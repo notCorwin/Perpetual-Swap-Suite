@@ -91,8 +91,9 @@
     --control-height-lg: 36px;
     --control-radius: 6px;
     --control-font-size: 13px;
-    /* Each material owns its default alpha. The global setting is a weight:
-       0 clears its paint, while 1 preserves the material's own default. */
+    /* Controls and panels weight their default alpha by the window setting.
+       Floating surfaces keep their own opaque fill so underlying text cannot
+       bleed through menus or dialogs, even when the window is transparent. */
     --surface-opacity-weight: var(--window-background-opacity);
     /* Floating surfaces must separate overlapping text; controls need a clear
        fill, while larger panels retain more of the window's glass. Saturated
@@ -103,7 +104,7 @@
     --primary-default-opacity: 0.4;
     --control-opacity: calc(var(--control-default-opacity) * var(--surface-opacity-weight));
     --panel-opacity: calc(var(--panel-default-opacity) * var(--surface-opacity-weight));
-    --floating-opacity: calc(var(--floating-default-opacity) * var(--surface-opacity-weight));
+    --floating-opacity: var(--floating-default-opacity);
     --primary-opacity: calc(var(--primary-default-opacity) * var(--surface-opacity-weight));
     --state-hover-default-opacity: 0.12;
     --state-selection-default-opacity: 0.28;
@@ -114,7 +115,6 @@
     --overlay-default-opacity: 0.12;
     --control-blur: calc((1 - var(--window-background-opacity)) * 12px);
     --panel-blur: calc((1 - var(--window-background-opacity)) * 16px);
-    --floating-blur: calc((1 - var(--window-background-opacity)) * 24px);
     --control-filter: none;
     --panel-filter: none;
     --floating-filter: none;
@@ -254,7 +254,6 @@
 :root[data-translucent-background="true"] {
     --control-filter: blur(var(--control-blur));
     --panel-filter: blur(var(--panel-blur));
-    --floating-filter: blur(var(--floating-blur));
 }
 
 :root[data-frosted-background="false"] {

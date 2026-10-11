@@ -915,19 +915,19 @@ final class RuleEditorUITests: BackgroundTestCase {
             const parent = element.parentElement?.closest('[data-surface="control"], [data-surface="panel"], [data-surface="floating"]');
             const nativeTable = document.documentElement.dataset.nativeWindowBackground === 'true' && element.closest('[data-slot="table-container"]');
             const inherited = role === 'inherited' || role !== 'floating' && (parent || nativeTable && role === 'control');
-            const expected = p === 1 || inherited ? 0 : ({control:12,panel:16,floating:24}[role] ?? 0) * (1-p);
+            const expected = p === 1 || inherited || role === 'floating' ? 0 : ({control:12,panel:16}[role] ?? 0) * (1-p);
             if (Math.abs(radius - expected) > 0.05 || expected === 0 && filter !== 'none') issues.push(`${element.dataset.slot ?? element.tagName} ${role}: filter=${filter}, expected=${expected}`);
             if (role === 'floating' && style.transitionProperty !== 'none') issues.push(`${element.dataset.slot ?? element.tagName}: implicit material transition`);
-            if (p < 1 && role !== 'inherited' && read(style.backgroundColor)[3] === 255) issues.push(`${element.dataset.slot ?? element.tagName}: opaque component paint`);
+            if (p < 1 && !['inherited','floating'].includes(role) && read(style.backgroundColor)[3] === 255) issues.push(`${element.dataset.slot ?? element.tagName}: opaque component paint`);
             if (style.opacity !== '1' || read(style.color)[3] !== 255) issues.push(`${element.dataset.slot ?? element.tagName}: faded content`);
             if (!style.fontVariantNumeric.includes('tabular-nums')) issues.push(`${element.dataset.slot ?? element.tagName}: non-tabular numbers`);
           }
           const input = document.querySelector('#background-opacity');
           if (input && (getComputedStyle(input).backdropFilter || getComputedStyle(input).webkitBackdropFilter) !== 'none') issues.push('Settings input must reuse its floating owner');
           const defaults = Object.fromEntries(['control','panel','floating','primary','state-hover','state-selection','state-accent','state-secondary','state-warning','table-header','overlay'].map(role => [role, Number(root.getPropertyValue(`--${role}-default-opacity`))]));
-          const checkAlpha = (label, color, baseline) => {
-            const actual = read(color)[3]/255, expected = baseline*p;
-            if (Math.abs(actual-expected) > 1/255) issues.push(`${label}: alpha=${actual}, expected own default ${baseline} * global weight ${p}`);
+          const checkAlpha = (label, color, baseline, weight = p) => {
+            const actual = read(color)[3]/255, expected = baseline*weight;
+            if (Math.abs(actual-expected) > 1/255) issues.push(`${label}: alpha=${actual}, expected own default ${baseline} * weight ${weight}`);
           };
           for (const [role, tokens] of Object.entries({
             control: ['control','control-hover','selection','secondary','muted','accent','destructive-surface','destructive-hover','positive-surface','chart-annotation'],
@@ -935,12 +935,12 @@ final class RuleEditorUITests: BackgroundTestCase {
             'state-hover': ['state-hover'], 'state-selection': ['state-selection'], 'state-accent': ['state-accent'],
             'state-secondary': ['state-secondary'], 'state-warning': ['state-warning'], 'table-header': ['table-header'], overlay: ['overlay']
           })) {
-            for (const token of tokens) checkAlpha(`--${token}`, root.getPropertyValue(`--${token}`), defaults[role]);
+            for (const token of tokens) checkAlpha(`--${token}`, root.getPropertyValue(`--${token}`), defaults[role], role === 'floating' ? 1 : p);
           }
           for (const element of document.querySelectorAll('[data-slot="input"], [data-slot="textarea"], [data-slot="input-group"], [data-slot="tabs-list"][data-surface="control"], [data-slot="select-trigger"], [data-slot="table-header"], [data-slot="table-footer"], [data-slot="dialog-footer"], [data-slot="dialog-overlay"], [data-surface="floating"], [data-slot="button"][data-variant="default"], [data-slot="badge"][data-variant="default"]')) {
             if (!element.getBoundingClientRect().width || !element.getBoundingClientRect().height) continue;
             const role = element.dataset.surface === 'floating' ? 'floating' : ['button','badge'].includes(element.dataset.slot) ? 'primary' : element.dataset.slot === 'dialog-footer' ? 'state-hover' : element.dataset.slot === 'dialog-overlay' ? 'overlay' : ['table-header','table-footer'].includes(element.dataset.slot) ? 'table-header' : 'control';
-            checkAlpha(element.dataset.slot, getComputedStyle(element).backgroundColor, defaults[role]);
+            checkAlpha(element.dataset.slot, getComputedStyle(element).backgroundColor, defaults[role], role === 'floating' ? 1 : p);
           }
           // Raising neutral control alpha must not turn primary fills into
           // saturated backgrounds with unreadable foreground text at weight 1.
@@ -970,7 +970,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         XCTAssertEqual(values["issues"] as? [String], [], "Surface rendering contract: \(values)")
         XCTAssertEqual(values["opacity"] as? Double, opacity)
         let alphas = try XCTUnwrap(values["alphas"] as? [Double])
-        for (actual, expected) in zip(alphas, [defaultOpacities[0] * opacity, defaultOpacities[1] * opacity, defaultOpacities[2] * opacity, defaultOpacities[3] * opacity, 1]) {
+        for (actual, expected) in zip(alphas, [defaultOpacities[0] * opacity, defaultOpacities[1] * opacity, defaultOpacities[2], defaultOpacities[3] * opacity, 1]) {
             XCTAssertEqual(actual, expected, accuracy: 1 / 255.0)
         }
         XCTAssertEqual(values["destructive"] as? [Int], [232, 85, 168, 255])
@@ -1015,7 +1015,7 @@ final class RuleEditorUITests: BackgroundTestCase {
             try await wait(view, "document.querySelector('#background-opacity') !== null")
             try await assertSharedSurfaces(view, opacity: 0.3)
             if appearance == .aqua { try await assertScaledSurfaces(view, window: window) }
-            if capturePixels { try await assertBackdropPixels(view, project: project, theme: theme, selector: "[data-slot=\"popover-content\"]", name: "settings") }
+            if capturePixels { try await assertFloatingPixels(view, project: project, theme: theme, selector: "[data-slot=\"popover-content\"]", name: "settings") }
             try await dismissFloating(view)
 
             try await click(view, "Universe rules")
@@ -1026,7 +1026,7 @@ final class RuleEditorUITests: BackgroundTestCase {
             try await wait(view, "document.querySelector('[data-rule-library]') !== null")
             try await assertSharedSurfaces(view, opacity: 0.3)
             if appearance == .aqua { try await assertScaledSurfaces(view, window: window) }
-            if capturePixels { try await assertBackdropPixels(view, project: project, theme: theme, selector: "[data-rule-library]", name: "library") }
+            if capturePixels { try await assertFloatingPixels(view, project: project, theme: theme, selector: "[data-rule-library]", name: "library") }
             try await input(view, "[data-rule-library] [cmdk-input]", "Price")
             _ = try await js(view, "document.querySelector('[data-library-id=\"metric:price\"]').click(); true")
             try await wait(view, "document.querySelector('[data-rule-library][data-state=\"open\"]') === null")
@@ -1080,12 +1080,10 @@ final class RuleEditorUITests: BackgroundTestCase {
 
     @MainActor
     private func assertScaledSurfaces(_ view: WKWebView, window: BackgroundTestWindow) async throws {
-        // Layout scaling is shared by both themes. Check each surface at both
-        // widths once; material colors and native pixels still cover both themes.
         for width in [1440, 720] {
             window.setContentSize(NSSize(width: width, height: 900))
             present(window)
-            try await wait(view, "innerWidth === \(width)")
+            try await wait(view, "innerWidth === \(width) && (() => { const content = document.querySelector('[data-market-list-content]'); return !content || Math.abs(content.getBoundingClientRect().width - innerWidth) < 1; })()")
             try await assertSharedSurfaces(view, opacity: 0.3)
             let overflow = try await js(view, "document.documentElement.scrollWidth > innerWidth + 1") as? Bool
             XCTAssertEqual(overflow, false)
@@ -1093,8 +1091,7 @@ final class RuleEditorUITests: BackgroundTestCase {
             XCTAssertEqual(squeezedLabels, false, "Portaled rule details must retain readable label widths when the window scales.")
         }
         window.setContentSize(NSSize(width: 1440, height: 900))
-        try await wait(view, "innerWidth === 1440")
-        try await settleRendering(view)
+        try await wait(view, "innerWidth === 1440 && (() => { const content = document.querySelector('[data-market-list-content]'); return !content || Math.abs(content.getBoundingClientRect().width - innerWidth) < 1; })()")
     }
 
     @MainActor
@@ -1105,36 +1102,27 @@ final class RuleEditorUITests: BackgroundTestCase {
     }
 
     @MainActor
-    private func assertBackdropPixels(_ view: WKWebView, project: URL, theme: String, selector: String, name: String) async throws {
+    private func assertFloatingPixels(_ view: WKWebView, project: URL, theme: String, selector: String, name: String) async throws {
         let query = String(data: try JSONEncoder().encode(selector), encoding: .utf8)!
-        let content = try await nativeRendererSnapshot(view)
-        _ = try await js(view, "(() => { const source=document.querySelector(\(query)); window.radarOriginalFilter={source,filter:source.style.backdropFilter,webkit:source.style.webkitBackdropFilter}; source.style.backdropFilter='none'; source.style.webkitBackdropFilter='none'; return true; })()")
-        try await settleRendering(view)
-        let unfilteredContent = try await nativeRendererSnapshot(view)
-        _ = try await js(view, "(() => { const {source,filter,webkit}=window.radarOriginalFilter; source.style.backdropFilter=filter; source.style.webkitBackdropFilter=webkit; delete window.radarOriginalFilter; return true; })()")
-        let normal = try XCTUnwrap(NSBitmapImageRep(data: content.tiffRepresentation!)), unfiltered = try XCTUnwrap(NSBitmapImageRep(data: unfilteredContent.tiffRepresentation!))
-        let contentBounds = try await js(view, "document.querySelector(\(query)).getBoundingClientRect().toJSON()") as? [String: Double]
-        let contentRect = try XCTUnwrap(contentBounds), contentScale = Double(normal.pixelsWide) / view.bounds.width
-        var difference = 0.0, samples = 0
-        for y in stride(from: contentRect["y"]! + 32, to: contentRect["bottom"]! - 32, by: 3) {
-            for x in stride(from: contentRect["x"]! + 32, to: contentRect["right"]! - 32, by: 3) {
-                let a = try XCTUnwrap(normal.colorAt(x: Int(x * contentScale), y: Int(y * contentScale))?.usingColorSpace(.sRGB)), b = try XCTUnwrap(unfiltered.colorAt(x: Int(x * contentScale), y: Int(y * contentScale))?.usingColorSpace(.sRGB))
-                difference += abs(a.redComponent-b.redComponent) + abs(a.greenComponent-b.greenComponent) + abs(a.blueComponent-b.blueComponent); samples += 3
-            }
-        }
-        print("Glass actual app background pixel difference \(name) \(theme): \(difference / Double(samples))")
-        XCTAssertGreaterThan(difference / Double(samples), 0.002, "The floating blur must affect the real scaled app content, not just a standalone backing fixture.")
         let bounds = try await js(view, """
         (() => {
-          const fixture = document.createElement('div'); fixture.id = 'glass-pixel-fixture';
+          // Put high-contrast content behind the real portaled surface in the
+          // scaled app. Hide only its children so its own material is sampled.
+          const fixture = document.createElement('div'); fixture.id = 'floating-pixel-fixture';
           fixture.style.cssText = 'position:absolute;inset:0;z-index:49;pointer-events:none;background:repeating-linear-gradient(90deg,#000 0px,#000 4px,#fff 4px,#fff 8px)';
           const source = document.querySelector(\(query));
-          source.dataset.qaGlassTest = 'true';
-          const hideContent = document.createElement('style'); hideContent.id = 'glass-pixel-style';
-          hideContent.textContent = '[data-qa-glass-test] > * { visibility:hidden!important }';
+          source.dataset.qaFloatingTest = 'true';
+          const hideContent = document.createElement('style'); hideContent.id = 'floating-pixel-style';
+          hideContent.textContent = '[data-qa-floating-test] > * { visibility:hidden!important }';
           document.querySelector('[data-market-list-content]').append(fixture);
           document.body.append(hideContent);
-          window.radarSurfaceFixture = { source, filter:source.style.backdropFilter, webkit:source.style.webkitBackdropFilter };
+          window.radarSurfaceFixture = { source, background:source.style.backgroundColor };
+          // Compare paint in the same native capture/color space. Canvas and
+          // ScreenCaptureKit can resolve wide-gamut dark colors differently.
+          const calibration = document.createElement('div'); calibration.id = 'floating-pixel-color';
+          calibration.style.cssText = 'position:fixed;left:0;top:0;width:16px;height:16px;z-index:100;pointer-events:none';
+          calibration.style.backgroundColor = getComputedStyle(source).backgroundColor;
+          document.body.append(calibration);
           return source.getBoundingClientRect().toJSON();
         })()
         """) as? [String: Double]
@@ -1143,25 +1131,32 @@ final class RuleEditorUITests: BackgroundTestCase {
         let image = try await nativeRendererSnapshot(view)
         let bitmap = try XCTUnwrap(NSBitmapImageRep(data: image.tiffRepresentation!))
         let scaleX = Double(bitmap.pixelsWide) / view.bounds.width, scaleY = Double(bitmap.pixelsHigh) / view.bounds.height
-        func contrast(_ bitmap: NSBitmapImageRep) throws -> Double {
-            let values = try (24..<216).map { offset -> Double in
+        let referenceColor = try XCTUnwrap(bitmap.colorAt(x: Int(8 * scaleX), y: Int(8 * scaleY))?.usingColorSpace(.sRGB))
+        let rgb = [referenceColor.redComponent, referenceColor.greenComponent, referenceColor.blueComponent]
+        func samples(_ bitmap: NSBitmapImageRep) throws -> [[Double]] {
+            try (24..<216).map { offset in
                 let color = try XCTUnwrap(bitmap.colorAt(x: Int((rect["x"]! + Double(offset)) * scaleX), y: Int((rect["y"]! + 120) * scaleY))?.usingColorSpace(.sRGB))
-                return (color.redComponent + color.greenComponent + color.blueComponent) / 3
+                return [color.redComponent, color.greenComponent, color.blueComponent]
             }
+        }
+        func contrast(_ samples: [[Double]]) -> Double {
+            let values = samples.map { $0.reduce(0, +) / 3 }
             return values.max()! - values.min()!
         }
-        let blurred = try contrast(bitmap)
-        _ = try await js(view, "window.radarSurfaceFixture.source.style.backdropFilter='none'; window.radarSurfaceFixture.source.style.webkitBackdropFilter='none'; true")
+        let opaqueSamples = try samples(bitmap), covered = contrast(opaqueSamples)
+        let fillError = opaqueSamples.flatMap { zip($0, rgb).map { abs($0 - $1) } }.max()!
+        _ = try await js(view, "window.radarSurfaceFixture.source.style.backgroundColor='transparent'; true")
         try await settleRendering(view)
         let reference = try await nativeRendererSnapshot(view)
         let referenceBitmap = try XCTUnwrap(NSBitmapImageRep(data: reference.tiffRepresentation!))
-        let sharp = try contrast(referenceBitmap)
-        _ = try await js(view, "(() => { const {source,filter,webkit}=window.radarSurfaceFixture; source.style.backdropFilter=filter; source.style.webkitBackdropFilter=webkit; delete source.dataset.qaGlassTest; delete window.radarSurfaceFixture; document.querySelector('#glass-pixel-fixture').remove(); document.querySelector('#glass-pixel-style').remove(); return true; })()")
-        print("Glass backdrop pixel contrast \(name) \(theme): blurred=\(blurred), unfiltered=\(sharp)")
-        XCTAssertGreaterThan(sharp, 0.15, "The reference must contain visible stripes with the same tint alpha.")
-        XCTAssertLessThan(blurred, sharp * 0.25, "The real floating material must blur app pixels, not merely paint a translucent tint.")
+        let exposed = contrast(try samples(referenceBitmap))
+        _ = try await js(view, "(() => { const {source,background}=window.radarSurfaceFixture; source.style.backgroundColor=background; delete source.dataset.qaFloatingTest; delete window.radarSurfaceFixture; document.querySelector('#floating-pixel-fixture').remove(); document.querySelector('#floating-pixel-style').remove(); document.querySelector('#floating-pixel-color').remove(); return true; })()")
+        print("Floating pixel contrast \(name) \(theme): covered=\(covered), exposed=\(exposed), fillError=\(fillError)")
+        XCTAssertGreaterThan(exposed, 0.15, "The reference must expose high-contrast app content behind the floating surface.")
+        XCTAssertLessThan(covered, 0.01, "An opaque floating surface must completely hide underlying content.")
+        XCTAssertLessThan(fillError, 0.02, "Native pixels must match the floating surface's own background color.")
         try FileManager.default.createDirectory(at: project.appendingPathComponent(".build/ui-qa"), withIntermediateDirectories: true)
-        try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: project.appendingPathComponent(".build/ui-qa/glass-backdrop-pixels-\(name)-\(theme).png"))
+        try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: project.appendingPathComponent(".build/ui-qa/floating-occlusion-\(name)-\(theme).png"))
     }
 
     @MainActor
