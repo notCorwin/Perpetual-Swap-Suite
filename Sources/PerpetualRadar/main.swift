@@ -211,7 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls {
-            if let strategy = RadarNotificationRoute.longStrategy(in: url) {
+            if let strategy = RadarNotificationRoute.strategy(in: url) {
                 pendingNotificationStrategyID = strategy; showWindow(); openNotificationContract(); continue
             }
             guard let id = RadarNotificationRoute.contract(in: url) else { continue }
@@ -279,7 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func openNotificationContract() {
         if let strategy = pendingNotificationStrategyID, let webView, !webView.isLoading {
             pendingNotificationStrategyID = nil
-            webView.callAsyncJavaScript("window.radarNotificationStrategy = strategyID; window.dispatchEvent(new Event('radar-open-long'));", arguments: ["strategyID": strategy], in: nil, in: .page, completionHandler: nil)
+            webView.callAsyncJavaScript("window.radarNotificationStrategy = strategyID; window.dispatchEvent(new Event('radar-open-strategy'));", arguments: ["strategyID": strategy], in: nil, in: .page, completionHandler: nil)
         }
         guard let id = pendingNotificationInstId, let webView, !webView.isLoading else { return }
         pendingNotificationInstId = nil

@@ -76,7 +76,7 @@ final class BTCMarketContextTests: XCTestCase {
         let original = context([90,100,110,120,130,140])
         XCTAssertEqual(try value(#"BTC(Close, "live")"#, original).number, 90)
         XCTAssertEqual(try value(#"BTC(Close, "closed")"#, original).number, 100)
-        let closed = LongDecision.context(original, forming: false)
+        let closed = SuiteEvaluation.context(original, forming: false)
         XCTAssertEqual(try value("BTC(Close)", closed).number, 100)
         XCTAssertEqual(try value(#"BTC(Close, "live")"#, closed).number, 90)
         XCTAssertEqual(try value(#"BTC(Close, "closed")"#, closed).number, 100)
@@ -167,29 +167,6 @@ final class BTCMarketContextTests: XCTestCase {
         XCTAssertFalse(proof.referenceDriven, "A constant match cannot be presented as a BTC risk trigger.")
     }
 
-    func testBTCExitBeforeFirstContractCloseMissingContractAndNoPreviewDependency() async throws {
-        let worker = LongDecisionWorker()
-        let strategy = LongStrategy(name: "BTC safety", entryJSON: try FilterCompiler.compile(source: "Close > 0").config.json,
-            exitJSON: try FilterCompiler.compile(source: #"LongReturn < -5 OR BTC(ROC(1), "live") <= -2"#).config.json)
-        let own = context([97,100,100,100])
-        let position = LongTrackedPosition(strategyID: strategy.id, instrument: own.id, enteredAt: hour+1000, entryPrice: 100, strategy: strategy)
-        for forming in [false, true] {
-            let rows = try await worker.evaluate([own], strategy: strategy, positions: [position], forming: forming, available: true, detailID: own.id)
-            let row = try XCTUnwrap(rows.first)
-            XCTAssertEqual(row.action, "Exit Long"); XCTAssertTrue(row.btcExit)
-            XCTAssertTrue(row.reason.contains("BTC(ROC(1)")); XCTAssertNotNil(row.exitTraceJSON)
-        }
-        let missing = try await worker.evaluate([], strategy: strategy, positions: [position], forming: false, available: true, reference: own.referenceBTC)
-        XCTAssertEqual(missing.first?.action, "Exit Long"); XCTAssertTrue(missing.first!.btcExit)
-        let paused = try await worker.evaluate([own], strategy: strategy, positions: [position], forming: false, available: false)
-        XCTAssertEqual(paused.first?.action, "Unknown")
-        for source in [#"LongReturn < -5 AND BTC(ROC(1), "live") <= -2"#, #"unavailable(Close) AND BTC(ROC(1), "live") <= -2"#] {
-            var custom = strategy; custom.exitJSON = try FilterCompiler.compile(source: source).config.json
-            let rows = try await worker.evaluate([own], strategy: custom, positions: [position], forming: false, available: true)
-            XCTAssertFalse(rows.first!.btcExit, "BTC urgency must preserve custom AND and availability semantics.")
-        }
-    }
-
     func testBTCResearchClocksHaveNoFutureReadsAndCooldownUsesHourlySamples() throws {
         var btc = ResearchSeries(candles: Dictionary(uniqueKeysWithValues: ResearchFixture.bars().map { ($0.hour,$0) }))
         let h = ResearchFixture.hour
@@ -219,23 +196,6 @@ final class BTCMarketContextTests: XCTestCase {
             let context = ResearchEngine.context(instrument: ResearchFixture.instrument, hour: h+Int64(offset)*hourMS, series: btc, reference: .init(instrument: ResearchFixture.instrument, series: btc))
             XCTAssertEqual(FilterEvaluator(market: context, filter: cooldown).evaluate().result, truth)
         }
-    }
-
-    func testBTCCapturedSequenceCanExitImmediatelyWithoutUsingContractCaptures() async throws {
-        let worker = LongDecisionWorker(), own = context([110,100,100,100])
-        let entry = try FilterCompiler.compile(source: "Close > 0").config.json
-        let source = #"sequence(2, stage("start", true, 2, capture("level", mean(abs(BTC(Close, "live")), 1))), stage("finish", BTC(Close, "live") > start.level, 2))"#
-        let strategy = LongStrategy(name: "BTC sequence", entryJSON: entry, exitJSON: try FilterCompiler.compile(source: source).config.json)
-        let position = LongTrackedPosition(strategyID: strategy.id, instrument: own.id, enteredAt: hour+1000, entryPrice: 100, strategy: strategy)
-        let rows = try await worker.evaluate([own], strategy: strategy, positions: [position], forming: false, available: true, detailID: own.id)
-        XCTAssertEqual(rows.first?.action, "Exit Long"); XCTAssertTrue(rows.first!.btcExit)
-        let trace = try evaluate(source, own)
-        XCTAssertTrue(trace.referenceDriven)
-        XCTAssertTrue(trace.children[0].children[0].readingSources.keys.contains("start.level"))
-        var mixed = strategy
-        mixed.exitJSON = try FilterCompiler.compile(source: source.replacingOccurrences(of: #"mean(abs(BTC(Close, "live")), 1)"#, with: "Close")).config.json
-        let blocked = try await worker.evaluate([own], strategy: mixed, positions: [position], forming: false, available: true)
-        XCTAssertFalse(blocked.first!.btcExit, "A contract capture must still await the contract's decision clock.")
     }
 
     func testResearchDownloadsAndFreezesBTCWithoutAddingItToSamplePopulation() async throws {

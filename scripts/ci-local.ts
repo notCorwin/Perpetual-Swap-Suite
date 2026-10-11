@@ -75,7 +75,7 @@ try {
     // Start long scenarios first. One shared pool bounds native processes,
     // including the packaged apps, instead of oversubscribing WindowServer.
     // Every discovered test is assigned once, including newly added cases.
-    const priority = ['testSuitePhaseEditing', 'testResearchPrepareRun', 'testVisualFunctionCoverage', 'testDraggingConditions', 'testDualDirection', 'testGlassTint', 'testBTCMarketContext', 'testNativeTypedRule']
+    const priority = ['testBullishSetupEditing', 'testResearchPrepareRun', 'testVisualFunctionCoverage', 'testDraggingConditions', 'testBullishSetupRadar', 'testGlassTint', 'testBTCMarketContext', 'testNativeTypedRule']
     const weight = (id: string) => { const rank = priority.findIndex(name => id.includes(name)); return rank < 0 ? priority.length : rank }
     const orderedUI = ui.filter(id => !benchmark.includes(id) && !pixels.includes(id)).sort((a, b) => weight(a) - weight(b))
     const uiTask = (id: string) => ({ name: `webkit-${id.split('/')[1]}`, ids: [id] })

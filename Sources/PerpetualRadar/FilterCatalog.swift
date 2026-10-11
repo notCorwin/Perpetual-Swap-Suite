@@ -100,12 +100,6 @@ enum FilterCatalog {
         }
     }
     static let metrics: [FilterMetricInfo] = [
-        .init(key: "ShortEntryPrice", label: "Short entry price", group: "Short position", description: "Actual or simulated Short entry price. Available only to Bearish Exhaustion while holding a Short.", unit: "USDT", numeric: true),
-        .init(key: "ShortReturn", label: "Short return (%)", group: "Short position", description: "(Entry price − selected close) / |entry price| × 100%. Gross, without leverage or costs.", unit: "%", numeric: true),
-        .init(key: "ShortHeldHours", label: "Short holding time (h)", group: "Short position", description: "Elapsed hours since Short entry. Only available after entry.", unit: "hours", numeric: true),
-        .init(key: "LongEntryPrice", label: "Long entry price", group: "Long position", description: "Actual tracked entry price, or the simulated next-hour entry open. Only available to exit filters while a Long is open.", unit: "USDT", numeric: true),
-        .init(key: "LongReturn", label: "Long return (%)", group: "Long position", description: "(Selected hourly close / Long entry price − 1) × 100%. Gross, without leverage or costs. Use for close-based profit and loss exits.", unit: "%", numeric: true),
-        .init(key: "LongHeldHours", label: "Long holding time (h)", group: "Long position", description: "Hours elapsed from entry to this reading. Available only after entry; supports time-based exits.", unit: "hours", numeric: true),
         .init(key: "emaTrend", label: "EMA200 trend", group: "EMA & candle", description: "EMA200 at the selected hour compared with the preceding hour's EMA200.", unit: "category", numeric: false),
         .init(key: "emaSlope", label: "EMA200 hourly slope (%)", group: "EMA & candle", description: "Percentage change of EMA200 from the preceding hour's EMA200.", unit: "%", numeric: true),
         .init(key: "emaBody", label: "Candle body vs EMA200", group: "EMA & candle", description: "Selected hourly open and close only; wicks do not affect this relation. Touching includes equality at either end.", unit: "category", numeric: false),

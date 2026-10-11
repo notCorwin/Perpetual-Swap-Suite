@@ -158,7 +158,12 @@ struct MonitorIPCFailure: Error, LocalizedError {
 }
 
 enum MonitorIPC {
+    // CoreFoundation reuses remote ports. Serialize individual send/poll calls
+    // so concurrent clients cannot race the port's reply bookkeeping; submitted
+    // asynchronous jobs still run concurrently in the monitor.
+    private static let sendLock = NSLock()
     static func send(_ data: Data, message: Int32, name: String = MonitorRuntime.portName) throws -> Data {
+        sendLock.lock(); defer { sendLock.unlock() }
         guard let port = CFMessagePortCreateRemote(nil, name as CFString) else { throw MonitorIPCFailure(reason: .unavailable) }
         var reply: Unmanaged<CFData>?
         let result = CFMessagePortSendRequest(port, message, data as CFData, 2, 2, CFRunLoopMode.defaultMode.rawValue, &reply)
@@ -244,7 +249,7 @@ final class MonitorClient {
         let reads: Set<String> = ["serviceInfo", "rocPeriod", "marocPeriod", "sinceRevision", "compileMarketFilters",
                                   "previewMarketFilters", "explainMarketFilters", "chartInstId", "chartEndHour", "loadChart"]
         if body.keys.allSatisfy({ reads.contains($0) }) { return true }
-        if body.count == 1, let request = body["longDecision"] as? [String: Any] {
+        if body.count == 1, let request = body["suite"] as? [String: Any] {
             return ["inventory", "evaluate"].contains(request["action"] as? String ?? "inventory")
         }
         return body.count == 1 && body["notificationAction"] as? String == "refresh"

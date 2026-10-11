@@ -2,8 +2,8 @@ import Foundation
 import UserNotifications
 
 enum RadarNotificationRoute {
-    static func longStrategy(in url: URL) -> String? {
-        guard url.scheme == "perpetualradar", url.host == "long", url.pathComponents.count == 2 else { return nil }
+    static func strategy(in url: URL) -> String? {
+        guard url.scheme == "perpetualradar", url.host == "strategy", url.pathComponents.count == 2 else { return nil }
         let id = url.lastPathComponent
         return !id.isEmpty && id.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }) ? id : nil
     }
@@ -48,7 +48,7 @@ final class MarketNotifications: NSObject, UNUserNotificationCenterDelegate {
     private let transport: any MarketNotificationTransport
     private let enabled: () -> Bool
     var onOpen: ((String?) -> Void)?
-    var onOpenLong: ((String) -> Void)?
+    var onOpenStrategy: ((String) -> Void)?
     var onStateChanged: (() -> Void)?
     private(set) var authorization = MarketNotificationAuthorization.notDetermined
     private(set) var error = ""
@@ -76,13 +76,12 @@ final class MarketNotifications: NSObject, UNUserNotificationCenterDelegate {
             let content = UNMutableNotificationContent()
             content.title = change.direction == .entered ? "Strategy signal confirmed" : "Strategy signal ended"
             let parts = change.instId.split(separator: "|").map(String.init), instrument = parts[0], phase = parts.count > 1 ? parts[1] : nil
-            if phase?.hasPrefix("Exit ") == true && change.direction == .exited { continue }
             content.subtitle = instrument
             if let phase { content.title = phase + (change.direction == .entered ? " · Confirmed" : " · Ended") }
             content.body = change.direction == .entered
                 ? "This OKX USDT perpetual swap now matches the active saved 1h strategy."
                 : "This OKX USDT perpetual swap no longer matches the active saved 1h strategy or has left the exchange universe."
-            if let phase { content.body = "\(instrument) · \(phase) at the completed 1h close. Inspect your saved rules and actual position in Radar." }
+            if let phase { content.body = "\(instrument) · \(phase) at the completed 1h close. Inspect your Bullish Setup rules and signal evidence in Radar." }
             content.sound = .default
             content.threadIdentifier = "saved-strategy-signals"
             content.userInfo = ["instId": instrument, "direction": change.direction.rawValue]
@@ -99,22 +98,6 @@ final class MarketNotifications: NSObject, UNUserNotificationCenterDelegate {
         content.sound = .default
         await deliver(content)
     }
-    func sendLongExits(_ changes: [LongExitChange]) async {
-        guard enabled(), !changes.isEmpty else { return }
-        await refresh()
-        guard enabled(), authorization.canDeliver else { return }
-        for change in changes {
-            guard enabled(), !Task.isCancelled else { return }
-            let content = UNMutableNotificationContent()
-            content.title = "Exit Long · \(change.instruments.count) tracked \(change.instruments.count == 1 ? "position" : "positions")"
-            content.subtitle = change.strategyName
-            content.body = change.instruments.joined(separator: ", ") + ". " + change.reasons.joined(separator: " ")
-            content.sound = .default; content.threadIdentifier = "long-exits-" + change.strategyID
-            content.userInfo = ["strategyID": change.strategyID, "instruments": change.instruments, "route": "perpetualradar://long/" + change.strategyID]
-            await deliver(content)
-        }
-    }
-
     private func deliver(_ content: UNMutableNotificationContent) async {
         do {
             try await transport.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
@@ -134,7 +117,7 @@ final class MarketNotifications: NSObject, UNUserNotificationCenterDelegate {
             let instId = response.notification.request.content.userInfo["instId"] as? String
             let strategyID = response.notification.request.content.userInfo["strategyID"] as? String
             Task { @MainActor [weak self] in
-                if let strategyID { self?.onOpenLong?(strategyID) } else { self?.onOpen?(instId) }
+                if let strategyID { self?.onOpenStrategy?(strategyID) } else { self?.onOpen?(instId) }
             }
         }
         completionHandler()

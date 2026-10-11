@@ -1,11 +1,10 @@
 import type { SuiteReading } from './suite-types.ts'
 
 export type SignalTiming = 'both' | 'confirmed' | 'provisional'
-export type EntryPhase = 'bullishSetup' | 'bearishReversal'
 export type RadarSignal = { instrument: string; confirmed?: SuiteReading; provisional?: SuiteReading }
 
-export function phaseMatches(reading: SuiteReading | undefined, phase: EntryPhase): boolean {
-  return reading?.universe === 'true' && reading.phases[phase]?.result === 'true'
+export function phaseMatches(reading: SuiteReading | undefined): boolean {
+  return reading?.universe === 'true' && reading.phases.bullishSetup?.result === 'true'
 }
 
 // A phase and its Universe must come from the same evaluated hour. Never gate a
@@ -23,17 +22,13 @@ export function radarSignals(confirmed: SuiteReading[], provisional: SuiteReadin
   return [...signals.values()]
 }
 
-export function signalMatches(signal: RadarSignal, phase: EntryPhase): boolean {
-  return phaseMatches(signal.confirmed, phase) || phaseMatches(signal.provisional, phase)
+export function signalMatches(signal: RadarSignal): boolean {
+  return phaseMatches(signal.confirmed) || phaseMatches(signal.provisional)
 }
 
 export function signalIsUnknown(signal: RadarSignal): boolean {
   return [signal.confirmed, signal.provisional].some(reading => reading && (
     reading.universe === 'unknown' || reading.universe === 'true' &&
-    (reading.phases.bullishSetup?.result === 'unknown' || reading.phases.bearishReversal?.result === 'unknown')
+    (reading.phases.bullishSetup?.result ?? 'unknown') === 'unknown'
   ))
-}
-
-export function signalHasConflict(signal: RadarSignal): boolean {
-  return [signal.confirmed, signal.provisional].some(reading => reading?.universe === 'true' && reading.conflict)
 }

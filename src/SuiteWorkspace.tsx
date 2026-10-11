@@ -20,44 +20,37 @@ import { MarketListViewport } from '@/MarketListViewport'
 import { ModeTitle } from '@/ModeTitle'
 import { MarketChart } from '@/MarketChart'
 import { SuitePhaseBadges } from '@/SuitePhaseBadges'
-import { SuiteExecutionFields } from '@/SuiteStudyConfiguration'
 import { emptyFilterConfig, initialLibraryPreferences, parseFilterConfig } from '@/rule-engine'
-import { longPrice } from '@/long-decisions'
-import { researchPercent, researchTime } from '@/research-types'
-import { defaultExecution, requestSuite, SUITE_PHASES, suiteSpec, type StrategyProfile, type SuitePosition, type SuiteReading, type SuiteDraft, type SuiteWorkspaceProps } from '@/suite-types'
+import { researchTime } from '@/research-types'
+import { requestSuite, SUITE_PHASES, suiteSpec, type StrategyProfile, type SuiteReading, type SuiteDraft, type SuiteWorkspaceProps } from '@/suite-types'
 
 export function SuiteWorkspace({ mode, inputs, active, initialTab = 'rules', routeKey, onBack, onResearch, onSwitchMode, switchingMode }: SuiteWorkspaceProps) {
   const suite = useSuite(mode, active), snapshot = suite.snapshot
   const [loaded, setLoaded] = useState<StrategyProfile | null>(null), [name, setName] = useState('My strategy')
   const [hydrated, setHydrated] = useState(false)
-  const [execution, setExecution] = useState(defaultExecution), [tab, setTab] = useState<string>(initialTab), [phase, setPhase] = useState('universe')
+  const [tab, setTab] = useState<string>(initialTab), [phase, setPhase] = useState('universe')
   const [notice, setNotice] = useState(''), [error, setError] = useState(''), [preferences, setPreferences] = useState(initialLibraryPreferences)
-  const [page, setPage] = useState(0), [positionPage, setPositionPage] = useState(0), [search, setSearch] = useState('')
+  const [page, setPage] = useState(0), [search, setSearch] = useState('')
   const [chart, setChart] = useState<string | null>(null), [detail, setDetail] = useState<SuiteReading | null>(null)
-  const [record, setRecord] = useState<{ kind: 'open' | 'close'; profileID: string; instrument: string; direction: string; price: string; time: string; reference?: number } | null>(null)
-  const [confirm, setConfirm] = useState<{ kind: 'load' | 'delete' | 'remove'; profile?: StrategyProfile; position?: SuitePosition } | null>(null)
+  const [confirm, setConfirm] = useState<{ kind: 'load' | 'delete'; profile?: StrategyProfile } | null>(null)
   const universe = useStrategyFilter(JSON.stringify(emptyFilterConfig()), 'universe'), setup = useStrategyFilter(JSON.stringify(emptyFilterConfig()), 'bullishSetup')
-  const exhaustion = useStrategyFilter(JSON.stringify(emptyFilterConfig()), 'bullishExhaustion'), reversal = useStrategyFilter(JSON.stringify(emptyFilterConfig()), 'bearishReversal'), bearish = useStrategyFilter(JSON.stringify(emptyFilterConfig()), 'bearishExhaustion')
-  const models = [universe, setup, exhaustion, reversal, bearish]
+  const models = [universe, setup]
   const initialized = useRef(false)
-  const resetUniverse = universe.reset, resetSetup = setup.reset, resetExhaustion = exhaustion.reset, resetReversal = reversal.reset, resetBearish = bearish.reset
+  const resetUniverse = universe.reset, resetSetup = setup.reset
   const load = useCallback((profile: StrategyProfile | null) => {
-    setLoaded(profile); setName(profile?.name ?? 'My strategy'); setExecution(profile?.execution ?? defaultExecution())
+    setLoaded(profile); setName(profile?.name ?? 'My strategy')
     resetUniverse(profile?.universeJSON ?? JSON.stringify(emptyFilterConfig()))
     resetSetup(profile?.phaseRules.bullishSetup ?? JSON.stringify(emptyFilterConfig()))
-    resetExhaustion(profile?.phaseRules.bullishExhaustion ?? JSON.stringify(emptyFilterConfig()))
-    resetReversal(profile?.phaseRules.bearishReversal ?? JSON.stringify(emptyFilterConfig()))
-    resetBearish(profile?.phaseRules.bearishExhaustion ?? JSON.stringify(emptyFilterConfig()))
     setError(''); setNotice(''); setTab('rules')
-  }, [resetUniverse, resetSetup, resetExhaustion, resetReversal, resetBearish])
+  }, [resetUniverse, resetSetup])
   const original = loaded ? [loaded.universeJSON, ...SUITE_PHASES.map(p => loaded.phaseRules[p.key])] : []
-  const dirty = name !== (loaded?.name ?? 'My strategy') || JSON.stringify(execution) !== JSON.stringify(loaded?.execution ?? defaultExecution()) || models.some((m, i) => m.dirty || loaded && m.canonical !== null && m.canonical !== original[i])
-  const draftJSON = JSON.stringify({profile:loaded,name,execution,rules:models.map(m=>({json:JSON.stringify(m.draft??m.filters),source:m.editor.source,nameDrafts:m.editor.nameDrafts,expressionDrafts:m.editor.expressionDrafts,lastValid:m.lastValid}))} satisfies SuiteDraft)
+  const dirty = name !== (loaded?.name ?? 'My strategy') || models.some((m, i) => m.dirty || loaded && m.canonical !== null && m.canonical !== original[i])
+  const draftJSON = JSON.stringify({profile:loaded,name,rules:models.map(m=>({json:JSON.stringify(m.draft??m.filters),source:m.editor.source,nameDrafts:m.editor.nameDrafts,expressionDrafts:m.editor.expressionDrafts,lastValid:m.lastValid}))} satisfies SuiteDraft)
   useEffect(() => {
     if(!suite.ready || initialized.current)return
     initialized.current=true
     const savedDraft=snapshot.draft
-    if(savedDraft?.rules.length===5){setLoaded(savedDraft.profile);setName(savedDraft.name);setExecution(savedDraft.execution);models.forEach((m,i)=>m.restore(savedDraft.rules[i]))}
+    if(savedDraft && savedDraft.rules.length >= 2){setLoaded(savedDraft.profile);setName(savedDraft.name);models.forEach((m,i)=>m.restore(savedDraft.rules[i]))}
     else load(snapshot.profiles.find(p=>p.id===snapshot.selectedID)??snapshot.profiles[0]??null)
     setHydrated(true)
     // Initial hydration is applied once; later inventories must preserve edits.
@@ -80,8 +73,8 @@ export function SuiteWorkspace({ mode, inputs, active, initialTab = 'rules', rou
   const save = () => perform(async () => {
     if (!name.trim()) { document.getElementById('suite-strategy-name')?.focus(); throw new Error('Give this strategy a name.') }
     const invalid = models.findIndex((m,i) => !m.valid || !m.canonical || i>0 && ['all','any'].includes(parseFilterConfig(m.canonical).root.kind) && parseFilterConfig(m.canonical).root.children.length===0)
-    if (invalid >= 0) { setPhase(invalid ? SUITE_PHASES[invalid-1].key : 'universe'); throw new Error('Finish all five valid rule configurations before saving.') }
-    const profile: StrategyProfile = { id: loaded?.id ?? '', mode, name: name.trim(), universeJSON: universe.canonical!, phaseRules: Object.fromEntries(SUITE_PHASES.map((p,i) => [p.key,models[i+1].canonical!])) as StrategyProfile['phaseRules'], revision: loaded?.revision ?? 0, updatedAt: Date.now(), execution }
+    if (invalid >= 0) { setPhase(invalid ? SUITE_PHASES[invalid-1].key : 'universe'); throw new Error('Finish the Universe and Bullish Setup rules before saving.') }
+    const profile: StrategyProfile = { id: loaded?.id ?? '', mode, name: name.trim(), universeJSON: universe.canonical!, phaseRules: Object.fromEntries(SUITE_PHASES.map((p,i) => [p.key,models[i+1].canonical!])) as StrategyProfile['phaseRules'], revision: loaded?.revision ?? 0, updatedAt: Date.now() }
     const response = await suite.perform({ action: 'save', profile })
     if (response.saved) { initialized.current = true; load(response.saved); setNotice(snapshot.selectedID===response.saved.id ? 'Strategy saved. Active revision updated with a quiet confirmation baseline; existing experiments keep their snapshots.' : 'Strategy saved. Activate it explicitly to change Radar monitoring; existing experiments keep their snapshots.') }
   })
@@ -99,24 +92,18 @@ export function SuiteWorkspace({ mode, inputs, active, initialTab = 'rules', rou
   const savePreferences = async (value: typeof preferences) => { await window.webkit.messageHandlers.radar.postMessage({ filterLibraryPreferencesJSON: JSON.stringify(value) }); setPreferences(value) }
   const readings = (snapshot.confirmed ?? []).filter(r => r.instrument.toLowerCase().includes(search.trim().toLowerCase()))
   const activeProfile = snapshot.profiles.find(p => p.id === snapshot.selectedID)
-  const positions = snapshot.positions.slice().reverse()
-  const beginRecord = (kind: 'open' | 'close', instrument = '', price?: number, position?: SuitePosition, direction = 'Long') => {
-    const profileID = position?.strategyID ?? activeProfile?.id ?? loaded?.id
-    if (!profileID) { setError('Save a Radar strategy before recording an actual position.'); return }
-    setRecord({ kind, profileID, instrument, direction: position?.direction ?? direction, price: '', reference: price, time: new Date().toISOString().slice(0,16) })
-  }
   const inspect = (reading: SuiteReading) => setDetail(reading)
   useEffect(() => {
     if (mode !== 'radar' || !active || !hydrated) return
-    const openPosition = () => {
+    const openStrategy = () => {
       const id = window.radarNotificationStrategy
       const profile = snapshot.profiles.find(p => p.id === id)
       if (!profile) return
       delete window.radarNotificationStrategy
-      choose(profile); setTab('positions')
+      choose(profile); setTab('rules')
     }
-    window.addEventListener('radar-open-long',openPosition);openPosition()
-    return () => window.removeEventListener('radar-open-long',openPosition)
+    window.addEventListener('radar-open-strategy',openStrategy);openStrategy()
+    return () => window.removeEventListener('radar-open-strategy',openStrategy)
     // Consume the native route after inventory hydration; preserve any current draft warning.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[mode,active,hydrated,snapshot.profiles])
@@ -128,35 +115,25 @@ export function SuiteWorkspace({ mode, inputs, active, initialTab = 'rules', rou
     {notice && <p role="status" aria-live="polite" className="text-sm">{notice}</p>}
     {loaded && latestLoaded && latestLoaded.revision !== loaded.revision && <Alert variant="warning"><AlertDescription>A newer saved revision is available: r{latestLoaded.revision}. Your draft is retained. <Button variant="link" onClick={() => choose(latestLoaded)}>Reload saved strategy…</Button></AlertDescription></Alert>}
     {loaded && !latestLoaded && <Alert variant="warning"><AlertDescription>This strategy is no longer in the shared library. Duplicate it to restore its saved rules, or choose another strategy.</AlertDescription></Alert>}
-    <div className="flex items-center gap-3"><Field className="w-80"><FieldLabel>Saved strategies</FieldLabel><Select value={loaded?.id ?? 'new'} onValueChange={id => choose(snapshot.profiles.find(p => p.id === id) ?? null)}><SelectTrigger aria-label="Saved phase strategies"><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="new">New strategy…</SelectItem>{snapshot.profiles.map(p => <SelectItem key={p.id} value={p.id}>{p.name} · r{p.revision}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>
+    <div className="flex items-center gap-3"><Field className="w-80"><FieldLabel>Saved strategies</FieldLabel><Select value={loaded?.id ?? 'new'} onValueChange={id => choose(snapshot.profiles.find(p => p.id === id) ?? null)}><SelectTrigger aria-label="Saved strategies"><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="new">New strategy…</SelectItem>{snapshot.profiles.map(p => <SelectItem key={p.id} value={p.id}>{p.name} · r{p.revision}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>
       <Button variant="outline" disabled={!loaded || suite.pending} onClick={() => void copy()}><Copy data-icon="inline-start" aria-hidden="true" />Duplicate saved strategy</Button>
       <Button variant="outline" disabled={!loaded || suite.pending} onClick={() => void perform(async () => { await suite.perform({ action: 'select', profileID: loaded!.id }); setNotice('Saved revision activated in Radar. Confirmation monitoring starts with a quiet baseline.') })}>{mode === 'radar' ? 'Activate saved strategy' : 'Use saved strategy in Radar'}</Button>
       {activeProfile && <Button variant="ghost" onClick={() => void perform(async () => { await suite.perform({ action: 'select', profileID: '' }); setNotice('Strategy deactivated. Radar displays all markets; confirmed alerts resume after activation.') })}>Deactivate</Button>}
       <Button variant="outline" disabled={!loaded || suite.pending} onClick={() => void perform(async () => { if (loaded) { await requestSuite({mode,action:'draft',draft:JSON.parse(draftJSON) as SuiteDraft});onResearch(suiteSpec([loaded])) } })}>Backtest saved strategy</Button>
       <Button variant="ghost" disabled={!loaded || suite.pending} onClick={() => setConfirm({ kind: 'delete', profile: loaded ?? undefined })}><Trash2 data-icon="inline-start" aria-hidden="true" />Delete…</Button>
     </div>
-    <Tabs value={tab} onValueChange={setTab}><TabsList><TabsTrigger value="rules">Strategy rules</TabsTrigger>{mode === 'radar' && <><TabsTrigger value="signals">Confirmed phases</TabsTrigger><TabsTrigger value="positions">Positions</TabsTrigger></>}</TabsList>
-      <TabsContent value="rules" className="flex flex-col gap-4"><form onSubmit={e => { e.preventDefault(); void save() }} className="flex flex-col gap-4"><FieldGroup><Field><FieldLabel htmlFor="suite-strategy-name">Strategy name</FieldLabel><Input id="suite-strategy-name" name="strategyName" autoComplete="off" value={name} onChange={e => setName(e.target.value)} /><FieldDescription>All five configurations are saved atomically. Drafts and previews never change confirmed alerts.</FieldDescription></Field><SuiteExecutionFields value={execution} onChange={setExecution} /></FieldGroup><div className="flex gap-3"><Button type="submit" disabled={suite.pending || models.some(m => !m.valid)}>{suite.pending ? <Spinner data-icon="inline-start" /> : <Save data-icon="inline-start" aria-hidden="true" />}Save strategy</Button>{dirty && <Badge variant="outline">Unsaved draft</Badge>}</div></form>
+    <Tabs value={tab} onValueChange={setTab}><TabsList><TabsTrigger value="rules">Strategy rules</TabsTrigger>{mode === 'radar' && <><TabsTrigger value="signals">Confirmed setups</TabsTrigger></>}</TabsList>
+      <TabsContent value="rules" className="flex flex-col gap-4"><form onSubmit={e => { e.preventDefault(); void save() }} className="flex flex-col gap-4"><FieldGroup><Field><FieldLabel htmlFor="suite-strategy-name">Strategy name</FieldLabel><Input id="suite-strategy-name" name="strategyName" autoComplete="off" value={name} onChange={e => setName(e.target.value)} /><FieldDescription>Universe and Bullish Setup are saved together. Drafts and previews never change confirmed alerts.</FieldDescription></Field></FieldGroup><div className="flex gap-3"><Button type="submit" disabled={suite.pending || models.some(m => !m.valid)}>{suite.pending ? <Spinner data-icon="inline-start" /> : <Save data-icon="inline-start" aria-hidden="true" />}Save strategy</Button>{dirty && <Badge variant="outline">Unsaved draft</Badge>}</div></form>
         <ToggleGroup type="single" variant="outline" value={phase} onValueChange={value => { if (value) setPhase(value) }} aria-label="Phase rule editor"><ToggleGroupItem value="universe">Universe</ToggleGroupItem>{SUITE_PHASES.map(p => <ToggleGroupItem key={p.key} value={p.key}>{p.label}</ToggleGroupItem>)}</ToggleGroup>
-        {[{ key: 'universe', label: 'Universe', description: 'Restricts candidates and entries. Open-position exits remain active outside the Universe.' }, ...SUITE_PHASES].map((p,i) => <div key={p.key} hidden={phase !== p.key}><StrategyPhaseEditor label={p.label} description={p.description} model={models[i]} inputs={inputs} preferences={preferences} onPreferences={savePreferences} active={active && tab === 'rules' && phase === p.key} strategyID={mode === 'radar' ? loaded?.id ?? '' : ''} /></div>)}
+        {[{ key: 'universe', label: 'Universe', description: 'Restricts the contracts evaluated for Bullish Setup.' }, ...SUITE_PHASES].map((p,i) => <div key={p.key} hidden={phase !== p.key}><StrategyPhaseEditor label={p.label} description={p.description} model={models[i]} inputs={inputs} preferences={preferences} onPreferences={savePreferences} active={active && tab === 'rules' && phase === p.key} strategyID={mode === 'radar' ? loaded?.id ?? '' : ''} /></div>)}
       </TabsContent>
       <TabsContent value="signals" className="flex flex-col gap-3"><Field><FieldLabel htmlFor="phase-search">Search contracts</FieldLabel><Input id="phase-search" name="phaseSearch" value={search} onChange={e => { setSearch(e.target.value); setPage(0) }} placeholder="BTC, ETH…" /></Field>
-        <Table aria-label="Confirmed phase readings"><TableHeader><TableRow>{['Contract', 'Phases', 'Confirmed close', 'Decision', 'Details / actual fills'].map(label => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader><TableBody>{readings.slice(page*50,page*50+50).map(r => <TableRow key={r.instrument}><TableCell><Button variant="link" onClick={() => setChart(r.instrument)}>{r.instrument}</Button></TableCell><TableCell><SuitePhaseBadges confirmed={r} provisional={snapshot.provisional?.find(p => p.instrument === r.instrument)} /></TableCell><TableCell>{researchTime(r.hour+3_600_000)}</TableCell><TableCell title={r.reason}>{r.action}</TableCell><TableCell><div className="flex gap-2"><Button variant="ghost" onClick={() => void inspect(r)}>Explain</Button>{r.position ? <Button variant="outline" onClick={() => beginRecord('close',r.instrument,r.price,r.position)}>Record exit…</Button> : <Button variant="outline" onClick={() => beginRecord('open',r.instrument,r.price,undefined,r.action.includes('Short') ? 'Short' : 'Long')}>Record entry…</Button>}</div></TableCell></TableRow>)}</TableBody></Table>
-        {!readings.length && <Empty><EmptyHeader><EmptyTitle>No active phase readings</EmptyTitle><EmptyDescription>Save and activate a complete strategy, or wait for the native collector to load its hourly inputs.</EmptyDescription></EmptyHeader></Empty>}
+        <Table aria-label="Confirmed phase readings"><TableHeader><TableRow>{['Contract', 'Bullish Setup', 'Confirmed close', 'Decision', 'Evidence'].map(label => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader><TableBody>{readings.slice(page*50,page*50+50).map(r => <TableRow key={r.instrument}><TableCell><Button variant="link" onClick={() => setChart(r.instrument)}>{r.instrument}</Button></TableCell><TableCell><SuitePhaseBadges confirmed={r} provisional={snapshot.provisional?.find(p => p.instrument === r.instrument)} /></TableCell><TableCell>{researchTime(r.hour+3_600_000)}</TableCell><TableCell title={r.reason}>{r.action}</TableCell><TableCell><div className="flex gap-2"><Button variant="ghost" onClick={() => void inspect(r)}>Explain</Button></div></TableCell></TableRow>)}</TableBody></Table>
+        {!readings.length && <Empty><EmptyHeader><EmptyTitle>No active setup readings</EmptyTitle><EmptyDescription>Save and activate a complete strategy, or wait for the native collector to load its hourly inputs.</EmptyDescription></EmptyHeader></Empty>}
         <div className="flex gap-2"><Button variant="outline" disabled={page === 0} onClick={() => setPage(p => p-1)}>Previous contracts</Button><Button variant="outline" disabled={(page+1)*50 >= readings.length} onClick={() => setPage(p => p+1)}>Next contracts</Button></div>
       </TabsContent>
-      <TabsContent value="positions" className="flex flex-col gap-3"><div className="flex items-center gap-3"><h2 className="font-semibold">Actual position records</h2><Button variant="outline" onClick={() => beginRecord('open')}>Record entry…</Button><span className="text-xs text-muted-foreground">Records update only after you enter actual fills.</span></div>
-        <Table aria-label="Actual Long and Short positions"><TableHeader><TableRow>{['Contract / direction', 'Strategy', 'Entry', 'Exit', 'Price return', 'Decision', 'Actions'].map(label => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader><TableBody>{positions.slice(positionPage*50,positionPage*50+50).map(p => {
-          const reading = snapshot.confirmed?.find(r => r.instrument === p.instrument && r.position?.id === p.id)
-          const provisional = snapshot.provisional?.find(r => r.instrument === p.instrument && r.position?.id === p.id)
-          const rawReturn = p.priceReturn ?? reading?.positionReturn, ret = rawReturn == null ? undefined : Number(rawReturn)
-          return <TableRow key={p.id}><TableCell>{p.instrument}<br /><Badge variant="outline">{p.direction}</Badge></TableCell><TableCell>{p.strategy.name} · entry r{p.strategy.revision}</TableCell><TableCell>{researchTime(p.enteredAt)}<br />{longPrice(p.entryPrice)}</TableCell><TableCell>{p.exitedAt == null ? 'Open' : researchTime(p.exitedAt)}<br />{longPrice(p.exitPrice)}</TableCell><TableCell className={ret == null ? undefined : ret > 0 ? 'text-positive' : ret < 0 ? 'text-destructive' : undefined}>{researchPercent(ret)}</TableCell><TableCell>{p.exitedAt != null ? 'Closed' : p.strategyID !== snapshot.selectedID ? 'Inactive Strategy' : reading?.action ?? 'Unknown'}{p.exitedAt == null && p.strategyID === snapshot.selectedID && provisional?.action.startsWith('Exit') && !reading?.action.startsWith('Exit') && <div><Badge variant="outline">Provisional · {provisional.action}</Badge></div>}</TableCell><TableCell><div className="flex gap-2">{p.exitedAt == null && <Button variant="outline" onClick={() => beginRecord('close',p.instrument,reading?.price,p)}>Record exit…</Button>}<Button variant="ghost" onClick={() => setConfirm({ kind: 'remove', position: p })}>Remove record…</Button></div></TableCell></TableRow>
-        })}</TableBody></Table>
-        <div className="flex gap-2"><Button variant="outline" disabled={positionPage === 0} onClick={() => setPositionPage(p => p-1)}>Previous records</Button><Button variant="outline" disabled={(positionPage+1)*50 >= positions.length} onClick={() => setPositionPage(p => p+1)}>Next records</Button></div>
-      </TabsContent>
     </Tabs>
-    <Dialog open={active && Boolean(record)} onOpenChange={open => { if (!open) setRecord(null) }}><DialogContent><DialogHeader><DialogTitle>Record actual {record?.kind === 'open' ? 'entry' : 'exit'}</DialogTitle><DialogDescription>Enter your actual fill price and UTC time. This records a trade you performed.</DialogDescription></DialogHeader>{record && <form className="flex flex-col gap-4" onSubmit={e => { e.preventDefault(); void perform(async () => { await suite.perform({ action: record.kind, profileID: record.profileID, instrument: record.instrument.trim().toUpperCase(), direction: record.direction, price: Number(record.price), timestamp: Date.parse(record.time+'Z') }); setRecord(null); setNotice('Actual fill recorded.') }) }}>{error && <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert>}<FieldGroup><Field><FieldLabel htmlFor="position-symbol">Contract</FieldLabel><Input id="position-symbol" name="instrument" value={record.instrument} disabled={record.kind === 'close'} onChange={e => setRecord({ ...record,instrument: e.target.value })} placeholder="BTC-USDT-SWAP…" /></Field><Field><FieldLabel>Direction</FieldLabel><ToggleGroup type="single" variant="outline" value={record.direction} disabled={record.kind === 'close'} onValueChange={value => { if (value) setRecord({ ...record,direction: value }) }} aria-label="Actual position direction"><ToggleGroupItem value="Long">Long</ToggleGroupItem><ToggleGroupItem value="Short">Short</ToggleGroupItem></ToggleGroup></Field><Field><FieldLabel htmlFor="actual-price">Actual price (USDT)</FieldLabel><Input id="actual-price" name="price" inputMode="decimal" placeholder={record.reference==null?'Actual execution price…':'Hourly reference: '+longPrice(record.reference)} value={record.price} onChange={e => setRecord({ ...record,price: e.target.value })} /></Field><Field><FieldLabel htmlFor="actual-time">Fill time (UTC)</FieldLabel><Input id="actual-time" name="timestamp" type="datetime-local" value={record.time} onChange={e => setRecord({ ...record,time: e.target.value })} /></Field></FieldGroup><Button type="submit" disabled={suite.pending}>Save actual fill</Button></form>}</DialogContent></Dialog>
-    <Dialog open={active && Boolean(confirm)} onOpenChange={open => { if (!open) setConfirm(null) }}><DialogContent><DialogHeader><DialogTitle>{confirm?.kind === 'load' ? 'Discard unsaved draft?' : confirm?.kind === 'delete' ? 'Delete strategy?' : 'Remove actual tracking record?'}</DialogTitle><DialogDescription>{confirm?.kind === 'load' ? 'The saved strategy and existing studies remain available.' : 'This removes the selected local item. Removing a record does not invent a closing trade.'}</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setConfirm(null)}>Cancel</Button><Button variant="destructive" onClick={() => void perform(async () => { const value = confirm; if (!value) return; if (value.kind === 'load') load(value.profile ?? null); else if (value.kind === 'delete') { await suite.perform({ action: 'delete',profileID: value.profile!.id }); load(null) } else await suite.perform({ action: 'removeTracking',positionID: value.position!.id }); setConfirm(null) })}>Confirm</Button></DialogFooter></DialogContent></Dialog>
+    <Dialog open={active && Boolean(confirm)} onOpenChange={open => { if (!open) setConfirm(null) }}><DialogContent><DialogHeader><DialogTitle>{confirm?.kind === 'load' ? 'Discard unsaved draft?' : 'Delete strategy?'}</DialogTitle><DialogDescription>{confirm?.kind === 'load' ? 'The saved strategy and existing studies remain available.' : 'This removes the selected local item. Saved experiments keep their frozen rules.'}</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setConfirm(null)}>Cancel</Button><Button variant="destructive" onClick={() => void perform(async () => { const value = confirm; if (!value) return; if (value.kind === 'load') load(value.profile ?? null); else if (value.kind === 'delete') { await suite.perform({ action: 'delete',profileID: value.profile!.id }); load(null) }; setConfirm(null) })}>Confirm</Button></DialogFooter></DialogContent></Dialog>
     {active && activeProfile && <SuitePhaseExplanation instrument={detail?.instrument ?? null} profile={activeProfile} inputs={inputs} onClose={() => setDetail(null)} />}
   </main></MarketListViewport>
 }

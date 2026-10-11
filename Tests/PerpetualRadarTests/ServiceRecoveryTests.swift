@@ -104,7 +104,7 @@ final class ServiceRecoveryTests: XCTestCase {
                 return reply("new")
             }
         }
-        let body: [String: Any] = isWrite ? ["longDecision": ["action": "save"]] : ["sinceRevision": -1]
+        let body: [String: Any] = ["suite": ["mode": "radar", "action": isWrite ? "save" : "evaluate"]]
         do {
             let result = try await client.request(body)
             XCTAssertFalse(isWrite, "An uncertain write must be reconciled before the user retries.")

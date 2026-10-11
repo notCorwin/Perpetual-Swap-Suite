@@ -61,14 +61,13 @@ actor ResearchWorker {
     func run(_ study: ResearchStudy, progress: @escaping @Sendable (Int, Int, String) -> Void) throws -> StudyReport {
         let store = try ResearchStore(directory: directory)
         guard let id = study.manifestID, let manifest = try store.get(id, as: DataManifest.self) else { throw FilterError("Prepare data before running this study.") }
-        guard manifest.engine == (study.spec.kind == "cycle" ? SuiteStudyEngine.version : study.spec.kind == "long" ? LongStudyEngine.version : ResearchVersion.engine) else { throw FilterError("This checkpoint requires engine \(manifest.engine). Keep its frozen results or copy its configuration to use the current engine.") }
+        guard manifest.engine == ResearchVersion.engine else { throw FilterError("This checkpoint requires engine \(manifest.engine). Keep its frozen results or copy its configuration to use the current engine.") }
         var checkpoint = try store.get("checkpoint:\(study.id)", as: Checkpoint.self) ?? Checkpoint(studyID: study.id, phase: "running")
         checkpoint.phase = "running"; try store.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
-        if study.spec.kind == "cycle" { try SuiteStudyEngine.run(store: store, study: study, manifest: manifest, checkpoint: &checkpoint, progress: progress) }
-        else if study.spec.kind == "long" { try LongStudyEngine.run(store: store, study: study, manifest: manifest, checkpoint: &checkpoint, progress: progress) }
-        else { try ResearchEngine.run(store: store, study: study, manifest: manifest, checkpoint: &checkpoint, progress: progress) }
+        try study.spec.validate()
+        try ResearchEngine.run(store: store, study: study, manifest: manifest, checkpoint: &checkpoint, progress: progress)
         progress(1, 1, "Calculating baselines, medians and confidence intervals…")
-        let report = study.spec.kind == "cycle" ? try store.suiteReport(study, manifest: manifest) : study.spec.kind == "long" ? try store.longReport(study, manifest: manifest, counters: checkpoint.longCounters ?? .init()) : try store.report(study, manifest: manifest)
+        let report = try store.report(study, manifest: manifest)
         checkpoint.phase = "completed"; checkpoint.updatedAt = researchNow()
         try store.database.transaction {
             try store.put("report:\(study.id)", kind: "report", report)
@@ -120,27 +119,12 @@ actor ResearchReader {
             try handle.write(contentsOf: Data(line.utf8))
         }
         let spec = try researchJSON(report.spec)
-        if report.suite != nil {
-            try SuiteCSV.export(store: store, report: report, manifest: manifest, kind: kind, write: write)
-        } else if kind == "summary" {
-            let longColumns = report.long == nil ? [] : ["duration_protocol","exit_rule","long_closed","long_open","long_incomplete","long_uncertain","gross_profit_usdt","available_net_profit_usdt","gross_profit_factor","average_hold_hours"]
-            try write(["study_id", "manifest_id", "data_digest", "engine", "source_revision", "group", "rule", "hours", "n", "excluded", "net_n", "mean", "median", "win_rate", "net_mean", "net_median", "net_win_rate", "mfe", "mae", "baseline", "excess", "ci_low", "ci_high", "net_ci_low", "net_ci_high", "spec_json"] + longColumns)
+        if kind == "summary" {
+            try write(["study_id", "manifest_id", "data_digest", "engine", "source_revision", "group", "rule", "hours", "n", "excluded", "net_n", "mean", "median", "win_rate", "net_mean", "net_median", "net_win_rate", "mfe", "mae", "baseline", "excess", "ci_low", "ci_high", "net_ci_low", "net_ci_high", "spec_json"])
             func n(_ value: Double?) -> String { value.map { String($0) } ?? "" }
-            let longValues = report.long.map { ["Exit filter determines holding time",report.spec.rules[1].name,String($0.closed),String($0.open),String($0.incomplete),String($0.uncertain),n($0.grossProfit),n($0.netProfit),n($0.profitFactor),n($0.averageHours)] } ?? []
             for s in report.summaries {
                 try Task.checkCancellation()
-                try write([studyID, manifest.id, manifest.digest, manifest.engine, manifest.sourceRevision, s.group, report.spec.rules[s.ruleIndex].name, String(s.hours), String(s.count), String(s.excluded), String(s.netCount), n(s.mean), n(s.median), n(s.winRate), n(s.netMean), n(s.netMedian), n(s.netWinRate), n(s.mfe), n(s.mae), n(s.baseline), n(s.excess), n(s.intervalLow), n(s.intervalHigh), n(s.netIntervalLow), n(s.netIntervalHigh), spec] + longValues)
-            }
-        } else if report.long != nil {
-            try write(["study_id","manifest_id","data_digest","engine","instrument","entry_utc_ms","entry_price","exit_utc_ms","exit_price","holding_hours","status","uncertain","unknown_hours","gross","net","mfe","mae","reason","net_unavailable","entry_trace_json","exit_trace_json","sources_json","spec_json","entry_split","exit_split","crosses_split"])
-            var offset = 0
-            while true {
-                try Task.checkCancellation(); let trades = try store.longTrades(studyID, offset: offset, limit: 100); if trades.isEmpty { break }
-                for trade in trades {
-                    let o = trade.outcome
-                    try write([studyID,manifest.id,manifest.digest,manifest.engine,trade.instrument,String(trade.entryTime),trade.entryPrice.map { String($0) } ?? "",trade.exitTime.map { String($0) } ?? "",trade.exitPrice.map { String($0) } ?? "",String(o.hours),trade.status,String(trade.uncertain),String(trade.unknownHours),o.gross.map { String($0) } ?? "",o.net.map { String($0) } ?? "",o.mfe.map { String($0) } ?? "",o.mae.map { String($0) } ?? "",o.reason ?? "",o.netReason ?? "",trade.entryEvent.traceJSON,trade.exitEvent?.traceJSON ?? "",try researchJSON(Array(Set(trade.entryEvent.sources+(trade.exitEvent?.sources ?? []))).sorted()),spec,trade.entryEvent.split,trade.exitEvent?.split ?? "",String(trade.crossesSplit)])
-                }
-                offset += trades.count
+                try write([studyID, manifest.id, manifest.digest, manifest.engine, manifest.sourceRevision, s.group, report.spec.rules[s.ruleIndex].name, String(s.hours), String(s.count), String(s.excluded), String(s.netCount), n(s.mean), n(s.median), n(s.winRate), n(s.netMean), n(s.netMedian), n(s.netWinRate), n(s.mfe), n(s.mae), n(s.baseline), n(s.excess), n(s.intervalLow), n(s.intervalHigh), n(s.netIntervalLow), n(s.netIntervalHigh), spec])
             }
         } else {
             try write(["study_id", "manifest_id", "data_digest", "engine", "instrument", "timestamp_utc_ms", "rule", "direction", "entry", "split", "score", "score_complete", "status", "setup", "hours", "gross", "net", "mfe", "mae", "exclusion", "net_unavailable", "sources_json", "trace_json", "opportunity_json"])
@@ -296,15 +280,6 @@ final class ResearchController {
         case "events":
             guard let id = request["studyID"] as? String else { throw FilterError("Choose a study.") }
             return ["events": try snapshot(store.events(id, offset: request["offset"] as? Int ?? 0)), "count": try store.count("SELECT COUNT(*) FROM research_events WHERE study=?", [id])]
-        case "trades":
-            guard let id = request["studyID"] as? String else { throw FilterError("Choose a study.") }
-            return ["trades": try snapshot(store.longTrades(id, offset: request["offset"] as? Int ?? 0)), "count": try store.count("SELECT COUNT(*) FROM research_long_trades WHERE study=?", [id])]
-        case "suiteTrades":
-            guard let id = request["studyID"] as? String else { throw FilterError("Choose a study.") }
-            return ["suiteTrades": try snapshot(store.suiteTrades(id, offset: request["offset"] as? Int ?? 0)), "count": try store.count("SELECT COUNT(*) FROM research_suite_trades WHERE study=?", [id])]
-        case "suiteCurve":
-            guard let id = request["studyID"] as? String, let profile = request["profileID"] as? String, let instrument = request["instrument"] as? String, let model = request["model"] as? String else { throw FilterError("Choose an independent account curve.") }
-            return ["curve": try snapshot(store.suiteCurve(id, profile: profile, instrument: instrument, model: model, offset: request["offset"] as? Int ?? 0)), "count": try store.count("SELECT COUNT(*) FROM research_suite_equity WHERE study=? AND profile=? AND inst=? AND model=?", [id,profile,instrument,model])]
         case "chart":
             guard let id = request["eventID"] as? String else { throw FilterError("Choose an event.") }
             let chart = try await reader.chart(eventID: id, endingAt: (request["endHour"] as? NSNumber)?.int64Value)
@@ -355,7 +330,7 @@ final class ResearchController {
             return ["bytesRemoved": try store.cleanCache()]
         case "inventory":
             var studies: [[String: Any]] = []
-            for study in try store.objects("study", as: ResearchStudy.self) {
+            for study in try store.objects("study", as: ResearchStudy.self) where ["filter", "score", "comparison"].contains(study.spec.kind) && (study.spec.strategyPhase == nil || study.spec.strategyPhase == "bullishSetup") {
                 var item = try snapshot(study) as! [String: Any]
                 let checkpoint = try store.get("checkpoint:\(study.id)", as: Checkpoint.self)
                 item["phase"] = activeStudyID == study.id && isBusy ? status?.phase ?? "running" : ["running", "preparing", "planning"].contains(checkpoint?.phase ?? "") ? "paused" : checkpoint?.phase ?? "paused"

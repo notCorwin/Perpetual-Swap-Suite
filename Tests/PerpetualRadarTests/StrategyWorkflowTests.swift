@@ -6,8 +6,7 @@ final class StrategyWorkflowTests: XCTestCase {
     private func rule(_ source: String) throws -> String { try FilterCompiler.compile(source: source).config.json }
     private func profile(universe: String = "Close > 0", setup: String = "Close > 100") throws -> StrategyProfile {
         .init(name: "Strategy version", universeJSON: try rule(universe), phaseRules: [
-            "bullishSetup": try rule(setup), "bullishExhaustion": try rule("LongReturn > 0"),
-            "bearishReversal": try rule("Close < 100"), "bearishExhaustion": try rule("ShortReturn > 0")], revision: 3)
+            "bullishSetup": try rule(setup)], revision: 3)
     }
     private func market(_ price: Double) -> FilterMarketData {
         let bars = Dictionary(uniqueKeysWithValues: (0...3).map { age in
@@ -54,17 +53,6 @@ final class StrategyWorkflowTests: XCTestCase {
         XCTAssertEqual(try spec.resolvingStrategyRules().rules[0].filtersJSON, resolved.rules[0].filtersJSON, "Projected conditions have stable identities for reproducible studies.")
     }
 
-    func testLongSimulationKeepsExitsActiveOutsideUniverse() throws {
-        var spec = StudySpec(name: "Long simulation", kind: "long", rules: [], through: hour, direction: "Long")
-        spec.strategySnapshots = [try profile(universe: "Close > 200", setup: "Close > 100")]
-        let resolved = try spec.resolvingStrategyRules()
-        try resolved.validate()
-        let held = SuiteEvaluation.positionContext(market(150), direction: "Long", price: 100, time: hour - hourMS)
-        XCTAssertEqual(try truth(resolved.rules[0].filtersJSON, market: held), .no)
-        XCTAssertEqual(try truth(resolved.rules[1].filtersJSON, market: held), .yes)
-        XCTAssertTrue(resolved.rules[1].name.contains("Bullish Exhaustion"))
-    }
-
     func testSignalStudiesAllowUnrestrictedUniverse() throws {
         for kind in ["all", "any"] {
             var profile = try profile()
@@ -81,17 +69,20 @@ final class StrategyWorkflowTests: XCTestCase {
     func testScoreAndComparisonRulesComeFromFrozenStrategies() throws {
         let first = try profile(universe: "Close > 100"), second = try profile(universe: "Close > 200")
         var spec = StudySpec(name: "Opportunity", kind: "score", rules: [], through: hour)
-        spec.strategySnapshots = [first]
-        XCTAssertEqual(try spec.resolvingStrategyRules().rules.first?.filtersJSON, first.universeJSON)
+        spec.strategySnapshots = [try profile(universe: "Close > 100", setup: "Close > 200")]
+        let scored = try spec.resolvingStrategyRules()
+        XCTAssertEqual(scored.direction, "Long"); XCTAssertEqual(scored.sampling, "hourly")
+        XCTAssertEqual(try truth(scored.rules[0].filtersJSON, market: market(150)), .no)
+        XCTAssertEqual(try truth(scored.rules[0].filtersJSON, market: market(250)), .yes)
         spec.kind = "comparison"; spec.strategySnapshots = [first, second]; spec.strategyPhase = "bullishSetup"
         let comparison = try spec.resolvingStrategyRules()
         try comparison.validate()
         XCTAssertEqual(try truth(comparison.rules[0].filtersJSON, market: market(150)), .yes)
         XCTAssertEqual(try truth(comparison.rules[1].filtersJSON, market: market(150)), .no)
         spec.strategyPhase = "bearishReversal"
-        XCTAssertEqual(try spec.resolvingStrategyRules().direction, "Short")
-        spec.strategySnapshots = []; XCTAssertThrowsError(try spec.resolvingStrategyRules())
-        spec.strategySnapshots = [first, second]; spec.strategyPhase = "bullishExhaustion"
-        XCTAssertThrowsError(try spec.resolvingStrategyRules(), "Holding phases require a position simulation.")
+        XCTAssertThrowsError(try spec.resolvingStrategyRules())
+        spec.strategyPhase = "bullishSetup"; spec.strategySnapshots = []; XCTAssertThrowsError(try spec.resolvingStrategyRules())
+        spec.strategySnapshots = [first, second]; spec.kind = "cycle"
+        XCTAssertThrowsError(try spec.resolvingStrategyRules(), "Only Bullish Setup is supported.")
     }
 }

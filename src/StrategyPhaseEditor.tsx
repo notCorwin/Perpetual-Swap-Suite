@@ -31,7 +31,7 @@ export function StrategyPhaseEditor({ label, model, inputs, preferences, onPrefe
   const expressions = { ...model.editor.expressionDrafts, ...model.compilation.expressions }
   const metrics = inputs.metrics.filter(metric => !model.compilation.allowedMetrics || model.compilation.allowedMetrics.includes(metric.key))
   return <section aria-label={label} className="flex flex-col gap-3" data-strategy-rules>
-    <FieldDescription className="px-4">{description} Keep rules for preview; Save strategy applies all five configurations together.</FieldDescription>
+    <FieldDescription className="px-4">{description} Keep rules for preview; Save strategy applies Universe and Bullish Setup together.</FieldDescription>
     <StrategyRules label={label} embedded atClose strategyID={strategyID} filters={model.filters} draft={model.draft} editor={model.editor} onEditorChange={model.setEditor} onDraftChange={model.setDraft} onApply={model.keep}
       metrics={metrics} templates={inputs.templates} preferences={preferences} onPreferences={onPreferences}
       rows={rows} results={results} previewJSON={previewJSON} revision={revision} onExplain={setExplaining} units={model.compilation.units ?? {}} expressions={expressions}

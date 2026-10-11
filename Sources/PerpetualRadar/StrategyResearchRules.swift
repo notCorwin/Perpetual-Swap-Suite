@@ -2,35 +2,28 @@ import Foundation
 
 extension StudySpec {
     // The native planner derives study conditions from frozen strategies. The UI
-    // selects versions and phases; it never supplies a separate applied filter.
+    // selects versions; it never supplies a separate applied filter.
     func resolvingStrategyRules() throws -> StudySpec {
-        guard kind != "cycle", let profiles = strategySnapshots else { return self }
+        guard ["filter", "score", "comparison"].contains(kind) else { throw FilterError("Choose Bullish Setup signals, Opportunity, or Compare strategies.") }
+        guard strategyPhase == nil || strategyPhase == "bullishSetup" else { throw FilterError("Research supports Bullish Setup only.") }
+        guard let profiles = strategySnapshots else { return self }
         guard profiles.count == (kind == "comparison" ? 2 : 1) else {
             throw FilterError("Choose one strategy, or two strategy versions for a comparison.")
         }
         for profile in profiles { _ = try profile.compiled() }
         var spec = self
-        if kind == "long" {
-            let profile = profiles[0]
-            spec.rules = [try profile.researchRule("bullishSetup"),
-                          .init(name: profile.name + " · Bullish Exhaustion", filtersJSON: profile.phaseRules["bullishExhaustion"]!)]
-        } else {
-            let phase = kind == "score" ? "universe" : strategyPhase ?? "bullishSetup"
-            spec.rules = try profiles.map { try $0.researchRule(phase) }
-            if direction == "auto", phase != "universe" {
-                spec.direction = phase == "bullishSetup" ? "Long" : "Short"
-            }
-        }
+        spec.rules = try profiles.map { try $0.researchRule("bullishSetup") }
+        spec.direction = "Long"
+        if kind == "score" { spec.sampling = "hourly" }
         return spec
     }
 }
 
 extension StrategyProfile {
     func researchRule(_ scope: String) throws -> StudyRule {
-        if scope == "universe" { return .init(name: name + " · Universe", filtersJSON: universeJSON) }
-        guard let phase = SuitePhase(rawValue: scope), [.bullishSetup, .bearishReversal].contains(phase),
+        guard let phase = SuitePhase(rawValue: scope), phase == .bullishSetup,
               let phaseJSON = phaseRules[scope] else {
-            throw FilterError("Choose Universe, Bullish Setup or Bearish Reversal. Study holding phases with a cycle or Long entry / exit simulation.")
+            throw FilterError("Choose Bullish Setup.")
         }
         let universe = try scopedResearchConfig(universeJSON, prefix: "universe_")
         let signal = try scopedResearchConfig(phaseJSON, prefix: "phase_")

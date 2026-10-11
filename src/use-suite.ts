@@ -3,7 +3,7 @@ import { keepSnapshotValue } from '@/market-snapshot'
 import { requestSuite, type SuiteMode, type SuiteRequest, type SuiteResponse } from '@/suite-types'
 
 export function useSuite(mode: SuiteMode, active: boolean) {
-  const [snapshot, setSnapshot] = useState<SuiteResponse>({ profiles: [], positions: [], selectedID: '' })
+  const [snapshot, setSnapshot] = useState<SuiteResponse>({ profiles: [], selectedID: '' })
   const [error, setError] = useState(''), [pending, setPending] = useState(false), [ready,setReady] = useState(false)
   const generation = useRef(0), mutating = useRef(false)
   const accept = useCallback((value: SuiteResponse) => setSnapshot(previous => { const same = previous.selectedID === value.selectedID && previous.profiles.find(p => p.id===previous.selectedID)?.revision === value.profiles.find(p => p.id===value.selectedID)?.revision; return keepSnapshotValue(previous, { ...previous, ...value,

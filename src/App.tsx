@@ -18,7 +18,6 @@ import { modeTitle, suiteSpec } from "@/suite-types"
 import { useSuite } from "@/use-suite"
 import { SuitePhaseBadges } from "@/SuitePhaseBadges"
 import type { StrategyProfile, SuiteReading, SuiteRequest, SuiteResponse } from "@/suite-types"
-import type { LongRequest, LongResponse } from "@/long-decisions"
 import { Research } from "@/Research"
 import type { ResearchInputs, ResearchRequest, ResearchResponse, StudySpec } from "@/research-types"
 import { Input } from "@/components/ui/input"
@@ -49,7 +48,6 @@ type UnchangedSnapshot = { unchanged: true; revision: number; error: string }
 type SettingRequest = Partial<WindowAppearance> & { backgroundMonitoringEnabled?: boolean; notificationsEnabled?: boolean; monitoringPaused?: boolean; launchAtLogin?: boolean; notificationAction?: "refresh" | "requestPermission" | "test" | "openSettings"; filterLibraryPreferencesJSON?: string }
 type NativeBridge = {
   postMessage(request: { suite: SuiteRequest }): Promise<SuiteResponse>
-  postMessage(request: { longDecision: LongRequest }): Promise<LongResponse>
   postMessage(request: { research: ResearchRequest }): Promise<ResearchResponse>
   postMessage(request: { foregroundWorkspace: "radar" | "research" }): Promise<{ ok: boolean }>
   postMessage(request: { rocPeriod: number; marocPeriod: number; sinceRevision: number }): Promise<Snapshot | UnchangedSnapshot>
@@ -150,7 +148,7 @@ const MarketRows = memo(function MarketRows({ rows, onSelect, onExplain, canExpl
   return <MarketRowsViewport ids={rows.map(row => row.instId)}>{index => <MarketRowView row={rows[index]} index={index} onSelect={onSelect} onExplain={onExplain} canExplain={canExplain} confirmed={confirmed[rows[index].instId]} provisional={provisional[rows[index].instId]} />}</MarketRowsViewport>
 })
 
-function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: boolean; onResearch: (inputs: ResearchInputs, spec?: StudySpec) => void; onDecisions: (inputs: ResearchInputs, tab?: 'rules' | 'signals' | 'positions') => void; switchingMode: boolean }) {
+function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: boolean; onResearch: (inputs: ResearchInputs, spec?: StudySpec) => void; onDecisions: (inputs: ResearchInputs, tab?: 'rules' | 'signals') => void; switchingMode: boolean }) {
   const revision = useRef(-1)
   const serviceSession = useRef<string | undefined>(undefined)
   const backgroundOpacityDraftDirty = useRef(false)
@@ -182,17 +180,17 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   const [rows, setRows] = useState<NativeMarketRow[]>([])
   const routedStrategy = useRef<string | null>(null)
   useEffect(() => {
-    const openLong = () => {
+    const openStrategy = () => {
       const id = window.radarNotificationStrategy
       if (ready && id && routedStrategy.current !== id) {
         routedStrategy.current = id
         onDecisions({ metrics, templates, functions })
       }
     }
-    const notified = () => { routedStrategy.current = null; openLong() }
-    window.addEventListener('radar-open-long', notified)
-    openLong()
-    return () => window.removeEventListener('radar-open-long', notified)
+    const notified = () => { routedStrategy.current = null; openStrategy() }
+    window.addEventListener('radar-open-strategy', notified)
+    openStrategy()
+    return () => window.removeEventListener('radar-open-strategy', notified)
   }, [ready, metrics, templates, functions, onDecisions])
   const [status, setStatus] = useState("Connecting")
   const [error, setError] = useState("")
@@ -351,7 +349,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   const matchedRows = useMemo(() => rows.filter(row => activeProfile ? confirmedPhases[row.instId]?.universe === "true" || provisionalPhases[row.instId]?.universe === "true" : true), [rows,activeProfile,confirmedPhases,provisionalPhases])
   const searchedRows = useMemo(() => rows.filter(row => row.instId.toLowerCase().includes(query.trim().toLowerCase())), [rows, query])
   const searchedSignals = useMemo(() => signals.filter(signal => signal.instrument.toLowerCase().includes(query.trim().toLowerCase())), [signals, query])
-  const signalInstruments = useMemo(() => new Set(searchedSignals.filter(signal => signalMatches(signal, 'bullishSetup') || signalMatches(signal, 'bearishReversal')).map(signal => signal.instrument)), [searchedSignals])
+  const signalInstruments = useMemo(() => new Set(searchedSignals.filter(signal => signalMatches(signal)).map(signal => signal.instrument)), [searchedSignals])
   const visible = useMemo(() => searchedRows.filter(row => {
     if (!activeProfile) return true
     return phaseView === 'markets' || signalInstruments.has(row.instId)
@@ -435,7 +433,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     <main className="flex min-h-[inherit] flex-col">
       <header className="flex items-center gap-3 border-b px-4 py-3 whitespace-nowrap">
         <ModeTitle mode="radar" pending={switchingMode} onSwitch={() => onResearch({ metrics, templates, functions })} />
-        <Button variant="outline" onClick={() => onDecisions({ metrics, templates, functions })}>Strategies &amp; Positions</Button>
+        <Button variant="outline" onClick={() => onDecisions({ metrics, templates, functions })}>Strategy Library</Button>
         <span className="text-xs text-muted-foreground">OKX · USDT swaps · 1h</span>
         <span className="text-xs tabular-nums text-muted-foreground">{visible.length} / {rows.length} markets</span>
         <Popover onOpenChange={open => { if (!open && backgroundOpacityDraftDirty.current) saveBackgroundOpacity(); if (open) void updateNotifications({ notificationAction: "refresh" }) }}>
@@ -449,7 +447,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
                   <FieldLabel htmlFor="strategy-notifications">Strategy notifications</FieldLabel>
                   <Toggle id="strategy-notifications" variant="outline" pressed={notificationSettings.notificationsEnabled} disabled={notificationPending} onPressedChange={enabled => void updateNotifications({ notificationsEnabled: enabled })} aria-label="Enable strategy notifications" aria-describedby="notification-description">{notificationSettings.notificationsEnabled ? "On" : "Off"}</Toggle>
                 </Field>
-                <FieldDescription id="notification-description">Notify about confirmed phases and position exits from the active saved strategy. Drafts and search do not affect alerts.</FieldDescription>
+                <FieldDescription id="notification-description">Notify about confirmed Bullish Setup signals from the active saved strategy. Drafts and search do not affect alerts.</FieldDescription>
                 <FieldDescription role="status">{notificationDescription}</FieldDescription>
                 <div className="flex flex-wrap gap-2">
                   {notificationSettings.notificationAuthorization === "notDetermined" && <Button variant="outline" size="sm" disabled={notificationPending} onClick={() => void updateNotifications({ notificationAction: "requestPermission" })}>Allow notifications</Button>}
@@ -500,16 +498,16 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
       </header>
       <div className="flex items-center gap-4 border-b px-4 py-3">
         <Field orientation="horizontal" className="w-fit"><FieldLabel htmlFor="radar-strategy">Active strategy</FieldLabel><Select value={activeProfile?.id ?? 'none'} disabled={suite.pending || filterDraft !== null || editor.source !== null} onValueChange={chooseStrategy}><SelectTrigger id="radar-strategy" className="w-72" aria-label="Active Radar strategy"><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="none">No active strategy</SelectItem>{suite.snapshot.profiles.map(profile => <SelectItem key={profile.id} value={profile.id}>{profile.name} · r{profile.revision}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>
-        {activeProfile ? <><ToggleGroup type="single" variant="outline" value={phaseView} onValueChange={value => { if (value) setPhaseView(value) }} aria-label="Radar view"><ToggleGroupItem value="signals">Signals</ToggleGroupItem><ToggleGroupItem value="markets">All markets</ToggleGroupItem></ToggleGroup>{phaseView === 'signals' && <ToggleGroup type="single" variant="outline" value={signalTiming} onValueChange={value => { if (value) setSignalTiming(value as SignalTiming) }} aria-label="Signal timing"><ToggleGroupItem value="both">Both hours</ToggleGroupItem><ToggleGroupItem value="confirmed">Confirmed</ToggleGroupItem><ToggleGroupItem value="provisional">Provisional</ToggleGroupItem></ToggleGroup>}</> : <span className="text-xs text-muted-foreground">Choose a shared strategy to watch Bullish Setup and Bearish Reversal together.</span>}
+        {activeProfile ? <><ToggleGroup type="single" variant="outline" value={phaseView} onValueChange={value => { if (value) setPhaseView(value) }} aria-label="Radar view"><ToggleGroupItem value="signals">Signals</ToggleGroupItem><ToggleGroupItem value="markets">All markets</ToggleGroupItem></ToggleGroup>{phaseView === 'signals' && <ToggleGroup type="single" variant="outline" value={signalTiming} onValueChange={value => { if (value) setSignalTiming(value as SignalTiming) }} aria-label="Signal timing"><ToggleGroupItem value="both">Both hours</ToggleGroupItem><ToggleGroupItem value="confirmed">Confirmed</ToggleGroupItem><ToggleGroupItem value="provisional">Provisional</ToggleGroupItem></ToggleGroup>}</> : <span className="text-xs text-muted-foreground">Choose a shared strategy to watch Bullish Setup signals.</span>}
         <span className="ml-auto text-xs text-muted-foreground">Shared with Research{filterDraft !== null || editor.source !== null ? ' · Apply or discard Universe edits before changing strategy' : ''}</span>
       </div>
-      {suite.ready && !activeProfile && <Empty className="border-b"><EmptyHeader><EmptyTitle>Activate a strategy to monitor signals</EmptyTitle><EmptyDescription>All markets remain available below. Create a Strategy with Universe rules and four phases to enable signals, position decisions and confirmed alerts.</EmptyDescription></EmptyHeader><EmptyContent><Button variant="outline" onClick={() => onDecisions({ metrics, templates, functions })}>Strategy Library…</Button></EmptyContent></Empty>}
+      {suite.ready && !activeProfile && <Empty className="border-b"><EmptyHeader><EmptyTitle>Activate a strategy to monitor signals</EmptyTitle><EmptyDescription>All markets remain available below. Create a Strategy with Universe and Bullish Setup rules to enable signals and confirmed alerts.</EmptyDescription></EmptyHeader><EmptyContent><Button variant="outline" onClick={() => onDecisions({ metrics, templates, functions })}>Strategy Library…</Button></EmptyContent></Empty>}
       {suite.error && <p role="alert" className="px-4 text-destructive">{suite.error}</p>}
       {activeProfile && phaseView === 'markets' && <StrategyRules label="Universe rules" strategyID={activeProfile.id} filters={listFilters} draft={filterDraft} editor={editor} onEditorChange={setEditor} onDraftChange={setFilterDraft} onApply={saveUniverse} metrics={metrics.filter(metric => !compilation.allowedMetrics || compilation.allowedMetrics.includes(metric.key))} templates={templates} preferences={libraryPreferences} onPreferences={saveLibraryPreferences} rows={rows} results={results} previewJSON={previewJSON} revision={revision.current} onExplain={explainMarket} units={compilation.units ?? {}} expressions={editorExpressions} diagnostics={compilation.diagnostics} valid={valid} compiling={compiling} requiredHours={compilation.requiredHours ?? 0} matches={searchedRows.filter(row => results[row.instId] === 'true').length} total={searchedRows.length} unknown={unknownCount} previewPending={lastValidJSON !== previewJSON} history={history} />}
       {activeProfile && <SuitePhaseExplanation instrument={phaseExplainingID} profile={activeProfile} inputs={{metrics,templates,functions}} onClose={() => setPhaseExplainingID(null)} />}
       {activeProfile && <FilterExplanation strategyID={activeProfile.id} open={explanationOpen} onOpenChange={setExplanationOpen} instId={explainingId} onSelect={setExplainingId} rows={rows} results={results} filtersJSON={previewJSON} revision={revision.current} metrics={metrics} expressions={editorExpressions} units={compilation.units ?? {}} templates={templates} />}
       {error && <p role="alert" className="border-b px-4 py-2 text-sm text-destructive">{error}</p>}
-      {activeProfile && phaseView === 'signals' ? <RadarSignalBoard profile={activeProfile} signals={searchedSignals} positionReadings={suite.snapshot.confirmed ?? []} rows={rows} positions={suite.snapshot.positions} paused={suite.snapshot.paused} onChart={(instrument, order) => { setSignalChartOrder(order); setSelected(instrument) }} onExplain={explainRow} onPositions={() => onDecisions({ metrics, templates, functions }, 'positions')} onResearch={() => onResearch({ metrics, templates, functions }, suiteSpec([activeProfile]))} /> : <section aria-label="Perpetual swap markets" className="flex-1">
+      {activeProfile && phaseView === 'signals' ? <RadarSignalBoard profile={activeProfile} signals={searchedSignals} rows={rows} paused={suite.snapshot.paused} onChart={(instrument, order) => { setSignalChartOrder(order); setSelected(instrument) }} onExplain={explainRow} onResearch={() => onResearch({ metrics, templates, functions }, suiteSpec([activeProfile]))} /> : <section aria-label="Perpetual swap markets" className="flex-1">
         <Table className="table-auto" data-market-count={visible.length} aria-rowcount={visible.length + 1}>
           <TableHeader>
             <TableRow>
@@ -550,7 +548,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
           </TableHeader>
           {visible.length ? <MarketRows canExplain={Boolean(activeProfile)} confirmed={confirmedPhases} provisional={provisionalPhases} rows={visible} onSelect={setSelected} onExplain={explainRow} /> : <TableBody><TableRow><TableCell colSpan={8} className="py-12">
               <Empty>
-                <EmptyHeader><EmptyTitle>{rows.length ? "No matching contracts" : "Waiting for contracts"}</EmptyTitle><EmptyDescription>{rows.length ? "Adjust the search or inspect the active strategy rules. Explain markets includes unmatched and unknown contracts." : "OKX hourly data is loading. Activate a strategy to monitor its Universe and four phases."}</EmptyDescription></EmptyHeader>
+                <EmptyHeader><EmptyTitle>{rows.length ? "No matching contracts" : "Waiting for contracts"}</EmptyTitle><EmptyDescription>{rows.length ? "Adjust the search or inspect the active strategy rules. Explain markets includes unmatched and unknown contracts." : "OKX hourly data is loading. Activate a strategy to monitor its Universe and Bullish Setup."}</EmptyDescription></EmptyHeader>
                 <EmptyContent>
                   {filterDraft !== null && <Button variant="outline" size="sm" onClick={() => { setFilterDraft(null); setEditor(current => ({ ...current, source: null })) }}>Discard preview</Button>}
                   {activeProfile && listFilters.root.children.length > 0 && <Button variant="outline" size="sm" onClick={() => { void saveUniverse(emptyFilterConfig()).catch(cause => setError(cause instanceof Error ? cause.message : "Cannot clear Universe rules")) }}>Clear all rules</Button>}
@@ -570,7 +568,7 @@ function App() {
   const [inputs, setInputs] = useState<ResearchInputs | null>(null)
   const [workspaceError, setWorkspaceError] = useState("")
   const [decisionsMounted, setDecisionsMounted] = useState(false)
-  const [decisionsTab, setDecisionsTab] = useState<'rules' | 'signals' | 'positions'>('rules'), [decisionsRoute, setDecisionsRoute] = useState(0)
+  const [decisionsTab, setDecisionsTab] = useState<'rules' | 'signals'>('rules'), [decisionsRoute, setDecisionsRoute] = useState(0)
   const [researchMounted, setResearchMounted] = useState(false)
   const [switchingMode, setSwitchingMode] = useState(false), switching = useRef(false)
   const scrollPositions = useRef<Record<string, number>>({})

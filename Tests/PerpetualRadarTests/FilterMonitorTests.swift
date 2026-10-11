@@ -4,62 +4,6 @@ import XCTest
 
 final class FilterMonitorTests: BackgroundTestCase {
     @MainActor
-    func testLongNotificationsAggregateStrategiesAndPreserveDedupThroughUnknown() throws {
-        let strategy = LongStrategy(name: "First", entryJSON: try FilterCompiler.compile(source: "Close > 0").config.json, exitJSON: try FilterCompiler.compile(source: "Close < 0").config.json)
-        var other = strategy; other.id = "other"; other.name = "Second"
-        func row(_ symbol: String, _ strategy: LongStrategy, _ action: String, id: String? = nil) -> LongDecisionRow {
-            var position = LongTrackedPosition(strategyID: strategy.id, instrument: symbol, enteredAt: 1, entryPrice: 100, strategy: strategy)
-            position.id = id ?? symbol
-            return .init(instrument: symbol, hour: 1, entry: "unknown", exit: action == "Unknown" ? "unknown" : action == "Exit Long" ? "true" : "false", action: action, reason: "BTC crash", position: position)
-        }
-        let tracker = LongExitTracker()
-        let hits = [LongExitObservation(strategy: strategy, rows: [row("ETH",strategy,"Exit Long"), row("SOL",strategy,"Exit Long")]), LongExitObservation(strategy: other, rows: [row("ETH",other,"Exit Long")])]
-        let first = tracker.consume(hits)
-        XCTAssertEqual(first.count, 2); XCTAssertEqual(first[0].instruments, ["ETH", "SOL"])
-        XCTAssertTrue(tracker.consume(hits).isEmpty)
-        var revision = hits; revision[0].strategy.revision += 1
-        XCTAssertTrue(tracker.consume(revision).isEmpty, "Saving edits must not repeat a continuously satisfied exit notification.")
-        let unknown = [LongExitObservation(strategy: strategy, rows: [row("ETH",strategy,"Unknown"), row("SOL",strategy,"Unknown")]), hits[1]]
-        XCTAssertTrue(tracker.consume(unknown).isEmpty); XCTAssertTrue(tracker.consume(hits).isEmpty)
-        let clear = [LongExitObservation(strategy: strategy, rows: [row("ETH",strategy,"Hold Long"), row("SOL",strategy,"Exit Long")]), hits[1]]
-        XCTAssertTrue(tracker.consume(clear).isEmpty)
-        XCTAssertEqual(tracker.consume(hits).first?.instruments, ["ETH"])
-        let newPosition = [LongExitObservation(strategy: strategy, rows: [row("ETH",strategy,"Exit Long",id: "new-entry"), row("SOL",strategy,"Exit Long")]), hits[1]]
-        XCTAssertEqual(tracker.consume(newPosition).first?.instruments, ["ETH"])
-    }
-
-    @MainActor
-    func testRestartedMonitorRetainsLongNotificationMemoryUntilDefiniteRecovery() async throws {
-        let strategy = LongStrategy(name: "BTC pause", entryJSON: try FilterCompiler.compile(source: "Close > 0").config.json, exitJSON: try FilterCompiler.compile(source: #"BTC(ROC(1), "live") <= -2"#).config.json)
-        let position = LongTrackedPosition(strategyID: strategy.id, instrument: "ETH-USDT-SWAP", enteredAt: 1, entryPrice: 100, strategy: strategy)
-        let tracker = LongExitTracker()
-        var samples = 0, changes: [LongExitChange] = [], action = "Exit Long"
-        func monitor() -> FilterMonitor {
-            FilterMonitor(interval: .seconds(30), longTracker: tracker, sample: {
-                samples += 1
-                var observation = self.observation([:])
-                observation.longExits = [.init(strategy: strategy, rows: [.init(instrument: position.instrument, hour: 1, entry: "unknown", exit: action == "Unknown" ? "unknown" : action == "Exit Long" ? "true" : "false", action: action, reason: "BTC crash", position: position)])]
-                return observation
-            }, onChanges: { _ in }, onLongExits: { changes += $0 })
-        }
-        func wait(_ target: Int) async throws {
-            let deadline = Date().addingTimeInterval(2)
-            while samples < target, Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
-            try await Task.sleep(for: .milliseconds(10))
-            XCTAssertEqual(samples, target)
-        }
-        let first = monitor(); first.start(); try await wait(1); first.stop()
-        XCTAssertEqual(changes.count, 1)
-        let resumed = monitor(); defer { resumed.stop() }
-        action = "Unknown"; resumed.start(); try await wait(2)
-        action = "Exit Long"; resumed.wake(); try await wait(3)
-        XCTAssertEqual(changes.count, 1, "Pausing and resuming must not repeat a continuously triggered Long exit.")
-        action = "Hold Long"; resumed.wake(); try await wait(4)
-        action = "Exit Long"; resumed.wake(); try await wait(5)
-        XCTAssertEqual(changes.count, 2)
-    }
-
-    @MainActor
     func testBTCWakeEvaluatesImmediatelyWithoutWaitingForFallbackPoll() async throws {
         var samples = 0, changes: [FilterMembershipChange] = []
         let monitor = FilterMonitor(interval: .seconds(30), sample: {
@@ -145,16 +89,13 @@ final class FilterMonitorTests: BackgroundTestCase {
         let previousPreference = MonitorRuntime.defaults.object(forKey: AppUpdater.backgroundRelaunchKey)
         window.orderBack(nil)
         XCTAssertTrue(window.isVisible)
-        var samples = 0, changes: [FilterMembershipChange] = [], errors: [String] = [], longChanges: [LongExitChange] = []
-        let strategy = LongStrategy(name: "Closed-window BTC", entryJSON: try FilterCompiler.compile(source: "Close > 0").config.json, exitJSON: try FilterCompiler.compile(source: #"BTC(ROC(1), "live") <= -2"#).config.json)
-        let position = LongTrackedPosition(strategyID: strategy.id,instrument: "ETH-USDT-SWAP",enteredAt: 1,entryPrice: 100,strategy: strategy)
+        var samples = 0, changes: [FilterMembershipChange] = [], errors: [String] = []
         let monitor = FilterMonitor(interval: .milliseconds(10), sample: {
             samples += 1
             if samples == 2 { throw FilterError("Temporary collector failure") }
-            var observation = self.observation(["BTC": samples < 3 ? .no : .yes])
-            observation.longExits = [.init(strategy: strategy, rows: [.init(instrument: position.instrument,hour: 1,entry: "unknown",exit: samples < 3 ? "false" : "true",action: samples < 3 ? "Hold Long" : "Exit Long",reason: "BTC crash",position: position,btcExit: true)])]
+            let observation = self.observation(["BTC": samples < 3 ? .no : .yes])
             return observation
-        }, onChanges: { changes += $0 }, onLongExits: { longChanges += $0 }, onError: { errors.append($0) })
+        }, onChanges: { changes += $0 }, onError: { errors.append($0) })
         defer {
             monitor.stop(); window.delegate = nil; window.close()
             defaults.set(previousPreference, forKey: AppUpdater.backgroundRelaunchKey)
@@ -170,7 +111,6 @@ final class FilterMonitorTests: BackgroundTestCase {
         let deadline = Date().addingTimeInterval(3)
         while changes.isEmpty, Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertEqual(changes, [.init(instId: "BTC", direction: .entered)])
-        XCTAssertEqual(longChanges.count, 1); XCTAssertEqual(longChanges.first?.instruments, [position.instrument])
         XCTAssertTrue(errors.contains { $0.contains("Temporary collector failure") })
         XCTAssertEqual(errors.last, "")
         monitor.stop()

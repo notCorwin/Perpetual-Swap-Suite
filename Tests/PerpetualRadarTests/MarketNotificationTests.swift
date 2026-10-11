@@ -18,28 +18,6 @@ private final class NotificationTransportFixture: MarketNotificationTransport {
 
 final class MarketNotificationTests: XCTestCase {
     @MainActor
-    func testLongExitsAreAggregatedByStrategyAndCarryValidClickRouting() async throws {
-        let transport = NotificationTransportFixture(); transport.state = .authorized
-        var enabled = true
-        let service = MarketNotifications(transport: transport, enabled: { enabled })
-        let change = LongExitChange(strategyID: "strategy-123", strategyName: "BTC gate", instruments: ["ETH-USDT-SWAP", "SOL-USDT-SWAP"], reasons: ["BTC 1h crash"])
-        await service.sendLongExits([change])
-        let content = try XCTUnwrap(transport.requests.first?.content)
-        XCTAssertEqual(transport.requests.count, 1)
-        XCTAssertTrue(content.title.contains("2 tracked"))
-        XCTAssertEqual(content.subtitle, "BTC gate")
-        XCTAssertTrue(content.body.contains("ETH-USDT-SWAP")); XCTAssertTrue(content.body.contains("SOL-USDT-SWAP"))
-        XCTAssertEqual(content.userInfo["strategyID"] as? String, change.strategyID)
-        XCTAssertEqual(RadarNotificationRoute.longStrategy(in: URL(string: content.userInfo["route"] as! String)!), change.strategyID)
-        XCTAssertNil(RadarNotificationRoute.longStrategy(in: URL(string: "perpetualradar://long/a/b")!))
-        XCTAssertNil(RadarNotificationRoute.longStrategy(in: URL(string: "https://long/strategy-123")!))
-        XCTAssertNotNil(content.sound)
-        enabled = false; await service.sendLongExits([change])
-        XCTAssertEqual(transport.requests.count, 1)
-        enabled = true; transport.state = .denied; await service.sendLongExits([change])
-        XCTAssertEqual(transport.requests.count, 1); XCTAssertEqual(transport.permissionRequests, 0)
-    }
-    @MainActor
     func testPermissionIsRequestedOnlyWhenUndeterminedAndDeniedStateRemainsVisible() async {
         let transport = NotificationTransportFixture()
         let service = MarketNotifications(transport: transport, enabled: { true })

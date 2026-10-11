@@ -17,14 +17,10 @@ struct FilterMarketData: Sendable {
     var current: [String: FilterScalar] = [:]
     var previousEMA: Double?
     var historicalClose = false
-    var longEntryPrice: Double?
-    var longEnteredAt: Int64?
     var referenceBTC: FilterReferenceSnapshot?
     var evaluationTime: Int64?
     var cooldowns: FilterCooldownMemory?
     var recordCooldowns = true
-    var shortEntryPrice: Double?
-    var shortEnteredAt: Int64?
 }
 
 final class FilterEvaluator {
@@ -35,7 +31,7 @@ final class FilterEvaluator {
     private var sources: [String: [FilterReadingSource]] = [:]
     private let referenceOnly: Bool
     init(market: FilterMarketData, filter: CompiledFilter, sharedReadings: [String: FilterScalar] = [:], referenceOnly: Bool = false) { self.market = market; self.filter = filter; cache = sharedReadings; self.referenceOnly = referenceOnly }
-    var sharedReadings: [String: FilterScalar] { cache.filter { ($0.key.hasPrefix("metric|") || $0.key.hasPrefix("indicator|")) && !$0.key.contains("LongEntryPrice") && !$0.key.contains("LongReturn") && !$0.key.contains("LongHeldHours") && !$0.key.contains("ShortEntryPrice") && !$0.key.contains("ShortReturn") && !$0.key.contains("ShortHeldHours") } }
+    var sharedReadings: [String: FilterScalar] { cache.filter { $0.key.hasPrefix("metric|") || $0.key.hasPrefix("indicator|") } }
     func evaluate(explain: Bool = false) -> FilterTrace {
         let root = filter.config.root
         // BTC cooldowns describe the shared market context. Observe them even
@@ -88,18 +84,6 @@ final class FilterEvaluator {
         func fn(_ name: String, _ args: [Double]) -> FilterScalar { indicator(name.lowercased(), args, at: hour) }
         let b = bar(hour)
         switch key {
-        case "LongEntryPrice", "LongReturn", "LongHeldHours":
-            guard let price = market.longEntryPrice, price > 0, let entered = market.longEnteredAt,
-                  hour >= entered / hourMS * hourMS, min(hour+hourMS, market.now) >= entered else { return unknown("No Long was open at this reading", at: hour) }
-            if key == "LongEntryPrice" { return number(price) }
-            if key == "LongHeldHours" { return number(Double(min(hour+hourMS,market.now)-entered)/Double(hourMS)) }
-            return number(b.map { ($0.close/price-1)*100 }, "The Long return requires this hour's price.")
-        case "ShortEntryPrice", "ShortReturn", "ShortHeldHours":
-            guard let price = market.shortEntryPrice, price > 0, let entered = market.shortEnteredAt,
-                  hour >= entered / hourMS * hourMS, min(hour+hourMS, market.now) >= entered else { return unknown("No Short was open at this reading", at: hour) }
-            if key == "ShortEntryPrice" { return number(price) }
-            if key == "ShortHeldHours" { return number(Double(min(hour+hourMS,market.now)-entered)/Double(hourMS)) }
-            return number(b.map { (price-$0.close)/abs(price)*100 }, "The Short return requires this hour's price.")
         case "Symbol": return .text(market.id)
         case "ListingAgeMonths":
             guard let listedAt = market.listedAt, listedAt > 0 else { return unknown("Listing date is unavailable", at: hour) }

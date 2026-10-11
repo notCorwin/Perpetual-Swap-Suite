@@ -1,4 +1,4 @@
-import type { StrategyProfile, SuiteExecution, SuiteCapital, SuiteStudyReport, SuiteTrade, SuiteCurvePoint } from '@/suite-types'
+import type { StrategyProfile } from '@/suite-types'
 import type { ChartResponse } from '@/MarketChart'
 import type { FilterMetric } from '@/rule-engine'
 import type { ExpressionTemplate } from '@/filter-expression'
@@ -8,9 +8,9 @@ export const RESEARCH_HOUR = 3_600_000
 export type ResearchInputs = { metrics: FilterMetric[]; templates: ExpressionTemplate[]; functions?: string[] }
 export type StudyRule = { name: string; filtersJSON: string }
 export type StudySpec = {
-  name: string; kind: 'filter' | 'score' | 'comparison' | 'long' | 'cycle'; rules: StudyRule[]; instruments: string[]
-  from: number | null; through: number; direction: 'auto' | 'Long' | 'Short'; sampling: 'entries' | 'hourly'
-  strategySnapshots?: StrategyProfile[]; strategyPhase?: 'universe' | 'bullishSetup' | 'bearishReversal'; execution?: SuiteExecution; capital?: SuiteCapital
+  name: string; kind: 'filter' | 'score' | 'comparison'; rules: StudyRule[]; instruments: string[]
+  from: number | null; through: number; direction: 'Long'; sampling: 'entries' | 'hourly'
+  strategySnapshots?: StrategyProfile[]
   costs: { entryFeeBps: number; exitFeeBps: number; slippageBps: number } | null
 }
 export type ResearchInstrument = { id: string; listedAt?: number; delistedAt?: number; verified: boolean; contractValue?: number; source: string; observedAt: number }
@@ -25,12 +25,12 @@ export type ResearchSummary = {
   mean?: number; median?: number; winRate?: number; netMean?: number; netMedian?: number; netWinRate?: number
   mfe?: number; mae?: number; baseline?: number; excess?: number; intervalLow?: number; intervalHigh?: number; netIntervalLow?: number; netIntervalHigh?: number
 }
-export type StudyReport = { studyID: string; manifestID: string; spec: StudySpec; summaries: ResearchSummary[]; evaluated: number; unknown: number; directionless: number; commonPool: number; uncertain: number; baseline: number; warnings: string[]; completedAt: number; long?: LongStudyReport; suite?: SuiteStudyReport }
+export type StudyReport = { studyID: string; manifestID: string; spec: StudySpec; summaries: ResearchSummary[]; evaluated: number; unknown: number; directionless: number; commonPool: number; uncertain: number; baseline: number; warnings: string[]; completedAt: number }
 export type ResearchCoverage = { instrument: string; kind: string; available: number; expected: number; first?: number; last?: number; gaps: { from: number; through: number }[] }
 export type DataManifest = { id: string; digest: string; from: number; through: number; parser: string; engine: string; sourceRevision: string; instruments: ResearchInstrument[]; referenceInstruments?: ResearchInstrument[]; unknownInstruments: string[]; warnings: string[]; coverage: ResearchCoverage[]; sources: ResearchSource[] }
 export type ResearchChartData = ChartResponse & { endHour: number; oldestHour?: number; latestHour?: number; signalHour: number; manifestID: string }
 export type ResearchRequest = { action: string; spec?: StudySpec; refresh?: boolean; planID?: string; studyID?: string; eventID?: string; offset?: number; endHour?: number; kind?: string; profileID?: string; instrument?: string; model?: string }
-export type ResearchResponse = { jobID?: string; job?: ResearchJob | null; studies?: ResearchStudy[]; plan?: DataPlan; estimatedBytes?: number; study?: ResearchStudy; report?: StudyReport | null; manifest?: DataManifest | null; events?: ResearchEvent[]; count?: number; trades?: ResearchLongTrade[]; suiteTrades?: SuiteTrade[]; curve?: SuiteCurvePoint[]; chart?: ResearchChartData; cacheDirectory?: string; cachedRows?: number; rawFiles?: number; bytesRemoved?: number; ok?: boolean; cancelled?: boolean }
+export type ResearchResponse = { jobID?: string; job?: ResearchJob | null; studies?: ResearchStudy[]; plan?: DataPlan; estimatedBytes?: number; study?: ResearchStudy; report?: StudyReport | null; manifest?: DataManifest | null; events?: ResearchEvent[]; count?: number; chart?: ResearchChartData; cacheDirectory?: string; cachedRows?: number; rawFiles?: number; bytesRemoved?: number; ok?: boolean; cancelled?: boolean }
 export const requestResearch = (request: ResearchRequest) => window.webkit.messageHandlers.radar.postMessage({ research: request })
 export const researchPercent = (value: number | null | undefined) => value == null ? '—' : new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 3 }).format(value)
 export const researchTime = (timestamp: number) => new Date(timestamp).toLocaleString('en-US', { year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC', timeZoneName: 'short' })
@@ -43,6 +43,3 @@ export function researchDateRange(from: string, through: string, now = Date.now(
   if (start !== null && start >= last) throw new Error('The start date must precede the last completed hour.')
   return { from: start, through: last }
 }
-
-export type ResearchLongTrade = { id: string; studyID: string; instrument: string; entryTime: number; entryPrice?: number; exitTime?: number; exitPrice?: number; status: string; uncertain: boolean; unknownHours: number; crossesSplit: boolean; entryEvent: ResearchEvent; exitEvent?: ResearchEvent; outcome: ResearchOutcome }
-export type LongStudyReport = { closed: number; open: number; incomplete: number; uncertain: number; grossProfit?: number; netProfit?: number; profitFactor?: number; averageHours?: number }

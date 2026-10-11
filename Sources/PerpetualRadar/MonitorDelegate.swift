@@ -11,7 +11,6 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     private var radar: Radar? { collector.value }
     private var monitor: FilterMonitor?
-    private let longExitTracker = LongExitTracker()
     private var notifications: MarketNotifications?
     private var activity: NSObjectProtocol?
     private var statusItem: NSStatusItem?
@@ -66,7 +65,7 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             center.delegate = service; notifications = service
         }
         notifications?.onOpen = { [weak self] id in self?.openInterface(instId: id) }
-        notifications?.onOpenLong = { [weak self] id in self?.openInterface(instId: nil, strategyID: id) }
+        notifications?.onOpenStrategy = { [weak self] id in self?.openInterface(instId: nil, strategyID: id) }
         notifications?.onStateChanged = { [weak self] in self?.renderMenu() }
         Task { await notifications?.refresh() }
         Task {
@@ -150,11 +149,11 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let radar, monitor == nil, collectionAllowed else { return }
         if fixture == nil { radar.start() }
         activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep, reason: "Monitor OKX contracts and deliver strategy notifications after the interface quits")
-        monitor = FilterMonitor(interval: fixture == nil ? .seconds(2) : .milliseconds(100), longTracker: longExitTracker, sample: { [weak self] in
+        monitor = FilterMonitor(interval: fixture == nil ? .seconds(2) : .milliseconds(100), sample: { [weak self] in
             guard let self, let radar = self.radar else { return nil }
             if let fixture { return try await fixture.observe(profile: radar.monitoringStrategy()) }
             return try await radar.observeSavedStrategy()
-        }, onChanges: { [weak self] changes in await self?.notifications?.send(changes) }, onLongExits: { [weak self] changes in await self?.notifications?.sendLongExits(changes) }, onError: { [weak self] error in self?.monitoringError = error; self?.renderMenu() })
+        }, onChanges: { [weak self] changes in await self?.notifications?.send(changes) }, onError: { [weak self] error in self?.monitoringError = error; self?.renderMenu() })
         radar.onBTCUpdate = { [weak self] in self?.monitor?.wake() }
         monitor?.start()
     }
@@ -304,7 +303,6 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // A request can be the first successful open after a startup failure.
         if recovering { reconcileMonitoring() }
         if let request = parameters["suite"] as? [String: Any] { return decorated(try await radar.suiteRequest(request)) }
-        if let request = parameters["longDecision"] as? [String: Any] { return decorated(try await radar.longDecisionRequest(request)) }
         if let requested = parameters["monitoringPaused"] {
             guard let paused = requested as? Bool else { throw FilterError("Invalid monitoring setting.") }
             try setPaused(paused)
@@ -482,7 +480,7 @@ private final class MonitorFixture: MarketNotificationTransport {
             return (timestamp, Candle(hour: timestamp, high: price, low: price, close: price, quoteVolume: 100, baseVolume: 1, open: price, confirmed: age > 0))
         })
         let market = FilterMarketData(id: "BTC-USDT-SWAP", hour: hour, now: hour + hourMS / 2, listedAt: 1, candles: bars, stats: [:], quotes: [:])
-        let readings = try await worker.evaluate([market], profile: profile, positions: [], forming: false, available: true)
+        let readings = try await worker.evaluate([market], profile: profile, forming: false, available: true)
         return try strategyObservation(profile: profile, readings: readings)
     }
 }
