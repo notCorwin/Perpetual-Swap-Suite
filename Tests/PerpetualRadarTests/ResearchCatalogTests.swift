@@ -35,7 +35,7 @@ private actor ResearchCatalogTransport: ResearchTransport {
         return try JSONSerialization.data(withJSONObject: ["code": "0", "data": rows])
     }
 
-    func download(_ url: URL, to destination: URL) async throws { throw FilterError("Planning must not download archives.") }
+    func download(_ url: URL, to destination: URL, progress: @escaping @Sendable (ResearchDownloadProgress) async -> Void) async throws { throw FilterError("Planning must not download archives.") }
     func urls() -> [URL] { requests }
 }
 

@@ -3,29 +3,31 @@ import CryptoKit
 
 protocol ResearchTransport: Sendable {
     func get(_ url: URL) async throws -> Data
-    func download(_ url: URL, to destination: URL) async throws
+    func download(_ url: URL, to destination: URL, progress: @escaping @Sendable (ResearchDownloadProgress) async -> Void) async throws
 }
 
 actor OKXResearchTransport: ResearchTransport {
     private let session: URLSession
     private var lastRequest = ContinuousClock.now - .seconds(1)
-    init() {
+    init(session: URLSession? = nil) {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpMaximumConnectionsPerHost = 2
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.timeoutIntervalForRequest = 60
         configuration.timeoutIntervalForResource = 24 * 60 * 60
-        session = URLSession(configuration: configuration)
+        self.session = session ?? URLSession(configuration: configuration)
     }
     func get(_ url: URL) async throws -> Data {
         let wait = lastRequest + .milliseconds(420) - ContinuousClock.now
         if wait > .zero { try await Task.sleep(for: wait) }
         lastRequest = .now
         let (data, response) = try await session.data(from: url)
-        guard let response = response as? HTTPURLResponse, response.statusCode == 200, data.count < 16 * 1024 * 1024 else { throw FilterError("OKX history request failed: \(url.path).") }
+        guard let response = response as? HTTPURLResponse else { throw FilterError("OKX returned an invalid history response: \(url.path).") }
+        guard response.statusCode == 200 else { throw FilterError("OKX history request failed (HTTP \(response.statusCode)): \(url.path).") }
+        guard data.count < 16 * 1024 * 1024 else { throw FilterError("OKX history response exceeds the 16 MB page limit: \(url.path).") }
         return data
     }
-    func download(_ url: URL, to destination: URL) async throws {
+    func download(_ url: URL, to destination: URL, progress: @escaping @Sendable (ResearchDownloadProgress) async -> Void) async throws {
         let part = destination.appendingPathExtension("part"), validatorURL = part.appendingPathExtension("validator")
         let existing = (try? part.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
         let validator = try? String(contentsOf: validatorURL, encoding: .utf8)
@@ -40,12 +42,17 @@ actor OKXResearchTransport: ResearchTransport {
             // Cancellation after the final buffer can leave a complete .part.
             // The importer still verifies the full file's hash and archive CRC.
             try FileManager.default.moveItem(at: part, to: destination)
+            await progress(.init(receivedBytes: existing, totalBytes: existing, bytesPerSecond: nil))
             try? FileManager.default.removeItem(at: validatorURL); return
         }
-        guard [200, 206].contains(response.statusCode) else { throw FilterError("Archive download failed; completed files remain cached.") }
+        guard [200, 206].contains(response.statusCode) else { throw FilterError("Archive download failed (HTTP \(response.statusCode)); completed files remain cached.") }
         let resumed = response.statusCode == 206
+        let declaredLength = response.value(forHTTPHeaderField: "Content-Length").flatMap(Int64.init)
+        var total = declaredLength ?? (response.expectedContentLength > 0 ? response.expectedContentLength : nil)
         if resumed {
-            guard existing > 0, response.value(forHTTPHeaderField: "Content-Range")?.hasPrefix("bytes \(existing)-") == true else { throw FilterError("Invalid archive continuation response.") }
+            guard existing > 0, let range = response.value(forHTTPHeaderField: "Content-Range")?.firstMatch(of: /^bytes ([0-9]+)-([0-9]+)\/([0-9]+|\*)$/),
+                  Int64(range.1) == existing, let end = Int64(range.2), end >= existing else { throw FilterError("Invalid archive continuation response.") }
+            total = Int64(range.3) ?? declaredLength.map { $0 + existing }
         } else {
             FileManager.default.createFile(atPath: part.path, contents: nil)
             let handle = try FileHandle(forWritingTo: part); try handle.truncate(atOffset: 0); try handle.close()
@@ -57,11 +64,21 @@ actor OKXResearchTransport: ResearchTransport {
         }
         let handle = try FileHandle(forWritingTo: part); defer { try? handle.close() }
         if resumed { try handle.seekToEnd() }
+        let offset = resumed ? existing : 0
+        let started = ContinuousClock.now
+        var lastProgress = started, received = offset
+        await progress(.init(receivedBytes: received, totalBytes: total, bytesPerSecond: nil))
         var buffer = Data(); buffer.reserveCapacity(64 * 1024)
         do {
             for try await byte in bytes {
                 buffer.append(byte)
+                received += 1
                 if buffer.count >= 64 * 1024 { try handle.write(contentsOf: buffer); buffer.removeAll(keepingCapacity: true); try ResearchPressure.shared.check() }
+                if received % 1024 == 0, lastProgress.duration(to: .now) >= .milliseconds(250) {
+                    let elapsed = researchSeconds(started.duration(to: .now))
+                    await progress(.init(receivedBytes: received, totalBytes: total, bytesPerSecond: Double(received - offset) / max(elapsed, 0.001)))
+                    lastProgress = .now
+                }
             }
             if !buffer.isEmpty { try handle.write(contentsOf: buffer) }
             try handle.synchronize()
@@ -69,12 +86,14 @@ actor OKXResearchTransport: ResearchTransport {
             if !buffer.isEmpty { try? handle.write(contentsOf: buffer) }
             throw error
         }
-        if response.expectedContentLength >= 0 {
-            let actual = try part.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-            guard Int64(actual) == response.expectedContentLength + (resumed ? existing : 0) else { throw FilterError("The archive download ended before its declared length. Resume to finish the partial file.") }
+        if let total {
+            // Read the live file length; URL resource values can retain the pre-resume size.
+            let actual = try handle.seekToEnd()
+            guard total >= 0, actual == UInt64(total) else { throw FilterError("Archive size check failed: received \(actual) of \(total) bytes. Resume to finish the partial file.") }
         }
         if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
         try FileManager.default.moveItem(at: part, to: destination)
+        await progress(.init(receivedBytes: received, totalBytes: total ?? received, bytesPerSecond: Double(received - offset) / max(researchSeconds(started.duration(to: .now)), 0.001)))
         try? FileManager.default.removeItem(at: validatorURL)
     }
 }
@@ -335,18 +354,30 @@ final class ResearchDataProvider {
         while let data = try handle.read(upToCount: 1024 * 1024), !data.isEmpty { try Task.checkCancellation(); hash.update(data: data) }
         return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
-    func prepare(_ source: ResearchSource, instruments: [ResearchInstrument]) async throws {
+    func prepare(_ source: ResearchSource, instruments: [ResearchInstrument], progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void = { _ in }) async throws {
         var source = source
         let file = store.rawURL(source)
+        let filename = source.filename, instrument = source.instrument
+        await progress(.init(stage: "checking", filename: filename, instrument: instrument))
         if !(try store.rawIsComplete(source)) {
-            if source.archive { try await transport.download(URL(string: source.url)!, to: file) }
-            else { try await fetchREST(source, file: file) }
+            if source.archive {
+                await progress(.init(stage: "connecting", filename: filename, instrument: instrument, totalBytes: source.sizeBytes))
+                try await transport.download(URL(string: source.url)!, to: file) { transfer in
+                    let rate = transfer.bytesPerSecond.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+                    let remaining = transfer.totalBytes.flatMap { total in rate.map { Double(max(0, total - transfer.receivedBytes)) / $0 } }
+                    await progress(.init(stage: "downloading", filename: filename, instrument: instrument, receivedBytes: transfer.receivedBytes, totalBytes: transfer.totalBytes, bytesPerSecond: rate, fileRemainingSeconds: remaining))
+                }
+            }
+            else { try await fetchREST(source, file: file, progress: progress) }
+            await progress(.init(stage: "verifying", filename: filename, instrument: instrument))
             source.rawHash = try hashFile(file)
             try store.put(source.id, kind: "source", source)
         } else if let saved = try store.get(source.id, as: ResearchSource.self) {
+            await progress(.init(stage: "verifying", filename: filename, instrument: instrument))
             guard try hashFile(file) == saved.rawHash else { throw FilterError("A cached archive failed its SHA-256 check. Refresh the data plan to replace it.") }
             source.rawHash = saved.rawHash
         }
+        await progress(.init(stage: "importing", filename: filename, instrument: instrument))
         if source.archive {
             let importer = ResearchArchiveImporter(store: store, source: source, instruments: instruments)
             let encountered = try importer.run(file: file)
@@ -359,12 +390,14 @@ final class ResearchDataProvider {
         source.parser = ResearchVersion.parser; try store.put(source.id, kind: "source", source)
         try store.cover(source)
     }
-    private func fetchREST(_ source: ResearchSource, file: URL) async throws {
+    private func fetchREST(_ source: ResearchSource, file: URL, progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void) async throws {
         // Each fetched page is fixed immediately. A restart reuses all completed
         // pages rather than refetching a partially prepared multi-year range.
         var cursor = source.through + hourMS, pages: [ResearchRawPage] = []
+        var received: Int64 = 0
         while cursor > source.from {
             try Task.checkCancellation()
+            await progress(.init(stage: "fetching", filename: source.filename, instrument: source.instrument, receivedBytes: received, pages: pages.count, fraction: min(1, Double(source.through + hourMS - cursor) / Double(max(hourMS, source.through + hourMS - source.from)))))
             var components = URLComponents(string: source.url)!
             let key = ["oi", "taker"].contains(source.kind) ? "end" : "after"
             components.queryItems = components.queryItems?.map { $0.name == key ? URLQueryItem(name: key, value: String(cursor)) : $0 }
@@ -375,6 +408,7 @@ final class ResearchDataProvider {
             else { data = try await transport.get(url); _ = try rows(data); try data.write(to: page, options: .atomic) }
             let record = ResearchRawPage(path: page.path, digest: researchHash(data), sourceID: source.id)
             pages.append(record)
+            received += Int64(data.count)
             try store.put("raw-page:\(source.id):\(researchHash(pageID))", kind: "rawPage", record)
             let values = try rows(data)
             let timestamps = values.compactMap { row -> Int64? in
@@ -385,6 +419,7 @@ final class ResearchDataProvider {
             cursor = oldest
             if oldest <= source.from { break }
         }
+        await progress(.init(stage: "fetching", filename: source.filename, instrument: source.instrument, receivedBytes: received, pages: pages.count, fraction: 1))
         // The compact file is an index of permanently cached raw response pages.
         try researchJSON(pages).write(to: file, atomically: true, encoding: .utf8)
     }

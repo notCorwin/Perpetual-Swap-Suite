@@ -1,13 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowRight, Database, Download, Pause, Play, Trash2, X } from 'lucide-react'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { ArrowRight, Database, Download, Play, Trash2 } from 'lucide-react'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
 import { Field, FieldDescription, FieldGroup, FieldLabel, FieldLegend, FieldSet } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
-import { Progress } from '@/components/ui/progress'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Spinner } from '@/components/ui/spinner'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
@@ -21,6 +20,7 @@ import { ModeTitle } from '@/ModeTitle'
 import { useSuite } from '@/use-suite'
 import { sameStrategyVersion, suiteSpec, type StrategyProfile } from '@/suite-types'
 import { ResearchChart } from '@/ResearchChart'
+import { ResearchTask } from '@/ResearchTask'
 import { parseFilterConfig, type FilterTrace } from '@/rule-engine'
 import { keepSnapshotValue } from '@/market-snapshot'
 import { requestResearch, researchDateRange, researchPercent, researchSize, researchTime, RESEARCH_HORIZONS, type DataManifest, type DataPlan, type ResearchEvent, type ResearchInputs, type ResearchJob, type ResearchResponse, type ResearchStudy, type ResearchSummary, type StudyReport, type StudySpec } from '@/research-types'
@@ -195,23 +195,19 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
     await researchSuite.perform({ action: 'select', profileID: profile.id }); onRadar()
     return {}
   })
-  if (libraryOpen) return <SuiteWorkspace mode="research" active={active} inputs={inputs} switchingMode={switchingMode} onSwitchMode={onSwitchMode} onBack={() => setLibraryOpen(false)} onResearch={chooseStrategySpec} />
-  return <MarketListViewport><main className="flex min-h-[inherit] flex-col gap-4 p-4 tabular-nums" data-research>
+  const taskError = Array.from(new Set([job?.error, error, pollError, researchSuite.error].filter(Boolean))).join('\n')
+  const taskStatus = <ResearchTask active={active} job={job} error={taskError} pending={pending}
+    onPause={() => void perform(() => requestResearch({ action: 'pause' }))} onCancel={() => void perform(() => requestResearch({ action: 'cancel' }))}
+    onResume={() => void perform(() => requestResearch({ action: 'resume', studyID: job?.resultID }))} />
+  if (libraryOpen) return <><SuiteWorkspace mode="research" active={active} inputs={inputs} switchingMode={switchingMode} onSwitchMode={onSwitchMode} onBack={() => setLibraryOpen(false)} onResearch={chooseStrategySpec} /><div className="h-64" />{taskStatus}</>
+  return <><MarketListViewport><main className="flex min-h-[inherit] flex-col gap-4 p-4 pb-64 tabular-nums" data-research>
     <header className="flex items-center gap-3 border-b pb-3">
       <ModeTitle mode="research" pending={switchingMode} onSwitch={onSwitchMode} />
       <span className="flex-1 text-xs text-muted-foreground">OKX · Hourly close · Fixed local data</span>
       <Button variant="outline" disabled={!radarSpec || researchSuite.pending || pending} onClick={() => void activateVersionInRadar()}>Use this version in Radar</Button>
       <Badge variant="outline"><Database data-icon="inline-start" aria-hidden="true" />{integer(cache.rows)} cached rows</Badge>
     </header>
-    {(error || pollError || job?.error || researchSuite.error) && <Alert variant="destructive"><AlertTitle>Research needs attention</AlertTitle><AlertDescription>{error || pollError || job?.error || researchSuite.error}</AlertDescription></Alert>}
     {notice && <p role="status" className="text-sm text-muted-foreground">{notice}</p>}
-    {job && <section data-surface="panel" className="flex flex-col gap-2 rounded-lg border bg-card p-3" aria-label="Research task">
-      <div className="flex items-center gap-3"><Badge variant="secondary">{job.phase}</Badge><span className="min-w-0 flex-1 truncate text-sm" role="status">{job.message || 'Cached files and checkpoints are retained.'}</span>
-        {busy && <><Button variant="outline" size="sm" disabled={pending} onClick={() => void perform(() => requestResearch({ action: 'pause' }))}><Pause data-icon="inline-start" aria-hidden="true" />Pause</Button><Button variant="ghost" size="sm" disabled={pending} onClick={() => void perform(() => requestResearch({ action: 'cancel' }))}><X data-icon="inline-start" aria-hidden="true" />Cancel</Button></>}
-      </div>
-      {['planning', 'preparing', 'running'].includes(job.phase) && <Progress aria-label="Research task progress" value={job.total ? job.completed / job.total * 100 : undefined} />}
-      <p className="text-xs text-muted-foreground">{job.total ? integer(job.completed) + ' / ' + integer(job.total) + ' work items · ' : ''}Pause or quit to save a checkpoint. Completed data stays on disk.</p>
-    </section>}
     <Tabs value={tab} onValueChange={setTab}>
       <TabsList variant="line"><TabsTrigger value="configure">Configure</TabsTrigger><TabsTrigger value="data">Data coverage</TabsTrigger><TabsTrigger value="results">Results</TabsTrigger><TabsTrigger value="scores">Score calibration</TabsTrigger><TabsTrigger value="history">Studies & cache</TabsTrigger></TabsList>
       <TabsContent value="configure">
@@ -286,7 +282,7 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
       <TabsContent value="history" className="flex flex-col gap-4">
         <div className="flex items-center gap-3"><h2 className="flex-1 font-semibold">Saved experiments</h2><Button variant="outline" disabled={busy} onClick={() => void perform(() => requestResearch({ action: 'importCatalog' }))}>Import verified instrument catalog…</Button><Button variant="outline" disabled={busy} onClick={() => setConfirm({ action: 'cleanCache' })}><Trash2 data-icon="inline-start" aria-hidden="true" />Clear unreferenced cache…</Button></div>
         <p className="text-xs text-muted-foreground">{integer(cache.files)} raw sources · {integer(cache.rows)} cached rows · {cache.directory}</p>
-        <Table aria-label="Saved studies"><TableHeader><TableRow>{['Study', 'Created', 'State', 'Actions'].map(label => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader><TableBody>{studies.map(saved => <TableRow key={saved.id}><TableCell><div className="font-medium">{saved.spec.name}</div><div className="text-xs text-muted-foreground">{saved.spec.kind} · {saved.spec.rules.map(r => r.name).join(' / ')}</div></TableCell><TableCell>{researchTime(saved.createdAt)}</TableCell><TableCell><Badge variant="outline">{saved.phase}</Badge></TableCell><TableCell><div className="flex gap-2"><Button variant="ghost" size="sm" onClick={() => void perform(async () => { await selectStudy(saved.id); setTab(saved.phase === 'completed' ? 'results' : 'data') })}>Open</Button>{!['completed', 'cancelled'].includes(saved.phase) && <Button variant="outline" size="sm" disabled={busy} onClick={() => void perform(() => requestResearch({ action: 'resume', studyID: saved.id }))}>Resume</Button>}<Button variant="ghost" size="sm" disabled={busy} onClick={() => duplicate(saved)}>Copy configuration</Button><Button variant="ghost" size="sm" disabled={busy} onClick={() => setConfirm({ action: 'delete', studyID: saved.id })} aria-label={'Delete ' + saved.spec.name}><Trash2 data-icon="inline-start" aria-hidden="true" /></Button></div></TableCell></TableRow>)}</TableBody></Table>
+        <Table aria-label="Saved studies"><TableHeader><TableRow>{['Study', 'Created', 'State', 'Actions'].map(label => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader><TableBody>{studies.map(saved => <TableRow key={saved.id}><TableCell><div className="font-medium">{saved.spec.name}</div><div className="text-xs text-muted-foreground">{saved.spec.kind} · {saved.spec.rules.map(r => r.name).join(' / ')}</div></TableCell><TableCell>{researchTime(saved.createdAt)}</TableCell><TableCell><Badge variant="outline">{saved.phase}</Badge>{saved.error && <p className="mt-1 max-w-80 wrap-anywhere text-xs text-destructive">{saved.error}</p>}</TableCell><TableCell><div className="flex gap-2"><Button variant="ghost" size="sm" onClick={() => void perform(async () => { await selectStudy(saved.id); setTab(saved.phase === 'completed' ? 'results' : 'data') })}>Open</Button>{!['completed', 'cancelled'].includes(saved.phase) && <Button variant="outline" size="sm" disabled={busy} onClick={() => void perform(() => requestResearch({ action: 'resume', studyID: saved.id }))}>Resume</Button>}<Button variant="ghost" size="sm" disabled={busy} onClick={() => duplicate(saved)}>Copy configuration</Button><Button variant="ghost" size="sm" disabled={busy} onClick={() => setConfirm({ action: 'delete', studyID: saved.id })} aria-label={'Delete ' + saved.spec.name}><Trash2 data-icon="inline-start" aria-hidden="true" /></Button></div></TableCell></TableRow>)}</TableBody></Table>
         {!studies.length && <Empty><EmptyHeader><EmptyTitle>No saved studies yet</EmptyTitle><EmptyDescription>Prepared datasets, checkpoints and completed experiments will appear here.</EmptyDescription></EmptyHeader></Empty>}
       </TabsContent>
     </Tabs>
@@ -305,5 +301,5 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
         <details><summary>Input provenance</summary><p className="my-2 break-all text-xs text-muted-foreground">Dataset {report.manifestID}</p><Table aria-label="Event input provenance"><TableHeader><TableRow><TableHead>Input / source</TableHead><TableHead>Range</TableHead><TableHead>SHA-256</TableHead></TableRow></TableHeader><TableBody>{manifest?.sources.filter(source => event.sources.includes(source.id)).map(source => <TableRow key={source.id}><TableCell><div>{source.kind} · {source.kind === 'metadata' ? 'Verified instrument catalog' : source.module === 3 ? 'Recorded funding archive' : source.archive ? 'Archive reconstruction' : source.kind === 'local' ? 'Recorded Radar inputs' : 'Public REST'}</div><div className="break-all text-xs text-muted-foreground">{source.url}</div></TableCell><TableCell>{researchTime(source.from)} → {researchTime(source.through)}</TableCell><TableCell className="max-w-56 break-all text-xs">{source.rawHash ?? '—'}</TableCell></TableRow>)}</TableBody></Table></details>
       </div>}
     </DialogContent></Dialog>
-  </main></MarketListViewport>
+  </main></MarketListViewport>{taskStatus}</>
 }

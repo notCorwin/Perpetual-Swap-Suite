@@ -8,7 +8,13 @@
     100% { opacity: 0; }
 }
 
+@keyframes progress-indeterminate {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(300%); }
+}
+
 @theme inline {
+    --animate-progress-indeterminate: progress-indeterminate 1.5s ease-in-out infinite;
     --font-heading: var(--font-sans);
     --font-sans: system-ui, sans-serif;
     --color-sidebar-ring: var(--sidebar-ring);

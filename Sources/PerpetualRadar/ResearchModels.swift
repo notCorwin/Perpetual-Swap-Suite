@@ -18,6 +18,7 @@ func researchJSON<T: Encodable>(_ value: T) throws -> String {
 func researchHash(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
 func researchHash(_ value: String) -> String { researchHash(Data(value.utf8)) }
 func researchNow() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
+func researchSeconds(_ duration: Duration) -> Double { Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18 }
 
 struct StudyRule: Codable, Sendable {
     var name: String
@@ -152,6 +153,7 @@ struct Checkpoint: Codable, Sendable {
     var phase: String
     var completedSources: [String] = []
     var refresh = false
+    var error: String?
     var instrumentIndex = 0
     var nextHour: Int64?
     var episodes: [String: ResearchEpisode] = [:]
@@ -279,6 +281,28 @@ struct ResearchJobStatus: Codable, Sendable {
     var message = ""
     var error = ""
     var resultID: String?
+    var startedAt = researchNow()
+    var updatedAt = researchNow()
+    var preparation: ResearchPreparationProgress?
+}
+
+struct ResearchDownloadProgress: Sendable {
+    var receivedBytes: Int64
+    var totalBytes: Int64?
+    var bytesPerSecond: Double?
+}
+
+struct ResearchPreparationProgress: Codable, Sendable {
+    var stage: String
+    var filename: String
+    var instrument: String
+    var receivedBytes: Int64 = 0
+    var totalBytes: Int64?
+    var bytesPerSecond: Double?
+    var fileRemainingSeconds: Double?
+    var remainingSeconds: Double?
+    var pages = 0
+    var fraction: Double?
 }
 
 // Pressure notifications are shared by the downloader and the single parser /

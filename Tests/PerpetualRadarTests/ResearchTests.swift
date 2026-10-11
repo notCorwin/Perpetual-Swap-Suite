@@ -24,7 +24,7 @@ actor ResearchFixtureTransport: ResearchTransport {
         else { throw FilterError("Unexpected fixture request \(url.path)") }
         return try JSONSerialization.data(withJSONObject: ["code": "0", "data": rows])
     }
-    func download(_ url: URL, to destination: URL) async throws { downloads += 1; throw FilterError("No archive download is expected.") }
+    func download(_ url: URL, to destination: URL, progress: @escaping @Sendable (ResearchDownloadProgress) async -> Void) async throws { downloads += 1; throw FilterError("No archive download is expected.") }
     func counts() -> (Int, Int) { (requests.count, downloads) }
     func setFailure(_ index: Int?) { failAt = index }
     func urls() -> [String] { requests }

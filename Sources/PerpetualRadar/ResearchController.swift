@@ -34,21 +34,38 @@ actor ResearchWorker {
         try store.pinInputs(plan, owner: owner)
         return plan
     }
-    func prepare(_ study: ResearchStudy, plan: DataPlan, progress: @escaping @Sendable (Int, Int, String) async -> Void) async throws -> ResearchStudy {
+    func prepare(_ study: ResearchStudy, plan: DataPlan, progress: @escaping @Sendable (Int, Int, ResearchPreparationProgress) async -> Void) async throws -> ResearchStudy {
         let store = try ResearchStore(directory: directory), provider = ResearchDataProvider(store: store, transport: transport, radarURL: radarURL)
         var checkpoint = try store.get("checkpoint:\(study.id)", as: Checkpoint.self) ?? Checkpoint(studyID: study.id, phase: "preparing")
         try store.pinInputs(plan, owner: study.id)
-        checkpoint.phase = "preparing"; try store.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
+        checkpoint.phase = "preparing"; checkpoint.error = nil; try store.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
+        var measuredSeconds = 0.0, measuredSources = 0
         for (index, source) in plan.sources.enumerated() {
             try Task.checkCancellation()
-            await progress(index, plan.sources.count, source.filename)
             if checkpoint.completedSources.contains(source.id) { continue }
-            try await provider.prepare(source, instruments: plan.inputInstruments)
+            let started = ContinuousClock.now
+            let estimate = measuredSources > 0 ? measuredSeconds / Double(measuredSources) * Double(plan.sources.count - index) : nil
+            do {
+                try await provider.prepare(source, instruments: plan.inputInstruments) { update in
+                    var update = update
+                    if let estimate {
+                        let remaining = max(update.fileRemainingSeconds ?? 0, estimate - researchSeconds(started.duration(to: .now)))
+                        update.remainingSeconds = remaining > 0 ? remaining : nil
+                    }
+                    await progress(index, plan.sources.count, update)
+                }
+            } catch {
+                if Task.isCancelled { throw error }
+                throw FilterError("\(source.instrument) · \(source.filename): \(error.localizedDescription)")
+            }
+            measuredSeconds += researchSeconds(started.duration(to: .now)); measuredSources += 1
             try store.pinInputs(plan, owner: study.id)
             checkpoint.completedSources.append(source.id); checkpoint.updatedAt = researchNow()
             try store.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
+            await progress(index + 1, plan.sources.count, .init(stage: "prepared", filename: source.filename, instrument: source.instrument))
         }
         try Task.checkCancellation()
+        await progress(plan.sources.count, plan.sources.count, .init(stage: "freezing", filename: "Freezing verified local inputs…", instrument: ""))
         let manifest = try store.freeze(plan)
         var result = study; result.manifestID = manifest.id
         checkpoint.phase = "ready"; checkpoint.updatedAt = researchNow()
@@ -63,7 +80,7 @@ actor ResearchWorker {
         guard let id = study.manifestID, let manifest = try store.get(id, as: DataManifest.self) else { throw FilterError("Prepare data before running this study.") }
         guard manifest.engine == ResearchVersion.engine else { throw FilterError("This checkpoint requires engine \(manifest.engine). Keep its frozen results or copy its configuration to use the current engine.") }
         var checkpoint = try store.get("checkpoint:\(study.id)", as: Checkpoint.self) ?? Checkpoint(studyID: study.id, phase: "running")
-        checkpoint.phase = "running"; try store.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
+        checkpoint.phase = "running"; checkpoint.error = nil; try store.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
         try study.spec.validate()
         try ResearchEngine.run(store: store, study: study, manifest: manifest, checkpoint: &checkpoint, progress: progress)
         progress(1, 1, "Calculating baselines, medians and confidence intervals…")
@@ -167,13 +184,25 @@ final class ResearchController {
         activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep, reason: "Complete user-requested research while the window is minimized")
         let id = UUID().uuidString; status = .init(id: id, phase: phase); activeStudyID = studyID; onBusyChanged?(true); return id
     }
-    private func advance(_ id: String, completed: Int, total: Int, message: String) {
-        guard status?.id == id else { return }
+    private func advance(_ id: String, completed: Int, total: Int, message: String, preparation: ResearchPreparationProgress? = nil) {
+        guard status?.id == id, ["planning", "preparing", "running"].contains(status?.phase ?? "") else { return }
         status?.completed = completed; status?.total = total; status?.message = message
+        status?.preparation = preparation; status?.updatedAt = researchNow()
     }
     private func finish(_ id: String, phase: String, resultID: String? = nil, error: String = "") {
         guard status?.id == id else { return }
         status?.phase = phase; status?.resultID = resultID; status?.error = error
+        if phase == "ready" { status?.message = "Dataset frozen and ready to run." }
+        if phase == "completed" { status?.message = "Study complete." }
+        status?.updatedAt = researchNow()
+        if let studyID = activeStudyID, phase == "failed" {
+            do {
+                var checkpoint = try store.get("checkpoint:\(studyID)", as: Checkpoint.self) ?? Checkpoint(studyID: studyID, phase: phase)
+                checkpoint.phase = phase; checkpoint.error = error; checkpoint.updatedAt = researchNow()
+                try store.put("checkpoint:\(studyID)", kind: "checkpoint", checkpoint)
+            } catch { status?.error += " Checkpoint status could not be saved: \(error.localizedDescription)" }
+        }
+        if ["ready", "completed"].contains(phase) { let total = status?.total ?? 0; status?.completed = total }
         task = nil
         if let activity { ProcessInfo.processInfo.endActivity(activity); self.activity = nil }
         onBusyChanged?(false)
@@ -184,7 +213,7 @@ final class ResearchController {
         let study = try resumeID.flatMap { try store.get($0, as: ResearchStudy.self) } ?? ResearchStudy(spec: spec, planID: UUID().uuidString)
         let id = try begin("planning", studyID: study.id)
         var checkpoint = try store.get("checkpoint:\(study.id)", as: Checkpoint.self) ?? Checkpoint(studyID: study.id, phase: "planning")
-        checkpoint.phase = "planning"; checkpoint.refresh = refresh
+        checkpoint.phase = "planning"; checkpoint.refresh = refresh; checkpoint.error = nil
         try store.database.transaction {
             try store.put(study.id, kind: "study", study)
             try store.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
@@ -218,7 +247,7 @@ final class ResearchController {
         }
         task = Task.detached(priority: .background) { [self, worker] in
             do {
-                let prepared = try await worker.prepare(study, plan: plan) { n, total, message in await self.advance(id, completed: n, total: total, message: message) }
+                let prepared = try await worker.prepare(study, plan: plan) { n, total, update in await self.advance(id, completed: n, total: total, message: update.filename, preparation: update) }
                 await self.finish(id, phase: "ready", resultID: prepared.id)
             } catch { await self.finish(id, phase: Task.isCancelled ? "paused" : "failed", resultID: study.id, error: Task.isCancelled ? "" : error.localizedDescription) }
         }
@@ -334,6 +363,7 @@ final class ResearchController {
                 var item = try snapshot(study) as! [String: Any]
                 let checkpoint = try store.get("checkpoint:\(study.id)", as: Checkpoint.self)
                 item["phase"] = activeStudyID == study.id && isBusy ? status?.phase ?? "running" : ["running", "preparing", "planning"].contains(checkpoint?.phase ?? "") ? "paused" : checkpoint?.phase ?? "paused"
+                item["error"] = checkpoint?.error ?? ""
                 studies.append(item)
             }
             return ["job": try status.map(snapshot) ?? NSNull(), "studies": studies, "cacheDirectory": store.directory.path,

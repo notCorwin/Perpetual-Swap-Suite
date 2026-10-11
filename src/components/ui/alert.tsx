@@ -12,6 +12,8 @@ const alertVariants = cva(
           "bg-card text-destructive *:data-[slot=alert-description]:text-destructive *:[svg]:text-current",
         warning:
           "border-warning-border bg-state-warning text-warning *:data-[slot=alert-description]:text-foreground",
+        task: "bg-popover text-popover-foreground",
+        "task-error": "bg-popover text-destructive *:data-[slot=alert-description]:text-popover-foreground",
       },
     },
     defaultVariants: {
@@ -28,7 +30,7 @@ function Alert({
   return (
     <div
       data-slot="alert"
-      data-surface={variant === "warning" ? "inherited" : "panel"}
+      data-surface={variant === "task" || variant === "task-error" ? "floating" : variant === "warning" ? "inherited" : "panel"}
       data-variant={variant}
       role="alert"
       className={cn(alertVariants({ variant }), className)}

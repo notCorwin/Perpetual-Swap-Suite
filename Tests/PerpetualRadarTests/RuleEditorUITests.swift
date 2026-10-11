@@ -45,6 +45,7 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
     var suiteEvaluationDelay: UInt64 = 0
     var suiteReadError: String?
     var researchReadError: String?
+    var researchJobOverride: [String: Any]?
     var research: ResearchController?
     var launchAtLogin = "disabled"
     var loginSettingsOpenCount = 0
@@ -125,7 +126,11 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
         }
         if let parameters = request["research"] as? [String: Any], let research {
             if parameters["action"] as? String == "inventory", let researchReadError { replyHandler(nil, researchReadError); return }
-            Task { do { replyHandler(try await research.handle(parameters), nil) } catch { replyHandler(nil, error.localizedDescription) } }; return
+            Task { do {
+                var result = try await research.handle(parameters)
+                if parameters["action"] as? String == "inventory", let researchJobOverride { result["job"] = researchJobOverride }
+                replyHandler(result, nil)
+            } catch { replyHandler(nil, error.localizedDescription) } }; return
         }
         radarRequests += 1
         if request["backgroundMonitoringEnabled"] != nil || request["notificationsEnabled"] != nil || request["notificationAction"] != nil || request["monitoringPaused"] != nil || request["launchAtLogin"] != nil {
@@ -560,11 +565,31 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await Task.sleep(for:.milliseconds(300))
         radarRequests = bridge.radarRequests
         bridge.researchReadError = "Research cache temporarily locked"
-        try await wait(view,"document.querySelector('[data-research] [role=alert]')?.innerText.includes('Research cache temporarily locked')")
+        try await wait(view,"document.querySelector('[data-research-task] [role=alert]')?.innerText.includes('Research cache temporarily locked')")
         bridge.researchReadError = nil
         try await wait(view,"!document.body.innerText.includes('Research cache temporarily locked')")
         let recoveredName = try await js(view,"document.querySelector('#study-name').value") as? String
         XCTAssertEqual(recoveredName,"WKWebView experiment", "Reconnection must preserve the research draft.")
+        bridge.researchJobOverride = ["id": "transfer", "phase": "preparing", "completed": 3, "total": 10, "message": "BTC-USDT-SWAP-2025-06.zip", "error": "", "startedAt": researchNow() - 60_000, "updatedAt": researchNow(),
+            "preparation": ["stage": "downloading", "filename": "BTC-USDT-SWAP-2025-06.zip", "instrument": "BTC-USDT-SWAP", "receivedBytes": 50_000_000, "totalBytes": 100_000_000, "bytesPerSecond": 1_000_000, "fileRemainingSeconds": 50, "remainingSeconds": 600, "pages": 0]]
+        try await wait(view, "document.querySelector('[aria-label=\"Current file download progress\"]')?.getAttribute('aria-valuenow') === '50'")
+        let downloadStatus = try await js(view, "document.querySelector('[data-research-task]').innerText") as? String ?? ""
+        XCTAssertTrue(downloadStatus.contains("50 MB / 100 MB")); XCTAssertTrue(downloadStatus.contains("1 MB/s"))
+        XCTAssertTrue(downloadStatus.contains("File remaining: About 50s")); XCTAssertTrue(downloadStatus.contains("Estimated time to ready: About 10m 0s"))
+        let placement = try await js(view, "window.scrollTo(0, document.body.scrollHeight); const r=document.querySelector('[data-research-task]').getBoundingClientRect(); r.top >= 0 && r.bottom <= window.innerHeight + 1") as? Bool
+        XCTAssertEqual(placement, true, "Download status must stay visible after scrolling.")
+        try await assertSharedSurfaces(view, opacity: bridge.radar.frostedBackgroundOpacity)
+        if var progress = bridge.researchJobOverride?["preparation"] as? [String: Any] { progress["receivedBytes"] = 75_000_000; bridge.researchJobOverride?["preparation"] = progress }
+        _ = try await js(view, "document.documentElement.style.setProperty('--window-background-opacity','0'); true")
+        try await assertSharedSurfaces(view, opacity: 0)
+        _ = try await js(view, "document.documentElement.style.setProperty('--window-background-opacity','\(bridge.radar.frostedBackgroundOpacity)'); true")
+        try await wait(view, "document.querySelector('[aria-label=\"Current file download progress\"]')?.getAttribute('aria-valuenow') === '75'")
+        bridge.researchJobOverride?["updatedAt"] = researchNow() - 20_000
+        try await wait(view, "document.querySelector('[data-research-task]')?.innerText.includes('No data received for')")
+        bridge.researchJobOverride?["phase"] = "failed"; bridge.researchJobOverride?["error"] = "Archive connection lost: BTC-USDT-SWAP-2025-06.zip"
+        try await wait(view, "document.querySelector('[data-research-task] [role=alert]')?.innerText.includes('Archive connection lost')")
+        bridge.researchJobOverride = nil
+        _ = try await js(view, "window.scrollTo(0,0); true")
         try await click(view, "Every matching hour")
         let formatter = DateFormatter(); formatter.dateFormat = "yyyy-MM-dd"; formatter.timeZone = TimeZone(secondsFromGMT: 0)
         try await input(view, "#study-from", formatter.string(from: Date(timeIntervalSince1970: Double(ResearchFixture.hour)/1000)))
