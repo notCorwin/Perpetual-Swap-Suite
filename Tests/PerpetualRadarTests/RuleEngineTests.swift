@@ -53,10 +53,20 @@ final class RuleEngineTests: XCTestCase {
     func testRelativeVolumeExcludesLiveBarFromTwentyClosedHourMean() throws {
         var context = market(Array(repeating: 100, count: 25))
         context.candles[hour] = Candle(hour: hour, high: 101, low: 99, close: 100, quoteVolume: 201, baseVolume: 1, open: 100, confirmed: false)
-        let source = "let ratio = Volume / mean(lag(Volume, 1), 20); ratio > 2"
+        let source = "Volume > multiple(mean(lag(Volume, 1), 20), 2)"
         XCTAssertEqual(try evaluate(source, context).result, .yes)
         context.candles.removeValue(forKey: hour - 20 * hourMS)
         XCTAssertEqual(try evaluate(source, context).result, .unknown)
+    }
+
+    func testPositiveBaselineMultipleRejectsDegenerateBaselinesWithoutDivision() throws {
+        XCTAssertEqual(try scalar("multiple(100, 2)").number, 200)
+        XCTAssertEqual(try evaluate("Close > multiple(0, 2)").result, .unknown)
+        XCTAssertEqual(try evaluate("Close > multiple(-1, 2)").result, .unknown)
+        XCTAssertEqual(try evaluate("Close > multiple(1e308, 2)").result, .unknown)
+        XCTAssertThrowsError(try FilterCompiler.compile(source: "Close > multiple(100, 0)"))
+        XCTAssertThrowsError(try FilterCompiler.compile(source: "Close > multiple(100, -2)"))
+        XCTAssertThrowsError(try FilterCompiler.compile(source: "Close > multiple(100, Close)"))
     }
 
     func testMathUnitsHistoryOffsetsAndDivisionByZero() throws {

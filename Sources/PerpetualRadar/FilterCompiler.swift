@@ -300,6 +300,10 @@ struct FilterCompiler {
             }
             if ["closed", "live"].contains(f), args.count == 1 { return try scalarKind(args[0], scope: scope) }
             if f == "abs", args.count == 1, try scalarKind(args[0], scope: scope) { return true }
+            if f == "multiple", args.count == 2, try scalarKind(args[0], scope: scope) {
+                guard case .number(let multiplier) = args[1], multiplier.isFinite, multiplier > 0 else { throw FilterError("The baseline multiplier must be a positive number.") }
+                return true
+            }
             if ["mean", "sum", "highest", "lowest", "stddev", "lag", "change"].contains(f), args.count == 2, try scalarKind(args[0], scope: scope) {
                 _ = try FilterParser.integer(args[1], zero: f == "lag"); return true
             }

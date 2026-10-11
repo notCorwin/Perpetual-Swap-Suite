@@ -13,12 +13,13 @@ export const expressionTemplates: ExpressionTemplate[] = [
   })),
   { name: "abs", label: "Absolute value", group: "Expression functions", unit: "source unit", parameters: [source], defaults: ["Price"], description: "Returns the magnitude of a numeric expression." },
   ...[["mean", "Mean"], ["sum", "Sum"], ["highest", "Highest"], ["lowest", "Lowest"], ["stddev", "Standard deviation"]].map(([name, label]) => ({ name, label, group: "Expression functions", unit: "source unit", parameters: [source, hours("Window hours")], defaults: ["Volume", "20"], description: "Includes the selected hour and preceding hourly slots. Missing hours make the value Unknown." })),
+  { name: "multiple", label: "Positive baseline multiple", group: "Expression functions", unit: "source unit", parameters: [source, { label: "Multiplier", kind: "number", minimum: Number.MIN_VALUE, step: "any", unit: "× baseline" }], defaults: ["mean(lag(Volume, 1), 20)", "2"], description: "Multiplies a strictly positive baseline by a positive constant. A zero, negative or unavailable baseline is Unknown." },
   { name: "lag", label: "Historical offset", group: "Expression functions", unit: "source unit", parameters: [source, hours("Offset hours", 0)], defaults: ["Volume", "1"], description: "Reads the expression at the selected hour minus the offset." },
   { name: "change", label: "Change rate", group: "Expression functions", unit: "%", parameters: [source, hours("Offset hours")], defaults: ["Price", "1"], description: "(Current − previous) / |previous| × 100%. The offset chooses the previous hour." },
   { name: "closed", label: "Previous closed hour", group: "Expression functions", unit: "source unit", parameters: [source], defaults: ["Price"], description: "Shifts this expression back one hour relative to the rule's evaluation hour." },
   { name: "live", label: "Current evaluation hour", group: "Expression functions", unit: "source unit", parameters: [source], defaults: ["Price"], description: "Reads at the rule's evaluation hour. A parent Closed anchor still applies." },
 ]
-export const arithmeticOperations = [["+", "Add +"], ["-", "Subtract −"], ["*", "Multiply ×"], ["/", "Divide ÷"]]
+export const arithmeticOperations = [["+", "Add +"], ["-", "Subtract −"], ["*", "Multiply ×"]]
 export const expressionName = (expression: EditorExpression): string => expression.operation?.toLowerCase() ?? ""
 export function rawExpression(value: string, unit = ""): EditorExpression { return { kind: "raw", source: value, unit, arguments: [], choices: [] } }
 export function numberExpression(value: string): EditorExpression { return { ...rawExpression(value, "constant"), kind: "number", value } }

@@ -129,7 +129,7 @@ export const indicatorTemplates = [
 ]
 export const formulaExamples = [
   { label: "Long or Short alignment", source: '(emaTrend == "rising" AND ROC(9) > 0) OR (emaTrend == "falling" AND ROC(9) < 0)' },
-  { label: "Relative volume", source: 'let volumeRatio = Volume / mean(lag(Volume, 1), 20);\nvolumeRatio > 2' },
+  { label: "Relative volume", source: 'Volume > multiple(mean(lag(Volume, 1), 20), 2)' },
   { label: "Three closed RSI hours", source: 'closed(every(RSI(14) > 50, 3))' },
   { label: "Break, retest, reclaim", source: 'sequence(6,\n  stage("break", High > PriorHigh(48), 6, capture("level", PriorHigh(48))),\n  stage("retest", Low < break.level, 6),\n  stage("reclaim", crossUp(Close, break.level), 6)\n)' },
 ]

@@ -3,12 +3,12 @@ import test from "node:test"
 import { arithmeticExpression, expressionTemplates, functionCompletion, numberExpression, rawExpression, selectRuleLeft, templateExpression, withExpressionArguments } from "./filter-expression.ts"
 import { makeRule, type EditorExpression, type FilterMetric } from "./rule-engine.ts"
 
-test("visual relative volume edits preserve nested offsets and allow invalid drafts without losing operands", () => {
+test("visual relative volume edits preserve a positive baseline and nested offsets", () => {
   const template = (name: string) => expressionTemplates.find(item => item.name === name)!
   const lag = templateExpression(template("lag"), rawExpression("Volume", "USDT"))
   const mean = templateExpression(template("mean"), lag)
-  const ratio = withExpressionArguments(arithmeticExpression("/", rawExpression("Volume", "USDT")), 1, mean)
-  assert.equal(ratio.source, "(Volume / mean(lag(Volume, 1), 20))")
+  const multiple = templateExpression(template("multiple"), mean)
+  assert.equal(multiple.source, "multiple(mean(lag(Volume, 1), 20), 2)")
   const emptyWindow = withExpressionArguments(mean, 1, numberExpression(""))
   assert.equal(emptyWindow.source, "mean(lag(Volume, 1), )")
   assert.equal(withExpressionArguments(emptyWindow, 1, numberExpression("48")).source, "mean(lag(Volume, 1), 48)")
@@ -28,7 +28,7 @@ test('BTC expressions edit the clock without formula entry, including an omitted
   assert.equal(functionCompletion('cooldown(condition, hours)'), 'cooldown(BTC(ROC(1), "live") < -2, 0)')
 })
 
-test("formula completions insert usable defaults for every scalar and time function", () => {
+test("value block completions have usable defaults for every scalar and time function", () => {
   for (const item of expressionTemplates) {
     const completion = functionCompletion(`${item.name}(x, n)`)
     assert.equal(completion, templateExpression(item).source)
@@ -37,7 +37,7 @@ test("formula completions insert usable defaults for every scalar and time funct
   for (const signature of ["all(...)", "any(...)", "NOT condition", "between(x, min, max)", "absGte(x, threshold)", "absLte(x, threshold)", "every(condition, hours)", "recent(condition, hours)", 'count(condition, hours, "gte", minimum)', "crossUp(left, right)", "crossDown(left, right)", "sequence(hours, stages)"]) assert.notEqual(functionCompletion(signature), signature)
 })
 
-test("categorical and numeric selections repair incompatible operators and preserve valid formula operands", () => {
+test("categorical and numeric selections repair incompatible operators and preserve valid reference operands", () => {
   const oi: FilterMetric = { key: "oiTrend", label: "OI trend", group: "Participation", description: "", unit: "category", numeric: false, choices: [{ value: "rising", label: "Rising" }] }
   const symbol: FilterMetric = { ...oi, key: "Symbol", unit: "text", choices: [] }
   const name: EditorExpression = { ...rawExpression("trend", "category"), kind: "name", value: "trend", choices: oi.choices }

@@ -7,6 +7,7 @@ import XCTest
 final class BackgroundTestAudit {
     private var activatedPIDs = Set<Int32>()
     private var visiblePIDs = Set<Int32>()
+    private var visibleWindowDetails: [Int32: Set<String>] = [:]
     private var dockPIDs = Set<Int32>()
     private var windowListAvailable = true
     private var observer: NSObjectProtocol?
@@ -45,6 +46,12 @@ final class BackgroundTestAudit {
                   (window[kCGWindowAlpha as String] as? Double ?? 1) > 0,
                   displays.contains(where: { $0.intersects(bounds) }) else { continue }
             visiblePIDs.insert(pid)
+            guard pid == getpid() else { continue }
+            let number = window[kCGWindowNumber as String] as? Int ?? -1
+            let layer = window[kCGWindowLayer as String] as? Int ?? -1
+            let alpha = window[kCGWindowAlpha as String] as? Double ?? 1
+            let name = window[kCGWindowName as String] as? String ?? ""
+            visibleWindowDetails[pid, default: []].insert("#\(number) layer=\(layer) alpha=\(alpha) bounds=\(bounds) name=\(name)")
         }
     }
 
@@ -52,7 +59,9 @@ final class BackgroundTestAudit {
         sample()
         XCTAssertTrue(windowListAvailable, "WindowServer geometry must be available for the background audit.", file: file, line: line)
         XCTAssertTrue(activatedPIDs.isDisjoint(with: pids), "Tests took focus: \(activatedPIDs.intersection(pids))", file: file, line: line)
-        XCTAssertTrue(visiblePIDs.isDisjoint(with: pids), "Test windows appeared on a display: \(visiblePIDs.intersection(pids))", file: file, line: line)
+        let visible = visiblePIDs.intersection(pids)
+        let details = visible.flatMap { visibleWindowDetails[$0, default: []] }.sorted()
+        XCTAssertTrue(visible.isEmpty, "Test windows appeared on a display: \(visible); details: \(details)", file: file, line: line)
         XCTAssertTrue(dockPIDs.isDisjoint(with: pids), "Test processes became Dock applications: \(dockPIDs.intersection(pids))", file: file, line: line)
     }
 

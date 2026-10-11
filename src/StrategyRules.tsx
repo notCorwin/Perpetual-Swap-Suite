@@ -1,16 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react'
-import { CircleAlert, Check, ChevronDown, Code, Copy, Filter, Plus, Redo2, Save, Trash2, Undo2, X } from 'lucide-react'
+import { CircleAlert, Check, ChevronDown, Copy, Filter, Plus, Redo2, Save, Trash2, Undo2, X } from 'lucide-react'
 import { Alert, AlertAction, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
-import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegend, FieldSet } from '@/components/ui/field'
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Spinner } from '@/components/ui/spinner'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Textarea } from '@/components/ui/textarea'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { FilterNameInput } from '@/FilterNameInput'
 import { ExpressionInput } from '@/FilterExpressionInput'
@@ -18,7 +14,7 @@ import { RuleInspector, RuleOutline, RulePicker, type RuleDropTarget, type RuleT
 import { FilterRulePreview } from '@/FilterRulePreview'
 import { RuleLibrary } from '@/RuleLibrary'
 import { addLibraryRule, conditionLibrary, renameValueReferences, rulePath, topLevelSelection, visualPresets, type LibraryItem } from '@/filter-builder'
-import { functionCompletion, type ExpressionTemplate } from '@/filter-expression'
+import type { ExpressionTemplate } from '@/filter-expression'
 import { filterRuleSummary } from '@/filter-summary'
 import { cn } from '@/lib/utils'
 import { duplicateRule, emptyFilterConfig, findRule, newRuleID, parseFilterConfig, removeRule, ruleCount, updateRule, type EditorExpression, type FilterConfigV2, type FilterDraftRevision, type FilterEditorState, type FilterLibraryPreferences, type FilterMetric, type FilterTruth, type NativeMarketRow, type RuleNode } from '@/rule-engine'
@@ -28,26 +24,25 @@ type Props = {
   filters: FilterConfigV2; draft: FilterConfigV2 | null; editor: FilterEditorState
   onDraftChange: (draft: FilterConfigV2 | null) => void; onEditorChange: Dispatch<SetStateAction<FilterEditorState>>
   onApply: (filters: FilterConfigV2) => Promise<void>
-  metrics: FilterMetric[]; functions: string[]; templates: ExpressionTemplate[]; units: Record<string, string>; expressions: Record<string, EditorExpression>; formula: string; diagnostics: string[]; valid: boolean; compiling: boolean; requiredHours: number
+  metrics: FilterMetric[]; templates: ExpressionTemplate[]; units: Record<string, string>; expressions: Record<string, EditorExpression>; diagnostics: string[]; valid: boolean; compiling: boolean; requiredHours: number
   preferences: FilterLibraryPreferences; onPreferences: (preferences: FilterLibraryPreferences) => Promise<void>
   rows: NativeMarketRow[]; results: Record<string, FilterTruth>; previewJSON: string | null; revision: number; onExplain: (id: string) => void
   matches: number; total: number; unknown: number; previewPending: boolean; history: { pending: number; completed: number; error: string } | null
 }
-const firstCondition = (n: RuleNode): RuleNode => ['condition', 'crossup', 'crossdown'].includes(n.kind) ? n : n.children.length ? firstCondition(n.children[0]) : n
 export function StrategyRules(props: Props) {
   const { filters, draft: override, editor, onEditorChange, onDraftChange, metrics } = props
-  const formulaInput = useRef<HTMLTextAreaElement>(null), lastEdit = useRef(''), coalesceTimer = useRef<number | undefined>(undefined)
-  const [completionOpen, setCompletionOpen] = useState(false), [libraryOpen, setLibraryOpen] = useState(false)
+  const lastEdit = useRef(''), coalesceTimer = useRef<number | undefined>(undefined)
+  const [libraryOpen, setLibraryOpen] = useState(false)
   const [saving, setSaving] = useState(false), [saveError, setSaveError] = useState(''), [feedback, setFeedback] = useState('')
   const [dragging, setDragging] = useState<string | null>(null), [drop, setDrop] = useState<RuleDropTarget | null>(null)
   const pendingName = Object.keys(editor.nameDrafts).length > 0
-  const draft = override ?? filters, dirty = override !== null || editor.source !== null || pendingName
+  const draft = override ?? filters, dirty = override !== null || pendingName
   useEffect(() => () => window.clearTimeout(coalesceTimer.current), [])
   const activeFilters = useMemo(() => props.previewJSON ? parseFilterConfig(props.previewJSON) : filters, [props.previewJSON, filters])
   const activeName = props.label ?? 'Strategy rules'
   const activeSummary = useMemo(() => filterRuleSummary(activeFilters, metrics, props.expressions, props.templates), [activeFilters, metrics, props.expressions, props.templates])
   const activeCount = ruleCount(activeFilters.root)
-  const selectedRule = findRule(draft.root, editor.selectedRuleId ?? '') ?? (editor.source !== null ? firstCondition(draft.root) : draft.root)
+  const selectedRule = findRule(draft.root, editor.selectedRuleId ?? '') ?? draft.root
   const guided = props.preferences.layout === 'guided'
   const record = (source: string | null, selectedId?: string, nextConfig = draft) => {
     const field = document.activeElement instanceof HTMLInputElement || document.activeElement instanceof HTMLTextAreaElement ? document.activeElement.getAttribute('aria-label') ?? document.activeElement.id : ''
@@ -81,11 +76,6 @@ export function StrategyRules(props: Props) {
     for (const id of bulkIds) root = action === 'copy' ? duplicateRule(root, id) : action === 'delete' ? removeRule(root, id) : updateRule(root, id, n => ({ ...n, mode: action }))
     edit({ ...draft, root }); if (action === 'delete') onEditorChange(current => ({ ...current, selectedIds: [] }))
   }
-  const insertFormula = (expression: string) => {
-    const source = editor.source ?? props.formula, start = formulaInput.current?.selectionStart ?? source.length, end = formulaInput.current?.selectionEnd ?? start
-    record(source.slice(0, start) + expression + source.slice(end)); setCompletionOpen(false)
-    window.requestAnimationFrame(() => { formulaInput.current?.focus(); formulaInput.current?.setSelectionRange(start + expression.length, start + expression.length) })
-  }
   const rememberExpression = (expression: EditorExpression) => onEditorChange(current => ({ ...current, expressionDrafts: { ...current.expressionDrafts, [expression.source]: expression } }))
   const tree: RuleTreeContext = { config: draft, edit, select, selectedId: selectedRule.id, metrics, units: props.units, expressions: props.expressions, templates: props.templates, editor, setEditor: onEditorChange, disabled: saving, guided, rememberExpression, dragging, setDragging, drop, setDrop }
   const preview = <FilterRulePreview nodeId={selectedRule.id} rows={props.rows} results={props.results} filtersJSON={props.previewJSON} revision={props.revision} instId={editor.explainId} onSelect={id => onEditorChange(current => ({ ...current, explainId: id }))} onExplain={props.onExplain} metrics={metrics} expressions={props.expressions} units={props.units} templates={props.templates} valid={props.valid} atClose={props.atClose} strategyID={props.strategyID} />
@@ -111,8 +101,8 @@ export function StrategyRules(props: Props) {
       <AlertAction><Button type="button" size="sm" disabled={applyDisabled} onClick={apply}>{saving ? <Spinner data-icon="inline-start" aria-hidden="true" /> : <Save data-icon="inline-start" aria-hidden="true" />}{props.embedded ? 'Keep rules' : 'Save Universe'}</Button></AlertAction>
     </Alert>}
     <CollapsibleContent className="pt-3"><fieldset disabled={saving} className="flex flex-col gap-4"><legend className="sr-only">Strategy rule editor</legend>
-      <Tabs value={editor.tab} onValueChange={tab => onEditorChange(current => ({ ...current, tab: tab as 'rules' | 'formula' }))}><div className="flex items-center justify-between gap-3"><TabsList><TabsTrigger value="rules"><Filter data-icon="inline-start" aria-hidden="true" />Rules</TabsTrigger><TabsTrigger value="formula"><Code data-icon="inline-start" aria-hidden="true" />Formula</TabsTrigger></TabsList>{editor.tab === 'rules' && <ToggleGroup type="single" variant="outline" size="sm" spacing={0} value={props.preferences.layout} onValueChange={layout => { if (layout) preferences({ ...props.preferences, layout: layout as FilterLibraryPreferences['layout'] }) }} aria-label="Rule layout"><ToggleGroupItem value="sentences">Sentence rows</ToggleGroupItem><ToggleGroupItem value="guided">Guided cards</ToggleGroupItem></ToggleGroup>}</div>
-        <TabsContent value="rules" className="pt-3"><FieldGroup className="gap-3"><div className="flex items-center gap-2"><span className="text-xs text-muted-foreground">Start with a condition</span>{visualPresets.filter(p => ['preset:oi', 'preset:body', 'preset:volume', 'preset:sequence'].includes(p.id)).map(p => <Button key={p.id} type="button" variant="outline" size="sm" onClick={() => preset(p.id)}>{p.label}</Button>)}</div>
+      <div className="flex items-center justify-between gap-3"><div><p className="text-sm font-medium">Rule judgments</p><p className="text-xs text-muted-foreground">Choose values, comparisons and explicit thresholds. Unknown data never becomes a match.</p></div><ToggleGroup type="single" variant="outline" size="sm" spacing={0} value={props.preferences.layout} onValueChange={layout => { if (layout) preferences({ ...props.preferences, layout: layout as FilterLibraryPreferences['layout'] }) }} aria-label="Rule layout"><ToggleGroupItem value="sentences">Sentence rows</ToggleGroupItem><ToggleGroupItem value="guided">Guided cards</ToggleGroupItem></ToggleGroup></div>
+        <FieldGroup className="gap-3"><div className="flex items-center gap-2"><span className="text-xs text-muted-foreground">Start with a condition</span>{visualPresets.filter(p => ['preset:oi', 'preset:body', 'preset:volume', 'preset:sequence'].includes(p.id)).map(p => <Button key={p.id} type="button" variant="outline" size="sm" onClick={() => preset(p.id)}>{p.label}</Button>)}</div>
           <div className="flex items-center gap-2"><RuleLibrary metrics={metrics} templates={props.templates} preferences={props.preferences} onPreferences={preferences} onAdd={add} open={libraryOpen} onOpenChange={setLibraryOpen} /><Button type="button" variant="outline" onClick={() => preset('rule:all')}><Plus data-icon="inline-start" aria-hidden="true" />Add group</Button><div className="w-64"><RulePicker label="Rule example" value="example" choices={[["example", "More ready-to-use conditions…"], ...visualPresets.map(p => [p.id, p.label])]} onChange={value => { if (value !== 'example') preset(value) }} /></div><span className="text-xs text-muted-foreground">Ctrl+Space to find a condition</span><div className="ml-auto flex items-center gap-1"><Button type="button" variant="ghost" size="icon" aria-label="Undo rule edit" disabled={!editor.past.length} onClick={() => travel('undo')}><Undo2 aria-hidden="true" /></Button><Button type="button" variant="ghost" size="icon" aria-label="Redo rule edit" disabled={!editor.future.length} onClick={() => travel('redo')}><Redo2 aria-hidden="true" /></Button></div></div>
           {bulkIds.length > 0 && <div className="flex items-center gap-2"><Badge variant="outline">{bulkIds.length} selected</Badge><Button type="button" variant="outline" size="sm" onClick={() => bulk('live')}>Set Live</Button><Button type="button" variant="outline" size="sm" onClick={() => bulk('closed')}>Set Closed</Button><Button type="button" variant="outline" size="sm" onClick={() => bulk('copy')}><Copy data-icon="inline-start" aria-hidden="true" />Duplicate selected</Button><Button type="button" variant="outline" size="sm" onClick={() => bulk('delete')}><Trash2 data-icon="inline-start" aria-hidden="true" />Remove selected</Button><Button type="button" variant="ghost" size="sm" onClick={() => onEditorChange(current => ({ ...current, selectedIds: [] }))}>Clear selection</Button></div>}
           <div className={cn('grid items-start gap-4', !guided && 'grid-cols-[minmax(0,1fr)_minmax(36rem,0.85fr)]')} data-rule-layout={props.preferences.layout}>
@@ -123,9 +113,7 @@ export function StrategyRules(props: Props) {
         const next = renameValueReferences(draft, { [item.name]: name }, props.expressions)
         edit({ ...next, definitions: next.definitions.map(c => c.id === item.id ? { ...c, name } : c) })
       }} /><FieldDescription>Spaces become underscores; references update automatically.</FieldDescription></Field><ExpressionInput label="Reusable value" value={item.expression} metrics={metrics} units={props.units} expressions={props.expressions} templates={props.templates} onExpressionDraft={rememberExpression} definitions={draft.definitions.filter(c => c.id !== item.id)} onChange={expression => edit({ ...draft, definitions: draft.definitions.map(c => c.id === item.id ? { ...c, expression } : c) })} /><Button type="button" variant="ghost" size="icon" className="mt-6" aria-label="Remove reusable value" onClick={() => edit({ ...draft, definitions: draft.definitions.filter(c => c.id !== item.id) })}><X aria-hidden="true" /></Button></FieldGroup>)}</FieldGroup><Button type="button" variant="outline" size="sm" className="mt-3" onClick={() => { let i = 1; while (draft.definitions.some(item => item.name === `value${i}`)) i++; edit({ ...draft, definitions: [...draft.definitions, { id: newRuleID(), name: `value${i}`, expression: 'Price' }] }) }}><Plus data-icon="inline-start" aria-hidden="true" />Add reusable value</Button></FieldSet></CollapsibleContent></Collapsible>
-        </FieldGroup></TabsContent>
-        <TabsContent value="formula" className="pt-3"><FieldGroup><Field data-invalid={props.diagnostics.length > 0}><FieldLabel>Rule formula</FieldLabel><Textarea ref={formulaInput} value={editor.source ?? props.formula} rows={12} aria-label="Rule formula" aria-invalid={props.diagnostics.length > 0} spellCheck={false} onChange={event => record(event.target.value)} onKeyDown={event => { if (event.ctrlKey && event.key === ' ') { event.preventDefault(); setCompletionOpen(true) } }} /><FieldDescription>Optional formula editing uses the same rule tree as Rules. Declare reusable values with let; use AND / OR / NOT, parameterized indicators and time functions.</FieldDescription></Field><Popover open={completionOpen} onOpenChange={setCompletionOpen}><PopoverTrigger asChild><Button type="button" variant="outline" size="sm"><Plus data-icon="inline-start" aria-hidden="true" />Insert metric / function (Ctrl+Space)</Button></PopoverTrigger><PopoverContent className="w-[32rem] p-0"><Command><CommandInput placeholder="Search expressions…" /><CommandList><CommandEmpty>No expressions found.</CommandEmpty><CommandGroup heading="Reusable values">{draft.definitions.map(item => <CommandItem key={item.id} value={item.name} onSelect={() => insertFormula(item.name)}>{item.name}</CommandItem>)}</CommandGroup><CommandGroup heading="Functions">{props.functions.map(item => <CommandItem key={item} value={item} onSelect={() => insertFormula(functionCompletion(item, props.templates))}>{item}</CommandItem>)}</CommandGroup><CommandGroup heading="Metrics">{metrics.map(item => <CommandItem key={item.key} value={`${item.key} ${item.label}`} onSelect={() => insertFormula(item.key)}>{item.label}<span className="ml-auto text-muted-foreground">{item.unit}</span></CommandItem>)}</CommandGroup></CommandList></Command></PopoverContent></Popover></FieldGroup></TabsContent>
-      </Tabs>
+        </FieldGroup>
       {props.diagnostics.length > 0 && <FieldError role="alert">{props.diagnostics.join(' ')} Last valid preview remains active.</FieldError>}{pendingName && <FieldDescription>Press Enter or leave the name field to update its references before applying.</FieldDescription>}
       <div className="flex items-center gap-2"><Button type="button" disabled={applyDisabled} onClick={apply}>{saving ? <Spinner data-icon="inline-start" aria-hidden="true" /> : <Check data-icon="inline-start" aria-hidden="true" />}{props.embedded ? 'Keep rules' : 'Save Universe'}</Button><Button type="button" variant="outline" disabled={!dirty} onClick={() => { record(null); onDraftChange(null); onEditorChange(current => ({ ...current, nameDrafts: {}, expressionDrafts: {} })); setFeedback(props.embedded ? 'Kept rules restored.' : 'Saved Universe restored.') }}>Discard changes</Button><Button type="button" variant="ghost" onClick={() => { edit(emptyFilterConfig()); onEditorChange(current => ({ ...current, selectedRuleId: null, selectedIds: [] })) }}>Reset draft</Button><span className="ml-auto text-xs text-muted-foreground">Required history: {props.requiredHours}h · only True matches</span></div>
     </fieldset>{props.history && props.history.pending > 0 && <p className="mt-2 text-xs text-muted-foreground" role="status">Loading rule history for {props.history.pending} contracts · {props.history.completed} completed.</p>}{props.history?.error && <FieldError>{props.history.error} Available history remains usable.</FieldError>}</CollapsibleContent>

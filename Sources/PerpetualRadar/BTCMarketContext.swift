@@ -56,7 +56,7 @@ extension CompiledFilter {
         case .call(let name, let arguments):
             let function = name.lowercased()
             if function == "btc" { return false }
-            if ["closed", "live", "abs", "lag", "change", "mean", "sum", "highest", "lowest", "stddev"].contains(function) { return usesContractInput(arguments[0], visiting: visiting, bound: bound) }
+            if ["closed", "live", "abs", "multiple", "lag", "change", "mean", "sum", "highest", "lowest", "stddev"].contains(function) { return usesContractInput(arguments[0], visiting: visiting, bound: bound) }
             return true
         }
     }

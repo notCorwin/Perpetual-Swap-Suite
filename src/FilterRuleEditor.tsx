@@ -10,7 +10,7 @@ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { FilterNameInput } from '@/FilterNameInput'
 import { ExpressionInput, type ExpressionInputProps } from '@/FilterExpressionInput'
 import { anchorOffset, bodyPresentation, captureScope, humanName, makeVisualBranch, renameValueReferences, ruleHelp, ruleSentence, timeWrapper } from '@/filter-builder'
-import { selectRuleLeft, type ExpressionTemplate } from '@/filter-expression'
+import { expressionName, expressionSource, numberExpression, rawExpression, selectRuleLeft, type ExpressionTemplate } from '@/filter-expression'
 import { cn } from '@/lib/utils'
 import { canReceiveChildren, categoryComparisons, comparisons, duplicateRule, findParent, findRule, moveRule, newRuleID, removeRule, ruleKinds, unaryComparison, unwrapRule, updateRule, wrapRule, type EditorExpression, type FilterConfigV2, type FilterEditorState, type FilterMetric, type RuleKind, type RuleNode } from '@/rule-engine'
 
@@ -39,6 +39,74 @@ export type RuleTreeContext = {
   rememberExpression: (expression: EditorExpression) => void
 }
 function changeRule(tree: RuleTreeContext, node: RuleNode, next: Partial<RuleNode>) { tree.edit({ ...tree.config, root: updateRule(tree.config.root, node.id, n => ({ ...n, ...next })) }) }
+function callExpression(operation: string, args: EditorExpression[], unit: string): EditorExpression {
+  const expression: EditorExpression = { kind: 'call', source: '', unit, operation, arguments: args, choices: [] }
+  return { ...expression, source: expressionSource(expression) }
+}
+function resolvedExpression(source: string, tree: RuleTreeContext, unit = ''): EditorExpression {
+  const found = tree.expressions[source]
+  if (found) return found
+  if (source.trim() && Number.isFinite(Number(source))) return numberExpression(source)
+  const metric = tree.metrics.find(item => item.key.toLowerCase() === source.trim().toLowerCase())
+  return metric ? { ...rawExpression(metric.key, metric.unit), kind: 'name', value: metric.key, choices: metric.choices } : rawExpression(source, unit)
+}
+function defaultMultiple(node: RuleNode, tree: RuleTreeContext, unit: string): EditorExpression {
+  const source = resolvedExpression(node.left, tree, unit)
+  const lag = callExpression('lag', [source, numberExpression('1')], unit)
+  const mean = callExpression('mean', [lag, numberExpression('20')], unit)
+  return callExpression('multiple', [mean, numberExpression('2')], unit)
+}
+function averageMultipleParts(expression: EditorExpression, node: RuleNode, tree: RuleTreeContext, unit: string) {
+  const fallback = defaultMultiple(node, tree, unit)
+  const multiple = expressionName(expression) === 'multiple' ? expression : fallback
+  const candidate = multiple.arguments[0]
+  const baseline = candidate && expressionName(candidate) === 'mean' ? candidate : fallback.arguments[0]
+  const sample = baseline.arguments[0] ?? fallback.arguments[0].arguments[0]
+  const lag = expressionName(sample) === 'lag' ? sample : callExpression('lag', [sample, numberExpression('0')], unit)
+  return {
+    source: lag.arguments[0],
+    window: baseline.arguments[1] ?? numberExpression('20'),
+    offset: lag.arguments[1] ?? numberExpression('1'),
+    multiplier: multiple.arguments[1] ?? numberExpression('2'),
+  }
+}
+function NumericReferenceInput({ node, tree, field = 'right', displayLabel = 'Threshold / reference value' }: { node: RuleNode; tree: RuleTreeContext; field?: 'right' | 'upper'; displayLabel?: string }) {
+  const definitions = [...tree.config.definitions, ...(captureScope(tree.config.root, node.id) ?? [])]
+  const source = node[field]
+  const leftUnit = tree.units[node.left] ?? tree.metrics.find(item => item.key.toLowerCase() === node.left.trim().toLowerCase())?.unit ?? ''
+  const resolved = resolvedExpression(source, tree, leftUnit)
+  const mode = expressionName(resolved) === 'multiple' || /^multiple\s*\(/i.test(source) ? 'multiple' : source.trim() === '' || Number.isFinite(Number(source)) ? 'fixed' : 'value'
+  const shared = { metrics: tree.metrics, definitions, units: tree.units, expressions: tree.expressions, templates: tree.templates.filter(item => item.name.toLowerCase() !== 'multiple'), onExpressionDraft: tree.rememberExpression, allowArithmetic: false }
+  const replace = (expression: EditorExpression) => { tree.rememberExpression(expression); changeRule(tree, node, field === 'right' ? { right: expression.source } : { upper: expression.source }) }
+  const setMode = (next: string) => {
+    if (next === mode) return
+    if (next === 'fixed') replace(numberExpression('0'))
+    else if (next === 'multiple') replace(defaultMultiple(node, tree, leftUnit))
+    else replace(callExpression('lag', [resolvedExpression(node.left, tree, leftUnit), numberExpression('1')], leftUnit))
+  }
+  const multiple = expressionName(resolved) === 'multiple' ? resolved : defaultMultiple(node, tree, leftUnit)
+  const average = averageMultipleParts(multiple, node, tree, leftUnit)
+  const updateAverage = (next: Partial<typeof average>) => {
+    const parts = { ...average, ...next }
+    const lag = callExpression('lag', [parts.source, parts.offset], leftUnit)
+    const mean = callExpression('mean', [lag, parts.window], leftUnit)
+    replace(callExpression('multiple', [mean, parts.multiplier], leftUnit))
+  }
+  return <FieldGroup className="gap-3">
+    <Field><FieldLabel>{displayLabel}</FieldLabel><RulePicker label={`${displayLabel} type`} value={mode} choices={[["fixed", "Fixed threshold"], ["value", "Another value / indicator"], ["multiple", "Average × multiplier"]]} onChange={setMode} /></Field>
+    {mode === 'fixed' && <Field><FieldLabel>Threshold</FieldLabel><Input type="number" step="any" value={source} aria-label={field === 'upper' ? 'Maximum threshold' : 'Threshold'} onChange={event => changeRule(tree, node, field === 'right' ? { right: event.target.value } : { upper: event.target.value })} /><FieldDescription>{leftUnit || 'Numeric value'}</FieldDescription></Field>}
+    {mode === 'value' && <ExpressionInput label={field === 'upper' ? 'Maximum reference value' : 'Reference value'} displayLabel="Reference value" value={source} expression={resolved} onChange={next => changeRule(tree, node, { [field]: next })} unit={leftUnit} {...shared} />}
+    {mode === 'multiple' && <FieldGroup className="gap-3 rounded-lg border p-3">
+      <FieldGroup className="grid grid-cols-[minmax(0,2fr)_repeat(3,minmax(0,1fr))] items-start gap-3">
+        <ExpressionInput {...shared} templates={[]} allowTransforms={false} label={field === 'upper' ? 'Maximum baseline indicator' : 'Baseline indicator'} displayLabel="Baseline indicator" value={average.source.source} expression={average.source} onChange={(next, expression) => updateAverage({ source: expression ?? resolvedExpression(next, tree, leftUnit) })} unit={leftUnit} />
+        <Field><FieldLabel>Average window (h)</FieldLabel><Input type="number" min="1" step="1" value={average.window.value ?? average.window.source} aria-label={field === 'upper' ? 'Maximum baseline average window hours' : 'Baseline average window hours'} onChange={event => updateAverage({ window: numberExpression(event.target.value) })} /><FieldDescription>Hourly samples.</FieldDescription></Field>
+        <Field><FieldLabel>End offset (h)</FieldLabel><Input type="number" min="0" step="1" value={average.offset.value ?? average.offset.source} aria-label={field === 'upper' ? 'Maximum baseline end offset hours' : 'Baseline end offset hours'} onChange={event => updateAverage({ offset: numberExpression(event.target.value) })} /><FieldDescription>1 excludes live hour.</FieldDescription></Field>
+        <Field><FieldLabel>Multiplier</FieldLabel><Input type="number" min={Number.MIN_VALUE} step="any" value={average.multiplier.value ?? average.multiplier.source} aria-label={field === 'upper' ? 'Maximum baseline multiplier' : 'Baseline multiplier'} onChange={event => updateAverage({ multiplier: numberExpression(event.target.value) })} /><FieldDescription>Must be greater than 0.</FieldDescription></Field>
+      </FieldGroup>
+      <FieldDescription>The reference is the selected indicator's hourly average × multiplier. A zero, negative or unavailable average returns Unknown; the comparison never divides.</FieldDescription>
+    </FieldGroup>}
+  </FieldGroup>
+}
 function ConditionFields({ node, tree }: { node: RuleNode; tree: RuleTreeContext }) {
   const definitions = [...tree.config.definitions, ...(captureScope(tree.config.root, node.id) ?? [])]
   const propsUnit = (source: string) => tree.units[source] ?? tree.metrics.find(m => m.key.toLowerCase() === source.toLowerCase())?.unit
@@ -49,9 +117,9 @@ function ConditionFields({ node, tree }: { node: RuleNode; tree: RuleTreeContext
   return <FieldGroup className="gap-3">
     <Field><FieldLabel>Comparison</FieldLabel><RulePicker label="Comparison" value={node.kind === 'condition' ? node.comparison : node.kind} choices={categorical ? categoryComparisons : [...comparisons, ['crossup', 'Crosses above'], ['crossdown', 'Crosses below']]} onChange={comparison => changeRule(tree, node, comparison.startsWith('cross') ? { kind: comparison as RuleKind } : { kind: 'condition', comparison })} />{node.kind !== 'condition' && <FieldDescription>{ruleHelp(node.kind)}</FieldDescription>}</Field>
     <FieldGroup className="grid grid-cols-2 items-start gap-3">
-      <ExpressionInput label="Left expression" displayLabel="Indicator / value" value={node.left} onChange={left => changeRule(tree, node, { left })} onSelectExpression={(left, expression) => changeRule(tree, node, selectRuleLeft(node, left, tree.metrics, tree.expressions, tree.units, expression, tree.templates))} {...shared} />
-      {(node.kind !== 'condition' || !unaryComparison(node.comparison)) && <FieldGroup className="gap-3">{node.kind === 'condition' && categorical ? <CategoryValueInput label="Right expression" value={node.right} onChange={right => changeRule(tree, node, { right })} choices={choices} unit={propsUnit(node.left)} {...shared} /> : <ExpressionInput label={node.kind === 'condition' && node.comparison === 'between' ? 'Minimum expression' : 'Right expression'} displayLabel="Threshold / reference value" value={node.right} onChange={right => changeRule(tree, node, { right })} unit={propsUnit(node.left)} {...shared} />}
-        {node.kind === 'condition' && node.comparison === 'between' && <ExpressionInput label="Maximum expression" displayLabel="Maximum value" value={node.upper} onChange={upper => changeRule(tree, node, { upper })} unit={propsUnit(node.left)} {...shared} />}
+      <ExpressionInput label="Left expression" displayLabel="Indicator / value" value={node.left} onChange={left => changeRule(tree, node, { left })} onSelectExpression={(left, expression) => changeRule(tree, node, selectRuleLeft(node, left, tree.metrics, tree.expressions, tree.units, expression, tree.templates))} allowArithmetic={false} {...shared} />
+      {(node.kind !== 'condition' || !unaryComparison(node.comparison)) && <FieldGroup className="gap-3">{node.kind === 'condition' && categorical ? <CategoryValueInput label="Right expression" value={node.right} onChange={right => changeRule(tree, node, { right })} choices={choices} unit={propsUnit(node.left)} {...shared} /> : <NumericReferenceInput node={node} tree={tree} displayLabel={node.kind === 'condition' && node.comparison === 'between' ? 'Minimum reference' : 'Threshold / reference value'} />}
+        {node.kind === 'condition' && node.comparison === 'between' && <NumericReferenceInput node={node} tree={tree} field="upper" displayLabel="Maximum reference" />}
       </FieldGroup>}
     </FieldGroup>
   </FieldGroup>

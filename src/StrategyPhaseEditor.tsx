@@ -33,8 +33,8 @@ export function StrategyPhaseEditor({ label, model, inputs, preferences, onPrefe
   return <section aria-label={label} className="flex flex-col gap-3" data-strategy-rules>
     <FieldDescription className="px-4">{description} Keep rules for preview; Save strategy applies all five configurations together.</FieldDescription>
     <StrategyRules label={label} embedded atClose strategyID={strategyID} filters={model.filters} draft={model.draft} editor={model.editor} onEditorChange={model.setEditor} onDraftChange={model.setDraft} onApply={model.keep}
-      metrics={metrics} functions={inputs.functions ?? inputs.templates.map(t => t.name)} templates={inputs.templates} preferences={preferences} onPreferences={onPreferences}
-      rows={rows} results={results} previewJSON={previewJSON} revision={revision} onExplain={setExplaining} units={model.compilation.units ?? {}} expressions={expressions} formula={model.compilation.formula ?? 'true'}
+      metrics={metrics} templates={inputs.templates} preferences={preferences} onPreferences={onPreferences}
+      rows={rows} results={results} previewJSON={previewJSON} revision={revision} onExplain={setExplaining} units={model.compilation.units ?? {}} expressions={expressions}
       diagnostics={model.compilation.diagnostics} valid={model.valid} compiling={model.compiling} requiredHours={model.compilation.requiredHours ?? 0}
       matches={Object.values(results).filter(v => v === 'true').length} total={rows.length} unknown={Object.values(results).filter(v => v === 'unknown').length} previewPending={previewJSON !== model.lastValid} history={history} />
     <FilterExplanation open={active && Boolean(explaining)} onOpenChange={open => { if (!open) setExplaining(null) }} instId={explaining} onSelect={setExplaining} rows={rows} results={results} filtersJSON={previewJSON} revision={revision}

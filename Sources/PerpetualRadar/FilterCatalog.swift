@@ -71,6 +71,7 @@ enum FilterCatalog {
             result.append(transform(name, label, "source unit", [source, P(label: "Window hours", kind: "number")], ["Volume", "20"], "Includes the evaluated hour and preceding hourly slots. Add a one-hour offset to use only previous closed candles. Any missing slot makes this value Unknown."))
         }
         result += [
+            transform("multiple", "Positive baseline multiple", "source unit", [source, P(label: "Multiplier", kind: "number", minimum: Double.leastNonzeroMagnitude, step: "any", unit: "× baseline")], ["mean(lag(Volume, 1), 20)", "2"], "Multiplies a strictly positive baseline by a positive constant. A zero, negative or unavailable baseline is Unknown."),
             transform("lag", "Historical offset", "source unit", [source, P(label: "Offset hours", kind: "number", minimum: 0)], ["Volume", "1"], "Reads the source that many hours before the rule's evaluation hour."),
             transform("change", "Change rate", "%", [source, P(label: "Offset hours", kind: "number")], ["Price", "1"], "Percentage change from the earlier value, divided by its absolute value."),
             transform("closed", "Previous closed hour", "source unit", [source], ["Price"], "Shifts this value one hour before the rule's anchor. A parent Closed anchor also applies."),

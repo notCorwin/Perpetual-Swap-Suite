@@ -305,6 +305,13 @@ final class FilterEvaluator {
             if f == "closed" { return eval(args[0], hour - hourMS) }
             if f == "live" { return eval(args[0]) }
             if f == "abs" { let value = eval(args[0]); return value.number.map { .number(abs($0)) } ?? value }
+            if f == "multiple" {
+                let baseline = eval(args[0]), multiplier = eval(args[1])
+                guard let base = baseline.number, let factor = multiplier.number else { return .unknown(baseline.reason ?? multiplier.reason ?? "The baseline is unavailable.") }
+                guard base > 0 else { return .unknown("The baseline must be greater than zero.") }
+                let value = base * factor
+                return value.isFinite ? .number(value) : .unknown("The baseline multiple is outside the supported numeric range.")
+            }
             if f == "lag" { return eval(args[0], hour - Int64(try! FilterParser.integer(args[1], zero: true)) * hourMS) }
             if f == "change" { return change(eval(args[0]), eval(args[0], hour - Int64(try! FilterParser.integer(args[1])) * hourMS)) }
             if ["mean", "sum", "highest", "lowest", "stddev"].contains(f) {
@@ -352,7 +359,7 @@ final class FilterEvaluator {
             let f = name.lowercased()
             if f == "closed" { return readingHours(args[0], at: hour-hourMS) }
             if f == "lag" { return readingHours(args[0], at: hour-Int64(try! FilterParser.integer(args[1], zero: true))*hourMS) }
-            if ["live", "abs"].contains(f) { return readingHours(args[0], at: hour) }
+            if ["live", "abs", "multiple"].contains(f) { return readingHours(args[0], at: hour) }
             if ["mean", "sum", "highest", "lowest", "stddev", "change"].contains(f) {
                 // The selected endpoints describe the source interval without
                 // allocating one provenance record per potentially huge slot.

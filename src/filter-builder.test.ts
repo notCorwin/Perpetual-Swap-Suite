@@ -41,7 +41,7 @@ test('ready-to-use rules encode complete windows, closed anchors and frozen even
   const body = preset('preset:body')
   assert.equal(body.mode, 'closed'); assert.equal(body.kind, 'every'); assert.equal(body.hours, 48)
   assert.deepEqual(body.children[0].children.map(n => [n.left, n.comparison, n.right, n.mode]), [['Open', 'gt', 'EMA(200)', 'live'], ['Close', 'gt', 'EMA(200)', 'live']])
-  assert.equal(preset('preset:volume').right, '(mean(lag(Volume, 1), 20) * 2)')
+  assert.equal(preset('preset:volume').right, 'multiple(mean(lag(Volume, 1), 20), 2)')
   const rsi = preset('preset:rsi'); assert.equal(rsi.mode, 'closed'); assert.equal(rsi.hours, 3)
   const sequence = preset('preset:sequence')
   assert.equal(sequence.hours, 6)

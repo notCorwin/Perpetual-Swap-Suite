@@ -19,15 +19,14 @@ export function useStrategyFilter(initial: string, suitePhase?: string) {
       } catch (cause) { if (!stopped) setCompilation({ key, pending: false, diagnostics: [cause instanceof Error ? cause.message : 'Cannot compile these strategy rules.'] }) }
     }, 150)
     return () => { stopped = true; window.clearTimeout(timer) }
-    // The Formula source remains the input when its compiled tree replaces the
-    // visual draft. Match Radar's compiler key to avoid validating that output again.
+    // Match the compiler key so a completed native validation is not repeated.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, suitePhase])
   const reset = useCallback((next: string) => {
     setFilters(parseFilterConfig(next)); setDraft(null); setEditor({ ...initialEditorState(), open: true }); setLastValid(null); setGeneration(current => current + 1)
   }, [])
   const restore = useCallback((value: { json: string; source: string|null; nameDrafts: typeof editor.nameDrafts; expressionDrafts: typeof editor.expressionDrafts; lastValid: string|null }) => {
-    setFilters(parseFilterConfig(value.json)); setDraft(null); setEditor({ ...initialEditorState(),open:true,source:value.source,nameDrafts:value.nameDrafts,expressionDrafts:value.expressionDrafts });setLastValid(value.lastValid);setGeneration(g=>g+1)
+    setFilters(parseFilterConfig(value.json)); setDraft(null); setEditor({ ...initialEditorState(),open:true,source:null,nameDrafts:value.nameDrafts,expressionDrafts:value.expressionDrafts });setLastValid(value.lastValid);setGeneration(g=>g+1)
   },[])
   const compiling = compilation.pending || compilation.key !== key
   const valid = !compiling && !compilation.diagnostics.length && Boolean(compilation.configJSON) && !Object.keys(editor.nameDrafts).length
