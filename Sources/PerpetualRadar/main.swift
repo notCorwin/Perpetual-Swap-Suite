@@ -45,7 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? FileManager.default.removeItem(at: MonitorRuntime.updateSuppressionURL)
-        let launchInBackground = ProcessInfo.processInfo.environment["PERPETUAL_RADAR_BACKGROUND"] == "1"
+        let launchInBackground = MonitorRuntime.testChannel != nil || ProcessInfo.processInfo.environment["PERPETUAL_RADAR_BACKGROUND"] == "1"
         if let path = ProcessInfo.processInfo.environment["PERPETUAL_RADAR_PID_FILE"], !path.isEmpty {
             FileManager.default.createFile(atPath: path, contents: Data(String(ProcessInfo.processInfo.processIdentifier).utf8))
         }
@@ -92,9 +92,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         webView.navigationDelegate = self
         webView.setValue(false, forKey: "drawsBackground")
         webView.underPageBackgroundColor = .clear
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1440, height: 900),
-                          styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-                          backing: .buffered, defer: false)
+        let windowType: NSWindow.Type = MonitorRuntime.testChannel == nil ? NSWindow.self : BackgroundTestWindow.self
+        window = windowType.init(contentRect: NSRect(x: 0, y: 0, width: 1440, height: 900),
+                                 styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                                 backing: .buffered, defer: false)
         window.title = "Perpetual Swap Radar"
         window.isReleasedWhenClosed = false
         applyAppearance(Self.preferredAppearance())
@@ -125,13 +126,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                     if let request = body["suite"] as? [String: Any] { value = try await monitorClient.request(["suite":request]) }
                     if let request = body["research"] as? [String: Any] { value = try await researchCache.get().handle(request) }
                     if let request = body["monitor"] as? [String: Any] { value = try await monitorClient.request(request) }
-                    if body["minimize"] as? Bool == true {
-                        let edge = NSScreen.screens.map { $0.frame.maxX }.max() ?? 1440
-                        NSApp.setActivationPolicy(.regular)
-                        window.setFrameOrigin(NSPoint(x: edge+1000, y: 0)); window.animationBehavior = .none
-                        window.orderBack(nil); window.miniaturize(nil)
+                    if body["hideWindow"] as? Bool == true {
+                        // Dock miniaturization requires a regular application
+                        // and exposes a desktop icon. Exercise hidden-window
+                        // research lifecycle here; delegate callbacks have
+                        // their own native tests without invoking the Dock.
+                        window.orderOut(nil)
+                        updateRelaunchPresentation()
                     }
-                    value["minimized"] = window.isMiniaturized
+                    if body["showWindow"] as? Bool == true { showWindow() }
+                    value["windowHidden"] = !window.isVisible
                     value["windowTitle"] = window.title
                     if body["close"] as? Bool == true { Task { try? await Task.sleep(for: .milliseconds(50)); self.window.performClose(nil) } }
                     return try JSONSerialization.data(withJSONObject: ["value": value])
@@ -230,6 +234,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc private func showWindow() {
         guard let window else { return }
+        if MonitorRuntime.testChannel != nil {
+            window.orderBack(nil)
+            updateRelaunchPresentation()
+            applyWindowBackground()
+            return
+        }
         NSApp.setActivationPolicy(.regular)
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
@@ -256,13 +266,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         Task { if let info = try? await monitorClient.request(["serviceInfo": true]) { acceptNativeSettings(info) } }
     }
 
-    private func updateRelaunchPresentation() {
-        guard let window else { return }
+    private func updateRelaunchPresentation(for presentedWindow: NSWindow? = nil) {
+        guard let window = presentedWindow ?? window else { return }
         MonitorRuntime.defaults.set(MonitorRuntime.backgroundMonitoringEnabled && (!window.isVisible || window.isMiniaturized || NSApp.isHidden), forKey: AppUpdater.backgroundRelaunchKey)
     }
 
-    func windowDidMiniaturize(_ notification: Notification) { updateRelaunchPresentation() }
-    func windowDidDeminiaturize(_ notification: Notification) { updateRelaunchPresentation() }
+    func windowDidMiniaturize(_ notification: Notification) { updateRelaunchPresentation(for: notification.object as? NSWindow) }
+    func windowDidDeminiaturize(_ notification: Notification) { updateRelaunchPresentation(for: notification.object as? NSWindow) }
     func applicationDidHide(_ notification: Notification) { updateRelaunchPresentation() }
     func applicationDidUnhide(_ notification: Notification) { updateRelaunchPresentation() }
 
@@ -444,7 +454,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 }
 
 let application = NSApplication.shared
-application.setActivationPolicy(MonitorRuntime.isHelper || ProcessInfo.processInfo.environment["PERPETUAL_RADAR_BACKGROUND"] == "1" ? .accessory : .regular)
+application.setActivationPolicy(MonitorRuntime.testChannel != nil || MonitorRuntime.isHelper || ProcessInfo.processInfo.environment["PERPETUAL_RADAR_BACKGROUND"] == "1" ? .accessory : .regular)
 let delegate: any NSApplicationDelegate = MonitorRuntime.isHelper ? MonitorDelegate() : AppDelegate()
 application.delegate = delegate
 application.run()

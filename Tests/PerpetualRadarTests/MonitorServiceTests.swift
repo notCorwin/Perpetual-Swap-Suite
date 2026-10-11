@@ -3,43 +3,24 @@ import CoreFoundation
 import XCTest
 @testable import PerpetualRadar
 
-@MainActor
-private final class BackgroundFocusAudit {
-    private var activatedPIDs = Set<Int32>()
-    private var observer: NSObjectProtocol?
-
-    init() {
-        observer = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] notification in
-            guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
-            let pid = application.processIdentifier
-            MainActor.assumeIsolated { self?.activatedPIDs.insert(pid) }
-        }
-    }
-    func assertBackground(_ pids: [Int32], file: StaticString = #filePath, line: UInt = #line) {
-        var activated = activatedPIDs
-        if let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier { activated.insert(pid) }
-        XCTAssertTrue(activated.isDisjoint(with: pids), "Packaged CI activated a test process: \(activated.intersection(pids))", file: file, line: line)
-    }
-    func stop() { if let observer { NSWorkspace.shared.notificationCenter.removeObserver(observer) }; observer = nil }
-}
-
-final class MonitorServiceTests: XCTestCase {
+final class MonitorServiceTests: BackgroundTestCase {
     @MainActor
     func testPackagedDatabaseStartupFailuresRecoverInPlaceAndRetainSettings() async throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["RADAR_SERVICE_TESTS"] == "1", "Run after packaging; the application stays hidden.")
-        let app = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/app/Perpetual Swap Suite.app")
+        let builtApp = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/app/Perpetual Swap Suite.app")
         let channel = UUID().uuidString, name = "com.perpetualradar.monitor.\(getuid()).\(channel)", suite = "RadarServiceTests.\(channel)"
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(channel), defaults = UserDefaults(suiteName: suite)!
         let radarURL = directory.appendingPathComponent("radar.sqlite3"), researchDirectory = directory.appendingPathComponent("Research")
         let researchURL = researchDirectory.appendingPathComponent("research.sqlite3")
         let config = try FilterCompiler.compile(source: "Close > 105").config.json
-        let focus = BackgroundFocusAudit(); defer { focus.stop() }
+        let focus = BackgroundTestAudit(); defer { focus.stop() }
         let process = Process(); var helperPID: Int32?
         defer {
             if process.isRunning { process.terminate() }
             if let helperPID { kill(helperPID, SIGTERM) }
             defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory)
         }
+        let app = try backgroundTestApp(from: builtApp, in: directory)
         defaults.set(false, forKey: "BackgroundMonitoring"); defaults.set(false, forKey: "AutomaticallyInstallUpdates")
         do {
             let radar = try Radar(defaults: defaults, storeURL: radarURL)
@@ -125,12 +106,12 @@ final class MonitorServiceTests: XCTestCase {
     }
 
     @MainActor
-    func testPackagedOnDemandResearchMinimizeCloseQuitCrashAndManualResume() async throws {
+    func testPackagedOnDemandResearchHiddenWindowCloseQuitCrashAndManualResume() async throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["RADAR_SERVICE_TESTS"] == "1", "Package the app and set RADAR_SERVICE_TESTS=1.")
-        let app = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/app/Perpetual Swap Suite.app")
+        let builtApp = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/app/Perpetual Swap Suite.app")
         let channel = UUID().uuidString, name = "com.perpetualradar.monitor.\(getuid()).\(channel)", suite = "RadarServiceTests.\(channel)"
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(channel), defaults = UserDefaults(suiteName: suite)!
-        let focus = BackgroundFocusAudit(); defer { focus.stop() }
+        let focus = BackgroundTestAudit(); defer { focus.stop() }
         let store = try ResearchStore(directory: directory.appendingPathComponent("Research"))
         try ResearchFixture.seed(store, bars: ResearchFixture.bars(through: ResearchFixture.hour+3048*hourMS))
         let spec = try ResearchFixture.spec(through: ResearchFixture.hour+3000*hourMS), plan = ResearchFixture.plan(spec)
@@ -142,11 +123,12 @@ final class MonitorServiceTests: XCTestCase {
             if let helperPID { kill(helperPID, SIGTERM) }
             defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory)
         }
+        let app = try backgroundTestApp(from: builtApp, in: directory)
         func launch() throws -> Process {
             let process = Process(); process.executableURL = app.appendingPathComponent("Contents/MacOS/PerpetualRadar")
             var environment = ProcessInfo.processInfo.environment
             environment["PERPETUAL_RADAR_TEST_CHANNEL"] = channel; environment["PERPETUAL_RADAR_TEST_DIRECTORY"] = directory.path
-            environment["PERPETUAL_RADAR_BACKGROUND"] = "1"; process.environment = environment
+            environment.removeValue(forKey: "PERPETUAL_RADAR_BACKGROUND"); process.environment = environment
             process.standardOutput = FileHandle.nullDevice
             let log = URL(fileURLWithPath: "/tmp/perp-research-packaged-\(processes.count).log")
             FileManager.default.createFile(atPath: log.path, contents: Data()); process.standardError = try FileHandle(forWritingTo: log)
@@ -199,8 +181,9 @@ final class MonitorServiceTests: XCTestCase {
         let inventory = try await request(["research": ["action": "inventory"]], interface: true)
         let studyID = try XCTUnwrap((inventory["job"] as? [String: Any])?["resultID"] as? String)
         _ = try await request(["research": ["action": "run", "studyID": studyID]], interface: true)
-        _ = try await request(["minimize": true], interface: true)
-        try await wait("minimized") { (try await request([:], interface: true))["minimized"] as? Bool == true }
+        _ = try await request(["showWindow": true], interface: true)
+        _ = try await request(["hideWindow": true], interface: true)
+        try await wait("hidden") { (try await request([:], interface: true))["windowHidden"] as? Bool == true }
         try await wait("checkpoint") { (try store.get("checkpoint:\(studyID)", as: Checkpoint.self))?.nextHour != nil }
         _ = try await request(["close": true], interface: true)
         let oldHelper = helperPID!
@@ -251,13 +234,13 @@ final class MonitorServiceTests: XCTestCase {
     private func checkPackagedMonitorLifecycle(preferencesMatchBundleIdentifier: Bool) async throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["RADAR_SERVICE_TESTS"] == "1", "Run after packaging with RADAR_SERVICE_TESTS=1; every process remains in the background.")
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        var app = root.appendingPathComponent(".build/app/Perpetual Swap Suite.app")
+        let builtApp = root.appendingPathComponent(".build/app/Perpetual Swap Suite.app")
         let channel = UUID().uuidString, name = "com.perpetualradar.monitor.\(getuid()).\(channel)"
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(channel)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let suite = "RadarServiceTests.\(channel)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        let focus = BackgroundFocusAudit(); defer { focus.stop() }
+        let focus = BackgroundTestAudit(); defer { focus.stop() }
         var processes: [Process] = []
         var monitorPID: Int32?
         defer {
@@ -266,22 +249,9 @@ final class MonitorServiceTests: XCTestCase {
             defaults.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: directory)
         }
-        if preferencesMatchBundleIdentifier {
-            // Mirror the production app's own preference domain without touching real settings.
-            let isolatedApp = directory.appendingPathComponent("Perpetual Swap Suite.app")
-            try FileManager.default.copyItem(at: app, to: isolatedApp)
-            app = isolatedApp
-            let plistURL = app.appendingPathComponent("Contents/Info.plist")
-            var plist = try XCTUnwrap(try PropertyListSerialization.propertyList(from: Data(contentsOf: plistURL), options: [], format: nil) as? [String: Any])
-            plist["CFBundleIdentifier"] = suite
-            try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0).write(to: plistURL)
-            let signer = Process()
-            signer.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-            signer.arguments = ["--force", "--sign", "-", app.path]
-            signer.standardOutput = FileHandle.nullDevice; signer.standardError = FileHandle.nullDevice
-            try signer.run(); signer.waitUntilExit()
-            XCTAssertEqual(signer.terminationStatus, 0)
-        }
+        // Also exercise the production preference-domain relationship in an
+        // isolated bundle, with background metadata set before process launch.
+        let app = try backgroundTestApp(from: builtApp, in: directory, bundleIdentifier: preferencesMatchBundleIdentifier ? suite : nil)
         defaults.set(true, forKey: "BackgroundMonitoring")
         defaults.set(false, forKey: "AutomaticallyInstallUpdates")
         defaults.set(false, forKey: AppUpdater.backgroundRelaunchKey)

@@ -5,11 +5,11 @@
   "type": "module",
   "scripts": {
     "build": "tsc -b && vite build",
-    "lint": "oxlint src && node --experimental-strip-types scripts/check-surfaces.ts",
+    "lint": "oxlint src && node --experimental-strip-types scripts/check-surfaces.ts && node --experimental-strip-types scripts/check-background-tests.ts",
     "test": "scripts/test-native.sh && node --experimental-strip-types --test src/*.test.ts",
-    "ci:local": "npm test && npm run lint && CI=1 npm run app && RADAR_UI_TESTS=1 RADAR_SERVICE_TESTS=1 scripts/test-native.sh --filter 'RuleEditorUITests|MonitorServiceTests'",
+    "ci:local": "npm test && npm run lint && CI=1 npm run app && RADAR_UI_TESTS=1 RADAR_VISUAL_TESTS=1 RADAR_SERVICE_TESTS=1 scripts/test-native.sh --filter 'RuleEditorUITests|MonitorServiceTests'",
     "app": "scripts/build-app.sh",
-    "test:ui": "npm run build && RADAR_UI_TESTS=1 scripts/test-native.sh --filter RuleEditorUITests",
+    "test:ui": "npm run build && RADAR_UI_TESTS=1 RADAR_VISUAL_TESTS=1 scripts/test-native.sh --filter RuleEditorUITests",
     "test:ui:visual": "npm run build && RADAR_UI_TESTS=1 RADAR_VISUAL_TESTS=1 scripts/test-native.sh --filter RuleEditorUITests.testAllSurfaceFamiliesAndChartCaptureInNativeWebKit"
   },
   "dependencies": {

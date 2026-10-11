@@ -4,15 +4,6 @@ import ScreenCaptureKit
 import XCTest
 @testable import PerpetualRadar
 
-@MainActor
-private final class BackgroundTestWindow: NSWindow {
-    // WindowServer marks windows beyond the display edges as occluded. Keep
-    // WebKit's real compositor clock active without showing or focusing them.
-    override var occlusionState: NSWindow.OcclusionState {
-        ProcessInfo.processInfo.environment["RADAR_VISUAL_TESTS"] == "1" ? super.occlusionState : super.occlusionState.union(.visible)
-    }
-}
-
 // Exercises the actual packaged-origin WebKit renderer and promise bridge with
 // native compile/evaluation/persistence and a deterministic 500-market feed.
 @MainActor
@@ -254,8 +245,8 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
     func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {}
 }
 
-final class RuleEditorUITests: XCTestCase {
-    private var visualUI: Bool { ProcessInfo.processInfo.environment["RADAR_VISUAL_TESTS"] == "1" }
+final class RuleEditorUITests: BackgroundTestCase {
+    private var capturePixels: Bool { ProcessInfo.processInfo.environment["RADAR_VISUAL_TESTS"] == "1" }
 
     @MainActor
     private func showAllMarkets(_ view: WKWebView) async throws {
@@ -272,19 +263,11 @@ final class RuleEditorUITests: XCTestCase {
     }
 
     @MainActor
-    private func present(_ window: NSWindow) {
-        NSApp.setActivationPolicy(.accessory)
-        if visualUI {
-            window.level = .floating
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-        } else {
-            // Keep a real laid-out WebKit window without occupying the user's
-            // screen, changing focus, or creating a Dock icon during local CI.
-            let edge = NSScreen.screens.map { $0.frame.maxX }.max() ?? 1440
-            window.setFrameOrigin(NSPoint(x: edge + 1000, y: 0))
-            window.orderBack(nil)
-        }
+    private func present(_ window: BackgroundTestWindow) {
+        window.orderBack(nil)
+        XCTAssertFalse(NSScreen.screens.contains { $0.frame.intersects(window.frame) })
+        XCTAssertFalse(window.isKeyWindow)
+        XCTAssertFalse(window.isMainWindow)
     }
 
     @MainActor
@@ -986,12 +969,8 @@ final class RuleEditorUITests: XCTestCase {
     @MainActor
     func testAllSurfaceFamiliesAndChartCaptureInNativeWebKit() async throws {
         guard ProcessInfo.processInfo.environment["RADAR_UI_TESTS"] == "1" else { throw XCTSkip("Run npm run test:ui after building the Web renderer.") }
-        if visualUI {
+        if capturePixels {
             guard #available(macOS 14.4, *) else { throw XCTSkip("Current-process window capture requires macOS 14.4.") }
-            let session = CGSessionCopyCurrentDictionary() as? [String: Any]
-            guard CGDisplayIsAsleep(CGMainDisplayID()) == 0, session?["CGSSessionScreenIsLocked"] as? Bool != true else {
-                throw XCTSkip("Foreground pixel acceptance requires an awake, unlocked display; background material and interaction checks remain in local CI.")
-            }
         }
         let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist")), configuration = uiConfiguration()
@@ -1022,7 +1001,7 @@ final class RuleEditorUITests: XCTestCase {
             try await wait(view, "document.querySelector('#background-opacity') !== null")
             try await assertSharedSurfaces(view, opacity: 0.3)
             try await glassScreenshots(view, window: window, project: project, name: "settings-\(theme)")
-            if visualUI { try await assertBackdropPixels(view, project: project, theme: theme, selector: "[data-slot=\"popover-content\"]", name: "settings") }
+            if capturePixels { try await assertBackdropPixels(view, project: project, theme: theme, selector: "[data-slot=\"popover-content\"]", name: "settings") }
             try await dismissFloating(view)
 
             try await click(view, "Universe rules")
@@ -1033,7 +1012,7 @@ final class RuleEditorUITests: XCTestCase {
             try await wait(view, "document.querySelector('[data-rule-library]') !== null")
             try await assertSharedSurfaces(view, opacity: 0.3)
             try await glassScreenshots(view, window: window, project: project, name: "library-\(theme)")
-            if visualUI { try await assertBackdropPixels(view, project: project, theme: theme, selector: "[data-rule-library]", name: "library") }
+            if capturePixels { try await assertBackdropPixels(view, project: project, theme: theme, selector: "[data-rule-library]", name: "library") }
             try await input(view, "[data-rule-library] [cmdk-input]", "Price")
             _ = try await js(view, "document.querySelector('[data-library-id=\"metric:price\"]').click(); true")
             try await wait(view, "document.querySelector('[data-rule-library][data-state=\"open\"]') === null")
@@ -1088,7 +1067,7 @@ final class RuleEditorUITests: XCTestCase {
     }
 
     @MainActor
-    private func glassScreenshots(_ view: WKWebView, window: NSWindow, project: URL, name: String) async throws {
+    private func glassScreenshots(_ view: WKWebView, window: BackgroundTestWindow, project: URL, name: String) async throws {
         for width in [1440, 720] {
             window.setContentSize(NSSize(width: width, height: 900))
             present(window)
@@ -1099,10 +1078,10 @@ final class RuleEditorUITests: XCTestCase {
             XCTAssertEqual(overflow, false)
             let squeezedLabels = try await js(view, "(() => { const scale=Number(getComputedStyle(document.documentElement).getPropertyValue('--market-list-scale')); return Array.from(document.querySelectorAll('[aria-label=\"Rule decision details\"] summary > span.flex-1')).some(x=>x.getBoundingClientRect().width < 100*scale); })()") as? Bool
             XCTAssertEqual(squeezedLabels, false, "Portaled rule details must retain readable label widths when the window scales.")
-            if !visualUI && name.starts(with: "explanation-") {
+            if !capturePixels && name.starts(with: "explanation-") {
                 try await screenshot(view, project.appendingPathComponent(".build/ui-qa/glass-dialog-layout-\(name)-\(width).png"))
             }
-            if !visualUI { continue }
+            if !capturePixels { continue }
             let file = project.appendingPathComponent(".build/ui-qa/glass-\(name)-\(width).png")
             let image = try await nativeRendererSnapshot(view)
             // Flatten the native window capture for portable QA artifacts.

@@ -176,16 +176,16 @@ Run the complete local CI before pushing:
 npm run ci:local
 ```
 
-This runs Swift and TypeScript tests, lint and surface-contract checks, a full macOS app build, real WKWebView interaction/material checks, and isolated monitor lifecycle tests. Routine test windows run in the background without taking focus or occupying visible displays.
+This runs Swift and TypeScript tests, lint and surface-contract checks, a full macOS app build, real WKWebView interaction/material checks, and isolated monitor lifecycle tests. Every test runs in the background without taking focus, occupying visible displays, or creating Dock icons. Native test windows remain outside every connected display even when resized, centered, or reordered; runtime audits check window bounds, activation, and Dock eligibility.
 
 | Command | Purpose |
 | --- | --- |
 | `npm test` | Swift tests in isolated preference/cache domains, then TypeScript tests |
-| `npm run lint` | Oxlint and the shared component surface-contract check |
-| `npm run test:ui` | Build the renderer and run native WKWebView checks in background windows |
-| `npm run test:ui:visual` | Opt-in foreground pixel acceptance for materials and chart capture; use an awake, unlocked display |
+| `npm run lint` | Oxlint, shared component surface contracts, and the background-test contract |
+| `npm run test:ui` | Build the renderer and run native WKWebView interaction, material, and pixel checks offscreen |
+| `npm run test:ui:visual` | Run the focused material and chart pixel acceptance suite entirely offscreen |
 
-UI review snapshots are saved under `.build/ui-qa`. Functional material and interaction checks remain part of local CI; foreground pixel captures are a separate opt-in step.
+UI review snapshots are saved under `.build/ui-qa`. Functional checks, material checks, and native compositor pixel captures are all part of local CI. Screenshots capture only the test window, including real backdrop filters, without displaying it. Packaged lifecycle tests use isolated, re-signed app copies with `LSUIElement` set before launch, preventing a Dock icon before Swift starts. They hide the research window without invoking Dock animations; native miniaturize/deminiaturize callbacks are covered separately. There is no foreground test mode, including when `RADAR_VISUAL_TESTS=1`.
 
 GitHub Actions handles **CD only**. Every push to `main` builds and packages the app, publishes `Perpetual.Swap.Suite.app.tar` and `update.json`, and moves the single `autobuild` release/tag to that commit. The workflow does not run the test or lint suites.
 

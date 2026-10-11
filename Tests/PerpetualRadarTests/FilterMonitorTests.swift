@@ -2,7 +2,7 @@ import AppKit
 import XCTest
 @testable import PerpetualRadar
 
-final class FilterMonitorTests: XCTestCase {
+final class FilterMonitorTests: BackgroundTestCase {
     @MainActor
     func testLongNotificationsAggregateStrategiesAndPreserveDedupThroughUnknown() throws {
         let strategy = LongStrategy(name: "First", entryJSON: try FilterCompiler.compile(source: "Close > 0").config.json, exitJSON: try FilterCompiler.compile(source: "Close < 0").config.json)
@@ -138,13 +138,11 @@ final class FilterMonitorTests: XCTestCase {
         defaults.set(true, forKey: "BackgroundMonitoring")
         let app = NSApplication.shared, delegate = AppDelegate()
         app.setActivationPolicy(.accessory)
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 200),
+        let window = BackgroundTestWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 200),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.delegate = delegate
         let previousPreference = MonitorRuntime.defaults.object(forKey: AppUpdater.backgroundRelaunchKey)
-        let screenEdge = NSScreen.screens.map { $0.frame.maxX }.max() ?? 1440
-        window.setFrameOrigin(NSPoint(x: screenEdge + 1000, y: 0))
         window.orderBack(nil)
         XCTAssertTrue(window.isVisible)
         var samples = 0, changes: [FilterMembershipChange] = [], errors: [String] = [], longChanges: [LongExitChange] = []
