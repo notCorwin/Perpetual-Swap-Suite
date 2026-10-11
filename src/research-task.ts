@@ -25,7 +25,8 @@ export function researchFilePercent(job: ResearchJob) {
 }
 
 export function researchWaiting(job: ResearchJob, now: number) {
-  if (!researchTaskActive(job) || !['connecting', 'downloading', 'fetching'].includes(job.preparation?.stage ?? '')) return ''
+  const network = job.catalog?.waitingForResponse || ['connecting', 'downloading', 'fetching'].includes(job.preparation?.stage ?? '')
+  if (!researchTaskActive(job) || !network) return ''
   const elapsed = Math.max(0, (now - (job.updatedAt ?? now)) / 1000)
   return elapsed >= 15 ? 'No data received for ' + researchDuration(elapsed) + '. Waiting for OKX; no error has been reported.' : ''
 }

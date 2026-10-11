@@ -570,6 +570,12 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await wait(view,"!document.body.innerText.includes('Research cache temporarily locked')")
         let recoveredName = try await js(view,"document.querySelector('#study-name').value") as? String
         XCTAssertEqual(recoveredName,"WKWebView experiment", "Reconnection must preserve the research draft.")
+        bridge.researchJobOverride = ["id": "catalog", "phase": "planning", "completed": 4, "total": 8, "message": "Checking spread archive catalog", "error": "", "updatedAt": researchNow() - 20_000,
+            "catalog": ["kind": "spread", "completed": 4, "total": 8, "message": "Checking spread archive catalog", "waitingForResponse": true, "remainingSeconds": 60]]
+        try await wait(view, "document.querySelector('[data-research-task]')?.innerText.includes('Catalog pages checked: 4 / 8') && document.querySelector('[data-research-task]')?.innerText.includes('No data received for')")
+        let catalogStatus = try await js(view, "document.querySelector('[data-research-task]').innerText") as? String ?? ""
+        XCTAssertTrue(catalogStatus.contains("file downloads start after Prepare Data"))
+        XCTAssertTrue(catalogStatus.contains("Estimated catalog time remaining: About 1m 0s"))
         bridge.researchJobOverride = ["id": "transfer", "phase": "preparing", "completed": 3, "total": 10, "message": "BTC-USDT-SWAP-2025-06.zip", "error": "", "startedAt": researchNow() - 60_000, "updatedAt": researchNow(),
             "preparation": ["stage": "downloading", "filename": "BTC-USDT-SWAP-2025-06.zip", "instrument": "BTC-USDT-SWAP", "receivedBytes": 50_000_000, "totalBytes": 100_000_000, "bytesPerSecond": 1_000_000, "fileRemainingSeconds": 50, "remainingSeconds": 600, "pages": 0]]
         try await wait(view, "document.querySelector('[aria-label=\"Current file download progress\"]')?.getAttribute('aria-valuenow') === '50'")

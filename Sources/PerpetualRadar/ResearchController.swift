@@ -27,10 +27,10 @@ actor ResearchWorker {
     init(directory: URL, transport: any ResearchTransport = OKXResearchTransport(), radarURL: URL? = nil) {
         self.directory = directory; self.transport = transport; self.radarURL = radarURL
     }
-    func plan(_ spec: StudySpec, refresh: Bool, owner: String, progress: @escaping @Sendable (String) async -> Void) async throws -> DataPlan {
+    func plan(_ spec: StudySpec, refresh: Bool, owner: String, catalogProgress: @escaping @Sendable (ResearchCatalogProgress) async -> Void, progress: @escaping @Sendable (String) async -> Void) async throws -> DataPlan {
         let store = try ResearchStore(directory: directory)
         let provider = ResearchDataProvider(store: store, transport: transport, radarURL: radarURL)
-        let plan = try await provider.plan(spec, refresh: refresh, progress: progress)
+        let plan = try await provider.plan(spec, refresh: refresh, catalogProgress: catalogProgress, progress: progress)
         try store.pinInputs(plan, owner: owner)
         return plan
     }
@@ -184,10 +184,11 @@ final class ResearchController {
         activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep, reason: "Complete user-requested research while the window is minimized")
         let id = UUID().uuidString; status = .init(id: id, phase: phase); activeStudyID = studyID; onBusyChanged?(true); return id
     }
-    private func advance(_ id: String, completed: Int, total: Int, message: String, preparation: ResearchPreparationProgress? = nil) {
+    private func advance(_ id: String, completed: Int, total: Int, message: String, preparation: ResearchPreparationProgress? = nil, catalog: ResearchCatalogProgress? = nil) {
         guard status?.id == id, ["planning", "preparing", "running"].contains(status?.phase ?? "") else { return }
         status?.completed = completed; status?.total = total; status?.message = message
         status?.preparation = preparation; status?.updatedAt = researchNow()
+        status?.catalog = catalog
     }
     private func finish(_ id: String, phase: String, resultID: String? = nil, error: String = "") {
         guard status?.id == id else { return }
@@ -220,7 +221,9 @@ final class ResearchController {
         }
         task = Task.detached(priority: .background) { [self, worker] in
             do {
-                let plan = try await worker.plan(spec, refresh: refresh, owner: study.id) { message in await self.advance(id, completed: 0, total: 0, message: message) }
+                let plan = try await worker.plan(spec, refresh: refresh, owner: study.id, catalogProgress: { update in
+                    await self.advance(id, completed: update.completed, total: update.total, message: update.message, catalog: update)
+                }) { message in await self.advance(id, completed: 0, total: 0, message: message) }
                 try await self.savePlan(plan, study: study)
                 await self.finish(id, phase: "planned", resultID: plan.id)
             } catch { await self.finish(id, phase: Task.isCancelled ? "paused" : "failed", resultID: study.id, error: Task.isCancelled ? "" : error.localizedDescription) }

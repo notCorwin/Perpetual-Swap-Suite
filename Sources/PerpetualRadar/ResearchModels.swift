@@ -284,6 +284,16 @@ struct ResearchJobStatus: Codable, Sendable {
     var startedAt = researchNow()
     var updatedAt = researchNow()
     var preparation: ResearchPreparationProgress?
+    var catalog: ResearchCatalogProgress?
+}
+
+struct ResearchCatalogProgress: Codable, Sendable {
+    var kind: String
+    var completed: Int
+    var total: Int
+    var message: String
+    var waitingForResponse = false
+    var remainingSeconds: Double?
 }
 
 struct ResearchDownloadProgress: Sendable {

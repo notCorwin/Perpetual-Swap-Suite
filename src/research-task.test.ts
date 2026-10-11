@@ -35,3 +35,11 @@ test('stalled network feedback is distinct from failures and local import work',
   job.phase = 'preparing'; job.preparation!.stage = 'importing'
   assert.equal(researchWaiting(job, 16000), '')
 })
+
+test('archive directory scans have waiting feedback before file downloads begin', () => {
+  const job: ResearchJob = { id: 'planning', phase: 'planning', completed: 4, total: 10, message: 'Checking spread archive catalog', error: '', updatedAt: 1000,
+    catalog: { kind: 'spread', completed: 4, total: 10, message: 'Checking spread archive catalog', waitingForResponse: true, remainingSeconds: 60 } }
+  assert.match(researchWaiting(job, 21000), /No data received for 20s/)
+  job.catalog!.waitingForResponse = false
+  assert.equal(researchWaiting(job, 21000), '')
+})

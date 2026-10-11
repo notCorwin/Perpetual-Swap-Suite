@@ -8,6 +8,7 @@ protocol ResearchTransport: Sendable {
 
 actor OKXResearchTransport: ResearchTransport {
     private let session: URLSession
+    private let apiSession: URLSession
     private var lastRequest = ContinuousClock.now - .seconds(1)
     init(session: URLSession? = nil) {
         let configuration = URLSessionConfiguration.ephemeral
@@ -16,12 +17,19 @@ actor OKXResearchTransport: ResearchTransport {
         configuration.timeoutIntervalForRequest = 60
         configuration.timeoutIntervalForResource = 24 * 60 * 60
         self.session = session ?? URLSession(configuration: configuration)
+        // Small JSON requests need a total deadline; archive transfers can take hours.
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 30
+        apiSession = session ?? URLSession(configuration: configuration)
     }
     func get(_ url: URL) async throws -> Data {
-        let wait = lastRequest + .milliseconds(420) - ContinuousClock.now
-        if wait > .zero { try await Task.sleep(for: wait) }
-        lastRequest = .now
-        let (data, response) = try await session.data(from: url)
+        // Reserve the slot before awaiting so concurrent catalog reads remain rate limited.
+        let scheduled = max(lastRequest + .milliseconds(420), ContinuousClock.now)
+        lastRequest = scheduled
+        if scheduled > .now { try await Task.sleep(until: scheduled, clock: .continuous) }
+        let data: Data, response: URLResponse
+        do { (data, response) = try await apiSession.data(from: url) }
+        catch let error as URLError where error.code == .timedOut { throw FilterError("OKX history request timed out (30-second request deadline): \(url.path). Resume to retry; completed responses remain cached.") }
         guard let response = response as? HTTPURLResponse else { throw FilterError("OKX returned an invalid history response: \(url.path).") }
         guard response.statusCode == 200 else { throw FilterError("OKX history request failed (HTTP \(response.statusCode)): \(url.path).") }
         guard data.count < 16 * 1024 * 1024 else { throw FilterError("OKX history response exceeds the 16 MB page limit: \(url.path).") }
@@ -101,6 +109,9 @@ actor OKXResearchTransport: ResearchTransport {
 final class ResearchDataProvider {
     // OKX rejects catalog requests with more than five families (code 50025).
     private static let archiveFamilyLimit = 5
+    // The published OKX order book dataset starts in March 2023.
+    // Explicit refresh still searches earlier periods for new backfills.
+    private static let orderBookArchiveStart: Int64 = 1_677_628_800_000
     let store: ResearchStore
     let transport: any ResearchTransport
     let radarURL: URL?
@@ -183,48 +194,87 @@ final class ResearchDataProvider {
         let url = Self.url(paths[kind]!, parameters).absoluteString
         return ResearchSource(id: researchHash(url + ":\(range.from):\(range.through)" + (refresh ? UUID().uuidString : "")), instrument: instrument, kind: kind, from: range.from, through: range.through, url: url, filename: "\(instrument) · \(kind) · REST", sizeBytes: nil, archive: false, refresh: refresh)
     }
-    private func archiveSources(module: Int, instruments: [ResearchInstrument], from: Int64, through: Int64, refresh: Bool) async throws -> [ResearchSource] {
+    private struct CatalogRequest: Sendable {
+        var url: URL
+        var instruments: [ResearchInstrument]
+        var from: Int64
+        var through: Int64
+        var cacheID: String { "catalog:" + researchHash(url.absoluteString) }
+    }
+    private func archiveSources(module: Int, kind: String, instruments: [ResearchInstrument], ranges: [String: [ResearchRange]], from: Int64, through: Int64, refresh: Bool,
+                                progress: @escaping @Sendable (ResearchCatalogProgress) async -> Void) async throws -> [ResearchSource] {
         guard from <= through else { return [] }
         var calendar = Calendar(identifier: .gregorian); calendar.timeZone = TimeZone(secondsFromGMT: 8 * 3600)!
         if [4, 5, 6].contains(module) { calendar.timeZone = TimeZone(secondsFromGMT: 0)! }
         let firstDate = Date(timeIntervalSince1970: Double(from) / 1000)
         let daily = [4, 5, 6].contains(module)
         var month = daily ? calendar.startOfDay(for: firstDate) : calendar.date(from: calendar.dateComponents([.year, .month], from: firstDate))!
-        var result: [ResearchSource] = []
+        var requests: [CatalogRequest] = []
         while Int64(month.timeIntervalSince1970 * 1000) <= through {
             try Task.checkCancellation()
             let endMonth = calendar.date(byAdding: daily ? .day : .month, value: 10, to: month)!
             let end = min(through, Int64(endMonth.timeIntervalSince1970 * 1000) - 1)
-            for chunk in stride(from: 0, to: instruments.count, by: Self.archiveFamilyLimit) {
-                let group = Array(instruments[chunk..<min(chunk + Self.archiveFamilyLimit, instruments.count)])
+            let begin = Int64(month.timeIntervalSince1970 * 1000)
+            let eligible = instruments.filter { instrument in
+                (module != 4 || refresh || end >= Self.orderBookArchiveStart) &&
+                ranges[instrument.id, default: []].contains { $0.from <= end && $0.through >= begin }
+            }
+            for chunk in stride(from: 0, to: eligible.count, by: Self.archiveFamilyLimit) {
+                let group = Array(eligible[chunk..<min(chunk + Self.archiveFamilyLimit, eligible.count)])
                 let families = group.map { $0.id.replacingOccurrences(of: "-SWAP", with: "") }.joined(separator: ",")
-                let url = Self.url("/public/market-data-history", [("module", String(module)), ("instType", "SWAP"), ("instFamilyList", families), ("dateAggrType", daily ? "daily" : "monthly"), ("begin", String(Int64(month.timeIntervalSince1970 * 1000))), ("end", String(end))])
-                let cacheID = "catalog:" + researchHash(url.absoluteString)
-                let catalogRows: [Any]
-                if !refresh, let cached = try store.get(cacheID, as: CachedCatalog.self) { catalogRows = try rows(Data(cached.json.utf8)) }
-                else {
-                    let data = try await transport.get(url)
-                    catalogRows = try rows(data)
-                    try store.put(cacheID, kind: "catalog", CachedCatalog(json: String(decoding: data, as: UTF8.self)))
-                }
-                for case let top as [String: Any] in catalogRows {
-                    for case let detail as [String: Any] in top["details"] as? [Any] ?? [] {
-                        for case let file as [String: Any] in detail["groupDetails"] as? [Any] ?? [] {
-                            guard let filename = file["filename"] as? String, let download = file["url"] as? String else { continue }
-                            let instrument = group.first { filename.hasPrefix($0.id + "-") }?.id
-                                ?? (detail["instFamily"] as? String).map { $0 + "-SWAP" }
-                            guard let instrument, group.contains(where: { $0.id == instrument }) else { continue }
-                            // Dates in API queries use module-specific timezones. File rows
-                            // remain absolute UTC timestamps; filename dates use the module timezone.
-                            let period = Self.fileRange(filename, module: module) ?? ResearchRange(from: from, through: end)
-                            if period.through < from || period.from > through { continue }
-                            let kind = module == 2 ? "candle" : module == 3 ? "funding" : module == 1 ? "taker" : "spread"
-                            result.append(ResearchSource(id: researchHash(download + (refresh ? UUID().uuidString : "")), instrument: instrument, kind: kind, from: period.from, through: period.through, url: download, filename: filename, sizeBytes: (file["sizeMB"] as? String).flatMap(Double.init).map { Int64($0 * 1_000_000) }, archive: true, module: module))
-                        }
-                    }
-                }
+                let url = Self.url("/public/market-data-history", [("module", String(module)), ("instType", "SWAP"), ("instFamilyList", families), ("dateAggrType", daily ? "daily" : "monthly"), ("begin", String(begin)), ("end", String(end))])
+                requests.append(.init(url: url, instruments: group, from: begin, through: end))
             }
             month = endMonth
+        }
+        var result: [ResearchSource] = [], pending: [CatalogRequest] = []
+        var completed = 0
+        for request in requests {
+            if !refresh, let cached = try store.get(request.cacheID, as: CachedCatalog.self) {
+                result += try catalogSources(Data(cached.json.utf8), request: request, module: module, kind: kind, refresh: false, from: from, through: through)
+                completed += 1
+            } else { pending.append(request) }
+        }
+        await progress(.init(kind: kind, completed: completed, total: requests.count, message: "Checking \(kind) archive catalog · \(completed)/\(requests.count) pages · \(pending.count) network requests remaining", waitingForResponse: !pending.isEmpty))
+        let transport = transport, started = ContinuousClock.now
+        var fetched = 0
+        // Only network reads run concurrently. Parsing and SQLite cache writes
+        // stay on this worker's connection, with at most two in-flight requests.
+        try await withThrowingTaskGroup(of: (Int, Data).self) { group in
+            var next = 0
+            func enqueue() {
+                let index = next, url = pending[index].url
+                group.addTask { (index, try await transport.get(url)) }
+                next += 1
+            }
+            for _ in 0..<min(2, pending.count) { enqueue() }
+            while let (index, data) = try await group.next() {
+                let request = pending[index]
+                result += try catalogSources(data, request: request, module: module, kind: kind, refresh: refresh, from: from, through: through)
+                try store.put(request.cacheID, kind: "catalog", CachedCatalog(json: String(decoding: data, as: UTF8.self)))
+                completed += 1; fetched += 1
+                if next < pending.count { enqueue() }
+                let remaining = Double(pending.count - fetched) * researchSeconds(started.duration(to: .now)) / Double(fetched)
+                let formatter = DateFormatter(); formatter.timeZone = calendar.timeZone; formatter.dateFormat = "yyyy-MM-dd"; formatter.locale = Locale(identifier: "en_US_POSIX")
+                let dates = formatter.string(from: Date(timeIntervalSince1970: Double(request.from) / 1000)) + " to " + formatter.string(from: Date(timeIntervalSince1970: Double(request.through) / 1000))
+                await progress(.init(kind: kind, completed: completed, total: requests.count, message: "Checking \(kind) archive catalog · \(completed)/\(requests.count) pages · checked \(dates)", waitingForResponse: fetched < pending.count, remainingSeconds: remaining))
+            }
+        }
+        return result
+    }
+    private func catalogSources(_ data: Data, request: CatalogRequest, module: Int, kind: String, refresh: Bool, from: Int64, through: Int64) throws -> [ResearchSource] {
+        var result: [ResearchSource] = []
+        for case let top as [String: Any] in try rows(data) {
+            for case let detail as [String: Any] in top["details"] as? [Any] ?? [] {
+                for case let file as [String: Any] in detail["groupDetails"] as? [Any] ?? [] {
+                    guard let filename = file["filename"] as? String, let download = file["url"] as? String else { continue }
+                    let instrument = request.instruments.first { filename.hasPrefix($0.id + "-") }?.id ?? (detail["instFamily"] as? String).map { $0 + "-SWAP" }
+                    guard let instrument, request.instruments.contains(where: { $0.id == instrument }) else { continue }
+                    let period = Self.fileRange(filename, module: module) ?? ResearchRange(from: request.from, through: request.through)
+                    if period.through < from || period.from > through { continue }
+                    result.append(ResearchSource(id: researchHash(download + (refresh ? UUID().uuidString : "")), instrument: instrument, kind: kind, from: period.from, through: period.through, url: download, filename: filename, sizeBytes: (file["sizeMB"] as? String).flatMap(Double.init).map { Int64($0 * 1_000_000) }, archive: true, module: module))
+                }
+            }
         }
         return result
     }
@@ -237,7 +287,7 @@ final class ResearchDataProvider {
               let end = calendar.date(byAdding: match.3 == nil ? .month : .day, value: 1, to: first) else { return nil }
         return .init(from: Int64(first.timeIntervalSince1970 * 1000), through: Int64(end.timeIntervalSince1970 * 1000) - hourMS)
     }
-    func plan(_ spec: StudySpec, refresh: Bool = false, progress: @escaping @Sendable (String) async -> Void) async throws -> DataPlan {
+    func plan(_ spec: StudySpec, refresh: Bool = false, catalogProgress: @escaping @Sendable (ResearchCatalogProgress) async -> Void = { _ in }, progress: @escaping @Sendable (String) async -> Void) async throws -> DataPlan {
         try spec.validate()
         await progress("Reading the fixed local cache and instrument registry…")
         let registry = try await instruments(through: spec.through, refresh: refresh)
@@ -276,19 +326,22 @@ final class ResearchDataProvider {
         let recent = researchNow() / hourMS * hourMS - 60 * 24 * hourMS
         let oldEnd = min(last, recent - hourMS)
         let earliestInput = max(0, first - Int64(warmup + 1) * hourMS)
+        if !refresh, earliestInput < Self.orderBookArchiveStart, inputs.contains(where: { needs("spread", $0.id) }) {
+            plan.warnings.append("Published OKX order book archives start in March 2023. Earlier spread readings use local recordings when available; otherwise they remain Unknown. Refresh source data to check for earlier backfills.")
+        }
         var catalogs: [Int: [ResearchSource]] = [:]
         // Batch within the catalog family limit; cached complete periods need no catalog requests.
         for (module, kind, end) in [(2, "candle", oldEnd), (1, "taker", oldEnd), (3, "funding", oldEnd), (4, "spread", last)] where earliestInput <= end {
-            let missing = try inputs.filter { instrument in
-                guard needs(kind, instrument.id) else { return false }
+            var ranges: [String: [ResearchRange]] = [:]
+            for instrument in inputs where needs(kind, instrument.id) {
                 let begin = max(earliestInput, instrument.listedAt! / hourMS * hourMS)
-                guard begin <= end else { return false }
-                if refresh { return true }
-                return try !store.missing(instrument.id, kind: kind, from: begin, through: end).isEmpty
+                guard begin <= end else { continue }
+                ranges[instrument.id] = refresh ? [.init(from: begin, through: end)] : try store.missing(instrument.id, kind: kind, from: begin, through: end)
             }
+            let missing = inputs.filter { !ranges[$0.id, default: []].isEmpty }
             if !missing.isEmpty {
                 await progress("Reading published \(kind) archive ranges for \(missing.count) instrument families…")
-                catalogs[module] = try await archiveSources(module: module, instruments: missing, from: earliestInput, through: end, refresh: refresh)
+                catalogs[module] = try await archiveSources(module: module, kind: kind, instruments: missing, ranges: ranges, from: earliestInput, through: end, refresh: refresh, progress: catalogProgress)
             }
         }
         func published(_ module: Int, _ id: String, _ from: Int64, _ through: Int64) -> [ResearchSource] {
