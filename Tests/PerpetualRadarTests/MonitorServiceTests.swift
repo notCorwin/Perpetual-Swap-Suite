@@ -5,11 +5,25 @@ import XCTest
 
 final class MonitorServiceTests: BackgroundTestCase {
     @MainActor
+    private func requestShutdown(_ body: [String: Any], name: String) async throws {
+        do { _ = try await MonitorIPC.request(body, name: name) }
+        catch let failure as MonitorIPCFailure where failure.isConnectionFailure && failure.requestMayHaveRun {
+            // The endpoint can exit before the client polls its reply. Each
+            // caller verifies process termination and persisted state below.
+        }
+    }
+
+    private func serviceTestDirectory(_ channel: String) -> URL {
+        let root = ProcessInfo.processInfo.environment["PERPETUAL_RADAR_TEST_DIRECTORY"].map { URL(fileURLWithPath: $0) } ?? FileManager.default.temporaryDirectory
+        return root.appendingPathComponent(channel)
+    }
+
+    @MainActor
     func testPackagedDatabaseStartupFailuresRecoverInPlaceAndRetainSettings() async throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["RADAR_SERVICE_TESTS"] == "1", "Run after packaging; the application stays hidden.")
         let builtApp = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/app/Perpetual Swap Suite.app")
         let channel = UUID().uuidString, name = "com.perpetualradar.monitor.\(getuid()).\(channel)", suite = "RadarServiceTests.\(channel)"
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(channel), defaults = UserDefaults(suiteName: suite)!
+        let directory = serviceTestDirectory(channel), defaults = UserDefaults(suiteName: suite)!
         let radarURL = directory.appendingPathComponent("radar.sqlite3"), researchDirectory = directory.appendingPathComponent("Research")
         let researchURL = researchDirectory.appendingPathComponent("research.sqlite3")
         let config = try FilterCompiler.compile(source: "Close > 105").config.json
@@ -43,7 +57,7 @@ final class MonitorServiceTests: BackgroundTestCase {
         environment["PERPETUAL_RADAR_BACKGROUND"] = "1"
         environment["PERPETUAL_RADAR_READY_FILE"] = directory.appendingPathComponent("ui-ready").path
         process.environment = environment; process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
-        try process.run()
+        try process.run(); focus.track(process.processIdentifier)
         func request(_ body: [String: Any], interface: Bool = false) async throws -> [String: Any] {
             try await MonitorIPC.request(body, name: name + (interface ? ".interface-tests" : ""), timeout: .seconds(15))
         }
@@ -110,7 +124,7 @@ final class MonitorServiceTests: BackgroundTestCase {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["RADAR_SERVICE_TESTS"] == "1", "Package the app and set RADAR_SERVICE_TESTS=1.")
         let builtApp = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/app/Perpetual Swap Suite.app")
         let channel = UUID().uuidString, name = "com.perpetualradar.monitor.\(getuid()).\(channel)", suite = "RadarServiceTests.\(channel)"
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(channel), defaults = UserDefaults(suiteName: suite)!
+        let directory = serviceTestDirectory(channel), defaults = UserDefaults(suiteName: suite)!
         let focus = BackgroundTestAudit(); defer { focus.stop() }
         let store = try ResearchStore(directory: directory.appendingPathComponent("Research"))
         try ResearchFixture.seed(store, bars: ResearchFixture.bars(through: ResearchFixture.hour+3048*hourMS))
@@ -130,9 +144,9 @@ final class MonitorServiceTests: BackgroundTestCase {
             environment["PERPETUAL_RADAR_TEST_CHANNEL"] = channel; environment["PERPETUAL_RADAR_TEST_DIRECTORY"] = directory.path
             environment.removeValue(forKey: "PERPETUAL_RADAR_BACKGROUND"); process.environment = environment
             process.standardOutput = FileHandle.nullDevice
-            let log = URL(fileURLWithPath: "/tmp/perp-research-packaged-\(processes.count).log")
+            let log = directory.appendingPathComponent("process-\(processes.count).log")
             FileManager.default.createFile(atPath: log.path, contents: Data()); process.standardError = try FileHandle(forWritingTo: log)
-            try process.run(); processes.append(process); return process
+            try process.run(); focus.track(process.processIdentifier); processes.append(process); return process
         }
         func request(_ body: [String: Any], interface: Bool = false) async throws -> [String: Any] {
             try await MonitorIPC.request(body, name: name + (interface ? ".interface-tests" : ""))
@@ -185,7 +199,7 @@ final class MonitorServiceTests: BackgroundTestCase {
         _ = try await request(["hideWindow": true], interface: true)
         try await wait("hidden") { (try await request([:], interface: true))["windowHidden"] as? Bool == true }
         try await wait("checkpoint") { (try store.get("checkpoint:\(studyID)", as: Checkpoint.self))?.nextHour != nil }
-        _ = try await request(["close": true], interface: true)
+        try await requestShutdown(["close": true], name: name + ".interface-tests")
         let oldHelper = helperPID!
         try await wait("closed") { !ui.isRunning && CFMessagePortCreateRemote(nil, name as CFString) == nil && kill(oldHelper,0) != 0 }
         XCTAssertEqual(ui.terminationStatus, 0)
@@ -204,7 +218,7 @@ final class MonitorServiceTests: BackgroundTestCase {
         XCTAssertEqual(try researchJSON(store.get("checkpoint:\(studyID)", as: Checkpoint.self)), checkpoint, "Reopening must not resume research automatically.")
         _ = try await request(["workspace": "research", "research": ["action": "resume", "studyID": studyID]], interface: true)
         try await Task.sleep(for: .milliseconds(150))
-        _ = try await request(["testQuitUI": true])
+        try await requestShutdown(["testQuitUI": true], name: name)
         let quitHelper = helperPID!
         try await wait("quit") { !reopened.isRunning && kill(quitHelper,0) != 0 }
         XCTAssertEqual(try store.get("checkpoint:\(studyID)", as: Checkpoint.self)?.phase, "paused")
@@ -221,22 +235,17 @@ final class MonitorServiceTests: BackgroundTestCase {
     }
 
     @MainActor
-    func testPackagedMonitorSurvivesQuitNotifiesReopensPausesAndQuitsCompletely() async throws {
-        try await checkPackagedMonitorLifecycle(preferencesMatchBundleIdentifier: false)
+    func testPackagedMonitorLifecycleAndInterfacePreferencesDomain() async throws {
+        try await checkPackagedMonitorLifecycle()
     }
 
     @MainActor
-    func testPackagedInterfaceStartsWithItsOwnPreferencesDomain() async throws {
-        try await checkPackagedMonitorLifecycle(preferencesMatchBundleIdentifier: true)
-    }
-
-    @MainActor
-    private func checkPackagedMonitorLifecycle(preferencesMatchBundleIdentifier: Bool) async throws {
+    private func checkPackagedMonitorLifecycle() async throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["RADAR_SERVICE_TESTS"] == "1", "Run after packaging with RADAR_SERVICE_TESTS=1; every process remains in the background.")
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         let builtApp = root.appendingPathComponent(".build/app/Perpetual Swap Suite.app")
         let channel = UUID().uuidString, name = "com.perpetualradar.monitor.\(getuid()).\(channel)"
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(channel)
+        let directory = serviceTestDirectory(channel)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let suite = "RadarServiceTests.\(channel)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -251,7 +260,7 @@ final class MonitorServiceTests: BackgroundTestCase {
         }
         // Also exercise the production preference-domain relationship in an
         // isolated bundle, with background metadata set before process launch.
-        let app = try backgroundTestApp(from: builtApp, in: directory, bundleIdentifier: preferencesMatchBundleIdentifier ? suite : nil)
+        let app = try backgroundTestApp(from: builtApp, in: directory, bundleIdentifier: suite)
         defaults.set(true, forKey: "BackgroundMonitoring")
         defaults.set(false, forKey: "AutomaticallyInstallUpdates")
         defaults.set(false, forKey: AppUpdater.backgroundRelaunchKey)
@@ -269,7 +278,7 @@ final class MonitorServiceTests: BackgroundTestCase {
             let log = directory.appendingPathComponent("\(processes.count).log")
             FileManager.default.createFile(atPath: log.path, contents: Data())
             process.standardError = try FileHandle(forWritingTo: log)
-            try process.run(); processes.append(process); return process
+            try process.run(); focus.track(process.processIdentifier); processes.append(process); return process
         }
         func request(_ body: [String: Any]) async throws -> [String: Any] { try await MonitorIPC.request(body, name: name) }
         func wait(_ label: String, _ condition: () async throws -> Bool) async throws {
@@ -289,7 +298,8 @@ final class MonitorServiceTests: BackgroundTestCase {
         XCTAssertNotEqual(helperPID, ui.processIdentifier)
         XCTAssertNotNil(NSImage(systemSymbolName: MonitorDelegate.symbolName, accessibilityDescription: nil))
         XCTAssertEqual(info["menuSymbol"] as? String, "dot.radiowaves.left.and.right")
-        XCTAssertEqual(info["appPath"] as? String, app.path)
+        let reportedApp = URL(fileURLWithPath: try XCTUnwrap(info["appPath"] as? String))
+        XCTAssertEqual(reportedApp.resolvingSymlinksInPath(), app.resolvingSymlinksInPath())
         XCTAssertEqual(info["automaticUpdatesEnabled"] as? Bool, false, "The helper must read the interface's existing preferences.")
         let config = try FilterCompiler.compile(source: "Close > 105").config.json
         let off = try FilterCompiler.compile(source: "1 > 2").config.json

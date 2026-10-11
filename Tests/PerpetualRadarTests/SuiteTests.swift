@@ -3,6 +3,11 @@ import XCTest
 @testable import PerpetualRadar
 
 final class SuiteTests: XCTestCase {
+    private func directory() -> URL {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SuiteTests-\(UUID())")
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return directory
+    }
     private let hour = ResearchFixture.hour
     private func json(_ source: String) throws -> String { try FilterCompiler.compile(source: source).config.json }
     private func profile(universe: String = "1 < 2", setup: String = "Close >= 100", longExit: String = "LongHeldHours >= 1", reversal: String = "Close < 95", shortExit: String = "ShortHeldHours >= 1") throws -> StrategyProfile {
@@ -15,7 +20,7 @@ final class SuiteTests: XCTestCase {
         }
     }
     private func dataset(_ profile: StrategyProfile? = nil, bars: [Candle]? = nil, hours: Int = 6, execution: SuiteExecution = .init(), capital: SuiteCapitalSettings = .init(maintenanceRate: 0.005,liquidationFeeBps: 100), costs: ResearchCosts? = nil, funding: [(Int64,Double,Double?)]? = nil) throws -> (ResearchStore,ResearchStudy,DataManifest) {
-        let store = try ResearchStore(directory: FileManager.default.temporaryDirectory.appendingPathComponent("SuiteTests-\(UUID())"))
+        let store = try ResearchStore(directory: directory())
         let p = try profile ?? self.profile(), input = bars ?? self.bars([90,100,110,90,80,100,120])
         var spec = StudySpec(name: "Cycle",kind: "cycle",rules: p.studyRules,from: hour,through: hour+Int64(hours)*hourMS)
         spec.strategySnapshots = [p]; spec.execution = execution; spec.capital = .init(defaults: capital); spec.costs = costs
@@ -38,7 +43,7 @@ final class SuiteTests: XCTestCase {
         return (try data.0.suiteTrades(data.1.id,limit: 100),try data.0.suiteReport(data.1,manifest: data.2))
     }
     func testFourPhaseValidationAtomicSaveIndependentCopiesAndActualShortSnapshots() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SuiteStore-\(UUID())"), store = try Store(url: directory.appendingPathComponent("radar.sqlite3"))
+        let directory = directory(), store = try Store(url: directory.appendingPathComponent("radar.sqlite3"))
         var p = try store.saveSuiteProfile(profile()); XCTAssertEqual(p.revision,1)
         let original = p
         _ = try store.manageSuite(["action":"draft","draft":["name":"Incomplete draft","formula":"ShortReturn >"]],mode:"radar")
@@ -68,7 +73,7 @@ final class SuiteTests: XCTestCase {
         XCTAssertEqual(closed.strategy.revision,2); XCTAssertEqual(closed.exitStrategy?.revision,3); XCTAssertEqual(closed.exitPrice,90); XCTAssertEqual(Double(closed.priceReturn!),0.1)
     }
     func testSharedLibraryRevisionsActivationDraftIsolationAndFrozenStudy() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SharedSuite-\(UUID())")
+        let directory = directory()
         let radar = try Store(url: directory.appendingPathComponent("radar.sqlite3")), research = try Store(url: radar.url)
         let saved = try radar.saveSuiteProfile(profile())
         _ = try research.manageSuite(["action":"select","profileID":saved.id],mode:"research")
@@ -89,7 +94,7 @@ final class SuiteTests: XCTestCase {
         XCTAssertTrue(try radar.suiteProfiles("radar").isEmpty); XCTAssertNil(try radar.selectedSuiteProfile("radar"))
     }
     func testExistingModeLibrariesConsolidateWithoutChangingVersionsOrPositionIdentity() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SuiteConsolidation-\(UUID())")
+        let directory = directory()
         let radar = try Store(url: directory.appendingPathComponent("radar.sqlite3"))
         let research = try Store(url: directory.appendingPathComponent("Research/research.sqlite3"))
         var live = try profile(); live.revision = 3

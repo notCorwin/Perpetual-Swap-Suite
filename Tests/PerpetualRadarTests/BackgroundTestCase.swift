@@ -11,13 +11,20 @@ final class BackgroundTestAudit {
     private var dockPIDs = Set<Int32>()
     private var windowListAvailable = true
     private var observer: NSObjectProtocol?
+    private var launchObserver: NSObjectProtocol?
+    private var trackedPIDs: Set<Int32> = [getpid()]
     private var timer: Timer?
 
     init() {
         observer = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] notification in
             guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
             let pid = application.processIdentifier
-            MainActor.assumeIsolated { self?.activatedPIDs.insert(pid) }
+            MainActor.assumeIsolated { _ = self?.activatedPIDs.insert(pid) }
+        }
+        launchObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] notification in
+            guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            let pid = application.processIdentifier
+            MainActor.assumeIsolated { self?.track(pid) }
         }
         let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.sample() }
@@ -30,7 +37,7 @@ final class BackgroundTestAudit {
     private func sample() {
         if let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier { activatedPIDs.insert(pid) }
         // Keep only process IDs, never titles or pixels from the user's apps.
-        dockPIDs.formUnion(NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }.map(\.processIdentifier))
+        for pid in trackedPIDs where NSRunningApplication(processIdentifier: pid)?.activationPolicy == .regular { dockPIDs.insert(pid) }
         let displays = NSScreen.screens.compactMap { screen -> CGRect? in
             guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
             return CGDisplayBounds(number.uint32Value)
@@ -55,7 +62,10 @@ final class BackgroundTestAudit {
         }
     }
 
+    func track(_ pid: Int32) { trackedPIDs.insert(pid); sample() }
+
     func assertBackground(_ pids: [Int32] = [getpid()], file: StaticString = #filePath, line: UInt = #line) {
+        trackedPIDs.formUnion(pids)
         sample()
         XCTAssertTrue(windowListAvailable, "WindowServer geometry must be available for the background audit.", file: file, line: line)
         XCTAssertTrue(activatedPIDs.isDisjoint(with: pids), "Tests took focus: \(activatedPIDs.intersection(pids))", file: file, line: line)
@@ -68,7 +78,9 @@ final class BackgroundTestAudit {
     func stop() {
         timer?.invalidate(); timer = nil
         if let observer { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        if let launchObserver { NSWorkspace.shared.notificationCenter.removeObserver(launchObserver) }
         observer = nil
+        launchObserver = nil
     }
 }
 

@@ -119,10 +119,10 @@ final class MarketNotificationTests: XCTestCase {
         defaults.removePersistentDomain(forName: suite)
         XCTAssertFalse(try Radar(defaults: defaults, storeURL: url).notificationsEnabled)
         let blocker = try Store(url: url)
-        try blocker.execute("BEGIN IMMEDIATE")
+        try blocker.execute("CREATE TRIGGER reject_notification_write BEFORE UPDATE ON preferences WHEN NEW.key='strategyNotificationsEnabled' BEGIN SELECT RAISE(ABORT,'Fixture write failure'); END")
         XCTAssertThrowsError(try radar.setNotificationsEnabled(true))
         XCTAssertFalse(radar.notificationsEnabled)
-        try blocker.execute("ROLLBACK")
+        try blocker.execute("DROP TRIGGER reject_notification_write")
         try radar.setNotificationsEnabled(true)
         XCTAssertTrue(try Radar(defaults: defaults, storeURL: url).notificationsEnabled)
     }

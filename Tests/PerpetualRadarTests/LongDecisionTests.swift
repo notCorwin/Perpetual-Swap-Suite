@@ -6,7 +6,11 @@ final class LongDecisionTests: XCTestCase {
     private func strategy(entry: String = "Close > 100", exit: String = "LongHeldHours >= 3") throws -> LongStrategy {
         .init(name: "Long fixture", entryJSON: try FilterCompiler.compile(source: entry).config.json, exitJSON: try FilterCompiler.compile(source: exit).config.json)
     }
-    private func directory() -> URL { FileManager.default.temporaryDirectory.appendingPathComponent("LongTests-\(UUID())") }
+    private func directory() -> URL {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("LongTests-\(UUID())")
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return directory
+    }
     private func dataset(_ entry: String = "Close > 0", _ exit: String = "LongHeldHours >= 3", hours: Int = 240, bars: [Candle]? = nil, costs: ResearchCosts? = nil) throws -> (ResearchStore, ResearchStudy, DataManifest) {
         let store = try ResearchStore(directory: directory()), rule = try strategy(entry: entry, exit: exit), hour = ResearchFixture.hour
         var spec = StudySpec(name: "Paired Long filters",kind: "long",rules: [.init(name: "Entry",filtersJSON: rule.entryJSON),.init(name: "Exit",filtersJSON: rule.exitJSON)],from: hour,through: hour+Int64(hours)*hourMS,direction: "Long")

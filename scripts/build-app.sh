@@ -2,21 +2,18 @@
 set -euo pipefail
 cd "${0:A:h}/.."
 
-npm run build
-swift build -c release
+if [[ "${1:-}" != "--prebuilt" ]]; then
+  npm run build
+  scripts/build-native.sh
+fi
+[[ -s dist/index.html && -x .build/release/PerpetualRadar ]]
 
 app="$PWD/.build/app/Perpetual Swap Suite.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp ".build/release/PerpetualRadar" "$app/Contents/MacOS/PerpetualRadar"
 cp macos/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
-iconset="$PWD/.build/icon-assets/Assets.xcassets/AppIcon.appiconset"
-mkdir -p "$iconset"
-iconutil -c iconset macos/AppIcon.icns -o "$PWD/.build/icon-assets/AppIcon.iconset"
-cp "$PWD/.build/icon-assets/AppIcon.iconset/"*.png "$iconset/"
-cp macos/AppIconContents.json "$iconset/Contents.json"
+scripts/build-icons.sh
 compiled="$PWD/.build/icon-assets/compiled"
-mkdir -p "$compiled"
-xcrun actool --compile "$compiled" --platform macosx --minimum-deployment-target 14.0 --app-icon AppIcon --output-partial-info-plist "$PWD/.build/icon-assets/Info.plist" "$PWD/.build/icon-assets/Assets.xcassets"
 cp "$compiled/Assets.car" "$app/Contents/Resources/Assets.car"
 rm -rf "$app/Contents/Resources/Web"
 ditto dist "$app/Contents/Resources/Web"
@@ -35,6 +32,7 @@ if [[ -n "$revision" ]]; then
 fi
 codesign --force --sign - "$helper" >/dev/null
 codesign --force --sign - "$app" >/dev/null
+codesign --verify --deep --strict "$app"
 touch "$app"
 if [[ -z "${CI:-}" ]]; then
   /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$app"

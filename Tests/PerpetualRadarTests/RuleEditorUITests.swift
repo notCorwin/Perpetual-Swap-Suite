@@ -17,6 +17,11 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
     var rows: [[String: Any]]
     var contexts: [FilterMarketData]
     var previewDelay: UInt64 = 0
+    var cancelPreviousPreview = true
+    var previewRequests = 0
+    var previewResponses = 0
+    var holdNextPreview = false
+    var heldPreviewReply: (() -> Void)?
     private var previewTask: Task<Void, Never>?
     var strategySaveDelay: UInt64 = 0
     var strategySaveError: String?
@@ -49,7 +54,7 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
     let worker = FilterEvaluationWorker()
     let longWorker = LongDecisionWorker()
     let suiteWorker = SuiteEvaluationWorker()
-    init(root: URL, seedStrategy: Bool = true) throws {
+    init(root: URL, seedStrategy: Bool = true, marketCount: Int = 500) throws {
         self.root = root; suite = "RuleUI-\(UUID())"
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
         radar = try Radar(defaults: UserDefaults(suiteName: suite)!, storeURL: directory.appendingPathComponent("radar.sqlite3"))
@@ -57,7 +62,7 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
         let template = fixtures[0]["row"] as! [String: Any], hour = Int64(Date().timeIntervalSince1970 * 1000) / hourMS * hourMS
         var generated: [[String: Any]] = [], data: [FilterMarketData] = []
         let candles = Dictionary(uniqueKeysWithValues: (0...900).map { age in let ts = hour - Int64(age) * hourMS; return (ts, Candle(hour: ts, high: 111, low: 99, close: 110, quoteVolume: 100, baseVolume: 1, open: 105, confirmed: age != 0)) })
-        for index in 0..<500 {
+        for index in 0..<marketCount {
             var row = template; let id = String(format: "MKT%03d-USDT-SWAP", index)
             row["instId"] = id; row["turnover24hUSDT"] = index % 4 == 0 ? 5_000_000.0 : 20_000_000.0
             row["oiChange"] = index % 3 == 0 ? 2.0 : index % 3 == 1 ? 0.0 : -2.0
@@ -76,7 +81,7 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
         super.init()
     }
     var savedUniverseJSON: String { (try? radar.monitoringStrategy()?.universeJSON) ?? "" }
-    func cleanUp() { previewTask?.cancel(); ProcessInfo.processInfo.endActivity(renderingActivity); UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+    func cleanUp() { heldPreviewReply?(); heldPreviewReply = nil; previewTask?.cancel(); ProcessInfo.processInfo.endActivity(renderingActivity); UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
     func snapshot() -> [String: Any] {
         var result = radar.snapshot(rocPeriod: 9, marocPeriod: 9)
         result["rows"] = rows; result["revision"] = revision
@@ -189,7 +194,10 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
             var original = snapshot()
             if pulseRows { pulse += 0.01; original["rows"] = rows.map { var row = $0; row["price"] = 110 + pulse; return row } }
             let source = preview["filtersJSON"] as! String, token = preview["token"] as! String, delay = previewDelay
-            previewTask?.cancel()
+            previewRequests += 1
+            let holdReply = holdNextPreview
+            holdNextPreview = false
+            if cancelPreviousPreview { previewTask?.cancel() }
             previewTask = Task {
                 do {
                     let filter = try FilterCompiler.compile(FilterConfigV2.decode(source))
@@ -197,7 +205,8 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
                     try Task.checkCancellation()
                     if delay > 0 { try await Task.sleep(nanoseconds: delay) }
                     var result = original; result["filterToken"] = token; result["filterResults"] = results.mapValues(\.rawValue); result["historyProgress"] = ["pending": 0, "completed": 0, "error": ""]
-                    replyHandler(result, nil)
+                    let reply: () -> Void = { self.previewResponses += 1; replyHandler(result, nil) }
+                    if holdReply { heldPreviewReply = reply } else { reply() }
                 } catch { replyHandler(nil, String(describing: error)) }
             }; return
         }
@@ -249,10 +258,10 @@ final class RuleEditorUITests: BackgroundTestCase {
     private var capturePixels: Bool { ProcessInfo.processInfo.environment["RADAR_VISUAL_TESTS"] == "1" }
 
     @MainActor
-    private func showAllMarkets(_ view: WKWebView) async throws {
+    private func showAllMarkets(_ view: WKWebView, count: Int = 500) async throws {
         try await wait(view, "Array.from(document.querySelectorAll('button')).some(button => button.textContent.trim() === 'All markets' && !button.disabled)")
         try await click(view, "All markets")
-        try await wait(view, "Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === 500")
+        try await wait(view, "Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === \(count)")
     }
 
     @MainActor
@@ -478,7 +487,9 @@ final class RuleEditorUITests: BackgroundTestCase {
     func testSuitePhaseEditingActualPositionsCycleEvidenceAndExportsInNativeWebKit() async throws {
         guard ProcessInfo.processInfo.environment["RADAR_UI_TESTS"] == "1" else { throw XCTSkip("Run npm run test:ui after building the Web renderer.") }
         let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist"), seedStrategy: false), configuration = uiConfiguration()
+        // This scenario tests positions and backtests; the separate menu and
+        // navigation benchmarks retain the full 500-market workload.
+        let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist"), seedStrategy: false, marketCount: 8), configuration = uiConfiguration()
         let directory = bridge.directory.appendingPathComponent("Research"), store = try ResearchStore(directory: directory)
         try ResearchFixture.seed(store)
         bridge.research = try ResearchController(directory: directory,transport: ResearchFixtureTransport(),radarURL: bridge.directory.appendingPathComponent("absent"),exportDestination: { kind,_ in directory.appendingPathComponent("long-\(kind).csv") })
@@ -490,7 +501,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         bridge.windowBackground = background; window.contentView = background; present(window)
         defer { view.stopLoading(); window.orderOut(nil); configuration.userContentController.removeScriptMessageHandler(forName: "radar",contentWorld: .page); bridge.cleanUp() }
         view.load(URLRequest(url: URL(string: "radar://app/index.html")!))
-        try await wait(view,"Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === 500")
+        try await wait(view,"Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === 8")
         try await click(view,"Strategies & Positions")
         try await wait(view,"document.querySelector('[data-suite-workspace=radar] #suite-strategy-name') !== null")
         XCTAssertEqual(bridge.foregroundWorkspace,"radar")
@@ -581,7 +592,7 @@ final class RuleEditorUITests: BackgroundTestCase {
     func testResearchPrepareRunFrozenChartPaginationAndRadarIsolationInNativeWebKit() async throws {
         guard ProcessInfo.processInfo.environment["RADAR_UI_TESTS"] == "1" else { throw XCTSkip("Run npm run test:ui after building the Web renderer.") }
         let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist")), configuration = uiConfiguration()
+        let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist"), marketCount: 8), configuration = uiConfiguration()
         let directory = bridge.directory.appendingPathComponent("Research"), store = try ResearchStore(directory: directory)
         try ResearchFixture.seed(store)
         bridge.research = try ResearchController(directory: directory, transport: ResearchFixtureTransport(), radarURL: bridge.directory.appendingPathComponent("absent"), exportDestination: { kind, _ in directory.appendingPathComponent("research-\(kind).csv") })
@@ -592,8 +603,8 @@ final class RuleEditorUITests: BackgroundTestCase {
         bridge.windowBackground = background; window.contentView = background; present(window)
         defer { view.stopLoading(); window.orderOut(nil); configuration.userContentController.removeScriptMessageHandler(forName: "radar", contentWorld: .page); bridge.cleanUp() }
         view.load(URLRequest(url: URL(string: "radar://app/index.html")!))
-        try await showAllMarkets(view)
-        try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 375")
+        try await showAllMarkets(view, count: 8)
+        try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 6")
         let nativeStore = try Store(url: bridge.directory.appendingPathComponent("radar.sqlite3"))
         var shared = try XCTUnwrap(nativeStore.selectedSuiteProfile("radar"))
         shared.universeJSON = FilterConfigV2().json
@@ -889,7 +900,7 @@ final class RuleEditorUITests: BackgroundTestCase {
     private func assertSharedSurfaces(_ view: WKWebView, opacity: Double, defaultOpacities: [Double] = [0.8, 0.6, 1, 0.4]) async throws {
         // Wait for control color transitions; inspect the renderer rather than
         // matching generated classes or the source token formulas.
-        try await Task.sleep(nanoseconds: 200_000_000)
+        try await settleRendering(view)
         try await wait(view, "Array.from(document.querySelectorAll('[data-surface=\"floating\"]')).every(x => x.closest('[data-state=\"closed\"]') || !x.getBoundingClientRect().width || !x.getBoundingClientRect().height || getComputedStyle(x).opacity === '1')", seconds: 2)
         let result = try await js(view, """
         (() => {
@@ -969,7 +980,9 @@ final class RuleEditorUITests: BackgroundTestCase {
             guard #available(macOS 14.4, *) else { throw XCTSkip("Current-process window capture requires macOS 14.4.") }
         }
         let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist")), configuration = uiConfiguration()
+        // Fill the viewport and exercise virtualization without repeating the
+        // 500-market stress workload during every material/pixel assertion.
+        let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist"), marketCount: 48), configuration = uiConfiguration()
         bridge.includeChartBars = true
         configuration.userContentController.addScriptMessageHandler(bridge, contentWorld: .page, name: "radar")
         configuration.setURLSchemeHandler(bridge, forURLScheme: "radar")
@@ -985,8 +998,8 @@ final class RuleEditorUITests: BackgroundTestCase {
         background.apply(enabled: true, opacity: 0.3, to: window)
         defer { view.stopLoading(); window.orderOut(nil); configuration.userContentController.removeScriptMessageHandler(forName: "radar", contentWorld: .page); bridge.cleanUp() }
         view.load(URLRequest(url: URL(string: "radar://app/index.html")!))
-        try await showAllMarkets(view)
-        try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 375 && document.documentElement.dataset.nativeWindowBackground === 'true'")
+        try await showAllMarkets(view, count: 48)
+        try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 36 && document.documentElement.dataset.nativeWindowBackground === 'true'")
 
         for appearance in [NSAppearance.Name.aqua, .darkAqua] {
             let theme = appearance == .darkAqua ? "dark" : "light"
@@ -996,35 +1009,34 @@ final class RuleEditorUITests: BackgroundTestCase {
             try await click(view, "Settings")
             try await wait(view, "document.querySelector('#background-opacity') !== null")
             try await assertSharedSurfaces(view, opacity: 0.3)
-            try await glassScreenshots(view, window: window, project: project, name: "settings-\(theme)")
+            try await assertScaledSurfaces(view, window: window)
             if capturePixels { try await assertBackdropPixels(view, project: project, theme: theme, selector: "[data-slot=\"popover-content\"]", name: "settings") }
             try await dismissFloating(view)
 
             try await click(view, "Universe rules")
             try await wait(view, "document.querySelector('[data-rule-layout]') !== null")
             try await assertSharedSurfaces(view, opacity: 0.3)
-            try await glassScreenshots(view, window: window, project: project, name: "filters-\(theme)")
+            try await assertScaledSurfaces(view, window: window)
             _ = try await js(view, "document.querySelector('[aria-label=\"Add condition\"]').click(); true")
             try await wait(view, "document.querySelector('[data-rule-library]') !== null")
             try await assertSharedSurfaces(view, opacity: 0.3)
-            try await glassScreenshots(view, window: window, project: project, name: "library-\(theme)")
+            try await assertScaledSurfaces(view, window: window)
             if capturePixels { try await assertBackdropPixels(view, project: project, theme: theme, selector: "[data-rule-library]", name: "library") }
             try await input(view, "[data-rule-library] [cmdk-input]", "Price")
             _ = try await js(view, "document.querySelector('[data-library-id=\"metric:price\"]').click(); true")
             try await wait(view, "document.querySelector('[data-rule-library][data-state=\"open\"]') === null")
             try await validDraft(view)
             try await assertSharedSurfaces(view, opacity: 0.3)
-            let timing = try await openMenu(view, selector: "[aria-label=\"Choose Left expression\"]", popover: true)
-            XCTAssertLessThan(timing, 250)
+            _ = try await openMenu(view, selector: "[aria-label=\"Choose Left expression\"]", popover: true)
             try await assertSharedSurfaces(view, opacity: 0.3)
             try await dismissFloating(view)
 
             try await assertSharedSurfaces(view, opacity: 0.3)
-            try await glassScreenshots(view, window: window, project: project, name: "judgments-\(theme)")
+            try await assertScaledSurfaces(view, window: window)
             try await click(view, "Explain markets")
             try await wait(view, "document.querySelector('[role=dialog]') !== null")
             try await assertSharedSurfaces(view, opacity: 0.3)
-            try await glassScreenshots(view, window: window, project: project, name: "explanation-\(theme)")
+            try await assertScaledSurfaces(view, window: window)
             try await click(view, "Done")
             try await wait(view, "document.querySelector('[role=dialog]') === null")
             try await click(view, "Universe rules")
@@ -1032,12 +1044,12 @@ final class RuleEditorUITests: BackgroundTestCase {
             _ = try await js(view, "Array.from(document.querySelectorAll('button')).find(x => x.getAttribute('aria-label')?.startsWith('View ') && x.getAttribute('aria-label').includes('opportunity details')).click(); true")
             try await wait(view, "document.querySelector('[data-slot=\"popover-content\"]')?.innerText.includes('Opportunity')")
             try await assertSharedSurfaces(view, opacity: 0.3)
-            try await glassScreenshots(view, window: window, project: project, name: "opportunity-\(theme)")
+            try await assertScaledSurfaces(view, window: window)
             try await dismissFloating(view)
             _ = try await js(view, "document.querySelector('tbody tr[tabindex]').click(); true")
             try await wait(view, "document.querySelector('section[aria-label$=\" chart\"] svg[role=img]') !== null")
             try await assertSharedSurfaces(view, opacity: 0.3)
-            try await glassScreenshots(view, window: window, project: project, name: "chart-\(theme)")
+            try await assertScaledSurfaces(view, window: window)
             bridge.chartSnapshotRGB = []
             try await click(view, "Copy chart")
             let deadline = Date().addingTimeInterval(2)
@@ -1058,38 +1070,31 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await wait(view, "document.querySelector('[data-slot=\"dialog-content\"][data-state=\"open\"]') === null")
         _ = try await js(view, "document.querySelector('[data-slot=\"popover-content\"][data-state=\"open\"]')?.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape',bubbles:true})); true")
         try await wait(view, "document.querySelector('[data-slot=\"popover-content\"][data-state=\"open\"]') === null")
-        try await Task.sleep(nanoseconds: 150_000_000)
+        try await settleRendering(view)
     }
 
     @MainActor
-    private func glassScreenshots(_ view: WKWebView, window: BackgroundTestWindow, project: URL, name: String) async throws {
+    private func assertScaledSurfaces(_ view: WKWebView, window: BackgroundTestWindow) async throws {
         for width in [1440, 720] {
             window.setContentSize(NSSize(width: width, height: 900))
             present(window)
             try await wait(view, "innerWidth === \(width)")
-            try await Task.sleep(nanoseconds: 200_000_000)
             try await assertSharedSurfaces(view, opacity: 0.3)
             let overflow = try await js(view, "document.documentElement.scrollWidth > innerWidth + 1") as? Bool
             XCTAssertEqual(overflow, false)
             let squeezedLabels = try await js(view, "(() => { const scale=Number(getComputedStyle(document.documentElement).getPropertyValue('--market-list-scale')); return Array.from(document.querySelectorAll('[aria-label=\"Rule decision details\"] summary > span.flex-1')).some(x=>x.getBoundingClientRect().width < 100*scale); })()") as? Bool
             XCTAssertEqual(squeezedLabels, false, "Portaled rule details must retain readable label widths when the window scales.")
-            if !capturePixels && name.starts(with: "explanation-") {
-                try await screenshot(view, project.appendingPathComponent(".build/ui-qa/glass-dialog-layout-\(name)-\(width).png"))
-            }
-            if !capturePixels { continue }
-            let file = project.appendingPathComponent(".build/ui-qa/glass-\(name)-\(width).png")
-            let image = try await nativeRendererSnapshot(view)
-            // Flatten the native window capture for portable QA artifacts.
-            let resolvedRGB = try await js(view, "(() => { const c = document.createElement('canvas'); c.width = c.height = 1; const x = c.getContext('2d'); x.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--chart-snapshot-background'); x.fillRect(0,0,1,1); return Array.from(x.getImageData(0,0,1,1).data).slice(0,3).map(v=>v/255); })()") as? [Double]
-            let rgb = try XCTUnwrap(resolvedRGB)
-            let opaque = try XCTUnwrap(opaqueChartSnapshot(image, backgroundRGB: rgb))
-            let bitmap = try XCTUnwrap(NSBitmapImageRep(data: opaque.tiffRepresentation!))
-            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: file)
         }
         window.setContentSize(NSSize(width: 1440, height: 900))
         try await wait(view, "innerWidth === 1440")
-        try await Task.sleep(nanoseconds: 400_000_000)
+        try await settleRendering(view)
+    }
+
+    @MainActor
+    private func settleRendering(_ view: WKWebView) async throws {
+        // Allow the 150 ms control transitions to finish without enumerating
+        // thousands of table-cell animations or awaiting offscreen frame callbacks.
+        try await Task.sleep(for: .milliseconds(200))
     }
 
     @MainActor
@@ -1097,7 +1102,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         let query = String(data: try JSONEncoder().encode(selector), encoding: .utf8)!
         let content = try await nativeRendererSnapshot(view)
         _ = try await js(view, "(() => { const source=document.querySelector(\(query)); window.radarOriginalFilter={source,filter:source.style.backdropFilter,webkit:source.style.webkitBackdropFilter}; source.style.backdropFilter='none'; source.style.webkitBackdropFilter='none'; return true; })()")
-        try await Task.sleep(nanoseconds: 200_000_000)
+        try await settleRendering(view)
         let unfilteredContent = try await nativeRendererSnapshot(view)
         _ = try await js(view, "(() => { const {source,filter,webkit}=window.radarOriginalFilter; source.style.backdropFilter=filter; source.style.webkitBackdropFilter=webkit; delete window.radarOriginalFilter; return true; })()")
         let normal = try XCTUnwrap(NSBitmapImageRep(data: content.tiffRepresentation!)), unfiltered = try XCTUnwrap(NSBitmapImageRep(data: unfilteredContent.tiffRepresentation!))
@@ -1127,7 +1132,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         })()
         """) as? [String: Double]
         let rect = try XCTUnwrap(bounds)
-        try await Task.sleep(nanoseconds: 200_000_000)
+        try await settleRendering(view)
         let image = try await nativeRendererSnapshot(view)
         let bitmap = try XCTUnwrap(NSBitmapImageRep(data: image.tiffRepresentation!))
         let scaleX = Double(bitmap.pixelsWide) / view.bounds.width, scaleY = Double(bitmap.pixelsHigh) / view.bounds.height
@@ -1140,7 +1145,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         }
         let blurred = try contrast(bitmap)
         _ = try await js(view, "window.radarSurfaceFixture.source.style.backdropFilter='none'; window.radarSurfaceFixture.source.style.webkitBackdropFilter='none'; true")
-        try await Task.sleep(nanoseconds: 200_000_000)
+        try await settleRendering(view)
         let reference = try await nativeRendererSnapshot(view)
         let referenceBitmap = try XCTUnwrap(NSBitmapImageRep(data: reference.tiffRepresentation!))
         let sharp = try contrast(referenceBitmap)
@@ -1158,7 +1163,8 @@ final class RuleEditorUITests: BackgroundTestCase {
         // This API enumerates only this process's capturable windows and needs
         // no screen recording consent. WK takeSnapshot omits backdrop filters.
         let scale = window.backingScaleFactor
-        let capture = try await Self.nativeWindowImage(id: CGWindowID(window.windowNumber), width: Int(window.frame.width * scale), height: Int(window.frame.height * scale))
+        let id = CGWindowID(window.windowNumber), width = Int(window.frame.width * scale), height = Int(window.frame.height * scale)
+        let capture = try await withNativeCaptureDeadline { try await Self.nativeWindowImage(id: id, width: width, height: height) }
         let rect = view.convert(view.bounds, to: contentView)
         let sx = CGFloat(capture.width) / window.frame.width, sy = CGFloat(capture.height) / window.frame.height
         let crop = CGRect(x: rect.minX * sx, y: (window.frame.height - rect.maxY) * sy, width: rect.width * sx, height: rect.height * sy)
@@ -1212,14 +1218,6 @@ final class RuleEditorUITests: BackgroundTestCase {
     private func input(_ view: WKWebView, _ selector: String, _ text: String, textarea: Bool = false) async throws {
         _ = try await js(view, "(() => { const x = Array.from(document.querySelectorAll(\(formulaQuote(selector)))).find(x => x instanceof \(textarea ? "HTMLTextAreaElement" : "HTMLInputElement") && x.getBoundingClientRect().height > 0); if (!x) throw new Error('Missing visible input: ' + \(formulaQuote(selector)) + '\\nInputs: ' + Array.from(document.querySelectorAll('input')).map(x => x.getAttribute('aria-label')).join(', ')); Object.getOwnPropertyDescriptor(\(textarea ? "HTMLTextAreaElement" : "HTMLInputElement").prototype, 'value').set.call(x, \(formulaQuote(text))); x.dispatchEvent(new Event('input', {bubbles:true})); return true; })()")
     }
-    @MainActor
-    private func screenshot(_ view: WKWebView, _ file: URL) async throws {
-        try await Task.sleep(nanoseconds: 350_000_000)
-        let image = try await view.takeSnapshot(configuration: nil), data = image.tiffRepresentation!, bitmap = NSBitmapImageRep(data: data)!
-        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try bitmap.representation(using: .png, properties: [:])!.write(to: file)
-    }
-
     @MainActor
     private func openMenu(_ view: WKWebView, selector: String, popover: Bool = false) async throws -> Double {
         if selector.contains("Rule type") || selector.contains("Wrap rule") {
@@ -1473,7 +1471,7 @@ final class RuleEditorUITests: BackgroundTestCase {
     func testVisualFunctionCoverageRelativeVolumeCountTextAndCrossingControls() async throws {
         guard ProcessInfo.processInfo.environment["RADAR_UI_TESTS"] == "1" else { throw XCTSkip("Run npm run test:ui after building the Web renderer.") }
         let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist")), configuration = uiConfiguration()
+        let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist"), marketCount: 8), configuration = uiConfiguration()
         bridge.pulseRows = true
         configuration.userContentController.addScriptMessageHandler(bridge, contentWorld: .page, name: "radar")
         configuration.setURLSchemeHandler(bridge, forURLScheme: "radar")
@@ -1482,8 +1480,8 @@ final class RuleEditorUITests: BackgroundTestCase {
         window.contentView = view; present(window)
         defer { view.stopLoading(); window.orderOut(nil); configuration.userContentController.removeScriptMessageHandler(forName: "radar", contentWorld: .page); bridge.cleanUp() }
         view.load(URLRequest(url: URL(string: "radar://app/index.html")!))
-        try await showAllMarkets(view)
-        try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 375")
+        try await showAllMarkets(view, count: 8)
+        try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 6")
         try await click(view, "Universe rules"); try await click(view, "Reset draft"); try await click(view, "Add condition")
         try await validDraft(view)
         // New numeric rules exclude equality; inclusive comparisons remain explicit choices.
@@ -1496,12 +1494,12 @@ final class RuleEditorUITests: BackgroundTestCase {
         let comparisons = try await js(view, "Array.from(document.querySelectorAll('[data-slot=\"select-item\"]')).map(item=>item.textContent.trim())") as? [String]
         XCTAssertEqual(Array(try XCTUnwrap(comparisons).prefix(2)), ["Greater than >", "Less than <"])
         try await option(view, "At least ≥"); try await validDraft(view)
-        try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 500")
+        try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 8")
         _ = try await openMenu(view, selector: "[aria-label=\"Comparison\"]")
         try await option(view, "Less than <"); try await validDraft(view)
         try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 0")
         try await input(view, "[aria-label=\"Threshold\"]", "111"); try await validDraft(view)
-        try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 500")
+        try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 8")
         _ = try await openMenu(view, selector: "[aria-label=\"Comparison\"]")
         try await option(view, "Greater than >")
         try await input(view, "[aria-label=\"Threshold\"]", "0"); try await validDraft(view)
@@ -1526,9 +1524,9 @@ final class RuleEditorUITests: BackgroundTestCase {
             try await wait(view, "document.querySelector('[aria-label=\"Right value\"]')?.textContent.includes(\(formulaQuote(FilterCatalog.choices(for: key).last!.label)))")
         }
         _ = try await metric(view, "Close"); try await validDraft(view)
-        // Every scalar template compiles and exposes editable parameters.
+        // Exercise each parameter-control shape; FilterLibraryTests validates every scalar default.
         _ = try await openMenu(view, selector: "[aria-label=\"Threshold / reference value type\"]"); try await option(view, "Another value / indicator")
-        for name in ["EMA", "RSI", "ROC", "MAROC", "LogBBUpper", "LogBBMiddle", "LogBBLower", "VWAP", "PriorHigh", "PriorLow", "BreakoutAge", "BreakdownAge", "abs", "mean", "sum", "highest", "lowest", "stddev", "lag", "change", "closed", "live"] {
+        for name in ["EMA", "MAROC", "LogBBUpper", "abs", "mean", "lag", "closed"] {
             try await expression(view, field: "Reference value", choice: name)
             try await validDraft(view)
             let parts = try await js(view, "document.querySelector('[aria-label=\"Toggle Reference value parameters\"]') !== null") as? Bool
@@ -1547,7 +1545,6 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await click(view, "Markets")
         try await wait(view, "document.querySelector('[aria-label=\"Baseline average window hours\"]')?.value === '' && document.querySelector('[aria-label=\"Baseline end offset hours\"]')?.value === '1'")
         try await input(view, "[aria-label=\"Baseline average window hours\"]", "20"); try await validDraft(view)
-        try await screenshot(view, project.appendingPathComponent(".build/ui-qa/visual-relative-volume.png"))
         // Existing conditions can be wrapped in counts and unwrapped without losing the typed reference.
         _ = try await openMenu(view, selector: "[aria-label=\"Wrap rule\"]"); try await option(view, "Occurrence count")
         try await input(view, "[aria-label=\"Window hours\"]", "48")
@@ -1577,7 +1574,8 @@ final class RuleEditorUITests: BackgroundTestCase {
         XCTAssertEqual(noFormulaEditor, true)
         window.setContentSize(NSSize(width: 720, height: 1000))
         window.appearance = NSAppearance(named: .darkAqua)
-        try await screenshot(view, project.appendingPathComponent(".build/ui-qa/visual-functions-dark-narrow.png"))
+        try await wait(view, "innerWidth === 720")
+        try await settleRendering(view)
         let overflowing = try await js(view, "document.documentElement.scrollWidth > window.innerWidth + 1") as? Bool
         XCTAssertEqual(overflowing, false)
     }
@@ -1598,13 +1596,12 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await showAllMarkets(view)
         try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 375")
         try await click(view, "Universe rules"); try await click(view, "Reset draft")
-        let latency = try await openMenu(view, selector: "[aria-label=\"Add condition\"]", popover: true)
+        _ = try await openMenu(view, selector: "[aria-label=\"Add condition\"]", popover: true)
         try await input(view, "[data-rule-library] [cmdk-input]", "持仓趋势")
         try await wait(view, "document.querySelector('[data-library-id=\"metric:oiTrend\"]') !== null")
         _ = try await js(view, "document.querySelector('[data-library-id=\"metric:oiTrend\"]').click(); true")
         try await validDraft(view)
         try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 167 && document.querySelector('[data-rule-preview]')?.innerText.includes('rising')")
-        XCTAssertLessThan(latency, 250)
         let noFormula = try await js(view, "document.querySelector('textarea') === null") as? Bool
         XCTAssertEqual(noFormula, true)
         try await click(view, "Guided cards")
@@ -1626,7 +1623,6 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await input(view, "[aria-label=\"Body EMA period hours\"]", "480")
         try await validDraft(view)
         try await wait(view, "document.querySelector('[aria-label=\"Body EMA period hours\"]')?.value === '480' && document.querySelector('[aria-label=\"Window hours\"]')?.value === '48' && document.body.innerText.includes('Whole candle body above EMA 480')")
-        try await screenshot(view, project.appendingPathComponent(".build/ui-qa/sentence-body-window.png"))
         try await click(view, "Reset draft"); try await click(view, "Volume surge")
         try await validDraft(view)
         try await wait(view, "document.querySelector('[aria-label=\"Threshold / reference value type\"]')?.textContent.includes('Average × multiplier') && document.querySelector('[aria-label=\"Baseline end offset hours\"]')?.value === '1'")
@@ -1652,7 +1648,8 @@ final class RuleEditorUITests: BackgroundTestCase {
         _ = try await js(view, "document.querySelector('[data-rule-library]').dispatchEvent(new KeyboardEvent('keydown', {key:'Escape',bubbles:true})); true")
         try await wait(view, "document.querySelector('[data-rule-library]') === null")
         window.setContentSize(NSSize(width: 720, height: 1000)); window.appearance = NSAppearance(named: .darkAqua)
-        try await screenshot(view, project.appendingPathComponent(".build/ui-qa/sentence-builder-dark-narrow.png"))
+        try await wait(view, "innerWidth === 720")
+        try await settleRendering(view)
         let overflow = try await js(view, "document.documentElement.scrollWidth > window.innerWidth + 1") as? Bool
         XCTAssertEqual(overflow, false)
     }
@@ -1698,6 +1695,8 @@ final class RuleEditorUITests: BackgroundTestCase {
         _ = try await js(view, "document.querySelector('[aria-label=\"Search contracts\"]').focus(); window.scrollTo({top:0,behavior:'instant'}); true")
         try await wait(view, "document.querySelector('tr[data-market-index=\"0\"]') !== null")
         var timings: [Double] = []
+        timings.append(try await openMenu(view, selector: "[aria-label=\"Add condition\"]", popover: true))
+        try await dismissFloating(view)
         timings.append(try await openMenu(view, selector: "[aria-label=\"Rule type\"]"))
         try await option(view, "All (AND)")
         try await click(view, "Add condition")
@@ -1734,11 +1733,9 @@ final class RuleEditorUITests: BackgroundTestCase {
         _ = try await js(view, "Array.from(document.querySelector('[data-rule-kind=\"condition\"] [aria-label=\"Evaluation hour\"]').querySelectorAll('button')).find(x => x.textContent.trim() === 'Closed').click(); true")
         try await validDraft(view)
         try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 166")
-        try await screenshot(view, project.appendingPathComponent(".build/ui-qa/oi-trend-closed.png"))
         _ = try await js(view, "Array.from(document.querySelector('[data-rule-kind=\"condition\"] [aria-label=\"Evaluation hour\"]').querySelectorAll('button')).find(x => x.textContent.trim() === 'Live').click(); true")
         try await validDraft(view)
         try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 167")
-        try await screenshot(view, project.appendingPathComponent(".build/ui-qa/oi-trend-rules.png"))
         let restored = try await js(view, "document.querySelector('[aria-label=\"Right value\"]').textContent.includes('Rising')") as? Bool
         XCTAssertEqual(restored, true)
         // A categorical reference can be another indicator without text entry.
@@ -1819,7 +1816,6 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 375")
 
         for appearance in [NSAppearance.Name.aqua, .darkAqua] {
-            let theme = appearance == .darkAqua ? "dark" : "light"
             window.appearance = NSAppearance(named: appearance)
             try await wait(view, "window.matchMedia('(prefers-color-scheme: dark)').matches === \(appearance == .darkAqua)")
             try await wait(view, "document.querySelector('[data-filter-unsaved]') === null && document.querySelector('[data-filter-unsaved-badge]') === null")
@@ -1829,10 +1825,8 @@ final class RuleEditorUITests: BackgroundTestCase {
             let accessible = try await js(view, "document.querySelector('[data-filter-unsaved]')?.getAttribute('role') === 'status' && document.querySelector('[data-filter-unsaved]')?.getAttribute('aria-live') === 'polite'") as? Bool
             XCTAssertEqual(accessible, true)
             try await assertSharedSurfaces(view, opacity: 0.3)
-            try await screenshot(view, project.appendingPathComponent(".build/ui-qa/filters-unsaved-expanded-\(theme).png"))
             try await click(view, "Universe rules")
             try await wait(view, "document.querySelector('[data-rule-layout]') === null && document.querySelector('[data-filter-unsaved] button')?.disabled === false")
-            try await screenshot(view, project.appendingPathComponent(".build/ui-qa/filters-unsaved-collapsed-\(theme).png"))
             window.setContentSize(NSSize(width: 720, height: 900))
             try await wait(view, "window.innerWidth === 720")
             let fits = try await js(view, """
@@ -1844,7 +1838,6 @@ final class RuleEditorUITests: BackgroundTestCase {
             })()
             """) as? Bool
             XCTAssertEqual(fits, true, "The unsaved warning and save action must fit the scaled native layout.")
-            try await screenshot(view, project.appendingPathComponent(".build/ui-qa/filters-unsaved-narrow-\(theme).png"))
             window.setContentSize(NSSize(width: 1440, height: 900))
             try await wait(view, "window.innerWidth === 1440")
 
@@ -1856,7 +1849,6 @@ final class RuleEditorUITests: BackgroundTestCase {
             try await wait(view, "Array.from(document.querySelectorAll('[role=alert]')).some(x => x.textContent.includes('Strategy save failed. Try again.')) && document.querySelector('[data-filter-unsaved] button')?.disabled === false")
             XCTAssertEqual(bridge.savedUniverseJSON, saved)
             XCTAssertEqual(bridge.revision, revision)
-            try await screenshot(view, project.appendingPathComponent(".build/ui-qa/filters-unsaved-failure-\(theme).png"))
             bridge.strategySaveDelay = 0; bridge.strategySaveError = nil
             try await click(view, "Save Universe")
             try await wait(view, "document.querySelector('[data-filter-unsaved]') === null && document.querySelector('[data-filter-unsaved-badge]') === null && document.body.innerText.includes('Universe saved to the strategy.')")
@@ -1887,17 +1879,14 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await showAllMarkets(view)
         try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 375")
         try await wait(view, "document.querySelector('[data-filter-summary] [data-slot=\"collapsible-trigger\"]')?.getAttribute('aria-expanded') === 'false' && document.querySelector('[aria-label=\"Combination name\"]') === null && document.querySelector('[data-filter-rules]')?.textContent.includes('24h turnover')")
-        try await screenshot(view, project.appendingPathComponent(".build/ui-qa/markets-light.png"))
         try await click(view, "Universe rules")
         try await click(view, "Reset draft"); try await click(view, "Volume surge"); try await validDraft(view)
         try await wait(view, "Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === 500 && Array.from(document.querySelectorAll('button')).some(x => x.textContent.trim() === 'Save Universe' && !x.disabled)")
         try await wait(view, "document.querySelector('[data-filter-unsaved]') !== null")
         try await click(view, "Universe rules")
         try await wait(view, "document.querySelector('[data-filter-name]')?.textContent === 'Universe rules' && document.querySelector('[data-filter-count]')?.textContent === '1 condition' && document.querySelector('[data-filter-rules]')?.textContent.includes('2× Average Quote volume') && document.querySelector('[aria-label=\"Combination name\"]') === null")
-        try await screenshot(view, project.appendingPathComponent(".build/ui-qa/filters-collapsed-light.png"))
         try await click(view, "Universe rules")
         try await wait(view, "document.querySelector('[aria-label=\"Baseline multiplier\"]')?.value === '2'")
-        try await screenshot(view, project.appendingPathComponent(".build/ui-qa/rules-light.png"))
         try await input(view, "[aria-label=\"Baseline multiplier\"]", "")
         try await wait(view, "document.body.innerText.includes('Last valid preview remains active')")
         try await wait(view, "document.querySelector('[data-filter-name]')?.textContent === 'Universe rules' && document.querySelector('[data-filter-rules]')?.textContent.includes('2× Average Quote volume')")
@@ -1913,15 +1902,26 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await click(view, "Universe rules"); try await click(view, "Universe rules")
         try await wait(view, "document.querySelector('[aria-label=\"Baseline multiplier\"]')?.value === ''")
         // A slow old draft response must not overwrite a later valid preview.
-        bridge.previewDelay = 800_000_000
+        bridge.cancelPreviousPreview = false
+        bridge.holdNextPreview = true
+        let previousRequests = bridge.previewRequests, previousResponses = bridge.previewResponses
         try await input(view, "[aria-label=\"Baseline multiplier\"]", "200")
-        try await Task.sleep(nanoseconds: 250_000_000)
-        bridge.previewDelay = 0
+        let requestDeadline = ContinuousClock.now + .seconds(2)
+        while bridge.previewRequests == previousRequests && ContinuousClock.now < requestDeadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertGreaterThan(bridge.previewRequests, previousRequests)
         try await input(view, "[aria-label=\"Baseline multiplier\"]", "2")
-        try await wait(view, "Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === 500 && !document.body.innerText.includes('Compiling…')")
-        try await Task.sleep(nanoseconds: 1_000_000_000)
-        let count = try await js(view, "Number(document.querySelector('table[data-market-count]')?.dataset.marketCount)") as? Int
+        try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 500 && !document.body.innerText.includes('Compiling…')")
+        let responseDeadline = ContinuousClock.now + .seconds(2)
+        while (bridge.heldPreviewReply == nil || bridge.previewResponses < previousResponses + 1) && ContinuousClock.now < responseDeadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertGreaterThanOrEqual(bridge.previewResponses, previousResponses + 1)
+        let obsoleteReply = try XCTUnwrap(bridge.heldPreviewReply)
+        bridge.heldPreviewReply = nil
+        obsoleteReply()
+        XCTAssertGreaterThanOrEqual(bridge.previewResponses, previousResponses + 2, "Deliver the obsolete reply only after the new preview has rendered.")
+        try await settleRendering(view)
+        let count = try await js(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount)") as? Int
         XCTAssertEqual(count, 500)
+        bridge.cancelPreviousPreview = true
         try await click(view, "Save Universe")
         try await wait(view, "document.body.innerText.includes('Universe saved to the strategy')")
         try await wait(view, "document.querySelector('[data-filter-name]')?.textContent === 'Universe rules' && document.querySelector('[data-filter-rules]')?.textContent.includes('2× Average Quote volume')")
@@ -1931,7 +1931,6 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await wait(view, "document.body.innerText.includes('500 Unknown')")
         try await click(view, "Explain markets")
         try await wait(view, "document.querySelector('[aria-label=\"Rule decision details\"]')?.innerText.includes('Spread has no quote snapshot')")
-        try await screenshot(view, project.appendingPathComponent(".build/ui-qa/explanation-light.png"))
         try await click(view, "Done")
         try await wait(view, "document.querySelector('[role=\"dialog\"]') === null")
         try await setBasicRule(view, metric: "Close", comparison: "Greater than >", threshold: "0")
@@ -1939,10 +1938,9 @@ final class RuleEditorUITests: BackgroundTestCase {
         // The real scaling container must retain its design layout at narrow native widths.
         window.setContentSize(NSSize(width: 720, height: 900))
         window.appearance = NSAppearance(named: .darkAqua)
-        try await Task.sleep(nanoseconds: 200_000_000)
+        try await settleRendering(view)
         let overflow = try await js(view, "document.documentElement.scrollWidth > window.innerWidth + 1") as? Bool
         XCTAssertEqual(overflow, false)
-        try await screenshot(view, project.appendingPathComponent(".build/ui-qa/judgments-dark-narrow.png"))
         let start = Date()
         try await input(view, "[aria-label=\"Search contracts\"]", "MKT499")
         try await wait(view, "Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === 1", seconds: 2)

@@ -9,6 +9,9 @@ let package = Package(
         .systemLibrary(name: "CSQLite"),
         .systemLibrary(name: "CZlib"),
         .executableTarget(name: "PerpetualRadar", dependencies: ["CSQLite", "CZlib", "ZIPFoundation"]),
-        .testTarget(name: "PerpetualRadarTests", dependencies: ["PerpetualRadar"]),
+        // Exercise optimized shipping code without optimizing the assertion
+        // harness and its large embedded WebKit scripts on every test edit.
+        .testTarget(name: "PerpetualRadarTests", dependencies: ["PerpetualRadar"],
+                    swiftSettings: [.unsafeFlags(["-Onone", "-Xfrontend", "-warn-long-expression-type-checking=1000"], .when(configuration: .release))]),
     ]
 )
