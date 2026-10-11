@@ -180,6 +180,8 @@ This runs Swift and TypeScript tests, lint and surface-contract checks, a full m
 
 The CI runner enforces a 60-second wall-clock budget. It shares one optimized native build between the packaged app and the tests, runs independent checks concurrently, and partitions every discovered WebKit test across isolated processes. No checks are selected by changed files or silently skipped to meet the budget. The 250 ms menu benchmark runs alone before a bounded native test pool. SwiftPM and icon assets reuse validated build outputs; clearing caches can exceed the budget and will fail CI. Stage logs and a successful run's timings are saved in `.build/ci`; install dependencies with `npm ci` before running CI.
 
+For a fresh checkout or cleared build cache, run `CI=1 npm run app` and `scripts/build-native.sh --build-tests` once to prime compilation, then run `npm run ci:local`. Cache warm-up does not replace any CI check.
+
 | Command | Purpose |
 | --- | --- |
 | `npm test` | Swift tests in isolated preference/cache domains, then TypeScript tests |
