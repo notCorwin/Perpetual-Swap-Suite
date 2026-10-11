@@ -80,6 +80,8 @@ actor OKXResearchTransport: ResearchTransport {
 }
 
 final class ResearchDataProvider {
+    // OKX rejects catalog requests with more than five families (code 50025).
+    private static let archiveFamilyLimit = 5
     let store: ResearchStore
     let transport: any ResearchTransport
     let radarURL: URL?
@@ -174,18 +176,19 @@ final class ResearchDataProvider {
             try Task.checkCancellation()
             let endMonth = calendar.date(byAdding: daily ? .day : .month, value: 10, to: month)!
             let end = min(through, Int64(endMonth.timeIntervalSince1970 * 1000) - 1)
-            for chunk in stride(from: 0, to: instruments.count, by: 10) {
-                let group = Array(instruments[chunk..<min(chunk + 10, instruments.count)])
+            for chunk in stride(from: 0, to: instruments.count, by: Self.archiveFamilyLimit) {
+                let group = Array(instruments[chunk..<min(chunk + Self.archiveFamilyLimit, instruments.count)])
                 let families = group.map { $0.id.replacingOccurrences(of: "-SWAP", with: "") }.joined(separator: ",")
                 let url = Self.url("/public/market-data-history", [("module", String(module)), ("instType", "SWAP"), ("instFamilyList", families), ("dateAggrType", daily ? "daily" : "monthly"), ("begin", String(Int64(month.timeIntervalSince1970 * 1000))), ("end", String(end))])
                 let cacheID = "catalog:" + researchHash(url.absoluteString)
-                let data: Data
-                if !refresh, let cached = try store.get(cacheID, as: CachedCatalog.self) { data = Data(cached.json.utf8) }
+                let catalogRows: [Any]
+                if !refresh, let cached = try store.get(cacheID, as: CachedCatalog.self) { catalogRows = try rows(Data(cached.json.utf8)) }
                 else {
-                    data = try await transport.get(url)
+                    let data = try await transport.get(url)
+                    catalogRows = try rows(data)
                     try store.put(cacheID, kind: "catalog", CachedCatalog(json: String(decoding: data, as: UTF8.self)))
                 }
-                for case let top as [String: Any] in try rows(data) {
+                for case let top as [String: Any] in catalogRows {
                     for case let detail as [String: Any] in top["details"] as? [Any] ?? [] {
                         for case let file as [String: Any] in detail["groupDetails"] as? [Any] ?? [] {
                             guard let filename = file["filename"] as? String, let download = file["url"] as? String else { continue }
@@ -255,7 +258,7 @@ final class ResearchDataProvider {
         let oldEnd = min(last, recent - hourMS)
         let earliestInput = max(0, first - Int64(warmup + 1) * hourMS)
         var catalogs: [Int: [ResearchSource]] = [:]
-        // Batch up to ten families per catalog call; cached complete periods need no catalog requests.
+        // Batch within the catalog family limit; cached complete periods need no catalog requests.
         for (module, kind, end) in [(2, "candle", oldEnd), (1, "taker", oldEnd), (3, "funding", oldEnd), (4, "spread", last)] where earliestInput <= end {
             let missing = try inputs.filter { instrument in
                 guard needs(kind, instrument.id) else { return false }
