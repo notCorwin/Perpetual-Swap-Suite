@@ -62,6 +62,28 @@ final class ResearchRequestTests: XCTestCase {
         ResearchRequestLimiter(interval: interval, initialBackoff: backoff, maximumBackoff: cap, jitter: 0)
     }
 
+    func testDefaultQuotasUseFasterCandlePacingAndIndependentInstrumentAdmission() async throws {
+        let fixture = ResearchHTTPFixture { _, _ in .init() }, requestLimiter = ResearchRequestLimiter()
+        let session = session(fixture), transport = OKXResearchTransport(session: session, limiter: requestLimiter)
+        defer { session.invalidateAndCancel(); ResearchHTTPProtocol.remove(fixture) }
+        let candleURL = URL(string: "https://\(fixture.host)/api/v5/market/history-candles")!
+        for _ in 0..<3 { _ = try await transport.get(candleURL) }
+        let candles = fixture.requests
+        for pair in zip(candles, candles.dropFirst()) {
+            let elapsed = researchSeconds(pair.0.1.duration(to: pair.1.1))
+            XCTAssertGreaterThanOrEqual(elapsed, 0.10)
+            XCTAssertLessThan(elapsed, 0.40, "Candle history must use its 20/2s quota instead of the catalog's slow quota.")
+        }
+        let first = URL(string: "https://\(fixture.host)/api/v5/public/funding-rate-history?instId=BTC-USDT-SWAP")!
+        let second = URL(string: "https://\(fixture.host)/api/v5/public/funding-rate-history?instId=ETH-USDT-SWAP")!
+        _ = try await transport.get(first)
+        _ = try await transport.get(second)
+        _ = try await transport.get(first)
+        let requests = Array(fixture.requests.dropFirst(3))
+        XCTAssertLessThan(researchSeconds(requests[0].1.duration(to: requests[1].1)), 0.15, "Different instruments have independent funding quotas.")
+        XCTAssertGreaterThanOrEqual(researchSeconds(requests[0].1.duration(to: requests[2].1)), 0.20)
+    }
+
     func testRepeatedHTTPAndEnvelopeRateLimitsRecoverWithoutManualResume() async throws {
         let fixture = ResearchHTTPFixture { _, ordinal in
             guard ordinal <= 8 else { return .init() }

@@ -21,8 +21,8 @@ final class ResearchStore {
         self.directory = directory
         database = try Store(url: directory.appendingPathComponent("research.sqlite3"))
         try FileManager.default.createDirectory(at: directory.appendingPathComponent("Raw"), withIntermediateDirectories: true)
-        if try database.preference(forKey: "researchSchemaVersion") != "1" { try database.transaction {
-            guard try database.preference(forKey: "researchSchemaVersion") != "1" else { return }
+        if try database.preference(forKey: "researchSchemaVersion") == nil { try database.transaction {
+            guard try database.preference(forKey: "researchSchemaVersion") == nil else { return }
             try database.execute("CREATE TABLE IF NOT EXISTS research_objects (id TEXT PRIMARY KEY, kind TEXT NOT NULL, json TEXT NOT NULL)")
             try database.execute("CREATE TABLE IF NOT EXISTS research_data (revision INTEGER PRIMARY KEY AUTOINCREMENT, inst TEXT NOT NULL, kind TEXT NOT NULL, ts INTEGER NOT NULL, digest TEXT NOT NULL, json TEXT NOT NULL, UNIQUE(inst,kind,ts,digest))")
             try database.execute("CREATE INDEX IF NOT EXISTS research_data_key ON research_data(inst,kind,ts,revision)")
@@ -38,6 +38,29 @@ final class ResearchStore {
             try database.execute("CREATE INDEX IF NOT EXISTS research_events_page ON research_events(study,ts,id)")
             try database.setPreference("1", forKey: "researchSchemaVersion")
         } }
+        if try database.preference(forKey: "researchSchemaVersion") != "4" { try database.transaction {
+            guard try database.preference(forKey: "researchSchemaVersion") != "4" else { return }
+            try database.execute("CREATE INDEX IF NOT EXISTS research_objects_kind ON research_objects(kind)")
+            try database.execute("CREATE INDEX IF NOT EXISTS research_coverage_input ON research_coverage(inst,kind,parser,first,last)")
+            if try database.preference(forKey: "researchSchemaVersion") == "3" { try database.execute("ALTER TABLE research_prepared_sources ADD COLUMN seconds REAL") }
+            try database.execute("CREATE TABLE IF NOT EXISTS research_prepared_sources (study TEXT, source TEXT, seconds REAL, PRIMARY KEY(study,source))")
+            // Invalidation is durable and also observes writes from other connections.
+            for table in ["research_heads", "research_coverage"] {
+                for event in ["INSERT", "UPDATE", "DELETE"] {
+                    try database.execute("CREATE TRIGGER IF NOT EXISTS plan_cache_\(table)_\(event) AFTER \(event) ON \(table) BEGIN DELETE FROM research_objects WHERE kind='planCache'; END")
+                }
+                try database.execute("DROP TRIGGER IF EXISTS prepared_cache_\(table)_DELETE")
+            }
+            try database.execute("CREATE TRIGGER prepared_cache_research_heads_DELETE AFTER DELETE ON research_heads BEGIN DELETE FROM research_objects WHERE kind='preparedSource' AND id IN (SELECT 'prepared:'||j.value FROM research_data d,json_each(d.json,'$.sources') j WHERE d.revision=OLD.revision); END")
+            try database.execute("CREATE TRIGGER prepared_cache_research_coverage_DELETE AFTER DELETE ON research_coverage BEGIN DELETE FROM research_objects WHERE id='prepared:'||OLD.source; END")
+            for event in ["INSERT", "UPDATE", "DELETE"] {
+                let row = event == "DELETE" ? "OLD" : "NEW"
+                try database.execute("CREATE TRIGGER IF NOT EXISTS plan_cache_objects_\(event) AFTER \(event) ON research_objects WHEN \(row).kind IN ('source','instrument') BEGIN DELETE FROM research_objects WHERE kind='planCache'; END")
+            }
+            try database.execute("DELETE FROM research_objects WHERE kind='planCache'")
+            try database.execute("DELETE FROM research_objects WHERE kind='preparedSource'")
+            try database.setPreference("4", forKey: "researchSchemaVersion")
+        } }
     }
 
     static var defaultDirectory: URL {
@@ -51,7 +74,21 @@ final class ResearchStore {
     func get<T: Decodable>(_ id: String, as type: T.Type) throws -> T? {
         var json: String?
         try database.query("SELECT json FROM research_objects WHERE id=?", [id]) { json = Self.text($0, 0) }
-        return try json.map { try decoder.decode(type, from: Data($0.utf8)) }
+        guard let json else { return nil }
+        let value = try decoder.decode(type, from: Data(json.utf8))
+        if var checkpoint = value as? Checkpoint {
+            var sources = Set(checkpoint.completedSources)
+            try database.query("SELECT source,seconds FROM research_prepared_sources WHERE study=? ORDER BY rowid", [checkpoint.studyID]) {
+                let source = Self.text($0, 0)
+                if sources.insert(source).inserted { checkpoint.completedSources.append(source) }
+                if let seconds = Self.number($0, 1) {
+                    if checkpoint.sourceSeconds == nil { checkpoint.sourceSeconds = [:] }
+                    checkpoint.sourceSeconds?[source] = seconds
+                }
+            }
+            return checkpoint as? T
+        }
+        return value
     }
     func objects<T: Decodable>(_ kind: String, as type: T.Type) throws -> [T] {
         var json: [String] = []
@@ -62,6 +99,37 @@ final class ResearchStore {
     func rawIsComplete(_ source: ResearchSource) throws -> Bool {
         guard let saved = try get(source.id, as: ResearchSource.self), saved.rawHash != nil else { return false }
         return FileManager.default.fileExists(atPath: rawURL(saved).path)
+    }
+    private struct PreparedSource: Codable {
+        var rawHash: String
+        var parser: String
+        var metadata: String
+        var size: Int
+        var modifiedAt: Date?
+    }
+    private func preparationMetadata(_ source: ResearchSource, instruments: [ResearchInstrument]) throws -> String {
+        struct Metadata: Encodable { var id: String; var verified: Bool; var contractValue: Double? }
+        return researchHash(try researchJSON(instruments.filter { source.instrument == "ANY" || $0.id == source.instrument }.sorted { $0.id < $1.id }.map { Metadata(id: $0.id, verified: $0.verified, contractValue: $0.contractValue) }))
+    }
+    func isPrepared(_ source: ResearchSource, instruments: [ResearchInstrument]) throws -> Bool {
+        guard let saved = try get(source.id, as: ResearchSource.self),
+              let completed = try get("prepared:\(source.id)", as: PreparedSource.self),
+              completed.parser == ResearchVersion.parser, completed.rawHash == saved.rawHash,
+              completed.metadata == (try preparationMetadata(source, instruments: instruments)),
+              try rawIsComplete(saved) else { return false }
+        let attributes = try rawURL(saved).resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        return attributes.fileSize == completed.size && attributes.contentModificationDate == completed.modifiedAt
+    }
+    func finishPreparation(_ source: ResearchSource, instruments: [ResearchInstrument], cover accepted: Bool = true) throws {
+        guard let hash = source.rawHash else { throw FilterError("Prepared source has no verified original file.") }
+        let attributes = try rawURL(source).resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        let completed = PreparedSource(rawHash: hash, parser: ResearchVersion.parser, metadata: try preparationMetadata(source, instruments: instruments), size: attributes.fileSize ?? 0, modifiedAt: attributes.contentModificationDate)
+        try database.transaction {
+            try put(source.id, kind: "source", source)
+            if accepted { try cover(source) }
+            else { try database.execute("DELETE FROM research_coverage WHERE source=?", [source.id]) }
+            try put("prepared:\(source.id)", kind: "preparedSource", completed)
+        }
     }
     func count(_ sql: String, _ values: [Any?] = []) throws -> Int {
         var count = 0; try database.query(sql, values) { count = Int(sqlite3_column_int64($0, 0)) }; return count
@@ -76,8 +144,16 @@ final class ResearchStore {
     func write(_ values: [ResearchDatum]) throws {
         try ResearchPressure.shared.check()
         if let available = try directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage, available < 16 * 1024 * 1024 { throw FilterError("Research stopped because disk space is low. Completed cache and checkpoints were retained.") }
+        // Encoding/hash work overlaps on every parser core. Only merged fields
+        // need to be encoded while holding SQLite's single writer lock.
+        let encoded = try values.map { datum -> (ResearchDatum, String?, String?) in
+            if ["stat", "quote"].contains(datum.kind) { return (datum, nil, nil) }
+            let json = try researchJSON(datum)
+            return (datum, json, researchHash(json))
+        }
         try database.transaction {
-            for var datum in values {
+            for (input, encodedJSON, encodedHash) in encoded {
+                var datum = input
                 if datum.kind == "stat" || datum.kind == "quote", let previous = try latest(datum.instrument, kind: datum.kind, timestamp: datum.timestamp) {
                     if datum.kind == "stat" {
                         datum.stat = FilterStat(oi: datum.stat?.oi ?? previous.stat?.oi, sell: datum.stat?.sell ?? previous.stat?.sell, buy: datum.stat?.buy ?? previous.stat?.buy)
@@ -86,7 +162,7 @@ final class ResearchStore {
                     }
                     datum.sources = Array(Set(datum.sources + previous.sources)).sorted()
                 }
-                let json = try researchJSON(datum), hash = researchHash(json)
+                let json = try encodedJSON ?? researchJSON(datum), hash = encodedHash ?? researchHash(json)
                 try database.execute("INSERT OR IGNORE INTO research_data(inst,kind,ts,digest,json) VALUES (?,?,?,?,?)", [datum.instrument, datum.kind, datum.timestamp, hash, json])
                 try database.execute("INSERT INTO research_heads SELECT inst,kind,ts,revision FROM research_data WHERE inst=? AND kind=? AND ts=? AND digest=? ON CONFLICT(inst,kind,ts) DO UPDATE SET revision=excluded.revision", [datum.instrument, datum.kind, datum.timestamp, hash])
             }
@@ -136,6 +212,7 @@ final class ResearchStore {
     }
     func missing(_ instrument: String, kind: String, from: Int64, through: Int64) throws -> [ResearchRange] {
         guard through >= from else { return [] }
+        if kind == "candle" { return try missingConfirmedCandles(instrument, from: from, through: through) }
         var covered: [ResearchRange] = []
         try database.query("SELECT first,last FROM research_coverage WHERE inst=? AND kind=? AND parser=? AND last>=? AND first<=? ORDER BY first", [instrument, kind, ResearchVersion.parser, from, through]) {
             covered.append(.init(from: sqlite3_column_int64($0, 0), through: sqlite3_column_int64($0, 1)))
@@ -339,6 +416,12 @@ final class ResearchStore {
         for source in plan.sources { try database.execute("INSERT OR IGNORE INTO research_source_pins VALUES (?,?)", [owner, source.id]) }
         try database.execute("INSERT OR IGNORE INTO research_source_pins SELECT ?,j.value FROM research_pins p JOIN research_data d USING(revision),json_each(d.json,'$.sources') j WHERE p.manifest=?", [owner, owner])
     }
+    func pinPreparedSource(_ source: ResearchSource, plan: DataPlan, owner: String) throws {
+        let from = max(source.from, plan.from - Int64(plan.warmupHours + 1) * hourMS)
+        let through = min(source.through, plan.through + 48 * hourMS)
+        try database.execute("INSERT OR IGNORE INTO research_pins SELECT ?,revision FROM research_heads WHERE inst=? AND ts>=? AND ts<=?", [owner, source.instrument, from, through])
+        try database.execute("INSERT OR IGNORE INTO research_source_pins SELECT ?,source FROM research_coverage WHERE inst=? AND last>=? AND first<=?", [owner, source.instrument, from, through])
+    }
     func freeze(_ plan: DataPlan) throws -> DataManifest {
         let plan = try plan.excludingSpread()
         var manifest = DataManifest(planID: plan.id, from: plan.from, through: plan.through, instruments: plan.instruments, warnings: plan.warnings, unknownInstruments: plan.unknownInstruments)
@@ -413,6 +496,7 @@ final class ResearchStore {
         }
     }
     func cleanCache() throws -> Int64 {
+        try database.execute("DELETE FROM research_objects WHERE kind='planCache'")
         let studies = try objects("study", as: ResearchStudy.self)
         let pendingPlans = try studies.filter { $0.manifestID == nil }.compactMap { try get($0.planID, as: DataPlan.self) }
         try database.transaction {
@@ -458,6 +542,8 @@ final class ResearchStore {
         }
         try database.execute("DELETE FROM research_objects WHERE kind='rawPage' AND json_extract(json,'$.sourceID') NOT IN (SELECT source FROM research_source_pins)")
         try database.execute("DELETE FROM research_objects WHERE kind='indicator' AND id NOT IN (SELECT key FROM research_indicator_pins)")
+        try database.execute("DELETE FROM research_objects WHERE kind='preparedSource' AND substr(id,10) NOT IN (SELECT id FROM research_objects WHERE kind='source')")
+        try database.execute("DELETE FROM research_prepared_sources WHERE study NOT IN (SELECT id FROM research_objects WHERE kind='study')")
         return bytes
     }
 }

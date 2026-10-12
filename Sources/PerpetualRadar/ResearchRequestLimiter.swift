@@ -4,20 +4,21 @@ import Foundation
 // sleep: reserving future slots lets delayed tasks send a burst when they wake.
 actor ResearchRequestLimiter {
     static let shared = ResearchRequestLimiter()
-    private let interval: Duration
+    private let interval: Duration?
     private let initialBackoff: Double
     private let maximumBackoff: Double
     private let jitter: Double
     private var nextRequest: [String: ContinuousClock.Instant] = [:]
     private var cooldown: [String: ContinuousClock.Instant] = [:]
 
-    init(interval: Duration = .milliseconds(500), initialBackoff: Double = 2, maximumBackoff: Double = 60, jitter: Double = 0.25) {
+    init(interval: Duration? = nil, initialBackoff: Double = 2, maximumBackoff: Double = 60, jitter: Double = 0.25) {
         self.interval = interval; self.initialBackoff = initialBackoff
         self.maximumBackoff = maximumBackoff; self.jitter = jitter
     }
 
     func wait(for url: URL) async throws {
-        let host = url.host ?? "", key = host + (url.path.hasPrefix("/api/v5/") ? url.path : "/archives")
+        let host = url.host ?? "", policy = Self.policy(for: url)
+        let key = host + policy.key
         while true {
             try Task.checkCancellation()
             let now = ContinuousClock.now
@@ -25,11 +26,25 @@ actor ResearchRequestLimiter {
             if scheduled > now {
                 try await Task.sleep(until: scheduled, clock: .continuous)
             } else {
-                // OKX's archive catalog allows 5 requests / 2 seconds per IP.
-                // Leave headroom and serialize admission across transport instances.
-                nextRequest[key] = now + interval
+                nextRequest[key] = now + (interval ?? policy.interval)
                 return
             }
+        }
+    }
+
+    // Published OKX limits differ by endpoint and sometimes instrument. Keep
+    // headroom while allowing independent instruments to use their own quota.
+    private static func policy(for url: URL) -> (key: String, interval: Duration) {
+        let instrument = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "instId" }?.value ?? ""
+        switch url.path {
+        case "/api/v5/market/history-candles", "/api/v5/market/history-mark-price-candles":
+            return (url.path, .milliseconds(110)) // 20 / 2s per IP
+        case "/api/v5/public/funding-rate-history", "/api/v5/rubik/stat/contracts/open-interest-history":
+            return (url.path + ":" + instrument, .milliseconds(220)) // 10 / 2s per instrument
+        case "/api/v5/rubik/stat/taker-volume-contract":
+            return (url.path + ":" + instrument, .milliseconds(450)) // 5 / 2s per instrument
+        default:
+            return url.path.hasPrefix("/api/v5/") ? (url.path, .milliseconds(450)) : ("/archives", .zero)
         }
     }
 

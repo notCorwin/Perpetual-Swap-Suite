@@ -55,6 +55,33 @@ actor ResearchProgressFixtureTransport: ResearchTransport {
 }
 
 final class ResearchProgressTests: XCTestCase {
+    func testCancellingAnActiveNativeDownloadSavesPartialBytesAndResumesWithoutRestarting() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ResearchTransferCancel-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ResearchDownloadProtocol.self]
+        let session = URLSession(configuration: configuration), transport = OKXResearchTransport(session: session)
+        defer { session.invalidateAndCancel() }
+        let destination = directory.appendingPathComponent("resumed"), recorder = ResearchTransferRecorder()
+        let url = URL(string: "https://research-download.test/cancel")!
+        let download = Task { try await transport.download(url, to: destination) { await recorder.append($0) } }
+        let deadline = ContinuousClock.now + .seconds(3)
+        while !(await recorder.values()).contains(where: { $0.receivedBytes > 0 }), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        download.cancel()
+        do { try await download.value; XCTFail("Pause must interrupt a transfer.") } catch {}
+        let part = destination.appendingPathExtension("part")
+        let saved = try Data(contentsOf: part)
+        XCTAssertGreaterThan(saved.count, 0); XCTAssertLessThan(saved.count, ResearchDownloadProtocol.payload.count)
+        let resumed = ResearchTransferRecorder()
+        try await transport.download(url, to: destination) { await resumed.append($0) }
+        let updates = await resumed.values()
+        XCTAssertEqual(updates.first?.receivedBytes, Int64(saved.count))
+        XCTAssertEqual(try Data(contentsOf: destination), ResearchDownloadProtocol.payload)
+    }
+
     func testNativeDownloadReportsStreamingBytesUnknownLengthsAndResumedOffsets() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ResearchTransfer-\(UUID())")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

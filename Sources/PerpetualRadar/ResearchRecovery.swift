@@ -37,6 +37,7 @@ enum ResearchRecovery {
     }
 
     static func run<Value>(
+        isolation: isolated (any Actor)? = #isolation,
         onRetry: (Double, String) async -> Void,
         operation: () async throws -> Value
     ) async throws -> Value {

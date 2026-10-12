@@ -97,6 +97,7 @@ final class ResearchRecoveryTests: XCTestCase {
     func testDamagedCachedArchiveIsRetainedAndReplacedAutomatically() async throws {
         let store = try store(); defer { try? FileManager.default.removeItem(at: store.directory) }
         let source = try archive(store), payload = try Data(contentsOf: store.rawURL(source))
+        try await ResearchDataProvider(store: store, transport: RecoveryTransport(candles: ResearchFixture.bars(from: source.from, through: source.through))).prepare(source, instruments: [ResearchFixture.instrument])
         try Data("damaged".utf8).write(to: store.rawURL(source))
         let transport = RecoveryTransport(candles: ResearchFixture.bars(from: source.from, through: source.through), archivePayload: payload)
         try await ResearchDataProvider(store: store, transport: transport).prepare(source, instruments: [ResearchFixture.instrument])

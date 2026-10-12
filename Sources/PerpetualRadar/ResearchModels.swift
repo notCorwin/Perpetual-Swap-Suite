@@ -357,10 +357,11 @@ struct ResearchPreparationProgress: Codable, Sendable {
     var fraction: Double?
     var retryAt: Int64?
     var recovery: String?
+    var workers: Int?
 }
 
-// Pressure notifications are shared by the downloader and the single parser /
-// calculation worker. A failed chunk leaves the previous durable checkpoint.
+// Pressure notifications are shared by downloaders, parsers and calculation.
+// A failed chunk leaves the previous durable checkpoint.
 final class ResearchPressure: @unchecked Sendable {
     static let shared = ResearchPressure()
     private let lock = NSLock()

@@ -11,7 +11,7 @@ extension ResearchTransport {
     func get(_ url: URL, onRetry: @escaping @Sendable (Double) async -> Void) async throws -> Data { try await get(url) }
 }
 
-actor OKXResearchTransport: ResearchTransport {
+final class OKXResearchTransport: ResearchTransport, Sendable {
     private let session: URLSession
     private let apiSession: URLSession
     private let limiter: ResearchRequestLimiter
@@ -64,98 +64,23 @@ actor OKXResearchTransport: ResearchTransport {
         var attempt = 0
         while true {
             try Task.checkCancellation()
-            do { try await downloadAttempt(url, to: destination, progress: progress); return }
-            catch {
+            try await limiter.wait(for: url)
+            let delay: Double
+            do {
+                let response = try await ResearchArchiveDownload.transfer(url, to: destination, configuration: session.configuration, progress: progress)
+                if !ResearchRecovery.isRecoverable(ResearchHTTPError(status: response.statusCode, path: url.path)) { return }
+                delay = await limiter.retrying(url, response: response, attempt: attempt)
+            } catch {
                 try Task.checkCancellation()
                 guard ResearchRecovery.isRecoverable(error) else { throw error }
-                let delay = await limiter.retrying(url, attempt: attempt)
-                let received = (try? destination.appendingPathExtension("part").resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
-                await progress(.init(receivedBytes: received, totalBytes: nil, bytesPerSecond: nil, retryAt: researchNow() + Int64(delay * 1_000)))
-                attempt = min(attempt + 1, 30)
+                delay = await limiter.retrying(url, attempt: attempt)
             }
-        }
-    }
-    private func downloadAttempt(_ url: URL, to destination: URL, progress: @escaping @Sendable (ResearchDownloadProgress) async -> Void) async throws {
-        let part = destination.appendingPathExtension("part"), validatorURL = part.appendingPathExtension("validator")
-        let existing = (try? part.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
-        let validator = try? String(contentsOf: validatorURL, encoding: .utf8)
-        var request = URLRequest(url: url)
-        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-        if existing > 0, let validator { request.setValue("bytes=\(existing)-", forHTTPHeaderField: "Range"); request.setValue(validator, forHTTPHeaderField: "If-Range") }
-        let (bytes, response) = try await archiveResponse(request, received: existing, progress: progress)
-        if response.statusCode == 416, existing > 0, validator != nil,
-           response.value(forHTTPHeaderField: "Content-Range") == "bytes */\(existing)",
-           (response.value(forHTTPHeaderField: "ETag") ?? response.value(forHTTPHeaderField: "Last-Modified")).map({ $0 == validator }) != false {
-            // Cancellation after the final buffer can leave a complete .part.
-            // The importer still verifies the full file's hash and archive CRC.
-            try FileManager.default.moveItem(at: part, to: destination)
-            await progress(.init(receivedBytes: existing, totalBytes: existing, bytesPerSecond: nil))
-            try? FileManager.default.removeItem(at: validatorURL); return
-        }
-        guard [200, 206].contains(response.statusCode) else { throw ResearchHTTPError(status: response.statusCode, path: url.path) }
-        let resumed = response.statusCode == 206
-        let declaredLength = response.value(forHTTPHeaderField: "Content-Length").flatMap(Int64.init)
-        var total = declaredLength ?? (response.expectedContentLength > 0 ? response.expectedContentLength : nil)
-        if resumed {
-            guard existing > 0, let range = response.value(forHTTPHeaderField: "Content-Range")?.firstMatch(of: /^bytes ([0-9]+)-([0-9]+)\/([0-9]+|\*)$/),
-                  Int64(range.1) == existing, let end = Int64(range.2), end >= existing else { throw FilterError("Invalid archive continuation response.") }
-            total = Int64(range.3) ?? declaredLength.map { $0 + existing }
-        } else {
-            FileManager.default.createFile(atPath: part.path, contents: nil)
-            let handle = try FileHandle(forWritingTo: part); try handle.truncate(atOffset: 0); try handle.close()
-        }
-        if let value = response.value(forHTTPHeaderField: "ETag") ?? response.value(forHTTPHeaderField: "Last-Modified") { try value.write(to: validatorURL, atomically: true, encoding: .utf8) }
-        if response.expectedContentLength > 0 {
-            let available = try destination.deletingLastPathComponent().resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage
-            if let available, available < response.expectedContentLength + 64 * 1024 * 1024 { throw FilterError("Not enough disk space for this archive. Clear unreferenced cache or free disk space, then resume.") }
-        }
-        let handle = try FileHandle(forWritingTo: part); defer { try? handle.close() }
-        if resumed { try handle.seekToEnd() }
-        let offset = resumed ? existing : 0
-        let started = ContinuousClock.now
-        var lastProgress = started, received = offset
-        await progress(.init(receivedBytes: received, totalBytes: total, bytesPerSecond: nil))
-        var buffer = Data(); buffer.reserveCapacity(64 * 1024)
-        do {
-            for try await byte in bytes {
-                buffer.append(byte)
-                received += 1
-                if buffer.count >= 64 * 1024 { try handle.write(contentsOf: buffer); buffer.removeAll(keepingCapacity: true); try ResearchPressure.shared.check() }
-                if received % 1024 == 0, lastProgress.duration(to: .now) >= .milliseconds(250) {
-                    let elapsed = researchSeconds(started.duration(to: .now))
-                    await progress(.init(receivedBytes: received, totalBytes: total, bytesPerSecond: Double(received - offset) / max(elapsed, 0.001)))
-                    lastProgress = .now
-                }
-            }
-            if !buffer.isEmpty { try handle.write(contentsOf: buffer) }
-            try handle.synchronize()
-        } catch {
-            if !buffer.isEmpty { try? handle.write(contentsOf: buffer) }
-            throw error
-        }
-        if let total {
-            // Read the live file length; URL resource values can retain the pre-resume size.
-            let actual = try handle.seekToEnd()
-            guard total >= 0, actual == UInt64(total) else { throw URLError(.networkConnectionLost, userInfo: [NSLocalizedDescriptionKey: "Archive transfer was incomplete: received \(actual) of \(total) bytes."]) }
-        }
-        if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
-        try FileManager.default.moveItem(at: part, to: destination)
-        await progress(.init(receivedBytes: received, totalBytes: total ?? received, bytesPerSecond: Double(received - offset) / max(researchSeconds(started.duration(to: .now)), 0.001)))
-        try? FileManager.default.removeItem(at: validatorURL)
-    }
-    private func archiveResponse(_ request: URLRequest, received: Int64, progress: @escaping @Sendable (ResearchDownloadProgress) async -> Void) async throws -> (URLSession.AsyncBytes, HTTPURLResponse) {
-        var attempt = 0
-        while true {
-            try await limiter.wait(for: request.url!)
-            let (bytes, response) = try await session.bytes(for: request)
-            guard let response = response as? HTTPURLResponse else { bytes.task.cancel(); throw FilterError("Archive download failed; completed files remain cached.") }
-            if !ResearchRecovery.isRecoverable(ResearchHTTPError(status: response.statusCode, path: request.url!.path)) { try Task.checkCancellation(); return (bytes, response) }
-            bytes.task.cancel()
-            let delay = await limiter.retrying(request.url!, response: response, attempt: attempt)
+            let received = (try? destination.appendingPathExtension("part").resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
             await progress(.init(receivedBytes: received, totalBytes: nil, bytesPerSecond: nil, retryAt: researchNow() + Int64(delay * 1_000)))
             attempt = min(attempt + 1, 30)
         }
     }
+
 }
 
 final class ResearchDataProvider {
@@ -394,13 +319,21 @@ final class ResearchDataProvider {
         try spec.validate()
         
         // Check for cached plan if not refreshing
+        var cacheSpec = spec
+        cacheSpec.name = ""
+        cacheSpec.instruments.sort()
+        let cacheID = "plan-cache:\(ResearchVersion.parser):\(ResearchVersion.engine):" + researchHash(try researchJSON(cacheSpec))
+        let radarStamp = try radarSignature()
+        let completedThrough = min(spec.through + 48 * hourMS, researchNow() / hourMS * hourMS - hourMS)
         if !refresh {
-            let specHash = researchHash(try researchJSON(spec))
-            let cacheID = "plan-cache:\(specHash)"
             if let cached = try store.get(cacheID, as: CachedPlan.self),
+               cached.radarSignature == radarStamp, cached.completedThrough == completedThrough,
                cached.createdAt >= researchNow() - 24 * 3600 * 1000 { // 24 hour cache validity
                 await progress(.init(stage: "saving", unit: "steps", completed: 1, total: 1, message: "Using cached data plan from \(formatCacheAge(cached.createdAt))"))
-                return cached.plan
+                var plan = cached.plan
+                plan.id = UUID().uuidString; plan.spec = spec; plan.createdAt = researchNow()
+                try store.put(plan.id, kind: "plan", plan)
+                return plan
             }
         }
         
@@ -533,9 +466,7 @@ final class ResearchDataProvider {
         try store.put(plan.id, kind: "plan", plan)
         
         // Cache the plan for future requests with the same spec
-        let specHash = researchHash(try researchJSON(spec))
-        let cacheID = "plan-cache:\(specHash)"
-        try store.put(cacheID, kind: "planCache", CachedPlan(plan: plan, createdAt: researchNow()))
+        try store.put(cacheID, kind: "planCache", CachedPlan(plan: plan, createdAt: researchNow(), radarSignature: radarStamp, completedThrough: completedThrough))
         
         return plan
     }
@@ -546,7 +477,15 @@ final class ResearchDataProvider {
         if seconds < 3600 { return "\(seconds / 60)m ago" }
         return "\(seconds / 3600)h ago"
     }
-    private struct CachedPlan: Codable { var plan: DataPlan; var createdAt: Int64 }
+    private struct CachedPlan: Codable { var plan: DataPlan; var createdAt: Int64; var radarSignature: String; var completedThrough: Int64 }
+    private func radarSignature() throws -> String {
+        guard let radarURL else { return "absent" }
+        return try [radarURL, URL(fileURLWithPath: radarURL.path + "-wal")].map { url in
+            guard FileManager.default.fileExists(atPath: url.path) else { return url.path + ":absent" }
+            let values = try url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+            return "\(url.path):\(values.fileSize ?? 0):\(values.contentModificationDate?.timeIntervalSince1970 ?? 0)"
+        }.joined(separator: "|")
+    }
     static func subtract(_ range: ResearchRange, covered: [ResearchRange]) -> [ResearchRange] {
         var next = range.from, result: [ResearchRange] = []
         for part in covered.sorted(by: { $0.from < $1.from }) {
@@ -561,15 +500,16 @@ final class ResearchDataProvider {
         while let data = try handle.read(upToCount: 1024 * 1024), !data.isEmpty { try Task.checkCancellation(); hash.update(data: data) }
         return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
-    func prepare(_ source: ResearchSource, instruments: [ResearchInstrument], progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void = { _ in }) async throws {
+    func prepare(_ source: ResearchSource, instruments: [ResearchInstrument], requiredRange: ResearchRange? = nil, isolation: isolated (any Actor)? = #isolation, progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void = { _ in }) async throws {
         guard !ResearchSpreadPolicy.excludes(source) else { throw FilterError("Research no longer prepares bid/ask spread or order book archives. Review the updated data plan.") }
-        // Preparation changes local coverage, even when interrupted. Replanning
-        // must inspect that checkpoint's inputs instead of returning stale gaps.
-        try store.database.execute("DELETE FROM research_objects WHERE kind='planCache'")
         var source = source
         let file = store.rawURL(source)
         let filename = source.filename, instrument = source.instrument
         await progress(.init(stage: "checking", filename: filename, instrument: instrument))
+        if try store.isPrepared(source, instruments: instruments) {
+            try await fillCandleGaps(source, instruments: instruments, requiredRange: requiredRange, progress: progress)
+            return
+        }
         if !(try store.rawIsComplete(source)) {
             if source.archive {
                 await progress(.init(stage: "connecting", filename: filename, instrument: instrument, totalBytes: source.sizeBytes))
@@ -589,7 +529,7 @@ final class ResearchDataProvider {
                 // Retain the damaged input, then fetch a fresh copy.
                 try FileManager.default.moveItem(at: file, to: file.appendingPathExtension("rejected-\(UUID())"))
                 source.rawHash = nil; try store.put(source.id, kind: "source", source)
-                try await prepare(source, instruments: instruments, progress: progress)
+                try await prepare(source, instruments: instruments, requiredRange: requiredRange, progress: progress)
                 return
             }
             source.rawHash = saved.rawHash
@@ -605,34 +545,40 @@ final class ResearchDataProvider {
                 try store.rejectArchiveCandles(source)
                 archiveAccepted = false; encountered = []
                 source.warnings = importer.warnings + ["\(filename): \(error.localizedDescription) Confirmed REST history was requested automatically; the archive was retained."]
-                try await prepare(restSource(instrument, kind: source.kind, .init(from: source.from, through: source.through), refresh: source.refresh), instruments: instruments, progress: progress)
             }
             for id in encountered where !instruments.contains(where: { $0.id == id }) {
                 if try store.get("instrument:\(id)", as: ResearchInstrument.self) == nil {
                     try store.put("instrument:\(id)", kind: "instrument", ResearchInstrument(id: id, verified: false, source: source.url, observedAt: researchNow()))
                 }
             }
-            if source.kind == "candle" {
-                let metadata = instruments.first { $0.id == instrument }
-                let from = max(source.from, metadata?.listedAt.map { ($0 + hourMS - 1) / hourMS * hourMS } ?? source.from)
-                let through = min(source.through, researchNow() / hourMS * hourMS - hourMS, metadata?.delistedAt.map { ($0 / hourMS) * hourMS - hourMS } ?? source.through)
-                let gaps = try store.missingConfirmedCandles(instrument, from: from, through: through)
-                for range in gaps {
-                    await progress(.init(stage: "recovering", filename: filename, instrument: instrument,
-                                         recovery: "Checking missing archive hours against confirmed OKX history automatically."))
-                    try await prepare(restSource(instrument, kind: "candle", range, refresh: source.refresh), instruments: instruments, progress: progress)
-                }
-                let remaining = try store.missingConfirmedCandles(instrument, from: from, through: through)
-                if !remaining.isEmpty {
-                    archiveAccepted = false
-                    source.warnings = (source.warnings ?? []) + ["\(filename): \(remaining.reduce(0) { $0 + $1.hours }) hourly candles remain unavailable after checking confirmed OKX history; affected inputs remain Unknown and archive coverage was not marked complete."]
-                }
-            }
         } else { try parseREST(source, file: file) }
-        source.parser = ResearchVersion.parser; try store.put(source.id, kind: "source", source)
-        if archiveAccepted { try store.cover(source) }
+        source.parser = ResearchVersion.parser
+        // Save the verified import before repairing gaps. A transient REST
+        // failure can then resume without parsing the archive again.
+        try store.finishPreparation(source, instruments: instruments, cover: !source.archive)
+        let remaining = try await fillCandleGaps(source, instruments: instruments, requiredRange: requiredRange, progress: progress)
+        if !remaining.isEmpty {
+            archiveAccepted = false
+            source.warnings = (source.warnings ?? []) + ["\(filename): \(remaining.reduce(0) { $0 + $1.hours }) hourly candles remain unavailable after checking confirmed OKX history; affected inputs remain Unknown and archive coverage was not marked complete."]
+        }
+        try store.finishPreparation(source, instruments: instruments, cover: archiveAccepted)
     }
-    private func fetchREST(_ source: ResearchSource, file: URL, progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void) async throws {
+    @discardableResult
+    private func fillCandleGaps(_ source: ResearchSource, instruments: [ResearchInstrument], requiredRange: ResearchRange?, isolation: isolated (any Actor)? = #isolation, progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void) async throws -> [ResearchRange] {
+        guard source.archive, source.kind == "candle" else { return [] }
+        let metadata = instruments.first { $0.id == source.instrument }
+        let range = requiredRange ?? .init(from: source.from, through: source.through)
+        let from = max(source.from, range.from, metadata?.listedAt.map { ($0 + hourMS - 1) / hourMS * hourMS } ?? source.from)
+        let through = min(source.through, range.through, researchNow() / hourMS * hourMS - hourMS, metadata?.delistedAt.map { $0 / hourMS * hourMS - hourMS } ?? source.through)
+        for gap in try store.missingConfirmedCandles(source.instrument, from: from, through: through) {
+            await progress(.init(stage: "recovering", filename: source.filename, instrument: source.instrument,
+                                 recovery: "Checking missing archive hours against confirmed OKX history automatically."))
+            let fallback = restSource(source.instrument, kind: "candle", gap, refresh: source.refresh)
+            try await prepare(fallback, instruments: instruments, progress: progress)
+        }
+        return try store.missingConfirmedCandles(source.instrument, from: from, through: through)
+    }
+    private func fetchREST(_ source: ResearchSource, file: URL, isolation: isolated (any Actor)? = #isolation, progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void) async throws {
         // Each fetched page is fixed immediately. A restart reuses all completed
         // pages rather than refetching a partially prepared multi-year range.
         var cursor = source.through + hourMS, pages: [ResearchRawPage] = []

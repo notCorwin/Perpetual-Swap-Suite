@@ -33,6 +33,7 @@ export const ResearchTask = memo(function ResearchTask({ active, job, error, pen
       <AlertTitle className="flex items-center gap-3">
         {working && <Spinner aria-hidden="true" />}
         <span role="status" aria-live="polite">{error ? 'Research needs attention' : phases[job?.phase ?? ''] ?? 'Research'}</span>
+        {working && source?.workers != null && <Badge variant="outline">{source.workers.toLocaleString('en-US')} parallel workers</Badge>}
         {source && (working || ['failed', 'paused'].includes(job?.phase ?? '')) && <Badge variant="outline">{stages[source.stage] ?? source.stage}</Badge>}
         {job && (job.planning || job.catalog) && <Badge variant="outline">{researchPlanningStage(job)}</Badge>}
         <span className="flex-1" />
@@ -60,7 +61,7 @@ export const ResearchTask = memo(function ResearchTask({ active, job, error, pen
           {job.phase === 'preparing' && <div className="flex items-center gap-6"><span title="Estimated from completed sources. Download and import times may vary.">Estimated time to ready: {source?.remainingSeconds == null ? 'Estimating…' : 'About ' + researchDuration(source.remainingSeconds)}</span>{downloading && <span>File remaining: {source.fileRemainingSeconds == null ? 'Estimating…' : 'About ' + researchDuration(source.fileRemainingSeconds)}</span>}</div>}
           {waiting && <p role="status" aria-live="polite">{waiting}</p>}
         </>}
-        <p>Completed data stays on disk.{working ? ' Recoverable errors retry automatically. Pause or quit to save a checkpoint.' : job?.phase === 'failed' || job?.phase === 'paused' ? ' Resume to retry from the saved checkpoint.' : ''}</p>
+        <p>Completed data stays on disk.{working ? ' Each completed source is saved immediately. Recoverable errors retry automatically.' : job?.phase === 'failed' || job?.phase === 'paused' ? ' Resume to retry from the saved checkpoint.' : ''}</p>
       </AlertDescription>
     </Alert>
   </aside>, document.body)

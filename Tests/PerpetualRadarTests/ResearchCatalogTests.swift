@@ -127,6 +127,9 @@ final class ResearchCatalogTests: XCTestCase {
         let instruments = try seed(store, count: 1), transport = ResearchCatalogTransport(), recorder = ResearchCatalogRecorder()
         let spec = try ResearchFixture.spec("Close > 0 AND buy > 0")
         let begin = ResearchFixture.hour - 276 * hourMS, end = spec.through + 48 * hourMS
+        try store.write(ResearchFixture.bars(from: begin, through: end).map {
+            .init(instrument: instruments[0].id, kind: "candle", timestamp: $0.hour, candle: $0, sources: ["candle"])
+        })
         for (kind, last) in [("candle", end), ("taker", end - 2 * hourMS)] {
             try store.cover(.init(id: kind, instrument: instruments[0].id, kind: kind, from: begin, through: last, url: "fixture", filename: "Local coverage", archive: false))
         }
