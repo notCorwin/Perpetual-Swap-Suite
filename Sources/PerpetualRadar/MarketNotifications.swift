@@ -2,6 +2,8 @@ import Foundation
 import UserNotifications
 
 enum RadarNotificationRoute {
+    static func url(strategy id: String) -> URL? { URL(string: "perpetualradar://strategy/\(id)") }
+    static func url(contract id: String) -> URL? { URL(string: "perpetualradar://contract/\(id)") }
     static func strategy(in url: URL) -> String? {
         guard url.scheme == "perpetualradar", url.host == "strategy", url.pathComponents.count == 2 else { return nil }
         let id = url.lastPathComponent

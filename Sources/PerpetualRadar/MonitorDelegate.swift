@@ -48,9 +48,9 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             server = try MonitorIPCServer { [weak self] data in
                 do {
                     guard let self, let body = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw FilterError("Invalid background request.") }
-                    return try JSONSerialization.data(withJSONObject: ["value": try await handle(body)])
+                    return try SafeJSON.data(["value": try await handle(body)])
                 } catch {
-                    return (try? JSONSerialization.data(withJSONObject: ["error": error.localizedDescription])) ?? Data("{}".utf8)
+                    return (try? SafeJSON.data(["error": error.localizedDescription])) ?? Data("{}".utf8)
                 }
             }
         } catch { NSApp.terminate(nil); return }
@@ -225,8 +225,7 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func showInterface() { openInterface(instId: nil) }
     private func openInterface(instId: String?, strategyID: String? = nil) {
         let configuration = NSWorkspace.OpenConfiguration(); configuration.activates = true
-        let target = strategyID.map { "perpetualradar://long/\($0)" } ?? instId.map { "perpetualradar://contract/\($0)" }
-        if let target, let url = URL(string: target) {
+        if let url = strategyID.flatMap(RadarNotificationRoute.url(strategy:)) ?? instId.flatMap(RadarNotificationRoute.url(contract:)) {
             NSWorkspace.shared.open([url], withApplicationAt: MonitorRuntime.appURL, configuration: configuration)
         } else {
             NSWorkspace.shared.openApplication(at: MonitorRuntime.appURL, configuration: configuration)

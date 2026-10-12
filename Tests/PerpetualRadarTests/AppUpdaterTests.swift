@@ -11,6 +11,28 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertFalse(AppDelegate.automaticUpdatesEnabled(in: defaults))
     }
 
+    func testOlderSourceCommitIsNotOfferedAsAnUpdate() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "revision": String(repeating: "a", count: 40),
+            "asset_url": "https://github.com/notCorwin/Perpetual-Swap-Suite/releases/download/autobuild/Perpetual.Swap.Suite.app.tar",
+            "digest": "sha256:\(String(repeating: "b", count: 64))",
+            "commit_date": "2026-09-27T00:00:00Z",
+        ])
+        let current = String(repeating: "c", count: 40), commit = Date(timeIntervalSince1970: 1_790_467_200)
+        guard case .success(let older) = AppUpdater.parse(data: data, currentRevision: current, currentCommitDate: commit.addingTimeInterval(60)) else {
+            return XCTFail("Expected an older manifest to parse")
+        }
+        XCTAssertNil(older)
+        guard case .success(let newer) = AppUpdater.parse(data: data, currentRevision: current, currentCommitDate: commit.addingTimeInterval(-60)) else {
+            return XCTFail("Expected a newer manifest to parse")
+        }
+        XCTAssertNotNil(newer)
+        guard case .success(let undated) = AppUpdater.parse(data: data, currentRevision: current) else {
+            return XCTFail("Expected an undated install to keep revision-only updates")
+        }
+        XCTAssertNotNil(undated)
+    }
+
     func testManifestUsesOnlyTheExpectedAppAndDigest() throws {
         let revision = String(repeating: "a", count: 40)
         let digest = String(repeating: "b", count: 64)

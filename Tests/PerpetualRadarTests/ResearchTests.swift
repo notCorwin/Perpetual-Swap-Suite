@@ -57,7 +57,8 @@ final class ResearchTests: XCTestCase {
     }
     func testHourlyCloseLiveClosedAndFutureInvarianceIncludingSequenceCaptures() throws {
         let hour = ResearchFixture.hour
-        var series = ResearchSeries(candles: Dictionary(uniqueKeysWithValues: ResearchFixture.bars().map { ($0.hour, $0) }))
+        // Closed-hour EMA(200) reads its full 5x warmup (bounded by the listing), so start at the listing.
+        var series = ResearchSeries(candles: Dictionary(uniqueKeysWithValues: ResearchFixture.bars(from: ResearchFixture.instrument.listedAt!).map { ($0.hour, $0) }))
         series.candles[hour] = Candle(hour: hour, high: 120, low: 90, close: 110, quoteVolume: 100, baseVolume: 1, open: 100)
         series.candles[hour-hourMS] = Candle(hour: hour-hourMS, high: 102, low: 98, close: 100, quoteVolume: 100, baseVolume: 1, open: 100)
         let sources = ["Close == 110 AND closed(Close == 100)", "lag(turnover, 100) > 0", "available(EMA(200)) AND available(RSI(24))",

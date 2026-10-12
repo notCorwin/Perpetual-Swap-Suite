@@ -237,12 +237,11 @@ final class FilterEvaluator {
                 }
                 let target = hour == market.hour ? hour - hourMS : hour
                 var values: [Double] = []
-                let available = market.listedAt.map { max(0, Int((target - $0 / hourMS * hourMS) / hourMS) + 1) } ?? max(250, n)
-                for age in 0..<min(max(250, n), available) { if Task.isCancelled { return .unknown("Evaluation cancelled.") }; guard let b = bar(target - Int64(age) * hourMS) else { return number(nil) }; values.append(b.close) }
-                guard values.count >= n else { return number(nil) }; values.reverse()
-                var value = values.prefix(n).reduce(0, +) / Double(n), alpha = 2 / Double(n + 1)
-                for close in values.dropFirst(n) { value += (close - value) * alpha }
-                if hour == market.hour { guard let b = bar(hour) else { return number(nil) }; value += (b.close - value) * alpha }
+                let window = emaWarmupHours(n)
+                let available = market.listedAt.map { max(0, Int((target - $0 / hourMS * hourMS) / hourMS) + 1) } ?? window
+                for age in 0..<min(window, available) { if Task.isCancelled { return .unknown("Evaluation cancelled.") }; guard let b = bar(target - Int64(age) * hourMS) else { return number(nil) }; values.append(b.close) }
+                guard var value = windowedEMA(values.reversed(), period: n) else { return number(nil) }
+                if hour == market.hour { guard let b = bar(hour) else { return number(nil) }; value += (b.close - value) * (2 / Double(n + 1)) }
                 return number(value)
             }
             var bars: [Candle] = []

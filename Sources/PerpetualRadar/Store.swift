@@ -74,12 +74,12 @@ final class Store {
                 var mode = ""
                 do {
                     defer { sqlite3_finalize(current) }
-                    try readRows(current) { mode = String(cString: sqlite3_column_text(current, 0)) }
+                    try readRows(current) { mode = Store.text(current, 0) }
                 }
                 if mode == "wal" { return }
                 let stmt = try statement("PRAGMA journal_mode=WAL")
                 defer { sqlite3_finalize(stmt) }
-                try readRows(stmt) { mode = String(cString: sqlite3_column_text(stmt, 0)) }
+                try readRows(stmt) { mode = Store.text(stmt, 0) }
                 guard mode == "wal" else {
                     throw NSError(domain: "SQLite", code: Int(SQLITE_ERROR),
                                   userInfo: [NSLocalizedDescriptionKey: "Cannot enable SQLite write-ahead logging."])
@@ -106,6 +106,9 @@ final class Store {
             switch value {
             case let text as String: sqlite3_bind_text(stmt, position, text, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
             case let integer as Int64: sqlite3_bind_int64(stmt, position, integer)
+            case let flag as Bool: sqlite3_bind_int64(stmt, position, flag ? 1 : 0)
+            case let integer as Int: sqlite3_bind_int64(stmt, position, Int64(integer))
+            case let integer as Int32: sqlite3_bind_int64(stmt, position, Int64(integer))
             case let double as Double: sqlite3_bind_double(stmt, position, double)
             default: sqlite3_bind_null(stmt, position)
             }
@@ -130,8 +133,13 @@ final class Store {
         let stmt = try statement("PRAGMA table_info(\(table))")
         defer { sqlite3_finalize(stmt) }
         var names = Set<String>()
-        try readRows(stmt) { names.insert(String(cString: sqlite3_column_text(stmt, 1))) }
+        try readRows(stmt) { names.insert(Store.text(stmt, 1)) }
         return names
+    }
+
+    /// NULL-safe text column read; `String(cString:)` on a NULL column pointer traps.
+    static func text(_ stmt: OpaquePointer, _ column: Int32) -> String {
+        sqlite3_column_text(stmt, column).map { String(cString: $0) } ?? ""
     }
 
     func preference(forKey key: String) throws -> String? {
@@ -139,7 +147,7 @@ final class Store {
         defer { sqlite3_finalize(stmt) }
         bind([key], to: stmt)
         switch sqlite3_step(stmt) {
-        case SQLITE_ROW: return String(cString: sqlite3_column_text(stmt, 0))
+        case SQLITE_ROW: return sqlite3_column_text(stmt, 0).map { String(cString: $0) }
         case SQLITE_DONE: return nil
         default: throw failure()
         }
@@ -189,7 +197,7 @@ final class Store {
         defer { sqlite3_finalize(candleStmt) }
         bind([hour - Int64(candleLookback) * hourMS, hour], to: candleStmt)
         try readRows(candleStmt) {
-            let id = String(cString: sqlite3_column_text(candleStmt, 0))
+            let id = Store.text(candleStmt, 0)
             guard ids.contains(id) else { return }
             let ts = sqlite3_column_int64(candleStmt, 1)
             candles[id, default: [:]][ts] = Candle(hour: ts, high: sqlite3_column_double(candleStmt, 2), low: sqlite3_column_double(candleStmt, 3), close: sqlite3_column_double(candleStmt, 4), quoteVolume: sqlite3_column_type(candleStmt, 5) == SQLITE_NULL ? nil : sqlite3_column_double(candleStmt, 5), baseVolume: sqlite3_column_type(candleStmt, 6) == SQLITE_NULL ? nil : sqlite3_column_double(candleStmt, 6), open: sqlite3_column_type(candleStmt, 7) == SQLITE_NULL ? nil : sqlite3_column_double(candleStmt, 7))
@@ -197,7 +205,7 @@ final class Store {
         let emaStmt = try statement("SELECT inst_id,hour,value FROM ema200")
         defer { sqlite3_finalize(emaStmt) }
         try readRows(emaStmt) {
-            let id = String(cString: sqlite3_column_text(emaStmt, 0))
+            let id = Store.text(emaStmt, 0)
             if ids.contains(id) { ema[id] = (sqlite3_column_int64(emaStmt, 1), sqlite3_column_double(emaStmt, 2)) }
         }
         return (candles, ema)
@@ -245,7 +253,7 @@ final class Store {
         bind([hour], to: stmt)
         var result: [String: Double] = [:]
         try readRows(stmt) {
-            result[String(cString: sqlite3_column_text(stmt, 0))] = sqlite3_column_double(stmt, 1)
+            result[Store.text(stmt, 0)] = sqlite3_column_double(stmt, 1)
         }
         return result
     }

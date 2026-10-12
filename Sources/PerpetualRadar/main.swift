@@ -139,8 +139,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                     value["windowHidden"] = !window.isVisible
                     value["windowTitle"] = window.title
                     if body["close"] as? Bool == true { Task { try? await Task.sleep(for: .milliseconds(50)); self.window.performClose(nil) } }
-                    return try JSONSerialization.data(withJSONObject: ["value": value])
-                } catch { return (try? JSONSerialization.data(withJSONObject: ["error": error.localizedDescription])) ?? Data("{}".utf8) }
+                    return try SafeJSON.data(["value": value])
+                } catch { return (try? SafeJSON.data(["error": error.localizedDescription])) ?? Data("{}".utf8) }
             }
         }
         let leaseTimer = Timer(timeInterval: 2, target: self, selector: #selector(renewForegroundLease), userInfo: nil, repeats: true)

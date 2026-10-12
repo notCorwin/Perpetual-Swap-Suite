@@ -389,6 +389,8 @@ final class MonitorServiceTests: BackgroundTestCase {
         XCTAssertFalse(radar.monitoringPaused); try radar.setMonitoringPaused(true)
         XCTAssertTrue(try Radar(defaults: defaults, storeURL: url).monitoringPaused)
         XCTAssertEqual(RadarNotificationRoute.contract(in: URL(string: "perpetualradar://contract/BTC-USDT-SWAP")!), "BTC-USDT-SWAP")
+        XCTAssertEqual(RadarNotificationRoute.strategy(in: try XCTUnwrap(RadarNotificationRoute.url(strategy: "suite-1"))), "suite-1")
+        XCTAssertEqual(RadarNotificationRoute.contract(in: try XCTUnwrap(RadarNotificationRoute.url(contract: "BTC-USDT-SWAP"))), "BTC-USDT-SWAP")
         XCTAssertNil(RadarNotificationRoute.contract(in: URL(string: "perpetualradar://contract/BTC-USDT-SWAP/extra")!))
         XCTAssertNil(RadarNotificationRoute.contract(in: URL(string: "https://contract/BTC-USDT-SWAP")!))
         XCTAssertNil(RadarNotificationRoute.contract(in: URL(string: "perpetualradar://contract/../../../etc/passwd")!))

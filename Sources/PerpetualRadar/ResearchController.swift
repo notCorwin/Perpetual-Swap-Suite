@@ -365,14 +365,19 @@ final class ResearchController {
     }
     func stop(cancel: Bool = false) async throws {
         guard let pending = task else { return }
+        let jobID = status?.id, studyID = activeStudyID
         pending.cancel(); await pending.value
-        if let id = activeStudyID {
+        // Another job may have started while this one wound down; never relabel it.
+        guard status?.id == jobID else { return }
+        if let id = studyID {
             var checkpoint = try store.get("checkpoint:\(id)", as: Checkpoint.self) ?? Checkpoint(studyID: id, phase: "paused")
-            if checkpoint.phase == "completed" { return }
+            // A job that reached a terminal state before cancellation took effect keeps it;
+            // only an explicit cancel discards a frozen (ready) dataset.
+            if checkpoint.phase == "completed" || (!cancel && checkpoint.phase == "ready") { return }
             checkpoint.phase = cancel ? "cancelled" : "paused"; checkpoint.updatedAt = researchNow()
             try store.put("checkpoint:\(id)", kind: "checkpoint", checkpoint)
         }
-        status?.phase = cancel ? "cancelled" : "paused"; status?.resultID = activeStudyID
+        status?.phase = cancel ? "cancelled" : "paused"; status?.resultID = studyID
     }
     private func snapshot<T: Encodable>(_ value: T) throws -> Any { try JSONSerialization.jsonObject(with: Data(try researchJSON(value).utf8)) }
     func handle(_ request: [String: Any], window: NSWindow? = nil) async throws -> [String: Any] {
@@ -380,7 +385,7 @@ final class ResearchController {
         switch action {
         case "plan":
             guard let value = request["spec"] else { throw FilterError("A complete study specification is required.") }
-            let spec = try JSONDecoder().decode(StudySpec.self, from: JSONSerialization.data(withJSONObject: value))
+            let spec = try JSONDecoder().decode(StudySpec.self, from: SafeJSON.data(value))
             return ["jobID": try plan(spec, refresh: request["refresh"] as? Bool == true)]
         case "prepare":
             guard let id = request["planID"] as? String else { throw FilterError("Choose a data plan.") }

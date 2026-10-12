@@ -160,8 +160,8 @@ enum ResearchEngine {
                             let outcomes = needsOutcomes ? ResearchVersion.horizons.map { outcome(timestamp: timestamp, direction: direction!, hours: $0, series: series, costs: study.spec.costs) } : []
                             let event = hasEvent ? ResearchEvent(id: researchHash("\(study.id)|\(ri)|\(instrument.id)|\(timestamp)"), studyID: study.id, ruleIndex: ri, instrument: instrument.id, timestamp: timestamp, direction: direction!, entry: entry,
                                 score: opportunity.score, scoreComplete: complete, status: opportunity.status, setup: opportunity.setup, split: split, outcomes: outcomes,
-                                traceJSON: String(decoding: try JSONSerialization.data(withJSONObject: trace.snapshot, options: [.sortedKeys]), as: UTF8.self),
-                                opportunityJSON: String(decoding: try JSONSerialization.data(withJSONObject: opportunity.snapshot, options: [.sortedKeys]), as: UTF8.self), sources: Array(Set(series.sources + [instrument.metadataSourceID].compactMap { $0 } + (reference?.sources ?? []))).sorted()) : nil
+                                traceJSON: String(decoding: try SafeJSON.data(trace.snapshot, options: [.sortedKeys]), as: UTF8.self),
+                                opportunityJSON: String(decoding: try SafeJSON.data(opportunity.snapshot, options: [.sortedKeys]), as: UTF8.self), sources: Array(Set(series.sources + [instrument.metadataSourceID].compactMap { $0 } + (reference?.sources ?? []))).sorted()) : nil
                             let recordedEntry = split == "Purged" && hasEvent ? "purged" : entry
                             try store.saveSample(study: study.id, rule: ri, instrument: instrument.id, timestamp: timestamp, truth: trace.result, direction: direction, entry: recordedEntry, opportunity: opportunity, complete: complete, split: split, outcomes: outcomes, event: event)
                         }

@@ -29,6 +29,11 @@ revision="${APP_REVISION:-$(git rev-parse HEAD 2>/dev/null || true)}"
 if [[ -n "$revision" ]]; then
   /usr/libexec/PlistBuddy -c "Add :CFBundleSourceRevision string $revision" "$app/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Add :CFBundleSourceRevision string $revision" "$helper/Contents/Info.plist"
+  commit_date="${APP_COMMIT_DATE:-$(TZ=UTC git show -s --date=format-local:'%Y-%m-%dT%H:%M:%SZ' --format=%cd "$revision" 2>/dev/null || true)}"
+  if [[ -n "$commit_date" ]]; then
+    /usr/libexec/PlistBuddy -c "Add :CFBundleSourceCommitDate string $commit_date" "$app/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Add :CFBundleSourceCommitDate string $commit_date" "$helper/Contents/Info.plist"
+  fi
 fi
 codesign --force --sign - "$helper" >/dev/null
 codesign --force --sign - "$app" >/dev/null

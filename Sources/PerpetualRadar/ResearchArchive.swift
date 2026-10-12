@@ -123,7 +123,7 @@ final class ResearchArchiveImporter {
         return result
     }
     init(store: ResearchStore, source: ResearchSource, instruments: [ResearchInstrument]) {
-        self.store = store; self.source = source; self.instruments = Dictionary(uniqueKeysWithValues: instruments.map { ($0.id, $0) })
+        self.store = store; self.source = source; self.instruments = Dictionary(instruments.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
     }
     private func append(_ value: ResearchDatum) throws {
         batch.append(value)
@@ -209,7 +209,7 @@ final class ResearchArchiveImporter {
               let action = cell(row, "action", "type"), ["snapshot", "update"].contains(action.lowercased()) else { throw ResearchArchiveError("Order book CSV requires a timestamp, action and bid/ask levels. Its raw file was retained.") }
         var message: [String: Any] = ["instId": cell(row, "instid", "instrument_name") ?? source.instrument, "ts": time, "action": action.lowercased(), "bids": try JSONSerialization.jsonObject(with: Data(bids.utf8)), "asks": try JSONSerialization.jsonObject(with: Data(asks.utf8))]
         for key in ["seqid", "prevseqid", "checksum"] { if let value = cell(row, key) { message[key == "seqid" ? "seqId" : key == "prevseqid" ? "prevSeqId" : "checksum"] = value } }
-        try jsonLine(JSONSerialization.data(withJSONObject: message))
+        try jsonLine(SafeJSON.data(message))
     }
     private func jsonLine(_ line: Data) throws {
         guard !line.isEmpty else { return }

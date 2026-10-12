@@ -104,7 +104,7 @@ final class MonitorIPCServer: @unchecked Sendable {
         if message == 1 {
             guard let request = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let id = request["id"] as? String, let body = request["body"],
-                  let payload = try? JSONSerialization.data(withJSONObject: body) else { return Data("{}".utf8) }
+                  let payload = try? SafeJSON.data(body) else { return Data("{}".utf8) }
             lock.lock()
             let expired = jobs.filter { $0.value.expires < .now }.map(\.key)
             for key in expired { jobs.removeValue(forKey: key)?.task?.cancel() }
@@ -179,7 +179,7 @@ enum MonitorIPC {
     static func request(_ body: [String: Any], name: String = MonitorRuntime.portName,
                         id: String = UUID().uuidString, timeout: Duration = .seconds(100)) async throws -> [String: Any] {
         let key = Data(id.utf8)
-        let data = try JSONSerialization.data(withJSONObject: ["id": id, "body": body])
+        let data = try SafeJSON.data(["id": id, "body": body])
         var submitted = false
         do {
             try Task.checkCancellation()

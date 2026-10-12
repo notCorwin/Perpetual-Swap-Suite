@@ -38,6 +38,20 @@ func historicalPage(_ rows: [Any], before: Int64) -> [Candle] {
     rows.compactMap { ($0 as? [String]).flatMap(Candle.init) }.filter { $0.confirmed && $0.hour < before }
 }
 
+/// History used for an EMA reading: seed with SMA(period) at the start of the window, then
+/// iterate. A 5x window leaves (1 - 2/(n+1))^(4n) ≈ e^-8 of the seed error, so closed-hour
+/// (Research/strategy) readings converge to the long-running live EMA instead of a 50-step SMA.
+func emaWarmupHours(_ period: Int) -> Int { max(candleLookback, period * 5) }
+
+/// `closes` must be contiguous and in ascending time order.
+func windowedEMA<C: Collection>(_ closes: C, period n: Int) -> Double? where C.Element == Double {
+    guard n > 0, closes.count >= n else { return nil }
+    let alpha = 2 / Double(n + 1)
+    var value = closes.prefix(n).reduce(0, +) / Double(n)
+    for close in closes.dropFirst(n) { value += (close - value) * alpha }
+    return value.isFinite && value > 0 ? value : nil
+}
+
 func updatedEMA200(_ previous: Double?, close: Double?) -> Double? {
     guard let previous, let close, previous.isFinite, close.isFinite, previous > 0, close > 0 else { return nil }
     return previous + (close - previous) * (2.0 / 201.0)

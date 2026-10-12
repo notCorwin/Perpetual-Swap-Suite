@@ -126,6 +126,7 @@ final class AppUpdater: @unchecked Sendable {
         let immutableAssetUrl: URL?
         let digest: String
         let publishedAt: Date?
+        let commitDate: Date?
     }
     private let metadataSession: URLSession
     private let metadataDelegate: DownloadProgressDelegate
@@ -471,12 +472,14 @@ final class AppUpdater: @unchecked Sendable {
     }
 
     private func parse(data: Data) -> Result<AppUpdate?, AppUpdateError> {
-        let currentRevision = Bundle(url: currentAppURL)?
-            .object(forInfoDictionaryKey: "CFBundleSourceRevision") as? String
-        return Self.parse(data: data, currentRevision: currentRevision)
+        let bundle = Bundle(url: currentAppURL)
+        let currentRevision = bundle?.object(forInfoDictionaryKey: "CFBundleSourceRevision") as? String
+        let currentCommitDate = (bundle?.object(forInfoDictionaryKey: "CFBundleSourceCommitDate") as? String)
+            .flatMap { ISO8601DateFormatter().date(from: $0) }
+        return Self.parse(data: data, currentRevision: currentRevision, currentCommitDate: currentCommitDate)
     }
 
-    static func parse(data: Data, currentRevision: String?) -> Result<AppUpdate?, AppUpdateError> {
+    static func parse(data: Data, currentRevision: String?, currentCommitDate: Date? = nil) -> Result<AppUpdate?, AppUpdateError> {
         do {
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -492,6 +495,11 @@ final class AppUpdater: @unchecked Sendable {
 
             let expectedSHA256 = try normalizedSHA256(from: manifest.digest)
             if releaseRevision == revision(in: currentRevision) {
+                return .success(nil)
+            }
+            // The autobuild channel is rolling; never replace a build with one whose source
+            // commit is older. Builds without commit dates keep the revision-only comparison.
+            if let releaseDate = manifest.commitDate, let currentCommitDate, releaseDate < currentCommitDate {
                 return .success(nil)
             }
             guard let expectedSHA256 else {

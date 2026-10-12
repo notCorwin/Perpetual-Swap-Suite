@@ -130,7 +130,9 @@ struct FilterParser {
             if f == "all" || f == "any" { return FilterNode(kind: f, children: try args.map(rule)) }
             if f == "closed" || f == "live", args.count == 1 {
                 var node = try rule(args[0])
-                if f == "closed", node.mode == "closed" { return FilterNode(children: [node], mode: "closed") }
+                // `live` reads at the current anchor and never cancels a nested Closed anchor.
+                if f == "live" { return node }
+                if node.mode == "closed" { return FilterNode(children: [node], mode: "closed") }
                 node.mode = f; return node
             }
             if ["available", "unavailable", "positive", "negative", "zero"].contains(f), args.count == 1 {
@@ -371,7 +373,7 @@ struct FilterCompiler {
             if let def = compiled.definitions[n], !visiting.contains(n) { return try scalarRequirement(def, visiting: visiting.union([n])) }
             if n.contains(".") { return 0 }
             let key = FilterCatalog.key(n) ?? n
-            if key.hasPrefix("opportunity") || ["emaTrend", "emaSlope", "emaBody", "priceEMA", "emaDistance"].contains(key) { return 250 }
+            if key.hasPrefix("opportunity") || ["emaTrend", "emaSlope", "emaBody", "priceEMA", "emaDistance"].contains(key) { return emaWarmupHours(200) + 1 }
             if key.hasPrefix("rsi") { return 250 }
             if key.contains("96") { return 144 }
             if key.contains("48") || ["highPriorAge", "lowPriorAge"].contains(key) { return 96 }
@@ -386,7 +388,8 @@ struct FilterCompiler {
         case .call(let name, let args):
             let f = name.lowercased()
             if f == "btc" { return 0 }
-            if ["ema", "rsi"].contains(f) { return max(250, try FilterParser.integer(args[0]) + 1) }
+            if f == "ema" { return emaWarmupHours(try FilterParser.integer(args[0])) + 1 }
+            if f == "rsi" { return max(250, try FilterParser.integer(args[0]) + 1) }
             if ["roc", "efficiency", "vwap", "priorhigh", "priorlow"].contains(f) || f.hasPrefix("logbb") { return try FilterParser.integer(args[0]) + 1 }
             if ["maroc", "breakoutage", "breakdownage"].contains(f) { return try FilterParser.integer(args[0]) + FilterParser.integer(args[1]) }
             if ["mean", "sum", "highest", "lowest", "stddev", "lag", "change"].contains(f) { return try scalarRequirement(args[0], visiting: visiting) + FilterParser.integer(args[1], zero: f == "lag") }

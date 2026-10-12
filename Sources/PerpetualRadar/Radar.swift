@@ -88,6 +88,7 @@ final class Radar {
     private var tasks: [Task<Void, Never>] = []
     private var historyTasks: [Task<Void, Never>] = []
     private var sockets: [URLSessionWebSocketTask] = []
+    private var socketActivity: [String: Int64] = [:]
     private var running = false
     private var refreshingInstruments = false
     private var startupError = ""
@@ -200,7 +201,7 @@ final class Radar {
         if ["save", "select", "copy", "delete"].contains(action) { touch() }
         let profile: StrategyProfile?
         if action == "preview", let raw = request["profile"] {
-            profile = try JSONDecoder().decode(StrategyProfile.self, from: JSONSerialization.data(withJSONObject: raw))
+            profile = try JSONDecoder().decode(StrategyProfile.self, from: SafeJSON.data(raw))
         } else { profile = try store.selectedSuiteProfile("radar") }
         if ["evaluate", "preview"].contains(action), let profile {
             let hydration = try profile.hydration(), captured = try await calculateSnapshot(rocPeriod: 9, marocPeriod: 9)
@@ -606,9 +607,15 @@ final class Radar {
         while !Task.isCancelled {
             let socket = URLSession.shared.webSocketTask(with: URL(string: address)!)
             sockets.append(socket); socket.resume()
-            let ping = Task {
+            socketActivity[channel] = millis()
+            let ping = Task { [weak self] in
                 while !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 20_000_000_000)
+                    // A half-open connection (e.g. after a network change) never errors and never
+                    // answers ping; recycle it once nothing, not even "pong", arrived for a minute.
+                    if let last = self?.socketActivity[channel], millis() - last > 60_000 {
+                        socket.cancel(with: .goingAway, reason: nil); return
+                    }
                     try? await socket.send(.string("ping"))
                 }
             }
@@ -616,21 +623,27 @@ final class Radar {
                 let args = rows.keys.sorted().map { ["channel": channel, "instId": $0] }
                 for start in stride(from: 0, to: args.count, by: 50) {
                     let message = ["op": "subscribe", "args": Array(args[start..<min(start + 50, args.count)])] as [String: Any]
-                    let data = try JSONSerialization.data(withJSONObject: message)
+                    let data = try SafeJSON.data(message)
                     try await socket.send(.string(String(decoding: data, as: UTF8.self)))
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
-                disconnectedChannels.remove(channel); backoff = 1_000_000_000
+                disconnectedChannels.remove(channel)
                 while !Task.isCancelled {
                     let message = try await socket.receive()
+                    socketActivity[channel] = millis()
                     guard case let .string(text) = message, text != "pong",
                           let data = text.data(using: .utf8),
                           let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
                     if payload["event"] as? String == "error" {
-                        throw NSError(domain: "OKX", code: 3, userInfo: [NSLocalizedDescriptionKey: payload["msg"] as? String ?? "Subscription failed"])
+                        // A rejected argument (e.g. one delisted contract) must not drop every other
+                        // subscription. Connection-level failures close the socket and throw from receive().
+                        NSLog("%@ WebSocket subscription error %@: %@", channel, payload["code"] as? String ?? "", payload["msg"] as? String ?? "")
+                        continue
                     }
                     guard let arg = payload["arg"] as? [String: String], arg["channel"] == channel,
                           let items = payload["data"] as? [Any] else { continue }
+                    // Reset only after the exchange actually delivers data on this connection.
+                    backoff = 1_000_000_000
                     for item in items {
                         if channel == "open-interest", let value = item as? [String: Any] { updateOI(value) }
                         if channel == "candle1H", let id = arg["instId"], let value = item as? [String] {
@@ -645,7 +658,7 @@ final class Radar {
             sockets.removeAll { $0 === socket }
             disconnectedChannels.insert(channel)
             if channel == "candle1H" { onBTCUpdate?() }
-            try? await Task.sleep(nanoseconds: backoff)
+            try? await Task.sleep(nanoseconds: backoff + UInt64.random(in: 0...(backoff / 4)))
             backoff = min(backoff * 2, 30_000_000_000)
         }
     }
@@ -691,12 +704,21 @@ final class Radar {
             }
         }
         if state?.0 != target {
-            let closes = (0..<200).compactMap { age -> Double? in
-                guard let bar = bars[target - Int64(age) * hourMS], bar.confirmed else { return nil }
-                return bar.close
+            // Seed with the same windowed EMA used for closed-hour evaluation so live and
+            // Research/strategy readings share one definition. Older persisted candles extend
+            // the in-memory lookback; the seed stops at the first gap (or the listing).
+            let window = emaWarmupHours(200)
+            var history = bars
+            if let stored = try? store.candles(id, since: max(0, target - Int64(window - 1) * hourMS), through: target) {
+                history.merge(stored) { live, _ in live }
             }
-            guard closes.count == 200 else { return nil }
-            state = (target, closes.reduce(0, +) / 200)
+            var closes: [Double] = []
+            for age in 0..<window {
+                guard let bar = history[target - Int64(age) * hourMS], bar.confirmed else { break }
+                closes.append(bar.close)
+            }
+            guard let seeded = windowedEMA(closes.reversed(), period: 200) else { return nil }
+            state = (target, seeded)
         }
         if emaStates[id]?.0 != state?.0 || emaStates[id]?.1 != state?.1 {
             emaStates[id] = state
@@ -827,15 +849,20 @@ final class Radar {
         var series: [Int64: Candle]
         let stats: [Int64: (oi: Double?, sell: Double?, buy: Double?)]
         do {
-            series = endHour == nil ? candles[id] ?? [:] : try store.candles(id, since: max(0, first - Int64(candleLookback) * hourMS), through: end)
+            let warmup = max(candleLookback, emaWarmupHours(200))
+            series = endHour == nil ? candles[id] ?? [:] : try store.candles(id, since: max(0, first - Int64(warmup) * hourMS), through: end)
             if endHour != nil {
-                for (ts, bar) in candles[id] ?? [:] where ts >= first - Int64(candleLookback) * hourMS && ts <= end { series[ts] = bar }
+                for (ts, bar) in candles[id] ?? [:] where ts >= first - Int64(warmup) * hourMS && ts <= end { series[ts] = bar }
             }
             stats = try store.chartStats(id, since: first, through: end)
         }
         catch { return ["bars": [], "error": "Cannot read chart cache: \(error.localizedDescription)", "revision": chartRevision] }
-        let seed = (1...200).compactMap { series[first - Int64($0) * hourMS]?.confirmed == true ? series[first - Int64($0) * hourMS]?.close : nil }
-        var ema: Double? = seed.count == 200 ? seed.reduce(0, +) / 200 : nil
+        var seed: [Double] = []
+        for age in 1...emaWarmupHours(200) {
+            guard let bar = series[first - Int64(age) * hourMS], bar.confirmed else { break }
+            seed.append(bar.close)
+        }
+        var ema: Double? = windowedEMA(seed.reversed(), period: 200)
         var chartEMA: [Int64: Double] = [:]
         if endHour == nil, let previous = ema200(id, series) {
             let alpha = 2.0 / 201.0
@@ -960,7 +987,7 @@ final class Radar {
     // requests always use asyncSnapshot / calculateSnapshot above.
     func snapshot(rocPeriod: Int, marocPeriod: Int, sinceRevision: Int? = nil) -> [String: Any] {
         let batch = prepareSnapshot(rocPeriod: rocPeriod, marocPeriod: marocPeriod, sinceRevision: sinceRevision)
-        let calculated = Dictionary(uniqueKeysWithValues: batch.inputs.filter { batch.cached[$0.id] == nil }.map { ($0.id, $0.calculate(rocPeriod: rocPeriod, marocPeriod: marocPeriod)) })
+        let calculated = Dictionary(batch.inputs.filter { batch.cached[$0.id] == nil }.map { ($0.id, $0.calculate(rocPeriod: rocPeriod, marocPeriod: marocPeriod)) }, uniquingKeysWith: { _, last in last })
         return finishSnapshot(batch, calculated: calculated).response
     }
 }

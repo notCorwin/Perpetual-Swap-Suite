@@ -6,11 +6,14 @@ enum SuitePhase: String, CaseIterable, Codable, Sendable {
 }
 
 func strategyObservation(profile: StrategyProfile, readings: [SuiteReading]) throws -> FilterObservation {
-    let results = Dictionary(uniqueKeysWithValues: readings.map { reading in
+    // Duplicate instrument readings must not trap; conflicting duplicates are Unknown.
+    var results: [String: FilterTruth] = [:]
+    for reading in readings {
         let truth = FilterTruth(rawValue: reading.phases["bullishSetup"]?.result ?? "unknown") ?? .unknown
         let result: FilterTruth = truth == .no || reading.universe == "false" ? .no : truth == .yes && reading.universe == "true" ? .yes : .unknown
-        return (reading.instrument + "|Bullish Setup", result)
-    })
+        let key = reading.instrument + "|Bullish Setup"
+        results[key] = results[key].map { $0 == result ? result : .unknown } ?? result
+    }
     return .init(configuration: try researchJSON(profile), universe: Set(results.keys), results: results)
 }
 
@@ -102,7 +105,7 @@ actor SuiteEvaluationWorker {
         return try markets.map { original in
             try Task.checkCancellation()
             var context = SuiteEvaluation.context(original, forming: forming)
-            context.cooldowns = confirmationCooldowns; context.recordCooldowns = !forming
+            context.cooldowns = confirmationCooldowns
             if !forming {
                 context.evaluationTime = context.now
                 if let reference = context.referenceBTC, !reference.market.historicalClose {
@@ -112,6 +115,8 @@ actor SuiteEvaluationWorker {
                 }
             }
             let ready = available && context.candles[context.hour].map { forming || $0.confirmed } == true
+            // Paused or unavailable hours are reported as Unknown, so they must not advance cooldown memory either.
+            context.recordCooldowns = !forming && ready
             var traces = SuiteEvaluation.traces(context, filters: filters, explain: detail == original.id)
             if !ready {
                 for index in traces.indices { traces[index].result = .unknown; traces[index].reason = "Monitoring is paused or this hourly candle is unavailable. Last definite membership is retained."; traces[index].children = [] }
@@ -119,10 +124,10 @@ actor SuiteEvaluationWorker {
             var phases: [String: SuitePhaseReading] = [:]
             for (index, phase) in SuitePhase.allCases.enumerated() {
                 let trace = traces[index + 1]
-                phases[phase.rawValue] = .init(result: ready ? trace.result.rawValue : "unknown", hour: context.hour, traceJSON: detail == original.id ? String(decoding: try JSONSerialization.data(withJSONObject: trace.snapshot, options: [.sortedKeys]), as: UTF8.self) : nil)
+                phases[phase.rawValue] = .init(result: ready ? trace.result.rawValue : "unknown", hour: context.hour, traceJSON: detail == original.id ? String(decoding: try SafeJSON.data(trace.snapshot, options: [.sortedKeys]), as: UTF8.self) : nil)
             }
             let decision = ready ? SuiteEvaluation.decision(traces) : ("Unknown", "Monitoring is paused or this hourly candle is unavailable.")
-            return SuiteReading(strategyID: profile.id, revision: profile.revision, instrument: original.id, hour: context.hour, provisional: forming, universe: ready ? traces[0].result.rawValue : "unknown", universeTraceJSON: detail == original.id ? String(decoding: try JSONSerialization.data(withJSONObject: traces[0].snapshot, options: [.sortedKeys]), as: UTF8.self) : nil, phases: phases, action: decision.0, reason: decision.1, price: context.candles[context.hour]?.close)
+            return SuiteReading(strategyID: profile.id, revision: profile.revision, instrument: original.id, hour: context.hour, provisional: forming, universe: ready ? traces[0].result.rawValue : "unknown", universeTraceJSON: detail == original.id ? String(decoding: try SafeJSON.data(traces[0].snapshot, options: [.sortedKeys]), as: UTF8.self) : nil, phases: phases, action: decision.0, reason: decision.1, price: context.candles[context.hour]?.close)
         }
     }
 }
@@ -205,12 +210,12 @@ extension Store {
             // Drafts are opaque editor state. They never compile, activate or
             // change confirmation membership, and may contain incomplete text.
             guard let raw = request["draft"], JSONSerialization.isValidJSONObject(raw) else { throw FilterError("Provide valid editor state.") }
-            let data = try JSONSerialization.data(withJSONObject: raw, options: [.sortedKeys])
+            let data = try SafeJSON.data(raw, options: [.sortedKeys])
             guard data.count <= 1_048_576 else { throw FilterError("The editor draft exceeds 1 MiB.") }
             try setPreference(String(decoding: data, as: UTF8.self), forKey: "suiteDraft.\(mode)")
         case "save", "copy":
             guard let raw = request["profile"] else { throw FilterError("Provide Universe and Bullish Setup rules.") }
-            var profile = try JSONDecoder().decode(StrategyProfile.self, from: JSONSerialization.data(withJSONObject: raw)); profile.mode = mode
+            var profile = try JSONDecoder().decode(StrategyProfile.self, from: SafeJSON.data(raw)); profile.mode = mode
             saved = try saveSuiteProfile(profile, copy: action == "copy")
         case "select":
             guard try id.isEmpty || suiteProfiles(mode).contains(where: { $0.id == id }) else { throw FilterError("This strategy no longer exists.") }
