@@ -866,12 +866,26 @@ final class AppUpdater: @unchecked Sendable {
             try fileManager.copyItem(at: currentApp, to: backupApp)
             backupCreated = true
             try fileManager.copyItem(at: extractedApp, to: stagedApp)
+            
+            // Verify Web assets exist in staged app before replacing
+            let webAssets = stagedApp.appendingPathComponent("Contents/Resources/Web/index.html")
+            guard fileManager.fileExists(atPath: webAssets.path) else {
+                throw AppUpdateError.installFailed("Web assets missing from extracted package")
+            }
+            
             _ = try fileManager.replaceItemAt(
                 currentApp,
                 withItemAt: stagedApp,
                 backupItemName: nil,
                 options: []
             )
+            
+            // Verify Web assets still exist after replacement
+            let installedWebAssets = currentApp.appendingPathComponent("Contents/Resources/Web/index.html")
+            guard fileManager.fileExists(atPath: installedWebAssets.path) else {
+                // Rollback and report specific failure
+                throw AppUpdateError.installFailed("Web assets missing after installation - rolling back")
+            }
         } catch {
             try? fileManager.removeItem(at: stagedApp)
             if backupCreated, !fileManager.fileExists(atPath: currentApp.path) {
