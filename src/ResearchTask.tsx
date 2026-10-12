@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { memo, useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Pause, Play, X } from 'lucide-react'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -13,7 +13,7 @@ import { researchTime } from '@/research-types'
 const stages: Record<string, string> = { checking: 'Checking local cache', connecting: 'Connecting to OKX', downloading: 'Downloading archive', fetching: 'Fetching history pages', verifying: 'Verifying downloaded data', importing: 'Importing downloaded data', prepared: 'Source prepared', freezing: 'Freezing dataset' }
 const phases: Record<string, string> = { planning: 'Planning', planned: 'Data plan ready', preparing: 'Preparing data', running: 'Running study', ready: 'Data ready', completed: 'Study completed', failed: 'Failed', paused: 'Paused', cancelled: 'Cancelled' }
 
-export function ResearchTask({ active, job, error, pending, onPause, onCancel, onResume }: {
+export const ResearchTask = memo(function ResearchTask({ active, job, error, pending, onPause, onCancel, onResume }: {
   active: boolean; job: ResearchJob | null; error: string; pending: boolean
   onPause: () => void; onCancel: () => void; onResume: () => void
 }) {
@@ -64,4 +64,4 @@ export function ResearchTask({ active, job, error, pending, onPause, onCancel, o
       </AlertDescription>
     </Alert>
   </aside>, document.body)
-}
+})

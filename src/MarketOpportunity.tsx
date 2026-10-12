@@ -1,4 +1,4 @@
-import { useId } from "react"
+import { memo, useId } from "react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Popover, PopoverContent, PopoverDescription, PopoverHeader, PopoverTitle, PopoverTrigger } from "@/components/ui/popover"
@@ -11,7 +11,7 @@ const componentLabels: [keyof OpportunityComponents, string, number][] = [
 ]
 const points = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 })
 
-export function MarketOpportunity({ instId, opportunity }: { instId: string; opportunity: OpportunityResult }) {
+export const MarketOpportunity = memo(function MarketOpportunity({ instId, opportunity }: { instId: string; opportunity: OpportunityResult }) {
   const titleId = useId(), descriptionId = useId()
   const { direction, setup, status, score, components, reasons } = opportunity
   const variant = status === "Candidate" ? "secondary" : status === "Overheated" ? "destructive" : "outline"
@@ -48,4 +48,4 @@ export function MarketOpportunity({ instId, opportunity }: { instId: string; opp
       </ul>
     </PopoverContent>
   </Popover>
-}
+})
