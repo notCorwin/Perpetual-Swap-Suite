@@ -86,6 +86,7 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
   const [confirm, setConfirm] = useState<{ action: 'delete' | 'cleanCache'; studyID?: string } | null>(null)
   const [notice, setNotice] = useState('')
   const handledJob = useRef(''), selection = useRef(0), polling = useRef(false)
+  const refreshResearch = useRef<(() => void) | null>(null)
   const selectedStudyID = useRef<string | null>(null), eventPage = useRef(0)
   const busy = pending || Boolean(job && ['planning', 'preparing', 'running'].includes(job.phase))
   // The picker and selected snapshot share the same revision-qualified ID.
@@ -123,13 +124,15 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
   }, [pageEvents])
   useEffect(() => {
     if (!active) return
-    let stopped = false, timer: number
+    let stopped = false, timer: number, refreshRequested = false, retryDelay = 1000
     const refresh = async () => {
-      if (polling.current) { timer = window.setTimeout(refresh, 1000); return }
+      if (stopped) return
+      if (polling.current) { timer = window.setTimeout(refresh, 250); return }
+      refreshRequested = false
       polling.current = true
       try {
         const result = await requestResearch({ action: 'inventory' })
-        if (stopped) return
+        if (stopped || refreshRequested) return
         setJob(current => keepSnapshotValue(current, result.job ?? null)); setStudies(current => keepSnapshotValue(current, result.studies ?? []))
         setCache(current => keepSnapshotValue(current, { directory: result.cacheDirectory ?? '', rows: result.cachedRows ?? 0, files: result.rawFiles ?? 0 }))
         const j = result.job, key = j?.id + ':' + j?.phase + ':' + j?.resultID
@@ -151,24 +154,37 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
           handledJob.current = key
         }
         setPollError('')
-        // shortcut: Poll faster when job is active, slower when idle. Could add exponential backoff.
+        retryDelay = 1000
         const hasActiveJob = j && ['planning', 'preparing', 'running'].includes(j.phase)
-        const delay = hasActiveJob ? 1000 : 5000
+        const delay = hasActiveJob ? 250 : 5000
         if (!stopped) timer = window.setTimeout(refresh, delay)
       } catch (cause) {
         if (!stopped) setPollError(cause instanceof Error ? cause.message : 'Cannot open research.')
-        if (!stopped) timer = window.setTimeout(refresh, 5000)
+        if (!stopped) timer = window.setTimeout(refresh, retryDelay)
+        retryDelay = Math.min(retryDelay * 2, 5000)
       }
-      finally { polling.current = false }
+      finally {
+        polling.current = false
+        if (!stopped && refreshRequested) {
+          window.clearTimeout(timer)
+          timer = window.setTimeout(refresh, 0)
+        }
+      }
     }
+    const wake = () => {
+      window.clearTimeout(timer)
+      refreshRequested = true
+      if (!polling.current) void refresh()
+    }
+    refreshResearch.current = wake
     void refresh()
-    return () => { stopped = true; window.clearTimeout(timer) }
+    return () => { stopped = true; window.clearTimeout(timer); refreshResearch.current = null }
   }, [active,selectStudy])
   const perform = async (action: () => Promise<ResearchResponse | void>) => {
     setPending(true); setError(''); setNotice('')
     try { const result = await action(); if (result?.jobID) setJob({ id: result.jobID, phase: 'running', completed: 0, total: 0, message: 'Starting…', error: '' }) }
     catch (cause) { setError(cause instanceof Error ? cause.message : 'Research request failed.') }
-    finally { setPending(false) }
+    finally { setPending(false); refreshResearch.current?.() }
   }
   const createPlan = (refresh = false) => perform(async () => {
     if (!selectedProfiles.length) throw new Error('Choose a saved Strategy. Use Strategy Library to create one.')

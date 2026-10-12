@@ -57,7 +57,9 @@ final class ResearchCoverageProgressTests: XCTestCase {
             XCTFail("A local read error must fail checking.")
         } catch {
             XCTAssertTrue(error.localizedDescription.contains("Local coverage check failed"))
-            XCTAssertTrue(error.localizedDescription.contains("BTC-USDT-SWAP · candle"))
+            // Concurrent checks can encounter the same missing table in any
+            // input first; the error must still identify the actual input.
+            XCTAssertTrue(["candle", "oi", "taker", "turnover recorded", "settlement mark"].contains { error.localizedDescription.contains("BTC-USDT-SWAP · \($0) ·") })
             XCTAssertTrue(error.localizedDescription.contains(String(ResearchFixture.hour)))
         }
     }

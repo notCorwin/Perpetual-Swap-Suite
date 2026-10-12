@@ -51,7 +51,9 @@ final class BackgroundTestAudit {
                   let rawBounds = window[kCGWindowBounds as String] as? NSDictionary,
                   let bounds = CGRect(dictionaryRepresentation: rawBounds),
                   (window[kCGWindowAlpha as String] as? Double ?? 1) > 0,
-                  displays.contains(where: { $0.intersects(bounds) }) else { continue }
+                  // WindowServer can briefly return zero-sized placeholders
+                  // during title changes. Require an intersection with pixels.
+                  displays.contains(where: { !$0.intersection(bounds).isEmpty }) else { continue }
             visiblePIDs.insert(pid)
             guard pid == getpid() else { continue }
             let number = window[kCGWindowNumber as String] as? Int ?? -1

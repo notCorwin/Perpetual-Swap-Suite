@@ -308,6 +308,15 @@ struct ResearchPlanningCounter {
     var unit: String
     var total: Int
     private let started = ContinuousClock.now
+    private var reported = ContinuousClock.now
+    init(stage: String, unit: String, total: Int) {
+        self.stage = stage; self.unit = unit; self.total = total
+    }
+    mutating func shouldReport(_ completed: Int) -> Bool {
+        guard completed == 1 || completed == total || reported.duration(to: .now) >= .milliseconds(250) else { return false }
+        reported = .now
+        return true
+    }
     func update(_ completed: Int, _ message: String, instrument: String? = nil, kind: String? = nil, range: ResearchRange? = nil) -> ResearchPlanningProgress {
         let remaining = completed > 0 ? researchSeconds(started.duration(to: .now)) / Double(completed) * Double(max(0, total - completed)) : nil
         return .init(stage: stage, unit: unit, completed: completed, total: total, message: message, instrument: instrument, kind: kind, from: range?.from, through: range?.through, remainingSeconds: remaining)

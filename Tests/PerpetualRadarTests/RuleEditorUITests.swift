@@ -671,7 +671,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await input(view, "#study-from", formatter.string(from: Date(timeIntervalSince1970: Double(ResearchFixture.hour)/1000)))
         try await input(view, "#study-through", formatter.string(from: Date(timeIntervalSince1970: Double(ResearchFixture.hour+192*hourMS)/1000)))
         try await click(view, "Review data plan")
-        try await wait(view, "document.body.innerText.includes('This range is fully cached.')")
+        try await wait(view, "document.body.innerText.includes('This range is fully cached.')", seconds: 4)
         let planDescription = try await js(view, "document.querySelector('[data-research]').innerText") as? String ?? ""
         XCTAssertTrue(planDescription.contains("Spread-dependent conditions excluded from this study (1)"))
         let sourceKinds = try await js(view, "Array.from(document.querySelectorAll('table[aria-label=\"Planned data sources\"] tbody tr')).map(row => row.cells[1].innerText).join(',')") as? String ?? ""

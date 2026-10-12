@@ -2,6 +2,16 @@ import Foundation
 import CSQLite
 import CryptoKit
 
+struct ResearchInputCheck: Sendable {
+    var instrument: String
+    var range: ResearchRange
+    var kinds: [String]
+}
+struct ResearchInputGaps: Sendable {
+    var cachedHours: Int
+    var missing: [String: [ResearchRange]]
+}
+
 // Each controller/worker owns its connection. Research never writes radar.sqlite3.
 final class ResearchStore {
     let directory: URL
@@ -87,6 +97,14 @@ final class ResearchStore {
         try database.query("SELECT d.json FROM research_heads h JOIN research_data d USING(revision) WHERE h.inst=? AND h.kind=? AND h.ts=?", [instrument, kind, timestamp]) { json = Self.text($0, 0) }
         return try json.map { try decoder.decode(ResearchDatum.self, from: Data($0.utf8)) }
     }
+    func radarInputs(_ instrument: String, from: Int64, through: Int64) throws -> [ResearchDatum] {
+        var json: [String] = []
+        // Use all three columns of the heads index for each imported row kind.
+        // Filtering the revisions table instead can scan the entire heads
+        // table, including unrelated instruments and historical revisions.
+        try database.query("SELECT d.json FROM research_heads h JOIN research_data d USING(revision) WHERE h.inst=? AND h.kind IN ('candle','stat','quote') AND h.ts>=? AND h.ts<=?", [instrument, from, through]) { json.append(Self.text($0, 0)) }
+        return try json.map { try decoder.decode(ResearchDatum.self, from: Data($0.utf8)) }
+    }
     func data(_ instrument: String, from: Int64, through: Int64, manifest: String? = nil) throws -> [ResearchDatum] {
         var json: [String] = []
         let join = manifest == nil ? "JOIN research_heads h USING(revision)" : "JOIN research_pins p USING(revision)"
@@ -138,12 +156,60 @@ final class ResearchStore {
         if next <= through { missing.append(.init(from: next, through: through)) }
         return missing
     }
-    private struct CoverageCheck {
+    private actor InputReader {
+        private let store: ResearchStore
+        init(directory: URL) throws { store = try ResearchStore(directory: directory) }
+        func inspect(_ check: ResearchInputCheck, refresh: Bool) throws -> ResearchInputGaps {
+            var missing: [String: [ResearchRange]] = [:]
+            for kind in check.kinds {
+                try ResearchPressure.shared.check()
+                do {
+                    missing[kind] = refresh ? [check.range] : try store.missing(check.instrument, kind: kind, from: check.range.from, through: check.range.through)
+                } catch {
+                    if Task.isCancelled { throw error }
+                    throw FilterError("Local input check failed · \(check.instrument) · \(kind) · \(check.range.from)–\(check.range.through): \(error.localizedDescription)")
+                }
+            }
+            let cached = try store.count("SELECT COUNT(*) FROM research_heads WHERE inst=? AND kind='candle' AND ts>=? AND ts<=?", [check.instrument, check.range.from, check.range.through])
+            return .init(cachedHours: cached, missing: missing)
+        }
+    }
+    func inputGapsWithProgress(_ checks: [ResearchInputCheck], refresh: Bool,
+                               progress: @escaping @Sendable (ResearchPlanningProgress) async -> Void) async throws -> [String: ResearchInputGaps] {
+        let readers = try (0..<min(ResearchLocalScan.concurrency, checks.count)).map { _ in try InputReader(directory: directory) }
+        var counter = ResearchPlanningCounter(stage: "missing", unit: "instruments", total: checks.count)
+        var completed = 0, result: [String: ResearchInputGaps] = [:]
+        let initial = checks.first
+        await progress(counter.update(0, initial.map { "Checking local gaps for archive planning · \($0.instrument) · candle" } ?? "Checking local data gaps concurrently…", instrument: initial?.instrument, kind: "candle", range: initial?.range))
+        try await ResearchLocalScan.run(checks, operation: { slot, check in
+            try await readers[slot].inspect(check, refresh: refresh)
+        }) { index, gaps in
+            let check = checks[index]
+            result[check.instrument] = gaps
+            completed += 1
+            if counter.shouldReport(completed) {
+                await progress(counter.update(completed, "Local input gaps checked concurrently · \(check.instrument)", instrument: check.instrument, range: check.range))
+            }
+        }
+        return result
+    }
+    private struct CoverageCheck: Sendable {
         var instrument: String
         var kind: String
         var rowKind: String
         var field: String
         var range: ResearchRange
+    }
+    private actor CoverageReader {
+        private let store: ResearchStore
+        init(directory: URL) throws { store = try ResearchStore(directory: directory) }
+        func inspect(_ check: CoverageCheck) throws -> ResearchCoverage {
+            do { return try store.inspectCoverage(check, manifest: nil) }
+            catch {
+                if Task.isCancelled { throw error }
+                throw FilterError("Local coverage check failed · \(check.instrument) · \(check.kind) · \(check.range.from)–\(check.range.through): \(error.localizedDescription)")
+            }
+        }
     }
     private func coverageChecks(_ instruments: [ResearchInstrument], from: Int64, through: Int64) -> [CoverageCheck] {
         instruments.flatMap { instrument -> [CoverageCheck] in
@@ -184,24 +250,37 @@ final class ResearchStore {
     func coverageWithProgress(_ instruments: [ResearchInstrument], from: Int64, through: Int64,
                               progress: @escaping @Sendable (ResearchPlanningProgress) async -> Void) async throws -> [ResearchCoverage] {
         let checks = coverageChecks(instruments, from: from, through: through)
-        let counter = ResearchPlanningCounter(stage: "coverage", unit: "hours", total: checks.reduce(0) { $0 + $1.range.hours })
-        var completed = 0, results: [ResearchCoverage] = []
-        await progress(counter.update(0, "Checking local hourly inputs and data gaps…"))
-        for check in checks {
-            var result = ResearchCoverage(instrument: check.instrument, kind: check.kind, available: 0, expected: 0, gaps: [])
+        var counter = ResearchPlanningCounter(stage: "coverage", unit: "hours", total: checks.reduce(0) { $0 + $1.range.hours })
+        var chunks: [(Int, CoverageCheck)] = []
+        for (index, check) in checks.enumerated() {
             var first = check.range.from
             while first <= check.range.through {
-                try ResearchPressure.shared.check()
+                try Task.checkCancellation()
                 var part = check
                 part.range = .init(from: first, through: min(check.range.through, first + 719 * hourMS))
-                let message = "Checking local coverage · \(check.instrument) · \(check.kind)"
-                await progress(counter.update(completed, message, instrument: check.instrument, kind: check.kind, range: part.range))
-                let inspected: ResearchCoverage
-                do { inspected = try inspectCoverage(part, manifest: nil) }
-                catch {
-                    if Task.isCancelled { throw error }
-                    throw FilterError("Local coverage check failed · \(check.instrument) · \(check.kind) · \(part.range.from)–\(part.range.through): \(error.localizedDescription)")
-                }
+                chunks.append((index, part))
+                first = part.range.through + hourMS
+            }
+        }
+        let readers = try (0..<min(ResearchLocalScan.concurrency, chunks.count)).map { _ in try CoverageReader(directory: directory) }
+        var completed = 0, parts = Array(repeating: [(ResearchRange, ResearchCoverage)](), count: checks.count)
+        await progress(counter.update(0, "Checking local hourly inputs and data gaps concurrently…", instrument: checks.first?.instrument, kind: checks.first?.kind, range: checks.first?.range))
+        try await ResearchLocalScan.run(chunks, operation: { slot, input in
+            try await readers[slot].inspect(input.1)
+        }) { index, inspected in
+            let (checkIndex, part) = chunks[index]
+            parts[checkIndex].append((part.range, inspected))
+            completed += part.range.hours
+            if completed == part.range.hours || counter.shouldReport(completed) {
+                await progress(counter.update(completed, "Checking local coverage · \(part.instrument) · \(part.kind)", instrument: part.instrument, kind: part.kind, range: part.range))
+            }
+        }
+        try Task.checkCancellation()
+        // Task completion order is arbitrary; merge in chronological order and
+        // retain the same instrument/input order as the synchronous API.
+        return checks.enumerated().map { index, check in
+            var result = ResearchCoverage(instrument: check.instrument, kind: check.kind, available: 0, expected: 0, gaps: [])
+            for (_, inspected) in parts[index].sorted(by: { $0.0.from < $1.0.from }) {
                 result.available += inspected.available; result.expected += inspected.expected
                 if let value = inspected.first { result.first = min(result.first ?? value, value) }
                 if let value = inspected.last { result.last = max(result.last ?? value, value) }
@@ -210,13 +289,9 @@ final class ResearchStore {
                         result.gaps[result.gaps.count - 1].through = max(previous.through, gap.through)
                     } else { result.gaps.append(gap) }
                 }
-                completed += part.range.hours
-                await progress(counter.update(completed, message, instrument: check.instrument, kind: check.kind, range: part.range))
-                first = part.range.through + hourMS
             }
-            results.append(result)
+            return result
         }
-        return results
     }
     func fundingCoverage(_ instrument: String, manifest: String?) throws -> [ResearchRange] {
         if let manifest, let frozen = try get(manifest, as: DataManifest.self) { return frozen.fundingRanges[instrument] ?? [] }

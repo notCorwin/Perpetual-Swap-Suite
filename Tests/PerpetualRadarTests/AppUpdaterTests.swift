@@ -134,6 +134,7 @@ final class AppUpdaterTests: XCTestCase {
         try updater.install(downloadedFile: archive, expectedRevision: "unknown")
         let marker = current.appendingPathComponent("Contents/Resources/marker")
         XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "new")
+        XCTAssertEqual(try String(contentsOf: current.appendingPathComponent("Contents/Resources/Web/index.html"), encoding: .utf8), "<html>new</html>")
     }
 
     func testRelaunchWaitsForOldProcessAndReusesDockApp() throws {
@@ -281,10 +282,11 @@ final class AppUpdaterTests: XCTestCase {
         let contents = url.appendingPathComponent("Contents")
         let executable = contents.appendingPathComponent("MacOS/PerpetualRadar")
         try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: contents.appendingPathComponent("Resources"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: contents.appendingPathComponent("Resources/Web"), withIntermediateDirectories: true)
         try Data("#!/bin/sh\nexit 0\n".utf8).write(to: executable)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         try Data(marker.utf8).write(to: contents.appendingPathComponent("Resources/marker"))
+        try Data("<html>\(marker)</html>".utf8).write(to: contents.appendingPathComponent("Resources/Web/index.html"))
         let plist = try PropertyListSerialization.data(fromPropertyList: [
             "CFBundleExecutable": "PerpetualRadar",
             "CFBundleIdentifier": "com.perpetualradar.macos",

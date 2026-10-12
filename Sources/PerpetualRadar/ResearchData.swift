@@ -145,53 +145,100 @@ final class ResearchDataProvider {
         }
         return previous.sorted { $0.id < $1.id }
     }
-    private func importRadar(_ instruments: [ResearchInstrument], from: Int64, through: Int64, progress: @escaping @Sendable (ResearchPlanningProgress) async -> Void) async throws {
+    func importRadar(_ instruments: [ResearchInstrument], from: Int64, through: Int64, progress: @escaping @Sendable (ResearchPlanningProgress) async -> Void) async throws {
         guard let radarURL, FileManager.default.fileExists(atPath: radarURL.path) else { return }
-        let radar = try Store(url: radarURL)
-        let total = instruments.count * ((ResearchRange(from: from, through: through).hours + 999) / 1000)
-        let counter = ResearchPlanningCounter(stage: "localImport", unit: "ranges", total: total)
+        var ranges: [RadarRange] = []
+        // Interleave instruments so one long history cannot block every other
+        // instrument, including when only a few have recorded data.
+        var first = from
+        while first <= through {
+            try Task.checkCancellation()
+            let last = min(through, first + 999 * hourMS)
+            ranges += instruments.map { RadarRange(instrument: $0.id, range: .init(from: first, through: last)) }
+            first = last + hourMS
+        }
+        let readers = try (0..<min(ResearchLocalScan.concurrency, ranges.count)).map { _ in try RadarReader(url: radarURL) }
+        var counter = ResearchPlanningCounter(stage: "localImport", unit: "ranges", total: ranges.count)
         var completed = 0
-        for instrument in instruments {
-            var first = from
-            while first <= through {
-                try ResearchPressure.shared.check()
-                let last = min(through, first + 999 * hourMS)
-                let range = ResearchRange(from: first, through: last)
-                await progress(counter.update(completed, "Reading recorded Radar history · \(instrument.id)", instrument: instrument.id, range: range))
-                let candles = try radar.candles(instrument.id, since: first, through: last), stats = try radar.chartStats(instrument.id, since: first, through: last)
-                let quotes = try radar.hourlyQuotes(instrument.id, since: first, through: last).compactMapValues { quote in
-                    quote.turnover.map { FilterQuote(turnover: $0, spread: nil, timestamp: quote.timestamp) }
+        let initial = ranges.first
+        await progress(counter.update(0, "Reading recorded Radar history concurrently…", instrument: initial?.instrument, range: initial?.range))
+        try await ResearchLocalScan.run(ranges, operation: { slot, input in
+            try await readers[slot].read(input)
+        }) { index, batch in
+            let input = ranges[index]
+            if let source = batch.source, let raw = batch.raw {
+                if !(try store.rawIsComplete(source)) {
+                    try raw.write(to: store.rawURL(source), options: .atomic)
+                    try store.put(source.id, kind: "source", source)
                 }
-                let id = "radar:\(instrument.id):\(first):\(last)", raw = try researchJSON(LocalRows(candles: Array(candles.values).sorted { $0.hour < $1.hour }, stats: stats.mapValues { FilterStat(oi: $0.oi, sell: $0.sell, buy: $0.buy) }, quotes: quotes))
-                let source = ResearchSource(id: researchHash(id + raw), instrument: instrument.id, kind: "local", from: first, through: last, url: radarURL.path, filename: "Local confirmed hours", sizeBytes: Int64(raw.utf8.count), archive: false, rawHash: researchHash(raw))
-                if !candles.isEmpty || !stats.isEmpty || !quotes.isEmpty {
-                    if !(try store.rawIsComplete(source)) { try Data(raw.utf8).write(to: store.rawURL(source), options: .atomic); try store.put(source.id, kind: "source", source) }
-                    var values = candles.values.filter { $0.confirmed && $0.open != nil }.map { ResearchDatum(instrument: instrument.id, kind: "candle", timestamp: $0.hour, candle: $0, sources: [source.id]) }
-                    values += stats.map { ResearchDatum(instrument: instrument.id, kind: "stat", timestamp: $0.key, stat: FilterStat(oi: $0.value.oi, sell: $0.value.sell, buy: $0.value.buy), sources: [source.id]) }
-                    values += quotes.map { ResearchDatum(instrument: instrument.id, kind: "quote", timestamp: $0.key, quote: $0.value, sources: [source.id]) }
-                    values = try values.compactMap { value in
-                        guard let old = try store.latest(value.instrument, kind: value.kind, timestamp: value.timestamp) else { return value }
-                        if value.kind == "candle" { return nil }
-                        var fill = value
-                        if let stat = value.stat {
-                            fill.stat = FilterStat(oi: old.stat?.oi == nil ? stat.oi : nil, sell: old.stat?.sell == nil ? stat.sell : nil, buy: old.stat?.buy == nil ? stat.buy : nil)
-                            if fill.stat?.oi == nil && fill.stat?.buy == nil && fill.stat?.sell == nil { return nil }
-                        }
-                        if let quote = value.quote {
-                            fill.quote = FilterQuote(turnover: old.quote?.turnover == nil ? quote.turnover : nil, spread: nil, timestamp: quote.timestamp)
-                            if fill.quote?.turnover == nil { return nil }
-                        }
-                        return fill
+                // Load existing heads once per range rather than issuing one
+                // SQLite query for every candle/stat/quote being considered.
+                var existing: [String: [Int64: ResearchDatum]] = [:]
+                for value in try store.radarInputs(input.instrument, from: input.range.from, through: input.range.through) {
+                    existing[value.kind, default: [:]][value.timestamp] = value
+                }
+                let values = batch.values.compactMap { value -> ResearchDatum? in
+                    guard let old = existing[value.kind]?[value.timestamp] else { return value }
+                    if value.kind == "candle" { return nil }
+                    var fill = value
+                    if let stat = value.stat {
+                        fill.stat = FilterStat(oi: old.stat?.oi == nil ? stat.oi : nil, sell: old.stat?.sell == nil ? stat.sell : nil, buy: old.stat?.buy == nil ? stat.buy : nil)
+                        if fill.stat?.oi == nil && fill.stat?.buy == nil && fill.stat?.sell == nil { return nil }
                     }
-                    try store.write(values)
+                    if let quote = value.quote {
+                        fill.quote = FilterQuote(turnover: old.quote?.turnover == nil ? quote.turnover : nil, spread: nil, timestamp: quote.timestamp)
+                        if fill.quote?.turnover == nil { return nil }
+                    }
+                    return fill
                 }
-                completed += 1
-                await progress(counter.update(completed, "Recorded Radar range inspected · \(instrument.id)", instrument: instrument.id, range: range))
-                first = last + hourMS
+                if !values.isEmpty { try store.write(values) }
+            }
+            completed += 1
+            if counter.shouldReport(completed) {
+                await progress(counter.update(completed, "Recorded Radar ranges inspected concurrently · \(input.instrument)", instrument: input.instrument, range: input.range))
             }
         }
     }
-    private struct LocalRows: Codable { var candles: [Candle]; var stats: [Int64: FilterStat]; var quotes: [Int64: FilterQuote] }
+    private struct RadarRange: Sendable { var instrument: String; var range: ResearchRange }
+    private struct RadarBatch: Sendable {
+        var source: ResearchSource?
+        var raw: Data?
+        var values: [ResearchDatum] = []
+    }
+    private actor RadarReader {
+        private let radar: Store
+        init(url: URL) throws { radar = try Store(url: url) }
+        func read(_ input: RadarRange) throws -> RadarBatch {
+            try ResearchPressure.shared.check()
+            let instrument = input.instrument, range = input.range
+            do {
+                let candles = try radar.candles(instrument, since: range.from, through: range.through)
+                let stats = try radar.chartStats(instrument, since: range.from, through: range.through).mapValues { FilterStat(oi: $0.oi, sell: $0.sell, buy: $0.buy) }
+                let quotes = try radar.hourlyQuotes(instrument, since: range.from, through: range.through).compactMapValues { quote in
+                    quote.turnover.map { FilterQuote(turnover: $0, spread: nil, timestamp: quote.timestamp) }
+                }
+                // Most historical ranges predate Radar's local recordings.
+                guard !candles.isEmpty || !stats.isEmpty || !quotes.isEmpty else { return RadarBatch() }
+                try ResearchPressure.shared.check()
+                // String timestamp keys let JSONEncoder sort them. Int64-keyed
+                // dictionaries encode as unordered arrays and change the raw
+                // hash on a repeat scan even when every reading is unchanged.
+                let raw = try researchJSON(LocalRows(candles: Array(candles.values).sorted { $0.hour < $1.hour },
+                    stats: Dictionary(uniqueKeysWithValues: stats.map { (String($0.key), $0.value) }),
+                    quotes: Dictionary(uniqueKeysWithValues: quotes.map { (String($0.key), $0.value) })))
+                let id = "radar:\(instrument):\(range.from):\(range.through)"
+                let source = ResearchSource(id: researchHash(id + raw), instrument: instrument, kind: "local", from: range.from, through: range.through, url: radar.url.path, filename: "Local confirmed hours", sizeBytes: Int64(raw.utf8.count), archive: false, rawHash: researchHash(raw))
+                var values = candles.values.filter { $0.confirmed && $0.open != nil }.map { ResearchDatum(instrument: instrument, kind: "candle", timestamp: $0.hour, candle: $0, sources: [source.id]) }
+                values += stats.map { ResearchDatum(instrument: instrument, kind: "stat", timestamp: $0.key, stat: $0.value, sources: [source.id]) }
+                values += quotes.map { ResearchDatum(instrument: instrument, kind: "quote", timestamp: $0.key, quote: $0.value, sources: [source.id]) }
+                return RadarBatch(source: source, raw: Data(raw.utf8), values: values)
+            } catch {
+                if Task.isCancelled { throw error }
+                throw FilterError("Recorded Radar read failed · \(instrument) · \(range.from)–\(range.through): \(error.localizedDescription)")
+            }
+        }
+    }
+    private struct LocalRows: Encodable { var candles: [Candle]; var stats: [String: FilterStat]; var quotes: [String: FilterQuote] }
     private func restSource(_ instrument: String, kind: String, _ range: ResearchRange, refresh: Bool) -> ResearchSource {
         let paths = ["candle": "/market/history-candles", "oi": "/rubik/stat/contracts/open-interest-history", "taker": "/rubik/stat/taker-volume-contract", "funding": "/public/funding-rate-history", "mark": "/market/history-mark-price-candles"]
         var parameters = [("instId", instrument)]
@@ -333,18 +380,25 @@ final class ResearchDataProvider {
         let recent = researchNow() / hourMS * hourMS - 60 * 24 * hourMS
         let oldEnd = min(last, recent - hourMS)
         let earliestInput = max(0, first - Int64(warmup + 1) * hourMS)
+        let checks = inputs.compactMap { instrument -> ResearchInputCheck? in
+            let begin = max(first - Int64(warmup + 1) * hourMS, instrument.listedAt! / hourMS * hourMS)
+            guard begin <= last else { return nil }
+            return .init(instrument: instrument.id, range: .init(from: begin, through: last), kinds: ["candle", "oi", "taker", "funding", "mark"].filter { needs($0, instrument.id) })
+        }
+        let localInputs = try await store.inputGapsWithProgress(checks, refresh: refresh, progress: progress)
         var catalogs: [Int: [ResearchSource]] = [:]
         // Batch within the catalog family limit; cached complete periods need no catalog requests.
         for (module, kind, end) in [(2, "candle", oldEnd), (1, "taker", oldEnd), (3, "funding", oldEnd)] where earliestInput <= end {
             var ranges: [String: [ResearchRange]] = [:]
             let candidates = inputs.filter { needs(kind, $0.id) }
-            let counter = ResearchPlanningCounter(stage: "missing", unit: "instruments", total: candidates.count)
-            for (index, instrument) in candidates.enumerated() {
-                await progress(counter.update(index, "Checking local gaps for archive planning · \(instrument.id) · \(kind)", instrument: instrument.id, kind: kind))
+            for instrument in candidates {
+                try Task.checkCancellation()
                 let begin = max(earliestInput, instrument.listedAt! / hourMS * hourMS)
                 guard begin <= end else { continue }
-                ranges[instrument.id] = refresh ? [.init(from: begin, through: end)] : try store.missing(instrument.id, kind: kind, from: begin, through: end)
-                await progress(counter.update(index + 1, "Local archive gaps checked · \(instrument.id) · \(kind)", instrument: instrument.id, kind: kind))
+                ranges[instrument.id] = localInputs[instrument.id]?.missing[kind]?.compactMap { range in
+                    let clipped = ResearchRange(from: max(begin, range.from), through: min(end, range.through))
+                    return clipped.from <= clipped.through ? clipped : nil
+                } ?? []
             }
             let missing = inputs.filter { !ranges[$0.id, default: []].isEmpty }
             if !missing.isEmpty {
@@ -354,15 +408,15 @@ final class ResearchDataProvider {
         func published(_ module: Int, _ id: String, _ from: Int64, _ through: Int64) -> [ResearchSource] {
             catalogs[module, default: []].filter { $0.instrument == id && $0.through >= from && $0.from <= through }
         }
-        let sourceCounter = ResearchPlanningCounter(stage: "sources", unit: "instruments", total: inputs.count)
+        var sourceCounter = ResearchPlanningCounter(stage: "sources", unit: "instruments", total: inputs.count)
+        await progress(sourceCounter.update(0, "Building download ranges from verified local checks…"))
         for (index, instrument) in inputs.enumerated() {
             try Task.checkCancellation()
-            await progress(sourceCounter.update(index, "Building download ranges · \(instrument.id)", instrument: instrument.id))
             let begin = max(first - Int64(warmup + 1) * hourMS, instrument.listedAt! / hourMS * hourMS)
             guard begin <= last else { continue }
             plan.requestedHours += Int((last - begin) / hourMS) + 1
-            plan.cachedHours += try store.count("SELECT COUNT(*) FROM research_heads WHERE inst=? AND kind='candle' AND ts>=? AND ts<=?", [instrument.id, begin, last])
-            let missingPrices = refresh ? [ResearchRange(from: begin, through: last)] : try store.missing(instrument.id, kind: "candle", from: begin, through: last)
+            plan.cachedHours += localInputs[instrument.id]?.cachedHours ?? 0
+            let missingPrices = localInputs[instrument.id]?.missing["candle"] ?? []
             for range in missingPrices {
                 var archives: [ResearchSource] = []
                 if range.from <= oldEnd { archives = published(2, instrument.id, range.from, min(range.through, oldEnd)) }
@@ -372,7 +426,7 @@ final class ResearchDataProvider {
                 for gap in Self.subtract(range, covered: archiveRanges) { plan.sources.append(restSource(instrument.id, kind: "candle", gap, refresh: refresh)) }
             }
             for kind in ["oi", "taker", "funding", "mark"] where needs(kind, instrument.id) {
-                let ranges = refresh ? [ResearchRange(from: begin, through: last)] : try store.missing(instrument.id, kind: kind, from: begin, through: last)
+                let ranges = localInputs[instrument.id]?.missing[kind] ?? []
                 for range in ranges {
                     if ["taker", "funding"].contains(kind), range.from <= oldEnd {
                         let module = kind == "taker" ? 1 : 3
@@ -384,7 +438,9 @@ final class ResearchDataProvider {
                     if restBegin <= range.through { plan.sources.append(restSource(instrument.id, kind: kind, .init(from: restBegin, through: range.through), refresh: refresh)) }
                 }
             }
-            await progress(sourceCounter.update(index + 1, "Download ranges planned · \(instrument.id)", instrument: instrument.id))
+            if sourceCounter.shouldReport(index + 1) {
+                await progress(sourceCounter.update(index + 1, "Download ranges planned · \(instrument.id)", instrument: instrument.id))
+            }
         }
         if !refresh {
             plan.sources += try store.objects("source", as: ResearchSource.self).filter { source in
@@ -392,17 +448,18 @@ final class ResearchDataProvider {
             }
         }
         plan.sources = Array(Dictionary(plan.sources.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a }).values).sorted { ($0.instrument, $0.kind, $0.from) < ($1.instrument, $1.kind, $1.from) }
-        let cacheCounter = ResearchPlanningCounter(stage: "cache", unit: "sources", total: plan.sources.count)
-        // shortcut: Batch file existence checks instead of one-by-one for faster planning.
-        await progress(cacheCounter.update(0, "Checking cached source files (batch)"))
+        var cacheCounter = ResearchPlanningCounter(stage: "cache", unit: "sources", total: plan.sources.count)
+        await progress(cacheCounter.update(0, "Checking cached source files concurrently…"))
         let savedSources = try Dictionary(uniqueKeysWithValues: store.objects("source", as: ResearchSource.self).filter { $0.rawHash != nil }.map { ($0.id, $0) })
-        let fileManager = FileManager.default
-        for index in plan.sources.indices {
-            try Task.checkCancellation()
-            let source = plan.sources[index]
-            plan.sources[index].cached = savedSources[source.id].map { fileManager.fileExists(atPath: store.rawURL($0).path) } ?? false
-            if (index + 1) % 50 == 0 || index + 1 == plan.sources.count {
-                await progress(cacheCounter.update(index + 1, "Cached sources checked · \(index + 1)/\(plan.sources.count)"))
+        let cachedURLs = plan.sources.map { source in savedSources[source.id].map { store.rawURL($0) } }
+        var cachedCompleted = 0
+        try await ResearchLocalScan.run(cachedURLs, operation: { _, url in
+            url.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+        }) { index, cached in
+            plan.sources[index].cached = cached
+            cachedCompleted += 1
+            if cacheCounter.shouldReport(cachedCompleted) {
+                await progress(cacheCounter.update(cachedCompleted, "Cached sources checked · \(cachedCompleted)/\(plan.sources.count)"))
             }
         }
         plan.warnings = Array(Set(plan.warnings)).sorted()
