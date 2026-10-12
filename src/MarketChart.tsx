@@ -501,6 +501,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
     let timer: number
     let lastLoad = chartCache.get(instId)?.loadedAt ?? 0
     let revision = chartCache.get(instId)?.data.revision ?? -1
+    let backoff = 2000
     const refresh = async () => {
       try {
         const shouldLoad = Date.now() - lastLoad >= 60_000
@@ -512,15 +513,19 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
           if (!shouldLoad) rememberChart(instId, result, lastLoad)
           if (windowEndRef.current?.id !== instId) setDisplayed({ id: instId, data: result })
           warmChart(instId, result, false)
+          backoff = 2000
+        } else {
+          backoff = Math.min(backoff * 1.5, 30000)
         }
         if (windowEndRef.current?.id !== instId) setChartError(current => current?.id === instId && current.message === result.error ? current : { id: instId, message: result.error })
       } catch (cause) {
         if (!stopped) {
           const message = cause instanceof Error ? cause.message : "Cannot load chart"
           if (windowEndRef.current?.id !== instId) setChartError(current => current?.id === instId && current.message === message ? current : { id: instId, message })
+          backoff = Math.min(backoff * 2, 30000)
         }
       }
-      if (!stopped) timer = window.setTimeout(refresh, 2000)
+      if (!stopped) timer = window.setTimeout(refresh, backoff)
     }
     if (!chartCache.has(instId)) void previewChart(instId).then(data => {
       if (!stopped) { if (windowEndRef.current?.id !== instId) setDisplayed({ id: instId, data }); warmChart(instId, data, false) }

@@ -16,15 +16,25 @@ export function StrategyPhaseEditor({ label, model, inputs, preferences, onPrefe
   const [explaining, setExplaining] = useState<string | null>(null)
   useEffect(() => {
     if (!active || !model.lastValid) return
-    let stopped = false, timer: number
+    let stopped = false, timer: number, backoff = 2000
     const token = newRuleID(), json = model.lastValid
     const refresh = async () => {
       try {
         const snapshot = await window.webkit.messageHandlers.radar.postMessage({ previewMarketFilters: { filtersJSON: json, token, atClose: true, strategyID } })
         if (stopped) return
-        setRows(snapshot.rows); setResults(snapshot.filterResults); setRevision(snapshot.revision); setHistory(snapshot.historyProgress); setPreviewJSON(json)
-      } catch (cause) { if (!stopped) setHistory({ pending: 0, completed: 0, error: cause instanceof Error ? cause.message : 'Cannot preview these rules.' }) }
-      if (!stopped) timer = window.setTimeout(refresh, 2000)
+        if ("unchanged" in snapshot) {
+          backoff = Math.min(backoff * 1.5, 30000)
+        } else {
+          setRows(snapshot.rows); setResults(snapshot.filterResults); setRevision(snapshot.revision); setHistory(snapshot.historyProgress); setPreviewJSON(json)
+          backoff = 2000
+        }
+      } catch (cause) {
+        if (!stopped) {
+          setHistory({ pending: 0, completed: 0, error: cause instanceof Error ? cause.message : 'Cannot preview these rules.' })
+          backoff = Math.min(backoff * 2, 30000)
+        }
+      }
+      if (!stopped) timer = window.setTimeout(refresh, backoff)
     }
     void refresh(); return () => { stopped = true; window.clearTimeout(timer) }
   }, [active, model.lastValid, strategyID])

@@ -286,23 +286,27 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   useEffect(() => {
     if (!active) return
     let stopped = false
+    let backoff = 2000 // Start at 2s, increase when unchanged
     const load = async () => {
       try {
         const snapshot = await window.webkit.messageHandlers.radar.postMessage({ rocPeriod: ROC_PERIOD, marocPeriod: MAROC_PERIOD, sinceRevision: revision.current })
         if (stopped) return
         if ("unchanged" in snapshot) {
-          // shortcut: Skip state updates when backend reports no changes
+          // shortcut: Exponential backoff when data unchanged, max 30s
           setStatus("Live")
+          backoff = Math.min(backoff * 1.5, 30000)
         } else {
           acceptSnapshot(snapshot)
           setStatus("Live")
+          backoff = 2000 // Reset to fast polling on changes
         }
       } catch (cause) {
         if (stopped) return
         setError(cause instanceof Error ? cause.message : "Cannot connect to the native collector")
         setStatus("Reconnecting")
+        backoff = Math.min(backoff * 2, 30000) // Slower retry on errors
       }
-      if (!stopped) timer = window.setTimeout(load, 2000)
+      if (!stopped) timer = window.setTimeout(load, backoff)
     }
     let timer: number
     void load()
@@ -335,6 +339,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     if (!active || !lastValidJSON || !activeStrategyID) return
     let stopped = false
     let timer: number
+    let backoff = 2000
     const epoch = ++previewEpoch.current
     const token = `${epoch}:${newRuleID()}`
     const refresh = async () => {
@@ -342,18 +347,21 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
         const snapshot = await window.webkit.messageHandlers.radar.postMessage({ previewMarketFilters: { filtersJSON: lastValidJSON, token, strategyID: activeStrategyID } })
         if (stopped || epoch !== previewEpoch.current) return
         if (previewResponseIsCurrent(snapshot, token, snapshot.serviceSession && snapshot.serviceSession !== serviceSession.current ? -1 : revision.current)) startTransition(() => {
-          if (!acceptSnapshot(snapshot)) return
+          const updated = acceptSnapshot(snapshot)
+          if (!updated) { backoff = Math.min(backoff * 1.5, 30000); return }
           setResults(current => keepSnapshotValue(current, snapshot.filterResults))
           setPreviewJSON(lastValidJSON)
           setHistory(current => keepSnapshotValue(current, snapshot.historyProgress))
           setStatus("Live")
+          backoff = 2000
         })
       } catch (cause) {
         if (stopped) return
         setStatus("Reconnecting")
         setError(cause instanceof Error ? cause.message : "Cannot preview native rules")
+        backoff = Math.min(backoff * 2, 30000)
       }
-      if (!stopped) timer = window.setTimeout(refresh, 2000)
+      if (!stopped) timer = window.setTimeout(refresh, backoff)
     }
     void refresh()
     return () => { stopped = true; window.clearTimeout(timer) }
