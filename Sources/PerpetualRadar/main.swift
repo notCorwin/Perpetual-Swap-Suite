@@ -237,6 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             applyWindowBackground(); configureBackgroundScript(in: webView.configuration.userContentController)
         }
         if let title = snapshot["updateMenuTitle"] as? String { checkUpdatesItem.title = title }
+        if let toolTip = snapshot["updateMenuToolTip"] as? String { checkUpdatesItem.toolTip = toolTip.isEmpty ? nil : toolTip }
         if let enabled = snapshot["updateMenuEnabled"] as? Bool { checkUpdatesItem.isEnabled = enabled }
         if let enabled = snapshot["automaticUpdatesEnabled"] as? Bool { automaticUpdatesItem.state = enabled ? .on : .off }
     }

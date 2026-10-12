@@ -25,7 +25,9 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private lazy var notificationsItem = NSMenuItem(title: "Strategy Notifications", action: #selector(toggleNotifications), keyEquivalent: "")
     private lazy var testItem = NSMenuItem(title: "Send Test Notification", action: #selector(sendTest), keyEquivalent: "")
     private lazy var loginItem = NSMenuItem(title: "Start at Login", action: #selector(toggleLogin), keyEquivalent: "")
-    private lazy var updater = AppUpdater(currentAppURL: MonitorRuntime.appURL)
+    private let injectedUpdater: (any AppUpdating)?
+    private lazy var updater: any AppUpdating = injectedUpdater ?? AppUpdater(currentAppURL: MonitorRuntime.appURL)
+    private let now: () -> Date
     private var updateTimer: Timer?
     private var updateState = "idle"
     private var update: AppUpdate?
@@ -34,6 +36,8 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var installingAutomatically = false
     private var isPresentingUpdate = false
     private var automaticInstallRetryAfter: Date?
+    private var updateProgress: AppUpdateProgress?
+    private var updateError = ""
     private lazy var checkUpdatesItem = NSMenuItem(title: "Check for Updates", action: #selector(checkForUpdatesNow), keyEquivalent: "")
     private lazy var automaticUpdatesItem = NSMenuItem(title: "Automatically Install Updates", action: #selector(toggleAutomaticUpdates), keyEquivalent: "")
     private var fixture: MonitorFixture?
@@ -44,6 +48,12 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var researchBusy: Bool { leases.values.contains(where: \.researchBusy) }
     private var leaseTimer: Timer?
     private var collectionAllowed: Bool { MonitorRuntime.backgroundMonitoringEnabled || !leases.isEmpty }
+
+    init(updater: (any AppUpdating)? = nil, now: @escaping () -> Date = Date.init) {
+        injectedUpdater = updater
+        self.now = now
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         do {
@@ -78,7 +88,7 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let leaseTimer = Timer(timeInterval: 2, target: self, selector: #selector(checkForegroundLease), userInfo: nil, repeats: true)
         RunLoop.main.add(leaseTimer, forMode: .common); self.leaseTimer = leaseTimer
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(resumeAfterWake), name: NSWorkspace.didWakeNotification, object: nil)
-        if ProcessInfo.processInfo.environment["PERPETUAL_RADAR_UPDATE_ROLLBACK"] == "1" { automaticInstallRetryAfter = Date().addingTimeInterval(5 * 60) }
+        if ProcessInfo.processInfo.environment["PERPETUAL_RADAR_UPDATE_ROLLBACK"] == "1" { automaticInstallRetryAfter = now().addingTimeInterval(5 * 60) }
         if fixture == nil {
             let timer = Timer(timeInterval: 15, target: self, selector: #selector(checkForUpdatesAutomatically), userInfo: nil, repeats: true)
             RunLoop.main.add(timer, forMode: .common); updateTimer = timer
@@ -216,8 +226,10 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc private func checkForegroundLease() {
         Task { await refreshLoginStatus() }
+        let wasResearchBusy = researchBusy
         leases = leases.filter { kill($0.key, 0) == 0 || errno == EPERM }
-        if leases.isEmpty && !MonitorRuntime.backgroundMonitoringEnabled { NSApp.terminate(nil) }
+        if leases.isEmpty && !MonitorRuntime.backgroundMonitoringEnabled && !isInstallingUpdate { NSApp.terminate(nil) }
+        if wasResearchBusy && !researchBusy { resumeAutomaticUpdate() }
         if collectionAllowed { recoverCollector() }
     }
     @objc private func showInterface() { openInterface(instId: nil) }
@@ -250,17 +262,21 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         result["databaseReady"] = radar != nil
         result["launchAtLogin"] = loginStatus; result["launchAtLoginError"] = loginError
         result["updateMenuTitle"] = checkUpdatesItem.title; result["updateMenuEnabled"] = !isCheckingUpdate && !isInstallingUpdate
+        result["updateMenuToolTip"] = checkUpdatesItem.toolTip ?? ""
         result["automaticUpdatesEnabled"] = AppDelegate.automaticUpdatesEnabled(in: MonitorRuntime.defaults)
         return result
     }
 
     private func handle(_ parameters: [String: Any]) async throws -> [String: Any] {
         if let lease = parameters["foregroundLease"] as? [String: Any], let pid = lease["pid"] as? Int32, pid > 0 {
+            let wasResearchBusy = researchBusy
             leases[pid] = Lease(workspace: lease["workspace"] as? String == "research" ? "research" : "radar", researchBusy: lease["researchBusy"] as? Bool == true)
-            if isInstallingUpdate && installingAutomatically && (researchBusy || foregroundWorkspace == "research") {
+            if isInstallingUpdate && installingAutomatically && researchBusy {
                 guard updater.cancel() else { throw FilterError("An update is completing its app replacement. Open Research after the app restarts.") }
-                isInstallingUpdate = false; installingAutomatically = false; updateState = "available"; renderUpdateItem()
+                isInstallingUpdate = false; installingAutomatically = false; updateProgress = nil; updateState = "available"
             }
+            if wasResearchBusy && !researchBusy { resumeAutomaticUpdate() }
+            renderUpdateItem()
             reconcileMonitoring()
         }
         if let enabled = parameters["backgroundMonitoringEnabled"] as? Bool {
@@ -277,10 +293,13 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return info
         }
         if let pid = parameters["releaseLease"] as? Int32 {
+            let wasResearchBusy = researchBusy
             leases.removeValue(forKey: pid)
+            if wasResearchBusy && !researchBusy { resumeAutomaticUpdate() }
+            renderUpdateItem()
             let remaining = leases.count
             if remaining == 0 && !MonitorRuntime.backgroundMonitoringEnabled && !isInstallingUpdate {
-                Task { try? await Task.sleep(for: .milliseconds(200)); if self.leases.isEmpty { NSApp.terminate(nil) } }
+                Task { try? await Task.sleep(for: .milliseconds(200)); if self.leases.isEmpty && !self.isInstallingUpdate { NSApp.terminate(nil) } }
             }
             return ["remainingClients": remaining]
         }
@@ -359,8 +378,18 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         automaticUpdatesItem.state = enabled ? .on : .off
         if enabled, updateState == "available", let update,
            !isInstallingUpdate, !isPresentingUpdate {
+            automaticInstallRetryAfter = nil
             installUpdate(update, automatically: true)
         }
+        renderUpdateItem()
+    }
+
+    private func resumeAutomaticUpdate() {
+        guard updateState == "available", let update,
+              AppDelegate.automaticUpdatesEnabled(in: MonitorRuntime.defaults),
+              !isCheckingUpdate, !isInstallingUpdate, !isPresentingUpdate,
+              automaticInstallRetryAfter.map({ $0 <= now() }) ?? true else { return }
+        installUpdate(update, automatically: true)
     }
 
     private func renderUpdateItem() {
@@ -371,12 +400,39 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let formatter = RelativeDateTimeFormatter()
                 formatter.locale = Locale(identifier: "en_US")
                 formatter.unitsStyle = .abbreviated
-                age = " · \(formatter.localizedString(for: publishedAt, relativeTo: Date()))"
+                age = " · \(formatter.localizedString(for: publishedAt, relativeTo: now()))"
             } else { age = "" }
-            checkUpdatesItem.title = "Update Available\(revision)\(age)"
+            if AppDelegate.automaticUpdatesEnabled(in: MonitorRuntime.defaults), researchBusy {
+                checkUpdatesItem.title = "Update Available\(revision) · Waiting for Research"
+            } else if !updateError.isEmpty {
+                let retry = automaticInstallRetryAfter.flatMap { date -> String? in
+                    guard AppDelegate.automaticUpdatesEnabled(in: MonitorRuntime.defaults), date > now() else { return nil }
+                    let minutes = max(1, Int(ceil(date.timeIntervalSince(now()) / 60)))
+                    return " · Retrying in \(minutes)m"
+                } ?? ""
+                checkUpdatesItem.title = "Update Failed\(revision)\(retry)"
+            } else {
+                checkUpdatesItem.title = "Update Available\(revision)\(age)"
+            }
+        } else if isInstallingUpdate {
+            switch updateProgress {
+            case .downloading(let received, let total):
+                if total > 0 {
+                    checkUpdatesItem.title = "Downloading Update · \(min(100, received * 100 / total))%"
+                } else {
+                    checkUpdatesItem.title = received > 0 ? "Downloading Update · \(ByteCountFormatter.string(fromByteCount: received, countStyle: .file))" : "Downloading Update…"
+                }
+            case .retrying(let attempt, let total):
+                checkUpdatesItem.title = "Retrying Update Download · \(attempt)/\(total)"
+            case .installing:
+                checkUpdatesItem.title = "Installing Update…"
+            case nil:
+                checkUpdatesItem.title = "Downloading Update…"
+            }
         } else {
-            checkUpdatesItem.title = updateState == "installing" ? "Installing Update…" : "Check for Updates"
+            checkUpdatesItem.title = "Check for Updates"
         }
+        checkUpdatesItem.toolTip = updateError.isEmpty ? nil : updateError
         checkUpdatesItem.isEnabled = !isCheckingUpdate && !isInstallingUpdate
     }
 
@@ -390,11 +446,17 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             isCheckingUpdate = false
             switch result {
             case .success(let found):
+                if found?.revision != update?.revision {
+                    updateError = ""
+                    // Preserve the startup cooldown after an installer rollback.
+                    // A genuinely newer offer can replace a failed cached offer.
+                    if update != nil { automaticInstallRetryAfter = nil }
+                }
                 update = found
                 updateState = found == nil ? "latest" : "available"
                 if let found {
                     if AppDelegate.automaticUpdatesEnabled(in: MonitorRuntime.defaults),
-                       automaticInstallRetryAfter.map({ $0 <= Date() }) ?? true {
+                       automaticInstallRetryAfter.map({ $0 <= now() }) ?? true {
                         installUpdate(found, automatically: true)
                     } else if !silently {
                         presentUpdate(found)
@@ -428,14 +490,20 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func installUpdate(_ update: AppUpdate, automatically: Bool) {
         guard !isInstallingUpdate else { return }
-        guard !researchBusy && (!automatically || leases.isEmpty || foregroundWorkspace != "research") else {
+        guard !researchBusy else {
             if !automatically { showUpdateAlert("Research Is Running", "Pause research before installing an update. Its checkpoint and cache will be retained.") }
+            renderUpdateItem()
             return
         }
         isInstallingUpdate = true; installingAutomatically = automatically
+        updateError = ""; updateProgress = .downloading(received: 0, total: 0)
         updateState = "installing"
         renderUpdateItem()
-        updater.downloadAndInstall(update) { [weak self] result in
+        updater.downloadAndInstall(update, progress: { [weak self] progress in
+            guard let self, isInstallingUpdate else { return }
+            updateProgress = progress
+            renderUpdateItem()
+        }) { [weak self] result in
             guard let self else { return }
             switch result {
             case .success:
@@ -443,8 +511,13 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 NSApp.terminate(nil)
             case .failure(let error):
                 isInstallingUpdate = false
+                installingAutomatically = false; updateProgress = nil
+                updateError = error.localizedDescription
                 updateState = "available"
-                if automatically { automaticInstallRetryAfter = Date().addingTimeInterval(5 * 60) }
+                if automatically {
+                    if case .rateLimited(let until) = error { automaticInstallRetryAfter = until }
+                    else { automaticInstallRetryAfter = now().addingTimeInterval(5 * 60) }
+                }
                 renderUpdateItem()
                 if !automatically { showUpdateAlert("Update Failed", error.localizedDescription) }
             }

@@ -1,3 +1,4 @@
+import CryptoKit
 import XCTest
 @testable import PerpetualRadar
 
@@ -158,6 +159,45 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "new")
         XCTAssertEqual(try String(contentsOf: current.appendingPathComponent("Contents/Resources/Web/index.html"), encoding: .utf8), "<html>new</html>")
         XCTAssertEqual(try String(contentsOf: current.appendingPathComponent("Contents/Library/LoginItems/\(MonitorRuntime.helperName)/Contents/Resources/marker"), encoding: .utf8), "new")
+    }
+
+    @MainActor
+    func testNativeDownloadRetriesReportsStreamingProgressAndInstallsVerifiedRelease() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("UpdateTransfer-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let current = root.appendingPathComponent("Perpetual Swap Suite.app")
+        let release = root.appendingPathComponent("release/Perpetual Swap Suite.app")
+        let archive = root.appendingPathComponent("update.tar"), revision = String(repeating: "a", count: 40)
+        try makeApp(at: current, marker: "old")
+        try makeApp(at: release, marker: revision)
+        let tar = Process()
+        tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        tar.arguments = ["-cf", archive.path, "-C", release.deletingLastPathComponent().path, "Perpetual Swap Suite.app"]
+        try tar.run(); tar.waitUntilExit()
+        XCTAssertEqual(tar.terminationStatus, 0)
+        let digest = SHA256.hash(data: try Data(contentsOf: archive)).map { String(format: "%02x", $0) }.joined()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [UpdateDownloadProtocol.self]
+        configuration.httpAdditionalHeaders = ["X-Update-Fixture": root.path]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let updater = AppUpdater(session: session, currentAppURL: current, relauncher: { _, _ in })
+        let finished = expectation(description: "Verified update installed")
+        var updates: [AppUpdateProgress] = [], result: Result<Void, AppUpdateError>?
+        updater.downloadAndInstall(AppUpdate(
+            name: "autobuild", revision: revision,
+            assetURL: URL(string: "https://github.com/notCorwin/Perpetual-Swap-Suite/releases/download/autobuild/Perpetual.Swap.Suite.app.tar")!,
+            expectedSHA256: digest
+        ), progress: { updates.append($0) }) { outcome in
+            result = outcome; finished.fulfill()
+        }
+        await fulfillment(of: [finished], timeout: 8)
+        try XCTUnwrap(result).get()
+        XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("attempts"), encoding: .utf8), "3")
+        XCTAssertTrue(updates.contains { if case .retrying = $0 { return true }; return false })
+        XCTAssertTrue(updates.contains { if case .downloading(let received, let total) = $0 { return received > 0 && received < total }; return false }, "Native download progress must arrive before completion.")
+        XCTAssertTrue(updates.contains { if case .installing = $0 { return true }; return false })
+        XCTAssertEqual(try String(contentsOf: current.appendingPathComponent("Contents/Resources/marker"), encoding: .utf8), revision)
     }
 
     func testInstallRejectsMissingOrMismatchedMonitorBeforeReplacingApp() throws {
@@ -355,4 +395,30 @@ final class AppUpdaterTests: XCTestCase {
             "CFBundlePackageType": "APPL", "CFBundleSourceRevision": marker,
         ], format: .xml, options: 0).write(to: helper.appendingPathComponent("Info.plist"))
     }
+}
+
+private final class UpdateDownloadProtocol: URLProtocol, @unchecked Sendable {
+    private var stream: Task<Void, Never>?
+    override class func canInit(with request: URLRequest) -> Bool { request.value(forHTTPHeaderField: "X-Update-Fixture") != nil }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        do {
+            let root = URL(fileURLWithPath: try XCTUnwrap(request.value(forHTTPHeaderField: "X-Update-Fixture")))
+            let attempts = root.appendingPathComponent("attempts")
+            let count = (try? String(contentsOf: attempts, encoding: .utf8)).flatMap(Int.init) ?? 0
+            try String(count + 1).write(to: attempts, atomically: true, encoding: .utf8)
+            if count < 2 { client?.urlProtocol(self, didFailWithError: URLError(.timedOut)); return }
+            let data = try Data(contentsOf: root.appendingPathComponent("update.tar"))
+            let response = try XCTUnwrap(HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Length": String(data.count)]))
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            stream = Task {
+                for start in stride(from: 0, to: data.count, by: 4096) {
+                    do { try await Task.sleep(for: .milliseconds(20)) } catch { return }
+                    client?.urlProtocol(self, didLoad: data.subdata(in: start..<min(data.count, start + 4096)))
+                }
+                client?.urlProtocolDidFinishLoading(self)
+            }
+        } catch { client?.urlProtocol(self, didFailWithError: error) }
+    }
+    override func stopLoading() { stream?.cancel() }
 }

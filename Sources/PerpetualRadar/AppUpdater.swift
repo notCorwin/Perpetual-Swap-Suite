@@ -58,21 +58,63 @@ enum AppUpdateError: LocalizedError, Sendable {
     }
 }
 
+enum AppUpdateProgress: Sendable {
+    case downloading(received: Int64, total: Int64)
+    case retrying(attempt: Int, total: Int)
+    case installing
+}
+
+protocol AppUpdating: Sendable {
+    @MainActor @discardableResult func cancel() -> Bool
+    @MainActor func check(completion: @escaping AppUpdater.CheckCompletion)
+    @MainActor func downloadAndInstall(
+        _ update: AppUpdate,
+        progress: @escaping AppUpdater.ProgressHandler,
+        completion: @escaping AppUpdater.InstallCompletion
+    )
+}
+
 private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     typealias OversizedHandler = @Sendable (URLSessionDownloadTask) -> Void
+    typealias Completion = @Sendable (URL?, URLResponse?, Error?) -> Void
 
     private let maximumBytes: Int64
+    private let lock = NSLock()
+    private var completions: [Int: Completion] = [:]
     var oversizedHandler: OversizedHandler?
+    var progressHandler: (@Sendable (URLSessionDownloadTask, Int64, Int64) -> Void)?
 
     init(maximumBytes: Int64) {
         self.maximumBytes = maximumBytes
+    }
+
+    func downloadTask(in session: URLSession, request: URLRequest, resumeData: Data? = nil, completion: @escaping Completion) -> URLSessionDownloadTask {
+        // Use delegate-based tasks so streaming progress and size checks run
+        // before completion. The downloaded file lives only during this callback.
+        let task = resumeData.map { session.downloadTask(withResumeData: $0) } ?? session.downloadTask(with: request)
+        lock.lock()
+        completions[task.taskIdentifier] = completion
+        lock.unlock()
+        return task
+    }
+
+    private func takeCompletion(for task: URLSessionTask) -> Completion? {
+        lock.lock()
+        defer { lock.unlock() }
+        return completions.removeValue(forKey: task.taskIdentifier)
     }
 
     func urlSession(
         _ session: URLSession,
         downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
-    ) {}
+    ) {
+        takeCompletion(for: downloadTask)?(location, downloadTask.response, nil)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        takeCompletion(for: task)?(nil, task.response, error)
+    }
 
     func urlSession(
         _ session: URLSession,
@@ -81,21 +123,23 @@ private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelega
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
-        guard totalBytesWritten > maximumBytes || totalBytesExpectedToWrite > maximumBytes else {
-            return
+        if totalBytesWritten > maximumBytes || totalBytesExpectedToWrite > maximumBytes {
+            oversizedHandler?(downloadTask)
+        } else {
+            progressHandler?(downloadTask, totalBytesWritten, totalBytesExpectedToWrite)
         }
-        oversizedHandler?(downloadTask)
     }
 }
 
 // task is protected independently; operationGeneration and installationInProgress share generationLock.
 // Installation work stays off the main actor.
-final class AppUpdater: @unchecked Sendable {
+final class AppUpdater: AppUpdating, @unchecked Sendable {
     // Window visibility is a UI preference; the installer reads it off the main
     // actor and forwards it only for update relaunches, not ordinary launches.
     static let backgroundRelaunchKey = "RelaunchUpdatedRadarInBackground"
     typealias CheckCompletion = @MainActor @Sendable (Result<AppUpdate?, AppUpdateError>) -> Void
     typealias InstallCompletion = @MainActor @Sendable (Result<Void, AppUpdateError>) -> Void
+    typealias ProgressHandler = @MainActor @Sendable (AppUpdateProgress) -> Void
     typealias Relauncher = @Sendable (URL, URL) throws -> Void
 
     private static let appName = "Perpetual Swap Suite"
@@ -137,6 +181,9 @@ final class AppUpdater: @unchecked Sendable {
     private let taskLock = NSLock()
     private let generationLock = NSLock()
     private var task: URLSessionTask?
+    private var downloadProgress: (@Sendable (Int64, Int64) -> Void)?
+    private var reportedDownloadUnit: Int64 = -1
+    private var resumableDownload: (update: AppUpdate, data: Data)?
     private var operationGeneration = 0
     private var installationInProgress = false
     private var oversizedMetadata = false
@@ -151,15 +198,21 @@ final class AppUpdater: @unchecked Sendable {
         self.relauncher = relauncher
         let metadataDelegate = DownloadProgressDelegate(maximumBytes: Self.maxReleaseMetadataBytes)
         self.metadataDelegate = metadataDelegate
+        let metadataConfiguration = session.configuration
+        metadataConfiguration.timeoutIntervalForResource = min(metadataConfiguration.timeoutIntervalForResource, 60)
         self.metadataSession = URLSession(
-            configuration: session.configuration,
+            configuration: metadataConfiguration,
             delegate: metadataDelegate,
             delegateQueue: nil
         )
         let downloadDelegate = DownloadProgressDelegate(maximumBytes: Self.maxDownloadedPackageBytes)
         self.downloadDelegate = downloadDelegate
+        let downloadConfiguration = session.configuration
+        // URLSession's default resource timeout is seven days. Bound the whole
+        // attempt as well as idle time so a stalled release cannot hold the UI.
+        downloadConfiguration.timeoutIntervalForResource = min(downloadConfiguration.timeoutIntervalForResource, 5 * 60)
         self.downloadSession = URLSession(
-            configuration: session.configuration,
+            configuration: downloadConfiguration,
             delegate: downloadDelegate,
             delegateQueue: nil
         )
@@ -168,6 +221,9 @@ final class AppUpdater: @unchecked Sendable {
         }
         downloadDelegate.oversizedHandler = { [weak self] task in
             self?.cancelOversizedDownload(task)
+        }
+        downloadDelegate.progressHandler = { [weak self] task, received, total in
+            self?.reportDownloadProgress(task, received: received, total: total)
         }
     }
 
@@ -228,7 +284,7 @@ final class AppUpdater: @unchecked Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         request.setValue("PerpetualRadar", forHTTPHeaderField: "User-Agent")
-        let task = metadataSession.downloadTask(with: request) { [weak self] location, response, error in
+        let task = metadataDelegate.downloadTask(in: metadataSession, request: request) { [weak self] location, response, error in
             guard let self else { return }
             guard self.isCurrentOperation(generation) else { return }
 
@@ -325,6 +381,7 @@ final class AppUpdater: @unchecked Sendable {
     @MainActor
     func downloadAndInstall(
         _ update: AppUpdate,
+        progress: @escaping ProgressHandler = { _ in },
         completion: @escaping InstallCompletion
     ) {
         guard currentAppURL.pathExtension == "app" else {
@@ -346,22 +403,23 @@ final class AppUpdater: @unchecked Sendable {
             return
         }
 
-        downloadAndInstall(update, attempt: 1, completion: completion)
+        downloadAndInstall(update, attempt: 1, progress: progress, completion: completion)
     }
 
     private func downloadAndInstall(
         _ update: AppUpdate,
         attempt: Int,
+        progress: @escaping ProgressHandler,
         completion: @escaping InstallCompletion
     ) {
         let generation = currentOperationGeneration()
         var request = URLRequest(url: update.assetURL)
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        request.timeoutInterval = 5 * 60
+        request.timeoutInterval = 30
         request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         request.setValue("PerpetualRadar", forHTTPHeaderField: "User-Agent")
-        let task = downloadSession.downloadTask(with: request) { [weak self] location, response, error in
+        let handler: @Sendable (URL?, URLResponse?, Error?) -> Void = { [weak self] location, response, error in
             guard let self else { return }
             guard self.isCurrentOperation(generation) else { return }
 
@@ -374,8 +432,9 @@ final class AppUpdater: @unchecked Sendable {
                 return
             }
             if let error {
+                self.saveResumeData((error as NSError).userInfo[NSURLSessionDownloadTaskResumeData] as? Data, for: update)
                 if self.retryIfNeeded(attempt: attempt, generation: generation, error: error, operation: {
-                    self.downloadAndInstall(update, attempt: attempt + 1, completion: completion)
+                    self.downloadAndInstall(update, attempt: attempt + 1, progress: progress, completion: completion)
                 }) {
                     return
                 }
@@ -400,6 +459,7 @@ final class AppUpdater: @unchecked Sendable {
                 return
             }
             guard (200..<300).contains(response.statusCode) else {
+                self.saveResumeData(nil, for: update)
                 if let until = Self.retryDate(for: response) {
                     self.finish(completion, with: .failure(.rateLimited(until)), generation: generation)
                     return
@@ -409,7 +469,7 @@ final class AppUpdater: @unchecked Sendable {
                     generation: generation,
                     statusCode: response.statusCode,
                     operation: {
-                        self.downloadAndInstall(update, attempt: attempt + 1, completion: completion)
+                        self.downloadAndInstall(update, attempt: attempt + 1, progress: progress, completion: completion)
                     }
                 ) {
                     return
@@ -448,10 +508,16 @@ final class AppUpdater: @unchecked Sendable {
 
             do {
                 try self.verifySHA256(of: location, expected: update.expectedSHA256)
+                self.saveResumeData(nil, for: update)
                 guard self.beginInstallation(for: generation) else { return }
+                Task { @MainActor in
+                    guard self.isCurrentOperation(generation) else { return }
+                    progress(.installing)
+                }
                 try self.install(downloadedFile: location, expectedRevision: update.revision)
                 self.finish(completion, with: .success(()), generation: generation)
             } catch {
+                self.saveResumeData(nil, for: update)
                 self.finish(
                     completion,
                     with: .failure(error as? AppUpdateError ?? .installFailed(error.localizedDescription)),
@@ -459,7 +525,17 @@ final class AppUpdater: @unchecked Sendable {
                 )
             }
         }
-        setTask(task)
+        let task = downloadDelegate.downloadTask(in: downloadSession, request: request, resumeData: resumeData(for: update), completion: handler)
+        setTask(task, downloadProgress: { [weak self] received, total in
+            Task { @MainActor in
+                guard let self, self.isCurrentOperation(generation) else { return }
+                progress(.downloading(received: received, total: total))
+            }
+        })
+        Task { @MainActor in
+            guard self.isCurrentOperation(generation) else { return }
+            progress(attempt == 1 ? .downloading(received: 0, total: 0) : .retrying(attempt: attempt, total: Self.maxAttempts))
+        }
         task.resume()
     }
 
@@ -758,9 +834,11 @@ final class AppUpdater: @unchecked Sendable {
         return task != nil
     }
 
-    private func setTask(_ task: URLSessionTask?) {
+    private func setTask(_ task: URLSessionTask?, downloadProgress: (@Sendable (Int64, Int64) -> Void)? = nil) {
         taskLock.lock()
         self.task = task
+        self.downloadProgress = downloadProgress
+        reportedDownloadUnit = -1
         if task == nil {
             oversizedMetadata = false
             oversizedDownload = false
@@ -772,10 +850,45 @@ final class AppUpdater: @unchecked Sendable {
         taskLock.lock()
         let task = self.task
         self.task = nil
+        downloadProgress = nil
         oversizedMetadata = false
         oversizedDownload = false
         taskLock.unlock()
         task?.cancel()
+    }
+
+    private func reportDownloadProgress(_ task: URLSessionDownloadTask, received: Int64, total: Int64) {
+        taskLock.lock()
+        // Update menus once per percentage point (or MiB for unknown lengths),
+        // rather than enqueueing a main-actor job for every network chunk.
+        let unit = total > 0 ? received * 100 / total : received / (1024 * 1024)
+        guard self.task === task, unit != reportedDownloadUnit else {
+            taskLock.unlock()
+            return
+        }
+        reportedDownloadUnit = unit
+        let report = downloadProgress
+        taskLock.unlock()
+        report?(received, total)
+    }
+
+    private func saveResumeData(_ data: Data?, for update: AppUpdate) {
+        taskLock.lock()
+        resumableDownload = data.map { (update, $0) }
+        taskLock.unlock()
+    }
+
+    private func resumeData(for update: AppUpdate) -> Data? {
+        taskLock.lock()
+        defer { taskLock.unlock() }
+        guard let saved = resumableDownload,
+              saved.update.revision == update.revision,
+              saved.update.assetURL == update.assetURL,
+              saved.update.expectedSHA256 == update.expectedSHA256 else {
+            resumableDownload = nil
+            return nil
+        }
+        return saved.data
     }
 
     private func cancelOversizedMetadata(_ task: URLSessionDownloadTask) {
