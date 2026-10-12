@@ -302,7 +302,7 @@ final class ResearchController {
                 try store.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
             }
         }
-        task = Task.detached(priority: .background) { [self, worker] in
+        task = Task.detached(priority: .userInitiated) { [self, worker] in
             do {
                 let plan = try await ResearchRecovery.run(onRetry: { delay, reason in await self.retry(id, delay: delay, reason: reason) }) {
                     let plan = try await worker.plan(spec, refresh: refresh, owner: study.id, catalogProgress: { update in
@@ -338,7 +338,7 @@ final class ResearchController {
                 try store.put(study.id, kind: "study", study)
             }
         }
-        task = Task.detached(priority: .background) { [self, worker] in
+        task = Task.detached(priority: .userInitiated) { [self, worker] in
             do {
                 let prepared = try await ResearchRecovery.run(onRetry: { delay, reason in await self.retry(id, delay: delay, reason: reason) }) {
                     try await worker.prepare(study, plan: plan) { n, total, update in await self.advance(id, completed: n, total: total, message: update.filename, preparation: update) }
