@@ -393,11 +393,17 @@ final class ResearchDataProvider {
         }
         plan.sources = Array(Dictionary(plan.sources.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a }).values).sorted { ($0.instrument, $0.kind, $0.from) < ($1.instrument, $1.kind, $1.from) }
         let cacheCounter = ResearchPlanningCounter(stage: "cache", unit: "sources", total: plan.sources.count)
+        // shortcut: Batch file existence checks instead of one-by-one for faster planning.
+        await progress(cacheCounter.update(0, "Checking cached source files (batch)"))
+        let savedSources = try Dictionary(uniqueKeysWithValues: store.objects("source", as: ResearchSource.self).filter { $0.rawHash != nil }.map { ($0.id, $0) })
+        let fileManager = FileManager.default
         for index in plan.sources.indices {
             try Task.checkCancellation()
-            await progress(cacheCounter.update(index, "Checking cached source files · \(plan.sources[index].filename)"))
-            plan.sources[index].cached = try store.rawIsComplete(plan.sources[index])
-            await progress(cacheCounter.update(index + 1, "Cached source checked · \(plan.sources[index].filename)"))
+            let source = plan.sources[index]
+            plan.sources[index].cached = savedSources[source.id].map { fileManager.fileExists(atPath: store.rawURL($0).path) } ?? false
+            if (index + 1) % 50 == 0 || index + 1 == plan.sources.count {
+                await progress(cacheCounter.update(index + 1, "Cached sources checked · \(index + 1)/\(plan.sources.count)"))
+            }
         }
         plan.warnings = Array(Set(plan.warnings)).sorted()
         plan.coverage = try await store.coverageWithProgress(inputs, from: max(0, first-Int64(warmup+1)*hourMS), through: last, progress: progress)
