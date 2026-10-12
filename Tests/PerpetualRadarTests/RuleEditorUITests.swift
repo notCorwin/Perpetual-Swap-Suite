@@ -779,6 +779,70 @@ final class RuleEditorUITests: BackgroundTestCase {
     }
 
     @MainActor
+    func testSavedResearchErrorsWrapInsideTheirColumnAndStaySeparateFromTheCurrentTask() async throws {
+        guard ProcessInfo.processInfo.environment["RADAR_UI_TESTS"] == "1" else { throw XCTSkip("Run npm run test:ui after building the Web renderer.") }
+        let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist")), configuration = uiConfiguration()
+        let directory = bridge.directory.appendingPathComponent("Research"), store = try ResearchStore(directory: directory)
+        try ResearchFixture.seed(store)
+        var oldSpec = try ResearchFixture.spec(); oldSpec.name = "Historical failed study"
+        var failed = ResearchStudy(spec: oldSpec, planID: "old-plan"); failed.createdAt = researchNow() - 3_600_000
+        let savedError = "BTC-USDT-SWAP · BTC-USDT-SWAP-candlesticks-2021-09.zip: 43200 invalid archive records; the file was kept for retry, and coverage was not marked complete.\n" + String(repeating: "long-record-name-", count: 35)
+        var checkpoint = Checkpoint(studyID: failed.id, phase: "failed"); checkpoint.error = savedError; checkpoint.updatedAt = failed.createdAt + 60_000
+        try store.put(failed.id, kind: "study", failed); try store.put("checkpoint:\(failed.id)", kind: "checkpoint", checkpoint)
+        var currentSpec = try ResearchFixture.spec(); currentSpec.name = "Current preparing study"
+        var plan = ResearchFixture.plan(currentSpec)
+        plan.sources = [.init(id: "current-source", instrument: ResearchFixture.instrument.id, kind: "candle", from: ResearchFixture.hour, through: ResearchFixture.hour + 2 * hourMS,
+            url: ResearchDataProvider.url("/market/history-candles", [("after", String(ResearchFixture.hour + 3 * hourMS))]).absoluteString, filename: "Current history range", archive: false)]
+        try store.put(plan.id, kind: "plan", plan)
+        let controller = try ResearchController(directory: directory, transport: ResearchFixtureTransport(delay: .seconds(60)), radarURL: directory.appendingPathComponent("absent"))
+        bridge.research = controller
+        _ = try controller.prepare(planID: plan.id)
+        configuration.userContentController.addScriptMessageHandler(bridge, contentWorld: .page, name: "radar")
+        configuration.setURLSchemeHandler(bridge, forURLScheme: "radar")
+        let window = BackgroundTestWindow(contentRect: NSRect(x: 0, y: 0, width: 1440, height: 900), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        let view = WKWebView(frame: .zero, configuration: configuration), background = WindowBackgroundView(contentView: view)
+        bridge.windowBackground = background; window.contentView = background; present(window)
+        defer { view.stopLoading(); window.orderOut(nil); configuration.userContentController.removeScriptMessageHandler(forName: "radar", contentWorld: .page); bridge.cleanUp(); Task { try? await controller.stop() } }
+        view.load(URLRequest(url: URL(string: "radar://app/index.html")!))
+        try await wait(view, "document.querySelector('[data-mode-switch=radar]') !== null")
+        try await click(view, "Perpetual Swap Radar")
+        try await wait(view, "document.querySelector('[data-research-task]')?.innerText.includes('Preparing data')")
+        try await click(view, "Studies & cache")
+        try await wait(view, "document.querySelector('table[aria-label=\"Saved studies\"]')?.innerText.includes('Current task')")
+        let collapsed = try await js(view, "(() => { const details = document.querySelector('[data-study-error]'); return !details.open && details.getBoundingClientRect().height <= details.querySelector('summary').getBoundingClientRect().height + 2; })()") as? Bool
+        XCTAssertEqual(collapsed, true, "Saved errors must start collapsed so they cannot cover neighboring actions.")
+        _ = try await js(view, "document.querySelector('[data-study-error] summary').click(); true")
+        try await wait(view, "document.querySelector('[data-study-error]').open")
+        for width in [1440.0, 960.0] {
+            window.setContentSize(NSSize(width: width, height: 900))
+            try await Task.sleep(for: .milliseconds(100))
+            let fits = try await js(view, """
+            (() => {
+              const details = document.querySelector('[data-study-error]'), row = details.closest('tr'), cell = details.closest('td');
+              const error = details.querySelector('p:last-child'), bounds = cell.getBoundingClientRect(), text = error.getBoundingClientRect();
+              const actions = row.cells[3].getBoundingClientRect(), buttons = Array.from(row.cells[3].querySelectorAll('button'));
+              return getComputedStyle(cell).whiteSpace === 'normal' && getComputedStyle(error).whiteSpace === 'pre-wrap'
+                && error.scrollWidth <= error.clientWidth + 1 && text.left >= bounds.left && text.right <= bounds.right + 1
+                && text.right <= actions.left && buttons.every(button => { const b=button.getBoundingClientRect(); return b.left >= actions.left && b.right <= actions.right + 1; });
+            })()
+            """) as? Bool
+            XCTAssertEqual(fits, true, "Expanded long errors and every action must stay inside their columns at \(width)px.")
+        }
+        let errorText = try await js(view, "document.querySelector('[data-study-error] p:last-child').textContent") as? String
+        XCTAssertEqual(errorText, savedError, "The complete saved error must remain readable.")
+        let currentIsClear = try await js(view, "!document.querySelector('[data-research-task] [role=alert]') && !document.querySelector('[data-research-task]').innerText.includes('43200 invalid archive records')") as? Bool
+        XCTAssertEqual(currentIsClear, true, "A historical failure must not become the current task's error.")
+        let image = try await view.takeSnapshot(configuration: nil)
+        let snapshot = project.appendingPathComponent(".build/ui-qa/research-saved-errors.png")
+        try FileManager.default.createDirectory(at: snapshot.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
+        try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: snapshot)
+        XCTAssertEqual(try store.get("checkpoint:\(failed.id)", as: Checkpoint.self)?.error, savedError)
+        try await controller.stop()
+    }
+
+    @MainActor
     func testNotificationSettingsPermissionRecoveryAndContractRoutingInNativeWebKit() async throws {
         guard ProcessInfo.processInfo.environment["RADAR_UI_TESTS"] == "1" else { throw XCTSkip("Run npm run test:ui after building the Web renderer.") }
         let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()

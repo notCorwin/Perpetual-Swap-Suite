@@ -127,6 +127,8 @@ Missing prices, funding, or other required inputs remain Unknown or make affecte
 
 Downloaded inputs and checkpoints persist without automatic expiry. **Clear unreferenced cache** removes only inputs no longer referenced by experiments.
 
+**Studies & cache** marks the current task separately from saved failures. Expand **Saved error** to read a study's complete previous error and its saved timestamp. **Resume** retries that study using its cached inputs.
+
 Planning reports each stage separately, including local history ranges, cached source files, and hourly input coverage. Local coverage checks run in bounded time ranges and report measured progress, the current instrument/input/range, and an estimate for the current stage. Pause stops between ranges; failures retain the last progress and a checkpoint error. Published archive catalog checks and file downloads use their own progress units and wording.
 
 Older OKX candle archives may contain `None` for currency volumes while their prices and contract volumes are valid. Research imports complete hourly OHLC, converts available contract volume with verified contract metadata, and records missing quote-currency volume as Unknown. Missing currency volume does not fail the entire archive; VWAP and volume-dependent readings require the corresponding actual inputs. Retrying after a parser update reuses cached originals.

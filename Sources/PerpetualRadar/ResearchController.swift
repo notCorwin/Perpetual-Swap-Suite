@@ -378,6 +378,8 @@ final class ResearchController {
                 let checkpoint = try store.get("checkpoint:\(study.id)", as: Checkpoint.self)
                 item["phase"] = activeStudyID == study.id && isBusy ? status?.phase ?? "running" : ["running", "preparing", "planning"].contains(checkpoint?.phase ?? "") ? "paused" : checkpoint?.phase ?? "paused"
                 item["error"] = checkpoint?.error ?? ""
+                item["active"] = activeStudyID == study.id && isBusy
+                item["updatedAt"] = checkpoint?.updatedAt ?? study.createdAt
                 studies.append(item)
             }
             return ["job": try status.map(snapshot) ?? NSNull(), "studies": studies, "cacheDirectory": store.directory.path,
