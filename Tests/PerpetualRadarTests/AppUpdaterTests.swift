@@ -411,12 +411,12 @@ private final class UpdateDownloadProtocol: URLProtocol, @unchecked Sendable {
             let data = try Data(contentsOf: root.appendingPathComponent("update.tar"))
             let response = try XCTUnwrap(HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Length": String(data.count)]))
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            stream = Task {
+            stream = Task { @Sendable [self, data] in
                 for start in stride(from: 0, to: data.count, by: 4096) {
                     do { try await Task.sleep(for: .milliseconds(20)) } catch { return }
-                    client?.urlProtocol(self, didLoad: data.subdata(in: start..<min(data.count, start + 4096)))
+                    self.client?.urlProtocol(self, didLoad: data.subdata(in: start..<min(data.count, start + 4096)))
                 }
-                client?.urlProtocolDidFinishLoading(self)
+                self.client?.urlProtocolDidFinishLoading(self)
             }
         } catch { client?.urlProtocol(self, didFailWithError: error) }
     }
