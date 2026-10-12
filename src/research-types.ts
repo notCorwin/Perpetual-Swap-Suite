@@ -36,9 +36,12 @@ export type ResearchChartData = ChartResponse & { endHour: number; oldestHour?: 
 export type ResearchRequest = { action: string; spec?: StudySpec; refresh?: boolean; planID?: string; studyID?: string; eventID?: string; offset?: number; endHour?: number; kind?: string; profileID?: string; instrument?: string; model?: string }
 export type ResearchResponse = { jobID?: string; job?: ResearchJob | null; studies?: ResearchStudy[]; plan?: DataPlan; estimatedBytes?: number; study?: ResearchStudy; report?: StudyReport | null; manifest?: DataManifest | null; events?: ResearchEvent[]; count?: number; chart?: ResearchChartData; cacheDirectory?: string; cachedRows?: number; rawFiles?: number; bytesRemoved?: number; ok?: boolean; cancelled?: boolean }
 export const requestResearch = (request: ResearchRequest) => window.webkit.messageHandlers.radar.postMessage({ research: request })
-export const researchPercent = (value: number | null | undefined) => value == null ? '—' : new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 3 }).format(value)
-export const researchTime = (timestamp: number) => new Date(timestamp).toLocaleString('en-US', { year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC', timeZoneName: 'short' })
-export const researchSize = (bytes: number) => new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(bytes / (bytes >= 1_000_000_000 ? 1_000_000_000 : 1_000_000)) + (bytes >= 1_000_000_000 ? ' GB' : ' MB')
+const percentFormatter = new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 3 })
+const timeFormatter = new Intl.DateTimeFormat('en-US', { year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC', timeZoneName: 'short' })
+const sizeFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 })
+export const researchPercent = (value: number | null | undefined) => value == null ? '—' : percentFormatter.format(value)
+export const researchTime = (timestamp: number) => timeFormatter.format(timestamp)
+export const researchSize = (bytes: number) => sizeFormatter.format(bytes / (bytes >= 1_000_000_000 ? 1_000_000_000 : 1_000_000)) + (bytes >= 1_000_000_000 ? ' GB' : ' MB')
 export function researchDateRange(from: string, through: string, now = Date.now()): { from: number | null; through: number } {
   const start = from ? Date.parse(from + 'T00:00:00Z') : null
   const end = through ? Date.parse(through + 'T00:00:00Z') + 24 * RESEARCH_HOUR : now

@@ -747,6 +747,101 @@ final class RuleEditorUITests: BackgroundTestCase {
     }
 
     @MainActor
+    func testLargeResearchDataPlanKeepsWorkspaceSwitchingResponsive() async throws {
+        guard ProcessInfo.processInfo.environment["RADAR_UI_TESTS"] == "1" else { throw XCTSkip("Run after building the Web renderer.") }
+        let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist"), marketCount: 500), configuration = uiConfiguration()
+        let directory = bridge.directory.appendingPathComponent("Research"), store = try ResearchStore(directory: directory)
+        var plan = ResearchFixture.plan(try ResearchFixture.spec())
+        plan.spec.name = "All contracts data plan"
+        plan.instruments = (0..<500).map { index in
+            var instrument = ResearchFixture.instrument; instrument.id = "PLAN\(index)-USDT-SWAP"; return instrument
+        }
+        plan.referenceInstruments = [ResearchFixture.instrument]
+        plan.sources = plan.instruments.flatMap { instrument in
+            (0..<12).map { index in
+                ResearchSource(id: "\(instrument.id):\(index)", instrument: instrument.id, kind: "candle", from: plan.from, through: plan.through,
+                    url: "https://www.okx.com/fixture", filename: "\(instrument.id)-\(index).zip", archive: true)
+            }
+        }
+        plan.coverage = plan.inputInstruments.flatMap { instrument in
+            ["candle", "stat", "funding"].map { kind in
+                ResearchCoverage(instrument: instrument.id, kind: kind, available: 120, expected: 240, first: plan.from, last: plan.through,
+                    gaps: (0..<64).map { index in .init(from: plan.from + Int64(index * 2) * hourMS, through: plan.from + Int64(index * 2) * hourMS) })
+            }
+        }
+        try store.put(plan.id, kind: "plan", plan)
+        bridge.research = try ResearchController(directory: directory, transport: ResearchFixtureTransport(), radarURL: bridge.directory.appendingPathComponent("absent"))
+        bridge.researchJobOverride = ["id": "large-plan", "phase": "planned", "resultID": plan.id, "completed": 1, "total": 1, "message": "Plan ready", "error": ""]
+        configuration.userContentController.addScriptMessageHandler(bridge, contentWorld: .page, name: "radar")
+        configuration.setURLSchemeHandler(bridge, forURLScheme: "radar")
+        let window = BackgroundTestWindow(contentRect: NSRect(x: 0, y: 0, width: 1440, height: 900), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        let view = WKWebView(frame: .zero, configuration: configuration)
+        window.contentView = view; present(window)
+        defer { view.stopLoading(); window.orderOut(nil); configuration.userContentController.removeScriptMessageHandler(forName: "radar", contentWorld: .page); bridge.cleanUp() }
+        view.load(URLRequest(url: URL(string: "radar://app/index.html")!))
+        try await showAllMarkets(view)
+        try await click(view, "Perpetual Swap Radar")
+        try await wait(view, "document.querySelector('table[aria-label=\"Planned data sources\"] tbody tr') !== null")
+        try await wait(view, "!document.querySelector('table[aria-label=\"Frozen input coverage\"]') && !document.querySelector('table[aria-label=\"Historical instrument catalog\"]')")
+        try await click(view, "Last sources")
+        try await wait(view, "document.querySelector('table[aria-label=\"Planned data sources\"] tbody').lastElementChild.innerText.includes('PLAN499-USDT-SWAP-11.zip')")
+        try await click(view, "First sources"); try await click(view, "Next sources")
+        try await wait(view, "document.querySelector('table[aria-label=\"Planned data sources\"] tbody').firstElementChild.innerText.includes('PLAN4-USDT-SWAP-2.zip')")
+
+        for expanded in [false, true] {
+            if expanded {
+                try await click(view, "Local input coverage and data gaps")
+                try await wait(view, "document.querySelectorAll('table[aria-label=\"Frozen input coverage\"] tbody tr').length === 50")
+                try await click(view, "Missing intervals for PLAN0-USDT-SWAP candle")
+                try await wait(view, "document.querySelectorAll('div[aria-label=\"Missing intervals for PLAN0-USDT-SWAP candle\"] p').length === 50")
+                try await click(view, "Next gaps for PLAN0-USDT-SWAP candle")
+                try await wait(view, "document.querySelectorAll('div[aria-label=\"Missing intervals for PLAN0-USDT-SWAP candle\"] p').length === 14")
+                try await click(view, "Last coverage")
+                try await wait(view, "document.querySelectorAll('table[aria-label=\"Frozen input coverage\"] tbody tr').length === 3 && document.querySelector('table[aria-label=\"Frozen input coverage\"]').innerText.includes('BTC-USDT-SWAPReference')")
+                try await click(view, "First coverage"); try await click(view, "Next coverage")
+                try await click(view, "Missing intervals for PLAN16-USDT-SWAP funding")
+                try await click(view, "Next gaps for PLAN16-USDT-SWAP funding")
+                try await click(view, "Historical instrument eligibility and sources")
+                try await wait(view, "document.querySelectorAll('table[aria-label=\"Historical instrument catalog\"] tbody tr').length === 50")
+                try await click(view, "Last instruments")
+                try await wait(view, "document.querySelectorAll('table[aria-label=\"Historical instrument catalog\"] tbody tr').length === 1 && document.querySelector('table[aria-label=\"Historical instrument catalog\"]').innerText.includes('BTC-USDT-SWAP')")
+                try await click(view, "First instruments"); try await click(view, "Next instruments")
+            }
+            for _ in 0..<2 {
+                for mode in ["research", "radar"] {
+                    let elapsed = try await view.callAsyncJavaScript("""
+                        const start = performance.now();
+                        document.querySelector('[data-mode-switch=' + mode + ']').click();
+                        const target = mode === 'research' ? 'radar' : 'research';
+                        await new Promise((resolve, reject) => {
+                            const check = () => {
+                                const button = document.querySelector('[data-mode-switch=' + target + ']');
+                                if (button && !button.disabled && button.getBoundingClientRect().height > 0 && document.activeElement === button) {
+                                    requestAnimationFrame(() => requestAnimationFrame(resolve)); return;
+                                }
+                                if (performance.now() - start > 5000) { reject(new Error('Workspace switch stalled')); return; }
+                                requestAnimationFrame(check);
+                            };
+                            requestAnimationFrame(check);
+                        });
+                        return performance.now() - start;
+                        """, arguments: ["mode": mode], in: nil, contentWorld: .page) as? Double
+                    print("Large data plan \(mode) switch (expanded: \(expanded)): \(elapsed ?? -1)ms")
+                    XCTAssertLessThan(try XCTUnwrap(elapsed), 500, "Switching with an all-contract data plan must remain interactive.")
+                }
+            }
+            try await wait(view, "document.querySelector('table[aria-label=\"Planned data sources\"] tbody').firstElementChild.innerText.includes('PLAN4-USDT-SWAP-2.zip')")
+            if expanded {
+                try await wait(view, "document.querySelector('table[aria-label=\"Frozen input coverage\"] tbody').firstElementChild.innerText.includes('PLAN16-USDT-SWAP') && document.querySelector('table[aria-label=\"Historical instrument catalog\"] tbody').firstElementChild.innerText.includes('PLAN50-USDT-SWAP')")
+                try await wait(view, "document.querySelectorAll('div[aria-label=\"Missing intervals for PLAN16-USDT-SWAP funding\"] p').length === 14")
+            }
+        }
+        try await click(view, "Configure"); try await click(view, "Data coverage")
+        try await wait(view, "document.querySelector('table[aria-label=\"Planned data sources\"] tbody').firstElementChild.innerText.includes('PLAN4-USDT-SWAP-2.zip')")
+    }
+
+    @MainActor
     func testResearchReportSwitchIgnoresLateEventsFromThePreviousStudy() async throws {
         let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist"), marketCount: 8), configuration = uiConfiguration()
