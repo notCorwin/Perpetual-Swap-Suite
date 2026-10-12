@@ -1209,7 +1209,7 @@ final class RuleEditorUITests: BackgroundTestCase {
             const parent = element.parentElement?.closest('[data-surface="control"], [data-surface="panel"], [data-surface="floating"]');
             const nativeTable = document.documentElement.dataset.nativeWindowBackground === 'true' && element.closest('[data-slot="table-container"]');
             const inherited = role === 'inherited' || role !== 'floating' && (parent || nativeTable && role === 'control');
-            const expected = role === 'floating' ? 24 : p === 1 || inherited ? 0 : ({control:12,panel:16}[role] ?? 0) * (1-p);
+            const expected = role === 'floating' ? 64 : p === 1 || inherited ? 0 : ({control:12,panel:16}[role] ?? 0) * (1-p);
             if (Math.abs(radius - expected) > 0.05 || expected === 0 && filter !== 'none') issues.push(`${element.dataset.slot ?? element.tagName} ${role}: filter=${filter}, expected=${expected}`);
             if (role === 'floating' && style.transitionProperty !== 'none') issues.push(`${element.dataset.slot ?? element.tagName}: implicit material transition`);
             if (role === 'floating' && style.backgroundImage !== 'none') issues.push(`${element.dataset.slot ?? element.tagName}: tinted glass gradient`);
@@ -1574,17 +1574,17 @@ final class RuleEditorUITests: BackgroundTestCase {
         let query = String(data: try JSONEncoder().encode(selector), encoding: .utf8)!
         let bounds = try await js(view, """
         (() => {
-          // Put high-contrast content behind the real portaled surface in the
-          // scaled app. Hide only its children so its own material is sampled.
+          // Large checkerboard tiles model app blocks, not just fine text.
+          // Hide only the real portaled surface's children to sample its material.
           const fixture = document.createElement('div'); fixture.id = 'floating-pixel-fixture';
-          fixture.style.cssText = 'position:absolute;inset:0;z-index:49;pointer-events:none;background:repeating-linear-gradient(90deg,#000 0px,#000 4px,#fff 4px,#fff 8px)';
+          fixture.style.cssText = 'position:absolute;inset:0;z-index:49;pointer-events:none;background:conic-gradient(#000 25%,#fff 0 50%,#000 0 75%,#fff 0) 0 0 / 128px 128px';
           const source = document.querySelector(\(query));
           source.dataset.qaFloatingTest = 'true';
           const hideContent = document.createElement('style'); hideContent.id = 'floating-pixel-style';
           hideContent.textContent = '[data-qa-floating-test] > * { visibility:hidden!important }';
           document.querySelector('[data-market-list-content]').append(fixture);
           document.body.append(hideContent);
-          window.radarSurfaceFixture = { source, style:source.style.cssText };
+          window.radarSurfaceFixture = { source, style:source.style.cssText, backdrop:fixture.style.background };
           return source.getBoundingClientRect().toJSON();
         })()
         """) as? [String: Double]
@@ -1605,8 +1605,8 @@ final class RuleEditorUITests: BackgroundTestCase {
             let values = samples.map { $0.reduce(0, +) / 3 }
             return values.max()! - values.min()!
         }
-        // Clear glass must soften fine detail while retaining the backdrop's
-        // color. An opaque fill could hide stripes but would fail this change.
+        // Clear glass must diffuse broad shapes while retaining the backdrop's
+        // color. An opaque fill could hide the tiles but would fail this change.
         let blurredSamples = try samples(bitmap), softened = contrast(blurredSamples)
         _ = try await js(view, "document.querySelector('#floating-pixel-fixture').style.background='rgb(32 128 224)'; true")
         try await settleRendering(view)
@@ -1617,7 +1617,7 @@ final class RuleEditorUITests: BackgroundTestCase {
             backdropResponse += zip(before, after).map { abs($0 - $1) }.max()!
         }
         backdropResponse /= Double(blurredSamples.count)
-        _ = try await js(view, "document.querySelector('#floating-pixel-fixture').style.background='repeating-linear-gradient(90deg,#000 0px,#000 4px,#fff 4px,#fff 8px)'; window.radarSurfaceFixture.source.style.backdropFilter='none'; window.radarSurfaceFixture.source.style.webkitBackdropFilter='none'; true")
+        _ = try await js(view, "document.querySelector('#floating-pixel-fixture').style.background=window.radarSurfaceFixture.backdrop; window.radarSurfaceFixture.source.style.backdropFilter='none'; window.radarSurfaceFixture.source.style.webkitBackdropFilter='none'; true")
         try await settleRendering(view)
         let reference = try await nativeRendererSnapshot(view)
         let referenceBitmap = try XCTUnwrap(NSBitmapImageRep(data: reference.tiffRepresentation!))
@@ -1625,7 +1625,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         _ = try await js(view, "(() => { const {source,style}=window.radarSurfaceFixture; source.style.cssText=style; delete source.dataset.qaFloatingTest; delete window.radarSurfaceFixture; document.querySelector('#floating-pixel-fixture').remove(); document.querySelector('#floating-pixel-style').remove(); return true; })()")
         print("Floating pixel contrast \(name) \(theme): softened=\(softened), exposed=\(exposed), backdropResponse=\(backdropResponse)")
         XCTAssertGreaterThan(exposed, 0.15, "The reference must expose high-contrast app content behind the floating surface.")
-        XCTAssertLessThan(softened, exposed * 0.1, "Glass blur must suppress fine backdrop detail without blurring its own content.")
+        XCTAssertLessThan(softened, exposed * 0.1, "Glass blur must suppress broad backdrop shapes without blurring its own content.")
         XCTAssertGreaterThan(backdropResponse, 0.1, "Untinted glass must retain the backdrop's colors instead of covering them with a solid fill.")
         try FileManager.default.createDirectory(at: project.appendingPathComponent(".build/ui-qa"), withIntermediateDirectories: true)
         try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: project.appendingPathComponent(".build/ui-qa/floating-blur-\(name)-\(theme).png"))

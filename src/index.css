@@ -122,7 +122,8 @@
     --overlay-default-opacity: 0.12;
     --control-blur: calc((1 - var(--window-background-opacity)) * 12px);
     --panel-blur: calc((1 - var(--window-background-opacity)) * 16px);
-    --floating-blur: 24px;
+    /* Broad blur diffuses underlying text and blocks without adding a tint. */
+    --floating-blur: 64px;
     --control-filter: none;
     --panel-filter: none;
     --floating-filter: blur(var(--floating-blur));
