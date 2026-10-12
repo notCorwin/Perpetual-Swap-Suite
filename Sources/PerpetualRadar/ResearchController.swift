@@ -36,46 +36,103 @@ actor ResearchWorker {
         return plan
     }
     func prepare(_ study: ResearchStudy, plan: DataPlan, progress: @escaping @Sendable (Int, Int, ResearchPreparationProgress) async -> Void) async throws -> ResearchStudy {
-        let store = try ResearchStore(directory: directory), provider = ResearchDataProvider(store: store, transport: transport, radarURL: radarURL)
         let plan = try plan.excludingSpread()
-        var checkpoint = try store.get("checkpoint:\(study.id)", as: Checkpoint.self) ?? Checkpoint(studyID: study.id, phase: "preparing")
-        try store.pinInputs(plan, owner: study.id)
-        checkpoint.phase = "preparing"; checkpoint.error = nil; try store.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
-        var measuredSeconds = 0.0, measuredSources = 0
-        for (index, source) in plan.sources.enumerated() {
-            try Task.checkCancellation()
-            if checkpoint.completedSources.contains(source.id) { continue }
+        let initialStore = try ResearchStore(directory: directory)
+        var checkpoint = try initialStore.get("checkpoint:\(study.id)", as: Checkpoint.self) ?? Checkpoint(studyID: study.id, phase: "preparing")
+        try initialStore.pinInputs(plan, owner: study.id)
+        checkpoint.phase = "preparing"; checkpoint.error = nil; try initialStore.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
+        
+        // Filter sources that need preparation
+        let completedIDs = Set(checkpoint.completedSources)
+        let pendingSources = plan.sources.enumerated().filter { !completedIDs.contains($0.element.id) }
+        
+        // Concurrent preparation with progress tracking
+        let coordinator = PreparationCoordinator(total: plan.sources.count, alreadyCompleted: completedIDs.count)
+        let inputs = pendingSources.map { ($0.offset, $0.element) }
+        
+        // Each concurrent task gets its own store and provider to avoid shared state issues
+        try await ResearchLocalScan.run(inputs, operation: { [directory, transport, radarURL] (_: Int, item: (Int, ResearchSource)) -> PreparedSource in
+            let (index, source) = item
             let started = ContinuousClock.now
-            let estimate = measuredSources > 0 ? measuredSeconds / Double(measuredSources) * Double(plan.sources.count - index) : nil
+            // Create isolated store and provider for this task
+            let taskStore = try ResearchStore(directory: directory)
+            let taskProvider = ResearchDataProvider(store: taskStore, transport: transport, radarURL: radarURL)
             do {
-                try await provider.prepare(source, instruments: plan.inputInstruments) { update in
+                try await taskProvider.prepare(source, instruments: plan.inputInstruments) { update in
                     var update = update
+                    let (completed, estimate) = await coordinator.estimateRemaining(for: index)
                     if let estimate {
                         let remaining = max(update.fileRemainingSeconds ?? 0, estimate - researchSeconds(started.duration(to: .now)))
                         update.remainingSeconds = remaining > 0 ? remaining : nil
                     }
-                    await progress(index, plan.sources.count, update)
+                    await progress(completed, plan.sources.count, update)
                 }
+                let elapsed = researchSeconds(started.duration(to: .now))
+                return PreparedSource(index: index, source: source, elapsed: elapsed, error: nil)
             } catch {
                 if Task.isCancelled { throw error }
                 throw FilterError("\(source.instrument) · \(source.filename): \(error.localizedDescription)")
             }
-            measuredSeconds += researchSeconds(started.duration(to: .now)); measuredSources += 1
-            try store.pinInputs(plan, owner: study.id)
-            checkpoint.completedSources.append(source.id); checkpoint.updatedAt = researchNow()
-            try store.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
-            await progress(index + 1, plan.sources.count, .init(stage: "prepared", filename: source.filename, instrument: source.instrument))
+        }) { [directory] (_: Int, result: PreparedSource) in
+            try Task.checkCancellation()
+            let completed = await coordinator.recordCompletion(result)
+            // Use main store for checkpoint updates to serialize writes
+            let checkpointStore = try ResearchStore(directory: directory)
+            try checkpointStore.pinInputs(plan, owner: study.id)
+            var updatedCheckpoint = try checkpointStore.get("checkpoint:\(study.id)", as: Checkpoint.self) ?? checkpoint
+            if !updatedCheckpoint.completedSources.contains(result.source.id) {
+                updatedCheckpoint.completedSources.append(result.source.id)
+            }
+            updatedCheckpoint.updatedAt = researchNow()
+            try checkpointStore.put("checkpoint:\(study.id)", kind: "checkpoint", updatedCheckpoint)
+            await progress(completed, plan.sources.count, .init(stage: "prepared", filename: result.source.filename, instrument: result.source.instrument))
         }
+        
         try Task.checkCancellation()
         await progress(plan.sources.count, plan.sources.count, .init(stage: "freezing", filename: "Freezing verified local inputs…", instrument: ""))
-        let manifest = try store.freeze(plan)
+        let finalStore = try ResearchStore(directory: directory)
+        let manifest = try finalStore.freeze(plan)
         var result = study; result.spec = plan.spec; result.manifestID = manifest.id
+        checkpoint = try finalStore.get("checkpoint:\(study.id)", as: Checkpoint.self) ?? checkpoint
         checkpoint.phase = "ready"; checkpoint.updatedAt = researchNow()
-        try store.database.transaction {
-            try store.put(result.id, kind: "study", result)
-            try store.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
+        try finalStore.database.transaction {
+            try finalStore.put(result.id, kind: "study", result)
+            try finalStore.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
         }
         return result
+    }
+    
+    private struct PreparedSource: Sendable {
+        var index: Int
+        var source: ResearchSource
+        var elapsed: Double
+        var error: String?
+    }
+    
+    private actor PreparationCoordinator {
+        private let total: Int
+        private var completed: Int
+        private var measuredSeconds: Double = 0
+        private var measuredCount: Int = 0
+        
+        init(total: Int, alreadyCompleted: Int) {
+            self.total = total
+            self.completed = alreadyCompleted
+        }
+        
+        func recordCompletion(_ result: PreparedSource) -> Int {
+            completed += 1
+            measuredSeconds += result.elapsed
+            measuredCount += 1
+            return completed
+        }
+        
+        func estimateRemaining(for index: Int) -> (completed: Int, estimate: Double?) {
+            guard measuredCount > 0 else { return (completed, nil) }
+            let averageSeconds = measuredSeconds / Double(measuredCount)
+            let remaining = total - completed
+            return (completed, averageSeconds * Double(remaining))
+        }
     }
     func run(_ study: ResearchStudy, progress: @escaping @Sendable (Int, Int, String) -> Void) throws -> StudyReport {
         let store = try ResearchStore(directory: directory)

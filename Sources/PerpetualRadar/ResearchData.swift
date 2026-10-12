@@ -370,6 +370,18 @@ final class ResearchDataProvider {
     func plan(_ spec: StudySpec, refresh: Bool = false, catalogProgress: @escaping @Sendable (ResearchCatalogProgress) async -> Void = { _ in }, progress: @escaping @Sendable (ResearchPlanningProgress) async -> Void) async throws -> DataPlan {
         let spec = try spec.excludingSpread()
         try spec.validate()
+        
+        // Check for cached plan if not refreshing
+        if !refresh {
+            let specHash = researchHash(try researchJSON(spec))
+            let cacheID = "plan-cache:\(specHash)"
+            if let cached = try store.get(cacheID, as: CachedPlan.self),
+               cached.createdAt >= researchNow() - 24 * 3600 * 1000 { // 24 hour cache validity
+                await progress(.init(stage: "saving", unit: "steps", completed: 1, total: 1, message: "Using cached data plan from \(formatCacheAge(cached.createdAt))"))
+                return cached.plan
+            }
+        }
+        
         await progress(.init(stage: "registry", unit: "steps", completed: 0, total: 1, message: "Reading local instrument metadata; requesting OKX metadata if needed…"))
         let registry = try await instruments(through: spec.through, refresh: refresh, onRateLimit: { delay in
             await progress(.init(stage: "registry", unit: "steps", completed: 0, total: 1,
@@ -497,8 +509,22 @@ final class ResearchDataProvider {
         plan = try plan.excludingSpread()
         await progress(.init(stage: "saving", unit: "steps", completed: 0, total: 1, message: "Saving the verified data plan and checkpoint…"))
         try store.put(plan.id, kind: "plan", plan)
+        
+        // Cache the plan for future requests with the same spec
+        let specHash = researchHash(try researchJSON(spec))
+        let cacheID = "plan-cache:\(specHash)"
+        try store.put(cacheID, kind: "planCache", CachedPlan(plan: plan, createdAt: researchNow()))
+        
         return plan
     }
+    
+    private func formatCacheAge(_ timestamp: Int64) -> String {
+        let seconds = (researchNow() - timestamp) / 1000
+        if seconds < 60 { return "\(seconds)s ago" }
+        if seconds < 3600 { return "\(seconds / 60)m ago" }
+        return "\(seconds / 3600)h ago"
+    }
+    private struct CachedPlan: Codable { var plan: DataPlan; var createdAt: Int64 }
     static func subtract(_ range: ResearchRange, covered: [ResearchRange]) -> [ResearchRange] {
         var next = range.from, result: [ResearchRange] = []
         for part in covered.sorted(by: { $0.from < $1.from }) {
