@@ -101,15 +101,13 @@
     --control-radius: 6px;
     --control-font-size: 13px;
     /* Controls and panels weight their default alpha by the window setting.
-       Floating surfaces keep their own opaque fill so underlying text cannot
-       bleed through menus or dialogs, even when the window is transparent. */
+       Floating glass stays untinted and blurs independently of that setting. */
     --surface-opacity-weight: var(--window-background-opacity);
-    /* Floating surfaces must separate overlapping text; controls need a clear
-       fill, while larger panels retain more of the window's glass. Saturated
+    /* Controls need a clear fill, while larger panels retain more of the window's glass. Saturated
        primary paint has its own lighter default to preserve text contrast. */
     --control-default-opacity: 0.8;
     --panel-default-opacity: 0.6;
-    --floating-default-opacity: 1;
+    --floating-default-opacity: 0;
     --primary-default-opacity: 0.4;
     --control-opacity: calc(var(--control-default-opacity) * var(--surface-opacity-weight));
     --panel-opacity: calc(var(--panel-default-opacity) * var(--surface-opacity-weight));
@@ -124,9 +122,10 @@
     --overlay-default-opacity: 0.12;
     --control-blur: calc((1 - var(--window-background-opacity)) * 12px);
     --panel-blur: calc((1 - var(--window-background-opacity)) * 16px);
+    --floating-blur: 24px;
     --control-filter: none;
     --panel-filter: none;
-    --floating-filter: none;
+    --floating-filter: blur(var(--floating-blur));
     --control: color-mix(in srgb, var(--control-base) calc(var(--control-opacity) * 100%), transparent);
     --control-hover: color-mix(in srgb, color-mix(in srgb, var(--control-base), var(--foreground) 5%) calc(var(--control-opacity) * 100%), transparent);
     --selection: color-mix(in srgb, color-mix(in srgb, var(--ring) 14%, var(--control-base)) calc(var(--control-opacity) * 100%), transparent);
@@ -150,11 +149,8 @@
     --card: color-mix(in srgb, var(--card-base) calc(var(--panel-opacity) * 100%), transparent);
     --chart-snapshot-background: var(--card-base);
     --control-shadow: 0 1px 2px rgb(0 0 0 / 10%);
-    /* Opaque glass: the solid popover fill occludes app content, while surface
-       lighting and an inset rim supply depth without sampling the backdrop. */
-    --floating-glass-highlight: rgb(255 255 255 / 85%);
-    --floating-glass-shade: rgb(45 57 78 / 4%);
-    --floating-glass-image: linear-gradient(165deg, var(--floating-glass-highlight), transparent 45%), linear-gradient(180deg, transparent 50%, var(--floating-glass-shade));
+    /* Untinted glass uses backdrop blur and an inset rim, without a solid
+       fill or gradient painted over the underlying content. */
     --floating-border: oklch(0.65 0.015 260 / 30%);
     --floating-muted-foreground: oklch(0.45 0.014 260);
     --floating-shadow: inset 0 1px 0 rgb(255 255 255 / 95%), inset 0 -1px 0 rgb(45 57 78 / 5%), 0 12px 32px rgb(25 33 48 / 14%), 0 2px 6px rgb(25 33 48 / 6%);
@@ -245,8 +241,6 @@
         --chart-roc-positive-area: color-mix(in srgb, var(--positive) 16%, transparent);
         --chart-roc-negative-area: color-mix(in srgb, var(--destructive) 16%, transparent);
         --border: oklch(0.85 0.01 260 / 20%);
-        --floating-glass-highlight: rgb(224 234 255 / 8%);
-        --floating-glass-shade: rgb(4 9 18 / 12%);
         --floating-border: oklch(0.75 0.014 260 / 30%);
         --floating-muted-foreground: oklch(0.78 0.014 260);
         --floating-shadow: inset 0 1px 0 rgb(235 242 255 / 18%), inset 0 -1px 0 rgb(0 0 0 / 20%), 0 12px 32px rgb(0 0 0 / 32%), 0 2px 6px rgb(0 0 0 / 16%);
@@ -302,7 +296,6 @@
 @utility surface-floating {
     --border: var(--floating-border);
     --muted-foreground: var(--floating-muted-foreground);
-    background-image: var(--floating-glass-image);
     box-shadow: var(--floating-shadow);
     -webkit-backdrop-filter: var(--floating-filter);
     backdrop-filter: var(--floating-filter);

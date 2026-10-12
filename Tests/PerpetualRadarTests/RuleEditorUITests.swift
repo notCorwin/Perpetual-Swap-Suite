@@ -1139,7 +1139,7 @@ final class RuleEditorUITests: BackgroundTestCase {
     }
 
     @MainActor
-    private func assertSharedSurfaces(_ view: WKWebView, opacity: Double, defaultOpacities: [Double] = [0.8, 0.6, 1, 0.4]) async throws {
+    private func assertSharedSurfaces(_ view: WKWebView, opacity: Double, defaultOpacities: [Double] = [0.8, 0.6, 0, 0.4]) async throws {
         // Wait for control color transitions; inspect the renderer rather than
         // matching generated classes or the source token formulas.
         try await wait(view, "Array.from(document.querySelectorAll('[data-surface=\"floating\"]')).every(x => x.closest('[data-state=\"closed\"]') || !x.getBoundingClientRect().width || !x.getBoundingClientRect().height || getComputedStyle(x).opacity === '1')", seconds: 2)
@@ -1157,9 +1157,10 @@ final class RuleEditorUITests: BackgroundTestCase {
             const parent = element.parentElement?.closest('[data-surface="control"], [data-surface="panel"], [data-surface="floating"]');
             const nativeTable = document.documentElement.dataset.nativeWindowBackground === 'true' && element.closest('[data-slot="table-container"]');
             const inherited = role === 'inherited' || role !== 'floating' && (parent || nativeTable && role === 'control');
-            const expected = p === 1 || inherited || role === 'floating' ? 0 : ({control:12,panel:16}[role] ?? 0) * (1-p);
+            const expected = role === 'floating' ? 24 : p === 1 || inherited ? 0 : ({control:12,panel:16}[role] ?? 0) * (1-p);
             if (Math.abs(radius - expected) > 0.05 || expected === 0 && filter !== 'none') issues.push(`${element.dataset.slot ?? element.tagName} ${role}: filter=${filter}, expected=${expected}`);
             if (role === 'floating' && style.transitionProperty !== 'none') issues.push(`${element.dataset.slot ?? element.tagName}: implicit material transition`);
+            if (role === 'floating' && style.backgroundImage !== 'none') issues.push(`${element.dataset.slot ?? element.tagName}: tinted glass gradient`);
             if (p < 1 && !['inherited','floating'].includes(role) && read(style.backgroundColor)[3] === 255) issues.push(`${element.dataset.slot ?? element.tagName}: opaque component paint`);
             if (style.opacity !== '1' || read(style.color)[3] !== 255) issues.push(`${element.dataset.slot ?? element.tagName}: faded content`);
             if (!style.fontVariantNumeric.includes('tabular-nums')) issues.push(`${element.dataset.slot ?? element.tagName}: non-tabular numbers`);
@@ -1531,7 +1532,7 @@ final class RuleEditorUITests: BackgroundTestCase {
           hideContent.textContent = '[data-qa-floating-test] > * { visibility:hidden!important }';
           document.querySelector('[data-market-list-content]').append(fixture);
           document.body.append(hideContent);
-          window.radarSurfaceFixture = { source, background:source.style.backgroundColor, image:source.style.backgroundImage };
+          window.radarSurfaceFixture = { source, style:source.style.cssText };
           return source.getBoundingClientRect().toJSON();
         })()
         """) as? [String: Double]
@@ -1552,25 +1553,30 @@ final class RuleEditorUITests: BackgroundTestCase {
             let values = samples.map { $0.reduce(0, +) / 3 }
             return values.max()! - values.min()!
         }
-        // The material can have its own gradient. Inverting only the content
-        // behind it must leave every sampled surface pixel unchanged.
-        let opaqueSamples = try samples(bitmap)
-        _ = try await js(view, "document.querySelector('#floating-pixel-fixture').style.backgroundImage='repeating-linear-gradient(90deg,#fff 0px,#fff 4px,#000 4px,#000 8px)'; true")
+        // Clear glass must soften fine detail while retaining the backdrop's
+        // color. An opaque fill could hide stripes but would fail this change.
+        let blurredSamples = try samples(bitmap), softened = contrast(blurredSamples)
+        _ = try await js(view, "document.querySelector('#floating-pixel-fixture').style.background='rgb(32 128 224)'; true")
         try await settleRendering(view)
-        let inverted = try await nativeRendererSnapshot(view)
-        let invertedSamples = try samples(XCTUnwrap(NSBitmapImageRep(data: inverted.tiffRepresentation!)))
-        let backdropDifference = zip(opaqueSamples, invertedSamples).flatMap { zip($0, $1).map { abs($0 - $1) } }.max()!
-        _ = try await js(view, "window.radarSurfaceFixture.source.style.backgroundColor='transparent'; window.radarSurfaceFixture.source.style.backgroundImage='none'; true")
+        let colored = try await nativeRendererSnapshot(view)
+        let coloredSamples = try samples(XCTUnwrap(NSBitmapImageRep(data: colored.tiffRepresentation!)))
+        var backdropResponse = 0.0
+        for (before, after) in zip(blurredSamples, coloredSamples) {
+            backdropResponse += zip(before, after).map { abs($0 - $1) }.max()!
+        }
+        backdropResponse /= Double(blurredSamples.count)
+        _ = try await js(view, "document.querySelector('#floating-pixel-fixture').style.background='repeating-linear-gradient(90deg,#000 0px,#000 4px,#fff 4px,#fff 8px)'; window.radarSurfaceFixture.source.style.backdropFilter='none'; window.radarSurfaceFixture.source.style.webkitBackdropFilter='none'; true")
         try await settleRendering(view)
         let reference = try await nativeRendererSnapshot(view)
         let referenceBitmap = try XCTUnwrap(NSBitmapImageRep(data: reference.tiffRepresentation!))
         let exposed = contrast(try samples(referenceBitmap))
-        _ = try await js(view, "(() => { const {source,background,image}=window.radarSurfaceFixture; source.style.backgroundColor=background; source.style.backgroundImage=image; delete source.dataset.qaFloatingTest; delete window.radarSurfaceFixture; document.querySelector('#floating-pixel-fixture').remove(); document.querySelector('#floating-pixel-style').remove(); return true; })()")
-        print("Floating pixel contrast \(name) \(theme): backdropDifference=\(backdropDifference), exposed=\(exposed)")
+        _ = try await js(view, "(() => { const {source,style}=window.radarSurfaceFixture; source.style.cssText=style; delete source.dataset.qaFloatingTest; delete window.radarSurfaceFixture; document.querySelector('#floating-pixel-fixture').remove(); document.querySelector('#floating-pixel-style').remove(); return true; })()")
+        print("Floating pixel contrast \(name) \(theme): softened=\(softened), exposed=\(exposed), backdropResponse=\(backdropResponse)")
         XCTAssertGreaterThan(exposed, 0.15, "The reference must expose high-contrast app content behind the floating surface.")
-        XCTAssertLessThan(backdropDifference, 0.01, "Opaque glass must completely hide underlying content, including beneath its highlights and shading.")
+        XCTAssertLessThan(softened, exposed * 0.1, "Glass blur must suppress fine backdrop detail without blurring its own content.")
+        XCTAssertGreaterThan(backdropResponse, 0.1, "Untinted glass must retain the backdrop's colors instead of covering them with a solid fill.")
         try FileManager.default.createDirectory(at: project.appendingPathComponent(".build/ui-qa"), withIntermediateDirectories: true)
-        try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: project.appendingPathComponent(".build/ui-qa/floating-occlusion-\(name)-\(theme).png"))
+        try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: project.appendingPathComponent(".build/ui-qa/floating-blur-\(name)-\(theme).png"))
     }
 
     @MainActor
