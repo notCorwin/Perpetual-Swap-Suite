@@ -1,6 +1,6 @@
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
 import { streamText } from 'ai'
-import { ANALYSIS_SYSTEM, ChartAnalysisStore, type AnalysisSettingsRequest, type AnalysisRunner } from './chart-analysis.ts'
+import { ChartAnalysisStore, type AnalysisSettingsRequest, type AnalysisRunner } from './chart-analysis.ts'
 import { createGatewayFetch } from './gateway-fetch.ts'
 
 export const requestAnalysisSettings = (request: AnalysisSettingsRequest) => window.webkit.messageHandlers.radar.postMessage({ analysisSettings: request })
@@ -8,7 +8,7 @@ export const requestAnalysisSettings = (request: AnalysisSettingsRequest) => win
 export function createAnalysisRunner(nativeFetch: typeof fetch): AnalysisRunner {
   const provider = createOpenAICompatible({ name: 'openai', baseURL: 'https://ai-gateway.vercel.sh/v1', fetch: nativeFetch })
   return async (input, onText) => {
-    const result = streamText({ model: provider(input.model), instructions: ANALYSIS_SYSTEM, messages: input.messages, abortSignal: input.signal, maxRetries: 0, streamRetries: 0, onError: () => {} })
+    const result = streamText({ model: provider(input.model), instructions: input.instructions, messages: input.messages, abortSignal: input.signal, maxRetries: 0, streamRetries: 0, onError: () => {} })
     let finished = false
     for await (const part of result.fullStream) {
       if (part.type === 'text-delta') onText(part.text)

@@ -11,7 +11,7 @@ import { Bubble, BubbleContent } from '@/components/ui/bubble'
 import { Spinner } from '@/components/ui/spinner'
 import { AnalysisSettingsButton } from '@/AnalysisSettingsDialog'
 import { chartAnalysis } from '@/analysis-service'
-import type { AnalysisSession } from '@/chart-analysis'
+import { ANALYSIS_PROMPTS, type AnalysisSession } from '@/chart-analysis'
 
 const MessageResponse = lazy(() => import('@/components/ai-elements/message').then(module => ({ default: module.MessageResponse })))
 const captureTime = (value: number) => new Date(value).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
@@ -34,7 +34,7 @@ export function ChartAnalysisPanel({ instId, session, ready, onNew, onClose }: {
       <Button variant="ghost" size="icon-sm" onClick={onClose} aria-label="Close analysis"><X /></Button>
     </div>
     <div className="flex shrink-0 flex-col gap-2 border-b p-3">
-      <p className="font-medium">{instId.replace(/-SWAP$/, '')} · 1h</p>
+      <div className="flex items-center gap-2"><p className="flex-1 font-medium">{instId.replace(/-SWAP$/, '')} · 1h</p>{session && <Badge variant="outline">{ANALYSIS_PROMPTS[session.direction].label}</Badge>}</div>
       <p className="break-all text-xs text-muted-foreground">{session?.model ?? 'Vercel AI Gateway'}</p>
       {session?.capturedAt ? <div className="flex flex-col gap-1 text-xs text-muted-foreground"><p>Captured {captureTime(session.capturedAt)}</p><p>{session.rangeLabel}</p><p>Follow-ups use this snapshot.</p></div> : null}
       <div className="flex items-center gap-2"><Button variant="outline" size="sm" disabled={busy || !ready} onClick={onNew}>{session?.image ? 'New analysis' : 'Analyze chart'}</Button><AnalysisSettingsButton />{busy && <Button variant="ghost" size="sm" onClick={() => chartAnalysis.stop(instId)}><Square data-icon="inline-start" />Stop</Button>}</div>

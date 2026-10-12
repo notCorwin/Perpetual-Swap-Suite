@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { ANALYSIS_QUESTION, ANALYSIS_SYSTEM, ChartAnalysisStore, DEFAULT_ANALYSIS_MODEL, type AnalysisRunner } from './chart-analysis.ts'
+import { ANALYSIS_PROMPTS, ChartAnalysisStore, DEFAULT_ANALYSIS_MODEL, type AnalysisRunner } from './chart-analysis.ts'
 import { createAnalysisRunner } from './analysis-service.ts'
 import { createGatewayFetch, type GatewayBridge, type GatewayEvent } from './gateway-fetch.ts'
 
@@ -21,12 +21,36 @@ test('analysis and follow-ups keep the snapshot, model, and successful context p
   assert.equal(messages[1].content, '等待确认。')
   assert.equal(messages[2].content, '确认条件是什么？')
   const first = messages[0].content as { type: string; text?: string; data?: URL }[]
-  assert.equal(first[0].text, ANALYSIS_QUESTION)
+  assert.equal(first[0].text, ANALYSIS_PROMPTS.long.question)
   assert.equal(first[1].data?.href, (await snapshot()).imageDataURL)
   assert.equal(store.get('BTC')?.draft, '')
   await store.analyze('BTC', snapshot)
   assert.equal(store.get('BTC')?.turns.length, 1)
   assert.equal(requests.at(-1)!.messages.length, 1)
+})
+
+test('short analysis keeps its direction through follow-ups, retries, and other contracts', async () => {
+  const requests: Parameters<AnalysisRunner>[0][] = []
+  const store = new ChartAnalysisStore(async (request, text) => {
+    requests.push(request); text('等待反弹确认。')
+    if (requests.length === 3) throw new Error('Stream interrupted.')
+  }, settings)
+  await store.analyze('BTC', snapshot, 'short')
+  await store.analyze('ETH', snapshot)
+  await store.send('BTC', '反弹到哪里再开空？')
+  await store.retry('BTC')
+  assert.equal(store.get('BTC')?.direction, 'short')
+  assert.equal(store.get('ETH')?.direction, 'long')
+  assert.equal(store.get('BTC')?.turns.length, 2)
+  assert.equal(store.get('BTC')?.phase, 'ready')
+  assert.match(requests[1].instructions, /追多/)
+  for (const request of [requests[0], requests[2], requests[3]]) {
+    assert.match(request.instructions, /是否追空/)
+    assert.doesNotMatch(request.instructions, /追多/)
+    const first = request.messages[0].content as { type: string; text?: string }[]
+    assert.equal(first[0].text, '你推荐我追空吗？如果追空，限价单开在哪个位置合适？如果不追，应该等待什么确认？')
+  }
+  assert.equal(requests[3].messages.at(-1)?.content, '反弹到哪里再开空？')
 })
 
 test('retry retains partial errors until retry and does not duplicate the question', async () => {
@@ -98,16 +122,16 @@ function nativeFixture(status: number, data: string, interrupted = false) {
 }
 
 const delta = (content: string, finish: string | null = null) => `data: ${JSON.stringify({ id: 'response', choices: [{ index: 0, delta: { content }, finish_reason: finish }] })}\n\n`
-test('actual compatible SDK serializes image and instructions and decodes native UTF-8 SSE', async () => {
+for (const direction of ['long', 'short'] as const) test(`actual compatible SDK serializes ${direction} image and instructions and decodes native UTF-8 SSE`, async () => {
   const native = nativeFixture(200, delta('等待') + delta('确认。') + delta('', 'stop') + 'data: [DONE]\n\n')
   const store = new ChartAnalysisStore(createAnalysisRunner(native.fetch), settings)
-  await store.analyze('BTC', snapshot)
+  await store.analyze('BTC', snapshot, direction)
   assert.equal(store.get('BTC')?.turns[0].text, '等待确认。')
   assert.equal(store.get('BTC')?.phase, 'ready')
   const body = JSON.parse(native.bodies[0])
   assert.equal(body.model, DEFAULT_ANALYSIS_MODEL)
-  assert.equal(body.messages[0].content, ANALYSIS_SYSTEM)
-  assert.equal(body.messages[1].content[0].text, ANALYSIS_QUESTION)
+  assert.equal(body.messages[0].content, ANALYSIS_PROMPTS[direction].system)
+  assert.equal(body.messages[1].content[0].text, ANALYSIS_PROMPTS[direction].question)
   assert.equal(body.messages[1].content[1].image_url.url, (await snapshot()).imageDataURL)
   assert.equal(native.bodies.length, 1)
 })

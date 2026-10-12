@@ -2,22 +2,33 @@ import type { ModelMessage } from 'ai'
 import type { ChartImage } from './chart-capture.ts'
 
 export const DEFAULT_ANALYSIS_MODEL = 'openai/gpt-6.1-sol'
-export const ANALYSIS_QUESTION = '你推荐我追多吗？如果追多，限价单开在哪个位置合适？如果不追，应该等待什么确认？'
-export const ANALYSIS_SYSTEM = '你是 OKX USDT 永续合约的 1 小时图表分析助手。依据截图和对话，用中文简洁回答是否追多、合适的限价位置及依据，或需要等待的确认条件，并说明判断的失效条件。区分未收盘 K 线与已确认信号；看不清的价格或缺失的信息不要编造。'
+export const ANALYSIS_PROMPTS = {
+  long: {
+    label: 'Chase long',
+    question: '你推荐我追多吗？如果追多，限价单开在哪个位置合适？如果不追，应该等待什么确认？',
+    system: '你是 OKX USDT 永续合约的 1 小时图表分析助手。依据截图和对话，用中文简洁回答是否追多、合适的限价位置及依据，或需要等待的确认条件，并说明判断的失效条件。区分未收盘 K 线与已确认信号；看不清的价格或缺失的信息不要编造。',
+  },
+  short: {
+    label: 'Chase short',
+    question: '你推荐我追空吗？如果追空，限价单开在哪个位置合适？如果不追，应该等待什么确认？',
+    system: '你是 OKX USDT 永续合约的 1 小时图表分析助手。依据截图和对话，用中文简洁回答是否追空、合适的限价位置及依据，或需要等待的确认条件，并说明判断的失效条件。区分未收盘 K 线与已确认信号；看不清的价格或缺失的信息不要编造。',
+  },
+}
+export type AnalysisDirection = keyof typeof ANALYSIS_PROMPTS
 export type AnalysisSettings = { model: string; hasAPIKey: boolean }
 export type AnalysisSettingsRequest = { action: 'read' } | { action: 'save'; model: string; apiKey: string } | { action: 'removeKey' }
 export type AnalysisTurn = { id: string; question: string; text: string; status: 'streaming' | 'complete' | 'stopped' | 'error'; error: string }
 export type AnalysisSession = {
-  instId: string; model: string; image: ChartImage | null; capturedAt: number; rangeLabel: string; draft: string
+  instId: string; direction: AnalysisDirection; model: string; image: ChartImage | null; capturedAt: number; rangeLabel: string; draft: string
   phase: 'capturing' | 'ready' | 'streaming' | 'error' | 'stopped'; error: string; turns: AnalysisTurn[]
 }
-export type AnalysisRunner = (input: { model: string; messages: ModelMessage[]; signal: AbortSignal }, onText: (text: string) => void) => Promise<void>
+export type AnalysisRunner = (input: { model: string; instructions: string; messages: ModelMessage[]; signal: AbortSignal }, onText: (text: string) => void) => Promise<void>
 export type AnalysisSnapshot = ChartImage & { capturedAt: number; rangeLabel: string }
 
 export function analysisMessages(session: AnalysisSession, index: number): ModelMessage[] {
   if (!session.image) throw new Error('Start a new analysis to capture a chart.')
   const messages: ModelMessage[] = [{ role: 'user', content: [
-    { type: 'text', text: ANALYSIS_QUESTION },
+    { type: 'text', text: ANALYSIS_PROMPTS[session.direction].question },
     { type: 'file', data: new URL(session.image.imageDataURL), mediaType: 'image/png' },
   ] }]
   for (let i = 0; i < index; i++) {
@@ -56,11 +67,11 @@ export class ChartAnalysisStore {
     this.update(id, session => ({ ...session, phase: 'stopped', error: '', turns: session.turns.map(turn => turn.status === 'streaming' ? { ...turn, status: 'stopped' } : turn) }))
   }
   private current(id: string, operation: AbortController) { return this.operations.get(id) === operation && !operation.signal.aborted }
-  async analyze(id: string, capture: () => Promise<AnalysisSnapshot>) {
+  async analyze(id: string, capture: () => Promise<AnalysisSnapshot>, direction: AnalysisDirection = 'long') {
     this.stop(id)
     const operation = new AbortController()
     this.operations.set(id, operation)
-    this.publish(id, { instId: id, model: DEFAULT_ANALYSIS_MODEL, image: null, capturedAt: 0, rangeLabel: '', draft: '', phase: 'capturing', error: '', turns: [] })
+    this.publish(id, { instId: id, direction, model: DEFAULT_ANALYSIS_MODEL, image: null, capturedAt: 0, rangeLabel: '', draft: '', phase: 'capturing', error: '', turns: [] })
     try {
       const settings = await this.settings()
       if (!this.current(id, operation)) return
@@ -68,7 +79,7 @@ export class ChartAnalysisStore {
       const image = await capture()
       if (!this.current(id, operation)) return
       this.update(id, session => ({ ...session, model: settings.model, image, capturedAt: image.capturedAt, rangeLabel: image.rangeLabel }))
-      await this.runTurn(id, ANALYSIS_QUESTION, operation)
+      await this.runTurn(id, ANALYSIS_PROMPTS[direction].question, operation)
     } catch (error) { this.fail(id, operation, error) }
     finally { if (this.current(id, operation)) this.operations.delete(id) }
   }
@@ -100,7 +111,7 @@ export class ChartAnalysisStore {
     const turns = retry ? [...session.turns.slice(0, -1), turn] : [...session.turns, turn]
     const next = { ...session, turns, phase: 'streaming' as const, error: '' }
     this.publish(id, next)
-    await this.runner({ model: next.model, messages: analysisMessages(next, turns.length - 1), signal: operation.signal }, text => {
+    await this.runner({ model: next.model, instructions: ANALYSIS_PROMPTS[next.direction].system, messages: analysisMessages(next, turns.length - 1), signal: operation.signal }, text => {
       if (this.current(id, operation)) this.update(id, value => ({ ...value, turns: value.turns.map(item => item.id === turn.id ? { ...item, text: item.text + text } : item) }))
     })
     if (!this.current(id, operation)) return
