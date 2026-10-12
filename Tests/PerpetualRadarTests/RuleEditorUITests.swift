@@ -660,6 +660,11 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await assertSharedSurfaces(view, opacity: 0)
         _ = try await js(view, "document.documentElement.style.setProperty('--window-background-opacity','\(bridge.radar.frostedBackgroundOpacity)'); true")
         try await wait(view, "document.querySelector('[aria-label=\"Current file download progress\"]')?.getAttribute('aria-valuenow') === '75'")
+        if var progress = bridge.researchJobOverride?["preparation"] as? [String: Any] { progress["retryAt"] = researchNow() + 5_000; bridge.researchJobOverride?["preparation"] = progress }
+        try await wait(view, "document.querySelector('[data-research-task]')?.innerText.includes('Retrying automatically in') && Array.from(document.querySelectorAll('[data-research-task] button')).some(b=>b.textContent.trim()==='Pause') && !Array.from(document.querySelectorAll('[data-research-task] button')).some(b=>b.textContent.trim()==='Resume') && document.querySelector('[aria-label=\"Current file download progress\"]')?.getAttribute('aria-valuenow') === '75'", seconds: 3)
+        if var progress = bridge.researchJobOverride?["preparation"] as? [String: Any] { progress["retryAt"] = researchNow() - 1; bridge.researchJobOverride?["preparation"] = progress }
+        try await wait(view, "document.querySelector('[data-research-task]')?.innerText.includes('Retrying the current request automatically')", seconds: 3)
+        if var progress = bridge.researchJobOverride?["preparation"] as? [String: Any] { progress.removeValue(forKey: "retryAt"); bridge.researchJobOverride?["preparation"] = progress }
         bridge.researchJobOverride?["updatedAt"] = researchNow() - 20_000
         try await wait(view, "document.querySelector('[data-research-task]')?.innerText.includes('No data received for')")
         bridge.researchJobOverride?["phase"] = "failed"; bridge.researchJobOverride?["error"] = "Archive connection lost: BTC-USDT-SWAP-2025-06.zip"

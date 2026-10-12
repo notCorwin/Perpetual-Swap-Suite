@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
 import type { ResearchJob } from './research-types.ts'
-import { researchByteSize, researchDuration, researchFilePercent, researchPlanningDescription, researchPlanningStage, researchProgressLabel, researchWaiting } from './research-task.ts'
+import { researchByteSize, researchDuration, researchFilePercent, researchPlanningDescription, researchPlanningStage, researchProgressLabel, researchTaskActive, researchWaiting } from './research-task.ts'
 
 const downloading = (): ResearchJob => ({ id: 'job', phase: 'preparing', completed: 0, total: 3, message: 'archive.zip', error: '', updatedAt: 1000,
   preparation: { stage: 'downloading', filename: 'archive.zip', instrument: 'BTC-USDT-SWAP', receivedBytes: 250, totalBytes: 1000, pages: 0 } })
@@ -68,4 +68,25 @@ test('every planning phase explains its current work instead of repeating catalo
   job.catalog = { kind: 'candle', completed: 0, total: 2, message: '', waitingForResponse: true }
   assert.equal(researchProgressLabel(job), 'Catalog pages checked')
   assert.match(researchPlanningDescription(job), /Reading published archive catalogs/)
+})
+
+test('rate limits show automatic retry countdown without pausing the task or losing progress', () => {
+  const job: ResearchJob = { id: 'retry', phase: 'planning', completed: 165, total: 222, message: '', error: '',
+    catalog: { kind: 'candle', completed: 165, total: 222, message: '', waitingForResponse: true, retryAt: 6000 } }
+  assert.equal(researchTaskActive(job), true)
+  assert.match(researchWaiting(job, 1000), /Retrying automatically in 5s/)
+  assert.match(researchWaiting(job, 6000), /Retrying the current request automatically/)
+  assert.equal(job.completed, 165)
+  job.catalog = undefined
+  job.planning = { stage: 'registry', unit: 'steps', completed: 0, total: 1, message: '', retryAt: 6000 }
+  assert.match(researchWaiting(job, 1000), /Retrying automatically in 5s/)
+  job.planning = undefined
+  job.phase = 'preparing'; job.catalog = undefined
+  job.preparation = { stage: 'fetching', filename: 'REST', instrument: 'BTC-USDT-SWAP', receivedBytes: 50, pages: 2, fraction: 0.75, retryAt: 6000 }
+  assert.match(researchWaiting(job, 1000), /Retrying automatically in 5s/)
+  assert.equal(researchFilePercent(job), 75)
+  job.preparation.retryAt = undefined
+  assert.equal(researchWaiting(job, 1000), '')
+  job.phase = 'paused'; job.preparation.retryAt = 6000
+  assert.equal(researchWaiting(job, 1000), '')
 })

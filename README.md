@@ -131,6 +131,8 @@ Downloaded inputs and checkpoints persist without automatic expiry. **Clear unre
 
 Planning reports each stage separately, including local history ranges, cached source files, and hourly input coverage. Local coverage checks run in bounded time ranges and report measured progress, the current instrument/input/range, and an estimate for the current stage. Pause stops between ranges; failures retain the last progress and a checkpoint error. Published archive catalog checks and file downloads use their own progress units and wording.
 
+OKX rate limits (`HTTP 429` or API code `50011`) keep Research active and automatically retry the current request. Requests share pacing and cooldowns, honor `Retry-After`, and use exponential backoff with jitter capped at 60 seconds unless OKX asks for a longer wait. The task panel shows the automatic retry countdown. Completed catalog pages, REST pages, and partial archive downloads remain reusable; Pause and Cancel interrupt the wait immediately.
+
 Older OKX candle archives may contain `None` for currency volumes while their prices and contract volumes are valid. Research imports complete hourly OHLC, converts available contract volume with verified contract metadata, and records missing quote-currency volume as Unknown. Missing currency volume does not fail the entire archive; VWAP and volume-dependent readings require the corresponding actual inputs. Retrying after a parser update reuses cached originals.
 
 ## Monitoring, notifications, and updates

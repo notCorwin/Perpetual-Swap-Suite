@@ -49,6 +49,8 @@ export function researchFilePercent(job: ResearchJob) {
 export function researchWaiting(job: ResearchJob, now: number) {
   const network = job.catalog?.waitingForResponse || ['connecting', 'downloading', 'fetching'].includes(job.preparation?.stage ?? '')
   if (!researchTaskActive(job)) return ''
+  const retryAt = job.catalog?.retryAt ?? job.preparation?.retryAt ?? job.planning?.retryAt
+  if (retryAt != null) return retryAt > now ? 'OKX rate limit. Retrying automatically in ' + researchDuration((retryAt - now) / 1000) + '; completed data stays on disk.' : 'Retrying the current request automatically after the OKX rate limit.'
   const elapsed = Math.max(0, (now - (job.updatedAt ?? now)) / 1000)
   if (!network) return job.planning && elapsed >= 15 ? 'Last check progress update was ' + researchDuration(elapsed) + ' ago. No error has been reported.' : ''
   return elapsed >= 15 ? 'No data received for ' + researchDuration(elapsed) + '. Waiting for OKX; no error has been reported.' : ''

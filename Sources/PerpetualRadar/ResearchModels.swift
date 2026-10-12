@@ -301,6 +301,7 @@ struct ResearchPlanningProgress: Codable, Sendable {
     var from: Int64?
     var through: Int64?
     var remainingSeconds: Double?
+    var retryAt: Int64?
 }
 
 struct ResearchPlanningCounter {
@@ -330,12 +331,14 @@ struct ResearchCatalogProgress: Codable, Sendable {
     var message: String
     var waitingForResponse = false
     var remainingSeconds: Double?
+    var retryAt: Int64?
 }
 
 struct ResearchDownloadProgress: Sendable {
     var receivedBytes: Int64
     var totalBytes: Int64?
     var bytesPerSecond: Double?
+    var retryAt: Int64?
 }
 
 struct ResearchPreparationProgress: Codable, Sendable {
@@ -349,6 +352,7 @@ struct ResearchPreparationProgress: Codable, Sendable {
     var remainingSeconds: Double?
     var pages = 0
     var fraction: Double?
+    var retryAt: Int64?
 }
 
 // Pressure notifications are shared by the downloader and the single parser /
