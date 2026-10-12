@@ -665,6 +665,19 @@ final class RuleEditorUITests: BackgroundTestCase {
         if var progress = bridge.researchJobOverride?["preparation"] as? [String: Any] { progress["retryAt"] = researchNow() - 1; bridge.researchJobOverride?["preparation"] = progress }
         try await wait(view, "document.querySelector('[data-research-task]')?.innerText.includes('Retrying the current request automatically')", seconds: 3)
         if var progress = bridge.researchJobOverride?["preparation"] as? [String: Any] { progress.removeValue(forKey: "retryAt"); bridge.researchJobOverride?["preparation"] = progress }
+        bridge.researchJobOverride?["retryAt"] = researchNow() + 5_000
+        bridge.researchJobOverride?["recovery"] = "The network connection was lost."
+        try await wait(view, "document.querySelector('[data-research-task]')?.innerText.includes('network connection was lost') && document.querySelector('[data-research-task]')?.innerText.includes('Retrying automatically in') && !document.querySelector('[data-research-task] [role=alert]') && Array.from(document.querySelectorAll('[data-research-task] button')).some(b=>b.textContent.trim()==='Pause') && !Array.from(document.querySelectorAll('[data-research-task] button')).some(b=>b.textContent.trim()==='Resume')", seconds: 3)
+        bridge.researchJobOverride?.removeValue(forKey: "retryAt"); bridge.researchJobOverride?.removeValue(forKey: "recovery")
+        if var progress = bridge.researchJobOverride?["preparation"] as? [String: Any] {
+            progress["stage"] = "recovering"; progress["recovery"] = "Checking missing archive hours automatically."
+            bridge.researchJobOverride?["preparation"] = progress
+        }
+        try await wait(view, "document.querySelector('[data-research-task]')?.innerText.includes('Recovering missing data') && document.querySelector('[data-research-task]')?.innerText.includes('Checking missing archive hours automatically.') && !document.querySelector('[data-research-task] [role=alert]')", seconds: 3)
+        if var progress = bridge.researchJobOverride?["preparation"] as? [String: Any] {
+            progress["stage"] = "downloading"; progress.removeValue(forKey: "recovery")
+            bridge.researchJobOverride?["preparation"] = progress
+        }
         bridge.researchJobOverride?["updatedAt"] = researchNow() - 20_000
         try await wait(view, "document.querySelector('[data-research-task]')?.innerText.includes('No data received for')")
         bridge.researchJobOverride?["phase"] = "failed"; bridge.researchJobOverride?["error"] = "Archive connection lost: BTC-USDT-SWAP-2025-06.zip"

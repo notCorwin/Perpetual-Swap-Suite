@@ -16,7 +16,7 @@ final class ResearchCSV {
     }
     func feed(_ bytes: Data) throws {
         for byte in bytes {
-            guard field.count < 8 * 1024 * 1024 else { throw FilterError("An archive row exceeds the streaming parser budget.") }
+            guard field.count < 8 * 1024 * 1024 else { throw ResearchArchiveError("An archive row exceeds the streaming parser budget.") }
             if afterCR { afterCR = false; if byte == 10 { continue } }
             if quotePending {
                 quotePending = false
@@ -32,7 +32,7 @@ final class ResearchCSV {
         }
     }
     func finish() throws {
-        guard !quoted || quotePending else { throw FilterError("The CSV archive ends inside a quoted field.") }
+        guard !quoted || quotePending else { throw ResearchArchiveError("The CSV archive ends inside a quoted field.") }
         if !field.isEmpty || !row.isEmpty { try endRow() }
     }
 }
@@ -111,10 +111,12 @@ final class ResearchArchiveImporter {
     private var batch: [ResearchDatum] = []
     private(set) var rows = 0
     private var rejected = 0
+    private var unconfirmed = 0
     private var encountered = Set<String>()
     private var missingBase = 0, missingQuote = 0, convertedBase = 0
     var warnings: [String] {
         var result: [String] = []
+        if unconfirmed > 0 { result.append("\(source.filename): \(unconfirmed) unconfirmed minute candles were excluded; missing hours are checked against confirmed OKX history automatically.") }
         if convertedBase > 0 { result.append("\(source.filename): base-currency volume for \(convertedBase) minute candles was converted from contract volume using verified contract metadata.") }
         if missingBase > 0 { result.append("\(source.filename): base-currency volume is missing for \(missingBase) minute candles; affected volume-dependent inputs remain Unknown.") }
         if missingQuote > 0 { result.append("\(source.filename): quote-currency volume is missing for \(missingQuote) minute candles; affected VWAP and quote-volume inputs remain Unknown. OHLC prices were imported.") }
@@ -140,7 +142,7 @@ final class ResearchArchiveImporter {
             guard let index = headers[name], index < row.count else { continue }
             let text = row[index].trimmingCharacters(in: .whitespacesAndNewlines)
             if ["", "none", "null"].contains(text.lowercased()) { continue }
-            guard let value = Double(text), value.isFinite, value >= 0 else { throw FilterError("Invalid archive volume in \(name): \(text.prefix(80)). The raw file was retained.") }
+            guard let value = Double(text), value.isFinite, value >= 0 else { throw ResearchArchiveError("Invalid archive volume in \(name): \(text.prefix(80)). The raw file was retained.") }
             return value
         }
         return nil
@@ -148,7 +150,7 @@ final class ResearchArchiveImporter {
     private func finishAggregate(_ id: String) throws {
         guard let value = aggregate.removeValue(forKey: id) else { return }
         let key = "\(id):\(value.hour)"
-        guard !flushed.contains(key) else { throw FilterError("Archive hours are not ordered; incomplete aggregation was rejected.") }
+        guard !flushed.contains(key) else { throw ResearchArchiveError("Archive hours are not ordered; incomplete aggregation was rejected.") }
         flushed.insert(key)
         if source.module == 2 {
             if value.minutes.count == 60 {
@@ -179,7 +181,8 @@ final class ResearchArchiveImporter {
         let hour = ts / hourMS * hourMS
         if aggregate[id]?.hour != hour { try finishAggregate(id); aggregate[id] = ResearchHourAggregate(hour: hour) }
         if source.module == 2 {
-            guard cell(row, "confirm") != "0", let open = number(row, "open", "o"), let high = number(row, "high", "h"), let low = number(row, "low", "l"), let close = number(row, "close", "c"),
+            if cell(row, "confirm") == "0" { unconfirmed += 1; return }
+            guard let open = number(row, "open", "o"), let high = number(row, "high", "h"), let low = number(row, "low", "l"), let close = number(row, "close", "c"),
                   low > 0, high >= low, (low...high).contains(open), (low...high).contains(close), ts % 60_000 == 0 else { rejected += 1; return }
             var base = try volume(row, "vol_ccy", "volccy")
             let quote = try volume(row, "vol_quote", "volccyquote")
@@ -189,7 +192,7 @@ final class ResearchArchiveImporter {
                 base = contracts * contractValue; convertedBase += 1
             }
             if base == nil { missingBase += 1 }; if quote == nil { missingQuote += 1 }
-            guard !aggregate[id]!.minutes.contains(Int((ts - hour) / 60_000)) else { throw FilterError("Duplicate minute candle in archive.") }
+            guard !aggregate[id]!.minutes.contains(Int((ts - hour) / 60_000)) else { throw ResearchArchiveError("Duplicate minute candle in archive.") }
             aggregate[id]!.add(timestamp: ts, open: open, high: high, low: low, close: close, base: base, quote: quote)
         } else {
             guard let price = number(row, "price", "px"), let size = number(row, "size", "sz"), let side = cell(row, "side"), ["buy", "sell"].contains(side), price > 0, size >= 0 else { rejected += 1; return }
@@ -203,20 +206,20 @@ final class ResearchArchiveImporter {
             try jsonLine(Data(record.utf8)); return
         }
         guard let bids = cell(row, "bids"), let asks = cell(row, "asks"), let time = cell(row, "ts", "timestamp", "created_time"),
-              let action = cell(row, "action", "type"), ["snapshot", "update"].contains(action.lowercased()) else { throw FilterError("Order book CSV requires a timestamp, action and bid/ask levels. Its raw file was retained.") }
+              let action = cell(row, "action", "type"), ["snapshot", "update"].contains(action.lowercased()) else { throw ResearchArchiveError("Order book CSV requires a timestamp, action and bid/ask levels. Its raw file was retained.") }
         var message: [String: Any] = ["instId": cell(row, "instid", "instrument_name") ?? source.instrument, "ts": time, "action": action.lowercased(), "bids": try JSONSerialization.jsonObject(with: Data(bids.utf8)), "asks": try JSONSerialization.jsonObject(with: Data(asks.utf8))]
         for key in ["seqid", "prevseqid", "checksum"] { if let value = cell(row, key) { message[key == "seqid" ? "seqId" : key == "prevseqid" ? "prevSeqId" : "checksum"] = value } }
         try jsonLine(JSONSerialization.data(withJSONObject: message))
     }
     private func jsonLine(_ line: Data) throws {
         guard !line.isEmpty else { return }
-        guard let body = try JSONSerialization.jsonObject(with: line) as? [String: Any] else { throw FilterError("Invalid order book record.") }
+        guard let body = try JSONSerialization.jsonObject(with: line) as? [String: Any] else { throw ResearchArchiveError("Invalid order book record.") }
         let messages = body["data"] as? [[String: Any]] ?? [body]
         for var message in messages {
             let id = message["instId"] as? String ?? (body["arg"] as? [String: Any])?["instId"] as? String ?? source.instrument
             guard id == source.instrument || source.instrument == "ANY" else { continue }
             message["action"] = message["action"] ?? body["action"]
-            guard let ts = ResearchBook.integer(message["ts"]) else { throw FilterError("Order book timestamp is missing.") }
+            guard let ts = ResearchBook.integer(message["ts"]) else { throw ResearchArchiveError("Order book timestamp is missing.") }
             let book = books[id] ?? ResearchBook(); books[id] = book
             let hour = ts / hourMS * hourMS
             if let previous = bookHours[id], hour > previous {
@@ -246,7 +249,7 @@ final class ResearchArchiveImporter {
             while let newline = pending.firstIndex(of: 10) {
                 let line = Data(pending[..<newline]); pending.removeSubrange(...newline); try jsonLine(line)
             }
-            guard pending.count < 8*1024*1024 else { throw FilterError("Order book record exceeds the streaming budget.") }
+            guard pending.count < 8*1024*1024 else { throw ResearchArchiveError("Order book record exceeds the streaming budget.") }
         }
         func finish() throws {
             guard supported else { return }
@@ -257,16 +260,21 @@ final class ResearchArchiveImporter {
             let tar = ResearchTar(begin: begin, consume: consume, finish: finish)
             try ResearchTar.readGzip(file) { try tar.feed($0) }; try tar.complete()
         } else {
-            let archive = try Archive(url: file, accessMode: .read)
-            for entry in archive where entry.type == .file {
-                begin(entry.path)
-                _ = try archive.extract(entry, bufferSize: 64*1024, consumer: consume)
-                try finish()
+            do {
+                let archive = try Archive(url: file, accessMode: .read)
+                for entry in archive where entry.type == .file {
+                    begin(entry.path)
+                    let checksum = try archive.extract(entry, bufferSize: 64*1024, consumer: consume)
+                    guard checksum == entry.checksum else { throw ResearchArchiveError("ZIP archive failed its CRC check. The raw file was retained.") }
+                    try finish()
+                }
+            } catch let error as Archive.ArchiveError {
+                throw ResearchArchiveError("ZIP archive validation failed: \(error). The raw file was retained.")
             }
         }
-        if [4, 5, 6].contains(source.module ?? 0), rows == 0 { throw FilterError("The order book archive contains no valid snapshot/update records. Its format and coverage were not accepted.") }
-        guard files > 0 else { throw FilterError("Archive contains no supported market data files.") }
-        guard rejected == 0 else { throw FilterError("\(rejected) invalid archive records; the file was kept for retry, and coverage was not marked complete.") }
+        if [4, 5, 6].contains(source.module ?? 0), rows == 0 { throw ResearchArchiveError("The order book archive contains no valid snapshot/update records. Its format and coverage were not accepted.") }
+        guard files > 0 else { throw ResearchArchiveError("Archive contains no supported market data files.") }
+        guard rejected == 0 else { throw ResearchArchiveError("\(rejected) invalid archive records; the raw file was retained, and archive coverage was not accepted.") }
         for (id, book) in books {
             if let hour = bookHours[id], book.timestamp >= hour, book.timestamp < hour + hourMS, let spread = book.spread {
                 try append(.init(instrument: id, kind: "quote", timestamp: hour, quote: FilterQuote(turnover: nil, spread: spread, timestamp: book.timestamp), sources: [source.id]))

@@ -156,6 +156,35 @@ final class ResearchStore {
         if next <= through { missing.append(.init(from: next, through: through)) }
         return missing
     }
+    func missingConfirmedCandles(_ instrument: String, from: Int64, through: Int64) throws -> [ResearchRange] {
+        guard through >= from else { return [] }
+        var covered: [ResearchRange] = []
+        // Inspected source ranges do not prove that every candle was confirmed.
+        try database.query("SELECT h.ts FROM research_heads h JOIN research_data d USING(revision) WHERE h.inst=? AND h.kind='candle' AND h.ts>=? AND h.ts<=? AND COALESCE(json_extract(d.json,'$.candle.confirmed'),1)=1 ORDER BY h.ts", [instrument, from, through]) {
+            let ts = sqlite3_column_int64($0, 0); covered.append(.init(from: ts, through: ts))
+        }
+        return ResearchDataProvider.subtract(.init(from: from, through: through), covered: covered)
+    }
+    func rejectArchiveCandles(_ source: ResearchSource) throws {
+        // A streaming importer may have saved verified-looking chunks before
+        // finding a bad record or CRC. Restore earlier independent inputs;
+        // immutable revisions and already frozen manifests stay on disk.
+        try database.transaction {
+            var hours: [Int64] = []
+            try database.query("SELECT h.ts FROM research_heads h JOIN research_data d USING(revision),json_each(d.json,'$.sources') j WHERE h.inst=? AND h.kind='candle' AND j.value=?", [source.instrument, source.id]) {
+                hours.append(sqlite3_column_int64($0, 0))
+            }
+            for hour in hours {
+                var previous: Int64?
+                try database.query("SELECT MAX(revision) FROM research_data d WHERE inst=? AND kind='candle' AND ts=? AND NOT EXISTS (SELECT 1 FROM json_each(d.json,'$.sources') WHERE value=?)", [source.instrument, hour, source.id]) {
+                    if sqlite3_column_type($0, 0) != SQLITE_NULL { previous = sqlite3_column_int64($0, 0) }
+                }
+                if let previous { try database.execute("UPDATE research_heads SET revision=? WHERE inst=? AND kind='candle' AND ts=?", [previous, source.instrument, hour]) }
+                else { try database.execute("DELETE FROM research_heads WHERE inst=? AND kind='candle' AND ts=?", [source.instrument, hour]) }
+            }
+            try database.execute("DELETE FROM research_coverage WHERE source=?", [source.id])
+        }
+    }
     private actor InputReader {
         private let store: ResearchStore
         init(directory: URL) throws { store = try ResearchStore(directory: directory) }
@@ -167,7 +196,7 @@ final class ResearchStore {
                     missing[kind] = refresh ? [check.range] : try store.missing(check.instrument, kind: kind, from: check.range.from, through: check.range.through)
                 } catch {
                     if Task.isCancelled { throw error }
-                    throw FilterError("Local input check failed · \(check.instrument) · \(kind) · \(check.range.from)–\(check.range.through): \(error.localizedDescription)")
+                    throw ResearchOperationError(context: "Local input check failed · \(check.instrument) · \(kind) · \(check.range.from)–\(check.range.through)", underlying: error)
                 }
             }
             let cached = try store.count("SELECT COUNT(*) FROM research_heads WHERE inst=? AND kind='candle' AND ts>=? AND ts<=?", [check.instrument, check.range.from, check.range.through])
@@ -207,7 +236,7 @@ final class ResearchStore {
             do { return try store.inspectCoverage(check, manifest: nil) }
             catch {
                 if Task.isCancelled { throw error }
-                throw FilterError("Local coverage check failed · \(check.instrument) · \(check.kind) · \(check.range.from)–\(check.range.through): \(error.localizedDescription)")
+                throw ResearchOperationError(context: "Local coverage check failed · \(check.instrument) · \(check.kind) · \(check.range.from)–\(check.range.through)", underlying: error)
             }
         }
     }

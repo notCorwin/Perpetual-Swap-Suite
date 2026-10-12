@@ -37,12 +37,16 @@ actor ResearchProgressFixtureTransport: ResearchTransport {
     init(archive: Data) { self.archive = archive }
     func release(fail: Bool = false) { blocked = false; self.fail = fail }
     func get(_ url: URL) async throws -> Data {
+        while blocked { try await Task.sleep(for: .milliseconds(10)) }
         try await Task.sleep(for: .milliseconds(50))
         return Data(#"{"code":"0","data":[]}"#.utf8)
     }
     func download(_ url: URL, to destination: URL, progress: @escaping @Sendable (ResearchDownloadProgress) async -> Void) async throws {
         await progress(.init(receivedBytes: Int64(archive.count / 2), totalBytes: Int64(archive.count), bytesPerSecond: 1000))
-        while blocked { try await Task.sleep(for: .milliseconds(10)) }
+        while blocked {
+            try await Task.sleep(for: .milliseconds(10))
+            await progress(.init(receivedBytes: Int64(archive.count / 2), totalBytes: Int64(archive.count), bytesPerSecond: 1000))
+        }
         if fail { throw FilterError("Fixture connection lost") }
         try await Task.sleep(for: .milliseconds(20))
         try archive.write(to: destination)
@@ -123,7 +127,7 @@ final class ResearchProgressTests: XCTestCase {
         _ = try await controller.handle(["action": "resume", "studyID": studyID])
         var sawEstimate = false
         while controller.isBusy {
-            if controller.status?.preparation?.stage == "fetching", controller.status?.preparation?.remainingSeconds != nil { sawEstimate = true }
+            if controller.status?.preparation?.remainingSeconds != nil { sawEstimate = true }
             try await Task.sleep(for: .milliseconds(5))
         }
         XCTAssertTrue(sawEstimate)

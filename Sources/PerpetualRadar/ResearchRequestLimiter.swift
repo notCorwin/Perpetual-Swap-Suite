@@ -33,9 +33,9 @@ actor ResearchRequestLimiter {
         }
     }
 
-    func rateLimited(_ url: URL, response: HTTPURLResponse, attempt: Int) -> Double {
+    func retrying(_ url: URL, response: HTTPURLResponse? = nil, attempt: Int) -> Double {
         let backoff = min(maximumBackoff, initialBackoff * pow(2, Double(min(attempt, 30))) + Double.random(in: 0...jitter))
-        let delay = max(backoff, Self.retryAfter(response) ?? 0)
+        let delay = max(backoff, response.flatMap(Self.retryAfter) ?? 0)
         let host = url.host ?? "", now = ContinuousClock.now
         let deadline = max(cooldown[host] ?? now, now + .seconds(delay))
         cooldown[host] = deadline
@@ -65,10 +65,10 @@ actor ResearchCatalogReporter {
         self.kind = kind; self.total = total; self.completed = completed; self.pending = pending; self.progress = progress
     }
 
-    func rateLimited(_ seconds: Double) async {
+    func retrying(_ seconds: Double) async {
         retryAt = max(retryAt ?? 0, researchNow() + Int64(seconds * 1_000))
         await progress(.init(kind: kind, completed: completed, total: total,
-                             message: "OKX rate limit · waiting to retry the current catalog page automatically.", waitingForResponse: true,
+                             message: "Temporary request failure or OKX rate limit · waiting to retry the current catalog page automatically.", waitingForResponse: true,
                              retryAt: retryAt))
     }
 

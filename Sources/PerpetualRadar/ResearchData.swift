@@ -3,12 +3,12 @@ import CryptoKit
 
 protocol ResearchTransport: Sendable {
     func get(_ url: URL) async throws -> Data
-    func get(_ url: URL, onRateLimit: @escaping @Sendable (Double) async -> Void) async throws -> Data
+    func get(_ url: URL, onRetry: @escaping @Sendable (Double) async -> Void) async throws -> Data
     func download(_ url: URL, to destination: URL, progress: @escaping @Sendable (ResearchDownloadProgress) async -> Void) async throws
 }
 
 extension ResearchTransport {
-    func get(_ url: URL, onRateLimit: @escaping @Sendable (Double) async -> Void) async throws -> Data { try await get(url) }
+    func get(_ url: URL, onRetry: @escaping @Sendable (Double) async -> Void) async throws -> Data { try await get(url) }
 }
 
 actor OKXResearchTransport: ResearchTransport {
@@ -29,31 +29,53 @@ actor OKXResearchTransport: ResearchTransport {
         apiSession = session ?? URLSession(configuration: configuration)
     }
     func get(_ url: URL) async throws -> Data {
-        try await get(url, onRateLimit: { _ in })
+        try await get(url, onRetry: { _ in })
     }
-    func get(_ url: URL, onRateLimit: @escaping @Sendable (Double) async -> Void) async throws -> Data {
+    func get(_ url: URL, onRetry: @escaping @Sendable (Double) async -> Void) async throws -> Data {
         var attempt = 0
         while true {
             try await limiter.wait(for: url)
             let data: Data, response: URLResponse
             do { (data, response) = try await apiSession.data(from: url) }
-            catch let error as URLError where error.code == .timedOut { throw FilterError("OKX history request timed out (30-second request deadline): \(url.path). Resume to retry; completed responses remain cached.") }
+            catch {
+                try Task.checkCancellation()
+                guard ResearchRecovery.isRecoverable(error) else { throw error }
+                let delay = await limiter.retrying(url, attempt: attempt)
+                await onRetry(delay)
+                attempt = min(attempt + 1, 30)
+                continue
+            }
             guard let response = response as? HTTPURLResponse else { throw FilterError("OKX returned an invalid history response: \(url.path).") }
             // OKX can also report rate limiting in a successful HTTP envelope.
             let code = data.count < 16 * 1024 * 1024 ? (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["code"] as? String : nil
-            if response.statusCode == 429 || code == "50011" {
-                let delay = await limiter.rateLimited(url, response: response, attempt: attempt)
-                await onRateLimit(delay)
+            if ResearchRecovery.isRecoverable(ResearchHTTPError(status: response.statusCode, path: url.path)) || code == "50011" {
+                let delay = await limiter.retrying(url, response: response, attempt: attempt)
+                await onRetry(delay)
                 attempt = min(attempt + 1, 30)
                 continue
             }
             try Task.checkCancellation()
-            guard response.statusCode == 200 else { throw FilterError("OKX history request failed (HTTP \(response.statusCode)): \(url.path).") }
+            guard response.statusCode == 200 else { throw ResearchHTTPError(status: response.statusCode, path: url.path) }
             guard data.count < 16 * 1024 * 1024 else { throw FilterError("OKX history response exceeds the 16 MB page limit: \(url.path).") }
             return data
         }
     }
     func download(_ url: URL, to destination: URL, progress: @escaping @Sendable (ResearchDownloadProgress) async -> Void) async throws {
+        var attempt = 0
+        while true {
+            try Task.checkCancellation()
+            do { try await downloadAttempt(url, to: destination, progress: progress); return }
+            catch {
+                try Task.checkCancellation()
+                guard ResearchRecovery.isRecoverable(error) else { throw error }
+                let delay = await limiter.retrying(url, attempt: attempt)
+                let received = (try? destination.appendingPathExtension("part").resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+                await progress(.init(receivedBytes: received, totalBytes: nil, bytesPerSecond: nil, retryAt: researchNow() + Int64(delay * 1_000)))
+                attempt = min(attempt + 1, 30)
+            }
+        }
+    }
+    private func downloadAttempt(_ url: URL, to destination: URL, progress: @escaping @Sendable (ResearchDownloadProgress) async -> Void) async throws {
         let part = destination.appendingPathExtension("part"), validatorURL = part.appendingPathExtension("validator")
         let existing = (try? part.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
         let validator = try? String(contentsOf: validatorURL, encoding: .utf8)
@@ -70,7 +92,7 @@ actor OKXResearchTransport: ResearchTransport {
             await progress(.init(receivedBytes: existing, totalBytes: existing, bytesPerSecond: nil))
             try? FileManager.default.removeItem(at: validatorURL); return
         }
-        guard [200, 206].contains(response.statusCode) else { throw FilterError("Archive download failed (HTTP \(response.statusCode)); completed files remain cached.") }
+        guard [200, 206].contains(response.statusCode) else { throw ResearchHTTPError(status: response.statusCode, path: url.path) }
         let resumed = response.statusCode == 206
         let declaredLength = response.value(forHTTPHeaderField: "Content-Length").flatMap(Int64.init)
         var total = declaredLength ?? (response.expectedContentLength > 0 ? response.expectedContentLength : nil)
@@ -114,7 +136,7 @@ actor OKXResearchTransport: ResearchTransport {
         if let total {
             // Read the live file length; URL resource values can retain the pre-resume size.
             let actual = try handle.seekToEnd()
-            guard total >= 0, actual == UInt64(total) else { throw FilterError("Archive size check failed: received \(actual) of \(total) bytes. Resume to finish the partial file.") }
+            guard total >= 0, actual == UInt64(total) else { throw URLError(.networkConnectionLost, userInfo: [NSLocalizedDescriptionKey: "Archive transfer was incomplete: received \(actual) of \(total) bytes."]) }
         }
         if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
         try FileManager.default.moveItem(at: part, to: destination)
@@ -127,9 +149,9 @@ actor OKXResearchTransport: ResearchTransport {
             try await limiter.wait(for: request.url!)
             let (bytes, response) = try await session.bytes(for: request)
             guard let response = response as? HTTPURLResponse else { bytes.task.cancel(); throw FilterError("Archive download failed; completed files remain cached.") }
-            if response.statusCode != 429 { try Task.checkCancellation(); return (bytes, response) }
+            if !ResearchRecovery.isRecoverable(ResearchHTTPError(status: response.statusCode, path: request.url!.path)) { try Task.checkCancellation(); return (bytes, response) }
             bytes.task.cancel()
-            let delay = await limiter.rateLimited(request.url!, response: response, attempt: attempt)
+            let delay = await limiter.retrying(request.url!, response: response, attempt: attempt)
             await progress(.init(receivedBytes: received, totalBytes: nil, bytesPerSecond: nil, retryAt: researchNow() + Int64(delay * 1_000)))
             attempt = min(attempt + 1, 30)
         }
@@ -154,10 +176,10 @@ final class ResearchDataProvider {
         guard let response = try JSONSerialization.jsonObject(with: data) as? [String: Any], response["code"] as? String == "0", let rows = response["data"] as? [Any] else { throw FilterError("OKX rejected a public history request: \(String(decoding: data.prefix(300), as: UTF8.self)).") }
         return rows
     }
-    private func instruments(through: Int64, refresh: Bool, onRateLimit: @escaping @Sendable (Double) async -> Void) async throws -> [ResearchInstrument] {
+    private func instruments(through: Int64, refresh: Bool, onRetry: @escaping @Sendable (Double) async -> Void) async throws -> [ResearchInstrument] {
         var previous = try store.objects("instrument", as: ResearchInstrument.self)
         if !refresh, !previous.isEmpty, previous.filter(\.verified).map(\.observedAt).max().map({ $0 >= through }) == true { return previous }
-        let url = Self.url("/public/instruments", [("instType", "SWAP")]), data = try await transport.get(url, onRateLimit: onRateLimit)
+        let url = Self.url("/public/instruments", [("instType", "SWAP")]), data = try await transport.get(url, onRetry: onRetry)
         let raw = ResearchSource(id: researchHash(url.absoluteString + researchHash(data)), instrument: "CATALOG", kind: "metadata", from: 0, through: researchNow(), url: url.absoluteString, filename: "OKX instrument metadata snapshot", sizeBytes: Int64(data.count), archive: false, rawHash: researchHash(data))
         try data.write(to: store.rawURL(raw), options: .atomic); try store.put(raw.id, kind: "source", raw)
         for case let item as [String: Any] in try rows(data) {
@@ -264,7 +286,7 @@ final class ResearchDataProvider {
                 return RadarBatch(source: source, raw: Data(raw.utf8), values: values)
             } catch {
                 if Task.isCancelled { throw error }
-                throw FilterError("Recorded Radar read failed · \(instrument) · \(range.from)–\(range.through): \(error.localizedDescription)")
+                throw ResearchOperationError(context: "Recorded Radar read failed · \(instrument) · \(range.from)–\(range.through)", underlying: error)
             }
         }
     }
@@ -326,7 +348,7 @@ final class ResearchDataProvider {
             var next = 0
             func enqueue() {
                 let index = next, url = pending[index].url
-                group.addTask { (index, try await transport.get(url, onRateLimit: { await reporter.rateLimited($0) })) }
+                group.addTask { (index, try await transport.get(url, onRetry: { await reporter.retrying($0) })) }
                 next += 1
             }
             for _ in 0..<min(8, pending.count) { enqueue() }
@@ -383,9 +405,9 @@ final class ResearchDataProvider {
         }
         
         await progress(.init(stage: "registry", unit: "steps", completed: 0, total: 1, message: "Reading local instrument metadata; requesting OKX metadata if needed…"))
-        let registry = try await instruments(through: spec.through, refresh: refresh, onRateLimit: { delay in
+        let registry = try await instruments(through: spec.through, refresh: refresh, onRetry: { delay in
             await progress(.init(stage: "registry", unit: "steps", completed: 0, total: 1,
-                                 message: "OKX rate limit · waiting to retry instrument metadata automatically.", retryAt: researchNow() + Int64(delay * 1_000)))
+                                 message: "Temporary request failure or OKX rate limit · waiting to retry instrument metadata automatically.", retryAt: researchNow() + Int64(delay * 1_000)))
         })
         let chosen = registry.filter { $0.verified && $0.listedAt != nil && (spec.instruments.isEmpty || spec.instruments.contains($0.id)) }
         guard !chosen.isEmpty else { throw FilterError("No verified eligible USDT swaps. Refresh the instrument catalog or choose a known instrument.") }
@@ -541,6 +563,9 @@ final class ResearchDataProvider {
     }
     func prepare(_ source: ResearchSource, instruments: [ResearchInstrument], progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void = { _ in }) async throws {
         guard !ResearchSpreadPolicy.excludes(source) else { throw FilterError("Research no longer prepares bid/ask spread or order book archives. Review the updated data plan.") }
+        // Preparation changes local coverage, even when interrupted. Replanning
+        // must inspect that checkpoint's inputs instead of returning stale gaps.
+        try store.database.execute("DELETE FROM research_objects WHERE kind='planCache'")
         var source = source
         let file = store.rawURL(source)
         let filename = source.filename, instrument = source.instrument
@@ -560,22 +585,52 @@ final class ResearchDataProvider {
             try store.put(source.id, kind: "source", source)
         } else if let saved = try store.get(source.id, as: ResearchSource.self) {
             await progress(.init(stage: "verifying", filename: filename, instrument: instrument))
-            guard try hashFile(file) == saved.rawHash else { throw FilterError("A cached archive failed its SHA-256 check. Refresh the data plan to replace it.") }
+            if try hashFile(file) != saved.rawHash {
+                // Retain the damaged input, then fetch a fresh copy.
+                try FileManager.default.moveItem(at: file, to: file.appendingPathExtension("rejected-\(UUID())"))
+                source.rawHash = nil; try store.put(source.id, kind: "source", source)
+                try await prepare(source, instruments: instruments, progress: progress)
+                return
+            }
             source.rawHash = saved.rawHash
         }
         await progress(.init(stage: "importing", filename: filename, instrument: instrument))
+        var archiveAccepted = true
         if source.archive {
             let importer = ResearchArchiveImporter(store: store, source: source, instruments: instruments)
-            let encountered = try importer.run(file: file)
-            source.warnings = importer.warnings
+            let encountered: [String]
+            do { encountered = try importer.run(file: file); source.warnings = importer.warnings }
+            catch let error as ResearchArchiveError {
+                guard source.kind == "candle" else { throw error }
+                try store.rejectArchiveCandles(source)
+                archiveAccepted = false; encountered = []
+                source.warnings = importer.warnings + ["\(filename): \(error.localizedDescription) Confirmed REST history was requested automatically; the archive was retained."]
+                try await prepare(restSource(instrument, kind: source.kind, .init(from: source.from, through: source.through), refresh: source.refresh), instruments: instruments, progress: progress)
+            }
             for id in encountered where !instruments.contains(where: { $0.id == id }) {
                 if try store.get("instrument:\(id)", as: ResearchInstrument.self) == nil {
                     try store.put("instrument:\(id)", kind: "instrument", ResearchInstrument(id: id, verified: false, source: source.url, observedAt: researchNow()))
                 }
             }
+            if source.kind == "candle" {
+                let metadata = instruments.first { $0.id == instrument }
+                let from = max(source.from, metadata?.listedAt.map { ($0 + hourMS - 1) / hourMS * hourMS } ?? source.from)
+                let through = min(source.through, researchNow() / hourMS * hourMS - hourMS, metadata?.delistedAt.map { ($0 / hourMS) * hourMS - hourMS } ?? source.through)
+                let gaps = try store.missingConfirmedCandles(instrument, from: from, through: through)
+                for range in gaps {
+                    await progress(.init(stage: "recovering", filename: filename, instrument: instrument,
+                                         recovery: "Checking missing archive hours against confirmed OKX history automatically."))
+                    try await prepare(restSource(instrument, kind: "candle", range, refresh: source.refresh), instruments: instruments, progress: progress)
+                }
+                let remaining = try store.missingConfirmedCandles(instrument, from: from, through: through)
+                if !remaining.isEmpty {
+                    archiveAccepted = false
+                    source.warnings = (source.warnings ?? []) + ["\(filename): \(remaining.reduce(0) { $0 + $1.hours }) hourly candles remain unavailable after checking confirmed OKX history; affected inputs remain Unknown and archive coverage was not marked complete."]
+                }
+            }
         } else { try parseREST(source, file: file) }
         source.parser = ResearchVersion.parser; try store.put(source.id, kind: "source", source)
-        try store.cover(source)
+        if archiveAccepted { try store.cover(source) }
     }
     private func fetchREST(_ source: ResearchSource, file: URL, progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void) async throws {
         // Each fetched page is fixed immediately. A restart reuses all completed
@@ -595,7 +650,7 @@ final class ResearchDataProvider {
             else {
                 let received = received, count = pages.count
                 let fraction = min(1, Double(source.through + hourMS - cursor) / Double(max(hourMS, source.through + hourMS - source.from)))
-                data = try await transport.get(url, onRateLimit: { delay in
+                data = try await transport.get(url, onRetry: { delay in
                     await progress(.init(stage: "fetching", filename: source.filename, instrument: source.instrument, receivedBytes: received, pages: count, fraction: fraction, retryAt: researchNow() + Int64(delay * 1_000)))
                 })
                 _ = try rows(data); try data.write(to: page, options: .atomic)

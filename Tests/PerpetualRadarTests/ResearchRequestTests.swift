@@ -5,6 +5,7 @@ private struct ResearchHTTPReply: Sendable {
     var status = 200
     var headers: [String: String] = [:]
     var data = Data(#"{"code":"0","data":[]}"#.utf8)
+    var error: URLError.Code?
 }
 
 private final class ResearchHTTPFixture: @unchecked Sendable {
@@ -33,6 +34,7 @@ private final class ResearchHTTPProtocol: URLProtocol, @unchecked Sendable {
     override func startLoading() {
         guard let fixture = Self.lock.withLock({ Self.fixtures[request.url!.host!] }) else { return }
         let reply = fixture.respond(request)
+        if let error = reply.error { client?.urlProtocol(self, didFailWithError: URLError(error)); return }
         let response = HTTPURLResponse(url: request.url!, statusCode: reply.status, httpVersion: "HTTP/1.1", headerFields: reply.headers)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: reply.data)
@@ -68,7 +70,7 @@ final class ResearchRequestTests: XCTestCase {
         let session = session(fixture), recorder = ResearchRetryRecorder()
         defer { session.invalidateAndCancel(); ResearchHTTPProtocol.remove(fixture) }
         let transport = OKXResearchTransport(session: session, limiter: limiter())
-        let data = try await transport.get(fixture.url, onRateLimit: { await recorder.retry($0) })
+        let data = try await transport.get(fixture.url, onRetry: { await recorder.retry($0) })
         XCTAssertEqual(data, ResearchHTTPReply().data)
         let requests = fixture.requests, delays = await recorder.delays
         XCTAssertEqual(requests.count, 9, "Even prolonged rate limiting must recover automatically, without an attempt limit.")
@@ -86,7 +88,7 @@ final class ResearchRequestTests: XCTestCase {
         let session = session(fixture), recorder = ResearchRetryRecorder(), requestLimiter = limiter(interval: .milliseconds(20), backoff: 0.12, cap: 0.12)
         defer { session.invalidateAndCancel(); ResearchHTTPProtocol.remove(fixture) }
         let first = OKXResearchTransport(session: session, limiter: requestLimiter), second = OKXResearchTransport(session: session, limiter: requestLimiter)
-        let initial = Task { try await first.get(fixture.url, onRateLimit: { await recorder.retry($0) }) }
+        let initial = Task { try await first.get(fixture.url, onRetry: { await recorder.retry($0) }) }
         let deadline = ContinuousClock.now + .seconds(2)
         while !(await recorder.hasRetry()), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
         let reported = await recorder.hasRetry(); XCTAssertTrue(reported)
@@ -116,7 +118,7 @@ final class ResearchRequestTests: XCTestCase {
             let session = session(fixture), recorder = ResearchRetryRecorder()
             defer { session.invalidateAndCancel(); ResearchHTTPProtocol.remove(fixture) }
             let transport = OKXResearchTransport(session: session, limiter: limiter())
-            _ = try await transport.get(fixture.url, onRateLimit: { await recorder.retry($0) })
+            _ = try await transport.get(fixture.url, onRetry: { await recorder.retry($0) })
             let requests = fixture.requests, delays = await recorder.delays
             XCTAssertEqual(requests.count, 2)
             XCTAssertGreaterThanOrEqual(delays[0], 0.9)
@@ -129,7 +131,7 @@ final class ResearchRequestTests: XCTestCase {
         let session = session(fixture), recorder = ResearchRetryRecorder()
         defer { session.invalidateAndCancel(); ResearchHTTPProtocol.remove(fixture) }
         let transport = OKXResearchTransport(session: session, limiter: limiter())
-        let work = Task { try await transport.get(fixture.url, onRateLimit: { await recorder.retry($0) }) }
+        let work = Task { try await transport.get(fixture.url, onRetry: { await recorder.retry($0) }) }
         let deadline = ContinuousClock.now + .seconds(2)
         while !(await recorder.hasRetry()), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
         let reported = await recorder.hasRetry(); XCTAssertTrue(reported)
@@ -142,13 +144,59 @@ final class ResearchRequestTests: XCTestCase {
     }
 
     func testPermanentHTTPFailureIsNotRetried() async throws {
-        let fixture = ResearchHTTPFixture { _, _ in .init(status: 404) }
-        let session = session(fixture)
+        for status in [400, 401, 403, 404, 501, 505] {
+            let fixture = ResearchHTTPFixture { _, _ in .init(status: status) }
+            let session = session(fixture)
+            defer { session.invalidateAndCancel(); ResearchHTTPProtocol.remove(fixture) }
+            let transport = OKXResearchTransport(session: session, limiter: limiter())
+            do { _ = try await transport.get(fixture.url); XCTFail("A permanent HTTP error must stop the request.") }
+            catch { XCTAssertTrue(error.localizedDescription.contains("HTTP \(status)")) }
+            XCTAssertEqual(fixture.requests.count, 1)
+        }
+    }
+
+    func testNetworkFailuresAndServerErrorsRetryTheSameRequestAutomatically() async throws {
+        let fixture = ResearchHTTPFixture { _, ordinal in
+            switch ordinal {
+            case 1: return .init(error: .timedOut)
+            case 2: return .init(error: .networkConnectionLost)
+            case 3: return .init(error: .notConnectedToInternet)
+            case 4: return .init(status: 503)
+            case 5: return .init(status: 408)
+            default: return .init()
+            }
+        }
+        let session = session(fixture), recorder = ResearchRetryRecorder()
         defer { session.invalidateAndCancel(); ResearchHTTPProtocol.remove(fixture) }
         let transport = OKXResearchTransport(session: session, limiter: limiter())
-        do { _ = try await transport.get(fixture.url); XCTFail("A missing endpoint must report its error.") }
-        catch { XCTAssertTrue(error.localizedDescription.contains("HTTP 404")) }
-        XCTAssertEqual(fixture.requests.count, 1)
+        let data = try await transport.get(fixture.url, onRetry: { await recorder.retry($0) })
+        XCTAssertEqual(data, ResearchHTTPReply().data)
+        XCTAssertEqual(fixture.requests.count, 6)
+        XCTAssertTrue(fixture.requests.allSatisfy { $0.0.url == fixture.url })
+        let delays = await recorder.delays
+        XCTAssertEqual(delays.count, 5)
+        XCTAssertTrue(delays.allSatisfy { $0 > 0 })
+    }
+
+    func testTruncatedArchiveResumesItsPartialBytesAutomatically() async throws {
+        let payload = Data(repeating: 42, count: 65_540), offset = 65_536
+        let fixture = ResearchHTTPFixture { _, ordinal in
+            ordinal == 1 ? .init(headers: ["ETag": "fixture", "Content-Length": String(payload.count)], data: payload.prefix(offset)) :
+                .init(status: 206, headers: ["ETag": "fixture", "Content-Length": "4", "Content-Range": "bytes \(offset)-65539/65540"], data: payload.dropFirst(offset))
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ResearchTruncated-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let destination = directory.appendingPathComponent("archive.zip"), session = session(fixture), recorder = ResearchRetryRecorder()
+        defer { session.invalidateAndCancel(); ResearchHTTPProtocol.remove(fixture); try? FileManager.default.removeItem(at: directory) }
+        let transport = OKXResearchTransport(session: session, limiter: limiter())
+        try await transport.download(fixture.url, to: destination) { update in
+            if let retryAt = update.retryAt { await recorder.retry(Double(retryAt)) }
+        }
+        XCTAssertEqual(try Data(contentsOf: destination), payload)
+        XCTAssertEqual(fixture.requests.count, 2)
+        XCTAssertEqual(fixture.requests.last?.0.value(forHTTPHeaderField: "Range"), "bytes=\(offset)-")
+        XCTAssertEqual(fixture.requests.last?.0.value(forHTTPHeaderField: "If-Range"), "fixture")
+        let reported = await recorder.hasRetry(); XCTAssertTrue(reported)
     }
 
     func testArchiveRateLimitPreservesResumeHeadersAndPartialBytes() async throws {

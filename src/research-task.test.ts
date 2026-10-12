@@ -90,3 +90,16 @@ test('rate limits show automatic retry countdown without pausing the task or los
   job.phase = 'paused'; job.preparation.retryAt = 6000
   assert.equal(researchWaiting(job, 1000), '')
 })
+
+test('recoverable task errors stay active and show the cause and automatic retry countdown', () => {
+  const job = downloading()
+  job.retryAt = 6000; job.recovery = 'The network connection was lost.'
+  assert.equal(researchTaskActive(job), true)
+  assert.match(researchWaiting(job, 1000), /network connection was lost.*Retrying automatically in 5s/)
+  assert.equal(job.error, '')
+  job.retryAt = undefined; job.recovery = undefined
+  job.preparation!.stage = 'recovering'; job.preparation!.recovery = 'Checking missing archive hours automatically.'
+  assert.equal(researchWaiting(job, 1000), 'Checking missing archive hours automatically.')
+  job.phase = 'paused'
+  assert.equal(researchWaiting(job, 1000), '')
+})

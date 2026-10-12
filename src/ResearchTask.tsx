@@ -10,7 +10,7 @@ import type { ResearchJob } from '@/research-types'
 import { researchByteSize, researchDuration, researchFilePercent, researchPlanningDescription, researchPlanningStage, researchProgressLabel, researchTaskActive, researchWaiting } from '@/research-task'
 import { researchTime } from '@/research-types'
 
-const stages: Record<string, string> = { checking: 'Checking local cache', connecting: 'Connecting to OKX', downloading: 'Downloading archive', fetching: 'Fetching history pages', verifying: 'Verifying downloaded data', importing: 'Importing downloaded data', prepared: 'Source prepared', freezing: 'Freezing dataset' }
+const stages: Record<string, string> = { checking: 'Checking local cache', connecting: 'Connecting to OKX', downloading: 'Downloading archive', fetching: 'Fetching history pages', verifying: 'Verifying downloaded data', importing: 'Importing downloaded data', recovering: 'Recovering missing data', retrying: 'Retrying automatically', prepared: 'Source prepared', freezing: 'Freezing dataset' }
 const phases: Record<string, string> = { planning: 'Planning', planned: 'Data plan ready', preparing: 'Preparing data', running: 'Running study', ready: 'Data ready', completed: 'Study completed', failed: 'Failed', paused: 'Paused', cancelled: 'Cancelled' }
 
 export const ResearchTask = memo(function ResearchTask({ active, job, error, pending, onPause, onCancel, onResume }: {
@@ -60,7 +60,7 @@ export const ResearchTask = memo(function ResearchTask({ active, job, error, pen
           {job.phase === 'preparing' && <div className="flex items-center gap-6"><span title="Estimated from completed sources. Download and import times may vary.">Estimated time to ready: {source?.remainingSeconds == null ? 'Estimating…' : 'About ' + researchDuration(source.remainingSeconds)}</span>{downloading && <span>File remaining: {source.fileRemainingSeconds == null ? 'Estimating…' : 'About ' + researchDuration(source.fileRemainingSeconds)}</span>}</div>}
           {waiting && <p role="status" aria-live="polite">{waiting}</p>}
         </>}
-        <p>Completed data stays on disk.{working ? ' Pause or quit to save a checkpoint.' : job?.phase === 'failed' || job?.phase === 'paused' ? ' Resume to retry from the saved checkpoint.' : ''}</p>
+        <p>Completed data stays on disk.{working ? ' Recoverable errors retry automatically. Pause or quit to save a checkpoint.' : job?.phase === 'failed' || job?.phase === 'paused' ? ' Resume to retry from the saved checkpoint.' : ''}</p>
       </AlertDescription>
     </Alert>
   </aside>, document.body)

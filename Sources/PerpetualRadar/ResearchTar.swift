@@ -43,7 +43,7 @@ final class ResearchTar {
                     }
                     size = !overflow && value <= UInt64(Int64.max) ? Int64(value) : nil
                 } else { size = Int64(text(124,136), radix: 8) }
-                guard Int(text(148,156), radix: 8) == checksum, let size, size >= 0 else { throw FilterError("Invalid TAR member header or checksum.") }
+                guard Int(text(148,156), radix: 8) == checksum, let size, size >= 0 else { throw ResearchArchiveError("Invalid TAR member header or checksum.") }
                 remaining = size; padding = Int((512 - size % 512) % 512)
                 if header[156] == 48 || header[156] == 0 {
                     let prefix = text(345,500), filename = (prefix.isEmpty ? "" : prefix+"/") + text(0,100)
@@ -54,11 +54,11 @@ final class ResearchTar {
         }
         if ended { pending.removeAll() }
     }
-    func complete() throws { guard ended, remaining == 0 else { throw FilterError("The TAR archive is truncated.") } }
+    func complete() throws { guard ended, remaining == 0 else { throw ResearchArchiveError("The TAR archive is truncated.") } }
     static func readGzip(_ file: URL, consume: (Data) throws -> Void) throws {
         let handle = try FileHandle(forReadingFrom: file); defer { try? handle.close() }
         var stream = z_stream()
-        guard inflateInit2_(&stream, 32+MAX_WBITS, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size)) == Z_OK else { throw FilterError("Cannot initialize the archive decompressor.") }
+        guard inflateInit2_(&stream, 32+MAX_WBITS, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size)) == Z_OK else { throw ResearchArchiveError("Cannot initialize the archive decompressor.") }
         defer { inflateEnd(&stream) }
         let output = UnsafeMutablePointer<UInt8>.allocate(capacity: 64*1024); defer { output.deallocate() }
         var ended = false
@@ -70,13 +70,13 @@ final class ResearchTar {
                     stream.next_out = output; stream.avail_out = 64*1024
                     let code = inflate(&stream, Z_NO_FLUSH), count = 64*1024-Int(stream.avail_out)
                     if code == Z_BUF_ERROR && stream.avail_in == 0 && count == 0 { break }
-                    guard code == Z_OK || code == Z_STREAM_END else { throw FilterError("Gzip archive failed its stream or CRC check.") }
+                    guard code == Z_OK || code == Z_STREAM_END else { throw ResearchArchiveError("Gzip archive failed its stream or CRC check.") }
                     if count > 0 { try consume(Data(bytes: output, count: count)) }
                     if code == Z_STREAM_END { ended = true; break }
                 } while stream.avail_in > 0 || stream.avail_out == 0
             }
             if ended { break }
         }
-        guard ended else { throw FilterError("The Gzip archive is truncated. Its partial file was retained.") }
+        guard ended else { throw ResearchArchiveError("The Gzip archive is truncated. Its partial file was retained.") }
     }
 }

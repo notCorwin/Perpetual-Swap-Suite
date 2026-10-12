@@ -47,31 +47,37 @@ actor ResearchWorker {
         let pendingSources = plan.sources.enumerated().filter { !completedIDs.contains($0.element.id) }
         
         // Concurrent preparation with progress tracking
-        let coordinator = PreparationCoordinator(total: plan.sources.count, alreadyCompleted: completedIDs.count)
+        let coordinator = PreparationCoordinator(total: plan.sources.count, alreadyCompleted: completedIDs.count,
+                                                 durations: completedIDs.compactMap { checkpoint.sourceSeconds?[$0] })
         let inputs = pendingSources.map { ($0.offset, $0.element) }
         
         // Each concurrent task gets its own store and provider to avoid shared state issues
         try await ResearchLocalScan.run(inputs, operation: { [directory, transport, radarURL] (_: Int, item: (Int, ResearchSource)) -> PreparedSource in
             let (index, source) = item
             let started = ContinuousClock.now
-            // Create isolated store and provider for this task
-            let taskStore = try ResearchStore(directory: directory)
-            let taskProvider = ResearchDataProvider(store: taskStore, transport: transport, radarURL: radarURL)
             do {
-                try await taskProvider.prepare(source, instruments: plan.inputInstruments) { update in
-                    var update = update
-                    let (completed, estimate) = await coordinator.estimateRemaining(for: index)
-                    if let estimate {
-                        let remaining = max(update.fileRemainingSeconds ?? 0, estimate - researchSeconds(started.duration(to: .now)))
-                        update.remainingSeconds = remaining > 0 ? remaining : nil
+                try await ResearchRecovery.run(onRetry: { delay, reason in
+                    let (completed, _) = await coordinator.estimateRemaining(for: index)
+                    await progress(completed, plan.sources.count, .init(stage: "retrying", filename: source.filename, instrument: source.instrument,
+                                                                       retryAt: researchNow() + Int64(delay * 1_000), recovery: reason))
+                }) {
+                    let taskStore = try ResearchStore(directory: directory)
+                    let taskProvider = ResearchDataProvider(store: taskStore, transport: transport, radarURL: radarURL)
+                    try await taskProvider.prepare(source, instruments: plan.inputInstruments) { update in
+                        var update = update
+                        let (completed, estimate) = await coordinator.estimateRemaining(for: index)
+                        if let estimate {
+                            let remaining = max(update.fileRemainingSeconds ?? 0, estimate - researchSeconds(started.duration(to: .now)))
+                            update.remainingSeconds = remaining > 0 ? remaining : nil
+                        }
+                        await progress(completed, plan.sources.count, update)
                     }
-                    await progress(completed, plan.sources.count, update)
                 }
                 let elapsed = researchSeconds(started.duration(to: .now))
                 return PreparedSource(index: index, source: source, elapsed: elapsed, error: nil)
             } catch {
                 if Task.isCancelled { throw error }
-                throw FilterError("\(source.instrument) · \(source.filename): \(error.localizedDescription)")
+                throw ResearchOperationError(context: "\(source.instrument) · \(source.filename)", underlying: error)
             }
         }) { [directory] (_: Int, result: PreparedSource) in
             try Task.checkCancellation()
@@ -83,9 +89,12 @@ actor ResearchWorker {
             if !updatedCheckpoint.completedSources.contains(result.source.id) {
                 updatedCheckpoint.completedSources.append(result.source.id)
             }
+            if updatedCheckpoint.sourceSeconds == nil { updatedCheckpoint.sourceSeconds = [:] }
+            updatedCheckpoint.sourceSeconds?[result.source.id] = result.elapsed
             updatedCheckpoint.updatedAt = researchNow()
             try checkpointStore.put("checkpoint:\(study.id)", kind: "checkpoint", updatedCheckpoint)
-            await progress(completed, plan.sources.count, .init(stage: "prepared", filename: result.source.filename, instrument: result.source.instrument))
+            let (_, estimate) = await coordinator.estimateRemaining(for: result.index)
+            await progress(completed, plan.sources.count, .init(stage: "prepared", filename: result.source.filename, instrument: result.source.instrument, remainingSeconds: estimate))
         }
         
         try Task.checkCancellation()
@@ -115,9 +124,10 @@ actor ResearchWorker {
         private var measuredSeconds: Double = 0
         private var measuredCount: Int = 0
         
-        init(total: Int, alreadyCompleted: Int) {
+        init(total: Int, alreadyCompleted: Int, durations: [Double]) {
             self.total = total
             self.completed = alreadyCompleted
+            measuredSeconds = durations.reduce(0, +); measuredCount = durations.count
         }
         
         func recordCompletion(_ result: PreparedSource) -> Int {
@@ -249,6 +259,12 @@ final class ResearchController {
         status?.completed = completed; status?.total = total; status?.message = message
         status?.preparation = preparation; status?.updatedAt = researchNow()
         status?.catalog = catalog; status?.planning = planning
+        status?.retryAt = nil; status?.recovery = nil
+    }
+    private func retry(_ id: String, delay: Double, reason: String) {
+        guard status?.id == id else { return }
+        status?.retryAt = researchNow() + Int64(delay * 1_000)
+        status?.recovery = reason; status?.updatedAt = researchNow()
     }
     private func finish(_ id: String, phase: String, resultID: String? = nil, error: String = "") {
         guard status?.id == id else { return }
@@ -257,6 +273,7 @@ final class ResearchController {
         if phase == "ready" { status?.message = "Dataset frozen and ready to run." }
         if phase == "completed" { status?.message = "Study complete." }
         status?.updatedAt = researchNow()
+        status?.retryAt = nil; status?.recovery = nil
         if let studyID = activeStudyID, phase == "failed" {
             do {
                 var checkpoint = try store.get("checkpoint:\(studyID)", as: Checkpoint.self) ?? Checkpoint(studyID: studyID, phase: phase)
@@ -283,10 +300,13 @@ final class ResearchController {
         }
         task = Task.detached(priority: .background) { [self, worker] in
             do {
-                let plan = try await worker.plan(spec, refresh: refresh, owner: study.id, catalogProgress: { update in
-                    await self.advance(id, completed: update.completed, total: update.total, message: update.message, catalog: update)
-                }) { update in await self.advance(id, completed: update.completed, total: update.total, message: update.message, planning: update) }
-                try await self.savePlan(plan, study: study)
+                let plan = try await ResearchRecovery.run(onRetry: { delay, reason in await self.retry(id, delay: delay, reason: reason) }) {
+                    let plan = try await worker.plan(spec, refresh: refresh, owner: study.id, catalogProgress: { update in
+                        await self.advance(id, completed: update.completed, total: update.total, message: update.message, catalog: update)
+                    }) { update in await self.advance(id, completed: update.completed, total: update.total, message: update.message, planning: update) }
+                    try await self.savePlan(plan, study: study)
+                    return plan
+                }
                 await self.finish(id, phase: "planned", resultID: plan.id)
             } catch { await self.finish(id, phase: Task.isCancelled ? "paused" : "failed", resultID: study.id, error: Task.isCancelled ? "" : error.localizedDescription) }
         }
@@ -316,7 +336,9 @@ final class ResearchController {
         }
         task = Task.detached(priority: .background) { [self, worker] in
             do {
-                let prepared = try await worker.prepare(study, plan: plan) { n, total, update in await self.advance(id, completed: n, total: total, message: update.filename, preparation: update) }
+                let prepared = try await ResearchRecovery.run(onRetry: { delay, reason in await self.retry(id, delay: delay, reason: reason) }) {
+                    try await worker.prepare(study, plan: plan) { n, total, update in await self.advance(id, completed: n, total: total, message: update.filename, preparation: update) }
+                }
                 await self.finish(id, phase: "ready", resultID: prepared.id)
             } catch { await self.finish(id, phase: Task.isCancelled ? "paused" : "failed", resultID: study.id, error: Task.isCancelled ? "" : error.localizedDescription) }
         }
@@ -329,7 +351,9 @@ final class ResearchController {
         let id = try begin("running", studyID: study.id)
         task = Task.detached(priority: .background) { [self, worker] in
             do {
-                let report = try await worker.run(study) { n, total, message in Task { await self.advance(id, completed: n, total: total, message: message) } }
+                let report = try await ResearchRecovery.run(onRetry: { delay, reason in await self.retry(id, delay: delay, reason: reason) }) {
+                    try await worker.run(study) { n, total, message in Task { await self.advance(id, completed: n, total: total, message: message) } }
+                }
                 await self.finish(id, phase: "completed", resultID: report.studyID)
             } catch { await self.finish(id, phase: Task.isCancelled ? "paused" : "failed", resultID: study.id, error: Task.isCancelled ? "" : error.localizedDescription) }
         }

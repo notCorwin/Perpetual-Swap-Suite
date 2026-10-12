@@ -150,7 +150,6 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
             if (stopped) return
             if (selected && j.phase === 'completed') setTab('results')
           }
-          if (j.error) setError(j.error)
           handledJob.current = key
         }
         setPollError('')

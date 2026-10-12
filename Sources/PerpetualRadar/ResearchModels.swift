@@ -154,6 +154,7 @@ struct Checkpoint: Codable, Sendable {
     var studyID: String
     var phase: String
     var completedSources: [String] = []
+    var sourceSeconds: [String: Double]?
     var refresh = false
     var error: String?
     var instrumentIndex = 0
@@ -288,6 +289,8 @@ struct ResearchJobStatus: Codable, Sendable {
     var preparation: ResearchPreparationProgress?
     var catalog: ResearchCatalogProgress?
     var planning: ResearchPlanningProgress?
+    var retryAt: Int64?
+    var recovery: String?
 }
 
 struct ResearchPlanningProgress: Codable, Sendable {
@@ -353,6 +356,7 @@ struct ResearchPreparationProgress: Codable, Sendable {
     var pages = 0
     var fraction: Double?
     var retryAt: Int64?
+    var recovery: String?
 }
 
 // Pressure notifications are shared by the downloader and the single parser /
