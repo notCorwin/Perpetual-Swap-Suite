@@ -76,7 +76,7 @@ final class ResearchCatalogTests: XCTestCase {
             let plan = try await provider.plan(spec) { _ in }
             let expectedIDs = Set(instruments.map(\.id))
             XCTAssertEqual(Set(plan.instruments.map(\.id)), expectedIDs)
-            for (module, kind) in [(1, "taker"), (2, "candle"), (3, "funding"), (4, "spread")] {
+            for (module, kind) in [(1, "taker"), (2, "candle"), (3, "funding")] {
                 XCTAssertEqual(Set(plan.sources.filter { $0.archive && $0.module == module && $0.kind == kind }.map(\.instrument)), expectedIDs)
             }
             let urls = await transport.urls()
@@ -88,7 +88,8 @@ final class ResearchCatalogTests: XCTestCase {
                 let period = "\(parameters["module"]!):\(parameters["begin"]!):\(parameters["end"]!)"
                 periods[period, default: []] += families
             }
-            XCTAssertGreaterThan(periods.keys.filter { $0.hasPrefix("4:") }.count, 1, "Daily archives must span multiple date windows.")
+            XCTAssertFalse(periods.keys.contains { $0.hasPrefix("4:") }, "Research must never query order book archives, even when a saved rule uses spread.")
+            XCTAssertFalse(plan.sources.contains { $0.kind == "spread" })
             let expectedFamilies = Set(instruments.map { $0.id.replacingOccurrences(of: "-SWAP", with: "") })
             for families in periods.values {
                 XCTAssertEqual(Set(families), expectedFamilies)
@@ -124,9 +125,9 @@ final class ResearchCatalogTests: XCTestCase {
         let store = try ResearchStore(directory: FileManager.default.temporaryDirectory.appendingPathComponent("ResearchCatalog-\(UUID())"))
         defer { try? FileManager.default.removeItem(at: store.directory) }
         let instruments = try seed(store, count: 1), transport = ResearchCatalogTransport(), recorder = ResearchCatalogRecorder()
-        let spec = try ResearchFixture.spec("Close > 0 AND spread >= 0")
+        let spec = try ResearchFixture.spec("Close > 0 AND buy > 0")
         let begin = ResearchFixture.hour - 276 * hourMS, end = spec.through + 48 * hourMS
-        for (kind, last) in [("candle", end), ("spread", end - 2 * hourMS)] {
+        for (kind, last) in [("candle", end), ("taker", end - 2 * hourMS)] {
             try store.cover(.init(id: kind, instrument: instruments[0].id, kind: kind, from: begin, through: last, url: "fixture", filename: "Local coverage", archive: false))
         }
         let provider = ResearchDataProvider(store: store, transport: transport, radarURL: store.directory.appendingPathComponent("absent"))
@@ -134,15 +135,15 @@ final class ResearchCatalogTests: XCTestCase {
         let urls = await transport.urls(), updates = await recorder.values()
         XCTAssertEqual(urls.count, 1, "Only the date window containing the remaining gap needs a directory request.")
         let parameters = Dictionary(uniqueKeysWithValues: URLComponents(url: urls[0], resolvingAgainstBaseURL: false)!.queryItems!.map { ($0.name, $0.value!) })
-        XCTAssertEqual(parameters["module"], "4")
-        XCTAssertGreaterThan(Int64(parameters["begin"]!)!, begin)
+        XCTAssertEqual(parameters["module"], "1")
+        XCTAssertGreaterThan(Int64(parameters["end"]!)!, end - 2 * hourMS)
         XCTAssertEqual(updates.first?.completed, 0); XCTAssertEqual(updates.first?.total, 1)
         XCTAssertEqual(updates.last?.completed, 1); XCTAssertEqual(updates.last?.waitingForResponse, false)
         XCTAssertEqual(updates.last?.remainingSeconds, 0)
-        XCTAssertTrue(plan.sources.allSatisfy { $0.kind == "spread" })
+        XCTAssertTrue(plan.sources.allSatisfy { $0.kind == "taker" })
     }
 
-    func testPublishedOrderBookStartKeepsStudyRangeAndExplicitRefreshCanFindEarlierBackfills() async throws {
+    func testSpreadIsExcludedAcrossAllDatesAndExplicitRefresh() async throws {
         let store = try ResearchStore(directory: FileManager.default.temporaryDirectory.appendingPathComponent("ResearchCatalog-\(UUID())"))
         defer { try? FileManager.default.removeItem(at: store.directory) }
         let first: Int64 = 1_675_209_600_000 // 2023-02-01 UTC
@@ -154,11 +155,13 @@ final class ResearchCatalogTests: XCTestCase {
         let originalURLs = await transport.urls()
         XCTAssertFalse(originalURLs.contains { $0.query?.contains("module=4") == true })
         XCTAssertEqual(plan.from, first); XCTAssertEqual(plan.through, spec.through)
-        XCTAssertTrue(plan.warnings.contains { $0.contains("March 2023") && $0.contains("Unknown") })
+        XCTAssertTrue(plan.warnings.contains { $0.contains("excludes bid/ask spread") })
+        XCTAssertFalse(plan.coverage.contains { $0.kind == "spread" })
         let refreshed = try await provider.plan(spec, refresh: true) { _ in }
         let refreshedURLs = await transport.urls()
-        XCTAssertTrue(refreshedURLs.contains { $0.query?.contains("module=4") == true })
-        XCTAssertTrue(refreshed.sources.contains { $0.kind == "spread" && $0.from < 1_677_628_800_000 })
+        XCTAssertFalse(refreshedURLs.contains { $0.query?.contains("module=4") == true })
+        XCTAssertFalse(refreshed.sources.contains { $0.kind == "spread" })
+        XCTAssertEqual(refreshed.from, first); XCTAssertEqual(refreshed.through, spec.through)
     }
 
     func testCatalogConcurrencyIsBoundedAndKeepsAllFiles() async throws {

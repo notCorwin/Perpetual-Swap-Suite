@@ -30,13 +30,14 @@ enum ResearchEngine {
     }
     static func reconstruct(_ input: ResearchSeries) -> ResearchSeries {
         var result = input, volumes: [(Int64, Double)] = [], sum = 0.0
+        result.quotes = input.quotes.compactMapValues { quote in quote.turnover.map { .init(turnover: $0, spread: nil, timestamp: quote.timestamp) } }
         for hour in input.candles.keys.sorted() {
             guard let bar = input.candles[hour], bar.confirmed, let base = bar.baseVolume else { volumes.removeAll(); sum = 0; continue }
             if let previous = volumes.last, previous.0 + hourMS != hour { volumes.removeAll(); sum = 0 }
             volumes.append((hour, base)); sum += base
             if volumes.count > 24 { sum -= volumes.removeFirst().1 }
             if volumes.count == 24, result.quotes[hour]?.turnover == nil {
-                result.quotes[hour] = FilterQuote(turnover: sum * bar.close, spread: result.quotes[hour]?.spread, timestamp: hour + hourMS - 1)
+                result.quotes[hour] = FilterQuote(turnover: sum * bar.close, spread: nil, timestamp: hour + hourMS - 1)
             }
         }
         return result
@@ -83,7 +84,7 @@ enum ResearchEngine {
     }
     static func run(store: ResearchStore, study: ResearchStudy, manifest: DataManifest, checkpoint: inout Checkpoint,
                     progress: (Int, Int, String) -> Void) throws {
-        let rules = try study.spec.rules.map { try FilterCompiler.compile(FilterConfigV2.decode($0.filtersJSON)) }
+        let rules = try study.spec.excludingSpread().rules.map { try FilterCompiler.compile(FilterConfigV2.decode($0.filtersJSON)) }
         let warmup = ResearchVersion.warmup(rules)
         let total = manifest.instruments.count
         func firstHour(_ instrument: ResearchInstrument) -> Int64 { max(manifest.from - hourMS, (instrument.listedAt ?? manifest.from) / hourMS * hourMS) }

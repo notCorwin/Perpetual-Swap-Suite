@@ -66,6 +66,26 @@ final class StrategyWorkflowTests: XCTestCase {
         }
     }
 
+    func testResearchOmitsSpreadFromFrozenStrategiesAndPreservesRadarRules() throws {
+        let original = try profile(universe: "turnover > 0 AND spread <= 0.15", setup: "Close > 100 AND btc(spread) <= 0.15")
+        var spec = StudySpec(name: "Without spread", rules: [], through: hour)
+        spec.strategySnapshots = [original]
+        let resolved = try spec.resolvingStrategyRules()
+        XCTAssertEqual(resolved.strategySnapshots?.first?.universeJSON, original.universeJSON)
+        XCTAssertEqual(resolved.strategySnapshots?.first?.phaseRules, original.phaseRules)
+        let compiled = try FilterCompiler.compile(FilterConfigV2.decode(resolved.rules[0].filtersJSON))
+        XCTAssertFalse(compiled.metrics.contains("spread")); XCTAssertFalse(compiled.referencesBTC)
+        var context = market(150)
+        context.quotes[hour] = .init(turnover: 20_000_000, spread: 50, timestamp: hour + hourMS - 1)
+        XCTAssertEqual(try truth(original.universeJSON, market: context), .no, "Radar still applies the saved spread restriction.")
+        XCTAssertEqual(try truth(resolved.rules[0].filtersJSON, market: context), .yes)
+        context = market(50)
+        context.quotes[hour] = .init(turnover: 20_000_000, spread: 50, timestamp: hour + hourMS - 1)
+        XCTAssertEqual(try truth(resolved.rules[0].filtersJSON, market: context), .no, "Research still applies non-spread conditions.")
+        XCTAssertEqual(resolved.excludedSpreadConditions?.count, 2)
+        XCTAssertEqual(try spec.resolvingStrategyRules().rules[0].filtersJSON, resolved.rules[0].filtersJSON)
+    }
+
     func testScoreAndComparisonRulesComeFromFrozenStrategies() throws {
         let first = try profile(universe: "Close > 100"), second = try profile(universe: "Close > 200")
         var spec = StudySpec(name: "Opportunity", kind: "score", rules: [], through: hour)

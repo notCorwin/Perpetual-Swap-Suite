@@ -109,9 +109,6 @@ actor OKXResearchTransport: ResearchTransport {
 final class ResearchDataProvider {
     // OKX rejects catalog requests with more than five families (code 50025).
     private static let archiveFamilyLimit = 5
-    // The published OKX order book dataset starts in March 2023.
-    // Explicit refresh still searches earlier periods for new backfills.
-    private static let orderBookArchiveStart: Int64 = 1_677_628_800_000
     let store: ResearchStore
     let transport: any ResearchTransport
     let radarURL: URL?
@@ -156,7 +153,10 @@ final class ResearchDataProvider {
             while first <= through {
                 try ResearchPressure.shared.check()
                 let last = min(through, first + 999 * hourMS)
-                let candles = try radar.candles(instrument.id, since: first, through: last), stats = try radar.chartStats(instrument.id, since: first, through: last), quotes = try radar.hourlyQuotes(instrument.id, since: first, through: last)
+                let candles = try radar.candles(instrument.id, since: first, through: last), stats = try radar.chartStats(instrument.id, since: first, through: last)
+                let quotes = try radar.hourlyQuotes(instrument.id, since: first, through: last).compactMapValues { quote in
+                    quote.turnover.map { FilterQuote(turnover: $0, spread: nil, timestamp: quote.timestamp) }
+                }
                 let id = "radar:\(instrument.id):\(first):\(last)", raw = try researchJSON(LocalRows(candles: Array(candles.values).sorted { $0.hour < $1.hour }, stats: stats.mapValues { FilterStat(oi: $0.oi, sell: $0.sell, buy: $0.buy) }, quotes: quotes))
                 let source = ResearchSource(id: researchHash(id + raw), instrument: instrument.id, kind: "local", from: first, through: last, url: radarURL.path, filename: "Local confirmed hours", sizeBytes: Int64(raw.utf8.count), archive: false, rawHash: researchHash(raw))
                 if !candles.isEmpty || !stats.isEmpty || !quotes.isEmpty {
@@ -173,8 +173,8 @@ final class ResearchDataProvider {
                             if fill.stat?.oi == nil && fill.stat?.buy == nil && fill.stat?.sell == nil { return nil }
                         }
                         if let quote = value.quote {
-                            fill.quote = FilterQuote(turnover: old.quote?.turnover == nil ? quote.turnover : nil, spread: old.quote?.spread == nil ? quote.spread : nil, timestamp: quote.timestamp)
-                            if fill.quote?.turnover == nil && fill.quote?.spread == nil { return nil }
+                            fill.quote = FilterQuote(turnover: old.quote?.turnover == nil ? quote.turnover : nil, spread: nil, timestamp: quote.timestamp)
+                            if fill.quote?.turnover == nil { return nil }
                         }
                         return fill
                     }
@@ -216,7 +216,6 @@ final class ResearchDataProvider {
             let end = min(through, Int64(endMonth.timeIntervalSince1970 * 1000) - 1)
             let begin = Int64(month.timeIntervalSince1970 * 1000)
             let eligible = instruments.filter { instrument in
-                (module != 4 || refresh || end >= Self.orderBookArchiveStart) &&
                 ranges[instrument.id, default: []].contains { $0.from <= end && $0.through >= begin }
             }
             for chunk in stride(from: 0, to: eligible.count, by: Self.archiveFamilyLimit) {
@@ -288,6 +287,7 @@ final class ResearchDataProvider {
         return .init(from: Int64(first.timeIntervalSince1970 * 1000), through: Int64(end.timeIntervalSince1970 * 1000) - hourMS)
     }
     func plan(_ spec: StudySpec, refresh: Bool = false, catalogProgress: @escaping @Sendable (ResearchCatalogProgress) async -> Void = { _ in }, progress: @escaping @Sendable (String) async -> Void) async throws -> DataPlan {
+        let spec = try spec.excludingSpread()
         try spec.validate()
         await progress("Reading the fixed local cache and instrument registry…")
         let registry = try await instruments(through: spec.through, refresh: refresh)
@@ -309,7 +309,7 @@ final class ResearchDataProvider {
         plan.warnings += ["Historic eligibility is limited to instruments with verified metadata. Archive-only symbols without verified classification or listing dates are reported separately.", "Hourly OI has limited public coverage. Full and partial Opportunity scores are reported separately."]
         if rules.contains(where: \.hasLiveBTC) { plan.warnings.append("Hourly approximation of live BTC rules: check at the completed hourly close and execute at the next hourly open. Intrahour trigger times are not reconstructed.") }
         let metrics = Set(rules.flatMap { $0.metrics }), scoreInputs = spec.kind == "score" || metrics.contains { $0.hasPrefix("opportunity") }
-        let needSpread = metrics.contains("spread"), needFlow = scoreInputs || !metrics.isDisjoint(with: ["buy", "sell", "takerRatio", "buyVsSell"])
+        let needFlow = scoreInputs || !metrics.isDisjoint(with: ["buy", "sell", "takerRatio", "buyVsSell"])
         let needOI = scoreInputs || !metrics.isDisjoint(with: ["oiUSD", "oiChange", "oiTrend"])
         let btcMetrics = Set(rules.flatMap { $0.btcRequirements?.metrics ?? [] })
         func needs(_ kind: String, _ id: String) -> Bool {
@@ -319,19 +319,16 @@ final class ResearchDataProvider {
             case "candle": return true
             case "oi": return target && needOI || reference && (btcMetrics.contains { $0.hasPrefix("opportunity") } || !btcMetrics.isDisjoint(with: ["oiUSD", "oiChange", "oiTrend"]))
             case "taker": return target && needFlow || reference && (btcMetrics.contains { $0.hasPrefix("opportunity") } || !btcMetrics.isDisjoint(with: ["buy", "sell", "buyVsSell", "takerRatio"]))
-            case "spread": return target && needSpread || reference && btcMetrics.contains("spread")
+            case "spread": return false
             default: return target && spec.costs != nil
             }
         }
         let recent = researchNow() / hourMS * hourMS - 60 * 24 * hourMS
         let oldEnd = min(last, recent - hourMS)
         let earliestInput = max(0, first - Int64(warmup + 1) * hourMS)
-        if !refresh, earliestInput < Self.orderBookArchiveStart, inputs.contains(where: { needs("spread", $0.id) }) {
-            plan.warnings.append("Published OKX order book archives start in March 2023. Earlier spread readings use local recordings when available; otherwise they remain Unknown. Refresh source data to check for earlier backfills.")
-        }
         var catalogs: [Int: [ResearchSource]] = [:]
         // Batch within the catalog family limit; cached complete periods need no catalog requests.
-        for (module, kind, end) in [(2, "candle", oldEnd), (1, "taker", oldEnd), (3, "funding", oldEnd), (4, "spread", last)] where earliestInput <= end {
+        for (module, kind, end) in [(2, "candle", oldEnd), (1, "taker", oldEnd), (3, "funding", oldEnd)] where earliestInput <= end {
             var ranges: [String: [ResearchRange]] = [:]
             for instrument in inputs where needs(kind, instrument.id) {
                 let begin = max(earliestInput, instrument.listedAt! / hourMS * hourMS)
@@ -362,21 +359,17 @@ final class ResearchDataProvider {
                 let archiveRanges = archives.map { ResearchRange(from: $0.from, through: $0.through) }
                 for gap in Self.subtract(range, covered: archiveRanges) { plan.sources.append(restSource(instrument.id, kind: "candle", gap, refresh: refresh)) }
             }
-            for kind in ["oi", "taker", "funding", "mark", "spread"] where needs(kind, instrument.id) {
+            for kind in ["oi", "taker", "funding", "mark"] where needs(kind, instrument.id) {
                 let ranges = refresh ? [ResearchRange(from: begin, through: last)] : try store.missing(instrument.id, kind: kind, from: begin, through: last)
                 for range in ranges {
-                    if ["taker", "funding", "spread"].contains(kind), range.from <= oldEnd {
-                        let module = kind == "taker" ? 1 : kind == "funding" ? 3 : 4
+                    if ["taker", "funding"].contains(kind), range.from <= oldEnd {
+                        let module = kind == "taker" ? 1 : 3
                         let archives = published(module, instrument.id, range.from, min(range.through, oldEnd))
                         plan.sources += archives
                         if archives.isEmpty { plan.warnings.append("\(instrument.id): no \(kind) archive is available for part of the requested range; those inputs remain Unknown.") }
                     }
-                    if kind != "spread" {
-                        let restBegin = ["oi", "taker", "funding"].contains(kind) ? max(range.from, kind == "funding" ? recent - 30 * 24 * hourMS : recent) : range.from
-                        if restBegin <= range.through { plan.sources.append(restSource(instrument.id, kind: kind, .init(from: restBegin, through: range.through), refresh: refresh)) }
-                    } else if range.through > oldEnd {
-                        plan.sources += published(4, instrument.id, max(range.from, oldEnd + hourMS), range.through)
-                    }
+                    let restBegin = ["oi", "taker", "funding"].contains(kind) ? max(range.from, kind == "funding" ? recent - 30 * 24 * hourMS : recent) : range.from
+                    if restBegin <= range.through { plan.sources.append(restSource(instrument.id, kind: kind, .init(from: restBegin, through: range.through), refresh: refresh)) }
                 }
             }
         }
@@ -390,6 +383,7 @@ final class ResearchDataProvider {
         plan.warnings = Array(Set(plan.warnings)).sorted()
         await progress("Inspecting local input coverage and gaps…")
         plan.coverage = try store.coverage(inputs, from: max(0, first-Int64(warmup+1)*hourMS), through: last)
+        plan = try plan.excludingSpread()
         try store.put(plan.id, kind: "plan", plan)
         return plan
     }
@@ -408,6 +402,7 @@ final class ResearchDataProvider {
         return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
     func prepare(_ source: ResearchSource, instruments: [ResearchInstrument], progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void = { _ in }) async throws {
+        guard !ResearchSpreadPolicy.excludes(source) else { throw FilterError("Research no longer prepares bid/ask spread or order book archives. Review the updated data plan.") }
         var source = source
         let file = store.rawURL(source)
         let filename = source.filename, instrument = source.instrument

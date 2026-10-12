@@ -6,7 +6,7 @@ extension StudySpec {
     func resolvingStrategyRules() throws -> StudySpec {
         guard ["filter", "score", "comparison"].contains(kind) else { throw FilterError("Choose Bullish Setup signals, Opportunity, or Compare strategies.") }
         guard strategyPhase == nil || strategyPhase == "bullishSetup" else { throw FilterError("Research supports Bullish Setup only.") }
-        guard let profiles = strategySnapshots else { return self }
+        guard let profiles = strategySnapshots else { return try excludingSpread() }
         guard profiles.count == (kind == "comparison" ? 2 : 1) else {
             throw FilterError("Choose one strategy, or two strategy versions for a comparison.")
         }
@@ -15,7 +15,7 @@ extension StudySpec {
         spec.rules = try profiles.map { try $0.researchRule("bullishSetup") }
         spec.direction = "Long"
         if kind == "score" { spec.sampling = "hourly" }
-        return spec
+        return try spec.excludingSpread()
     }
 }
 

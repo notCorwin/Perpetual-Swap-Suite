@@ -36,6 +36,7 @@ actor ResearchWorker {
     }
     func prepare(_ study: ResearchStudy, plan: DataPlan, progress: @escaping @Sendable (Int, Int, ResearchPreparationProgress) async -> Void) async throws -> ResearchStudy {
         let store = try ResearchStore(directory: directory), provider = ResearchDataProvider(store: store, transport: transport, radarURL: radarURL)
+        let plan = try plan.excludingSpread()
         var checkpoint = try store.get("checkpoint:\(study.id)", as: Checkpoint.self) ?? Checkpoint(studyID: study.id, phase: "preparing")
         try store.pinInputs(plan, owner: study.id)
         checkpoint.phase = "preparing"; checkpoint.error = nil; try store.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
@@ -67,7 +68,7 @@ actor ResearchWorker {
         try Task.checkCancellation()
         await progress(plan.sources.count, plan.sources.count, .init(stage: "freezing", filename: "Freezing verified local inputs…", instrument: ""))
         let manifest = try store.freeze(plan)
-        var result = study; result.manifestID = manifest.id
+        var result = study; result.spec = plan.spec; result.manifestID = manifest.id
         checkpoint.phase = "ready"; checkpoint.updatedAt = researchNow()
         try store.database.transaction {
             try store.put(result.id, kind: "study", result)
@@ -231,7 +232,7 @@ final class ResearchController {
         return id
     }
     private func savePlan(_ plan: DataPlan, study: ResearchStudy) throws {
-        var study = study; study.planID = plan.id
+        var study = study; study.planID = plan.id; study.spec = plan.spec
         var checkpoint = try store.get("checkpoint:\(study.id)", as: Checkpoint.self) ?? Checkpoint(studyID: study.id, phase: "planned")
         checkpoint.phase = "planned"; checkpoint.updatedAt = researchNow()
         try store.database.transaction {
@@ -240,12 +241,15 @@ final class ResearchController {
         }
     }
     func prepare(planID: String, resumeID: String? = nil) throws -> String {
-        guard let plan = try store.get(planID, as: DataPlan.self) else { throw FilterError("Create a data plan first.") }
+        guard let savedPlan = try store.get(planID, as: DataPlan.self) else { throw FilterError("Create a data plan first.") }
+        let plan = try savedPlan.excludingSpread()
         let existing = try store.objects("study", as: ResearchStudy.self).first { $0.planID == planID && $0.manifestID == nil }
-        let study = try resumeID.flatMap { try store.get($0, as: ResearchStudy.self) } ?? existing ?? ResearchStudy(spec: plan.spec, planID: planID)
+        var study = try resumeID.flatMap { try store.get($0, as: ResearchStudy.self) } ?? existing ?? ResearchStudy(spec: plan.spec, planID: planID)
+        study.spec = plan.spec
         guard (try store.get("checkpoint:\(study.id)", as: Checkpoint.self))?.phase != "cancelled" else { throw FilterError("This task was cancelled. Copy its configuration to start a new study.") }
         let id = try begin("preparing", studyID: study.id)
         try store.database.transaction {
+            try store.put(plan.id, kind: "plan", plan)
             try store.put(study.id, kind: "study", study)
         }
         task = Task.detached(priority: .background) { [self, worker] in
@@ -301,13 +305,15 @@ final class ResearchController {
             return ["jobID": try study.manifestID == nil ? prepare(planID: study.planID, resumeID: id) : run(studyID: id)]
         case "pause", "cancel": try await stop(cancel: action == "cancel"); return ["ok": true]
         case "planDetail":
-            guard let id = request["planID"] as? String, let plan = try store.get(id, as: DataPlan.self) else { throw FilterError("Data plan not found.") }
+            guard let id = request["planID"] as? String, let saved = try store.get(id, as: DataPlan.self) else { throw FilterError("Data plan not found.") }
+            let plan = try saved.excludingSpread()
             return ["plan": try snapshot(plan), "estimatedBytes": plan.estimatedBytes]
         case "study":
             guard let id = request["studyID"] as? String, let study = try store.get(id, as: ResearchStudy.self) else { throw FilterError("Study not found.") }
             let report = try store.get("report:\(id)", as: StudyReport.self)
             let manifest = try study.manifestID.flatMap { try store.get($0, as: DataManifest.self) }
-            let plan = try store.get(study.planID, as: DataPlan.self)
+            let savedPlan = try store.get(study.planID, as: DataPlan.self)
+            let plan = try study.manifestID == nil ? savedPlan?.excludingSpread() : savedPlan
             return ["study": try snapshot(study), "report": try report.map(snapshot) ?? NSNull(), "manifest": try manifest.map(snapshot) ?? NSNull(), "plan": try plan.map(snapshot) ?? NSNull(), "estimatedBytes": plan?.estimatedBytes ?? 0]
         case "events":
             guard let id = request["studyID"] as? String else { throw FilterError("Choose a study.") }

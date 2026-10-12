@@ -116,6 +116,8 @@ Click the **Perpetual Swap Radar / Perpetual Swap Research** title to switch mod
 
 Research freezes rules, engine versions, input revisions, and a SHA-256 data manifest. Updating Radar rules or refreshing cached sources does not change an existing experiment. Historical evaluation runs at hourly close, with execution at the next hourly open; it does not use future candles or live EMA state.
 
+Research excludes bid/ask spread data and omits conditions that depend on spread, including reusable formulas, BTC references, and captured values. Data plans and reports list the omitted conditions. Remaining AND/OR conditions retain their logic; sequence stages retain their timing and independent captures. Research does not query or download order book archives, including when resuming older preparation plans. Recorded turnover, Opportunity scoring, fees, and configured slippage remain available. Shared strategy versions retain their original spread rules for Radar. Completed experiments retain their original results; copy an older frozen experiment to run it with the current engine.
+
 Missing prices, funding, or other required inputs remain Unknown or make affected results Incomplete. The data plan exposes public-history limits and gaps. Live BTC rules use an hourly approximation in historical studies. Fixed-horizon outcomes measure signals using next-hour opens and never infer actual positions.
 
 Downloaded inputs and checkpoints persist without automatic expiry. **Clear unreferenced cache** removes only inputs no longer referenced by experiments.

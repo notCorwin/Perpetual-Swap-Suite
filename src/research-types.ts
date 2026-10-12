@@ -11,6 +11,7 @@ export type StudySpec = {
   name: string; kind: 'filter' | 'score' | 'comparison'; rules: StudyRule[]; instruments: string[]
   from: number | null; through: number; direction: 'Long'; sampling: 'entries' | 'hourly'
   strategySnapshots?: StrategyProfile[]
+  excludedSpreadConditions?: string[]
   costs: { entryFeeBps: number; exitFeeBps: number; slippageBps: number } | null
 }
 export type ResearchInstrument = { id: string; listedAt?: number; delistedAt?: number; verified: boolean; contractValue?: number; source: string; observedAt: number }

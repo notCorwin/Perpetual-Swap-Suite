@@ -143,7 +143,7 @@ final class ResearchStore {
         for instrument in instruments {
             let begin = max(from, (instrument.listedAt ?? from) / hourMS * hourMS), end = min(through, instrument.delistedAt.map { $0 / hourMS * hourMS - hourMS } ?? through)
             if end < begin { continue }
-            for (kind, rowKind, field) in [("candle", "candle", "$.candle.open"), ("oi", "stat", "$.stat.oi"), ("taker", "stat", "$.stat.buy"), ("spread", "quote", "$.quote.spread"), ("turnover recorded", "quote", "$.quote.turnover"), ("settlement mark", "mark", "$.mark")] {
+            for (kind, rowKind, field) in [("candle", "candle", "$.candle.open"), ("oi", "stat", "$.stat.oi"), ("taker", "stat", "$.stat.buy"), ("turnover recorded", "quote", "$.quote.turnover"), ("settlement mark", "mark", "$.mark")] {
                 let join = manifest == nil ? "JOIN research_heads h USING(revision)" : "JOIN research_pins p USING(revision)"
                 var values: [Any?] = [instrument.id, rowKind, begin, end, field]; if let manifest { values.append(manifest) }
                 var hours: [Int64] = []
@@ -175,6 +175,7 @@ final class ResearchStore {
         try database.execute("INSERT OR IGNORE INTO research_source_pins SELECT ?,j.value FROM research_pins p JOIN research_data d USING(revision),json_each(d.json,'$.sources') j WHERE p.manifest=?", [owner, owner])
     }
     func freeze(_ plan: DataPlan) throws -> DataManifest {
+        let plan = try plan.excludingSpread()
         var manifest = DataManifest(planID: plan.id, from: plan.from, through: plan.through, instruments: plan.instruments, warnings: plan.warnings, unknownInstruments: plan.unknownInstruments)
         manifest.referenceInstruments = plan.referenceInstruments
         var hash = SHA256()
@@ -202,7 +203,7 @@ final class ResearchStore {
             manifest.coverage = try coverage(plan.inputInstruments, from: plan.from - hourMS, through: plan.through + 48 * hourMS, manifest: manifest.id)
             var sourceIDs: [String] = []
             try database.query("SELECT source FROM research_source_pins WHERE manifest=? ORDER BY source", [manifest.id]) { sourceIDs.append(Self.text($0,0)) }
-            manifest.sources = try sourceIDs.compactMap { try get($0, as: ResearchSource.self) }
+            manifest.sources = try sourceIDs.compactMap { try get($0, as: ResearchSource.self) }.filter { !ResearchSpreadPolicy.excludes($0) }
             manifest.unknownInstruments = Array(Set(plan.unknownInstruments + (try objects("instrument", as: ResearchInstrument.self)).filter { !$0.verified || $0.listedAt == nil }.map(\.id))).sorted()
             manifest.digest = hash.finalize().map { String(format: "%02x", $0) }.joined()
             try put(manifest.id, kind: "manifest", manifest)

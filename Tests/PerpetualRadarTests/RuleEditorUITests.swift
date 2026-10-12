@@ -525,7 +525,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 6")
         let nativeStore = try Store(url: bridge.directory.appendingPathComponent("radar.sqlite3"))
         var shared = try XCTUnwrap(nativeStore.selectedSuiteProfile("radar"))
-        shared.universeJSON = FilterConfigV2().json
+        shared.universeJSON = try FilterCompiler.compile(source: "spread <= 0.15").config.json
         _ = try nativeStore.saveSuiteProfile(shared)
         bridge.workspaceError = "Mode switch temporarily unavailable"
         try await click(view, "Perpetual Swap Radar")
@@ -570,8 +570,11 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await wait(view,"!document.body.innerText.includes('Research cache temporarily locked')")
         let recoveredName = try await js(view,"document.querySelector('#study-name').value") as? String
         XCTAssertEqual(recoveredName,"WKWebView experiment", "Reconnection must preserve the research draft.")
-        bridge.researchJobOverride = ["id": "catalog", "phase": "planning", "completed": 4, "total": 8, "message": "Checking spread archive catalog", "error": "", "updatedAt": researchNow() - 20_000,
-            "catalog": ["kind": "spread", "completed": 4, "total": 8, "message": "Checking spread archive catalog", "waitingForResponse": true, "remainingSeconds": 60]]
+        let researchDescription = try await js(view, "document.querySelector('[data-research]').innerText") as? String ?? ""
+        XCTAssertTrue(researchDescription.contains("Bid/ask spread data is excluded from Research"))
+        XCTAssertTrue(researchDescription.contains("Order book archives are not downloaded"))
+        bridge.researchJobOverride = ["id": "catalog", "phase": "planning", "completed": 4, "total": 8, "message": "Checking candle archive catalog", "error": "", "updatedAt": researchNow() - 20_000,
+            "catalog": ["kind": "candle", "completed": 4, "total": 8, "message": "Checking candle archive catalog", "waitingForResponse": true, "remainingSeconds": 60]]
         try await wait(view, "document.querySelector('[data-research-task]')?.innerText.includes('Catalog pages checked: 4 / 8') && document.querySelector('[data-research-task]')?.innerText.includes('No data received for')")
         let catalogStatus = try await js(view, "document.querySelector('[data-research-task]').innerText") as? String ?? ""
         XCTAssertTrue(catalogStatus.contains("file downloads start after Prepare Data"))
@@ -602,6 +605,10 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await input(view, "#study-through", formatter.string(from: Date(timeIntervalSince1970: Double(ResearchFixture.hour+192*hourMS)/1000)))
         try await click(view, "Review data plan")
         try await wait(view, "document.body.innerText.includes('This range is fully cached.')")
+        let planDescription = try await js(view, "document.querySelector('[data-research]').innerText") as? String ?? ""
+        XCTAssertTrue(planDescription.contains("Spread-dependent conditions excluded from this study (1)"))
+        let sourceKinds = try await js(view, "Array.from(document.querySelectorAll('table[aria-label=\"Planned data sources\"] tbody tr')).map(row => row.cells[1].innerText).join(',')") as? String ?? ""
+        XCTAssertFalse(sourceKinds.contains("spread"))
         try await click(view, "Prepare Data")
         try await wait(view, "document.body.innerText.includes('Frozen dataset') && Array.from(document.querySelectorAll('button')).some(b=>b.textContent.trim()==='Run Study')")
         try await click(view, "Run Study")

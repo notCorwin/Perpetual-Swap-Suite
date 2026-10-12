@@ -375,7 +375,8 @@ final class ResearchTests: XCTestCase {
     func testPlanningCheckpointManualResumeAndUnfinishedInputsSurviveCacheCleanup() async throws {
         let store = try store(); defer { try? FileManager.default.removeItem(at: store.directory) }
         try ResearchFixture.seed(store)
-        let spec = try ResearchFixture.spec("spread >= 0")
+        let spec = try ResearchFixture.spec("buy >= 0")
+        try store.database.execute("DELETE FROM research_heads WHERE kind='stat'")
         let slow = try ResearchController(directory: store.directory, transport: ResearchFixtureTransport(delay: .seconds(5)), radarURL: store.directory.appendingPathComponent("absent"))
         _ = try slow.plan(spec)
         try await Task.sleep(for: .milliseconds(30)); try await slow.stop()
