@@ -38,6 +38,10 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
     var holdGateway = false
     weak var windowBackground: WindowBackgroundView?
     var windowTintRGB: [Double] = []
+    var previewWindowBlur: Double?
+    var holdNextBlurSave = false
+    var heldBlurSave: (() -> Void)?
+    var blurSaveError: String?
     var notificationAuthorization = "authorized"
     var notificationTestCount = 0
     var notificationSettingsOpenCount = 0
@@ -99,6 +103,23 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
     }
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage, replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void) {
         let request = message.body as! [String: Any]
+        if let radius = request["previewWindowBlur"] {
+            previewWindowBlur = radius as? Double
+            applyAppearance()
+            replyHandler(["ok": true], nil); return
+        }
+        if ["frostedBackgroundEnabled", "frostedBackgroundOpacity", "windowBlurRadius", "floatingBlurRadius"].contains(where: { request[$0] != nil }) {
+            let save = { [self] in
+                do {
+                    if let blurSaveError { throw FilterError(blurSaveError) }
+                    guard try radar.setFrostedBackground(enabled: request["frostedBackgroundEnabled"] as? Bool, opacity: request["frostedBackgroundOpacity"] as? Double,
+                        windowBlur: request["windowBlurRadius"] as? Double, floatingBlur: request["floatingBlurRadius"] as? Double) else { throw FilterError("Invalid appearance setting.") }
+                    applyAppearance(); revision += 1; replyHandler(snapshot(), nil)
+                } catch { replyHandler(nil, error.localizedDescription) }
+            }
+            if holdNextBlurSave { holdNextBlurSave = false; heldBlurSave = save } else { save() }
+            return
+        }
         if let settings = request["analysisSettings"] as? [String: Any] {
             if settings["action"] as? String == "save" {
                 analysisModel = settings["model"] as! String
@@ -257,17 +278,17 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
             return
         }
         do {
-            if request["frostedBackgroundEnabled"] != nil || request["frostedBackgroundOpacity"] != nil {
-                _ = try radar.setFrostedBackground(enabled: request["frostedBackgroundEnabled"] as? Bool, opacity: request["frostedBackgroundOpacity"] as? Double)
-                if let background = windowBackground, let window = background.window {
-                    background.apply(enabled: radar.frostedBackgroundEnabled, opacity: radar.frostedBackgroundOpacity, to: window)
-                }
-                revision += 1
-            }
             if let json = request["filterLibraryPreferencesJSON"] as? String { try radar.setFilterLibraryPreferences(json); revision += 1 }
             replyHandler(snapshot(), nil)
         } catch { replyHandler(nil, String(describing: error)) }
     }
+    private func applyAppearance() {
+        if let background = windowBackground, let window = background.window {
+            background.apply(enabled: radar.frostedBackgroundEnabled, opacity: radar.frostedBackgroundOpacity,
+                blurRadius: previewWindowBlur ?? radar.windowBlurRadius, to: window)
+        }
+    }
+
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
         let url = task.request.url!, file = root.appendingPathComponent(String(url.path.dropFirst()))
         do {
@@ -1075,6 +1096,62 @@ final class RuleEditorUITests: BackgroundTestCase {
     }
 
     @MainActor
+    func testBlurSlidersPreviewWhileSavingAndRestoreAfterReload() async throws {
+        guard ProcessInfo.processInfo.environment["RADAR_UI_TESTS"] == "1" else { throw XCTSkip("Run npm run test:ui after building the Web renderer.") }
+        let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist"), marketCount: 48), configuration = uiConfiguration()
+        configuration.userContentController.addScriptMessageHandler(bridge, contentWorld: .page, name: "radar")
+        configuration.setURLSchemeHandler(bridge, forURLScheme: "radar")
+        let window = BackgroundTestWindow(contentRect: NSRect(x: 0, y: 0, width: 1440, height: 900), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        let view = WKWebView(frame: .zero, configuration: configuration), background = WindowBackgroundView(contentView: view)
+        bridge.windowBackground = background; window.contentView = background; present(window)
+        defer { bridge.heldBlurSave?(); bridge.heldBlurSave = nil; view.stopLoading(); window.orderOut(nil); configuration.userContentController.removeScriptMessageHandler(forName: "radar", contentWorld: .page); bridge.cleanUp() }
+        view.load(URLRequest(url: URL(string: "radar://app/index.html")!))
+        try await showAllMarkets(view, count: 48)
+        try await click(view, "Settings")
+        try await wait(view, "document.querySelector('#window-blur [role=slider]')?.getAttribute('aria-valuenow') === '64' && document.querySelector('#floating-blur [role=slider]')?.getAttribute('aria-valuenow') === '64'")
+        func slide(_ id: String, _ key: String) async throws {
+            _ = try await js(view, "(() => { const thumb = document.querySelector('#\(id) [role=slider]'); thumb.focus(); thumb.dispatchEvent(new KeyboardEvent('keydown', {key:'\(key)',bubbles:true,cancelable:true})); return true; })()")
+        }
+        bridge.holdNextBlurSave = true
+        try await slide("window-blur", "End")
+        try await wait(view, "document.querySelector('#window-blur [role=slider]').getAttribute('aria-valuenow') === '160' && document.body.innerText.includes('Saving')")
+        XCTAssertEqual(bridge.previewWindowBlur, 160)
+        XCTAssertEqual(bridge.radar.windowBlurRadius, 64, "Preview must not wait for or prematurely persist a pending save.")
+        try await slide("window-blur", "Home")
+        try await wait(view, "document.querySelector('#window-blur [role=slider]').getAttribute('aria-valuenow') === '0'")
+        XCTAssertEqual(bridge.previewWindowBlur, 0)
+        try XCTUnwrap(bridge.heldBlurSave)(); bridge.heldBlurSave = nil
+        try await wait(view, "!document.body.innerText.includes('Saving')")
+        XCTAssertEqual(bridge.radar.windowBlurRadius, 0, "The latest edit must win over an older pending save.")
+        XCTAssertNil(bridge.previewWindowBlur)
+        try await slide("floating-blur", "End")
+        try await wait(view, "getComputedStyle(document.querySelector('[data-slot=popover-content]')).backdropFilter === 'blur(160px)' && !document.body.innerText.includes('Saving')")
+        XCTAssertEqual(bridge.radar.floatingBlurRadius, 160)
+        if capturePixels {
+            try await settleRendering(view)
+            let image = try await nativeRendererSnapshot(view)
+            let bitmap = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
+            let path = project.appendingPathComponent(".build/ui-qa/blur-settings.png")
+            try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: path)
+        }
+        bridge.blurSaveError = "Cannot save blur fixture"
+        try await slide("floating-blur", "Home")
+        try await wait(view, "document.body.innerText.includes('Cannot save blur fixture') && getComputedStyle(document.querySelector('[data-slot=popover-content]')).backdropFilter === 'none'")
+        XCTAssertEqual(bridge.radar.floatingBlurRadius, 160)
+        bridge.blurSaveError = nil
+        try await click(view, "Retry saving")
+        try await wait(view, "!document.body.innerText.includes('Cannot save blur fixture') && !document.body.innerText.includes('Saving')")
+        XCTAssertEqual(bridge.radar.floatingBlurRadius, 0)
+        view.reload()
+        try await showAllMarkets(view, count: 48)
+        try await click(view, "Settings")
+        try await wait(view, "document.querySelector('#window-blur [role=slider]')?.getAttribute('aria-valuenow') === '0' && document.querySelector('#floating-blur [role=slider]')?.getAttribute('aria-valuenow') === '0'")
+        try await assertSharedSurfaces(view, opacity: 0.3)
+    }
+
+    @MainActor
     func testGlassTintAndAppearanceChangesKeepTheBackgroundAndContentSeparate() async throws {
         guard ProcessInfo.processInfo.environment["RADAR_UI_TESTS"] == "1" else { throw XCTSkip("Run npm run test:ui after building the Web renderer.") }
         let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -1209,7 +1286,7 @@ final class RuleEditorUITests: BackgroundTestCase {
             const parent = element.parentElement?.closest('[data-surface="control"], [data-surface="panel"], [data-surface="floating"]');
             const nativeTable = document.documentElement.dataset.nativeWindowBackground === 'true' && element.closest('[data-slot="table-container"]');
             const inherited = role === 'inherited' || role !== 'floating' && (parent || nativeTable && role === 'control');
-            const expected = role === 'floating' ? 64 : p === 1 || inherited ? 0 : ({control:12,panel:16}[role] ?? 0) * (1-p);
+            const expected = role === 'floating' ? parseFloat(root.getPropertyValue('--floating-blur')) : p === 1 || inherited ? 0 : ({control:12,panel:16}[role] ?? 0) * (1-p);
             if (Math.abs(radius - expected) > 0.05 || expected === 0 && filter !== 'none') issues.push(`${element.dataset.slot ?? element.tagName} ${role}: filter=${filter}, expected=${expected}`);
             if (role === 'floating' && style.transitionProperty !== 'none') issues.push(`${element.dataset.slot ?? element.tagName}: implicit material transition`);
             if (role === 'floating' && style.backgroundImage !== 'none') issues.push(`${element.dataset.slot ?? element.tagName}: tinted glass gradient`);

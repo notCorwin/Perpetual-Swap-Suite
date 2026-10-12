@@ -3,8 +3,9 @@ import Darwin
 
 @MainActor
 enum WindowServerBlur {
-    // Ghostty maps background-blur=true to an untinted WindowServer blur radius of 20.
-    static let radius: Int32 = 20
+    static func validRadius(_ value: Double) -> Bool {
+        value.isFinite && (0...160).contains(value)
+    }
 
     private typealias Connection = @convention(c) () -> UnsafeMutableRawPointer?
     private typealias SetRadius = @convention(c) (UnsafeMutableRawPointer?, UInt, Int32) -> Int32

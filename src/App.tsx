@@ -41,8 +41,10 @@ import { expressionTemplates, type ExpressionTemplate } from "@/filter-expressio
 import { AnalysisSettingsButton } from '@/AnalysisSettingsDialog'
 import type { AnalysisSettings, AnalysisSettingsRequest } from '@/chart-analysis'
 import type { ChartCaptureBounds, ChartImage } from '@/chart-capture'
+import { BlurControls } from '@/BlurSettings'
+import { initialBlurSettings, useBlurSettings, withSettingsDeadline, type BlurSettings } from '@/blur-settings'
 
-type WindowAppearance = { frostedBackgroundEnabled: boolean; frostedBackgroundOpacity: number }
+type WindowAppearance = BlurSettings & { frostedBackgroundEnabled: boolean; frostedBackgroundOpacity: number }
 type NotificationSettings = { backgroundMonitoringEnabled: boolean; notificationsEnabled: boolean; notificationAuthorization: "notDetermined" | "denied" | "authorized" | "quiet" | "unavailable"; notificationError: string; backgroundMonitoringError: string; monitoringPaused: boolean; launchAtLogin: "enabled" | "disabled" | "requiresApproval" | "unavailable"; launchAtLoginError: string }
 type HistoryProgress = { pending: number; completed: number; error: string }
 type Snapshot = WindowAppearance & NotificationSettings & { rows: NativeMarketRow[]; updatedAt: number | null; error: string; revision: number; serviceSession?: string; filterMetricsCatalog: FilterMetric[]; filterFunctions: string[]; filterFunctionCatalog: ExpressionTemplate[]; filterLibraryPreferences: FilterLibraryPreferences; }
@@ -65,6 +67,7 @@ type NativeBridge = {
   postMessage(request: SettingRequest): Promise<Snapshot>
   postMessage(request: { captureChart: { x: number; y: number; width: number; height: number; backgroundRGB: number[] } }): Promise<{ ok: boolean }>
   postMessage(request: { windowTintRGB: number[] }): Promise<{ ok: boolean }>
+  postMessage(request: { previewWindowBlur: number | null }): Promise<{ ok: boolean }>
   postMessage(request: { chartInstId: string; loadChart?: boolean; sinceRevision?: number; chartEndHour?: number }): Promise<ChartPollResponse>
 }
 declare global {
@@ -208,6 +211,11 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   const [frostedBackgroundOpacity, setFrostedBackgroundOpacity] = useState(window.radarAppearance?.frostedBackgroundOpacity ?? 0.3)
   const [backgroundOpacityDraft, setBackgroundOpacityDraft] = useState(String(window.radarAppearance?.frostedBackgroundOpacity ?? 0.3))
   const [backgroundOpacityError, setBackgroundOpacityError] = useState("")
+  const blurSettings = useBlurSettings(() => initialBlurSettings(window.radarAppearance), async request => {
+    const snapshot = await withSettingsDeadline(window.webkit.messageHandlers.radar.postMessage(request))
+    acceptSnapshot(snapshot)
+    return snapshot
+  }, radius => withSettingsDeadline(window.webkit.messageHandlers.radar.postMessage({ previewWindowBlur: radius })))
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>({ backgroundMonitoringEnabled: false, notificationsEnabled: true, notificationAuthorization: "notDetermined", notificationError: "", backgroundMonitoringError: "", monitoringPaused: false, launchAtLogin: "disabled", launchAtLoginError: "" })
   const [notificationPending, setNotificationPending] = useState(false)
   const [sort, setSort] = useState<SortKey>("opportunity")
@@ -263,6 +271,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     setRows(current => reconcileMarketRows(current, snapshot.rows))
     setFrostedBackgroundEnabled(snapshot.frostedBackgroundEnabled)
     setFrostedBackgroundOpacity(snapshot.frostedBackgroundOpacity)
+    blurSettings.synchronize(initialBlurSettings(snapshot))
     setNotificationSettings(current => keepSnapshotValue(current, {
       backgroundMonitoringEnabled: snapshot.backgroundMonitoringEnabled ?? false,
       notificationsEnabled: snapshot.notificationsEnabled ?? true,
@@ -473,7 +482,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
         <Button variant="outline" onClick={() => onDecisions({ metrics, templates, functions })}>Strategy Library</Button>
         <span className="text-xs text-muted-foreground">OKX · USDT swaps · 1h</span>
         <span className="text-xs tabular-nums text-muted-foreground">{visible.length} / {rows.length} markets</span>
-        <Popover onOpenChange={open => { if (!open && backgroundOpacityDraftDirty.current) saveBackgroundOpacity(); if (open) void updateNotifications({ notificationAction: "refresh" }) }}>
+        <Popover onOpenChange={open => { if (!open) { if (backgroundOpacityDraftDirty.current) saveBackgroundOpacity(); blurSettings.commitAll() } if (open) void updateNotifications({ notificationAction: "refresh" }) }}>
           <PopoverTrigger asChild><Button variant="outline"><Settings2 data-icon="inline-start" aria-hidden="true" />Settings</Button></PopoverTrigger>
           <PopoverContent align="end">
             <PopoverHeader><PopoverTitle>Settings</PopoverTitle><PopoverDescription>Customize monitoring, notifications and the window background.</PopoverDescription></PopoverHeader>
@@ -521,6 +530,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
                 <FieldDescription id="background-opacity-description">0 reveals more of the blurred desktop; 1 is solid. Text and charts stay opaque.</FieldDescription>
                 {backgroundOpacityError && <FieldError id="background-opacity-error" role="alert">{backgroundOpacityError}</FieldError>}
               </Field>
+              <BlurControls settings={blurSettings} windowDisabled={!frostedBackgroundEnabled || frostedBackgroundOpacity === 1} />
             </FieldGroup>
           </PopoverContent>
         </Popover>

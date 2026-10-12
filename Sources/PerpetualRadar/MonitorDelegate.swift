@@ -358,10 +358,12 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if parameters["loadChart"] as? Bool == true { return await radar.loadChart(id) }
             return radar.chartSnapshot(id, sinceRevision: parameters["sinceRevision"] as? Int)
         }
-        if parameters["frostedBackgroundEnabled"] != nil || parameters["frostedBackgroundOpacity"] != nil {
+        if ["frostedBackgroundEnabled", "frostedBackgroundOpacity", "windowBlurRadius", "floatingBlurRadius"].contains(where: { parameters[$0] != nil }) {
             let enabled = parameters["frostedBackgroundEnabled"] as? Bool, opacity = parameters["frostedBackgroundOpacity"] as? Double
+            let windowBlur = parameters["windowBlurRadius"] as? Double, floatingBlur = parameters["floatingBlurRadius"] as? Double
             guard parameters["frostedBackgroundEnabled"] == nil || enabled != nil, parameters["frostedBackgroundOpacity"] == nil || opacity != nil,
-                  try radar.setFrostedBackground(enabled: enabled, opacity: opacity) else { throw FilterError("Invalid frosted background setting. Opacity must be between 0 and 1.") }
+                  parameters["windowBlurRadius"] == nil || windowBlur != nil, parameters["floatingBlurRadius"] == nil || floatingBlur != nil,
+                  try radar.setFrostedBackground(enabled: enabled, opacity: opacity, windowBlur: windowBlur, floatingBlur: floatingBlur) else { throw FilterError("Invalid frosted background setting. Opacity must be 0–1 and blur must be 0–160.") }
         }
         if let value = parameters["filterLibraryPreferencesJSON"] { guard let json = value as? String else { throw FilterError("Invalid condition library preferences.") }; try radar.setFilterLibraryPreferences(json) }
         return decorated(try await radar.asyncSnapshot(rocPeriod: parameters["rocPeriod"] as? Int ?? 9, marocPeriod: parameters["marocPeriod"] as? Int ?? 9, sinceRevision: parameters["sinceRevision"] as? Int))

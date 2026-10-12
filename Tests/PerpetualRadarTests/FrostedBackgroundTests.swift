@@ -33,6 +33,8 @@ final class FrostedBackgroundTests: BackgroundTestCase {
             let initial = try XCTUnwrap(radar).snapshot(rocPeriod: 9, marocPeriod: 9)
             XCTAssertEqual(initial["frostedBackgroundEnabled"] as? Bool, true)
             XCTAssertEqual(initial["frostedBackgroundOpacity"] as? Double, 0.3)
+            XCTAssertEqual(initial["windowBlurRadius"] as? Double, 64)
+            XCTAssertEqual(initial["floatingBlurRadius"] as? Double, 64)
             let revision = try XCTUnwrap(initial["revision"] as? Int)
             XCTAssertTrue(try XCTUnwrap(radar).setFrostedBackground(enabled: false, opacity: 0.65))
             let changed = try XCTUnwrap(radar).snapshot(rocPeriod: 9, marocPeriod: 9, sinceRevision: revision)
@@ -59,6 +61,41 @@ final class FrostedBackgroundTests: BackgroundTestCase {
             let unchangedRevision = try XCTUnwrap(reopened.snapshot(rocPeriod: 9, marocPeriod: 9)["revision"] as? Int)
             XCTAssertTrue(try reopened.setFrostedBackground(enabled: true, opacity: 0.3))
             XCTAssertEqual(reopened.snapshot(rocPeriod: 9, marocPeriod: 9, sinceRevision: unchangedRevision)["unchanged"] as? Bool, true)
+        }
+    }
+
+    @MainActor
+    func testBlurSettingsPersistIndependentlyAndRejectInvalidValues() async throws {
+        try withDatabase { url, defaults, _ in
+            let radar = try Radar(defaults: defaults, storeURL: url)
+            XCTAssertTrue(try radar.setFrostedBackground(enabled: false, windowBlur: 120, floatingBlur: 96))
+            let restored = try Radar(defaults: defaults, storeURL: url)
+            XCTAssertFalse(restored.frostedBackgroundEnabled)
+            XCTAssertEqual(restored.windowBlurRadius, 120)
+            XCTAssertEqual(restored.floatingBlurRadius, 96)
+            XCTAssertTrue(try restored.setFrostedBackground(enabled: true))
+            for value in [0.0, 160.0, 64.0] {
+                XCTAssertTrue(try restored.setFrostedBackground(windowBlur: value))
+                XCTAssertEqual(try Radar(defaults: defaults, storeURL: url).windowBlurRadius, value)
+                XCTAssertEqual(restored.floatingBlurRadius, 96)
+            }
+            let revision = try XCTUnwrap(restored.snapshot(rocPeriod: 9, marocPeriod: 9)["revision"] as? Int)
+            for value in [-1.0, 161.0, .nan, .infinity, -.infinity] {
+                XCTAssertFalse(try restored.setFrostedBackground(enabled: false, windowBlur: value))
+                XCTAssertFalse(try restored.setFrostedBackground(windowBlur: 100, floatingBlur: value))
+                XCTAssertTrue(restored.frostedBackgroundEnabled)
+                XCTAssertEqual(restored.windowBlurRadius, 64)
+                XCTAssertEqual(restored.floatingBlurRadius, 96)
+                XCTAssertEqual(restored.snapshot(rocPeriod: 9, marocPeriod: 9, sinceRevision: revision)["unchanged"] as? Bool, true)
+            }
+            let store = try Store(url: url)
+            for value in ["invalid", "nan", "inf", "-1", "161"] {
+                try store.setPreference(value, forKey: "windowBlurRadius")
+                try store.setPreference(value, forKey: "floatingBlurRadius")
+                let fallback = try Radar(defaults: defaults, storeURL: url)
+                XCTAssertEqual(fallback.windowBlurRadius, 64)
+                XCTAssertEqual(fallback.floatingBlurRadius, 64)
+            }
         }
     }
 
@@ -103,9 +140,11 @@ final class FrostedBackgroundTests: BackgroundTestCase {
             let store = try Store(url: url)
             try store.execute("CREATE TRIGGER reject_background_opacity BEFORE UPDATE ON preferences WHEN NEW.key='frostedBackgroundOpacity' BEGIN SELECT RAISE(ABORT,'Cannot save opacity'); END")
 
-            XCTAssertThrowsError(try radar.setFrostedBackground(enabled: false, opacity: 0.8))
+            XCTAssertThrowsError(try radar.setFrostedBackground(enabled: false, opacity: 0.8, windowBlur: 128, floatingBlur: 96))
             XCTAssertTrue(radar.frostedBackgroundEnabled)
             XCTAssertEqual(radar.frostedBackgroundOpacity, 0.4)
+            XCTAssertEqual(radar.windowBlurRadius, 64)
+            XCTAssertEqual(radar.floatingBlurRadius, 64)
             XCTAssertEqual(try store.preference(forKey: "frostedBackgroundEnabled"), "true")
             XCTAssertEqual(try store.preference(forKey: "frostedBackgroundOpacity"), "0.4")
             XCTAssertEqual(radar.snapshot(rocPeriod: 9, marocPeriod: 9, sinceRevision: revision)["unchanged"] as? Bool, true)
@@ -159,6 +198,10 @@ final class FrostedBackgroundTests: BackgroundTestCase {
         let tint = background.subviews[1]
         XCTAssertTrue(background.setTint(rgb: [40 / 255.0, 44 / 255.0, 52 / 255.0]))
         XCTAssertEqual(effect.blendingMode, .behindWindow)
+        for radius in [0.0, 64.0, 160.0] {
+            XCTAssertTrue(background.apply(enabled: true, opacity: 0, blurRadius: radius, to: window))
+            XCTAssertTrue(effect.isHidden, "Adjustable blur must not add a second native tint.")
+        }
 
         for appearance in [NSAppearance.Name.aqua, .darkAqua] {
             window.appearance = NSAppearance(named: appearance)

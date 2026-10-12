@@ -356,9 +356,11 @@ final class MonitorServiceTests: BackgroundTestCase {
         let profile = StrategyProfile(name: "Background strategy", universeJSON: FilterConfigV2().json, phaseRules: ["bullishSetup": config])
         _ = try await request(["suite": ["mode": "radar", "action": "save", "profile": try JSONSerialization.jsonObject(with: Data(researchJSON(profile).utf8))]])
         _ = try await request(["suite": ["mode": "radar", "action": "select", "profileID": profile.id]])
-        let saved = try await request(["frostedBackgroundOpacity": 0.55])
+        let saved = try await request(["frostedBackgroundOpacity": 0.55, "windowBlurRadius": 112, "floatingBlurRadius": 96])
         XCTAssertNil(saved["filterConfigJSON"])
         XCTAssertEqual(saved["frostedBackgroundOpacity"] as? Double, 0.55)
+        XCTAssertEqual(saved["windowBlurRadius"] as? Double, 112)
+        XCTAssertEqual(saved["floatingBlurRadius"] as? Double, 96)
         let baseline = (try await request(["serviceInfo": true]))["samples"] as! Int
         try await wait("rule-samples") { (try await request(["serviceInfo": true]))["samples"] as? Int ?? 0 >= baseline + 2 }
         _ = try await request(["testQuitUI": true])
@@ -382,6 +384,8 @@ final class MonitorServiceTests: BackgroundTestCase {
         let restored = try await request([:])
         XCTAssertEqual(try Store(url: directory.appendingPathComponent("radar.sqlite3")).selectedSuiteProfile("radar")?.phaseRules["bullishSetup"], config)
         XCTAssertEqual(restored["frostedBackgroundOpacity"] as? Double, 0.55)
+        XCTAssertEqual(restored["windowBlurRadius"] as? Double, 112)
+        XCTAssertEqual(restored["floatingBlurRadius"] as? Double, 96)
         _ = try await request(["monitoringPaused": true])
         let pausedSamples = (try await request(["serviceInfo": true]))["samples"] as! Int
         _ = try await request(["testPrice": 110.0]); try await Task.sleep(for: .milliseconds(350))
@@ -409,6 +413,8 @@ final class MonitorServiceTests: BackgroundTestCase {
         let afterRestart = try await request([:])
         XCTAssertEqual(try Store(url: directory.appendingPathComponent("radar.sqlite3")).selectedSuiteProfile("radar")?.phaseRules["bullishSetup"], config)
         XCTAssertEqual(afterRestart["frostedBackgroundOpacity"] as? Double, 0.55)
+        XCTAssertEqual(afterRestart["windowBlurRadius"] as? Double, 112)
+        XCTAssertEqual(afterRestart["floatingBlurRadius"] as? Double, 96)
         let stalledPID = monitorPID!
         defer { if monitorPID == stalledPID { kill(stalledPID, SIGCONT) } }
         XCTAssertEqual(kill(stalledPID, SIGSTOP), 0)
@@ -427,6 +433,8 @@ final class MonitorServiceTests: BackgroundTestCase {
         let afterHang = try await request([:])
         XCTAssertEqual(try Store(url: directory.appendingPathComponent("radar.sqlite3")).selectedSuiteProfile("radar")?.phaseRules["bullishSetup"], config)
         XCTAssertEqual(afterHang["frostedBackgroundOpacity"] as? Double, 0.55)
+        XCTAssertEqual(afterHang["windowBlurRadius"] as? Double, 112)
+        XCTAssertEqual(afterHang["floatingBlurRadius"] as? Double, 96)
         XCTAssertEqual(afterHang["monitoringPaused"] as? Bool, true)
         let quittingPID = monitorPID!
         _ = try await request(["quitCompletely": true])

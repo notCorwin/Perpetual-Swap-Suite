@@ -123,7 +123,9 @@
     --control-blur: calc((1 - var(--window-background-opacity)) * 12px);
     --panel-blur: calc((1 - var(--window-background-opacity)) * 16px);
     /* Broad blur diffuses underlying text and blocks without adding a tint. */
+    --window-blur: 64px;
     --floating-blur: 64px;
+    --blur-radius-max: 160;
     --control-filter: none;
     --panel-filter: none;
     --floating-filter: blur(var(--floating-blur));
@@ -292,6 +294,10 @@
 @utility surface-panel {
     -webkit-backdrop-filter: var(--panel-filter);
     backdrop-filter: var(--panel-filter);
+}
+
+:root[data-floating-blur="false"] {
+    --floating-filter: none;
 }
 
 @utility surface-floating {

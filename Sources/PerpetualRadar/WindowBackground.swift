@@ -76,7 +76,8 @@ final class WindowBackgroundView: NSView {
     }
 
     @discardableResult
-    func apply(enabled: Bool, opacity: Double, to window: NSWindow) -> Bool {
+    func apply(enabled: Bool, opacity: Double, blurRadius: Double = 64, to window: NSWindow) -> Bool {
+        guard WindowServerBlur.validRadius(blurRadius) else { return false }
         let transparent = enabled && opacity < 1
         window.isOpaque = !transparent
         // Like Ghostty, retain a minimal window fill for correct native compositing.
@@ -86,9 +87,9 @@ final class WindowBackgroundView: NSView {
         window.titlebarSeparatorStyle = .none
         tintOpacity = enabled ? CGFloat(opacity) : 1
         updateTint()
-        let nativeBlur = WindowServerBlur.apply(radius: transparent ? WindowServerBlur.radius : 0, to: window)
+        let nativeBlur = WindowServerBlur.apply(radius: transparent ? Int32(blurRadius.rounded()) : 0, to: window)
         // Standard AppKit materials add their own tint, so reserve them for fallback.
-        effectView.isHidden = !transparent || nativeBlur
+        effectView.isHidden = !transparent || blurRadius == 0 || nativeBlur
         window.invalidateShadow()
         return nativeBlur
     }

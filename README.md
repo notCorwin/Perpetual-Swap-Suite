@@ -158,6 +158,8 @@ Automatic update installation is enabled by default. Use **Perpetual Swap Suite 
 
 Choose Light, Dark, or System in the native **Appearance** menu. **Settings** controls the frosted background and opacity; the initial appearance is Dark with opacity 0.3. Dropdown menus, popovers, dialogs, and research task overlays share untinted frosted glass: no solid fill or gradient, with strong backdrop blur, inset edges, and shadows in both appearances. This material stays independent of window opacity; the blur diffuses underlying text and shapes while retaining the backdrop's natural colors. Text and chart lines remain clear as background opacity changes.
 
+**Window blur** controls the native blur behind the entire window, including the desktop. **Popover blur** controls app content behind menus, dialogs, and task overlays. Both default to 64 and can be adjusted independently from 0 to 160: sliders preview immediately and save on release, with errors and retry controls if persistence fails. Preferences survive window and monitor restarts. Window blur requires the frosted background to be on and background opacity below 1. Popover blur remains independent; increasing it alone cannot change the native desktop blur or make glass opaque.
+
 ## Local data
 
 | Location | Contents |

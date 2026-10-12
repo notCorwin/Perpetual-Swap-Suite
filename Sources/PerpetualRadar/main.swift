@@ -10,6 +10,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let gatewayClient = GatewayClient()
     private var frostedBackgroundEnabled = MonitorRuntime.defaults.object(forKey: "LastWindowFrostedEnabled") as? Bool ?? true
     private var frostedBackgroundOpacity = MonitorRuntime.defaults.object(forKey: "LastWindowFrostedOpacity") as? Double ?? 0.3
+    private var windowBlurRadius = MonitorRuntime.defaults.object(forKey: "LastWindowBlurRadius") as? Double ?? 64
+    private var floatingBlurRadius = MonitorRuntime.defaults.object(forKey: "LastFloatingBlurRadius") as? Double ?? 64
+    private var previewWindowBlurRadius: Double?
     private var pendingNotificationInstId: String?
     private var pendingNotificationStrategyID: String?
     private var filterPreviewTask: Task<Void, Never>?
@@ -234,6 +237,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             frostedBackgroundEnabled = enabled; frostedBackgroundOpacity = opacity
             MonitorRuntime.defaults.set(enabled, forKey: "LastWindowFrostedEnabled")
             MonitorRuntime.defaults.set(opacity, forKey: "LastWindowFrostedOpacity")
+            if let value = snapshot["windowBlurRadius"] as? Double, WindowServerBlur.validRadius(value) {
+                windowBlurRadius = value; MonitorRuntime.defaults.set(value, forKey: "LastWindowBlurRadius")
+            }
+            if let value = snapshot["floatingBlurRadius"] as? Double, WindowServerBlur.validRadius(value) {
+                floatingBlurRadius = value; MonitorRuntime.defaults.set(value, forKey: "LastFloatingBlurRadius")
+            }
             applyWindowBackground(); configureBackgroundScript(in: webView.configuration.userContentController)
         }
         if let title = snapshot["updateMenuTitle"] as? String { checkUpdatesItem.title = title }
@@ -295,6 +304,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         pendingNotificationInstId = nil
         webView.callAsyncJavaScript("window.radarNotificationContract = instId; window.dispatchEvent(new Event('radar-open-contract'));",
             arguments: ["instId": id], in: nil, in: .page, completionHandler: nil)
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        previewWindowBlurRadius = nil; applyWindowBackground()
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { openNotificationContract() }
@@ -363,12 +376,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         // Keep the document-start settings current for wake and WebKit process reloads.
         controller.removeAllUserScripts()
         controller.addUserScript(WKUserScript(
-            source: "window.radarAppearance = { frostedBackgroundEnabled: \(enabled), frostedBackgroundOpacity: \(opacity), nativeWindowBackground: true };",
+            source: "window.radarAppearance = { frostedBackgroundEnabled: \(enabled), frostedBackgroundOpacity: \(opacity), windowBlurRadius: \(windowBlurRadius), floatingBlurRadius: \(floatingBlurRadius), nativeWindowBackground: true };",
             injectionTime: .atDocumentStart, forMainFrameOnly: true))
     }
 
     private func applyWindowBackground() {
-        windowBackground.apply(enabled: frostedBackgroundEnabled, opacity: frostedBackgroundOpacity, to: window)
+        windowBackground.apply(enabled: frostedBackgroundEnabled, opacity: frostedBackgroundOpacity, blurRadius: previewWindowBlurRadius ?? windowBlurRadius, to: window)
     }
 
     @objc private func checkForUpdatesNow() { sendUpdateAction("check") }
@@ -437,6 +450,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         if let requested = parameters["windowTintRGB"] {
             guard let rgb = requested as? [Double], windowBackground.setTint(rgb: rgb) else { replyHandler(nil, "Invalid window tint"); return }
+            replyHandler(["ok": true], nil)
+            return
+        }
+        if let requested = parameters["previewWindowBlur"] {
+            if requested is NSNull { previewWindowBlurRadius = nil }
+            else {
+                guard let value = requested as? Double, WindowServerBlur.validRadius(value) else { replyHandler(nil, "Blur must be between 0 and 160."); return }
+                previewWindowBlurRadius = value
+            }
+            applyWindowBackground()
             replyHandler(["ok": true], nil)
             return
         }

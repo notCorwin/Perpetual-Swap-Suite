@@ -5,6 +5,8 @@ private let publicWS = "wss://ws.okx.com:8443/ws/v5/public"
 private let businessWS = "wss://ws.okx.com:8443/ws/v5/business"
 private let frostedBackgroundEnabledKey = "frostedBackgroundEnabled"
 private let frostedBackgroundOpacityKey = "frostedBackgroundOpacity"
+private let windowBlurRadiusKey = "windowBlurRadius"
+private let floatingBlurRadiusKey = "floatingBlurRadius"
 private let notificationsEnabledKey = "strategyNotificationsEnabled"
 private let monitoringPausedKey = "monitoringPaused"
 
@@ -67,6 +69,8 @@ final class Radar {
     private(set) var filterLibraryPreferences = FilterLibraryPreferences()
     private(set) var frostedBackgroundEnabled: Bool
     private(set) var frostedBackgroundOpacity: Double
+    private(set) var windowBlurRadius: Double
+    private(set) var floatingBlurRadius: Double
     private(set) var notificationsEnabled: Bool
     private(set) var monitoringPaused: Bool
     private var rows: [String: Market] = [:]
@@ -115,6 +119,10 @@ final class Radar {
         frostedBackgroundEnabled = try store.preference(forKey: frostedBackgroundEnabledKey) != "false"
         let savedOpacity = (try store.preference(forKey: frostedBackgroundOpacityKey)).flatMap(Double.init) ?? 0.3
         frostedBackgroundOpacity = savedOpacity.isFinite && (0...1).contains(savedOpacity) ? savedOpacity : 0.3
+        let savedWindowBlur = (try store.preference(forKey: windowBlurRadiusKey)).flatMap(Double.init) ?? 64
+        let savedFloatingBlur = (try store.preference(forKey: floatingBlurRadiusKey)).flatMap(Double.init) ?? 64
+        windowBlurRadius = WindowServerBlur.validRadius(savedWindowBlur) ? savedWindowBlur : 64
+        floatingBlurRadius = WindowServerBlur.validRadius(savedFloatingBlur) ? savedFloatingBlur : 64
         let savedNotifications = try store.preference(forKey: notificationsEnabledKey) ?? store.preference(forKey: "filterNotificationsEnabled")
         notificationsEnabled = savedNotifications != "false"
         monitoringPaused = try store.preference(forKey: monitoringPausedKey) == "true"
@@ -138,17 +146,24 @@ final class Radar {
         if let id { chartRevisions[id, default: 0] &+= 1 }
     }
 
-    func setFrostedBackground(enabled: Bool? = nil, opacity: Double? = nil) throws -> Bool {
+    func setFrostedBackground(enabled: Bool? = nil, opacity: Double? = nil, windowBlur: Double? = nil, floatingBlur: Double? = nil) throws -> Bool {
         if let opacity, !opacity.isFinite || !(0...1).contains(opacity) { return false }
+        if let windowBlur, !WindowServerBlur.validRadius(windowBlur) { return false }
+        if let floatingBlur, !WindowServerBlur.validRadius(floatingBlur) { return false }
         let enabled = enabled ?? frostedBackgroundEnabled
         let opacity = opacity ?? frostedBackgroundOpacity
-        guard enabled != frostedBackgroundEnabled || opacity != frostedBackgroundOpacity else { return true }
+        let windowBlur = windowBlur ?? windowBlurRadius, floatingBlur = floatingBlur ?? floatingBlurRadius
+        guard enabled != frostedBackgroundEnabled || opacity != frostedBackgroundOpacity || windowBlur != windowBlurRadius || floatingBlur != floatingBlurRadius else { return true }
         try store.transaction {
             try store.setPreference(String(enabled), forKey: frostedBackgroundEnabledKey)
             try store.setPreference(String(opacity), forKey: frostedBackgroundOpacityKey)
+            try store.setPreference(String(windowBlur), forKey: windowBlurRadiusKey)
+            try store.setPreference(String(floatingBlur), forKey: floatingBlurRadiusKey)
         }
         frostedBackgroundEnabled = enabled
         frostedBackgroundOpacity = opacity
+        windowBlurRadius = windowBlur
+        floatingBlurRadius = floatingBlur
         touch()
         return true
     }
@@ -947,6 +962,7 @@ final class Radar {
         return ["rows": [[String: Any]](), "updatedAt": updatedAt as Any? ?? NSNull(), "error": error, "revision": revision,
                 "btcReceivedAt": btcReceivedAt as Any? ?? NSNull(), "btcConnected": running && !disconnectedChannels.contains("candle1H"),
                 "frostedBackgroundEnabled": frostedBackgroundEnabled, "frostedBackgroundOpacity": frostedBackgroundOpacity,
+                "windowBlurRadius": windowBlurRadius, "floatingBlurRadius": floatingBlurRadius,
                 "notificationsEnabled": notificationsEnabled,
                 "filterMetricsCatalog": FilterCatalog.metrics.map(\.snapshot), "filterFunctions": FilterCatalog.functions,
                 "filterFunctionCatalog": FilterCatalog.scalarFunctions.map(\.snapshot), "filterLibraryPreferences": filterLibraryPreferences.snapshot]
