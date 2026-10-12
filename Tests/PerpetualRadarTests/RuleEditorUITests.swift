@@ -1513,13 +1513,7 @@ final class RuleEditorUITests: BackgroundTestCase {
           hideContent.textContent = '[data-qa-floating-test] > * { visibility:hidden!important }';
           document.querySelector('[data-market-list-content]').append(fixture);
           document.body.append(hideContent);
-          window.radarSurfaceFixture = { source, background:source.style.backgroundColor };
-          // Compare paint in the same native capture/color space. Canvas and
-          // ScreenCaptureKit can resolve wide-gamut dark colors differently.
-          const calibration = document.createElement('div'); calibration.id = 'floating-pixel-color';
-          calibration.style.cssText = 'position:fixed;left:0;top:0;width:16px;height:16px;z-index:100;pointer-events:none';
-          calibration.style.backgroundColor = getComputedStyle(source).backgroundColor;
-          document.body.append(calibration);
+          window.radarSurfaceFixture = { source, background:source.style.backgroundColor, image:source.style.backgroundImage };
           return source.getBoundingClientRect().toJSON();
         })()
         """) as? [String: Double]
@@ -1528,30 +1522,35 @@ final class RuleEditorUITests: BackgroundTestCase {
         let image = try await nativeRendererSnapshot(view)
         let bitmap = try XCTUnwrap(NSBitmapImageRep(data: image.tiffRepresentation!))
         let scaleX = Double(bitmap.pixelsWide) / view.bounds.width, scaleY = Double(bitmap.pixelsHigh) / view.bounds.height
-        let referenceColor = try XCTUnwrap(bitmap.colorAt(x: Int(8 * scaleX), y: Int(8 * scaleY))?.usingColorSpace(.sRGB))
-        let rgb = [referenceColor.redComponent, referenceColor.greenComponent, referenceColor.blueComponent]
         func samples(_ bitmap: NSBitmapImageRep) throws -> [[Double]] {
-            try (24..<216).map { offset in
-                let color = try XCTUnwrap(bitmap.colorAt(x: Int((rect["x"]! + Double(offset)) * scaleX), y: Int((rect["y"]! + 120) * scaleY))?.usingColorSpace(.sRGB))
-                return [color.redComponent, color.greenComponent, color.blueComponent]
+            try [0.2, 0.5, 0.8].flatMap { fraction in
+                try (24..<216).map { offset in
+                    let color = try XCTUnwrap(bitmap.colorAt(x: Int((rect["x"]! + Double(offset)) * scaleX), y: Int((rect["y"]! + rect["height"]! * fraction) * scaleY))?.usingColorSpace(.sRGB))
+                    return [color.redComponent, color.greenComponent, color.blueComponent]
+                }
             }
         }
         func contrast(_ samples: [[Double]]) -> Double {
             let values = samples.map { $0.reduce(0, +) / 3 }
             return values.max()! - values.min()!
         }
-        let opaqueSamples = try samples(bitmap), covered = contrast(opaqueSamples)
-        let fillError = opaqueSamples.flatMap { zip($0, rgb).map { abs($0 - $1) } }.max()!
-        _ = try await js(view, "window.radarSurfaceFixture.source.style.backgroundColor='transparent'; true")
+        // The material can have its own gradient. Inverting only the content
+        // behind it must leave every sampled surface pixel unchanged.
+        let opaqueSamples = try samples(bitmap)
+        _ = try await js(view, "document.querySelector('#floating-pixel-fixture').style.backgroundImage='repeating-linear-gradient(90deg,#fff 0px,#fff 4px,#000 4px,#000 8px)'; true")
+        try await settleRendering(view)
+        let inverted = try await nativeRendererSnapshot(view)
+        let invertedSamples = try samples(XCTUnwrap(NSBitmapImageRep(data: inverted.tiffRepresentation!)))
+        let backdropDifference = zip(opaqueSamples, invertedSamples).flatMap { zip($0, $1).map { abs($0 - $1) } }.max()!
+        _ = try await js(view, "window.radarSurfaceFixture.source.style.backgroundColor='transparent'; window.radarSurfaceFixture.source.style.backgroundImage='none'; true")
         try await settleRendering(view)
         let reference = try await nativeRendererSnapshot(view)
         let referenceBitmap = try XCTUnwrap(NSBitmapImageRep(data: reference.tiffRepresentation!))
         let exposed = contrast(try samples(referenceBitmap))
-        _ = try await js(view, "(() => { const {source,background}=window.radarSurfaceFixture; source.style.backgroundColor=background; delete source.dataset.qaFloatingTest; delete window.radarSurfaceFixture; document.querySelector('#floating-pixel-fixture').remove(); document.querySelector('#floating-pixel-style').remove(); document.querySelector('#floating-pixel-color').remove(); return true; })()")
-        print("Floating pixel contrast \(name) \(theme): covered=\(covered), exposed=\(exposed), fillError=\(fillError)")
+        _ = try await js(view, "(() => { const {source,background,image}=window.radarSurfaceFixture; source.style.backgroundColor=background; source.style.backgroundImage=image; delete source.dataset.qaFloatingTest; delete window.radarSurfaceFixture; document.querySelector('#floating-pixel-fixture').remove(); document.querySelector('#floating-pixel-style').remove(); return true; })()")
+        print("Floating pixel contrast \(name) \(theme): backdropDifference=\(backdropDifference), exposed=\(exposed)")
         XCTAssertGreaterThan(exposed, 0.15, "The reference must expose high-contrast app content behind the floating surface.")
-        XCTAssertLessThan(covered, 0.01, "An opaque floating surface must completely hide underlying content.")
-        XCTAssertLessThan(fillError, 0.02, "Native pixels must match the floating surface's own background color.")
+        XCTAssertLessThan(backdropDifference, 0.01, "Opaque glass must completely hide underlying content, including beneath its highlights and shading.")
         try FileManager.default.createDirectory(at: project.appendingPathComponent(".build/ui-qa"), withIntermediateDirectories: true)
         try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: project.appendingPathComponent(".build/ui-qa/floating-occlusion-\(name)-\(theme).png"))
     }

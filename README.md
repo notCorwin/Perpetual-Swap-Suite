@@ -156,7 +156,7 @@ Enable **Settings → Strategy notifications** and allow notifications for **Per
 
 Automatic update installation is enabled by default. Use **Perpetual Swap Suite → Automatically Install Updates** to change it, or **Check for Updates** for a manual check. The helper verifies the release digest and source revision before installation; updates are deferred while Research is busy.
 
-Choose Light, Dark, or System in the native **Appearance** menu. **Settings** controls the frosted background and opacity; the initial appearance is Dark with opacity 0.3. Dropdown menus, popovers, and dialogs keep an independent opaque background at every window opacity so underlying content cannot obscure them. Text and chart lines remain clear as background opacity changes.
+Choose Light, Dark, or System in the native **Appearance** menu. **Settings** controls the frosted background and opacity; the initial appearance is Dark with opacity 0.3. Dropdown menus, popovers, dialogs, and research task overlays share an opaque glass material: a solid fill with soft highlights, shading, and inset edges in both appearances. This material stays independent of window opacity and never blurs or reveals underlying content. Text and chart lines remain clear as background opacity changes.
 
 ## Local data
 
