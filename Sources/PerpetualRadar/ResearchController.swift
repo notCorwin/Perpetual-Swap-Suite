@@ -27,11 +27,12 @@ actor ResearchWorker {
     init(directory: URL, transport: any ResearchTransport = OKXResearchTransport(), radarURL: URL? = nil) {
         self.directory = directory; self.transport = transport; self.radarURL = radarURL
     }
-    func plan(_ spec: StudySpec, refresh: Bool, owner: String, catalogProgress: @escaping @Sendable (ResearchCatalogProgress) async -> Void, progress: @escaping @Sendable (String) async -> Void) async throws -> DataPlan {
+    func plan(_ spec: StudySpec, refresh: Bool, owner: String, catalogProgress: @escaping @Sendable (ResearchCatalogProgress) async -> Void, progress: @escaping @Sendable (ResearchPlanningProgress) async -> Void) async throws -> DataPlan {
         let store = try ResearchStore(directory: directory)
         let provider = ResearchDataProvider(store: store, transport: transport, radarURL: radarURL)
         let plan = try await provider.plan(spec, refresh: refresh, catalogProgress: catalogProgress, progress: progress)
         try store.pinInputs(plan, owner: owner)
+        await progress(.init(stage: "saving", unit: "steps", completed: 1, total: 1, message: "Data plan and checkpoint saved."))
         return plan
     }
     func prepare(_ study: ResearchStudy, plan: DataPlan, progress: @escaping @Sendable (Int, Int, ResearchPreparationProgress) async -> Void) async throws -> ResearchStudy {
@@ -185,22 +186,23 @@ final class ResearchController {
         activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep, reason: "Complete user-requested research while the window is minimized")
         let id = UUID().uuidString; status = .init(id: id, phase: phase); activeStudyID = studyID; onBusyChanged?(true); return id
     }
-    private func advance(_ id: String, completed: Int, total: Int, message: String, preparation: ResearchPreparationProgress? = nil, catalog: ResearchCatalogProgress? = nil) {
+    private func advance(_ id: String, completed: Int, total: Int, message: String, preparation: ResearchPreparationProgress? = nil, catalog: ResearchCatalogProgress? = nil, planning: ResearchPlanningProgress? = nil) {
         guard status?.id == id, ["planning", "preparing", "running"].contains(status?.phase ?? "") else { return }
         status?.completed = completed; status?.total = total; status?.message = message
         status?.preparation = preparation; status?.updatedAt = researchNow()
-        status?.catalog = catalog
+        status?.catalog = catalog; status?.planning = planning
     }
     private func finish(_ id: String, phase: String, resultID: String? = nil, error: String = "") {
         guard status?.id == id else { return }
-        status?.phase = phase; status?.resultID = resultID; status?.error = error
+        let context = status?.phase == "planning" && !error.isEmpty ? status?.message : nil
+        status?.phase = phase; status?.resultID = resultID; status?.error = context.map { $0 + "\n" + error } ?? error
         if phase == "ready" { status?.message = "Dataset frozen and ready to run." }
         if phase == "completed" { status?.message = "Study complete." }
         status?.updatedAt = researchNow()
         if let studyID = activeStudyID, phase == "failed" {
             do {
                 var checkpoint = try store.get("checkpoint:\(studyID)", as: Checkpoint.self) ?? Checkpoint(studyID: studyID, phase: phase)
-                checkpoint.phase = phase; checkpoint.error = error; checkpoint.updatedAt = researchNow()
+                checkpoint.phase = phase; checkpoint.error = status?.error; checkpoint.updatedAt = researchNow()
                 try store.put("checkpoint:\(studyID)", kind: "checkpoint", checkpoint)
             } catch { status?.error += " Checkpoint status could not be saved: \(error.localizedDescription)" }
         }
@@ -224,7 +226,7 @@ final class ResearchController {
             do {
                 let plan = try await worker.plan(spec, refresh: refresh, owner: study.id, catalogProgress: { update in
                     await self.advance(id, completed: update.completed, total: update.total, message: update.message, catalog: update)
-                }) { message in await self.advance(id, completed: 0, total: 0, message: message) }
+                }) { update in await self.advance(id, completed: update.completed, total: update.total, message: update.message, planning: update) }
                 try await self.savePlan(plan, study: study)
                 await self.finish(id, phase: "planned", resultID: plan.id)
             } catch { await self.finish(id, phase: Task.isCancelled ? "paused" : "failed", resultID: study.id, error: Task.isCancelled ? "" : error.localizedDescription) }

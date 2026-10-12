@@ -138,24 +138,85 @@ final class ResearchStore {
         if next <= through { missing.append(.init(from: next, through: through)) }
         return missing
     }
-    func coverage(_ instruments: [ResearchInstrument], from: Int64, through: Int64, manifest: String? = nil) throws -> [ResearchCoverage] {
-        var result: [ResearchCoverage] = []
-        for instrument in instruments {
+    private struct CoverageCheck {
+        var instrument: String
+        var kind: String
+        var rowKind: String
+        var field: String
+        var range: ResearchRange
+    }
+    private func coverageChecks(_ instruments: [ResearchInstrument], from: Int64, through: Int64) -> [CoverageCheck] {
+        instruments.flatMap { instrument -> [CoverageCheck] in
             let begin = max(from, (instrument.listedAt ?? from) / hourMS * hourMS), end = min(through, instrument.delistedAt.map { $0 / hourMS * hourMS - hourMS } ?? through)
-            if end < begin { continue }
-            for (kind, rowKind, field) in [("candle", "candle", "$.candle.open"), ("oi", "stat", "$.stat.oi"), ("taker", "stat", "$.stat.buy"), ("turnover recorded", "quote", "$.quote.turnover"), ("settlement mark", "mark", "$.mark")] {
-                let join = manifest == nil ? "JOIN research_heads h USING(revision)" : "JOIN research_pins p USING(revision)"
-                var values: [Any?] = [instrument.id, rowKind, begin, end, field]; if let manifest { values.append(manifest) }
-                var hours: [Int64] = []
-                try database.query("SELECT d.ts FROM research_data d \(join) WHERE d.inst=? AND d.kind=? AND d.ts>=? AND d.ts<=? AND json_extract(d.json,?) IS NOT NULL" + (manifest == nil ? "" : " AND p.manifest=?") + " ORDER BY d.ts", values) { hours.append(sqlite3_column_int64($0, 0)) }
-                let gaps = ResearchDataProvider.subtract(.init(from: begin, through: end), covered: hours.map { .init(from: $0, through: $0) })
-                result.append(.init(instrument: instrument.id, kind: kind, available: hours.count, expected: Int((end-begin)/hourMS)+1, first: hours.first, last: hours.last, gaps: gaps))
+            guard begin <= end else { return [] }
+            return [("candle", "candle", "$.candle.open"), ("oi", "stat", "$.stat.oi"), ("taker", "stat", "$.stat.buy"), ("turnover recorded", "quote", "$.quote.turnover"), ("settlement mark", "mark", "$.mark"), ("funding inspected", "funding", "")].map { kind, rowKind, field in
+                CoverageCheck(instrument: instrument.id, kind: kind, rowKind: rowKind, field: field, range: .init(from: begin, through: end))
             }
-            let series = try fundingCoverage(instrument.id, manifest: manifest)
-            let gaps = ResearchDataProvider.subtract(.init(from: begin, through: end), covered: series)
-            result.append(.init(instrument: instrument.id, kind: "funding inspected", available: Int((end-begin)/hourMS)+1-gaps.reduce(0) { $0+$1.hours }, expected: Int((end-begin)/hourMS)+1, first: series.map(\.from).min(), last: series.map(\.through).max(), gaps: gaps))
         }
-        return result
+    }
+    private func inspectCoverage(_ check: CoverageCheck, manifest: String?) throws -> ResearchCoverage {
+        try ResearchPressure.shared.check()
+        let range = check.range
+        if check.kind == "funding inspected" {
+            let series = try fundingCoverage(check.instrument, manifest: manifest)
+            let gaps = ResearchDataProvider.subtract(range, covered: series)
+            return .init(instrument: check.instrument, kind: check.kind, available: range.hours - gaps.reduce(0) { $0 + $1.hours }, expected: range.hours, first: series.map(\.from).min(), last: series.map(\.through).max(), gaps: gaps)
+        }
+        var values: [Any?] = [check.instrument, check.rowKind, range.from, range.through, check.field]
+        let sql: String
+        if let manifest {
+            values.append(manifest)
+            sql = "SELECT d.ts FROM research_data d WHERE d.inst=? AND d.kind=? AND d.ts>=? AND d.ts<=? AND json_extract(d.json,?) IS NOT NULL AND EXISTS (SELECT 1 FROM research_pins p WHERE p.manifest=? AND p.revision=d.revision) ORDER BY d.ts"
+        } else {
+            // Constrain the composite heads index first, then look up each row by
+            // its primary key. Filtering d instead made SQLite scan h per row.
+            sql = "SELECT h.ts FROM research_heads h JOIN research_data d USING(revision) WHERE h.inst=? AND h.kind=? AND h.ts>=? AND h.ts<=? AND json_extract(d.json,?) IS NOT NULL ORDER BY h.ts"
+        }
+        var hours: [Int64] = []
+        try database.query(sql, values) { hours.append(sqlite3_column_int64($0, 0)) }
+        try ResearchPressure.shared.check()
+        let gaps = ResearchDataProvider.subtract(range, covered: hours.map { .init(from: $0, through: $0) })
+        return .init(instrument: check.instrument, kind: check.kind, available: hours.count, expected: range.hours, first: hours.first, last: hours.last, gaps: gaps)
+    }
+    func coverage(_ instruments: [ResearchInstrument], from: Int64, through: Int64, manifest: String? = nil) throws -> [ResearchCoverage] {
+        try coverageChecks(instruments, from: from, through: through).map { try inspectCoverage($0, manifest: manifest) }
+    }
+    func coverageWithProgress(_ instruments: [ResearchInstrument], from: Int64, through: Int64,
+                              progress: @escaping @Sendable (ResearchPlanningProgress) async -> Void) async throws -> [ResearchCoverage] {
+        let checks = coverageChecks(instruments, from: from, through: through)
+        let counter = ResearchPlanningCounter(stage: "coverage", unit: "hours", total: checks.reduce(0) { $0 + $1.range.hours })
+        var completed = 0, results: [ResearchCoverage] = []
+        await progress(counter.update(0, "Checking local hourly inputs and data gaps…"))
+        for check in checks {
+            var result = ResearchCoverage(instrument: check.instrument, kind: check.kind, available: 0, expected: 0, gaps: [])
+            var first = check.range.from
+            while first <= check.range.through {
+                try ResearchPressure.shared.check()
+                var part = check
+                part.range = .init(from: first, through: min(check.range.through, first + 719 * hourMS))
+                let message = "Checking local coverage · \(check.instrument) · \(check.kind)"
+                await progress(counter.update(completed, message, instrument: check.instrument, kind: check.kind, range: part.range))
+                let inspected: ResearchCoverage
+                do { inspected = try inspectCoverage(part, manifest: nil) }
+                catch {
+                    if Task.isCancelled { throw error }
+                    throw FilterError("Local coverage check failed · \(check.instrument) · \(check.kind) · \(part.range.from)–\(part.range.through): \(error.localizedDescription)")
+                }
+                result.available += inspected.available; result.expected += inspected.expected
+                if let value = inspected.first { result.first = min(result.first ?? value, value) }
+                if let value = inspected.last { result.last = max(result.last ?? value, value) }
+                for gap in inspected.gaps {
+                    if let previous = result.gaps.last, previous.through + hourMS >= gap.from {
+                        result.gaps[result.gaps.count - 1].through = max(previous.through, gap.through)
+                    } else { result.gaps.append(gap) }
+                }
+                completed += part.range.hours
+                await progress(counter.update(completed, message, instrument: check.instrument, kind: check.kind, range: part.range))
+                first = part.range.through + hourMS
+            }
+            results.append(result)
+        }
+        return results
     }
     func fundingCoverage(_ instrument: String, manifest: String?) throws -> [ResearchRange] {
         if let manifest, let frozen = try get(manifest, as: DataManifest.self) { return frozen.fundingRanges[instrument] ?? [] }
@@ -204,6 +265,7 @@ final class ResearchStore {
             var sourceIDs: [String] = []
             try database.query("SELECT source FROM research_source_pins WHERE manifest=? ORDER BY source", [manifest.id]) { sourceIDs.append(Self.text($0,0)) }
             manifest.sources = try sourceIDs.compactMap { try get($0, as: ResearchSource.self) }.filter { !ResearchSpreadPolicy.excludes($0) }
+            manifest.warnings = Array(Set(manifest.warnings + manifest.sources.flatMap { $0.warnings ?? [] })).sorted()
             manifest.unknownInstruments = Array(Set(plan.unknownInstruments + (try objects("instrument", as: ResearchInstrument.self)).filter { !$0.verified || $0.listedAt == nil }.map(\.id))).sorted()
             manifest.digest = hash.finalize().map { String(format: "%02x", $0) }.joined()
             try put(manifest.id, kind: "manifest", manifest)

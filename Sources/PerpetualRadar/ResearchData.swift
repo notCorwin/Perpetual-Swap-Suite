@@ -145,14 +145,19 @@ final class ResearchDataProvider {
         }
         return previous.sorted { $0.id < $1.id }
     }
-    private func importRadar(_ instruments: [ResearchInstrument], from: Int64, through: Int64) throws {
+    private func importRadar(_ instruments: [ResearchInstrument], from: Int64, through: Int64, progress: @escaping @Sendable (ResearchPlanningProgress) async -> Void) async throws {
         guard let radarURL, FileManager.default.fileExists(atPath: radarURL.path) else { return }
         let radar = try Store(url: radarURL)
+        let total = instruments.count * ((ResearchRange(from: from, through: through).hours + 999) / 1000)
+        let counter = ResearchPlanningCounter(stage: "localImport", unit: "ranges", total: total)
+        var completed = 0
         for instrument in instruments {
             var first = from
             while first <= through {
                 try ResearchPressure.shared.check()
                 let last = min(through, first + 999 * hourMS)
+                let range = ResearchRange(from: first, through: last)
+                await progress(counter.update(completed, "Reading recorded Radar history · \(instrument.id)", instrument: instrument.id, range: range))
                 let candles = try radar.candles(instrument.id, since: first, through: last), stats = try radar.chartStats(instrument.id, since: first, through: last)
                 let quotes = try radar.hourlyQuotes(instrument.id, since: first, through: last).compactMapValues { quote in
                     quote.turnover.map { FilterQuote(turnover: $0, spread: nil, timestamp: quote.timestamp) }
@@ -180,6 +185,8 @@ final class ResearchDataProvider {
                     }
                     try store.write(values)
                 }
+                completed += 1
+                await progress(counter.update(completed, "Recorded Radar range inspected · \(instrument.id)", instrument: instrument.id, range: range))
                 first = last + hourMS
             }
         }
@@ -286,10 +293,10 @@ final class ResearchDataProvider {
               let end = calendar.date(byAdding: match.3 == nil ? .month : .day, value: 1, to: first) else { return nil }
         return .init(from: Int64(first.timeIntervalSince1970 * 1000), through: Int64(end.timeIntervalSince1970 * 1000) - hourMS)
     }
-    func plan(_ spec: StudySpec, refresh: Bool = false, catalogProgress: @escaping @Sendable (ResearchCatalogProgress) async -> Void = { _ in }, progress: @escaping @Sendable (String) async -> Void) async throws -> DataPlan {
+    func plan(_ spec: StudySpec, refresh: Bool = false, catalogProgress: @escaping @Sendable (ResearchCatalogProgress) async -> Void = { _ in }, progress: @escaping @Sendable (ResearchPlanningProgress) async -> Void) async throws -> DataPlan {
         let spec = try spec.excludingSpread()
         try spec.validate()
-        await progress("Reading the fixed local cache and instrument registry…")
+        await progress(.init(stage: "registry", unit: "steps", completed: 0, total: 1, message: "Reading local instrument metadata; requesting OKX metadata if needed…"))
         let registry = try await instruments(through: spec.through, refresh: refresh)
         let chosen = registry.filter { $0.verified && $0.listedAt != nil && (spec.instruments.isEmpty || spec.instruments.contains($0.id)) }
         guard !chosen.isEmpty else { throw FilterError("No verified eligible USDT swaps. Refresh the instrument catalog or choose a known instrument.") }
@@ -304,7 +311,7 @@ final class ResearchDataProvider {
             else { plan.warnings.append("BTC reference metadata is unavailable; BTC readings remain Unknown.") }
         }
         let inputs = plan.inputInstruments
-        try importRadar(inputs, from: max(0, first - Int64(warmup + 1) * hourMS), through: last)
+        try await importRadar(inputs, from: max(0, first - Int64(warmup + 1) * hourMS), through: last, progress: progress)
         plan.unknownInstruments = Array(Set(registry.filter { !$0.verified || $0.listedAt == nil }.map(\.id) + spec.instruments.filter { id in !chosen.contains { $0.id == id } })).sorted()
         plan.warnings += ["Historic eligibility is limited to instruments with verified metadata. Archive-only symbols without verified classification or listing dates are reported separately.", "Hourly OI has limited public coverage. Full and partial Opportunity scores are reported separately."]
         if rules.contains(where: \.hasLiveBTC) { plan.warnings.append("Hourly approximation of live BTC rules: check at the completed hourly close and execute at the next hourly open. Intrahour trigger times are not reconstructed.") }
@@ -330,22 +337,27 @@ final class ResearchDataProvider {
         // Batch within the catalog family limit; cached complete periods need no catalog requests.
         for (module, kind, end) in [(2, "candle", oldEnd), (1, "taker", oldEnd), (3, "funding", oldEnd)] where earliestInput <= end {
             var ranges: [String: [ResearchRange]] = [:]
-            for instrument in inputs where needs(kind, instrument.id) {
+            let candidates = inputs.filter { needs(kind, $0.id) }
+            let counter = ResearchPlanningCounter(stage: "missing", unit: "instruments", total: candidates.count)
+            for (index, instrument) in candidates.enumerated() {
+                await progress(counter.update(index, "Checking local gaps for archive planning · \(instrument.id) · \(kind)", instrument: instrument.id, kind: kind))
                 let begin = max(earliestInput, instrument.listedAt! / hourMS * hourMS)
                 guard begin <= end else { continue }
                 ranges[instrument.id] = refresh ? [.init(from: begin, through: end)] : try store.missing(instrument.id, kind: kind, from: begin, through: end)
+                await progress(counter.update(index + 1, "Local archive gaps checked · \(instrument.id) · \(kind)", instrument: instrument.id, kind: kind))
             }
             let missing = inputs.filter { !ranges[$0.id, default: []].isEmpty }
             if !missing.isEmpty {
-                await progress("Reading published \(kind) archive ranges for \(missing.count) instrument families…")
                 catalogs[module] = try await archiveSources(module: module, kind: kind, instruments: missing, ranges: ranges, from: earliestInput, through: end, refresh: refresh, progress: catalogProgress)
             }
         }
         func published(_ module: Int, _ id: String, _ from: Int64, _ through: Int64) -> [ResearchSource] {
             catalogs[module, default: []].filter { $0.instrument == id && $0.through >= from && $0.from <= through }
         }
+        let sourceCounter = ResearchPlanningCounter(stage: "sources", unit: "instruments", total: inputs.count)
         for (index, instrument) in inputs.enumerated() {
-            try Task.checkCancellation(); await progress("Planning \(instrument.id) · \(index + 1)/\(inputs.count)")
+            try Task.checkCancellation()
+            await progress(sourceCounter.update(index, "Building download ranges · \(instrument.id)", instrument: instrument.id))
             let begin = max(first - Int64(warmup + 1) * hourMS, instrument.listedAt! / hourMS * hourMS)
             guard begin <= last else { continue }
             plan.requestedHours += Int((last - begin) / hourMS) + 1
@@ -372,6 +384,7 @@ final class ResearchDataProvider {
                     if restBegin <= range.through { plan.sources.append(restSource(instrument.id, kind: kind, .init(from: restBegin, through: range.through), refresh: refresh)) }
                 }
             }
+            await progress(sourceCounter.update(index + 1, "Download ranges planned · \(instrument.id)", instrument: instrument.id))
         }
         if !refresh {
             plan.sources += try store.objects("source", as: ResearchSource.self).filter { source in
@@ -379,11 +392,17 @@ final class ResearchDataProvider {
             }
         }
         plan.sources = Array(Dictionary(plan.sources.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a }).values).sorted { ($0.instrument, $0.kind, $0.from) < ($1.instrument, $1.kind, $1.from) }
-        for index in plan.sources.indices { plan.sources[index].cached = try store.rawIsComplete(plan.sources[index]) }
+        let cacheCounter = ResearchPlanningCounter(stage: "cache", unit: "sources", total: plan.sources.count)
+        for index in plan.sources.indices {
+            try Task.checkCancellation()
+            await progress(cacheCounter.update(index, "Checking cached source files · \(plan.sources[index].filename)"))
+            plan.sources[index].cached = try store.rawIsComplete(plan.sources[index])
+            await progress(cacheCounter.update(index + 1, "Cached source checked · \(plan.sources[index].filename)"))
+        }
         plan.warnings = Array(Set(plan.warnings)).sorted()
-        await progress("Inspecting local input coverage and gaps…")
-        plan.coverage = try store.coverage(inputs, from: max(0, first-Int64(warmup+1)*hourMS), through: last)
+        plan.coverage = try await store.coverageWithProgress(inputs, from: max(0, first-Int64(warmup+1)*hourMS), through: last, progress: progress)
         plan = try plan.excludingSpread()
+        await progress(.init(stage: "saving", unit: "steps", completed: 0, total: 1, message: "Saving the verified data plan and checkpoint…"))
         try store.put(plan.id, kind: "plan", plan)
         return plan
     }
@@ -429,6 +448,7 @@ final class ResearchDataProvider {
         if source.archive {
             let importer = ResearchArchiveImporter(store: store, source: source, instruments: instruments)
             let encountered = try importer.run(file: file)
+            source.warnings = importer.warnings
             for id in encountered where !instruments.contains(where: { $0.id == id }) {
                 if try store.get("instrument:\(id)", as: ResearchInstrument.self) == nil {
                     try store.put("instrument:\(id)", kind: "instrument", ResearchInstrument(id: id, verified: false, source: source.url, observedAt: researchNow()))

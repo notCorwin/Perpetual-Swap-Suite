@@ -13,7 +13,7 @@ struct Candle: Codable, Sendable {
     let low: Double
     let close: Double
     let confirmed: Bool
-    let quoteVolume: Double
+    let quoteVolume: Double?
     let baseVolume: Double?
 
     init?(_ values: [String]) {
@@ -28,7 +28,7 @@ struct Candle: Codable, Sendable {
         confirmed = values[8] == "1"; quoteVolume = quote; baseVolume = base
     }
 
-    init(hour: Int64, high: Double, low: Double, close: Double, quoteVolume: Double, baseVolume: Double?, open: Double? = nil, confirmed: Bool = true) {
+    init(hour: Int64, high: Double, low: Double, close: Double, quoteVolume: Double?, baseVolume: Double?, open: Double? = nil, confirmed: Bool = true) {
         self.hour = hour; self.open = open; self.high = high; self.low = low; self.close = close
         self.confirmed = confirmed; self.quoteVolume = quoteVolume; self.baseVolume = baseVolume
     }
@@ -193,8 +193,8 @@ func vwap14(_ bars: [Int64: Candle], _ hour: Int64) -> Double? {
     var quote = 0.0, base = 0.0
     for age in (0..<14).reversed() {
         guard let bar = bars[hour - Int64(age) * hourMS],
-              (age == 0 || bar.confirmed), let volume = bar.baseVolume else { return nil }
-        quote += bar.quoteVolume; base += volume
+              (age == 0 || bar.confirmed), let volume = bar.baseVolume, let quoteVolume = bar.quoteVolume else { return nil }
+        quote += quoteVolume; base += volume
     }
     return base > 0 ? quote / base : nil
 }

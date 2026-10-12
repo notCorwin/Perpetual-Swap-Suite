@@ -18,7 +18,7 @@ actor ResearchFixtureTransport: ResearchTransport {
         if url.path.hasSuffix("history-candles") {
             let cursor = Int64(params["after"]!)!
             rows = candles.filter { $0.hour < cursor }.sorted { $0.hour > $1.hour }.prefix(300).map {
-                [String($0.hour), String($0.open!), String($0.high), String($0.low), String($0.close), "1", String($0.baseVolume!), String($0.quoteVolume), "1"]
+                [String($0.hour), String($0.open!), String($0.high), String($0.low), String($0.close), "1", String($0.baseVolume!), String($0.quoteVolume!), "1"]
             }
         } else if url.path.hasSuffix("market-data-history") { rows = [] }
         else { throw FilterError("Unexpected fixture request \(url.path)") }
@@ -316,6 +316,53 @@ final class ResearchTests: XCTestCase {
         for byte in Data("a,\"quote \"\" text\",中文\r\nb,\"two\nlines\",c".utf8) { try csv.feed(Data([byte])) }
         try csv.finish()
         XCTAssertEqual(decoded, [["a", "quote \" text", "中文"], ["b", "two\nlines", "c"]])
+    }
+    func testLegacyMonthlyCandlesKeepOHLCAndUnknownQuoteVolume() async throws {
+        let store = try store(); defer { try? FileManager.default.removeItem(at: store.directory) }
+        let first: Int64 = 1_630_425_600_000
+        let header = "instrument_name,open,high,low,close,vol,vol_ccy,vol_quote,open_time,confirm\r\n"
+        let rows = (0..<120).map { "BTC-USDT-SWAP,100,102,99,101,10,None,None,\(first + Int64($0) * 60_000),1\r\n" }.joined()
+        let external = ProcessInfo.processInfo.environment["RADAR_RESEARCH_ARCHIVE_FIXTURE"].map { URL(fileURLWithPath: $0) }
+        let file = try external ?? zip(store, content: header + rows)
+        let last = first + Int64(external == nil ? 1 : 719) * hourMS
+        var instrument = ResearchFixture.instrument; instrument.listedAt = first - 100 * hourMS
+        let source = ResearchSource(id: "legacy", instrument: instrument.id, kind: "candle", from: first, through: last, url: "fixture", filename: "BTC-USDT-SWAP-candlesticks-2021-09.zip", archive: true, module: 2, rawHash: researchHash(try Data(contentsOf: file)))
+        try FileManager.default.copyItem(at: file, to: store.rawURL(source))
+        try store.put(source.id, kind: "source", source)
+        let transport = ResearchFixtureTransport(), provider = ResearchDataProvider(store: store, transport: transport, radarURL: store.directory.appendingPathComponent("absent"))
+        try await provider.prepare(source, instruments: [instrument])
+        let series = try store.series(instrument.id, from: first, through: last)
+        XCTAssertEqual(series.candles.count, external == nil ? 2 : 720)
+        XCTAssertTrue(series.candles.values.allSatisfy { $0.open != nil && $0.high >= $0.low && $0.baseVolume != nil && $0.quoteVolume == nil })
+        if external == nil {
+            XCTAssertEqual(try XCTUnwrap(series.candles[first]?.baseVolume), 6, accuracy: 1e-9)
+            XCTAssertEqual(series.candles[first]?.open, 100); XCTAssertEqual(series.candles[first]?.close, 101)
+        }
+        let context = ResearchEngine.context(instrument: instrument, hour: last, series: ResearchEngine.reconstruct(series))
+        XCTAssertEqual(FilterEvaluator(market: context, filter: try FilterCompiler.compile(source: "Close > 0")).evaluate().result, .yes)
+        XCTAssertEqual(FilterEvaluator(market: context, filter: try FilterCompiler.compile(source: "Volume > 0")).evaluate().result, .unknown)
+        XCTAssertEqual(FilterEvaluator(market: context, filter: try FilterCompiler.compile(source: "VWAP(2) > 0")).evaluate().result, .unknown)
+        XCTAssertTrue(try store.missing(instrument.id, kind: "candle", from: first, through: last).isEmpty)
+        let saved = try XCTUnwrap(store.get(source.id, as: ResearchSource.self))
+        XCTAssertTrue(saved.warnings?.contains { $0.contains("quote-currency volume is missing") } == true)
+        let manifest = try store.freeze(.init(spec: try ResearchFixture.spec(), instruments: [instrument], from: first, through: last, warmupHours: 0, sources: [source]))
+        XCTAssertTrue(manifest.warnings.contains { $0.contains("OHLC prices were imported") })
+        let counts = await transport.counts()
+        XCTAssertEqual(counts.1, 0, "Retry must reuse the already downloaded archive.")
+    }
+    func testMissingArchiveVolumesStayUnknownWithoutVerifiedConversionAndMalformedValuesFail() throws {
+        let store = try store(); defer { try? FileManager.default.removeItem(at: store.directory) }
+        let hour = ResearchFixture.hour
+        let header = "open_time,open,high,low,close,vol,vol_ccy,vol_quote,confirm\n"
+        let rows = (0..<60).map { "\(hour + Int64($0) * 60_000),100,102,99,101,10,None,None,1\n" }.joined()
+        var instrument = ResearchFixture.instrument; instrument.contractValue = nil
+        let source = ResearchSource(id: "missing", instrument: instrument.id, kind: "candle", from: hour, through: hour, url: "fixture", filename: "fixture.zip", archive: true, module: 2)
+        _ = try ResearchArchiveImporter(store: store, source: source, instruments: [instrument]).run(file: zip(store, content: header + rows))
+        let candle = try XCTUnwrap(store.latest(instrument.id, kind: "candle", timestamp: hour)?.candle)
+        XCTAssertNil(candle.baseVolume); XCTAssertNil(candle.quoteVolume)
+        XCTAssertThrowsError(try ResearchArchiveImporter(store: store, source: source, instruments: [instrument]).run(file: zip(store, content: header + rows.replacingOccurrences(of: "None,None", with: "None,broken")))) { error in
+            XCTAssertTrue(error.localizedDescription.contains("Invalid archive volume in vol_quote"))
+        }
     }
     func testBookSnapshotsUpdatesSequenceGapsAndNoNextHourLeak() throws {
         let store = try store(); defer { try? FileManager.default.removeItem(at: store.directory) }

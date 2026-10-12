@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
 import type { ResearchJob } from './research-types.ts'
-import { researchByteSize, researchDuration, researchFilePercent, researchWaiting } from './research-task.ts'
+import { researchByteSize, researchDuration, researchFilePercent, researchPlanningDescription, researchPlanningStage, researchProgressLabel, researchWaiting } from './research-task.ts'
 
 const downloading = (): ResearchJob => ({ id: 'job', phase: 'preparing', completed: 0, total: 3, message: 'archive.zip', error: '', updatedAt: 1000,
   preparation: { stage: 'downloading', filename: 'archive.zip', instrument: 'BTC-USDT-SWAP', receivedBytes: 250, totalBytes: 1000, pages: 0 } })
@@ -42,4 +42,30 @@ test('archive directory scans have waiting feedback before file downloads begin'
   assert.match(researchWaiting(job, 21000), /No data received for 20s/)
   job.catalog!.waitingForResponse = false
   assert.equal(researchWaiting(job, 21000), '')
+})
+
+test('local checking has its own units, phase wording, estimate and stalled feedback', () => {
+  const job: ResearchJob = { id: 'local', phase: 'planning', completed: 720, total: 6000, message: 'Checking BTC candles', error: '', updatedAt: 1000,
+    planning: { stage: 'coverage', unit: 'hours', completed: 720, total: 6000, message: 'Checking BTC candles', remainingSeconds: 120 } }
+  assert.equal(researchProgressLabel(job), 'Hourly inputs checked')
+  assert.equal(researchPlanningStage(job), 'Checking local input coverage')
+  assert.match(researchPlanningDescription(job), /Checking cached hours and missing intervals/)
+  assert.doesNotMatch(researchPlanningDescription(job), /Reading.*catalog/)
+  assert.equal(researchDuration(job.planning!.remainingSeconds), '2m 0s')
+  assert.match(researchWaiting(job, 21000), /Last check progress update.*20s/)
+  assert.doesNotMatch(researchWaiting(job, 21000), /Waiting for OKX/)
+  job.phase = 'failed'; job.error = 'Local database read failed'
+  assert.equal(researchWaiting(job, 21000), '')
+})
+
+test('every planning phase explains its current work instead of repeating catalog wording', () => {
+  const job: ResearchJob = { id: 'plan', phase: 'planning', completed: 0, total: 1, message: '', error: '' }
+  for (const stage of ['registry', 'localImport', 'missing', 'sources', 'cache', 'coverage', 'saving']) {
+    job.planning = { stage, unit: 'steps', completed: 0, total: 1, message: '' }
+    assert.doesNotMatch(researchPlanningDescription(job), /Reading published archive catalogs/)
+    assert.notEqual(researchPlanningStage(job), 'Starting planning')
+  }
+  job.catalog = { kind: 'candle', completed: 0, total: 2, message: '', waitingForResponse: true }
+  assert.equal(researchProgressLabel(job), 'Catalog pages checked')
+  assert.match(researchPlanningDescription(job), /Reading published archive catalogs/)
 })

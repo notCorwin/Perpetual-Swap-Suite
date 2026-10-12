@@ -861,7 +861,7 @@ final class Radar {
             let buy = ts == hour ? rows[id]?.buy ?? live?.buy : stat?.buy
             output.append([
                 "hour": ts, "open": open, "high": bar.high, "low": bar.low, "close": bar.close,
-                "volume": bar.quoteVolume, "confirmed": bar.confirmed,
+                "volume": bar.quoteVolume as Any? ?? null, "confirmed": bar.confirmed,
                 "vwap": vwap14(series, ts) as Any? ?? null, "ema": ema as Any? ?? null,
                 "logBBUpper": upper as Any? ?? null, "logBBMiddle": middle as Any? ?? null, "logBBLower": lower as Any? ?? null,
                 "roc": percentageSnapshot(roc), "maroc": percentageSnapshot(maroc),

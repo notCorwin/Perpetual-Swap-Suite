@@ -192,7 +192,7 @@ final class Store {
             let id = String(cString: sqlite3_column_text(candleStmt, 0))
             guard ids.contains(id) else { return }
             let ts = sqlite3_column_int64(candleStmt, 1)
-            candles[id, default: [:]][ts] = Candle(hour: ts, high: sqlite3_column_double(candleStmt, 2), low: sqlite3_column_double(candleStmt, 3), close: sqlite3_column_double(candleStmt, 4), quoteVolume: sqlite3_column_double(candleStmt, 5), baseVolume: sqlite3_column_type(candleStmt, 6) == SQLITE_NULL ? nil : sqlite3_column_double(candleStmt, 6), open: sqlite3_column_type(candleStmt, 7) == SQLITE_NULL ? nil : sqlite3_column_double(candleStmt, 7))
+            candles[id, default: [:]][ts] = Candle(hour: ts, high: sqlite3_column_double(candleStmt, 2), low: sqlite3_column_double(candleStmt, 3), close: sqlite3_column_double(candleStmt, 4), quoteVolume: sqlite3_column_type(candleStmt, 5) == SQLITE_NULL ? nil : sqlite3_column_double(candleStmt, 5), baseVolume: sqlite3_column_type(candleStmt, 6) == SQLITE_NULL ? nil : sqlite3_column_double(candleStmt, 6), open: sqlite3_column_type(candleStmt, 7) == SQLITE_NULL ? nil : sqlite3_column_double(candleStmt, 7))
         }
         let emaStmt = try statement("SELECT inst_id,hour,value FROM ema200")
         defer { sqlite3_finalize(emaStmt) }
@@ -222,7 +222,7 @@ final class Store {
         var result: [Int64: Candle] = [:]
         try readRows(stmt) {
             let ts = sqlite3_column_int64(stmt, 0)
-            result[ts] = Candle(hour: ts, high: sqlite3_column_double(stmt, 1), low: sqlite3_column_double(stmt, 2), close: sqlite3_column_double(stmt, 3), quoteVolume: sqlite3_column_double(stmt, 4), baseVolume: sqlite3_column_type(stmt, 5) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 5), open: sqlite3_column_type(stmt, 6) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 6))
+            result[ts] = Candle(hour: ts, high: sqlite3_column_double(stmt, 1), low: sqlite3_column_double(stmt, 2), close: sqlite3_column_double(stmt, 3), quoteVolume: sqlite3_column_type(stmt, 4) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 4), baseVolume: sqlite3_column_type(stmt, 5) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 5), open: sqlite3_column_type(stmt, 6) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 6))
         }
         return result
     }

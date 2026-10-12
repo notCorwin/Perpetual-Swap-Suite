@@ -2,7 +2,7 @@ import Foundation
 import CryptoKit
 
 enum ResearchVersion {
-    static let parser = "okx-archives-1"
+    static let parser = "okx-archives-2"
     static let engine = "hourly-close-btc-no-spread-3"
     static let horizons = [1, 3, 6, 12, 24, 48]
     static let memoryBudget = 128 * 1024 * 1024
@@ -98,6 +98,7 @@ struct ResearchSource: Codable, Sendable {
     var cached = false
     var parser = ResearchVersion.parser
     var refresh = false
+    var warnings: [String]?
 }
 
 struct DataPlan: Codable, Sendable {
@@ -286,6 +287,31 @@ struct ResearchJobStatus: Codable, Sendable {
     var updatedAt = researchNow()
     var preparation: ResearchPreparationProgress?
     var catalog: ResearchCatalogProgress?
+    var planning: ResearchPlanningProgress?
+}
+
+struct ResearchPlanningProgress: Codable, Sendable {
+    var stage: String
+    var unit: String
+    var completed: Int
+    var total: Int
+    var message: String
+    var instrument: String?
+    var kind: String?
+    var from: Int64?
+    var through: Int64?
+    var remainingSeconds: Double?
+}
+
+struct ResearchPlanningCounter {
+    var stage: String
+    var unit: String
+    var total: Int
+    private let started = ContinuousClock.now
+    func update(_ completed: Int, _ message: String, instrument: String? = nil, kind: String? = nil, range: ResearchRange? = nil) -> ResearchPlanningProgress {
+        let remaining = completed > 0 ? researchSeconds(started.duration(to: .now)) / Double(completed) * Double(max(0, total - completed)) : nil
+        return .init(stage: stage, unit: unit, completed: completed, total: total, message: message, instrument: instrument, kind: kind, from: range?.from, through: range?.through, remainingSeconds: remaining)
+    }
 }
 
 struct ResearchCatalogProgress: Codable, Sendable {

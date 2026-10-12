@@ -42,14 +42,17 @@ struct ResearchHourAggregate {
     var first: Int64 = .max, last: Int64 = .min
     var open = 0.0, close = 0.0, high = 0.0, low = Double.infinity
     var base = 0.0, quote = 0.0, buy = 0.0, sell = 0.0
+    var baseComplete = true, quoteComplete = true
     var minutes = Set<Int>()
-    mutating func add(timestamp: Int64, open: Double, high: Double, low: Double, close: Double, base: Double, quote: Double) {
+    mutating func add(timestamp: Int64, open: Double, high: Double, low: Double, close: Double, base: Double?, quote: Double?) {
         if timestamp < first { first = timestamp; self.open = open }
         if timestamp >= last { last = timestamp; self.close = close }
-        self.high = max(self.high, high); self.low = min(self.low, low); self.base += base; self.quote += quote
+        self.high = max(self.high, high); self.low = min(self.low, low)
+        if let base { self.base += base } else { baseComplete = false }
+        if let quote { self.quote += quote } else { quoteComplete = false }
         minutes.insert(Int((timestamp - hour) / 60_000))
     }
-    var candle: Candle { Candle(hour: hour, high: high, low: low, close: close, quoteVolume: quote, baseVolume: base, open: open) }
+    var candle: Candle { Candle(hour: hour, high: high, low: low, close: close, quoteVolume: quoteComplete ? quote : nil, baseVolume: baseComplete ? base : nil, open: open) }
 }
 
 final class ResearchBook {
@@ -109,6 +112,14 @@ final class ResearchArchiveImporter {
     private(set) var rows = 0
     private var rejected = 0
     private var encountered = Set<String>()
+    private var missingBase = 0, missingQuote = 0, convertedBase = 0
+    var warnings: [String] {
+        var result: [String] = []
+        if convertedBase > 0 { result.append("\(source.filename): base-currency volume for \(convertedBase) minute candles was converted from contract volume using verified contract metadata.") }
+        if missingBase > 0 { result.append("\(source.filename): base-currency volume is missing for \(missingBase) minute candles; affected volume-dependent inputs remain Unknown.") }
+        if missingQuote > 0 { result.append("\(source.filename): quote-currency volume is missing for \(missingQuote) minute candles; affected VWAP and quote-volume inputs remain Unknown. OHLC prices were imported.") }
+        return result
+    }
     init(store: ResearchStore, source: ResearchSource, instruments: [ResearchInstrument]) {
         self.store = store; self.source = source; self.instruments = Dictionary(uniqueKeysWithValues: instruments.map { ($0.id, $0) })
     }
@@ -123,6 +134,16 @@ final class ResearchArchiveImporter {
     }
     private func number(_ row: [String], _ names: String...) -> Double? {
         for name in names { if let index = headers[name], index < row.count, let n = Double(row[index]), n.isFinite { return n } }; return nil
+    }
+    private func volume(_ row: [String], _ names: String...) throws -> Double? {
+        for name in names {
+            guard let index = headers[name], index < row.count else { continue }
+            let text = row[index].trimmingCharacters(in: .whitespacesAndNewlines)
+            if ["", "none", "null"].contains(text.lowercased()) { continue }
+            guard let value = Double(text), value.isFinite, value >= 0 else { throw FilterError("Invalid archive volume in \(name): \(text.prefix(80)). The raw file was retained.") }
+            return value
+        }
+        return nil
     }
     private func finishAggregate(_ id: String) throws {
         guard let value = aggregate.removeValue(forKey: id) else { return }
@@ -159,8 +180,15 @@ final class ResearchArchiveImporter {
         if aggregate[id]?.hour != hour { try finishAggregate(id); aggregate[id] = ResearchHourAggregate(hour: hour) }
         if source.module == 2 {
             guard cell(row, "confirm") != "0", let open = number(row, "open", "o"), let high = number(row, "high", "h"), let low = number(row, "low", "l"), let close = number(row, "close", "c"),
-                  let base = number(row, "vol_ccy", "volccy"), let quote = number(row, "vol_quote", "volccyquote"), low > 0, high >= low,
-                  (low...high).contains(open), (low...high).contains(close), base >= 0, quote >= 0, ts % 60_000 == 0 else { rejected += 1; return }
+                  low > 0, high >= low, (low...high).contains(open), (low...high).contains(close), ts % 60_000 == 0 else { rejected += 1; return }
+            var base = try volume(row, "vol_ccy", "volccy")
+            let quote = try volume(row, "vol_quote", "volccyquote")
+            if base == nil, let metadata = instruments[id], metadata.verified,
+               let contractValue = metadata.contractValue, contractValue.isFinite, contractValue > 0,
+               let contracts = try volume(row, "vol", "volume"), (contracts * contractValue).isFinite {
+                base = contracts * contractValue; convertedBase += 1
+            }
+            if base == nil { missingBase += 1 }; if quote == nil { missingQuote += 1 }
             guard !aggregate[id]!.minutes.contains(Int((ts - hour) / 60_000)) else { throw FilterError("Duplicate minute candle in archive.") }
             aggregate[id]!.add(timestamp: ts, open: open, high: high, low: low, close: close, base: base, quote: quote)
         } else {

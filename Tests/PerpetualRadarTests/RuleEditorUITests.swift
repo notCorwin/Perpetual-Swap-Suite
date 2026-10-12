@@ -579,6 +579,18 @@ final class RuleEditorUITests: BackgroundTestCase {
         let catalogStatus = try await js(view, "document.querySelector('[data-research-task]').innerText") as? String ?? ""
         XCTAssertTrue(catalogStatus.contains("file downloads start after Prepare Data"))
         XCTAssertTrue(catalogStatus.contains("Estimated catalog time remaining: About 1m 0s"))
+        bridge.researchJobOverride = ["id": "coverage", "phase": "planning", "completed": 3600, "total": 7200, "message": "Checking local coverage · BTC-USDT-SWAP · candle", "error": "", "updatedAt": researchNow(),
+            "planning": ["stage": "coverage", "unit": "hours", "completed": 3600, "total": 7200, "message": "Checking local coverage · BTC-USDT-SWAP · candle", "from": ResearchFixture.hour, "through": ResearchFixture.hour + 719 * hourMS, "remainingSeconds": 120]]
+        try await wait(view, "document.querySelector('[data-research-task]')?.innerText.includes('Hourly inputs checked: 3,600 / 7,200 · 50.0%')")
+        let localStatus = try await js(view, "document.querySelector('[data-research-task]').innerText") as? String ?? ""
+        XCTAssertTrue(localStatus.contains("Checking local input coverage")); XCTAssertTrue(localStatus.contains("Current range:"))
+        XCTAssertTrue(localStatus.contains("Estimated check time remaining: About 2m 0s"))
+        XCTAssertFalse(localStatus.contains("Counting")); XCTAssertFalse(localStatus.contains("Reading archive catalogs"))
+        let localPercent = try await js(view, "document.querySelector('[aria-label=\"Research task progress\"]').getAttribute('aria-valuenow')") as? String
+        XCTAssertEqual(localPercent, "50")
+        bridge.researchJobOverride?["completed"] = 5400; bridge.researchJobOverride?["phase"] = "failed"
+        bridge.researchJobOverride?["error"] = "Local coverage check failed · BTC-USDT-SWAP · candle: database read failed"
+        try await wait(view, "document.querySelector('[data-research-task] [role=alert]')?.innerText.includes('database read failed') && document.querySelector('[data-research-task]')?.innerText.includes('Hourly inputs checked: 5,400 / 7,200')")
         bridge.researchJobOverride = ["id": "transfer", "phase": "preparing", "completed": 3, "total": 10, "message": "BTC-USDT-SWAP-2025-06.zip", "error": "", "startedAt": researchNow() - 60_000, "updatedAt": researchNow(),
             "preparation": ["stage": "downloading", "filename": "BTC-USDT-SWAP-2025-06.zip", "instrument": "BTC-USDT-SWAP", "receivedBytes": 50_000_000, "totalBytes": 100_000_000, "bytesPerSecond": 1_000_000, "fileRemainingSeconds": 50, "remainingSeconds": 600, "pages": 0]]
         try await wait(view, "document.querySelector('[aria-label=\"Current file download progress\"]')?.getAttribute('aria-valuenow') === '50'")

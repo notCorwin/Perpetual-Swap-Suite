@@ -248,8 +248,8 @@ final class FilterEvaluator {
             var bars: [Candle] = []
             for age in (0..<n).reversed() { if Task.isCancelled { return .unknown("Evaluation cancelled.") }; guard let b = bar(hour - Int64(age) * hourMS) else { return number(nil) }; bars.append(b) }
             if name == "vwap" {
-                guard bars.allSatisfy({ $0.baseVolume != nil }) else { return number(nil) }
-                let base = bars.reduce(0) { $0 + $1.baseVolume! }, quote = bars.reduce(0) { $0 + $1.quoteVolume }
+                guard bars.allSatisfy({ $0.baseVolume != nil && $0.quoteVolume != nil }) else { return number(nil) }
+                let base = bars.reduce(0) { $0 + $1.baseVolume! }, quote = bars.reduce(0) { $0 + $1.quoteVolume! }
                 return number(base > 0 ? quote / base : nil)
             }
             if name.hasPrefix("logbb") {
