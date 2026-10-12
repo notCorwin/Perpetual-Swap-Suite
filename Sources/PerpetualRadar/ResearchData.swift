@@ -12,7 +12,7 @@ actor OKXResearchTransport: ResearchTransport {
     private var lastRequest = ContinuousClock.now - .seconds(1)
     init(session: URLSession? = nil) {
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.httpMaximumConnectionsPerHost = 2
+        configuration.httpMaximumConnectionsPerHost = 8
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.timeoutIntervalForRequest = 60
         configuration.timeoutIntervalForResource = 24 * 60 * 60
@@ -244,8 +244,8 @@ final class ResearchDataProvider {
         await progress(.init(kind: kind, completed: completed, total: requests.count, message: "Checking \(kind) archive catalog · \(completed)/\(requests.count) pages · \(pending.count) network requests remaining", waitingForResponse: !pending.isEmpty))
         let transport = transport, started = ContinuousClock.now
         var fetched = 0
-        // Only network reads run concurrently. Parsing and SQLite cache writes
-        // stay on this worker's connection, with at most two in-flight requests.
+        // shortcut: Increased concurrency from 2 to 8 for faster catalog downloads.
+        // Network reads run concurrently; parsing and SQLite writes stay sequential.
         try await withThrowingTaskGroup(of: (Int, Data).self) { group in
             var next = 0
             func enqueue() {
@@ -253,7 +253,7 @@ final class ResearchDataProvider {
                 group.addTask { (index, try await transport.get(url)) }
                 next += 1
             }
-            for _ in 0..<min(2, pending.count) { enqueue() }
+            for _ in 0..<min(8, pending.count) { enqueue() }
             while let (index, data) = try await group.next() {
                 let request = pending[index]
                 result += try catalogSources(data, request: request, module: module, kind: kind, refresh: refresh, from: from, through: through)
