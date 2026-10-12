@@ -32,6 +32,8 @@ jobs:
           app='.build/app/Perpetual Swap Suite.app'
           test -x "$app/Contents/MacOS/PerpetualRadar"
           test -s "$app/Contents/Resources/Assets.car"
+          test -s "$app/Contents/Resources/Web/index.html"
+          test -d "$app/Contents/Resources/Web/assets"
           test "$(cat "$app/Contents/PkgInfo")" = 'APPL????'
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = com.perpetualradar.macos
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$app/Contents/Info.plist")" = AppIcon

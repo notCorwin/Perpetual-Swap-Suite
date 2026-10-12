@@ -156,8 +156,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             webRoot = development.deletingLastPathComponent()
             webView.load(URLRequest(url: URL(string: "radar://app/index.html")!))
         } else {
-            let message = "Build the interface with npm run build, then launch the app again."
-            webView.loadHTMLString("<html><body style='font:14px system-ui;padding:40px'>\(message)</body></html>", baseURL: nil)
+            let diagnostics = [
+                "Bundle resource path: \(Bundle.main.resourceURL?.path ?? "none")",
+                "Bundled web path exists: \(bundled.map { FileManager.default.fileExists(atPath: $0.path) } ?? false)",
+                "Development path: \(development.path)",
+                "Development exists: \(FileManager.default.fileExists(atPath: development.path))",
+                "Current directory: \(FileManager.default.currentDirectoryPath)"
+            ].joined(separator: "<br>")
+            let message = "Web assets not found. Diagnostics:<br><br>\(diagnostics)<br><br>If you downloaded this app from the internet, try: Right-click the app → Open (to bypass Gatekeeper), or run in Terminal:<br><code>xattr -cr '/path/to/Perpetual Swap Suite.app'</code>"
+            webView.loadHTMLString("<html><body style='font:13px system-ui;padding:40px;line-height:1.6'>\(message)</body></html>", baseURL: nil)
         }
         if !launchInBackground { NSApp.activate(ignoringOtherApps: true) }
     }
@@ -290,6 +297,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { openNotificationContract() }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        let alert = NSAlert()
+        alert.messageText = "Navigation Failed"
+        alert.informativeText = "Failed to load the interface: \(error.localizedDescription)\n\nIf you downloaded this app, try removing quarantine attributes: xattr -cr '/path/to/app'"
+        alert.alertStyle = .warning
+        alert.runModal()
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        let alert = NSAlert()
+        alert.messageText = "Failed to Load Interface"
+        let nsError = error as NSError
+        var details = "Error: \(error.localizedDescription)\nDomain: \(nsError.domain)\nCode: \(nsError.code)"
+        if let url = nsError.userInfo[NSURLErrorKey] as? URL {
+            details += "\nURL: \(url.absoluteString)"
+        }
+        if let bundleURL = Bundle.main.resourceURL?.appendingPathComponent("Web") {
+            let webExists = FileManager.default.fileExists(atPath: bundleURL.path)
+            details += "\n\nWeb assets directory exists: \(webExists)"
+            if webExists {
+                let contents = try? FileManager.default.contentsOfDirectory(atPath: bundleURL.path)
+                details += "\nFiles found: \(contents?.count ?? 0)"
+            }
+        }
+        alert.informativeText = details
+        alert.alertStyle = .critical
+        alert.runModal()
+    }
 
     @objc private func resumeAfterWake(_ notification: Notification) {
         applyWindowBackground()
