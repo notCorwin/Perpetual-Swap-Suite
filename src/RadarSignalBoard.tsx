@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import { ArrowUpRight, FlaskConical, ScanSearch } from 'lucide-react'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -45,7 +45,7 @@ function SignalLane({ signals, markets, onChart, onExplain }: { signals: RadarSi
   </section>
 }
 
-export function RadarSignalBoard({ profile, signals, rows, paused, onChart, onExplain, onResearch }: { profile: StrategyProfile; signals: RadarSignal[]; rows: NativeMarketRow[]; paused?: boolean; onChart: SignalChartAction; onExplain: (instrument: string) => void; onResearch: () => void }) {
+export const RadarSignalBoard = memo(function RadarSignalBoard({ profile, signals, rows, paused, onChart, onExplain, onResearch }: { profile: StrategyProfile; signals: RadarSignal[]; rows: NativeMarketRow[]; paused?: boolean; onChart: SignalChartAction; onExplain: (instrument: string) => void; onResearch: () => void }) {
   const markets = new Map(rows.map(row => [row.instId, row]))
   const unknown = signals.filter(signalIsUnknown).length
   return <section aria-label="Bullish Setup radar" className="flex flex-col gap-4 p-4" data-signal-board>
@@ -54,4 +54,4 @@ export function RadarSignalBoard({ profile, signals, rows, paused, onChart, onEx
     {(unknown > 0 || !signals.length) && <p role="status" className="text-xs text-muted-foreground">{!signals.length ? 'Waiting for strategy inputs. ' : ''}{unknown > 0 ? unknown + ' contracts have Unknown setup inputs. Inspect All markets for missing data.' : ''}</p>}
     <SignalLane key={profile.id} signals={signals} markets={markets} onChart={onChart} onExplain={onExplain} />
   </section>
-}
+})

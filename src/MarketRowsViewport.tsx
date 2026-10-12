@@ -1,9 +1,9 @@
-import { Fragment, useLayoutEffect, useRef, useState, type ReactNode } from "react"
+import { Fragment, memo, useLayoutEffect, useRef, useState, type ReactNode } from "react"
 import { TableBody, TableCell, TableRow } from "@/components/ui/table"
 
 // The list is scaled as a complete macOS window layout. Measure in screen pixels
 // for scrolling, then convert spacer heights back into the original design size.
-export function MarketRowsViewport({ ids, children }: { ids: string[]; children: (index: number) => ReactNode }) {
+export const MarketRowsViewport = memo(function MarketRowsViewport({ ids, children }: { ids: string[]; children: (index: number) => ReactNode }) {
   const body = useRef<HTMLTableSectionElement>(null)
   const geometry = useRef({ top: 0, rowPixels: 96 })
   const focusRequest = useRef<number | null>(null)
@@ -75,4 +75,4 @@ export function MarketRowsViewport({ ids, children }: { ids: string[]; children:
     {ordered.map((index, position) => <Fragment key={ids[index]}>{spacer(index - (position ? ordered[position - 1] + 1 : 0), `before-${index}`)}{children(index)}</Fragment>)}
     {spacer(ids.length - (ordered.length ? ordered[ordered.length - 1] + 1 : 0), "after")}
   </TableBody>
-}
+})

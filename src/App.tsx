@@ -233,6 +233,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   const draftJSON = JSON.stringify(filterDraft ?? listFilters)
   const compileKey = (activeProfile?.id ?? '') + ':universe:' + (editor.source === null ? draftJSON : `source:${editor.source}`)
   const editorExpressions = useMemo(() => ({ ...editor.expressionDrafts, ...compilation.expressions }), [editor.expressionDrafts, compilation.expressions])
+  const allowedMetrics = useMemo(() => metrics.filter(metric => !compilation.allowedMetrics || compilation.allowedMetrics.includes(metric.key)), [metrics, compilation.allowedMetrics])
   const compiling = compilation.pending || compilation.key !== compileKey
   const valid = !compiling && compilation.diagnostics.length === 0 && Boolean(compilation.configJSON)
   useLayoutEffect(() => {
@@ -289,8 +290,13 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
       try {
         const snapshot = await window.webkit.messageHandlers.radar.postMessage({ rocPeriod: ROC_PERIOD, marocPeriod: MAROC_PERIOD, sinceRevision: revision.current })
         if (stopped) return
-        if (!("unchanged" in snapshot)) acceptSnapshot(snapshot)
-        setStatus("Live")
+        if ("unchanged" in snapshot) {
+          // shortcut: Skip state updates when backend reports no changes
+          setStatus("Live")
+        } else {
+          acceptSnapshot(snapshot)
+          setStatus("Live")
+        }
       } catch (cause) {
         if (stopped) return
         setError(cause instanceof Error ? cause.message : "Cannot connect to the native collector")
@@ -362,7 +368,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     if (!activeProfile) return true
     return phaseView === 'markets' || signalInstruments.has(row.instId)
   }).sort((a, b) => compareMarketRows(a, b, sort, descending)), [searchedRows, sort, descending, activeProfile, phaseView, signalInstruments])
-  const unknownCount = searchedRows.filter(row => results[row.instId] === "unknown").length
+  const unknownCount = useMemo(() => searchedRows.filter(row => results[row.instId] === "unknown").length, [searchedRows, results])
   const listOrder = useMemo(() => visible.map(row => row.instId), [visible])
   const turnoverOrder = useMemo(() => [...matchedRows].sort(compareMarketTurnover).map(row => row.instId), [matchedRows])
   useEffect(() => {
@@ -525,7 +531,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
       </div>
       {suite.ready && !activeProfile && <Empty className="border-b"><EmptyHeader><EmptyTitle>Activate a strategy to monitor signals</EmptyTitle><EmptyDescription>All markets remain available below. Create a Strategy with Universe and Bullish Setup rules to enable signals and confirmed alerts.</EmptyDescription></EmptyHeader><EmptyContent><Button variant="outline" onClick={() => onDecisions({ metrics, templates, functions })}>Strategy Library…</Button></EmptyContent></Empty>}
       {suite.error && <p role="alert" className="px-4 text-destructive">{suite.error}</p>}
-      {activeProfile && phaseView === 'markets' && <StrategyRules label="Universe rules" strategyID={activeProfile.id} filters={listFilters} draft={filterDraft} editor={editor} onEditorChange={setEditor} onDraftChange={setFilterDraft} onApply={saveUniverse} metrics={metrics.filter(metric => !compilation.allowedMetrics || compilation.allowedMetrics.includes(metric.key))} templates={templates} preferences={libraryPreferences} onPreferences={saveLibraryPreferences} rows={rows} results={results} previewJSON={previewJSON} revision={revision.current} onExplain={explainMarket} units={compilation.units ?? {}} expressions={editorExpressions} diagnostics={compilation.diagnostics} valid={valid} compiling={compiling} requiredHours={compilation.requiredHours ?? 0} matches={searchedRows.filter(row => results[row.instId] === 'true').length} total={searchedRows.length} unknown={unknownCount} previewPending={lastValidJSON !== previewJSON} history={history} />}
+      {activeProfile && phaseView === 'markets' && <StrategyRules label="Universe rules" strategyID={activeProfile.id} filters={listFilters} draft={filterDraft} editor={editor} onEditorChange={setEditor} onDraftChange={setFilterDraft} onApply={saveUniverse} metrics={allowedMetrics} templates={templates} preferences={libraryPreferences} onPreferences={saveLibraryPreferences} rows={rows} results={results} previewJSON={previewJSON} revision={revision.current} onExplain={explainMarket} units={compilation.units ?? {}} expressions={editorExpressions} diagnostics={compilation.diagnostics} valid={valid} compiling={compiling} requiredHours={compilation.requiredHours ?? 0} matches={searchedRows.filter(row => results[row.instId] === 'true').length} total={searchedRows.length} unknown={unknownCount} previewPending={lastValidJSON !== previewJSON} history={history} />}
       {activeProfile && <SuitePhaseExplanation instrument={phaseExplainingID} profile={activeProfile} inputs={{metrics,templates,functions}} onClose={() => setPhaseExplainingID(null)} />}
       {activeProfile && <FilterExplanation strategyID={activeProfile.id} open={explanationOpen} onOpenChange={setExplanationOpen} instId={explainingId} onSelect={setExplainingId} rows={rows} results={results} filtersJSON={previewJSON} revision={revision.current} metrics={metrics} expressions={editorExpressions} units={compilation.units ?? {}} templates={templates} />}
       {error && <p role="alert" className="border-b px-4 py-2 text-sm text-destructive">{error}</p>}
