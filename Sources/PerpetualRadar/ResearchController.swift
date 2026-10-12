@@ -48,54 +48,43 @@ actor ResearchWorker {
         }
         
         // A checkpoint is advisory; verify the durable source cache on resume.
-        // Reuse one actor-owned connection per CPU rather than reopening a
-        // database and repinning the complete plan for every source.
+        // Keep acquisition actors separate from long synchronous import work,
+        // so a busy parser cannot delay starting a SWAP's next download. Both
+        // pools reuse CPU-sized sets of connections rather than one per SWAP.
+        try ResearchPreparationPipeline.reserveFileCapacity(downloads: Set(plan.sources.map(\.instrument)).count,
+                                                            workers: min(ResearchLocalScan.concurrency, plan.sources.count))
         let workers = try (0..<min(ResearchLocalScan.concurrency, plan.sources.count)).map { _ in
-            try PreparationWorker(directory: directory, transport: transport, radarURL: radarURL)
+            try PreparationWorker(directory: directory, transport: transport, radarURL: radarURL, plan: plan, checkpoint: checkpoint)
         }
-        let coordinator = PreparationCoordinator(total: plan.sources.count, concurrency: workers.count, durations: previousDurations)
-        var firstError: String?
-        try await withThrowingTaskGroup(of: (Int, ResearchSource, Double, String?).self) { group in
-            var next = 0
-            func enqueue(_ slot: Int) {
-                let source = plan.sources[next]
-                group.addTask {
-                    let started = ContinuousClock.now
-                    do {
-                        try await ResearchRecovery.run(onRetry: { delay, reason in
-                            await coordinator.report(.init(stage: "retrying", filename: source.filename, instrument: source.instrument,
-                                                           retryAt: researchNow() + Int64(delay * 1_000), recovery: reason), progress: progress)
-                        }) {
-                            try await workers[slot].prepare(source, plan: plan) { update in
-                                await coordinator.report(update, progress: progress)
-                            }
-                        }
-                        return (slot, source, researchSeconds(started.duration(to: .now)), nil)
-                    } catch {
-                        if Task.isCancelled { throw error }
-                        return (slot, source, researchSeconds(started.duration(to: .now)), "\(source.instrument) · \(source.filename): \(error.localizedDescription)")
-                    }
-                }
-                next += 1
-            }
-            for slot in workers.indices { enqueue(slot) }
-            while let (slot, source, elapsed, error) = try await group.next() {
-                try Task.checkCancellation()
-                if let error { firstError = firstError ?? error }
-                else {
-                    // Persist each completed source before accepting another result.
-                    checkpoint.updatedAt = researchNow()
-                    try initialStore.database.transaction {
-                        try initialStore.pinPreparedSource(source, plan: plan, owner: study.id)
-                        try initialStore.database.execute("INSERT OR REPLACE INTO research_prepared_sources VALUES (?,?,?)", [study.id, source.id, elapsed])
-                        try initialStore.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
-                    }
-                    await coordinator.completed(source, elapsed: elapsed, progress: progress)
-                }
-                if firstError == nil, next < plan.sources.count { enqueue(slot) }
-            }
+        let downloaders = try workers.map { _ in
+            try AcquisitionWorker(directory: directory, transport: transport, radarURL: radarURL, instruments: plan.inputInstruments)
         }
-        if let firstError { throw FilterError(firstError) }
+        let downloadLanes = Set(plan.sources.filter { $0.instrument.hasSuffix("-USDT-SWAP") }.map(\.instrument)).count
+        let coordinator = PreparationCoordinator(total: plan.sources.count, concurrency: workers.count, downloadLanes: downloadLanes, durations: previousDurations)
+        try await ResearchPreparationPipeline.run(plan.sources, concurrency: workers.count, acquire: { slot, source in
+            try await ResearchRecovery.run(onRetry: { delay, reason in
+                await coordinator.report(.init(stage: "retrying", filename: source.filename, instrument: source.instrument,
+                                               retryAt: researchNow() + Int64(delay * 1_000), recovery: reason), progress: progress)
+            }) {
+                try await downloaders[slot].acquire(source) { await coordinator.report($0, progress: progress) }
+            }
+        }, importSource: { slot, source in
+            try await ResearchRecovery.run(onRetry: { delay, reason in
+                await coordinator.report(.init(stage: "retrying", filename: source.filename, instrument: source.instrument,
+                                               retryAt: researchNow() + Int64(delay * 1_000), recovery: reason), progress: progress)
+            }) {
+                try await workers[slot].importSource(source) { await coordinator.report($0, progress: progress) }
+            }
+        }, finish: { slot, source, imported, started in
+            try await ResearchRecovery.run(onRetry: { delay, reason in
+                await coordinator.report(.init(stage: "retrying", filename: source.filename, instrument: source.instrument,
+                                               retryAt: researchNow() + Int64(delay * 1_000), recovery: reason), progress: progress)
+            }) {
+                try await workers[slot].finish(imported, started: started) { await coordinator.report($0, progress: progress) }
+            }
+        }, receive: { source, elapsed in
+            await coordinator.completed(source, elapsed: elapsed, progress: progress)
+        })
         try Task.checkCancellation()
         await progress(plan.sources.count, plan.sources.count, .init(stage: "freezing", filename: "Freezing verified local inputs…", instrument: ""))
         let manifest = try initialStore.freeze(plan)
@@ -109,43 +98,108 @@ actor ResearchWorker {
         return result
     }
 
+    private actor AcquisitionWorker {
+        private let provider: ResearchDataProvider
+        private let instruments: [ResearchInstrument]
+        init(directory: URL, transport: any ResearchTransport, radarURL: URL?, instruments: [ResearchInstrument]) throws {
+            provider = ResearchDataProvider(store: try ResearchStore(directory: directory), transport: transport, radarURL: radarURL)
+            self.instruments = instruments
+        }
+        func acquire(_ source: ResearchSource, progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void) async throws -> ResearchSource {
+            try await provider.acquire(source, instruments: instruments, progress: progress)
+        }
+    }
+
     private actor PreparationWorker {
         private let provider: ResearchDataProvider
-        init(directory: URL, transport: any ResearchTransport, radarURL: URL?) throws {
+        private let plan: DataPlan
+        private let instruments: [ResearchInstrument]
+        private let metadata: [String: ResearchInstrument]
+        private var checkpoint: Checkpoint
+        init(directory: URL, transport: any ResearchTransport, radarURL: URL?, plan: DataPlan, checkpoint: Checkpoint) throws {
             provider = ResearchDataProvider(store: try ResearchStore(directory: directory), transport: transport, radarURL: radarURL)
+            self.plan = plan; self.checkpoint = checkpoint
+            instruments = plan.inputInstruments
+            metadata = Dictionary(instruments.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
         }
-        func prepare(_ source: ResearchSource, plan: DataPlan, progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void) async throws {
-            let instrument = plan.inputInstruments.first { $0.id == source.instrument }
+        func importSource(_ source: ResearchSource, progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void) async throws -> ResearchImportResult {
+            await progress(.init(stage: "importing", filename: source.filename, instrument: source.instrument))
+            return try provider.importAcquired(source, instruments: instruments)
+        }
+        func finish(_ imported: ResearchImportResult, started: ContinuousClock.Instant, progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void) async throws -> Double {
+            let source = imported.source
+            let instrument = metadata[source.instrument]
             let from = max(plan.from - Int64(plan.warmupHours + 1) * hourMS, (instrument?.listedAt ?? 0) / hourMS * hourMS)
             let through = min(plan.through + 48 * hourMS, researchNow() / hourMS * hourMS - hourMS, instrument?.delistedAt.map { $0 / hourMS * hourMS - hourMS } ?? Int64.max)
-            try await provider.prepare(source, instruments: plan.inputInstruments, requiredRange: .init(from: from, through: through), progress: progress)
+            try await provider.finishImport(imported, instruments: instruments, requiredRange: .init(from: from, through: through), progress: progress)
+            let elapsed = researchSeconds(started.duration(to: .now))
+            checkpoint.updatedAt = researchNow()
+            // Commit on the owning worker before publishing completion.
+            // Completed inputs survive even if the UI or
+            // another transfer is slow, fails, or is cancelled.
+            try provider.store.database.transaction {
+                try provider.store.pinPreparedSource(source, plan: plan, owner: checkpoint.studyID)
+                try provider.store.database.execute("INSERT OR REPLACE INTO research_prepared_sources VALUES (?,?,?)", [checkpoint.studyID, source.id, elapsed])
+                try provider.store.put("checkpoint:\(checkpoint.studyID)", kind: "checkpoint", checkpoint)
+            }
+            return elapsed
         }
     }
 
     private actor PreparationCoordinator {
-        private let total: Int, concurrency: Int
+        private let total: Int, concurrency: Int, downloadLanes: Int
         private let started = ContinuousClock.now
         private var count = 0
         private var measuredSeconds = 0.0
         private var measuredCount = 0
-        init(total: Int, concurrency: Int, durations: [Double]) {
+        private var reported: ContinuousClock.Instant?
+        private var pending: ResearchPreparationProgress?
+        private var delivery: Task<Void, Never>?
+        init(total: Int, concurrency: Int, downloadLanes: Int, durations: [Double]) {
             self.total = total; self.concurrency = max(1, concurrency)
+            self.downloadLanes = downloadLanes
             measuredSeconds = durations.reduce(0, +); measuredCount = durations.count
         }
-        func report(_ update: ResearchPreparationProgress, progress: @Sendable (Int, Int, ResearchPreparationProgress) async -> Void) async {
+        func report(_ update: ResearchPreparationProgress, progress: @escaping @Sendable (Int, Int, ResearchPreparationProgress) async -> Void) async {
+            // Hundreds of simultaneous transfers must not flood the main actor.
+            // Keep retries visible immediately and coalesce ordinary updates.
+            if update.retryAt == nil, let reported, reported.duration(to: .now) < .milliseconds(100) {
+                pending = update
+                if delivery == nil {
+                    delivery = Task {
+                        do { try await Task.sleep(until: reported + .milliseconds(100), clock: .continuous) }
+                        catch { return }
+                        await self.flush(progress: progress)
+                    }
+                }
+                return
+            }
+            pending = nil; delivery?.cancel(); delivery = nil
+            await publish(update, progress: progress)
+        }
+        private func flush(progress: @Sendable (Int, Int, ResearchPreparationProgress) async -> Void) async {
+            guard !Task.isCancelled else { return }
+            delivery = nil
+            guard let update = pending else { return }
+            pending = nil
+            await publish(update, progress: progress)
+        }
+        private func publish(_ update: ResearchPreparationProgress, progress: @Sendable (Int, Int, ResearchPreparationProgress) async -> Void) async {
+            reported = .now
             var update = update
             update.workers = concurrency
-            if measuredCount > 0 {
+            update.downloadLanes = downloadLanes
+            if count > 0 {
+                update.remainingSeconds = researchSeconds(started.duration(to: .now)) / Double(count) * Double(total - count)
+            } else if measuredCount > 0 {
                 update.remainingSeconds = measuredSeconds / Double(measuredCount) * Double(total - count) / Double(concurrency)
             }
             await progress(count, total, update)
         }
         func completed(_ source: ResearchSource, elapsed: Double, progress: @Sendable (Int, Int, ResearchPreparationProgress) async -> Void) async {
             count += 1; measuredCount += 1; measuredSeconds += elapsed
-            var update = ResearchPreparationProgress(stage: "prepared", filename: source.filename, instrument: source.instrument)
-            update.workers = concurrency
-            update.remainingSeconds = count > 0 ? researchSeconds(started.duration(to: .now)) / Double(count) * Double(total - count) : nil
-            await progress(count, total, update)
+            pending = nil; delivery?.cancel(); delivery = nil
+            await publish(.init(stage: "prepared", filename: source.filename, instrument: source.instrument), progress: progress)
         }
     }
     func run(_ study: ResearchStudy, progress: @escaping @Sendable (Int, Int, String) -> Void) throws -> StudyReport {
@@ -353,7 +407,7 @@ final class ResearchController {
         guard (try store.get("checkpoint:\(study.id)", as: Checkpoint.self))?.phase != "cancelled" else { throw FilterError("This task was cancelled. Copy its configuration to start a new study.") }
         guard try store.get("report:\(study.id)", as: StudyReport.self) == nil else { throw FilterError("This completed experiment is immutable. Copy its configuration to run a new study.") }
         let id = try begin("running", studyID: study.id)
-        task = Task.detached(priority: .background) { [self, worker] in
+        task = Task.detached(priority: .userInitiated) { [self, worker] in
             do {
                 let report = try await ResearchRecovery.run(onRetry: { delay, reason in await self.retry(id, delay: delay, reason: reason) }) {
                     try await worker.run(study) { n, total, message in Task { await self.advance(id, completed: n, total: total, message: message) } }

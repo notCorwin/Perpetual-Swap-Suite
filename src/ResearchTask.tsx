@@ -33,7 +33,8 @@ export const ResearchTask = memo(function ResearchTask({ active, job, error, pen
       <AlertTitle className="flex items-center gap-3">
         {working && <Spinner aria-hidden="true" />}
         <span role="status" aria-live="polite">{error ? 'Research needs attention' : phases[job?.phase ?? ''] ?? 'Research'}</span>
-        {working && source?.workers != null && <Badge variant="outline">{source.workers.toLocaleString('en-US')} parallel workers</Badge>}
+        {working && source?.workers != null && <Badge variant="outline">{source.workers.toLocaleString('en-US')} CPU workers</Badge>}
+        {working && source?.downloadLanes != null && source.downloadLanes > 0 && <Badge variant="outline">{source.downloadLanes.toLocaleString('en-US')} SWAP download lanes</Badge>}
         {source && (working || ['failed', 'paused'].includes(job?.phase ?? '')) && <Badge variant="outline">{stages[source.stage] ?? source.stage}</Badge>}
         {job && (job.planning || job.catalog) && <Badge variant="outline">{researchPlanningStage(job)}</Badge>}
         <span className="flex-1" />

@@ -30,6 +30,14 @@ final class BackgroundWindowTests: BackgroundTestCase {
         for operation in operations {
             operation()
             try await Task.sleep(for: .milliseconds(60))
+            // A fresh sharded xctest process can still be completing AppKit's
+            // accessory registration after ordering its first native window.
+            // Keep the exact policy assertion and the continuous focus/Dock
+            // audit, waiting only for that asynchronous registration to settle.
+            let deadline = ContinuousClock.now + .milliseconds(250)
+            while NSApp.activationPolicy() != .accessory, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
             XCTAssertFalse(NSScreen.screens.contains { $0.frame.intersects(window.frame) })
             XCTAssertFalse(window.isKeyWindow)
             XCTAssertFalse(window.isMainWindow)

@@ -1,7 +1,8 @@
 import { spawn, type ChildProcess } from 'node:child_process'
-import { mkdirSync, openSync, closeSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdirSync, openSync, closeSync, readdirSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
+import { availableParallelism } from 'node:os'
 
 const root = resolve(import.meta.dirname, '..')
 const logs = join(root, '.build', 'ci')
@@ -65,24 +66,62 @@ try {
         throw new Error(`${name} did not execute every assigned test without skips`)
       }
     }
+    // Millisecond-level network admission assertions need their own process,
+    // free of other suites' URLSession callbacks and heavy WebKit rendering.
+    const paced = units.filter(id => id.includes('.ResearchRequestTests/'))
+    if (!paced.length) throw new Error('The research network quota suite is missing')
+    const pacedTask = execute('research-network-pacing', paced)
+    pacedTask.catch(() => {})
     const benchmark = ui.filter(id => id.includes('testCategoricalMenusAndTypedRuleEditingStayResponsive'))
     if (benchmark.length !== 1) throw new Error('The isolated menu benchmark is missing')
     const pixels = ui.filter(id => id.includes('testAllSurfaceFamiliesAndChartCapture'))
     if (pixels.length !== 1) throw new Error('The native pixel suite is missing')
+    // Keep each test class together, but overlap independent business suites.
+    // Reuse observed test durations when available: updater/lifecycle waits
+    // otherwise make a single unit-test process the critical path.
+    const durationFile = join(logs, 'test-durations.json')
+    const durations = new Map<string, number>(existsSync(durationFile) ? Object.entries(JSON.parse(readFileSync(durationFile, 'utf8'))) : [])
+    for (const file of readdirSync(logs).filter(name => name.endsWith('.log')).sort()) {
+      for (const match of readFileSync(join(logs, file), 'utf8').matchAll(/Test Case '-\[PerpetualRadarTests\.([^ ]+) ([^\]]+)\]' passed \(([\d.]+) seconds\)/g)) {
+        durations.set(`PerpetualRadarTests.${match[1]}/${match[2]}`, Number(match[3]))
+      }
+    }
+    // Retain successful observations even if a later run is interrupted and
+    // its per-stage logs contain only the next test's start message.
+    writeFileSync(durationFile, JSON.stringify(Object.fromEntries(durations), null, 2) + '\n')
+    const classes = new Map<string, string[]>()
+    for (const id of units.filter(id => !paced.includes(id))) {
+      const name = id.split('/')[0], group = classes.get(name) ?? []
+      group.push(id); classes.set(name, group)
+    }
+    const cost = (ids: string[]) => ids.reduce((seconds, id) => seconds + Math.max(0.02, durations.get(id) ?? 0.1), 0)
+    const unitShards = [1, 2].map(index => ({ name: `native-unit-tests-${index}`, ids: [] as string[], seconds: 0 }))
+    for (const group of [...classes.values()].sort((a, b) => cost(b) - cost(a))) {
+      const shard = unitShards.reduce((a, b) => a.seconds <= b.seconds ? a : b)
+      shard.ids.push(...group); shard.seconds += cost(group)
+    }
     await Promise.all([web, ...checks])
     await run('app-package', 'scripts/build-app.sh', ['--prebuilt'])
-    await execute('webkit-responsiveness', benchmark)
+    // Business tests do not share the menu benchmark's WebView. Start their
+    // independent processes now rather than leaving every CPU idle during it.
+    const unitTasks = unitShards.filter(shard => shard.ids.length).map(shard => execute(shard.name, shard.ids))
+    // Attach rejection handlers before awaiting the benchmark; the shared
+    // result handling below still propagates every unit-test failure.
+    Promise.all(unitTasks).catch(() => {})
+    await Promise.all([execute('webkit-responsiveness', benchmark), pacedTask])
     // Start long scenarios first. One shared pool bounds native processes,
     // including the packaged apps, instead of oversubscribing WindowServer.
     // Every discovered test is assigned once, including newly added cases.
-    const priority = ['testBullishSetupEditing', 'testResearchPrepareRun', 'testVisualFunctionCoverage', 'testDraggingConditions', 'testBullishSetupRadar', 'testGlassTint', 'testBTCMarketContext', 'testNativeTypedRule']
+    const priority = ['testResearchPrepareRun', 'testVisualFunctionCoverage', 'testDraggingConditions', 'testBullishSetupEditing', 'testBullishSetupRadar', 'testGlassTint', 'testBTCMarketContext', 'testNativeTypedRule']
     const weight = (id: string) => { const rank = priority.findIndex(name => id.includes(name)); return rank < 0 ? priority.length : rank }
-    const orderedUI = ui.filter(id => !benchmark.includes(id) && !pixels.includes(id)).sort((a, b) => weight(a) - weight(b))
+    const initialCosts: [string, number][] = [['testResearchPrepareRun', 45], ['testVisualFunctionCoverage', 25], ['testDraggingConditions', 20], ['.MonitorServiceTests/testPackaged', 20]]
+    const taskCost = (ids: string[]) => ids.reduce((seconds, id) => seconds + (durations.get(id) ?? initialCosts.find(([name]) => id.includes(name))?.[1] ?? 5), 0)
+    const orderedUI = ui.filter(id => !benchmark.includes(id) && !pixels.includes(id)).sort((a, b) => taskCost([b]) - taskCost([a]) || weight(a) - weight(b))
     const uiTask = (id: string) => ({ name: `webkit-${id.split('/')[1]}`, ids: [id] })
     const queue = [
       ...services.map((id, index) => ({ name: `packaged-lifecycle-${index + 1}`, ids: [id] })),
       ...orderedUI.slice(3).map(uiTask),
-    ]
+    ].sort((a, b) => taskCost(b.ids) - taskCost(a.ids))
     const drain = async () => {
       for (let task = queue.shift(); task; task = queue.shift()) {
         await execute(task.name, task.ids)
@@ -91,11 +130,13 @@ try {
     // Start long-lived WebViews together. Do not start further WebKit tests or
     // lifecycle apps while ScreenCaptureKit is capturing the first wave.
     const captured = execute('webkit-native-pixels', pixels)
-    const first = [{ name: 'native-unit-tests', ids: units }, ...orderedUI.slice(0, 3).map(uiTask)]
+    const first = orderedUI.slice(0, 3).map(uiTask)
+    const nativeSlots = Math.max(6, Math.min(8, availableParallelism()))
     await Promise.all([
       captured,
+      ...unitTasks.map(async task => { await task; await captured; await drain() }),
       ...first.map(async task => { await execute(task.name, task.ids); await captured; await drain() }),
-      ...Array.from({ length: 2 }, async () => { await captured; await drain() }),
+      ...Array.from({ length: nativeSlots - first.length - unitTasks.length }, async () => { await captured; await drain() }),
     ])
   })
   // Attach all rejection handlers immediately, including the dependent stages.

@@ -83,6 +83,12 @@ final class OKXResearchTransport: ResearchTransport, Sendable {
 
 }
 
+struct ResearchImportResult: Sendable {
+    var source: ResearchSource
+    var accepted = true
+    var alreadyPrepared = false
+}
+
 final class ResearchDataProvider {
     // OKX rejects catalog requests with more than five families (code 50025).
     private static let archiveFamilyLimit = 5
@@ -500,23 +506,27 @@ final class ResearchDataProvider {
         while let data = try handle.read(upToCount: 1024 * 1024), !data.isEmpty { try Task.checkCancellation(); hash.update(data: data) }
         return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
-    func prepare(_ source: ResearchSource, instruments: [ResearchInstrument], requiredRange: ResearchRange? = nil, isolation: isolated (any Actor)? = #isolation, progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void = { _ in }) async throws {
+    func acquire(_ source: ResearchSource, instruments: [ResearchInstrument], isolation: isolated (any Actor)? = #isolation, progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void = { _ in }) async throws -> ResearchSource {
         guard !ResearchSpreadPolicy.excludes(source) else { throw FilterError("Research no longer prepares bid/ask spread or order book archives. Review the updated data plan.") }
         var source = source
         let file = store.rawURL(source)
         let filename = source.filename, instrument = source.instrument
         await progress(.init(stage: "checking", filename: filename, instrument: instrument))
         if try store.isPrepared(source, instruments: instruments) {
-            try await fillCandleGaps(source, instruments: instruments, requiredRange: requiredRange, progress: progress)
-            return
+            return try store.get(source.id, as: ResearchSource.self) ?? source
         }
         if !(try store.rawIsComplete(source)) {
             if source.archive {
-                await progress(.init(stage: "connecting", filename: filename, instrument: instrument, totalBytes: source.sizeBytes))
-                try await transport.download(URL(string: source.url)!, to: file) { transfer in
-                    let rate = transfer.bytesPerSecond.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
-                    let remaining = transfer.totalBytes.flatMap { total in rate.map { Double(max(0, total - transfer.receivedBytes)) / $0 } }
-                    await progress(.init(stage: "downloading", filename: filename, instrument: instrument, receivedBytes: transfer.receivedBytes, totalBytes: transfer.totalBytes, bytesPerSecond: rate, fileRemainingSeconds: remaining, retryAt: transfer.retryAt))
+                // Native transfers promote a synchronized .part file only on
+                // completion. Reuse it if a stop occurred before hash metadata
+                // was committed; SHA-256 and archive CRC checks still follow.
+                if !FileManager.default.fileExists(atPath: file.path) {
+                    await progress(.init(stage: "connecting", filename: filename, instrument: instrument, totalBytes: source.sizeBytes))
+                    try await transport.download(URL(string: source.url)!, to: file) { transfer in
+                        let rate = transfer.bytesPerSecond.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+                        let remaining = transfer.totalBytes.flatMap { total in rate.map { Double(max(0, total - transfer.receivedBytes)) / $0 } }
+                        await progress(.init(stage: "downloading", filename: filename, instrument: instrument, receivedBytes: transfer.receivedBytes, totalBytes: transfer.totalBytes, bytesPerSecond: rate, fileRemainingSeconds: remaining, retryAt: transfer.retryAt))
+                    }
                 }
             }
             else { try await fetchREST(source, file: file, progress: progress) }
@@ -529,12 +539,28 @@ final class ResearchDataProvider {
                 // Retain the damaged input, then fetch a fresh copy.
                 try FileManager.default.moveItem(at: file, to: file.appendingPathExtension("rejected-\(UUID())"))
                 source.rawHash = nil; try store.put(source.id, kind: "source", source)
-                try await prepare(source, instruments: instruments, requiredRange: requiredRange, progress: progress)
-                return
+                return try await acquire(source, instruments: instruments, progress: progress)
             }
             source.rawHash = saved.rawHash
         }
-        await progress(.init(stage: "importing", filename: filename, instrument: instrument))
+        return source
+    }
+    func prepare(_ input: ResearchSource, instruments: [ResearchInstrument], requiredRange: ResearchRange? = nil, isolation: isolated (any Actor)? = #isolation, progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void = { _ in }) async throws {
+        let source = try await acquire(input, instruments: instruments, progress: progress)
+        if try !store.isPrepared(source, instruments: instruments) {
+            await progress(.init(stage: "importing", filename: source.filename, instrument: source.instrument))
+        }
+        let imported = try importAcquired(source, instruments: instruments)
+        try await finishImport(imported, instruments: instruments, requiredRange: requiredRange, progress: progress)
+    }
+    // Synchronous CPU work is isolated from REST gap repair. The pipeline can
+    // immediately reuse its parser slot while a verified import is finalized.
+    func importAcquired(_ source: ResearchSource, instruments: [ResearchInstrument]) throws -> ResearchImportResult {
+        if try store.isPrepared(source, instruments: instruments) {
+            return .init(source: source, alreadyPrepared: true)
+        }
+        var source = source
+        let file = store.rawURL(source), filename = source.filename
         var archiveAccepted = true
         if source.archive {
             let importer = ResearchArchiveImporter(store: store, source: source, instruments: instruments)
@@ -556,10 +582,15 @@ final class ResearchDataProvider {
         // Save the verified import before repairing gaps. A transient REST
         // failure can then resume without parsing the archive again.
         try store.finishPreparation(source, instruments: instruments, cover: !source.archive)
+        return .init(source: source, accepted: archiveAccepted)
+    }
+    func finishImport(_ imported: ResearchImportResult, instruments: [ResearchInstrument], requiredRange: ResearchRange? = nil, isolation: isolated (any Actor)? = #isolation, progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void = { _ in }) async throws {
+        var source = imported.source, archiveAccepted = imported.accepted
         let remaining = try await fillCandleGaps(source, instruments: instruments, requiredRange: requiredRange, progress: progress)
+        if imported.alreadyPrepared { return }
         if !remaining.isEmpty {
             archiveAccepted = false
-            source.warnings = (source.warnings ?? []) + ["\(filename): \(remaining.reduce(0) { $0 + $1.hours }) hourly candles remain unavailable after checking confirmed OKX history; affected inputs remain Unknown and archive coverage was not marked complete."]
+            source.warnings = (source.warnings ?? []) + ["\(source.filename): \(remaining.reduce(0) { $0 + $1.hours }) hourly candles remain unavailable after checking confirmed OKX history; affected inputs remain Unknown and archive coverage was not marked complete."]
         }
         try store.finishPreparation(source, instruments: instruments, cover: archiveAccepted)
     }

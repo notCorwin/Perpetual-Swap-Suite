@@ -125,7 +125,7 @@ enum ResearchArchiveDownload {
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         if existing > 0, let validator { request.setValue("bytes=\(existing)-", forHTTPHeaderField: "Range"); request.setValue(validator, forHTTPHeaderField: "If-Range") }
         let delegate = ResearchArchiveDownloadDelegate(destination: destination, existing: existing, validator: validator)
-        let queue = OperationQueue(); queue.maxConcurrentOperationCount = 1; queue.qualityOfService = .utility
+        let queue = OperationQueue(); queue.maxConcurrentOperationCount = 1; queue.qualityOfService = .userInitiated
         let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: queue)
         defer { session.invalidateAndCancel() }
         let task = session.dataTask(with: request)

@@ -165,7 +165,8 @@ final class ResearchArchiveImporter {
     }
     private func csv(_ row: [String]) throws {
         if headers.isEmpty { for (index, name) in row.enumerated() { headers[header(name)] = index }; return }
-        try ResearchPressure.shared.check()
+        // The streaming consumer checks each 64 KiB chunk, and each persisted
+        // batch checks again. Avoid a shared pressure lock for every CSV row.
         if [4, 5, 6].contains(source.module ?? 0) { try bookCSV(row); return }
         let id = cell(row, "instrument_name", "instid", "instrument", "symbol") ?? source.instrument
         guard id.hasSuffix("-USDT-SWAP") else { return }

@@ -358,6 +358,7 @@ struct ResearchPreparationProgress: Codable, Sendable {
     var retryAt: Int64?
     var recovery: String?
     var workers: Int?
+    var downloadLanes: Int?
 }
 
 // Pressure notifications are shared by downloaders, parsers and calculation.

@@ -33,11 +33,19 @@ private actor ResearchTransferRecorder {
 
 actor ResearchProgressFixtureTransport: ResearchTransport {
     private let archive: Data
+    private let repeatProgress: Bool
     private var blocked = true, fail = false
-    init(archive: Data) { self.archive = archive }
+    private var historyReleased = false
+    init(archive: Data, repeatProgress: Bool = true) { self.archive = archive; self.repeatProgress = repeatProgress }
     func release(fail: Bool = false) { blocked = false; self.fail = fail }
+    func releaseHistory() { historyReleased = true }
     func get(_ url: URL) async throws -> Data {
         while blocked { try await Task.sleep(for: .milliseconds(10)) }
+        // Hold the separate planned range after archive gap repair finishes,
+        // so estimates are observable without racing a very fast preparation.
+        if URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.contains(where: { $0.name == "instId" }) != true {
+            while !historyReleased { try await Task.sleep(for: .milliseconds(5)) }
+        }
         try await Task.sleep(for: .milliseconds(50))
         return Data(#"{"code":"0","data":[]}"#.utf8)
     }
@@ -45,7 +53,7 @@ actor ResearchProgressFixtureTransport: ResearchTransport {
         await progress(.init(receivedBytes: Int64(archive.count / 2), totalBytes: Int64(archive.count), bytesPerSecond: 1000))
         while blocked {
             try await Task.sleep(for: .milliseconds(10))
-            await progress(.init(receivedBytes: Int64(archive.count / 2), totalBytes: Int64(archive.count), bytesPerSecond: 1000))
+            if repeatProgress { await progress(.init(receivedBytes: Int64(archive.count / 2), totalBytes: Int64(archive.count), bytesPerSecond: 1000)) }
         }
         if fail { throw FilterError("Fixture connection lost") }
         try await Task.sleep(for: .milliseconds(20))
@@ -116,7 +124,7 @@ final class ResearchProgressTests: XCTestCase {
         let archiveURL = directory.appendingPathComponent("fixture.zip"), archive = try Archive(url: archiveURL, accessMode: .create)
         let csv = Data("timestamp,open,high,low,close,vol,volCcy,volCcyQuote\n\(ResearchFixture.hour),100,110,90,105,1,10,1000\n".utf8)
         try archive.addEntry(with: "BTC-USDT-SWAP.csv", type: .file, uncompressedSize: Int64(csv.count), compressionMethod: .deflate) { position, count in csv.subdata(in: Int(position)..<min(csv.count, Int(position) + count)) }
-        let payload = try Data(contentsOf: archiveURL), transport = ResearchProgressFixtureTransport(archive: payload)
+        let payload = try Data(contentsOf: archiveURL), transport = ResearchProgressFixtureTransport(archive: payload, repeatProgress: false)
         var plan = ResearchFixture.plan(try ResearchFixture.spec())
         plan.sources = [
             .init(id: "archive", instrument: ResearchFixture.instrument.id, kind: "candle", from: ResearchFixture.hour, through: ResearchFixture.hour, url: "https://example.com/archive.zip", filename: "archive.zip", archive: true, module: 2),
@@ -131,6 +139,8 @@ final class ResearchProgressTests: XCTestCase {
         XCTAssertEqual(controller.status?.completed, 0); XCTAssertEqual(controller.status?.total, 2)
         XCTAssertEqual(live.receivedBytes, Int64(payload.count / 2)); XCTAssertEqual(live.totalBytes, Int64(payload.count))
         XCTAssertEqual(live.bytesPerSecond, 1000); XCTAssertNotNil(live.fileRemainingSeconds)
+        XCTAssertEqual(live.workers, min(ResearchLocalScan.concurrency, plan.sources.count))
+        XCTAssertEqual(live.downloadLanes, 1)
         let inventory = try await controller.handle(["action": "inventory"]), job = try XCTUnwrap(inventory["job"] as? [String: Any])
         XCTAssertEqual((job["preparation"] as? [String: Any])?["stage"] as? String, "downloading")
         let activeStudy = try XCTUnwrap((inventory["studies"] as? [[String: Any]])?.first)
@@ -153,10 +163,14 @@ final class ResearchProgressTests: XCTestCase {
         await transport.release()
         _ = try await controller.handle(["action": "resume", "studyID": studyID])
         var sawEstimate = false
-        while controller.isBusy {
-            if controller.status?.preparation?.remainingSeconds != nil { sawEstimate = true }
+        let readyDeadline = ContinuousClock.now + .seconds(3)
+        while controller.isBusy, ContinuousClock.now < readyDeadline {
+            if controller.status?.preparation?.remainingSeconds != nil {
+                sawEstimate = true; await transport.releaseHistory()
+            }
             try await Task.sleep(for: .milliseconds(5))
         }
+        if controller.isBusy { try await controller.stop(); XCTFail("Preparation did not finish after releasing the remaining range.") }
         XCTAssertTrue(sawEstimate)
         XCTAssertEqual(controller.status?.phase, "ready", controller.status?.error ?? "")
         XCTAssertEqual(controller.status?.completed, 2)
