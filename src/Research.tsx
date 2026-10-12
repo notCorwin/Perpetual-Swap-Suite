@@ -151,8 +151,15 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
           handledJob.current = key
         }
         setPollError('')
-      } catch (cause) { if (!stopped) setPollError(cause instanceof Error ? cause.message : 'Cannot open research.') }
-      finally { polling.current = false; if (!stopped) timer = window.setTimeout(refresh, 1000) }
+        // shortcut: Poll faster when job is active, slower when idle. Could add exponential backoff.
+        const hasActiveJob = j && ['planning', 'preparing', 'running'].includes(j.phase)
+        const delay = hasActiveJob ? 1000 : 5000
+        if (!stopped) timer = window.setTimeout(refresh, delay)
+      } catch (cause) {
+        if (!stopped) setPollError(cause instanceof Error ? cause.message : 'Cannot open research.')
+        if (!stopped) timer = window.setTimeout(refresh, 5000)
+      }
+      finally { polling.current = false }
     }
     void refresh()
     return () => { stopped = true; window.clearTimeout(timer) }
