@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { keepSnapshotValue } from '@/market-snapshot'
+import { pageVisible } from '@/lib/utils'
 import { requestSuite, type SuiteMode, type SuiteRequest, type SuiteResponse } from '@/suite-types'
 
 export function useSuite(mode: SuiteMode, active: boolean) {
@@ -13,6 +14,7 @@ export function useSuite(mode: SuiteMode, active: boolean) {
     if (!active) return
     let stopped = false, timer: number
     const refresh = async () => {
+      await pageVisible(); if (stopped) return
       try {
         if (!mutating.current) {
           const epoch = generation.current

@@ -1,5 +1,4 @@
 import AppKit
-import CoreFoundation
 import XCTest
 @testable import PerpetualRadar
 
@@ -31,24 +30,45 @@ final class ServiceRecoveryTests: XCTestCase {
             return try! JSONSerialization.data(withJSONObject: ["value": ["writes": writes]])
         }
         defer { server.invalidate() }
-        let submission = try JSONSerialization.data(withJSONObject: ["id": id, "body": ["save": true]])
-        func send(_ data: Data, _ message: Int32) async throws -> [String: Any] {
-            let result = try await Task.detached { try MonitorIPC.send(data, message: message, name: name) }.value
-            return try JSONSerialization.jsonObject(with: result) as! [String: Any]
-        }
-        _ = try await send(submission, 1)
-        let key = Data(id.utf8)
-        for _ in 0..<100 {
-            if (try await send(key, 2))["value"] != nil { break }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        _ = try await send(submission, 1)
-        let replay = try await send(key, 2)
-        XCTAssertEqual((replay["value"] as? [String: Any])?["writes"] as? Int, 1)
+        // An unacknowledged reply (e.g. lost with its connection) is replayed to a resubmission.
+        let first = try await MonitorIPC.request(["save": true], name: name, id: id, acknowledge: false)
+        let replay = try await MonitorIPC.request(["save": true], name: name, id: id)
+        XCTAssertEqual(first["writes"] as? Int, 1); XCTAssertEqual(replay["writes"] as? Int, 1)
         XCTAssertEqual(writes, 1)
-        _ = try await send(key, 4)
-        let acknowledged = try await send(key, 2)
-        XCTAssertEqual(acknowledged["ipcError"] as? String, "expired")
+        try await Task.sleep(for: .milliseconds(50))
+        // Acknowledgment releases the reply; the same ID is then new work.
+        let next = try await MonitorIPC.request(["save": true], name: name, id: id)
+        XCTAssertEqual(next["writes"] as? Int, 2)
+    }
+
+    func testAnotherOpenCopyKeepsItsSharedMonitorInsteadOfReplacingIt() async throws {
+        try await checkForeignMonitor(otherClients: [ProcessInfo.processInfo.processIdentifier &+ 1])
+        // Once no other interface uses it, this copy installs its own monitor.
+        try await checkForeignMonitor(otherClients: [])
+    }
+
+    private func checkForeignMonitor(otherClients: [Int32]) async throws {
+        let name = "com.perpetualradar.recovery.\(UUID())", app = URL(fileURLWithPath: "/tmp/Recovery.app")
+        var replacements = 0, launches = 0
+        var foreign: MonitorIPCServer?, own: MonitorIPCServer?
+        defer { foreign?.invalidate(); own?.invalidate() }
+        foreign = try MonitorIPCServer(name: name) { data in
+            let body = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+            if body["stopForReplacement"] != nil { replacements += 1; foreign?.invalidate() }
+            return try! JSONSerialization.data(withJSONObject: ["value": ["appPath": "/tmp/Other.app", "revision": "other", "serviceSession": "foreign",
+                                                                          "ipcVersion": MonitorIPC.protocolVersion, "foregroundPIDs": otherClients]])
+        }
+        let client = MonitorClient(name: name, appURL: app, revision: "fixture") {
+            launches += 1
+            own = try MonitorIPCServer(name: name) { _ in
+                try! JSONSerialization.data(withJSONObject: ["value": ["appPath": app.path, "revision": "fixture", "serviceSession": "own"]])
+            }
+        }
+        let info = try await client.request(["serviceInfo": true])
+        let shared = !otherClients.isEmpty
+        XCTAssertEqual(info["serviceSession"] as? String, shared ? "foreign" : "own")
+        XCTAssertEqual(replacements, shared ? 0 : 1, "A monitor used by another open copy must not be replaced.")
+        XCTAssertEqual(launches, shared ? 0 : 1)
     }
 
     func testConcurrentClientRequestsShareOneLaunchAndValidationErrorsDoNotRestartIt() async throws {

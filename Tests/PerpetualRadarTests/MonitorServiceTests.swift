@@ -1,5 +1,4 @@
 import AppKit
-import CoreFoundation
 import XCTest
 @testable import PerpetualRadar
 
@@ -90,7 +89,7 @@ final class MonitorServiceTests: BackgroundTestCase {
         XCTAssertTrue(process.isRunning)
         focus.assertBackground([process.processIdentifier, helperPID!])
         _ = try await request(["quitCompletely": true])
-        try await wait { !process.isRunning && CFMessagePortCreateRemote(nil, name as CFString) == nil }
+        try await wait { !process.isRunning && !MonitorIPC.endpointExists(name) }
         helperPID = nil
     }
 
@@ -192,7 +191,7 @@ final class MonitorServiceTests: BackgroundTestCase {
         try await wait("checkpoint") { (try store.get("checkpoint:\(studyID)", as: Checkpoint.self))?.nextHour != nil }
         try await requestShutdown(["close": true], name: name + ".interface-tests")
         let oldHelper = helperPID!
-        try await wait("closed") { !ui.isRunning && CFMessagePortCreateRemote(nil, name as CFString) == nil && kill(oldHelper,0) != 0 }
+        try await wait("closed") { !ui.isRunning && !MonitorIPC.endpointExists(name) && kill(oldHelper,0) != 0 }
         XCTAssertEqual(ui.terminationStatus, 0)
         XCTAssertFalse(defaults.bool(forKey: AppUpdater.backgroundRelaunchKey))
         XCTAssertEqual(try store.get("checkpoint:\(studyID)", as: Checkpoint.self)?.phase, "paused")
@@ -220,7 +219,7 @@ final class MonitorServiceTests: BackgroundTestCase {
         helperPIDs.append(helperPID!)
         let orphan = helperPID!
         kill(crashing.processIdentifier, SIGKILL)
-        try await wait("crash-exit") { !crashing.isRunning && kill(orphan,0) != 0 && CFMessagePortCreateRemote(nil, name as CFString) == nil }
+        try await wait("crash-exit") { !crashing.isRunning && kill(orphan,0) != 0 && !MonitorIPC.endpointExists(name) }
         helperPID = nil
         focus.assertBackground(processes.map(\.processIdentifier) + helperPIDs)
     }
@@ -373,7 +372,7 @@ final class MonitorServiceTests: BackgroundTestCase {
         XCTAssertEqual(afterHang["monitoringPaused"] as? Bool, true)
         let quittingPID = monitorPID!
         _ = try await request(["quitCompletely": true])
-        try await wait("quit-completely") { !reopened.isRunning && CFMessagePortCreateRemote(nil, name as CFString) == nil && kill(quittingPID, 0) != 0 }
+        try await wait("quit-completely") { !reopened.isRunning && !MonitorIPC.endpointExists(name) && kill(quittingPID, 0) != 0 }
         XCTAssertEqual(reopened.terminationStatus, 0)
         XCTAssertNotEqual(kill(quittingPID, 0), 0, "Quit Completely must terminate the helper too.")
         focus.assertBackground(processes.map(\.processIdentifier) + [helperPID, stalledPID, quittingPID])

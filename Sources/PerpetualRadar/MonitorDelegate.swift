@@ -37,11 +37,13 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private lazy var checkUpdatesItem = NSMenuItem(title: "Check for Updates", action: #selector(checkForUpdatesNow), keyEquivalent: "")
     private lazy var automaticUpdatesItem = NSMenuItem(title: "Automatically Install Updates", action: #selector(toggleAutomaticUpdates), keyEquivalent: "")
     private var fixture: MonitorFixture?
-    private var foregroundPID: Int32? = ProcessInfo.processInfo.environment["PERPETUAL_RADAR_OWNER_PID"].flatMap(Int32.init)
-    private var foregroundWorkspace = "radar"
-    private var researchBusy = false
+    // Every open interface holds its own lease; several copies may share this monitor.
+    private struct Lease { var workspace = "radar", researchBusy = false }
+    private var leases: [Int32: Lease] = ProcessInfo.processInfo.environment["PERPETUAL_RADAR_OWNER_PID"].flatMap(Int32.init).map { [$0: Lease()] } ?? [:]
+    private var foregroundWorkspace: String { leases.values.contains { $0.workspace == "research" } ? "research" : "radar" }
+    private var researchBusy: Bool { leases.values.contains(where: \.researchBusy) }
     private var leaseTimer: Timer?
-    private var collectionAllowed: Bool { MonitorRuntime.backgroundMonitoringEnabled || foregroundPID != nil }
+    private var collectionAllowed: Bool { MonitorRuntime.backgroundMonitoringEnabled || !leases.isEmpty }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         do {
@@ -154,7 +156,6 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let fixture { return try await fixture.observe(profile: radar.monitoringStrategy()) }
             return try await radar.observeSavedStrategy()
         }, onChanges: { [weak self] changes in await self?.notifications?.send(changes) }, onError: { [weak self] error in self?.monitoringError = error; self?.renderMenu() })
-        radar.onBTCUpdate = { [weak self] in self?.monitor?.wake() }
         monitor?.start()
     }
 
@@ -215,11 +216,8 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc private func checkForegroundLease() {
         Task { await refreshLoginStatus() }
-        let alive = foregroundPID.map { kill($0, 0) == 0 || errno == EPERM } ?? false
-        if !alive {
-            foregroundPID = nil; researchBusy = false
-            if !MonitorRuntime.backgroundMonitoringEnabled { NSApp.terminate(nil) }
-        }
+        leases = leases.filter { kill($0.key, 0) == 0 || errno == EPERM }
+        if leases.isEmpty && !MonitorRuntime.backgroundMonitoringEnabled { NSApp.terminate(nil) }
         if collectionAllowed { recoverCollector() }
     }
     @objc private func showInterface() { openInterface(instId: nil) }
@@ -246,6 +244,8 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         result["monitoringPaused"] = radar?.monitoringPaused ?? false
         result["backgroundMonitoringEnabled"] = MonitorRuntime.backgroundMonitoringEnabled
         result["foregroundWorkspace"] = foregroundWorkspace
+        result["foregroundPIDs"] = leases.keys.sorted()
+        result["ipcVersion"] = MonitorIPC.protocolVersion
         result["serviceSession"] = sessionID
         result["databaseReady"] = radar != nil
         result["launchAtLogin"] = loginStatus; result["launchAtLoginError"] = loginError
@@ -256,9 +256,7 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func handle(_ parameters: [String: Any]) async throws -> [String: Any] {
         if let lease = parameters["foregroundLease"] as? [String: Any], let pid = lease["pid"] as? Int32, pid > 0 {
-            foregroundPID = pid
-            foregroundWorkspace = lease["workspace"] as? String == "research" ? "research" : "radar"
-            researchBusy = lease["researchBusy"] as? Bool == true
+            leases[pid] = Lease(workspace: lease["workspace"] as? String == "research" ? "research" : "radar", researchBusy: lease["researchBusy"] as? Bool == true)
             if isInstallingUpdate && installingAutomatically && (researchBusy || foregroundWorkspace == "research") {
                 guard updater.cancel() else { throw FilterError("An update is completing its app replacement. Open Research after the app restarts.") }
                 isInstallingUpdate = false; installingAutomatically = false; updateState = "available"; renderUpdateItem()
@@ -277,6 +275,14 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             info["menuSymbol"] = Self.symbolName
             if let fixture { info["samples"] = fixture.samples; info["delivered"] = fixture.delivered }
             return info
+        }
+        if let pid = parameters["releaseLease"] as? Int32 {
+            leases.removeValue(forKey: pid)
+            let remaining = leases.count
+            if remaining == 0 && !MonitorRuntime.backgroundMonitoringEnabled && !isInstallingUpdate {
+                Task { try? await Task.sleep(for: .milliseconds(200)); if self.leases.isEmpty { NSApp.terminate(nil) } }
+            }
+            return ["remainingClients": remaining]
         }
         if parameters["stopForReplacement"] as? Bool == true || parameters["quitCompletely"] as? Bool == true {
             guard !isInstallingUpdate else { throw FilterError("An update is being installed. Try again after installation finishes.") }
@@ -422,7 +428,7 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func installUpdate(_ update: AppUpdate, automatically: Bool) {
         guard !isInstallingUpdate else { return }
-        guard !researchBusy && (!automatically || foregroundPID == nil || foregroundWorkspace != "research") else {
+        guard !researchBusy && (!automatically || leases.isEmpty || foregroundWorkspace != "research") else {
             if !automatically { showUpdateAlert("Research Is Running", "Pause research before installing an update. Its checkpoint and cache will be retained.") }
             return
         }

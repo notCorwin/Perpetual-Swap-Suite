@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { pageVisible } from '@/lib/utils'
 import { StrategyRules } from '@/StrategyRules'
 import { FilterExplanation } from '@/FilterExplanation'
 import { FieldDescription } from '@/components/ui/field'
@@ -19,6 +20,7 @@ export function StrategyPhaseEditor({ label, model, inputs, preferences, onPrefe
     let stopped = false, timer: number, backoff = 2000
     const token = newRuleID(), json = model.lastValid
     const refresh = async () => {
+      await pageVisible(); if (stopped) return
       try {
         const snapshot = await window.webkit.messageHandlers.radar.postMessage({ previewMarketFilters: { filtersJSON: json, token, atClose: true, strategyID } })
         if (stopped) return

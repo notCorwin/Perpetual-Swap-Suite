@@ -10,7 +10,7 @@ import { chartCaptureBounds } from '@/chart-capture'
 import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicY } from "@/chart-axis"
 import { chartCandleWidth, chartHourX, chartLayout, fitPriceTag, type ChartPanel as Panel } from "@/chart-layout"
 import { livePriceTag, scrollChartEnd, visibleChartBars } from "@/chart-viewport"
-import { cn } from "@/lib/utils"
+import { cn, pageVisible } from "@/lib/utils"
 import { chartNavigationTarget, wrappedMarket } from "@/market-sort"
 import { finitePercentage, formatPercent, type PercentageValue } from "@/market-percent"
 
@@ -503,6 +503,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
     let revision = chartCache.get(instId)?.data.revision ?? -1
     let backoff = 2000
     const refresh = async () => {
+      await pageVisible(); if (stopped) return
       try {
         const shouldLoad = Date.now() - lastLoad >= 60_000
         const result = shouldLoad ? await loadChart(instId) : await window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, sinceRevision: revision })

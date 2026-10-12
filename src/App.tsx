@@ -22,7 +22,7 @@ import { Research } from "@/Research"
 import type { ResearchInputs, ResearchRequest, ResearchResponse, StudySpec } from "@/research-types"
 import { Input } from "@/components/ui/input"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { cn } from "@/lib/utils"
+import { cn, pageVisible } from "@/lib/utils"
 import { compareMarketRows, compareMarketTurnover, defaultSortDescending, type SortKey } from "@/market-sort"
 import { PERCENT_CHANGE_DESCRIPTION, formatPercent, percentageNumber, type PercentageValue } from "@/market-percent"
 import { BREAK_DESCRIPTION, describeBreak, formatBreakPriorAge, formatBreakTime, type BreakDirection, type BreakResult } from "@/market-breaks"
@@ -288,6 +288,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     let stopped = false
     let backoff = 2000 // Start at 2s, increase when unchanged
     const load = async () => {
+      await pageVisible(); if (stopped) return
       try {
         const snapshot = await window.webkit.messageHandlers.radar.postMessage({ rocPeriod: ROC_PERIOD, marocPeriod: MAROC_PERIOD, sinceRevision: revision.current })
         if (stopped) return
@@ -343,6 +344,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     const epoch = ++previewEpoch.current
     const token = `${epoch}:${newRuleID()}`
     const refresh = async () => {
+      await pageVisible(); if (stopped) return
       try {
         const snapshot = await window.webkit.messageHandlers.radar.postMessage({ previewMarketFilters: { filtersJSON: lastValidJSON, token, strategyID: activeStrategyID } })
         if (stopped || epoch !== previewEpoch.current) return

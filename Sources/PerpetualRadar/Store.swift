@@ -159,6 +159,9 @@ final class Store {
         return sqlite3_column_int64(stmt, 0)
     }
 
+    // Rows changed by this connection; data_version only reports other connections.
+    var totalChanges: Int64 { sqlite3_total_changes64(db) }
+
     func setPreference(_ value: String, forKey key: String) throws {
         try execute("INSERT INTO preferences (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [key, value])
     }

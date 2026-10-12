@@ -1,12 +1,14 @@
 import AppKit
-import CoreFoundation
+import CryptoKit
+import Network
 
 enum MonitorRuntime {
     static let helperIdentifier = "com.perpetualradar.macos.monitor"
     static let helperName = "Perpetual Swap Suite Monitor.app"
     static let isHelper = Bundle.main.bundleIdentifier == helperIdentifier || ProcessInfo.processInfo.environment["PERPETUAL_RADAR_ROLE"] == "monitor"
     static let testChannel = ProcessInfo.processInfo.environment["PERPETUAL_RADAR_TEST_CHANNEL"]
-    static let portName = "com.perpetualradar.monitor.\(getuid())\(testChannel.map { ".\($0)" } ?? "")"
+    static let productionPortName = "com.perpetualradar.monitor.\(getuid())"
+    static let portName = productionPortName + (testChannel.map { ".\($0)" } ?? "")
     static let quitUI = Notification.Name(portName + ".quit-ui")
     static var updateSuppressionURL: URL {
         let directory = storeURL?.deletingLastPathComponent() ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("PerpetualRadar")
@@ -40,45 +42,102 @@ enum MonitorRuntime {
     }
 }
 
-// A named Mach message port is independent of both app lifetimes. Submit/poll
-// messages return immediately: chart/history awaits never block another client
-// or the AppKit run loop. Requests and completed replies exist only in memory.
+// One persistent Unix-domain stream per client. Replies are pushed as soon as a
+// job completes, so no client polls, holds a process-wide lock or blocks a Swift
+// concurrency thread. Requests and completed replies exist only in memory.
+struct MonitorIPCFrame {
+    enum Op: UInt8 { case submit = 1, reply = 2, cancel = 3, acknowledge = 4, ping = 5, pong = 6 }
+    static let maximumLength = 512 << 20
+    let op: Op
+    let id: String
+    var payload = Data()
+
+    var encoded: Data {
+        let key = Data(id.utf8)
+        var data = Data(capacity: 7 + key.count + payload.count)
+        withUnsafeBytes(of: UInt32(3 + key.count + payload.count).bigEndian) { data.append(contentsOf: $0) }
+        data.append(op.rawValue)
+        withUnsafeBytes(of: UInt16(key.count).bigEndian) { data.append(contentsOf: $0) }
+        data.append(key); data.append(payload)
+        return data
+    }
+
+    init(op: Op, id: String, payload: Data = Data()) { self.op = op; self.id = id; self.payload = payload }
+    init?(_ body: Data) {
+        let bytes = [UInt8](body)
+        guard bytes.count >= 3, let op = Op(rawValue: bytes[0]) else { return nil }
+        let length = Int(bytes[1]) << 8 | Int(bytes[2])
+        guard bytes.count >= 3 + length, let id = String(bytes: bytes[3..<(3 + length)], encoding: .utf8) else { return nil }
+        self.op = op; self.id = id; payload = Data(bytes[(3 + length)...])
+    }
+
+    static func read(_ connection: NWConnection, _ done: @escaping @Sendable (MonitorIPCFrame?) -> Void) {
+        connection.receive(minimumIncompleteLength: 4, maximumLength: 4) { header, _, _, error in
+            guard error == nil, let header, header.count == 4 else { return done(nil) }
+            let length = header.reduce(0) { $0 << 8 | Int($1) }
+            guard (3...maximumLength).contains(length) else { return done(nil) }
+            connection.receive(minimumIncompleteLength: length, maximumLength: length) { body, _, _, error in
+                guard error == nil, let body, body.count == length else { return done(nil) }
+                done(MonitorIPCFrame(body))
+            }
+        }
+    }
+}
+
 final class MonitorIPCServer: @unchecked Sendable {
     typealias Handler = @MainActor @Sendable (Data) async -> Data
-    private final class Context {
-        weak var server: MonitorIPCServer?
-        init(_ server: MonitorIPCServer) { self.server = server }
-    }
     private struct Job {
         var task: Task<Void, Never>?
         var reply: Data?
+        var waiters: [ObjectIdentifier: NWConnection] = [:]
         let expires = ContinuousClock.now + .seconds(120)
     }
     private let handler: Handler
-    private let lock = NSLock()
-    private var jobs: [String: Job] = [:]
-    private var port: CFMessagePort?
-    private var expiryTimer: DispatchSourceTimer?
+    private let path: String
     private let queue = DispatchQueue(label: "com.perpetualradar.monitor.ipc")
+    private let queueKey = DispatchSpecificKey<Bool>()
+    // All state below is confined to `queue`.
+    private var jobs: [String: Job] = [:]
+    private var connections: [ObjectIdentifier: NWConnection] = [:]
+    private var listener: NWListener?
+    private var lockDescriptor: Int32 = -1
+    private var expiryTimer: DispatchSourceTimer?
 
     init(name: String = MonitorRuntime.portName, handler: @escaping Handler) throws {
         self.handler = handler
-        let info = Unmanaged.passRetained(Context(self))
-        defer { info.release() }
-        var context = CFMessagePortContext(version: 0, info: info.toOpaque(), retain: {
-            guard let pointer = $0 else { return nil }
-            _ = Unmanaged<Context>.fromOpaque(pointer).retain(); return UnsafeRawPointer(pointer)
-        }, release: { pointer in
-            if let pointer { Unmanaged<Context>.fromOpaque(pointer).release() }
-        }, copyDescription: nil)
-        var unused = DarwinBoolean(false)
-        guard let local = CFMessagePortCreateLocal(nil, name as CFString, { _, message, data, info in
-            guard let info, let data else { return nil }
-            guard let server = Unmanaged<Context>.fromOpaque(info).takeUnretainedValue().server else { return nil }
-            return Unmanaged.passRetained(server.receive(message, data: data as Data) as CFData)
-        }, &context, &unused), !unused.boolValue else { throw FilterError("Background monitoring is already running.") }
-        port = local
-        CFMessagePortSetDispatchQueue(local, queue)
+        path = MonitorIPC.socketPath(name)
+        queue.setSpecific(key: queueKey, value: true)
+        try FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        // The kernel releases this lock when the process exits, so a crashed
+        // monitor never blocks its successor and two monitors never coexist.
+        let descriptor = open(path + ".lock", O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { throw FilterError("Cannot create the background monitor lock: \(String(cString: strerror(errno))).") }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else { close(descriptor); throw FilterError("Background monitoring is already running.") }
+        lockDescriptor = descriptor
+        unlink(path)
+        do {
+            let parameters = NWParameters.tcp
+            parameters.requiredLocalEndpoint = .unix(path: path)
+            let listener = try NWListener(using: parameters)
+            let ready = DispatchSemaphore(value: 0)
+            nonisolated(unsafe) var failure: Error?
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready: ready.signal()
+                case .failed(let error): failure = error; ready.signal()
+                default: break
+                }
+            }
+            listener.newConnectionHandler = { [weak self] connection in self?.accept(connection) }
+            listener.start(queue: queue)
+            guard ready.wait(timeout: .now() + 5) == .success, failure == nil else {
+                listener.cancel()
+                throw FilterError("Cannot start the background monitor endpoint: \(failure?.localizedDescription ?? "timed out").")
+            }
+            listener.stateUpdateHandler = nil
+            self.listener = listener
+            chmod(path, 0o600)
+        } catch { close(descriptor); lockDescriptor = -1; throw error }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 30, repeating: 30)
         timer.setEventHandler { [weak self] in self?.expireJobs() }
@@ -87,60 +146,95 @@ final class MonitorIPCServer: @unchecked Sendable {
 
     deinit { invalidate() }
     func invalidate() {
-        expiryTimer?.cancel(); expiryTimer = nil
-        if let port { CFMessagePortInvalidate(port) }
-        port = nil
-        lock.lock(); let tasks = jobs.values.compactMap(\.task); jobs.removeAll(); lock.unlock()
+        let tasks: [Task<Void, Never>] = onQueue {
+            guard lockDescriptor >= 0 else { return [] }
+            expiryTimer?.cancel(); expiryTimer = nil
+            listener?.cancel(); listener = nil
+            connections.values.forEach { $0.cancel() }; connections.removeAll()
+            let tasks = jobs.values.compactMap(\.task); jobs.removeAll()
+            // Unlink before releasing the lock: only a lock holder owns the path.
+            unlink(path); close(lockDescriptor); lockDescriptor = -1
+            return tasks
+        }
         tasks.forEach { $0.cancel() }
     }
 
-    private func expireJobs() {
-        lock.lock(); defer { lock.unlock() }
-        let expired = jobs.filter { $0.value.expires < .now }.map(\.key)
-        for key in expired { jobs.removeValue(forKey: key)?.task?.cancel() }
+    private func onQueue<T>(_ body: () -> T) -> T {
+        DispatchQueue.getSpecific(key: queueKey) == true ? body() : queue.sync(execute: body)
     }
 
-    private func receive(_ message: Int32, data: Data) -> Data {
-        if message == 1 {
-            guard let request = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let id = request["id"] as? String, let body = request["body"],
-                  let payload = try? SafeJSON.data(body) else { return Data("{}".utf8) }
-            lock.lock()
-            let expired = jobs.filter { $0.value.expires < .now }.map(\.key)
-            for key in expired { jobs.removeValue(forKey: key)?.task?.cancel() }
-            if jobs[id] == nil {
-                jobs[id] = Job()
-                jobs[id]?.task = Task { @MainActor [weak self, handler] in
-                    let reply = await handler(payload)
-                    self?.complete(id, reply: reply)
-                }
+    private func accept(_ connection: NWConnection) {
+        let key = ObjectIdentifier(connection)
+        connections[key] = connection
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            switch state {
+            case .failed, .cancelled: if let connection { self?.drop(connection) }
+            default: break
             }
-            lock.unlock()
-            return Data("{\"accepted\":true}".utf8)
         }
-        let id = String(decoding: data, as: UTF8.self)
-        lock.lock(); defer { lock.unlock() }
-        if message == 3 { jobs.removeValue(forKey: id)?.task?.cancel(); return Data("{}".utf8) }
-        if message == 4 {
-            if jobs[id]?.reply != nil { jobs.removeValue(forKey: id) }
-            return Data("{}".utf8)
+        connection.start(queue: queue)
+        receive(connection)
+    }
+
+    private func receive(_ connection: NWConnection) {
+        MonitorIPCFrame.read(connection) { [weak self, weak connection] frame in
+            guard let self, let connection else { return }
+            guard let frame else { return drop(connection) }
+            handle(frame, from: connection)
+            receive(connection)
         }
-        guard let job = jobs[id] else { return Data("{\"ipcError\":\"expired\"}".utf8) }
-        // Keep the result until receipt is acknowledged. A lost poll reply or a
+    }
+
+    private func drop(_ connection: NWConnection) {
+        let key = ObjectIdentifier(connection)
+        guard connections.removeValue(forKey: key) != nil else { return }
+        // Keep the job: a reconnecting client resubmits the same ID and
+        // receives this result instead of repeating a mutation.
+        for id in jobs.keys { jobs[id]?.waiters.removeValue(forKey: key) }
+        connection.cancel()
+    }
+
+    private func expireJobs() {
+        for (id, job) in jobs where job.expires < .now { jobs.removeValue(forKey: id); job.task?.cancel() }
+    }
+
+    private func handle(_ frame: MonitorIPCFrame, from connection: NWConnection) {
+        switch frame.op {
+        case .submit:
+            expireJobs()
+            if let reply = jobs[frame.id]?.reply { return send(reply, id: frame.id, to: connection) }
+            if jobs[frame.id] != nil { jobs[frame.id]?.waiters[ObjectIdentifier(connection)] = connection; return }
+            var job = Job(); job.waiters[ObjectIdentifier(connection)] = connection
+            let id = frame.id, payload = frame.payload, handler = handler
+            job.task = Task { @MainActor [weak self] in
+                let reply = await handler(payload)
+                guard let server = self else { return }
+                server.queue.async { server.complete(id, reply: reply) }
+            }
+            jobs[id] = job
+        case .cancel: jobs.removeValue(forKey: frame.id)?.task?.cancel()
+        // Keep the result until receipt is acknowledged. A lost reply or a
         // repeated submission must never run a mutation twice in this session.
-        if let reply = job.reply { return reply }
-        return Data("{\"pending\":true}".utf8)
+        case .acknowledge: if jobs[frame.id]?.reply != nil { jobs.removeValue(forKey: frame.id) }
+        // Answered on the IPC queue, so a busy main actor is not mistaken for a hung process.
+        case .ping: connection.send(content: MonitorIPCFrame(op: .pong, id: frame.id).encoded, completion: .contentProcessed { _ in })
+        case .reply, .pong: drop(connection)
+        }
     }
 
     private func complete(_ id: String, reply: Data) {
-        lock.lock(); defer { lock.unlock() }
-        jobs[id]?.reply = reply
-        jobs[id]?.task = nil
+        guard let waiters = jobs[id]?.waiters else { return }
+        jobs[id]?.reply = reply; jobs[id]?.task = nil; jobs[id]?.waiters.removeAll()
+        for connection in waiters.values { send(reply, id: id, to: connection) }
+    }
+
+    private func send(_ reply: Data, id: String, to connection: NWConnection) {
+        connection.send(content: MonitorIPCFrame(op: .reply, id: id, payload: reply).encoded, completion: .contentProcessed { _ in })
     }
 }
 
 struct MonitorIPCFailure: Error, LocalizedError {
-    enum Reason { case unavailable, transport(Int32), expired, timeout, invalidResponse }
+    enum Reason { case unavailable, transport, timeout, invalidResponse }
     let reason: Reason
     var requestMayHaveRun = false
     var isConnectionFailure: Bool {
@@ -149,68 +243,191 @@ struct MonitorIPCFailure: Error, LocalizedError {
     var errorDescription: String? {
         switch reason {
         case .unavailable: "Monitor is reconnecting. Automatically retrying."
-        case .transport(let status): "Monitor connection was interrupted (\(status)). Automatically reconnecting."
-        case .expired: "The monitor request expired. Try this action again."
+        case .transport: "Monitor connection was interrupted. Automatically reconnecting."
         case .timeout: "The monitor request took too long. Live data will retry automatically."
         case .invalidResponse: "The monitor returned an invalid response."
         }
     }
 }
 
-enum MonitorIPC {
-    // CoreFoundation reuses remote ports. Serialize individual send/poll calls
-    // so concurrent clients cannot race the port's reply bookkeeping; submitted
-    // asynchronous jobs still run concurrently in the monitor.
-    private static let sendLock = NSLock()
-    static func send(_ data: Data, message: Int32, name: String = MonitorRuntime.portName) throws -> Data {
-        sendLock.lock(); defer { sendLock.unlock() }
-        guard let port = CFMessagePortCreateRemote(nil, name as CFString) else { throw MonitorIPCFailure(reason: .unavailable) }
-        var reply: Unmanaged<CFData>?
-        let result = CFMessagePortSendRequest(port, message, data as CFData, 2, 2, CFRunLoopMode.defaultMode.rawValue, &reply)
-        guard result == kCFMessagePortSuccess, let reply else {
-            reply?.release()
-            CFMessagePortInvalidate(port)
-            throw MonitorIPCFailure(reason: .transport(result))
+// A client's persistent stream. Pending replies resume immediately when the
+// monitor answers or the connection drops; nothing is polled.
+final class MonitorIPCConnection: @unchecked Sendable {
+    private let connection: NWConnection
+    private let queue = DispatchQueue(label: "com.perpetualradar.monitor.client")
+    // State below is confined to `queue`.
+    private var opening: CheckedContinuation<Void, Error>?
+    private var pending: [String: (token: UUID, continuation: CheckedContinuation<Data, Error>)] = [:]
+    private var cancelled = Set<String>()
+    private var failed = false
+    private var lastHeard = ContinuousClock.now
+    private var heartbeat: DispatchSourceTimer?
+    // A stopped or hung monitor keeps its socket open; while requests are
+    // outstanding, missing heartbeats turn it into a connection failure.
+    private static let heartbeatTimeout: Duration = .seconds(3)
+
+    init(name: String) { connection = NWConnection(to: .unix(path: MonitorIPC.socketPath(name)), using: .tcp) }
+
+    var isFailed: Bool { queue.sync { failed } }
+
+    func open() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async { [self] in
+                opening = continuation
+                connection.stateUpdateHandler = { [weak self] state in
+                    guard let self else { return }
+                    switch state {
+                    case .ready:
+                        opening?.resume(); opening = nil
+                        receive(); startHeartbeat()
+                    // A missing or refused socket waits for a path change; treat it as unavailable.
+                    case .waiting, .failed, .cancelled: fail()
+                    default: break
+                    }
+                }
+                connection.start(queue: queue)
+            }
         }
-        return reply.takeRetainedValue() as Data
+    }
+
+    func send(_ frame: MonitorIPCFrame) {
+        connection.send(content: frame.encoded, completion: .contentProcessed { [weak self] error in
+            if error != nil { self?.fail() }
+        })
+    }
+
+    func call(id: String, payload: Data, timeout: Duration) async throws -> Data {
+        let token = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+                queue.async { [self] in
+                    if cancelled.remove(id) != nil { return continuation.resume(throwing: CancellationError()) }
+                    guard !failed else { return continuation.resume(throwing: MonitorIPCFailure(reason: .unavailable)) }
+                    pending.removeValue(forKey: id)?.continuation.resume(throwing: CancellationError())
+                    if pending.isEmpty { lastHeard = .now }
+                    pending[id] = (token, continuation)
+                    send(MonitorIPCFrame(op: .submit, id: id, payload: payload))
+                    let (seconds, attoseconds) = timeout.components
+                    queue.asyncAfter(deadline: .now() + .milliseconds(Int(seconds * 1_000 + attoseconds / 1_000_000_000_000_000))) { [weak self] in
+                        guard let self, pending[id]?.token == token else { return }
+                        pending.removeValue(forKey: id)?.continuation.resume(throwing: MonitorIPCFailure(reason: .timeout))
+                    }
+                }
+            }
+        } onCancel: {
+            queue.async { [self] in
+                if let entry = pending[id], entry.token == token { pending.removeValue(forKey: id); entry.continuation.resume(throwing: CancellationError()) }
+                else { cancelled.insert(id) }
+            }
+        }
+    }
+
+    private func receive() {
+        MonitorIPCFrame.read(connection) { [weak self] frame in
+            guard let self else { return }
+            guard let frame, frame.op == .reply || frame.op == .pong else { return fail() }
+            lastHeard = .now
+            if frame.op == .pong { return receive() }
+            pending.removeValue(forKey: frame.id)?.continuation.resume(returning: frame.payload)
+            cancelled.remove(frame.id)
+            receive()
+        }
+    }
+
+    private func startHeartbeat() {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.setEventHandler { [weak self] in
+            guard let self, !pending.isEmpty else { return }
+            if lastHeard.duration(to: .now) > Self.heartbeatTimeout { return fail() }
+            send(MonitorIPCFrame(op: .ping, id: ""))
+        }
+        timer.resume(); heartbeat = timer
+    }
+
+    private func fail() {
+        guard !failed else { return }
+        failed = true
+        heartbeat?.cancel(); heartbeat = nil
+        connection.stateUpdateHandler = nil
+        connection.cancel()
+        opening?.resume(throwing: MonitorIPCFailure(reason: .unavailable)); opening = nil
+        let waiting = pending.values; pending.removeAll()
+        waiting.forEach { $0.continuation.resume(throwing: MonitorIPCFailure(reason: .transport)) }
+    }
+}
+
+enum MonitorIPC {
+    // Bump when the request or reply format changes. Copies of the app that
+    // share this version may share one monitor; see MonitorClient.compatible.
+    static let protocolVersion = 2
+    @MainActor private static var connections: [String: Task<MonitorIPCConnection, Error>] = [:]
+
+    static func socketPath(_ name: String) -> String {
+        let digest = SHA256.hash(data: Data(name.utf8)).prefix(10).map { String(format: "%02x", $0) }.joined()
+        // The production endpoint lives beside the cache, which the system
+        // never purges; process tests keep theirs in the temporary directory.
+        let production = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("PerpetualRadar/monitor-\(digest).sock").path
+        if name == MonitorRuntime.productionPortName, production.utf8.count < 100 { return production }
+        return URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("psm-\(digest).sock").path
+    }
+
+    static func endpointExists(_ name: String) -> Bool {
+        let path = socketPath(name)
+        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { return false }
+        defer { close(descriptor) }
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let bytes = Array(path.utf8)
+        guard bytes.count < MemoryLayout.size(ofValue: address.sun_path) else { return false }
+        withUnsafeMutableBytes(of: &address.sun_path) { $0.copyBytes(from: bytes) }
+        return withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+        } == 0
+    }
+
+    @MainActor
+    private static func connection(_ name: String) async throws -> MonitorIPCConnection {
+        if let existing = connections[name] {
+            if let connection = try? await existing.value, !connection.isFailed { return connection }
+            if connections[name] == existing { connections[name] = nil }
+        }
+        let task = Task { () throws -> MonitorIPCConnection in
+            let connection = MonitorIPCConnection(name: name)
+            try await connection.open()
+            return connection
+        }
+        connections[name] = task
+        do { return try await task.value }
+        catch { if connections[name] == task { connections[name] = nil }; throw error }
     }
 
     @MainActor
     static func request(_ body: [String: Any], name: String = MonitorRuntime.portName,
-                        id: String = UUID().uuidString, timeout: Duration = .seconds(100)) async throws -> [String: Any] {
-        let key = Data(id.utf8)
-        let data = try SafeJSON.data(["id": id, "body": body])
-        var submitted = false
+                        id: String = UUID().uuidString, timeout: Duration = .seconds(100),
+                        acknowledge: Bool = true) async throws -> [String: Any] {
+        let payload = try SafeJSON.data(body)
+        var submitted: MonitorIPCConnection?  // Set once a submission may reach the monitor.
         do {
             try Task.checkCancellation()
-            let deadline = ContinuousClock.now + timeout
-            _ = try await Task.detached { try send(data, message: 1, name: name) }.value
-            submitted = true
-            while ContinuousClock.now < deadline {
-                try Task.checkCancellation()
-                let data = try await Task.detached { try send(key, message: 2, name: name) }.value
-                guard let response = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw MonitorIPCFailure(reason: .invalidResponse) }
-                if response["ipcError"] as? String == "expired" { throw MonitorIPCFailure(reason: .expired) }
-                if response["error"] is String || response["value"] is [String: Any] {
-                    try Task.checkCancellation()
-                    _ = try? await Task.detached { try send(key, message: 4, name: name) }.value
-                    if let error = response["error"] as? String { throw FilterError(error) }
-                    return response["value"] as! [String: Any]
-                }
-                guard response["pending"] as? Bool == true else { throw MonitorIPCFailure(reason: .invalidResponse) }
-                try await Task.sleep(for: .milliseconds(30))
-            }
-            throw MonitorIPCFailure(reason: .timeout)
+            let connection = try await connection(name)
+            try Task.checkCancellation()
+            submitted = connection
+            let data = try await connection.call(id: id, payload: payload, timeout: timeout)
+            guard let response = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw MonitorIPCFailure(reason: .invalidResponse) }
+            if acknowledge { connection.send(MonitorIPCFrame(op: .acknowledge, id: id)) }
+            if let error = response["error"] as? String { throw FilterError(error) }
+            guard let value = response["value"] as? [String: Any] else { throw MonitorIPCFailure(reason: .invalidResponse) }
+            return value
         } catch {
             if var failure = error as? MonitorIPCFailure, failure.isConnectionFailure, !Task.isCancelled {
-                // An unavailable endpoint before submission is known not to
-                // have executed; send timeouts can occur after acceptance.
-                failure.requestMayHaveRun = submitted || {
-                    if case .transport = failure.reason { return true }; return false
-                }()
+                // An unavailable endpoint is known not to have received the submission.
+                failure.requestMayHaveRun = failure.reason == .transport
                 throw failure
             }
-            _ = try? await Task.detached { try send(key, message: 3, name: name) }.value
+            submitted?.send(MonitorIPCFrame(op: .cancel, id: id))
             try Task.checkCancellation()
             throw error
         }
@@ -287,14 +504,15 @@ final class MonitorClient {
     func shutdown() async {
         shuttingDown = true; launchTask?.cancel()
         _ = try? await launchTask?.value
-        if endpointExists {
-            _ = try? await MonitorIPC.request(["stopForReplacement": true], name: name, timeout: .seconds(3))
+        // Another open copy keeps using the monitor; only the last client stops it.
+        let released = try? await MonitorIPC.request(["releaseLease": ProcessInfo.processInfo.processIdentifier], name: name, timeout: .seconds(3))
+        if released?["remainingClients"] as? Int ?? 0 == 0 {
             for _ in 0..<60 {
                 if !endpointExists { break }
                 try? await Task.sleep(for: .milliseconds(50))
             }
+            await stopOwnedHelper()
         }
-        await stopOwnedHelper()
         connection = nil
     }
 
@@ -302,7 +520,7 @@ final class MonitorClient {
         guard !shuttingDown else { throw CancellationError() }
         try Task.checkCancellation()
         if let launchTask { try await launchTask.value; try Task.checkCancellation(); return }
-        if let connection, connection.checkedAt.duration(to: .now) < .seconds(10), endpointExists { return }
+        if let connection, connection.checkedAt.duration(to: .now) < .seconds(10) { return }
         let task = Task { try await connectOrLaunch() }
         launchTask = task
         defer { launchTask = nil }
@@ -310,10 +528,17 @@ final class MonitorClient {
         try Task.checkCancellation()
     }
 
-    private var endpointExists: Bool { CFMessagePortCreateRemote(nil, name as CFString) != nil }
+    private var endpointExists: Bool { MonitorIPC.endpointExists(name) }
     private var helperURL: URL { appURL.appendingPathComponent("Contents/Library/LoginItems/\(MonitorRuntime.helperName)") }
+    private func otherClients(_ info: [String: Any]) -> Bool {
+        (info["foregroundPIDs"] as? [Int32] ?? []).contains { $0 != ProcessInfo.processInfo.processIdentifier }
+    }
+    // Our own monitor build is always preferred, but another open copy of the
+    // app keeps its monitor while it shares the IPC protocol. Replacing it
+    // would make both copies replace each other forever.
     private func compatible(_ info: [String: Any]) -> Bool {
-        info["appPath"] as? String == appURL.path && info["revision"] as? String == revision
+        if info["appPath"] as? String == appURL.path && info["revision"] as? String == revision { return true }
+        return info["ipcVersion"] as? Int == MonitorIPC.protocolVersion && otherClients(info)
     }
     private func probe() async throws -> [String: Any] {
         try await MonitorIPC.request(["serviceInfo": true, "foregroundLease": lease], name: name, timeout: .seconds(8))
@@ -367,7 +592,12 @@ final class MonitorClient {
                 return try await launchAndConnect()
             }
             if compatible(info) { try acceptConnection(info); return }
-            _ = try await MonitorIPC.request(["stopForReplacement": true], name: name, timeout: .seconds(5))
+            if otherClients(info) {
+                throw FilterError("Another copy of Perpetual Swap Suite (\((info["appPath"] as? String) ?? "unknown location")) is using an incompatible background monitor. Quit that copy to continue.")
+            }
+            // The monitor may exit before its acknowledgment arrives; its endpoint is checked below.
+            do { _ = try await MonitorIPC.request(["stopForReplacement": true], name: name, timeout: .seconds(5)) }
+            catch let failure as MonitorIPCFailure where failure.isConnectionFailure {}
             for _ in 0..<100 {
                 if !endpointExists { break }
                 try await Task.sleep(for: .milliseconds(50))

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowRight, Database, Download, Play, Trash2 } from 'lucide-react'
+import { pageVisible } from '@/lib/utils'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -129,6 +130,7 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
     let stopped = false, timer: number, refreshRequested = false, retryDelay = 1000
     const refresh = async () => {
       if (stopped) return
+      await pageVisible(); if (stopped) return
       if (polling.current) { timer = window.setTimeout(refresh, 250); return }
       refreshRequested = false
       polling.current = true

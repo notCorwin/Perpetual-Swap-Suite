@@ -56,7 +56,6 @@ final class Radar {
     private let monitorBTCHistoryLoader: FilterHistoryLoader
     private let cooldowns = FilterCooldownMemory()
     private var btcReceivedAt: Int64?
-    var onBTCUpdate: (() -> Void)?
     private let filterWorker = FilterEvaluationWorker()
     private let snapshotWorker = MarketSnapshotWorker()
     private var snapshotGenerations: [String: Int] = [:]
@@ -90,6 +89,17 @@ final class Radar {
     private var sockets: [URLSessionWebSocketTask] = []
     private var socketActivity: [String: Int64] = [:]
     private var running = false
+    // Everything a closed-hour strategy reading depends on. Live ticks are not
+    // part of it, so they never trigger a full-universe re-evaluation.
+    private struct ClosedEvaluationKey: Equatable {
+        let profile: String, revision: Int, hour: Int64, paused: Bool, universe: Set<String>, ownChanges: Int64, otherChanges: Int64
+    }
+    private var lastMonitorEvaluation: (key: ClosedEvaluationKey, at: ContinuousClock.Instant)?
+    private var confirmedCache: (key: ClosedEvaluationKey, detail: String?, readings: [SuiteReading], at: ContinuousClock.Instant)?
+    private func closedEvaluationKey(_ profile: StrategyProfile) throws -> ClosedEvaluationKey {
+        ClosedEvaluationKey(profile: profile.id, revision: profile.revision, hour: hour, paused: monitoringPaused || !running,
+                            universe: Set(rows.keys), ownChanges: store.totalChanges, otherChanges: try store.dataVersion())
+    }
     private var refreshingInstruments = false
     private var startupError = ""
 
@@ -204,10 +214,19 @@ final class Radar {
             profile = try JSONDecoder().decode(StrategyProfile.self, from: SafeJSON.data(raw))
         } else { profile = try store.selectedSuiteProfile("radar") }
         if ["evaluate", "preview"].contains(action), let profile {
+            let detail = request["instrument"] as? String
+            // Drafts may share a revision with different rules; only the saved selection is cached.
+            let key = action == "evaluate" ? try closedEvaluationKey(profile) : nil
             let hydration = try profile.hydration(), captured = try await calculateSnapshot(rocPeriod: 9, marocPeriod: 9)
             let prepared = try await prepareFilterMarkets(captured, filter: hydration)
-            let provisional = try await suiteWorker.evaluate(prepared, profile: profile, forming: true, available: running && !monitoringPaused, detail: request["instrument"] as? String)
-            let confirmed = try await suiteWorker.evaluate(prepared, profile: profile, forming: false, available: running && !monitoringPaused, detail: request["instrument"] as? String)
+            let provisional = try await suiteWorker.evaluate(prepared, profile: profile, forming: true, available: running && !monitoringPaused, detail: detail)
+            let confirmed: [SuiteReading]
+            if let key, let cached = confirmedCache, cached.key == key, cached.detail == detail, cached.at.duration(to: .now) < .seconds(60) {
+                confirmed = cached.readings
+            } else {
+                confirmed = try await suiteWorker.evaluate(prepared, profile: profile, forming: false, available: running && !monitoringPaused, detail: detail)
+                if let key { confirmedCache = (key, detail, confirmed, .now) }
+            }
             if action == "evaluate", try store.selectedSuiteProfile("radar")?.id != profile.id || store.selectedSuiteProfile("radar")?.revision != profile.revision {
                 response = try store.suiteInventory(mode)
                 response["confirmed"] = []; response["provisional"] = []
@@ -278,12 +297,17 @@ final class Radar {
             for (id, closed) in try await monitorHistoryLoader.consumeUpdatedHistory(through: hour - hourMS) where rows[id] != nil {
                 candles[id, default: [:]].merge(closed) { _, observed in observed }; invalidateSnapshot(id); touch(id)
             }
+            let key = try closedEvaluationKey(profile)
+            // Unchanged inputs produce identical readings; re-check periodically as a safety net.
+            if let last = lastMonitorEvaluation, last.key == key, last.at.duration(to: .now) < .seconds(60) { return nil }
             let captured = try await calculateSnapshot(rocPeriod: 9, marocPeriod: 9)
             let prepared = try await prepareFilterMarkets(captured, filter: hydration, monitoring: true)
             let readings = try await suiteMonitorWorker.evaluate(prepared, profile: profile, forming: false, available: !monitoringPaused)
             guard capturedHour == hour, Set(prepared.map(\.id)) == Set(rows.keys),
                   try store.selectedSuiteProfile("radar")?.revision == profile.revision, try store.selectedSuiteProfile("radar")?.id == profile.id else { return nil }
-            return try strategyObservation(profile: profile, readings: readings)
+            let observation = try strategyObservation(profile: profile, readings: readings)
+            lastMonitorEvaluation = (key, .now)
+            return observation
         }
         return FilterObservation(configuration: "no-active-strategy", universe: [], results: [:])
     }
@@ -337,7 +361,7 @@ final class Radar {
         tasks.forEach { $0.cancel() }; tasks.removeAll()
         historyTasks.forEach { $0.cancel() }; historyTasks.removeAll()
         sockets.forEach { $0.cancel(with: .goingAway, reason: nil) }; sockets.removeAll()
-        running = false
+        running = false; lastMonitorEvaluation = nil
         btcReceivedAt = nil
         Task { await historyLoader.cancel(); await monitorHistoryLoader.cancel(); await btcHistoryLoader.cancel(); await monitorBTCHistoryLoader.cancel() }
     }
@@ -647,7 +671,7 @@ final class Radar {
                     for item in items {
                         if channel == "open-interest", let value = item as? [String: Any] { updateOI(value) }
                         if channel == "candle1H", let id = arg["instId"], let value = item as? [String] {
-                            if let _ = updateCandle(id, value), id == btcReferenceID { btcReceivedAt = millis(); onBTCUpdate?() }
+                            if let _ = updateCandle(id, value), id == btcReferenceID { btcReceivedAt = millis() }
                         }
                     }
                 }
@@ -657,7 +681,6 @@ final class Radar {
             ping.cancel(); socket.cancel(with: .goingAway, reason: nil)
             sockets.removeAll { $0 === socket }
             disconnectedChannels.insert(channel)
-            if channel == "candle1H" { onBTCUpdate?() }
             try? await Task.sleep(nanoseconds: backoff + UInt64.random(in: 0...(backoff / 4)))
             backoff = min(backoff * 2, 30_000_000_000)
         }
