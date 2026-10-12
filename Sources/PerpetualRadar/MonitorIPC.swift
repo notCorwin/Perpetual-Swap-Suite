@@ -5,7 +5,8 @@ import Network
 enum MonitorRuntime {
     static let helperIdentifier = "com.perpetualradar.macos.monitor"
     static let helperName = "Perpetual Swap Suite Monitor.app"
-    static let isHelper = Bundle.main.bundleIdentifier == helperIdentifier || ProcessInfo.processInfo.environment["PERPETUAL_RADAR_ROLE"] == "monitor"
+    private static let isHelperBundle = Bundle.main.bundleIdentifier == helperIdentifier || Bundle.main.object(forInfoDictionaryKey: "PerpetualRadarRole") as? String == "monitor"
+    static let isHelper = isHelperBundle || ProcessInfo.processInfo.environment["PERPETUAL_RADAR_ROLE"] == "monitor"
     static let testChannel = ProcessInfo.processInfo.environment["PERPETUAL_RADAR_TEST_CHANNEL"]
     static let productionPortName = "com.perpetualradar.monitor.\(getuid())"
     static let portName = productionPortName + (testChannel.map { ".\($0)" } ?? "")
@@ -23,7 +24,7 @@ enum MonitorRuntime {
         return UserDefaults(suiteName: suite)!
     }
     static var appURL: URL {
-        if Bundle.main.bundleIdentifier == helperIdentifier {
+        if isHelperBundle {
             return Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         }
         return Bundle.main.bundleURL
@@ -569,6 +570,20 @@ final class MonitorClient {
         launchedProcess = nil; helperApplication = nil
     }
 
+    static func openHelper(at url: URL, environment: [String: String]) async throws -> NSRunningApplication {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = false
+        // LaunchServices otherwise reuses ANY running bundle with this ID,
+        // including a different app copy or an isolated test monitor.
+        configuration.createsNewApplicationInstance = true
+        configuration.environment = environment
+        let application = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+        guard application.bundleURL?.resolvingSymlinksInPath() == url.resolvingSymlinksInPath() else {
+            throw FilterError("macOS opened a different Monitor. Automatically retrying the connection.")
+        }
+        return application
+    }
+
     private func connectOrLaunch() async throws {
         // Reopening the interface must also recover a helper that was already
         // stalled before this client existed. Test channels have isolated owners.
@@ -628,14 +643,12 @@ final class MonitorClient {
                 process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
                 try process.run(); launchedProcess = process
             }
-        } else {
-            let configuration = NSWorkspace.OpenConfiguration()
-            configuration.activates = false
-            configuration.environment = ["PERPETUAL_RADAR_OWNER_PID": String(ProcessInfo.processInfo.processIdentifier)]
+        } else if helperApplication?.isTerminated != false {
+            var environment = ["PERPETUAL_RADAR_OWNER_PID": String(ProcessInfo.processInfo.processIdentifier)]
             if let rollback = ProcessInfo.processInfo.environment["PERPETUAL_RADAR_UPDATE_ROLLBACK"] {
-                configuration.environment["PERPETUAL_RADAR_UPDATE_ROLLBACK"] = rollback
+                environment["PERPETUAL_RADAR_UPDATE_ROLLBACK"] = rollback
             }
-            helperApplication = try await NSWorkspace.shared.openApplication(at: helperURL, configuration: configuration)
+            helperApplication = try await Self.openHelper(at: helperURL, environment: environment)
         }
         let deadline = ContinuousClock.now + .seconds(15)
         while ContinuousClock.now < deadline {
@@ -651,6 +664,10 @@ final class MonitorClient {
             }
             if launch == nil, let process = launchedProcess, !process.isRunning {
                 throw FilterError("Monitor stopped during startup (\(process.terminationStatus)). Automatically retrying.")
+            }
+            if launch == nil, helperApplication?.isTerminated == true {
+                helperApplication = nil
+                throw FilterError("Monitor stopped during startup. Automatically retrying.")
             }
             try await Task.sleep(for: .milliseconds(50))
         }

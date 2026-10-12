@@ -860,6 +860,15 @@ final class AppUpdater: @unchecked Sendable {
                 throw AppUpdateError.invalidPackage
             }
         }
+        let helperURL = extractedApp.appendingPathComponent("Contents/Library/LoginItems/\(MonitorRuntime.helperName)")
+        guard let helper = Bundle(url: helperURL),
+              helper.bundleIdentifier == MonitorRuntime.helperIdentifier,
+              helper.object(forInfoDictionaryKey: "CFBundleSourceRevision") as? String == bundle.object(forInfoDictionaryKey: "CFBundleSourceRevision") as? String,
+              let helperExecutable = helper.executableURL,
+              Self.isExpectedExecutable(helperExecutable, in: helperURL),
+              Self.isExecutableRegularFile(atPath: helperExecutable.path, fileManager: fileManager) else {
+            throw AppUpdateError.invalidPackage
+        }
 
         let currentApp = currentAppURL
         guard currentApp.pathExtension == "app" else {
@@ -1028,7 +1037,12 @@ final class AppUpdater: @unchecked Sendable {
         shift
         if [ "${PERPETUAL_RADAR_BACKGROUND:-0}" = 1 ]; then
             monitor_app="$app_to_open/Contents/Library/LoginItems/Perpetual Swap Suite Monitor.app"
-            if [ -x "$monitor_app/Contents/MacOS/PerpetualRadar" ]; then app_to_open="$monitor_app"; fi
+            if [ -x "$monitor_app/Contents/MacOS/PerpetualRadar" ]; then
+                # An older monitor in another app copy must not absorb this
+                # launch and its readiness environment. Helpers have no Dock tile.
+                "$opener" -n -g -a "$monitor_app" --env "PERPETUAL_RADAR_BACKGROUND=1" "$@"
+                return $?
+            fi
             "$opener" -g -a "$app_to_open" --env "PERPETUAL_RADAR_BACKGROUND=1" "$@"
         else
             "$opener" -a "$app_to_open" --env "PERPETUAL_RADAR_BACKGROUND=0" "$@"

@@ -18,6 +18,64 @@ final class MonitorServiceTests: BackgroundTestCase {
     }
 
     @MainActor
+    func testPackagedLaunchSelectsEmbeddedMonitorWhenAnotherCopyIsRunning() async throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["RADAR_SERVICE_TESTS"] == "1", "Run after packaging; both monitors stay hidden.")
+        let builtApp = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/app/Perpetual Swap Suite.app")
+        let channel = UUID().uuidString, foreignChannel = UUID().uuidString
+        let directory = serviceTestDirectory(channel), foreignDirectory = serviceTestDirectory(foreignChannel)
+        let identifier = "RadarServiceTests.\(channel)"
+        for id in [channel, foreignChannel] {
+            UserDefaults(suiteName: "RadarServiceTests.\(id)")?.set(false, forKey: "BackgroundMonitoring")
+        }
+        let focus = BackgroundTestAudit(); defer { focus.stop() }
+        let foreign = Process()
+        var selected: NSRunningApplication?
+        defer {
+            if foreign.isRunning { kill(foreign.processIdentifier, SIGKILL) }
+            if let selected, !selected.isTerminated { selected.forceTerminate() }
+            for (id, path) in [(channel, directory), (foreignChannel, foreignDirectory)] {
+                UserDefaults(suiteName: "RadarServiceTests.\(id)")?.removePersistentDomain(forName: "RadarServiceTests.\(id)")
+                try? FileManager.default.removeItem(at: path)
+            }
+        }
+        // Both copies deliberately share a test-only identity to reproduce
+        // LaunchServices' reuse behavior without registering production IDs.
+        let ownApp = try backgroundTestApp(from: builtApp, in: directory, bundleIdentifier: identifier)
+        let foreignApp = try backgroundTestApp(from: builtApp, in: foreignDirectory, bundleIdentifier: identifier)
+        func environment(_ id: String, _ path: URL) -> [String: String] {
+            ["PERPETUAL_RADAR_TEST_CHANNEL": id, "PERPETUAL_RADAR_TEST_DIRECTORY": path.path,
+             "PERPETUAL_RADAR_OWNER_PID": String(ProcessInfo.processInfo.processIdentifier), "PERPETUAL_RADAR_BACKGROUND": "1"]
+        }
+        func info(_ id: String) async throws -> [String: Any] {
+            let name = "com.perpetualradar.monitor.\(getuid()).\(id)"
+            let deadline = ContinuousClock.now + .seconds(5)
+            while !MonitorIPC.endpointExists(name), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(25)) }
+            return try await MonitorIPC.request(["serviceInfo": true], name: name, timeout: .seconds(5))
+        }
+        let helperPath = "Contents/Library/LoginItems/\(MonitorRuntime.helperName)"
+        foreign.executableURL = foreignApp.appendingPathComponent(helperPath + "/Contents/MacOS/PerpetualRadar")
+        foreign.environment = environment(foreignChannel, foreignDirectory)
+        foreign.standardOutput = FileHandle.nullDevice; foreign.standardError = FileHandle.nullDevice
+        try foreign.run(); focus.track(foreign.processIdentifier)
+        let foreignInfo = try await info(foreignChannel)
+        XCTAssertEqual(foreignInfo["pid"] as? Int32, foreign.processIdentifier)
+        selected = try await MonitorClient.openHelper(at: ownApp.appendingPathComponent(helperPath), environment: environment(channel, directory))
+        let own = try XCTUnwrap(selected); focus.track(own.processIdentifier)
+        let ownInfo = try await info(channel)
+        XCTAssertEqual(ownInfo["pid"] as? Int32, own.processIdentifier)
+        XCTAssertNotEqual(own.processIdentifier, foreign.processIdentifier)
+        XCTAssertEqual(URL(fileURLWithPath: try XCTUnwrap(ownInfo["appPath"] as? String)).resolvingSymlinksInPath(), ownApp.resolvingSymlinksInPath())
+        XCTAssertEqual(ownInfo["revision"] as? String, Bundle(url: ownApp)?.object(forInfoDictionaryKey: "CFBundleSourceRevision") as? String)
+        XCTAssertTrue(foreign.isRunning, "Launching the embedded monitor must not terminate another copy's monitor.")
+        focus.assertBackground([foreign.processIdentifier, own.processIdentifier])
+        try await requestShutdown(["quitCompletely": true], name: "com.perpetualradar.monitor.\(getuid()).\(channel)")
+        try await requestShutdown(["quitCompletely": true], name: "com.perpetualradar.monitor.\(getuid()).\(foreignChannel)")
+        let deadline = ContinuousClock.now + .seconds(3)
+        while (foreign.isRunning || !own.isTerminated), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertFalse(foreign.isRunning); XCTAssertTrue(own.isTerminated)
+    }
+
+    @MainActor
     func testPackagedDatabaseStartupFailuresRecoverInPlaceAndRetainSettings() async throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["RADAR_SERVICE_TESTS"] == "1", "Run after packaging; the application stays hidden.")
         let builtApp = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/app/Perpetual Swap Suite.app")

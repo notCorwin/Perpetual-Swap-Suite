@@ -1,4 +1,5 @@
 import Foundation
+@testable import PerpetualRadar
 
 /// LaunchServices reads the bundle before Swift's entry point runs. Setting
 /// activationPolicy in main is too late to prevent a transient Dock icon.
@@ -6,13 +7,23 @@ func backgroundTestApp(from source: URL, in directory: URL, bundleIdentifier: St
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     let app = directory.appendingPathComponent(source.lastPathComponent)
     try FileManager.default.copyItem(at: source, to: app)
-    let plistURL = app.appendingPathComponent("Contents/Info.plist")
-    guard var plist = try PropertyListSerialization.propertyList(from: Data(contentsOf: plistURL), options: [], format: nil) as? [String: Any] else {
-        throw CocoaError(.fileReadCorruptFile)
+    // Test bundles must never register the production IDs with LaunchServices.
+    let identifier = bundleIdentifier ?? "RadarServiceTests.\(UUID().uuidString)"
+    let helper = app.appendingPathComponent("Contents/Library/LoginItems/\(MonitorRuntime.helperName)")
+    for (bundle, id) in [(helper, identifier + ".monitor"), (app, identifier)] {
+        let plistURL = bundle.appendingPathComponent("Contents/Info.plist")
+        guard var plist = try PropertyListSerialization.propertyList(from: Data(contentsOf: plistURL), options: [], format: nil) as? [String: Any] else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        plist["LSUIElement"] = true
+        plist["CFBundleIdentifier"] = id
+        try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0).write(to: plistURL)
+        try signBackgroundTestBundle(bundle)
     }
-    plist["LSUIElement"] = true
-    if let bundleIdentifier { plist["CFBundleIdentifier"] = bundleIdentifier }
-    try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0).write(to: plistURL)
+    return app
+}
+
+private func signBackgroundTestBundle(_ app: URL) throws {
     let signer = Process()
     signer.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
     signer.arguments = ["--force", "--sign", "-", app.path]
@@ -21,5 +32,4 @@ func backgroundTestApp(from source: URL, in directory: URL, bundleIdentifier: St
     try signer.run()
     signer.waitUntilExit()
     guard signer.terminationStatus == 0 else { throw CocoaError(.executableLoad) }
-    return app
 }

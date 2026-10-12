@@ -157,6 +157,32 @@ final class AppUpdaterTests: XCTestCase {
         let marker = current.appendingPathComponent("Contents/Resources/marker")
         XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "new")
         XCTAssertEqual(try String(contentsOf: current.appendingPathComponent("Contents/Resources/Web/index.html"), encoding: .utf8), "<html>new</html>")
+        XCTAssertEqual(try String(contentsOf: current.appendingPathComponent("Contents/Library/LoginItems/\(MonitorRuntime.helperName)/Contents/Resources/marker"), encoding: .utf8), "new")
+    }
+
+    func testInstallRejectsMissingOrMismatchedMonitorBeforeReplacingApp() throws {
+        for missing in [true, false] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("MonitorUpdateTests-\(UUID())")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let current = root.appendingPathComponent("Perpetual Swap Suite.app")
+            let release = root.appendingPathComponent("release/Perpetual Swap Suite.app")
+            let archive = root.appendingPathComponent("update.tar")
+            try makeApp(at: current, marker: "old"); try makeApp(at: release, marker: "new")
+            let helper = release.appendingPathComponent("Contents/Library/LoginItems/\(MonitorRuntime.helperName)")
+            if missing { try FileManager.default.removeItem(at: helper) }
+            else {
+                let url = helper.appendingPathComponent("Contents/Info.plist")
+                var plist = try XCTUnwrap(PropertyListSerialization.propertyList(from: Data(contentsOf: url), format: nil) as? [String: Any])
+                plist["CFBundleSourceRevision"] = "old"
+                try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0).write(to: url)
+            }
+            let tar = Process(); tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+            tar.arguments = ["-cf", archive.path, "-C", release.deletingLastPathComponent().path, release.lastPathComponent]
+            try tar.run(); tar.waitUntilExit(); XCTAssertEqual(tar.terminationStatus, 0)
+            let updater = AppUpdater(currentAppURL: current, relauncher: { _, _ in XCTFail("Incomplete updates must not relaunch.") })
+            XCTAssertThrowsError(try updater.install(downloadedFile: archive, expectedRevision: "unknown"))
+            XCTAssertEqual(try String(contentsOf: current.appendingPathComponent("Contents/Resources/marker"), encoding: .utf8), "old")
+        }
     }
 
     func testRelaunchWaitsForOldProcessAndReusesDockApp() throws {
@@ -243,6 +269,7 @@ final class AppUpdaterTests: XCTestCase {
             let arguments = try String(contentsOf: log, encoding: .utf8)
             let openedPath = embeddedMonitor ? app.appendingPathComponent("Contents/Library/LoginItems/Perpetual Swap Suite Monitor.app").path : app.path
             XCTAssertTrue(arguments.contains("-g\n-a\n\(openedPath)\n--env\nPERPETUAL_RADAR_BACKGROUND=1\n"))
+            XCTAssertEqual(arguments.contains("-n\n"), embeddedMonitor, "Updated monitors must launch from the replaced bundle even when another copy is running.")
             XCTAssertEqual(arguments.components(separatedBy: "\(openedPath)\n").count - 1, fail ? 2 : 1, "Each attempt opens the app once")
             if fail { XCTAssertTrue(arguments.contains("PERPETUAL_RADAR_UPDATE_ROLLBACK=1")) }
             XCTAssertEqual(helper.terminationStatus == 0, !fail)
@@ -315,7 +342,17 @@ final class AppUpdaterTests: XCTestCase {
             "CFBundleInfoDictionaryVersion": "6.0",
             "CFBundleName": "Perpetual Swap Suite",
             "CFBundlePackageType": "APPL",
+            "CFBundleSourceRevision": marker,
         ], format: .xml, options: 0)
         try plist.write(to: contents.appendingPathComponent("Info.plist"))
+        let helper = contents.appendingPathComponent("Library/LoginItems/\(MonitorRuntime.helperName)/Contents")
+        try FileManager.default.createDirectory(at: helper.appendingPathComponent("MacOS"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: helper.appendingPathComponent("Resources"), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: executable, to: helper.appendingPathComponent("MacOS/PerpetualRadar"))
+        try Data(marker.utf8).write(to: helper.appendingPathComponent("Resources/marker"))
+        try PropertyListSerialization.data(fromPropertyList: [
+            "CFBundleExecutable": "PerpetualRadar", "CFBundleIdentifier": MonitorRuntime.helperIdentifier,
+            "CFBundlePackageType": "APPL", "CFBundleSourceRevision": marker,
+        ], format: .xml, options: 0).write(to: helper.appendingPathComponent("Info.plist"))
     }
 }

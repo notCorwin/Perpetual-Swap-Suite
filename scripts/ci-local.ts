@@ -14,6 +14,7 @@ const environment = { ...process.env, CI: '1', RADAR_UI_TESTS: '1', RADAR_VISUAL
 let stopped = false
 
 function stop() {
+  if (stopped) return
   stopped = true
   const groups = [...running].flatMap(child => child.pid ? [child.pid] : [])
   for (const pid of groups) { try { process.kill(-pid, 'SIGTERM') } catch { /* Already exited. */ } }
@@ -118,19 +119,22 @@ try {
     const taskCost = (ids: string[]) => ids.reduce((seconds, id) => seconds + (durations.get(id) ?? initialCosts.find(([name]) => id.includes(name))?.[1] ?? 5), 0)
     const orderedUI = ui.filter(id => !benchmark.includes(id) && !pixels.includes(id)).sort((a, b) => taskCost([b]) - taskCost([a]) || weight(a) - weight(b))
     const uiTask = (id: string) => ({ name: `webkit-${id.split('/')[1]}`, ids: [id] })
+    const serviceTasks = services.map((id, index) => ({ name: `packaged-lifecycle-${index + 1}`, ids: [id] }))
+    const firstServices = serviceTasks.filter(task => task.ids[0].includes('testPackaged') && !task.ids[0].includes('testPackagedLaunch')).sort((a, b) => taskCost(b.ids) - taskCost(a.ids))
     const queue = [
-      ...services.map((id, index) => ({ name: `packaged-lifecycle-${index + 1}`, ids: [id] })),
-      ...orderedUI.slice(3).map(uiTask),
+      ...serviceTasks.filter(task => !firstServices.includes(task)),
+      ...orderedUI.slice(2).map(uiTask),
     ].sort((a, b) => taskCost(b.ids) - taskCost(a.ids))
     const drain = async () => {
       for (let task = queue.shift(); task; task = queue.shift()) {
         await execute(task.name, task.ids)
       }
     }
-    // Start long-lived WebViews together. Do not start further WebKit tests or
-    // lifecycle apps while ScreenCaptureKit is capturing the first wave.
+    // Start the long lifecycle scenarios in the first wave too: their real
+    // recovery deadlines must overlap capture, not start after it finishes.
+    // Keep subsequent test launches behind capture to bound WindowServer load.
     const captured = execute('webkit-native-pixels', pixels)
-    const first = orderedUI.slice(0, 3).map(uiTask)
+    const first = [...firstServices, ...orderedUI.slice(0, 2).map(uiTask)]
     const nativeSlots = Math.max(6, Math.min(8, availableParallelism()))
     await Promise.all([
       captured,

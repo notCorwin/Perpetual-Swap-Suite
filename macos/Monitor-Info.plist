@@ -4,6 +4,7 @@
   <key>CFBundleDevelopmentRegion</key><string>en</string>
   <key>CFBundleExecutable</key><string>PerpetualRadar</string>
   <key>CFBundleIdentifier</key><string>com.perpetualradar.macos.monitor</string>
+  <key>PerpetualRadarRole</key><string>monitor</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Perpetual Swap Suite Monitor</string>
   <key>CFBundleDisplayName</key><string>Perpetual Swap Suite</string>
