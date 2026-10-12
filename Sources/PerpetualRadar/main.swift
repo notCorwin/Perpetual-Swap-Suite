@@ -307,6 +307,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        windowBackground.updateFloatingGlass([])
         previewWindowBlurRadius = nil; applyWindowBackground()
     }
 
@@ -399,6 +400,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage,
                                replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void) {
         guard let parameters = message.body as? [String: Any] else { replyHandler(nil, "Invalid request"); return }
+        if let surfaces = parameters["floatingGlassSurfaces"] as? [[String: Double]] {
+            windowBackground.updateFloatingGlass(surfaces)
+            replyHandler(["ok": true], nil); return
+        }
         if let text = parameters["copyText"] as? String {
             NSPasteboard.general.clearContents()
             replyHandler(["ok": NSPasteboard.general.setString(text, forType: .string)], nil)

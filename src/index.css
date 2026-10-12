@@ -122,7 +122,9 @@
     --overlay-default-opacity: 0.12;
     --control-blur: calc((1 - var(--window-background-opacity)) * 12px);
     --panel-blur: calc((1 - var(--window-background-opacity)) * 16px);
-    /* Broad blur diffuses underlying text and blocks without adding a tint. */
+    /* Native transparent WebKit windows consume these same blur values in the
+       floating compositor, replacing source pixels instead of double-drawing
+       a translucent blurred copy over still-sharp content. */
     --window-blur: 64px;
     --floating-blur: 64px;
     --blur-radius-max: 160;

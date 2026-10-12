@@ -200,6 +200,10 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
                 replyHandler(result, nil)
             } catch { replyHandler(nil, error.localizedDescription) } }; return
         }
+        if let surfaces = request["floatingGlassSurfaces"] as? [[String: Double]] {
+            windowBackground?.updateFloatingGlass(surfaces)
+            replyHandler(["ok": true], nil); return
+        }
         radarRequests += 1
         if request["backgroundMonitoringEnabled"] != nil || request["notificationsEnabled"] != nil || request["notificationAction"] != nil || request["monitoringPaused"] != nil || request["launchAtLogin"] != nil {
             do {
@@ -1102,8 +1106,10 @@ final class RuleEditorUITests: BackgroundTestCase {
         let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist"), marketCount: 48), configuration = uiConfiguration()
         configuration.userContentController.addScriptMessageHandler(bridge, contentWorld: .page, name: "radar")
         configuration.setURLSchemeHandler(bridge, forURLScheme: "radar")
+        configuration.userContentController.addUserScript(WKUserScript(source: "window.radarAppearance = { frostedBackgroundEnabled: true, frostedBackgroundOpacity: 0.3, nativeWindowBackground: true };", injectionTime: .atDocumentStart, forMainFrameOnly: true))
         let window = BackgroundTestWindow(contentRect: NSRect(x: 0, y: 0, width: 1440, height: 900), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         let view = WKWebView(frame: .zero, configuration: configuration), background = WindowBackgroundView(contentView: view)
+        view.setValue(false, forKey: "drawsBackground"); view.underPageBackgroundColor = .clear
         bridge.windowBackground = background; window.contentView = background; present(window)
         defer { bridge.heldBlurSave?(); bridge.heldBlurSave = nil; view.stopLoading(); window.orderOut(nil); configuration.userContentController.removeScriptMessageHandler(forName: "radar", contentWorld: .page); bridge.cleanUp() }
         view.load(URLRequest(url: URL(string: "radar://app/index.html")!))
@@ -1125,10 +1131,32 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await wait(view, "!document.body.innerText.includes('Saving')")
         XCTAssertEqual(bridge.radar.windowBlurRadius, 0, "The latest edit must win over an older pending save.")
         XCTAssertNil(bridge.previewWindowBlur)
+        var clearMaterial: NSBitmapImageRep?
+        var materialRect = CGRect.zero
+        try await slide("floating-blur", "Home")
+        try await wait(view, "getComputedStyle(document.querySelector('[data-slot=popover-content]')).backdropFilter === 'none' && !document.body.innerText.includes('Saving')")
+        if capturePixels {
+            let bounds = try await js(view, "(() => { const style=document.createElement('style'); style.id='slider-pixel-style'; style.textContent='[data-slot=popover-content] > * {visibility:hidden!important}'; document.head.append(style); return document.querySelector('[data-slot=popover-content]').getBoundingClientRect().toJSON(); })()") as! [String: Double]
+            materialRect = CGRect(x: bounds["x"]! + 20, y: bounds["y"]! + 20, width: bounds["width"]! - 40, height: bounds["height"]! - 40)
+            try await settleRendering(view)
+            let image = try await nativeRendererSnapshot(view)
+            clearMaterial = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
+        }
         try await slide("floating-blur", "End")
         try await wait(view, "getComputedStyle(document.querySelector('[data-slot=popover-content]')).backdropFilter === 'blur(160px)' && !document.body.innerText.includes('Saving')")
         XCTAssertEqual(bridge.radar.floatingBlurRadius, 160)
         if capturePixels {
+            try await settleRendering(view)
+            let material = try await nativeRendererSnapshot(view)
+            let blurred = try XCTUnwrap(NSBitmapImageRep(data: material.tiffRepresentation!)), clear = try XCTUnwrap(clearMaterial)
+            let sharp = try pixelDetail(clear, rect: materialRect, view: view)
+            let softened = try pixelDetail(blurred, rect: materialRect, view: view)
+            print("Real app text detail, Popover blur 0 → 160: \(sharp) → \(softened)")
+            XCTAssertGreaterThan(sharp, 0.005, "The baseline must contain real, readable app text behind the menu.")
+            XCTAssertLessThan(softened, sharp * 0.2, "Changing the slider must replace the sharp backdrop, not overlay a translucent blurred copy.")
+            let outside = CGRect(x: 24, y: 200, width: 200, height: 500)
+            XCTAssertEqual(try pixelDetail(blurred, rect: outside, view: view), try pixelDetail(clear, rect: outside, view: view), accuracy: 0.002, "Popover blur must leave content outside its bounds sharp.")
+            _ = try await js(view, "document.querySelector('#slider-pixel-style').remove(); true")
             try await settleRendering(view)
             let image = try await nativeRendererSnapshot(view)
             let bitmap = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
@@ -1144,7 +1172,12 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await click(view, "Retry saving")
         try await wait(view, "!document.body.innerText.includes('Cannot save blur fixture') && !document.body.innerText.includes('Saving')")
         XCTAssertEqual(bridge.radar.floatingBlurRadius, 0)
+        let documentTimeOrigin = try await js(view, "performance.timeOrigin")
+        let previousDocument = try XCTUnwrap(documentTimeOrigin as? Double)
         view.reload()
+        // Wait for the new document before querying controls: the old page
+        // remains interactive briefly while WebKit starts a reload.
+        try await wait(view, "performance.timeOrigin !== \(previousDocument)")
         try await showAllMarkets(view, count: 48)
         try await click(view, "Settings")
         try await wait(view, "document.querySelector('#window-blur [role=slider]')?.getAttribute('aria-valuenow') === '0' && document.querySelector('#floating-blur [role=slider]')?.getAttribute('aria-valuenow') === '0'")
@@ -1361,6 +1394,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         // 500-market stress workload during every material/pixel assertion.
         let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist"), marketCount: 48), configuration = uiConfiguration()
         bridge.includeChartBars = true
+        bridge.research = try ResearchController(directory: bridge.directory.appendingPathComponent("Research"), transport: ResearchFixtureTransport(), radarURL: bridge.directory.appendingPathComponent("radar.sqlite3"))
         configuration.userContentController.addScriptMessageHandler(bridge, contentWorld: .page, name: "radar")
         configuration.setURLSchemeHandler(bridge, forURLScheme: "radar")
         configuration.userContentController.addUserScript(WKUserScript(source: "window.radarAppearance = { frostedBackgroundEnabled: true, frostedBackgroundOpacity: 0.3, nativeWindowBackground: true };", injectionTime: .atDocumentStart, forMainFrameOnly: true))
@@ -1453,6 +1487,14 @@ final class RuleEditorUITests: BackgroundTestCase {
             try await click(view, "Markets")
             try await wait(view, "document.querySelector('table[data-market-count]') !== null")
             try await click(view, "Universe rules"); try await click(view, "Universe rules")
+            bridge.researchJobOverride = ["id": "glass-task", "phase": "preparing", "completed": 3, "total": 10, "message": "Preparing glass fixture", "error": "", "startedAt": researchNow() - 60_000, "updatedAt": researchNow()]
+            try await click(view, "Perpetual Swap Radar")
+            try await wait(view, "document.querySelector('[data-research-task] [data-surface=floating]') !== null")
+            try await assertSharedSurfaces(view, opacity: 0.3)
+            if capturePixels { try await assertFloatingPixels(view, project: project, theme: theme, selector: "[data-research-task] [data-surface=floating]", name: "research-task") }
+            try await click(view, "Perpetual Swap Research")
+            bridge.researchJobOverride = nil
+            try await wait(view, "document.querySelector('table[data-market-count]')?.getBoundingClientRect().width > 0")
         }
     }
 
@@ -1654,12 +1696,14 @@ final class RuleEditorUITests: BackgroundTestCase {
           // Large checkerboard tiles model app blocks, not just fine text.
           // Hide only the real portaled surface's children to sample its material.
           const fixture = document.createElement('div'); fixture.id = 'floating-pixel-fixture';
-          fixture.style.cssText = 'position:absolute;inset:0;z-index:49;pointer-events:none;background:conic-gradient(#000 25%,#fff 0 50%,#000 0 75%,#fff 0) 0 0 / 128px 128px';
+          // Translucent tiles expose the source-over bug that an opaque test
+          // background used to conceal in the real translucent window.
+          fixture.style.cssText = 'position:absolute;inset:0;z-index:39;pointer-events:none;background:conic-gradient(rgb(0 0 0 / .2) 25%,#fff 0 50%,rgb(0 0 0 / .2) 0 75%,#fff 0) 0 0 / 128px 128px';
           const source = document.querySelector(\(query));
           source.dataset.qaFloatingTest = 'true';
           const hideContent = document.createElement('style'); hideContent.id = 'floating-pixel-style';
           hideContent.textContent = '[data-qa-floating-test] > * { visibility:hidden!important }';
-          document.querySelector('[data-market-list-content]').append(fixture);
+          Array.from(document.querySelectorAll('[data-market-list-content]')).find(element => element.getBoundingClientRect().width > 0).append(fixture);
           document.body.append(hideContent);
           window.radarSurfaceFixture = { source, style:source.style.cssText, backdrop:fixture.style.background };
           return source.getBoundingClientRect().toJSON();
@@ -1706,6 +1750,24 @@ final class RuleEditorUITests: BackgroundTestCase {
         XCTAssertGreaterThan(backdropResponse, 0.1, "Untinted glass must retain the backdrop's colors instead of covering them with a solid fill.")
         try FileManager.default.createDirectory(at: project.appendingPathComponent(".build/ui-qa"), withIntermediateDirectories: true)
         try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: project.appendingPathComponent(".build/ui-qa/floating-blur-\(name)-\(theme).png"))
+    }
+
+    @MainActor
+    private func pixelDetail(_ bitmap: NSBitmapImageRep, rect: CGRect, view: WKWebView) throws -> Double {
+        let scaleX = CGFloat(bitmap.pixelsWide) / view.bounds.width, scaleY = CGFloat(bitmap.pixelsHigh) / view.bounds.height
+        func brightness(_ x: CGFloat, _ y: CGFloat) throws -> Double {
+            let color = try XCTUnwrap(bitmap.colorAt(x: Int(x * scaleX), y: Int(y * scaleY))?.usingColorSpace(.sRGB))
+            return (color.redComponent + color.greenComponent + color.blueComponent) / 3
+        }
+        var difference = 0.0, count = 0
+        for y in stride(from: rect.minY, to: rect.maxY - 2, by: 4) {
+            for x in stride(from: rect.minX, to: rect.maxX - 2, by: 4) {
+                let center = try brightness(x, y)
+                difference += abs(center - (try brightness(x + 2, y))) + abs(center - (try brightness(x, y + 2)))
+                count += 2
+            }
+        }
+        return difference / Double(count)
     }
 
     @MainActor
