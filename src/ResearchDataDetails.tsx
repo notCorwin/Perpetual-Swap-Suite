@@ -1,5 +1,6 @@
 import { memo, useMemo, useState } from 'react'
 import { ChevronRight } from 'lucide-react'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
@@ -8,6 +9,18 @@ import { researchSize, researchTime, type DataManifest, type DataPlan, type Rese
 
 const PAGE_SIZE = 50
 const integer = (value: number) => value.toLocaleString('en-US')
+
+// Archive preparation can produce thousands of provenance warnings. Keep every
+// warning accessible without laying out the entire archive history on each click.
+export const ResearchWarnings = memo(function ResearchWarnings({ warnings }: { warnings: string[] }) {
+  const [page, setPage] = useState(0)
+  if (!warnings.length) return null
+  return <section aria-label="Data warnings" className="flex flex-col gap-2">
+    <h3 className="font-semibold">Data warnings ({integer(warnings.length)})</h3>
+    <DataPagination count={warnings.length} page={page} onPageChange={setPage} label="warnings" />
+    {warnings.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE).map((warning, index) => <Alert key={page * PAGE_SIZE + index} variant="warning"><AlertDescription>{warning}</AlertDescription></Alert>)}
+  </section>
+})
 
 function DataPagination({ count, page, onPageChange, label, context = label }: { count: number; page: number; onPageChange: (page: number) => void; label: string; context?: string }) {
   if (count <= PAGE_SIZE) return null

@@ -842,6 +842,58 @@ final class RuleEditorUITests: BackgroundTestCase {
     }
 
     @MainActor
+    func testFrozenResearchWarningsStayPagedAndInteractiveAfterPreparation() async throws {
+        guard ProcessInfo.processInfo.environment["RADAR_UI_TESTS"] == "1" else { throw XCTSkip("Run after building the Web renderer.") }
+        let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist"), marketCount: 8), configuration = uiConfiguration()
+        let directory = bridge.directory.appendingPathComponent("Research"), store = try ResearchStore(directory: directory)
+        let spec = try ResearchFixture.spec(), plan = ResearchFixture.plan(spec)
+        var manifest = DataManifest(planID: plan.id, from: plan.from, through: plan.through, instruments: plan.instruments, warnings: [], unknownInstruments: [])
+        manifest.warnings = (0..<4445).map { "Archive warning \($0): base-currency volume for 43200 minute candles was converted using verified contract metadata. Quote-currency volume is missing; affected VWAP inputs remain Unknown. OHLC prices were imported." }
+        manifest.sources = (0..<13209).map { index in
+            ResearchSource(id: "source-\(index)", instrument: ResearchFixture.instrument.id, kind: "candle", from: plan.from, through: plan.through, url: "https://www.okx.com/fixture/\(index)", filename: "archive-\(index).zip", archive: true)
+        }
+        let study = ResearchStudy(spec: spec, planID: plan.id, manifestID: manifest.id)
+        try store.put(plan.id, kind: "plan", plan)
+        try store.put(manifest.id, kind: "manifest", manifest)
+        try store.put(study.id, kind: "study", study)
+        try store.put("checkpoint:\(study.id)", kind: "checkpoint", Checkpoint(studyID: study.id, phase: "ready"))
+        bridge.research = try ResearchController(directory: directory, transport: ResearchFixtureTransport())
+        bridge.researchJobOverride = ["id": "prepared", "phase": "ready", "resultID": study.id, "completed": 1, "total": 1, "message": "Dataset frozen and ready to run.", "error": ""]
+        configuration.userContentController.addScriptMessageHandler(bridge, contentWorld: .page, name: "radar")
+        configuration.setURLSchemeHandler(bridge, forURLScheme: "radar")
+        let window = BackgroundTestWindow(contentRect: NSRect(x: 0, y: 0, width: 1440, height: 900), styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        let view = WKWebView(frame: .zero, configuration: configuration)
+        window.contentView = view; present(window)
+        defer { view.stopLoading(); window.orderOut(nil); configuration.userContentController.removeScriptMessageHandler(forName: "radar", contentWorld: .page); bridge.cleanUp() }
+        view.load(URLRequest(url: URL(string: "radar://app/index.html")!))
+        try await showAllMarkets(view, count: 8)
+        try await click(view, "Perpetual Swap Radar")
+        try await click(view, "Data coverage")
+        try await wait(view, "document.querySelector('[aria-label=\"Data warnings\"]')?.innerText.includes('Data warnings (4,445)')")
+        try await wait(view, "document.querySelectorAll('[aria-label=\"Data warnings\"] [role=alert]').length === 50")
+        try await click(view, "Last warnings")
+        try await wait(view, "document.querySelectorAll('[aria-label=\"Data warnings\"] [role=alert]').length === 45 && document.querySelector('[aria-label=\"Data warnings\"]').innerText.includes('Archive warning 4444:')")
+        try await click(view, "First warnings"); try await click(view, "Next warnings")
+        try await wait(view, "document.querySelector('[aria-label=\"Data warnings\"] [role=alert]').innerText.includes('Archive warning 50:')")
+        for label in ["Configure", "Data coverage", "Studies & cache", "Data coverage", "Perpetual Swap Research", "Perpetual Swap Radar"] {
+            let elapsed = try await view.callAsyncJavaScript("""
+                const start = performance.now();
+                const button = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === label && b.getBoundingClientRect().height > 0);
+                if (!button || button.disabled) throw new Error('Missing enabled control: ' + label);
+                button.click();
+                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                return performance.now() - start;
+                """, arguments: ["label": label], in: nil, contentWorld: .page) as? Double
+            print("Frozen dataset \(label) interaction: \(elapsed ?? -1)ms")
+            XCTAssertLessThan(try XCTUnwrap(elapsed), 500, "Prepared archive warnings must not stall ordinary clicks.")
+        }
+        try await wait(view, "document.querySelector('[data-research]')?.getBoundingClientRect().height > 0 && Array.from(document.querySelectorAll('button')).some(b => b.textContent.trim() === 'Run Study' && !b.disabled)")
+        let rows = try await js(view, "document.querySelectorAll('[aria-label=\"Data warnings\"] [role=alert]').length") as? Int
+        XCTAssertEqual(rows, 50)
+    }
+
+    @MainActor
     func testResearchReportSwitchIgnoresLateEventsFromThePreviousStudy() async throws {
         let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist"), marketCount: 8), configuration = uiConfiguration()

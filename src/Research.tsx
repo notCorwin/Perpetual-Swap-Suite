@@ -22,7 +22,7 @@ import { useSuite } from '@/use-suite'
 import { sameStrategyVersion, suiteSpec, type StrategyProfile } from '@/suite-types'
 import { ResearchChart } from '@/ResearchChart'
 import { ResearchTask } from '@/ResearchTask'
-import { ResearchInputDetails, ResearchSources } from '@/ResearchDataDetails'
+import { ResearchInputDetails, ResearchSources, ResearchWarnings } from '@/ResearchDataDetails'
 import { parseFilterConfig, type FilterTrace } from '@/rule-engine'
 import { keepSnapshotValue } from '@/market-snapshot'
 import { requestResearch, researchDateRange, researchPercent, researchSize, researchTime, RESEARCH_HORIZONS, type DataManifest, type DataPlan, type ResearchEvent, type ResearchInputs, type ResearchJob, type ResearchResponse, type ResearchStudy, type ResearchSummary, type StudyReport, type StudySpec } from '@/research-types'
@@ -304,7 +304,7 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
           </>}
           {manifest && <section className="flex flex-col gap-2 rounded-lg border p-3"><h2 className="font-semibold">Frozen dataset</h2><p className="break-all text-xs text-muted-foreground">Data digest: {manifest.digest} · {manifest.engine} · {manifest.parser}</p><p className="text-sm">{manifest.instruments.length} sample instruments · {(manifest.referenceInstruments ?? []).length} reference instruments · {manifest.unknownInstruments.length} unverified or ineligible instruments excluded</p><p className="text-xs text-muted-foreground">BTC reference data informs rules without adding research samples. This experiment keeps its original rules and inputs when newer data is cached.</p>{study && !report && <Button className="w-fit" disabled={busy} onClick={() => void perform(() => requestResearch({ action: 'run', studyID: study.id }))}><Play data-icon="inline-start" aria-hidden="true" />Run Study</Button>}</section>}
           {(manifest || plan) && <ResearchInputDetails key={(manifest ?? plan)!.id} data={(manifest ?? plan)!} frozen={Boolean(manifest)} />}
-          {(manifest?.warnings ?? plan?.warnings ?? []).map(warning => <Alert key={warning} variant="warning"><AlertDescription>{warning}</AlertDescription></Alert>)}
+          {(manifest || plan) && <ResearchWarnings key={'warnings:' + (manifest ?? plan)!.id} warnings={(manifest ?? plan)!.warnings} />}
           <ExcludedSpreadConditions spec={plan?.spec ?? study?.spec} />
           {(manifest?.unknownInstruments ?? plan?.unknownInstruments ?? []).length > 0 && <details><summary>Unverified or ineligible historical instruments</summary><p className="mt-2 break-words text-xs text-muted-foreground">{(manifest?.unknownInstruments ?? plan?.unknownInstruments)?.join(', ')}</p></details>}
         </>}

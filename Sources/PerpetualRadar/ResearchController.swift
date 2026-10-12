@@ -294,6 +294,7 @@ final class ResearchController {
     private let store: ResearchStore
     private let worker: ResearchWorker
     private let reader: ResearchReader
+    private let library: ResearchLibrary
     private let exportDestination: (@MainActor (String, NSWindow?) async -> URL?)?
     private var task: Task<Void, Never>?
     private var activeStudyID: String?
@@ -305,6 +306,7 @@ final class ResearchController {
         self.exportDestination = exportDestination
         store = try ResearchStore(directory: directory); worker = ResearchWorker(directory: directory, transport: transport, radarURL: radarURL)
         reader = ResearchReader(directory: directory)
+        library = ResearchLibrary(directory: directory)
     }
     private func begin(_ phase: String, studyID: String? = nil, persist: () throws -> Void = {}) throws -> String {
         guard task == nil else { throw FilterError("Pause or cancel the current research task first.") }
@@ -454,19 +456,14 @@ final class ResearchController {
             return ["jobID": try study.manifestID == nil ? prepare(planID: study.planID, resumeID: id) : run(studyID: id)]
         case "pause", "cancel": try await stop(cancel: action == "cancel"); return ["ok": true]
         case "planDetail":
-            guard let id = request["planID"] as? String, let saved = try store.get(id, as: DataPlan.self) else { throw FilterError("Data plan not found.") }
-            let plan = try saved.excludingSpread()
-            return ["plan": try snapshot(plan), "estimatedBytes": plan.estimatedBytes]
+            guard let id = request["planID"] as? String else { throw FilterError("Data plan not found.") }
+            return try await library.plan(id)
         case "study":
-            guard let id = request["studyID"] as? String, let study = try store.get(id, as: ResearchStudy.self) else { throw FilterError("Study not found.") }
-            let report = try store.get("report:\(id)", as: StudyReport.self)
-            let manifest = try study.manifestID.flatMap { try store.get($0, as: DataManifest.self) }
-            let savedPlan = try store.get(study.planID, as: DataPlan.self)
-            let plan = try study.manifestID == nil ? savedPlan?.excludingSpread() : savedPlan
-            return ["study": try snapshot(study), "report": try report.map(snapshot) ?? NSNull(), "manifest": try manifest.map(snapshot) ?? NSNull(), "plan": try plan.map(snapshot) ?? NSNull(), "estimatedBytes": plan?.estimatedBytes ?? 0]
+            guard let id = request["studyID"] as? String else { throw FilterError("Study not found.") }
+            return try await library.study(id)
         case "events":
             guard let id = request["studyID"] as? String else { throw FilterError("Choose a study.") }
-            return ["events": try snapshot(store.events(id, offset: request["offset"] as? Int ?? 0)), "count": try store.count("SELECT COUNT(*) FROM research_events WHERE study=?", [id])]
+            return try await library.events(id, offset: request["offset"] as? Int ?? 0)
         case "chart":
             guard let id = request["eventID"] as? String else { throw FilterError("Choose an event.") }
             let chart = try await reader.chart(eventID: id, endingAt: (request["endHour"] as? NSNumber)?.int64Value)
@@ -516,18 +513,17 @@ final class ResearchController {
             guard !isBusy else { throw FilterError("Stop research before clearing unreferenced cache.") }
             return ["bytesRemoved": try store.cleanCache()]
         case "inventory":
-            var studies: [[String: Any]] = []
-            for study in try store.objects("study", as: ResearchStudy.self) where ["filter", "score", "comparison"].contains(study.spec.kind) && (study.spec.strategyPhase == nil || study.spec.strategyPhase == "bullishSetup") {
-                var item = try snapshot(study) as! [String: Any]
-                let checkpoint = try store.get("checkpoint:\(study.id)", as: Checkpoint.self)
-                item["phase"] = activeStudyID == study.id && isBusy ? status?.phase ?? "running" : ["running", "preparing", "planning"].contains(checkpoint?.phase ?? "") ? "paused" : checkpoint?.phase ?? "paused"
-                item["error"] = checkpoint?.error ?? ""
-                item["active"] = activeStudyID == study.id && isBusy
-                item["updatedAt"] = checkpoint?.updatedAt ?? study.createdAt
-                studies.append(item)
+            var result = try await library.inventory()
+            var studies = result["studies"] as! [[String: Any]]
+            // Read the live job only after the background query returns. A job
+            // can finish (or a new one start) while this request is suspended.
+            if isBusy, let index = studies.firstIndex(where: { $0["id"] as? String == activeStudyID }) {
+                studies[index]["phase"] = status?.phase ?? "running"
+                studies[index]["active"] = true
             }
-            return ["job": try status.map(snapshot) ?? NSNull(), "studies": studies, "cacheDirectory": store.directory.path,
-                "rawFiles": try store.count("SELECT COUNT(*) FROM research_objects WHERE kind='source'"), "cachedRows": try store.count("SELECT COUNT(*) FROM research_heads")]
+            result["studies"] = studies
+            result["job"] = try status.map(snapshot) ?? NSNull()
+            return result
         default: throw FilterError("Unknown research action.")
         }
     }
