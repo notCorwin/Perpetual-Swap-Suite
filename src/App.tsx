@@ -436,6 +436,19 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
 
   if (selected && active) return <MarketChart instId={selected} listOrder={signalChartOrder ?? listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} backLabel={signalChartOrder ? 'Signals' : 'Markets'} onBack={() => { setSelected(null); setSignalChartOrder(null) }} />
 
+  if (!ready) {
+    return (
+      <MarketListViewport>
+        <main className="flex min-h-[inherit] flex-col items-center justify-center">
+          <div className="flex flex-col items-center gap-4">
+            <p className="text-lg font-medium">{error || status}</p>
+            {error && <p className="text-sm text-muted-foreground">Check that the Monitor process is running</p>}
+          </div>
+        </main>
+      </MarketListViewport>
+    )
+  }
+
   return (
     <MarketListViewport>
     <main className="flex min-h-[inherit] flex-col">
