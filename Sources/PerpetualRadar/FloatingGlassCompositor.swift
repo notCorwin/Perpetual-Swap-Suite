@@ -57,10 +57,11 @@ final class FloatingGlassCompositor {
     private func observe(_ layer: CALayer) {
         let id = ObjectIdentifier(layer)
         guard observations[id] == nil else { return }
-        // WebKit commits its AppKit layer tree on the main thread. Observe
-        // changes instead of polling while a menu remains open and idle.
+        // WebKit also updates scrolling layers off the main thread. KVO runs
+        // on the mutating thread, so enqueue before touching compositor state.
+        // schedule() coalesces notifications without blocking WebKit's locks.
         let changed: @Sendable () -> Void = { [weak self] in
-            MainActor.assumeIsolated { self?.schedule() }
+            DispatchQueue.main.async { [weak self] in self?.schedule() }
         }
         observations[id] = [
             layer.observe(\.sublayers) { _, _ in changed() },
@@ -98,7 +99,9 @@ final class FloatingGlassCompositor {
             let id = ObjectIdentifier(backdrop)
             targets.insert(id)
             if hidden[id] == nil { hidden[id] = (backdrop, backdrop.isHidden) }
-            backdrop.isHidden = true
+            // Notifications are asynchronous, including our own mutations.
+            // Avoid generating another notification on an unchanged backdrop.
+            if !backdrop.isHidden { backdrop.isHidden = true }
 
             func addSource(_ source: CALayer) {
                 guard !source.isHidden, source.opacity > 0 else { return }

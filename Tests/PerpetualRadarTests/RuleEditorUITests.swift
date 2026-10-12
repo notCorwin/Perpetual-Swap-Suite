@@ -4,6 +4,22 @@ import ScreenCaptureKit
 import XCTest
 @testable import PerpetualRadar
 
+// Core Animation supports layer updates inside per-thread transactions. Model
+// WebKit's scrolling thread without handing an AppKit view to another executor.
+private final class BackgroundScrollingFixture: @unchecked Sendable {
+    let layer = CALayer()
+
+    func scroll() -> Bool {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        for offset in 1...128 {
+            layer.bounds.origin.y = CGFloat(offset)
+            layer.position.y = CGFloat(offset)
+        }
+        CATransaction.commit()
+        return Thread.isMainThread
+    }
+}
+
 // Exercises the actual packaged-origin WebKit renderer and promise bridge with
 // native compile/evaluation/persistence and a deterministic 500-market feed.
 @MainActor
@@ -1116,6 +1132,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await showAllMarkets(view, count: 48)
         try await click(view, "Settings")
         try await wait(view, "document.querySelector('#window-blur [role=slider]')?.getAttribute('aria-valuenow') === '64' && document.querySelector('#floating-blur [role=slider]')?.getAttribute('aria-valuenow') === '64'")
+        try await exerciseBackgroundScrollingLayers(view)
         func slide(_ id: String, _ key: String) async throws {
             _ = try await js(view, "(() => { const thumb = document.querySelector('#\(id) [role=slider]'); thumb.focus(); thumb.dispatchEvent(new KeyboardEvent('keydown', {key:'\(key)',bubbles:true,cancelable:true})); return true; })()")
         }
@@ -1750,6 +1767,20 @@ final class RuleEditorUITests: BackgroundTestCase {
         XCTAssertGreaterThan(backdropResponse, 0.1, "Untinted glass must retain the backdrop's colors instead of covering them with a solid fill.")
         try FileManager.default.createDirectory(at: project.appendingPathComponent(".build/ui-qa"), withIntermediateDirectories: true)
         try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: project.appendingPathComponent(".build/ui-qa/floating-blur-\(name)-\(theme).png"))
+    }
+
+    @MainActor
+    private func exerciseBackgroundScrollingLayers(_ view: WKWebView) async throws {
+        let fixture = BackgroundScrollingFixture(), root = try XCTUnwrap(view.layer)
+        fixture.layer.bounds = CGRect(x: 0, y: 0, width: 100, height: 100)
+        root.addSublayer(fixture.layer)
+        defer { fixture.layer.removeFromSuperlayer() }
+        try await settleRendering(view)
+        let ranOnMainThread = await Task.detached(priority: .userInitiated) { fixture.scroll() }.value
+        XCTAssertFalse(ranOnMainThread, "The regression must reproduce WebKit's background scrolling callbacks.")
+        try await settleRendering(view)
+        // The existing slider, persistence and pixel assertions below verify
+        // that the app remains interactive and the material still renders.
     }
 
     @MainActor
