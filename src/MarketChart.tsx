@@ -543,7 +543,9 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
 
   useEffect(() => {
     const navigate = (event: KeyboardEvent) => {
-      if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.defaultPrevented) return
+      if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.defaultPrevented || event.isComposing || event.keyCode === 229) return
+      const target = event.target instanceof Element ? event.target : document.activeElement
+      if (target?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]')) return
       if (!(event.key === "ArrowUp" || event.key === "ArrowDown" || event.key === "ArrowLeft" || event.key === "ArrowRight")) return
       event.preventDefault()
       const id = chartNavigationTarget(listOrder, turnoverOrder, navigationId.current, event.key)

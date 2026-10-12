@@ -271,7 +271,10 @@ final class MonitorServiceTests: BackgroundTestCase {
             process.standardError = try FileHandle(forWritingTo: log)
             try process.run(); focus.track(process.processIdentifier); processes.append(process); return process
         }
-        func request(_ body: [String: Any]) async throws -> [String: Any] { try await MonitorIPC.request(body, name: name) }
+        func request(_ body: [String: Any], line: UInt = #line) async throws -> [String: Any] {
+            do { return try await MonitorIPC.request(body, name: name) }
+            catch { throw FilterError("Background lifecycle request at line \(line) (\(body.keys.sorted().joined(separator: ", "))): \(error)") }
+        }
         func wait(_ label: String, _ condition: () async throws -> Bool) async throws {
             for _ in 0..<200 { if (try? await condition()) == true { return }; try await Task.sleep(for: .milliseconds(50)) }
             let logs = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).filter { $0.pathExtension == "log" }.map { (try? String(contentsOf: $0, encoding: .utf8)) ?? "" }.joined(separator: "\n")

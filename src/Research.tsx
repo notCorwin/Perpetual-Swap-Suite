@@ -86,6 +86,7 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
   const [confirm, setConfirm] = useState<{ action: 'delete' | 'cleanCache'; studyID?: string } | null>(null)
   const [notice, setNotice] = useState('')
   const handledJob = useRef(''), selection = useRef(0), polling = useRef(false)
+  const selectedStudyID = useRef<string | null>(null), eventPage = useRef(0)
   const busy = pending || Boolean(job && ['planning', 'preparing', 'running'].includes(job.phase))
   // The picker and selected snapshot share the same revision-qualified ID.
   // Changing an option's ID after selection can clear Radix's native form value.
@@ -98,18 +99,27 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
     return latest && latest.revision !== profile.revision
   })
   const pageEvents = useCallback(async (id: string, start: number) => {
-    const result = await requestResearch({ action: 'events', studyID: id, offset: start })
-    setEvents(result.events ?? []); setEventCount(result.count ?? 0); setOffset(start)
-    return result.events ?? []
+    const epoch = selection.current, page = ++eventPage.current
+    const current = () => epoch === selection.current && page === eventPage.current && id === selectedStudyID.current
+    try {
+      const result = await requestResearch({ action: 'events', studyID: id, offset: start })
+      if (!current()) return null
+      setEvents(result.events ?? []); setEventCount(result.count ?? 0); setOffset(start)
+      return result.events ?? []
+    } catch (cause) { if (!current()) return null; throw cause }
   }, [])
   const selectStudy = useCallback(async (id: string) => {
     const epoch = ++selection.current
-    const result = await requestResearch({ action: 'study', studyID: id })
-    if (epoch !== selection.current) return
+    let result: ResearchResponse
+    try { result = await requestResearch({ action: 'study', studyID: id }) }
+    catch (cause) { if (epoch !== selection.current) return false; throw cause }
+    if (epoch !== selection.current) return false
+    selectedStudyID.current = result.study?.id ?? null
     setStudy(result.study ?? null); setReport(result.report ?? null); setManifest(result.manifest ?? null)
     setPlan(result.manifest ? null : result.plan ?? null); setEstimatedBytes(result.estimatedBytes ?? 0)
+    setEvents([]); setOffset(0); setEventCount(0); setEvent(null)
     if (result.report) await pageEvents(id, 0)
-    else { setEvents([]); setOffset(0); setEventCount(0) }
+    return epoch === selection.current
   }, [pageEvents])
   useEffect(() => {
     if (!active) return
@@ -125,13 +135,17 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
         const j = result.job, key = j?.id + ':' + j?.phase + ':' + j?.resultID
         if (j && key !== handledJob.current && ['planned', 'ready', 'completed', 'paused', 'failed', 'cancelled'].includes(j.phase)) {
           if (j.phase === 'planned' && j.resultID) {
+            const epoch = ++selection.current
             const detail = await requestResearch({ action: 'planDetail', planID: j.resultID })
             if (stopped) return
-            setPlan(detail.plan ?? null); setEstimatedBytes(detail.estimatedBytes ?? 0); setSourcePage(0); setStudy(null); setReport(null); setManifest(null); setTab('data')
+            if (epoch === selection.current) {
+              selectedStudyID.current = null
+              setPlan(detail.plan ?? null); setEstimatedBytes(detail.estimatedBytes ?? 0); setSourcePage(0); setStudy(null); setReport(null); setManifest(null); setEvents([]); setOffset(0); setEventCount(0); setEvent(null); setTab('data')
+            }
           } else if (j.resultID) {
-            await selectStudy(j.resultID)
+            const selected = await selectStudy(j.resultID)
             if (stopped) return
-            if (j.phase === 'completed') setTab('results')
+            if (selected && j.phase === 'completed') setTab('results')
           }
           if (j.error) setError(j.error)
           handledJob.current = key
@@ -159,17 +173,19 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
       instruments: instrumentText.split(/[\s,]+/).map(s => s.trim().toUpperCase()).filter(Boolean), ...researchDateRange(from, through),
       direction: 'Long', sampling: kind === 'score' ? 'hourly' : sampling, costs: allEmpty ? null : { entryFeeBps: Number(fees.entry), exitFeeBps: Number(fees.exit), slippageBps: Number(fees.slip) } }
     if (!spec.name) { document.getElementById('study-name')?.focus(); throw new Error('Give the study a name.') }
-    setPlan(null); setStudy(null); setReport(null); setManifest(null)
+    selection.current += 1; selectedStudyID.current = null
+    setPlan(null); setStudy(null); setReport(null); setManifest(null); setEvents([]); setOffset(0); setEventCount(0); setEvent(null)
     return requestResearch({ action: 'plan', spec, refresh })
   })
   const duplicate = (saved: ResearchStudy) => {
+    selection.current += 1; selectedStudyID.current = null
     seededStrategy.current = true
     const spec = saved.spec
     setSelectedProfiles(spec.strategySnapshots ?? [])
     setName(spec.name + ' copy'); setKind(spec.kind); setSampling(spec.sampling)
     setFrom(spec.from ? new Date(spec.from).toISOString().slice(0, 10) : ''); setThrough(new Date(spec.through - 1).toISOString().slice(0, 10))
     setInstrumentText(spec.instruments.join(', ')); setFees({ entry: spec.costs ? String(spec.costs.entryFeeBps) : '', exit: spec.costs ? String(spec.costs.exitFeeBps) : '', slip: spec.costs ? String(spec.costs.slippageBps) : '' })
-    setTab('configure'); setPlan(null); setReport(null); setStudy(null); setManifest(null)
+    setTab('configure'); setPlan(null); setReport(null); setStudy(null); setManifest(null); setEvents([]); setOffset(0); setEventCount(0); setEvent(null)
   }
   const navigateEvent = (step: number) => {
     if (!event || !study) return
@@ -178,7 +194,7 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
     else {
       const start = offset + (step > 0 ? 50 : -50)
       if (start < 0 || start >= eventCount) return
-      void perform(async () => { const rows = await pageEvents(study.id, start); setEvent(step > 0 ? rows[0] : rows.at(-1) ?? null) })
+      void perform(async () => { const rows = await pageEvents(study.id, start); if (rows) setEvent(step > 0 ? rows[0] ?? null : rows.at(-1) ?? null) })
     }
   }
   const coverage = manifest?.coverage ?? plan?.coverage ?? []
@@ -291,13 +307,13 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
       <TabsContent value="history" className="flex flex-col gap-4">
         <div className="flex items-center gap-3"><h2 className="flex-1 font-semibold">Saved experiments</h2><Button variant="outline" disabled={busy} onClick={() => void perform(() => requestResearch({ action: 'importCatalog' }))}>Import verified instrument catalog…</Button><Button variant="outline" disabled={busy} onClick={() => setConfirm({ action: 'cleanCache' })}><Trash2 data-icon="inline-start" aria-hidden="true" />Clear unreferenced cache…</Button></div>
         <p className="text-xs text-muted-foreground">{integer(cache.files)} raw sources · {integer(cache.rows)} cached rows · {cache.directory}</p>
-        <Table aria-label="Saved studies"><TableHeader><TableRow>{['Study', 'Created', 'State', 'Actions'].map(label => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader><TableBody>{studies.map(saved => <TableRow key={saved.id}><TableCell><div className="font-medium">{saved.spec.name}</div><div className="text-xs text-muted-foreground">{saved.spec.kind} · {saved.spec.rules.map(r => r.name).join(' / ')}</div></TableCell><TableCell>{researchTime(saved.createdAt)}</TableCell><TableCell><Badge variant="outline">{saved.phase}</Badge>{saved.error && <p className="mt-1 max-w-80 wrap-anywhere text-xs text-destructive">{saved.error}</p>}</TableCell><TableCell><div className="flex gap-2"><Button variant="ghost" size="sm" onClick={() => void perform(async () => { await selectStudy(saved.id); setTab(saved.phase === 'completed' ? 'results' : 'data') })}>Open</Button>{!['completed', 'cancelled'].includes(saved.phase) && <Button variant="outline" size="sm" disabled={busy} onClick={() => void perform(() => requestResearch({ action: 'resume', studyID: saved.id }))}>Resume</Button>}<Button variant="ghost" size="sm" disabled={busy} onClick={() => duplicate(saved)}>Copy configuration</Button><Button variant="ghost" size="sm" disabled={busy} onClick={() => setConfirm({ action: 'delete', studyID: saved.id })} aria-label={'Delete ' + saved.spec.name}><Trash2 data-icon="inline-start" aria-hidden="true" /></Button></div></TableCell></TableRow>)}</TableBody></Table>
+        <Table aria-label="Saved studies"><TableHeader><TableRow>{['Study', 'Created', 'State', 'Actions'].map(label => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader><TableBody>{studies.map(saved => <TableRow key={saved.id}><TableCell><div className="font-medium">{saved.spec.name}</div><div className="text-xs text-muted-foreground">{saved.spec.kind} · {saved.spec.rules.map(r => r.name).join(' / ')}</div></TableCell><TableCell>{researchTime(saved.createdAt)}</TableCell><TableCell><Badge variant="outline">{saved.phase}</Badge>{saved.error && <p className="mt-1 max-w-80 wrap-anywhere text-xs text-destructive">{saved.error}</p>}</TableCell><TableCell><div className="flex gap-2"><Button variant="ghost" size="sm" onClick={() => void perform(async () => { if (await selectStudy(saved.id)) setTab(saved.phase === 'completed' ? 'results' : 'data') })}>Open</Button>{!['completed', 'cancelled'].includes(saved.phase) && <Button variant="outline" size="sm" disabled={busy} onClick={() => void perform(() => requestResearch({ action: 'resume', studyID: saved.id }))}>Resume</Button>}<Button variant="ghost" size="sm" disabled={busy} onClick={() => duplicate(saved)}>Copy configuration</Button><Button variant="ghost" size="sm" disabled={busy} onClick={() => setConfirm({ action: 'delete', studyID: saved.id })} aria-label={'Delete ' + saved.spec.name}><Trash2 data-icon="inline-start" aria-hidden="true" /></Button></div></TableCell></TableRow>)}</TableBody></Table>
         {!studies.length && <Empty><EmptyHeader><EmptyTitle>No saved studies yet</EmptyTitle><EmptyDescription>Prepared datasets, checkpoints and completed experiments will appear here.</EmptyDescription></EmptyHeader></Empty>}
       </TabsContent>
     </Tabs>
     <Dialog open={active && Boolean(confirm)} onOpenChange={open => { if (!open) setConfirm(null) }}><DialogContent><DialogHeader><DialogTitle>{confirm?.action === 'delete' ? 'Delete this experiment?' : 'Clear unreferenced cache?'}</DialogTitle><DialogDescription>{confirm?.action === 'delete' ? 'Remove this study, its report and checkpoint. Downloaded data remains cached.' : 'Remove data that no saved experiment references. Pinned experiment inputs and results are retained.'}</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setConfirm(null)}>Keep</Button><Button variant="destructive" disabled={pending} onClick={() => void perform(async () => {
       if (!confirm) return
-      const result = await requestResearch(confirm); if (confirm.action === 'delete' && study?.id === confirm.studyID) { setStudy(null); setReport(null); setManifest(null) }
+      const result = await requestResearch(confirm); if (confirm.action === 'delete' && study?.id === confirm.studyID) { selection.current += 1; selectedStudyID.current = null; setStudy(null); setReport(null); setManifest(null); setEvents([]); setOffset(0); setEventCount(0); setEvent(null) }
       setNotice(confirm.action === 'cleanCache' ? researchSize(result.bytesRemoved ?? 0) + ' cleared. Pinned inputs were retained.' : 'Experiment deleted. Cached data was retained.'); setConfirm(null)
     })}>Remove</Button></DialogFooter></DialogContent></Dialog>
     <Dialog open={active && Boolean(event)} onOpenChange={open => { if (!open) setEvent(null) }}><DialogContent className="flex h-[min(calc(var(--market-list-layout-height)*0.94),80rem)] w-[min(calc(var(--market-list-layout-width)*0.94),100rem)] max-w-none scale-(--market-list-scale) flex-col sm:max-w-none">

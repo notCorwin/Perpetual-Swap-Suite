@@ -181,8 +181,9 @@ final class ResearchController {
         store = try ResearchStore(directory: directory); worker = ResearchWorker(directory: directory, transport: transport, radarURL: radarURL)
         reader = ResearchReader(directory: directory)
     }
-    private func begin(_ phase: String, studyID: String? = nil) throws -> String {
+    private func begin(_ phase: String, studyID: String? = nil, persist: () throws -> Void = {}) throws -> String {
         guard task == nil else { throw FilterError("Pause or cancel the current research task first.") }
+        try persist()
         activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep, reason: "Complete user-requested research while the window is minimized")
         let id = UUID().uuidString; status = .init(id: id, phase: phase); activeStudyID = studyID; onBusyChanged?(true); return id
     }
@@ -215,12 +216,13 @@ final class ResearchController {
         let spec = try spec.resolvingStrategyRules()
         try spec.validate()
         let study = try resumeID.flatMap { try store.get($0, as: ResearchStudy.self) } ?? ResearchStudy(spec: spec, planID: UUID().uuidString)
-        let id = try begin("planning", studyID: study.id)
-        var checkpoint = try store.get("checkpoint:\(study.id)", as: Checkpoint.self) ?? Checkpoint(studyID: study.id, phase: "planning")
-        checkpoint.phase = "planning"; checkpoint.refresh = refresh; checkpoint.error = nil
-        try store.database.transaction {
-            try store.put(study.id, kind: "study", study)
-            try store.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
+        let id = try begin("planning", studyID: study.id) {
+            var checkpoint = try store.get("checkpoint:\(study.id)", as: Checkpoint.self) ?? Checkpoint(studyID: study.id, phase: "planning")
+            checkpoint.phase = "planning"; checkpoint.refresh = refresh; checkpoint.error = nil
+            try store.database.transaction {
+                try store.put(study.id, kind: "study", study)
+                try store.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
+            }
         }
         task = Task.detached(priority: .background) { [self, worker] in
             do {
@@ -249,10 +251,11 @@ final class ResearchController {
         var study = try resumeID.flatMap { try store.get($0, as: ResearchStudy.self) } ?? existing ?? ResearchStudy(spec: plan.spec, planID: planID)
         study.spec = plan.spec
         guard (try store.get("checkpoint:\(study.id)", as: Checkpoint.self))?.phase != "cancelled" else { throw FilterError("This task was cancelled. Copy its configuration to start a new study.") }
-        let id = try begin("preparing", studyID: study.id)
-        try store.database.transaction {
-            try store.put(plan.id, kind: "plan", plan)
-            try store.put(study.id, kind: "study", study)
+        let id = try begin("preparing", studyID: study.id) {
+            try store.database.transaction {
+                try store.put(plan.id, kind: "plan", plan)
+                try store.put(study.id, kind: "study", study)
+            }
         }
         task = Task.detached(priority: .background) { [self, worker] in
             do {

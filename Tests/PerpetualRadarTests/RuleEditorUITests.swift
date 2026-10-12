@@ -52,6 +52,8 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
     var suiteEvaluationDelay: UInt64 = 0
     var suiteReadError: String?
     var researchReadError: String?
+    var holdNextResearchEvents = false
+    var heldResearchEventsReply: (() -> Void)?
     var researchJobOverride: [String: Any]?
     var research: ResearchController?
     var launchAtLogin = "disabled"
@@ -169,6 +171,11 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
             Task { do {
                 var result = try await research.handle(parameters)
                 if parameters["action"] as? String == "inventory", let researchJobOverride { result["job"] = researchJobOverride }
+                if parameters["action"] as? String == "events", holdNextResearchEvents {
+                    holdNextResearchEvents = false
+                    heldResearchEventsReply = { replyHandler(result, nil) }
+                    return
+                }
                 replyHandler(result, nil)
             } catch { replyHandler(nil, error.localizedDescription) } }; return
         }
@@ -722,6 +729,56 @@ final class RuleEditorUITests: BackgroundTestCase {
     }
 
     @MainActor
+    func testResearchReportSwitchIgnoresLateEventsFromThePreviousStudy() async throws {
+        let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist"), marketCount: 8), configuration = uiConfiguration()
+        let directory = bridge.directory.appendingPathComponent("Research"), store = try ResearchStore(directory: directory)
+        try ResearchFixture.seed(store)
+        let bars = ResearchFixture.bars()
+        try store.write(bars.map { .init(instrument: "ETH-USDT-SWAP", kind: "candle", timestamp: $0.hour, candle: $0, sources: ["fixture"]) })
+        for (instrument, name) in [("BTC-USDT-SWAP", "Bitcoin experiment"), ("ETH-USDT-SWAP", "Ether experiment")] {
+            var spec = try ResearchFixture.spec(); spec.name = name; spec.instruments = [instrument]
+            var plan = ResearchFixture.plan(spec); plan.instruments[0].id = instrument
+            let manifest = try store.freeze(plan), study = ResearchStudy(spec: spec, planID: plan.id, manifestID: manifest.id)
+            var checkpoint = Checkpoint(studyID: study.id, phase: "running")
+            try ResearchEngine.run(store: store, study: study, manifest: manifest, checkpoint: &checkpoint) { _, _, _ in }
+            let report = try store.report(study, manifest: manifest)
+            checkpoint.phase = "completed"
+            try store.put(study.id, kind: "study", study)
+            try store.put("report:\(study.id)", kind: "report", report)
+            try store.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
+        }
+        bridge.research = try ResearchController(directory: directory, transport: ResearchFixtureTransport(), radarURL: bridge.directory.appendingPathComponent("absent"))
+        configuration.userContentController.addScriptMessageHandler(bridge, contentWorld: .page, name: "radar")
+        configuration.setURLSchemeHandler(bridge, forURLScheme: "radar")
+        let window = BackgroundTestWindow(contentRect: NSRect(x: 0, y: 0, width: 1440, height: 900), styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        let view = WKWebView(frame: .zero, configuration: configuration)
+        window.contentView = view; present(window)
+        defer {
+            bridge.heldResearchEventsReply?(); bridge.heldResearchEventsReply = nil
+            view.stopLoading(); window.orderOut(nil); configuration.userContentController.removeScriptMessageHandler(forName: "radar", contentWorld: .page); bridge.cleanUp()
+        }
+        view.load(URLRequest(url: URL(string: "radar://app/index.html")!))
+        try await showAllMarkets(view, count: 8)
+        try await click(view, "Perpetual Swap Radar")
+        try await wait(view, "document.querySelector('[data-research]')?.getBoundingClientRect().height > 0")
+        try await click(view, "Studies & cache")
+        try await wait(view, "document.querySelector('table[aria-label=\"Saved studies\"] tbody').innerText.includes('Ether experiment')")
+        bridge.holdNextResearchEvents = true
+        _ = try await js(view, "Array.from(document.querySelectorAll('table[aria-label=\"Saved studies\"] tbody tr')).find(row => row.innerText.includes('Bitcoin experiment')).querySelector('button').click(); true")
+        let deadline = ContinuousClock.now + .seconds(5)
+        while bridge.heldResearchEventsReply == nil && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertNotNil(bridge.heldResearchEventsReply)
+        _ = try await js(view, "Array.from(document.querySelectorAll('table[aria-label=\"Saved studies\"] tbody tr')).find(row => row.innerText.includes('Ether experiment')).querySelector('button').click(); true")
+        try await wait(view, "document.querySelector('table[aria-label=\"Signal events\"] tbody')?.innerText.includes('ETH-USDT-SWAP')")
+        bridge.heldResearchEventsReply?(); bridge.heldResearchEventsReply = nil
+        try await Task.sleep(for: .milliseconds(100))
+        let instruments = try await js(view, "Array.from(document.querySelectorAll('table[aria-label=\"Signal events\"] tbody tr')).map(row => row.cells[0].innerText)") as? [String]
+        XCTAssertFalse(instruments?.isEmpty ?? true)
+        XCTAssertEqual(Set(instruments ?? []), ["ETH-USDT-SWAP"], "Late Bitcoin events must never appear under the Ether report's statistics or rule evidence.")
+    }
+
+    @MainActor
     func testNotificationSettingsPermissionRecoveryAndContractRoutingInNativeWebKit() async throws {
         guard ProcessInfo.processInfo.environment["RADAR_UI_TESTS"] == "1" else { throw XCTSkip("Run npm run test:ui after building the Web renderer.") }
         let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -1090,6 +1147,48 @@ final class RuleEditorUITests: BackgroundTestCase {
             try await wait(view, "document.querySelector('table[data-market-count]') !== null")
             try await click(view, "Universe rules"); try await click(view, "Universe rules")
         }
+    }
+
+    @MainActor
+    func testChartNavigationKeepsArrowKeysInAnalysisInputsAndDialogs() async throws {
+        let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist"), marketCount: 12), configuration = uiConfiguration()
+        bridge.includeChartBars = true
+        configuration.userContentController.addScriptMessageHandler(bridge, contentWorld: .page, name: "radar")
+        configuration.setURLSchemeHandler(bridge, forURLScheme: "radar")
+        let window = BackgroundTestWindow(contentRect: NSRect(x: 0, y: 0, width: 1440, height: 900), styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        let view = WKWebView(frame: .zero, configuration: configuration)
+        window.contentView = view; present(window)
+        defer { view.stopLoading(); window.orderOut(nil); configuration.userContentController.removeScriptMessageHandler(forName: "radar", contentWorld: .page); bridge.cleanUp() }
+        view.load(URLRequest(url: URL(string: "radar://app/index.html")!))
+        try await showAllMarkets(view, count: 12)
+        _ = try await js(view, "document.querySelector('tbody tr[tabindex]').click(); true")
+        try await wait(view, "document.querySelector('[data-chart-inst] svg[role=img]') !== null")
+        let contractValue = try await js(view, "document.querySelector('[data-chart-inst]').dataset.chartInst") as? String
+        let contract = try XCTUnwrap(contractValue)
+        try await click(view, "Analyze chart")
+        try await wait(view, "document.querySelector('[data-analysis-answer]') !== null && !document.querySelector('[aria-label=\"Ask a follow-up\"]').disabled")
+        try await input(view, "[aria-label=\"Ask a follow-up\"]", "Edit this question", textarea: true)
+        for key in ["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight"] {
+            let allowed = try await js(view, "(() => { const input = document.querySelector('[aria-label=\"Ask a follow-up\"]'); input.focus(); const event = new KeyboardEvent('keydown', {key:\(formulaQuote(key)),bubbles:true,cancelable:true}); input.dispatchEvent(event); return !event.defaultPrevented })()") as? Bool
+            XCTAssertEqual(allowed, true, "\(key) must remain available for editing a follow-up.")
+            guard allowed == true else { return }
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        let afterEditing = try await js(view, "document.querySelector('[data-chart-inst]').dataset.chartInst") as? String
+        XCTAssertEqual(afterEditing, contract)
+        try await click(view, "Configure analysis")
+        try await wait(view, "!document.querySelector('#analysis-model')?.disabled")
+        for selector in ["#analysis-model", "#gateway-api-key", "[aria-label=\"AI analysis settings\"]"] {
+            let allowed = try await js(view, "(() => { const input = document.querySelector(\(formulaQuote(selector))); const event = new KeyboardEvent('keydown', {key:'ArrowDown',bubbles:true,cancelable:true}); input.dispatchEvent(event); return !event.defaultPrevented })()") as? Bool
+            XCTAssertEqual(allowed, true, "A settings dialog must keep its keyboard input.")
+            guard allowed == true else { return }
+        }
+        try await click(view, "Cancel")
+        let composing = try await js(view, "(() => { document.activeElement.blur(); const event = new KeyboardEvent('keydown', {key:'ArrowDown',bubbles:true,cancelable:true,isComposing:true}); window.dispatchEvent(event); return !event.defaultPrevented })()") as? Bool
+        XCTAssertEqual(composing, true, "IME candidate navigation must not switch contracts.")
+        _ = try await js(view, "document.activeElement.blur(); window.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowDown',bubbles:true,cancelable:true})); true")
+        try await wait(view, "document.querySelector('[data-chart-inst]').dataset.chartInst !== \(formulaQuote(contract))")
     }
 
     @MainActor
