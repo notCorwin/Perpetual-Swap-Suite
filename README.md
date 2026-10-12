@@ -95,6 +95,11 @@ Click a symbol to open its chart. Hold the primary mouse button to inspect a can
 | Left | First contract in the current sorted search results |
 | Right | Highest-turnover contract matching the valid rule preview, regardless of search |
 | Copy chart | Copy an image with an opaque theme background |
+| Analyze chart / Analysis | Analyze the visible chart or reopen its conversation |
+
+Open **Settings → Configure analysis** to save a Vercel AI Gateway API Key in macOS Keychain and choose an image-capable model. The default is `openai/gpt-6.1-sol`. Chart analysis uses the OpenAI-compatible AI SDK provider with native URLSession networking.
+
+**Analyze chart** opens the right-hand panel and sends an opaque PNG of the visible chart with the fixed long-entry question. Answers stream in Chinese. Follow-ups reuse that snapshot and the conversation's model; **New analysis** captures the current chart and starts over. Each contract's conversation and draft stay in memory until the app exits. Switching contracts, leaving the chart, closing the panel, or pressing **Stop** cancels an active request; retries are manual.
 
 ### Monitor Bullish Setup
 

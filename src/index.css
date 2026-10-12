@@ -1,6 +1,8 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
+@source "../node_modules/streamdown/dist/*.js";
+@source "../node_modules/@streamdown/code/dist/*.js";
 
 @keyframes chart-capture-flash {
     0% { opacity: 0; }
@@ -59,6 +61,7 @@
     --color-state-accent: var(--state-accent);
     --color-state-secondary: var(--state-secondary);
     --color-state-warning: var(--state-warning);
+    --color-state-destructive: var(--state-destructive);
     --color-destructive-surface: var(--destructive-surface);
     --color-positive-surface: var(--positive-surface);
     --color-destructive-hover: var(--destructive-hover);
@@ -133,6 +136,7 @@
     --state-accent: color-mix(in srgb, var(--foreground) calc(var(--state-accent-default-opacity) * var(--surface-opacity-weight) * 100%), transparent);
     --state-secondary: color-mix(in srgb, var(--foreground) calc(var(--state-secondary-default-opacity) * var(--surface-opacity-weight) * 100%), transparent);
     --state-warning: color-mix(in srgb, var(--warning) calc(var(--state-warning-default-opacity) * var(--surface-opacity-weight) * 100%), transparent);
+    --state-destructive: color-mix(in srgb, var(--destructive) calc(var(--state-accent-default-opacity) * var(--surface-opacity-weight) * 100%), transparent);
     --warning-border: color-mix(in srgb, var(--warning) 45%, var(--border));
     --primary-hover: color-mix(in srgb, var(--primary), var(--foreground) 10%);
     --primary-surface: color-mix(in srgb, var(--primary) calc(var(--primary-opacity) * 100%), transparent);
@@ -152,6 +156,8 @@
     --chart-annotation: var(--control);
     --chart-rsi-area: color-mix(in srgb, var(--foreground) 5%, transparent);
     --market-list-design-width: 1600px;
+    --analysis-design-width: 1600px;
+    --analysis-panel-width: 400px;
     --market-list-scale: 1;
     --market-list-layout-width: 100vw;
     --market-list-layout-height: 100vh;
@@ -328,6 +334,9 @@
     @apply overflow-x-clip overscroll-none font-sans;
     }
 }
+
+[data-analysis-answer], [data-analysis-answer] * { user-select: text; }
+[data-analysis-answer] [data-slot="table-container"] { overflow-x: auto; }
 
 @media (prefers-reduced-motion: reduce) {
   [data-slot="button"], [data-slot="input"], [data-slot="toggle"],

@@ -29,6 +29,13 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
     var pulse = 0.0
     var includeChartBars = false
     var chartSnapshotRGB: [Double] = []
+    var analysisModel = "openai/gpt-6.1-sol"
+    var analysisKey = "fixture-key"
+    var analysisCaptureBounds: [[String: Any]] = []
+    var analysisPNG: [String: Any]?
+    var gatewayRequests: [[String: Any]] = []
+    var gatewayCancelled: [String] = []
+    var holdGateway = false
     weak var windowBackground: WindowBackgroundView?
     var windowTintRGB: [Double] = []
     var notificationAuthorization = "authorized"
@@ -90,6 +97,39 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
     }
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage, replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void) {
         let request = message.body as! [String: Any]
+        if let settings = request["analysisSettings"] as? [String: Any] {
+            if settings["action"] as? String == "save" {
+                analysisModel = settings["model"] as! String
+                if let key = settings["apiKey"] as? String, !key.isEmpty { analysisKey = key }
+            }
+            if settings["action"] as? String == "removeKey" { analysisKey = "" }
+            replyHandler(["model": analysisModel, "hasAPIKey": !analysisKey.isEmpty], nil); return
+        }
+        if let id = request["cancelGatewayFetch"] as? String {
+            gatewayCancelled.append(id); replyHandler(["ok": true], nil); return
+        }
+        if let text = request["copyText"] as? String {
+            NSPasteboard.general.clearContents(); replyHandler(["ok": NSPasteboard.general.setString(text, forType: .string)], nil); return
+        }
+        if let gateway = request["gatewayFetch"] as? [String: Any] {
+            let body = try! JSONSerialization.jsonObject(with: Data((gateway["body"] as! String).utf8)) as! [String: Any]
+            gatewayRequests.append(body)
+            let id = gateway["id"] as! String, hold = holdGateway
+            replyHandler(["status": 200, "headers": ["Content-Type": "text/event-stream"]], nil)
+            Task { @MainActor in
+                func delta(_ text: String, finish: Any = NSNull()) -> String {
+                    let value: [String: Any] = ["id": "fixture", "choices": [["index": 0, "delta": ["content": text], "finish_reason": finish]]]
+                    return "data: " + String(data: try! JSONSerialization.data(withJSONObject: value), encoding: .utf8)! + "\n\n"
+                }
+                let response = delta(hold ? "部分分析" : "## 判断\n\n等待确认，不追多。\n\n| 条件 | 确认 |\n| --- | --- |\n| 1h 收盘 | 站稳阻力 |") + (hold ? "" : delta("", finish: "stop") + "data: [DONE]\n\n")
+                let bytes = Array(response.utf8)
+                let chunks = stride(from: 0, to: bytes.count, by: 7).map { Data(bytes[$0..<min($0 + 7, bytes.count)]).base64EncodedString() }
+                message.webView?.callAsyncJavaScript(
+                    "for (const base64 of chunks) window.dispatchEvent(new CustomEvent('radar-gateway-stream', {detail:{id,type:'data',base64}})); if (!hold) window.dispatchEvent(new CustomEvent('radar-gateway-stream', {detail:{id,type:'end'}}));",
+                    arguments: ["chunks": chunks, "id": id, "hold": hold], in: nil, in: .page, completionHandler: nil)
+            }
+            return
+        }
         if let workspace = request["foregroundWorkspace"] as? String {
             Task {
                 if workspaceDelay > 0 { try? await Task.sleep(nanoseconds:workspaceDelay) }
@@ -185,6 +225,14 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
         }
         if let capture = request["captureChart"] as? [String: Any], let rgb = capture["backgroundRGB"] as? [Double] {
             chartSnapshotRGB = rgb
+            if capture["output"] as? String == "png", let view = message.webView {
+                analysisCaptureBounds.append(capture)
+                captureChartImage(in: view, bounds: capture) { image, error in
+                    guard let image, let png = chartSnapshotPNG(image) else { replyHandler(nil, error ?? "PNG capture failed"); return }
+                    self.analysisPNG = png; replyHandler(png, nil)
+                }
+                return
+            }
             replyHandler(["ok": true], nil)
             return
         }
@@ -976,6 +1024,11 @@ final class RuleEditorUITests: BackgroundTestCase {
             try await assertSharedSurfaces(view, opacity: 0.3)
             if appearance == .aqua { try await assertScaledSurfaces(view, window: window) }
             if capturePixels { try await assertFloatingPixels(view, project: project, theme: theme, selector: "[data-slot=\"popover-content\"]", name: "settings") }
+            try await click(view, "Configure analysis")
+            try await wait(view, "document.querySelector('[aria-label=\"AI analysis settings\"]') !== null && !document.querySelector('#analysis-model').disabled")
+            try await assertSharedSurfaces(view, opacity: 0.3)
+            if capturePixels { try await assertFloatingPixels(view, project: project, theme: theme, selector: "[aria-label=\"AI analysis settings\"]", name: "analysis-settings") }
+            try await click(view, "Cancel")
             try await dismissFloating(view)
 
             try await click(view, "Universe rules")
@@ -1023,10 +1076,118 @@ final class RuleEditorUITests: BackgroundTestCase {
             let image = try await view.takeSnapshot(configuration: nil)
             let opaque = try XCTUnwrap(opaqueChartSnapshot(image, backgroundRGB: bridge.chartSnapshotRGB))
             XCTAssertEqual(NSBitmapImageRep(data: opaque.tiffRepresentation!)?.colorAt(x: 0, y: 0)?.alphaComponent, 1)
+            if try await js(view, "Array.from(document.querySelectorAll('button')).some(x=>x.textContent.trim()==='Analysis')") as? Bool == true {
+                try await click(view, "Analysis"); try await click(view, "New analysis")
+            } else { try await click(view, "Analyze chart") }
+            try await wait(view, "document.querySelector('[data-analysis-answer] table') !== null && !document.querySelector('[aria-label=\"Ask a follow-up\"]').disabled")
+            try await assertSharedSurfaces(view, opacity: 0.3)
+            let analysisPreview = try await view.takeSnapshot(configuration: nil)
+            if let png = chartSnapshotPNG(try XCTUnwrap(opaqueChartSnapshot(analysisPreview, backgroundRGB: bridge.chartSnapshotRGB))),
+               let url = png["imageDataURL"] as? String, let bytes = Data(base64Encoded: String(url.dropFirst("data:image/png;base64,".count))) {
+                try bytes.write(to: project.appendingPathComponent(".build/analysis-\(theme).png"))
+            }
             try await click(view, "Markets")
             try await wait(view, "document.querySelector('table[data-market-count]') !== null")
             try await click(view, "Universe rules"); try await click(view, "Universe rules")
         }
+    }
+
+    @MainActor
+    func testChartAnalysisConfigurationSnapshotFollowUpsCancellationAndRestoration() async throws {
+        let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist"), marketCount: 12), configuration = uiConfiguration()
+        bridge.includeChartBars = true
+        configuration.userContentController.addScriptMessageHandler(bridge, contentWorld: .page, name: "radar")
+        configuration.setURLSchemeHandler(bridge, forURLScheme: "radar")
+        configuration.userContentController.addUserScript(WKUserScript(source: "window.radarAppearance = {frostedBackgroundEnabled:true,frostedBackgroundOpacity:0.3,nativeWindowBackground:true};", injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        let window = BackgroundTestWindow(contentRect: NSRect(x: 0, y: 0, width: 1440, height: 900), styleMask: [.titled, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
+        let view = WKWebView(frame: .zero, configuration: configuration), background = WindowBackgroundView(contentView: view)
+        bridge.windowBackground = background; window.contentView = background; present(window)
+        background.apply(enabled: true, opacity: 0.3, to: window)
+        defer { view.stopLoading(); window.orderOut(nil); configuration.userContentController.removeScriptMessageHandler(forName: "radar", contentWorld: .page); bridge.cleanUp() }
+        view.load(URLRequest(url: URL(string: "radar://app/index.html")!))
+        try await showAllMarkets(view, count: 12)
+        try await click(view, "Settings"); try await click(view, "Configure analysis")
+        try await wait(view, "document.querySelector('#analysis-model')?.value === 'openai/gpt-6.1-sol' && !document.querySelector('#analysis-model').disabled")
+        let passwordDraft = try await js(view, "document.querySelector('#gateway-api-key').value") as? String
+        XCTAssertEqual(passwordDraft, "")
+        try await click(view, "Remove key")
+        try await wait(view, "document.querySelector('[aria-label=\"AI analysis settings\"]')?.innerText.includes('Not configured.')")
+        try await click(view, "Cancel"); try await dismissFloating(view)
+        _ = try await js(view, "document.querySelector('tbody tr[tabindex]').click(); true")
+        try await wait(view, "document.querySelector('[data-chart-inst] svg[role=img]') !== null")
+        let contractResult = try await js(view, "document.querySelector('[data-chart-inst]').dataset.chartInst") as? String
+        let contract = try XCTUnwrap(contractResult)
+        try await click(view, "Analyze chart")
+        try await wait(view, "document.querySelector('[aria-label=\"Chart analysis\"]')?.innerText.includes('Configure a Gateway API Key')")
+        XCTAssertTrue(bridge.gatewayRequests.isEmpty)
+        try await click(view, "Configure analysis")
+        try await wait(view, "!document.querySelector('#gateway-api-key')?.disabled")
+        try await input(view, "#gateway-api-key", "fixture-replacement")
+        try await click(view, "Save")
+        try await wait(view, "document.querySelector('[role=dialog][data-state=open]') === null")
+        try await click(view, "Analyze chart")
+        try await wait(view, "document.querySelector('[data-analysis-answer]')?.innerText.includes('等待确认，不追多。') && !document.querySelector('[aria-label=\"Ask a follow-up\"]')?.disabled")
+        XCTAssertEqual(bridge.analysisKey, "fixture-replacement")
+        XCTAssertEqual(bridge.gatewayRequests.count, 1)
+        XCTAssertEqual(bridge.analysisCaptureBounds.count, 1)
+        let first = try XCTUnwrap(bridge.gatewayRequests.first), messages = try XCTUnwrap(first["messages"] as? [[String: Any]])
+        XCTAssertEqual(first["model"] as? String, "openai/gpt-6.1-sol")
+        XCTAssertTrue((messages[0]["content"] as? String)?.contains("未收盘") == true)
+        let contents = try XCTUnwrap(messages[1]["content"] as? [[String: Any]])
+        XCTAssertEqual(contents[0]["text"] as? String, "你推荐我追多吗？如果追多，限价单开在哪个位置合适？如果不追，应该等待什么确认？")
+        let imageURL = try XCTUnwrap((contents[1]["image_url"] as? [String: Any])?["url"] as? String)
+        XCTAssertTrue(imageURL.hasPrefix("data:image/png;base64,"))
+        let bounds = bridge.analysisCaptureBounds[0]
+        let panelResult = try await js(view, "document.querySelector('[aria-label=\"Chart analysis\"]').getBoundingClientRect().x") as? Double
+        let panelX = try XCTUnwrap(panelResult)
+        XCTAssertLessThanOrEqual((bounds["x"] as! Double) + (bounds["width"] as! Double), panelX + 1)
+        try await click(view, "Copy analysis")
+        try await wait(view, "document.querySelector('[aria-label=\"Copy analysis\"]')?.innerText.includes('Copied')")
+        XCTAssertTrue(NSPasteboard.general.string(forType: .string)?.contains("等待确认") == true)
+
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            window.appearance = NSAppearance(named: appearance)
+            try await wait(view, "matchMedia('(prefers-color-scheme: dark)').matches === \(appearance == .darkAqua)")
+            try await assertSharedSurfaces(view, opacity: 0.3)
+        }
+        window.setContentSize(NSSize(width: 800, height: 650))
+        try await wait(view, "innerWidth === 800 && Math.abs(document.querySelector('[aria-label=\"Chart analysis\"]').getBoundingClientRect().width - 200) < 1")
+        let scaledLayout = try await js(view, "document.documentElement.scrollWidth <= innerWidth + 1 && document.querySelector('[data-chart-workspace]').offsetWidth === 1600") as? Bool
+        XCTAssertEqual(scaledLayout, true)
+        window.setContentSize(NSSize(width: 1440, height: 900))
+        try await wait(view, "innerWidth === 1440")
+        try await input(view, "[aria-label=\"Ask a follow-up\"]", "确认条件是什么？", textarea: true)
+        _ = try await js(view, "(() => { const x=document.querySelector('[aria-label=\"Ask a follow-up\"]'); x.dispatchEvent(new CompositionEvent('compositionstart',{bubbles:true})); x.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,isComposing:true})); return true })()")
+        XCTAssertEqual(bridge.gatewayRequests.count, 1)
+        _ = try await js(view, "(() => { const x=document.querySelector('[aria-label=\"Ask a follow-up\"]'); x.dispatchEvent(new CompositionEvent('compositionend',{bubbles:true})); const e=new KeyboardEvent('keydown',{key:'Enter',shiftKey:true,bubbles:true,cancelable:true}); x.dispatchEvent(e); return !e.defaultPrevented })()")
+        XCTAssertEqual(bridge.gatewayRequests.count, 1)
+        _ = try await js(view, "document.querySelector('[aria-label=\"Ask a follow-up\"]').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true})); true")
+        try await wait(view, "document.querySelectorAll('[data-analysis-answer]').length === 2 && !document.querySelector('[aria-label=\"Ask a follow-up\"]').disabled")
+        XCTAssertEqual(bridge.gatewayRequests.count, 2)
+        XCTAssertEqual(bridge.analysisCaptureBounds.count, 1)
+        let follow = bridge.gatewayRequests[1]["messages"] as! [[String: Any]]
+        XCTAssertEqual(((follow[1]["content"] as! [[String: Any]])[1]["image_url"] as! [String: Any])["url"] as? String, imageURL)
+        XCTAssertEqual(follow.last?["content"] as? String, "确认条件是什么？")
+        try await input(view, "[aria-label=\"Ask a follow-up\"]", "保留草稿", textarea: true)
+        try await click(view, "Markets")
+        try await wait(view, "document.querySelector('table[data-market-count]') !== null")
+        _ = try await js(view, "Array.from(document.querySelectorAll('tbody tr[tabindex]')).find(x=>x.getAttribute('aria-label') === 'View \(contract) chart').click(); true")
+        try await wait(view, "document.querySelector('[aria-label=\"Ask a follow-up\"]')?.value === '保留草稿'")
+        bridge.holdGateway = true
+        try await click(view, "Send follow-up")
+        try await wait(view, "Array.from(document.querySelectorAll('[data-analysis-answer]')).some(x=>x.innerText.includes('部分分析'))")
+        try await click(view, "Close analysis")
+        try await wait(view, "document.querySelector('[aria-label=\"Chart analysis\"]') === null")
+        XCTAssertFalse(bridge.gatewayCancelled.isEmpty)
+        bridge.holdGateway = false
+        try await click(view, "Analysis"); try await click(view, "Retry")
+        try await wait(view, "document.querySelectorAll('[data-analysis-answer]').length === 3 && !document.querySelector('[aria-label=\"Ask a follow-up\"]').disabled")
+        XCTAssertEqual(bridge.gatewayRequests.count, 4)
+        XCTAssertEqual(bridge.analysisCaptureBounds.count, 1)
+        try await click(view, "New analysis")
+        try await wait(view, "document.querySelectorAll('[data-analysis-answer]').length === 1 && !document.querySelector('[aria-label=\"Ask a follow-up\"]').disabled")
+        XCTAssertEqual(bridge.analysisCaptureBounds.count, 2)
     }
 
     @MainActor

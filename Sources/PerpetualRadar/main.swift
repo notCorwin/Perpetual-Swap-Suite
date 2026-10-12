@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var webView: WKWebView!
     private var windowBackground: WindowBackgroundView!
     private let monitorClient = MonitorClient()
+    private let gatewayClient = GatewayClient()
     private var frostedBackgroundEnabled = MonitorRuntime.defaults.object(forKey: "LastWindowFrostedEnabled") as? Bool ?? true
     private var frostedBackgroundOpacity = MonitorRuntime.defaults.object(forKey: "LastWindowFrostedOpacity") as? Double ?? 0.3
     private var pendingNotificationInstId: String?
@@ -162,6 +163,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        gatewayClient.cancelAll()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         DistributedNotificationCenter.default().removeObserver(self)
         filterPreviewTask?.cancel(); filterExplainTask?.cancel()
@@ -299,6 +301,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     func windowDidExitFullScreen(_ notification: Notification) { applyWindowBackground() }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        gatewayClient.cancelAll()
         webView.reload()
     }
 
@@ -346,6 +349,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage,
                                replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void) {
         guard let parameters = message.body as? [String: Any] else { replyHandler(nil, "Invalid request"); return }
+        if let text = parameters["copyText"] as? String {
+            NSPasteboard.general.clearContents()
+            replyHandler(["ok": NSPasteboard.general.setString(text, forType: .string)], nil)
+            return
+        }
+        if let request = parameters["analysisSettings"] as? [String: Any] {
+            do { replyHandler(try gatewayClient.settings.handle(request), nil) }
+            catch { replyHandler(nil, error.localizedDescription) }
+            return
+        }
+        if let id = parameters["cancelGatewayFetch"] as? String {
+            gatewayClient.cancel(id); replyHandler(["ok": true], nil); return
+        }
+        if let request = parameters["gatewayFetch"] as? [String: Any] {
+            guard let id = request["id"] as? String, let body = request["body"] as? String else {
+                replyHandler(nil, "Invalid Gateway request"); return
+            }
+            do {
+                try gatewayClient.start(id: id, body: body, reply: replyHandler) { [weak webView] event in
+                    guard let webView else { return }
+                    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                        webView.callAsyncJavaScript(
+                            "window.dispatchEvent(new CustomEvent('radar-gateway-stream', {detail: event}));",
+                            arguments: ["event": event], in: nil, in: .page) { _ in continuation.resume() }
+                    }
+                }
+            } catch { replyHandler(nil, error.localizedDescription) }
+            return
+        }
         if let workspace = parameters["foregroundWorkspace"] as? String {
             let previous = monitorClient.workspace
             let mode = workspace == "research" ? "research" : "radar"
@@ -372,27 +404,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             return
         }
         if let bounds = parameters["captureChart"] as? [String: Any] {
-            guard let x = bounds["x"] as? Double, x.isFinite,
-                  let y = bounds["y"] as? Double, y.isFinite,
-                  let width = bounds["width"] as? Double, width.isFinite, width > 0,
-                  let height = bounds["height"] as? Double, height.isFinite, height > 0,
-                  let backgroundRGB = bounds["backgroundRGB"] as? [Double], backgroundRGB.count == 3,
-                  backgroundRGB.allSatisfy({ $0.isFinite && (0...1).contains($0) }) else {
-                replyHandler(nil, "Invalid chart bounds"); return
-            }
-            let rect = CGRect(x: x, y: y, width: width, height: height).intersection(webView.bounds)
-            guard !rect.isNull, rect.width > 0, rect.height > 0 else {
-                replyHandler(nil, "Chart is outside the window"); return
-            }
-            let configuration = WKSnapshotConfiguration()
-            configuration.rect = rect
-            configuration.afterScreenUpdates = true
-            webView.takeSnapshot(with: configuration) { image, error in
-                guard let image else {
-                    replyHandler(nil, error?.localizedDescription ?? "Could not capture chart screenshot"); return
-                }
-                guard let image = opaqueChartSnapshot(image, backgroundRGB: backgroundRGB) else {
-                    replyHandler(nil, "Could not prepare chart screenshot"); return
+            captureChartImage(in: webView, bounds: bounds) { image, error in
+                guard let image else { replyHandler(nil, error); return }
+                if bounds["output"] as? String == "png" {
+                    guard let png = chartSnapshotPNG(image) else { replyHandler(nil, "Could not encode chart screenshot"); return }
+                    replyHandler(png, nil); return
                 }
                 let pasteboard = NSPasteboard.general
                 pasteboard.clearContents()

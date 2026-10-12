@@ -38,6 +38,9 @@ import { FilterExplanation } from "@/FilterExplanation"
 import { keepSnapshotValue, reconcileMarketRows } from "@/market-snapshot"
 import { emptyFilterConfig, initialEditorState, initialLibraryPreferences, parseFilterConfig, previewResponseIsCurrent, newRuleID, type CompileResponse, type ExplainResponse, type FilterConfigV2, type FilterEditorState, type FilterLibraryPreferences, type FilterMetric, type FilterTruth, type NativeMarketRow } from "@/rule-engine"
 import { expressionTemplates, type ExpressionTemplate } from "@/filter-expression"
+import { AnalysisSettingsButton } from '@/AnalysisSettingsDialog'
+import type { AnalysisSettings, AnalysisSettingsRequest } from '@/chart-analysis'
+import type { ChartCaptureBounds, ChartImage } from '@/chart-capture'
 
 type WindowAppearance = { frostedBackgroundEnabled: boolean; frostedBackgroundOpacity: number }
 type NotificationSettings = { backgroundMonitoringEnabled: boolean; notificationsEnabled: boolean; notificationAuthorization: "notDetermined" | "denied" | "authorized" | "quiet" | "unavailable"; notificationError: string; backgroundMonitoringError: string; monitoringPaused: boolean; launchAtLogin: "enabled" | "disabled" | "requiresApproval" | "unavailable"; launchAtLoginError: string }
@@ -47,6 +50,11 @@ type PreviewSnapshot = Snapshot & { filterResults: Record<string, FilterTruth>; 
 type UnchangedSnapshot = { unchanged: true; revision: number; error: string }
 type SettingRequest = Partial<WindowAppearance> & { backgroundMonitoringEnabled?: boolean; notificationsEnabled?: boolean; monitoringPaused?: boolean; launchAtLogin?: boolean; notificationAction?: "refresh" | "requestPermission" | "test" | "openSettings"; filterLibraryPreferencesJSON?: string }
 type NativeBridge = {
+  postMessage(request: { analysisSettings: AnalysisSettingsRequest }): Promise<AnalysisSettings>
+  postMessage(request: { gatewayFetch: { id: string; body: string } }): Promise<{ status: number; headers: Record<string, string> }>
+  postMessage(request: { cancelGatewayFetch: string }): Promise<{ ok: boolean }>
+  postMessage(request: { copyText: string }): Promise<{ ok: boolean }>
+  postMessage(request: { captureChart: ChartCaptureBounds & { output: 'png' } }): Promise<ChartImage>
   postMessage(request: { suite: SuiteRequest }): Promise<SuiteResponse>
   postMessage(request: { research: ResearchRequest }): Promise<ResearchResponse>
   postMessage(request: { foregroundWorkspace: "radar" | "research" }): Promise<{ ok: boolean }>
@@ -441,6 +449,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
           <PopoverContent align="end">
             <PopoverHeader><PopoverTitle>Settings</PopoverTitle><PopoverDescription>Customize monitoring, notifications and the window background.</PopoverDescription></PopoverHeader>
             <FieldGroup>
+              <Field><FieldLabel>AI analysis</FieldLabel><AnalysisSettingsButton /><FieldDescription>Configure the Gateway API Key and chart analysis model.</FieldDescription></Field>
               <Field><FieldLabel>Run mode</FieldLabel><ToggleGroup type="single" variant="outline" disabled={notificationPending} value={notificationSettings.backgroundMonitoringEnabled ? "background" : "onDemand"} onValueChange={value => { if (value) void updateNotifications({ backgroundMonitoringEnabled: value === "background" }) }} aria-label="Run mode"><ToggleGroupItem value="onDemand">On-demand</ToggleGroupItem><ToggleGroupItem value="background">Background Monitoring</ToggleGroupItem></ToggleGroup><FieldDescription>Background Monitoring allows the helper to keep collecting after closing or quitting. Start at Login requires this mode.</FieldDescription></Field>
               <Field>
                 <Field orientation="horizontal">

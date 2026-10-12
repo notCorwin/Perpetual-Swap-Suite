@@ -1,8 +1,12 @@
-import { memo, startTransition, useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
+import { memo, startTransition, useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from "react"
 import { flushSync } from "react-dom"
 import { ArrowLeft, Camera, Radio } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { ChartAnalysisPanel } from '@/ChartAnalysisPanel'
+import { ChartWorkspaceViewport } from '@/ChartWorkspaceViewport'
+import { chartAnalysis } from '@/analysis-service'
+import { chartCaptureBounds } from '@/chart-capture'
 import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicY } from "@/chart-axis"
 import { chartCandleWidth, chartHourX, chartLayout, fitPriceTag, type ChartPanel as Panel } from "@/chart-layout"
 import { livePriceTag, scrollChartEnd, visibleChartBars } from "@/chart-viewport"
@@ -327,6 +331,9 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
 })
 
 export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack, backLabel = 'Markets' }: { instId: string; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void; onBack: () => void; backLabel?: string }) {
+  const analysis = useSyncExternalStore(chartAnalysis.subscribe, () => chartAnalysis.get(instId))
+  const [analysisOpen, setAnalysisOpen] = useState(() => chartAnalysis.get(instId) !== null)
+  useEffect(() => () => chartAnalysis.stop(instId), [instId])
   const [displayed, setDisplayed] = useState<{ id: string; data: ChartResponse } | null>(null)
   const [historyBars, setHistoryBars] = useState<{ id: string; bars: Bar[] } | null>(null)
   const [historyBoundary, setHistoryBoundary] = useState<{ id: string; oldestHour: number } | null>(null)
@@ -386,15 +393,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
     if (!rect || rect.width <= 0 || rect.height <= 0) return
     setCapture({ id: instId, status: "copying", error: "" })
     try {
-      // Resolve the theme token to sRGB so native clipboard images retain an opaque chart background.
-      const swatch = document.createElement("canvas")
-      swatch.width = swatch.height = 1
-      const context = swatch.getContext("2d")
-      if (!context) throw new Error("Could not prepare the chart background")
-      context.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--chart-snapshot-background")
-      context.fillRect(0, 0, 1, 1)
-      const backgroundRGB = Array.from(context.getImageData(0, 0, 1, 1).data).slice(0, 3).map(value => value / 255)
-      await window.webkit.messageHandlers.radar.postMessage({ captureChart: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, backgroundRGB } })
+      await window.webkit.messageHandlers.radar.postMessage({ captureChart: chartCaptureBounds(chartRef.current!) })
       setCapture({ id: instId, status: "flashing", error: "" })
     } catch (cause) {
       setCapture({ id: instId, status: "failed", error: cause instanceof Error ? cause.message : "Could not copy chart screenshot" })
@@ -598,15 +597,31 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
   const warmSurfaces = useMemo(() => new Map([...warmCharts].map(([id, data]) => [id, { ...data, bars: visibleChartBars(data.bars, data.bars.at(-1)?.hour ?? 0) }])), [warmCharts])
   const surfaces = new Map(warmSurfaces)
   if (bars.length && chart) surfaces.set(instId, { ...chart, bars, endHour: viewportEnd })
+  const analyzeChart = () => {
+    if (!bars.length || plotSize.width <= 0 || captureStatus === 'copying') return
+    flushSync(() => { setAnalysisOpen(true); setCapture({ id: instId, status: 'idle', error: '' }) })
+    void chartAnalysis.analyze(instId, async () => {
+      // Let the scaled workspace and chart's ResizeObserver settle before
+      // measuring the capture. Native snapshots include only this section.
+      await new Promise<void>(resolve => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())))
+      const element = chartRef.current
+      if (!element || element.dataset.chartInst !== instId) throw new Error('Chart changed before capture. Start a new analysis.')
+      const capturedAt = Date.now()
+      const rangeLabel = `${time(Number(element.dataset.chartStart))} – ${time(Number(element.dataset.chartEnd))}`
+      const image = await window.webkit.messageHandlers.radar.postMessage({ captureChart: { ...chartCaptureBounds(element), output: 'png' } })
+      return { ...image, capturedAt, rangeLabel }
+    })
+  }
   const chartDescription = `OKX perpetual · 1h · ${historicalEnd === null ? "Latest 96 hours" : `History through ${time(historicalEnd)}`} · Hold to inspect · Scroll chart for history · 24h turnover rank ${turnoverPosition + 1}/${turnoverOrder.length} · ↑/↓ list order · ← list first · → turnover first`
-  return <main className="flex h-svh min-h-0 flex-col overflow-hidden overscroll-none text-sm font-normal tabular-nums">
+  return <ChartWorkspaceViewport expanded={analysisOpen}><main className="flex h-full min-h-0 flex-col overflow-hidden overscroll-none text-sm font-normal tabular-nums">
     <header className="flex shrink-0 items-center gap-3 border-b px-4 py-2">
       <Button variant="ghost" size="sm" onClick={onBack}><ArrowLeft data-icon="inline-start" aria-hidden="true" />{backLabel}</Button>
       <div className="min-w-0 flex-1">
         <h1 className="truncate text-base font-semibold tracking-tight" title={instId}>{instId.replace(/-SWAP$/, "")}</h1>
         <p className="truncate text-xs text-muted-foreground" title={chartDescription}>{chartDescription}</p>
       </div>
-      <Button variant="outline" size="sm" disabled={!bars.length || plotSize.width <= 0 || captureStatus === "copying"} onClick={() => { void captureChart() }}><Camera data-icon="inline-start" aria-hidden="true" />{captureStatus === "copying" ? "Copying…" : "Copy chart"}</Button>
+      <Button variant="outline" size="sm" disabled={!bars.length || plotSize.width <= 0 || captureStatus === "copying" || analysis?.phase === 'capturing'} onClick={() => { void captureChart() }}><Camera data-icon="inline-start" aria-hidden="true" />{captureStatus === "copying" ? "Copying…" : "Copy chart"}</Button>
+      <Button variant="outline" size="sm" disabled={captureStatus === 'copying' || !analysis && (!bars.length || plotSize.width <= 0)} onClick={() => { if (analysis) setAnalysisOpen(true); else analyzeChart() }}>{analysis ? 'Analysis' : 'Analyze chart'}</Button>
       <span role="status" className="sr-only">{captureStatus === "flashing" ? "Chart copied to clipboard" : ""}</span>
       <Badge variant="secondary"><Radio data-icon="inline-start" aria-hidden="true" />{historicalEnd !== null ? "History" : active && !active.confirmed ? "Live candle" : "Hourly chart"}</Badge>
     </header>
@@ -616,7 +631,8 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
       setHistoryRetry(value => value + 1)
     }}>Retry</Button>}</div>}
     {captureError && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{captureError}</p>}
-    <section ref={chartRef} data-surface="panel" aria-label={`${instId} chart`} className="relative flex min-h-0 flex-1 flex-col bg-chart-surface">
+    <div className="flex min-h-0 flex-1">
+    <section ref={chartRef} data-chart-inst={instId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-surface="panel" aria-label={`${instId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-chart-surface">
       {active && <div className="grid shrink-0 grid-cols-[minmax(9rem,1.2fr)_repeat(4,minmax(0,1fr))] items-center border-b px-4 py-1.5 text-[length:var(--chart-text-size)]" aria-live="off">
         <p className="min-w-0 truncate border-r pr-3"><span className="font-medium">{instId.replace(/-SWAP$/, "")}</span> · <span className="text-muted-foreground">{inspected === null ? historicalEnd === null ? "Latest" : "Window end" : "Selected"}</span> {time(active.hour)}{active.confirmed ? "" : " · Live"}</p>
         {([ ["Open", active.open], ["High", active.high], ["Low", active.low], ["Close", active.close] ] as const).map(([label, value]) => <div key={label} className="min-w-0 px-3">
@@ -624,6 +640,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
         </div>)}
       </div>}
       <div ref={plotRef} className="relative min-h-0 flex-1 overflow-hidden" onWheel={event => {
+        if (analysis?.phase === 'capturing') return
         const horizontal = Math.abs(event.deltaX) > Math.abs(event.deltaY)
         const delta = horizontal ? event.deltaX : -event.deltaY
         wheelPixels.current += delta * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 240 : 1)
@@ -661,5 +678,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
       </div>
       {captureStatus === "flashing" && <div aria-hidden="true" data-surface="inherited" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
     </section>
-  </main>
+    {analysisOpen && <ChartAnalysisPanel instId={instId} session={analysis} ready={bars.length > 0 && plotSize.width > 0 && captureStatus !== 'copying'} onNew={analyzeChart} onClose={() => { chartAnalysis.stop(instId); setAnalysisOpen(false) }} />}
+    </div>
+  </main></ChartWorkspaceViewport>
 }
