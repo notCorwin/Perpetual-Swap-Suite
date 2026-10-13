@@ -13,6 +13,41 @@ final class SuiteTests: XCTestCase {
     private func profile(universe: String = "1 < 2", setup: String = "Close >= 100") throws -> StrategyProfile {
         .init(name: "Bullish Setup", universeJSON: try json(universe), phaseRules: ["bullishSetup": try json(setup)])
     }
+    @MainActor
+    func testCollectorStartupIsRecoveringRatherThanPaused() async throws {
+        let radar = try Radar(storeURL: directory().appendingPathComponent("radar.sqlite3"))
+        var response = try await radar.suiteRequest(["mode": "radar", "action": "inventory"])
+        XCTAssertEqual(response["paused"] as? Bool, false)
+        XCTAssertEqual(response["recovering"] as? Bool, true)
+
+        try radar.setMonitoringPaused(true)
+        response = try await radar.suiteRequest(["mode": "radar", "action": "inventory"])
+        XCTAssertEqual(response["paused"] as? Bool, true)
+        XCTAssertEqual(response["recovering"] as? Bool, false)
+    }
+    @MainActor
+    func testRadarEvaluationReturnsMaterializedSnapshotWithoutBlockingTheRequest() async throws {
+        let radar = try Radar(storeURL: directory().appendingPathComponent("radar.sqlite3"))
+        let now = Int64(Date().timeIntervalSince1970 * 1000), current = now / hourMS * hourMS
+        try radar.initializeMarkets(
+            instruments: [["instId": "BTC-USDT-SWAP", "state": "live", "instCategory": "1", "settleCcy": "USDT"]],
+            tickers: [["instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "1000", "ts": String(now)]])
+        radar.updateCandle("BTC-USDT-SWAP", [String(current), "100", "101", "99", "100", "1", "1", "100", "0"])
+
+        let first = try await radar.suiteRequest(["mode": "radar", "action": "evaluate"])
+        XCTAssertEqual(first["evaluationPending"] as? Bool, true)
+        XCTAssertEqual((first["confirmed"] as? [Any])?.count, 0)
+
+        var materialized: [String: Any] = [:]
+        for _ in 0..<100 {
+            try await Task.sleep(for: .milliseconds(10))
+            materialized = try await radar.suiteRequest(["mode": "radar", "action": "evaluate"])
+            if (materialized["confirmed"] as? [Any])?.count == 1 { break }
+        }
+        XCTAssertEqual((materialized["confirmed"] as? [Any])?.count, 1)
+        XCTAssertEqual((materialized["provisional"] as? [Any])?.count, 1)
+        XCTAssertEqual(materialized["evaluationPending"] as? Bool, false)
+    }
     func testBuiltInDefaultStrategyMatchesSpecificationAndCannotBeChangedOrDeleted() throws {
         let store = try Store(url: directory().appendingPathComponent("radar.sqlite3"))
         try store.initializeSharedSuiteLibrary()

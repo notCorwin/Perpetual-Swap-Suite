@@ -95,6 +95,7 @@ final class Radar {
     private var takerHistory: [String: [Int64: TakerVolume]] = [:]
     private var takerRequests: [String: ContinuousClock.Instant] = [:]
     private var takerFailures = Set<String>()
+    private var takerRequestFailures = Set<String>()
     private var hour = millis() / hourMS * hourMS
     private var updatedAt: Int64?
     private var revision = 0
@@ -112,6 +113,17 @@ final class Radar {
     }
     private var lastMonitorEvaluation: (key: ClosedEvaluationKey, at: ContinuousClock.Instant)?
     private var confirmedCache: (key: ClosedEvaluationKey, detail: String?, readings: [SuiteReading], at: ContinuousClock.Instant)?
+    private struct MaterializedSuite {
+        let profileID: String, profileRevision: Int
+        let closedKey: ClosedEvaluationKey
+        let sourceRevision: Int
+        let provisional: [SuiteReading], confirmed: [SuiteReading]
+        let historyProgress: FilterHistoryProgress
+        let createdAt: ContinuousClock.Instant
+    }
+    private var materializedSuite: MaterializedSuite?
+    private var materializationTask: Task<Void, Never>?
+    private var materializationToken = UUID()
     private func closedEvaluationKey(_ profile: StrategyProfile) throws -> ClosedEvaluationKey {
         ClosedEvaluationKey(profile: profile.id, revision: profile.revision, hour: hour, paused: monitoringPaused || !running,
                             universe: Set(rows.keys), ownChanges: store.totalChanges, otherChanges: try store.dataVersion())
@@ -201,6 +213,7 @@ final class Radar {
         guard paused != monitoringPaused else { return }
         try store.setPreference(String(paused), forKey: monitoringPausedKey)
         monitoringPaused = paused
+        invalidateMaterialization()
         touch()
     }
 
@@ -258,13 +271,32 @@ final class Radar {
             // chart payloads immediately so BUY markers cannot belong to the
             // previously active revision.
             for id in rows.keys { chartRevisions[id, default: 0] &+= 1 }
+            invalidateMaterialization()
             touch()
         }
         let profile: StrategyProfile?
         if action == "preview", let raw = request["profile"] {
             profile = try JSONDecoder().decode(StrategyProfile.self, from: SafeJSON.data(raw))
         } else { profile = try store.selectedSuiteProfile("radar") }
-        if ["evaluate", "preview"].contains(action), let profile {
+        if action == "evaluate", let profile, request["instrument"] == nil {
+            var hasCurrentMaterialization = false
+            if let cached = materializedSuite, cached.profileID == profile.id, cached.profileRevision == profile.revision,
+               cached.closedKey.hour == hour, cached.closedKey.paused == (monitoringPaused || !running) {
+                func object<T: Encodable>(_ value: T) throws -> Any { try JSONSerialization.jsonObject(with: Data(researchJSON(value).utf8)) }
+                response["provisional"] = try object(cached.provisional)
+                response["confirmed"] = try object(cached.confirmed)
+                response["revision"] = cached.sourceRevision
+                response["historyProgress"] = cached.historyProgress.snapshot
+                hasCurrentMaterialization = true
+            }
+            if !hasCurrentMaterialization { response["provisional"] = []; response["confirmed"] = [] }
+            let stale = materializedSuite.map {
+                $0.profileID != profile.id || $0.profileRevision != profile.revision ||
+                $0.sourceRevision != revision || $0.createdAt.duration(to: .now) >= .seconds(5)
+            } ?? true
+            if stale { scheduleMaterialization(profile) }
+            response["evaluationPending"] = stale || materializationTask != nil
+        } else if ["evaluate", "preview"].contains(action), let profile {
             let detail = request["instrument"] as? String
             // Drafts may share a revision with different rules; only the saved selection is cached.
             let key = action == "evaluate" ? try closedEvaluationKey(profile) : nil
@@ -288,8 +320,49 @@ final class Radar {
             response["rows"] = captured.response["rows"]; response["historyProgress"] = await historyLoader.progress().snapshot
             response["revision"] = captured.response["revision"]
         }
-        response["paused"] = monitoringPaused || !running
+        // A collector that is starting or reconnecting is not user-paused.
+        // Keep the states separate so the interface does not ask the user to
+        // resume something that is already recovering automatically.
+        response["paused"] = monitoringPaused
+        response["recovering"] = !monitoringPaused && !running
         return response
+    }
+
+    private func scheduleMaterialization(_ profile: StrategyProfile) {
+        if let task = materializationTask, !task.isCancelled { return }
+        let token = UUID(); materializationToken = token
+        materializationTask = Task { [weak self] in
+            guard let self else { return }
+            defer { if materializationToken == token { materializationTask = nil } }
+            do {
+                let hydration = try profile.hydration(), capturedHour = hour
+                for (id, closed) in try await monitorHistoryLoader.consumeUpdatedHistory(through: hour - hourMS) where rows[id] != nil {
+                    candles[id, default: [:]].merge(closed) { _, observed in observed }
+                    emaStates.removeValue(forKey: id); invalidateSnapshot(id); touch(id)
+                }
+                let key = try closedEvaluationKey(profile)
+                let captured = try await calculateSnapshot(rocPeriod: 9, marocPeriod: 9)
+                let prepared = try await prepareFilterMarkets(captured, filter: hydration, monitoring: true)
+                let provisional = try await suiteMonitorWorker.evaluate(prepared, profile: profile, forming: true, available: running && !monitoringPaused)
+                let confirmed = try await suiteMonitorWorker.evaluate(prepared, profile: profile, forming: false, available: running && !monitoringPaused)
+                try Task.checkCancellation()
+                guard token == materializationToken, capturedHour == hour,
+                      try store.selectedSuiteProfile("radar")?.id == profile.id,
+                      try store.selectedSuiteProfile("radar")?.revision == profile.revision else { return }
+                let progress = await monitorHistoryLoader.progress()
+                materializedSuite = .init(profileID: profile.id, profileRevision: profile.revision,
+                    closedKey: key, sourceRevision: captured.response["revision"] as? Int ?? revision,
+                    provisional: provisional, confirmed: confirmed, historyProgress: progress, createdAt: .now)
+            } catch {
+                if !Task.isCancelled { NSLog("Strategy materialization: %@", error.localizedDescription) }
+            }
+        }
+    }
+
+    private func invalidateMaterialization() {
+        materializationToken = UUID()
+        materializationTask?.cancel(); materializationTask = nil
+        materializedSuite = nil
     }
 
     private func strategyPreviewContexts(_ markets: [FilterMarketData], atClose: Bool) -> [FilterMarketData] {
@@ -345,19 +418,14 @@ final class Radar {
     func observeSavedStrategy() async throws -> FilterObservation? {
         guard running else { return nil }
         if let profile = try store.selectedSuiteProfile("radar") {
-            let hydration = try profile.hydration(), capturedHour = hour
-            for (id, closed) in try await monitorHistoryLoader.consumeUpdatedHistory(through: hour - hourMS) where rows[id] != nil {
-                candles[id, default: [:]].merge(closed) { _, observed in observed }; emaStates.removeValue(forKey: id); invalidateSnapshot(id); touch(id)
-            }
             let key = try closedEvaluationKey(profile)
             // Unchanged inputs produce identical readings; re-check periodically as a safety net.
             if let last = lastMonitorEvaluation, last.key == key, last.at.duration(to: .now) < .seconds(60) { return nil }
-            let captured = try await calculateSnapshot(rocPeriod: 9, marocPeriod: 9)
-            let prepared = try await prepareFilterMarkets(captured, filter: hydration, monitoring: true)
-            let readings = try await suiteMonitorWorker.evaluate(prepared, profile: profile, forming: false, available: !monitoringPaused)
-            guard capturedHour == hour, Set(prepared.map(\.id)) == Set(rows.keys),
-                  try store.selectedSuiteProfile("radar")?.revision == profile.revision, try store.selectedSuiteProfile("radar")?.id == profile.id else { return nil }
-            let observation = try strategyObservation(profile: profile, readings: readings)
+            scheduleMaterialization(profile)
+            await materializationTask?.value
+            guard let cached = materializedSuite, cached.profileID == profile.id,
+                  cached.profileRevision == profile.revision, cached.closedKey == key else { return nil }
+            let observation = try strategyObservation(profile: profile, readings: cached.confirmed)
             lastMonitorEvaluation = (key, .now)
             return observation
         }
@@ -416,13 +484,20 @@ final class Radar {
         tasks.forEach { $0.cancel() }; tasks.removeAll()
         historyTasks.forEach { $0.cancel() }; historyTasks.removeAll()
         sockets.forEach { $0.cancel(with: .goingAway, reason: nil) }; sockets.removeAll()
-        running = false; lastMonitorEvaluation = nil
+        running = false; lastMonitorEvaluation = nil; invalidateMaterialization()
         btcReceivedAt = nil
         Task { await historyLoader.cancel(); await monitorHistoryLoader.cancel(); await btcHistoryLoader.cancel(); await monitorBTCHistoryLoader.cancel() }
     }
 
     func resumeAfterWake() {
-        guard running else { return }
+        // A wake/network transition should not leave an in-flight bootstrap
+        // sleeping on its old retry window. Restart it immediately. Once the
+        // collector is live, recycle its sockets and repair any missed data.
+        guard running else {
+            tasks.forEach { $0.cancel() }; tasks.removeAll()
+            start()
+            return
+        }
         sockets.forEach { $0.cancel(with: .goingAway, reason: nil) }
         disconnectedChannels.formUnion(["tickers", "open-interest", "candle1H"])
         advanceHourIfNeeded()
@@ -458,8 +533,9 @@ final class Radar {
                 running = true
                 return
             } catch {
+                guard !Task.isCancelled else { return }
                 startupError = "OKX unavailable: \(error.localizedDescription). Retrying."
-                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                do { try await Task.sleep(for: .seconds(10)) } catch { return }
             }
         }
     }
@@ -483,7 +559,10 @@ final class Radar {
     private func pollTakerVolumes() async {
         while !Task.isCancelled {
             await refreshTakerVolumes()
-            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            // These are cumulative 1h statistics. Polling every contract every
+            // two seconds created a permanent request storm and could starve
+            // interactive suite evaluations and IPC replies.
+            do { try await Task.sleep(for: .seconds(30)) } catch { return }
         }
     }
 
@@ -498,9 +577,12 @@ final class Radar {
               takerRequests[response.id].map({ response.requestedAt >= $0 }) ?? true else { return }
         do {
             if let error = response.error { throw FilterError(error) }
+            let recovered = takerRequestFailures.remove(response.id) != nil
             try updateTakerVolumes(response.id, response.volumes, requestedAt: response.requestedAt)
+            if recovered { touch(response.id) }
         } catch {
             takerRequests[response.id] = response.requestedAt
+            takerRequestFailures.insert(response.id)
             if takerFailures.insert(response.id).inserted { touch(response.id) }
             NSLog("Taker volume %@: %@", response.id, error.localizedDescription)
         }
@@ -582,7 +664,7 @@ final class Radar {
                 liveHourQuotes.removeValue(forKey: id); closedHourQuotes.removeValue(forKey: id)
                 chartRevisions.removeValue(forKey: id); snapshotGenerations.removeValue(forKey: id)
                 cachedRows.removeValue(forKey: id); takerHistory.removeValue(forKey: id)
-                takerRequests.removeValue(forKey: id); takerFailures.remove(id)
+                takerRequests.removeValue(forKey: id); takerFailures.remove(id); takerRequestFailures.remove(id)
                 exhaustedCandleHistory.remove(id)
             }
             for id in added {
@@ -1153,7 +1235,12 @@ final class Radar {
     }
 
     private func snapshotMetadata() -> [String: Any] {
-        let error = !startupError.isEmpty ? startupError : pendingCandleWrites.values.contains(where: { !$0.isEmpty }) ? "Cannot persist completed candles; retrying the cache write." : !takerFailures.isEmpty ? "Some OKX current-hour taker volume is unavailable; retrying." : !failedPaths.isEmpty ? "Some OKX data is unavailable; retrying." :
+        // A newly listed or temporarily unsupported contract should remain
+        // Unknown without turning the whole application into an error state.
+        // Surface a global warning only when failures indicate a broad service
+        // problem; individual charts still report their exact missing source.
+        let broadTakerFailure = takerRequestFailures.count >= max(3, Int(ceil(Double(rows.count) * 0.1)))
+        let error = !startupError.isEmpty ? startupError : pendingCandleWrites.values.contains(where: { !$0.isEmpty }) ? "Cannot persist completed candles; retrying the cache write." : broadTakerFailure ? "Some OKX current-hour taker volume is unavailable; retrying." : !failedPaths.isEmpty ? "Some OKX data is unavailable; retrying." :
             !disconnectedChannels.isEmpty ? "OKX \(disconnectedChannels.sorted()[0]) disconnected; reconnecting." : ""
         return ["rows": [[String: Any]](), "updatedAt": updatedAt as Any? ?? NSNull(), "error": error, "revision": revision,
                 "btcReceivedAt": btcReceivedAt as Any? ?? NSNull(), "btcConnected": running && !disconnectedChannels.contains("candle1H"),

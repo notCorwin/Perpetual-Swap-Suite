@@ -27,7 +27,10 @@ export function useSuite(mode: SuiteMode, active: boolean) {
           if (!stopped && epoch === generation.current) { accept(value); setError(''); setReady(true) }
         }
       } catch (cause) { if (!stopped) setError(cause instanceof Error ? cause.message : 'Cannot read strategies.') }
-      if (!stopped) timer = window.setTimeout(refresh, 2000)
+      // Strategy evaluation traverses every contract and its dependency
+      // window. Market ticks keep their faster poll; hourly strategy signals
+      // do not need a second full-universe pass every two seconds.
+      if (!stopped) timer = window.setTimeout(refresh, 5000)
     }
     void refresh(); return () => { stopped = true; window.clearTimeout(timer) }
   }, [active, mode, accept])

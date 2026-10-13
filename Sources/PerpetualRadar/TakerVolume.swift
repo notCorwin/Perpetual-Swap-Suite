@@ -30,7 +30,7 @@ struct TakerVolumeResponse: Sendable {
 // wait for each other's network round trips or a slow/failed contract.
 struct TakerVolumePoller: Sendable {
     let transport: any FilterHistoryTransport
-    var concurrency = 32
+    var concurrency = 16
 
     func refresh(_ instruments: [String], receive: @escaping @Sendable (TakerVolumeResponse) async -> Void) async {
         await withTaskGroup(of: Void.self) { group in
@@ -41,7 +41,10 @@ struct TakerVolumePoller: Sendable {
                     do {
                         try Task.checkCancellation()
                         let rows = try await transport.fetch(path: "/rubik/stat/taker-volume-contract",
-                            parameters: ["instId": id, "period": "1H", "unit": "1", "limit": "100"])
+                            // Live polling needs only the forming hour and the
+                            // most recently closed hour. Historical hydration
+                            // has its own paginated loader.
+                            parameters: ["instId": id, "period": "1H", "unit": "1", "limit": "2"])
                         try Task.checkCancellation()
                         await receive(.init(id: id, requestedAt: requestedAt, volumes: rows.compactMap(TakerVolume.init)))
                     } catch {

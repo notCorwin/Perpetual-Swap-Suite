@@ -47,12 +47,13 @@ function SignalLane({ signals, markets, onChart, onExplain, onBrowseCharts }: { 
   </section>
 }
 
-export const RadarSignalBoard = memo(function RadarSignalBoard({ profile, signals, rows, paused, onChart, onExplain, onResearch, onBrowseCharts }: { profile: StrategyProfile; signals: RadarSignal[]; rows: NativeMarketRow[]; paused?: boolean; onChart: SignalChartAction; onExplain: (instrument: string) => void; onResearch: () => void; onBrowseCharts: () => void }) {
+export const RadarSignalBoard = memo(function RadarSignalBoard({ profile, signals, rows, paused, recovering, onChart, onExplain, onResearch, onBrowseCharts }: { profile: StrategyProfile; signals: RadarSignal[]; rows: NativeMarketRow[]; paused?: boolean; recovering?: boolean; onChart: SignalChartAction; onExplain: (instrument: string) => void; onResearch: () => void; onBrowseCharts: () => void }) {
   const markets = useMemo(() => new Map(rows.map(row => [row.instId, row])), [rows])
   const unknown = useMemo(() => signals.reduce((count, signal) => count + Number(signalIsUnknown(signal)), 0), [signals])
   return <section aria-label="Bullish Setup radar" className="flex flex-col gap-4 p-4" data-signal-board>
     <div className="flex items-center gap-3"><div className="flex min-w-0 flex-1 flex-col gap-1"><h2 className="font-semibold">Bullish Setup Radar</h2><p className="text-xs text-muted-foreground">{profile.name} · r{profile.revision} · Universe and Bullish Setup evaluated together</p></div><Button variant="outline" onClick={onResearch}><FlaskConical data-icon="inline-start" aria-hidden="true" />Test strategy</Button></div>
     {paused && <Alert variant="warning"><AlertDescription>Monitoring is paused. Resume in Settings to collect new signals.</AlertDescription></Alert>}
+    {!paused && recovering && <Alert variant="warning"><AlertDescription>Monitoring is reconnecting. New signals will resume automatically.</AlertDescription></Alert>}
     {(unknown > 0 || !signals.length) && <p role="status" className="text-xs text-muted-foreground">{!signals.length ? 'Waiting for strategy inputs. ' : ''}{unknown > 0 ? unknown + ' contracts have Unknown setup inputs. Inspect All markets for missing data.' : ''}</p>}
     <SignalLane key={profile.id} signals={signals} markets={markets} onChart={onChart} onExplain={onExplain} onBrowseCharts={onBrowseCharts} />
   </section>

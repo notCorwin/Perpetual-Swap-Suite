@@ -143,10 +143,9 @@ final class RuleHistoryTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(try canonical.candles(id, since: hours.last!, through: hours.first!).count, filter.requiredHours,
                        "Verified Research rows must publish immediately to the canonical Radar market store.")
         let transport = TestHistoryTransport(), loader = FilterHistoryLoader(url: url, transport: transport, requestDelay: 0)
-        let prepared = try await loader.prepare([market()], filter: filter)
+        _ = try await loader.importResearch(id, from: hours.last!, through: hours.first!)
         let edgeRows = try await loader.importResearch(id, from: older, through: hours.first!)
         XCTAssertEqual(edgeRows, 3, "Extending a cached range by one hour must import only that candle/stat/quote edge.")
-        await loader.schedule(prepared, filter: filter); await loader.waitUntilIdle()
         let hydrated = try await loader.prepare([market()], filter: filter)
         XCTAssertEqual(FilterEvaluator(market: hydrated[0], filter: filter).evaluate().result, .yes)
         let requests = await transport.count()
