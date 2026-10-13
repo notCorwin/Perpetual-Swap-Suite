@@ -40,6 +40,10 @@ test('filters and inline material values cannot bypass the centralized material'
   assert.deepEqual(check('<div className="shadow-floating" />'), [])
 })
 
+test('floating materials do not animate out of sync with the native blur mask', () => {
+  assert.match(css, /\[data-surface="floating"\]\s*\{[^}]*animation:\s*none;/s)
+})
+
 test('business code composes component states without replacing its material', () => {
   assert.match(check('import { Button } from "@/components/ui/button"; const x = <Button className="bg-card" />', 'src/Example.tsx').join('\n'), /Compose UI/)
   assert.match(check('import { Button } from "@/components/ui/button"; const x = <Button data-surface="inherited" />', 'src/Example.tsx').join('\n'), /Compose UI/)

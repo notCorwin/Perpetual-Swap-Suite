@@ -27,6 +27,7 @@ final class ResearchStore {
     private var frozenFunding: [String: [String: [ResearchRange]]] = [:]
     private var frozenWindows: [String: (range: ResearchRange, values: [ResearchDatum])] = [:]
     private var calculationTableAvailable = false
+    private var canonicalMarketStore: Store?
     init(directory: URL) throws {
         self.directory = directory
         database = try Store(url: directory.appendingPathComponent("research.sqlite3"))
@@ -71,6 +72,13 @@ final class ResearchStore {
             try database.execute("DELETE FROM research_objects WHERE kind='preparedSource'")
             try database.setPreference("4", forKey: "researchSchemaVersion")
         } }
+        // Radar's confirmed-hour database is the canonical latest market view.
+        // Do not create it from a standalone Research context, but publish to it
+        // whenever the application/monitor has already established the store.
+        let marketURL = directory.deletingLastPathComponent().appendingPathComponent("radar.sqlite3")
+        if marketURL != database.url, FileManager.default.fileExists(atPath: marketURL.path) {
+            canonicalMarketStore = try Store(url: marketURL)
+        }
     }
     func prepareCalculationIndexes() throws {
         // Building an index over a large cache belongs to the background
@@ -242,6 +250,10 @@ final class ResearchStore {
                 if datum.kind == "stat" || datum.kind == "quote" { prior[mergeKey] = datum }
             }
         }
+        // Commit the immutable revision first. If the canonical projection is
+        // temporarily locked, retrying this idempotent batch completes the
+        // projection without losing the verified Research revision.
+        try canonicalMarketStore?.saveMarketData(values)
     }
     func latest(_ instrument: String, kind: String, timestamp: Int64) throws -> ResearchDatum? {
         var json: String?

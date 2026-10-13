@@ -246,6 +246,20 @@ final class Store {
         }
     }
 
+    /// Publishes normalized Research inputs into Radar's canonical confirmed
+    /// market store. Research keeps its revision ledger separately for frozen
+    /// manifests; current market state has one authoritative representation.
+    func saveMarketData(_ values: [ResearchDatum]) throws {
+        guard !values.isEmpty else { return }
+        try transaction {
+            for value in values {
+                if let candle = value.candle, candle.confirmed { try save(value.instrument, candle) }
+                if let stat = value.stat { try saveChartStat(value.instrument, hour: value.timestamp, oi: stat.oi, sell: stat.sell, buy: stat.buy) }
+                if let quote = value.quote { try saveHourlyQuote(value.instrument, hour: value.timestamp, quote: quote) }
+            }
+        }
+    }
+
     func candles(_ id: String, since: Int64, through: Int64) throws -> [Int64: Candle] {
         let stmt = try statement("SELECT hour,high,low,close,volume,base_volume,open FROM candles WHERE inst_id=? AND hour>=? AND hour<=? ORDER BY hour")
         defer { sqlite3_finalize(stmt) }

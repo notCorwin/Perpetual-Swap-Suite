@@ -317,10 +317,14 @@
 @layer components {
     [data-surface="control"] { @apply surface-control; }
     [data-surface="panel"] { @apply surface-panel; }
-    /* duration-* drives the entry/exit animation, but otherwise enables an
-       implicit transition of every property, including backdrop-filter.
-       Material settings must settle immediately even in a background window. */
-    [data-surface="floating"] { @apply surface-floating transition-none; }
+    /* Floating surfaces are mirrored into a native blur mask. Transforming or
+       fading that WebKit layer makes the two compositors paint different frames,
+       which presents as a flash. Keep the physical material stationary and let
+       controls inside it provide interaction feedback instead. */
+    [data-surface="floating"] {
+        @apply surface-floating transition-none;
+        animation: none;
+    }
     [data-surface="inherited"] { @apply surface-inherited; }
 
     /* A physical surface owns the blur once. Portaled menus start a new owner;
