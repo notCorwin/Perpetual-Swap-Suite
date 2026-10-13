@@ -17,7 +17,7 @@ import { chartHistoryNeedsLoad, livePriceTag, scrollChartEnd, visibleChartBars }
 import { cn, pageVisible } from "@/lib/utils"
 import { chartNavigationTarget, wrappedMarket } from "@/market-sort"
 import { finitePercentage, formatPercent, type PercentageValue } from "@/market-percent"
-import { capturePriceMoves, type PriceMoveMode, type PriceMoveSignal } from '@/price-move-signals'
+import { capturePriceMoves, type PriceMoveMode, type PriceMoveObjective, type PriceMoveSignal } from '@/price-move-signals'
 import { SnapshotOrder } from '@/snapshot-order'
 import { mergeChartBars } from '@/chart-snapshot'
 
@@ -390,6 +390,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
   const analysis = useSyncExternalStore(chartAnalysis.subscribe, () => chartAnalysis.get(instId))
   const [analysisOpen, setAnalysisOpen] = useState(() => chartAnalysis.get(instId) !== null)
   const [moveMode, setMoveMode] = useState<PriceMoveMode>('close')
+  const [moveObjective, setMoveObjective] = useState<PriceMoveObjective>('amplitude')
   const analysisBusy = analysis?.phase === 'capturing' || analysis?.phase === 'streaming'
   useEffect(() => () => chartAnalysis.stop(instId), [instId])
   const [displayed, setDisplayed] = useState<{ id: string; data: ChartResponse } | null>(null)
@@ -642,7 +643,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
 
   const viewportEnd = historicalEnd ?? chart?.bars.at(-1)?.hour ?? 0
   const bars = useMemo(() => visibleChartBars(cachedBars, viewportEnd), [cachedBars, viewportEnd])
-  const visibleMoveSignals = useMemo(() => capturePriceMoves(bars, 1, moveMode), [bars, moveMode])
+  const visibleMoveSignals = useMemo(() => capturePriceMoves(bars, 1, moveMode, moveObjective), [bars, moveMode, moveObjective])
   const inspectedIndex = inspection?.id === instId ? bars.findIndex(bar => bar.hour === inspection.hour) : -1
   const inspected = inspectedIndex < 0 ? null : inspectedIndex
   const inspectAt = (target: SVGSVGElement, clientX: number) => {
@@ -697,8 +698,10 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
   }
   const longMoves = visibleMoveSignals.filter(signal => signal.direction === 'long').length
   const shortMoves = visibleMoveSignals.length - longMoves
+  const strongestMove = visibleMoveSignals[0]
   const moveSource = moveMode === 'close' ? 'Close' : 'High / Low'
-  const chartDescription = `OKX perpetual · 1h · ${historicalEnd === null ? "Latest 96 hours" : `History through ${time(historicalEnd)}`} · Future-aware Long and Short labels capture ${moveMode === 'close' ? 'close-to-close' : 'Low-to-High and High-to-Low'} moves over 1% · Hold to inspect · Scroll chart for history · 24h turnover rank ${turnoverPosition + 1}/${turnoverOrder.length} · ↑/↓ list order · ← list first · → turnover first`
+  const objectiveLabel = moveObjective === 'amplitude' ? 'maximum total move' : 'maximum move per K-line'
+  const chartDescription = `OKX perpetual · 1h · ${historicalEnd === null ? "Latest 96 hours" : `History through ${time(historicalEnd)}`} · Future-aware Long and Short labels capture the ${objectiveLabel} from ${moveMode === 'close' ? 'close-to-close' : 'Low-to-High and High-to-Low'} candidates over 1% · Hold to inspect · Scroll chart for history · 24h turnover rank ${turnoverPosition + 1}/${turnoverOrder.length} · ↑/↓ list order · ← list first · → turnover first`
   return <ChartWorkspaceViewport expanded={analysisOpen}><main className="flex h-full min-h-0 flex-col overflow-hidden overscroll-none text-sm font-normal tabular-nums">
     <header className="flex shrink-0 items-center gap-3 border-b px-4 py-2">
       <Button variant="ghost" size="sm" onClick={onBack}><ArrowLeft data-icon="inline-start" aria-hidden="true" />{backLabel}</Button>
@@ -717,11 +720,11 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
       </ButtonGroup>
       <span role="status" className="sr-only">{captureStatus === "flashing" ? "Chart copied to clipboard" : ""}</span>
       <Badge variant="secondary"><Radio data-icon="inline-start" aria-hidden="true" />{historicalEnd !== null ? "History" : active && !active.confirmed ? "Live candle" : "Hourly chart"}</Badge>
-      <Badge variant="outline" title={`Hindsight labels use future completed candle ${moveSource} values and are not live trading signals`}>{longMoves} Long · {shortMoves} Short</Badge>
+      <Badge variant="outline" title={`Hindsight labels use future completed candle ${moveSource} values and are not live trading signals`}>{longMoves} Long · {shortMoves} Short{moveObjective === 'efficiency' && strongestMove ? ` · ${formatPercent(strongestMove.efficiencyPercentPerPeriod)} / K` : ''}</Badge>
     </header>
     <div role="status" data-price-move-summary className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-xs">
       <span className="font-medium"><span className="text-positive">{longMoves} Long</span> · <span className="text-destructive">{shortMoves} Short</span></span>
-      <span className="text-muted-foreground">Strongest visible move · completed candles · move &gt; 1% · shortest K-line span breaks ties</span>
+      <span className="text-muted-foreground">{moveObjective === 'amplitude' ? 'Strongest visible move · shortest K-line span breaks ties' : 'Highest |change| / K · total move breaks ties'} · completed candles · move &gt; 1%</span>
       <ToggleGroup type="single" variant="outline" size="sm" spacing={0} value={moveMode} onValueChange={value => {
         if (!value) return
         setMoveMode(value as PriceMoveMode)
@@ -731,6 +734,14 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
       }} aria-label="Move price source" data-price-move-mode={moveMode}>
         <ToggleGroupItem value="close">Close</ToggleGroupItem>
         <ToggleGroupItem value="highLow">High / Low</ToggleGroupItem>
+      </ToggleGroup>
+      <ToggleGroup type="single" variant="outline" size="sm" spacing={0} value={moveObjective} onValueChange={value => {
+        if (!value) return
+        setMoveObjective(value as PriceMoveObjective)
+        plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus()
+      }} aria-label="Move optimization objective" data-price-move-objective={moveObjective}>
+        <ToggleGroupItem value="amplitude">Max Move</ToggleGroupItem>
+        <ToggleGroupItem value="efficiency">Max Efficiency</ToggleGroupItem>
       </ToggleGroup>
       <span className="ml-auto text-muted-foreground">Uses future data · labels only</span>
     </div>

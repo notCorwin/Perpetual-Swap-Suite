@@ -506,6 +506,10 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await wait(view,"document.querySelector('[data-price-move-mode]')?.dataset.priceMoveMode === 'highLow' && document.activeElement?.matches('svg[tabindex=\"0\"]')")
         try await click(view,"Close")
         try await wait(view,"document.querySelector('[data-price-move-mode]')?.dataset.priceMoveMode === 'close' && document.activeElement?.matches('svg[tabindex=\"0\"]')")
+        try await click(view,"Max Efficiency")
+        try await wait(view,"document.querySelector('[data-price-move-objective]')?.dataset.priceMoveObjective === 'efficiency' && document.activeElement?.matches('svg[tabindex=\"0\"]')")
+        try await click(view,"Max Move")
+        try await wait(view,"document.querySelector('[data-price-move-objective]')?.dataset.priceMoveObjective === 'amplitude' && document.activeElement?.matches('svg[tabindex=\"0\"]')")
         let latestChartEnd = try await js(view,"Number(document.querySelector('[data-chart-inst]').dataset.chartEnd)") as? Double
         _ = try await js(view,"document.querySelector('[data-chart-plot]').dispatchEvent(new WheelEvent('wheel',{deltaY:120,bubbles:true,cancelable:true})); true")
         try await wait(view,"Number(document.querySelector('[data-chart-inst]').dataset.chartEnd) < \(latestChartEnd ?? 0)")

@@ -21,6 +21,19 @@ test('a temporary reversal does not split a larger future move', () => {
   assert.equal(signal.changePercent, 10)
 })
 
+test('efficiency objective prefers more movement per candle over total amplitude', () => {
+  const input = bars([100, 102, 102.8, 103.6, 104.4, 105.2, 106, 106.8, 107.6, 108.4, 109.2, 110])
+  const [amplitude] = capturePriceMoves(input)
+  assert.equal(amplitude.hour, 0)
+  assert.equal(amplitude.exitHour, 11 * hour)
+  assert.equal(amplitude.changePercent, 10)
+  const [efficient] = capturePriceMoves(input, 1, 'close', 'efficiency')
+  assert.equal(efficient.hour, 0)
+  assert.equal(efficient.exitHour, hour)
+  assert.equal(efficient.changePercent, 2)
+  assert.equal(efficient.efficiencyPercentPerPeriod, 2)
+})
+
 test('moves must exceed one percent and use the shortest span for equal extrema', () => {
   assert.deepEqual(capturePriceMoves(bars([100, 101])), [])
   const [signal] = capturePriceMoves(bars([100, 100, 102, 102]))
