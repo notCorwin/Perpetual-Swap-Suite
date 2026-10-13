@@ -45,7 +45,7 @@ enum ResearchFixture {
     static func seed(_ store: ResearchStore, bars: [Candle] = bars()) throws {
         try store.put("instrument:\(instrument.id)", kind: "instrument", instrument)
         try store.write(bars.map { .init(instrument: instrument.id, kind: "candle", timestamp: $0.hour, candle: $0, sources: ["fixture"]) })
-        try store.write(bars.map { .init(instrument: instrument.id, kind: "stat", timestamp: $0.hour, stat: .init(oi: 1_000_000 + Double(($0.hour-hour)/hourMS), sell: 40, buy: 60), sources: ["fixture"]) })
+        try store.write(bars.map { .init(instrument: instrument.id, kind: "stat", timestamp: $0.hour, stat: .init(oi: 10_000 + Double(($0.hour-hour)/hourMS), oiUSD: 1_000_000 + Double(($0.hour-hour)/hourMS), sell: 40, buy: 60), sources: ["fixture"]) })
     }
     static func plan(_ spec: StudySpec) -> DataPlan { .init(spec: spec, instruments: [instrument], from: spec.from ?? hour, through: spec.through, warmupHours: 275) }
 }

@@ -34,7 +34,7 @@ const mergedComparisonPresets = [
   { id: 'vs:price-ema', label: 'Price vs EMA', group: 'EMA & candle', description: 'Compare candle close with an EMA. Both the price source and EMA period are editable.', keys: ['priceEMA'], left: 'Close', right: 'EMA(200)' },
   { id: 'vs:rsi-rsi', label: 'RSI vs RSI', group: 'RSI', description: 'Compare two RSI readings with independently editable periods.', keys: ['rsi6vs12', 'rsi12vs24'], left: 'RSI(6)', right: 'RSI(12)' },
   { id: 'vs:roc-maroc', label: 'ROC vs MAROC', group: 'Momentum', description: 'Compare editable ROC and mean ROC readings directly.', keys: ['rocVsMaroc'], left: 'ROC(9)', right: 'MAROC(9, 9)' },
-  { id: 'vs:buy-sell', label: 'Buy vs Sell', group: 'Participation', description: 'Compare selected-hour taker buy and sell contract volumes directly.', keys: ['buyVsSell'], left: 'buy', right: 'sell' },
+  { id: 'vs:buy-sell', label: 'Buy vs Sell', group: 'Participation', description: 'Compare selected-hour taker buy and sell base-currency volumes directly.', keys: ['buyVsSell'], left: 'buy', right: 'sell' },
   { id: 'vs:log-bb', label: 'Price or wick vs Log BB', group: 'Bands & VWAP', description: 'Compare close, high, or low with an editable Log BB band.', keys: ['priceUpper', 'priceMiddle', 'priceLower', 'highUpper', 'lowLower'], left: 'Close', right: 'LogBB(20, 2, "upper")' },
   { id: 'vs:price-vwap', label: 'Price vs VWAP', group: 'Bands & VWAP', description: 'Compare candle close with a VWAP using an editable period.', keys: ['priceVWAP'], left: 'Close', right: 'VWAP(14)' },
 ]

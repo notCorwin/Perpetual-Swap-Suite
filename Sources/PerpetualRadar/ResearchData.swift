@@ -165,8 +165,8 @@ final class ResearchDataProvider {
                     if value.kind == "candle" { return nil }
                     var fill = value
                     if let stat = value.stat {
-                        fill.stat = FilterStat(oi: old.stat?.oi == nil ? stat.oi : nil, sell: old.stat?.sell == nil ? stat.sell : nil, buy: old.stat?.buy == nil ? stat.buy : nil)
-                        if fill.stat?.oi == nil && fill.stat?.buy == nil && fill.stat?.sell == nil { return nil }
+                        fill.stat = FilterStat(oi: old.stat?.oi == nil ? stat.oi : nil, oiUSD: old.stat?.oiUSD == nil ? stat.oiUSD : nil, sell: old.stat?.sell == nil ? stat.sell : nil, buy: old.stat?.buy == nil ? stat.buy : nil)
+                        if fill.stat?.oi == nil && fill.stat?.oiUSD == nil && fill.stat?.buy == nil && fill.stat?.sell == nil { return nil }
                     }
                     if let quote = value.quote {
                         fill.quote = FilterQuote(turnover: old.quote?.turnover == nil ? quote.turnover : nil, spread: nil, timestamp: quote.timestamp)
@@ -196,7 +196,7 @@ final class ResearchDataProvider {
             let instrument = input.instrument, range = input.range
             do {
                 let candles = try radar.candles(instrument, since: range.from, through: range.through)
-                let stats = try radar.chartStats(instrument, since: range.from, through: range.through).mapValues { FilterStat(oi: $0.oi, sell: $0.sell, buy: $0.buy) }
+                let stats = try radar.chartStats(instrument, since: range.from, through: range.through).mapValues { FilterStat(oi: $0.oi, oiUSD: $0.oiUSD, sell: $0.sell, buy: $0.buy) }
                 let quotes = try radar.hourlyQuotes(instrument, since: range.from, through: range.through).compactMapValues { quote in
                     quote.turnover.map { FilterQuote(turnover: $0, spread: nil, timestamp: quote.timestamp) }
                 }
@@ -227,7 +227,7 @@ final class ResearchDataProvider {
         var parameters = [("instId", instrument)]
         if kind == "candle" || kind == "mark" { parameters += [("bar", "1H"), ("after", String(range.through + hourMS)), ("limit", kind == "mark" ? "100" : "300")] }
         else if kind == "funding" { parameters += [("after", String(range.through + hourMS)), ("limit", "400")] }
-        else { parameters += [("period", "1H"), ("end", String(range.through + hourMS)), ("begin", String(range.from - 1)), ("limit", "100")]; if kind == "taker" { parameters.append(("unit", "1")) } }
+        else { parameters += [("period", "1H"), ("end", String(range.through + hourMS)), ("begin", String(range.from - 1)), ("limit", "100")]; if kind == "taker" { parameters.append(("unit", "0")) } }
         let url = Self.url(paths[kind]!, parameters).absoluteString
         return ResearchSource(id: researchHash(url + ":\(range.from):\(range.through)" + (refresh ? UUID().uuidString : "")), instrument: instrument, kind: kind, from: range.from, through: range.through, url: url, filename: "\(instrument) · \(kind) · REST", sizeBytes: nil, archive: false, refresh: refresh)
     }
@@ -673,7 +673,11 @@ final class ResearchDataProvider {
             guard ts >= source.from, ts <= source.through else { continue }
             if source.kind == "candle", let candle = Candle(value), candle.confirmed { batch.append(.init(instrument: source.instrument, kind: "candle", timestamp: ts, candle: candle, sources: [source.id])) }
             if source.kind == "mark", value.count >= 6, value[5] == "1", let mark = Double(value[1]), mark.isFinite, mark > 0 { batch.append(.init(instrument: source.instrument, kind: "mark", timestamp: ts, mark: mark, sources: [source.id])) }
-            if source.kind == "oi", value.count >= 4, let oi = Double(value[3]), oi.isFinite, oi >= 0 { batch.append(.init(instrument: source.instrument, kind: "stat", timestamp: ts, stat: FilterStat(oi: oi, sell: nil, buy: nil), sources: [source.id])) }
+            if source.kind == "oi", value.count >= 4,
+               let oi = Double(value[1]), let oiUSD = Double(value[3]),
+               oi.isFinite, oiUSD.isFinite, oi >= 0, oiUSD >= 0 {
+                batch.append(.init(instrument: source.instrument, kind: "stat", timestamp: ts, stat: FilterStat(oi: oi, oiUSD: oiUSD, sell: nil, buy: nil), sources: [source.id]))
+            }
             if source.kind == "taker", value.count >= 3, let sell = Double(value[1]), let buy = Double(value[2]), sell.isFinite, buy.isFinite, sell >= 0, buy >= 0 { batch.append(.init(instrument: source.instrument, kind: "stat", timestamp: ts, stat: FilterStat(oi: nil, sell: sell, buy: buy), sources: [source.id])) }
         }
         if !batch.isEmpty { try store.write(batch) }

@@ -199,7 +199,9 @@ final class ResearchArchiveImporter {
             guard let price = number(row, "price", "px"), let size = number(row, "size", "sz"), let side = cell(row, "side"), ["buy", "sell"].contains(side), price > 0, size >= 0 else { rejected += 1; return }
             let base = size * (instruments[id]?.contractValue ?? 0)
             aggregate[id]!.add(timestamp: ts, open: price, high: price, low: price, close: price, base: base, quote: base * price)
-            if side == "buy" { aggregate[id]!.buy += size } else { aggregate[id]!.sell += size }
+            // Archive trade sizes are contracts. Keep taker data in the same
+            // base-currency unit as REST unit=0 and candle volCcy.
+            if side == "buy" { aggregate[id]!.buy += base } else { aggregate[id]!.sell += base }
         }
     }
     private func bookCSV(_ row: [String]) throws {

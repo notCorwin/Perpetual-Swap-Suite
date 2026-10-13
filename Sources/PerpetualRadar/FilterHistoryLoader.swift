@@ -9,7 +9,7 @@ struct OKXFilterHistoryTransport: FilterHistoryTransport {
 
     func fetch(path: String, parameters: [String: String]) async throws -> [[String]] {
         var parameters = parameters
-        if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "1" }
+        if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "0" }
         var parts = URLComponents(string: "https://www.okx.com/api/v5" + path)!
         parts.queryItems = parameters.map { URLQueryItem(name: $0.key, value: $0.value) }
         var request = URLRequest(url: parts.url!, cachePolicy: .reloadIgnoringLocalCacheData); request.timeoutInterval = 15
@@ -98,7 +98,7 @@ actor FilterHistoryLoader {
         try db.transaction {
             for value in values {
                 if let candle = value.candle, candle.confirmed { try db.save(id, candle) }
-                if let stat = value.stat { try db.saveChartStat(id, hour: value.timestamp, oi: stat.oi, sell: stat.sell, buy: stat.buy) }
+                if let stat = value.stat { try db.saveChartStat(id, hour: value.timestamp, oi: stat.oi, oiUSD: stat.oiUSD, sell: stat.sell, buy: stat.buy) }
                 if let quote = value.quote { try db.saveHourlyQuote(id, hour: value.timestamp, quote: quote) }
             }
         }
@@ -135,7 +135,7 @@ actor FilterHistoryLoader {
             for (ts, bar) in original.candles where ts == original.hour || market.candles[ts] == nil { market.candles[ts] = bar }
             if filter.needsStats {
                 let statFirst = statRanges[market.id].map { $0.first <= first && $0.last >= last ? max(first, last - hourMS) : first } ?? first
-                for (ts, s) in try db.chartStats(market.id, since: statFirst, through: last) { statCache[market.id, default: [:]][ts] = FilterStat(oi: s.oi, sell: s.sell, buy: s.buy) }
+                for (ts, s) in try db.chartStats(market.id, since: statFirst, through: last) { statCache[market.id, default: [:]][ts] = FilterStat(oi: s.oi, oiUSD: s.oiUSD, sell: s.sell, buy: s.buy) }
                 statRanges[market.id] = (min(first, statRanges[market.id]?.first ?? first), last)
                 market.stats = (statCache[market.id] ?? [:]).filter { $0.key >= first && $0.key <= last }
                 market.stats.merge(original.stats) { _, live in live }
@@ -166,7 +166,7 @@ actor FilterHistoryLoader {
             let listing = market.listedAt.map { $0 / hourMS * hourMS } ?? first
             let availableFirst = max(first, listing, floor(market.id) ?? first)
             let missingCandles = stride(from: market.hour - hourMS, through: availableFirst, by: -Int(hourMS)).contains { !Self.complete(market.candles[$0]) }
-            let missingStats = filter.needsStats && stride(from: market.hour - hourMS, through: max(first, listing), by: -Int(hourMS)).contains { market.stats[$0]?.oi == nil || market.stats[$0]?.buy == nil || market.stats[$0]?.sell == nil }
+            let missingStats = filter.needsStats && stride(from: market.hour - hourMS, through: max(first, listing), by: -Int(hourMS)).contains { market.stats[$0]?.oi == nil || market.stats[$0]?.oiUSD == nil || market.stats[$0]?.buy == nil || market.stats[$0]?.sell == nil }
             if !missingCandles && !missingStats { continue }
             if jobs[key] == nil { queue.append(key) }
             jobs[key] = (market, max(filter.requiredHours, jobs[key]?.hours ?? 0), filter.needsStats || jobs[key]?.stats == true)
@@ -233,18 +233,22 @@ actor FilterHistoryLoader {
                     let expectedFirst = max(first, listing, pageStart)
                     let existing = try db.chartStats(market.id, since: expectedFirst, through: pageEnd)
                     var loaded = Set(existing.compactMap { timestamp, value in
-                        path.contains("open-interest") ? (value.oi == nil ? nil : timestamp) : (value.sell == nil || value.buy == nil ? nil : timestamp)
+                        path.contains("open-interest") ? (value.oi == nil || value.oiUSD == nil ? nil : timestamp) : (value.sell == nil || value.buy == nil ? nil : timestamp)
                     })
                     if stride(from: expectedFirst, through: pageEnd, by: Int(hourMS)).allSatisfy({ loaded.contains($0) }) {
                         statPages[pageKey] = Date().addingTimeInterval(900); continue
                     }
                     var parameters = ["instId": market.id, "period": "1H", "end": String(pageEnd + hourMS), "limit": "100"]
-                    if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "1" }
+                    if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "0" }
                     let values = try await fetch(path, parameters)
                     for value in values {
                         guard let ts = value.first.flatMap(Int64.init), ts % hourMS == 0, ts >= pageStart, ts <= pageEnd else { continue }
-                        if path.contains("open-interest"), value.count >= 4, let oi = Double(value[3]), oi.isFinite, oi >= 0 {
-                            try db.saveChartStat(market.id, hour: ts, oi: oi); statCache[market.id, default: [:]][ts, default: .init()].oi = oi
+                        if path.contains("open-interest"), value.count >= 4,
+                           let oi = Double(value[1]), let oiUSD = Double(value[3]),
+                           oi.isFinite, oiUSD.isFinite, oi >= 0, oiUSD >= 0 {
+                            try db.saveChartStat(market.id, hour: ts, oi: oi, oiUSD: oiUSD)
+                            statCache[market.id, default: [:]][ts, default: .init()].oi = oi
+                            statCache[market.id, default: [:]][ts, default: .init()].oiUSD = oiUSD
                             updatedMarkets.insert(market.id)
                             loaded.insert(ts)
                         } else if !path.contains("open-interest"), value.count >= 3, let sell = Double(value[1]), let buy = Double(value[2]), sell.isFinite, buy.isFinite, sell >= 0, buy >= 0 {

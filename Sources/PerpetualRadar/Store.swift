@@ -3,7 +3,7 @@ import CSQLite
 
 final class Store {
     private static let busyTimeoutMilliseconds: Int32 = 5_000
-    private static let schemaVersion: Int64 = 2
+    private static let schemaVersion: Int64 = 3
     private var db: OpaquePointer?
     private var reusableStatements: [String: OpaquePointer] = [:]
     let url: URL
@@ -31,12 +31,19 @@ final class Store {
                 try execute("CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
                 try execute("CREATE TABLE IF NOT EXISTS candles (inst_id TEXT, hour INTEGER, high REAL, low REAL, close REAL, volume REAL, base_volume REAL, open REAL, PRIMARY KEY(inst_id,hour))")
                 try execute("CREATE TABLE IF NOT EXISTS ema200 (inst_id TEXT PRIMARY KEY, hour INTEGER, value REAL)")
-                try execute("CREATE TABLE IF NOT EXISTS chart_stats (inst_id TEXT, hour INTEGER, oi REAL, sell REAL, buy REAL, PRIMARY KEY(inst_id,hour))")
+                try execute("CREATE TABLE IF NOT EXISTS chart_stats (inst_id TEXT, hour INTEGER, oi REAL, oi_usd REAL, sell REAL, buy REAL, PRIMARY KEY(inst_id,hour))")
                 try execute("CREATE INDEX IF NOT EXISTS candles_hour ON candles(hour)")
                 try execute("CREATE INDEX IF NOT EXISTS chart_stats_hour ON chart_stats(hour)")
                 // Existing Python caches may predate base_volume.
                 if try !columns("candles").contains("base_volume") { try execute("ALTER TABLE candles ADD COLUMN base_volume REAL") }
                 if try !columns("candles").contains("open") { try execute("ALTER TABLE candles ADD COLUMN open REAL") }
+                if try !columns("chart_stats").contains("oi_usd") {
+                    try execute("ALTER TABLE chart_stats ADD COLUMN oi_usd REAL")
+                    // The former oi column contained USD and taker values were
+                    // contracts. Neither can be relabeled safely; hydrate them
+                    // again from OKX using the new explicit units.
+                    try execute("UPDATE chart_stats SET oi=NULL,oi_usd=NULL,sell=NULL,buy=NULL")
+                }
                 try execute("CREATE TABLE IF NOT EXISTS hourly_quotes (inst_id TEXT, hour INTEGER, turnover REAL, spread REAL, quote_timestamp INTEGER NOT NULL, PRIMARY KEY(inst_id,hour))")
                 try execute("CREATE TRIGGER IF NOT EXISTS candle_insert_invalidates_ema AFTER INSERT ON candles BEGIN DELETE FROM ema200 WHERE inst_id=NEW.inst_id AND hour>=NEW.hour; END")
                 try execute("CREATE TRIGGER IF NOT EXISTS candle_correction_invalidates_ema AFTER UPDATE OF close ON candles WHEN NEW.close IS NOT OLD.close BEGIN DELETE FROM ema200 WHERE inst_id=NEW.inst_id AND hour>=NEW.hour; END")
@@ -254,7 +261,7 @@ final class Store {
         try transaction {
             for value in values {
                 if let candle = value.candle, candle.confirmed { try save(value.instrument, candle) }
-                if let stat = value.stat { try saveChartStat(value.instrument, hour: value.timestamp, oi: stat.oi, sell: stat.sell, buy: stat.buy) }
+                if let stat = value.stat { try saveChartStat(value.instrument, hour: value.timestamp, oi: stat.oi, oiUSD: stat.oiUSD, sell: stat.sell, buy: stat.buy) }
                 if let quote = value.quote { try saveHourlyQuote(value.instrument, hour: value.timestamp, quote: quote) }
             }
         }
@@ -280,8 +287,8 @@ final class Store {
         return sqlite3_column_type(stmt, 0) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, 0)
     }
 
-    func saveChartStat(_ id: String, hour: Int64, oi: Double? = nil, sell: Double? = nil, buy: Double? = nil) throws {
-        try execute("INSERT INTO chart_stats (inst_id,hour,oi,sell,buy) VALUES (?,?,?,?,?) ON CONFLICT(inst_id,hour) DO UPDATE SET oi=COALESCE(excluded.oi,chart_stats.oi),sell=COALESCE(excluded.sell,chart_stats.sell),buy=COALESCE(excluded.buy,chart_stats.buy)", [id, hour, oi, sell, buy])
+    func saveChartStat(_ id: String, hour: Int64, oi: Double? = nil, oiUSD: Double? = nil, sell: Double? = nil, buy: Double? = nil) throws {
+        try execute("INSERT INTO chart_stats (inst_id,hour,oi,oi_usd,sell,buy) VALUES (?,?,?,?,?,?) ON CONFLICT(inst_id,hour) DO UPDATE SET oi=COALESCE(excluded.oi,chart_stats.oi),oi_usd=COALESCE(excluded.oi_usd,chart_stats.oi_usd),sell=COALESCE(excluded.sell,chart_stats.sell),buy=COALESCE(excluded.buy,chart_stats.buy)", [id, hour, oi, oiUSD, sell, buy])
     }
 
     func openInterest(hour: Int64) throws -> [String: Double] {
@@ -295,16 +302,17 @@ final class Store {
         return result
     }
 
-    func chartStats(_ id: String, since: Int64, through: Int64 = .max) throws -> [Int64: (oi: Double?, sell: Double?, buy: Double?)] {
-        let stmt = try statement("SELECT hour,oi,sell,buy FROM chart_stats WHERE inst_id=? AND hour>=? AND hour<=?")
+    func chartStats(_ id: String, since: Int64, through: Int64 = .max) throws -> [Int64: (oi: Double?, oiUSD: Double?, sell: Double?, buy: Double?)] {
+        let stmt = try statement("SELECT hour,oi,oi_usd,sell,buy FROM chart_stats WHERE inst_id=? AND hour>=? AND hour<=?")
         defer { sqlite3_finalize(stmt) }
         bind([id, since, through], to: stmt)
-        var result: [Int64: (oi: Double?, sell: Double?, buy: Double?)] = [:]
+        var result: [Int64: (oi: Double?, oiUSD: Double?, sell: Double?, buy: Double?)] = [:]
         try readRows(stmt) {
             result[sqlite3_column_int64(stmt, 0)] = (
                 sqlite3_column_type(stmt, 1) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 1),
                 sqlite3_column_type(stmt, 2) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 2),
-                sqlite3_column_type(stmt, 3) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 3))
+                sqlite3_column_type(stmt, 3) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 3),
+                sqlite3_column_type(stmt, 4) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 4))
         }
         return result
     }

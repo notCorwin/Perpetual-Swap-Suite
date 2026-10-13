@@ -44,7 +44,7 @@ struct TakerVolumePoller: Sendable {
                             // Live polling needs only the forming hour and the
                             // most recently closed hour. Historical hydration
                             // has its own paginated loader.
-                            parameters: ["instId": id, "period": "1H", "unit": "1", "limit": "2"])
+                            parameters: ["instId": id, "period": "1H", "unit": "0", "limit": "2"])
                         try Task.checkCancellation()
                         await receive(.init(id: id, requestedAt: requestedAt, volumes: rows.compactMap(TakerVolume.init)))
                     } catch {

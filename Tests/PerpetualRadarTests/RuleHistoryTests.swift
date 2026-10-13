@@ -87,7 +87,8 @@ final class RuleHistoryTests: XCTestCase, @unchecked Sendable {
         let prepared = try await loader.prepare([market()], filter: filter)
         await loader.schedule(prepared, filter: filter); await loader.waitUntilIdle()
         let loaded = try await loader.prepare([market()], filter: filter)
-        XCTAssertEqual(loaded[0].stats[hour - hourMS]?.oi, 1_000_000)
+        XCTAssertEqual(loaded[0].stats[hour - hourMS]?.oi, 1)
+        XCTAssertEqual(loaded[0].stats[hour - hourMS]?.oiUSD, 1_000_000)
         XCTAssertEqual(loaded[0].stats[hour - hourMS]?.sell, 10)
         XCTAssertEqual(loaded[0].stats[hour - hourMS]?.buy, 20)
         XCTAssertNil(loaded[0].stats[hour - 20 * hourMS])
@@ -119,7 +120,7 @@ final class RuleHistoryTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(FilterEvaluator(market: initial[0], filter: filter).evaluate().result, .unknown)
         let ts = hour - hourMS
         try db.saveCandles(market().id, [Candle(hour: ts, high: 110, low: 90, close: 100, quoteVolume: 100, baseVolume: 1, open: 100)])
-        try db.saveChartStat(market().id, hour: ts, oi: 1_000_000)
+        try db.saveChartStat(market().id, hour: ts, oi: 10_000, oiUSD: 1_000_000)
         try db.saveHourlyQuote(market().id, hour: ts, quote: .init(turnover: 20_000_000, spread: 0.1, timestamp: hour - 1))
         let refreshed = try await loader.prepare([market()], filter: filter)
         XCTAssertEqual(FilterEvaluator(market: refreshed[0], filter: filter).evaluate().result, .yes)
@@ -136,7 +137,7 @@ final class RuleHistoryTests: XCTestCase, @unchecked Sendable {
             let candle = Candle(hour: timestamp, high: 110, low: 90, close: 100, quoteVolume: 100, baseVolume: 1, open: 100)
             try research.write([
                 .init(instrument: id, kind: "candle", timestamp: timestamp, candle: candle, sources: ["research"]),
-                .init(instrument: id, kind: "stat", timestamp: timestamp, stat: .init(oi: 1_000_000, sell: 10, buy: 20), sources: ["research"]),
+                .init(instrument: id, kind: "stat", timestamp: timestamp, stat: .init(oi: 10_000, oiUSD: 1_000_000, sell: 10, buy: 20), sources: ["research"]),
                 .init(instrument: id, kind: "quote", timestamp: timestamp, quote: .init(turnover: 20_000_000, spread: nil, timestamp: timestamp + hourMS - 1), sources: ["research-\(index)"]),
             ])
         }

@@ -12,6 +12,7 @@ struct MarketSnapshotInput: Sendable {
     var sell: Double?
     var takerRatio: Double?
     var currentOI: Double?
+    var currentOIUSD: Double?
     var previousOI: Double?
     var previousEMA: Double?
 
@@ -57,7 +58,7 @@ struct MarketSnapshotInput: Sendable {
                 "bbUpper": upper as Any? ?? null, "bbMiddle": middle as Any? ?? null, "bbLower": lower as Any? ?? null,
                 "priorHigh48": extremes48.high as Any? ?? null, "priorLow48": extremes48.low as Any? ?? null,
                 "priorHigh96": extremes96.high as Any? ?? null, "priorLow96": extremes96.low as Any? ?? null,
-                "oiUSD": currentOI as Any? ?? null, "spreadPercent": spreadPercent as Any? ?? null,
+                "oiUSD": currentOIUSD as Any? ?? null, "spreadPercent": spreadPercent as Any? ?? null,
                 "liveVolumeUSDT": live?.quoteVolume as Any? ?? null,
             ],
         ]
@@ -69,7 +70,7 @@ struct MarketSnapshotInput: Sendable {
 
     func filterData(row: [String: Any]) -> FilterMarketData {
         .init(id: id, hour: hour, now: now, listedAt: listedAt, candles: candles,
-            stats: [hour: .init(oi: currentOI, sell: sell, buy: buy)],
+            stats: [hour: .init(oi: currentOI, oiUSD: currentOIUSD, sell: sell, buy: buy)],
             quotes: [hour: .init(turnover: turnover, spread: spreadPercent, timestamp: quoteTimestamp)],
             current: LegacyFilterReadings.from(row), previousEMA: previousEMA)
     }

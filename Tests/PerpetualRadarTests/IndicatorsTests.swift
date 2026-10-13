@@ -233,7 +233,7 @@ final class IndicatorsTests: XCTestCase {
         try store.save("BTC-USDT-SWAP", bar)
         let olderHour = hour - 300 * hourMS
         try store.save("BTC-USDT-SWAP", Candle(hour: olderHour, high: 110, low: 90, close: 100, quoteVolume: 200, baseVolume: 2, open: 99))
-        try store.saveChartStat("BTC-USDT-SWAP", hour: hour, oi: 1_000)
+        try store.saveChartStat("BTC-USDT-SWAP", hour: hour, oi: 1_000, oiUSD: 2_000_000)
         try store.saveChartStat("BTC-USDT-SWAP", hour: hour, sell: 20, buy: 30)
         try store.saveChartStat("BTC-USDT-SWAP", hour: hour - hourMS, oi: 800)
         try store.saveChartStat("ETH-USDT-SWAP", hour: hour - hourMS, oi: 600)
@@ -244,6 +244,7 @@ final class IndicatorsTests: XCTestCase {
         XCTAssertEqual(loaded.candles["BTC-USDT-SWAP"]?[hour]?.open, 100)
         let stat = try store.chartStats("BTC-USDT-SWAP", since: hour)
         XCTAssertEqual(stat[hour]?.oi, 1_000)
+        XCTAssertEqual(stat[hour]?.oiUSD, 2_000_000)
         XCTAssertEqual(stat[hour]?.sell, 20)
         XCTAssertEqual(stat[hour]?.buy, 30)
         XCTAssertEqual(try store.openInterest(hour: hour - hourMS), ["BTC-USDT-SWAP": 800, "ETH-USDT-SWAP": 600])

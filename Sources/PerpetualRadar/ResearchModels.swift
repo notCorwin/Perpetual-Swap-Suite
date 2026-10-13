@@ -2,8 +2,8 @@ import Foundation
 import CryptoKit
 
 enum ResearchVersion {
-    static let parser = "okx-archives-2"
-    static let engine = "hourly-close-btc-no-spread-ema5x-4"
+    static let parser = "okx-archives-3"
+    static let engine = "hourly-close-btc-no-spread-ema5x-5"
     static let horizons = [1, 3, 6, 12, 24, 48]
     static let memoryBudget = 128 * 1024 * 1024
     static func warmup(_ rules: [CompiledFilter]) -> Int { max(275, rules.map { max($0.requiredHours + ($0.metrics.contains("turnover") ? 24 : 0), ($0.btcRequirements?.hours ?? 0) + ($0.btcRequirements?.metrics.contains("turnover") == true ? 24 : 0)) }.max() ?? 275) }
