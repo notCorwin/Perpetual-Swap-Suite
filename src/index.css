@@ -101,13 +101,14 @@
     --control-radius: 6px;
     --control-font-size: 13px;
     /* Controls and panels weight their default alpha by the window setting.
-       Floating glass stays untinted and blurs independently of that setting. */
+       Floating glass blurs and tints independently of that setting: blur
+       scatters the backdrop, and a dense tint makes the glass read as solid. */
     --surface-opacity-weight: var(--window-background-opacity);
     /* Controls need a clear fill, while larger panels retain more of the window's glass. Saturated
        primary paint has its own lighter default to preserve text contrast. */
     --control-default-opacity: 0.8;
     --panel-default-opacity: 0.6;
-    --floating-default-opacity: 0;
+    --floating-default-opacity: 0.82;
     --primary-default-opacity: 0.4;
     --control-opacity: calc(var(--control-default-opacity) * var(--surface-opacity-weight));
     --panel-opacity: calc(var(--panel-default-opacity) * var(--surface-opacity-weight));

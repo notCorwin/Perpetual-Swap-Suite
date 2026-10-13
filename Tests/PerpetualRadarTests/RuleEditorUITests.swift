@@ -1153,7 +1153,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await slide("floating-blur", "Home")
         try await wait(view, "getComputedStyle(document.querySelector('[data-slot=popover-content]')).backdropFilter === 'none' && !document.body.innerText.includes('Saving')")
         if capturePixels {
-            let bounds = try await js(view, "(() => { const style=document.createElement('style'); style.id='slider-pixel-style'; style.textContent='[data-slot=popover-content] > * {visibility:hidden!important}'; document.head.append(style); return document.querySelector('[data-slot=popover-content]').getBoundingClientRect().toJSON(); })()") as! [String: Double]
+            let bounds = try await js(view, "(() => { const style=document.createElement('style'); style.id='slider-pixel-style'; style.textContent='[data-slot=popover-content] > * {visibility:hidden!important} [data-slot=popover-content] {background-color:transparent!important}'; document.head.append(style); return document.querySelector('[data-slot=popover-content]').getBoundingClientRect().toJSON(); })()") as! [String: Double]
             materialRect = CGRect(x: bounds["x"]! + 20, y: bounds["y"]! + 20, width: bounds["width"]! - 40, height: bounds["height"]! - 40)
             try await settleRendering(view)
             let image = try await nativeRendererSnapshot(view)
@@ -1318,7 +1318,7 @@ final class RuleEditorUITests: BackgroundTestCase {
     }
 
     @MainActor
-    private func assertSharedSurfaces(_ view: WKWebView, opacity: Double, defaultOpacities: [Double] = [0.8, 0.6, 0, 0.4]) async throws {
+    private func assertSharedSurfaces(_ view: WKWebView, opacity: Double, defaultOpacities: [Double] = [0.8, 0.6, 0.82, 0.4]) async throws {
         // Wait for control color transitions; inspect the renderer rather than
         // matching generated classes or the source token formulas.
         try await wait(view, "Array.from(document.querySelectorAll('[data-surface=\"floating\"]')).every(x => x.closest('[data-state=\"closed\"]') || !x.getBoundingClientRect().width || !x.getBoundingClientRect().height || getComputedStyle(x).opacity === '1')", seconds: 2)
@@ -1723,10 +1723,10 @@ final class RuleEditorUITests: BackgroundTestCase {
           Array.from(document.querySelectorAll('[data-market-list-content]')).find(element => element.getBoundingClientRect().width > 0).append(fixture);
           document.body.append(hideContent);
           window.radarSurfaceFixture = { source, style:source.style.cssText, backdrop:fixture.style.background };
-          return source.getBoundingClientRect().toJSON();
+          return { ...source.getBoundingClientRect().toJSON(), alpha: Number(getComputedStyle(document.documentElement).getPropertyValue('--floating-default-opacity')) };
         })()
         """) as? [String: Double]
-        let rect = try XCTUnwrap(bounds)
+        let rect = try XCTUnwrap(bounds), alpha = try XCTUnwrap(rect["alpha"])
         try await settleRendering(view)
         let image = try await nativeRendererSnapshot(view)
         let bitmap = try XCTUnwrap(NSBitmapImageRep(data: image.tiffRepresentation!))
@@ -1743,8 +1743,9 @@ final class RuleEditorUITests: BackgroundTestCase {
             let values = samples.map { $0.reduce(0, +) / 3 }
             return values.max()! - values.min()!
         }
-        // Clear glass must diffuse broad shapes while retaining the backdrop's
-        // color. An opaque fill could hide the tiles but would fail this change.
+        // Frosted glass diffuses broad shapes under a dense tint. The backdrop
+        // color must still bleed through (glass, not a solid fill), but only
+        // within the tint's remaining transmission.
         let blurredSamples = try samples(bitmap), softened = contrast(blurredSamples)
         _ = try await js(view, "document.querySelector('#floating-pixel-fixture').style.background='rgb(32 128 224)'; true")
         try await settleRendering(view)
@@ -1755,16 +1756,19 @@ final class RuleEditorUITests: BackgroundTestCase {
             backdropResponse += zip(before, after).map { abs($0 - $1) }.max()!
         }
         backdropResponse /= Double(blurredSamples.count)
-        _ = try await js(view, "document.querySelector('#floating-pixel-fixture').style.background=window.radarSurfaceFixture.backdrop; window.radarSurfaceFixture.source.style.backdropFilter='none'; window.radarSurfaceFixture.source.style.webkitBackdropFilter='none'; true")
+        _ = try await js(view, "document.querySelector('#floating-pixel-fixture').style.background=window.radarSurfaceFixture.backdrop; window.radarSurfaceFixture.source.style.backdropFilter='none'; window.radarSurfaceFixture.source.style.webkitBackdropFilter='none'; window.radarSurfaceFixture.source.style.backgroundColor='transparent'; true")
         try await settleRendering(view)
         let reference = try await nativeRendererSnapshot(view)
         let referenceBitmap = try XCTUnwrap(NSBitmapImageRep(data: reference.tiffRepresentation!))
         let exposed = contrast(try samples(referenceBitmap))
         _ = try await js(view, "(() => { const {source,style}=window.radarSurfaceFixture; source.style.cssText=style; delete source.dataset.qaFloatingTest; delete window.radarSurfaceFixture; document.querySelector('#floating-pixel-fixture').remove(); document.querySelector('#floating-pixel-style').remove(); return true; })()")
-        print("Floating pixel contrast \(name) \(theme): softened=\(softened), exposed=\(exposed), backdropResponse=\(backdropResponse)")
+        print("Floating pixel contrast \(name) \(theme): softened=\(softened), exposed=\(exposed), backdropResponse=\(backdropResponse), alpha=\(alpha)")
         XCTAssertGreaterThan(exposed, 0.15, "The reference must expose high-contrast app content behind the floating surface.")
         XCTAssertLessThan(softened, exposed * 0.1, "Glass blur must suppress broad backdrop shapes without blurring its own content.")
-        XCTAssertGreaterThan(backdropResponse, 0.1, "Untinted glass must retain the backdrop's colors instead of covering them with a solid fill.")
+        XCTAssertGreaterThan(alpha, 0.5, "A dense tint makes frosted glass read as solid.")
+        XCTAssertLessThan(alpha, 1, "Floating glass keeps a translucent tint rather than a solid fill.")
+        XCTAssertGreaterThan(backdropResponse, 0.01, "The backdrop's colors must still bleed through the glass.")
+        XCTAssertLessThan(backdropResponse, (1 - alpha) + 0.05, "The dense tint must dominate the frosted backdrop.")
         try FileManager.default.createDirectory(at: project.appendingPathComponent(".build/ui-qa"), withIntermediateDirectories: true)
         try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: project.appendingPathComponent(".build/ui-qa/floating-blur-\(name)-\(theme).png"))
     }
