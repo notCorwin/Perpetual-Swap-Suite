@@ -133,7 +133,7 @@ const MarketRowView = memo(function MarketRowView({ row, index, onSelect, onExpl
         <BreakReadings result={row.lowBreakdown} direction="low" />
       </div>
     </TableCell>
-    <TableCell className={cn("text-center tabular-nums", directionClass(row.takerRatio))} title={row.buy !== null && row.sell !== null ? `Buy ${row.buy.toLocaleString("en-US")} / Sell ${row.sell.toLocaleString("en-US")} contracts` : "Loading current-hour taker volume"}>{formatPercent(row.takerRatio)}</TableCell>
+    <TableCell className={cn("text-center tabular-nums", directionClass(row.takerRatio))} title={row.buy !== null && row.sell !== null ? `Current 1h cumulative volume · Buy ${row.buy.toLocaleString("en-US")} / Sell ${row.sell.toLocaleString("en-US")} contracts · Imbalance (Buy − Sell) / (Buy + Sell), not Buy / Sell` : "Loading current-hour taker volume"}>{formatPercent(row.takerRatio)}</TableCell>
     <TableCell className={cn("text-center tabular-nums", directionClass(row.oiChange))}>{formatPercent(row.oiChange)}</TableCell>
     <TableCell className="text-center tabular-nums">
       <div className="mx-auto grid w-max grid-cols-[max-content_max-content] gap-x-3 text-right">
@@ -296,16 +296,16 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   useEffect(() => {
     if (!active) return
     let stopped = false
-    let backoff = 2000 // Start at 2s, increase when unchanged
+    let backoff = 2000
     const load = async () => {
       await pageVisible(); if (stopped) return
       try {
         const snapshot = await window.webkit.messageHandlers.radar.postMessage({ rocPeriod: ROC_PERIOD, marocPeriod: MAROC_PERIOD, sinceRevision: revision.current })
         if (stopped) return
         if ("unchanged" in snapshot) {
-          // shortcut: Exponential backoff when data unchanged, max 30s
           setStatus("Live")
-          backoff = Math.min(backoff * 1.5, 30000)
+          setError(snapshot.error)
+          backoff = 2000
         } else {
           acceptSnapshot(snapshot)
           setStatus("Live")
@@ -574,7 +574,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
                   {header("Low age", "lowBreakdownPriorAge", undefined, "Sort by the previous low's age at the breakdown, longest first. Tied lows use the most recent occurrence.")}
                 </div>
               </TableHead>
-              <TableHead className="text-center" aria-sort={sort === "takerRatio" ? descending ? "descending" : "ascending" : "none"}>{header("Taker buy-sell ratio", "takerRatio", math(String.raw`\frac{Buy_t-Sell_t}{Buy_t+Sell_t}\times100\%`))}</TableHead>
+              <TableHead className="text-center" aria-sort={sort === "takerRatio" ? descending ? "descending" : "ascending" : "none"}>{header("Taker imbalance", "takerRatio", math(String.raw`\frac{Buy_t-Sell_t}{Buy_t+Sell_t}\times100\%`))}</TableHead>
               <TableHead className="text-center" aria-sort={sort === "oiChange" ? descending ? "descending" : "ascending" : "none"}>{header("OI Relative Change", "oiChange", undefined, `Hourly OI relative change. ${PERCENT_CHANGE_DESCRIPTION}`)}</TableHead>
               <TableHead className="py-1.5 text-center" aria-sort={sort === "roc" || sort === "maroc" ? descending ? "descending" : "ascending" : "none"}>
                 <div className="flex flex-col items-center">

@@ -89,6 +89,8 @@ closed(every(RSI(14) > 50, 3))
 
 Click a symbol to open its chart. Hold the primary mouse button to inspect a candle, drag while holding to inspect others, and release to return to the displayed window's latest candle. Scroll to load older history; returning to the newest candle resumes automatic following.
 
+Taker Buy/Sell uses OKX's per-contract `1H` statistics in **contracts** (`unit=1`), accumulated within the selected hour. Compare the same perpetual contract, hour, and unit on OKX; coin or USDT amounts have a different scale. **Taker imbalance** is `(Buy − Sell) / (Buy + Sell) × 100%`, rather than the Buy/Sell quotient. Radar refreshes independent contracts concurrently, and the table, chart, and strategy readings share the newest observation. Unavailable current-hour data stays Unknown and is retried; completed-hour corrections are persisted, while live values stay in memory.
+
 | Control | Action |
 | --- | --- |
 | Up / Down | Previous / next contract in visible list order, wrapping at either end |

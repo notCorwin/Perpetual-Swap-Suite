@@ -5,11 +5,16 @@ protocol FilterHistoryTransport: Sendable {
 }
 
 struct OKXFilterHistoryTransport: FilterHistoryTransport {
+    var session: URLSession = .shared
+
     func fetch(path: String, parameters: [String: String]) async throws -> [[String]] {
+        var parameters = parameters
+        if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "1" }
         var parts = URLComponents(string: "https://www.okx.com/api/v5" + path)!
         parts.queryItems = parameters.map { URLQueryItem(name: $0.key, value: $0.value) }
-        var request = URLRequest(url: parts.url!); request.timeoutInterval = 15
-        let (data, response) = try await URLSession.shared.data(for: request)
+        var request = URLRequest(url: parts.url!, cachePolicy: .reloadIgnoringLocalCacheData); request.timeoutInterval = 15
+        try await ResearchRequestLimiter.shared.wait(for: parts.url!)
+        let (data, response) = try await session.data(for: request)
         guard (response as? HTTPURLResponse)?.statusCode == 200,
               let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any], payload["code"] as? String == "0", let rows = payload["data"] as? [[String]] else {
             throw FilterError("OKX history is unavailable; retrying.")
@@ -167,7 +172,9 @@ actor FilterHistoryLoader {
                 for path in ["/rubik/stat/contracts/open-interest-history", "/rubik/stat/taker-volume-contract"] {
                     let pageKey = "\(market.id)|\(path)|\(pageStart)|\(pageEnd)"
                     if statPages[pageKey].map({ $0 > Date() }) == true { continue }
-                    let values = try await fetch(path, ["instId": market.id, "period": "1H", "end": String(pageEnd + hourMS), "limit": "100"])
+                    var parameters = ["instId": market.id, "period": "1H", "end": String(pageEnd + hourMS), "limit": "100"]
+                    if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "1" }
+                    let values = try await fetch(path, parameters)
                     for value in values {
                         guard let ts = value.first.flatMap(Int64.init), ts % hourMS == 0, ts >= pageStart, ts <= pageEnd else { continue }
                         if path.contains("open-interest"), value.count >= 4, let oi = Double(value[3]), oi.isFinite, oi >= 0 {

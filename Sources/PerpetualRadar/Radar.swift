@@ -52,6 +52,8 @@ private struct Market {
 @MainActor
 final class Radar {
     private let store: Store
+    private let session: URLSession
+    private let takerPoller: TakerVolumePoller
     private let historyLoader: FilterHistoryLoader
     private let monitorHistoryLoader: FilterHistoryLoader
     private let btcHistoryLoader: FilterHistoryLoader
@@ -82,7 +84,9 @@ final class Radar {
     private var chartLiveStats: [String: (oi: Double?, sell: Double?, buy: Double?)] = [:]
     private var exhaustedCandleHistory = Set<String>()
     private var loadedStatPages = Set<String>()
-    private var takerHistorySavedAt: [String: Int64] = [:]
+    private var takerHistory: [String: [Int64: TakerVolume]] = [:]
+    private var takerRequests: [String: ContinuousClock.Instant] = [:]
+    private var takerFailures = Set<String>()
     private var hour = millis() / hourMS * hourMS
     private var updatedAt: Int64?
     private var revision = 0
@@ -107,7 +111,9 @@ final class Radar {
     private var refreshingInstruments = false
     private var startupError = ""
 
-    init(defaults: UserDefaults = .standard, storeURL: URL? = nil) throws {
+    init(defaults: UserDefaults = .standard, storeURL: URL? = nil, session: URLSession = .shared, takerTransport: (any FilterHistoryTransport)? = nil) throws {
+        self.session = session
+        takerPoller = TakerVolumePoller(transport: takerTransport ?? OKXFilterHistoryTransport(session: session))
         if let storeURL {
             store = try Store(url: storeURL)
         } else {
@@ -344,11 +350,14 @@ final class Radar {
     }
 
     private func getData(_ path: String, _ parameters: [String: String]) async throws -> Data {
+        var parameters = parameters
+        if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "1" }
         var parts = URLComponents(string: api + path)!
         parts.queryItems = parameters.map { URLQueryItem(name: $0.key, value: $0.value) }
-        var request = URLRequest(url: parts.url!)
+        var request = URLRequest(url: parts.url!, cachePolicy: .reloadIgnoringLocalCacheData)
         request.timeoutInterval = 15
-        let (data, response) = try await URLSession.shared.data(for: request)
+        if path == "/rubik/stat/taker-volume-contract" { try await ResearchRequestLimiter.shared.wait(for: parts.url!) }
+        let (data, response) = try await session.data(for: request)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else {
             throw NSError(domain: "OKX", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid OKX response for \(path)"])
         }
@@ -398,11 +407,7 @@ final class Radar {
                 let (instrumentData, tickerData) = try await (instruments, marketTickers)
                 let items = try decodeRows(instrumentData, path: "/public/instruments")
                 let tickers = try decodeRows(tickerData, path: "/market/tickers")
-                rows = liveUSDTInstruments(items).mapValues { Market(id: $0.id, listedAt: $0.listedAt) }
-                guard !rows.isEmpty else { throw NSError(domain: "OKX", code: 2, userInfo: [NSLocalizedDescriptionKey: "No live USDT perpetual swaps found"]) }
-                try updateTickers(tickers)
-                let cached = try store.load(hour: hour, ids: Set(rows.keys))
-                candles = cached.candles; emaStates = cached.ema
+                try initializeMarkets(instruments: items, tickers: tickers)
                 startupError = ""; touch()
                 tasks.append(Task { [weak self] in
                     guard let self else { return }
@@ -411,7 +416,7 @@ final class Radar {
                     } catch { NSLog("/public/open-interest: %@", error.localizedDescription) }
                 })
                 startHistoryScans()
-                tasks.append(Task { [weak self] in await self?.scan("/rubik/stat/taker-volume-contract", delay: 250_000_000, repeatScan: true) })
+                tasks.append(Task { [weak self] in await self?.pollTakerVolumes() })
                 tasks.append(Task { [weak self] in await self?.websocket(publicWS, channel: "open-interest") })
                 tasks.append(Task { [weak self] in await self?.websocket(businessWS, channel: "candle1H") })
                 tasks.append(Task { [weak self] in await self?.pollTickers() })
@@ -433,6 +438,56 @@ final class Radar {
             historyTasks.append(Task { [weak self] in await self?.scan("/market/candles", delay: 120_000_000, shard: shard) })
             historyTasks.append(Task { [weak self] in await self?.scan("/rubik/stat/contracts/open-interest-history", delay: 250_000_000, shard: shard) })
         }
+    }
+
+    func initializeMarkets(instruments: [Any], tickers: [Any]) throws {
+        rows = liveUSDTInstruments(instruments).mapValues { Market(id: $0.id, listedAt: $0.listedAt) }
+        guard !rows.isEmpty else { throw FilterError("No live USDT perpetual swaps found") }
+        try updateTickers(tickers)
+        let cached = try store.load(hour: hour, ids: Set(rows.keys))
+        candles = cached.candles; emaStates = cached.ema
+    }
+
+    private func pollTakerVolumes() async {
+        while !Task.isCancelled {
+            await refreshTakerVolumes()
+            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+        }
+    }
+
+    func refreshTakerVolumes() async {
+        await takerPoller.refresh(rows.keys.sorted()) { [weak self] response in
+            await self?.receiveTakerVolumes(response)
+        }
+    }
+
+    private func receiveTakerVolumes(_ response: TakerVolumeResponse) {
+        guard rows[response.id] != nil, !Task.isCancelled,
+              takerRequests[response.id].map({ response.requestedAt >= $0 }) ?? true else { return }
+        do {
+            if let error = response.error { throw FilterError(error) }
+            try updateTakerVolumes(response.id, response.volumes, requestedAt: response.requestedAt)
+        } catch {
+            if takerFailures.insert(response.id).inserted { touch(response.id) }
+            NSLog("Taker volume %@: %@", response.id, error.localizedDescription)
+        }
+    }
+
+    func updateTakerVolumes(_ id: String, _ volumes: [TakerVolume], requestedAt: ContinuousClock.Instant) throws {
+        guard rows[id] != nil, takerRequests[id].map({ requestedAt >= $0 }) ?? true else { return }
+        let current = volumes.first { $0.hour == hour }
+        let closed = volumes.filter { $0.hour < hour && takerHistory[id]?[$0.hour] != $0 }
+        try store.transaction { for volume in closed {
+            try store.saveChartStat(id, hour: volume.hour, sell: volume.sell, buy: volume.buy)
+        } }
+        for volume in closed { takerHistory[id, default: [:]][volume.hour] = volume }
+        takerRequests[id] = requestedAt
+        let changed = rows[id]?.buy != current?.buy || rows[id]?.sell != current?.sell
+        rows[id]?.buy = current?.buy; rows[id]?.sell = current?.sell; rows[id]?.takerRatio = current?.imbalance
+        let errorChanged = current == nil ? takerFailures.insert(id).inserted : takerFailures.remove(id) != nil
+        // A chart fetch and the background poll share this observation. Taker
+        // changes publish even when the independent OI request fails.
+        if changed || !closed.isEmpty || errorChanged { invalidateSnapshot(id); touch(id) }
     }
 
     private func updateTickers(_ tickers: [Any]) throws {
@@ -493,7 +548,8 @@ final class Radar {
                 emaStates.removeValue(forKey: id); chartLiveStats.removeValue(forKey: id)
                 liveHourQuotes.removeValue(forKey: id); closedHourQuotes.removeValue(forKey: id)
                 chartRevisions.removeValue(forKey: id); snapshotGenerations.removeValue(forKey: id)
-                cachedRows.removeValue(forKey: id); takerHistorySavedAt.removeValue(forKey: id)
+                cachedRows.removeValue(forKey: id); takerHistory.removeValue(forKey: id)
+                takerRequests.removeValue(forKey: id); takerFailures.remove(id)
                 exhaustedCandleHistory.remove(id)
             }
             for id in added {
@@ -533,7 +589,7 @@ final class Radar {
     }
 
     @discardableResult
-    private func updateCandle(_ id: String, _ values: [String], history: Bool = false, persist: Bool = true) -> Candle? {
+    func updateCandle(_ id: String, _ values: [String], history: Bool = false, persist: Bool = true) -> Candle? {
         guard rows[id] != nil, let bar = Candle(values), bar.hour >= hour - Int64(candleLookback) * hourMS else { return nil }
         let old = candles[id]?[bar.hour]
         guard !history || old == nil || (!old!.confirmed && bar.confirmed) || old!.baseVolume == nil || old!.open == nil else { return nil }
@@ -579,8 +635,8 @@ final class Radar {
             (1..<(min(hours, 13) + 1)).allSatisfy { series[hour - Int64($0) * hourMS]?.baseVolume != nil }
     }
 
-    private func scan(_ path: String, delay: UInt64, repeatScan: Bool = false, shard: Int = 0) async {
-        let workers = repeatScan ? 1 : 2
+    private func scan(_ path: String, delay: UInt64, shard: Int = 0) async {
+        let workers = 2
         var ids = rows.keys.sorted().enumerated().compactMap { $0.offset % workers == shard ? $0.element : nil }
         let failureKey = "\(path)#\(shard)"
         while !Task.isCancelled {
@@ -608,24 +664,7 @@ final class Radar {
                             touch(id)
                         }
                         if !hasPreviousHour { failed.insert(id) }
-                    default:
-                        if takerHistorySavedAt[id] != hour {
-                            for case let item as [String] in result {
-                                guard item.count >= 3, let ts = Int64(item[0]), ts % hourMS == 0, ts < hour,
-                                      let sell = Double(item[1]), let buy = Double(item[2]),
-                                      sell.isFinite, buy.isFinite, sell >= 0, buy >= 0 else { continue }
-                                try store.saveChartStat(id, hour: ts, sell: sell, buy: buy)
-                            }
-                            takerHistorySavedAt[id] = hour
-                        }
-                        if let item = result.compactMap({ $0 as? [String] }).first(where: { Int64($0.first ?? "") == hour }),
-                           item.count >= 3, let sell = Double(item[1]), let buy = Double(item[2]),
-                           buy.isFinite, sell.isFinite, buy >= 0, sell >= 0 {
-                            rows[id]?.buy = buy; rows[id]?.sell = sell
-                            rows[id]?.takerRatio = buy + sell > 0 ? (buy - sell) / (buy + sell) * 100 : nil
-                            invalidateSnapshot(id)
-                            touch(id)
-                        }
+                    default: break
                     }
                 } catch {
                     failed.insert(id)
@@ -635,8 +674,8 @@ final class Radar {
             }
             if Task.isCancelled { return }
             if failed.isEmpty { failedPaths.remove(failureKey) } else { failedPaths.insert(failureKey) }
-            if !repeatScan && failed.isEmpty { return }
-            ids = repeatScan ? rows.keys.sorted() : failed.sorted()
+            if failed.isEmpty { return }
+            ids = failed.sorted()
             try? await Task.sleep(nanoseconds: 10_000_000_000)
         }
     }
@@ -722,6 +761,7 @@ final class Radar {
         invalidateSnapshots()
         for id in rows.keys { chartRevisions[id, default: 0] &+= 1 }
         chartLiveStats.removeAll()
+        for id in takerHistory.keys { takerHistory[id] = takerHistory[id]?.filter { $0.key >= hour - 100 * hourMS } }
         for id in rows.keys {
             rows[id]?.buy = nil; rows[id]?.sell = nil; rows[id]?.takerRatio = nil
             rows[id]?.turnover24hUSDT = nil; rows[id]?.spreadPercent = nil; rows[id]?.quoteTimestamp = 0
@@ -771,6 +811,7 @@ final class Radar {
         let candlePath = "/market/candles"
         let oiPath = "/rubik/stat/contracts/open-interest-history"
         let takerPath = "/rubik/stat/taker-volume-contract"
+        let takerRequestedAt = ContinuousClock.now
         async let candleData = getData(candlePath, ["instId": id, "bar": "1H", "limit": "251"])
         async let oiData = getData(oiPath, ["instId": id, "period": "1H"])
         async let takerData = getData(takerPath, ["instId": id, "period": "1H"])
@@ -781,8 +822,14 @@ final class Radar {
         var statistics: [(label: String, values: [Any])] = []
         do { statistics.append(("OI", try decodeRows(await oiData, path: oiPath))) }
         catch { failures.append("OI") }
-        do { statistics.append(("taker volume", try decodeRows(await takerData, path: takerPath))) }
-        catch { failures.append("taker volume") }
+        do {
+            let volumes = try decodeRows(await takerData, path: takerPath).compactMap { ($0 as? [String]).flatMap(TakerVolume.init) }
+            try updateTakerVolumes(id, volumes, requestedAt: takerRequestedAt)
+            if takerFailures.contains(id) { failures.append("current-hour taker volume") }
+        } catch {
+            receiveTakerVolumes(.init(id: id, requestedAt: takerRequestedAt, volumes: [], error: error.localizedDescription))
+            failures.append("taker volume")
+        }
         var updatedOI = false
         for (label, result) in statistics {
             do {
@@ -795,13 +842,6 @@ final class Radar {
                             live.oi = value; chartLiveStats[id] = live
                         } else { try store.saveChartStat(id, hour: ts, oi: value) }
                         if ts >= hour - hourMS { updatedOI = true }
-                    } else if label == "taker volume", values.count >= 3,
-                              let sell = Double(values[1]), let buy = Double(values[2]),
-                              sell.isFinite, buy.isFinite, sell >= 0, buy >= 0 {
-                        if ts == hour {
-                            var live = chartLiveStats[id] ?? (oi: nil, sell: nil, buy: nil)
-                            live.sell = sell; live.buy = buy; chartLiveStats[id] = live
-                        } else { try store.saveChartStat(id, hour: ts, sell: sell, buy: buy) }
                     }
                 }
             } catch { failures.append(label) }
@@ -878,8 +918,9 @@ final class Radar {
     func chartSnapshot(_ id: String, sinceRevision: Int? = nil, endingAt endHour: Int64? = nil) -> [String: Any] {
         guard rows[id] != nil else { return ["bars": [], "error": "Unknown contract", "revision": -1] }
         let chartRevision = chartRevisions[id] ?? 0
+        let error = endHour == nil && takerFailures.contains(id) ? "OKX current-hour taker volume is unavailable; retrying." : ""
         if endHour == nil && sinceRevision == chartRevision {
-            return ["unchanged": true, "revision": chartRevision, "error": ""]
+            return ["unchanged": true, "revision": chartRevision, "error": error]
         }
         let null = NSNull()
         let end = endHour ?? hour
@@ -922,8 +963,8 @@ final class Radar {
             let stat = stats[ts]
             let live = chartLiveStats[id]
             let oi = ts == hour ? rows[id]?.oiUsd ?? live?.oi : stat?.oi
-            let sell = ts == hour ? rows[id]?.sell ?? live?.sell : stat?.sell
-            let buy = ts == hour ? rows[id]?.buy ?? live?.buy : stat?.buy
+            let sell = ts == hour ? rows[id]?.sell : stat?.sell
+            let buy = ts == hour ? rows[id]?.buy : stat?.buy
             output.append([
                 "hour": ts, "open": open, "high": bar.high, "low": bar.low, "close": bar.close,
                 "volume": bar.quoteVolume as Any? ?? null, "confirmed": bar.confirmed,
@@ -936,7 +977,7 @@ final class Radar {
                 "oi": oi as Any? ?? null, "sell": sell as Any? ?? null, "buy": buy as Any? ?? null,
             ])
         }
-        return ["bars": output, "error": "", "revision": chartRevision]
+        return ["bars": output, "error": error, "revision": chartRevision]
     }
 
     private func invalidateSnapshot(_ id: String) {
@@ -957,7 +998,7 @@ final class Radar {
     }
 
     private func snapshotMetadata() -> [String: Any] {
-        let error = !startupError.isEmpty ? startupError : !failedPaths.isEmpty ? "Some OKX data is unavailable; retrying." :
+        let error = !startupError.isEmpty ? startupError : !takerFailures.isEmpty ? "Some OKX current-hour taker volume is unavailable; retrying." : !failedPaths.isEmpty ? "Some OKX data is unavailable; retrying." :
             !disconnectedChannels.isEmpty ? "OKX \(disconnectedChannels.sorted()[0]) disconnected; reconnecting." : ""
         return ["rows": [[String: Any]](), "updatedAt": updatedAt as Any? ?? NSNull(), "error": error, "revision": revision,
                 "btcReceivedAt": btcReceivedAt as Any? ?? NSNull(), "btcConnected": running && !disconnectedChannels.contains("candle1H"),
