@@ -297,7 +297,11 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
                         "roc": sin(Double(index) / 5) * 2, "maroc": sin(Double(index) / 7), "rsi6": 50 + sin(Double(index) / 5) * 20,
                         "rsi12": 50 + sin(Double(index) / 7) * 10, "rsi24": 50 + sin(Double(index) / 9) * 5, "oi": 100_000_000 + index * 100_000, "buy": 1000 + index * 5, "sell": 800 + index * 3]
             }
-            let response: [String: Any] = ["bars": bars, "revision": revision, "error": "", "endHour": hour]
+            var response: [String: Any] = ["bars": bars, "revision": revision, "error": "", "endHour": hour]
+            if let profile = try? Store(url: directory.appendingPathComponent("radar.sqlite3")).selectedSuiteProfile("radar") {
+                response["strategy"] = ["id": profile.id, "name": profile.name, "revision": profile.revision]
+                response["strategySignals"] = [["hour": hour - 5 * hourMS, "price": 110.0]]
+            }
             if request["loadChart"] as? Bool == true, request["chartInstId"] as? String == holdChartLoadID {
                 holdChartLoadID = nil; heldChartLoadReply = { replyHandler(response, nil) }
                 return
@@ -519,7 +523,7 @@ final class RuleEditorUITests: BackgroundTestCase {
             if let data=image.tiffRepresentation, let png=NSBitmapImageRep(data:data)?.representation(using:.png,properties:[:]) { try png.write(to:URL(fileURLWithPath:path)) }
         }
         _ = try await js(view,"document.querySelector('[data-signal-lane=bullishSetup] button[aria-label=\"View MKT001-USDT-SWAP chart\"]').click(); true")
-        try await wait(view,"document.querySelector('section[aria-label=\"MKT001-USDT-SWAP chart\"] svg') !== null")
+        try await wait(view,"document.querySelector('section[aria-label=\"MKT001-USDT-SWAP chart\"] [data-chart-buy-hour]') !== null && document.querySelector('[title=\"BUY markers use completed hourly candles only\"]')?.innerText.includes('BUY')")
         _ = try await js(view,"window.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown'})); true")
         try await wait(view,"document.querySelector('section[aria-label=\"MKT002-USDT-SWAP chart\"]') !== null")
         try await click(view,"Signals")

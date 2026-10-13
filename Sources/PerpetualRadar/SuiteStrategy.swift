@@ -70,6 +70,11 @@ struct SuiteReading: Codable, Sendable {
     var price: Double?
 }
 
+struct StrategyChartSignal: Codable, Sendable, Equatable {
+    var hour: Int64
+    var price: Double
+}
+
 enum SuiteEvaluation {
     static func context(_ input: FilterMarketData, forming: Bool) -> FilterMarketData {
         if forming { return input }
@@ -95,6 +100,39 @@ enum SuiteEvaluation {
         if traces[0].result == .unknown || setup == .unknown { return ("Unknown", "A Universe or Bullish Setup input is unavailable.") }
         return ("Bullish Setup", "Universe and Bullish Setup match at this hour.")
     }
+}
+
+/// Replays a saved strategy one completed hour at a time. Each context is
+/// anchored to that candle close, so candles and readings after `hour` remain
+/// inaccessible to the evaluator even when they are present in the series.
+func strategyChartSignals(profile: StrategyProfile, market: FilterMarketData,
+                          reference: FilterMarketData? = nil, from: Int64, through: Int64) throws -> [StrategyChartSignal] {
+    guard from <= through else { return [] }
+    let filters = try profile.compiled(), cooldowns = FilterCooldownMemory()
+    var episode = ResearchEpisode(), output: [StrategyChartSignal] = []
+    for hour in stride(from: from, through: through, by: Int(hourMS)) {
+        var context = market
+        context.hour = hour; context.now = hour + hourMS
+        context.current = [:]; context.previousEMA = nil; context.historicalClose = true
+        context.evaluationTime = context.now; context.cooldowns = cooldowns; context.recordCooldowns = true
+        if let reference {
+            var referenceAtClose = reference
+            referenceAtClose.hour = hour; referenceAtClose.now = hour + hourMS
+            referenceAtClose.current = [:]; referenceAtClose.previousEMA = nil; referenceAtClose.historicalClose = true
+            referenceAtClose.evaluationTime = referenceAtClose.now; referenceAtClose.cooldowns = cooldowns
+            context.referenceBTC = FilterReferenceSnapshot(market: referenceAtClose)
+        } else { context.referenceBTC = nil }
+        guard context.candles[hour]?.confirmed == true else {
+            _ = episode.observe(.unknown)
+            continue
+        }
+        let traces = SuiteEvaluation.traces(context, filters: filters)
+        let matches = FilterTruth.all([traces[0].result, SuiteEvaluation.truth(traces, .bullishSetup)])
+        if episode.observe(matches) == "entry", let close = context.candles[hour]?.close, close.isFinite, close > 0 {
+            output.append(.init(hour: hour, price: close))
+        }
+    }
+    return output
 }
 
 actor SuiteEvaluationWorker {
