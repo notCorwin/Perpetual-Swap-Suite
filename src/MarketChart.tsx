@@ -338,12 +338,25 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
       const triangle = isLong
         ? `M${markerX} ${markerY - 7}L${markerX - 5} ${markerY + 1}H${markerX + 5}Z`
         : `M${markerX} ${markerY + 7}L${markerX - 5} ${markerY - 1}H${markerX + 5}Z`
-      const aria = `${isLong ? 'Long' : 'Short'} future move at ${time(signalHour)} close, ${formatPercent(signal.changePercent)} over ${signal.periods} hourly candles`
+      const aria = `${isLong ? 'Long' : 'Short'} future move entry at ${time(signalHour)}, ${formatPercent(signal.changePercent)} over ${signal.periods} hourly candles`
+      const exitX = exitIndex >= 0 ? x(exitIndex, 'price') : 0
+      const exitY = isLong
+        ? Math.max(panels.price[0] + 17, priceY(signal.exitPrice) - 9)
+        : Math.min(panels.price[1] - 17, priceY(signal.exitPrice) + 9)
+      const exitTriangle = isLong
+        ? `M${exitX} ${exitY + 7}L${exitX - 5} ${exitY - 1}H${exitX + 5}Z`
+        : `M${exitX} ${exitY - 7}L${exitX - 5} ${exitY + 1}H${exitX + 5}Z`
+      const exitAria = `Exit ${isLong ? 'Long' : 'Short'} future move at ${time(signal.exitHour)}, ${formatPercent(signal.changePercent)} after ${signal.periods} hourly candles`
       return <g key={`${signal.direction}-${signalHour}`} data-chart-move-direction={signal.direction} data-chart-move-hour={signalHour} aria-label={aria}>
-        {exitIndex >= 0 && <line x1={markerX} y1={priceY(signal.entryPrice)} x2={x(exitIndex, 'price')} y2={priceY(signal.exitPrice)} stroke={color} strokeWidth="1.2" strokeDasharray="3 4" opacity="0.7" />}
+        {exitIndex >= 0 && <line x1={markerX} y1={priceY(signal.entryPrice)} x2={exitX} y2={priceY(signal.exitPrice)} stroke={color} strokeWidth="1.2" strokeDasharray="3 4" opacity="0.7" />}
         <path d={triangle} fill={color} stroke="var(--chart-surface)" strokeWidth="1.5" />
         <text x={markerX} y={labelY} textAnchor="middle" fill={color} fontWeight="700">{isLong ? 'LONG' : 'SHORT'}</text>
         <title>{aria}</title>
+        {exitIndex >= 0 && <g data-chart-move-exit-direction={signal.direction} data-chart-move-exit-hour={signal.exitHour} aria-label={exitAria}>
+          <path d={exitTriangle} fill="var(--chart-surface)" stroke={color} strokeWidth="2" />
+          <text x={exitX} y={exitY + (isLong ? -10 : 14)} textAnchor="middle" fill={color} fontWeight="700">{isLong ? 'EXIT LONG' : 'EXIT SHORT'}</text>
+          <title>{exitAria}</title>
+        </g>}
       </g>
     })}
     {inspected !== null && panelKeys.map(key => <line key={key} x1={x(inspected, key)} x2={x(inspected, key)} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--foreground)" strokeWidth="0.65" strokeDasharray="3 5" opacity="0.3" />)}
@@ -649,7 +662,11 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
     const latestHour = chartCache.get(instId)?.data.bars.at(-1)?.hour ?? bars.at(-1)?.hour
     if (latestHour === undefined || steps === 0) return
     const current = windowEndRef.current?.id === instId ? windowEndRef.current.hour : null
-    const nextHour = scrollChartEnd(current, latestHour, steps, Number.isFinite(oldestCachedHour) ? oldestCachedHour : 0)
+    // Cached coverage is not the history boundary. Let the viewport move past
+    // it so the history-loading effect can fetch older candles. Clamp only
+    // after native has explicitly reported that exchange history is exhausted.
+    const oldestAvailableHour = historyBoundary?.id === instId ? historyBoundary.oldestHour : 0
+    const nextHour = scrollChartEnd(current, latestHour, steps, oldestAvailableHour)
     if (nextHour === current) { wheelPixels.current = 0; return }
     const next = nextHour === null ? null : { id: instId, hour: nextHour }
     windowEndRef.current = next
@@ -724,7 +741,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
           <span className="text-muted-foreground">{label} </span><span title={price(value)}>{price(value)}</span>
         </div>)}
       </div>}
-      <div ref={plotRef} className="relative min-h-0 flex-1 overflow-hidden" onWheel={event => {
+      <div ref={plotRef} data-chart-plot className="relative min-h-0 flex-1 overflow-hidden" onWheel={event => {
         if (analysis?.phase === 'capturing') return
         const horizontal = Math.abs(event.deltaX) > Math.abs(event.deltaY)
         const delta = horizontal ? event.deltaX : -event.deltaY

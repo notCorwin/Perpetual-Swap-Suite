@@ -10,8 +10,8 @@ export function livePriceTag(live: { hour: number; open: number; close: number }
 }
 
 // null means the right edge follows the latest candle.
-export function scrollChartEnd(endHour: number | null, latestHour: number, steps: number, oldestCachedHour = 0): number | null {
-  const earliestEnd = Math.min(latestHour, oldestCachedHour + 95 * hour)
+export function scrollChartEnd(endHour: number | null, latestHour: number, steps: number, oldestAvailableHour = 0): number | null {
+  const earliestEnd = Math.min(latestHour, oldestAvailableHour + 95 * hour)
   const next = Math.max(earliestEnd, Math.min(latestHour, (endHour ?? latestHour) + steps * hour))
   return next >= latestHour ? null : next
 }

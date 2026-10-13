@@ -24,6 +24,13 @@ test("historical scrolling holds its hour while the latest candle advances", () 
   assert.equal(scrollChartEnd(105 * hour, 500 * hour, 1, 10 * hour), 106 * hour)
 })
 
+test("cached coverage must not be used as the exchange history boundary", () => {
+  const latest = 500 * hour
+  const oldestCached = latest - 95 * hour
+  assert.equal(scrollChartEnd(null, latest, -1, oldestCached), null, "Passing cached coverage reproduces the locked viewport")
+  assert.equal(scrollChartEnd(null, latest, -1), latest - hour, "An unknown history boundary allows loading the preceding candle")
+})
+
 test("a cached candle range changes the visible 96-hour window immediately", () => {
   const bars = Array.from({ length: 250 }, (_, index) => ({ hour: index * hour }))
   assert.equal(visibleChartBars(bars, 249 * hour).length, 96)
