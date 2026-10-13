@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { addLibraryRule, anchorOffset, bodyPresentation, captureScope, conditionLibrary, parameterizedConditionMetrics, renameValueReferences, ruleSentence, topLevelSelection, visualPresets } from './filter-builder.ts'
 import { arithmeticExpression, rawExpression } from './filter-expression.ts'
-import { emptyFilterConfig, makeRule, unwrapRule, wrapRule, type FilterMetric } from './rule-engine.ts'
+import { comparisonConditionMetrics, emptyFilterConfig, makeRule, unwrapRule, wrapRule, type FilterMetric } from './rule-engine.ts'
 
 const metrics: FilterMetric[] = [
   { key: 'oiTrend', label: 'OI Trend', group: 'Open interest', description: 'Compare hourly OI.', unit: 'category', numeric: false, choices: [{ value: 'rising', label: 'Rising' }] },
@@ -87,6 +87,21 @@ test('fixed derived conditions collapse into canonical parameterized entries', (
   assert.equal(library.find(item => item.id === 'function:PriorExtreme')!.create().left, 'PriorExtreme(48, "high")')
   assert.equal(library.find(item => item.id === 'function:ExtremeAge')!.create().left, 'ExtremeAge(48, 48, "breakout")')
   assert.equal(library.find(item => item.id === 'function:relativeChange')!.create().left, 'relativeChange(Close, Open)')
+})
+test('legacy vs fields merge into direct editable comparisons', () => {
+  const variants = [...comparisonConditionMetrics].map(key => ({ key, label: key.replace(/([a-z])([A-Z])/g, '$1 vs $2'), group: 'Derived', description: 'Legacy comparison.', unit: 'category', numeric: false, choices: [] } satisfies FilterMetric))
+  const library = conditionLibrary(variants)
+  for (const key of comparisonConditionMetrics) {
+    assert.equal(library.some(item => item.id === `metric:${key}`), false, key)
+    assert.equal(library.some(item => item.id.startsWith('vs:') && item.keywords.includes(key)), true, key)
+  }
+  assert.deepEqual(library.filter(item => item.id.startsWith('vs:')).map(item => item.id), ['vs:price-ema', 'vs:rsi-rsi', 'vs:roc-maroc', 'vs:buy-sell', 'vs:log-bb', 'vs:price-vwap'])
+  const values = (id: string) => { const rule = library.find(item => item.id === id)!.create(); return [rule.left, rule.comparison, rule.right] }
+  assert.deepEqual(values('vs:rsi-rsi'), ['RSI(6)', 'gt', 'RSI(12)'])
+  assert.deepEqual(values('vs:roc-maroc'), ['ROC(9)', 'gt', 'MAROC(9, 9)'])
+  assert.deepEqual(values('vs:buy-sell'), ['buy', 'gt', 'sell'])
+  assert.deepEqual(values('vs:log-bb'), ['Close', 'gt', 'LogBB(20, 2, "upper")'])
+  assert.ok(library.find(item => item.id === 'vs:rsi-rsi')!.keywords.includes('rsi12vs24'))
 })
 test('summaries retain the selected time semantics and bulk operations do not double-apply ancestors', () => {
   const root = makeRule('all'), group = makeRule('every'), child = makeRule()

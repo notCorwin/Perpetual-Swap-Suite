@@ -18,7 +18,7 @@ export function RuleLibrary({ metrics, templates, preferences, onPreferences, on
   const words = query.toLowerCase().trim().split(/\s+/).filter(Boolean)
   const filtered = items.filter(item => {
     const text = `${item.label} ${item.group} ${item.description} ${item.keywords.join(' ')}`.toLowerCase()
-    const inSection = section === 'all' || section === 'favorites' && preferences.favorites.includes(item.id) || section === 'recent' && preferences.recent.includes(item.id) || section === 'ready' && item.id.startsWith('preset:') || section === 'indicators' && (item.metric || item.template?.group === 'Parameterized indicators') || section === 'values' && item.group === 'Value blocks' || section === 'logic' && ['Logic & time', 'Comparisons & availability'].includes(item.group)
+    const inSection = section === 'all' || section === 'favorites' && preferences.favorites.includes(item.id) || section === 'recent' && preferences.recent.includes(item.id) || section === 'ready' && item.id.startsWith('preset:') || section === 'indicators' && (item.indicator || item.metric || item.template?.group === 'Parameterized indicators') || section === 'values' && item.group === 'Value blocks' || section === 'logic' && ['Logic & time', 'Comparisons & availability'].includes(item.group)
     return inSection && words.every(word => text.includes(word))
   }).sort((a, b) => section === 'recent' ? preferences.recent.indexOf(a.id) - preferences.recent.indexOf(b.id) : 0)
   const visible = filtered.slice(0, limit), chosen = items.find(item => item.id === active)
