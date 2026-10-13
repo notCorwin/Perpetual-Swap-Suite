@@ -78,7 +78,10 @@ actor FilterHistoryLoader {
         guard through >= from, let research = try researchDatabase() else { return 0 }
         let version = try research.database.dataVersion()
         if let range = researchRanges[id], range.version == version, range.first <= from, range.last >= through { return 0 }
-        let values = try research.data(id, from: from, through: through)
+        // This path needs only the current candle/stat/quote heads. Starting
+        // from research_data makes SQLite inspect historical revisions before
+        // joining heads and can saturate several cores on a mature cache.
+        let values = try research.radarInputs(id, from: from, through: through)
         guard !values.isEmpty else {
             researchRanges[id] = (min(from, researchRanges[id]?.first ?? from), max(through, researchRanges[id]?.last ?? through), version)
             return 0
@@ -108,9 +111,11 @@ actor FilterHistoryLoader {
             try Task.checkCancellation()
             var market = original
             let first = max(0, market.hour - Int64(filter.requiredHours) * hourMS), last = market.hour - hourMS
-            // Research is an optimization source; an unavailable/corrupt
-            // research cache must never block Radar's own durable data or OKX.
-            _ = try? importResearch(market.id, from: first, through: last)
+            // Never import Research history on an interactive snapshot path.
+            // A large cache can contain hundreds of thousands of rows and used
+            // to keep suite evaluation inside one IPC request for minutes.
+            // `hydrate` imports the same verified rows in the background before
+            // making any OKX request, then publishes them through updatedMarkets.
             if ranges[market.id].map({ $0.first <= first && $0.last >= last }) != true {
                 let cached = try db.candles(market.id, since: first, through: last)
                 candleCache[market.id, default: [:]].merge(cached) { _, new in new }

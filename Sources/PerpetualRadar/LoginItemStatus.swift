@@ -32,7 +32,7 @@ final class LoginItemStatus {
     }
 
     nonisolated private static func systemStatus() -> String {
-        switch SMAppService.mainApp.status {
+        switch SMAppService.loginItem(identifier: MonitorRuntime.helperIdentifier).status {
         case .enabled: return "enabled"
         case .requiresApproval: return "requiresApproval"
         case .notRegistered: return "disabled"

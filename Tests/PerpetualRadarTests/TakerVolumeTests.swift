@@ -30,7 +30,7 @@ private actor SlowContractTransport: FilterHistoryTransport {
     let hour: Int64
     init(hour: Int64) { self.hour = hour }
     func fetch(path: String, parameters: [String: String]) async throws -> [[String]] {
-        guard path == "/rubik/stat/taker-volume-contract", parameters["unit"] == "1", parameters["period"] == "1H" else { throw FilterError("Incorrect Taker request") }
+        guard path == "/rubik/stat/taker-volume-contract", parameters["unit"] == "1", parameters["period"] == "1H", parameters["limit"] == "2" else { throw FilterError("Incorrect Taker request") }
         if parameters["instId"] == "AAA-USDT-SWAP" { try await Task.sleep(for: .seconds(60)) }
         if parameters["instId"] == "BAD-USDT-SWAP" { throw FilterError("Contract temporarily unavailable") }
         return [[String(hour), "200", "380"]]

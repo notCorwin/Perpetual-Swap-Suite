@@ -361,7 +361,7 @@ final class MonitorIPCConnection: @unchecked Sendable {
 enum MonitorIPC {
     // Bump when the request or reply format changes. Copies of the app that
     // share this version may share one monitor; see MonitorClient.compatible.
-    static let protocolVersion = 2
+    static let protocolVersion = 3
     @MainActor private static var connections: [String: Task<MonitorIPCConnection, Error>] = [:]
 
     static func socketPath(_ name: String) -> String {
@@ -444,6 +444,7 @@ final class MonitorClient {
     private let name: String
     private let appURL: URL
     private let revision: String
+    private let clientID = UUID().uuidString
     private let launch: (@MainActor () async throws -> Void)?
     private var connection: Connection?
     private var launchTask: Task<Void, Error>?
@@ -453,7 +454,7 @@ final class MonitorClient {
     var workspace = "radar"
     var researchBusy = false
     private var shuttingDown = false
-    private var lease: [String: Any] { ["pid": ProcessInfo.processInfo.processIdentifier, "workspace": workspace, "researchBusy": researchBusy] }
+    private var lease: [String: Any] { ["clientID": clientID, "pid": ProcessInfo.processInfo.processIdentifier, "workspace": workspace, "researchBusy": researchBusy] }
 
     init(name: String = MonitorRuntime.portName, appURL: URL = MonitorRuntime.appURL,
          revision: String = Bundle.main.object(forInfoDictionaryKey: "CFBundleSourceRevision") as? String ?? "development",
@@ -506,7 +507,7 @@ final class MonitorClient {
         shuttingDown = true; launchTask?.cancel()
         _ = try? await launchTask?.value
         // Another open copy keeps using the monitor; only the last client stops it.
-        let released = try? await MonitorIPC.request(["releaseLease": ProcessInfo.processInfo.processIdentifier], name: name, timeout: .seconds(3))
+        let released = try? await MonitorIPC.request(["releaseLease": clientID], name: name, timeout: .seconds(3))
         if released?["remainingClients"] as? Int ?? 0 == 0 {
             for _ in 0..<60 {
                 if !endpointExists { break }

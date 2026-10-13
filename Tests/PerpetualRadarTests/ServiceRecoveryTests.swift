@@ -149,4 +149,24 @@ final class ServiceRecoveryTests: XCTestCase {
         catch { XCTAssertTrue(error is CancellationError) }
         XCTAssertEqual(calls, 0)
     }
+
+    func testClientLeaseHasStableIdentityAndShutdownReleasesThatExactLease() async throws {
+        let name = "com.perpetualradar.recovery.\(UUID())", app = URL(fileURLWithPath: "/tmp/Recovery.app")
+        var acquired: String?, released: String?
+        let server = try MonitorIPCServer(name: name) { data in
+            let body = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+            if let lease = body["foregroundLease"] as? [String: Any] { acquired = lease["clientID"] as? String }
+            released = body["releaseLease"] as? String ?? released
+            return try! JSONSerialization.data(withJSONObject: ["value": [
+                "appPath": app.path, "revision": "fixture", "serviceSession": "one",
+                "remainingClients": body["releaseLease"] == nil ? 1 : 0,
+            ]])
+        }
+        defer { server.invalidate() }
+        let client = MonitorClient(name: name, appURL: app, revision: "fixture")
+        _ = try await client.request(["serviceInfo": true])
+        await client.shutdown()
+        XCTAssertNotNil(acquired)
+        XCTAssertEqual(released, acquired)
+    }
 }

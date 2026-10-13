@@ -233,6 +233,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func acceptNativeSettings(_ snapshot: [String: Any]) {
+        // UserDefaults caches are process-local. Mirror the Monitor's confirmed
+        // run mode so close/quit decisions cannot use a stale cross-process value.
+        if let enabled = snapshot["backgroundMonitoringEnabled"] as? Bool {
+            MonitorRuntime.defaults.set(enabled, forKey: "BackgroundMonitoring")
+        }
         if let enabled = snapshot["frostedBackgroundEnabled"] as? Bool, let opacity = snapshot["frostedBackgroundOpacity"] as? Double {
             frostedBackgroundEnabled = enabled; frostedBackgroundOpacity = opacity
             MonitorRuntime.defaults.set(enabled, forKey: "LastWindowFrostedEnabled")

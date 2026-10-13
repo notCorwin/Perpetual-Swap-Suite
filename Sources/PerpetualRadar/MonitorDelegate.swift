@@ -42,8 +42,13 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private lazy var automaticUpdatesItem = NSMenuItem(title: "Automatically Install Updates", action: #selector(toggleAutomaticUpdates), keyEquivalent: "")
     private var fixture: MonitorFixture?
     // Every open interface holds its own lease; several copies may share this monitor.
-    private struct Lease { var workspace = "radar", researchBusy = false }
-    private var leases: [Int32: Lease] = ProcessInfo.processInfo.environment["PERPETUAL_RADAR_OWNER_PID"].flatMap(Int32.init).map { [$0: Lease()] } ?? [:]
+    private struct Lease {
+        var pid: Int32
+        var workspace = "radar"
+        var researchBusy = false
+        var refreshedAt = ContinuousClock.now
+    }
+    private var leases: [String: Lease] = ProcessInfo.processInfo.environment["PERPETUAL_RADAR_OWNER_PID"].flatMap(Int32.init).map { ["launch:\($0)": Lease(pid: $0)] } ?? [:]
     private var foregroundWorkspace: String { leases.values.contains { $0.workspace == "research" } ? "research" : "radar" }
     private var researchBusy: Bool { leases.values.contains(where: \.researchBusy) }
     private var leaseTimer: Timer?
@@ -136,9 +141,9 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func renderMenu() {
-        let paused = radar?.monitoringPaused == true || !collectionAllowed
-        status.title = paused ? "Monitoring paused" : (!startupError.isEmpty || !monitoringError.isEmpty ? "Monitoring unavailable; retrying" : ((try? radar?.monitoringStrategy()) != nil ? "Monitoring active strategy · 1h" : "No active strategy · 1h"))
-        pauseItem.title = paused ? "Resume Monitoring" : "Pause Monitoring"; pauseItem.isEnabled = radar != nil
+        let paused = radar?.monitoringPaused == true
+        status.title = paused ? "Monitoring paused" : !collectionAllowed ? "Monitoring idle" : (!startupError.isEmpty || !monitoringError.isEmpty ? "Monitoring unavailable; retrying" : ((try? radar?.monitoringStrategy()) != nil ? "Monitoring active strategy · 1h" : "No active strategy · 1h"))
+        pauseItem.title = paused ? "Resume Monitoring" : "Pause Monitoring"; pauseItem.isEnabled = radar != nil && collectionAllowed
         let state = notifications?.authorization ?? .unavailable
         let labels: [MarketNotificationAuthorization: String] = [.notDetermined: "Permission needed", .denied: "Blocked in System Settings", .authorized: "Allowed", .quiet: "Banners disabled in System Settings", .unavailable: "Launch the packaged app"]
         permission.title = "Notifications: \(labels[state] ?? "Unavailable")"
@@ -147,7 +152,8 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginItem.state = loginStatus == "enabled" ? .on : loginStatus == "requiresApproval" ? .mixed : .off
         loginItem.title = loginStatus == "requiresApproval" ? "Start at Login · Approval Needed…" : "Start at Login"
         loginItem.isEnabled = MonitorRuntime.backgroundMonitoringEnabled && loginStatus != "unavailable"
-        statusItem?.button?.toolTip = "Perpetual Swap Suite · \(paused ? "Monitoring paused" : "Background monitoring")"
+        let toolTipState = paused ? "Monitoring paused" : collectionAllowed ? "Background monitoring" : "Monitoring idle"
+        statusItem?.button?.toolTip = "Perpetual Swap Suite · \(toolTipState)"
         renderUpdateItem()
         automaticUpdatesItem.state = AppDelegate.automaticUpdatesEnabled(in: MonitorRuntime.defaults) ? .on : .off
     }
@@ -158,10 +164,13 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func startMonitoring() {
-        guard let radar, monitor == nil, collectionAllowed else { return }
+        guard let radar, collectionAllowed else { return }
+        // Starting Radar is idempotent. Calling it before checking `monitor`
+        // also repairs a collector/monitor lifecycle mismatch automatically.
         if fixture == nil { radar.start() }
+        guard monitor == nil else { return }
         activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep, reason: "Monitor OKX contracts and deliver strategy notifications after the interface quits")
-        monitor = FilterMonitor(interval: fixture == nil ? .seconds(2) : .milliseconds(100), sample: { [weak self] in
+        monitor = FilterMonitor(interval: fixture == nil ? .seconds(15) : .milliseconds(100), sample: { [weak self] in
             guard let self, let radar = self.radar else { return nil }
             if let fixture { return try await fixture.observe(profile: radar.monitoringStrategy()) }
             return try await radar.observeSavedStrategy()
@@ -187,10 +196,11 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let loginStatus = await loginItemStatus.refresh(force: true)
         guard loginStatus != "unavailable" else { throw FilterError("Start at Login requires the packaged app.") }
         do {
+            let service = SMAppService.loginItem(identifier: MonitorRuntime.helperIdentifier)
             if enabled {
                 if loginStatus == "requiresApproval" { SMAppService.openSystemSettingsLoginItems() }
-                else if loginStatus != "enabled" { try SMAppService.mainApp.register() }
-            } else if loginStatus != "disabled" { try await SMAppService.mainApp.unregister() }
+                else if loginStatus != "enabled" { try service.register() }
+            } else if loginStatus != "disabled" { try await service.unregister() }
             loginError = ""
         } catch { loginError = error.localizedDescription; throw error }
         await refreshLoginStatus(force: true)
@@ -213,7 +223,10 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openNotificationSettings() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")!) }
     @objc private func resumeAfterWake(_ notification: Notification) {
         collector.retryNow(); recoverCollector()
-        if collectionAllowed && radar?.monitoringPaused == false { radar?.resumeAfterWake() }
+        if collectionAllowed && radar?.monitoringPaused == false {
+            radar?.resumeAfterWake()
+            monitor?.wake()
+        }
     }
     private func recoverCollector() {
         guard radar == nil else { return }
@@ -227,10 +240,16 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func checkForegroundLease() {
         Task { await refreshLoginStatus() }
         let wasResearchBusy = researchBusy
-        leases = leases.filter { kill($0.key, 0) == 0 || errno == EPERM }
+        leases = leases.filter {
+            let processIsAlive = kill($0.value.pid, 0) == 0 || errno == EPERM
+            return processIsAlive && $0.value.refreshedAt.duration(to: .now) < .seconds(60)
+        }
         if leases.isEmpty && !MonitorRuntime.backgroundMonitoringEnabled && !isInstallingUpdate { NSApp.terminate(nil) }
         if wasResearchBusy && !researchBusy { resumeAutomaticUpdate() }
         if collectionAllowed { recoverCollector() }
+        // This timer doubles as a lightweight supervisor. All operations are
+        // idempotent, so startup, wake, or lifecycle races heal automatically.
+        reconcileMonitoring()
     }
     @objc private func showInterface() { openInterface(instId: nil) }
     private func openInterface(instId: String?, strategyID: String? = nil) {
@@ -256,7 +275,7 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         result["monitoringPaused"] = radar?.monitoringPaused ?? false
         result["backgroundMonitoringEnabled"] = MonitorRuntime.backgroundMonitoringEnabled
         result["foregroundWorkspace"] = foregroundWorkspace
-        result["foregroundPIDs"] = leases.keys.sorted()
+        result["foregroundPIDs"] = Array(Set(leases.values.map(\.pid))).sorted()
         result["ipcVersion"] = MonitorIPC.protocolVersion
         result["serviceSession"] = sessionID
         result["databaseReady"] = radar != nil
@@ -270,7 +289,12 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func handle(_ parameters: [String: Any]) async throws -> [String: Any] {
         if let lease = parameters["foregroundLease"] as? [String: Any], let pid = lease["pid"] as? Int32, pid > 0 {
             let wasResearchBusy = researchBusy
-            leases[pid] = Lease(workspace: lease["workspace"] as? String == "research" ? "research" : "radar", researchBusy: lease["researchBusy"] as? Bool == true)
+            let clientID = lease["clientID"] as? String ?? "legacy:\(pid)"
+            // Replace the short-lived launch lease as soon as the real client
+            // identifies itself. Client IDs prevent a recycled PID from
+            // keeping an abandoned lease alive forever.
+            leases = leases.filter { !$0.key.hasPrefix("launch:") || $0.value.pid != pid }
+            leases[clientID] = Lease(pid: pid, workspace: lease["workspace"] as? String == "research" ? "research" : "radar", researchBusy: lease["researchBusy"] as? Bool == true)
             if isInstallingUpdate && installingAutomatically && researchBusy {
                 guard updater.cancel() else { throw FilterError("An update is completing its app replacement. Open Research after the app restarts.") }
                 isInstallingUpdate = false; installingAutomatically = false; updateProgress = nil; updateState = "available"
@@ -292,9 +316,10 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let fixture { info["samples"] = fixture.samples; info["delivered"] = fixture.delivered }
             return info
         }
-        if let pid = parameters["releaseLease"] as? Int32 {
+        if let released = parameters["releaseLease"] {
             let wasResearchBusy = researchBusy
-            leases.removeValue(forKey: pid)
+            if let clientID = released as? String { leases.removeValue(forKey: clientID) }
+            else if let pid = released as? Int32 { leases = leases.filter { $0.value.pid != pid } }
             if wasResearchBusy && !researchBusy { resumeAutomaticUpdate() }
             renderUpdateItem()
             let remaining = leases.count
