@@ -162,6 +162,7 @@
     --table-header: color-mix(in srgb, var(--foreground) calc(var(--table-header-default-opacity) * var(--surface-opacity-weight) * 100%), transparent);
     --chart-surface: transparent;
     --chart-annotation: var(--control);
+    --chart-price-tag-background: var(--card-base);
     --chart-rsi-area: color-mix(in srgb, var(--foreground) 5%, transparent);
     --market-list-design-width: 1600px;
     --analysis-design-width: 1600px;
@@ -173,11 +174,9 @@
     --market-table-leading-inset: 24px;
     --chart-text-size: 10px;
     --chart-legend-gap: 24px;
-    --chart-price-tag-gap: 7px;
     --chart-price-tag-padding-x: 12px;
     --chart-price-tag-padding-y: 7px;
     --chart-price-tag-row-gap: 2px;
-    --chart-price-tag-radius: var(--control-radius);
     --chart-price-tag-text-size: 12px;
     --chart-price-tag-stroke-width: 1.5px;
     --chart-price-tag-line-height: 1.1;

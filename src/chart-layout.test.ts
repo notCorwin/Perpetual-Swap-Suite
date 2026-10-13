@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chartCandleWidth, chartHourX, chartLayout, fitPriceTag, type ChartPanel } from "./chart-layout.ts"
+import { chartCandleWidth, chartHourX, chartLayout, fitAxisPriceTag, type ChartPanel } from "./chart-layout.ts"
 
 test("stacked chart layout stays aligned and bounded", () => {
   const order: ChartPanel[] = ["price", "roc", "rsi", "oi", "taker"]
@@ -30,19 +30,20 @@ test("chart hours retain their position when candles are missing", () => {
   assert.equal(chartHourX(10 * hour, 95 * hour, 0, 960), first + (last - first) * 10 / 95)
 })
 
-test("price tag scales to the axis gutter without clipping or shrinking below axis text", () => {
-  const gap = 7, stroke = 1.5, intrinsicWidth = 90, minimumScale = 10 / 12
-  const narrow = fitPriceTag(42, intrinsicWidth, gap, stroke, minimumScale)
+test("price tag fills the axis gutter without clipping or shrinking below axis text", () => {
+  const stroke = 1.5, intrinsicWidth = 90, minimumScale = 10 / 12
+  const narrow = fitAxisPriceTag(42, intrinsicWidth, stroke, minimumScale)
   assert.ok(narrow.scale >= minimumScale)
-  assert.ok(narrow.gutter < gap + intrinsicWidth + stroke)
-  assert.ok(gap + (intrinsicWidth + stroke) * narrow.scale <= narrow.gutter)
+  assert.ok(narrow.gutter < intrinsicWidth + stroke)
+  assert.equal((narrow.boxWidth + stroke) * narrow.scale, narrow.gutter)
 
-  const medium = fitPriceTag(85, intrinsicWidth, gap, stroke, minimumScale)
+  const medium = fitAxisPriceTag(85, intrinsicWidth, stroke, minimumScale)
   assert.equal(medium.gutter, 85)
   assert.ok(medium.scale > narrow.scale && medium.scale < 1)
-  assert.ok(gap + (intrinsicWidth + stroke) * medium.scale <= medium.gutter)
+  assert.equal((medium.boxWidth + stroke) * medium.scale, medium.gutter)
 
-  const wide = fitPriceTag(120, intrinsicWidth, gap, stroke, minimumScale)
+  const wide = fitAxisPriceTag(120, intrinsicWidth, stroke, minimumScale)
   assert.equal(wide.gutter, 120)
   assert.equal(wide.scale, 1)
+  assert.equal(wide.boxWidth + stroke, wide.gutter)
 })
