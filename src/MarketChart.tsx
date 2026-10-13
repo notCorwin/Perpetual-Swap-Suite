@@ -5,7 +5,9 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { ButtonGroup } from "@/components/ui/button-group"
 import { Spinner } from "@/components/ui/spinner"
+import { Toggle } from '@/components/ui/toggle'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
+import { Slider } from '@/components/ui/slider'
 import { ChartAnalysisPanel } from '@/ChartAnalysisPanel'
 import { ChartWorkspaceViewport } from '@/ChartWorkspaceViewport'
 import { chartAnalysis } from '@/analysis-service'
@@ -339,7 +341,7 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
         ? `M${markerX} ${markerY - 7}L${markerX - 5} ${markerY + 1}H${markerX + 5}Z`
         : `M${markerX} ${markerY + 7}L${markerX - 5} ${markerY - 1}H${markerX + 5}Z`
       const rank = moveSignals.length > 1 ? ` #${signal.rank}` : ''
-      const aria = `${isLong ? 'Long' : 'Short'}${rank} future move entry at ${time(signalHour)}, ${formatPercent(signal.changePercent)} over ${signal.periods} hourly candles, ${formatPercent(signal.efficiencyPercentPerPeriod)} per candle`
+      const aria = `${isLong ? 'Long' : 'Short'}${rank} future move entry at ${time(signalHour)}, ${formatPercent(signal.changePercent)} over ${signal.periods} hourly candles, efficiency score ${signal.efficiencyScore.toFixed(2)}`
       const exitX = exitIndex >= 0 ? x(exitIndex, 'price') : 0
       const exitY = isLong
         ? Math.max(panels.price[0] + 17, priceY(signal.exitPrice) - 9)
@@ -387,11 +389,13 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
   </>
 })
 
-export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack, backLabel = 'Markets' }: { instId: string; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void; onBack: () => void; backLabel?: string }) {
+export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = { chartMovePriceSource: 'highLow', chartMoveObjective: 'amplitude', chartMoveLabelsVisible: true, chartMoveEfficiencyFactor: 1 }, onSelect, onBack, backLabel = 'Markets' }: { instId: string; listOrder: string[]; turnoverOrder: string[]; moveDefaults?: { chartMovePriceSource: PriceMoveMode; chartMoveObjective: PriceMoveObjective; chartMoveLabelsVisible: boolean; chartMoveEfficiencyFactor: number }; onSelect: (id: string) => void; onBack: () => void; backLabel?: string }) {
   const analysis = useSyncExternalStore(chartAnalysis.subscribe, () => chartAnalysis.get(instId))
   const [analysisOpen, setAnalysisOpen] = useState(() => chartAnalysis.get(instId) !== null)
-  const [moveMode, setMoveMode] = useState<PriceMoveMode>('close')
-  const [moveObjective, setMoveObjective] = useState<PriceMoveObjective>('amplitude')
+  const [moveMode, setMoveMode] = useState<PriceMoveMode>(moveDefaults.chartMovePriceSource)
+  const [moveObjective, setMoveObjective] = useState<PriceMoveObjective>(moveDefaults.chartMoveObjective)
+  const [showMoveLabels, setShowMoveLabels] = useState(moveDefaults.chartMoveLabelsVisible)
+  const [moveEfficiencyFactor, setMoveEfficiencyFactor] = useState(moveDefaults.chartMoveEfficiencyFactor)
   const analysisBusy = analysis?.phase === 'capturing' || analysis?.phase === 'streaming'
   useEffect(() => () => chartAnalysis.stop(instId), [instId])
   const [displayed, setDisplayed] = useState<{ id: string; data: ChartResponse } | null>(null)
@@ -644,7 +648,8 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
 
   const viewportEnd = historicalEnd ?? chart?.bars.at(-1)?.hour ?? 0
   const bars = useMemo(() => visibleChartBars(cachedBars, viewportEnd), [cachedBars, viewportEnd])
-  const visibleMoveSignals = useMemo(() => capturePriceMoves(bars, 1, moveMode, moveObjective), [bars, moveMode, moveObjective])
+  const rankedMoveSignals = useMemo(() => capturePriceMoves(bars, 1, moveMode, moveObjective, moveEfficiencyFactor), [bars, moveMode, moveObjective, moveEfficiencyFactor])
+  const visibleMoveSignals = showMoveLabels ? rankedMoveSignals : []
   const inspectedIndex = inspection?.id === instId ? bars.findIndex(bar => bar.hour === inspection.hour) : -1
   const inspected = inspectedIndex < 0 ? null : inspectedIndex
   const inspectAt = (target: SVGSVGElement, clientX: number) => {
@@ -721,11 +726,11 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
       </ButtonGroup>
       <span role="status" className="sr-only">{captureStatus === "flashing" ? "Chart copied to clipboard" : ""}</span>
       <Badge variant="secondary"><Radio data-icon="inline-start" aria-hidden="true" />{historicalEnd !== null ? "History" : active && !active.confirmed ? "Live candle" : "Hourly chart"}</Badge>
-      <Badge variant="outline" title={`Hindsight labels use future completed candle ${moveSource} values and are not live trading signals`}>{longMoves} Long · {shortMoves} Short{moveObjective === 'efficiency' && strongestMove ? ` · ${formatPercent(strongestMove.efficiencyPercentPerPeriod)} / K` : ''}</Badge>
+      <Badge variant="outline" title={`Hindsight labels use future completed candle ${moveSource} values and are not live trading signals`}>{longMoves} Long · {shortMoves} Short{moveObjective === 'efficiency' && strongestMove ? ` · score ${strongestMove.efficiencyScore.toFixed(2)}` : ''}</Badge>
     </header>
     <div role="status" data-price-move-summary className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-xs">
       <span className="font-medium"><span className="text-positive">{longMoves} Long</span> · <span className="text-destructive">{shortMoves} Short</span></span>
-      <span className="text-muted-foreground">{visibleMoveSignals.length} ranked non-overlapping segments · {moveObjective === 'amplitude' ? 'largest move first' : 'highest |change| / K first'} · completed candles · move &gt; 1%</span>
+      <span className="text-muted-foreground">{visibleMoveSignals.length} ranked non-overlapping segments · {moveObjective === 'amplitude' ? 'largest move first' : `highest |change| / K^${moveEfficiencyFactor.toFixed(1)} first`} · completed candles · move &gt; 1%</span>
       <ToggleGroup type="single" variant="outline" size="sm" spacing={0} value={moveMode} onValueChange={value => {
         if (!value) return
         setMoveMode(value as PriceMoveMode)
@@ -744,6 +749,8 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
         <ToggleGroupItem value="amplitude">Max Move</ToggleGroupItem>
         <ToggleGroupItem value="efficiency">Max Efficiency</ToggleGroupItem>
       </ToggleGroup>
+      <div className="flex w-32 items-center gap-2" data-price-move-efficiency-factor={moveEfficiencyFactor} title="Efficiency = |change| / periods^factor"><span className="shrink-0 text-muted-foreground">Factor</span><Slider min={0} max={2} step={0.1} value={[moveEfficiencyFactor]} aria-label="Chart efficiency factor" onValueChange={([value]) => setMoveEfficiencyFactor(value)} onValueCommit={() => plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus()} onPointerUp={() => plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus()} onKeyUp={() => plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus()} /><span className="w-5 text-right tabular-nums">{moveEfficiencyFactor.toFixed(1)}</span></div>
+      <Toggle variant="outline" size="sm" pressed={showMoveLabels} onPressedChange={setShowMoveLabels} aria-label="Show move label layer" data-price-move-layer={showMoveLabels ? 'visible' : 'hidden'}>{showMoveLabels ? 'Labels On' : 'Labels Off'}</Toggle>
       <span className="ml-auto text-muted-foreground">Uses future data · labels only</span>
     </div>
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}{historicalEnd !== null && <Button variant="outline" size="sm" onClick={() => {

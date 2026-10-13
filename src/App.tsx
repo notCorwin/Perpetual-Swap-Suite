@@ -9,6 +9,7 @@ import { Toggle } from "@/components/ui/toggle"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Spinner } from "@/components/ui/spinner"
+import { Slider } from '@/components/ui/slider'
 import { RadarSignalBoard } from "@/RadarSignalBoard"
 import { radarSignals, signalMatches, type SignalTiming } from "@/radar-signals"
 import { ModeTitle } from "@/ModeTitle"
@@ -25,6 +26,7 @@ import { PERCENT_CHANGE_DESCRIPTION, formatPercent, percentageNumber, type Perce
 import { BREAK_DESCRIPTION, describeBreak, formatBreakPriorAge, formatBreakTime, type BreakDirection, type BreakResult } from "@/market-breaks"
 import { BANDWIDTH_EXPANSION_DESCRIPTION, LOG_BB_DESCRIPTION, formatBandWidthExpansion, formatLiveBand } from "@/market-logbb"
 import { MarketChart, type ChartPollResponse } from "@/MarketChart"
+import type { PriceMoveMode, PriceMoveObjective } from '@/price-move-signals'
 import { OPPORTUNITY_DESCRIPTION } from "@/market-opportunity"
 import { MarketOpportunity } from "@/MarketOpportunity"
 import { MarketListViewport } from "@/MarketListViewport"
@@ -48,10 +50,11 @@ const Research = lazy(() => import('@/Research').then(module => ({ default: modu
 type WindowAppearance = BlurSettings & { frostedBackgroundEnabled: boolean; frostedBackgroundOpacity: number }
 type NotificationSettings = { backgroundMonitoringEnabled: boolean; notificationsEnabled: boolean; notificationAuthorization: "notDetermined" | "denied" | "authorized" | "quiet" | "unavailable"; notificationError: string; backgroundMonitoringError: string; monitoringPaused: boolean; launchAtLogin: "enabled" | "disabled" | "requiresApproval" | "unavailable"; launchAtLoginError: string }
 type HistoryProgress = { pending: number; completed: number; error: string }
-type Snapshot = WindowAppearance & NotificationSettings & { rows: NativeMarketRow[]; updatedAt: number | null; error: string; revision: number; serviceSession?: string; filterMetricsCatalog: FilterMetric[]; filterFunctions: string[]; filterFunctionCatalog: ExpressionTemplate[]; filterLibraryPreferences: FilterLibraryPreferences; }
+type ChartMoveSettings = { chartMovePriceSource: PriceMoveMode; chartMoveObjective: PriceMoveObjective; chartMoveLabelsVisible: boolean; chartMoveEfficiencyFactor: number }
+type Snapshot = WindowAppearance & NotificationSettings & ChartMoveSettings & { rows: NativeMarketRow[]; updatedAt: number | null; error: string; revision: number; serviceSession?: string; filterMetricsCatalog: FilterMetric[]; filterFunctions: string[]; filterFunctionCatalog: ExpressionTemplate[]; filterLibraryPreferences: FilterLibraryPreferences; }
 type PreviewSnapshot = Snapshot & { filterResults: Record<string, FilterTruth>; filterToken: string; historyProgress: HistoryProgress }
 type UnchangedSnapshot = { unchanged: true; revision: number; error: string; serviceSession?: string }
-type SettingRequest = Partial<WindowAppearance> & { backgroundMonitoringEnabled?: boolean; notificationsEnabled?: boolean; monitoringPaused?: boolean; launchAtLogin?: boolean; notificationAction?: "refresh" | "requestPermission" | "test" | "openSettings"; filterLibraryPreferencesJSON?: string }
+type SettingRequest = Partial<WindowAppearance & ChartMoveSettings> & { backgroundMonitoringEnabled?: boolean; notificationsEnabled?: boolean; monitoringPaused?: boolean; launchAtLogin?: boolean; notificationAction?: "refresh" | "requestPermission" | "test" | "openSettings"; filterLibraryPreferencesJSON?: string }
 type NativeBridge = {
   postMessage(request: { analysisSettings: AnalysisSettingsRequest }): Promise<AnalysisSettings>
   postMessage(request: { gatewayFetch: { id: string; body: string } }): Promise<{ status: number; headers: Record<string, string> }>
@@ -222,6 +225,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     return snapshot
   }, radius => withSettingsDeadline(window.webkit.messageHandlers.radar.postMessage({ previewWindowBlur: radius })))
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>({ backgroundMonitoringEnabled: false, notificationsEnabled: true, notificationAuthorization: "notDetermined", notificationError: "", backgroundMonitoringError: "", monitoringPaused: false, launchAtLogin: "disabled", launchAtLoginError: "" })
+  const [chartMoveSettings, setChartMoveSettings] = useState<ChartMoveSettings>({ chartMovePriceSource: 'highLow', chartMoveObjective: 'amplitude', chartMoveLabelsVisible: true, chartMoveEfficiencyFactor: 1 })
   const [notificationPending, setNotificationPending] = useState(false)
   const [sort, setSort] = useState<SortKey>("opportunity")
   const [descending, setDescending] = useState(true)
@@ -287,6 +291,12 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
       launchAtLogin: snapshot.launchAtLogin ?? "disabled",
       launchAtLoginError: snapshot.launchAtLoginError ?? "",
     }))
+    setChartMoveSettings({
+      chartMovePriceSource: snapshot.chartMovePriceSource ?? 'highLow',
+      chartMoveObjective: snapshot.chartMoveObjective ?? 'amplitude',
+      chartMoveLabelsVisible: snapshot.chartMoveLabelsVisible ?? true,
+      chartMoveEfficiencyFactor: snapshot.chartMoveEfficiencyFactor ?? 1,
+    })
     if (!backgroundOpacityDraftDirty.current && document.activeElement?.id !== "background-opacity") setBackgroundOpacityDraft(String(snapshot.frostedBackgroundOpacity))
     setMetrics(current => keepSnapshotValue(current, snapshot.filterMetricsCatalog))
     setFunctions(current => keepSnapshotValue(current, snapshot.filterFunctions))
@@ -464,7 +474,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     </Button>
   }
 
-  if (selected && active) return <MarketChart instId={selected} listOrder={signalChartOrder ?? listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} backLabel={signalChartOrder ? 'Signals' : 'Markets'} onBack={() => { setSelected(null); setSignalChartOrder(null) }} />
+  if (selected && active) return <MarketChart instId={selected} listOrder={signalChartOrder ?? listOrder} turnoverOrder={turnoverOrder} moveDefaults={chartMoveSettings} onSelect={setSelected} backLabel={signalChartOrder ? 'Signals' : 'Markets'} onBack={() => { setSelected(null); setSignalChartOrder(null) }} />
 
   if (!ready) {
     return (
@@ -493,6 +503,14 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
             <PopoverHeader><PopoverTitle>Settings</PopoverTitle><PopoverDescription>Customize monitoring, notifications and the window background.</PopoverDescription></PopoverHeader>
             <FieldGroup>
               <Field><FieldLabel>AI analysis</FieldLabel><AnalysisSettingsButton /><FieldDescription>Configure the Gateway API Key and chart analysis model.</FieldDescription></Field>
+              <Field>
+                <FieldLabel>Move label defaults</FieldLabel>
+                <ToggleGroup type="single" variant="outline" spacing={0} value={chartMoveSettings.chartMovePriceSource} onValueChange={value => { if (value) saveSetting({ chartMovePriceSource: value as PriceMoveMode }) }} aria-label="Default move price source"><ToggleGroupItem value="close">Close</ToggleGroupItem><ToggleGroupItem value="highLow">High / Low</ToggleGroupItem></ToggleGroup>
+                <ToggleGroup type="single" variant="outline" spacing={0} value={chartMoveSettings.chartMoveObjective} onValueChange={value => { if (value) saveSetting({ chartMoveObjective: value as PriceMoveObjective }) }} aria-label="Default move optimization objective"><ToggleGroupItem value="amplitude">Max Move</ToggleGroupItem><ToggleGroupItem value="efficiency">Max Efficiency</ToggleGroupItem></ToggleGroup>
+                <Field><FieldLabel id="default-efficiency-factor">Efficiency factor <span className="tabular-nums text-muted-foreground">{chartMoveSettings.chartMoveEfficiencyFactor.toFixed(1)}</span></FieldLabel><Slider min={0} max={2} step={0.1} value={[chartMoveSettings.chartMoveEfficiencyFactor]} aria-labelledby="default-efficiency-factor" onValueChange={([value]) => setChartMoveSettings(current => ({ ...current, chartMoveEfficiencyFactor: value }))} onValueCommit={([value]) => saveSetting({ chartMoveEfficiencyFactor: value })} /></Field>
+                <Field orientation="horizontal"><FieldLabel htmlFor="default-move-label-layer">Show labels by default</FieldLabel><Toggle id="default-move-label-layer" variant="outline" pressed={chartMoveSettings.chartMoveLabelsVisible} onPressedChange={value => saveSetting({ chartMoveLabelsVisible: value })}>{chartMoveSettings.chartMoveLabelsVisible ? 'On' : 'Off'}</Toggle></Field>
+                <FieldDescription>Efficiency = |change| / periods^factor. 0 ignores time; 1 is change per K-line; values above 1 favor shorter moves more strongly. New charts use these defaults.</FieldDescription>
+              </Field>
               <Field><FieldLabel>Run mode</FieldLabel><ToggleGroup type="single" variant="outline" disabled={notificationPending} value={notificationSettings.backgroundMonitoringEnabled ? "background" : "onDemand"} onValueChange={value => { if (value) void updateNotifications({ backgroundMonitoringEnabled: value === "background" }) }} aria-label="Run mode"><ToggleGroupItem value="onDemand">On-demand</ToggleGroupItem><ToggleGroupItem value="background">Background Monitoring</ToggleGroupItem></ToggleGroup><FieldDescription>Background Monitoring allows the helper to keep collecting after closing or quitting. Start at Login requires this mode.</FieldDescription></Field>
               <Field>
                 <Field orientation="horizontal">

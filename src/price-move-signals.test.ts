@@ -32,8 +32,12 @@ test('efficiency objective prefers more movement per candle over total amplitude
   assert.equal(efficient.hour, 0)
   assert.equal(efficient.exitHour, hour)
   assert.equal(efficient.changePercent, 2)
-  assert.equal(efficient.efficiencyPercentPerPeriod, 2)
+  assert.equal(efficient.efficiencyScore, 2)
   assert.equal(efficient.rank, 1)
+  const noTimePenalty = capturePriceMoves(input, 1, 'close', 'efficiency', 0).find(signal => signal.rank === 1)!
+  assert.equal(noTimePenalty.exitHour, 11 * hour)
+  const strongerTimePenalty = capturePriceMoves(input, 1, 'close', 'efficiency', 2).find(signal => signal.rank === 1)!
+  assert.equal(strongerTimePenalty.exitHour, hour)
 })
 
 test('efficiency objective ranks every non-overlapping move above the amplitude threshold', () => {
