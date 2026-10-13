@@ -115,18 +115,18 @@ export const comparisons = [
 export const unaryComparison = (op: string): boolean => ["positive", "negative", "zero", "present", "missing"].includes(op)
 export const categoryComparisons = comparisons.filter(([key]) => ["eq", "neq", "present", "missing"].includes(key))
 export const parameterizedConditionMetrics: Record<string, string[]> = {
-  EMA: ['emaSlope', 'priceEMA', 'emaDistance'],
-  RSI: ['rsi6', 'rsi12', 'rsi24', 'rsi6vs12', 'rsi12vs24'],
-  ROC: ['roc', 'rocVsMaroc', 'rocChange'],
+  EMA: ['emaSlope', 'emaDistance'],
+  RSI: ['rsi6', 'rsi12', 'rsi24'],
+  ROC: ['roc', 'rocChange'],
   MAROC: ['maroc', 'marocChange'],
-  LogBB: ['priceUpper', 'priceMiddle', 'priceLower', 'highUpper', 'lowLower'],
-  VWAP: ['priceVWAP', 'vwapDistance'],
+  VWAP: ['vwapDistance'],
   PriorExtreme: ['high48', 'high96', 'closeHigh48', 'closeHigh96', 'low48', 'low96', 'closeLow48', 'closeLow96'],
   ExtremeAge: ['recentHigh48', 'recentHigh96', 'recentLow48', 'recentLow96', 'high48Age', 'high96Age', 'low48Age', 'low96Age'],
   relativeChange: ['priceChange', 'bodyChange', 'candleRange', 'oiChange'],
 }
-export const composableConditionMetrics = new Set(['price', 'liveVolume', 'candleDirection', 'buyVsSell'])
-export const replacedConditionMetrics = new Set([...Object.values(parameterizedConditionMetrics).flat(), ...composableConditionMetrics])
+export const comparisonConditionMetrics = new Set(['priceEMA', 'rsi6vs12', 'rsi12vs24', 'rocVsMaroc', 'buyVsSell', 'priceUpper', 'priceMiddle', 'priceLower', 'highUpper', 'lowLower', 'priceVWAP'])
+export const composableConditionMetrics = new Set(['price', 'liveVolume', 'candleDirection'])
+export const replacedConditionMetrics = new Set([...Object.values(parameterizedConditionMetrics).flat(), ...comparisonConditionMetrics, ...composableConditionMetrics])
 export const formulaExamples = [
   { label: "Long or Short alignment", source: '(emaTrend == "rising" AND ROC(9) > 0) OR (emaTrend == "falling" AND ROC(9) < 0)' },
   { label: "Relative volume", source: 'Volume > multiple(mean(lag(Volume, 1), 20), 2)' },

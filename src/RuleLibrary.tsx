@@ -20,7 +20,7 @@ export function RuleLibrary({ metrics, templates, preferences, onPreferences, on
     const favorites = new Set(preferences.favorites), recent = new Map(preferences.recent.map((id, index) => [id, index]))
     const filtered = items.filter(item => {
       const text = `${item.label} ${item.group} ${item.description} ${item.keywords.join(' ')}`.toLowerCase()
-      const inSection = section === 'all' || section === 'favorites' && favorites.has(item.id) || section === 'recent' && recent.has(item.id) || section === 'ready' && item.id.startsWith('preset:') || section === 'indicators' && (item.metric || item.template?.group === 'Parameterized indicators') || section === 'values' && item.group === 'Value blocks' || section === 'logic' && ['Logic & time', 'Comparisons & availability'].includes(item.group)
+      const inSection = section === 'all' || section === 'favorites' && favorites.has(item.id) || section === 'recent' && recent.has(item.id) || section === 'ready' && item.id.startsWith('preset:') || section === 'indicators' && (item.indicator || item.metric || item.template?.group === 'Parameterized indicators') || section === 'values' && item.group === 'Value blocks' || section === 'logic' && ['Logic & time', 'Comparisons & availability'].includes(item.group)
       return inSection && words.every(word => text.includes(word))
     }).sort((a, b) => section === 'recent' ? (recent.get(a.id) ?? Infinity) - (recent.get(b.id) ?? Infinity) : 0)
     const groups = new Map<string, LibraryItem[]>()

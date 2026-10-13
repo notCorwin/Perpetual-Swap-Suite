@@ -2,7 +2,7 @@ import { expressionName, expressionSource, expressionTemplates, templateExpressi
 import { canReceiveChildren, comparisons, findParent, findRule, makeRule, newRuleID, parameterizedConditionMetrics, replacedConditionMetrics, ruleKinds, updateRule, type EditorExpression, type FilterConfigV2, type FilterMetric, type NamedFormula, type RuleKind, type RuleNode } from './rule-engine.ts'
 export { parameterizedConditionMetrics } from './rule-engine.ts'
 
-export type LibraryItem = { id: string; label: string; group: string; description: string; keywords: string[]; unit?: string; metric?: FilterMetric; template?: ExpressionTemplate; create: () => RuleNode }
+export type LibraryItem = { id: string; label: string; group: string; description: string; keywords: string[]; unit?: string; metric?: FilterMetric; template?: ExpressionTemplate; indicator?: boolean; create: () => RuleNode }
 const condition = (left: string, comparison: string, right: string): RuleNode => ({ ...makeRule(), left, comparison, right })
 const branch = (kind: RuleKind, children: RuleNode[], hours = 3): RuleNode => ({ ...makeRule(kind), children, hours })
 // The condition editor exposes canonical parameterized/composable values
@@ -30,6 +30,14 @@ export const visualPresets = [
   { id: 'preset:sequence', label: 'Break & retest', description: 'Break above the prior 48h high, retest the captured level, then reclaim within 6 hours.', keywords: ['breakout retest reclaim event sequence capture', '突破 回踩 重新站上'], create: () => makeVisualBranch('sequence') },
   { id: 'preset:alignment', label: 'Long or short alignment', description: 'Rising EMA and positive ROC, or falling EMA and negative ROC, in separate groups.', keywords: ['and or long short trend momentum', '多空 分组'], create: () => branch('any', [branch('all', [condition('emaTrend', 'eq', '"rising"'), condition('ROC(9)', 'gt', '0')]), branch('all', [condition('emaTrend', 'eq', '"falling"'), condition('ROC(9)', 'lt', '0')])]) },
 ]
+const mergedComparisonPresets = [
+  { id: 'vs:price-ema', label: 'Price vs EMA', group: 'EMA & candle', description: 'Compare candle close with an EMA. Both the price source and EMA period are editable.', keys: ['priceEMA'], left: 'Close', right: 'EMA(200)' },
+  { id: 'vs:rsi-rsi', label: 'RSI vs RSI', group: 'RSI', description: 'Compare two RSI readings with independently editable periods.', keys: ['rsi6vs12', 'rsi12vs24'], left: 'RSI(6)', right: 'RSI(12)' },
+  { id: 'vs:roc-maroc', label: 'ROC vs MAROC', group: 'Momentum', description: 'Compare editable ROC and mean ROC readings directly.', keys: ['rocVsMaroc'], left: 'ROC(9)', right: 'MAROC(9, 9)' },
+  { id: 'vs:buy-sell', label: 'Buy vs Sell', group: 'Participation', description: 'Compare selected-hour taker buy and sell contract volumes directly.', keys: ['buyVsSell'], left: 'buy', right: 'sell' },
+  { id: 'vs:log-bb', label: 'Price or wick vs Log BB', group: 'Bands & VWAP', description: 'Compare close, high, or low with an editable Log BB band.', keys: ['priceUpper', 'priceMiddle', 'priceLower', 'highUpper', 'lowLower'], left: 'Close', right: 'LogBB(20, 2, "upper")' },
+  { id: 'vs:price-vwap', label: 'Price vs VWAP', group: 'Bands & VWAP', description: 'Compare candle close with a VWAP using an editable period.', keys: ['priceVWAP'], left: 'Close', right: 'VWAP(14)' },
+]
 export function conditionLibrary(metrics: FilterMetric[], templates: ExpressionTemplate[] = expressionTemplates): LibraryItem[] {
   const aliases = (template: ExpressionTemplate) => parameterizedConditionMetrics[template.name]?.flatMap(key => {
     const metric = metrics.find(item => item.key === key)
@@ -37,6 +45,9 @@ export function conditionLibrary(metrics: FilterMetric[], templates: ExpressionT
   }) ?? []
   return [
     ...visualPresets.map(p => ({ ...p, group: p.id.startsWith('preset:btc-') ? 'BTC Market Context' : 'Ready to use' })),
+    ...mergedComparisonPresets.map(preset => ({ id: preset.id, label: preset.label, group: preset.group, description: preset.description, indicator: true, unit: 'comparison',
+      keywords: ['vs', 'versus', ...preset.keys.flatMap(key => { const metric = metrics.find(item => item.key === key); return metric ? [key, metric.label, ...(metric.aliases ?? [])] : [key] })],
+      create: () => condition(preset.left, 'gt', preset.right) })),
     ...metrics.filter(metric => !replacedConditionMetrics.has(metric.key)).map(metric => ({ id: `metric:${metric.key}`, label: metric.label, group: metric.group, description: metric.description, keywords: [metric.key, ...(metric.aliases ?? [])], unit: metric.unit, metric,
       create: () => condition(metric.key, metric.numeric ? 'gt' : 'eq', metric.numeric ? metric.unit === '0–100' ? '50' : '0' : JSON.stringify(metric.choices[0]?.value ?? '')) })),
     ...templates.map(template => ({ id: `function:${template.name}`, label: template.label, group: template.group === 'Expression functions' ? 'Value blocks' : template.group, description: template.description, keywords: [template.name, ...aliases(template)], unit: template.unit, template,
