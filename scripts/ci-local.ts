@@ -18,9 +18,13 @@ function stop() {
   stopped = true
   const groups = [...running].flatMap(child => child.pid ? [child.pid] : [])
   for (const pid of groups) { try { process.kill(-pid, 'SIGTERM') } catch { /* Already exited. */ } }
+  // test-native.sh needs time to terminate LaunchServices-detached app/helper
+  // children and remove its private bundle. Killing its shell after 500 ms
+  // bypasses that EXIT cleanup and leaves WebKit processes competing with the
+  // next CI run.
   setTimeout(() => {
     for (const pid of groups) { try { process.kill(-pid, 'SIGKILL') } catch { /* Already exited. */ } }
-  }, 500).unref()
+  }, 2_000).unref()
 }
 
 async function run(name: string, command: string, args: string[]): Promise<string> {
@@ -71,8 +75,6 @@ try {
     // free of other suites' URLSession callbacks and heavy WebKit rendering.
     const paced = units.filter(id => id.includes('.ResearchRequestTests/'))
     if (!paced.length) throw new Error('The research network quota suite is missing')
-    const pacedTask = execute('research-network-pacing', paced)
-    pacedTask.catch(() => {})
     const updateInstall = units.filter(id => id.includes('.AppUpdaterTests/testNativeDownloadRetriesReportsStreamingProgressAndInstallsVerifiedRelease'))
     if (updateInstall.length !== 1) throw new Error('The isolated update install test is missing')
     const monitorUpdates = units.filter(id => id.includes('.MonitorUpdateTests/'))
@@ -87,6 +89,8 @@ try {
     if (navigationDeadline.length !== 1) throw new Error('The isolated navigation deadline test is missing')
     const saveDeadline = ui.filter(id => id.includes('testStrategyUniverseSavesPromptlyWhilePreviewIsSlowAndKeepsMarketRows'))
     if (saveDeadline.length !== 1) throw new Error('The isolated strategy save deadline test is missing')
+    const typedRecovery = ui.filter(id => id.includes('testNativeTypedRuleDraftRecoveryExplanationsAndLargeMarketResponsiveness'))
+    if (typedRecovery.length !== 1) throw new Error('The isolated typed-rule recovery test is missing')
     const earlyResearch = ui.filter(id => id.includes('testResearchPrepareRunFrozenChartPaginationAndRadarIsolationInNativeWebKit') || id.includes('testLargeResearchDataPlanKeepsWorkspaceSwitchingResponsive'))
     if (earlyResearch.length !== 2) throw new Error('An early Research workflow test is missing')
     // Keep each test class together, but overlap independent business suites.
@@ -116,6 +120,13 @@ try {
     }
     await Promise.all([web, ...checks])
     await run('app-package', 'scripts/build-app.sh', ['--prebuilt'])
+    // Run the two lightweight timing suites after compilers and bundlers have
+    // released the machine, before starting the large native process pool.
+    // They exercise independent subsystems (WebKit paint and URL admission),
+    // while heavy workers would turn both into machine-contention benchmarks.
+    const pacedTask = execute('research-network-pacing', paced)
+    pacedTask.catch(() => {})
+    await Promise.all([execute('webkit-responsiveness', benchmark), pacedTask])
     const earlyResearchTasks = earlyResearch.map((id, index) => execute(`webkit-early-research-${index + 1}`, [id]))
     Promise.all(earlyResearchTasks).catch(() => {})
     // This test owns a deliberately short completion deadline. Run it once the
@@ -123,10 +134,11 @@ try {
     // turn its timing assertion into a machine-load test.
     await Promise.all([
       execute('update-install-deadline', updateInstall),
-      execute('monitor-update-coordination', monitorUpdates),
+      ...monitorUpdates.map((id, index) => execute(`monitor-update-coordination-${index + 1}`, [id])),
       execute('native-capture-deadline', nativeCapture),
       execute('navigation-deadline', navigationDeadline),
       execute('strategy-save-deadline', saveDeadline),
+      execute('typed-rule-recovery', typedRecovery),
     ])
     const earlyServiceTasks = services.map((id, index) => execute(`packaged-lifecycle-${index + 1}`, [id]))
     Promise.all(earlyServiceTasks).catch(() => {})
@@ -138,10 +150,10 @@ try {
     // Business tests do not share the menu benchmark's WebView. Start their
     // independent processes now rather than leaving every CPU idle during it.
     const unitTasks = unitShards.filter(shard => shard.ids.length).map(shard => execute(shard.name, shard.ids))
-    // Attach rejection handlers before awaiting the benchmark; the shared
-    // result handling below still propagates every unit-test failure.
     Promise.all(unitTasks).catch(() => {})
-    await Promise.all([execute('webkit-responsiveness', benchmark), pacedTask])
+    // Attach rejection handlers immediately; the shared result handling below
+    // still propagates every unit-test failure.
+    Promise.all(unitTasks).catch(() => {})
     // Start long scenarios first. One shared pool bounds native processes,
     // including the packaged apps, instead of oversubscribing WindowServer.
     // Every discovered test is assigned once, including newly added cases.
@@ -149,7 +161,7 @@ try {
     const weight = (id: string) => { const rank = priority.findIndex(name => id.includes(name)); return rank < 0 ? priority.length : rank }
     const initialCosts: [string, number][] = [['testResearchPrepareRun', 45], ['testVisualFunctionCoverage', 25], ['testDraggingConditions', 20], ['.MonitorServiceTests/testPackaged', 20]]
     const taskCost = (ids: string[]) => ids.reduce((seconds, id) => seconds + (durations.get(id) ?? initialCosts.find(([name]) => id.includes(name))?.[1] ?? 5), 0)
-    const orderedUI = ui.filter(id => !benchmark.includes(id) && !pixels.includes(id) && !nativeCapture.includes(id) && !navigationDeadline.includes(id) && !saveDeadline.includes(id) && !earlyResearch.includes(id)).sort((a, b) => taskCost([b]) - taskCost([a]) || weight(a) - weight(b))
+    const orderedUI = ui.filter(id => !benchmark.includes(id) && !pixels.includes(id) && !nativeCapture.includes(id) && !navigationDeadline.includes(id) && !saveDeadline.includes(id) && !typedRecovery.includes(id) && !earlyResearch.includes(id)).sort((a, b) => taskCost([b]) - taskCost([a]) || weight(a) - weight(b))
     const uiTask = (id: string) => ({ name: `webkit-${id.split('/')[1]}`, ids: [id] })
     const queue = [
       ...orderedUI.slice(2).map(uiTask),
