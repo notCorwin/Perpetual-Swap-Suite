@@ -722,7 +722,13 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
     <div role="status" data-price-move-summary className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-xs">
       <span className="font-medium"><span className="text-positive">{longMoves} Long</span> · <span className="text-destructive">{shortMoves} Short</span></span>
       <span className="text-muted-foreground">Strongest visible move · completed candles · move &gt; 1% · shortest K-line span breaks ties</span>
-      <ToggleGroup type="single" variant="outline" size="sm" spacing={0} value={moveMode} onValueChange={value => { if (value) setMoveMode(value as PriceMoveMode) }} aria-label="Move price source" data-price-move-mode={moveMode}>
+      <ToggleGroup type="single" variant="outline" size="sm" spacing={0} value={moveMode} onValueChange={value => {
+        if (!value) return
+        setMoveMode(value as PriceMoveMode)
+        // Radix single-select items are radios. Return focus to the chart so
+        // market-navigation shortcuts remain active immediately after switching.
+        plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus()
+      }} aria-label="Move price source" data-price-move-mode={moveMode}>
         <ToggleGroupItem value="close">Close</ToggleGroupItem>
         <ToggleGroupItem value="highLow">High / Low</ToggleGroupItem>
       </ToggleGroup>
