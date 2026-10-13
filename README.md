@@ -99,7 +99,9 @@ Taker Buy/Sell uses OKX's per-contract `1H` statistics in **contracts** (`unit=1
 | Copy chart | Copy an image with an opaque theme background |
 | Analyze chart / Analysis | Analyze the visible chart or reopen its conversation |
 
-Open **Settings → Configure analysis** to save a Vercel AI Gateway API Key in macOS Keychain and choose an image-capable model. The default is `openai/gpt-6.1-sol`. Chart analysis uses the OpenAI-compatible AI SDK provider with native URLSession networking.
+Open **Settings → Configure analysis** to save a Vercel AI Gateway API Key locally for your macOS user and choose an image-capable model. The default is `openai/gpt-6.1-sol`. Chart analysis uses the OpenAI-compatible AI SDK provider with native URLSession networking.
+
+The key lives outside the app bundle in `~/Library/Application Support/PerpetualRadar/Credentials/ai-gateway.json`, with file permissions `0600` and directory permissions `0700`. It is stored as local plaintext protected by your macOS account's file permissions. App updates and repeated analyses use this record without Keychain authorization. Existing installations import their old Keychain key once; macOS may request authorization for that migration. A canceled or failed import can be retried, or bypassed by saving a new key. The local record then becomes authoritative, including after **Remove key**, so the unused legacy Keychain item is never reimported. Credential access runs off the main actor, and settings responses never contain the saved key.
 
 **Analyze chart** opens the right-hand panel and sends an opaque PNG of the visible chart with the fixed long-entry question. Answers stream in Chinese. Follow-ups reuse that snapshot and the conversation's model; **New analysis** captures the current chart and starts over. Each contract's conversation and draft stay in memory until the app exits. Switching contracts, leaving the chart, closing the panel, or pressing **Stop** cancels an active request; retries are manual.
 

@@ -8,19 +8,20 @@ struct GatewayError: LocalizedError {
     init(_ message: String) { self.message = message }
 }
 
-@MainActor
-protocol GatewayCredentials {
-    func read() throws -> String?
-    func write(_ key: String) throws
-    func remove() throws
+protocol GatewayCredentialReader: Sendable {
+    func read() async throws -> String?
 }
 
-@MainActor
-final class KeychainGatewayCredentials: GatewayCredentials {
+protocol GatewayCredentials: GatewayCredentialReader {
+    func write(_ key: String) async throws
+    func remove() async throws
+}
+
+actor KeychainGatewayCredentials: GatewayCredentialReader {
     private var query: [String: Any] {
         let context = LAContext()
-        // Normal app use can authorize Keychain access after an app update;
-        // every test channel forbids authentication UI.
+        // Only legacy migration reads Keychain. Every test channel forbids
+        // authentication UI, including direct invocations of this reader.
         context.interactionNotAllowed = MonitorRuntime.testChannel != nil
         return [kSecClass as String: kSecClassGenericPassword,
          kSecAttrService as String: "com.perpetualradar.macos.ai-gateway",
@@ -40,23 +41,6 @@ final class KeychainGatewayCredentials: GatewayCredentials {
         }
         return value
     }
-    func write(_ key: String) throws {
-        let data = Data(key.utf8)
-        var status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-        if status == errSecItemNotFound {
-            var item = query
-            item[kSecValueData as String] = data
-            item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            status = SecItemAdd(item as CFDictionary, nil)
-        }
-        guard status == errSecSuccess else { throw GatewayError("Cannot save the Gateway API Key in Keychain (\(status)).") }
-    }
-    func remove() throws {
-        let status = SecItemDelete(query as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw GatewayError("Cannot remove the Gateway API Key from Keychain (\(status)).")
-        }
-    }
 }
 
 @MainActor
@@ -64,14 +48,14 @@ final class GatewaySettings {
     static let defaultModel = "openai/gpt-6.1-sol"
     private let credentials: any GatewayCredentials
     private let defaults: UserDefaults
-    init(credentials: any GatewayCredentials = KeychainGatewayCredentials(), defaults: UserDefaults = .standard) {
+    init(credentials: any GatewayCredentials = FileGatewayCredentials(), defaults: UserDefaults = .standard) {
         self.credentials = credentials; self.defaults = defaults
     }
-    func snapshot() throws -> [String: Any] {
+    func snapshot() async throws -> [String: Any] {
         ["model": defaults.string(forKey: "AIAnalysisModel") ?? Self.defaultModel,
-         "hasAPIKey": !(try credentials.read() ?? "").isEmpty]
+         "hasAPIKey": !(try await credentials.read() ?? "").isEmpty]
     }
-    func handle(_ request: [String: Any]) throws -> [String: Any] {
+    func handle(_ request: [String: Any]) async throws -> [String: Any] {
         switch request["action"] as? String {
         case "read": break
         case "save":
@@ -79,18 +63,18 @@ final class GatewaySettings {
                 throw GatewayError("Enter a model ID.")
             }
             if let key = request["apiKey"] as? String, !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                try credentials.write(key.trimmingCharacters(in: .whitespacesAndNewlines))
+                try await credentials.write(key.trimmingCharacters(in: .whitespacesAndNewlines))
             }
             defaults.set(model.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "AIAnalysisModel")
-        case "removeKey": try credentials.remove()
+        case "removeKey": try await credentials.remove()
         default: throw GatewayError("Invalid analysis settings action.")
         }
-        return try snapshot()
+        return try await snapshot()
     }
-    func authorizedRequest(body: String) throws -> URLRequest {
-        guard let key = try credentials.read(), !key.isEmpty else { throw GatewayError("Configure a Gateway API Key to analyze charts.") }
+    func authorizedRequest(body: String) async throws -> URLRequest {
         guard let data = body.data(using: .utf8), let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               object["model"] is String, object["messages"] is [Any] else { throw GatewayError("Invalid Gateway request.") }
+        guard let key = try await credentials.read(), !key.isEmpty else { throw GatewayError("Configure a Gateway API Key to analyze charts.") }
         var request = URLRequest(url: URL(string: "https://ai-gateway.vercel.sh/v1/chat/completions")!)
         request.httpMethod = "POST"; request.httpBody = data
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
@@ -121,11 +105,12 @@ final class GatewayClient {
                reply: @escaping @MainActor @Sendable (Any?, String?) -> Void,
                emit: @escaping @MainActor ([String: Any]) async -> Void) throws {
         guard !id.isEmpty, tasks[id] == nil else { throw GatewayError("Invalid or duplicate Gateway request ID.") }
-        let request = try settings.authorizedRequest(body: body)
         tasks[id] = Task {
             var replied = false
             defer { tasks.removeValue(forKey: id) }
             do {
+                let request = try await settings.authorizedRequest(body: body)
+                try Task.checkCancellation()
                 let (bytes, response) = try await session.bytes(for: request)
                 networkTasks[id] = bytes.task
                 defer { bytes.task.cancel(); networkTasks.removeValue(forKey: id) }
