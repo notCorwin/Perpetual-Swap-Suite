@@ -105,4 +105,28 @@ final class StrategyWorkflowTests: XCTestCase {
         spec.strategySnapshots = [first, second]; spec.kind = "cycle"
         XCTAssertThrowsError(try spec.resolvingStrategyRules(), "Only Bullish Setup is supported.")
     }
+
+    func testChartBuySignalsUseOnlyCompletedInformationAndMarkEpisodeEntries() throws {
+        let start = hour - 5 * hourMS
+        var bars: [Int64: Candle] = [:]
+        for (index, close) in [90.0, 95, 110, 120, 80, 130].enumerated() {
+            let timestamp = start + Int64(index) * hourMS
+            bars[timestamp] = Candle(hour: timestamp, high: close + 1, low: close - 1, close: close, quoteVolume: 100, baseVolume: 1, open: close)
+        }
+        let strategy = try profile(universe: "Close > 0", setup: "Close > 100")
+        var context = FilterMarketData(id: "ETH-USDT-SWAP", hour: hour, now: hour + hourMS, listedAt: 1,
+            candles: bars, stats: [:], quotes: [:], historicalClose: true)
+        XCTAssertEqual(try strategyChartSignals(profile: strategy, market: context, from: start, through: hour).map(\.hour),
+                       [start + 2 * hourMS, start + 5 * hourMS])
+
+        // A later candle is available in memory but cannot alter an earlier decision.
+        context.candles[hour] = Candle(hour: hour, high: 1_001, low: 999, close: 1_000, quoteVolume: 100, baseVolume: 1, open: 1_000)
+        XCTAssertEqual(try strategyChartSignals(profile: strategy, market: context, from: start, through: start + 3 * hourMS).map(\.hour),
+                       [start + 2 * hourMS])
+
+        context.candles[start + 5 * hourMS] = Candle(hour: start + 5 * hourMS, high: 131, low: 129, close: 130,
+            quoteVolume: 100, baseVolume: 1, open: 130, confirmed: false)
+        XCTAssertEqual(try strategyChartSignals(profile: strategy, market: context, from: start, through: hour).map(\.hour),
+                       [start + 2 * hourMS], "The forming candle must never become a historical BUY marker.")
+    }
 }

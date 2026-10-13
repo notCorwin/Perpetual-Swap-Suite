@@ -235,7 +235,13 @@ final class Radar {
         let mode = request["mode"] as? String ?? "radar"
         var response = try store.manageSuite(request, mode: mode)
         let action = request["action"] as? String ?? "inventory"
-        if ["save", "select", "copy", "delete"].contains(action) { touch() }
+        if ["save", "select", "copy", "delete"].contains(action) {
+            // Strategy identity is part of every chart response. Retire cached
+            // chart payloads immediately so BUY markers cannot belong to the
+            // previously active revision.
+            for id in rows.keys { chartRevisions[id, default: 0] &+= 1 }
+            touch()
+        }
         let profile: StrategyProfile?
         if action == "preview", let raw = request["profile"] {
             profile = try JSONDecoder().decode(StrategyProfile.self, from: SafeJSON.data(raw))
@@ -989,11 +995,30 @@ final class Radar {
         let first = end - Int64(candleLookback - 1) * hourMS
         var series: [Int64: Candle]
         let stats: [Int64: (oi: Double?, sell: Double?, buy: Double?)]
+        let profile = try? store.selectedSuiteProfile("radar")
+        var chartSignals: [StrategyChartSignal] = []
         do {
             let warmup = max(candleLookback, emaWarmupHours(200))
             series = try store.candles(id, since: max(0, first - Int64(warmup) * hourMS), through: end)
             for (ts, bar) in candles[id] ?? [:] where ts >= first - Int64(warmup) * hourMS && ts <= end && (ts == hour || series[ts] == nil) { series[ts] = bar }
-            stats = try store.chartStats(id, since: first, through: end)
+            let dataFirst = max(0, first - Int64(warmup) * hourMS)
+            stats = try store.chartStats(id, since: dataFirst, through: end)
+            if let profile {
+                let hydration = try profile.hydration()
+                let quotes = hydration.needsQuotes ? try store.hourlyQuotes(id, since: dataFirst, through: end) : [:]
+                let market = FilterMarketData(id: id, hour: end, now: end + hourMS, listedAt: rows[id]?.listedAt,
+                    candles: series, stats: stats.mapValues { FilterStat(oi: $0.oi, sell: $0.sell, buy: $0.buy) }, quotes: quotes, historicalClose: true)
+                var reference: FilterMarketData?
+                if hydration.referencesBTC {
+                    let referenceCandles = try store.candles(btcReferenceID, since: dataFirst, through: end)
+                    let referenceStats = hydration.btcRequirements?.needsStats == true ? try store.chartStats(btcReferenceID, since: dataFirst, through: end) : [:]
+                    let referenceQuotes = hydration.btcRequirements?.needsQuotes == true ? try store.hourlyQuotes(btcReferenceID, since: dataFirst, through: end) : [:]
+                    reference = FilterMarketData(id: btcReferenceID, hour: end, now: end + hourMS, listedAt: rows[btcReferenceID]?.listedAt,
+                        candles: referenceCandles, stats: referenceStats.mapValues { FilterStat(oi: $0.oi, sell: $0.sell, buy: $0.buy) }, quotes: referenceQuotes, historicalClose: true)
+                }
+                let confirmedThrough = min(end, hour - hourMS)
+                chartSignals = try strategyChartSignals(profile: profile, market: market, reference: reference, from: first, through: confirmedThrough)
+            }
         }
         catch { return ["bars": [], "error": "Cannot read chart cache: \(error.localizedDescription)", "revision": chartRevision] }
         var seed: [Double] = []
@@ -1036,7 +1061,12 @@ final class Radar {
                 "oi": oi as Any? ?? null, "sell": sell as Any? ?? null, "buy": buy as Any? ?? null,
             ])
         }
-        return ["bars": output, "error": error, "revision": chartRevision]
+        var result: [String: Any] = ["bars": output, "error": error, "revision": chartRevision]
+        if let profile {
+            result["strategy"] = ["id": profile.id, "name": profile.name, "revision": profile.revision]
+            result["strategySignals"] = try? JSONSerialization.jsonObject(with: JSONEncoder().encode(chartSignals))
+        }
+        return result
     }
 
     private func invalidateSnapshot(_ id: String) {
