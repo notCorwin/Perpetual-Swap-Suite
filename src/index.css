@@ -101,13 +101,13 @@
     --control-radius: 6px;
     --control-font-size: 13px;
     /* Controls and panels weight their default alpha by the window setting.
-       Floating glass stays untinted and blurs independently of that setting. */
+       Floating glass uses one dense WebKit material, independent of that setting. */
     --surface-opacity-weight: var(--window-background-opacity);
     /* Controls need a clear fill, while larger panels retain more of the window's glass. Saturated
        primary paint has its own lighter default to preserve text contrast. */
     --control-default-opacity: 0.8;
     --panel-default-opacity: 0.6;
-    --floating-default-opacity: 0;
+    --floating-default-opacity: 0.92;
     --primary-default-opacity: 0.4;
     --control-opacity: calc(var(--control-default-opacity) * var(--surface-opacity-weight));
     --panel-opacity: calc(var(--panel-default-opacity) * var(--surface-opacity-weight));
@@ -122,9 +122,8 @@
     --overlay-default-opacity: 0.12;
     --control-blur: calc((1 - var(--window-background-opacity)) * 12px);
     --panel-blur: calc((1 - var(--window-background-opacity)) * 16px);
-    /* Native transparent WebKit windows consume these same blur values in the
-       floating compositor, replacing source pixels instead of double-drawing
-       a translucent blurred copy over still-sharp content. */
+    /* Floating blur stays in WebKit so opening a popup never swaps live Core
+       Animation layers after its first frame. */
     --window-blur: 64px;
     --floating-blur: 64px;
     --blur-radius-max: 160;
@@ -154,8 +153,7 @@
     --card: color-mix(in srgb, var(--card-base) calc(var(--panel-opacity) * 100%), transparent);
     --chart-snapshot-background: var(--card-base);
     --control-shadow: 0 1px 2px rgb(0 0 0 / 10%);
-    /* Untinted glass uses backdrop blur and an inset rim, without a solid
-       fill or gradient painted over the underlying content. */
+    /* Dense glass uses backdrop blur and an inset rim without a gradient. */
     --floating-border: oklch(0.65 0.015 260 / 30%);
     --floating-muted-foreground: oklch(0.45 0.014 260);
     --floating-shadow: inset 0 1px 0 rgb(255 255 255 / 95%), inset 0 -1px 0 rgb(45 57 78 / 5%), 0 12px 32px rgb(25 33 48 / 14%), 0 2px 6px rgb(25 33 48 / 6%);
@@ -317,10 +315,9 @@
 @layer components {
     [data-surface="control"] { @apply surface-control; }
     [data-surface="panel"] { @apply surface-panel; }
-    /* Floating surfaces are mirrored into a native blur mask. Transforming or
-       fading that WebKit layer makes the two compositors paint different frames,
-       which presents as a flash. Keep the physical material stationary and let
-       controls inside it provide interaction feedback instead. */
+    /* Keep the WebKit material stationary while it mounts and unmounts. Its
+       controls still provide interaction feedback without exposing the live
+       backdrop through a transformed or faded popup frame. */
     [data-surface="floating"] {
         @apply surface-floating transition-none;
         animation: none;

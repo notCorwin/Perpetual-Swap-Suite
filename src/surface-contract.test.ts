@@ -40,8 +40,16 @@ test('filters and inline material values cannot bypass the centralized material'
   assert.deepEqual(check('<div className="shadow-floating" />'), [])
 })
 
-test('floating materials do not animate out of sync with the native blur mask', () => {
+test('floating materials mount without an entry or exit animation', () => {
   assert.match(css, /\[data-surface="floating"\]\s*\{[^}]*animation:\s*none;/s)
+})
+
+test('floating materials use one dense WebKit compositor path', () => {
+  const webEntry = readFileSync(new URL('./main.tsx', import.meta.url), 'utf8')
+  const nativeBridge = readFileSync(new URL('../Sources/PerpetualRadar/main.swift', import.meta.url), 'utf8')
+  const opacity = Number(css.match(/--floating-default-opacity:\s*([\d.]+)/)?.[1])
+  assert.ok(opacity >= 0.9)
+  assert.doesNotMatch(webEntry + nativeBridge, /floatingGlassSurfaces|installFloatingGlass/)
 })
 
 test('business code composes component states without replacing its material', () => {

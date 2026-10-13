@@ -69,7 +69,6 @@ type NativeBridge = {
   postMessage(request: { captureChart: { x: number; y: number; width: number; height: number; backgroundRGB: number[] } }): Promise<{ ok: boolean }>
   postMessage(request: { windowTintRGB: number[] }): Promise<{ ok: boolean }>
   postMessage(request: { previewWindowBlur: number | null }): Promise<{ ok: boolean }>
-  postMessage(request: { floatingGlassSurfaces: { x: number; y: number; width: number; height: number; radius: number; corner: number }[] }): Promise<{ ok: boolean }>
   postMessage(request: { chartInstId: string; loadChart?: boolean; sinceRevision?: number; chartEndHour?: number; serviceSession?: string }): Promise<ChartPollResponse>
 }
 declare global {

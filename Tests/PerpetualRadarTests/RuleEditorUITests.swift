@@ -4,22 +4,6 @@ import ScreenCaptureKit
 import XCTest
 @testable import PerpetualRadar
 
-// Core Animation supports layer updates inside per-thread transactions. Model
-// WebKit's scrolling thread without handing an AppKit view to another executor.
-private final class BackgroundScrollingFixture: @unchecked Sendable {
-    let layer = CALayer()
-
-    func scroll() -> Bool {
-        CATransaction.begin(); CATransaction.setDisableActions(true)
-        for offset in 1...128 {
-            layer.bounds.origin.y = CGFloat(offset)
-            layer.position.y = CGFloat(offset)
-        }
-        CATransaction.commit()
-        return Thread.isMainThread
-    }
-}
-
 // Exercises the actual packaged-origin WebKit renderer and promise bridge with
 // native compile/evaluation/persistence and a deterministic 500-market feed.
 @MainActor
@@ -220,10 +204,6 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
                 }
                 replyHandler(result, nil)
             } catch { replyHandler(nil, error.localizedDescription) } }; return
-        }
-        if let surfaces = request["floatingGlassSurfaces"] as? [[String: Double]] {
-            windowBackground?.updateFloatingGlass(surfaces)
-            replyHandler(["ok": true], nil); return
         }
         radarRequests += 1
         if request["backgroundMonitoringEnabled"] != nil || request["notificationsEnabled"] != nil || request["notificationAction"] != nil || request["monitoringPaused"] != nil || request["launchAtLogin"] != nil {
@@ -1159,7 +1139,6 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await showAllMarkets(view, count: 48)
         try await click(view, "Settings")
         try await wait(view, "document.querySelector('#window-blur [role=slider]')?.getAttribute('aria-valuenow') === '64' && document.querySelector('#floating-blur [role=slider]')?.getAttribute('aria-valuenow') === '64'")
-        try await exerciseBackgroundScrollingLayers(view)
         func slide(_ id: String, _ key: String) async throws {
             _ = try await js(view, "(() => { const thumb = document.querySelector('#\(id) [role=slider]'); thumb.focus(); thumb.dispatchEvent(new KeyboardEvent('keydown', {key:'\(key)',bubbles:true,cancelable:true})); return true; })()")
         }
@@ -1180,7 +1159,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await slide("floating-blur", "Home")
         try await wait(view, "getComputedStyle(document.querySelector('[data-slot=popover-content]')).backdropFilter === 'none' && !document.body.innerText.includes('Saving')")
         if capturePixels {
-            let bounds = try await js(view, "(() => { const style=document.createElement('style'); style.id='slider-pixel-style'; style.textContent='[data-slot=popover-content] > * {visibility:hidden!important}'; document.head.append(style); return document.querySelector('[data-slot=popover-content]').getBoundingClientRect().toJSON(); })()") as! [String: Double]
+            let bounds = try await js(view, "(() => { const style=document.createElement('style'); style.id='slider-pixel-style'; style.textContent='[data-slot=popover-content] > * {visibility:hidden!important}'; document.head.append(style); const fixture=document.createElement('div'); fixture.id='slider-pixel-fixture'; fixture.style.cssText='position:fixed;inset:0;z-index:49;pointer-events:none;background:conic-gradient(#111 25%,#fff 0 50%,#111 0 75%,#fff 0) 0 0 / 24px 24px'; document.body.append(fixture); return document.querySelector('[data-slot=popover-content]').getBoundingClientRect().toJSON(); })()") as! [String: Double]
             materialRect = CGRect(x: bounds["x"]! + 20, y: bounds["y"]! + 20, width: bounds["width"]! - 40, height: bounds["height"]! - 40)
             try await settleRendering(view)
             let image = try await nativeRendererSnapshot(view)
@@ -1195,12 +1174,12 @@ final class RuleEditorUITests: BackgroundTestCase {
             let blurred = try XCTUnwrap(NSBitmapImageRep(data: material.tiffRepresentation!)), clear = try XCTUnwrap(clearMaterial)
             let sharp = try pixelDetail(clear, rect: materialRect, view: view)
             let softened = try pixelDetail(blurred, rect: materialRect, view: view)
-            print("Real app text detail, Popover blur 0 → 160: \(sharp) → \(softened)")
-            XCTAssertGreaterThan(sharp, 0.005, "The baseline must contain real, readable app text behind the menu.")
-            XCTAssertLessThan(softened, sharp * 0.2, "Changing the slider must replace the sharp backdrop, not overlay a translucent blurred copy.")
+            print("Backdrop detail, Popover blur 0 → 160: \(sharp) → \(softened)")
+            XCTAssertGreaterThan(sharp, 0.005, "The baseline must retain a visible backdrop response behind the dense material.")
+            XCTAssertLessThan(softened, sharp * 0.2, "Changing the slider must strongly diffuse the backdrop.")
             let outside = CGRect(x: 24, y: 200, width: 200, height: 500)
             XCTAssertEqual(try pixelDetail(blurred, rect: outside, view: view), try pixelDetail(clear, rect: outside, view: view), accuracy: 0.002, "Popover blur must leave content outside its bounds sharp.")
-            _ = try await js(view, "document.querySelector('#slider-pixel-style').remove(); true")
+            _ = try await js(view, "document.querySelector('#slider-pixel-style').remove(); document.querySelector('#slider-pixel-fixture').remove(); true")
             try await settleRendering(view)
             let image = try await nativeRendererSnapshot(view)
             let bitmap = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
@@ -1346,7 +1325,7 @@ final class RuleEditorUITests: BackgroundTestCase {
     }
 
     @MainActor
-    private func assertSharedSurfaces(_ view: WKWebView, opacity: Double, defaultOpacities: [Double] = [0.8, 0.6, 0, 0.4]) async throws {
+    private func assertSharedSurfaces(_ view: WKWebView, opacity: Double, defaultOpacities: [Double] = [0.8, 0.6, 0.92, 0.4]) async throws {
         // Wait for control color transitions; inspect the renderer rather than
         // matching generated classes or the source token formulas.
         try await wait(view, "Array.from(document.querySelectorAll('[data-surface=\"floating\"]')).every(x => x.closest('[data-state=\"closed\"]') || !x.getBoundingClientRect().width || !x.getBoundingClientRect().height || getComputedStyle(x).opacity === '1')", seconds: 2)
@@ -1811,8 +1790,8 @@ final class RuleEditorUITests: BackgroundTestCase {
           // Large checkerboard tiles model app blocks, not just fine text.
           // Hide only the real portaled surface's children to sample its material.
           const fixture = document.createElement('div'); fixture.id = 'floating-pixel-fixture';
-          // Translucent tiles expose the source-over bug that an opaque test
-          // background used to conceal in the real translucent window.
+          // Translucent tiles expose backdrop response in the real translucent
+          // window without relying on incidental table text.
           fixture.style.cssText = 'position:absolute;inset:0;z-index:39;pointer-events:none;background:conic-gradient(rgb(0 0 0 / .2) 25%,#fff 0 50%,rgb(0 0 0 / .2) 0 75%,#fff 0) 0 0 / 128px 128px';
           const source = document.querySelector(\(query));
           source.dataset.qaFloatingTest = 'true';
@@ -1841,8 +1820,8 @@ final class RuleEditorUITests: BackgroundTestCase {
             let values = samples.map { $0.reduce(0, +) / 3 }
             return values.max()! - values.min()!
         }
-        // Clear glass must diffuse broad shapes while retaining the backdrop's
-        // color. An opaque fill could hide the tiles but would fail this change.
+        // Dense glass must diffuse broad shapes. It deliberately limits the
+        // backdrop response so live content cannot flash through during mount.
         let blurredSamples = try samples(bitmap), softened = contrast(blurredSamples)
         _ = try await js(view, "document.querySelector('#floating-pixel-fixture').style.background='rgb(32 128 224)'; true")
         try await settleRendering(view)
@@ -1853,7 +1832,7 @@ final class RuleEditorUITests: BackgroundTestCase {
             backdropResponse += zip(before, after).map { abs($0 - $1) }.max()!
         }
         backdropResponse /= Double(blurredSamples.count)
-        _ = try await js(view, "document.querySelector('#floating-pixel-fixture').style.background=window.radarSurfaceFixture.backdrop; window.radarSurfaceFixture.source.style.backdropFilter='none'; window.radarSurfaceFixture.source.style.webkitBackdropFilter='none'; true")
+        _ = try await js(view, "document.querySelector('#floating-pixel-fixture').style.background=window.radarSurfaceFixture.backdrop; window.radarSurfaceFixture.source.style.backgroundColor='transparent'; window.radarSurfaceFixture.source.style.backdropFilter='none'; window.radarSurfaceFixture.source.style.webkitBackdropFilter='none'; true")
         try await settleRendering(view)
         let reference = try await nativeRendererSnapshot(view)
         let referenceBitmap = try XCTUnwrap(NSBitmapImageRep(data: reference.tiffRepresentation!))
@@ -1861,24 +1840,11 @@ final class RuleEditorUITests: BackgroundTestCase {
         _ = try await js(view, "(() => { const {source,style}=window.radarSurfaceFixture; source.style.cssText=style; delete source.dataset.qaFloatingTest; delete window.radarSurfaceFixture; document.querySelector('#floating-pixel-fixture').remove(); document.querySelector('#floating-pixel-style').remove(); return true; })()")
         print("Floating pixel contrast \(name) \(theme): softened=\(softened), exposed=\(exposed), backdropResponse=\(backdropResponse)")
         XCTAssertGreaterThan(exposed, 0.15, "The reference must expose high-contrast app content behind the floating surface.")
-        XCTAssertLessThan(softened, exposed * 0.1, "Glass blur must suppress broad backdrop shapes without blurring its own content.")
-        XCTAssertGreaterThan(backdropResponse, 0.1, "Untinted glass must retain the backdrop's colors instead of covering them with a solid fill.")
+        XCTAssertLessThan(softened, exposed * 0.1, "Dense glass must suppress broad backdrop shapes without blurring its own content.")
+        XCTAssertGreaterThan(backdropResponse, 0.005, "Dense glass must retain a subtle response to the blurred backdrop.")
+        XCTAssertLessThan(backdropResponse, 0.1, "Dense glass must prevent live backdrop changes from flashing through the popup.")
         try FileManager.default.createDirectory(at: project.appendingPathComponent(".build/ui-qa"), withIntermediateDirectories: true)
         try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: project.appendingPathComponent(".build/ui-qa/floating-blur-\(name)-\(theme).png"))
-    }
-
-    @MainActor
-    private func exerciseBackgroundScrollingLayers(_ view: WKWebView) async throws {
-        let fixture = BackgroundScrollingFixture(), root = try XCTUnwrap(view.layer)
-        fixture.layer.bounds = CGRect(x: 0, y: 0, width: 100, height: 100)
-        root.addSublayer(fixture.layer)
-        defer { fixture.layer.removeFromSuperlayer() }
-        try await settleRendering(view)
-        let ranOnMainThread = await Task.detached(priority: .userInitiated) { fixture.scroll() }.value
-        XCTAssertFalse(ranOnMainThread, "The regression must reproduce WebKit's background scrolling callbacks.")
-        try await settleRendering(view)
-        // The existing slider, persistence and pixel assertions below verify
-        // that the app remains interactive and the material still renders.
     }
 
     @MainActor

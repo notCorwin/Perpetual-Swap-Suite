@@ -8,10 +8,6 @@ final class WindowBackgroundView: NSView {
     private var contentConstraints: [NSLayoutConstraint] = []
     private var tintColor: NSColor?
     private var tintOpacity: CGFloat = 1
-    private lazy var floatingGlass = FloatingGlassCompositor(view: content)
-
-    func updateFloatingGlass(_ surfaces: [[String: Double]]) { floatingGlass.update(surfaces) }
-
     init(contentView: NSView) {
         content = contentView
         super.init(frame: .zero)
