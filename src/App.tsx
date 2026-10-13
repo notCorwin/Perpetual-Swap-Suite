@@ -1,5 +1,5 @@
 import { Fragment, Suspense, lazy, memo, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react"
-import { ArrowDown, ArrowDownUp, ArrowUp, Radio, Search, ScanSearch, Settings2 } from "lucide-react"
+import { ArrowDown, ArrowDownUp, ArrowLeftRight, ArrowUp, Radio, Search, ScanSearch, Settings2 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty"
@@ -9,8 +9,6 @@ import { Toggle } from "@/components/ui/toggle"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Spinner } from "@/components/ui/spinner"
-import { Slider } from '@/components/ui/slider'
-import { RockerSwitch } from '@/components/ui/rocker-switch'
 import { RadarSignalBoard } from "@/RadarSignalBoard"
 import { radarSignals, signalMatches, type SignalTiming } from "@/radar-signals"
 import { ModeTitle } from "@/ModeTitle"
@@ -227,6 +225,8 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   }, radius => withSettingsDeadline(window.webkit.messageHandlers.radar.postMessage({ previewWindowBlur: radius })))
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>({ backgroundMonitoringEnabled: false, notificationsEnabled: true, notificationAuthorization: "notDetermined", notificationError: "", backgroundMonitoringError: "", monitoringPaused: false, launchAtLogin: "disabled", launchAtLoginError: "" })
   const [chartMoveSettings, setChartMoveSettings] = useState<ChartMoveSettings>({ chartMovePriceSource: 'highLow', chartMoveObjective: 'amplitude', chartMoveLabelsVisible: true, chartMoveEfficiencyFactor: 1 })
+  const [chartEfficiencyFactorDraft, setChartEfficiencyFactorDraft] = useState('1')
+  const [chartEfficiencyFactorError, setChartEfficiencyFactorError] = useState('')
   const [notificationPending, setNotificationPending] = useState(false)
   const [sort, setSort] = useState<SortKey>("opportunity")
   const [descending, setDescending] = useState(true)
@@ -298,6 +298,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
       chartMoveLabelsVisible: snapshot.chartMoveLabelsVisible ?? true,
       chartMoveEfficiencyFactor: snapshot.chartMoveEfficiencyFactor ?? 1,
     })
+    if (document.activeElement?.id !== 'default-efficiency-factor') setChartEfficiencyFactorDraft(String(snapshot.chartMoveEfficiencyFactor ?? 1))
     if (!backgroundOpacityDraftDirty.current && document.activeElement?.id !== "background-opacity") setBackgroundOpacityDraft(String(snapshot.frostedBackgroundOpacity))
     setMetrics(current => keepSnapshotValue(current, snapshot.filterMetricsCatalog))
     setFunctions(current => keepSnapshotValue(current, snapshot.filterFunctions))
@@ -467,6 +468,17 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     setBackgroundOpacityDraft(String(value))
     if (value !== frostedBackgroundOpacity) saveSetting({ frostedBackgroundOpacity: value })
   }
+  const saveChartEfficiencyFactor = () => {
+    const value = Number(chartEfficiencyFactorDraft)
+    if (!chartEfficiencyFactorDraft.trim() || !Number.isFinite(value) || value < 0 || value > 2) {
+      setChartEfficiencyFactorError('Enter a number from 0 to 2.')
+      return
+    }
+    setChartEfficiencyFactorError('')
+    setChartEfficiencyFactorDraft(String(value))
+    setChartMoveSettings(current => ({ ...current, chartMoveEfficiencyFactor: value }))
+    if (value !== chartMoveSettings.chartMoveEfficiencyFactor) saveSetting({ chartMoveEfficiencyFactor: value })
+  }
 
   const header = (label: string, key: SortKey, content: ReactNode = label, description?: string) => {
     const SortIcon = sort !== key ? ArrowDownUp : descending ? ArrowDown : ArrowUp
@@ -506,9 +518,9 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
               <Field><FieldLabel>AI analysis</FieldLabel><AnalysisSettingsButton /><FieldDescription>Configure the Gateway API Key and chart analysis model.</FieldDescription></Field>
               <Field>
                 <FieldLabel>Move label defaults</FieldLabel>
-                <RockerSwitch leftLabel="Close" rightLabel="High / Low" checked={chartMoveSettings.chartMovePriceSource === 'highLow'} onCheckedChange={checked => saveSetting({ chartMovePriceSource: checked ? 'highLow' : 'close' })} aria-label="Default move price source" />
-                <RockerSwitch leftLabel="Max Move" rightLabel="Max Efficiency" checked={chartMoveSettings.chartMoveObjective === 'efficiency'} onCheckedChange={checked => saveSetting({ chartMoveObjective: checked ? 'efficiency' : 'amplitude' })} aria-label="Default move optimization objective" />
-                <Field><FieldLabel id="default-efficiency-factor">Efficiency factor <span className="tabular-nums text-muted-foreground">{chartMoveSettings.chartMoveEfficiencyFactor.toFixed(1)}</span></FieldLabel><Slider min={0} max={2} step={0.1} value={[chartMoveSettings.chartMoveEfficiencyFactor]} aria-labelledby="default-efficiency-factor" onValueChange={([value]) => setChartMoveSettings(current => ({ ...current, chartMoveEfficiencyFactor: value }))} onValueCommit={([value]) => saveSetting({ chartMoveEfficiencyFactor: value })} /></Field>
+                <Button variant="ghost" onClick={() => saveSetting({ chartMovePriceSource: chartMoveSettings.chartMovePriceSource === 'highLow' ? 'close' : 'highLow' })} aria-label="Default move price source" title={`Switch to ${chartMoveSettings.chartMovePriceSource === 'highLow' ? 'Close' : 'High / Low'}`}><span className="font-semibold">{chartMoveSettings.chartMovePriceSource === 'highLow' ? 'High / Low' : 'Close'}</span><ArrowLeftRight data-icon="inline-end" aria-hidden="true" /></Button>
+                <Button variant="ghost" onClick={() => saveSetting({ chartMoveObjective: chartMoveSettings.chartMoveObjective === 'efficiency' ? 'amplitude' : 'efficiency' })} aria-label="Default move optimization objective" title={`Switch to ${chartMoveSettings.chartMoveObjective === 'efficiency' ? 'Max Move' : 'Max Efficiency'}`}><span className="font-semibold">{chartMoveSettings.chartMoveObjective === 'efficiency' ? 'Max Efficiency' : 'Max Move'}</span><ArrowLeftRight data-icon="inline-end" aria-hidden="true" /></Button>
+                <Field data-invalid={Boolean(chartEfficiencyFactorError)}><FieldLabel htmlFor="default-efficiency-factor">Efficiency factor</FieldLabel><Input id="default-efficiency-factor" type="number" min="0" max="2" step="0.1" inputMode="decimal" value={chartEfficiencyFactorDraft} aria-invalid={Boolean(chartEfficiencyFactorError)} onChange={event => { setChartEfficiencyFactorDraft(event.target.value); setChartEfficiencyFactorError('') }} onBlur={saveChartEfficiencyFactor} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }} />{chartEfficiencyFactorError && <FieldError>{chartEfficiencyFactorError}</FieldError>}</Field>
                 <Field orientation="horizontal"><FieldLabel htmlFor="default-move-label-layer">Show labels by default</FieldLabel><Toggle id="default-move-label-layer" variant="outline" pressed={chartMoveSettings.chartMoveLabelsVisible} onPressedChange={value => saveSetting({ chartMoveLabelsVisible: value })}>{chartMoveSettings.chartMoveLabelsVisible ? 'On' : 'Off'}</Toggle></Field>
                 <FieldDescription>Efficiency = |change| / periods^factor. 0 ignores time; 1 is change per K-line; values above 1 favor shorter moves more strongly. New charts use these defaults.</FieldDescription>
               </Field>
