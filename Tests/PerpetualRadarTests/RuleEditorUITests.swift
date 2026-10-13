@@ -271,15 +271,15 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
         }
         if request["chartInstId"] != nil {
             guard includeChartBars else { replyHandler(["bars": [], "revision": revision, "error": "Fixture chart"], nil); return }
-            let hour = contexts[0].hour
+            let hour = contexts[0].hour, chartEnd = request["chartEndHour"] as? Int64 ?? hour
             let bars: [[String: Any]] = (0..<96).map { index in
                 let close = (index == 95 ? chartLiveClose : nil) ?? (105 + Double(index) * 0.05 + sin(Double(index) / 5))
-                return ["hour": hour - Int64(95 - index) * hourMS, "open": close - 0.3, "high": close + 0.8, "low": close - 0.7, "close": close, "confirmed": index != 95,
+                return ["hour": chartEnd - Int64(95 - index) * hourMS, "open": close - 0.3, "high": close + 0.8, "low": close - 0.7, "close": close, "confirmed": chartEnd < hour || index != 95,
                         "vwap": close - 0.4, "ema": 105.0, "logBBUpper": close + 1.5, "logBBMiddle": close, "logBBLower": close - 1.5,
                         "roc": sin(Double(index) / 5) * 2, "maroc": sin(Double(index) / 7), "rsi6": 50 + sin(Double(index) / 5) * 20,
                         "rsi12": 50 + sin(Double(index) / 7) * 10, "rsi24": 50 + sin(Double(index) / 9) * 5, "oi": 100_000_000 + index * 100_000, "buy": 1000 + index * 5, "sell": 800 + index * 3]
             }
-            let response: [String: Any] = ["bars": bars, "revision": revision, "error": "", "endHour": hour]
+            let response: [String: Any] = ["bars": bars, "revision": revision, "error": "", "endHour": chartEnd]
             if request["loadChart"] as? Bool == true, request["chartInstId"] as? String == holdChartLoadID {
                 holdChartLoadID = nil; heldChartLoadReply = { replyHandler(response, nil) }
                 return
@@ -501,11 +501,14 @@ final class RuleEditorUITests: BackgroundTestCase {
             if let data=image.tiffRepresentation, let png=NSBitmapImageRep(data:data)?.representation(using:.png,properties:[:]) { try png.write(to:URL(fileURLWithPath:path)) }
         }
         _ = try await js(view,"document.querySelector('[data-signal-lane=bullishSetup] button[aria-label=\"View MKT001-USDT-SWAP chart\"]').click(); true")
-        try await wait(view,"document.querySelector('section[aria-label=\"MKT001-USDT-SWAP chart\"] [data-chart-move-direction]') !== null && document.querySelector('[data-price-move-summary]')?.innerText.includes('Uses future data') && !document.querySelector('[data-strategy-chart-summary]') && !document.querySelector('[data-chart-buy-hour]')")
+        try await wait(view,"document.querySelector('section[aria-label=\"MKT001-USDT-SWAP chart\"] [data-chart-move-direction]') !== null && document.querySelector('[data-chart-move-exit-direction]')?.textContent.includes('EXIT') && document.querySelector('[data-price-move-summary]')?.innerText.includes('Uses future data') && !document.querySelector('[data-strategy-chart-summary]') && !document.querySelector('[data-chart-buy-hour]')")
         try await click(view,"High / Low")
         try await wait(view,"document.querySelector('[data-price-move-mode]')?.dataset.priceMoveMode === 'highLow'")
         try await click(view,"Close")
         try await wait(view,"document.querySelector('[data-price-move-mode]')?.dataset.priceMoveMode === 'close'")
+        let latestChartEnd = try await js(view,"Number(document.querySelector('[data-chart-inst]').dataset.chartEnd)") as? Double
+        _ = try await js(view,"document.querySelector('[data-chart-plot]').dispatchEvent(new WheelEvent('wheel',{deltaY:120,bubbles:true,cancelable:true})); true")
+        try await wait(view,"Number(document.querySelector('[data-chart-inst]').dataset.chartEnd) < \(latestChartEnd ?? 0)")
         _ = try await js(view,"window.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown'})); true")
         try await wait(view,"document.querySelector('section[aria-label=\"MKT002-USDT-SWAP chart\"]') !== null")
         try await click(view,"Signals")
