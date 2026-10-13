@@ -148,7 +148,7 @@ final class AppUpdaterTests: XCTestCase {
 
         let tar = Process()
         tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        tar.arguments = ["-cf", archive.path, "-C", release.deletingLastPathComponent().path, "Perpetual Swap Suite.app"]
+        tar.arguments = ["-czf", archive.path, "-C", release.deletingLastPathComponent().path, "Perpetual Swap Suite.app"]
         try tar.run()
         tar.waitUntilExit()
         XCTAssertEqual(tar.terminationStatus, 0)
@@ -197,6 +197,42 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertTrue(updates.contains { if case .retrying = $0 { return true }; return false })
         XCTAssertTrue(updates.contains { if case .downloading(let received, let total) = $0 { return received > 0 && received < total }; return false }, "Native download progress must arrive before completion.")
         XCTAssertTrue(updates.contains { if case .installing = $0 { return true }; return false })
+        XCTAssertEqual(try String(contentsOf: current.appendingPathComponent("Contents/Resources/marker"), encoding: .utf8), revision)
+    }
+
+    @MainActor
+    func testNativeDownloadUsesFourRangesAndInstallsTheirVerifiedAssembly() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ParallelUpdateTransfer-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let current = root.appendingPathComponent("Perpetual Swap Suite.app")
+        let release = root.appendingPathComponent("release/Perpetual Swap Suite.app")
+        let archive = root.appendingPathComponent("update.tar"), revision = String(repeating: "d", count: 40)
+        try makeApp(at: current, marker: "old")
+        try makeApp(at: release, marker: revision)
+        let padding = release.appendingPathComponent("Contents/Resources/padding")
+        try Data(repeating: 7, count: 5 * 1024 * 1024).write(to: padding)
+        let tar = Process()
+        tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        tar.arguments = ["-cf", archive.path, "-C", release.deletingLastPathComponent().path, "Perpetual Swap Suite.app"]
+        try tar.run(); tar.waitUntilExit()
+        XCTAssertEqual(tar.terminationStatus, 0)
+        let digest = SHA256.hash(data: try Data(contentsOf: archive)).map { String(format: "%02x", $0) }.joined()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [UpdateDownloadProtocol.self]
+        configuration.httpAdditionalHeaders = ["X-Update-Fixture": root.path, "X-Update-Parallel": "1"]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let updater = AppUpdater(session: session, currentAppURL: current, relauncher: { _, _ in })
+        let finished = expectation(description: "Parallel update installed")
+        var result: Result<Void, AppUpdateError>?
+        updater.downloadAndInstall(AppUpdate(
+            name: "autobuild", revision: revision,
+            assetURL: URL(string: "https://github.com/notCorwin/Perpetual-Swap-Suite/releases/download/autobuild/Perpetual.Swap.Suite.app.tar")!,
+            expectedSHA256: digest
+        ), progress: { _ in }) { outcome in result = outcome; finished.fulfill() }
+        await fulfillment(of: [finished], timeout: 8)
+        try XCTUnwrap(result).get()
+        XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("attempts"), encoding: .utf8), "4")
         XCTAssertEqual(try String(contentsOf: current.appendingPathComponent("Contents/Resources/marker"), encoding: .utf8), revision)
     }
 
@@ -404,17 +440,47 @@ private final class UpdateDownloadProtocol: URLProtocol, @unchecked Sendable {
     override func startLoading() {
         do {
             let root = URL(fileURLWithPath: try XCTUnwrap(request.value(forHTTPHeaderField: "X-Update-Fixture")))
-            let attempts = root.appendingPathComponent("attempts")
-            let count = (try? String(contentsOf: attempts, encoding: .utf8)).flatMap(Int.init) ?? 0
-            try String(count + 1).write(to: attempts, atomically: true, encoding: .utf8)
-            if count < 2 { client?.urlProtocol(self, didFailWithError: URLError(.timedOut)); return }
             let data = try Data(contentsOf: root.appendingPathComponent("update.tar"))
-            let response = try XCTUnwrap(HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Length": String(data.count)]))
+            let parallel = request.value(forHTTPHeaderField: "X-Update-Parallel") == "1"
+            if request.httpMethod == "HEAD" {
+                var headers = ["Content-Length": String(data.count)]
+                if parallel { headers["Accept-Ranges"] = "bytes" }
+                let response = try XCTUnwrap(HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers))
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                client?.urlProtocolDidFinishLoading(self)
+                return
+            }
+            let attempts = root.appendingPathComponent("attempts")
+            let count = updateFixtureLock.withLock { () -> Int in
+                let count = (try? String(contentsOf: attempts, encoding: .utf8)).flatMap(Int.init) ?? 0
+                try? String(count + 1).write(to: attempts, atomically: true, encoding: .utf8)
+                return count
+            }
+            if !parallel, count < 2 { client?.urlProtocol(self, didFailWithError: URLError(.timedOut)); return }
+            let body: Data, status: Int, headers: [String: String]
+            if parallel {
+                let value = try XCTUnwrap(request.value(forHTTPHeaderField: "Range"))
+                let bounds = value.dropFirst("bytes=".count).split(separator: "-").compactMap { Int($0) }
+                XCTAssertEqual(bounds.count, 2)
+                let start = bounds[0], end = bounds[1]
+                body = data.subdata(in: start..<(end + 1))
+                status = 206
+                headers = ["Content-Length": String(body.count), "Content-Range": "bytes \(start)-\(end)/\(data.count)"]
+            } else {
+                body = data; status = 200; headers = ["Content-Length": String(data.count)]
+            }
+            let response = try XCTUnwrap(HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers))
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            stream = Task { @Sendable [self, data] in
-                for start in stride(from: 0, to: data.count, by: 4096) {
-                    do { try await Task.sleep(for: .milliseconds(20)) } catch { return }
-                    self.client?.urlProtocol(self, didLoad: data.subdata(in: start..<min(data.count, start + 4096)))
+            stream = Task.detached(priority: .high) { @Sendable [self, body, parallel] in
+                let chunkSize = parallel ? 64 * 1024 : 4096
+                for start in stride(from: 0, to: body.count, by: chunkSize) {
+                    guard !Task.isCancelled else { return }
+                    self.client?.urlProtocol(self, didLoad: body.subdata(in: start..<min(body.count, start + chunkSize)))
+                    if start == 0 {
+                        do { try await Task.sleep(for: .milliseconds(1)) } catch { return }
+                    } else {
+                        await Task.yield()
+                    }
                 }
                 self.client?.urlProtocolDidFinishLoading(self)
             }
@@ -422,3 +488,5 @@ private final class UpdateDownloadProtocol: URLProtocol, @unchecked Sendable {
     }
     override func stopLoading() { stream?.cancel() }
 }
+
+private let updateFixtureLock = NSLock()

@@ -37,6 +37,8 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isPresentingUpdate = false
     private var automaticInstallRetryAfter: Date?
     private var updateProgress: AppUpdateProgress?
+    private var updateTransferSample: (date: Date, bytes: Int64)?
+    private var updateBytesPerSecond: Double?
     private var updateError = ""
     private lazy var checkUpdatesItem = NSMenuItem(title: "Check for Updates", action: #selector(checkForUpdatesNow), keyEquivalent: "")
     private lazy var automaticUpdatesItem = NSMenuItem(title: "Automatically Install Updates", action: #selector(toggleAutomaticUpdates), keyEquivalent: "")
@@ -421,10 +423,21 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if isInstallingUpdate {
             switch updateProgress {
             case .downloading(let received, let total):
+                let transferDetails: String
+                if let speed = updateBytesPerSecond, speed > 0 {
+                    let speedText = ByteCountFormatter.string(fromByteCount: Int64(speed), countStyle: .file) + "/s"
+                    if total > received {
+                        let seconds = Double(total - received) / speed
+                        let eta = seconds < 60 ? "\(max(1, Int(ceil(seconds))))s left" : "\(max(1, Int(ceil(seconds / 60))))m left"
+                        transferDetails = " · \(speedText) · \(eta)"
+                    } else {
+                        transferDetails = " · \(speedText)"
+                    }
+                } else { transferDetails = "" }
                 if total > 0 {
-                    checkUpdatesItem.title = "Downloading Update · \(min(100, received * 100 / total))%"
+                    checkUpdatesItem.title = "Downloading Update · \(min(100, received * 100 / total))%\(transferDetails)"
                 } else {
-                    checkUpdatesItem.title = received > 0 ? "Downloading Update · \(ByteCountFormatter.string(fromByteCount: received, countStyle: .file))" : "Downloading Update…"
+                    checkUpdatesItem.title = received > 0 ? "Downloading Update · \(ByteCountFormatter.string(fromByteCount: received, countStyle: .file))\(transferDetails)" : "Downloading Update…"
                 }
             case .retrying(let attempt, let total):
                 checkUpdatesItem.title = "Retrying Update Download · \(attempt)/\(total)"
@@ -500,11 +513,13 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         isInstallingUpdate = true; installingAutomatically = automatically
+        updateTransferSample = nil; updateBytesPerSecond = nil
         updateError = ""; updateProgress = .downloading(received: 0, total: 0)
         updateState = "installing"
         renderUpdateItem()
         updater.downloadAndInstall(update, progress: { [weak self] progress in
             guard let self, isInstallingUpdate else { return }
+            recordUpdateTransfer(progress)
             updateProgress = progress
             renderUpdateItem()
         }) { [weak self] result in
@@ -526,6 +541,23 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if !automatically { showUpdateAlert("Update Failed", error.localizedDescription) }
             }
         }
+    }
+
+    private func recordUpdateTransfer(_ progress: AppUpdateProgress) {
+        guard case .downloading(let received, _) = progress else {
+            updateTransferSample = nil
+            updateBytesPerSecond = nil
+            return
+        }
+        let date = now()
+        defer { updateTransferSample = (date, received) }
+        guard let previous = updateTransferSample else { return }
+        let elapsed = date.timeIntervalSince(previous.date)
+        let delta = received - previous.bytes
+        if delta < 0 { updateBytesPerSecond = nil }
+        guard elapsed >= 0.25, delta > 0 else { return }
+        let current = Double(delta) / elapsed
+        updateBytesPerSecond = updateBytesPerSecond.map { $0 * 0.7 + current * 0.3 } ?? current
     }
 
     private func showUpdateAlert(_ title: String, _ message: String) {

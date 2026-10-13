@@ -43,7 +43,9 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$helper/Contents/Info.plist")" = com.perpetualradar.macos.monitor
           test "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$helper/Contents/Info.plist")" = true
           codesign --verify --deep --strict "$app"
-          tar -cf Perpetual.Swap.Suite.app.tar -C .build/app 'Perpetual Swap Suite.app'
+          # Keep the historical .tar asset URL so already-installed versions can
+          # update, while gzip-compressing its contents to reduce transfer time.
+          tar -czf Perpetual.Swap.Suite.app.tar -C .build/app 'Perpetual Swap Suite.app'
           tar -tf Perpetual.Swap.Suite.app.tar | grep -qx 'Perpetual Swap Suite.app/Contents/MacOS/PerpetualRadar'
           sha256="$(shasum -a 256 Perpetual.Swap.Suite.app.tar | cut -d' ' -f1)"
           built_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"

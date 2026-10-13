@@ -34,7 +34,7 @@ final class MonitorUpdateTests: BackgroundTestCase {
 
     @MainActor
     func testIdleResearchAllowsUpdatesAndMenusShowRealProgress() async throws {
-        try await withMonitor { transport, _ in
+        try await withMonitor { transport, clock in
             _ = try await lease(busy: false)
             var info = try await request(["updateAction": "check"])
             XCTAssertEqual(transport.downloads, 1)
@@ -45,6 +45,11 @@ final class MonitorUpdateTests: BackgroundTestCase {
             transport.progress?(.downloading(received: 8_000_000, total: 32_000_000))
             info = try await request(["serviceInfo": true])
             XCTAssertEqual(info["updateMenuTitle"] as? String, "Downloading Update · 25%")
+            clock.date.addTimeInterval(2)
+            transport.progress?(.downloading(received: 12_000_000, total: 32_000_000))
+            info = try await request(["serviceInfo": true])
+            XCTAssertTrue((info["updateMenuTitle"] as? String ?? "").contains("/s"))
+            XCTAssertTrue((info["updateMenuTitle"] as? String ?? "").contains("left"))
             transport.progress?(.retrying(attempt: 2, total: 3))
             info = try await request(["serviceInfo": true])
             XCTAssertEqual(info["updateMenuTitle"] as? String, "Retrying Update Download · 2/3")
