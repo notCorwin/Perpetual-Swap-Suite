@@ -2,6 +2,12 @@ import XCTest
 @testable import PerpetualRadar
 
 final class StrategyWorkflowTests: XCTestCase {
+    func testHistoricalChartLoadsOneReusableFiveHundredHourBuffer() {
+        let end = Int64(2_000) * hourMS
+        XCTAssertEqual(historicalChartBufferHours, 500)
+        XCTAssertEqual(historicalChartBufferStart(end), end - 499 * hourMS)
+        XCTAssertEqual(historicalChartBufferStart(100 * hourMS), 0)
+    }
     private let hour = Int64(20_000) * hourMS
     private func rule(_ source: String) throws -> String { try FilterCompiler.compile(source: source).config.json }
     private func profile(universe: String = "Close > 0", setup: String = "Close > 100") throws -> StrategyProfile {
@@ -150,6 +156,7 @@ final class StrategyWorkflowTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(report.historyHours, 1_000)
         XCTAssertEqual(report.matchedHours, 1)
         XCTAssertEqual(report.unknownHours, 0, "EMA200, RSI24 and PriorExtreme(48) must receive their required historical warm-up.")
+        XCTAssertEqual(report.readings, [.init(hour: hour, result: FilterTruth.yes.rawValue, completed: true)])
     }
 
     func testRadarChartBacktestSeedsTheVisibleBoundaryBeforeEmittingBuy() throws {
@@ -162,6 +169,7 @@ final class StrategyWorkflowTests: XCTestCase {
             candles: bars, stats: [:], quotes: [:], historicalClose: true)
         let report = try strategyChartReplay(profile: profile(), market: market, from: hour, through: hour)
         XCTAssertEqual(report.signals.map(\.hour), [hour], "A transition on the first visible candle must not be lost at the chart boundary.")
+        XCTAssertEqual(report.readings.count, 1)
     }
 
     func testChartReplayReconstructsPastTurnoverWithoutInventingSpread() throws {

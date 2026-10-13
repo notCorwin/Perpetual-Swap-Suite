@@ -131,7 +131,8 @@ final class RuleHistoryTests: XCTestCase, @unchecked Sendable {
         let research = try ResearchStore(directory: url.deletingLastPathComponent().appendingPathComponent("Research"))
         let filter = try FilterCompiler.compile(source: "closed(every(Close > 0 AND oiUSD > 0 AND buy > sell AND turnover > 0, 3))")
         let id = market().id, hours = (1...filter.requiredHours).map { hour - Int64($0) * hourMS }
-        for (index, timestamp) in hours.enumerated() {
+        let older = hours.last! - hourMS
+        for (index, timestamp) in (hours + [older]).enumerated() {
             let candle = Candle(hour: timestamp, high: 110, low: 90, close: 100, quoteVolume: 100, baseVolume: 1, open: 100)
             try research.write([
                 .init(instrument: id, kind: "candle", timestamp: timestamp, candle: candle, sources: ["research"]),
@@ -143,6 +144,8 @@ final class RuleHistoryTests: XCTestCase, @unchecked Sendable {
                        "Verified Research rows must publish immediately to the canonical Radar market store.")
         let transport = TestHistoryTransport(), loader = FilterHistoryLoader(url: url, transport: transport, requestDelay: 0)
         let prepared = try await loader.prepare([market()], filter: filter)
+        let edgeRows = try await loader.importResearch(id, from: older, through: hours.first!)
+        XCTAssertEqual(edgeRows, 3, "Extending a cached range by one hour must import only that candle/stat/quote edge.")
         await loader.schedule(prepared, filter: filter); await loader.waitUntilIdle()
         let hydrated = try await loader.prepare([market()], filter: filter)
         XCTAssertEqual(FilterEvaluator(market: hydrated[0], filter: filter).evaluate().result, .yes)

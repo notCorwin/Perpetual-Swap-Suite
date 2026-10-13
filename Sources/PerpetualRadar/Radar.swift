@@ -9,6 +9,8 @@ private let windowBlurRadiusKey = "windowBlurRadius"
 private let floatingBlurRadiusKey = "floatingBlurRadius"
 private let notificationsEnabledKey = "strategyNotificationsEnabled"
 private let monitoringPausedKey = "monitoringPaused"
+let historicalChartBufferHours = 500
+func historicalChartBufferStart(_ end: Int64) -> Int64 { max(0, end - Int64(historicalChartBufferHours - 1) * hourMS) }
 
 private func numeric(_ value: Any?) -> Double? {
     let result = (value as? String).flatMap(Double.init) ?? (value as? NSNumber)?.doubleValue
@@ -947,7 +949,8 @@ final class Radar {
         var failures: [String] = []
         var candleLoadFailed = false
         let warmup = max(candleLookback, strategyChartHistoryHours())
-        let warmupStart = max(0, requestedEnd - Int64(candleLookback - 1 + warmup) * hourMS)
+        let bufferedFirst = historicalChartBufferStart(requestedEnd)
+        let warmupStart = max(0, bufferedFirst - Int64(warmup) * hourMS)
         do {
             _ = try? await historyLoader.importResearch(id, from: warmupStart, through: requestedEnd)
             var cached = try store.candles(id, since: warmupStart, through: requestedEnd)
@@ -972,7 +975,7 @@ final class Radar {
         } catch { failures.append("candles"); candleLoadFailed = true }
         let oldest = (try? store.oldestCandleHour(id)) ?? nil
         let end = boundedHistoryEnd(requestedEnd, oldest: oldest, exhausted: exhaustedCandleHistory.contains(id), latest: hour)
-        let first = end - Int64(candleLookback - 1) * hourMS
+        let first = historicalChartBufferStart(end)
         for path in ["/rubik/stat/contracts/open-interest-history", "/rubik/stat/taker-volume-contract"] {
             for pageStart in stride(from: first / (Int64(chartHours) * hourMS) * Int64(chartHours) * hourMS,
                                     through: end, by: Int(chartHours) * Int(hourMS)) {
@@ -1009,7 +1012,7 @@ final class Radar {
                 } catch { failures.append(path.contains("open-interest") ? "OI" : "taker volume") }
             }
         }
-        var result = chartSnapshot(id, endingAt: end)
+        var result = chartSnapshot(id, endingAt: end, outputHours: historicalChartBufferHours)
         result["endHour"] = end
         result["oldestHour"] = oldest as Any? ?? NSNull()
         result["historyExhausted"] = exhaustedCandleHistory.contains(id)
@@ -1018,7 +1021,7 @@ final class Radar {
         return result
     }
 
-    func chartSnapshot(_ id: String, sinceRevision: Int? = nil, endingAt endHour: Int64? = nil) -> [String: Any] {
+    func chartSnapshot(_ id: String, sinceRevision: Int? = nil, endingAt endHour: Int64? = nil, outputHours: Int = chartHours) -> [String: Any] {
         guard rows[id] != nil else { return ["bars": [], "error": "Unknown contract", "revision": -1] }
         synchronizeRecordedData()
         let chartRevision = chartRevisions[id] ?? 0
@@ -1028,7 +1031,7 @@ final class Radar {
         }
         let null = NSNull()
         let end = endHour ?? hour
-        let first = end - Int64(candleLookback - 1) * hourMS
+        let first = max(0, end - Int64(max(1, outputHours) - 1) * hourMS)
         var series: [Int64: Candle]
         let stats: [Int64: (oi: Double?, sell: Double?, buy: Double?)]
         let profile = try? store.selectedSuiteProfile("radar")
@@ -1054,7 +1057,7 @@ final class Radar {
                 }
                 let replayEnd = endHour == nil ? series.filter { $0.value.open != nil }.keys.max() ?? end : end
                 let confirmedThrough = min(replayEnd, hour - hourMS)
-                let replayFirst = radarStrategyReplayStart(chartEnd: replayEnd)
+                let replayFirst = endHour == nil ? radarStrategyReplayStart(chartEnd: replayEnd) : first
                 chartReplay = try strategyChartReplay(profile: profile, market: market, reference: reference, from: replayFirst, through: confirmedThrough)
             }
         }

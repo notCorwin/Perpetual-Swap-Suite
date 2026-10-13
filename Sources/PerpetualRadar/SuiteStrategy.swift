@@ -131,6 +131,13 @@ struct StrategyChartReplay: Codable, Sendable, Equatable {
     var matchedHours = 0
     var unknownHours = 0
     var signals: [StrategyChartSignal] = []
+    var readings: [StrategyChartReading] = []
+}
+
+struct StrategyChartReading: Codable, Sendable, Equatable {
+    var hour: Int64
+    var result: String
+    var completed: Bool
 }
 
 enum SuiteEvaluation {
@@ -204,7 +211,10 @@ func strategyChartReplay(profile: StrategyProfile, market: FilterMarketData,
         } else { context.referenceBTC = nil }
         guard context.candles[hour]?.confirmed == true else {
             _ = episode.observe(.unknown)
-            if !baseline { output.unknownHours += 1 }
+            if !baseline {
+                output.unknownHours += 1
+                output.readings.append(.init(hour: hour, result: FilterTruth.unknown.rawValue, completed: false))
+            }
             continue
         }
         if !baseline { output.completedHours += 1 }
@@ -212,6 +222,7 @@ func strategyChartReplay(profile: StrategyProfile, market: FilterMarketData,
         let matches = FilterTruth.all([traces[0].result, SuiteEvaluation.truth(traces, .bullishSetup)])
         if !baseline, matches == .yes { output.matchedHours += 1 }
         if !baseline, matches == .unknown { output.unknownHours += 1 }
+        if !baseline { output.readings.append(.init(hour: hour, result: matches.rawValue, completed: true)) }
         if episode.observe(matches, baseline: baseline) == "entry", let close = context.candles[hour]?.close, close.isFinite, close > 0 {
             output.signals.append(.init(hour: hour, price: close))
         }

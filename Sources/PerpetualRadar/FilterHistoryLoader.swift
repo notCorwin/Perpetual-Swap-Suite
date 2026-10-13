@@ -77,10 +77,18 @@ actor FilterHistoryLoader {
     func importResearch(_ id: String, from: Int64, through: Int64) throws -> Int {
         guard through >= from, let research = try researchDatabase() else { return 0 }
         let version = try research.database.dataVersion()
-        if let range = researchRanges[id], range.version == version, range.first <= from, range.last >= through { return 0 }
-        let values = try research.data(id, from: from, through: through)
+        let previous = researchRanges[id]
+        let gaps: [ResearchRange]
+        if let previous, previous.version == version {
+            var missing: [ResearchRange] = []
+            if from < previous.first { missing.append(.init(from: from, through: min(through, previous.first - hourMS))) }
+            if through > previous.last { missing.append(.init(from: max(from, previous.last + hourMS), through: through)) }
+            gaps = missing.filter { $0.from <= $0.through }
+        } else { gaps = [.init(from: from, through: through)] }
+        guard !gaps.isEmpty else { return 0 }
+        let values = try gaps.flatMap { try research.data(id, from: $0.from, through: $0.through) }
         guard !values.isEmpty else {
-            researchRanges[id] = (min(from, researchRanges[id]?.first ?? from), max(through, researchRanges[id]?.last ?? through), version)
+            researchRanges[id] = (min(from, previous?.first ?? from), max(through, previous?.last ?? through), version)
             return 0
         }
         let db = try database()
@@ -91,7 +99,7 @@ actor FilterHistoryLoader {
                 if let quote = value.quote { try db.saveHourlyQuote(id, hour: value.timestamp, quote: quote) }
             }
         }
-        researchRanges[id] = (min(from, researchRanges[id]?.first ?? from), max(through, researchRanges[id]?.last ?? through), version)
+        researchRanges[id] = (min(from, previous?.first ?? from), max(through, previous?.last ?? through), version)
         candleCache.removeValue(forKey: id); statCache.removeValue(forKey: id); quoteCache.removeValue(forKey: id)
         ranges.removeValue(forKey: id); statRanges.removeValue(forKey: id)
         updatedMarkets.insert(id)

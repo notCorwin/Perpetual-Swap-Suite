@@ -12,7 +12,7 @@ import { type AnalysisDirection } from '@/chart-analysis'
 import { chartCaptureBounds } from '@/chart-capture'
 import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicY } from "@/chart-axis"
 import { chartCandleWidth, chartHourX, chartLayout, fitAxisPriceTag, type ChartPanel as Panel } from "@/chart-layout"
-import { livePriceTag, scrollChartEnd, visibleChartBars } from "@/chart-viewport"
+import { chartHistoryNeedsLoad, livePriceTag, scrollChartEnd, visibleChartBars } from "@/chart-viewport"
 import { cn, pageVisible } from "@/lib/utils"
 import { chartNavigationTarget, wrappedMarket } from "@/market-sort"
 import { finitePercentage, formatPercent, type PercentageValue } from "@/market-percent"
@@ -27,7 +27,7 @@ export type Bar = {
 }
 export type StrategyChartSignal = { hour: number; price: number }
 export type ChartStrategy = { id: string; name: string; revision: number }
-export type StrategyChartReplay = { fromHour: number; throughHour: number; historyHours: number; completedHours: number; matchedHours: number; unknownHours: number; signals: StrategyChartSignal[] }
+export type StrategyChartReplay = { fromHour: number; throughHour: number; historyHours: number; completedHours: number; matchedHours: number; unknownHours: number; signals: StrategyChartSignal[]; readings?: { hour: number; result: string; completed: boolean }[] }
 export type ChartResponse = { bars: Bar[]; error: string; revision: number; serviceSession?: string; endHour?: number; oldestHour?: number | null; historyExhausted?: boolean; candleLoadFailed?: boolean; strategy?: ChartStrategy; strategySignals?: StrategyChartSignal[]; strategyReplay?: StrategyChartReplay }
 export type ChartPollResponse = ChartResponse | { unchanged: true; error: string; revision: number; serviceSession?: string }
 
@@ -379,7 +379,6 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
   const wheelPixels = useRef(0)
   const wheelFrame = useRef<number | null>(null)
   const historyRequests = useRef(new Map<string, Promise<ChartPollResponse>>())
-  const loadedHistoryBuckets = useRef(new Set<string>())
   const requestedHistoryEnds = useRef(new Set<string>())
   const [inspection, setInspection] = useState<{ id: string; hour: number } | null>(null)
   const heldPointer = useRef<{ id: string; pointerId: number; target: SVGSVGElement } | null>(null)
@@ -413,7 +412,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
   const captureStatus = capture.id === instId ? capture.status : "idle"
   const captureError = capture.id === instId ? capture.error : ""
   useEffect(() => {
-    loadedHistoryBuckets.current.clear(); requestedHistoryEnds.current.clear()
+    requestedHistoryEnds.current.clear()
     setHistoryBars(null); setHistoryBoundary(null)
   }, [instId, chart?.serviceSession])
   useEffect(() => {
@@ -471,10 +470,11 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
   }, [instId, endInspection])
   useEffect(() => {
     if (historicalEnd === null) return
-    const bucket = `${instId}:${Math.floor(historicalEnd / (96 * 3_600_000))}`
-    const needsCandles = historicalEnd - 95 * 3_600_000 <= oldestCachedHour + 48 * 3_600_000
+    const needsCandles = chartHistoryNeedsLoad(historicalEnd, oldestCachedHour)
     const key = `${instId}:${historicalEnd}`
-    if ((!needsCandles && loadedHistoryBuckets.current.has(bucket)) || requestedHistoryEnds.current.has(key)) return
+    // A buffered response can satisfy many adjacent viewport positions. Native
+    // work is needed only near the left edge, not once per exact end hour.
+    if (!needsCandles || requestedHistoryEnds.current.has(key)) return
     let stopped = false
     const timer = window.setTimeout(() => {
       setHistoryLoading(key)
@@ -496,7 +496,6 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
           setHistoryBoundary(current => current?.id === instId && current.oldestHour === oldestHour ? current : { id: instId, oldestHour })
         }
         if (stopped || windowEndRef.current?.id !== instId || windowEndRef.current.hour !== historicalEnd || "unchanged" in result) return
-        if (!result.error && !result.candleLoadFailed) loadedHistoryBuckets.current.add(bucket)
         setHistoryBars(current => {
           const merged = mergeChartBars(result, current?.id === instId ? current.data : null)
           const first = historicalEnd - 499 * 3_600_000
@@ -627,10 +626,21 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
     return [...new Map(sources.filter(value => value.strategy?.id === strategy.id && value.strategy.revision === strategy.revision)
       .flatMap(value => value.strategySignals ?? []).map(signal => [signal.hour, signal])).values()]
   }, [chart, historyBars, instId])
-  const strategyReplay = historicalEnd === null ? chart?.strategyReplay : historyBars?.id === instId ? historyBars.data.strategyReplay : undefined
+  const replaySource = historicalEnd === null ? chart?.strategyReplay : historyBars?.id === instId ? historyBars.data.strategyReplay : undefined
+  const strategyReplay = useMemo(() => {
+    if (!replaySource?.readings?.length || !bars.length) return replaySource
+    const hours = new Set(bars.map(bar => Number(bar.hour)))
+    const readings = replaySource.readings.filter(reading => hours.has(Number(reading.hour)))
+    const signals = replaySource.signals.filter(signal => hours.has(Number(signal.hour)))
+    return { ...replaySource, fromHour: bars[0].hour, throughHour: bars.at(-1)!.hour, readings, signals,
+      completedHours: readings.filter(reading => reading.completed).length,
+      matchedHours: readings.filter(reading => reading.result === 'yes').length,
+      unknownHours: readings.filter(reading => reading.result === 'unknown').length }
+  }, [replaySource, bars])
   const visibleStrategySignals = useMemo(() => {
     const hours = new Set(bars.map(bar => Number(bar.hour)))
-    return (strategyReplay?.signals ?? strategySignals).filter(signal => hours.has(Number(signal.hour)))
+    return [...new Map([...strategySignals, ...(strategyReplay?.signals ?? [])].map(signal => [signal.hour, signal])).values()]
+      .filter(signal => hours.has(Number(signal.hour)))
   }, [bars, strategyReplay, strategySignals])
   const inspectedIndex = inspection?.id === instId ? bars.findIndex(bar => bar.hour === inspection.hour) : -1
   const inspected = inspectedIndex < 0 ? null : inspectedIndex
@@ -654,9 +664,8 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
     const nextHour = scrollChartEnd(current, latestHour, steps, Number.isFinite(oldestCachedHour) ? oldestCachedHour : 0)
     if (nextHour === current) { wheelPixels.current = 0; return }
     const next = nextHour === null ? null : { id: instId, hour: nextHour }
-    requestedHistoryEnds.current.clear()
     windowEndRef.current = next
-    setWindowEnd(next)
+    startTransition(() => setWindowEnd(next))
     endInspection()
   }
   const active = bars[inspected ?? bars.length - 1]
@@ -710,7 +719,6 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
     </div>}
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}{historicalEnd !== null && <Button variant="outline" size="sm" onClick={() => {
       requestedHistoryEnds.current.delete(`${instId}:${historicalEnd}`)
-      loadedHistoryBuckets.current.delete(`${instId}:${Math.floor(historicalEnd / (96 * 3_600_000))}`)
       setHistoryRetry(value => value + 1)
     }}>Retry</Button>}</div>}
     {captureError && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{captureError}</p>}
@@ -732,7 +740,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
           wheelFrame.current = null
           const steps = Math.trunc(wheelPixels.current / 12)
           wheelPixels.current -= steps * 12
-          flushSync(() => moveHistory(steps))
+          moveHistory(steps)
         })
       }}>
         <div className="relative h-full w-full">

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { livePriceTag, scrollChartEnd, visibleChartBars } from "./chart-viewport.ts"
+import { chartHistoryNeedsLoad, livePriceTag, scrollChartEnd, visibleChartBars } from "./chart-viewport.ts"
 
 const hour = 3_600_000
 test("live price and countdown do not change when the chart scrolls into history", () => {
@@ -29,4 +29,11 @@ test("a cached candle range changes the visible 96-hour window immediately", () 
   assert.equal(visibleChartBars(bars, 249 * hour).length, 96)
   assert.equal(visibleChartBars(bars, 200 * hour)[0].hour, 105 * hour)
   assert.equal(visibleChartBars(bars, 200 * hour).at(-1)?.hour, 200 * hour)
+})
+
+test("a buffered history block avoids native requests until the viewport nears its left edge", () => {
+  const oldest = 1_000 * hour
+  assert.equal(chartHistoryNeedsLoad(1_499 * hour, oldest), false)
+  assert.equal(chartHistoryNeedsLoad(1_144 * hour, oldest), false)
+  assert.equal(chartHistoryNeedsLoad(1_143 * hour, oldest), true)
 })

@@ -20,3 +20,7 @@ export function visibleChartBars<T extends { hour: number }>(bars: T[], endHour:
   const firstHour = endHour - 95 * hour
   return bars.filter(bar => bar.hour >= firstHour && bar.hour <= endHour)
 }
+
+export function chartHistoryNeedsLoad(endHour: number, oldestCachedHour: number, visibleHours = 96, prefetchHours = 48): boolean {
+  return endHour - (visibleHours - 1) * hour <= oldestCachedHour + prefetchHours * hour
+}
