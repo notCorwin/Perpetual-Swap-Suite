@@ -12,10 +12,11 @@ export function chartHourX(hour: number, latestHour: number, start: number, end:
 }
 
 export function fitAxisPriceTag(axisGutter: number, tagWidth: number, strokeWidth: number, minimumScale: number) {
+  const leadingInset = 2, trailingInset = 4
   const fullTagWidth = tagWidth + strokeWidth
-  const gutter = Math.ceil(Math.max(axisGutter, fullTagWidth * minimumScale))
-  const scale = Math.min(1, gutter / fullTagWidth)
-  return { gutter, scale, boxWidth: gutter / scale - strokeWidth }
+  const gutter = Math.ceil(Math.max(axisGutter, leadingInset + trailingInset + fullTagWidth * minimumScale))
+  const scale = Math.min(1, (gutter - leadingInset - trailingInset) / fullTagWidth)
+  return { gutter, scale, offset: leadingInset / scale, boxWidth: (gutter - leadingInset - trailingInset) / scale - strokeWidth }
 }
 
 export function chartLayout(width: number, height: number, labelGutter = 64) {
