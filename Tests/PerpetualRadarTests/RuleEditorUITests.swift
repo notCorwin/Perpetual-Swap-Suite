@@ -589,7 +589,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await click(view,"Explain"); try await wait(view,"document.querySelector('[role=dialog]')?.innerText.includes('Bullish Setup')")
         try await dismissFloating(view)
         try await click(view,"Strategy rules")
-        let focused = try await js(view,"Array.from(document.querySelectorAll('[aria-label=\"Phase rule editor\"] button')).map(b=>b.textContent.trim()).join('|') === 'Universe|Bullish Setup' && !document.querySelector('[data-suite-workspace=radar]').innerText.includes('Positions')") as? Bool
+        let focused = try await js(view,"Array.from(document.querySelectorAll('[aria-label=\"Phase rule editor\"] button')).map(b=>b.getAttribute('aria-label')).join('|') === 'Universe|Bullish Setup' && !document.querySelector('[data-suite-workspace=radar]').innerText.includes('Positions')") as? Bool
         XCTAssertEqual(focused, true)
         try await click(view,"Duplicate saved strategy")
         try await wait(view,"document.body.innerText.includes('Strategy duplicated in the shared library')")
@@ -1937,7 +1937,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         _ = try await openMenu(view, selector: "[aria-label=\"Comparison\"]")
         try await option(view, comparison)
         try await input(view, "[aria-label=\"Threshold\"]", threshold)
-        if waitUntilValid { try await wait(view, "Array.from(document.querySelectorAll('button')).some(x => ['Save Universe', 'Keep rules'].includes(x.textContent.trim()) && !x.disabled && x.getBoundingClientRect().height > 0) && !document.body.innerText.includes('Compiling…')") }
+        if waitUntilValid { try await wait(view, "(Array.from(document.querySelectorAll('button')).some(x => x.textContent.trim() === 'Save Universe' && !x.disabled && x.getBoundingClientRect().height > 0) || Array.from(document.querySelectorAll('[data-rule-draft-state=\"valid\"]')).some(x => x.closest('[data-strategy-rules]') && x.getBoundingClientRect().height > 0)) && !document.body.innerText.includes('Compiling…')") }
     }
 
     @MainActor
@@ -1954,7 +1954,7 @@ final class RuleEditorUITests: BackgroundTestCase {
 
     @MainActor
     private func validDraft(_ view: WKWebView) async throws {
-        try await wait(view, "Array.from(document.querySelectorAll('button')).some(x => ['Save Universe', 'Keep rules'].includes(x.textContent.trim()) && !x.disabled && x.getBoundingClientRect().height > 0) && !document.body.innerText.includes('Compiling…')")
+        try await wait(view, "(Array.from(document.querySelectorAll('button')).some(x => x.textContent.trim() === 'Save Universe' && !x.disabled && x.getBoundingClientRect().height > 0) || Array.from(document.querySelectorAll('[data-rule-draft-state=\"valid\"]')).some(x => x.closest('[data-strategy-rules]') && x.getBoundingClientRect().height > 0)) && !document.body.innerText.includes('Compiling…')")
     }
 
     @MainActor
