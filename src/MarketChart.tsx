@@ -16,6 +16,7 @@ import { chartHistoryNeedsLoad, livePriceTag, scrollChartEnd, visibleChartBars }
 import { cn, pageVisible } from "@/lib/utils"
 import { chartNavigationTarget, wrappedMarket } from "@/market-sort"
 import { finitePercentage, formatPercent, type PercentageValue } from "@/market-percent"
+import { capturePriceMoves, type PriceMoveSignal } from '@/price-move-signals'
 import { SnapshotOrder } from '@/snapshot-order'
 import { mergeChartBars } from '@/chart-snapshot'
 
@@ -25,10 +26,7 @@ export type Bar = {
   roc: PercentageValue; maroc: PercentageValue; rsi6: number | null; rsi12: number | null; rsi24: number | null
   oi: number | null; buy: number | null; sell: number | null
 }
-export type StrategyChartSignal = { hour: number; price: number }
-export type ChartStrategy = { id: string; name: string; revision: number }
-export type StrategyChartReplay = { fromHour: number; throughHour: number; historyHours: number; completedHours: number; matchedHours: number; unknownHours: number; signals: StrategyChartSignal[]; readings?: { hour: number; result: string; completed: boolean }[] }
-export type ChartResponse = { bars: Bar[]; error: string; revision: number; serviceSession?: string; endHour?: number; oldestHour?: number | null; historyExhausted?: boolean; candleLoadFailed?: boolean; strategy?: ChartStrategy; strategySignals?: StrategyChartSignal[]; strategyReplay?: StrategyChartReplay }
+export type ChartResponse = { bars: Bar[]; error: string; revision: number; serviceSession?: string; endHour?: number; oldestHour?: number | null; historyExhausted?: boolean; candleLoadFailed?: boolean }
 export type ChartPollResponse = ChartResponse | { unchanged: true; error: string; revision: number; serviceSession?: string }
 
 const chartCache = new Map<string, { data: ChartResponse; loadedAt: number }>()
@@ -133,7 +131,7 @@ export const chartGutter = (bars: Bar[], height: number, liveClose = bars[bars.l
   return fitAxisPriceTag(axisGutter, priceTagWidth(price(liveClose), "00:00"), tagStrokeWidth, minimumScale)
 }
 
-export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height, now, endHour, strategySignals = [] }: { bars: Bar[]; liveBar: Bar; inspected: number | null; width: number; height: number; now: number; endHour: number; strategySignals?: StrategyChartSignal[] }) {
+export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height, now, endHour, moveSignals = [] }: { bars: Bar[]; liveBar: Bar; inspected: number | null; width: number; height: number; now: number; endHour: number; moveSignals?: PriceMoveSignal[] }) {
   const areaClipId = useId().replaceAll(":", "")
   const n = bars.length
   const active = bars[inspected ?? n - 1]
@@ -326,15 +324,25 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
     {lineStroke(line("roc", "roc", value => scale(value, rocAxis.min, rocAxis.max, panels.roc)), "var(--chart-1)")}
     {lineStroke(line("maroc", "roc", value => scale(value, rocAxis.min, rocAxis.max, panels.roc)), "var(--chart-2)", indicatorWidth, 1, "7 4")}
     {oiAxis && lineStroke(line("oi", "oi", oiY), "var(--chart-2)")}
-    {strategySignals.map(signal => {
+    {moveSignals.map(signal => {
       const signalHour = Number(signal.hour)
       const index = bars.findIndex(bar => Number(bar.hour) === signalHour && bar.confirmed)
       if (index < 0) return null
-      const markerX = x(index, "price"), markerY = Math.min(panels.price[1] - 5, priceY(bars[index].low) + 9)
-      return <g key={signalHour} data-chart-buy-hour={signalHour} aria-label={`Strategy buy signal at ${time(signalHour)} close; reference entry is the next-hour open`}>
-        <path d={`M${markerX} ${markerY - 7}L${markerX - 5} ${markerY + 1}H${markerX + 5}Z`} fill="var(--positive)" stroke="var(--chart-surface)" strokeWidth="1.5" />
-        <circle cx={markerX} cy={markerY + 3.5} r="2.25" fill="var(--positive)" stroke="var(--chart-surface)" strokeWidth="1" />
-        <text x={markerX} y={markerY + 14} textAnchor="middle" fill="var(--positive)" fontWeight="700">BUY</text>
+      const exitIndex = bars.findIndex(bar => Number(bar.hour) === Number(signal.exitHour) && bar.confirmed)
+      const isLong = signal.direction === 'long'
+      const color = isLong ? 'var(--positive)' : 'var(--destructive)'
+      const markerX = x(index, "price")
+      const markerY = isLong ? Math.min(panels.price[1] - 17, priceY(bars[index].low) + 9) : Math.max(panels.price[0] + 17, priceY(bars[index].high) - 9)
+      const labelY = markerY + (isLong ? 14 : -10)
+      const triangle = isLong
+        ? `M${markerX} ${markerY - 7}L${markerX - 5} ${markerY + 1}H${markerX + 5}Z`
+        : `M${markerX} ${markerY + 7}L${markerX - 5} ${markerY - 1}H${markerX + 5}Z`
+      const aria = `${isLong ? 'Long' : 'Short'} future move at ${time(signalHour)} close, ${formatPercent(signal.changePercent)} over ${signal.periods} hourly candles`
+      return <g key={`${signal.direction}-${signalHour}`} data-chart-move-direction={signal.direction} data-chart-move-hour={signalHour} aria-label={aria}>
+        {exitIndex >= 0 && <line x1={markerX} y1={priceY(signal.entryPrice)} x2={x(exitIndex, 'price')} y2={priceY(signal.exitPrice)} stroke={color} strokeWidth="1.2" strokeDasharray="3 4" opacity="0.7" />}
+        <path d={triangle} fill={color} stroke="var(--chart-surface)" strokeWidth="1.5" />
+        <text x={markerX} y={labelY} textAnchor="middle" fill={color} fontWeight="700">{isLong ? 'LONG' : 'SHORT'}</text>
+        <title>{aria}</title>
       </g>
     })}
     {inspected !== null && panelKeys.map(key => <line key={key} x1={x(inspected, key)} x2={x(inspected, key)} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--foreground)" strokeWidth="0.65" strokeDasharray="3 5" opacity="0.3" />)}
@@ -619,29 +627,11 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
 
   const viewportEnd = historicalEnd ?? chart?.bars.at(-1)?.hour ?? 0
   const bars = useMemo(() => visibleChartBars(cachedBars, viewportEnd), [cachedBars, viewportEnd])
-  const strategySignals = useMemo(() => {
-    const sources = [chart, historyBars?.id === instId ? historyBars.data : null].filter((value): value is ChartResponse => value !== null)
-    const strategy = chart?.strategy ?? sources.find(value => value.strategy)?.strategy
-    if (!strategy) return []
-    return [...new Map(sources.filter(value => value.strategy?.id === strategy.id && value.strategy.revision === strategy.revision)
-      .flatMap(value => value.strategySignals ?? []).map(signal => [signal.hour, signal])).values()]
-  }, [chart, historyBars, instId])
-  const replaySource = historicalEnd === null ? chart?.strategyReplay : historyBars?.id === instId ? historyBars.data.strategyReplay : undefined
-  const strategyReplay = useMemo(() => {
-    if (!replaySource?.readings?.length || !bars.length) return replaySource
+  const moveSignals = useMemo(() => capturePriceMoves(cachedBars), [cachedBars])
+  const visibleMoveSignals = useMemo(() => {
     const hours = new Set(bars.map(bar => Number(bar.hour)))
-    const readings = replaySource.readings.filter(reading => hours.has(Number(reading.hour)))
-    const signals = replaySource.signals.filter(signal => hours.has(Number(signal.hour)))
-    return { ...replaySource, fromHour: bars[0].hour, throughHour: bars.at(-1)!.hour, readings, signals,
-      completedHours: readings.filter(reading => reading.completed).length,
-      matchedHours: readings.filter(reading => reading.result === 'yes').length,
-      unknownHours: readings.filter(reading => reading.result === 'unknown').length }
-  }, [replaySource, bars])
-  const visibleStrategySignals = useMemo(() => {
-    const hours = new Set(bars.map(bar => Number(bar.hour)))
-    return [...new Map([...strategySignals, ...(strategyReplay?.signals ?? [])].map(signal => [signal.hour, signal])).values()]
-      .filter(signal => hours.has(Number(signal.hour)))
-  }, [bars, strategyReplay, strategySignals])
+    return moveSignals.filter(signal => hours.has(Number(signal.hour)))
+  }, [bars, moveSignals])
   const inspectedIndex = inspection?.id === instId ? bars.findIndex(bar => bar.hour === inspection.hour) : -1
   const inspected = inspectedIndex < 0 ? null : inspectedIndex
   const inspectAt = (target: SVGSVGElement, clientX: number) => {
@@ -674,7 +664,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
   // Data for neighboring markets remains in warmCharts; mounting their full
   // hidden SVGs would still consume reconciliation, layout and a11y resources.
   const surfaces = new Map<string, ChartResponse>()
-  if (bars.length && chart) surfaces.set(instId, { ...chart, bars, endHour: viewportEnd, strategySignals: visibleStrategySignals })
+  if (bars.length && chart) surfaces.set(instId, { ...chart, bars, endHour: viewportEnd })
   const analyzeChart = (direction: AnalysisDirection) => {
     if (!bars.length || plotSize.width <= 0 || captureStatus === 'copying') return
     flushSync(() => { setAnalysisOpen(true); setCapture({ id: instId, status: 'idle', error: '' }) })
@@ -690,7 +680,9 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
       return { ...image, capturedAt, rangeLabel }
     }, direction)
   }
-  const chartDescription = `OKX perpetual · 1h · ${historicalEnd === null ? "Latest 96 hours" : `History through ${time(historicalEnd)}`} · Strategy BUY marks the signal close; reference entry is next-hour open · Hold to inspect · Scroll chart for history · 24h turnover rank ${turnoverPosition + 1}/${turnoverOrder.length} · ↑/↓ list order · ← list first · → turnover first`
+  const longMoves = visibleMoveSignals.filter(signal => signal.direction === 'long').length
+  const shortMoves = visibleMoveSignals.length - longMoves
+  const chartDescription = `OKX perpetual · 1h · ${historicalEnd === null ? "Latest 96 hours" : `History through ${time(historicalEnd)}`} · Future-aware Long and Short labels capture close-to-close moves over 1% · Hold to inspect · Scroll chart for history · 24h turnover rank ${turnoverPosition + 1}/${turnoverOrder.length} · ↑/↓ list order · ← list first · → turnover first`
   return <ChartWorkspaceViewport expanded={analysisOpen}><main className="flex h-full min-h-0 flex-col overflow-hidden overscroll-none text-sm font-normal tabular-nums">
     <header className="flex shrink-0 items-center gap-3 border-b px-4 py-2">
       <Button variant="ghost" size="sm" onClick={onBack}><ArrowLeft data-icon="inline-start" aria-hidden="true" />{backLabel}</Button>
@@ -709,14 +701,13 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
       </ButtonGroup>
       <span role="status" className="sr-only">{captureStatus === "flashing" ? "Chart copied to clipboard" : ""}</span>
       <Badge variant="secondary"><Radio data-icon="inline-start" aria-hidden="true" />{historicalEnd !== null ? "History" : active && !active.confirmed ? "Live candle" : "Hourly chart"}</Badge>
-      {chart?.strategy && <Badge variant="outline" title="BUY markers use completed hourly candles only">{chart.strategy.name} · r{chart.strategy.revision} · {visibleStrategySignals.length} BUY</Badge>}
+      <Badge variant="outline" title="Hindsight labels use future completed closes and are not live trading signals">{longMoves} Long · {shortMoves} Short</Badge>
     </header>
-    {chart?.strategy && strategyReplay && <div role="status" data-strategy-chart-summary className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-xs">
-      <span className={visibleStrategySignals.length ? 'font-medium text-positive' : 'font-medium'}>{visibleStrategySignals.length} BUY {visibleStrategySignals.length === 1 ? 'entry' : 'entries'} across visible completed candles</span>
-      <span className="text-muted-foreground">Rule-required history through each candle · no future data</span>
-      <span className="text-muted-foreground">{strategyReplay.matchedHours} matching completed hours · {strategyReplay.completedHours} completed hours checked{strategyReplay.unknownHours ? ` · ${strategyReplay.unknownHours} Unknown` : ''}</span>
-      {!visibleStrategySignals.length && <span className="ml-auto text-muted-foreground">The strategy did not transition from non-match to match in this window.</span>}
-    </div>}
+    <div role="status" data-price-move-summary className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-xs">
+      <span className="font-medium"><span className="text-positive">{longMoves} Long</span> · <span className="text-destructive">{shortMoves} Short</span></span>
+      <span className="text-muted-foreground">Completed closes · move &gt; 1% · maximum swing first · shortest K-line span second</span>
+      <span className="ml-auto text-muted-foreground">Uses future data · labels only</span>
+    </div>
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}{historicalEnd !== null && <Button variant="outline" size="sm" onClick={() => {
       requestedHistoryEnds.current.delete(`${instId}:${historicalEnd}`)
       setHistoryRetry(value => value + 1)
@@ -761,7 +752,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
           if (!(event.buttons & 1)) { endInspection(); return }
           inspectAt(event.currentTarget, event.clientX)
         }}>
-          <Plot bars={data.bars} liveBar={chart?.bars.at(-1) ?? data.bars.at(-1)!} inspected={inspected} width={plotSize.width} height={plotSize.height} now={1} endHour={data.endHour ?? data.bars.at(-1)!.hour} strategySignals={data.strategySignals} />
+          <Plot bars={data.bars} liveBar={chart?.bars.at(-1) ?? data.bars.at(-1)!} inspected={inspected} width={plotSize.width} height={plotSize.height} now={1} endHour={data.endHour ?? data.bars.at(-1)!.hour} moveSignals={visibleMoveSignals} />
         </svg>) : <p className="flex h-full items-center justify-center text-muted-foreground">{chart ? "No candle data available yet" : "Loading chart…"}</p>}
         {historicalEnd !== null && historyLoading === `${instId}:${historicalEnd}` && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Loading history…</span>}
         {atHistoryBoundary && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Start of available history</span>}
