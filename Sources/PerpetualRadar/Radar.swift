@@ -1037,7 +1037,8 @@ final class Radar {
                         candles: referenceCandles, stats: referenceStats.mapValues { FilterStat(oi: $0.oi, sell: $0.sell, buy: $0.buy) }, quotes: referenceQuotes, historicalClose: true)
                 }
                 let confirmedThrough = min(end, hour - hourMS)
-                chartReplay = try strategyChartReplay(profile: profile, market: market, reference: reference, from: first, through: confirmedThrough)
+                let replayFirst = radarStrategyBacktestStart(through: confirmedThrough)
+                chartReplay = try strategyChartReplay(profile: profile, market: market, reference: reference, from: replayFirst, through: confirmedThrough)
             }
         }
         catch { return ["bars": [], "error": "Cannot read chart cache: \(error.localizedDescription)", "revision": chartRevision] }

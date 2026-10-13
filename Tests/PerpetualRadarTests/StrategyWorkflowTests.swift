@@ -130,6 +130,13 @@ final class StrategyWorkflowTests: XCTestCase {
                        [start + 2 * hourMS], "The forming candle must never become a historical BUY marker.")
     }
 
+    func testRadarChartBacktestUses48HoursEndingAtTheEvaluatedCandle() {
+        let evaluatedHour = hour - hourMS
+        let start = radarStrategyBacktestStart(through: evaluatedHour)
+        XCTAssertEqual(start, evaluatedHour - 47 * hourMS)
+        XCTAssertEqual((evaluatedHour - start) / hourMS + 1, 48)
+    }
+
     func testChartReplayReconstructsPastTurnoverWithoutInventingSpread() throws {
         let start = hour - 25 * hourMS
         let bars = Dictionary(uniqueKeysWithValues: (0...25).map { index in

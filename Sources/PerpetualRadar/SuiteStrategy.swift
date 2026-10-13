@@ -2,6 +2,11 @@ import Foundation
 
 let defaultStrategyID = "builtin.default-strategy"
 private let defaultStrategyRevision = 1
+let radarStrategyBacktestHours = 48
+
+func radarStrategyBacktestStart(through: Int64) -> Int64 {
+    max(0, through - Int64(radarStrategyBacktestHours - 1) * hourMS)
+}
 
 private func defaultRule(_ id: String, _ name: String, left: String, _ comparison: String, right: String) -> FilterNode {
     var node = FilterNode(kind: "condition", name: name, left: left, comparison: comparison, right: right)
