@@ -11,7 +11,7 @@ import { chartAnalysis } from '@/analysis-service'
 import { type AnalysisDirection } from '@/chart-analysis'
 import { chartCaptureBounds } from '@/chart-capture'
 import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicY } from "@/chart-axis"
-import { chartCandleWidth, chartHourX, chartLayout, fitPriceTag, type ChartPanel as Panel } from "@/chart-layout"
+import { chartCandleWidth, chartHourX, chartLayout, fitAxisPriceTag, type ChartPanel as Panel } from "@/chart-layout"
 import { livePriceTag, scrollChartEnd, visibleChartBars } from "@/chart-viewport"
 import { cn, pageVisible } from "@/lib/utils"
 import { chartNavigationTarget, wrappedMarket } from "@/market-sort"
@@ -114,13 +114,12 @@ export const chartGutter = (bars: Bar[], height: number, liveClose = bars[bars.l
     ...takerAxis.ticks.map(compact),
   ]
   const style = getComputedStyle(document.documentElement)
-  const tagGap = Number.parseFloat(style.getPropertyValue("--chart-price-tag-gap"))
   const tagStrokeWidth = Number.parseFloat(style.getPropertyValue("--chart-price-tag-stroke-width"))
   const tagTextSize = Number.parseFloat(style.getPropertyValue("--chart-price-tag-text-size"))
   const axisTextSize = Number.parseFloat(style.getPropertyValue("--chart-text-size"))
   const minimumScale = Math.min(1, axisTextSize / tagTextSize)
   const axisGutter = Math.max(...labels.map(label => 8 + legendWidth(label)))
-  return fitPriceTag(axisGutter, priceTagWidth(price(liveClose), "00:00"), tagGap, tagStrokeWidth, minimumScale)
+  return fitAxisPriceTag(axisGutter, priceTagWidth(price(liveClose), "00:00"), tagStrokeWidth, minimumScale)
 }
 
 export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height, now, endHour, strategySignals = [] }: { bars: Bar[]; liveBar: Bar; inspected: number | null; width: number; height: number; now: number; endHour: number; strategySignals?: StrategyChartSignal[] }) {
@@ -131,7 +130,7 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
   const firstHour = endHour - 95 * 3_600_000
   const firstAtLeft = bars[0].hour === firstHour
   const candleHigh = Math.max(...bars.map(bar => bar.high)), candleLow = Math.min(...bars.map(bar => bar.low))
-  const { gutter, scale: tagScale } = chartGutter(bars, height, liveBar.close)
+  const { gutter, scale: tagScale, boxWidth: tagBoxWidth } = chartGutter(bars, height, liveBar.close)
   const { panels, columns, axisStarts, headerY, left, right } = chartLayout(width, height, gutter)
   const x = (index: number, panel: Panel) => chartHourX(bars[index].hour, latestHour, ...columns[panel])
   const barWidth = chartCandleWidth(right - left)
@@ -159,20 +158,18 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
   const showCountdown = now > 0
   const secondsLeft = tag.secondsLeft
   const countdown = `${String(Math.floor(secondsLeft / 60)).padStart(2, "0")}:${String(secondsLeft % 60).padStart(2, "0")}`
-  const latestPrice = price(tag.price), tagWidth = priceTagWidth(latestPrice, countdown)
+  const latestPrice = price(tag.price)
   const tagStyle = getComputedStyle(document.documentElement)
   const tagFontSize = tagStyle.getPropertyValue("--chart-price-tag-text-size").trim()
   const tagLineHeight = Number.parseFloat(tagFontSize) * Number.parseFloat(tagStyle.getPropertyValue("--chart-price-tag-line-height"))
   const tagPaddingY = Number.parseFloat(tagStyle.getPropertyValue("--chart-price-tag-padding-y"))
   const tagRowGap = Number.parseFloat(tagStyle.getPropertyValue("--chart-price-tag-row-gap"))
-  const tagGap = Number.parseFloat(tagStyle.getPropertyValue("--chart-price-tag-gap"))
   const tagStrokeWidth = Number.parseFloat(tagStyle.getPropertyValue("--chart-price-tag-stroke-width"))
-  const tagRadius = Number.parseFloat(tagStyle.getPropertyValue("--chart-price-tag-radius"))
   const tickHalfHeight = Number.parseFloat(tagStyle.getPropertyValue("--chart-text-size")) / 2
   const tagHeight = tagLineHeight * (showCountdown ? 2 : 1) + (showCountdown ? tagRowGap : 0) + tagPaddingY * 2
   const scaledTagHeight = tagHeight * tagScale
   const priceTagY = tag.inViewport ? Math.max(panels.price[0], Math.min(latestY - scaledTagHeight / 2, panels.price[1] - scaledTagHeight)) : panels.price[0]
-  const tagX = right + tagGap + tagStrokeWidth * tagScale / 2
+  const tagX = right
   const line = (key: keyof Bar, panelKey: Panel, y: (value: number) => number) => {
     const segments: string[] = []
     let segment = ""
@@ -341,9 +338,9 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
       </g>
     })}
     <g data-surface="inherited" transform={`translate(${tagX},${priceTagY}) scale(${tagScale})`}>
-      <rect width={tagWidth} height={tagHeight} rx={tagRadius} fill="var(--chart-annotation)" stroke={latestColor} strokeWidth="var(--chart-price-tag-stroke-width)" />
-      <text x={tagWidth / 2} y={tagPaddingY + tagLineHeight / 2} textAnchor="middle" dominantBaseline="middle" fill="var(--foreground)" fontSize={tagFontSize}>{latestPrice}</text>
-      {showCountdown && <text x={tagWidth / 2} y={tagPaddingY + tagLineHeight * 1.5 + tagRowGap} textAnchor="middle" dominantBaseline="middle" fill="var(--foreground)" fontSize={tagFontSize}>{countdown}</text>}
+      <rect x={tagStrokeWidth / 2} width={tagBoxWidth} height={tagHeight} fill="var(--chart-price-tag-background)" stroke={latestColor} strokeWidth="var(--chart-price-tag-stroke-width)" />
+      <text x={(tagBoxWidth + tagStrokeWidth) / 2} y={tagPaddingY + tagLineHeight / 2} textAnchor="middle" dominantBaseline="middle" fill="var(--foreground)" fontSize={tagFontSize}>{latestPrice}</text>
+      {showCountdown && <text x={(tagBoxWidth + tagStrokeWidth) / 2} y={tagPaddingY + tagLineHeight * 1.5 + tagRowGap} textAnchor="middle" dominantBaseline="middle" fill="var(--foreground)" fontSize={tagFontSize}>{countdown}</text>}
     </g>
     {legend("price", [["VWAP14", price(active.vwap), "var(--chart-2)"], ["EMA200", price(active.ema), "var(--chart-3)"], ["Log BB(20)", `U ${price(active.logBBUpper)}\u00a0·\u00a0M ${price(active.logBBMiddle)}\u00a0·\u00a0L ${price(active.logBBLower)}`, "var(--chart-1)"]])}
     {legend("roc", [["ROC(9)", formatPercent(active.roc), "var(--chart-1)"], ["MAROC(9)", formatPercent(active.maroc), "var(--chart-2)"]])}

@@ -11,10 +11,11 @@ export function chartHourX(hour: number, latestHour: number, start: number, end:
   return start + candleWidth / 2 + (hour - (latestHour - 95 * 3_600_000)) * (end - start - candleWidth) / (95 * 3_600_000)
 }
 
-export function fitPriceTag(axisGutter: number, tagWidth: number, gap: number, strokeWidth: number, minimumScale: number) {
+export function fitAxisPriceTag(axisGutter: number, tagWidth: number, strokeWidth: number, minimumScale: number) {
   const fullTagWidth = tagWidth + strokeWidth
-  const gutter = Math.ceil(Math.max(axisGutter, gap + fullTagWidth * minimumScale))
-  return { gutter, scale: Math.min(1, (gutter - gap) / fullTagWidth) }
+  const gutter = Math.ceil(Math.max(axisGutter, fullTagWidth * minimumScale))
+  const scale = Math.min(1, gutter / fullTagWidth)
+  return { gutter, scale, boxWidth: gutter / scale - strokeWidth }
 }
 
 export function chartLayout(width: number, height: number, labelGutter = 64) {
