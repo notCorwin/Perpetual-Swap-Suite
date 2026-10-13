@@ -502,6 +502,10 @@ final class RuleEditorUITests: BackgroundTestCase {
         }
         _ = try await js(view,"document.querySelector('[data-signal-lane=bullishSetup] button[aria-label=\"View MKT001-USDT-SWAP chart\"]').click(); true")
         try await wait(view,"document.querySelector('section[aria-label=\"MKT001-USDT-SWAP chart\"] [data-chart-move-direction]') !== null && document.querySelector('[data-price-move-summary]')?.innerText.includes('Uses future data') && !document.querySelector('[data-strategy-chart-summary]') && !document.querySelector('[data-chart-buy-hour]')")
+        try await click(view,"High / Low")
+        try await wait(view,"document.querySelector('[data-price-move-mode]')?.dataset.priceMoveMode === 'highLow'")
+        try await click(view,"Close")
+        try await wait(view,"document.querySelector('[data-price-move-mode]')?.dataset.priceMoveMode === 'close'")
         _ = try await js(view,"window.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown'})); true")
         try await wait(view,"document.querySelector('section[aria-label=\"MKT002-USDT-SWAP chart\"]') !== null")
         try await click(view,"Signals")
