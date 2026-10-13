@@ -29,7 +29,7 @@ final class StrategyWorkflowTests: XCTestCase {
         }
         try store.setPreference("false", forKey: "filterNotificationsEnabled")
         let radar = try Radar(storeURL: store.url), snapshot = radar.snapshot(rocPeriod: 9, marocPeriod: 9)
-        XCTAssertNil(try radar.monitoringStrategy())
+        XCTAssertEqual(try radar.monitoringStrategy()?.id, defaultStrategyID)
         XCTAssertFalse(radar.notificationsEnabled, "Renaming notifications preserves the user's disabled setting.")
         try radar.setNotificationsEnabled(true)
         XCTAssertTrue(try Radar(storeURL: store.url).notificationsEnabled)

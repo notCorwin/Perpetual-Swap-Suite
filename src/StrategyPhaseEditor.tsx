@@ -7,10 +7,10 @@ import type { ResearchInputs } from '@/research-types'
 import type { useStrategyFilter } from '@/use-strategy-filter'
 
 export type StageStatus = { matches: number; total: number; unknown: number }
-export function StrategyPhaseEditor({ label, model, inputs, preferences, onPreferences, active, strategyID, description, statusKey = label, onStatus }: {
+export function StrategyPhaseEditor({ label, model, inputs, preferences, onPreferences, active, strategyID, description, readOnly = false, statusKey = label, onStatus }: {
   label: string; description?: string; model: ReturnType<typeof useStrategyFilter>; inputs: ResearchInputs; preferences: FilterLibraryPreferences
   onPreferences: (value: FilterLibraryPreferences) => Promise<void>; active: boolean; strategyID: string
-  statusKey?: string; onStatus?: (key: string, status: StageStatus) => void
+  readOnly?: boolean; statusKey?: string; onStatus?: (key: string, status: StageStatus) => void
 }) {
   const [rows, setRows] = useState<NativeMarketRow[]>([]), [results, setResults] = useState<Record<string, FilterTruth>>({})
   const [previewJSON, setPreviewJSON] = useState<string | null>(null)
@@ -51,7 +51,7 @@ export function StrategyPhaseEditor({ label, model, inputs, preferences, onPrefe
   useEffect(() => { if (previewJSON !== null) onStatus?.(statusKey, { matches, total: rows.length, unknown }) }, [onStatus, statusKey, matches, rows.length, unknown, previewJSON])
   return <section aria-label={label} className="flex flex-col gap-3" data-strategy-rules>
     {description && <FieldDescription className="px-4">{description}</FieldDescription>}
-    <StrategyRules label={label} embedded filters={model.filters} draft={model.draft} editor={model.editor} onEditorChange={model.setEditor} onDraftChange={model.setDraft} onApply={model.keep}
+    <StrategyRules label={label} embedded readOnly={readOnly} filters={model.filters} draft={model.draft} editor={model.editor} onEditorChange={model.setEditor} onDraftChange={model.setDraft} onApply={model.keep}
       metrics={metrics} templates={inputs.templates} preferences={preferences} onPreferences={onPreferences}
       previewJSON={previewJSON} units={model.compilation.units ?? {}} expressions={expressions}
       diagnostics={model.compilation.diagnostics} valid={model.valid} compiling={model.compiling} requiredHours={model.compilation.requiredHours ?? 0}

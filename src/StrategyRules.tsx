@@ -19,7 +19,7 @@ import { cn } from '@/lib/utils'
 import { duplicateRule, emptyFilterConfig, findParent, findRule, newRuleID, parseFilterConfig, removeRule, ruleCount, updateRule, type EditorExpression, type FilterConfigV2, type FilterDraftRevision, type FilterEditorState, type FilterLibraryPreferences, type FilterMetric, type RuleNode } from '@/rule-engine'
 
 type Props = {
-  label?: string; embedded?: boolean
+  label?: string; embedded?: boolean; readOnly?: boolean
   filters: FilterConfigV2; draft: FilterConfigV2 | null; editor: FilterEditorState
   onDraftChange: (draft: FilterConfigV2 | null) => void; onEditorChange: Dispatch<SetStateAction<FilterEditorState>>
   onApply: (filters: FilterConfigV2) => Promise<void>
@@ -35,7 +35,8 @@ export function StrategyRules(props: Props) {
   const [saving, setSaving] = useState(false), [saveError, setSaveError] = useState(''), [feedback, setFeedback] = useState('')
   const [dragging, setDragging] = useState<string | null>(null), [drop, setDrop] = useState<RuleDropTarget | null>(null)
   const pendingName = Object.keys(editor.nameDrafts).length > 0
-  const draft = override ?? filters, dirty = override !== null || pendingName
+  const readOnly = props.readOnly ?? false
+  const draft = override ?? filters, dirty = !readOnly && (override !== null || pendingName)
   useEffect(() => () => window.clearTimeout(coalesceTimer.current), [])
   const activeFilters = useMemo(() => props.previewJSON ? parseFilterConfig(props.previewJSON) : filters, [props.previewJSON, filters])
   const activeName = props.label ?? 'Strategy rules'
@@ -54,7 +55,7 @@ export function StrategyRules(props: Props) {
     onEditorChange(current => ({ ...current, source, selectedRuleId: selectedId ?? current.selectedRuleId, past: coalesce ? current.past : [...current.past, previous].slice(-40), future: [], nameDrafts: Object.fromEntries(Object.entries(current.nameDrafts).filter(([id]) => names.has(id))), expressionDrafts: Object.fromEntries(Object.entries(current.expressionDrafts).filter(([key]) => sources.has(key))) }))
     lastEdit.current = field; window.clearTimeout(coalesceTimer.current); coalesceTimer.current = window.setTimeout(() => { lastEdit.current = '' }, 700); setSaveError(''); setFeedback('')
   }
-  const edit = (config: FilterConfigV2, selectedId?: string) => { record(null, selectedId ?? selectedRule.id, config); onDraftChange(config) }
+  const edit = (config: FilterConfigV2, selectedId?: string) => { if (readOnly) return; record(null, selectedId ?? selectedRule.id, config); onDraftChange(config) }
   const travel = (direction: 'undo' | 'redo') => {
     const list = direction === 'undo' ? editor.past : editor.future, next = list[list.length - 1]
     if (!next) return
@@ -76,9 +77,9 @@ export function StrategyRules(props: Props) {
     edit({ ...draft, root }); if (action === 'delete') onEditorChange(current => ({ ...current, selectedIds: [] }))
   }
   const rememberExpression = (expression: EditorExpression) => onEditorChange(current => ({ ...current, expressionDrafts: { ...current.expressionDrafts, [expression.source]: expression } }))
-  const tree: RuleTreeContext = { config: draft, edit, select, selectedId: selectedRule.id, metrics, units: props.units, expressions: props.expressions, templates: props.templates, editor, setEditor: onEditorChange, disabled: saving, guided, rememberExpression, dragging, setDragging, drop, setDrop, addInto: id => { select(id); setLibraryOpen(true) } }
+  const tree: RuleTreeContext = { config: draft, edit, select, selectedId: selectedRule.id, metrics, units: props.units, expressions: props.expressions, templates: props.templates, editor, setEditor: onEditorChange, disabled: saving || readOnly, guided, rememberExpression, dragging, setDragging, drop, setDrop, addInto: id => { select(id); setLibraryOpen(true) } }
   return <Collapsible open={editor.open} onOpenChange={open => onEditorChange(current => ({ ...current, open }))} className="border-b px-4 py-3" onKeyDown={event => {
-    if (event.defaultPrevented) return
+    if (event.defaultPrevented || readOnly) return
     const typing = event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement
     if (event.ctrlKey && event.key === ' ') { event.preventDefault(); setLibraryOpen(true) }
     if (!typing && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); travel(event.shiftKey ? 'redo' : 'undo') }
@@ -95,6 +96,7 @@ export function StrategyRules(props: Props) {
       {dirty && !props.embedded && <Badge variant="warning" data-filter-unsaved-badge><CircleAlert data-icon="inline-start" aria-hidden="true" />Unsaved changes</Badge>}
       <Badge variant="secondary" className="max-w-64" title={activeName} data-filter-name><span className="truncate">{activeName}</span></Badge>
       <Badge variant="outline" data-filter-count>{activeCount} {activeCount === 1 ? 'condition' : 'conditions'}</Badge>
+      {readOnly && <Badge variant="secondary">Built-in · Read only</Badge>}
       <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground" title={activeSummary} data-filter-rules>{activeSummary}</span>
       <span className="shrink-0 text-xs text-muted-foreground" role="status" data-strategy-match-count={props.matches} data-rule-draft-state={props.compiling ? 'compiling' : !props.valid || pendingName ? 'invalid' : 'valid'}>{props.matches} / {props.total} markets · {props.unknown} Unknown{props.compiling ? ' · Compiling…' : !props.valid ? ' · Invalid draft · Last valid preview' : props.previewPending ? ' · Updating preview…' : dirty ? ' · Draft preview' : ' · Applied'}</span>
     </div>
@@ -104,7 +106,7 @@ export function StrategyRules(props: Props) {
       <AlertDescription>{props.embedded ? props.compiling ? 'Checking these rules. Save strategy applies Universe and Bullish Setup together.' : pendingName ? 'Finish editing the rule name before keeping these rules.' : !props.valid ? 'Fix the rule errors before keeping these rules. The last valid preview remains active.' : 'These rules are a strategy draft. Keep them for preview; Save strategy applies all rules together.' : props.compiling ? 'Checking your draft. Save Universe when validation finishes to update the strategy.' : pendingName ? 'Finish editing the rule name, then save Universe to update the strategy.' : !props.valid ? 'Fix the rule errors before applying. The last valid preview remains active.' : 'These changes are previewed only. Save Universe to update the strategy.'}</AlertDescription>
       <AlertAction><Button type="button" size="sm" disabled={applyDisabled} onClick={apply}>{saving ? <Spinner data-icon="inline-start" aria-hidden="true" /> : <Save data-icon="inline-start" aria-hidden="true" />}{props.embedded ? 'Keep rules' : 'Save Universe'}</Button></AlertAction>
     </Alert>}
-    <CollapsibleContent className="pt-3"><fieldset disabled={saving} className="flex flex-col gap-4"><legend className="sr-only">Strategy rule editor</legend>
+    <CollapsibleContent className="pt-3"><fieldset disabled={saving || readOnly} className="flex flex-col gap-4"><legend className="sr-only">Strategy rule editor</legend>
       <div className="flex items-center justify-between gap-3"><div><p className="text-sm font-medium">Rule judgments</p><p className="text-xs text-muted-foreground">Choose values, comparisons and explicit thresholds. Unknown data never becomes a match.</p></div><ToggleGroup type="single" variant="outline" size="sm" spacing={0} value={props.preferences.layout} onValueChange={layout => { if (layout) preferences({ ...props.preferences, layout: layout as FilterLibraryPreferences['layout'] }) }} aria-label="Rule layout"><ToggleGroupItem value="sentences">Sentence rows</ToggleGroupItem><ToggleGroupItem value="guided">Guided cards</ToggleGroupItem></ToggleGroup></div>
         <FieldGroup className="gap-3"><div className="flex items-center gap-2"><span className="text-xs text-muted-foreground">Start with a condition</span>{visualPresets.filter(p => ['preset:oi', 'preset:body', 'preset:volume', 'preset:sequence'].includes(p.id)).map(p => <Button key={p.id} type="button" variant="outline" size="sm" onClick={() => preset(p.id)}>{p.label}</Button>)}</div>
           <div className="flex items-center gap-2"><RuleLibrary metrics={metrics} templates={props.templates} preferences={props.preferences} onPreferences={preferences} onAdd={add} open={libraryOpen} onOpenChange={setLibraryOpen} /><Button type="button" variant="outline" onClick={() => preset('rule:all')}><Plus data-icon="inline-start" aria-hidden="true" />Add group</Button><div className="w-64"><RulePicker label="Rule example" value="example" choices={[["example", "More ready-to-use conditions…"], ...visualPresets.map(p => [p.id, p.label])]} onChange={value => { if (value !== 'example') preset(value) }} /></div><span className="text-xs text-muted-foreground">Ctrl+Space to find a condition</span><div className="ml-auto flex items-center gap-1"><Button type="button" variant="ghost" size="icon" aria-label="Undo rule edit" disabled={!editor.past.length} onClick={() => travel('undo')}><Undo2 aria-hidden="true" /></Button><Button type="button" variant="ghost" size="icon" aria-label="Redo rule edit" disabled={!editor.future.length} onClick={() => travel('redo')}><Redo2 aria-hidden="true" /></Button></div></div>

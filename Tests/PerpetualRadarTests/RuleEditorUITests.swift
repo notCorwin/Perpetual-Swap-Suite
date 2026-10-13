@@ -105,6 +105,8 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
             let profile = try store.saveSuiteProfile(.init(id: "test-strategy", name: "Test strategy", universeJSON: try FilterCompiler.compile(source: "turnover >= 10").config.json,
                 phaseRules: ["bullishSetup": on]))
             _ = try store.manageSuite(["action": "select", "profileID": profile.id], mode: "radar")
+        } else {
+            _ = try Store(url: directory.appendingPathComponent("radar.sqlite3")).manageSuite(["action": "select", "profileID": ""], mode: "radar")
         }
         super.init()
     }

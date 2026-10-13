@@ -21,7 +21,7 @@ import { MarketChart } from '@/MarketChart'
 import { SuitePhaseBadges } from '@/SuitePhaseBadges'
 import { emptyFilterConfig, initialLibraryPreferences, parseFilterConfig } from '@/rule-engine'
 import { researchTime } from '@/research-types'
-import { requestSuite, SUITE_PHASES, suiteSpec, type StrategyProfile, type SuiteReading, type SuiteDraft, type SuiteWorkspaceProps } from '@/suite-types'
+import { isDefaultStrategy, requestSuite, SUITE_PHASES, suiteSpec, type StrategyProfile, type SuiteReading, type SuiteDraft, type SuiteWorkspaceProps } from '@/suite-types'
 
 export function SuiteWorkspace({ mode, inputs, active, initialTab = 'rules', routeKey, onBack, onResearch, onSwitchMode, switchingMode }: SuiteWorkspaceProps) {
   const suite = useSuite(mode, active), snapshot = suite.snapshot
@@ -34,6 +34,7 @@ export function SuiteWorkspace({ mode, inputs, active, initialTab = 'rules', rou
   const [confirm, setConfirm] = useState<{ kind: 'load' | 'delete'; profile?: StrategyProfile } | null>(null)
   const universe = useStrategyFilter(JSON.stringify(emptyFilterConfig()), 'universe'), setup = useStrategyFilter(JSON.stringify(emptyFilterConfig()), 'bullishSetup')
   const models = [universe, setup]
+  const readOnly = isDefaultStrategy(loaded)
   const initialized = useRef(false)
   const resetUniverse = universe.reset, resetSetup = setup.reset
   const load = useCallback((profile: StrategyProfile | null) => {
@@ -43,13 +44,13 @@ export function SuiteWorkspace({ mode, inputs, active, initialTab = 'rules', rou
     setError(''); setNotice(''); setTab('rules')
   }, [resetUniverse, resetSetup])
   const original = loaded ? [loaded.universeJSON, ...SUITE_PHASES.map(p => loaded.phaseRules[p.key])] : []
-  const dirty = name !== (loaded?.name ?? 'My strategy') || models.some((m, i) => m.dirty || loaded && m.canonical !== null && m.canonical !== original[i])
+  const dirty = !readOnly && (name !== (loaded?.name ?? 'My strategy') || models.some((m, i) => m.dirty || loaded && m.canonical !== null && m.canonical !== original[i]))
   const draftJSON = JSON.stringify({profile:loaded,name,rules:models.map(m=>({json:JSON.stringify(m.draft??m.filters),source:m.editor.source,nameDrafts:m.editor.nameDrafts,expressionDrafts:m.editor.expressionDrafts,lastValid:m.lastValid}))} satisfies SuiteDraft)
   useEffect(() => {
     if(!suite.ready || initialized.current)return
     initialized.current=true
     const savedDraft=snapshot.draft
-    if(savedDraft && savedDraft.rules.length >= 2){setLoaded(savedDraft.profile);setName(savedDraft.name);models.forEach((m,i)=>m.restore(savedDraft.rules[i]))}
+    if(savedDraft && savedDraft.rules.length >= 2 && !isDefaultStrategy(savedDraft.profile)){setLoaded(savedDraft.profile);setName(savedDraft.name);models.forEach((m,i)=>m.restore(savedDraft.rules[i]))}
     else load(snapshot.profiles.find(p=>p.id===snapshot.selectedID)??snapshot.profiles[0]??null)
     setHydrated(true)
     // Initial hydration is applied once; later inventories must preserve edits.
@@ -70,6 +71,7 @@ export function SuiteWorkspace({ mode, inputs, active, initialTab = 'rules', rou
   }, [])
   const perform = async (action: () => Promise<void>) => { setError(''); setNotice(''); try { await action() } catch (cause) { setError(cause instanceof Error ? cause.message : 'Cannot complete this change.') } }
   const save = () => perform(async () => {
+    if (readOnly) throw new Error('Default Strategy is built in and cannot be edited.')
     if (!name.trim()) { document.getElementById('suite-strategy-name')?.focus(); throw new Error('Give this strategy a name.') }
     const invalid = models.findIndex((m,i) => !m.valid || !m.canonical || i>0 && ['all','any'].includes(parseFilterConfig(m.canonical).root.kind) && parseFilterConfig(m.canonical).root.children.length===0)
     if (invalid >= 0) { setPhase(invalid ? SUITE_PHASES[invalid-1].key : 'universe'); throw new Error('Finish the Universe and Bullish Setup rules before saving.') }
@@ -145,10 +147,10 @@ export function SuiteWorkspace({ mode, inputs, active, initialTab = 'rules', rou
       </nav>
       <div className="flex min-w-0 flex-col gap-4">
         <form onSubmit={e => { e.preventDefault(); void save() }} className="flex items-end gap-3" data-strategy-header>
-          <Field className="min-w-0 flex-1"><FieldLabel htmlFor="suite-strategy-name">Strategy name</FieldLabel><Input id="suite-strategy-name" name="strategyName" autoComplete="off" value={name} onChange={e => setName(e.target.value)} /></Field>
+          <Field className="min-w-0 flex-1"><FieldLabel htmlFor="suite-strategy-name">Strategy name</FieldLabel><Input id="suite-strategy-name" name="strategyName" autoComplete="off" value={name} disabled={readOnly} onChange={e => setName(e.target.value)} /></Field>
           <span role="status" aria-live="polite" className="flex h-(--control-height) items-center gap-1 text-xs text-muted-foreground" data-strategy-state={invalidStage ? 'invalid' : dirty ? 'dirty' : 'saved'}>{invalidStage ? <><CircleAlert aria-hidden="true" className="size-3.5 text-warning" />Finish {invalidStage.label} to save</> : dirty ? <><CircleAlert aria-hidden="true" className="size-3.5 text-warning" />Unsaved changes</> : loaded ? `Saved · r${loaded.revision}` : 'New strategy'}</span>
           {dirty && loaded && <Button type="button" variant="ghost" onClick={() => setConfirm({ kind: 'load', profile: latestLoaded ?? loaded })}><RotateCcw data-icon="inline-start" aria-hidden="true" />Revert…</Button>}
-          <Button type="submit" title="Save strategy (⌘S)" disabled={suite.pending || models.some(m => !m.valid)}>{suite.pending ? <Spinner data-icon="inline-start" /> : <Save data-icon="inline-start" aria-hidden="true" />}Save strategy</Button>
+          <Button type="submit" title={readOnly ? 'Default Strategy is built in and cannot be edited' : 'Save strategy (⌘S)'} disabled={readOnly || suite.pending || models.some(m => !m.valid)}>{suite.pending ? <Spinner data-icon="inline-start" /> : <Save data-icon="inline-start" aria-hidden="true" />}Save strategy</Button>
         </form>
         <div className="flex items-center gap-2" role="toolbar" aria-label="Saved strategy actions">
           {loaded && snapshot.selectedID === loaded.id ? <><Badge variant="secondary"><Power data-icon="inline-start" aria-hidden="true" />Active in Radar · r{activeProfile?.revision}</Badge><Button variant="ghost" size="sm" disabled={suite.pending} onClick={() => void perform(async () => { await suite.perform({ action: 'select', profileID: '' }); setNotice('Strategy deactivated. Radar displays all markets; confirmed alerts resume after activation.') })}>Deactivate</Button></>
@@ -156,7 +158,7 @@ export function SuiteWorkspace({ mode, inputs, active, initialTab = 'rules', rou
           {activeProfile && loaded?.id !== activeProfile.id && <span className="text-xs text-muted-foreground">Radar uses {activeProfile.name} · r{activeProfile.revision}</span>}
           <Button variant="outline" size="sm" disabled={!loaded || suite.pending} onClick={() => void perform(async () => { if (loaded) { await requestSuite({mode,action:'draft',draft:JSON.parse(draftJSON) as SuiteDraft});onResearch(suiteSpec([loaded])) } })}><FlaskConical data-icon="inline-start" aria-hidden="true" />Backtest saved strategy</Button>
           <Button variant="outline" size="sm" disabled={!loaded || suite.pending} onClick={() => void copy()}><Copy data-icon="inline-start" aria-hidden="true" />Duplicate saved strategy</Button>
-          <Button variant="ghost" size="sm" className="ml-auto" disabled={!loaded || suite.pending} onClick={() => setConfirm({ kind: 'delete', profile: loaded ?? undefined })}><Trash2 data-icon="inline-start" aria-hidden="true" />Delete…</Button>
+          {!readOnly && <Button variant="ghost" size="sm" className="ml-auto" disabled={!loaded || suite.pending} onClick={() => setConfirm({ kind: 'delete', profile: loaded ?? undefined })}><Trash2 data-icon="inline-start" aria-hidden="true" />Delete…</Button>}
         </div>
     <Tabs value={tab} onValueChange={setTab}><TabsList><TabsTrigger value="rules">Strategy rules</TabsTrigger>{mode === 'radar' && <><TabsTrigger value="signals">Confirmed setups</TabsTrigger></>}</TabsList>
       <TabsContent value="rules" className="flex flex-col gap-4">
@@ -168,7 +170,7 @@ export function SuiteWorkspace({ mode, inputs, active, initialTab = 'rules', rou
               <span id={`stage-status-${p.key}`} className="text-xs font-normal text-muted-foreground">{broken ? 'Needs attention' : m.compiling ? 'Checking…' : s ? `${s.matches} / ${s.total} pass${s.unknown ? ` · ${s.unknown} unknown` : ''}` : 'Preview pending'}</span>
             </ToggleGroupItem>] })}
         </ToggleGroup>
-        {stages.map((p,i) => <div key={p.key} hidden={phase !== p.key}><StrategyPhaseEditor label={p.label} description={p.description} model={models[i]} inputs={inputs} preferences={preferences} onPreferences={savePreferences} active={active && tab === 'rules' && phase === p.key} strategyID={mode === 'radar' ? loaded?.id ?? '' : ''} statusKey={p.key} onStatus={reportStatus} /></div>)}
+        {stages.map((p,i) => <div key={p.key} hidden={phase !== p.key}><StrategyPhaseEditor label={p.label} description={p.description} model={models[i]} inputs={inputs} preferences={preferences} onPreferences={savePreferences} active={active && tab === 'rules' && phase === p.key} strategyID={mode === 'radar' ? loaded?.id ?? '' : ''} readOnly={readOnly} statusKey={p.key} onStatus={reportStatus} /></div>)}
       </TabsContent>
       <TabsContent value="signals" className="flex flex-col gap-3"><Field><FieldLabel htmlFor="phase-search">Search contracts</FieldLabel><Input id="phase-search" name="phaseSearch" value={search} onChange={e => { setSearch(e.target.value); setPage(0) }} placeholder="BTC, ETH…" /></Field>
         <Table aria-label="Confirmed phase readings"><TableHeader><TableRow>{['Contract', 'Bullish Setup', 'Confirmed close', 'Decision', 'Evidence'].map(label => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader><TableBody>{readings.slice(page*50,page*50+50).map(r => <TableRow key={r.instrument}><TableCell><Button variant="link" onClick={() => setChart(r.instrument)}>{r.instrument}</Button></TableCell><TableCell><SuitePhaseBadges confirmed={r} provisional={snapshot.provisional?.find(p => p.instrument === r.instrument)} /></TableCell><TableCell>{researchTime(r.hour+3_600_000)}</TableCell><TableCell title={r.reason}>{r.action}</TableCell><TableCell><div className="flex gap-2"><Button variant="ghost" onClick={() => void inspect(r)}>Explain</Button></div></TableCell></TableRow>)}</TableBody></Table>

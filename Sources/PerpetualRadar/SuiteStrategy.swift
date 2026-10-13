@@ -1,5 +1,48 @@
 import Foundation
 
+let defaultStrategyID = "builtin.default-strategy"
+private let defaultStrategyRevision = 1
+
+private func defaultRule(_ id: String, _ name: String, left: String, _ comparison: String, right: String) -> FilterNode {
+    var node = FilterNode(kind: "condition", name: name, left: left, comparison: comparison, right: right)
+    node.id = id
+    return node
+}
+
+private func defaultGroup(_ id: String, _ name: String, _ children: [FilterNode]) -> FilterNode {
+    var node = FilterNode(kind: "all", name: name, children: children)
+    node.id = id
+    return node
+}
+
+func defaultStrategyProfile() -> StrategyProfile {
+    let universe = defaultGroup("default-universe", "Universe", [
+        defaultRule("default-universe-turnover", "24h trading volume ≥ 10M USDT", left: "turnover", "gte", right: "10"),
+        defaultRule("default-universe-oi", "Live Open Interest is increasing", left: "oiTrend", "eq", right: #""rising""#),
+        defaultRule("default-universe-age", "Trading history ≥ 6 months", left: "ListingAgeMonths", "gte", right: "6"),
+        defaultRule("default-universe-bb", "Live Bollinger Bandwidth is expanding", left: "bbExpansion", "gt", right: "0"),
+    ])
+    var setup = defaultGroup("default-bullish-setup", "Bullish Setup", [
+        defaultGroup("default-momentum", "Momentum", [
+            defaultRule("default-roc-positive", "ROC(9) > 0", left: "ROC(9)", "gt", right: "0"),
+            defaultRule("default-roc-rising", "Hour-over-hour change in ROC(9) > 0", left: "change(ROC(9), 1)", "gt", right: "0"),
+        ]),
+        defaultGroup("default-trend", "Trend", [
+            defaultRule("default-price-ema", "Live price is above EMA(200)", left: "Price", "gt", right: "EMA(200)"),
+        ]),
+        defaultGroup("default-breakout", "Breakout", [
+            defaultRule("default-high-logbb", "Live HH > Log BB upper band", left: "High", "gt", right: #"LogBB(20, 2, "upper")"#),
+            defaultRule("default-high-48", "Price wick breaks above the previous 48h high", left: "High", "gt", right: #"PriorExtreme(48, "high")"#),
+        ]),
+        defaultGroup("default-overheat", "Overheat", [
+            defaultRule("default-rsi", "RSI(24) < 70", left: "RSI(24)", "lt", right: "70"),
+        ]),
+    ])
+    setup.mode = "live"
+    return StrategyProfile(id: defaultStrategyID, name: "Default Strategy", universeJSON: FilterConfigV2(root: universe).json,
+                           phaseRules: ["bullishSetup": FilterConfigV2(root: setup).json], revision: defaultStrategyRevision, updatedAt: 0)
+}
+
 enum SuitePhase: String, CaseIterable, Codable, Sendable {
     case bullishSetup
     var label: String { "Bullish Setup" }
@@ -206,16 +249,21 @@ extension Store {
     // Modes are views over one library. Research experiments retain their own
     // immutable snapshots; only editable profiles live in the shared service.
     func initializeSharedSuiteLibrary(researchURL: URL? = nil) throws {
-        guard try preference(forKey: "suiteProfiles") == nil else { return }
         func legacy(_ store: Store, _ mode: String) throws -> [StrategyProfile] {
             try store.preference(forKey: "suiteProfiles.\(mode)").map { try JSONDecoder().decode([StrategyProfile].self, from: Data($0.utf8)) } ?? []
         }
-        var sources = try legacy(self, "radar") + legacy(self, "research")
-        if let researchURL, FileManager.default.fileExists(atPath: researchURL.path) {
-            sources += try legacy(Store(url: researchURL), "research")
+        let shared = try preference(forKey: "suiteProfiles")
+        var sources: [StrategyProfile]
+        if let shared {
+            sources = try JSONDecoder().decode([StrategyProfile].self, from: Data(shared.utf8))
+        } else {
+            sources = try legacy(self, "radar") + legacy(self, "research")
+            if let researchURL, FileManager.default.fileExists(atPath: researchURL.path) {
+                sources += try legacy(Store(url: researchURL), "research")
+            }
         }
-        var profiles: [StrategyProfile] = []
-        for var profile in sources where !profiles.contains(where: { $0.id == profile.id }) {
+        var profiles = [defaultStrategyProfile()]
+        for var profile in sources where profile.id != defaultStrategyID && !profiles.contains(where: { $0.id == profile.id }) {
             if profiles.contains(where: { $0.name.lowercased() == profile.name.lowercased() }) {
                 let base = String(profile.name.prefix(60)); var suffix = 1
                 repeat { profile.name = base + " · Research \(suffix)"; suffix += 1 }
@@ -223,9 +271,11 @@ extension Store {
             }
             profile.mode = "radar"; profiles.append(profile)
         }
+        let existingSelection = try preference(forKey: "suiteSelected")
+        let migratedSelection = try preference(forKey: "suiteSelected.radar")
         try transaction {
             try setPreference(try researchJSON(profiles), forKey: "suiteProfiles")
-            try setPreference(try preference(forKey: "suiteSelected.radar") ?? "", forKey: "suiteSelected")
+            try setPreference(existingSelection ?? migratedSelection ?? defaultStrategyID, forKey: "suiteSelected")
         }
     }
     func suiteProfiles(_ mode: String) throws -> [StrategyProfile] {
@@ -241,6 +291,7 @@ extension Store {
         return try suiteProfiles(mode).first { $0.id == selected }
     }
     func saveSuiteProfile(_ input: StrategyProfile, copy: Bool = false) throws -> StrategyProfile {
+        guard copy || input.id != defaultStrategyID else { throw FilterError("Default Strategy is built in and cannot be edited.") }
         var result = input; let rules = try input.compiled()
         result.mode = "radar"
         result.universeJSON = rules[0].config.json
@@ -291,6 +342,7 @@ extension Store {
             guard try id.isEmpty || suiteProfiles(mode).contains(where: { $0.id == id }) else { throw FilterError("This strategy no longer exists.") }
             try setPreference(id, forKey: "suiteSelected")
         case "delete":
+            guard id != defaultStrategyID else { throw FilterError("Default Strategy is built in and cannot be deleted.") }
             try setPreference(try researchJSON(try suiteProfiles(mode).filter { $0.id != id }), forKey: "suiteProfiles")
             if try preference(forKey: "suiteSelected") == id { try setPreference("", forKey: "suiteSelected") }
         case "inventory", "evaluate", "preview": break

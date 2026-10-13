@@ -6,6 +6,8 @@ export const SUITE_PHASES = [
 ] as const
 export type SuitePhase = typeof SUITE_PHASES[number]['key']
 export type SuiteMode = 'radar' | 'research'
+export const DEFAULT_STRATEGY_ID = 'builtin.default-strategy'
+export const isDefaultStrategy = (profile: StrategyProfile | null | undefined): boolean => profile?.id === DEFAULT_STRATEGY_ID
 export const modeTitle = (mode: SuiteMode) => mode === 'radar' ? 'Perpetual Swap Radar' : 'Perpetual Swap Research'
 export type StrategyProfile = { id: string; mode: SuiteMode; name: string; universeJSON: string; phaseRules: Record<SuitePhase, string>; revision: number; updatedAt: number }
 export type SuiteReading = { strategyID: string; revision: number; universeTraceJSON?: string; instrument: string; hour: number; provisional: boolean; universe: FilterTruth; phases: Partial<Record<SuitePhase, { result: FilterTruth; hour: number; traceJSON?: string }>>; action: string; reason: string; price?: number }

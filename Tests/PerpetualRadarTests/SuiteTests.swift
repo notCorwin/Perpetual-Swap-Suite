@@ -13,6 +13,24 @@ final class SuiteTests: XCTestCase {
     private func profile(universe: String = "1 < 2", setup: String = "Close >= 100") throws -> StrategyProfile {
         .init(name: "Bullish Setup", universeJSON: try json(universe), phaseRules: ["bullishSetup": try json(setup)])
     }
+    func testBuiltInDefaultStrategyMatchesSpecificationAndCannotBeChangedOrDeleted() throws {
+        let store = try Store(url: directory().appendingPathComponent("radar.sqlite3"))
+        try store.initializeSharedSuiteLibrary()
+        let builtIn = try XCTUnwrap(store.suiteProfiles("radar").first)
+        XCTAssertEqual(builtIn.id, defaultStrategyID)
+        XCTAssertEqual(builtIn.name, "Default Strategy")
+        XCTAssertEqual(try store.selectedSuiteProfile("radar")?.id, defaultStrategyID)
+        let rules = try builtIn.compiled()
+        XCTAssertEqual(rules[0].formula, #"named("Universe", all(named("24h trading volume ≥ 10M USDT", (turnover >= 10)), named("Live Open Interest is increasing", (oiTrend == "rising")), named("Trading history ≥ 6 months", (ListingAgeMonths >= 6)), named("Live Bollinger Bandwidth is expanding", (bbExpansion > 0))))"#)
+        for condition in ["(ROC(9) > 0)", "(change(ROC(9), 1) > 0)", "(Price > EMA(200))",
+                          #"(High > LogBB(20, 2, "upper"))"#, #"(High > PriorExtreme(48, "high"))"#, "(RSI(24) < 70)"] {
+            XCTAssertTrue(rules[1].formula.contains(condition), condition)
+        }
+        var changed = builtIn; changed.name = "Changed"
+        XCTAssertThrowsError(try store.saveSuiteProfile(changed))
+        XCTAssertThrowsError(try store.manageSuite(["action": "delete", "profileID": defaultStrategyID], mode: "radar"))
+        XCTAssertNotEqual(try store.saveSuiteProfile(builtIn, copy: true).id, defaultStrategyID)
+    }
     func testBullishSetupSavesWithOnlyUniverseAndSetupAndRejectsEmptyOrPositionRules() throws {
         let store = try Store(url: directory().appendingPathComponent("radar.sqlite3"))
         let saved = try store.saveSuiteProfile(profile())
@@ -75,12 +93,12 @@ final class SuiteTests: XCTestCase {
         try research.setPreference(try researchJSON([historical]),forKey:"suiteProfiles.research")
         try radar.initializeSharedSuiteLibrary(researchURL: research.url)
         let shared = try radar.suiteProfiles("research")
-        XCTAssertEqual(shared.count,2); XCTAssertEqual(Set(shared.map(\.id)),[live.id,historical.id])
+        XCTAssertEqual(shared.count,3); XCTAssertEqual(Set(shared.map(\.id)),[defaultStrategyID,live.id,historical.id])
         XCTAssertEqual(shared.first(where: {$0.id == historical.id})?.revision,5)
         XCTAssertEqual(try radar.selectedSuiteProfile("research")?.id,live.id)
         XCTAssertNotEqual(shared[0].name,shared[1].name)
         try radar.initializeSharedSuiteLibrary(researchURL: research.url)
-        XCTAssertEqual(try radar.suiteProfiles("radar").count,2)
+        XCTAssertEqual(try radar.suiteProfiles("radar").count,3)
     }
     func testProvisionalRetractionConfirmedCloseBaselineDedupAndUnknownRecovery() async throws {
         let p = try profile(setup: "Close > 100")
