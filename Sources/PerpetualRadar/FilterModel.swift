@@ -1,6 +1,6 @@
 import Foundation
 
-enum FilterTruth: String, Codable, Sendable {
+enum FilterTruth: String, Codable, Hashable, Sendable {
     case yes = "true", no = "false", unknown
     var negated: Self { self == .unknown ? .unknown : self == .yes ? .no : .yes }
     static func all(_ values: [Self]) -> Self { values.contains(.no) ? .no : values.contains(.unknown) ? .unknown : .yes }
@@ -102,7 +102,7 @@ func formulaQuote(_ text: String) -> String {
     String(decoding: try! JSONEncoder().encode(text), as: UTF8.self)
 }
 
-enum FilterScalar: Equatable, Sendable {
+enum FilterScalar: Hashable, Sendable {
     case number(Double), text(String), unknown(String)
     var number: Double? { if case .number(let n) = self { return n }; return nil }
     var text: String? { if case .text(let s) = self { return s }; return nil }

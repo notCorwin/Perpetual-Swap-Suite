@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { pageVisible } from '@/lib/utils'
 import { StrategyRules } from '@/StrategyRules'
 import { FieldDescription } from '@/components/ui/field'
@@ -42,7 +42,11 @@ export function StrategyPhaseEditor({ label, model, inputs, preferences, onPrefe
   }, [active, model.lastValid, strategyID])
   const expressions = { ...model.editor.expressionDrafts, ...model.compilation.expressions }
   const metrics = inputs.metrics.filter(metric => !model.compilation.allowedMetrics || model.compilation.allowedMetrics.includes(metric.key))
-  const matches = Object.values(results).filter(v => v === 'true').length, unknown = Object.values(results).filter(v => v === 'unknown').length
+  const { matches, unknown } = useMemo(() => Object.values(results).reduce((counts, value) => {
+    if (value === 'true') counts.matches += 1
+    else if (value === 'unknown') counts.unknown += 1
+    return counts
+  }, { matches: 0, unknown: 0 }), [results])
   // Report the latest preview so the pipeline overview stays informed while another stage is open.
   useEffect(() => { if (previewJSON !== null) onStatus?.(statusKey, { matches, total: rows.length, unknown }) }, [onStatus, statusKey, matches, rows.length, unknown, previewJSON])
   return <section aria-label={label} className="flex flex-col gap-3" data-strategy-rules>

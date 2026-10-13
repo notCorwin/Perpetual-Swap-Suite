@@ -73,10 +73,22 @@ try {
     if (!paced.length) throw new Error('The research network quota suite is missing')
     const pacedTask = execute('research-network-pacing', paced)
     pacedTask.catch(() => {})
+    const updateInstall = units.filter(id => id.includes('.AppUpdaterTests/testNativeDownloadRetriesReportsStreamingProgressAndInstallsVerifiedRelease'))
+    if (updateInstall.length !== 1) throw new Error('The isolated update install test is missing')
+    const monitorUpdates = units.filter(id => id.includes('.MonitorUpdateTests/'))
+    if (!monitorUpdates.length) throw new Error('The isolated monitor update suite is missing')
     const benchmark = ui.filter(id => id.includes('testCategoricalMenusAndTypedRuleEditingStayResponsive'))
     if (benchmark.length !== 1) throw new Error('The isolated menu benchmark is missing')
     const pixels = ui.filter(id => id.includes('testAllSurfaceFamiliesAndChartCapture'))
     if (pixels.length !== 1) throw new Error('The native pixel suite is missing')
+    const nativeCapture = ui.filter(id => id.includes('testBlurSlidersPreviewWhileSavingAndRestoreAfterReload'))
+    if (nativeCapture.length !== 1) throw new Error('The native capture deadline test is missing')
+    const navigationDeadline = ui.filter(id => id.includes('testBTCMarketContextVisualParametersReadingsMaterialsAndNotificationNavigation'))
+    if (navigationDeadline.length !== 1) throw new Error('The isolated navigation deadline test is missing')
+    const saveDeadline = ui.filter(id => id.includes('testStrategyUniverseSavesPromptlyWhilePreviewIsSlowAndKeepsMarketRows'))
+    if (saveDeadline.length !== 1) throw new Error('The isolated strategy save deadline test is missing')
+    const earlyResearch = ui.filter(id => id.includes('testResearchPrepareRunFrozenChartPaginationAndRadarIsolationInNativeWebKit') || id.includes('testLargeResearchDataPlanKeepsWorkspaceSwitchingResponsive'))
+    if (earlyResearch.length !== 2) throw new Error('An early Research workflow test is missing')
     // Keep each test class together, but overlap independent business suites.
     // Reuse observed test durations when available: updater/lifecycle waits
     // otherwise make a single unit-test process the critical path.
@@ -91,18 +103,38 @@ try {
     // its per-stage logs contain only the next test's start message.
     writeFileSync(durationFile, JSON.stringify(Object.fromEntries(durations), null, 2) + '\n')
     const classes = new Map<string, string[]>()
-    for (const id of units.filter(id => !paced.includes(id))) {
+    for (const id of units.filter(id => !paced.includes(id) && !updateInstall.includes(id) && !monitorUpdates.includes(id))) {
       const name = id.split('/')[0], group = classes.get(name) ?? []
       group.push(id); classes.set(name, group)
     }
     const cost = (ids: string[]) => ids.reduce((seconds, id) => seconds + Math.max(0.02, durations.get(id) ?? 0.1), 0)
-    const unitShards = [1, 2].map(index => ({ name: `native-unit-tests-${index}`, ids: [] as string[], seconds: 0 }))
+    const unitShardCount = Math.max(2, Math.min(4, Math.floor(availableParallelism() / 2)))
+    const unitShards = Array.from({ length: unitShardCount }, (_, index) => ({ name: `native-unit-tests-${index + 1}`, ids: [] as string[], seconds: 0 }))
     for (const group of [...classes.values()].sort((a, b) => cost(b) - cost(a))) {
       const shard = unitShards.reduce((a, b) => a.seconds <= b.seconds ? a : b)
       shard.ids.push(...group); shard.seconds += cost(group)
     }
     await Promise.all([web, ...checks])
     await run('app-package', 'scripts/build-app.sh', ['--prebuilt'])
+    const earlyResearchTasks = earlyResearch.map((id, index) => execute(`webkit-early-research-${index + 1}`, [id]))
+    Promise.all(earlyResearchTasks).catch(() => {})
+    // This test owns a deliberately short completion deadline. Run it once the
+    // build processes are gone so unrelated WebKit/WindowServer load cannot
+    // turn its timing assertion into a machine-load test.
+    await Promise.all([
+      execute('update-install-deadline', updateInstall),
+      execute('monitor-update-coordination', monitorUpdates),
+      execute('native-capture-deadline', nativeCapture),
+      execute('navigation-deadline', navigationDeadline),
+      execute('strategy-save-deadline', saveDeadline),
+    ])
+    const earlyServiceTasks = services.map((id, index) => execute(`packaged-lifecycle-${index + 1}`, [id]))
+    Promise.all(earlyServiceTasks).catch(() => {})
+    // ScreenCaptureKit permits only one capture owner in this background test
+    // process family. Start the full pixel suite as soon as that isolated
+    // deadline check releases the service, while other non-capture work runs.
+    const captured = execute('webkit-native-pixels', pixels)
+    captured.catch(() => {})
     // Business tests do not share the menu benchmark's WebView. Start their
     // independent processes now rather than leaving every CPU idle during it.
     const unitTasks = unitShards.filter(shard => shard.ids.length).map(shard => execute(shard.name, shard.ids))
@@ -117,12 +149,9 @@ try {
     const weight = (id: string) => { const rank = priority.findIndex(name => id.includes(name)); return rank < 0 ? priority.length : rank }
     const initialCosts: [string, number][] = [['testResearchPrepareRun', 45], ['testVisualFunctionCoverage', 25], ['testDraggingConditions', 20], ['.MonitorServiceTests/testPackaged', 20]]
     const taskCost = (ids: string[]) => ids.reduce((seconds, id) => seconds + (durations.get(id) ?? initialCosts.find(([name]) => id.includes(name))?.[1] ?? 5), 0)
-    const orderedUI = ui.filter(id => !benchmark.includes(id) && !pixels.includes(id)).sort((a, b) => taskCost([b]) - taskCost([a]) || weight(a) - weight(b))
+    const orderedUI = ui.filter(id => !benchmark.includes(id) && !pixels.includes(id) && !nativeCapture.includes(id) && !navigationDeadline.includes(id) && !saveDeadline.includes(id) && !earlyResearch.includes(id)).sort((a, b) => taskCost([b]) - taskCost([a]) || weight(a) - weight(b))
     const uiTask = (id: string) => ({ name: `webkit-${id.split('/')[1]}`, ids: [id] })
-    const serviceTasks = services.map((id, index) => ({ name: `packaged-lifecycle-${index + 1}`, ids: [id] }))
-    const firstServices = serviceTasks.filter(task => task.ids[0].includes('testPackaged') && !task.ids[0].includes('testPackagedLaunch')).sort((a, b) => taskCost(b.ids) - taskCost(a.ids))
     const queue = [
-      ...serviceTasks.filter(task => !firstServices.includes(task)),
       ...orderedUI.slice(2).map(uiTask),
     ].sort((a, b) => taskCost(b.ids) - taskCost(a.ids))
     const drain = async () => {
@@ -132,15 +161,20 @@ try {
     }
     // Start the long lifecycle scenarios in the first wave too: their real
     // recovery deadlines must overlap capture, not start after it finishes.
-    // Keep subsequent test launches behind capture to bound WindowServer load.
-    const captured = execute('webkit-native-pixels', pixels)
-    const first = [...firstServices, ...orderedUI.slice(0, 2).map(uiTask)]
-    const nativeSlots = Math.max(6, Math.min(8, availableParallelism()))
+    // Released workers immediately drain the remaining background-only tests;
+    // waiting for capture here left most CPU cores idle for half the CI budget.
+    const first = orderedUI.slice(0, 2).map(uiTask)
+    // Most remaining app scenarios wait on WebKit callbacks and lifecycle
+    // deadlines rather than occupying a core. Allow bounded oversubscription
+    // after deadline-sensitive cases have run in isolation.
+    const nativeSlots = Math.max(10, Math.min(12, availableParallelism() * 2))
     await Promise.all([
       captured,
-      ...unitTasks.map(async task => { await task; await captured; await drain() }),
-      ...first.map(async task => { await execute(task.name, task.ids); await captured; await drain() }),
-      ...Array.from({ length: nativeSlots - first.length - unitTasks.length }, async () => { await captured; await drain() }),
+      ...earlyResearchTasks,
+      ...earlyServiceTasks,
+      ...unitTasks.map(async task => { await task; await drain() }),
+      ...first.map(async task => { await execute(task.name, task.ids); await drain() }),
+      ...Array.from({ length: Math.max(0, nativeSlots - 1 - first.length - unitTasks.length) }, drain),
     ])
   })
   // Attach all rejection handlers immediately, including the dependent stages.

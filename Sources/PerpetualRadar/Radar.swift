@@ -65,6 +65,7 @@ final class Radar {
     private let snapshotWorker = MarketSnapshotWorker()
     private var snapshotGenerations: [String: Int] = [:]
     private var compiledFilters: [String: CompiledFilter] = [:]
+    private var compiledFilterLRU: [String] = []
     private let suiteWorker = SuiteEvaluationWorker()
     private let suiteMonitorWorker = SuiteEvaluationWorker()
     private var liveHourQuotes: [String: FilterQuote] = [:]
@@ -77,6 +78,7 @@ final class Radar {
     private(set) var notificationsEnabled: Bool
     private(set) var monitoringPaused: Bool
     private var rows: [String: Market] = [:]
+    private var marketOrder: [String] = []
     private var cachedRows: [String: [String: Any]] = [:]
     private var cachedPeriods: (roc: Int, maroc: Int)?
     private var chartRevisions: [String: Int] = [:]
@@ -158,6 +160,12 @@ final class Radar {
         if let id { chartRevisions[id, default: 0] &+= 1 }
     }
 
+    private func touch(_ ids: Set<String>) {
+        guard !ids.isEmpty else { return }
+        updatedAt = millis(); revision &+= 1
+        for id in ids { chartRevisions[id, default: 0] &+= 1 }
+    }
+
     func setFrostedBackground(enabled: Bool? = nil, opacity: Double? = nil, windowBlur: Double? = nil, floatingBlur: Double? = nil) throws -> Bool {
         if let opacity, !opacity.isFinite || !(0...1).contains(opacity) { return false }
         if let windowBlur, !WindowServerBlur.validRadius(windowBlur) { return false }
@@ -195,10 +203,15 @@ final class Radar {
     }
 
     private func compiledFilter(_ value: String) throws -> CompiledFilter {
-        if let cached = compiledFilters[value] { return cached }
+        if let cached = compiledFilters[value] {
+            compiledFilterLRU.removeAll { $0 == value }; compiledFilterLRU.append(value)
+            return cached
+        }
         let compiled = try FilterCompiler.compile(FilterConfigV2.decode(value))
-        if compiledFilters.count >= 8 { compiledFilters.removeAll() }
-        compiledFilters[value] = compiled; return compiled
+        if compiledFilters.count >= 8, let oldest = compiledFilterLRU.first {
+            compiledFilters.removeValue(forKey: oldest); compiledFilterLRU.removeFirst()
+        }
+        compiledFilters[value] = compiled; compiledFilterLRU.append(value); return compiled
     }
 
     func setFilterLibraryPreferences(_ json: String) throws {
@@ -223,8 +236,11 @@ final class Radar {
             else if let json = request["filtersJSON"] as? String { compiled = try compiledFilter(json) }
             else { throw FilterError("Provide a formula or strategy rule configuration.") }
             let configJSON = compiled.config.json
-            if compiledFilters.count >= 8, compiledFilters[configJSON] == nil { compiledFilters.removeAll() }
+            if compiledFilters.count >= 8, compiledFilters[configJSON] == nil, let oldest = compiledFilterLRU.first {
+                compiledFilters.removeValue(forKey: oldest); compiledFilterLRU.removeFirst()
+            }
             compiledFilters[configJSON] = compiled
+            compiledFilterLRU.removeAll { $0 == configJSON }; compiledFilterLRU.append(configJSON)
             if request["suitePhase"] != nil { try StrategyProfile.validateRule(compiled, phase: phase) }
             return metadata.merging(["configJSON": compiled.config.json, "formula": compiled.formula, "diagnostics": [], "requiredHours": compiled.requiredHours,
                     "units": compiled.units, "expressions": compiled.editorExpressions.mapValues(\.snapshot)]) { _, value in value }
@@ -456,6 +472,7 @@ final class Radar {
     func initializeMarkets(instruments: [Any], tickers: [Any]) throws {
         rows = liveUSDTInstruments(instruments).mapValues { Market(id: $0.id, listedAt: $0.listedAt) }
         guard !rows.isEmpty else { throw FilterError("No live USDT perpetual swaps found") }
+        marketOrder = rows.keys.sorted()
         try updateTickers(tickers)
         let cached = try store.load(hour: hour, ids: Set(rows.keys))
         candles = cached.candles; emaStates = cached.ema
@@ -505,7 +522,7 @@ final class Radar {
     }
 
     func updateTickers(_ tickers: [Any]) throws {
-        var valid = false
+        var valid = false, changed = Set<String>()
         for case let ticker as [String: Any] in tickers {
             guard let id = ticker["instId"] as? String, let old = rows[id],
                   let price = numeric(ticker["last"]), price > 0,
@@ -518,9 +535,10 @@ final class Radar {
             if timestamp >= hour, timestamp < hour + hourMS {
                 liveHourQuotes[id] = FilterQuote(turnover: turnover, spread: spread, timestamp: timestamp)
             }
-            if old.turnover24hUSDT != turnover || old.spreadPercent != spread || old.lastPrice != price || old.quoteTimestamp != timestamp { invalidateSnapshot(id); touch(id) }
+            if old.turnover24hUSDT != turnover || old.spreadPercent != spread || old.lastPrice != price || old.quoteTimestamp != timestamp { invalidateSnapshot(id); changed.insert(id) }
         }
         guard valid else { throw FilterError("No USDT swap ticker data found") }
+        touch(changed)
     }
 
     private func pollTickers() async {
@@ -569,6 +587,7 @@ final class Radar {
                 rows[id] = Market(id: id, listedAt: instruments[id]?.listedAt)
                 candles[id] = cached?.candles[id]; emaStates[id] = cached?.ema[id]
             }
+            marketOrder = rows.keys.sorted()
             touch()
             // Existing socket loops reconnect and subscribe to the new universe.
             sockets.forEach { $0.cancel(with: .goingAway, reason: nil) }
@@ -812,7 +831,8 @@ final class Radar {
 
     private func clock() async {
         while !Task.isCancelled {
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            let now = millis(), nextHour = (now / hourMS + 1) * hourMS
+            try? await Task.sleep(for: .milliseconds(max(100, nextHour - now)))
             if advanceHourIfNeeded() { startHistoryScans() }
         }
     }
@@ -1138,7 +1158,7 @@ final class Radar {
         do { previousOI = try store.openInterest(hour: hour - hourMS) }
         catch { startupError = "Cache error: \(error.localizedDescription)"; previousOI = [:] }
         let now = millis()
-        for id in rows.keys.sorted() {
+        for id in marketOrder {
             guard let row = rows[id] else { continue }
             let bars = candles[id] ?? [:]
             batch.inputs.append(.init(id: id, hour: hour, now: now, candles: bars, listedAt: row.listedAt,

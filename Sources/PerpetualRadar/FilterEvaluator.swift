@@ -1,5 +1,11 @@
 import Foundation
 
+private struct SequenceBinding: Hashable { let name: String; let value: FilterScalar }
+private struct SequenceSearchState: Hashable {
+    let index: Int, previous: Int64?, certainty: FilterTruth
+    let bindings: [SequenceBinding]
+}
+
 struct FilterStat: Codable, Sendable { var oi: Double?, sell: Double?, buy: Double? }
 struct FilterQuote: Codable, Sendable {
     var turnover: Double?
@@ -545,11 +551,11 @@ final class FilterEvaluator {
         var trace = FilterTrace(id: node.id, label: node.name.isEmpty ? node.formula : node.name, result: .no, hour: target)
         let firstHour = target - Int64(node.hours) * hourMS
         var uncertain: [FilterTrace] = [], uncertainTimes: [Int64] = []
-        var exhaustedPaths = Set<String>()
+        var exhaustedPaths = Set<SequenceSearchState>()
         func search(_ index: Int, _ previous: Int64?, _ values: [String: FilterScalar], _ path: [FilterTrace], _ certainty: FilterTruth) -> Bool {
             if Task.isCancelled { return false }
-            let bindings = values.keys.sorted().map { key in "\(key)=\(values[key]!.snapshot)" }.joined(separator: "|")
-            let state = "\(index)|\(previous ?? -1)|\(certainty.rawValue)|\(bindings)"
+            let state = SequenceSearchState(index: index, previous: previous, certainty: certainty,
+                                            bindings: values.keys.sorted().map { SequenceBinding(name: $0, value: values[$0]!) })
             if exhaustedPaths.contains(state) { return false }
             let stage = node.children[index], last = index == node.children.count - 1
             let earliest = max(firstHour, previous.map { $0 + hourMS } ?? firstHour)
@@ -589,10 +595,29 @@ final class FilterEvaluator {
 }
 
 actor FilterEvaluationWorker {
-    func evaluate(_ markets: [FilterMarketData], filter: CompiledFilter) -> [String: FilterTruth] {
-        var results: [String: FilterTruth] = [:]
-        for market in markets { if Task.isCancelled { break }; results[market.id] = FilterEvaluator(market: market, filter: filter).evaluate().result }
-        return results
+    func evaluate(_ markets: [FilterMarketData], filter: CompiledFilter) async -> [String: FilterTruth] {
+        let workers = max(1, min(markets.count, ProcessInfo.processInfo.activeProcessorCount))
+        guard workers > 1 else {
+            return Dictionary(uniqueKeysWithValues: markets.map { ($0.id, FilterEvaluator(market: $0, filter: filter).evaluate().result) })
+        }
+        return await withTaskGroup(of: [(String, FilterTruth)].self) { group in
+            for offset in 0..<workers {
+                group.addTask {
+                    var values: [(String, FilterTruth)] = []
+                    values.reserveCapacity((markets.count + workers - 1) / workers)
+                    for index in stride(from: offset, to: markets.count, by: workers) {
+                        if Task.isCancelled { break }
+                        let market = markets[index]
+                        values.append((market.id, FilterEvaluator(market: market, filter: filter).evaluate().result))
+                    }
+                    return values
+                }
+            }
+            var result: [String: FilterTruth] = [:]
+            result.reserveCapacity(markets.count)
+            for await values in group { for (id, truth) in values { result[id] = truth } }
+            return result
+        }
     }
     func explain(_ market: FilterMarketData, filter: CompiledFilter) -> FilterTrace { FilterEvaluator(market: market, filter: filter).evaluate(explain: true) }
 }

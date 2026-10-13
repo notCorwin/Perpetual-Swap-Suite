@@ -98,6 +98,17 @@ const priceTagWidth = (priceText: string, countdown: string) => {
   const fontSize = style.getPropertyValue("--chart-price-tag-text-size").trim()
   return Math.ceil(Math.max(chartTextWidth(priceText, fontSize), chartTextWidth(countdown, fontSize)) + padding * 2)
 }
+
+const PriceCountdown = memo(function PriceCountdown({ hour, x, y, fontSize }: { hour: number; x: number; y: number; fontSize: string }) {
+  const [now, setNow] = useState(Date.now)
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
+  const seconds = Math.max(0, Math.floor((hour + 3_600_000 - now) / 1000))
+  const value = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`
+  return <text x={x} y={y} textAnchor="middle" dominantBaseline="middle" fill="var(--foreground)" fontSize={fontSize}>{value}</text>
+})
 export const chartGutter = (bars: Bar[], height: number, liveClose = bars[bars.length - 1].close) => {
   const { panels } = chartLayout(0, height)
   const values = chartPriceValues(bars)
@@ -157,8 +168,7 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
   const latestY = priceY(tag.price)
   const latestColor = tag.rising ? "var(--positive)" : "var(--destructive)"
   const showCountdown = now > 0
-  const secondsLeft = tag.secondsLeft
-  const countdown = `${String(Math.floor(secondsLeft / 60)).padStart(2, "0")}:${String(secondsLeft % 60).padStart(2, "0")}`
+  const countdown = "00:00"
   const latestPrice = price(tag.price), tagWidth = priceTagWidth(latestPrice, countdown)
   const tagStyle = getComputedStyle(document.documentElement)
   const tagFontSize = tagStyle.getPropertyValue("--chart-price-tag-text-size").trim()
@@ -343,7 +353,7 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
     <g data-surface="inherited" transform={`translate(${tagX},${priceTagY}) scale(${tagScale})`}>
       <rect width={tagWidth} height={tagHeight} rx={tagRadius} fill="var(--chart-annotation)" stroke={latestColor} strokeWidth="var(--chart-price-tag-stroke-width)" />
       <text x={tagWidth / 2} y={tagPaddingY + tagLineHeight / 2} textAnchor="middle" dominantBaseline="middle" fill="var(--foreground)" fontSize={tagFontSize}>{latestPrice}</text>
-      {showCountdown && <text x={tagWidth / 2} y={tagPaddingY + tagLineHeight * 1.5 + tagRowGap} textAnchor="middle" dominantBaseline="middle" fill="var(--foreground)" fontSize={tagFontSize}>{countdown}</text>}
+      {showCountdown && <PriceCountdown hour={liveBar.hour} x={tagWidth / 2} y={tagPaddingY + tagLineHeight * 1.5 + tagRowGap} fontSize={tagFontSize} />}
     </g>
     {legend("price", [["VWAP14", price(active.vwap), "var(--chart-2)"], ["EMA200", price(active.ema), "var(--chart-3)"], ["Log BB(20)", `U ${price(active.logBBUpper)}\u00a0·\u00a0M ${price(active.logBBMiddle)}\u00a0·\u00a0L ${price(active.logBBLower)}`, "var(--chart-1)"]])}
     {legend("roc", [["ROC(9)", formatPercent(active.roc), "var(--chart-1)"], ["MAROC(9)", formatPercent(active.maroc), "var(--chart-2)"]])}
@@ -390,7 +400,6 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
   const navigationId = useRef(instId)
   const navigationFrame = useRef<number | null>(null)
   const [plotSize, setPlotSize] = useState({ width: 0, height: 0 })
-  const [now, setNow] = useState(Date.now)
   const listPosition = listOrder.indexOf(instId)
   const turnoverPosition = turnoverOrder.indexOf(instId)
   const previous = chartNavigationTarget(listOrder, turnoverOrder, instId, "ArrowUp")
@@ -452,10 +461,6 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
     const preventPageScroll = (event: WheelEvent) => event.preventDefault()
     element.addEventListener("wheel", preventPageScroll, { passive: false })
     return () => element.removeEventListener("wheel", preventPageScroll)
-  }, [])
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 1000)
-    return () => window.clearInterval(timer)
   }, [])
   useEffect(() => {
     const endWhenHidden = () => { if (document.hidden) endInspection() }
@@ -660,8 +665,9 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
   const active = bars[inspected ?? bars.length - 1]
   const atHistoryBoundary = historicalEnd !== null && historyBoundary?.id === instId
     && historicalEnd === Math.min(chart?.bars.at(-1)?.hour ?? historicalEnd, historyBoundary.oldestHour + 95 * 3_600_000)
-  const warmSurfaces = useMemo(() => new Map([...warmCharts].map(([id, data]) => [id, { ...data, bars: visibleChartBars(data.bars, data.bars.at(-1)?.hour ?? 0) }])), [warmCharts])
-  const surfaces = new Map(warmSurfaces)
+  // Data for neighboring markets remains in warmCharts; mounting their full
+  // hidden SVGs would still consume reconciliation, layout and a11y resources.
+  const surfaces = new Map<string, ChartResponse>()
   if (bars.length && chart) surfaces.set(instId, { ...chart, bars, endHour: viewportEnd, strategySignals: visibleStrategySignals })
   const analyzeChart = (direction: AnalysisDirection) => {
     if (!bars.length || plotSize.width <= 0 || captureStatus === 'copying') return
@@ -749,7 +755,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
           if (!(event.buttons & 1)) { endInspection(); return }
           inspectAt(event.currentTarget, event.clientX)
         }}>
-          <Plot bars={data.bars} liveBar={id === instId ? chart?.bars.at(-1) ?? data.bars.at(-1)! : data.bars.at(-1)!} inspected={id === instId ? inspected : null} width={plotSize.width} height={plotSize.height} now={id === instId ? now : 0} endHour={data.endHour ?? data.bars.at(-1)!.hour} strategySignals={data.strategySignals} />
+          <Plot bars={data.bars} liveBar={chart?.bars.at(-1) ?? data.bars.at(-1)!} inspected={inspected} width={plotSize.width} height={plotSize.height} now={1} endHour={data.endHour ?? data.bars.at(-1)!.hour} strategySignals={data.strategySignals} />
         </svg>) : <p className="flex h-full items-center justify-center text-muted-foreground">{chart ? "No candle data available yet" : "Loading chart…"}</p>}
         {historicalEnd !== null && historyLoading === `${instId}:${historicalEnd}` && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Loading history…</span>}
         {atHistoryBoundary && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Start of available history</span>}

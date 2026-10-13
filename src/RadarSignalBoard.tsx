@@ -1,4 +1,4 @@
-import { memo, useState } from 'react'
+import { memo, useMemo, useState } from 'react'
 import { ArrowUpRight, FlaskConical, ScanSearch } from 'lucide-react'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -18,10 +18,12 @@ type SignalChartAction = (instrument: string, order: string[]) => void
 function SignalLane({ signals, markets, onChart, onExplain, onBrowseCharts }: { signals: RadarSignal[]; markets: Map<string, NativeMarketRow>; onChart: SignalChartAction; onExplain: (instrument: string) => void; onBrowseCharts: () => void }) {
   const [page, setPage] = useState(0)
   const label = 'Bullish Setup'
-  const matching = signals.filter(signal => signalMatches(signal)).sort((a, b) => Number(phaseMatches(b.confirmed)) - Number(phaseMatches(a.confirmed)) || (markets.get(b.instrument)?.turnover24hUSDT ?? 0) - (markets.get(a.instrument)?.turnover24hUSDT ?? 0) || a.instrument.localeCompare(b.instrument))
+  const { matching, order, confirmed, forming } = useMemo(() => {
+    const matching = signals.filter(signalMatches).sort((a, b) => Number(phaseMatches(b.confirmed)) - Number(phaseMatches(a.confirmed)) || (markets.get(b.instrument)?.turnover24hUSDT ?? 0) - (markets.get(a.instrument)?.turnover24hUSDT ?? 0) || a.instrument.localeCompare(b.instrument))
+    const [confirmed, forming] = matching.reduce(([confirmed, forming], signal) => [confirmed + Number(phaseMatches(signal.confirmed)), forming + Number(phaseMatches(signal.provisional))], [0, 0])
+    return { matching, order: matching.map(signal => signal.instrument), confirmed, forming }
+  }, [markets, signals])
   const currentPage = Math.min(page, Math.max(0, Math.ceil(matching.length / 25) - 1))
-  const confirmed = matching.filter(signal => phaseMatches(signal.confirmed)).length
-  const forming = matching.filter(signal => phaseMatches(signal.provisional)).length
   return <section aria-label={label + ' signals'} className="flex min-w-0 flex-col rounded-lg border" data-signal-lane="bullishSetup">
     <header className="flex items-start gap-3 border-b p-4">
       <div className="mt-0.5 text-positive"><ArrowUpRight aria-hidden="true" /></div>
@@ -32,7 +34,7 @@ function SignalLane({ signals, markets, onChart, onExplain, onBrowseCharts }: { 
       <Table aria-label={label + ' contracts'}><TableHeader><TableRow><TableHead>Contract / market</TableHead><TableHead>Signal / decision</TableHead><TableHead className="text-right">Evidence</TableHead></TableRow></TableHeader><TableBody>{matching.slice(currentPage * 25, currentPage * 25 + 25).map(signal => {
         const market = markets.get(signal.instrument)
         return <TableRow key={signal.instrument} data-signal-instrument={signal.instrument}>
-          <TableCell><Button variant="link" onClick={() => onChart(signal.instrument, matching.map(match => match.instrument))} aria-label={'View ' + signal.instrument + ' chart'}>{signal.instrument.replace(/-USDT-SWAP$/, '')}</Button><p className="text-xs" title="Latest traded price; hourly indicators use the exchange candle close">{(market?.lastPrice ?? market?.price) == null ? '—' : price.format((market?.lastPrice ?? market?.price)!)} USDT</p><p className="text-xs text-muted-foreground">{market?.turnover24hUSDT == null ? 'Est. turnover —' : turnover.format(market.turnover24hUSDT) + ' USDT / 24h (est.)'}</p></TableCell>
+          <TableCell><Button variant="link" onClick={() => onChart(signal.instrument, order)} aria-label={'View ' + signal.instrument + ' chart'}>{signal.instrument.replace(/-USDT-SWAP$/, '')}</Button><p className="text-xs" title="Latest traded price; hourly indicators use the exchange candle close">{(market?.lastPrice ?? market?.price) == null ? '—' : price.format((market?.lastPrice ?? market?.price)!)} USDT</p><p className="text-xs text-muted-foreground">{market?.turnover24hUSDT == null ? 'Est. turnover —' : turnover.format(market.turnover24hUSDT) + ' USDT / 24h (est.)'}</p></TableCell>
           <TableCell><div className="flex flex-col items-start gap-1">{(['confirmed', 'provisional'] as const).map(source => {
             const reading = signal[source]
             return phaseMatches(reading) && reading && <div key={source} className="flex flex-col items-start gap-1"><Badge variant={source === 'confirmed' ? 'positive' : 'outline'} title={researchTime(reading.hour + (source === 'confirmed' ? 3_600_000 : 0))}>{source === 'confirmed' ? 'BUY · Confirmed close' : 'FORMING BUY · Live hour'}</Badge><span className="text-xs" title={reading.reason}>{reading.action}</span></div>
@@ -46,8 +48,8 @@ function SignalLane({ signals, markets, onChart, onExplain, onBrowseCharts }: { 
 }
 
 export const RadarSignalBoard = memo(function RadarSignalBoard({ profile, signals, rows, paused, onChart, onExplain, onResearch, onBrowseCharts }: { profile: StrategyProfile; signals: RadarSignal[]; rows: NativeMarketRow[]; paused?: boolean; onChart: SignalChartAction; onExplain: (instrument: string) => void; onResearch: () => void; onBrowseCharts: () => void }) {
-  const markets = new Map(rows.map(row => [row.instId, row]))
-  const unknown = signals.filter(signalIsUnknown).length
+  const markets = useMemo(() => new Map(rows.map(row => [row.instId, row])), [rows])
+  const unknown = useMemo(() => signals.reduce((count, signal) => count + Number(signalIsUnknown(signal)), 0), [signals])
   return <section aria-label="Bullish Setup radar" className="flex flex-col gap-4 p-4" data-signal-board>
     <div className="flex items-center gap-3"><div className="flex min-w-0 flex-1 flex-col gap-1"><h2 className="font-semibold">Bullish Setup Radar</h2><p className="text-xs text-muted-foreground">{profile.name} · r{profile.revision} · Universe and Bullish Setup evaluated together</p></div><Button variant="outline" onClick={onResearch}><FlaskConical data-icon="inline-start" aria-hidden="true" />Test strategy</Button></div>
     {paused && <Alert variant="warning"><AlertDescription>Monitoring is paused. Resume in Settings to collect new signals.</AlertDescription></Alert>}

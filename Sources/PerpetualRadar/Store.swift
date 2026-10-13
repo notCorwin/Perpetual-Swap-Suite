@@ -17,6 +17,12 @@ final class Store {
             // WAL lets readers proceed during writes; competing writers wait briefly.
             guard sqlite3_busy_timeout(db, Self.busyTimeoutMilliseconds) == SQLITE_OK else { throw failure() }
             try enableWriteAheadLogging()
+            // WAL already protects durability. NORMAL avoids an fsync for every
+            // small committed batch, while mmap and a larger negative cache keep
+            // the hourly/research indexes hot without imposing a hard page count.
+            for pragma in ["PRAGMA synchronous=NORMAL", "PRAGMA temp_store=MEMORY", "PRAGMA cache_size=-65536", "PRAGMA mmap_size=268435456"] {
+                try query(pragma) { _ in }
+            }
             // Opening a current database is read-only. History readers must not
             // queue behind the writer merely to repeat already completed DDL.
             if try version() < Self.schemaVersion { try transaction {
@@ -162,20 +168,15 @@ final class Store {
     }
 
     func preference(forKey key: String) throws -> String? {
-        let stmt = try statement("SELECT value FROM preferences WHERE key=?")
-        defer { sqlite3_finalize(stmt) }
-        bind([key], to: stmt)
-        switch sqlite3_step(stmt) {
-        case SQLITE_ROW: return sqlite3_column_text(stmt, 0).map { String(cString: $0) }
-        case SQLITE_DONE: return nil
-        default: throw failure()
-        }
+        var value: String?
+        try query("SELECT value FROM preferences WHERE key=?", [key]) { value = Store.text($0, 0) }
+        return value
     }
 
     func dataVersion() throws -> Int64 {
-        let stmt = try statement("PRAGMA data_version"); defer { sqlite3_finalize(stmt) }
-        guard sqlite3_step(stmt) == SQLITE_ROW else { throw failure() }
-        return sqlite3_column_int64(stmt, 0)
+        var value: Int64 = 0
+        try query("PRAGMA data_version") { value = sqlite3_column_int64($0, 0) }
+        return value
     }
 
     // Rows changed by this connection; data_version only reports other connections.

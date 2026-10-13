@@ -214,10 +214,21 @@ final class ResearchStore {
             let json = try researchJSON(datum)
             return (datum, json, researchHash(json))
         }
+        let mergeInputs = Dictionary(grouping: values.filter { $0.kind == "stat" || $0.kind == "quote" }) { "\($0.instrument)\u{1f}\($0.kind)" }
+        var prior: [String: ResearchDatum] = [:]
+        for group in mergeInputs.values {
+            guard let sample = group.first, let first = group.map(\.timestamp).min(), let last = group.map(\.timestamp).max() else { continue }
+            try database.query("SELECT d.json FROM research_heads h JOIN research_data d USING(revision) WHERE h.inst=? AND h.kind=? AND h.ts>=? AND h.ts<=?", [sample.instrument, sample.kind, first, last]) { row in
+                if let datum = try? decoder.decode(ResearchDatum.self, from: Data(Self.text(row, 0).utf8)) {
+                    prior["\(datum.instrument)\u{1f}\(datum.kind)\u{1f}\(datum.timestamp)"] = datum
+                }
+            }
+        }
         try database.transaction {
             for (input, encodedJSON, encodedHash) in encoded {
                 var datum = input
-                if datum.kind == "stat" || datum.kind == "quote", let previous = try latest(datum.instrument, kind: datum.kind, timestamp: datum.timestamp) {
+                let mergeKey = "\(datum.instrument)\u{1f}\(datum.kind)\u{1f}\(datum.timestamp)"
+                if datum.kind == "stat" || datum.kind == "quote", let previous = prior[mergeKey] {
                     if datum.kind == "stat" {
                         datum.stat = FilterStat(oi: datum.stat?.oi ?? previous.stat?.oi, sell: datum.stat?.sell ?? previous.stat?.sell, buy: datum.stat?.buy ?? previous.stat?.buy)
                     } else if let quote = datum.quote {
@@ -228,6 +239,7 @@ final class ResearchStore {
                 let json = try encodedJSON ?? researchJSON(datum), hash = encodedHash ?? researchHash(json)
                 try database.execute("INSERT OR IGNORE INTO research_data(inst,kind,ts,digest,json) VALUES (?,?,?,?,?)", [datum.instrument, datum.kind, datum.timestamp, hash, json])
                 try database.execute("INSERT INTO research_heads SELECT inst,kind,ts,revision FROM research_data WHERE inst=? AND kind=? AND ts=? AND digest=? ON CONFLICT(inst,kind,ts) DO UPDATE SET revision=excluded.revision", [datum.instrument, datum.kind, datum.timestamp, hash])
+                if datum.kind == "stat" || datum.kind == "quote" { prior[mergeKey] = datum }
             }
         }
     }
