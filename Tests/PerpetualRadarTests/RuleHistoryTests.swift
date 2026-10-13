@@ -127,6 +127,7 @@ final class RuleHistoryTests: XCTestCase, @unchecked Sendable {
 
     func testResearchCacheHydratesRadarWithoutDuplicateOKXRequests() async throws {
         let url = database(); defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let canonical = try Store(url: url)
         let research = try ResearchStore(directory: url.deletingLastPathComponent().appendingPathComponent("Research"))
         let filter = try FilterCompiler.compile(source: "closed(every(Close > 0 AND oiUSD > 0 AND buy > sell AND turnover > 0, 3))")
         let id = market().id, hours = (1...filter.requiredHours).map { hour - Int64($0) * hourMS }
@@ -138,6 +139,8 @@ final class RuleHistoryTests: XCTestCase, @unchecked Sendable {
                 .init(instrument: id, kind: "quote", timestamp: timestamp, quote: .init(turnover: 20_000_000, spread: nil, timestamp: timestamp + hourMS - 1), sources: ["research-\(index)"]),
             ])
         }
+        XCTAssertEqual(try canonical.candles(id, since: hours.last!, through: hours.first!).count, filter.requiredHours,
+                       "Verified Research rows must publish immediately to the canonical Radar market store.")
         let transport = TestHistoryTransport(), loader = FilterHistoryLoader(url: url, transport: transport, requestDelay: 0)
         let prepared = try await loader.prepare([market()], filter: filter)
         await loader.schedule(prepared, filter: filter); await loader.waitUntilIdle()
@@ -145,10 +148,8 @@ final class RuleHistoryTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(FilterEvaluator(market: hydrated[0], filter: filter).evaluate().result, .yes)
         let requests = await transport.count()
         XCTAssertEqual(requests, 0, "Radar must not request history already normalized by Research.")
-        let radar = try Store(url: url)
-        XCTAssertEqual(try radar.candles(id, since: hours.last!, through: hours.first!).count, filter.requiredHours)
-        XCTAssertEqual(try radar.chartStats(id, since: hours.last!, through: hours.first!).count, filter.requiredHours)
-        XCTAssertEqual(try radar.hourlyQuotes(id, since: hours.last!, through: hours.first!).count, filter.requiredHours)
+        XCTAssertEqual(try canonical.chartStats(id, since: hours.last!, through: hours.first!).count, filter.requiredHours)
+        XCTAssertEqual(try canonical.hourlyQuotes(id, since: hours.last!, through: hours.first!).count, filter.requiredHours)
     }
 
     func testSmallerDraftCancelsObsoleteLongHistoryWork() async throws {
