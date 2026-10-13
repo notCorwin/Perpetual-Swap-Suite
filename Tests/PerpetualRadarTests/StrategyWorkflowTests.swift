@@ -129,4 +129,23 @@ final class StrategyWorkflowTests: XCTestCase {
         XCTAssertEqual(try strategyChartSignals(profile: strategy, market: context, from: start, through: hour).map(\.hour),
                        [start + 2 * hourMS], "The forming candle must never become a historical BUY marker.")
     }
+
+    func testChartReplayReconstructsPastTurnoverWithoutInventingSpread() throws {
+        let start = hour - 25 * hourMS
+        let bars = Dictionary(uniqueKeysWithValues: (0...25).map { index in
+            let timestamp = start + Int64(index) * hourMS
+            return (timestamp, Candle(hour: timestamp, high: 11, low: 9, close: 10, quoteVolume: 20, baseVolume: 2, open: 10))
+        })
+        let market = FilterMarketData(id: "ETH-USDT-SWAP", hour: hour, now: hour + hourMS, listedAt: 1,
+            candles: bars, stats: [:], quotes: [:], historicalClose: true)
+        let reconstructed = try profile(universe: "turnover > 0", setup: "Close > 0")
+        let report = try strategyChartReplay(profile: reconstructed, market: market, from: start, through: hour)
+        XCTAssertGreaterThan(report.matchedHours, 0)
+        XCTAssertGreaterThan(report.unknownHours, 0, "The first 23 hours cannot have a future-filled 24h turnover window.")
+
+        let exactSpread = try profile(universe: "spread < 0.15", setup: "Close > 0")
+        let spreadReport = try strategyChartReplay(profile: exactSpread, market: market, from: start, through: hour)
+        XCTAssertEqual(spreadReport.matchedHours, 0)
+        XCTAssertEqual(spreadReport.unknownHours, 26, "Historical replay must not synthesize unavailable spread snapshots.")
+    }
 }

@@ -996,7 +996,7 @@ final class Radar {
         var series: [Int64: Candle]
         let stats: [Int64: (oi: Double?, sell: Double?, buy: Double?)]
         let profile = try? store.selectedSuiteProfile("radar")
-        var chartSignals: [StrategyChartSignal] = []
+        var chartReplay: StrategyChartReplay?
         do {
             let warmup = max(candleLookback, emaWarmupHours(200))
             series = try store.candles(id, since: max(0, first - Int64(warmup) * hourMS), through: end)
@@ -1017,7 +1017,7 @@ final class Radar {
                         candles: referenceCandles, stats: referenceStats.mapValues { FilterStat(oi: $0.oi, sell: $0.sell, buy: $0.buy) }, quotes: referenceQuotes, historicalClose: true)
                 }
                 let confirmedThrough = min(end, hour - hourMS)
-                chartSignals = try strategyChartSignals(profile: profile, market: market, reference: reference, from: first, through: confirmedThrough)
+                chartReplay = try strategyChartReplay(profile: profile, market: market, reference: reference, from: first, through: confirmedThrough)
             }
         }
         catch { return ["bars": [], "error": "Cannot read chart cache: \(error.localizedDescription)", "revision": chartRevision] }
@@ -1064,7 +1064,8 @@ final class Radar {
         var result: [String: Any] = ["bars": output, "error": error, "revision": chartRevision]
         if let profile {
             result["strategy"] = ["id": profile.id, "name": profile.name, "revision": profile.revision]
-            result["strategySignals"] = try? JSONSerialization.jsonObject(with: JSONEncoder().encode(chartSignals))
+            result["strategySignals"] = try? JSONSerialization.jsonObject(with: JSONEncoder().encode(chartReplay?.signals ?? []))
+            if let chartReplay { result["strategyReplay"] = try? JSONSerialization.jsonObject(with: JSONEncoder().encode(chartReplay)) }
         }
         return result
     }

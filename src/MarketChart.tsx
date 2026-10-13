@@ -27,7 +27,8 @@ export type Bar = {
 }
 export type StrategyChartSignal = { hour: number; price: number }
 export type ChartStrategy = { id: string; name: string; revision: number }
-export type ChartResponse = { bars: Bar[]; error: string; revision: number; serviceSession?: string; endHour?: number; oldestHour?: number | null; historyExhausted?: boolean; candleLoadFailed?: boolean; strategy?: ChartStrategy; strategySignals?: StrategyChartSignal[] }
+export type StrategyChartReplay = { fromHour: number; throughHour: number; completedHours: number; matchedHours: number; unknownHours: number; signals: StrategyChartSignal[] }
+export type ChartResponse = { bars: Bar[]; error: string; revision: number; serviceSession?: string; endHour?: number; oldestHour?: number | null; historyExhausted?: boolean; candleLoadFailed?: boolean; strategy?: ChartStrategy; strategySignals?: StrategyChartSignal[]; strategyReplay?: StrategyChartReplay }
 export type ChartPollResponse = ChartResponse | { unchanged: true; error: string; revision: number; serviceSession?: string }
 
 const chartCache = new Map<string, { data: ChartResponse; loadedAt: number }>()
@@ -326,6 +327,7 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
       return <g key={signalHour} data-chart-buy-hour={signalHour} aria-label={`Strategy buy signal at ${time(signalHour)} close; reference entry is the next-hour open`}>
         <path d={`M${markerX} ${markerY - 7}L${markerX - 5} ${markerY + 1}H${markerX + 5}Z`} fill="var(--positive)" stroke="var(--chart-surface)" strokeWidth="1.5" />
         <circle cx={markerX} cy={markerY + 3.5} r="2.25" fill="var(--positive)" stroke="var(--chart-surface)" strokeWidth="1" />
+        <text x={markerX} y={markerY + 14} textAnchor="middle" fill="var(--positive)" fontWeight="700">BUY</text>
       </g>
     })}
     {inspected !== null && panelKeys.map(key => <line key={key} x1={x(inspected, key)} x2={x(inspected, key)} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--foreground)" strokeWidth="0.65" strokeDasharray="3 5" opacity="0.3" />)}
@@ -623,6 +625,11 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
     return [...new Map(sources.filter(value => value.strategy?.id === strategy.id && value.strategy.revision === strategy.revision)
       .flatMap(value => value.strategySignals ?? []).map(signal => [signal.hour, signal])).values()]
   }, [chart, historyBars, instId])
+  const strategyReplay = historicalEnd === null ? chart?.strategyReplay : historyBars?.id === instId ? historyBars.data.strategyReplay : undefined
+  const visibleStrategySignals = useMemo(() => {
+    const hours = new Set(bars.map(bar => Number(bar.hour)))
+    return (strategyReplay?.signals ?? strategySignals).filter(signal => hours.has(Number(signal.hour)))
+  }, [bars, strategyReplay, strategySignals])
   const inspectedIndex = inspection?.id === instId ? bars.findIndex(bar => bar.hour === inspection.hour) : -1
   const inspected = inspectedIndex < 0 ? null : inspectedIndex
   const inspectAt = (target: SVGSVGElement, clientX: number) => {
@@ -655,7 +662,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
     && historicalEnd === Math.min(chart?.bars.at(-1)?.hour ?? historicalEnd, historyBoundary.oldestHour + 95 * 3_600_000)
   const warmSurfaces = useMemo(() => new Map([...warmCharts].map(([id, data]) => [id, { ...data, bars: visibleChartBars(data.bars, data.bars.at(-1)?.hour ?? 0) }])), [warmCharts])
   const surfaces = new Map(warmSurfaces)
-  if (bars.length && chart) surfaces.set(instId, { ...chart, bars, endHour: viewportEnd, strategySignals })
+  if (bars.length && chart) surfaces.set(instId, { ...chart, bars, endHour: viewportEnd, strategySignals: visibleStrategySignals })
   const analyzeChart = (direction: AnalysisDirection) => {
     if (!bars.length || plotSize.width <= 0 || captureStatus === 'copying') return
     flushSync(() => { setAnalysisOpen(true); setCapture({ id: instId, status: 'idle', error: '' }) })
@@ -690,8 +697,13 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
       </ButtonGroup>
       <span role="status" className="sr-only">{captureStatus === "flashing" ? "Chart copied to clipboard" : ""}</span>
       <Badge variant="secondary"><Radio data-icon="inline-start" aria-hidden="true" />{historicalEnd !== null ? "History" : active && !active.confirmed ? "Live candle" : "Hourly chart"}</Badge>
-      {chart?.strategy && <Badge variant="outline" title="BUY markers use completed hourly candles only">{chart.strategy.name} · r{chart.strategy.revision} · BUY</Badge>}
+      {chart?.strategy && <Badge variant="outline" title="BUY markers use completed hourly candles only">{chart.strategy.name} · r{chart.strategy.revision} · {visibleStrategySignals.length} BUY</Badge>}
     </header>
+    {chart?.strategy && strategyReplay && <div role="status" data-strategy-chart-summary className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-xs">
+      <span className={visibleStrategySignals.length ? 'font-medium text-positive' : 'font-medium'}>{visibleStrategySignals.length} BUY {visibleStrategySignals.length === 1 ? 'entry' : 'entries'} in this 96-hour window</span>
+      <span className="text-muted-foreground">{strategyReplay.matchedHours} matching completed hours · {strategyReplay.completedHours} completed hours checked{strategyReplay.unknownHours ? ` · ${strategyReplay.unknownHours} Unknown` : ''}</span>
+      {!visibleStrategySignals.length && <span className="ml-auto text-muted-foreground">The strategy did not transition from non-match to match in this window.</span>}
+    </div>}
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}{historicalEnd !== null && <Button variant="outline" size="sm" onClick={() => {
       requestedHistoryEnds.current.delete(`${instId}:${historicalEnd}`)
       loadedHistoryBuckets.current.delete(`${instId}:${Math.floor(historicalEnd / (96 * 3_600_000))}`)

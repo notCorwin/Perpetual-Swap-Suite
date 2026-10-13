@@ -301,6 +301,9 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
             if let profile = try? Store(url: directory.appendingPathComponent("radar.sqlite3")).selectedSuiteProfile("radar") {
                 response["strategy"] = ["id": profile.id, "name": profile.name, "revision": profile.revision]
                 response["strategySignals"] = [["hour": hour - 5 * hourMS, "price": 110.0]]
+                response["strategyReplay"] = ["fromHour": hour - 95 * hourMS, "throughHour": hour - hourMS,
+                    "completedHours": 95, "matchedHours": 3, "unknownHours": 0,
+                    "signals": [["hour": hour - 5 * hourMS, "price": 110.0]]]
             }
             if request["loadChart"] as? Bool == true, request["chartInstId"] as? String == holdChartLoadID {
                 holdChartLoadID = nil; heldChartLoadReply = { replyHandler(response, nil) }
@@ -523,7 +526,7 @@ final class RuleEditorUITests: BackgroundTestCase {
             if let data=image.tiffRepresentation, let png=NSBitmapImageRep(data:data)?.representation(using:.png,properties:[:]) { try png.write(to:URL(fileURLWithPath:path)) }
         }
         _ = try await js(view,"document.querySelector('[data-signal-lane=bullishSetup] button[aria-label=\"View MKT001-USDT-SWAP chart\"]').click(); true")
-        try await wait(view,"document.querySelector('section[aria-label=\"MKT001-USDT-SWAP chart\"] [data-chart-buy-hour]') !== null && document.querySelector('[title=\"BUY markers use completed hourly candles only\"]')?.innerText.includes('BUY')")
+        try await wait(view,"document.querySelector('section[aria-label=\"MKT001-USDT-SWAP chart\"] [data-chart-buy-hour]')?.textContent.includes('BUY') && document.querySelector('[data-strategy-chart-summary]')?.innerText.includes('1 BUY entry')")
         _ = try await js(view,"window.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown'})); true")
         try await wait(view,"document.querySelector('section[aria-label=\"MKT002-USDT-SWAP chart\"]') !== null")
         try await click(view,"Signals")
@@ -550,7 +553,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await click(view,"Save strategy");try await wait(view,"document.body.innerText.includes('Strategy saved.')")
         XCTAssertEqual(try store.selectedSuiteProfile("radar")?.id,profile.id);XCTAssertEqual(try store.selectedSuiteProfile("radar")?.revision,2)
         try await click(view,"Research");try await click(view,"Perpetual Swap Research")
-        try await wait(view,"document.querySelector('[data-signal-board]')?.innerText.includes('Shared Radar · r2') && document.querySelector('[data-signal-lane=bullishSetup]')?.innerText.includes('No Bullish Setup matches')")
+        try await wait(view,"document.querySelector('[data-signal-board]')?.innerText.includes('Shared Radar · r2') && document.querySelector('[data-signal-lane=bullishSetup]')?.innerText.includes('No BUY signals right now')")
         try await click(view,"Perpetual Swap Radar")
         try await wait(view,"document.querySelector('[data-research]')?.innerText.includes('New saved revisions exist')")
         try await click(view,"Use this version in Radar")
