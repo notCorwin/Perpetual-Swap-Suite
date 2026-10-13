@@ -139,7 +139,7 @@ const MarketRowView = memo(function MarketRowView({ row, index, onSelect, onExpl
         <BreakReadings result={row.lowBreakdown} direction="low" />
       </div>
     </TableCell>
-    <TableCell className={cn("text-center tabular-nums", directionClass(row.takerRatio))} title={row.buy !== null && row.sell !== null ? `Current 1h cumulative volume · Buy ${row.buy.toLocaleString("en-US")} / Sell ${row.sell.toLocaleString("en-US")} contracts · Imbalance (Buy − Sell) / (Buy + Sell), not Buy / Sell` : "Loading current-hour taker volume"}>{formatPercent(row.takerRatio)}</TableCell>
+    <TableCell className={cn("text-center tabular-nums", directionClass(row.takerRatio))} title={row.buy !== null && row.sell !== null ? `Current 1h provisional cumulative volume · Buy ${row.buy.toLocaleString("en-US")} / Sell ${row.sell.toLocaleString("en-US")} base currency · Imbalance (Buy − Sell) / (Buy + Sell), not Buy / Sell` : "Loading current-hour taker volume"}>{formatPercent(row.takerRatio)}</TableCell>
     <TableCell className={cn("text-center tabular-nums", directionClass(row.oiChange))}>{formatPercent(row.oiChange)}</TableCell>
     <TableCell className="text-center tabular-nums">
       <div className="mx-auto grid w-max grid-cols-[max-content_max-content] gap-x-3 text-right">
@@ -607,7 +607,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
                 </div>
               </TableHead>
               <TableHead className="text-center" aria-sort={sort === "takerRatio" ? descending ? "descending" : "ascending" : "none"}>{header("Taker imbalance", "takerRatio", math(String.raw`\frac{Buy_t-Sell_t}{Buy_t+Sell_t}\times100\%`))}</TableHead>
-              <TableHead className="text-center" aria-sort={sort === "oiChange" ? descending ? "descending" : "ascending" : "none"}>{header("OI Relative Change", "oiChange", undefined, `Hourly OI relative change. ${PERCENT_CHANGE_DESCRIPTION}`)}</TableHead>
+              <TableHead className="text-center" aria-sort={sort === "oiChange" ? descending ? "descending" : "ascending" : "none"}>{header("OI Relative Change", "oiChange", undefined, `Hourly change in OI contracts, unaffected by price-only changes. ${PERCENT_CHANGE_DESCRIPTION}`)}</TableHead>
               <TableHead className="py-1.5 text-center" aria-sort={sort === "roc" || sort === "maroc" ? descending ? "descending" : "ascending" : "none"}>
                 <div className="flex flex-col items-center">
                   {header(`ROC ${ROC_PERIOD}`, "roc", math(String.raw`\mathrm{ROC}_{${ROC_PERIOD}}\ (\%)`), `${ROC_PERIOD}-hour price change. ${PERCENT_CHANGE_DESCRIPTION}`)}

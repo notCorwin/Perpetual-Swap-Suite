@@ -10,7 +10,8 @@ final class MarketSnapshotTests: XCTestCase {
         })
         return .init(id: id, hour: hour, now: hour + hourMS / 2, candles: bars, listedAt: 0,
             turnover: 20_000_000, spreadPercent: 0.1, quoteTimestamp: hour + 1,
-            buy: 3, sell: 1, takerRatio: 50, currentOI: 1_020_000, previousOI: 1_000_000, previousEMA: 100)
+            buy: 3, sell: 1, takerRatio: 50, currentOI: 1_020_000, currentOIUSD: 82_000_000,
+            previousOI: 1_000_000, previousEMA: 100)
     }
 
     func testBackgroundRowsPreserveSnapshotReadingsAndUseTheCapturedHourForRules() async throws {
@@ -23,6 +24,7 @@ final class MarketSnapshotTests: XCTestCase {
         XCTAssertEqual(market.current["oiTrend"]?.text, "rising")
         XCTAssertEqual(market.current["emaBody"]?.text, "above")
         XCTAssertEqual(market.stats[input.hour]?.oi, 1_020_000)
+        XCTAssertEqual(market.stats[input.hour]?.oiUSD, 82_000_000)
         XCTAssertEqual(market.quotes[input.hour]?.timestamp, input.quoteTimestamp)
         XCTAssertEqual(NSDictionary(dictionary: row), NSDictionary(dictionary: input.calculate(rocPeriod: 9, marocPeriod: 9).fields))
         let filter = try FilterCompiler.compile(source: "oiTrend == \"rising\" AND emaBody == \"above\"")
@@ -34,7 +36,8 @@ final class MarketSnapshotTests: XCTestCase {
         let template = input(), worker = MarketSnapshotWorker()
         let markets = (0..<500).map { index in
             MarketSnapshotInput(id: "MKT\(index)", hour: template.hour, now: template.now, candles: template.candles,
-                listedAt: template.listedAt, currentOI: template.currentOI, previousOI: template.previousOI, previousEMA: template.previousEMA)
+                listedAt: template.listedAt, currentOI: template.currentOI, currentOIUSD: template.currentOIUSD,
+                previousOI: template.previousOI, previousEMA: template.previousEMA)
         }
         let task = Task { try await worker.calculate(markets, rocPeriod: 9, marocPeriod: 9) }
         let start = Date()

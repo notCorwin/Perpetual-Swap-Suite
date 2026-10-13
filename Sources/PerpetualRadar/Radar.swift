@@ -50,10 +50,16 @@ private struct Market {
     var quoteTimestamp: Int64 = 0
     var lastPrice: Double?
     var oiTimestamp = 0.0
+    var oiContracts: Double?
     var oiUsd: Double?
     var buy: Double?
     var sell: Double?
     var takerRatio: Double?
+}
+
+private struct OpenInterestObservation: Equatable {
+    let contracts: Double
+    let usd: Double
 }
 
 @MainActor
@@ -96,7 +102,7 @@ final class Radar {
     private var emaStates: [String: (Int64, Double)] = [:]
     private var candleRequests: [String: [Int64: ContinuousClock.Instant]] = [:]
     private var pendingCandleWrites: [String: Set<Int64>] = [:]
-    private var oiHistory: [String: [Int64: Double]] = [:]
+    private var oiHistory: [String: [Int64: OpenInterestObservation]] = [:]
     private var oiHistoryRequests: [String: ContinuousClock.Instant] = [:]
     private var exhaustedCandleHistory = Set<String>()
     private var loadedStatPages: [String: ContinuousClock.Instant] = [:]
@@ -488,7 +494,7 @@ final class Radar {
 
     private func getData(_ path: String, _ parameters: [String: String]) async throws -> Data {
         var parameters = parameters
-        if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "1" }
+        if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "0" }
         var parts = URLComponents(string: api + path)!
         parts.queryItems = parameters.map { URLQueryItem(name: $0.key, value: $0.value) }
         var request = URLRequest(url: parts.url!, cachePolicy: .reloadIgnoringLocalCacheData)
@@ -736,37 +742,40 @@ final class Radar {
 
     func updateOI(_ item: [String: Any]) {
         guard let id = item["instId"] as? String,
-              let current = numeric(item["oi"]), current >= 0,
-              let stamp = numeric(item["ts"]), let value = numeric(item["oiUsd"]), value >= 0 else { return }
-        applyOI(id, value: value, timestamp: stamp)
+              let stamp = numeric(item["ts"]),
+              let contracts = numeric(item["oi"]), contracts >= 0,
+              let usd = numeric(item["oiUsd"]), usd >= 0 else { return }
+        applyOI(id, contracts: contracts, usd: usd, timestamp: stamp)
     }
 
-    private func applyOI(_ id: String, value: Double, timestamp: Double) {
+    private func applyOI(_ id: String, contracts: Double, usd: Double, timestamp: Double) {
         guard var row = rows[id], timestamp >= row.oiTimestamp else { return }
-        guard row.oiTimestamp != timestamp || row.oiUsd != value else { return }
-        row.oiTimestamp = timestamp; row.oiUsd = value
+        guard row.oiTimestamp != timestamp || row.oiContracts != contracts || row.oiUsd != usd else { return }
+        row.oiTimestamp = timestamp; row.oiContracts = contracts; row.oiUsd = usd
         rows[id] = row; invalidateSnapshot(id); touch(id)
     }
 
-    private func currentOI(_ id: String) -> Double? {
+    private func currentOI(_ id: String) -> (contracts: Double, usd: Double)? {
         guard let row = rows[id], row.oiTimestamp >= Double(hour), row.oiTimestamp < Double(hour + hourMS) else { return nil }
-        return row.oiUsd
+        guard let contracts = row.oiContracts, let usd = row.oiUsd else { return nil }
+        return (contracts, usd)
     }
 
     @discardableResult
     func updateOIHistory(_ id: String, _ values: [Any], requestedAt: ContinuousClock.Instant) throws -> Bool {
         guard rows[id] != nil, oiHistoryRequests[id].map({ requestedAt >= $0 }) ?? true else { return false }
-        var observations: [Int64: Double] = [:]
+        var observations: [Int64: OpenInterestObservation] = [:]
         for case let item as [String] in values {
             guard item.count >= 4, let ts = Int64(item[0]), ts >= 0, ts % hourMS == 0, ts <= hour,
-                  let oi = Double(item[3]), oi.isFinite, oi >= 0 else { continue }
-            observations[ts] = oi
+                  let contracts = Double(item[1]), let usd = Double(item[3]),
+                  contracts.isFinite, usd.isFinite, contracts >= 0, usd >= 0 else { continue }
+            observations[ts] = .init(contracts: contracts, usd: usd)
         }
         let closed = observations.filter { $0.key < hour && oiHistory[id]?[$0.key] != $0.value }
-        try store.transaction { for (ts, value) in closed { try store.saveChartStat(id, hour: ts, oi: value) } }
+        try store.transaction { for (ts, value) in closed { try store.saveChartStat(id, hour: ts, oi: value.contracts, oiUSD: value.usd) } }
         for (ts, value) in closed { oiHistory[id, default: [:]][ts] = value }
         oiHistoryRequests[id] = requestedAt
-        if let live = observations[hour] { applyOI(id, value: live, timestamp: Double(hour)) }
+        if let live = observations[hour] { applyOI(id, contracts: live.contracts, usd: live.usd, timestamp: Double(hour)) }
         if !closed.isEmpty { invalidateSnapshot(id); touch(id) }
         return observations[hour - hourMS] != nil
     }
@@ -1107,7 +1116,7 @@ final class Radar {
                     let lastExpected = min(pageEnd, hour - hourMS)
                     let existing = try store.chartStats(id, since: firstExpected, through: lastExpected)
                     var loaded = Set(existing.compactMap { timestamp, value in
-                        path.contains("open-interest") ? (value.oi == nil ? nil : timestamp) : (value.sell == nil || value.buy == nil ? nil : timestamp)
+                        path.contains("open-interest") ? (value.oi == nil || value.oiUSD == nil ? nil : timestamp) : (value.sell == nil || value.buy == nil ? nil : timestamp)
                     })
                     if firstExpected > lastExpected || stride(from: firstExpected, through: lastExpected, by: Int(hourMS)).allSatisfy({ loaded.contains($0) }) {
                         loadedStatPages[key] = .now; continue
@@ -1115,8 +1124,10 @@ final class Radar {
                     let values = try await get(path, ["instId": id, "period": "1H", "end": String(pageEnd + hourMS), "limit": "100"])
                     for case let row as [String] in values {
                         guard let stamp = row.first.flatMap(Int64.init), stamp >= pageStart, stamp <= pageEnd, stamp < hour else { continue }
-                        if path.contains("open-interest"), row.count >= 4, let oi = Double(row[3]), oi.isFinite, oi >= 0 {
-                            try store.saveChartStat(id, hour: stamp, oi: oi)
+                        if path.contains("open-interest"), row.count >= 4,
+                           let oi = Double(row[1]), let oiUSD = Double(row[3]),
+                           oi.isFinite, oiUSD.isFinite, oi >= 0, oiUSD >= 0 {
+                            try store.saveChartStat(id, hour: stamp, oi: oi, oiUSD: oiUSD)
                             loaded.insert(stamp)
                         } else if !path.contains("open-interest"), row.count >= 3,
                                   let sell = Double(row[1]), let buy = Double(row[2]),
@@ -1153,7 +1164,7 @@ final class Radar {
         let end = endHour ?? hour
         let first = max(0, end - Int64(max(1, outputHours) - 1) * hourMS)
         var series: [Int64: Candle]
-        let stats: [Int64: (oi: Double?, sell: Double?, buy: Double?)]
+        let stats: [Int64: (oi: Double?, oiUSD: Double?, sell: Double?, buy: Double?)]
         do {
             let warmup = candleLookback
             series = try store.candles(id, since: max(0, first - Int64(warmup) * hourMS), through: end)
@@ -1187,7 +1198,7 @@ final class Radar {
             let (roc, maroc) = rocMaroc(series, ts, 9, 9)
             let (upper, middle, lower) = logBB(series, ts)
             let stat = stats[ts]
-            let oi = ts == hour ? currentOI(id) : stat?.oi
+            let oi = ts == hour ? currentOI(id)?.contracts : stat?.oi
             let sell = ts == hour ? rows[id]?.sell : stat?.sell
             let buy = ts == hour ? rows[id]?.buy : stat?.buy
             output.append([
@@ -1283,12 +1294,12 @@ final class Radar {
         let now = millis()
         for id in marketOrder {
             guard let row = rows[id] else { continue }
-            let bars = candles[id] ?? [:]
+            let bars = candles[id] ?? [:], oi = currentOI(id)
             batch.inputs.append(.init(id: id, hour: hour, now: now, candles: bars, listedAt: row.listedAt,
                 turnover: row.turnover24hUSDT, spreadPercent: row.spreadPercent, quoteTimestamp: row.quoteTimestamp,
                 lastPrice: row.lastPrice,
                 buy: row.buy, sell: row.sell, takerRatio: row.takerRatio,
-                currentOI: currentOI(id),
+                currentOI: oi?.contracts, currentOIUSD: oi?.usd,
                 previousOI: previousOI[id], previousEMA: ema200(id, bars)))
             batch.generations[id] = snapshotGenerations[id, default: 0]
         }

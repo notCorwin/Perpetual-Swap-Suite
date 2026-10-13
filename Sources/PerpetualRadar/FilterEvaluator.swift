@@ -6,7 +6,14 @@ private struct SequenceSearchState: Hashable {
     let bindings: [SequenceBinding]
 }
 
-struct FilterStat: Codable, Sendable { var oi: Double?, sell: Double?, buy: Double? }
+/// OI contracts drive trend/change signals; OI USD is retained separately for
+/// notional-size filters. Taker volumes use OKX's crypto/base-currency unit.
+struct FilterStat: Codable, Sendable {
+    var oi: Double?
+    var oiUSD: Double? = nil
+    var sell: Double?
+    var buy: Double?
+}
 struct FilterQuote: Codable, Sendable {
     var turnover: Double?
     var spread: Double?
@@ -121,12 +128,13 @@ final class FilterEvaluator {
         case "spread": return number(market.quotes[hour]?.spread, "Spread has no quote snapshot for this hour.")
         case "buy": return number(market.stats[hour]?.buy, "Taker buy history is unavailable.")
         case "sell": return number(market.stats[hour]?.sell, "Taker sell history is unavailable.")
-        case "oiUSD": return number(market.stats[hour]?.oi.map { $0 / 1_000_000 }, "OI history is unavailable.")
+        case "oiUSD": return number(market.stats[hour]?.oiUSD.map { $0 / 1_000_000 }, "OI USD history is unavailable.")
         case "takerRatio":
             guard let buy = value("buy").number, let sell = value("sell").number, buy + sell > 0 else { return number(nil, "Taker imbalance requires nonzero buy or sell volume.") }
             return number((buy - sell) / (buy + sell) * 100)
         case "buyVsSell": return relation(value("buy"), value("sell"))
-        case "oiChange": return change(value("oiUSD"), metric("oiUSD", at: hour - hourMS))
+        case "oiChange": return change(number(market.stats[hour]?.oi, "OI contract history is unavailable."),
+                                        number(market.stats[hour - hourMS]?.oi, "Previous OI contract history is unavailable."))
         case "oiTrend": return direction(value("oiChange"))
         case "priceChange": return change(value("Close"), metric("Close", at: hour - hourMS))
         case "candleDirection": return relation(value("Close"), value("Open"))

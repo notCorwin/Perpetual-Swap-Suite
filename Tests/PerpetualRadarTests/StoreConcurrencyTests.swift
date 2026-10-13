@@ -246,7 +246,7 @@ final class StoreConcurrencyTests: XCTestCase, @unchecked Sendable {
             try store.execute("ALTER TABLE candles RENAME TO stored_candles")
             try store.execute("CREATE VIEW candles AS SELECT inst_id,abs(-9223372036854775808) AS hour,high,low,close,volume,base_volume,open FROM stored_candles")
             try store.execute("ALTER TABLE chart_stats RENAME TO stored_stats")
-            try store.execute("CREATE VIEW chart_stats AS SELECT inst_id,abs(-9223372036854775808) AS hour,oi,sell,buy FROM stored_stats")
+            try store.execute("CREATE VIEW chart_stats AS SELECT inst_id,abs(-9223372036854775808) AS hour,oi,oi_usd,sell,buy FROM stored_stats")
             try store.execute("ALTER TABLE hourly_quotes RENAME TO stored_quotes")
             try store.execute("CREATE VIEW hourly_quotes AS SELECT inst_id,abs(-9223372036854775808) AS hour,turnover,spread,quote_timestamp FROM stored_quotes")
             XCTAssertThrowsError(try store.load(hour: hourMS, ids: [id]))

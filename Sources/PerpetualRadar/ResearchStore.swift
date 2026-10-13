@@ -72,6 +72,16 @@ final class ResearchStore {
             try database.execute("DELETE FROM research_objects WHERE kind='preparedSource'")
             try database.setPreference("4", forKey: "researchSchemaVersion")
         } }
+        if try Int(database.preference(forKey: "researchSchemaVersion") ?? "0") ?? 0 < 5 { try database.transaction {
+            guard try Int(database.preference(forKey: "researchSchemaVersion") ?? "0") ?? 0 < 5 else { return }
+            // Old stat heads encode OI USD in `oi` and taker contracts in
+            // buy/sell. Frozen manifests retain their pinned revisions, while
+            // new plans must hydrate the corrected explicit units.
+            try database.execute("DELETE FROM research_heads WHERE kind='stat'")
+            try database.execute("DELETE FROM research_coverage WHERE kind IN ('oi','taker')")
+            try database.execute("DELETE FROM research_objects WHERE kind IN ('planCache','preparedSource')")
+            try database.setPreference("5", forKey: "researchSchemaVersion")
+        } }
         // Radar's confirmed-hour database is the canonical latest market view.
         // Do not create it from a standalone Research context, but publish to it
         // whenever the application/monitor has already established the store.
@@ -238,7 +248,10 @@ final class ResearchStore {
                 let mergeKey = "\(datum.instrument)\u{1f}\(datum.kind)\u{1f}\(datum.timestamp)"
                 if datum.kind == "stat" || datum.kind == "quote", let previous = prior[mergeKey] {
                     if datum.kind == "stat" {
-                        datum.stat = FilterStat(oi: datum.stat?.oi ?? previous.stat?.oi, sell: datum.stat?.sell ?? previous.stat?.sell, buy: datum.stat?.buy ?? previous.stat?.buy)
+                        datum.stat = FilterStat(oi: datum.stat?.oi ?? previous.stat?.oi,
+                                                oiUSD: datum.stat?.oiUSD ?? previous.stat?.oiUSD,
+                                                sell: datum.stat?.sell ?? previous.stat?.sell,
+                                                buy: datum.stat?.buy ?? previous.stat?.buy)
                     } else if let quote = datum.quote {
                         datum.quote = FilterQuote(turnover: quote.turnover ?? previous.quote?.turnover, spread: quote.spread ?? previous.quote?.spread, timestamp: max(quote.timestamp, previous.quote?.timestamp ?? 0))
                     }
