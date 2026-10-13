@@ -562,7 +562,8 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await wait(view,"document.title === 'Perpetual Swap Radar' && document.querySelector('[data-signal-lane=bullishSetup] [data-signal-instrument=\"MKT003-USDT-SWAP\"]') !== null")
         let restored = try XCTUnwrap(store.selectedSuiteProfile("radar"))
         XCTAssertNotEqual(restored.id,profile.id);XCTAssertEqual(restored.phaseRules,profile.phaseRules)
-        XCTAssertEqual(try store.suiteProfiles("research").count,2)
+        let researchProfiles = try store.suiteProfiles("research")
+        XCTAssertEqual(Set(researchProfiles.map(\.id)), [defaultStrategyID, profile.id, restored.id])
     }
 
     @MainActor
@@ -587,6 +588,8 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await click(view,"Strategy Library")
         try await wait(view,"document.querySelector('[data-suite-workspace=radar] #suite-strategy-name') !== null")
         XCTAssertEqual(bridge.foregroundWorkspace,"radar")
+        try await click(view,"New strategy")
+        try await wait(view,"document.querySelector('#suite-strategy-name')?.value === 'My strategy' && !document.querySelector('#suite-strategy-name')?.disabled")
         try await input(view,"#suite-strategy-name","WK Bullish")
         for (label,metric,comparison,threshold) in [("Universe","Close","Greater than >","0"),("Bullish Setup","Close","At least ≥","100")] {
             try await selectPhase(view,label)
@@ -616,7 +619,8 @@ final class RuleEditorUITests: BackgroundTestCase {
         XCTAssertEqual(focused, true)
         try await click(view,"Duplicate saved strategy")
         try await wait(view,"document.body.innerText.includes('Strategy duplicated in the shared library')")
-        XCTAssertEqual(try Store(url:bridge.directory.appendingPathComponent("radar.sqlite3")).suiteProfiles("research").count, 2)
+        let profiles = try Store(url:bridge.directory.appendingPathComponent("radar.sqlite3")).suiteProfiles("research")
+        XCTAssertEqual(Set(profiles.map(\.name)), ["Default Strategy", "WK Bullish", "WK Bullish copy"])
         try await click(view,"Backtest saved strategy")
         try await wait(view,"document.querySelector('#study-name')?.value === 'WK Bullish Bullish Setup study'")
         let questions = try await js(view,"Array.from(document.querySelectorAll('[aria-label=\"Research question\"] button')).map(b=>b.textContent.trim()).join('|')") as? String

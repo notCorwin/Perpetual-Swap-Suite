@@ -200,7 +200,7 @@ final class Store {
 
     func saveHourlyQuote(_ id: String, hour: Int64, quote: FilterQuote) throws {
         guard quote.timestamp >= hour, quote.timestamp < hour + hourMS else { return }
-        try execute("INSERT INTO hourly_quotes (inst_id,hour,turnover,spread,quote_timestamp) VALUES (?,?,?,?,?) ON CONFLICT(inst_id,hour) DO UPDATE SET turnover=excluded.turnover,spread=excluded.spread,quote_timestamp=excluded.quote_timestamp WHERE excluded.quote_timestamp>hourly_quotes.quote_timestamp", [id, hour, quote.turnover, quote.spread, quote.timestamp])
+        try execute("INSERT INTO hourly_quotes (inst_id,hour,turnover,spread,quote_timestamp) VALUES (?,?,?,?,?) ON CONFLICT(inst_id,hour) DO UPDATE SET turnover=COALESCE(excluded.turnover,hourly_quotes.turnover),spread=COALESCE(excluded.spread,hourly_quotes.spread),quote_timestamp=MAX(excluded.quote_timestamp,hourly_quotes.quote_timestamp) WHERE excluded.quote_timestamp>=hourly_quotes.quote_timestamp", [id, hour, quote.turnover, quote.spread, quote.timestamp])
     }
 
     func hourlyQuotes(_ id: String, since: Int64, through: Int64) throws -> [Int64: FilterQuote] {

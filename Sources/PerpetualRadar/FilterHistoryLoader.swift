@@ -32,9 +32,12 @@ struct FilterHistoryProgress: Sendable {
 // the AppKit main actor. Only confirmed exchange observations are stored.
 actor FilterHistoryLoader {
     private let url: URL
+    private let researchURL: URL
     private let transport: any FilterHistoryTransport
     private let requestDelay: UInt64
     private var store: Store?
+    private var researchStore: ResearchStore?
+    private var researchRanges: [String: (first: Int64, last: Int64, version: Int64)] = [:]
     private var candleCache: [String: [Int64: Candle]] = [:]
     private var statCache: [String: [Int64: FilterStat]] = [:]
     private var quoteCache: [String: [Int64: FilterQuote]] = [:]
@@ -54,11 +57,45 @@ actor FilterHistoryLoader {
     private var completed = 0
     private var updatedMarkets = Set<String>()
     private var lastError = ""
-    init(url: URL, transport: any FilterHistoryTransport = OKXFilterHistoryTransport(), requestDelay: UInt64 = 150_000_000) {
-        self.url = url; self.transport = transport; self.requestDelay = requestDelay
+    init(url: URL, researchURL: URL? = nil, transport: any FilterHistoryTransport = OKXFilterHistoryTransport(), requestDelay: UInt64 = 150_000_000) {
+        self.url = url
+        self.researchURL = researchURL ?? url.deletingLastPathComponent().appendingPathComponent("Research/research.sqlite3")
+        self.transport = transport; self.requestDelay = requestDelay
     }
     private func database() throws -> Store {
         if let store { return store }; let db = try Store(url: url); store = db; return db
+    }
+    private func researchDatabase() throws -> ResearchStore? {
+        guard FileManager.default.fileExists(atPath: researchURL.path) else { return nil }
+        if let researchStore { return researchStore }
+        let db = try ResearchStore(directory: researchURL.deletingLastPathComponent()); researchStore = db; return db
+    }
+    /// Copies current normalized Research heads into Radar's operational cache.
+    /// Frozen manifests remain immutable; this reads only the reusable latest
+    /// rows and lets Radar request solely fields that neither mode has cached.
+    @discardableResult
+    func importResearch(_ id: String, from: Int64, through: Int64) throws -> Int {
+        guard through >= from, let research = try researchDatabase() else { return 0 }
+        let version = try research.database.dataVersion()
+        if let range = researchRanges[id], range.version == version, range.first <= from, range.last >= through { return 0 }
+        let values = try research.data(id, from: from, through: through)
+        guard !values.isEmpty else {
+            researchRanges[id] = (min(from, researchRanges[id]?.first ?? from), max(through, researchRanges[id]?.last ?? through), version)
+            return 0
+        }
+        let db = try database()
+        try db.transaction {
+            for value in values {
+                if let candle = value.candle, candle.confirmed { try db.save(id, candle) }
+                if let stat = value.stat { try db.saveChartStat(id, hour: value.timestamp, oi: stat.oi, sell: stat.sell, buy: stat.buy) }
+                if let quote = value.quote { try db.saveHourlyQuote(id, hour: value.timestamp, quote: quote) }
+            }
+        }
+        researchRanges[id] = (min(from, researchRanges[id]?.first ?? from), max(through, researchRanges[id]?.last ?? through), version)
+        candleCache.removeValue(forKey: id); statCache.removeValue(forKey: id); quoteCache.removeValue(forKey: id)
+        ranges.removeValue(forKey: id); statRanges.removeValue(forKey: id)
+        updatedMarkets.insert(id)
+        return values.count
     }
     func prepare(_ markets: [FilterMarketData], filter: CompiledFilter) throws -> [FilterMarketData] {
         let db = try database()
@@ -71,6 +108,9 @@ actor FilterHistoryLoader {
             try Task.checkCancellation()
             var market = original
             let first = max(0, market.hour - Int64(filter.requiredHours) * hourMS), last = market.hour - hourMS
+            // Research is an optimization source; an unavailable/corrupt
+            // research cache must never block Radar's own durable data or OKX.
+            _ = try? importResearch(market.id, from: first, through: last)
             if ranges[market.id].map({ $0.first <= first && $0.last >= last }) != true {
                 let cached = try db.candles(market.id, since: first, through: last)
                 candleCache[market.id, default: [:]].merge(cached) { _, new in new }
@@ -148,6 +188,7 @@ actor FilterHistoryLoader {
     }
     private func hydrate(_ market: FilterMarketData, hours: Int, stats: Bool) async throws {
         let db = try database(), first = max(0, market.hour - Int64(hours) * hourMS), listing = market.listedAt.map { $0 / hourMS * hourMS } ?? first
+        _ = try? importResearch(market.id, from: first, through: market.hour - hourMS)
         let fetchFirst = max(first, listing, floor(market.id) ?? first)
         // A smaller queued request may have just persisted a page and pruned its
         // memory. Reuse those rows before deciding which page to request next.
@@ -176,10 +217,17 @@ actor FilterHistoryLoader {
                 for path in ["/rubik/stat/contracts/open-interest-history", "/rubik/stat/taker-volume-contract"] {
                     let pageKey = "\(market.id)|\(path)|\(pageStart)|\(pageEnd)"
                     if statPages[pageKey].map({ $0 > Date() }) == true { continue }
+                    let expectedFirst = max(first, listing, pageStart)
+                    let existing = try db.chartStats(market.id, since: expectedFirst, through: pageEnd)
+                    var loaded = Set(existing.compactMap { timestamp, value in
+                        path.contains("open-interest") ? (value.oi == nil ? nil : timestamp) : (value.sell == nil || value.buy == nil ? nil : timestamp)
+                    })
+                    if stride(from: expectedFirst, through: pageEnd, by: Int(hourMS)).allSatisfy({ loaded.contains($0) }) {
+                        statPages[pageKey] = Date().addingTimeInterval(900); continue
+                    }
                     var parameters = ["instId": market.id, "period": "1H", "end": String(pageEnd + hourMS), "limit": "100"]
                     if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "1" }
                     let values = try await fetch(path, parameters)
-                    var loaded = Set<Int64>()
                     for value in values {
                         guard let ts = value.first.flatMap(Int64.init), ts % hourMS == 0, ts >= pageStart, ts <= pageEnd else { continue }
                         if path.contains("open-interest"), value.count >= 4, let oi = Double(value[3]), oi.isFinite, oi >= 0 {
@@ -193,7 +241,6 @@ actor FilterHistoryLoader {
                             loaded.insert(ts)
                         }
                     }
-                    let expectedFirst = max(first, listing, pageStart)
                     if stride(from: expectedFirst, through: pageEnd, by: Int(hourMS)).allSatisfy({ loaded.contains($0) }) {
                         statPages[pageKey] = Date().addingTimeInterval(900)
                     } else { incomplete = true }

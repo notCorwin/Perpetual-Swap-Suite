@@ -219,6 +219,11 @@ final class ResearchTests: XCTestCase {
         do { try await provider.prepare(source, instruments: [ResearchFixture.instrument]); XCTFail("The second page must interrupt preparation.") } catch {}
         let before = await transport.counts()
         XCTAssertEqual(before.0, 2)
+        XCTAssertEqual(try store.count("SELECT COUNT(*) FROM research_heads WHERE kind='candle'"), 300,
+                       "A successful page must become usable even when a later page fails.")
+        XCTAssertNotNil(try store.latest(source.instrument, kind: "candle", timestamp: source.through))
+        XCTAssertEqual(try store.missingConfirmedCandles(source.instrument, from: source.from, through: source.through),
+                       [.init(from: source.from, through: source.from + 399 * hourMS)])
         await transport.setFailure(nil)
         try await provider.prepare(source, instruments: [ResearchFixture.instrument])
         let after = await transport.counts(), urls = await transport.urls()

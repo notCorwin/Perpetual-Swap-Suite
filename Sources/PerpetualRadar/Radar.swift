@@ -921,6 +921,7 @@ final class Radar {
 
     func loadChart(_ id: String) async -> [String: Any] {
         guard rows[id] != nil else { return ["bars": [], "error": "Unknown contract", "revision": -1] }
+        _ = try? await historyLoader.importResearch(id, from: max(0, hour - Int64(max(candleLookback, emaWarmupHours(200))) * hourMS), through: hour - hourMS)
         // Each child publishes immediately; a slow source cannot withhold an
         // already-completed update from snapshot polling or strategy readings.
         async let candles = refreshChartSource(id, path: "/market/candles")
@@ -940,6 +941,7 @@ final class Radar {
         var candleLoadFailed = false
         let warmupStart = max(0, requestedEnd - Int64(candleLookback - 1 + emaWarmupHours(200)) * hourMS)
         do {
+            _ = try? await historyLoader.importResearch(id, from: warmupStart, through: requestedEnd)
             var cached = try store.candles(id, since: warmupStart, through: requestedEnd)
             for (ts, bar) in candles[id] ?? [:] where ts >= warmupStart && ts <= requestedEnd { cached[ts] = bar }
             var cursor: Int64?
@@ -970,8 +972,16 @@ final class Radar {
                 if loadedStatPages[key].map({ $0.duration(to: .now) < .seconds(900) }) == true { continue }
                 let pageEnd = pageStart + Int64(chartHours - 1) * hourMS
                 do {
+                    let firstExpected = max(0, pageStart, (rows[id]?.listedAt ?? 0) / hourMS * hourMS)
+                    let lastExpected = min(pageEnd, hour - hourMS)
+                    let existing = try store.chartStats(id, since: firstExpected, through: lastExpected)
+                    var loaded = Set(existing.compactMap { timestamp, value in
+                        path.contains("open-interest") ? (value.oi == nil ? nil : timestamp) : (value.sell == nil || value.buy == nil ? nil : timestamp)
+                    })
+                    if firstExpected > lastExpected || stride(from: firstExpected, through: lastExpected, by: Int(hourMS)).allSatisfy({ loaded.contains($0) }) {
+                        loadedStatPages[key] = .now; continue
+                    }
                     let values = try await get(path, ["instId": id, "period": "1H", "end": String(pageEnd + hourMS), "limit": "100"])
-                    var loaded = Set<Int64>()
                     for case let row as [String] in values {
                         guard let stamp = row.first.flatMap(Int64.init), stamp >= pageStart, stamp <= pageEnd, stamp < hour else { continue }
                         if path.contains("open-interest"), row.count >= 4, let oi = Double(row[3]), oi.isFinite, oi >= 0 {
@@ -985,8 +995,6 @@ final class Radar {
                         }
                     }
                     if !loaded.isEmpty { invalidateSnapshot(id); touch(id) }
-                    let firstExpected = max(0, pageStart, (rows[id]?.listedAt ?? 0) / hourMS * hourMS)
-                    let lastExpected = min(pageEnd, hour - hourMS)
                     if firstExpected > lastExpected || stride(from: firstExpected, through: lastExpected, by: Int(hourMS)).allSatisfy({ loaded.contains($0) }) {
                         loadedStatPages[key] = .now
                     } else { failures.append(path.contains("open-interest") ? "OI coverage" : "taker volume coverage") }

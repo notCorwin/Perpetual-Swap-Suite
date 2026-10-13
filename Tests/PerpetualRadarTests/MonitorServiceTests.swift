@@ -136,7 +136,10 @@ final class MonitorServiceTests: BackgroundTestCase {
             try FileManager.default.removeItem(at: url)
             try FileManager.default.moveItem(at: url.appendingPathExtension("parked"), to: url)
         }
-        try await wait { ((try await request(["suite": ["mode": "radar", "action": "inventory"]], interface: true))["profiles"] as? [[String: Any]])?.first?["universeJSON"] as? String == config }
+        try await wait {
+            let profiles = (try await request(["suite": ["mode": "radar", "action": "inventory"]], interface: true))["profiles"] as? [[String: Any]]
+            return profiles?.contains { $0["universeJSON"] as? String == config } == true
+        }
         try await wait { (try await request(["research": ["action": "inventory"]], interface: true))["studies"] != nil }
         let restored = try await request(["monitor": [:]], interface: true)
         XCTAssertEqual(restored["frostedBackgroundOpacity"] as? Double, 0.55)
@@ -227,7 +230,9 @@ final class MonitorServiceTests: BackgroundTestCase {
         XCTAssertEqual(try Store(url: directory.appendingPathComponent("radar.sqlite3")).suiteProfiles("radar").first?.universeJSON, phaseProfile.universeJSON)
         XCTAssertNotNil(savedSuite["saved"])
         let copiedSuite=try await request(["suite":["mode":"research","action":"copy","profile":rawProfile]],interface:true)
-        XCTAssertEqual((copiedSuite["profiles"] as? [[String:Any]])?.count,2)
+        let copiedProfiles = try XCTUnwrap(copiedSuite["profiles"] as? [[String:Any]])
+        XCTAssertEqual(copiedProfiles.count,3)
+        XCTAssertTrue(copiedProfiles.contains { $0["id"] as? String == defaultStrategyID })
         XCTAssertNotEqual((copiedSuite["saved"] as? [String:Any])?["id"] as? String,phaseProfile.id)
         let researchWindow = try await request(["workspace": "research"], interface: true)
         XCTAssertEqual(researchWindow["windowTitle"] as? String,"Perpetual Swap Research")
@@ -260,8 +265,10 @@ final class MonitorServiceTests: BackgroundTestCase {
         let reopenedInfo = try await request(["serviceInfo": true]); helperPID = try XCTUnwrap(reopenedInfo["pid"] as? Int32)
         helperPIDs.append(helperPID!)
         let restoredSuite = try await request(["suite": ["mode": "radar", "action": "inventory"]])
-        XCTAssertEqual((restoredSuite["profiles"] as? [[String: Any]])?.count, 2)
-        XCTAssertEqual((restoredSuite["profiles"] as? [[String: Any]])?.first?["phaseRules"] as? [String: String], phaseProfile.phaseRules)
+        let restoredProfiles = try XCTUnwrap(restoredSuite["profiles"] as? [[String: Any]])
+        XCTAssertEqual(restoredProfiles.count, 3)
+        let restoredProfile = restoredProfiles.first { ($0["name"] as? String)?.hasPrefix("Packaged suite") == true }
+        XCTAssertEqual(restoredProfile?["phaseRules"] as? [String: String], phaseProfile.phaseRules)
         try await Task.sleep(for: .milliseconds(300))
         XCTAssertEqual(try researchJSON(store.get("checkpoint:\(studyID)", as: Checkpoint.self)), checkpoint, "Reopening must not resume research automatically.")
         _ = try await request(["workspace": "research", "research": ["action": "resume", "studyID": studyID]], interface: true)

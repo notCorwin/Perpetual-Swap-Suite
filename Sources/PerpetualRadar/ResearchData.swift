@@ -610,8 +610,10 @@ final class ResearchDataProvider {
         return try store.missingConfirmedCandles(source.instrument, from: from, through: through)
     }
     private func fetchREST(_ source: ResearchSource, file: URL, isolation: isolated (any Actor)? = #isolation, progress: @escaping @Sendable (ResearchPreparationProgress) async -> Void) async throws {
-        // Each fetched page is fixed immediately. A restart reuses all completed
-        // pages rather than refetching a partially prepared multi-year range.
+        // Each fetched page is fixed and normalized immediately. A restart or a
+        // different overlapping study can use every completed page instead of
+        // waiting for the entire multi-year source to finish first.
+        try store.put(source.id, kind: "source", source)
         var cursor = source.through + hourMS, pages: [ResearchRawPage] = []
         var received: Int64 = 0
         while cursor > source.from {
@@ -622,25 +624,23 @@ final class ResearchDataProvider {
             components.queryItems = components.queryItems?.map { $0.name == key ? URLQueryItem(name: key, value: String(cursor)) : $0 }
             let url = components.url!, pageID = "page:" + researchHash(url.absoluteString + (source.refresh ? source.id : ""))
             let page = store.directory.appendingPathComponent("Raw/\(researchHash(pageID)).page")
-            let data: Data
-            if FileManager.default.fileExists(atPath: page.path) { data = try Data(contentsOf: page) }
+            let data: Data, values: [Any]
+            if FileManager.default.fileExists(atPath: page.path) {
+                data = try Data(contentsOf: page); values = try rows(data)
+            }
             else {
                 let received = received, count = pages.count
                 let fraction = min(1, Double(source.through + hourMS - cursor) / Double(max(hourMS, source.through + hourMS - source.from)))
                 data = try await transport.get(url, onRetry: { delay in
                     await progress(.init(stage: "fetching", filename: source.filename, instrument: source.instrument, receivedBytes: received, pages: count, fraction: fraction, retryAt: researchNow() + Int64(delay * 1_000)))
                 })
-                _ = try rows(data); try data.write(to: page, options: .atomic)
+                values = try rows(data); try data.write(to: page, options: .atomic)
             }
             let record = ResearchRawPage(path: page.path, digest: researchHash(data), sourceID: source.id)
             pages.append(record)
             received += Int64(data.count)
             try store.put("raw-page:\(source.id):\(researchHash(pageID))", kind: "rawPage", record)
-            let values = try rows(data)
-            let timestamps = values.compactMap { row -> Int64? in
-                if let row = row as? [String] { return row.first.flatMap(Int64.init) }
-                return (row as? [String: Any])?["fundingTime"].flatMap { ($0 as? String).flatMap(Int64.init) }
-            }
+            let timestamps = try parseRESTPage(source, values: values)
             guard let oldest = timestamps.min(), oldest < cursor else { break }
             cursor = oldest
             if oldest <= source.from { break }
@@ -653,23 +653,30 @@ final class ResearchDataProvider {
         let pages = try JSONDecoder().decode([ResearchRawPage].self, from: Data(contentsOf: file))
         for page in pages {
             try Task.checkCancellation()
-            var batch: [ResearchDatum] = []
             let data = try Data(contentsOf: URL(fileURLWithPath: page.path))
             guard researchHash(data) == page.digest else { throw FilterError("A cached REST page failed its SHA-256 check. Refresh the data plan to replace it.") }
-            for item in try rows(data) {
-                if source.kind == "funding" {
-                    guard let value = item as? [String: Any], let ts = (value["fundingTime"] as? String).flatMap(Int64.init) else { throw FilterError("Funding history contains an invalid settlement timestamp. Its raw response was retained.") }
-                    guard ts >= source.from, ts <= source.through + hourMS else { continue }
-                    let rate = (value["realizedRate"] as? String).flatMap(Double.init).flatMap { $0.isFinite ? $0 : nil }
-                    batch.append(.init(instrument: source.instrument, kind: "funding", timestamp: ts, rate: rate, sources: [source.id])); continue
-                }
-                guard let value = item as? [String], let ts = value.first.flatMap(Int64.init), ts >= source.from, ts <= source.through else { continue }
-                if source.kind == "candle", let candle = Candle(value), candle.confirmed { batch.append(.init(instrument: source.instrument, kind: "candle", timestamp: ts, candle: candle, sources: [source.id])) }
-                if source.kind == "mark", value.count >= 6, value[5] == "1", let mark = Double(value[1]), mark.isFinite, mark > 0 { batch.append(.init(instrument: source.instrument, kind: "mark", timestamp: ts, mark: mark, sources: [source.id])) }
-                if source.kind == "oi", value.count >= 4, let oi = Double(value[3]), oi.isFinite, oi >= 0 { batch.append(.init(instrument: source.instrument, kind: "stat", timestamp: ts, stat: FilterStat(oi: oi, sell: nil, buy: nil), sources: [source.id])) }
-                if source.kind == "taker", value.count >= 3, let sell = Double(value[1]), let buy = Double(value[2]), sell.isFinite, buy.isFinite, sell >= 0, buy >= 0 { batch.append(.init(instrument: source.instrument, kind: "stat", timestamp: ts, stat: FilterStat(oi: nil, sell: sell, buy: buy), sources: [source.id])) }
-            }
-            try store.write(batch)
+            _ = try parseRESTPage(source, values: try rows(data))
         }
+    }
+    private func parseRESTPage(_ source: ResearchSource, values: [Any]) throws -> [Int64] {
+        var batch: [ResearchDatum] = [], timestamps: [Int64] = []
+        for item in values {
+            if source.kind == "funding" {
+                guard let value = item as? [String: Any], let ts = (value["fundingTime"] as? String).flatMap(Int64.init) else { throw FilterError("Funding history contains an invalid settlement timestamp. Its raw response was retained.") }
+                timestamps.append(ts)
+                guard ts >= source.from, ts <= source.through + hourMS else { continue }
+                let rate = (value["realizedRate"] as? String).flatMap(Double.init).flatMap { $0.isFinite ? $0 : nil }
+                batch.append(.init(instrument: source.instrument, kind: "funding", timestamp: ts, rate: rate, sources: [source.id])); continue
+            }
+            guard let value = item as? [String], let ts = value.first.flatMap(Int64.init) else { continue }
+            timestamps.append(ts)
+            guard ts >= source.from, ts <= source.through else { continue }
+            if source.kind == "candle", let candle = Candle(value), candle.confirmed { batch.append(.init(instrument: source.instrument, kind: "candle", timestamp: ts, candle: candle, sources: [source.id])) }
+            if source.kind == "mark", value.count >= 6, value[5] == "1", let mark = Double(value[1]), mark.isFinite, mark > 0 { batch.append(.init(instrument: source.instrument, kind: "mark", timestamp: ts, mark: mark, sources: [source.id])) }
+            if source.kind == "oi", value.count >= 4, let oi = Double(value[3]), oi.isFinite, oi >= 0 { batch.append(.init(instrument: source.instrument, kind: "stat", timestamp: ts, stat: FilterStat(oi: oi, sell: nil, buy: nil), sources: [source.id])) }
+            if source.kind == "taker", value.count >= 3, let sell = Double(value[1]), let buy = Double(value[2]), sell.isFinite, buy.isFinite, sell >= 0, buy >= 0 { batch.append(.init(instrument: source.instrument, kind: "stat", timestamp: ts, stat: FilterStat(oi: nil, sell: sell, buy: buy), sources: [source.id])) }
+        }
+        if !batch.isEmpty { try store.write(batch) }
+        return timestamps
     }
 }

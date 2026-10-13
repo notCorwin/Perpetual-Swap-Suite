@@ -285,8 +285,12 @@ extension Store {
         }
         let existingSelection = try preference(forKey: "suiteSelected")
         let migratedSelection = try preference(forKey: "suiteSelected.radar")
+        // Opening an already normalized library must remain read-only. Radar can
+        // launch while the collector or Research owns the SQLite writer lock.
+        let normalized = try researchJSON(profiles)
+        if shared == normalized, existingSelection != nil { return }
         try transaction {
-            try setPreference(try researchJSON(profiles), forKey: "suiteProfiles")
+            try setPreference(normalized, forKey: "suiteProfiles")
             try setPreference(existingSelection ?? migratedSelection ?? defaultStrategyID, forKey: "suiteSelected")
         }
     }
