@@ -82,12 +82,28 @@ struct MarketSnapshotRow: @unchecked Sendable {
 }
 
 actor MarketSnapshotWorker {
-    func calculate(_ inputs: [MarketSnapshotInput], rocPeriod: Int, marocPeriod: Int) throws -> [String: MarketSnapshotRow] {
-        var rows: [String: MarketSnapshotRow] = [:]
-        for input in inputs {
-            try Task.checkCancellation()
-            rows[input.id] = input.calculate(rocPeriod: rocPeriod, marocPeriod: marocPeriod)
+    func calculate(_ inputs: [MarketSnapshotInput], rocPeriod: Int, marocPeriod: Int) async throws -> [String: MarketSnapshotRow] {
+        guard !inputs.isEmpty else { return [:] }
+        return try await withThrowingTaskGroup(of: (String, MarketSnapshotRow).self) { group in
+            // Leave cores for WebKit and cancellation delivery; snapshot work
+            // otherwise completes a large obsolete generation before its
+            // cancellation can be observed under a saturated process pool.
+            let limit = max(1, min(inputs.count, max(2, ProcessInfo.processInfo.activeProcessorCount / 2)))
+            var next = 0
+            for _ in 0..<limit {
+                let input = inputs[next]; next += 1
+                group.addTask { try Task.checkCancellation(); return (input.id, input.calculate(rocPeriod: rocPeriod, marocPeriod: marocPeriod)) }
+            }
+            var rows: [String: MarketSnapshotRow] = [:]
+            rows.reserveCapacity(inputs.count)
+            while let (id, row) = try await group.next() {
+                rows[id] = row
+                if next < inputs.count {
+                    let input = inputs[next]; next += 1
+                    group.addTask { try Task.checkCancellation(); return (input.id, input.calculate(rocPeriod: rocPeriod, marocPeriod: marocPeriod)) }
+                }
+            }
+            return rows
         }
-        return rows
     }
 }

@@ -1,7 +1,5 @@
-import { Fragment, memo, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react"
+import { Fragment, Suspense, lazy, memo, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { ArrowDown, ArrowDownUp, ArrowUp, Radio, Search, ScanSearch, Settings2 } from "lucide-react"
-import katex from "katex"
-import "katex/dist/katex.min.css"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty"
@@ -10,7 +8,7 @@ import { Popover, PopoverContent, PopoverDescription, PopoverHeader, PopoverTitl
 import { Toggle } from "@/components/ui/toggle"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { SuiteWorkspace } from "@/SuiteWorkspace"
+import { Spinner } from "@/components/ui/spinner"
 import { RadarSignalBoard } from "@/RadarSignalBoard"
 import { radarSignals, signalMatches, type SignalTiming } from "@/radar-signals"
 import { ModeTitle } from "@/ModeTitle"
@@ -18,7 +16,6 @@ import { modeTitle, suiteSpec } from "@/suite-types"
 import { useSuite } from "@/use-suite"
 import { SuitePhaseBadges } from "@/SuitePhaseBadges"
 import type { StrategyProfile, SuiteReading, SuiteRequest, SuiteResponse } from "@/suite-types"
-import { Research } from "@/Research"
 import type { ResearchInputs, ResearchRequest, ResearchResponse, StudySpec } from "@/research-types"
 import { Input } from "@/components/ui/input"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
@@ -44,6 +41,9 @@ import type { AnalysisSettings, AnalysisSettingsRequest } from '@/chart-analysis
 import type { ChartCaptureBounds, ChartImage } from '@/chart-capture'
 import { BlurControls } from '@/BlurSettings'
 import { initialBlurSettings, useBlurSettings, withSettingsDeadline, type BlurSettings } from '@/blur-settings'
+
+const SuiteWorkspace = lazy(() => import('@/SuiteWorkspace').then(module => ({ default: module.SuiteWorkspace })))
+const Research = lazy(() => import('@/Research').then(module => ({ default: module.Research })))
 
 type WindowAppearance = BlurSettings & { frostedBackgroundEnabled: boolean; frostedBackgroundOpacity: number }
 type NotificationSettings = { backgroundMonitoringEnabled: boolean; notificationsEnabled: boolean; notificationAuthorization: "notDetermined" | "denied" | "authorized" | "quiet" | "unavailable"; notificationError: string; backgroundMonitoringError: string; monitoringPaused: boolean; launchAtLogin: "enabled" | "disabled" | "requiresApproval" | "unavailable"; launchAtLoginError: string }
@@ -87,10 +87,13 @@ const directionClass = (value: PercentageValue) => {
 }
 const rsiClass = (value: number | null) => value === null ? "text-muted-foreground" : value > 70 ? "text-positive" : value < 30 ? "text-destructive" : ""
 const RSI_PERIODS = [6, 12, 24] as const
-const mathCache = new Map<string, string>()
 const math = (formula: string) => {
-  if (!mathCache.has(formula)) mathCache.set(formula, katex.renderToString(formula))
-  return <span className="text-xs font-medium text-foreground" dangerouslySetInnerHTML={{ __html: mathCache.get(formula)! }} />
+  const plain = formula
+    .replace(/\\mathrm\{([^}]+)\}/g, '$1')
+    .replace(/\\frac\{([^}]+)\}\{([^}]+)\}/g, '($1) / ($2)')
+    .replace(/_\{([^}]+)\}/g, '$1').replace(/\\times/g, '×').replace(/\\%/g, '%')
+    .replace(/[{}]/g, '')
+  return <span className="text-xs font-medium text-foreground" aria-hidden="true">{plain}</span>
 }
 
 function BreakReadings({ result, direction }: { result: BreakResult; direction: BreakDirection }) {
@@ -649,17 +652,23 @@ function App() {
     const switched = previousMode.current !== mode
     previousMode.current = mode
     document.title = modeTitle(mode)
-    const frame = window.requestAnimationFrame(() => {
+    let frame = 0, attempts = 0
+    const restore = () => {
       window.scrollTo({ top: scrollPositions.current[workspace] ?? 0, behavior: 'instant' })
-      if (switched) Array.from(document.querySelectorAll<HTMLButtonElement>('[data-mode-switch]')).find(button => button.getBoundingClientRect().height > 0)?.focus({ preventScroll: true })
-    })
+      if (switched) {
+        const button = Array.from(document.querySelectorAll<HTMLButtonElement>('[data-mode-switch]')).find(candidate => candidate.getBoundingClientRect().height > 0)
+        if (button) button.focus({ preventScroll: true })
+        else if (++attempts < 60) { frame = window.requestAnimationFrame(restore); return }
+      }
+    }
+    frame = window.requestAnimationFrame(restore)
     return () => window.cancelAnimationFrame(frame)
   },[workspace])
   return <Fragment>
     {workspaceError && <p role="alert" className="p-3 text-destructive">{workspaceError}</p>}
     <div hidden={workspace !== "radar"}><RadarApp active={workspace === "radar"} switchingMode={switchingMode} onResearch={(value, spec) => void changeWorkspace("research",value,spec)} onDecisions={(value, tab = 'rules') => { setDecisionsTab(tab); setDecisionsRoute(current => current + 1); void changeWorkspace("decisions", value) }} /></div>
-    {inputs && decisionsMounted && <div hidden={workspace !== "decisions"}><SuiteWorkspace mode="radar" active={workspace === "decisions"} inputs={inputs} initialTab={decisionsTab} routeKey={decisionsRoute} switchingMode={switchingMode} onSwitchMode={() => void changeWorkspace("research")} onBack={() => void changeWorkspace("radar")} onResearch={spec => void changeWorkspace("research",undefined,spec)} /></div>}
-    {inputs && researchMounted && <div hidden={workspace !== "research"}><Research key={researchSeed} active={workspace === "research"} switchingMode={switchingMode} inputs={inputs} initialSpec={researchSpec} onRadar={() => void changeWorkspace("radar")} onSwitchMode={() => void changeWorkspace(researchReturn)} /></div>}
+    {inputs && decisionsMounted && <div hidden={workspace !== "decisions"}><Suspense fallback={<Spinner className="m-6" />}><SuiteWorkspace mode="radar" active={workspace === "decisions"} inputs={inputs} initialTab={decisionsTab} routeKey={decisionsRoute} switchingMode={switchingMode} onSwitchMode={() => void changeWorkspace("research")} onBack={() => void changeWorkspace("radar")} onResearch={spec => void changeWorkspace("research",undefined,spec)} /></Suspense></div>}
+    {inputs && researchMounted && <div hidden={workspace !== "research"}><Suspense fallback={<Spinner className="m-6" />}><Research key={researchSeed} active={workspace === "research"} switchingMode={switchingMode} inputs={inputs} initialSpec={researchSpec} onRadar={() => void changeWorkspace("radar")} onSwitchMode={() => void changeWorkspace(researchReturn)} /></Suspense></div>}
   </Fragment>
 }
 

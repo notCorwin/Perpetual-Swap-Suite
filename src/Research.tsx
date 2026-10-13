@@ -224,9 +224,16 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
     }
   }
   const coverage = manifest?.coverage ?? plan?.coverage ?? []
-  const selectedRows = report?.summaries.filter(s => s.hours === Number(horizon)) ?? []
-  const resultRows = selectedRows.filter(s => !s.group.startsWith('Score ·'))
-  const scoreRows = selectedRows.filter(s => s.group.startsWith('Score · ' + scoreView + ' ·') && (scoreView === 'Thresholds' ? true : !s.group.includes('≥')))
+  const { resultRows, scoreRows, thresholdRows } = useMemo(() => {
+    const resultRows: ResearchSummary[] = [], scoreRows: ResearchSummary[] = [], thresholdRows: ResearchSummary[] = []
+    for (const summary of report?.summaries ?? []) {
+      if (summary.hours !== Number(horizon)) continue
+      if (!summary.group.startsWith('Score ·')) resultRows.push(summary)
+      else if (summary.group.startsWith('Score · ' + scoreView + ' ·') && (scoreView === 'Thresholds' || !summary.group.includes('≥'))) scoreRows.push(summary)
+      if (summary.group.startsWith('Score · Full · ≥')) thresholdRows.push(summary)
+    }
+    return { resultRows, scoreRows, thresholdRows }
+  }, [report?.summaries, horizon, scoreView])
   const context = { metrics: inputs.metrics, expressions: {}, units: {}, templates: inputs.templates }
   const radarSpec = tab === 'configure'
     ? selectedProfiles.length ? suiteSpec(selectedProfiles.slice(0, 1)) : null
@@ -318,7 +325,7 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
           {report.warnings.filter(warning => warning.startsWith("Hourly approximation of live BTC rules")).map(warning => <Alert key={warning} variant="warning"><AlertDescription>{warning}</AlertDescription></Alert>)}
           {report.spec.excludedSpreadConditions && <p className="text-xs text-muted-foreground">Bid/ask spread data and spread-dependent conditions were excluded from this study. Net returns include configured fees and slippage.</p>}
           <ExcludedSpreadConditions spec={report.spec} />
-          <SummaryTable report={report} rows={view === 'results' ? resultRows : scoreView === 'Thresholds' ? selectedRows.filter(s => s.group.startsWith('Score · Full · ≥')) : scoreRows} />
+          <SummaryTable report={report} rows={view === 'results' ? resultRows : scoreView === 'Thresholds' ? thresholdRows : scoreRows} />
           <p className="text-xs text-muted-foreground">Returns use 1 USDT initial notional and next-hour opens. Unknown, uncertain entry and purged boundary samples are excluded from main statistics. Net N includes only complete funding and settlement marks. Confidence intervals require 30 samples and 8 UTC weeks.</p>
           <h3 className="font-semibold">Signal events</h3>
           <Table aria-label="Signal events"><TableHeader><TableRow>{['Instrument', 'Signal close', 'Rules', 'Direction', 'Entry', 'Score inputs', 'Status', 'Split', 'Gross', 'Net', 'Inspect'].map(label => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader><TableBody>{events.map(e => {
