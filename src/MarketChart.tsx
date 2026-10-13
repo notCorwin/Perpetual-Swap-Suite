@@ -107,7 +107,7 @@ const PriceCountdown = memo(function PriceCountdown({ hour, x, y, fontSize }: { 
   }, [])
   const seconds = Math.max(0, Math.floor((hour + 3_600_000 - now) / 1000))
   const value = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`
-  return <text x={x} y={y} textAnchor="middle" dominantBaseline="middle" fill="var(--foreground)" fontSize={fontSize}>{value}</text>
+  return <text x={x} y={y} textAnchor="middle" dominantBaseline="middle" fill="var(--chart-price-tag-foreground)" fontSize={fontSize}>{value}</text>
 })
 export const chartGutter = (bars: Bar[], height: number, liveClose = bars[bars.length - 1].close) => {
   const { panels } = chartLayout(0, height)
@@ -141,7 +141,7 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
   const firstHour = endHour - 95 * 3_600_000
   const firstAtLeft = bars[0].hour === firstHour
   const candleHigh = Math.max(...bars.map(bar => bar.high)), candleLow = Math.min(...bars.map(bar => bar.low))
-  const { gutter, scale: tagScale, boxWidth: tagBoxWidth } = chartGutter(bars, height, liveBar.close)
+  const { gutter, scale: tagScale, offset: tagOffset, boxWidth: tagBoxWidth } = chartGutter(bars, height, liveBar.close)
   const { panels, columns, axisStarts, headerY, left, right } = chartLayout(width, height, gutter)
   const x = (index: number, panel: Panel) => chartHourX(bars[index].hour, latestHour, ...columns[panel])
   const barWidth = chartCandleWidth(right - left)
@@ -306,7 +306,8 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
       const tickY = priceY(tick)
       return <g key={tick}><line x1={columns.price[0]} x2={right} y1={tickY} y2={tickY} stroke="var(--border)" strokeOpacity="0.35" />{(tickY + tickHalfHeight < priceTagY || tickY - tickHalfHeight > priceTagY + scaledTagHeight) && lineLabel(axisStarts.price, tickY, axisPrice.format(tick))}</g>
     })}
-    {tag.inViewport && <line x1={columns.price[0]} x2={right} y1={latestY} y2={latestY} stroke={latestColor} opacity="0.5" />}
+    <line x1={right} x2={right} y1={panels.price[0]} y2={panels.taker[1]} stroke="var(--border)" strokeWidth="1" opacity="0.8" />
+    {tag.inViewport && <line x1={columns.price[0]} x2={right + tagOffset * tagScale} y1={latestY} y2={latestY} stroke={latestColor} strokeWidth="1.2" strokeDasharray="4 5" />}
     <path d={upWicks.join(" ")} fill="none" stroke="var(--positive)" strokeWidth="1.2" />
     <path d={downWicks.join(" ")} fill="none" stroke="var(--destructive)" strokeWidth="1.2" />
     <path d={upBodies.join(" ")} fill="var(--positive)" />
@@ -347,9 +348,9 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
       </g>
     })}
     <g data-surface="inherited" transform={`translate(${tagX},${priceTagY}) scale(${tagScale})`}>
-      <rect x={tagStrokeWidth / 2} width={tagBoxWidth} height={tagHeight} fill="var(--chart-price-tag-background)" stroke={latestColor} strokeWidth="var(--chart-price-tag-stroke-width)" />
-      <text x={(tagBoxWidth + tagStrokeWidth) / 2} y={tagPaddingY + tagLineHeight / 2} textAnchor="middle" dominantBaseline="middle" fill="var(--foreground)" fontSize={tagFontSize}>{latestPrice}</text>
-      {showCountdown && <PriceCountdown hour={liveBar.hour} x={(tagBoxWidth + tagStrokeWidth) / 2} y={tagPaddingY + tagLineHeight * 1.5 + tagRowGap} fontSize={tagFontSize} />}
+      <rect x={tagOffset + tagStrokeWidth / 2} width={tagBoxWidth} height={tagHeight} rx="4" fill={latestColor} stroke={latestColor} strokeWidth="var(--chart-price-tag-stroke-width)" />
+      <text x={tagOffset + (tagBoxWidth + tagStrokeWidth) / 2} y={tagPaddingY + tagLineHeight / 2} textAnchor="middle" dominantBaseline="middle" fill="var(--chart-price-tag-foreground)" fontSize={tagFontSize}>{latestPrice}</text>
+      {showCountdown && <PriceCountdown hour={liveBar.hour} x={tagOffset + (tagBoxWidth + tagStrokeWidth) / 2} y={tagPaddingY + tagLineHeight * 1.5 + tagRowGap} fontSize={tagFontSize} />}
     </g>
     {legend("price", [["VWAP14", price(active.vwap), "var(--chart-2)"], ["EMA200", price(active.ema), "var(--chart-3)"], ["Log BB(20)", `U ${price(active.logBBUpper)}\u00a0·\u00a0M ${price(active.logBBMiddle)}\u00a0·\u00a0L ${price(active.logBBLower)}`, "var(--chart-1)"]])}
     {legend("roc", [["ROC(9)", formatPercent(active.roc), "var(--chart-1)"], ["MAROC(9)", formatPercent(active.maroc), "var(--chart-2)"]])}

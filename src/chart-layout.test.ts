@@ -30,20 +30,24 @@ test("chart hours retain their position when candles are missing", () => {
   assert.equal(chartHourX(10 * hour, 95 * hour, 0, 960), first + (last - first) * 10 / 95)
 })
 
-test("price tag fills the axis gutter without clipping or shrinking below axis text", () => {
+test("price tag rests inside the axis gutter without clipping or shrinking below axis text", () => {
   const stroke = 1.5, intrinsicWidth = 90, minimumScale = 10 / 12
+  const closeTo = (actual: number, expected: number) => assert.ok(Math.abs(actual - expected) < 1e-9)
   const narrow = fitAxisPriceTag(42, intrinsicWidth, stroke, minimumScale)
   assert.ok(narrow.scale >= minimumScale)
-  assert.ok(narrow.gutter < intrinsicWidth + stroke)
-  assert.equal((narrow.boxWidth + stroke) * narrow.scale, narrow.gutter)
+  assert.ok(narrow.gutter < intrinsicWidth + stroke + 6)
+  closeTo(narrow.offset * narrow.scale, 2)
+  closeTo((narrow.boxWidth + stroke) * narrow.scale, narrow.gutter - 6)
 
   const medium = fitAxisPriceTag(85, intrinsicWidth, stroke, minimumScale)
   assert.equal(medium.gutter, 85)
   assert.ok(medium.scale > narrow.scale && medium.scale < 1)
-  assert.equal((medium.boxWidth + stroke) * medium.scale, medium.gutter)
+  closeTo(medium.offset * medium.scale, 2)
+  closeTo((medium.boxWidth + stroke) * medium.scale, medium.gutter - 6)
 
   const wide = fitAxisPriceTag(120, intrinsicWidth, stroke, minimumScale)
   assert.equal(wide.gutter, 120)
   assert.equal(wide.scale, 1)
-  assert.equal(wide.boxWidth + stroke, wide.gutter)
+  assert.equal(wide.offset, 2)
+  assert.equal(wide.boxWidth + stroke, wide.gutter - 6)
 })
