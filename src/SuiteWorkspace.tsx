@@ -1,19 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { ArrowLeft, Copy, Save, Trash2 } from 'lucide-react'
+import { ArrowLeft, ChevronRight, CircleAlert, Copy, FlaskConical, Plus, Power, RotateCcw, Save, Trash2 } from 'lucide-react'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
-import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field'
+import { Field, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
-import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Spinner } from '@/components/ui/spinner'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { SuitePhaseExplanation } from '@/SuitePhaseExplanation'
-import { StrategyPhaseEditor } from '@/StrategyPhaseEditor'
+import { StrategyPhaseEditor, type StageStatus } from '@/StrategyPhaseEditor'
 import { useStrategyFilter } from '@/use-strategy-filter'
 import { useSuite } from '@/use-suite'
 import { MarketListViewport } from '@/MarketListViewport'
@@ -107,6 +106,23 @@ export function SuiteWorkspace({ mode, inputs, active, initialTab = 'rules', rou
     // Consume the native route after inventory hydration; preserve any current draft warning.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[mode,active,hydrated,snapshot.profiles])
+  // Pipeline overview: each stage reports its latest preview so both stay visible while one is edited.
+  const [stageStatus, setStageStatus] = useState<Record<string, StageStatus>>({})
+  const reportStatus = useCallback((key: string, next: StageStatus) => setStageStatus(current => {
+    const old = current[key]
+    return old && old.matches === next.matches && old.total === next.total && old.unknown === next.unknown ? current : { ...current, [key]: next }
+  }), [])
+  const invalidStage = models.findIndex(m => !m.compiling && !m.valid) >= 0 ? (i => i === 0 ? { label: 'Universe' } : SUITE_PHASES[i - 1])(models.findIndex(m => !m.compiling && !m.valid)) : null
+  const stages = [{ key: 'universe', label: 'Universe', description: 'Which contracts are eligible. Bullish Setup only evaluates contracts that pass the Universe.' }, ...SUITE_PHASES]
+  // ⌘S saves the whole strategy from anywhere in the workspace.
+  const saveShortcut = useRef(save)
+  useEffect(() => { saveShortcut.current = save })
+  useEffect(() => {
+    if (!active || !hydrated) return
+    const key = (event: KeyboardEvent) => { if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === 's') { event.preventDefault(); void saveShortcut.current() } }
+    window.addEventListener('keydown', key)
+    return () => window.removeEventListener('keydown', key)
+  }, [active, hydrated])
   if (!hydrated) return <MarketListViewport><main className="flex min-h-[inherit] flex-col gap-4 p-4 tabular-nums" data-suite-workspace={mode}><header className="flex items-center gap-3 border-b pb-3"><Button variant="ghost" onClick={onBack}><ArrowLeft data-icon="inline-start" aria-hidden="true" />{mode === 'radar' ? 'Radar' : 'Research'}</Button><ModeTitle mode={mode} pending={switchingMode} onSwitch={onSwitchMode} /></header>{suite.error ? <Alert variant="destructive"><AlertDescription>{suite.error}</AlertDescription></Alert> : <p role="status" className="flex items-center gap-2 text-sm"><Spinner aria-hidden="true" />Loading saved strategies and drafts…</p>}</main></MarketListViewport>
   if (active && chart) return <MarketChart instId={chart} listOrder={readings.map(r => r.instrument)} turnoverOrder={readings.map(r => r.instrument)} onSelect={setChart} onBack={() => setChart(null)} />
   return <MarketListViewport><main className="flex min-h-[inherit] flex-col gap-4 p-4 tabular-nums" data-suite-workspace={mode}>
@@ -115,17 +131,44 @@ export function SuiteWorkspace({ mode, inputs, active, initialTab = 'rules', rou
     {notice && <p role="status" aria-live="polite" className="text-sm">{notice}</p>}
     {loaded && latestLoaded && latestLoaded.revision !== loaded.revision && <Alert variant="warning"><AlertDescription>A newer saved revision is available: r{latestLoaded.revision}. Your draft is retained. <Button variant="link" onClick={() => choose(latestLoaded)}>Reload saved strategy…</Button></AlertDescription></Alert>}
     {loaded && !latestLoaded && <Alert variant="warning"><AlertDescription>This strategy is no longer in the shared library. Duplicate it to restore its saved rules, or choose another strategy.</AlertDescription></Alert>}
-    <div className="flex items-center gap-3"><Field className="w-80"><FieldLabel>Saved strategies</FieldLabel><Select value={loaded?.id ?? 'new'} onValueChange={id => choose(snapshot.profiles.find(p => p.id === id) ?? null)}><SelectTrigger aria-label="Saved strategies"><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="new">New strategy…</SelectItem>{snapshot.profiles.map(p => <SelectItem key={p.id} value={p.id}>{p.name} · r{p.revision}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>
-      <Button variant="outline" disabled={!loaded || suite.pending} onClick={() => void copy()}><Copy data-icon="inline-start" aria-hidden="true" />Duplicate saved strategy</Button>
-      <Button variant="outline" disabled={!loaded || suite.pending} onClick={() => void perform(async () => { await suite.perform({ action: 'select', profileID: loaded!.id }); setNotice('Saved revision activated in Radar. Confirmation monitoring starts with a quiet baseline.') })}>{mode === 'radar' ? 'Activate saved strategy' : 'Use saved strategy in Radar'}</Button>
-      {activeProfile && <Button variant="ghost" onClick={() => void perform(async () => { await suite.perform({ action: 'select', profileID: '' }); setNotice('Strategy deactivated. Radar displays all markets; confirmed alerts resume after activation.') })}>Deactivate</Button>}
-      <Button variant="outline" disabled={!loaded || suite.pending} onClick={() => void perform(async () => { if (loaded) { await requestSuite({mode,action:'draft',draft:JSON.parse(draftJSON) as SuiteDraft});onResearch(suiteSpec([loaded])) } })}>Backtest saved strategy</Button>
-      <Button variant="ghost" disabled={!loaded || suite.pending} onClick={() => setConfirm({ kind: 'delete', profile: loaded ?? undefined })}><Trash2 data-icon="inline-start" aria-hidden="true" />Delete…</Button>
-    </div>
+    <div className="grid grid-cols-[16rem_minmax(0,1fr)] items-start gap-4">
+      <nav aria-label="Saved strategies" className="flex flex-col gap-1 rounded-lg border p-2" data-strategy-library>
+        <div className="flex items-center justify-between px-2 py-1"><span className="text-sm font-medium">Strategies</span><Button variant="ghost" size="icon-sm" aria-label="New strategy" title="New strategy" onClick={() => choose(null)}><Plus aria-hidden="true" /></Button></div>
+        {!loaded && <Button variant="ghost" aria-pressed className="h-auto justify-start py-1.5 text-left"><span className="min-w-0 flex-1 truncate">{name.trim() || 'Untitled strategy'}</span><Badge variant="outline">Draft</Badge></Button>}
+        {snapshot.profiles.map(p => <Button key={p.id} variant="ghost" aria-pressed={loaded?.id === p.id} aria-current={loaded?.id === p.id ? 'page' : undefined} data-strategy-id={p.id} className="h-auto justify-start py-1.5 text-left" onClick={() => { if (loaded?.id !== p.id) choose(p) }}>
+          <span className="min-w-0 flex-1 truncate">{loaded?.id === p.id ? name.trim() || p.name : p.name}</span>
+          {loaded?.id === p.id && dirty && <CircleAlert aria-label="Unsaved changes" className="text-warning" />}
+          {snapshot.selectedID === p.id && <Badge variant="secondary">Radar</Badge>}
+          <span className="text-xs text-muted-foreground">r{p.revision}</span>
+        </Button>)}
+        {!snapshot.profiles.length && <p className="px-2 py-1 text-xs text-muted-foreground">No saved strategies yet. Name this draft and save it.</p>}
+      </nav>
+      <div className="flex min-w-0 flex-col gap-4">
+        <form onSubmit={e => { e.preventDefault(); void save() }} className="flex items-end gap-3" data-strategy-header>
+          <Field className="min-w-0 flex-1"><FieldLabel htmlFor="suite-strategy-name">Strategy name</FieldLabel><Input id="suite-strategy-name" name="strategyName" autoComplete="off" value={name} onChange={e => setName(e.target.value)} /></Field>
+          <span role="status" aria-live="polite" className="flex h-(--control-height) items-center gap-1 text-xs text-muted-foreground" data-strategy-state={invalidStage ? 'invalid' : dirty ? 'dirty' : 'saved'}>{invalidStage ? <><CircleAlert aria-hidden="true" className="size-3.5 text-warning" />Finish {invalidStage.label} to save</> : dirty ? <><CircleAlert aria-hidden="true" className="size-3.5 text-warning" />Unsaved changes</> : loaded ? `Saved · r${loaded.revision}` : 'New strategy'}</span>
+          {dirty && loaded && <Button type="button" variant="ghost" onClick={() => setConfirm({ kind: 'load', profile: latestLoaded ?? loaded })}><RotateCcw data-icon="inline-start" aria-hidden="true" />Revert…</Button>}
+          <Button type="submit" title="Save strategy (⌘S)" disabled={suite.pending || models.some(m => !m.valid)}>{suite.pending ? <Spinner data-icon="inline-start" /> : <Save data-icon="inline-start" aria-hidden="true" />}Save strategy</Button>
+        </form>
+        <div className="flex items-center gap-2" role="toolbar" aria-label="Saved strategy actions">
+          {loaded && snapshot.selectedID === loaded.id ? <><Badge variant="secondary"><Power data-icon="inline-start" aria-hidden="true" />Active in Radar · r{activeProfile?.revision}</Badge><Button variant="ghost" size="sm" disabled={suite.pending} onClick={() => void perform(async () => { await suite.perform({ action: 'select', profileID: '' }); setNotice('Strategy deactivated. Radar displays all markets; confirmed alerts resume after activation.') })}>Deactivate</Button></>
+            : <Button variant="outline" size="sm" disabled={!loaded || suite.pending} title={dirty ? 'Activates the last saved revision, not this draft' : undefined} onClick={() => void perform(async () => { await suite.perform({ action: 'select', profileID: loaded!.id }); setNotice('Saved revision activated in Radar. Confirmation monitoring starts with a quiet baseline.') })}><Power data-icon="inline-start" aria-hidden="true" />{mode === 'radar' ? 'Activate saved strategy' : 'Use saved strategy in Radar'}</Button>}
+          {activeProfile && loaded?.id !== activeProfile.id && <span className="text-xs text-muted-foreground">Radar uses {activeProfile.name} · r{activeProfile.revision}</span>}
+          <Button variant="outline" size="sm" disabled={!loaded || suite.pending} onClick={() => void perform(async () => { if (loaded) { await requestSuite({mode,action:'draft',draft:JSON.parse(draftJSON) as SuiteDraft});onResearch(suiteSpec([loaded])) } })}><FlaskConical data-icon="inline-start" aria-hidden="true" />Backtest saved strategy</Button>
+          <Button variant="outline" size="sm" disabled={!loaded || suite.pending} onClick={() => void copy()}><Copy data-icon="inline-start" aria-hidden="true" />Duplicate saved strategy</Button>
+          <Button variant="ghost" size="sm" className="ml-auto" disabled={!loaded || suite.pending} onClick={() => setConfirm({ kind: 'delete', profile: loaded ?? undefined })}><Trash2 data-icon="inline-start" aria-hidden="true" />Delete…</Button>
+        </div>
     <Tabs value={tab} onValueChange={setTab}><TabsList><TabsTrigger value="rules">Strategy rules</TabsTrigger>{mode === 'radar' && <><TabsTrigger value="signals">Confirmed setups</TabsTrigger></>}</TabsList>
-      <TabsContent value="rules" className="flex flex-col gap-4"><form onSubmit={e => { e.preventDefault(); void save() }} className="flex flex-col gap-4"><FieldGroup><Field><FieldLabel htmlFor="suite-strategy-name">Strategy name</FieldLabel><Input id="suite-strategy-name" name="strategyName" autoComplete="off" value={name} onChange={e => setName(e.target.value)} /><FieldDescription>Universe and Bullish Setup are saved together. Drafts and previews never change confirmed alerts.</FieldDescription></Field></FieldGroup><div className="flex gap-3"><Button type="submit" disabled={suite.pending || models.some(m => !m.valid)}>{suite.pending ? <Spinner data-icon="inline-start" /> : <Save data-icon="inline-start" aria-hidden="true" />}Save strategy</Button>{dirty && <Badge variant="outline">Unsaved draft</Badge>}</div></form>
-        <ToggleGroup type="single" variant="outline" value={phase} onValueChange={value => { if (value) setPhase(value) }} aria-label="Phase rule editor"><ToggleGroupItem value="universe">Universe</ToggleGroupItem>{SUITE_PHASES.map(p => <ToggleGroupItem key={p.key} value={p.key}>{p.label}</ToggleGroupItem>)}</ToggleGroup>
-        {[{ key: 'universe', label: 'Universe', description: 'Restricts the contracts evaluated for Bullish Setup.' }, ...SUITE_PHASES].map((p,i) => <div key={p.key} hidden={phase !== p.key}><StrategyPhaseEditor label={p.label} description={p.description} model={models[i]} inputs={inputs} preferences={preferences} onPreferences={savePreferences} active={active && tab === 'rules' && phase === p.key} strategyID={mode === 'radar' ? loaded?.id ?? '' : ''} /></div>)}
+      <TabsContent value="rules" className="flex flex-col gap-4">
+        <ToggleGroup type="single" variant="outline" spacing={0} value={phase} onValueChange={value => { if (value) setPhase(value) }} aria-label="Phase rule editor" data-strategy-pipeline>
+          {stages.map((p, i) => { const s = stageStatus[p.key], m = models[i], broken = !m.compiling && !m.valid; return [
+            i > 0 && <ChevronRight key={p.key + ':arrow'} aria-hidden="true" className="mx-1 text-muted-foreground" />,
+            <ToggleGroupItem key={p.key} value={p.key} aria-label={p.label} aria-describedby={`stage-status-${p.key}`} className="h-auto flex-col items-start gap-0.5 px-3 py-1.5" data-stage={p.key}>
+              <span className="flex items-center gap-1 font-medium">{broken && <CircleAlert aria-hidden="true" className="text-warning" />}{p.label}</span>
+              <span id={`stage-status-${p.key}`} className="text-xs font-normal text-muted-foreground">{broken ? 'Needs attention' : m.compiling ? 'Checking…' : s ? `${s.matches} / ${s.total} pass${s.unknown ? ` · ${s.unknown} unknown` : ''}` : 'Preview pending'}</span>
+            </ToggleGroupItem>] })}
+        </ToggleGroup>
+        {stages.map((p,i) => <div key={p.key} hidden={phase !== p.key}><StrategyPhaseEditor label={p.label} description={p.description} model={models[i]} inputs={inputs} preferences={preferences} onPreferences={savePreferences} active={active && tab === 'rules' && phase === p.key} strategyID={mode === 'radar' ? loaded?.id ?? '' : ''} statusKey={p.key} onStatus={reportStatus} /></div>)}
       </TabsContent>
       <TabsContent value="signals" className="flex flex-col gap-3"><Field><FieldLabel htmlFor="phase-search">Search contracts</FieldLabel><Input id="phase-search" name="phaseSearch" value={search} onChange={e => { setSearch(e.target.value); setPage(0) }} placeholder="BTC, ETH…" /></Field>
         <Table aria-label="Confirmed phase readings"><TableHeader><TableRow>{['Contract', 'Bullish Setup', 'Confirmed close', 'Decision', 'Evidence'].map(label => <TableHead key={label}>{label}</TableHead>)}</TableRow></TableHeader><TableBody>{readings.slice(page*50,page*50+50).map(r => <TableRow key={r.instrument}><TableCell><Button variant="link" onClick={() => setChart(r.instrument)}>{r.instrument}</Button></TableCell><TableCell><SuitePhaseBadges confirmed={r} provisional={snapshot.provisional?.find(p => p.instrument === r.instrument)} /></TableCell><TableCell>{researchTime(r.hour+3_600_000)}</TableCell><TableCell title={r.reason}>{r.action}</TableCell><TableCell><div className="flex gap-2"><Button variant="ghost" onClick={() => void inspect(r)}>Explain</Button></div></TableCell></TableRow>)}</TableBody></Table>
@@ -133,6 +176,8 @@ export function SuiteWorkspace({ mode, inputs, active, initialTab = 'rules', rou
         <div className="flex gap-2"><Button variant="outline" disabled={page === 0} onClick={() => setPage(p => p-1)}>Previous contracts</Button><Button variant="outline" disabled={(page+1)*50 >= readings.length} onClick={() => setPage(p => p+1)}>Next contracts</Button></div>
       </TabsContent>
     </Tabs>
+      </div>
+    </div>
     <Dialog open={active && Boolean(confirm)} onOpenChange={open => { if (!open) setConfirm(null) }}><DialogContent><DialogHeader><DialogTitle>{confirm?.kind === 'load' ? 'Discard unsaved draft?' : 'Delete strategy?'}</DialogTitle><DialogDescription>{confirm?.kind === 'load' ? 'The saved strategy and existing studies remain available.' : 'This removes the selected local item. Saved experiments keep their frozen rules.'}</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setConfirm(null)}>Cancel</Button><Button variant="destructive" onClick={() => void perform(async () => { const value = confirm; if (!value) return; if (value.kind === 'load') load(value.profile ?? null); else if (value.kind === 'delete') { await suite.perform({ action: 'delete',profileID: value.profile!.id }); load(null) }; setConfirm(null) })}>Confirm</Button></DialogFooter></DialogContent></Dialog>
     {active && activeProfile && <SuitePhaseExplanation instrument={detail?.instrument ?? null} profile={activeProfile} inputs={inputs} onClose={() => setDetail(null)} />}
   </main></MarketListViewport>

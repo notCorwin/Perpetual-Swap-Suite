@@ -7,9 +7,11 @@ import { newRuleID, type FilterLibraryPreferences, type FilterTruth, type Native
 import type { ResearchInputs } from '@/research-types'
 import type { useStrategyFilter } from '@/use-strategy-filter'
 
-export function StrategyPhaseEditor({ label, model, inputs, preferences, onPreferences, active, strategyID, description }: {
+export type StageStatus = { matches: number; total: number; unknown: number }
+export function StrategyPhaseEditor({ label, model, inputs, preferences, onPreferences, active, strategyID, description, statusKey = label, onStatus }: {
   label: string; description?: string; model: ReturnType<typeof useStrategyFilter>; inputs: ResearchInputs; preferences: FilterLibraryPreferences
   onPreferences: (value: FilterLibraryPreferences) => Promise<void>; active: boolean; strategyID: string
+  statusKey?: string; onStatus?: (key: string, status: StageStatus) => void
 }) {
   const [rows, setRows] = useState<NativeMarketRow[]>([]), [results, setResults] = useState<Record<string, FilterTruth>>({})
   const [revision, setRevision] = useState(0), [previewJSON, setPreviewJSON] = useState<string | null>(null)
@@ -42,13 +44,16 @@ export function StrategyPhaseEditor({ label, model, inputs, preferences, onPrefe
   }, [active, model.lastValid, strategyID])
   const expressions = { ...model.editor.expressionDrafts, ...model.compilation.expressions }
   const metrics = inputs.metrics.filter(metric => !model.compilation.allowedMetrics || model.compilation.allowedMetrics.includes(metric.key))
+  const matches = Object.values(results).filter(v => v === 'true').length, unknown = Object.values(results).filter(v => v === 'unknown').length
+  // Report the latest preview so the pipeline overview stays informed while another stage is open.
+  useEffect(() => { if (previewJSON !== null) onStatus?.(statusKey, { matches, total: rows.length, unknown }) }, [onStatus, statusKey, matches, rows.length, unknown, previewJSON])
   return <section aria-label={label} className="flex flex-col gap-3" data-strategy-rules>
-    <FieldDescription className="px-4">{description} Keep rules for preview; Save strategy applies Universe and Bullish Setup together.</FieldDescription>
+    {description && <FieldDescription className="px-4">{description}</FieldDescription>}
     <StrategyRules label={label} embedded atClose strategyID={strategyID} filters={model.filters} draft={model.draft} editor={model.editor} onEditorChange={model.setEditor} onDraftChange={model.setDraft} onApply={model.keep}
       metrics={metrics} templates={inputs.templates} preferences={preferences} onPreferences={onPreferences}
       rows={rows} results={results} previewJSON={previewJSON} revision={revision} onExplain={setExplaining} units={model.compilation.units ?? {}} expressions={expressions}
       diagnostics={model.compilation.diagnostics} valid={model.valid} compiling={model.compiling} requiredHours={model.compilation.requiredHours ?? 0}
-      matches={Object.values(results).filter(v => v === 'true').length} total={rows.length} unknown={Object.values(results).filter(v => v === 'unknown').length} previewPending={previewJSON !== model.lastValid} history={history} />
+      matches={matches} total={rows.length} unknown={unknown} previewPending={previewJSON !== model.lastValid} history={history} />
     <FilterExplanation open={active && Boolean(explaining)} onOpenChange={open => { if (!open) setExplaining(null) }} instId={explaining} onSelect={setExplaining} rows={rows} results={results} filtersJSON={previewJSON} revision={revision}
       metrics={inputs.metrics} expressions={expressions} units={model.compilation.units ?? {}} templates={inputs.templates} atClose strategyID={strategyID} />
   </section>

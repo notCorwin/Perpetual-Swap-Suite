@@ -410,8 +410,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             return
         }
         if let request = parameters["analysisSettings"] as? [String: Any] {
-            do { replyHandler(try gatewayClient.settings.handle(request), nil) }
-            catch { replyHandler(nil, error.localizedDescription) }
+            Task {
+                do { replyHandler(try await gatewayClient.settings.handle(request), nil) }
+                catch { replyHandler(nil, error.localizedDescription) }
+            }
             return
         }
         if let id = parameters["cancelGatewayFetch"] as? String {

@@ -42,38 +42,45 @@ private final class HoldingGatewayFixtureProtocol: URLProtocol, @unchecked Senda
 
 @MainActor
 final class AIGatewayTests: XCTestCase {
-    func testSettingsPersistModelPreserveBlankKeyAndNeverReturnCredentials() throws {
+    func testSettingsPersistModelPreserveBlankKeyAndNeverReturnCredentials() async throws {
         let name = "GatewayTests-\(UUID())", defaults = UserDefaults(suiteName: name)!
         defer { defaults.removePersistentDomain(forName: name) }
         let credentials = MemoryGatewayCredentials(), settings = GatewaySettings(credentials: credentials, defaults: defaults)
-        XCTAssertEqual(try settings.snapshot()["model"] as? String, "openai/gpt-6.1-sol")
-        XCTAssertEqual(try settings.snapshot()["hasAPIKey"] as? Bool, false)
-        let saved = try settings.handle(["action": "save", "model": " openai/gpt-6.1-sol ", "apiKey": "fixture-secret"])
+        let initial = try await settings.snapshot()
+        XCTAssertEqual(initial["model"] as? String, "openai/gpt-6.1-sol")
+        XCTAssertEqual(initial["hasAPIKey"] as? Bool, false)
+        let saved = try await settings.handle(["action": "save", "model": " openai/gpt-6.1-sol ", "apiKey": "fixture-secret"])
         XCTAssertEqual(Set(saved.keys), ["model", "hasAPIKey"])
         XCTAssertFalse(String(describing: saved).contains("fixture-secret"))
-        _ = try settings.handle(["action": "save", "model": "other/vision-model", "apiKey": "  "])
+        _ = try await settings.handle(["action": "save", "model": "other/vision-model", "apiKey": "  "])
         XCTAssertEqual(credentials.key, "fixture-secret")
         let restored = GatewaySettings(credentials: credentials, defaults: defaults)
-        XCTAssertEqual(try restored.snapshot()["model"] as? String, "other/vision-model")
-        _ = try restored.handle(["action": "save", "model": "other/vision-model", "apiKey": "replacement"])
+        let restoredSnapshot = try await restored.snapshot()
+        XCTAssertEqual(restoredSnapshot["model"] as? String, "other/vision-model")
+        _ = try await restored.handle(["action": "save", "model": "other/vision-model", "apiKey": "replacement"])
         XCTAssertEqual(credentials.key, "replacement")
-        XCTAssertEqual(try restored.handle(["action": "removeKey"])["hasAPIKey"] as? Bool, false)
-        XCTAssertThrowsError(try settings.handle(["action": "save", "model": " ", "apiKey": "unused"]))
+        let removed = try await restored.handle(["action": "removeKey"])
+        XCTAssertEqual(removed["hasAPIKey"] as? Bool, false)
+        do { _ = try await settings.handle(["action": "save", "model": " ", "apiKey": "unused"]); XCTFail("Empty model must fail.") }
+        catch { XCTAssertEqual(error.localizedDescription, "Enter a model ID.") }
     }
 
-    func testNativeRequestUsesFixedEndpointAndAddsKeyOnlyToAuthorization() throws {
+    func testNativeRequestUsesFixedEndpointAndAddsKeyOnlyToAuthorization() async throws {
         let credentials = MemoryGatewayCredentials(), settings = GatewaySettings(credentials: credentials)
         let body = "{\"model\":\"openai/gpt-6.1-sol\",\"messages\":[],\"stream\":true}"
-        XCTAssertThrowsError(try settings.authorizedRequest(body: body))
+        do { _ = try await settings.authorizedRequest(body: body); XCTFail("Missing key must fail.") }
+        catch { XCTAssertEqual(error.localizedDescription, "Configure a Gateway API Key to analyze charts.") }
         credentials.key = "fixture-secret"
-        let request = try settings.authorizedRequest(body: body)
+        let request = try await settings.authorizedRequest(body: body)
         XCTAssertEqual(request.url?.absoluteString, "https://ai-gateway.vercel.sh/v1/chat/completions")
         XCTAssertEqual(request.httpMethod, "POST")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer fixture-secret")
         XCTAssertEqual(request.httpBody, Data(body.utf8))
-        XCTAssertThrowsError(try settings.authorizedRequest(body: "{}"))
+        do { _ = try await settings.authorizedRequest(body: "{}"); XCTFail("Invalid body must fail.") }
+        catch { XCTAssertEqual(error.localizedDescription, "Invalid Gateway request.") }
         credentials.failure = true
-        XCTAssertThrowsError(try settings.snapshot())
+        do { _ = try await settings.snapshot(); XCTFail("Unavailable credentials must fail.") }
+        catch { XCTAssertEqual(error.localizedDescription, "Keychain unavailable.") }
     }
 
     func testNativeStreamForwardsUTF8BytesAndHeadersInOrder() async throws {
