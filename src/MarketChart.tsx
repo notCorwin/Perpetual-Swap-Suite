@@ -338,7 +338,8 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
       const triangle = isLong
         ? `M${markerX} ${markerY - 7}L${markerX - 5} ${markerY + 1}H${markerX + 5}Z`
         : `M${markerX} ${markerY + 7}L${markerX - 5} ${markerY - 1}H${markerX + 5}Z`
-      const aria = `${isLong ? 'Long' : 'Short'} future move entry at ${time(signalHour)}, ${formatPercent(signal.changePercent)} over ${signal.periods} hourly candles`
+      const rank = moveSignals.length > 1 ? ` #${signal.rank}` : ''
+      const aria = `${isLong ? 'Long' : 'Short'}${rank} future move entry at ${time(signalHour)}, ${formatPercent(signal.changePercent)} over ${signal.periods} hourly candles, ${formatPercent(signal.efficiencyPercentPerPeriod)} per candle`
       const exitX = exitIndex >= 0 ? x(exitIndex, 'price') : 0
       const exitY = isLong
         ? Math.max(panels.price[0] + 17, priceY(signal.exitPrice) - 9)
@@ -346,15 +347,15 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
       const exitTriangle = isLong
         ? `M${exitX} ${exitY + 7}L${exitX - 5} ${exitY - 1}H${exitX + 5}Z`
         : `M${exitX} ${exitY - 7}L${exitX - 5} ${exitY + 1}H${exitX + 5}Z`
-      const exitAria = `Exit ${isLong ? 'Long' : 'Short'} future move at ${time(signal.exitHour)}, ${formatPercent(signal.changePercent)} after ${signal.periods} hourly candles`
+      const exitAria = `Exit ${isLong ? 'Long' : 'Short'}${rank} future move at ${time(signal.exitHour)}, ${formatPercent(signal.changePercent)} after ${signal.periods} hourly candles`
       return <g key={`${signal.direction}-${signalHour}`} data-chart-move-direction={signal.direction} data-chart-move-hour={signalHour} aria-label={aria}>
         {exitIndex >= 0 && <line x1={markerX} y1={priceY(signal.entryPrice)} x2={exitX} y2={priceY(signal.exitPrice)} stroke={color} strokeWidth="1.2" strokeDasharray="3 4" opacity="0.7" />}
         <path d={triangle} fill={color} stroke="var(--chart-surface)" strokeWidth="1.5" />
-        <text x={markerX} y={labelY} textAnchor="middle" fill={color} fontWeight="700">{isLong ? 'LONG' : 'SHORT'}</text>
+        <text x={markerX} y={labelY} textAnchor="middle" fill={color} fontWeight="700">{isLong ? 'LONG' : 'SHORT'}{rank}</text>
         <title>{aria}</title>
         {exitIndex >= 0 && <g data-chart-move-exit-direction={signal.direction} data-chart-move-exit-hour={signal.exitHour} aria-label={exitAria}>
           <path d={exitTriangle} fill="var(--chart-surface)" stroke={color} strokeWidth="2" />
-          <text x={exitX} y={exitY + (isLong ? -10 : 14)} textAnchor="middle" fill={color} fontWeight="700">{isLong ? 'EXIT LONG' : 'EXIT SHORT'}</text>
+          <text x={exitX} y={exitY + (isLong ? -10 : 14)} textAnchor="middle" fill={color} fontWeight="700">{isLong ? 'EXIT LONG' : 'EXIT SHORT'}{rank}</text>
           <title>{exitAria}</title>
         </g>}
       </g>
@@ -698,7 +699,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
   }
   const longMoves = visibleMoveSignals.filter(signal => signal.direction === 'long').length
   const shortMoves = visibleMoveSignals.length - longMoves
-  const strongestMove = visibleMoveSignals[0]
+  const strongestMove = visibleMoveSignals.find(signal => signal.rank === 1)
   const moveSource = moveMode === 'close' ? 'Close' : 'High / Low'
   const objectiveLabel = moveObjective === 'amplitude' ? 'maximum total move' : 'maximum move per K-line'
   const chartDescription = `OKX perpetual · 1h · ${historicalEnd === null ? "Latest 96 hours" : `History through ${time(historicalEnd)}`} · Future-aware Long and Short labels capture the ${objectiveLabel} from ${moveMode === 'close' ? 'close-to-close' : 'Low-to-High and High-to-Low'} candidates over 1% · Hold to inspect · Scroll chart for history · 24h turnover rank ${turnoverPosition + 1}/${turnoverOrder.length} · ↑/↓ list order · ← list first · → turnover first`
@@ -724,7 +725,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
     </header>
     <div role="status" data-price-move-summary className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-xs">
       <span className="font-medium"><span className="text-positive">{longMoves} Long</span> · <span className="text-destructive">{shortMoves} Short</span></span>
-      <span className="text-muted-foreground">{moveObjective === 'amplitude' ? 'Strongest visible move · shortest K-line span breaks ties' : 'Highest |change| / K · total move breaks ties'} · completed candles · move &gt; 1%</span>
+      <span className="text-muted-foreground">{visibleMoveSignals.length} ranked non-overlapping segments · {moveObjective === 'amplitude' ? 'largest move first' : 'highest |change| / K first'} · completed candles · move &gt; 1%</span>
       <ToggleGroup type="single" variant="outline" size="sm" spacing={0} value={moveMode} onValueChange={value => {
         if (!value) return
         setMoveMode(value as PriceMoveMode)

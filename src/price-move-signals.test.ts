@@ -5,10 +5,11 @@ import { capturePriceMoves } from './price-move-signals.ts'
 const hour = 3_600_000
 const bars = (closes: number[]) => closes.map((close, index) => ({ hour: index * hour, close, confirmed: true }))
 
-test('future move labels keep only the globally strongest move', () => {
+test('future move labels rank globally strongest non-overlapping moves', () => {
   const signals = capturePriceMoves(bars([100, 102, 101.5, 104, 102]))
-  assert.deepEqual(signals.map(({ direction, hour: start, exitHour, periods }) => ({ direction, start, exitHour, periods })), [
-    { direction: 'long', start: 0, exitHour: 3 * hour, periods: 3 },
+  assert.deepEqual(signals.map(({ direction, hour: start, exitHour, periods, rank }) => ({ direction, start, exitHour, periods, rank })), [
+    { direction: 'long', start: 0, exitHour: 3 * hour, periods: 3, rank: 1 },
+    { direction: 'short', start: 3 * hour, exitHour: 4 * hour, periods: 1, rank: 2 },
   ])
   assert.equal(signals[0].changePercent, 4)
 })
@@ -32,6 +33,16 @@ test('efficiency objective prefers more movement per candle over total amplitude
   assert.equal(efficient.exitHour, hour)
   assert.equal(efficient.changePercent, 2)
   assert.equal(efficient.efficiencyPercentPerPeriod, 2)
+  assert.equal(efficient.rank, 1)
+})
+
+test('efficiency objective ranks every non-overlapping move above the amplitude threshold', () => {
+  const signals = capturePriceMoves(bars([100, 102, 100, 103]), 1, 'close', 'efficiency')
+  assert.deepEqual(signals.map(({ direction, hour: start, exitHour, rank }) => ({ direction, start, exitHour, rank })), [
+    { direction: 'long', start: 0, exitHour: hour, rank: 2 },
+    { direction: 'short', start: hour, exitHour: 2 * hour, rank: 3 },
+    { direction: 'long', start: 2 * hour, exitHour: 3 * hour, rank: 1 },
+  ])
 })
 
 test('moves must exceed one percent and use the shortest span for equal extrema', () => {
@@ -60,6 +71,7 @@ test('High / Low mode captures wick extremes independently from closes', () => {
   const signals = capturePriceMoves(input, 1, 'highLow')
   assert.deepEqual(signals.map(({ direction, hour: start, exitHour, entryPrice, exitPrice, periods }) =>
     ({ direction, start, exitHour, entryPrice, exitPrice, periods })), [
+    { direction: 'long', start: 0, exitHour: hour, entryPrice: 100, exitPrice: 103, periods: 1 },
     { direction: 'short', start: hour, exitHour: 2 * hour, entryPrice: 103, exitPrice: 99, periods: 1 },
   ])
 })
