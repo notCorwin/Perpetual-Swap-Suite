@@ -1491,9 +1491,9 @@ final class RuleEditorUITests: BackgroundTestCase {
             let image = try await view.takeSnapshot(configuration: nil)
             let opaque = try XCTUnwrap(opaqueChartSnapshot(image, backgroundRGB: bridge.chartSnapshotRGB))
             XCTAssertEqual(NSBitmapImageRep(data: opaque.tiffRepresentation!)?.colorAt(x: 0, y: 0)?.alphaComponent, 1)
-            if try await js(view, "Array.from(document.querySelectorAll('button')).some(x=>x.textContent.trim()==='Analysis')") as? Bool == true {
-                try await click(view, "Analysis"); try await click(view, "New analysis")
-            } else { try await click(view, "Analyze chart") }
+            if try await js(view, "document.querySelector('[aria-label=\"Chart analysis\"]') !== null") as? Bool == true {
+                try await click(view, "New analysis")
+            } else { try await click(view, "Analyze Long") }
             try await wait(view, "document.querySelector('[data-analysis-answer] table') !== null && !document.querySelector('[aria-label=\"Ask a follow-up\"]').disabled")
             try await assertSharedSurfaces(view, opacity: 0.3)
             let analysisPreview = try await view.takeSnapshot(configuration: nil)
@@ -1532,7 +1532,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await wait(view, "document.querySelector('[data-chart-inst] svg[role=img]') !== null")
         let contractValue = try await js(view, "document.querySelector('[data-chart-inst]').dataset.chartInst") as? String
         let contract = try XCTUnwrap(contractValue)
-        try await click(view, "Analyze chart")
+        try await click(view, "Analyze Long")
         try await wait(view, "document.querySelector('[data-analysis-answer]') !== null && !document.querySelector('[aria-label=\"Ask a follow-up\"]').disabled")
         try await input(view, "[aria-label=\"Ask a follow-up\"]", "Edit this question", textarea: true)
         for key in ["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight"] {
@@ -1583,13 +1583,11 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await wait(view, "document.querySelector('[data-chart-inst] svg[role=img]') !== null")
         let contractResult = try await js(view, "document.querySelector('[data-chart-inst]').dataset.chartInst") as? String
         let contract = try XCTUnwrap(contractResult)
-        try await click(view, "Chase short")
-        try await wait(view, "document.querySelector('[aria-label=\"Analysis direction\"] button[aria-checked=true]')?.innerText === 'Chase short'")
-        _ = try await js(view, "document.querySelector('[aria-label=\"Analysis direction\"] button[aria-checked=true]').dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true})); true")
+        _ = try await js(view, "Array.from(document.querySelectorAll('[aria-label=\"Chart analysis actions\"] button')).find(x=>x.textContent.trim()==='Analyze Short').dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true})); true")
         try await settleRendering(view)
         let unchangedContract = try await js(view, "document.querySelector('[data-chart-inst]').dataset.chartInst") as? String
         XCTAssertEqual(unchangedContract, contract, "Direction controls must not trigger chart navigation.")
-        try await click(view, "Analyze chart")
+        try await click(view, "Analyze Short")
         try await wait(view, "document.querySelector('[aria-label=\"Chart analysis\"]')?.innerText.includes('Configure a Gateway API Key')")
         XCTAssertTrue(bridge.gatewayRequests.isEmpty)
         try await click(view, "Configure analysis")
@@ -1648,29 +1646,37 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await wait(view, "document.querySelector('table[data-market-count]') !== null")
         _ = try await js(view, "Array.from(document.querySelectorAll('tbody tr[tabindex]')).find(x=>x.getAttribute('aria-label') === 'View \(contract) chart').click(); true")
         try await wait(view, "document.querySelector('[aria-label=\"Ask a follow-up\"]')?.value === '保留草稿'")
-        let restoredDirection = try await js(view, "document.querySelector('[aria-label=\"Analysis direction\"] button[aria-checked=true]')?.innerText") as? String
+        let restoredDirection = try await js(view, "document.querySelector('[aria-label=\"Chart analysis\"] [data-slot=badge]')?.innerText") as? String
         XCTAssertEqual(restoredDirection, "Chase short")
         bridge.holdGateway = true
         try await click(view, "Send follow-up")
         try await wait(view, "Array.from(document.querySelectorAll('[data-analysis-answer]')).some(x=>x.innerText.includes('部分分析'))")
+        let protectedAnalysis = try await js(view, "(() => { const buttons=Array.from(document.querySelectorAll('[aria-label=\"Chart analysis actions\"] button')); return buttons.find(x=>x.textContent.trim()==='Analyze Long').disabled && !buttons.find(x=>x.textContent.trim()==='Analyze Short').disabled; })()") as? Bool
+        XCTAssertEqual(protectedAnalysis, true, "Keep the running analysis accessible without allowing a direction change to replace it.")
         try await click(view, "Close analysis")
         try await wait(view, "document.querySelector('[aria-label=\"Chart analysis\"]') === null")
         XCTAssertFalse(bridge.gatewayCancelled.isEmpty)
         bridge.holdGateway = false
-        try await click(view, "Analysis"); try await click(view, "Retry")
+        try await click(view, "Analyze Short")
+        XCTAssertEqual(bridge.analysisCaptureBounds.count, 1, "Opening the existing directional analysis must preserve its snapshot and conversation.")
+        try await click(view, "Retry")
         try await wait(view, "document.querySelectorAll('[data-analysis-answer]').length === 3 && !document.querySelector('[aria-label=\"Ask a follow-up\"]').disabled")
         XCTAssertEqual(bridge.gatewayRequests.count, 4)
         XCTAssertEqual(bridge.analysisCaptureBounds.count, 1)
         let retried = bridge.gatewayRequests[3]["messages"] as! [[String: Any]]
         XCTAssertTrue((retried[0]["content"] as? String)?.contains("是否追空") == true)
-        try await click(view, "Chase long")
-        try await click(view, "New analysis")
+        try await click(view, "Analyze Long")
         try await wait(view, "document.querySelectorAll('[data-analysis-answer]').length === 1 && !document.querySelector('[aria-label=\"Ask a follow-up\"]').disabled")
         XCTAssertEqual(bridge.analysisCaptureBounds.count, 2)
         let replacement = bridge.gatewayRequests[4]["messages"] as! [[String: Any]]
         XCTAssertTrue((replacement[0]["content"] as? String)?.contains("是否追多") == true)
         XCTAssertFalse((replacement[0]["content"] as? String)?.contains("追空") == true)
         XCTAssertEqual((replacement[1]["content"] as! [[String: Any]])[0]["text"] as? String, "你推荐我追多吗？如果追多，限价单开在哪个位置合适？如果不追，应该等待什么确认？")
+        try await click(view, "New analysis")
+        try await wait(view, "document.querySelectorAll('[data-analysis-answer]').length === 1 && !document.querySelector('[aria-label=\"Ask a follow-up\"]').disabled")
+        XCTAssertEqual(bridge.analysisCaptureBounds.count, 3)
+        let refreshed = bridge.gatewayRequests[5]["messages"] as! [[String: Any]]
+        XCTAssertTrue((refreshed[0]["content"] as? String)?.contains("是否追多") == true, "New analysis must retain the direction chosen by the toolbar action.")
     }
 
     @MainActor

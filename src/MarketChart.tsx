@@ -3,11 +3,12 @@ import { flushSync } from "react-dom"
 import { ArrowLeft, Camera, Radio } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
+import { ButtonGroup } from "@/components/ui/button-group"
+import { Spinner } from "@/components/ui/spinner"
 import { ChartAnalysisPanel } from '@/ChartAnalysisPanel'
 import { ChartWorkspaceViewport } from '@/ChartWorkspaceViewport'
 import { chartAnalysis } from '@/analysis-service'
-import { ANALYSIS_PROMPTS, type AnalysisDirection } from '@/chart-analysis'
+import { type AnalysisDirection } from '@/chart-analysis'
 import { chartCaptureBounds } from '@/chart-capture'
 import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicY } from "@/chart-axis"
 import { chartCandleWidth, chartHourX, chartLayout, fitPriceTag, type ChartPanel as Panel } from "@/chart-layout"
@@ -335,8 +336,7 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
 export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack, backLabel = 'Markets' }: { instId: string; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void; onBack: () => void; backLabel?: string }) {
   const analysis = useSyncExternalStore(chartAnalysis.subscribe, () => chartAnalysis.get(instId))
   const [analysisOpen, setAnalysisOpen] = useState(() => chartAnalysis.get(instId) !== null)
-  const [analysisChoice, setAnalysisChoice] = useState<{ instId: string; direction: AnalysisDirection } | null>(null)
-  const analysisDirection = analysisChoice?.instId === instId ? analysisChoice.direction : analysis?.direction ?? 'long'
+  const analysisBusy = analysis?.phase === 'capturing' || analysis?.phase === 'streaming'
   useEffect(() => () => chartAnalysis.stop(instId), [instId])
   const [displayed, setDisplayed] = useState<{ id: string; data: ChartResponse } | null>(null)
   const [historyBars, setHistoryBars] = useState<{ id: string; bars: Bar[] } | null>(null)
@@ -555,7 +555,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
     const navigate = (event: KeyboardEvent) => {
       if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.defaultPrevented || event.isComposing || event.keyCode === 229) return
       const target = event.target instanceof Element ? event.target : document.activeElement
-      if (target?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="radio"], [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]')) return
+      if (target?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="radio"], [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"], [data-slot="button-group"]')) return
       if (!(event.key === "ArrowUp" || event.key === "ArrowDown" || event.key === "ArrowLeft" || event.key === "ArrowRight")) return
       event.preventDefault()
       const id = chartNavigationTarget(listOrder, turnoverOrder, navigationId.current, event.key)
@@ -609,7 +609,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
   const warmSurfaces = useMemo(() => new Map([...warmCharts].map(([id, data]) => [id, { ...data, bars: visibleChartBars(data.bars, data.bars.at(-1)?.hour ?? 0) }])), [warmCharts])
   const surfaces = new Map(warmSurfaces)
   if (bars.length && chart) surfaces.set(instId, { ...chart, bars, endHour: viewportEnd })
-  const analyzeChart = () => {
+  const analyzeChart = (direction: AnalysisDirection) => {
     if (!bars.length || plotSize.width <= 0 || captureStatus === 'copying') return
     flushSync(() => { setAnalysisOpen(true); setCapture({ id: instId, status: 'idle', error: '' }) })
     void chartAnalysis.analyze(instId, async () => {
@@ -622,7 +622,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
       const rangeLabel = `${time(Number(element.dataset.chartStart))} – ${time(Number(element.dataset.chartEnd))}`
       const image = await window.webkit.messageHandlers.radar.postMessage({ captureChart: { ...chartCaptureBounds(element), output: 'png' } })
       return { ...image, capturedAt, rangeLabel }
-    }, analysisDirection)
+    }, direction)
   }
   const chartDescription = `OKX perpetual · 1h · ${historicalEnd === null ? "Latest 96 hours" : `History through ${time(historicalEnd)}`} · Hold to inspect · Scroll chart for history · 24h turnover rank ${turnoverPosition + 1}/${turnoverOrder.length} · ↑/↓ list order · ← list first · → turnover first`
   return <ChartWorkspaceViewport expanded={analysisOpen}><main className="flex h-full min-h-0 flex-col overflow-hidden overscroll-none text-sm font-normal tabular-nums">
@@ -633,8 +633,14 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
         <p className="truncate text-xs text-muted-foreground" title={chartDescription}>{chartDescription}</p>
       </div>
       <Button variant="outline" size="sm" disabled={!bars.length || plotSize.width <= 0 || captureStatus === "copying" || analysis?.phase === 'capturing'} onClick={() => { void captureChart() }}><Camera data-icon="inline-start" aria-hidden="true" />{captureStatus === "copying" ? "Copying…" : "Copy chart"}</Button>
-      <ToggleGroup type="single" variant="outline" size="sm" spacing={0} value={analysisDirection} disabled={analysis?.phase === 'capturing' || analysis?.phase === 'streaming'} onValueChange={direction => { if (direction === 'long' || direction === 'short') setAnalysisChoice({ instId, direction }) }} aria-label="Analysis direction" title="Direction for new analyses"><ToggleGroupItem value="long">{ANALYSIS_PROMPTS.long.label}</ToggleGroupItem><ToggleGroupItem value="short">{ANALYSIS_PROMPTS.short.label}</ToggleGroupItem></ToggleGroup>
-      <Button variant="outline" size="sm" disabled={captureStatus === 'copying' || !analysis && (!bars.length || plotSize.width <= 0)} onClick={() => { if (analysis) setAnalysisOpen(true); else analyzeChart() }}>{analysis ? 'Analysis' : 'Analyze chart'}</Button>
+      <ButtonGroup aria-label="Chart analysis actions">
+        {(['long', 'short'] as const).map(direction => <Button
+          key={direction} variant="outline" size="sm"
+          disabled={captureStatus === 'copying' || (analysis?.direction !== direction && (analysisBusy || !bars.length || plotSize.width <= 0))}
+          title={analysis?.direction === direction ? `Open existing ${direction} analysis` : undefined}
+          onClick={() => { if (analysis?.direction === direction) setAnalysisOpen(true); else analyzeChart(direction) }}
+        >{analysisBusy && analysis?.direction === direction && <Spinner data-icon="inline-start" />}Analyze {direction === 'long' ? 'Long' : 'Short'}</Button>)}
+      </ButtonGroup>
       <span role="status" className="sr-only">{captureStatus === "flashing" ? "Chart copied to clipboard" : ""}</span>
       <Badge variant="secondary"><Radio data-icon="inline-start" aria-hidden="true" />{historicalEnd !== null ? "History" : active && !active.confirmed ? "Live candle" : "Hourly chart"}</Badge>
     </header>
@@ -691,7 +697,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
       </div>
       {captureStatus === "flashing" && <div aria-hidden="true" data-surface="inherited" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
     </section>
-    {analysisOpen && <ChartAnalysisPanel instId={instId} session={analysis} ready={bars.length > 0 && plotSize.width > 0 && captureStatus !== 'copying'} onNew={analyzeChart} onClose={() => { chartAnalysis.stop(instId); setAnalysisOpen(false) }} />}
+    {analysisOpen && <ChartAnalysisPanel instId={instId} session={analysis} ready={bars.length > 0 && plotSize.width > 0 && captureStatus !== 'copying'} onNew={() => analyzeChart(analysis?.direction ?? 'long')} onClose={() => { chartAnalysis.stop(instId); setAnalysisOpen(false) }} />}
     </div>
   </main></ChartWorkspaceViewport>
 }
