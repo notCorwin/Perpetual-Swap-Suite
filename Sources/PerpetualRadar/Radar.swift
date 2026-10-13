@@ -919,9 +919,16 @@ final class Radar {
         }
     }
 
+    private func strategyChartHistoryHours() -> Int {
+        guard let profile = try? store.selectedSuiteProfile("radar") else { return 0 }
+        return (try? profile.hydration().requiredHours) ?? 0
+    }
+
     func loadChart(_ id: String) async -> [String: Any] {
         guard rows[id] != nil else { return ["bars": [], "error": "Unknown contract", "revision": -1] }
-        _ = try? await historyLoader.importResearch(id, from: max(0, hour - Int64(max(candleLookback, emaWarmupHours(200))) * hourMS), through: hour - hourMS)
+        let warmup = max(candleLookback, strategyChartHistoryHours())
+        let dataFirst = max(0, hour - Int64(candleLookback - 1 + warmup) * hourMS)
+        _ = try? await historyLoader.importResearch(id, from: dataFirst, through: hour - hourMS)
         // Each child publishes immediately; a slow source cannot withhold an
         // already-completed update from snapshot polling or strategy readings.
         async let candles = refreshChartSource(id, path: "/market/candles")
@@ -939,7 +946,8 @@ final class Radar {
         }
         var failures: [String] = []
         var candleLoadFailed = false
-        let warmupStart = max(0, requestedEnd - Int64(candleLookback - 1 + emaWarmupHours(200)) * hourMS)
+        let warmup = max(candleLookback, strategyChartHistoryHours())
+        let warmupStart = max(0, requestedEnd - Int64(candleLookback - 1 + warmup) * hourMS)
         do {
             _ = try? await historyLoader.importResearch(id, from: warmupStart, through: requestedEnd)
             var cached = try store.candles(id, since: warmupStart, through: requestedEnd)
@@ -1026,13 +1034,13 @@ final class Radar {
         let profile = try? store.selectedSuiteProfile("radar")
         var chartReplay: StrategyChartReplay?
         do {
-            let warmup = max(candleLookback, emaWarmupHours(200))
+            let hydration = try profile?.hydration()
+            let warmup = max(candleLookback, hydration?.requiredHours ?? 0)
             series = try store.candles(id, since: max(0, first - Int64(warmup) * hourMS), through: end)
             for (ts, bar) in candles[id] ?? [:] where ts >= first - Int64(warmup) * hourMS && ts <= end && (ts == hour || series[ts] == nil) { series[ts] = bar }
             let dataFirst = max(0, first - Int64(warmup) * hourMS)
             stats = try store.chartStats(id, since: dataFirst, through: end)
-            if let profile {
-                let hydration = try profile.hydration()
+            if let profile, let hydration {
                 let quotes = hydration.needsQuotes ? try store.hourlyQuotes(id, since: dataFirst, through: end) : [:]
                 let market = FilterMarketData(id: id, hour: end, now: end + hourMS, listedAt: rows[id]?.listedAt,
                     candles: series, stats: stats.mapValues { FilterStat(oi: $0.oi, sell: $0.sell, buy: $0.buy) }, quotes: quotes, historicalClose: true)

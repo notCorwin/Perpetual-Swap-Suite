@@ -2,7 +2,6 @@ import Foundation
 
 let defaultStrategyID = "builtin.default-strategy"
 private let defaultStrategyRevision = 1
-let radarStrategyContextHours = 48
 let radarChartHours = 96
 
 func radarStrategyReplayStart(chartEnd: Int64) -> Int64 {
@@ -127,7 +126,7 @@ struct StrategyChartSignal: Codable, Sendable, Equatable {
 struct StrategyChartReplay: Codable, Sendable, Equatable {
     var fromHour: Int64
     var throughHour: Int64
-    var contextHours = radarStrategyContextHours
+    var historyHours: Int
     var completedHours = 0
     var matchedHours = 0
     var unknownHours = 0
@@ -161,17 +160,18 @@ enum SuiteEvaluation {
     }
 }
 
-/// Replays a saved strategy one completed hour at a time. Each context is a
-/// rolling window ending at that candle, so neither future data nor data older
-/// than the configured context can influence the evaluation.
+/// Replays a saved strategy one completed hour at a time. Each context ends at
+/// that candle and includes the rule-required warm-up, so indicators are usable
+/// without exposing any future data to the evaluator.
 func strategyChartReplay(profile: StrategyProfile, market: FilterMarketData,
-                         reference: FilterMarketData? = nil, from: Int64, through: Int64) throws -> StrategyChartReplay {
-    var output = StrategyChartReplay(fromHour: from, throughHour: through)
-    guard from <= through else { return output }
+                          reference: FilterMarketData? = nil, from: Int64, through: Int64) throws -> StrategyChartReplay {
     let filters = try profile.compiled(), cooldowns = FilterCooldownMemory()
+    let historyHours = ResearchVersion.warmup(filters)
+    var output = StrategyChartReplay(fromHour: from, throughHour: through, historyHours: historyHours)
+    guard from <= through else { return output }
     func rollingContext(_ input: FilterMarketData, at anchor: Int64) -> FilterMarketData {
         var result = input
-        let first = max(0, anchor - Int64(radarStrategyContextHours - 1) * hourMS)
+        let first = max(0, anchor - Int64(historyHours) * hourMS)
         result.candles = input.candles.filter { $0.key >= first && $0.key <= anchor }
         result.stats = input.stats.filter { $0.key >= first && $0.key <= anchor }
         result.quotes = input.quotes.filter { $0.key >= first && $0.key <= anchor }
@@ -188,7 +188,9 @@ func strategyChartReplay(profile: StrategyProfile, market: FilterMarketData,
         return result
     }
     var episode = ResearchEpisode()
-    for hour in stride(from: from, through: through, by: Int(hourMS)) {
+    let replayFrom = from >= hourMS ? from - hourMS : from
+    for hour in stride(from: replayFrom, through: through, by: Int(hourMS)) {
+        let baseline = hour < from
         var context = rollingContext(market, at: hour)
         context.hour = hour; context.now = hour + hourMS
         context.current = [:]; context.previousEMA = nil; context.historicalClose = true
@@ -202,15 +204,15 @@ func strategyChartReplay(profile: StrategyProfile, market: FilterMarketData,
         } else { context.referenceBTC = nil }
         guard context.candles[hour]?.confirmed == true else {
             _ = episode.observe(.unknown)
-            output.unknownHours += 1
+            if !baseline { output.unknownHours += 1 }
             continue
         }
-        output.completedHours += 1
+        if !baseline { output.completedHours += 1 }
         let traces = SuiteEvaluation.traces(context, filters: filters)
         let matches = FilterTruth.all([traces[0].result, SuiteEvaluation.truth(traces, .bullishSetup)])
-        if matches == .yes { output.matchedHours += 1 }
-        if matches == .unknown { output.unknownHours += 1 }
-        if episode.observe(matches) == "entry", let close = context.candles[hour]?.close, close.isFinite, close > 0 {
+        if !baseline, matches == .yes { output.matchedHours += 1 }
+        if !baseline, matches == .unknown { output.unknownHours += 1 }
+        if episode.observe(matches, baseline: baseline) == "entry", let close = context.candles[hour]?.close, close.isFinite, close > 0 {
             output.signals.append(.init(hour: hour, price: close))
         }
     }

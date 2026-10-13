@@ -136,22 +136,32 @@ final class StrategyWorkflowTests: XCTestCase {
         XCTAssertEqual((hour - hourMS - start) / hourMS + 1, 95, "The live chart's forming candle is monitored, not historically replayed.")
     }
 
-    func testRadarChartBacktestUsesRolling48HourContextsEndingAtEachCandle() throws {
-        let start = hour - 60 * hourMS
-        let bars = Dictionary(uniqueKeysWithValues: (0...60).map { index in
+    func testRadarChartBacktestProvidesRuleWarmupWithoutFutureData() throws {
+        let start = hour - 1_100 * hourMS
+        let bars = Dictionary(uniqueKeysWithValues: (0...1_100).map { index in
             let timestamp = start + Int64(index) * hourMS
-            return (timestamp, Candle(hour: timestamp, high: 11, low: 9, close: 10, quoteVolume: 100, baseVolume: 1, open: 10))
+            let close = 10 + Double(index) / 100
+            return (timestamp, Candle(hour: timestamp, high: close + 1, low: close - 1, close: close, quoteVolume: 100, baseVolume: 1, open: close))
         })
         let market = FilterMarketData(id: "ETH-USDT-SWAP", hour: hour, now: hour + hourMS, listedAt: 1,
             candles: bars, stats: [:], quotes: [:], historicalClose: true)
-        let inside = try profile(universe: "Close > 0", setup: "lag(Close, 47) > 0")
-        let outside = try profile(universe: "Close > 0", setup: "lag(Close, 48) > 0")
-        let insideReport = try strategyChartReplay(profile: inside, market: market, from: hour, through: hour)
-        let outsideReport = try strategyChartReplay(profile: outside, market: market, from: hour, through: hour)
-        XCTAssertEqual(insideReport.contextHours, 48)
-        XCTAssertEqual(insideReport.matchedHours, 1)
-        XCTAssertEqual(outsideReport.matchedHours, 0)
-        XCTAssertEqual(outsideReport.unknownHours, 1, "Data before the rolling 48-hour context must remain inaccessible.")
+        let strategy = try profile(universe: "Close > 0", setup: "Close > EMA(200) AND RSI(24) >= 0 AND High > PriorExtreme(48, \"high\")")
+        let report = try strategyChartReplay(profile: strategy, market: market, from: hour, through: hour)
+        XCTAssertGreaterThanOrEqual(report.historyHours, 1_000)
+        XCTAssertEqual(report.matchedHours, 1)
+        XCTAssertEqual(report.unknownHours, 0, "EMA200, RSI24 and PriorExtreme(48) must receive their required historical warm-up.")
+    }
+
+    func testRadarChartBacktestSeedsTheVisibleBoundaryBeforeEmittingBuy() throws {
+        let prior = hour - hourMS
+        let bars = [
+            prior: Candle(hour: prior, high: 91, low: 89, close: 90, quoteVolume: 100, baseVolume: 1, open: 90),
+            hour: Candle(hour: hour, high: 111, low: 109, close: 110, quoteVolume: 100, baseVolume: 1, open: 110),
+        ]
+        let market = FilterMarketData(id: "ETH-USDT-SWAP", hour: hour, now: hour + hourMS, listedAt: 1,
+            candles: bars, stats: [:], quotes: [:], historicalClose: true)
+        let report = try strategyChartReplay(profile: profile(), market: market, from: hour, through: hour)
+        XCTAssertEqual(report.signals.map(\.hour), [hour], "A transition on the first visible candle must not be lost at the chart boundary.")
     }
 
     func testChartReplayReconstructsPastTurnoverWithoutInventingSpread() throws {

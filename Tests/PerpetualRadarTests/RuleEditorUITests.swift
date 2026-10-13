@@ -303,7 +303,7 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
             if let profile = try? Store(url: directory.appendingPathComponent("radar.sqlite3")).selectedSuiteProfile("radar") {
                 response["strategy"] = ["id": profile.id, "name": profile.name, "revision": profile.revision]
                 response["strategySignals"] = [["hour": hour - 5 * hourMS, "price": 110.0]]
-                response["strategyReplay"] = ["fromHour": hour - 95 * hourMS, "throughHour": hour - hourMS, "contextHours": 48,
+                response["strategyReplay"] = ["fromHour": hour - 95 * hourMS, "throughHour": hour - hourMS, "historyHours": 1001,
                     "completedHours": 95, "matchedHours": 3, "unknownHours": 0,
                     "signals": [["hour": hour - 5 * hourMS, "price": 110.0]]]
             }
