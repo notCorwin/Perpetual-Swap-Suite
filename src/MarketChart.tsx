@@ -6,8 +6,8 @@ import { Button } from "@/components/ui/button"
 import { ButtonGroup } from "@/components/ui/button-group"
 import { Spinner } from "@/components/ui/spinner"
 import { Toggle } from '@/components/ui/toggle'
-import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { Slider } from '@/components/ui/slider'
+import { RockerSwitch } from '@/components/ui/rocker-switch'
 import { ChartAnalysisPanel } from '@/ChartAnalysisPanel'
 import { ChartWorkspaceViewport } from '@/ChartWorkspaceViewport'
 import { chartAnalysis } from '@/analysis-service'
@@ -731,24 +731,16 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
     <div role="status" data-price-move-summary className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-xs">
       <span className="font-medium"><span className="text-positive">{longMoves} Long</span> · <span className="text-destructive">{shortMoves} Short</span></span>
       <span className="text-muted-foreground">{visibleMoveSignals.length} ranked non-overlapping segments · {moveObjective === 'amplitude' ? 'largest move first' : `highest |change| / K^${moveEfficiencyFactor.toFixed(1)} first`} · completed candles · move &gt; 1%</span>
-      <ToggleGroup type="single" variant="outline" size="sm" spacing={0} value={moveMode} onValueChange={value => {
-        if (!value) return
-        setMoveMode(value as PriceMoveMode)
-        // Radix single-select items are radios. Return focus to the chart so
-        // market-navigation shortcuts remain active immediately after switching.
+      <RockerSwitch size="sm" leftLabel="Close" rightLabel="High / Low" checked={moveMode === 'highLow'} onCheckedChange={checked => {
+        setMoveMode(checked ? 'highLow' : 'close')
+        // Return focus to the chart so market-navigation shortcuts remain
+        // active immediately after switching.
         plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus()
-      }} aria-label="Move price source" data-price-move-mode={moveMode}>
-        <ToggleGroupItem value="close">Close</ToggleGroupItem>
-        <ToggleGroupItem value="highLow">High / Low</ToggleGroupItem>
-      </ToggleGroup>
-      <ToggleGroup type="single" variant="outline" size="sm" spacing={0} value={moveObjective} onValueChange={value => {
-        if (!value) return
-        setMoveObjective(value as PriceMoveObjective)
+      }} aria-label="Move price source" data-price-move-mode={moveMode} />
+      <RockerSwitch size="sm" leftLabel="Max Move" rightLabel="Max Efficiency" checked={moveObjective === 'efficiency'} onCheckedChange={checked => {
+        setMoveObjective(checked ? 'efficiency' : 'amplitude')
         plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus()
-      }} aria-label="Move optimization objective" data-price-move-objective={moveObjective}>
-        <ToggleGroupItem value="amplitude">Max Move</ToggleGroupItem>
-        <ToggleGroupItem value="efficiency">Max Efficiency</ToggleGroupItem>
-      </ToggleGroup>
+      }} aria-label="Move optimization objective" data-price-move-objective={moveObjective} />
       <div className="flex w-32 items-center gap-2" data-price-move-efficiency-factor={moveEfficiencyFactor} title="Efficiency = |change| / periods^factor"><span className="shrink-0 text-muted-foreground">Factor</span><Slider min={0} max={2} step={0.1} value={[moveEfficiencyFactor]} aria-label="Chart efficiency factor" onValueChange={([value]) => setMoveEfficiencyFactor(value)} onValueCommit={() => plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus()} onPointerUp={() => plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus()} onKeyUp={() => plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus()} /><span className="w-5 text-right tabular-nums">{moveEfficiencyFactor.toFixed(1)}</span></div>
       <Toggle variant="outline" size="sm" pressed={showMoveLabels} onPressedChange={setShowMoveLabels} aria-label="Show move label layer" data-price-move-layer={showMoveLabels ? 'visible' : 'hidden'}>{showMoveLabels ? 'Labels On' : 'Labels Off'}</Toggle>
       <span className="ml-auto text-muted-foreground">Uses future data · labels only</span>
