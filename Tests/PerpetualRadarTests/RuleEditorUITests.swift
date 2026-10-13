@@ -125,6 +125,17 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
             if holdNextBlurSave { holdNextBlurSave = false; heldBlurSave = save } else { save() }
             return
         }
+        if ["chartMovePriceSource", "chartMoveObjective", "chartMoveLabelsVisible", "chartMoveEfficiencyFactor"].contains(where: { request[$0] != nil }) {
+            do {
+                guard try radar.setChartMoveDefaults(priceSource: request["chartMovePriceSource"] as? String,
+                    objective: request["chartMoveObjective"] as? String, labelsVisible: request["chartMoveLabelsVisible"] as? Bool,
+                    efficiencyFactor: request["chartMoveEfficiencyFactor"] as? Double) else {
+                    throw FilterError("Invalid chart move label defaults.")
+                }
+                revision += 1; replyHandler(snapshot(), nil)
+            } catch { replyHandler(nil, error.localizedDescription) }
+            return
+        }
         if let settings = request["analysisSettings"] as? [String: Any] {
             if settings["action"] as? String == "save" {
                 analysisModel = settings["model"] as! String
@@ -501,15 +512,21 @@ final class RuleEditorUITests: BackgroundTestCase {
             if let data=image.tiffRepresentation, let png=NSBitmapImageRep(data:data)?.representation(using:.png,properties:[:]) { try png.write(to:URL(fileURLWithPath:path)) }
         }
         _ = try await js(view,"document.querySelector('[data-signal-lane=bullishSetup] button[aria-label=\"View MKT001-USDT-SWAP chart\"]').click(); true")
-        try await wait(view,"document.querySelector('section[aria-label=\"MKT001-USDT-SWAP chart\"] [data-chart-move-direction]') !== null && document.querySelector('[data-chart-move-exit-direction]')?.textContent.includes('EXIT') && document.querySelector('[data-price-move-summary]')?.innerText.includes('Uses future data') && !document.querySelector('[data-strategy-chart-summary]') && !document.querySelector('[data-chart-buy-hour]')")
-        try await click(view,"High / Low")
-        try await wait(view,"document.querySelector('[data-price-move-mode]')?.dataset.priceMoveMode === 'highLow' && document.activeElement?.matches('svg[tabindex=\"0\"]')")
+        try await wait(view,"document.querySelector('section[aria-label=\"MKT001-USDT-SWAP chart\"] [data-chart-move-direction]') !== null && document.querySelector('[data-chart-move-exit-direction]')?.textContent.includes('EXIT') && document.querySelector('[data-price-move-mode]')?.dataset.priceMoveMode === 'highLow' && document.querySelector('[data-price-move-objective]')?.dataset.priceMoveObjective === 'amplitude' && document.querySelector('[data-price-move-layer]')?.dataset.priceMoveLayer === 'visible' && Number(document.querySelector('[data-price-move-efficiency-factor]')?.dataset.priceMoveEfficiencyFactor) === 1 && document.querySelector('[data-price-move-summary]')?.innerText.includes('Uses future data') && !document.querySelector('[data-strategy-chart-summary]') && !document.querySelector('[data-chart-buy-hour]')")
         try await click(view,"Close")
         try await wait(view,"document.querySelector('[data-price-move-mode]')?.dataset.priceMoveMode === 'close' && document.activeElement?.matches('svg[tabindex=\"0\"]')")
+        try await click(view,"High / Low")
+        try await wait(view,"document.querySelector('[data-price-move-mode]')?.dataset.priceMoveMode === 'highLow' && document.activeElement?.matches('svg[tabindex=\"0\"]')")
         try await click(view,"Max Efficiency")
         try await wait(view,"document.querySelector('[data-price-move-objective]')?.dataset.priceMoveObjective === 'efficiency' && document.activeElement?.matches('svg[tabindex=\"0\"]')")
         try await click(view,"Max Move")
         try await wait(view,"document.querySelector('[data-price-move-objective]')?.dataset.priceMoveObjective === 'amplitude' && document.activeElement?.matches('svg[tabindex=\"0\"]')")
+        _ = try await js(view,"(() => { const slider=document.querySelector('[role=slider][aria-label=\"Chart efficiency factor\"]'); slider.focus(); slider.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true,cancelable:true})); slider.dispatchEvent(new KeyboardEvent('keyup',{key:'ArrowRight',bubbles:true,cancelable:true})); return true; })()")
+        try await wait(view,"Number(document.querySelector('[data-price-move-efficiency-factor]')?.dataset.priceMoveEfficiencyFactor) === 1.1")
+        try await click(view,"Labels On")
+        try await wait(view,"document.querySelector('[data-price-move-layer]')?.dataset.priceMoveLayer === 'hidden' && !document.querySelector('[data-chart-move-direction]')")
+        try await click(view,"Labels Off")
+        try await wait(view,"document.querySelector('[data-price-move-layer]')?.dataset.priceMoveLayer === 'visible' && Boolean(document.querySelector('[data-chart-move-direction]'))")
         let latestChartEnd = try await js(view,"Number(document.querySelector('[data-chart-inst]').dataset.chartEnd)") as? Double
         _ = try await js(view,"document.querySelector('[data-chart-plot]').dispatchEvent(new WheelEvent('wheel',{deltaY:120,bubbles:true,cancelable:true})); true")
         try await wait(view,"Number(document.querySelector('[data-chart-inst]').dataset.chartEnd) < \(latestChartEnd ?? 0)")
