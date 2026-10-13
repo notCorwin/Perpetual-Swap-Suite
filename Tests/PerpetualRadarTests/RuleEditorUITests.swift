@@ -418,7 +418,10 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await wait(view,"document.querySelector('[data-rule-library]')?.innerText.includes('BTC Market Context')")
         _ = try await js(view,"document.querySelector('[data-library-id=\"preset:btc-crash\"]').click(); true")
         try await validDraft(view)
-        try await wait(view,"document.querySelector('[aria-label=\"Window hours\"]')?.value === '0' && document.querySelector('[data-btc-reading-source]')?.innerText.includes('BTC-USDT-SWAP')")
+        try await wait(view,"document.querySelector('[aria-label=\"Window hours\"]')?.value === '0'")
+        try await click(view,"Explain markets")
+        try await wait(view,"document.querySelector('[role=dialog] [data-btc-reading-source]')?.innerText.includes('BTC-USDT-SWAP')")
+        try await click(view,"Done")
         try await input(view,"[aria-label=\"Window hours\"]","2"); try await validDraft(view)
         try await wait(view,"document.querySelector('[aria-label=\"Window hours\"]')?.value === '2'")
         // BTC clock and indicator parameters are edited as typed controls.
@@ -429,7 +432,10 @@ final class RuleEditorUITests: BackgroundTestCase {
         _ = try await openMenu(view,selector: "[aria-label=\"Left expression BTC clock\"]")
         try await option(view,"Latest closed BTC hour")
         try await validDraft(view)
-        try await wait(view,"Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 0 && document.querySelector('[data-btc-reading-source]')?.innerText.includes('Closed')")
+        try await wait(view,"Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 0")
+        try await click(view,"Explain markets")
+        try await wait(view,"document.querySelector('[role=dialog] [data-btc-reading-source]')?.innerText.includes('Closed')")
+        try await click(view,"Done")
         try await input(view,"[aria-label=\"Left expression Source expression Period (h)\"]","3")
         try await validDraft(view)
         for theme in [NSAppearance.Name.aqua,.darkAqua] {
@@ -2273,7 +2279,7 @@ final class RuleEditorUITests: BackgroundTestCase {
     }
 
     @MainActor
-    func testConditionLibraryTemplatesGuidedCardsUndoBulkAndInlineReadings() async throws {
+    func testConditionLibraryTemplatesGuidedCardsUndoAndBulkEditing() async throws {
         guard ProcessInfo.processInfo.environment["RADAR_UI_TESTS"] == "1" else { throw XCTSkip("Run npm run test:ui after building the Web renderer.") }
         let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist"), marketCount: 20), configuration = uiConfiguration()
@@ -2293,7 +2299,9 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await wait(view, "document.querySelector('[data-library-id=\"metric:oiTrend\"]') !== null")
         _ = try await js(view, "document.querySelector('[data-library-id=\"metric:oiTrend\"]').click(); true")
         try await validDraft(view)
-        try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 7 && document.querySelector('[data-rule-preview]')?.innerText.includes('rising')")
+        try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 7")
+        let contractCheckRemoved = try await js(view, "document.querySelector('[data-rule-preview]') === null && !document.body.innerText.includes('Check a contract')") as? Bool
+        XCTAssertEqual(contractCheckRemoved, true)
         let noFormula = try await js(view, "document.querySelector('textarea') === null") as? Bool
         XCTAssertEqual(noFormula, true)
         try await click(view, "Guided cards")

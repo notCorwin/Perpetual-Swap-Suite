@@ -65,7 +65,7 @@ Search narrows the visible list. Click column headings to sort; the default **Op
 
 1. In **Strategy Library**, choose a Strategy and its **Universe** or **Bullish Setup** rules, then open **Rules**, then **Add condition**. Search the condition library or choose a preset such as OI rising, Volume surge, or a BTC market context condition.
 2. Edit conditions in sentence rows or **Guided cards**. Select **Live** for the forming hour or **Closed** for completed-hour evaluation; combine conditions with groups, calculations, or time requirements.
-3. Use **Check a contract** or **Explain markets** to inspect matching, unmatched, and Unknown results.
+3. Use **Explain markets** to inspect matching, unmatched, and Unknown results.
 4. Choose **Save strategy** to save Universe and Bullish Setup together. In Radar’s **All markets → Universe rules** panel, **Save Universe** updates the active Strategy directly.
 
 Valid draft edits immediately preview rule matches. The All markets table remains complete. Alerts use the **active saved Strategy**. Invalid drafts retain the last valid preview and cannot be applied. Missing inputs evaluate as **Unknown**, including under NOT; only True Universe and Bullish Setup matches become signals.
@@ -230,6 +230,6 @@ GitHub Actions handles **CD only**. Every push to `main` builds and packages the
 
 Maintained by [notCorwin](https://github.com/notCorwin). Report bugs or request features through [GitHub Issues](https://github.com/notCorwin/Perpetual-Swap-Suite/issues); include your macOS version, build revision, reproduction steps, and the relevant error message or data gap.
 
-The in-app condition library, **Check a contract**, and **Explain markets** describe supported rules and their readings. Developers can inspect the [native indicator/function catalog](Sources/PerpetualRadar/FilterCatalog.swift), [rule compiler](Sources/PerpetualRadar/FilterCompiler.swift), and [tests](Tests/PerpetualRadarTests) for executable examples.
+The in-app condition library and **Explain markets** describe supported rules and their readings. Developers can inspect the [native indicator/function catalog](Sources/PerpetualRadar/FilterCatalog.swift), [rule compiler](Sources/PerpetualRadar/FilterCompiler.swift), and [tests](Tests/PerpetualRadarTests) for executable examples.
 
 Before contributing, read [AGENTS.md](AGENTS.md). Keep system services in Swift/native APIs, reuse shadcn/ui components, and follow the shared design tokens and `data-surface` material contract. Use current stable toolchains, run `npm run ci:local` before pushing, and keep GitHub Actions focused on release delivery. Submit focused pull requests with a description of the resulting behavior and local validation.

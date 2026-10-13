@@ -21,11 +21,11 @@ export type NativeMarketRow = MarketRow & { opportunity: OpportunityResult }
 export type FilterDraftRevision = { config: FilterConfigV2; source: string | null; expressionDrafts?: Record<string, EditorExpression> }
 export type FilterEditorState = {
   open: boolean; tab: "rules" | "formula"; source: string | null; collapsed: Record<string, boolean>
-  selectedRuleId: string | null; selectedIds: string[]; past: FilterDraftRevision[]; future: FilterDraftRevision[]; explainId: string | null
+  selectedRuleId: string | null; selectedIds: string[]; past: FilterDraftRevision[]; future: FilterDraftRevision[]
   nameDrafts: Record<string, string>
   expressionDrafts: Record<string, EditorExpression>
 }
-export const initialEditorState = (): FilterEditorState => ({ open: false, tab: "rules", source: null, collapsed: {}, selectedRuleId: null, selectedIds: [], past: [], future: [], explainId: null, nameDrafts: {}, expressionDrafts: {} })
+export const initialEditorState = (): FilterEditorState => ({ open: false, tab: "rules", source: null, collapsed: {}, selectedRuleId: null, selectedIds: [], past: [], future: [], nameDrafts: {}, expressionDrafts: {} })
 // WKWebView's custom radar:// origin can omit randomUUID while still providing
 // getRandomValues. Draft identities must work in the packaged native app.
 export function newRuleID(): string {

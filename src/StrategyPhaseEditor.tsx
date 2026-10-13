@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react'
 import { pageVisible } from '@/lib/utils'
 import { StrategyRules } from '@/StrategyRules'
-import { FilterExplanation } from '@/FilterExplanation'
 import { FieldDescription } from '@/components/ui/field'
 import { newRuleID, type FilterLibraryPreferences, type FilterTruth, type NativeMarketRow } from '@/rule-engine'
 import type { ResearchInputs } from '@/research-types'
@@ -14,9 +13,8 @@ export function StrategyPhaseEditor({ label, model, inputs, preferences, onPrefe
   statusKey?: string; onStatus?: (key: string, status: StageStatus) => void
 }) {
   const [rows, setRows] = useState<NativeMarketRow[]>([]), [results, setResults] = useState<Record<string, FilterTruth>>({})
-  const [revision, setRevision] = useState(0), [previewJSON, setPreviewJSON] = useState<string | null>(null)
+  const [previewJSON, setPreviewJSON] = useState<string | null>(null)
   const [history, setHistory] = useState<{ pending: number; completed: number; error: string } | null>(null)
-  const [explaining, setExplaining] = useState<string | null>(null)
   useEffect(() => {
     if (!active || !model.lastValid) return
     let stopped = false, timer: number, backoff = 2000
@@ -29,7 +27,7 @@ export function StrategyPhaseEditor({ label, model, inputs, preferences, onPrefe
         if ("unchanged" in snapshot) {
           backoff = Math.min(backoff * 1.5, 30000)
         } else {
-          setRows(snapshot.rows); setResults(snapshot.filterResults); setRevision(snapshot.revision); setHistory(snapshot.historyProgress); setPreviewJSON(json)
+          setRows(snapshot.rows); setResults(snapshot.filterResults); setHistory(snapshot.historyProgress); setPreviewJSON(json)
           backoff = 2000
         }
       } catch (cause) {
@@ -49,12 +47,10 @@ export function StrategyPhaseEditor({ label, model, inputs, preferences, onPrefe
   useEffect(() => { if (previewJSON !== null) onStatus?.(statusKey, { matches, total: rows.length, unknown }) }, [onStatus, statusKey, matches, rows.length, unknown, previewJSON])
   return <section aria-label={label} className="flex flex-col gap-3" data-strategy-rules>
     {description && <FieldDescription className="px-4">{description}</FieldDescription>}
-    <StrategyRules label={label} embedded atClose strategyID={strategyID} filters={model.filters} draft={model.draft} editor={model.editor} onEditorChange={model.setEditor} onDraftChange={model.setDraft} onApply={model.keep}
+    <StrategyRules label={label} embedded filters={model.filters} draft={model.draft} editor={model.editor} onEditorChange={model.setEditor} onDraftChange={model.setDraft} onApply={model.keep}
       metrics={metrics} templates={inputs.templates} preferences={preferences} onPreferences={onPreferences}
-      rows={rows} results={results} previewJSON={previewJSON} revision={revision} onExplain={setExplaining} units={model.compilation.units ?? {}} expressions={expressions}
+      previewJSON={previewJSON} units={model.compilation.units ?? {}} expressions={expressions}
       diagnostics={model.compilation.diagnostics} valid={model.valid} compiling={model.compiling} requiredHours={model.compilation.requiredHours ?? 0}
       matches={matches} total={rows.length} unknown={unknown} previewPending={previewJSON !== model.lastValid} history={history} />
-    <FilterExplanation open={active && Boolean(explaining)} onOpenChange={open => { if (!open) setExplaining(null) }} instId={explaining} onSelect={setExplaining} rows={rows} results={results} filtersJSON={previewJSON} revision={revision}
-      metrics={inputs.metrics} expressions={expressions} units={model.compilation.units ?? {}} templates={inputs.templates} atClose strategyID={strategyID} />
   </section>
 }

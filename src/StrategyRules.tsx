@@ -11,22 +11,21 @@ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { FilterNameInput } from '@/FilterNameInput'
 import { ExpressionInput } from '@/FilterExpressionInput'
 import { RuleInspector, RuleOutline, RulePicker, type RuleDropTarget, type RuleTreeContext } from '@/FilterRuleEditor'
-import { FilterRulePreview } from '@/FilterRulePreview'
 import { RuleLibrary } from '@/RuleLibrary'
 import { addLibraryRule, conditionLibrary, renameValueReferences, rulePath, topLevelSelection, visualPresets, type LibraryItem } from '@/filter-builder'
 import type { ExpressionTemplate } from '@/filter-expression'
 import { filterRuleSummary } from '@/filter-summary'
 import { cn } from '@/lib/utils'
-import { duplicateRule, emptyFilterConfig, findParent, findRule, newRuleID, parseFilterConfig, removeRule, ruleCount, updateRule, type EditorExpression, type FilterConfigV2, type FilterDraftRevision, type FilterEditorState, type FilterLibraryPreferences, type FilterMetric, type FilterTruth, type NativeMarketRow, type RuleNode } from '@/rule-engine'
+import { duplicateRule, emptyFilterConfig, findParent, findRule, newRuleID, parseFilterConfig, removeRule, ruleCount, updateRule, type EditorExpression, type FilterConfigV2, type FilterDraftRevision, type FilterEditorState, type FilterLibraryPreferences, type FilterMetric, type RuleNode } from '@/rule-engine'
 
 type Props = {
-  label?: string; embedded?: boolean; atClose?: boolean; strategyID?: string
+  label?: string; embedded?: boolean
   filters: FilterConfigV2; draft: FilterConfigV2 | null; editor: FilterEditorState
   onDraftChange: (draft: FilterConfigV2 | null) => void; onEditorChange: Dispatch<SetStateAction<FilterEditorState>>
   onApply: (filters: FilterConfigV2) => Promise<void>
   metrics: FilterMetric[]; templates: ExpressionTemplate[]; units: Record<string, string>; expressions: Record<string, EditorExpression>; diagnostics: string[]; valid: boolean; compiling: boolean; requiredHours: number
   preferences: FilterLibraryPreferences; onPreferences: (preferences: FilterLibraryPreferences) => Promise<void>
-  rows: NativeMarketRow[]; results: Record<string, FilterTruth>; previewJSON: string | null; revision: number; onExplain: (id: string) => void
+  previewJSON: string | null
   matches: number; total: number; unknown: number; previewPending: boolean; history: { pending: number; completed: number; error: string } | null
 }
 export function StrategyRules(props: Props) {
@@ -78,7 +77,6 @@ export function StrategyRules(props: Props) {
   }
   const rememberExpression = (expression: EditorExpression) => onEditorChange(current => ({ ...current, expressionDrafts: { ...current.expressionDrafts, [expression.source]: expression } }))
   const tree: RuleTreeContext = { config: draft, edit, select, selectedId: selectedRule.id, metrics, units: props.units, expressions: props.expressions, templates: props.templates, editor, setEditor: onEditorChange, disabled: saving, guided, rememberExpression, dragging, setDragging, drop, setDrop, addInto: id => { select(id); setLibraryOpen(true) } }
-  const preview = <FilterRulePreview nodeId={selectedRule.id} rows={props.rows} results={props.results} filtersJSON={props.previewJSON} revision={props.revision} instId={editor.explainId} onSelect={id => onEditorChange(current => ({ ...current, explainId: id }))} onExplain={props.onExplain} metrics={metrics} expressions={props.expressions} units={props.units} templates={props.templates} valid={props.valid} atClose={props.atClose} strategyID={props.strategyID} />
   return <Collapsible open={editor.open} onOpenChange={open => onEditorChange(current => ({ ...current, open }))} className="border-b px-4 py-3" onKeyDown={event => {
     if (event.defaultPrevented) return
     const typing = event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement
@@ -112,8 +110,8 @@ export function StrategyRules(props: Props) {
           <div className="flex items-center gap-2"><RuleLibrary metrics={metrics} templates={props.templates} preferences={props.preferences} onPreferences={preferences} onAdd={add} open={libraryOpen} onOpenChange={setLibraryOpen} /><Button type="button" variant="outline" onClick={() => preset('rule:all')}><Plus data-icon="inline-start" aria-hidden="true" />Add group</Button><div className="w-64"><RulePicker label="Rule example" value="example" choices={[["example", "More ready-to-use conditions…"], ...visualPresets.map(p => [p.id, p.label])]} onChange={value => { if (value !== 'example') preset(value) }} /></div><span className="text-xs text-muted-foreground">Ctrl+Space to find a condition</span><div className="ml-auto flex items-center gap-1"><Button type="button" variant="ghost" size="icon" aria-label="Undo rule edit" disabled={!editor.past.length} onClick={() => travel('undo')}><Undo2 aria-hidden="true" /></Button><Button type="button" variant="ghost" size="icon" aria-label="Redo rule edit" disabled={!editor.future.length} onClick={() => travel('redo')}><Redo2 aria-hidden="true" /></Button></div></div>
           {bulkIds.length > 0 && <div className="flex items-center gap-2"><Badge variant="outline">{bulkIds.length} selected</Badge><Button type="button" variant="outline" size="sm" onClick={() => bulk('live')}>Set Live</Button><Button type="button" variant="outline" size="sm" onClick={() => bulk('closed')}>Set Closed</Button><Button type="button" variant="outline" size="sm" onClick={() => bulk('copy')}><Copy data-icon="inline-start" aria-hidden="true" />Duplicate selected</Button><Button type="button" variant="outline" size="sm" onClick={() => bulk('delete')}><Trash2 data-icon="inline-start" aria-hidden="true" />Remove selected</Button><Button type="button" variant="ghost" size="sm" onClick={() => onEditorChange(current => ({ ...current, selectedIds: [] }))}>Clear selection</Button></div>}
           <div className={cn('grid items-start gap-4', !guided && 'grid-cols-[minmax(0,1fr)_minmax(36rem,0.85fr)]')} data-rule-layout={props.preferences.layout}>
-            <div className="flex min-w-0 flex-col gap-3"><RuleOutline node={draft.root} tree={tree} />{!draft.root.children.length && <Empty><EmptyHeader><EmptyTitle>All contracts in the universe</EmptyTitle><EmptyDescription>Choose a ready-to-use condition or search the complete library. Every market restriction is visible in the rule tree.</EmptyDescription></EmptyHeader></Empty>}{guided && preview}</div>
-            {!guided && <aside data-surface="panel" className="flex min-w-0 flex-col gap-4 rounded-lg border bg-card p-4" aria-label="Selected rule editor"><RuleInspector key={selectedRule.id} node={selectedRule} tree={tree} />{props.diagnostics.length > 0 && <FieldError role="alert">{props.diagnostics.join(' ')}</FieldError>}{preview}</aside>}
+            <div className="flex min-w-0 flex-col gap-3"><RuleOutline node={draft.root} tree={tree} />{!draft.root.children.length && <Empty><EmptyHeader><EmptyTitle>All contracts in the universe</EmptyTitle><EmptyDescription>Choose a ready-to-use condition or search the complete library. Every market restriction is visible in the rule tree.</EmptyDescription></EmptyHeader></Empty>}</div>
+            {!guided && <aside data-surface="panel" className="flex min-w-0 flex-col gap-4 rounded-lg border bg-card p-4" aria-label="Selected rule editor"><RuleInspector key={selectedRule.id} node={selectedRule} tree={tree} />{props.diagnostics.length > 0 && <FieldError role="alert">{props.diagnostics.join(' ')}</FieldError>}</aside>}
           </div>
           <Collapsible><CollapsibleTrigger asChild><Button type="button" variant="ghost" size="sm"><ChevronDown data-icon="inline-start" aria-hidden="true" />Reusable values{draft.definitions.length > 0 ? ` (${draft.definitions.length})` : ''}</Button></CollapsibleTrigger><CollapsibleContent className="pt-3"><FieldSet><FieldLegend>Reusable values</FieldLegend><FieldDescription>Build a value with indicators and calculation blocks, give it a name, then select it in any condition.</FieldDescription><FieldGroup className="mt-3 gap-3">{draft.definitions.map(item => <FieldGroup key={item.id} className="grid grid-cols-[16rem_minmax(0,1fr)_auto] items-start gap-3"><Field><FieldLabel>Value name</FieldLabel><FilterNameInput id={item.id} name={item.name} label="Value name" editor={editor} setEditor={onEditorChange} onCommit={name => {
         const next = renameValueReferences(draft, { [item.name]: name }, props.expressions)
