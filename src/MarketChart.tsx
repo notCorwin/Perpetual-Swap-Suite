@@ -1,13 +1,12 @@
 import { memo, startTransition, useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from "react"
 import { flushSync } from "react-dom"
-import { ArrowLeft, Camera, Radio } from "lucide-react"
+import { ArrowLeft, ArrowLeftRight, Camera, Radio } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { ButtonGroup } from "@/components/ui/button-group"
 import { Spinner } from "@/components/ui/spinner"
 import { Toggle } from '@/components/ui/toggle'
-import { Slider } from '@/components/ui/slider'
-import { RockerSwitch } from '@/components/ui/rocker-switch'
+import { Input } from '@/components/ui/input'
 import { ChartAnalysisPanel } from '@/ChartAnalysisPanel'
 import { ChartWorkspaceViewport } from '@/ChartWorkspaceViewport'
 import { chartAnalysis } from '@/analysis-service'
@@ -396,6 +395,8 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
   const [moveObjective, setMoveObjective] = useState<PriceMoveObjective>(moveDefaults.chartMoveObjective)
   const [showMoveLabels, setShowMoveLabels] = useState(moveDefaults.chartMoveLabelsVisible)
   const [moveEfficiencyFactor, setMoveEfficiencyFactor] = useState(moveDefaults.chartMoveEfficiencyFactor)
+  const [moveEfficiencyFactorDraft, setMoveEfficiencyFactorDraft] = useState(String(moveDefaults.chartMoveEfficiencyFactor))
+  const [moveEfficiencyFactorError, setMoveEfficiencyFactorError] = useState(false)
   const analysisBusy = analysis?.phase === 'capturing' || analysis?.phase === 'streaming'
   useEffect(() => () => chartAnalysis.stop(instId), [instId])
   const [displayed, setDisplayed] = useState<{ id: string; data: ChartResponse } | null>(null)
@@ -680,6 +681,17 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
     startTransition(() => setWindowEnd(next))
     endInspection()
   }
+  const commitMoveEfficiencyFactor = () => {
+    const value = Number(moveEfficiencyFactorDraft)
+    if (!moveEfficiencyFactorDraft.trim() || !Number.isFinite(value) || value < 0 || value > 2) {
+      setMoveEfficiencyFactorError(true)
+      return false
+    }
+    setMoveEfficiencyFactorError(false)
+    setMoveEfficiencyFactorDraft(String(value))
+    setMoveEfficiencyFactor(value)
+    return true
+  }
   const active = bars[inspected ?? bars.length - 1]
   const atHistoryBoundary = historicalEnd !== null && historyBoundary?.id === instId
     && historicalEnd === Math.min(chart?.bars.at(-1)?.hour ?? historicalEnd, historyBoundary.oldestHour + 95 * 3_600_000)
@@ -730,17 +742,17 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
     </header>
     <div role="status" data-price-move-summary className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-xs">
       <span className="font-medium"><span className="text-positive">{longMoves} Long</span> · <span className="text-destructive">{shortMoves} Short</span></span>
-      <RockerSwitch size="sm" leftLabel="Close" rightLabel="High / Low" checked={moveMode === 'highLow'} onCheckedChange={checked => {
-        setMoveMode(checked ? 'highLow' : 'close')
+      <Button variant="ghost" size="sm" onClick={() => {
+        setMoveMode(current => current === 'highLow' ? 'close' : 'highLow')
         // Return focus to the chart so market-navigation shortcuts remain
         // active immediately after switching.
         plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus()
-      }} aria-label="Move price source" data-price-move-mode={moveMode} />
-      <RockerSwitch size="sm" leftLabel="Max Move" rightLabel="Max Efficiency" checked={moveObjective === 'efficiency'} onCheckedChange={checked => {
-        setMoveObjective(checked ? 'efficiency' : 'amplitude')
+      }} aria-label="Move price source" title={`Switch to ${moveMode === 'highLow' ? 'Close' : 'High / Low'}`} data-price-move-mode={moveMode}><span className="font-semibold">{moveMode === 'highLow' ? 'High / Low' : 'Close'}</span><ArrowLeftRight data-icon="inline-end" aria-hidden="true" /></Button>
+      <Button variant="ghost" size="sm" onClick={() => {
+        setMoveObjective(current => current === 'efficiency' ? 'amplitude' : 'efficiency')
         plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus()
-      }} aria-label="Move optimization objective" data-price-move-objective={moveObjective} />
-      <div className="flex w-32 items-center gap-2" data-price-move-efficiency-factor={moveEfficiencyFactor} title="Efficiency = |change| / periods^factor"><span className="shrink-0 text-muted-foreground">Factor</span><Slider min={0} max={2} step={0.1} value={[moveEfficiencyFactor]} aria-label="Chart efficiency factor" onValueChange={([value]) => setMoveEfficiencyFactor(value)} onValueCommit={() => plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus()} onPointerUp={() => plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus()} onKeyUp={() => plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus()} /><span className="w-5 text-right tabular-nums">{moveEfficiencyFactor.toFixed(1)}</span></div>
+      }} aria-label="Move optimization objective" title={`Switch to ${moveObjective === 'efficiency' ? 'Max Move' : 'Max Efficiency'}`} data-price-move-objective={moveObjective}><span className="font-semibold">{moveObjective === 'efficiency' ? 'Max Efficiency' : 'Max Move'}</span><ArrowLeftRight data-icon="inline-end" aria-hidden="true" /></Button>
+      <div className="flex items-center gap-2" data-price-move-efficiency-factor={moveEfficiencyFactor} title="Efficiency = |change| / periods^factor"><label htmlFor="chart-efficiency-factor" className="text-muted-foreground">Factor</label><Input id="chart-efficiency-factor" className="h-(--control-height-sm) w-16" type="number" min="0" max="2" step="0.1" inputMode="decimal" value={moveEfficiencyFactorDraft} aria-label="Chart efficiency factor" aria-invalid={moveEfficiencyFactorError} onChange={event => { setMoveEfficiencyFactorDraft(event.target.value); setMoveEfficiencyFactorError(false) }} onBlur={commitMoveEfficiencyFactor} onKeyDown={event => { if (event.key === 'Enter') { if (commitMoveEfficiencyFactor()) plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus() } }} /></div>
       <Toggle variant="outline" size="sm" pressed={showMoveLabels} onPressedChange={setShowMoveLabels} aria-label="Show move label layer" data-price-move-layer={showMoveLabels ? 'visible' : 'hidden'}>{showMoveLabels ? 'Labels On' : 'Labels Off'}</Toggle>
     </div>
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}{historicalEnd !== null && <Button variant="outline" size="sm" onClick={() => {
