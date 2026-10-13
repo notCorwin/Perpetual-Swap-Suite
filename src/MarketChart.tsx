@@ -5,6 +5,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { ButtonGroup } from "@/components/ui/button-group"
 import { Spinner } from "@/components/ui/spinner"
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { ChartAnalysisPanel } from '@/ChartAnalysisPanel'
 import { ChartWorkspaceViewport } from '@/ChartWorkspaceViewport'
 import { chartAnalysis } from '@/analysis-service'
@@ -16,7 +17,7 @@ import { chartHistoryNeedsLoad, livePriceTag, scrollChartEnd, visibleChartBars }
 import { cn, pageVisible } from "@/lib/utils"
 import { chartNavigationTarget, wrappedMarket } from "@/market-sort"
 import { finitePercentage, formatPercent, type PercentageValue } from "@/market-percent"
-import { capturePriceMoves, type PriceMoveSignal } from '@/price-move-signals'
+import { capturePriceMoves, type PriceMoveMode, type PriceMoveSignal } from '@/price-move-signals'
 import { SnapshotOrder } from '@/snapshot-order'
 import { mergeChartBars } from '@/chart-snapshot'
 
@@ -375,6 +376,7 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
 export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack, backLabel = 'Markets' }: { instId: string; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void; onBack: () => void; backLabel?: string }) {
   const analysis = useSyncExternalStore(chartAnalysis.subscribe, () => chartAnalysis.get(instId))
   const [analysisOpen, setAnalysisOpen] = useState(() => chartAnalysis.get(instId) !== null)
+  const [moveMode, setMoveMode] = useState<PriceMoveMode>('close')
   const analysisBusy = analysis?.phase === 'capturing' || analysis?.phase === 'streaming'
   useEffect(() => () => chartAnalysis.stop(instId), [instId])
   const [displayed, setDisplayed] = useState<{ id: string; data: ChartResponse } | null>(null)
@@ -627,7 +629,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
 
   const viewportEnd = historicalEnd ?? chart?.bars.at(-1)?.hour ?? 0
   const bars = useMemo(() => visibleChartBars(cachedBars, viewportEnd), [cachedBars, viewportEnd])
-  const moveSignals = useMemo(() => capturePriceMoves(cachedBars), [cachedBars])
+  const moveSignals = useMemo(() => capturePriceMoves(cachedBars, 1, moveMode), [cachedBars, moveMode])
   const visibleMoveSignals = useMemo(() => {
     const hours = new Set(bars.map(bar => Number(bar.hour)))
     return moveSignals.filter(signal => hours.has(Number(signal.hour)))
@@ -682,7 +684,8 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
   }
   const longMoves = visibleMoveSignals.filter(signal => signal.direction === 'long').length
   const shortMoves = visibleMoveSignals.length - longMoves
-  const chartDescription = `OKX perpetual · 1h · ${historicalEnd === null ? "Latest 96 hours" : `History through ${time(historicalEnd)}`} · Future-aware Long and Short labels capture close-to-close moves over 1% · Hold to inspect · Scroll chart for history · 24h turnover rank ${turnoverPosition + 1}/${turnoverOrder.length} · ↑/↓ list order · ← list first · → turnover first`
+  const moveSource = moveMode === 'close' ? 'Close' : 'High / Low'
+  const chartDescription = `OKX perpetual · 1h · ${historicalEnd === null ? "Latest 96 hours" : `History through ${time(historicalEnd)}`} · Future-aware Long and Short labels capture ${moveMode === 'close' ? 'close-to-close' : 'Low-to-High and High-to-Low'} moves over 1% · Hold to inspect · Scroll chart for history · 24h turnover rank ${turnoverPosition + 1}/${turnoverOrder.length} · ↑/↓ list order · ← list first · → turnover first`
   return <ChartWorkspaceViewport expanded={analysisOpen}><main className="flex h-full min-h-0 flex-col overflow-hidden overscroll-none text-sm font-normal tabular-nums">
     <header className="flex shrink-0 items-center gap-3 border-b px-4 py-2">
       <Button variant="ghost" size="sm" onClick={onBack}><ArrowLeft data-icon="inline-start" aria-hidden="true" />{backLabel}</Button>
@@ -701,11 +704,15 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
       </ButtonGroup>
       <span role="status" className="sr-only">{captureStatus === "flashing" ? "Chart copied to clipboard" : ""}</span>
       <Badge variant="secondary"><Radio data-icon="inline-start" aria-hidden="true" />{historicalEnd !== null ? "History" : active && !active.confirmed ? "Live candle" : "Hourly chart"}</Badge>
-      <Badge variant="outline" title="Hindsight labels use future completed closes and are not live trading signals">{longMoves} Long · {shortMoves} Short</Badge>
+      <Badge variant="outline" title={`Hindsight labels use future completed candle ${moveSource} values and are not live trading signals`}>{longMoves} Long · {shortMoves} Short</Badge>
     </header>
     <div role="status" data-price-move-summary className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-xs">
       <span className="font-medium"><span className="text-positive">{longMoves} Long</span> · <span className="text-destructive">{shortMoves} Short</span></span>
-      <span className="text-muted-foreground">Completed closes · move &gt; 1% · maximum swing first · shortest K-line span second</span>
+      <span className="text-muted-foreground">Completed candles · move &gt; 1% · maximum swing first · shortest K-line span second</span>
+      <ToggleGroup type="single" variant="outline" size="sm" spacing={0} value={moveMode} onValueChange={value => { if (value) setMoveMode(value as PriceMoveMode) }} aria-label="Move price source" data-price-move-mode={moveMode}>
+        <ToggleGroupItem value="close">Close</ToggleGroupItem>
+        <ToggleGroupItem value="highLow">High / Low</ToggleGroupItem>
+      </ToggleGroup>
       <span className="ml-auto text-muted-foreground">Uses future data · labels only</span>
     </div>
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}{historicalEnd !== null && <Button variant="outline" size="sm" onClick={() => {
