@@ -1561,10 +1561,10 @@ final class RuleEditorUITests: BackgroundTestCase {
         while bridge.heldChartLoadReply == nil, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
         XCTAssertNotNil(bridge.heldChartLoadReply, "The network hydration request must remain pending during this check.")
         bridge.chartLiveClose = 150; bridge.revision += 1
-        try await wait(view, "document.querySelector('[data-chart-live-price=\"150\"]') !== null")
+        try await wait(view, "document.querySelector('[data-chart-inst] > div')?.innerText.includes('Close 150')")
         bridge.heldChartLoadReply?(); bridge.heldChartLoadReply = nil
         try await Task.sleep(for: .milliseconds(100))
-        let latest = try await js(view, "document.querySelector('[data-chart-live-price=\"150\"]') !== null") as? Bool
+        let latest = try await js(view, "document.querySelector('[data-chart-inst] > div')?.innerText.includes('Close 150')") as? Bool
         XCTAssertEqual(latest, true, "A late hydration response must not regress the live candle.")
     }
 
