@@ -37,6 +37,8 @@ actor ResearchRequestLimiter {
     private static func policy(for url: URL) -> (key: String, interval: Duration) {
         let instrument = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "instId" }?.value ?? ""
         switch url.path {
+        case "/api/v5/market/candles":
+            return (url.path, .milliseconds(55)) // 40 / 2s per IP
         case "/api/v5/market/history-candles", "/api/v5/market/history-mark-price-candles":
             return (url.path, .milliseconds(110)) // 20 / 2s per IP
         case "/api/v5/public/funding-rate-history", "/api/v5/rubik/stat/contracts/open-interest-history":

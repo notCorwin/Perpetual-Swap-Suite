@@ -354,9 +354,10 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return try await radar.explainMarketFilters(instId: id, filtersJSON: json, token: token, atClose: request["atClose"] as? Bool == true, strategyID: request["strategyID"] as? String)
         }
         if let id = parameters["chartInstId"] as? String {
-            if let endHour = parameters["chartEndHour"] as? Int64 { return await radar.loadHistoricalChart(id, endingAt: endHour) }
-            if parameters["loadChart"] as? Bool == true { return await radar.loadChart(id) }
-            return radar.chartSnapshot(id, sinceRevision: parameters["sinceRevision"] as? Int)
+            if let endHour = parameters["chartEndHour"] as? Int64 { return decorated(await radar.loadHistoricalChart(id, endingAt: endHour)) }
+            if parameters["loadChart"] as? Bool == true { return decorated(await radar.loadChart(id)) }
+            let since = (parameters["serviceSession"] as? String).map { $0 == sessionID } == false ? nil : parameters["sinceRevision"] as? Int
+            return decorated(radar.chartSnapshot(id, sinceRevision: since))
         }
         if ["frostedBackgroundEnabled", "frostedBackgroundOpacity", "windowBlurRadius", "floatingBlurRadius"].contains(where: { parameters[$0] != nil }) {
             let enabled = parameters["frostedBackgroundEnabled"] as? Bool, opacity = parameters["frostedBackgroundOpacity"] as? Double
@@ -366,7 +367,8 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                   try radar.setFrostedBackground(enabled: enabled, opacity: opacity, windowBlur: windowBlur, floatingBlur: floatingBlur) else { throw FilterError("Invalid frosted background setting. Opacity must be 0–1 and blur must be 0–160.") }
         }
         if let value = parameters["filterLibraryPreferencesJSON"] { guard let json = value as? String else { throw FilterError("Invalid condition library preferences.") }; try radar.setFilterLibraryPreferences(json) }
-        return decorated(try await radar.asyncSnapshot(rocPeriod: parameters["rocPeriod"] as? Int ?? 9, marocPeriod: parameters["marocPeriod"] as? Int ?? 9, sinceRevision: parameters["sinceRevision"] as? Int))
+        let since = (parameters["serviceSession"] as? String).map { $0 == sessionID } == false ? nil : parameters["sinceRevision"] as? Int
+        return decorated(try await radar.asyncSnapshot(rocPeriod: parameters["rocPeriod"] as? Int ?? 9, marocPeriod: parameters["marocPeriod"] as? Int ?? 9, sinceRevision: since))
     }
     @objc private func checkForUpdatesNow() {
         if updateState == "available", let update { presentUpdate(update) }

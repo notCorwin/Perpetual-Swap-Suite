@@ -26,6 +26,7 @@ export type MarketRow = {
   turnover24hUSDT: number | null
   ema200Signal: EMA200Signal | null
   price: number | null
+  lastPrice?: number | null
   priceChange: PercentageValue
   currentLow: number | null
   currentHigh: number | null

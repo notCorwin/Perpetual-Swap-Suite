@@ -16,6 +16,8 @@ import { livePriceTag, scrollChartEnd, visibleChartBars } from "@/chart-viewport
 import { cn, pageVisible } from "@/lib/utils"
 import { chartNavigationTarget, wrappedMarket } from "@/market-sort"
 import { finitePercentage, formatPercent, type PercentageValue } from "@/market-percent"
+import { SnapshotOrder } from '@/snapshot-order'
+import { mergeChartBars } from '@/chart-snapshot'
 
 export type Bar = {
   hour: number; open: number; high: number; low: number; close: number; confirmed: boolean
@@ -23,24 +25,32 @@ export type Bar = {
   roc: PercentageValue; maroc: PercentageValue; rsi6: number | null; rsi12: number | null; rsi24: number | null
   oi: number | null; buy: number | null; sell: number | null
 }
-export type ChartResponse = { bars: Bar[]; error: string; revision: number; endHour?: number; oldestHour?: number | null; historyExhausted?: boolean; candleLoadFailed?: boolean }
-export type ChartPollResponse = ChartResponse | { unchanged: true; error: string; revision: number }
+export type ChartResponse = { bars: Bar[]; error: string; revision: number; serviceSession?: string; endHour?: number; oldestHour?: number | null; historyExhausted?: boolean; candleLoadFailed?: boolean }
+export type ChartPollResponse = ChartResponse | { unchanged: true; error: string; revision: number; serviceSession?: string }
 
 const chartCache = new Map<string, { data: ChartResponse; loadedAt: number }>()
 const chartLoads = new Map<string, Promise<ChartResponse>>()
 const chartPreviews = new Map<string, Promise<ChartResponse>>()
+const chartOrders = new Map<string, SnapshotOrder>()
 function rememberChart(id: string, data: ChartResponse, loadedAt: number) {
+  let order = chartOrders.get(id)
+  if (!order) { order = new SnapshotOrder(); chartOrders.set(id, order) }
+  if (!order.accept(data)) {
+    const cached = chartCache.get(id)
+    if (cached) return cached.data
+    throw new Error('Obsolete chart response; refreshing the current collector')
+  }
   chartCache.delete(id)
   chartCache.set(id, { data, loadedAt })
   if (chartCache.size > 8) chartCache.delete(chartCache.keys().next().value!)
+  return data
 }
 function loadChart(id: string): Promise<ChartResponse> {
   const pending = chartLoads.get(id)
   if (pending) return pending
   const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: id, loadChart: true }).then(result => {
     if ("unchanged" in result) throw new Error("No chart data returned")
-    rememberChart(id, result, Date.now())
-    return result
+    return rememberChart(id, result, Date.now())
   }).finally(() => chartLoads.delete(id))
   chartLoads.set(id, request)
   return request
@@ -52,7 +62,7 @@ function previewChart(id: string): Promise<ChartResponse> {
   if (pending) return pending
   const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: id, sinceRevision: -1 }).then(result => {
     if ("unchanged" in result) throw new Error("No chart data returned")
-    if (!chartCache.has(id)) rememberChart(id, result, 0)
+    rememberChart(id, result, chartCache.get(id)?.loadedAt ?? 0)
     return chartCache.get(id)!.data
   }).finally(() => chartPreviews.delete(id))
   chartPreviews.set(id, request)
@@ -339,7 +349,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
   const analysisBusy = analysis?.phase === 'capturing' || analysis?.phase === 'streaming'
   useEffect(() => () => chartAnalysis.stop(instId), [instId])
   const [displayed, setDisplayed] = useState<{ id: string; data: ChartResponse } | null>(null)
-  const [historyBars, setHistoryBars] = useState<{ id: string; bars: Bar[] } | null>(null)
+  const [historyBars, setHistoryBars] = useState<{ id: string; data: ChartResponse } | null>(null)
   const [historyBoundary, setHistoryBoundary] = useState<{ id: string; oldestHour: number } | null>(null)
   const [windowEnd, setWindowEnd] = useState<{ id: string; hour: number } | null>(null)
   const [historyLoading, setHistoryLoading] = useState<string | null>(null)
@@ -376,17 +386,16 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
   const historicalEnd = windowEnd?.id === instId ? windowEnd.hour : null
   const chart = chartCache.get(instId)?.data ?? (displayed?.id === instId ? displayed.data : null) ?? warmCharts.get(instId) ?? null
   const cachedBars = useMemo(() => {
-    const merged = new Map<number, Bar>()
-    for (const bar of chart?.bars ?? []) merged.set(bar.hour, bar)
-    if (historyBars?.id === instId) for (const bar of historyBars.bars) merged.set(bar.hour, bar)
-    const live = chart?.bars.at(-1)
-    if (live && !live.confirmed) merged.set(live.hour, live)
-    return [...merged.values()].sort((a, b) => a.hour - b.hour)
+    return mergeChartBars(chart, historyBars?.id === instId ? historyBars.data : null)
   }, [chart, historyBars, instId])
   const oldestCachedHour = cachedBars[0]?.hour ?? Infinity
   const error = chartError?.id === instId ? chartError.message : chart?.error ?? ""
   const captureStatus = capture.id === instId ? capture.status : "idle"
   const captureError = capture.id === instId ? capture.error : ""
+  useEffect(() => {
+    loadedHistoryBuckets.current.clear(); requestedHistoryEnds.current.clear()
+    setHistoryBars(null); setHistoryBoundary(null)
+  }, [instId, chart?.serviceSession])
   useEffect(() => {
     if (capture.status !== "flashing") return
     const timer = window.setTimeout(() => setCapture(current => current === capture ? { ...current, status: "idle" } : current), 550)
@@ -461,18 +470,22 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
         historyRequests.current.set(instId, request)
         try {
           const result = await request
+        if (chartOrders.get(instId)?.isRetiredSession(result.serviceSession)) {
+          requestedHistoryEnds.current.delete(key)
+          if (!stopped) { setHistoryLoading(null); setHistoryRetry(value => value + 1) }
+          return
+        }
         if (!("unchanged" in result) && result.historyExhausted && result.oldestHour !== null && result.oldestHour !== undefined) {
           const oldestHour = result.oldestHour
           setHistoryBoundary(current => current?.id === instId && current.oldestHour === oldestHour ? current : { id: instId, oldestHour })
         }
         if (stopped || windowEndRef.current?.id !== instId || windowEndRef.current.hour !== historicalEnd || "unchanged" in result) return
-        if (!result.candleLoadFailed) loadedHistoryBuckets.current.add(bucket)
+        if (!result.error && !result.candleLoadFailed) loadedHistoryBuckets.current.add(bucket)
         setHistoryBars(current => {
-          const merged = new Map<number, Bar>(current?.id === instId ? current.bars.map(bar => [bar.hour, bar]) : [])
-          for (const bar of result.bars) merged.set(bar.hour, bar)
+          const merged = mergeChartBars(result, current?.id === instId ? current.data : null)
           const first = historicalEnd - 499 * 3_600_000
           const last = historicalEnd + 249 * 3_600_000
-          return { id: instId, bars: [...merged.values()].filter(bar => bar.hour >= first && bar.hour <= last).sort((a, b) => a.hour - b.hour) }
+          return { id: instId, data: { ...result, bars: merged.filter(bar => bar.hour >= first && bar.hour <= last) } }
         })
         endInspection()
         if (result.endHour !== undefined && result.endHour !== historicalEnd) {
@@ -501,42 +514,57 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
     wheelFrame.current = null
   }, [instId])
   useEffect(() => {
-    let stopped = false
-    let timer: number
+    let stopped = false, timer: number, loadTimer: number
     let lastLoad = chartCache.get(instId)?.loadedAt ?? 0
-    let revision = chartCache.get(instId)?.data.revision ?? -1
+    let hydrationError = chartCache.get(instId)?.data.error ?? ''
     let backoff = 2000
+    const order = chartOrders.get(instId) ?? new SnapshotOrder()
+    chartOrders.set(instId, order)
+    const show = (data: ChartResponse) => {
+      if (windowEndRef.current?.id !== instId) setDisplayed({ id: instId, data })
+      warmChart(instId, data, false)
+    }
+    const showError = (message: string) => {
+      if (windowEndRef.current?.id !== instId) setChartError(current => current?.id === instId && current.message === message ? current : { id: instId, message })
+    }
+    // Network hydration has its own clock. Snapshot polling continues while
+    // an independent source is waiting, timing out, or retrying.
+    const hydrate = async () => {
+      await pageVisible(); if (stopped) return
+      try {
+        const data = await loadChart(instId)
+        if (stopped) return
+        lastLoad = chartCache.get(instId)?.loadedAt ?? Date.now()
+        hydrationError = data.error
+        show(data); showError(hydrationError)
+      } catch (cause) {
+        if (stopped) return
+        hydrationError = cause instanceof Error ? cause.message : 'Cannot refresh chart sources'
+        showError(hydrationError)
+      }
+      if (!stopped) loadTimer = window.setTimeout(hydrate, hydrationError ? 10_000 : 60_000)
+    }
     const refresh = async () => {
       await pageVisible(); if (stopped) return
       try {
-        const shouldLoad = Date.now() - lastLoad >= 60_000
-        const result = shouldLoad ? await loadChart(instId) : await window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, sinceRevision: revision })
+        const result = await window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, sinceRevision: order.revision, serviceSession: order.serviceSession })
         if (stopped) return
-        if (shouldLoad) lastLoad = chartCache.get(instId)?.loadedAt ?? Date.now()
-        if (!("unchanged" in result)) {
-          revision = result.error ? -1 : result.revision
-          if (!shouldLoad) rememberChart(instId, result, lastLoad)
-          if (windowEndRef.current?.id !== instId) setDisplayed({ id: instId, data: result })
-          warmChart(instId, result, false)
-          backoff = 2000
-        } else {
-          backoff = 2000
+        if (order.isCurrent(result)) {
+          if (!("unchanged" in result)) show(rememberChart(instId, result, lastLoad))
+          showError([...new Set([hydrationError, result.error].filter(Boolean))].join(' '))
         }
-        if (windowEndRef.current?.id !== instId) setChartError(current => current?.id === instId && current.message === result.error ? current : { id: instId, message: result.error })
+        backoff = 2000
       } catch (cause) {
         if (!stopped) {
-          const message = cause instanceof Error ? cause.message : "Cannot load chart"
-          if (windowEndRef.current?.id !== instId) setChartError(current => current?.id === instId && current.message === message ? current : { id: instId, message })
+          showError(cause instanceof Error ? cause.message : "Cannot load chart")
           backoff = Math.min(backoff * 2, 30000)
         }
       }
       if (!stopped) timer = window.setTimeout(refresh, backoff)
     }
-    if (!chartCache.has(instId)) void previewChart(instId).then(data => {
-      if (!stopped) { if (windowEndRef.current?.id !== instId) setDisplayed({ id: instId, data }); warmChart(instId, data, false) }
-    }).catch(() => {})
+    loadTimer = window.setTimeout(hydrate, hydrationError ? 0 : Math.max(0, 60_000 - (Date.now() - lastLoad)))
     void refresh()
-    return () => { stopped = true; window.clearTimeout(timer) }
+    return () => { stopped = true; window.clearTimeout(timer); window.clearTimeout(loadTimer) }
   }, [instId, warmChart])
 
   useEffect(() => {

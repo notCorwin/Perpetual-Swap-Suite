@@ -2,14 +2,19 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { keepSnapshotValue } from '@/market-snapshot'
 import { pageVisible } from '@/lib/utils'
 import { requestSuite, type SuiteMode, type SuiteRequest, type SuiteResponse } from '@/suite-types'
+import { SnapshotOrder } from '@/snapshot-order'
 
 export function useSuite(mode: SuiteMode, active: boolean) {
   const [snapshot, setSnapshot] = useState<SuiteResponse>({ profiles: [], selectedID: '' })
   const [error, setError] = useState(''), [pending, setPending] = useState(false), [ready,setReady] = useState(false)
   const generation = useRef(0), mutating = useRef(false)
-  const accept = useCallback((value: SuiteResponse) => setSnapshot(previous => { const same = previous.selectedID === value.selectedID && previous.profiles.find(p => p.id===previous.selectedID)?.revision === value.profiles.find(p => p.id===value.selectedID)?.revision; return keepSnapshotValue(previous, { ...previous, ...value,
+  const order = useRef(new SnapshotOrder())
+  const accept = useCallback((value: SuiteResponse) => {
+    if (value.revision !== undefined && !order.current.accept({ revision: value.revision, serviceSession: value.serviceSession })) return
+    setSnapshot(previous => { const same = previous.selectedID === value.selectedID && previous.profiles.find(p => p.id===previous.selectedID)?.revision === value.profiles.find(p => p.id===value.selectedID)?.revision; return keepSnapshotValue(previous, { ...previous, ...value,
     confirmed: same ? value.confirmed ?? previous.confirmed : value.confirmed,
-    provisional: same ? value.provisional ?? previous.provisional : value.provisional }) }), [])
+    provisional: same ? value.provisional ?? previous.provisional : value.provisional }) })
+  }, [])
   useEffect(() => {
     if (!active) return
     let stopped = false, timer: number

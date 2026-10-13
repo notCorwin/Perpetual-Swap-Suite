@@ -77,7 +77,9 @@ actor FilterHistoryLoader {
                 ranges[market.id] = (min(first, ranges[market.id]?.first ?? first), last)
             }
             market.candles = (candleCache[market.id] ?? [:]).filter { $0.key >= first && $0.key <= market.hour }
-            market.candles.merge(original.candles) { _, live in live }
+            // Closed observations on disk can have been corrected by another
+            // collector since this live snapshot was captured.
+            for (ts, bar) in original.candles where ts == original.hour || market.candles[ts] == nil { market.candles[ts] = bar }
             if filter.needsStats {
                 let statFirst = statRanges[market.id].map { $0.first <= first && $0.last >= last ? max(first, last - hourMS) : first } ?? first
                 for (ts, s) in try db.chartStats(market.id, since: statFirst, through: last) { statCache[market.id, default: [:]][ts] = FilterStat(oi: s.oi, sell: s.sell, buy: s.buy) }
@@ -150,7 +152,8 @@ actor FilterHistoryLoader {
         // A smaller queued request may have just persisted a page and pruned its
         // memory. Reuse those rows before deciding which page to request next.
         var series = try db.candles(market.id, since: first, through: market.hour - hourMS)
-        series.merge(candleCache[market.id] ?? [:]) { old, _ in old }; series.merge(market.candles) { _, new in new }
+        for (ts, bar) in candleCache[market.id] ?? [:] where series[ts] == nil { series[ts] = bar }
+        for (ts, bar) in market.candles where ts == market.hour || series[ts] == nil { series[ts] = bar }
         candleCache[market.id, default: [:]].merge(series.filter { $0.value.confirmed }) { _, new in new }
         var cursor = stride(from: market.hour - hourMS, through: fetchFirst, by: -Int(hourMS)).first { !Self.complete(series[$0]) }.map { $0 + hourMS }
         while let before = cursor, before > fetchFirst {
@@ -167,6 +170,7 @@ actor FilterHistoryLoader {
             cursor = stride(from: oldest - hourMS, through: fetchFirst, by: -Int(hourMS)).first { !Self.complete(series[$0]) }.map { $0 + hourMS }
         }
         if stats {
+            var incomplete = false
             for pageStart in stride(from: max(first, listing) / (100 * hourMS) * (100 * hourMS), through: market.hour - hourMS, by: Int(100 * hourMS)) {
                 let pageEnd = min(pageStart + 99 * hourMS, market.hour - hourMS)
                 for path in ["/rubik/stat/contracts/open-interest-history", "/rubik/stat/taker-volume-contract"] {
@@ -175,20 +179,27 @@ actor FilterHistoryLoader {
                     var parameters = ["instId": market.id, "period": "1H", "end": String(pageEnd + hourMS), "limit": "100"]
                     if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "1" }
                     let values = try await fetch(path, parameters)
+                    var loaded = Set<Int64>()
                     for value in values {
                         guard let ts = value.first.flatMap(Int64.init), ts % hourMS == 0, ts >= pageStart, ts <= pageEnd else { continue }
                         if path.contains("open-interest"), value.count >= 4, let oi = Double(value[3]), oi.isFinite, oi >= 0 {
                             try db.saveChartStat(market.id, hour: ts, oi: oi); statCache[market.id, default: [:]][ts, default: .init()].oi = oi
                             updatedMarkets.insert(market.id)
+                            loaded.insert(ts)
                         } else if !path.contains("open-interest"), value.count >= 3, let sell = Double(value[1]), let buy = Double(value[2]), sell.isFinite, buy.isFinite, sell >= 0, buy >= 0 {
                             try db.saveChartStat(market.id, hour: ts, sell: sell, buy: buy)
                             updatedMarkets.insert(market.id)
                             statCache[market.id, default: [:]][ts, default: .init()].sell = sell; statCache[market.id, default: [:]][ts, default: .init()].buy = buy
+                            loaded.insert(ts)
                         }
                     }
-                    statPages[pageKey] = Date().addingTimeInterval(900)
+                    let expectedFirst = max(first, listing, pageStart)
+                    if stride(from: expectedFirst, through: pageEnd, by: Int(hourMS)).allSatisfy({ loaded.contains($0) }) {
+                        statPages[pageKey] = Date().addingTimeInterval(900)
+                    } else { incomplete = true }
                 }
             }
+            if incomplete { throw FilterError("OKX statistics coverage is incomplete; retrying missing hours.") }
         }
         // Bound reusable memory to each request's dependency window. The durable
         // database retains older observations for later rules and chart history.

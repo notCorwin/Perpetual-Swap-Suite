@@ -44,6 +44,9 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
     var pulseRows = false
     var pulse = 0.0
     var includeChartBars = false
+    var holdChartLoadID: String?
+    var heldChartLoadReply: (() -> Void)?
+    var chartLiveClose: Double?
     var chartSnapshotRGB: [Double] = []
     var analysisModel = "openai/gpt-6.1-sol"
     var analysisKey = "fixture-key"
@@ -288,13 +291,18 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
             guard includeChartBars else { replyHandler(["bars": [], "revision": revision, "error": "Fixture chart"], nil); return }
             let hour = contexts[0].hour
             let bars: [[String: Any]] = (0..<96).map { index in
-                let close = 105 + Double(index) * 0.05 + sin(Double(index) / 5)
+                let close = (index == 95 ? chartLiveClose : nil) ?? (105 + Double(index) * 0.05 + sin(Double(index) / 5))
                 return ["hour": hour - Int64(95 - index) * hourMS, "open": close - 0.3, "high": close + 0.8, "low": close - 0.7, "close": close, "confirmed": index != 95,
                         "vwap": close - 0.4, "ema": 105.0, "logBBUpper": close + 1.5, "logBBMiddle": close, "logBBLower": close - 1.5,
                         "roc": sin(Double(index) / 5) * 2, "maroc": sin(Double(index) / 7), "rsi6": 50 + sin(Double(index) / 5) * 20,
                         "rsi12": 50 + sin(Double(index) / 7) * 10, "rsi24": 50 + sin(Double(index) / 9) * 5, "oi": 100_000_000 + index * 100_000, "buy": 1000 + index * 5, "sell": 800 + index * 3]
             }
-            replyHandler(["bars": bars, "revision": revision, "error": "", "endHour": hour], nil)
+            let response: [String: Any] = ["bars": bars, "revision": revision, "error": "", "endHour": hour]
+            if request["loadChart"] as? Bool == true, request["chartInstId"] as? String == holdChartLoadID {
+                holdChartLoadID = nil; heldChartLoadReply = { replyHandler(response, nil) }
+                return
+            }
+            replyHandler(response, nil)
             return
         }
         do {
@@ -1513,6 +1521,36 @@ final class RuleEditorUITests: BackgroundTestCase {
             bridge.researchJobOverride = nil
             try await wait(view, "document.querySelector('table[data-market-count]')?.getBoundingClientRect().width > 0")
         }
+    }
+
+    @MainActor
+    func testChartKeepsLivePollingDuringSlowHydrationAndRejectsItsLateOldReply() async throws {
+        guard ProcessInfo.processInfo.environment["RADAR_UI_TESTS"] == "1" else { throw XCTSkip("Run npm run ci:local for native WebKit checks.") }
+        let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let bridge = try RuleUIBridge(root: project.appendingPathComponent("dist"), marketCount: 3), configuration = uiConfiguration()
+        bridge.includeChartBars = true; bridge.holdChartLoadID = "MKT000-USDT-SWAP"
+        configuration.userContentController.addScriptMessageHandler(bridge, contentWorld: .page, name: "radar")
+        configuration.setURLSchemeHandler(bridge, forURLScheme: "radar")
+        let window = BackgroundTestWindow(contentRect: NSRect(x: 0, y: 0, width: 1440, height: 900), styleMask: [.titled], backing: .buffered, defer: false)
+        let view = WKWebView(frame: .zero, configuration: configuration)
+        window.contentView = view; present(window)
+        defer {
+            bridge.heldChartLoadReply?(); bridge.heldChartLoadReply = nil
+            view.stopLoading(); window.orderOut(nil); configuration.userContentController.removeScriptMessageHandler(forName: "radar", contentWorld: .page); bridge.cleanUp()
+        }
+        view.load(URLRequest(url: URL(string: "radar://app/index.html")!))
+        try await showAllMarkets(view, count: 3)
+        _ = try await js(view, "document.querySelector('[aria-label=\"View MKT000-USDT-SWAP chart\"]').click(); true")
+        try await wait(view, "document.querySelector('[data-chart-inst] svg[role=img]') !== null")
+        let deadline = ContinuousClock.now + .seconds(3)
+        while bridge.heldChartLoadReply == nil, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertNotNil(bridge.heldChartLoadReply, "The network hydration request must remain pending during this check.")
+        bridge.chartLiveClose = 150; bridge.revision += 1
+        try await wait(view, "document.querySelector('[data-chart-inst] > div')?.innerText.includes('Close 150')")
+        bridge.heldChartLoadReply?(); bridge.heldChartLoadReply = nil
+        try await Task.sleep(for: .milliseconds(100))
+        let latest = try await js(view, "document.querySelector('[data-chart-inst] > div')?.innerText.includes('Close 150')") as? Bool
+        XCTAssertEqual(latest, true, "A late hydration response must not regress the live candle.")
     }
 
     @MainActor

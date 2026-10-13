@@ -36,6 +36,7 @@ import { StrategyRules } from "@/StrategyRules"
 import { SuitePhaseExplanation } from "@/SuitePhaseExplanation"
 import { FilterExplanation } from "@/FilterExplanation"
 import { keepSnapshotValue, reconcileMarketRows } from "@/market-snapshot"
+import { SnapshotOrder } from "@/snapshot-order"
 import { emptyFilterConfig, initialEditorState, initialLibraryPreferences, parseFilterConfig, previewResponseIsCurrent, newRuleID, type CompileResponse, type ExplainResponse, type FilterConfigV2, type FilterEditorState, type FilterLibraryPreferences, type FilterMetric, type FilterTruth, type NativeMarketRow } from "@/rule-engine"
 import { expressionTemplates, type ExpressionTemplate } from "@/filter-expression"
 import { AnalysisSettingsButton } from '@/AnalysisSettingsDialog'
@@ -49,7 +50,7 @@ type NotificationSettings = { backgroundMonitoringEnabled: boolean; notification
 type HistoryProgress = { pending: number; completed: number; error: string }
 type Snapshot = WindowAppearance & NotificationSettings & { rows: NativeMarketRow[]; updatedAt: number | null; error: string; revision: number; serviceSession?: string; filterMetricsCatalog: FilterMetric[]; filterFunctions: string[]; filterFunctionCatalog: ExpressionTemplate[]; filterLibraryPreferences: FilterLibraryPreferences; }
 type PreviewSnapshot = Snapshot & { filterResults: Record<string, FilterTruth>; filterToken: string; historyProgress: HistoryProgress }
-type UnchangedSnapshot = { unchanged: true; revision: number; error: string }
+type UnchangedSnapshot = { unchanged: true; revision: number; error: string; serviceSession?: string }
 type SettingRequest = Partial<WindowAppearance> & { backgroundMonitoringEnabled?: boolean; notificationsEnabled?: boolean; monitoringPaused?: boolean; launchAtLogin?: boolean; notificationAction?: "refresh" | "requestPermission" | "test" | "openSettings"; filterLibraryPreferencesJSON?: string }
 type NativeBridge = {
   postMessage(request: { analysisSettings: AnalysisSettingsRequest }): Promise<AnalysisSettings>
@@ -60,7 +61,7 @@ type NativeBridge = {
   postMessage(request: { suite: SuiteRequest }): Promise<SuiteResponse>
   postMessage(request: { research: ResearchRequest }): Promise<ResearchResponse>
   postMessage(request: { foregroundWorkspace: "radar" | "research" }): Promise<{ ok: boolean }>
-  postMessage(request: { rocPeriod: number; marocPeriod: number; sinceRevision: number }): Promise<Snapshot | UnchangedSnapshot>
+  postMessage(request: { rocPeriod: number; marocPeriod: number; sinceRevision: number; serviceSession?: string }): Promise<Snapshot | UnchangedSnapshot>
   postMessage(request: { compileMarketFilters: { filtersJSON?: string; source?: string; previousJSON?: string; suitePhase?: string } }): Promise<CompileResponse>
   postMessage(request: { previewMarketFilters: { filtersJSON: string; token: string; atClose?: boolean; strategyID?: string } }): Promise<PreviewSnapshot>
   postMessage(request: { explainMarketFilters: { instId: string; filtersJSON: string; token: string; atClose?: boolean; strategyID?: string } }): Promise<ExplainResponse>
@@ -69,7 +70,7 @@ type NativeBridge = {
   postMessage(request: { windowTintRGB: number[] }): Promise<{ ok: boolean }>
   postMessage(request: { previewWindowBlur: number | null }): Promise<{ ok: boolean }>
   postMessage(request: { floatingGlassSurfaces: { x: number; y: number; width: number; height: number; radius: number; corner: number }[] }): Promise<{ ok: boolean }>
-  postMessage(request: { chartInstId: string; loadChart?: boolean; sinceRevision?: number; chartEndHour?: number }): Promise<ChartPollResponse>
+  postMessage(request: { chartInstId: string; loadChart?: boolean; sinceRevision?: number; chartEndHour?: number; serviceSession?: string }): Promise<ChartPollResponse>
 }
 declare global {
   interface Window { radarNotificationContract?: string; radarNotificationStrategy?: string; radarAppearance?: WindowAppearance & { nativeWindowBackground?: boolean }; webkit: { messageHandlers: { radar: NativeBridge } } }
@@ -115,15 +116,15 @@ const MarketRowView = memo(function MarketRowView({ row, index, onSelect, onExpl
       <span className="font-medium">{row.instId.replace(/-USDT-SWAP$/, "")}</span>
       {(confirmed || provisional) && <SuitePhaseBadges confirmed={confirmed} provisional={provisional} />}
       <div className="flex justify-start gap-2 text-xs tabular-nums">
-        <span>{formatPrice(row.price)}</span>
-        <span className={directionClass(row.priceChange)} title={`Price change from the previous completed hour. ${PERCENT_CHANGE_DESCRIPTION}`}>{formatPercent(row.priceChange)}</span>
+        <span title="Latest traded price; hourly indicators use the exchange candle close">{formatPrice(row.lastPrice ?? row.price)}</span>
+        <span className={directionClass(row.priceChange)} title={`Hourly candle close change from the previous completed hour. ${PERCENT_CHANGE_DESCRIPTION}`}>{formatPercent(row.priceChange)}</span>
       </div>
       <div className="flex items-center justify-start gap-3 text-xs tabular-nums">
         <span className="flex gap-1"><span className="text-muted-foreground">Low</span><span>{formatPrice(row.currentLow)}</span></span>
         <span className="flex gap-1"><span className="text-muted-foreground">High</span><span>{formatPrice(row.currentHigh)}</span></span>
       </div>
-      <div className="flex items-center justify-start gap-1 text-xs tabular-nums" title={row.turnover24hUSDT === null ? "Hourly turnover is unavailable" : `${row.turnover24hUSDT.toLocaleString("en-US", { maximumFractionDigits: 2 })} USDT`}>
-        <span className="text-muted-foreground">Turnover</span><span>{row.turnover24hUSDT === null ? "—" : turnoverFormatter.format(row.turnover24hUSDT)} USDT</span>
+      <div className="flex items-center justify-start gap-1 text-xs tabular-nums" title={row.turnover24hUSDT === null ? "Estimated 24h turnover is unavailable" : `${row.turnover24hUSDT.toLocaleString("en-US", { maximumFractionDigits: 2 })} USDT · 24h base volume × latest price estimate`}>
+        <span className="text-muted-foreground">Est. turnover</span><span>{row.turnover24hUSDT === null ? "—" : turnoverFormatter.format(row.turnover24hUSDT)} USDT</span>
       </div>
     </TableCell>
     <TableCell className="text-center tabular-nums"><MarketOpportunity instId={row.instId} opportunity={row.opportunity} /><Button variant="ghost" size="sm" className="mt-1" aria-label={`Explain ${row.instId} rules`} disabled={!canExplain} onClick={event => { event.stopPropagation(); onExplain(row.instId) }} onKeyDown={event => event.stopPropagation()}><ScanSearch data-icon="inline-start" aria-hidden="true" />Rules</Button></TableCell>
@@ -163,6 +164,7 @@ const MarketRows = memo(function MarketRows({ rows, onSelect, onExplain, canExpl
 function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: boolean; onResearch: (inputs: ResearchInputs, spec?: StudySpec) => void; onDecisions: (inputs: ResearchInputs, tab?: 'rules' | 'signals') => void; switchingMode: boolean }) {
   const revision = useRef(-1)
   const serviceSession = useRef<string | undefined>(undefined)
+  const snapshotOrder = useRef(new SnapshotOrder())
   const backgroundOpacityDraftDirty = useRef(false)
   const compileEpoch = useRef(0)
   const previewEpoch = useRef(0)
@@ -266,9 +268,9 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     return () => theme.removeEventListener("change", updateTint)
   }, [frostedBackgroundEnabled, frostedBackgroundOpacity])
   const acceptSnapshot = (snapshot: Snapshot) => {
-    if (snapshot.serviceSession && snapshot.serviceSession !== serviceSession.current) { serviceSession.current = snapshot.serviceSession; revision.current = -1 }
-    if (snapshot.revision < revision.current) return false
-    revision.current = snapshot.revision
+    if (!snapshotOrder.current.accept(snapshot)) return false
+    serviceSession.current = snapshotOrder.current.serviceSession
+    revision.current = snapshotOrder.current.revision
     setRows(current => reconcileMarketRows(current, snapshot.rows))
     setFrostedBackgroundEnabled(snapshot.frostedBackgroundEnabled)
     setFrostedBackgroundOpacity(snapshot.frostedBackgroundOpacity)
@@ -300,11 +302,11 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     const load = async () => {
       await pageVisible(); if (stopped) return
       try {
-        const snapshot = await window.webkit.messageHandlers.radar.postMessage({ rocPeriod: ROC_PERIOD, marocPeriod: MAROC_PERIOD, sinceRevision: revision.current })
+        const snapshot = await window.webkit.messageHandlers.radar.postMessage({ rocPeriod: ROC_PERIOD, marocPeriod: MAROC_PERIOD, sinceRevision: revision.current, serviceSession: serviceSession.current })
         if (stopped) return
         if ("unchanged" in snapshot) {
           setStatus("Live")
-          setError(snapshot.error)
+          if (snapshotOrder.current.isCurrent(snapshot)) setError(snapshot.error)
           backoff = 2000
         } else {
           acceptSnapshot(snapshot)
@@ -358,9 +360,9 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
       try {
         const snapshot = await window.webkit.messageHandlers.radar.postMessage({ previewMarketFilters: { filtersJSON: lastValidJSON, token, strategyID: activeStrategyID } })
         if (stopped || epoch !== previewEpoch.current) return
-        if (previewResponseIsCurrent(snapshot, token, snapshot.serviceSession && snapshot.serviceSession !== serviceSession.current ? -1 : revision.current)) startTransition(() => {
+        if (snapshotOrder.current.isCurrent(snapshot) && previewResponseIsCurrent(snapshot, token, snapshot.serviceSession && snapshot.serviceSession !== serviceSession.current ? -1 : revision.current)) startTransition(() => {
           const updated = acceptSnapshot(snapshot)
-          if (!updated) { backoff = Math.min(backoff * 1.5, 30000); return }
+          if (!updated) { backoff = 2000; return }
           setResults(current => keepSnapshotValue(current, snapshot.filterResults))
           setPreviewJSON(lastValidJSON)
           setHistory(current => keepSnapshotValue(current, snapshot.historyProgress))

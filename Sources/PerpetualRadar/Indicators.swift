@@ -6,7 +6,7 @@ let chartHours = 96
 let breakoutLookbackHours = 48
 let breakoutSearchHours = 48
 
-struct Candle: Codable, Sendable {
+struct Candle: Codable, Equatable, Sendable {
     let hour: Int64
     let open: Double?
     let high: Double

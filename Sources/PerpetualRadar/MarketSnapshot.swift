@@ -7,6 +7,7 @@ struct MarketSnapshotInput: Sendable {
     var turnover: Double?
     var spreadPercent: Double?
     var quoteTimestamp: Int64 = 0
+    var lastPrice: Double?
     var buy: Double?
     var sell: Double?
     var takerRatio: Double?
@@ -30,6 +31,7 @@ struct MarketSnapshotInput: Sendable {
         let price = current?.close
         var result: [String: Any] = [
             "instId": id, "turnover24hUSDT": turnover as Any? ?? null, "price": price as Any? ?? null,
+            "lastPrice": lastPrice as Any? ?? null,
             "priceChange": percentageSnapshot(percentChange(price, previous?.confirmed == true ? previous?.close : nil)),
             "currentLow": live?.low as Any? ?? null, "currentHigh": live?.high as Any? ?? null,
             "ema200Signal": ema200Signal(live, liveEMA)?.rawValue as Any? ?? null,

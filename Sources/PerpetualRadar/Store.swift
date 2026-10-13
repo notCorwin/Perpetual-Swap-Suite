@@ -3,7 +3,7 @@ import CSQLite
 
 final class Store {
     private static let busyTimeoutMilliseconds: Int32 = 5_000
-    private static let schemaVersion: Int64 = 1
+    private static let schemaVersion: Int64 = 2
     private var db: OpaquePointer?
     private var reusableStatements: [String: OpaquePointer] = [:]
     let url: URL
@@ -32,6 +32,9 @@ final class Store {
                 if try !columns("candles").contains("base_volume") { try execute("ALTER TABLE candles ADD COLUMN base_volume REAL") }
                 if try !columns("candles").contains("open") { try execute("ALTER TABLE candles ADD COLUMN open REAL") }
                 try execute("CREATE TABLE IF NOT EXISTS hourly_quotes (inst_id TEXT, hour INTEGER, turnover REAL, spread REAL, quote_timestamp INTEGER NOT NULL, PRIMARY KEY(inst_id,hour))")
+                try execute("CREATE TRIGGER IF NOT EXISTS candle_insert_invalidates_ema AFTER INSERT ON candles BEGIN DELETE FROM ema200 WHERE inst_id=NEW.inst_id AND hour>=NEW.hour; END")
+                try execute("CREATE TRIGGER IF NOT EXISTS candle_correction_invalidates_ema AFTER UPDATE OF close ON candles WHEN NEW.close IS NOT OLD.close BEGIN DELETE FROM ema200 WHERE inst_id=NEW.inst_id AND hour>=NEW.hour; END")
+                try execute("DELETE FROM ema200") // Prior caches did not track candle corrections.
                 try execute("PRAGMA user_version=\(Self.schemaVersion)")
             } }
         } catch {
@@ -196,7 +199,7 @@ final class Store {
 
     func saveHourlyQuote(_ id: String, hour: Int64, quote: FilterQuote) throws {
         guard quote.timestamp >= hour, quote.timestamp < hour + hourMS else { return }
-        try execute("INSERT INTO hourly_quotes (inst_id,hour,turnover,spread,quote_timestamp) VALUES (?,?,?,?,?) ON CONFLICT(inst_id,hour) DO NOTHING", [id, hour, quote.turnover, quote.spread, quote.timestamp])
+        try execute("INSERT INTO hourly_quotes (inst_id,hour,turnover,spread,quote_timestamp) VALUES (?,?,?,?,?) ON CONFLICT(inst_id,hour) DO UPDATE SET turnover=excluded.turnover,spread=excluded.spread,quote_timestamp=excluded.quote_timestamp WHERE excluded.quote_timestamp>hourly_quotes.quote_timestamp", [id, hour, quote.turnover, quote.spread, quote.timestamp])
     }
 
     func hourlyQuotes(_ id: String, since: Int64, through: Int64) throws -> [Int64: FilterQuote] {
@@ -232,7 +235,7 @@ final class Store {
 
     func save(_ id: String, _ bar: Candle) throws {
         guard bar.confirmed else { return }
-        try execute("INSERT INTO candles (inst_id,hour,high,low,close,volume,base_volume,open) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(inst_id,hour) DO UPDATE SET base_volume=COALESCE(excluded.base_volume,candles.base_volume),open=COALESCE(excluded.open,candles.open)", [id, bar.hour, bar.high, bar.low, bar.close, bar.quoteVolume, bar.baseVolume, bar.open])
+        try execute("INSERT INTO candles (inst_id,hour,high,low,close,volume,base_volume,open) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(inst_id,hour) DO UPDATE SET high=excluded.high,low=excluded.low,close=excluded.close,volume=COALESCE(excluded.volume,candles.volume),base_volume=COALESCE(excluded.base_volume,candles.base_volume),open=COALESCE(excluded.open,candles.open)", [id, bar.hour, bar.high, bar.low, bar.close, bar.quoteVolume, bar.baseVolume, bar.open])
     }
 
     func saveCandles(_ id: String, _ bars: [Candle]) throws {
