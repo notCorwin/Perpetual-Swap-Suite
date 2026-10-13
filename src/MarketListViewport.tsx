@@ -8,23 +8,25 @@ export function MarketListViewport({ children }: { children: ReactNode }) {
     const viewport = viewportRef.current
     const content = contentRef.current
     if (!viewport || !content) return
-    const tables = new Set<HTMLTableElement>()
-    let designWidth = Number.parseFloat(getComputedStyle(viewport).getPropertyValue("--market-list-design-width"))
+    const designWidth = Number.parseFloat(getComputedStyle(viewport).getPropertyValue("--market-list-design-width"))
     let scale = 1
-    let frame: number | null = null
+    let widthFrame: number | null = null
+    let heightFrame: number | null = null
+    let previousWidth = -1
     let stopped = false
-    const fit = () => {
-      frame = null
+    const fitHeight = () => {
+      heightFrame = null
+      viewport.style.height = `${content.getBoundingClientRect().height}px`
+    }
+    const scheduleHeight = () => {
+      if (!stopped && heightFrame === null) heightFrame = window.requestAnimationFrame(fitHeight)
+    }
+    const fitWidth = () => {
+      widthFrame = null
       const available = viewport.getBoundingClientRect().width
       if (!available) return
       const width = Math.max(available, designWidth)
       content.style.width = `${width}px`
-      const required = Math.max(width, ...Array.from(tables, table => table.getBoundingClientRect().width / scale))
-      if (required > width + 0.5) {
-        // Retain enough room for the widest loaded row, including while filtering the list.
-        designWidth = Math.ceil(required)
-        content.style.width = `${designWidth}px`
-      }
       scale = Math.min(1, available / designWidth)
       // Portaled dialogs retain the same design layout and typography scale.
       const root = document.documentElement.style
@@ -32,34 +34,32 @@ export function MarketListViewport({ children }: { children: ReactNode }) {
       root.setProperty('--market-list-layout-width', `${window.innerWidth / scale}px`)
       root.setProperty('--market-list-layout-height', `${window.innerHeight / scale}px`)
       content.style.minHeight = `${window.innerHeight / scale}px`
-      // Keep table and KaTeX layout at their original size; scale only the finished rendering.
+      // Keep the design canvas independent from live content. Data changes may
+      // repaint a cell, but only a viewport resize may change the global scale.
       content.style.transform = `scale(${scale})`
-      viewport.style.height = `${content.getBoundingClientRect().height}px`
+      fitHeight()
     }
-    const schedule = () => {
-      if (!stopped && frame === null) frame = window.requestAnimationFrame(fit)
+    const scheduleWidth = () => {
+      if (!stopped && widthFrame === null) widthFrame = window.requestAnimationFrame(fitWidth)
     }
-    const observer = new ResizeObserver(schedule)
-    observer.observe(viewport)
-    observer.observe(content)
-    const watchTables = () => {
-      for (const table of content.querySelectorAll('table')) {
-        if (!tables.has(table)) { tables.add(table); observer.observe(table) }
-      }
-      for (const table of tables) { if (!table.isConnected) { observer.unobserve(table); tables.delete(table) } }
-      schedule()
-    }
-    const mutations = new MutationObserver(watchTables)
-    mutations.observe(content, { childList: true, subtree: true })
-    watchTables()
-    window.addEventListener("resize", schedule)
-    fit()
-    void document.fonts.ready.then(schedule)
+    const viewportObserver = new ResizeObserver(([entry]) => {
+      const width = entry.contentRect.width
+      if (Math.abs(width - previousWidth) <= 0.5) return
+      previousWidth = width
+      scheduleWidth()
+    })
+    const contentObserver = new ResizeObserver(scheduleHeight)
+    viewportObserver.observe(viewport)
+    contentObserver.observe(content)
+    window.addEventListener("resize", scheduleWidth)
+    fitWidth()
+    void document.fonts.ready.then(scheduleHeight)
     return () => {
       stopped = true
-      observer.disconnect(); mutations.disconnect()
-      window.removeEventListener("resize", schedule)
-      if (frame !== null) window.cancelAnimationFrame(frame)
+      viewportObserver.disconnect(); contentObserver.disconnect()
+      window.removeEventListener("resize", scheduleWidth)
+      if (widthFrame !== null) window.cancelAnimationFrame(widthFrame)
+      if (heightFrame !== null) window.cancelAnimationFrame(heightFrame)
       for (const token of ['--market-list-scale', '--market-list-layout-width', '--market-list-layout-height']) document.documentElement.style.removeProperty(token)
     }
   }, [])

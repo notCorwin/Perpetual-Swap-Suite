@@ -562,7 +562,17 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
       {activeProfile && <FilterExplanation strategyID={activeProfile.id} open={explanationOpen} onOpenChange={setExplanationOpen} instId={explainingId} onSelect={setExplainingId} rows={rows} results={results} filtersJSON={previewJSON} revision={revision.current} metrics={metrics} expressions={editorExpressions} units={compilation.units ?? {}} templates={templates} />}
       {error && <p role="alert" className="border-b px-4 py-2 text-sm text-destructive">{error}</p>}
       {activeProfile && phaseView === 'signals' ? <RadarSignalBoard profile={activeProfile} signals={searchedSignals} rows={rows} paused={suite.snapshot.paused} onChart={(instrument, order) => { setSignalChartOrder(order); setSelected(instrument) }} onExplain={explainRow} onResearch={() => onResearch({ metrics, templates, functions }, suiteSpec([activeProfile]))} onBrowseCharts={() => setPhaseView('markets')} /> : <section aria-label="Perpetual swap markets" className="flex-1">
-        <Table className="table-auto" data-market-count={visible.length} aria-rowcount={visible.length + 1}>
+        <Table className="table-fixed" data-market-count={visible.length} aria-rowcount={visible.length + 1}>
+          <colgroup>
+            <col className="w-[17%]" />
+            <col className="w-[12%]" />
+            <col className="w-[21%]" />
+            <col className="w-[11%]" />
+            <col className="w-[11%]" />
+            <col className="w-[12%]" />
+            <col className="w-[8%]" />
+            <col className="w-[8%]" />
+          </colgroup>
           <TableHeader>
             <TableRow>
               <TableHead className="py-1.5 pl-[var(--market-table-leading-inset)] text-left" aria-sort={sort === "turnover24hUSDT" ? descending ? "descending" : "ascending" : "none"}>

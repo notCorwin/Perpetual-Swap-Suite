@@ -1250,6 +1250,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         view.load(URLRequest(url: URL(string: "radar://app/index.html")!))
         try await showAllMarkets(view, count: 48)
         try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 36 && document.documentElement.dataset.nativeWindowBackground === 'true'")
+        try await assertLiveValuesDoNotResizeLayout(view)
         let pixels = """
         (() => {
           const canvas = document.createElement('canvas'); canvas.width = canvas.height = 1;
@@ -1759,6 +1760,40 @@ final class RuleEditorUITests: BackgroundTestCase {
         }
         window.setContentSize(NSSize(width: 1440, height: 900))
         try await wait(view, "innerWidth === 1440 && (() => { const content = document.querySelector('[data-market-list-content]'); return !content || Math.abs(content.getBoundingClientRect().width - innerWidth) < 1; })()")
+    }
+
+    @MainActor
+    private func assertLiveValuesDoNotResizeLayout(_ view: WKWebView) async throws {
+        let beforeResult = try await js(view, """
+        (() => {
+          const content = document.querySelector('[data-market-list-content]');
+          const table = document.querySelector('table[data-market-count]');
+          return {scale: Number(getComputedStyle(document.documentElement).getPropertyValue('--market-list-scale')), contentWidth: content.getBoundingClientRect().width, tableWidth: table.getBoundingClientRect().width};
+        })()
+        """)
+        let before = try XCTUnwrap(beforeResult as? [String: Double])
+        _ = try await js(view, """
+        (() => {
+          const fixture = document.createElement('span');
+          fixture.dataset.liveWidthFixture = 'true';
+          fixture.textContent = '9'.repeat(400);
+          document.querySelector('tbody td').append(fixture);
+          return true;
+        })()
+        """)
+        try await Task.sleep(for: .milliseconds(100))
+        let afterResult = try await js(view, """
+        (() => {
+          const content = document.querySelector('[data-market-list-content]');
+          const table = document.querySelector('table[data-market-count]');
+          document.querySelector('[data-live-width-fixture]')?.remove();
+          return {scale: Number(getComputedStyle(document.documentElement).getPropertyValue('--market-list-scale')), contentWidth: content.getBoundingClientRect().width, tableWidth: table.getBoundingClientRect().width};
+        })()
+        """)
+        let after = try XCTUnwrap(afterResult as? [String: Double])
+        XCTAssertEqual(try XCTUnwrap(after["scale"]), try XCTUnwrap(before["scale"]), accuracy: 0.000_001)
+        XCTAssertEqual(try XCTUnwrap(after["contentWidth"]), try XCTUnwrap(before["contentWidth"]), accuracy: 0.5)
+        XCTAssertEqual(try XCTUnwrap(after["tableWidth"]), try XCTUnwrap(before["tableWidth"]), accuracy: 0.5)
     }
 
     @MainActor
