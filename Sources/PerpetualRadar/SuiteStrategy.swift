@@ -2,10 +2,11 @@ import Foundation
 
 let defaultStrategyID = "builtin.default-strategy"
 private let defaultStrategyRevision = 1
-let radarStrategyBacktestHours = 48
+let radarStrategyContextHours = 48
+let radarChartHours = 96
 
-func radarStrategyBacktestStart(through: Int64) -> Int64 {
-    max(0, through - Int64(radarStrategyBacktestHours - 1) * hourMS)
+func radarStrategyReplayStart(chartEnd: Int64) -> Int64 {
+    max(0, chartEnd - Int64(radarChartHours - 1) * hourMS)
 }
 
 private func defaultRule(_ id: String, _ name: String, left: String, _ comparison: String, right: String) -> FilterNode {
@@ -126,6 +127,7 @@ struct StrategyChartSignal: Codable, Sendable, Equatable {
 struct StrategyChartReplay: Codable, Sendable, Equatable {
     var fromHour: Int64
     var throughHour: Int64
+    var contextHours = radarStrategyContextHours
     var completedHours = 0
     var matchedHours = 0
     var unknownHours = 0
@@ -159,35 +161,40 @@ enum SuiteEvaluation {
     }
 }
 
-/// Replays a saved strategy one completed hour at a time. Each context is
-/// anchored to that candle close, so candles and readings after `hour` remain
-/// inaccessible to the evaluator even when they are present in the series.
+/// Replays a saved strategy one completed hour at a time. Each context is a
+/// rolling window ending at that candle, so neither future data nor data older
+/// than the configured context can influence the evaluation.
 func strategyChartReplay(profile: StrategyProfile, market: FilterMarketData,
                          reference: FilterMarketData? = nil, from: Int64, through: Int64) throws -> StrategyChartReplay {
     var output = StrategyChartReplay(fromHour: from, throughHour: through)
     guard from <= through else { return output }
     let filters = try profile.compiled(), cooldowns = FilterCooldownMemory()
-    func reconstructed(_ input: FilterMarketData) -> FilterMarketData {
+    func rollingContext(_ input: FilterMarketData, at anchor: Int64) -> FilterMarketData {
         var result = input
-        let series = ResearchEngine.reconstruct(.init(candles: input.candles, stats: input.stats, quotes: input.quotes))
+        let first = max(0, anchor - Int64(radarStrategyContextHours - 1) * hourMS)
+        result.candles = input.candles.filter { $0.key >= first && $0.key <= anchor }
+        result.stats = input.stats.filter { $0.key >= first && $0.key <= anchor }
+        result.quotes = input.quotes.filter { $0.key >= first && $0.key <= anchor }
+        result.historicalReadings = nil
+        let recordedQuotes = result.quotes
+        let series = ResearchEngine.reconstruct(.init(candles: result.candles, stats: result.stats, quotes: result.quotes))
         result.candles = series.candles; result.stats = series.stats
         result.quotes = Dictionary(uniqueKeysWithValues: series.quotes.map { hour, generated in
-            (hour, FilterQuote(turnover: generated.turnover, spread: input.quotes[hour]?.spread, timestamp: generated.timestamp))
+            (hour, FilterQuote(turnover: generated.turnover, spread: recordedQuotes[hour]?.spread, timestamp: generated.timestamp))
         })
         // Preserve exact recorded spread snapshots, including hours where a
         // turnover snapshot was absent; generated turnover never invents spread.
-        for (hour, recorded) in input.quotes where result.quotes[hour] == nil { result.quotes[hour] = recorded }
+        for (hour, recorded) in recordedQuotes where result.quotes[hour] == nil { result.quotes[hour] = recorded }
         return result
     }
-    let market = reconstructed(market), reference = reference.map(reconstructed)
     var episode = ResearchEpisode()
     for hour in stride(from: from, through: through, by: Int(hourMS)) {
-        var context = market
+        var context = rollingContext(market, at: hour)
         context.hour = hour; context.now = hour + hourMS
         context.current = [:]; context.previousEMA = nil; context.historicalClose = true
         context.evaluationTime = context.now; context.cooldowns = cooldowns; context.recordCooldowns = true
         if let reference {
-            var referenceAtClose = reference
+            var referenceAtClose = rollingContext(reference, at: hour)
             referenceAtClose.hour = hour; referenceAtClose.now = hour + hourMS
             referenceAtClose.current = [:]; referenceAtClose.previousEMA = nil; referenceAtClose.historicalClose = true
             referenceAtClose.evaluationTime = referenceAtClose.now; referenceAtClose.cooldowns = cooldowns

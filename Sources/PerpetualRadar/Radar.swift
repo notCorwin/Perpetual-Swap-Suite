@@ -1036,8 +1036,9 @@ final class Radar {
                     reference = FilterMarketData(id: btcReferenceID, hour: end, now: end + hourMS, listedAt: rows[btcReferenceID]?.listedAt,
                         candles: referenceCandles, stats: referenceStats.mapValues { FilterStat(oi: $0.oi, sell: $0.sell, buy: $0.buy) }, quotes: referenceQuotes, historicalClose: true)
                 }
-                let confirmedThrough = min(end, hour - hourMS)
-                let replayFirst = radarStrategyBacktestStart(through: confirmedThrough)
+                let replayEnd = endHour == nil ? series.filter { $0.value.open != nil }.keys.max() ?? end : end
+                let confirmedThrough = min(replayEnd, hour - hourMS)
+                let replayFirst = radarStrategyReplayStart(chartEnd: replayEnd)
                 chartReplay = try strategyChartReplay(profile: profile, market: market, reference: reference, from: replayFirst, through: confirmedThrough)
             }
         }

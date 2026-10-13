@@ -130,11 +130,28 @@ final class StrategyWorkflowTests: XCTestCase {
                        [start + 2 * hourMS], "The forming candle must never become a historical BUY marker.")
     }
 
-    func testRadarChartBacktestUses48HoursEndingAtTheEvaluatedCandle() {
-        let evaluatedHour = hour - hourMS
-        let start = radarStrategyBacktestStart(through: evaluatedHour)
-        XCTAssertEqual(start, evaluatedHour - 47 * hourMS)
-        XCTAssertEqual((evaluatedHour - start) / hourMS + 1, 48)
+    func testRadarChartBacktestEvaluatesEveryVisibleCompletedCandle() {
+        let start = radarStrategyReplayStart(chartEnd: hour)
+        XCTAssertEqual(start, hour - 95 * hourMS)
+        XCTAssertEqual((hour - hourMS - start) / hourMS + 1, 95, "The live chart's forming candle is monitored, not historically replayed.")
+    }
+
+    func testRadarChartBacktestUsesRolling48HourContextsEndingAtEachCandle() throws {
+        let start = hour - 60 * hourMS
+        let bars = Dictionary(uniqueKeysWithValues: (0...60).map { index in
+            let timestamp = start + Int64(index) * hourMS
+            return (timestamp, Candle(hour: timestamp, high: 11, low: 9, close: 10, quoteVolume: 100, baseVolume: 1, open: 10))
+        })
+        let market = FilterMarketData(id: "ETH-USDT-SWAP", hour: hour, now: hour + hourMS, listedAt: 1,
+            candles: bars, stats: [:], quotes: [:], historicalClose: true)
+        let inside = try profile(universe: "Close > 0", setup: "lag(Close, 47) > 0")
+        let outside = try profile(universe: "Close > 0", setup: "lag(Close, 48) > 0")
+        let insideReport = try strategyChartReplay(profile: inside, market: market, from: hour, through: hour)
+        let outsideReport = try strategyChartReplay(profile: outside, market: market, from: hour, through: hour)
+        XCTAssertEqual(insideReport.contextHours, 48)
+        XCTAssertEqual(insideReport.matchedHours, 1)
+        XCTAssertEqual(outsideReport.matchedHours, 0)
+        XCTAssertEqual(outsideReport.unknownHours, 1, "Data before the rolling 48-hour context must remain inaccessible.")
     }
 
     func testChartReplayReconstructsPastTurnoverWithoutInventingSpread() throws {

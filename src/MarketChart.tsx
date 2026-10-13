@@ -27,7 +27,7 @@ export type Bar = {
 }
 export type StrategyChartSignal = { hour: number; price: number }
 export type ChartStrategy = { id: string; name: string; revision: number }
-export type StrategyChartReplay = { fromHour: number; throughHour: number; completedHours: number; matchedHours: number; unknownHours: number; signals: StrategyChartSignal[] }
+export type StrategyChartReplay = { fromHour: number; throughHour: number; contextHours: number; completedHours: number; matchedHours: number; unknownHours: number; signals: StrategyChartSignal[] }
 export type ChartResponse = { bars: Bar[]; error: string; revision: number; serviceSession?: string; endHour?: number; oldestHour?: number | null; historyExhausted?: boolean; candleLoadFailed?: boolean; strategy?: ChartStrategy; strategySignals?: StrategyChartSignal[]; strategyReplay?: StrategyChartReplay }
 export type ChartPollResponse = ChartResponse | { unchanged: true; error: string; revision: number; serviceSession?: string }
 
@@ -703,7 +703,8 @@ export function MarketChart({ instId, listOrder, turnoverOrder, onSelect, onBack
       {chart?.strategy && <Badge variant="outline" title="BUY markers use completed hourly candles only">{chart.strategy.name} · r{chart.strategy.revision} · {visibleStrategySignals.length} BUY</Badge>}
     </header>
     {chart?.strategy && strategyReplay && <div role="status" data-strategy-chart-summary className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-xs">
-      <span className={visibleStrategySignals.length ? 'font-medium text-positive' : 'font-medium'}>{visibleStrategySignals.length} BUY {visibleStrategySignals.length === 1 ? 'entry' : 'entries'} in this 48-hour backtest</span>
+      <span className={visibleStrategySignals.length ? 'font-medium text-positive' : 'font-medium'}>{visibleStrategySignals.length} BUY {visibleStrategySignals.length === 1 ? 'entry' : 'entries'} across visible completed candles</span>
+      <span className="text-muted-foreground">Rolling {strategyReplay.contextHours}-hour context ending at each candle</span>
       <span className="text-muted-foreground">{strategyReplay.matchedHours} matching completed hours · {strategyReplay.completedHours} completed hours checked{strategyReplay.unknownHours ? ` · ${strategyReplay.unknownHours} Unknown` : ''}</span>
       {!visibleStrategySignals.length && <span className="ml-auto text-muted-foreground">The strategy did not transition from non-match to match in this window.</span>}
     </div>}
