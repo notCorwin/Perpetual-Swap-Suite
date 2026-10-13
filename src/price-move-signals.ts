@@ -1,5 +1,6 @@
 export type PriceMoveDirection = 'long' | 'short'
 export type PriceMoveMode = 'close' | 'highLow'
+export type PriceMoveObjective = 'amplitude' | 'efficiency'
 
 export type PriceMoveSignal = {
   direction: PriceMoveDirection
@@ -9,6 +10,8 @@ export type PriceMoveSignal = {
   exitPrice: number
   changePercent: number
   periods: number
+  efficiencyPercentPerPeriod: number
+  rank: number
 }
 
 type PriceBar = { hour: number; close: number; high?: number; low?: number; confirmed: boolean }
@@ -16,26 +19,30 @@ type PriceBar = { hour: number; close: number; high?: number; low?: number; conf
 const HOUR_MS = 3_600_000
 const change = (from: number, to: number) => (to - from) / Math.abs(from) * 100
 
-function stronger(candidate: PriceMoveSignal, current: PriceMoveSignal | null): boolean {
-  if (!current) return true
+function compareMoves(candidate: PriceMoveSignal, current: PriceMoveSignal, objective: PriceMoveObjective): number {
+  if (objective === 'efficiency') {
+    const efficiency = candidate.efficiencyPercentPerPeriod - current.efficiencyPercentPerPeriod
+    if (efficiency !== 0) return efficiency > 0 ? -1 : 1
+  }
   const amplitude = Math.abs(candidate.changePercent) - Math.abs(current.changePercent)
-  if (amplitude !== 0) return amplitude > 0
-  if (candidate.periods !== current.periods) return candidate.periods < current.periods
-  if (candidate.hour !== current.hour) return candidate.hour < current.hour
-  return candidate.direction === 'long' && current.direction === 'short'
+  if (amplitude !== 0) return amplitude > 0 ? -1 : 1
+  if (candidate.periods !== current.periods) return candidate.periods - current.periods
+  if (candidate.hour !== current.hour) return candidate.hour - current.hour
+  return candidate.direction === current.direction ? 0 : candidate.direction === 'long' ? -1 : 1
 }
 
 // Deliberately uses hindsight. Every valid pair of completed candles is
-// considered, then exactly one move wins lexicographically: greatest absolute
-// signed relative change first, fewest candle periods second.
-function strongestSegmentMove(bars: PriceBar[], thresholdPercent: number, mode: PriceMoveMode): PriceMoveSignal | null {
-  let best: PriceMoveSignal | null = null
+// considered, then exactly one move wins the selected lexicographic objective:
+// total amplitude, or absolute signed relative change per candle period.
+function segmentMoves(bars: PriceBar[], thresholdPercent: number, mode: PriceMoveMode): PriceMoveSignal[] {
+  const output: PriceMoveSignal[] = []
   const consider = (direction: PriceMoveDirection, start: number, end: number, entryPrice: number, exitPrice: number) => {
     const changePercent = change(entryPrice, exitPrice)
     if (direction === 'long' ? changePercent <= thresholdPercent : changePercent >= -thresholdPercent) return
+    const periods = end - start
     const candidate: PriceMoveSignal = { direction, hour: bars[start].hour, exitHour: bars[end].hour,
-      entryPrice, exitPrice, changePercent, periods: end - start }
-    if (stronger(candidate, best)) best = candidate
+      entryPrice, exitPrice, changePercent, periods, efficiencyPercentPerPeriod: Math.abs(changePercent) / periods, rank: 0 }
+    output.push(candidate)
   }
   for (let start = 0; start < bars.length - 1; start++) {
     for (let end = start + 1; end < bars.length; end++) {
@@ -48,18 +55,17 @@ function strongestSegmentMove(bars: PriceBar[], thresholdPercent: number, mode: 
       }
     }
   }
-  return best
+  return output
 }
 
-export function capturePriceMoves(input: PriceBar[], thresholdPercent = 1, mode: PriceMoveMode = 'close'): PriceMoveSignal[] {
+export function capturePriceMoves(input: PriceBar[], thresholdPercent = 1, mode: PriceMoveMode = 'close', objective: PriceMoveObjective = 'amplitude'): PriceMoveSignal[] {
   const valid = (bar: PriceBar) => bar.confirmed && Number.isFinite(bar.close) && bar.close > 0 && Number.isFinite(bar.hour)
     && (mode === 'close' || (Number.isFinite(bar.high) && Number.isFinite(bar.low) && bar.high! >= bar.low! && bar.low! > 0))
   const bars = [...new Map(input.filter(valid).map(bar => [bar.hour, bar])).values()].sort((a, b) => a.hour - b.hour)
-  let best: PriceMoveSignal | null = null
+  const candidates: PriceMoveSignal[] = []
   let segment: PriceBar[] = []
   const finish = () => {
-    const candidate = strongestSegmentMove(segment, thresholdPercent, mode)
-    if (candidate && stronger(candidate, best)) best = candidate
+    candidates.push(...segmentMoves(segment, thresholdPercent, mode))
     segment = []
   }
   for (const bar of bars) {
@@ -67,5 +73,11 @@ export function capturePriceMoves(input: PriceBar[], thresholdPercent = 1, mode:
     segment.push(bar)
   }
   finish()
-  return best ? [best] : []
+  candidates.sort((a, b) => compareMoves(a, b, objective))
+  const selected: PriceMoveSignal[] = []
+  for (const candidate of candidates) {
+    const overlaps = selected.some(existing => candidate.hour < existing.exitHour && candidate.exitHour > existing.hour)
+    if (!overlaps) selected.push({ ...candidate, rank: selected.length + 1 })
+  }
+  return selected.sort((a, b) => a.hour - b.hour || a.exitHour - b.exitHour)
 }
