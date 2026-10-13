@@ -5,13 +5,20 @@ import { capturePriceMoves } from './price-move-signals.ts'
 const hour = 3_600_000
 const bars = (closes: number[]) => closes.map((close, index) => ({ hour: index * hour, close, confirmed: true }))
 
-test('future move labels preserve the maximum swing before reversal', () => {
+test('future move labels keep only the globally strongest move', () => {
   const signals = capturePriceMoves(bars([100, 102, 101.5, 104, 102]))
   assert.deepEqual(signals.map(({ direction, hour: start, exitHour, periods }) => ({ direction, start, exitHour, periods })), [
     { direction: 'long', start: 0, exitHour: 3 * hour, periods: 3 },
-    { direction: 'short', start: 3 * hour, exitHour: 4 * hour, periods: 1 },
   ])
   assert.equal(signals[0].changePercent, 4)
+})
+
+test('a temporary reversal does not split a larger future move', () => {
+  const [signal] = capturePriceMoves(bars([100, 103, 101, 110]))
+  assert.equal(signal.direction, 'long')
+  assert.equal(signal.hour, 0)
+  assert.equal(signal.exitHour, 3 * hour)
+  assert.equal(signal.changePercent, 10)
 })
 
 test('moves must exceed one percent and use the shortest span for equal extrema', () => {
@@ -40,7 +47,6 @@ test('High / Low mode captures wick extremes independently from closes', () => {
   const signals = capturePriceMoves(input, 1, 'highLow')
   assert.deepEqual(signals.map(({ direction, hour: start, exitHour, entryPrice, exitPrice, periods }) =>
     ({ direction, start, exitHour, entryPrice, exitPrice, periods })), [
-    { direction: 'long', start: 0, exitHour: hour, entryPrice: 100, exitPrice: 103, periods: 1 },
     { direction: 'short', start: hour, exitHour: 2 * hour, entryPrice: 103, exitPrice: 99, periods: 1 },
   ])
 })
