@@ -161,6 +161,13 @@ struct Checkpoint: Codable, Sendable {
     var nextHour: Int64?
     var episodes: [String: ResearchEpisode] = [:]
     var updatedAt = researchNow()
+    var calculation: [String: ResearchCalculationPosition]?
+}
+
+struct ResearchCalculationPosition: Codable, Sendable {
+    var nextHour: Int64?
+    var episodes: [String: ResearchEpisode] = [:]
+    var completed = false
 }
 
 struct ResearchEpisode: Codable, Sendable {

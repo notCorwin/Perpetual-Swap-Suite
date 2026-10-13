@@ -202,16 +202,19 @@ actor ResearchWorker {
             await publish(.init(stage: "prepared", filename: source.filename, instrument: source.instrument), progress: progress)
         }
     }
-    func run(_ study: ResearchStudy, progress: @escaping @Sendable (Int, Int, String) -> Void) throws -> StudyReport {
+    func run(_ study: ResearchStudy, progress: @escaping @Sendable (Int, Int, String) -> Void) async throws -> StudyReport {
         let store = try ResearchStore(directory: directory)
         guard let id = study.manifestID, let manifest = try store.get(id, as: DataManifest.self) else { throw FilterError("Prepare data before running this study.") }
         guard manifest.engine == ResearchVersion.engine else { throw FilterError("This checkpoint requires engine \(manifest.engine). Keep its frozen results or copy its configuration to use the current engine.") }
         var checkpoint = try store.get("checkpoint:\(study.id)", as: Checkpoint.self) ?? Checkpoint(studyID: study.id, phase: "running")
         checkpoint.phase = "running"; checkpoint.error = nil; try store.put("checkpoint:\(study.id)", kind: "checkpoint", checkpoint)
         try study.spec.validate()
-        try ResearchEngine.run(store: store, study: study, manifest: manifest, checkpoint: &checkpoint, progress: progress)
+        progress(0, 0, "Indexing frozen history for calculation…")
+        try store.prepareCalculationIndexes()
+        checkpoint = try store.calculationCheckpoint(checkpoint)
+        checkpoint = try await ResearchEngine.runConcurrent(directory: directory, study: study, manifest: manifest, checkpoint: checkpoint, progress: progress)
         progress(1, 1, "Calculating baselines, medians and confidence intervals…")
-        let report = try store.report(study, manifest: manifest)
+        let report = try store.report(study, manifest: manifest) { progress(1, 1, $0) }
         checkpoint.phase = "completed"; checkpoint.updatedAt = researchNow()
         try store.database.transaction {
             try store.put("report:\(study.id)", kind: "report", report)

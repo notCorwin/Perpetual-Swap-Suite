@@ -5,6 +5,7 @@ final class Store {
     private static let busyTimeoutMilliseconds: Int32 = 5_000
     private static let schemaVersion: Int64 = 1
     private var db: OpaquePointer?
+    private var reusableStatements: [String: OpaquePointer] = [:]
     let url: URL
 
     init(url: URL) throws {
@@ -40,7 +41,10 @@ final class Store {
         }
     }
 
-    deinit { sqlite3_close(db) }
+    deinit {
+        for statement in reusableStatements.values { sqlite3_finalize(statement) }
+        sqlite3_close(db)
+    }
 
     private func failure() -> NSError {
         NSError(domain: "SQLite", code: Int(sqlite3_errcode(db)), userInfo: [NSLocalizedDescriptionKey: String(cString: sqlite3_errmsg(db))])
@@ -116,17 +120,29 @@ final class Store {
     }
 
     func execute(_ sql: String, _ values: [Any?] = []) throws {
-        let stmt = try statement(sql)
-        defer { sqlite3_finalize(stmt) }
-        bind(values, to: stmt)
-        guard sqlite3_step(stmt) == SQLITE_DONE else { throw failure() }
+        try reuse(sql) { stmt in
+            bind(values, to: stmt)
+            guard sqlite3_step(stmt) == SQLITE_DONE else { throw failure() }
+        }
     }
 
     func query(_ sql: String, _ values: [Any?] = [], read: (OpaquePointer) -> Void) throws {
-        let stmt = try statement(sql)
-        defer { sqlite3_finalize(stmt) }
-        bind(values, to: stmt)
-        try readRows(stmt) { read(stmt) }
+        try reuse(sql) { stmt in
+            bind(values, to: stmt)
+            try readRows(stmt) { read(stmt) }
+        }
+    }
+
+    private func reuse<T>(_ sql: String, _ action: (OpaquePointer) throws -> T) throws -> T {
+        // Lease the statement out of the cache: nested queries may use the same
+        // SQL while a surrounding query is still reading its rows.
+        let stmt = try reusableStatements.removeValue(forKey: sql) ?? statement(sql)
+        defer {
+            sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
+            if reusableStatements[sql] == nil, reusableStatements.count < 128 { reusableStatements[sql] = stmt }
+            else { sqlite3_finalize(stmt) }
+        }
+        return try action(stmt)
     }
 
     private func columns(_ table: String) throws -> Set<String> {

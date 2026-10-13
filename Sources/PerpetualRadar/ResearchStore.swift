@@ -17,6 +17,16 @@ final class ResearchStore {
     let directory: URL
     let database: Store
     private let decoder = JSONDecoder()
+    private let monthFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian); formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0); formatter.dateFormat = "yyyy-MM"
+        return formatter
+    }()
+    private var months: [Int64: String] = [:]
+    private var frozenFunding: [String: [String: [ResearchRange]]] = [:]
+    private var frozenWindows: [String: (range: ResearchRange, values: [ResearchDatum])] = [:]
+    private var calculationTableAvailable = false
     init(directory: URL) throws {
         self.directory = directory
         database = try Store(url: directory.appendingPathComponent("research.sqlite3"))
@@ -38,8 +48,8 @@ final class ResearchStore {
             try database.execute("CREATE INDEX IF NOT EXISTS research_events_page ON research_events(study,ts,id)")
             try database.setPreference("1", forKey: "researchSchemaVersion")
         } }
-        if try database.preference(forKey: "researchSchemaVersion") != "4" { try database.transaction {
-            guard try database.preference(forKey: "researchSchemaVersion") != "4" else { return }
+        if try Int(database.preference(forKey: "researchSchemaVersion") ?? "0") ?? 0 < 4 { try database.transaction {
+            guard try Int(database.preference(forKey: "researchSchemaVersion") ?? "0") ?? 0 < 4 else { return }
             try database.execute("CREATE INDEX IF NOT EXISTS research_objects_kind ON research_objects(kind)")
             try database.execute("CREATE INDEX IF NOT EXISTS research_coverage_input ON research_coverage(inst,kind,parser,first,last)")
             if try database.preference(forKey: "researchSchemaVersion") == "3" { try database.execute("ALTER TABLE research_prepared_sources ADD COLUMN seconds REAL") }
@@ -62,6 +72,51 @@ final class ResearchStore {
             try database.setPreference("4", forKey: "researchSchemaVersion")
         } }
     }
+    func prepareCalculationIndexes() throws {
+        // Building an index over a large cache belongs to the background
+        // calculation worker, never a window/controller's startup connection.
+        if try database.preference(forKey: "researchCalculationIndexVersion") != "3" { try database.transaction {
+            guard try database.preference(forKey: "researchCalculationIndexVersion") != "3" else { return }
+            try database.execute("CREATE INDEX IF NOT EXISTS research_data_time ON research_data(inst,ts,revision)")
+            try database.execute("CREATE INDEX IF NOT EXISTS research_samples_totals ON research_samples(study,rule,truth,direction,entry)")
+            try database.execute("CREATE TABLE IF NOT EXISTS research_calculation_positions (study TEXT,inst TEXT,json TEXT,PRIMARY KEY(study,inst))")
+            try database.setPreference("3", forKey: "researchCalculationIndexVersion")
+        } }
+        calculationTableAvailable = true
+    }
+
+    func calculationCheckpoint(_ checkpoint: Checkpoint) throws -> Checkpoint {
+        // Preparation already has a normalized durable source table. Retain
+        // legacy embedded entries there once, rather than rewriting thousands
+        // of source IDs and timings with every 64-hour calculation checkpoint.
+        try database.transaction {
+            for source in checkpoint.completedSources {
+                try database.execute("INSERT INTO research_prepared_sources VALUES (?,?,?) ON CONFLICT(study,source) DO UPDATE SET seconds=COALESCE(research_prepared_sources.seconds,excluded.seconds)", [checkpoint.studyID, source, checkpoint.sourceSeconds?[source]])
+            }
+            if let positions = checkpoint.calculation {
+                for (instrument, position) in positions { try saveCalculationPosition(checkpoint.studyID, instrument: instrument, position: position) }
+            }
+        }
+        let completed = Set(checkpoint.completedSources)
+        var compact = checkpoint; compact.completedSources = []
+        compact.sourceSeconds = checkpoint.sourceSeconds?.filter { !completed.contains($0.key) }
+        if compact.sourceSeconds?.isEmpty == true { compact.sourceSeconds = nil }
+        return compact
+    }
+
+    func saveCalculationPosition(_ study: String, instrument: String, position: ResearchCalculationPosition) throws {
+        try database.execute("INSERT INTO research_calculation_positions VALUES (?,?,?) ON CONFLICT(study,inst) DO UPDATE SET json=excluded.json", [study, instrument, try researchJSON(position)])
+    }
+    func saveCalculationCheckpoint(_ checkpoint: Checkpoint) throws {
+        var durable = checkpoint; durable.calculation = nil
+        try put("checkpoint:\(checkpoint.studyID)", kind: "checkpoint", durable)
+    }
+    private func hasCalculationPositions() throws -> Bool {
+        if !calculationTableAvailable {
+            calculationTableAvailable = try count("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='research_calculation_positions'") > 0
+        }
+        return calculationTableAvailable
+    }
 
     static var defaultDirectory: URL {
         if let url = MonitorRuntime.storeURL { return url.deletingLastPathComponent().appendingPathComponent("Research") }
@@ -77,6 +132,14 @@ final class ResearchStore {
         guard let json else { return nil }
         let value = try decoder.decode(type, from: Data(json.utf8))
         if var checkpoint = value as? Checkpoint {
+            if try hasCalculationPositions() {
+                var rows: [(String, String)] = []
+                try database.query("SELECT inst,json FROM research_calculation_positions WHERE study=?", [checkpoint.studyID]) { rows.append((Self.text($0, 0), Self.text($0, 1))) }
+                if !rows.isEmpty {
+                    if checkpoint.calculation == nil { checkpoint.calculation = [:] }
+                    for (instrument, json) in rows { checkpoint.calculation?[instrument] = try decoder.decode(ResearchCalculationPosition.self, from: Data(json.utf8)) }
+                }
+            }
             var sources = Set(checkpoint.completedSources)
             try database.query("SELECT source,seconds FROM research_prepared_sources WHERE study=? ORDER BY rowid", [checkpoint.studyID]) {
                 let source = Self.text($0, 0)
@@ -181,17 +244,30 @@ final class ResearchStore {
         try database.query("SELECT d.json FROM research_heads h JOIN research_data d USING(revision) WHERE h.inst=? AND h.kind IN ('candle','stat','quote') AND h.ts>=? AND h.ts<=?", [instrument, from, through]) { json.append(Self.text($0, 0)) }
         return try json.map { try decoder.decode(ResearchDatum.self, from: Data($0.utf8)) }
     }
-    func data(_ instrument: String, from: Int64, through: Int64, manifest: String? = nil) throws -> [ResearchDatum] {
+    func useFrozenManifest(_ manifest: DataManifest) { frozenFunding[manifest.id] = manifest.fundingRanges }
+    func data(_ instrument: String, from: Int64, through: Int64, manifest: String? = nil, reuseFrozenInputs: Bool = false) throws -> [ResearchDatum] {
+        let key = manifest.map { $0 + "|" + instrument }
+        let previous = reuseFrozenInputs ? key.flatMap { frozenWindows[$0] } : nil
+        let overlaps = previous.map { from >= $0.range.from && from <= $0.range.through && through >= $0.range.through } ?? false
+        let queryFrom = overlaps ? previous!.range.through + 1 : from
         var json: [String] = []
-        let join = manifest == nil ? "JOIN research_heads h USING(revision)" : "JOIN research_pins p USING(revision)"
+        let join = manifest == nil ? "JOIN research_heads h USING(revision)" : "CROSS JOIN research_pins p ON p.revision=d.revision"
         let clause = manifest == nil ? "" : " AND p.manifest=?"
-        var values: [Any?] = [instrument, from, through]; if let manifest { values.append(manifest) }
+        var values: [Any?] = [instrument, queryFrom, through]; if let manifest { values.append(manifest) }
         try database.query("SELECT d.json FROM research_data d \(join) WHERE d.inst=? AND d.ts>=? AND d.ts<=?\(clause) ORDER BY d.ts", values) { json.append(Self.text($0, 0)) }
-        return try json.map { try decoder.decode(ResearchDatum.self, from: Data($0.utf8)) }
+        var result = overlaps ? previous!.values.filter { $0.timestamp >= from } : []
+        result += try json.map { try decoder.decode(ResearchDatum.self, from: Data($0.utf8)) }
+        if reuseFrozenInputs, let key {
+            // A calculation lane needs only its current contract and BTC. Bound
+            // retention across subsequent contracts; each frozen row is immutable.
+            if frozenWindows[key] == nil, frozenWindows.count >= 2 { frozenWindows.removeAll(keepingCapacity: true) }
+            frozenWindows[key] = (.init(from: from, through: through), result)
+        }
+        return result
     }
-    func series(_ instrument: String, from: Int64, through: Int64, manifest: String? = nil) throws -> ResearchSeries {
+    func series(_ instrument: String, from: Int64, through: Int64, manifest: String? = nil, reuseFrozenInputs: Bool = false) throws -> ResearchSeries {
         var result = ResearchSeries(), marks: [Int64: Double] = [:], rates: [Int64: Double] = [:], sources = Set<String>()
-        for value in try data(instrument, from: from, through: through, manifest: manifest) {
+        for value in try data(instrument, from: from, through: through, manifest: manifest, reuseFrozenInputs: reuseFrozenInputs) {
             sources.formUnion(value.sources)
             if let bar = value.candle { result.candles[value.timestamp] = bar }
             if let stat = value.stat { result.stats[value.timestamp] = stat }
@@ -400,7 +476,13 @@ final class ResearchStore {
         }
     }
     func fundingCoverage(_ instrument: String, manifest: String?) throws -> [ResearchRange] {
-        if let manifest, let frozen = try get(manifest, as: DataManifest.self) { return frozen.fundingRanges[instrument] ?? [] }
+        if let manifest {
+            if let ranges = frozenFunding[manifest] { return ranges[instrument] ?? [] }
+            if let frozen = try get(manifest, as: DataManifest.self) {
+                frozenFunding[manifest] = frozen.fundingRanges
+                return frozen.fundingRanges[instrument] ?? []
+            }
+        }
         var values: [Any?] = [instrument, ResearchVersion.parser]; if let manifest { values.append(manifest) }
         var ranges: [ResearchRange] = []
         try database.query("SELECT first,last FROM research_coverage WHERE inst=? AND kind='funding' AND parser=?" + (manifest == nil ? "" : " AND source IN (SELECT source FROM research_source_pins WHERE manifest=?)") + " ORDER BY first", values) { ranges.append(.init(from: sqlite3_column_int64($0,0), through: sqlite3_column_int64($0,1))) }
@@ -460,10 +542,16 @@ final class ResearchStore {
         return manifest
     }
     func saveSample(study: String, rule: Int, instrument: String, timestamp: Int64, truth: FilterTruth, direction: String?, entry: String, opportunity: NativeOpportunity, complete: Bool, split: String, outcomes: [ResearchOutcome], event: ResearchEvent?) throws {
-        let date = Date(timeIntervalSince1970: Double(timestamp) / 1000), formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian); formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.timeZone = TimeZone(secondsFromGMT: 0); formatter.dateFormat = "yyyy-MM"
+        let day = timestamp / (24 * hourMS)
+        let month: String
+        if let saved = months[day] { month = saved }
+        else {
+            month = monthFormatter.string(from: Date(timeIntervalSince1970: Double(timestamp) / 1000))
+            if months.count >= 512 { months.removeAll(keepingCapacity: true) }
+            months[day] = month
+        }
         let week = (timestamp + 3 * 24 * hourMS) / (7 * 24 * hourMS)
-        try database.execute("INSERT OR REPLACE INTO research_samples VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [study, Int64(rule), instrument, timestamp, truth.rawValue, direction, entry, opportunity.score.map { Int64($0) }, Int64(complete ? 1 : 0), opportunity.status, opportunity.setup, split, formatter.string(from: date), week])
+        try database.execute("INSERT OR REPLACE INTO research_samples VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [study, Int64(rule), instrument, timestamp, truth.rawValue, direction, entry, opportunity.score.map { Int64($0) }, Int64(complete ? 1 : 0), opportunity.status, opportunity.setup, split, month, week])
         for outcome in outcomes {
             try database.execute("INSERT OR REPLACE INTO research_outcomes VALUES (?,?,?,?,?,?,?,?,?,?,?)", [study, Int64(rule), instrument, timestamp, Int64(outcome.hours), outcome.gross, outcome.net, outcome.mfe, outcome.mae, outcome.reason, outcome.netReason])
         }
@@ -479,8 +567,10 @@ final class ResearchStore {
         return try value.map { try decoder.decode(ResearchEvent.self, from: Data($0.utf8)) }
     }
     func deleteStudy(_ id: String) throws {
+        frozenWindows.removeAll(); frozenFunding.removeAll()
         let study = try get(id, as: ResearchStudy.self)
         try database.transaction {
+            if try hasCalculationPositions() { try database.execute("DELETE FROM research_calculation_positions WHERE study=?", [id]) }
             for table in ["research_samples", "research_outcomes", "research_events"] { try database.execute("DELETE FROM \(table) WHERE study=?", [id]) }
             for key in [id, "checkpoint:\(id)", "report:\(id)"] { try database.execute("DELETE FROM research_objects WHERE id=?", [key]) }
             for table in ["research_pins", "research_source_pins"] { try database.execute("DELETE FROM \(table) WHERE manifest=?", [id]) }
@@ -496,6 +586,7 @@ final class ResearchStore {
         }
     }
     func cleanCache() throws -> Int64 {
+        frozenWindows.removeAll(); frozenFunding.removeAll()
         try database.execute("DELETE FROM research_objects WHERE kind='planCache'")
         let studies = try objects("study", as: ResearchStudy.self)
         let pendingPlans = try studies.filter { $0.manifestID == nil }.compactMap { try get($0.planID, as: DataPlan.self) }
@@ -544,6 +635,7 @@ final class ResearchStore {
         try database.execute("DELETE FROM research_objects WHERE kind='indicator' AND id NOT IN (SELECT key FROM research_indicator_pins)")
         try database.execute("DELETE FROM research_objects WHERE kind='preparedSource' AND substr(id,10) NOT IN (SELECT id FROM research_objects WHERE kind='source')")
         try database.execute("DELETE FROM research_prepared_sources WHERE study NOT IN (SELECT id FROM research_objects WHERE kind='study')")
+        if try hasCalculationPositions() { try database.execute("DELETE FROM research_calculation_positions WHERE study NOT IN (SELECT id FROM research_objects WHERE kind='study')") }
         return bytes
     }
 }

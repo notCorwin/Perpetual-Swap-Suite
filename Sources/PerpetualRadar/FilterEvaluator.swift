@@ -21,6 +21,7 @@ struct FilterMarketData: Sendable {
     var evaluationTime: Int64?
     var cooldowns: FilterCooldownMemory?
     var recordCooldowns = true
+    var historicalReadings: FilterHistoricalReadings?
 }
 
 final class FilterEvaluator {
@@ -54,7 +55,10 @@ final class FilterEvaluator {
         guard let expression = filter.expressions[source] else { return .unknown("Expression is not compiled.") }
         return expressionValue(expression, at: hour, scope: scope)
     }
-    private func unknown(_ reason: String, at hour: Int64) -> FilterScalar { .unknown("\(reason) [\(ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: Double(hour) / 1000)))].") }
+    private func unknown(_ reason: String, at hour: Int64) -> FilterScalar {
+        let date = market.historicalReadings?.timestamp(hour) ?? ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: Double(hour) / 1000))
+        return .unknown("\(reason) [\(date)].")
+    }
     private func bar(_ hour: Int64) -> Candle? {
         guard hour <= market.hour, let bar = market.candles[hour],
               market.historicalClose ? bar.confirmed : (hour == market.hour ? !bar.confirmed : bar.confirmed) else { return nil }; return bar
@@ -69,14 +73,21 @@ final class FilterEvaluator {
         guard let a = current.number, let b = previous.number else { return .unknown(current.reason ?? previous.reason ?? "Change history is unavailable.") }
         return numeric(percentChange(a, b), "Change cannot be computed.", at: market.hour)
     }
-    private func cached(_ key: String, _ calculate: () -> FilterScalar) -> FilterScalar {
-        if let cached = cache[key] { return cached }; let value = calculate(); cache[key] = value; return value
+    private func cached(_ key: String, at hour: Int64, _ calculate: () -> FilterScalar) -> FilterScalar {
+        if let cached = cache[key] { return cached }
+        let value: FilterScalar
+        if hour <= market.hour, let readings = market.historicalReadings {
+            // An anchor-hour EMA includes an update after its historical seed;
+            // an earlier-hour EMA uses the complete historical window instead.
+            value = readings.scalar(key, anchor: hour == market.hour, calculate)
+        } else { value = calculate() }
+        cache[key] = value; return value
     }
     func metric(_ name: String, at hour: Int64) -> FilterScalar {
         if referenceOnly { return .unknown("This contract input awaits its normal decision clock.") }
         guard let key = FilterCatalog.key(name) else { return .unknown("Unknown metric: \(name).") }
         if !market.historicalClose, hour == market.hour, let value = market.current[key] { return value }
-        return cached("metric|\(key)|\(hour)") { read(key, at: hour) }
+        return cached("metric|\(key)|\(hour)", at: hour) { read(key, at: hour) }
     }
     private func read(_ key: String, at hour: Int64) -> FilterScalar {
         func number(_ n: Double?, _ reason: String = "Hourly data is unavailable.") -> FilterScalar { numeric(n, reason, at: hour) }
@@ -172,7 +183,9 @@ final class FilterEvaluator {
     private func extremes(at hour: Int64, lookback: Int, search: Int) -> (highBreakout: BreakResult, lowBreakdown: BreakResult) {
         let key = "\(hour)|\(lookback)|\(search)"
         if let cached = breaksCache[key] { return cached }
-        let result = recentExtremesBreaks(market.candles, hour, listedAt: market.listedAt, lookbackHours: lookback, searchHours: search)
+        let result = market.historicalReadings?.breaks(key) {
+            recentExtremesBreaks(market.candles, hour, listedAt: market.listedAt, lookbackHours: lookback, searchHours: search, historicalReadings: market.historicalReadings)
+        } ?? recentExtremesBreaks(market.candles, hour, listedAt: market.listedAt, lookbackHours: lookback, searchHours: search)
         breaksCache[key] = result; return result
     }
     func opportunity(at hour: Int64) -> NativeOpportunity {
@@ -187,7 +200,7 @@ final class FilterEvaluator {
     }
     private func indicator(_ name: String, _ args: [Double], at hour: Int64) -> FilterScalar {
         if referenceOnly { return .unknown("This contract indicator awaits its normal decision clock.") }
-        return cached("indicator|\(name)|\(args)|\(hour)") {
+        return cached("indicator|\(name)|\(args)|\(hour)", at: hour) {
             let n = Int(args[0])
             func number(_ x: Double?) -> FilterScalar { numeric(x, "\(name) requires complete hourly history.", at: hour) }
             if name == "priorhigh" || name == "priorlow" {
@@ -240,7 +253,8 @@ final class FilterEvaluator {
                 let window = emaWarmupHours(n)
                 let available = market.listedAt.map { max(0, Int((target - $0 / hourMS * hourMS) / hourMS) + 1) } ?? window
                 for age in 0..<min(window, available) { if Task.isCancelled { return .unknown("Evaluation cancelled.") }; guard let b = bar(target - Int64(age) * hourMS) else { return number(nil) }; values.append(b.close) }
-                guard var value = windowedEMA(values.reversed(), period: n) else { return number(nil) }
+                values.reverse()
+                guard var value = windowedEMA(values, period: n) else { return number(nil) }
                 if hour == market.hour { guard let b = bar(hour) else { return number(nil) }; value += (b.close - value) * (2 / Double(n + 1)) }
                 return number(value)
             }
@@ -400,7 +414,8 @@ final class FilterEvaluator {
     }
     private func rule(_ node: FilterNode, at anchor: Int64, scope: [String: FilterScalar], explain: Bool) -> FilterTrace {
         let hour = anchor - (node.mode == "closed" ? hourMS : 0)
-        var trace = FilterTrace(id: node.id, label: node.name.isEmpty ? node.formula : node.name, result: .unknown, hour: hour)
+        let label = !explain && market.historicalReadings != nil ? "" : node.name.isEmpty ? node.formula : node.name
+        var trace = FilterTrace(id: node.id, label: label, result: .unknown, hour: hour)
         func eval(_ source: String) -> FilterScalar { scalar(source, at: hour, scope: scope) }
         switch node.kind {
         case "all", "any", "not":

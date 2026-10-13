@@ -9,6 +9,7 @@
     "test": "scripts/test-native.sh && node --experimental-strip-types --test src/*.test.ts",
     "ci:local": "node --experimental-strip-types scripts/ci-local.ts",
     "app": "scripts/build-app.sh",
+    "benchmark:study": "scripts/benchmark-study.sh",
     "test:ui": "npm run build && RADAR_UI_TESTS=1 RADAR_VISUAL_TESTS=1 scripts/test-native.sh --filter RuleEditorUITests",
     "test:ui:visual": "npm run build && RADAR_UI_TESTS=1 RADAR_VISUAL_TESTS=1 scripts/test-native.sh --filter RuleEditorUITests.testAllSurfaceFamiliesAndChartCaptureInNativeWebKit"
   },

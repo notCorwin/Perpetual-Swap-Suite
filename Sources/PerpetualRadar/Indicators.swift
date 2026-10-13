@@ -44,11 +44,24 @@ func historicalPage(_ rows: [Any], before: Int64) -> [Candle] {
 func emaWarmupHours(_ period: Int) -> Int { max(candleLookback, period * 5) }
 
 /// `closes` must be contiguous and in ascending time order.
+@inlinable
 func windowedEMA<C: Collection>(_ closes: C, period n: Int) -> Double? where C.Element == Double {
     guard n > 0, closes.count >= n else { return nil }
     let alpha = 2 / Double(n + 1)
     var value = closes.prefix(n).reduce(0, +) / Double(n)
     for close in closes.dropFirst(n) { value += (close - value) * alpha }
+    return value.isFinite && value > 0 ? value : nil
+}
+
+// The shipping build optimizes each source file independently. A concrete
+// array loop avoids collection witness dispatch for every historical close.
+func windowedEMA(_ closes: [Double], period n: Int) -> Double? {
+    guard n > 0, closes.count >= n else { return nil }
+    var sum = 0.0
+    for index in 0..<n { sum += closes[index] }
+    let alpha = 2 / Double(n+1)
+    var value = sum / Double(n)
+    for index in n..<closes.count { value += (closes[index]-value)*alpha }
     return value.isFinite && value > 0 ? value : nil
 }
 
@@ -137,7 +150,8 @@ enum BreakResult: Equatable, Sendable {
 }
 
 func recentExtremesBreaks(_ bars: [Int64: Candle], _ hour: Int64, listedAt: Int64? = nil,
-                         lookbackHours: Int = breakoutLookbackHours, searchHours: Int = breakoutSearchHours) -> (highBreakout: BreakResult, lowBreakdown: BreakResult) {
+                         lookbackHours: Int = breakoutLookbackHours, searchHours: Int = breakoutSearchHours,
+                         historicalReadings: FilterHistoricalReadings? = nil) -> (highBreakout: BreakResult, lowBreakdown: BreakResult) {
     guard lookbackHours > 0,
           completedHistoryHours(at: hour, since: listedAt, limit: lookbackHours) == lookbackHours else {
         return (.insufficientHistory, .insufficientHistory)
@@ -152,7 +166,11 @@ func recentExtremesBreaks(_ bars: [Int64: Candle], _ hour: Int64, listedAt: Int6
         }
         var high = -Double.infinity, low = Double.infinity
         var highHour = candidateHour, lowHour = candidateHour
-        for offset in 1...lookbackHours {
+        if let historicalReadings {
+            let prior = historicalReadings.prior(bars, candidateHour, hours: lookbackHours)
+            guard prior.complete else { return (highBreakout ?? .loading, lowBreakdown ?? .loading) }
+            high = prior.high; low = prior.low; highHour = prior.highHour; lowHour = prior.lowHour
+        } else { for offset in 1...lookbackHours {
             let priorHour = candidateHour - Int64(offset) * hourMS
             guard let prior = bars[priorHour], prior.confirmed else {
                 // An unknown newer candidate could supersede any older event.
@@ -160,7 +178,7 @@ func recentExtremesBreaks(_ bars: [Int64: Candle], _ hour: Int64, listedAt: Int6
             }
             if prior.high > high { high = prior.high; highHour = priorHour }
             if prior.low < low { low = prior.low; lowHour = priorHour }
-        }
+        } }
         if highBreakout == nil, candidate.high > high {
             highBreakout = .event(BreakEvent(hour: candidateHour, hoursAgo: age, priorHour: highHour,
                                            priorAgeHours: Int((candidateHour - highHour) / hourMS), priorPrice: high, live: !candidate.confirmed))

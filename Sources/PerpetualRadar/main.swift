@@ -534,6 +534,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 }
 
+if ["--study-benchmark", "--study-report-benchmark"].contains(CommandLine.arguments.dropFirst().first ?? "") { ResearchBenchmark.start(arguments: CommandLine.arguments) }
+
 let application = NSApplication.shared
 application.setActivationPolicy(MonitorRuntime.testChannel != nil || MonitorRuntime.isHelper || ProcessInfo.processInfo.environment["PERPETUAL_RADAR_BACKGROUND"] == "1" ? .accessory : .regular)
 let delegate: any NSApplicationDelegate = MonitorRuntime.isHelper ? MonitorDelegate() : AppDelegate()
