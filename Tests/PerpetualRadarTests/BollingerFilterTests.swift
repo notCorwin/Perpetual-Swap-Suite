@@ -19,14 +19,14 @@ final class BollingerFilterTests: XCTestCase {
     }
 
     private func band(_ name: String, _ market: FilterMarketData) throws -> Double {
-        let filter = try FilterCompiler.compile(source: "available(\(name)(20, 2))")
+        let filter = try FilterCompiler.compile(source: "available(LogBB(20, 2, \"\(name)\"))")
         let value = FilterEvaluator(market: market, filter: filter).scalar(filter.config.root.children[0].left, at: hour)
         return try XCTUnwrap(value.number)
     }
 
     func testWicksCompareTheirOwnExtremesAndPreserveStrictEquality() throws {
         var context = market()
-        let upper = try band("LogBBUpper", context), lower = try band("LogBBLower", context)
+        let upper = try band("upper", context), lower = try band("lower", context)
         for (offset, relation) in [(1.0, "above"), (0.0, "equal"), (-1.0, "below")] {
             context.candles[hour] = Candle(hour: hour, high: upper + offset, low: lower + offset, close: 100, quoteVolume: 100, baseVolume: 1, open: 100, confirmed: false)
             XCTAssertEqual(try evaluate("highUpper == \"\(relation)\" AND lowLower == \"\(relation)\"", context), .yes)
@@ -41,7 +41,7 @@ final class BollingerFilterTests: XCTestCase {
             let context = market(open: open, close: close)
             XCTAssertEqual(try evaluate("bodyUpper == \"\(expected)\" AND bodyLower == \"\(expected)\"", context), .yes, "\(open) → \(close)")
         }
-        for (field, name) in [("bodyUpper", "LogBBUpper"), ("bodyLower", "LogBBLower")] {
+        for (field, name) in [("bodyUpper", "upper"), ("bodyLower", "lower")] {
             for close in [30.0, 200.0] {
                 let reference = try band(name, market(close: close))
                 XCTAssertEqual(try evaluate("\(field) == \"touching\"", market(open: reference, close: close)), .yes, "An open on the band is a touch, not a strict crossing.")

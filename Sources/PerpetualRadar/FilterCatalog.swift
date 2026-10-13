@@ -52,17 +52,12 @@ enum FilterCatalog {
             indicator("Efficiency", "Efficiency(n)", "Direction efficiency", "ratio", [period], ["24"], "Absolute net close change divided by the sum of absolute hourly close changes. Complete flat history is 0; missing hours are Unknown."),
             indicator("MAROC", "MAROC(rocN, meanN)", "MAROC", "%", [P(label: "ROC period (h)", kind: "number"), P(label: "Mean period (h)", kind: "number")], ["9", "9"], "Average of hourly ROC readings, with independently editable ROC and averaging periods.")
         ]
-        for band in ["Upper", "Middle", "Lower"] {
-            result.append(indicator("LogBB\(band)", "LogBB\(band)(n, deviations)", "Log BB \(band)", "USDT", [period, P(label: "Deviations", kind: "number", minimum: 0, step: "any", unit: "standard deviations")], ["20", "2"], "\(band) Bollinger band computed in log-price space, returned as a price in USDT."))
-        }
         result += [
+            indicator("LogBB", "LogBB(n, deviations, band)", "Log BB", "USDT", [period, P(label: "Deviations", kind: "number", minimum: 0, step: "any", unit: "standard deviations"), P(label: "Band", kind: "choice", unit: "band", choices: [Choice(value: "upper", label: "Upper"), Choice(value: "middle", label: "Middle"), Choice(value: "lower", label: "Lower")])], ["20", "2", "\"upper\""], "Log-price Bollinger band with editable period, deviations and band."),
             indicator("VWAP", "VWAP(n)", "VWAP", "USDT", [period], ["14"], "Volume-weighted average price over the specified hourly window."),
-            indicator("PriorHigh", "PriorHigh(n)", "Prior high", "USDT", [P(label: "Reference hours", kind: "number")], ["48"], "Highest high of the previous completed hours. Excludes the evaluated candle."),
-            indicator("PriorLow", "PriorLow(n)", "Prior low", "USDT", [P(label: "Reference hours", kind: "number")], ["48"], "Lowest low of the previous completed hours. Excludes the evaluated candle.")
+            indicator("PriorExtreme", "PriorExtreme(n, extreme)", "Prior extreme", "USDT", [P(label: "Reference hours", kind: "number"), P(label: "Extreme", kind: "choice", unit: "extreme", choices: [Choice(value: "high", label: "High"), Choice(value: "low", label: "Low")])], ["48", "\"high\""], "Highest high or lowest low of the previous completed hours. Excludes the evaluated candle.")
         ]
-        for direction in ["Breakout", "Breakdown"] {
-            result.append(indicator("\(direction)Age", "\(direction)Age(n, searchHours)", "\(direction) age", "hours", [P(label: "Reference hours", kind: "number"), P(label: "Search hours", kind: "number")], ["48", "48"], "Hours since the latest strict \(direction.lowercased()) in the search window. No event or insufficient history is Unknown."))
-        }
+        result.append(indicator("ExtremeAge", "ExtremeAge(n, searchHours, direction)", "Extreme event age", "hours", [P(label: "Reference hours", kind: "number"), P(label: "Search hours", kind: "number"), P(label: "Direction", kind: "choice", unit: "direction", choices: [Choice(value: "breakout", label: "High breakout"), Choice(value: "breakdown", label: "Low breakdown")])], ["48", "48", "\"breakout\""], "Hours since the latest strict high breakout or low breakdown in the editable search window. No event or insufficient history is Unknown."))
         func transform(_ name: String, _ label: String, _ unit: String, _ parameters: [P], _ defaults: [String], _ description: String) -> FilterFunctionInfo {
             .init(name: name, signature: "\(name)(x\(parameters.count > 1 ? ", n" : ""))", label: label, group: "Expression functions", unit: unit, description: description, parameters: parameters, defaults: defaults)
         }
@@ -74,6 +69,7 @@ enum FilterCatalog {
             transform("multiple", "Positive baseline multiple", "source unit", [source, P(label: "Multiplier", kind: "number", minimum: Double.leastNonzeroMagnitude, step: "any", unit: "× baseline")], ["mean(lag(Volume, 1), 20)", "2"], "Multiplies a strictly positive baseline by a positive constant. A zero, negative or unavailable baseline is Unknown."),
             transform("lag", "Historical offset", "source unit", [source, P(label: "Offset hours", kind: "number", minimum: 0)], ["Volume", "1"], "Reads the source that many hours before the rule's evaluation hour."),
             transform("change", "Change rate", "%", [source, P(label: "Offset hours", kind: "number")], ["Price", "1"], "Percentage change from the earlier value, divided by its absolute value."),
+            transform("relativeChange", "Relative change", "%", [source, P(label: "Baseline expression", kind: "expression", unit: "source unit")], ["Close", "Open"], "Percentage difference between two editable values: (current − baseline) / |baseline| × 100%."),
             transform("closed", "Previous closed hour", "source unit", [source], ["Price"], "Shifts this value one hour before the rule's anchor. A parent Closed anchor also applies."),
             transform("live", "Current evaluation hour", "source unit", [source], ["Price"], "Reads at the rule's current anchor; it does not cancel a parent's Closed anchor.")
         ]

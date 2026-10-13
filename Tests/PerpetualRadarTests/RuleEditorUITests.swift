@@ -1469,8 +1469,8 @@ final class RuleEditorUITests: BackgroundTestCase {
             try await assertSharedSurfaces(view, opacity: 0.3)
             if appearance == .aqua { try await assertScaledSurfaces(view, window: window) }
             if capturePixels { try await assertFloatingPixels(view, project: project, theme: theme, selector: "[data-rule-library]", name: "library") }
-            try await input(view, "[data-rule-library] [cmdk-input]", "Price")
-            _ = try await js(view, "document.querySelector('[data-library-id=\"metric:price\"]').click(); true")
+            try await input(view, "[data-rule-library] [cmdk-input]", "Candle close")
+            _ = try await js(view, "document.querySelector('[data-library-id=\"metric:Close\"]').click(); true")
             try await wait(view, "document.querySelector('[data-rule-library][data-state=\"open\"]') === null")
             try await validDraft(view)
             try await assertSharedSurfaces(view, opacity: 0.3)
@@ -1907,8 +1907,8 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await wait(view, "(() => { const x = Array.from(document.querySelectorAll('button')).find(x => (x.textContent.trim() === \(formulaQuote(label)) || x.getAttribute('aria-label') === \(formulaQuote(label))) && !x.disabled && x.getBoundingClientRect().height > 0); if (!x) return false; x.dispatchEvent(new MouseEvent('mousedown', {bubbles:true,button:0})); x.click(); return true; })()")
         if label == "Add condition" {
             try await wait(view, "Array.from(document.querySelectorAll('[data-rule-library]')).some(x => x.getBoundingClientRect().height > 0)")
-            try await input(view, "[data-rule-library] [cmdk-input]", "Price")
-            _ = try await js(view, "Array.from(document.querySelectorAll('[data-library-id=\"metric:price\"]')).find(x => x.getBoundingClientRect().height > 0).click(); true")
+            try await input(view, "[data-rule-library] [cmdk-input]", "Candle close")
+            _ = try await js(view, "Array.from(document.querySelectorAll('[data-library-id=\"metric:Close\"]')).find(x => x.getBoundingClientRect().height > 0).click(); true")
             try await wait(view, "!Array.from(document.querySelectorAll('[data-rule-library]')).some(x => x.getBoundingClientRect().height > 0) && Array.from(document.querySelectorAll('[aria-label=\"Choose Left expression\"]')).some(x => x.getBoundingClientRect().height > 0)")
         }
     }
@@ -2161,7 +2161,7 @@ final class RuleEditorUITests: BackgroundTestCase {
             try await wait(view, "document.body.innerText.includes('Universe saved to the strategy.')")
             let saved = try FilterConfigV2.decode(bridge.savedUniverseJSON)
             let moved = saved.root.children.first(where: { $0.id == empty })?.children.first
-            XCTAssertEqual(moved?.id, source, layout); XCTAssertEqual(moved?.left, "price", layout); XCTAssertEqual(moved?.right, "100", layout)
+            XCTAssertEqual(moved?.id, source, layout); XCTAssertEqual(moved?.left, "Close", layout); XCTAssertEqual(moved?.right, "100", layout)
         }
     }
 
@@ -2205,15 +2205,17 @@ final class RuleEditorUITests: BackgroundTestCase {
         _ = try await openMenu(view, selector: "[aria-label=\"Choose Left expression\"]", popover: true)
         let entryValues = try await js(view, "Array.from(document.querySelectorAll('[cmdk-item]')).map(x => x.dataset.value)") as? [String]
         let entries = try XCTUnwrap(entryValues)
-        for metric in FilterCatalog.metrics {
+        let consolidated = Set(["emaSlope", "priceEMA", "emaDistance", "rsi6", "rsi12", "rsi24", "rsi6vs12", "rsi12vs24", "roc", "rocVsMaroc", "rocChange", "maroc", "marocChange", "priceUpper", "priceMiddle", "priceLower", "highUpper", "lowLower", "priceVWAP", "vwapDistance", "high48", "high96", "closeHigh48", "closeHigh96", "low48", "low96", "closeLow48", "closeLow96", "recentHigh48", "recentHigh96", "recentLow48", "recentLow96", "high48Age", "high96Age", "low48Age", "low96Age", "priceChange", "bodyChange", "candleRange", "oiChange", "price", "liveVolume", "candleDirection", "buyVsSell"])
+        for metric in FilterCatalog.metrics where !consolidated.contains(metric.key) {
             XCTAssertTrue(entries.contains { $0.hasSuffix(" " + metric.key) }, metric.key)
         }
-        for name in ["EMA", "RSI", "ROC", "MAROC", "LogBBUpper", "LogBBMiddle", "LogBBLower", "VWAP", "PriorHigh", "PriorLow", "BreakoutAge", "BreakdownAge", "abs", "mean", "sum", "highest", "lowest", "stddev", "lag", "change", "closed", "live"] { XCTAssertTrue(entries.contains { $0.hasSuffix(" " + name) }, name) }
+        for key in consolidated { XCTAssertFalse(entries.contains { $0.hasSuffix(" " + key) }, key) }
+        for name in ["EMA", "RSI", "ROC", "MAROC", "LogBB", "VWAP", "PriorExtreme", "ExtremeAge", "abs", "mean", "sum", "highest", "lowest", "stddev", "lag", "change", "relativeChange", "closed", "live"] { XCTAssertTrue(entries.contains { $0.hasSuffix(" " + name) }, name) }
         XCTAssertEqual(entries.filter { $0.hasPrefix("arithmetic ") }.count, 0)
         _ = try await js(view, "document.querySelector('[data-slot=\"popover-content\"]').dispatchEvent(new KeyboardEvent('keydown', {key:'Escape',bubbles:true})); true")
         try await wait(view, "document.querySelector('[data-slot=\"popover-content\"]') === null")
         // Wick/body band relations expose their complete categorical choices through the native catalogue.
-        for key in ["highUpper", "lowLower", "bodyUpper", "bodyLower"] {
+        for key in ["bodyUpper", "bodyLower"] {
             _ = try await metric(view, key)
             for choice in FilterCatalog.choices(for: key) {
                 _ = try await openMenu(view, selector: "[aria-label=\"Right value\"]")
@@ -2224,7 +2226,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         _ = try await metric(view, "Close"); try await validDraft(view)
         // Exercise each parameter-control shape; FilterLibraryTests validates every scalar default.
         _ = try await openMenu(view, selector: "[aria-label=\"Threshold / reference value type\"]"); try await option(view, "Another value / indicator")
-        for name in ["EMA", "MAROC", "LogBBUpper", "abs", "mean", "lag", "closed"] {
+        for name in ["EMA", "MAROC", "LogBB", "PriorExtreme", "ExtremeAge", "relativeChange", "abs", "mean", "lag", "closed"] {
             try await expression(view, field: "Reference value", choice: name)
             try await validDraft(view)
             let parts = try await js(view, "document.querySelector('[aria-label=\"Toggle Reference value parameters\"]') !== null") as? Bool

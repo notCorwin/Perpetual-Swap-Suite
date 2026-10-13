@@ -240,7 +240,7 @@ actor ResearchReader {
         }
         let end = min(latest ?? event.timestamp, max((oldest ?? event.timestamp) + 95 * hourMS, endingAt ?? event.timestamp + 47 * hourMS))
         let series = ResearchEngine.reconstruct(try store.series(instrument.id, from: max(0, end - 370 * hourMS), through: end, manifest: id))
-        let expressions = ["VWAP(14)", "EMA(200)", "LogBBUpper(20, 2)", "LogBBMiddle(20, 2)", "LogBBLower(20, 2)"]
+        let expressions = ["VWAP(14)", "EMA(200)", "LogBB(20, 2, \"upper\")", "LogBB(20, 2, \"middle\")", "LogBB(20, 2, \"lower\")"]
         let compiled = try FilterCompiler.compile(FilterConfigV2(root: FilterNode(children: expressions.map { FilterNode(kind: "condition", left: $0, comparison: "present") })))
         var bars: [ResearchChartBar] = []
         for h in stride(from: end - 95 * hourMS, through: end, by: Int(hourMS)) {

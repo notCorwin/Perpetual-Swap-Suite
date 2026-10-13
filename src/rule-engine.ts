@@ -114,24 +114,24 @@ export const comparisons = [
 ]
 export const unaryComparison = (op: string): boolean => ["positive", "negative", "zero", "present", "missing"].includes(op)
 export const categoryComparisons = comparisons.filter(([key]) => ["eq", "neq", "present", "missing"].includes(key))
-export const indicatorTemplates = [
-  { expression: "EMA(200)", label: "EMA", unit: "USDT", params: ["Period (h)"] },
-  { expression: "RSI(14)", label: "RSI", unit: "0–100", params: ["Period (h)"] },
-  { expression: "ROC(9)", label: "ROC", unit: "%", params: ["Period (h)"] },
-  { expression: "Efficiency(24)", label: "Direction efficiency", unit: "ratio", params: ["Period (h)"] },
-  { expression: "MAROC(9, 9)", label: "MAROC", unit: "%", params: ["ROC period (h)", "Mean period (h)"] },
-  ...["Upper", "Middle", "Lower"].map(band => ({ expression: `LogBB${band}(20, 2)`, label: `Log BB ${band}`, unit: "USDT", params: ["Period (h)", "Deviations"] })),
-  { expression: "VWAP(14)", label: "VWAP", unit: "USDT", params: ["Period (h)"] },
-  { expression: "PriorHigh(48)", label: "Prior high", unit: "USDT", params: ["Reference hours"] },
-  { expression: "PriorLow(48)", label: "Prior low", unit: "USDT", params: ["Reference hours"] },
-  { expression: "BreakoutAge(48, 48)", label: "Breakout age", unit: "hours", params: ["Reference hours", "Search hours"] },
-  { expression: "BreakdownAge(48, 48)", label: "Breakdown age", unit: "hours", params: ["Reference hours", "Search hours"] },
-]
+export const parameterizedConditionMetrics: Record<string, string[]> = {
+  EMA: ['emaSlope', 'priceEMA', 'emaDistance'],
+  RSI: ['rsi6', 'rsi12', 'rsi24', 'rsi6vs12', 'rsi12vs24'],
+  ROC: ['roc', 'rocVsMaroc', 'rocChange'],
+  MAROC: ['maroc', 'marocChange'],
+  LogBB: ['priceUpper', 'priceMiddle', 'priceLower', 'highUpper', 'lowLower'],
+  VWAP: ['priceVWAP', 'vwapDistance'],
+  PriorExtreme: ['high48', 'high96', 'closeHigh48', 'closeHigh96', 'low48', 'low96', 'closeLow48', 'closeLow96'],
+  ExtremeAge: ['recentHigh48', 'recentHigh96', 'recentLow48', 'recentLow96', 'high48Age', 'high96Age', 'low48Age', 'low96Age'],
+  relativeChange: ['priceChange', 'bodyChange', 'candleRange', 'oiChange'],
+}
+export const composableConditionMetrics = new Set(['price', 'liveVolume', 'candleDirection', 'buyVsSell'])
+export const replacedConditionMetrics = new Set([...Object.values(parameterizedConditionMetrics).flat(), ...composableConditionMetrics])
 export const formulaExamples = [
   { label: "Long or Short alignment", source: '(emaTrend == "rising" AND ROC(9) > 0) OR (emaTrend == "falling" AND ROC(9) < 0)' },
   { label: "Relative volume", source: 'Volume > multiple(mean(lag(Volume, 1), 20), 2)' },
   { label: "Three closed RSI hours", source: 'closed(every(RSI(14) > 50, 3))' },
-  { label: "Break, retest, reclaim", source: 'sequence(6,\n  stage("break", High > PriorHigh(48), 6, capture("level", PriorHigh(48))),\n  stage("retest", Low < break.level, 6),\n  stage("reclaim", crossUp(Close, break.level), 6)\n)' },
+  { label: "Break, retest, reclaim", source: 'sequence(6,\n  stage("break", High > PriorExtreme(48, "high"), 6, capture("level", PriorExtreme(48, "high"))),\n  stage("retest", Low < break.level, 6),\n  stage("reclaim", crossUp(Close, break.level), 6)\n)' },
 ]
 
 export function previewResponseIsCurrent(response: { filterToken: string; revision: number }, token: string, minimumRevision: number): boolean {

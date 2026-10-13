@@ -39,7 +39,7 @@ test("sequence copies use independent stage names, and reset clears every univer
 
 test("wrapping a closed sequence stage keeps its capture at the same hour and unwrapping retains the condition", () => {
   const root = makeRule("all"), sequence = makeRule("sequence"), stage = makeRule()
-  stage.mode = "closed"; stage.name = "break"; stage.gapHours = 4; stage.captures = [{ id: "level", name: "level", expression: "PriorHigh(48)" }]
+  stage.mode = "closed"; stage.name = "break"; stage.gapHours = 4; stage.captures = [{ id: "level", name: "level", expression: 'PriorExtreme(48, "high")' }]
   sequence.children = [stage]; root.children = [sequence]
   const wrapped = wrapRule(root, stage.id, "count"), wrapper = wrapped.children[0].children[0]
   assert.equal(wrapper.mode, "closed")

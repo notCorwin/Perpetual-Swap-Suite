@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { addLibraryRule, anchorOffset, bodyPresentation, captureScope, conditionLibrary, renameValueReferences, ruleSentence, topLevelSelection, visualPresets } from './filter-builder.ts'
+import { addLibraryRule, anchorOffset, bodyPresentation, captureScope, conditionLibrary, parameterizedConditionMetrics, renameValueReferences, ruleSentence, topLevelSelection, visualPresets } from './filter-builder.ts'
 import { arithmeticExpression, rawExpression } from './filter-expression.ts'
 import { emptyFilterConfig, makeRule, unwrapRule, wrapRule, type FilterMetric } from './rule-engine.ts'
 
-const metrics: FilterMetric[] = [{ key: 'oiTrend', label: 'OI Trend', group: 'Open interest', description: 'Compare hourly OI.', unit: 'category', numeric: false, choices: [{ value: 'rising', label: 'Rising' }] }]
+const metrics: FilterMetric[] = [
+  { key: 'oiTrend', label: 'OI Trend', group: 'Open interest', description: 'Compare hourly OI.', unit: 'category', numeric: false, choices: [{ value: 'rising', label: 'Rising' }] },
+  { key: 'customStatus', label: 'Custom status', group: 'Custom', description: 'Unique categorical state.', unit: 'category', numeric: false, choices: [{ value: 'ready', label: 'Ready' }] },
+]
 test('BTC presets expose independent clocks, confirmation, thresholds and disabled cooldowns', () => {
   const library = conditionLibrary(metrics)
   const crash = library.find(item => item.id === 'preset:btc-crash')!
@@ -45,19 +48,45 @@ test('ready-to-use rules encode complete windows, closed anchors and frozen even
   const rsi = preset('preset:rsi'); assert.equal(rsi.mode, 'closed'); assert.equal(rsi.hours, 3)
   const sequence = preset('preset:sequence')
   assert.equal(sequence.hours, 6)
-  assert.equal(sequence.children[0].captures[0].expression, 'PriorHigh(48)')
+  assert.equal(sequence.children[0].captures[0].expression, 'PriorExtreme(48, "high")')
   assert.equal(sequence.children[1].right, 'break.level'); assert.equal(sequence.children[2].kind, 'crossup')
   assert.deepEqual(captureScope(sequence, sequence.children[2].id)?.map(c => c.name), ['break.level'])
 })
 test('library additions honor the selected group and preserve unrelated rules and settings', () => {
   const cfg = emptyFilterConfig(), group = makeRule('any'); cfg.root.children = [group]
-  const item = conditionLibrary(metrics).find(i => i.id === 'metric:oiTrend')!
+  const item = conditionLibrary(metrics).find(i => i.id === 'metric:customStatus')!
   const next = addLibraryRule(cfg, group.id, item)
   assert.equal(next.config.root.children[0].children[0].id, next.selectedId)
-  assert.equal(next.config.root.children[0].children[0].right, '"rising"')
+  assert.equal(next.config.root.children[0].children[0].right, '"ready"')
   assert.equal(cfg.root.children[0].children.length, 0)
   assert.equal(next.config.root.kind, 'all')
   assert.equal(new Set(conditionLibrary(metrics).map(i => i.id)).size, conditionLibrary(metrics).length)
+})
+test('fixed derived conditions collapse into canonical parameterized entries', () => {
+  const namedVariants: FilterMetric[] = [
+    { key: 'rsi6', label: 'RSI6', group: 'RSI', description: 'Fixed RSI.', unit: '0–100', numeric: true, choices: [] },
+    { key: 'rsi12', label: 'RSI12', group: 'RSI', description: 'Fixed RSI.', unit: '0–100', numeric: true, choices: [] },
+    { key: 'rsi24', label: 'RSI24', group: 'RSI', description: 'Fixed RSI.', unit: '0–100', numeric: true, choices: [] },
+    { key: 'roc', label: 'ROC9 (%)', group: 'Momentum', description: 'Fixed ROC.', unit: '%', numeric: true, choices: [] },
+    { key: 'maroc', label: 'MAROC9 (%)', group: 'Momentum', description: 'Fixed MAROC.', unit: '%', numeric: true, choices: [] },
+  ]
+  const named = new Map(namedVariants.map(metric => [metric.key, metric]))
+  const variants = [...new Set(Object.values(parameterizedConditionMetrics).flat())].map(key => named.get(key) ?? ({ key, label: key, group: 'Derived', description: 'Fixed derived condition.', unit: '%', numeric: true, choices: [] } satisfies FilterMetric))
+  const library = conditionLibrary(variants)
+  for (const keys of Object.values(parameterizedConditionMetrics)) {
+    for (const key of keys) assert.equal(library.some(item => item.id === `metric:${key}`), false, key)
+  }
+  const rsi = library.find(item => item.id === 'function:RSI')!
+  assert.equal(rsi.create().left, 'RSI(14)')
+  assert.ok(rsi.keywords.includes('rsi6'))
+  assert.ok(rsi.keywords.includes('RSI24'))
+  assert.equal(library.filter(item => item.id === 'function:RSI').length, 1)
+  assert.equal(library.find(item => item.id === 'function:ROC')!.create().left, 'ROC(9)')
+  assert.equal(library.find(item => item.id === 'function:MAROC')!.create().left, 'MAROC(9, 9)')
+  assert.equal(library.find(item => item.id === 'function:LogBB')!.create().left, 'LogBB(20, 2, "upper")')
+  assert.equal(library.find(item => item.id === 'function:PriorExtreme')!.create().left, 'PriorExtreme(48, "high")')
+  assert.equal(library.find(item => item.id === 'function:ExtremeAge')!.create().left, 'ExtremeAge(48, 48, "breakout")')
+  assert.equal(library.find(item => item.id === 'function:relativeChange')!.create().left, 'relativeChange(Close, Open)')
 })
 test('summaries retain the selected time semantics and bulk operations do not double-apply ancestors', () => {
   const root = makeRule('all'), group = makeRule('every'), child = makeRule()

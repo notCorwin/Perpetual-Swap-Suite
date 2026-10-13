@@ -309,10 +309,19 @@ struct FilterCompiler {
             if ["mean", "sum", "highest", "lowest", "stddev", "lag", "change"].contains(f), args.count == 2, try scalarKind(args[0], scope: scope) {
                 _ = try FilterParser.integer(args[1], zero: f == "lag"); return true
             }
-            if ["ema", "rsi", "roc", "efficiency", "vwap", "priorhigh", "priorlow"].contains(f), args.count == 1 { _ = try FilterParser.integer(args[0]); return true }
-            if ["maroc", "breakoutage", "breakdownage"].contains(f), args.count == 2 { for arg in args { _ = try FilterParser.integer(arg) }; return true }
-            if ["logbbupper", "logbbmiddle", "logbblower"].contains(f), args.count == 2 {
-                _ = try FilterParser.integer(args[0]); guard case .number(let k) = args[1], k > 0 else { throw FilterError("Log BB deviations must be positive.") }; return true
+            if f == "relativechange", args.count == 2, try scalarKind(args[0], scope: scope), try scalarKind(args[1], scope: scope) { return true }
+            if ["ema", "rsi", "roc", "efficiency", "vwap"].contains(f), args.count == 1 { _ = try FilterParser.integer(args[0]); return true }
+            if f == "maroc", args.count == 2 { for arg in args { _ = try FilterParser.integer(arg) }; return true }
+            if f == "priorextreme", args.count == 2 {
+                _ = try FilterParser.integer(args[0]); guard ["high", "low"].contains(try FilterParser.string(args[1])) else { throw FilterError("Choose high or low for the prior extreme.") }; return true
+            }
+            if f == "extremeage", args.count == 3 {
+                _ = try FilterParser.integer(args[0]); _ = try FilterParser.integer(args[1]); guard ["breakout", "breakdown"].contains(try FilterParser.string(args[2])) else { throw FilterError("Choose breakout or breakdown for the extreme event.") }; return true
+            }
+            if f == "logbb", args.count == 3 {
+                _ = try FilterParser.integer(args[0]); guard case .number(let k) = args[1], k > 0 else { throw FilterError("Log BB deviations must be positive.") }
+                guard ["upper", "middle", "lower"].contains(try FilterParser.string(args[2])) else { throw FilterError("Choose upper, middle or lower for the Log BB band.") }
+                return true
             }
             throw FilterError("Unknown function or invalid arguments: \(name).")
         }
@@ -390,9 +399,10 @@ struct FilterCompiler {
             if f == "btc" { return 0 }
             if f == "ema" { return emaWarmupHours(try FilterParser.integer(args[0])) + 1 }
             if f == "rsi" { return max(250, try FilterParser.integer(args[0]) + 1) }
-            if ["roc", "efficiency", "vwap", "priorhigh", "priorlow"].contains(f) || f.hasPrefix("logbb") { return try FilterParser.integer(args[0]) + 1 }
-            if ["maroc", "breakoutage", "breakdownage"].contains(f) { return try FilterParser.integer(args[0]) + FilterParser.integer(args[1]) }
+            if ["roc", "efficiency", "vwap", "priorextreme", "logbb"].contains(f) { return try FilterParser.integer(args[0]) + 1 }
+            if ["maroc", "extremeage"].contains(f) { return try FilterParser.integer(args[0]) + FilterParser.integer(args[1]) }
             if ["mean", "sum", "highest", "lowest", "stddev", "lag", "change"].contains(f) { return try scalarRequirement(args[0], visiting: visiting) + FilterParser.integer(args[1], zero: f == "lag") }
+            if f == "relativechange" { return max(try scalarRequirement(args[0], visiting: visiting), try scalarRequirement(args[1], visiting: visiting)) }
             return try scalarRequirement(args[0], visiting: visiting) + (f == "closed" ? 1 : 0)
         }
     }
@@ -477,9 +487,9 @@ struct FilterCompiler {
             let f = name.lowercased()
             if f == "rsi" { return "0–100" }
             if f == "efficiency" { return "ratio" }
-            if ["roc", "maroc", "change"].contains(f) { return "%" }
-            if ["breakoutage", "breakdownage"].contains(f) { return "hours" }
-            if ["ema", "vwap", "priorhigh", "priorlow"].contains(f) || f.hasPrefix("logbb") { return "USDT" }
+            if ["roc", "maroc", "change", "relativechange"].contains(f) { return "%" }
+            if f == "extremeage" { return "hours" }
+            if ["ema", "vwap", "priorextreme", "logbb"].contains(f) { return "USDT" }
             return args.first.map(unit) ?? "constant"
         }
     }

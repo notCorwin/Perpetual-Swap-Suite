@@ -309,6 +309,7 @@ final class FilterEvaluator {
                 let value = base * factor
                 return value.isFinite ? .number(value) : .unknown("The baseline multiple is outside the supported numeric range.")
             }
+            if f == "relativechange" { return change(eval(args[0]), eval(args[1])) }
             if f == "lag" { return eval(args[0], hour - Int64(try! FilterParser.integer(args[1], zero: true)) * hourMS) }
             if f == "change" { return change(eval(args[0]), eval(args[0], hour - Int64(try! FilterParser.integer(args[1])) * hourMS)) }
             if ["mean", "sum", "highest", "lowest", "stddev"].contains(f) {
@@ -318,6 +319,19 @@ final class FilterEvaluator {
                 for number in numbers { let term = number / Double(n) - correction, next = mean + term; correction = (next - mean) - term; mean = next }
                 let result = f == "mean" ? mean : f == "sum" ? numbers.reduce(0, +) : f == "highest" ? numbers.max()! : f == "lowest" ? numbers.min()! : sqrt(numbers.reduce(0) { $0 + pow($1 - mean, 2) } / Double(n))
                 return result.isNaN ? .unknown("Aggregate result is undefined.") : .number(result)
+            }
+            if f == "logbb" {
+                let band = (try? FilterParser.string(args[2])) ?? "upper"
+                guard case .number(let deviations) = args[1] else { return .unknown("Log BB deviations are invalid.") }
+                return indicator("logbb\(band)", [Double(try! FilterParser.integer(args[0])), deviations], at: hour)
+            }
+            if f == "priorextreme" {
+                let extreme = (try? FilterParser.string(args[1])) ?? "high"
+                return indicator("prior\(extreme)", [Double(try! FilterParser.integer(args[0]))], at: hour)
+            }
+            if f == "extremeage" {
+                let direction = (try? FilterParser.string(args[2])) ?? "breakout"
+                return indicator("\(direction)age", [Double(try! FilterParser.integer(args[0])), Double(try! FilterParser.integer(args[1]))], at: hour)
             }
             return indicator(f, args.map { if case .number(let n) = $0 { return n }; return 0 }, at: hour)
         }
@@ -357,6 +371,7 @@ final class FilterEvaluator {
             if f == "closed" { return readingHours(args[0], at: hour-hourMS) }
             if f == "lag" { return readingHours(args[0], at: hour-Int64(try! FilterParser.integer(args[1], zero: true))*hourMS) }
             if ["live", "abs", "multiple"].contains(f) { return readingHours(args[0], at: hour) }
+            if f == "relativechange" { return readingHours(args[0], at: hour) + readingHours(args[1], at: hour) }
             if ["mean", "sum", "highest", "lowest", "stddev", "change"].contains(f) {
                 // The selected endpoints describe the source interval without
                 // allocating one provenance record per potentially huge slot.

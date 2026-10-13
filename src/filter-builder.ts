@@ -1,12 +1,15 @@
 import { expressionName, expressionSource, expressionTemplates, templateExpression, type ExpressionTemplate } from './filter-expression.ts'
-import { canReceiveChildren, comparisons, findParent, findRule, makeRule, newRuleID, ruleKinds, updateRule, type EditorExpression, type FilterConfigV2, type FilterMetric, type NamedFormula, type RuleKind, type RuleNode } from './rule-engine.ts'
+import { canReceiveChildren, comparisons, findParent, findRule, makeRule, newRuleID, parameterizedConditionMetrics, replacedConditionMetrics, ruleKinds, updateRule, type EditorExpression, type FilterConfigV2, type FilterMetric, type NamedFormula, type RuleKind, type RuleNode } from './rule-engine.ts'
+export { parameterizedConditionMetrics } from './rule-engine.ts'
 
 export type LibraryItem = { id: string; label: string; group: string; description: string; keywords: string[]; unit?: string; metric?: FilterMetric; template?: ExpressionTemplate; create: () => RuleNode }
 const condition = (left: string, comparison: string, right: string): RuleNode => ({ ...makeRule(), left, comparison, right })
 const branch = (kind: RuleKind, children: RuleNode[], hours = 3): RuleNode => ({ ...makeRule(kind), children, hours })
+// The condition editor exposes canonical parameterized/composable values
+// instead of repeating fixed-period native snapshot fields.
 export function makeVisualBranch(kind: RuleKind): RuleNode {
   if (kind === 'sequence') {
-    const first = { ...condition('High', 'gt', 'PriorHigh(48)'), name: 'break', captures: [{ id: newRuleID(), name: 'level', expression: 'PriorHigh(48)' }] }
+    const first = { ...condition('High', 'gt', 'PriorExtreme(48, "high")'), name: 'break', captures: [{ id: newRuleID(), name: 'level', expression: 'PriorExtreme(48, "high")' }] }
     return branch('sequence', [first, { ...condition('Low', 'lt', 'break.level'), name: 'retest' }, { ...condition('Close', 'gt', 'break.level'), kind: 'crossup', name: 'reclaim' }], 6)
   }
   if (['all', 'any'].includes(kind)) return branch(kind, [])
@@ -28,11 +31,15 @@ export const visualPresets = [
   { id: 'preset:alignment', label: 'Long or short alignment', description: 'Rising EMA and positive ROC, or falling EMA and negative ROC, in separate groups.', keywords: ['and or long short trend momentum', '多空 分组'], create: () => branch('any', [branch('all', [condition('emaTrend', 'eq', '"rising"'), condition('ROC(9)', 'gt', '0')]), branch('all', [condition('emaTrend', 'eq', '"falling"'), condition('ROC(9)', 'lt', '0')])]) },
 ]
 export function conditionLibrary(metrics: FilterMetric[], templates: ExpressionTemplate[] = expressionTemplates): LibraryItem[] {
+  const aliases = (template: ExpressionTemplate) => parameterizedConditionMetrics[template.name]?.flatMap(key => {
+    const metric = metrics.find(item => item.key === key)
+    return metric ? [metric.key, metric.label, ...(metric.aliases ?? [])] : [key]
+  }) ?? []
   return [
     ...visualPresets.map(p => ({ ...p, group: p.id.startsWith('preset:btc-') ? 'BTC Market Context' : 'Ready to use' })),
-    ...metrics.map(metric => ({ id: `metric:${metric.key}`, label: metric.label, group: metric.group, description: metric.description, keywords: [metric.key, ...(metric.aliases ?? [])], unit: metric.unit, metric,
+    ...metrics.filter(metric => !replacedConditionMetrics.has(metric.key)).map(metric => ({ id: `metric:${metric.key}`, label: metric.label, group: metric.group, description: metric.description, keywords: [metric.key, ...(metric.aliases ?? [])], unit: metric.unit, metric,
       create: () => condition(metric.key, metric.numeric ? 'gt' : 'eq', metric.numeric ? metric.unit === '0–100' ? '50' : '0' : JSON.stringify(metric.choices[0]?.value ?? '')) })),
-    ...templates.map(template => ({ id: `function:${template.name}`, label: template.label, group: template.group === 'Expression functions' ? 'Value blocks' : template.group, description: template.description, keywords: [template.name], unit: template.unit, template,
+    ...templates.map(template => ({ id: `function:${template.name}`, label: template.label, group: template.group === 'Expression functions' ? 'Value blocks' : template.group, description: template.description, keywords: [template.name, ...aliases(template)], unit: template.unit, template,
       create: () => condition(templateExpression(template).source, 'gt', template.unit === '0–100' ? '50' : '0') })),
     ...ruleKinds.filter(k => k.value !== 'condition').map(k => ({ id: `rule:${k.value}`, label: k.label, group: 'Logic & time', description: ruleHelp(k.value), keywords: [k.value], create: () => makeVisualBranch(k.value) })),
     ...comparisons.map(([key, label]) => ({ id: `comparison:${key}`, label, group: 'Comparisons & availability', description: ['present', 'missing'].includes(key) ? 'Explicitly checks whether data exists. This can select markets with missing data.' : 'Compare any numeric indicator, constant or reusable value. Both sides are editable.', keywords: [key], create: () => condition('Price', key, '0') })),

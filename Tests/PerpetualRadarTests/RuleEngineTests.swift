@@ -77,6 +77,7 @@ final class RuleEngineTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(scalar("stddev(Close, 3)").number), sqrt(2.0 / 3), accuracy: 1e-10)
         XCTAssertEqual(try scalar("lag(Close, 2)").number, 99)
         XCTAssertEqual(try scalar("change(Close, 1)").number, 1)
+        XCTAssertEqual(try scalar("relativeChange(Close, lag(Close, 1))").number, 1)
         XCTAssertEqual(try scalar("abs(-2) + 3 * 4 / 2").number, 8)
         XCTAssertEqual(try evaluate("NOT (Close / 0 > 1)").result, .unknown)
         let compiled = try FilterCompiler.compile(source: "let ratio = Volume / mean(Volume, 20); ratio > 2 AND change(Close, 1) > 1")
@@ -154,7 +155,7 @@ final class RuleEngineTests: XCTestCase {
         context.candles[hour - 2 * hourMS] = Candle(hour: hour - 2 * hourMS, high: 107, low: 100, close: 102, quoteVolume: 100, baseVolume: 1, open: 106)
         context.candles[hour - hourMS] = Candle(hour: hour - hourMS, high: 103, low: 99, close: 101, quoteVolume: 100, baseVolume: 1, open: 102)
         context.candles[hour] = Candle(hour: hour, high: 107, low: 101, close: 106, quoteVolume: 100, baseVolume: 1, open: 101, confirmed: false)
-        let source = #"sequence(6, stage("break", High > PriorHigh(48), 6, capture("level", PriorHigh(48))), stage("retest", Low <= break.level, 3), stage("reclaim", crossUp(Close, break.level), 3))"#
+        let source = #"sequence(6, stage("break", High > PriorExtreme(48, "high"), 6, capture("level", PriorExtreme(48, "high"))), stage("retest", Low <= break.level, 3), stage("reclaim", crossUp(Close, break.level), 3))"#
         let trace = eventTrace(try evaluate(source, context, explain: true))
         XCTAssertEqual(trace.result, .yes)
         XCTAssertEqual(trace.eventHours.last, hour)
@@ -200,7 +201,7 @@ final class RuleEngineTests: XCTestCase {
     }
 
     func testFormulaRoundTripPreservesNamesIdentityParametersAndCapturedScopes() throws {
-        let source = #"let ratio = Volume / mean(lag(Volume, 1), 20); named("My rules", all(named("Volume gate", ratio > 2), closed(every(RSI(14) > 50, 3)), sequence(6, stage("break", High > PriorHigh(48), 6, capture("level", PriorHigh(48))), stage("reclaim", crossUp(Close, break.level), 6))))"#
+        let source = #"let ratio = Volume / mean(lag(Volume, 1), 20); named("My rules", all(named("Volume gate", ratio > 2), closed(every(RSI(14) > 50, 3)), sequence(6, stage("break", High > PriorExtreme(48, "high"), 6, capture("level", PriorExtreme(48, "high"))), stage("reclaim", crossUp(Close, break.level), 6))))"#
         let original = try FilterCompiler.compile(source: source)
         XCTAssertEqual(original.units["break.level"], "USDT")
         let roundTrip = try FilterCompiler.compile(source: original.formula, previous: original.config)
@@ -218,7 +219,7 @@ final class RuleEngineTests: XCTestCase {
     }
 
     func testCompilerRejectsInvalidTypesCyclesScopesAndWindows() throws {
-        for source in ["", "Close >", "RSI(0) > 1", "RSI(1.5) > 1", "Close > Symbol", "Symbol + 1 > 0", "let a = b; let b = a; a > 0", "every(Close > 0, 0)", "mean(Close, 0) > 0", "unknown > 0", "LogBBUpper(20, 0) > 1", #"sequence(6, stage("a", Close > b.level, 6), stage("b", Close > 0, 6, capture("level", Close)))"#] {
+        for source in ["", "Close >", "RSI(0) > 1", "RSI(1.5) > 1", "Close > Symbol", "Symbol + 1 > 0", "let a = b; let b = a; a > 0", "every(Close > 0, 0)", "mean(Close, 0) > 0", "unknown > 0", "LogBB(20, 0, \"upper\") > 1", #"sequence(6, stage("a", Close > b.level, 6), stage("b", Close > 0, 6, capture("level", Close)))"#] {
             XCTAssertThrowsError(try FilterCompiler.compile(source: source), source)
         }
     }

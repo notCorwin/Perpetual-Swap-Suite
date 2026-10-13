@@ -10,7 +10,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { cn } from "@/lib/utils"
 import { arithmeticExpression, arithmeticOperations, expressionName, expressionSource, expressionTemplates, numberExpression, rawExpression, templateExpression, withExpressionArguments, type ExpressionTemplate } from "@/filter-expression"
 import { expressionLabel, humanName } from "@/filter-builder"
-import type { EditorExpression, FilterMetric, NamedFormula } from "@/rule-engine"
+import { replacedConditionMetrics, type EditorExpression, type FilterMetric, type NamedFormula } from "@/rule-engine"
 
 export type ExpressionInputProps = {
   label: string; displayLabel?: string; value: string; onChange: (value: string, expression?: EditorExpression) => void; onSelectExpression?: (value: string, expression?: EditorExpression) => void
@@ -50,6 +50,7 @@ export function ExpressionInput({ label, displayLabel = label, value, onChange, 
   const insert = (next: EditorExpression) => { changeTree(next, true); selectedExpression.current = true; setOpen(false); trigger.current?.focus() }
   const shared = { metrics, definitions, units, expressions, templates, onExpressionDraft, allowArithmetic, allowTransforms }
   const wrappers = templates.filter(item => item.parameters[0]?.kind === "expression" && (!["category", "text"].includes(resolvedUnit) || ["closed", "live", "BTC"].includes(item.name)))
+  const visibleMetrics = metrics.filter(metric => !replacedConditionMetrics.has(metric.key))
   const hasParts = ["binary", "unary"].includes(tree.kind) || tree.kind === "call" && template
   return <FieldGroup className="gap-2" data-expression-field={label} data-expression-source={value}>
     <Field>
@@ -63,7 +64,7 @@ export function ExpressionInput({ label, displayLabel = label, value, onChange, 
             <CommandList><CommandEmpty>No matching expressions.</CommandEmpty>
               <CommandGroup heading="Constants"><CommandItem value="Numeric value constant" onSelect={() => insert(numberExpression("0"))}>Numeric value</CommandItem><CommandItem value="Text value constant" onSelect={() => insert({ ...rawExpression('""', "text"), kind: "text", value: "" })}>Text value</CommandItem></CommandGroup>
               {choices.length > 0 && <CommandGroup heading="Values">{choices.map(choice => <CommandItem key={choice.value} value={`value ${choice.label}`} onSelect={() => insert({ ...rawExpression(JSON.stringify(choice.value), "category"), kind: "text", value: choice.value })}>{choice.label}</CommandItem>)}</CommandGroup>}
-              {[...new Set(metrics.map(metric => metric.group))].map(group => <CommandGroup key={group} heading={group}>{metrics.filter(metric => metric.group === group).map(metric => <CommandItem key={metric.key} data-metric-key={metric.key} value={`${metric.label} ${metric.key}`} keywords={[`${metric.group} ${metric.label}`, metric.description, ...(metric.aliases ?? [])]} onSelect={() => insert({ ...rawExpression(metric.key, metric.unit), kind: "name", value: metric.key, choices: metric.choices })}>{metric.label}<span className="ml-auto text-muted-foreground">{metric.unit}</span></CommandItem>)}</CommandGroup>)}
+              {[...new Set(visibleMetrics.map(metric => metric.group))].map(group => <CommandGroup key={group} heading={group}>{visibleMetrics.filter(metric => metric.group === group).map(metric => <CommandItem key={metric.key} data-metric-key={metric.key} value={`${metric.label} ${metric.key}`} keywords={[`${metric.group} ${metric.label}`, metric.description, ...(metric.aliases ?? [])]} onSelect={() => insert({ ...rawExpression(metric.key, metric.unit), kind: "name", value: metric.key, choices: metric.choices })}>{metric.label}<span className="ml-auto text-muted-foreground">{metric.unit}</span></CommandItem>)}</CommandGroup>)}
               {definitions.length > 0 && <CommandGroup heading="Reusable values / captured prices">{definitions.map(item => <CommandItem key={item.id} value={item.name} onSelect={() => insert(expressions[item.name] ?? { ...rawExpression(item.name, units[item.name]), kind: "name", value: item.name })}>{humanName(item.name)}<span className="ml-auto text-muted-foreground">{units[item.name] ?? "value"}</span></CommandItem>)}</CommandGroup>}
               {[...new Set(templates.filter(item => item.name.toLowerCase() !== "multiple").map(item => item.group))].map(group => <CommandGroup key={group} heading={group === "Expression functions" ? "Value blocks" : group}>{templates.filter(item => item.group === group && item.name.toLowerCase() !== "multiple").map(item => <CommandItem key={item.name} data-function-name={item.name} value={`${item.label} ${item.name}`} keywords={[item.description]} onSelect={() => insert(templateExpression(item))}>{item.label}<span className="ml-auto text-muted-foreground">{item.unit}</span></CommandItem>)}</CommandGroup>)}
               {allowArithmetic && <CommandGroup heading="Calculation blocks">{arithmeticOperations.map(([operation, title]) => <CommandItem key={operation} value={`arithmetic ${title}`} onSelect={() => insert(arithmeticExpression(operation))}>{title}</CommandItem>)}</CommandGroup>}
