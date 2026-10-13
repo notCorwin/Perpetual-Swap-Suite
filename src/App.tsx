@@ -10,6 +10,7 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Spinner } from "@/components/ui/spinner"
 import { Slider } from '@/components/ui/slider'
+import { RockerSwitch } from '@/components/ui/rocker-switch'
 import { RadarSignalBoard } from "@/RadarSignalBoard"
 import { radarSignals, signalMatches, type SignalTiming } from "@/radar-signals"
 import { ModeTitle } from "@/ModeTitle"
@@ -505,8 +506,8 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
               <Field><FieldLabel>AI analysis</FieldLabel><AnalysisSettingsButton /><FieldDescription>Configure the Gateway API Key and chart analysis model.</FieldDescription></Field>
               <Field>
                 <FieldLabel>Move label defaults</FieldLabel>
-                <ToggleGroup type="single" variant="outline" spacing={0} value={chartMoveSettings.chartMovePriceSource} onValueChange={value => { if (value) saveSetting({ chartMovePriceSource: value as PriceMoveMode }) }} aria-label="Default move price source"><ToggleGroupItem value="close">Close</ToggleGroupItem><ToggleGroupItem value="highLow">High / Low</ToggleGroupItem></ToggleGroup>
-                <ToggleGroup type="single" variant="outline" spacing={0} value={chartMoveSettings.chartMoveObjective} onValueChange={value => { if (value) saveSetting({ chartMoveObjective: value as PriceMoveObjective }) }} aria-label="Default move optimization objective"><ToggleGroupItem value="amplitude">Max Move</ToggleGroupItem><ToggleGroupItem value="efficiency">Max Efficiency</ToggleGroupItem></ToggleGroup>
+                <RockerSwitch leftLabel="Close" rightLabel="High / Low" checked={chartMoveSettings.chartMovePriceSource === 'highLow'} onCheckedChange={checked => saveSetting({ chartMovePriceSource: checked ? 'highLow' : 'close' })} aria-label="Default move price source" />
+                <RockerSwitch leftLabel="Max Move" rightLabel="Max Efficiency" checked={chartMoveSettings.chartMoveObjective === 'efficiency'} onCheckedChange={checked => saveSetting({ chartMoveObjective: checked ? 'efficiency' : 'amplitude' })} aria-label="Default move optimization objective" />
                 <Field><FieldLabel id="default-efficiency-factor">Efficiency factor <span className="tabular-nums text-muted-foreground">{chartMoveSettings.chartMoveEfficiencyFactor.toFixed(1)}</span></FieldLabel><Slider min={0} max={2} step={0.1} value={[chartMoveSettings.chartMoveEfficiencyFactor]} aria-labelledby="default-efficiency-factor" onValueChange={([value]) => setChartMoveSettings(current => ({ ...current, chartMoveEfficiencyFactor: value }))} onValueCommit={([value]) => saveSetting({ chartMoveEfficiencyFactor: value })} /></Field>
                 <Field orientation="horizontal"><FieldLabel htmlFor="default-move-label-layer">Show labels by default</FieldLabel><Toggle id="default-move-label-layer" variant="outline" pressed={chartMoveSettings.chartMoveLabelsVisible} onPressedChange={value => saveSetting({ chartMoveLabelsVisible: value })}>{chartMoveSettings.chartMoveLabelsVisible ? 'On' : 'Off'}</Toggle></Field>
                 <FieldDescription>Efficiency = |change| / periods^factor. 0 ignores time; 1 is change per K-line; values above 1 favor shorter moves more strongly. New charts use these defaults.</FieldDescription>
