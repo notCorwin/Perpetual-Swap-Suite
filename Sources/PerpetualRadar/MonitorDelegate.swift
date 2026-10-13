@@ -343,7 +343,12 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if let action = parameters["updateAction"] as? String {
             switch action {
-            case "check": checkForUpdatesNow()
+            case "check": return decorated(try await checkForUpdatesForClient())
+            case "install":
+                guard let update, updateState == "available", !researchBusy else {
+                    throw FilterError(researchBusy ? "Pause research before installing the update." : "No update is ready to install.")
+                }
+                installUpdate(update, automatically: false)
             case "toggleAutomatic": toggleAutomaticUpdates()
             default: throw FilterError("Invalid update action.")
             }
@@ -490,8 +495,8 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         checkUpdatesItem.isEnabled = !isCheckingUpdate && !isInstallingUpdate
     }
 
-    private func checkForUpdates(silently: Bool) {
-        guard !isCheckingUpdate, !isInstallingUpdate, !isPresentingUpdate else { return }
+    private func checkForUpdates(silently: Bool, presentResult: Bool = true, completion: ((Result<AppUpdate?, AppUpdateError>) -> Void)? = nil) {
+        guard !isCheckingUpdate, !isInstallingUpdate, !isPresentingUpdate else { completion?(.failure(.busy)); return }
         isCheckingUpdate = true
         updateState = "checking"
         renderUpdateItem()
@@ -512,18 +517,38 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     if AppDelegate.automaticUpdatesEnabled(in: MonitorRuntime.defaults),
                        automaticInstallRetryAfter.map({ $0 <= now() }) ?? true {
                         installUpdate(found, automatically: true)
-                    } else if !silently {
+                    } else if !silently, presentResult {
                         presentUpdate(found)
                     }
-                } else if !silently {
+                } else if !silently, presentResult {
                     showUpdateAlert("Up to Date", "You have the latest version of Perpetual Swap Suite.")
                 }
             case .failure(let error):
                 updateState = update == nil ? "failed" : "available"
-                if !silently { showUpdateAlert("Update Check Failed", error.localizedDescription) }
+                if !silently, presentResult { showUpdateAlert("Update Check Failed", error.localizedDescription) }
             }
             renderUpdateItem()
+            completion?(result)
         }
+    }
+
+    private func checkForUpdatesForClient() async throws -> [String: Any] {
+        if updateState == "available", let update { return updateCheckResponse(update) }
+        let found = try await withCheckedThrowingContinuation { continuation in
+            checkForUpdates(silently: false, presentResult: false) { result in
+                switch result {
+                case .success(let update): continuation.resume(returning: update)
+                case .failure(let error): continuation.resume(throwing: error)
+                }
+            }
+        }
+        guard let found else { return ["updateCheckStatus": "latest"] }
+        return updateCheckResponse(found)
+    }
+
+    private func updateCheckResponse(_ update: AppUpdate) -> [String: Any] {
+        ["updateCheckStatus": isInstallingUpdate ? "installing" : "available",
+         "updateName": update.name, "updateRevision": update.revision]
     }
 
     private func presentUpdate(_ update: AppUpdate) {
