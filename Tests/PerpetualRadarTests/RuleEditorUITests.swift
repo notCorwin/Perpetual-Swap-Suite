@@ -324,7 +324,7 @@ final class RuleEditorUITests: BackgroundTestCase {
 
     @MainActor
     private func showAllMarkets(_ view: WKWebView, count: Int = 500) async throws {
-        try await wait(view, "document.querySelector('section[aria-label=\"Perpetual swap markets\"]') !== null && Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === \(count)")
+        try await wait(view, "document.querySelector('section[aria-label=\"Perpetual swap markets\"]') !== null && Number(document.querySelector('table[data-market-count]')?.dataset.totalMarketCount) === \(count) && Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) > 0")
         let formulasUseHTML = try await js(view, """
         (() => {
           const formulas = Array.from(document.querySelectorAll('[data-header-formula="html"]'));
@@ -2510,6 +2510,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         view.load(URLRequest(url: URL(string: "radar://app/index.html")!))
         try await showAllMarkets(view)
         try await wait(view, "Number(document.querySelector('[data-strategy-match-count]')?.dataset.strategyMatchCount) === 375")
+        try await wait(view, "Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === 375")
         try await click(view, "Universe rules")
         try await setBasicRule(view, metric: "Close", comparison: "Greater than >", threshold: "0")
         try await wait(view, "Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === 500")
