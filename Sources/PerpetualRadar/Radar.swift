@@ -129,6 +129,7 @@ final class Radar {
         let closedKey: ClosedEvaluationKey
         let sourceRevision: Int
         let provisional: [SuiteReading], confirmed: [SuiteReading]
+        let provisionalSnapshot: Any, confirmedSnapshot: Any
         let historyProgress: FilterHistoryProgress
         let createdAt: ContinuousClock.Instant
     }
@@ -311,9 +312,8 @@ final class Radar {
             var hasCurrentMaterialization = false
             if let cached = materializedSuite, cached.profileID == profile.id, cached.profileRevision == profile.revision,
                cached.closedKey.hour == hour, cached.closedKey.paused == (monitoringPaused || !running) {
-                func object<T: Encodable>(_ value: T) throws -> Any { try JSONSerialization.jsonObject(with: Data(researchJSON(value).utf8)) }
-                response["provisional"] = try object(cached.provisional)
-                response["confirmed"] = try object(cached.confirmed)
+                response["provisional"] = cached.provisionalSnapshot
+                response["confirmed"] = cached.confirmedSnapshot
                 response["revision"] = cached.sourceRevision
                 response["historyProgress"] = cached.historyProgress.snapshot
                 hasCurrentMaterialization = true
@@ -379,9 +379,12 @@ final class Radar {
                       try store.selectedSuiteProfile("radar")?.id == profile.id,
                       try store.selectedSuiteProfile("radar")?.revision == profile.revision else { return }
                 let progress = await monitorHistoryLoader.progress()
+                func object<T: Encodable>(_ value: T) throws -> Any { try JSONSerialization.jsonObject(with: Data(researchJSON(value).utf8)) }
                 materializedSuite = .init(profileID: profile.id, profileRevision: profile.revision,
                     closedKey: key, sourceRevision: captured.response["revision"] as? Int ?? revision,
-                    provisional: provisional, confirmed: confirmed, historyProgress: progress, createdAt: .now)
+                    provisional: provisional, confirmed: confirmed,
+                    provisionalSnapshot: try object(provisional), confirmedSnapshot: try object(confirmed),
+                    historyProgress: progress, createdAt: .now)
             } catch {
                 if !Task.isCancelled { NSLog("Strategy materialization: %@", error.localizedDescription) }
             }
