@@ -14,7 +14,7 @@ import { type AnalysisDirection } from '@/chart-analysis'
 import { chartCaptureBounds } from '@/chart-capture'
 import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicY } from "@/chart-axis"
 import { chartCandleWidth, chartHourX, chartLayout, fitAxisPriceTag, type ChartPanel as Panel } from "@/chart-layout"
-import { chartHistoryNeedsLoad, livePriceTag, scrollChartEnd, visibleChartBars } from "@/chart-viewport"
+import { chartHistoryNeedsLoad, chartStatsNeedLoad, livePriceTag, scrollChartEnd, visibleChartBars } from "@/chart-viewport"
 import { cn, pageVisible } from "@/lib/utils"
 import { chartNavigationTarget, wrappedMarket } from "@/market-sort"
 import { finitePercentage, formatPercent, type PercentageValue } from "@/market-percent"
@@ -519,10 +519,11 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
   useEffect(() => {
     if (historicalEnd === null) return
     const needsCandles = chartHistoryNeedsLoad(historicalEnd, oldestCachedHour)
+    const needsStats = chartStatsNeedLoad(cachedBars, historicalEnd)
     const key = `${instId}:${historicalEnd}`
-    // A buffered response can satisfy many adjacent viewport positions. Native
-    // work is needed only near the left edge, not once per exact end hour.
-    if (!needsCandles || requestedHistoryEnds.current.has(key)) return
+    // A buffered response can satisfy many adjacent viewport positions. A
+    // failed or partial attempt stays stopped until the user explicitly retries.
+    if ((!needsCandles && !needsStats) || requestedHistoryEnds.current.has(key)) return
     let stopped = false
     setHistoryLoading(key)
     void (async () => {
@@ -572,7 +573,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
       }
     })()
     return () => { stopped = true }
-  }, [instId, historicalEnd, oldestCachedHour, historyRetry, endInspection])
+  }, [instId, historicalEnd, oldestCachedHour, cachedBars, historyRetry, endInspection])
   useEffect(() => {
     wheelPixels.current = 0
     if (wheelFrame.current !== null) window.cancelAnimationFrame(wheelFrame.current)

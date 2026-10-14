@@ -12,6 +12,7 @@ private let monitoringPausedKey = "monitoringPaused"
 private let chartMoveLabelsVisibleKey = "chartMoveLabelsVisible"
 private let chartMoveEfficiencyFactorKey = "chartMoveEfficiencyFactor"
 let historicalChartBufferHours = 500
+let historicalChartStatBufferHours = chartHours * 2
 func historicalChartBufferStart(_ end: Int64) -> Int64 { max(0, end - Int64(historicalChartBufferHours - 1) * hourMS) }
 
 private func numeric(_ value: Any?) -> Double? {
@@ -1096,12 +1097,13 @@ final class Radar {
         let oldest = (try? store.oldestCandleHour(id)) ?? nil
         let end = boundedHistoryEnd(requestedEnd, oldest: oldest, exhausted: exhaustedCandleHistory.contains(id), latest: hour)
         let first = historicalChartBufferStart(end)
+        let statFirst = max(first, end - Int64(historicalChartStatBufferHours - 1) * hourMS)
         loadedStatPages = loadedStatPages.filter { $0.value.duration(to: .now) < .seconds(900) }
         if loadedStatPages.count > 4_096 {
             for key in Array(loadedStatPages.keys.prefix(loadedStatPages.count - 4_096)) { loadedStatPages.removeValue(forKey: key) }
         }
         for path in ["/rubik/stat/contracts/open-interest-history", "/rubik/stat/taker-volume-contract"] {
-            for pageStart in stride(from: first / (Int64(chartHours) * hourMS) * Int64(chartHours) * hourMS,
+            for pageStart in stride(from: statFirst / (Int64(chartHours) * hourMS) * Int64(chartHours) * hourMS,
                                     through: end, by: Int(chartHours) * Int(hourMS)) {
                 let key = "\(id)|\(path)|\(pageStart)"
                 if loadedStatPages[key].map({ $0.duration(to: .now) < .seconds(900) }) == true { continue }
