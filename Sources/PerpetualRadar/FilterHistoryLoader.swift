@@ -43,6 +43,7 @@ actor FilterHistoryLoader {
     private var quoteCache: [String: [Int64: FilterQuote]] = [:]
     private var ranges: [String: (first: Int64, last: Int64)] = [:]
     private var statRanges: [String: (first: Int64, last: Int64)] = [:]
+    private var coverageChecks: [String: (demand: String, candlesMissing: Bool, statsMissing: Bool)] = [:]
     private var queue: [String] = []
     private var jobs: [String: (market: FilterMarketData, hours: Int, stats: Bool)] = [:]
     private var running: Task<Void, Never>?
@@ -104,7 +105,7 @@ actor FilterHistoryLoader {
         }
         researchRanges[id] = (min(from, previous?.first ?? from), max(through, previous?.last ?? through), version)
         candleCache.removeValue(forKey: id); statCache.removeValue(forKey: id); quoteCache.removeValue(forKey: id)
-        ranges.removeValue(forKey: id); statRanges.removeValue(forKey: id)
+        ranges.removeValue(forKey: id); statRanges.removeValue(forKey: id); coverageChecks.removeValue(forKey: id)
         updatedMarkets.insert(id)
         return values.count
     }
@@ -112,7 +113,7 @@ actor FilterHistoryLoader {
         let db = try database()
         let version = try db.dataVersion()
         if let previous = observedDataVersion, previous != version {
-            candleCache.removeAll(); statCache.removeAll(); quoteCache.removeAll(); ranges.removeAll(); statRanges.removeAll()
+            candleCache.removeAll(); statCache.removeAll(); quoteCache.removeAll(); ranges.removeAll(); statRanges.removeAll(); coverageChecks.removeAll()
         }
         observedDataVersion = version
         return try markets.map { original in
@@ -165,8 +166,17 @@ actor FilterHistoryLoader {
             let first = max(0, market.hour - Int64(filter.requiredHours) * hourMS)
             let listing = market.listedAt.map { $0 / hourMS * hourMS } ?? first
             let availableFirst = max(first, listing, floor(market.id) ?? first)
-            let missingCandles = stride(from: market.hour - hourMS, through: availableFirst, by: -Int(hourMS)).contains { !Self.complete(market.candles[$0]) }
-            let missingStats = filter.needsStats && stride(from: market.hour - hourMS, through: max(first, listing), by: -Int(hourMS)).contains { market.stats[$0]?.oi == nil || market.stats[$0]?.oiUSD == nil || market.stats[$0]?.buy == nil || market.stats[$0]?.sell == nil }
+            let coverage: (demand: String, candlesMissing: Bool, statsMissing: Bool)
+            if let cached = coverageChecks[market.id], cached.demand == demand {
+                coverage = cached
+            } else {
+                coverage = (demand,
+                    stride(from: market.hour - hourMS, through: availableFirst, by: -Int(hourMS)).contains { !Self.complete(market.candles[$0]) },
+                    filter.needsStats && stride(from: market.hour - hourMS, through: max(first, listing), by: -Int(hourMS)).contains { market.stats[$0]?.oi == nil || market.stats[$0]?.oiUSD == nil || market.stats[$0]?.buy == nil || market.stats[$0]?.sell == nil })
+                coverageChecks[market.id] = coverage
+            }
+            let missingCandles = coverage.candlesMissing
+            let missingStats = coverage.statsMissing
             if !missingCandles && !missingStats { continue }
             if jobs[key] == nil { queue.append(key) }
             jobs[key] = (market, max(filter.requiredHours, jobs[key]?.hours ?? 0), filter.needsStats || jobs[key]?.stats == true)
@@ -274,6 +284,7 @@ actor FilterHistoryLoader {
         quoteCache[market.id] = quoteCache[market.id]?.filter { $0.key >= first }
         if let range = ranges[market.id] { ranges[market.id] = (max(first, range.first), range.last) }
         if let range = statRanges[market.id] { statRanges[market.id] = (max(first, range.first), range.last) }
+        coverageChecks.removeValue(forKey: market.id)
     }
     private static func complete(_ candle: Candle?) -> Bool { candle?.confirmed == true && candle?.open != nil && candle?.baseVolume != nil }
     private func floor(_ id: String) -> Int64? { guard let value = candleFloor[id], value.expires > Date() else { candleFloor.removeValue(forKey: id); return nil }; return value.hour }
