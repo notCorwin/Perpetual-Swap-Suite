@@ -1210,7 +1210,6 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await wait(view, "document.body.innerText.includes('Cannot save blur fixture') && getComputedStyle(document.querySelector('[data-slot=popover-content]')).backdropFilter === 'none'")
         XCTAssertEqual(bridge.radar.floatingBlurRadius, 160)
         bridge.blurSaveError = nil
-        try await click(view, "Retry saving")
         try await wait(view, "!document.body.innerText.includes('Cannot save blur fixture') && !document.body.innerText.includes('Saving')")
         XCTAssertEqual(bridge.radar.floatingBlurRadius, 0)
         let documentTimeOrigin = try await js(view, "performance.timeOrigin")
@@ -1714,7 +1713,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         bridge.holdGateway = false
         try await click(view, "Analyze Short")
         XCTAssertEqual(bridge.analysisCaptureBounds.count, 1, "Opening the existing directional analysis must preserve its snapshot and conversation.")
-        try await click(view, "Retry")
+        try await click(view, "Send follow-up")
         try await wait(view, "document.querySelectorAll('[data-analysis-answer]').length === 3 && !document.querySelector('[aria-label=\"Ask a follow-up\"]').disabled")
         XCTAssertEqual(bridge.gatewayRequests.count, 4)
         XCTAssertEqual(bridge.analysisCaptureBounds.count, 1)

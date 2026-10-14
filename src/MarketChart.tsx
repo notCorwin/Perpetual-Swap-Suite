@@ -429,6 +429,8 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
   const wheelFrame = useRef<number | null>(null)
   const historyRequests = useRef(new Map<string, Promise<ChartPollResponse>>())
   const requestedHistoryEnds = useRef(new Set<string>())
+  const historyRetryTimers = useRef(new Map<string, number>())
+  const historyRetryAttempts = useRef(new Map<string, number>())
   const [inspection, setInspection] = useState<{ id: string; hour: number } | null>(null)
   const heldPointer = useRef<{ id: string; pointerId: number; target: SVGSVGElement } | null>(null)
   const endInspection = useCallback(() => {
@@ -461,8 +463,11 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
   const captureError = capture.id === instId ? capture.error : ""
   useEffect(() => {
     requestedHistoryEnds.current.clear()
+    for (const timer of historyRetryTimers.current.values()) window.clearTimeout(timer)
+    historyRetryTimers.current.clear(); historyRetryAttempts.current.clear()
     setHistoryBars(null); setHistoryBoundary(null)
   }, [instId, chart?.serviceSession])
+  useEffect(() => () => { for (const timer of historyRetryTimers.current.values()) window.clearTimeout(timer) }, [])
   useEffect(() => {
     if (capture.status !== "flashing") return
     const timer = window.setTimeout(() => setCapture(current => current === capture ? { ...current, status: "idle" } : current), 550)
@@ -521,10 +526,21 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
     const needsCandles = chartHistoryNeedsLoad(historicalEnd, oldestCachedHour)
     const needsStats = chartStatsNeedLoad(cachedBars, historicalEnd)
     const key = `${instId}:${historicalEnd}`
-    // A buffered response can satisfy many adjacent viewport positions. A
-    // failed or partial attempt stays stopped until the user explicitly retries.
+    // A buffered response can satisfy many adjacent viewport positions. Failed
+    // or partial attempts are released by the bounded automatic retry timer.
     if ((!needsCandles && !needsStats) || requestedHistoryEnds.current.has(key)) return
     let stopped = false
+    const retryAutomatically = () => {
+      if (stopped || historyRetryTimers.current.has(key)) return
+      const attempt = (historyRetryAttempts.current.get(key) ?? 0) + 1
+      historyRetryAttempts.current.set(key, attempt)
+      const timer = window.setTimeout(() => {
+        historyRetryTimers.current.delete(key)
+        requestedHistoryEnds.current.delete(key)
+        setHistoryRetry(value => value + 1)
+      }, Math.min(30_000, 2_000 * 2 ** Math.min(attempt - 1, 4)))
+      historyRetryTimers.current.set(key, timer)
+    }
     setHistoryLoading(key)
     void (async () => {
       try { await historyRequests.current.get(instId) } catch { /* retry the newest position */ }
@@ -563,11 +579,14 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
         }
         setChartError({ id: instId, message: result.error })
         setHistoryLoading(null)
+        if (result.error) retryAutomatically()
+        else historyRetryAttempts.current.delete(key)
       } catch (cause) {
         if (!stopped && windowEndRef.current?.id === instId && windowEndRef.current.hour === historicalEnd) {
           setChartError({ id: instId, message: cause instanceof Error ? cause.message : "Cannot load history" })
           setHistoryLoading(null)
         }
+        retryAutomatically()
       } finally {
         if (historyRequests.current.get(instId) === request) historyRequests.current.delete(instId)
       }
@@ -751,10 +770,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
       </div>
       <Toggle variant="outline" size="sm" pressed={showMoveLabels} onPressedChange={setShowMoveLabels} aria-label="Show move label layer" data-price-move-layer={showMoveLabels ? 'visible' : 'hidden'}>{showMoveLabels ? 'Labels On' : 'Labels Off'}</Toggle>
     </header>
-    {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}{historicalEnd !== null && <Button variant="outline" size="sm" onClick={() => {
-      requestedHistoryEnds.current.delete(`${instId}:${historicalEnd}`)
-      setHistoryRetry(value => value + 1)
-    }}>Retry</Button>}</div>}
+    {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}{historicalEnd !== null && ' Retrying automatically.'}</div>}
     {captureError && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{captureError}</p>}
     <div className="flex min-h-0 flex-1">
     <section ref={chartRef} data-chart-inst={instId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-surface="panel" aria-label={`${instId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-chart-surface">

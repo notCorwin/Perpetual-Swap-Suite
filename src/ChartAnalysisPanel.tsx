@@ -1,4 +1,4 @@
-import { Fragment, lazy, Suspense, useState } from 'react'
+import { Fragment, lazy, Suspense, useEffect, useRef, useState } from 'react'
 import { Copy, Send, Square, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -20,6 +20,19 @@ export function ChartAnalysisPanel({ instId, session, ready, onNew, onClose }: {
   const busy = session?.phase === 'capturing' || session?.phase === 'streaming'
   const [copyState, setCopyState] = useState<{ id: string; error: string } | null>(null)
   const [composing, setComposing] = useState(false)
+  const retryAttempt = useRef(0)
+  const onNewRef = useRef(onNew)
+  useEffect(() => { onNewRef.current = onNew }, [onNew])
+  useEffect(() => { retryAttempt.current = 0 }, [instId])
+  useEffect(() => {
+    if (session?.phase !== 'error') { if (session?.phase === 'ready') retryAttempt.current = 0; return }
+    const attempt = ++retryAttempt.current
+    const timer = window.setTimeout(() => {
+      if (session.turns.length) void chartAnalysis.retry(instId)
+      else onNewRef.current()
+    }, Math.min(30_000, 2_000 * 2 ** Math.min(attempt - 1, 4)))
+    return () => window.clearTimeout(timer)
+  }, [instId, session?.phase, session?.error, session?.turns.length])
   const copy = async (id: string, text: string) => {
     try {
       const result = await window.webkit.messageHandlers.radar.postMessage({ copyText: text })
@@ -39,7 +52,7 @@ export function ChartAnalysisPanel({ instId, session, ready, onNew, onClose }: {
       {session?.capturedAt ? <div className="flex flex-col gap-1 text-xs text-muted-foreground"><p>Captured {captureTime(session.capturedAt)}</p><p>{session.rangeLabel}</p><p>Follow-ups use this snapshot.</p></div> : null}
       <div className="flex items-center gap-2"><Button variant="outline" size="sm" disabled={busy || !ready} onClick={onNew}>{session?.image ? 'New analysis' : 'Analyze chart'}</Button><AnalysisSettingsButton />{busy && <Button variant="ghost" size="sm" onClick={() => chartAnalysis.stop(instId)}><Square data-icon="inline-start" />Stop</Button>}</div>
     </div>
-    {session?.error && <Alert variant="destructive"><AlertDescription>{session.error}<Button variant="outline" size="sm" disabled={!session.turns.length && !ready} onClick={() => { if (session.turns.length) void chartAnalysis.retry(instId); else onNew() }}>Retry</Button></AlertDescription></Alert>}
+    {session?.error && <Alert variant="destructive"><AlertDescription>{session.error} Automatically retrying.</AlertDescription></Alert>}
     {copyState?.error && <Alert variant="destructive"><AlertDescription>{copyState.error}</AlertDescription></Alert>}
     <div className="min-h-0 flex-1">
       <MessageScrollerProvider key={instId} autoScroll>
@@ -51,7 +64,7 @@ export function ChartAnalysisPanel({ instId, session, ready, onNew, onClose }: {
               <MessageScrollerItem messageId={`${turn.id}-assistant`}><Message><MessageContent>
                 {turn.text && <div data-analysis-answer lang="zh-CN"><Suspense fallback={<p className="whitespace-pre-wrap">{turn.text}</p>}><MessageResponse isAnimating={turn.status === 'streaming'} controls={false}>{turn.text}</MessageResponse></Suspense></div>}
                 {turn.status === 'streaming' && <p role="status" className="flex items-center gap-2 text-xs text-muted-foreground"><Spinner />{turn.text ? 'Generating…' : 'Analyzing chart…'}</p>}
-                <MessageFooter>{turn.status !== 'complete' && turn.status !== 'streaming' && <Badge variant="outline">{turn.status === 'stopped' ? 'Stopped' : 'Failed'}</Badge>}{turn.text && <Button variant="ghost" size="xs" aria-label="Copy analysis" onClick={() => void copy(turn.id, turn.text)}><Copy data-icon="inline-start" />{copyState?.id === turn.id && !copyState.error ? 'Copied' : 'Copy'}</Button>}{turn === session.turns.at(-1) && turn.status === 'stopped' && <Button variant="ghost" size="xs" onClick={() => void chartAnalysis.retry(instId)}>Retry</Button>}</MessageFooter>
+                <MessageFooter>{turn.status !== 'complete' && turn.status !== 'streaming' && <Badge variant="outline">{turn.status === 'stopped' ? 'Stopped' : 'Failed'}</Badge>}{turn.text && <Button variant="ghost" size="xs" aria-label="Copy analysis" onClick={() => void copy(turn.id, turn.text)}><Copy data-icon="inline-start" />{copyState?.id === turn.id && !copyState.error ? 'Copied' : 'Copy'}</Button>}</MessageFooter>
               </MessageContent></Message></MessageScrollerItem>
             </Fragment>)}
           </MessageScrollerContent></MessageScrollerViewport>
