@@ -11,8 +11,8 @@ private final class TakerChartProtocol: URLProtocol, @unchecked Sendable {
         let code: String
         if url.path.hasSuffix("taker-volume-contract") {
             let parameters = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
-            let baseCurrency = parameters.contains { $0.name == "unit" && $0.value == "0" }
-            code = baseCurrency && request.cachePolicy == .reloadIgnoringLocalCacheData ? "0" : "1"
+            let usdt = parameters.contains { $0.name == "unit" && $0.value == "2" }
+            code = usdt && request.cachePolicy == .reloadIgnoringLocalCacheData ? "0" : "1"
             data = [[String(hour), "200", "380"], [String(hour - hourMS), "250", "500"]]
         } else if url.path.hasSuffix("/candles") {
             code = "0"
@@ -30,7 +30,7 @@ private actor SlowContractTransport: FilterHistoryTransport {
     let hour: Int64
     init(hour: Int64) { self.hour = hour }
     func fetch(path: String, parameters: [String: String]) async throws -> [[String]] {
-        guard path == "/rubik/stat/taker-volume-contract", parameters["unit"] == "0", parameters["period"] == "1H", parameters["limit"] == "2" else { throw FilterError("Incorrect Taker request") }
+        guard path == "/rubik/stat/taker-volume-contract", parameters["unit"] == "2", parameters["period"] == "1H", parameters["limit"] == "2" else { throw FilterError("Incorrect Taker request") }
         if parameters["instId"] == "AAA-USDT-SWAP" { try await Task.sleep(for: .seconds(60)) }
         if parameters["instId"] == "BAD-USDT-SWAP" { throw FilterError("Contract temporarily unavailable") }
         return [[String(hour), "200", "380"]]

@@ -138,7 +138,7 @@ const MarketRowView = memo(function MarketRowView({ row, index, onSelect, onExpl
         <BreakReadings result={row.lowBreakdown} direction="low" />
       </div>
     </TableCell>
-    <TableCell className={cn("text-center tabular-nums", directionClass(row.takerRatio))} title={row.buy !== null && row.sell !== null ? `Current 1h provisional cumulative volume · Buy ${row.buy.toLocaleString("en-US")} / Sell ${row.sell.toLocaleString("en-US")} base currency · Imbalance (Buy − Sell) / (Buy + Sell), not Buy / Sell` : "Loading current-hour taker volume"}>{formatPercent(row.takerRatio)}</TableCell>
+    <TableCell className={cn("text-center tabular-nums", directionClass(row.takerRatio))} title={row.buy !== null && row.sell !== null ? `Current 1h provisional cumulative volume · Buy ${row.buy.toLocaleString("en-US")} / Sell ${row.sell.toLocaleString("en-US")} USDT · Imbalance (Buy − Sell) / (Buy + Sell), not Buy / Sell` : "Loading current-hour taker volume"}>{formatPercent(row.takerRatio)}</TableCell>
     <TableCell className={cn("text-center tabular-nums", directionClass(row.oiChange))}>{formatPercent(row.oiChange)}</TableCell>
     <TableCell className="text-center tabular-nums">
       <div className="mx-auto grid w-max grid-cols-[max-content_max-content] gap-x-3 text-right">

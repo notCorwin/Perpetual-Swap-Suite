@@ -227,7 +227,7 @@ final class ResearchDataProvider {
         var parameters = [("instId", instrument)]
         if kind == "candle" || kind == "mark" { parameters += [("bar", "1H"), ("after", String(range.through + hourMS)), ("limit", kind == "mark" ? "100" : "300")] }
         else if kind == "funding" { parameters += [("after", String(range.through + hourMS)), ("limit", "400")] }
-        else { parameters += [("period", "1H"), ("end", String(range.through + hourMS)), ("begin", String(range.from - 1)), ("limit", "100")]; if kind == "taker" { parameters.append(("unit", "0")) } }
+        else { parameters += [("period", "1H"), ("end", String(range.through + hourMS)), ("begin", String(range.from - 1)), ("limit", "100")]; if kind == "taker" { parameters.append(("unit", "2")) } }
         let url = Self.url(paths[kind]!, parameters).absoluteString
         return ResearchSource(id: researchHash(url + ":\(range.from):\(range.through)" + (refresh ? UUID().uuidString : "")), instrument: instrument, kind: kind, from: range.from, through: range.through, url: url, filename: "\(instrument) · \(kind) · REST", sizeBytes: nil, archive: false, refresh: refresh)
     }

@@ -494,7 +494,7 @@ final class Radar {
 
     private func getData(_ path: String, _ parameters: [String: String]) async throws -> Data {
         var parameters = parameters
-        if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "0" }
+        if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "2" }
         var parts = URLComponents(string: api + path)!
         parts.queryItems = parameters.map { URLQueryItem(name: $0.key, value: $0.value) }
         var request = URLRequest(url: parts.url!, cachePolicy: .reloadIgnoringLocalCacheData)
@@ -1198,7 +1198,7 @@ final class Radar {
             let (roc, maroc) = rocMaroc(series, ts, 9, 9)
             let (upper, middle, lower) = logBB(series, ts)
             let stat = stats[ts]
-            let oi = ts == hour ? currentOI(id)?.contracts : stat?.oi
+            let oi = ts == hour ? currentOI(id)?.usd : stat?.oiUSD
             let sell = ts == hour ? rows[id]?.sell : stat?.sell
             let buy = ts == hour ? rows[id]?.buy : stat?.buy
             output.append([

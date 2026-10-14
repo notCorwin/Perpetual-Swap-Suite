@@ -3,7 +3,7 @@ import CSQLite
 
 final class Store {
     private static let busyTimeoutMilliseconds: Int32 = 5_000
-    private static let schemaVersion: Int64 = 3
+    private static let schemaVersion: Int64 = 4
     private var db: OpaquePointer?
     private var reusableStatements: [String: OpaquePointer] = [:]
     let url: URL
@@ -43,6 +43,11 @@ final class Store {
                     // contracts. Neither can be relabeled safely; hydrate them
                     // again from OKX using the new explicit units.
                     try execute("UPDATE chart_stats SET oi=NULL,oi_usd=NULL,sell=NULL,buy=NULL")
+                }
+                if try version() < 4 {
+                    // Taker history previously used OKX unit=0 (base currency).
+                    // It cannot be relabeled as USDT, so force authoritative rehydration.
+                    try execute("UPDATE chart_stats SET sell=NULL,buy=NULL")
                 }
                 try execute("CREATE TABLE IF NOT EXISTS hourly_quotes (inst_id TEXT, hour INTEGER, turnover REAL, spread REAL, quote_timestamp INTEGER NOT NULL, PRIMARY KEY(inst_id,hour))")
                 try execute("CREATE TRIGGER IF NOT EXISTS candle_insert_invalidates_ema AFTER INSERT ON candles BEGIN DELETE FROM ema200 WHERE inst_id=NEW.inst_id AND hour>=NEW.hour; END")

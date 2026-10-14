@@ -9,7 +9,7 @@ struct OKXFilterHistoryTransport: FilterHistoryTransport {
 
     func fetch(path: String, parameters: [String: String]) async throws -> [[String]] {
         var parameters = parameters
-        if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "0" }
+        if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "2" }
         var parts = URLComponents(string: "https://www.okx.com/api/v5" + path)!
         parts.queryItems = parameters.map { URLQueryItem(name: $0.key, value: $0.value) }
         var request = URLRequest(url: parts.url!, cachePolicy: .reloadIgnoringLocalCacheData); request.timeoutInterval = 15
@@ -239,7 +239,7 @@ actor FilterHistoryLoader {
                         statPages[pageKey] = Date().addingTimeInterval(900); continue
                     }
                     var parameters = ["instId": market.id, "period": "1H", "end": String(pageEnd + hourMS), "limit": "100"]
-                    if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "0" }
+                    if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "2" }
                     let values = try await fetch(path, parameters)
                     for value in values {
                         guard let ts = value.first.flatMap(Int64.init), ts % hourMS == 0, ts >= pageStart, ts <= pageEnd else { continue }
