@@ -94,6 +94,24 @@ final class ResearchStore {
             try database.execute("CREATE TRIGGER prepared_cache_research_coverage_DELETE AFTER DELETE ON research_coverage BEGIN DELETE FROM research_objects WHERE id='prepared:'||OLD.source; END")
             try database.setPreference("5", forKey: "researchSchemaVersion")
         } }
+        if try Int(database.preference(forKey: "researchSchemaVersion") ?? "0") ?? 0 < 6 { try database.transaction {
+            guard try Int(database.preference(forKey: "researchSchemaVersion") ?? "0") ?? 0 < 6 else { return }
+            // v5 taker rows use base currency. A stat row combines OI and
+            // taker values, so discard latest stat heads and rehydrate both
+            // sources rather than mixing base-currency history with USDT.
+            for table in ["research_heads", "research_coverage"] {
+                try database.execute("DROP TRIGGER IF EXISTS plan_cache_\(table)_DELETE")
+                try database.execute("DROP TRIGGER IF EXISTS prepared_cache_\(table)_DELETE")
+            }
+            try database.execute("DELETE FROM research_heads WHERE kind='stat'")
+            try database.execute("DELETE FROM research_coverage WHERE kind IN ('oi','taker')")
+            try database.execute("DELETE FROM research_objects WHERE kind IN ('planCache','preparedSource')")
+            try database.execute("CREATE TRIGGER plan_cache_research_heads_DELETE AFTER DELETE ON research_heads BEGIN DELETE FROM research_objects WHERE kind='planCache'; END")
+            try database.execute("CREATE TRIGGER prepared_cache_research_heads_DELETE AFTER DELETE ON research_heads BEGIN DELETE FROM research_objects WHERE kind='preparedSource' AND id IN (SELECT 'prepared:'||j.value FROM research_data d,json_each(d.json,'$.sources') j WHERE d.revision=OLD.revision); END")
+            try database.execute("CREATE TRIGGER plan_cache_research_coverage_DELETE AFTER DELETE ON research_coverage BEGIN DELETE FROM research_objects WHERE kind='planCache'; END")
+            try database.execute("CREATE TRIGGER prepared_cache_research_coverage_DELETE AFTER DELETE ON research_coverage BEGIN DELETE FROM research_objects WHERE id='prepared:'||OLD.source; END")
+            try database.setPreference("6", forKey: "researchSchemaVersion")
+        } }
         // Radar's confirmed-hour database is the canonical latest market view.
         // Do not create it from a standalone Research context, but publish to it
         // whenever the application/monitor has already established the store.
