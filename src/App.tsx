@@ -479,7 +479,11 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     </Button>
   }
 
-  if (selected && active) return <MarketChart instId={selected} listOrder={signalChartOrder ?? listOrder} turnoverOrder={turnoverOrder} moveDefaults={chartMoveSettings} onSelect={setSelected} backLabel={signalChartOrder ? 'Signals' : 'Markets'} onBack={() => { setSelected(null); setSignalChartOrder(null) }} />
+  if (selected && active) return <MarketChart instId={selected} listOrder={signalChartOrder ?? listOrder} turnoverOrder={turnoverOrder} moveDefaults={chartMoveSettings} onMoveEfficiencyFactorChange={value => {
+    setChartMoveSettings(current => ({ ...current, chartMoveEfficiencyFactor: value }))
+    setChartEfficiencyFactorDraft(String(value))
+    saveSetting({ chartMoveEfficiencyFactor: value })
+  }} onSelect={setSelected} backLabel={signalChartOrder ? 'Signals' : 'Markets'} onBack={() => { setSelected(null); setSignalChartOrder(null) }} />
 
   if (!ready) {
     return (

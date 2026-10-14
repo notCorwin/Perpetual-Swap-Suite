@@ -409,7 +409,7 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
   </>
 })
 
-export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = { chartMoveLabelsVisible: true, chartMoveEfficiencyFactor: 1 }, onSelect, onBack, backLabel = 'Markets' }: { instId: string; listOrder: string[]; turnoverOrder: string[]; moveDefaults?: { chartMoveLabelsVisible: boolean; chartMoveEfficiencyFactor: number }; onSelect: (id: string) => void; onBack: () => void; backLabel?: string }) {
+export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = { chartMoveLabelsVisible: true, chartMoveEfficiencyFactor: 1 }, onMoveEfficiencyFactorChange, onSelect, onBack, backLabel = 'Markets' }: { instId: string; listOrder: string[]; turnoverOrder: string[]; moveDefaults?: { chartMoveLabelsVisible: boolean; chartMoveEfficiencyFactor: number }; onMoveEfficiencyFactorChange?: (value: number) => void; onSelect: (id: string) => void; onBack: () => void; backLabel?: string }) {
   const analysis = useSyncExternalStore(chartAnalysis.subscribe, () => chartAnalysis.get(instId))
   const [analysisOpen, setAnalysisOpen] = useState(() => chartAnalysis.get(instId) !== null)
   const moveMode: PriceMoveMode = 'highLow'
@@ -740,7 +740,10 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
       <Badge variant="secondary"><Radio data-icon="inline-start" aria-hidden="true" />{historicalEnd !== null ? "History" : active && !active.confirmed ? "Live candle" : "Hourly chart"}</Badge>
       <div className="flex w-36 items-center gap-2" data-price-move-efficiency-factor={moveEfficiencyFactor} title="Efficiency = |change| / periods^factor">
         <label htmlFor="chart-efficiency-factor" className="shrink-0 text-xs text-muted-foreground">Factor</label>
-        <Slider id="chart-efficiency-factor" min={0} max={1} step={0.01} value={[moveEfficiencyFactor]} onValueChange={values => setMoveEfficiencyFactor(values[0] ?? 0)} aria-label={`Efficiency factor ${moveEfficiencyFactor.toFixed(2)}`} />
+        <Slider id="chart-efficiency-factor" min={0} max={1} step={0.01} value={[moveEfficiencyFactor]} onValueChange={values => setMoveEfficiencyFactor(values[0] ?? 0)} onValueCommit={values => {
+          onMoveEfficiencyFactorChange?.(values[0] ?? 0)
+          window.requestAnimationFrame(() => plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus())
+        }} aria-label={`Efficiency factor ${moveEfficiencyFactor.toFixed(2)}`} />
         <span className="w-8 text-right text-xs tabular-nums">{moveEfficiencyFactor.toFixed(2)}</span>
       </div>
       <Toggle variant="outline" size="sm" pressed={showMoveLabels} onPressedChange={setShowMoveLabels} aria-label="Show move label layer" data-price-move-layer={showMoveLabels ? 'visible' : 'hidden'}>{showMoveLabels ? 'Labels On' : 'Labels Off'}</Toggle>
