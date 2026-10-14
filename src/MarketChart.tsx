@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button"
 import { ButtonGroup } from "@/components/ui/button-group"
 import { Spinner } from "@/components/ui/spinner"
 import { Toggle } from '@/components/ui/toggle'
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { Slider } from '@/components/ui/slider'
 import { ChartAnalysisPanel } from '@/ChartAnalysisPanel'
 import { ChartWorkspaceViewport } from '@/ChartWorkspaceViewport'
@@ -22,6 +23,7 @@ import { capturePriceMoves, type PriceMoveMode, type PriceMoveObjective, type Pr
 import { SnapshotOrder } from '@/snapshot-order'
 import { mergeChartBars } from '@/chart-snapshot'
 import { placeChartLabels, type ChartLabel } from '@/chart-label-layout'
+import { RADAR_TIMEFRAMES, timeframeLabel, timeframeMilliseconds, type RadarTimeframe } from '@/timeframe'
 
 export type Bar = {
   hour: number; open: number; high: number; low: number; close: number; confirmed: boolean
@@ -29,54 +31,57 @@ export type Bar = {
   roc: PercentageValue; maroc: PercentageValue; rsi6: number | null; rsi12: number | null; rsi24: number | null
   oi: number | null; buy: number | null; sell: number | null
 }
-export type ChartResponse = { bars: Bar[]; error: string; revision: number; serviceSession?: string; endHour?: number; oldestHour?: number | null; historyExhausted?: boolean; candleLoadFailed?: boolean }
+export type ChartResponse = { bars: Bar[]; error: string; revision: number; timeframe?: RadarTimeframe; intervalMS?: number; serviceSession?: string; endHour?: number; oldestHour?: number | null; historyExhausted?: boolean; candleLoadFailed?: boolean }
 export type ChartPollResponse = ChartResponse | { unchanged: true; error: string; revision: number; serviceSession?: string }
 
 const chartCache = new Map<string, { data: ChartResponse; loadedAt: number }>()
 const chartLoads = new Map<string, Promise<ChartResponse>>()
 const chartPreviews = new Map<string, Promise<ChartResponse>>()
 const chartOrders = new Map<string, SnapshotOrder>()
-function rememberChart(id: string, data: ChartResponse, loadedAt: number) {
-  let order = chartOrders.get(id)
-  if (!order) { order = new SnapshotOrder(); chartOrders.set(id, order) }
+const chartKey = (id: string, timeframe: RadarTimeframe) => `${timeframe}:${id}`
+function rememberChart(key: string, data: ChartResponse, loadedAt: number) {
+  let order = chartOrders.get(key)
+  if (!order) { order = new SnapshotOrder(); chartOrders.set(key, order) }
   if (!order.accept(data)) {
-    const cached = chartCache.get(id)
+    const cached = chartCache.get(key)
     if (cached) return cached.data
     throw new Error('Obsolete chart response; refreshing the current collector')
   }
-  chartCache.delete(id)
-  chartCache.set(id, { data, loadedAt })
+  chartCache.delete(key)
+  chartCache.set(key, { data, loadedAt })
   if (chartCache.size > 8) chartCache.delete(chartCache.keys().next().value!)
   return data
 }
-function loadChart(id: string): Promise<ChartResponse> {
-  const pending = chartLoads.get(id)
+function loadChart(id: string, timeframe: RadarTimeframe): Promise<ChartResponse> {
+  const key = chartKey(id, timeframe)
+  const pending = chartLoads.get(key)
   if (pending) return pending
-  const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: id, loadChart: true }).then(result => {
+  const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: id, timeframe, loadChart: true }).then(result => {
     if ("unchanged" in result) throw new Error("No chart data returned")
-    return rememberChart(id, result, Date.now())
-  }).finally(() => chartLoads.delete(id))
-  chartLoads.set(id, request)
+    return rememberChart(key, result, Date.now())
+  }).finally(() => chartLoads.delete(key))
+  chartLoads.set(key, request)
   return request
 }
-function previewChart(id: string): Promise<ChartResponse> {
-  const cached = chartCache.get(id)
+function previewChart(id: string, timeframe: RadarTimeframe): Promise<ChartResponse> {
+  const key = chartKey(id, timeframe)
+  const cached = chartCache.get(key)
   if (cached) return Promise.resolve(cached.data)
-  const pending = chartPreviews.get(id)
+  const pending = chartPreviews.get(key)
   if (pending) return pending
-  const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: id, sinceRevision: -1 }).then(result => {
+  const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: id, timeframe, sinceRevision: -1 }).then(result => {
     if ("unchanged" in result) throw new Error("No chart data returned")
-    rememberChart(id, result, chartCache.get(id)?.loadedAt ?? 0)
-    return chartCache.get(id)!.data
-  }).finally(() => chartPreviews.delete(id))
-  chartPreviews.set(id, request)
+    rememberChart(key, result, chartCache.get(key)?.loadedAt ?? 0)
+    return chartCache.get(key)!.data
+  }).finally(() => chartPreviews.delete(key))
+  chartPreviews.set(key, request)
   return request
 }
 
 const compact = (value: number | null) => value === null ? "—" : new Intl.NumberFormat("en-US", { maximumSignificantDigits: 5, notation: "compact" }).format(value)
 const price = (value: number | null) => value === null ? "—" : new Intl.NumberFormat("en-US", { maximumSignificantDigits: 8 }).format(value)
 const time = (hour: number) => new Date(hour).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })
-const hourLabel = (hour: number) => new Date(hour).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", hour12: false })
+const hourLabel = (hour: number) => new Date(hour).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })
 const chartPriceValues = (bars: Bar[]) => bars.flatMap(bar => [bar.low, bar.high, bar.vwap, bar.ema, bar.logBBUpper, bar.logBBMiddle, bar.logBBLower].filter((value): value is number => value !== null && value > 0))
 const rocAxisFor = (bars: Bar[]) => {
   const values = bars.flatMap(bar => [finitePercentage(bar.roc), finitePercentage(bar.maroc)].filter((value): value is number => value !== null))
@@ -100,13 +105,13 @@ const priceTagWidth = (priceText: string, countdown: string) => {
   return Math.ceil(Math.max(chartTextWidth(priceText, fontSize), chartTextWidth(countdown, fontSize)) + padding * 2)
 }
 
-const PriceCountdown = memo(function PriceCountdown({ hour, x, y, fontSize }: { hour: number; x: number; y: number; fontSize: string }) {
+const PriceCountdown = memo(function PriceCountdown({ hour, intervalMS, x, y, fontSize }: { hour: number; intervalMS: number; x: number; y: number; fontSize: string }) {
   const [now, setNow] = useState(Date.now)
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
     return () => window.clearInterval(timer)
   }, [])
-  const seconds = Math.max(0, Math.floor((hour + 3_600_000 - now) / 1000))
+  const seconds = Math.max(0, Math.floor((hour + intervalMS - now) / 1000))
   const value = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`
   return <text x={x} y={y} textAnchor="middle" dominantBaseline="middle" fill="var(--chart-price-tag-foreground)" fontSize={fontSize}>{value}</text>
 })
@@ -134,17 +139,17 @@ export const chartGutter = (bars: Bar[], height: number, liveClose = bars[bars.l
   return fitAxisPriceTag(axisGutter, priceTagWidth(price(liveClose), "00:00"), tagStrokeWidth, minimumScale)
 }
 
-export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height, now, endHour, moveSignals = [] }: { bars: Bar[]; liveBar: Bar; inspected: number | null; width: number; height: number; now: number; endHour: number; moveSignals?: PriceMoveSignal[] }) {
+export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height, now, endHour, intervalMS = 3_600_000, moveSignals = [] }: { bars: Bar[]; liveBar: Bar; inspected: number | null; width: number; height: number; now: number; endHour: number; intervalMS?: number; moveSignals?: PriceMoveSignal[] }) {
   const areaClipId = useId().replaceAll(":", "")
   const n = bars.length
   const active = bars[inspected ?? n - 1]
   const latestHour = endHour
-  const firstHour = endHour - 95 * 3_600_000
+  const firstHour = endHour - 95 * intervalMS
   const firstAtLeft = bars[0].hour === firstHour
   const candleHigh = Math.max(...bars.map(bar => bar.high)), candleLow = Math.min(...bars.map(bar => bar.low))
   const { gutter, scale: tagScale, offset: tagOffset, boxWidth: tagBoxWidth } = chartGutter(bars, height, liveBar.close)
   const { panels, columns, axisStarts, headerY, left, right } = chartLayout(width, height, gutter)
-  const x = (index: number, panel: Panel) => chartHourX(bars[index].hour, latestHour, ...columns[panel])
+  const x = (index: number, panel: Panel) => chartHourX(bars[index].hour, latestHour, ...columns[panel], intervalMS)
   const barWidth = chartCandleWidth(right - left)
   const priceValues = chartPriceValues(bars)
   const priceMin = Math.min(...priceValues), priceMax = Math.max(...priceValues)
@@ -164,7 +169,7 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
   const oiY = (value: number) => oiAxis ? logarithmicY(value, oiAxis, panels.oi) : NaN
   const takerY = (value: number) => scale(value, takerAxis.min, takerAxis.max, panels.taker)
   const rocZeroY = scale(0, rocAxis.min, rocAxis.max, panels.roc)
-  const tag = livePriceTag(liveBar, endHour, now)
+  const tag = livePriceTag(liveBar, endHour, now, intervalMS)
   const latestY = priceY(tag.price)
   const latestColor = tag.rising ? "var(--positive)" : "var(--destructive)"
   const showCountdown = now > 0
@@ -186,7 +191,7 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
     bars.forEach((bar, index) => {
       const value = bar[key]
       const pointY = typeof value === "number" ? y(value) : NaN
-      if (!Number.isFinite(pointY) || (index > 0 && bar.hour - bars[index - 1].hour !== 3_600_000)) {
+      if (!Number.isFinite(pointY) || (index > 0 && bar.hour - bars[index - 1].hour !== intervalMS)) {
         if (segment) segments.push(segment)
         segment = ""
         if (!Number.isFinite(pointY)) return
@@ -210,7 +215,7 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
     }
     bars.forEach((bar, index) => {
       const value = finitePercentage(bar[key])
-      if (value === null || (index > 0 && bar.hour - bars[index - 1].hour !== 3_600_000)) finish()
+      if (value === null || (index > 0 && bar.hour - bars[index - 1].hour !== intervalMS)) finish()
       if (value === null) return
       const pointY = Number(scale(value, rocAxis.min, rocAxis.max, panels.roc).toFixed(1))
       if (index === 0 && firstAtLeft) points.push([left, pointY])
@@ -228,7 +233,7 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
   }
   bars.forEach((bar, index) => {
     if (bar.logBBUpper === null || bar.logBBLower === null) { finishBand(); return }
-    if (index > 0 && bar.hour - bars[index - 1].hour !== 3_600_000) finishBand()
+    if (index > 0 && bar.hour - bars[index - 1].hour !== intervalMS) finishBand()
     const pointX = x(index, "price").toFixed(1)
     if (index === 0 && firstAtLeft) {
       upper.push(`${left} ${priceY(bar.logBBUpper).toFixed(1)}`)
@@ -321,8 +326,8 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
     <rect x={columns.rsi[0]} y={rsiY(70)} width={columns.rsi[1] - columns.rsi[0]} height={rsiY(30) - rsiY(70)} fill="var(--chart-rsi-area)" />
     {grid}
     {rocZeroY > panels.roc[0] && rocZeroY < panels.roc[1] && <line x1={columns.roc[0]} x2={columns.roc[1]} y1={rocZeroY} y2={rocZeroY} stroke="var(--muted-foreground)" strokeWidth="1" strokeOpacity="0.5" />}
-    {bars.flatMap((bar, index) => (bar.hour - firstHour) % (12 * 3_600_000) === 0 ? panelKeys.map(key => <line key={`${bar.hour}-${key}`} x1={x(index, key)} x2={x(index, key)} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--border)" strokeOpacity="0.22" />) : [])}
-    {bars.map((bar, index) => ({ bar, index })).filter(({ bar, index }) => index === n - 1 || (bar.hour - firstHour) % (24 * 3_600_000) === 0).map(({ bar, index }) => <text key={bar.hour} x={x(index, "taker")} y={height - 7} textAnchor={index === 0 ? "start" : index === n - 1 ? "end" : "middle"} fill="var(--muted-foreground)">{hourLabel(bar.hour)}</text>)}
+    {bars.flatMap((bar, index) => (bar.hour - firstHour) % (12 * intervalMS) === 0 ? panelKeys.map(key => <line key={`${bar.hour}-${key}`} x1={x(index, key)} x2={x(index, key)} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--border)" strokeOpacity="0.22" />) : [])}
+    {bars.map((bar, index) => ({ bar, index })).filter(({ bar, index }) => index === n - 1 || (bar.hour - firstHour) % (24 * intervalMS) === 0).map(({ bar, index }) => <text key={bar.hour} x={x(index, "taker")} y={height - 7} textAnchor={index === 0 ? "start" : index === n - 1 ? "end" : "middle"} fill="var(--muted-foreground)">{hourLabel(bar.hour)}</text>)}
     {priceAxis.ticks.map(tick => {
       const tickY = priceY(tick)
       return <g key={tick}><line x1={columns.price[0]} x2={right} y1={tickY} y2={tickY} stroke="var(--border)" strokeOpacity="0.35" />{(tickY + tickHalfHeight < priceTagY || tickY - tickHalfHeight > priceTagY + scaledTagHeight) && lineLabel(axisStarts.price, tickY, axisPrice.format(tick))}</g>
@@ -352,11 +357,11 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
       const triangle = isLong
         ? `M${markerX} ${markerY - 7}L${markerX - 5} ${markerY + 1}H${markerX + 5}Z`
         : `M${markerX} ${markerY + 7}L${markerX - 5} ${markerY - 1}H${markerX + 5}Z`
-      const aria = `${isLong ? 'Long' : 'Short'}${rank} future move entry at ${time(signalHour)}, ${formatPercent(signal.changePercent)} over ${signal.periods} hourly candles, efficiency score ${signal.efficiencyScore.toFixed(2)}`
+      const aria = `${isLong ? 'Long' : 'Short'}${rank} future move entry at ${time(signalHour)}, ${formatPercent(signal.changePercent)} over ${signal.periods} candles, efficiency score ${signal.efficiencyScore.toFixed(2)}`
       const exitTriangle = isLong
         ? `M${exitX} ${exitY + 7}L${exitX - 5} ${exitY - 1}H${exitX + 5}Z`
         : `M${exitX} ${exitY - 7}L${exitX - 5} ${exitY + 1}H${exitX + 5}Z`
-      const exitAria = `Exit ${isLong ? 'Long' : 'Short'}${rank} future move at ${time(signal.exitHour)}, ${formatPercent(signal.changePercent)} after ${signal.periods} hourly candles`
+      const exitAria = `Exit ${isLong ? 'Long' : 'Short'}${rank} future move at ${time(signal.exitHour)}, ${formatPercent(signal.changePercent)} after ${signal.periods} candles`
       const entryLabel = moveLabelLayout.labels.get(`${signal.direction}-${signalHour}-entry`)!
       const exitLabel = moveLabelLayout.labels.get(`${signal.direction}-${signalHour}-exit`)
       return <g key={`${signal.direction}-${signalHour}`} data-chart-move-direction={signal.direction} data-chart-move-hour={signalHour} aria-label={aria}>
@@ -395,7 +400,7 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
     <g data-surface="inherited" transform={`translate(${tagX},${priceTagY}) scale(${tagScale})`}>
       <rect x={tagOffset + tagStrokeWidth / 2} width={tagBoxWidth} height={tagHeight} rx="4" fill={latestColor} stroke={latestColor} strokeWidth="var(--chart-price-tag-stroke-width)" />
       <text x={tagOffset + (tagBoxWidth + tagStrokeWidth) / 2} y={tagPaddingY + tagLineHeight / 2} textAnchor="middle" dominantBaseline="middle" fill="var(--chart-price-tag-foreground)" fontSize={tagFontSize}>{latestPrice}</text>
-      {showCountdown && <PriceCountdown hour={liveBar.hour} x={tagOffset + (tagBoxWidth + tagStrokeWidth) / 2} y={tagPaddingY + tagLineHeight * 1.5 + tagRowGap} fontSize={tagFontSize} />}
+      {showCountdown && <PriceCountdown hour={liveBar.hour} intervalMS={intervalMS} x={tagOffset + (tagBoxWidth + tagStrokeWidth) / 2} y={tagPaddingY + tagLineHeight * 1.5 + tagRowGap} fontSize={tagFontSize} />}
     </g>
     {legend("price", [["VWAP14", price(active.vwap), "var(--chart-2)"], ["EMA200", price(active.ema), "var(--chart-3)"], ["Log BB(20)", `U ${price(active.logBBUpper)}\u00a0·\u00a0M ${price(active.logBBMiddle)}\u00a0·\u00a0L ${price(active.logBBLower)}`, "var(--chart-1)"]])}
     {legend("roc", [["ROC(9)", formatPercent(active.roc), "var(--chart-1)"], ["MAROC(9)", formatPercent(active.maroc), "var(--chart-2)"]])}
@@ -409,7 +414,9 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
   </>
 })
 
-export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = { chartMoveLabelsVisible: true, chartMoveEfficiencyFactor: 1 }, onMoveEfficiencyFactorChange, onSelect, onBack, backLabel = 'Markets' }: { instId: string; listOrder: string[]; turnoverOrder: string[]; moveDefaults?: { chartMoveLabelsVisible: boolean; chartMoveEfficiencyFactor: number }; onMoveEfficiencyFactorChange?: (value: number) => void; onSelect: (id: string) => void; onBack: () => void; backLabel?: string }) {
+export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listOrder, turnoverOrder, moveDefaults = { chartMoveLabelsVisible: true, chartMoveEfficiencyFactor: 1 }, onMoveEfficiencyFactorChange, onSelect, onBack, backLabel = 'Markets' }: { instId: string; timeframe?: RadarTimeframe; onTimeframeChange?: (value: RadarTimeframe) => void; listOrder: string[]; turnoverOrder: string[]; moveDefaults?: { chartMoveLabelsVisible: boolean; chartMoveEfficiencyFactor: number }; onMoveEfficiencyFactorChange?: (value: number) => void; onSelect: (id: string) => void; onBack: () => void; backLabel?: string }) {
+  const intervalMS = timeframeMilliseconds(timeframe)
+  const cacheKey = chartKey(instId, timeframe)
   const analysis = useSyncExternalStore(chartAnalysis.subscribe, () => chartAnalysis.get(instId))
   const [analysisOpen, setAnalysisOpen] = useState(() => chartAnalysis.get(instId) !== null)
   const moveMode: PriceMoveMode = 'highLow'
@@ -417,7 +424,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
   const [showMoveLabels, setShowMoveLabels] = useState(moveDefaults.chartMoveLabelsVisible)
   const [moveEfficiencyFactor, setMoveEfficiencyFactor] = useState(moveDefaults.chartMoveEfficiencyFactor)
   const analysisBusy = analysis?.phase === 'capturing' || analysis?.phase === 'streaming'
-  useEffect(() => () => chartAnalysis.stop(instId), [instId])
+  useEffect(() => () => chartAnalysis.stop(instId), [instId, timeframe])
   const [displayed, setDisplayed] = useState<{ id: string; data: ChartResponse } | null>(null)
   const [historyBars, setHistoryBars] = useState<{ id: string; data: ChartResponse } | null>(null)
   const [historyBoundary, setHistoryBoundary] = useState<{ id: string; oldestHour: number } | null>(null)
@@ -441,7 +448,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
   }, [])
   const [chartError, setChartError] = useState<{ id: string; message: string } | null>(null)
   const [warmCharts, setWarmCharts] = useState(() => new Map<string, ChartResponse>())
-  const [capture, setCapture] = useState<{ id: string; status: "idle" | "copying" | "flashing" | "failed"; error: string }>({ id: instId, status: "idle", error: "" })
+  const [capture, setCapture] = useState<{ id: string; status: "idle" | "copying" | "flashing" | "failed"; error: string }>({ id: cacheKey, status: "idle", error: "" })
   const chartRef = useRef<HTMLElement>(null)
   const plotRef = useRef<HTMLDivElement>(null)
   const navigationId = useRef(instId)
@@ -452,21 +459,23 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
   const next = chartNavigationTarget(listOrder, turnoverOrder, instId, "ArrowDown")
   const beforePrevious = listPosition < 0 ? undefined : wrappedMarket(listOrder, listPosition - 2)
   const afterNext = listPosition < 0 ? undefined : wrappedMarket(listOrder, listPosition + 2)
-  const historicalEnd = windowEnd?.id === instId ? windowEnd.hour : null
-  const chart = chartCache.get(instId)?.data ?? (displayed?.id === instId ? displayed.data : null) ?? warmCharts.get(instId) ?? null
+  const historicalEnd = windowEnd?.id === cacheKey ? windowEnd.hour : null
+  const chart = chartCache.get(cacheKey)?.data ?? (displayed?.id === cacheKey ? displayed.data : null) ?? warmCharts.get(cacheKey) ?? null
   const cachedBars = useMemo(() => {
-    return mergeChartBars(chart, historyBars?.id === instId ? historyBars.data : null)
-  }, [chart, historyBars, instId])
+    return mergeChartBars(chart, historyBars?.id === cacheKey ? historyBars.data : null)
+  }, [chart, historyBars, cacheKey])
   const oldestCachedHour = cachedBars[0]?.hour ?? Infinity
-  const error = chartError?.id === instId ? chartError.message : chart?.error ?? ""
-  const captureStatus = capture.id === instId ? capture.status : "idle"
-  const captureError = capture.id === instId ? capture.error : ""
+  const error = chartError?.id === cacheKey ? chartError.message : chart?.error ?? ""
+  const captureStatus = capture.id === cacheKey ? capture.status : "idle"
+  const captureError = capture.id === cacheKey ? capture.error : ""
   useEffect(() => {
     requestedHistoryEnds.current.clear()
     for (const timer of historyRetryTimers.current.values()) window.clearTimeout(timer)
     historyRetryTimers.current.clear(); historyRetryAttempts.current.clear()
-    setHistoryBars(null); setHistoryBoundary(null)
-  }, [instId, chart?.serviceSession])
+    windowEndRef.current = null
+    setWindowEnd(null); setInspection(null)
+    setHistoryBars(null); setHistoryBoundary(null); setHistoryLoading(null)
+  }, [cacheKey, chart?.serviceSession])
   useEffect(() => () => { for (const timer of historyRetryTimers.current.values()) window.clearTimeout(timer) }, [])
   useEffect(() => {
     if (capture.status !== "flashing") return
@@ -476,12 +485,12 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
   const captureChart = async () => {
     const rect = chartRef.current?.getBoundingClientRect()
     if (!rect || rect.width <= 0 || rect.height <= 0) return
-    setCapture({ id: instId, status: "copying", error: "" })
+    setCapture({ id: cacheKey, status: "copying", error: "" })
     try {
       await window.webkit.messageHandlers.radar.postMessage({ captureChart: chartCaptureBounds(chartRef.current!) })
-      setCapture({ id: instId, status: "flashing", error: "" })
+      setCapture({ id: cacheKey, status: "flashing", error: "" })
     } catch (cause) {
-      setCapture({ id: instId, status: "failed", error: cause instanceof Error ? cause.message : "Could not copy chart screenshot" })
+      setCapture({ id: cacheKey, status: "failed", error: cause instanceof Error ? cause.message : "Could not copy chart screenshot" })
     }
   }
   const warmChart = useCallback((id: string, data: ChartResponse, deferred = true) => {
@@ -520,12 +529,12 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
       document.removeEventListener("visibilitychange", endWhenHidden)
       endInspection()
     }
-  }, [instId, endInspection])
+  }, [cacheKey, endInspection])
   useEffect(() => {
     if (historicalEnd === null) return
-    const needsCandles = chartHistoryNeedsLoad(historicalEnd, oldestCachedHour)
-    const needsStats = chartStatsNeedLoad(cachedBars, historicalEnd)
-    const key = `${instId}:${historicalEnd}`
+    const needsCandles = chartHistoryNeedsLoad(historicalEnd, oldestCachedHour, 96, 48, intervalMS)
+    const needsStats = timeframe === '1H' && chartStatsNeedLoad(cachedBars, historicalEnd, 96, intervalMS)
+    const key = `${cacheKey}:${historicalEnd}`
     // A buffered response can satisfy many adjacent viewport positions. Failed
     // or partial attempts are released by the bounded automatic retry timer.
     if ((!needsCandles && !needsStats) || requestedHistoryEnds.current.has(key)) return
@@ -543,83 +552,83 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
     }
     setHistoryLoading(key)
     void (async () => {
-      try { await historyRequests.current.get(instId) } catch { /* retry the newest position */ }
-      if (stopped || windowEndRef.current?.id !== instId || windowEndRef.current.hour !== historicalEnd) return
+       try { await historyRequests.current.get(cacheKey) } catch { /* retry the newest position */ }
+       if (stopped || windowEndRef.current?.id !== cacheKey || windowEndRef.current.hour !== historicalEnd) return
       requestedHistoryEnds.current.add(key)
-      const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, chartEndHour: historicalEnd })
-      historyRequests.current.set(instId, request)
+       const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, timeframe, chartEndHour: historicalEnd })
+       historyRequests.current.set(cacheKey, request)
       try {
         const result = await request
-        if (chartOrders.get(instId)?.isRetiredSession(result.serviceSession)) {
+         if (chartOrders.get(cacheKey)?.isRetiredSession(result.serviceSession)) {
           requestedHistoryEnds.current.delete(key)
           if (!stopped) { setHistoryLoading(null); setHistoryRetry(value => value + 1) }
           return
         }
         if (!("unchanged" in result) && result.historyExhausted && result.oldestHour !== null && result.oldestHour !== undefined) {
           const oldestHour = result.oldestHour
-          setHistoryBoundary(current => current?.id === instId && current.oldestHour === oldestHour ? current : { id: instId, oldestHour })
+           setHistoryBoundary(current => current?.id === cacheKey && current.oldestHour === oldestHour ? current : { id: cacheKey, oldestHour })
         }
         // Keep a completed buffered page even when the user continued scrolling
         // while it was in flight. The next viewport can usually be rendered from
         // the same page; discarding it caused a blank chart and a duplicate native
         // download for every wheel movement.
-        if (windowEndRef.current?.id !== instId || "unchanged" in result) return
+         if (windowEndRef.current?.id !== cacheKey || "unchanged" in result) return
         setHistoryBars(current => {
-          const merged = mergeChartBars(result, current?.id === instId ? current.data : null)
-          const first = historicalEnd - 499 * 3_600_000
-          const last = historicalEnd + 249 * 3_600_000
-          return { id: instId, data: { ...result, bars: merged.filter(bar => bar.hour >= first && bar.hour <= last) } }
+           const merged = mergeChartBars(result, current?.id === cacheKey ? current.data : null)
+           const first = historicalEnd - 499 * intervalMS
+           const last = historicalEnd + 249 * intervalMS
+           return { id: cacheKey, data: { ...result, bars: merged.filter(bar => bar.hour >= first && bar.hour <= last) } }
         })
         endInspection()
         if (!stopped && windowEndRef.current?.hour === historicalEnd && result.endHour !== undefined && result.endHour !== historicalEnd) {
-          const latestHour = chartCache.get(instId)?.data.bars.at(-1)?.hour ?? result.bars.at(-1)?.hour ?? result.endHour
-          const next = result.endHour >= latestHour ? null : { id: instId, hour: result.endHour }
+           const latestHour = chartCache.get(cacheKey)?.data.bars.at(-1)?.hour ?? result.bars.at(-1)?.hour ?? result.endHour
+           const next = result.endHour >= latestHour ? null : { id: cacheKey, hour: result.endHour }
           windowEndRef.current = next
           setWindowEnd(next)
         }
-        setChartError({ id: instId, message: result.error })
+         setChartError({ id: cacheKey, message: result.error })
         setHistoryLoading(null)
         if (result.error) retryAutomatically()
         else historyRetryAttempts.current.delete(key)
       } catch (cause) {
-        if (!stopped && windowEndRef.current?.id === instId && windowEndRef.current.hour === historicalEnd) {
-          setChartError({ id: instId, message: cause instanceof Error ? cause.message : "Cannot load history" })
+         if (!stopped && windowEndRef.current?.id === cacheKey && windowEndRef.current.hour === historicalEnd) {
+           setChartError({ id: cacheKey, message: cause instanceof Error ? cause.message : "Cannot load history" })
           setHistoryLoading(null)
         }
         retryAutomatically()
       } finally {
-        if (historyRequests.current.get(instId) === request) historyRequests.current.delete(instId)
+         if (historyRequests.current.get(cacheKey) === request) historyRequests.current.delete(cacheKey)
       }
     })()
     return () => { stopped = true }
-  }, [instId, historicalEnd, oldestCachedHour, cachedBars, historyRetry, endInspection])
+  }, [instId, cacheKey, timeframe, intervalMS, historicalEnd, oldestCachedHour, cachedBars, historyRetry, endInspection])
   useEffect(() => {
     wheelPixels.current = 0
     if (wheelFrame.current !== null) window.cancelAnimationFrame(wheelFrame.current)
     wheelFrame.current = null
-  }, [instId])
+  }, [cacheKey])
   useEffect(() => {
     let stopped = false, timer: number, loadTimer: number
-    let lastLoad = chartCache.get(instId)?.loadedAt ?? 0
-    let hydrationError = chartCache.get(instId)?.data.error ?? ''
+    let lastLoad = chartCache.get(cacheKey)?.loadedAt ?? 0
+    let hydrationError = chartCache.get(cacheKey)?.data.error ?? ''
     let backoff = 2000
-    const order = chartOrders.get(instId) ?? new SnapshotOrder()
-    chartOrders.set(instId, order)
+    const order = chartOrders.get(cacheKey) ?? new SnapshotOrder()
+    chartOrders.set(cacheKey, order)
     const show = (data: ChartResponse) => {
-      if (windowEndRef.current?.id !== instId) setDisplayed({ id: instId, data })
-      warmChart(instId, data, false)
+      if (windowEndRef.current?.id !== cacheKey) setDisplayed({ id: cacheKey, data })
+      warmChart(cacheKey, data, false)
     }
     const showError = (message: string) => {
-      if (windowEndRef.current?.id !== instId) setChartError(current => current?.id === instId && current.message === message ? current : { id: instId, message })
+      if (windowEndRef.current?.id !== cacheKey) setChartError(current => current?.id === cacheKey && current.message === message ? current : { id: cacheKey, message })
     }
     // Network hydration has its own clock. Snapshot polling continues while
     // an independent source is waiting, timing out, or retrying.
     const hydrate = async () => {
       await pageVisible(); if (stopped) return
       try {
-        const data = await loadChart(instId)
+        const data = await loadChart(instId, timeframe)
         if (stopped) return
-        lastLoad = chartCache.get(instId)?.loadedAt ?? Date.now()
+        lastLoad = chartCache.get(cacheKey)?.loadedAt ?? Date.now()
         hydrationError = data.error
         show(data); showError(hydrationError)
       } catch (cause) {
@@ -632,10 +641,10 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
     const refresh = async () => {
       await pageVisible(); if (stopped) return
       try {
-        const result = await window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, sinceRevision: order.revision, serviceSession: order.serviceSession })
+        const result = await window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, timeframe, sinceRevision: order.revision, serviceSession: order.serviceSession })
         if (stopped) return
         if (order.isCurrent(result)) {
-          if (!("unchanged" in result)) show(rememberChart(instId, result, lastLoad))
+          if (!("unchanged" in result)) show(rememberChart(cacheKey, result, lastLoad))
           showError([...new Set([hydrationError, result.error].filter(Boolean))].join(' '))
         }
         backoff = 2000
@@ -650,19 +659,20 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
     loadTimer = window.setTimeout(hydrate, hydrationError ? 0 : Math.max(0, 60_000 - (Date.now() - lastLoad)))
     void refresh()
     return () => { stopped = true; window.clearTimeout(timer); window.clearTimeout(loadTimer) }
-  }, [instId, warmChart])
+  }, [instId, cacheKey, timeframe, warmChart])
 
   useEffect(() => {
     let stopped = false
     for (const id of new Set([beforePrevious, previous, next, afterNext, listOrder[0], turnoverOrder[0]])) {
       if (!id || id === instId) continue
-      void previewChart(id).then(data => { if (!stopped) warmChart(id, data) }).catch(() => {})
-      if ((id === previous || id === next) && !chartCache.get(id)?.loadedAt) {
-        void loadChart(id).then(data => { if (!stopped) warmChart(id, data) }).catch(() => {})
+      const neighborKey = chartKey(id, timeframe)
+      void previewChart(id, timeframe).then(data => { if (!stopped) warmChart(neighborKey, data) }).catch(() => {})
+      if ((id === previous || id === next) && !chartCache.get(neighborKey)?.loadedAt) {
+        void loadChart(id, timeframe).then(data => { if (!stopped) warmChart(neighborKey, data) }).catch(() => {})
       }
     }
     return () => { stopped = true }
-  }, [instId, beforePrevious, previous, next, afterNext, listOrder, turnoverOrder, warmChart])
+  }, [instId, timeframe, beforePrevious, previous, next, afterNext, listOrder, turnoverOrder, warmChart])
 
   useEffect(() => {
     const navigate = (event: KeyboardEvent) => {
@@ -688,10 +698,10 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
   }, [listOrder, turnoverOrder, onSelect])
 
   const viewportEnd = historicalEnd ?? chart?.bars.at(-1)?.hour ?? 0
-  const bars = useMemo(() => visibleChartBars(cachedBars, viewportEnd), [cachedBars, viewportEnd])
-  const rankedMoveSignals = useMemo(() => capturePriceMoves(bars, 1, moveMode, moveObjective, moveEfficiencyFactor), [bars, moveMode, moveObjective, moveEfficiencyFactor])
+  const bars = useMemo(() => visibleChartBars(cachedBars, viewportEnd, intervalMS), [cachedBars, viewportEnd, intervalMS])
+  const rankedMoveSignals = useMemo(() => capturePriceMoves(bars, 1, moveMode, moveObjective, moveEfficiencyFactor, intervalMS), [bars, moveMode, moveObjective, moveEfficiencyFactor, intervalMS])
   const visibleMoveSignals = showMoveLabels ? rankedMoveSignals : []
-  const inspectedIndex = inspection?.id === instId ? bars.findIndex(bar => bar.hour === inspection.hour) : -1
+  const inspectedIndex = inspection?.id === cacheKey ? bars.findIndex(bar => bar.hour === inspection.hour) : -1
   const inspected = inspectedIndex < 0 ? null : inspectedIndex
   const inspectAt = (target: SVGSVGElement, clientX: number) => {
     const rect = target.getBoundingClientRect()
@@ -701,36 +711,36 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
     const [start, end] = columns.price
     let index = 0
     for (let i = 1; i < bars.length; i++) {
-      if (Math.abs(chartHourX(bars[i].hour, viewportEnd, start, end) - svgX) < Math.abs(chartHourX(bars[index].hour, viewportEnd, start, end) - svgX)) index = i
+      if (Math.abs(chartHourX(bars[i].hour, viewportEnd, start, end, intervalMS) - svgX) < Math.abs(chartHourX(bars[index].hour, viewportEnd, start, end, intervalMS) - svgX)) index = i
     }
     const hour = bars[index].hour
-    setInspection(current => current?.id === instId && current.hour === hour ? current : { id: instId, hour })
+    setInspection(current => current?.id === cacheKey && current.hour === hour ? current : { id: cacheKey, hour })
   }
   const moveHistory = (steps: number) => {
-    const latestHour = chartCache.get(instId)?.data.bars.at(-1)?.hour ?? bars.at(-1)?.hour
+    const latestHour = chartCache.get(cacheKey)?.data.bars.at(-1)?.hour ?? bars.at(-1)?.hour
     if (latestHour === undefined || steps === 0) return
-    const current = windowEndRef.current?.id === instId ? windowEndRef.current.hour : null
+    const current = windowEndRef.current?.id === cacheKey ? windowEndRef.current.hour : null
     // Cached coverage is not the history boundary. Let the viewport move past
     // it so the history-loading effect can fetch older candles. Clamp only
     // after native has explicitly reported that exchange history is exhausted.
-    const oldestAvailableHour = historyBoundary?.id === instId ? historyBoundary.oldestHour : 0
-    const nextHour = scrollChartEnd(current, latestHour, steps, oldestAvailableHour)
+    const oldestAvailableHour = historyBoundary?.id === cacheKey ? historyBoundary.oldestHour : 0
+    const nextHour = scrollChartEnd(current, latestHour, steps, oldestAvailableHour, intervalMS)
     if (nextHour === current) { wheelPixels.current = 0; return }
-    const next = nextHour === null ? null : { id: instId, hour: nextHour }
+    const next = nextHour === null ? null : { id: cacheKey, hour: nextHour }
     windowEndRef.current = next
     startTransition(() => setWindowEnd(next))
     endInspection()
   }
   const active = bars[inspected ?? bars.length - 1]
-  const atHistoryBoundary = historicalEnd !== null && historyBoundary?.id === instId
-    && historicalEnd === Math.min(chart?.bars.at(-1)?.hour ?? historicalEnd, historyBoundary.oldestHour + 95 * 3_600_000)
+  const atHistoryBoundary = historicalEnd !== null && historyBoundary?.id === cacheKey
+    && historicalEnd === Math.min(chart?.bars.at(-1)?.hour ?? historicalEnd, historyBoundary.oldestHour + 95 * intervalMS)
   // Data for neighboring markets remains in warmCharts; mounting their full
   // hidden SVGs would still consume reconciliation, layout and a11y resources.
   const surfaces = new Map<string, ChartResponse>()
   if (bars.length && chart) surfaces.set(instId, { ...chart, bars, endHour: viewportEnd })
   const analyzeChart = (direction: AnalysisDirection) => {
     if (!bars.length || plotSize.width <= 0 || captureStatus === 'copying') return
-    flushSync(() => { setAnalysisOpen(true); setCapture({ id: instId, status: 'idle', error: '' }) })
+    flushSync(() => { setAnalysisOpen(true); setCapture({ id: cacheKey, status: 'idle', error: '' }) })
     void chartAnalysis.analyze(instId, async () => {
       // Let the scaled workspace and chart's ResizeObserver settle before
       // measuring the capture. Native snapshots include only this section.
@@ -749,6 +759,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
       <div className="min-w-0 flex-1">
         <h1 className="truncate text-base font-semibold tracking-tight" title={instId}>{instId.replace(/-SWAP$/, "")}</h1>
       </div>
+      <ToggleGroup type="single" variant="outline" value={timeframe} onValueChange={value => { if (value) onTimeframeChange?.(value as RadarTimeframe) }} aria-label="Chart timeframe">{RADAR_TIMEFRAMES.map(item => <ToggleGroupItem key={item.value} value={item.value}>{item.label}</ToggleGroupItem>)}</ToggleGroup>
       <Button variant="outline" size="sm" disabled={!bars.length || plotSize.width <= 0 || captureStatus === "copying" || analysis?.phase === 'capturing'} onClick={() => { void captureChart() }}><Camera data-icon="inline-start" aria-hidden="true" />{captureStatus === "copying" ? "Copying…" : "Copy chart"}</Button>
       <ButtonGroup aria-label="Chart analysis actions">
         {(['long', 'short'] as const).map(direction => <Button
@@ -759,7 +770,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
         >{analysisBusy && analysis?.direction === direction && <Spinner data-icon="inline-start" />}Analyze {direction === 'long' ? 'Long' : 'Short'}</Button>)}
       </ButtonGroup>
       <span role="status" className="sr-only">{captureStatus === "flashing" ? "Chart copied to clipboard" : ""}</span>
-      <Badge variant="secondary"><Radio data-icon="inline-start" aria-hidden="true" />{historicalEnd !== null ? "History" : active && !active.confirmed ? "Live candle" : "Hourly chart"}</Badge>
+      <Badge variant="secondary"><Radio data-icon="inline-start" aria-hidden="true" />{historicalEnd !== null ? `${timeframeLabel(timeframe)} history` : active && !active.confirmed ? `Live ${timeframeLabel(timeframe)}` : `${timeframeLabel(timeframe)} chart`}</Badge>
       <div className="flex w-36 items-center gap-2" data-price-move-efficiency-factor={moveEfficiencyFactor} title="Efficiency = |change| / periods^factor">
         <label htmlFor="chart-efficiency-factor" className="shrink-0 text-xs text-muted-foreground">Factor</label>
         <Slider id="chart-efficiency-factor" min={0} max={1} step={0.01} value={[moveEfficiencyFactor]} onValueChange={values => setMoveEfficiencyFactor(values[0] ?? 0)} onValueCommit={values => {
@@ -794,7 +805,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
         })
       }}>
         <div className="relative h-full w-full">
-        {bars.length && plotSize.width > 0 ? [...surfaces].map(([id, data]) => <svg key={id} viewBox={`0 0 ${plotSize.width} ${plotSize.height}`} className={cn("absolute inset-0 h-full w-full text-[length:var(--chart-text-size)] select-none focus-visible:outline-2 focus-visible:outline-ring", id !== instId && "hidden")} role="img" tabIndex={id === instId ? 0 : -1} aria-hidden={id !== instId} aria-label={`${id} 96 hour candlestick chart with VWAP14, EMA200 and Log BB on a logarithmic price scale; open interest uses a zero-inclusive logarithmic scale, while RSI, ROC, MAROC, and taker volume use linear scales. RSI has a shaded 30 to 70 range and ROC and MAROC have shaded positive and negative areas. Hold the primary mouse button to inspect a candle, drag while holding to inspect others, and release to return to the window end. Scroll to review history; returning to the latest candle resumes automatic following. Up and down arrows follow the visible market list order; left jumps to the first market in the current sorted search results and right jumps to the highest 24-hour turnover market satisfying Settings and applied indicator filters, regardless of search.`} onPointerDown={event => {
+        {bars.length && plotSize.width > 0 ? [...surfaces].map(([id, data]) => <svg key={id} viewBox={`0 0 ${plotSize.width} ${plotSize.height}`} className={cn("absolute inset-0 h-full w-full text-[length:var(--chart-text-size)] select-none focus-visible:outline-2 focus-visible:outline-ring", id !== instId && "hidden")} role="img" tabIndex={id === instId ? 0 : -1} aria-hidden={id !== instId} aria-label={`${id} 96-candle ${timeframeLabel(timeframe)} chart with VWAP14, EMA200 and Log BB on a logarithmic price scale; open interest and taker volume are available on the 1h timeframe, while RSI, ROC and MAROC use the selected candle interval. RSI has a shaded 30 to 70 range and ROC and MAROC have shaded positive and negative areas. Hold the primary mouse button to inspect a candle, drag while holding to inspect others, and release to return to the window end. Scroll to review history; returning to the latest candle resumes automatic following. Up and down arrows follow the visible market list order; left jumps to the first market in the current sorted search results and right jumps to the highest 24-hour turnover market satisfying Settings and applied indicator filters, regardless of search.`} onPointerDown={event => {
           if (id !== instId || event.button !== 0 || heldPointer.current) return
           event.preventDefault()
           event.currentTarget.setPointerCapture(event.pointerId)
@@ -811,15 +822,15 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
           if (!(event.buttons & 1)) { endInspection(); return }
           inspectAt(event.currentTarget, event.clientX)
         }}>
-          <Plot bars={data.bars} liveBar={chart?.bars.at(-1) ?? data.bars.at(-1)!} inspected={inspected} width={plotSize.width} height={plotSize.height} now={1} endHour={data.endHour ?? data.bars.at(-1)!.hour} moveSignals={visibleMoveSignals} />
-        </svg>) : <p className="flex h-full items-center justify-center text-muted-foreground">{historyLoading?.startsWith(`${instId}:`) ? "Loading history…" : chart ? "No candle data available yet" : "Loading chart…"}</p>}
-        {historicalEnd !== null && historyLoading === `${instId}:${historicalEnd}` && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Loading history…</span>}
+          <Plot bars={data.bars} liveBar={chart?.bars.at(-1) ?? data.bars.at(-1)!} inspected={inspected} width={plotSize.width} height={plotSize.height} now={1} endHour={data.endHour ?? data.bars.at(-1)!.hour} intervalMS={intervalMS} moveSignals={visibleMoveSignals} />
+        </svg>) : <p className="flex h-full items-center justify-center text-muted-foreground">{historyLoading?.startsWith(`${cacheKey}:`) ? "Loading history…" : chart ? "No candle data available yet" : "Loading chart…"}</p>}
+        {historicalEnd !== null && historyLoading === `${cacheKey}:${historicalEnd}` && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Loading history…</span>}
         {atHistoryBoundary && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Start of available history</span>}
         </div>
       </div>
       {captureStatus === "flashing" && <div aria-hidden="true" data-surface="inherited" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
     </section>
-    {analysisOpen && <ChartAnalysisPanel instId={instId} session={analysis} ready={bars.length > 0 && plotSize.width > 0 && captureStatus !== 'copying'} onNew={() => analyzeChart(analysis?.direction ?? 'long')} onClose={() => { chartAnalysis.stop(instId); setAnalysisOpen(false) }} />}
+    {analysisOpen && <ChartAnalysisPanel instId={instId} timeframe={timeframeLabel(timeframe)} session={analysis} ready={bars.length > 0 && plotSize.width > 0 && captureStatus !== 'copying'} onNew={() => analyzeChart(analysis?.direction ?? 'long')} onClose={() => { chartAnalysis.stop(instId); setAnalysisOpen(false) }} />}
     </div>
   </main></ChartWorkspaceViewport>
 }

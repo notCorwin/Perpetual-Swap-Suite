@@ -13,7 +13,9 @@ private let chartMoveLabelsVisibleKey = "chartMoveLabelsVisible"
 private let chartMoveEfficiencyFactorKey = "chartMoveEfficiencyFactor"
 let historicalChartBufferHours = 500
 let historicalChartStatBufferHours = chartHours * 2
-func historicalChartBufferStart(_ end: Int64) -> Int64 { max(0, end - Int64(historicalChartBufferHours - 1) * hourMS) }
+func historicalChartBufferStart(_ end: Int64, intervalMS: Int64 = hourMS) -> Int64 {
+    max(0, end - Int64(historicalChartBufferHours - 1) * intervalMS)
+}
 
 private func numeric(_ value: Any?) -> Double? {
     let result = (value as? String).flatMap(Double.init) ?? (value as? NSNumber)?.doubleValue
@@ -36,9 +38,10 @@ func spreadPercent(_ ticker: [String: Any]) -> Double? {
 
 private func millis() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
 
-func boundedHistoryEnd(_ requested: Int64, oldest: Int64?, exhausted: Bool, latest: Int64) -> Int64 {
+func boundedHistoryEnd(_ requested: Int64, oldest: Int64?, exhausted: Bool, latest: Int64,
+                       intervalMS: Int64 = hourMS) -> Int64 {
     guard exhausted, let oldest else { return requested }
-    return min(latest, max(requested, oldest + Int64(chartHours - 1) * hourMS))
+    return min(latest, max(requested, oldest + Int64(chartHours - 1) * intervalMS))
 }
 
 private struct Market {
@@ -93,11 +96,16 @@ final class Radar {
     private var rows: [String: Market] = [:]
     private var marketOrder: [String] = []
     private var cachedRows: [String: [String: Any]] = [:]
-    private var cachedPeriods: (roc: Int, maroc: Int)?
+    private var cachedPeriods: (roc: Int, maroc: Int, timeframe: CandleTimeframe)?
     private var chartRevisions: [String: Int] = [:]
+    private var fiveMinuteCandles: [String: [Int64: Candle]] = [:]
+    private var fifteenMinuteCandles: [String: [Int64: Candle]] = [:]
     private var candles: [String: [Int64: Candle]] = [:]
     private var emaStates: [String: (Int64, Double)] = [:]
+    private var fiveMinuteCandleRequests: [String: [Int64: ContinuousClock.Instant]] = [:]
     private var candleRequests: [String: [Int64: ContinuousClock.Instant]] = [:]
+    private var pendingFiveMinuteWrites: [String: Set<Int64>] = [:]
+    private var candleHistoryCursors: [String: Int64] = [:]
     private var pendingCandleWrites: [String: Set<Int64>] = [:]
     private var oiHistory: [String: [Int64: OpenInterestObservation]] = [:]
     private var previousOICache: [String: Double] = [:]
@@ -144,6 +152,26 @@ final class Radar {
     private var refreshingInstruments = false
     private var startupError = ""
     private var observedDataVersion: Int64?
+
+    private func periodStart(_ timeframe: CandleTimeframe, now: Int64 = millis()) -> Int64 {
+        timeframe == .oneHour ? hour : timeframe.start(containing: now)
+    }
+
+    private func memoryCandles(_ id: String, timeframe: CandleTimeframe) -> [Int64: Candle] {
+        switch timeframe {
+        case .fiveMinutes: fiveMinuteCandles[id] ?? [:]
+        case .fifteenMinutes: fifteenMinuteCandles[id] ?? [:]
+        case .oneHour: candles[id] ?? [:]
+        }
+    }
+
+    private func setMemoryCandle(_ id: String, _ bar: Candle, timeframe: CandleTimeframe) {
+        switch timeframe {
+        case .fiveMinutes: fiveMinuteCandles[id, default: [:]][bar.hour] = bar
+        case .fifteenMinutes: fifteenMinuteCandles[id, default: [:]][bar.hour] = bar
+        case .oneHour: candles[id, default: [:]][bar.hour] = bar
+        }
+    }
 
     init(defaults: UserDefaults = .standard, storeURL: URL? = nil, session: URLSession = .shared, takerTransport: (any FilterHistoryTransport)? = nil) throws {
         self.session = session
@@ -295,6 +323,7 @@ final class Radar {
 
     func suiteRequest(_ request: [String: Any]) async throws -> [String: Any] {
         let mode = request["mode"] as? String ?? "radar"
+        guard let timeframe = CandleTimeframe(requestValue: request["timeframe"] as? String) else { throw FilterError("Invalid Radar timeframe.") }
         var response = try store.manageSuite(request, mode: mode)
         let action = request["action"] as? String ?? "inventory"
         if ["save", "select", "copy", "delete"].contains(action) {
@@ -309,7 +338,7 @@ final class Radar {
         if action == "preview", let raw = request["profile"] {
             profile = try JSONDecoder().decode(StrategyProfile.self, from: SafeJSON.data(raw))
         } else { profile = try store.selectedSuiteProfile("radar") }
-        if action == "evaluate", let profile, request["instrument"] == nil {
+        if action == "evaluate", timeframe == .oneHour, let profile, request["instrument"] == nil {
             var hasCurrentMaterialization = false
             if let cached = materializedSuite, cached.profileID == profile.id, cached.profileRevision == profile.revision,
                cached.closedKey.hour == hour, cached.closedKey.paused == (monitoringPaused || !running) {
@@ -329,8 +358,8 @@ final class Radar {
         } else if ["evaluate", "preview"].contains(action), let profile {
             let detail = request["instrument"] as? String
             // Drafts may share a revision with different rules; only the saved selection is cached.
-            let key = action == "evaluate" ? try closedEvaluationKey(profile) : nil
-            let hydration = try profile.hydration(), captured = try await calculateSnapshot(rocPeriod: 9, marocPeriod: 9)
+            let key = action == "evaluate" && timeframe == .oneHour ? try closedEvaluationKey(profile) : nil
+            let hydration = try profile.hydration(), captured = try await calculateSnapshot(rocPeriod: 9, marocPeriod: 9, timeframe: timeframe)
             let prepared = try await prepareFilterMarkets(captured, filter: hydration)
             let provisional = try await suiteWorker.evaluate(prepared, profile: profile, forming: true, available: running && !monitoringPaused, detail: detail)
             let confirmed: [SuiteReading]
@@ -355,6 +384,7 @@ final class Radar {
         // resume something that is already recovering automatically.
         response["paused"] = monitoringPaused
         response["recovering"] = !monitoringPaused && !running
+        response["timeframe"] = timeframe.rawValue
         return response
     }
 
@@ -412,7 +442,8 @@ final class Radar {
         var reference: FilterReferenceSnapshot?
         if filter.referencesBTC {
             let sourceLoader = monitoring ? monitorBTCHistoryLoader : btcHistoryLoader
-            let original = captured.markets.first { $0.id == btcReferenceID } ?? FilterMarketData(id: btcReferenceID, hour: hour, now: millis(), listedAt: rows[btcReferenceID]?.listedAt, candles: candles[btcReferenceID] ?? [:], stats: [:], quotes: [:])
+            let timeframe = CandleTimeframe(milliseconds: captured.markets.first?.intervalMS ?? hourMS) ?? .oneHour
+            let original = captured.markets.first { $0.id == btcReferenceID } ?? FilterMarketData(id: btcReferenceID, hour: periodStart(timeframe), now: millis(), intervalMS: timeframe.milliseconds, listedAt: rows[btcReferenceID]?.listedAt, candles: memoryCandles(btcReferenceID, timeframe: timeframe), stats: [:], quotes: [:])
             let sources = try await sourceLoader.prepare([original], filter: filter.btcHydration)
             if running { await sourceLoader.schedule(sources, filter: filter.btcHydration) }
             if let source = sources.first { reference = FilterReferenceSnapshot(market: source, receivedAt: captured.response["btcReceivedAt"] as? Int64, connected: captured.response["btcConnected"] as? Bool == true) }
@@ -422,7 +453,8 @@ final class Radar {
         }
         return prepared
     }
-    func previewMarketFilters(filtersJSON: String, token: String, atClose: Bool = false, strategyID: String? = nil) async throws -> [String: Any] {
+    func previewMarketFilters(filtersJSON: String, token: String, atClose: Bool = false, strategyID: String? = nil,
+                              timeframe: CandleTimeframe = .oneHour) async throws -> [String: Any] {
         var compiled = try compiledFilter(filtersJSON)
         if atClose {
             compiled.requiredHours += 1
@@ -433,7 +465,7 @@ final class Radar {
             emaStates.removeValue(forKey: id)
             invalidateSnapshot(id); touch(id)
         }
-        let captured = try await calculateSnapshot(rocPeriod: 9, marocPeriod: 9)
+        let captured = try await calculateSnapshot(rocPeriod: 9, marocPeriod: 9, timeframe: timeframe)
         var response = captured.response
         let prepared = try await prepareFilterMarkets(captured, filter: compiled)
         try Task.checkCancellation()
@@ -467,13 +499,14 @@ final class Radar {
 
     func monitoringStrategy() throws -> StrategyProfile? { try store.selectedSuiteProfile("radar") }
 
-    func explainMarketFilters(instId: String, filtersJSON: String, token: String, atClose: Bool = false, strategyID: String? = nil) async throws -> [String: Any] {
+    func explainMarketFilters(instId: String, filtersJSON: String, token: String, atClose: Bool = false, strategyID: String? = nil,
+                              timeframe: CandleTimeframe = .oneHour) async throws -> [String: Any] {
         var compiled = try compiledFilter(filtersJSON)
         if atClose {
             compiled.requiredHours += 1
             if compiled.btcClocks.contains("aligned") { compiled.btcRequirements?.hours += 1 }
         }
-        let captured = try await calculateSnapshot(rocPeriod: 9, marocPeriod: 9)
+        let captured = try await calculateSnapshot(rocPeriod: 9, marocPeriod: 9, timeframe: timeframe)
         guard let original = captured.markets.first(where: { $0.id == instId }) else { throw FilterError("Unknown contract.") }
         let prepared = try await prepareFilterMarkets(captured, filter: compiled)
         guard let market = prepared.first(where: { $0.id == original.id }) else { throw FilterError("Contract data is unavailable.") }
@@ -532,7 +565,7 @@ final class Radar {
             return
         }
         sockets.forEach { $0.cancel(with: .goingAway, reason: nil) }
-        disconnectedChannels.formUnion(["tickers", "open-interest", "candle1H"])
+        disconnectedChannels.formUnion(["tickers", "open-interest", "candle5m"])
         advanceHourIfNeeded()
         startHistoryScans()
         Task { [weak self] in await self?.refreshInstruments(); await self?.refreshTickers() }
@@ -547,7 +580,7 @@ final class Radar {
                 let items = try decodeRows(instrumentData, path: "/public/instruments")
                 let tickers = try decodeRows(tickerData, path: "/market/tickers")
                 try initializeMarkets(instruments: items, tickers: tickers)
-                disconnectedChannels.formUnion(["tickers", "open-interest", "candle1H"])
+                disconnectedChannels.formUnion(["tickers", "open-interest", "candle5m"])
                 startupError = ""; touch()
                 tasks.append(Task { [weak self] in
                     guard let self else { return }
@@ -559,7 +592,7 @@ final class Radar {
                 tasks.append(Task { [weak self] in await self?.pollTakerVolumes() })
                 tasks.append(Task { [weak self] in await self?.websocket(publicWS, channel: "open-interest") })
                 tasks.append(Task { [weak self] in await self?.websocket(publicWS, channel: "tickers") })
-                tasks.append(Task { [weak self] in await self?.websocket(businessWS, channel: "candle1H") })
+                tasks.append(Task { [weak self] in await self?.websocket(businessWS, channel: "candle5m") })
                 tasks.append(Task { [weak self] in await self?.pollTickers() })
                 tasks.append(Task { [weak self] in await self?.pollInstruments() })
                 tasks.append(Task { [weak self] in await self?.clock() })
@@ -587,6 +620,8 @@ final class Radar {
         try updateTickers(tickers)
         let cached = try store.load(hour: hour, ids: Set(rows.keys))
         candles = cached.candles; emaStates = cached.ema
+        fiveMinuteCandles = try store.loadCandles(endingAt: periodStart(.fiveMinutes), ids: Set(rows.keys), timeframe: .fiveMinutes)
+        fifteenMinuteCandles = try store.loadCandles(endingAt: periodStart(.fifteenMinutes), ids: Set(rows.keys), timeframe: .fifteenMinutes)
     }
 
     private func pollTakerVolumes() async {
@@ -691,7 +726,10 @@ final class Radar {
             failedPaths.remove("/public/instruments")
             for id in removed {
                 rows.removeValue(forKey: id); candles.removeValue(forKey: id)
+                fiveMinuteCandles.removeValue(forKey: id); fifteenMinuteCandles.removeValue(forKey: id)
                 emaStates.removeValue(forKey: id); candleRequests.removeValue(forKey: id)
+                fiveMinuteCandleRequests.removeValue(forKey: id); pendingFiveMinuteWrites.removeValue(forKey: id)
+                candleHistoryCursors.removeValue(forKey: id)
                 pendingCandleWrites.removeValue(forKey: id)
                 oiHistory.removeValue(forKey: id); oiHistoryRequests.removeValue(forKey: id)
                 liveHourQuotes.removeValue(forKey: id); closedHourQuotes.removeValue(forKey: id)
@@ -704,11 +742,17 @@ final class Radar {
                 rows[id] = Market(id: id, listedAt: instruments[id]?.listedAt)
                 candles[id] = cached?.candles[id]; emaStates[id] = cached?.ema[id]
             }
+            if !added.isEmpty {
+                let current5m = periodStart(.fiveMinutes), current15m = periodStart(.fifteenMinutes)
+                let five = try store.loadCandles(endingAt: current5m, ids: added, timeframe: .fiveMinutes)
+                let fifteen = try store.loadCandles(endingAt: current15m, ids: added, timeframe: .fifteenMinutes)
+                for id in added { fiveMinuteCandles[id] = five[id]; fifteenMinuteCandles[id] = fifteen[id] }
+            }
             marketOrder = rows.keys.sorted()
             touch()
             // Existing socket loops reconnect and subscribe to the new universe.
             sockets.forEach { $0.cancel(with: .goingAway, reason: nil) }
-            disconnectedChannels.formUnion(["tickers", "open-interest", "candle1H"])
+            disconnectedChannels.formUnion(["tickers", "open-interest", "candle5m"])
             startHistoryScans()
             await refreshTickers()
         } catch {
@@ -792,6 +836,113 @@ final class Radar {
         return settled
     }
 
+    private func refreshAggregates(_ id: String, sourceHours: Set<Int64>) {
+        guard !sourceHours.isEmpty else { return }
+        for timeframe in [CandleTimeframe.fifteenMinutes, .oneHour] {
+            for start in Set(sourceHours.map { timeframe.start(containing: $0) }) {
+                let end = start + timeframe.milliseconds - fiveMinuteMS
+                var source = (try? store.candles(id, since: start, through: end, timeframe: .fiveMinutes)) ?? [:]
+                for (timestamp, bar) in fiveMinuteCandles[id] ?? [:] where timestamp >= start && timestamp <= end {
+                    source[timestamp] = bar
+                }
+                let allowIncomplete = start == periodStart(timeframe)
+                guard let aggregate = aggregateFiveMinuteCandle(source, startingAt: start, timeframe: timeframe,
+                                                                 allowIncomplete: allowIncomplete) else { continue }
+                let old = memoryCandles(id, timeframe: timeframe)[start]
+                guard old?.confirmed != true || aggregate.confirmed else { continue }
+                if old != aggregate {
+                    setMemoryCandle(id, aggregate, timeframe: timeframe)
+                    if timeframe == .oneHour, aggregate.confirmed { emaStates.removeValue(forKey: id) }
+                }
+            }
+        }
+    }
+
+    private func applyPersistedAggregates(_ id: String, _ values: [CandleTimeframe: [Candle]]) {
+        for timeframe in [CandleTimeframe.fifteenMinutes, .oneHour] {
+            for bar in values[timeframe] ?? [] {
+                let old = memoryCandles(id, timeframe: timeframe)[bar.hour]
+                if old != bar { setMemoryCandle(id, bar, timeframe: timeframe) }
+                if timeframe == .oneHour, old != bar { emaStates.removeValue(forKey: id) }
+            }
+        }
+    }
+
+    /// Applies one authoritative OKX 5m observation and locally rebuilds its
+    /// naturally aligned 15m and 1h buckets. Repeated live frames replace the
+    /// source candle, so cumulative volume is never double-counted.
+    @discardableResult
+    func updateFiveMinuteCandle(_ id: String, _ values: [String], persist: Bool = true,
+                                requestedAt: ContinuousClock.Instant = .now) -> Candle? {
+        guard rows[id] != nil, let bar = Candle(values, alignment: fiveMinuteMS),
+              bar.hour >= hour - Int64(candleLookback) * hourMS else { return nil }
+        let old = fiveMinuteCandles[id]?[bar.hour]
+        guard old?.confirmed != true || bar.confirmed else { return nil }
+        guard fiveMinuteCandleRequests[id]?[bar.hour].map({ requestedAt >= $0 }) ?? true else { return nil }
+        if !bar.confirmed, let old, let volume = old.baseVolume, let next = bar.baseVolume, next < volume { return nil }
+        fiveMinuteCandleRequests[id, default: [:]][bar.hour] = requestedAt
+        guard old != bar || pendingFiveMinuteWrites[id]?.contains(bar.hour) == true else { return nil }
+        fiveMinuteCandles[id, default: [:]][bar.hour] = bar
+        var needsLiveRefresh = !bar.confirmed || !persist
+        if bar.confirmed && persist {
+            do {
+                let derived = try store.ingestFiveMinuteCandles(id, [bar])
+                applyPersistedAggregates(id, derived)
+                pendingFiveMinuteWrites[id]?.remove(bar.hour)
+                needsLiveRefresh = [CandleTimeframe.fifteenMinutes, .oneHour].contains { $0.start(containing: bar.hour) == periodStart($0) }
+            } catch {
+                pendingFiveMinuteWrites[id, default: []].insert(bar.hour)
+                NSLog("5m candle cache %@: %@", id, error.localizedDescription)
+            }
+        }
+        if needsLiveRefresh { refreshAggregates(id, sourceHours: [bar.hour]) }
+        invalidateSnapshot(id); touch(id)
+        return bar
+    }
+
+    func updateHistoricalFiveMinuteCandles(_ id: String, _ result: [Any],
+                                            requestedAt: ContinuousClock.Instant = .now) throws {
+        guard rows[id] != nil else { return }
+        let previousFive = fiveMinuteCandles[id], previousFifteen = fifteenMinuteCandles[id]
+        let previousHourly = candles[id], previousRequests = fiveMinuteCandleRequests[id]
+        let previousEMA = emaStates[id], previousRow = cachedRows[id]
+        let previousUpdatedAt = updatedAt, previousRevision = revision, previousChartRevision = chartRevisions[id]
+        var accepted: [Candle] = []
+        for case let values as [String] in result {
+            guard let bar = Candle(values, alignment: fiveMinuteMS),
+                  bar.hour >= hour - Int64(candleLookback) * hourMS else { continue }
+            let old = fiveMinuteCandles[id]?[bar.hour]
+            guard old?.confirmed != true || bar.confirmed,
+                  fiveMinuteCandleRequests[id]?[bar.hour].map({ requestedAt >= $0 }) ?? true else { continue }
+            if !bar.confirmed, let old, let volume = old.baseVolume, let next = bar.baseVolume, next < volume { continue }
+            fiveMinuteCandleRequests[id, default: [:]][bar.hour] = requestedAt
+            guard old != bar || pendingFiveMinuteWrites[id]?.contains(bar.hour) == true else { continue }
+            fiveMinuteCandles[id, default: [:]][bar.hour] = bar
+            accepted.append(bar)
+        }
+        guard !accepted.isEmpty else { return }
+        do {
+            let confirmed = accepted.filter(\.confirmed)
+            var liveHours = Set(accepted.filter { !$0.confirmed }.map(\.hour))
+            if !confirmed.isEmpty {
+                let derived = try store.ingestFiveMinuteCandles(id, confirmed)
+                applyPersistedAggregates(id, derived)
+                for bar in confirmed { pendingFiveMinuteWrites[id]?.remove(bar.hour) }
+                for bar in confirmed where [CandleTimeframe.fifteenMinutes, .oneHour].contains(where: { $0.start(containing: bar.hour) == periodStart($0) }) {
+                    liveHours.insert(bar.hour)
+                }
+            }
+            refreshAggregates(id, sourceHours: liveHours)
+            invalidateSnapshot(id); touch(id)
+        } catch {
+            fiveMinuteCandles[id] = previousFive; fifteenMinuteCandles[id] = previousFifteen
+            candles[id] = previousHourly; fiveMinuteCandleRequests[id] = previousRequests
+            emaStates[id] = previousEMA; cachedRows[id] = previousRow
+            updatedAt = previousUpdatedAt; revision = previousRevision; chartRevisions[id] = previousChartRevision
+            throw error
+        }
+    }
+
     func updateHistoricalCandles(_ id: String, _ result: [Any], requestedAt: ContinuousClock.Instant = .now) throws {
         let previousCandles = candles[id]
         let previousRequests = candleRequests[id], previousEMA = emaStates[id]
@@ -828,15 +979,31 @@ final class Radar {
     private func scanMarket(_ path: String, id: String) async -> Bool {
         do {
             let requestedAt = ContinuousClock.now
-            let parameters = path == "/market/candles"
-                ? ["instId": id, "bar": "1H", "limit": historyReady(id) ? "2" : "251"]
-                : ["instId": id, "period": "1H"]
-            let result = try await get(path, parameters)
+            let ready = path == "/market/candles" && historyReady(id)
+            var requestPath = path
+            var parameters: [String: String]
+            if path == "/market/candles" {
+                if !ready, candleHistoryCursors[id] == nil {
+                    candleHistoryCursors[id] = try? store.oldestCandleHour(id, timeframe: .fiveMinutes)
+                }
+                if !ready, let cursor = candleHistoryCursors[id] {
+                    requestPath = "/market/history-candles"
+                    parameters = ["instId": id, "bar": "5m", "after": String(cursor), "limit": "300"]
+                } else {
+                    parameters = ["instId": id, "bar": "5m", "limit": ready ? "24" : "300"]
+                }
+            } else { parameters = ["instId": id, "period": "1H"] }
+            let result = try await get(requestPath, parameters)
             try Task.checkCancellation()
             guard rows[id] != nil else { return true }
             if path == "/market/candles" {
-                try updateHistoricalCandles(id, result, requestedAt: requestedAt)
-                return historyReady(id)
+                try updateHistoricalFiveMinuteCandles(id, result, requestedAt: requestedAt)
+                if let oldest = result.compactMap({ ($0 as? [String])?.first.flatMap(Int64.init) }).min() {
+                    candleHistoryCursors[id] = min(oldest, candleHistoryCursors[id] ?? oldest)
+                } else if requestPath == "/market/history-candles" { exhaustedCandleHistory.insert(id) }
+                let complete = historyReady(id)
+                if complete { candleHistoryCursors.removeValue(forKey: id) }
+                return complete
             }
             return try updateOIHistory(id, result, requestedAt: requestedAt)
         } catch {
@@ -927,14 +1094,14 @@ final class Radar {
                     if !receivedData {
                         receivedData = true
                         disconnectedChannels.remove(channel); touch()
-                        if channel == "candle1H", connectedBefore { startHistoryScans() }
+                        if channel == "candle5m", connectedBefore { startHistoryScans() }
                         connectedBefore = true
                     }
                     for item in items {
                         if channel == "tickers", let value = item as? [String: Any] { try? updateTickers([value]) }
                         if channel == "open-interest", let value = item as? [String: Any] { updateOI(value) }
-                        if channel == "candle1H", let id = arg["instId"], let value = item as? [String] {
-                            if let _ = updateCandle(id, value), id == btcReferenceID { btcReceivedAt = millis() }
+                        if channel == "candle5m", let id = arg["instId"], let value = item as? [String] {
+                            if let _ = updateFiveMinuteCandle(id, value), id == btcReferenceID { btcReceivedAt = millis() }
                         }
                     }
                 }
@@ -973,8 +1140,13 @@ final class Radar {
         for id in takerHistory.keys { takerHistory[id] = takerHistory[id]?.filter { $0.key >= hour - 100 * hourMS } }
         for id in oiHistory.keys { oiHistory[id] = oiHistory[id]?.filter { $0.key >= hour - 100 * hourMS } }
         for id in candleRequests.keys { candleRequests[id] = candleRequests[id]?.filter { $0.key >= hour - Int64(candleLookback) * hourMS } }
+        let fiveMinuteFloor = periodStart(.fiveMinutes) - Int64(candleLookback - 1) * fiveMinuteMS
+        let fifteenMinuteFloor = periodStart(.fifteenMinutes) - Int64(candleLookback - 1) * CandleTimeframe.fifteenMinutes.milliseconds
+        for id in fiveMinuteCandleRequests.keys { fiveMinuteCandleRequests[id] = fiveMinuteCandleRequests[id]?.filter { $0.key >= fiveMinuteFloor } }
         for id in rows.keys {
             rows[id]?.buy = nil; rows[id]?.sell = nil; rows[id]?.takerRatio = nil
+            fiveMinuteCandles[id] = fiveMinuteCandles[id]?.filter { $0.key >= fiveMinuteFloor }
+            fifteenMinuteCandles[id] = fifteenMinuteCandles[id]?.filter { $0.key >= fifteenMinuteFloor }
             candles[id] = candles[id]?.filter { $0.key >= hour - Int64(candleLookback) * hourMS }
         }
         emaStates = emaStates.filter { $0.value.0 >= hour - Int64(candleLookback + 1) * hourMS && $0.value.0 < hour }
@@ -1016,15 +1188,31 @@ final class Radar {
         return state?.1
     }
 
+    private func previousEMA200(_ id: String, timeframe: CandleTimeframe, bars: [Int64: Candle], current: Int64) -> Double? {
+        if timeframe == .oneHour { return ema200(id, bars) }
+        let target = current - timeframe.milliseconds, window = emaWarmupHours(200)
+        var history = bars
+        if let stored = try? store.candles(id, since: max(0, target - Int64(window - 1) * timeframe.milliseconds),
+                                            through: target, timeframe: timeframe) {
+            history.merge(stored) { _, recorded in recorded }
+        }
+        var closes: [Double] = []
+        for age in 0..<window {
+            guard let bar = history[target - Int64(age) * timeframe.milliseconds], bar.confirmed else { break }
+            closes.append(bar.close)
+        }
+        return windowedEMA(closes.reversed(), period: 200)
+    }
+
     private func refreshChartSource(_ id: String, path: String) async -> String? {
         let requestedAt = ContinuousClock.now
         let label = path == "/market/candles" ? "candles" : path.contains("open-interest") ? "OI" : "taker volume"
         do {
             let parameters = path == "/market/candles"
-                ? ["instId": id, "bar": "1H", "limit": "251"] : ["instId": id, "period": "1H"]
+                ? ["instId": id, "bar": "5m", "limit": "300"] : ["instId": id, "period": "1H"]
             let result = try await get(path, parameters)
             try Task.checkCancellation()
-            if path == "/market/candles" { try updateHistoricalCandles(id, result, requestedAt: requestedAt) }
+            if path == "/market/candles" { try updateHistoricalFiveMinuteCandles(id, result, requestedAt: requestedAt) }
             else if path.contains("open-interest") { try updateOIHistory(id, result, requestedAt: requestedAt) }
             else {
                 try updateTakerVolumes(id, result.compactMap { ($0 as? [String]).flatMap(TakerVolume.init) }, requestedAt: requestedAt)
@@ -1044,105 +1232,133 @@ final class Radar {
         return (try? profile.hydration().requiredHours) ?? 0
     }
 
-    func loadChart(_ id: String) async -> [String: Any] {
+    func loadChart(_ id: String, timeframe: CandleTimeframe = .oneHour) async -> [String: Any] {
         guard rows[id] != nil else { return ["bars": [], "error": "Unknown contract", "revision": -1] }
-        let warmup = max(candleLookback, strategyChartHistoryHours())
-        let dataFirst = max(0, hour - Int64(candleLookback - 1 + warmup) * hourMS)
-        _ = try? await historyLoader.importResearch(id, from: dataFirst, through: hour - hourMS)
+        if timeframe == .oneHour {
+            let warmup = max(candleLookback, strategyChartHistoryHours())
+            let dataFirst = max(0, hour - Int64(candleLookback - 1 + warmup) * hourMS)
+            _ = try? await historyLoader.importResearch(id, from: dataFirst, through: hour - hourMS)
+        }
         // Each child publishes immediately; a slow source cannot withhold an
         // already-completed update from snapshot polling or strategy readings.
         async let candles = refreshChartSource(id, path: "/market/candles")
         async let oi = refreshChartSource(id, path: "/rubik/stat/contracts/open-interest-history")
         async let taker = refreshChartSource(id, path: "/rubik/stat/taker-volume-contract")
-        let failures = await [candles, oi, taker].compactMap { $0 }
+        var failures = await [candles, oi, taker].compactMap { $0 }
+        if timeframe == .oneHour {
+            do {
+                let lastClosedSource = periodStart(.fiveMinutes) - fiveMinuteMS
+                try await hydrateFiveMinuteRange(id, from: max(0, hour - Int64(chartHours) * hourMS), through: lastClosedSource, maxPages: 3)
+            } catch { failures.append("candle history") }
+        }
         // The cache/import step above already prepares a much wider candle
         // range. Return it on the first load so ordinary scrolling stays local
         // instead of immediately entering the paginated history path.
-        var result = chartSnapshot(id, outputHours: historicalChartBufferHours)
+        var result = chartSnapshot(id, outputHours: historicalChartBufferHours, timeframe: timeframe)
         if !failures.isEmpty { result["error"] = "Some chart data is unavailable: \(failures.joined(separator: ", "))." }
         return result
     }
 
-    func loadHistoricalChart(_ id: String, endingAt requestedEnd: Int64) async -> [String: Any] {
-        guard rows[id] != nil, requestedEnd >= 0, requestedEnd <= hour, requestedEnd % hourMS == 0 else {
+    private func hydrateFiveMinuteRange(_ id: String, from: Int64, through: Int64, maxPages: Int) async throws {
+        guard from <= through, maxPages > 0 else { return }
+        var source = try store.candles(id, since: from, through: through, timeframe: .fiveMinutes)
+        for (timestamp, bar) in fiveMinuteCandles[id] ?? [:] where timestamp >= from && timestamp <= through { source[timestamp] = bar }
+        var pages = 0
+        while pages < maxPages, !exhaustedCandleHistory.contains(id) {
+            let newestMissing = stride(from: through, through: from, by: -Int(fiveMinuteMS)).first { source[$0]?.confirmed != true }
+            guard let missing = newestMissing else { break }
+            let before = missing + fiveMinuteMS
+            let values = try await get("/market/history-candles", ["instId": id, "bar": "5m", "after": String(before), "limit": "300"])
+            let fetched = historicalPage(values, before: before, alignment: fiveMinuteMS)
+            guard let oldest = fetched.map(\.hour).min(), oldest < before else {
+                if values.isEmpty { exhaustedCandleHistory.insert(id) }
+                else { throw FilterError("OKX returned an invalid 5m candle page; retrying.") }
+                break
+            }
+            let derived = try store.ingestFiveMinuteCandles(id, fetched)
+            for bar in fetched { source[bar.hour] = bar }
+            let rawFloor = periodStart(.fiveMinutes) - Int64(candleLookback - 1) * fiveMinuteMS
+            for bar in fetched where bar.hour >= rawFloor { fiveMinuteCandles[id, default: [:]][bar.hour] = bar }
+            for timeframe in [CandleTimeframe.fifteenMinutes, .oneHour] {
+                let floor = periodStart(timeframe) - Int64(candleLookback - 1) * timeframe.milliseconds
+                for bar in derived[timeframe] ?? [] where bar.hour >= floor { setMemoryCandle(id, bar, timeframe: timeframe) }
+            }
+            pages += 1
+            if oldest <= from { break }
+        }
+        if pages > 0 { emaStates.removeValue(forKey: id); invalidateSnapshot(id); touch(id) }
+    }
+
+    func loadHistoricalChart(_ id: String, endingAt requestedEnd: Int64,
+                             timeframe: CandleTimeframe = .oneHour) async -> [String: Any] {
+        let interval = timeframe.milliseconds, latest = periodStart(timeframe)
+        guard rows[id] != nil, requestedEnd >= 0, requestedEnd <= latest, requestedEnd % interval == 0 else {
             return ["bars": [], "error": "Invalid chart time", "revision": -1]
         }
         var failures: [String] = []
         var candleLoadFailed = false
-        let warmup = max(candleLookback, strategyChartHistoryHours())
-        let bufferedFirst = historicalChartBufferStart(requestedEnd)
-        let warmupStart = max(0, bufferedFirst - Int64(warmup) * hourMS)
+        let strategyWarmup = timeframe == .oneHour ? strategyChartHistoryHours() : 0
+        let warmup = max(emaWarmupHours(200), strategyWarmup)
+        let bufferedFirst = historicalChartBufferStart(requestedEnd, intervalMS: interval)
+        let warmupStart = max(0, bufferedFirst - Int64(warmup) * interval)
         do {
-            _ = try? await historyLoader.importResearch(id, from: warmupStart, through: requestedEnd)
-            var cached = try store.candles(id, since: warmupStart, through: requestedEnd)
-            for (ts, bar) in candles[id] ?? [:] where ts >= warmupStart && ts <= requestedEnd { cached[ts] = bar }
-            var cursor: Int64?
-            for ts in stride(from: requestedEnd, through: warmupStart, by: -Int(hourMS)) where ts < hour {
-                if cached[ts]?.confirmed != true || cached[ts]?.open == nil || cached[ts]?.baseVolume == nil { cursor = ts + hourMS; break }
+            if timeframe == .oneHour { _ = try? await historyLoader.importResearch(id, from: warmupStart, through: requestedEnd) }
+            var cached = try store.candles(id, since: warmupStart, through: requestedEnd, timeframe: timeframe)
+            for (ts, bar) in memoryCandles(id, timeframe: timeframe) where ts >= warmupStart && ts <= requestedEnd { cached[ts] = bar }
+            let missing = stride(from: requestedEnd, through: warmupStart, by: -Int(interval)).contains {
+                $0 < latest && (cached[$0]?.confirmed != true || cached[$0]?.open == nil || cached[$0]?.baseVolume == nil)
             }
-            var pages = 0
-            while let next = cursor, next > warmupStart && pages < 5 && !exhaustedCandleHistory.contains(id) {
-                let rows = try await get("/market/history-candles", ["instId": id, "bar": "1H", "after": String(next), "limit": "300"])
-                let fetched = historicalPage(rows, before: next)
-                guard let oldest = fetched.map(\.hour).min() else { exhaustedCandleHistory.insert(id); break }
-                try store.saveCandles(id, fetched)
-                for bar in fetched where bar.hour >= hour - Int64(candleLookback) * hourMS { candles[id, default: [:]][bar.hour] = bar }
-                emaStates.removeValue(forKey: id); invalidateSnapshot(id); touch(id)
-                for bar in fetched { cached[bar.hour] = bar }
-                cursor = oldest
-                pages += 1
-                if oldest <= warmupStart { break }
+            if missing {
+                let rawThrough = min(periodStart(.fiveMinutes) - fiveMinuteMS, requestedEnd + interval - fiveMinuteMS)
+                try await hydrateFiveMinuteRange(id, from: warmupStart, through: rawThrough, maxPages: 5)
             }
         } catch { failures.append("candles"); candleLoadFailed = true }
-        let oldest = (try? store.oldestCandleHour(id)) ?? nil
-        let end = boundedHistoryEnd(requestedEnd, oldest: oldest, exhausted: exhaustedCandleHistory.contains(id), latest: hour)
-        let first = historicalChartBufferStart(end)
-        let statFirst = max(first, end - Int64(historicalChartStatBufferHours - 1) * hourMS)
-        loadedStatPages = loadedStatPages.filter { $0.value.duration(to: .now) < .seconds(900) }
-        if loadedStatPages.count > 4_096 {
-            for key in Array(loadedStatPages.keys.prefix(loadedStatPages.count - 4_096)) { loadedStatPages.removeValue(forKey: key) }
-        }
-        for path in ["/rubik/stat/contracts/open-interest-history", "/rubik/stat/taker-volume-contract"] {
-            for pageStart in stride(from: statFirst / (Int64(chartHours) * hourMS) * Int64(chartHours) * hourMS,
-                                    through: end, by: Int(chartHours) * Int(hourMS)) {
-                let key = "\(id)|\(path)|\(pageStart)"
-                if loadedStatPages[key].map({ $0.duration(to: .now) < .seconds(900) }) == true { continue }
-                let pageEnd = pageStart + Int64(chartHours - 1) * hourMS
-                do {
-                    let firstExpected = max(0, pageStart, (rows[id]?.listedAt ?? 0) / hourMS * hourMS)
-                    let lastExpected = min(pageEnd, hour - hourMS)
-                    let existing = try store.chartStats(id, since: firstExpected, through: lastExpected)
-                    var loaded = Set(existing.compactMap { timestamp, value in
-                        path.contains("open-interest") ? (value.oi == nil || value.oiUSD == nil ? nil : timestamp) : (value.sell == nil || value.buy == nil ? nil : timestamp)
-                    })
-                    if firstExpected > lastExpected || stride(from: firstExpected, through: lastExpected, by: Int(hourMS)).allSatisfy({ loaded.contains($0) }) {
-                        loadedStatPages[key] = .now; continue
-                    }
-                    let values = try await get(path, ["instId": id, "period": "1H", "end": String(pageEnd + hourMS), "limit": "100"])
-                    var updates: [(hour: Int64, oi: Double?, oiUSD: Double?, sell: Double?, buy: Double?)] = []
-                    for case let row as [String] in values {
-                        guard let stamp = row.first.flatMap(Int64.init), stamp >= pageStart, stamp <= pageEnd, stamp < hour else { continue }
-                        if path.contains("open-interest"), row.count >= 4,
-                           let oi = Double(row[1]), let oiUSD = Double(row[3]),
-                           oi.isFinite, oiUSD.isFinite, oi >= 0, oiUSD >= 0 {
-                            updates.append((stamp, oi, oiUSD, nil, nil))
-                            loaded.insert(stamp)
-                        } else if !path.contains("open-interest"), row.count >= 3,
-                                  let sell = Double(row[1]), let buy = Double(row[2]),
-                                  sell.isFinite, buy.isFinite, sell >= 0, buy >= 0 {
-                            updates.append((stamp, nil, nil, sell, buy))
-                            loaded.insert(stamp)
+        let oldest = (try? store.oldestCandleHour(id, timeframe: timeframe)) ?? nil
+        let end = boundedHistoryEnd(requestedEnd, oldest: oldest, exhausted: exhaustedCandleHistory.contains(id), latest: latest, intervalMS: interval)
+        let first = historicalChartBufferStart(end, intervalMS: interval)
+        if timeframe == .oneHour {
+            let statFirst = max(first, end - Int64(historicalChartStatBufferHours - 1) * hourMS)
+            loadedStatPages = loadedStatPages.filter { $0.value.duration(to: .now) < .seconds(900) }
+            if loadedStatPages.count > 4_096 {
+                for key in Array(loadedStatPages.keys.prefix(loadedStatPages.count - 4_096)) { loadedStatPages.removeValue(forKey: key) }
+            }
+            for path in ["/rubik/stat/contracts/open-interest-history", "/rubik/stat/taker-volume-contract"] {
+                for pageStart in stride(from: statFirst / (Int64(chartHours) * hourMS) * Int64(chartHours) * hourMS,
+                                        through: end, by: Int(chartHours) * Int(hourMS)) {
+                    let key = "\(id)|\(path)|\(pageStart)"
+                    if loadedStatPages[key].map({ $0.duration(to: .now) < .seconds(900) }) == true { continue }
+                    let pageEnd = pageStart + Int64(chartHours - 1) * hourMS
+                    do {
+                        let firstExpected = max(0, pageStart, (rows[id]?.listedAt ?? 0) / hourMS * hourMS)
+                        let lastExpected = min(pageEnd, hour - hourMS)
+                        let existing = try store.chartStats(id, since: firstExpected, through: lastExpected)
+                        var loaded = Set(existing.compactMap { timestamp, value in
+                            path.contains("open-interest") ? (value.oi == nil || value.oiUSD == nil ? nil : timestamp) : (value.sell == nil || value.buy == nil ? nil : timestamp)
+                        })
+                        if firstExpected > lastExpected || stride(from: firstExpected, through: lastExpected, by: Int(hourMS)).allSatisfy({ loaded.contains($0) }) {
+                            loadedStatPages[key] = .now; continue
                         }
-                    }
-                    try store.saveChartStats(id, updates)
-                    if !loaded.isEmpty { invalidateSnapshot(id); touch(id) }
-                    if firstExpected > lastExpected || stride(from: firstExpected, through: lastExpected, by: Int(hourMS)).allSatisfy({ loaded.contains($0) }) {
-                        loadedStatPages[key] = .now
-                    } else { failures.append(path.contains("open-interest") ? "OI coverage" : "taker volume coverage") }
-                } catch { failures.append(path.contains("open-interest") ? "OI" : "taker volume") }
+                        let values = try await get(path, ["instId": id, "period": "1H", "end": String(pageEnd + hourMS), "limit": "100"])
+                        var updates: [(hour: Int64, oi: Double?, oiUSD: Double?, sell: Double?, buy: Double?)] = []
+                        for case let row as [String] in values {
+                            guard let stamp = row.first.flatMap(Int64.init), stamp >= pageStart, stamp <= pageEnd, stamp < hour else { continue }
+                            if path.contains("open-interest"), row.count >= 4,
+                               let oi = Double(row[1]), let oiUSD = Double(row[3]), oi.isFinite, oiUSD.isFinite, oi >= 0, oiUSD >= 0 {
+                                updates.append((stamp, oi, oiUSD, nil, nil)); loaded.insert(stamp)
+                            } else if !path.contains("open-interest"), row.count >= 3,
+                                      let sell = Double(row[1]), let buy = Double(row[2]), sell.isFinite, buy.isFinite, sell >= 0, buy >= 0 {
+                                updates.append((stamp, nil, nil, sell, buy)); loaded.insert(stamp)
+                            }
+                        }
+                        try store.saveChartStats(id, updates)
+                        if !loaded.isEmpty { invalidateSnapshot(id); touch(id) }
+                        if firstExpected > lastExpected || stride(from: firstExpected, through: lastExpected, by: Int(hourMS)).allSatisfy({ loaded.contains($0) }) { loadedStatPages[key] = .now }
+                        else { failures.append(path.contains("open-interest") ? "OI coverage" : "taker volume coverage") }
+                    } catch { failures.append(path.contains("open-interest") ? "OI" : "taker volume") }
+                }
             }
         }
-        var result = chartSnapshot(id, endingAt: end, outputHours: historicalChartBufferHours)
+        var result = chartSnapshot(id, endingAt: end, outputHours: historicalChartBufferHours, timeframe: timeframe)
         result["endHour"] = end
         result["oldestHour"] = oldest as Any? ?? NSNull()
         result["historyExhausted"] = exhaustedCandleHistory.contains(id)
@@ -1151,35 +1367,38 @@ final class Radar {
         return result
     }
 
-    func chartSnapshot(_ id: String, sinceRevision: Int? = nil, endingAt endHour: Int64? = nil, outputHours: Int = chartHours) -> [String: Any] {
+    func chartSnapshot(_ id: String, sinceRevision: Int? = nil, endingAt endHour: Int64? = nil,
+                       outputHours: Int = chartHours, timeframe: CandleTimeframe = .oneHour) -> [String: Any] {
         guard rows[id] != nil else { return ["bars": [], "error": "Unknown contract", "revision": -1] }
         synchronizeRecordedData()
         let chartRevision = chartRevisions[id] ?? 0
         let error = endHour == nil && takerFailures.contains(id) ? "OKX current-hour taker volume is unavailable; retrying." : ""
         if endHour == nil && sinceRevision == chartRevision {
-            return ["unchanged": true, "revision": chartRevision, "error": error]
+            return ["unchanged": true, "revision": chartRevision, "error": error, "timeframe": timeframe.rawValue, "intervalMS": timeframe.milliseconds]
         }
         let null = NSNull()
-        let end = endHour ?? hour
-        let first = max(0, end - Int64(max(1, outputHours) - 1) * hourMS)
+        let interval = timeframe.milliseconds
+        let current = periodStart(timeframe)
+        let end = endHour ?? current
+        let first = max(0, end - Int64(max(1, outputHours) - 1) * interval)
         var series: [Int64: Candle]
         let stats: [Int64: (oi: Double?, oiUSD: Double?, sell: Double?, buy: Double?)]
         do {
-            let warmup = candleLookback
-            series = try store.candles(id, since: max(0, first - Int64(warmup) * hourMS), through: end)
-            for (ts, bar) in candles[id] ?? [:] where ts >= first - Int64(warmup) * hourMS && ts <= end && (ts == hour || series[ts] == nil) { series[ts] = bar }
-            let dataFirst = max(0, first - Int64(warmup) * hourMS)
-            stats = try store.chartStats(id, since: dataFirst, through: end)
+            let warmup = emaWarmupHours(200)
+            series = try store.candles(id, since: max(0, first - Int64(warmup) * interval), through: end, timeframe: timeframe)
+            for (ts, bar) in memoryCandles(id, timeframe: timeframe) where ts >= first - Int64(warmup) * interval && ts <= end && (ts == current || series[ts] == nil) { series[ts] = bar }
+            let dataFirst = max(0, first - Int64(warmup) * interval)
+            stats = timeframe == .oneHour ? try store.chartStats(id, since: dataFirst, through: end) : [:]
         }
         catch { return ["bars": [], "error": "Cannot read chart cache: \(error.localizedDescription)", "revision": chartRevision] }
         var seed: [Double] = []
         for age in 1...emaWarmupHours(200) {
-            guard let bar = series[first - Int64(age) * hourMS], bar.confirmed else { break }
+            guard let bar = series[first - Int64(age) * interval], bar.confirmed else { break }
             seed.append(bar.close)
         }
         var ema: Double? = windowedEMA(seed.reversed(), period: 200)
         var chartEMA: [Int64: Double] = [:]
-        if endHour == nil, let previous = ema200(id, series) {
+        if timeframe == .oneHour, endHour == nil, let previous = ema200(id, series) {
             let alpha = 2.0 / 201.0
             let last = series[hour] == nil ? hour - hourMS : hour
             var value = series[hour].flatMap { updatedEMA200(previous, close: $0.close) } ?? previous
@@ -1190,29 +1409,30 @@ final class Radar {
             }
         }
         var output: [[String: Any]] = []
-        for ts in stride(from: first, through: end, by: Int(hourMS)) {
+        for ts in stride(from: first, through: end, by: Int(interval)) {
             guard let bar = series[ts] else { ema = nil; continue }
             ema = chartEMA[ts] ?? updatedEMA200(ema, close: bar.close)
             guard let open = bar.open else { continue }
-            let (roc, maroc) = rocMaroc(series, ts, 9, 9)
-            let (upper, middle, lower) = logBB(series, ts)
+            let (roc, maroc) = rocMaroc(series, ts, 9, 9, intervalMS: interval)
+            let (upper, middle, lower) = logBB(series, ts, intervalMS: interval)
             let stat = stats[ts]
-            let oi = ts == hour ? currentOI(id)?.usd : stat?.oiUSD
-            let sell = ts == hour ? rows[id]?.sell : stat?.sell
-            let buy = ts == hour ? rows[id]?.buy : stat?.buy
+            let oi = timeframe == .oneHour && ts == hour ? currentOI(id)?.usd : stat?.oiUSD
+            let sell = timeframe == .oneHour && ts == hour ? rows[id]?.sell : stat?.sell
+            let buy = timeframe == .oneHour && ts == hour ? rows[id]?.buy : stat?.buy
             output.append([
                 "hour": ts, "open": open, "high": bar.high, "low": bar.low, "close": bar.close,
                 "volume": bar.quoteVolume as Any? ?? null, "confirmed": bar.confirmed,
-                "vwap": vwap14(series, ts) as Any? ?? null, "ema": ema as Any? ?? null,
+                "vwap": vwap14(series, ts, intervalMS: interval) as Any? ?? null, "ema": ema as Any? ?? null,
                 "logBBUpper": upper as Any? ?? null, "logBBMiddle": middle as Any? ?? null, "logBBLower": lower as Any? ?? null,
                 "roc": percentageSnapshot(roc), "maroc": percentageSnapshot(maroc),
-                "rsi6": rsi(series, ts, 6) as Any? ?? null,
-                "rsi12": rsi(series, ts, 12) as Any? ?? null,
-                "rsi24": rsi(series, ts, 24) as Any? ?? null,
+                "rsi6": rsi(series, ts, 6, intervalMS: interval) as Any? ?? null,
+                "rsi12": rsi(series, ts, 12, intervalMS: interval) as Any? ?? null,
+                "rsi24": rsi(series, ts, 24, intervalMS: interval) as Any? ?? null,
                 "oi": oi as Any? ?? null, "sell": sell as Any? ?? null, "buy": buy as Any? ?? null,
             ])
         }
-        return ["bars": output, "error": error, "revision": chartRevision]
+        return ["bars": output, "error": error, "revision": chartRevision,
+                "timeframe": timeframe.rawValue, "intervalMS": interval]
     }
 
     private func invalidateSnapshot(_ id: String) {
@@ -1261,18 +1481,21 @@ final class Radar {
         var cached: [String: [String: Any]] = [:]
         var generations: [String: Int] = [:]
         var roc = 9, maroc = 9
+        var timeframe = CandleTimeframe.oneHour
     }
 
-    private func snapshotMetadata() -> [String: Any] {
+    private func snapshotMetadata(_ timeframe: CandleTimeframe = .oneHour) -> [String: Any] {
         // A newly listed or temporarily unsupported contract should remain
         // Unknown without turning the whole application into an error state.
         // Surface a global warning only when failures indicate a broad service
         // problem; individual charts still report their exact missing source.
         let broadTakerFailure = takerRequestFailures.count >= max(3, Int(ceil(Double(rows.count) * 0.1)))
-        let error = !startupError.isEmpty ? startupError : pendingCandleWrites.values.contains(where: { !$0.isEmpty }) ? "Cannot persist completed candles; retrying the cache write." : broadTakerFailure ? "Some OKX current-hour taker volume is unavailable; retrying." : !failedPaths.isEmpty ? "Some OKX data is unavailable; retrying." :
+        let candleWritePending = pendingCandleWrites.values.contains(where: { !$0.isEmpty }) || pendingFiveMinuteWrites.values.contains(where: { !$0.isEmpty })
+        let error = !startupError.isEmpty ? startupError : candleWritePending ? "Cannot persist completed candles; retrying the cache write." : broadTakerFailure ? "Some OKX current-hour taker volume is unavailable; retrying." : !failedPaths.isEmpty ? "Some OKX data is unavailable; retrying." :
             !disconnectedChannels.isEmpty ? "OKX \(disconnectedChannels.sorted()[0]) disconnected; reconnecting." : ""
         return ["rows": [[String: Any]](), "updatedAt": updatedAt as Any? ?? NSNull(), "error": error, "revision": revision,
-                "btcReceivedAt": btcReceivedAt as Any? ?? NSNull(), "btcConnected": running && !disconnectedChannels.contains("candle1H"),
+                "timeframe": timeframe.rawValue, "intervalMS": timeframe.milliseconds,
+                "btcReceivedAt": btcReceivedAt as Any? ?? NSNull(), "btcConnected": running && !disconnectedChannels.contains("candle5m"),
                 "frostedBackgroundEnabled": frostedBackgroundEnabled, "frostedBackgroundOpacity": frostedBackgroundOpacity,
                 "windowBlurRadius": windowBlurRadius, "floatingBlurRadius": floatingBlurRadius,
                 "notificationsEnabled": notificationsEnabled,
@@ -1282,35 +1505,38 @@ final class Radar {
                 "filterFunctionCatalog": FilterCatalog.scalarFunctions.map(\.snapshot), "filterLibraryPreferences": filterLibraryPreferences.snapshot]
     }
 
-    private func prepareSnapshot(rocPeriod: Int, marocPeriod: Int, sinceRevision: Int? = nil) -> SnapshotBatch {
+    private func prepareSnapshot(rocPeriod: Int, marocPeriod: Int, timeframe: CandleTimeframe = .oneHour,
+                                 sinceRevision: Int? = nil) -> SnapshotBatch {
         synchronizeRecordedData()
-        var batch = SnapshotBatch(response: snapshotMetadata(), roc: rocPeriod, maroc: marocPeriod)
+        var batch = SnapshotBatch(response: snapshotMetadata(timeframe), roc: rocPeriod, maroc: marocPeriod, timeframe: timeframe)
         guard (1...100).contains(rocPeriod), (1...100).contains(marocPeriod) else {
             batch.response["error"] = "Periods must be from 1 to 100."; return batch
         }
-        if cachedPeriods?.roc != rocPeriod || cachedPeriods?.maroc != marocPeriod {
-            invalidateSnapshots(); cachedPeriods = (rocPeriod, marocPeriod)
+        if cachedPeriods?.roc != rocPeriod || cachedPeriods?.maroc != marocPeriod || cachedPeriods?.timeframe != timeframe {
+            invalidateSnapshots(); cachedPeriods = (rocPeriod, marocPeriod, timeframe)
         } else if sinceRevision == revision {
             batch.response = ["unchanged": true, "revision": revision, "error": batch.response["error"] ?? ""]; return batch
         }
         let previousOI: [String: Double]
         do {
-            previousOI = try store.openInterest(hour: hour - hourMS)
+            previousOI = timeframe == .oneHour ? try store.openInterest(hour: hour - hourMS) : [:]
             let changedOI = Set(previousOI.keys).union(previousOICache.keys).filter { previousOI[$0] != previousOICache[$0] }
             for id in changedOI { invalidateSnapshot(id) }
             previousOICache = previousOI
         }
         catch { startupError = "Cache error: \(error.localizedDescription)"; previousOI = [:] }
         let now = millis()
+        let current = periodStart(timeframe, now: now)
         for id in marketOrder {
             guard let row = rows[id] else { continue }
-            let bars = candles[id] ?? [:], oi = currentOI(id)
-            batch.inputs.append(.init(id: id, hour: hour, now: now, candles: bars, listedAt: row.listedAt,
+            let bars = memoryCandles(id, timeframe: timeframe)
+            let oi = timeframe == .oneHour ? currentOI(id) : nil
+            batch.inputs.append(.init(id: id, hour: current, now: now, candles: bars, intervalMS: timeframe.milliseconds, listedAt: row.listedAt,
                 turnover: row.turnover24hUSDT, spreadPercent: row.spreadPercent, quoteTimestamp: row.quoteTimestamp,
                 lastPrice: row.lastPrice,
-                buy: row.buy, sell: row.sell, takerRatio: row.takerRatio,
+                buy: timeframe == .oneHour ? row.buy : nil, sell: timeframe == .oneHour ? row.sell : nil, takerRatio: timeframe == .oneHour ? row.takerRatio : nil,
                 currentOI: oi?.contracts, currentOIUSD: oi?.usd,
-                previousOI: previousOI[id], previousEMA: ema200(id, bars)))
+                previousOI: previousOI[id], previousEMA: previousEMA200(id, timeframe: timeframe, bars: bars, current: current)))
             batch.generations[id] = snapshotGenerations[id, default: 0]
         }
         batch.cached = cachedRows
@@ -1324,29 +1550,33 @@ final class Radar {
             output.append(row); markets.append(input.filterData(row: row))
             // An OI/ticker/candle update during background work must invalidate
             // this row without changing the captured response's revision.
-            if calculated[input.id] != nil, snapshotGenerations[input.id, default: 0] == batch.generations[input.id], input.hour == hour,
-               cachedPeriods?.roc == batch.roc, cachedPeriods?.maroc == batch.maroc { cachedRows[input.id] = row }
+            if calculated[input.id] != nil, snapshotGenerations[input.id, default: 0] == batch.generations[input.id], input.hour == periodStart(batch.timeframe),
+               cachedPeriods?.roc == batch.roc, cachedPeriods?.maroc == batch.maroc,
+               cachedPeriods?.timeframe == batch.timeframe { cachedRows[input.id] = row }
         }
         if response["unchanged"] == nil { response["rows"] = output }
         return (response, markets)
     }
 
-    private func calculateSnapshot(rocPeriod: Int, marocPeriod: Int, sinceRevision: Int? = nil) async throws -> (response: [String: Any], markets: [FilterMarketData]) {
-        let batch = prepareSnapshot(rocPeriod: rocPeriod, marocPeriod: marocPeriod, sinceRevision: sinceRevision)
+    private func calculateSnapshot(rocPeriod: Int, marocPeriod: Int, timeframe: CandleTimeframe = .oneHour,
+                                   sinceRevision: Int? = nil) async throws -> (response: [String: Any], markets: [FilterMarketData]) {
+        let batch = prepareSnapshot(rocPeriod: rocPeriod, marocPeriod: marocPeriod, timeframe: timeframe, sinceRevision: sinceRevision)
         let missing = batch.inputs.filter { batch.cached[$0.id] == nil }
         let calculated = try await snapshotWorker.calculate(missing, rocPeriod: rocPeriod, marocPeriod: marocPeriod)
         try Task.checkCancellation()
         return finishSnapshot(batch, calculated: calculated)
     }
 
-    func asyncSnapshot(rocPeriod: Int, marocPeriod: Int, sinceRevision: Int? = nil) async throws -> [String: Any] {
-        try await calculateSnapshot(rocPeriod: rocPeriod, marocPeriod: marocPeriod, sinceRevision: sinceRevision).response
+    func asyncSnapshot(rocPeriod: Int, marocPeriod: Int, timeframe: CandleTimeframe = .oneHour,
+                       sinceRevision: Int? = nil) async throws -> [String: Any] {
+        try await calculateSnapshot(rocPeriod: rocPeriod, marocPeriod: marocPeriod, timeframe: timeframe, sinceRevision: sinceRevision).response
     }
 
     // Retain the synchronous read API for persistence clients. Interactive app
     // requests always use asyncSnapshot / calculateSnapshot above.
-    func snapshot(rocPeriod: Int, marocPeriod: Int, sinceRevision: Int? = nil) -> [String: Any] {
-        let batch = prepareSnapshot(rocPeriod: rocPeriod, marocPeriod: marocPeriod, sinceRevision: sinceRevision)
+    func snapshot(rocPeriod: Int, marocPeriod: Int, timeframe: CandleTimeframe = .oneHour,
+                  sinceRevision: Int? = nil) -> [String: Any] {
+        let batch = prepareSnapshot(rocPeriod: rocPeriod, marocPeriod: marocPeriod, timeframe: timeframe, sinceRevision: sinceRevision)
         let calculated = Dictionary(batch.inputs.filter { batch.cached[$0.id] == nil }.map { ($0.id, $0.calculate(rocPeriod: rocPeriod, marocPeriod: marocPeriod)) }, uniquingKeysWith: { _, last in last })
         return finishSnapshot(batch, calculated: calculated).response
     }

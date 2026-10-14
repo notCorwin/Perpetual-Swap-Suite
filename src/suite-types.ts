@@ -1,8 +1,9 @@
 import type { FilterTruth, NativeMarketRow, FilterEditorState } from '@/rule-engine'
 import type { ResearchInputs, StudySpec } from '@/research-types'
+import type { RadarTimeframe } from '@/timeframe'
 
 export const SUITE_PHASES = [
-  { key: 'bullishSetup', label: 'Bullish Setup', description: 'Finds bullish hourly setups within the Strategy Universe. Only market readings are used.' },
+  { key: 'bullishSetup', label: 'Bullish Setup', description: 'Finds bullish candle setups within the Strategy Universe. Only market readings are used.' },
 ] as const
 export type SuitePhase = typeof SUITE_PHASES[number]['key']
 export type SuiteMode = 'radar' | 'research'
@@ -12,8 +13,8 @@ export const modeTitle = (mode: SuiteMode) => mode === 'radar' ? 'Perpetual Swap
 export type StrategyProfile = { id: string; mode: SuiteMode; name: string; universeJSON: string; phaseRules: Record<SuitePhase, string>; revision: number; updatedAt: number }
 export type SuiteReading = { strategyID: string; revision: number; universeTraceJSON?: string; instrument: string; hour: number; provisional: boolean; universe: FilterTruth; phases: Partial<Record<SuitePhase, { result: FilterTruth; hour: number; traceJSON?: string }>>; action: string; reason: string; price?: number }
 export type SuiteDraft = { profile: StrategyProfile | null; name: string; rules: { json: string; source: string | null; nameDrafts: FilterEditorState['nameDrafts']; expressionDrafts: FilterEditorState['expressionDrafts']; lastValid: string | null }[] }
-export type SuiteRequest = { draft?: SuiteDraft; mode: SuiteMode; action: string; profileID?: string; profile?: StrategyProfile; instrument?: string }
-export type SuiteResponse = { draft?: SuiteDraft; profiles: StrategyProfile[]; selectedID: string; saved?: StrategyProfile; provisional?: SuiteReading[]; confirmed?: SuiteReading[]; paused?: boolean; recovering?: boolean; evaluationPending?: boolean; rows?: NativeMarketRow[]; revision?: number; serviceSession?: string; historyProgress?: { pending: number; completed: number; error: string } }
+export type SuiteRequest = { draft?: SuiteDraft; mode: SuiteMode; action: string; profileID?: string; profile?: StrategyProfile; instrument?: string; timeframe?: RadarTimeframe }
+export type SuiteResponse = { draft?: SuiteDraft; profiles: StrategyProfile[]; selectedID: string; saved?: StrategyProfile; provisional?: SuiteReading[]; confirmed?: SuiteReading[]; paused?: boolean; recovering?: boolean; evaluationPending?: boolean; rows?: NativeMarketRow[]; revision?: number; serviceSession?: string; timeframe?: RadarTimeframe; historyProgress?: { pending: number; completed: number; error: string } }
 export const requestSuite = (request: SuiteRequest) => window.webkit.messageHandlers.radar.postMessage({ suite: request })
 export function sameStrategyVersion(saved: StrategyProfile | undefined, frozen: StrategyProfile): boolean {
   return Boolean(saved && saved.id === frozen.id.split('@r')[0] && saved.revision === frozen.revision &&

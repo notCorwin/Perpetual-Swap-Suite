@@ -15,12 +15,12 @@ final class FilterHistoricalReadings: @unchecked Sendable {
     }
     private var ranges: [RangeKey: Extremes] = [:]
 
-    func prior(_ bars: [Int64: Candle], _ hour: Int64, hours: Int) -> Extremes {
+    func prior(_ bars: [Int64: Candle], _ hour: Int64, hours: Int, intervalMS: Int64 = hourMS) -> Extremes {
         let key = RangeKey(hour: hour, hours: hours)
         if let saved = ranges[key] { return saved }
         var result = Extremes(highHour: hour, lowHour: hour)
         for offset in 1...hours {
-            let priorHour = hour-Int64(offset)*hourMS
+            let priorHour = hour-Int64(offset)*intervalMS
             guard let bar = bars[priorHour], bar.confirmed else { result.complete = false; break }
             if bar.high > result.high { result.high = bar.high; result.highHour = priorHour }
             if bar.low < result.low { result.low = bar.low; result.lowHour = priorHour }

@@ -16,8 +16,8 @@ struct Candle: Codable, Equatable, Sendable {
     let quoteVolume: Double?
     let baseVolume: Double?
 
-    init?(_ values: [String]) {
-        guard values.count >= 9, let hour = Int64(values[0]), hour % hourMS == 0,
+    init?(_ values: [String], alignment: Int64 = fiveMinuteMS) {
+        guard alignment > 0, values.count >= 9, let hour = Int64(values[0]), hour >= 0, hour % alignment == 0,
               let open = Double(values[1]),
               let high = Double(values[2]), let low = Double(values[3]),
               let close = Double(values[4]), let base = Double(values[6]),
@@ -34,8 +34,8 @@ struct Candle: Codable, Equatable, Sendable {
     }
 }
 
-func historicalPage(_ rows: [Any], before: Int64) -> [Candle] {
-    rows.compactMap { ($0 as? [String]).flatMap(Candle.init) }.filter { $0.confirmed && $0.hour < before }
+func historicalPage(_ rows: [Any], before: Int64, alignment: Int64 = fiveMinuteMS) -> [Candle] {
+    rows.compactMap { ($0 as? [String]).flatMap { Candle($0, alignment: alignment) } }.filter { $0.confirmed && $0.hour < before }
 }
 
 /// History used for an EMA reading: seed with SMA(period) at the start of the window, then
@@ -112,13 +112,13 @@ func percentageSnapshot(_ value: Double?) -> Any {
     return value
 }
 
-func completedHistoryHours(at hour: Int64, since listedAt: Int64?, limit: Int) -> Int {
+func completedHistoryHours(at hour: Int64, since listedAt: Int64?, limit: Int, intervalMS: Int64 = hourMS) -> Int {
     guard limit > 0 else { return 0 }
     guard let listedAt, listedAt >= 0 else { return limit }
-    // A contract listed mid-hour has a partial first candle at that hour's start.
-    let firstHour = listedAt / hourMS * hourMS
+    // A contract listed mid-period has a partial first candle at that period's start.
+    let firstHour = listedAt / intervalMS * intervalMS
     guard firstHour < hour else { return 0 }
-    return Int(min(Int64(limit), (hour - firstHour) / hourMS))
+    return Int(min(Int64(limit), (hour - firstHour) / intervalMS))
 }
 
 struct BreakEvent: Equatable, Sendable {
@@ -150,28 +150,29 @@ enum BreakResult: Equatable, Sendable {
 }
 
 func recentExtremesBreaks(_ bars: [Int64: Candle], _ hour: Int64, listedAt: Int64? = nil,
-                         lookbackHours: Int = breakoutLookbackHours, searchHours: Int = breakoutSearchHours,
-                         historicalReadings: FilterHistoricalReadings? = nil) -> (highBreakout: BreakResult, lowBreakdown: BreakResult) {
+                          lookbackHours: Int = breakoutLookbackHours, searchHours: Int = breakoutSearchHours,
+                          historicalReadings: FilterHistoricalReadings? = nil,
+                          intervalMS: Int64 = hourMS) -> (highBreakout: BreakResult, lowBreakdown: BreakResult) {
     guard lookbackHours > 0,
-          completedHistoryHours(at: hour, since: listedAt, limit: lookbackHours) == lookbackHours else {
+          completedHistoryHours(at: hour, since: listedAt, limit: lookbackHours, intervalMS: intervalMS) == lookbackHours else {
         return (.insufficientHistory, .insufficientHistory)
     }
     var highBreakout: BreakResult?, lowBreakdown: BreakResult?
     for age in 0..<max(0, searchHours) {
-        let candidateHour = hour - Int64(age) * hourMS
+        let candidateHour = hour - Int64(age) * intervalMS
         // Do not shorten the comparison window for newly listed contracts.
-        guard completedHistoryHours(at: candidateHour, since: listedAt, limit: lookbackHours) == lookbackHours else { break }
+        guard completedHistoryHours(at: candidateHour, since: listedAt, limit: lookbackHours, intervalMS: intervalMS) == lookbackHours else { break }
         guard let candidate = bars[candidateHour], age == 0 || candidate.confirmed else {
             return (highBreakout ?? .loading, lowBreakdown ?? .loading)
         }
         var high = -Double.infinity, low = Double.infinity
         var highHour = candidateHour, lowHour = candidateHour
         if let historicalReadings {
-            let prior = historicalReadings.prior(bars, candidateHour, hours: lookbackHours)
+            let prior = historicalReadings.prior(bars, candidateHour, hours: lookbackHours, intervalMS: intervalMS)
             guard prior.complete else { return (highBreakout ?? .loading, lowBreakdown ?? .loading) }
             high = prior.high; low = prior.low; highHour = prior.highHour; lowHour = prior.lowHour
         } else { for offset in 1...lookbackHours {
-            let priorHour = candidateHour - Int64(offset) * hourMS
+            let priorHour = candidateHour - Int64(offset) * intervalMS
             guard let prior = bars[priorHour], prior.confirmed else {
                 // An unknown newer candidate could supersede any older event.
                 return (highBreakout ?? .loading, lowBreakdown ?? .loading)
@@ -181,11 +182,11 @@ func recentExtremesBreaks(_ bars: [Int64: Candle], _ hour: Int64, listedAt: Int6
         } }
         if highBreakout == nil, candidate.high > high {
             highBreakout = .event(BreakEvent(hour: candidateHour, hoursAgo: age, priorHour: highHour,
-                                           priorAgeHours: Int((candidateHour - highHour) / hourMS), priorPrice: high, live: !candidate.confirmed))
+                                           priorAgeHours: Int((candidateHour - highHour) / intervalMS), priorPrice: high, live: !candidate.confirmed))
         }
         if lowBreakdown == nil, candidate.low < low {
             lowBreakdown = .event(BreakEvent(hour: candidateHour, hoursAgo: age, priorHour: lowHour,
-                                           priorAgeHours: Int((candidateHour - lowHour) / hourMS), priorPrice: low, live: !candidate.confirmed))
+                                           priorAgeHours: Int((candidateHour - lowHour) / intervalMS), priorPrice: low, live: !candidate.confirmed))
         }
         if highBreakout != nil, lowBreakdown != nil { break }
     }
@@ -194,23 +195,23 @@ func recentExtremesBreaks(_ bars: [Int64: Candle], _ hour: Int64, listedAt: Int6
 
 // Current-candle filters compare against completed hours only. A history gap is
 // unavailable, never evidence that a contract has not broken an extreme.
-func priorExtremes(_ bars: [Int64: Candle], _ hour: Int64, hours: Int) -> (high: Double?, low: Double?) {
+func priorExtremes(_ bars: [Int64: Candle], _ hour: Int64, hours: Int, intervalMS: Int64 = hourMS) -> (high: Double?, low: Double?) {
     guard hours > 0 else { return (nil, nil) }
     var high = -Double.infinity, low = Double.infinity
     for offset in 1...hours {
-        guard let bar = bars[hour - Int64(offset) * hourMS], bar.confirmed else { return (nil, nil) }
+        guard let bar = bars[hour - Int64(offset) * intervalMS], bar.confirmed else { return (nil, nil) }
         high = max(high, bar.high)
         low = min(low, bar.low)
     }
     return (high, low)
 }
 
-func rocMaroc(_ bars: [Int64: Candle], _ hour: Int64, _ rocPeriod: Int, _ marocPeriod: Int) -> (Double?, Double?) {
+func rocMaroc(_ bars: [Int64: Candle], _ hour: Int64, _ rocPeriod: Int, _ marocPeriod: Int, intervalMS: Int64 = hourMS) -> (Double?, Double?) {
     guard (1...100).contains(rocPeriod), (1...100).contains(marocPeriod) else { return (nil, nil) }
     var values: [Double] = []
     for offset in 0..<marocPeriod {
-        guard let current = bars[hour - Int64(offset) * hourMS],
-              let previous = bars[hour - Int64(offset + rocPeriod) * hourMS],
+        guard let current = bars[hour - Int64(offset) * intervalMS],
+              let previous = bars[hour - Int64(offset + rocPeriod) * intervalMS],
               (offset == 0 || current.confirmed), previous.confirmed,
               let change = percentChange(current.close, previous.close) else {
             return (values.first, nil)
@@ -221,20 +222,20 @@ func rocMaroc(_ bars: [Int64: Candle], _ hour: Int64, _ rocPeriod: Int, _ marocP
     return (values.first, average.isNaN ? nil : average)
 }
 
-func vwap14(_ bars: [Int64: Candle], _ hour: Int64) -> Double? {
+func vwap14(_ bars: [Int64: Candle], _ hour: Int64, intervalMS: Int64 = hourMS) -> Double? {
     var quote = 0.0, base = 0.0
     for age in (0..<14).reversed() {
-        guard let bar = bars[hour - Int64(age) * hourMS],
+        guard let bar = bars[hour - Int64(age) * intervalMS],
               (age == 0 || bar.confirmed), let volume = bar.baseVolume, let quoteVolume = bar.quoteVolume else { return nil }
         quote += quoteVolume; base += volume
     }
     return base > 0 ? quote / base : nil
 }
 
-func rsi(_ bars: [Int64: Candle], _ hour: Int64, _ period: Int, historyHours: Int = candleLookback) -> Double? {
+func rsi(_ bars: [Int64: Candle], _ hour: Int64, _ period: Int, historyHours: Int = candleLookback, intervalMS: Int64 = hourMS) -> Double? {
     var closes: [Double] = []
     for age in 0...historyHours {
-        guard let bar = bars[hour - Int64(age) * hourMS], age == 0 || bar.confirmed else { break }
+        guard let bar = bars[hour - Int64(age) * intervalMS], age == 0 || bar.confirmed else { break }
         closes.append(bar.close)
     }
     guard closes.count > period else { return nil }
@@ -249,10 +250,10 @@ func rsi(_ bars: [Int64: Candle], _ hour: Int64, _ period: Int, historyHours: In
     return gain + loss > 0 ? 100 * gain / (gain + loss) : 50
 }
 
-func logBB(_ bars: [Int64: Candle], _ hour: Int64) -> (Double?, Double?, Double?) {
+func logBB(_ bars: [Int64: Candle], _ hour: Int64, intervalMS: Int64 = hourMS) -> (Double?, Double?, Double?) {
     var logCloses: [Double] = []
     for age in 0..<20 {
-        guard let bar = bars[hour - Int64(age) * hourMS], age == 0 || bar.confirmed,
+        guard let bar = bars[hour - Int64(age) * intervalMS], age == 0 || bar.confirmed,
               bar.close > 0 else { return (nil, nil, nil) }
         logCloses.append(log(bar.close))
     }
@@ -293,9 +294,9 @@ struct BandWidthExpansion: Equatable, Sendable {
     var snapshot: [String: Any] { ["hours": hours, "complete": complete] }
 }
 
-func logBBExpansion(_ bars: [Int64: Candle], _ hour: Int64, listedAt: Int64? = nil) -> BandWidthExpansion? {
+func logBBExpansion(_ bars: [Int64: Candle], _ hour: Int64, listedAt: Int64? = nil, intervalMS: Int64 = hourMS) -> BandWidthExpansion? {
     func width(at time: Int64) -> Double? {
-        let (upper, middle, lower) = logBB(bars, time)
+        let (upper, middle, lower) = logBB(bars, time, intervalMS: intervalMS)
         return logBBBandWidth(upper, middle, lower)
     }
     guard var current = width(at: hour) else { return nil }
@@ -303,10 +304,10 @@ func logBBExpansion(_ bars: [Int64: Candle], _ hour: Int64, listedAt: Int64? = n
     while true {
         // The first valid 20-candle band has no earlier Band Width to compare.
         if let listedAt, listedAt >= 0,
-           completedHistoryHours(at: time, since: listedAt, limit: 20) < 20 {
+           completedHistoryHours(at: time, since: listedAt, limit: 20, intervalMS: intervalMS) < 20 {
             return BandWidthExpansion(hours: hours, complete: true)
         }
-        let previousHour = time - hourMS
+        let previousHour = time - intervalMS
         guard bars[previousHour]?.confirmed == true, let previous = width(at: previousHour) else {
             // Missing history cannot establish the start of an ongoing expansion.
             return hours > 0 ? BandWidthExpansion(hours: hours, complete: false) : nil

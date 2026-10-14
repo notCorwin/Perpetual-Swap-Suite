@@ -24,14 +24,14 @@ func defaultStrategyProfile() -> StrategyProfile {
     var setup = defaultGroup("default-bullish-setup", "Bullish Setup", [
         defaultGroup("default-momentum", "Momentum", [
             defaultRule("default-roc-positive", "ROC(9) > 0", left: "ROC(9)", "gt", right: "0"),
-            defaultRule("default-roc-rising", "Hour-over-hour change in ROC(9) > 0", left: "change(ROC(9), 1)", "gt", right: "0"),
+            defaultRule("default-roc-rising", "Candle-over-candle change in ROC(9) > 0", left: "change(ROC(9), 1)", "gt", right: "0"),
         ]),
         defaultGroup("default-trend", "Trend", [
             defaultRule("default-price-ema", "Live price is above EMA(200)", left: "Price", "gt", right: "EMA(200)"),
         ]),
         defaultGroup("default-breakout", "Breakout", [
             defaultRule("default-high-logbb", "Live HH > Log BB upper band", left: "High", "gt", right: #"LogBB(20, 2, "upper")"#),
-            defaultRule("default-high-48", "Price wick breaks above the previous 48h high", left: "High", "gt", right: #"PriorExtreme(48, "high")"#),
+            defaultRule("default-high-48", "Price wick breaks above the previous 48-candle high", left: "High", "gt", right: #"PriorExtreme(48, "high")"#),
         ]),
         defaultGroup("default-overheat", "Overheat", [
             defaultRule("default-rsi", "RSI(24) < 70", left: "RSI(24)", "lt", right: "70"),
@@ -117,7 +117,7 @@ enum SuiteEvaluation {
         if forming { return input }
         var market = input
         market.evaluationTime = input.evaluationTime ?? input.now
-        market.hour -= hourMS; market.now = market.hour + hourMS
+        market.hour -= market.intervalMS; market.now = market.hour + market.intervalMS
         market.current = [:]; market.previousEMA = nil; market.historicalClose = true
         let series = ResearchEngine.reconstruct(ResearchSeries(candles: market.candles, stats: market.stats, quotes: market.quotes))
         market.quotes = series.quotes
@@ -135,7 +135,7 @@ enum SuiteEvaluation {
         let setup = truth(traces, .bullishSetup)
         if traces[0].result == .no || setup == .no { return ("Wait", "Universe or Bullish Setup rules do not match.") }
         if traces[0].result == .unknown || setup == .unknown { return ("Unknown", "A Universe or Bullish Setup input is unavailable.") }
-        return ("Bullish Setup", "Universe and Bullish Setup match at this hour.")
+        return ("Bullish Setup", "Universe and Bullish Setup match on this candle.")
     }
 }
 
@@ -161,14 +161,14 @@ actor SuiteEvaluationWorker {
             context.recordCooldowns = !forming && ready
             var traces = SuiteEvaluation.traces(context, filters: filters, explain: detail == original.id)
             if !ready {
-                for index in traces.indices { traces[index].result = .unknown; traces[index].reason = "Monitoring is paused or this hourly candle is unavailable. Last definite membership is retained."; traces[index].children = [] }
+                for index in traces.indices { traces[index].result = .unknown; traces[index].reason = "Monitoring is paused or this candle is unavailable. Last definite membership is retained."; traces[index].children = [] }
             }
             var phases: [String: SuitePhaseReading] = [:]
             for (index, phase) in SuitePhase.allCases.enumerated() {
                 let trace = traces[index + 1]
                 phases[phase.rawValue] = .init(result: ready ? trace.result.rawValue : "unknown", hour: context.hour, traceJSON: detail == original.id ? String(decoding: try SafeJSON.data(trace.snapshot, options: [.sortedKeys]), as: UTF8.self) : nil)
             }
-            let decision = ready ? SuiteEvaluation.decision(traces) : ("Unknown", "Monitoring is paused or this hourly candle is unavailable.")
+            let decision = ready ? SuiteEvaluation.decision(traces) : ("Unknown", "Monitoring is paused or this candle is unavailable.")
             return SuiteReading(strategyID: profile.id, revision: profile.revision, instrument: original.id, hour: context.hour, provisional: forming, universe: ready ? traces[0].result.rawValue : "unknown", universeTraceJSON: detail == original.id ? String(decoding: try SafeJSON.data(traces[0].snapshot, options: [.sortedKeys]), as: UTF8.self) : nil, phases: phases, action: decision.0, reason: decision.1, price: context.candles[context.hour]?.close)
         }
     }

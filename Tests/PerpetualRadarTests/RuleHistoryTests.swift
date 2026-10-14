@@ -26,6 +26,20 @@ private actor TestHistoryTransport: FilterHistoryTransport {
     func waitForFirstRequest() async { if requests.isEmpty { await withCheckedContinuation { startedWaiters.append($0) } } }
 }
 
+private actor FiveMinuteHistoryTransport: FilterHistoryTransport {
+    private var requests: [[String: String]] = []
+    func fetch(path: String, parameters: [String: String]) async throws -> [[String]] {
+        guard path == "/market/history-candles" else { return [] }
+        requests.append(parameters)
+        let before = Int64(parameters["after"]!)!
+        return (1...300).map { offset in
+            let ts = before - Int64(offset) * fiveMinuteMS
+            return [String(ts), "100", "110", "90", "100", "1", "1", "100", "1"]
+        }
+    }
+    func parameters() -> [[String: String]] { requests }
+}
+
 final class RuleHistoryTests: XCTestCase, @unchecked Sendable {
     private let hour = Int64(10_000) * hourMS
     private func database() -> URL { FileManager.default.temporaryDirectory.appendingPathComponent("RuleHistory-\(UUID())").appendingPathComponent("radar.sqlite3") }
@@ -169,5 +183,29 @@ final class RuleHistoryTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(progress.pending, 0)
         XCTAssertTrue(progress.error.isEmpty)
         XCTAssertTrue(try Store(url: url).candles(market().id, since: hour - 720 * hourMS, through: hour).isEmpty)
+    }
+
+    func testFifteenMinuteRulesHydrateOnlyFiveMinuteCandlesAndUseLocalAggregates() async throws {
+        let url = database(); defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let transport = FiveMinuteHistoryTransport(), loader = FilterHistoryLoader(url: url, transport: transport, requestDelay: 0)
+        let interval = CandleTimeframe.fifteenMinutes.milliseconds
+        var context = market()
+        context.intervalMS = interval
+        context.hour = hour / interval * interval
+        context.now = context.hour + 1
+        context.candles = [context.hour: Candle(hour: context.hour, high: 110, low: 90, close: 100,
+                                                       quoteVolume: 100, baseVolume: 1, open: 100, confirmed: false)]
+        let filter = try FilterCompiler.compile(source: "mean(Close, 120) > 0")
+        let prepared = try await loader.prepare([context], filter: filter)
+        await loader.schedule(prepared, filter: filter)
+        await loader.waitUntilIdle()
+        let hydrated = try await loader.prepare([context], filter: filter)
+        XCTAssertEqual(FilterEvaluator(market: hydrated[0], filter: filter).evaluate().result, .yes)
+        let requests = await transport.parameters()
+        XCTAssertFalse(requests.isEmpty)
+        XCTAssertTrue(requests.allSatisfy { $0["bar"] == "5m" })
+        let stored = try Store(url: url).candles(context.id, since: context.hour - 120 * interval,
+                                                  through: context.hour, timeframe: .fifteenMinutes)
+        XCTAssertGreaterThanOrEqual(stored.count, 119)
     }
 }

@@ -3,7 +3,7 @@ import CSQLite
 
 final class Store {
     private static let busyTimeoutMilliseconds: Int32 = 5_000
-    private static let schemaVersion: Int64 = 4
+    private static let schemaVersion: Int64 = 5
     private var db: OpaquePointer?
     private var reusableStatements: [String: OpaquePointer] = [:]
     let url: URL
@@ -30,9 +30,13 @@ final class Store {
                 guard try version() < Self.schemaVersion else { return }
                 try execute("CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
                 try execute("CREATE TABLE IF NOT EXISTS candles (inst_id TEXT, hour INTEGER, high REAL, low REAL, close REAL, volume REAL, base_volume REAL, open REAL, PRIMARY KEY(inst_id,hour))")
+                try execute("CREATE TABLE IF NOT EXISTS candles_5m (inst_id TEXT, hour INTEGER, high REAL, low REAL, close REAL, volume REAL, base_volume REAL, open REAL, PRIMARY KEY(inst_id,hour))")
+                try execute("CREATE TABLE IF NOT EXISTS candles_15m (inst_id TEXT, hour INTEGER, high REAL, low REAL, close REAL, volume REAL, base_volume REAL, open REAL, PRIMARY KEY(inst_id,hour))")
                 try execute("CREATE TABLE IF NOT EXISTS ema200 (inst_id TEXT PRIMARY KEY, hour INTEGER, value REAL)")
                 try execute("CREATE TABLE IF NOT EXISTS chart_stats (inst_id TEXT, hour INTEGER, oi REAL, oi_usd REAL, sell REAL, buy REAL, PRIMARY KEY(inst_id,hour))")
                 try execute("CREATE INDEX IF NOT EXISTS candles_hour ON candles(hour)")
+                try execute("CREATE INDEX IF NOT EXISTS candles_5m_hour ON candles_5m(hour)")
+                try execute("CREATE INDEX IF NOT EXISTS candles_15m_hour ON candles_15m(hour)")
                 try execute("CREATE INDEX IF NOT EXISTS chart_stats_hour ON chart_stats(hour)")
                 // Existing Python caches may predate base_volume.
                 if try !columns("candles").contains("base_volume") { try execute("ALTER TABLE candles ADD COLUMN base_volume REAL") }
@@ -248,16 +252,68 @@ final class Store {
         return (candles, ema)
     }
 
-    func save(_ id: String, _ bar: Candle) throws {
-        guard bar.confirmed else { return }
-        try execute("INSERT INTO candles (inst_id,hour,high,low,close,volume,base_volume,open) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(inst_id,hour) DO UPDATE SET high=excluded.high,low=excluded.low,close=excluded.close,volume=COALESCE(excluded.volume,candles.volume),base_volume=COALESCE(excluded.base_volume,candles.base_volume),open=COALESCE(excluded.open,candles.open)", [id, bar.hour, bar.high, bar.low, bar.close, bar.quoteVolume, bar.baseVolume, bar.open])
+    func loadCandles(endingAt timestamp: Int64, ids: Set<String>, timeframe: CandleTimeframe,
+                     limit: Int = candleLookback) throws -> [String: [Int64: Candle]] {
+        var result: [String: [Int64: Candle]] = [:]
+        guard !ids.isEmpty, limit > 0 else { return result }
+        let instruments = Array(ids), placeholders = Array(repeating: "?", count: instruments.count).joined(separator: ",")
+        let table = candleTable(timeframe)
+        let stmt = try statement("SELECT inst_id,hour,high,low,close,volume,base_volume,open FROM \(table) WHERE inst_id IN (\(placeholders)) AND hour>=? AND hour<=?")
+        defer { sqlite3_finalize(stmt) }
+        let first = max(0, timestamp - Int64(limit - 1) * timeframe.milliseconds)
+        bind(instruments.map { $0 as Any? } + [first, timestamp], to: stmt)
+        try readRows(stmt) {
+            let id = Store.text(stmt, 0), ts = sqlite3_column_int64(stmt, 1)
+            result[id, default: [:]][ts] = Candle(hour: ts, high: sqlite3_column_double(stmt, 2), low: sqlite3_column_double(stmt, 3), close: sqlite3_column_double(stmt, 4), quoteVolume: sqlite3_column_type(stmt, 5) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 5), baseVolume: sqlite3_column_type(stmt, 6) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 6), open: sqlite3_column_type(stmt, 7) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 7))
+        }
+        return result
     }
 
-    func saveCandles(_ id: String, _ bars: [Candle]) throws {
+    private func candleTable(_ timeframe: CandleTimeframe) -> String {
+        switch timeframe {
+        case .fiveMinutes: "candles_5m"
+        case .fifteenMinutes: "candles_15m"
+        case .oneHour: "candles"
+        }
+    }
+
+    func save(_ id: String, _ bar: Candle, timeframe: CandleTimeframe = .oneHour) throws {
+        guard bar.confirmed, bar.hour % timeframe.milliseconds == 0 else { return }
+        let table = candleTable(timeframe)
+        try execute("INSERT INTO \(table) (inst_id,hour,high,low,close,volume,base_volume,open) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(inst_id,hour) DO UPDATE SET high=excluded.high,low=excluded.low,close=excluded.close,volume=COALESCE(excluded.volume,\(table).volume),base_volume=COALESCE(excluded.base_volume,\(table).base_volume),open=COALESCE(excluded.open,\(table).open)", [id, bar.hour, bar.high, bar.low, bar.close, bar.quoteVolume, bar.baseVolume, bar.open])
+    }
+
+    func saveCandles(_ id: String, _ bars: [Candle], timeframe: CandleTimeframe = .oneHour) throws {
         guard !bars.isEmpty else { return }
         try transaction {
-            for bar in bars { try save(id, bar) }
+            for bar in bars { try save(id, bar, timeframe: timeframe) }
         }
+    }
+
+    /// Persists authoritative 5m observations and refreshes every affected
+    /// confirmed 15m/1h aggregate in the same transaction. Derived candles are
+    /// never accepted unless all of their source slots are present.
+    @discardableResult
+    func ingestFiveMinuteCandles(_ id: String, _ input: [Candle]) throws -> [CandleTimeframe: [Candle]] {
+        let bars = input.filter { $0.confirmed && $0.hour % fiveMinuteMS == 0 }
+        guard !bars.isEmpty else { return [:] }
+        var result: [CandleTimeframe: [Candle]] = [.fiveMinutes: bars]
+        try transaction {
+            for bar in bars { try save(id, bar, timeframe: .fiveMinutes) }
+            let first = bars.map(\.hour).min()!, last = bars.map(\.hour).max()!
+            let sourceFirst = CandleTimeframe.oneHour.start(containing: first)
+            let sourceLast = CandleTimeframe.oneHour.start(containing: last) + hourMS - fiveMinuteMS
+            let source = try candles(id, since: sourceFirst, through: sourceLast, timeframe: .fiveMinutes)
+            for timeframe in [CandleTimeframe.fifteenMinutes, .oneHour] {
+                let affected = Set(bars.map { timeframe.start(containing: $0.hour) })
+                let derived = affected.compactMap { start in
+                    aggregateFiveMinuteCandle(source, startingAt: start, timeframe: timeframe)
+                }.sorted { $0.hour < $1.hour }
+                for bar in derived { try save(id, bar, timeframe: timeframe) }
+                result[timeframe] = derived
+            }
+        }
+        return result
     }
 
     /// Publishes normalized Research inputs into Radar's canonical confirmed
@@ -274,8 +330,8 @@ final class Store {
         }
     }
 
-    func candles(_ id: String, since: Int64, through: Int64) throws -> [Int64: Candle] {
-        let stmt = try statement("SELECT hour,high,low,close,volume,base_volume,open FROM candles WHERE inst_id=? AND hour>=? AND hour<=? ORDER BY hour")
+    func candles(_ id: String, since: Int64, through: Int64, timeframe: CandleTimeframe = .oneHour) throws -> [Int64: Candle] {
+        let stmt = try statement("SELECT hour,high,low,close,volume,base_volume,open FROM \(candleTable(timeframe)) WHERE inst_id=? AND hour>=? AND hour<=? ORDER BY hour")
         defer { sqlite3_finalize(stmt) }
         bind([id, since, through], to: stmt)
         var result: [Int64: Candle] = [:]
@@ -286,8 +342,8 @@ final class Store {
         return result
     }
 
-    func oldestCandleHour(_ id: String) throws -> Int64? {
-        let stmt = try statement("SELECT MIN(hour) FROM candles WHERE inst_id=? AND open IS NOT NULL")
+    func oldestCandleHour(_ id: String, timeframe: CandleTimeframe = .oneHour) throws -> Int64? {
+        let stmt = try statement("SELECT MIN(hour) FROM \(candleTable(timeframe)) WHERE inst_id=? AND open IS NOT NULL")
         defer { sqlite3_finalize(stmt) }
         bind([id], to: stmt)
         guard sqlite3_step(stmt) == SQLITE_ROW else { throw failure() }

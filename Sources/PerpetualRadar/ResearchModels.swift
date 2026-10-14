@@ -2,7 +2,7 @@ import Foundation
 import CryptoKit
 
 enum ResearchVersion {
-    static let parser = "okx-archives-4"
+    static let parser = "okx-archives-5"
     static let engine = "hourly-close-btc-no-spread-ema5x-6"
     static let horizons = [1, 3, 6, 12, 24, 48]
     static let memoryBudget = 128 * 1024 * 1024

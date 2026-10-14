@@ -225,7 +225,8 @@ final class ResearchDataProvider {
     private func restSource(_ instrument: String, kind: String, _ range: ResearchRange, refresh: Bool) -> ResearchSource {
         let paths = ["candle": "/market/history-candles", "oi": "/rubik/stat/contracts/open-interest-history", "taker": "/rubik/stat/taker-volume-contract", "funding": "/public/funding-rate-history", "mark": "/market/history-mark-price-candles"]
         var parameters = [("instId", instrument)]
-        if kind == "candle" || kind == "mark" { parameters += [("bar", "1H"), ("after", String(range.through + hourMS)), ("limit", kind == "mark" ? "100" : "300")] }
+        if kind == "candle" { parameters += [("bar", "5m"), ("after", String(range.through + hourMS)), ("limit", "300")] }
+        else if kind == "mark" { parameters += [("bar", "1H"), ("after", String(range.through + hourMS)), ("limit", "100")] }
         else if kind == "funding" { parameters += [("after", String(range.through + hourMS)), ("limit", "400")] }
         else { parameters += [("period", "1H"), ("end", String(range.through + hourMS)), ("begin", String(range.from - 1)), ("limit", "100")]; if kind == "taker" { parameters.append(("unit", "2")) } }
         let url = Self.url(paths[kind]!, parameters).absoluteString
@@ -660,6 +661,19 @@ final class ResearchDataProvider {
     }
     private func parseRESTPage(_ source: ResearchSource, values: [Any]) throws -> [Int64] {
         var batch: [ResearchDatum] = [], timestamps: [Int64] = []
+        if source.kind == "candle" {
+            let sourceBars = values.compactMap { ($0 as? [String]).flatMap { Candle($0, alignment: fiveMinuteMS) } }.filter(\.confirmed)
+            timestamps = sourceBars.map(\.hour)
+            let sorted = sourceBars.sorted { $0.hour < $1.hour }
+            let legacyHourlyPage = sorted.count < 2 || zip(sorted.dropFirst(), sorted).allSatisfy { $0.hour - $1.hour == hourMS }
+            let hourly = legacyHourlyPage ? Dictionary(uniqueKeysWithValues: sourceBars.map { ($0.hour, $0) })
+                : aggregateFiveMinuteCandles(Dictionary(uniqueKeysWithValues: sourceBars.map { ($0.hour, $0) }), timeframe: .oneHour)
+            batch = hourly.values.filter { $0.hour >= source.from && $0.hour <= source.through }.map {
+                .init(instrument: source.instrument, kind: "candle", timestamp: $0.hour, candle: $0, sources: [source.id])
+            }
+            if !batch.isEmpty { try store.write(batch) }
+            return timestamps
+        }
         for item in values {
             if source.kind == "funding" {
                 guard let value = item as? [String: Any], let ts = (value["fundingTime"] as? String).flatMap(Int64.init) else { throw FilterError("Funding history contains an invalid settlement timestamp. Its raw response was retained.") }
@@ -671,7 +685,6 @@ final class ResearchDataProvider {
             guard let value = item as? [String], let ts = value.first.flatMap(Int64.init) else { continue }
             timestamps.append(ts)
             guard ts >= source.from, ts <= source.through else { continue }
-            if source.kind == "candle", let candle = Candle(value), candle.confirmed { batch.append(.init(instrument: source.instrument, kind: "candle", timestamp: ts, candle: candle, sources: [source.id])) }
             if source.kind == "mark", value.count >= 6, value[5] == "1", let mark = Double(value[1]), mark.isFinite, mark > 0 { batch.append(.init(instrument: source.instrument, kind: "mark", timestamp: ts, mark: mark, sources: [source.id])) }
             if source.kind == "oi", value.count >= 4,
                let oi = Double(value[1]), let oiUSD = Double(value[3]),

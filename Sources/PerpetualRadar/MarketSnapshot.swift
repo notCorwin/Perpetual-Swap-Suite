@@ -3,6 +3,7 @@ import Foundation
 struct MarketSnapshotInput: Sendable {
     let id: String, hour: Int64, now: Int64
     let candles: [Int64: Candle]
+    var intervalMS: Int64 = hourMS
     var listedAt: Int64?
     var turnover: Double?
     var spreadPercent: Double?
@@ -19,16 +20,16 @@ struct MarketSnapshotInput: Sendable {
     func calculate(rocPeriod: Int, marocPeriod: Int) -> MarketSnapshotRow {
         let null = NSNull()
         let bars = candles
-        let breaks = recentExtremesBreaks(bars, hour, listedAt: listedAt)
-        let breaks96 = recentExtremesBreaks(bars, hour, listedAt: listedAt, lookbackHours: 96)
-        let extremes48 = priorExtremes(bars, hour, hours: 48)
-        let extremes96 = priorExtremes(bars, hour, hours: 96)
-        let (upper, middle, lower) = logBB(bars, hour)
-        let (roc, maroc) = rocMaroc(bars, hour, rocPeriod, marocPeriod)
-        let current = bars[hour], previous = bars[hour - hourMS]
+        let breaks = recentExtremesBreaks(bars, hour, listedAt: listedAt, intervalMS: intervalMS)
+        let breaks96 = recentExtremesBreaks(bars, hour, listedAt: listedAt, lookbackHours: 96, intervalMS: intervalMS)
+        let extremes48 = priorExtremes(bars, hour, hours: 48, intervalMS: intervalMS)
+        let extremes96 = priorExtremes(bars, hour, hours: 96, intervalMS: intervalMS)
+        let (upper, middle, lower) = logBB(bars, hour, intervalMS: intervalMS)
+        let (roc, maroc) = rocMaroc(bars, hour, rocPeriod, marocPeriod, intervalMS: intervalMS)
+        let current = bars[hour], previous = bars[hour - intervalMS]
         let live = current?.confirmed == false ? current : nil
         let liveEMA = updatedEMA200(previousEMA, close: live?.close)
-        let (oldRoc, oldMaroc) = previous?.confirmed == true ? rocMaroc(bars, hour - hourMS, rocPeriod, marocPeriod) : (nil, nil)
+        let (oldRoc, oldMaroc) = previous?.confirmed == true ? rocMaroc(bars, hour - intervalMS, rocPeriod, marocPeriod, intervalMS: intervalMS) : (nil, nil)
         let price = current?.close
         var result: [String: Any] = [
             "instId": id, "turnover24hUSDT": turnover as Any? ?? null, "price": price as Any? ?? null,
@@ -46,15 +47,15 @@ struct MarketSnapshotInput: Sendable {
             "roc": percentageSnapshot(roc), "maroc": percentageSnapshot(maroc),
             "rocChange": percentageSnapshot(percentChange(roc, oldRoc)),
             "marocChange": percentageSnapshot(percentChange(maroc, oldMaroc)),
-            "rsi6": rsi(bars, hour, 6) as Any? ?? null,
-            "rsi12": rsi(bars, hour, 12) as Any? ?? null,
-            "rsi24": rsi(bars, hour, 24) as Any? ?? null,
+            "rsi6": rsi(bars, hour, 6, intervalMS: intervalMS) as Any? ?? null,
+            "rsi12": rsi(bars, hour, 12, intervalMS: intervalMS) as Any? ?? null,
+            "rsi24": rsi(bars, hour, 24, intervalMS: intervalMS) as Any? ?? null,
             "logBBAboveBand": logBBAboveBand(price, upper, middle, lower)?.rawValue as Any? ?? null,
-            "logBBExpansion": logBBExpansion(bars, hour, listedAt: listedAt)?.snapshot as Any? ?? null,
+            "logBBExpansion": logBBExpansion(bars, hour, listedAt: listedAt, intervalMS: intervalMS)?.snapshot as Any? ?? null,
             "filterMetrics": [
                 "liveOpen": live?.open as Any? ?? null, "liveClose": live?.close as Any? ?? null,
                 "ema200": liveEMA as Any? ?? null, "previousEMA200": previousEMA as Any? ?? null,
-                "vwap14": vwap14(bars, hour) as Any? ?? null,
+                "vwap14": vwap14(bars, hour, intervalMS: intervalMS) as Any? ?? null,
                 "bbUpper": upper as Any? ?? null, "bbMiddle": middle as Any? ?? null, "bbLower": lower as Any? ?? null,
                 "priorHigh48": extremes48.high as Any? ?? null, "priorLow48": extremes48.low as Any? ?? null,
                 "priorHigh96": extremes96.high as Any? ?? null, "priorLow96": extremes96.low as Any? ?? null,
@@ -62,14 +63,14 @@ struct MarketSnapshotInput: Sendable {
                 "liveVolumeUSDT": live?.quoteVolume as Any? ?? null,
             ],
         ]
-        let context = FilterMarketData(id: id, hour: hour, now: now, listedAt: listedAt, candles: bars,
+        let context = FilterMarketData(id: id, hour: hour, now: now, intervalMS: intervalMS, listedAt: listedAt, candles: bars,
             stats: [:], quotes: [:], current: LegacyFilterReadings.from(result), previousEMA: previousEMA)
         result["opportunity"] = FilterEvaluator(market: context, filter: CompiledFilter(config: FilterConfigV2())).opportunity(at: hour).snapshot
         return MarketSnapshotRow(fields: result)
     }
 
     func filterData(row: [String: Any]) -> FilterMarketData {
-        .init(id: id, hour: hour, now: now, listedAt: listedAt, candles: candles,
+        .init(id: id, hour: hour, now: now, intervalMS: intervalMS, listedAt: listedAt, candles: candles,
             stats: [hour: .init(oi: currentOI, oiUSD: currentOIUSD, sell: sell, buy: buy)],
             quotes: [hour: .init(turnover: turnover, spread: spreadPercent, timestamp: quoteTimestamp)],
             current: LegacyFilterReadings.from(row), previousEMA: previousEMA)

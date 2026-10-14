@@ -2,17 +2,17 @@
 
 [![Publish macOS Release](https://github.com/notCorwin/Perpetual-Swap-Suite/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/notCorwin/Perpetual-Swap-Suite/actions/workflows/release.yml)
 
-A native macOS app for discovering Bullish Setup signals on OKX perpetual swaps and researching their historical results. It covers live, non-TradFi USDT perpetual contracts and uses one-hour data throughout.
+A native macOS app for discovering Bullish Setup signals on OKX perpetual swaps and researching their historical results. It covers live, non-TradFi USDT perpetual contracts. Radar supports 5m, 15m, and 1h candles from one authoritative 5m feed; Research keeps hourly execution semantics.
 
 **Radar** discovers live signals. **Research** tests the same strategies against frozen data. Both modes share one strategy library, identity and revisions. Swift handles market data, calculations, storage, and native services; an AppKit window hosts the React dashboard in WKWebView. The interface is English-only. No OKX API key or local web server is required.
 
 ## Features
 
 - **Live signal discovery:** a full-width Bullish Setup radar with separate confirmed and provisional readings and direct chart/evidence access. All markets retains sortable indicators, search, and Long/Short Opportunity rankings with score explanations. Indicators include EMA200, Log Bollinger Bands, RSI, ROC/MAROC, open interest, taker volume, and high breakouts/low breakdowns.
-- **Visual and formula rules:** synchronized editors support AND/OR/NOT groups, calculations, hourly conditions, event sequences, reusable values, and BTC market context. Inspect actual operands and data gaps with rule previews and market explanations.
+- **Visual and formula rules:** synchronized editors support AND/OR/NOT groups, calculations, candle-window conditions, event sequences, reusable values, and BTC market context. Inspect actual operands and data gaps with rule previews and market explanations.
 - **Shared strategy library:** save Universe and Bullish Setup rules together, monitor confirmed and provisional signals, and use the exact saved revisions in either mode.
 - **Reproducible research:** study Bullish Setup signals, compare frozen strategy versions, and calibrate Opportunity scores on matching setups. Review coverage, fixed-horizon Long returns, costs, funding, and signal evidence; pause, resume, and export CSVs.
-- **Interactive charts:** review 96 hourly candles at a time with VWAP14, EMA200, Log BB, RSI, ROC/MAROC, OI, and taker volume. Load older history, navigate contracts by keyboard, and copy charts to the clipboard.
+- **Interactive charts:** review 96 selected-period candles at a time with VWAP14, EMA200, Log BB, RSI, and ROC/MAROC. The 1h chart also includes OI and taker volume. Load older history, navigate contracts by keyboard, and copy charts to the clipboard.
 - **Native macOS workflow:** optional background monitoring, menu bar controls, notifications, Start at Login, automatic updates, Light/Dark/System appearance, adjustable frosted backgrounds, and tabular numbers.
 
 ## Quick start
@@ -29,7 +29,7 @@ The current `autobuild` package targets Apple Silicon (`arm64`). For Intel Macs,
 
 The release contains an ad hoc signed app bundle. Each successful release build replaces the `autobuild` package.
 
-On first launch, the collector loads hourly history across the exchange universe. Markets and indicators appear as their data becomes available; missing readings display as `—`.
+On first launch, the collector loads 5m history across the exchange universe and derives naturally aligned 15m and 1h candles locally. Markets and indicators appear as their data becomes available; missing readings display as `—`.
 
 ### Build from source
 
@@ -53,7 +53,7 @@ open ".build/app/Perpetual Swap Suite.app"
 
 ### Screen markets
 
-Select an **Active strategy** from the shared library to show its **Signals** and **All markets** together on one Radar page. Radar watches **Bullish Setup** across the supported universe. Each signal applies Universe and Bullish Setup rules from the same hour. **Both hours**, **Confirmed**, and **Provisional** control which readings appear. Confirmed matches sort first, followed by 24-hour turnover; signals paginate in groups of 25. Chart navigation follows the signal list you opened.
+Select an **Active strategy** from the shared library to show its **Signals** and **All markets** together on one Radar page. Choose **5m**, **15m**, or **1h**; each signal applies Universe and Bullish Setup rules to the same selected candle. **Both states**, **Confirmed**, and **Provisional** control which readings appear. Confirmed matches sort first, followed by 24-hour turnover; signals paginate in groups of 25. Chart navigation follows the signal list you opened.
 
 **All markets** appears below Signals and exposes the full supported universe, including nonmatches and Unknown inputs. Search applies to both sections. **Test strategy** carries the exact saved version into Bullish Setup Research.
 
@@ -91,7 +91,7 @@ Click a symbol to open its chart. Hold the primary mouse button to inspect a can
 
 Taker Buy/Sell uses OKX's per-contract `1H` statistics in **contracts** (`unit=1`), accumulated within the selected hour. Compare the same perpetual contract, hour, and unit on OKX; coin or USDT amounts have a different scale. **Taker imbalance** is `(Buy − Sell) / (Buy + Sell) × 100%`, rather than the Buy/Sell quotient. Radar refreshes independent contracts concurrently, and the table, chart, and strategy readings share the newest observation. Unavailable current-hour data stays Unknown and is retried; completed-hour corrections are persisted, while live values stay in memory.
 
-Latest trade prices and quotes use OKX's ticker stream with a REST fallback. Hourly candle inputs remain exchange candle observations; a ticker never fabricates candle OHLC. Recovery scans repair missing closing candles and OI observations, and a slow chart source does not pause live snapshot updates. Completed candle corrections invalidate derived indicators and survive reopening the application. Table and chart OI share the same timestamp checks, so an observation from the previous hour cannot appear as current-hour OI.
+Latest trade prices and quotes use OKX's ticker stream with a REST fallback. Candle OHLCV comes only from OKX `5m` market candles over WebSocket/REST; a ticker never fabricates OHLC. Radar replaces repeated live 5m frames by timestamp, then derives 15m/1h Open, High, Low, Close, and summed volumes on natural UTC boundaries. A derived historical candle is accepted only when every required 5m source candle is present and confirmed. Completed corrections rebuild affected aggregates, invalidate derived indicators, and survive reopening the application.
 
 **Estimated turnover** values OKX's 24-hour base-currency volume at the latest USDT trade price. It is an estimate, rather than the sum of each trade's actual notional. Indicator comparisons also require the same candle period, price source, formula, and warmup history; Log BB and VWAP14 retain this application's documented definitions.
 
@@ -113,7 +113,7 @@ The key lives outside the app bundle in `~/Library/Application Support/Perpetual
 
 Open **Strategy Library** and configure **Universe** plus **Bullish Setup**. Universe may be unrestricted; Bullish Setup must contain valid, nonempty market rules before saving or activation. Radar monitors one activated saved strategy at a time. Saving from either mode updates that same strategy and revision. **Duplicate saved strategy** creates a separate strategy in the shared library. Unsaved drafts remain separate for each mode.
 
-**Confirmed** results use completed hourly snapshots; **Provisional** results use the forming hour and may retract. Both use the Universe evaluated at their own hour. Only definite matches become signals; missing inputs remain Unknown.
+**Confirmed** results use the previous completed candle in the selected Radar timeframe; **Provisional** results use its forming candle and may retract. Both use the Universe evaluated at their own candle. Only definite matches become signals; missing inputs remain Unknown. OI and taker statistics currently remain 1h-only, so rules that require them are Unknown on 5m/15m.
 
 ## Using Research
 
@@ -149,7 +149,7 @@ Planning reports each stage separately, including local history ranges, cached s
 
 OKX rate limits (`HTTP 429` or API code `50011`) keep Research active and automatically retry the current request. Requests share pacing and cooldowns, honor `Retry-After`, and use exponential backoff with jitter capped at 60 seconds unless OKX asks for a longer wait. The task panel shows the automatic retry countdown. Completed catalog pages, REST pages, and partial archive downloads remain reusable; Pause and Cancel interrupt the wait immediately.
 
-Older OKX candle archives may contain `None` for currency volumes while their prices and contract volumes are valid. Research imports complete hourly OHLC, converts available contract volume with verified contract metadata, and records missing quote-currency volume as Unknown. Missing currency volume does not fail the entire archive; VWAP and volume-dependent readings require the corresponding actual inputs. Retrying after a parser update reuses cached originals.
+Older OKX candle archives may contain `None` for currency volumes while their prices and contract volumes are valid. Research imports complete hourly OHLC, converts available contract volume with verified contract metadata, and records missing quote-currency volume as Unknown. REST candle fallback requests only `5m` market candles and locally builds complete hourly OHLCV. Missing currency volume does not fail the entire archive; VWAP and volume-dependent readings require the corresponding actual inputs. Retrying after a parser update reuses cached originals.
 
 Archive minutes marked `confirm=0` are skipped and reported separately from malformed records. Missing required candle hours are supplemented with confirmed REST history; an inspected archive alone never makes those hours complete. API pacing follows each endpoint's published quota, including separate instrument quotas for funding, open interest, and taker volume.
 
@@ -176,7 +176,7 @@ Choose Light, Dark, or System in the native **Appearance** menu. **Settings** co
 
 | Location | Contents |
 | --- | --- |
-| `~/Library/Application Support/PerpetualRadar/radar.sqlite3` | Completed hourly candles/statistics, EMA state, saved Universe/Bullish Setup strategies and shared settings |
+| `~/Library/Application Support/PerpetualRadar/radar.sqlite3` | Confirmed 5m source candles, derived 15m/1h candles, hourly statistics, EMA state, saved Universe/Bullish Setup strategies and shared settings |
 | `~/Library/Application Support/PerpetualRadar/Research/research.sqlite3` | Normalized historical data, frozen experiments, results, and checkpoints |
 | `~/Library/Application Support/PerpetualRadar/Research/Raw/` | Downloaded research source files |
 

@@ -375,16 +375,19 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if let request = parameters["compileMarketFilters"] as? [String: Any] { return radar.compileMarketFilters(request) }
         if let request = parameters["previewMarketFilters"] as? [String: Any], let json = request["filtersJSON"] as? String, let token = request["token"] as? String {
-            return decorated(try await radar.previewMarketFilters(filtersJSON: json, token: token, atClose: request["atClose"] as? Bool == true, strategyID: request["strategyID"] as? String))
+            guard let timeframe = CandleTimeframe(requestValue: request["timeframe"] as? String) else { throw FilterError("Invalid Radar timeframe.") }
+            return decorated(try await radar.previewMarketFilters(filtersJSON: json, token: token, atClose: request["atClose"] as? Bool == true, strategyID: request["strategyID"] as? String, timeframe: timeframe))
         }
         if let request = parameters["explainMarketFilters"] as? [String: Any], let json = request["filtersJSON"] as? String, let token = request["token"] as? String, let id = request["instId"] as? String {
-            return try await radar.explainMarketFilters(instId: id, filtersJSON: json, token: token, atClose: request["atClose"] as? Bool == true, strategyID: request["strategyID"] as? String)
+            guard let timeframe = CandleTimeframe(requestValue: request["timeframe"] as? String) else { throw FilterError("Invalid Radar timeframe.") }
+            return try await radar.explainMarketFilters(instId: id, filtersJSON: json, token: token, atClose: request["atClose"] as? Bool == true, strategyID: request["strategyID"] as? String, timeframe: timeframe)
         }
         if let id = parameters["chartInstId"] as? String {
-            if let endHour = parameters["chartEndHour"] as? Int64 { return decorated(await radar.loadHistoricalChart(id, endingAt: endHour)) }
-            if parameters["loadChart"] as? Bool == true { return decorated(await radar.loadChart(id)) }
+            guard let timeframe = CandleTimeframe(requestValue: parameters["timeframe"] as? String) else { throw FilterError("Invalid chart timeframe.") }
+            if let endHour = parameters["chartEndHour"] as? Int64 { return decorated(await radar.loadHistoricalChart(id, endingAt: endHour, timeframe: timeframe)) }
+            if parameters["loadChart"] as? Bool == true { return decorated(await radar.loadChart(id, timeframe: timeframe)) }
             let since = (parameters["serviceSession"] as? String).map { $0 == sessionID } == false ? nil : parameters["sinceRevision"] as? Int
-            return decorated(radar.chartSnapshot(id, sinceRevision: since))
+            return decorated(radar.chartSnapshot(id, sinceRevision: since, timeframe: timeframe))
         }
         if ["frostedBackgroundEnabled", "frostedBackgroundOpacity", "windowBlurRadius", "floatingBlurRadius"].contains(where: { parameters[$0] != nil }) {
             let enabled = parameters["frostedBackgroundEnabled"] as? Bool, opacity = parameters["frostedBackgroundOpacity"] as? Double
@@ -404,7 +407,8 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if let value = parameters["filterLibraryPreferencesJSON"] { guard let json = value as? String else { throw FilterError("Invalid condition library preferences.") }; try radar.setFilterLibraryPreferences(json) }
         let since = (parameters["serviceSession"] as? String).map { $0 == sessionID } == false ? nil : parameters["sinceRevision"] as? Int
-        return decorated(try await radar.asyncSnapshot(rocPeriod: parameters["rocPeriod"] as? Int ?? 9, marocPeriod: parameters["marocPeriod"] as? Int ?? 9, sinceRevision: since))
+        guard let timeframe = CandleTimeframe(requestValue: parameters["timeframe"] as? String) else { throw FilterError("Invalid Radar timeframe.") }
+        return decorated(try await radar.asyncSnapshot(rocPeriod: parameters["rocPeriod"] as? Int ?? 9, marocPeriod: parameters["marocPeriod"] as? Int ?? 9, timeframe: timeframe, sinceRevision: since))
     }
     @objc private func checkForUpdatesNow() {
         if updateState == "available", let update { presentUpdate(update) }

@@ -10,6 +10,7 @@ import { cn } from "@/lib/utils"
 import { FilterReadings, type ReadingContext } from "@/FilterReadings"
 import { ruleSentence } from "@/filter-builder"
 import { findRule, parseFilterConfig, previewResponseIsCurrent, newRuleID, type FilterConfigV2, type FilterTrace, type FilterTruth, type NativeMarketRow } from "@/rule-engine"
+import { timeframeLabel, type RadarTimeframe } from '@/timeframe'
 
 function Truth({ value }: { value: FilterTruth | undefined }) {
   const Icon = value === "true" ? Check : value === "false" ? X : CircleHelp
@@ -30,14 +31,14 @@ export function TraceNode({ trace, config, context }: { trace: FilterTrace; conf
   </details>
 }
 
-type Props = ReadingContext & { atClose?: boolean; strategyID?: string; open: boolean; onOpenChange: (open: boolean) => void; instId: string | null; onSelect: (id: string) => void; rows: NativeMarketRow[]; results: Record<string, FilterTruth>; filtersJSON: string | null; revision: number }
-export function FilterExplanation({ open, onOpenChange, instId, onSelect, rows, results, filtersJSON, revision, metrics, expressions, units, templates, atClose, strategyID }: Props) {
+type Props = ReadingContext & { atClose?: boolean; strategyID?: string; timeframe?: RadarTimeframe; open: boolean; onOpenChange: (open: boolean) => void; instId: string | null; onSelect: (id: string) => void; rows: NativeMarketRow[]; results: Record<string, FilterTruth>; filtersJSON: string | null; revision: number }
+export function FilterExplanation({ open, onOpenChange, instId, onSelect, rows, results, filtersJSON, revision, metrics, expressions, units, templates, atClose, strategyID, timeframe = '1H' }: Props) {
   const [search, setSearch] = useState(''), [limit, setLimit] = useState(50)
   const config = useMemo(() => filtersJSON ? parseFilterConfig(filtersJSON) : null, [filtersJSON])
   const searched = rows.filter(row => row.instId.toLowerCase().includes(search.trim().toLowerCase()))
   const context = { metrics, expressions, units, templates }
   const id = instId ?? rows[0]?.instId
-  const key = `${id ?? ""}|${filtersJSON ?? ""}|${atClose}|${strategyID ?? ""}`
+  const key = `${id ?? ""}|${filtersJSON ?? ""}|${atClose}|${strategyID ?? ""}|${timeframe}`
   const [detail, setDetail] = useState<{ key: string; revision: number; trace: FilterTrace | null; error: string } | null>(null)
   const trace = detail?.key === key ? detail.trace : null
   const error = detail?.key === key && detail.revision >= revision ? detail.error : ""
@@ -46,18 +47,18 @@ export function FilterExplanation({ open, onOpenChange, instId, onSelect, rows, 
     if (!open || !id || !filtersJSON) return
     let stopped = false
     const token = newRuleID()
-    void window.webkit.messageHandlers.radar.postMessage({ explainMarketFilters: { instId: id, filtersJSON, token, atClose, strategyID } }).then(response => {
+    void window.webkit.messageHandlers.radar.postMessage({ explainMarketFilters: { instId: id, filtersJSON, token, atClose, strategyID, timeframe } }).then(response => {
       if (!stopped && response.instId === id && previewResponseIsCurrent(response, token, revision)) setDetail({ key, revision: response.revision, trace: response.trace, error: "" })
     }).catch(cause => { if (!stopped) setDetail(previous => ({ key, revision, trace: previous?.key === key ? previous.trace : null, error: cause instanceof Error ? cause.message : "Cannot explain this contract." })) })
     return () => { stopped = true }
-  }, [open, id, filtersJSON, revision, key, atClose, strategyID])
+  }, [open, id, filtersJSON, revision, key, atClose, strategyID, timeframe])
   return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent className="flex h-[min(calc(var(--market-list-layout-height)*0.85),60rem)] w-[min(calc(var(--market-list-layout-width)*0.92),84rem)] max-w-none scale-(--market-list-scale) flex-col gap-3 sm:max-w-none">
     <DialogHeader><DialogTitle>Market rule explanations</DialogTitle><DialogDescription>Inspect matching, unmatched, and unknown markets using the current valid preview. Times use your local time zone.</DialogDescription></DialogHeader>
     <div className="grid min-h-0 flex-1 grid-cols-[18rem_minmax(0,1fr)] gap-4">
       <Command className="border" shouldFilter={false}><CommandInput placeholder="Search all contracts…" value={search} onValueChange={value => { setSearch(value); setLimit(50) }} /><CommandList className="max-h-none"><CommandEmpty>No contracts found.</CommandEmpty>{searched.slice(0, limit).map(row => <CommandItem key={row.instId} value={row.instId} onSelect={() => onSelect(row.instId)} data-current={id === row.instId}><span className="flex-1">{row.instId.replace(/-USDT-SWAP$/, "")}</span><Truth value={results[row.instId]} /></CommandItem>)}{searched.length > limit && <Button type="button" variant="ghost" className="w-full" onClick={() => setLimit(limit + 50)}>Show more contracts</Button>}</CommandList></Command>
       <section aria-label="Rule decision details" className="min-h-0 overflow-y-auto">
         <div className="mb-3 flex items-center gap-2"><ScanSearch className="size-4" aria-hidden="true" /><span className="font-medium">{id ?? "Waiting for markets"}</span><Truth value={trace?.result ?? (id ? results[id] : undefined)} /><Button variant="ghost" size="sm" className="ml-auto" onClick={() => onOpenChange(false)}>Done</Button></div>
-        {loading && <p className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner aria-hidden="true" />Explaining hourly rules…</p>}
+        {loading && <p className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner aria-hidden="true" />Explaining {timeframeLabel(timeframe)} rules…</p>}
         {error && <FieldError role="alert">{error}</FieldError>}
         {trace && <TraceNode trace={trace} config={config} context={context} />}
       </section>

@@ -41,6 +41,7 @@ import type { AnalysisSettings, AnalysisSettingsRequest } from '@/chart-analysis
 import type { ChartCaptureBounds, ChartImage } from '@/chart-capture'
 import { BlurControls } from '@/BlurSettings'
 import { initialBlurSettings, useBlurSettings, withSettingsDeadline, type BlurSettings } from '@/blur-settings'
+import { RADAR_TIMEFRAMES, timeframeLabel, type RadarTimeframe } from '@/timeframe'
 
 const SuiteWorkspace = lazy(() => import('@/SuiteWorkspace').then(module => ({ default: module.SuiteWorkspace })))
 const Research = lazy(() => import('@/Research').then(module => ({ default: module.Research })))
@@ -49,7 +50,7 @@ type WindowAppearance = BlurSettings & { frostedBackgroundEnabled: boolean; fros
 type NotificationSettings = { backgroundMonitoringEnabled: boolean; notificationsEnabled: boolean; notificationAuthorization: "notDetermined" | "denied" | "authorized" | "quiet" | "unavailable"; notificationError: string; backgroundMonitoringError: string; monitoringPaused: boolean; launchAtLogin: "enabled" | "disabled" | "requiresApproval" | "unavailable"; launchAtLoginError: string }
 type HistoryProgress = { pending: number; completed: number; error: string }
 type ChartMoveSettings = { chartMoveLabelsVisible: boolean; chartMoveEfficiencyFactor: number }
-type Snapshot = WindowAppearance & NotificationSettings & ChartMoveSettings & { rows: NativeMarketRow[]; updatedAt: number | null; error: string; revision: number; serviceSession?: string; filterMetricsCatalog: FilterMetric[]; filterFunctions: string[]; filterFunctionCatalog: ExpressionTemplate[]; filterLibraryPreferences: FilterLibraryPreferences; }
+type Snapshot = WindowAppearance & NotificationSettings & ChartMoveSettings & { rows: NativeMarketRow[]; updatedAt: number | null; error: string; revision: number; serviceSession?: string; timeframe?: RadarTimeframe; intervalMS?: number; filterMetricsCatalog: FilterMetric[]; filterFunctions: string[]; filterFunctionCatalog: ExpressionTemplate[]; filterLibraryPreferences: FilterLibraryPreferences; }
 type PreviewSnapshot = Snapshot & { filterResults: Record<string, FilterTruth>; filterToken: string; historyProgress: HistoryProgress }
 type UnchangedSnapshot = { unchanged: true; revision: number; error: string; serviceSession?: string }
 type SettingRequest = Partial<WindowAppearance & ChartMoveSettings> & { backgroundMonitoringEnabled?: boolean; notificationsEnabled?: boolean; monitoringPaused?: boolean; launchAtLogin?: boolean; notificationAction?: "refresh" | "requestPermission" | "test" | "openSettings"; filterLibraryPreferencesJSON?: string }
@@ -62,15 +63,15 @@ type NativeBridge = {
   postMessage(request: { suite: SuiteRequest }): Promise<SuiteResponse>
   postMessage(request: { research: ResearchRequest }): Promise<ResearchResponse>
   postMessage(request: { foregroundWorkspace: "radar" | "research" }): Promise<{ ok: boolean }>
-  postMessage(request: { rocPeriod: number; marocPeriod: number; sinceRevision: number; serviceSession?: string }): Promise<Snapshot | UnchangedSnapshot>
+  postMessage(request: { rocPeriod: number; marocPeriod: number; timeframe?: RadarTimeframe; sinceRevision: number; serviceSession?: string }): Promise<Snapshot | UnchangedSnapshot>
   postMessage(request: { compileMarketFilters: { filtersJSON?: string; source?: string; previousJSON?: string; suitePhase?: string } }): Promise<CompileResponse>
-  postMessage(request: { previewMarketFilters: { filtersJSON: string; token: string; atClose?: boolean; strategyID?: string } }): Promise<PreviewSnapshot>
-  postMessage(request: { explainMarketFilters: { instId: string; filtersJSON: string; token: string; atClose?: boolean; strategyID?: string } }): Promise<ExplainResponse>
+  postMessage(request: { previewMarketFilters: { filtersJSON: string; token: string; atClose?: boolean; strategyID?: string; timeframe?: RadarTimeframe } }): Promise<PreviewSnapshot>
+  postMessage(request: { explainMarketFilters: { instId: string; filtersJSON: string; token: string; atClose?: boolean; strategyID?: string; timeframe?: RadarTimeframe } }): Promise<ExplainResponse>
   postMessage(request: SettingRequest): Promise<Snapshot>
   postMessage(request: { captureChart: { x: number; y: number; width: number; height: number; backgroundRGB: number[] } }): Promise<{ ok: boolean }>
   postMessage(request: { windowTintRGB: number[] }): Promise<{ ok: boolean }>
   postMessage(request: { previewWindowBlur: number | null }): Promise<{ ok: boolean }>
-  postMessage(request: { chartInstId: string; loadChart?: boolean; sinceRevision?: number; chartEndHour?: number; serviceSession?: string }): Promise<ChartPollResponse>
+  postMessage(request: { chartInstId: string; timeframe?: RadarTimeframe; loadChart?: boolean; sinceRevision?: number; chartEndHour?: number; serviceSession?: string }): Promise<ChartPollResponse>
 }
 declare global {
   interface Window { radarNotificationContract?: string; radarNotificationStrategy?: string; radarAppearance?: WindowAppearance & { nativeWindowBackground?: boolean }; webkit: { messageHandlers: { radar: NativeBridge } } }
@@ -96,31 +97,31 @@ const takerImbalanceFormula = <span data-header-formula="html" className="inline
   <span>× 100%</span>
 </span>
 
-function BreakReadings({ result, direction }: { result: BreakResult; direction: BreakDirection }) {
-  const description = describeBreak(result, direction)
+function BreakReadings({ result, direction, timeframe }: { result: BreakResult; direction: BreakDirection; timeframe: RadarTimeframe }) {
+  const description = describeBreak(result, direction, timeframe)
   const hasEvent = result.status === "event"
   return <Fragment>
     <span className={cn("inline-flex items-baseline justify-end gap-1", hasEvent ? direction === "high" ? "text-positive" : "text-destructive" : "text-muted-foreground")} title={description}>
       <span className="sr-only">{direction === "high" ? "High breakout" : "Low breakdown"} </span>
       {hasEvent && <span aria-hidden="true">{direction === "high" ? "↑" : "↓"}</span>}
-      {(hasEvent && result.live) || result.status === "loading" ? <Badge variant={result.status === "loading" ? "outline" : "secondary"}>{formatBreakTime(result)}</Badge> : formatBreakTime(result)}
+      {(hasEvent && result.live) || result.status === "loading" ? <Badge variant={result.status === "loading" ? "outline" : "secondary"}>{formatBreakTime(result, timeframe)}</Badge> : formatBreakTime(result, timeframe)}
     </span>
     <span className="text-xs text-muted-foreground" title={description}>
-      <span className="sr-only">Previous {direction === "high" ? "high" : "low"} age at the break </span>{formatBreakPriorAge(result)}
+      <span className="sr-only">Previous {direction === "high" ? "high" : "low"} age at the break </span>{formatBreakPriorAge(result, timeframe)}
     </span>
   </Fragment>
 }
 
-const MarketRowView = memo(function MarketRowView({ row, index, onSelect, onExplain, canExplain, confirmed, provisional }: { canExplain: boolean; confirmed?: SuiteReading; provisional?: SuiteReading; row: NativeMarketRow; index: number; onSelect: (id: string) => void; onExplain: (id: string) => void }) {
+const MarketRowView = memo(function MarketRowView({ row, index, onSelect, onExplain, canExplain, confirmed, provisional, timeframe }: { canExplain: boolean; confirmed?: SuiteReading; provisional?: SuiteReading; row: NativeMarketRow; index: number; onSelect: (id: string) => void; onExplain: (id: string) => void; timeframe: RadarTimeframe }) {
   return <TableRow data-market-index={index} aria-rowindex={index + 2} interactive tabIndex={0} aria-label={`View ${row.instId} chart`} onClick={() => onSelect(row.instId)} onKeyDown={event => {
     if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect(row.instId) }
   }}>
     <TableCell className="pl-[var(--market-table-leading-inset)] text-left" title={row.instId}>
       <span className="font-medium">{row.instId.replace(/-USDT-SWAP$/, "")}</span>
-      {(confirmed || provisional) && <SuitePhaseBadges confirmed={confirmed} provisional={provisional} />}
+      {(confirmed || provisional) && <SuitePhaseBadges confirmed={confirmed} provisional={provisional} timeframe={timeframe} />}
       <div className="flex justify-start gap-2 text-xs tabular-nums">
-        <span title="Latest traded price; hourly indicators use the exchange candle close">{formatPrice(row.lastPrice ?? row.price)}</span>
-        <span className={directionClass(row.priceChange)} title={`Hourly candle close change from the previous completed hour. ${PERCENT_CHANGE_DESCRIPTION}`}>{formatPercent(row.priceChange)}</span>
+        <span title={`Latest traded price; ${timeframeLabel(timeframe)} indicators use the locally aggregated candle close`}>{formatPrice(row.lastPrice ?? row.price)}</span>
+        <span className={directionClass(row.priceChange)} title={`${timeframeLabel(timeframe)} candle close change from the previous completed candle. ${PERCENT_CHANGE_DESCRIPTION}`}>{formatPercent(row.priceChange)}</span>
       </div>
       <div className="flex items-center justify-start gap-3 text-xs tabular-nums">
         <span className="flex gap-1"><span className="text-muted-foreground">Low</span><span>{formatPrice(row.currentLow)}</span></span>
@@ -133,18 +134,18 @@ const MarketRowView = memo(function MarketRowView({ row, index, onSelect, onExpl
     <TableCell className="text-center tabular-nums"><MarketOpportunity instId={row.instId} opportunity={row.opportunity} /><Button variant="ghost" size="sm" className="mt-1" aria-label={`Explain ${row.instId} rules`} disabled={!canExplain} onClick={event => { event.stopPropagation(); onExplain(row.instId) }} onKeyDown={event => event.stopPropagation()}><ScanSearch data-icon="inline-start" aria-hidden="true" />Rules</Button></TableCell>
     <TableCell className="text-center tabular-nums">
       <div className="mx-auto grid w-max grid-cols-[max-content_max-content] items-baseline gap-x-3 text-right">
-        <BreakReadings result={row.highBreakout} direction="high" />
-        <BreakReadings result={row.lowBreakdown} direction="low" />
+        <BreakReadings result={row.highBreakout} direction="high" timeframe={timeframe} />
+        <BreakReadings result={row.lowBreakdown} direction="low" timeframe={timeframe} />
       </div>
     </TableCell>
-    <TableCell className={cn("text-center tabular-nums", directionClass(row.takerRatio))} title={row.buy !== null && row.sell !== null ? `Current 1h provisional cumulative volume · Buy ${row.buy.toLocaleString("en-US")} / Sell ${row.sell.toLocaleString("en-US")} USDT · Imbalance (Buy − Sell) / (Buy + Sell), not Buy / Sell` : "Loading current-hour taker volume"}>{formatPercent(row.takerRatio)}</TableCell>
+    <TableCell className={cn("text-center tabular-nums", directionClass(row.takerRatio))} title={timeframe !== '1H' ? 'Taker volume is currently available on the 1h timeframe.' : row.buy !== null && row.sell !== null ? `Current 1h provisional cumulative volume · Buy ${row.buy.toLocaleString("en-US")} / Sell ${row.sell.toLocaleString("en-US")} USDT · Imbalance (Buy − Sell) / (Buy + Sell), not Buy / Sell` : "Loading current-hour taker volume"}>{formatPercent(row.takerRatio)}</TableCell>
     <TableCell className={cn("text-center tabular-nums", directionClass(row.oiChange))}>{formatPercent(row.oiChange)}</TableCell>
     <TableCell className="text-center tabular-nums">
       <div className="mx-auto grid w-max grid-cols-[max-content_max-content] gap-x-3 text-right">
         <span className={directionClass(row.roc)}><span className="sr-only">ROC </span>{formatPercent(row.roc)}</span>
-        <span className={directionClass(row.rocChange)} title={`Hourly ROC change. ${PERCENT_CHANGE_DESCRIPTION}`}><span className="sr-only">ROC hourly change </span>{formatPercent(row.rocChange)}</span>
+        <span className={directionClass(row.rocChange)} title={`One-candle ROC change. ${PERCENT_CHANGE_DESCRIPTION}`}><span className="sr-only">ROC candle change </span>{formatPercent(row.rocChange)}</span>
         <span className={directionClass(row.maroc)}><span className="sr-only">MAROC </span>{formatPercent(row.maroc)}</span>
-        <span className={directionClass(row.marocChange)} title={`Hourly MAROC change. ${PERCENT_CHANGE_DESCRIPTION}`}><span className="sr-only">MAROC hourly change </span>{formatPercent(row.marocChange)}</span>
+        <span className={directionClass(row.marocChange)} title={`One-candle MAROC change. ${PERCENT_CHANGE_DESCRIPTION}`}><span className="sr-only">MAROC candle change </span>{formatPercent(row.marocChange)}</span>
       </div>
     </TableCell>
     <TableCell className="text-center tabular-nums">
@@ -155,13 +156,13 @@ const MarketRowView = memo(function MarketRowView({ row, index, onSelect, onExpl
     <TableCell className="text-center tabular-nums">
       <div className="flex flex-col items-center text-xs">
         <div className="flex gap-1" title={LOG_BB_DESCRIPTION}><span className="text-muted-foreground">Live</span><span className={cn(row.logBBAboveBand === null ? "text-muted-foreground" : row.logBBAboveBand === "below" ? "text-destructive" : "text-positive")}>{formatLiveBand(row.logBBAboveBand)}</span></div>
-        <div className="flex gap-1" title={BANDWIDTH_EXPANSION_DESCRIPTION}><span className="text-muted-foreground">Expansion</span><span className={cn(row.logBBExpansion && row.logBBExpansion.hours > 0 ? "text-positive" : "text-muted-foreground")}>{formatBandWidthExpansion(row.logBBExpansion)}</span></div>
+        <div className="flex gap-1" title={BANDWIDTH_EXPANSION_DESCRIPTION}><span className="text-muted-foreground">Expansion</span><span className={cn(row.logBBExpansion && row.logBBExpansion.hours > 0 ? "text-positive" : "text-muted-foreground")}>{formatBandWidthExpansion(row.logBBExpansion, timeframe)}</span></div>
       </div>
     </TableCell>
   </TableRow>
 })
-const MarketRows = memo(function MarketRows({ rows, onSelect, onExplain, canExplain, confirmed = {}, provisional = {} }: { canExplain: boolean; confirmed?: Record<string, SuiteReading>; provisional?: Record<string, SuiteReading>; rows: NativeMarketRow[]; onSelect: (id: string) => void; onExplain: (id: string) => void }) {
-  return <MarketRowsViewport ids={rows.map(row => row.instId)}>{index => <MarketRowView row={rows[index]} index={index} onSelect={onSelect} onExplain={onExplain} canExplain={canExplain} confirmed={confirmed[rows[index].instId]} provisional={provisional[rows[index].instId]} />}</MarketRowsViewport>
+const MarketRows = memo(function MarketRows({ rows, onSelect, onExplain, canExplain, confirmed = {}, provisional = {}, timeframe }: { canExplain: boolean; confirmed?: Record<string, SuiteReading>; provisional?: Record<string, SuiteReading>; rows: NativeMarketRow[]; onSelect: (id: string) => void; onExplain: (id: string) => void; timeframe: RadarTimeframe }) {
+  return <MarketRowsViewport ids={rows.map(row => row.instId)}>{index => <MarketRowView row={rows[index]} index={index} onSelect={onSelect} onExplain={onExplain} canExplain={canExplain} confirmed={confirmed[rows[index].instId]} provisional={provisional[rows[index].instId]} timeframe={timeframe} />}</MarketRowsViewport>
 })
 
 function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: boolean; onResearch: (inputs: ResearchInputs, spec?: StudySpec) => void; onDecisions: (inputs: ResearchInputs, tab?: 'rules' | 'signals') => void; switchingMode: boolean }) {
@@ -172,14 +173,20 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   const compileEpoch = useRef(0)
   const previewEpoch = useRef(0)
   const [ready, setReady] = useState(false)
-  const suite = useSuite('radar', active)
+  const [timeframe, setTimeframe] = useState<RadarTimeframe>('1H')
+  const timeframeRef = useRef(timeframe)
+  timeframeRef.current = timeframe
+  const suite = useSuite('radar', active, timeframe)
   const activeProfile = suite.snapshot.profiles.find(p => p.id === suite.snapshot.selectedID)
   const activeStrategyID = activeProfile?.id
   const activeProfileRef = useRef<StrategyProfile | undefined>(activeProfile)
   activeProfileRef.current = activeProfile
   const [signalTiming, setSignalTiming] = useState<SignalTiming>('both')
-  const confirmedPhases = useMemo(() => Object.fromEntries((suite.snapshot.confirmed ?? []).map(r => [r.instrument,r])), [suite.snapshot.confirmed])
-  const provisionalPhases = useMemo(() => Object.fromEntries((suite.snapshot.provisional ?? []).map(r => [r.instrument,r])), [suite.snapshot.provisional])
+  const suiteTimeframeCurrent = !suite.snapshot.timeframe || suite.snapshot.timeframe === timeframe
+  const confirmedReadings = useMemo(() => suiteTimeframeCurrent ? suite.snapshot.confirmed ?? [] : [], [suiteTimeframeCurrent, suite.snapshot.confirmed])
+  const provisionalReadings = useMemo(() => suiteTimeframeCurrent ? suite.snapshot.provisional ?? [] : [], [suiteTimeframeCurrent, suite.snapshot.provisional])
+  const confirmedPhases = useMemo(() => Object.fromEntries(confirmedReadings.map(r => [r.instrument,r])), [confirmedReadings])
+  const provisionalPhases = useMemo(() => Object.fromEntries(provisionalReadings.map(r => [r.instrument,r])), [provisionalReadings])
   const [listFilters, setListFilters] = useState<FilterConfigV2>(emptyFilterConfig)
   const [filterDraft, setFilterDraft] = useState<FilterConfigV2 | null>(null)
   const [editor, setEditor] = useState<FilterEditorState>(initialEditorState)
@@ -275,6 +282,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     return () => theme.removeEventListener("change", updateTint)
   }, [frostedBackgroundEnabled, frostedBackgroundOpacity])
   const acceptSnapshot = (snapshot: Snapshot) => {
+    if (snapshot.timeframe && snapshot.timeframe !== timeframeRef.current) return false
     if (!snapshotOrder.current.accept(snapshot)) return false
     serviceSession.current = snapshotOrder.current.serviceSession
     revision.current = snapshotOrder.current.revision
@@ -320,7 +328,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
         return
       }
       try {
-        const snapshot = await window.webkit.messageHandlers.radar.postMessage({ rocPeriod: ROC_PERIOD, marocPeriod: MAROC_PERIOD, sinceRevision: revision.current, serviceSession: serviceSession.current })
+        const snapshot = await window.webkit.messageHandlers.radar.postMessage({ rocPeriod: ROC_PERIOD, marocPeriod: MAROC_PERIOD, timeframe, sinceRevision: revision.current, serviceSession: serviceSession.current })
         if (stopped) return
         if ("unchanged" in snapshot) {
           setStatus("Live")
@@ -342,7 +350,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     let timer: number
     void load()
     return () => { stopped = true; window.clearTimeout(timer) }
-  }, [active])
+  }, [active, timeframe])
   useEffect(() => {
     if (!active || !ready || !activeStrategyID) return
     const epoch = ++compileEpoch.current
@@ -376,7 +384,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     const refresh = async () => {
       await pageVisible(); if (stopped) return
       try {
-        const snapshot = await window.webkit.messageHandlers.radar.postMessage({ previewMarketFilters: { filtersJSON: lastValidJSON, token, strategyID: activeStrategyID } })
+        const snapshot = await window.webkit.messageHandlers.radar.postMessage({ previewMarketFilters: { filtersJSON: lastValidJSON, token, strategyID: activeStrategyID, timeframe } })
         if (stopped || epoch !== previewEpoch.current) return
         if (snapshotOrder.current.isCurrent(snapshot) && previewResponseIsCurrent(snapshot, token, snapshot.serviceSession && snapshot.serviceSession !== serviceSession.current ? -1 : revision.current)) startTransition(() => {
           const updated = acceptSnapshot(snapshot)
@@ -397,9 +405,9 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     }
     void refresh()
     return () => { stopped = true; window.clearTimeout(timer) }
-  }, [active, lastValidJSON, activeStrategyID])
+  }, [active, lastValidJSON, activeStrategyID, timeframe])
 
-  const signals = useMemo(() => activeProfile ? radarSignals(suite.snapshot.confirmed ?? [], suite.snapshot.provisional ?? [], activeProfile.id, activeProfile.revision, signalTiming) : [], [activeProfile, suite.snapshot.confirmed, suite.snapshot.provisional, signalTiming])
+  const signals = useMemo(() => activeProfile ? radarSignals(confirmedReadings, provisionalReadings, activeProfile.id, activeProfile.revision, signalTiming) : [], [activeProfile, confirmedReadings, provisionalReadings, signalTiming])
   const matchedRows = useMemo(() => rows.filter(row => activeProfile ? confirmedPhases[row.instId]?.universe === "true" || provisionalPhases[row.instId]?.universe === "true" : true), [rows,activeProfile,confirmedPhases,provisionalPhases])
   const searchedRows = useMemo(() => rows.filter(row => row.instId.toLowerCase().includes(query.trim().toLowerCase())), [rows, query])
   const searchedSignals = useMemo(() => signals.filter(signal => signal.instrument.toLowerCase().includes(query.trim().toLowerCase())), [signals, query])
@@ -487,7 +495,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     </Button>
   }
 
-  if (selected && active) return <MarketChart instId={selected} listOrder={signalChartOrder ?? listOrder} turnoverOrder={turnoverOrder} moveDefaults={chartMoveSettings} onMoveEfficiencyFactorChange={value => {
+  if (selected && active) return <MarketChart instId={selected} timeframe={timeframe} onTimeframeChange={setTimeframe} listOrder={signalChartOrder ?? listOrder} turnoverOrder={turnoverOrder} moveDefaults={chartMoveSettings} onMoveEfficiencyFactorChange={value => {
     setChartMoveSettings(current => ({ ...current, chartMoveEfficiencyFactor: value }))
     setChartEfficiencyFactorDraft(String(value))
     saveSetting({ chartMoveEfficiencyFactor: value })
@@ -582,17 +590,18 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
         <span className="text-xs text-muted-foreground">{updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString("en-US")}` : "Waiting for data"}</span>
       </header>
       <div className="flex items-center gap-4 border-b px-4 py-3">
+        <Field orientation="horizontal" className="w-fit"><FieldLabel>Timeframe</FieldLabel><ToggleGroup type="single" variant="outline" value={timeframe} onValueChange={value => { if (value) { revision.current = -1; setRows([]); setResults({}); setStatus('Loading'); setTimeframe(value as RadarTimeframe) } }} aria-label="Radar timeframe">{RADAR_TIMEFRAMES.map(item => <ToggleGroupItem key={item.value} value={item.value}>{item.label}</ToggleGroupItem>)}</ToggleGroup></Field>
         <Field orientation="horizontal" className="w-fit"><FieldLabel htmlFor="radar-strategy">Active strategy</FieldLabel><Select value={activeProfile?.id ?? 'none'} disabled={suite.pending || filterDraft !== null || editor.source !== null} onValueChange={chooseStrategy}><SelectTrigger id="radar-strategy" className="w-72" aria-label="Active Radar strategy"><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="none">No active strategy</SelectItem>{suite.snapshot.profiles.map(profile => <SelectItem key={profile.id} value={profile.id}>{profile.name} · r{profile.revision}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>
-        {activeProfile ? <ToggleGroup type="single" variant="outline" value={signalTiming} onValueChange={value => { if (value) setSignalTiming(value as SignalTiming) }} aria-label="Signal timing"><ToggleGroupItem value="both">Both hours</ToggleGroupItem><ToggleGroupItem value="confirmed">Confirmed</ToggleGroupItem><ToggleGroupItem value="provisional">Provisional</ToggleGroupItem></ToggleGroup> : <span className="text-xs text-muted-foreground">Choose a shared strategy to watch Bullish Setup signals.</span>}
+        {activeProfile ? <ToggleGroup type="single" variant="outline" value={signalTiming} onValueChange={value => { if (value) setSignalTiming(value as SignalTiming) }} aria-label="Signal timing"><ToggleGroupItem value="both">Both states</ToggleGroupItem><ToggleGroupItem value="confirmed">Confirmed</ToggleGroupItem><ToggleGroupItem value="provisional">Provisional</ToggleGroupItem></ToggleGroup> : <span className="text-xs text-muted-foreground">Choose a shared strategy to watch Bullish Setup signals.</span>}
         {(filterDraft !== null || editor.source !== null) && <span className="ml-auto text-xs text-muted-foreground">Apply or discard Universe edits before changing strategy</span>}
       </div>
       {suite.ready && !activeProfile && <Empty className="border-b"><EmptyHeader><EmptyTitle>Activate a strategy to monitor signals</EmptyTitle><EmptyDescription>All markets remain available below. Create a Strategy with Universe and Bullish Setup rules to enable signals and confirmed alerts.</EmptyDescription></EmptyHeader><EmptyContent><Button variant="outline" onClick={() => onDecisions({ metrics, templates, functions })}>Strategy Library…</Button></EmptyContent></Empty>}
       {suite.error && <p role="alert" className="px-4 text-destructive">{suite.error}</p>}
       {activeProfile && <StrategyRules label="Universe rules" filters={listFilters} draft={filterDraft} editor={editor} onEditorChange={setEditor} onDraftChange={setFilterDraft} onApply={saveUniverse} metrics={allowedMetrics} templates={templates} preferences={libraryPreferences} onPreferences={saveLibraryPreferences} previewJSON={previewJSON} units={compilation.units ?? {}} expressions={editorExpressions} diagnostics={compilation.diagnostics} valid={valid} compiling={compiling} requiredHours={compilation.requiredHours ?? 0} matches={searchedRows.filter(row => results[row.instId] === 'true').length} total={searchedRows.length} unknown={unknownCount} previewPending={lastValidJSON !== previewJSON} history={history} />}
-      {activeProfile && <SuitePhaseExplanation instrument={phaseExplainingID} profile={activeProfile} inputs={{metrics,templates,functions}} onClose={() => setPhaseExplainingID(null)} />}
-      {activeProfile && <FilterExplanation strategyID={activeProfile.id} open={explanationOpen} onOpenChange={setExplanationOpen} instId={explainingId} onSelect={setExplainingId} rows={rows} results={results} filtersJSON={previewJSON} revision={revision.current} metrics={metrics} expressions={editorExpressions} units={compilation.units ?? {}} templates={templates} />}
+      {activeProfile && <SuitePhaseExplanation instrument={phaseExplainingID} profile={activeProfile} inputs={{metrics,templates,functions}} timeframe={timeframe} onClose={() => setPhaseExplainingID(null)} />}
+      {activeProfile && <FilterExplanation strategyID={activeProfile.id} timeframe={timeframe} open={explanationOpen} onOpenChange={setExplanationOpen} instId={explainingId} onSelect={setExplainingId} rows={rows} results={results} filtersJSON={previewJSON} revision={revision.current} metrics={metrics} expressions={editorExpressions} units={compilation.units ?? {}} templates={templates} />}
       {error && <p role="alert" className="border-b px-4 py-2 text-sm text-destructive">{error}</p>}
-      {activeProfile && <RadarSignalBoard profile={activeProfile} signals={searchedSignals} rows={rows} paused={suite.snapshot.paused} recovering={suite.snapshot.recovering} onChart={(instrument, order) => { setSignalChartOrder(order); setSelected(instrument) }} onExplain={explainRow} onResearch={() => onResearch({ metrics, templates, functions }, suiteSpec([activeProfile]))} onBrowseCharts={() => document.getElementById('all-markets')?.scrollIntoView({ behavior: 'smooth', block: 'start' })} />}
+       {activeProfile && <RadarSignalBoard profile={activeProfile} timeframe={timeframe} signals={searchedSignals} rows={rows} paused={suite.snapshot.paused} recovering={suite.snapshot.recovering} onChart={(instrument, order) => { setSignalChartOrder(order); setSelected(instrument) }} onExplain={explainRow} onResearch={() => onResearch({ metrics, templates, functions }, suiteSpec([activeProfile]))} onBrowseCharts={() => document.getElementById('all-markets')?.scrollIntoView({ behavior: 'smooth', block: 'start' })} />}
       <section id="all-markets" aria-label="Perpetual swap markets" className="flex-1 scroll-mt-4">
         <header className="border-y px-4 py-3"><h2 className="font-semibold">All markets</h2></header>
         <Table className="table-fixed" data-market-count={visible.length} aria-rowcount={visible.length + 1}>
@@ -616,18 +625,18 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
               <TableHead className="text-center" aria-sort={sort === "opportunity" ? descending ? "descending" : "ascending" : "none"}>{header("Opportunity", "opportunity", undefined, OPPORTUNITY_DESCRIPTION)}</TableHead>
               <TableHead className="py-1.5 text-center" aria-sort={["highBreakout", "highBreakoutPriorAge", "lowBreakdown", "lowBreakdownPriorAge"].includes(sort) ? descending ? "descending" : "ascending" : "none"}>
                 <div className="mx-auto grid w-max grid-cols-[max-content_max-content] items-center gap-x-3">
-                  {header("High breakout · 48h", "highBreakout", undefined, BREAK_DESCRIPTION)}
+                  {header(`High breakout · 48 × ${timeframeLabel(timeframe)}`, "highBreakout", undefined, BREAK_DESCRIPTION)}
                   {header("High age", "highBreakoutPriorAge", undefined, "Sort by the previous high's age at the breakout, longest first. Tied highs use the most recent occurrence.")}
-                  {header("Low breakdown · 48h", "lowBreakdown", undefined, BREAK_DESCRIPTION)}
+                  {header(`Low breakdown · 48 × ${timeframeLabel(timeframe)}`, "lowBreakdown", undefined, BREAK_DESCRIPTION)}
                   {header("Low age", "lowBreakdownPriorAge", undefined, "Sort by the previous low's age at the breakdown, longest first. Tied lows use the most recent occurrence.")}
                 </div>
               </TableHead>
               <TableHead className="text-center" aria-sort={sort === "takerRatio" ? descending ? "descending" : "ascending" : "none"}>{header("Taker imbalance", "takerRatio", takerImbalanceFormula)}</TableHead>
-              <TableHead className="text-center" aria-sort={sort === "oiChange" ? descending ? "descending" : "ascending" : "none"}>{header("OI Relative Change", "oiChange", undefined, `Hourly change in OI contracts, unaffected by price-only changes. ${PERCENT_CHANGE_DESCRIPTION}`)}</TableHead>
+              <TableHead className="text-center" aria-sort={sort === "oiChange" ? descending ? "descending" : "ascending" : "none"}>{header("OI Relative Change", "oiChange", undefined, timeframe === '1H' ? `Hourly change in OI contracts, unaffected by price-only changes. ${PERCENT_CHANGE_DESCRIPTION}` : 'OI change is currently available on the 1h timeframe.')}</TableHead>
               <TableHead className="py-1.5 text-center" aria-sort={sort === "roc" || sort === "maroc" ? descending ? "descending" : "ascending" : "none"}>
                 <div className="flex flex-col items-center">
-                  {header(`ROC ${ROC_PERIOD}`, "roc", indicatorFormula('ROC', ROC_PERIOD), `${ROC_PERIOD}-hour price change. ${PERCENT_CHANGE_DESCRIPTION}`)}
-                  {header(`MAROC ${MAROC_PERIOD}`, "maroc", indicatorFormula('MAROC', MAROC_PERIOD), `Mean of the latest ${MAROC_PERIOD} hourly ROC readings, as a percentage.`)}
+                  {header(`ROC ${ROC_PERIOD}`, "roc", indicatorFormula('ROC', ROC_PERIOD), `${ROC_PERIOD}-candle price change on ${timeframeLabel(timeframe)} candles. ${PERCENT_CHANGE_DESCRIPTION}`)}
+                  {header(`MAROC ${MAROC_PERIOD}`, "maroc", indicatorFormula('MAROC', MAROC_PERIOD), `Mean of the latest ${MAROC_PERIOD} ${timeframeLabel(timeframe)} ROC readings, as a percentage.`)}
                 </div>
               </TableHead>
               <TableHead className="py-1.5 text-center" aria-sort={sort.startsWith("rsi") ? descending ? "descending" : "ascending" : "none"}>
@@ -643,9 +652,9 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
               </TableHead>
             </TableRow>
           </TableHeader>
-          {visible.length ? <MarketRows canExplain={Boolean(activeProfile)} confirmed={confirmedPhases} provisional={provisionalPhases} rows={visible} onSelect={setSelected} onExplain={explainRow} /> : <TableBody><TableRow><TableCell colSpan={8} className="py-12">
+          {visible.length ? <MarketRows canExplain={Boolean(activeProfile)} confirmed={confirmedPhases} provisional={provisionalPhases} rows={visible} onSelect={setSelected} onExplain={explainRow} timeframe={timeframe} /> : <TableBody><TableRow><TableCell colSpan={8} className="py-12">
               <Empty>
-                <EmptyHeader><EmptyTitle>{rows.length ? "No matching contracts" : "Waiting for contracts"}</EmptyTitle><EmptyDescription>{rows.length ? "Adjust the search or inspect the active strategy rules. Explain markets includes unmatched and unknown contracts." : "OKX hourly data is loading. Activate a strategy to monitor its Universe and Bullish Setup."}</EmptyDescription></EmptyHeader>
+                <EmptyHeader><EmptyTitle>{rows.length ? "No matching contracts" : "Waiting for contracts"}</EmptyTitle><EmptyDescription>{rows.length ? "Adjust the search or inspect the active strategy rules. Explain markets includes unmatched and unknown contracts." : `OKX 5m source data is loading for the ${timeframeLabel(timeframe)} view. Activate a strategy to monitor its Universe and Bullish Setup.`}</EmptyDescription></EmptyHeader>
                 <EmptyContent>
                   {filterDraft !== null && <Button variant="outline" size="sm" onClick={() => { setFilterDraft(null); setEditor(current => ({ ...current, source: null })) }}>Discard preview</Button>}
                   {activeProfile && listFilters.root.children.length > 0 && <Button variant="outline" size="sm" onClick={() => { void saveUniverse(emptyFilterConfig()).catch(cause => setError(cause instanceof Error ? cause.message : "Cannot clear Universe rules")) }}>Clear all rules</Button>}

@@ -58,7 +58,7 @@ function segmentMoves(bars: PriceBar[], thresholdPercent: number, mode: PriceMov
   return output
 }
 
-export function capturePriceMoves(input: PriceBar[], thresholdPercent = 1, mode: PriceMoveMode = 'close', objective: PriceMoveObjective = 'amplitude', efficiencyFactor = 1): PriceMoveSignal[] {
+export function capturePriceMoves(input: PriceBar[], thresholdPercent = 1, mode: PriceMoveMode = 'close', objective: PriceMoveObjective = 'amplitude', efficiencyFactor = 1, intervalMS = HOUR_MS): PriceMoveSignal[] {
   if (!Number.isFinite(efficiencyFactor) || efficiencyFactor < 0 || efficiencyFactor > 2) efficiencyFactor = 1
   const valid = (bar: PriceBar) => bar.confirmed && Number.isFinite(bar.close) && bar.close > 0 && Number.isFinite(bar.hour)
     && (mode === 'close' || (Number.isFinite(bar.high) && Number.isFinite(bar.low) && bar.high! >= bar.low! && bar.low! > 0))
@@ -70,7 +70,7 @@ export function capturePriceMoves(input: PriceBar[], thresholdPercent = 1, mode:
     segment = []
   }
   for (const bar of bars) {
-    if (segment.length && bar.hour - segment.at(-1)!.hour !== HOUR_MS) finish()
+    if (segment.length && bar.hour - segment.at(-1)!.hour !== intervalMS) finish()
     segment.push(bar)
   }
   finish()

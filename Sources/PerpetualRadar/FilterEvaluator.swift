@@ -23,6 +23,7 @@ struct FilterMarketData: Sendable {
     var id: String
     var hour: Int64
     var now: Int64
+    var intervalMS: Int64 = hourMS
     var listedAt: Int64?
     var candles: [Int64: Candle]
     var stats: [Int64: FilterStat]
@@ -54,7 +55,7 @@ final class FilterEvaluator {
             if node.kind == "cooldown", node.hours > 0, !filter.usesContractInput(node), filter.referencesBTC(in: node) {
                 _ = rule(node, at: hour, scope: [:], explain: false); return
             }
-            for child in node.children { observe(child, at: hour-(node.mode == "closed" ? hourMS : 0)) }
+            for child in node.children { observe(child, at: hour-(node.mode == "closed" ? market.intervalMS : 0)) }
         }
         if market.cooldowns != nil, market.recordCooldowns { observe(root, at: market.hour) }
         if ["all", "any"].contains(root.kind), root.children.isEmpty {
@@ -103,7 +104,7 @@ final class FilterEvaluator {
         return cached("metric|\(key)|\(hour)", at: hour) { read(key, at: hour) }
     }
     private func read(_ key: String, at hour: Int64) -> FilterScalar {
-        func number(_ n: Double?, _ reason: String = "Hourly data is unavailable.") -> FilterScalar { numeric(n, reason, at: hour) }
+        func number(_ n: Double?, _ reason: String = "Candle data is unavailable.") -> FilterScalar { numeric(n, reason, at: hour) }
         func value(_ name: String) -> FilterScalar { metric(name, at: hour) }
         func fn(_ name: String, _ args: [Double]) -> FilterScalar { indicator(name.lowercased(), args, at: hour) }
         let b = bar(hour)
@@ -111,7 +112,7 @@ final class FilterEvaluator {
         case "Symbol": return .text(market.id)
         case "ListingAgeMonths":
             guard let listedAt = market.listedAt, listedAt > 0 else { return unknown("Listing date is unavailable", at: hour) }
-            let end = hour == market.hour ? market.now : hour + hourMS
+            let end = hour == market.hour ? market.now : hour + market.intervalMS
             let start = Date(timeIntervalSince1970: Double(listedAt) / 1000), now = Date(timeIntervalSince1970: Double(end) / 1000)
             guard start <= now else { return unknown("Listing date is later than this reading", at: hour) }
             var calendar = Calendar(identifier: .gregorian); calendar.timeZone = TimeZone(secondsFromGMT: 0)!
@@ -134,13 +135,13 @@ final class FilterEvaluator {
             return number((buy - sell) / (buy + sell) * 100)
         case "buyVsSell": return relation(value("buy"), value("sell"))
         case "oiChange": return change(number(market.stats[hour]?.oi, "OI contract history is unavailable."),
-                                        number(market.stats[hour - hourMS]?.oi, "Previous OI contract history is unavailable."))
+                                         number(market.stats[hour - market.intervalMS]?.oi, "Previous OI contract history is unavailable."))
         case "oiTrend": return direction(value("oiChange"))
-        case "priceChange": return change(value("Close"), metric("Close", at: hour - hourMS))
+        case "priceChange": return change(value("Close"), metric("Close", at: hour - market.intervalMS))
         case "candleDirection": return relation(value("Close"), value("Open"))
         case "bodyChange": return change(value("Close"), value("Open"))
         case "candleRange": return change(value("High"), value("Low"))
-        case "emaSlope": return change(fn("ema", [200]), indicator("ema", [200], at: hour - hourMS))
+        case "emaSlope": return change(fn("ema", [200]), indicator("ema", [200], at: hour - market.intervalMS))
         case "emaTrend": return direction(value("emaSlope"))
         case "emaDistance": return change(value("Close"), fn("ema", [200]))
         case "priceEMA": return relation(value("Close"), fn("ema", [200]))
@@ -154,8 +155,8 @@ final class FilterEvaluator {
         case "roc": return fn("roc", [9])
         case "maroc": return fn("maroc", [9, 9])
         case "rocVsMaroc": return relation(value("roc"), value("maroc"))
-        case "rocChange": return change(value("roc"), metric("roc", at: hour - hourMS))
-        case "marocChange": return change(value("maroc"), metric("maroc", at: hour - hourMS))
+        case "rocChange": return change(value("roc"), metric("roc", at: hour - market.intervalMS))
+        case "marocChange": return change(value("maroc"), metric("maroc", at: hour - market.intervalMS))
         case "priceUpper": return relation(value("Close"), fn("logbbupper", [20, 2]))
         case "priceMiddle": return relation(value("Close"), fn("logbbmiddle", [20, 2]))
         case "priceLower": return relation(value("Close"), fn("logbblower", [20, 2]))
@@ -168,7 +169,7 @@ final class FilterEvaluator {
             return logBBAboveBand(b?.close, fn("logbbupper", [20, 2]).number, fn("logbbmiddle", [20, 2]).number, fn("logbblower", [20, 2]).number).map { .text($0.rawValue) } ?? number(nil, "Log BB history is unavailable.")
         case "bbWidth": return number(logBBBandWidth(fn("logbbupper", [20, 2]).number, fn("logbbmiddle", [20, 2]).number, fn("logbblower", [20, 2]).number))
         case "bbExpansion", "bbExpansionComplete":
-            guard let expansion = logBBExpansion(market.candles, hour, listedAt: market.listedAt) else { return number(nil, "Expansion history is unavailable.") }
+            guard let expansion = logBBExpansion(market.candles, hour, listedAt: market.listedAt, intervalMS: market.intervalMS) else { return number(nil, "Expansion history is unavailable.") }
             return key == "bbExpansion" ? .number(Double(expansion.hours)) : .text(expansion.complete ? "complete" : "partial")
         case "priceVWAP": return relation(value("Close"), fn("vwap", [14]))
         case "vwapDistance": return change(value("Close"), fn("vwap", [14]))
@@ -198,8 +199,8 @@ final class FilterEvaluator {
         let key = "\(hour)|\(lookback)|\(search)"
         if let cached = breaksCache[key] { return cached }
         let result = market.historicalReadings?.breaks(key) {
-            recentExtremesBreaks(market.candles, hour, listedAt: market.listedAt, lookbackHours: lookback, searchHours: search, historicalReadings: market.historicalReadings)
-        } ?? recentExtremesBreaks(market.candles, hour, listedAt: market.listedAt, lookbackHours: lookback, searchHours: search)
+            recentExtremesBreaks(market.candles, hour, listedAt: market.listedAt, lookbackHours: lookback, searchHours: search, historicalReadings: market.historicalReadings, intervalMS: market.intervalMS)
+        } ?? recentExtremesBreaks(market.candles, hour, listedAt: market.listedAt, lookbackHours: lookback, searchHours: search, intervalMS: market.intervalMS)
         breaksCache[key] = result; return result
     }
     func opportunity(at hour: Int64) -> NativeOpportunity {
@@ -216,21 +217,21 @@ final class FilterEvaluator {
         if referenceOnly { return .unknown("This contract indicator awaits its normal decision clock.") }
         return cached("indicator|\(name)|\(args)|\(hour)", at: hour) {
             let n = Int(args[0])
-            func number(_ x: Double?) -> FilterScalar { numeric(x, "\(name) requires complete hourly history.", at: hour) }
+            func number(_ x: Double?) -> FilterScalar { numeric(x, "\(name) requires complete candle history.", at: hour) }
             if name == "priorhigh" || name == "priorlow" {
-                let extremes = priorExtremes(market.candles, hour, hours: n); return number(name == "priorhigh" ? extremes.high : extremes.low)
+                let extremes = priorExtremes(market.candles, hour, hours: n, intervalMS: market.intervalMS); return number(name == "priorhigh" ? extremes.high : extremes.low)
             }
             if name == "breakoutage" || name == "breakdownage" {
                 let events = extremes(at: hour, lookback: n, search: Int(args[1])), result = name == "breakoutage" ? events.highBreakout : events.lowBreakdown
                 if case .event(let e) = result { return .number(Double(e.hoursAgo)) }
                 return unknown(result == .none ? "No event in the search window" : "Breakout history is incomplete", at: hour)
             }
-            if name == "roc" { return change(metric("Close", at: hour), metric("Close", at: hour - Int64(n) * hourMS)) }
+            if name == "roc" { return change(metric("Close", at: hour), metric("Close", at: hour - Int64(n) * market.intervalMS)) }
             if name == "efficiency" {
                 var closes: [Double] = []
                 for age in 0...n {
                     if Task.isCancelled { return .unknown("Evaluation cancelled.") }
-                    guard let b = bar(hour - Int64(age) * hourMS) else { return number(nil) }; closes.append(b.close)
+                    guard let b = bar(hour - Int64(age) * market.intervalMS) else { return number(nil) }; closes.append(b.close)
                 }
                 let movement = zip(closes, closes.dropFirst()).reduce(0.0) { $0 + abs($1.0 - $1.1) }
                 return number(movement == 0 ? 0 : abs(closes[0] - closes[n]) / movement)
@@ -239,41 +240,41 @@ final class FilterEvaluator {
                 var readings: [Double] = []
                 for offset in 0..<Int(args[1]) {
                     if Task.isCancelled { return .unknown("Evaluation cancelled.") }
-                    guard let x = indicator("roc", [Double(n)], at: hour - Int64(offset) * hourMS).number else { return number(nil) }; readings.append(x)
+                    guard let x = indicator("roc", [Double(n)], at: hour - Int64(offset) * market.intervalMS).number else { return number(nil) }; readings.append(x)
                 }
                 return number(readings.reduce(0) { $0 + $1 / args[1] })
             }
             if name == "rsi" {
-                let available = market.listedAt.map { max(0, Int((hour - $0 / hourMS * hourMS) / hourMS)) } ?? max(250, n)
+                let available = market.listedAt.map { max(0, Int((hour - $0 / market.intervalMS * market.intervalMS) / market.intervalMS)) } ?? max(250, n)
                 let warmup = min(max(250, n), available)
-                guard warmup >= n, (0...warmup).allSatisfy({ bar(hour - Int64($0) * hourMS) != nil }) else { return number(nil) }
-                return number(rsi(market.candles, hour, n, historyHours: warmup))
+                guard warmup >= n, (0...warmup).allSatisfy({ bar(hour - Int64($0) * market.intervalMS) != nil }) else { return number(nil) }
+                return number(rsi(market.candles, hour, n, historyHours: warmup, intervalMS: market.intervalMS))
             }
             if name == "ema" {
                 if n == 200, !market.historicalClose, let previous = market.previousEMA {
                     if hour == market.hour { return number(updatedEMA200(previous, close: bar(hour)?.close)) }
-                    if hour == market.hour - hourMS { return number(previous) }
+                    if hour == market.hour - market.intervalMS { return number(previous) }
                     var value = previous
-                    for ts in stride(from: market.hour - hourMS, to: hour, by: -Int(hourMS)) {
+                    for ts in stride(from: market.hour - market.intervalMS, to: hour, by: -Int(market.intervalMS)) {
                         if Task.isCancelled { return .unknown("Evaluation cancelled.") }
                         guard let b = bar(ts) else { return number(nil) }; value = (value - b.close * 2 / 201) / (1 - 2.0 / 201)
                         guard value.isFinite, value > 0 else { return number(nil) }
-                        cache["indicator|ema|[200.0]|\(ts - hourMS)"] = .number(value)
+                        cache["indicator|ema|[200.0]|\(ts - market.intervalMS)"] = .number(value)
                     }
                     return number(value)
                 }
-                let target = hour == market.hour ? hour - hourMS : hour
+                let target = hour == market.hour ? hour - market.intervalMS : hour
                 var values: [Double] = []
                 let window = emaWarmupHours(n)
-                let available = market.listedAt.map { max(0, Int((target - $0 / hourMS * hourMS) / hourMS) + 1) } ?? window
-                for age in 0..<min(window, available) { if Task.isCancelled { return .unknown("Evaluation cancelled.") }; guard let b = bar(target - Int64(age) * hourMS) else { return number(nil) }; values.append(b.close) }
+                let available = market.listedAt.map { max(0, Int((target - $0 / market.intervalMS * market.intervalMS) / market.intervalMS) + 1) } ?? window
+                for age in 0..<min(window, available) { if Task.isCancelled { return .unknown("Evaluation cancelled.") }; guard let b = bar(target - Int64(age) * market.intervalMS) else { return number(nil) }; values.append(b.close) }
                 values.reverse()
                 guard var value = windowedEMA(values, period: n) else { return number(nil) }
                 if hour == market.hour { guard let b = bar(hour) else { return number(nil) }; value += (b.close - value) * (2 / Double(n + 1)) }
                 return number(value)
             }
             var bars: [Candle] = []
-            for age in (0..<n).reversed() { if Task.isCancelled { return .unknown("Evaluation cancelled.") }; guard let b = bar(hour - Int64(age) * hourMS) else { return number(nil) }; bars.append(b) }
+            for age in (0..<n).reversed() { if Task.isCancelled { return .unknown("Evaluation cancelled.") }; guard let b = bar(hour - Int64(age) * market.intervalMS) else { return number(nil) }; bars.append(b) }
             if name == "vwap" {
                 guard bars.allSatisfy({ $0.baseVolume != nil && $0.quoteVolume != nil }) else { return number(nil) }
                 let base = bars.reduce(0) { $0 + $1.baseVolume! }, quote = bars.reduce(0) { $0 + $1.quoteVolume! }
@@ -313,7 +314,7 @@ final class FilterEvaluator {
         case .call(let name, let args):
             let f = name.lowercased()
             if f == "btc" { return btcValue(args, source: expr.source, at: hour, scope: scope) }
-            if f == "closed" { return eval(args[0], hour - hourMS) }
+            if f == "closed" { return eval(args[0], hour - market.intervalMS) }
             if f == "live" { return eval(args[0]) }
             if f == "abs" { let value = eval(args[0]); return value.number.map { .number(abs($0)) } ?? value }
             if f == "multiple" {
@@ -324,11 +325,11 @@ final class FilterEvaluator {
                 return value.isFinite ? .number(value) : .unknown("The baseline multiple is outside the supported numeric range.")
             }
             if f == "relativechange" { return change(eval(args[0]), eval(args[1])) }
-            if f == "lag" { return eval(args[0], hour - Int64(try! FilterParser.integer(args[1], zero: true)) * hourMS) }
-            if f == "change" { return change(eval(args[0]), eval(args[0], hour - Int64(try! FilterParser.integer(args[1])) * hourMS)) }
+            if f == "lag" { return eval(args[0], hour - Int64(try! FilterParser.integer(args[1], zero: true)) * market.intervalMS) }
+            if f == "change" { return change(eval(args[0]), eval(args[0], hour - Int64(try! FilterParser.integer(args[1])) * market.intervalMS)) }
             if ["mean", "sum", "highest", "lowest", "stddev"].contains(f) {
                 let n = try! FilterParser.integer(args[1]); var numbers: [Double] = []
-                for age in 0..<n { if Task.isCancelled { return .unknown("Evaluation cancelled.") }; let value = eval(args[0], hour - Int64(age) * hourMS); guard let number = value.number else { return value }; numbers.append(number) }
+                for age in 0..<n { if Task.isCancelled { return .unknown("Evaluation cancelled.") }; let value = eval(args[0], hour - Int64(age) * market.intervalMS); guard let number = value.number else { return value }; numbers.append(number) }
                 var mean = 0.0, correction = 0.0
                 for number in numbers { let term = number / Double(n) - correction, next = mean + term; correction = (next - mean) - term; mean = next }
                 let result = f == "mean" ? mean : f == "sum" ? numbers.reduce(0, +) : f == "highest" ? numbers.max()! : f == "lowest" ? numbers.min()! : sqrt(numbers.reduce(0) { $0 + pow($1 - mean, 2) } / Double(n))
@@ -354,7 +355,7 @@ final class FilterEvaluator {
         let clock = args.count == 2 ? (try? FilterParser.string(args[1])) ?? "aligned" : "aligned"
         guard let reference = market.referenceBTC else { return .unknown("BTC-USDT-SWAP reference data is unavailable.") }
         let snapshot = reference.market, offset = market.hour - hour
-        let base = clock == "aligned" ? market.hour : clock == "closed" && !snapshot.historicalClose ? snapshot.hour - hourMS : snapshot.hour
+        let base = clock == "aligned" ? market.hour : clock == "closed" && !snapshot.historicalClose ? snapshot.hour - snapshot.intervalMS : snapshot.hour
         let target = base - offset
         let hours = readingHours(args[0], at: target)
         let provenance = Array(Set(hours)).sorted(by: >).map { h in
@@ -382,15 +383,15 @@ final class FilterEvaluator {
         case .binary(_, let left, let right): return readingHours(left, at: hour) + readingHours(right, at: hour)
         case .call(let name, let args):
             let f = name.lowercased()
-            if f == "closed" { return readingHours(args[0], at: hour-hourMS) }
-            if f == "lag" { return readingHours(args[0], at: hour-Int64(try! FilterParser.integer(args[1], zero: true))*hourMS) }
+            if f == "closed" { return readingHours(args[0], at: hour-market.intervalMS) }
+            if f == "lag" { return readingHours(args[0], at: hour-Int64(try! FilterParser.integer(args[1], zero: true))*market.intervalMS) }
             if ["live", "abs", "multiple"].contains(f) { return readingHours(args[0], at: hour) }
             if f == "relativechange" { return readingHours(args[0], at: hour) + readingHours(args[1], at: hour) }
             if ["mean", "sum", "highest", "lowest", "stddev", "change"].contains(f) {
                 // The selected endpoints describe the source interval without
                 // allocating one provenance record per potentially huge slot.
                 let n = try! FilterParser.integer(args[1]), ages = f == "change" ? [0, n] : [0, n-1]
-                return ages.flatMap { readingHours(args[0], at: hour-Int64($0)*hourMS) }
+                return ages.flatMap { readingHours(args[0], at: hour-Int64($0)*market.intervalMS) }
             }
             return [hour]
         default: return []
@@ -404,12 +405,12 @@ final class FilterEvaluator {
         case .binary(_, let a, let b): return expressionSources(a, at: hour, visiting: visiting) + expressionSources(b, at: hour, visiting: visiting)
         case .call(let name, let args):
             let f = name.lowercased()
-            if f == "closed" { return expressionSources(args[0], at: hour-hourMS, visiting: visiting) }
-            if f == "lag" { return expressionSources(args[0], at: hour-Int64(try! FilterParser.integer(args[1], zero: true))*hourMS, visiting: visiting) }
+            if f == "closed" { return expressionSources(args[0], at: hour-market.intervalMS, visiting: visiting) }
+            if f == "lag" { return expressionSources(args[0], at: hour-Int64(try! FilterParser.integer(args[1], zero: true))*market.intervalMS, visiting: visiting) }
             if ["mean", "sum", "highest", "lowest", "stddev", "change"].contains(f) {
                 let n = try! FilterParser.integer(args[1])
-                if f == "change" { return [0,n].flatMap { expressionSources(args[0], at: hour-Int64($0)*hourMS, visiting: visiting) } }
-                let prefix = args[0].source + "|", first = hour-Int64(n-1)*hourMS
+                if f == "change" { return [0,n].flatMap { expressionSources(args[0], at: hour-Int64($0)*market.intervalMS, visiting: visiting) } }
+                let prefix = args[0].source + "|", first = hour-Int64(n-1)*market.intervalMS
                 return sources.compactMap { key, values -> [FilterReadingSource]? in
                     guard key.hasPrefix(prefix), let timestamp = Int64(key.dropFirst(prefix.count)), timestamp >= first, timestamp <= hour else { return nil }
                     return values
@@ -442,7 +443,7 @@ final class FilterEvaluator {
         return passes ? .yes : .no
     }
     private func rule(_ node: FilterNode, at anchor: Int64, scope: [String: FilterScalar], explain: Bool) -> FilterTrace {
-        let hour = anchor - (node.mode == "closed" ? hourMS : 0)
+        let hour = anchor - (node.mode == "closed" ? market.intervalMS : 0)
         let label = !explain && market.historicalReadings != nil ? "" : node.name.isEmpty ? node.formula : node.name
         var trace = FilterTrace(id: node.id, label: label, result: .unknown, hour: hour)
         func eval(_ source: String) -> FilterScalar { scalar(source, at: hour, scope: scope) }
@@ -482,7 +483,7 @@ final class FilterEvaluator {
             if referenceOnly, [node.left, node.right].contains(where: { filter.expressions[$0].map { filter.usesContractInput($0, bound: bound) } ?? false }) {
                 trace.reason = "This crossing depends on the tracked contract's decision clock."; return trace
             }
-            let a = eval(node.left), b = eval(node.right), oldA = scalar(node.left, at: hour - hourMS, scope: scope), oldB = scalar(node.right, at: hour - hourMS, scope: scope)
+            let a = eval(node.left), b = eval(node.right), oldA = scalar(node.left, at: hour - market.intervalMS, scope: scope), oldB = scalar(node.right, at: hour - market.intervalMS, scope: scope)
             if let a = a.number, let b = b.number, let oldA = oldA.number, let oldB = oldB.number { trace.result = (node.kind == "crossup" ? oldA <= oldB && a > b : oldA >= oldB && a < b) ? .yes : .no }
             // Equal operands are valid expressions and must not create duplicate
             // dictionary-literal keys in the native preview or explanation.
@@ -490,7 +491,7 @@ final class FilterEvaluator {
             trace.readings["Previous \(node.left)"] = oldA; trace.readings["Previous \(node.right)"] = oldB
             for source in [node.left, node.right] where filter.referencesBTC {
                 guard let expression = filter.expressions[source] else { continue }
-                for (key, h) in [(source, hour), ("Previous \(source)", hour-hourMS)] {
+                for (key, h) in [(source, hour), ("Previous \(source)", hour-market.intervalMS)] {
                     let provenance = expressionSources(expression, at: h)
                     if !provenance.isEmpty { trace.readingSources[key] = provenance; trace.referenceDriven = true }
                 }
@@ -507,18 +508,18 @@ final class FilterEvaluator {
             var latest = market.cooldowns?.lastMatch(key, through: now)
             var missing = child.result == .unknown
             if child.result == .yes { latest = now }
-            if child.result != .yes, latest == nil || latest! + Int64(node.hours)*hourMS <= now {
+            if child.result != .yes, latest == nil || latest! + Int64(node.hours)*market.intervalMS <= now {
                 for age in 1...node.hours {
                     if Task.isCancelled { trace.reason = "Evaluation cancelled."; return trace }
-                    let previous = rule(node.children[0], at: hour-Int64(age)*hourMS, scope: scope, explain: false)
+                    let previous = rule(node.children[0], at: hour-Int64(age)*market.intervalMS, scope: scope, explain: false)
                     missing = missing || previous.result == .unknown
-                    if previous.result == .yes { latest = now-Int64(age)*hourMS; trace.referenceDriven = trace.referenceDriven || previous.referenceDriven; break }
+                    if previous.result == .yes { latest = now-Int64(age)*market.intervalMS; trace.referenceDriven = trace.referenceDriven || previous.referenceDriven; break }
                 }
             }
             if let latest {
                 if market.recordCooldowns, hour == market.hour { market.cooldowns?.record(key, at: latest) }
-                let remaining = max(0, latest+Int64(node.hours)*hourMS-now)
-                trace.readings["Cooldown remaining"] = .number(Double(remaining)/Double(hourMS))
+                let remaining = max(0, latest+Int64(node.hours)*market.intervalMS-now)
+                trace.readings["Cooldown remaining"] = .number(Double(remaining)/Double(market.intervalMS))
                 trace.eventHours = [latest]
                 if child.result == .yes || remaining > 0 { trace.result = .yes; trace.referenceDriven = trace.referenceDriven || shared }
                 else { trace.result = missing ? .unknown : child.result }
@@ -528,7 +529,7 @@ final class FilterEvaluator {
             var yes = 0, unknown = 0, children: [FilterTrace] = []
             for age in 0..<node.hours {
                 if Task.isCancelled { trace.reason = "Evaluation cancelled."; return trace }
-                let result = rule(node.children[0], at: hour - Int64(age) * hourMS, scope: scope, explain: explain)
+                let result = rule(node.children[0], at: hour - Int64(age) * market.intervalMS, scope: scope, explain: explain)
                 trace.referenceDriven = trace.referenceDriven || result.referenceDriven
                 if result.result == .yes { yes += 1 }; if result.result == .unknown { unknown += 1 }
                 if explain { children.append(result) }
@@ -555,9 +556,9 @@ final class FilterEvaluator {
         return trace
     }
     private func sequence(_ node: FilterNode, at hour: Int64, scope: [String: FilterScalar], explain: Bool) -> FilterTrace {
-        let target = hour - (node.children.last?.mode == "closed" ? hourMS : 0)
+        let target = hour - (node.children.last?.mode == "closed" ? market.intervalMS : 0)
         var trace = FilterTrace(id: node.id, label: node.name.isEmpty ? node.formula : node.name, result: .no, hour: target)
-        let firstHour = target - Int64(node.hours) * hourMS
+        let firstHour = target - Int64(node.hours) * market.intervalMS
         var uncertain: [FilterTrace] = [], uncertainTimes: [Int64] = []
         var exhaustedPaths = Set<SequenceSearchState>()
         func search(_ index: Int, _ previous: Int64?, _ values: [String: FilterScalar], _ path: [FilterTrace], _ certainty: FilterTruth) -> Bool {
@@ -566,15 +567,15 @@ final class FilterEvaluator {
                                             bindings: values.keys.sorted().map { SequenceBinding(name: $0, value: values[$0]!) })
             if exhaustedPaths.contains(state) { return false }
             let stage = node.children[index], last = index == node.children.count - 1
-            let earliest = max(firstHour, previous.map { $0 + hourMS } ?? firstHour)
-            let latest = min(target, previous.map { $0 + Int64(stage.gapHours) * hourMS } ?? target)
+            let earliest = max(firstHour, previous.map { $0 + market.intervalMS } ?? firstHour)
+            let latest = min(target, previous.map { $0 + Int64(stage.gapHours) * market.intervalMS } ?? target)
             guard earliest <= latest, !last || (earliest...latest).contains(target) else { return false }
-            let times = last ? [target] : Array(stride(from: latest, through: earliest, by: -Int(hourMS)))
+            let times = last ? [target] : Array(stride(from: latest, through: earliest, by: -Int(market.intervalMS)))
             for candidate in times {
                 if Task.isCancelled { return false }
-                var result = rule(stage, at: candidate + (stage.mode == "closed" ? hourMS : 0), scope: values, explain: explain)
+                var result = rule(stage, at: candidate + (stage.mode == "closed" ? market.intervalMS : 0), scope: values, explain: explain)
                 if result.result == .no { continue }
-                if let previous, result.hour <= previous || result.hour - previous > Int64(stage.gapHours) * hourMS { continue }
+                if let previous, result.hour <= previous || result.hour - previous > Int64(stage.gapHours) * market.intervalMS { continue }
                 var captured = values
                 for item in stage.captures {
                     let name = "\(stage.name).\(item.name)", value = scalar(item.expression, at: result.hour, scope: captured)

@@ -59,6 +59,9 @@ actor FilterHistoryLoader {
     private var completed = 0
     private var updatedMarkets = Set<String>()
     private var lastError = ""
+    private func cacheKey(_ id: String, intervalMS: Int64) -> String {
+        intervalMS == hourMS ? id : "\(id)|\(intervalMS)"
+    }
     init(url: URL, researchURL: URL? = nil, transport: any FilterHistoryTransport = OKXFilterHistoryTransport(), requestDelay: UInt64 = 150_000_000) {
         self.url = url
         self.researchURL = researchURL ?? url.deletingLastPathComponent().appendingPathComponent("Research/research.sqlite3")
@@ -120,31 +123,33 @@ actor FilterHistoryLoader {
         return try markets.map { original in
             try Task.checkCancellation()
             var market = original
-            let first = max(0, market.hour - Int64(filter.requiredHours) * hourMS), last = market.hour - hourMS
+            guard let timeframe = CandleTimeframe(milliseconds: market.intervalMS) else { throw FilterError("Unsupported candle interval.") }
+            let key = cacheKey(market.id, intervalMS: market.intervalMS)
+            let first = max(0, market.hour - Int64(filter.requiredHours) * market.intervalMS), last = market.hour - market.intervalMS
             // Never import Research history on an interactive snapshot path.
             // A large cache can contain hundreds of thousands of rows and used
             // to keep suite evaluation inside one IPC request for minutes.
             // `hydrate` imports the same verified rows in the background before
             // making any OKX request, then publishes them through updatedMarkets.
-            if ranges[market.id].map({ $0.first <= first && $0.last >= last }) != true {
-                let cached = try db.candles(market.id, since: first, through: last)
-                candleCache[market.id, default: [:]].merge(cached) { _, new in new }
-                ranges[market.id] = (min(first, ranges[market.id]?.first ?? first), last)
+            if ranges[key].map({ $0.first <= first && $0.last >= last }) != true {
+                let cached = try db.candles(market.id, since: first, through: last, timeframe: timeframe)
+                candleCache[key, default: [:]].merge(cached) { _, new in new }
+                ranges[key] = (min(first, ranges[key]?.first ?? first), last)
             }
-            market.candles = (candleCache[market.id] ?? [:]).filter { $0.key >= first && $0.key <= market.hour }
+            market.candles = (candleCache[key] ?? [:]).filter { $0.key >= first && $0.key <= market.hour }
             // Closed observations on disk can have been corrected by another
             // collector since this live snapshot was captured.
             for (ts, bar) in original.candles where ts == original.hour || market.candles[ts] == nil { market.candles[ts] = bar }
-            if filter.needsStats {
-                let statFirst = statRanges[market.id].map { $0.first <= first && $0.last >= last ? max(first, last - hourMS) : first } ?? first
-                for (ts, s) in try db.chartStats(market.id, since: statFirst, through: last) { statCache[market.id, default: [:]][ts] = FilterStat(oi: s.oi, oiUSD: s.oiUSD, sell: s.sell, buy: s.buy) }
-                statRanges[market.id] = (min(first, statRanges[market.id]?.first ?? first), last)
-                market.stats = (statCache[market.id] ?? [:]).filter { $0.key >= first && $0.key <= last }
+            if filter.needsStats, market.intervalMS == hourMS {
+                let statFirst = statRanges[key].map { $0.first <= first && $0.last >= last ? max(first, last - hourMS) : first } ?? first
+                for (ts, s) in try db.chartStats(market.id, since: statFirst, through: last) { statCache[key, default: [:]][ts] = FilterStat(oi: s.oi, oiUSD: s.oiUSD, sell: s.sell, buy: s.buy) }
+                statRanges[key] = (min(first, statRanges[key]?.first ?? first), last)
+                market.stats = (statCache[key] ?? [:]).filter { $0.key >= first && $0.key <= last }
                 market.stats.merge(original.stats) { _, live in live }
             }
-            if filter.needsQuotes {
-                quoteCache[market.id, default: [:]].merge(try db.hourlyQuotes(market.id, since: first, through: last)) { _, new in new }
-                market.quotes = quoteCache[market.id] ?? [:]; market.quotes.merge(original.quotes) { _, live in live }
+            if filter.needsQuotes, market.intervalMS == hourMS {
+                quoteCache[key, default: [:]].merge(try db.hourlyQuotes(market.id, since: first, through: last)) { _, new in new }
+                market.quotes = quoteCache[key] ?? [:]; market.quotes.merge(original.quotes) { _, live in live }
             }
             return market
         }
@@ -157,7 +162,7 @@ actor FilterHistoryLoader {
             candleFloor = candleFloor.filter { $0.value.expires > now }
             lastCachePrune = now
         }
-        let demand = "\(filter.requiredHours)|\(filter.needsStats)|\(markets.first?.hour ?? 0)"
+        let demand = "\(filter.requiredHours)|\(filter.needsStats)|\(markets.first?.hour ?? 0)|\(markets.first?.intervalMS ?? hourMS)"
         if activeDemand != demand {
             // A smaller/new-hour preview no longer needs obsolete queued work.
             // An increased demand can reuse the active page before extending it.
@@ -167,27 +172,28 @@ actor FilterHistoryLoader {
             activeDemand = demand; lastError = ""
         }
         for market in markets {
-            let key = "\(market.id)|\(market.hour)", retryKey = "\(key)|\(filter.requiredHours)|\(filter.needsStats)"
+            let key = "\(market.id)|\(market.hour)|\(market.intervalMS)", retryKey = "\(key)|\(filter.requiredHours)|\(filter.needsStats)"
             if let retry = retries[retryKey], retry > Date() { continue }
             if processingID == key && processingHours >= filter.requiredHours && (processingStats || !filter.needsStats) { continue }
             if let queued = jobs[key], queued.hours >= filter.requiredHours && (queued.stats || !filter.needsStats) { continue }
-            let first = max(0, market.hour - Int64(filter.requiredHours) * hourMS)
-            let listing = market.listedAt.map { $0 / hourMS * hourMS } ?? first
-            let availableFirst = max(first, listing, floor(market.id) ?? first)
+            let first = max(0, market.hour - Int64(filter.requiredHours) * market.intervalMS)
+            let listing = market.listedAt.map { $0 / market.intervalMS * market.intervalMS } ?? first
+            let historyKey = cacheKey(market.id, intervalMS: market.intervalMS)
+            let availableFirst = max(first, listing, floor(historyKey) ?? first)
             let coverage: (demand: String, candlesMissing: Bool, statsMissing: Bool)
-            if let cached = coverageChecks[market.id], cached.demand == demand {
+            if let cached = coverageChecks[historyKey], cached.demand == demand {
                 coverage = cached
             } else {
                 coverage = (demand,
-                    stride(from: market.hour - hourMS, through: availableFirst, by: -Int(hourMS)).contains { !Self.complete(market.candles[$0]) },
-                    filter.needsStats && stride(from: market.hour - hourMS, through: max(first, listing), by: -Int(hourMS)).contains { market.stats[$0]?.oi == nil || market.stats[$0]?.oiUSD == nil || market.stats[$0]?.buy == nil || market.stats[$0]?.sell == nil })
-                coverageChecks[market.id] = coverage
+                    stride(from: market.hour - market.intervalMS, through: availableFirst, by: -Int(market.intervalMS)).contains { !Self.complete(market.candles[$0]) },
+                    filter.needsStats && market.intervalMS == hourMS && stride(from: market.hour - hourMS, through: max(first, listing), by: -Int(hourMS)).contains { market.stats[$0]?.oi == nil || market.stats[$0]?.oiUSD == nil || market.stats[$0]?.buy == nil || market.stats[$0]?.sell == nil })
+                coverageChecks[historyKey] = coverage
             }
             let missingCandles = coverage.candlesMissing
             let missingStats = coverage.statsMissing
             if !missingCandles && !missingStats { continue }
             if jobs[key] == nil { queue.append(key) }
-            jobs[key] = (market, max(filter.requiredHours, jobs[key]?.hours ?? 0), filter.needsStats || jobs[key]?.stats == true)
+            jobs[key] = (market, max(filter.requiredHours, jobs[key]?.hours ?? 0), market.intervalMS == hourMS && (filter.needsStats || jobs[key]?.stats == true))
         }
         if running == nil, !queue.isEmpty { running = Task { await process() } }
     }
@@ -218,28 +224,42 @@ actor FilterHistoryLoader {
         if !queue.isEmpty { running = Task { await process() } }
     }
     private func hydrate(_ market: FilterMarketData, hours: Int, stats: Bool) async throws {
-        let db = try database(), first = max(0, market.hour - Int64(hours) * hourMS), listing = market.listedAt.map { $0 / hourMS * hourMS } ?? first
-        _ = try? importResearch(market.id, from: first, through: market.hour - hourMS)
-        let fetchFirst = max(first, listing, floor(market.id) ?? first)
+        guard let timeframe = CandleTimeframe(milliseconds: market.intervalMS) else { throw FilterError("Unsupported candle interval.") }
+        let db = try database(), interval = market.intervalMS
+        let first = max(0, market.hour - Int64(hours) * interval), listing = market.listedAt.map { $0 / interval * interval } ?? first
+        let key = cacheKey(market.id, intervalMS: interval)
+        if timeframe == .oneHour { _ = try? importResearch(market.id, from: first, through: market.hour - interval) }
+        let fetchFirst = max(first, listing, floor(key) ?? first)
         // A smaller queued request may have just persisted a page and pruned its
         // memory. Reuse those rows before deciding which page to request next.
-        var series = try db.candles(market.id, since: first, through: market.hour - hourMS)
-        for (ts, bar) in candleCache[market.id] ?? [:] where series[ts] == nil { series[ts] = bar }
+        var series = try db.candles(market.id, since: first, through: market.hour - interval, timeframe: timeframe)
+        for (ts, bar) in candleCache[key] ?? [:] where series[ts] == nil { series[ts] = bar }
         for (ts, bar) in market.candles where ts == market.hour || series[ts] == nil { series[ts] = bar }
-        candleCache[market.id, default: [:]].merge(series.filter { $0.value.confirmed }) { _, new in new }
-        var cursor = stride(from: market.hour - hourMS, through: fetchFirst, by: -Int(hourMS)).first { !Self.complete(series[$0]) }.map { $0 + hourMS }
+        candleCache[key, default: [:]].merge(series.filter { $0.value.confirmed }) { _, new in new }
+        var cursor = stride(from: market.hour - interval, through: fetchFirst, by: -Int(interval)).first { !Self.complete(series[$0]) }.map { $0 + interval }
         while let before = cursor, before > fetchFirst {
-            let rows = try await fetch("/market/history-candles", ["instId": market.id, "bar": "1H", "after": String(before), "limit": "300"])
-            let bars = historicalPage(rows, before: before)
-            guard let oldest = bars.map(\.hour).min(), oldest < before else {
+            let rows = try await fetch("/market/history-candles", ["instId": market.id, "bar": "5m", "after": String(before), "limit": "300"])
+            let source = historicalPage(rows, before: before, alignment: fiveMinuteMS)
+            guard let oldestSource = source.map(\.hour).min(), oldestSource < before else {
                 if !rows.isEmpty { throw FilterError("OKX returned an invalid candle page; retrying.") }
-                candleFloor[market.id] = (before, Date().addingTimeInterval(300)); break
+                candleFloor[key] = (before, Date().addingTimeInterval(300)); break
             }
-            try db.saveCandles(market.id, bars)
+            let sorted = source.sorted { $0.hour < $1.hour }
+            let legacyHourlyFixture = sorted.count < 2 || zip(sorted.dropFirst(), sorted).allSatisfy { $0.hour - $1.hour == hourMS }
+            let bars: [Candle]
+            if legacyHourlyFixture, timeframe == .oneHour {
+                // Custom transports and previously cached hourly pages remain
+                // readable; OKX 5m pages normally contain 5m adjacency.
+                bars = source
+                try db.saveCandles(market.id, bars)
+            } else {
+                bars = try db.ingestFiveMinuteCandles(market.id, source)[timeframe] ?? []
+            }
             updatedMarkets.insert(market.id)
-            for bar in bars { series[bar.hour] = bar; candleCache[market.id, default: [:]][bar.hour] = bar }
-            if oldest <= fetchFirst { break }
-            cursor = stride(from: oldest - hourMS, through: fetchFirst, by: -Int(hourMS)).first { !Self.complete(series[$0]) }.map { $0 + hourMS }
+            for bar in bars { series[bar.hour] = bar; candleCache[key, default: [:]][bar.hour] = bar }
+            if oldestSource <= fetchFirst { break }
+            if stride(from: market.hour - interval, through: fetchFirst, by: -Int(interval)).allSatisfy({ Self.complete(series[$0]) }) { break }
+            cursor = oldestSource
         }
         if stats {
             var incomplete = false
@@ -287,12 +307,12 @@ actor FilterHistoryLoader {
         }
         // Bound reusable memory to each request's dependency window. The durable
         // database retains older observations for later rules and chart history.
-        candleCache[market.id] = candleCache[market.id]?.filter { $0.key >= first }
-        statCache[market.id] = statCache[market.id]?.filter { $0.key >= first }
-        quoteCache[market.id] = quoteCache[market.id]?.filter { $0.key >= first }
-        if let range = ranges[market.id] { ranges[market.id] = (max(first, range.first), range.last) }
-        if let range = statRanges[market.id] { statRanges[market.id] = (max(first, range.first), range.last) }
-        coverageChecks.removeValue(forKey: market.id)
+        candleCache[key] = candleCache[key]?.filter { $0.key >= first }
+        statCache[key] = statCache[key]?.filter { $0.key >= first }
+        quoteCache[key] = quoteCache[key]?.filter { $0.key >= first }
+        if let range = ranges[key] { ranges[key] = (max(first, range.first), range.last) }
+        if let range = statRanges[key] { statRanges[key] = (max(first, range.first), range.last) }
+        coverageChecks.removeValue(forKey: key)
     }
     private static func complete(_ candle: Candle?) -> Bool { candle?.confirmed == true && candle?.open != nil && candle?.baseVolume != nil }
     private func floor(_ id: String) -> Int64? { guard let value = candleFloor[id], value.expires > Date() else { candleFloor.removeValue(forKey: id); return nil }; return value.hour }
