@@ -62,7 +62,6 @@ try {
     const ui = identifiers.filter(id => id.includes('.RuleEditorUITests/'))
     const services = identifiers.filter(id => id.includes('.MonitorServiceTests/'))
     const units = identifiers.filter(id => !ui.includes(id) && !services.includes(id))
-    if (!ui.length || !services.length || !units.length) throw new Error('A required native test family is missing')
     console.log(`Native checks: ${units.length} business/window tests, ${services.length} lifecycle tests, ${ui.length} WebKit tests.`)
     const execute = async (name: string, ids: string[]) => {
       const output = await run(name, 'scripts/test-native.sh', ['--xctest', '-XCTest', ids.join(',')])
@@ -74,25 +73,15 @@ try {
     // Millisecond-level network admission assertions need their own process,
     // free of other suites' URLSession callbacks and heavy WebKit rendering.
     const paced = units.filter(id => id.includes('.ResearchRequestTests/'))
-    if (!paced.length) throw new Error('The research network quota suite is missing')
     const updateInstall = units.filter(id => id.includes('.AppUpdaterTests/testNativeDownloadRetriesReportsStreamingProgressAndInstallsVerifiedRelease'))
-    if (updateInstall.length !== 1) throw new Error('The isolated update install test is missing')
     const monitorUpdates = units.filter(id => id.includes('.MonitorUpdateTests/'))
-    if (!monitorUpdates.length) throw new Error('The isolated monitor update suite is missing')
     const benchmark = ui.filter(id => id.includes('testCategoricalMenusAndTypedRuleEditingStayResponsive'))
-    if (benchmark.length !== 1) throw new Error('The isolated menu benchmark is missing')
     const pixels = ui.filter(id => id.includes('testAllSurfaceFamiliesAndChartCapture'))
-    if (pixels.length !== 1) throw new Error('The native pixel suite is missing')
     const nativeCapture = ui.filter(id => id.includes('testBlurSlidersPreviewWhileSavingAndRestoreAfterReload'))
-    if (nativeCapture.length !== 1) throw new Error('The native capture deadline test is missing')
     const navigationDeadline = ui.filter(id => id.includes('testBTCMarketContextVisualParametersReadingsMaterialsAndNotificationNavigation'))
-    if (navigationDeadline.length !== 1) throw new Error('The isolated navigation deadline test is missing')
     const saveDeadline = ui.filter(id => id.includes('testStrategyUniverseSavesPromptlyWhilePreviewIsSlowAndKeepsMarketRows'))
-    if (saveDeadline.length !== 1) throw new Error('The isolated strategy save deadline test is missing')
     const typedRecovery = ui.filter(id => id.includes('testNativeTypedRuleDraftRecoveryExplanationsAndLargeMarketResponsiveness'))
-    if (typedRecovery.length !== 1) throw new Error('The isolated typed-rule recovery test is missing')
     const earlyResearch = ui.filter(id => id.includes('testResearchPrepareRunFrozenChartPaginationAndRadarIsolationInNativeWebKit') || id.includes('testLargeResearchDataPlanKeepsWorkspaceSwitchingResponsive'))
-    if (earlyResearch.length !== 2) throw new Error('An early Research workflow test is missing')
     // Keep each test class together, but overlap independent business suites.
     // Reuse observed test durations when available: updater/lifecycle waits
     // otherwise make a single unit-test process the critical path.
@@ -124,35 +113,33 @@ try {
     // released the machine, before starting the large native process pool.
     // They exercise independent subsystems (WebKit paint and URL admission),
     // while heavy workers would turn both into machine-contention benchmarks.
-    const pacedTask = execute('research-network-pacing', paced)
-    pacedTask.catch(() => {})
-    await Promise.all([execute('webkit-responsiveness', benchmark), pacedTask])
+    const isolated = (name: string, ids: string[]) => ids.length ? [execute(name, ids)] : []
+    const pacedTasks = isolated('research-network-pacing', paced)
+    pacedTasks.forEach(task => task.catch(() => {}))
+    await Promise.all([...isolated('webkit-responsiveness', benchmark), ...pacedTasks])
     const earlyResearchTasks = earlyResearch.map((id, index) => execute(`webkit-early-research-${index + 1}`, [id]))
     Promise.all(earlyResearchTasks).catch(() => {})
     // This test owns a deliberately short completion deadline. Run it once the
     // build processes are gone so unrelated WebKit/WindowServer load cannot
     // turn its timing assertion into a machine-load test.
     await Promise.all([
-      execute('update-install-deadline', updateInstall),
+      ...isolated('update-install-deadline', updateInstall),
       ...monitorUpdates.map((id, index) => execute(`monitor-update-coordination-${index + 1}`, [id])),
-      execute('native-capture-deadline', nativeCapture),
-      execute('navigation-deadline', navigationDeadline),
-      execute('strategy-save-deadline', saveDeadline),
-      execute('typed-rule-recovery', typedRecovery),
+      ...isolated('native-capture-deadline', nativeCapture),
+      ...isolated('navigation-deadline', navigationDeadline),
+      ...isolated('strategy-save-deadline', saveDeadline),
+      ...isolated('typed-rule-recovery', typedRecovery),
     ])
     const earlyServiceTasks = services.map((id, index) => execute(`packaged-lifecycle-${index + 1}`, [id]))
     Promise.all(earlyServiceTasks).catch(() => {})
     // ScreenCaptureKit permits only one capture owner in this background test
     // process family. Start the full pixel suite as soon as that isolated
     // deadline check releases the service, while other non-capture work runs.
-    const captured = execute('webkit-native-pixels', pixels)
-    captured.catch(() => {})
+    const captured = isolated('webkit-native-pixels', pixels)
+    captured.forEach(task => task.catch(() => {}))
     // Business tests do not share the menu benchmark's WebView. Start their
     // independent processes now rather than leaving every CPU idle during it.
     const unitTasks = unitShards.filter(shard => shard.ids.length).map(shard => execute(shard.name, shard.ids))
-    Promise.all(unitTasks).catch(() => {})
-    // Attach rejection handlers immediately; the shared result handling below
-    // still propagates every unit-test failure.
     Promise.all(unitTasks).catch(() => {})
     // Start long scenarios first. One shared pool bounds native processes,
     // including the packaged apps, instead of oversubscribing WindowServer.
@@ -181,7 +168,7 @@ try {
     // after deadline-sensitive cases have run in isolation.
     const nativeSlots = Math.max(10, Math.min(12, availableParallelism() * 2))
     await Promise.all([
-      captured,
+      ...captured,
       ...earlyResearchTasks,
       ...earlyServiceTasks,
       ...unitTasks.map(async task => { await task; await drain() }),

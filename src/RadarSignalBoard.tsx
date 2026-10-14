@@ -27,7 +27,7 @@ function SignalLane({ signals, markets, onChart, onExplain, onBrowseCharts }: { 
   return <section aria-label={label + ' signals'} className="flex min-w-0 flex-col rounded-lg border" data-signal-lane="bullishSetup">
     <header className="flex items-start gap-3 border-b p-4">
       <div className="mt-0.5 text-positive"><ArrowUpRight aria-hidden="true" /></div>
-      <div className="flex min-w-0 flex-1 flex-col gap-1"><h2 className="font-semibold">Strategy BUY signals</h2><p className="text-xs text-muted-foreground">Bullish hourly setups within the Strategy Universe</p><p className="text-xs text-muted-foreground">{confirmed} confirmed BUY · {forming} forming BUY</p></div>
+      <div className="flex min-w-0 flex-1 flex-col gap-1"><h2 className="font-semibold">Strategy BUY signals</h2><p className="text-xs text-muted-foreground">{confirmed} confirmed BUY · {forming} forming BUY</p></div>
       <Badge variant="positive" aria-label={matching.length + ' ' + label + ' contracts'}>{matching.length}</Badge>
     </header>
     {matching.length ? <>
@@ -51,7 +51,7 @@ export const RadarSignalBoard = memo(function RadarSignalBoard({ profile, signal
   const markets = useMemo(() => new Map(rows.map(row => [row.instId, row])), [rows])
   const unknown = useMemo(() => signals.reduce((count, signal) => count + Number(signalIsUnknown(signal)), 0), [signals])
   return <section aria-label="Bullish Setup radar" className="flex flex-col gap-4 p-4" data-signal-board>
-    <div className="flex items-center gap-3"><div className="flex min-w-0 flex-1 flex-col gap-1"><h2 className="font-semibold">Bullish Setup Radar</h2><p className="text-xs text-muted-foreground">{profile.name} · r{profile.revision} · Universe and Bullish Setup evaluated together</p></div><Button variant="outline" onClick={onResearch}><FlaskConical data-icon="inline-start" aria-hidden="true" />Test strategy</Button></div>
+    <div className="flex items-center gap-3"><div className="flex min-w-0 flex-1 flex-col gap-1"><h2 className="font-semibold">Bullish Setup Radar</h2><p className="text-xs text-muted-foreground">{profile.name} · r{profile.revision}</p></div><Button variant="outline" onClick={onResearch}><FlaskConical data-icon="inline-start" aria-hidden="true" />Test strategy</Button></div>
     {paused && <Alert variant="warning"><AlertDescription>Monitoring is paused. Resume in Settings to collect new signals.</AlertDescription></Alert>}
     {!paused && recovering && <Alert variant="warning"><AlertDescription>Monitoring is reconnecting. New signals will resume automatically.</AlertDescription></Alert>}
     {(unknown > 0 || !signals.length) && <p role="status" className="text-xs text-muted-foreground">{!signals.length ? 'Waiting for strategy inputs. ' : ''}{unknown > 0 ? unknown + ' contracts have Unknown setup inputs. Inspect All markets for missing data.' : ''}</p>}

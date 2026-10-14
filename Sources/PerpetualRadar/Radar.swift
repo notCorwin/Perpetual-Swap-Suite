@@ -9,11 +9,10 @@ private let windowBlurRadiusKey = "windowBlurRadius"
 private let floatingBlurRadiusKey = "floatingBlurRadius"
 private let notificationsEnabledKey = "strategyNotificationsEnabled"
 private let monitoringPausedKey = "monitoringPaused"
-private let chartMovePriceSourceKey = "chartMovePriceSource"
-private let chartMoveObjectiveKey = "chartMoveObjective"
 private let chartMoveLabelsVisibleKey = "chartMoveLabelsVisible"
 private let chartMoveEfficiencyFactorKey = "chartMoveEfficiencyFactor"
 let historicalChartBufferHours = 500
+let historicalChartStatBufferHours = chartHours * 2
 func historicalChartBufferStart(_ end: Int64) -> Int64 { max(0, end - Int64(historicalChartBufferHours - 1) * hourMS) }
 
 private func numeric(_ value: Any?) -> Double? {
@@ -89,8 +88,6 @@ final class Radar {
     private(set) var floatingBlurRadius: Double
     private(set) var notificationsEnabled: Bool
     private(set) var monitoringPaused: Bool
-    private(set) var chartMovePriceSource: String
-    private(set) var chartMoveObjective: String
     private(set) var chartMoveLabelsVisible: Bool
     private(set) var chartMoveEfficiencyFactor: Double
     private var rows: [String: Market] = [:]
@@ -103,6 +100,7 @@ final class Radar {
     private var candleRequests: [String: [Int64: ContinuousClock.Instant]] = [:]
     private var pendingCandleWrites: [String: Set<Int64>] = [:]
     private var oiHistory: [String: [Int64: OpenInterestObservation]] = [:]
+    private var previousOICache: [String: Double] = [:]
     private var oiHistoryRequests: [String: ContinuousClock.Instant] = [:]
     private var exhaustedCandleHistory = Set<String>()
     private var loadedStatPages: [String: ContinuousClock.Instant] = [:]
@@ -132,6 +130,7 @@ final class Radar {
         let closedKey: ClosedEvaluationKey
         let sourceRevision: Int
         let provisional: [SuiteReading], confirmed: [SuiteReading]
+        let provisionalSnapshot: Any, confirmedSnapshot: Any
         let historyProgress: FilterHistoryProgress
         let createdAt: ContinuousClock.Instant
     }
@@ -167,13 +166,9 @@ final class Radar {
         let savedNotifications = try store.preference(forKey: notificationsEnabledKey) ?? store.preference(forKey: "filterNotificationsEnabled")
         notificationsEnabled = savedNotifications != "false"
         monitoringPaused = try store.preference(forKey: monitoringPausedKey) == "true"
-        let savedMovePriceSource = try store.preference(forKey: chartMovePriceSourceKey)
-        chartMovePriceSource = ["close", "highLow"].contains(savedMovePriceSource ?? "") ? savedMovePriceSource! : "highLow"
-        let savedMoveObjective = try store.preference(forKey: chartMoveObjectiveKey)
-        chartMoveObjective = ["amplitude", "efficiency"].contains(savedMoveObjective ?? "") ? savedMoveObjective! : "amplitude"
         chartMoveLabelsVisible = try store.preference(forKey: chartMoveLabelsVisibleKey) != "false"
         let savedEfficiencyFactor = (try store.preference(forKey: chartMoveEfficiencyFactorKey)).flatMap(Double.init) ?? 1
-        chartMoveEfficiencyFactor = savedEfficiencyFactor.isFinite && (0...2).contains(savedEfficiencyFactor) ? savedEfficiencyFactor : 1
+        chartMoveEfficiencyFactor = savedEfficiencyFactor.isFinite && (0...1).contains(savedEfficiencyFactor) ? savedEfficiencyFactor : 1
         historyLoader = FilterHistoryLoader(url: store.url)
         btcHistoryLoader = FilterHistoryLoader(url: store.url)
         monitorBTCHistoryLoader = FilterHistoryLoader(url: store.url)
@@ -230,23 +225,15 @@ final class Radar {
         touch()
     }
 
-    func setChartMoveDefaults(priceSource: String? = nil, objective: String? = nil, labelsVisible: Bool? = nil, efficiencyFactor: Double? = nil) throws -> Bool {
-        if let priceSource, !["close", "highLow"].contains(priceSource) { return false }
-        if let objective, !["amplitude", "efficiency"].contains(objective) { return false }
-        if let efficiencyFactor, !efficiencyFactor.isFinite || !(0...2).contains(efficiencyFactor) { return false }
-        let priceSource = priceSource ?? chartMovePriceSource
-        let objective = objective ?? chartMoveObjective
+    func setChartMoveDefaults(labelsVisible: Bool? = nil, efficiencyFactor: Double? = nil) throws -> Bool {
+        if let efficiencyFactor, !efficiencyFactor.isFinite || !(0...1).contains(efficiencyFactor) { return false }
         let labelsVisible = labelsVisible ?? chartMoveLabelsVisible
         let efficiencyFactor = efficiencyFactor ?? chartMoveEfficiencyFactor
-        guard priceSource != chartMovePriceSource || objective != chartMoveObjective || labelsVisible != chartMoveLabelsVisible || efficiencyFactor != chartMoveEfficiencyFactor else { return true }
+        guard labelsVisible != chartMoveLabelsVisible || efficiencyFactor != chartMoveEfficiencyFactor else { return true }
         try store.transaction {
-            try store.setPreference(priceSource, forKey: chartMovePriceSourceKey)
-            try store.setPreference(objective, forKey: chartMoveObjectiveKey)
             try store.setPreference(String(labelsVisible), forKey: chartMoveLabelsVisibleKey)
             try store.setPreference(String(efficiencyFactor), forKey: chartMoveEfficiencyFactorKey)
         }
-        chartMovePriceSource = priceSource
-        chartMoveObjective = objective
         chartMoveLabelsVisible = labelsVisible
         chartMoveEfficiencyFactor = efficiencyFactor
         touch()
@@ -326,9 +313,8 @@ final class Radar {
             var hasCurrentMaterialization = false
             if let cached = materializedSuite, cached.profileID == profile.id, cached.profileRevision == profile.revision,
                cached.closedKey.hour == hour, cached.closedKey.paused == (monitoringPaused || !running) {
-                func object<T: Encodable>(_ value: T) throws -> Any { try JSONSerialization.jsonObject(with: Data(researchJSON(value).utf8)) }
-                response["provisional"] = try object(cached.provisional)
-                response["confirmed"] = try object(cached.confirmed)
+                response["provisional"] = cached.provisionalSnapshot
+                response["confirmed"] = cached.confirmedSnapshot
                 response["revision"] = cached.sourceRevision
                 response["historyProgress"] = cached.historyProgress.snapshot
                 hasCurrentMaterialization = true
@@ -394,9 +380,12 @@ final class Radar {
                       try store.selectedSuiteProfile("radar")?.id == profile.id,
                       try store.selectedSuiteProfile("radar")?.revision == profile.revision else { return }
                 let progress = await monitorHistoryLoader.progress()
+                func object<T: Encodable>(_ value: T) throws -> Any { try JSONSerialization.jsonObject(with: Data(researchJSON(value).utf8)) }
                 materializedSuite = .init(profileID: profile.id, profileRevision: profile.revision,
                     closedKey: key, sourceRevision: captured.response["revision"] as? Int ?? revision,
-                    provisional: provisional, confirmed: confirmed, historyProgress: progress, createdAt: .now)
+                    provisional: provisional, confirmed: confirmed,
+                    provisionalSnapshot: try object(provisional), confirmedSnapshot: try object(confirmed),
+                    historyProgress: progress, createdAt: .now)
             } catch {
                 if !Task.isCancelled { NSLog("Strategy materialization: %@", error.localizedDescription) }
             }
@@ -1066,7 +1055,10 @@ final class Radar {
         async let oi = refreshChartSource(id, path: "/rubik/stat/contracts/open-interest-history")
         async let taker = refreshChartSource(id, path: "/rubik/stat/taker-volume-contract")
         let failures = await [candles, oi, taker].compactMap { $0 }
-        var result = chartSnapshot(id)
+        // The cache/import step above already prepares a much wider candle
+        // range. Return it on the first load so ordinary scrolling stays local
+        // instead of immediately entering the paginated history path.
+        var result = chartSnapshot(id, outputHours: historicalChartBufferHours)
         if !failures.isEmpty { result["error"] = "Some chart data is unavailable: \(failures.joined(separator: ", "))." }
         return result
     }
@@ -1105,8 +1097,13 @@ final class Radar {
         let oldest = (try? store.oldestCandleHour(id)) ?? nil
         let end = boundedHistoryEnd(requestedEnd, oldest: oldest, exhausted: exhaustedCandleHistory.contains(id), latest: hour)
         let first = historicalChartBufferStart(end)
+        let statFirst = max(first, end - Int64(historicalChartStatBufferHours - 1) * hourMS)
+        loadedStatPages = loadedStatPages.filter { $0.value.duration(to: .now) < .seconds(900) }
+        if loadedStatPages.count > 4_096 {
+            for key in Array(loadedStatPages.keys.prefix(loadedStatPages.count - 4_096)) { loadedStatPages.removeValue(forKey: key) }
+        }
         for path in ["/rubik/stat/contracts/open-interest-history", "/rubik/stat/taker-volume-contract"] {
-            for pageStart in stride(from: first / (Int64(chartHours) * hourMS) * Int64(chartHours) * hourMS,
+            for pageStart in stride(from: statFirst / (Int64(chartHours) * hourMS) * Int64(chartHours) * hourMS,
                                     through: end, by: Int(chartHours) * Int(hourMS)) {
                 let key = "\(id)|\(path)|\(pageStart)"
                 if loadedStatPages[key].map({ $0.duration(to: .now) < .seconds(900) }) == true { continue }
@@ -1122,20 +1119,22 @@ final class Radar {
                         loadedStatPages[key] = .now; continue
                     }
                     let values = try await get(path, ["instId": id, "period": "1H", "end": String(pageEnd + hourMS), "limit": "100"])
+                    var updates: [(hour: Int64, oi: Double?, oiUSD: Double?, sell: Double?, buy: Double?)] = []
                     for case let row as [String] in values {
                         guard let stamp = row.first.flatMap(Int64.init), stamp >= pageStart, stamp <= pageEnd, stamp < hour else { continue }
                         if path.contains("open-interest"), row.count >= 4,
                            let oi = Double(row[1]), let oiUSD = Double(row[3]),
                            oi.isFinite, oiUSD.isFinite, oi >= 0, oiUSD >= 0 {
-                            try store.saveChartStat(id, hour: stamp, oi: oi, oiUSD: oiUSD)
+                            updates.append((stamp, oi, oiUSD, nil, nil))
                             loaded.insert(stamp)
                         } else if !path.contains("open-interest"), row.count >= 3,
                                   let sell = Double(row[1]), let buy = Double(row[2]),
                                   sell.isFinite, buy.isFinite, sell >= 0, buy >= 0 {
-                            try store.saveChartStat(id, hour: stamp, sell: sell, buy: buy)
+                            updates.append((stamp, nil, nil, sell, buy))
                             loaded.insert(stamp)
                         }
                     }
+                    try store.saveChartStats(id, updates)
                     if !loaded.isEmpty { invalidateSnapshot(id); touch(id) }
                     if firstExpected > lastExpected || stride(from: firstExpected, through: lastExpected, by: Int(hourMS)).allSatisfy({ loaded.contains($0) }) {
                         loadedStatPages[key] = .now
@@ -1231,17 +1230,24 @@ final class Radar {
             guard observedDataVersion != version else { return }
             guard !rows.isEmpty else { observedDataVersion = version; return }
             let recorded = try store.load(hour: hour, ids: Set(rows.keys))
+            var changedIDs = Set<String>()
             for (id, bars) in recorded.candles {
                 var changed = false
                 for (ts, bar) in bars where candles[id]?[ts] != bar && pendingCandleWrites[id]?.contains(ts) != true {
                     candles[id, default: [:]][ts] = bar; candleRequests[id, default: [:]][ts] = .now
                     changed = true
                 }
-                if changed { touch(id) }
+                if changed { changedIDs.insert(id) }
             }
-            // An external history writer may also extend the EMA seed beyond
-            // the in-memory lookback, or correct an OI comparison hour.
-            emaStates.removeAll(); oiHistory.removeAll(); takerHistory.removeAll(); invalidateSnapshots(); touch()
+            // Reuse the EMA rows fetched with the candle batch. A correction
+            // deletes only that instrument's persisted EMA through the trigger,
+            // so unrelated markets keep both their snapshot and EMA caches.
+            for id in rows.keys {
+                if let state = recorded.ema[id] { emaStates[id] = state }
+                else if changedIDs.contains(id) { emaStates.removeValue(forKey: id) }
+            }
+            for id in changedIDs { invalidateSnapshot(id) }
+            if !changedIDs.isEmpty { touch() }
             observedDataVersion = version
         } catch {
             let error = "Cache error: \(error.localizedDescription)"
@@ -1270,7 +1276,6 @@ final class Radar {
                 "frostedBackgroundEnabled": frostedBackgroundEnabled, "frostedBackgroundOpacity": frostedBackgroundOpacity,
                 "windowBlurRadius": windowBlurRadius, "floatingBlurRadius": floatingBlurRadius,
                 "notificationsEnabled": notificationsEnabled,
-                "chartMovePriceSource": chartMovePriceSource, "chartMoveObjective": chartMoveObjective,
                 "chartMoveLabelsVisible": chartMoveLabelsVisible,
                 "chartMoveEfficiencyFactor": chartMoveEfficiencyFactor,
                 "filterMetricsCatalog": FilterCatalog.metrics.map(\.snapshot), "filterFunctions": FilterCatalog.functions,
@@ -1289,7 +1294,12 @@ final class Radar {
             batch.response = ["unchanged": true, "revision": revision, "error": batch.response["error"] ?? ""]; return batch
         }
         let previousOI: [String: Double]
-        do { previousOI = try store.openInterest(hour: hour - hourMS) }
+        do {
+            previousOI = try store.openInterest(hour: hour - hourMS)
+            let changedOI = Set(previousOI.keys).union(previousOICache.keys).filter { previousOI[$0] != previousOICache[$0] }
+            for id in changedOI { invalidateSnapshot(id) }
+            previousOICache = previousOI
+        }
         catch { startupError = "Cache error: \(error.localizedDescription)"; previousOI = [:] }
         let now = millis()
         for id in marketOrder {

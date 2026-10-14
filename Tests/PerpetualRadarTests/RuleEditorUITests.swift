@@ -125,10 +125,9 @@ private final class RuleUIBridge: NSObject, WKScriptMessageHandlerWithReply, WKU
             if holdNextBlurSave { holdNextBlurSave = false; heldBlurSave = save } else { save() }
             return
         }
-        if ["chartMovePriceSource", "chartMoveObjective", "chartMoveLabelsVisible", "chartMoveEfficiencyFactor"].contains(where: { request[$0] != nil }) {
+        if ["chartMoveLabelsVisible", "chartMoveEfficiencyFactor"].contains(where: { request[$0] != nil }) {
             do {
-                guard try radar.setChartMoveDefaults(priceSource: request["chartMovePriceSource"] as? String,
-                    objective: request["chartMoveObjective"] as? String, labelsVisible: request["chartMoveLabelsVisible"] as? Bool,
+                guard try radar.setChartMoveDefaults(labelsVisible: request["chartMoveLabelsVisible"] as? Bool,
                     efficiencyFactor: request["chartMoveEfficiencyFactor"] as? Double) else {
                     throw FilterError("Invalid chart move label defaults.")
                 }
@@ -325,9 +324,17 @@ final class RuleEditorUITests: BackgroundTestCase {
 
     @MainActor
     private func showAllMarkets(_ view: WKWebView, count: Int = 500) async throws {
-        try await wait(view, "Array.from(document.querySelectorAll('button')).some(button => button.textContent.trim() === 'All markets' && !button.disabled)")
-        try await click(view, "All markets")
-        try await wait(view, "Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === \(count)")
+        try await wait(view, "document.querySelector('section[aria-label=\"Perpetual swap markets\"]') !== null && Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === \(count)")
+        let formulasUseHTML = try await js(view, """
+        (() => {
+          const formulas = Array.from(document.querySelectorAll('[data-header-formula="html"]'));
+          return formulas.length === 6 && formulas.every(formula => !formula.querySelector('.katex')) &&
+            formulas.every(formula => formula.getAttribute('aria-hidden') === 'true') &&
+            formulas.filter(formula => formula.querySelector('sub')).length === 6 &&
+            formulas.some(formula => formula.querySelectorAll(':scope > span > span').length === 2);
+        })()
+        """) as? Bool
+        XCTAssertEqual(formulasUseHTML, true, "Market header formulas must render as accessible native HTML, without KaTeX.")
     }
 
     @MainActor
@@ -512,18 +519,7 @@ final class RuleEditorUITests: BackgroundTestCase {
             if let data=image.tiffRepresentation, let png=NSBitmapImageRep(data:data)?.representation(using:.png,properties:[:]) { try png.write(to:URL(fileURLWithPath:path)) }
         }
         _ = try await js(view,"document.querySelector('[data-signal-lane=bullishSetup] button[aria-label=\"View MKT001-USDT-SWAP chart\"]').click(); true")
-        try await wait(view,"document.querySelector('section[aria-label=\"MKT001-USDT-SWAP chart\"] [data-chart-move-direction]') !== null && document.querySelector('[data-chart-move-exit-direction]')?.textContent.includes('EXIT') && document.querySelector('[data-price-move-mode]')?.dataset.priceMoveMode === 'highLow' && document.querySelector('[data-price-move-objective]')?.dataset.priceMoveObjective === 'amplitude' && document.querySelector('[data-price-move-layer]')?.dataset.priceMoveLayer === 'visible' && Number(document.querySelector('[data-price-move-efficiency-factor]')?.dataset.priceMoveEfficiencyFactor) === 1 && !document.querySelector('[data-price-move-summary]')?.innerText.includes('ranked non-overlapping') && !document.querySelector('[data-price-move-summary]')?.innerText.includes('Uses future data') && !document.querySelector('[data-strategy-chart-summary]') && !document.querySelector('[data-chart-buy-hour]')")
-        try await click(view,"Move price source")
-        try await wait(view,"document.querySelector('[data-price-move-mode]')?.dataset.priceMoveMode === 'close' && document.activeElement?.matches('svg[tabindex=\"0\"]')")
-        try await click(view,"Move price source")
-        try await wait(view,"document.querySelector('[data-price-move-mode]')?.dataset.priceMoveMode === 'highLow' && document.activeElement?.matches('svg[tabindex=\"0\"]')")
-        try await click(view,"Move optimization objective")
-        try await wait(view,"document.querySelector('[data-price-move-objective]')?.dataset.priceMoveObjective === 'efficiency' && document.activeElement?.matches('svg[tabindex=\"0\"]')")
-        try await click(view,"Move optimization objective")
-        try await wait(view,"document.querySelector('[data-price-move-objective]')?.dataset.priceMoveObjective === 'amplitude' && document.activeElement?.matches('svg[tabindex=\"0\"]')")
-        try await input(view,"input[aria-label='Chart efficiency factor']","1.1")
-        _ = try await js(view,"document.querySelector('input[aria-label=\"Chart efficiency factor\"]').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true})); true")
-        try await wait(view,"Number(document.querySelector('[data-price-move-efficiency-factor]')?.dataset.priceMoveEfficiencyFactor) === 1.1")
+        try await wait(view,"document.querySelector('section[aria-label=\"MKT001-USDT-SWAP chart\"] [data-chart-move-direction]') !== null && document.querySelector('[data-chart-move-exit-direction]')?.textContent.includes('EXIT') && document.querySelector('[data-price-move-layer]')?.dataset.priceMoveLayer === 'visible' && Number(document.querySelector('[data-price-move-efficiency-factor]')?.dataset.priceMoveEfficiencyFactor) === 1 && document.querySelector('[data-price-move-efficiency-factor] [role=slider]')?.getAttribute('aria-valuemax') === '1' && !document.querySelector('[data-price-move-summary]') && !document.querySelector('[data-strategy-chart-summary]') && !document.querySelector('[data-chart-buy-hour]')")
         try await click(view,"Labels On")
         try await wait(view,"document.querySelector('[data-price-move-layer]')?.dataset.priceMoveLayer === 'hidden' && !document.querySelector('[data-chart-move-direction]')")
         try await click(view,"Labels Off")
@@ -544,10 +540,10 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await click(view,"Explain MKT001-USDT-SWAP Bullish Setup")
         try await wait(view,"document.querySelector('[role=dialog]')?.innerText.includes('Bullish Setup') && !document.querySelector('[role=dialog]')?.innerText.includes('Bearish Reversal')")
         try await dismissFloating(view)
-        try await click(view,"All markets");try await wait(view,"Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === 1")
+        try await wait(view,"Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === 1")
         try await input(view,"input[aria-label='Search contracts']","")
         try await wait(view,"Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === 500")
-        try await click(view,"Signals");try await input(view,"input[aria-label='Search contracts']","MKT00");try await click(view,"Test strategy")
+        try await input(view,"input[aria-label='Search contracts']","MKT00");try await click(view,"Test strategy")
         try await wait(view,"document.querySelector('#study-name')?.value === 'Shared Radar Bullish Setup study'")
         try await click(view,"Strategy Library…")
         try await wait(view,"document.querySelector('#suite-strategy-name')?.value === 'Shared Radar'")
@@ -1214,7 +1210,6 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await wait(view, "document.body.innerText.includes('Cannot save blur fixture') && getComputedStyle(document.querySelector('[data-slot=popover-content]')).backdropFilter === 'none'")
         XCTAssertEqual(bridge.radar.floatingBlurRadius, 160)
         bridge.blurSaveError = nil
-        try await click(view, "Retry saving")
         try await wait(view, "!document.body.innerText.includes('Cannot save blur fixture') && !document.body.innerText.includes('Saving')")
         XCTAssertEqual(bridge.radar.floatingBlurRadius, 0)
         let documentTimeOrigin = try await js(view, "performance.timeOrigin")
@@ -1718,7 +1713,7 @@ final class RuleEditorUITests: BackgroundTestCase {
         bridge.holdGateway = false
         try await click(view, "Analyze Short")
         XCTAssertEqual(bridge.analysisCaptureBounds.count, 1, "Opening the existing directional analysis must preserve its snapshot and conversation.")
-        try await click(view, "Retry")
+        try await click(view, "Send follow-up")
         try await wait(view, "document.querySelectorAll('[data-analysis-answer]').length === 3 && !document.querySelector('[aria-label=\"Ask a follow-up\"]').disabled")
         XCTAssertEqual(bridge.gatewayRequests.count, 4)
         XCTAssertEqual(bridge.analysisCaptureBounds.count, 1)

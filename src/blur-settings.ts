@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 export type BlurSettings = { windowBlurRadius: number; floatingBlurRadius: number }
 type BlurKey = keyof BlurSettings
@@ -14,7 +14,7 @@ export async function withSettingsDeadline<T>(operation: Promise<T>): Promise<T>
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     return await Promise.race([operation, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Saving timed out. Try again.')), 8000)
+      timer = setTimeout(() => reject(new Error('Saving timed out.')), 8000)
     })])
   } finally { clearTimeout(timer) }
 }
@@ -28,6 +28,9 @@ export function useBlurSettings(initial: () => BlurSettings, save: (request: Par
   const versions = useRef({ windowBlurRadius: 0, floatingBlurRadius: 0 })
   const queue = useRef<Partial<Record<BlurKey, Promise<void>>>>({})
   const saving = useRef<Partial<Record<BlurKey, number>>>({})
+  const retryTimers = useRef<Partial<Record<BlurKey, ReturnType<typeof setTimeout>>>>({})
+  const retryAttempts = useRef<Partial<Record<BlurKey, number>>>({})
+  useEffect(() => () => { for (const timer of Object.values(retryTimers.current)) clearTimeout(timer) }, [])
   useLayoutEffect(() => {
     document.documentElement.style.setProperty('--floating-blur', `${values.floatingBlurRadius}px`)
     document.documentElement.dataset.floatingBlur = String(values.floatingBlurRadius > 0)
@@ -42,6 +45,8 @@ export function useBlurSettings(initial: () => BlurSettings, save: (request: Par
     if (draft.current[key] === value) return
     const version = ++versions.current[key]
     dirty.current.add(key)
+    if (retryTimers.current[key]) clearTimeout(retryTimers.current[key])
+    delete retryTimers.current[key]; delete retryAttempts.current[key]
     draft.current = { ...draft.current, [key]: value }
     setValues(draft.current); setErrors(current => ({ ...current, [key]: undefined }))
     if (key === 'windowBlurRadius') void previewWindow(value).catch(cause => {
@@ -63,6 +68,8 @@ export function useBlurSettings(initial: () => BlurSettings, save: (request: Par
         const saved = await save({ [key]: value })
         if (version !== versions.current[key]) return
         dirty.current.delete(key)
+        if (retryTimers.current[key]) clearTimeout(retryTimers.current[key])
+        delete retryTimers.current[key]; delete retryAttempts.current[key]
         draft.current = { ...draft.current, [key]: saved[key] }
         setValues(draft.current)
         if (key === 'windowBlurRadius') await previewWindow(null)
@@ -71,6 +78,12 @@ export function useBlurSettings(initial: () => BlurSettings, save: (request: Par
         if (version === versions.current[key]) {
           dirty.current.add(key)
           setErrors(current => ({ ...current, [key]: cause instanceof Error ? cause.message : 'Cannot save blur.' }))
+          const attempt = (retryAttempts.current[key] ?? 0) + 1
+          retryAttempts.current[key] = attempt
+          retryTimers.current[key] = setTimeout(() => {
+            delete retryTimers.current[key]
+            if (version === versions.current[key]) commit(key)
+          }, Math.min(30_000, 1_000 * 2 ** Math.min(attempt - 1, 5)))
         }
       } finally {
         if (saving.current[key] === version) {

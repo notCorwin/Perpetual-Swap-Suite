@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chartHistoryNeedsLoad, livePriceTag, scrollChartEnd, visibleChartBars } from "./chart-viewport.ts"
+import { chartHistoryNeedsLoad, chartStatsNeedLoad, livePriceTag, scrollChartEnd, visibleChartBars } from "./chart-viewport.ts"
 
 const hour = 3_600_000
 test("live price and countdown do not change when the chart scrolls into history", () => {
@@ -43,4 +43,14 @@ test("a buffered history block avoids native requests until the viewport nears i
   assert.equal(chartHistoryNeedsLoad(1_499 * hour, oldest), false)
   assert.equal(chartHistoryNeedsLoad(1_144 * hour, oldest), false)
   assert.equal(chartHistoryNeedsLoad(1_143 * hour, oldest), true)
+})
+
+test("cached candles still request history when visible OI or taker data is missing", () => {
+  const complete = Array.from({ length: 500 }, (_, index) => ({ hour: index * hour, confirmed: true, oi: 1, buy: 2, sell: 3 }))
+  assert.equal(chartStatsNeedLoad(complete, 450 * hour), false)
+  const missingOI = complete.map(bar => bar.hour === 420 * hour ? { ...bar, oi: null } : bar)
+  assert.equal(chartStatsNeedLoad(missingOI, 450 * hour), true)
+  const missingTaker = complete.map(bar => bar.hour === 420 * hour ? { ...bar, buy: null } : bar)
+  assert.equal(chartStatsNeedLoad(missingTaker, 450 * hour), true)
+  assert.equal(chartStatsNeedLoad(missingTaker, 300 * hour), false, "Only the visible window should trigger a statistics request")
 })

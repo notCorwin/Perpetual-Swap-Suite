@@ -14,12 +14,12 @@ export function createAnalysisRunner(nativeFetch: typeof fetch): AnalysisRunner 
       if (part.type === 'text-delta') onText(part.text)
       else if (part.type === 'error') throw part.error
       else if (part.type === 'finish') {
-        if (part.finishReason === 'length') throw new Error('The model reached its output limit. Retry or choose another model.')
+        if (part.finishReason === 'length') throw new Error('The model reached its output limit. It will retry automatically; you can also choose another model.')
         finished = true
       }
     }
     input.signal.throwIfAborted()
-    if (!finished) throw new Error('Gateway stream interrupted. Retry to generate the answer again.')
+    if (!finished) throw new Error('Gateway stream interrupted. Retrying automatically.')
   }
 }
 

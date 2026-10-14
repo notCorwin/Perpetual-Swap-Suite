@@ -115,7 +115,7 @@ export class ChartAnalysisStore {
       if (this.current(id, operation)) this.update(id, value => ({ ...value, turns: value.turns.map(item => item.id === turn.id ? { ...item, text: item.text + text } : item) }))
     })
     if (!this.current(id, operation)) return
-    if (!this.get(id)!.turns.at(-1)!.text.trim()) throw new Error('The model returned an empty answer. Retry or choose another model.')
+    if (!this.get(id)!.turns.at(-1)!.text.trim()) throw new Error('The model returned an empty answer. It will retry automatically; you can also choose another model.')
     this.update(id, value => ({ ...value, phase: 'ready', turns: value.turns.map(item => item.id === turn.id ? { ...item, status: 'complete' } : item) }))
   }
 }

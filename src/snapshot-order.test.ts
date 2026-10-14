@@ -27,3 +27,10 @@ test('charts do not mix cached history from a previous collector process', () =>
   const history = { revision: 100, serviceSession: 'old', bars: [{ hour: 2, confirmed: true, close: 110 }] }
   assert.deepEqual(mergeChartBars(live, history), live.bars)
 })
+
+test('adjacent history windows cannot erase previously loaded OI and taker values', () => {
+  type StatBar = { hour: number; confirmed: boolean; close: number; oi: number | null; buy: number | null; sell: number | null }
+  const first: { revision: number; bars: StatBar[] } = { revision: 10, bars: [{ hour: 2, confirmed: true, close: 120, oi: 1_000, buy: 40, sell: 30 }] }
+  const adjacent: { revision: number; bars: StatBar[] } = { revision: 11, bars: [{ hour: 2, confirmed: true, close: 121, oi: null, buy: null, sell: null }] }
+  assert.deepEqual(mergeChartBars(adjacent, first), [{ hour: 2, confirmed: true, close: 121, oi: 1_000, buy: 40, sell: 30 }])
+})

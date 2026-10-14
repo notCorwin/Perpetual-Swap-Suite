@@ -1,5 +1,5 @@
 import { Fragment, Suspense, lazy, memo, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react"
-import { ArrowDown, ArrowDownUp, ArrowLeftRight, ArrowUp, Radio, Search, ScanSearch, Settings2 } from "lucide-react"
+import { ArrowDown, ArrowDownUp, ArrowUp, Radio, Search, ScanSearch, Settings2 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty"
@@ -10,7 +10,7 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Spinner } from "@/components/ui/spinner"
 import { RadarSignalBoard } from "@/RadarSignalBoard"
-import { radarSignals, signalMatches, type SignalTiming } from "@/radar-signals"
+import { radarSignals, type SignalTiming } from "@/radar-signals"
 import { ModeTitle } from "@/ModeTitle"
 import { modeTitle, suiteSpec } from "@/suite-types"
 import { useSuite } from "@/use-suite"
@@ -25,7 +25,6 @@ import { PERCENT_CHANGE_DESCRIPTION, formatPercent, percentageNumber, type Perce
 import { BREAK_DESCRIPTION, describeBreak, formatBreakPriorAge, formatBreakTime, type BreakDirection, type BreakResult } from "@/market-breaks"
 import { BANDWIDTH_EXPANSION_DESCRIPTION, LOG_BB_DESCRIPTION, formatBandWidthExpansion, formatLiveBand } from "@/market-logbb"
 import { MarketChart, type ChartPollResponse } from "@/MarketChart"
-import type { PriceMoveMode, PriceMoveObjective } from '@/price-move-signals'
 import { OPPORTUNITY_DESCRIPTION } from "@/market-opportunity"
 import { MarketOpportunity } from "@/MarketOpportunity"
 import { MarketListViewport } from "@/MarketListViewport"
@@ -49,7 +48,7 @@ const Research = lazy(() => import('@/Research').then(module => ({ default: modu
 type WindowAppearance = BlurSettings & { frostedBackgroundEnabled: boolean; frostedBackgroundOpacity: number }
 type NotificationSettings = { backgroundMonitoringEnabled: boolean; notificationsEnabled: boolean; notificationAuthorization: "notDetermined" | "denied" | "authorized" | "quiet" | "unavailable"; notificationError: string; backgroundMonitoringError: string; monitoringPaused: boolean; launchAtLogin: "enabled" | "disabled" | "requiresApproval" | "unavailable"; launchAtLoginError: string }
 type HistoryProgress = { pending: number; completed: number; error: string }
-type ChartMoveSettings = { chartMovePriceSource: PriceMoveMode; chartMoveObjective: PriceMoveObjective; chartMoveLabelsVisible: boolean; chartMoveEfficiencyFactor: number }
+type ChartMoveSettings = { chartMoveLabelsVisible: boolean; chartMoveEfficiencyFactor: number }
 type Snapshot = WindowAppearance & NotificationSettings & ChartMoveSettings & { rows: NativeMarketRow[]; updatedAt: number | null; error: string; revision: number; serviceSession?: string; filterMetricsCatalog: FilterMetric[]; filterFunctions: string[]; filterFunctionCatalog: ExpressionTemplate[]; filterLibraryPreferences: FilterLibraryPreferences; }
 type PreviewSnapshot = Snapshot & { filterResults: Record<string, FilterTruth>; filterToken: string; historyProgress: HistoryProgress }
 type UnchangedSnapshot = { unchanged: true; revision: number; error: string; serviceSession?: string }
@@ -88,14 +87,14 @@ const directionClass = (value: PercentageValue) => {
 }
 const rsiClass = (value: number | null) => value === null ? "text-muted-foreground" : value > 70 ? "text-positive" : value < 30 ? "text-destructive" : ""
 const RSI_PERIODS = [6, 12, 24] as const
-const math = (formula: string) => {
-  const plain = formula
-    .replace(/\\mathrm\{([^}]+)\}/g, '$1')
-    .replace(/\\frac\{([^}]+)\}\{([^}]+)\}/g, '($1) / ($2)')
-    .replace(/_\{([^}]+)\}/g, '$1').replace(/\\times/g, '×').replace(/\\%/g, '%')
-    .replace(/[{}]/g, '')
-  return <span className="text-xs font-medium text-foreground" aria-hidden="true">{plain}</span>
-}
+const indicatorFormula = (name: string, period: number) => <span data-header-formula="html" className="text-xs font-medium text-foreground" aria-hidden="true">{name}<sub>{period}</sub>{name === 'RSI' ? '' : ' (%)'}</span>
+const takerImbalanceFormula = <span data-header-formula="html" className="inline-flex items-center gap-1 text-xs font-medium text-foreground" aria-hidden="true">
+  <span className="inline-flex flex-col items-center leading-none">
+    <span className="border-b border-current px-0.5 pb-0.5">Buy<sub>t</sub> − Sell<sub>t</sub></span>
+    <span className="px-0.5 pt-0.5">Buy<sub>t</sub> + Sell<sub>t</sub></span>
+  </span>
+  <span>× 100%</span>
+</span>
 
 function BreakReadings({ result, direction }: { result: BreakResult; direction: BreakDirection }) {
   const description = describeBreak(result, direction)
@@ -178,7 +177,6 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   const activeStrategyID = activeProfile?.id
   const activeProfileRef = useRef<StrategyProfile | undefined>(activeProfile)
   activeProfileRef.current = activeProfile
-  const [phaseView, setPhaseView] = useState('signals')
   const [signalTiming, setSignalTiming] = useState<SignalTiming>('both')
   const confirmedPhases = useMemo(() => Object.fromEntries((suite.snapshot.confirmed ?? []).map(r => [r.instrument,r])), [suite.snapshot.confirmed])
   const provisionalPhases = useMemo(() => Object.fromEntries((suite.snapshot.provisional ?? []).map(r => [r.instrument,r])), [suite.snapshot.provisional])
@@ -195,6 +193,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   const [templates, setTemplates] = useState<ExpressionTemplate[]>(expressionTemplates)
   const [libraryPreferences, setLibraryPreferences] = useState<FilterLibraryPreferences>(initialLibraryPreferences)
   const librarySaveEpoch = useRef(0), librarySavePending = useRef(false)
+  const previewPolling = useRef(false)
   const [rows, setRows] = useState<NativeMarketRow[]>([])
   const routedStrategy = useRef<string | null>(null)
   useEffect(() => {
@@ -218,13 +217,14 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   const [frostedBackgroundOpacity, setFrostedBackgroundOpacity] = useState(window.radarAppearance?.frostedBackgroundOpacity ?? 0.3)
   const [backgroundOpacityDraft, setBackgroundOpacityDraft] = useState(String(window.radarAppearance?.frostedBackgroundOpacity ?? 0.3))
   const [backgroundOpacityError, setBackgroundOpacityError] = useState("")
+  previewPolling.current = Boolean(active && lastValidJSON && activeStrategyID)
   const blurSettings = useBlurSettings(() => initialBlurSettings(window.radarAppearance), async request => {
     const snapshot = await withSettingsDeadline(window.webkit.messageHandlers.radar.postMessage(request))
     acceptSnapshot(snapshot)
     return snapshot
   }, radius => withSettingsDeadline(window.webkit.messageHandlers.radar.postMessage({ previewWindowBlur: radius })))
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>({ backgroundMonitoringEnabled: false, notificationsEnabled: true, notificationAuthorization: "notDetermined", notificationError: "", backgroundMonitoringError: "", monitoringPaused: false, launchAtLogin: "disabled", launchAtLoginError: "" })
-  const [chartMoveSettings, setChartMoveSettings] = useState<ChartMoveSettings>({ chartMovePriceSource: 'highLow', chartMoveObjective: 'amplitude', chartMoveLabelsVisible: true, chartMoveEfficiencyFactor: 1 })
+  const [chartMoveSettings, setChartMoveSettings] = useState<ChartMoveSettings>({ chartMoveLabelsVisible: true, chartMoveEfficiencyFactor: 1 })
   const [chartEfficiencyFactorDraft, setChartEfficiencyFactorDraft] = useState('1')
   const [chartEfficiencyFactorError, setChartEfficiencyFactorError] = useState('')
   const [notificationPending, setNotificationPending] = useState(false)
@@ -293,8 +293,6 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
       launchAtLoginError: snapshot.launchAtLoginError ?? "",
     }))
     setChartMoveSettings({
-      chartMovePriceSource: snapshot.chartMovePriceSource ?? 'highLow',
-      chartMoveObjective: snapshot.chartMoveObjective ?? 'amplitude',
       chartMoveLabelsVisible: snapshot.chartMoveLabelsVisible ?? true,
       chartMoveEfficiencyFactor: snapshot.chartMoveEfficiencyFactor ?? 1,
     })
@@ -315,6 +313,12 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     let backoff = 2000
     const load = async () => {
       await pageVisible(); if (stopped) return
+      // Rule previews return the same market snapshot plus filter results.
+      // Avoid a second full bridge request while that richer poll is active.
+      if (previewPolling.current) {
+        timer = window.setTimeout(load, 2000)
+        return
+      }
       try {
         const snapshot = await window.webkit.messageHandlers.radar.postMessage({ rocPeriod: ROC_PERIOD, marocPeriod: MAROC_PERIOD, sinceRevision: revision.current, serviceSession: serviceSession.current })
         if (stopped) return
@@ -399,11 +403,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   const matchedRows = useMemo(() => rows.filter(row => activeProfile ? confirmedPhases[row.instId]?.universe === "true" || provisionalPhases[row.instId]?.universe === "true" : true), [rows,activeProfile,confirmedPhases,provisionalPhases])
   const searchedRows = useMemo(() => rows.filter(row => row.instId.toLowerCase().includes(query.trim().toLowerCase())), [rows, query])
   const searchedSignals = useMemo(() => signals.filter(signal => signal.instrument.toLowerCase().includes(query.trim().toLowerCase())), [signals, query])
-  const signalInstruments = useMemo(() => new Set(searchedSignals.filter(signal => signalMatches(signal)).map(signal => signal.instrument)), [searchedSignals])
-  const visible = useMemo(() => searchedRows.filter(row => {
-    if (!activeProfile) return true
-    return phaseView === 'markets' || signalInstruments.has(row.instId)
-  }).sort((a, b) => compareMarketRows(a, b, sort, descending)), [searchedRows, sort, descending, activeProfile, phaseView, signalInstruments])
+  const visible = useMemo(() => searchedRows.sort((a, b) => compareMarketRows(a, b, sort, descending)), [searchedRows, sort, descending])
   const unknownCount = useMemo(() => searchedRows.filter(row => results[row.instId] === "unknown").length, [searchedRows, results])
   const listOrder = useMemo(() => visible.map(row => row.instId), [visible])
   const turnoverOrder = useMemo(() => [...matchedRows].sort(compareMarketTurnover).map(row => row.instId), [matchedRows])
@@ -412,7 +412,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
       setListFilters(parseFilterConfig(activeProfile.universeJSON))
     }
   }, [activeProfile])
-  const chooseStrategy = (id: string) => { void suite.perform({ action: 'select', profileID: id === 'none' ? '' : id }).then(() => { setPhaseView('signals'); setFilterDraft(null); setEditor(initialEditorState()) }).catch(() => {}) }
+  const chooseStrategy = (id: string) => { void suite.perform({ action: 'select', profileID: id === 'none' ? '' : id }).then(() => { setFilterDraft(null); setEditor(initialEditorState()) }).catch(() => {}) }
   const saveUniverse = async (rules: FilterConfigV2) => {
     if (!activeProfile) throw new Error("Activate a strategy before editing its Universe.")
     const response = await suite.perform({ action: "save", profile: { ...activeProfile, universeJSON: JSON.stringify(rules) } })
@@ -470,8 +470,8 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   }
   const saveChartEfficiencyFactor = () => {
     const value = Number(chartEfficiencyFactorDraft)
-    if (!chartEfficiencyFactorDraft.trim() || !Number.isFinite(value) || value < 0 || value > 2) {
-      setChartEfficiencyFactorError('Enter a number from 0 to 2.')
+    if (!chartEfficiencyFactorDraft.trim() || !Number.isFinite(value) || value < 0 || value > 1) {
+      setChartEfficiencyFactorError('Enter a number from 0 to 1.')
       return
     }
     setChartEfficiencyFactorError('')
@@ -487,7 +487,11 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     </Button>
   }
 
-  if (selected && active) return <MarketChart instId={selected} listOrder={signalChartOrder ?? listOrder} turnoverOrder={turnoverOrder} moveDefaults={chartMoveSettings} onSelect={setSelected} backLabel={signalChartOrder ? 'Signals' : 'Markets'} onBack={() => { setSelected(null); setSignalChartOrder(null) }} />
+  if (selected && active) return <MarketChart instId={selected} listOrder={signalChartOrder ?? listOrder} turnoverOrder={turnoverOrder} moveDefaults={chartMoveSettings} onMoveEfficiencyFactorChange={value => {
+    setChartMoveSettings(current => ({ ...current, chartMoveEfficiencyFactor: value }))
+    setChartEfficiencyFactorDraft(String(value))
+    saveSetting({ chartMoveEfficiencyFactor: value })
+  }} onSelect={setSelected} backLabel={signalChartOrder ? 'Signals' : 'Markets'} onBack={() => { setSelected(null); setSignalChartOrder(null) }} />
 
   if (!ready) {
     return (
@@ -508,7 +512,6 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
       <header className="flex items-center gap-3 border-b px-4 py-3 whitespace-nowrap">
         <ModeTitle mode="radar" pending={switchingMode} onSwitch={() => onResearch({ metrics, templates, functions })} />
         <Button variant="outline" onClick={() => onDecisions({ metrics, templates, functions })}>Strategy Library</Button>
-        <span className="text-xs text-muted-foreground">OKX · USDT swaps · 1h</span>
         <span className="text-xs tabular-nums text-muted-foreground">{visible.length} / {rows.length} markets</span>
         <Popover onOpenChange={open => { if (!open) { if (backgroundOpacityDraftDirty.current) saveBackgroundOpacity(); blurSettings.commitAll() } if (open) void updateNotifications({ notificationAction: "refresh" }) }}>
           <PopoverTrigger asChild><Button variant="outline"><Settings2 data-icon="inline-start" aria-hidden="true" />Settings</Button></PopoverTrigger>
@@ -518,11 +521,9 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
               <Field><FieldLabel>AI analysis</FieldLabel><AnalysisSettingsButton /><FieldDescription>Configure the Gateway API Key and chart analysis model.</FieldDescription></Field>
               <Field>
                 <FieldLabel>Move label defaults</FieldLabel>
-                <Button variant="ghost" onClick={() => saveSetting({ chartMovePriceSource: chartMoveSettings.chartMovePriceSource === 'highLow' ? 'close' : 'highLow' })} aria-label="Default move price source" title={`Switch to ${chartMoveSettings.chartMovePriceSource === 'highLow' ? 'Close' : 'High / Low'}`}><span className="font-semibold">{chartMoveSettings.chartMovePriceSource === 'highLow' ? 'High / Low' : 'Close'}</span><ArrowLeftRight data-icon="inline-end" aria-hidden="true" /></Button>
-                <Button variant="ghost" onClick={() => saveSetting({ chartMoveObjective: chartMoveSettings.chartMoveObjective === 'efficiency' ? 'amplitude' : 'efficiency' })} aria-label="Default move optimization objective" title={`Switch to ${chartMoveSettings.chartMoveObjective === 'efficiency' ? 'Max Move' : 'Max Efficiency'}`}><span className="font-semibold">{chartMoveSettings.chartMoveObjective === 'efficiency' ? 'Max Efficiency' : 'Max Move'}</span><ArrowLeftRight data-icon="inline-end" aria-hidden="true" /></Button>
-                <Field data-invalid={Boolean(chartEfficiencyFactorError)}><FieldLabel htmlFor="default-efficiency-factor">Efficiency factor</FieldLabel><Input id="default-efficiency-factor" type="number" min="0" max="2" step="0.1" inputMode="decimal" value={chartEfficiencyFactorDraft} aria-invalid={Boolean(chartEfficiencyFactorError)} onChange={event => { setChartEfficiencyFactorDraft(event.target.value); setChartEfficiencyFactorError('') }} onBlur={saveChartEfficiencyFactor} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }} />{chartEfficiencyFactorError && <FieldError>{chartEfficiencyFactorError}</FieldError>}</Field>
+                <Field data-invalid={Boolean(chartEfficiencyFactorError)}><FieldLabel htmlFor="default-efficiency-factor">Efficiency factor</FieldLabel><Input id="default-efficiency-factor" type="number" min="0" max="1" step="0.01" inputMode="decimal" value={chartEfficiencyFactorDraft} aria-invalid={Boolean(chartEfficiencyFactorError)} onChange={event => { setChartEfficiencyFactorDraft(event.target.value); setChartEfficiencyFactorError('') }} onBlur={saveChartEfficiencyFactor} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }} />{chartEfficiencyFactorError && <FieldError>{chartEfficiencyFactorError}</FieldError>}</Field>
                 <Field orientation="horizontal"><FieldLabel htmlFor="default-move-label-layer">Show labels by default</FieldLabel><Toggle id="default-move-label-layer" variant="outline" pressed={chartMoveSettings.chartMoveLabelsVisible} onPressedChange={value => saveSetting({ chartMoveLabelsVisible: value })}>{chartMoveSettings.chartMoveLabelsVisible ? 'On' : 'Off'}</Toggle></Field>
-                <FieldDescription>Efficiency = |change| / periods^factor. 0 ignores time; 1 is change per K-line; values above 1 favor shorter moves more strongly. New charts use these defaults.</FieldDescription>
+                <FieldDescription>Efficiency = |change| / periods^factor. 0 ignores time; 1 is change per K-line. New charts use these defaults.</FieldDescription>
               </Field>
               <Field><FieldLabel>Run mode</FieldLabel><ToggleGroup type="single" variant="outline" disabled={notificationPending} value={notificationSettings.backgroundMonitoringEnabled ? "background" : "onDemand"} onValueChange={value => { if (value) void updateNotifications({ backgroundMonitoringEnabled: value === "background" }) }} aria-label="Run mode"><ToggleGroupItem value="onDemand">On-demand</ToggleGroupItem><ToggleGroupItem value="background">Background Monitoring</ToggleGroupItem></ToggleGroup><FieldDescription>Background Monitoring allows the helper to keep collecting after closing or quitting. Start at Login requires this mode.</FieldDescription></Field>
               <Field>
@@ -582,16 +583,18 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
       </header>
       <div className="flex items-center gap-4 border-b px-4 py-3">
         <Field orientation="horizontal" className="w-fit"><FieldLabel htmlFor="radar-strategy">Active strategy</FieldLabel><Select value={activeProfile?.id ?? 'none'} disabled={suite.pending || filterDraft !== null || editor.source !== null} onValueChange={chooseStrategy}><SelectTrigger id="radar-strategy" className="w-72" aria-label="Active Radar strategy"><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="none">No active strategy</SelectItem>{suite.snapshot.profiles.map(profile => <SelectItem key={profile.id} value={profile.id}>{profile.name} · r{profile.revision}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>
-        {activeProfile ? <><ToggleGroup type="single" variant="outline" value={phaseView} onValueChange={value => { if (value) setPhaseView(value) }} aria-label="Radar view"><ToggleGroupItem value="signals">Signals</ToggleGroupItem><ToggleGroupItem value="markets">All markets</ToggleGroupItem></ToggleGroup>{phaseView === 'signals' && <ToggleGroup type="single" variant="outline" value={signalTiming} onValueChange={value => { if (value) setSignalTiming(value as SignalTiming) }} aria-label="Signal timing"><ToggleGroupItem value="both">Both hours</ToggleGroupItem><ToggleGroupItem value="confirmed">Confirmed</ToggleGroupItem><ToggleGroupItem value="provisional">Provisional</ToggleGroupItem></ToggleGroup>}</> : <span className="text-xs text-muted-foreground">Choose a shared strategy to watch Bullish Setup signals.</span>}
-        <span className="ml-auto text-xs text-muted-foreground">Shared with Research{filterDraft !== null || editor.source !== null ? ' · Apply or discard Universe edits before changing strategy' : ''}</span>
+        {activeProfile ? <ToggleGroup type="single" variant="outline" value={signalTiming} onValueChange={value => { if (value) setSignalTiming(value as SignalTiming) }} aria-label="Signal timing"><ToggleGroupItem value="both">Both hours</ToggleGroupItem><ToggleGroupItem value="confirmed">Confirmed</ToggleGroupItem><ToggleGroupItem value="provisional">Provisional</ToggleGroupItem></ToggleGroup> : <span className="text-xs text-muted-foreground">Choose a shared strategy to watch Bullish Setup signals.</span>}
+        {(filterDraft !== null || editor.source !== null) && <span className="ml-auto text-xs text-muted-foreground">Apply or discard Universe edits before changing strategy</span>}
       </div>
       {suite.ready && !activeProfile && <Empty className="border-b"><EmptyHeader><EmptyTitle>Activate a strategy to monitor signals</EmptyTitle><EmptyDescription>All markets remain available below. Create a Strategy with Universe and Bullish Setup rules to enable signals and confirmed alerts.</EmptyDescription></EmptyHeader><EmptyContent><Button variant="outline" onClick={() => onDecisions({ metrics, templates, functions })}>Strategy Library…</Button></EmptyContent></Empty>}
       {suite.error && <p role="alert" className="px-4 text-destructive">{suite.error}</p>}
-      {activeProfile && phaseView === 'markets' && <StrategyRules label="Universe rules" filters={listFilters} draft={filterDraft} editor={editor} onEditorChange={setEditor} onDraftChange={setFilterDraft} onApply={saveUniverse} metrics={allowedMetrics} templates={templates} preferences={libraryPreferences} onPreferences={saveLibraryPreferences} previewJSON={previewJSON} units={compilation.units ?? {}} expressions={editorExpressions} diagnostics={compilation.diagnostics} valid={valid} compiling={compiling} requiredHours={compilation.requiredHours ?? 0} matches={searchedRows.filter(row => results[row.instId] === 'true').length} total={searchedRows.length} unknown={unknownCount} previewPending={lastValidJSON !== previewJSON} history={history} />}
+      {activeProfile && <StrategyRules label="Universe rules" filters={listFilters} draft={filterDraft} editor={editor} onEditorChange={setEditor} onDraftChange={setFilterDraft} onApply={saveUniverse} metrics={allowedMetrics} templates={templates} preferences={libraryPreferences} onPreferences={saveLibraryPreferences} previewJSON={previewJSON} units={compilation.units ?? {}} expressions={editorExpressions} diagnostics={compilation.diagnostics} valid={valid} compiling={compiling} requiredHours={compilation.requiredHours ?? 0} matches={searchedRows.filter(row => results[row.instId] === 'true').length} total={searchedRows.length} unknown={unknownCount} previewPending={lastValidJSON !== previewJSON} history={history} />}
       {activeProfile && <SuitePhaseExplanation instrument={phaseExplainingID} profile={activeProfile} inputs={{metrics,templates,functions}} onClose={() => setPhaseExplainingID(null)} />}
       {activeProfile && <FilterExplanation strategyID={activeProfile.id} open={explanationOpen} onOpenChange={setExplanationOpen} instId={explainingId} onSelect={setExplainingId} rows={rows} results={results} filtersJSON={previewJSON} revision={revision.current} metrics={metrics} expressions={editorExpressions} units={compilation.units ?? {}} templates={templates} />}
       {error && <p role="alert" className="border-b px-4 py-2 text-sm text-destructive">{error}</p>}
-      {activeProfile && phaseView === 'signals' ? <RadarSignalBoard profile={activeProfile} signals={searchedSignals} rows={rows} paused={suite.snapshot.paused} recovering={suite.snapshot.recovering} onChart={(instrument, order) => { setSignalChartOrder(order); setSelected(instrument) }} onExplain={explainRow} onResearch={() => onResearch({ metrics, templates, functions }, suiteSpec([activeProfile]))} onBrowseCharts={() => setPhaseView('markets')} /> : <section aria-label="Perpetual swap markets" className="flex-1">
+      {activeProfile && <RadarSignalBoard profile={activeProfile} signals={searchedSignals} rows={rows} paused={suite.snapshot.paused} recovering={suite.snapshot.recovering} onChart={(instrument, order) => { setSignalChartOrder(order); setSelected(instrument) }} onExplain={explainRow} onResearch={() => onResearch({ metrics, templates, functions }, suiteSpec([activeProfile]))} onBrowseCharts={() => document.getElementById('all-markets')?.scrollIntoView({ behavior: 'smooth', block: 'start' })} />}
+      <section id="all-markets" aria-label="Perpetual swap markets" className="flex-1 scroll-mt-4">
+        <header className="border-y px-4 py-3"><h2 className="font-semibold">All markets</h2></header>
         <Table className="table-fixed" data-market-count={visible.length} aria-rowcount={visible.length + 1}>
           <colgroup>
             <col className="w-[17%]" />
@@ -619,17 +622,17 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
                   {header("Low age", "lowBreakdownPriorAge", undefined, "Sort by the previous low's age at the breakdown, longest first. Tied lows use the most recent occurrence.")}
                 </div>
               </TableHead>
-              <TableHead className="text-center" aria-sort={sort === "takerRatio" ? descending ? "descending" : "ascending" : "none"}>{header("Taker imbalance", "takerRatio", math(String.raw`\frac{Buy_t-Sell_t}{Buy_t+Sell_t}\times100\%`))}</TableHead>
+              <TableHead className="text-center" aria-sort={sort === "takerRatio" ? descending ? "descending" : "ascending" : "none"}>{header("Taker imbalance", "takerRatio", takerImbalanceFormula)}</TableHead>
               <TableHead className="text-center" aria-sort={sort === "oiChange" ? descending ? "descending" : "ascending" : "none"}>{header("OI Relative Change", "oiChange", undefined, `Hourly change in OI contracts, unaffected by price-only changes. ${PERCENT_CHANGE_DESCRIPTION}`)}</TableHead>
               <TableHead className="py-1.5 text-center" aria-sort={sort === "roc" || sort === "maroc" ? descending ? "descending" : "ascending" : "none"}>
                 <div className="flex flex-col items-center">
-                  {header(`ROC ${ROC_PERIOD}`, "roc", math(String.raw`\mathrm{ROC}_{${ROC_PERIOD}}\ (\%)`), `${ROC_PERIOD}-hour price change. ${PERCENT_CHANGE_DESCRIPTION}`)}
-                  {header(`MAROC ${MAROC_PERIOD}`, "maroc", math(String.raw`\mathrm{MAROC}_{${MAROC_PERIOD}}\ (\%)`), `Mean of the latest ${MAROC_PERIOD} hourly ROC readings, as a percentage.`)}
+                  {header(`ROC ${ROC_PERIOD}`, "roc", indicatorFormula('ROC', ROC_PERIOD), `${ROC_PERIOD}-hour price change. ${PERCENT_CHANGE_DESCRIPTION}`)}
+                  {header(`MAROC ${MAROC_PERIOD}`, "maroc", indicatorFormula('MAROC', MAROC_PERIOD), `Mean of the latest ${MAROC_PERIOD} hourly ROC readings, as a percentage.`)}
                 </div>
               </TableHead>
               <TableHead className="py-1.5 text-center" aria-sort={sort.startsWith("rsi") ? descending ? "descending" : "ascending" : "none"}>
                 <div className="flex flex-col items-center">
-                  {RSI_PERIODS.map(period => <Fragment key={period}>{header(`RSI ${period}`, `rsi${period}`, math(String.raw`\mathrm{RSI}_{${period}}`))}</Fragment>)}
+                  {RSI_PERIODS.map(period => <Fragment key={period}>{header(`RSI ${period}`, `rsi${period}`, indicatorFormula('RSI', period))}</Fragment>)}
                 </div>
               </TableHead>
               <TableHead className="py-1.5 text-center" aria-sort={sort.startsWith("logBB") ? descending ? "descending" : "ascending" : "none"}>
@@ -651,7 +654,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
               </Empty>
             </TableCell></TableRow></TableBody>}
         </Table>
-      </section>}
+      </section>
     </main>
     </MarketListViewport>
   )

@@ -127,7 +127,7 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
   }, [pageEvents])
   useEffect(() => {
     if (!active) return
-    let stopped = false, timer: number, refreshRequested = false, retryDelay = 1000
+    let stopped = false, timer: number, refreshRequested = false, retryDelay = 1000, lastInventory = 0
     const refresh = async () => {
       if (stopped) return
       await pageVisible(); if (stopped) return
@@ -135,10 +135,15 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
       refreshRequested = false
       polling.current = true
       try {
-        const result = await requestResearch({ action: 'inventory' })
+        const fullInventory = Date.now() - lastInventory >= 5000
+        const result = await requestResearch({ action: fullInventory ? 'inventory' : 'jobStatus' })
         if (stopped || refreshRequested) return
-        setJob(current => keepSnapshotValue(current, result.job ?? null)); setStudies(current => keepSnapshotValue(current, result.studies ?? []))
-        setCache(current => keepSnapshotValue(current, { directory: result.cacheDirectory ?? '', rows: result.cachedRows ?? 0, files: result.rawFiles ?? 0 }))
+        setJob(current => keepSnapshotValue(current, result.job ?? null))
+        if (result.studies) {
+          lastInventory = Date.now()
+          setStudies(current => keepSnapshotValue(current, result.studies ?? []))
+          setCache(current => keepSnapshotValue(current, { directory: result.cacheDirectory ?? '', rows: result.cachedRows ?? 0, files: result.rawFiles ?? 0 }))
+        }
         const j = result.job, key = j?.id + ':' + j?.phase + ':' + j?.resultID
         if (j && key !== handledJob.current && ['planned', 'ready', 'completed', 'paused', 'failed', 'cancelled'].includes(j.phase)) {
           if (j.phase === 'planned' && j.resultID) {
@@ -257,7 +262,7 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
   return <><MarketListViewport><main className="flex min-h-[inherit] flex-col gap-4 p-4 pb-64 tabular-nums" data-research>
     <header className="flex items-center gap-3 border-b pb-3">
       <ModeTitle mode="research" pending={switchingMode} onSwitch={onSwitchMode} />
-      <span className="flex-1 text-xs text-muted-foreground">OKX · Hourly close · Fixed local data</span>
+      <span className="flex-1" />
       <Button variant="outline" disabled={!radarSpec || researchSuite.pending || pending} onClick={() => void activateVersionInRadar()}>Use this version in Radar</Button>
       <Badge variant="outline"><Database data-icon="inline-start" aria-hidden="true" />{integer(cache.rows)} cached rows</Badge>
     </header>

@@ -1,12 +1,12 @@
 import { memo, startTransition, useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from "react"
 import { flushSync } from "react-dom"
-import { ArrowLeft, ArrowLeftRight, Camera, Radio } from "lucide-react"
+import { ArrowLeft, Camera, Radio } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { ButtonGroup } from "@/components/ui/button-group"
 import { Spinner } from "@/components/ui/spinner"
 import { Toggle } from '@/components/ui/toggle'
-import { Input } from '@/components/ui/input'
+import { Slider } from '@/components/ui/slider'
 import { ChartAnalysisPanel } from '@/ChartAnalysisPanel'
 import { ChartWorkspaceViewport } from '@/ChartWorkspaceViewport'
 import { chartAnalysis } from '@/analysis-service'
@@ -14,13 +14,14 @@ import { type AnalysisDirection } from '@/chart-analysis'
 import { chartCaptureBounds } from '@/chart-capture'
 import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicY } from "@/chart-axis"
 import { chartCandleWidth, chartHourX, chartLayout, fitAxisPriceTag, type ChartPanel as Panel } from "@/chart-layout"
-import { chartHistoryNeedsLoad, livePriceTag, scrollChartEnd, visibleChartBars } from "@/chart-viewport"
+import { chartHistoryNeedsLoad, chartStatsNeedLoad, livePriceTag, scrollChartEnd, visibleChartBars } from "@/chart-viewport"
 import { cn, pageVisible } from "@/lib/utils"
 import { chartNavigationTarget, wrappedMarket } from "@/market-sort"
 import { finitePercentage, formatPercent, type PercentageValue } from "@/market-percent"
 import { capturePriceMoves, type PriceMoveMode, type PriceMoveObjective, type PriceMoveSignal } from '@/price-move-signals'
 import { SnapshotOrder } from '@/snapshot-order'
 import { mergeChartBars } from '@/chart-snapshot'
+import { placeChartLabels, type ChartLabel } from '@/chart-label-layout'
 
 export type Bar = {
   hour: number; open: number; high: number; low: number; close: number; confirmed: boolean
@@ -261,6 +262,26 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
     if (sell > 0) sells.push(rectangle(volumeX, totalY, barWidth, buyY - totalY))
   }
   const panelKeys: Panel[] = ["price", "roc", "rsi", "oi", "taker"]
+  const moveGeometry = moveSignals.flatMap(signal => {
+    const signalHour = Number(signal.hour)
+    const index = bars.findIndex(bar => Number(bar.hour) === signalHour && bar.confirmed)
+    if (index < 0) return []
+    const exitIndex = bars.findIndex(bar => Number(bar.hour) === Number(signal.exitHour) && bar.confirmed)
+    const isLong = signal.direction === 'long'
+    const markerX = x(index, "price")
+    const markerY = isLong ? Math.min(panels.price[1] - 17, priceY(bars[index].low) + 9) : Math.max(panels.price[0] + 17, priceY(bars[index].high) - 9)
+    const rank = moveSignals.length > 1 ? ` #${signal.rank}` : ''
+    const exitX = exitIndex >= 0 ? x(exitIndex, 'price') : 0
+    const exitY = isLong
+      ? Math.max(panels.price[0] + 17, priceY(signal.exitPrice) - 9)
+      : Math.min(panels.price[1] - 17, priceY(signal.exitPrice) + 9)
+    return [{ signal, signalHour, index, exitIndex, isLong, markerX, markerY, rank, exitX, exitY }]
+  })
+  const moveLabelInputs: ChartLabel[] = moveGeometry.flatMap(({ signal, signalHour, exitIndex, isLong, markerX, markerY, rank, exitX, exitY }) => [
+    { id: `${signal.direction}-${signalHour}-entry`, anchorX: markerX, anchorY: markerY, text: `${isLong ? 'LONG' : 'SHORT'}${rank}`, side: isLong ? 'bottom' as const : 'top' as const, priority: signal.rank * 2 },
+    ...(exitIndex >= 0 ? [{ id: `${signal.direction}-${signalHour}-exit`, anchorX: exitX, anchorY: exitY, text: `${isLong ? 'EXIT LONG' : 'EXIT SHORT'}${rank}`, side: isLong ? 'top' as const : 'bottom' as const, priority: signal.rank * 2 + 1 }] : []),
+  ])
+  const moveLabelLayout = placeChartLabels(moveLabelInputs, { left, right, top: panels.price[0] + 2, bottom: panels.price[1] - 2 }, label => chartTextWidth(label, getComputedStyle(document.documentElement).getPropertyValue("--chart-text-size").trim()))
   const grid = panelKeys.flatMap(key => panels[key].map((y, index) =>
     <line key={`${key}-${index}`} x1={columns[key][0]} x2={columns[key][1]} y1={y} y2={y} stroke="var(--border)" strokeWidth="1" opacity={index ? 0.32 : 0.55} />))
   const legend = (key: Panel, items: [string, string, string][]) => {
@@ -326,41 +347,41 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
     {lineStroke(line("roc", "roc", value => scale(value, rocAxis.min, rocAxis.max, panels.roc)), "var(--chart-1)")}
     {lineStroke(line("maroc", "roc", value => scale(value, rocAxis.min, rocAxis.max, panels.roc)), "var(--chart-2)", indicatorWidth, 1, "7 4")}
     {oiAxis && lineStroke(line("oi", "oi", oiY), "var(--chart-2)")}
-    {moveSignals.map(signal => {
-      const signalHour = Number(signal.hour)
-      const index = bars.findIndex(bar => Number(bar.hour) === signalHour && bar.confirmed)
-      if (index < 0) return null
-      const exitIndex = bars.findIndex(bar => Number(bar.hour) === Number(signal.exitHour) && bar.confirmed)
-      const isLong = signal.direction === 'long'
+    {moveGeometry.map(({ signal, signalHour, exitIndex, isLong, markerX, markerY, rank, exitX, exitY }) => {
       const color = isLong ? 'var(--positive)' : 'var(--destructive)'
-      const markerX = x(index, "price")
-      const markerY = isLong ? Math.min(panels.price[1] - 17, priceY(bars[index].low) + 9) : Math.max(panels.price[0] + 17, priceY(bars[index].high) - 9)
-      const labelY = markerY + (isLong ? 14 : -10)
       const triangle = isLong
         ? `M${markerX} ${markerY - 7}L${markerX - 5} ${markerY + 1}H${markerX + 5}Z`
         : `M${markerX} ${markerY + 7}L${markerX - 5} ${markerY - 1}H${markerX + 5}Z`
-      const rank = moveSignals.length > 1 ? ` #${signal.rank}` : ''
       const aria = `${isLong ? 'Long' : 'Short'}${rank} future move entry at ${time(signalHour)}, ${formatPercent(signal.changePercent)} over ${signal.periods} hourly candles, efficiency score ${signal.efficiencyScore.toFixed(2)}`
-      const exitX = exitIndex >= 0 ? x(exitIndex, 'price') : 0
-      const exitY = isLong
-        ? Math.max(panels.price[0] + 17, priceY(signal.exitPrice) - 9)
-        : Math.min(panels.price[1] - 17, priceY(signal.exitPrice) + 9)
       const exitTriangle = isLong
         ? `M${exitX} ${exitY + 7}L${exitX - 5} ${exitY - 1}H${exitX + 5}Z`
         : `M${exitX} ${exitY - 7}L${exitX - 5} ${exitY + 1}H${exitX + 5}Z`
       const exitAria = `Exit ${isLong ? 'Long' : 'Short'}${rank} future move at ${time(signal.exitHour)}, ${formatPercent(signal.changePercent)} after ${signal.periods} hourly candles`
+      const entryLabel = moveLabelLayout.labels.get(`${signal.direction}-${signalHour}-entry`)!
+      const exitLabel = moveLabelLayout.labels.get(`${signal.direction}-${signalHour}-exit`)
       return <g key={`${signal.direction}-${signalHour}`} data-chart-move-direction={signal.direction} data-chart-move-hour={signalHour} aria-label={aria}>
         {exitIndex >= 0 && <line x1={markerX} y1={priceY(signal.entryPrice)} x2={exitX} y2={priceY(signal.exitPrice)} stroke={color} strokeWidth="1.2" strokeDasharray="3 4" opacity="0.7" />}
         <path d={triangle} fill={color} stroke="var(--chart-surface)" strokeWidth="1.5" />
-        <text x={markerX} y={labelY} textAnchor="middle" fill={color} fontWeight="700">{isLong ? 'LONG' : 'SHORT'}{rank}</text>
+        {!entryLabel.hidden && <>
+          {(entryLabel.x !== markerX || Math.abs(entryLabel.y - markerY) > 16) && <line x1={markerX} y1={markerY} x2={entryLabel.x} y2={entryLabel.y + (entryLabel.side === 'top' ? 3 : -11)} stroke={color} strokeWidth="0.8" opacity="0.55" />}
+          <text x={entryLabel.x} y={entryLabel.y} textAnchor="middle" fill={color} fontWeight="700" paintOrder="stroke" stroke="var(--chart-surface)" strokeWidth="3" strokeLinejoin="round">{entryLabel.text}</text>
+        </>}
         <title>{aria}</title>
         {exitIndex >= 0 && <g data-chart-move-exit-direction={signal.direction} data-chart-move-exit-hour={signal.exitHour} aria-label={exitAria}>
           <path d={exitTriangle} fill="var(--chart-surface)" stroke={color} strokeWidth="2" />
-          <text x={exitX} y={exitY + (isLong ? -10 : 14)} textAnchor="middle" fill={color} fontWeight="700">{isLong ? 'EXIT LONG' : 'EXIT SHORT'}{rank}</text>
+          {exitLabel && !exitLabel.hidden && <>
+            {(exitLabel.x !== exitX || Math.abs(exitLabel.y - exitY) > 16) && <line x1={exitX} y1={exitY} x2={exitLabel.x} y2={exitLabel.y + (exitLabel.side === 'top' ? 3 : -11)} stroke={color} strokeWidth="0.8" opacity="0.55" />}
+            <text x={exitLabel.x} y={exitLabel.y} textAnchor="middle" fill={color} fontWeight="700" paintOrder="stroke" stroke="var(--chart-surface)" strokeWidth="3" strokeLinejoin="round">{exitLabel.text}</text>
+          </>}
           <title>{exitAria}</title>
         </g>}
       </g>
     })}
+    {moveLabelLayout.summaries.map(summary => <g key={summary.id} data-chart-label-summary={summary.side} aria-label={`${summary.count} additional move labels hidden to prevent overlap`}>
+      <rect x={summary.x - 10} y={summary.y - 12} width="20" height="14" rx="4" fill="var(--chart-surface)" stroke="var(--muted-foreground)" />
+      <text x={summary.x} y={summary.y} textAnchor="middle" fill="var(--muted-foreground)" fontWeight="700">{summary.text}</text>
+      <title>{summary.count} additional move labels hidden to prevent overlap</title>
+    </g>)}
     {inspected !== null && panelKeys.map(key => <line key={key} x1={x(inspected, key)} x2={x(inspected, key)} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--foreground)" strokeWidth="0.65" strokeDasharray="3 5" opacity="0.3" />)}
     {([[highIndex, candleHigh, "high"], [lowIndex, candleLow, "low"]] as const).map(([index, value, kind]) => {
       const markerX = x(index, "price"), label = price(value)
@@ -388,15 +409,13 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
   </>
 })
 
-export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = { chartMovePriceSource: 'highLow', chartMoveObjective: 'amplitude', chartMoveLabelsVisible: true, chartMoveEfficiencyFactor: 1 }, onSelect, onBack, backLabel = 'Markets' }: { instId: string; listOrder: string[]; turnoverOrder: string[]; moveDefaults?: { chartMovePriceSource: PriceMoveMode; chartMoveObjective: PriceMoveObjective; chartMoveLabelsVisible: boolean; chartMoveEfficiencyFactor: number }; onSelect: (id: string) => void; onBack: () => void; backLabel?: string }) {
+export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = { chartMoveLabelsVisible: true, chartMoveEfficiencyFactor: 1 }, onMoveEfficiencyFactorChange, onSelect, onBack, backLabel = 'Markets' }: { instId: string; listOrder: string[]; turnoverOrder: string[]; moveDefaults?: { chartMoveLabelsVisible: boolean; chartMoveEfficiencyFactor: number }; onMoveEfficiencyFactorChange?: (value: number) => void; onSelect: (id: string) => void; onBack: () => void; backLabel?: string }) {
   const analysis = useSyncExternalStore(chartAnalysis.subscribe, () => chartAnalysis.get(instId))
   const [analysisOpen, setAnalysisOpen] = useState(() => chartAnalysis.get(instId) !== null)
-  const [moveMode, setMoveMode] = useState<PriceMoveMode>(moveDefaults.chartMovePriceSource)
-  const [moveObjective, setMoveObjective] = useState<PriceMoveObjective>(moveDefaults.chartMoveObjective)
+  const moveMode: PriceMoveMode = 'highLow'
+  const moveObjective: PriceMoveObjective = 'efficiency'
   const [showMoveLabels, setShowMoveLabels] = useState(moveDefaults.chartMoveLabelsVisible)
   const [moveEfficiencyFactor, setMoveEfficiencyFactor] = useState(moveDefaults.chartMoveEfficiencyFactor)
-  const [moveEfficiencyFactorDraft, setMoveEfficiencyFactorDraft] = useState(String(moveDefaults.chartMoveEfficiencyFactor))
-  const [moveEfficiencyFactorError, setMoveEfficiencyFactorError] = useState(false)
   const analysisBusy = analysis?.phase === 'capturing' || analysis?.phase === 'streaming'
   useEffect(() => () => chartAnalysis.stop(instId), [instId])
   const [displayed, setDisplayed] = useState<{ id: string; data: ChartResponse } | null>(null)
@@ -410,6 +429,8 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
   const wheelFrame = useRef<number | null>(null)
   const historyRequests = useRef(new Map<string, Promise<ChartPollResponse>>())
   const requestedHistoryEnds = useRef(new Set<string>())
+  const historyRetryTimers = useRef(new Map<string, number>())
+  const historyRetryAttempts = useRef(new Map<string, number>())
   const [inspection, setInspection] = useState<{ id: string; hour: number } | null>(null)
   const heldPointer = useRef<{ id: string; pointerId: number; target: SVGSVGElement } | null>(null)
   const endInspection = useCallback(() => {
@@ -427,7 +448,6 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
   const navigationFrame = useRef<number | null>(null)
   const [plotSize, setPlotSize] = useState({ width: 0, height: 0 })
   const listPosition = listOrder.indexOf(instId)
-  const turnoverPosition = turnoverOrder.indexOf(instId)
   const previous = chartNavigationTarget(listOrder, turnoverOrder, instId, "ArrowUp")
   const next = chartNavigationTarget(listOrder, turnoverOrder, instId, "ArrowDown")
   const beforePrevious = listPosition < 0 ? undefined : wrappedMarket(listOrder, listPosition - 2)
@@ -443,8 +463,11 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
   const captureError = capture.id === instId ? capture.error : ""
   useEffect(() => {
     requestedHistoryEnds.current.clear()
+    for (const timer of historyRetryTimers.current.values()) window.clearTimeout(timer)
+    historyRetryTimers.current.clear(); historyRetryAttempts.current.clear()
     setHistoryBars(null); setHistoryBoundary(null)
   }, [instId, chart?.serviceSession])
+  useEffect(() => () => { for (const timer of historyRetryTimers.current.values()) window.clearTimeout(timer) }, [])
   useEffect(() => {
     if (capture.status !== "flashing") return
     const timer = window.setTimeout(() => setCapture(current => current === capture ? { ...current, status: "idle" } : current), 550)
@@ -501,21 +524,32 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
   useEffect(() => {
     if (historicalEnd === null) return
     const needsCandles = chartHistoryNeedsLoad(historicalEnd, oldestCachedHour)
+    const needsStats = chartStatsNeedLoad(cachedBars, historicalEnd)
     const key = `${instId}:${historicalEnd}`
-    // A buffered response can satisfy many adjacent viewport positions. Native
-    // work is needed only near the left edge, not once per exact end hour.
-    if (!needsCandles || requestedHistoryEnds.current.has(key)) return
+    // A buffered response can satisfy many adjacent viewport positions. Failed
+    // or partial attempts are released by the bounded automatic retry timer.
+    if ((!needsCandles && !needsStats) || requestedHistoryEnds.current.has(key)) return
     let stopped = false
-    const timer = window.setTimeout(() => {
-      setHistoryLoading(key)
-      void (async () => {
-        try { await historyRequests.current.get(instId) } catch { /* retry the newest position */ }
-        if (stopped || windowEndRef.current?.id !== instId || windowEndRef.current.hour !== historicalEnd) return
-        requestedHistoryEnds.current.add(key)
-        const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, chartEndHour: historicalEnd })
-        historyRequests.current.set(instId, request)
-        try {
-          const result = await request
+    const retryAutomatically = () => {
+      if (stopped || historyRetryTimers.current.has(key)) return
+      const attempt = (historyRetryAttempts.current.get(key) ?? 0) + 1
+      historyRetryAttempts.current.set(key, attempt)
+      const timer = window.setTimeout(() => {
+        historyRetryTimers.current.delete(key)
+        requestedHistoryEnds.current.delete(key)
+        setHistoryRetry(value => value + 1)
+      }, Math.min(30_000, 2_000 * 2 ** Math.min(attempt - 1, 4)))
+      historyRetryTimers.current.set(key, timer)
+    }
+    setHistoryLoading(key)
+    void (async () => {
+      try { await historyRequests.current.get(instId) } catch { /* retry the newest position */ }
+      if (stopped || windowEndRef.current?.id !== instId || windowEndRef.current.hour !== historicalEnd) return
+      requestedHistoryEnds.current.add(key)
+      const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, chartEndHour: historicalEnd })
+      historyRequests.current.set(instId, request)
+      try {
+        const result = await request
         if (chartOrders.get(instId)?.isRetiredSession(result.serviceSession)) {
           requestedHistoryEnds.current.delete(key)
           if (!stopped) { setHistoryLoading(null); setHistoryRetry(value => value + 1) }
@@ -525,7 +559,11 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
           const oldestHour = result.oldestHour
           setHistoryBoundary(current => current?.id === instId && current.oldestHour === oldestHour ? current : { id: instId, oldestHour })
         }
-        if (stopped || windowEndRef.current?.id !== instId || windowEndRef.current.hour !== historicalEnd || "unchanged" in result) return
+        // Keep a completed buffered page even when the user continued scrolling
+        // while it was in flight. The next viewport can usually be rendered from
+        // the same page; discarding it caused a blank chart and a duplicate native
+        // download for every wheel movement.
+        if (windowEndRef.current?.id !== instId || "unchanged" in result) return
         setHistoryBars(current => {
           const merged = mergeChartBars(result, current?.id === instId ? current.data : null)
           const first = historicalEnd - 499 * 3_600_000
@@ -533,7 +571,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
           return { id: instId, data: { ...result, bars: merged.filter(bar => bar.hour >= first && bar.hour <= last) } }
         })
         endInspection()
-        if (result.endHour !== undefined && result.endHour !== historicalEnd) {
+        if (!stopped && windowEndRef.current?.hour === historicalEnd && result.endHour !== undefined && result.endHour !== historicalEnd) {
           const latestHour = chartCache.get(instId)?.data.bars.at(-1)?.hour ?? result.bars.at(-1)?.hour ?? result.endHour
           const next = result.endHour >= latestHour ? null : { id: instId, hour: result.endHour }
           windowEndRef.current = next
@@ -541,18 +579,20 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
         }
         setChartError({ id: instId, message: result.error })
         setHistoryLoading(null)
-        } catch (cause) {
-          if (!stopped && windowEndRef.current?.id === instId && windowEndRef.current.hour === historicalEnd) {
-            setChartError({ id: instId, message: cause instanceof Error ? cause.message : "Cannot load history" })
-            setHistoryLoading(null)
-          }
-        } finally {
-          if (historyRequests.current.get(instId) === request) historyRequests.current.delete(instId)
+        if (result.error) retryAutomatically()
+        else historyRetryAttempts.current.delete(key)
+      } catch (cause) {
+        if (!stopped && windowEndRef.current?.id === instId && windowEndRef.current.hour === historicalEnd) {
+          setChartError({ id: instId, message: cause instanceof Error ? cause.message : "Cannot load history" })
+          setHistoryLoading(null)
         }
-      })()
-    }, 80)
-    return () => { stopped = true; window.clearTimeout(timer) }
-  }, [instId, historicalEnd, oldestCachedHour, historyRetry, endInspection])
+        retryAutomatically()
+      } finally {
+        if (historyRequests.current.get(instId) === request) historyRequests.current.delete(instId)
+      }
+    })()
+    return () => { stopped = true }
+  }, [instId, historicalEnd, oldestCachedHour, cachedBars, historyRetry, endInspection])
   useEffect(() => {
     wheelPixels.current = 0
     if (wheelFrame.current !== null) window.cancelAnimationFrame(wheelFrame.current)
@@ -681,17 +721,6 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
     startTransition(() => setWindowEnd(next))
     endInspection()
   }
-  const commitMoveEfficiencyFactor = () => {
-    const value = Number(moveEfficiencyFactorDraft)
-    if (!moveEfficiencyFactorDraft.trim() || !Number.isFinite(value) || value < 0 || value > 2) {
-      setMoveEfficiencyFactorError(true)
-      return false
-    }
-    setMoveEfficiencyFactorError(false)
-    setMoveEfficiencyFactorDraft(String(value))
-    setMoveEfficiencyFactor(value)
-    return true
-  }
   const active = bars[inspected ?? bars.length - 1]
   const atHistoryBoundary = historicalEnd !== null && historyBoundary?.id === instId
     && historicalEnd === Math.min(chart?.bars.at(-1)?.hour ?? historicalEnd, historyBoundary.oldestHour + 95 * 3_600_000)
@@ -714,18 +743,11 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
       return { ...image, capturedAt, rangeLabel }
     }, direction)
   }
-  const longMoves = visibleMoveSignals.filter(signal => signal.direction === 'long').length
-  const shortMoves = visibleMoveSignals.length - longMoves
-  const strongestMove = visibleMoveSignals.find(signal => signal.rank === 1)
-  const moveSource = moveMode === 'close' ? 'Close' : 'High / Low'
-  const objectiveLabel = moveObjective === 'amplitude' ? 'maximum total move' : 'maximum move per K-line'
-  const chartDescription = `OKX perpetual · 1h · ${historicalEnd === null ? "Latest 96 hours" : `History through ${time(historicalEnd)}`} · Future-aware Long and Short labels capture the ${objectiveLabel} from ${moveMode === 'close' ? 'close-to-close' : 'Low-to-High and High-to-Low'} candidates over 1% · Hold to inspect · Scroll chart for history · 24h turnover rank ${turnoverPosition + 1}/${turnoverOrder.length} · ↑/↓ list order · ← list first · → turnover first`
   return <ChartWorkspaceViewport expanded={analysisOpen}><main className="flex h-full min-h-0 flex-col overflow-hidden overscroll-none text-sm font-normal tabular-nums">
     <header className="flex shrink-0 items-center gap-3 border-b px-4 py-2">
       <Button variant="ghost" size="sm" onClick={onBack}><ArrowLeft data-icon="inline-start" aria-hidden="true" />{backLabel}</Button>
       <div className="min-w-0 flex-1">
         <h1 className="truncate text-base font-semibold tracking-tight" title={instId}>{instId.replace(/-SWAP$/, "")}</h1>
-        <p className="truncate text-xs text-muted-foreground" title={chartDescription}>{chartDescription}</p>
       </div>
       <Button variant="outline" size="sm" disabled={!bars.length || plotSize.width <= 0 || captureStatus === "copying" || analysis?.phase === 'capturing'} onClick={() => { void captureChart() }}><Camera data-icon="inline-start" aria-hidden="true" />{captureStatus === "copying" ? "Copying…" : "Copy chart"}</Button>
       <ButtonGroup aria-label="Chart analysis actions">
@@ -738,27 +760,17 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
       </ButtonGroup>
       <span role="status" className="sr-only">{captureStatus === "flashing" ? "Chart copied to clipboard" : ""}</span>
       <Badge variant="secondary"><Radio data-icon="inline-start" aria-hidden="true" />{historicalEnd !== null ? "History" : active && !active.confirmed ? "Live candle" : "Hourly chart"}</Badge>
-      <Badge variant="outline" title={`Hindsight labels use future completed candle ${moveSource} values and are not live trading signals`}>{longMoves} Long · {shortMoves} Short{moveObjective === 'efficiency' && strongestMove ? ` · score ${strongestMove.efficiencyScore.toFixed(2)}` : ''}</Badge>
-    </header>
-    <div role="status" data-price-move-summary className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-xs">
-      <span className="font-medium"><span className="text-positive">{longMoves} Long</span> · <span className="text-destructive">{shortMoves} Short</span></span>
-      <Button variant="ghost" size="sm" onClick={() => {
-        setMoveMode(current => current === 'highLow' ? 'close' : 'highLow')
-        // Return focus to the chart so market-navigation shortcuts remain
-        // active immediately after switching.
-        plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus()
-      }} aria-label="Move price source" title={`Switch to ${moveMode === 'highLow' ? 'Close' : 'High / Low'}`} data-price-move-mode={moveMode}><span className="font-semibold">{moveMode === 'highLow' ? 'High / Low' : 'Close'}</span><ArrowLeftRight data-icon="inline-end" aria-hidden="true" /></Button>
-      <Button variant="ghost" size="sm" onClick={() => {
-        setMoveObjective(current => current === 'efficiency' ? 'amplitude' : 'efficiency')
-        plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus()
-      }} aria-label="Move optimization objective" title={`Switch to ${moveObjective === 'efficiency' ? 'Max Move' : 'Max Efficiency'}`} data-price-move-objective={moveObjective}><span className="font-semibold">{moveObjective === 'efficiency' ? 'Max Efficiency' : 'Max Move'}</span><ArrowLeftRight data-icon="inline-end" aria-hidden="true" /></Button>
-      <div className="flex items-center gap-2" data-price-move-efficiency-factor={moveEfficiencyFactor} title="Efficiency = |change| / periods^factor"><label htmlFor="chart-efficiency-factor" className="text-muted-foreground">Factor</label><Input id="chart-efficiency-factor" className="h-(--control-height-sm) w-16" type="number" min="0" max="2" step="0.1" inputMode="decimal" value={moveEfficiencyFactorDraft} aria-label="Chart efficiency factor" aria-invalid={moveEfficiencyFactorError} onChange={event => { setMoveEfficiencyFactorDraft(event.target.value); setMoveEfficiencyFactorError(false) }} onBlur={commitMoveEfficiencyFactor} onKeyDown={event => { if (event.key === 'Enter') { if (commitMoveEfficiencyFactor()) plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus() } }} /></div>
+      <div className="flex w-36 items-center gap-2" data-price-move-efficiency-factor={moveEfficiencyFactor} title="Efficiency = |change| / periods^factor">
+        <label htmlFor="chart-efficiency-factor" className="shrink-0 text-xs text-muted-foreground">Factor</label>
+        <Slider id="chart-efficiency-factor" min={0} max={1} step={0.01} value={[moveEfficiencyFactor]} onValueChange={values => setMoveEfficiencyFactor(values[0] ?? 0)} onValueCommit={values => {
+          onMoveEfficiencyFactorChange?.(values[0] ?? 0)
+          window.requestAnimationFrame(() => plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus())
+        }} aria-label={`Efficiency factor ${moveEfficiencyFactor.toFixed(2)}`} />
+        <span className="w-8 text-right text-xs tabular-nums">{moveEfficiencyFactor.toFixed(2)}</span>
+      </div>
       <Toggle variant="outline" size="sm" pressed={showMoveLabels} onPressedChange={setShowMoveLabels} aria-label="Show move label layer" data-price-move-layer={showMoveLabels ? 'visible' : 'hidden'}>{showMoveLabels ? 'Labels On' : 'Labels Off'}</Toggle>
-    </div>
-    {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}{historicalEnd !== null && <Button variant="outline" size="sm" onClick={() => {
-      requestedHistoryEnds.current.delete(`${instId}:${historicalEnd}`)
-      setHistoryRetry(value => value + 1)
-    }}>Retry</Button>}</div>}
+    </header>
+    {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}{historicalEnd !== null && ' Retrying automatically.'}</div>}
     {captureError && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{captureError}</p>}
     <div className="flex min-h-0 flex-1">
     <section ref={chartRef} data-chart-inst={instId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-surface="panel" aria-label={`${instId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-chart-surface">
@@ -800,7 +812,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
           inspectAt(event.currentTarget, event.clientX)
         }}>
           <Plot bars={data.bars} liveBar={chart?.bars.at(-1) ?? data.bars.at(-1)!} inspected={inspected} width={plotSize.width} height={plotSize.height} now={1} endHour={data.endHour ?? data.bars.at(-1)!.hour} moveSignals={visibleMoveSignals} />
-        </svg>) : <p className="flex h-full items-center justify-center text-muted-foreground">{chart ? "No candle data available yet" : "Loading chart…"}</p>}
+        </svg>) : <p className="flex h-full items-center justify-center text-muted-foreground">{historyLoading?.startsWith(`${instId}:`) ? "Loading history…" : chart ? "No candle data available yet" : "Loading chart…"}</p>}
         {historicalEnd !== null && historyLoading === `${instId}:${historicalEnd}` && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Loading history…</span>}
         {atHistoryBoundary && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Start of available history</span>}
         </div>

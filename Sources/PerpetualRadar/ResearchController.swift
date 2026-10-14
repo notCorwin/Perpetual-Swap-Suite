@@ -515,6 +515,8 @@ final class ResearchController {
         case "cleanCache":
             guard !isBusy else { throw FilterError("Stop research before clearing unreferenced cache.") }
             return ["bytesRemoved": try store.cleanCache()]
+        case "jobStatus":
+            return ["job": try status.map(snapshot) ?? NSNull()]
         case "inventory":
             var result = try await library.inventory()
             var studies = result["studies"] as! [[String: Any]]

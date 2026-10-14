@@ -1,5 +1,4 @@
 import { useState } from 'react'
-import { Button } from '@/components/ui/button'
 import { Field, FieldDescription, FieldError, FieldLabel } from '@/components/ui/field'
 import { Slider } from '@/components/ui/slider'
 import { blurRadiusLimit, type useBlurSettings } from '@/blur-settings'
@@ -18,7 +17,7 @@ export function BlurControls({ settings, windowDisabled }: { settings: ReturnTyp
         aria-labelledby={`${id}-label`} aria-describedby={`${id}-description`} onValueChange={([value]) => settings.change(key, value)} onValueCommit={([value]) => settings.commit(key, value)} />
       <FieldDescription id={`${id}-description`}>{windowBlur ? 'Blurs the desktop behind the window. Requires a translucent frosted background.' : 'Blurs app content behind menus, dialogs, and task overlays. Higher values soften more detail.'}</FieldDescription>
       {settings.pending[key] && <FieldDescription role="status">Saving…</FieldDescription>}
-      {settings.errors[key] && <><FieldError role="alert">{settings.errors[key]}</FieldError><Button variant="outline" size="sm" onClick={() => settings.commit(key)}>Retry saving</Button></>}
+      {settings.errors[key] && <FieldError role="alert">{settings.errors[key]} Automatically retrying.</FieldError>}
     </Field>
   })
 }

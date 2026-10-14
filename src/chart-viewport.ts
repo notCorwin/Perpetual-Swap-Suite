@@ -24,3 +24,9 @@ export function visibleChartBars<T extends { hour: number }>(bars: T[], endHour:
 export function chartHistoryNeedsLoad(endHour: number, oldestCachedHour: number, visibleHours = 96, prefetchHours = 48): boolean {
   return endHour - (visibleHours - 1) * hour <= oldestCachedHour + prefetchHours * hour
 }
+
+export function chartStatsNeedLoad<T extends { hour: number; confirmed: boolean; oi: number | null; buy: number | null; sell: number | null }>(bars: T[], endHour: number, visibleHours = 96): boolean {
+  const firstHour = endHour - (visibleHours - 1) * hour
+  return bars.some(bar => bar.confirmed && bar.hour >= firstHour && bar.hour <= endHour
+    && (bar.oi === null || bar.buy === null || bar.sell === null))
+}

@@ -43,6 +43,7 @@ actor FilterHistoryLoader {
     private var quoteCache: [String: [Int64: FilterQuote]] = [:]
     private var ranges: [String: (first: Int64, last: Int64)] = [:]
     private var statRanges: [String: (first: Int64, last: Int64)] = [:]
+    private var coverageChecks: [String: (demand: String, candlesMissing: Bool, statsMissing: Bool)] = [:]
     private var queue: [String] = []
     private var jobs: [String: (market: FilterMarketData, hours: Int, stats: Bool)] = [:]
     private var running: Task<Void, Never>?
@@ -54,6 +55,7 @@ actor FilterHistoryLoader {
     private var retries: [String: Date] = [:]
     private var candleFloor: [String: (hour: Int64, expires: Date)] = [:]
     private var statPages: [String: Date] = [:]
+    private var lastCachePrune = Date.distantPast
     private var completed = 0
     private var updatedMarkets = Set<String>()
     private var lastError = ""
@@ -104,7 +106,7 @@ actor FilterHistoryLoader {
         }
         researchRanges[id] = (min(from, previous?.first ?? from), max(through, previous?.last ?? through), version)
         candleCache.removeValue(forKey: id); statCache.removeValue(forKey: id); quoteCache.removeValue(forKey: id)
-        ranges.removeValue(forKey: id); statRanges.removeValue(forKey: id)
+        ranges.removeValue(forKey: id); statRanges.removeValue(forKey: id); coverageChecks.removeValue(forKey: id)
         updatedMarkets.insert(id)
         return values.count
     }
@@ -112,7 +114,7 @@ actor FilterHistoryLoader {
         let db = try database()
         let version = try db.dataVersion()
         if let previous = observedDataVersion, previous != version {
-            candleCache.removeAll(); statCache.removeAll(); quoteCache.removeAll(); ranges.removeAll(); statRanges.removeAll()
+            candleCache.removeAll(); statCache.removeAll(); quoteCache.removeAll(); ranges.removeAll(); statRanges.removeAll(); coverageChecks.removeAll()
         }
         observedDataVersion = version
         return try markets.map { original in
@@ -148,6 +150,13 @@ actor FilterHistoryLoader {
         }
     }
     func schedule(_ markets: [FilterMarketData], filter: CompiledFilter) {
+        let now = Date()
+        if now.timeIntervalSince(lastCachePrune) >= 60 || retries.count + statPages.count + candleFloor.count > 8_192 {
+            retries = retries.filter { $0.value > now }
+            statPages = statPages.filter { $0.value > now }
+            candleFloor = candleFloor.filter { $0.value.expires > now }
+            lastCachePrune = now
+        }
         let demand = "\(filter.requiredHours)|\(filter.needsStats)|\(markets.first?.hour ?? 0)"
         if activeDemand != demand {
             // A smaller/new-hour preview no longer needs obsolete queued work.
@@ -165,8 +174,17 @@ actor FilterHistoryLoader {
             let first = max(0, market.hour - Int64(filter.requiredHours) * hourMS)
             let listing = market.listedAt.map { $0 / hourMS * hourMS } ?? first
             let availableFirst = max(first, listing, floor(market.id) ?? first)
-            let missingCandles = stride(from: market.hour - hourMS, through: availableFirst, by: -Int(hourMS)).contains { !Self.complete(market.candles[$0]) }
-            let missingStats = filter.needsStats && stride(from: market.hour - hourMS, through: max(first, listing), by: -Int(hourMS)).contains { market.stats[$0]?.oi == nil || market.stats[$0]?.oiUSD == nil || market.stats[$0]?.buy == nil || market.stats[$0]?.sell == nil }
+            let coverage: (demand: String, candlesMissing: Bool, statsMissing: Bool)
+            if let cached = coverageChecks[market.id], cached.demand == demand {
+                coverage = cached
+            } else {
+                coverage = (demand,
+                    stride(from: market.hour - hourMS, through: availableFirst, by: -Int(hourMS)).contains { !Self.complete(market.candles[$0]) },
+                    filter.needsStats && stride(from: market.hour - hourMS, through: max(first, listing), by: -Int(hourMS)).contains { market.stats[$0]?.oi == nil || market.stats[$0]?.oiUSD == nil || market.stats[$0]?.buy == nil || market.stats[$0]?.sell == nil })
+                coverageChecks[market.id] = coverage
+            }
+            let missingCandles = coverage.candlesMissing
+            let missingStats = coverage.statsMissing
             if !missingCandles && !missingStats { continue }
             if jobs[key] == nil { queue.append(key) }
             jobs[key] = (market, max(filter.requiredHours, jobs[key]?.hours ?? 0), filter.needsStats || jobs[key]?.stats == true)
@@ -241,23 +259,25 @@ actor FilterHistoryLoader {
                     var parameters = ["instId": market.id, "period": "1H", "end": String(pageEnd + hourMS), "limit": "100"]
                     if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "2" }
                     let values = try await fetch(path, parameters)
+                    var updates: [(hour: Int64, oi: Double?, oiUSD: Double?, sell: Double?, buy: Double?)] = []
                     for value in values {
                         guard let ts = value.first.flatMap(Int64.init), ts % hourMS == 0, ts >= pageStart, ts <= pageEnd else { continue }
                         if path.contains("open-interest"), value.count >= 4,
                            let oi = Double(value[1]), let oiUSD = Double(value[3]),
                            oi.isFinite, oiUSD.isFinite, oi >= 0, oiUSD >= 0 {
-                            try db.saveChartStat(market.id, hour: ts, oi: oi, oiUSD: oiUSD)
+                            updates.append((ts, oi, oiUSD, nil, nil))
                             statCache[market.id, default: [:]][ts, default: .init()].oi = oi
                             statCache[market.id, default: [:]][ts, default: .init()].oiUSD = oiUSD
                             updatedMarkets.insert(market.id)
                             loaded.insert(ts)
                         } else if !path.contains("open-interest"), value.count >= 3, let sell = Double(value[1]), let buy = Double(value[2]), sell.isFinite, buy.isFinite, sell >= 0, buy >= 0 {
-                            try db.saveChartStat(market.id, hour: ts, sell: sell, buy: buy)
+                            updates.append((ts, nil, nil, sell, buy))
                             updatedMarkets.insert(market.id)
                             statCache[market.id, default: [:]][ts, default: .init()].sell = sell; statCache[market.id, default: [:]][ts, default: .init()].buy = buy
                             loaded.insert(ts)
                         }
                     }
+                    try db.saveChartStats(market.id, updates)
                     if stride(from: expectedFirst, through: pageEnd, by: Int(hourMS)).allSatisfy({ loaded.contains($0) }) {
                         statPages[pageKey] = Date().addingTimeInterval(900)
                     } else { incomplete = true }
@@ -272,6 +292,7 @@ actor FilterHistoryLoader {
         quoteCache[market.id] = quoteCache[market.id]?.filter { $0.key >= first }
         if let range = ranges[market.id] { ranges[market.id] = (max(first, range.first), range.last) }
         if let range = statRanges[market.id] { statRanges[market.id] = (max(first, range.first), range.last) }
+        coverageChecks.removeValue(forKey: market.id)
     }
     private static func complete(_ candle: Candle?) -> Bool { candle?.confirmed == true && candle?.open != nil && candle?.baseVolume != nil }
     private func floor(_ id: String) -> Int64? { guard let value = candleFloor[id], value.expires > Date() else { candleFloor.removeValue(forKey: id); return nil }; return value.hour }
