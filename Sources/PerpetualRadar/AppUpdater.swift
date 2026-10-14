@@ -4,6 +4,7 @@ import Foundation
 struct AppUpdate: Sendable {
     let name: String
     let revision: String
+    let build: String?
     let assetURL: URL
     let expectedSHA256: String
     let publishedAt: Date?
@@ -11,12 +12,14 @@ struct AppUpdate: Sendable {
     init(
         name: String,
         revision: String,
+        build: String? = nil,
         assetURL: URL,
         expectedSHA256: String,
         publishedAt: Date? = nil
     ) {
         self.name = name
         self.revision = revision
+        self.build = build
         self.assetURL = assetURL
         self.expectedSHA256 = expectedSHA256
         self.publishedAt = publishedAt
@@ -167,6 +170,7 @@ final class AppUpdater: AppUpdating, @unchecked Sendable {
 
     private struct Manifest: Decodable {
         let revision: String
+        let build: String?
         let assetUrl: URL
         let versionedAssetUrl: URL?
         let immutableAssetUrl: URL?
@@ -732,6 +736,7 @@ final class AppUpdater: AppUpdating, @unchecked Sendable {
             return .success(AppUpdate(
                 name: "autobuild",
                 revision: releaseRevision,
+                build: manifest.build,
                 assetURL: manifest.versionedAssetUrl ?? manifest.immutableAssetUrl ?? manifest.assetUrl,
                 expectedSHA256: expectedSHA256,
                 publishedAt: manifest.publishedAt

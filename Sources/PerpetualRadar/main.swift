@@ -419,8 +419,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             alert.runModal()
         case "available":
             let revision = (response["updateRevision"] as? String).map { String($0.prefix(7)) } ?? ""
+            let build = response["updateBuild"] as? String
             alert.messageText = "Update Available"
-            alert.informativeText = revision.isEmpty ? "A new version is available." : "A new version (\(revision)) is available."
+            let version = build.map { "Build \($0)" } ?? "A new build"
+            alert.informativeText = revision.isEmpty ? "\(version) is available." : "\(version) · \(revision) is available."
             alert.addButton(withTitle: "Download and Install")
             alert.addButton(withTitle: "Later")
             if alert.runModal() == .alertFirstButtonReturn { sendUpdateAction("install") }
