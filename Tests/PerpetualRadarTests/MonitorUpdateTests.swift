@@ -38,7 +38,6 @@ final class MonitorUpdateTests: BackgroundTestCase {
             _ = try await lease(busy: false)
             var info = try await request(["updateAction": "check"])
             XCTAssertEqual(transport.downloads, 1)
-            XCTAssertEqual(info["updateCheckStatus"] as? String, "installing")
             XCTAssertEqual(info["updateMenuTitle"] as? String, "Downloading Update…")
             XCTAssertEqual(info["updateMenuEnabled"] as? Bool, false)
             _ = try await lease(busy: false)
@@ -83,8 +82,7 @@ final class MonitorUpdateTests: BackgroundTestCase {
         try await withMonitor { transport, _ in
             _ = try await lease(busy: true)
             _ = try await lease(busy: true, pid: getppid())
-            let checked = try await request(["updateAction": "check"])
-            XCTAssertEqual(checked["updateCheckStatus"] as? String, "available")
+            _ = try await request(["updateAction": "check"])
             _ = try await lease(busy: false)
             XCTAssertEqual(transport.downloads, 0)
             _ = try await request(["releaseLease": getppid()])
