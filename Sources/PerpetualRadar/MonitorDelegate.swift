@@ -343,12 +343,7 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if let action = parameters["updateAction"] as? String {
             switch action {
-            case "check": return decorated(try await checkForUpdatesForClient())
-            case "install":
-                guard let update, updateState == "available", !researchBusy else {
-                    throw FilterError(researchBusy ? "Pause research before installing the update." : "No update is ready to install.")
-                }
-                installUpdate(update, automatically: false)
+            case "check": checkForUpdatesNow()
             case "toggleAutomatic": toggleAutomaticUpdates()
             default: throw FilterError("Invalid update action.")
             }
@@ -443,7 +438,6 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func renderUpdateItem() {
         if updateState == "available", let update {
             let revision = update.revision == "unknown" ? "" : " · \(update.revision.prefix(7))"
-            let build = update.build.map { " · Build \($0)" } ?? ""
             let age: String
             if let publishedAt = update.publishedAt {
                 let formatter = RelativeDateTimeFormatter()
@@ -452,16 +446,16 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 age = " · \(formatter.localizedString(for: publishedAt, relativeTo: now()))"
             } else { age = "" }
             if AppDelegate.automaticUpdatesEnabled(in: MonitorRuntime.defaults), researchBusy {
-                checkUpdatesItem.title = "Update Available\(build)\(revision) · Waiting for Research"
+                checkUpdatesItem.title = "Update Available\(revision) · Waiting for Research"
             } else if !updateError.isEmpty {
                 let retry = automaticInstallRetryAfter.flatMap { date -> String? in
                     guard AppDelegate.automaticUpdatesEnabled(in: MonitorRuntime.defaults), date > now() else { return nil }
                     let minutes = max(1, Int(ceil(date.timeIntervalSince(now()) / 60)))
                     return " · Retrying in \(minutes)m"
                 } ?? ""
-                checkUpdatesItem.title = "Update Failed\(build)\(revision)\(retry)"
+                checkUpdatesItem.title = "Update Failed\(revision)\(retry)"
             } else {
-                checkUpdatesItem.title = "Update Available\(build)\(revision)\(age)"
+                checkUpdatesItem.title = "Update Available\(revision)\(age)"
             }
         } else if isInstallingUpdate {
             switch updateProgress {
@@ -496,8 +490,8 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         checkUpdatesItem.isEnabled = !isCheckingUpdate && !isInstallingUpdate
     }
 
-    private func checkForUpdates(silently: Bool, presentResult: Bool = true, completion: ((Result<AppUpdate?, AppUpdateError>) -> Void)? = nil) {
-        guard !isCheckingUpdate, !isInstallingUpdate, !isPresentingUpdate else { completion?(.failure(.busy)); return }
+    private func checkForUpdates(silently: Bool) {
+        guard !isCheckingUpdate, !isInstallingUpdate, !isPresentingUpdate else { return }
         isCheckingUpdate = true
         updateState = "checking"
         renderUpdateItem()
@@ -518,39 +512,18 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     if AppDelegate.automaticUpdatesEnabled(in: MonitorRuntime.defaults),
                        automaticInstallRetryAfter.map({ $0 <= now() }) ?? true {
                         installUpdate(found, automatically: true)
-                    } else if !silently, presentResult {
+                    } else if !silently {
                         presentUpdate(found)
                     }
-                } else if !silently, presentResult {
+                } else if !silently {
                     showUpdateAlert("Up to Date", "You have the latest version of Perpetual Swap Suite.")
                 }
             case .failure(let error):
                 updateState = update == nil ? "failed" : "available"
-                if !silently, presentResult { showUpdateAlert("Update Check Failed", error.localizedDescription) }
+                if !silently { showUpdateAlert("Update Check Failed", error.localizedDescription) }
             }
             renderUpdateItem()
-            completion?(result)
         }
-    }
-
-    private func checkForUpdatesForClient() async throws -> [String: Any] {
-        if updateState == "available", let update { return updateCheckResponse(update) }
-        let found = try await withCheckedThrowingContinuation { continuation in
-            checkForUpdates(silently: false, presentResult: false) { result in
-                switch result {
-                case .success(let update): continuation.resume(returning: update)
-                case .failure(let error): continuation.resume(throwing: error)
-                }
-            }
-        }
-        guard let found else { return ["updateCheckStatus": "latest"] }
-        return updateCheckResponse(found)
-    }
-
-    private func updateCheckResponse(_ update: AppUpdate) -> [String: Any] {
-        ["updateCheckStatus": isInstallingUpdate ? "installing" : "available",
-         "updateName": update.name, "updateRevision": update.revision,
-         "updateBuild": update.build as Any? ?? NSNull()]
     }
 
     private func presentUpdate(_ update: AppUpdate) {
@@ -558,9 +531,8 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isPresentingUpdate = true
         let alert = NSAlert()
         alert.messageText = "Update Available"
-        let revision = update.revision == "unknown" ? "" : " · \(update.revision.prefix(7))"
-        let build = update.build.map { "Build \($0)" } ?? update.name
-        alert.informativeText = "\(build)\(revision) is available. Download and install it now?"
+        let revision = update.revision == "unknown" ? "" : " (\(update.revision.prefix(7)))"
+        alert.informativeText = "\(update.name)\(revision) is available. Download and install it now?"
         alert.addButton(withTitle: "Update")
         alert.addButton(withTitle: "Later")
         NSApp.activate(ignoringOtherApps: true)

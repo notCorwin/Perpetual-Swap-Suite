@@ -34,11 +34,6 @@ if [[ -n "$revision" ]]; then
     /usr/libexec/PlistBuddy -c "Add :CFBundleSourceCommitDate string $commit_date" "$app/Contents/Info.plist"
     /usr/libexec/PlistBuddy -c "Add :CFBundleSourceCommitDate string $commit_date" "$helper/Contents/Info.plist"
   fi
-  build_number="${APP_BUILD_NUMBER:-$(git rev-list --count "$revision" 2>/dev/null || true)}"
-  if [[ "$build_number" == <-> ]]; then
-    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $build_number" "$app/Contents/Info.plist"
-    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $build_number" "$helper/Contents/Info.plist"
-  fi
 fi
 codesign --force --sign - "$helper" >/dev/null
 codesign --force --sign - "$app" >/dev/null

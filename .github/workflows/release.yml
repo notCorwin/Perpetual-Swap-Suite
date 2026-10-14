@@ -25,7 +25,7 @@ jobs:
       - name: Build release app
         run: |
           npm ci
-          APP_REVISION="$GITHUB_SHA" APP_BUILD_NUMBER="$GITHUB_RUN_NUMBER" npm run app
+          APP_REVISION="$GITHUB_SHA" npm run app
       - name: Package release app
         shell: bash
         run: |
@@ -38,7 +38,6 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = com.perpetualradar.macos
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$app/Contents/Info.plist")" = AppIcon
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleSourceRevision' "$app/Contents/Info.plist")" = "$GITHUB_SHA"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")" = "$GITHUB_RUN_NUMBER"
           helper="$app/Contents/Library/LoginItems/Perpetual Swap Suite Monitor.app"
           test -x "$helper/Contents/MacOS/PerpetualRadar"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$helper/Contents/Info.plist")" = com.perpetualradar.macos.monitor
@@ -53,8 +52,8 @@ jobs:
           repository_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
           asset_url="${repository_url}/releases/download/autobuild/Perpetual.Swap.Suite.app.tar"
           commit_date="$(TZ=UTC git show -s --date=format-local:'%Y-%m-%dT%H:%M:%SZ' --format=%cd "$GITHUB_SHA")"
-          printf '{"revision":"%s","build":"%s","asset_url":"%s","digest":"sha256:%s","published_at":"%s","commit_date":"%s"}\n' \
-            "$GITHUB_SHA" "$GITHUB_RUN_NUMBER" "$asset_url" "$sha256" "$built_at" "$commit_date" > update.json
+          printf '{"revision":"%s","asset_url":"%s","digest":"sha256:%s","published_at":"%s","commit_date":"%s"}\n' \
+            "$GITHUB_SHA" "$asset_url" "$sha256" "$built_at" "$commit_date" > update.json
           printf 'Latest automatic build from `main`. This release is replaced after each successful build.\n\n[Download Perpetual Swap Suite](%s)\n\nCommit: [%s](%s/commit/%s)\n\nBuilt at: %s (UTC)\n' \
             "$asset_url" "$GITHUB_SHA" "$repository_url" "$GITHUB_SHA" "$built_at" > release-notes.md
       - name: Publish autobuild release

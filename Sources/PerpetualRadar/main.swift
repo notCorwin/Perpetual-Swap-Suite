@@ -398,43 +398,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc private func toggleAutomaticUpdates() { sendUpdateAction("toggleAutomatic") }
     private func sendUpdateAction(_ action: String) {
         Task {
-            do {
-                let response = try await monitorClient.request(["updateAction": action])
-                acceptNativeSettings(response)
-                if action == "check" { presentUpdateCheck(response) }
-            }
+            do { acceptNativeSettings(try await monitorClient.request(["updateAction": action])) }
             catch {
-                let alert = NSAlert(); alert.messageText = action == "check" ? "Update Check Failed" : "Cannot Reach Background Monitor"
+                let alert = NSAlert(); alert.messageText = "Cannot Reach Background Monitor"
                 alert.informativeText = error.localizedDescription; alert.runModal()
             }
-        }
-    }
-
-    private func presentUpdateCheck(_ response: [String: Any]) {
-        let status = response["updateCheckStatus"] as? String
-        let alert = NSAlert()
-        switch status {
-        case "latest":
-            alert.messageText = "Up to Date"
-            alert.informativeText = "You have the latest version of Perpetual Swap Suite."
-            alert.runModal()
-        case "installing":
-            alert.messageText = "Update Found"
-            alert.informativeText = "The latest version is being downloaded and installed automatically."
-            alert.runModal()
-        case "available":
-            let revision = (response["updateRevision"] as? String).map { String($0.prefix(7)) } ?? ""
-            let build = response["updateBuild"] as? String
-            alert.messageText = "Update Available"
-            let version = build.map { "Build \($0)" } ?? "A new build"
-            alert.informativeText = revision.isEmpty ? "\(version) is available." : "\(version) · \(revision) is available."
-            alert.addButton(withTitle: "Download and Install")
-            alert.addButton(withTitle: "Later")
-            if alert.runModal() == .alertFirstButtonReturn { sendUpdateAction("install") }
-        default:
-            alert.messageText = "Update Check Failed"
-            alert.informativeText = "The background monitor returned an invalid update status."
-            alert.runModal()
         }
     }
 
