@@ -18,7 +18,7 @@ final class ResearchSchemaMigrationTests: XCTestCase {
         }
 
         let migrated = try ResearchStore(directory: directory)
-        XCTAssertEqual(try migrated.database.preference(forKey: "researchSchemaVersion"), "5")
+        XCTAssertEqual(try migrated.database.preference(forKey: "researchSchemaVersion"), "6")
         var heads = 0, staleObjects = 0, triggers = Set<String>()
         try migrated.database.query("SELECT COUNT(*) FROM research_heads WHERE kind='stat'") { heads = Int(sqlite3_column_int64($0, 0)) }
         try migrated.database.query("SELECT COUNT(*) FROM research_objects WHERE kind IN ('planCache','preparedSource')") { staleObjects = Int(sqlite3_column_int64($0, 0)) }
