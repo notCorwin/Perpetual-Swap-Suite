@@ -228,20 +228,22 @@ final class Store {
 
     func load(hour: Int64, ids: Set<String>) throws -> (candles: [String: [Int64: Candle]], ema: [String: (Int64, Double)]) {
         var candles: [String: [Int64: Candle]] = [:], ema: [String: (Int64, Double)] = [:]
-        let candleStmt = try statement("SELECT inst_id,hour,high,low,close,volume,base_volume,open FROM candles WHERE hour >= ? AND hour < ?")
+        guard !ids.isEmpty else { return (candles, ema) }
+        let instruments = Array(ids), placeholders = Array(repeating: "?", count: instruments.count).joined(separator: ",")
+        let candleStmt = try statement("SELECT inst_id,hour,high,low,close,volume,base_volume,open FROM candles WHERE inst_id IN (\(placeholders)) AND hour >= ? AND hour < ?")
         defer { sqlite3_finalize(candleStmt) }
-        bind([hour - Int64(candleLookback) * hourMS, hour], to: candleStmt)
+        bind(instruments.map { $0 as Any? } + [hour - Int64(candleLookback) * hourMS, hour], to: candleStmt)
         try readRows(candleStmt) {
             let id = Store.text(candleStmt, 0)
-            guard ids.contains(id) else { return }
             let ts = sqlite3_column_int64(candleStmt, 1)
             candles[id, default: [:]][ts] = Candle(hour: ts, high: sqlite3_column_double(candleStmt, 2), low: sqlite3_column_double(candleStmt, 3), close: sqlite3_column_double(candleStmt, 4), quoteVolume: sqlite3_column_type(candleStmt, 5) == SQLITE_NULL ? nil : sqlite3_column_double(candleStmt, 5), baseVolume: sqlite3_column_type(candleStmt, 6) == SQLITE_NULL ? nil : sqlite3_column_double(candleStmt, 6), open: sqlite3_column_type(candleStmt, 7) == SQLITE_NULL ? nil : sqlite3_column_double(candleStmt, 7))
         }
-        let emaStmt = try statement("SELECT inst_id,hour,value FROM ema200")
+        let emaStmt = try statement("SELECT inst_id,hour,value FROM ema200 WHERE inst_id IN (\(placeholders))")
         defer { sqlite3_finalize(emaStmt) }
+        bind(instruments.map { $0 as Any? }, to: emaStmt)
         try readRows(emaStmt) {
             let id = Store.text(emaStmt, 0)
-            if ids.contains(id) { ema[id] = (sqlite3_column_int64(emaStmt, 1), sqlite3_column_double(emaStmt, 2)) }
+            ema[id] = (sqlite3_column_int64(emaStmt, 1), sqlite3_column_double(emaStmt, 2))
         }
         return (candles, ema)
     }
