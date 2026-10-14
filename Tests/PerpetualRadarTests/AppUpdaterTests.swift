@@ -39,6 +39,7 @@ final class AppUpdaterTests: XCTestCase {
         let digest = String(repeating: "b", count: 64)
         let data = try JSONSerialization.data(withJSONObject: [
             "revision": revision,
+            "build": "42",
             "asset_url": "https://github.com/notCorwin/Perpetual-Swap-Suite/releases/download/autobuild/Perpetual.Swap.Suite.app.tar",
             "digest": "sha256:\(digest)",
             "published_at": "2026-09-27T00:00:00Z",
@@ -48,6 +49,7 @@ final class AppUpdaterTests: XCTestCase {
             return XCTFail("Expected an available update")
         }
         XCTAssertEqual(available?.revision, revision)
+        XCTAssertEqual(available?.build, "42")
         XCTAssertEqual(available?.assetURL.absoluteString, "https://github.com/notCorwin/Perpetual-Swap-Suite/releases/download/autobuild/Perpetual.Swap.Suite.app.tar")
         XCTAssertEqual(available?.expectedSHA256, digest)
         XCTAssertEqual(available?.publishedAt, Date(timeIntervalSince1970: 1_790_467_200))
