@@ -193,6 +193,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   const [templates, setTemplates] = useState<ExpressionTemplate[]>(expressionTemplates)
   const [libraryPreferences, setLibraryPreferences] = useState<FilterLibraryPreferences>(initialLibraryPreferences)
   const librarySaveEpoch = useRef(0), librarySavePending = useRef(false)
+  const previewPolling = useRef(false)
   const [rows, setRows] = useState<NativeMarketRow[]>([])
   const routedStrategy = useRef<string | null>(null)
   useEffect(() => {
@@ -216,6 +217,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   const [frostedBackgroundOpacity, setFrostedBackgroundOpacity] = useState(window.radarAppearance?.frostedBackgroundOpacity ?? 0.3)
   const [backgroundOpacityDraft, setBackgroundOpacityDraft] = useState(String(window.radarAppearance?.frostedBackgroundOpacity ?? 0.3))
   const [backgroundOpacityError, setBackgroundOpacityError] = useState("")
+  previewPolling.current = Boolean(active && lastValidJSON && activeStrategyID)
   const blurSettings = useBlurSettings(() => initialBlurSettings(window.radarAppearance), async request => {
     const snapshot = await withSettingsDeadline(window.webkit.messageHandlers.radar.postMessage(request))
     acceptSnapshot(snapshot)
@@ -311,6 +313,12 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     let backoff = 2000
     const load = async () => {
       await pageVisible(); if (stopped) return
+      // Rule previews return the same market snapshot plus filter results.
+      // Avoid a second full bridge request while that richer poll is active.
+      if (previewPolling.current) {
+        timer = window.setTimeout(load, 2000)
+        return
+      }
       try {
         const snapshot = await window.webkit.messageHandlers.radar.postMessage({ rocPeriod: ROC_PERIOD, marocPeriod: MAROC_PERIOD, sinceRevision: revision.current, serviceSession: serviceSession.current })
         if (stopped) return
