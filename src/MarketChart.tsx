@@ -524,16 +524,15 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
     // work is needed only near the left edge, not once per exact end hour.
     if (!needsCandles || requestedHistoryEnds.current.has(key)) return
     let stopped = false
-    const timer = window.setTimeout(() => {
-      setHistoryLoading(key)
-      void (async () => {
-        try { await historyRequests.current.get(instId) } catch { /* retry the newest position */ }
-        if (stopped || windowEndRef.current?.id !== instId || windowEndRef.current.hour !== historicalEnd) return
-        requestedHistoryEnds.current.add(key)
-        const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, chartEndHour: historicalEnd })
-        historyRequests.current.set(instId, request)
-        try {
-          const result = await request
+    setHistoryLoading(key)
+    void (async () => {
+      try { await historyRequests.current.get(instId) } catch { /* retry the newest position */ }
+      if (stopped || windowEndRef.current?.id !== instId || windowEndRef.current.hour !== historicalEnd) return
+      requestedHistoryEnds.current.add(key)
+      const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, chartEndHour: historicalEnd })
+      historyRequests.current.set(instId, request)
+      try {
+        const result = await request
         if (chartOrders.get(instId)?.isRetiredSession(result.serviceSession)) {
           requestedHistoryEnds.current.delete(key)
           if (!stopped) { setHistoryLoading(null); setHistoryRetry(value => value + 1) }
@@ -543,7 +542,11 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
           const oldestHour = result.oldestHour
           setHistoryBoundary(current => current?.id === instId && current.oldestHour === oldestHour ? current : { id: instId, oldestHour })
         }
-        if (stopped || windowEndRef.current?.id !== instId || windowEndRef.current.hour !== historicalEnd || "unchanged" in result) return
+        // Keep a completed buffered page even when the user continued scrolling
+        // while it was in flight. The next viewport can usually be rendered from
+        // the same page; discarding it caused a blank chart and a duplicate native
+        // download for every wheel movement.
+        if (windowEndRef.current?.id !== instId || "unchanged" in result) return
         setHistoryBars(current => {
           const merged = mergeChartBars(result, current?.id === instId ? current.data : null)
           const first = historicalEnd - 499 * 3_600_000
@@ -551,7 +554,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
           return { id: instId, data: { ...result, bars: merged.filter(bar => bar.hour >= first && bar.hour <= last) } }
         })
         endInspection()
-        if (result.endHour !== undefined && result.endHour !== historicalEnd) {
+        if (!stopped && windowEndRef.current?.hour === historicalEnd && result.endHour !== undefined && result.endHour !== historicalEnd) {
           const latestHour = chartCache.get(instId)?.data.bars.at(-1)?.hour ?? result.bars.at(-1)?.hour ?? result.endHour
           const next = result.endHour >= latestHour ? null : { id: instId, hour: result.endHour }
           windowEndRef.current = next
@@ -559,17 +562,16 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
         }
         setChartError({ id: instId, message: result.error })
         setHistoryLoading(null)
-        } catch (cause) {
-          if (!stopped && windowEndRef.current?.id === instId && windowEndRef.current.hour === historicalEnd) {
-            setChartError({ id: instId, message: cause instanceof Error ? cause.message : "Cannot load history" })
-            setHistoryLoading(null)
-          }
-        } finally {
-          if (historyRequests.current.get(instId) === request) historyRequests.current.delete(instId)
+      } catch (cause) {
+        if (!stopped && windowEndRef.current?.id === instId && windowEndRef.current.hour === historicalEnd) {
+          setChartError({ id: instId, message: cause instanceof Error ? cause.message : "Cannot load history" })
+          setHistoryLoading(null)
         }
-      })()
-    }, 80)
-    return () => { stopped = true; window.clearTimeout(timer) }
+      } finally {
+        if (historyRequests.current.get(instId) === request) historyRequests.current.delete(instId)
+      }
+    })()
+    return () => { stopped = true }
   }, [instId, historicalEnd, oldestCachedHour, historyRetry, endInspection])
   useEffect(() => {
     wheelPixels.current = 0
@@ -793,7 +795,7 @@ export function MarketChart({ instId, listOrder, turnoverOrder, moveDefaults = {
           inspectAt(event.currentTarget, event.clientX)
         }}>
           <Plot bars={data.bars} liveBar={chart?.bars.at(-1) ?? data.bars.at(-1)!} inspected={inspected} width={plotSize.width} height={plotSize.height} now={1} endHour={data.endHour ?? data.bars.at(-1)!.hour} moveSignals={visibleMoveSignals} />
-        </svg>) : <p className="flex h-full items-center justify-center text-muted-foreground">{chart ? "No candle data available yet" : "Loading chart…"}</p>}
+        </svg>) : <p className="flex h-full items-center justify-center text-muted-foreground">{historyLoading?.startsWith(`${instId}:`) ? "Loading history…" : chart ? "No candle data available yet" : "Loading chart…"}</p>}
         {historicalEnd !== null && historyLoading === `${instId}:${historicalEnd}` && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Loading history…</span>}
         {atHistoryBoundary && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Start of available history</span>}
         </div>

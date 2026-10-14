@@ -1050,7 +1050,10 @@ final class Radar {
         async let oi = refreshChartSource(id, path: "/rubik/stat/contracts/open-interest-history")
         async let taker = refreshChartSource(id, path: "/rubik/stat/taker-volume-contract")
         let failures = await [candles, oi, taker].compactMap { $0 }
-        var result = chartSnapshot(id)
+        // The cache/import step above already prepares a much wider candle
+        // range. Return it on the first load so ordinary scrolling stays local
+        // instead of immediately entering the paginated history path.
+        var result = chartSnapshot(id, outputHours: historicalChartBufferHours)
         if !failures.isEmpty { result["error"] = "Some chart data is unavailable: \(failures.joined(separator: ", "))." }
         return result
     }
