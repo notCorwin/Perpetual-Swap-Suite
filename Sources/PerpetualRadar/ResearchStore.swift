@@ -77,9 +77,21 @@ final class ResearchStore {
             // Old stat heads encode OI USD in `oi` and taker contracts in
             // buy/sell. Frozen manifests retain their pinned revisions, while
             // new plans must hydrate the corrected explicit units.
+            // Disable per-row invalidation while bulk-removing hundreds of
+            // thousands of heads. The prepared-head trigger searches pinned
+            // research_data JSON and turns this migration into an effectively
+            // unbounded startup operation on a mature multi-gigabyte cache.
+            for table in ["research_heads", "research_coverage"] {
+                try database.execute("DROP TRIGGER IF EXISTS plan_cache_\(table)_DELETE")
+                try database.execute("DROP TRIGGER IF EXISTS prepared_cache_\(table)_DELETE")
+            }
             try database.execute("DELETE FROM research_heads WHERE kind='stat'")
             try database.execute("DELETE FROM research_coverage WHERE kind IN ('oi','taker')")
             try database.execute("DELETE FROM research_objects WHERE kind IN ('planCache','preparedSource')")
+            try database.execute("CREATE TRIGGER plan_cache_research_heads_DELETE AFTER DELETE ON research_heads BEGIN DELETE FROM research_objects WHERE kind='planCache'; END")
+            try database.execute("CREATE TRIGGER prepared_cache_research_heads_DELETE AFTER DELETE ON research_heads BEGIN DELETE FROM research_objects WHERE kind='preparedSource' AND id IN (SELECT 'prepared:'||j.value FROM research_data d,json_each(d.json,'$.sources') j WHERE d.revision=OLD.revision); END")
+            try database.execute("CREATE TRIGGER plan_cache_research_coverage_DELETE AFTER DELETE ON research_coverage BEGIN DELETE FROM research_objects WHERE kind='planCache'; END")
+            try database.execute("CREATE TRIGGER prepared_cache_research_coverage_DELETE AFTER DELETE ON research_coverage BEGIN DELETE FROM research_objects WHERE id='prepared:'||OLD.source; END")
             try database.setPreference("5", forKey: "researchSchemaVersion")
         } }
         // Radar's confirmed-hour database is the canonical latest market view.
