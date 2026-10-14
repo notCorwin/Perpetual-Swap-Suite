@@ -9,8 +9,6 @@ private let windowBlurRadiusKey = "windowBlurRadius"
 private let floatingBlurRadiusKey = "floatingBlurRadius"
 private let notificationsEnabledKey = "strategyNotificationsEnabled"
 private let monitoringPausedKey = "monitoringPaused"
-private let chartMovePriceSourceKey = "chartMovePriceSource"
-private let chartMoveObjectiveKey = "chartMoveObjective"
 private let chartMoveLabelsVisibleKey = "chartMoveLabelsVisible"
 private let chartMoveEfficiencyFactorKey = "chartMoveEfficiencyFactor"
 let historicalChartBufferHours = 500
@@ -89,8 +87,6 @@ final class Radar {
     private(set) var floatingBlurRadius: Double
     private(set) var notificationsEnabled: Bool
     private(set) var monitoringPaused: Bool
-    private(set) var chartMovePriceSource: String
-    private(set) var chartMoveObjective: String
     private(set) var chartMoveLabelsVisible: Bool
     private(set) var chartMoveEfficiencyFactor: Double
     private var rows: [String: Market] = [:]
@@ -167,13 +163,9 @@ final class Radar {
         let savedNotifications = try store.preference(forKey: notificationsEnabledKey) ?? store.preference(forKey: "filterNotificationsEnabled")
         notificationsEnabled = savedNotifications != "false"
         monitoringPaused = try store.preference(forKey: monitoringPausedKey) == "true"
-        let savedMovePriceSource = try store.preference(forKey: chartMovePriceSourceKey)
-        chartMovePriceSource = ["close", "highLow"].contains(savedMovePriceSource ?? "") ? savedMovePriceSource! : "highLow"
-        let savedMoveObjective = try store.preference(forKey: chartMoveObjectiveKey)
-        chartMoveObjective = ["amplitude", "efficiency"].contains(savedMoveObjective ?? "") ? savedMoveObjective! : "amplitude"
         chartMoveLabelsVisible = try store.preference(forKey: chartMoveLabelsVisibleKey) != "false"
         let savedEfficiencyFactor = (try store.preference(forKey: chartMoveEfficiencyFactorKey)).flatMap(Double.init) ?? 1
-        chartMoveEfficiencyFactor = savedEfficiencyFactor.isFinite && (0...2).contains(savedEfficiencyFactor) ? savedEfficiencyFactor : 1
+        chartMoveEfficiencyFactor = savedEfficiencyFactor.isFinite && (0...1).contains(savedEfficiencyFactor) ? savedEfficiencyFactor : 1
         historyLoader = FilterHistoryLoader(url: store.url)
         btcHistoryLoader = FilterHistoryLoader(url: store.url)
         monitorBTCHistoryLoader = FilterHistoryLoader(url: store.url)
@@ -230,23 +222,15 @@ final class Radar {
         touch()
     }
 
-    func setChartMoveDefaults(priceSource: String? = nil, objective: String? = nil, labelsVisible: Bool? = nil, efficiencyFactor: Double? = nil) throws -> Bool {
-        if let priceSource, !["close", "highLow"].contains(priceSource) { return false }
-        if let objective, !["amplitude", "efficiency"].contains(objective) { return false }
-        if let efficiencyFactor, !efficiencyFactor.isFinite || !(0...2).contains(efficiencyFactor) { return false }
-        let priceSource = priceSource ?? chartMovePriceSource
-        let objective = objective ?? chartMoveObjective
+    func setChartMoveDefaults(labelsVisible: Bool? = nil, efficiencyFactor: Double? = nil) throws -> Bool {
+        if let efficiencyFactor, !efficiencyFactor.isFinite || !(0...1).contains(efficiencyFactor) { return false }
         let labelsVisible = labelsVisible ?? chartMoveLabelsVisible
         let efficiencyFactor = efficiencyFactor ?? chartMoveEfficiencyFactor
-        guard priceSource != chartMovePriceSource || objective != chartMoveObjective || labelsVisible != chartMoveLabelsVisible || efficiencyFactor != chartMoveEfficiencyFactor else { return true }
+        guard labelsVisible != chartMoveLabelsVisible || efficiencyFactor != chartMoveEfficiencyFactor else { return true }
         try store.transaction {
-            try store.setPreference(priceSource, forKey: chartMovePriceSourceKey)
-            try store.setPreference(objective, forKey: chartMoveObjectiveKey)
             try store.setPreference(String(labelsVisible), forKey: chartMoveLabelsVisibleKey)
             try store.setPreference(String(efficiencyFactor), forKey: chartMoveEfficiencyFactorKey)
         }
-        chartMovePriceSource = priceSource
-        chartMoveObjective = objective
         chartMoveLabelsVisible = labelsVisible
         chartMoveEfficiencyFactor = efficiencyFactor
         touch()
@@ -1270,7 +1254,6 @@ final class Radar {
                 "frostedBackgroundEnabled": frostedBackgroundEnabled, "frostedBackgroundOpacity": frostedBackgroundOpacity,
                 "windowBlurRadius": windowBlurRadius, "floatingBlurRadius": floatingBlurRadius,
                 "notificationsEnabled": notificationsEnabled,
-                "chartMovePriceSource": chartMovePriceSource, "chartMoveObjective": chartMoveObjective,
                 "chartMoveLabelsVisible": chartMoveLabelsVisible,
                 "chartMoveEfficiencyFactor": chartMoveEfficiencyFactor,
                 "filterMetricsCatalog": FilterCatalog.metrics.map(\.snapshot), "filterFunctions": FilterCatalog.functions,

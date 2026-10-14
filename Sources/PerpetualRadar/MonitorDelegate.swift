@@ -393,15 +393,12 @@ final class MonitorDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                   parameters["windowBlurRadius"] == nil || windowBlur != nil, parameters["floatingBlurRadius"] == nil || floatingBlur != nil,
                   try radar.setFrostedBackground(enabled: enabled, opacity: opacity, windowBlur: windowBlur, floatingBlur: floatingBlur) else { throw FilterError("Invalid frosted background setting. Opacity must be 0–1 and blur must be 0–160.") }
         }
-        if ["chartMovePriceSource", "chartMoveObjective", "chartMoveLabelsVisible", "chartMoveEfficiencyFactor"].contains(where: { parameters[$0] != nil }) {
-            let priceSource = parameters["chartMovePriceSource"] as? String, objective = parameters["chartMoveObjective"] as? String
+        if ["chartMoveLabelsVisible", "chartMoveEfficiencyFactor"].contains(where: { parameters[$0] != nil }) {
             let labelsVisible = parameters["chartMoveLabelsVisible"] as? Bool
             let efficiencyFactor = parameters["chartMoveEfficiencyFactor"] as? Double
-            guard parameters["chartMovePriceSource"] == nil || priceSource != nil,
-                  parameters["chartMoveObjective"] == nil || objective != nil,
-                  parameters["chartMoveLabelsVisible"] == nil || labelsVisible != nil,
+            guard parameters["chartMoveLabelsVisible"] == nil || labelsVisible != nil,
                   parameters["chartMoveEfficiencyFactor"] == nil || efficiencyFactor != nil,
-                  try radar.setChartMoveDefaults(priceSource: priceSource, objective: objective, labelsVisible: labelsVisible, efficiencyFactor: efficiencyFactor) else {
+                  try radar.setChartMoveDefaults(labelsVisible: labelsVisible, efficiencyFactor: efficiencyFactor) else {
                 throw FilterError("Invalid chart move label defaults.")
             }
         }

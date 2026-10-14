@@ -1,5 +1,5 @@
 import { Fragment, Suspense, lazy, memo, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react"
-import { ArrowDown, ArrowDownUp, ArrowLeftRight, ArrowUp, Radio, Search, ScanSearch, Settings2 } from "lucide-react"
+import { ArrowDown, ArrowDownUp, ArrowUp, Radio, Search, ScanSearch, Settings2 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty"
@@ -25,7 +25,6 @@ import { PERCENT_CHANGE_DESCRIPTION, formatPercent, percentageNumber, type Perce
 import { BREAK_DESCRIPTION, describeBreak, formatBreakPriorAge, formatBreakTime, type BreakDirection, type BreakResult } from "@/market-breaks"
 import { BANDWIDTH_EXPANSION_DESCRIPTION, LOG_BB_DESCRIPTION, formatBandWidthExpansion, formatLiveBand } from "@/market-logbb"
 import { MarketChart, type ChartPollResponse } from "@/MarketChart"
-import type { PriceMoveMode, PriceMoveObjective } from '@/price-move-signals'
 import { OPPORTUNITY_DESCRIPTION } from "@/market-opportunity"
 import { MarketOpportunity } from "@/MarketOpportunity"
 import { MarketListViewport } from "@/MarketListViewport"
@@ -49,7 +48,7 @@ const Research = lazy(() => import('@/Research').then(module => ({ default: modu
 type WindowAppearance = BlurSettings & { frostedBackgroundEnabled: boolean; frostedBackgroundOpacity: number }
 type NotificationSettings = { backgroundMonitoringEnabled: boolean; notificationsEnabled: boolean; notificationAuthorization: "notDetermined" | "denied" | "authorized" | "quiet" | "unavailable"; notificationError: string; backgroundMonitoringError: string; monitoringPaused: boolean; launchAtLogin: "enabled" | "disabled" | "requiresApproval" | "unavailable"; launchAtLoginError: string }
 type HistoryProgress = { pending: number; completed: number; error: string }
-type ChartMoveSettings = { chartMovePriceSource: PriceMoveMode; chartMoveObjective: PriceMoveObjective; chartMoveLabelsVisible: boolean; chartMoveEfficiencyFactor: number }
+type ChartMoveSettings = { chartMoveLabelsVisible: boolean; chartMoveEfficiencyFactor: number }
 type Snapshot = WindowAppearance & NotificationSettings & ChartMoveSettings & { rows: NativeMarketRow[]; updatedAt: number | null; error: string; revision: number; serviceSession?: string; filterMetricsCatalog: FilterMetric[]; filterFunctions: string[]; filterFunctionCatalog: ExpressionTemplate[]; filterLibraryPreferences: FilterLibraryPreferences; }
 type PreviewSnapshot = Snapshot & { filterResults: Record<string, FilterTruth>; filterToken: string; historyProgress: HistoryProgress }
 type UnchangedSnapshot = { unchanged: true; revision: number; error: string; serviceSession?: string }
@@ -223,7 +222,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     return snapshot
   }, radius => withSettingsDeadline(window.webkit.messageHandlers.radar.postMessage({ previewWindowBlur: radius })))
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>({ backgroundMonitoringEnabled: false, notificationsEnabled: true, notificationAuthorization: "notDetermined", notificationError: "", backgroundMonitoringError: "", monitoringPaused: false, launchAtLogin: "disabled", launchAtLoginError: "" })
-  const [chartMoveSettings, setChartMoveSettings] = useState<ChartMoveSettings>({ chartMovePriceSource: 'highLow', chartMoveObjective: 'amplitude', chartMoveLabelsVisible: true, chartMoveEfficiencyFactor: 1 })
+  const [chartMoveSettings, setChartMoveSettings] = useState<ChartMoveSettings>({ chartMoveLabelsVisible: true, chartMoveEfficiencyFactor: 1 })
   const [chartEfficiencyFactorDraft, setChartEfficiencyFactorDraft] = useState('1')
   const [chartEfficiencyFactorError, setChartEfficiencyFactorError] = useState('')
   const [notificationPending, setNotificationPending] = useState(false)
@@ -292,8 +291,6 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
       launchAtLoginError: snapshot.launchAtLoginError ?? "",
     }))
     setChartMoveSettings({
-      chartMovePriceSource: snapshot.chartMovePriceSource ?? 'highLow',
-      chartMoveObjective: snapshot.chartMoveObjective ?? 'amplitude',
       chartMoveLabelsVisible: snapshot.chartMoveLabelsVisible ?? true,
       chartMoveEfficiencyFactor: snapshot.chartMoveEfficiencyFactor ?? 1,
     })
@@ -465,8 +462,8 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   }
   const saveChartEfficiencyFactor = () => {
     const value = Number(chartEfficiencyFactorDraft)
-    if (!chartEfficiencyFactorDraft.trim() || !Number.isFinite(value) || value < 0 || value > 2) {
-      setChartEfficiencyFactorError('Enter a number from 0 to 2.')
+    if (!chartEfficiencyFactorDraft.trim() || !Number.isFinite(value) || value < 0 || value > 1) {
+      setChartEfficiencyFactorError('Enter a number from 0 to 1.')
       return
     }
     setChartEfficiencyFactorError('')
@@ -503,7 +500,6 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
       <header className="flex items-center gap-3 border-b px-4 py-3 whitespace-nowrap">
         <ModeTitle mode="radar" pending={switchingMode} onSwitch={() => onResearch({ metrics, templates, functions })} />
         <Button variant="outline" onClick={() => onDecisions({ metrics, templates, functions })}>Strategy Library</Button>
-        <span className="text-xs text-muted-foreground">OKX · USDT swaps · 1h</span>
         <span className="text-xs tabular-nums text-muted-foreground">{visible.length} / {rows.length} markets</span>
         <Popover onOpenChange={open => { if (!open) { if (backgroundOpacityDraftDirty.current) saveBackgroundOpacity(); blurSettings.commitAll() } if (open) void updateNotifications({ notificationAction: "refresh" }) }}>
           <PopoverTrigger asChild><Button variant="outline"><Settings2 data-icon="inline-start" aria-hidden="true" />Settings</Button></PopoverTrigger>
@@ -513,11 +509,9 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
               <Field><FieldLabel>AI analysis</FieldLabel><AnalysisSettingsButton /><FieldDescription>Configure the Gateway API Key and chart analysis model.</FieldDescription></Field>
               <Field>
                 <FieldLabel>Move label defaults</FieldLabel>
-                <Button variant="ghost" onClick={() => saveSetting({ chartMovePriceSource: chartMoveSettings.chartMovePriceSource === 'highLow' ? 'close' : 'highLow' })} aria-label="Default move price source" title={`Switch to ${chartMoveSettings.chartMovePriceSource === 'highLow' ? 'Close' : 'High / Low'}`}><span className="font-semibold">{chartMoveSettings.chartMovePriceSource === 'highLow' ? 'High / Low' : 'Close'}</span><ArrowLeftRight data-icon="inline-end" aria-hidden="true" /></Button>
-                <Button variant="ghost" onClick={() => saveSetting({ chartMoveObjective: chartMoveSettings.chartMoveObjective === 'efficiency' ? 'amplitude' : 'efficiency' })} aria-label="Default move optimization objective" title={`Switch to ${chartMoveSettings.chartMoveObjective === 'efficiency' ? 'Max Move' : 'Max Efficiency'}`}><span className="font-semibold">{chartMoveSettings.chartMoveObjective === 'efficiency' ? 'Max Efficiency' : 'Max Move'}</span><ArrowLeftRight data-icon="inline-end" aria-hidden="true" /></Button>
-                <Field data-invalid={Boolean(chartEfficiencyFactorError)}><FieldLabel htmlFor="default-efficiency-factor">Efficiency factor</FieldLabel><Input id="default-efficiency-factor" type="number" min="0" max="2" step="0.1" inputMode="decimal" value={chartEfficiencyFactorDraft} aria-invalid={Boolean(chartEfficiencyFactorError)} onChange={event => { setChartEfficiencyFactorDraft(event.target.value); setChartEfficiencyFactorError('') }} onBlur={saveChartEfficiencyFactor} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }} />{chartEfficiencyFactorError && <FieldError>{chartEfficiencyFactorError}</FieldError>}</Field>
+                <Field data-invalid={Boolean(chartEfficiencyFactorError)}><FieldLabel htmlFor="default-efficiency-factor">Efficiency factor</FieldLabel><Input id="default-efficiency-factor" type="number" min="0" max="1" step="0.01" inputMode="decimal" value={chartEfficiencyFactorDraft} aria-invalid={Boolean(chartEfficiencyFactorError)} onChange={event => { setChartEfficiencyFactorDraft(event.target.value); setChartEfficiencyFactorError('') }} onBlur={saveChartEfficiencyFactor} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }} />{chartEfficiencyFactorError && <FieldError>{chartEfficiencyFactorError}</FieldError>}</Field>
                 <Field orientation="horizontal"><FieldLabel htmlFor="default-move-label-layer">Show labels by default</FieldLabel><Toggle id="default-move-label-layer" variant="outline" pressed={chartMoveSettings.chartMoveLabelsVisible} onPressedChange={value => saveSetting({ chartMoveLabelsVisible: value })}>{chartMoveSettings.chartMoveLabelsVisible ? 'On' : 'Off'}</Toggle></Field>
-                <FieldDescription>Efficiency = |change| / periods^factor. 0 ignores time; 1 is change per K-line; values above 1 favor shorter moves more strongly. New charts use these defaults.</FieldDescription>
+                <FieldDescription>Efficiency = |change| / periods^factor. 0 ignores time; 1 is change per K-line. New charts use these defaults.</FieldDescription>
               </Field>
               <Field><FieldLabel>Run mode</FieldLabel><ToggleGroup type="single" variant="outline" disabled={notificationPending} value={notificationSettings.backgroundMonitoringEnabled ? "background" : "onDemand"} onValueChange={value => { if (value) void updateNotifications({ backgroundMonitoringEnabled: value === "background" }) }} aria-label="Run mode"><ToggleGroupItem value="onDemand">On-demand</ToggleGroupItem><ToggleGroupItem value="background">Background Monitoring</ToggleGroupItem></ToggleGroup><FieldDescription>Background Monitoring allows the helper to keep collecting after closing or quitting. Start at Login requires this mode.</FieldDescription></Field>
               <Field>
@@ -578,7 +572,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
       <div className="flex items-center gap-4 border-b px-4 py-3">
         <Field orientation="horizontal" className="w-fit"><FieldLabel htmlFor="radar-strategy">Active strategy</FieldLabel><Select value={activeProfile?.id ?? 'none'} disabled={suite.pending || filterDraft !== null || editor.source !== null} onValueChange={chooseStrategy}><SelectTrigger id="radar-strategy" className="w-72" aria-label="Active Radar strategy"><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="none">No active strategy</SelectItem>{suite.snapshot.profiles.map(profile => <SelectItem key={profile.id} value={profile.id}>{profile.name} · r{profile.revision}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>
         {activeProfile ? <ToggleGroup type="single" variant="outline" value={signalTiming} onValueChange={value => { if (value) setSignalTiming(value as SignalTiming) }} aria-label="Signal timing"><ToggleGroupItem value="both">Both hours</ToggleGroupItem><ToggleGroupItem value="confirmed">Confirmed</ToggleGroupItem><ToggleGroupItem value="provisional">Provisional</ToggleGroupItem></ToggleGroup> : <span className="text-xs text-muted-foreground">Choose a shared strategy to watch Bullish Setup signals.</span>}
-        <span className="ml-auto text-xs text-muted-foreground">Shared with Research{filterDraft !== null || editor.source !== null ? ' · Apply or discard Universe edits before changing strategy' : ''}</span>
+        {(filterDraft !== null || editor.source !== null) && <span className="ml-auto text-xs text-muted-foreground">Apply or discard Universe edits before changing strategy</span>}
       </div>
       {suite.ready && !activeProfile && <Empty className="border-b"><EmptyHeader><EmptyTitle>Activate a strategy to monitor signals</EmptyTitle><EmptyDescription>All markets remain available below. Create a Strategy with Universe and Bullish Setup rules to enable signals and confirmed alerts.</EmptyDescription></EmptyHeader><EmptyContent><Button variant="outline" onClick={() => onDecisions({ metrics, templates, functions })}>Strategy Library…</Button></EmptyContent></Empty>}
       {suite.error && <p role="alert" className="px-4 text-destructive">{suite.error}</p>}
@@ -588,7 +582,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
       {error && <p role="alert" className="border-b px-4 py-2 text-sm text-destructive">{error}</p>}
       {activeProfile && <RadarSignalBoard profile={activeProfile} signals={searchedSignals} rows={rows} paused={suite.snapshot.paused} recovering={suite.snapshot.recovering} onChart={(instrument, order) => { setSignalChartOrder(order); setSelected(instrument) }} onExplain={explainRow} onResearch={() => onResearch({ metrics, templates, functions }, suiteSpec([activeProfile]))} onBrowseCharts={() => document.getElementById('all-markets')?.scrollIntoView({ behavior: 'smooth', block: 'start' })} />}
       <section id="all-markets" aria-label="Perpetual swap markets" className="flex-1 scroll-mt-4">
-        <header className="border-y px-4 py-3"><h2 className="font-semibold">All markets</h2><p className="text-xs text-muted-foreground">Every supported OKX USDT perpetual swap, including strategy nonmatches and Unknown inputs</p></header>
+        <header className="border-y px-4 py-3"><h2 className="font-semibold">All markets</h2></header>
         <Table className="table-fixed" data-market-count={visible.length} aria-rowcount={visible.length + 1}>
           <colgroup>
             <col className="w-[17%]" />

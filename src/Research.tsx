@@ -257,7 +257,7 @@ export function Research({ inputs, active, onSwitchMode, onRadar, switchingMode,
   return <><MarketListViewport><main className="flex min-h-[inherit] flex-col gap-4 p-4 pb-64 tabular-nums" data-research>
     <header className="flex items-center gap-3 border-b pb-3">
       <ModeTitle mode="research" pending={switchingMode} onSwitch={onSwitchMode} />
-      <span className="flex-1 text-xs text-muted-foreground">OKX · Hourly close · Fixed local data</span>
+      <span className="flex-1" />
       <Button variant="outline" disabled={!radarSpec || researchSuite.pending || pending} onClick={() => void activateVersionInRadar()}>Use this version in Radar</Button>
       <Badge variant="outline"><Database data-icon="inline-start" aria-hidden="true" />{integer(cache.rows)} cached rows</Badge>
     </header>
