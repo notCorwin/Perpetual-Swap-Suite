@@ -55,7 +55,7 @@ open ".build/app/Perpetual Swap Suite.app"
 
 Select an **Active strategy** from the shared library to show its **Signals** and **All markets** together on one Radar page. Radar watches **Bullish Setup** across the supported universe. Each signal applies Universe and Bullish Setup rules from the same hour. **Both hours**, **Confirmed**, and **Provisional** control which readings appear. Confirmed matches sort first, followed by 24-hour turnover; signals paginate in groups of 25. Chart navigation follows the signal list you opened.
 
-**All markets** appears below Signals and exposes the full supported universe, including nonmatches and Unknown inputs. Search applies to both sections. **Test strategy** carries the exact saved version into Bullish Setup Research.
+**All markets** appears below Signals. With an active Strategy, it contains only contracts whose current Universe result is **True**, so liquidity and other eligibility rules screen the market list as well as signals. With no active Strategy, it exposes the full supported exchange universe. **Explain markets** still includes nonmatches and Unknown inputs. Search applies to both sections. **Test strategy** carries the exact saved version into Bullish Setup Research.
 
 With **No active strategy**, Radar displays every contract in the supported exchange universe and offers **Strategy Library…** to create or activate a strategy. Signals and confirmed alerts require an active Strategy. Turnover, spread, listing age and every other restriction belong to the Strategy Universe; no independent Filter configuration or saved combination is applied.
 
@@ -68,7 +68,7 @@ Search narrows the visible list. Click column headings to sort; the default **Op
 3. Use **Explain markets** to inspect matching, unmatched, and Unknown results.
 4. Choose **Save strategy** to save Universe and Bullish Setup together. In Radar’s **Universe rules** panel, **Save Universe** updates the active Strategy directly.
 
-Valid draft edits immediately preview rule matches. The All markets table remains complete. Alerts use the **active saved Strategy**. Invalid drafts retain the last valid preview and cannot be applied. Missing inputs evaluate as **Unknown**, including under NOT; only True Universe and Bullish Setup matches become signals.
+Valid draft edits immediately preview rule matches and filter the All markets table. Alerts use the **active saved Strategy**. Invalid drafts retain the last valid preview and cannot be applied. Missing inputs evaluate as **Unknown**, including under NOT; only True Universe matches appear in All markets, and only True Universe and Bullish Setup matches become signals.
 
 New numeric conditions default to **Greater than >**. Numeric presets use strict **> / <** comparisons, with these choices first in the comparison menu. Inclusive comparisons remain available when selected explicitly.
 

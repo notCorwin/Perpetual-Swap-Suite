@@ -186,6 +186,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   const [compilation, setCompilation] = useState<CompileResponse & { key: string; pending: boolean }>({ key: "", pending: true, diagnostics: [] })
   const [lastValidJSON, setLastValidJSON] = useState<string | null>(null)
   const [previewJSON, setPreviewJSON] = useState<string | null>(null)
+  const [previewStrategyID, setPreviewStrategyID] = useState<string | null>(null)
   const [results, setResults] = useState<Record<string, FilterTruth>>({})
   const [history, setHistory] = useState<HistoryProgress | null>(null)
   const [metrics, setMetrics] = useState<FilterMetric[]>([])
@@ -383,6 +384,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
           if (!updated) { backoff = 2000; return }
           setResults(current => keepSnapshotValue(current, snapshot.filterResults))
           setPreviewJSON(lastValidJSON)
+          setPreviewStrategyID(activeStrategyID)
           setHistory(current => keepSnapshotValue(current, snapshot.historyProgress))
           setStatus("Live")
           backoff = 2000
@@ -400,13 +402,14 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   }, [active, lastValidJSON, activeStrategyID])
 
   const signals = useMemo(() => activeProfile ? radarSignals(suite.snapshot.confirmed ?? [], suite.snapshot.provisional ?? [], activeProfile.id, activeProfile.revision, signalTiming) : [], [activeProfile, suite.snapshot.confirmed, suite.snapshot.provisional, signalTiming])
-  const matchedRows = useMemo(() => rows.filter(row => activeProfile ? confirmedPhases[row.instId]?.universe === "true" || provisionalPhases[row.instId]?.universe === "true" : true), [rows,activeProfile,confirmedPhases,provisionalPhases])
   const searchedRows = useMemo(() => rows.filter(row => row.instId.toLowerCase().includes(query.trim().toLowerCase())), [rows, query])
+  const eligibleRows = useMemo(() => activeProfile ? previewStrategyID === activeProfile.id ? rows.filter(row => results[row.instId] === "true") : [] : rows, [rows, activeProfile, previewStrategyID, results])
+  const universeRows = useMemo(() => activeProfile ? previewStrategyID === activeProfile.id ? searchedRows.filter(row => results[row.instId] === "true") : [] : searchedRows, [searchedRows, activeProfile, previewStrategyID, results])
   const searchedSignals = useMemo(() => signals.filter(signal => signal.instrument.toLowerCase().includes(query.trim().toLowerCase())), [signals, query])
-  const visible = useMemo(() => searchedRows.sort((a, b) => compareMarketRows(a, b, sort, descending)), [searchedRows, sort, descending])
+  const visible = useMemo(() => [...universeRows].sort((a, b) => compareMarketRows(a, b, sort, descending)), [universeRows, sort, descending])
   const unknownCount = useMemo(() => searchedRows.filter(row => results[row.instId] === "unknown").length, [searchedRows, results])
   const listOrder = useMemo(() => visible.map(row => row.instId), [visible])
-  const turnoverOrder = useMemo(() => [...matchedRows].sort(compareMarketTurnover).map(row => row.instId), [matchedRows])
+  const turnoverOrder = useMemo(() => [...eligibleRows].sort(compareMarketTurnover).map(row => row.instId), [eligibleRows])
   useEffect(() => {
     if (activeProfile) {
       setListFilters(parseFilterConfig(activeProfile.universeJSON))
@@ -594,8 +597,8 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
       {error && <p role="alert" className="border-b px-4 py-2 text-sm text-destructive">{error}</p>}
       {activeProfile && <RadarSignalBoard profile={activeProfile} signals={searchedSignals} rows={rows} paused={suite.snapshot.paused} recovering={suite.snapshot.recovering} onChart={(instrument, order) => { setSignalChartOrder(order); setSelected(instrument) }} onExplain={explainRow} onResearch={() => onResearch({ metrics, templates, functions }, suiteSpec([activeProfile]))} onBrowseCharts={() => document.getElementById('all-markets')?.scrollIntoView({ behavior: 'smooth', block: 'start' })} />}
       <section id="all-markets" aria-label="Perpetual swap markets" className="flex-1 scroll-mt-4">
-        <header className="border-y px-4 py-3"><h2 className="font-semibold">All markets</h2></header>
-        <Table className="table-fixed" data-market-count={visible.length} aria-rowcount={visible.length + 1}>
+        <header className="border-y px-4 py-3"><h2 className="font-semibold">All markets</h2>{activeProfile && <p className="text-xs text-muted-foreground">Showing contracts that match the active Strategy Universe.</p>}</header>
+        <Table className="table-fixed" data-market-count={visible.length} data-total-market-count={rows.length} aria-rowcount={visible.length + 1}>
           <colgroup>
             <col className="w-[17%]" />
             <col className="w-[12%]" />
@@ -645,7 +648,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
           </TableHeader>
           {visible.length ? <MarketRows canExplain={Boolean(activeProfile)} confirmed={confirmedPhases} provisional={provisionalPhases} rows={visible} onSelect={setSelected} onExplain={explainRow} /> : <TableBody><TableRow><TableCell colSpan={8} className="py-12">
               <Empty>
-                <EmptyHeader><EmptyTitle>{rows.length ? "No matching contracts" : "Waiting for contracts"}</EmptyTitle><EmptyDescription>{rows.length ? "Adjust the search or inspect the active strategy rules. Explain markets includes unmatched and unknown contracts." : "OKX hourly data is loading. Activate a strategy to monitor its Universe and Bullish Setup."}</EmptyDescription></EmptyHeader>
+                <EmptyHeader><EmptyTitle>{rows.length ? activeProfile && previewStrategyID !== activeProfile.id ? "Evaluating Universe" : "No matching contracts" : "Waiting for contracts"}</EmptyTitle><EmptyDescription>{rows.length ? activeProfile && previewStrategyID !== activeProfile.id ? "Applying the active Strategy Universe to All markets." : "Adjust the search or inspect the active Strategy Universe. Explain markets includes unmatched and Unknown contracts." : "OKX hourly data is loading. Activate a strategy to monitor its Universe and Bullish Setup."}</EmptyDescription></EmptyHeader>
                 <EmptyContent>
                   {filterDraft !== null && <Button variant="outline" size="sm" onClick={() => { setFilterDraft(null); setEditor(current => ({ ...current, source: null })) }}>Discard preview</Button>}
                   {activeProfile && listFilters.root.children.length > 0 && <Button variant="outline" size="sm" onClick={() => { void saveUniverse(emptyFilterConfig()).catch(cause => setError(cause instanceof Error ? cause.message : "Cannot clear Universe rules")) }}>Clear all rules</Button>}
