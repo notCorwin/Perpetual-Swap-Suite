@@ -53,9 +53,9 @@ open ".build/app/Perpetual Swap Suite.app"
 
 ### Screen markets
 
-Select an **Active strategy** from the shared library to open **Signals**. Radar watches **Bullish Setup** across the supported universe. Each signal applies Universe and Bullish Setup rules from the same hour. **Both hours**, **Confirmed**, and **Provisional** control which readings appear. Confirmed matches sort first, followed by 24-hour turnover; signals paginate in groups of 25. Chart navigation follows the signal list you opened.
+Select an **Active strategy** from the shared library to show its **Signals** and **All markets** together on one Radar page. Radar watches **Bullish Setup** across the supported universe. Each signal applies Universe and Bullish Setup rules from the same hour. **Both hours**, **Confirmed**, and **Provisional** control which readings appear. Confirmed matches sort first, followed by 24-hour turnover; signals paginate in groups of 25. Chart navigation follows the signal list you opened.
 
-**All markets** exposes the full supported universe, including nonmatches and Unknown inputs. Search applies to either view. **Test strategy** carries the exact saved version into Bullish Setup Research.
+**All markets** appears below Signals and exposes the full supported universe, including nonmatches and Unknown inputs. Search applies to both sections. **Test strategy** carries the exact saved version into Bullish Setup Research.
 
 With **No active strategy**, Radar displays every contract in the supported exchange universe and offers **Strategy Library…** to create or activate a strategy. Signals and confirmed alerts require an active Strategy. Turnover, spread, listing age and every other restriction belong to the Strategy Universe; no independent Filter configuration or saved combination is applied.
 
@@ -66,7 +66,7 @@ Search narrows the visible list. Click column headings to sort; the default **Op
 1. In **Strategy Library**, choose a Strategy and its **Universe** or **Bullish Setup** rules, then open **Rules**, then **Add condition**. Search the condition library or choose a preset such as OI rising, Volume surge, or a BTC market context condition.
 2. Edit conditions in sentence rows or **Guided cards**. Select **Live** for the forming hour or **Closed** for completed-hour evaluation; combine conditions with groups, calculations, or time requirements.
 3. Use **Explain markets** to inspect matching, unmatched, and Unknown results.
-4. Choose **Save strategy** to save Universe and Bullish Setup together. In Radar’s **All markets → Universe rules** panel, **Save Universe** updates the active Strategy directly.
+4. Choose **Save strategy** to save Universe and Bullish Setup together. In Radar’s **Universe rules** panel, **Save Universe** updates the active Strategy directly.
 
 Valid draft edits immediately preview rule matches. The All markets table remains complete. Alerts use the **active saved Strategy**. Invalid drafts retain the last valid preview and cannot be applied. Missing inputs evaluate as **Unknown**, including under NOT; only True Universe and Bullish Setup matches become signals.
 

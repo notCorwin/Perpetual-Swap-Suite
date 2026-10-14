@@ -325,9 +325,7 @@ final class RuleEditorUITests: BackgroundTestCase {
 
     @MainActor
     private func showAllMarkets(_ view: WKWebView, count: Int = 500) async throws {
-        try await wait(view, "Array.from(document.querySelectorAll('button')).some(button => button.textContent.trim() === 'All markets' && !button.disabled)")
-        try await click(view, "All markets")
-        try await wait(view, "Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === \(count)")
+        try await wait(view, "document.querySelector('section[aria-label=\"Perpetual swap markets\"]') !== null && Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === \(count)")
     }
 
     @MainActor
@@ -544,10 +542,10 @@ final class RuleEditorUITests: BackgroundTestCase {
         try await click(view,"Explain MKT001-USDT-SWAP Bullish Setup")
         try await wait(view,"document.querySelector('[role=dialog]')?.innerText.includes('Bullish Setup') && !document.querySelector('[role=dialog]')?.innerText.includes('Bearish Reversal')")
         try await dismissFloating(view)
-        try await click(view,"All markets");try await wait(view,"Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === 1")
+        try await wait(view,"Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === 1")
         try await input(view,"input[aria-label='Search contracts']","")
         try await wait(view,"Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === 500")
-        try await click(view,"Signals");try await input(view,"input[aria-label='Search contracts']","MKT00");try await click(view,"Test strategy")
+        try await input(view,"input[aria-label='Search contracts']","MKT00");try await click(view,"Test strategy")
         try await wait(view,"document.querySelector('#study-name')?.value === 'Shared Radar Bullish Setup study'")
         try await click(view,"Strategy Library…")
         try await wait(view,"document.querySelector('#suite-strategy-name')?.value === 'Shared Radar'")
