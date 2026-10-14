@@ -326,6 +326,16 @@ final class RuleEditorUITests: BackgroundTestCase {
     @MainActor
     private func showAllMarkets(_ view: WKWebView, count: Int = 500) async throws {
         try await wait(view, "document.querySelector('section[aria-label=\"Perpetual swap markets\"]') !== null && Number(document.querySelector('table[data-market-count]')?.dataset.marketCount) === \(count)")
+        let formulasUseHTML = try await js(view, """
+        (() => {
+          const formulas = Array.from(document.querySelectorAll('[data-header-formula="html"]'));
+          return formulas.length === 6 && formulas.every(formula => !formula.querySelector('.katex')) &&
+            formulas.every(formula => formula.getAttribute('aria-hidden') === 'true') &&
+            formulas.filter(formula => formula.querySelector('sub')).length === 6 &&
+            formulas.some(formula => formula.querySelectorAll(':scope > span > span').length === 2);
+        })()
+        """) as? Bool
+        XCTAssertEqual(formulasUseHTML, true, "Market header formulas must render as accessible native HTML, without KaTeX.")
     }
 
     @MainActor

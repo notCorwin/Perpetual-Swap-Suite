@@ -88,14 +88,14 @@ const directionClass = (value: PercentageValue) => {
 }
 const rsiClass = (value: number | null) => value === null ? "text-muted-foreground" : value > 70 ? "text-positive" : value < 30 ? "text-destructive" : ""
 const RSI_PERIODS = [6, 12, 24] as const
-const math = (formula: string) => {
-  const plain = formula
-    .replace(/\\mathrm\{([^}]+)\}/g, '$1')
-    .replace(/\\frac\{([^}]+)\}\{([^}]+)\}/g, '($1) / ($2)')
-    .replace(/_\{([^}]+)\}/g, '$1').replace(/\\times/g, '×').replace(/\\%/g, '%')
-    .replace(/[{}]/g, '')
-  return <span className="text-xs font-medium text-foreground" aria-hidden="true">{plain}</span>
-}
+const indicatorFormula = (name: string, period: number) => <span data-header-formula="html" className="text-xs font-medium text-foreground" aria-hidden="true">{name}<sub>{period}</sub>{name === 'RSI' ? '' : ' (%)'}</span>
+const takerImbalanceFormula = <span data-header-formula="html" className="inline-flex items-center gap-1 text-xs font-medium text-foreground" aria-hidden="true">
+  <span className="inline-flex flex-col items-center leading-none">
+    <span className="border-b border-current px-0.5 pb-0.5">Buy<sub>t</sub> − Sell<sub>t</sub></span>
+    <span className="px-0.5 pt-0.5">Buy<sub>t</sub> + Sell<sub>t</sub></span>
+  </span>
+  <span>× 100%</span>
+</span>
 
 function BreakReadings({ result, direction }: { result: BreakResult; direction: BreakDirection }) {
   const description = describeBreak(result, direction)
@@ -616,17 +616,17 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
                   {header("Low age", "lowBreakdownPriorAge", undefined, "Sort by the previous low's age at the breakdown, longest first. Tied lows use the most recent occurrence.")}
                 </div>
               </TableHead>
-              <TableHead className="text-center" aria-sort={sort === "takerRatio" ? descending ? "descending" : "ascending" : "none"}>{header("Taker imbalance", "takerRatio", math(String.raw`\frac{Buy_t-Sell_t}{Buy_t+Sell_t}\times100\%`))}</TableHead>
+              <TableHead className="text-center" aria-sort={sort === "takerRatio" ? descending ? "descending" : "ascending" : "none"}>{header("Taker imbalance", "takerRatio", takerImbalanceFormula)}</TableHead>
               <TableHead className="text-center" aria-sort={sort === "oiChange" ? descending ? "descending" : "ascending" : "none"}>{header("OI Relative Change", "oiChange", undefined, `Hourly change in OI contracts, unaffected by price-only changes. ${PERCENT_CHANGE_DESCRIPTION}`)}</TableHead>
               <TableHead className="py-1.5 text-center" aria-sort={sort === "roc" || sort === "maroc" ? descending ? "descending" : "ascending" : "none"}>
                 <div className="flex flex-col items-center">
-                  {header(`ROC ${ROC_PERIOD}`, "roc", math(String.raw`\mathrm{ROC}_{${ROC_PERIOD}}\ (\%)`), `${ROC_PERIOD}-hour price change. ${PERCENT_CHANGE_DESCRIPTION}`)}
-                  {header(`MAROC ${MAROC_PERIOD}`, "maroc", math(String.raw`\mathrm{MAROC}_{${MAROC_PERIOD}}\ (\%)`), `Mean of the latest ${MAROC_PERIOD} hourly ROC readings, as a percentage.`)}
+                  {header(`ROC ${ROC_PERIOD}`, "roc", indicatorFormula('ROC', ROC_PERIOD), `${ROC_PERIOD}-hour price change. ${PERCENT_CHANGE_DESCRIPTION}`)}
+                  {header(`MAROC ${MAROC_PERIOD}`, "maroc", indicatorFormula('MAROC', MAROC_PERIOD), `Mean of the latest ${MAROC_PERIOD} hourly ROC readings, as a percentage.`)}
                 </div>
               </TableHead>
               <TableHead className="py-1.5 text-center" aria-sort={sort.startsWith("rsi") ? descending ? "descending" : "ascending" : "none"}>
                 <div className="flex flex-col items-center">
-                  {RSI_PERIODS.map(period => <Fragment key={period}>{header(`RSI ${period}`, `rsi${period}`, math(String.raw`\mathrm{RSI}_{${period}}`))}</Fragment>)}
+                  {RSI_PERIODS.map(period => <Fragment key={period}>{header(`RSI ${period}`, `rsi${period}`, indicatorFormula('RSI', period))}</Fragment>)}
                 </div>
               </TableHead>
               <TableHead className="py-1.5 text-center" aria-sort={sort.startsWith("logBB") ? descending ? "descending" : "ascending" : "none"}>
