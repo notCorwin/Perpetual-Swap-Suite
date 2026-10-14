@@ -99,6 +99,7 @@ final class Radar {
     private var candleRequests: [String: [Int64: ContinuousClock.Instant]] = [:]
     private var pendingCandleWrites: [String: Set<Int64>] = [:]
     private var oiHistory: [String: [Int64: OpenInterestObservation]] = [:]
+    private var previousOICache: [String: Double] = [:]
     private var oiHistoryRequests: [String: ContinuousClock.Instant] = [:]
     private var exhaustedCandleHistory = Set<String>()
     private var loadedStatPages: [String: ContinuousClock.Instant] = [:]
@@ -1220,17 +1221,24 @@ final class Radar {
             guard observedDataVersion != version else { return }
             guard !rows.isEmpty else { observedDataVersion = version; return }
             let recorded = try store.load(hour: hour, ids: Set(rows.keys))
+            var changedIDs = Set<String>()
             for (id, bars) in recorded.candles {
                 var changed = false
                 for (ts, bar) in bars where candles[id]?[ts] != bar && pendingCandleWrites[id]?.contains(ts) != true {
                     candles[id, default: [:]][ts] = bar; candleRequests[id, default: [:]][ts] = .now
                     changed = true
                 }
-                if changed { touch(id) }
+                if changed { changedIDs.insert(id) }
             }
-            // An external history writer may also extend the EMA seed beyond
-            // the in-memory lookback, or correct an OI comparison hour.
-            emaStates.removeAll(); oiHistory.removeAll(); takerHistory.removeAll(); invalidateSnapshots(); touch()
+            // Reuse the EMA rows fetched with the candle batch. A correction
+            // deletes only that instrument's persisted EMA through the trigger,
+            // so unrelated markets keep both their snapshot and EMA caches.
+            for id in rows.keys {
+                if let state = recorded.ema[id] { emaStates[id] = state }
+                else if changedIDs.contains(id) { emaStates.removeValue(forKey: id) }
+            }
+            for id in changedIDs { invalidateSnapshot(id) }
+            if !changedIDs.isEmpty { touch() }
             observedDataVersion = version
         } catch {
             let error = "Cache error: \(error.localizedDescription)"
@@ -1277,7 +1285,12 @@ final class Radar {
             batch.response = ["unchanged": true, "revision": revision, "error": batch.response["error"] ?? ""]; return batch
         }
         let previousOI: [String: Double]
-        do { previousOI = try store.openInterest(hour: hour - hourMS) }
+        do {
+            previousOI = try store.openInterest(hour: hour - hourMS)
+            let changedOI = Set(previousOI.keys).union(previousOICache.keys).filter { previousOI[$0] != previousOICache[$0] }
+            for id in changedOI { invalidateSnapshot(id) }
+            previousOICache = previousOI
+        }
         catch { startupError = "Cache error: \(error.localizedDescription)"; previousOI = [:] }
         let now = millis()
         for id in marketOrder {
