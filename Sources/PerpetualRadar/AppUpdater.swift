@@ -1351,7 +1351,7 @@ final class AppUpdater: AppUpdating, @unchecked Sendable {
     new_pid=
     attempt=0
     if [ "$launched" -eq 0 ]; then
-        while [ "$attempt" -lt 100 ]; do
+        while [ "$attempt" -lt 300 ]; do
             if [ -z "$new_pid" ] && [ -s "$pid_file" ]; then
                 new_pid=$(/bin/cat "$pid_file")
             fi

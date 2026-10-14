@@ -170,6 +170,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             webView.loadHTMLString("<html><body style='font:13px system-ui;padding:40px;line-height:1.6'>\(message)</body></html>", baseURL: nil)
         }
         if !launchInBackground { NSApp.activate(ignoringOtherApps: true) }
+        // Update rollback only needs proof that the replacement executable,
+        // window and bundled Web resources initialized. Monitor/database and
+        // notification recovery continue independently and can exceed the
+        // installer's readiness deadline on a busy machine.
+        MonitorRuntime.markReady()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
