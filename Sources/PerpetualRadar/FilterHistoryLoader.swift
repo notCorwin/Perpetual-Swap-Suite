@@ -55,6 +55,7 @@ actor FilterHistoryLoader {
     private var retries: [String: Date] = [:]
     private var candleFloor: [String: (hour: Int64, expires: Date)] = [:]
     private var statPages: [String: Date] = [:]
+    private var lastCachePrune = Date.distantPast
     private var completed = 0
     private var updatedMarkets = Set<String>()
     private var lastError = ""
@@ -149,6 +150,13 @@ actor FilterHistoryLoader {
         }
     }
     func schedule(_ markets: [FilterMarketData], filter: CompiledFilter) {
+        let now = Date()
+        if now.timeIntervalSince(lastCachePrune) >= 60 || retries.count + statPages.count + candleFloor.count > 8_192 {
+            retries = retries.filter { $0.value > now }
+            statPages = statPages.filter { $0.value > now }
+            candleFloor = candleFloor.filter { $0.value.expires > now }
+            lastCachePrune = now
+        }
         let demand = "\(filter.requiredHours)|\(filter.needsStats)|\(markets.first?.hour ?? 0)"
         if activeDemand != demand {
             // A smaller/new-hour preview no longer needs obsolete queued work.

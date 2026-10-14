@@ -1093,6 +1093,10 @@ final class Radar {
         let oldest = (try? store.oldestCandleHour(id)) ?? nil
         let end = boundedHistoryEnd(requestedEnd, oldest: oldest, exhausted: exhaustedCandleHistory.contains(id), latest: hour)
         let first = historicalChartBufferStart(end)
+        loadedStatPages = loadedStatPages.filter { $0.value.duration(to: .now) < .seconds(900) }
+        if loadedStatPages.count > 4_096 {
+            for key in Array(loadedStatPages.keys.prefix(loadedStatPages.count - 4_096)) { loadedStatPages.removeValue(forKey: key) }
+        }
         for path in ["/rubik/stat/contracts/open-interest-history", "/rubik/stat/taker-volume-contract"] {
             for pageStart in stride(from: first / (Int64(chartHours) * hourMS) * Int64(chartHours) * hourMS,
                                     through: end, by: Int(chartHours) * Int(hourMS)) {
