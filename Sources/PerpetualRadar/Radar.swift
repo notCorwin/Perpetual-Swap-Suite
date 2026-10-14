@@ -1109,20 +1109,22 @@ final class Radar {
                         loadedStatPages[key] = .now; continue
                     }
                     let values = try await get(path, ["instId": id, "period": "1H", "end": String(pageEnd + hourMS), "limit": "100"])
+                    var updates: [(hour: Int64, oi: Double?, oiUSD: Double?, sell: Double?, buy: Double?)] = []
                     for case let row as [String] in values {
                         guard let stamp = row.first.flatMap(Int64.init), stamp >= pageStart, stamp <= pageEnd, stamp < hour else { continue }
                         if path.contains("open-interest"), row.count >= 4,
                            let oi = Double(row[1]), let oiUSD = Double(row[3]),
                            oi.isFinite, oiUSD.isFinite, oi >= 0, oiUSD >= 0 {
-                            try store.saveChartStat(id, hour: stamp, oi: oi, oiUSD: oiUSD)
+                            updates.append((stamp, oi, oiUSD, nil, nil))
                             loaded.insert(stamp)
                         } else if !path.contains("open-interest"), row.count >= 3,
                                   let sell = Double(row[1]), let buy = Double(row[2]),
                                   sell.isFinite, buy.isFinite, sell >= 0, buy >= 0 {
-                            try store.saveChartStat(id, hour: stamp, sell: sell, buy: buy)
+                            updates.append((stamp, nil, nil, sell, buy))
                             loaded.insert(stamp)
                         }
                     }
+                    try store.saveChartStats(id, updates)
                     if !loaded.isEmpty { invalidateSnapshot(id); touch(id) }
                     if firstExpected > lastExpected || stride(from: firstExpected, through: lastExpected, by: Int(hourMS)).allSatisfy({ loaded.contains($0) }) {
                         loadedStatPages[key] = .now

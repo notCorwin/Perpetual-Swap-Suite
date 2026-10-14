@@ -241,23 +241,25 @@ actor FilterHistoryLoader {
                     var parameters = ["instId": market.id, "period": "1H", "end": String(pageEnd + hourMS), "limit": "100"]
                     if path == "/rubik/stat/taker-volume-contract" { parameters["unit"] = "2" }
                     let values = try await fetch(path, parameters)
+                    var updates: [(hour: Int64, oi: Double?, oiUSD: Double?, sell: Double?, buy: Double?)] = []
                     for value in values {
                         guard let ts = value.first.flatMap(Int64.init), ts % hourMS == 0, ts >= pageStart, ts <= pageEnd else { continue }
                         if path.contains("open-interest"), value.count >= 4,
                            let oi = Double(value[1]), let oiUSD = Double(value[3]),
                            oi.isFinite, oiUSD.isFinite, oi >= 0, oiUSD >= 0 {
-                            try db.saveChartStat(market.id, hour: ts, oi: oi, oiUSD: oiUSD)
+                            updates.append((ts, oi, oiUSD, nil, nil))
                             statCache[market.id, default: [:]][ts, default: .init()].oi = oi
                             statCache[market.id, default: [:]][ts, default: .init()].oiUSD = oiUSD
                             updatedMarkets.insert(market.id)
                             loaded.insert(ts)
                         } else if !path.contains("open-interest"), value.count >= 3, let sell = Double(value[1]), let buy = Double(value[2]), sell.isFinite, buy.isFinite, sell >= 0, buy >= 0 {
-                            try db.saveChartStat(market.id, hour: ts, sell: sell, buy: buy)
+                            updates.append((ts, nil, nil, sell, buy))
                             updatedMarkets.insert(market.id)
                             statCache[market.id, default: [:]][ts, default: .init()].sell = sell; statCache[market.id, default: [:]][ts, default: .init()].buy = buy
                             loaded.insert(ts)
                         }
                     }
+                    try db.saveChartStats(market.id, updates)
                     if stride(from: expectedFirst, through: pageEnd, by: Int(hourMS)).allSatisfy({ loaded.contains($0) }) {
                         statPages[pageKey] = Date().addingTimeInterval(900)
                     } else { incomplete = true }
