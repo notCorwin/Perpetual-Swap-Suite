@@ -14,6 +14,11 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp .build/release/PerpetualSwapSuite "$app/Contents/MacOS/PerpetualSwapSuite"
 cp macos/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
 ditto dist "$app/Contents/Resources/Web"
+mkdir -p "$app/Contents/Resources/Node"
+node_binary="${NODE_BINARY:-$(command -v node)}"
+[[ -x "$node_binary" ]]
+cp "$node_binary" "$app/Contents/Resources/Node/node"
+cp node/strategy-host.mjs "$app/Contents/Resources/Node/strategy-host.mjs"
 cp macos/Info.plist "$app/Contents/Info.plist"
 printf 'APPL????' > "$app/Contents/PkgInfo"
 

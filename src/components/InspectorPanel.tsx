@@ -1,13 +1,20 @@
 import { Button } from '@base-ui/react/button'
 import { Tabs } from '@base-ui/react/tabs'
-import { CheckCircle2, Database, Play, ShieldAlert } from 'lucide-react'
-import { useState } from 'react'
+import { CheckCircle2, Database, ShieldAlert } from 'lucide-react'
+import { lazy, Suspense, useState } from 'react'
 import { formatCompact, formatDate, formatPercent } from '../lib/format'
-import type { ValidationReport, WorkspaceSnapshot } from '../types'
+import type { BacktestReport, ValidationReport, WorkspaceSnapshot } from '../types'
 
-type Props = { snapshot: WorkspaceSnapshot; onValidate(): Promise<ValidationReport> }
+const StrategyLab = lazy(() => import('./StrategyLab').then(module => ({ default: module.StrategyLab })))
 
-export function InspectorPanel({ snapshot, onValidate }: Props) {
+type Props = {
+  snapshot: WorkspaceSnapshot
+  report: BacktestReport | null
+  onReport(report: BacktestReport): void
+  onValidate(): Promise<ValidationReport>
+}
+
+export function InspectorPanel({ snapshot, report, onReport, onValidate }: Props) {
   const market = snapshot.markets.find(item => item.instrument.id === snapshot.selectedInstrument)
   const [validation, setValidation] = useState<ValidationReport | null>(null)
   const [validating, setValidating] = useState(false)
@@ -44,12 +51,8 @@ export function InspectorPanel({ snapshot, onValidate }: Props) {
         </section>
         {!!market?.missingRequirements.length && <div className="warning-card"><ShieldAlert size={16} /><span>Missing: {market.missingRequirements.join(', ')}</span></div>}
       </Tabs.Panel>
-      <Tabs.Panel value="strategy" className="tab-panel placeholder-panel">
-        <div className="placeholder-icon">JS</div><h3>JavaScript strategy</h3><p>The code editor and dual order API are installed in the next stage.</p>
-      </Tabs.Panel>
-      <Tabs.Panel value="backtest" className="tab-panel placeholder-panel">
-        <Play size={24} /><h3>Broker emulator</h3><p>TradingView-style 5m execution will run here without synthetic interpolation.</p>
-      </Tabs.Panel>
+      <Tabs.Panel value="strategy" className="tab-panel strategy-tab"><Suspense fallback={<PanelLoading />}><StrategyLab mode="strategy" snapshot={snapshot} report={report} onReport={onReport} /></Suspense></Tabs.Panel>
+      <Tabs.Panel value="backtest" className="tab-panel"><Suspense fallback={<PanelLoading />}><StrategyLab mode="backtest" snapshot={snapshot} report={report} onReport={onReport} /></Suspense></Tabs.Panel>
       <Tabs.Panel value="data" className="tab-panel">
         <div className="panel-title"><div><span className="section-kicker">PARQUET</span><h2>Data coverage</h2></div><Database size={17} /></div>
         <section className="metric-section">
@@ -71,3 +74,5 @@ export function InspectorPanel({ snapshot, onValidate }: Props) {
 function Metric({ label, value, target }: { label: string; value: string; target?: string }) {
   return <div className="metric-row"><span>{label}{target && <small>{target}</small>}</span><strong>{value}</strong></div>
 }
+
+function PanelLoading() { return <div className="placeholder-panel"><span>Loading strategy tools…</span></div> }

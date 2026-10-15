@@ -100,3 +100,66 @@ export type ValidationReport = {
   duplicateCandles: number
   checkedAt: number
 }
+
+export type StrategySummary = { id: string; name: string; modifiedAt: number }
+export type StrategyDocument = StrategySummary & { source: string }
+
+export type StrategyExecutionOptions = {
+  onHistoryTick: boolean
+  onOrderFill: boolean
+  processOrdersOnClose: boolean
+  verifyLimitTicks: number
+}
+
+export type BacktestRequest = {
+  strategyID: string
+  instrument: string
+  timeframe: Timeframe
+  from: number | null
+  through: number | null
+  execution: StrategyExecutionOptions
+}
+
+export type BacktestTrade = {
+  id: string
+  direction: 'long' | 'short'
+  entryAt: number
+  exitAt: number
+  entryPrice: number
+  exitPrice: number
+  quantityContracts: number
+  grossPnLUSDT: number
+  feesUSDT: number
+  fundingUSDT: number
+  netPnLUSDT: number
+  returnOnMarginPercent: number
+  durationMS: number
+  maximumAdverseExcursionPercent: number
+  maximumFavorableExcursionPercent: number
+  exitReason: string
+  liquidated: boolean
+}
+
+export type BacktestMarker = { timestamp: number; price: number; kind: string; label: string }
+
+export type BacktestReport = {
+  strategyID: string
+  instrument: string
+  timeframe: Timeframe
+  from: number | null
+  through: number | null
+  initialCapitalUSDT: number
+  finalEquityUSDT: number
+  netProfitUSDT: number
+  returnPercent: number
+  winRatePercent: number
+  maximumDrawdownPercent: number
+  totalTrades: number
+  winningTrades: number
+  losingTrades: number
+  liquidations: number
+  trades: BacktestTrade[]
+  markers: BacktestMarker[]
+  warnings: string[]
+  elapsedMS: number
+}

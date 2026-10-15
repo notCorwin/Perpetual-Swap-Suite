@@ -1,6 +1,6 @@
 import Foundation
 
-struct AppSettings: Codable, Equatable, Sendable {
+struct AppSettings: Codable, Equatable, Hashable, Sendable {
     var settlementCurrencies = ["USDT"]
     var spreadLimitPercent = 0.05
     var depthRangePercent = 0.5

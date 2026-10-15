@@ -91,6 +91,7 @@ actor MarketService {
 
     func validateData() async throws -> ParquetMarketStore.ValidationReport { try await store.validate() }
     func query(_ sql: String) async throws -> [[String: AnyCodable]] { try await store.queryJSON(sql) }
+    func instrument(id: String) -> Instrument? { instruments[id] }
 
     private func loadBooks(for instruments: [Instrument]) async -> [String: OrderBook] {
         await withTaskGroup(of: (String, OrderBook?).self, returning: [String: OrderBook].self) { group in
