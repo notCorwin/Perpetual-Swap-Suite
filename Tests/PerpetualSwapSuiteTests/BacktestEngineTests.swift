@@ -25,6 +25,7 @@ import Testing
     )
     let report = try await BacktestEngine().run(
         request: request, instrument: instrument, settings: AppSettings(), candles: candles,
+        funding: [.init(instrument: instrument.id, timestamp: 400_000, rate: 0.001)],
         execute: { event in await strategy.commands(for: event) }
     )
     #expect(report.totalTrades == 1)
@@ -32,6 +33,7 @@ import Testing
     let trade = try #require(report.trades.first)
     #expect(trade.entryAt >= 300_000)
     #expect(trade.exitReason == "Take profit")
+    #expect(trade.fundingUSDT > 0)
 }
 
 @Test func nodeRuntimeLoadsAUserStrategy() async throws {

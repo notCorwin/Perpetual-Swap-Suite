@@ -62,6 +62,15 @@ struct OKXClient: Sendable {
         try await request(path: "/api/v5/public/funding-rate", query: ["instId": instrument]).first?.double("fundingRate")
     }
 
+    func fundingHistory(instrument: String, after: Int64? = nil, limit: Int = 400) async throws -> [FundingPoint] {
+        var query = ["instId": instrument, "limit": String(min(400, max(1, limit)))]
+        if let after { query["after"] = String(after) }
+        return try await request(path: "/api/v5/public/funding-rate-history", query: query).compactMap { row in
+            guard let timestamp = row.int64("fundingTime"), let rate = row.double("fundingRate") else { return nil }
+            return .init(instrument: instrument, timestamp: timestamp, rate: rate)
+        }.sorted { $0.timestamp < $1.timestamp }
+    }
+
     func orderBook(instrument: String, depth: Int = 400) async throws -> OrderBook {
         let rows = try await request(path: "/api/v5/market/books", query: ["instId": instrument, "sz": String(depth)])
         guard let row = rows.first else { throw OKXError.invalidResponse("Order book is empty") }

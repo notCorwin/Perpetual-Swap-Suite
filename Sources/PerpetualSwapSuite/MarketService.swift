@@ -33,11 +33,23 @@ actor MarketService {
                 estimatedVolume(tickers[$0.id]) > estimatedVolume(tickers[$1.id])
             }
             let candidates = Array(ranked.prefix(60))
-            let books = await loadBooks(for: candidates)
+            async let booksTask = loadBooks(for: candidates)
+            async let fundingTask = loadFunding(for: candidates)
+            let books = await booksTask
+            let funding = await fundingTask
+            var volumeRatios = [String: Double]()
+            if settings.volumeStabilityEnabled {
+                for instrument in candidates {
+                    if let ratio = try? await store.hourlyVolumeRatio(instrument: instrument.id) {
+                        volumeRatios[instrument.id] = ratio
+                    }
+                }
+            }
             markets = candidates.map { instrument in
                 summary(
                     instrument: instrument, ticker: tickers[instrument.id],
-                    openInterest: openInterest[instrument.id], book: books[instrument.id], settings: settings
+                    openInterest: openInterest[instrument.id], fundingRate: funding[instrument.id],
+                    hourlyVolumeRatio: volumeRatios[instrument.id], book: books[instrument.id], settings: settings
                 )
             }.sorted { left, right in
                 if left.eligible != right.eligible { return left.eligible && !right.eligible }
@@ -106,13 +118,25 @@ actor MarketService {
         }
     }
 
+    private func loadFunding(for instruments: [Instrument]) async -> [String: Double] {
+        await withTaskGroup(of: (String, Double?).self, returning: [String: Double].self) { group in
+            for instrument in instruments.prefix(20) {
+                group.addTask { (instrument.id, try? await self.client.fundingRate(instrument: instrument.id)) }
+            }
+            var result = [String: Double]()
+            for await (id, rate) in group { if let rate { result[id] = rate * 100 } }
+            return result
+        }
+    }
+
     private func estimatedVolume(_ ticker: OKXTicker?) -> Double {
         guard let ticker, let last = ticker.last, let volume = ticker.volumeBase24h else { return 0 }
         return last * volume
     }
 
     private func summary(
-        instrument: Instrument, ticker: OKXTicker?, openInterest: Double?, book: OrderBook?, settings: AppSettings
+        instrument: Instrument, ticker: OKXTicker?, openInterest: Double?, fundingRate: Double?,
+        hourlyVolumeRatio: Double?, book: OrderBook?, settings: AppSettings
     ) -> MarketSummary {
         let volume = estimatedVolume(ticker)
         let liquidity = book.map {
@@ -129,6 +153,8 @@ actor MarketService {
         if liquidity.sellSlippagePercent.map({ $0 >= settings.slippageLimitPercent }) ?? true { missing.append("Sell slippage") }
         if volume <= settings.minimumVolume24hUSDT { missing.append("24h volume") }
         if (openInterest ?? 0) <= settings.minimumOpenInterestUSDT { missing.append("Open interest") }
+        if settings.volumeStabilityEnabled,
+           hourlyVolumeRatio.map({ $0 >= settings.maximumHourlyVolumeRatio }) ?? true { missing.append("Volume stability") }
         let change = ticker.flatMap { value -> Double? in
             guard let last = value.last, let open = value.open24h else { return nil }
             return signedRelativeChange(current: last, baseline: open)
@@ -136,7 +162,8 @@ actor MarketService {
         return .init(
             instrument: instrument, last: ticker?.last, change24hPercent: change,
             volume24hUSDT: volume == 0 ? nil : volume, openInterestUSDT: openInterest,
-            fundingRatePercent: nil, liquidity: liquidity, eligible: missing.isEmpty,
+            fundingRatePercent: fundingRate, hourlyVolumeRatio: hourlyVolumeRatio,
+            liquidity: liquidity, eligible: missing.isEmpty,
             missingRequirements: missing, updatedAt: ticker?.timestamp ?? unixMilliseconds()
         )
     }

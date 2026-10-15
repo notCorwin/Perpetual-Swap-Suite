@@ -41,6 +41,7 @@ export type MarketSummary = {
   volume24hUSDT: number | null
   openInterestUSDT: number | null
   fundingRatePercent: number | null
+  hourlyVolumeRatio: number | null
   liquidity: LiquidityReading
   eligible: boolean
   missingRequirements: string[]
@@ -162,4 +163,16 @@ export type BacktestReport = {
   markers: BacktestMarker[]
   warnings: string[]
   elapsedMS: number
+}
+
+export type DataSyncStatus = {
+  active: boolean
+  instruments: string[]
+  completedInstruments: number
+  currentInstrument: string | null
+  downloadedCandles: number
+  downloadedFundingRates: number
+  startedAt: number | null
+  finishedAt: number | null
+  error: string | null
 }

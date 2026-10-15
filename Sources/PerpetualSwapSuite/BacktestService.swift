@@ -26,12 +26,13 @@ actor BacktestService {
             instrument: request.instrument, timeframe: .fiveMinutes,
             from: request.from, through: request.through
         )
+        let funding = try await store.funding(instrument: request.instrument, from: request.from, through: request.through)
         let strategyURL = try await strategies.fileURL(id: request.strategyID)
         let session = try runtime.session(strategyURL: strategyURL)
         try await session.initialize(settings: settings)
         defer { Task { await session.stop() } }
         return try await engine.run(
-            request: request, instrument: instrument, settings: settings, candles: candles,
+            request: request, instrument: instrument, settings: settings, candles: candles, funding: funding,
             execute: { event in try await session.evaluate(event) }
         )
     }

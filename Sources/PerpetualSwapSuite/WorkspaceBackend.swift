@@ -7,6 +7,10 @@ actor WorkspaceBackend {
     let market: MarketService
     let strategies: StrategyStore
     let backtests: BacktestService
+    let dataSync: DataSyncService
+    let ai: AIGateway
+    let updater: AppUpdater
+    private var refreshTask: Task<Void, Never>?
 
     init(root: URL? = nil) throws {
         paths = try AppPaths(root: root)
@@ -18,13 +22,27 @@ actor WorkspaceBackend {
         store = marketStore
         market = marketService
         strategies = strategyStore
+        dataSync = DataSyncService(store: marketStore)
+        ai = AIGateway(credentialURL: paths.aiCredential, settings: settingsStore)
+        updater = AppUpdater(cache: paths.cache)
         backtests = BacktestService(
             market: marketService, store: marketStore, settings: settingsStore,
             strategies: strategyStore, runtime: NodeStrategyRuntime(paths: paths, store: marketStore)
         )
     }
 
-    func start() async { await market.refresh() }
+    func start() async {
+        guard refreshTask == nil else { return }
+        await market.refresh()
+        if (await settings.current()).launchAtLogin { try? LoginItemController.apply(enabled: true) }
+        refreshTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(30))
+                guard !Task.isCancelled else { break }
+                await market.refresh()
+            }
+        }
+    }
 
     func handle(_ request: [String: Any]) async throws -> Data {
         let method = request["method"] as? String ?? "snapshot"
@@ -40,6 +58,7 @@ actor WorkspaceBackend {
         case "settings":
             guard let object = request["settings"] else { throw BridgeError.invalidRequest }
             let settings = try decodeBridge(AppSettings.self, from: object)
+            try LoginItemController.apply(enabled: settings.launchAtLogin)
             return try bridgeData(try await market.updateSettings(settings))
         case "validate":
             return try bridgeData(try await market.validateData())
@@ -57,8 +76,35 @@ actor WorkspaceBackend {
         case "backtest":
             guard let value = request["backtest"] else { throw BridgeError.invalidRequest }
             return try bridgeData(try await backtests.run(decodeBridge(BacktestRequest.self, from: value)))
+        case "syncStart":
+            guard let instruments = request["instruments"] as? [String] else { throw BridgeError.invalidRequest }
+            return try bridgeData(try await dataSync.start(instruments: instruments))
+        case "syncStatus":
+            return try bridgeData(await dataSync.status())
+        case "syncCancel":
+            return try bridgeData(await dataSync.cancel())
+        case "aiStatus":
+            return try bridgeData(await ai.status())
+        case "aiSaveKey":
+            return try bridgeData(try await ai.save(key: request["key"] as? String))
+        case "aiFetch":
+            guard let value = request["request"] else { throw BridgeError.invalidRequest }
+            return try bridgeData(try await ai.fetch(decodeBridge(AIGatewayRequest.self, from: value)))
+        case "updateCheck":
+            return try bridgeData(try await updater.check())
+        case "updateInstall":
+            return try bridgeData(try await updater.install())
         default: throw BridgeError.unknownMethod(method)
         }
+    }
+
+    func prepareAutomaticUpdate() async -> Bool {
+        guard (await settings.current()).automaticUpdatesEnabled else { return false }
+        do {
+            let checked = try await updater.check()
+            guard checked.state == "available" else { return false }
+            return try await updater.install().relaunchRequired
+        } catch { return false }
     }
 }
 
