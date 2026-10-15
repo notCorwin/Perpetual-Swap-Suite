@@ -2,20 +2,16 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>CFBundleDevelopmentRegion</key><string>en</string>
-  <key>CFBundleExecutable</key><string>PerpetualRadar</string>
-  <key>CFBundleIdentifier</key><string>com.perpetualradar.macos</string>
+  <key>CFBundleExecutable</key><string>PerpetualSwapSuite</string>
+  <key>CFBundleIdentifier</key><string>com.perpetualswapsuite.macos</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Perpetual Swap Suite</string>
+  <key>CFBundleDisplayName</key><string>Perpetual Swap Suite</string>
   <key>CFBundleIconFile</key><string>AppIcon.icns</string>
-  <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0.0</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
-  <key>CFBundleURLTypes</key><array><dict>
-    <key>CFBundleURLName</key><string>com.perpetualradar.contract</string>
-    <key>CFBundleURLSchemes</key><array><string>perpetualradar</string></array>
-  </dict></array>
 </dict></plist>

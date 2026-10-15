@@ -1,13 +1,13 @@
 {
-  "originHash" : "9deacbfc07b2da5f3471c716a3386a231dc7a9494a56264fa0ab8abcab47029b",
+  "originHash" : "b6c14525a62ca2f8159f13d08b8025add46a743792f9da6f1e278126ef7d7125",
   "pins" : [
     {
-      "identity" : "zipfoundation",
+      "identity" : "duckdb-swift",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/weichsel/ZIPFoundation.git",
+      "location" : "https://github.com/duckdb/duckdb-swift.git",
       "state" : {
-        "revision" : "22787ffb59de99e5dc1fbfe80b19c97a904ad48d",
-        "version" : "0.9.20"
+        "revision" : "9583f44fedc20a8e0b6151d2e43f6d850016712f",
+        "version" : "1.1.3"
       }
     }
   ],
