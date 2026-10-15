@@ -50,8 +50,8 @@ struct OKXClient: Sendable {
         })
     }
 
-    func openInterest(settlementCurrency: String) async throws -> [String: Double] {
-        let rows = try await request(path: "/api/v5/public/open-interest", query: ["instType": "SWAP", "instFamily": "\(settlementCurrency)-SWAP"])
+    func openInterest() async throws -> [String: Double] {
+        let rows = try await request(path: "/api/v5/public/open-interest", query: ["instType": "SWAP"])
         return Dictionary(uniqueKeysWithValues: rows.compactMap { row in
             guard let id = row.string("instId") else { return nil }
             return (id, row.double("oiUsd") ?? 0)

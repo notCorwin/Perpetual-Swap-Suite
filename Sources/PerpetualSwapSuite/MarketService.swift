@@ -27,11 +27,7 @@ actor MarketService {
             }
             instruments = Dictionary(uniqueKeysWithValues: listed.map { ($0.id, $0) })
             async let tickerTask = client.tickers()
-            var openInterest = [String: Double]()
-            for currency in settings.settlementCurrencies {
-                let values = try? await client.openInterest(settlementCurrency: currency)
-                openInterest.merge(values ?? [:]) { _, new in new }
-            }
+            let openInterest = (try? await client.openInterest()) ?? [:]
             let tickers = try await tickerTask
             let ranked = listed.sorted {
                 estimatedVolume(tickers[$0.id]) > estimatedVolume(tickers[$1.id])
@@ -69,13 +65,14 @@ actor MarketService {
     func snapshot(instrument: String? = nil) async -> WorkspaceSnapshot {
         let settings = await settingsStore.current()
         let selected = instrument ?? settings.selectedInstrument
-        let values: [Candle]
-        if let cached = cache[selected] { values = cached }
-        else { values = (try? await store.candles(instrument: selected, limit: 500)) ?? [] }
+        let values = (try? await store.candles(
+            instrument: selected, timeframe: settings.selectedTimeframe, limit: 500
+        )) ?? []
+        let live = formingCandle(instrument: selected, timeframe: settings.selectedTimeframe)
         let coverage = try? await store.coverage(instrument: selected)
         return .init(
             markets: markets, selectedInstrument: selected, candles: values,
-            formingCandle: forming[selected], coverage: coverage, settings: settings,
+            formingCandle: live, coverage: coverage, settings: settings,
             status: status, error: lastError, updatedAt: updatedAt
         )
     }
@@ -140,6 +137,21 @@ actor MarketService {
             volume24hUSDT: volume == 0 ? nil : volume, openInterestUSDT: openInterest,
             fundingRatePercent: nil, liquidity: liquidity, eligible: missing.isEmpty,
             missingRequirements: missing, updatedAt: ticker?.timestamp ?? unixMilliseconds()
+        )
+    }
+
+    private func formingCandle(instrument: String, timeframe: Timeframe) -> Candle? {
+        guard let live = forming[instrument] else { return nil }
+        if timeframe == .fiveMinutes { return live }
+        let bucket = live.timestamp / timeframe.milliseconds * timeframe.milliseconds
+        let sources = (cache[instrument] ?? []).filter { $0.timestamp >= bucket && $0.timestamp < live.timestamp } + [live]
+        guard let first = sources.first else { return nil }
+        return Candle(
+            instrument: instrument, timestamp: bucket, open: first.open,
+            high: sources.map(\.high).max() ?? live.high, low: sources.map(\.low).min() ?? live.low,
+            close: live.close, volumeContracts: sources.reduce(0) { $0 + $1.volumeContracts },
+            volumeBase: sources.compactMap(\.volumeBase).reduce(0, +),
+            volumeQuote: sources.compactMap(\.volumeQuote).reduce(0, +), confirmed: false
         )
     }
 }
