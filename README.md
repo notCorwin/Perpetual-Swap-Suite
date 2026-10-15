@@ -96,7 +96,7 @@ Available interfaces include:
 
 - `strategy.entry`, `strategy.order`, `strategy.exit`, `strategy.close`, `strategy.cancel`, and `strategy.cancelAll`
 - `exchange.placeOrder`, `exchange.amendOrder`, `exchange.cancelOrder`, and `exchange.cancelAllOrders`
-- `suite.query(sql)` for read-only `SELECT`, `WITH`, or `EXPLAIN` queries through DuckDB
+- `suite.query(sql)` for read-only `SELECT`, `WITH`, or `EXPLAIN` queries through DuckDB; stable views are named `market_candles` and `funding_rates`
 - `context.indicators.ema()` and `context.indicators.rsi()`
 
 Strategies are trusted local code and run with the permissions of the current macOS user.
