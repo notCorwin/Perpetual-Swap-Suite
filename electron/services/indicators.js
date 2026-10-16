@@ -63,8 +63,7 @@ export function roc(candles, period = 9) {
   return values
 }
 
-export function barsWithIndicators(candles) {
-  const ordered = [...candles].filter(candle => finite(candle.timestamp) !== null && finite(candle.close) !== null).sort((left, right) => left.timestamp - right.timestamp)
+function indicatorBars(ordered) {
   const ema200 = ema(ordered), rsi6 = rsi(ordered, 6), rsi12 = rsi(ordered, 12), rsi24 = rsi(ordered, 24), bands = bollinger(ordered), vwaps = vwap(ordered), rocs = roc(ordered), marocValues = new Map()
   for (let index = 8; index < ordered.length; index += 1) {
     const window = ordered.slice(index - 8, index + 1).map(candle => rocs.get(candle.timestamp)).filter(value => value !== undefined)
@@ -75,4 +74,18 @@ export function barsWithIndicators(candles) {
     const bandPosition = !band ? null : price > band.upper ? 'upper' : price > band.middle ? 'middle' : price > band.lower ? 'lower' : 'below'
     return { hour: candle.timestamp, quoteVolume: candle.quoteVolume ?? null, open: candle.open, high: candle.high, low: candle.low, close: price, confirmed: Boolean(candle.confirmed), vwap: vwaps.get(candle.timestamp) ?? null, ema: ema200.get(candle.timestamp) ?? null, logBBUpper: band?.upper ?? null, logBBMiddle: band?.middle ?? null, logBBLower: band?.lower ?? null, roc: rocs.get(candle.timestamp) ?? null, maroc: marocValues.get(candle.timestamp) ?? null, rsi6: rsi6.get(candle.timestamp) ?? null, rsi12: rsi12.get(candle.timestamp) ?? null, rsi24: rsi24.get(candle.timestamp) ?? null, oi: finite(candle.oi), buy: finite(candle.buy), sell: finite(candle.sell), bandPosition, rocChange: change(rocs.get(candle.timestamp) ?? null, previousROC ?? null), marocChange: change(marocValues.get(candle.timestamp) ?? null, previousMAROC ?? null) }
   })
+}
+
+// Indicators may never span missing periods. Split the input into contiguous
+// runs so each calculation restarts after a gap instead of silently using an
+// old close as the seed for a newer time range.
+export function barsWithIndicators(candles, intervalMS = 300_000) {
+  const ordered = [...candles].filter(candle => finite(candle.timestamp) !== null && finite(candle.close) !== null).sort((left, right) => left.timestamp - right.timestamp)
+  const runs = []
+  for (const candle of ordered) {
+    const current = runs.at(-1)
+    if (!current || candle.timestamp - current.at(-1).timestamp !== intervalMS) runs.push([candle])
+    else current.push(candle)
+  }
+  return runs.flatMap(indicatorBars)
 }

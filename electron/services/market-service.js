@@ -7,7 +7,11 @@ const DEPTH_USD_MINIMUM = 100_000
 const MAX_SPREAD_PERCENT = 0.05
 const MAX_SLIPPAGE_PERCENT = 0.1
 const MAX_HOURLY_VOLUME_RATIO = 2
-const HISTORY_CANDLES = 2_520
+const VISIBLE_CANDLES = 96
+const EMA_WARMUP_CANDLES = 199
+// 96 visible 1h candles need 199 earlier 1h candles before their left edge.
+// Store a small extra buffer for an in-progress 5m candle and UTC alignment.
+const HISTORY_CANDLES = 3_600
 const emptyBreak = { status: 'insufficient-history' }
 const incompleteOpportunity = reasons => ({ direction: null, setup: null, status: 'Incomplete', score: null, components: null, reasons })
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds))
@@ -194,18 +198,21 @@ export class MarketService {
 
   async loadOlder(instrument, timeframe, targetEnd) {
     const intervalMS = timeframe === '5m' ? 300_000 : timeframe === '15m' ? 900_000 : 3_600_000
-    const neededHour = targetEnd - 95 * intervalMS
+    const neededHour = targetEnd - (VISIBLE_CANDLES - 1 + EMA_WARMUP_CANDLES) * intervalMS
     let source = await this.store.candles({ instrument: instrument.instId, timeframe: '5m' })
+    const fetched = []
     while (source[0] && source[0].timestamp > neededHour && !this.historyExhausted.has(instrument.instId)) {
       const after = source[0].timestamp
       const page = await this.get('/market/history-candles', { instId: instrument.instId, bar: '5m', limit: 300, after })
       const older = page.map(value => candle(instrument.instId, value)).filter(Boolean)
       if (!older.length) { this.historyExhausted.add(instrument.instId); break }
-      await this.persistCandles(instrument.instId, older)
-      await this.hydrateStatistics(instrument, after)
-      source = await this.store.candles({ instrument: instrument.instId, timeframe: '5m' })
+      fetched.push(...older)
+      source = [...older, ...source].sort((left, right) => left.timestamp - right.timestamp)
       if (page.length < 300) this.historyExhausted.add(instrument.instId)
     }
+    // One Parquet write and one derived-series rebuild per scroll request keeps
+    // chart navigation responsive even when several archive pages are needed.
+    if (fetched.length) await this.persistCandles(instrument.instId, fetched)
   }
 
   async bars(instrument, timeframe, targetEnd) {
@@ -218,7 +225,8 @@ export class MarketService {
       candles = aggregate(source, timeframe === '15m' ? 900_000 : 3_600_000)
     }
     const live = timeframe === '5m' ? this.liveCandles.get(instrument) : undefined
-    return barsWithIndicators(live ? [...candles, live] : candles)
+    const intervalMS = timeframe === '5m' ? 300_000 : timeframe === '15m' ? 900_000 : 3_600_000
+    return barsWithIndicators(live ? [...candles, live] : candles, intervalMS)
   }
 
   isHistoryExhausted(instrument) { return this.historyExhausted.has(instrument) || !this.instruments.has(instrument) }

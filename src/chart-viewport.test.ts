@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chartHistoryNeedsLoad, chartStatsNeedLoad, livePriceTag, renderableChartEnd, scrollChartEnd, visibleChartBars } from "./chart-viewport.ts"
+import { chartHistoryNeedsLoad, chartStatsNeedLoad, completeIndicatorSeries, livePriceTag, renderableChartEnd, scrollChartEnd, visibleChartBars } from "./chart-viewport.ts"
 
 const hour = 3_600_000
 test("live price and countdown do not change when the chart scrolls into history", () => {
@@ -42,6 +42,13 @@ test("a pending history range keeps rendering the nearest cached window", () => 
   const bars = Array.from({ length: 96 }, (_, index) => ({ hour: index * hour }))
   assert.equal(renderableChartEnd(bars, -hour), 95 * hour)
   assert.equal(renderableChartEnd(bars, 95 * hour), 95 * hour)
+})
+
+test("indicators render only for a complete visible candle window", () => {
+  const complete = Array.from({ length: 96 }, (_, index) => ({ ema: index + 1 }))
+  assert.equal(completeIndicatorSeries(complete, 'ema'), true)
+  assert.equal(completeIndicatorSeries([...complete.slice(0, 95), { ema: null }], 'ema'), false)
+  assert.equal(completeIndicatorSeries(complete.slice(1), 'ema'), false)
 })
 
 test("a buffered history block avoids native requests until the viewport nears its left edge", () => {

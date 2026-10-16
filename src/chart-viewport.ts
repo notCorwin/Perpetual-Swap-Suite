@@ -30,6 +30,10 @@ export function renderableChartEnd<T extends { hour: number }>(bars: T[], reques
   return Math.min(latest, oldest + 95 * intervalMS)
 }
 
+export function completeIndicatorSeries<T extends Record<string, unknown>>(bars: T[], key: string, visibleCandles = 96): boolean {
+  return bars.length >= visibleCandles && bars.every(bar => typeof bar[key] === 'number' && Number.isFinite(bar[key]))
+}
+
 export function chartHistoryNeedsLoad(endHour: number, oldestCachedHour: number, visibleHours = 96, prefetchHours = 48, intervalMS = hour): boolean {
   return endHour - (visibleHours - 1) * intervalMS <= oldestCachedHour + prefetchHours * intervalMS
 }
