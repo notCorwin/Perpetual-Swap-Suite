@@ -113,7 +113,18 @@ async function handleRequest(event, request) {
   if ('explainMarketFilters' in request) return { instId: request.explainMarketFilters.instId, filterToken: request.explainMarketFilters.token, revision: 0, trace: null }
   if ('chartInstId' in request) {
     const timeframe = request.timeframe ?? '1H'
-    return { bars: await marketService.bars(request.chartInstId, timeframe), error: '', revision: marketService.revision, timeframe, historyExhausted: false }
+    const bars = await marketService.bars(request.chartInstId, timeframe)
+    const intervalMS = timeframe === '5m' ? 300_000 : timeframe === '15m' ? 900_000 : 3_600_000
+    const oldestHour = bars[0]?.hour ?? null, latestHour = bars.at(-1)?.hour ?? null
+    const minimumEnd = oldestHour === null ? null : Math.min(latestHour ?? oldestHour, oldestHour + 95 * intervalMS)
+    const requestedEnd = request.chartEndHour
+    const endHour = requestedEnd === undefined || minimumEnd === null || latestHour === null
+      ? undefined
+      : Math.max(minimumEnd, Math.min(latestHour, requestedEnd))
+    return {
+      bars, error: '', revision: marketService.revision, timeframe, oldestHour,
+      endHour, historyExhausted: requestedEnd !== undefined && minimumEnd !== null && requestedEnd <= minimumEnd,
+    }
   }
   if ('gatewayFetch' in request) return gatewayFetch(event, request.gatewayFetch)
   if ('cancelGatewayFetch' in request) { gatewayRequests.get(request.cancelGatewayFetch)?.abort(); return { ok: true } }

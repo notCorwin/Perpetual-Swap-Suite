@@ -44,6 +44,10 @@ test('completed candles round-trip through Parquet and chart IPC', async () => {
   const chart = await request({ chartInstId: 'BTC-USDT-SWAP', timeframe: '5m', loadChart: true })
   assert.equal(chart.timeframe, '5m')
   assert.deepEqual(chart.bars.map(bar => [bar.hour, bar.close, bar.confirmed]), [[timestamp, 108, true]])
+  const boundary = await request({ chartInstId: 'BTC-USDT-SWAP', timeframe: '5m', chartEndHour: timestamp - 300_000 })
+  assert.equal(boundary.historyExhausted, true)
+  assert.equal(boundary.oldestHour, timestamp)
+  assert.equal(boundary.endHour, timestamp)
 })
 
 test('clipboard, screenshot capture, analysis settings, and safe gateway cancellation work', async () => {
