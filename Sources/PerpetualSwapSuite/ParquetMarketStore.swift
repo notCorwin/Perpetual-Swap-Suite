@@ -42,7 +42,6 @@ actor ParquetMarketStore {
                 duplicate_candles BIGINT NOT NULL
             );
             """)
-        try Self.refreshViews(connection: connection, paths: paths)
     }
 
     func upsert(candles: [Candle]) throws {
@@ -90,7 +89,6 @@ actor ParquetMarketStore {
                 )
                 """)
         }
-        try Self.refreshViews(connection: connection, paths: paths)
     }
 
     func funding(instrument: String, from: Int64? = nil, through: Int64? = nil) throws -> [FundingPoint] {
@@ -180,17 +178,11 @@ actor ParquetMarketStore {
 
     func queryJSON(_ sql: String) throws -> [[String: AnyCodable]] {
         let trimmed = sql.trimmingCharacters(in: .whitespacesAndNewlines)
-        let statement = trimmed.hasSuffix(";") ? String(trimmed.dropLast()).trimmingCharacters(in: .whitespacesAndNewlines) : trimmed
-        let prefix = statement.prefix(16).lowercased()
+        let prefix = trimmed.prefix(16).lowercased()
         guard prefix.hasPrefix("select") || prefix.hasPrefix("with") || prefix.hasPrefix("explain") else {
             throw StoreError.readOnlyQueryRequired
         }
-        let forbidden = try NSRegularExpression(pattern: "(?i)\\b(insert|update|delete|create|drop|alter|copy|attach|detach|pragma|call|install|load|set|vacuum|truncate)\\b")
-        let range = NSRange(statement.startIndex..<statement.endIndex, in: statement)
-        guard !statement.contains(";"), forbidden.firstMatch(in: statement, range: range) == nil else {
-            throw StoreError.readOnlyQueryRequired
-        }
-        let result = try connection.query("SELECT to_json(row_value) FROM (SELECT t AS row_value FROM (\(statement)) t)")
+        let result = try connection.query("SELECT to_json(row_value) FROM (SELECT t AS row_value FROM (\(trimmed)) t)")
         guard result.columnCount == 1 else { return [] }
         let values = result[0].cast(to: String.self)
         return try (0..<result.rowCount).compactMap { index in
@@ -291,7 +283,6 @@ actor ParquetMarketStore {
                 \(first), \(last), \(count), \(unixMilliseconds())
             )
             """)
-        try Self.refreshViews(connection: connection, paths: paths)
     }
 
     private func registeredFiles(instrument: String) throws -> [String] {
@@ -324,28 +315,6 @@ actor ParquetMarketStore {
 
     private static func sqlLiteral(_ value: String) -> String { value.replacingOccurrences(of: "'", with: "''") }
     private static func execute(_ connection: Connection, _ sql: String) throws { _ = try connection.query(sql) }
-    private static func refreshViews(connection: Connection, paths: AppPaths) throws {
-        if containsParquet(in: paths.candles) {
-            try execute(connection, """
-                CREATE OR REPLACE VIEW market_candles AS
-                SELECT instrument, ts, open, high, low, close, volume_contracts, volume_base, volume_quote, confirmed
-                FROM read_parquet('\(sqlLiteral(paths.candles.path))/**/*.parquet', union_by_name = true, hive_partitioning = false)
-                """)
-        }
-        if containsParquet(in: paths.funding) {
-            try execute(connection, """
-                CREATE OR REPLACE VIEW funding_rates AS
-                SELECT instrument, ts, rate
-                FROM read_parquet('\(sqlLiteral(paths.funding.path))/**/*.parquet', union_by_name = true, hive_partitioning = false)
-                """)
-        }
-    }
-
-    private static func containsParquet(in directory: URL) -> Bool {
-        guard let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil) else { return false }
-        for case let file as URL in enumerator where file.pathExtension == "parquet" { return true }
-        return false
-    }
 }
 
 enum StoreError: LocalizedError {

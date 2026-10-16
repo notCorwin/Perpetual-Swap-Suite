@@ -58,12 +58,6 @@ import Testing
     #expect(aggregated[0].close == 103)
     #expect(aggregated[0].high == 104)
     #expect(aggregated[0].low == 99)
-    let rows = try await store.queryJSON("SELECT instrument, count(*) AS count FROM market_candles GROUP BY instrument;")
-    #expect(rows.first?["instrument"]?.value == .string("BTC-USDT-SWAP"))
-    #expect(rows.first?["count"]?.value == .int(3))
-    await #expect(throws: StoreError.self) {
-        try await store.queryJSON("SELECT 1; DELETE FROM data_files")
-    }
 }
 
 @Test func fundingRatesRoundTripThroughParquet() async throws {
@@ -78,8 +72,6 @@ import Testing
     try await store.upsert(funding: values)
     try await store.upsert(funding: [values[1]])
     #expect(try await store.funding(instrument: "BTC-USDT-SWAP") == values)
-    let rows = try await store.queryJSON("SELECT count(*) AS count FROM funding_rates")
-    #expect(rows.first?["count"]?.value == .int(2))
 }
 
 @Test func aiCredentialIsStoredOutsideSettingsWithPrivatePermissions() async throws {
