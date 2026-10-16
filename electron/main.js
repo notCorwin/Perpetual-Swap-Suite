@@ -36,6 +36,21 @@ async function saveSettings(value) {
   return next
 }
 
+function preferences(saved) {
+  try { return saved.filterLibraryPreferencesJSON ? JSON.parse(saved.filterLibraryPreferencesJSON) : { favorites: [], recent: [], layout: 'sentences' } }
+  catch { return { favorites: [], recent: [], layout: 'sentences' } }
+}
+
+async function snapshot() {
+  const saved = await settings()
+  return {
+    ...saved, rows: [], updatedAt: null, error: '', revision: 0,
+    filterMetricsCatalog: [], filterFunctions: [], filterFunctionCatalog: [],
+    filterLibraryPreferences: preferences(saved), notificationAuthorization: 'unavailable',
+    notificationError: '', backgroundMonitoringError: '', launchAtLogin: 'unavailable', launchAtLoginError: '',
+  }
+}
+
 function headersFor(response) { return Object.fromEntries(response.headers.entries()) }
 
 async function gatewayFetch(event, value) {
@@ -77,6 +92,19 @@ async function handleRequest(event, request) {
     if (request.e2e.action === 'settings') return settings()
     throw new Error('Unknown E2E desktop action.')
   }
+  if ('suite' in request) {
+    return { profiles: [], selectedID: '', confirmed: [], provisional: [], rows: [], revision: 0, timeframe: request.suite.timeframe }
+  }
+  if ('research' in request) return { studies: [], job: null, ok: true }
+  if ('foregroundWorkspace' in request) return { ok: true }
+  if ('rocPeriod' in request) return snapshot()
+  if ('compileMarketFilters' in request) {
+    const source = request.compileMarketFilters
+    const configJSON = source.filtersJSON ?? source.previousJSON ?? ''
+    return { diagnostics: configJSON ? [] : ['A rule configuration is required.'], configJSON, expressions: {}, units: {}, requiredHours: 0 }
+  }
+  if ('previewMarketFilters' in request) return { ...(await snapshot()), filterToken: request.previewMarketFilters.token, filterResults: {}, historyProgress: { pending: 0, completed: 0, error: '' } }
+  if ('explainMarketFilters' in request) return { instId: request.explainMarketFilters.instId, filterToken: request.explainMarketFilters.token, revision: 0, trace: null }
   if ('chartInstId' in request) {
     const timeframe = request.timeframe ?? '1H'
     const candles = await marketStore.candles({ instrument: request.chartInstId, timeframe })
@@ -107,8 +135,8 @@ async function handleRequest(event, request) {
   if ('windowTintRGB' in request || 'previewWindowBlur' in request) return { ok: true }
   const keys = Object.keys(request)
   if (keys.some(key => key in defaults || key === 'filterLibraryPreferencesJSON')) {
-    const next = await saveSettings(request)
-    return { ...next, rows: [], updatedAt: null, error: '', revision: 0, filterMetricsCatalog: [], filterFunctions: [], filterFunctionCatalog: [], filterLibraryPreferences: { collapsedGroups: [] } }
+    await saveSettings(request)
+    return snapshot()
   }
   return unsupported(request)
 }
