@@ -19,7 +19,6 @@ const markets: MarketSummary[] = marketSeeds.map(([base, last, change, volume, o
     tickSize: last > 100 ? 0.1 : 0.0001, lotSize: 1, listedAt: now - 500 * 86_400_000, state: 'live',
   },
   last, change24hPercent: change, volume24hUSDT: volume, openInterestUSDT: oi, fundingRatePercent: 0.01,
-  hourlyVolumeRatio: 1.42 + index * 0.05,
   liquidity: {
     spreadPercent: 0.012 + index * 0.003, bidDepthUSDT: 388_000 - index * 19_000,
     askDepthUSDT: 402_000 - index * 21_000, buySlippagePercent: 0.031 + index * 0.004,

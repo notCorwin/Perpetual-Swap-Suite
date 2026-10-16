@@ -31,11 +31,6 @@ export default function App() {
     return () => window.removeEventListener('resize', resize)
   }, [])
 
-  useLayoutEffect(() => {
-    document.documentElement.dataset.appearance = snapshot.settings.appearance
-    document.documentElement.style.colorScheme = snapshot.settings.appearance === 'system' ? 'light dark' : snapshot.settings.appearance
-  }, [snapshot.settings.appearance])
-
   const setTimeframe = (value: Timeframe | null) => {
     if (!value) return
     void workspace.saveSettings({ ...snapshot.settings, selectedTimeframe: value })
@@ -64,7 +59,7 @@ export default function App() {
       <main className="three-column-workspace">
         <MarketSidebar markets={snapshot.markets} selected={snapshot.selectedInstrument} onSelect={instrument => void workspace.select(instrument)} />
         <Suspense fallback={<div className="chart-loading">Loading chart…</div>}><MarketChart market={market} candles={snapshot.candles} forming={snapshot.formingCandle} timeframe={snapshot.settings.selectedTimeframe} markers={report?.markers ?? []} /></Suspense>
-        <InspectorPanel snapshot={snapshot} report={report} onReport={setReport} onValidate={workspace.validate} onSaveSettings={workspace.saveSettings} />
+        <InspectorPanel snapshot={snapshot} report={report} onReport={setReport} onValidate={workspace.validate} />
       </main>
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={snapshot.settings} onSave={workspace.saveSettings} />
     </div>

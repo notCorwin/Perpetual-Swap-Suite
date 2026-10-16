@@ -25,7 +25,7 @@ import Testing
     #expect(reading.sellSlippagePercent! > 0)
 }
 
-@Test func settingsPersistInJSON() async throws {
+@Test func settingsPersistWithoutSQLite() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
     defer { try? FileManager.default.removeItem(at: root) }
     let paths = try AppPaths(root: root)
@@ -58,31 +58,4 @@ import Testing
     #expect(aggregated[0].close == 103)
     #expect(aggregated[0].high == 104)
     #expect(aggregated[0].low == 99)
-}
-
-@Test func fundingRatesRoundTripThroughParquet() async throws {
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-    defer { try? FileManager.default.removeItem(at: root) }
-    let paths = try AppPaths(root: root)
-    let store = try ParquetMarketStore(paths: paths)
-    let values = [
-        FundingPoint(instrument: "BTC-USDT-SWAP", timestamp: 1_700_000_000_000, rate: 0.0001),
-        FundingPoint(instrument: "BTC-USDT-SWAP", timestamp: 1_700_028_800_000, rate: -0.0002),
-    ]
-    try await store.upsert(funding: values)
-    try await store.upsert(funding: [values[1]])
-    #expect(try await store.funding(instrument: "BTC-USDT-SWAP") == values)
-}
-
-@Test func aiCredentialIsStoredOutsideSettingsWithPrivatePermissions() async throws {
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-    defer { try? FileManager.default.removeItem(at: root) }
-    let paths = try AppPaths(root: root)
-    let settings = try SettingsStore(url: paths.settings)
-    let gateway = AIGateway(credentialURL: paths.aiCredential, settings: settings)
-    #expect(await gateway.status().configured == false)
-    #expect(try await gateway.save(key: " secret ").configured == true)
-    #expect(try String(contentsOf: paths.aiCredential, encoding: .utf8) == "secret")
-    let permissions = try FileManager.default.attributesOfItem(atPath: paths.aiCredential.path)[.posixPermissions] as? NSNumber
-    #expect(permissions?.intValue == 0o600)
 }

@@ -8,19 +8,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     private var webRoot: URL?
     private var backend: WorkspaceBackend?
     private var startupError: Error?
-    private lazy var checkUpdatesItem = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         do { backend = try WorkspaceBackend() } catch { startupError = error }
         configureMenus()
         configureWindow()
         loadInterface()
-        if let backend {
-            Task {
-                await backend.start()
-                if await backend.prepareAutomaticUpdate() { NSApp.terminate(nil) }
-            }
-        }
+        if let backend { Task { await backend.start() } }
     }
 
     private func configureMenus() {
@@ -28,8 +22,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         let appItem = NSMenuItem()
         let app = NSMenu(title: "Perpetual Swap Suite")
         app.addItem(withTitle: "About Perpetual Swap Suite", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
-        checkUpdatesItem.target = self
-        app.addItem(checkUpdatesItem)
         app.addItem(.separator())
         app.addItem(withTitle: "Hide Perpetual Swap Suite", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         app.addItem(.separator())
@@ -66,7 +58,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         window.title = "Perpetual Swap Suite"
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
-        window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
         window.minSize = NSSize(width: 720, height: 450)
         window.contentView = WindowMaterialView(content: webView)
@@ -107,16 +98,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     ) {
         guard let request = message.body as? [String: Any] else { replyHandler(nil, BridgeError.invalidRequest.localizedDescription); return }
         guard let backend else { replyHandler(nil, startupError?.localizedDescription ?? "Native backend is unavailable."); return }
-        let method = request["method"] as? String
         Task {
             do {
                 let data = try await backend.handle(request)
-                let object = try JSONSerialization.jsonObject(with: data)
-                replyHandler(object, nil)
-                if method == "updateInstall",
-                   (object as? [String: Any])?["relaunchRequired"] as? Bool == true {
-                    NSApp.terminate(nil)
-                }
+                replyHandler(try JSONSerialization.jsonObject(with: data), nil)
             }
             catch { replyHandler(nil, error.localizedDescription) }
         }
@@ -145,31 +130,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     }
 
     func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {}
-
-    @objc private func checkForUpdates() {
-        guard let backend else { return }
-        checkUpdatesItem.isEnabled = false
-        Task {
-            defer { checkUpdatesItem.isEnabled = true }
-            do {
-                let data = try await backend.handle(["method": "updateCheck"])
-                let status = try JSONDecoder().decode(AppUpdateStatus.self, from: data)
-                let alert = NSAlert()
-                alert.messageText = status.state == "available" ? "Update Available" : "Perpetual Swap Suite"
-                alert.informativeText = status.message
-                if status.state == "available" {
-                    alert.addButton(withTitle: "Install and Relaunch")
-                    alert.addButton(withTitle: "Later")
-                    if alert.runModal() == .alertFirstButtonReturn {
-                        let installed = try JSONDecoder().decode(AppUpdateStatus.self, from: await backend.handle(["method": "updateInstall"]))
-                        if installed.relaunchRequired { NSApp.terminate(nil) }
-                    }
-                } else { alert.runModal() }
-            } catch {
-                let alert = NSAlert(); alert.messageText = "Update Check Failed"; alert.informativeText = error.localizedDescription; alert.runModal()
-            }
-        }
-    }
 }
 
 let application = NSApplication.shared

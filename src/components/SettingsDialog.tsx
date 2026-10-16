@@ -33,7 +33,6 @@ function SettingsForm({ settings, onSave, onClose }: { settings: AppSettings; on
           <Dialog.Description className="dialog-description">Liquidity, simulation, and application defaults are persisted outside the market database.</Dialog.Description>
           <div className="settings-grid">
             <SettingsGroup title="Liquidity">
-              <label className="setting-field"><span>Settlement currencies</span><div className="wide-setting-input"><Input value={draft.settlementCurrencies.join(', ')} onChange={event => setDraft(current => ({ ...current, settlementCurrencies: event.target.value.split(',').map(value => value.trim().toUpperCase()).filter(Boolean) }))} /></div></label>
               <Setting label="Maximum spread" suffix="%"><Input type="number" step="0.01" {...number('spreadLimitPercent')} /></Setting>
               <Setting label="Depth range" suffix="%"><Input type="number" step="0.1" {...number('depthRangePercent')} /></Setting>
               <Setting label="Minimum side depth" suffix="USDT"><Input type="number" step="1000" {...number('minimumSideDepthUSDT')} /></Setting>
@@ -49,12 +48,6 @@ function SettingsForm({ settings, onSave, onClose }: { settings: AppSettings; on
               <Setting label="Stop loss on margin" suffix="%"><Input type="number" step="1" {...number('stopLossMarginPercent')} /></Setting>
               <Setting label="Taker fee" suffix="%"><Input type="number" step="0.01" {...number('takerFeePercent')} /></Setting>
               <label className="setting-switch"><span><strong>Hourly volume stability</strong><small>Require max / min below {draft.maximumHourlyVolumeRatio}</small></span><Switch.Root className="switch-root" checked={draft.volumeStabilityEnabled} onCheckedChange={value => setDraft(current => ({ ...current, volumeStabilityEnabled: value }))}><Switch.Thumb className="switch-thumb" /></Switch.Root></label>
-            </SettingsGroup>
-            <SettingsGroup title="Application">
-              <label className="setting-switch"><span><strong>Continue in background</strong><small>Closing the window keeps market collection active</small></span><Switch.Root className="switch-root" checked={draft.backgroundEnabled} onCheckedChange={value => setDraft(current => ({ ...current, backgroundEnabled: value }))}><Switch.Thumb className="switch-thumb" /></Switch.Root></label>
-              <label className="setting-switch"><span><strong>Launch at login</strong><small>Start the main application after signing in</small></span><Switch.Root className="switch-root" checked={draft.launchAtLogin} onCheckedChange={value => setDraft(current => ({ ...current, launchAtLogin: value }))}><Switch.Thumb className="switch-thumb" /></Switch.Root></label>
-              <label className="setting-switch"><span><strong>Automatic updates</strong><small>Install the newest main-branch build</small></span><Switch.Root className="switch-root" checked={draft.automaticUpdatesEnabled} onCheckedChange={value => setDraft(current => ({ ...current, automaticUpdatesEnabled: value }))}><Switch.Thumb className="switch-thumb" /></Switch.Root></label>
-              <div className="appearance-setting"><span>Appearance</span><div>{(['system', 'light', 'dark'] as const).map(value => <Button key={value} className="appearance-choice" data-selected={draft.appearance === value || undefined} onClick={() => setDraft(current => ({ ...current, appearance: value }))}>{value[0].toUpperCase() + value.slice(1)}</Button>)}</div></div>
             </SettingsGroup>
           </div>
           <div className="dialog-actions"><Dialog.Close className="secondary-button">Cancel</Dialog.Close><Button className="primary-button" disabled={saving} onClick={() => void save()}>{saving ? 'Saving…' : 'Save settings'}</Button></div>

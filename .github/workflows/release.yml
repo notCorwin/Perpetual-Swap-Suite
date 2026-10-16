@@ -30,17 +30,23 @@ jobs:
         shell: bash
         run: |
           app='.build/app/Perpetual Swap Suite.app'
-          test -x "$app/Contents/MacOS/PerpetualSwapSuite"
-          test -x "$app/Contents/Resources/Node/node"
-          test -s "$app/Contents/Resources/Node/strategy-host.mjs"
+          test -x "$app/Contents/MacOS/PerpetualRadar"
+          test -s "$app/Contents/Resources/Assets.car"
           test -s "$app/Contents/Resources/Web/index.html"
           test -d "$app/Contents/Resources/Web/assets"
           test "$(cat "$app/Contents/PkgInfo")" = 'APPL????'
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = com.perpetualswapsuite.macos
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = com.perpetualradar.macos
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$app/Contents/Info.plist")" = AppIcon
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleSourceRevision' "$app/Contents/Info.plist")" = "$GITHUB_SHA"
+          helper="$app/Contents/Library/LoginItems/Perpetual Swap Suite Monitor.app"
+          test -x "$helper/Contents/MacOS/PerpetualRadar"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$helper/Contents/Info.plist")" = com.perpetualradar.macos.monitor
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$helper/Contents/Info.plist")" = true
           codesign --verify --deep --strict "$app"
+          # Keep the historical .tar asset URL so already-installed versions can
+          # update, while gzip-compressing its contents to reduce transfer time.
           tar -czf Perpetual.Swap.Suite.app.tar -C .build/app 'Perpetual Swap Suite.app'
-          tar -tf Perpetual.Swap.Suite.app.tar | grep -qx 'Perpetual Swap Suite.app/Contents/MacOS/PerpetualSwapSuite'
+          tar -tf Perpetual.Swap.Suite.app.tar | grep -qx 'Perpetual Swap Suite.app/Contents/MacOS/PerpetualRadar'
           sha256="$(shasum -a 256 Perpetual.Swap.Suite.app.tar | cut -d' ' -f1)"
           built_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           repository_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"

@@ -35,24 +35,6 @@ struct Candle: Codable, Hashable, Sendable {
     let confirmed: Bool
 }
 
-struct FundingPoint: Codable, Hashable, Sendable {
-    let instrument: String
-    let timestamp: Int64
-    let rate: Double
-}
-
-struct DataSyncStatus: Codable, Hashable, Sendable {
-    var active = false
-    var instruments: [String] = []
-    var completedInstruments = 0
-    var currentInstrument: String?
-    var downloadedCandles = 0
-    var downloadedFundingRates = 0
-    var startedAt: Int64?
-    var finishedAt: Int64?
-    var error: String?
-}
-
 struct Instrument: Codable, Hashable, Sendable {
     let id: String
     let baseCurrency: String
@@ -93,7 +75,6 @@ struct MarketSummary: Codable, Hashable, Sendable {
     let volume24hUSDT: Double?
     let openInterestUSDT: Double?
     let fundingRatePercent: Double?
-    let hourlyVolumeRatio: Double?
     let liquidity: LiquidityReading
     let eligible: Bool
     let missingRequirements: [String]

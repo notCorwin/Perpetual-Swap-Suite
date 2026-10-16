@@ -33,11 +33,10 @@ struct BacktestEngine: Sendable {
         instrument: Instrument,
         settings: AppSettings,
         candles: [Candle],
-        funding: [FundingPoint] = [],
         execute: StrategyExecutor
     ) async throws -> BacktestReport {
         let started = ContinuousClock.now
-        var simulation = Simulation(request: request, instrument: instrument, settings: settings, fundingPoints: funding)
+        var simulation = Simulation(request: request, instrument: instrument, settings: settings)
         let source = candles.filter(\.confirmed).sorted { $0.timestamp < $1.timestamp }
         guard !source.isEmpty else { throw BacktestError.noData }
 
@@ -52,7 +51,6 @@ struct BacktestEngine: Sendable {
             for tick in TradingViewPath.ticks(for: candle) {
                 simulation.sequence += 1
                 simulation.updateBar(candle: candle, tick: tick)
-                simulation.applyFunding(through: tick.timestamp, price: tick.price)
                 let fills = simulation.processOrders(at: tick)
                 simulation.checkLiquidation(at: tick)
                 simulation.markToMarket(price: tick.price, timestamp: tick.timestamp)
@@ -134,30 +132,13 @@ private struct Simulation {
     var maximumDrawdownPercent = 0.0
     var lastPrice = 0.0
     var lastTimestamp: Int64 = 0
-    let fundingPoints: [FundingPoint]
-    var fundingIndex = 0
 
-    init(request: BacktestRequest, instrument: Instrument, settings: AppSettings, fundingPoints: [FundingPoint]) {
+    init(request: BacktestRequest, instrument: Instrument, settings: AppSettings) {
         self.request = request
         self.instrument = instrument
         self.settings = settings
-        self.fundingPoints = fundingPoints.sorted { $0.timestamp < $1.timestamp }
         cash = settings.initialCapitalUSDT
         peakEquity = settings.initialCapitalUSDT
-    }
-
-    mutating func applyFunding(through timestamp: Int64, price: Double) {
-        while fundingIndex < fundingPoints.count, fundingPoints[fundingIndex].timestamp <= timestamp {
-            let point = fundingPoints[fundingIndex]
-            fundingIndex += 1
-            guard var current = position, point.timestamp >= current.entryAt else { continue }
-            let notional = current.quantity * instrument.contractValue * price
-            let payment = notional * point.rate * (current.direction == .long ? 1 : -1)
-            cash -= payment
-            funding += payment
-            current.funding += payment
-            position = current
-        }
     }
 
     mutating func updateBar(candle: Candle, tick: BrokerTick) {
@@ -441,8 +422,7 @@ private struct Simulation {
             maximumDrawdownPercent: maximumDrawdownPercent, totalTrades: trades.count,
             winningTrades: wins, losingTrades: losses,
             liquidations: trades.filter(\.liquidated).count, trades: sorted, markers: markers,
-            warnings: ["5m OHLC broker emulation does not model queue position or historical order-book capacity."]
-                + (fundingPoints.isEmpty ? ["Historical funding is shown as zero until the local funding series covers the selected range."] : []),
+            warnings: ["5m OHLC broker emulation does not model queue position or historical order-book capacity.", "Historical funding is shown as zero until the local funding series covers the selected range."],
             elapsedMS: elapsedMS
         )
     }

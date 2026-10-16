@@ -51,60 +51,6 @@ actor ParquetMarketStore {
         for (key, values) in grouped { try rewritePartition(key: key, adding: values) }
     }
 
-    func upsert(funding points: [FundingPoint]) throws {
-        guard !points.isEmpty else { return }
-        for (instrument, values) in Dictionary(grouping: points, by: \.instrument) {
-            let directory = paths.funding.appendingPathComponent("instrument=\(instrument)", isDirectory: true)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let target = directory.appendingPathComponent("funding.parquet")
-            let temporary = directory.appendingPathComponent(".\(UUID().uuidString).parquet")
-            let table = "funding_\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
-            defer { try? Self.execute(connection, "DROP TABLE IF EXISTS \(table)"); try? FileManager.default.removeItem(at: temporary) }
-            try Self.execute(connection, "CREATE TEMP TABLE \(table) (instrument VARCHAR, ts BIGINT, rate DOUBLE)")
-            let statement = try PreparedStatement(connection: connection, query: "INSERT INTO \(table) VALUES ($1,$2,$3)")
-            for point in values {
-                try statement.bind(point.instrument, at: 1)
-                try statement.bind(point.timestamp, at: 2)
-                try statement.bind(point.rate, at: 3)
-                _ = try statement.execute()
-            }
-            let existing = FileManager.default.fileExists(atPath: target.path)
-                ? "SELECT instrument, ts, rate FROM read_parquet('\(Self.sqlLiteral(target.path))', hive_partitioning = false) UNION ALL"
-                : ""
-            try Self.execute(connection, """
-                COPY (
-                    SELECT instrument, ts, rate FROM (\(existing) SELECT * FROM \(table)) combined
-                    QUALIFY row_number() OVER (PARTITION BY instrument, ts ORDER BY ts) = 1
-                    ORDER BY ts
-                ) TO '\(Self.sqlLiteral(temporary.path))' (FORMAT PARQUET, COMPRESSION ZSTD)
-                """)
-            if FileManager.default.fileExists(atPath: target.path) { _ = try FileManager.default.replaceItemAt(target, withItemAt: temporary) }
-            else { try FileManager.default.moveItem(at: temporary, to: target) }
-            let stats = try connection.query("SELECT min(ts), max(ts), count(*) FROM read_parquet('\(Self.sqlLiteral(target.path))', hive_partitioning = false)")
-            try Self.execute(connection, """
-                INSERT OR REPLACE INTO data_files VALUES (
-                    '\(Self.sqlLiteral(target.path))', '\(Self.sqlLiteral(instrument))', 'funding',
-                    \(stats[0].cast(to: Int64.self)[0] ?? 0), \(stats[1].cast(to: Int64.self)[0] ?? 0),
-                    \(stats[2].cast(to: Int64.self)[0] ?? 0), \(unixMilliseconds())
-                )
-                """)
-        }
-    }
-
-    func funding(instrument: String, from: Int64? = nil, through: Int64? = nil) throws -> [FundingPoint] {
-        let result = try connection.query("SELECT path FROM data_files WHERE instrument = '\(Self.sqlLiteral(instrument))' AND timeframe = 'funding' LIMIT 1")
-        guard result.rowCount > 0, let path = result[0].cast(to: String.self)[0], FileManager.default.fileExists(atPath: path) else { return [] }
-        var predicates = ["instrument = '\(Self.sqlLiteral(instrument))'"]
-        if let from { predicates.append("ts >= \(from)") }
-        if let through { predicates.append("ts <= \(through)") }
-        let rows = try connection.query("SELECT instrument, ts, rate FROM read_parquet('\(Self.sqlLiteral(path))', hive_partitioning = false) WHERE \(predicates.joined(separator: " AND ")) ORDER BY ts")
-        let instruments = rows[0].cast(to: String.self), timestamps = rows[1].cast(to: Int64.self), rates = rows[2].cast(to: Double.self)
-        return (0..<rows.rowCount).compactMap { index in
-            guard let instrument = instruments[index], let timestamp = timestamps[index], let rate = rates[index] else { return nil }
-            return .init(instrument: instrument, timestamp: timestamp, rate: rate)
-        }
-    }
-
     func candles(
         instrument: String,
         timeframe: Timeframe = .fiveMinutes,
@@ -157,23 +103,6 @@ actor ParquetMarketStore {
             gaps += 1
         }
         return .init(instrument: instrument, from: first.timestamp, through: last.timestamp, candleCount: values.count, gaps: gaps)
-    }
-
-    func hourlyVolumeRatio(instrument: String) throws -> Double? {
-        let values = try candles(instrument: instrument, limit: 288)
-        let groups = Dictionary(grouping: values) { $0.timestamp / Timeframe.oneHour.milliseconds }
-        let completed = groups.values
-            .filter { $0.count == 12 }
-            .sorted { ($0.first?.timestamp ?? 0) < ($1.first?.timestamp ?? 0) }
-            .suffix(24)
-        guard completed.count == 24 else { return nil }
-        let volumes = completed.map { candles in
-            candles.reduce(0) { total, candle in
-                total + (candle.volumeQuote ?? candle.volumeBase.map { $0 * candle.close } ?? candle.volumeContracts)
-            }
-        }
-        guard let minimum = volumes.min(), let maximum = volumes.max(), minimum > 0 else { return nil }
-        return maximum / minimum
     }
 
     func queryJSON(_ sql: String) throws -> [[String: AnyCodable]] {

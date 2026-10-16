@@ -1,5 +1,5 @@
 import { mockSnapshot } from '../mock-data'
-import type { AppSettings, BacktestReport, BacktestRequest, DataSyncStatus, StrategyDocument, StrategySummary, ValidationReport, WorkspaceSnapshot } from '../types'
+import type { AppSettings, BacktestReport, BacktestRequest, StrategyDocument, StrategySummary, ValidationReport, WorkspaceSnapshot } from '../types'
 
 type NativeBridge = { postMessage(request: Record<string, unknown>): Promise<unknown> }
 
@@ -96,52 +96,4 @@ function mockBacktest(request: BacktestRequest): BacktestReport {
     })),
     warnings: ['5m OHLC broker emulation does not model queue position or historical order-book capacity.'], elapsedMS: 284,
   }
-}
-
-let previewSync: DataSyncStatus = { active: false, instruments: [], completedInstruments: 0, currentInstrument: null, downloadedCandles: 0, downloadedFundingRates: 0, startedAt: null, finishedAt: null, error: null }
-
-export async function startDataSync(instruments: string[]): Promise<DataSyncStatus> {
-  const bridge = window.webkit?.messageHandlers.suite
-  if (!bridge) {
-    previewSync = { active: true, instruments, completedInstruments: 0, currentInstrument: instruments[0] ?? null, downloadedCandles: 18_420, downloadedFundingRates: 292, startedAt: Date.now(), finishedAt: null, error: null }
-    return previewSync
-  }
-  return await bridge.postMessage({ method: 'syncStart', instruments }) as DataSyncStatus
-}
-
-export async function dataSyncStatus(): Promise<DataSyncStatus> {
-  const bridge = window.webkit?.messageHandlers.suite
-  if (!bridge) return previewSync
-  return await bridge.postMessage({ method: 'syncStatus' }) as DataSyncStatus
-}
-
-export async function cancelDataSync(): Promise<DataSyncStatus> {
-  const bridge = window.webkit?.messageHandlers.suite
-  if (!bridge) {
-    previewSync = { ...previewSync, active: false, currentInstrument: null, finishedAt: Date.now() }
-    return previewSync
-  }
-  return await bridge.postMessage({ method: 'syncCancel' }) as DataSyncStatus
-}
-
-export async function aiCredentialStatus(): Promise<{ configured: boolean }> {
-  const bridge = window.webkit?.messageHandlers.suite
-  if (!bridge) return { configured: false }
-  return await bridge.postMessage({ method: 'aiStatus' }) as { configured: boolean }
-}
-
-export async function saveAIKey(key: string): Promise<{ configured: boolean }> {
-  const bridge = window.webkit?.messageHandlers.suite
-  if (!bridge) return { configured: Boolean(key.trim()) }
-  return await bridge.postMessage({ method: 'aiSaveKey', key }) as { configured: boolean }
-}
-
-export async function nativeAIFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-  const source = input instanceof Request ? input : new Request(input, init)
-  const body = source.body ? await source.clone().text() : null
-  const request = { url: source.url, method: source.method, headers: Object.fromEntries(source.headers.entries()), body }
-  const bridge = window.webkit?.messageHandlers.suite
-  if (!bridge) return new Response(JSON.stringify({ error: { message: 'AI requests are available in the packaged macOS application.' } }), { status: 503, headers: { 'content-type': 'application/json' } })
-  const result = await bridge.postMessage({ method: 'aiFetch', request }) as { status: number; headers: Record<string, string>; body: string }
-  return new Response(result.body, { status: result.status, headers: result.headers })
 }
