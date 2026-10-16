@@ -1,23 +1,17 @@
-// swift-tools-version: 6.1
+// swift-tools-version: 6.2
 import PackageDescription
 
 let package = Package(
-    name: "PerpetualSwapSuite",
+    name: "PerpetualRadar",
     platforms: [.macOS(.v14)],
-    products: [
-        .executable(name: "PerpetualSwapSuite", targets: ["PerpetualSwapSuite"]),
-    ],
-    dependencies: [
-        .package(url: "https://github.com/duckdb/duckdb-swift.git", exact: "1.1.3"),
-    ],
+    dependencies: [.package(url: "https://github.com/weichsel/ZIPFoundation.git", from: "0.9.20")],
     targets: [
-        .executableTarget(
-            name: "PerpetualSwapSuite",
-            dependencies: [.product(name: "DuckDB", package: "duckdb-swift")]
-        ),
-        .testTarget(
-            name: "PerpetualSwapSuiteTests",
-            dependencies: ["PerpetualSwapSuite"]
-        ),
+        .systemLibrary(name: "CSQLite"),
+        .systemLibrary(name: "CZlib"),
+        .executableTarget(name: "PerpetualRadar", dependencies: ["CSQLite", "CZlib", "ZIPFoundation"]),
+        // Exercise optimized shipping code without optimizing the assertion
+        // harness and its large embedded WebKit scripts on every test edit.
+        .testTarget(name: "PerpetualRadarTests", dependencies: ["PerpetualRadar"],
+                    swiftSettings: [.unsafeFlags(["-Onone", "-Xfrontend", "-warn-long-expression-type-checking=1000"], .when(configuration: .release))]),
     ]
 )
