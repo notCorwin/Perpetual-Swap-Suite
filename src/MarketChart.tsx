@@ -86,6 +86,7 @@ function previewChart(id: string, timeframe: RadarTimeframe): Promise<ChartRespo
 
 const compact = (value: number | null) => value === null ? "—" : new Intl.NumberFormat("en-US", { maximumSignificantDigits: 5, notation: "compact" }).format(value)
 const price = (value: number | null) => value === null ? "—" : new Intl.NumberFormat("en-US", { maximumSignificantDigits: 8 }).format(value)
+const finiteNumber = (value: number | null | undefined): value is number => typeof value === "number" && Number.isFinite(value)
 const time = (hour: number) => new Date(hour).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })
 const hourLabel = (hour: number) => new Date(hour).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })
 const chartPriceValues = (bars: Bar[]) => {
@@ -134,8 +135,8 @@ export const chartGutter = (bars: Bar[], height: number, liveClose = bars[bars.l
   const decimals = priceAxis.decimals
   const priceFormatter = new Intl.NumberFormat("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals })
   const rocAxis = rocAxisFor(bars)
-  const oiValues = bars.flatMap(bar => bar.oi === null ? [] : [bar.oi])
-  const takerAxis = chartAxisForLabels(0, Math.max(1, ...bars.map(bar => (bar.buy ?? 0) + (bar.sell ?? 0))), axisLabelLimit(panels.taker, 7))
+  const oiValues = bars.flatMap(bar => finiteNumber(bar.oi) ? [bar.oi] : [])
+  const takerAxis = chartAxisForLabels(0, Math.max(1, ...bars.map(bar => (finiteNumber(bar.buy) ? bar.buy : 0) + (finiteNumber(bar.sell) ? bar.sell : 0))), axisLabelLimit(panels.taker, 7))
   const labels = [
     ...priceAxis.ticks.map(tick => priceFormatter.format(tick)),
     formatPercent(rocAxis.max, rocAxis.decimals), formatPercent(rocAxis.min, rocAxis.decimals), "100", "0",
@@ -166,16 +167,27 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
   const priceValues = chartPriceValues(bars)
   const indicatorReady = (key: keyof Bar) => completeIndicatorSeries(bars, key)
   const bandsReady = indicatorReady('logBBUpper') && indicatorReady('logBBMiddle') && indicatorReady('logBBLower')
-  const takerReady = indicatorReady('buy') && indicatorReady('sell')
+  const oiComplete = indicatorReady('oi')
+  const takerComplete = indicatorReady('buy') && indicatorReady('sell')
   const priceMin = Math.min(...priceValues), priceMax = Math.max(...priceValues)
   const priceAxis = logarithmicChartAxis(priceMin, priceMax, axisLabelLimit(panels.price, 9))
   const highIndex = bars.findIndex(bar => bar.high === candleHigh), lowIndex = bars.findIndex(bar => bar.low === candleLow)
   const priceDecimals = priceAxis.decimals
   const axisPrice = new Intl.NumberFormat("en-US", { minimumFractionDigits: priceDecimals, maximumFractionDigits: priceDecimals })
   const rocAxis = rocAxisFor(bars)
-  const oiValues = indicatorReady('oi') ? bars.flatMap(bar => bar.oi === null ? [] : [bar.oi]) : []
+  // Statistics arrive independently from candles. A partially hydrated
+  // viewport is still useful data: draw the known OI/Taker samples and leave
+  // a visible gap for unknown points instead of hiding the whole panel.
+  const oiSamples = bars.flatMap((bar, index) => finiteNumber(bar.oi) ? [{ index, value: bar.oi }] : [])
+  const oiValues = oiSamples.map(sample => sample.value)
   const oiAxis = oiValues.length ? logarithmicChartAxis(Math.min(...oiValues), Math.max(...oiValues), axisLabelLimit(panels.oi, 7), true) : null
-  const maxTaker = takerReady ? Math.max(1, ...bars.map(bar => (bar.buy ?? 0) + (bar.sell ?? 0))) : 1
+  const takerSamples = bars.flatMap((bar, index) => {
+    const buy = finiteNumber(bar.buy) ? bar.buy : 0
+    const sell = finiteNumber(bar.sell) ? bar.sell : 0
+    return buy > 0 || sell > 0 ? [{ index, buy, sell }] : []
+  })
+  const takerAvailable = takerSamples.length > 0
+  const maxTaker = takerAvailable ? Math.max(1, ...takerSamples.map(sample => sample.buy + sample.sell)) : 1
   const takerAxis = chartAxisForLabels(0, maxTaker, axisLabelLimit(panels.taker, 7))
   const scale = (value: number, min: number, max: number, panel: readonly [number, number]) =>
     panel[1] - (value - min) / (max - min || 1) * (panel[1] - panel[0])
@@ -276,10 +288,10 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
     bodies.push(rectangle(center - barWidth / 2, top, barWidth, Math.max(1.5, priceY(Math.min(bar.open, bar.close)) - top)))
     const volumeCenter = x(index, "taker")
     const volumeX = volumeCenter - barWidth / 2
-    const buy = bar.buy ?? 0, sell = bar.sell ?? 0
+    const buy = finiteNumber(bar.buy) ? bar.buy : 0, sell = finiteNumber(bar.sell) ? bar.sell : 0
     const zeroY = takerY(0), buyY = takerY(buy), totalY = takerY(buy + sell)
-    if (takerReady && buy > 0) buys.push(rectangle(volumeX, buyY, barWidth, zeroY - buyY))
-    if (takerReady && sell > 0) sells.push(rectangle(volumeX, totalY, barWidth, buyY - totalY))
+    if (takerAvailable && buy > 0) buys.push(rectangle(volumeX, buyY, barWidth, zeroY - buyY))
+    if (takerAvailable && sell > 0) sells.push(rectangle(volumeX, totalY, barWidth, buyY - totalY))
   }
   const panelKeys: Panel[] = ["price", "roc", "rsi", "oi", "taker"]
   const grid = panelKeys.flatMap(key => panels[key].map((y, index) =>
@@ -333,9 +345,11 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
     <path d={downWicks.join(" ")} fill="none" stroke="var(--destructive)" strokeWidth="1.2" />
     <path d={upBodies.join(" ")} fill="var(--positive)" />
     <path d={downBodies.join(" ")} fill="var(--destructive)" />
-    <path d={buys.join(" ")} fill="var(--positive)" opacity="0.9" />
-    <path d={sells.join(" ")} fill="var(--destructive)" opacity="0.9" />
-    <path d={sells.join(" ")} fill="url(#sell-hatch)" opacity="0.7" />
+    <g data-chart-taker={takerComplete ? "complete" : takerAvailable ? "partial" : "empty"}>
+      <path data-chart-taker-buy-samples={buys.length} d={buys.join(" ")} fill="var(--positive)" opacity="0.9" />
+      <path data-chart-taker-sell-samples={sells.length} d={sells.join(" ")} fill="var(--destructive)" opacity="0.9" />
+      <path d={sells.join(" ")} fill="url(#sell-hatch)" opacity="0.7" />
+    </g>
     {bandsReady && <>{lineStroke(priceLine("logBBUpper"), "var(--chart-1)", indicatorWidth, 0.62)}{lineStroke(priceLine("logBBMiddle"), "var(--chart-1)")}{lineStroke(priceLine("logBBLower"), "var(--chart-1)", indicatorWidth, 0.62)}</>}
     {indicatorReady('vwap') && lineStroke(priceLine("vwap"), "var(--chart-2)")}
     {indicatorReady('ema') && lineStroke(priceLine("ema"), "var(--chart-3)", indicatorWidth, 0.9)}
@@ -344,7 +358,10 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
     {indicatorReady('rsi24') && lineStroke(line("rsi24", "rsi", rsiY), "var(--chart-3)", indicatorWidth, 1, "1 4")}
     {indicatorReady('roc') && lineStroke(line("roc", "roc", value => scale(value, rocAxis.min, rocAxis.max, panels.roc)), "var(--chart-1)")}
     {indicatorReady('maroc') && lineStroke(line("maroc", "roc", value => scale(value, rocAxis.min, rocAxis.max, panels.roc)), "var(--chart-2)", indicatorWidth, 1, "7 4")}
-    {oiAxis && indicatorReady('oi') && lineStroke(line("oi", "oi", oiY), "var(--chart-2)")}
+    {oiAxis && <g data-chart-oi={oiComplete ? "complete" : "partial"} data-chart-oi-samples={oiSamples.length}>
+      {lineStroke(line("oi", "oi", oiY), "var(--chart-2)")}
+      {!oiComplete && oiSamples.map(sample => <circle key={bars[sample.index].hour} data-chart-oi-sample cx={x(sample.index, "oi")} cy={oiY(sample.value)} r="2" fill="var(--chart-2)" />)}
+    </g>}
     {inspected !== null && panelKeys.map(key => <line key={key} x1={x(inspected, key)} x2={x(inspected, key)} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--foreground)" strokeWidth="0.65" strokeDasharray="3 5" opacity="0.3" />)}
     {([[highIndex, candleHigh, "high"], [lowIndex, candleLow, "low"]] as const).map(([index, value, kind]) => {
       const markerX = x(index, "price"), label = price(value)
@@ -363,8 +380,8 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
     {legend("price", [["VWAP14", price(indicatorReady('vwap') ? active.vwap : null), "var(--chart-2)"], ["EMA200", price(indicatorReady('ema') ? active.ema : null), "var(--chart-3)"], ["Log BB(20)", bandsReady ? `U ${price(active.logBBUpper)}\u00a0·\u00a0M ${price(active.logBBMiddle)}\u00a0·\u00a0L ${price(active.logBBLower)}` : "—", "var(--chart-1)"]])}
     {legend("roc", [["ROC(9)", indicatorReady('roc') ? formatPercent(active.roc) : "—", "var(--chart-1)"], ["MAROC(9)", indicatorReady('maroc') ? formatPercent(active.maroc) : "—", "var(--chart-2)"]])}
     {legend("rsi", [["RSI(6)", indicatorReady('rsi6') ? active.rsi6?.toFixed(1) ?? "—" : "—", "var(--chart-1)"], ["RSI(12)", indicatorReady('rsi12') ? active.rsi12?.toFixed(1) ?? "—" : "—", "var(--chart-2)"], ["RSI(24)", indicatorReady('rsi24') ? active.rsi24?.toFixed(1) ?? "—" : "—", "var(--chart-3)"]])}
-    {legend("oi", [["OI (Contracts)", indicatorReady('oi') ? compact(active.oi) : "—", "var(--chart-2)"]])}
-    {legend("taker", [["Taker Buy (Contracts)", takerReady ? compact(active.buy) : "—", "var(--positive)"], ["Taker Sell (Contracts)", takerReady ? compact(active.sell) : "—", "var(--destructive)"]])}
+    {legend("oi", [["OI (Contracts)", finiteNumber(active.oi) ? compact(active.oi) : oiValues.length ? "Loading…" : "—", "var(--chart-2)"]])}
+    {legend("taker", [["Taker Buy (Contracts)", finiteNumber(active.buy) ? compact(active.buy) : takerAvailable ? "Loading…" : "—", "var(--positive)"], ["Taker Sell (Contracts)", finiteNumber(active.sell) ? compact(active.sell) : takerAvailable ? "Loading…" : "—", "var(--destructive)"]])}
     {panels.rsi[1] - panels.rsi[0] >= 35 && <>{lineLabel(axisStarts.rsi, panels.rsi[0], "100")}{lineLabel(axisStarts.rsi, panels.rsi[1], "0")}</>}
     {panels.roc[1] - panels.roc[0] >= 35 && <>{lineLabel(axisStarts.roc, panels.roc[0], formatPercent(rocAxis.max, rocAxis.decimals))}{lineLabel(axisStarts.roc, panels.roc[1], formatPercent(rocAxis.min, rocAxis.decimals))}</>}
     {oiAxis && panels.oi[1] - panels.oi[0] >= 35 && oiAxis.ticks.map(tick => <g key={tick}><line x1={columns.oi[0]} x2={right} y1={oiY(tick)} y2={oiY(tick)} stroke="var(--border)" strokeOpacity="0.25" />{lineLabel(axisStarts.oi, oiY(tick), compact(tick))}</g>)}

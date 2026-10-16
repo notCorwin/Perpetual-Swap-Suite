@@ -9,6 +9,8 @@ import { MarketService } from './services/market-service.js'
 const root = fileURLToPath(new URL('..', import.meta.url))
 const rendererURL = process.env.ELECTRON_RENDERER_URL
 const testMode = process.env.PERPETUAL_SWAP_E2E === '1'
+const FIVE_MINUTES = 300_000
+const HOUR = 3_600_000
 const settingsFile = () => join(app.getPath('userData'), 'settings.json')
 let window
 let marketStore
@@ -17,6 +19,15 @@ const gatewayRequests = new Map()
 const chartFocus = new ChartFocus()
 let shuttingDown = false
 let shutdownComplete = false
+
+// Electron E2E tests must never depend on OKX availability or mutate the
+// fixture while the renderer is asserting a loading/partial-data state.
+const offlineE2EFetch = async () => ({
+  status: 200,
+  ok: true,
+  headers: { get: () => null },
+  json: async () => ({ code: '0', data: [] }),
+})
 
 const defaults = {
   windowBlurRadius: 64,
@@ -99,6 +110,65 @@ async function gatewayFetch(event, value) {
   } catch (error) { gatewayRequests.delete(id); throw error }
 }
 
+async function seedPartialStatisticsChart() {
+  const instId = 'BTC-USDT-SWAP'
+  const timeframe = '1H'
+  const end = Date.UTC(2024, 11, 16, 12, 0)
+  const warmupHours = 199
+  const visibleBars = 96
+  const partialSamples = 8
+  const sourceStart = end - (visibleBars - 1 + warmupHours) * HOUR
+  const source = []
+  for (let timestamp = sourceStart; timestamp <= end + HOUR - FIVE_MINUTES; timestamp += FIVE_MINUTES) {
+    const index = (timestamp - sourceStart) / FIVE_MINUTES
+    const base = 100 + index * 0.01
+    source.push({
+      instrument: instId, timeframe: '5m', timestamp,
+      open: base, high: base + 1, low: base - 1, close: base + 0.25,
+      volume: 10, quoteVolume: 1_000, confirmed: true,
+    })
+  }
+  const statistics = Array.from({ length: visibleBars }, (_, index) => {
+    const sourceHour = warmupHours + index
+    const base = 100 + sourceHour * 0.12
+    const available = index >= visibleBars - partialSamples
+    return {
+      instrument: instId, timeframe, timestamp: end - (visibleBars - 1 - index) * HOUR,
+      open: base, high: base + 1.11, low: base - 1, close: base + 0.36,
+      volume: 120, quoteVolume: 12_000,
+      oi: available ? 1_000_000 + index * 1_000 : null,
+      buy: available ? 100_000 + index * 100 : null,
+      sell: available ? 80_000 + index * 100 : null,
+      statisticsVersion: available ? 1 : null,
+      confirmed: true,
+    }
+  })
+  await marketStore.appendCandles(source)
+  await marketStore.appendCandles(statistics)
+  marketService.instruments.set(instId, { instId })
+  // The source fixture is already complete; keep the latest-candle fetcher
+  // out of this test so no live response can replace its deliberate gaps.
+  marketService.lastCandleHydration.set(instId, Date.now())
+  marketService.rows = [{
+    instId, turnover24hUSDT: 40_000_000, ema200Signal: null,
+    price: 135, lastPrice: 135, priceChange: 0, currentLow: 99, currentHigh: 136,
+    buy: null, sell: null, takerRatio: null, oiChange: null,
+    highBreakout: { status: 'none' }, lowBreakdown: { status: 'none' }, highBreakout96: { status: 'none' }, lowBreakdown96: { status: 'none' },
+    roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null,
+    logBBAboveBand: null, logBBExpansion: null, rocChange: null, marocChange: null,
+    filterMetrics: {
+      liveOpen: null, liveClose: null, ema200: null, previousEMA200: null, vwap14: null,
+      bbUpper: null, bbMiddle: null, bbLower: null, priorHigh48: null, priorLow48: null,
+      priorHigh96: null, priorLow96: null, oiUSD: null, spreadPercent: null, liveVolumeUSDT: null,
+    },
+    opportunity: { direction: null, setup: null, status: 'Incomplete', score: null, components: null, reasons: [] },
+  }]
+  marketService.error = ''
+  marketService.lastRefreshAt = Date.now()
+  marketService.markChartDataChanged()
+  return { instId, timeframe, end, start: end - (visibleBars - 1) * HOUR, visibleBars, oiSamples: partialSamples, takerSamples: partialSamples }
+}
+
 function unsupported(request) {
   const operation = Object.keys(request).find(key => !['copyText', 'captureChart', 'analysisSettings', 'windowTintRGB', 'previewWindowBlur'].includes(key)) ?? 'request'
   throw new Error(`Electron data service does not yet implement “${operation}”. Configure the DuckDB/Parquet service before using market data.`)
@@ -109,6 +179,7 @@ async function handleRequest(event, request) {
   if ('e2e' in request) {
     if (!testMode) throw new Error('The E2E desktop API is unavailable outside tests.')
     if (request.e2e.action === 'seedCandles') return { written: await marketStore.appendCandles(request.e2e.candles ?? []) }
+    if (request.e2e.action === 'seedPartialStatisticsChart') return seedPartialStatisticsChart()
     if (request.e2e.action === 'settings') return settings()
     throw new Error('Unknown E2E desktop action.')
   }
@@ -211,7 +282,12 @@ async function createWindow() {
 app.whenReady().then(async () => {
   if (process.env.PERPETUAL_SWAP_USER_DATA) app.setPath('userData', process.env.PERPETUAL_SWAP_USER_DATA)
   marketStore = await MarketStore.open(join(app.getPath('userData'), 'MarketData'))
-  marketService = new MarketService(marketStore, () => ({ hourlyVolumeStabilityEnabled: settingsCache.hourlyVolumeStabilityEnabled }))
+  marketService = new MarketService(
+    marketStore,
+    () => ({ hourlyVolumeStabilityEnabled: settingsCache.hourlyVolumeStabilityEnabled }),
+    testMode ? offlineE2EFetch : fetch,
+    !testMode,
+  )
   ipcMain.handle('radar:request', handleRequest)
   await createWindow()
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) void createWindow() })

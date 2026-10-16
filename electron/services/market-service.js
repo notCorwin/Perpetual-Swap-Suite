@@ -19,6 +19,10 @@ const LATEST_CANDLE_REFRESH = 60_000
 const HISTORY_BOUNDARY_EMPTY_RESPONSES = 3
 const REQUEST_TIMEOUT = 12_000
 const REQUEST_PRIORITY = { background: 0, warmup: 1, statistics: 2, foreground: 3, repair: 4 }
+// OI/Taker values are only reusable when they came from the current direct
+// endpoint contract. Earlier builds derived them from 5m/USDT data, which is
+// neither the requested timeframe nor the requested unit.
+const STATISTICS_VERSION = 1
 const emptyBreak = { status: 'insufficient-history' }
 const incompleteOpportunity = reasons => ({ direction: null, setup: null, status: 'Incomplete', score: null, components: null, reasons })
 const sleep = (milliseconds, ...signals) => new Promise((resolve, reject) => {
@@ -124,6 +128,55 @@ function chartVisibleRange(timeframe, end) {
   }
 }
 
+function chartRepairRange(timeframe, end, repairEnd = end) {
+  const range = chartBaseRange(timeframe, end)
+  const intervalMS = timeframeMilliseconds(timeframe)
+  return {
+    ...range,
+    // The newest raw bucket can be incomplete while the last displayable
+    // bucket is still valid. Keep that tail inside the active repair range so
+    // falling back for rendering never abandons its retry.
+    through: Math.max(range.through, repairEnd + intervalMS - FIVE_MINUTES),
+  }
+}
+
+// Derived periods are rendered from confirmed 5m source candles. A direct
+// 15m/1H statistics row can exist before its complete raw source bucket does,
+// so it must never choose the latest chart end. Doing so makes the statistics
+// request target one interval to the right of the bar actually rendered.
+async function latestCompleteChartEnds(store, instrument, rawCoverage, timeframe) {
+  const rawLast = rawCoverage.last
+  if (rawLast === null) return { displayEnd: null, repairEnd: null }
+  if (timeframe === '5m') return { displayEnd: rawLast, repairEnd: rawLast }
+  const intervalMS = timeframeMilliseconds(timeframe)
+  const bucket = Math.floor(rawLast / intervalMS) * intervalMS
+  const repairEnd = rawLast >= bucket + intervalMS - FIVE_MINUTES ? bucket : bucket - intervalMS
+  if (rawCoverage.first === null || repairEnd < rawCoverage.first) return { displayEnd: null, repairEnd: null }
+
+  // `coverage.last` tells us only that the final 5m row exists. Inspect a
+  // bounded tail before treating its parent 15m/1H bucket as chartable: an
+  // internal raw gap otherwise makes aggregation silently drop that bar.
+  const searchFrom = Math.max(rawCoverage.first, repairEnd - (VISIBLE_CANDLES - 1) * intervalMS)
+  const source = await store.candles({
+    instrument,
+    timeframe: '5m',
+    from: searchFrom,
+    through: repairEnd + intervalMS - FIVE_MINUTES,
+  })
+  const timestamps = new Set(source.map(value => value.timestamp))
+  const complete = end => {
+    for (let timestamp = end; timestamp < end + intervalMS; timestamp += FIVE_MINUTES) if (!timestamps.has(timestamp)) return false
+    return true
+  }
+  for (let displayEnd = repairEnd; displayEnd >= searchFrom; displayEnd -= intervalMS) {
+    if (complete(displayEnd)) return { displayEnd, repairEnd }
+  }
+  // There is no displayable bucket in the recent chart tail. Preserve the
+  // repair target so the normal gap-retry pipeline can recover it instead of
+  // treating stale direct statistics as a valid chart.
+  return { displayEnd: repairEnd, repairEnd }
+}
+
 function requestURL(path, parameters = {}) {
   const query = new URLSearchParams(Object.entries(parameters).filter(([, value]) => value !== undefined && value !== null).map(([key, value]) => [key, String(value)]))
   return `${OKX_ORIGIN}${path}?${query}`
@@ -194,7 +247,7 @@ function aggregate(candles, period) {
     // OI and taker values are endpoint-specific snapshots, not values that can
     // be derived faithfully from 5m rows. They are hydrated directly for the
     // visible timeframe and remain null until that happens.
-    return [{ instrument: ordered[0].instrument, timeframe: period === 900_000 ? '15m' : '1H', timestamp, open: ordered[0].open, high: Math.max(...ordered.map(candle => candle.high)), low: Math.min(...ordered.map(candle => candle.low)), close: ordered.at(-1).close, volume: ordered.reduce((sum, candle) => sum + (candle.volume ?? 0), 0), quoteVolume: ordered.reduce((sum, candle) => sum + (candle.quoteVolume ?? 0), 0), oi: null, buy: null, sell: null, confirmed: true }]
+    return [{ instrument: ordered[0].instrument, timeframe: period === 900_000 ? '15m' : '1H', timestamp, open: ordered[0].open, high: Math.max(...ordered.map(candle => candle.high)), low: Math.min(...ordered.map(candle => candle.low)), close: ordered.at(-1).close, volume: ordered.reduce((sum, candle) => sum + (candle.volume ?? 0), 0), quoteVolume: ordered.reduce((sum, candle) => sum + (candle.quoteVolume ?? 0), 0), oi: null, buy: null, sell: null, statisticsVersion: null, confirmed: true }]
   })
 }
 
@@ -204,13 +257,20 @@ function candle(instrument, value) {
   return { instrument, timeframe: '5m', timestamp, open, high, low, close, volume: number(value[5]) ?? 0, quoteVolume: number(value[7]) ?? 0, confirmed: value[8] === '1' }
 }
 
-const candleFields = ['instrument', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'quoteVolume', 'oi', 'buy', 'sell', 'confirmed']
-const optionalCandleFields = new Set(['oi', 'buy', 'sell'])
+const candleFields = ['instrument', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'quoteVolume', 'oi', 'buy', 'sell', 'statisticsVersion', 'confirmed']
+const optionalCandleFields = new Set(['oi', 'buy', 'sell', 'statisticsVersion'])
 
 function mergedCandle(previous, next) {
-  if (!previous) return next
-  const merged = { ...previous, ...next }
-  for (const field of optionalCandleFields) if (next[field] === null || next[field] === undefined) merged[field] = previous[field] ?? null
+  // Raw/derived candle writes use null as “no new statistics”, so they must
+  // preserve the direct statistics already attached to that timestamp.
+  // Statistics hydration is different: an explicit null from the current
+  // direct endpoint is authoritative and must clear any legacy value. Keep
+  // that one-shot replacement instruction out of the Parquet record itself.
+  const replaceStatistics = next.replaceStatistics === true
+  const { replaceStatistics: _replaceStatistics, ...candidate } = next
+  if (!previous) return candidate
+  const merged = { ...previous, ...candidate }
+  if (!replaceStatistics) for (const field of optionalCandleFields) if (candidate[field] === null || candidate[field] === undefined) merged[field] = previous[field] ?? null
   return merged
 }
 
@@ -415,7 +475,12 @@ export class MarketService {
 
   completeStatisticsRows(rows, first, intervalMS) {
     return rows.length === VISIBLE_CANDLES && rows.every((value, index) => value.timestamp === first + index * intervalMS
-      && number(value.oi) !== null && number(value.buy) !== null && number(value.sell) !== null)
+      && number(value.oi) !== null && number(value.buy) !== null && number(value.sell) !== null
+      && number(value.statisticsVersion) === STATISTICS_VERSION)
+  }
+
+  hasCurrentStatistics(value) {
+    return number(value?.statisticsVersion) === STATISTICS_VERSION
   }
 
   async hasCompleteStoredStatistics(instrument, timeframe, end) {
@@ -490,7 +555,7 @@ export class MarketService {
       let changed = false
       try {
         // A process restart or a bounded in-memory state cache must not turn
-        // already-persisted OI/Taker into another pair of network requests.
+        // verified, current-contract OI/Taker into another pair of requests.
         const stored = await this.hasCompleteStoredStatistics(instrument, timeframe, end)
         if (this.disposed || controller.signal.aborted || !this.isActiveStatistics(instrument, timeframe, end)) return
         if (this.deferStatisticsForRepair(instrument, timeframe, end, state)) return
@@ -563,8 +628,27 @@ export class MarketService {
       const rebuiltChanged = rebuilt.length ? await this.appendChangedCandlesLocked(rebuilt) : []
       const local = await this.store.candles({ instrument: instrument.instId, timeframe, from: first, through: end })
       const patched = local.flatMap(value => {
-        const oi = oiByHour.get(value.timestamp), volumes = takerByHour.get(value.timestamp)
-        return oi === undefined && volumes === undefined ? [] : [{ ...value, oi: oi ?? value.oi ?? null, sell: volumes?.sell ?? value.sell ?? null, buy: volumes?.buy ?? value.buy ?? null }]
+        // Map.has deliberately distinguishes a missing endpoint row from a
+        // row whose value is null. The former leaves a previously verified
+        // observation alone; the latter is an explicit current response and
+        // must not be backfilled from legacy unit=2 data.
+        const hasOI = oiByHour.has(value.timestamp)
+        const hasTaker = takerByHour.has(value.timestamp)
+        if (!hasOI && !hasTaker) return []
+        const current = this.hasCurrentStatistics(value)
+        const oi = hasOI ? oiByHour.get(value.timestamp) : current ? number(value.oi) : null
+        const volumes = hasTaker ? takerByHour.get(value.timestamp) : current ? { sell: number(value.sell), buy: number(value.buy) } : null
+        return [{
+          ...value,
+          oi: oi ?? null,
+          sell: volumes?.sell ?? null,
+          buy: volumes?.buy ?? null,
+          // Any field retained above is either from this direct request or
+          // from an earlier direct request using the same contract. Legacy
+          // 5m/USDT values are deliberately discarded rather than shown.
+          statisticsVersion: STATISTICS_VERSION,
+          replaceStatistics: true,
+        }]
       })
       const changed = await this.appendChangedCandlesLocked(patched)
       if (timeframe === '5m' && changed.length) await this.rebuildDerivedLocked(instrument.instId, changed)
@@ -614,14 +698,14 @@ export class MarketService {
     }
   }
 
-  activateChartViewport(instrument, timeframe, end, latest = false) {
+  activateChartViewport(instrument, timeframe, end, latest = false, repairEnd = end) {
     if (!this.isActiveChartInstrument(instrument)) return
     // Hydrating the live 5m page is useful only while the viewport actually
     // follows latest. A same-instrument history jump must release its queued
     // slot immediately instead of waiting for the request deadline.
     if (!latest) this.pauseLatestCandleHydration(instrument)
-    const next = { instrument: instrument.instId, timeframe, end, latest }
-    if (this.activeChartViewport?.instrument === next.instrument && this.activeChartViewport.timeframe === next.timeframe && this.activeChartViewport.end === next.end && this.activeChartViewport.latest === next.latest) return
+    const next = { instrument: instrument.instId, timeframe, end, latest, repairEnd }
+    if (this.activeChartViewport?.instrument === next.instrument && this.activeChartViewport.timeframe === next.timeframe && this.activeChartViewport.end === next.end && this.activeChartViewport.latest === next.latest && this.activeChartViewport.repairEnd === next.repairEnd) return
     this.activeChartViewport = next
     // The initial latest request has no confirmed end until it returns. It is
     // still an intentional latest viewport for cancellation/retry purposes,
@@ -629,7 +713,7 @@ export class MarketService {
     if (latest && !Number.isFinite(end)) return
     this.pauseInactiveStatistics(this.statisticsKey(instrument, timeframe, end))
     const repairs = this.candleRepairs.get(instrument.instId)
-    const repairable = chartBaseRange(timeframe, end)
+    const repairable = chartRepairRange(timeframe, end, repairEnd)
     const visible = chartVisibleRange(timeframe, end)
     const repartitioned = repairs ? this.repartitionCandleRepairRanges(repairs, visible) : { changed: false, currentSplit: false }
     let reclassified = false
@@ -674,7 +758,7 @@ export class MarketService {
     if (this.activeChartInstrument === null) return null
     const viewport = this.activeChartViewport
     if (this.activeChartInstrument !== instrument.instId || viewport?.instrument !== instrument.instId || !Number.isFinite(viewport.end)) return undefined
-    return chartBaseRange(viewport.timeframe, viewport.end)
+    return chartRepairRange(viewport.timeframe, viewport.end, viewport.repairEnd ?? viewport.end)
   }
 
   activeVisibleRepairRange(instrument) {
@@ -980,8 +1064,8 @@ export class MarketService {
     }
   }
 
-  async ensureChartRange(instrument, timeframe, end, focusToken) {
-    const range = chartBaseRange(timeframe, end)
+  async ensureChartRange(instrument, timeframe, end, focusToken, repairEnd = end) {
+    const range = chartRepairRange(timeframe, end, repairEnd)
     const visibleRange = chartVisibleRange(timeframe, end)
     const state = this.candleRepairState(instrument.instId)
     this.repartitionCandleRepairRanges(state, visibleRange)
@@ -1142,19 +1226,20 @@ export class MarketService {
     // second DuckDB read, a repair, or a chart calculation for a viewport that
     // has already lost foreground ownership.
     if (staleForeground()) return staleResult()
-    const coverage = await this.store.coverage(instrument, timeframe)
+    const latest = targetEnd === undefined ? await latestCompleteChartEnds(this.store, instrument, rawCoverage, timeframe) : null
     if (staleForeground()) return staleResult()
-    const chartEnd = targetEnd ?? coverage.last ?? (rawCoverage.last === null ? null : Math.floor(rawCoverage.last / intervalMS) * intervalMS)
+    const chartEnd = targetEnd ?? latest?.displayEnd ?? null
+    const repairEnd = targetEnd ?? latest?.repairEnd ?? chartEnd
     if (chartEnd === null) {
-      const latest = metadata ? this.latestCandleRetryState(metadata) : null
-      return { bars: [], candleState: latest?.status === 'ready' ? 'loading' : latest?.status ?? 'ready', missingCandleRanges: [], candleRetryAt: latest?.retryAt ?? null, statisticsState: 'ready', statisticsRetryAt: null }
+      const latestCandleState = metadata ? this.latestCandleRetryState(metadata) : null
+      return { bars: [], candleState: latestCandleState?.status === 'ready' ? 'loading' : latestCandleState?.status ?? 'ready', missingCandleRanges: [], candleRetryAt: latestCandleState?.retryAt ?? null, statisticsState: 'ready', statisticsRetryAt: null }
     }
     let currentForeground = !foreground || this.ownsForeground(instrument, focusToken)
     if (foreground && metadata && currentForeground) {
-      if (targetEnd === undefined) this.activateChartViewport(metadata, timeframe, chartEnd, true)
+      if (targetEnd === undefined) this.activateChartViewport(metadata, timeframe, chartEnd, true, repairEnd)
       else currentForeground = this.isActiveChartViewport(instrument, timeframe, chartEnd)
     }
-    const availability = metadata && repair && currentForeground ? await this.ensureChartRange(metadata, timeframe, chartEnd, focusToken) : { visibleCandleReady: true, candleState: 'ready', missingCandleRanges: [], candleRetryAt: null }
+    const availability = metadata && repair && currentForeground ? await this.ensureChartRange(metadata, timeframe, chartEnd, focusToken, repairEnd) : { visibleCandleReady: true, candleState: 'ready', missingCandleRanges: [], candleRetryAt: null }
     if (staleForeground() || availability.stale) return staleResult()
     const ownsForeground = currentForeground && this.ownsForeground(instrument, focusToken)
     // OI/Taker comes from direct timeframe endpoints and only needs the
@@ -1163,6 +1248,11 @@ export class MarketService {
     const statisticsState = metadata && statistics && ownsForeground && availability.visibleCandleReady ? this.requestStatistics(metadata, timeframe, chartEnd) : null
     const live = timeframe === '5m' ? this.liveCandles.get(instrument) : undefined
     const through = targetEnd === undefined ? Math.max(chartEnd, live?.timestamp ?? chartEnd) : chartEnd + CHART_FUTURE_CANDLES * intervalMS
+    // To aggregate a derived bar at `through`, read the complete 5m bucket
+    // that ends at `through + interval - 5m`. Using the display end as the
+    // source end silently drops the rightmost 15m/1H bar, while OI/Taker was
+    // fetched for that dropped bar.
+    const sourceThrough = timeframe === '5m' ? through : through + intervalMS - FIVE_MINUTES
     const outputFrom = chartEnd - CHART_HISTORY_CANDLES * intervalMS
     const calculationFrom = outputFrom - EMA_WARMUP_CANDLES * intervalMS
     const key = `${instrument}:${timeframe}:${chartEnd}:${through}`
@@ -1177,13 +1267,21 @@ export class MarketService {
           candles = await this.store.candles({ instrument, timeframe, from: calculationFrom, through })
         } else {
           const [source, direct] = await Promise.all([
-            this.store.candles({ instrument, timeframe: '5m', from: calculationFrom, through }),
+            this.store.candles({ instrument, timeframe: '5m', from: calculationFrom, through: sourceThrough }),
             this.store.candles({ instrument, timeframe, from: calculationFrom, through }),
           ])
           const directStatistics = new Map(direct.map(value => [value.timestamp, value]))
           candles = aggregate(source, timeframe === '15m' ? 900_000 : 3_600_000).map(value => {
             const statistics = directStatistics.get(value.timestamp)
-            return { ...value, oi: statistics?.oi ?? null, buy: statistics?.buy ?? null, sell: statistics?.sell ?? null }
+            // Never render the legacy 5m/USDT cache as if it were direct
+            // timeframe contract data. It is rehydrated in the foreground.
+            const current = this.hasCurrentStatistics(statistics)
+            return {
+              ...value,
+              oi: current ? number(statistics.oi) : null,
+              buy: current ? number(statistics.buy) : null,
+              sell: current ? number(statistics.sell) : null,
+            }
           })
         }
         if (staleForeground()) return staleResult()

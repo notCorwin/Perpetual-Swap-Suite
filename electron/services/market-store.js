@@ -8,7 +8,7 @@ const safeSegment = value => {
   if (!result || result === '.' || result === '..') throw new Error('Invalid Parquet partition key.')
   return result
 }
-const numericCandleFields = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'quoteVolume', 'oi', 'buy', 'sell', 'writtenAt']
+const numericCandleFields = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'quoteVolume', 'oi', 'buy', 'sell', 'statisticsVersion', 'writtenAt']
 const normalizeCandleRow = row => {
   const candle = Object.fromEntries(Object.entries(row).map(([key, value]) => [key, typeof value === 'bigint' ? Number(value) : value]))
   // Parquet files are append-only and older parts may omit optional fields.

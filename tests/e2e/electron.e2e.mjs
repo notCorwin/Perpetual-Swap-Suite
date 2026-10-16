@@ -65,3 +65,32 @@ test('clipboard, screenshot capture, analysis settings, and safe gateway cancell
   assert.equal(initial.error, '')
   assert.deepEqual(initial.rows, [])
 })
+
+test('partially cached OI and Taker samples remain visibly plotted while statistics are incomplete', async () => {
+  const fixture = await request({ e2e: { action: 'seedPartialStatisticsChart' } })
+  assert.equal(fixture.visibleBars, 96)
+  assert.equal(fixture.oiSamples, 8)
+  assert.equal(fixture.takerSamples, 8)
+
+  // Reload after the test-only main-process fixture is ready so this uses the
+  // same market-list selection path a user uses, rather than only chart IPC.
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  const market = page.locator(`[aria-label="View ${fixture.instId} chart"]`)
+  await market.waitFor({ state: 'visible', timeout: 10_000 })
+  await market.click()
+
+  const chart = page.locator(`[data-chart-inst="${fixture.instId}"]`)
+  await chart.waitFor({ state: 'visible' })
+  await page.waitForFunction(({ instId, start, end }) => {
+    const element = document.querySelector(`[data-chart-inst="${instId}"]`)
+    return element?.getAttribute('data-chart-start') === String(start) && element.getAttribute('data-chart-end') === String(end)
+  }, fixture)
+
+  const oi = chart.locator('[data-chart-oi="partial"]')
+  await oi.waitFor({ state: 'visible' })
+  assert.equal(await oi.locator('[data-chart-oi-sample]').count(), fixture.oiSamples)
+
+  const taker = chart.locator('[data-chart-taker="partial"]')
+  await taker.waitFor({ state: 'visible' })
+  assert.ok((await taker.locator('path').first().getAttribute('d'))?.length)
+})

@@ -87,6 +87,7 @@ test('OI and Taker use contract units, the requested timeframe, and an inclusive
     assert.equal(last.oi, 1_095)
     assert.equal(last.sell, 105)
     assert.equal(last.buy, 115)
+    assert.equal(last.statisticsVersion, 1)
     const oi = calls.find(call => call.pathname.endsWith('/open-interest-history'))!
     const taker = calls.find(call => call.pathname.endsWith('/taker-volume-contract'))!
     assert.equal(oi.searchParams.get('period'), '1H')
@@ -95,6 +96,202 @@ test('OI and Taker use contract units, the requested timeframe, and an inclusive
     assert.equal(taker.searchParams.get('unit'), '1')
     assert.equal(taker.searchParams.get('end'), String(end + hour))
   } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('latest derived 15m/1H charts stop at a complete raw bucket and hydrate that visible window', async () => {
+  const cases = [['15m', 15 * 60_000], ['1H', hour]] as const
+  for (const [timeframe, interval] of cases) {
+    const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+    const store = await MarketStore.open(root)
+    const instrument = { instId: 'BTC-USDT-SWAP' }
+    const end = Date.UTC(2024, 0, 15, 12)
+    const first = end - 95 * interval
+    const incompleteNextBucket = end + interval
+    const visibleTimestamps = Array.from({ length: 96 }, (_, index) => first + index * interval)
+    const calls: URL[] = []
+    const fetcher: typeof fetch = async input => {
+      const url = new URL(String(input)); calls.push(url)
+      if (url.pathname.endsWith('/open-interest-history')) return response(visibleTimestamps.map((timestamp, index) => [String(timestamp), String(1_000 + index), '0', '0']))
+      if (url.pathname.endsWith('/taker-volume-contract')) return response(visibleTimestamps.map((timestamp, index) => [String(timestamp), String(10 + index), String(20 + index)]))
+      throw new Error(`Unexpected ${url}`)
+    }
+    const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+    try {
+      const raw = []
+      for (let timestamp = first; timestamp <= end + interval - fiveMinutes; timestamp += fiveMinutes) raw.push(rawCandle(timestamp, 100 + raw.length / 100))
+      // A direct row for the next period may already be persisted while only
+      // its opening 5m candle exists. It must not become the latest chart end.
+      raw.push(rawCandle(incompleteNextBucket, 200))
+      await store.appendCandles([
+        ...raw,
+        { ...rawCandle(incompleteNextBucket, 300), timeframe, oi: 99_999, buy: 88_888, sell: 77_777, statisticsVersion: 1 },
+      ])
+      service.instruments.set(instrument.instId, instrument)
+      assert.equal(service.focusChart(instrument.instId, 1), true)
+
+      const initial = await service.bars(instrument.instId, timeframe, undefined, { hydrate: false, repair: false, foreground: true, focusToken: 1 })
+      assert.equal(initial.bars.at(-1)?.hour, end)
+      assert.equal(service.activeChartViewport?.end, end)
+      await waitFor(() => service.statisticsState(instrument, timeframe, end).status === 'ready')
+
+      const chart = await service.bars(instrument.instId, timeframe, undefined, { hydrate: false, repair: false, statistics: false, foreground: true, focusToken: 1 })
+      const visible = chart.bars.filter((bar: any) => bar.hour >= first && bar.hour <= end)
+      assert.equal(visible.length, 96)
+      assert.equal(visible[0]?.hour, first)
+      assert.equal(visible.at(-1)?.hour, end)
+      assert.equal(chart.bars.some((bar: any) => bar.hour === incompleteNextBucket), false)
+      assert.equal(visible.at(-1)?.oi, 1_095)
+      assert.equal(visible.at(-1)?.sell, 105)
+      assert.equal(visible.at(-1)?.buy, 115)
+      assert.ok(visible.every((bar: any) => bar.oi !== null && bar.buy !== null && bar.sell !== null))
+
+      const statisticsCalls = calls.filter(call => call.pathname.includes('/rubik/stat/'))
+      assert.equal(statisticsCalls.length, 2)
+      for (const call of statisticsCalls) {
+        assert.equal(call.searchParams.get('period'), timeframe)
+        assert.equal(call.searchParams.get('end'), String(end + interval))
+      }
+    } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+  }
+})
+
+test('legacy unversioned OI/Taker rows are rehydrated instead of accepted as complete statistics', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 0, 16, 12)
+  const first = end - 95 * hour
+  const timestamps = Array.from({ length: 96 }, (_, index) => first + index * hour)
+  let oiCalls = 0, takerCalls = 0
+  const fetcher: typeof fetch = async input => {
+    const url = new URL(String(input))
+    if (url.pathname.endsWith('/open-interest-history')) {
+      oiCalls += 1
+      return response(timestamps.map((timestamp, index) => [String(timestamp), String(10_000 + index), '0', '0']))
+    }
+    if (url.pathname.endsWith('/taker-volume-contract')) {
+      takerCalls += 1
+      return response(timestamps.map((timestamp, index) => [String(timestamp), String(1_000 + index), String(2_000 + index)]))
+    }
+    throw new Error(`Unexpected ${url}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    const raw = Array.from({ length: 96 * 12 }, (_, index) => rawCandle(first + index * fiveMinutes, 100 + index / 100))
+    const legacy = timestamps.map((timestamp, index) => ({
+      ...rawCandle(timestamp, 100 + index), timeframe: '1H',
+      // This is the legacy shape: values look complete but have no proof that
+      // they came from current-timeframe, contract-unit endpoints.
+      oi: 500 + index, buy: 600 + index, sell: 700 + index,
+    }))
+    await store.appendCandles([...raw, ...legacy])
+    assert.equal(await service.hasCompleteStoredStatistics(instrument, '1H', end), false)
+
+    service.instruments.set(instrument.instId, instrument)
+    const cached = await service.bars(instrument.instId, '1H', end, { hydrate: false, repair: false, statistics: false })
+    const cachedVisible = cached.bars.filter((bar: any) => bar.hour >= first && bar.hour <= end)
+    assert.equal(cachedVisible.length, 96)
+    assert.ok(cachedVisible.every((bar: any) => bar.oi === null && bar.buy === null && bar.sell === null), 'Unversioned legacy statistics must never reach the chart.')
+    service.focusChart(instrument.instId, 1)
+    service.activateChartViewport(instrument, '1H', end)
+    service.requestStatistics(instrument, '1H', end)
+    await waitFor(() => service.statisticsState(instrument, '1H', end).status === 'ready')
+
+    assert.equal(oiCalls, 1)
+    assert.equal(takerCalls, 1)
+    const rehydrated = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: first, through: end })
+    assert.equal(rehydrated.length, 96)
+    assert.ok(rehydrated.every((bar: any) => bar.statisticsVersion === 1))
+    assert.equal(rehydrated[0]?.oi, 10_000)
+    assert.equal(rehydrated[0]?.sell, 1_000)
+    assert.equal(rehydrated[0]?.buy, 2_000)
+    assert.equal(rehydrated.at(-1)?.oi, 10_095)
+    assert.equal(rehydrated.at(-1)?.sell, 1_095)
+    assert.equal(rehydrated.at(-1)?.buy, 2_095)
+    assert.equal(await service.hasCompleteStoredStatistics(instrument, '1H', end), true)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a partial direct statistics response clears legacy fields and keeps the viewport retrying', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 0, 17, 12)
+  const first = end - 95 * hour
+  const timestamps = Array.from({ length: 96 }, (_, index) => first + index * hour)
+  let oiCalls = 0, takerCalls = 0
+  const fetcher: typeof fetch = async input => {
+    const url = new URL(String(input))
+    if (url.pathname.endsWith('/open-interest-history')) {
+      oiCalls += 1
+      return response(timestamps.map((timestamp, index) => [String(timestamp), String(10_000 + index), '0', '0']))
+    }
+    if (url.pathname.endsWith('/taker-volume-contract')) {
+      takerCalls += 1
+      return response([])
+    }
+    throw new Error(`Unexpected ${url}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    await store.appendCandles(timestamps.map((timestamp, index) => ({
+      ...rawCandle(timestamp, 100 + index), timeframe: '1H',
+      oi: 500 + index, buy: 600 + index, sell: 700 + index,
+    })))
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+    service.activateChartViewport(instrument, '1H', end)
+    service.requestStatistics(instrument, '1H', end)
+    await waitFor(() => service.statisticsState(instrument, '1H', end).status === 'retrying')
+
+    assert.equal(oiCalls, 1)
+    assert.equal(takerCalls, 1)
+    const partial = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: first, through: end })
+    assert.ok(partial.every((bar: any) => bar.statisticsVersion === 1))
+    assert.equal(partial[0]?.oi, 10_000)
+    assert.equal(partial.at(-1)?.oi, 10_095)
+    assert.ok(partial.every((bar: any) => bar.buy === null && bar.sell === null), 'Legacy unit=2 taker values must not be re-certified by a partial response.')
+    assert.ok(partial.every((bar: any) => !('replaceStatistics' in bar)), 'The in-memory replacement marker must never reach Parquet.')
+    assert.equal(await service.hasCompleteStoredStatistics(instrument, '1H', end), false)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('an internally gapped newest raw bucket falls back for display while its tail stays repairable', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 0, 18, 12)
+  const displayEnd = end - hour
+  const first = displayEnd - (95 + 199) * hour
+  const missing = end + 30 * 60_000
+  let historyCalls = 0
+  const fetcher: typeof fetch = async input => {
+    const url = new URL(String(input))
+    if (url.pathname.endsWith('/market/history-candles')) {
+      historyCalls += 1
+      return response([okxCandle(rawCandle(missing, 200))])
+    }
+    if (url.pathname.endsWith('/open-interest-history') || url.pathname.endsWith('/taker-volume-contract')) return response([])
+    throw new Error(`Unexpected ${url}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    const source = []
+    for (let timestamp = first; timestamp <= end + hour - fiveMinutes; timestamp += fiveMinutes) {
+      if (timestamp !== missing) source.push(rawCandle(timestamp, 100 + source.length / 100))
+    }
+    await service.persistCandles(instrument.instId, source)
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+
+    const chart = await service.bars(instrument.instId, '1H', undefined, { hydrate: false, repair: true, statistics: false, foreground: true, focusToken: 1 })
+    assert.equal(chart.bars.at(-1)?.hour, displayEnd)
+    assert.equal(service.activeChartViewport?.end, displayEnd)
+    assert.equal(service.activeChartViewport?.repairEnd, end)
+    assert.equal(chart.candleState, 'loading')
+    await waitFor(() => historyCalls === 1)
+    await waitFor(async () => (await store.candles({ instrument: instrument.instId, timeframe: '5m', from: missing, through: missing })).length === 1)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
 test('an internal 5m gap is repaired immediately instead of being mistaken for a history boundary', async () => {
@@ -416,13 +613,13 @@ test('disposing waits for an already-running chart read before callers may close
   const coverageGate = new Promise<void>(resolve => { releaseCoverage = resolve })
   store.coverage = async (...arguments_) => {
     coverageCalls += 1
-    if (coverageCalls === 2) await coverageGate
+    if (coverageCalls === 1) await coverageGate
     return originalCoverage(...arguments_)
   }
   const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
   try {
     const bars = service.bars('BTC-USDT-SWAP', '5m', undefined, { hydrate: false, repair: false, statistics: false })
-    await waitFor(() => coverageCalls === 2)
+    await waitFor(() => coverageCalls === 1)
     let disposed = false
     const shutdown = service.dispose().then(() => { disposed = true })
     await new Promise(resolve => setTimeout(resolve, 20))
@@ -483,7 +680,7 @@ test('a raw rebuild never overwrites direct timeframe OI or taker statistics', a
   const start = Date.UTC(2024, 7, 1)
   const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
   try {
-    await store.appendCandles([{ ...rawCandle(start, 100), timeframe: '1H', oi: 9_999, buy: 8_888, sell: 7_777 }])
+    await store.appendCandles([{ ...rawCandle(start, 100), timeframe: '1H', oi: 9_999, buy: 8_888, sell: 7_777, statisticsVersion: 1 }])
     await service.persistCandles(instrument.instId, Array.from({ length: 12 }, (_, index) => ({
       ...rawCandle(start + index * fiveMinutes, 100 + index), oi: 10 + index, buy: 20 + index, sell: 30 + index,
     })))
@@ -1081,7 +1278,7 @@ test('a newer same-instrument viewport cannot be retaken by a delayed older requ
     releaseCoverage?.()
     const old = await oldRequest
     assert.equal(old.stale, true)
-    assert.equal(coverageCalls, 3, 'The stale window stops after its first coverage read; the current viewport needs two.')
+    assert.equal(coverageCalls, 2, 'The stale and current viewports each read raw coverage once.')
     assert.equal(service.activeChartViewport.end, newEnd)
   } finally { releaseCoverage?.(); await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
