@@ -1,7 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { chartCandleWidth, chartHourX, chartLayout, fitAxisPriceTag, type ChartPanel } from "./chart-layout.ts"
-import { placeChartLabels, type ChartLabel } from "./chart-label-layout.ts"
 
 test("stacked chart layout stays aligned and bounded", () => {
   const order: ChartPanel[] = ["price", "roc", "rsi", "oi", "taker"]
@@ -51,44 +50,4 @@ test("price tag rests inside the axis gutter without clipping or shrinking below
   assert.equal(wide.scale, 1)
   assert.equal(wide.offset, 2)
   assert.equal(wide.boxWidth + stroke, wide.gutter - 6)
-})
-
-test("chart move labels occupy collision-free lanes while retaining their anchors", () => {
-  const labels: ChartLabel[] = Array.from({ length: 8 }, (_, index) => ({
-    id: `label-${index}`,
-    anchorX: 100 + index * 2,
-    anchorY: 100,
-    text: `LONG #${index + 1}`,
-    side: "bottom",
-    priority: index,
-  }))
-  const layout = placeChartLabels(labels, { left: 0, right: 240, top: 20, bottom: 280 }, text => text.length * 7)
-  const visible = [...layout.labels.values()].filter(label => !label.hidden)
-  assert.equal(visible.length, labels.length)
-  assert.equal(visible[0].x, labels[0].anchorX)
-  for (const [index, label] of visible.entries()) {
-    assert.ok(label.y > label.anchorY)
-    for (const other of visible.slice(index + 1)) {
-      const separatedHorizontally = label.x + label.width / 2 + 3 <= other.x - other.width / 2 || other.x + other.width / 2 + 3 <= label.x - label.width / 2
-      const separatedVertically = Math.abs(label.y - other.y) >= 19
-      assert.ok(separatedHorizontally || separatedVertically)
-    }
-  }
-})
-
-test("chart move labels stay inside the plot and summarize unavoidable overflow", () => {
-  const labels: ChartLabel[] = Array.from({ length: 6 }, (_, index) => ({
-    id: `label-${index}`,
-    anchorX: index % 2 ? 2 : 198,
-    anchorY: 55,
-    text: `EXIT SHORT #${index + 1}`,
-    side: "top",
-    priority: index,
-  }))
-  const layout = placeChartLabels(labels, { left: 0, right: 200, top: 30, bottom: 80 }, text => text.length * 7)
-  const visible = [...layout.labels.values()].filter(label => !label.hidden)
-  assert.ok(visible.every(label => label.x - label.width / 2 >= 0 && label.x + label.width / 2 <= 200))
-  assert.equal(layout.summaries.length, 1)
-  assert.equal(layout.summaries[0].count, labels.length - visible.length)
-  assert.match(layout.summaries[0].text, /^\+\d+$/)
 })

@@ -5,9 +5,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { ButtonGroup } from "@/components/ui/button-group"
 import { Spinner } from "@/components/ui/spinner"
-import { Toggle } from '@/components/ui/toggle'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
-import { Slider } from '@/components/ui/slider'
 import { ChartAnalysisPanel } from '@/ChartAnalysisPanel'
 import { ChartWorkspaceViewport } from '@/ChartWorkspaceViewport'
 import { chartAnalysis } from '@/analysis-service'
@@ -19,10 +17,8 @@ import { chartHistoryNeedsLoad, chartStatsNeedLoad, livePriceTag, scrollChartEnd
 import { cn, pageVisible } from "@/lib/utils"
 import { chartNavigationTarget, wrappedMarket } from "@/market-sort"
 import { finitePercentage, formatPercent, type PercentageValue } from "@/market-percent"
-import { capturePriceMoves, type PriceMoveMode, type PriceMoveObjective, type PriceMoveSignal } from '@/price-move-signals'
 import { SnapshotOrder } from '@/snapshot-order'
 import { mergeChartBars } from '@/chart-snapshot'
-import { placeChartLabels, type ChartLabel } from '@/chart-label-layout'
 import { RADAR_TIMEFRAMES, timeframeLabel, timeframeMilliseconds, type RadarTimeframe } from '@/timeframe'
 
 export type Bar = {
@@ -139,7 +135,7 @@ export const chartGutter = (bars: Bar[], height: number, liveClose = bars[bars.l
   return fitAxisPriceTag(axisGutter, priceTagWidth(price(liveClose), "00:00"), tagStrokeWidth, minimumScale)
 }
 
-export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height, now, endHour, intervalMS = 3_600_000, moveSignals = [] }: { bars: Bar[]; liveBar: Bar; inspected: number | null; width: number; height: number; now: number; endHour: number; intervalMS?: number; moveSignals?: PriceMoveSignal[] }) {
+export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height, now, endHour, intervalMS = 3_600_000 }: { bars: Bar[]; liveBar: Bar; inspected: number | null; width: number; height: number; now: number; endHour: number; intervalMS?: number }) {
   const areaClipId = useId().replaceAll(":", "")
   const n = bars.length
   const active = bars[inspected ?? n - 1]
@@ -267,26 +263,6 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
     if (sell > 0) sells.push(rectangle(volumeX, totalY, barWidth, buyY - totalY))
   }
   const panelKeys: Panel[] = ["price", "roc", "rsi", "oi", "taker"]
-  const moveGeometry = moveSignals.flatMap(signal => {
-    const signalHour = Number(signal.hour)
-    const index = bars.findIndex(bar => Number(bar.hour) === signalHour && bar.confirmed)
-    if (index < 0) return []
-    const exitIndex = bars.findIndex(bar => Number(bar.hour) === Number(signal.exitHour) && bar.confirmed)
-    const isLong = signal.direction === 'long'
-    const markerX = x(index, "price")
-    const markerY = isLong ? Math.min(panels.price[1] - 17, priceY(bars[index].low) + 9) : Math.max(panels.price[0] + 17, priceY(bars[index].high) - 9)
-    const rank = moveSignals.length > 1 ? ` #${signal.rank}` : ''
-    const exitX = exitIndex >= 0 ? x(exitIndex, 'price') : 0
-    const exitY = isLong
-      ? Math.max(panels.price[0] + 17, priceY(signal.exitPrice) - 9)
-      : Math.min(panels.price[1] - 17, priceY(signal.exitPrice) + 9)
-    return [{ signal, signalHour, index, exitIndex, isLong, markerX, markerY, rank, exitX, exitY }]
-  })
-  const moveLabelInputs: ChartLabel[] = moveGeometry.flatMap(({ signal, signalHour, exitIndex, isLong, markerX, markerY, rank, exitX, exitY }) => [
-    { id: `${signal.direction}-${signalHour}-entry`, anchorX: markerX, anchorY: markerY, text: `${isLong ? 'LONG' : 'SHORT'}${rank}`, side: isLong ? 'bottom' as const : 'top' as const, priority: signal.rank * 2 },
-    ...(exitIndex >= 0 ? [{ id: `${signal.direction}-${signalHour}-exit`, anchorX: exitX, anchorY: exitY, text: `${isLong ? 'EXIT LONG' : 'EXIT SHORT'}${rank}`, side: isLong ? 'top' as const : 'bottom' as const, priority: signal.rank * 2 + 1 }] : []),
-  ])
-  const moveLabelLayout = placeChartLabels(moveLabelInputs, { left, right, top: panels.price[0] + 2, bottom: panels.price[1] - 2 }, label => chartTextWidth(label, getComputedStyle(document.documentElement).getPropertyValue("--chart-text-size").trim()))
   const grid = panelKeys.flatMap(key => panels[key].map((y, index) =>
     <line key={`${key}-${index}`} x1={columns[key][0]} x2={columns[key][1]} y1={y} y2={y} stroke="var(--border)" strokeWidth="1" opacity={index ? 0.32 : 0.55} />))
   const legend = (key: Panel, items: [string, string, string][]) => {
@@ -352,41 +328,6 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
     {lineStroke(line("roc", "roc", value => scale(value, rocAxis.min, rocAxis.max, panels.roc)), "var(--chart-1)")}
     {lineStroke(line("maroc", "roc", value => scale(value, rocAxis.min, rocAxis.max, panels.roc)), "var(--chart-2)", indicatorWidth, 1, "7 4")}
     {oiAxis && lineStroke(line("oi", "oi", oiY), "var(--chart-2)")}
-    {moveGeometry.map(({ signal, signalHour, exitIndex, isLong, markerX, markerY, rank, exitX, exitY }) => {
-      const color = isLong ? 'var(--positive)' : 'var(--destructive)'
-      const triangle = isLong
-        ? `M${markerX} ${markerY - 7}L${markerX - 5} ${markerY + 1}H${markerX + 5}Z`
-        : `M${markerX} ${markerY + 7}L${markerX - 5} ${markerY - 1}H${markerX + 5}Z`
-      const aria = `${isLong ? 'Long' : 'Short'}${rank} future move entry at ${time(signalHour)}, ${formatPercent(signal.changePercent)} over ${signal.periods} candles, efficiency score ${signal.efficiencyScore.toFixed(2)}`
-      const exitTriangle = isLong
-        ? `M${exitX} ${exitY + 7}L${exitX - 5} ${exitY - 1}H${exitX + 5}Z`
-        : `M${exitX} ${exitY - 7}L${exitX - 5} ${exitY + 1}H${exitX + 5}Z`
-      const exitAria = `Exit ${isLong ? 'Long' : 'Short'}${rank} future move at ${time(signal.exitHour)}, ${formatPercent(signal.changePercent)} after ${signal.periods} candles`
-      const entryLabel = moveLabelLayout.labels.get(`${signal.direction}-${signalHour}-entry`)!
-      const exitLabel = moveLabelLayout.labels.get(`${signal.direction}-${signalHour}-exit`)
-      return <g key={`${signal.direction}-${signalHour}`} data-chart-move-direction={signal.direction} data-chart-move-hour={signalHour} aria-label={aria}>
-        {exitIndex >= 0 && <line x1={markerX} y1={priceY(signal.entryPrice)} x2={exitX} y2={priceY(signal.exitPrice)} stroke={color} strokeWidth="1.2" strokeDasharray="3 4" opacity="0.7" />}
-        <path d={triangle} fill={color} stroke="var(--chart-surface)" strokeWidth="1.5" />
-        {!entryLabel.hidden && <>
-          {(entryLabel.x !== markerX || Math.abs(entryLabel.y - markerY) > 16) && <line x1={markerX} y1={markerY} x2={entryLabel.x} y2={entryLabel.y + (entryLabel.side === 'top' ? 3 : -11)} stroke={color} strokeWidth="0.8" opacity="0.55" />}
-          <text x={entryLabel.x} y={entryLabel.y} textAnchor="middle" fill={color} fontWeight="700" paintOrder="stroke" stroke="var(--chart-surface)" strokeWidth="3" strokeLinejoin="round">{entryLabel.text}</text>
-        </>}
-        <title>{aria}</title>
-        {exitIndex >= 0 && <g data-chart-move-exit-direction={signal.direction} data-chart-move-exit-hour={signal.exitHour} aria-label={exitAria}>
-          <path d={exitTriangle} fill="var(--chart-surface)" stroke={color} strokeWidth="2" />
-          {exitLabel && !exitLabel.hidden && <>
-            {(exitLabel.x !== exitX || Math.abs(exitLabel.y - exitY) > 16) && <line x1={exitX} y1={exitY} x2={exitLabel.x} y2={exitLabel.y + (exitLabel.side === 'top' ? 3 : -11)} stroke={color} strokeWidth="0.8" opacity="0.55" />}
-            <text x={exitLabel.x} y={exitLabel.y} textAnchor="middle" fill={color} fontWeight="700" paintOrder="stroke" stroke="var(--chart-surface)" strokeWidth="3" strokeLinejoin="round">{exitLabel.text}</text>
-          </>}
-          <title>{exitAria}</title>
-        </g>}
-      </g>
-    })}
-    {moveLabelLayout.summaries.map(summary => <g key={summary.id} data-chart-label-summary={summary.side} aria-label={`${summary.count} additional move labels hidden to prevent overlap`}>
-      <rect x={summary.x - 10} y={summary.y - 12} width="20" height="14" rx="4" fill="var(--chart-surface)" stroke="var(--muted-foreground)" />
-      <text x={summary.x} y={summary.y} textAnchor="middle" fill="var(--muted-foreground)" fontWeight="700">{summary.text}</text>
-      <title>{summary.count} additional move labels hidden to prevent overlap</title>
-    </g>)}
     {inspected !== null && panelKeys.map(key => <line key={key} x1={x(inspected, key)} x2={x(inspected, key)} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--foreground)" strokeWidth="0.65" strokeDasharray="3 5" opacity="0.3" />)}
     {([[highIndex, candleHigh, "high"], [lowIndex, candleLow, "low"]] as const).map(([index, value, kind]) => {
       const markerX = x(index, "price"), label = price(value)
@@ -414,15 +355,11 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
   </>
 })
 
-export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listOrder, turnoverOrder, moveDefaults = { chartMoveLabelsVisible: true, chartMoveEfficiencyFactor: 1 }, onMoveEfficiencyFactorChange, onSelect, onBack, backLabel = 'Markets' }: { instId: string; timeframe?: RadarTimeframe; onTimeframeChange?: (value: RadarTimeframe) => void; listOrder: string[]; turnoverOrder: string[]; moveDefaults?: { chartMoveLabelsVisible: boolean; chartMoveEfficiencyFactor: number }; onMoveEfficiencyFactorChange?: (value: number) => void; onSelect: (id: string) => void; onBack: () => void; backLabel?: string }) {
+export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listOrder, turnoverOrder, onSelect, onBack, backLabel = 'Markets' }: { instId: string; timeframe?: RadarTimeframe; onTimeframeChange?: (value: RadarTimeframe) => void; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void; onBack: () => void; backLabel?: string }) {
   const intervalMS = timeframeMilliseconds(timeframe)
   const cacheKey = chartKey(instId, timeframe)
   const analysis = useSyncExternalStore(chartAnalysis.subscribe, () => chartAnalysis.get(instId))
   const [analysisOpen, setAnalysisOpen] = useState(() => chartAnalysis.get(instId) !== null)
-  const moveMode: PriceMoveMode = 'highLow'
-  const moveObjective: PriceMoveObjective = 'efficiency'
-  const [showMoveLabels, setShowMoveLabels] = useState(moveDefaults.chartMoveLabelsVisible)
-  const [moveEfficiencyFactor, setMoveEfficiencyFactor] = useState(moveDefaults.chartMoveEfficiencyFactor)
   const analysisBusy = analysis?.phase === 'capturing' || analysis?.phase === 'streaming'
   useEffect(() => () => chartAnalysis.stop(instId), [instId, timeframe])
   const [displayed, setDisplayed] = useState<{ id: string; data: ChartResponse } | null>(null)
@@ -699,8 +636,6 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
 
   const viewportEnd = historicalEnd ?? chart?.bars.at(-1)?.hour ?? 0
   const bars = useMemo(() => visibleChartBars(cachedBars, viewportEnd, intervalMS), [cachedBars, viewportEnd, intervalMS])
-  const rankedMoveSignals = useMemo(() => capturePriceMoves(bars, 1, moveMode, moveObjective, moveEfficiencyFactor, intervalMS), [bars, moveMode, moveObjective, moveEfficiencyFactor, intervalMS])
-  const visibleMoveSignals = showMoveLabels ? rankedMoveSignals : []
   const inspectedIndex = inspection?.id === cacheKey ? bars.findIndex(bar => bar.hour === inspection.hour) : -1
   const inspected = inspectedIndex < 0 ? null : inspectedIndex
   const inspectAt = (target: SVGSVGElement, clientX: number) => {
@@ -771,15 +706,6 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
       </ButtonGroup>
       <span role="status" className="sr-only">{captureStatus === "flashing" ? "Chart copied to clipboard" : ""}</span>
       <Badge variant="secondary"><Radio data-icon="inline-start" aria-hidden="true" />{historicalEnd !== null ? `${timeframeLabel(timeframe)} history` : active && !active.confirmed ? `Live ${timeframeLabel(timeframe)}` : `${timeframeLabel(timeframe)} chart`}</Badge>
-      <div className="flex w-36 items-center gap-2" data-price-move-efficiency-factor={moveEfficiencyFactor} title="Efficiency = |change| / periods^factor">
-        <label htmlFor="chart-efficiency-factor" className="shrink-0 text-xs text-muted-foreground">Factor</label>
-        <Slider id="chart-efficiency-factor" min={0} max={1} step={0.01} value={[moveEfficiencyFactor]} onValueChange={values => setMoveEfficiencyFactor(values[0] ?? 0)} onValueCommit={values => {
-          onMoveEfficiencyFactorChange?.(values[0] ?? 0)
-          window.requestAnimationFrame(() => plotRef.current?.querySelector<SVGSVGElement>('svg[tabindex="0"]')?.focus())
-        }} aria-label={`Efficiency factor ${moveEfficiencyFactor.toFixed(2)}`} />
-        <span className="w-8 text-right text-xs tabular-nums">{moveEfficiencyFactor.toFixed(2)}</span>
-      </div>
-      <Toggle variant="outline" size="sm" pressed={showMoveLabels} onPressedChange={setShowMoveLabels} aria-label="Show move label layer" data-price-move-layer={showMoveLabels ? 'visible' : 'hidden'}>{showMoveLabels ? 'Labels On' : 'Labels Off'}</Toggle>
     </header>
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}{historicalEnd !== null && ' Retrying automatically.'}</div>}
     {captureError && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{captureError}</p>}
@@ -822,8 +748,8 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
           if (!(event.buttons & 1)) { endInspection(); return }
           inspectAt(event.currentTarget, event.clientX)
         }}>
-          <Plot bars={data.bars} liveBar={chart?.bars.at(-1) ?? data.bars.at(-1)!} inspected={inspected} width={plotSize.width} height={plotSize.height} now={1} endHour={data.endHour ?? data.bars.at(-1)!.hour} intervalMS={intervalMS} moveSignals={visibleMoveSignals} />
-        </svg>) : <p className="flex h-full items-center justify-center text-muted-foreground">{historyLoading?.startsWith(`${cacheKey}:`) ? "Loading history…" : chart ? "No candle data available yet" : "Loading chart…"}</p>}
+          <Plot bars={data.bars} liveBar={chart?.bars.at(-1) ?? data.bars.at(-1)!} inspected={inspected} width={plotSize.width} height={plotSize.height} now={1} endHour={data.endHour ?? data.bars.at(-1)!.hour} intervalMS={intervalMS} />
+        </svg>) : null}
         {historicalEnd !== null && historyLoading === `${cacheKey}:${historicalEnd}` && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Loading history…</span>}
         {atHistoryBoundary && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Start of available history</span>}
         </div>
