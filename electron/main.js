@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { MarketStore } from './services/market-store.js'
+import { MarketService } from './services/market-service.js'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const rendererURL = process.env.ELECTRON_RENDERER_URL
@@ -10,6 +11,7 @@ const testMode = process.env.PERPETUAL_SWAP_E2E === '1'
 const settingsFile = () => join(app.getPath('userData'), 'settings.json')
 let window
 let marketStore
+let marketService
 const gatewayRequests = new Map()
 
 const defaults = {
@@ -22,15 +24,19 @@ const defaults = {
   monitoringPaused: false,
   chartMoveLabelsVisible: true,
   chartMoveEfficiencyFactor: 1,
+  hourlyVolumeStabilityEnabled: true,
 }
+let settingsCache = { ...defaults }
 
 async function settings() {
-  try { return { ...defaults, ...JSON.parse(await readFile(settingsFile(), 'utf8')) } }
-  catch { return { ...defaults } }
+  try { settingsCache = { ...defaults, ...JSON.parse(await readFile(settingsFile(), 'utf8')) } }
+  catch { settingsCache = { ...defaults } }
+  return settingsCache
 }
 
 async function saveSettings(value) {
   const next = { ...(await settings()), ...value }
+  settingsCache = next
   await mkdir(dirname(settingsFile()), { recursive: true })
   await writeFile(settingsFile(), JSON.stringify(next, null, 2), { mode: 0o600 })
   return next
@@ -42,9 +48,9 @@ function preferences(saved) {
 }
 
 async function snapshot() {
-  const saved = await settings()
+  const saved = await settings(), market = marketService?.snapshot() ?? { rows: [], revision: 0, error: 'Loading OKX market data…', loading: true }
   return {
-    ...saved, rows: [], updatedAt: null, error: '', revision: 0,
+    ...saved, rows: market.rows, updatedAt: market.rows.length ? Date.now() : null, error: market.error, revision: market.revision,
     filterMetricsCatalog: [], filterFunctions: [], filterFunctionCatalog: [],
     filterLibraryPreferences: preferences(saved), notificationAuthorization: 'unavailable',
     notificationError: '', backgroundMonitoringError: '', launchAtLogin: 'unavailable', launchAtLoginError: '',
@@ -136,6 +142,7 @@ async function handleRequest(event, request) {
   const keys = Object.keys(request)
   if (keys.some(key => key in defaults || key === 'filterLibraryPreferencesJSON')) {
     await saveSettings(request)
+    if ('hourlyVolumeStabilityEnabled' in request) marketService?.invalidate()
     return snapshot()
   }
   return unsupported(request)
@@ -157,6 +164,7 @@ async function createWindow() {
 app.whenReady().then(async () => {
   if (process.env.PERPETUAL_SWAP_USER_DATA) app.setPath('userData', process.env.PERPETUAL_SWAP_USER_DATA)
   marketStore = await MarketStore.open(join(app.getPath('userData'), 'MarketData'))
+  marketService = new MarketService(marketStore, () => ({ hourlyVolumeStabilityEnabled: settingsCache.hourlyVolumeStabilityEnabled }))
   ipcMain.handle('radar:request', handleRequest)
   await createWindow()
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) void createWindow() })
