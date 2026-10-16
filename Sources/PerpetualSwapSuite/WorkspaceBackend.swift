@@ -5,23 +5,12 @@ actor WorkspaceBackend {
     let settings: SettingsStore
     let store: ParquetMarketStore
     let market: MarketService
-    let strategies: StrategyStore
-    let backtests: BacktestService
 
     init(root: URL? = nil) throws {
         paths = try AppPaths(root: root)
-        let settingsStore = try SettingsStore(url: paths.settings)
-        let marketStore = try ParquetMarketStore(paths: paths)
-        let marketService = MarketService(store: marketStore, settings: settingsStore)
-        let strategyStore = try StrategyStore(directory: paths.strategies)
-        settings = settingsStore
-        store = marketStore
-        market = marketService
-        strategies = strategyStore
-        backtests = BacktestService(
-            market: marketService, store: marketStore, settings: settingsStore,
-            strategies: strategyStore, runtime: NodeStrategyRuntime(paths: paths, store: marketStore)
-        )
+        settings = try SettingsStore(url: paths.settings)
+        store = try ParquetMarketStore(paths: paths)
+        market = MarketService(store: store, settings: settings)
     }
 
     func start() async { await market.refresh() }
@@ -46,17 +35,6 @@ actor WorkspaceBackend {
         case "query":
             guard let sql = request["sql"] as? String else { throw BridgeError.invalidRequest }
             return try bridgeData(try await market.query(sql))
-        case "strategyList":
-            return try bridgeData(try await strategies.list())
-        case "strategyRead":
-            guard let id = request["id"] as? String else { throw BridgeError.invalidRequest }
-            return try bridgeData(try await strategies.read(id: id))
-        case "strategySave":
-            guard let name = request["name"] as? String, let source = request["source"] as? String else { throw BridgeError.invalidRequest }
-            return try bridgeData(try await strategies.save(id: request["id"] as? String, name: name, source: source))
-        case "backtest":
-            guard let value = request["backtest"] else { throw BridgeError.invalidRequest }
-            return try bridgeData(try await backtests.run(decodeBridge(BacktestRequest.self, from: value)))
         default: throw BridgeError.unknownMethod(method)
         }
     }

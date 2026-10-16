@@ -1,22 +1,20 @@
 import { Button } from '@base-ui/react/button'
 import { Select } from '@base-ui/react/select'
 import { ChevronDown, RefreshCw, Settings2 } from 'lucide-react'
-import { lazy, Suspense, useLayoutEffect, useState } from 'react'
+import { useLayoutEffect, useState } from 'react'
 import { InspectorPanel } from './components/InspectorPanel'
+import { MarketChart } from './components/MarketChart'
 import { MarketSidebar } from './components/MarketSidebar'
 import { SettingsDialog } from './components/SettingsDialog'
 import type { Timeframe } from './types'
 import { useWorkspace } from './use-workspace'
-import type { BacktestReport } from './types'
 
 const timeframes: Timeframe[] = ['5m', '15m', '30m', '1H', '4H', '1D']
-const MarketChart = lazy(() => import('./components/MarketChart').then(module => ({ default: module.MarketChart })))
 
 export default function App() {
   const workspace = useWorkspace()
   const { snapshot } = workspace
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [report, setReport] = useState<BacktestReport | null>(null)
   const market = snapshot.markets.find(item => item.instrument.id === snapshot.selectedInstrument)
 
   useLayoutEffect(() => {
@@ -58,8 +56,8 @@ export default function App() {
       {workspace.error && <div className="error-banner">{workspace.error}</div>}
       <main className="three-column-workspace">
         <MarketSidebar markets={snapshot.markets} selected={snapshot.selectedInstrument} onSelect={instrument => void workspace.select(instrument)} />
-        <Suspense fallback={<div className="chart-loading">Loading chart…</div>}><MarketChart market={market} candles={snapshot.candles} forming={snapshot.formingCandle} timeframe={snapshot.settings.selectedTimeframe} markers={report?.markers ?? []} /></Suspense>
-        <InspectorPanel snapshot={snapshot} report={report} onReport={setReport} onValidate={workspace.validate} />
+        <MarketChart market={market} candles={snapshot.candles} forming={snapshot.formingCandle} timeframe={snapshot.settings.selectedTimeframe} />
+        <InspectorPanel snapshot={snapshot} onValidate={workspace.validate} />
       </main>
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} settings={snapshot.settings} onSave={workspace.saveSettings} />
     </div>

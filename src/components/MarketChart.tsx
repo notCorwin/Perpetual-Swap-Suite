@@ -1,20 +1,19 @@
-import { CandlestickSeries, ColorType, createChart, createSeriesMarkers, HistogramSeries, LineSeries, type UTCTimestamp } from 'lightweight-charts'
+import { CandlestickSeries, ColorType, createChart, HistogramSeries, LineSeries, type UTCTimestamp } from 'lightweight-charts'
 import { useEffect, useMemo, useRef } from 'react'
 import { ema, rsi } from '../lib/indicators'
 import { formatPercent, formatPrice } from '../lib/format'
-import type { BacktestMarker, Candle, MarketSummary, Timeframe } from '../types'
+import type { Candle, MarketSummary, Timeframe } from '../types'
 
 type Props = {
   market?: MarketSummary
   candles: Candle[]
   forming: Candle | null
   timeframe: Timeframe
-  markers: BacktestMarker[]
 }
 
 function css(name: string) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim() }
 
-export function MarketChart({ market, candles, forming, timeframe, markers }: Props) {
+export function MarketChart({ market, candles, forming, timeframe }: Props) {
   const container = useRef<HTMLDivElement>(null)
   const data = useMemo(() => forming ? [...candles.filter(candle => candle.timestamp !== forming.timestamp), forming] : candles, [candles, forming])
   const latest = data.at(-1)
@@ -38,13 +37,6 @@ export function MarketChart({ market, candles, forming, timeframe, markers }: Pr
       time: Math.floor(candle.timestamp / 1000) as UTCTimestamp,
       open: candle.open, high: candle.high, low: candle.low, close: candle.close,
     })))
-    createSeriesMarkers(candleSeries, markers.map(marker => ({
-      time: Math.floor(marker.timestamp / 1000) as UTCTimestamp,
-      position: marker.kind === 'long' ? 'belowBar' as const : marker.kind === 'short' ? 'aboveBar' as const : 'inBar' as const,
-      shape: marker.kind === 'long' ? 'arrowUp' as const : marker.kind === 'short' ? 'arrowDown' as const : 'circle' as const,
-      color: marker.kind === 'liquidation' || marker.kind === 'short' ? css('--negative') : css('--positive'),
-      text: marker.label,
-    })))
     const ema20 = ema(data, 20)
     const ema50 = ema(data, 50)
     const ema200 = ema(data, 200)
@@ -67,7 +59,7 @@ export function MarketChart({ market, candles, forming, timeframe, markers }: Pr
     const observer = new ResizeObserver(() => chart.timeScale().applyOptions({ barSpacing: Math.max(3, Math.min(9, element.clientWidth / Math.max(80, data.length))) }))
     observer.observe(element)
     return () => { observer.disconnect(); chart.remove() }
-  }, [data, markers])
+  }, [data])
 
   return <section className="chart-workspace">
     <div className="instrument-strip">
