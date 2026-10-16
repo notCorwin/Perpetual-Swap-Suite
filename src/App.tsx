@@ -232,7 +232,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     return snapshot
   }, radius => withSettingsDeadline(window.webkit.messageHandlers.radar.postMessage({ previewWindowBlur: radius })))
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>({ backgroundMonitoringEnabled: false, notificationsEnabled: true, notificationAuthorization: "notDetermined", notificationError: "", backgroundMonitoringError: "", monitoringPaused: false, launchAtLogin: "disabled", launchAtLoginError: "" })
-  const [chartMoveSettings, setChartMoveSettings] = useState<ChartMoveSettings>({ chartMoveLabelsVisible: true, chartMoveEfficiencyFactor: 1, hourlyVolumeStabilityEnabled: true })
+  const [chartMoveSettings, setChartMoveSettings] = useState<ChartMoveSettings>({ chartMoveLabelsVisible: true, chartMoveEfficiencyFactor: 1, hourlyVolumeStabilityEnabled: false })
   const [chartEfficiencyFactorDraft, setChartEfficiencyFactorDraft] = useState('1')
   const [chartEfficiencyFactorError, setChartEfficiencyFactorError] = useState('')
   const [notificationPending, setNotificationPending] = useState(false)
@@ -304,7 +304,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     setChartMoveSettings({
       chartMoveLabelsVisible: snapshot.chartMoveLabelsVisible ?? true,
       chartMoveEfficiencyFactor: snapshot.chartMoveEfficiencyFactor ?? 1,
-      hourlyVolumeStabilityEnabled: snapshot.hourlyVolumeStabilityEnabled ?? true,
+      hourlyVolumeStabilityEnabled: snapshot.hourlyVolumeStabilityEnabled ?? false,
     })
     if (document.activeElement?.id !== 'default-efficiency-factor') setChartEfficiencyFactorDraft(String(snapshot.chartMoveEfficiencyFactor ?? 1))
     if (!backgroundOpacityDraftDirty.current && document.activeElement?.id !== "background-opacity") setBackgroundOpacityDraft(String(snapshot.frostedBackgroundOpacity))

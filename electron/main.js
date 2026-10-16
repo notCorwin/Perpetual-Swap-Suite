@@ -24,7 +24,7 @@ const defaults = {
   monitoringPaused: false,
   chartMoveLabelsVisible: true,
   chartMoveEfficiencyFactor: 1,
-  hourlyVolumeStabilityEnabled: true,
+  hourlyVolumeStabilityEnabled: false,
 }
 let settingsCache = { ...defaults }
 
