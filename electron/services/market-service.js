@@ -81,7 +81,7 @@ function aggregate(candles, period) {
   return [...groups].flatMap(([timestamp, group]) => {
     const ordered = group.sort((left, right) => left.timestamp - right.timestamp)
     if (ordered.length !== expected || ordered.at(-1).timestamp - ordered[0].timestamp !== period - 300_000) return []
-    return [{ instrument: ordered[0].instrument, timeframe: period === 900_000 ? '15m' : '1H', timestamp, open: ordered[0].open, high: Math.max(...ordered.map(candle => candle.high)), low: Math.min(...ordered.map(candle => candle.low)), close: ordered.at(-1).close, volume: ordered.reduce((sum, candle) => sum + (candle.volume ?? 0), 0), quoteVolume: ordered.reduce((sum, candle) => sum + (candle.quoteVolume ?? 0), 0), confirmed: true }]
+    return [{ instrument: ordered[0].instrument, timeframe: period === 900_000 ? '15m' : '1H', timestamp, open: ordered[0].open, high: Math.max(...ordered.map(candle => candle.high)), low: Math.min(...ordered.map(candle => candle.low)), close: ordered.at(-1).close, volume: ordered.reduce((sum, candle) => sum + (candle.volume ?? 0), 0), quoteVolume: ordered.reduce((sum, candle) => sum + (candle.quoteVolume ?? 0), 0), oi: ordered.at(-1).oi ?? null, buy: ordered.reduce((sum, candle) => sum + (candle.buy ?? 0), 0), sell: ordered.reduce((sum, candle) => sum + (candle.sell ?? 0), 0), confirmed: true }]
   })
 }
 
@@ -107,7 +107,7 @@ function marketRow(instrument, ticker, result, bars = []) {
 export class MarketService {
   constructor(store, criteria = () => ({ hourlyVolumeStabilityEnabled: true }), fetcher = fetch, autoRefresh = true) {
     this.store = store; this.criteria = criteria; this.fetcher = fetcher; this.autoRefresh = autoRefresh
-    this.rows = []; this.revision = 0; this.refreshing = null; this.error = ''; this.lastRefreshAt = 0; this.hydrating = new Map(); this.instruments = new Map(); this.liveCandles = new Map(); this.nextRequestAt = 0
+    this.rows = []; this.revision = 0; this.refreshing = null; this.error = ''; this.lastRefreshAt = 0; this.hydrating = new Map(); this.instruments = new Map(); this.liveCandles = new Map(); this.nextRequestAt = 0; this.historyExhausted = new Set(); this.statisticsHydrated = new Set()
   }
 
   async get(path, parameters) {
@@ -132,6 +132,35 @@ export class MarketService {
     throw lastError instanceof Error ? lastError : new Error(`OKX ${path} failed after retries.`)
   }
 
+  async persistCandles(instrument, candles) {
+    const confirmed = candles.filter(value => value.confirmed)
+    if (!confirmed.length) return
+    await this.store.appendCandles(confirmed)
+    const source = await this.store.candles({ instrument, timeframe: '5m' })
+    await this.store.appendCandles(aggregate(source, 900_000))
+    await this.store.appendCandles(aggregate(source, 3_600_000))
+  }
+
+  async hydrateStatistics(instrument, after) {
+    const key = `${instrument.instId}:${after ?? 'latest'}`
+    if (this.statisticsHydrated.has(key)) return
+    const [openInterest, taker] = await Promise.all([
+      this.get('/rubik/stat/contracts/open-interest-history', { instId: instrument.instId, period: '5m', limit: 100, after }),
+      this.get('/rubik/stat/taker-volume-contract', { instId: instrument.instId, period: '5m', unit: 2, limit: 100, after }),
+    ])
+    // Both endpoints report contract counts: OI is the first OI field, while
+    // taker rows are [timestamp, sell contracts, buy contracts].
+    const oiByHour = new Map(openInterest.map(value => [Number(value[0]), number(value[1])]))
+    const takerByHour = new Map(taker.map(value => [Number(value[0]), { sell: number(value[1]), buy: number(value[2]) }]))
+    const local = await this.store.candles({ instrument: instrument.instId, timeframe: '5m' })
+    const patched = local.flatMap(value => {
+      const oi = oiByHour.get(value.timestamp), volumes = takerByHour.get(value.timestamp)
+      return oi === undefined && volumes === undefined ? [] : [{ ...value, oi: oi ?? value.oi ?? null, sell: volumes?.sell ?? value.sell ?? null, buy: volumes?.buy ?? value.buy ?? null }]
+    })
+    if (patched.length) await this.persistCandles(instrument.instId, patched)
+    this.statisticsHydrated.add(key)
+  }
+
   async hydrate(instrument) {
     if (this.hydrating.has(instrument.instId)) return this.hydrating.get(instrument.instId)
     const task = (async () => {
@@ -151,22 +180,38 @@ export class MarketService {
           after = oldest
           if (page.length < 300 && !usingArchive) { path = '/market/history-candles'; usingArchive = true }
         }
-        const confirmed = fetched.filter(value => value.confirmed)
         const live = fetched.filter(value => !value.confirmed).sort((left, right) => left.timestamp - right.timestamp).at(-1)
         if (live) this.liveCandles.set(instrument.instId, live)
-        await this.store.appendCandles(confirmed)
-        await this.store.appendCandles(aggregate(confirmed, 900_000))
-        await this.store.appendCandles(aggregate(confirmed, 3_600_000))
+        await this.persistCandles(instrument.instId, fetched)
+        await this.hydrateStatistics(instrument)
       }
+      await this.hydrateStatistics(instrument)
       this.revision += 1
     })().finally(() => this.hydrating.delete(instrument.instId))
     this.hydrating.set(instrument.instId, task)
     return task
   }
 
-  async bars(instrument, timeframe) {
+  async loadOlder(instrument, timeframe, targetEnd) {
+    const intervalMS = timeframe === '5m' ? 300_000 : timeframe === '15m' ? 900_000 : 3_600_000
+    const neededHour = targetEnd - 95 * intervalMS
+    let source = await this.store.candles({ instrument: instrument.instId, timeframe: '5m' })
+    while (source[0] && source[0].timestamp > neededHour && !this.historyExhausted.has(instrument.instId)) {
+      const after = source[0].timestamp
+      const page = await this.get('/market/history-candles', { instId: instrument.instId, bar: '5m', limit: 300, after })
+      const older = page.map(value => candle(instrument.instId, value)).filter(Boolean)
+      if (!older.length) { this.historyExhausted.add(instrument.instId); break }
+      await this.persistCandles(instrument.instId, older)
+      await this.hydrateStatistics(instrument, after)
+      source = await this.store.candles({ instrument: instrument.instId, timeframe: '5m' })
+      if (page.length < 300) this.historyExhausted.add(instrument.instId)
+    }
+  }
+
+  async bars(instrument, timeframe, targetEnd) {
     const metadata = this.instruments.get(instrument)
     if (metadata) await this.hydrate(metadata)
+    if (metadata && targetEnd !== undefined) await this.loadOlder(metadata, timeframe, targetEnd)
     let candles = await this.store.candles({ instrument, timeframe })
     if (!candles.length && timeframe !== '5m') {
       const source = await this.store.candles({ instrument, timeframe: '5m' })
@@ -175,6 +220,8 @@ export class MarketService {
     const live = timeframe === '5m' ? this.liveCandles.get(instrument) : undefined
     return barsWithIndicators(live ? [...candles, live] : candles)
   }
+
+  isHistoryExhausted(instrument) { return this.historyExhausted.has(instrument) || !this.instruments.has(instrument) }
 
   async refresh() {
     if (this.refreshing) return this.refreshing
