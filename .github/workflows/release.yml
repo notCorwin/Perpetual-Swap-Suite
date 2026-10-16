@@ -22,10 +22,13 @@ jobs:
         with:
           node-version: 'node'
           cache: npm
-      - name: Build release app
+      - name: Verify Electron app
         run: |
           npm ci
-          npm run app
+          npm test
+          npm run benchmark
+      - name: Build release app
+        run: npm run app
       - name: Package release app
         shell: bash
         run: |

@@ -1,11 +1,12 @@
-import { app, BrowserWindow, clipboard, ipcMain, nativeImage, shell } from 'electron'
-import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { MarketStore } from './services/market-store.js'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const rendererURL = process.env.ELECTRON_RENDERER_URL
+const testMode = process.env.PERPETUAL_SWAP_E2E === '1'
 const settingsFile = () => join(app.getPath('userData'), 'settings.json')
 let window
 let marketStore
@@ -70,6 +71,12 @@ function unsupported(request) {
 
 async function handleRequest(event, request) {
   if (!request || typeof request !== 'object') throw new Error('Invalid desktop bridge request.')
+  if ('e2e' in request) {
+    if (!testMode) throw new Error('The E2E desktop API is unavailable outside tests.')
+    if (request.e2e.action === 'seedCandles') return { written: await marketStore.appendCandles(request.e2e.candles ?? []) }
+    if (request.e2e.action === 'settings') return settings()
+    throw new Error('Unknown E2E desktop action.')
+  }
   if ('chartInstId' in request) {
     const timeframe = request.timeframe ?? '1H'
     const candles = await marketStore.candles({ instrument: request.chartInstId, timeframe })
@@ -111,6 +118,7 @@ async function createWindow() {
     width: 1440, height: 900, minWidth: 400, minHeight: 300,
     title: 'Perpetual Swap Suite',
     backgroundColor: '#101114',
+    show: !testMode,
     webPreferences: { preload: join(root, 'electron', 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   })
   if (rendererURL) await window.loadURL(rendererURL)
@@ -119,6 +127,7 @@ async function createWindow() {
 }
 
 app.whenReady().then(async () => {
+  if (process.env.PERPETUAL_SWAP_USER_DATA) app.setPath('userData', process.env.PERPETUAL_SWAP_USER_DATA)
   marketStore = await MarketStore.open(join(app.getPath('userData'), 'MarketData'))
   ipcMain.handle('radar:request', handleRequest)
   await createWindow()
