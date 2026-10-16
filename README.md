@@ -4,7 +4,7 @@
 
 An Electron desktop app for discovering Bullish Setup signals on OKX perpetual swaps and researching their historical results. It covers live, non-TradFi USDT perpetual contracts. Radar supports 5m, 15m, and 1h candles from one authoritative 5m feed; Research keeps hourly execution semantics.
 
-**Radar** discovers live signals. **Research** tests the same strategies against frozen data. Both modes share one strategy library, identity and revisions. Electron hosts the React dashboard behind a context-isolated preload bridge. The legacy Swift implementation remains in the repository only as a migration reference while the market-data service moves to DuckDB/Parquet. The interface is English-only. No OKX API key or local web server is required.
+**Radar** discovers live signals. **Research** tests the same strategies against frozen data. Both modes share one strategy library, identity and revisions. Electron hosts the React dashboard behind a context-isolated preload bridge. The Electron main process stores completed market observations as partitioned Parquet files and uses DuckDB for queries. The interface is English-only. No OKX API key or local web server is required.
 
 ## Features
 
@@ -36,7 +36,7 @@ On first launch, the collector loads 5m history across the exchange universe and
 Use a macOS version supported by your Xcode installation, with:
 
 - **Node.js 22.18+ within the 22.x line, or Node.js 24.11+**, and npm. These minimums follow the current dependency lockfile.
-- Network access for npm/Swift dependencies, OKX public REST and WebSocket endpoints, and GitHub releases.
+- Network access for npm dependencies, OKX public REST and WebSocket endpoints, and GitHub releases.
 
 ```sh
 git clone https://github.com/notCorwin/Perpetual-Swap-Suite.git
@@ -175,11 +175,10 @@ Choose Light, Dark, or System in the native **Appearance** menu. **Settings** co
 
 | Location | Contents |
 | --- | --- |
-| `~/Library/Application Support/PerpetualRadar/radar.sqlite3` | Confirmed 5m source candles, derived 15m/1h candles, hourly statistics, EMA state, saved Universe/Bullish Setup strategies and shared settings |
-| `~/Library/Application Support/PerpetualRadar/Research/research.sqlite3` | Normalized historical data, frozen experiments, results, and checkpoints |
-| `~/Library/Application Support/PerpetualRadar/Research/Raw/` | Downloaded research source files |
+| `~/Library/Application Support/Perpetual Swap Suite/MarketData/candles/` | Partitioned, immutable confirmed candle Parquet files by timeframe, instrument, and UTC date |
+| `~/Library/Application Support/Perpetual Swap Suite/settings.json` | Desktop preferences and local analysis credentials (mode `0600`) |
 
-Active quotes, live calculations, strategy rule previews, and notification membership remain in memory. Research datasets and workers use their own database, reuse confirmed Radar history, and do not change live market history. Editable strategies are read and written through the same native monitoring service in both modes. SQLite uses write-ahead logging; native services retry transient database and monitor failures automatically.
+Active quotes and the still-forming candle remain in memory. Completed periods are appended to Parquet; DuckDB scans only the required partitions for charts, indicators, and research. The Electron data service serializes writes so readers never observe a partial Parquet file.
 
 ## Development
 
@@ -188,13 +187,13 @@ Active quotes, live calculations, strategy rule previews, and notification membe
 | Path | Responsibility |
 | --- | --- |
 | [electron](electron) | Electron main process and context-isolated preload bridge; no Node APIs are exposed to the renderer |
-| [Sources/PerpetualRadar](Sources/PerpetualRadar) | Legacy Swift implementation retained as a reference while its market-data service is migrated to DuckDB/Parquet |
+| [electron/services](electron/services) | DuckDB query services and partitioned Parquet storage |
 | [src](src) | React/TypeScript dashboard, rule editors, charts, and Research views |
 | [src/components/ui](src/components/ui) | Shared shadcn/ui primitives |
 | [src/index.css](src/index.css) | Design tokens and component material contract; Tailwind CSS supplies layout and styling |
-| [Tests/PerpetualRadarTests](Tests/PerpetualRadarTests) and `src/*.test.ts` | Native and TypeScript test suites |
-| [scripts](scripts) | Electron packaging, development, migration checks, and legacy native test runner |
-| [macos](macos) | Bundle metadata and icon assets |
+| `src/*.test.ts` | TypeScript business, renderer, Electron bridge, and Parquet-store tests |
+| [scripts](scripts) | Electron development and renderer quality checks |
+| [macos](macos) | Electron app icon assets |
 | [.github/workflows/release.yml](.github/workflows/release.yml) | Release build, packaging, and publication |
 
 Swift dependencies are declared in [Package.swift](Package.swift) and resolved in [Package.resolved](Package.resolved). Web dependencies and commands are in [package.json](package.json), with exact versions in [package-lock.json](package-lock.json).

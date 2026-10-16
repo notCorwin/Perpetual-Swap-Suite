@@ -29,7 +29,7 @@ jobs:
       - name: Package release app
         shell: bash
         run: |
-          app="$(find release -path '*Perpetual Swap Suite.app' -type d -print -quit)"
+          app="$(find dist -path '*Perpetual Swap Suite.app' -type d -print -quit)"
           test -n "$app"
           test -x "$app/Contents/MacOS/Perpetual Swap Suite"
           test -f "$app/Contents/Resources/app.asar"

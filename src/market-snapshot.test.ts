@@ -5,7 +5,7 @@ import { keepSnapshotValue, reconcileMarketRows } from "./market-snapshot.ts"
 import type { NativeMarketRow } from "./rule-engine.ts"
 
 test("bridge refreshes keep unchanged row identities while updating changed readings and opportunity", () => {
-  const fixtures = JSON.parse(readFileSync(new URL("../Tests/Fixtures/filter-compatibility.json", import.meta.url), "utf8")) as { row: NativeMarketRow }[]
+  const fixtures = JSON.parse(readFileSync(new URL("./fixtures/filter-compatibility.json", import.meta.url), "utf8")) as { row: NativeMarketRow }[]
   const previous = fixtures.slice(0, 3).map((fixture, index) => ({ ...fixture.row, instId: `MKT${index}` }))
   assert.equal(reconcileMarketRows(previous, structuredClone(previous)), previous)
   const incoming = structuredClone(previous)

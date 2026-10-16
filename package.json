@@ -5,21 +5,17 @@
   "type": "module",
   "scripts": {
     "build": "tsc -b && vite build",
-    "lint": "oxlint src && node --experimental-strip-types scripts/check-surfaces.ts && node --experimental-strip-types scripts/check-background-tests.ts",
+    "lint": "oxlint src && node --experimental-strip-types scripts/check-surfaces.ts",
     "test": "npm run test:renderer",
-    "ci:local": "node --experimental-strip-types scripts/ci-local.ts",
     "app": "npm run electron:package",
-    "benchmark:study": "scripts/benchmark-study.sh",
-    "test:ui": "npm run build && RADAR_UI_TESTS=1 RADAR_VISUAL_TESTS=1 scripts/test-native.sh --filter RuleEditorUITests",
-    "test:ui:visual": "npm run build && RADAR_UI_TESTS=1 RADAR_VISUAL_TESTS=1 scripts/test-native.sh --filter RuleEditorUITests.testAllSurfaceFamiliesAndChartCaptureInNativeWebKit",
     "dev:renderer": "vite --host 127.0.0.1",
     "dev": "scripts/dev-electron.sh",
-    "electron:package": "npm run build && electron-builder --mac --publish never",
-    "app:native": "scripts/build-app.sh",
+    "electron:package": "scripts/package-electron.sh",
     "test:renderer": "node --experimental-strip-types --test src/*.test.ts"
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "3.0.67",
+    "@duckdb/node-api": "^1.5.6-r.1",
     "@shadcn/react": "0.3.1",
     "@streamdown/cjk": "1.0.4",
     "@streamdown/code": "2.0.0",
@@ -73,6 +69,9 @@
     },
     "dmg": {
       "title": "Perpetual Swap Suite"
-    }
+    },
+    "asarUnpack": [
+      "node_modules/@duckdb/node-api/**"
+    ]
   }
 }
