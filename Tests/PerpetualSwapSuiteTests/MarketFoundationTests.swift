@@ -43,19 +43,12 @@ import Testing
     let candles = [
         Candle(instrument: "BTC-USDT-SWAP", timestamp: 1_704_067_200_000, open: 100, high: 102, low: 99, close: 101, volumeContracts: 12, volumeBase: 1.2, volumeQuote: 121, confirmed: true),
         Candle(instrument: "BTC-USDT-SWAP", timestamp: 1_704_067_500_000, open: 101, high: 103, low: 100, close: 102, volumeContracts: 13, volumeBase: 1.3, volumeQuote: 132, confirmed: true),
-        Candle(instrument: "BTC-USDT-SWAP", timestamp: 1_704_067_800_000, open: 102, high: 104, low: 101, close: 103, volumeContracts: 14, volumeBase: 1.4, volumeQuote: 144, confirmed: true),
     ]
     try await store.upsert(candles: candles)
     try await store.upsert(candles: [candles[1]])
     let loaded = try await store.candles(instrument: "BTC-USDT-SWAP")
     #expect(loaded == candles)
     let coverage = try await store.coverage(instrument: "BTC-USDT-SWAP")
-    #expect(coverage.candleCount == 3)
+    #expect(coverage.candleCount == 2)
     #expect(coverage.gaps == 0)
-    let aggregated = try await store.candles(instrument: "BTC-USDT-SWAP", timeframe: .fifteenMinutes)
-    #expect(aggregated.count == 1)
-    #expect(aggregated[0].open == 100)
-    #expect(aggregated[0].close == 103)
-    #expect(aggregated[0].high == 104)
-    #expect(aggregated[0].low == 99)
 }

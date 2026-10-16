@@ -51,41 +51,19 @@ actor ParquetMarketStore {
         for (key, values) in grouped { try rewritePartition(key: key, adding: values) }
     }
 
-    func candles(
-        instrument: String,
-        timeframe: Timeframe = .fiveMinutes,
-        from: Int64? = nil,
-        through: Int64? = nil,
-        limit: Int? = nil
-    ) throws -> [Candle] {
+    func candles(instrument: String, from: Int64? = nil, through: Int64? = nil, limit: Int? = nil) throws -> [Candle] {
         let files = try registeredFiles(instrument: instrument)
         guard !files.isEmpty else { return [] }
         let sources = files.map { "'\(Self.sqlLiteral($0))'" }.joined(separator: ",")
         var predicates = ["instrument = '\(Self.sqlLiteral(instrument))'"]
         if let from { predicates.append("ts >= \(from)") }
         if let through { predicates.append("ts <= \(through)") }
-        let raw = """
+        var sql = """
             SELECT instrument, ts, open, high, low, close, volume_contracts, volume_base, volume_quote, confirmed
             FROM read_parquet([\(sources)], union_by_name = true)
             WHERE \(predicates.joined(separator: " AND "))
+            ORDER BY ts
             """
-        var sql: String
-        if timeframe == .fiveMinutes {
-            sql = "\(raw) ORDER BY ts"
-        } else {
-            let duration = timeframe.milliseconds
-            sql = """
-                SELECT instrument,
-                    (floor(ts::DOUBLE / \(duration))::BIGINT * \(duration)) AS ts,
-                    arg_min(open, ts) AS open, max(high) AS high, min(low) AS low, arg_max(close, ts) AS close,
-                    sum(volume_contracts) AS volume_contracts, sum(volume_base) AS volume_base,
-                    sum(volume_quote) AS volume_quote, bool_and(confirmed) AS confirmed
-                FROM (\(raw)) source
-                GROUP BY instrument, floor(ts::DOUBLE / \(duration))::BIGINT
-                HAVING count(*) = \(timeframe.sourceBarCount)
-                ORDER BY ts
-                """
-        }
         if let limit {
             sql = "SELECT * FROM (\(sql)) ordered ORDER BY ts DESC LIMIT \(max(1, limit))"
             sql = "SELECT * FROM (\(sql)) limited ORDER BY ts"
