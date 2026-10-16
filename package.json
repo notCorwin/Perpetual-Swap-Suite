@@ -6,12 +6,17 @@
   "scripts": {
     "build": "tsc -b && vite build",
     "lint": "oxlint src && node --experimental-strip-types scripts/check-surfaces.ts && node --experimental-strip-types scripts/check-background-tests.ts",
-    "test": "scripts/test-native.sh && node --experimental-strip-types --test src/*.test.ts",
+    "test": "npm run test:renderer",
     "ci:local": "node --experimental-strip-types scripts/ci-local.ts",
-    "app": "scripts/build-app.sh",
+    "app": "npm run electron:package",
     "benchmark:study": "scripts/benchmark-study.sh",
     "test:ui": "npm run build && RADAR_UI_TESTS=1 RADAR_VISUAL_TESTS=1 scripts/test-native.sh --filter RuleEditorUITests",
-    "test:ui:visual": "npm run build && RADAR_UI_TESTS=1 RADAR_VISUAL_TESTS=1 scripts/test-native.sh --filter RuleEditorUITests.testAllSurfaceFamiliesAndChartCaptureInNativeWebKit"
+    "test:ui:visual": "npm run build && RADAR_UI_TESTS=1 RADAR_VISUAL_TESTS=1 scripts/test-native.sh --filter RuleEditorUITests.testAllSurfaceFamiliesAndChartCaptureInNativeWebKit",
+    "dev:renderer": "vite --host 127.0.0.1",
+    "dev": "scripts/dev-electron.sh",
+    "electron:package": "npm run build && electron-builder --mac --publish never",
+    "app:native": "scripts/build-app.sh",
+    "test:renderer": "node --experimental-strip-types --test src/*.test.ts"
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "3.0.67",
@@ -42,9 +47,32 @@
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "@vitejs/plugin-react": "6.1.2",
+    "electron": "^44.8.0",
+    "electron-builder": "^26.15.3",
     "oxlint": "1.87.0",
     "tailwindcss": "4.3.3",
     "typescript": "7.0.2",
     "vite": "8.3.4"
+  },
+  "main": "electron/main.js",
+  "build": {
+    "appId": "com.perpetualradar.desktop",
+    "productName": "Perpetual Swap Suite",
+    "files": [
+      "dist/**",
+      "electron/**",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.finance",
+      "icon": "macos/AppIcon.icns",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "dmg": {
+      "title": "Perpetual Swap Suite"
+    }
   }
 }

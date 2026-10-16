@@ -1,4 +1,4 @@
-name: Publish macOS Release
+name: Publish Electron macOS Release
 
 on:
   push:
@@ -25,37 +25,23 @@ jobs:
       - name: Build release app
         run: |
           npm ci
-          APP_REVISION="$GITHUB_SHA" npm run app
+          npm run app
       - name: Package release app
         shell: bash
         run: |
-          app='.build/app/Perpetual Swap Suite.app'
-          test -x "$app/Contents/MacOS/PerpetualRadar"
-          test -s "$app/Contents/Resources/Assets.car"
-          test -s "$app/Contents/Resources/Web/index.html"
-          test -d "$app/Contents/Resources/Web/assets"
-          test "$(cat "$app/Contents/PkgInfo")" = 'APPL????'
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = com.perpetualradar.macos
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$app/Contents/Info.plist")" = AppIcon
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleSourceRevision' "$app/Contents/Info.plist")" = "$GITHUB_SHA"
-          helper="$app/Contents/Library/LoginItems/Perpetual Swap Suite Monitor.app"
-          test -x "$helper/Contents/MacOS/PerpetualRadar"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$helper/Contents/Info.plist")" = com.perpetualradar.macos.monitor
-          test "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$helper/Contents/Info.plist")" = true
-          codesign --verify --deep --strict "$app"
-          # Keep the historical .tar asset URL so already-installed versions can
-          # update, while gzip-compressing its contents to reduce transfer time.
-          tar -czf Perpetual.Swap.Suite.app.tar -C .build/app 'Perpetual Swap Suite.app'
-          tar -tf Perpetual.Swap.Suite.app.tar | grep -qx 'Perpetual Swap Suite.app/Contents/MacOS/PerpetualRadar'
-          sha256="$(shasum -a 256 Perpetual.Swap.Suite.app.tar | cut -d' ' -f1)"
+          app="$(find release -path '*Perpetual Swap Suite.app' -type d -print -quit)"
+          test -n "$app"
+          test -x "$app/Contents/MacOS/Perpetual Swap Suite"
+          test -f "$app/Contents/Resources/app.asar"
+          ditto -c -k --keepParent "$app" Perpetual.Swap.Suite.app.zip
+          sha256="$(shasum -a 256 Perpetual.Swap.Suite.app.zip | cut -d' ' -f1)"
           built_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           repository_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
-          asset_url="${repository_url}/releases/download/autobuild/Perpetual.Swap.Suite.app.tar"
+          asset_url="${repository_url}/releases/download/autobuild/Perpetual.Swap.Suite.app.zip"
           commit_date="$(TZ=UTC git show -s --date=format-local:'%Y-%m-%dT%H:%M:%SZ' --format=%cd "$GITHUB_SHA")"
           printf '{"revision":"%s","asset_url":"%s","digest":"sha256:%s","published_at":"%s","commit_date":"%s"}\n' \
             "$GITHUB_SHA" "$asset_url" "$sha256" "$built_at" "$commit_date" > update.json
-          printf 'Latest automatic build from `main`. This release is replaced after each successful build.\n\n[Download Perpetual Swap Suite](%s)\n\nCommit: [%s](%s/commit/%s)\n\nBuilt at: %s (UTC)\n' \
-            "$asset_url" "$GITHUB_SHA" "$repository_url" "$GITHUB_SHA" "$built_at" > release-notes.md
+          printf 'Latest Electron build from `main`.\n\n[Download Perpetual Swap Suite](%s)\n' "$asset_url" > release-notes.md
       - name: Publish autobuild release
         shell: bash
         env:
@@ -65,10 +51,10 @@ jobs:
             gh release create autobuild --target "$GITHUB_SHA" --title autobuild --latest \
               --notes-file release-notes.md
           fi
-          gh release upload autobuild 'Perpetual.Swap.Suite.app.tar#Perpetual Swap Suite.app' --clobber
+          gh release upload autobuild 'Perpetual.Swap.Suite.app.zip#Perpetual Swap Suite.app' --clobber
           digest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/autobuild" \
-            --jq '[.assets[] | select(.name == "Perpetual.Swap.Suite.app.tar")] | .[0].digest')"
-          if [[ "$digest" != "sha256:$(shasum -a 256 Perpetual.Swap.Suite.app.tar | cut -d' ' -f1)" ]]; then
+            --jq '[.assets[] | select(.name == "Perpetual.Swap.Suite.app.zip")] | .[0].digest')"
+          if [[ "$digest" != "sha256:$(shasum -a 256 Perpetual.Swap.Suite.app.zip | cut -d' ' -f1)" ]]; then
             echo 'Uploaded app digest does not match the build.' >&2
             exit 1
           fi
@@ -79,7 +65,7 @@ jobs:
             --notes-file release-notes.md
           release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/autobuild" --jq .id)"
           gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" --paginate |
-            jq -r '.[] | select(.name != "Perpetual.Swap.Suite.app.tar" and .name != "update.json") | .id' |
+            jq -r '.[] | select(.name != "Perpetual.Swap.Suite.app.zip" and .name != "update.json") | .id' |
             while read -r asset_id; do
               gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" >/dev/null
             done

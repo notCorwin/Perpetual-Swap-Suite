@@ -2,9 +2,9 @@
 
 [![Publish macOS Release](https://github.com/notCorwin/Perpetual-Swap-Suite/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/notCorwin/Perpetual-Swap-Suite/actions/workflows/release.yml)
 
-A native macOS app for discovering Bullish Setup signals on OKX perpetual swaps and researching their historical results. It covers live, non-TradFi USDT perpetual contracts. Radar supports 5m, 15m, and 1h candles from one authoritative 5m feed; Research keeps hourly execution semantics.
+An Electron desktop app for discovering Bullish Setup signals on OKX perpetual swaps and researching their historical results. It covers live, non-TradFi USDT perpetual contracts. Radar supports 5m, 15m, and 1h candles from one authoritative 5m feed; Research keeps hourly execution semantics.
 
-**Radar** discovers live signals. **Research** tests the same strategies against frozen data. Both modes share one strategy library, identity and revisions. Swift handles market data, calculations, storage, and native services; an AppKit window hosts the React dashboard in WKWebView. The interface is English-only. No OKX API key or local web server is required.
+**Radar** discovers live signals. **Research** tests the same strategies against frozen data. Both modes share one strategy library, identity and revisions. Electron hosts the React dashboard behind a context-isolated preload bridge. The legacy Swift implementation remains in the repository only as a migration reference while the market-data service moves to DuckDB/Parquet. The interface is English-only. No OKX API key or local web server is required.
 
 ## Features
 
@@ -31,11 +31,10 @@ The release contains an ad hoc signed app bundle. Each successful release build 
 
 On first launch, the collector loads 5m history across the exchange universe and derives naturally aligned 15m and 1h candles locally. Markets and indicators appear as their data becomes available; missing readings display as `—`.
 
-### Build from source
+### Build the Electron app from source
 
 Use a macOS version supported by your Xcode installation, with:
 
-- **Full Xcode and Swift 6.2+**, with Xcode selected as the active developer directory. Command Line Tools alone do not provide the asset compiler used to build the app.
 - **Node.js 22.18+ within the 22.x line, or Node.js 24.11+**, and npm. These minimums follow the current dependency lockfile.
 - Network access for npm/Swift dependencies, OKX public REST and WebSocket endpoints, and GitHub releases.
 
@@ -44,10 +43,10 @@ git clone https://github.com/notCorwin/Perpetual-Swap-Suite.git
 cd Perpetual-Swap-Suite
 npm ci
 npm run app
-open ".build/app/Perpetual Swap Suite.app"
+open "release/mac-arm64/Perpetual Swap Suite.app"
 ```
 
-`npm run app` builds the TypeScript renderer and release Swift executable, packages the dashboard and monitor helper, compiles the app icon, and ad hoc signs both bundles. It builds without opening the app; the final command launches it.
+`npm run app` builds the Vite renderer and packages a signed Electron `.app` with electron-builder. Use `npm run dev` for hot-reload development.
 
 ## Using Radar
 
@@ -188,12 +187,13 @@ Active quotes, live calculations, strategy rule previews, and notification membe
 
 | Path | Responsibility |
 | --- | --- |
-| [Sources/PerpetualRadar](Sources/PerpetualRadar) | AppKit/WebKit host, native monitor and IPC, OKX networking, indicators, rules, SQLite, Research, notifications, and updater |
+| [electron](electron) | Electron main process and context-isolated preload bridge; no Node APIs are exposed to the renderer |
+| [Sources/PerpetualRadar](Sources/PerpetualRadar) | Legacy Swift implementation retained as a reference while its market-data service is migrated to DuckDB/Parquet |
 | [src](src) | React/TypeScript dashboard, rule editors, charts, and Research views |
 | [src/components/ui](src/components/ui) | Shared shadcn/ui primitives |
 | [src/index.css](src/index.css) | Design tokens and component material contract; Tailwind CSS supplies layout and styling |
 | [Tests/PerpetualRadarTests](Tests/PerpetualRadarTests) and `src/*.test.ts` | Native and TypeScript test suites |
-| [scripts](scripts) | App packaging, isolated native test runner, and surface checks |
+| [scripts](scripts) | Electron packaging, development, migration checks, and legacy native test runner |
 | [macos](macos) | Bundle metadata and icon assets |
 | [.github/workflows/release.yml](.github/workflows/release.yml) | Release build, packaging, and publication |
 
