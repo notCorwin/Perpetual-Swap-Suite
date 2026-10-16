@@ -2,6 +2,7 @@ import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { ChartFocus } from './services/chart-focus.js'
 import { MarketStore } from './services/market-store.js'
 import { MarketService } from './services/market-service.js'
 
@@ -13,6 +14,9 @@ let window
 let marketStore
 let marketService
 const gatewayRequests = new Map()
+const chartFocus = new ChartFocus()
+let shuttingDown = false
+let shutdownComplete = false
 
 const defaults = {
   windowBlurRadius: 64,
@@ -38,6 +42,18 @@ async function saveSettings(value) {
   await mkdir(dirname(settingsFile()), { recursive: true })
   await writeFile(settingsFile(), JSON.stringify(next, null, 2), { mode: 0o600 })
   return next
+}
+
+function focusChart(instId, session, token) {
+  const accepted = chartFocus.focus(instId, session, token)
+  if (accepted.ok) marketService?.focusChart(instId, accepted.sequence)
+  return accepted
+}
+
+function focusLegacyChart(instId) {
+  const accepted = chartFocus.focusLegacy(instId)
+  if (accepted.ok) marketService?.focusChart(instId, accepted.sequence)
+  return accepted
 }
 
 function preferences(saved) {
@@ -109,19 +125,42 @@ async function handleRequest(event, request) {
   }
   if ('previewMarketFilters' in request) return { ...(await snapshot()), filterToken: request.previewMarketFilters.token, filterResults: {}, historyProgress: { pending: 0, completed: 0, error: '' } }
   if ('explainMarketFilters' in request) return { instId: request.explainMarketFilters.instId, filterToken: request.explainMarketFilters.token, revision: 0, trace: null }
+  if ('chartSession' in request) return { session: chartFocus.beginSession() }
+  if ('chartFocus' in request) return { ok: focusChart(request.chartFocus?.instId, request.chartFocus?.session, request.chartFocus?.token).ok }
   if ('chartInstId' in request) {
     const timeframe = request.timeframe ?? '1H'
-    const bars = await marketService.bars(request.chartInstId, timeframe, request.chartEndHour)
+    let focused = { ok: false, sequence: undefined }
+    if (!request.preview) {
+      if (Number.isSafeInteger(request.chartFocusSession) && Number.isSafeInteger(request.chartFocusToken)) {
+        focused = focusChart(request.chartInstId, request.chartFocusSession, request.chartFocusToken)
+      } else {
+        focused = focusLegacyChart(request.chartInstId)
+      }
+    }
+    // A newer wheel position already owns this renderer session. Do not let a
+    // late IPC message add cache-only DuckDB work ahead of the visible window.
+    if (!request.preview && !focused.ok) return { unchanged: true, error: '', revision: marketService.revision }
+    if (request.chartEndHour === undefined && request.sinceRevision === marketService.revision && marketService.isActiveChartViewport(request.chartInstId, timeframe, undefined)) {
+      return { unchanged: true, error: '', revision: marketService.revision }
+    }
+    // Neighbor previews may read the local cache, but must never enqueue
+    // hydration, gap repair, or OI/Taker work ahead of the visible chart.
+    const chart = await marketService.bars(request.chartInstId, timeframe, request.chartEndHour, focused.ok ? { foreground: true, focusToken: focused.sequence } : { hydrate: false, repair: false, statistics: false })
+    if (chart.stale) return { unchanged: true, error: '', revision: marketService.revision }
+    const { bars } = chart
     const intervalMS = timeframe === '5m' ? 300_000 : timeframe === '15m' ? 900_000 : 3_600_000
     const oldestHour = bars[0]?.hour ?? null, latestHour = bars.at(-1)?.hour ?? null
     const minimumEnd = oldestHour === null ? null : Math.min(latestHour ?? oldestHour, oldestHour + 95 * intervalMS)
     const requestedEnd = request.chartEndHour
+    const hasFixedHistoryBoundary = chart.candleState === 'exhausted' || marketService.isHistoryExhausted(request.chartInstId)
     const endHour = requestedEnd === undefined || minimumEnd === null || latestHour === null
       ? undefined
-      : Math.max(minimumEnd, Math.min(latestHour, requestedEnd))
+      : hasFixedHistoryBoundary ? Math.max(minimumEnd, Math.min(latestHour, requestedEnd)) : requestedEnd
     return {
-      bars, error: '', revision: marketService.revision, timeframe, oldestHour,
-      endHour, historyExhausted: requestedEnd !== undefined && minimumEnd !== null && requestedEnd <= minimumEnd && marketService.isHistoryExhausted(request.chartInstId),
+      bars, error: '', revision: chart.revision ?? marketService.revision, timeframe, oldestHour,
+      endHour, historyExhausted: requestedEnd !== undefined && minimumEnd !== null && requestedEnd <= minimumEnd && hasFixedHistoryBoundary,
+      candleState: chart.candleState, missingCandleRanges: chart.missingCandleRanges, candleRetryAt: chart.candleRetryAt,
+      statisticsState: chart.statisticsState, statisticsRetryAt: chart.statisticsRetryAt,
     }
   }
   if ('gatewayFetch' in request) return gatewayFetch(event, request.gatewayFetch)
@@ -177,5 +216,20 @@ app.whenReady().then(async () => {
   await createWindow()
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) void createWindow() })
 })
-app.on('before-quit', () => { void marketStore?.close() })
+app.on('before-quit', event => {
+  if (shutdownComplete) return
+  event.preventDefault()
+  if (shuttingDown) return
+  shuttingDown = true
+  ipcMain.removeHandler('radar:request')
+  void (async () => {
+    try {
+      await marketService?.dispose()
+      await marketStore?.close()
+    } finally {
+      shutdownComplete = true
+      app.quit()
+    }
+  })()
+})
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })

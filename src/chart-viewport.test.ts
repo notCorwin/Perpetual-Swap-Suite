@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chartHistoryNeedsLoad, chartStatsNeedLoad, completeIndicatorSeries, livePriceTag, renderableChartEnd, scrollChartEnd, visibleChartBars } from "./chart-viewport.ts"
+import { chartHistoryNeedsLoad, chartIndicatorsNeedLoad, chartScrollFloor, chartStatisticsRequestable, chartStatsNeedLoad, completeIndicatorSeries, hasCompleteChartWindow, livePriceTag, renderableChartEnd, scrollChartEnd, visibleChartBars } from "./chart-viewport.ts"
 
 const hour = 3_600_000
 test("live price and countdown do not change when the chart scrolls into history", () => {
@@ -44,6 +44,14 @@ test("a pending history range keeps rendering the nearest cached window", () => 
   assert.equal(renderableChartEnd(bars, 95 * hour), 95 * hour)
 })
 
+test("a partial overlap is not a renderable chart window", () => {
+  const bars = Array.from({ length: 301 }, (_, index) => ({ hour: index * hour })).filter(bar => bar.hour !== 148 * hour)
+  assert.equal(hasCompleteChartWindow(bars, 148 * hour), false)
+  assert.equal(renderableChartEnd(bars, 148 * hour), 147 * hour)
+  assert.equal(visibleChartBars(bars, renderableChartEnd(bars, 148 * hour)!, hour).length, 96)
+  assert.equal(renderableChartEnd(bars.slice(0, 95), 94 * hour), null)
+})
+
 test("indicators render only for a complete visible candle window", () => {
   const complete = Array.from({ length: 96 }, (_, index) => ({ ema: index + 1 }))
   assert.equal(completeIndicatorSeries(complete, 'ema'), true)
@@ -51,11 +59,30 @@ test("indicators render only for a complete visible candle window", () => {
   assert.equal(completeIndicatorSeries(complete.slice(1), 'ema'), false)
 })
 
+test("a complete visible candle window still reloads when a warm-up gap leaves an indicator null", () => {
+  const bars = Array.from({ length: 500 }, (_, index) => ({
+    hour: index * hour, vwap: 1, ema: 1, logBBUpper: 1, logBBMiddle: 1, logBBLower: 1,
+    roc: 1, maroc: 1, rsi6: 1, rsi12: 1, rsi24: 1,
+  }))
+  const end = 450 * hour
+  assert.equal(chartIndicatorsNeedLoad(bars, end), false)
+  assert.equal(chartIndicatorsNeedLoad(bars.map(bar => bar.hour === 400 * hour ? { ...bar, ema: null } : bar), end), true)
+  assert.equal(chartIndicatorsNeedLoad(bars.map(bar => bar.hour === 200 * hour ? { ...bar, ema: null } : bar), end), false)
+})
+
 test("a buffered history block avoids native requests until the viewport nears its left edge", () => {
   const oldest = 1_000 * hour
   assert.equal(chartHistoryNeedsLoad(1_499 * hour, oldest), false)
   assert.equal(chartHistoryNeedsLoad(1_144 * hour, oldest), false)
   assert.equal(chartHistoryNeedsLoad(1_143 * hour, oldest), true)
+})
+
+test("scrolling never requests an end below the earliest complete cached window", () => {
+  assert.equal(chartScrollFloor(1_000 * hour, null), 1_095 * hour)
+  assert.equal(chartScrollFloor(1_000 * hour, 900 * hour), 995 * hour)
+  const bars = Array.from({ length: 96 }, (_, index) => ({ hour: (1_000 + index) * hour }))
+  const floor = chartScrollFloor(1_000 * hour, null)
+  assert.equal(renderableChartEnd(bars, floor), floor)
 })
 
 test("cached candles still request history when visible OI or taker data is missing", () => {
@@ -66,4 +93,12 @@ test("cached candles still request history when visible OI or taker data is miss
   const missingTaker = complete.map(bar => bar.hour === 420 * hour ? { ...bar, buy: null } : bar)
   assert.equal(chartStatsNeedLoad(missingTaker, 450 * hour), true)
   assert.equal(chartStatsNeedLoad(missingTaker, 300 * hour), false, "Only the visible window should trigger a statistics request")
+})
+
+test("a complete visible window requests OI/Taker while an unrelated indicator warm-up repair retries", () => {
+  const complete = Array.from({ length: 96 }, (_, index) => ({ hour: index * hour, confirmed: true, oi: 1, buy: 2, sell: 3 }))
+  const missingOI = complete.map(bar => bar.hour === 40 * hour ? { ...bar, oi: null } : bar)
+
+  assert.equal(chartStatisticsRequestable(missingOI, 95 * hour, 95 * hour), true)
+  assert.equal(chartStatisticsRequestable(missingOI, 95 * hour, 94 * hour), false, "Never request statistics for a fallback viewport")
 })

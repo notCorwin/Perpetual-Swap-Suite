@@ -15,5 +15,6 @@ export class MarketStore {
   appendCandles(candles: CandleRecord[]): Promise<number>
   candles(query: { instrument: string; timeframe: string; from?: number; through?: number }): Promise<CandleRecord[]>
   coverage(instrument: string, timeframe: string): Promise<{ count: number; first: number | null; last: number | null }>
+  missingCandleRanges(query: { instrument: string; timeframe?: string; from: number; through: number; intervalMS?: number }): Promise<Array<{ from: number; through: number }>>
   close(): Promise<void>
 }

@@ -71,7 +71,9 @@ type NativeBridge = {
   postMessage(request: { captureChart: { x: number; y: number; width: number; height: number; backgroundRGB: number[] } }): Promise<{ ok: boolean }>
   postMessage(request: { windowTintRGB: number[] }): Promise<{ ok: boolean }>
   postMessage(request: { previewWindowBlur: number | null }): Promise<{ ok: boolean }>
-  postMessage(request: { chartInstId: string; timeframe?: RadarTimeframe; loadChart?: boolean; sinceRevision?: number; chartEndHour?: number; serviceSession?: string }): Promise<ChartPollResponse>
+  postMessage(request: { chartSession: true }): Promise<{ session: number }>
+  postMessage(request: { chartFocus: { instId: string; session: number; token: number } }): Promise<{ ok: boolean }>
+  postMessage(request: { chartInstId: string; timeframe?: RadarTimeframe; loadChart?: boolean; preview?: boolean; chartFocusSession?: number; chartFocusToken?: number; sinceRevision?: number; chartEndHour?: number; serviceSession?: string }): Promise<ChartPollResponse>
 }
 declare global {
   interface Window { radarNotificationContract?: string; radarNotificationStrategy?: string; radarAppearance?: WindowAppearance & { nativeWindowBackground?: boolean }; webkit: { messageHandlers: { radar: NativeBridge } } }
