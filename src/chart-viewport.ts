@@ -21,6 +21,15 @@ export function visibleChartBars<T extends { hour: number }>(bars: T[], endHour:
   return bars.filter(bar => bar.hour >= firstHour && bar.hour <= endHour)
 }
 
+// A scroll request can target history that is still downloading. Keep drawing
+// the nearest complete cached window until the response expands coverage;
+// rendering an empty range makes the chart appear to have fallen into limbo.
+export function renderableChartEnd<T extends { hour: number }>(bars: T[], requestedEnd: number, intervalMS = hour): number {
+  if (!bars.length || visibleChartBars(bars, requestedEnd, intervalMS).length) return requestedEnd
+  const oldest = bars[0].hour, latest = bars.at(-1)!.hour
+  return Math.min(latest, oldest + 95 * intervalMS)
+}
+
 export function chartHistoryNeedsLoad(endHour: number, oldestCachedHour: number, visibleHours = 96, prefetchHours = 48, intervalMS = hour): boolean {
   return endHour - (visibleHours - 1) * intervalMS <= oldestCachedHour + prefetchHours * intervalMS
 }

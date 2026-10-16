@@ -13,7 +13,7 @@ import { type AnalysisDirection } from '@/chart-analysis'
 import { chartCaptureBounds } from '@/chart-capture'
 import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicY } from "@/chart-axis"
 import { chartCandleWidth, chartHourX, chartLayout, fitAxisPriceTag, type ChartPanel as Panel } from "@/chart-layout"
-import { chartHistoryNeedsLoad, chartStatsNeedLoad, livePriceTag, scrollChartEnd, visibleChartBars } from "@/chart-viewport"
+import { chartHistoryNeedsLoad, livePriceTag, renderableChartEnd, scrollChartEnd, visibleChartBars } from "@/chart-viewport"
 import { cn, pageVisible } from "@/lib/utils"
 import { chartNavigationTarget, wrappedMarket } from "@/market-sort"
 import { finitePercentage, formatPercent, type PercentageValue } from "@/market-percent"
@@ -470,7 +470,9 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
   useEffect(() => {
     if (historicalEnd === null) return
     const needsCandles = chartHistoryNeedsLoad(historicalEnd, oldestCachedHour, 96, 48, intervalMS)
-    const needsStats = timeframe === '1H' && chartStatsNeedLoad(cachedBars, historicalEnd, 96, intervalMS)
+    // Missing OI/Taker samples are shown as unavailable. They must not turn a
+    // valid candle window into an endless history-loading state.
+    const needsStats = false
     const key = `${cacheKey}:${historicalEnd}`
     // A buffered response can satisfy many adjacent viewport positions. Failed
     // or partial attempts are released by the bounded automatic retry timer.
@@ -634,7 +636,8 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     }
   }, [listOrder, turnoverOrder, onSelect])
 
-  const viewportEnd = historicalEnd ?? chart?.bars.at(-1)?.hour ?? 0
+  const requestedViewportEnd = historicalEnd ?? chart?.bars.at(-1)?.hour ?? 0
+  const viewportEnd = useMemo(() => renderableChartEnd(cachedBars, requestedViewportEnd, intervalMS), [cachedBars, requestedViewportEnd, intervalMS])
   const bars = useMemo(() => visibleChartBars(cachedBars, viewportEnd, intervalMS), [cachedBars, viewportEnd, intervalMS])
   const inspectedIndex = inspection?.id === cacheKey ? bars.findIndex(bar => bar.hour === inspection.hour) : -1
   const inspected = inspectedIndex < 0 ? null : inspectedIndex
