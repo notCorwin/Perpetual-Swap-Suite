@@ -113,8 +113,7 @@ async function handleRequest(event, request) {
   if ('explainMarketFilters' in request) return { instId: request.explainMarketFilters.instId, filterToken: request.explainMarketFilters.token, revision: 0, trace: null }
   if ('chartInstId' in request) {
     const timeframe = request.timeframe ?? '1H'
-    const candles = await marketStore.candles({ instrument: request.chartInstId, timeframe })
-    return { bars: candles.map(candle => ({ hour: candle.timestamp, open: candle.open, high: candle.high, low: candle.low, close: candle.close, confirmed: Boolean(candle.confirmed), vwap: null, ema: null, logBBUpper: null, logBBMiddle: null, logBBLower: null, roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, oi: null, buy: null, sell: null })), error: '', revision: 0, timeframe, historyExhausted: true }
+    return { bars: await marketService.bars(request.chartInstId, timeframe), error: '', revision: marketService.revision, timeframe, historyExhausted: false }
   }
   if ('gatewayFetch' in request) return gatewayFetch(event, request.gatewayFetch)
   if ('cancelGatewayFetch' in request) { gatewayRequests.get(request.cancelGatewayFetch)?.abort(); return { ok: true } }

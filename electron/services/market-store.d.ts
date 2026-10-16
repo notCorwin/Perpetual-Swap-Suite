@@ -14,5 +14,6 @@ export class MarketStore {
   static open(root: string): Promise<MarketStore>
   appendCandles(candles: CandleRecord[]): Promise<number>
   candles(query: { instrument: string; timeframe: string; from?: number; through?: number }): Promise<CandleRecord[]>
+  coverage(instrument: string, timeframe: string): Promise<{ count: number; first: number | null; last: number | null }>
   close(): Promise<void>
 }

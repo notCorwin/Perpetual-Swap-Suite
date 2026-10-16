@@ -34,6 +34,8 @@ export class MarketStore {
 
   async appendCandles(candles) {
     if (!Array.isArray(candles) || candles.length === 0) return 0
+    const writtenAt = Date.now()
+    candles = candles.map(candle => ({ ...candle, writtenAt }))
     for (const candle of candles) {
       if (!Number.isFinite(candle.timestamp) || !candle.instrument || !candle.timeframe) throw new Error('A candle needs instrument, timeframe, and timestamp.')
     }
@@ -63,8 +65,13 @@ export class MarketStore {
     const files = dates.filter(entry => entry.isDirectory()).map(entry => join(directory, entry.name, '*.parquet'))
     if (!files.length) return []
     const list = `[${files.map(quote).join(', ')}]`
-    const result = await this.connection.runAndReadAll(`SELECT * FROM read_parquet(${list}, union_by_name = true) WHERE timestamp >= ${Number(from)} AND timestamp <= ${Number(through)} ORDER BY timestamp`)
+    const result = await this.connection.runAndReadAll(`SELECT * EXCLUDE (row_rank) FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY timestamp ORDER BY COALESCE(writtenAt, 0) DESC) AS row_rank FROM read_parquet(${list}, union_by_name = true) WHERE timestamp >= ${Number(from)} AND timestamp <= ${Number(through)}) WHERE row_rank = 1 ORDER BY timestamp`)
     return result.getRowObjectsJS().map(row => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, typeof value === 'bigint' ? Number(value) : value])))
+  }
+
+  async coverage(instrument, timeframe) {
+    const candles = await this.candles({ instrument, timeframe, from: 0, through: Date.now() })
+    return { count: candles.length, first: candles[0]?.timestamp ?? null, last: candles.at(-1)?.timestamp ?? null }
   }
 
   async close() { this.connection.closeSync() }
