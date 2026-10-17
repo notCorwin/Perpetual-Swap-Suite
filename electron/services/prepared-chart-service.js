@@ -2,8 +2,6 @@ import { Worker } from 'node:worker_threads'
 
 const VISIBLE = 96
 const WARMUP = 199
-const PRICE_PAGE = 300
-const STATISTICS_PAGE = 100
 const HISTORY_PERIODS = 1_440
 const SNAPSHOT_SCHEMA = 1
 const FORMULA_VERSION = 'native-ema200-wilder-flat50-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v2'
@@ -23,11 +21,13 @@ const expiryField = source => source === 1 ? 'statisticsOIExpiresAt' : 'statisti
 const sourceFresh = (row, source, now = Date.now()) => sourcePresent(row, source)
   && (!sourceMissing(row, source) || Number(row[expiryField(source)]) > now)
 const seriesKey = (instId, timeframe) => `${instId}:${timeframe}`
+const sourcePriority = value => value === 'background' || value === 'chartWarm' ? 'background' : 'foreground'
+const sameRow = (left, right) => left && right && Object.keys(left).length === Object.keys(right).length && Object.keys(left).every(field => Object.hasOwn(right, field) && Object.is(left[field], right[field]))
 
 /** Durable source pages and canonical calculations are independent of UI focus. */
 export class PreparedChartPipeline {
-  constructor({ store, get, parseCandle, normalize, persistCandles, persistStatistics, revision, liveCandles, instrument }) {
-    Object.assign(this, { store, get, parseCandle, normalize, persistCandles, persistStatistics, revision, liveCandles, instrument })
+  constructor({ store, history, normalize, revision, instrument }) {
+    Object.assign(this, { store, history, normalize, revision, instrument })
     this.series = new Map()
     this.nextGeneration = 0
     this.maxSeries = 8
@@ -221,15 +221,15 @@ export class PreparedChartPipeline {
     return compact
   }
 
-  produced(state, frame) {
-    this.frameVersions.set(frame, state.sourceVersion)
+  produced(state, frame, sourceVersion = state.sourceVersion) {
+    this.frameVersions.set(frame, { sourceVersion, liveVersion: state.liveVersion })
     return frame
   }
 
-  async saveCompact(state, frame, version = this.frameVersions.get(frame)) {
-    if (version === undefined || state.sourceVersion !== version || frame.generation !== state.generation) return null
+  async saveCompact(state, frame, version = this.frameVersions.get(frame), { persist = true } = {}) {
+    if (!version || state.sourceVersion !== version.sourceVersion || state.liveVersion !== version.liveVersion || frame.generation !== state.generation) return null
     const watermark = await this.store.candleWatermark(state.instId, state.timeframe, 'background')
-    if (this.closed || state.sourceVersion !== version || frame.generation !== state.generation) return null
+    if (this.closed || state.sourceVersion !== version.sourceVersion || state.liveVersion !== version.liveVersion || frame.generation !== state.generation) return null
     const existing = this.snapshots.get(state.key)
     if (existing?.valid && (existing.frame.generation > frame.generation || existing.frame.generation === frame.generation && existing.frame.revision > frame.revision)) return existing.frame
     // A lease may expire before its replacement observation is published.
@@ -245,8 +245,8 @@ export class PreparedChartPipeline {
     const snapshot = { schemaVersion: SNAPSHOT_SCHEMA, formulaVersion: FORMULA_VERSION, watermark, validUntil, frame }
     // Live candles are an in-memory overlay, never a durable observation.
     const { liveBar: _liveBar, ...confirmedFrame } = frame
-    await this.store.writeChartSnapshot(state.instId, state.timeframe, { ...snapshot, frame: confirmedFrame })
-    if (this.closed || state.sourceVersion !== version || frame.generation !== state.generation) return null
+    if (persist) await this.store.writeChartSnapshot(state.instId, state.timeframe, { ...snapshot, frame: confirmedFrame })
+    if (this.closed || state.sourceVersion !== version.sourceVersion || state.liveVersion !== version.liveVersion || frame.generation !== state.generation) return null
     const changed = !existing?.valid || JSON.stringify(existing.frame) !== JSON.stringify(frame)
     this.snapshots.set(state.key, { ...snapshot, valid: true })
     this.trimSnapshots()
@@ -291,7 +291,7 @@ export class PreparedChartPipeline {
       unavailable: { reason: 'insufficient-history', availableCandles, requiredCandles: VISIBLE, retryAt: state.floor + VISIBLE * step + 1_000 } }
   }
 
-  local(instId, timeframe, { force = false, priority = 'foreground' } = {}) {
+  local(instId, timeframe, { force = false, priority = 'foreground', persist = true } = {}) {
     if (!['5m', '15m', '1H'].includes(timeframe)) return Promise.reject(new Error('Unsupported chart timeframe.'))
     if (this.closed) return Promise.reject(new Error('Prepared chart data service is closed.'))
     const key = seriesKey(instId, timeframe), cached = this.cached(key)
@@ -336,7 +336,7 @@ export class PreparedChartPipeline {
               indicatorState: bars.every(bar => indicatorFields.every(field => Number.isFinite(bar[field]))) ? 'ready' : 'unavailable',
               liveBar: state.live && state.live.timestamp === end + state.intervalMS ? state.indicators.get(state.live.timestamp) : undefined, error: '' }
           }
-          const saved = await this.saveCompact(state, frame, version)
+          const saved = await this.saveCompact(state, this.produced(state, frame, version), undefined, { persist })
           if (saved) return saved
         }
         return null
@@ -352,7 +352,7 @@ export class PreparedChartPipeline {
       this.sourceVersions.set(key, (this.sourceVersions.get(key) ?? 0) + 1)
       const snapshot = this.snapshots.get(key)
       let changed = false, reseed = false
-      const oldLatest = Math.max(state ? extremeHour(state.rows) ?? -Infinity : -Infinity, snapshot?.frame.endHour ?? -Infinity)
+      const oldLatest = Math.max(state ? extremeHour(state.rows) ?? -Infinity : -Infinity, snapshot?.frame?.endHour ?? -Infinity)
       for (const row of batch) {
         const old = previous.get(row.timestamp)
         if (priceChanged(old, row)) {
@@ -364,6 +364,7 @@ export class PreparedChartPipeline {
       if (state) {
         state.sourceVersion += 1
         if (changed) state.priceVersion += 1
+        if (state.live && state.live.timestamp <= (this.latest(state) ?? -Infinity)) this.updateLive(state, null)
         if (reseed) state.generation = ++this.nextGeneration
       }
       if (snapshot && reseed) snapshot.valid = false
@@ -374,19 +375,103 @@ export class PreparedChartPipeline {
 
   async load(state, priority = 'foreground') {
     if (state.loaded) return
-    if (state.loading) return state.loading
-    state.loading = (async () => {
+    return this.reload(state, priority)
+  }
+
+  async reload(state, priority = 'foreground') {
+    // A source task resolves only after its durable write. If an earlier read
+    // is still running, wait for it and then perform a new read of that commit.
+    if (state.loading) { await state.loading; return this.reload(state, priority) }
+    const task = (async () => {
       while (!this.closed) {
         const version = state.sourceVersion
-        const rows = await this.store.candles({ instrument: state.instId, timeframe: state.timeframe }, priority)
+        const rows = await this.store.candles({ instrument: state.instId, timeframe: state.timeframe }, sourcePriority(priority))
         if (version !== state.sourceVersion) continue
-        state.rows = new Map(rows.filter(row => row.confirmed).map(row => [row.timestamp, this.normalize(row)]))
+        const next = new Map(rows.filter(row => row.confirmed).map(row => [row.timestamp, this.normalize(row)]))
+        const oldLatest = this.latest(state)
+        let changed = false, prices = false, reseed = false
+        for (const [hour, row] of next) {
+          const previous = state.rows.get(hour)
+          if (!sameRow(previous, row)) changed = true
+          if (priceChanged(previous, row)) {
+            prices = true
+            if (oldLatest !== null && hour <= oldLatest) reseed = true
+          }
+        }
+        for (const hour of state.rows.keys()) if (!next.has(hour)) { changed = true; prices = true; reseed = true }
+        state.rows = next
         state.loaded = true
+        if (changed) {
+          state.sourceVersion += 1
+          this.sourceVersions.set(state.key, (this.sourceVersions.get(state.key) ?? 0) + 1)
+        }
+        if (prices) state.priceVersion += 1
+        if (reseed) {
+          state.generation = ++this.nextGeneration
+          const snapshot = this.snapshots.get(state.key)
+          if (snapshot) snapshot.valid = false
+        }
+        if (state.live && state.live.timestamp <= (this.latest(state) ?? -Infinity)) this.updateLive(state, null)
         return
       }
       throw new Error('Prepared chart data service is closed.')
-    })().finally(() => { state.loading = null })
-    return state.loading
+    })().finally(() => { if (state.loading === task) state.loading = null })
+    state.loading = task
+    return task
+  }
+
+  invalidate(instId, timeframe) {
+    const key = seriesKey(instId, timeframe), state = this.series.get(key)
+    this.sourceVersions.set(key, (this.sourceVersions.get(key) ?? 0) + 1)
+    const snapshot = this.snapshots.get(key)
+    if (snapshot) snapshot.valid = false
+    else this.snapshots.set(key, { valid: false })
+    if (state) {
+      state.sourceVersion += 1
+      state.priceVersion += 1
+      state.generation = ++this.nextGeneration
+      state.rows.clear()
+      state.loaded = false
+      state.floor = null
+      state.indicators.clear()
+      state.latestAt = 0
+    }
+    if (this.universe.has(key) || snapshot) this.queueLocal(instId, timeframe, true)
+  }
+
+  updateLive(state, candle) {
+    const live = candle && !candle.confirmed && candle.timestamp > (this.latest(state) ?? -Infinity) ? candle : null
+    if (sameRow(state.live, live) || state.live === live) return false
+    state.live = live
+    state.liveVersion += 1
+    return true
+  }
+
+  async setLive(instId, timeframe, candle) {
+    if (this.closed) return null
+    if (!['5m', '15m', '1H'].includes(timeframe)) throw new Error('Unsupported chart timeframe.')
+    if (candle && (candle.confirmed || candle.instrument !== instId || candle.timeframe !== timeframe || !Number.isSafeInteger(candle.timestamp) || candle.timestamp % intervalFor(timeframe))) throw new Error('Invalid forming candle.')
+    const state = this.state(instId, timeframe)
+    if (!this.updateLive(state, candle)) return this.cached(state.key)
+    state.active += 1
+    try {
+      await this.load(state, 'background')
+      while (!this.closed) {
+        const version = state.sourceVersion, liveVersion = state.liveVersion
+        await this.indicators(state, 'foreground')
+        if (version !== state.sourceVersion || liveVersion !== state.liveVersion) continue
+        const snapshot = this.snapshots.get(state.key)
+        if (!snapshot?.valid) return this.local(instId, timeframe, { force: true, persist: false })
+        const liveBar = state.live?.timestamp === snapshot.frame.endHour + state.intervalMS ? state.indicators.get(state.live.timestamp) : undefined
+        const frame = { ...snapshot.frame, liveBar, revision: this.revision(instId) }
+        // The confirmed snapshot and watermark stay unchanged. A forming tick
+        // publishes an in-memory projection without a Parquet/snapshot write.
+        this.snapshots.set(state.key, { ...snapshot, frame })
+        this.emit(frame)
+        return frame
+      }
+      return null
+    } finally { state.active -= 1; this.trim() }
   }
 
   job(key, operation) {
@@ -402,136 +487,56 @@ export class PreparedChartPipeline {
 
   latest(state) { return extremeHour(state.rows) }
 
+  applyFloor(state, result) {
+    const floor = result?.floor
+    if (Number.isSafeInteger(floor) && floor >= 0 && floor % state.intervalMS === 0) state.floor = Math.max(state.floor ?? 0, floor)
+  }
+
   async refreshLatest(state, priority = 'prepared') {
     if (state.latestTask) return state.latestTask
-    if (state.latestAt + 60_000 > Date.now()) return
+    if (state.latestAt + REFRESH_MS > Date.now()) return
     state.latestTask = (async () => {
-      const values = await this.get('/market/candles', { instId: state.instId, bar: state.timeframe, limit: PRICE_PAGE }, priority)
-      const rows = values.map(value => this.parseCandle(state.instId, state.timeframe, value)).filter(Boolean)
-      const insufficientListing = state.floor !== null && Math.floor(Date.now() / state.intervalMS) * state.intervalMS - state.intervalMS < state.floor + (VISIBLE - 1) * state.intervalMS
-      if (!rows.some(row => row.confirmed) && this.latest(state) === null && !insufficientListing) throw new Error('OKX has not provided completed source candles.')
-      await this.persistCandles(state.instId, rows.filter(row => row.confirmed), priority)
-      const live = rows.find(row => !row.confirmed) ?? null
-      if (JSON.stringify(live) !== JSON.stringify(state.live)) { state.live = live; state.liveVersion += 1 }
-      if (state.timeframe === '5m' && live) this.liveCandles.set(state.instId, live)
+      const result = await this.history.latest(state.instId, state.timeframe, sourcePriority(priority))
+      if (this.closed) throw new Error('Prepared chart data service is closed.')
+      this.applyFloor(state, result)
+      await this.reload(state, priority)
+      if (result?.live && (!state.live || result.live.timestamp >= state.live.timestamp)) this.updateLive(state, result.live)
       state.latestAt = Date.now()
     })().finally(() => { state.latestTask = null })
     return state.latestTask
   }
 
-  async priceBlock(state, block, through, priority = 'prepared') {
-    const step = state.intervalMS, from = block * PRICE_PAGE * step
-    const end = Math.min(from + (PRICE_PAGE - 1) * step, through)
-    return this.job(`price:${state.key}:${block}`, async () => {
-      const missing = []
-      for (let hour = Math.max(from, state.floor ?? from); hour <= end; hour += step) if (!state.rows.has(hour)) missing.push(hour)
-      while (missing.length) {
-        const cursor = missing.at(-1)
-        const first = missing[0]
-        const limit = Math.min(PRICE_PAGE, Math.floor((cursor - first) / step) + 1)
-        const values = await this.get('/market/history-candles', { instId: state.instId, bar: state.timeframe, limit, after: cursor + step }, priority)
-        const rows = values.map(value => this.parseCandle(state.instId, state.timeframe, value)).filter(row => row?.confirmed)
-        if (!rows.length) {
-          const oldest = extremeHour(state.rows, true)
-          if (oldest !== null && cursor < oldest) {
-            // An empty historical cursor, rather than the resident cache edge,
-            // proves the provider boundary. Verify it before restricting scroll.
-            for (let attempt = 0; attempt < 2; attempt += 1) {
-              const check = await this.get('/market/history-candles', { instId: state.instId, bar: state.timeframe, limit: 1, after: cursor + step }, priority)
-              if (check.some(value => this.parseCandle(state.instId, state.timeframe, value)?.confirmed)) throw new Error('OKX historical candle boundary is not stable; retry this range.')
-            }
-            state.floor = await this.discoverFloor(state, cursor, oldest, priority)
-            return
-          }
-          throw new Error('OKX did not provide the missing source candle range.')
-        }
-        await this.persistCandles(state.instId, rows, priority)
-        const before = missing.length
-        for (let index = missing.length - 1; index >= 0; index -= 1) if (state.rows.has(missing[index]) || state.floor !== null && missing[index] < state.floor) missing.splice(index, 1)
-        if (missing.length === before) throw new Error('OKX source candle cursor did not advance.')
-      }
-    })
-  }
-
-  async discoverFloor(state, emptyThrough, knownHour, priority = 'prepared') {
-    const step = state.intervalMS
-    let lower = emptyThrough + step, upper = knownHour
-    // An empty far-past cursor does not make the resident cache edge the
-    // listing edge. Locate the first actual provider observation in between.
-    for (let attempt = 0; lower < upper && attempt < 48; attempt += 1) {
-      const middle = lower + Math.floor((upper - lower) / step / 2) * step
-      const values = await this.get('/market/history-candles', { instId: state.instId, bar: state.timeframe, limit: 1, after: middle + step }, priority)
-      const rows = values.map(value => this.parseCandle(state.instId, state.timeframe, value)).filter(row => row?.confirmed)
-      if (!rows.length) lower = middle + step
-      else {
-        const earliest = Math.min(...rows.map(row => row.timestamp))
-        if (earliest < lower || earliest > middle) throw new Error('OKX historical candle boundary changed during preparation.')
-        await this.persistCandles(state.instId, rows, priority)
-        upper = earliest
-      }
-    }
-    if (lower !== upper) throw new Error('Cannot determine the available source history boundary.')
-    return upper
-  }
-
   async ensurePrices(state, from, through, priority = 'prepared') {
-    const size = PRICE_PAGE * state.intervalMS
-    while (true) {
-      const blocks = new Set()
-      for (let hour = Math.max(from, state.floor ?? from); hour <= through; hour += state.intervalMS) {
-        if (!state.rows.has(hour)) blocks.add(Math.floor(hour / size))
-      }
-      if (!blocks.size) return
-      // Fill stable blocks only through known/requested completed data. The
-      // exchange may publish its latest completed candle slightly late.
-      const latestClosed = Math.min(Math.floor(Date.now() / state.intervalMS) * state.intervalMS - state.intervalMS, Math.max(through, this.latest(state) ?? through))
-      for (const block of [...blocks].sort((left, right) => right - left)) await this.priceBlock(state, block, latestClosed, priority)
-      // A concurrent request can have shared a shorter live-tail block. Read
-      // its committed rows before asking for any still-missing extension.
+    let missing = false
+    for (let hour = Math.max(from, state.floor ?? from); hour <= through; hour += state.intervalMS) {
+      const row = state.rows.get(hour)
+      if (!row || !Number.isFinite(row.baseVolume)) { missing = true; break }
     }
-  }
-
-  async statisticsBlock(state, block, source, priority = 'prepared') {
-    const step = state.intervalMS, from = block * STATISTICS_PAGE * step
-    const end = Math.min(from + (STATISTICS_PAGE - 1) * step, this.latest(state))
-    if (end < from) return
-    return this.job(`statistics:${state.key}:${block}:${source}`, async () => {
-      const rows = []
-      for (let hour = from; hour <= end; hour += step) {
-        const row = state.rows.get(hour)
-        if (row && !sourceFresh(row, source)) rows.push(row)
+    if (!missing) return
+    await this.job(`price:${state.key}:${from}:${through}`, async () => {
+      const result = await this.history.ensurePrices(state.instId, state.timeframe, from, through, sourcePriority(priority))
+      if (this.closed) throw new Error('Prepared chart data service is closed.')
+      this.applyFloor(state, result)
+      await this.reload(state, priority)
+      for (let hour = Math.max(from, state.floor ?? from); hour <= through; hour += state.intervalMS) {
+        if (!Number.isFinite(state.rows.get(hour)?.baseVolume)) throw new Error('The history task did not provide complete source candle coverage.')
       }
-      if (!rows.length) return
-      const earliest = rows[0].timestamp, latest = rows.at(-1).timestamp
-      const outsideRetention = latest < Date.now() - HISTORY_PERIODS * step
-      let values = []
-      if (!outsideRetention) {
-        const path = source === 1 ? '/rubik/stat/contracts/open-interest-history' : '/rubik/stat/taker-volume-contract'
-        const parameters = { instId: state.instId, period: state.timeframe, limit: STATISTICS_PAGE, begin: earliest - 1, end: latest + 1 }
-        if (source === 2) parameters.unit = 1
-        values = await this.get(path, parameters, priority)
-      }
-      // Only successful source observations (including a known retention
-      // boundary) become terminal nulls. Transport errors leave the page pending.
-      await this.persistStatistics({ instId: state.instId }, state.timeframe, end, source, values, { from, through: end, intervalMS: step }, priority)
     })
   }
 
   async ensureStatistics(state, from, through, priority = 'prepared') {
-    const size = STATISTICS_PAGE * state.intervalMS
-    const pages = new Map()
+    const missing = []
     for (let hour = from; hour <= through; hour += state.intervalMS) {
       const row = state.rows.get(hour)
-      for (const source of [1, 2]) if (!sourceFresh(row, source)) {
-        const block = Math.floor(hour / size)
-        pages.set(`${block}:${source}`, { block, source })
-      }
+      if (row && (!sourceFresh(row, 1) || !sourceFresh(row, 2))) missing.push(hour)
     }
-    // A known complete 96-window must not wait for a page's four extra
-    // observations. They will be prepared when a neighbor actually needs them.
-    const completed = await Promise.allSettled([...pages.values()].map(({ block, source }) => this.statisticsBlock(state, block, source, priority)))
-    const failure = completed.find(result => result.status === 'rejected')
-    if (failure) throw failure.reason
+    if (!missing.length) return
+    const first = missing[0], end = missing.at(-1)
+    await this.job(`statistics:${state.key}:${first}:${end}`, async () => {
+      await this.history.ensureStatistics(state.instId, state.timeframe, first, end, sourcePriority(priority))
+      if (this.closed) throw new Error('Prepared chart data service is closed.')
+      await this.reload(state, priority)
+    })
   }
 
   drainCalculations() {
@@ -660,6 +665,8 @@ export class PreparedChartPipeline {
     const { instId, timeframe, intervalMS: step } = state
     await this.load(state, priority === 'chartWarm' ? 'background' : 'foreground')
     this.listingFloor(state)
+    const unavailable = this.insufficientHistory(state)
+    if (unavailable) return this.produced(state, unavailable)
     if (targetEnd === undefined) await this.refreshLatest(state, priority)
     let latestEnd = this.latest(state)
     const ceiling = Math.floor(Date.now() / step) * step - step
@@ -689,12 +696,14 @@ export class PreparedChartPipeline {
     const first = end - (VISIBLE - 1) * step
     const available = []
     for (let hour = first; hour <= end; hour += step) {
-      if (!state.rows.has(hour)) throw new Error('A complete 96-candle source window is not available.')
+      if (!state.rows.has(hour) || !Number.isFinite(state.rows.get(hour).baseVolume)) throw new Error('A complete 96-candle source window is not available.')
       available.push(state.rows.get(hour))
     }
     await this.ensureStatistics(state, first, end, priority)
+    if (!state.loaded) return this.prepareState(state, targetEnd, { priority })
     do { await this.indicators(state, priority === 'chartWarm' ? 'background' : 'foreground') }
     while (state.calculatedVersion !== state.priceVersion || state.calculatedLiveVersion !== state.liveVersion)
+    if (!state.loaded) return this.prepareState(state, targetEnd, { priority })
     const generation = state.generation
     const central = available.map(row => this.bar(state, row.timestamp))
     if (central.some(bar => !bar)) throw new Error('Chart statistics have not completed preparation.')
@@ -709,7 +718,7 @@ export class PreparedChartPipeline {
     return this.produced(state, { instId, timeframe, intervalMS: step, endHour: end, latestEnd, oldestHour: state.floor,
       historyExhausted: state.floor !== null && first <= state.floor, generation, revision: this.revision(instId),
       bars: [...before, ...central, ...after], oiState, takerState, indicatorState,
-      liveBar: targetEnd === undefined && state.live ? state.indicators.get(state.live.timestamp) : undefined, error: '' })
+      liveBar: targetEnd === undefined && state.live?.timestamp === end + step ? state.indicators.get(state.live.timestamp) : undefined, error: '' })
   }
 
   async dispose() {
@@ -726,6 +735,6 @@ export class PreparedChartPipeline {
     const worker = this.worker
     this.worker = null
     if (worker) await worker.terminate()
-    await Promise.allSettled([this.localRunning, this.remoteRunning, ...this.localTasks.values()].filter(Boolean))
+    await Promise.allSettled([this.localRunning, this.remoteRunning, ...this.localTasks.values(), ...this.tasks.values()].filter(Boolean))
   }
 }

@@ -1,57 +1,33 @@
-import { evaluateMarketOpportunity, summarizeMarketBars, signedRelativeChange as percent } from './market-metrics.js'
+import { join } from 'node:path'
+import { evaluateMarketOpportunity, summarizeMarketBars } from './market-metrics.js'
 import { PreparedChartPipeline } from './prepared-chart-service.js'
+import { MetadataStore, DEFAULT_PREFERENCES, validatePreferences } from './metadata-store.js'
+import { MarketHistory } from './market-history.js'
+import { eligibleInstrument, evaluateLiquidity, quoteTurnover24h } from './liquidity.js'
+import { rankingFromCandles, compareRanking } from './ranking.js'
+import { RealtimeMarket } from './realtime-market.js'
 
 const OKX_ORIGIN = 'https://www.okx.com/api/v5'
-const USDT_TURNOVER_MINIMUM = 30_000_000
-const OI_USD_MINIMUM = 5_000_000
-const DEPTH_USD_MINIMUM = 100_000
-const MAX_SPREAD_PERCENT = 0.05
-const MAX_SLIPPAGE_PERCENT = 0.1
-const MAX_HOURLY_VOLUME_RATIO = 2
-const VISIBLE_CANDLES = 96
-const EMA_WARMUP_CANDLES = 199
-
-const LIST_WARMUP_CANDLES = EMA_WARMUP_CANDLES + 2
-const DEFAULT_LIST_TIMEFRAME = '1H'
-const LIST_TIMEFRAMES = ['5m', '15m', '1H']
-const LIST_WARMUP_CONCURRENCY = 2
 const FIVE_MINUTES = 300_000
-const MAX_REPAIR_PAGES = 16
-const RETRY_DELAYS = [1_000, 3_000, 10_000, 30_000]
-const UNAVAILABLE_RETRY_DELAY = 30_000
+const LIST_TIMEFRAMES = ['5m', '15m', '1H']
+const OBSERVATION_TTL = 90_000
 const LATEST_CANDLE_REFRESH = 60_000
 const HISTORICAL_STATISTICS_REFRESH = 6 * 3_600_000
-const HISTORY_BOUNDARY_EMPTY_RESPONSES = 3
 const REQUEST_TIMEOUT = 12_000
-const REQUEST_PRIORITY = { background: 0, chartWarm: 0, warmup: 1, statistics: 2, foreground: 3, repair: 4, prepared: 5 }
-// OKX applies the relevant public limits per endpoint family. A single global
-// queue turns those independent budgets into artificial serial work: a candle
-// repair used to hold OI and Taker behind it (and could even abort them).
-// Keep one ordered worker per family, so each family remains within its own
-// documented cadence while the three chart reads can make progress together.
+const RETRY_DELAYS = [1_000]
+const REQUEST_PRIORITY = { background: 0, chartWarm: 0, statistics: 1, foreground: 2, repair: 2, prepared: 2 }
 const REQUEST_LANE_INTERVALS = Object.freeze({ candles: 100, oi: 200, taker: 400, market: 80 })
 const requestLaneFor = path => path.includes('/rubik/stat/taker-volume-contract') ? 'taker'
   : path.includes('/rubik/stat/contracts/open-interest-history') ? 'oi'
-    : path.includes('/market/candles') || path.includes('/market/history-candles') ? 'candles'
-      : 'market'
-// OI/Taker values are only reusable when they came from the current direct
-// endpoint contract. Earlier builds derived them from 5m/USDT data, which is
-// neither the requested timeframe nor the requested unit.
-// `1` is the prior fully-hydrated marker. Keep writing it for complete numeric
-// rows so an existing healthy cache remains valid. The format bit below is
-// used only where one source has observed a terminal null.
+    : path.includes('/market/candles') || path.includes('/market/history-candles') ? 'candles' : 'market'
 const STATISTICS_VERSION = 1
-// statisticsVersion is otherwise a persisted source-observation bitset. The
-// format bit keeps it distinguishable from the previous `1` marker.
 const STATISTICS_FORMAT = 0b100
 const STATISTICS_OI = 0b001
 const STATISTICS_TAKER = 0b010
 const STATISTICS_COMPLETE = STATISTICS_OI | STATISTICS_TAKER
 const statisticsExpiryField = source => source === STATISTICS_OI ? 'statisticsOIExpiresAt' : 'statisticsTakerExpiresAt'
-// Bump this when liquidity eligibility semantics change. A cached catalogue
-// must never survive a policy change as if it had been checked by the new one.
-const CATALOG_SNAPSHOT_SCHEMA = 1
-const LIQUIDITY_POLICY_VERSION = 1
+const closedBoundary = (timeframe, now = Date.now()) => Math.floor(now / timeframeMilliseconds(timeframe)) * timeframeMilliseconds(timeframe)
+const emptyAudit = () => ({ phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '' })
 const sleep = (milliseconds, ...signals) => new Promise((resolve, reject) => {
   const activeSignals = signals.filter(Boolean)
   const aborted = activeSignals.find(signal => signal.aborted)
@@ -91,8 +67,6 @@ class RequestTimeoutError extends Error {
     this.name = 'RequestTimeoutError'
   }
 }
-const retryAfter = error => error instanceof RetryAfterError ? error.retryAfter : undefined
-const retryLane = error => error instanceof RetryAfterError ? error.lane : undefined
 const retryAfterDelay = value => {
   if (typeof value !== 'string' || !value.trim()) return undefined
   const seconds = Number(value)
@@ -100,21 +74,7 @@ const retryAfterDelay = value => {
   const timestamp = Date.parse(value)
   return Number.isFinite(timestamp) ? Math.max(RETRY_DELAYS[0], timestamp - Date.now()) : undefined
 }
-const retryPlan = (attempt, serverDelay) => {
-  const nextAttempt = attempt + 1
-  const serverDirected = Number.isFinite(serverDelay)
-  const unavailable = !serverDirected && nextAttempt > RETRY_DELAYS.length
-  return {
-    attempt: nextAttempt,
-    unavailable,
-    // Retry-After is a server-provided minimum. Never clip it down: retrying
-    // before that deadline recreates the 429 loop that blocked chart repairs.
-    delay: serverDirected ? Math.max(RETRY_DELAYS[0], serverDelay) : unavailable ? UNAVAILABLE_RETRY_DELAY : RETRY_DELAYS[nextAttempt - 1],
-  }
-}
 const requestPriority = priority => REQUEST_PRIORITY[priority] ?? REQUEST_PRIORITY.foreground
-const requestWasPreempted = error => error instanceof Error && error.name === 'RequestPreemptedError'
-const requestWasCancelled = error => requestWasPreempted(error) || error instanceof Error && error.name === 'AbortError'
 const number = value => {
   if (value === null || value === undefined || value === '') return null
   const parsed = Number(value)
@@ -169,16 +129,6 @@ function normalizedStatistics(candle) {
   return next
 }
 
-const rangeSlots = (ranges, intervalMS = FIVE_MINUTES) => ranges.reduce((total, range) => total + Math.floor((range.through - range.from) / intervalMS) + 1, 0)
-
-function listRawRange(timeframe, end) {
-  const intervalMS = timeframeMilliseconds(timeframe)
-  return {
-    from: end - (LIST_WARMUP_CANDLES - 1) * intervalMS,
-    through: end,
-  }
-}
-
 function requestURL(path, parameters = {}) {
   const query = new URLSearchParams(Object.entries(parameters).filter(([, value]) => value !== undefined && value !== null).map(([key, value]) => [key, String(value)]))
   return `${OKX_ORIGIN}${path}?${query}`
@@ -195,45 +145,6 @@ async function mapConcurrent(values, limit, operation) {
     }
   }))
   return output
-}
-
-function linearNotional(price, size, instrument) {
-  const contractValue = number(instrument.ctVal)
-  if (price === null || size === null || contractValue === null) return 0
-  return instrument.ctValCcy === 'USDT' ? size * contractValue : price * size * contractValue
-}
-
-function sideFill(levels, amount, instrument) {
-  let remaining = amount, notional = 0, quantity = 0
-  for (const level of levels) {
-    const price = number(level[0]), size = number(level[1]), levelNotional = linearNotional(price, size, instrument)
-    if (price === null || levelNotional <= 0) continue
-    const take = Math.min(levelNotional, remaining), units = instrument.ctValCcy === 'USDT' ? take / number(instrument.ctVal) : take / price
-    quantity += units; notional += take; remaining -= take
-    if (remaining <= 0) break
-  }
-  return { complete: remaining <= 0, average: quantity > 0 ? notional / quantity : null, depth: amount - remaining }
-}
-
-function liquidity(instrument, ticker, book, openInterest, hourly, criteria) {
-  const bid = number(ticker.bidPx), ask = number(ticker.askPx), last = number(ticker.last)
-  const spread = bid === null || ask === null || bid <= 0 ? null : (ask - bid) / bid * 100
-  const askFill = sideFill(Array.isArray(book.asks) ? book.asks : [], DEPTH_USD_MINIMUM, instrument), bidFill = sideFill(Array.isArray(book.bids) ? book.bids : [], DEPTH_USD_MINIMUM, instrument)
-  const askSlippage = ask === null || askFill.average === null ? null : (askFill.average - ask) / ask * 100
-  const bidSlippage = bid === null || bidFill.average === null ? null : (bid - bidFill.average) / bid * 100
-  const confirmedHourly = hourly.filter(candle => candle[8] === '1').slice(0, 24)
-  const volumes = confirmedHourly.map(candle => number(candle[7]) ?? (number(candle[5]) ?? 0) * (number(candle[4]) ?? 0)).filter(value => value > 0)
-  const volumeRatio = volumes.length < 24 ? null : Math.max(...volumes) / Math.min(...volumes)
-  const turnover = last === null ? null : (number(ticker.volCcy24h) ?? 0) * last, oiUSD = number(openInterest?.oiUsd)
-  const reasons = [
-    spread !== null && spread < MAX_SPREAD_PERCENT ? null : `Spread must be below ${MAX_SPREAD_PERCENT}%.`,
-    askFill.depth >= DEPTH_USD_MINIMUM && bidFill.depth >= DEPTH_USD_MINIMUM ? null : `Both book sides need ${DEPTH_USD_MINIMUM.toLocaleString('en-US')} USDT depth.`,
-    askSlippage !== null && bidSlippage !== null && askSlippage < MAX_SLIPPAGE_PERCENT && bidSlippage < MAX_SLIPPAGE_PERCENT ? null : `100k USDT slippage must be below ${MAX_SLIPPAGE_PERCENT}%.`,
-    turnover !== null && turnover > USDT_TURNOVER_MINIMUM ? null : `24h turnover must exceed ${USDT_TURNOVER_MINIMUM.toLocaleString('en-US')} USDT.`,
-    oiUSD !== null && oiUSD > OI_USD_MINIMUM ? null : `Open interest must exceed ${OI_USD_MINIMUM.toLocaleString('en-US')} USDT.`,
-    !criteria.hourlyVolumeStabilityEnabled || volumeRatio !== null && volumeRatio < MAX_HOURLY_VOLUME_RATIO ? null : `Hourly volume max/min must be below ${MAX_HOURLY_VOLUME_RATIO}.`,
-  ].filter(Boolean)
-  return { eligible: reasons.length === 0, reasons, turnover, spread, oiUSD, askSlippage, bidSlippage, volumeRatio }
 }
 
 function candle(instrument, timeframe, value) {
@@ -318,435 +229,247 @@ function marketRow(instrument, ticker, result, bars = []) {
   }
 }
 
+/** Owns market observations and projections; HistorySync owns every historical source task. */
 export class MarketService {
-  constructor(store, criteria = () => ({ hourlyVolumeStabilityEnabled: true }), fetcher = fetch, autoRefresh = true, { requestTimeout = REQUEST_TIMEOUT } = {}) {
-    this.store = store; this.criteria = criteria; this.fetcher = fetcher; this.autoRefresh = autoRefresh
-    this.catalog = new Map(); this.catalogRevision = 0; this.catalogUpdatedAt = null; this.catalogSource = 'none'; this.listRows = new Map(); this.listUpdatedAt = new Map(); this.listProjectionTasks = new Map(); this.listProjectionResults = new Map(); this.listProjectionDataVersions = new Map(); this.listCatalogProjectionTasks = new Map(); this.listProjectionVersions = new Map(); this.listWarmups = new Map(); this.listWarmupQueue = []; this.listWarmupRunning = 0; this.listGapStates = new Map()
-    this.revision = 0; this.refreshing = null; this.error = ''; this.lastRefreshAt = 0; this.disposed = false
-    this.hydrating = new Map(); this.lastCandleHydration = new Map(); this.instruments = new Map(); this.liveCandles = new Map()
-    this.requestLanes = new Map(Object.entries(REQUEST_LANE_INTERVALS).map(([name, interval]) => [name, {
-      name, interval, queue: [], task: null, running: false, active: null, nextAt: 0, rateLimitedUntil: 0,
-    }]))
-    this.backgroundRequestControllers = new Map(); this.refreshController = null
-    this.historyBoundaries = new Map(); this.candleMutations = new Map(); this.latestCandleRetries = new Map(); this.dataRevisions = new Map(); this.shutdownController = new AbortController(); this.abortControllers = new Set(); this.barTasks = new Set(); this.disposeTask = null
+  constructor(store, preferences = () => DEFAULT_PREFERENCES, fetcher = fetch, autoRefresh = true, { metadata, requestTimeout = REQUEST_TIMEOUT, webSocketFactory } = {}) {
+    if (typeof preferences !== 'function') throw new TypeError('A full Preferences callback is required.')
+    this.store = store
+    this.preferences = preferences
+    validatePreferences(preferences())
+    this.fetcher = fetcher
+    this.autoRefresh = autoRefresh
+    this.metadata = metadata
+    this.ownsMetadata = !metadata
+    this.webSocketFactory = webSocketFactory
     this.requestTimeout = Number.isFinite(requestTimeout) && requestTimeout > 0 ? requestTimeout : REQUEST_TIMEOUT
-    this.preparedCharts = new PreparedChartPipeline({
-      store,
-      get: (path, parameters, priority = 'prepared') => this.get(path, parameters, this.shutdownController.signal, priority),
-      parseCandle: candle,
-      normalize: normalizedStatistics,
-      persistCandles: (instId, rows, priority) => this.persistCandles(instId, rows, { projectList: false, priority: priority === 'chartWarm' ? 'background' : 'foreground' }),
-      persistStatistics: (instrument, timeframe, end, source, values, range, priority = 'prepared') => this.persistStatisticsSource(instrument, timeframe, end, source, values, this.shutdownController.signal, priority, false, { range, projectList: false }),
-      revision: instId => this.dataRevision(instId),
-      liveCandles: this.liveCandles,
-      instrument: instId => this.instruments.get(instId),
-    })
+    this.catalog = new Map()
+    this.instruments = new Map()
+    this.observations = new Map()
+    this.rankings = new Map()
+    this.rankingTasks = new Map()
+    this.listRows = new Map()
+    this.listUpdatedAt = new Map()
+    this.listProjectionTasks = new Map()
+    this.listProjectionResults = new Map()
+    this.listProjectionDataVersions = new Map()
+    this.dataRevisions = new Map()
+    this.liveCandles = new Map()
+    this.candleMutations = new Map()
+    this.barTasks = new Set()
+    this.backgroundTasks = new Set()
+    this.requestLanes = new Map(Object.entries(REQUEST_LANE_INTERVALS).map(([name, interval]) => [name, { name, interval, queue: [], task: null, running: false, active: null, nextAt: 0, rateLimitedUntil: 0 }]))
+    this.backgroundRequestControllers = new Map()
+    this.abortControllers = new Set()
+    this.shutdownController = new AbortController()
+    this.revision = 0
+    this.catalogRevision = 0
+    this.catalogSource = 'none'
+    this.catalogUpdatedAt = null
+    this.refreshing = null
+    this.lastRefreshAt = 0
+    this.error = ''
+    this.closing = false
+    this.disposed = false
+    this.disposeTask = null
+    this.refreshTimer = null
+    this.chartSubscriptions = []
+    this.latestAuditID = null
+    // The proxy admits no historical work until durable metadata has opened.
+    const history = Object.fromEntries(['ensurePrices', 'ensureStatistics', 'latest'].map(method => [method, async (...args) => { await this.ready; return this.history[method](...args) }]))
+    this.preparedCharts = new PreparedChartPipeline({ store, history, normalize: normalizedStatistics, revision: instId => this.dataRevision(instId), instrument: instId => this.instruments.get(instId) })
+    this.ready = this.initialize()
   }
 
-  listTimeframe(timeframe) { return LIST_TIMEFRAMES.includes(timeframe) ? timeframe : DEFAULT_LIST_TIMEFRAME }
-
-  listKey(instrument, timeframe) { return `${timeframe}:${instrument}` }
-
-  catalogEntry(instrument) { return this.catalog.get(instrument) }
-
-  catalogCriteriaKey() { return `hourlyVolumeStabilityEnabled=${this.criteria()?.hourlyVolumeStabilityEnabled ? '1' : '0'}` }
-
-  validCatalogEntry(entry) {
-    return Boolean(entry && typeof entry === 'object' && entry.instrument && typeof entry.instrument.instId === 'string' && entry.instrument.instId
-      && entry.ticker && typeof entry.ticker === 'object' && entry.result && typeof entry.result === 'object'
-      && (entry.change24h === null || entry.change24h === undefined || Number.isFinite(Number(entry.change24h))))
-  }
-
-  async restoreCatalog() {
-    const snapshot = await this.store.readCatalogSnapshot()
-    if (this.disposed || !snapshot || snapshot.schemaVersion !== CATALOG_SNAPSHOT_SCHEMA || snapshot.liquidityPolicyVersion !== LIQUIDITY_POLICY_VERSION || snapshot.criteriaKey !== this.catalogCriteriaKey() || !snapshot.entries.every(entry => this.validCatalogEntry(entry))) return false
-    this.catalogUpdatedAt = snapshot.savedAt
-    this.catalogSource = 'cache'
-    this.replaceCatalog(snapshot.entries)
-    // replaceCatalog starts the durable projection in the background. Base
-    // rows are ready now; local OI/Taker and indicators stream in afterward.
-    return true
-  }
-
-  async persistCatalog(entries, savedAt) {
-    try {
-      await this.store.writeCatalogSnapshot({
-        schemaVersion: CATALOG_SNAPSHOT_SCHEMA,
-        liquidityPolicyVersion: LIQUIDITY_POLICY_VERSION,
-        criteriaKey: this.catalogCriteriaKey(),
-        savedAt,
-        entries,
-      })
-    } catch {
-      // A disk-cache failure cannot invalidate a catalogue that the current
-      // live scan has already verified. The next scan will attempt it again.
-    }
-  }
-
-  catalogChange(entry) { return number(entry?.change24h) }
-
-  listComparator = (left, right) => {
-    const leftChange = Math.abs(this.catalogChange(this.catalogEntry(left.instId)) ?? 0)
-    const rightChange = Math.abs(this.catalogChange(this.catalogEntry(right.instId)) ?? 0)
-    return rightChange - leftChange || left.instId.localeCompare(right.instId)
-  }
-
-  listRowsFor(timeframe) {
-    const frame = this.listTimeframe(timeframe)
-    return [...(this.listRows.get(frame)?.values() ?? [])].sort(this.listComparator)
-  }
-
-  listWarmupState(instrument, timeframe) {
-    const frame = this.listTimeframe(timeframe), key = this.listKey(instrument, frame)
-    let state = this.listWarmups.get(key)
-    if (!state) {
-      state = { instrument, timeframe: frame, status: 'idle', attempt: 0, retryAt: null, timer: null, controller: null, task: null, entry: null, lastError: '' }
-      this.listWarmups.set(key, state)
-    }
-    return state
-  }
-
-  listProgress(timeframe) {
-    const frame = this.listTimeframe(timeframe), total = this.catalog.size
-    let completed = 0, retrying = 0, unavailable = 0
-    for (const instrument of this.catalog.keys()) {
-      const state = this.listWarmups.get(this.listKey(instrument, frame))
-      if (state?.status === 'ready') completed += 1
-      else if (state?.status === 'retrying') retrying += 1
-      else if (state?.status === 'unavailable') unavailable += 1
-    }
-    return { total, completed, pending: Math.max(0, total - completed - unavailable), retrying, unavailable }
-  }
-
+  prefs() { return validatePreferences(this.preferences()) }
+  listTimeframe(timeframe) { return LIST_TIMEFRAMES.includes(timeframe) ? timeframe : this.prefs().chartTimeframe }
+  listKey(instId, timeframe) { return `${timeframe}:${instId}` }
+  catalogCriteriaKey() { return JSON.stringify(this.prefs().liquidity) }
+  catalogEntry(instId) { return this.catalog.get(instId) }
   touchList() { this.revision += 1 }
 
-  listRowFor(entry, bars = []) { return marketRow(entry.instrument, entry.ticker, entry.result, bars) }
-
-  mergeCatalogRow(entry, previous) {
-    const base = this.listRowFor(entry)
-    if (!previous) return base
-    // A liquidity refresh must update live catalogue values without erasing
-    // indicators that were already projected from the local Parquet cache.
-    return {
-      ...base,
-      ...previous,
-      instId: base.instId,
-      turnover24hUSDT: base.turnover24hUSDT,
-      lastPrice: base.lastPrice,
-    }
+  async initialize() {
+    this.metadata ??= await MetadataStore.open(join(this.store.root, 'Metadata'))
+    this.history = new MarketHistory({
+      store: this.store, metadata: this.metadata,
+      get: (path, parameters, signal, priority) => this.get(path, parameters, signal, priority),
+      parseCandle: candle,
+      persistCandles: (instId, rows, options) => this.persistCandles(instId, rows, typeof options === 'string' ? { priority: options } : options),
+      persistStatistics: (instrument, timeframe, end, source, values, range, priority) => this.persistStatisticsSource(instrument, timeframe, end, source, values, this.shutdownController.signal, priority, false, { range }),
+      instrument: instId => this.instruments.get(instId),
+      onLive: (instId, timeframe, row) => this.setLive(instId, timeframe, row),
+      onReplace: (instId, timeframe) => this.onHistoryReplaced(instId, timeframe),
+      onProgress: task => this.onHistoryProgress(task),
+    })
+    await this.history.ready
+    const audits = this.history.audit.list().sort((a, b) => b.updatedAt - a.updatedAt)
+    this.latestAuditID = audits[0]?.id ?? null
+    this.readCatalog()
+    this.realtime = new RealtimeMarket({
+      parseCandle: candle,
+      ...(this.webSocketFactory ? { webSocketFactory: this.webSocketFactory } : {}),
+      onForming: row => this.setLive(row.instrument, row.timeframe, row),
+      onConfirmed: async row => {
+        await this.persistCandles(row.instrument, [row])
+        const live = this.liveCandles.get(`${row.instrument}:${row.timeframe}`)
+        if (!live || live.timestamp <= row.timestamp) await this.setLive(row.instrument, row.timeframe, null)
+        await this.updateRanking(row.instrument)
+      },
+      onReconnect: (subscriptions, context) => this.reconcileRealtime(subscriptions, context),
+      onState: () => { this.touchList() },
+    })
+    this.updateSubscriptions()
+    if (this.autoRefresh && !this.closing) { this.realtime.start(); this.scheduleRefresh() }
+    return this
   }
 
-  ensureListRows(timeframe) {
-    const frame = this.listTimeframe(timeframe), current = this.listRows.get(frame) ?? new Map(), next = new Map()
-    for (const entry of this.catalog.values()) next.set(entry.instrument.instId, this.mergeCatalogRow(entry, current.get(entry.instrument.instId)))
-    const changed = next.size !== current.size || [...next].some(([instrument, row]) => JSON.stringify(row) !== JSON.stringify(current.get(instrument)))
-    if (changed) {
-      this.listRows.set(frame, next)
-      this.listUpdatedAt.set(frame, this.lastRefreshAt || this.catalogUpdatedAt || Date.now())
-      this.touchList()
-    }
-    return frame
+  validCatalogEntry(entry, now = Date.now()) {
+    return Boolean(entry?.instrument?.instId && entry.ticker && entry.result?.eligible && entry.status === 'verified'
+      && entry.configKey === this.catalogCriteriaKey() && Number.isSafeInteger(entry.expiresAt) && entry.expiresAt > now)
   }
 
-  publishListRow(timeframe, row, updatedAt = Date.now()) {
-    const frame = this.listTimeframe(timeframe), current = this.listRows.get(frame) ?? new Map(), previous = current.get(row.instId)
-    if (previous && JSON.stringify(previous) === JSON.stringify(row)) return false
-    const next = new Map(current)
-    next.set(row.instId, row)
-    this.listRows.set(frame, next)
-    this.listUpdatedAt.set(frame, updatedAt)
-    this.touchList()
+  readCatalog() {
+    const entries = this.metadata.listCatalogEntries()
+    for (const entry of entries) {
+      if (entry.instrument?.instId) this.instruments.set(entry.instrument.instId, entry.instrument)
+      if (entry.observations) this.observations.set(entry.instrumentID, entry.observations)
+    }
+    const valid = entries.filter(entry => this.validCatalogEntry(entry))
+    if (!valid.length) return false
+    this.catalogSource = 'cache'
+    this.catalogUpdatedAt = Math.max(...valid.map(entry => entry.observedAt))
+    this.replaceCatalog(valid)
     return true
+  }
+
+  async restoreCatalog() { await this.ready; return this.readCatalog() }
+
+  async persistCatalog(entries, savedAt = Date.now()) {
+    await this.ready
+    for (const entry of entries) this.metadata.putCatalogEntry(this.catalogRecord(entry, savedAt))
+  }
+
+  catalogRecord(entry, timestamp = Date.now()) {
+    const configKey = entry.configKey ?? this.catalogCriteriaKey()
+    return { ...entry, instrumentID: entry.instrument.instId, schemaVersion: 1,
+      status: entry.status ?? (entry.result?.eligible ? 'verified' : 'failed'),
+      observedAt: entry.observedAt ?? timestamp, expiresAt: entry.expiresAt ?? timestamp + OBSERVATION_TTL,
+      preferencesRevision: this.metadata?.getSettings().revision ?? 0, configKey }
   }
 
   replaceCatalog(entries) {
     if (this.disposed) return false
-    const next = new Map(entries.map(entry => [entry.instrument.instId, entry]))
-    const changed = next.size !== this.catalog.size || [...next].some(([instrument, entry]) => JSON.stringify(entry) !== JSON.stringify(this.catalog.get(instrument)))
-    // Keep the existing entry objects when a completed discovery is identical.
-    // It avoids needlessly invalidating warm-up state and starting another
-    // catalogue generation for data that has not changed.
-    if (!changed) return false
+    const next = new Map(entries.map(entry => { const record = this.catalogRecord(entry); return [record.instrument.instId, record] }))
+    const changed = JSON.stringify([...next]) !== JSON.stringify([...this.catalog])
     this.catalog = next
     for (const entry of next.values()) this.instruments.set(entry.instrument.instId, entry.instrument)
-    this.catalogRevision += 1
-    for (const timeframe of new Set([DEFAULT_LIST_TIMEFRAME, ...this.listRows.keys()])) {
+    if (changed) { this.catalogRevision += 1; this.touchList() }
+    for (const timeframe of new Set([this.prefs().chartTimeframe, ...this.listRows.keys()])) {
       this.ensureListRows(timeframe)
-      this.listProjectionVersions.delete(timeframe)
-      // Cache projections are keyed by catalogue generation. A live refresh
-      // during startup therefore begins the current generation immediately,
-      // rather than waiting for an older snapshot to settle.
-      void this.primeListRowsFromCache(timeframe).catch(() => undefined)
+      for (const instId of next.keys()) this.track(this.projectListEntry(instId, timeframe))
     }
-    for (const [key, state] of this.listWarmups) {
-      const current = this.catalogEntry(state.instrument)
-      if (current && (!state.entry || state.entry === current)) continue
-      if (state.timer) clearTimeout(state.timer)
-      state.controller?.abort()
-      this.listWarmups.delete(key)
+    this.updateSubscriptions()
+    return changed
+  }
+
+  pruneCatalog() {
+    const valid = [...this.catalog.values()].filter(entry => this.validCatalogEntry(entry))
+    if (valid.length !== this.catalog.size) this.replaceCatalog(valid)
+  }
+
+  listRowFor(entry, bars = []) {
+    const ranking = this.rankings.get(entry.instrument.instId)
+    return { ...marketRow(entry.instrument, entry.ticker, entry.result, bars), ...(ranking?.rankingAsOf === closedBoundary('5m') ? ranking : { rankingChange: null, rankingAsOf: null }) }
+  }
+
+  ensureListRows(timeframe) {
+    const frame = this.listTimeframe(timeframe), current = this.listRows.get(frame) ?? new Map(), next = new Map()
+    for (const entry of this.catalog.values()) {
+      const base = this.listRowFor(entry), previous = current.get(entry.instrument.instId)
+      next.set(entry.instrument.instId, previous ? { ...previous, turnover24hUSDT: base.turnover24hUSDT, lastPrice: base.lastPrice, rankingChange: base.rankingChange, rankingAsOf: base.rankingAsOf } : base)
     }
-    this.listWarmupQueue = this.listWarmupQueue.filter(key => this.listWarmups.has(key))
-    return true
-  }
-
-  async readListBars(entry, timeframe) {
-    const frame = this.listTimeframe(timeframe), instrument = entry.instrument
-    const projection = await this.preparedCharts.projectSeries(instrument.instId, frame)
-    return { ...projection, range: projection.end === null ? null : listRawRange(frame, projection.end) }
-  }
-
-  publishListProjection(instrument, timeframe, projection, updatedAt) {
-    const entry = this.catalogEntry(instrument)
-    if (!entry) return null
-    const row = this.listRowFor(entry, projection.bars)
-    this.publishListRow(timeframe, row, updatedAt)
-    return { row, ...projection }
-  }
-
-  invalidateListProjection(instrument) {
-    this.listProjectionDataVersions.set(instrument, (this.listProjectionDataVersions.get(instrument) ?? 0) + 1)
-    for (const timeframe of this.listRows.keys()) this.listProjectionResults.delete(this.listKey(instrument, timeframe))
-  }
-
-  async projectListEntry(instrument, timeframe, { updatedAt } = {}) {
-    const frame = this.listTimeframe(timeframe)
-    if (this.disposed || !this.catalogEntry(instrument)) return null
-    const key = this.listKey(instrument, frame), dataVersion = this.listProjectionDataVersions.get(instrument) ?? 0
-    const cached = this.listProjectionResults.get(key)
-    if (cached?.dataVersion === dataVersion) return this.publishListProjection(instrument, frame, cached, updatedAt)
-    const existing = this.listProjectionTasks.get(key)
-    if (existing?.dataVersion === dataVersion) return existing.task
-    let task
-    task = (async () => {
-      // A newer local write waits behind the in-flight read, then starts a
-      // new projection for its own data version. This prevents a stale query
-      // from overwriting freshly hydrated OI/Taker or candles.
-      if (existing) await existing.task.catch(() => undefined)
-      if (this.disposed || !this.catalogEntry(instrument)) return null
-      const current = this.listProjectionResults.get(key)
-      if (current?.dataVersion === dataVersion) return this.publishListProjection(instrument, frame, current, updatedAt)
-      const projection = await this.readListBars(this.catalogEntry(instrument), frame)
-      // A projection is data for one instrument/timeframe, not for a ticker
-      // object. A liquidity refresh may replace its ticker/result while this
-      // DuckDB read is in flight; use that current entry to publish the same
-      // durable bars. Only a removed instrument has no valid destination.
-      if (this.disposed || (this.listProjectionDataVersions.get(instrument) ?? 0) !== dataVersion) return null
-      this.listProjectionResults.set(key, { ...projection, dataVersion })
-      return this.publishListProjection(instrument, frame, projection, updatedAt)
-    })().finally(() => {
-      if (this.listProjectionTasks.get(key)?.task === task) this.listProjectionTasks.delete(key)
-    })
-    this.listProjectionTasks.set(key, { dataVersion, task })
-    return task
-  }
-
-  async primeListRowsFromCache(timeframe) {
-    if (this.disposed) return
-    const frame = this.ensureListRows(timeframe), version = this.catalogRevision
-    if (this.listProjectionVersions.get(frame) === version) return
-    const existing = this.listCatalogProjectionTasks.get(frame)
-    if (existing?.version === version) return existing.task
-    const instruments = [...this.catalog.keys()], updatedAt = this.catalogSource === 'cache' ? this.catalogUpdatedAt ?? Date.now() : Date.now()
-    let task
-    task = (async () => {
-      await Promise.all(instruments.map(async instrument => {
-        try { await this.projectListEntry(instrument, frame, { updatedAt }) } catch { /* A warm-up retry will report and repair it. */ }
-      }))
-      if (this.disposed) return
-      if (this.catalogRevision === version) this.listProjectionVersions.set(frame, version)
-      // A new catalogue generation might have arrived while this one was
-      // reading. Its task is normally already running from replaceCatalog;
-      // this fallback also makes direct callers generation-safe.
-      else void this.primeListRowsFromCache(frame).catch(() => undefined)
-    })().finally(() => {
-      if (this.listCatalogProjectionTasks.get(frame)?.task === task) this.listCatalogProjectionTasks.delete(frame)
-    })
-    this.listCatalogProjectionTasks.set(frame, { version, task })
-    return task
-  }
-
-  queueListWarmup(instrument, timeframe, force = false) {
-    const frame = this.listTimeframe(timeframe), entry = this.catalogEntry(instrument)
-    if (!entry || this.disposed) return
-    const state = this.listWarmupState(instrument, frame), now = Date.now()
-    if (state.task || state.status === 'queued') return
-    if (state.timer || !force && state.retryAt && state.retryAt > now) return
-    if (!force && state.status === 'ready') return
-    state.status = 'queued'; state.retryAt = null; state.lastError = ''
-    this.listWarmupQueue.push(this.listKey(instrument, frame))
-    this.touchList()
-    void this.drainListWarmups()
-  }
-
-  startListWarmups(timeframe, force = false) {
-    const frame = this.listTimeframe(timeframe)
-    for (const instrument of this.catalog.keys()) this.queueListWarmup(instrument, frame, force)
-  }
-
-  scheduleListWarmupAt(entry, timeframe, state, message, retryAt) {
-    if (this.disposed || this.catalogEntry(entry.instrument.instId) !== entry) return
-    const deadline = Math.max(Date.now() + 1_000, Number.isFinite(retryAt) ? retryAt : Date.now() + RETRY_DELAYS[0])
-    state.status = 'retrying'; state.retryAt = deadline; state.lastError = message
-    if (state.timer) clearTimeout(state.timer)
-    const timer = setTimeout(() => {
-      state.timer = null
-      this.queueListWarmup(entry.instrument.instId, timeframe, true)
-    }, Math.max(0, deadline - Date.now()))
-    timer.unref?.()
-    state.timer = timer
-    this.touchList()
-  }
-
-  scheduleListWarmupRetry(entry, timeframe, state, message, serverDelay) {
-    if (this.disposed || this.catalogEntry(entry.instrument.instId) !== entry) return
-    const plan = retryPlan(state.attempt, serverDelay)
-    state.attempt = plan.attempt
-    if (plan.unavailable) state.status = 'unavailable'
-    else state.status = 'retrying'
-    state.retryAt = Date.now() + plan.delay; state.lastError = message
-    if (state.timer) clearTimeout(state.timer)
-    const timer = setTimeout(() => {
-      state.timer = null
-      this.queueListWarmup(entry.instrument.instId, timeframe, true)
-    }, plan.delay)
-    timer.unref?.()
-    state.timer = timer
-    this.touchList()
-  }
-
-  deferListWarmup(entry, timeframe, state) {
-    this.scheduleListWarmupAt(entry, timeframe, state, 'Foreground chart activity has priority.', Date.now() + RETRY_DELAYS[0])
-  }
-
-  seriesKey(instrument, timeframe) { return `${timeframe}:${typeof instrument === 'string' ? instrument : instrument.instId}` }
-
-  listHistoryGapKey(instrument, timeframe, gap) { return `${this.seriesKey(instrument, timeframe)}\u0000${gap.from}` }
-
-  reconcileListGapStates(instrument, timeframe, gaps) {
-    const prefix = `${this.seriesKey(instrument, timeframe)}\u0000`, active = new Set(gaps.map(gap => this.listHistoryGapKey(instrument, timeframe, gap)))
-    for (const key of this.listGapStates.keys()) if (key.startsWith(prefix) && !active.has(key)) this.listGapStates.delete(key)
-  }
-
-  trackedListGap(instrument, timeframe, gap) {
-    const key = this.listHistoryGapKey(instrument, timeframe, gap), previous = this.listGapStates.get(key) ?? { emptyResponses: 0 }
-    const tracked = { ...gap, emptyResponses: previous.emptyResponses ?? 0 }
-    this.listGapStates.set(key, { emptyResponses: tracked.emptyResponses })
-    return tracked
-  }
-
-  rememberListGap(instrument, timeframe, gap) {
-    this.listGapStates.set(this.listHistoryGapKey(instrument, timeframe, gap), { emptyResponses: gap.emptyResponses ?? 0 })
-  }
-
-  clearListGap(instrument, timeframe, gap) { this.listGapStates.delete(this.listHistoryGapKey(instrument, timeframe, gap)) }
-
-  hasFreshCandleCoverage(coverage, timeframe) {
-    if (coverage.last === null) return false
-    const intervalMS = timeframeMilliseconds(timeframe)
-    const latestLikelyComplete = Math.floor((Date.now() - intervalMS) / intervalMS) * intervalMS
-    return coverage.last >= latestLikelyComplete - intervalMS
-  }
-
-  async warmListEntry(entry, timeframe, state, signal) {
-    const frame = this.listTimeframe(timeframe), interrupted = () => signal.aborted || this.disposed || this.catalogEntry(entry.instrument.instId) !== entry
-    try {
-      // The cache prime already reads this exact window. Reuse that result to
-      // inspect gaps instead of immediately enqueuing another serialized
-      // DuckDB projection for every warm-up entry.
-      let projection = await this.projectListEntry(entry.instrument.instId, frame)
-      if (interrupted()) return
-      let coverage = await this.store.coverage(entry.instrument.instId, frame)
-      const hydrated = !this.hasFreshCandleCoverage(coverage, frame) && await this.hydrate(entry.instrument, frame, 'background')
-      if (interrupted()) return
-      coverage = await this.store.coverage(entry.instrument.instId, frame)
-      if (hydrated) projection = await this.projectListEntry(entry.instrument.instId, frame)
-      if (!projection || projection.end === null || !projection.range) {
-        const latest = this.latestCandleRetryState(entry.instrument, frame)
-        if (latest.retryAt && latest.retryAt > Date.now()) {
-          this.scheduleListWarmupAt(entry, frame, state, latest.lastError || 'Cannot refresh latest candles.', latest.retryAt)
-          return
-        }
-        throw new Error('No complete candle period is available yet.')
-      }
-      const intervalMS = timeframeMilliseconds(frame)
-      const gaps = await this.store.missingCandleRanges({ instrument: entry.instrument.instId, timeframe: frame, ...projection.range, intervalMS })
-      this.reconcileListGapStates(entry.instrument, frame, gaps)
-      const boundary = this.historyBoundaries.get(this.seriesKey(entry.instrument, frame))
-      const repairable = boundary === undefined ? gaps : gaps.filter(gap => gap.through >= boundary)
-      let repaired = false
-      for (const gap of repairable) {
-        const tracked = this.trackedListGap(entry.instrument, frame, gap)
-        const result = await this.repairGap(entry.instrument, frame, tracked, signal, 'background')
-        if (interrupted()) return
-        if (result.deferred) { this.deferListWarmup(entry, frame, state); return }
-        repaired ||= result.repaired
-        if (result.exhausted) { this.clearListGap(entry.instrument, frame, tracked); continue }
-        if (result.remaining?.length) {
-          this.rememberListGap(entry.instrument, frame, tracked)
-          throw new Error('The list candle window is still incomplete.')
-        }
-        this.clearListGap(entry.instrument, frame, tracked)
-      }
-      if (repaired) {
-        this.invalidateListProjection(entry.instrument.instId)
-        projection = await this.projectListEntry(entry.instrument.instId, frame)
-      }
-      if (interrupted()) return
-      const end = projection?.end
-      if (!Number.isFinite(end)) throw new Error('No complete candle period is available yet.')
-      if (!await this.hasCompleteStoredStatistics(entry.instrument, frame, end)) {
-        const statistics = await this.hydrateStatistics(entry.instrument, frame, end, signal, 'background')
-        if (!statistics.complete) throw new Error('OKX has not published a complete OI/Taker window yet.')
-      }
-      await this.projectListEntry(entry.instrument.instId, frame)
-      if (interrupted()) return
-      state.status = 'ready'; state.attempt = 0; state.retryAt = null; state.lastError = ''
-      this.touchList()
-    } catch (error) {
-      if (interrupted()) return
-      if (requestWasCancelled(error)) { this.deferListWarmup(entry, frame, state); return }
-      this.scheduleListWarmupRetry(entry, frame, state, error instanceof Error ? error.message : 'Cannot warm the list data.', retryAfter(error))
-    }
-  }
-
-  async drainListWarmups() {
-    while (!this.disposed && this.listWarmupRunning < LIST_WARMUP_CONCURRENCY && this.listWarmupQueue.length) {
-      const key = this.listWarmupQueue.shift(), state = this.listWarmups.get(key), entry = state && this.catalogEntry(state.instrument)
-      if (!state || !entry || state.status !== 'queued') continue
-      this.listWarmupRunning += 1
-      const controller = new AbortController()
-      state.status = 'loading'; state.controller = controller; state.entry = entry; this.touchList()
-      let task
-      task = this.warmListEntry(entry, state.timeframe, state, controller.signal).finally(() => {
-        if (state.task === task) { state.task = null; state.entry = null }
-        if (state.controller === controller) state.controller = null
-        this.listWarmupRunning -= 1
-        if (!this.disposed && this.listWarmups.get(key) === state && state.status === 'loading') this.deferListWarmup(entry, state.timeframe, state)
-        void this.drainListWarmups()
-      })
-      state.task = task
-    }
-  }
-
-  async ensureListTimeframe(timeframe) {
-    const frame = this.listTimeframe(timeframe)
-    // This method is intentionally the explicit "wait for cache" API used
-    // by fixtures and callers that need a settled list. Regular snapshots and
-    // refreshes never await it, so the window is never blocked by DuckDB.
-    while (!this.disposed) {
-      const version = this.catalogRevision
-      await this.primeListRowsFromCache(frame)
-      if (version === this.catalogRevision && this.listProjectionVersions.get(frame) === version) break
-    }
-    if (!this.disposed) this.startListWarmups(frame)
+    if (JSON.stringify([...current]) !== JSON.stringify([...next])) {
+      this.listRows.set(frame, next); this.listUpdatedAt.set(frame, Date.now()); this.touchList()
+    } else if (!this.listRows.has(frame)) this.listRows.set(frame, next)
     return frame
   }
 
-  scheduleListProjection(instrument) {
+  listRowsFor(timeframe) { this.pruneCatalog(); return [...(this.listRows.get(this.listTimeframe(timeframe))?.values() ?? [])].sort(compareRanking) }
+
+  publishListRow(timeframe, row, updatedAt = Date.now()) {
+    if (!this.catalog.has(row.instId)) return false
+    const frame = this.listTimeframe(timeframe), current = this.listRows.get(frame) ?? new Map()
+    if (JSON.stringify(current.get(row.instId)) === JSON.stringify(row)) return false
+    current.set(row.instId, row); this.listRows.set(frame, current); this.listUpdatedAt.set(frame, updatedAt); this.touchList()
+    return true
+  }
+
+  async readListBars(entry, timeframe) { return this.preparedCharts.projectSeries(entry.instrument.instId, this.listTimeframe(timeframe)) }
+
+  invalidateListProjection(instId) {
+    this.listProjectionDataVersions.set(instId, (this.listProjectionDataVersions.get(instId) ?? 0) + 1)
+    for (const timeframe of LIST_TIMEFRAMES) this.listProjectionResults.delete(this.listKey(instId, timeframe))
+  }
+
+  async projectListEntry(instId, timeframe) {
+    const frame = this.listTimeframe(timeframe)
+    if (this.disposed || !this.catalog.has(instId)) return null
+    const key = this.listKey(instId, frame), version = this.listProjectionDataVersions.get(instId) ?? 0
+    const existing = this.listProjectionTasks.get(key)
+    if (existing?.version === version) return existing.task
+    const task = (async () => {
+      if (existing) await existing.task.catch(() => undefined)
+      const entry = this.catalog.get(instId)
+      if (!entry || this.disposed) return null
+      const cached = this.listProjectionResults.get(key)
+      const projection = cached?.version === version ? cached : await this.readListBars(entry, frame)
+      if (this.disposed || (this.listProjectionDataVersions.get(instId) ?? 0) !== version) return null
+      this.listProjectionResults.set(key, { ...projection, version })
+      const current = this.catalog.get(instId)
+      if (!current) return null
+      const row = this.listRowFor(current, projection.bars)
+      this.publishListRow(frame, row)
+      return { ...projection, row }
+    })().finally(() => { if (this.listProjectionTasks.get(key)?.task === task) this.listProjectionTasks.delete(key) })
+    this.listProjectionTasks.set(key, { version, task })
+    return task
+  }
+
+  scheduleListProjection(instId) {
+    this.invalidateListProjection(instId)
+    for (const timeframe of this.listRows.keys()) this.track(this.projectListEntry(instId, timeframe))
+  }
+
+  async ensureListTimeframe(timeframe) {
+    await this.ready
+    const frame = this.ensureListRows(timeframe)
+    await Promise.all([...this.catalog.keys()].map(instId => this.projectListEntry(instId, frame)))
+    return this.listRowsFor(frame)
+  }
+
+  async updateRanking(instId, { ensure = false, asOf = closedBoundary('5m') } = {}) {
     if (this.disposed) return
-    this.invalidateListProjection(instrument)
-    if (!this.catalog.has(instrument)) return
-    for (const timeframe of this.listRows.keys()) void this.projectListEntry(instrument, timeframe).catch(() => undefined)
+    const lookback = this.prefs().rankingLookback, key = `${instId}:${lookback}:${asOf}`
+    if (this.rankingTasks.has(key)) return this.rankingTasks.get(key)
+    const task = (async () => {
+      const through = asOf - FIVE_MINUTES, from = Math.max(0, through - lookback * 60_000)
+      if (ensure) await this.history.ensurePrices(instId, '5m', from, through, 'foreground')
+      const rows = await this.store.candles({ instrument: instId, timeframe: '5m', from, through }, 'background')
+      const ranking = rankingFromCandles(rows, lookback, asOf)
+      if (this.disposed || this.prefs().rankingLookback !== lookback || asOf !== closedBoundary('5m')) return
+      this.rankings.set(instId, ranking)
+      for (const frame of this.listRows.keys()) {
+        const previous = this.listRows.get(frame)?.get(instId)
+        if (previous) this.publishListRow(frame, { ...previous, ...ranking })
+      }
+    })().finally(() => { if (this.rankingTasks.get(key) === task) this.rankingTasks.delete(key) })
+    this.rankingTasks.set(key, task)
+    return task
+  }
+
+  track(promise) {
+    const task = Promise.resolve(promise).catch(() => undefined).finally(() => this.backgroundTasks.delete(task))
+    this.backgroundTasks.add(task)
+    return task
   }
 
   requestLane(name) {
@@ -848,8 +571,6 @@ export class MarketService {
     const lane = requestLaneFor(path)
     // Foreground work may evict background work only from the same OKX
     // budget. In particular, a candle repair cannot cancel OI or Taker.
-    if (requestPriority(priority) > REQUEST_PRIORITY.background) this.cancelBackgroundRequests(lane)
-    this.preemptLowerPriorityRequest(priority, lane)
     const controller = new AbortController()
     const abort = () => controller.abort()
     this.shutdownController.signal.addEventListener('abort', abort, { once: true })
@@ -870,22 +591,6 @@ export class MarketService {
     return result
   }
 
-  preemptLowerPriorityRequest(priority, laneName) {
-    const active = this.requestLane(laneName).active
-    if (!active || active.controller.signal.aborted || requestPriority(active.priority) >= requestPriority(priority)) return
-    const error = new Error(`A higher-priority ${priority} request superseded ${active.priority} work.`)
-    error.name = 'RequestPreemptedError'
-    active.controller.abort(error)
-  }
-
-  cancelBackgroundRequests(laneName) {
-    // Disposal cancels all background work. Interactive preparation may
-    // preempt list work only in the same endpoint family.
-    if (laneName === undefined) this.refreshController?.abort()
-    for (const [controller, lane] of this.backgroundRequestControllers) {
-      if (laneName === undefined || lane === laneName) controller.abort()
-    }
-  }
 
   enqueueCandleMutation(instrument, operation) {
     const previous = this.candleMutations.get(instrument) ?? Promise.resolve()
@@ -912,12 +617,14 @@ export class MarketService {
 
   async persistCandles(instrument, candles, { projectList = true, priority = 'foreground' } = {}) {
     const confirmed = candles.filter(value => value.confirmed)
+    await this.ready
     if (this.disposed || !confirmed.length) return false
     return this.enqueueCandleMutation(instrument, async () => {
       if (this.disposed) return false
       const changed = await this.appendChangedCandlesLocked(confirmed, priority)
       if (!changed.length) return false
       this.markChartDataChanged(instrument)
+      if (confirmed.some(row => row.timeframe === '5m')) void this.updateRanking(instrument).catch(() => undefined)
       if (projectList) this.scheduleListProjection(instrument)
       return true
     })
@@ -930,53 +637,10 @@ export class MarketService {
 
   dataRevision(instId) { return this.dataRevisions.get(instId) ?? 0 }
 
-  statisticsWindow(rows, first, intervalMS) {
-    const candlesReady = this.completeCandleRows(rows, first, intervalMS)
-    if (!candlesReady) return { candlesReady: false, complete: false, status: 'loading', oiState: 'loading', takerState: 'loading' }
-    const sourceState = (source, fields) => {
-      if (!rows.every(value => hasStatisticsSource(value, source))) return 'loading'
-      return rows.every(value => fields.every(field => number(value[field]) !== null)) ? 'ready' : 'unavailable'
-    }
-    const oiState = sourceState(STATISTICS_OI, ['oi'])
-    const takerState = sourceState(STATISTICS_TAKER, ['buy', 'sell'])
-    const complete = oiState !== 'loading' && takerState !== 'loading'
-    return {
-      candlesReady,
-      complete,
-      oiState,
-      takerState,
-      // A source may have terminally empty historic rows while its sibling
-      // is useful. That is unavailable, not a retryable generic loading.
-      status: !complete ? 'loading' : oiState === 'ready' && takerState === 'ready' ? 'ready' : 'unavailable',
-    }
-  }
-
-  completeCandleRows(rows, first, intervalMS) {
-    return this.completeCandleRowsOfLength(rows, first, intervalMS, VISIBLE_CANDLES)
-  }
-
-  completeCandleRowsOfLength(rows, first, intervalMS, length) {
-    return rows.length === length && rows.every((value, index) => (value.timestamp ?? value.hour) === first + index * intervalMS && value.confirmed)
-  }
-
-  statisticsRange(timeframe, end) {
-    const intervalMS = timeframeMilliseconds(timeframe)
-    return { from: end - (VISIBLE_CANDLES - 1) * intervalMS, through: end, intervalMS }
-  }
 
   statisticsPageRange(timeframe, end) {
     const intervalMS = timeframeMilliseconds(timeframe)
     return { from: end - 99 * intervalMS, through: end, intervalMS }
-  }
-
-  async storedStatisticsWindow(instrument, timeframe, end, priority = 'foreground') {
-    const range = this.statisticsRange(timeframe, end)
-    const rows = (await this.store.candles({ instrument: instrument.instId, timeframe, from: range.from, through: range.through }, priority)).map(normalizedStatistics)
-    return { ...this.statisticsWindow(rows, range.from, range.intervalMS), rows, range }
-  }
-
-  async hasCompleteStoredStatistics(instrument, timeframe, end, priority = 'foreground') {
-    return (await this.storedStatisticsWindow(instrument, timeframe, end, priority)).complete
   }
 
   statisticsExpiry(timeframe, end) {
@@ -984,6 +648,7 @@ export class MarketService {
   }
 
   async persistStatisticsSource(instrument, timeframe, end, source, values, signal, priority = 'statistics', preserveExistingSource = false, { range, projectList = true } = {}) {
+    await this.ready
     const byHour = source === STATISTICS_OI
       ? new Map(values.map(value => [Number(value[0]), number(value[1])]))
       : new Map(values.map(value => [Number(value[0]), { sell: number(value[1]), buy: number(value[2]) }]))
@@ -1045,309 +710,306 @@ export class MarketService {
     return changed
   }
 
-  async hydrateStatistics(instrument, timeframe, end, signal, priority = 'statistics') {
-    if (this.disposed || signal?.aborted) return { changed: false, complete: false, status: 'loading', oiState: 'loading', takerState: 'loading' }
-    // The visible window decides what still needs a request. The actual write
-    // uses the wider 100-period page below, so its four older samples are
-    // immediately reusable when the user scrolls back one wheel tick.
-    const visible = await this.storedStatisticsWindow(instrument, timeframe, end, priority === 'background' ? 'background' : 'foreground')
-    if (!visible.candlesReady || visible.complete) return { changed: false, ...visible }
-    const { intervalMS } = visible.range
-    const storePriority = priority === 'background' ? 'background' : 'foreground'
-    const statisticsEnd = end + intervalMS
-    const persistSource = (source, values) => this.persistStatisticsSource(instrument, timeframe, end, source, values, signal, priority)
-    const operations = []
-    if (visible.oiState === 'loading') operations.push(this.get('/rubik/stat/contracts/open-interest-history', { instId: instrument.instId, period: timeframe, limit: 100, end: statisticsEnd }, signal, priority).then(values => persistSource(STATISTICS_OI, values)))
-    if (visible.takerState === 'loading') operations.push(this.get('/rubik/stat/taker-volume-contract', { instId: instrument.instId, period: timeframe, unit: 1, limit: 100, end: statisticsEnd }, signal, priority).then(values => persistSource(STATISTICS_TAKER, values)))
-    const settled = await Promise.allSettled(operations)
-    if (this.disposed || signal?.aborted) throw signal?.reason ?? new Error('The statistics request was aborted.')
-    const current = await this.storedStatisticsWindow(instrument, timeframe, end, storePriority)
-    const error = settled.find(result => result.status === 'rejected')?.reason
-    return { changed: settled.some(result => result.status === 'fulfilled' && result.value), ...current, error }
-  }
 
-  async repairGap(instrument, timeframe, gap, signal, priority = 'background') {
-    const intervalMS = timeframeMilliseconds(timeframe)
-    let cursor = gap.through + intervalMS, repaired = false, remaining = [gap]
-    const initialSlots = rangeSlots(remaining, intervalMS)
-    const storePriority = 'background'
-    for (let pageNumber = 0; cursor > gap.from && pageNumber < MAX_REPAIR_PAGES; pageNumber += 1) {
-      if (signal?.aborted) return { repaired, exhausted: false, deferred: true, remaining }
-      const page = await this.get('/market/history-candles', { instId: instrument.instId, bar: timeframe, limit: 300, after: cursor }, signal, priority)
-      if (this.disposed || signal?.aborted) return { repaired, exhausted: false, deferred: true, remaining }
-      const older = page.map(value => candle(instrument.instId, timeframe, value)).filter(value => value?.confirmed)
-      if (!older.length) {
-        // A successful earlier page may have advanced local coverage during
-        // this same repair. Read it again before declaring a listing boundary:
-        // the coverage captured by the caller can be hundreds of candles newer
-        // and would permanently hide repairable history from both list and
-        // chart paths.
-        const currentCoverage = await this.store.coverage(instrument.instId, timeframe, storePriority)
-        const unresolved = remaining.length ? remaining : [gap]
-        if (currentCoverage.first !== null && unresolved.every(range => range.through < currentCoverage.first)) {
-          gap.emptyResponses = (gap.emptyResponses ?? 0) + 1
-          if (gap.emptyResponses >= HISTORY_BOUNDARY_EMPTY_RESPONSES) {
-            const key = this.seriesKey(instrument, timeframe), previousBoundary = this.historyBoundaries.get(key)
-            this.historyBoundaries.set(key, previousBoundary === undefined ? currentCoverage.first : Math.min(previousBoundary, currentCoverage.first))
-            return { repaired, exhausted: true, remaining }
-          }
-        }
-        return { repaired, exhausted: false, remaining }
-      }
-      gap.emptyResponses = 0
-      const oldest = Math.min(...older.map(value => value.timestamp))
-      if (oldest >= cursor) throw new Error('OKX history cursor did not advance.')
-      await this.persistCandles(instrument.instId, older, { projectList: priority !== 'background', priority: storePriority })
-      remaining = await this.store.missingCandleRanges({ instrument: instrument.instId, timeframe, ...gap, intervalMS }, storePriority)
-      repaired ||= rangeSlots(remaining, intervalMS) < initialSlots
-      if (!remaining.length) return { repaired: true, exhausted: false, remaining }
-      cursor = oldest
-    }
-    return { repaired, exhausted: false, remaining }
-  }
-
-  latestCandleRetryState(instrument, timeframe = '5m') {
-    const key = this.seriesKey(instrument, timeframe)
-    let state = this.latestCandleRetries.get(key)
-    if (!state) {
-      state = { instrument: instrument.instId, timeframe, status: 'ready', attempt: 0, retryAt: null, rateLimitLane: null, timer: null, controller: null, priority: 'foreground', lastError: '' }
-      this.latestCandleRetries.set(key, state)
-    }
-    return state
-  }
-
-  lastCandleHydratedAt(instrument, timeframe) {
-    const key = this.seriesKey(instrument, timeframe)
-    return this.lastCandleHydration.get(key) ?? 0
-  }
-
-  scheduleLatestCandleRetry(instrument, timeframe, state, message, serverDelay, priority = state.priority, rateLimitLane = null) {
+  setLive(instId, timeframe, row) {
     if (this.disposed) return
-    const plan = retryPlan(state.attempt, serverDelay)
-    state.priority = priority; state.attempt = plan.attempt
-    state.status = plan.unavailable ? 'unavailable' : 'retrying'
-    state.retryAt = Date.now() + plan.delay
-    state.rateLimitLane = rateLimitLane
-    state.lastError = message
-    if (state.timer) clearTimeout(state.timer)
-    const timer = setTimeout(() => {
-      state.timer = null
-      if (!this.disposed) {
-        state.retryAt = null
-        void this.hydrate(instrument, timeframe, priority)
-      }
-    }, plan.delay)
-    timer.unref?.()
-    state.timer = timer
-    this.markChartDataChanged(instrument)
+    const key = `${instId}:${timeframe}`
+    if (row) this.liveCandles.set(key, row)
+    else this.liveCandles.delete(key)
+    return this.preparedCharts.setLive(instId, timeframe, row)
   }
 
-  async hydrate(instrument, timeframe = '5m', priority = 'foreground') {
-    if (this.disposed) return false
-    const key = this.seriesKey(instrument, timeframe), previous = this.hydrating.get(key)
-    const state = this.latestCandleRetryState(instrument, timeframe)
-    if (previous) {
-      if (requestPriority(priority) > requestPriority(state.priority)) {
-        const error = new Error(`A ${priority} candle request superseded ${state.priority} work.`)
-        error.name = 'RequestPreemptedError'
-        state.priority = priority
-        state.controller?.abort(error)
-        return previous.catch(() => false).then(() => this.hydrate(instrument, timeframe, priority))
-      }
-      return previous
+  onHistoryProgress(task) {
+    if (this.disposed) return
+    if (['completed', 'unavailable'].includes(task.status)) {
+      this.scheduleListProjection(task.instrument)
+      if (task.timeframe === '5m') this.track(this.updateRanking(task.instrument))
     }
-    if (requestPriority(priority) > requestPriority(state.priority)) {
-      if (state.timer) clearTimeout(state.timer)
-      state.timer = null; state.retryAt = null; state.status = 'ready'
+    this.touchList()
+  }
+
+  onHistoryReplaced(instId, timeframe) {
+    this.markChartDataChanged(instId)
+    this.preparedCharts.invalidate(instId, timeframe)
+    this.rankings.delete(instId)
+    this.invalidateListProjection(instId)
+    for (const frame of this.listRows.keys()) {
+      const entry = this.catalog.get(instId)
+      if (entry) this.publishListRow(frame, this.listRowFor(entry))
     }
-    if (this.lastCandleHydratedAt(instrument, timeframe) + LATEST_CANDLE_REFRESH > Date.now() || state.timer || state.retryAt && state.retryAt > Date.now()) return false
-    const controller = new AbortController()
-    state.controller = controller; state.priority = priority
-    let task
-    task = (async () => {
-      const recovering = state.status !== 'ready'
-      state.status = 'loading'; state.retryAt = null; state.rateLimitLane = null; state.lastError = ''
-      try {
-        const page = await this.get('/market/candles', { instId: instrument.instId, bar: timeframe, limit: 300 }, controller.signal, priority)
-        if (this.disposed || controller.signal.aborted) return false
-        const fetched = page.map(value => candle(instrument.instId, timeframe, value)).filter(Boolean)
-        const confirmed = fetched.filter(value => value.confirmed)
-        const live = timeframe === '5m' ? fetched.filter(value => !value.confirmed).sort((left, right) => left.timestamp - right.timestamp).at(-1) : undefined
-        const previousLive = this.liveCandles.get(instrument.instId)
-        const liveChanged = live ? !previousLive || !sameCandle(previousLive, live) : previousLive !== undefined
-        if (live) this.liveCandles.set(instrument.instId, live)
-        else this.liveCandles.delete(instrument.instId)
-        if (!confirmed.length) throw new Error(`OKX returned no confirmed ${timeframe} candles.`)
-        const persisted = await this.persistCandles(instrument.instId, confirmed, { priority: priority === 'background' ? 'background' : 'foreground' })
-        this.lastCandleHydration.set(key, Date.now())
-        state.status = 'ready'; state.attempt = 0; state.retryAt = null; state.rateLimitLane = null; state.lastError = ''
-        if (!persisted && (liveChanged || recovering)) this.markChartDataChanged(instrument)
-        return true
-      } catch (error) {
-        if (!controller.signal.aborted && !requestWasCancelled(error)) this.scheduleLatestCandleRetry(instrument, timeframe, state, error instanceof Error ? error.message : 'Cannot refresh latest candles.', retryAfter(error), priority, retryLane(error))
-        else if (state.status === 'loading') { state.status = 'ready'; state.retryAt = null }
-        return false
-      }
-    })().finally(() => {
-      if (state.controller === controller) state.controller = null
-      if (this.hydrating.get(key) === task) this.hydrating.delete(key)
-    })
-    this.hydrating.set(key, task)
-    return task
+    this.scheduleListProjection(instId)
+    if (timeframe === '5m') this.track(this.updateRanking(instId))
+  }
+
+  updateSubscriptions() {
+    if (!this.realtime) return
+    const subscriptions = new Map(this.chartSubscriptions.map(value => [`${value.instId}:${value.timeframe}`, value]))
+    for (const instId of this.catalog.keys()) for (const timeframe of LIST_TIMEFRAMES) subscriptions.set(`${instId}:${timeframe}`, { instId, timeframe })
+    this.realtime.setSubscriptions([...subscriptions.values()])
+  }
+
+  async reconcileRealtime(subscriptions, { signal } = {}) {
+    await this.ready
+    for (const { instId, timeframe } of subscriptions) {
+      if (this.closing || signal?.aborted) return
+      const step = timeframeMilliseconds(timeframe), through = closedBoundary(timeframe) - step
+      const coverage = await this.store.coverage(instId, timeframe, 'background')
+      const from = Math.max(0, coverage.last === null ? through - step : Math.min(through, coverage.last + step))
+      await this.history.ensurePrices(instId, timeframe, from, through, 'foreground', signal)
+      if (signal?.aborted) return
+      await this.history.ensureStatistics(instId, timeframe, from, through, 'foreground', signal)
+    }
   }
 
   prepareChartWindow(instId, timeframe, end) {
-    if (this.disposed) return Promise.reject(new Error('Market service is closed.'))
-    const task = this.preparedCharts.prepare(instId, timeframe, end)
+    if (this.closing || this.disposed) return Promise.reject(new Error('Market service is closed.'))
+    const task = this.ready.then(() => this.preparedCharts.prepare(instId, timeframe, end))
     this.barTasks.add(task)
     return task.finally(() => this.barTasks.delete(task))
   }
 
-  setChartUniverse(instIds, timeframe, focusInstId) {
-    if (this.disposed) return Promise.reject(new Error('Market service is closed.'))
-    return Promise.resolve(this.preparedCharts.setUniverse(instIds, timeframe, focusInstId))
+  async setChartUniverse(instIds, timeframe, focusInstId) {
+    await this.ready
+    if (this.closing || this.disposed) throw new Error('Market service is closed.')
+    this.chartSubscriptions = [...new Set(instIds)].map(instId => ({ instId, timeframe }))
+    this.updateSubscriptions()
+    return this.preparedCharts.setUniverse(instIds, timeframe, focusInstId)
   }
 
   subscribePreparedCharts(listener) { return this.preparedCharts.subscribe(listener) }
+  async localChartWindow(instId, timeframe) { await this.ready; return this.preparedCharts.local(instId, timeframe) }
 
-  localChartWindow(instId, timeframe) {
-    if (this.disposed) return Promise.reject(new Error('Market service is closed.'))
-    return this.preparedCharts.local(instId, timeframe)
+  observation(entry, key, now = Date.now()) {
+    const value = entry[key]
+    return value && Number.isSafeInteger(value.observedAt) && value.expiresAt > now ? value : null
   }
 
-  async dispose() {
-    if (this.disposeTask) return this.disposeTask
-    this.disposed = true
-    for (const state of this.latestCandleRetries.values()) if (state.timer) clearTimeout(state.timer)
-    for (const state of this.listWarmups.values()) {
-      if (state.timer) clearTimeout(state.timer)
-      state.controller?.abort()
+  async checkCandidate(instrument, tickerObservation, config, configKey, asOf, signal) {
+    const instId = instrument.instId, observations = { ...(this.observations.get(instId) ?? {}) }
+    const observe = async (key, operation) => {
+      try {
+        const value = await operation()
+        if (signal.aborted || this.disposed) return
+        const now = Date.now()
+        observations[key] = { value, observedAt: now, expiresAt: now + OBSERVATION_TTL }
+      } catch { /* An unsuccessful attempt never extends an earlier observation. */ }
     }
-    this.cancelBackgroundRequests()
-    this.shutdownController.abort()
-    const preparedClosed = this.preparedCharts.dispose()
-    for (const controller of this.abortControllers) controller.abort()
-    const queued = this.drainRequestQueues()
-    const work = [
-      this.refreshing,
-      queued,
-      preparedClosed,
-      ...this.barTasks,
-      ...this.hydrating.values(),
-      ...this.candleMutations.values(),
-      ...[...this.listWarmups.values()].map(state => state.task),
-      ...[...this.listProjectionTasks.values()].map(state => state.task),
-      ...[...this.listCatalogProjectionTasks.values()].map(state => state.task),
-    ].filter(Boolean)
-    this.disposeTask = Promise.allSettled(work).then(() => {
-      this.latestCandleRetries.clear()
-      this.listWarmups.clear()
-      this.listWarmupQueue = []
-      this.listGapStates.clear()
-      this.listProjectionTasks.clear()
-      this.listProjectionResults.clear()
-      this.listProjectionDataVersions.clear()
-      this.listCatalogProjectionTasks.clear()
-      this.dataRevisions.clear()
-    })
-    return this.disposeTask
+    const ticker = tickerObservation?.value
+    if (tickerObservation) observations.ticker = tickerObservation
+    const tasks = []
+    if (config.depth.enabled || config.slippage.enabled) tasks.push(observe('book', async () => {
+      const value = (await this.get('/market/books', { instId, sz: 400 }, signal, 'background'))[0]
+      if (!value || !Array.isArray(value.bids) || !value.bids.length || !Array.isArray(value.asks) || !value.asks.length) throw new Error('Missing order-book observation.')
+      return value
+    }))
+    if (config.openInterest.enabled) tasks.push(observe('openInterest', async () => {
+      const value = (await this.get('/public/open-interest', { instType: 'SWAP', instId }, signal, 'background'))[0]
+      if (number(value?.oiUsd) === null || number(value?.oiUsd) < 0) throw new Error('Missing open-interest observation.')
+      return value
+    }))
+    if (config.volume24h.enabled) tasks.push(observe('turnover', async () => {
+      const through = asOf - FIVE_MINUTES, from = through - 287 * FIVE_MINUTES
+      await this.history.ensurePrices(instId, '5m', from, through, 'foreground', signal)
+      const candles = await this.store.candles({ instrument: instId, timeframe: '5m', from, through }, 'foreground')
+      const turnover = quoteTurnover24h(candles, asOf)
+      if (turnover === null) throw new Error('The completed 24-hour quote-volume range is incomplete.')
+      return { asOf, turnover }
+    }))
+    if (config.volumeStability.enabled) tasks.push(observe('hourly', async () => {
+      const end = closedBoundary('1H', asOf), through = end - 3_600_000, from = through - 23 * 3_600_000
+      await this.history.ensurePrices(instId, '1H', from, through, 'foreground', signal)
+      const rows = await this.store.candles({ instrument: instId, timeframe: '1H', from, through }, 'foreground')
+      if (rows.length !== 24 || rows.some((row, index) => row.timestamp !== from + index * 3_600_000 || !row.confirmed || number(row.quoteVolume) === null)) throw new Error('Incomplete hourly source range.')
+      return { asOf: end, rows }
+    }))
+    await Promise.all(tasks)
+    if (this.disposed || signal.aborted || this.catalogCriteriaKey() !== configKey) return
+    this.observations.set(instId, observations)
+    const now = Date.now(), fresh = key => this.observation(observations, key, now)
+    const turnoverObservation = fresh('turnover'), hourlyObservation = fresh('hourly')
+    const turnover = turnoverObservation?.value.asOf === asOf ? turnoverObservation.value.turnover : null
+    const hourly = hourlyObservation?.value.asOf === closedBoundary('1H', asOf) ? hourlyObservation.value.rows : []
+    const result = evaluateLiquidity({ instrument, ticker: fresh('ticker')?.value ?? null, book: fresh('book')?.value ?? null,
+      openInterest: fresh('openInterest')?.value ?? null, hourlyCandles: hourly, turnover24hUSDT: turnover, asOf, config })
+    const required = []
+    if (config.spread.enabled) required.push('ticker')
+    if (config.depth.enabled || config.slippage.enabled) required.push('book')
+    if (config.openInterest.enabled) required.push('openInterest')
+    if (config.volume24h.enabled) required.push('turnover')
+    if (config.volumeStability.enabled) required.push('hourly')
+    const validObservations = required.map(fresh)
+    const complete = validObservations.every(Boolean)
+    const status = result.status === 'verified' && complete ? 'verified' : result.status === 'failed' ? 'failed' : 'unknown'
+    const record = this.catalogRecord({ instrument, ticker: fresh('ticker')?.value ?? ticker ?? {}, result: { ...result, eligible: status === 'verified' },
+      status, configKey, observations, observedAt: validObservations.length && complete ? Math.min(...validObservations.map(value => value.observedAt)) : now,
+      expiresAt: status === 'verified' ? validObservations.length ? Math.min(...validObservations.map(value => value.expiresAt)) : now + OBSERVATION_TTL : now })
+    this.metadata.putCatalogEntry(record)
+    const next = new Map(this.catalog)
+    if (status === 'verified') next.set(instId, record)
+    else next.delete(instId)
+    this.catalogSource = 'live'
+    this.catalogUpdatedAt = now
+    this.replaceCatalog([...next.values()])
+    if (status === 'verified') {
+      this.track(this.updateRanking(instId, { ensure: true, asOf }))
+      this.track(this.history.target(instId, { historyDays: this.prefs().historyDays, asOf }))
+    }
   }
 
   async refresh() {
+    await this.ready
+    if (this.closing || this.disposed) return
     if (this.refreshing) return this.refreshing
-    const controller = new AbortController()
+    const controller = new AbortController(), config = this.prefs().liquidity, configKey = JSON.stringify(config), asOf = closedBoundary('5m')
     this.refreshController = controller
     this.refreshing = (async () => {
-      let succeeded = false
       try {
         const [instruments, tickers] = await Promise.all([
           this.get('/public/instruments', { instType: 'SWAP' }, controller.signal, 'background'),
-          this.get('/market/tickers', { instType: 'SWAP' }, controller.signal, 'background'),
+          this.get('/market/tickers', { instType: 'SWAP' }, controller.signal, 'background').then(values => ({ values, observedAt: Date.now() })),
         ])
-        const tickerByID = new Map(tickers.map(ticker => [ticker.instId, ticker]))
-        const candidates = instruments.filter(instrument => instrument.state === 'live' && instrument.instCategory === '1' && instrument.settleCcy === 'USDT' && instrument.instId?.endsWith('-USDT-SWAP')).filter(instrument => {
-          const ticker = tickerByID.get(instrument.instId), last = number(ticker?.last), turnover = last === null ? null : (number(ticker?.volCcy24h) ?? 0) * last, bid = number(ticker?.bidPx), ask = number(ticker?.askPx)
-          return turnover !== null && turnover > USDT_TURNOVER_MINIMUM && bid !== null && ask !== null && (ask - bid) / bid * 100 < MAX_SPREAD_PERCENT
-        })
-        candidates.forEach(instrument => this.instruments.set(instrument.instId, instrument))
-        const checks = await mapConcurrent(candidates, 4, async instrument => {
-          try {
-            const [books, openInterest, hourly] = await Promise.all([
-              this.get('/market/books', { instId: instrument.instId, sz: 400 }, controller.signal, 'background'),
-              this.get('/public/open-interest', { instType: 'SWAP', instId: instrument.instId }, controller.signal, 'background'),
-              this.get('/market/candles', { instId: instrument.instId, bar: '1H', limit: 25 }, controller.signal, 'background'),
-            ])
-            const result = liquidity(instrument, tickerByID.get(instrument.instId), books[0] ?? {}, openInterest[0], hourly, this.criteria())
-            const ticker = tickerByID.get(instrument.instId)
-            return { instrument, failed: false, entry: result.eligible ? { instrument, ticker, result, change24h: percent(number(ticker?.last), number(ticker?.open24h)) } : null }
-          } catch { return { instrument, failed: true, entry: null } }
-        })
-        if (!controller.signal.aborted) {
-          const failed = new Set(checks.filter(check => check.failed).map(check => check.instrument.instId))
-          // A partial scan may not remove a previously verified contract just
-          // because that contract's own request failed. Retain that entry in
-          // memory, but only commit a new durable snapshot after a complete
-          // scan has verified the whole catalogue.
-          const preserved = [...this.catalog.values()].filter(entry => failed.has(entry.instrument.instId))
-          const entries = [...checks.flatMap(check => check.entry ? [check.entry] : []), ...preserved]
-          const complete = failed.size === 0
-          if (!complete && !entries.length) throw new Error('Cannot validate the live liquidity catalogue.')
-          const savedAt = Date.now()
-          // A partial scan mixes newly checked candidates with the last known
-          // catalog. Keep the persisted timestamp until a complete scan makes
-          // the catalog wholly live again; otherwise the UI would imply a
-          // successful full refresh that never happened.
-          if (complete || this.catalogUpdatedAt === null) this.catalogUpdatedAt = savedAt
-          this.catalogSource = complete ? 'live' : 'cache'
-          this.replaceCatalog(entries)
-          // The catalog is live as soon as liquidity discovery finishes. Its
-          // Parquet projections continue separately; waiting for all of them
-          // here made the first visible list depend on a serialized DuckDB
-          // queue and recreated the apparent "blank forever" failure.
-          this.startListWarmups(DEFAULT_LIST_TIMEFRAME, true)
-          if (complete) {
-            await this.persistCatalog(entries, savedAt)
-            this.error = entries.length ? '' : 'No contracts currently meet all enabled liquidity requirements.'
-          } else this.error = 'Some live liquidity checks failed; showing last verified contracts where necessary.'
-          succeeded = true
+        // OKX documents all swap/futures contract multipliers as 1. The API
+        // sometimes omits that inapplicable variation as an empty string.
+        // Keep malformed or absent metadata unknown; only normalize this explicit
+        // empty field for verified USDT linear swaps, never options.
+        // https://www.okx.com/help/get-started-with-okx-options
+        const candidates = instruments.filter(eligibleInstrument).map(value => value.ctMult === '' ? { ...value, ctMult: '1' } : value), tickerByID = new Map(tickers.values.map(value => [value.instId, { value, observedAt: tickers.observedAt, expiresAt: tickers.observedAt + OBSERVATION_TTL }]))
+        const candidateIDs = new Set(candidates.map(value => value.instId))
+        for (const instrument of candidates) this.instruments.set(instrument.instId, instrument)
+        this.replaceCatalog([...this.catalog.values()].filter(entry => candidateIDs.has(entry.instrument.instId) && this.validCatalogEntry(entry)))
+        // A successful check publishes independently; the first row does not wait for the full exchange scan.
+        await mapConcurrent(candidates, 4, instrument => this.checkCandidate(instrument, tickerByID.get(instrument.instId), config, configKey, asOf, controller.signal))
+        if (!controller.signal.aborted && this.catalogCriteriaKey() === configKey) {
+          this.lastRefreshAt = Date.now()
+          this.error = this.catalog.size ? '' : 'No contracts currently meet all enabled liquidity requirements.'
         }
       } catch (error) {
-        if (!controller.signal.aborted && !this.disposed) this.error = error instanceof Error ? error.message : 'Cannot load OKX markets.'
+        if (!controller.signal.aborted && !this.disposed) this.error = error instanceof Error ? error.message : String(error)
       } finally {
-        // A foreground chart can legitimately cancel discovery. Do not turn
-        // that cancellation into a fake 60-second successful refresh delay.
-        if (succeeded) this.lastRefreshAt = Date.now()
-        else if (controller.signal.aborted) this.lastRefreshAt = 0
+        this.pruneCatalog()
         if (this.refreshController === controller) this.refreshController = null
         this.refreshing = null
+        this.scheduleRefresh()
       }
     })()
     return this.refreshing
   }
 
-  invalidate() {
-    this.catalog.clear(); this.catalogRevision += 1; this.catalogUpdatedAt = null; this.catalogSource = 'none'; this.listRows.clear(); this.listUpdatedAt.clear(); this.listProjectionVersions.clear(); this.listGapStates.clear()
-    for (const state of this.listWarmups.values()) { if (state.timer) clearTimeout(state.timer); state.controller?.abort() }
-    this.listWarmups.clear(); this.listWarmupQueue = []; this.lastRefreshAt = 0; this.error = ''
-    this.touchList()
-    if (this.autoRefresh) void this.refresh()
+  scheduleRefresh() {
+    if (this.refreshTimer) clearTimeout(this.refreshTimer)
+    this.refreshTimer = null
+    if (!this.autoRefresh || this.closing || this.disposed) return
+    const due = this.lastRefreshAt ? Math.max(1, this.lastRefreshAt + LATEST_CANDLE_REFRESH - Date.now()) : LATEST_CANDLE_REFRESH
+    this.refreshTimer = setTimeout(() => { this.refreshTimer = null; this.track(this.refresh()) }, due)
+    this.refreshTimer.unref?.()
   }
 
-  async snapshot(timeframe = DEFAULT_LIST_TIMEFRAME) {
-    const frame = this.listTimeframe(timeframe)
-    if (this.autoRefresh && !this.disposed && !this.refreshing && Date.now() - this.lastRefreshAt >= LATEST_CANDLE_REFRESH) void this.refresh()
-    // A renderer poll must never wait for a full catalogue projection. It can
-    // render restored price/liquidity rows immediately while cache projections
-    // publish their indicator readings incrementally.
-    if (!this.disposed) {
-      this.ensureListRows(frame)
-      void this.primeListRowsFromCache(frame).catch(() => undefined)
-      this.startListWarmups(frame)
+  async reconfigure(previousPreferences) {
+    await this.ready
+    const current = this.prefs(), previous = validatePreferences(previousPreferences)
+    if (JSON.stringify(previous.liquidity) !== JSON.stringify(current.liquidity)) {
+      this.refreshController?.abort()
+      if (this.refreshing) await this.refreshing
+      this.replaceCatalog([...this.catalog.values()].filter(entry => this.validCatalogEntry(entry)))
+      this.lastRefreshAt = 0
+      if (this.autoRefresh) this.track(this.refresh())
     }
-    return {
-      rows: this.listRowsFor(frame), revision: this.revision, error: this.error, loading: this.refreshing !== null,
-      updatedAt: this.listUpdatedAt.get(frame) ?? (this.lastRefreshAt || null),
-      listProgress: this.listProgress(frame), timeframe: frame, catalogSource: this.catalogSource,
+    if (previous.rankingLookback !== current.rankingLookback) {
+      this.rankings.clear()
+      for (const frame of this.listRows.keys()) this.ensureListRows(frame)
+      for (const instId of this.catalog.keys()) this.track(this.updateRanking(instId, { ensure: true }))
     }
+    if (previous.historyDays !== current.historyDays) for (const instId of this.catalog.keys()) this.track(this.history.target(instId, { historyDays: current.historyDays, asOf: closedBoundary('5m') }))
+    if (previous.chartTimeframe !== current.chartTimeframe) {
+      this.ensureListRows(current.chartTimeframe)
+      for (const instId of this.catalog.keys()) this.track(this.projectListEntry(instId, current.chartTimeframe))
+    }
+    this.touchList()
+  }
+
+  invalidate() {
+    this.refreshController?.abort()
+    this.replaceCatalog([])
+    this.lastRefreshAt = 0
+    if (this.autoRefresh) this.track(this.refresh())
+  }
+
+  auditSnapshot(job) {
+    if (!job) return emptyAudit()
+    const slots = target => Math.floor((target.through - target.from) / timeframeMilliseconds(target.timeframe)) + 1
+    const total = job.targets.reduce((sum, target) => sum + slots(target), 0)
+    const targetIndex = job.cursor.targetIndex
+    const completed = job.phase !== 'inspect' || job.status === 'completed' ? total
+      : job.targets.slice(0, targetIndex).reduce((sum, target) => sum + slots(target), 0)
+        + (job.targets[targetIndex] ? Math.max(0, Math.floor((job.cursor.nextFrom - job.targets[targetIndex].from) / timeframeMilliseconds(job.targets[targetIndex].timeframe))) : 0)
+    return { id: job.id, phase: ['queued', 'running', 'paused'].includes(job.status) ? 'running' : job.status,
+      progress: { completed: Math.min(total, completed), total },
+      issues: job.issues.filter(issue => issue.status === 'open').map(({ instrument, timeframe, from, through, reason, repairable }) => ({ instrument, timeframe, from, through, reason, repairable })), error: job.error ?? '' }
+  }
+
+  async dataAuditRequest({ action, id } = {}) {
+    await this.ready
+    const audit = this.history.audit
+    const currentID = id ?? this.latestAuditID
+    if (action === 'start') {
+      const existing = currentID ? audit.get(currentID) : null
+      if (existing && ['queued', 'running'].includes(existing.status)) return this.auditSnapshot(existing)
+      const preferences = this.prefs(), targets = []
+      for (const instrument of this.instruments.values()) for (const timeframe of LIST_TIMEFRAMES) {
+        const step = timeframeMilliseconds(timeframe), through = closedBoundary(timeframe) - step
+        const listedAt = Number(instrument.listTime), horizon = Math.max(0, through - preferences.historyDays * 86_400_000 + step - 199 * step)
+        const from = Number.isFinite(listedAt) && listedAt > 0 ? Math.max(horizon, Math.ceil(listedAt / step) * step) : horizon
+        if (from <= through) targets.push({ instrument: instrument.instId, timeframe, source: 'candles', from, through })
+      }
+      if (!targets.length) return { ...emptyAudit(), phase: 'completed' }
+      const job = audit.start({ targets }); this.latestAuditID = job.id
+      return this.auditSnapshot(job)
+    }
+    if (!['status', 'cancel', 'repair'].includes(action)) throw new TypeError('Unknown data audit action.')
+    if (!currentID) return emptyAudit()
+    const job = action === 'cancel' ? audit.cancel(currentID) : action === 'repair' ? audit.repair(currentID) : audit.get(currentID)
+    return this.auditSnapshot(job)
+  }
+
+  listProgress(timeframe) {
+    const frame = this.listTimeframe(timeframe), entries = [...this.catalog.keys()]
+    const tasks = this.history?.sync.listTasks().filter(task => entries.includes(task.instrument) && task.timeframe === frame) ?? []
+    const completed = entries.filter(instId => this.listProjectionResults.has(this.listKey(instId, frame))).length
+    return { total: entries.length, completed, pending: Math.max(0, entries.length - completed),
+      retrying: new Set(tasks.filter(task => task.status === 'retry').map(task => task.instrument)).size,
+      unavailable: new Set(tasks.filter(task => ['unavailable', 'paused'].includes(task.status)).map(task => task.instrument)).size }
+  }
+
+  async snapshot(timeframe = this.prefs().chartTimeframe) {
+    await this.ready
+    this.pruneCatalog()
+    const frame = this.ensureListRows(timeframe)
+    if (!this.disposed && !this.closing) {
+      if (this.autoRefresh && !this.refreshing && Date.now() - this.lastRefreshAt >= LATEST_CANDLE_REFRESH) this.track(this.refresh())
+      for (const instId of this.catalog.keys()) { this.track(this.projectListEntry(instId, frame)); this.track(this.updateRanking(instId)) }
+    }
+    return { rows: this.listRowsFor(frame), revision: this.revision, error: this.error, loading: this.refreshing !== null,
+      updatedAt: this.listUpdatedAt.get(frame) ?? this.catalogUpdatedAt, listProgress: this.listProgress(frame), timeframe: frame,
+      catalogSource: this.catalogSource, realtimeState: this.realtime?.getState().status ?? 'disconnected' }
+  }
+
+  dispose() {
+    if (this.disposeTask) return this.disposeTask
+    this.closing = true
+    if (this.refreshTimer) clearTimeout(this.refreshTimer)
+    this.disposeTask = (async () => {
+      try { await this.ready } catch { if (this.ownsMetadata) this.metadata?.close(); return }
+      // A confirmed stream event resolves only after its durable write. Drain it before aborting source work.
+      await this.realtime?.close()
+      this.disposed = true
+      this.refreshController?.abort()
+      this.shutdownController.abort()
+      for (const controller of this.abortControllers) controller.abort()
+      await this.history.close()
+      await this.preparedCharts.dispose()
+      await Promise.allSettled([this.refreshing, this.drainRequestQueues(), ...this.barTasks, ...this.backgroundTasks, ...this.rankingTasks.values(), ...this.candleMutations.values(), ...[...this.listProjectionTasks.values()].map(value => value.task)].filter(Boolean))
+      if (this.ownsMetadata) this.metadata.close()
+    })()
+    return this.disposeTask
   }
 }

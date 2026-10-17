@@ -1,19 +1,32 @@
 import type { MarketStore } from './market-store.js'
+import type { MetadataStore, Preferences } from './metadata-store.js'
+import type { WebSocketFactory } from './realtime-market.js'
 import type { NativeMarketRow } from '../../src/market-row.ts'
 import type { PreparedChartResponse } from '../../src/chart-data.ts'
 export type { PreparedChartBar } from '../../src/chart-data.ts'
 export type PreparedChartWindow = PreparedChartResponse
+export type DataAuditSnapshot = {
+  id?: string
+  phase: 'idle' | 'running' | 'completed' | 'cancelled' | 'failed'
+  progress: { completed: number; total: number }
+  issues: Array<{ instrument: string; timeframe: string; from: number; through: number; reason: string; repairable: boolean }>
+  error: string
+}
+export type RankedMarketRow = NativeMarketRow & { rankingChange: number | null; rankingAsOf: number | null }
 export class MarketService {
-  constructor(store: MarketStore, criteria?: () => { hourlyVolumeStabilityEnabled: boolean }, fetcher?: typeof fetch, autoRefresh?: boolean, options?: { requestTimeout?: number })
+  constructor(store: MarketStore, preferences?: () => Readonly<Preferences>, fetcher?: typeof fetch, autoRefresh?: boolean, options?: { metadata?: MetadataStore; requestTimeout?: number; webSocketFactory?: WebSocketFactory })
   [key: string]: any
+  readonly ready: Promise<MarketService>
+  reconfigure(previousPreferences: Preferences): Promise<void>
+  dataAuditRequest(request: { action: 'start' | 'status' | 'cancel' | 'repair'; id?: string }): Promise<DataAuditSnapshot>
   invalidate(): void
   restoreCatalog(): Promise<boolean>
   refresh(): Promise<void>
-  listRowsFor(timeframe: '5m' | '15m' | '1H'): NativeMarketRow[]
+  listRowsFor(timeframe: '5m' | '15m' | '1H'): RankedMarketRow[]
   prepareChartWindow(instId: string, timeframe: '5m' | '15m' | '1H', end?: number): Promise<PreparedChartWindow>
   setChartUniverse(instIds: string[], timeframe: '5m' | '15m' | '1H', focusInstId?: string): Promise<{ frames: PreparedChartWindow[] }>
   subscribePreparedCharts(listener: (frame: PreparedChartWindow) => void): () => void
   localChartWindow(instId: string, timeframe: '5m' | '15m' | '1H'): Promise<PreparedChartWindow | null>
   dispose(): Promise<void>
-  snapshot(timeframe?: '5m' | '15m' | '1H'): Promise<{ rows: NativeMarketRow[]; revision: number; error: string; loading: boolean; updatedAt: number | null; timeframe: '5m' | '15m' | '1H'; catalogSource: 'none' | 'cache' | 'live'; listProgress: { total: number; completed: number; pending: number; retrying: number; unavailable: number } }>
+  snapshot(timeframe?: '5m' | '15m' | '1H'): Promise<{ rows: RankedMarketRow[]; revision: number; error: string; loading: boolean; updatedAt: number | null; timeframe: '5m' | '15m' | '1H'; realtimeState: 'connecting' | 'live' | 'reconnecting' | 'disconnected'; catalogSource: 'none' | 'cache' | 'live'; listProgress: { total: number; completed: number; pending: number; retrying: number; unavailable: number } }>
 }

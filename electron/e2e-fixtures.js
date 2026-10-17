@@ -53,7 +53,6 @@ export async function seedCachedListProjection(store, marketService) {
   marketService.catalogUpdatedAt = savedAt
   marketService.catalogSource = 'live'
   marketService.instruments.set(instId, instrument)
-  marketService.lastCandleHydration.set(instId, Date.now())
   marketService.replaceCatalog([entry])
   await marketService.persistCatalog([entry], savedAt)
   await marketService.ensureListTimeframe(timeframe)
@@ -114,7 +113,6 @@ export async function seedChartScrollBenchmark(store, marketService) {
   marketService.catalogUpdatedAt = savedAt
   marketService.catalogSource = 'live'
   marketService.instruments.set(instId, instrument)
-  for (const frame of timeframes) marketService.lastCandleHydration.set(`${frame}:${instId}`, savedAt)
   marketService.replaceCatalog([entry])
   await marketService.ensureListTimeframe(timeframe)
   await marketService.projectListEntry(instId, timeframe)
@@ -169,7 +167,6 @@ export async function seedInstrumentNavigationBenchmark(store, marketService) {
       })
       await marketService.persistCandles(instId, candles.map(row => ({ ...row, replaceStatistics: true })), { projectList: false })
       series[timeframe] = { intervalMS, start, end, bars: barsWithIndicators(candles, intervalMS) }
-      marketService.lastCandleHydration.set(`${timeframe}:${instId}`, savedAt)
     }
     const latest = series['1H'].bars.at(-1)
     const symbol = instId.split('-')[0]

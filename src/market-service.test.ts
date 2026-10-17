@@ -5,14 +5,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MarketStore } from '../electron/services/market-store.js'
 import { MarketService } from '../electron/services/market-service.js'
+import { MetadataStore, DEFAULT_PREFERENCES } from '../electron/services/metadata-store.js'
 
 const response = (data: unknown) => new Response(JSON.stringify({ code: '0', data }), { headers: { 'Content-Type': 'application/json' } })
-const hourly = Array.from({ length: 24 }, (_, index) => [String(1_700_000_000_000 + index * 3_600_000), '99', '101', '98', '100', '1', '1000', '100000', '1'])
 const fiveMinutes = 300_000
 const hour = 3_600_000
 const rawCandle = (timestamp: number, close = 100) => ({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp, open: Math.max(0.000001, close - 1), high: close + 1, low: Math.max(0.000001, close - 2), close, volume: 1, baseVolume: 1, quoteVolume: close, confirmed: true })
 const nativeCandle = (timestamp: number, timeframe: '5m' | '15m' | '1H', close = 100) => ({ ...rawCandle(timestamp, close), timeframe })
-const okxCandle = (value: ReturnType<typeof rawCandle>) => [String(value.timestamp), String(value.open), String(value.high), String(value.low), String(value.close), String(value.volume), '1', String(value.quoteVolume), '1']
 const waitFor = async (condition: () => boolean | Promise<boolean>, timeout = 2_000) => {
   const deadline = Date.now() + timeout
   while (Date.now() < deadline) {
@@ -22,34 +21,12 @@ const waitFor = async (condition: () => boolean | Promise<boolean>, timeout = 2_
   throw new Error('Timed out waiting for condition.')
 }
 
-test('market discovery admits only a fully liquid USDT perpetual', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  const fetcher: typeof fetch = async input => {
-    const url = new URL(String(input))
-    if (url.pathname.endsWith('/public/instruments')) return response([{ instId: 'BTC-USDT-SWAP', instCategory: '1', settleCcy: 'USDT', state: 'live', ctVal: '0.01', ctValCcy: 'BTC' }, { instId: 'ETH-USD-SWAP', instCategory: '1', settleCcy: 'USD', state: 'live', ctVal: '1', ctValCcy: 'USD' }])
-    if (url.pathname.endsWith('/market/tickers')) return response([{ instId: 'BTC-USDT-SWAP', last: '100', bidPx: '99.99', askPx: '100', open24h: '90', high24h: '110', low24h: '80', volCcy24h: '400000' }])
-    if (url.pathname.endsWith('/market/books')) return response([{ asks: [['100', '100100']], bids: [['99.99', '100100']] }])
-    if (url.pathname.endsWith('/public/open-interest')) return response([{ oiUsd: '6000000' }])
-    if (url.pathname.endsWith('/market/candles')) return response(hourly)
-    throw new Error(`Unexpected ${url}`)
-  }
-  try {
-    const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher)
-    await service.refresh()
-    const snapshot = await service.snapshot()
-    assert.equal(snapshot.error, '')
-    assert.equal(snapshot.rows.length, 1)
-    assert.equal(snapshot.rows[0].instId, 'BTC-USDT-SWAP')
-    assert.equal(snapshot.rows[0].turnover24hUSDT, 40_000_000)
-  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
-})
 
 test('native candles preserve absent or explicit-null statistics without manufacturing a derived row', async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
   const store = await MarketStore.open(root)
+  const service = new MarketService(store, () => DEFAULT_PREFERENCES, fetch, false)
   try {
-    const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
     const start = Date.UTC(2024, 0, 1)
     await service.persistCandles('BTC-USDT-SWAP', [{
       ...rawCandle(start),
@@ -63,7 +40,7 @@ test('native candles preserve absent or explicit-null statistics without manufac
     assert.equal(native.buy, null)
     assert.equal(native.sell, null)
     assert.deepEqual(await store.candles({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: start, through: start }), [])
-  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
 test('1H list projections read the native candle sequence instead of a 5m aggregation', async () => {
@@ -74,7 +51,7 @@ test('1H list projections read the native candle sequence instead of a 5m aggreg
   const first = end - 200 * hour
   const native = Array.from({ length: 201 }, (_, index) => ({ ...rawCandle(first + index * hour, 200 + index), timeframe: '1H', statisticsVersion: 1, oi: 1_000 + index, buy: 100 + index, sell: 50 + index }))
   const raw = Array.from({ length: 12 }, (_, index) => rawCandle(end - index * fiveMinutes, 1))
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
+  const service = new MarketService(store, () => DEFAULT_PREFERENCES, fetch, false)
   try {
     await store.appendCandles([...native, ...raw])
     const projection = await service.readListBars({ instrument }, '1H')
@@ -83,127 +60,12 @@ test('1H list projections read the native candle sequence instead of a 5m aggreg
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-test('OI and Taker use contract units, the requested timeframe, and an inclusive end cursor', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  const calls: URL[] = []
-  const instrument = { instId: 'BTC-USDT-SWAP' }
-  const start = Date.UTC(2024, 0, 1)
-  const end = start + 95 * hour
-  const hourlyCandles = Array.from({ length: 96 }, (_, index) => ({ instrument: instrument.instId, timeframe: '1H', timestamp: start + index * hour, open: 100, high: 101, low: 99, close: 100, volume: 1, quoteVolume: 100, confirmed: true }))
-  const fetcher: typeof fetch = async input => {
-    const url = new URL(String(input)); calls.push(url)
-    if (url.pathname.endsWith('/open-interest-history')) return response(hourlyCandles.map((value, index) => [String(value.timestamp), String(1_000 + index), '0', '0']))
-    if (url.pathname.endsWith('/taker-volume-contract')) return response(hourlyCandles.map((value, index) => [String(value.timestamp), String(10 + index), String(20 + index)]))
-    throw new Error(`Unexpected ${url}`)
-  }
-  try {
-    await store.appendCandles(hourlyCandles)
-    const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
-    const result = await service.hydrateStatistics(instrument, '1H', end)
-    assert.equal(result.complete, true)
-    const [last] = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: end, through: end })
-    assert.equal(last.oi, 1_095)
-    assert.equal(last.sell, 105)
-    assert.equal(last.buy, 115)
-    assert.equal(last.statisticsVersion, 1)
-    const oi = calls.find(call => call.pathname.endsWith('/open-interest-history'))!
-    const taker = calls.find(call => call.pathname.endsWith('/taker-volume-contract'))!
-    assert.equal(oi.searchParams.get('period'), '1H')
-    assert.equal(oi.searchParams.get('end'), String(end + hour))
-    assert.equal(taker.searchParams.get('period'), '1H')
-    assert.equal(taker.searchParams.get('unit'), '1')
-    assert.equal(taker.searchParams.get('end'), String(end + hour))
-  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('a history boundary uses fresh coverage after a successful earlier-page repair', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  const instrument = { instId: 'BTC-USDT-SWAP' }
-  const firstStored = Date.UTC(2024, 3, 1, 12)
-  const fetchedFirst = firstStored - 140 * fiveMinutes
-  const gapFrom = fetchedFirst - 60 * fiveMinutes
-  const gapThrough = firstStored - fiveMinutes
-  let historyRequests = 0
-  const fetcher: typeof fetch = async input => {
-    const url = new URL(String(input))
-    if (!url.pathname.endsWith('/market/history-candles')) throw new Error(`Unexpected ${url}`)
-    historyRequests += 1
-    if (historyRequests === 1) {
-      return response(Array.from({ length: 140 }, (_, index) => okxCandle(rawCandle(fetchedFirst + index * fiveMinutes, 100 + index))))
-    }
-    return response([])
-  }
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
-  try {
-    await store.appendCandles(Array.from({ length: 24 }, (_, index) => rawCandle(firstStored + index * fiveMinutes, 300 + index)))
-    let gap: { from: number; through: number; emptyResponses?: number } = { from: gapFrom, through: gapThrough, emptyResponses: 0 }
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const result = await service.repairGap(instrument, '5m', gap, new AbortController().signal, 'background', true)
-      assert.equal(result.deferred, undefined)
-      assert.ok(result.remaining?.length)
-      // List warm-up preserves this counter by gap start while reconstructing
-      // missing ranges from Parquet on the next retry.
-      gap = { ...result.remaining[0], emptyResponses: gap.emptyResponses }
-    }
-    assert.equal(historyRequests, 4)
-    assert.equal(service.historyBoundaries.get(service.seriesKey(instrument, '5m')), fetchedFirst)
-  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('disposing an active refresh aborts it before the DuckDB store closes', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  const instrument = { instId: 'BTC-USDT-SWAP' }
-  let started = false, aborted = false
-  const fetcher: typeof fetch = async (_input, init) => new Promise<Response>((_resolve, reject) => {
-    started = true
-    init?.signal?.addEventListener('abort', () => {
-      aborted = true
-      reject(new DOMException('The request was aborted.', 'AbortError'))
-    }, { once: true })
-  })
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
-  try {
-    const hydration = service.hydrate(instrument)
-    await waitFor(() => started)
-    await service.dispose()
-    assert.equal(await hydration, false)
-    assert.equal(aborted, true)
-    await store.close()
-    await assert.rejects(() => store.candles({ instrument: instrument.instId, timeframe: '5m' }), /MarketStore is closed/)
-  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('disposing during an OKX retry-after delay settles immediately', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  const instrument = { instId: 'BTC-USDT-SWAP' }
-  let calls = 0
-  const fetcher: typeof fetch = async () => {
-    calls += 1
-    return new Response(null, { status: 429, headers: { 'retry-after': '60' } })
-  }
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
-  try {
-    const hydration = service.hydrate(instrument)
-    await waitFor(() => calls === 1)
-    const completed = await Promise.race([
-      service.dispose().then(() => true),
-      new Promise<boolean>(resolve => setTimeout(() => resolve(false), 150)),
-    ])
-    assert.equal(completed, true)
-    assert.equal(await hydration, false)
-  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
 test('5m writes do not mutate native timeframe OI or taker statistics', async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
   const store = await MarketStore.open(root)
   const instrument = { instId: 'BTC-USDT-SWAP' }
   const start = Date.UTC(2024, 7, 1)
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
+  const service = new MarketService(store, () => DEFAULT_PREFERENCES, fetch, false)
   try {
     await store.appendCandles([{ ...rawCandle(start, 100), timeframe: '1H', oi: 9_999, buy: 8_888, sell: 7_777, statisticsVersion: 1 }])
     await service.persistCandles(instrument.instId, Array.from({ length: 12 }, (_, index) => ({
@@ -216,110 +78,13 @@ test('5m writes do not mutate native timeframe OI or taker statistics', async ()
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-test('rate-limited chart retries honor Retry-After and headerless 429s use bounded backoff', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  const instrument = { instId: 'BTC-USDT-SWAP' }
-  let directedCalls = 0, headerlessCalls = 0
-  const directed = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), async () => {
-    directedCalls += 1
-    return new Response(null, { status: 429, headers: { 'retry-after': '60' } })
-  }, false)
-  const headerless = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), async () => {
-    headerlessCalls += 1
-    return new Response(null, { status: 429 })
-  }, false)
-  try {
-    await directed.hydrate(instrument)
-    const limited = directed.latestCandleRetryState(instrument)
-    assert.equal(limited.status, 'retrying')
-    assert.ok((limited.retryAt ?? 0) - Date.now() >= 59_000)
-    assert.ok((limited.retryAt ?? Infinity) - Date.now() <= 60_100)
-    await new Promise(resolve => setTimeout(resolve, 120))
-    assert.equal(directedCalls, 1)
-
-    const delays: number[] = []
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await headerless.hydrate(instrument)
-      const state = headerless.latestCandleRetryState(instrument)
-      delays.push((state.retryAt ?? Date.now()) - Date.now())
-      if (state.timer) clearTimeout(state.timer)
-      state.timer = null; state.retryAt = null
-      // Advance this isolated retry state without waiting through the candle
-      // lane's one-second cool-off on every test iteration.
-      headerless.requestLane('candles').rateLimitedUntil = 0
-    }
-    const state = headerless.latestCandleRetryState(instrument)
-    assert.equal(headerlessCalls, 5)
-    assert.equal(state.status, 'unavailable')
-    assert.ok(delays[0] >= 900 && delays[1] >= 2_900 && delays[2] >= 9_900 && delays[3] >= 29_900)
-  } finally { await directed.dispose(); await headerless.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('a foreground request cancels noncooperative background work instead of inheriting its queue slot', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  let backgroundStarted = false, foregroundStarted = false
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), async input => {
-    const path = new URL(String(input)).pathname
-    if (path.endsWith('/background')) {
-      backgroundStarted = true
-      return new Promise<Response>(() => {})
-    }
-    foregroundStarted = true
-    return response([])
-  }, false)
-  try {
-    const background = service.get('/background', {}, undefined, 'background')
-    const backgroundResult = background.then(() => null, (error: unknown) => error)
-    await waitFor(() => backgroundStarted)
-    await service.get('/foreground', {})
-    assert.equal(foregroundStarted, true)
-    assert.ok(await backgroundResult)
-  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('a candle repair starts beside OI and Taker without aborting either statistics lane', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  let oiStarted = false, takerStarted = false, repairStarted = false, oiAborts = 0, takerAborts = 0
-  let releaseOI: (() => void) | undefined, releaseTaker: (() => void) | undefined
-  const fetcher: typeof fetch = async (input, init) => {
-    const path = new URL(String(input)).pathname
-    if (path.endsWith('/open-interest-history')) return new Promise<Response>((resolve, reject) => {
-      oiStarted = true
-      releaseOI = () => resolve(response([]))
-      init?.signal?.addEventListener('abort', () => { oiAborts += 1; reject(new DOMException('The request was aborted.', 'AbortError')) }, { once: true })
-    })
-    if (path.endsWith('/taker-volume-contract')) return new Promise<Response>((resolve, reject) => {
-      takerStarted = true
-      releaseTaker = () => resolve(response([]))
-      init?.signal?.addEventListener('abort', () => { takerAborts += 1; reject(new DOMException('The request was aborted.', 'AbortError')) }, { once: true })
-    })
-    if (path.endsWith('/market/history-candles')) { repairStarted = true; return response([]) }
-    throw new Error(`Unexpected ${path}`)
-  }
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
-  try {
-    const oi = service.get('/rubik/stat/contracts/open-interest-history', {}, undefined, 'statistics')
-    const taker = service.get('/rubik/stat/taker-volume-contract', {}, undefined, 'statistics')
-    await waitFor(() => oiStarted && takerStarted)
-    await service.get('/market/history-candles', {}, undefined, 'repair')
-    assert.equal(repairStarted, true)
-    assert.equal(oiAborts, 0)
-    assert.equal(takerAborts, 0)
-    releaseOI?.(); releaseTaker?.()
-    await Promise.all([oi, taker])
-  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
 test('Taker zero placeholders become unavailable without erasing genuine zero-volume periods or healthy direct values', async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
   const store = await MarketStore.open(root)
   const instrument = { instId: 'BTC-USDT-SWAP' }
   const end = Date.UTC(2024, 0, 20, 12)
   const timestamps = Array.from({ length: 100 }, (_, index) => end - (99 - index) * hour)
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
+  const service = new MarketService(store, () => DEFAULT_PREFERENCES, fetch, false)
   try {
     await store.appendCandles(timestamps.map((timestamp, index) => ({
       ...nativeCandle(timestamp, '1H'),
@@ -350,405 +115,303 @@ test('Taker zero placeholders become unavailable without erasing genuine zero-vo
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-// The market list must be a projection of the cache, not a catalogue-shaped
-// placeholder which only acquires readings after a user opens a chart.
-const listFixtureInstrument = { instId: 'BTC-USDT-SWAP', instCategory: '1', settleCcy: 'USDT', state: 'live', ctVal: '0.01', ctValCcy: 'BTC' }
-
-const liquidCatalogueResponse = (url: URL) => {
-  if (url.pathname.endsWith('/public/instruments')) return response([listFixtureInstrument])
-  if (url.pathname.endsWith('/market/tickers')) return response([{
-    instId: listFixtureInstrument.instId, last: '250', bidPx: '249.99', askPx: '250', open24h: '245', high24h: '255', low24h: '240', volCcy24h: '200000',
-  }])
-  if (url.pathname.endsWith('/market/books')) return response([{ asks: [['250', '60000']], bids: [['249.99', '60000']] }])
-  if (url.pathname.endsWith('/public/open-interest')) return response([{ oiUsd: '6000000' }])
-  if (url.pathname.endsWith('/market/candles')) return response(hourly)
-  return null
+const prefs = () => structuredClone(DEFAULT_PREFERENCES) as import('../electron/services/metadata-store.js').Preferences
+const disabled = () => {
+  const value = prefs()
+  for (const rule of Object.values(value.liquidity)) rule.enabled = false
+  return value
 }
-
-const seedProjectedListCache = async (store: MarketStore) => {
-  // Every list period is persisted from its own native OKX sequence. This
-  // keeps the cache fixture faithful to the production no-aggregation path.
-  const latestComplete = (interval: number) => Math.floor((Date.now() - interval) / interval) * interval
-  const start = latestComplete(hour) - 200 * hour
-  const closeAt = (timestamp: number) => 100 + (timestamp - start) / fiveMinutes * 0.05
-  const ends: Record<string, number> = {}
-  for (const [timeframe, interval, base] of [['5m', fiveMinutes, 1_000], ['15m', 3 * fiveMinutes, 2_000], ['1H', hour, 3_000]] as const) {
-    const end = latestComplete(interval)
-    ends[timeframe] = end
-    const candles = Array.from({ length: 201 }, (_, index) => {
-      const timestamp = end - (200 - index) * interval
-      return {
-        ...nativeCandle(timestamp, timeframe, closeAt(timestamp)),
-        ...(index < 105 ? {} : {
-          oi: base + (index - 105) * 11,
-          sell: base + index - 105,
-          buy: base + 200 + index - 105,
-          statisticsVersion: 1,
-        }),
-      }
-    })
-    await store.appendCandles(candles)
-  }
-  return { rawLast: ends['5m'], start, ends, closeAt }
-}
-
-test('refresh projects cached 1H indicators and direct OI/Taker statistics into the list', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+const instId = 'BTC-USDT-SWAP'
+const instrument = { instId, instType: 'SWAP', instCategory: '1', settleCcy: 'USDT', ctType: 'linear', state: 'live', ctVal: '0.01', ctMult: '1', ctValCcy: 'BTC', ruleType: 'normal' }
+const ticker = { instId, last: '100', bidPx: '99.99', askPx: '100', open24h: '90', high24h: '110', low24h: '80', volCcy24h: '999999999' }
+const fixture = async (preferences = disabled(), fetcher: typeof fetch = async () => { throw new Error('Unexpected network request.') }, options = {}) => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-service-integrated-'))
   const store = await MarketStore.open(root)
-  const requests: string[] = []
-  const fetcher: typeof fetch = async input => {
-    const url = new URL(String(input)); requests.push(url.pathname)
-    const result = liquidCatalogueResponse(url)
-    if (result) return result
-    throw new Error(`Unexpected list warm-up request: ${url.pathname}`)
-  }
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  const service = new MarketService(store, () => preferences, fetcher, false, options)
+  await service.ready
+  // Broad background targets are tested by MarketHistory; service tests control their source universe explicitly.
+  service.history.target = async () => []
+  const close = async () => { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+  return { root, store, service, preferences, close }
+}
+const localCatalog = (service: MarketService, ids = [instId]) => service.replaceCatalog(ids.map(id => ({
+  instrument: { ...instrument, instId: id }, ticker: { ...ticker, instId: id }, result: { eligible: true, status: 'verified', turnover: 40_000_000 },
+})))
+const discovery = (extra?: (url: URL) => Response | Promise<Response> | null): typeof fetch => async input => {
+  const url = new URL(String(input))
+  if (url.pathname.endsWith('/public/instruments')) return response([instrument])
+  if (url.pathname.endsWith('/market/tickers')) return response([ticker])
+  const result = extra?.(url)
+  if (result) return result
+  throw new Error(`Unexpected ${url}`)
+}
+
+test('constructor requires full Preferences and opens durable owned metadata', async () => {
+  const f = await fixture()
   try {
-    const fixture = await seedProjectedListCache(store)
-    await service.refresh()
-    const base = await service.snapshot('1H')
-    assert.ok(base.rows.find(value => value.instId === listFixtureInstrument.instId), 'A refresh must publish the liquid base row before its DuckDB projection settles.')
-    await waitFor(async () => {
-      const snapshot = await service.snapshot('1H')
-      const row = snapshot.rows.find(value => value.instId === listFixtureInstrument.instId)
-      return Boolean(row && Number.isFinite(row.roc) && row.oiChange !== null && row.takerRatio !== null)
-    })
-    const snapshot = await service.snapshot('1H')
-    const row = snapshot.rows.find(value => value.instId === listFixtureInstrument.instId)!
-    assert.equal(snapshot.timeframe, '1H')
-    assert.equal(snapshot.listProgress.total, 1)
-    assert.equal(row.ema200Signal, 'Long')
-    assert.ok(Number.isFinite(row.roc))
-    assert.ok(Number.isFinite(row.maroc))
-    assert.ok(Number.isFinite(row.rsi6))
-    assert.ok(Number.isFinite(row.rsi12))
-    assert.ok(Number.isFinite(row.rsi24))
-    assert.equal(row.oiChange, 11 / (3_000 + 94 * 11) * 100)
-    assert.equal(row.buy, 3_000 + 200 + 95)
-    assert.equal(row.sell, 3_000 + 95)
-    assert.ok((row.takerRatio ?? 0) > 0)
-    assert.notEqual(row.opportunity.status, 'Incomplete')
-    assert.equal(row.price, fixture.closeAt(fixture.ends['1H']))
-    assert.deepEqual(requests.sort(), [
-      '/api/v5/market/books', '/api/v5/market/candles', '/api/v5/market/tickers', '/api/v5/public/instruments', '/api/v5/public/open-interest',
-    ].sort(), 'A complete cached list must not fetch candles or statistics before displaying its readings.')
-    await waitFor(() => service.listProgress('1H').completed === 1)
-  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+    assert.equal(f.service.metadata.getSettings().preferences.chartTimeframe, '15m')
+    assert.equal(f.service.history.sync.closed, false)
+    assert.throws(() => new MarketService(f.store, (() => ({ hourlyVolumeStabilityEnabled: true })) as any), /Preferences/)
+    await f.service.persistCatalog([{ instrument, ticker, result: { eligible: true, status: 'verified' } }])
+    await f.service.dispose()
+    const metadata = await MetadataStore.open(join(f.root, 'Metadata'))
+    assert.equal(metadata.getCatalogEntry(instId)?.status, 'verified')
+    metadata.close()
+  } finally { await f.close() }
 })
 
-test('a persisted liquid catalog restores a base list immediately and projects cached readings without discovery', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  let store = await MarketStore.open(root)
-  const discovery: typeof fetch = async input => {
-    const result = liquidCatalogueResponse(new URL(String(input)))
-    if (result) return result
-    throw new Error(`Unexpected discovery request: ${input}`)
+test('discovery follows enabled conditions and publishes before a slower candidate completes', async () => {
+  let resolveSlow!: (value: Response) => void
+  let slowStarted = false
+  const configuration = disabled()
+  configuration.liquidity.openInterest.enabled = true
+  const fetcher: typeof fetch = async input => {
+    const url = new URL(String(input))
+    if (url.pathname.endsWith('/public/instruments')) return response([instrument, { ...instrument, instId: 'ETH-USDT-SWAP' }])
+    if (url.pathname.endsWith('/market/tickers')) return response([ticker, { ...ticker, instId: 'ETH-USDT-SWAP' }])
+    if (url.pathname.endsWith('/public/open-interest')) {
+      if (url.searchParams.get('instId') === instId) return response([{ oiUsd: '6000000' }])
+      slowStarted = true
+      return new Promise(resolve => { resolveSlow = resolve })
+    }
+    if (url.pathname.endsWith('/market/history-candles')) return response([])
+    throw new Error(`Disabled conditions must not request ${url}`)
   }
-  let initial = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), discovery, false)
+  const f = await fixture(configuration, fetcher)
+  try {
+    const refresh = f.service.refresh()
+    await waitFor(() => slowStarted && f.service.catalog.has(instId))
+    assert.equal((await f.service.snapshot()).rows[0].instId, instId)
+    assert.equal(f.service.refreshing !== null, true)
+    resolveSlow(response([{ oiUsd: '1' }]))
+    await refresh
+    assert.deepEqual((await f.service.snapshot()).rows.map(row => row.instId), [instId])
+  } finally { resolveSlow?.(response([])); await f.close() }
+})
+
+test('24-hour turnover uses exactly 288 completed native quote-volume observations', async () => {
+  const configuration = disabled(); configuration.liquidity.volume24h.enabled = true
+  const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
+  let historyCalls = 0
+  const f = await fixture(configuration, discovery(url => {
+    if (url.pathname.endsWith('/market/history-candles')) { historyCalls += 1; return response([]) }
+    return null
+  }))
+  try {
+    const candles = Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 200_000 }))
+    await f.service.persistCandles(instId, candles)
+    await f.service.refresh()
+    const snapshot = await f.service.snapshot()
+    assert.equal(snapshot.rows[0].turnover24hUSDT, 57_600_000)
+    assert.equal(historyCalls, 0, 'Complete persisted ranges never redownload history.')
+    assert.equal(f.service.metadata.getCatalogEntry(instId).configKey, JSON.stringify(configuration.liquidity))
+  } finally { await f.close() }
+})
+
+test('missing 24-hour source data remains unknown instead of manufacturing zero turnover', async () => {
+  const configuration = disabled(); configuration.liquidity.volume24h.enabled = true
+  const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
+  const f = await fixture(configuration, discovery())
+  try {
+    f.service.history.ensurePrices = async () => ({ rows: [] })
+    await f.service.persistCandles(instId, [rawCandle(asOf - fiveMinutes)])
+    await f.service.refresh()
+    assert.equal((await f.service.snapshot()).rows.length, 0)
+    assert.equal(f.service.metadata.getCatalogEntry(instId).status, 'unknown')
+  } finally { await f.close() }
+})
+
+test('failed and empty observations retain an existing valid lease without extending it', async () => {
+  const configuration = disabled(); configuration.liquidity.openInterest.enabled = true
+  let empty = false
+  const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response(empty ? [] : [{ oiUsd: '6000000' }]) : null))
+  try {
+    await f.service.refresh()
+    const initial = f.service.metadata.getCatalogEntry(instId)
+    empty = true
+    await f.service.refresh()
+    const retained = f.service.metadata.getCatalogEntry(instId)
+    assert.equal(retained.status, 'verified')
+    assert.equal(retained.observations.openInterest.observedAt, initial.observations.openInterest.observedAt)
+    assert.equal(retained.expiresAt, initial.expiresAt)
+    f.service.catalog.get(instId).expiresAt = Date.now() - 1
+    assert.equal((await f.service.snapshot()).rows.length, 0)
+  } finally { await f.close() }
+})
+
+test('SQLite catalogue restore enforces config key and expiry while historical charts remain readable', async () => {
+  const f = await fixture()
   let restored: MarketService | undefined
-  let releaseCacheProjection: (() => void) | undefined
   try {
-    await seedProjectedListCache(store)
-    await initial.refresh()
-    const savedAt = initial.catalogUpdatedAt
-    assert.ok(Number.isFinite(savedAt))
-    await initial.dispose()
-    await store.close()
-
-    store = await MarketStore.open(root)
-    const originalCoverage = store.candles.bind(store)
-    const cacheProjectionGate = new Promise<void>(resolve => { releaseCacheProjection = resolve })
-    let cacheProjectionStarted = false
-    store.candles = async (...arguments_) => {
-      cacheProjectionStarted = true
-      await cacheProjectionGate
-      return originalCoverage(...arguments_)
-    }
-    let requests = 0
-    restored = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), async () => {
-      requests += 1
-      throw new Error('A cache restore must not wait for discovery.')
-    }, false)
-    const restoring = restored.restoreCatalog()
-    await waitFor(() => cacheProjectionStarted)
-    assert.equal(await Promise.race([restoring, new Promise(resolve => setTimeout(() => resolve(false), 100))]), true, 'Restoring the catalogue must not wait for per-entry DuckDB projections.')
-    const initialSnapshot = await restored.snapshot('1H')
-    const initialRow = initialSnapshot.rows.find(value => value.instId === listFixtureInstrument.instId)
-    assert.equal(initialSnapshot.catalogSource, 'cache')
-    assert.equal(initialSnapshot.updatedAt, savedAt)
-    assert.equal(requests, 0)
-    assert.ok(initialRow, 'The restored catalogue makes a price/liquidity row available before cache projection finishes.')
-
-    if (!releaseCacheProjection) throw new Error('The cache projection gate was not installed.')
-    releaseCacheProjection()
-    await waitFor(async () => {
-      const snapshot = await restored!.snapshot('1H')
-      const row = snapshot.rows.find(value => value.instId === listFixtureInstrument.instId)
-      return Boolean(row && Number.isFinite(row.roc) && Number.isFinite(row.rsi6) && row.oiChange !== null && row.takerRatio !== null)
-    })
-    const snapshot = await restored.snapshot('1H')
-    const row = snapshot.rows.find(value => value.instId === listFixtureInstrument.instId)!
-    assert.ok(Number.isFinite(row.roc))
-    assert.ok(Number.isFinite(row.rsi6))
-    assert.notEqual(row.oiChange, null)
-    assert.notEqual(row.takerRatio, null)
-
-    // Startup starts live discovery after restoring the local catalogue. A
-    // failed discovery must report its error without erasing the last usable
-    // rows or relabelling cache data as live.
-    await restored.refresh()
-    const afterFailedDiscovery = await restored.snapshot('1H')
-    const retained = afterFailedDiscovery.rows.find(value => value.instId === listFixtureInstrument.instId)
-    assert.ok(requests > 0)
-    assert.equal(afterFailedDiscovery.catalogSource, 'cache')
-    assert.equal(afterFailedDiscovery.updatedAt, savedAt)
-    assert.ok(retained)
-    assert.notEqual(retained.oiChange, null)
-    assert.notEqual(retained.takerRatio, null)
-  } finally { releaseCacheProjection?.(); await restored?.dispose(); await initial.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+    localCatalog(f.service)
+    await f.service.persistCatalog([...f.service.catalog.values()])
+    const first = Date.UTC(2024, 0, 1)
+    await f.service.persistCandles(instId, Array.from({ length: 300 }, (_, index) => ({ ...rawCandle(first + index * fiveMinutes), oi: 100, buy: 10, sell: 8, statisticsVersion: 1 })))
+    await f.service.dispose()
+    restored = new MarketService(f.store, () => f.preferences, async () => { throw new Error('Offline') }, false)
+    await restored.ready
+    assert.equal((await restored.snapshot()).rows.length, 1)
+    restored.catalog.get(instId).expiresAt = Date.now() - 1
+    assert.equal((await restored.snapshot()).rows.length, 0)
+    const chart = await restored.prepareChartWindow(instId, '5m', first + 299 * fiveMinutes)
+    assert.equal(chart.bars.filter(bar => bar.hour >= chart.endHour! - 95 * fiveMinutes).length, 96)
+    f.preferences.liquidity.spread.maxPercent *= 2
+    assert.equal(await restored.restoreCatalog(), false)
+  } finally { await restored?.dispose(); await f.close() }
 })
 
-test('an unchanged catalogue keeps entry identity while a cache projection is in flight', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
-  const entry = {
-    instrument: { ...listFixtureInstrument },
-    ticker: { instId: listFixtureInstrument.instId, last: '103', open24h: '100', low24h: '90', high24h: '110' },
-    result: { eligible: true, turnover: 40_000_000, oiUSD: 6_000_000, spread: 0.01 },
-    change24h: 3,
-  }
+test('ranking uses one completed 5m boundary independently of chart timeframe', async () => {
+  const f = await fixture()
+  const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
   try {
-    assert.equal(service.replaceCatalog([entry]), true)
-    const activeEntry = service.catalogEntry(listFixtureInstrument.instId)
-    assert.equal(service.replaceCatalog([JSON.parse(JSON.stringify(entry))]), false)
-    assert.equal(service.catalogEntry(listFixtureInstrument.instId), activeEntry, 'An identical refresh must not invalidate an in-flight projection by changing entry identity.')
-    assert.equal(service.catalogRevision, 1)
-  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+    localCatalog(f.service, [instId, 'ETH-USDT-SWAP', 'SOL-USDT-SWAP'])
+    for (const [id, change] of [[instId, 10], ['ETH-USDT-SWAP', -20]] as const) {
+      const candles = Array.from({ length: 7 }, (_, index) => ({ ...rawCandle(asOf - (7 - index) * fiveMinutes, index >= 6 ? 100 + change : 100), instrument: id }))
+      await f.service.persistCandles(id, candles)
+      await f.service.updateRanking(id)
+    }
+    await f.service.ensureListTimeframe('15m')
+    const before = await f.service.snapshot('15m')
+    assert.deepEqual(before.rows.map(row => row.instId), ['ETH-USDT-SWAP', instId, 'SOL-USDT-SWAP'])
+    assert.equal(before.rows[0].rankingAsOf, asOf)
+    const previous = structuredClone(f.preferences)
+    f.preferences.chartTimeframe = '1H'
+    await f.service.reconfigure(previous)
+    assert.deepEqual((await f.service.snapshot('1H')).rows.map(row => [row.instId, row.rankingChange]), before.rows.map(row => [row.instId, row.rankingChange]))
+    const old = structuredClone(f.preferences); f.preferences.rankingLookback = 30
+    await f.service.reconfigure(old)
+    await waitFor(() => f.service.rankings.get(instId)?.rankingAsOf === asOf)
+    assert.notEqual(f.service.rankings.get(instId)?.rankingChange, null)
+  } finally { await f.close() }
 })
 
-test('a live catalogue replacement reuses the in-flight cache projection for its current row', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
-  const entry = {
-    instrument: { ...listFixtureInstrument },
-    ticker: { instId: listFixtureInstrument.instId, last: '103', open24h: '100', low24h: '90', high24h: '110' },
-    result: { eligible: true, turnover: 40_000_000, oiUSD: 6_000_000, spread: 0.01 },
-    change24h: 3,
-  }
-  const originalCoverage = store.candles.bind(store)
-  let releaseProjection: (() => void) | undefined, projectionStarted = false, coverageCalls = 0
-  const projectionGate = new Promise<void>(resolve => { releaseProjection = resolve })
-  store.candles = async (...arguments_) => {
-    coverageCalls += 1
-    if (coverageCalls === 1) {
-      projectionStarted = true
-      await projectionGate
-    }
-    return originalCoverage(...arguments_)
-  }
+test('candle, OI and Taker HTTP families proceed independently and Taker keeps contract unit', async () => {
+  const calls: URL[] = []
+  let releaseOI!: (response: Response) => void
+  const f = await fixture(disabled(), async input => {
+    const url = new URL(String(input)); calls.push(url)
+    if (url.pathname.endsWith('/open-interest-history')) return new Promise(resolve => { releaseOI = resolve })
+    return response([])
+  })
   try {
-    await seedProjectedListCache(store)
-    service.catalogSource = 'cache'
-    service.catalogUpdatedAt = Date.now()
-    service.replaceCatalog([entry])
-    await waitFor(() => projectionStarted)
-
-    const replacement = {
-      ...entry,
-      ticker: { ...entry.ticker, last: '104' },
-      result: { ...entry.result, turnover: 41_000_000 },
-      change24h: 4,
-    }
-    service.replaceCatalog([replacement])
-    const currentPrime = service.primeListRowsFromCache('1H')
-    if (!releaseProjection) throw new Error('The cache projection gate was not installed.')
-    releaseProjection()
-    await currentPrime
-
-    const row = service.listRowsFor('1H').find(value => value.instId === listFixtureInstrument.instId)
-    assert.ok(row, 'The replacement catalogue row should be published by the already-running cache projection.')
-    assert.equal(row.lastPrice, 104, 'The projected row must use the live replacement ticker, not its stale cache-era object.')
-    assert.ok(Number.isFinite(row.roc))
-    assert.ok(Number.isFinite(row.rsi6))
-    assert.notEqual(row.oiChange, null)
-    assert.notEqual(row.takerRatio, null)
-    assert.equal(service.listProjectionVersions.get('1H'), service.catalogRevision)
-    assert.equal(coverageCalls, 1, 'A metadata-only catalogue replacement must reuse the existing instrument projection instead of queueing a second DuckDB read.')
-  } finally { releaseProjection?.(); await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('disposing during a pending candle write never starts a late list projection', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
-  const entry = {
-    instrument: { ...listFixtureInstrument },
-    ticker: { instId: listFixtureInstrument.instId, last: '103', open24h: '100', low24h: '90', high24h: '110' },
-    result: { eligible: true, turnover: 40_000_000, oiUSD: 6_000_000, spread: 0.01 },
-    change24h: 3,
-  }
-  const originalAppend = store.appendCandles.bind(store), originalCoverage = store.coverage.bind(store)
-  let releaseWrite: (() => void) | undefined, writeStarted = false, appendCalls = 0, coverageCalls = 0
-  const writeGate = new Promise<void>(resolve => { releaseWrite = resolve })
-  store.appendCandles = async (...arguments_) => {
-    appendCalls += 1
-    if (appendCalls === 1) {
-      writeStarted = true
-      await writeGate
-    }
-    return originalAppend(...arguments_)
-  }
-  try {
-    service.replaceCatalog([entry])
-    await service.primeListRowsFromCache('1H')
-    store.coverage = async (...arguments_) => {
-      coverageCalls += 1
-      return originalCoverage(...arguments_)
-    }
-    const timestamp = Math.floor((Date.now() - fiveMinutes) / fiveMinutes) * fiveMinutes
-    const writing = service.persistCandles(listFixtureInstrument.instId, [rawCandle(timestamp, 101)])
-    await waitFor(() => writeStarted)
-    const disposing = service.dispose()
-    let disposed = false
-    void disposing.then(() => { disposed = true })
-    await new Promise(resolve => setTimeout(resolve, 20))
-    assert.equal(disposed, false, 'dispose must wait for the admitted candle mutation before the Store can close.')
-    if (!releaseWrite) throw new Error('The candle write gate was not installed.')
-    releaseWrite()
-    await writing
-    await disposing
-    assert.equal(coverageCalls, 0, 'A continuation after dispose must not enqueue a new DuckDB list projection.')
-  } finally { releaseWrite?.(); await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('a snapshot after disposal never restarts a cache projection', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
-  const entry = {
-    instrument: { ...listFixtureInstrument },
-    ticker: { instId: listFixtureInstrument.instId, last: '103', open24h: '100', low24h: '90', high24h: '110' },
-    result: { eligible: true, turnover: 40_000_000, oiUSD: 6_000_000, spread: 0.01 },
-    change24h: 3,
-  }
-  const originalCoverage = store.coverage.bind(store)
-  let coverageCalls = 0
-  try {
-    service.replaceCatalog([entry])
-    await service.primeListRowsFromCache('1H')
-    await service.dispose()
-    store.coverage = async (...arguments_) => {
-      coverageCalls += 1
-      return originalCoverage(...arguments_)
-    }
-    const snapshot = await service.snapshot('1H')
-    await service.primeListRowsFromCache('1H')
-    assert.equal(snapshot.rows.length, 1)
-    assert.equal(coverageCalls, 0, 'A late renderer poll cannot revive DuckDB work after service disposal.')
-  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('list snapshots project each selected timeframe instead of reusing the 1H row', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  const fetcher: typeof fetch = async input => {
-    const result = liquidCatalogueResponse(new URL(String(input)))
-    if (result) return result
-    throw new Error(`Unexpected list warm-up request: ${input}`)
-  }
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
-  try {
-    const fixture = await seedProjectedListCache(store)
-    assert.equal((await store.coverage(listFixtureInstrument.instId, '5m')).last, fixture.rawLast)
-    await service.refresh()
-    const [fiveMinute, fifteenMinute, oneHour] = await Promise.all([
-      service.snapshot('5m'), service.snapshot('15m'), service.snapshot('1H'),
+    const oi = f.service.get('/rubik/stat/contracts/open-interest-history', { period: '15m' }, undefined, 'background')
+    await waitFor(() => calls.length === 1)
+    await Promise.all([
+      f.service.get('/market/history-candles', { bar: '15m', limit: 2 }, undefined, 'foreground'),
+      f.service.get('/rubik/stat/taker-volume-contract', { period: '15m', unit: 1 }, undefined, 'foreground'),
     ])
-    assert.deepEqual([fiveMinute.timeframe, fifteenMinute.timeframe, oneHour.timeframe], ['5m', '15m', '1H'])
-    assert.ok([fiveMinute, fifteenMinute, oneHour].every(snapshot => snapshot.rows.some(value => value.instId === listFixtureInstrument.instId)), 'Each selected timeframe gets an immediate base row.')
-    await waitFor(async () => {
-      const snapshots = await Promise.all(['5m', '15m', '1H'].map(timeframe => service.snapshot(timeframe as '5m' | '15m' | '1H')))
-      return snapshots.every(snapshot => {
-        const row = snapshot.rows.find(value => value.instId === listFixtureInstrument.instId)
-        return Boolean(row && Number.isFinite(row.priceChange) && Number.isFinite(row.roc) && row.oiChange !== null && row.takerRatio !== null)
-      })
-    })
-    const settled = await Promise.all(['5m', '15m', '1H'].map(timeframe => service.snapshot(timeframe as '5m' | '15m' | '1H')))
-    const rows = settled.map(snapshot => snapshot.rows.find(value => value.instId === listFixtureInstrument.instId))
-    assert.ok(rows.every(Boolean))
-    const [five, fifteen, hourlyRow] = rows
-    assert.ok(Number.isFinite(five!.priceChange))
-    assert.ok(Number.isFinite(fifteen!.priceChange))
-    assert.ok(Number.isFinite(hourlyRow!.priceChange))
-    assert.notEqual(five!.priceChange, fifteen!.priceChange)
-    assert.notEqual(fifteen!.priceChange, hourlyRow!.priceChange)
-    assert.notEqual(five!.roc, hourlyRow!.roc)
-    assert.notEqual(five!.oiChange, fifteen!.oiChange)
-    assert.notEqual(fifteen!.oiChange, hourlyRow!.oiChange)
-    assert.notEqual(five!.takerRatio, null, '5m must keep its direct Taker statistics.')
-    const expectedFifteenEnd = fixture.ends['15m']
-    const directFifteen = await store.candles({ instrument: listFixtureInstrument.instId, timeframe: '15m', from: expectedFifteenEnd - 95 * 3 * fiveMinutes, through: expectedFifteenEnd })
-    assert.equal(directFifteen.length, 96)
-    assert.ok(directFifteen.every(value => value.statisticsVersion === 1))
-    assert.notEqual(fifteen!.takerRatio, null, '15m must keep its direct Taker statistics.')
-    assert.notEqual(hourlyRow!.takerRatio, null, '1H must keep its direct Taker statistics.')
-  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+    assert.equal(calls.length, 3)
+    assert.equal(calls.find(url => url.pathname.endsWith('/taker-volume-contract'))?.searchParams.get('unit'), '1')
+    releaseOI(response([])); await oi
+  } finally { releaseOI?.(response([])); await f.close() }
 })
 
-test('a failed background list warm-up enters a scheduled retry instead of stopping permanently', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  let candleRequests = 0
-  const fetcher: typeof fetch = async input => {
-    const url = new URL(String(input))
-    if (url.pathname.endsWith('/market/candles')) {
-      // Liquidity discovery uses a short 1H sample; the list's native 1H
-      // cache hydration uses limit=300 and is the request under test.
-      if (url.searchParams.get('limit') === '25') return response(hourly)
-      candleRequests += 1
-      return new Response('temporarily unavailable', { status: 503 })
-    }
-    const discovery = liquidCatalogueResponse(url)
-    if (discovery) return discovery
-    throw new Error(`Unexpected ${url.pathname}`)
-  }
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 1_000 })
+test('dispose aborts noncooperative HTTP and Retry-After pacing before closing stores', async () => {
+  let calls = 0
+  const f = await fixture(disabled(), async () => { calls += 1; return new Response(null, { status: 429, headers: { 'retry-after': '60' } }) })
   try {
-    await service.refresh()
-    await waitFor(() => service.listWarmupState(listFixtureInstrument.instId, '1H').status === 'retrying')
-    const state = service.listWarmupState(listFixtureInstrument.instId, '1H')
-    const snapshot = await service.snapshot('1H')
-    assert.ok(candleRequests >= 1)
-    assert.ok((state.retryAt ?? 0) > Date.now())
-    assert.equal(snapshot.listProgress.retrying, 1)
-    assert.equal(snapshot.listProgress.completed, 0)
-  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+    await assert.rejects(f.service.get('/market/history-candles', {}, undefined, 'foreground'), /rate limited/)
+    const pending = f.service.get('/market/history-candles', {}, undefined, 'foreground')
+    const rejected = assert.rejects(pending)
+    await f.service.dispose()
+    await rejected
+    assert.equal(calls, 1)
+    assert.equal((await f.service.snapshot()).realtimeState, 'disconnected')
+    assert.equal(f.service.history.sync.closed, true)
+  } finally { await f.close() }
 })
 
-test('list warm-up follows a latest-candle Retry-After instead of retrying around it', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  let candleRequests = 0
-  const fetcher: typeof fetch = async input => {
-    const url = new URL(String(input))
-    if (url.pathname.endsWith('/market/candles')) {
-      if (url.searchParams.get('limit') === '25') return response(hourly)
-      candleRequests += 1
-      return new Response(null, { status: 429, headers: { 'retry-after': '60' } })
-    }
-    const discovery = liquidCatalogueResponse(url)
-    if (discovery) return discovery
-    throw new Error(`Unexpected ${url.pathname}`)
-  }
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 1_000 })
+test('manual audit scans, repairs only its findings, and invalidates canonical generations', async () => {
+  const f = await fixture()
   try {
-    await service.refresh()
-    await waitFor(() => service.listWarmupState(listFixtureInstrument.instId, '1H').status === 'retrying')
-    const state = service.listWarmupState(listFixtureInstrument.instId, '1H')
-    assert.equal(candleRequests, 1)
-    assert.ok((state.retryAt ?? 0) - Date.now() >= 59_000)
-    assert.equal(state.attempt, 0, 'The list retry inherits the pending latest-candle cooldown rather than consuming its own attempts.')
-  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+    const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
+    f.service.instruments.set(instId, { ...instrument, listTime: String(asOf - fiveMinutes) })
+    const calls: Array<{ instrument: string; timeframe: string; from: number; through: number }> = []
+    f.service.history.audit.inspect = async (query: any) => ({ issues: calls.length ? [] : [{ ...query, reason: 'gap', repairable: true }], checkedRows: 0, files: 0 })
+    f.service.history.audit.repairRange = async (issue: any) => { calls.push(issue); f.service.onHistoryReplaced(issue.instrument, issue.timeframe) }
+    const started = await f.service.dataAuditRequest({ action: 'start' })
+    assert.equal(started.phase, 'running')
+    await f.service.history.audit.whenIdle()
+    const checked = await f.service.dataAuditRequest({ action: 'status' })
+    assert.equal(checked.phase, 'completed')
+    assert.ok(checked.issues.length > 0)
+    await f.service.dataAuditRequest({ action: 'repair' })
+    await f.service.history.audit.whenIdle()
+    const repaired = await f.service.dataAuditRequest({ action: 'status' })
+    assert.equal(repaired.issues.length, 0)
+    assert.equal(calls.length, checked.issues.length)
+    assert.ok(f.service.dataRevision(instId) > 0)
+  } finally { await f.close() }
+})
+
+class TestSocket extends EventTarget {
+  readyState = 0
+  open() { this.readyState = 1; this.dispatchEvent(new Event('open')) }
+  send(data: string) {
+    if (data === 'ping') return
+    const command = JSON.parse(data)
+    for (const arg of command.args) queueMicrotask(() => this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ id: command.id, event: command.op, arg }) })))
+  }
+  candle(timestamp: number, close: number, confirmed: boolean) {
+    this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ arg: { instId, channel: 'candle5m' }, data: [[String(timestamp), '100', '120', '90', String(close), '10', '1', '1000', confirmed ? '1' : '0']] }) }))
+  }
+  close() { this.readyState = 3; queueMicrotask(() => this.dispatchEvent(new Event('close'))) }
+}
+
+test('live integration stays in memory and close drains accepted confirmation while preserving a newer forming bar', async () => {
+  const socket = new TestSocket()
+  const f = await fixture(disabled(), undefined, { webSocketFactory: () => socket })
+  const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
+  try {
+    const candles = Array.from({ length: 300 }, (_, index) => ({ ...rawCandle(asOf - (301 - index) * fiveMinutes), statisticsVersion: 1, oi: 100, buy: 20, sell: 10 }))
+    await f.service.persistCandles(instId, candles)
+    await f.service.localChartWindow(instId, '5m')
+    const originalAppend = f.store.appendCandles.bind(f.store)
+    let writes = 0
+    f.store.appendCandles = async (...args) => { writes += 1; return originalAppend(...args) }
+    f.service.realtime.setSubscriptions([{ instId, timeframe: '5m' }])
+    f.service.realtime.start(); socket.open()
+    await f.service.realtime.whenIdle()
+    socket.candle(asOf - fiveMinutes, 105, false)
+    await f.service.realtime.whenIdle()
+    assert.equal(writes, 0)
+    assert.equal(f.service.preparedCharts.cached(`${instId}:5m`).liveBar.close, 105)
+    socket.candle(asOf, 106, false)
+    await f.service.realtime.whenIdle()
+    let releaseWrite!: () => void
+    let writeStarted = false
+    f.store.appendCandles = async (...args) => {
+      writeStarted = true
+      await new Promise<void>(resolve => { releaseWrite = resolve })
+      return originalAppend(...args)
+    }
+    socket.candle(asOf - fiveMinutes, 107, true)
+    await waitFor(() => writeStarted)
+    let closed = false
+    const closing = f.service.dispose().then(() => { closed = true })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(closed, false)
+    releaseWrite(); await closing
+    const rows = await f.store.candles({ instrument: instId, timeframe: '5m', from: asOf - fiveMinutes, through: asOf - fiveMinutes })
+    assert.equal(rows[0].close, 107)
+    assert.equal(f.service.liveCandles.get(`${instId}:5m`).timestamp, asOf)
+    assert.equal((await f.store.candles({ instrument: instId, timeframe: '5m', from: asOf })).length, 0)
+  } finally { await f.close() }
+})
+
+test('an explicit empty SWAP multiplier uses the documented product value without broadening missing contract units', async () => {
+  const configuration = disabled(); configuration.liquidity.depth.enabled = true; configuration.liquidity.slippage.enabled = true
+  const f = await fixture(configuration, async input => {
+    const url = new URL(String(input))
+    if (url.pathname.endsWith('/public/instruments')) return response([{ ...instrument, ctMult: '' }])
+    if (url.pathname.endsWith('/market/tickers')) return response([ticker])
+    if (url.pathname.endsWith('/market/books')) return response([{ asks: [['100', '200001']], bids: [['99.99', '200001']] }])
+    if (url.pathname.endsWith('/market/history-candles')) return response([])
+    throw new Error(`Unexpected ${url}`)
+  })
+  try {
+    await f.service.refresh()
+    assert.equal((await f.service.snapshot()).rows.length, 1)
+    assert.equal(f.service.catalog.get(instId).instrument.ctMult, '1')
+  } finally { await f.close() }
 })
