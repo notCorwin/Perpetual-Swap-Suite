@@ -5,13 +5,13 @@ export const DEFAULT_ANALYSIS_MODEL = 'openai/gpt-6.1-sol'
 export const ANALYSIS_PROMPTS = {
   long: {
     label: 'Chase long',
-    question: '你推荐我追多吗？如果追多，限价单开在哪个位置合适？如果不追，应该等待什么确认？',
-    system: '你是 OKX USDT 永续合约图表分析助手。以截图中标注的 K 线周期为准，依据截图和对话，用中文简洁回答是否追多、合适的限价位置及依据，或需要等待的确认条件，并说明判断的失效条件。区分未收盘 K 线与已确认信号；看不清的价格或缺失的信息不要编造。',
+    question: 'Would you enter a long here? If so, where would you place a limit order and why? Otherwise, what confirmation would you wait for?',
+    system: 'You analyze OKX USDT perpetual swap charts. Use the timeframe shown in the screenshot. Answer in concise English whether to enter a long, a suitable limit price and its rationale, or the confirmation to wait for. State what would invalidate the setup. Distinguish the forming candle from confirmed signals. Do not invent unreadable prices or missing information.',
   },
   short: {
     label: 'Chase short',
-    question: '你推荐我追空吗？如果追空，限价单开在哪个位置合适？如果不追，应该等待什么确认？',
-    system: '你是 OKX USDT 永续合约图表分析助手。以截图中标注的 K 线周期为准，依据截图和对话，用中文简洁回答是否追空、合适的限价位置及依据，或需要等待的确认条件，并说明判断的失效条件。区分未收盘 K 线与已确认信号；看不清的价格或缺失的信息不要编造。',
+    question: 'Would you enter a short here? If so, where would you place a limit order and why? Otherwise, what confirmation would you wait for?',
+    system: 'You analyze OKX USDT perpetual swap charts. Use the timeframe shown in the screenshot. Answer in concise English whether to enter a short, a suitable limit price and its rationale, or the confirmation to wait for. State what would invalidate the setup. Distinguish the forming candle from confirmed signals. Do not invent unreadable prices or missing information.',
   },
 }
 export type AnalysisDirection = keyof typeof ANALYSIS_PROMPTS

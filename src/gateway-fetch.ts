@@ -1,7 +1,7 @@
 export type GatewayEvent = { id: string; type: 'data' | 'end' | 'error'; base64?: string; message?: string }
 export type GatewayBridge = {
-  postMessage(request: { gatewayFetch: { id: string; body: string } }): Promise<{ status: number; headers: Record<string, string> }>
-  postMessage(request: { cancelGatewayFetch: string }): Promise<{ ok: boolean }>
+  request(request: { gatewayFetch: { id: string; body: string } }): Promise<{ status: number; headers: Record<string, string> }>
+  request(request: { cancelGatewayFetch: string }): Promise<{ ok: boolean }>
 }
 
 let sequence = 0
@@ -36,7 +36,7 @@ export function createGatewayFetch(bridge: GatewayBridge, events: EventTarget): 
       events.removeEventListener('radar-gateway-stream', receive)
       request.signal.removeEventListener('abort', abort)
     }
-    const cancel = () => { void bridge.postMessage({ cancelGatewayFetch: id }).catch(() => {}) }
+    const cancel = () => { void bridge.request({ cancelGatewayFetch: id }).catch(() => {}) }
     const abort = () => {
       if (disposed) return
       const reason = request.signal.reason ?? new DOMException('Request stopped.', 'AbortError')
@@ -61,7 +61,7 @@ export function createGatewayFetch(bridge: GatewayBridge, events: EventTarget): 
     events.addEventListener('radar-gateway-stream', receive)
     request.signal.addEventListener('abort', abort, { once: true })
     try {
-      const response = await Promise.race([bridge.postMessage({ gatewayFetch: { id, body } }), aborted])
+      const response = await Promise.race([bridge.request({ gatewayFetch: { id, body } }), aborted])
       request.signal.throwIfAborted()
       return new Response(stream, { status: response.status, headers: response.headers })
     } catch (error) {

@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
 import { after, before, test } from 'node:test'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { assertCompletePaints, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, startPaintProbe, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
+import { assertCompletePaints, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, startPaintProbe, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
 
 const root = new URL('../..', import.meta.url).pathname
 const userData = await mkdtemp(join(tmpdir(), 'perp-radar-e2e-'))
@@ -102,24 +102,34 @@ test('desktop window loads the React workspace with a restricted renderer', asyn
   assert.equal(await page.evaluate(() => document.visibilityState), 'visible')
   assert.equal(await page.evaluate(() => typeof window.require), 'undefined')
   assert.equal(await page.evaluate(() => typeof window.radarDesktop.request), 'function')
-  assert.equal(await page.evaluate(() => typeof window.webkit.messageHandlers.radar.postMessage), 'function')
+  assert.equal(await page.evaluate(() => typeof window.webkit?.messageHandlers?.radar), 'undefined')
 })
 
-test('preferences persist in the Electron-owned user-data directory', async () => {
-  const saved = await request({ windowBlurRadius: 17, floatingBlurRadius: 23, hourlyVolumeStabilityEnabled: true })
-  assert.equal(saved.windowBlurRadius, 17)
-  assert.equal(saved.floatingBlurRadius, 23)
-  assert.equal(saved.hourlyVolumeStabilityEnabled, true)
-  const disk = JSON.parse(await readFile(join(userData, 'settings.json'), 'utf8'))
-  assert.equal(disk.windowBlurRadius, 17)
-  assert.equal(disk.hourlyVolumeStabilityEnabled, true)
+test('preferences persist through the single desktop entry point and survive a process restart', async () => {
+  const initial = await request({ preferences: { action: 'read' } })
+  assert.equal(initial.chartTimeframe, '15m')
+  assert.equal(initial.rankingLookback, 15)
+  assert.equal(initial.historyDays, 30)
+  assert.equal(initial.liquidity.volumeStability.enabled, false)
+  const values = { rankingLookback: 30, historyDays: 45, liquidity: {
+    ...initial.liquidity, spread: { enabled: false, maxPercent: .04 },
+    volumeStability: { enabled: true, maxRatio: 2.5 },
+  } }
+  const saved = await request({ preferences: { action: 'update', values } })
+  assert.equal(saved.rankingLookback, 30)
+  assert.equal(saved.historyDays, 45)
+  assert.deepEqual(saved.liquidity.spread, values.liquidity.spread)
+  await electron.close()
+  await launchElectron()
+  assert.deepEqual(await request({ preferences: { action: 'read' } }), saved)
+  await request({ preferences: { action: 'update', values: initial } })
 })
 
 test('Radar has no Research or Strategy workspace or desktop operations', async () => {
-  await page.getByRole('heading', { name: 'Perpetual Swap Radar', exact: true }).waitFor()
+  await page.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).waitFor()
   assert.equal(await page.getByRole('button', { name: /Research|Strategy|Signals|Rules|Universe/ }).count(), 0)
   assert.equal(await page.locator('[data-mode-switch]').count(), 0)
-  const previous = await request({ rocPeriod: 9, marocPeriod: 9, timeframe: '5m', sinceRevision: -1 })
+  const previous = await request({ snapshot: { timeframe: '5m', sinceRevision: -1 } })
   for (const value of [
     { suite: { mode: 'radar', action: 'evaluate', timeframe: '5m' } },
     { research: { action: 'list' } },
@@ -132,9 +142,12 @@ test('Radar has no Research or Strategy workspace or desktop operations', async 
     { backgroundMonitoringEnabled: true },
     { monitoringPaused: true },
     { windowBlurRadius: 99, notificationsEnabled: true },
+    { previewWindowBlur: 20 },
+    { windowTint: '#ffffff' },
+    { rocPeriod: 9, marocPeriod: 9, timeframe: '5m', sinceRevision: -1 },
   ]) await assert.rejects(() => request(value), /Unsupported desktop bridge operation/)
-  const current = await request({ rocPeriod: 9, marocPeriod: 9, timeframe: '5m', sinceRevision: -1 })
-  assert.equal(current.windowBlurRadius, previous.windowBlurRadius, 'A retired preference must not partially apply an appearance change.')
+  const current = await request({ snapshot: { timeframe: '5m', sinceRevision: -1 } })
+  assert.equal(current.timeframe, previous.timeframe)
   for (const key of ['filterMetricsCatalog', 'filterFunctions', 'filterFunctionCatalog', 'filterLibraryPreferences',
     'notificationsEnabled', 'notificationAuthorization', 'notificationError', 'backgroundMonitoringEnabled',
     'backgroundMonitoringError', 'monitoringPaused', 'launchAtLogin', 'launchAtLoginError']) {
@@ -157,16 +170,16 @@ test('clipboard, screenshot capture, analysis settings, and safe gateway cancell
   assert.ok(image.width > 0 && image.height > 0)
   assert.deepEqual(await request({ analysisSettings: { action: 'save', model: 'test-model', apiKey: 'test-key' } }), { model: 'test-model', hasAPIKey: true })
   assert.deepEqual(await request({ analysisSettings: { action: 'read' } }), { model: 'test-model', hasAPIKey: true })
-  assert.equal('analysis' in await request({ rocPeriod: 9, marocPeriod: 9, timeframe: '5m', sinceRevision: -1 }), false)
+  assert.equal('analysis' in await request({ snapshot: { timeframe: '5m', sinceRevision: -1 } }), false)
   assert.deepEqual(await request({ analysisSettings: { action: 'removeKey' } }), { model: 'test-model', hasAPIKey: false })
   await assert.rejects(() => request({ gatewayFetch: { id: 'missing-key', body: '{}' } }), /Save an AI Gateway API key/)
   assert.deepEqual(await request({ cancelGatewayFetch: 'no-such-request' }), { ok: true })
-  const initial = await request({ rocPeriod: 9, marocPeriod: 9, timeframe: '5m', sinceRevision: -1 })
+  const initial = await request({ snapshot: { timeframe: '5m', sinceRevision: -1 } })
   assert.equal(initial.error, '')
   assert.deepEqual(initial.rows, [])
 })
 
-test('cached catalog projection renders real list OI, taker, and indicator readings', async () => {
+test('cached catalog projection retains statistics while the list shows contract, price, and independent ranking change', async () => {
   const fixture = await request({ e2e: { action: 'seedCachedListProjection' } })
   assert.equal(fixture.timeframe, '1H')
 
@@ -174,7 +187,7 @@ test('cached catalog projection renders real list OI, taker, and indicator readi
   // source/statistics cache rows and catalog context; it never injects a
   // ready-made market row.
   const projected = await waitFor(async () => {
-    const snapshot = await request({ rocPeriod: 9, marocPeriod: 9, timeframe: fixture.timeframe, sinceRevision: -1 })
+    const snapshot = await request({ snapshot: { timeframe: fixture.timeframe, sinceRevision: -1 } })
     const row = snapshot.rows?.find(value => value.instId === fixture.instId)
     return row && row.oiChange !== null && row.takerRatio !== null && row.rsi6 !== null && row.ema200Signal !== null ? row : null
   })
@@ -188,22 +201,15 @@ test('cached catalog projection renders real list OI, taker, and indicator readi
   await page.reload({ waitUntil: 'domcontentloaded' })
   const market = page.locator(`[aria-label="View ${fixture.instId} chart"]`)
   await market.waitFor({ state: 'visible', timeout: 10_000 })
-  await page.waitForFunction(instId => {
-    const row = document.querySelector(`[aria-label="View ${instId} chart"]`)
-    const cells = row?.querySelectorAll('td')
-    return Boolean(cells && [3, 4, 5, 6].every(index => !cells[index].textContent?.includes('—')))
-  }, fixture.instId)
-
   const cells = market.locator('td')
-  const taker = (await cells.nth(3).textContent())?.trim() ?? ''
-  const oi = (await cells.nth(4).textContent())?.trim() ?? ''
-  const roc = (await cells.nth(5).textContent())?.trim() ?? ''
-  const rsi = (await cells.nth(6).textContent())?.trim() ?? ''
-  assert.match(taker, /%/)
-  assert.match(oi, /%/)
-  assert.match(roc, /%/)
-  assert.match(rsi, /6\d+\.\d{2}/)
-  assert.match(await cells.nth(3).getAttribute('title') ?? '', /^Taker contracts/)
+  assert.equal(await cells.count(), 3)
+  assert.match((await cells.nth(0).textContent()) ?? '', /USDT/)
+  assert.doesNotMatch((await cells.nth(1).textContent()) ?? '', /—/)
+  assert.match((await cells.nth(2).textContent()) ?? '', /[↑↓→▲▼↔+−-].*%|—/)
+  assert.deepEqual(await page.locator('[data-market-list] th').allTextContents(), ['Contract', 'Price', '15m change'])
+  await page.locator('[data-chart-panel]').waitFor({ state: 'visible' })
+  await selectTimeframe(page, fixture.timeframe)
+  await page.locator(`[data-chart-inst="${fixture.instId}"]`).waitFor({ state: 'visible' })
 })
 
 test('a restarted desktop restores cached catalog readings before a live scan completes', async () => {
@@ -216,21 +222,13 @@ test('a restarted desktop restores cached catalog readings before a live scan co
 
   const market = page.locator(`[aria-label="View ${fixture.instId} chart"]`)
   await market.waitFor({ state: 'visible', timeout: 10_000 })
-  await page.waitForFunction(instId => {
-    const row = document.querySelector(`[aria-label="View ${instId} chart"]`)
-    const cells = row?.querySelectorAll('td')
-    return Boolean(cells && [3, 4, 5, 6].every(index => !cells[index].textContent?.includes('—')))
-  }, fixture.instId)
-
   const cells = market.locator('td')
-  assert.match((await cells.nth(3).textContent())?.trim() ?? '', /%/)
-  assert.match((await cells.nth(4).textContent())?.trim() ?? '', /%/)
-  assert.match((await cells.nth(5).textContent())?.trim() ?? '', /%/)
-  assert.match((await cells.nth(6).textContent())?.trim() ?? '', /6\d+\.\d{2}/)
-  const snapshot = await request({ rocPeriod: 9, marocPeriod: 9, timeframe: '1H', sinceRevision: -1 })
+  assert.equal(await cells.count(), 3)
+  assert.doesNotMatch((await cells.nth(1).textContent()) ?? '', /—/)
+  const snapshot = await request({ snapshot: { timeframe: '1H', sinceRevision: -1 } })
   assert.equal(snapshot.catalogSource, 'cache')
   assert.equal(snapshot.loading, true, 'The delayed production-style discovery must still be running.')
-  await page.waitForFunction(() => document.querySelector('[aria-live="polite"]')?.textContent?.includes('Cached'))
+  await page.locator('[data-market-list]').getByText('Cached', { exact: true }).waitFor()
 
   // Do not let the deliberately delayed discovery leak into the following
   // fixture: restore a deterministic test-mode process after this assertion.
@@ -259,6 +257,29 @@ test('prepared native chart pages preserve canonical indicator values across eve
     }
     assert.equal((await readRequestProbe(electron)).sourceCalls, 0, 'Complete durable periods must not be downloaded again.')
   } finally { await removeRequestProbe(electron) }
+})
+
+test('the 1600 design workspace keeps both panels and chart selection when search hides the selected row', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await openChart(page, fixture)
+  const originalViewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }))
+  try {
+    for (const width of [1_600, 1_120, 1_920]) {
+      await page.setViewportSize({ width, height: 1_000 })
+      await page.waitForFunction(width => Math.abs(Number(document.querySelector('[data-layout="market-workspace"]')?.dataset.uiScale) - width / 1_600) < 1e-5, width)
+      await assertWorkspaceLayout(page)
+    }
+    await page.getByRole('textbox', { name: 'Search contracts' }).fill('NO-MATCHING-CONTRACT')
+    assert.equal(await page.locator('[data-market-list] [aria-label^="View "]').count(), 0)
+    assert.equal(await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-inst'), fixture.instId, 'Search must preserve the selected chart even if the contract is hidden.')
+    await assertWorkspaceLayout(page)
+    await page.getByRole('textbox', { name: 'Search contracts' }).fill('')
+    await page.locator(`[aria-label="View ${fixture.instId} chart"]`).waitFor({ state: 'visible' })
+    assert.equal(await page.locator(`[aria-label="View ${fixture.instId} chart"]`).getAttribute('aria-selected'), 'true')
+  } finally {
+    await page.getByRole('textbox', { name: 'Search contracts' }).fill('')
+    if (originalViewport) await page.setViewportSize(originalViewport)
+  }
 })
 
 test('high velocity wheel bursts and reversals present only complete correct charts in 5m, 15m, and 1h', async () => {
@@ -442,8 +463,9 @@ test('a newly listed contract with fewer than 96 completed candles explains the 
     assert.equal(await chart.getAttribute('data-chart-loading'), 'false')
     assert.equal(await chart.locator('svg[data-rendered-inst]').count(), 0)
     assert.equal(await chart.locator('[data-slot="spinner"]').count(), 0)
+    const callsAtTerminal = await electron.evaluate(() => globalThis.__preparedTransform.calls)
     await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 1_100)))
-    assert.equal(await electron.evaluate(() => globalThis.__preparedTransform.calls), 1, 'Known insufficient history must not become a retry loop.')
+    assert.equal(await electron.evaluate(() => globalThis.__preparedTransform.calls), callsAtTerminal, 'Known insufficient history must not become a retry loop after selecting the native timeframe.')
   } finally {
     await removePreparedTransform()
   }

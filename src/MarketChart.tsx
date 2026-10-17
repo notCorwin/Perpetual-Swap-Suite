@@ -1,13 +1,12 @@
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react"
 import { flushSync } from "react-dom"
-import { ArrowLeft, Camera, Radio } from "lucide-react"
+import { Camera, Radio } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { ButtonGroup } from "@/components/ui/button-group"
 import { Spinner } from "@/components/ui/spinner"
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { ChartAnalysisPanel } from '@/ChartAnalysisPanel'
-import { ChartWorkspaceViewport } from '@/ChartWorkspaceViewport'
 import { chartAnalysis } from '@/analysis-service'
 import { type AnalysisDirection } from '@/chart-analysis'
 import { chartCaptureBounds } from '@/chart-capture'
@@ -33,11 +32,15 @@ const time = (hour: number) => chartTimeFormatter.format(hour)
 const hourLabel = time
 const chartPriceValues = (bars: readonly Bar[]) => bars.flatMap(bar => [
   bar.low, bar.high, bar.vwap, bar.ema, bar.bollUpper, bar.bollMiddle, bar.bollLower,
-].filter((value): value is number => finiteNumber(value)))
-const priceAxisFor = (values: number[], labels: number) => {
+].filter(finiteNumber))
+// BOLL is calculated in price space and can cross zero. Preserve those values
+// by showing the full window on a linear axis instead of dropping the band.
+const chartPriceAxis = (bars: readonly Bar[], labels: number) => {
+  const values = chartPriceValues(bars)
   const min = Math.min(...values), max = Math.max(...values)
-  return min > 0 ? { ...logarithmicChartAxis(min, max, labels), logarithmic: true }
-    : { ...chartAxisForLabels(min, max, labels), logarithmic: false }
+  return min <= 0
+    ? { ...chartAxisForLabels(min, max, labels), kind: 'linear' as const }
+    : { ...logarithmicChartAxis(min, max, labels), kind: 'logarithmic' as const }
 }
 const rocAxisFor = (bars: readonly Bar[]) => {
   const values = bars.flatMap(bar => [finitePercentage(bar.roc), finitePercentage(bar.maroc)].filter((value): value is number => value !== null))
@@ -87,12 +90,11 @@ const PriceCountdown = memo(function PriceCountdown({ hour, intervalMS, x, y, fo
   }, [])
   const seconds = Math.max(0, Math.floor((hour + intervalMS - now) / 1000))
   const value = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`
-  return <text data-chart-countdown x={x} y={y} textAnchor="middle" dominantBaseline="middle" fill="var(--chart-price-tag-foreground)" fontSize={fontSize}>{value}</text>
+  return <text data-chart-countdown x={x} y={y} textAnchor="middle" dominantBaseline="middle" fill="var(--foreground)" fontSize={fontSize}>{value}</text>
 })
-export const chartGutter = (bars: readonly Bar[], height: number, liveClose = bars[bars.length - 1].close) => {
+const chartGutter = (bars: readonly Bar[], height: number, liveClose = bars[bars.length - 1].close) => {
   const { panels } = chartLayout(0, height)
-  const values = chartPriceValues(bars)
-  const priceAxis = priceAxisFor(values, axisLabelLimit(panels.price, 9))
+  const priceAxis = chartPriceAxis(bars, axisLabelLimit(panels.price, 9))
   const decimals = priceAxis.decimals
   const priceFormatter = new Intl.NumberFormat("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals })
   const rocAxis = rocAxisFor(bars)
@@ -106,10 +108,10 @@ export const chartGutter = (bars: readonly Bar[], height: number, liveClose = ba
   ]
   const minimumScale = Math.min(1, chartTokens.textSize / chartTokens.priceTagTextSize)
   const axisGutter = Math.max(...labels.map(label => 8 + legendWidth(label)))
-  return fitAxisPriceTag(axisGutter, priceTagWidth(price(liveClose), "00:00"), chartTokens.priceTagStrokeWidth, minimumScale)
+  return fitAxisPriceTag(axisGutter, priceTagWidth(`↑ ${price(liveClose)}`, "00:00"), chartTokens.priceTagStrokeWidth, minimumScale)
 }
 
-export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, inspected, width, height, endHour, intervalMS = 3_600_000, oiState = 'ready', takerState = 'ready' }: { bars: readonly Bar[]; liveBar: Bar; liveOverlay?: boolean; inspected: number | null; width: number; height: number; endHour: number; intervalMS?: number; oiState?: PreparedChartState; takerState?: PreparedChartState }) {
+export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, inspected, width, height, endHour, intervalMS = 900_000, oiState = 'ready', takerState = 'ready' }: { bars: readonly Bar[]; liveBar: Bar; liveOverlay?: boolean; inspected: number | null; width: number; height: number; endHour: number; intervalMS?: number; oiState?: PreparedChartState; takerState?: PreparedChartState }) {
   const areaClipId = useId().replaceAll(":", "")
   const n = bars.length
   const active = bars[inspected ?? n - 1]
@@ -121,10 +123,9 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
   const { panels, columns, axisStarts, headerY, left, right } = chartLayout(width, height, gutter)
   const x = (index: number, panel: Panel) => chartHourX(bars[index].hour, latestHour, ...columns[panel], intervalMS)
   const barWidth = chartCandleWidth(right - left)
-  const priceValues = chartPriceValues(bars)
   const oiComplete = n === 96 && bars.every(bar => finiteNumber(bar.oi))
   const takerComplete = n === 96 && bars.every(bar => finiteNumber(bar.buy) && finiteNumber(bar.sell))
-  const priceAxis = priceAxisFor(priceValues, axisLabelLimit(panels.price, 9))
+  const priceAxis = chartPriceAxis(bars, axisLabelLimit(panels.price, 9))
   const highIndex = bars.findIndex(bar => bar.high === candleHigh), lowIndex = bars.findIndex(bar => bar.low === candleLow)
   const priceDecimals = priceAxis.decimals
   const axisPrice = new Intl.NumberFormat("en-US", { minimumFractionDigits: priceDecimals, maximumFractionDigits: priceDecimals })
@@ -143,16 +144,18 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
   const takerAxis = chartAxisForLabels(0, maxTaker, axisLabelLimit(panels.taker, 7))
   const scale = (value: number, min: number, max: number, panel: readonly [number, number]) =>
     panel[1] - (value - min) / (max - min || 1) * (panel[1] - panel[0])
-  const priceY = (value: number) => priceAxis.logarithmic ? logarithmicY(value, priceAxis as ReturnType<typeof logarithmicChartAxis>, panels.price) : scale(value, priceAxis.min, priceAxis.max, panels.price)
+  const priceY = (value: number) => priceAxis.kind === 'linear'
+    ? scale(value, priceAxis.min, priceAxis.max, panels.price)
+    : logarithmicY(value, priceAxis, panels.price)
   const rsiY = (value: number) => scale(value, 0, 100, panels.rsi)
   const oiY = (value: number) => oiAxis ? logarithmicY(value, oiAxis, panels.oi) : NaN
   const takerY = (value: number) => scale(value, takerAxis.min, takerAxis.max, panels.taker)
   const rocZeroY = scale(0, rocAxis.min, rocAxis.max, panels.roc)
   const tag = { price: liveBar.close, rising: liveBar.close >= liveBar.open, inViewport: liveBar.hour <= endHour + (liveOverlay ? intervalMS : 0) }
   const latestY = priceY(tag.price)
-  const latestColor = tag.rising ? "var(--positive)" : "var(--destructive)"
+  const latestColor = tag.rising ? "var(--positive)" : "var(--negative)"
   const showCountdown = liveOverlay
-  const latestPrice = price(tag.price)
+  const latestPrice = `${tag.rising ? '↑' : '↓'} ${price(tag.price)}`
   const tagFontSize = `${chartTokens.priceTagTextSize}px`
   const tagLineHeight = chartTokens.priceTagTextSize * chartTokens.priceTagLineHeight
   const tagPaddingY = chartTokens.priceTagPaddingY
@@ -210,7 +213,7 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
     upper = []; lower = []
   }
   bars.forEach((bar, index) => {
-    if (!finiteNumber(bar.bollUpper) || !finiteNumber(bar.bollLower) || bar.bollUpper <= 0 || bar.bollLower <= 0) { finishBand(); return }
+    if (!finiteNumber(bar.bollUpper) || !finiteNumber(bar.bollLower)) { finishBand(); return }
     if (index > 0 && bar.hour - bars[index - 1].hour !== intervalMS) finishBand()
     const pointX = x(index, "price").toFixed(1)
     if (index === 0 && firstAtLeft) {
@@ -247,22 +250,23 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
   const panelKeys: Panel[] = ["price", "roc", "rsi", "oi", "taker"]
   const grid = panelKeys.flatMap(key => panels[key].map((y, index) =>
     <line key={`${key}-${index}`} x1={columns[key][0]} x2={columns[key][1]} y1={y} y2={y} stroke="var(--border)" strokeWidth="1" opacity={index ? 0.32 : 0.55} />))
-  const legend = (key: Panel, items: [string, string, string][]) => {
+  const legend = (key: Panel, items: [string, string, string, string?][]) => {
     const gap = chartTokens.legendGap
     const start = columns[key][0] + gap / 2
-    const widths = items.map(([label, value]) => legendWidth(label) + 10 + legendWidth(value))
+    const widths = items.map(([label, value]) => 26 + legendWidth(label) + 10 + legendWidth(value))
     const available = right - start
     const required = widths.reduce((sum, itemWidth) => sum + itemWidth, 0) + gap * (items.length - 1)
     const shrink = Math.min(1, available / required)
     let cursor = 0
     return <g key={key}>
       <g transform={`translate(${start},${headerY[key]}) scale(${shrink})`}>
-      {items.map(([label, value, color], index) => {
+      {items.map(([label, value, color, dash], index) => {
         const itemStart = cursor
         cursor += widths[index] + gap
         return <g key={label} transform={`translate(${itemStart},0)`}>
-        <text dominantBaseline="middle" fill="var(--muted-foreground)">{label}</text>
-        <text x={legendWidth(label) + 10} dominantBaseline="middle" fill={color}>{value}</text>
+        <line data-chart-legend={label} x1="0" x2="18" stroke={color} strokeWidth="2" strokeDasharray={dash} />
+        <text x="26" dominantBaseline="middle" fill="var(--muted-foreground)">{label}</text>
+        <text x={26 + legendWidth(label) + 10} dominantBaseline="middle" fill="var(--foreground)">{value}</text>
         </g>
       })}
       </g>
@@ -276,7 +280,7 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
       <clipPath id={`${areaClipId}-positive`}><rect x={columns.roc[0]} y={panels.roc[0]} width={columns.roc[1] - columns.roc[0]} height={rocZeroY - panels.roc[0]} /></clipPath>
       <clipPath id={`${areaClipId}-negative`}><rect x={columns.roc[0]} y={rocZeroY} width={columns.roc[1] - columns.roc[0]} height={panels.roc[1] - rocZeroY} /></clipPath>
     </defs>
-    {bollBands.map((d, index) => <path key={index} d={d} fill="var(--chart-1)" fillOpacity="0.1" />)}
+    {bollBands.map((d, index) => <path key={index} data-chart-boll-band d={d} fill="var(--chart-1)" fillOpacity="0.1" />)}
     {rocAreas.map((area, index) => <g key={index}>
       <path d={area} fill="var(--chart-roc-positive-area)" clipPath={`url(#${areaClipId}-positive)`} />
       <path d={area} fill="var(--chart-roc-negative-area)" clipPath={`url(#${areaClipId}-negative)`} />
@@ -292,20 +296,22 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
     })}
     <line x1={right} x2={right} y1={panels.price[0]} y2={panels.taker[1]} stroke="var(--border)" strokeWidth="1" opacity="0.8" />
     {tag.inViewport && <line data-chart-live-price x1={columns.price[0]} x2={right + tagOffset * tagScale} y1={latestY} y2={latestY} stroke={latestColor} strokeWidth="1.2" strokeDasharray="4 5" />}
+    <path d={upWicks.join(" ")} fill="none" stroke="var(--foreground)" strokeWidth="2.2" />
     <path d={upWicks.join(" ")} fill="none" stroke="var(--positive)" strokeWidth="1.2" />
-    <path d={downWicks.join(" ")} fill="none" stroke="var(--destructive)" strokeWidth="1.2" />
-    <path d={upBodies.join(" ")} fill="var(--positive)" />
-    <path d={downBodies.join(" ")} fill="var(--destructive)" />
+    <path d={downWicks.join(" ")} fill="none" stroke="var(--negative)" strokeWidth="1.2" />
+    <path d={upBodies.join(" ")} fill="var(--chart-surface)" stroke="var(--foreground)" strokeWidth="2.2" />
+    <path data-chart-candle-direction="up" data-chart-candle-fill="hollow" d={upBodies.join(" ")} fill="var(--chart-surface)" stroke="var(--positive)" strokeWidth="1.2" />
+    <path data-chart-candle-direction="down" data-chart-candle-fill="solid" d={downBodies.join(" ")} fill="var(--negative)" />
     <g data-chart-taker={takerComplete ? "complete" : takerAvailable ? "partial" : "empty"} data-chart-taker-state={takerState}>
       <path data-chart-taker-buy-samples={buys.length} d={buys.join(" ")} fill="var(--positive)" opacity="0.9" />
-      <path data-chart-taker-sell-samples={sells.length} d={sells.join(" ")} fill="var(--destructive)" opacity="0.9" />
+      <path data-chart-taker-sell-samples={sells.length} d={sells.join(" ")} fill="var(--negative)" opacity="0.9" />
       <path d={sells.join(" ")} fill="url(#sell-hatch)" opacity="0.7" />
     </g>
-    {lineStroke("bollUpper", priceLine("bollUpper"), "var(--chart-1)", indicatorWidth, 0.62)}
+    {lineStroke("bollUpper", priceLine("bollUpper"), "var(--chart-1)", indicatorWidth)}
     {lineStroke("bollMiddle", priceLine("bollMiddle"), "var(--chart-1)")}
-    {lineStroke("bollLower", priceLine("bollLower"), "var(--chart-1)", indicatorWidth, 0.62)}
-    {lineStroke("vwap", priceLine("vwap"), "var(--chart-2)")}
-    {lineStroke("ema", priceLine("ema"), "var(--chart-3)", indicatorWidth, 0.9)}
+    {lineStroke("bollLower", priceLine("bollLower"), "var(--chart-1)", indicatorWidth)}
+    {lineStroke("vwap", priceLine("vwap"), "var(--chart-2)", indicatorWidth, 1, "2 3")}
+    {lineStroke("ema", priceLine("ema"), "var(--chart-3)", indicatorWidth, 1, "7 4")}
     {lineStroke("rsi6", line("rsi6", "rsi", rsiY), "var(--chart-1)")}
     {lineStroke("rsi12", line("rsi12", "rsi", rsiY), "var(--chart-2)", indicatorWidth, 1, "7 4")}
     {lineStroke("rsi24", line("rsi24", "rsi", rsiY), "var(--chart-3)", indicatorWidth, 1, "1 4")}
@@ -324,16 +330,16 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
         {lineLabel(start, priceY(value), label, "var(--foreground)")}
       </g>
     })}
-    <g data-surface="inherited" transform={`translate(${tagX},${priceTagY}) scale(${tagScale})`}>
-      <rect x={tagOffset + tagStrokeWidth / 2} width={tagBoxWidth} height={tagHeight} rx="4" fill={latestColor} stroke={latestColor} strokeWidth="var(--chart-price-tag-stroke-width)" />
-      <text x={tagOffset + (tagBoxWidth + tagStrokeWidth) / 2} y={tagPaddingY + tagLineHeight / 2} textAnchor="middle" dominantBaseline="middle" fill="var(--chart-price-tag-foreground)" fontSize={tagFontSize}>{latestPrice}</text>
+    <g transform={`translate(${tagX},${priceTagY}) scale(${tagScale})`}>
+      <rect x={tagOffset + tagStrokeWidth / 2} width={tagBoxWidth} height={tagHeight} rx="4" fill="var(--chart-surface)" stroke={latestColor} strokeWidth="var(--chart-price-tag-stroke-width)" />
+      <text x={tagOffset + (tagBoxWidth + tagStrokeWidth) / 2} y={tagPaddingY + tagLineHeight / 2} textAnchor="middle" dominantBaseline="middle" fill="var(--foreground)" fontSize={tagFontSize}>{latestPrice}</text>
       {showCountdown && <PriceCountdown hour={liveBar.hour} intervalMS={intervalMS} x={tagOffset + (tagBoxWidth + tagStrokeWidth) / 2} y={tagPaddingY + tagLineHeight * 1.5 + tagRowGap} fontSize={tagFontSize} />}
     </g>
-    {legend("price", [["VWAP14", price(active.vwap), "var(--chart-2)"], ["EMA200", price(active.ema), "var(--chart-3)"], ["BOLL(20, 2)", `U ${price(active.bollUpper)}\u00a0·\u00a0M ${price(active.bollMiddle)}\u00a0·\u00a0L ${price(active.bollLower)}`, "var(--chart-1)"]])}
+    {legend("price", [["VWAP(14)", price(active.vwap), "var(--chart-2)", "2 3"], ["EMA(200)", price(active.ema), "var(--chart-3)", "7 4"], ["BOLL(20,2)", `U ${price(active.bollUpper)}\u00a0·\u00a0M ${price(active.bollMiddle)}\u00a0·\u00a0L ${price(active.bollLower)}`, "var(--chart-1)"]])}
     {legend("roc", [["ROC(9)", formatPercent(active.roc), "var(--chart-1)"], ["MAROC(9)", formatPercent(active.maroc), "var(--chart-2)"]])}
     {legend("rsi", [["RSI(6)", active.rsi6?.toFixed(1) ?? "—", "var(--chart-1)"], ["RSI(12)", active.rsi12?.toFixed(1) ?? "—", "var(--chart-2)"], ["RSI(24)", active.rsi24?.toFixed(1) ?? "—", "var(--chart-3)"]])}
     {legend("oi", [["OI (Contracts)", finiteNumber(active.oi) ? compact(active.oi) : "Unavailable", "var(--chart-2)"]])}
-    {legend("taker", [["Taker Buy (Contracts)", finiteNumber(active.buy) ? compact(active.buy) : "Unavailable", "var(--positive)"], ["Taker Sell (Contracts)", finiteNumber(active.sell) ? compact(active.sell) : "Unavailable", "var(--destructive)"]])}
+    {legend("taker", [["↑ Taker Buy (Contracts)", finiteNumber(active.buy) ? compact(active.buy) : "Unavailable", "var(--positive)"], ["↓ Taker Sell (Contracts)", finiteNumber(active.sell) ? compact(active.sell) : "Unavailable", "var(--negative)", "2 3"]])}
     {panels.rsi[1] - panels.rsi[0] >= 35 && <>{lineLabel(axisStarts.rsi, panels.rsi[0], "100")}{lineLabel(axisStarts.rsi, panels.rsi[1], "0")}</>}
     {panels.roc[1] - panels.roc[0] >= 35 && <>{lineLabel(axisStarts.roc, panels.roc[0], formatPercent(rocAxis.max, rocAxis.decimals))}{lineLabel(axisStarts.roc, panels.roc[1], formatPercent(rocAxis.min, rocAxis.decimals))}</>}
     {oiAxis && panels.oi[1] - panels.oi[0] >= 35 && oiAxis.ticks.map(tick => <g key={tick}><line x1={columns.oi[0]} x2={right} y1={oiY(tick)} y2={oiY(tick)} stroke="var(--border)" strokeOpacity="0.25" />{lineLabel(axisStarts.oi, oiY(tick), compact(tick))}</g>)}
@@ -341,7 +347,7 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
   </>
 })
 
-export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listOrder, turnoverOrder, onSelect, onBack, backLabel = 'Markets' }: { instId: string; timeframe?: RadarTimeframe; onTimeframeChange?: (value: RadarTimeframe) => void; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void; onBack: () => void; backLabel?: string }) {
+export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, listOrder, turnoverOrder, onSelect }: { instId: string; timeframe?: RadarTimeframe; onTimeframeChange?: (value: RadarTimeframe) => void; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
   const view = useSyncExternalStore(chartController.subscribe, chartController.getSnapshot)
   useLayoutEffect(() => chartController.open(instId, timeframe), [instId, timeframe])
   const surface = view.presented
@@ -462,7 +468,8 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     if (pending || !surface || !chartRef.current) return
     setCapture({ status: 'copying', error: '' })
     try {
-      await window.webkit.messageHandlers.radar.postMessage({ captureChart: chartCaptureBounds(chartRef.current) })
+      const result = await window.radarDesktop.request({ captureChart: chartCaptureBounds(chartRef.current) })
+      if (!result.ok) throw new Error('Could not copy chart.')
       setCapture({ status: 'flashing', error: '' })
     } catch (cause) { setCapture({ status: 'failed', error: cause instanceof Error ? cause.message : 'Could not copy chart.' }) }
   }
@@ -474,7 +481,7 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
       await new Promise<void>(resolve => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())))
       const element = chartRef.current
       if (!element || chartController.getSnapshot().presented !== capturedSurface || chartController.getSnapshot().pending) throw new Error('Chart changed before capture. Start a new analysis.')
-      const image = await window.webkit.messageHandlers.radar.postMessage({ captureChart: { ...chartCaptureBounds(element), output: 'png' } })
+      const image = await window.radarDesktop.request({ captureChart: { ...chartCaptureBounds(element), output: 'png' } })
       return { ...image, capturedAt: Date.now(), rangeLabel: `${time(capturedSurface.bars[0]!.hour)} – ${time(capturedSurface.endHour)}` }
     }, direction)
   }
@@ -483,11 +490,11 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
   const takerState = surface?.takerState ?? 'ready'
   const historyDays = 1_440 * intervalMS / 86_400_000
   const atBoundary = view.historyExhausted && surface && view.oldestHour !== null && surface.endHour === Math.min(view.latestEnd ?? Infinity, view.oldestHour + 95 * intervalMS)
-  return <ChartWorkspaceViewport expanded={analysisOpen}><main className="flex h-full min-h-0 flex-col overflow-hidden overscroll-none text-sm font-normal tabular-nums">
-    <header className="flex shrink-0 items-center gap-3 border-b px-4 py-2">
-      <Button variant="ghost" size="sm" onClick={onBack}><ArrowLeft data-icon="inline-start" aria-hidden="true" />{backLabel}</Button>
-      <div className="min-w-0 flex-1"><h1 className="truncate text-base font-semibold tracking-tight" title={displayedId}>{displayedId.replace(/-SWAP$/, '')}</h1></div>
-      <ToggleGroup type="single" variant="outline" value={timeframe} onValueChange={value => { if (value) onTimeframeChange?.(value as RadarTimeframe) }} aria-label="Chart timeframe">{RADAR_TIMEFRAMES.map(item => <ToggleGroupItem key={item.value} value={item.value}>{item.label}</ToggleGroupItem>)}</ToggleGroup>
+  const priceScale = bars.length ? chartPriceAxis(bars, 9).kind : 'logarithmic'
+  return <section data-chart-workspace aria-label="Market chart workspace" className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden overscroll-none text-sm font-normal tabular-nums">
+    <header className="flex shrink-0 flex-wrap items-center gap-3 border-b px-4 py-2">
+      <div className="min-w-0 flex-1"><h2 className="truncate text-base font-semibold tracking-tight" title={displayedId}>{displayedId.replace(/-SWAP$/, '')}</h2></div>
+      <ToggleGroup variant="outline" value={[timeframe]} onValueChange={values => { const value = values[0]; if (value) onTimeframeChange?.(value as RadarTimeframe) }} aria-label="Chart timeframe">{RADAR_TIMEFRAMES.map(item => <ToggleGroupItem key={item.value} value={item.value}>{item.label}</ToggleGroupItem>)}</ToggleGroup>
       <Button variant="outline" size="sm" disabled={pending || !bars.length || plotSize.width <= 0 || captureStatus === 'copying' || analysis?.phase === 'capturing'} onClick={() => { void captureChart() }}><Camera data-icon="inline-start" aria-hidden="true" />{captureStatus === 'copying' ? 'Copying…' : 'Copy chart'}</Button>
       <ButtonGroup aria-label="Chart analysis actions">{(['long', 'short'] as const).map(direction => <Button key={direction} variant="outline" size="sm" disabled={captureStatus === 'copying' || (analysis?.direction !== direction && (analysisBusy || pending || !bars.length || plotSize.width <= 0))} title={analysis?.direction === direction ? `Open existing ${direction} analysis` : undefined} onClick={() => { if (analysis?.direction === direction) setAnalysisOpen(true); else analyzeChart(direction) }}>{analysisBusy && analysis?.direction === direction && <Spinner data-icon="inline-start" />}Analyze {direction === 'long' ? 'Long' : 'Short'}</Button>)}</ButtonGroup>
       <span role="status" className="sr-only">{captureStatus === 'flashing' ? 'Chart copied to clipboard' : ''}</span>
@@ -496,11 +503,12 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}</div>}
     {capture.error && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{capture.error}</p>}
     <div className="flex min-h-0 flex-1">
-    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={surface ? 'ready' : 'loading'} data-chart-statistics-state={surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete="false" data-chart-loading={pending && !unavailable ? 'true' : 'false'} data-surface="panel" aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-chart-surface">
+    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={surface ? 'ready' : 'loading'} data-chart-statistics-state={surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete="false" data-chart-loading={pending && !unavailable ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-chart-surface">
       {active && <div className="grid shrink-0 grid-cols-[minmax(9rem,1.2fr)_repeat(4,minmax(0,1fr))] items-center border-b px-4 py-1.5 text-[length:var(--chart-text-size)]" aria-live="off">
         <p className="min-w-0 truncate border-r pr-3"><span className="font-medium">{displayedId.replace(/-SWAP$/, '')}</span> · <span className="text-muted-foreground">{inspected === null ? historical ? 'Window end' : 'Latest' : 'Selected'}</span> {time(active.hour)}</p>
         {([['Open', active.open], ['High', active.high], ['Low', active.low], ['Close', active.close]] as const).map(([label, value]) => <div key={label} className="min-w-0 px-3"><span className="text-muted-foreground">{label} </span><span title={price(value)}>{price(value)}</span></div>)}
       </div>}
+      <p data-chart-price-scale={priceScale} className="shrink-0 border-b px-4 py-1 text-xs text-muted-foreground">{priceScale === 'linear' ? 'Linear scale · BOLL includes zero or negative values' : 'Logarithmic price scale'} · ↑ Hollow candles rise · ↓ Solid candles fall</p>
       <div ref={plotRef} data-chart-plot className="relative min-h-0 flex-1 overflow-hidden" onWheel={event => {
         if (analysis?.phase === 'capturing') return
         const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : -event.deltaY
@@ -516,15 +524,15 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
           if (!(event.buttons & 1)) { endInspection(); return }
           inspectAt(event.currentTarget, event.clientX)
         }}><Plot bars={bars} liveBar={surface.liveBar ?? bars.at(-1)!} liveOverlay={!!surface.liveBar} inspected={inspected} width={plotSize.width} height={plotSize.height} endHour={surface.endHour} intervalMS={surface.intervalMS} oiState={oiState} takerState={takerState} /></svg> : <div role="status" className="flex h-full items-center justify-center gap-2 text-muted-foreground">{unavailable ? unavailableText : <><Spinner />Preparing complete chart…</>}</div>}
-        {pending && surface && !unavailable && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Preparing {instId.replace(/-SWAP$/, '')} {timeframeLabel(timeframe)}{requestedEnd !== null ? ` · ${time(requestedEnd)}` : ''}…</span>}
-        {unavailable && surface && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 max-w-md rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{unavailableText}</span>}
-        {oiState === 'unavailable' && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-10 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{bars.some(bar => bar.oiUnavailableReason === 'outside-retention') ? `OKX ${timeframeLabel(displayedFrame)} OI history is limited to ${historyDays} days` : `OKX ${timeframeLabel(displayedFrame)} OI history is incomplete for this range`}</span>}
-        {takerState === 'unavailable' && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-20 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{bars.some(bar => bar.takerUnavailableReason === 'outside-retention') ? `OKX ${timeframeLabel(displayedFrame)} Taker history is limited to ${historyDays} days` : `OKX ${timeframeLabel(displayedFrame)} Taker history is incomplete for this range`}</span>}
-        {atBoundary && !pending && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Start of available history</span>}
+        {pending && surface && !unavailable && <span role="status" className="pointer-events-none absolute right-4 top-2 rounded-md border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Preparing {instId.replace(/-SWAP$/, '')} {timeframeLabel(timeframe)}{requestedEnd !== null ? ` · ${time(requestedEnd)}` : ''}…</span>}
+        {unavailable && surface && <span role="status" className="pointer-events-none absolute right-4 top-2 max-w-md rounded-md border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{unavailableText}</span>}
+        {oiState === 'unavailable' && <span role="status" className="pointer-events-none absolute right-4 top-10 rounded-md border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{bars.some(bar => bar.oiUnavailableReason === 'outside-retention') ? `OKX ${timeframeLabel(displayedFrame)} OI history is limited to ${historyDays} days` : `OKX ${timeframeLabel(displayedFrame)} OI history is incomplete for this range`}</span>}
+        {takerState === 'unavailable' && <span role="status" className="pointer-events-none absolute right-4 top-20 rounded-md border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{bars.some(bar => bar.takerUnavailableReason === 'outside-retention') ? `OKX ${timeframeLabel(displayedFrame)} Taker history is limited to ${historyDays} days` : `OKX ${timeframeLabel(displayedFrame)} Taker history is incomplete for this range`}</span>}
+        {atBoundary && !pending && <span role="status" className="pointer-events-none absolute right-4 top-2 rounded-md border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Start of available history</span>}
       </div>
-      {captureStatus === 'flashing' && <div aria-hidden="true" data-surface="inherited" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
+      {captureStatus === 'flashing' && <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
     </section>
     {analysisOpen && <ChartAnalysisPanel instId={instId} timeframe={timeframeLabel(timeframe)} session={analysis} ready={!pending && bars.length === 96 && plotSize.width > 0 && captureStatus !== 'copying'} onNew={() => analyzeChart(analysis?.direction ?? 'long')} onClose={() => { chartAnalysis.stop(instId); setAnalysisOpen(false) }} />}
     </div>
-  </main></ChartWorkspaceViewport>
+  </section>
 }

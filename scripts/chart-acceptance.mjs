@@ -18,10 +18,35 @@ export async function waitForRendered(page, fixture, timeframe = fixture.timefra
   }, { instId: fixture.instId, timeframe, end }, { timeout: 20_000 })
 }
 
+export async function assertWorkspaceLayout(page) {
+  const layout = await page.locator('[data-layout="market-workspace"]').evaluate(root => {
+    const list = root.querySelector('[data-market-list]')
+    const chart = root.querySelector('[data-chart-panel]')
+    const rectangle = node => { const { x, y, width, height } = node.getBoundingClientRect(); return { x, y, width, height } }
+    return {
+      designWidth: Number(root.dataset.designWidth), scale: Number(root.dataset.uiScale),
+      viewport: { width: innerWidth, height: innerHeight }, root: rectangle(root),
+      list: list ? rectangle(list) : null, chart: chart ? rectangle(chart) : null,
+      documentWidth: document.documentElement.scrollWidth, documentHeight: document.documentElement.scrollHeight,
+    }
+  })
+  assert.equal(layout.designWidth, 1_600)
+  assert.ok(layout.scale > 0)
+  assert.ok(Math.abs(layout.scale - layout.viewport.width / 1_600) < 1e-5, `All UI must use one width scale: ${JSON.stringify(layout)}`)
+  assert.ok(layout.list && layout.chart, 'The list and chart panel must remain mounted together.')
+  assert.ok(Math.abs(layout.list.width / layout.scale - 420) < 2, 'The contract list must keep its design width.')
+  assert.ok(Math.abs(layout.chart.width / layout.scale - 1_180) < 2, 'The chart panel must keep its design width.')
+  assert.ok(Math.abs(layout.list.x + layout.list.width - layout.chart.x) < 2, 'The chart must sit beside the contract list.')
+  assert.ok(layout.documentWidth <= layout.viewport.width + 1 && layout.documentHeight <= layout.viewport.height + 1, 'The workspace must scroll inside its panels, not the window.')
+  assert.equal(await page.getByRole('button', { name: /^(?:Back to Markets|Markets)$/i }).count(), 0)
+  return layout
+}
+
 export async function openChart(page, fixture, timeframe = fixture.timeframe) {
   await page.reload({ waitUntil: 'domcontentloaded' })
   await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click({ timeout: 15_000 })
   await page.locator(`[data-chart-inst="${fixture.instId}"]`).waitFor({ state: 'visible' })
+  await assertWorkspaceLayout(page)
   await selectTimeframe(page, timeframe)
   await waitForRendered(page, fixture, timeframe)
 }

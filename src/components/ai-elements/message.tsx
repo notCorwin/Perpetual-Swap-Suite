@@ -1,16 +1,13 @@
-// AI Elements MessageResponse, composed with the native-styled shadcn message primitives.
+// Shared Markdown rendering for chart analysis. Only code highlighting is needed.
 import { cn } from '@/lib/utils'
-import { cjk } from '@streamdown/cjk'
 import { code } from '@streamdown/code'
-import { math } from '@streamdown/math'
-import { mermaid } from '@streamdown/mermaid'
 import { memo, type ComponentProps } from 'react'
 import { Streamdown } from 'streamdown'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 
 export type MessageResponseProps = ComponentProps<typeof Streamdown>;
 
-const streamdownPlugins = { cjk, code, math, mermaid };
+const streamdownPlugins = { code };
 const markdownComponents: MessageResponseProps['components'] = {
   table: ({ node: _node, ...props }) => <Table {...props} />,
   thead: ({ node: _node, ...props }) => <TableHeader {...props} />,
@@ -23,7 +20,6 @@ const markdownComponents: MessageResponseProps['components'] = {
 export const MessageResponse = memo(
   ({ className, ...props }: MessageResponseProps) => (
     <Streamdown
-      data-surface="inherited"
       className={cn(
         "size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
         className

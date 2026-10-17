@@ -1,409 +1,158 @@
-import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react"
-import { ArrowDown, ArrowDownUp, ArrowUp, Radio, Search, Settings2 } from "lucide-react"
-import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
-import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty"
-import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field"
-import { Popover, PopoverContent, PopoverDescription, PopoverHeader, PopoverTitle, PopoverTrigger } from "@/components/ui/popover"
-import { Toggle } from "@/components/ui/toggle"
-import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
-import { Input } from "@/components/ui/input"
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { cn, pageVisible } from "@/lib/utils"
-import { compareMarketRows, compareMarketTurnover, defaultSortDescending, type SortKey } from "@/market-sort"
-import { PERCENT_CHANGE_DESCRIPTION, formatPercent, percentageNumber, type PercentageValue } from "@/market-percent"
-import { BREAK_DESCRIPTION, describeBreak, formatBreakPriorAge, formatBreakTime, type BreakDirection, type BreakResult } from "@/market-breaks"
-import { BANDWIDTH_EXPANSION_DESCRIPTION, BOLL_DESCRIPTION, formatBandWidthExpansion, formatLiveBand } from "@/market-bollinger"
-import { MarketChart } from "@/MarketChart"
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Radio } from 'lucide-react'
+import { Badge } from '@/components/ui/badge'
+import { Input } from '@/components/ui/input'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
+import { MarketChart } from '@/MarketChart'
+import { MarketRowsViewport } from '@/MarketRowsViewport'
+import { WorkspaceViewport } from '@/WorkspaceViewport'
+import { WorkspaceSettings } from '@/WorkspaceSettings'
 import { chartController } from '@/chart-controller'
+import { compareRankingChange } from '@/market-ranking'
+import { reconcileMarketRows } from '@/market-snapshot'
+import { SnapshotOrder } from '@/snapshot-order'
+import { DEFAULT_PREFERENCES, type Preferences } from '@/renderer-preferences'
+import type { MarketSnapshot, RankedMarketRow, UnchangedSnapshot } from '@/desktop-contract'
 import type { PreparedChartResponse } from '@/chart-data'
-import { OPPORTUNITY_DESCRIPTION } from "@/market-opportunity"
-import { MarketOpportunity } from "@/MarketOpportunity"
-import { MarketListViewport } from "@/MarketListViewport"
-import { MarketRowsViewport } from "@/MarketRowsViewport"
-import { reconcileMarketRows } from "@/market-snapshot"
-import { SnapshotOrder } from "@/snapshot-order"
-import type { NativeMarketRow } from "@/market-row"
-import { AnalysisSettingsButton } from '@/AnalysisSettingsDialog'
-import type { AnalysisSettings, AnalysisSettingsRequest } from '@/chart-analysis'
-import type { ChartCaptureBounds, ChartImage } from '@/chart-capture'
-import { BlurControls } from '@/BlurSettings'
-import { initialBlurSettings, useBlurSettings, withSettingsDeadline, type BlurSettings } from '@/blur-settings'
-import { RADAR_TIMEFRAMES, timeframeLabel, type RadarTimeframe } from '@/timeframe'
+import type { RadarTimeframe } from '@/timeframe'
+import { cn, pageVisible } from '@/lib/utils'
 
-type WindowAppearance = BlurSettings & { frostedBackgroundEnabled: boolean; frostedBackgroundOpacity: number }
-type LiquiditySettings = { hourlyVolumeStabilityEnabled: boolean }
-type ListProgress = { total: number; completed: number; pending: number; retrying: number; unavailable: number }
-type Snapshot = WindowAppearance & LiquiditySettings & { rows: NativeMarketRow[]; updatedAt: number | null; error: string; revision: number; loading?: boolean; listProgress?: ListProgress; catalogSource?: 'none' | 'cache' | 'live'; serviceSession?: string; timeframe?: RadarTimeframe; intervalMS?: number; }
-type UnchangedSnapshot = { unchanged: true; revision: number; error: string; serviceSession?: string }
-type SettingRequest = Partial<WindowAppearance & LiquiditySettings>
-type NativeBridge = {
-  postMessage(request: { analysisSettings: AnalysisSettingsRequest }): Promise<AnalysisSettings>
-  postMessage(request: { gatewayFetch: { id: string; body: string } }): Promise<{ status: number; headers: Record<string, string> }>
-  postMessage(request: { cancelGatewayFetch: string }): Promise<{ ok: boolean }>
-  postMessage(request: { copyText: string }): Promise<{ ok: boolean }>
-  postMessage(request: { captureChart: ChartCaptureBounds & { output: 'png' } }): Promise<ChartImage>
-  postMessage(request: { rocPeriod: number; marocPeriod: number; timeframe?: RadarTimeframe; sinceRevision: number; serviceSession?: string }): Promise<Snapshot | UnchangedSnapshot>
-  postMessage(request: SettingRequest): Promise<Snapshot>
-  postMessage(request: { captureChart: { x: number; y: number; width: number; height: number; backgroundRGB: number[] } }): Promise<{ ok: boolean }>
-  postMessage(request: { windowTintRGB: number[] }): Promise<{ ok: boolean }>
-  postMessage(request: { previewWindowBlur: number | null }): Promise<{ ok: boolean }>
-  postMessage(request: { chartWindow: { instId: string; timeframe: RadarTimeframe; endHour?: number } }): Promise<PreparedChartResponse>
-  postMessage(request: { chartLocal: { instId: string; timeframe: RadarTimeframe } }): Promise<PreparedChartResponse | null>
-  postMessage(request: { chartUniverse: { instIds: string[]; timeframe: RadarTimeframe; focusInstId?: string } }): Promise<{ frames: PreparedChartResponse[] }>
-}
-declare global {
-  interface Window { radarAppearance?: WindowAppearance & { nativeWindowBackground?: boolean }; webkit: { messageHandlers: { radar: NativeBridge } } }
-}
-const ROC_PERIOD = 9
-const MAROC_PERIOD = 9
-const formatIndicator = (value: number | null) => value === null ? "—" : value.toFixed(2)
-const priceFormatter = new Intl.NumberFormat("en-US", { maximumSignificantDigits: 8 })
-const turnoverFormatter = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 2 })
-const formatPrice = (value: number | null) => value === null ? "—" : priceFormatter.format(value)
-const listCollectorStatus = (snapshot: Pick<Snapshot, "loading" | "listProgress" | "catalogSource">) => {
+const priceFormatter = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 8 })
+const formatPrice = (value: number | null | undefined) => value == null ? '—' : priceFormatter.format(value)
+const collectorStatus = (snapshot: MarketSnapshot | UnchangedSnapshot) => {
   const progress = snapshot.listProgress
-  const cached = snapshot.catalogSource === 'cache'
-  if (progress && progress.total > 0 && progress.completed < progress.total) {
-    const work = progress.retrying || progress.unavailable ? `Retrying ${progress.completed}/${progress.total}` : `Loading ${progress.completed}/${progress.total}`
-    return cached ? `Cached · ${work}` : work
-  }
-  if (snapshot.loading) return cached ? "Cached · Refreshing" : "Refreshing"
-  return cached ? "Cached" : "Live"
+  if (progress && progress.total > 0 && progress.completed < progress.total) return `Loading ${progress.completed}/${progress.total}`
+  if (snapshot.loading) return 'Refreshing'
+  return snapshot.catalogSource === 'cache' ? 'Cached' : snapshot.catalogSource === 'none' ? 'Waiting' : 'Live'
 }
-const directionClass = (value: PercentageValue) => {
-  const number = percentageNumber(value)
-  return number === null ? "text-muted-foreground" : number > 0 ? "text-positive" : number < 0 ? "text-destructive" : ""
-}
-const rsiClass = (value: number | null) => value === null ? "text-muted-foreground" : value > 70 ? "text-positive" : value < 30 ? "text-destructive" : ""
-const RSI_PERIODS = [6, 12, 24] as const
-const indicatorFormula = (name: string, period: number) => <span data-header-formula="html" className="text-xs font-medium text-foreground" aria-hidden="true">{name}<sub>{period}</sub>{name === 'RSI' ? '' : ' (%)'}</span>
-const takerImbalanceFormula = <span data-header-formula="html" className="inline-flex items-center gap-1 text-xs font-medium text-foreground" aria-hidden="true">
-  <span className="inline-flex flex-col items-center leading-none">
-    <span className="border-b border-current px-0.5 pb-0.5">Buy<sub>t</sub> − Sell<sub>t</sub></span>
-    <span className="px-0.5 pt-0.5">Buy<sub>t</sub> + Sell<sub>t</sub></span>
-  </span>
-  <span>× 100%</span>
-</span>
+const message = (cause: unknown) => cause instanceof Error ? cause.message : 'The desktop data service could not complete this request.'
 
-function BreakReadings({ result, direction, timeframe }: { result: BreakResult; direction: BreakDirection; timeframe: RadarTimeframe }) {
-  const description = describeBreak(result, direction, timeframe)
-  const hasEvent = result.status === "event"
-  return <Fragment>
-    <span className={cn("inline-flex items-baseline justify-end gap-1", hasEvent ? direction === "high" ? "text-positive" : "text-destructive" : "text-muted-foreground")} title={description}>
-      <span className="sr-only">{direction === "high" ? "High breakout" : "Low breakdown"} </span>
-      {hasEvent && <span aria-hidden="true">{direction === "high" ? "↑" : "↓"}</span>}
-      {(hasEvent && result.live) || result.status === "loading" ? <Badge variant={result.status === "loading" ? "outline" : "secondary"}>{formatBreakTime(result, timeframe)}</Badge> : formatBreakTime(result, timeframe)}
-    </span>
-    <span className="text-xs text-muted-foreground" title={description}>
-      <span className="sr-only">Previous {direction === "high" ? "high" : "low"} age at the break </span>{formatBreakPriorAge(result, timeframe)}
-    </span>
-  </Fragment>
-}
-
-const MarketRowView = memo(function MarketRowView({ row, index, onSelect, timeframe }: { row: NativeMarketRow; index: number; onSelect: (id: string) => void; timeframe: RadarTimeframe }) {
-  return <TableRow data-market-index={index} aria-rowindex={index + 2} interactive tabIndex={0} aria-label={`View ${row.instId} chart`} onClick={() => onSelect(row.instId)} onKeyDown={event => {
-    if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect(row.instId) }
-  }}>
-    <TableCell className="pl-[var(--market-table-leading-inset)] text-left" title={row.instId}>
-      <span className="font-medium">{row.instId.replace(/-USDT-SWAP$/, "")}</span>
-      <div className="flex justify-start gap-2 text-xs tabular-nums">
-        <span title={`Latest traded price; ${timeframeLabel(timeframe)} indicators use the locally aggregated candle close`}>{formatPrice(row.lastPrice ?? row.price)}</span>
-        <span className={directionClass(row.priceChange)} title={`${timeframeLabel(timeframe)} candle close change from the previous completed candle. ${PERCENT_CHANGE_DESCRIPTION}`}>{formatPercent(row.priceChange)}</span>
-      </div>
-      <div className="flex items-center justify-start gap-3 text-xs tabular-nums">
-        <span className="flex gap-1"><span className="text-muted-foreground">Low</span><span>{formatPrice(row.currentLow)}</span></span>
-        <span className="flex gap-1"><span className="text-muted-foreground">High</span><span>{formatPrice(row.currentHigh)}</span></span>
-      </div>
-      <div className="flex items-center justify-start gap-1 text-xs tabular-nums" title={row.turnover24hUSDT === null ? "Estimated 24h turnover is unavailable" : `${row.turnover24hUSDT.toLocaleString("en-US", { maximumFractionDigits: 2 })} USDT · 24h base volume × latest price estimate`}>
-        <span className="text-muted-foreground">Est. turnover</span><span>{row.turnover24hUSDT === null ? "—" : turnoverFormatter.format(row.turnover24hUSDT)} USDT</span>
-      </div>
-    </TableCell>
-    <TableCell className="text-center tabular-nums"><MarketOpportunity instId={row.instId} opportunity={row.opportunity} /></TableCell>
-    <TableCell className="text-center tabular-nums">
-      <div className="mx-auto grid w-max grid-cols-[max-content_max-content] items-baseline gap-x-3 text-right">
-        <BreakReadings result={row.highBreakout} direction="high" timeframe={timeframe} />
-        <BreakReadings result={row.lowBreakdown} direction="low" timeframe={timeframe} />
-      </div>
-    </TableCell>
-    <TableCell className={cn("text-center tabular-nums", directionClass(row.takerRatio))} title={row.buy !== null && row.sell !== null ? `Taker contracts · Buy ${row.buy.toLocaleString("en-US")} / Sell ${row.sell.toLocaleString("en-US")} · Imbalance (Buy − Sell) / (Buy + Sell), not Buy / Sell` : "Loading taker contract volume"}>{formatPercent(row.takerRatio)}</TableCell>
-    <TableCell className={cn("text-center tabular-nums", directionClass(row.oiChange))}>{formatPercent(row.oiChange)}</TableCell>
-    <TableCell className="text-center tabular-nums">
-      <div className="mx-auto grid w-max grid-cols-[max-content_max-content] gap-x-3 text-right">
-        <span className={directionClass(row.roc)}><span className="sr-only">ROC </span>{formatPercent(row.roc)}</span>
-        <span className={directionClass(row.rocChange)} title={`One-candle ROC change. ${PERCENT_CHANGE_DESCRIPTION}`}><span className="sr-only">ROC candle change </span>{formatPercent(row.rocChange)}</span>
-        <span className={directionClass(row.maroc)}><span className="sr-only">MAROC </span>{formatPercent(row.maroc)}</span>
-        <span className={directionClass(row.marocChange)} title={`One-candle MAROC change. ${PERCENT_CHANGE_DESCRIPTION}`}><span className="sr-only">MAROC candle change </span>{formatPercent(row.marocChange)}</span>
-      </div>
-    </TableCell>
-    <TableCell className="text-center tabular-nums">
-      <div className="flex flex-col items-center text-xs">
-        {RSI_PERIODS.map(period => <div key={period} className="flex gap-1"><span className="text-muted-foreground">{period}</span><span className={rsiClass(row[`rsi${period}`])}>{formatIndicator(row[`rsi${period}`])}</span></div>)}
-      </div>
-    </TableCell>
-    <TableCell className="text-center tabular-nums">
-      <div className="flex flex-col items-center text-xs">
-        <div className="flex gap-1" title={BOLL_DESCRIPTION}><span className="text-muted-foreground">Live</span><span className={cn(row.bollAboveBand === null ? "text-muted-foreground" : row.bollAboveBand === "below" ? "text-destructive" : "text-positive")}>{formatLiveBand(row.bollAboveBand)}</span></div>
-        <div className="flex gap-1" title={BANDWIDTH_EXPANSION_DESCRIPTION}><span className="text-muted-foreground">Expansion</span><span className={cn(row.bollExpansion && row.bollExpansion.hours > 0 ? "text-positive" : "text-muted-foreground")}>{formatBandWidthExpansion(row.bollExpansion, timeframe)}</span></div>
-      </div>
+const MarketRowView = memo(function MarketRowView({ row, index, selected, lookback, onSelect }: { row: RankedMarketRow; index: number; selected: boolean; lookback: number; onSelect: (id: string) => void }) {
+  const change = Number.isFinite(row.rankingChange) ? row.rankingChange : null
+  return <TableRow data-market-index={index} aria-rowindex={index + 2} aria-selected={selected} data-state={selected ? 'selected' : undefined} tabIndex={0} aria-label={`View ${row.instId} chart`} onClick={() => onSelect(row.instId)} onKeyDown={event => {
+    if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(row.instId) }
+  }} className="cursor-pointer focus-visible:outline-2 focus-visible:outline-ring focus-visible:-outline-offset-2">
+    <TableCell className="font-medium" title={row.instId}><span className="block truncate">{row.instId.replace(/-USDT-SWAP$/, '')}</span><span className="block text-xs font-normal text-muted-foreground">USDT perpetual</span></TableCell>
+    <TableCell className="text-right">{formatPrice(row.lastPrice ?? row.price)}</TableCell>
+    <TableCell className="text-right" title={row.rankingAsOf ? `${lookback}-minute signed relative change · completed candle as of ${new Date(row.rankingAsOf).toLocaleString('en-US')}` : 'Completed candle ranking is not available'}>
+      <span className="inline-flex items-center justify-end gap-1"><span aria-hidden="true" className={cn(change === null ? 'text-muted-foreground' : change > 0 ? 'text-positive' : change < 0 ? 'text-negative' : 'text-muted-foreground')}>{change === null ? '' : change > 0 ? '↑' : change < 0 ? '↓' : '→'}</span><span>{change === null ? '—' : `${change > 0 ? '+' : ''}${change.toFixed(2)}%`}</span></span>
     </TableCell>
   </TableRow>
 })
-const MarketRows = memo(function MarketRows({ rows, onSelect, timeframe }: { rows: NativeMarketRow[]; onSelect: (id: string) => void; timeframe: RadarTimeframe }) {
-  return <MarketRowsViewport ids={rows.map(row => row.instId)}>{index => <MarketRowView row={rows[index]} index={index} onSelect={onSelect} timeframe={timeframe} />}</MarketRowsViewport>
-})
 
 function App() {
+  const [preferences, setPreferences] = useState<Preferences>(DEFAULT_PREFERENCES)
+  const [preferencesLoaded, setPreferencesLoaded] = useState(false)
+  const [preferencesError, setPreferencesError] = useState('')
+  const [rows, setRows] = useState<RankedMarketRow[]>([])
+  const [selected, setSelected] = useState<string | null>(null)
+  const [query, setQuery] = useState('')
+  const [ready, setReady] = useState(false)
+  const [status, setStatus] = useState('Connecting')
+  const [realtime, setRealtime] = useState('Connecting')
+  const [error, setError] = useState('')
+  const [updatedAt, setUpdatedAt] = useState<number | null>(null)
+  const [refresh, setRefresh] = useState(0)
+  const order = useRef(new SnapshotOrder())
+  const revision = useRef(-1)
+  const preferenceWrite = useRef(0)
+  const timeframe = preferences.chartTimeframe
+
   useEffect(() => {
     const receive = (event: Event) => chartController.ingestPrepared((event as CustomEvent<PreparedChartResponse>).detail)
     window.addEventListener('radar-chart-prepared', receive)
     return () => window.removeEventListener('radar-chart-prepared', receive)
   }, [])
-  const revision = useRef(-1)
-  const serviceSession = useRef<string | undefined>(undefined)
-  const snapshotOrder = useRef(new SnapshotOrder())
-  const backgroundOpacityDraftDirty = useRef(false)
-  const [ready, setReady] = useState(false)
-  const [timeframe, setTimeframe] = useState<RadarTimeframe>('1H')
-  const timeframeRef = useRef(timeframe)
-  timeframeRef.current = timeframe
-  const [rows, setRows] = useState<NativeMarketRow[]>([])
-  const [status, setStatus] = useState("Connecting")
-  const [error, setError] = useState("")
-  const [updatedAt, setUpdatedAt] = useState<number | null>(null)
-  const [query, setQuery] = useState("")
-  const [frostedBackgroundEnabled, setFrostedBackgroundEnabled] = useState(window.radarAppearance?.frostedBackgroundEnabled ?? true)
-  const [frostedBackgroundOpacity, setFrostedBackgroundOpacity] = useState(window.radarAppearance?.frostedBackgroundOpacity ?? 0.3)
-  const [backgroundOpacityDraft, setBackgroundOpacityDraft] = useState(String(window.radarAppearance?.frostedBackgroundOpacity ?? 0.3))
-  const [backgroundOpacityError, setBackgroundOpacityError] = useState("")
-  const blurSettings = useBlurSettings(() => initialBlurSettings(window.radarAppearance), async request => {
-    const snapshot = await withSettingsDeadline(window.webkit.messageHandlers.radar.postMessage(request))
-    acceptSnapshot(snapshot)
-    return snapshot
-  }, radius => withSettingsDeadline(window.webkit.messageHandlers.radar.postMessage({ previewWindowBlur: radius })))
-  const [liquiditySettings, setLiquiditySettings] = useState<LiquiditySettings>({ hourlyVolumeStabilityEnabled: false })
-  const [sort, setSort] = useState<SortKey>("opportunity")
-  const [descending, setDescending] = useState(true)
-  const [selected, setSelected] = useState<string | null>(null)
-  useLayoutEffect(() => {
-    document.documentElement.dataset.frostedBackground = String(frostedBackgroundEnabled)
-    document.documentElement.dataset.translucentBackground = String(frostedBackgroundEnabled && frostedBackgroundOpacity < 1)
-    document.documentElement.style.setProperty("--window-background-opacity", String(frostedBackgroundEnabled ? frostedBackgroundOpacity : 1))
-    if (!window.radarAppearance?.nativeWindowBackground) return
-    document.documentElement.dataset.nativeWindowBackground = "true"
-    const updateTint = () => {
-      const canvas = document.createElement("canvas")
-      canvas.width = canvas.height = 1
-      const context = canvas.getContext("2d")!
-      context.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--window-background-tint")
-      context.fillRect(0, 0, 1, 1)
-      const rgb = Array.from(context.getImageData(0, 0, 1, 1).data).slice(0, 3).map(value => value / 255)
-      void window.webkit.messageHandlers.radar.postMessage({ windowTintRGB: rgb }).catch(() => {})
-    }
-    const theme = window.matchMedia("(prefers-color-scheme: dark)")
-    updateTint()
-    theme.addEventListener("change", updateTint)
-    return () => theme.removeEventListener("change", updateTint)
-  }, [frostedBackgroundEnabled, frostedBackgroundOpacity])
-  const acceptSnapshot = (snapshot: Snapshot) => {
-    if (snapshot.timeframe && snapshot.timeframe !== timeframeRef.current) return false
-    if (!snapshotOrder.current.accept(snapshot)) return false
-    serviceSession.current = snapshotOrder.current.serviceSession
-    revision.current = snapshotOrder.current.revision
-    setRows(current => reconcileMarketRows(current, snapshot.rows))
-    setFrostedBackgroundEnabled(snapshot.frostedBackgroundEnabled)
-    setFrostedBackgroundOpacity(snapshot.frostedBackgroundOpacity)
-    blurSettings.synchronize(initialBlurSettings(snapshot))
-    setLiquiditySettings({ hourlyVolumeStabilityEnabled: snapshot.hourlyVolumeStabilityEnabled ?? false })
-    if (!backgroundOpacityDraftDirty.current && document.activeElement?.id !== "background-opacity") setBackgroundOpacityDraft(String(snapshot.frostedBackgroundOpacity))
-    setUpdatedAt(snapshot.updatedAt)
-    setError(snapshot.error)
-    setStatus(listCollectorStatus(snapshot))
-    setReady(true)
-    return true
-  }
   useEffect(() => {
     let stopped = false
+    const write = preferenceWrite.current
+    window.radarDesktop.request({ preferences: { action: 'read' } }).then(value => {
+      if (!stopped && write === preferenceWrite.current) { setPreferences(value); setPreferencesError('') }
+    }).catch(cause => { if (!stopped) setPreferencesError(message(cause)) }).finally(() => { if (!stopped) setPreferencesLoaded(true) })
+    return () => { stopped = true }
+  }, [])
+  useEffect(() => {
+    if (!preferencesLoaded) return
+    let stopped = false
+    let timer: number
     let backoff = 2000
     const load = async () => {
-      await pageVisible(); if (stopped) return
+      await pageVisible()
+      if (stopped) return
       try {
-        const snapshot = await window.webkit.messageHandlers.radar.postMessage({ rocPeriod: ROC_PERIOD, marocPeriod: MAROC_PERIOD, timeframe, sinceRevision: revision.current, serviceSession: serviceSession.current })
+        const snapshot = await window.radarDesktop.request({ snapshot: { timeframe, sinceRevision: revision.current, serviceSession: order.current.serviceSession } })
         if (stopped) return
-        if ("unchanged" in snapshot) {
-          if (snapshotOrder.current.isCurrent(snapshot)) setError(snapshot.error)
-          backoff = 2000
-        } else {
-          acceptSnapshot(snapshot)
-          backoff = 2000 // Reset to fast polling on changes
+        if ((!snapshot.timeframe || snapshot.timeframe === timeframe) && order.current.accept(snapshot)) {
+          revision.current = order.current.revision
+          if (!('unchanged' in snapshot)) {
+            setRows(current => reconcileMarketRows(current, snapshot.rows) as RankedMarketRow[])
+            setSelected(current => snapshot.rows.some(row => row.instId === current) ? current : snapshot.rows.reduce<RankedMarketRow | null>((first, row) => !first || compareRankingChange(row, first) < 0 ? row : first, null)?.instId ?? null)
+            setReady(true)
+          }
+          setError(snapshot.error)
+          if (!('unchanged' in snapshot) || snapshot.catalogSource !== undefined || snapshot.listProgress !== undefined || snapshot.loading !== undefined) setStatus(collectorStatus(snapshot))
+          if (snapshot.updatedAt !== undefined) setUpdatedAt(snapshot.updatedAt)
+          if (snapshot.realtimeState) setRealtime(snapshot.realtimeState)
         }
+        backoff = 2000
       } catch (cause) {
         if (stopped) return
-        setError(cause instanceof Error ? cause.message : "Cannot connect to the native collector")
-        setStatus("Reconnecting")
-        backoff = Math.min(backoff * 2, 30000) // Slower retry on errors
+        setError(message(cause)); setStatus('Reconnecting'); setRealtime('Disconnected')
+        backoff = Math.min(backoff * 2, 30_000)
       }
       if (!stopped) timer = window.setTimeout(load, backoff)
     }
-    let timer: number
     void load()
-    return () => { stopped = true; window.clearTimeout(timer) }
-  }, [timeframe])
-  const visible = useMemo(() => rows.filter(row => row.instId.toLowerCase().includes(query.trim().toLowerCase())).sort((a, b) => compareMarketRows(a, b, sort, descending)), [rows, query, sort, descending])
-  const listOrder = useMemo(() => visible.map(row => row.instId), [visible])
-  const turnoverOrder = useMemo(() => [...rows].sort(compareMarketTurnover).map(row => row.instId), [rows])
-  const chartCandidates = useMemo(() => [...new Set([...listOrder, ...turnoverOrder])], [listOrder, turnoverOrder])
-  useEffect(() => {
-    chartController.setUniverse(ready ? chartCandidates : [], timeframe)
-  }, [ready, chartCandidates, timeframe])
-  const changeSort = (key: SortKey) => {
-    if (sort === key) setDescending(!descending)
-    else { setSort(key); setDescending(defaultSortDescending(key)) }
-  }
+    return () => { stopped = true; clearTimeout(timer) }
+  }, [preferencesLoaded, timeframe, refresh])
 
-  const saveSetting = (request: SettingRequest) => {
-    void window.webkit.messageHandlers.radar.postMessage(request)
-      .then(acceptSnapshot)
-      .catch(cause => setError(cause instanceof Error ? cause.message : "Cannot save setting"))
-  }
+  const ranked = useMemo(() => [...rows].sort(compareRankingChange), [rows])
+  const visible = useMemo(() => ranked.filter(row => row.instId.toLowerCase().includes(query.trim().toLowerCase())), [ranked, query])
+  // Search changes the list without hiding the selected market. Qualification
+  // changes immediately choose the next qualified contract, or the empty state.
+  const selectedRow = rows.find(row => row.instId === selected) ?? ranked[0]
+  const selectedID = selectedRow?.instId ?? null
+  const listOrder = useMemo(() => ranked.map(row => row.instId), [ranked])
+  const turnoverOrder = useMemo(() => [...rows].sort((a, b) => (b.turnover24hUSDT ?? -1) - (a.turnover24hUSDT ?? -1) || a.instId.localeCompare(b.instId, 'en')).map(row => row.instId), [rows])
+  useEffect(() => { chartController.setUniverse(ready ? listOrder : [], timeframe) }, [ready, listOrder, timeframe])
+  const savePreferences = useCallback(async (values: Partial<Preferences>) => {
+    const write = ++preferenceWrite.current
+    let saved: Preferences
+    try { saved = await window.radarDesktop.request({ preferences: { action: 'update', values } }) }
+    catch (cause) { if (write !== preferenceWrite.current) return; throw cause }
+    if (write !== preferenceWrite.current) return
+    revision.current = -1
+    setPreferences(saved); setPreferencesError(''); setStatus('Refreshing'); setRefresh(current => current + 1)
+    if (values.liquidity || values.rankingLookback !== undefined) { setRows([]); setReady(false) }
+  }, [])
+  const changeTimeframe = useCallback((chartTimeframe: RadarTimeframe) => {
+    void savePreferences({ chartTimeframe }).catch(cause => setPreferencesError(message(cause)))
+  }, [savePreferences])
 
-  const saveBackgroundOpacity = () => {
-    const value = Number(backgroundOpacityDraft)
-    if (!backgroundOpacityDraft.trim() || !Number.isFinite(value) || value < 0 || value > 1) {
-      setBackgroundOpacityError("Enter a number from 0 to 1.")
-      return
-    }
-    backgroundOpacityDraftDirty.current = false
-    setBackgroundOpacityError("")
-    setBackgroundOpacityDraft(String(value))
-    if (value !== frostedBackgroundOpacity) saveSetting({ frostedBackgroundOpacity: value })
-  }
-  const header = (label: string, key: SortKey, content: ReactNode = label, description?: string) => {
-    const SortIcon = sort !== key ? ArrowDownUp : descending ? ArrowDown : ArrowUp
-    return <Button variant="ghost" size="xs" className={cn("h-auto min-h-(--control-height-xs) gap-1", key === "turnover24hUSDT" && "border-l-0 pl-0")} onClick={() => changeSort(key)} aria-label={`Sort by ${label}`} aria-pressed={sort === key} title={description}>
-      {content}<SortIcon data-icon="inline-end" aria-hidden="true" />
-    </Button>
-  }
-
-  if (selected) return <MarketChart instId={selected} timeframe={timeframe} onTimeframeChange={setTimeframe} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} backLabel="Markets" onBack={() => setSelected(null)} />
-
-  if (!ready) {
-    return (
-      <MarketListViewport>
-        <main className="flex min-h-[inherit] flex-col items-center justify-center">
-          <div className="flex flex-col items-center gap-4">
-            <p className="text-lg font-medium">{error || status}</p>
-            {error && <p className="text-sm text-muted-foreground">The desktop data service will retry automatically.</p>}
-          </div>
-        </main>
-      </MarketListViewport>
-    )
-  }
-
-  return (
-    <MarketListViewport>
-    <main className="flex min-h-[inherit] flex-col">
-      <header className="flex items-center gap-3 border-b px-4 py-3 whitespace-nowrap">
-        <h1 className="font-semibold">Perpetual Swap Radar</h1>
-        <span className="text-xs tabular-nums text-muted-foreground">{visible.length} / {rows.length} markets</span>
-        <Popover onOpenChange={open => { if (!open) { if (backgroundOpacityDraftDirty.current) saveBackgroundOpacity(); blurSettings.commitAll() } }}>
-          <PopoverTrigger asChild><Button variant="outline"><Settings2 data-icon="inline-start" aria-hidden="true" />Settings</Button></PopoverTrigger>
-          <PopoverContent align="end">
-            <PopoverHeader><PopoverTitle>Settings</PopoverTitle><PopoverDescription>Customize liquidity screening, chart analysis and the window background.</PopoverDescription></PopoverHeader>
-            <FieldGroup>
-              <Field><FieldLabel>AI analysis</FieldLabel><AnalysisSettingsButton /><FieldDescription>Configure the Gateway API Key and chart analysis model.</FieldDescription></Field>
-              <Field><FieldLabel>Liquidity screening</FieldLabel>
-                <Field orientation="horizontal"><FieldLabel htmlFor="hourly-volume-stability">Require stable hourly volume</FieldLabel><Toggle id="hourly-volume-stability" variant="outline" pressed={liquiditySettings.hourlyVolumeStabilityEnabled} onPressedChange={enabled => saveSetting({ hourlyVolumeStabilityEnabled: enabled })}>{liquiditySettings.hourlyVolumeStabilityEnabled ? 'On' : 'Off'}</Toggle></Field>
-                <FieldDescription>When on, contracts need a 24-hour 1h volume max/min ratio below 2. Turn it off to screen on the remaining liquidity requirements.</FieldDescription>
-              </Field>
-              <Field orientation="horizontal">
-                <FieldLabel htmlFor="frosted-background">Frosted background</FieldLabel>
-                <Toggle id="frosted-background" variant="outline" pressed={frostedBackgroundEnabled} onPressedChange={enabled => saveSetting({ frostedBackgroundEnabled: enabled })} aria-label="Enable frosted background">{frostedBackgroundEnabled ? "On" : "Off"}</Toggle>
-              </Field>
-              <Field data-invalid={Boolean(backgroundOpacityError)} data-disabled={!frostedBackgroundEnabled}>
-                <FieldLabel htmlFor="background-opacity">Background opacity</FieldLabel>
-                <Input id="background-opacity" name="frostedBackgroundOpacity" type="number" min="0" max="1" step="0.05" inputMode="decimal" autoComplete="off" disabled={!frostedBackgroundEnabled} aria-describedby={backgroundOpacityError ? "background-opacity-description background-opacity-error" : "background-opacity-description"} aria-invalid={Boolean(backgroundOpacityError)} value={backgroundOpacityDraft} onChange={event => { backgroundOpacityDraftDirty.current = true; setBackgroundOpacityDraft(event.target.value); setBackgroundOpacityError("") }} onBlur={saveBackgroundOpacity} onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur() }} />
-                <FieldDescription id="background-opacity-description">0 reveals more of the blurred desktop; 1 is solid. Text and charts stay opaque.</FieldDescription>
-                {backgroundOpacityError && <FieldError id="background-opacity-error" role="alert">{backgroundOpacityError}</FieldError>}
-              </Field>
-              <BlurControls settings={blurSettings} windowDisabled={!frostedBackgroundEnabled || frostedBackgroundOpacity === 1} />
-            </FieldGroup>
-          </PopoverContent>
-        </Popover>
-        <div className="relative ml-auto w-64 shrink-0">
-          <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
-          <Input aria-label="Search contracts" placeholder="Search contracts" value={query} onChange={event => setQuery(event.target.value)} className="pl-8" />
-        </div>
-        <Badge variant={status === "Live" ? "secondary" : "outline"} aria-live="polite">
-          <Radio aria-hidden="true" />{status}
-        </Badge>
-        <span className="text-xs text-muted-foreground">{updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString("en-US")}` : "Waiting for data"}</span>
+  return <WorkspaceViewport>
+    <aside data-market-list className="flex h-full w-[420px] shrink-0 flex-col border-r" aria-label="Contract list">
+      <header className="flex flex-col gap-4 border-b p-4">
+        <div className="flex items-center justify-between gap-2"><h1 className="text-base font-semibold">Perpetual Swap Suite</h1><WorkspaceSettings preferences={preferences} loadError={preferencesError} onSave={savePreferences} /></div>
+        <Input aria-label="Search contracts" placeholder="Search contracts…" value={query} onChange={event => setQuery(event.target.value)} />
+        <div className="flex items-center justify-between gap-2"><span className="text-xs text-muted-foreground">{visible.length} / {rows.length} contracts</span><Badge variant="outline"><Radio aria-hidden="true" />{status}</Badge></div>
       </header>
-      <div className="flex items-center gap-4 border-b px-4 py-3">
-        <Field orientation="horizontal" className="w-fit"><FieldLabel>Timeframe</FieldLabel><ToggleGroup type="single" variant="outline" value={timeframe} onValueChange={value => { if (value) { revision.current = -1; setRows([]); setStatus('Loading'); setTimeframe(value as RadarTimeframe) } }} aria-label="Radar timeframe">{RADAR_TIMEFRAMES.map(item => <ToggleGroupItem key={item.value} value={item.value}>{item.label}</ToggleGroupItem>)}</ToggleGroup></Field>
-      </div>
-      {error && <p role="alert" className="border-b px-4 py-2 text-sm text-destructive">{error}</p>}
-      <section id="all-markets" aria-label="Perpetual swap markets" className="flex-1 scroll-mt-4">
-        <header className="border-y px-4 py-3"><h2 className="font-semibold">All markets</h2></header>
+      {preferencesError && <p role="alert" className="border-b p-3 text-sm text-destructive">{preferencesError}</p>}
+      {error && <p role="alert" className="border-b p-3 text-sm text-destructive">{error}</p>}
+      <section data-market-scroll className="min-h-0 flex-1 overflow-y-auto [&>[data-slot=table-container]]:overflow-visible" aria-label="Perpetual swap markets">
         <Table className="table-fixed" data-market-count={visible.length} data-total-market-count={rows.length} aria-rowcount={visible.length + 1}>
-          <colgroup>
-            <col className="w-[17%]" />
-            <col className="w-[12%]" />
-            <col className="w-[21%]" />
-            <col className="w-[11%]" />
-            <col className="w-[11%]" />
-            <col className="w-[12%]" />
-            <col className="w-[8%]" />
-            <col className="w-[8%]" />
-          </colgroup>
-          <TableHeader>
-            <TableRow>
-              <TableHead className="py-1.5 pl-[var(--market-table-leading-inset)] text-left" aria-sort={sort === "turnover24hUSDT" ? descending ? "descending" : "ascending" : "none"}>
-                <div className="flex flex-col items-start">
-                  {header("Turnover", "turnover24hUSDT")}
-                </div>
-              </TableHead>
-              <TableHead className="text-center" aria-sort={sort === "opportunity" ? descending ? "descending" : "ascending" : "none"}>{header("Opportunity", "opportunity", undefined, OPPORTUNITY_DESCRIPTION)}</TableHead>
-              <TableHead className="py-1.5 text-center" aria-sort={["highBreakout", "highBreakoutPriorAge", "lowBreakdown", "lowBreakdownPriorAge"].includes(sort) ? descending ? "descending" : "ascending" : "none"}>
-                <div className="mx-auto grid w-max grid-cols-[max-content_max-content] items-center gap-x-3">
-                  {header(`High breakout · 48 × ${timeframeLabel(timeframe)}`, "highBreakout", undefined, BREAK_DESCRIPTION)}
-                  {header("High age", "highBreakoutPriorAge", undefined, "Sort by the previous high's age at the breakout, longest first. Tied highs use the most recent occurrence.")}
-                  {header(`Low breakdown · 48 × ${timeframeLabel(timeframe)}`, "lowBreakdown", undefined, BREAK_DESCRIPTION)}
-                  {header("Low age", "lowBreakdownPriorAge", undefined, "Sort by the previous low's age at the breakdown, longest first. Tied lows use the most recent occurrence.")}
-                </div>
-              </TableHead>
-              <TableHead className="text-center" aria-sort={sort === "takerRatio" ? descending ? "descending" : "ascending" : "none"}>{header("Taker imbalance", "takerRatio", takerImbalanceFormula)}</TableHead>
-              <TableHead className="text-center" aria-sort={sort === "oiChange" ? descending ? "descending" : "ascending" : "none"}>{header("OI Relative Change", "oiChange", undefined, timeframe === '1H' ? `Hourly change in OI contracts, unaffected by price-only changes. ${PERCENT_CHANGE_DESCRIPTION}` : 'OI change is currently available on the 1h timeframe.')}</TableHead>
-              <TableHead className="py-1.5 text-center" aria-sort={sort === "roc" || sort === "maroc" ? descending ? "descending" : "ascending" : "none"}>
-                <div className="flex flex-col items-center">
-                  {header(`ROC ${ROC_PERIOD}`, "roc", indicatorFormula('ROC', ROC_PERIOD), `${ROC_PERIOD}-candle price change on ${timeframeLabel(timeframe)} candles. ${PERCENT_CHANGE_DESCRIPTION}`)}
-                  {header(`MAROC ${MAROC_PERIOD}`, "maroc", indicatorFormula('MAROC', MAROC_PERIOD), `Mean of the latest ${MAROC_PERIOD} ${timeframeLabel(timeframe)} ROC readings, as a percentage.`)}
-                </div>
-              </TableHead>
-              <TableHead className="py-1.5 text-center" aria-sort={sort.startsWith("rsi") ? descending ? "descending" : "ascending" : "none"}>
-                <div className="flex flex-col items-center">
-                  {RSI_PERIODS.map(period => <Fragment key={period}>{header(`RSI ${period}`, `rsi${period}`, indicatorFormula('RSI', period))}</Fragment>)}
-                </div>
-              </TableHead>
-              <TableHead className="py-1.5 text-center" aria-sort={sort.startsWith("boll") ? descending ? "descending" : "ascending" : "none"}>
-                <div className="flex flex-col items-center">
-                  {header("BOLL(20, 2) · Live", "bollAboveBand", undefined, BOLL_DESCRIPTION)}
-                  {header("Bandwidth expansion", "bollExpansion", undefined, BANDWIDTH_EXPANSION_DESCRIPTION)}
-                </div>
-              </TableHead>
-            </TableRow>
-          </TableHeader>
-          {visible.length ? <MarketRows rows={visible} onSelect={setSelected} timeframe={timeframe} /> : <TableBody><TableRow><TableCell colSpan={8} className="py-12">
-              <Empty>
-                <EmptyHeader><EmptyTitle>{rows.length ? "No matching contracts" : "Waiting for contracts"}</EmptyTitle><EmptyDescription>{rows.length ? "Try a different contract name or clear the search." : `OKX 5m source data is loading for the ${timeframeLabel(timeframe)} view.`}</EmptyDescription></EmptyHeader>
-                {query && <EmptyContent><Button variant="ghost" size="sm" onClick={() => setQuery("")}>Clear search</Button></EmptyContent>}
-              </Empty>
-            </TableCell></TableRow></TableBody>}
+          <colgroup><col className="w-[35%]" /><col className="w-[33%]" /><col className="w-[32%]" /></colgroup>
+          <TableHeader className="sticky top-0 bg-background"><TableRow><TableHead>Contract</TableHead><TableHead className="text-right">Price</TableHead><TableHead className="text-right" aria-sort="descending" title="Sorted by absolute signed relative change, largest first">{preferences.rankingLookback}m change</TableHead></TableRow></TableHeader>
+          {visible.length ? <MarketRowsViewport ids={visible.map(row => row.instId)}>{index => <MarketRowView row={visible[index]} index={index} selected={visible[index].instId === selectedID} lookback={preferences.rankingLookback} onSelect={setSelected} />}</MarketRowsViewport> : <TableBody><TableRow><TableCell colSpan={3}>
+            <Empty><EmptyHeader><EmptyTitle>{query ? 'No matching contracts' : ready ? 'No qualified contracts' : 'Loading contracts'}</EmptyTitle><EmptyDescription>{query ? 'Try another contract name.' : ready ? 'Adjust the enabled liquidity conditions in Settings.' : 'The data service is preparing the market list.'}</EmptyDescription></EmptyHeader></Empty>
+          </TableCell></TableRow></TableBody>}
         </Table>
       </section>
-    </main>
-    </MarketListViewport>
-  )
+      <footer className="flex flex-col gap-1 border-t p-4 text-xs text-muted-foreground" aria-live="polite"><span>Realtime: {realtime}</span><span>{updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data'}</span><span>Ranking: completed 5m closes · {preferences.rankingLookback}m lookback</span></footer>
+    </aside>
+    <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
+      {selectedID ? <MarketChart instId={selectedID} timeframe={timeframe} onTimeframeChange={changeTimeframe} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{ready ? 'No qualified contracts' : 'Preparing market workspace'}</EmptyTitle><EmptyDescription>{ready ? 'Enable different liquidity conditions to view a chart.' : 'The chart will open when a qualified contract is available.'}</EmptyDescription></EmptyHeader></Empty></div>}
+    </section>
+  </WorkspaceViewport>
 }
-
 export default App

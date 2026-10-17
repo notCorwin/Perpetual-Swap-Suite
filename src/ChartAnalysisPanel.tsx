@@ -16,7 +16,7 @@ import { ANALYSIS_PROMPTS, type AnalysisSession } from '@/chart-analysis'
 const MessageResponse = lazy(() => import('@/components/ai-elements/message').then(module => ({ default: module.MessageResponse })))
 const captureTime = (value: number) => new Date(value).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
 
-export function ChartAnalysisPanel({ instId, timeframe = '1h', session, ready, onNew, onClose }: { instId: string; timeframe?: string; session: AnalysisSession | null; ready: boolean; onNew: () => void; onClose: () => void }) {
+export function ChartAnalysisPanel({ instId, timeframe = '15m', session, ready, onNew, onClose }: { instId: string; timeframe?: string; session: AnalysisSession | null; ready: boolean; onNew: () => void; onClose: () => void }) {
   const busy = session?.phase === 'capturing' || session?.phase === 'streaming'
   const canRetry = Boolean(session?.turns.at(-1) && ['error', 'stopped'].includes(session.turns.at(-1)!.status))
   const [copyState, setCopyState] = useState<{ id: string; error: string } | null>(null)
@@ -36,7 +36,7 @@ export function ChartAnalysisPanel({ instId, timeframe = '1h', session, ready, o
   }, [instId, session?.phase, session?.error, session?.turns.length])
   const copy = async (id: string, text: string) => {
     try {
-      const result = await window.webkit.messageHandlers.radar.postMessage({ copyText: text })
+      const result = await window.radarDesktop.request({ copyText: text })
       if (!result.ok) throw new Error('Could not copy analysis.')
       setCopyState({ id, error: '' })
     } catch (cause) { setCopyState({ id, error: cause instanceof Error ? cause.message : 'Could not copy analysis.' }) }
@@ -46,7 +46,7 @@ export function ChartAnalysisPanel({ instId, timeframe = '1h', session, ready, o
     if (session.draft.trim()) void chartAnalysis.send(instId, session.draft)
     else if (canRetry) void chartAnalysis.retry(instId)
   }
-  return <aside data-surface="panel" className="flex min-h-0 w-(--analysis-panel-width) shrink-0 flex-col border-l bg-card" aria-label="Chart analysis">
+  return <aside className="flex min-h-0 w-(--analysis-panel-width) shrink-0 flex-col border-l bg-card" aria-label="Chart analysis">
     <div className="flex shrink-0 items-center gap-2 border-b px-4 py-2">
       <h2 className="flex-1 font-semibold">Analysis</h2>
       <Button variant="ghost" size="icon-sm" onClick={onClose} aria-label="Close analysis"><X /></Button>
@@ -65,9 +65,9 @@ export function ChartAnalysisPanel({ instId, timeframe = '1h', session, ready, o
           <MessageScrollerViewport><MessageScrollerContent className="p-3">
             {!session?.turns.length && <Empty><EmptyHeader><EmptyTitle>{session?.phase === 'capturing' ? 'Preparing chart…' : session?.phase === 'stopped' ? 'Analysis stopped' : 'Analyze this chart'}</EmptyTitle><EmptyDescription>{session?.phase === 'capturing' ? 'Capturing the visible chart for the model.' : 'Start an analysis, then ask follow-up questions about the same snapshot.'}</EmptyDescription></EmptyHeader></Empty>}
             {session?.turns.map(turn => <Fragment key={turn.id}>
-              <MessageScrollerItem messageId={`${turn.id}-user`} scrollAnchor><Message align="end"><MessageContent><Bubble variant="secondary" align="end"><BubbleContent><p lang="zh-CN" className="whitespace-pre-wrap select-text">{turn.question}</p></BubbleContent></Bubble></MessageContent></Message></MessageScrollerItem>
+              <MessageScrollerItem messageId={`${turn.id}-user`} scrollAnchor><Message align="end"><MessageContent><Bubble variant="secondary" align="end"><BubbleContent><p lang="en" className="whitespace-pre-wrap select-text">{turn.question}</p></BubbleContent></Bubble></MessageContent></Message></MessageScrollerItem>
               <MessageScrollerItem messageId={`${turn.id}-assistant`}><Message><MessageContent>
-                {turn.text && <div data-analysis-answer lang="zh-CN"><Suspense fallback={<p className="whitespace-pre-wrap">{turn.text}</p>}><MessageResponse isAnimating={turn.status === 'streaming'} controls={false}>{turn.text}</MessageResponse></Suspense></div>}
+                {turn.text && <div data-analysis-answer lang="en"><Suspense fallback={<p className="whitespace-pre-wrap">{turn.text}</p>}><MessageResponse isAnimating={turn.status === 'streaming'} controls={false}>{turn.text}</MessageResponse></Suspense></div>}
                 {turn.status === 'streaming' && <p role="status" className="flex items-center gap-2 text-xs text-muted-foreground"><Spinner />{turn.text ? 'Generating…' : 'Analyzing chart…'}</p>}
                 <MessageFooter>{turn.status !== 'complete' && turn.status !== 'streaming' && <Badge variant="outline">{turn.status === 'stopped' ? 'Stopped' : 'Failed'}</Badge>}{turn.text && <Button variant="ghost" size="xs" aria-label="Copy analysis" onClick={() => void copy(turn.id, turn.text)}><Copy data-icon="inline-start" />{copyState?.id === turn.id && !copyState.error ? 'Copied' : 'Copy'}</Button>}</MessageFooter>
               </MessageContent></Message></MessageScrollerItem>
@@ -79,7 +79,7 @@ export function ChartAnalysisPanel({ instId, timeframe = '1h', session, ready, o
     </div>
     <form className="shrink-0 border-t p-3" onSubmit={event => { event.preventDefault(); send() }}>
       <InputGroup>
-        <InputGroupTextarea aria-label="Ask a follow-up" placeholder={canRetry ? 'Retry the stopped response or ask something new…' : 'Ask about this snapshot…'} value={session?.draft ?? ''} disabled={!session?.image || busy} onChange={event => chartAnalysis.draft(instId, event.target.value)} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} onKeyDown={event => {
+        <InputGroupTextarea name="analysis-question" aria-label="Ask a follow-up" placeholder={canRetry ? 'Retry the stopped response or ask something new…' : 'Ask about this snapshot…'} value={session?.draft ?? ''} disabled={!session?.image || busy} onChange={event => chartAnalysis.draft(instId, event.target.value)} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} onKeyDown={event => {
           if (event.key === 'Enter' && !event.shiftKey && !composing && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) { event.preventDefault(); send() }
         }} />
         <InputGroupAddon align="block-end"><span className="flex-1 text-xs text-muted-foreground">Shift+Enter for a new line</span><InputGroupButton type="submit" variant="outline" aria-label="Send follow-up" disabled={busy || !session?.image || (!session.draft.trim() && !canRetry)}><Send /></InputGroupButton></InputGroupAddon>

@@ -262,7 +262,7 @@ export class ChartController {
 }
 
 export const chartController = new ChartController({
-  prepare: target => window.webkit.messageHandlers.radar.postMessage({ chartWindow: { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } }),
-  local: (instId, timeframe) => window.webkit.messageHandlers.radar.postMessage({ chartLocal: { instId, timeframe } }),
-  universe: (instIds, timeframe, focusInstId) => window.webkit.messageHandlers.radar.postMessage({ chartUniverse: { instIds, timeframe, focusInstId } }),
+  prepare: target => window.radarDesktop.request({ chartWindow: { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } }),
+  local: (instId, timeframe) => window.radarDesktop.request({ chartLocal: { instId, timeframe } }),
+  universe: (instIds, timeframe, focusInstId) => window.radarDesktop.request({ chartUniverse: { instIds, timeframe, focusInstId } }),
 })

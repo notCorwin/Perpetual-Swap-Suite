@@ -3,7 +3,7 @@ import { streamText } from 'ai'
 import { ChartAnalysisStore, type AnalysisSettingsRequest, type AnalysisRunner } from './chart-analysis.ts'
 import { createGatewayFetch } from './gateway-fetch.ts'
 
-export const requestAnalysisSettings = (request: AnalysisSettingsRequest) => window.webkit.messageHandlers.radar.postMessage({ analysisSettings: request })
+export const requestAnalysisSettings = (request: AnalysisSettingsRequest) => window.radarDesktop.request({ analysisSettings: request })
 
 export function createAnalysisRunner(nativeFetch: typeof fetch): AnalysisRunner {
   const provider = createOpenAICompatible({ name: 'openai', baseURL: 'https://ai-gateway.vercel.sh/v1', fetch: nativeFetch })
@@ -23,4 +23,4 @@ export function createAnalysisRunner(nativeFetch: typeof fetch): AnalysisRunner 
   }
 }
 
-export const chartAnalysis = new ChartAnalysisStore(createAnalysisRunner((input, init) => createGatewayFetch(window.webkit.messageHandlers.radar, window)(input, init)), () => requestAnalysisSettings({ action: 'read' }))
+export const chartAnalysis = new ChartAnalysisStore(createAnalysisRunner((input, init) => createGatewayFetch(window.radarDesktop, window)(input, init)), () => requestAnalysisSettings({ action: 'read' }))

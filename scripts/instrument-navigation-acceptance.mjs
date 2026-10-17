@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { assertWorkspaceLayout, selectTimeframe } from './chart-acceptance.mjs'
 
 export async function installNavigationProbe(electron, page, fixture) {
   const observePrepared = () => {
@@ -103,13 +104,11 @@ export async function startNavigationPaintProbe(page, fixture) {
     const fail = message => { if (probe.violations.length < 20) probe.violations.push(message) }
     const sample = (presentedFrame = false) => {
       const chart = document.querySelector('[data-chart-inst]')
-      if (!chart) return // The user may return to the market list between clicks.
+      if (!chart) { if (probe.presentedSurface) fail('Navigation removed the embedded chart.'); return }
       const svg = chart.querySelector('svg[data-rendered-inst]')
       const snapshot = chart.__chartSnapshot
-      // Mounting from the market list is measured separately from the actual
-      // input to its first complete SVG (at most one animation frame). An
-      // early rAF callback can run before React's mount callback in that same
-      // frame; only a previously presented surface can disappear here.
+      // Preserve a complete prior frame while the next contract is preparing.
+      // Initial mounting may precede the first complete SVG in the same frame.
       if (!svg || !snapshot) { if (presentedFrame && chart === probe.presentedSurface) fail('Navigation removed the previously complete chart.'); return }
       probe.presentedSurface = chart
       if (svg.dataset.renderedInst !== snapshot.instId || svg.dataset.renderedTimeframe !== snapshot.timeframe) fail('The actual SVG combines different identities.')
@@ -231,15 +230,12 @@ export async function exerciseInstrumentNavigation(electron, page, fixture) {
     return { ...result, selectionIPC: after - before }
   }
   for (const timeframe of [fixture.timeframe, ...fixture.timeframes.filter(frame => frame !== fixture.timeframe)]) {
-    if (await page.locator('svg[data-rendered-inst]').count()) await page.getByRole('button', { name: 'Markets', exact: true }).click()
-    await page.locator('[aria-label="Radar timeframe"] button').filter({ hasText: new RegExp(`^${timeframe}$`, 'i') }).click()
-    // Opportunity scores can legitimately reorder while native list readings
-    // warm up. Use the fixture's fixed turnover ranking for the exact full-lap
-    // cache residency check, through the same sort control a user selects.
-    const turnoverSort = page.getByRole('button', { name: 'Sort by Turnover', exact: true })
-    if (await turnoverSort.getAttribute('aria-pressed') !== 'true') await turnoverSort.click()
+    await page.locator('[data-market-list] [aria-label^="View "]').first().waitFor({ state: 'visible' })
+    await selectTimeframe(page, timeframe)
+    await assertWorkspaceLayout(page)
     const prewarm = await waitForUniverseReady(electron, page, fixture, timeframe)
-    const first = await firstVisibleMarket(page)
+    const currentlySelected = await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-inst')
+    const first = await firstVisibleMarket(page, [currentlySelected])
     const holdThisPhase = heldHistory === null
     let heldStartedAt = null
     if (holdThisPhase) await holdInstrumentHistory(electron, first.instId)
@@ -257,7 +253,7 @@ export async function exerciseInstrumentNavigation(electron, page, fixture) {
         await new Promise(resolve => setTimeout(resolve, 10))
       }
     }
-    await page.getByRole('button', { name: 'Markets', exact: true }).click()
+    await assertWorkspaceLayout(page)
     const second = await firstVisibleMarket(page, [first.instId])
     const mouseSwitch = await nextFrame(() => second.locator.click(), { expectedInstId: second.instId, sourceInstId: first.instId, timeframe })
     await page.locator('svg[data-rendered-inst]').focus()
