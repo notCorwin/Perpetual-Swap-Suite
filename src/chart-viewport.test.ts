@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chartHistoryNeedsLoad, chartIndicatorsNeedLoad, chartScrollFloor, chartStatisticsRequestable, chartStatsNeedLoad, chartViewportRuns, completeIndicatorSeries, hasCompleteChartWindow, livePriceTag, renderableChartEnd, renderableChartEndFromRuns, scrollChartEnd, visibleChartBars } from "./chart-viewport.ts"
+import { chartHistoryNeedsLoad, chartIndicatorsNeedLoad, chartScrollFloor, chartStatisticsRequestable, chartStatisticsSnapshotNeeded, chartStatsNeedLoad, chartViewportRuns, completeIndicatorSeries, hasCompleteChartWindow, livePriceTag, renderableChartEnd, renderableChartEndFromRuns, scrollChartEnd, visibleChartBars } from "./chart-viewport.ts"
 
 const hour = 3_600_000
 test("live price and countdown do not change when the chart scrolls into history", () => {
@@ -115,4 +115,19 @@ test("a complete visible window requests OI/Taker while an unrelated indicator w
 
   assert.equal(chartStatisticsRequestable(missingOI, 95 * hour, 95 * hour), true)
   assert.equal(chartStatisticsRequestable(missingOI, 95 * hour, 94 * hour), false, "Never request statistics for a fallback viewport")
+})
+
+test("a completed source materializes its visible observations independently of the pending sibling", () => {
+  const pending = Array.from({ length: 200 }, (_, index) => ({ hour: index * hour, oi: null as number | null, buy: null as number | null, sell: null as number | null, statisticsSources: 0 }))
+  const status = { oiState: 'ready', takerState: 'loading' }
+  assert.equal(chartStatisticsSnapshotNeeded(pending, 199 * hour, status), true)
+  const oiOnly = pending.map(bar => ({ ...bar, oi: 10, statisticsSources: 1 }))
+  assert.equal(chartStatisticsSnapshotNeeded(oiOnly, 199 * hour, status), false, "A held Taker request must not repeatedly materialize an already rendered OI source")
+  assert.equal(chartStatisticsSnapshotNeeded(oiOnly, 199 * hour, { ...status, takerState: 'ready' }), true)
+  assert.equal(chartStatisticsSnapshotNeeded(oiOnly, 199 * hour, { ...status, takerState: 'unavailable' }), true, "Terminal null observations must also reach the visible series")
+  const observedNulls = pending.map(bar => ({ ...bar, statisticsSources: 3 }))
+  assert.equal(chartStatisticsSnapshotNeeded(observedNulls, 199 * hour, { oiState: 'unavailable', takerState: 'unavailable' }), false)
+  assert.equal(chartStatisticsSnapshotNeeded(observedNulls, 199 * hour, { oiState: 'ready', takerState: 'unavailable' }), true, "A revalidated source must replace its earlier terminal nulls")
+  const distantPreview = pending.map(bar => bar.hour < 96 * hour ? { ...bar, statisticsSources: 3 } : bar)
+  assert.equal(chartStatisticsSnapshotNeeded(distantPreview, 199 * hour, status), true, "A materialized distant range cannot settle the active viewport")
 })

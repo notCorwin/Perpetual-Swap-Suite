@@ -14,7 +14,7 @@ import { chartCaptureBounds } from '@/chart-capture'
 import { chartRequestKey, isCurrentChartViewportGeneration, retainViewportTimers } from '@/chart-request-key'
 import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicY } from "@/chart-axis"
 import { chartCandleWidth, chartHourX, chartLayout, fitAxisPriceTag, type ChartPanel as Panel } from "@/chart-layout"
-import { chartHistoryNeedsLoad, chartIndicatorsNeedLoad, chartScrollFloor, chartStatisticsRequestable, chartStatsNeedLoad, chartViewportRuns, hasCompleteChartWindow, livePriceTag, renderableChartEndFromRuns, scrollChartEnd, visibleChartBars } from "@/chart-viewport"
+import { chartHistoryNeedsLoad, chartIndicatorsNeedLoad, chartScrollFloor, chartStatisticsRequestable, chartStatisticsSnapshotNeeded, chartStatsNeedLoad, chartViewportRuns, hasCompleteChartWindow, livePriceTag, renderableChartEndFromRuns, scrollChartEnd, visibleChartBars } from "@/chart-viewport"
 import { cn, pageVisible } from "@/lib/utils"
 import { chartNavigationTarget, wrappedMarket } from "@/market-sort"
 import { finitePercentage, formatPercent, type PercentageValue } from "@/market-percent"
@@ -654,9 +654,10 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
       const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken, chartEndHour: historicalEnd })
       historyRequests.current.set(requestKey, request)
       void request.then(result => {
-        if ("unchanged" in result || !currentViewport()) return
+        if (!currentViewport()) return
+        if ("unchanged" in result) { retryAutomatically(STATISTICS_PROGRESS_POLL_MS); return }
         const stored = rememberVisibleChart(result)
-        if (!stored.accepted) return
+        if (!stored.accepted) { retryAutomatically(STATISTICS_PROGRESS_POLL_MS); return }
         if (result.candleState === 'exhausted' || result.historyExhausted) {
           historyExhaustedViewports.current.add(requestKey)
           if (historyExhaustedViewports.current.size > 64) historyExhaustedViewports.current.delete(historyExhaustedViewports.current.values().next().value!)
@@ -753,11 +754,17 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
       await pageVisible(); if (stopped) return
       try {
         const current = chartSeries.get(cacheKey)
-        const result = await window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken, sinceRevision: current?.revision ?? -1, serviceSession: current?.serviceSession })
+        const result = await window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken, sinceRevision: current?.barsRevision ?? -1, serviceSession: current?.serviceSession })
         if (stopped) return
-        const status = "unchanged" in result ? chartResponse(chartSeries.get(cacheKey)) : result
+        let status = "unchanged" in result ? chartResponse(chartSeries.get(cacheKey)) : result
         if (!("unchanged" in result)) {
-          rememberVisibleChart(result, lastLoad)
+          const stored = rememberVisibleChart(result, lastLoad)
+          if (stored.accepted && result.bars.length === 0 && result.statisticsEnd !== undefined
+            && (result.revision !== current?.barsRevision || chartStatisticsSnapshotNeeded(chartSeries.get(cacheKey)?.bars ?? [], result.statisticsEnd, result, intervalMS))) {
+            const full = await window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken })
+            if (stopped) return
+            if (!("unchanged" in full) && rememberVisibleChart(full, lastLoad).accepted) status = full
+          }
         }
         showError([...new Set([hydrationError, result.error].filter(Boolean))].join(' '))
         // While a foreground repair or direct-statistics request is active,
@@ -775,7 +782,7 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     loadTimer = window.setTimeout(hydrate, hydrationError ? 0 : Math.max(0, 60_000 - (Date.now() - lastLoad)))
     void refresh()
     return () => { stopped = true; window.clearTimeout(timer); window.clearTimeout(loadTimer) }
-  }, [instId, cacheKey, timeframe, rememberVisibleChart, focusSession, focusToken, historicalEnd])
+  }, [instId, cacheKey, timeframe, intervalMS, rememberVisibleChart, focusSession, focusToken, historicalEnd])
 
   useEffect(() => {
     for (const id of new Set([beforePrevious, previous, next, afterNext, listOrder[0], turnoverOrder[0]])) {
@@ -863,21 +870,27 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
         chartEndHour: historicalEnd, chartStatusOnly: statusOnly || undefined,
       })
       void request.then(async result => {
-        if ("unchanged" in result || !currentViewport()) return
+        if (!currentViewport()) return
+        // A concurrent prefetch can advance the canonical series before this
+        // reply arrives. Discarding that reply must not discard this poll's
+        // next turn as well: no render follows removal of the in-flight key.
+        if ("unchanged" in result) { retry(STATISTICS_PROGRESS_POLL_MS); return }
         const barsRevisionBefore = chartSeries.get(cacheKey)?.barsRevision
         let observed: ChartResponse = result
-        if (!rememberVisibleChart(observed).accepted) return
+        if (!rememberVisibleChart(observed).accepted) { retry(STATISTICS_PROGRESS_POLL_MS); return }
         // A status-only reply may observe a just-committed source page. Keep
         // the bars on screen immediately, then perform exactly one complete
         // read to merge the new OI/Taker values into the retained series.
-        if (statusOnly && barsRevisionBefore !== undefined && observed.revision !== barsRevisionBefore) {
+        if (statusOnly && (observed.revision !== barsRevisionBefore
+          || chartStatisticsSnapshotNeeded(chartSeries.get(cacheKey)?.bars ?? [], historicalEnd, observed, intervalMS))) {
           const full = await window.webkit.messageHandlers.radar.postMessage({
             chartInstId: instId, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken,
             chartEndHour: historicalEnd,
           })
-          if ("unchanged" in full || !currentViewport()) return
+          if (!currentViewport()) return
+          if ("unchanged" in full) { retry(STATISTICS_PROGRESS_POLL_MS); return }
           observed = full
-          if (!rememberVisibleChart(observed).accepted) return
+          if (!rememberVisibleChart(observed).accepted) { retry(STATISTICS_PROGRESS_POLL_MS); return }
         }
         const sourceLoading = observed.oiState === 'loading' || observed.takerState === 'loading'
         const sourceRetrying = observed.oiState === 'retrying' || observed.takerState === 'retrying'

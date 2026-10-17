@@ -125,6 +125,20 @@ export function chartStatsNeedLoad<T extends { hour: number; confirmed: boolean;
     && (bar.statisticsObserved === false || bar.statisticsObserved === undefined && (bar.oi === null || bar.buy === null || bar.sell === null)))
 }
 
+// A transport revision covers the whole series, while a preview may only
+// contain a distant range. A completed source still needs a materialized
+// read when its observations have not reached this visible window.
+export function chartStatisticsSnapshotNeeded<T extends { hour: number; oi: number | null; buy: number | null; sell: number | null; statisticsObserved?: boolean; statisticsSources?: number }>(bars: T[], endHour: number, status: { oiState?: string; takerState?: string }, intervalMS = hour): boolean {
+  const visible = visibleChartBars(bars, endHour, intervalMS)
+  const observed = (bar: T, source: number) => bar.statisticsObserved === true
+    || (bar.statisticsSources !== undefined ? (bar.statisticsSources & source) !== 0
+      : source === 1 ? bar.oi !== null : bar.buy !== null && bar.sell !== null)
+  return ([['oiState', 1], ['takerState', 2]] as const).some(([key, source]) =>
+    (status[key] === 'ready' || status[key] === 'unavailable')
+      && (visible.length !== 96 || visible.some(bar => !observed(bar, source)
+        || status[key] === 'ready' && (source === 1 ? !Number.isFinite(bar.oi) : !Number.isFinite(bar.buy) || !Number.isFinite(bar.sell)))))
+}
+
 // Source-candle repairs include indicator warm-up history to the left of the
 // visible chart. Statistics are independent direct timeframe values, so a
 // warm-up repair must not hold up OI/Taker once this 96-candle window is whole.

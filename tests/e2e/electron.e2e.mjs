@@ -201,3 +201,176 @@ test('a status-only chart poll retains bars in the renderer while reporting real
   assert.notEqual(status.candleState, 'ready')
   assert.ok(['loading', 'retrying', 'unavailable', 'ready'].includes(status.statisticsState))
 })
+
+test('historical statistics recover when a newer cache preview overtakes their in-flight response', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  const targetEnd = fixture.end - 12 * fixture.intervalMS
+
+  // Reorder real native-chart replies at the IPC boundary. The initial reply
+  // represents candles loaded before statistics arrived; a newer cache-only
+  // preview then overtakes the first historical foreground read. Its older
+  // range cannot hydrate the visible window, so rejecting the foreground
+  // response must leave a retry scheduled even if React already rendered.
+  await electron.evaluate(({ ipcMain }, { instId, targetEnd }) => {
+    const original = ipcMain._invokeHandlers.get('radar:request')
+    const race = {
+      original, historicalRequests: 0, previewDelivered: false, staleDelivered: false,
+      foregroundStarted: null, releaseForeground: null,
+    }
+    const foregroundStarted = new Promise(resolve => { race.foregroundStarted = resolve })
+    const foregroundRelease = new Promise(resolve => { race.releaseForeground = resolve })
+    const pending = (response, revision) => ({
+      ...response, revision,
+      bars: response.bars.map(bar => ({ ...bar, oi: null, buy: null, sell: null, statisticsSources: 0, statisticsObserved: false })),
+      statisticsState: 'loading', oiState: 'loading', takerState: 'loading',
+    })
+    ipcMain.removeHandler('radar:request')
+    ipcMain.handle('radar:request', async (event, value) => {
+      if (value.chartInstId !== instId) return original(event, value)
+      if (value.preview && Number.isFinite(value.chartEndHour)) {
+        await foregroundStarted
+        const response = await original(event, value)
+        race.previewDelivered = true
+        return pending(response, 100_001)
+      }
+      if (!value.preview && value.chartEndHour === targetEnd) {
+        race.historicalRequests += 1
+        const response = await original(event, value)
+        if (race.historicalRequests === 1) {
+          race.foregroundStarted()
+          await foregroundRelease
+          race.staleDelivered = true
+          return pending(response, 100_000)
+        }
+        return { ...response, revision: 100_001 }
+      }
+      const response = await original(event, value)
+      return response.bars ? pending(response, 100_000) : response
+    })
+    globalThis.__chartStatisticsRace = race
+  }, { instId: fixture.instId, targetEnd })
+
+  try {
+    const market = page.locator(`[aria-label="View ${fixture.instId} chart"]`)
+    await market.waitFor({ state: 'visible', timeout: 10_000 })
+    await market.click()
+    const chart = page.locator(`[data-chart-inst="${fixture.instId}"]`)
+    await chart.waitFor({ state: 'visible' })
+    await page.waitForFunction(({ instId, end }) => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+      return chart?.getAttribute('data-chart-end') === String(end)
+        && chart.getAttribute('data-chart-oi-samples') === '0'
+    }, fixture)
+
+    await chart.locator('[data-chart-plot]').dispatchEvent('wheel', { deltaY: 144 })
+    await page.waitForFunction(({ instId, end, intervalMS, targetEnd }) => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+      return chart?.getAttribute('data-chart-end') === String(targetEnd)
+        && Number(chart.getAttribute('data-chart-cache-start')) <= end - 900 * intervalMS
+    }, { ...fixture, targetEnd })
+
+    // The preview has now committed to React while the statistics request is
+    // still in flight. Releasing its obsolete reply reproduces the lost-wake
+    // condition without relying on timing or OKX/network availability.
+    await electron.evaluate(() => globalThis.__chartStatisticsRace.releaseForeground())
+    await page.waitForFunction(({ instId, targetEnd }) => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+      return chart?.getAttribute('data-chart-end') === String(targetEnd)
+        && chart.getAttribute('data-chart-statistics-state') === 'ready'
+        && chart.getAttribute('data-chart-oi-samples') === '96'
+        && chart.getAttribute('data-chart-taker-samples') === '96'
+        && chart.getAttribute('data-chart-loading') === 'false'
+    }, { instId: fixture.instId, targetEnd }, { timeout: 5_000 })
+    const race = await electron.evaluate(() => {
+      const race = globalThis.__chartStatisticsRace
+      return { historicalRequests: race.historicalRequests, previewDelivered: race.previewDelivered, staleDelivered: race.staleDelivered }
+    })
+    assert.equal(race.previewDelivered, true)
+    assert.equal(race.staleDelivered, true)
+    assert.ok(race.historicalRequests >= 2, 'The obsolete reply must trigger another foreground read.')
+    assert.equal(await chart.locator('[data-chart-oi="complete"]').count(), 1)
+    assert.equal(await chart.locator('[data-chart-taker="complete"]').count(), 1)
+  } finally {
+    await electron.evaluate(({ ipcMain }) => {
+      const race = globalThis.__chartStatisticsRace
+      race.releaseForeground()
+      ipcMain.removeHandler('radar:request')
+      ipcMain.handle('radar:request', race.original)
+      delete globalThis.__chartStatisticsRace
+    })
+  }
+})
+
+test('live statistics retry a failed full snapshot after a status-only completion', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await electron.evaluate(({ ipcMain }, { instId }) => {
+    const original = ipcMain._invokeHandlers.get('radar:request')
+    const race = { original, initialPoll: false, statusReplies: 0, fullFailures: 0, recoveredReads: 0 }
+    const pending = response => ({
+      ...response, revision: 200_000,
+      bars: response.bars.map(bar => ({ ...bar, oi: null, buy: null, sell: null, statisticsSources: 0, statisticsObserved: false })),
+      statisticsState: 'loading', oiState: 'loading', takerState: 'loading',
+    })
+    ipcMain.removeHandler('radar:request')
+    ipcMain.handle('radar:request', async (event, value) => {
+      if (value.chartInstId !== instId || value.preview || value.chartEndHour !== undefined) return original(event, value)
+      if (value.loadChart) return pending(await original(event, value))
+      if (value.sinceRevision !== undefined) {
+        const first = !race.initialPoll
+        race.initialPoll = true
+        const response = await original(event, value)
+        if (first) return pending(response)
+        race.statusReplies += 1
+        return {
+          ...response, bars: [], revision: 200_001,
+          statisticsState: 'ready', oiState: 'ready', takerState: 'ready', statusAuthoritative: true,
+        }
+      }
+      // Source completion has reached the status transport, but has not yet
+      // reached the renderer's bars. One transient full-read failure must not
+      // make the next poll claim that those newer bars were materialized.
+      if (race.statusReplies && !race.fullFailures) {
+        race.fullFailures += 1
+        throw new Error('Transient full chart snapshot failure')
+      }
+      const response = await original(event, value)
+      race.recoveredReads += 1
+      return { ...response, revision: 200_001 }
+    })
+    globalThis.__liveChartStatisticsRace = race
+  }, fixture)
+
+  try {
+    const market = page.locator(`[aria-label="View ${fixture.instId} chart"]`)
+    await market.waitFor({ state: 'visible', timeout: 10_000 })
+    await market.click()
+    const chart = page.locator(`[data-chart-inst="${fixture.instId}"]`)
+    await chart.waitFor({ state: 'visible' })
+    await page.waitForFunction(({ instId, end }) => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+      return chart?.getAttribute('data-chart-end') === String(end)
+        && chart.getAttribute('data-chart-statistics-state') === 'ready'
+        && chart.getAttribute('data-chart-oi-samples') === '96'
+        && chart.getAttribute('data-chart-taker-samples') === '96'
+        && chart.getAttribute('data-chart-loading') === 'false'
+    }, fixture, { timeout: 5_000 })
+    const race = await electron.evaluate(() => {
+      const race = globalThis.__liveChartStatisticsRace
+      return { statusReplies: race.statusReplies, fullFailures: race.fullFailures, recoveredReads: race.recoveredReads }
+    })
+    assert.equal(race.fullFailures, 1)
+    assert.ok(race.statusReplies >= 2, 'The renderer must poll again after the failed full read.')
+    assert.ok(race.recoveredReads >= 1, 'A later full read must materialize the completed statistics.')
+    assert.equal(await chart.locator('[data-chart-oi="complete"]').count(), 1)
+    assert.equal(await chart.locator('[data-chart-taker="complete"]').count(), 1)
+  } finally {
+    await electron.evaluate(({ ipcMain }) => {
+      const race = globalThis.__liveChartStatisticsRace
+      ipcMain.removeHandler('radar:request')
+      ipcMain.handle('radar:request', race.original)
+      delete globalThis.__liveChartStatisticsRace
+    })
+  }
+})
