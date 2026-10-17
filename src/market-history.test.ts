@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { MarketHistory } from '../electron/services/market-history.js'
 import { MarketStore } from '../electron/services/market-store.js'
 import { MetadataStore } from '../electron/services/metadata-store.js'
+import { statisticsMask } from '../electron/services/statistics-state.js'
 import type { CandleRecord, CandleQuery, CandleRange } from '../electron/services/market-store.js'
 import type { HistoryTask } from '../electron/services/history-sync.js'
 import type { AuditJob } from '../electron/services/data-audit.js'
@@ -65,17 +66,26 @@ const setup = (options: { store?: MemoryStore | MarketStore; metadata?: MemoryMe
     const through = Number(parameters.end) - step
     return Array.from({ length: Number(parameters.limit) }, (_, index) => path.includes('open-interest')
       ? [String(through - index * step), '50'] : [String(through - index * step), '20', '30'])
+      .filter(row => Number(row[0]) > Number(parameters.begin) && Number(row[0]) < Number(parameters.end))
   }
   const get: Get = (path, parameters, signal, priority) => {
     calls.push({ path, parameters, priority })
     return (options.get ?? source)(path, parameters, signal, priority)
   }
-  const persistStatistics = async (instrument: { instId: string }, timeframe: string, _end: number, bit: number, observations: (number | null)[][], range: CandleRange) => {
+  // Model the production owner's serialized read/merge/write boundary, since
+  // independent source HTTP responses can now reach storage concurrently.
+  let mutation = Promise.resolve<unknown>(undefined)
+  const mutate = (operation: () => Promise<unknown>) => {
+    const task = mutation.then(operation)
+    mutation = task.catch(() => undefined)
+    return task
+  }
+  const persistStatistics = (instrument: { instId: string }, timeframe: string, _end: number, bit: number, observations: (number | null)[][], range: CandleRange) => mutate(async () => {
     const byTimestamp = new Map(observations.map(row => [row[0], row]))
     const rows = await store.candles({ instrument: instrument.instId, timeframe, ...range })
     const patched = rows.map(row => {
-      const value = byTimestamp.get(row.timestamp), prior = row.statisticsVersion === 1 ? 3 : Number(row.statisticsVersion ?? 0) & 3
-      const next: CandleRecord = { ...row, statisticsVersion: 4 | prior | bit }
+      const value = byTimestamp.get(row.timestamp), prior = statisticsMask(row)
+      const next: CandleRecord = { ...row, statisticsVersion: 8 | prior | bit }
       if (bit === 1) { next.oi = value?.[1] ?? null; next.statisticsOIExpiresAt = next.oi === null ? now() + 60_000 : null }
       else {
         const valid = value?.[1] !== null && value?.[2] !== null && Number(value?.[1]) + Number(value?.[2]) > 0
@@ -85,9 +95,12 @@ const setup = (options: { store?: MemoryStore | MarketStore; metadata?: MemoryMe
       return next
     })
     await store.appendCandles(patched)
-  }
+  })
   const history = new MarketHistory({ store, metadata, get, parseCandle, persistStatistics,
-    persistCandles: (_instrument: string, rows: CandleRecord[]) => store.appendCandles(rows),
+    persistCandles: (instrument: string, rows: CandleRecord[]) => mutate(async () => {
+      const prior = new Map((await store.candles({ instrument, timeframe: rows[0].timeframe })).map(row => [row.timestamp, row]))
+      await store.appendCandles(rows.map(row => ({ ...prior.get(row.timestamp), ...row })))
+    }),
     replaceCandles: async (range, rows, priority) => { await store.replaceCandles(range, rows, priority); options.onReplace?.() },
     instrument: () => ({ instId, listTime: options.listing }), onLive: options.onLive, now })
   return { history, store, metadata, calls }
@@ -108,22 +121,31 @@ test('durable price coverage is reused and missing base volume refetches only it
   } finally { await history.close() }
 })
 
-test('statistics use direct contract sources, 100-period cursors, and retain unavailable older observations without HTTP', async () => {
+test('bounded statistics pages query both sources beyond 1440 periods and reuse their durable observations', async () => {
   const now = base + 1_500 * interval, through = now - interval, from = through - 1_499 * interval
   const { history, store, calls } = setup({ now: () => now })
   try {
     await store.appendCandles(Array.from({ length: 1_500 }, (_, index) => candle(from + index * interval)))
     const { rows } = await history.ensureStatistics(instId, '5m', from, through)
     assert.equal(rows.length, 1_500)
-    assert.equal(rows[0].oi, null)
-    assert.equal(rows[0].buy, null)
+    assert.equal(rows[0].oi, 50)
+    assert.equal(rows[0].buy, 30)
     assert.equal(rows.at(-1)!.oi, 50)
     assert.equal(rows.at(-1)!.buy, 30)
     assert.equal(rows.at(-1)!.sell, 20)
     assert.ok(calls.every(call => call.path.includes('/rubik/stat/')))
     assert.ok(calls.every(call => call.parameters.limit === 100))
     assert.ok(calls.filter(call => call.path.includes('taker')).every(call => call.parameters.unit === 1))
-    assert.ok(calls.every(call => Number(call.parameters.end) > through - 1_440 * interval))
+    for (const endpoint of ['open-interest', 'taker']) {
+      const pages = calls.filter(call => call.path.includes(endpoint)).map(call => call.parameters).sort((a, b) => Number(a.begin) - Number(b.begin))
+      assert.equal(pages.length, 15)
+      assert.equal(Number(pages[0].begin), from - interval)
+      assert.equal(Number(pages.at(-1)!.end), through + interval)
+      for (let index = 0; index < pages.length; index += 1) {
+        assert.equal(Number(pages[index].end) - Number(pages[index].begin), 101 * interval)
+        if (index) assert.equal(Number(pages[index].begin), Number(pages[index - 1].end) - interval, 'Exclusive API bounds produce adjacent non-overlapping closed pages.')
+      }
+    }
     const count = calls.length
     await history.ensureStatistics(instId, '5m', from, through)
     assert.equal(calls.length, count)
@@ -150,6 +172,97 @@ test('numeric statistics remain reusable while an empty sibling is retried only 
   } finally { await history.close() }
 })
 
+test('old inferred null leases are probed again without redownloading a genuine numeric sibling', async () => {
+  const now = base + 40 * day
+  const { history, store, calls } = setup({ now: () => now })
+  try {
+    await store.appendCandles([{ ...candle(base), oi: 777, buy: null, sell: null,
+      statisticsVersion: 7, statisticsTakerExpiresAt: now + day }])
+    const { rows } = await history.ensureStatistics(instId, '5m', base, base)
+    assert.deepEqual(calls.map(call => call.path), ['/rubik/stat/taker-volume-contract'])
+    assert.deepEqual([rows[0].oi, rows[0].buy, rows[0].sell], [777, 30, 20])
+  } finally { await history.close() }
+})
+
+test('cold foreground windows request prices, OI and Taker concurrently and merge only after the price page is durable', { timeout: 5_000 }, async () => {
+  let allStarted!: () => void, releasePrices!: () => void, releaseStatistics!: () => void
+  const entered = new Promise<void>(resolve => { allStarted = resolve })
+  const prices = new Promise<void>(resolve => { releasePrices = resolve })
+  const statistics = new Promise<void>(resolve => { releaseStatistics = resolve })
+  const active = new Set<string>()
+  const { history, store } = setup({ get: async (path, parameters) => {
+    active.add(path)
+    if (active.size === 3) allStarted()
+    if (path.includes('/market/')) { await prices; return [values(candle(base))] }
+    await statistics
+    assert.equal(parameters.begin, base - interval)
+    assert.equal(parameters.end, base + interval)
+    return path.includes('open-interest') ? [[String(base), '50']] : [[String(base), '20', '30']]
+  } })
+  let pending: Promise<unknown> | undefined
+  try {
+    pending = history.ensureStatistics(instId, '5m', base, base)
+    await entered
+    assert.equal((await store.candles({ instrument: instId, timeframe: '5m' })).length, 0)
+    releaseStatistics()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal((await store.candles({ instrument: instId, timeframe: '5m' })).length, 0, 'Statistics cannot create placeholder price candles.')
+    releasePrices()
+    await pending
+    const [row] = await store.candles({ instrument: instId, timeframe: '5m' })
+    assert.deepEqual([row.oi, row.buy, row.sell], [50, 30, 20])
+    assert.equal(active.size, 3)
+  } finally { releaseStatistics(); releasePrices(); await Promise.allSettled([pending]); await history.close() }
+})
+
+test('malformed statistics fail their source instead of acquiring a successful unavailable lease', async () => {
+  const { history, store } = setup({ get: async path => path.includes('open-interest')
+    ? [[String(base + 1), '50']] : [[String(base), '20', '30']] })
+  ;(history.sync as any).maxAttempts = 1
+  try {
+    await store.appendCandles([candle(base)])
+    await assert.rejects(history.ensureStatistics(instId, '5m', base, base), /native period grid/)
+    await history.sync.whenIdle()
+    const [row] = await store.candles({ instrument: instId, timeframe: '5m' })
+    assert.equal(statisticsMask(row) & 1, 0)
+    assert.equal(row.statisticsOIExpiresAt ?? null, null)
+    assert.equal(row.buy, 30)
+  } finally { await history.close() }
+})
+
+test('background statistics persist recent pages while older price history is still blocked', { timeout: 7_000 }, async () => {
+  const from = base, through = base + 1_199 * interval
+  let releaseOldest!: () => void, statsReady!: () => void
+  const oldest = new Promise<void>(resolve => { releaseOldest = resolve })
+  const observed = new Promise<void>(resolve => { statsReady = resolve })
+  const store = new MemoryStore(), append = store.appendCandles.bind(store)
+  store.appendCandles = async rows => {
+    const written = await append(rows)
+    if (rows.some(row => row.timestamp === through && row.oi === 50 && row.buy === 30)) statsReady()
+    return written
+  }
+  const { history } = setup({ store, now: () => through + interval, get: async (path, parameters) => {
+    if (path.includes('/market/')) {
+      if (Number(parameters.after) <= from + 300 * interval) await oldest
+      return Array.from({ length: Number(parameters.limit) }, (_, index) => values(candle(Number(parameters.after) - (index + 1) * interval)))
+    }
+    const end = Number(parameters.end), begin = Number(parameters.begin)
+    return Array.from({ length: 100 }, (_, index) => path.includes('open-interest')
+      ? [String(end - (index + 1) * interval), '50'] : [String(end - (index + 1) * interval), '20', '30'])
+      .filter(row => Number(row[0]) > begin)
+  } })
+  let pending: Promise<unknown> | undefined
+  try {
+    pending = history.ensureStatistics(instId, '5m', from, through, 'background')
+    await observed
+    const task = history.sync.listTasks().find(task => task.source === 'candles' && task.from === from && task.through === through)!
+    assert.notEqual(task.status, 'completed', 'An observed statistics page cannot wait for the containing multi-day price task.')
+    assert.equal((await store.candles({ instrument: instId, timeframe: '5m', from, through: from })).length, 0)
+    releaseOldest()
+    await pending
+  } finally { releaseOldest(); await Promise.allSettled([pending]); await history.close() }
+})
+
 test('REST initialization admits two explicit observations and leaves gap coverage to exact source tasks', async () => {
   const live: CandleRecord[] = []
   const now = base + 4 * interval
@@ -173,16 +286,19 @@ test('REST initialization admits two explicit observations and leaves gap covera
   } finally { await history.close() }
 })
 
-test('background targets include all timeframes plus 200 warmup bars and return before source completion', async () => {
+test('background targets immediately admit every source and start three HTTP lanes before price history finishes', { timeout: 5_000 }, async () => {
   let started!: () => void
   const entered = new Promise<void>(resolve => { started = resolve })
-  const { history } = setup({ now: () => base + 40 * day, get: async (_path, _parameters, signal) => {
-    started()
+  const active = new Set<string>()
+  const { history } = setup({ now: () => base + 40 * day, get: async (path, _parameters, signal) => {
+    active.add(path)
+    if (active.size === 3) started()
     return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
   } })
   try {
     const targets = await history.target(instId, { historyDays: 30, asOf: base + 40 * day })
-    assert.equal(targets.length, 3)
+    assert.equal(targets.length, 9)
+    assert.deepEqual(new Set(targets.map(target => target.history.source)), new Set(['candles', 'oi', 'taker']))
     for (const { history: task, warmup } of targets) {
       assert.ok(warmup)
       const step = intervals[task.timeframe]
@@ -191,6 +307,8 @@ test('background targets include all timeframes plus 200 warmup bars and return 
       assert.equal(warmup.through, task.from - step)
     }
     await entered
+    assert.equal(active.size, 3)
+    assert.equal(history.sync.listTasks().filter(task => task.status === 'completed').length, 0)
   } finally { await history.close() }
 })
 

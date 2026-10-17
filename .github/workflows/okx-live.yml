@@ -67,6 +67,9 @@ jobs:
           set +e
           node scripts/okx-live-1h.mjs 2>&1 | tee artifacts/okx-integration.log
           status="${PIPESTATUS[0]}"
+          node scripts/okx-live-statistics.mjs --report artifacts/okx-statistics.json 2>&1 | tee artifacts/okx-statistics.log
+          statistics_status="${PIPESTATUS[0]}"
+          if [ "$statistics_status" -ne 0 ]; then status="$statistics_status"; fi
           set -e
           echo "exit-code=$status" >> "$GITHUB_OUTPUT"
       - name: Classify live result
@@ -86,7 +89,7 @@ jobs:
             `Live OKX result: **${classification}**. Revision: \`${process.env.GITHUB_SHA}\`.\n\n` +
             (passed ? 'Live behavior checks passed.\n' : externalFailures.length
               ? 'Public endpoint probes failed. See okx-endpoints.json for HTTP/API status, network error, and response body.\n'
-              : 'Public endpoints responded at probe time. Inspect okx-integration.log for the failing assertion and observed request statuses.\n'))
+              : 'Public endpoints responded at probe time. Inspect okx-integration.log and okx-statistics.log for failing assertions and observed request statuses.\n'))
           console.log(JSON.stringify(result, null, 2))
           if (!passed) process.exitCode = 1
           NODE

@@ -141,7 +141,7 @@ test('transport failures leave statistics unknown; successful empty observations
   const f = await fixture()
   f.pipeline.history = { ...cachedHistory(), async ensureStatistics(_id: string, _tf: string, from: number, through: number) {
     if (fail) throw new Error('503')
-    await f.store.appendCandles(source.filter(row => row.timestamp >= from && row.timestamp <= through).map(row => ({ ...row, statisticsVersion: 7, statisticsOIExpiresAt: Date.now() + 60_000, statisticsTakerExpiresAt: Date.now() + 60_000 })))
+    await f.store.appendCandles(source.filter(row => row.timestamp >= from && row.timestamp <= through).map(row => ({ ...row, statisticsVersion: 11, statisticsOIExpiresAt: Date.now() + 60_000, statisticsTakerExpiresAt: Date.now() + 60_000 })))
   } }
   try {
     await f.store.appendCandles(source)
@@ -336,7 +336,7 @@ test('partial tails retain the complete latest pointer until both statistics sou
 test('expired null leases retain an in-memory close without renewing the durable lease until source refresh', async () => {
   const f = await fixture(), originalNow = Date.now; let now = originalNow()
   const first = Math.floor(now / hour) * hour - 400 * hour, expiresAt = now + 60_000
-  const source = Array.from({ length: 400 }, (_, index) => ({ ...candle(first + index * hour, index), ...(index === 399 ? { oi: null, buy: null, sell: null, statisticsVersion: 7, statisticsOIExpiresAt: expiresAt, statisticsTakerExpiresAt: expiresAt } : {}) }))
+  const source = Array.from({ length: 400 }, (_, index) => ({ ...candle(first + index * hour, index), ...(index === 399 ? { oi: null, buy: null, sell: null, statisticsVersion: 11, statisticsOIExpiresAt: expiresAt, statisticsTakerExpiresAt: expiresAt } : {}) }))
   let calls = 0
   f.pipeline.history = { ...cachedHistory(), async ensureStatistics(_id: string, _tf: string, from: number, through: number) { calls += 1; await f.persist(source.filter(row => row.timestamp >= from && row.timestamp <= through).map(row => ({ ...row, oi: 1_234, buy: 30, sell: 20, statisticsVersion: 1 }))) } }
   try {

@@ -72,6 +72,8 @@ Applicable relative changes use `(current − previous) / abs(previous) × 100%`
 
 Completed candles are written to Parquet and read through DuckDB for charts and indicators. WebSocket updates keep the forming candle in memory; confirmed data passes through durable ingestion before becoming completed history. Reconnection coordinates missing-range repair with the history synchronizer. Complete saved ranges are reused, and background jobs checkpoint their progress in SQLite.
 
+Price, OI and Taker history start on independent paced source lanes. Statistics wait only for their matching price page to be durable. Each statistics page explicitly specifies `begin` and `end`; availability is evaluated from the source response, without a shared local retention cutoff. Missing values and Taker zero placeholders inconsistent with actual traded volume remain unavailable with a bounded retry lease. See [historical source behavior](docs/STATISTICS_SOURCES.md) for the dated API observations and pagination rules.
+
 ### Check and repair data
 
 In **Settings → Data integrity**:
@@ -119,6 +121,7 @@ Install the locked dependencies with `npm ci`. The shadcn CLI is a development d
 | `npm run app:deliver` | Build, smoke-test, install, and verify the installed app with rollback on failure |
 | `npm run app:smoke -- --app "/path/to/Perpetual Swap Suite.app" --revision <full-git-sha>` | Verify an existing packaged executable using isolated data |
 | `npm run test:okx:1h` | Run live public OKX candle/OI/taker integration with temporary storage |
+| `node scripts/okx-live-statistics.mjs --report .build/okx-statistics.json` | Check bounded older OI/Taker requests, zero placeholders, reuse and persistence against actual public responses |
 | `npm run benchmark` | Measure Parquet writes and DuckDB queries |
 | `npm run benchmark:chart` | Exercise chart scrolling, reversals, jumps, and delayed reads |
 | `npm run benchmark:instruments` | Exercise contract prewarming, switching, and revisits |

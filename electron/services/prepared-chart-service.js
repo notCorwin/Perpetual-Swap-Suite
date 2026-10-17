@@ -1,9 +1,9 @@
 import { Worker } from 'node:worker_threads'
+import { statisticsMask } from './statistics-state.js'
 
 const VISIBLE = 96
 const WARMUP = 199
-const HISTORY_PERIODS = 1_440
-const SNAPSHOT_SCHEMA = 1
+const SNAPSHOT_SCHEMA = 2
 const FORMULA_VERSION = 'native-ema200-wilder-flat50-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v2'
 const REFRESH_MS = 60_000
 const priceFields = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'baseVolume', 'quoteVolume', 'confirmed']
@@ -15,7 +15,7 @@ const extremeHour = (rows, minimum = false) => {
   for (const hour of rows.keys()) result = minimum ? Math.min(result, hour) : Math.max(result, hour)
   return Number.isFinite(result) ? result : null
 }
-const sourcePresent = (row, source) => (row.statisticsVersion === 1 ? 3 : Number(row.statisticsVersion ?? 0) & 3) & source
+const sourcePresent = (row, source) => statisticsMask(row) & source
 const sourceMissing = (row, source) => source === 1 ? row.oi === null : row.buy === null || row.sell === null
 const expiryField = source => source === 1 ? 'statisticsOIExpiresAt' : 'statisticsTakerExpiresAt'
 const sourceFresh = (row, source, now = Date.now()) => sourcePresent(row, source)
@@ -633,8 +633,8 @@ export class PreparedChartPipeline {
       for (let timestamp = state.floor; timestamp <= hour; timestamp += state.intervalMS) if (!state.rows.has(timestamp)) return null
     }
     return { ...indicator, oi: raw.oi, buy: raw.buy, sell: raw.sell, statisticsSources: 3, statisticsObserved: true,
-      oiUnavailableReason: raw.oi === null ? hour < Date.now() - HISTORY_PERIODS * state.intervalMS ? 'outside-retention' : 'not-published' : undefined,
-      takerUnavailableReason: raw.buy === null || raw.sell === null ? hour < Date.now() - HISTORY_PERIODS * state.intervalMS ? 'outside-retention' : 'not-published' : undefined }
+      oiUnavailableReason: raw.oi === null ? 'not-published' : undefined,
+      takerUnavailableReason: raw.buy === null || raw.sell === null ? 'not-published' : undefined }
   }
 
   async prepare(instId, timeframe, targetEnd) {

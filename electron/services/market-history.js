@@ -1,23 +1,18 @@
 import { HistorySync } from './history-sync.js'
 import { DataAudit } from './data-audit.js'
 import { CANDLE_INTERVALS, validateCandle } from './market-store.js'
+import { statisticsMask, STATISTICS_OI as OI, STATISTICS_TAKER as TAKER, validTakerVolumes } from './statistics-state.js'
 
 const DAY = 86_400_000
-const SOURCE_PERIODS = 1_440
-const OI = 1
-const TAKER = 2
 const keyOf = (instrument, timeframe) => `${instrument}:${timeframe}`
 const rangeKey = value => `${keyOf(value.instrument, value.timeframe)}:${value.from}:${value.through}`
 const numeric = value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value)) ? Number(value) : null
 const nonnegative = value => typeof value === 'number' && Number.isFinite(value) && value >= 0
-const maskOf = row => row.statisticsVersion === 1 && nonnegative(row.oi) && nonnegative(row.buy) && nonnegative(row.sell)
-  ? 3 : (Number(row.statisticsVersion ?? 0) & 4) ? Number(row.statisticsVersion) & 3 : 0
 const expiryField = source => source === OI ? 'statisticsOIExpiresAt' : 'statisticsTakerExpiresAt'
 const pricePresent = row => row.confirmed === true && nonnegative(row.baseVolume) && nonnegative(row.quoteVolume)
 const sourcePresent = (row, source, now) => {
-  if (!(maskOf(row) & source)) return false
-  const valid = source === OI ? nonnegative(row.oi)
-    : nonnegative(row.buy) && nonnegative(row.sell) && (row.buy + row.sell > 0 || row.volume === 0 && row.quoteVolume === 0)
+  if (!(statisticsMask(row) & source)) return false
+  const valid = source === OI ? nonnegative(row.oi) : validTakerVolumes(row)
   return valid || Number(row[expiryField(source)]) > now
 }
 const missing = (rows, from, through, interval, present) => {
@@ -51,7 +46,6 @@ export class MarketHistory {
     this.latestTasks = new Map()
     this.seeds = new Map()
     this.repairs = new Map()
-    this.targets = new Set()
     const statistics = source => ({
       inspect: query => this.inspectSource(query),
       fetchGap: query => this.fetchStatistics(query, source),
@@ -69,6 +63,7 @@ export class MarketHistory {
       now,
       // MarketService.get already meters each independent OKX endpoint family.
       minRequestIntervalMS: 0,
+      maxConcurrentTasks: 3,
     })
     this.audit = new DataAudit({ metadata, now,
       inspect: async (target, { signal }) => {
@@ -164,13 +159,25 @@ export class MarketHistory {
     const interval = CANDLE_INTERVALS[timeframe]
     const pageFrom = Math.max(from, through - 99 * interval)
     const path = source === 'oi' ? '/rubik/stat/contracts/open-interest-history' : '/rubik/stat/taker-volume-contract'
-    const availableFrom = this.bounds(instrument, timeframe).through - (SOURCE_PERIODS - 1) * interval
-    // The documented source boundary is not an HTTP failure. Persist terminal
-    // null observations on the same source lane, with the normal bounded lease.
-    const values = through < availableFrom ? [] : await this.get(path, { instId: instrument, period: timeframe, limit: 100, end: through + interval, ...(source === 'taker' ? { unit: 1 } : {}) }, signal, priority)
+    // OKX excludes both boundaries. Ask each source about the actual page;
+    // a shared local retention cutoff cannot establish its availability.
+    const values = await this.get(path, { instId: instrument, period: timeframe, limit: 100,
+      begin: pageFrom - interval, end: through + interval, ...(source === 'taker' ? { unit: 1 } : {}) }, signal, priority)
     if (!Array.isArray(values)) throw new TypeError('OKX statistics must contain an array.')
-    const byTimestamp = new Map(values.filter(value => numeric(value[0]) >= availableFrom).map(value => [numeric(value[0]), value]))
-    const rows = await this.store.candles({ instrument, timeframe, from: pageFrom, through }, priority)
+    const byTimestamp = new Map()
+    for (const value of values) {
+      const timestamp = numeric(value?.[0])
+      if (!Number.isSafeInteger(timestamp) || timestamp % interval !== 0) throw new TypeError('OKX statistics need timestamps on the native period grid.')
+      if (timestamp < pageFrom || timestamp > through) continue
+      const observation = source === 'oi' ? [timestamp, numeric(value[1])] : [timestamp, numeric(value[1]), numeric(value[2])]
+      if (observation.slice(1).some(amount => !nonnegative(amount))) throw new TypeError('OKX statistics need finite nonnegative quantities.')
+      const previous = byTimestamp.get(timestamp)
+      if (previous && previous.some((amount, index) => amount !== observation[index])) throw new TypeError('OKX statistics contain conflicting observations for one period.')
+      byTimestamp.set(timestamp, observation)
+    }
+    // Network work starts independently. Only merging this page waits for its
+    // durable price rows, never for an entire multi-day history target.
+    const { rows } = await this.ensurePrices(instrument, timeframe, pageFrom, through, priority, signal)
     return rows.filter(pricePresent).map(row => {
       const value = byTimestamp.get(row.timestamp)
       return source === 'oi' ? { ...row, oi: numeric(value?.[1]) }
@@ -225,8 +232,8 @@ export class MarketHistory {
   }
 
   async ensureStatistics(instId, timeframe, from, through, priority = 'foreground', signal) {
-    await this.ensurePrices(instId, timeframe, from, through, priority, signal)
-    await Promise.all(['oi', 'taker'].map(source => this.request(instId, timeframe, source, from, through, priority, signal)))
+    await abortable(this.ready, signal)
+    await Promise.all(['candles', 'oi', 'taker'].map(source => this.request(instId, timeframe, source, from, through, priority, signal)))
     return { rows: await abortable(this.store.candles({ instrument: instId, timeframe, from, through }, priority), signal) }
   }
 
@@ -264,21 +271,9 @@ export class MarketHistory {
   async target(instId, { historyDays = 30, asOf = this.now() } = {}) {
     await this.ready
     this.assertOpen()
-    const tasks = await Promise.all(Object.keys(CANDLE_INTERVALS).map(timeframe => this.sync.enqueueTarget({
-      instrument: instId, timeframe, source: 'candles', historyDays, warmupCandles: 200, asOf, priority: 'background',
-    })))
-    // Statistics depend on durable price rows. Admit those source tasks after
-    // their corresponding price target, without making callers await 30 days.
-    for (const target of tasks) {
-      const operation = Promise.all([target.history, target.warmup].filter(Boolean).map(task => this.sync.waitFor(task.id))).then(async results => {
-        if (this.closed || results.some(task => !['completed', 'unavailable'].includes(task.status))) return
-        for (const price of [target.history, target.warmup].filter(Boolean)) {
-          for (const source of ['oi', 'taker']) await this.sync.enqueue({ instrument: instId, timeframe: price.timeframe, source, from: price.from, through: price.through, priority: 'background', purpose: price.purpose })
-        }
-      }).catch(() => undefined).finally(() => this.targets.delete(operation))
-      this.targets.add(operation)
-    }
-    return tasks
+    return Promise.all(Object.keys(CANDLE_INTERVALS).flatMap(timeframe => ['candles', 'oi', 'taker'].map(source => this.sync.enqueueTarget({
+      instrument: instId, timeframe, source, historyDays, warmupCandles: 200, asOf, priority: 'background',
+    }))))
   }
 
   async repair(issue, { signal }) {
@@ -322,7 +317,7 @@ export class MarketHistory {
       const audit = this.audit.close()
       await this.sync.close()
       await audit
-      await Promise.allSettled([...this.latestTasks.values(), ...this.targets])
+      await Promise.allSettled(this.latestTasks.values())
     })()
     return this.closeTask
   }

@@ -9,8 +9,8 @@ export type Bar = {
   vwap: number | null; ema: number | null; bollUpper: number | null; bollMiddle: number | null; bollLower: number | null
   roc: PercentageValue; maroc: PercentageValue; rsi6: number | null; rsi12: number | null; rsi24: number | null
   oi: number | null; buy: number | null; sell: number | null
-  oiUnavailableReason?: 'outside-retention' | 'not-published'
-  takerUnavailableReason?: 'outside-retention' | 'not-published'
+  oiUnavailableReason?: 'not-published'
+  takerUnavailableReason?: 'not-published'
 }
 
 export type PreparedChartState = 'ready' | 'unavailable'

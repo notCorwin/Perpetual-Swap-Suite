@@ -255,7 +255,8 @@ test('prepared native chart pages preserve canonical indicator values across eve
         assert.equal(bar.statisticsObserved, true)
       }
     }
-    assert.equal((await readRequestProbe(electron)).sourceCalls, 0, 'Complete durable periods must not be downloaded again.')
+    const requests = await readRequestProbe(electron)
+    assert.deepEqual(requests.sourceRequests.filter(call => call.path !== '/market/candles'), [], 'Complete durable periods must not be downloaded again; latest two-candle refreshes remain independent.')
   } finally { await removeRequestProbe(electron) }
 })
 
@@ -331,7 +332,7 @@ test('a held history read keeps the last complete paint and coalesces every late
     assert.equal(report.commits.at(-1).end, expectedEnd)
     const requests = await readRequestProbe(electron)
     assert.equal(requests.maxActive, 1)
-    assert.equal(requests.sourceCalls, 0)
+    assert.deepEqual(requests.sourceRequests.filter(call => call.path !== '/market/candles'), [], 'Scrolling must reuse durable history, independently of latest-candle refresh timing.')
     assert.ok(requests.calls.length <= 12, `Coalesced history work unexpectedly issued ${requests.calls.length} requests.`)
     assert.ok(!report.commits.some(commit => commit.end === fixture.end - 1_200 * fixture.intervalMS), 'The obsolete held target was presented after a newer input.')
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
@@ -360,7 +361,8 @@ test('a late history response cannot overwrite a more recently selected timefram
     const final15m = report.commits.findIndex(commit => commit.timeframe === '15m')
     assert.ok(final15m >= 0)
     assert.ok(report.commits.slice(final15m).every(commit => commit.timeframe === '15m'), 'An older timeframe repainted after the selected chart was ready.')
-    assert.equal((await readRequestProbe(electron)).sourceCalls, 0)
+    const requests = await readRequestProbe(electron)
+    assert.deepEqual(requests.sourceRequests.filter(call => call.path !== '/market/candles'), [], 'A fully local timeframe switch must reuse historical candles and statistics. Periodic latest two-candle refreshes are independent.')
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
 
@@ -482,7 +484,7 @@ test('historically unavailable statistics remain missing instead of becoming fal
   assert.equal(await chart.getAttribute('data-chart-oi-samples'), '0')
   assert.equal(await chart.getAttribute('data-chart-taker-samples'), '0')
   assert.equal(await chart.locator('[data-chart-taker="empty"]').count(), 1)
-  assert.equal(await chart.getByText('OKX 1h OI history is limited to 60 days', { exact: true }).count(), 1)
-  assert.equal(await chart.getByText('OKX 1h Taker history is limited to 60 days', { exact: true }).count(), 1)
+  assert.equal(await chart.getByText('OKX 1h OI history is incomplete for this range', { exact: true }).count(), 1)
+  assert.equal(await chart.getByText('OKX 1h Taker history is incomplete for this range', { exact: true }).count(), 1)
   assertCompletePaints(await finishPaintProbe(page))
 })

@@ -104,7 +104,7 @@ test('Taker zero placeholders become unavailable without erasing genuine zero-vo
       assert.equal(rows[index].buy, null)
       assert.equal(rows[index].sell, null)
       assert.equal(rows[index].oi, 1_000 + index, 'Rejecting Taker must retain the independent OI source.')
-      assert.equal(rows[index].statisticsVersion, 7, 'Invalid Taker is an observed null, not an unfetched source.')
+      assert.equal(rows[index].statisticsVersion, 11, 'Invalid Taker is an observed null, not an unfetched source.')
       assert.ok(Number(rows[index].statisticsTakerExpiresAt) > Date.now() + 5 * hour)
     }
     assert.deepEqual([rows[3].sell, rows[3].buy], [20, 30], 'The direct endpoint order is sell then buy.')
@@ -145,6 +145,28 @@ const discovery = (extra?: (url: URL) => Response | Promise<Response> | null): t
   if (result) return result
   throw new Error(`Unexpected ${url}`)
 }
+
+test('legacy inferred unavailable observations are revalidated through bounded HTTP while genuine history is retained', async () => {
+  const timestamp = Math.floor((Date.now() - 30 * 86_400_000) / fiveMinutes) * fiveMinutes
+  const calls: URL[] = []
+  const f = await fixture(disabled(), async input => {
+    const url = new URL(String(input)); calls.push(url)
+    assert.ok(url.pathname.endsWith('/taker-volume-contract'))
+    assert.equal(url.searchParams.get('begin'), String(timestamp - fiveMinutes))
+    assert.equal(url.searchParams.get('end'), String(timestamp + fiveMinutes))
+    return response([[String(timestamp), '333', '444']])
+  })
+  try {
+    await f.store.appendCandles([{ ...rawCandle(timestamp), oi: 777, buy: null, sell: null,
+      statisticsVersion: 7, statisticsTakerExpiresAt: Date.now() + hour }])
+    const result = await f.service.history.ensureStatistics(instId, '5m', timestamp, timestamp)
+    assert.deepEqual([result.rows[0].oi, result.rows[0].buy, result.rows[0].sell], [777, 444, 333])
+    assert.equal(calls.length, 1)
+    assert.equal(result.rows[0].statisticsTakerExpiresAt, null)
+    await f.service.history.ensureStatistics(instId, '5m', timestamp, timestamp)
+    assert.equal(calls.length, 1)
+  } finally { await f.close() }
+})
 
 test('constructor requires full Preferences and opens durable owned metadata', async () => {
   const f = await fixture()
@@ -511,19 +533,22 @@ test('statistics queued behind a replacement merge against repaired OHLC', async
 })
 
 test('replacement retains bounded null leases and revalidates Taker zeros against repaired traded volume', async () => {
-  const f = await fixture(), timestamp = Math.floor(Date.now() / fiveMinutes) * fiveMinutes - 2 * fiveMinutes, expiry = Date.now() + 20_000
+  const f = await fixture(), timestamp = Math.floor(Date.now() / fiveMinutes) * fiveMinutes - 3 * fiveMinutes, expiry = Date.now() + 20_000
   try {
     await f.store.appendCandles([
       { ...rawCandle(timestamp), volume: 0, baseVolume: 0, quoteVolume: 0, oi: 10, buy: 0, sell: 0, statisticsVersion: 1 },
-      { ...rawCandle(timestamp + fiveMinutes), oi: 11, buy: null, sell: null, statisticsVersion: 7, statisticsTakerExpiresAt: expiry },
+      { ...rawCandle(timestamp + fiveMinutes), oi: 11, buy: null, sell: null, statisticsVersion: 11, statisticsTakerExpiresAt: expiry },
+      { ...rawCandle(timestamp + 2 * fiveMinutes), volume: 0, baseVolume: 0, quoteVolume: 0, oi: null, buy: 0, sell: 0, statisticsVersion: 10 },
     ])
-    const range = { instrument: instId, timeframe: '5m', from: timestamp, through: timestamp + fiveMinutes }
-    await f.service.replaceCandles(range, [rawCandle(timestamp, 200), rawCandle(timestamp + fiveMinutes, 201)])
-    const [zero, leased] = await f.store.candles(range)
+    const range = { instrument: instId, timeframe: '5m', from: timestamp, through: timestamp + 2 * fiveMinutes }
+    await f.service.replaceCandles(range, [rawCandle(timestamp, 200), rawCandle(timestamp + fiveMinutes, 201), rawCandle(timestamp + 2 * fiveMinutes, 202)])
+    const [zero, leased, partialZero] = await f.store.candles(range)
     assert.deepEqual([zero.close, zero.oi, zero.buy, zero.sell], [200, 10, null, null])
     assert.ok(Number(zero.statisticsTakerExpiresAt) < Date.now(), 'An invalidated zero placeholder needs source revalidation.')
     assert.equal(leased.statisticsTakerExpiresAt, expiry, 'Price repair cannot extend the statistics observation lease.')
     assert.equal(leased.oi, 11)
+    assert.deepEqual([partialZero.buy, partialZero.sell], [null, null])
+    assert.ok(Number(partialZero.statisticsTakerExpiresAt) < Date.now(), 'A partial-source zero invalidated by a price correction cannot acquire a fresh null lease.')
   } finally { await f.close() }
 })
 

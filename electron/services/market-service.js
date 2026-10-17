@@ -6,6 +6,7 @@ import { MarketHistory } from './market-history.js'
 import { eligibleInstrument, evaluateLiquidity, quoteTurnover24h } from './liquidity.js'
 import { rankingFromCandles, compareRanking } from './ranking.js'
 import { RealtimeMarket } from './realtime-market.js'
+import { statisticsMask, statisticsVersionFor, validTakerVolumes, STATISTICS_OI, STATISTICS_TAKER } from './statistics-state.js'
 
 const OKX_ORIGIN = 'https://www.okx.com/api/v5'
 const FIVE_MINUTES = 300_000
@@ -20,11 +21,6 @@ const REQUEST_LANE_INTERVALS = Object.freeze({ candles: 100, oi: 200, taker: 400
 const requestLaneFor = path => path.includes('/rubik/stat/taker-volume-contract') ? 'taker'
   : path.includes('/rubik/stat/contracts/open-interest-history') ? 'oi'
     : path.includes('/market/candles') || path.includes('/market/history-candles') ? 'candles' : 'market'
-const STATISTICS_VERSION = 1
-const STATISTICS_FORMAT = 0b100
-const STATISTICS_OI = 0b001
-const STATISTICS_TAKER = 0b010
-const STATISTICS_COMPLETE = STATISTICS_OI | STATISTICS_TAKER
 const statisticsExpiryField = source => source === STATISTICS_OI ? 'statisticsOIExpiresAt' : 'statisticsTakerExpiresAt'
 const closedBoundary = (timeframe, now = Date.now()) => Math.floor(now / timeframeMilliseconds(timeframe)) * timeframeMilliseconds(timeframe)
 const emptyAudit = () => ({ phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '' })
@@ -80,31 +76,10 @@ const number = value => {
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : null
 }
-const statisticsMask = value => {
-  const version = number(value?.statisticsVersion)
-  // Preserve good data written by the preceding format. It was only ever
-  // assigned after both direct endpoint values were present.
-  if (version === 1 && number(value?.oi) !== null && number(value?.buy) !== null && number(value?.sell) !== null) return STATISTICS_COMPLETE
-  return version !== null && (version & STATISTICS_FORMAT) === STATISTICS_FORMAT ? version & STATISTICS_COMPLETE : 0
-}
 const hasStatisticsSource = (value, source) => (statisticsMask(value) & source) === source
-const statisticsVersionFor = (sources, values) => sources === STATISTICS_COMPLETE
-  && number(values?.oi) !== null && number(values?.buy) !== null && number(values?.sell) !== null
-  ? STATISTICS_VERSION
-  : STATISTICS_FORMAT | (sources & STATISTICS_COMPLETE)
 const timeframeMilliseconds = timeframe => timeframe === '5m' ? FIVE_MINUTES : timeframe === '15m' ? 900_000 : 3_600_000
 const statisticsExpiryAt = (timeframe, end, observedAt = Date.now()) => observedAt
   + (end >= observedAt - timeframeMilliseconds(timeframe) * 2 ? LATEST_CANDLE_REFRESH : HISTORICAL_STATISTICS_REFRESH)
-
-function validTakerVolumes(candle, volumes = candle) {
-  const buy = number(volumes?.buy), sell = number(volumes?.sell)
-  if (buy === null || sell === null || buy < 0 || sell < 0) return null
-  // Both the native derivative candle and unit=1 Taker feed use contracts.
-  // A confirmed traded period cannot have no taker buys and no taker sells.
-  // OKX also returns these zero placeholders for unavailable older periods.
-  if (candle.confirmed && buy === 0 && sell === 0 && (number(candle.volume) > 0 || number(candle.quoteVolume) > 0)) return null
-  return { buy, sell }
-}
 
 function normalizedStatistics(candle) {
   const sources = statisticsMask(candle)
@@ -115,15 +90,17 @@ function normalizedStatistics(candle) {
     buy: volumes?.buy ?? null,
     sell: volumes?.sell ?? null,
   }
-  // Normalize prior numeric zero placeholders without throwing away either
-  // source's observation. They are terminal nulls with a bounded lease, and
-  // a healthy OI sibling must remain usable when the Taker source is absent.
+  // Preserve genuine observations independently. Old inferred nulls and
+  // traded-period zero placeholders require a real bounded source request.
   next.statisticsVersion = sources ? statisticsVersionFor(sources, next) : null
   for (const source of [STATISTICS_OI, STATISTICS_TAKER]) {
     const field = statisticsExpiryField(source)
     const missing = source === STATISTICS_OI ? next.oi === null : next.buy === null || next.sell === null
+    // A price correction can invalidate a previously genuine zero Taker pair.
+    // That is new missing coverage, not a new successful empty HTTP response.
+    const invalidatedTaker = source === STATISTICS_TAKER && !volumes && (candle.buy != null || candle.sell != null)
     next[field] = sources & source && missing
-      ? number(candle[field]) ?? statisticsExpiryAt(candle.timeframe, candle.timestamp, number(candle.writtenAt) ?? 0)
+      ? number(candle[field]) ?? (invalidatedTaker ? 0 : statisticsExpiryAt(candle.timeframe, candle.timestamp, number(candle.writtenAt) ?? 0))
       : null
   }
   return next

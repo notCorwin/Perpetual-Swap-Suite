@@ -162,18 +162,18 @@ test('instrument and native timeframe caches have independent generations and hi
   assert.ok(store.window('ETH-USDT-SWAP', '1H'))
 })
 
-test('an updated source-unavailability reason replaces only the affected immutable window', () => {
+test('a new source-unavailability annotation replaces only the affected immutable window', () => {
   const store = new PreparedChartStore()
   const values = bars(0, 200)
-  values[10] = bar(10, hour, { oi: null, oiUnavailableReason: 'not-published' })
+  values[10] = bar(10, hour, { oi: null })
   store.ingest(response(values))
   const older = store.window(instId, '1H', 95 * hour)!
   const latest = store.window(instId, '1H')
-  store.ingest(response([bar(10, hour, { oi: null, oiUnavailableReason: 'outside-retention' })], { revision: 2 }))
+  store.ingest(response([bar(10, hour, { oi: null, oiUnavailableReason: 'not-published' })], { revision: 2 }))
   const updated = store.window(instId, '1H', 95 * hour)!
   assert.notEqual(updated, older)
-  assert.equal(updated.bars[10].oiUnavailableReason, 'outside-retention')
-  assert.equal(older.bars[10].oiUnavailableReason, 'not-published')
+  assert.equal(updated.bars[10].oiUnavailableReason, 'not-published')
+  assert.equal(older.bars[10].oiUnavailableReason, undefined)
   assert.equal(store.window(instId, '1H'), latest)
 })
 
