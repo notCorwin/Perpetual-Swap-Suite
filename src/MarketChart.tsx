@@ -67,6 +67,8 @@ const MAX_WHEEL_STEPS_PER_FRAME = 12
 // poll the foreground viewport quickly enough to display its sibling on the
 // next paint instead of leaving a durable result blank for half a second.
 const STATISTICS_PROGRESS_POLL_MS = 80
+// Both direct OKX statistics endpoints expose their latest 1,440 periods.
+const STATISTICS_HISTORY_PERIODS = 1_440
 let nextChartFocusToken = 0
 const chartKey = (id: string, timeframe: RadarTimeframe) => `${timeframe}:${id}`
 const chartResponse = (entry: ChartSeriesEntry<Bar, ChartStatus> | undefined): ChartResponse | null => entry
@@ -837,6 +839,10 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     : viewportResponse?.statisticsState ?? (statisticsNeedLoad ? 'loading' : 'ready')
   const oiState: ChartStatisticsState = useLocalStatistics ? localOIState : viewportResponse?.oiState ?? (statisticsNeedLoad ? 'loading' : 'ready')
   const takerState: ChartStatisticsState = useLocalStatistics ? localTakerState : viewportResponse?.takerState ?? (statisticsNeedLoad ? 'loading' : 'ready')
+  const statisticsHistoryDays = STATISTICS_HISTORY_PERIODS * intervalMS / 86_400_000
+  const statisticsHistoryCutoff = Date.now() - STATISTICS_HISTORY_PERIODS * intervalMS
+  const oiOutsideHistory = bars.some(bar => bar.oi === null && bar.hour < statisticsHistoryCutoff)
+  const takerOutsideHistory = bars.some(bar => (bar.buy === null || bar.sell === null) && bar.hour < statisticsHistoryCutoff)
   const incompleteViewport = requestedViewportEnd > 0 && viewportEnd !== requestedViewportEnd
   useEffect(() => {
     const hasStatisticsProgress = statisticsRefreshing || viewportResponse?.statisticsState === 'unavailable' && Number.isFinite(viewportResponse.statisticsRetryAt)
@@ -1049,8 +1055,8 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
         {historicalEnd !== null && historyLoading === `${cacheKey}:${historicalEnd}` && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Loading indicator warm-up history…</span>}
         {historyLoading !== `${cacheKey}:${historicalEnd}` && (candleState === 'loading' || candleState === 'retrying' || incompleteViewport) && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{candleState === 'retrying' ? 'Retrying chart history…' : 'Loading chart history…'}</span>}
         {candleState === 'unavailable' && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{historicalEnd === null ? 'Latest source candles unavailable' : 'Missing source candles in this range'}</span>}
-        {oiState !== 'ready' && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-10 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{oiState === 'unavailable' ? 'OI unavailable for this historical range' : oiState === 'retrying' ? 'Retrying OI data…' : 'Loading OI data…'}</span>}
-        {takerState !== 'ready' && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-20 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{takerState === 'unavailable' ? 'Taker data unavailable for this historical range' : takerState === 'retrying' ? 'Retrying Taker data…' : 'Loading Taker data…'}</span>}
+        {oiState !== 'ready' && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-10 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{oiState === 'unavailable' ? oiOutsideHistory ? `OKX ${timeframeLabel(timeframe)} OI history is limited to ${statisticsHistoryDays} days` : `OKX ${timeframeLabel(timeframe)} OI history is incomplete for this range` : oiState === 'retrying' ? 'Retrying OI data…' : 'Loading OI data…'}</span>}
+        {takerState !== 'ready' && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-20 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{takerState === 'unavailable' ? takerOutsideHistory ? `OKX ${timeframeLabel(timeframe)} Taker history is limited to ${statisticsHistoryDays} days` : `OKX ${timeframeLabel(timeframe)} Taker history is incomplete for this range` : takerState === 'retrying' ? 'Retrying Taker data…' : 'Loading Taker data…'}</span>}
         {atHistoryBoundary && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Start of available history</span>}
         </div>
       </div>

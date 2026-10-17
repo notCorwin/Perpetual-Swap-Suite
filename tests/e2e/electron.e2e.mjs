@@ -374,3 +374,22 @@ test('live statistics retry a failed full snapshot after a status-only completio
     })
   }
 })
+
+test('older source gaps explain the OKX retention limit without plotting false zero Taker volume', async () => {
+  const fixture = await request({ e2e: { action: 'seedHistoricalStatisticsBoundary' } })
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click()
+  const chart = page.locator(`[data-chart-inst="${fixture.instId}"]`)
+  await page.waitForFunction(({ instId, end }) => {
+    const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+    return chart?.getAttribute('data-chart-end') === String(end)
+      && chart.getAttribute('data-chart-oi-state') === 'unavailable'
+      && chart.getAttribute('data-chart-taker-state') === 'unavailable'
+      && chart.getAttribute('data-chart-oi-samples') === '0'
+      && chart.getAttribute('data-chart-taker-samples') === '0'
+      && chart.getAttribute('data-chart-loading') === 'false'
+  }, fixture)
+  assert.equal(await chart.getByText('OKX 1h OI history is limited to 60 days', { exact: true }).count(), 1)
+  assert.equal(await chart.getByText('OKX 1h Taker history is limited to 60 days', { exact: true }).count(), 1)
+  assert.equal(await chart.locator('[data-chart-taker="empty"]').count(), 1)
+})

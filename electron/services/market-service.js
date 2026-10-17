@@ -21,6 +21,7 @@ const MAX_REPAIR_PAGES = 16
 const RETRY_DELAYS = [1_000, 3_000, 10_000, 30_000]
 const UNAVAILABLE_RETRY_DELAY = 30_000
 const LATEST_CANDLE_REFRESH = 60_000
+const HISTORICAL_STATISTICS_REFRESH = 6 * 3_600_000
 const HISTORY_BOUNDARY_EMPTY_RESPONSES = 3
 const REQUEST_TIMEOUT = 12_000
 // A queued request can become unnecessary while another viewport persists
@@ -139,6 +140,41 @@ const statisticsVersionFor = (sources, values) => sources === STATISTICS_COMPLET
   : STATISTICS_FORMAT | (sources & STATISTICS_COMPLETE)
 const percent = (current, previous) => current === null || previous === null || previous === 0 ? null : (current - previous) / Math.abs(previous) * 100
 const timeframeMilliseconds = timeframe => timeframe === '5m' ? FIVE_MINUTES : timeframe === '15m' ? 900_000 : 3_600_000
+const statisticsExpiryAt = (timeframe, end, observedAt = Date.now()) => observedAt
+  + (end >= observedAt - timeframeMilliseconds(timeframe) * 2 ? LATEST_CANDLE_REFRESH : HISTORICAL_STATISTICS_REFRESH)
+
+function validTakerVolumes(candle, volumes = candle) {
+  const buy = number(volumes?.buy), sell = number(volumes?.sell)
+  if (buy === null || sell === null || buy < 0 || sell < 0) return null
+  // Both the native derivative candle and unit=1 Taker feed use contracts.
+  // A confirmed traded period cannot have no taker buys and no taker sells.
+  // OKX also returns these zero placeholders for unavailable older periods.
+  if (candle.confirmed && buy === 0 && sell === 0 && (number(candle.volume) > 0 || number(candle.quoteVolume) > 0)) return null
+  return { buy, sell }
+}
+
+function normalizedStatistics(candle) {
+  const sources = statisticsMask(candle)
+  const volumes = sources & STATISTICS_TAKER ? validTakerVolumes(candle) : null
+  const next = {
+    ...candle,
+    oi: sources & STATISTICS_OI ? number(candle.oi) : null,
+    buy: volumes?.buy ?? null,
+    sell: volumes?.sell ?? null,
+  }
+  // Normalize prior numeric zero placeholders without throwing away either
+  // source's observation. They are terminal nulls with a bounded lease, and
+  // a healthy OI sibling must remain usable when the Taker source is absent.
+  next.statisticsVersion = sources ? statisticsVersionFor(sources, next) : null
+  for (const source of [STATISTICS_OI, STATISTICS_TAKER]) {
+    const field = statisticsExpiryField(source)
+    const missing = source === STATISTICS_OI ? next.oi === null : next.buy === null || next.sell === null
+    next[field] = sources & source && missing
+      ? number(candle[field]) ?? statisticsExpiryAt(candle.timeframe, candle.timestamp, number(candle.writtenAt) ?? 0)
+      : null
+  }
+  return next
+}
 
 const rangesOverlap = (left, right) => left.from <= right.through && right.from <= left.through
 const rangeSlots = (ranges, intervalMS = FIVE_MINUTES) => ranges.reduce((total, range) => total + Math.floor((range.through - range.from) / intervalMS) + 1, 0)
@@ -541,9 +577,7 @@ export class MarketService {
     if (ends.displayEnd === null) return { bars: [], end: null, repairEnd: ends.repairEnd, range: null }
     const intervalMS = timeframeMilliseconds(frame), range = listRawRange(frame, ends.displayEnd)
     const source = await this.store.candles({ instrument: instrument.instId, timeframe: frame, ...range })
-    const candles = source.map(value => this.hasCurrentStatistics(value)
-      ? value
-      : { ...value, oi: null, buy: null, sell: null, statisticsVersion: null })
+    const candles = source.map(normalizedStatistics)
     const readings = barsWithIndicators(candles, intervalMS), byHour = new Map(readings.map(value => [value.hour, value])), bars = []
     for (let hour = ends.displayEnd; byHour.has(hour); hour -= intervalMS) bars.unshift(byHour.get(hour))
     return { bars, end: ends.displayEnd, repairEnd: ends.repairEnd, range }
@@ -1330,13 +1364,13 @@ export class MarketService {
 
   async storedStatisticsWindow(instrument, timeframe, end, priority = 'foreground') {
     const range = this.statisticsRange(timeframe, end)
-    const rows = await this.store.candles({ instrument: instrument.instId, timeframe, from: range.from, through: range.through }, priority)
+    const rows = (await this.store.candles({ instrument: instrument.instId, timeframe, from: range.from, through: range.through }, priority)).map(normalizedStatistics)
     return { ...this.statisticsWindow(rows, range.from, range.intervalMS), rows, range }
   }
 
   async storedStatisticsPage(instrument, timeframe, end, priority = 'foreground') {
     const range = this.statisticsPageRange(timeframe, end)
-    const rows = await this.store.candles({ instrument: instrument.instId, timeframe, from: range.from, through: range.through }, priority)
+    const rows = (await this.store.candles({ instrument: instrument.instId, timeframe, from: range.from, through: range.through }, priority)).map(normalizedStatistics)
     const candlesReady = this.completeCandleRowsOfLength(rows, range.from, range.intervalMS, 100)
     return {
       rows,
@@ -1359,7 +1393,7 @@ export class MarketService {
   }
 
   statisticsExpiry(timeframe, end) {
-    return end >= Date.now() - timeframeMilliseconds(timeframe) * 2 ? Date.now() + 60_000 : Infinity
+    return statisticsExpiryAt(timeframe, end)
   }
 
   isRateLimitedRetry(state, now = Date.now()) {
@@ -1406,14 +1440,14 @@ export class MarketService {
     const storePriority = priority === 'background' ? 'background' : 'foreground'
     const changed = await this.enqueueCandleMutation(instrument.instId, async () => {
       if (this.disposed || signal?.aborted) return false
-      const local = await this.store.candles({ instrument: instrument.instId, timeframe, from: page.from, through: page.through }, storePriority)
+      const local = (await this.store.candles({ instrument: instrument.instId, timeframe, from: page.from, through: page.through }, storePriority)).map(normalizedStatistics)
       const patched = local.filter(value => value.confirmed).map(value => {
         const sourceAlreadyObserved = hasStatisticsSource(value, source)
         const preserveSource = preserveExistingSource && sourceAlreadyObserved
         const existingOI = number(value.oi)
         const existingVolumes = { sell: number(value.sell), buy: number(value.buy) }
         const incomingOI = source === STATISTICS_OI ? byHour.get(value.timestamp) ?? null : null
-        const incomingVolumes = source === STATISTICS_TAKER ? byHour.get(value.timestamp) ?? null : null
+        const incomingVolumes = source === STATISTICS_TAKER ? validTakerVolumes(value, byHour.get(value.timestamp) ?? null) : null
         const incomingHasValue = source === STATISTICS_OI
           ? incomingOI !== null
           : incomingVolumes !== null && incomingVolumes.sell !== null && incomingVolumes.buy !== null
@@ -2377,7 +2411,7 @@ export class MarketService {
         // Never display a legacy OI/Taker cache as if it were direct native
         // timeframe contract data. Preserve the price candle and rehydrate
         // statistics only after the complete visible candle window exists.
-        const candles = source.map(value => {
+        const candles = source.map(normalizedStatistics).map(value => {
           const sources = statisticsMask(value)
           return sources ? {
             ...value,

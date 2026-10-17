@@ -1604,12 +1604,136 @@ test('Taker statistics persist before a deliberately held OI response', async ()
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-test('empty historic OI becomes terminal while complete Taker stays durable without repeat calls', async () => {
+test('Taker zero placeholders become unavailable without erasing genuine zero-volume periods or healthy direct values', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 0, 20, 12)
+  const timestamps = Array.from({ length: 100 }, (_, index) => end - (99 - index) * hour)
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
+  try {
+    await store.appendCandles(timestamps.map((timestamp, index) => ({
+      ...nativeCandle(timestamp, '1H'),
+      ...(index === 98 ? { volume: 0, quoteVolume: 0 } : {}),
+      oi: 1_000 + index,
+      buy: index === 97 ? 12 : null,
+      sell: index === 97 ? 13 : null,
+      statisticsVersion: index === 97 ? 1 : 5,
+    })))
+    const values = timestamps.map((timestamp, index) => [String(timestamp),
+      index === 1 ? '-1' : [0, 97, 98].includes(index) ? '0' : '20',
+      index === 2 ? '' : [0, 97, 98].includes(index) ? '0' : '30',
+    ])
+    await service.persistStatisticsSource(instrument, '1H', end, 2, values)
+    const rows = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: timestamps[0], through: end })
+    for (const index of [0, 1, 2]) {
+      assert.equal(rows[index].buy, null)
+      assert.equal(rows[index].sell, null)
+      assert.equal(rows[index].oi, 1_000 + index, 'Rejecting Taker must retain the independent OI source.')
+      assert.equal(rows[index].statisticsVersion, 7, 'Invalid Taker is an observed null, not an unfetched source.')
+      assert.ok(Number(rows[index].statisticsTakerExpiresAt) > Date.now() + 5 * hour)
+    }
+    assert.deepEqual([rows[3].sell, rows[3].buy], [20, 30], 'The direct endpoint order is sell then buy.')
+    assert.deepEqual([rows[97].buy, rows[97].sell], [12, 13], 'A zero placeholder cannot erase healthy direct statistics.')
+    assert.deepEqual([rows[98].buy, rows[98].sell], [0, 0], 'A candle with genuinely no trades may have zero on both sides.')
+    assert.equal(rows[98].statisticsVersion, 1)
+    assert.equal(rows[98].statisticsTakerExpiresAt, null)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('legacy zero Taker rows normalize consistently across charts, list projections, and source coverage', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 0, 20, 12)
+  const timestamps = Array.from({ length: 201 }, (_, index) => end - (200 - index) * hour)
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
+  try {
+    await store.appendCandles(timestamps.map((timestamp, index) => ({
+      ...nativeCandle(timestamp, '1H'),
+      ...(index === 199 ? { volume: 0, quoteVolume: 0 } : {}),
+      oi: 1_000 + index, buy: 0, sell: 0, statisticsVersion: index % 2 ? 7 : 1,
+    })))
+    const raw = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: timestamps[0], through: end })
+    const window = await service.storedStatisticsWindow(instrument, '1H', end)
+    assert.equal(window.status, 'unavailable')
+    assert.equal(window.oiState, 'ready')
+    assert.equal(window.takerState, 'unavailable')
+    assert.ok(window.rows.every((value: any) => value.statisticsVersion === 7 || value.timestamp === timestamps[199]))
+    assert.equal(window.rows.at(-1).statisticsTakerExpiresAt, Number(raw.at(-1)?.writtenAt) + 6 * hour,
+      'A legacy null expiry derives from its original observation time and cannot slide on every read.')
+    const page = await service.storedStatisticsPage(instrument, '1H', end)
+    assert.equal(page.oi, true)
+    assert.equal(page.taker, true, 'An invalid but observed historic response is terminal during its lease.')
+    assert.equal(page.rows.at(-1).buy, null)
+
+    const projection = await service.readListBars({ instrument }, '1H')
+    assert.deepEqual([projection.bars.at(-1)?.oi, projection.bars.at(-1)?.buy, projection.bars.at(-1)?.sell], [1_200, null, null])
+    assert.deepEqual([projection.bars.at(-2)?.buy, projection.bars.at(-2)?.sell], [0, 0])
+    const chart = await service.bars(instrument.instId, '1H', end, { hydrate: false, repair: false, statistics: false })
+    assert.deepEqual([chart.bars.at(-1)?.oi, chart.bars.at(-1)?.buy, chart.bars.at(-1)?.sell], [1_200, null, null])
+    assert.equal(chart.bars.at(-1)?.statisticsSources, 3)
+    assert.equal(chart.bars.at(-1)?.statisticsObserved, true)
+    assert.deepEqual([chart.bars.at(-2)?.buy, chart.bars.at(-2)?.sell], [0, 0])
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('an expired historical empty source can recover without polling repeatedly during its cooldown', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 0, 20, 12)
+  const timestamps = Array.from({ length: 100 }, (_, index) => end - (99 - index) * hour)
+  let oiCalls = 0, takerCalls = 0
+  const fetcher: typeof fetch = async input => {
+    const path = new URL(String(input)).pathname
+    if (path.endsWith('/open-interest-history')) {
+      oiCalls += 1
+      return response(oiCalls === 1 ? [] : timestamps.map(timestamp => [String(timestamp), '1000']))
+    }
+    if (path.endsWith('/taker-volume-contract')) {
+      takerCalls += 1
+      return response(takerCalls === 1 ? [] : timestamps.map(timestamp => [String(timestamp), '20', '30']))
+    }
+    throw new Error(`Unexpected ${path}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    await store.appendCandles(timestamps.map(timestamp => nativeCandle(timestamp, '1H')))
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+    service.activateChartViewport(instrument, '1H', end)
+    service.requestStatistics(instrument, '1H', end)
+    await waitFor(() => service.statisticsState(instrument, '1H', end).status === 'unavailable')
+    assert.deepEqual([oiCalls, takerCalls], [1, 1])
+    const state = service.statisticsState(instrument, '1H', end)
+    assert.ok(state.expiresAt > Date.now() + 5 * hour)
+    for (let index = 0; index < 5; index += 1) service.chartStatisticsStatus(instrument.instId, '1H', end)
+    assert.deepEqual([oiCalls, takerCalls], [1, 1])
+
+    const expiredAt = Date.now() - 1
+    const stored = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: timestamps[0], through: end })
+    await store.appendCandles(stored.map(value => ({ ...value, statisticsOIExpiresAt: expiredAt, statisticsTakerExpiresAt: expiredAt })))
+    state.sources.oi.expiresAt = expiredAt
+    state.sources.taker.expiresAt = expiredAt
+    service.syncStatisticsState(state)
+    service.chartStatisticsStatus(instrument.instId, '1H', end)
+    await waitFor(() => service.statisticsState(instrument, '1H', end).status === 'ready')
+    assert.deepEqual([oiCalls, takerCalls], [2, 2])
+    const recovered = await service.bars(instrument.instId, '1H', end, { hydrate: false, repair: false, foreground: true, focusToken: 1 })
+    const visible = recovered.bars.filter((bar: any) => bar.hour >= end - 95 * hour && bar.hour <= end)
+    assert.equal(visible.length, 96)
+    assert.ok(visible.every((bar: any) => bar.oi === 1_000 && bar.buy === 30 && bar.sell === 20))
+    assert.equal(recovered.statisticsState, 'ready')
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('empty historic OI has a bounded cooldown while complete Taker stays durable without repeat calls', async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
   const store = await MarketStore.open(root)
   const instrument = { instId: 'BTC-USDT-SWAP' }
   // This deliberately old window models OKX history outside the OI retention
-  // horizon. Empty historical OI is a source boundary, not a transient error.
+  // horizon. Empty historical OI stays unavailable during a long cooldown.
   const end = Date.UTC(2024, 0, 3, 12)
   const timestamps = Array.from({ length: 96 }, (_, index) => end - (95 - index) * hour)
   let oiCalls = 0, takerCalls = 0
@@ -1639,9 +1763,12 @@ test('empty historic OI becomes terminal while complete Taker stays durable with
     assert.equal(takerCalls, 1)
     assert.ok(stored.every(value => value.oi === null || value.oi === undefined))
     assert.ok(stored.every(value => Number.isFinite(value.buy) && Number.isFinite(value.sell)))
+    assert.ok(stored.every(value => Number(value.statisticsOIExpiresAt) > Date.now()))
+    assert.ok(state.sources.oi.expiresAt > Date.now() + 5 * hour)
+    assert.ok(state.sources.oi.expiresAt <= Date.now() + 6 * hour)
 
-    // A known historical boundary must survive both time and an explicit
-    // request; otherwise every revisit consumes the OI and Taker budgets.
+    // Reopening the chart during the cooldown must not consume the endpoint
+    // budgets again. An explicit request alone does not expire the lease.
     await new Promise(resolve => setTimeout(resolve, 1_200))
     service.requestStatistics(instrument, '1H', end)
     await new Promise(resolve => setTimeout(resolve, 100))

@@ -115,3 +115,13 @@ export async function seedChartScrollBenchmark(store, marketService) {
   // 22-frame phase deliberately reaches its 96-candle history floor.
   return { instId, timeframe, alternateTimeframe, intervalMS: HOUR, end, start: hourly[0].timestamp, periods, warmFrames: 12, boundaryFrames: 22 }
 }
+
+// Model the legacy cache at OKX's source retention boundary: prices exist,
+// but OI is empty and Taker returned zero placeholders despite real trades.
+export async function seedHistoricalStatisticsBoundary(store, marketService) {
+  const fixture = await seedChartScrollBenchmark(store, marketService)
+  const rows = await store.candles({ instrument: fixture.instId, timeframe: fixture.timeframe, from: fixture.end - 95 * HOUR, through: fixture.end })
+  await store.appendCandles(rows.map(row => ({ ...row, oi: null, buy: 0, sell: 0, statisticsVersion: 7 })))
+  marketService.markChartDataChanged(fixture.instId)
+  return fixture
+}
