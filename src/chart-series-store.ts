@@ -33,9 +33,24 @@ function preparedBar(bar: PreparedChartBar, intervalMS: number): PreparedChartBa
   return Object.freeze({ ...bar })
 }
 
+function readyWindow(meta: PreparedChartMeta, bars: PreparedChartBar[], endHour: number, liveBar?: Bar, previous?: ReadyChartWindow): ReadyChartWindow {
+  if (previous && previous.liveBar === liveBar && bars.every((bar, index) => previous.bars[index] === bar)) return previous
+  return Object.freeze({
+    key: meta.key, instId: meta.instId, timeframe: meta.timeframe, intervalMS: meta.intervalMS, bars: Object.freeze(bars), endHour,
+    oiState: bars.every(bar => finite(bar.oi)) ? 'ready' : 'unavailable',
+    takerState: bars.every(bar => finite(bar.buy) && finite(bar.sell)) ? 'ready' : 'unavailable',
+    indicatorState: bars.every(bar => indicatorFields.every(field => finite(bar[field]))) ? 'ready' : 'unavailable',
+    ...(liveBar ? { liveBar } : {}),
+  })
+}
+
 /** Only completed, prepared observations enter this cache. Rendering never reads a partial series. */
 export class PreparedChartStore {
   private readonly series = new Map<string, Series>()
+  private readonly latestFrames = new Map<string, { meta: PreparedChartMeta; window: ReadyChartWindow }>()
+  // Keep only the numeric watermark after eviction so in-flight old generations cannot reenter this session.
+  private readonly generations = new Map<string, number>()
+  private universe = new Set<string>()
   private readonly listeners = new Set<() => void>()
   private readonly maxSeries: number
   private readonly maxBarsPerSeries: number
@@ -62,25 +77,95 @@ export class PreparedChartStore {
   }
 
   get size() { return this.series.size }
+  get latestSize() { return this.latestFrames.size }
   latestEnd(instId: string, timeframe: RadarTimeframe) { return this.snapshotMeta(instId, timeframe)?.latestEnd ?? null }
   oldestHour(instId: string, timeframe: RadarTimeframe) { return this.snapshotMeta(instId, timeframe)?.oldestHour ?? null }
-  snapshotMeta(instId: string, timeframe: RadarTimeframe): PreparedChartMeta | null { return this.access(keyFor(instId, timeframe))?.meta ?? null }
+  snapshotMeta(instId: string, timeframe: RadarTimeframe): PreparedChartMeta | null {
+    const key = keyFor(instId, timeframe), series = this.access(key), latest = this.latestFrames.get(key)
+    if (!latest) return series ? this.universe.has(key) ? { ...series.meta, latestEnd: null } : series.meta : null
+    return series ? { ...series.meta, latestEnd: latest.window.endHour } : latest.meta
+  }
+
+  /** Compact latest frames belong to navigation candidates, independently of the history LRU. */
+  setUniverse(instIds: readonly string[], timeframe: RadarTimeframe, focusInstId?: string) {
+    this.universe = new Set([...instIds, ...(focusInstId ? [focusInstId] : [])].map(instId => keyFor(instId, timeframe)))
+    for (const key of this.latestFrames.keys()) if (!this.universe.has(key)) this.latestFrames.delete(key)
+    for (const [key, entry] of this.series) {
+      if (!this.universe.has(key) || this.latestFrames.has(key) || entry.meta.latestEnd === null) continue
+      const window = this.seriesWindow(entry, entry.meta.latestEnd)
+      if (window) this.latestFrames.set(key, { meta: entry.meta, window })
+    }
+  }
+
+  private acceptGeneration(key: string, generation: number) {
+    const known = this.generations.get(key)
+    if (known !== undefined && generation < known) return false
+    if (known !== undefined && generation > known) {
+      this.series.delete(key)
+      this.latestFrames.delete(key)
+    }
+    this.generations.set(key, generation)
+    return true
+  }
+
+  /** Latest-ready notifications never allocate a deep-history cache entry. */
+  ingestLatest(response: PreparedChartResponse): boolean {
+    const { instId, timeframe, intervalMS, generation, revision, endHour } = response
+    const key = keyFor(instId, timeframe)
+    if (!this.universe.has(key) || !finite(endHour) || endHour !== response.latestEnd || !instId
+      || !['5m', '15m', '1H'].includes(timeframe) || intervalMS !== timeframeMilliseconds(timeframe)
+      || !Number.isSafeInteger(revision) || revision < 0 || !Number.isSafeInteger(generation) || generation < 0
+      || !this.acceptGeneration(key, generation)) return false
+    if (this.series.has(key)) return this.ingest(response)
+    const previous = this.latestFrames.get(key)
+    if (previous && (revision < previous.meta.revision || endHour < previous.window.endHour)) return false
+    const incoming = new Map(response.bars.map(bar => [bar.hour, bar]))
+    const bars: PreparedChartBar[] = []
+    for (let index = WINDOW_BARS - 1; index >= 0; index -= 1) {
+      const hour = endHour - index * intervalMS, value = incoming.get(hour)
+      if (!value) return false
+      const bar = preparedBar(value, intervalMS)
+      if (!bar) return false
+      const oldBar = previous?.window.bars[WINDOW_BARS - index - 1]
+      bars.push(sameBar(oldBar, bar) ? oldBar! : bar)
+    }
+    const meta: PreparedChartMeta = Object.freeze({
+      key, instId, timeframe, intervalMS, generation, revision, latestEnd: endHour,
+      oldestHour: response.oldestHour === null ? previous?.meta.oldestHour ?? null : Math.min(previous?.meta.oldestHour ?? Infinity, response.oldestHour),
+      historyExhausted: response.historyExhausted || (previous?.meta.historyExhausted ?? false), error: response.error,
+    })
+    const live = response.liveBar
+    const liveBar = live && !live.confirmed && validPrice(live) && live.hour > endHour
+      && Number.isSafeInteger(live.hour) && live.hour % intervalMS === 0
+      ? sameBar(previous?.window.liveBar, live) ? previous!.window.liveBar : Object.freeze({ ...live }) : undefined
+    const window = readyWindow(meta, bars, endHour, liveBar, previous?.window)
+    this.latestFrames.set(key, { meta, window })
+    if (window !== previous?.window || revision !== previous?.meta.revision) for (const listener of this.listeners) listener()
+    return true
+  }
 
   ingest(response: PreparedChartResponse): boolean {
     const { instId, timeframe, intervalMS, generation, revision } = response
     if (!instId || !['5m', '15m', '1H'].includes(timeframe) || intervalMS !== timeframeMilliseconds(timeframe)
       || !Number.isSafeInteger(revision) || revision < 0 || !Number.isSafeInteger(generation) || generation < 0) return false
     const key = keyFor(instId, timeframe)
+    if (!this.acceptGeneration(key, generation)) return false
     let entry = this.access(key)
-    if (entry && generation < entry.meta.generation) return false
+    const latest = this.latestFrames.get(key)
     const newGeneration = !entry || entry.meta.generation !== generation
     if (newGeneration) {
       entry = {
-        meta: Object.freeze({ key, instId, timeframe, intervalMS, generation, revision, latestEnd: null, oldestHour: null, historyExhausted: false, error: '' }),
-        bars: new Map(), hours: [], windows: new Map(), boundaries: null, liveRevision: -1,
+        meta: latest?.meta ?? Object.freeze({ key, instId, timeframe, intervalMS, generation, revision, latestEnd: null, oldestHour: null, historyExhausted: false, error: '' }),
+        bars: new Map(latest?.window.bars.map(bar => [bar.hour, { bar, revision: latest.meta.revision }]) ?? []),
+        hours: latest?.window.bars.map(bar => bar.hour) ?? [],
+        windows: latest ? new Map([[latest.window.endHour, latest.window]]) : new Map(), boundaries: null,
+        liveBar: latest?.window.liveBar, liveRevision: latest?.meta.revision ?? -1,
       }
       this.series.set(key, entry)
-      while (this.series.size > this.maxSeries) this.series.delete(this.series.keys().next().value!)
+      while (this.series.size > this.maxSeries) {
+        const evicted = this.series.keys().next().value!
+        this.series.delete(evicted)
+      }
     }
     const current = entry!
     let changed = newGeneration
@@ -135,14 +220,30 @@ export class PreparedChartStore {
       current.boundaries = null
       changed = true
     }
+    if (this.universe.has(key)) {
+      const previous = this.latestFrames.get(key)
+      const end = response.endHour === response.latestEnd && finite(response.endHour)
+        ? Math.max(previous?.window.endHour ?? -Infinity, response.endHour) : previous?.window.endHour
+      const window = end === undefined ? null : this.seriesWindow(current, end)
+      if (window) {
+        this.latestFrames.set(key, { meta: Object.freeze({ ...current.meta, latestEnd: window.endHour }), window })
+        if (window !== previous?.window) changed = true
+      }
+    }
     if (changed) for (const listener of this.listeners) listener()
     return true
   }
 
   window(instId: string, timeframe: RadarTimeframe, end?: number | null): ReadyChartWindow | null {
-    const entry = this.access(keyFor(instId, timeframe))
+    const key = keyFor(instId, timeframe), entry = this.access(key), latest = this.latestFrames.get(key)
+    if (latest && (end === null || end === undefined || end === latest.window.endHour)) return latest.window
+    if ((end === null || end === undefined) && this.universe.has(key)) return null
     const endHour = end ?? entry?.meta.latestEnd
     if (!entry || endHour === null || endHour === undefined || !Number.isSafeInteger(endHour)) return null
+    return this.seriesWindow(entry, endHour)
+  }
+
+  private seriesWindow(entry: Series, endHour: number): ReadyChartWindow | null {
     const bars: PreparedChartBar[] = []
     for (let index = WINDOW_BARS - 1; index >= 0; index -= 1) {
       const value = entry.bars.get(endHour - index * entry.meta.intervalMS)
@@ -156,13 +257,7 @@ export class PreparedChartStore {
       entry.windows.set(endHour, cached)
       return cached
     }
-    const window: ReadyChartWindow = Object.freeze({
-      key: entry.meta.key, instId, timeframe, intervalMS: entry.meta.intervalMS, bars: Object.freeze(bars), endHour,
-      oiState: bars.every(bar => finite(bar.oi)) ? 'ready' : 'unavailable',
-      takerState: bars.every(bar => finite(bar.buy) && finite(bar.sell)) ? 'ready' : 'unavailable',
-      indicatorState: bars.every(bar => indicatorFields.every(field => finite(bar[field]))) ? 'ready' : 'unavailable',
-      ...(liveBar ? { liveBar } : {}),
-    })
+    const window = readyWindow(entry.meta, bars, endHour, liveBar)
     entry.windows.delete(endHour)
     entry.windows.set(endHour, window)
     while (entry.windows.size > this.maxWindowsPerSeries) entry.windows.delete(entry.windows.keys().next().value!)
@@ -178,8 +273,8 @@ export class PreparedChartStore {
   }
 
   readyBoundaries(instId: string, timeframe: RadarTimeframe): readonly ReadyChartBoundary[] {
-    const entry = this.series.get(keyFor(instId, timeframe))
-    if (!entry) return []
+    const key = keyFor(instId, timeframe), entry = this.series.get(key), latest = this.latestFrames.get(key)
+    if (!entry) return latest ? [{ firstEnd: latest.window.endHour, lastEnd: latest.window.endHour }] : []
     if (entry.boundaries) return entry.boundaries
     const runs: ReadyChartBoundary[] = []
     let start = 0

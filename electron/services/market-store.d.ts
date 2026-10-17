@@ -17,6 +17,9 @@ export class MarketStore {
   enqueue<T>(operation: () => T | Promise<T>, priority?: StorePriority): Promise<T>
   appendCandles(candles: CandleRecord[], priority?: StorePriority): Promise<number>
   candles(query: { instrument: string; timeframe: string; from?: number; through?: number }, priority?: StorePriority): Promise<CandleRecord[]>
+  candleWatermark(instrument: string, timeframe: string, priority?: StorePriority): Promise<number>
+  readChartSnapshot(instrument: string, timeframe: string): Promise<unknown>
+  writeChartSnapshot(instrument: string, timeframe: string, snapshot: unknown): Promise<void>
   candleTimestamps(query: { instrument: string; timeframe: string; from?: number; through?: number }, priority?: StorePriority): Promise<number[]>
   coverage(instrument: string, timeframe: string, priority?: StorePriority): Promise<{ count: number; first: number | null; last: number | null }>
   missingCandleRanges(query: { instrument: string; timeframe?: string; from: number; through: number; intervalMS?: number }, priority?: StorePriority): Promise<Array<{ from: number; through: number }>>

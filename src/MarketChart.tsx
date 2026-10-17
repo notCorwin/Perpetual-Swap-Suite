@@ -422,7 +422,7 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
       navigationId.current = id
       if (navigationFrame.current === null) navigationFrame.current = window.requestAnimationFrame(() => {
         navigationFrame.current = null
-        onSelect(navigationId.current)
+        flushSync(() => onSelect(navigationId.current))
       })
     }
     window.addEventListener('keydown', navigate)

@@ -2,7 +2,7 @@ import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { seedCachedListProjection, seedChartScrollBenchmark, seedHistoricalStatisticsBoundary } from './e2e-fixtures.js'
+import { seedCachedListProjection, seedChartScrollBenchmark, seedHistoricalStatisticsBoundary, seedInstrumentNavigationBenchmark } from './e2e-fixtures.js'
 import { MarketStore } from './services/market-store.js'
 import { MarketService } from './services/market-service.js'
 
@@ -135,6 +135,7 @@ async function handleRequest(event, request) {
     if (request.e2e.action === 'seedCachedListProjection') return seedCachedListProjection(marketStore, marketService)
     if (request.e2e.action === 'seedChartScrollBenchmark') return seedChartScrollBenchmark(marketStore, marketService)
     if (request.e2e.action === 'seedHistoricalStatisticsBoundary') return seedHistoricalStatisticsBoundary(marketStore, marketService)
+    if (request.e2e.action === 'seedInstrumentNavigationBenchmark') return seedInstrumentNavigationBenchmark(marketStore, marketService)
     if (request.e2e.action === 'settings') return settings()
     throw new Error('Unknown E2E desktop action.')
   }
@@ -156,6 +157,18 @@ async function handleRequest(event, request) {
     if (typeof instId !== 'string' || !['5m', '15m', '1H'].includes(timeframe)
       || endHour !== undefined && !Number.isSafeInteger(endHour)) throw new Error('Invalid chart window request.')
     return marketService.prepareChartWindow(instId, timeframe, endHour)
+  }
+  if ('chartLocal' in request) {
+    const { instId, timeframe } = request.chartLocal ?? {}
+    if (typeof instId !== 'string' || !['5m', '15m', '1H'].includes(timeframe)) throw new Error('Invalid local chart request.')
+    return marketService.localChartWindow(instId, timeframe)
+  }
+  if ('chartUniverse' in request) {
+    const { instIds, timeframe, focusInstId } = request.chartUniverse ?? {}
+    if (!Array.isArray(instIds) || instIds.length > 1_000 || instIds.some(id => typeof id !== 'string')
+      || !['5m', '15m', '1H'].includes(timeframe)
+      || focusInstId !== undefined && typeof focusInstId !== 'string') throw new Error('Invalid chart navigation universe.')
+    return marketService.setChartUniverse(instIds, timeframe, focusInstId)
   }
   if ('gatewayFetch' in request) return gatewayFetch(event, request.gatewayFetch)
   if ('cancelGatewayFetch' in request) { gatewayRequests.get(request.cancelGatewayFetch)?.abort(); return { ok: true } }
@@ -215,6 +228,9 @@ app.whenReady().then(async () => {
     testMode ? e2eLiveRefresh ? delayedOfflineE2EFetch : offlineE2EFetch : fetch,
     !testMode,
   )
+  marketService.subscribePreparedCharts(frame => {
+    if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('radar:chart-prepared', frame)
+  })
   ipcMain.handle('radar:request', handleRequest)
   await marketService.restoreCatalog()
   if (!testMode || e2eLiveRefresh) void marketService.refresh()

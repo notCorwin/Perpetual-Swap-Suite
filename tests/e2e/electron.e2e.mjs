@@ -34,6 +34,59 @@ const waitFor = async (read, timeout = 10_000) => {
   throw new Error('Timed out waiting for the expected Electron response.')
 }
 
+// Prepared snapshots reach the controller through local hits, universe hits,
+// pushed publications, and demand reads. Exercise the same payload at every
+// ingress so these geometry tests do not depend on a particular cache miss.
+const installPreparedTransform = async options => electron.evaluate(({ ipcMain, BrowserWindow }, options) => {
+  const original = ipcMain._invokeHandlers.get('radar:request')
+  const contents = BrowserWindow.getAllWindows()[0].webContents
+  const originalSend = contents.send
+  const probe = { original, contents, originalSend, calls: 0 }
+  const transform = response => {
+    if (response?.instId !== options.instId || options.timeframe && response.timeframe !== options.timeframe) return response
+    if (options.mode === 'terminal') return {
+      ...response, endHour: null, latestEnd: null, oldestHour: options.end - 11 * options.intervalMS,
+      historyExhausted: true, revision: 900_000, bars: [],
+      oiState: 'unavailable', takerState: 'unavailable', indicatorState: 'unavailable', error: '',
+      unavailable: { reason: 'insufficient-history', availableCandles: 12, requiredCandles: 96, retryAt: Date.now() + 60_000 },
+    }
+    if (options.mode === 'warmup') return { ...response, bars: response.bars.map(bar => ({
+      ...bar,
+      rsi6: bar.hour >= options.first && bar.hour <= options.warmupThrough ? null : bar.rsi6,
+      rsi12: bar.hour >= options.first && bar.hour <= options.warmupThrough || bar.hour === options.interiorGap ? null : bar.rsi12,
+    })) }
+    if (options.mode === 'live' && response.endHour === response.latestEnd) {
+      const last = response.bars.find(bar => bar.hour === response.endHour)
+      return { ...response, liveBar: {
+        ...last, hour: response.endHour + response.intervalMS,
+        open: options.livePrice * .999, high: options.livePrice * 1.001, low: options.livePrice * .998, close: options.livePrice,
+        confirmed: false, statisticsObserved: false, oi: null, buy: null, sell: null,
+      } }
+    }
+    return response
+  }
+  ipcMain.removeHandler('radar:request')
+  ipcMain.handle('radar:request', async (event, value) => {
+    if (value.chartWindow?.instId === options.instId) probe.calls += 1
+    const response = await original(event, value)
+    return value.chartUniverse ? { ...response, frames: response.frames.map(transform) }
+      : value.chartLocal || value.chartWindow ? transform(response) : response
+  })
+  contents.send = function (channel, ...args) {
+    if (channel === 'radar:chart-prepared') args[0] = transform(args[0])
+    return originalSend.call(this, channel, ...args)
+  }
+  globalThis.__preparedTransform = probe
+}, options)
+
+const removePreparedTransform = async () => electron.evaluate(({ ipcMain }) => {
+  const probe = globalThis.__preparedTransform
+  ipcMain.removeHandler('radar:request')
+  ipcMain.handle('radar:request', probe.original)
+  probe.contents.send = probe.originalSend
+  delete globalThis.__preparedTransform
+})
+
 before(async () => {
   await launchElectron()
 })
@@ -266,21 +319,7 @@ test('the live price overlay follows its actual price without changing the 96 co
   // A geometric midpoint must land at the center of a logarithmic price axis,
   // including symmetric axis padding. This expectation does not reuse Plot.
   const livePrice = Math.sqrt(Math.min(...prices) * Math.max(...prices))
-  await electron.evaluate(({ ipcMain }, { instId, livePrice }) => {
-    const original = ipcMain._invokeHandlers.get('radar:request')
-    ipcMain.removeHandler('radar:request')
-    ipcMain.handle('radar:request', async (event, value) => {
-      const response = await original(event, value)
-      if (value.chartWindow?.instId !== instId || value.chartWindow.endHour !== undefined) return response
-      const last = response.bars.find(bar => bar.hour === response.endHour)
-      return { ...response, liveBar: {
-        ...last, hour: response.endHour + response.intervalMS,
-        open: livePrice * .999, high: livePrice * 1.001, low: livePrice * .998, close: livePrice,
-        confirmed: false, statisticsObserved: false, oi: null, buy: null, sell: null,
-      } }
-    })
-    globalThis.__liveOverlayOriginal = original
-  }, { instId: fixture.instId, livePrice })
+  await installPreparedTransform({ mode: 'live', instId: fixture.instId, livePrice })
   try {
     await openChart(page, fixture)
     await startPaintProbe(page, fixture)
@@ -312,11 +351,7 @@ test('the live price overlay follows its actual price without changing the 96 co
     assert.equal(await page.evaluate(() => document.querySelector('[data-chart-inst]').__chartSnapshot.liveBar), undefined)
     assertCompletePaints(await finishPaintProbe(page))
   } finally {
-    await electron.evaluate(({ ipcMain }) => {
-      ipcMain.removeHandler('radar:request')
-      ipcMain.handle('radar:request', globalThis.__liveOverlayOriginal)
-      delete globalThis.__liveOverlayOriginal
-    })
+    await removePreparedTransform()
   }
 })
 
@@ -330,20 +365,7 @@ test('known RSI segments remain visible through indicator warm-up and internal m
     rsi6: bar.hour >= first && bar.hour <= warmupThrough ? null : bar.rsi6,
     rsi12: bar.hour >= first && bar.hour <= warmupThrough || bar.hour === interiorGap ? null : bar.rsi12,
   }))
-  await electron.evaluate(({ ipcMain }, { instId, timeframe, first, warmupThrough, interiorGap }) => {
-    const original = ipcMain._invokeHandlers.get('radar:request')
-    ipcMain.removeHandler('radar:request')
-    ipcMain.handle('radar:request', async (event, value) => {
-      const response = await original(event, value)
-      if (value.chartWindow?.instId !== instId || value.chartWindow.timeframe !== timeframe) return response
-      return { ...response, bars: response.bars.map(bar => ({
-        ...bar,
-        rsi6: bar.hour >= first && bar.hour <= warmupThrough ? null : bar.rsi6,
-        rsi12: bar.hour >= first && bar.hour <= warmupThrough || bar.hour === interiorGap ? null : bar.rsi12,
-      })) }
-    })
-    globalThis.__indicatorWarmupOriginal = original
-  }, { instId: fixture.instId, timeframe: fixture.timeframe, first, warmupThrough, interiorGap })
+  await installPreparedTransform({ mode: 'warmup', instId: fixture.instId, timeframe: fixture.timeframe, first, warmupThrough, interiorGap })
   try {
     await openChart(page, fixture)
     await startPaintProbe(page, fixture)
@@ -373,33 +395,13 @@ test('known RSI segments remain visible through indicator warm-up and internal m
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)))
     assertCompletePaints(await finishPaintProbe(page))
   } finally {
-    await electron.evaluate(({ ipcMain }) => {
-      ipcMain.removeHandler('radar:request')
-      ipcMain.handle('radar:request', globalThis.__indicatorWarmupOriginal)
-      delete globalThis.__indicatorWarmupOriginal
-    })
+    await removePreparedTransform()
   }
 })
 
 test('a newly listed contract with fewer than 96 completed candles explains the limit and stops retrying', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  await electron.evaluate(({ ipcMain }, fixture) => {
-    const original = ipcMain._invokeHandlers.get('radar:request')
-    const probe = { original, calls: 0 }
-    ipcMain.removeHandler('radar:request')
-    ipcMain.handle('radar:request', (event, value) => {
-      if (value.chartWindow?.instId !== fixture.instId) return original(event, value)
-      probe.calls += 1
-      return {
-        instId: fixture.instId, timeframe: value.chartWindow.timeframe, intervalMS: fixture.intervalMS,
-        endHour: null, latestEnd: null, oldestHour: fixture.end - 11 * fixture.intervalMS,
-        historyExhausted: true, generation: 1, revision: 900_000, bars: [],
-        oiState: 'unavailable', takerState: 'unavailable', indicatorState: 'unavailable', error: '',
-        unavailable: { reason: 'insufficient-history', availableCandles: 12, requiredCandles: 96, retryAt: Date.now() + 60_000 },
-      }
-    })
-    globalThis.__insufficientChartProbe = probe
-  }, { instId: fixture.instId, end: fixture.end, intervalMS: fixture.intervalMS })
+  await installPreparedTransform({ mode: 'terminal', instId: fixture.instId, end: fixture.end, intervalMS: fixture.intervalMS })
   try {
     await page.reload({ waitUntil: 'domcontentloaded' })
     await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click({ timeout: 15_000 })
@@ -410,14 +412,9 @@ test('a newly listed contract with fewer than 96 completed candles explains the 
     assert.equal(await chart.locator('svg[data-rendered-inst]').count(), 0)
     assert.equal(await chart.locator('[data-slot="spinner"]').count(), 0)
     await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 1_100)))
-    assert.equal(await electron.evaluate(() => globalThis.__insufficientChartProbe.calls), 1, 'Known insufficient history must not become a retry loop.')
+    assert.equal(await electron.evaluate(() => globalThis.__preparedTransform.calls), 1, 'Known insufficient history must not become a retry loop.')
   } finally {
-    await electron.evaluate(({ ipcMain }) => {
-      const probe = globalThis.__insufficientChartProbe
-      ipcMain.removeHandler('radar:request')
-      ipcMain.handle('radar:request', probe.original)
-      delete globalThis.__insufficientChartProbe
-    })
+    await removePreparedTransform()
   }
 })
 

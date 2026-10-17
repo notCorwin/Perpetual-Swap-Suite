@@ -11,6 +11,9 @@ export class MarketService {
   refresh(): Promise<void>
   listRowsFor(timeframe: '5m' | '15m' | '1H'): NativeMarketRow[]
   prepareChartWindow(instId: string, timeframe: '5m' | '15m' | '1H', end?: number): Promise<PreparedChartWindow>
+  setChartUniverse(instIds: string[], timeframe: '5m' | '15m' | '1H', focusInstId?: string): Promise<{ frames: PreparedChartWindow[] }>
+  subscribePreparedCharts(listener: (frame: PreparedChartWindow) => void): () => void
+  localChartWindow(instId: string, timeframe: '5m' | '15m' | '1H'): Promise<PreparedChartWindow | null>
   dispose(): Promise<void>
   snapshot(timeframe?: '5m' | '15m' | '1H'): Promise<{ rows: NativeMarketRow[]; revision: number; error: string; loading: boolean; updatedAt: number | null; timeframe: '5m' | '15m' | '1H'; catalogSource: 'none' | 'cache' | 'live'; listProgress: { total: number; completed: number; pending: number; retrying: number; unavailable: number } }>
 }

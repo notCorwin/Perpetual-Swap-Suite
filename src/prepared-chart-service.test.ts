@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { MarketStore } from '../electron/services/market-store.js'
 import { MarketService } from '../electron/services/market-service.js'
 import { barsWithIndicators } from '../electron/services/indicators.js'
+import { PreparedChartStore } from './chart-series-store.ts'
 
 const hour = 3_600_000
 const step = 300_000
@@ -203,7 +204,7 @@ test('a new listing with zero completed candles returns terminal metadata on the
     assert.equal(result.unavailable?.availableCandles, 0)
     assert.equal(result.unavailable?.retryAt, first + 96 * step + 1_000)
     await service.prepareChartWindow(instId, '5m')
-    assert.equal(calls, 1)
+    assert.equal(calls, 0, 'A proven local listing boundary never waits for a latest HTTP request.')
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
@@ -312,4 +313,308 @@ test('an in-flight canonical series remains protected while another market finis
     await pending
     assert.equal(service.preparedCharts.series.size, 1)
   } finally { released = true; releases.splice(0).forEach(release => release()); await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('the entire navigation universe prepares locally before remote warmup and survives canonical LRU eviction', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-switch-universe-'))
+  const store = await MarketStore.open(root)
+  const ids = Array.from({ length: 12 }, (_, index) => `LOCAL${index}-USDT-SWAP`)
+  const first = Date.UTC(2024, 0, 1)
+  const frames = new Map<string, any>()
+  let calls = 0, readyAtFirstRequest = -1
+  const service = new MarketService(store, undefined, async (_input, init) => {
+    calls += 1
+    readyAtFirstRequest = frames.size
+    return new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true }))
+  }, false)
+  const unsubscribe = service.subscribePreparedCharts(frame => { frames.set(frame.instId, frame) })
+  try {
+    for (const id of ids) await store.appendCandles(Array.from({ length: 400 }, (_, index) => ({ ...candle(first + index * hour, index), instrument: id })))
+    assert.deepEqual(await service.setChartUniverse(ids, '1H', ids.at(-1)), { frames: [] })
+    await waitFor(() => frames.size === ids.length && calls > 0)
+    assert.equal(readyAtFirstRequest, ids.length, 'Every local candidate must finish before the first warm HTTP request starts.')
+    assert.ok(service.preparedCharts.series.size <= 8)
+    const calculations = service.preparedCharts.nextCalculation
+    const coldId = ids.find(id => !service.preparedCharts.series.has(`${id}:1H`))!
+    assert.ok(coldId)
+    assert.equal(await service.localChartWindow(coldId, '1H'), frames.get(coldId))
+    assert.equal(service.preparedCharts.nextCalculation, calculations, 'A compact selection never reloads an evicted canonical series.')
+    const latest = await service.prepareChartWindow(coldId, '1H')
+    assert.equal(latest.endHour, first + 399 * hour)
+    assert.equal(latest.latestEnd, latest.endHour)
+    assert.equal(latest.bars.length, 96)
+    assert.equal(calls, 1, 'A pending freshness request cannot block or duplicate selection work.')
+  } finally { unsubscribe(); await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('durable latest snapshots restart without full-series reads or calculations', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-switch-restart-'))
+  let store = await MarketStore.open(root)
+  const first = Date.UTC(2024, 0, 1)
+  const source = Array.from({ length: 400 }, (_, index) => candle(first + index * hour, index))
+  let service = new MarketService(store, undefined, async () => { throw new Error('Local snapshots never fetch.') }, false)
+  try {
+    await store.appendCandles(source)
+    const state = service.preparedCharts.state(instId, '1H')
+    state.live = { ...candle(first + 400 * hour, 400), confirmed: false }
+    state.liveVersion += 1
+    const original = await service.localChartWindow(instId, '1H')
+    assert.equal(original?.bars.length, 96)
+    assert.equal(original?.liveBar?.confirmed, false)
+    const disk = await store.readChartSnapshot(instId, '1H') as any
+    assert.equal('liveBar' in disk.frame, false)
+    assert.ok(disk.frame.bars.every((bar: any) => bar.confirmed))
+    assert.equal(disk.watermark, await store.candleWatermark(instId, '1H'))
+    await service.dispose(); await store.close()
+    store = await MarketStore.open(root)
+    service = new MarketService(store, undefined, async () => { throw new Error('Snapshot restoration never fetches.') }, false)
+    store.candles = async () => { throw new Error('A valid snapshot must not decompress the complete native series.') }
+    const restored = await service.localChartWindow(instId, '1H')
+    assert.deepEqual(restored?.bars, JSON.parse(JSON.stringify(original?.bars)))
+    assert.equal(restored?.liveBar, undefined)
+    assert.equal(service.preparedCharts.nextCalculation, 0)
+    assert.equal(service.preparedCharts.series.size, 0)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a source correction invalidates a durable snapshot even when its previous process never rebuilt it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-switch-correction-'))
+  let store = await MarketStore.open(root)
+  const first = Date.UTC(2024, 0, 1)
+  const source = Array.from({ length: 400 }, (_, index) => candle(first + index * hour, index))
+  let service = new MarketService(store, undefined, async () => { throw new Error('A complete corrected series stays local.') }, false)
+  try {
+    await store.appendCandles(source)
+    const original = await service.localChartWindow(instId, '1H')
+    await service.dispose()
+    const corrected = { ...source[250], close: 120, high: 122 }
+    source[250] = corrected
+    await store.appendCandles([corrected])
+    await store.close()
+    store = await MarketStore.open(root)
+    service = new MarketService(store, undefined, async () => { throw new Error('A correction must not fetch.') }, false)
+    const rebuilt = await service.localChartWindow(instId, '1H')
+    const expected = barsWithIndicators(source, hour).slice(-96)
+    assert.equal(service.preparedCharts.nextCalculation, 1)
+    assert.notEqual(rebuilt?.bars.at(-1)?.ema, original?.bars.at(-1)?.ema)
+    assert.equal(rebuilt?.bars.at(-1)?.ema, expected.at(-1)?.ema)
+    assert.equal((await store.readChartSnapshot(instId, '1H') as any).watermark, await store.candleWatermark(instId, '1H'))
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a partially observed new tail retains the complete latest pointer until one atomic ready publication', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-switch-tail-'))
+  const store = await MarketStore.open(root)
+  const first = Date.UTC(2024, 0, 1)
+  const source = Array.from({ length: 400 }, (_, index) => candle(first + index * hour, index))
+  const service = new MarketService(store, undefined, async () => { throw new Error('Source writes already supply this fixture.') }, false)
+  const published: any[] = []
+  const unsubscribe = service.subscribePreparedCharts(frame => { published.push(frame) })
+  try {
+    await store.appendCandles(source)
+    const original = await service.localChartWindow(instId, '1H')
+    const next = { ...candle(first + 400 * hour, 400), oi: null, buy: null, sell: null, statisticsVersion: null }
+    await service.persistCandles(instId, [next], { projectList: false })
+    const retained = await service.localChartWindow(instId, '1H')
+    assert.equal(retained?.endHour, original?.endHour)
+    assert.equal(retained?.latestEnd, original?.endHour)
+    assert.equal(retained?.generation, original?.generation)
+    const range = { from: next.timestamp, through: next.timestamp, intervalMS: hour }
+    await service.persistStatisticsSource({ instId }, '1H', next.timestamp, 1, [[String(next.timestamp), '1234']], undefined, 'statistics', false, { range, projectList: false })
+    await service.persistStatisticsSource({ instId }, '1H', next.timestamp, 2, [[String(next.timestamp), '20', '30']], undefined, 'statistics', false, { range, projectList: false })
+    await waitFor(() => published.some(frame => frame.endHour === next.timestamp))
+    const complete = await service.localChartWindow(instId, '1H')
+    assert.equal(complete?.latestEnd, next.timestamp)
+    assert.equal(complete?.generation, original?.generation)
+    assert.equal(complete?.bars.length, 96)
+    assert.ok(complete?.bars.every(bar => bar.statisticsObserved && bar.indicatorsObserved))
+    assert.equal(complete?.bars.at(-1)?.ema, barsWithIndicators([...source, next], hour).at(-1)?.ema)
+  } finally { unsubscribe(); await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('durable source-unavailable snapshots expire with their observation leases', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-switch-expiry-'))
+  let store = await MarketStore.open(root)
+  const originalNow = Date.now
+  let now = originalNow()
+  const first = Math.floor(now / hour) * hour - 400 * hour
+  const expiresAt = now + 60_000
+  const source = Array.from({ length: 400 }, (_, index) => ({ ...candle(first + index * hour, index), ...(index === 399 ? { oi: null, buy: null, sell: null, statisticsVersion: 7, statisticsOIExpiresAt: expiresAt, statisticsTakerExpiresAt: expiresAt } : {}) }))
+  let calls = 0
+  let service = new MarketService(store, undefined, async () => { calls += 1; throw new Error('A local read never fetches.') }, false)
+  try {
+    Date.now = () => now
+    await store.appendCandles(source)
+    const initial = await service.localChartWindow(instId, '1H')
+    assert.equal(initial?.oiState, 'unavailable')
+    assert.equal((await store.readChartSnapshot(instId, '1H') as any).validUntil, expiresAt)
+    await service.dispose(); await store.close()
+    now = expiresAt + 1
+    store = await MarketStore.open(root)
+    service = new MarketService(store, undefined, async () => { calls += 1; throw new Error('An expired local observation never triggers HTTP itself.') }, false)
+    const current = await service.localChartWindow(instId, '1H')
+    assert.equal(current?.endHour, first + 398 * hour, 'An expired null lease cannot remain the latest ready observation forever.')
+    assert.equal(current?.oiState, 'ready')
+    assert.equal(calls, 0)
+  } finally { Date.now = originalNow; await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('compact and historical generations stay coherent after full-series eviction and an older source expansion', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-switch-generation-'))
+  const store = await MarketStore.open(root)
+  const first = Date.UTC(2024, 0, 1)
+  const source = Array.from({ length: 900 }, (_, index) => candle(first + index * hour, index))
+  const service = new MarketService(store, undefined, async input => {
+    const url = new URL(String(input))
+    assert.ok(url.pathname.endsWith('/market/history-candles'))
+    const after = Number(url.searchParams.get('after')), limit = Number(url.searchParams.get('limit'))
+    return response(source.filter(row => row.timestamp < after).slice(-limit).reverse().map(row => [String(row.timestamp), String(row.open), String(row.high), String(row.low), String(row.close), String(row.volume), '0', String(row.quoteVolume), '1']))
+  }, false)
+  try {
+    await store.appendCandles(source.slice(-400))
+    const initial = await service.localChartWindow(instId, '1H')
+    assert.ok(initial)
+    const renderer = new PreparedChartStore()
+    renderer.ingest(initial)
+    service.preparedCharts.maxSeries = 1
+    const other = 'OTHER-USDT-SWAP'
+    await store.appendCandles(source.slice(-400).map(row => ({ ...row, instrument: other })))
+    await service.localChartWindow(other, '1H')
+    assert.equal(service.preparedCharts.series.has(`${instId}:1H`), false)
+    const sameInput = await service.prepareChartWindow(instId, '1H', source.at(-1)!.timestamp)
+    assert.equal(sameInput.generation, initial.generation)
+    renderer.ingest(sameInput)
+    assert.ok(renderer.window(instId, '1H'), 'An unchanged canonical reload must preserve the compact latest generation.')
+
+    const expanded = await service.prepareChartWindow(instId, '1H', source[650].timestamp)
+    assert.ok(expanded.generation > initial.generation)
+    renderer.ingest(expanded)
+    const latest = await service.localChartWindow(instId, '1H')
+    assert.ok(latest)
+    assert.equal(latest.generation, expanded.generation)
+    renderer.ingest(latest)
+    assert.equal(renderer.window(instId, '1H')?.endHour, latest.endHour)
+    const persisted = await store.candles({ instrument: instId, timeframe: '1H' })
+    assert.equal(latest.bars.at(-1)?.ema, barsWithIndicators(persisted, hour).at(-1)?.ema)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('an expired latest null lease keeps its in-memory close while independent refresh replaces the observation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-switch-monotonic-'))
+  const store = await MarketStore.open(root)
+  const originalNow = Date.now
+  let now = originalNow()
+  const first = Math.floor(now / hour) * hour - 400 * hour
+  const expiresAt = now + 60_000
+  const source = Array.from({ length: 400 }, (_, index) => ({ ...candle(first + index * hour, index), ...(index === 399 ? { oi: null, buy: null, sell: null, statisticsVersion: 7, statisticsOIExpiresAt: expiresAt, statisticsTakerExpiresAt: expiresAt } : {}) }))
+  let statisticsCalls = 0
+  const published: any[] = []
+  const service = new MarketService(store, undefined, async input => {
+    const url = new URL(String(input))
+    if (url.pathname.endsWith('/market/candles')) return response(source.slice(-300).reverse().map(row => [String(row.timestamp), String(row.open), String(row.high), String(row.low), String(row.close), String(row.volume), '0', String(row.quoteVolume), '1']))
+    statisticsCalls += 1
+    const begin = Number(url.searchParams.get('begin')), end = Number(url.searchParams.get('end'))
+    return response(source.filter(row => row.timestamp > begin && row.timestamp < end).map(row => url.pathname.endsWith('/open-interest-history') ? [String(row.timestamp), '1234'] : [String(row.timestamp), '20', '30']))
+  }, false)
+  const unsubscribe = service.subscribePreparedCharts(frame => { published.push(frame) })
+  try {
+    Date.now = () => now
+    await store.appendCandles(source)
+    const original = await service.localChartWindow(instId, '1H')
+    now = expiresAt + 1
+    const retained = await service.localChartWindow(instId, '1H')
+    assert.equal(retained, original)
+    assert.equal(statisticsCalls, 0, 'The local path remains independent of HTTP.')
+    const disk = await store.readChartSnapshot(instId, '1H') as any
+    assert.equal(disk.frame.endHour, original?.endHour)
+    assert.equal(disk.validUntil, expiresAt, 'Holding a visible frame must not silently renew a source lease.')
+    await service.setChartUniverse([instId], '1H', instId)
+    await waitFor(() => published.some(frame => frame.endHour === original?.endHour && frame.oiState === 'ready' && frame.takerState === 'ready'))
+    const refreshed = await service.localChartWindow(instId, '1H')
+    assert.equal(refreshed?.generation, original?.generation)
+    assert.equal(refreshed?.latestEnd, original?.latestEnd)
+    assert.equal(refreshed?.bars.at(-1)?.oi, 1_234)
+    assert.equal(statisticsCalls, 2)
+    assert.equal((await store.readChartSnapshot(instId, '1H') as any).validUntil, null)
+  } finally { Date.now = originalNow; unsubscribe(); await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+for (const mutation of ['price', 'statistics'] as const) test(`latest preparation never certifies a prior frame after an intervening ${mutation} write`, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-switch-certification-'))
+  const store = await MarketStore.open(root)
+  const first = Date.UTC(2024, 0, 1)
+  const source = Array.from({ length: 400 }, (_, index) => ({ ...candle(first + index * hour, index), oi: null, buy: null, sell: null, statisticsVersion: null }))
+  const service = new MarketService(store, undefined, async input => {
+    const url = new URL(String(input))
+    assert.ok(url.pathname.endsWith('/market/candles'))
+    return response(source.slice(-300).reverse().map(row => [String(row.timestamp), String(row.open), String(row.high), String(row.low), String(row.close), String(row.volume), '0', String(row.quoteVolume), '1']))
+  }, false)
+  const pipeline = service.preparedCharts
+  const originalPrepare = pipeline.prepareState.bind(pipeline)
+  const originalWrite = store.writeChartSnapshot.bind(store)
+  let mutated = false, mutationWatermark = 0
+  const certified: any[] = []
+  store.writeChartSnapshot = async (instrument, timeframe, snapshot) => {
+    certified.push(snapshot)
+    await originalWrite(instrument, timeframe, snapshot)
+  }
+  pipeline.prepareState = async (...args: any[]) => {
+    const frame = await originalPrepare(...args)
+    if (!mutated) {
+      mutated = true
+      if (mutation === 'price') {
+        source[250] = { ...source[250], close: 120, high: 122 }
+        await service.persistCandles(instId, [source[250]], { projectList: false })
+      } else {
+        const end = source.at(-1)!.timestamp
+        await service.persistStatisticsSource({ instId }, '1H', end, 1, [[String(end), '9999']], undefined, 'statistics', false, { range: { from: end, through: end, intervalMS: hour }, projectList: false })
+      }
+      mutationWatermark = await store.candleWatermark(instId, '1H')
+    }
+    return frame
+  }
+  try {
+    await store.appendCandles(source)
+    const prepared = await service.prepareChartWindow(instId, '1H')
+    const expectedEMA = barsWithIndicators(source, hour).at(-1)?.ema
+    assert.ok(mutated)
+    assert.ok(certified.length > 0)
+    for (const snapshot of certified.filter(value => value.watermark >= mutationWatermark)) {
+      if (mutation === 'price') assert.equal(snapshot.frame.bars.at(-1).ema, expectedEMA, 'An old EMA must never be paired with a corrected source watermark.')
+      else assert.equal(snapshot.frame.bars.at(-1).oi, 9_999, 'Statistics-only writes also invalidate a frame awaiting certification.')
+    }
+    if (mutation === 'price') assert.equal(prepared.bars.at(-1)?.ema, expectedEMA)
+    else assert.equal(prepared.bars.at(-1)?.oi, 9_999)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('shutdown settles a preparation that reaches worker admission after its source read completes', { timeout: 5_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-switch-shutdown-'))
+  const store = await MarketStore.open(root)
+  const first = Date.UTC(2024, 0, 1)
+  const source = Array.from({ length: 400 }, (_, index) => candle(first + index * hour, index))
+  const service = new MarketService(store, undefined, async () => { throw new Error('The shutdown fixture is fully local.') }, false)
+  const pipeline = service.preparedCharts
+  const originalStatistics = pipeline.ensureStatistics.bind(pipeline)
+  let reachedSourceRead = false, release = () => {}
+  const released = new Promise<void>(resolve => { release = resolve })
+  pipeline.ensureStatistics = async (...args: any[]) => {
+    await originalStatistics(...args)
+    reachedSourceRead = true
+    await released
+  }
+  try {
+    await store.appendCandles(source)
+    const pending = service.prepareChartWindow(instId, '1H', source.at(-1)!.timestamp)
+    const rejected = assert.rejects(pending, /closed/)
+    await waitFor(() => reachedSourceRead)
+    const disposed = service.dispose()
+    assert.equal(pipeline.closed, true)
+    release()
+    await Promise.all([disposed, rejected])
+    assert.equal(pipeline.worker, null)
+    assert.equal(pipeline.nextCalculation, 0)
+    assert.equal(pipeline.calculations.size, 0)
+    assert.equal(pipeline.calculationQueue.length, 0)
+  } finally { release(); await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })

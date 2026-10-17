@@ -5,6 +5,9 @@ const WARMUP = 199
 const PRICE_PAGE = 300
 const STATISTICS_PAGE = 100
 const HISTORY_PERIODS = 1_440
+const SNAPSHOT_SCHEMA = 1
+const FORMULA_VERSION = 'native-ema200-wilder-rsi6-12-24-logbb20-2-vwap14-roc9-maroc9-v1'
+const REFRESH_MS = 60_000
 const priceFields = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'quoteVolume', 'confirmed']
 const indicatorFields = ['ema', 'vwap', 'logBBUpper', 'logBBMiddle', 'logBBLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24']
 const intervalFor = timeframe => timeframe === '5m' ? 300_000 : timeframe === '15m' ? 900_000 : 3_600_000
@@ -19,6 +22,7 @@ const sourceMissing = (row, source) => source === 1 ? row.oi === null : row.buy 
 const expiryField = source => source === 1 ? 'statisticsOIExpiresAt' : 'statisticsTakerExpiresAt'
 const sourceFresh = (row, source, now = Date.now()) => sourcePresent(row, source)
   && (!sourceMissing(row, source) || Number(row[expiryField(source)]) > now)
+const seriesKey = (instId, timeframe) => `${instId}:${timeframe}`
 
 /** Durable source pages and canonical calculations are independent of UI focus. */
 export class PreparedChartPipeline {
@@ -33,14 +37,30 @@ export class PreparedChartPipeline {
     this.nextCalculation = 0
     this.worker = null
     this.closed = false
+    this.snapshots = new Map()
+    this.localTasks = new Map()
+    this.sourceVersions = new Map()
+    this.listeners = new Set()
+    this.universe = new Map()
+    this.focusKey = null
+    this.localQueue = new Map()
+    this.remoteQueue = new Map()
+    this.remoteAttempts = new Map()
+    this.localRunning = null
+    this.remoteRunning = null
+    this.warmTimer = null
+    this.refreshTimer = null
+    this.calculationQueue = []
+    this.activeCalculation = null
+    this.frameVersions = new WeakMap()
   }
 
   state(instId, timeframe) {
-    const key = `${instId}:${timeframe}`
+    const key = seriesKey(instId, timeframe)
     let state = this.series.get(key)
     if (!state) {
       state = { key, instId, timeframe, intervalMS: intervalFor(timeframe), rows: new Map(), loaded: false, loading: null,
-        priceVersion: 0, calculatedVersion: -1, calculation: null, indicators: new Map(), generation: ++this.nextGeneration, active: 0,
+        priceVersion: 0, sourceVersion: 0, calculatedVersion: -1, calculation: null, indicators: new Map(), generation: this.snapshots.get(key)?.valid ? this.snapshots.get(key).frame.generation : ++this.nextGeneration, active: 0,
         floor: null, latestTask: null, latestAt: 0, live: null, liveVersion: 0, calculatedLiveVersion: -1 }
     }
     this.series.delete(key)
@@ -59,34 +79,307 @@ export class PreparedChartPipeline {
     }
   }
 
+  subscribe(listener) {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+
+  cached(key) {
+    const snapshot = this.snapshots.get(key)
+    if (!snapshot?.valid || snapshot.validUntil !== null && snapshot.validUntil <= Date.now() || snapshot.frame.unavailable?.retryAt <= Date.now()) return null
+    return snapshot.frame
+  }
+
+  setUniverse(instIds, timeframe, focusInstId) {
+    if (!['5m', '15m', '1H'].includes(timeframe) || !Array.isArray(instIds) || instIds.some(instId => typeof instId !== 'string' || !instId)) throw new Error('Invalid chart universe.')
+    this.universe = new Map([...new Set(instIds)].map(instId => [seriesKey(instId, timeframe), { instId, timeframe }]))
+    this.focusKey = focusInstId ? seriesKey(focusInstId, timeframe) : null
+    for (const [key] of this.localQueue) if (!this.universe.has(key)) this.localQueue.delete(key)
+    for (const [key] of this.remoteQueue) if (!this.universe.has(key)) this.remoteQueue.delete(key)
+    for (const [key] of this.remoteAttempts) if (!this.universe.has(key)) this.remoteAttempts.delete(key)
+    const frames = []
+    for (const [key, target] of this.universe) {
+      const frame = this.cached(key)
+      if (frame) frames.push(frame)
+      else this.queueLocal(target.instId, timeframe)
+      this.queueRemote(target.instId, timeframe, false)
+    }
+    if (!this.localQueue.size && this.remoteQueue.size) {
+      const first = this.universe.get(this.focusKey) ?? this.universe.values().next().value
+      if (first) this.queueLocal(first.instId, first.timeframe)
+    }
+    this.scheduleRefresh()
+    this.trimSnapshots()
+    const remaining = frames.splice(16)
+    const publishBatch = () => {
+      if (this.closed) return
+      for (const frame of remaining.splice(0, 16)) if (this.universe.has(seriesKey(frame.instId, frame.timeframe))) this.emit(frame)
+      if (remaining.length) setImmediate(publishBatch)
+    }
+    if (remaining.length) setImmediate(publishBatch)
+    return { frames }
+  }
+
+  emit(frame) {
+    for (const listener of this.listeners) { try { listener(frame) } catch { /* Disconnected renderers do not stop preparation. */ } }
+  }
+
+  trimSnapshots() {
+    let extra = [...this.snapshots.keys()].filter(key => !this.universe.has(key)).length
+    for (const [key] of this.snapshots) {
+      if (extra <= 16) break
+      if (!this.universe.has(key)) { this.snapshots.delete(key); extra -= 1 }
+    }
+  }
+
+  queueLocal(instId, timeframe, force = false) {
+    if (this.closed) return
+    const key = seriesKey(instId, timeframe), previous = this.localQueue.get(key)
+    this.localQueue.set(key, { instId, timeframe, force: force || previous?.force || false })
+    if (this.warmTimer === null) {
+      this.warmTimer = setTimeout(() => { this.warmTimer = null; void this.drainLocal() }, 0)
+      this.warmTimer.unref?.()
+    }
+  }
+
+  drainLocal() {
+    if (this.localRunning || this.closed) return this.localRunning
+    const task = (async () => {
+      while (this.localQueue.size && !this.closed) {
+        const key = this.localQueue.has(this.focusKey) ? this.focusKey : this.localQueue.keys().next().value
+        const target = this.localQueue.get(key)
+        this.localQueue.delete(key)
+        try { await this.local(target.instId, target.timeframe, { force: target.force, priority: key === this.focusKey ? 'foreground' : 'background' }) }
+        catch { /* A local read failure leaves this candidate for independent source preparation. */ }
+      }
+    })().finally(() => {
+      if (this.localRunning === task) this.localRunning = null
+      if (!this.closed) { if (this.localQueue.size) void this.drainLocal(); else void this.drainRemote() }
+    })
+    this.localRunning = task
+    return task
+  }
+
+  queueRemote(instId, timeframe, schedule = true) {
+    if (this.closed) return
+    const key = seriesKey(instId, timeframe)
+    if ((this.remoteAttempts.get(key) ?? 0) <= Date.now()) this.remoteQueue.set(key, { instId, timeframe })
+    if (!schedule) return
+    if (!this.localRunning && !this.localQueue.size) {
+      // Give a universe update its complete local pass before starting HTTP.
+      if (this.warmTimer === null) this.queueLocal(instId, timeframe)
+    }
+    this.scheduleRefresh()
+  }
+
+  scheduleRefresh() {
+    if (this.refreshTimer !== null) clearTimeout(this.refreshTimer)
+    this.refreshTimer = null
+    if (this.closed || !this.universe.size) return
+    const next = Math.min(...[...this.universe.keys()].map(key => this.remoteAttempts.get(key) ?? Date.now() + REFRESH_MS))
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = null
+      for (const [key, target] of this.universe) if ((this.remoteAttempts.get(key) ?? 0) <= Date.now()) this.remoteQueue.set(key, target)
+      if (!this.localRunning && !this.localQueue.size) void this.drainRemote()
+    }, Math.max(1_000, next - Date.now()))
+    this.refreshTimer.unref?.()
+  }
+
+  drainRemote() {
+    if (this.remoteRunning || this.localRunning || this.localQueue.size || this.closed) return this.remoteRunning
+    const task = (async () => {
+      while (this.remoteQueue.size && !this.localQueue.size && !this.localRunning && !this.closed) {
+        const key = this.remoteQueue.has(this.focusKey) ? this.focusKey : this.remoteQueue.keys().next().value
+        const target = this.remoteQueue.get(key)
+        this.remoteQueue.delete(key)
+        this.remoteAttempts.set(key, Date.now() + REFRESH_MS)
+        const state = this.state(target.instId, target.timeframe)
+        state.active += 1
+        this.trim()
+        try {
+          while (!this.closed) {
+            const frame = await this.prepareState(state, undefined, { priority: 'chartWarm' })
+            if (await this.saveCompact(state, this.compact(frame))) break
+          }
+        } catch {
+          this.remoteAttempts.set(key, Date.now() + 5_000)
+        } finally { state.active -= 1; this.trim() }
+      }
+    })().finally(() => {
+      if (this.remoteRunning === task) this.remoteRunning = null
+      this.scheduleRefresh()
+      if (!this.closed && this.localQueue.size) void this.drainLocal()
+    })
+    this.remoteRunning = task
+    return task
+  }
+
+  compact(frame) {
+    const compact = frame.unavailable ? { ...frame, latestEnd: null }
+      : { ...frame, latestEnd: frame.endHour, bars: frame.bars.filter(bar => bar.hour >= frame.endHour - 95 * frame.intervalMS && bar.hour <= frame.endHour) }
+    this.frameVersions.set(compact, this.frameVersions.get(frame))
+    return compact
+  }
+
+  produced(state, frame) {
+    this.frameVersions.set(frame, state.sourceVersion)
+    return frame
+  }
+
+  async saveCompact(state, frame, version = this.frameVersions.get(frame)) {
+    if (version === undefined || state.sourceVersion !== version || frame.generation !== state.generation) return null
+    const watermark = await this.store.candleWatermark(state.instId, state.timeframe, 'background')
+    if (this.closed || state.sourceVersion !== version || frame.generation !== state.generation) return null
+    const existing = this.snapshots.get(state.key)
+    if (existing?.valid && (existing.frame.generation > frame.generation || existing.frame.generation === frame.generation && existing.frame.revision > frame.revision)) return existing.frame
+    // A lease may expire before its replacement observation is published.
+    // Keep the previously presented close in memory while freshness work
+    // revalidates it; never overwrite its expired durable lease with an older
+    // window or make the prepared latest pointer move backward.
+    if (existing?.valid && existing.frame.generation === frame.generation && existing.frame.endHour !== null && frame.endHour !== null && frame.endHour < existing.frame.endHour) return existing.frame
+    const leases = frame.bars.flatMap(bar => {
+      const row = state.rows.get(bar.hour)
+      return [1, 2].filter(source => sourceMissing(row, source)).map(source => Number(row[expiryField(source)]) || 0)
+    })
+    const validUntil = leases.length ? Math.min(...leases) : null
+    const snapshot = { schemaVersion: SNAPSHOT_SCHEMA, formulaVersion: FORMULA_VERSION, watermark, validUntil, frame }
+    // Live candles are an in-memory overlay, never a durable observation.
+    const { liveBar: _liveBar, ...confirmedFrame } = frame
+    await this.store.writeChartSnapshot(state.instId, state.timeframe, { ...snapshot, frame: confirmedFrame })
+    if (this.closed || state.sourceVersion !== version || frame.generation !== state.generation) return null
+    const changed = !existing?.valid || JSON.stringify(existing.frame) !== JSON.stringify(frame)
+    this.snapshots.set(state.key, { ...snapshot, valid: true })
+    this.trimSnapshots()
+    if (changed) this.emit(frame)
+    return frame
+  }
+
+  async restoreSnapshot(instId, timeframe, priority) {
+    const key = seriesKey(instId, timeframe), version = this.sourceVersions.get(key) ?? 0
+    const snapshot = await this.store.readChartSnapshot(instId, timeframe)
+    const frame = snapshot?.frame
+    if (snapshot?.schemaVersion !== SNAPSHOT_SCHEMA || snapshot.formulaVersion !== FORMULA_VERSION || snapshot.validUntil !== null && snapshot.validUntil <= Date.now() || !frame || frame.liveBar || frame.instId !== instId || frame.timeframe !== timeframe || frame.intervalMS !== intervalFor(timeframe)) return null
+    if (frame.unavailable) {
+      if (frame.unavailable.reason !== 'insufficient-history' || frame.unavailable.retryAt <= Date.now() || frame.bars?.length) return null
+    } else if (!Number.isSafeInteger(frame.endHour) || frame.latestEnd !== frame.endHour || frame.bars?.length !== VISIBLE
+      || frame.bars.some((bar, index) => bar.hour !== frame.endHour - (95 - index) * frame.intervalMS || !bar.confirmed || !bar.indicatorsObserved || !bar.statisticsObserved || bar.statisticsSources !== 3
+        || ![bar.open, bar.high, bar.low, bar.close].every(value => Number.isFinite(value) && value > 0)
+        || ![...indicatorFields, 'oi', 'buy', 'sell'].every(field => bar[field] === null || Number.isFinite(bar[field])))) return null
+    const watermark = await this.store.candleWatermark(instId, timeframe, priority)
+    if (snapshot.watermark !== watermark || version !== (this.sourceVersions.get(key) ?? 0) || this.closed) return null
+    const state = this.series.get(key)
+    const restored = { ...frame, generation: state?.generation ?? ++this.nextGeneration, revision: this.revision(instId) }
+    this.snapshots.set(key, { ...snapshot, frame: restored, valid: true })
+    this.emit(restored)
+    this.trimSnapshots()
+    return restored
+  }
+
+  listingFloor(state) {
+    const listedAt = Number(this.instrument(state.instId)?.listTime)
+    if (Number.isFinite(listedAt) && listedAt > 0) state.floor = Math.max(state.floor ?? -Infinity, Math.floor(listedAt / state.intervalMS) * state.intervalMS)
+  }
+
+  insufficientHistory(state) {
+    const { instId, timeframe, intervalMS: step } = state, ceiling = Math.floor(Date.now() / step) * step - step
+    if (state.floor === null || ceiling >= state.floor + (VISIBLE - 1) * step) return null
+    const latestEnd = this.latest(state)
+    const availableCandles = latestEnd === null ? 0 : Math.max(0, Math.floor((Math.min(latestEnd, ceiling) - state.floor) / step) + 1)
+    return { instId, timeframe, intervalMS: step, endHour: null, latestEnd: null, oldestHour: state.floor,
+      historyExhausted: true, generation: state.generation, revision: this.revision(instId), bars: [],
+      oiState: 'unavailable', takerState: 'unavailable', indicatorState: 'unavailable', error: '',
+      unavailable: { reason: 'insufficient-history', availableCandles, requiredCandles: VISIBLE, retryAt: state.floor + VISIBLE * step + 1_000 } }
+  }
+
+  local(instId, timeframe, { force = false, priority = 'foreground' } = {}) {
+    if (!['5m', '15m', '1H'].includes(timeframe)) return Promise.reject(new Error('Unsupported chart timeframe.'))
+    if (this.closed) return Promise.reject(new Error('Prepared chart data service is closed.'))
+    const key = seriesKey(instId, timeframe), cached = this.cached(key)
+    if (priority === 'foreground') this.focusKey = key
+    if (cached && !force) return Promise.resolve(cached)
+    if (this.localTasks.has(key)) return this.localTasks.get(key)
+    const task = (async () => {
+      if (!this.snapshots.has(key)) {
+        const saved = await this.restoreSnapshot(instId, timeframe, priority)
+        if (saved && !force) return saved
+      }
+      const state = this.state(instId, timeframe)
+      state.active += 1
+      this.trim()
+      try {
+        await this.load(state, priority)
+        this.listingFloor(state)
+        while (!this.closed) {
+          const version = state.sourceVersion
+          let frame = this.insufficientHistory(state)
+          if (!frame) {
+            const hours = [...state.rows.keys()].sort((left, right) => right - left)
+            if (hours.length < VISIBLE) return null
+            // Source absence remains an explicit observation while its lease
+            // is revalidated independently. Unknown source holes never qualify.
+            let count = 0, prior = null, end = null
+            for (const hour of hours) {
+              const row = state.rows.get(hour)
+              count = prior === null || prior - hour === state.intervalMS ? count : 0
+              count = sourceFresh(row, 1) && sourceFresh(row, 2) ? count + 1 : 0
+              prior = hour
+              if (count === VISIBLE) { end = hour + 95 * state.intervalMS; break }
+            }
+            if (end === null) return this.cached(key)
+            await this.indicators(state, priority)
+            const bars = Array.from({ length: VISIBLE }, (_, index) => this.bar(state, end - (95 - index) * state.intervalMS))
+            if (version !== state.sourceVersion) continue
+            if (bars.some(bar => !bar)) return this.cached(key)
+            frame = { instId, timeframe, intervalMS: state.intervalMS, endHour: end, latestEnd: end, oldestHour: state.floor,
+              historyExhausted: state.floor !== null && bars[0].hour <= state.floor, generation: state.generation, revision: this.revision(instId), bars,
+              oiState: bars.every(bar => bar.oi !== null) ? 'ready' : 'unavailable', takerState: bars.every(bar => bar.buy !== null && bar.sell !== null) ? 'ready' : 'unavailable',
+              indicatorState: bars.every(bar => indicatorFields.every(field => Number.isFinite(bar[field]))) ? 'ready' : 'unavailable',
+              liveBar: state.live && state.live.timestamp === end + state.intervalMS ? state.indicators.get(state.live.timestamp) : undefined, error: '' }
+          }
+          const saved = await this.saveCompact(state, frame, version)
+          if (saved) return saved
+        }
+        return null
+      } finally { state.active -= 1; this.trim() }
+    })().finally(() => { if (this.localTasks.get(key) === task) this.localTasks.delete(key) })
+    this.localTasks.set(key, task)
+    return task
+  }
+
   observe(rows, previous) {
     for (const [key, batch] of Map.groupBy(rows, row => `${row.instrument}:${row.timeframe}`)) {
       const state = this.series.get(key)
-      if (!state) continue
+      this.sourceVersions.set(key, (this.sourceVersions.get(key) ?? 0) + 1)
+      const snapshot = this.snapshots.get(key)
       let changed = false, reseed = false
-      const oldLatest = extremeHour(state.rows) ?? -Infinity
+      const oldLatest = Math.max(state ? extremeHour(state.rows) ?? -Infinity : -Infinity, snapshot?.frame.endHour ?? -Infinity)
       for (const row of batch) {
         const old = previous.get(row.timestamp)
         if (priceChanged(old, row)) {
           changed = true
-          if (state.loaded && row.timestamp <= oldLatest) reseed = true
+          if (row.timestamp <= oldLatest) reseed = true
         }
-        if (state.loaded) state.rows.set(row.timestamp, this.normalize(row))
+        if (state?.loaded) state.rows.set(row.timestamp, this.normalize(row))
       }
-      if (changed) state.priceVersion += 1
-      if (reseed) state.generation = ++this.nextGeneration
+      if (state) {
+        state.sourceVersion += 1
+        if (changed) state.priceVersion += 1
+        if (reseed) state.generation = ++this.nextGeneration
+      }
+      if (snapshot && reseed) snapshot.valid = false
+      if (this.universe.has(key) || snapshot) this.queueLocal(batch[0].instrument, batch[0].timeframe, true)
     }
     this.trim()
   }
 
-  async load(state) {
+  async load(state, priority = 'foreground') {
     if (state.loaded) return
     if (state.loading) return state.loading
     state.loading = (async () => {
       while (!this.closed) {
-        const version = state.priceVersion
-        const rows = await this.store.candles({ instrument: state.instId, timeframe: state.timeframe }, 'foreground')
-        if (version !== state.priceVersion) continue
+        const version = state.sourceVersion
+        const rows = await this.store.candles({ instrument: state.instId, timeframe: state.timeframe }, priority)
+        if (version !== state.sourceVersion) continue
         state.rows = new Map(rows.filter(row => row.confirmed).map(row => [row.timestamp, this.normalize(row)]))
         state.loaded = true
         return
@@ -109,15 +402,15 @@ export class PreparedChartPipeline {
 
   latest(state) { return extremeHour(state.rows) }
 
-  async refreshLatest(state) {
+  async refreshLatest(state, priority = 'prepared') {
     if (state.latestTask) return state.latestTask
     if (state.latestAt + 60_000 > Date.now()) return
     state.latestTask = (async () => {
-      const values = await this.get('/market/candles', { instId: state.instId, bar: state.timeframe, limit: PRICE_PAGE })
+      const values = await this.get('/market/candles', { instId: state.instId, bar: state.timeframe, limit: PRICE_PAGE }, priority)
       const rows = values.map(value => this.parseCandle(state.instId, state.timeframe, value)).filter(Boolean)
       const insufficientListing = state.floor !== null && Math.floor(Date.now() / state.intervalMS) * state.intervalMS - state.intervalMS < state.floor + (VISIBLE - 1) * state.intervalMS
       if (!rows.some(row => row.confirmed) && this.latest(state) === null && !insufficientListing) throw new Error('OKX has not provided completed source candles.')
-      await this.persistCandles(state.instId, rows.filter(row => row.confirmed))
+      await this.persistCandles(state.instId, rows.filter(row => row.confirmed), priority)
       const live = rows.find(row => !row.confirmed) ?? null
       if (JSON.stringify(live) !== JSON.stringify(state.live)) { state.live = live; state.liveVersion += 1 }
       if (state.timeframe === '5m' && live) this.liveCandles.set(state.instId, live)
@@ -126,7 +419,7 @@ export class PreparedChartPipeline {
     return state.latestTask
   }
 
-  async priceBlock(state, block, through) {
+  async priceBlock(state, block, through, priority = 'prepared') {
     const step = state.intervalMS, from = block * PRICE_PAGE * step
     const end = Math.min(from + (PRICE_PAGE - 1) * step, through)
     return this.job(`price:${state.key}:${block}`, async () => {
@@ -136,7 +429,7 @@ export class PreparedChartPipeline {
         const cursor = missing.at(-1)
         const first = missing[0]
         const limit = Math.min(PRICE_PAGE, Math.floor((cursor - first) / step) + 1)
-        const values = await this.get('/market/history-candles', { instId: state.instId, bar: state.timeframe, limit, after: cursor + step })
+        const values = await this.get('/market/history-candles', { instId: state.instId, bar: state.timeframe, limit, after: cursor + step }, priority)
         const rows = values.map(value => this.parseCandle(state.instId, state.timeframe, value)).filter(row => row?.confirmed)
         if (!rows.length) {
           const oldest = extremeHour(state.rows, true)
@@ -144,15 +437,15 @@ export class PreparedChartPipeline {
             // An empty historical cursor, rather than the resident cache edge,
             // proves the provider boundary. Verify it before restricting scroll.
             for (let attempt = 0; attempt < 2; attempt += 1) {
-              const check = await this.get('/market/history-candles', { instId: state.instId, bar: state.timeframe, limit: 1, after: cursor + step })
+              const check = await this.get('/market/history-candles', { instId: state.instId, bar: state.timeframe, limit: 1, after: cursor + step }, priority)
               if (check.some(value => this.parseCandle(state.instId, state.timeframe, value)?.confirmed)) throw new Error('OKX historical candle boundary is not stable; retry this range.')
             }
-            state.floor = await this.discoverFloor(state, cursor, oldest)
+            state.floor = await this.discoverFloor(state, cursor, oldest, priority)
             return
           }
           throw new Error('OKX did not provide the missing source candle range.')
         }
-        await this.persistCandles(state.instId, rows)
+        await this.persistCandles(state.instId, rows, priority)
         const before = missing.length
         for (let index = missing.length - 1; index >= 0; index -= 1) if (state.rows.has(missing[index]) || state.floor !== null && missing[index] < state.floor) missing.splice(index, 1)
         if (missing.length === before) throw new Error('OKX source candle cursor did not advance.')
@@ -160,20 +453,20 @@ export class PreparedChartPipeline {
     })
   }
 
-  async discoverFloor(state, emptyThrough, knownHour) {
+  async discoverFloor(state, emptyThrough, knownHour, priority = 'prepared') {
     const step = state.intervalMS
     let lower = emptyThrough + step, upper = knownHour
     // An empty far-past cursor does not make the resident cache edge the
     // listing edge. Locate the first actual provider observation in between.
     for (let attempt = 0; lower < upper && attempt < 48; attempt += 1) {
       const middle = lower + Math.floor((upper - lower) / step / 2) * step
-      const values = await this.get('/market/history-candles', { instId: state.instId, bar: state.timeframe, limit: 1, after: middle + step })
+      const values = await this.get('/market/history-candles', { instId: state.instId, bar: state.timeframe, limit: 1, after: middle + step }, priority)
       const rows = values.map(value => this.parseCandle(state.instId, state.timeframe, value)).filter(row => row?.confirmed)
       if (!rows.length) lower = middle + step
       else {
         const earliest = Math.min(...rows.map(row => row.timestamp))
         if (earliest < lower || earliest > middle) throw new Error('OKX historical candle boundary changed during preparation.')
-        await this.persistCandles(state.instId, rows)
+        await this.persistCandles(state.instId, rows, priority)
         upper = earliest
       }
     }
@@ -181,7 +474,7 @@ export class PreparedChartPipeline {
     return upper
   }
 
-  async ensurePrices(state, from, through) {
+  async ensurePrices(state, from, through, priority = 'prepared') {
     const size = PRICE_PAGE * state.intervalMS
     while (true) {
       const blocks = new Set()
@@ -192,13 +485,13 @@ export class PreparedChartPipeline {
       // Fill stable blocks only through known/requested completed data. The
       // exchange may publish its latest completed candle slightly late.
       const latestClosed = Math.min(Math.floor(Date.now() / state.intervalMS) * state.intervalMS - state.intervalMS, Math.max(through, this.latest(state) ?? through))
-      for (const block of [...blocks].sort((left, right) => right - left)) await this.priceBlock(state, block, latestClosed)
+      for (const block of [...blocks].sort((left, right) => right - left)) await this.priceBlock(state, block, latestClosed, priority)
       // A concurrent request can have shared a shorter live-tail block. Read
       // its committed rows before asking for any still-missing extension.
     }
   }
 
-  async statisticsBlock(state, block, source) {
+  async statisticsBlock(state, block, source, priority = 'prepared') {
     const step = state.intervalMS, from = block * STATISTICS_PAGE * step
     const end = Math.min(from + (STATISTICS_PAGE - 1) * step, this.latest(state))
     if (end < from) return
@@ -216,15 +509,15 @@ export class PreparedChartPipeline {
         const path = source === 1 ? '/rubik/stat/contracts/open-interest-history' : '/rubik/stat/taker-volume-contract'
         const parameters = { instId: state.instId, period: state.timeframe, limit: STATISTICS_PAGE, begin: earliest - 1, end: latest + 1 }
         if (source === 2) parameters.unit = 1
-        values = await this.get(path, parameters)
+        values = await this.get(path, parameters, priority)
       }
       // Only successful source observations (including a known retention
       // boundary) become terminal nulls. Transport errors leave the page pending.
-      await this.persistStatistics({ instId: state.instId }, state.timeframe, end, source, values, { from, through: end, intervalMS: step })
+      await this.persistStatistics({ instId: state.instId }, state.timeframe, end, source, values, { from, through: end, intervalMS: step }, priority)
     })
   }
 
-  async ensureStatistics(state, from, through) {
+  async ensureStatistics(state, from, through, priority = 'prepared') {
     const size = STATISTICS_PAGE * state.intervalMS
     const pages = new Map()
     for (let hour = from; hour <= through; hour += state.intervalMS) {
@@ -236,12 +529,13 @@ export class PreparedChartPipeline {
     }
     // A known complete 96-window must not wait for a page's four extra
     // observations. They will be prepared when a neighbor actually needs them.
-    const completed = await Promise.allSettled([...pages.values()].map(({ block, source }) => this.statisticsBlock(state, block, source)))
+    const completed = await Promise.allSettled([...pages.values()].map(({ block, source }) => this.statisticsBlock(state, block, source, priority)))
     const failure = completed.find(result => result.status === 'rejected')
     if (failure) throw failure.reason
   }
 
-  calculate(candles, intervalMS) {
+  drainCalculations() {
+    if (this.activeCalculation !== null || this.closed || !this.calculationQueue.length) return
     if (!this.worker) {
       this.worker = new Worker(new URL('./prepared-chart-worker.js', import.meta.url))
       this.worker.unref()
@@ -249,32 +543,46 @@ export class PreparedChartPipeline {
         const pending = this.calculations.get(id)
         if (!pending) return
         this.calculations.delete(id)
-        if (!this.calculations.size) this.worker?.unref()
+        this.activeCalculation = null
         if (error) pending.reject(new Error(error))
         else pending.resolve(bars)
+        this.drainCalculations()
+        if (!this.calculations.size) this.worker?.unref()
       })
       this.worker.on('error', error => {
         for (const pending of this.calculations.values()) pending.reject(error)
         this.calculations.clear()
+        this.calculationQueue = []
+        this.activeCalculation = null
         this.worker = null
       })
     }
-    const id = ++this.nextCalculation
+    const index = this.calculationQueue.findIndex(id => this.calculations.get(id)?.priority === 'foreground')
+    const [id] = this.calculationQueue.splice(index < 0 ? 0 : index, 1)
+    const pending = this.calculations.get(id)
+    this.activeCalculation = id
     this.worker.ref()
+    this.worker.postMessage({ id, candles: pending.candles, intervalMS: pending.intervalMS })
+  }
+
+  calculate(candles, intervalMS, priority = 'foreground') {
+    if (this.closed) return Promise.reject(new Error('Prepared chart data service is closed.'))
+    const id = ++this.nextCalculation
     return new Promise((resolve, reject) => {
-      this.calculations.set(id, { resolve, reject })
-      this.worker.postMessage({ id, candles, intervalMS })
+      this.calculations.set(id, { resolve, reject, candles, intervalMS, priority })
+      this.calculationQueue.push(id)
+      this.drainCalculations()
     })
   }
 
-  async indicators(state) {
+  async indicators(state, priority = 'foreground') {
     if (state.calculation) return state.calculation
     const task = (async () => {
       while (state.calculatedVersion !== state.priceVersion || state.calculatedLiveVersion !== state.liveVersion) {
         const version = state.priceVersion, liveVersion = state.liveVersion
         const candles = [...state.rows.values()].map(row => Object.fromEntries(priceFields.map(field => [field, row[field]])))
         if (state.live && !state.rows.has(state.live.timestamp)) candles.push(state.live)
-        const bars = await this.calculate(candles, state.intervalMS)
+        const bars = await this.calculate(candles, state.intervalMS, priority)
         if (version !== state.priceVersion || liveVersion !== state.liveVersion) continue
         state.indicators = new Map(bars.map(bar => [bar.hour, bar]))
         state.calculatedVersion = version
@@ -302,40 +610,56 @@ export class PreparedChartPipeline {
   async prepare(instId, timeframe, targetEnd) {
     if (!['5m', '15m', '1H'].includes(timeframe)) throw new Error('Unsupported chart timeframe.')
     if (targetEnd !== undefined && !Number.isFinite(targetEnd)) throw new Error('Invalid chart window end.')
+    if (targetEnd === undefined) {
+      const local = await this.local(instId, timeframe)
+      if (local) { this.queueRemote(instId, timeframe); return local }
+    }
     const state = this.state(instId, timeframe)
     state.active += 1
-    try { return await this.prepareState(state, targetEnd) }
+    this.trim()
+    try {
+      while (!this.closed) {
+        const frame = await this.prepareState(state, targetEnd)
+        if (targetEnd === undefined) {
+          const saved = await this.saveCompact(state, this.compact(frame))
+          if (saved) return saved
+        } else {
+          if (this.universe.has(state.key)) this.queueLocal(instId, timeframe, true)
+          return frame
+        }
+      }
+      throw new Error('Prepared chart data service is closed.')
+    }
     finally { state.active -= 1; this.trim() }
   }
 
-  async prepareState(state, targetEnd) {
+  async prepareState(state, targetEnd, { priority = 'prepared' } = {}) {
     const { instId, timeframe, intervalMS: step } = state
-    await this.load(state)
-    const listedAt = Number(this.instrument(instId)?.listTime)
-    if (Number.isFinite(listedAt) && listedAt > 0) state.floor = Math.max(state.floor ?? -Infinity, Math.floor(listedAt / step) * step)
-    if (targetEnd === undefined) await this.refreshLatest(state)
+    await this.load(state, priority === 'chartWarm' ? 'background' : 'foreground')
+    this.listingFloor(state)
+    if (targetEnd === undefined) await this.refreshLatest(state, priority)
     let latestEnd = this.latest(state)
     const ceiling = Math.floor(Date.now() / step) * step - step
     if (state.floor !== null && ceiling < state.floor + (VISIBLE - 1) * step) {
       // The listing timestamp proves that 96 completed periods cannot exist
       // yet. Do not ask the exchange to repair future, nonexistent candles.
       const availableCandles = latestEnd === null ? 0 : Math.max(0, Math.floor((Math.min(latestEnd, ceiling) - state.floor) / step) + 1)
-      return { instId, timeframe, intervalMS: step, endHour: null, latestEnd, oldestHour: state.floor,
+      return this.produced(state, { instId, timeframe, intervalMS: step, endHour: null, latestEnd, oldestHour: state.floor,
         historyExhausted: true, generation: state.generation, revision: this.revision(instId), bars: [],
         oiState: 'unavailable', takerState: 'unavailable', indicatorState: 'unavailable', error: '',
-        unavailable: { reason: 'insufficient-history', availableCandles, requiredCandles: VISIBLE, retryAt: state.floor + VISIBLE * step + 1_000 } }
+        unavailable: { reason: 'insufficient-history', availableCandles, requiredCandles: VISIBLE, retryAt: state.floor + VISIBLE * step + 1_000 } })
     }
     if (latestEnd === null && targetEnd === undefined) throw new Error('No completed source candles are available.')
     let end = Math.min(targetEnd === undefined ? latestEnd : Math.floor(targetEnd / step) * step, ceiling)
     if (state.floor !== null) end = Math.max(end, state.floor + (VISIBLE - 1) * step)
     if (latestEnd !== null && targetEnd === undefined) end = Math.min(end, latestEnd)
-    await this.ensurePrices(state, Math.max(end - (VISIBLE - 1 + WARMUP) * step, state.floor ?? -Infinity), end)
+    await this.ensurePrices(state, Math.max(end - (VISIBLE - 1 + WARMUP) * step, state.floor ?? -Infinity), end, priority)
     latestEnd = this.latest(state)
     if (state.floor !== null) {
       const clampedEnd = Math.min(latestEnd, Math.max(end, state.floor + (VISIBLE - 1) * step))
       if (clampedEnd !== end) {
         end = clampedEnd
-        await this.ensurePrices(state, Math.max(end - (VISIBLE - 1 + WARMUP) * step, state.floor), end)
+        await this.ensurePrices(state, Math.max(end - (VISIBLE - 1 + WARMUP) * step, state.floor), end, priority)
         latestEnd = this.latest(state)
       }
     }
@@ -345,8 +669,9 @@ export class PreparedChartPipeline {
       if (!state.rows.has(hour)) throw new Error('A complete 96-candle source window is not available.')
       available.push(state.rows.get(hour))
     }
-    await this.ensureStatistics(state, first, end)
-    await this.indicators(state)
+    await this.ensureStatistics(state, first, end, priority)
+    do { await this.indicators(state, priority === 'chartWarm' ? 'background' : 'foreground') }
+    while (state.calculatedVersion !== state.priceVersion || state.calculatedLiveVersion !== state.liveVersion)
     const generation = state.generation
     const central = available.map(row => this.bar(state, row.timestamp))
     if (central.some(bar => !bar)) throw new Error('Chart statistics have not completed preparation.')
@@ -358,18 +683,26 @@ export class PreparedChartPipeline {
     const oiState = central.every(bar => bar.oi !== null) ? 'ready' : 'unavailable'
     const takerState = central.every(bar => bar.buy !== null && bar.sell !== null) ? 'ready' : 'unavailable'
     const indicatorState = central.every(bar => indicatorFields.every(field => Number.isFinite(bar[field]))) ? 'ready' : 'unavailable'
-    return { instId, timeframe, intervalMS: step, endHour: end, latestEnd, oldestHour: state.floor,
+    return this.produced(state, { instId, timeframe, intervalMS: step, endHour: end, latestEnd, oldestHour: state.floor,
       historyExhausted: state.floor !== null && first <= state.floor, generation, revision: this.revision(instId),
       bars: [...before, ...central, ...after], oiState, takerState, indicatorState,
-      liveBar: targetEnd === undefined && state.live ? state.indicators.get(state.live.timestamp) : undefined, error: '' }
+      liveBar: targetEnd === undefined && state.live ? state.indicators.get(state.live.timestamp) : undefined, error: '' })
   }
 
   async dispose() {
     this.closed = true
+    if (this.warmTimer !== null) clearTimeout(this.warmTimer)
+    if (this.refreshTimer !== null) clearTimeout(this.refreshTimer)
+    this.localQueue.clear()
+    this.remoteQueue.clear()
+    this.listeners.clear()
     for (const pending of this.calculations.values()) pending.reject(new Error('Prepared chart data service is closed.'))
     this.calculations.clear()
+    this.calculationQueue = []
+    this.activeCalculation = null
     const worker = this.worker
     this.worker = null
     if (worker) await worker.terminate()
+    await Promise.allSettled([this.localRunning, this.remoteRunning, ...this.localTasks.values()].filter(Boolean))
   }
 }

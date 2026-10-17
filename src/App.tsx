@@ -25,6 +25,7 @@ import { PERCENT_CHANGE_DESCRIPTION, formatPercent, percentageNumber, type Perce
 import { BREAK_DESCRIPTION, describeBreak, formatBreakPriorAge, formatBreakTime, type BreakDirection, type BreakResult } from "@/market-breaks"
 import { BANDWIDTH_EXPANSION_DESCRIPTION, LOG_BB_DESCRIPTION, formatBandWidthExpansion, formatLiveBand } from "@/market-logbb"
 import { MarketChart } from "@/MarketChart"
+import { chartController } from '@/chart-controller'
 import type { PreparedChartResponse } from '@/chart-data'
 import { OPPORTUNITY_DESCRIPTION } from "@/market-opportunity"
 import { MarketOpportunity } from "@/MarketOpportunity"
@@ -74,6 +75,8 @@ type NativeBridge = {
   postMessage(request: { windowTintRGB: number[] }): Promise<{ ok: boolean }>
   postMessage(request: { previewWindowBlur: number | null }): Promise<{ ok: boolean }>
   postMessage(request: { chartWindow: { instId: string; timeframe: RadarTimeframe; endHour?: number } }): Promise<PreparedChartResponse>
+  postMessage(request: { chartLocal: { instId: string; timeframe: RadarTimeframe } }): Promise<PreparedChartResponse | null>
+  postMessage(request: { chartUniverse: { instIds: string[]; timeframe: RadarTimeframe; focusInstId?: string } }): Promise<{ frames: PreparedChartResponse[] }>
 }
 declare global {
   interface Window { radarNotificationContract?: string; radarNotificationStrategy?: string; radarAppearance?: WindowAppearance & { nativeWindowBackground?: boolean }; webkit: { messageHandlers: { radar: NativeBridge } } }
@@ -178,6 +181,11 @@ const MarketRows = memo(function MarketRows({ rows, onSelect, onExplain, canExpl
 })
 
 function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: boolean; onResearch: (inputs: ResearchInputs, spec?: StudySpec) => void; onDecisions: (inputs: ResearchInputs, tab?: 'rules' | 'signals') => void; switchingMode: boolean }) {
+  useEffect(() => {
+    const receive = (event: Event) => chartController.ingestPrepared((event as CustomEvent<PreparedChartResponse>).detail)
+    window.addEventListener('radar-chart-prepared', receive)
+    return () => window.removeEventListener('radar-chart-prepared', receive)
+  }, [])
   const revision = useRef(-1)
   const serviceSession = useRef<string | undefined>(undefined)
   const snapshotOrder = useRef(new SnapshotOrder())
@@ -422,6 +430,10 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
   const unknownCount = useMemo(() => searchedRows.filter(row => results[row.instId] === "unknown").length, [searchedRows, results])
   const listOrder = useMemo(() => visible.map(row => row.instId), [visible])
   const turnoverOrder = useMemo(() => [...eligibleRows].sort(compareMarketTurnover).map(row => row.instId), [eligibleRows])
+  const chartCandidates = useMemo(() => [...new Set([...(signalChartOrder ?? []), ...listOrder, ...turnoverOrder])], [signalChartOrder, listOrder, turnoverOrder])
+  useEffect(() => {
+    chartController.setUniverse(active && ready ? chartCandidates : [], timeframe)
+  }, [active, ready, chartCandidates, timeframe])
   useEffect(() => {
     if (activeProfile) {
       setListFilters(parseFilterConfig(activeProfile.universeJSON))

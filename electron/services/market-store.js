@@ -1,5 +1,5 @@
 import { DuckDBInstance } from '@duckdb/node-api'
-import { mkdir, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 const quote = value => `'${String(value).replaceAll("'", "''")}'`
@@ -45,6 +45,8 @@ export class MarketStore {
     this.closed = false
     this.closeTask = null
     this.coverages = new Map()
+    this.watermarks = new Map()
+    this.chartSnapshotWrites = new Map()
   }
 
   // DuckDB connections are not a concurrent query coordinator. Keep every
@@ -144,7 +146,13 @@ export class MarketStore {
       }
       // Coverage only changes when rows are written. Invalidate per
       // instrument so unrelated instruments keep serving cached scans.
-      for (const candle of candles) this.coverages.delete(`${candle.instrument}:${candle.timeframe}`)
+      for (const candle of candles) {
+        const key = `${candle.instrument}:${candle.timeframe}`
+        this.coverages.delete(key)
+        // An existing cached maximum includes all older partitions. Without
+        // it, the next validation reads the actual maximum from Parquet.
+        if (this.watermarks.has(key)) this.watermarks.set(key, Math.max(this.watermarks.get(key), writtenAt))
+      }
       return candles.length
     }
     return this.enqueue(write, priority)
@@ -158,6 +166,47 @@ export class MarketStore {
       const result = await this.connection.runAndReadAll(`SELECT * EXCLUDE (row_rank) FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY timestamp ORDER BY COALESCE(writtenAt, 0) DESC) AS row_rank FROM read_parquet(${list}, union_by_name = true) WHERE timestamp >= ${Number(from)} AND timestamp <= ${Number(through)}) WHERE row_rank = 1 ORDER BY timestamp`)
       return result.getRowObjectsJS().map(normalizeCandleRow)
     }, priority)
+  }
+
+  async candleWatermark(instrument, timeframe, priority = 'background') {
+    const key = `${instrument}:${timeframe}`
+    return this.enqueue(async () => {
+      if (this.watermarks.has(key)) return this.watermarks.get(key)
+      const files = await this.parquetFiles(instrument, timeframe)
+      let watermark = 0
+      if (files.length) {
+        const list = `[${files.map(quote).join(', ')}]`
+        const rows = (await this.connection.runAndReadAll(`SELECT MAX(COALESCE(writtenAt, 0)) AS watermark FROM read_parquet(${list}, union_by_name = true)`)).getRowObjectsJS()
+        watermark = Number(rows[0]?.watermark ?? 0)
+      }
+      this.watermarks.set(key, watermark)
+      return watermark
+    }, priority)
+  }
+
+  chartSnapshotFile(instrument, timeframe) {
+    return join(this.root, 'prepared-charts', safeSegment(timeframe), `${safeSegment(instrument)}.json`)
+  }
+
+  async readChartSnapshot(instrument, timeframe) {
+    try { return JSON.parse(await readFile(this.chartSnapshotFile(instrument, timeframe), 'utf8')) }
+    catch { return null }
+  }
+
+  writeChartSnapshot(instrument, timeframe, snapshot) {
+    const key = `${instrument}:${timeframe}`, previous = this.chartSnapshotWrites.get(key) ?? Promise.resolve()
+    const task = previous.catch(() => undefined).then(async () => {
+      const directory = join(this.root, 'prepared-charts', safeSegment(timeframe))
+      await mkdir(directory, { recursive: true })
+      const target = this.chartSnapshotFile(instrument, timeframe)
+      const temporary = `${target}.${process.pid}-${Math.random().toString(16).slice(2)}.tmp`
+      try {
+        await writeFile(temporary, JSON.stringify(snapshot), { mode: 0o600 })
+        await rename(temporary, target)
+      } finally { await rm(temporary, { force: true }) }
+    }).finally(() => { if (this.chartSnapshotWrites.get(key) === task) this.chartSnapshotWrites.delete(key) })
+    this.chartSnapshotWrites.set(key, task)
+    return task
   }
 
   // Gap detection only needs timestamp presence. Reading the timestamp
@@ -289,6 +338,7 @@ export class MarketStore {
       // A late background repair must finish before the connection closes,
       // exactly as the old promise-chain lane guaranteed.
       while (this.draining || this.queue.length) await new Promise(resolve => setImmediate(resolve))
+      await Promise.allSettled([...this.chartSnapshotWrites.values()])
       this.connection.closeSync()
     })()
     return this.closeTask

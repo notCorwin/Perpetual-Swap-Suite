@@ -24,7 +24,7 @@ const LATEST_CANDLE_REFRESH = 60_000
 const HISTORICAL_STATISTICS_REFRESH = 6 * 3_600_000
 const HISTORY_BOUNDARY_EMPTY_RESPONSES = 3
 const REQUEST_TIMEOUT = 12_000
-const REQUEST_PRIORITY = { background: 0, warmup: 1, statistics: 2, foreground: 3, repair: 4, prepared: 5 }
+const REQUEST_PRIORITY = { background: 0, chartWarm: 0, warmup: 1, statistics: 2, foreground: 3, repair: 4, prepared: 5 }
 // OKX applies the relevant public limits per endpoint family. A single global
 // queue turns those independent budgets into artificial serial work: a candle
 // repair used to hold OI and Taker behind it (and could even abort them).
@@ -351,11 +351,11 @@ export class MarketService {
     this.requestTimeout = Number.isFinite(requestTimeout) && requestTimeout > 0 ? requestTimeout : REQUEST_TIMEOUT
     this.preparedCharts = new PreparedChartPipeline({
       store,
-      get: (path, parameters) => this.get(path, parameters, this.shutdownController.signal, 'prepared'),
+      get: (path, parameters, priority = 'prepared') => this.get(path, parameters, this.shutdownController.signal, priority),
       parseCandle: candle,
       normalize: normalizedStatistics,
-      persistCandles: (instId, rows) => this.persistCandles(instId, rows, { projectList: false, priority: 'foreground' }),
-      persistStatistics: (instrument, timeframe, end, source, values, range) => this.persistStatisticsSource(instrument, timeframe, end, source, values, this.shutdownController.signal, 'prepared', false, { range, projectList: false }),
+      persistCandles: (instId, rows, priority) => this.persistCandles(instId, rows, { projectList: false, priority: priority === 'chartWarm' ? 'background' : 'foreground' }),
+      persistStatistics: (instrument, timeframe, end, source, values, range, priority = 'prepared') => this.persistStatisticsSource(instrument, timeframe, end, source, values, this.shutdownController.signal, priority, false, { range, projectList: false }),
       revision: instId => this.dataRevision(instId),
       liveCandles: this.liveCandles,
       instrument: instId => this.instruments.get(instId),
@@ -1016,7 +1016,7 @@ export class MarketService {
     const page = range ?? this.statisticsPageRange(timeframe, end)
     const expiresAt = this.statisticsExpiry(timeframe, end)
     const expiryField = statisticsExpiryField(source)
-    const storePriority = priority === 'background' ? 'background' : 'foreground'
+    const storePriority = priority === 'background' || priority === 'chartWarm' ? 'background' : 'foreground'
     const changed = await this.enqueueCandleMutation(instrument.instId, async () => {
       if (this.disposed || signal?.aborted) return false
       const local = (await this.store.candles({ instrument: instrument.instId, timeframe, from: page.from, through: page.through }, storePriority)).map(normalizedStatistics)
@@ -1227,6 +1227,18 @@ export class MarketService {
     const task = this.preparedCharts.prepare(instId, timeframe, end)
     this.barTasks.add(task)
     return task.finally(() => this.barTasks.delete(task))
+  }
+
+  setChartUniverse(instIds, timeframe, focusInstId) {
+    if (this.disposed) return Promise.reject(new Error('Market service is closed.'))
+    return Promise.resolve(this.preparedCharts.setUniverse(instIds, timeframe, focusInstId))
+  }
+
+  subscribePreparedCharts(listener) { return this.preparedCharts.subscribe(listener) }
+
+  localChartWindow(instId, timeframe) {
+    if (this.disposed) return Promise.reject(new Error('Market service is closed.'))
+    return this.preparedCharts.local(instId, timeframe)
   }
 
   async dispose() {

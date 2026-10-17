@@ -29,13 +29,14 @@ const waitFor = async (predicate: () => boolean, timeout = 500) => {
 function transportQueue() {
   const calls: Array<{ target: ChartTarget; requestedAt: number; resolve: (response: PreparedChartResponse) => void; reject: (error: Error) => void }> = []
   let active = 0, maximumActive = 0
-  const transport = (target: ChartTarget) => {
+  const prepare = (target: ChartTarget) => {
     active += 1
     maximumActive = Math.max(maximumActive, active)
     return new Promise<PreparedChartResponse>((resolve, reject) => {
       calls.push({ target, requestedAt: Date.now(), resolve, reject })
     }).finally(() => { active -= 1 })
   }
+  const transport = { prepare, local: async () => null, universe: async () => ({ frames: [] }) }
   return { calls, transport, maximumActive: () => maximumActive }
 }
 function cached(first = 1_000, count = 200) {
@@ -53,6 +54,7 @@ test('an initial chart becomes visible only as one complete prepared window', as
   try {
     assert.equal(controller.getSnapshot().presented, null)
     assert.equal(controller.getSnapshot().pending, true)
+    await settled()
     queue.calls[0].resolve(prepared(btc, 199))
     await settled()
     assert.equal(controller.getSnapshot().presented?.endHour, 199 * hour)
@@ -89,6 +91,7 @@ test('rapid uncached scrolling preserves the complete frame and prepares only th
     assert.equal(controller.getSnapshot().requested?.end, 499 * hour)
     assert.equal(controller.getSnapshot().presented, original)
     assert.equal(controller.getSnapshot().pending, true)
+    assert.equal(queue.calls.length, 1, 'Same-series provider work coalesces behind its current history request.')
     queue.calls[0].resolve(prepared(btc, 999, { latestEnd: 1_199 * hour }))
     await settled()
     assert.equal(queue.calls[1].target.end, 499 * hour)
@@ -167,6 +170,7 @@ test('a preparation failure retries the current target without publishing partia
   const controller = new ChartController(queue.transport)
   const close = controller.open(btc, '1H')
   try {
+    await settled()
     queue.calls[0].reject(new Error('Temporary source failure'))
     await settled()
     assert.equal(controller.getSnapshot().pending, true)
@@ -188,6 +192,7 @@ test('explicitly unavailable observations are ready and do not wait for fabricat
   const controller = new ChartController(queue.transport)
   const close = controller.open(btc, '1H')
   try {
+    await settled()
     queue.calls[0].resolve(prepared(btc, 199, { bars: bars(104, 96).map(bar => ({ ...bar, oi: null, buy: null, sell: null, ema: null })) }))
     await settled()
     const view = controller.getSnapshot()
@@ -283,6 +288,7 @@ test('a listing with insufficient history stops preparation until its meaningful
   const previous = controller.getSnapshot().presented
   const closeETH = controller.open(eth, '1H')
   try {
+    await settled()
     const unavailable = { reason: 'insufficient-history' as const, availableCandles: 40, requiredCandles: 96 as const, retryAt: Date.now() + 100 }
     queue.calls[0].resolve(prepared(eth, 39, { bars: [], endHour: null, oldestHour: 0, historyExhausted: true, unavailable }))
     await settled()
@@ -325,4 +331,124 @@ test('a stale unavailable response cannot replace the latest requested range', a
     assert.equal(controller.getSnapshot().unavailable, null)
     assert.equal(controller.getSnapshot().pending, false)
   } finally { close() }
+})
+
+test('all candidate latest frames switch synchronously beyond the history LRU without resending reordered universes', async () => {
+  const queue = transportQueue()
+  const ids = Array.from({ length: 20 }, (_, index) => `NAV${index}-USDT-SWAP`)
+  let universeCalls = 0, localCalls = 0
+  const controller = new ChartController({
+    ...queue.transport,
+    local: async () => { localCalls += 1; return null },
+    universe: async () => { universeCalls += 1; return { frames: ids.map((id, index) => prepared(id, 199, { bars: bars(104, 96).map(bar => ({ ...bar, close: 200 + index, high: 201 + index })) })) } },
+  })
+  controller.setUniverse(ids, '1H')
+  await settled()
+  const releases: Array<() => void> = []
+  try {
+    for (const [index, id] of ids.entries()) {
+      releases.push(controller.open(id, '1H'))
+      const view = controller.getSnapshot()
+      assert.equal(view.presented?.instId, id)
+      assert.equal(view.presented?.bars.length, 96)
+      assert.ok(view.presented?.bars.every(bar => bar.close === 200 + index))
+      assert.equal(view.pending, false)
+    }
+    releases.push(controller.open(ids[0], '1H'))
+    assert.equal(controller.getSnapshot().presented?.instId, ids[0])
+    assert.equal(controller.getSnapshot().pending, false)
+    assert.equal(localCalls, 0)
+    controller.setUniverse(ids.toReversed(), '1H')
+    await settled()
+    assert.equal(universeCalls, 1, 'Live list reordering must not serialize the whole prepared universe again.')
+    assert.equal(queue.calls.length, 1, 'The held maintenance request does not create a network queue for every selected instrument.')
+  } finally { releases.forEach(release => release()) }
+})
+
+test('a local ready selection commits while an old history request remains unresolved', async () => {
+  const queue = transportQueue()
+  const controller = new ChartController({ ...queue.transport, local: async id => id === eth ? prepared(eth, 299) : null }, cached())
+  controller.setUniverse([btc, eth], '1H')
+  const closeBTC = controller.open(btc, '1H')
+  const closeETH = controller.open(eth, '1H')
+  try {
+    assert.equal(queue.calls[0].target.instId, btc)
+    assert.notEqual(controller.getSnapshot().presented?.instId, eth, 'No old candles are mislabeled as the requested instrument.')
+    await settled()
+    assert.equal(controller.getSnapshot().presented?.instId, eth)
+    assert.equal(controller.getSnapshot().presented?.bars.length, 96)
+    assert.equal(controller.getSnapshot().pending, false)
+    assert.equal(queue.calls.length, 1, 'The local lane must neither await nor duplicate provider work.')
+  } finally { closeBTC(); closeETH() }
+})
+
+test('an uncached different instrument can prepare beside an unresolved old history job', async () => {
+  const queue = transportQueue()
+  const controller = new ChartController(queue.transport, cached())
+  controller.setUniverse([btc, eth], '1H')
+  const closeBTC = controller.open(btc, '1H')
+  const closeETH = controller.open(eth, '1H')
+  try {
+    await settled()
+    assert.equal(queue.calls[0].target.instId, btc)
+    assert.equal(queue.calls[1].target.instId, eth)
+    assert.equal(queue.calls[1].target.end, null)
+    assert.equal(queue.maximumActive(), 2)
+    queue.calls[1].resolve(prepared(eth, 299))
+    await settled()
+    assert.equal(controller.getSnapshot().presented?.instId, eth)
+    assert.equal(controller.getSnapshot().presented?.bars.length, 96)
+    assert.equal(controller.getSnapshot().pending, false)
+  } finally { closeBTC(); closeETH() }
+})
+
+test('local selection and latest intent remain independent of a held old foreground request', async () => {
+  const queue = transportQueue()
+  const controller = new ChartController({ ...queue.transport, local: async id => id === eth ? prepared(eth, 299) : null })
+  controller.setUniverse([btc], '1H')
+  const closeBTC = controller.open(btc, '1H')
+  await settled()
+  const closeETH = controller.open(eth, '1H')
+  try {
+    await settled()
+    const ready = controller.getSnapshot().presented!
+    assert.equal(ready.instId, eth)
+    assert.equal(controller.getSnapshot().pending, false)
+    controller.setUniverse([btc], '1H')
+    controller.ingestPrepared(prepared(eth, 299, { generation: 2, bars: bars(204, 96).map(bar => ({ ...bar, ema: 200 })) }))
+    assert.ok(controller.getSnapshot().presented?.bars.every(bar => bar.ema === 200), 'The active contract remains pinned even outside the navigation candidate list.')
+    queue.calls[0].resolve(prepared(btc, 199))
+    await settled()
+    assert.equal(controller.getSnapshot().requested?.instId, eth)
+    assert.equal(controller.getSnapshot().presented?.instId, eth)
+    assert.ok(ready.bars.every(bar => bar.ema === 100))
+  } finally { closeBTC(); closeETH() }
+})
+
+test('rapid cold selections hydrate only the active local call and the final queued instrument', async () => {
+  const queue = transportQueue()
+  const sol = 'SOL-USDT-SWAP'
+  const localCalls: Array<{ instId: string; resolve: (response: PreparedChartResponse | null) => void }> = []
+  const controller = new ChartController({
+    ...queue.transport,
+    local: instId => new Promise(resolve => { localCalls.push({ instId, resolve }) }),
+  })
+  controller.setUniverse([btc, eth, sol], '1H')
+  const closeBTC = controller.open(btc, '1H')
+  const closeETH = controller.open(eth, '1H')
+  const closeSOL = controller.open(sol, '1H')
+  try {
+    assert.deepEqual(localCalls.map(call => call.instId), [btc])
+    localCalls[0].resolve(prepared(btc, 199))
+    await settled()
+    assert.deepEqual(localCalls.map(call => call.instId), [btc, sol])
+    assert.equal(controller.getSnapshot().requested?.instId, sol)
+    assert.equal(controller.getSnapshot().presented, null, 'A completed obsolete local read must not paint its instrument for the current request.')
+    localCalls[1].resolve(prepared(sol, 299))
+    await settled()
+    assert.equal(controller.getSnapshot().presented?.instId, sol)
+    assert.equal(controller.getSnapshot().presented?.bars.length, 96)
+    assert.equal(controller.getSnapshot().pending, false)
+    assert.ok(queue.calls.every(call => call.target.instId === sol))
+  } finally { closeBTC(); closeETH(); closeSOL() }
 })

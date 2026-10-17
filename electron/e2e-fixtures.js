@@ -135,3 +135,58 @@ export async function seedHistoricalStatisticsBoundary(store, marketService) {
     ? { ...bar, oi: null, buy: null, sell: null } : bar)
   return fixture
 }
+
+// Distinct native sequences make changing a label without changing the chart
+// fail numerical validation. Sixteen contracts also exceed the historical
+// renderer cache's twelve-series budget, without requiring network data.
+export async function seedInstrumentNavigationBenchmark(store, marketService) {
+  const instIds = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'ADA', 'AVAX', 'LINK', 'DOT', 'LTC', 'BCH', 'SUI', 'APT', 'NEAR', 'TRX', 'TON'].map(symbol => `${symbol}-USDT-SWAP`)
+  const timeframes = ['5m', '15m', '1H']
+  const intervals = { '5m': FIVE_MINUTES, '15m': 3 * FIVE_MINUTES, '1H': HOUR }
+  const periods = 1_024
+  const end = Date.UTC(2025, 9, 17, 12, 0)
+  const instruments = []
+  const catalog = []
+  const savedAt = Date.now()
+  for (const [instrumentIndex, instId] of instIds.entries()) {
+    const series = {}
+    for (const timeframe of timeframes) {
+      const intervalMS = intervals[timeframe]
+      const start = end - (periods - 1) * intervalMS
+      const candles = Array.from({ length: periods }, (_, index) => {
+        const open = 75 * (instrumentIndex + 1) + index * .017 + Math.sin(index / 9 + instrumentIndex) * 1.7
+        const close = open + Math.cos(index / 5 + instrumentIndex) * .4
+        const volume = 3_000 + instrumentIndex * 100 + index % 400
+        return {
+          instrument: instId, timeframe, timestamp: start + index * intervalMS,
+          open, high: Math.max(open, close) + .6, low: Math.min(open, close) - .6, close,
+          volume, quoteVolume: volume * close,
+          oi: 2_000_000 + instrumentIndex * 150_000 + index * 219,
+          buy: 60_000 + instrumentIndex * 1_300 + index % 700,
+          sell: 48_000 + instrumentIndex * 1_100 + index % 900,
+          statisticsVersion: 1, statisticsSources: 3, statisticsObserved: true, confirmed: true,
+        }
+      })
+      await marketService.persistCandles(instId, candles.map(row => ({ ...row, replaceStatistics: true })), { projectList: false })
+      series[timeframe] = { intervalMS, start, end, bars: barsWithIndicators(candles, intervalMS) }
+      marketService.lastCandleHydration.set(`${timeframe}:${instId}`, savedAt)
+    }
+    const latest = series['1H'].bars.at(-1)
+    const symbol = instId.split('-')[0]
+    const instrument = { instId, instCategory: '1', settleCcy: 'USDT', state: 'live', ctVal: '0.01', ctValCcy: symbol }
+    const ticker = { instId, last: String(latest.close), open24h: String(series['1H'].bars.at(-25).open), low24h: String(latest.low - 2), high24h: String(latest.high + 2), bidPx: String(latest.close - .01), askPx: String(latest.close + .01), volCcy24h: '500000' }
+    const result = { eligible: true, turnover: 90_000_000 + instrumentIndex * 1_000_000, oiUSD: 8_000_000, spread: .005, depth: 300_000, slippage: .02 }
+    marketService.instruments.set(instId, instrument)
+    catalog.push({ instrument, ticker, result, change24h: instrumentIndex + .1 })
+    instruments.push({ instId, series })
+    marketService.markChartDataChanged(instId)
+  }
+  marketService.catalogUpdatedAt = savedAt
+  marketService.catalogSource = 'live'
+  marketService.replaceCatalog(catalog)
+  await marketService.ensureListTimeframe('1H')
+  for (const instId of instIds) await marketService.projectListEntry(instId, '1H')
+  marketService.error = ''
+  marketService.lastRefreshAt = savedAt
+  return { instIds, timeframes, timeframe: '1H', intervalMS: HOUR, end, periods, instruments }
+}

@@ -29,6 +29,7 @@ jobs:
           npm run test:okx:1h
           npm run benchmark
           npm run benchmark:chart
+          npm run benchmark:instruments
       - name: Build release app
         run: npm run app
       - name: Package release app
