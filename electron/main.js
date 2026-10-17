@@ -11,6 +11,9 @@ const root = fileURLToPath(new URL('..', import.meta.url))
 const rendererURL = process.env.ELECTRON_RENDERER_URL
 const testMode = process.env.PERPETUAL_SWAP_E2E === '1'
 const e2eLiveRefresh = testMode && process.env.PERPETUAL_SWAP_E2E_LIVE_REFRESH === '1'
+const e2ePreviewDelayMS = testMode
+  ? Math.min(30_000, Math.max(0, Number(process.env.PERPETUAL_SWAP_E2E_PREVIEW_DELAY_MS) || 0))
+  : 0
 const FIVE_MINUTES = 300_000
 const HOUR = 3_600_000
 const settingsFile = () => join(app.getPath('userData'), 'settings.json')
@@ -235,6 +238,14 @@ async function handleRequest(event, request) {
     }
     // Neighbor previews may read the local cache, but must never enqueue
     // hydration, gap repair, or OI/Taker work ahead of the visible chart.
+    // A history preview is normally satisfied from the local store in a few
+    // milliseconds. The scroll regression needs to model a late response.
+    // Once the cursor stops at the floor, its foreground catch-up request
+    // follows the preview after a debounce, so delay both replies together.
+    // This branch is impossible outside the explicit Electron E2E mode.
+    if (e2ePreviewDelayMS && request.chartEndHour !== undefined) {
+      await new Promise(resolve => setTimeout(resolve, e2ePreviewDelayMS))
+    }
     const chart = await marketService.bars(request.chartInstId, timeframe, request.chartEndHour, focused.ok ? { foreground: true, focusToken: focused.sequence } : { hydrate: false, repair: false, statistics: false })
     if (chart.stale) return { unchanged: true, error: '', revision: marketService.dataRevision(request.chartInstId) }
     const { bars } = chart

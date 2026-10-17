@@ -1,4 +1,4 @@
-import { memo, startTransition, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
 import { flushSync } from "react-dom"
 import { ArrowLeft, Camera, Radio } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
@@ -18,8 +18,7 @@ import { chartHistoryNeedsLoad, chartIndicatorsNeedLoad, chartScrollFloor, chart
 import { cn, pageVisible } from "@/lib/utils"
 import { chartNavigationTarget, wrappedMarket } from "@/market-sort"
 import { finitePercentage, formatPercent, type PercentageValue } from "@/market-percent"
-import { SnapshotOrder } from '@/snapshot-order'
-import { mergeChartBars } from '@/chart-snapshot'
+import { ChartSeriesStore, type ChartSeriesEntry } from '@/chart-series-store'
 import { RADAR_TIMEFRAMES, timeframeLabel, timeframeMilliseconds, type RadarTimeframe } from '@/timeframe'
 
 export type Bar = {
@@ -36,31 +35,38 @@ export type ChartResponse = {
   statisticsState?: ChartStatisticsState; statisticsRetryAt?: number | null
 }
 export type ChartPollResponse = ChartResponse | { unchanged: true; error: string; revision: number; serviceSession?: string }
+type ChartSurface = {
+  cacheKey: string
+  instId: string
+  timeframe: RadarTimeframe
+  intervalMS: number
+  bars: Bar[]
+  endHour: number
+  liveBar: Bar
+}
 
-const chartCache = new Map<string, { data: ChartResponse; loadedAt: number }>()
+type ChartStatus = Omit<ChartResponse, 'bars' | 'revision' | 'serviceSession'>
+
+// A rendered series is application data, not a speculative preview. It must
+// outlive navigation and never be evicted by neighboring-chart warmups.
+const chartSeries = new ChartSeriesStore<Bar, ChartStatus>()
 const chartLoads = new Map<string, Promise<ChartResponse>>()
 const chartPreviews = new Map<string, Promise<ChartResponse>>()
-const chartOrders = new Map<string, SnapshotOrder>()
 const HISTORY_VIEWPORT_DEBOUNCE = 80
-const HISTORY_PREFETCH_CANDLES = 240
-const HISTORY_CACHE_CANDLES = 4_096
-const HISTORY_CACHE_CHARTS = 8
+// A 1H chart initially has ~404 cached candles before its history floor. At
+// the benchmark speed, start the next read as soon as history navigation
+// begins instead of discovering the cache edge after the user's wheel burst.
+const HISTORY_PREFETCH_CANDLES = 500
 const WHEEL_PIXELS_PER_CANDLE = 12
 const MAX_WHEEL_STEPS_PER_FRAME = 12
 let nextChartFocusToken = 0
 const chartKey = (id: string, timeframe: RadarTimeframe) => `${timeframe}:${id}`
-function rememberChart(key: string, data: ChartResponse, loadedAt: number) {
-  let order = chartOrders.get(key)
-  if (!order) { order = new SnapshotOrder(); chartOrders.set(key, order) }
-  if (!order.accept(data)) {
-    const cached = chartCache.get(key)
-    if (cached) return cached.data
-    throw new Error('Obsolete chart response; refreshing the current collector')
-  }
-  chartCache.delete(key)
-  chartCache.set(key, { data, loadedAt })
-  if (chartCache.size > 8) chartCache.delete(chartCache.keys().next().value!)
-  return data
+const chartResponse = (entry: ChartSeriesEntry<Bar, ChartStatus> | undefined): ChartResponse | null => entry
+  ? { ...entry.status, bars: entry.bars, revision: entry.revision, serviceSession: entry.serviceSession }
+  : null
+function rememberChart(key: string, data: ChartResponse, loadedAt = Date.now()) {
+  const result = chartSeries.upsert(key, data, loadedAt)
+  return { data: chartResponse(result.entry), accepted: result.accepted }
 }
 function loadChart(id: string, timeframe: RadarTimeframe, focusSession: number, focusToken: number): Promise<ChartResponse> {
   const key = chartKey(id, timeframe)
@@ -68,22 +74,33 @@ function loadChart(id: string, timeframe: RadarTimeframe, focusSession: number, 
   const pending = chartLoads.get(requestKey)
   if (pending) return pending
   const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: id, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken, loadChart: true }).then(result => {
-    if ("unchanged" in result) throw new Error("No chart data returned")
-    return rememberChart(key, result, Date.now())
+    if ("unchanged" in result) {
+      const retained = chartResponse(chartSeries.get(key))
+      if (retained) return retained
+      throw new Error("No chart data returned")
+    }
+    const retained = rememberChart(key, result).data
+    if (retained) return retained
+    throw new Error('Obsolete chart response; refreshing the current collector')
   }).finally(() => chartLoads.delete(requestKey))
   chartLoads.set(requestKey, request)
   return request
 }
 function previewChart(id: string, timeframe: RadarTimeframe): Promise<ChartResponse> {
   const key = chartKey(id, timeframe)
-  const cached = chartCache.get(key)
-  if (cached) return Promise.resolve(cached.data)
+  const cached = chartResponse(chartSeries.get(key))
+  if (cached?.bars.length) return Promise.resolve(cached)
   const pending = chartPreviews.get(key)
   if (pending) return pending
   const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: id, timeframe, preview: true, sinceRevision: -1 }).then(result => {
-    if ("unchanged" in result) throw new Error("No chart data returned")
-    rememberChart(key, result, chartCache.get(key)?.loadedAt ?? 0)
-    return chartCache.get(key)!.data
+    if ("unchanged" in result) {
+      const retained = chartResponse(chartSeries.get(key))
+      if (retained) return retained
+      throw new Error("No chart data returned")
+    }
+    const retained = rememberChart(key, result).data
+    if (retained) return retained
+    throw new Error('Obsolete chart response; refreshing the current collector')
   }).finally(() => chartPreviews.delete(key))
   chartPreviews.set(key, request)
   return request
@@ -446,8 +463,9 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     }).catch(() => {})
     return () => { stopped = true }
   }, [])
-  const [displayed, setDisplayed] = useState<{ id: string; data: ChartResponse } | null>(null)
-  const [historyCache, setHistoryCache] = useState(() => new Map<string, ChartResponse>())
+  // The canonical series is module-owned. This counter only subscribes the
+  // currently visible chart to writes for its own key.
+  const [seriesVersion, setSeriesVersion] = useState(0)
   const [historyBoundary, setHistoryBoundary] = useState<{ id: string; oldestHour: number } | null>(null)
   const [windowEnd, setWindowEnd] = useState<{ id: string; hour: number } | null>(null)
   const [settledWindowEnd, setSettledWindowEnd] = useState<{ id: string; hour: number } | null>(null)
@@ -479,7 +497,6 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     setInspection(null)
   }, [])
   const [chartError, setChartError] = useState<{ id: string; message: string } | null>(null)
-  const [warmCharts, setWarmCharts] = useState(() => new Map<string, ChartResponse>())
   const [capture, setCapture] = useState<{ id: string; status: "idle" | "copying" | "flashing" | "failed"; error: string }>({ id: cacheKey, status: "idle", error: "" })
   const chartRef = useRef<HTMLElement>(null)
   const plotRef = useRef<HTMLDivElement>(null)
@@ -518,17 +535,22 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     if (focusSession === null || focusToken === null) return
     void window.webkit.messageHandlers.radar.postMessage({ chartFocus: { instId, session: focusSession, token: focusToken } }).catch(() => {})
   }, [instId, focusSession, focusToken])
-  const chart = chartCache.get(cacheKey)?.data ?? (displayed?.id === cacheKey ? displayed.data : null) ?? warmCharts.get(cacheKey) ?? null
-  const history = historyCache.get(cacheKey) ?? null
-  // Do not let a renderer-local cache bridge collector restarts. It is safe
-  // to retain completed blocks across A → B → A navigation only within one
-  // service session.
-  const cachedHistory = chart?.serviceSession && history?.serviceSession && chart.serviceSession !== history.serviceSession ? null : history
-  const cachedBars = useMemo(() => mergeChartBars(chart, cachedHistory), [chart, cachedHistory])
+  const chart = useMemo(() => {
+    // `seriesVersion` is the visible-key subscription; the data itself stays
+    // in the durable application-lifetime store.
+    void seriesVersion
+    return chartResponse(chartSeries.get(cacheKey))
+  }, [cacheKey, seriesVersion])
+  const cachedBars = chart?.bars ?? []
   const oldestCachedHour = cachedBars[0]?.hour ?? Infinity
   const error = chartError?.id === cacheKey ? chartError.message : chart?.error ?? ""
   const captureStatus = capture.id === cacheKey ? capture.status : "idle"
   const captureError = capture.id === cacheKey ? capture.error : ""
+  const rememberVisibleChart = useCallback((data: ChartResponse, loadedAt = Date.now()) => {
+    const result = rememberChart(cacheKey, data, loadedAt)
+    if (result.accepted && currentCacheKey.current === cacheKey) setSeriesVersion(version => version + 1)
+    return result
+  }, [cacheKey])
   useEffect(() => {
     historyNextRefreshAt.current.clear()
     for (const timer of historyRetryTimers.current.values()) window.clearTimeout(timer)
@@ -537,7 +559,7 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     windowEndRef.current = null; pendingWindowEndRef.current = null; historyPrefetches.current.clear()
     setWindowEnd(null); setSettledWindowEnd(null); setInspection(null)
     setHistoryBoundary(null); setHistoryLoading(null)
-  }, [cacheKey, chart?.serviceSession])
+  }, [cacheKey])
   useEffect(() => () => {
     for (const timer of historyRetryTimers.current.values()) window.clearTimeout(timer)
     for (const timer of statisticsRetryTimers.current.values()) window.clearTimeout(timer)
@@ -568,34 +590,6 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
       setCapture({ id: cacheKey, status: "failed", error: cause instanceof Error ? cause.message : "Could not copy chart screenshot" })
     }
   }
-  const rememberHistory = useCallback((data: ChartResponse) => {
-    setHistoryCache(current => {
-      const merged = mergeChartBars(data, current.get(cacheKey) ?? null)
-      // Data already read from DuckDB remains resident while this chart is
-      // open or revisited. Keeping a bounded ordered series makes an A → B →
-      // A return a pure render operation instead of another IPC and range
-      // calculation.
-      const bars = merged.length > HISTORY_CACHE_CANDLES ? merged.slice(-HISTORY_CACHE_CANDLES) : merged
-      const next = new Map(current)
-      next.delete(cacheKey)
-      next.set(cacheKey, { ...data, bars })
-      if (next.size > HISTORY_CACHE_CHARTS) next.delete(next.keys().next().value!)
-      return next
-    })
-  }, [cacheKey])
-  const warmChart = useCallback((id: string, data: ChartResponse, deferred = true) => {
-    if (!data.bars.length) return
-    const update = () => setWarmCharts(current => {
-      if (current.get(id) === data) return current
-      const updated = new Map(current)
-      updated.delete(id)
-      updated.set(id, data)
-      if (updated.size > 7) updated.delete(updated.keys().next().value!)
-      return updated
-    })
-    if (deferred) startTransition(update)
-    else update()
-  }, [])
   useEffect(() => {
     const element = plotRef.current
     if (!element) return
@@ -653,7 +647,9 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
       const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken, chartEndHour: historicalEnd })
       historyRequests.current.set(requestKey, request)
       void request.then(result => {
-        if (chartOrders.get(cacheKey)?.isRetiredSession(result.serviceSession) || "unchanged" in result || !currentViewport()) return
+        if ("unchanged" in result || !currentViewport()) return
+        const stored = rememberVisibleChart(result)
+        if (!stored.accepted) return
         if (result.candleState === 'exhausted' || result.historyExhausted) {
           historyExhaustedViewports.current.add(requestKey)
           if (historyExhaustedViewports.current.size > 64) historyExhaustedViewports.current.delete(historyExhaustedViewports.current.values().next().value!)
@@ -661,7 +657,7 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
         if (result.historyExhausted && result.oldestHour !== null && result.oldestHour !== undefined) {
           const oldestHour = result.oldestHour
           setHistoryBoundary(current => current?.id === cacheKey && current.oldestHour === oldestHour ? current : { id: cacheKey, oldestHour })
-          const latestHour = chartCache.get(cacheKey)?.data.bars.at(-1)?.hour ?? result.bars.at(-1)?.hour ?? historicalEnd
+          const latestHour = chartSeries.latestKnownHour(cacheKey) ?? result.bars.at(-1)?.hour ?? historicalEnd
           const boundaryEnd = Math.min(latestHour, oldestHour + 95 * intervalMS)
           const current = windowEndRef.current
           if (current?.id === cacheKey && current.hour < boundaryEnd) {
@@ -670,7 +666,6 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
             setWindowEnd(next)
           }
         }
-        rememberHistory(result)
         endInspection()
         setChartError({ id: cacheKey, message: result.error })
         setHistoryLoading(current => current === key ? null : current)
@@ -687,7 +682,7 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
       })
     }
     startRequest()
-  }, [instId, cacheKey, timeframe, intervalMS, historicalEnd, settledHistoricalEnd, oldestCachedHour, cachedBars, historyRetry, endInspection, focusSession, focusToken, rememberHistory])
+  }, [instId, cacheKey, timeframe, intervalMS, historicalEnd, settledHistoricalEnd, oldestCachedHour, cachedBars, historyRetry, endInspection, focusSession, focusToken, rememberVisibleChart])
   useEffect(() => {
     if (historicalEnd === null || !Number.isFinite(oldestCachedHour)
       || !chartHistoryNeedsLoad(historicalEnd, oldestCachedHour, 96, HISTORY_PREFETCH_CANDLES, intervalMS)) return
@@ -701,11 +696,11 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     historyPrefetches.current.set(requestKey, request)
     void request.then(result => {
       if ("unchanged" in result || !mountedRef.current || currentCacheKey.current !== cacheKey) return
-      rememberHistory(result)
+      rememberVisibleChart(result)
     }).catch(() => {}).finally(() => {
       if (historyPrefetches.current.get(requestKey) === request) historyPrefetches.current.delete(requestKey)
     })
-  }, [instId, cacheKey, timeframe, intervalMS, historicalEnd, oldestCachedHour, rememberHistory])
+  }, [instId, cacheKey, timeframe, intervalMS, historicalEnd, oldestCachedHour, rememberVisibleChart])
   useEffect(() => {
     const cancelQueuedWheel = () => {
       wheelPixels.current = 0
@@ -721,14 +716,11 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     // and cancel the visible window's OI/Taker job.
     if (focusSession === null || focusToken === null || historicalEnd !== null) return
     let stopped = false, timer: number, loadTimer: number
-    let lastLoad = chartCache.get(cacheKey)?.loadedAt ?? 0
-    let hydrationError = chartCache.get(cacheKey)?.data.error ?? ''
+    let lastLoad = chartSeries.get(cacheKey)?.loadedAt ?? 0
+    let hydrationError = chartResponse(chartSeries.get(cacheKey))?.error ?? ''
     let backoff = 2000
-    const order = chartOrders.get(cacheKey) ?? new SnapshotOrder()
-    chartOrders.set(cacheKey, order)
-    const show = (data: ChartResponse) => {
-      if (windowEndRef.current?.id !== cacheKey) setDisplayed({ id: cacheKey, data })
-      warmChart(cacheKey, data, false)
+    const show = () => {
+      if (windowEndRef.current?.id !== cacheKey) setSeriesVersion(version => version + 1)
     }
     const showError = (message: string) => {
       if (windowEndRef.current?.id !== cacheKey) setChartError(current => current?.id === cacheKey && current.message === message ? current : { id: cacheKey, message })
@@ -740,9 +732,9 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
       try {
         const data = await loadChart(instId, timeframe, focusSession, focusToken)
         if (stopped) return
-        lastLoad = chartCache.get(cacheKey)?.loadedAt ?? Date.now()
+        lastLoad = chartSeries.get(cacheKey)?.loadedAt ?? Date.now()
         hydrationError = data.error
-        show(data); showError(hydrationError)
+        show(); showError(hydrationError)
       } catch (cause) {
         if (stopped) return
         hydrationError = cause instanceof Error ? cause.message : 'Cannot refresh chart sources'
@@ -753,13 +745,18 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     const refresh = async () => {
       await pageVisible(); if (stopped) return
       try {
-        const result = await window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken, sinceRevision: order.revision, serviceSession: order.serviceSession })
+        const current = chartSeries.get(cacheKey)
+        const result = await window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken, sinceRevision: current?.revision ?? -1, serviceSession: current?.serviceSession })
         if (stopped) return
-        if (order.isCurrent(result)) {
-          if (!("unchanged" in result)) show(rememberChart(cacheKey, result, lastLoad))
-          showError([...new Set([hydrationError, result.error].filter(Boolean))].join(' '))
+        const status = "unchanged" in result ? chartResponse(chartSeries.get(cacheKey)) : result
+        if (!("unchanged" in result)) {
+          rememberVisibleChart(result, lastLoad)
         }
-        backoff = 2000
+        showError([...new Set([hydrationError, result.error].filter(Boolean))].join(' '))
+        // While a foreground repair or direct-statistics request is active,
+        // observe the result promptly instead of holding a 2-second idle poll.
+        backoff = status?.candleState === 'loading' || status?.candleState === 'retrying'
+          || status?.statisticsState === 'loading' || status?.statisticsState === 'retrying' ? 250 : 2000
       } catch (cause) {
         if (!stopped) {
           showError(cause instanceof Error ? cause.message : "Cannot load chart")
@@ -771,17 +768,14 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     loadTimer = window.setTimeout(hydrate, hydrationError ? 0 : Math.max(0, 60_000 - (Date.now() - lastLoad)))
     void refresh()
     return () => { stopped = true; window.clearTimeout(timer); window.clearTimeout(loadTimer) }
-  }, [instId, cacheKey, timeframe, warmChart, focusSession, focusToken, historicalEnd])
+  }, [instId, cacheKey, timeframe, rememberVisibleChart, focusSession, focusToken, historicalEnd])
 
   useEffect(() => {
-    let stopped = false
     for (const id of new Set([beforePrevious, previous, next, afterNext, listOrder[0], turnoverOrder[0]])) {
       if (!id || id === instId) continue
-      const neighborKey = chartKey(id, timeframe)
-      void previewChart(id, timeframe).then(data => { if (!stopped) warmChart(neighborKey, data) }).catch(() => {})
+      void previewChart(id, timeframe).catch(() => {})
     }
-    return () => { stopped = true }
-  }, [instId, timeframe, beforePrevious, previous, next, afterNext, listOrder, turnoverOrder, warmChart])
+  }, [instId, timeframe, beforePrevious, previous, next, afterNext, listOrder, turnoverOrder])
 
   useEffect(() => {
     const navigate = (event: KeyboardEvent) => {
@@ -806,11 +800,11 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     }
   }, [listOrder, turnoverOrder, onSelect])
 
-  const requestedViewportEnd = historicalEnd ?? chart?.bars.at(-1)?.hour ?? 0
+  const requestedViewportEnd = historicalEnd ?? chartSeries.latestKnownHour(cacheKey) ?? 0
   const viewportRuns = useMemo(() => chartViewportRuns(cachedBars, intervalMS), [cachedBars, intervalMS])
   const viewportEnd = useMemo(() => renderableChartEndFromRuns(viewportRuns, requestedViewportEnd, intervalMS), [viewportRuns, requestedViewportEnd, intervalMS])
   const bars = useMemo(() => viewportEnd === null ? [] : visibleChartBars(cachedBars, viewportEnd, intervalMS), [cachedBars, viewportEnd, intervalMS])
-  const viewportResponse = historicalEnd !== null ? cachedHistory ?? chart : chart
+  const viewportResponse = chart
   const candleState = viewportEnd !== null && !chartIndicatorsNeedLoad(cachedBars, viewportEnd, 96, intervalMS) ? 'ready' : viewportResponse?.candleState ?? 'ready'
   const statisticsState = viewportEnd !== null && !chartStatsNeedLoad(bars, viewportEnd, 96, intervalMS) ? 'ready' : viewportResponse?.statisticsState ?? 'ready'
   const incompleteViewport = requestedViewportEnd > 0 && viewportEnd !== requestedViewportEnd
@@ -837,13 +831,13 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
       statisticsRequests.current.add(requestKey)
       const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken, chartEndHour: historicalEnd })
       void request.then(result => {
-        if ("unchanged" in result || chartOrders.get(cacheKey)?.isRetiredSession(result.serviceSession) || !currentViewport()) return
-        rememberHistory(result)
+        if ("unchanged" in result || !currentViewport()) return
+        if (!rememberVisibleChart(result).accepted) return
         if (result.statisticsState !== 'ready') retry(result.statisticsRetryAt === null || result.statisticsRetryAt === undefined ? 500 : result.statisticsRetryAt - Date.now())
       }).catch(() => retry(500)).finally(() => statisticsRequests.current.delete(requestKey))
     }
     startRequest()
-  }, [instId, cacheKey, timeframe, intervalMS, historicalEnd, settledHistoricalEnd, viewportEnd, bars, statisticsRetry, focusSession, focusToken, rememberHistory])
+  }, [instId, cacheKey, timeframe, intervalMS, historicalEnd, settledHistoricalEnd, viewportEnd, bars, statisticsRetry, focusSession, focusToken, rememberVisibleChart])
   const inspectedIndex = inspection?.id === cacheKey ? bars.findIndex(bar => bar.hour === inspection.hour) : -1
   const inspected = inspectedIndex < 0 ? null : inspectedIndex
   const inspectAt = (target: SVGSVGElement, clientX: number) => {
@@ -860,7 +854,7 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     setInspection(current => current?.id === cacheKey && current.hour === hour ? current : { id: cacheKey, hour })
   }
   const moveHistory = (steps: number) => {
-    const latestHour = chartCache.get(cacheKey)?.data.bars.at(-1)?.hour ?? bars.at(-1)?.hour
+    const latestHour = chartSeries.latestKnownHour(cacheKey) ?? bars.at(-1)?.hour
     if (latestHour === undefined || steps === 0) return false
     const current = pendingWindowEndRef.current?.id === cacheKey ? pendingWindowEndRef.current.hour : historicalEnd
     const oldestAvailableHour = historyBoundary?.id === cacheKey ? historyBoundary.oldestHour : null
@@ -869,11 +863,10 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     const candidate = scrollChartEnd(current, latestHour, steps, 0, intervalMS)
     const nextHour = candidate === null ? null : Math.max(floor, candidate)
     if (nextHour === current) {
-      // Keep a fast backward fling queued at the temporary resident-cache
-      // floor. The cache-extension effect below resumes it as soon as the
-      // prefetched block arrives. A known exchange boundary and the latest
-      // edge are real endpoints, so there is nothing to preserve there.
-      if (oldestAvailableHour !== null || nextHour === null) wheelPixels.current = 0
+      // A cache extension makes future input possible; it must never replay a
+      // wheel burst that was already stopped at the old cache floor. Replaying
+      // it produces the delayed self-scroll the user can see after loading.
+      wheelPixels.current = 0
       return false
     }
     const next = nextHour === null ? null : { id: cacheKey, hour: nextHour }
@@ -904,18 +897,21 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
       wheelFrame.current = window.requestAnimationFrame(() => flushWheelRef.current())
     }
   }
-  useEffect(() => {
-    if (wheelFrame.current === null && Math.abs(wheelPixels.current) >= WHEEL_PIXELS_PER_CANDLE) {
-      wheelFrame.current = window.requestAnimationFrame(() => flushWheelRef.current())
-    }
-  }, [cacheKey, oldestCachedHour, historyBoundary?.oldestHour])
   const active = bars[inspected ?? bars.length - 1]
   const atHistoryBoundary = historicalEnd !== null && historyBoundary?.id === cacheKey
-    && historicalEnd === Math.min(chart?.bars.at(-1)?.hour ?? historicalEnd, historyBoundary.oldestHour + 95 * intervalMS)
-  // Data for neighboring markets remains in warmCharts; mounting their full
-  // hidden SVGs would still consume reconciliation, layout and a11y resources.
-  const surfaces = new Map<string, ChartResponse>()
-  if (bars.length && chart && viewportEnd !== null) surfaces.set(instId, { ...chart, bars, endHour: viewportEnd })
+    && historicalEnd === Math.min(chartSeries.latestKnownHour(cacheKey) ?? historicalEnd, historyBoundary.oldestHour + 95 * intervalMS)
+  const targetSurface = useMemo<ChartSurface | null>(() => bars.length && viewportEnd !== null ? {
+    cacheKey, instId, timeframe, intervalMS, bars, endHour: viewportEnd, liveBar: chart?.bars.at(-1) ?? bars.at(-1)!,
+  } : null, [cacheKey, instId, timeframe, intervalMS, bars, viewportEnd, chart])
+  // Keep the completed SVG in place during a genuine first load for the next
+  // key. The next chart replaces it atomically; stale data is non-interactive
+  // and visibly labelled, so it cannot be mistaken for the selected series.
+  const lastSurface = useRef<ChartSurface | null>(null)
+  useLayoutEffect(() => {
+    if (targetSurface) lastSurface.current = targetSurface
+  }, [targetSurface])
+  const surface = targetSurface ?? lastSurface.current
+  const surfaceIsStale = surface !== null && targetSurface === null
   const analyzeChart = (direction: AnalysisDirection) => {
     if (!bars.length || plotSize.width <= 0 || captureStatus === 'copying') return
     flushSync(() => { setAnalysisOpen(true); setCapture({ id: cacheKey, status: 'idle', error: '' }) })
@@ -953,7 +949,7 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}{historicalEnd !== null && ' Retrying automatically.'}</div>}
     {captureError && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{captureError}</p>}
     <div className="flex min-h-0 flex-1">
-    <section ref={chartRef} data-chart-inst={instId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-cache-start={cachedBars[0]?.hour} data-chart-requested-end={requestedViewportEnd || undefined} data-chart-rendered-bars={bars.length} data-chart-candle-state={candleState} data-chart-statistics-state={statisticsState} data-chart-incomplete={incompleteViewport ? 'true' : 'false'} data-chart-loading={historyLoading === `${cacheKey}:${historicalEnd}` || candleState === 'loading' || candleState === 'retrying' || incompleteViewport || statisticsState === 'loading' || statisticsState === 'retrying' ? 'true' : 'false'} data-surface="panel" aria-label={`${instId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-chart-surface">
+    <section ref={chartRef} data-chart-inst={instId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-cache-start={cachedBars[0]?.hour} data-chart-requested-end={requestedViewportEnd || undefined} data-chart-rendered-bars={surface?.bars.length ?? 0} data-chart-target-bars={bars.length} data-chart-visual-stale={surfaceIsStale ? 'true' : 'false'} data-chart-candle-state={candleState} data-chart-statistics-state={statisticsState} data-chart-incomplete={incompleteViewport ? 'true' : 'false'} data-chart-loading={historyLoading === `${cacheKey}:${historicalEnd}` || candleState === 'loading' || candleState === 'retrying' || incompleteViewport || statisticsState === 'loading' || statisticsState === 'retrying' ? 'true' : 'false'} data-surface="panel" aria-label={`${instId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-chart-surface">
       {active && <div className="grid shrink-0 grid-cols-[minmax(9rem,1.2fr)_repeat(4,minmax(0,1fr))] items-center border-b px-4 py-1.5 text-[length:var(--chart-text-size)]" aria-live="off">
         <p className="min-w-0 truncate border-r pr-3"><span className="font-medium">{instId.replace(/-SWAP$/, "")}</span> · <span className="text-muted-foreground">{inspected === null ? historicalEnd === null ? "Latest" : "Window end" : "Selected"}</span> {time(active.hour)}{active.confirmed ? "" : " · Live"}</p>
         {([ ["Open", active.open], ["High", active.high], ["Low", active.low], ["Close", active.close] ] as const).map(([label, value]) => <div key={label} className="min-w-0 px-3">
@@ -968,11 +964,11 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
         queueWheel(pixels)
       }}>
         <div className="relative h-full w-full">
-        {bars.length && plotSize.width > 0 ? [...surfaces].map(([id, data]) => <svg key={id} viewBox={`0 0 ${plotSize.width} ${plotSize.height}`} className={cn("absolute inset-0 h-full w-full text-[length:var(--chart-text-size)] select-none focus-visible:outline-2 focus-visible:outline-ring", id !== instId && "hidden")} role="img" tabIndex={id === instId ? 0 : -1} aria-hidden={id !== instId} aria-label={`${id} 96-candle ${timeframeLabel(timeframe)} chart with VWAP14, EMA200, Log BB, open interest contracts, and taker buy/sell contracts. Hold the primary mouse button to inspect a candle, drag while holding to inspect others, and release to return to the window end. Scroll to review history; returning to the latest candle resumes automatic following. Up and down arrows follow the visible market list order; left jumps to the first market in the current sorted search results and right jumps to the highest 24-hour turnover market satisfying Settings and applied indicator filters, regardless of search.`} onPointerDown={event => {
-          if (id !== instId || event.button !== 0 || heldPointer.current) return
+        {surface && plotSize.width > 0 ? <svg key={surface.cacheKey} viewBox={`0 0 ${plotSize.width} ${plotSize.height}`} className={cn("absolute inset-0 h-full w-full text-[length:var(--chart-text-size)] select-none focus-visible:outline-2 focus-visible:outline-ring", surfaceIsStale && "pointer-events-none")} role="img" tabIndex={surfaceIsStale ? -1 : 0} aria-hidden={surfaceIsStale} aria-label={`${surface.instId} 96-candle ${timeframeLabel(surface.timeframe)} chart with VWAP14, EMA200, Log BB, open interest contracts, and taker buy/sell contracts. Hold the primary mouse button to inspect a candle, drag while holding to inspect others, and release to return to the window end. Scroll to review history; returning to the latest candle resumes automatic following. Up and down arrows follow the visible market list order; left jumps to the first market in the current sorted search results and right jumps to the highest 24-hour turnover market satisfying Settings and applied indicator filters, regardless of search.`} onPointerDown={event => {
+          if (surfaceIsStale || event.button !== 0 || heldPointer.current) return
           event.preventDefault()
           event.currentTarget.setPointerCapture(event.pointerId)
-          heldPointer.current = { id, pointerId: event.pointerId, target: event.currentTarget }
+          heldPointer.current = { id: surface.instId, pointerId: event.pointerId, target: event.currentTarget }
           inspectAt(event.currentTarget, event.clientX)
         }} onPointerUp={event => {
           if (heldPointer.current?.pointerId === event.pointerId) endInspection()
@@ -981,12 +977,13 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
         }} onLostPointerCapture={event => {
           if (heldPointer.current?.pointerId === event.pointerId) endInspection()
         }} onPointerMove={event => {
-          if (id !== instId || heldPointer.current?.id !== id || heldPointer.current.pointerId !== event.pointerId) return
+          if (surfaceIsStale || heldPointer.current?.id !== surface.instId || heldPointer.current.pointerId !== event.pointerId) return
           if (!(event.buttons & 1)) { endInspection(); return }
           inspectAt(event.currentTarget, event.clientX)
         }}>
-          <Plot bars={data.bars} liveBar={chart?.bars.at(-1) ?? data.bars.at(-1)!} inspected={inspected} width={plotSize.width} height={plotSize.height} now={1} endHour={data.endHour ?? data.bars.at(-1)!.hour} intervalMS={intervalMS} />
-        </svg>) : null}
+          <Plot bars={surface.bars} liveBar={surface.liveBar} inspected={surfaceIsStale ? null : inspected} width={plotSize.width} height={plotSize.height} now={1} endHour={surface.endHour} intervalMS={surface.intervalMS} />
+        </svg> : null}
+        {surfaceIsStale && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Loading {timeframeLabel(timeframe)} chart…</span>}
         {historicalEnd !== null && historyLoading === `${cacheKey}:${historicalEnd}` && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Repairing missing candles…</span>}
         {historyLoading !== `${cacheKey}:${historicalEnd}` && (candleState === 'loading' || candleState === 'retrying' || incompleteViewport) && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{candleState === 'retrying' ? 'Retrying missing candles…' : 'Repairing missing candles…'}</span>}
         {candleState === 'unavailable' && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{historicalEnd === null ? 'Latest source candles unavailable' : 'Missing source candles in this range'}</span>}

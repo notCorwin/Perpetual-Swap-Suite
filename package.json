@@ -14,7 +14,8 @@
     "test:renderer": "node --experimental-strip-types --test src/*.test.ts",
     "test:e2e": "npm run build && node --test-concurrency=1 --test tests/e2e/*.e2e.mjs",
     "benchmark": "node --experimental-strip-types scripts/benchmark.ts",
-    "benchmark:chart": "npm run build && node scripts/chart-scroll-benchmark.mjs"
+    "benchmark:chart": "npm run build && node scripts/chart-scroll-benchmark.mjs",
+    "test:okx:1h": "node scripts/okx-live-1h.mjs"
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "3.0.67",

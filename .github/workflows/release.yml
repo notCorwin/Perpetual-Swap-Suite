@@ -26,6 +26,7 @@ jobs:
         run: |
           npm ci
           npm test
+          npm run test:okx:1h
           npm run benchmark
           npm run benchmark:chart
       - name: Build release app

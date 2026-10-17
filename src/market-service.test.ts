@@ -11,6 +11,7 @@ const hourly = Array.from({ length: 24 }, (_, index) => [String(1_700_000_000_00
 const fiveMinutes = 300_000
 const hour = 3_600_000
 const rawCandle = (timestamp: number, close = 100) => ({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp, open: close - 1, high: close + 1, low: close - 2, close, volume: 1, quoteVolume: close, confirmed: true })
+const nativeCandle = (timestamp: number, timeframe: '5m' | '15m' | '1H', close = 100) => ({ ...rawCandle(timestamp, close), timeframe })
 const okxCandle = (value: ReturnType<typeof rawCandle>) => [String(value.timestamp), String(value.open), String(value.high), String(value.low), String(value.close), String(value.volume), '1', String(value.quoteVolume), '1']
 const waitFor = async (condition: () => boolean | Promise<boolean>, timeout = 2_000) => {
   const deadline = Date.now() + timeout
@@ -45,23 +46,101 @@ test('market discovery admits only a fully liquid USDT perpetual', async () => {
   } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-test('derived candles never turn absent or explicit-null statistics into zero', async () => {
+test('native candles preserve absent or explicit-null statistics without manufacturing a derived row', async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
   const store = await MarketStore.open(root)
   try {
     const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
     const start = Date.UTC(2024, 0, 1)
-    await service.persistCandles('BTC-USDT-SWAP', Array.from({ length: 12 }, (_, index) => ({
-      ...rawCandle(start + index * fiveMinutes),
+    await service.persistCandles('BTC-USDT-SWAP', [{
+      ...rawCandle(start),
+      timeframe: '1H',
       oi: null,
       buy: null,
       sell: null,
-    })))
-    const [derived] = await store.candles({ instrument: 'BTC-USDT-SWAP', timeframe: '1H', from: start, through: start })
-    assert.equal(derived.oi, null)
-    assert.equal(derived.buy, null)
-    assert.equal(derived.sell, null)
+    }])
+    const [native] = await store.candles({ instrument: 'BTC-USDT-SWAP', timeframe: '1H', from: start, through: start })
+    assert.equal(native.oi, null)
+    assert.equal(native.buy, null)
+    assert.equal(native.sell, null)
+    assert.deepEqual(await store.candles({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: start, through: start }), [])
   } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a cold 1H repair requests and persists the native OKX period without rebuilding 5m candles', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 0, 20, 12)
+  const first = end - (95 + 199) * hour
+  const native = Array.from({ length: 295 }, (_, index) => ({ ...rawCandle(first + index * hour, 100 + index / 10), timeframe: '1H' }))
+  const calls: URL[] = []
+  const fetcher: typeof fetch = async input => {
+    const url = new URL(String(input)); calls.push(url)
+    if (url.pathname.endsWith('/market/history-candles')) return response(native.map(okxCandle))
+    throw new Error(`Unexpected ${url}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+    const initial = await service.bars(instrument.instId, '1H', end, { hydrate: false, repair: true, statistics: false, foreground: true, focusToken: 1 })
+    assert.equal(initial.candleState, 'loading')
+    await waitFor(() => calls.length === 1 && service.candleRepairState(instrument.instId, '1H').status === 'ready')
+    assert.equal(calls[0].searchParams.get('bar'), '1H')
+    const stored = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: first, through: end })
+    assert.equal(stored.length, 295)
+    assert.deepEqual(await store.candles({ instrument: instrument.instId, timeframe: '5m', from: first, through: end }), [])
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('1H list projections read the native candle sequence instead of a 5m aggregation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 0, 20, 12)
+  const first = end - 200 * hour
+  const native = Array.from({ length: 201 }, (_, index) => ({ ...rawCandle(first + index * hour, 200 + index), timeframe: '1H', statisticsVersion: 1, oi: 1_000 + index, buy: 100 + index, sell: 50 + index }))
+  const raw = Array.from({ length: 12 }, (_, index) => rawCandle(end - index * fiveMinutes, 1))
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
+  try {
+    await store.appendCandles([...native, ...raw])
+    const projection = await service.readListBars({ instrument }, '1H')
+    assert.equal(projection.end, end)
+    assert.equal(projection.bars.at(-1)?.close, native.at(-1)?.close)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('OI/Taker endpoints stay idle until all 96 visible native candles exist', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 0, 20, 12)
+  const first = end - 95 * hour
+  const timestamps = Array.from({ length: 96 }, (_, index) => first + index * hour)
+  let oiCalls = 0, takerCalls = 0
+  const fetcher: typeof fetch = async input => {
+    const url = new URL(String(input))
+    if (url.pathname.endsWith('/open-interest-history')) { oiCalls += 1; return response(timestamps.map((timestamp, index) => [String(timestamp), String(1_000 + index), '0', '0'])) }
+    if (url.pathname.endsWith('/taker-volume-contract')) { takerCalls += 1; return response(timestamps.map((timestamp, index) => [String(timestamp), String(10 + index), String(20 + index)])) }
+    throw new Error(`Unexpected ${url}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    await store.appendCandles(timestamps.slice(1).map(timestamp => ({ ...rawCandle(timestamp), timeframe: '1H' })))
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+    const incomplete = await service.bars(instrument.instId, '1H', end, { hydrate: false, repair: false, foreground: true, focusToken: 1 })
+    assert.equal(incomplete.statisticsState, 'loading')
+    await new Promise(resolve => setTimeout(resolve, 50))
+    assert.equal(oiCalls, 0)
+    assert.equal(takerCalls, 0)
+
+    await store.appendCandles([{ ...rawCandle(first), timeframe: '1H' }])
+    service.markChartDataChanged(instrument.instId)
+    await service.bars(instrument.instId, '1H', end, { hydrate: false, repair: false, foreground: true, focusToken: 1 })
+    await waitFor(() => oiCalls === 1 && takerCalls === 1)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
 test('OI and Taker use contract units, the requested timeframe, and an inclusive end cursor', async () => {
@@ -152,7 +231,7 @@ test('a 5m chart does not treat legacy OI or taker values as current statistics'
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-test('latest derived 15m/1H charts stop at a complete raw bucket and hydrate that visible window', async () => {
+test('latest native 15m/1H charts select their own confirmed period and hydrate that visible window', async () => {
   const cases = [['15m', 15 * 60_000], ['1H', hour]] as const
   for (const [timeframe, interval] of cases) {
     const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
@@ -160,7 +239,6 @@ test('latest derived 15m/1H charts stop at a complete raw bucket and hydrate tha
     const instrument = { instId: 'BTC-USDT-SWAP' }
     const end = Date.UTC(2024, 0, 15, 12)
     const first = end - 95 * interval
-    const incompleteNextBucket = end + interval
     const visibleTimestamps = Array.from({ length: 96 }, (_, index) => first + index * interval)
     const calls: URL[] = []
     const fetcher: typeof fetch = async input => {
@@ -171,15 +249,7 @@ test('latest derived 15m/1H charts stop at a complete raw bucket and hydrate tha
     }
     const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
     try {
-      const raw = []
-      for (let timestamp = first; timestamp <= end + interval - fiveMinutes; timestamp += fiveMinutes) raw.push(rawCandle(timestamp, 100 + raw.length / 100))
-      // A direct row for the next period may already be persisted while only
-      // its opening 5m candle exists. It must not become the latest chart end.
-      raw.push(rawCandle(incompleteNextBucket, 200))
-      await store.appendCandles([
-        ...raw,
-        { ...rawCandle(incompleteNextBucket, 300), timeframe, oi: 99_999, buy: 88_888, sell: 77_777, statisticsVersion: 1 },
-      ])
+      await store.appendCandles(visibleTimestamps.map((timestamp, index) => ({ ...rawCandle(timestamp, 100 + index / 100), timeframe })))
       service.instruments.set(instrument.instId, instrument)
       assert.equal(service.focusChart(instrument.instId, 1), true)
 
@@ -193,7 +263,6 @@ test('latest derived 15m/1H charts stop at a complete raw bucket and hydrate tha
       assert.equal(visible.length, 96)
       assert.equal(visible[0]?.hour, first)
       assert.equal(visible.at(-1)?.hour, end)
-      assert.equal(chart.bars.some((bar: any) => bar.hour === incompleteNextBucket), false)
       assert.equal(visible.at(-1)?.oi, 1_095)
       assert.equal(visible.at(-1)?.sell, 105)
       assert.equal(visible.at(-1)?.buy, 115)
@@ -310,53 +379,15 @@ test('a partial direct statistics response clears legacy fields and keeps the vi
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-test('an internally gapped newest raw bucket falls back for display while its tail stays repairable', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  const instrument = { instId: 'BTC-USDT-SWAP' }
-  const end = Date.UTC(2024, 0, 18, 12)
-  const displayEnd = end - hour
-  const first = displayEnd - (95 + 199) * hour
-  const missing = end + 30 * 60_000
-  let historyCalls = 0
-  const fetcher: typeof fetch = async input => {
-    const url = new URL(String(input))
-    if (url.pathname.endsWith('/market/history-candles')) {
-      historyCalls += 1
-      return response([okxCandle(rawCandle(missing, 200))])
-    }
-    if (url.pathname.endsWith('/open-interest-history') || url.pathname.endsWith('/taker-volume-contract')) return response([])
-    throw new Error(`Unexpected ${url}`)
-  }
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
-  try {
-    const source = []
-    for (let timestamp = first; timestamp <= end + hour - fiveMinutes; timestamp += fiveMinutes) {
-      if (timestamp !== missing) source.push(rawCandle(timestamp, 100 + source.length / 100))
-    }
-    await service.persistCandles(instrument.instId, source)
-    service.instruments.set(instrument.instId, instrument)
-    service.focusChart(instrument.instId, 1)
-
-    const chart = await service.bars(instrument.instId, '1H', undefined, { hydrate: false, repair: true, statistics: false, foreground: true, focusToken: 1 })
-    assert.equal(chart.bars.at(-1)?.hour, displayEnd)
-    assert.equal(service.activeChartViewport?.end, displayEnd)
-    assert.equal(service.activeChartViewport?.repairEnd, end)
-    assert.equal(chart.candleState, 'loading')
-    await waitFor(() => historyCalls === 1)
-    await waitFor(async () => (await store.candles({ instrument: instrument.instId, timeframe: '5m', from: missing, through: missing })).length === 1)
-  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
 test('an internal 5m gap is repaired immediately instead of being mistaken for a history boundary', async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
   const store = await MarketStore.open(root)
   const instrument = { instId: 'BTC-USDT-SWAP' }
   const target = Date.UTC(2024, 1, 1, 12)
-  const from = target - (95 + 199) * hour
-  const through = target + hour - fiveMinutes
-  const gapStart = target - 10 * hour
-  const missing = Array.from({ length: 12 }, (_, index) => rawCandle(gapStart + index * fiveMinutes, 200 + index))
+  const from = target - (95 + 199) * fiveMinutes
+  const through = target
+  const gapStart = target - 10 * fiveMinutes
+  const missing = [rawCandle(gapStart, 200)]
   let historyCalls = 0, cursor = ''
   const fetcher: typeof fetch = async input => {
     const url = new URL(String(input))
@@ -368,21 +399,19 @@ test('an internal 5m gap is repaired immediately instead of being mistaken for a
   }
   try {
     const seed = []
-    for (let timestamp = from; timestamp <= through; timestamp += fiveMinutes) {
-      if (timestamp < gapStart || timestamp >= gapStart + hour) seed.push(rawCandle(timestamp))
-    }
+    for (let timestamp = from; timestamp <= through; timestamp += fiveMinutes) if (timestamp !== gapStart) seed.push(rawCandle(timestamp))
     const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
     service.instruments.set(instrument.instId, instrument)
     service.lastCandleHydration.set(instrument.instId, Date.now())
     await service.persistCandles(instrument.instId, seed)
-    const loading = await service.bars(instrument.instId, '1H', target)
+    const loading = await service.bars(instrument.instId, '5m', target)
     assert.equal(loading.candleState, 'loading')
     await waitFor(() => service.candleRepairState(instrument.instId).status === 'ready')
-    const availability = await service.ensureChartRange(instrument, '1H', target)
+    const availability = await service.ensureChartRange(instrument, '5m', target)
     assert.equal(availability.candleState, 'ready')
     assert.equal(historyCalls, 1)
-    assert.equal(cursor, String(gapStart + hour))
-    const [repaired] = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: gapStart, through: gapStart })
+    assert.equal(cursor, String(gapStart + fiveMinutes))
+    const [repaired] = await store.candles({ instrument: instrument.instId, timeframe: '5m', from: gapStart, through: gapStart })
     assert.equal(repaired.confirmed, true)
     assert.equal(service.isHistoryExhausted(instrument.instId), false)
   } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
@@ -471,7 +500,7 @@ test('a history boundary uses fresh coverage after a successful earlier-page rep
     await store.appendCandles(Array.from({ length: 24 }, (_, index) => rawCandle(firstStored + index * fiveMinutes, 300 + index)))
     let gap: { from: number; through: number; emptyResponses?: number } = { from: gapFrom, through: gapThrough, emptyResponses: 0 }
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const result = await service.repairGap(instrument, gap, new AbortController().signal, 'background', true)
+      const result = await service.repairGap(instrument, '5m', gap, new AbortController().signal, 'background', true)
       assert.equal(result.deferred, undefined)
       assert.ok(result.remaining?.length)
       // List warm-up preserves this counter by gap start while reconstructing
@@ -479,7 +508,7 @@ test('a history boundary uses fresh coverage after a successful earlier-page rep
       gap = { ...result.remaining[0], emptyResponses: gap.emptyResponses }
     }
     assert.equal(historyRequests, 4)
-    assert.equal(service.historyBoundaries.get(instrument.instId), fetchedFirst)
+    assert.equal(service.historyBoundaries.get(service.seriesKey(instrument, '5m')), fetchedFirst)
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
@@ -539,7 +568,7 @@ test('a changed live candle invalidates cached chart results even when no 5m can
     assert.equal(first.bars.at(-1)?.close, 101)
     service.chartResults.set('ETH-USDT-SWAP:5m:cached', [])
     const revision = service.dataRevision(instrument.instId)
-    service.lastCandleHydration.delete(instrument.instId)
+    service.lastCandleHydration.delete(service.seriesKey(instrument, '5m'))
     await service.hydrate(instrument)
     const second = await service.bars(instrument.instId, '5m')
     assert.equal(service.liveCandles.get(instrument.instId)?.close, 102)
@@ -549,32 +578,6 @@ test('a changed live candle invalidates cached chart results even when no 5m can
     // another contract's cached chart must survive untouched.
     assert.equal(service.chartResults.has('ETH-USDT-SWAP:5m:cached'), true)
   } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('statistics hydration starts while visible candles are still repairing', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  const instrument = { instId: 'BTC-USDT-SWAP' }
-  const end = Date.UTC(2024, 6, 1)
-  let oiCalls = 0, takerCalls = 0
-  const fetcher: typeof fetch = async input => {
-    const url = new URL(String(input))
-    if (url.pathname.endsWith('/market/history-candles')) return response([])
-    if (url.pathname.endsWith('/open-interest-history')) { oiCalls += 1; return response([]) }
-    if (url.pathname.endsWith('/taker-volume-contract')) { takerCalls += 1; return response([]) }
-    throw new Error(`Unexpected ${url}`)
-  }
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
-  try {
-    service.instruments.set(instrument.instId, instrument)
-    service.focusChart(instrument.instId, 1)
-    const chart = await service.bars(instrument.instId, '1H', end, { hydrate: false, repair: true, statistics: true, foreground: true, focusToken: 1 })
-    assert.equal(chart.visibleCandleReady, false)
-    // OKX publishes no 5m history, so the visible window can never fill.
-    // Direct OI/Taker hydration must still run instead of waiting for it.
-    await waitFor(() => oiCalls === 1 && takerCalls === 1)
-    assert.equal(chart.candleState, 'loading')
-  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
 test('a fresh internal gap repairs immediately while a different gap is backing off', async () => {
@@ -790,7 +793,7 @@ test('switching charts aborts stale OI/Taker work and immediately serves the new
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-test('a raw rebuild never overwrites direct timeframe OI or taker statistics', async () => {
+test('5m writes do not mutate native timeframe OI or taker statistics', async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
   const store = await MarketStore.open(root)
   const instrument = { instId: 'BTC-USDT-SWAP' }
@@ -805,67 +808,6 @@ test('a raw rebuild never overwrites direct timeframe OI or taker statistics', a
     assert.equal(derived.oi, 9_999)
     assert.equal(derived.buy, 8_888)
     assert.equal(derived.sell, 7_777)
-  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('a partial derived parquet range cannot make a complete raw hourly chart stutter', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  const instrument = 'BTC-USDT-SWAP'
-  const end = Date.UTC(2024, 7, 8)
-  const first = end - 95 * hour
-  const raw = Array.from({ length: 96 * 12 }, (_, index) => rawCandle(first + index * fiveMinutes, 100 + index / 100))
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
-  try {
-    await store.appendCandles([...raw, { ...rawCandle(end, 200), timeframe: '1H' }])
-    const chart = await service.bars(instrument, '1H', end, { hydrate: false, repair: false, statistics: false })
-    const visible = chart.bars.filter((bar: any) => bar.hour >= first && bar.hour <= end)
-    assert.equal(visible.length, 96)
-    assert.equal(visible[0]?.hour, first)
-    assert.equal(visible.at(-1)?.hour, end)
-  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('OI/Taker hydration rebuilds a partial hourly Parquet window from complete raw candles', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  const instrument = { instId: 'BTC-USDT-SWAP' }
-  const end = Date.UTC(2024, 7, 9)
-  const first = end - 95 * hour
-  const timestamps = Array.from({ length: 96 }, (_, index) => first + index * hour)
-  let oiCalls = 0, takerCalls = 0
-  const fetcher: typeof fetch = async input => {
-    const path = new URL(String(input)).pathname
-    if (path.endsWith('/open-interest-history')) {
-      oiCalls += 1
-      return response(timestamps.map((timestamp, index) => [String(timestamp), String(1_000 + index), '0', '0']))
-    }
-    if (path.endsWith('/taker-volume-contract')) {
-      takerCalls += 1
-      return response(timestamps.map((timestamp, index) => [String(timestamp), String(10 + index), String(20 + index)]))
-    }
-    throw new Error(`Unexpected ${path}`)
-  }
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
-  try {
-    const raw = Array.from({ length: 96 * 12 }, (_, index) => rawCandle(first + index * fiveMinutes, 100 + index / 100))
-    // Simulate an interrupted derived rebuild: raw coverage is intact while
-    // Parquet has just one direct 1H row for the visible window.
-    await store.appendCandles([...raw, { ...rawCandle(end, 200), timeframe: '1H' }])
-    service.instruments.set(instrument.instId, instrument)
-    service.focusChart(instrument.instId, 1)
-    const initial = await service.bars(instrument.instId, '1H', end, { hydrate: false, repair: false, foreground: true, focusToken: 1 })
-    assert.equal(initial.bars.filter((bar: any) => bar.hour >= first && bar.hour <= end).length, 96)
-    await waitFor(() => service.statisticsState(instrument, '1H', end).status === 'ready')
-    const direct = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: first, through: end })
-    assert.equal(direct.length, 96)
-    assert.ok(direct.every((bar: any) => bar.oi !== null && bar.buy !== null && bar.sell !== null))
-    const hydrated = await service.bars(instrument.instId, '1H', end, { hydrate: false, repair: false, statistics: false, foreground: true, focusToken: 1 })
-    const missing = hydrated.bars.filter((bar: any) => bar.hour >= first && bar.hour <= end && (bar.oi === null || bar.buy === null || bar.sell === null)).map((bar: any) => bar.hour)
-    assert.equal(hydrated.bars.find((bar: any) => bar.hour === first)?.oi, direct[0]?.oi)
-    assert.deepEqual(missing, [])
-    assert.equal(oiCalls, 1)
-    assert.equal(takerCalls, 1)
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
@@ -945,9 +887,9 @@ test('rate-limited chart retries honor Retry-After and headerless 429s use bound
       delays.push((state.retryAt ?? Date.now()) - Date.now())
       if (state.timer) clearTimeout(state.timer)
       state.timer = null; state.retryAt = null
-      // Advance this isolated retry state without waiting through the shared
-      // one-second global cool-off on every test iteration.
-      headerless.rateLimitedUntil = 0
+      // Advance this isolated retry state without waiting through the candle
+      // lane's one-second cool-off on every test iteration.
+      headerless.requestLane('candles').rateLimitedUntil = 0
     }
     const state = headerless.latestCandleRetryState(instrument)
     assert.equal(headerlessCalls, 5)
@@ -969,6 +911,7 @@ test('an explicit statistics Retry-After remains observable across a foreground 
     return new Response(null, { status: 429, headers: { 'retry-after': '60' } })
   }, false)
   try {
+    await store.appendCandles(Array.from({ length: 96 }, (_, index) => nativeCandle(end - (95 - index) * hour, '1H')))
     service.focusChart(instrument.instId, 1)
     service.activateChartViewport(instrument, '1H', end)
     service.requestStatistics(instrument, '1H', end)
@@ -982,7 +925,7 @@ test('an explicit statistics Retry-After remains observable across a foreground 
     assert.equal(state.status, 'retrying')
     assert.equal(state.retryAt, retryAt)
     await new Promise(resolve => setTimeout(resolve, 100))
-    assert.equal(requests, 1)
+    assert.equal(requests, 2, 'OI and Taker each issue their own native endpoint request before the shared retry state is preserved.')
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
@@ -1040,6 +983,40 @@ test('a foreground request cancels noncooperative background work instead of inh
     await service.get('/foreground', {})
     assert.equal(foregroundStarted, true)
     assert.ok(await backgroundResult)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a candle repair starts beside OI and Taker without aborting either statistics lane', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  let oiStarted = false, takerStarted = false, repairStarted = false, oiAborts = 0, takerAborts = 0
+  let releaseOI: (() => void) | undefined, releaseTaker: (() => void) | undefined
+  const fetcher: typeof fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname
+    if (path.endsWith('/open-interest-history')) return new Promise<Response>((resolve, reject) => {
+      oiStarted = true
+      releaseOI = () => resolve(response([]))
+      init?.signal?.addEventListener('abort', () => { oiAborts += 1; reject(new DOMException('The request was aborted.', 'AbortError')) }, { once: true })
+    })
+    if (path.endsWith('/taker-volume-contract')) return new Promise<Response>((resolve, reject) => {
+      takerStarted = true
+      releaseTaker = () => resolve(response([]))
+      init?.signal?.addEventListener('abort', () => { takerAborts += 1; reject(new DOMException('The request was aborted.', 'AbortError')) }, { once: true })
+    })
+    if (path.endsWith('/market/history-candles')) { repairStarted = true; return response([]) }
+    throw new Error(`Unexpected ${path}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    const oi = service.get('/rubik/stat/contracts/open-interest-history', {}, undefined, 'statistics')
+    const taker = service.get('/rubik/stat/taker-volume-contract', {}, undefined, 'statistics')
+    await waitFor(() => oiStarted && takerStarted)
+    await service.get('/market/history-candles', {}, undefined, 'repair')
+    assert.equal(repairStarted, true)
+    assert.equal(oiAborts, 0)
+    assert.equal(takerAborts, 0)
+    releaseOI?.(); releaseTaker?.()
+    await Promise.all([oi, taker])
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
@@ -1131,7 +1108,6 @@ test('OI/Taker starts when the visible hourly window is complete despite an EMA 
   const instrument = { instId: 'BTC-USDT-SWAP' }
   const end = Date.UTC(2024, 9, 15, 12)
   const sourceFrom = end - (95 + 199) * hour
-  const sourceThrough = end + hour - fiveMinutes
   const warmupGap = end - 150 * hour
   const visibleTimestamps = Array.from({ length: 96 }, (_, index) => end - (95 - index) * hour)
   let oiCalls = 0, takerCalls = 0
@@ -1151,7 +1127,7 @@ test('OI/Taker starts when the visible hourly window is complete despite an EMA 
   const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
   try {
     const source = []
-    for (let timestamp = sourceFrom; timestamp <= sourceThrough; timestamp += fiveMinutes) if (timestamp !== warmupGap) source.push(rawCandle(timestamp))
+    for (let timestamp = sourceFrom; timestamp <= end; timestamp += hour) if (timestamp !== warmupGap) source.push(nativeCandle(timestamp, '1H'))
     await service.persistCandles(instrument.instId, source)
     service.instruments.set(instrument.instId, instrument)
     service.focusChart(instrument.instId, 1)
@@ -1168,7 +1144,6 @@ test('a hung EMA warm-up repair never delays or interrupts visible OI/Taker hydr
   const instrument = { instId: 'BTC-USDT-SWAP' }
   const end = Date.UTC(2024, 9, 18, 12)
   const sourceFrom = end - (95 + 199) * hour
-  const sourceThrough = end + hour - fiveMinutes
   const warmupGap = end - 150 * hour
   const visibleTimestamps = Array.from({ length: 96 }, (_, index) => end - (95 - index) * hour)
   let warmupCalls = 0, warmupAborts = 0, oiCalls = 0, oiAborts = 0, takerCalls = 0, releaseOI: (() => void) | undefined
@@ -1197,7 +1172,7 @@ test('a hung EMA warm-up repair never delays or interrupts visible OI/Taker hydr
   const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 5_000 })
   try {
     const source = []
-    for (let timestamp = sourceFrom; timestamp <= sourceThrough; timestamp += fiveMinutes) if (timestamp !== warmupGap) source.push(rawCandle(timestamp))
+    for (let timestamp = sourceFrom; timestamp <= end; timestamp += hour) if (timestamp !== warmupGap) source.push(nativeCandle(timestamp, '1H'))
     await service.persistCandles(instrument.instId, source)
     service.instruments.set(instrument.instId, instrument)
     service.focusChart(instrument.instId, 1)
@@ -1209,7 +1184,7 @@ test('a hung EMA warm-up repair never delays or interrupts visible OI/Taker hydr
     await new Promise(resolve => setTimeout(resolve, 1_100))
     assert.equal(oiAborts, 0, 'The next warm-up retry stays below the active statistics request.')
     assert.ok(warmupCalls >= 1)
-    assert.ok(warmupAborts >= 1, 'Statistics may preempt warm-up work, never the other way around.')
+    assert.equal(warmupAborts, 0, 'A warm-up candle request occupies only the candles lane; OI/Taker never need to abort it.')
     releaseOI?.()
     await waitFor(() => takerCalls === 1 && service.statisticsState(instrument, '1H', end).status === 'ready')
     assert.equal(oiCalls, 1)
@@ -1222,19 +1197,18 @@ test('a crossing repair releases OI/Taker as soon as its visible segment is comp
   const instrument = { instId: 'BTC-USDT-SWAP' }
   const end = Date.UTC(2024, 9, 19, 12)
   const sourceFrom = end - (95 + 199) * hour
-  const sourceThrough = end + hour - fiveMinutes
   const visibleFrom = end - 95 * hour
-  const gapFrom = visibleFrom - 2 * fiveMinutes
-  const gapThrough = visibleFrom + 2 * fiveMinutes
+  const gapFrom = visibleFrom - hour
+  const gapThrough = visibleFrom + hour
   const visibleTimestamps = Array.from({ length: 96 }, (_, index) => end - (95 - index) * hour)
   let visibleRepairCalls = 0, warmupCalls = 0, warmupAborts = 0, oiCalls = 0, takerCalls = 0
   const fetcher: typeof fetch = async (input, init) => {
     const url = new URL(String(input)), path = url.pathname
     if (path.endsWith('/market/history-candles')) {
       const cursor = Number(url.searchParams.get('after'))
-      if (cursor === gapThrough + fiveMinutes) {
+      if (cursor === gapThrough + hour) {
         visibleRepairCalls += 1
-        return response([visibleFrom, visibleFrom + fiveMinutes, visibleFrom + 2 * fiveMinutes].map(timestamp => okxCandle(rawCandle(timestamp, 300))))
+        return response([visibleFrom, gapThrough].map(timestamp => okxCandle(nativeCandle(timestamp, '1H', 300))))
       }
       if (cursor === visibleFrom) {
         warmupCalls += 1
@@ -1258,8 +1232,8 @@ test('a crossing repair releases OI/Taker as soon as its visible segment is comp
   const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 5_000 })
   try {
     const source = []
-    for (let timestamp = sourceFrom; timestamp <= sourceThrough; timestamp += fiveMinutes) {
-      if (timestamp < gapFrom || timestamp > gapThrough) source.push(rawCandle(timestamp))
+    for (let timestamp = sourceFrom; timestamp <= end; timestamp += hour) {
+      if (timestamp < gapFrom || timestamp > gapThrough) source.push(nativeCandle(timestamp, '1H'))
     }
     await service.persistCandles(instrument.instId, source)
     service.instruments.set(instrument.instId, instrument)
@@ -1273,17 +1247,15 @@ test('a crossing repair releases OI/Taker as soon as its visible segment is comp
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-test('one-candle viewport scroll repartitions an old warm-up repair at the new visible boundary', async () => {
+test('one-candle viewport scroll promotes a native 1H warm-up repair at its new visible boundary', async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
   const store = await MarketStore.open(root)
   const instrument = { instId: 'BTC-USDT-SWAP' }
   const oldEnd = Date.UTC(2024, 9, 22, 12)
   const newEnd = oldEnd - hour
   const newVisibleFrom = newEnd - 95 * hour
-  const gapFrom = newVisibleFrom - fiveMinutes
-  const gapThrough = newVisibleFrom + fiveMinutes
   const sourceFrom = newEnd - (95 + 199) * hour
-  const sourceThrough = oldEnd + hour - fiveMinutes
+  const sourceThrough = oldEnd
   const visibleTimestamps = Array.from({ length: 96 }, (_, index) => newEnd - (95 - index) * hour)
   let historyCalls = 0, oldAborts = 0
   const fetcher: typeof fetch = async (input, init) => {
@@ -1294,7 +1266,7 @@ test('one-candle viewport scroll repartitions an old warm-up repair at the new v
         oldAborts += 1
         reject(new DOMException('The request was aborted.', 'AbortError'))
       }, { once: true }))
-      if (historyCalls === 2) return response([newVisibleFrom, newVisibleFrom + fiveMinutes].map(timestamp => okxCandle(rawCandle(timestamp, 350))))
+      if (historyCalls === 2) return response([okxCandle(nativeCandle(newVisibleFrom, '1H', 350))])
       return new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener('abort', () => reject(new DOMException('The request was aborted.', 'AbortError')), { once: true }))
     }
     if (path.endsWith('/open-interest-history')) return response(visibleTimestamps.map((timestamp, index) => [String(timestamp), String(1_000 + index), '0', '0']))
@@ -1302,12 +1274,9 @@ test('one-candle viewport scroll repartitions an old warm-up repair at the new v
     throw new Error(`Unexpected ${path}`)
   }
   const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 5_000 })
-  const crossesVisibleBoundary = (range: { from: number; through: number }) => range.from < newVisibleFrom && range.through >= newVisibleFrom
   try {
     const source = []
-    for (let timestamp = sourceFrom; timestamp <= sourceThrough; timestamp += fiveMinutes) {
-      if (timestamp < gapFrom || timestamp > gapThrough) source.push(rawCandle(timestamp))
-    }
+    for (let timestamp = sourceFrom; timestamp <= sourceThrough; timestamp += hour) if (timestamp !== newVisibleFrom) source.push(nativeCandle(timestamp, '1H'))
     await service.persistCandles(instrument.instId, source)
     service.instruments.set(instrument.instId, instrument)
     service.focusChart(instrument.instId, 1)
@@ -1317,54 +1286,11 @@ test('one-candle viewport scroll repartitions an old warm-up repair at the new v
 
     service.focusChart(instrument.instId, 2)
     service.activateChartViewport(instrument, '1H', newEnd)
-    assert.equal(service.candleRepairState(instrument.instId).ranges.some(crossesVisibleBoundary), false)
+    assert.equal(service.candleRepairState(instrument.instId, '1H').currentPriority, 'warmup')
     await service.ensureChartRange(instrument, '1H', newEnd, 2)
     await waitFor(async () => oldAborts === 1 && historyCalls >= 2
-      && (await store.candles({ instrument: instrument.instId, timeframe: '5m', from: newVisibleFrom, through: newVisibleFrom + fiveMinutes })).length === 2)
-    assert.equal(service.candleRepairState(instrument.instId).ranges.some(crossesVisibleBoundary), false)
-  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('a visible gap repair preempts a hung OI request instead of waiting for its request deadline', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
-  const store = await MarketStore.open(root)
-  const instrument = { instId: 'BTC-USDT-SWAP' }
-  const end = Date.UTC(2024, 9, 20, 12)
-  const sourceFrom = end - (95 + 199) * hour
-  const sourceThrough = end + hour - fiveMinutes
-  const visibleGap = end - 20 * hour
-  let oiStarted = 0, oiAborts = 0, takerStarted = 0, historyCalls = 0
-  const fetcher: typeof fetch = async (input, init) => {
-    const path = new URL(String(input)).pathname
-    if (path.endsWith('/open-interest-history')) {
-      oiStarted += 1
-      return new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener('abort', () => {
-        oiAborts += 1
-        reject(new DOMException('The request was aborted.', 'AbortError'))
-      }, { once: true }))
-    }
-    if (path.endsWith('/taker-volume-contract')) { takerStarted += 1; return response([]) }
-    if (path.endsWith('/market/history-candles')) {
-      historyCalls += 1
-      return response([okxCandle(rawCandle(visibleGap, 300))])
-    }
-    throw new Error(`Unexpected ${path}`)
-  }
-  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 10_000 })
-  try {
-    const source = []
-    for (let timestamp = sourceFrom; timestamp <= sourceThrough; timestamp += fiveMinutes) if (timestamp !== visibleGap) source.push(rawCandle(timestamp))
-    await service.persistCandles(instrument.instId, source)
-    service.instruments.set(instrument.instId, instrument)
-    service.focusChart(instrument.instId, 1)
-    service.activateChartViewport(instrument, '1H', end)
-    service.requestStatistics(instrument, '1H', end)
-    await waitFor(() => oiStarted === 1)
-
-    await service.ensureChartRange(instrument, '1H', end, 1)
-    await waitFor(async () => oiAborts === 1 && historyCalls === 1
-      && (await store.candles({ instrument: instrument.instId, timeframe: '5m', from: visibleGap, through: visibleGap })).length === 1)
-    assert.equal(takerStarted, 0, 'The paired statistics request is cancelled with its preempted OI request.')
+      && (await store.candles({ instrument: instrument.instId, timeframe: '1H', from: newVisibleFrom, through: newVisibleFrom })).length === 1)
+    assert.equal(service.candleRepairState(instrument.instId, '1H').ranges.some((range: { from: number; through: number }) => range.from <= newVisibleFrom && range.through >= newVisibleFrom), false)
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
@@ -1395,7 +1321,7 @@ test('a newer same-instrument viewport cannot be retaken by a delayed older requ
     releaseCandles?.()
     const old = await oldRequest
     assert.equal(old.stale, true)
-    assert.equal(candlesCalls, 4, 'The stale and current viewports each read their 5m source and direct rows once.')
+    assert.equal(candlesCalls, 2, 'The stale and current viewports each read their native 1H sequence once.')
     assert.equal(service.activeChartViewport.end, newEnd)
   } finally { releaseCandles?.(); await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
@@ -1479,30 +1405,38 @@ test('a same-instrument viewport change parks an old repair instead of restartin
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-test('an OI failure cancels the queued taker request before retrying', async () => {
+test('an OI failure leaves the independent Taker lane running and persists its result', async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
   const store = await MarketStore.open(root)
   const instrument = { instId: 'BTC-USDT-SWAP' }
   const end = Date.UTC(2024, 9, 1)
-  let rejectOI: ((reason?: unknown) => void) | undefined, takerStarted = false
+  const timestamps = Array.from({ length: 96 }, (_, index) => end - (95 - index) * hour)
+  let oiCalls = 0, takerCalls = 0, takerAborts = 0
   const fetcher: typeof fetch = async (input, init) => {
     const path = new URL(String(input)).pathname
-    if (path.endsWith('/open-interest-history')) return new Promise<Response>((_resolve, reject) => { rejectOI = reject })
-    if (path.endsWith('/taker-volume-contract')) return new Promise<Response>((_resolve, reject) => {
-      takerStarted = true
-      init?.signal?.addEventListener('abort', () => reject(new DOMException('The request was aborted.', 'AbortError')), { once: true })
-    })
+    if (path.endsWith('/open-interest-history')) {
+      oiCalls += 1
+      return new Response(null, { status: 429, headers: { 'retry-after': '60' } })
+    }
+    if (path.endsWith('/taker-volume-contract')) {
+      takerCalls += 1
+      init?.signal?.addEventListener('abort', () => { takerAborts += 1 }, { once: true })
+      return response(timestamps.map((timestamp, index) => [String(timestamp), String(10 + index), String(20 + index)]))
+    }
     throw new Error(`Unexpected ${path}`)
   }
   const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
   try {
+    await store.appendCandles(timestamps.map(timestamp => nativeCandle(timestamp, '1H')))
     service.focusChart(instrument.instId, 1)
     service.activateChartViewport(instrument, '1H', end)
     service.requestStatistics(instrument, '1H', end)
-    await waitFor(() => rejectOI !== undefined)
-    rejectOI?.(new Error('OI failed'))
     await waitFor(() => service.statisticsState(instrument, '1H', end).status === 'retrying')
-    assert.equal(takerStarted, false)
+    const stored = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: timestamps[0], through: end })
+    assert.equal(oiCalls, 1)
+    assert.equal(takerCalls, 1)
+    assert.equal(takerAborts, 0)
+    assert.ok(stored.every(value => value.oi === null && Number.isFinite(value.buy) && Number.isFinite(value.sell)))
     assert.equal(service.statisticsState(instrument, '1H', end).status, 'retrying')
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
@@ -1510,10 +1444,6 @@ test('an OI failure cancels the queued taker request before retrying', async () 
 // The market list must be a projection of the cache, not a catalogue-shaped
 // placeholder which only acquires readings after a user opens a chart.
 const listFixtureInstrument = { instId: 'BTC-USDT-SWAP', instCategory: '1', settleCcy: 'USDT', state: 'live', ctVal: '0.01', ctValCcy: 'BTC' }
-const completeListEnd = (rawLast: number, interval: number) => {
-  const bucket = Math.floor(rawLast / interval) * interval
-  return rawLast >= bucket + interval - fiveMinutes ? bucket : bucket - interval
-}
 
 const liquidCatalogueResponse = (url: URL) => {
   if (url.pathname.endsWith('/public/instruments')) return response([listFixtureInstrument])
@@ -1527,33 +1457,30 @@ const liquidCatalogueResponse = (url: URL) => {
 }
 
 const seedProjectedListCache = async (store: MarketStore) => {
-  // Keep the newest raw observation fresh. This means list warm-up verifies
-  // the cache rather than replacing this deterministic fixture over HTTP.
-  const rawLast = Math.floor((Date.now() - fiveMinutes) / fiveMinutes) * fiveMinutes
-  const oneHourEnd = completeListEnd(rawLast, hour)
-  const start = oneHourEnd - 200 * hour
+  // Every list period is persisted from its own native OKX sequence. This
+  // keeps the cache fixture faithful to the production no-aggregation path.
+  const latestComplete = (interval: number) => Math.floor((Date.now() - interval) / interval) * interval
+  const start = latestComplete(hour) - 200 * hour
   const closeAt = (timestamp: number) => 100 + (timestamp - start) / fiveMinutes * 0.05
-  const raw = []
-  for (let timestamp = start; timestamp <= rawLast; timestamp += fiveMinutes) raw.push(rawCandle(timestamp, closeAt(timestamp)))
-  await store.appendCandles(raw)
-
   const ends: Record<string, number> = {}
   for (const [timeframe, interval, base] of [['5m', fiveMinutes, 1_000], ['15m', 3 * fiveMinutes, 2_000], ['1H', hour, 3_000]] as const) {
-    const end = completeListEnd(rawLast, interval)
+    const end = latestComplete(interval)
     ends[timeframe] = end
-    const statistics = Array.from({ length: 96 }, (_, index) => {
-      const timestamp = end - (95 - index) * interval
+    const candles = Array.from({ length: 201 }, (_, index) => {
+      const timestamp = end - (200 - index) * interval
       return {
-        ...rawCandle(timestamp, closeAt(timestamp)), timeframe,
-        oi: base + index * 11,
-        sell: base + index,
-        buy: base + 200 + index,
-        statisticsVersion: 1,
+        ...nativeCandle(timestamp, timeframe, closeAt(timestamp)),
+        ...(index < 105 ? {} : {
+          oi: base + (index - 105) * 11,
+          sell: base + index - 105,
+          buy: base + 200 + index - 105,
+          statisticsVersion: 1,
+        }),
       }
     })
-    await store.appendCandles(statistics)
+    await store.appendCandles(candles)
   }
-  return { rawLast, start, ends, closeAt }
+  return { rawLast: ends['5m'], start, ends, closeAt }
 }
 
 test('refresh projects cached 1H indicators and direct OI/Taker statistics into the list', async () => {
@@ -1593,7 +1520,7 @@ test('refresh projects cached 1H indicators and direct OI/Taker statistics into 
     assert.equal(row.sell, 3_000 + 95)
     assert.ok((row.takerRatio ?? 0) > 0)
     assert.notEqual(row.opportunity.status, 'Incomplete')
-    assert.equal(row.filterMetrics.liveClose, fixture.closeAt(fixture.ends['1H'] + hour - fiveMinutes))
+    assert.equal(row.filterMetrics.liveClose, fixture.closeAt(fixture.ends['1H']))
     assert.deepEqual(requests.sort(), [
       '/api/v5/market/books', '/api/v5/market/candles', '/api/v5/market/tickers', '/api/v5/public/instruments', '/api/v5/public/open-interest',
     ].sort(), 'A complete cached list must not fetch candles or statistics before displaying its readings.')
@@ -1853,7 +1780,7 @@ test('list snapshots project each selected timeframe instead of reusing the 1H r
     assert.notEqual(five!.oiChange, fifteen!.oiChange)
     assert.notEqual(fifteen!.oiChange, hourlyRow!.oiChange)
     assert.notEqual(five!.takerRatio, null, '5m must keep its direct Taker statistics.')
-    const expectedFifteenEnd = completeListEnd((await store.coverage(listFixtureInstrument.instId, '5m')).last!, 3 * fiveMinutes)
+    const expectedFifteenEnd = fixture.ends['15m']
     const directFifteen = await store.candles({ instrument: listFixtureInstrument.instId, timeframe: '15m', from: expectedFifteenEnd - 95 * 3 * fiveMinutes, through: expectedFifteenEnd })
     assert.equal(directFifteen.length, 96)
     assert.ok(directFifteen.every(value => value.statisticsVersion === 1))
@@ -1868,12 +1795,15 @@ test('a failed background list warm-up enters a scheduled retry instead of stopp
   let candleRequests = 0
   const fetcher: typeof fetch = async input => {
     const url = new URL(String(input))
-    const discovery = url.pathname.endsWith('/market/candles') && url.searchParams.get('bar') === '5m' ? null : liquidCatalogueResponse(url)
-    if (discovery) return discovery
     if (url.pathname.endsWith('/market/candles')) {
+      // Liquidity discovery uses a short 1H sample; the list's native 1H
+      // cache hydration uses limit=300 and is the request under test.
+      if (url.searchParams.get('limit') === '25') return response(hourly)
       candleRequests += 1
       return new Response('temporarily unavailable', { status: 503 })
     }
+    const discovery = liquidCatalogueResponse(url)
+    if (discovery) return discovery
     throw new Error(`Unexpected ${url.pathname}`)
   }
   const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 1_000 })
@@ -1895,12 +1825,13 @@ test('list warm-up follows a latest-candle Retry-After instead of retrying aroun
   let candleRequests = 0
   const fetcher: typeof fetch = async input => {
     const url = new URL(String(input))
-    const discovery = url.pathname.endsWith('/market/candles') && url.searchParams.get('bar') === '5m' ? null : liquidCatalogueResponse(url)
-    if (discovery) return discovery
     if (url.pathname.endsWith('/market/candles')) {
+      if (url.searchParams.get('limit') === '25') return response(hourly)
       candleRequests += 1
       return new Response(null, { status: 429, headers: { 'retry-after': '60' } })
     }
+    const discovery = liquidCatalogueResponse(url)
+    if (discovery) return discovery
     throw new Error(`Unexpected ${url.pathname}`)
   }
   const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 1_000 })
@@ -1918,8 +1849,8 @@ test('list history repair remains runnable behind another chart and records an u
   const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
   const store = await MarketStore.open(root)
   const instrument = { ...listFixtureInstrument }
-  const now = Math.floor((Date.now() - fiveMinutes) / fiveMinutes) * fiveMinutes
-  const raw = Array.from({ length: 300 }, (_, index) => rawCandle(now - (299 - index) * fiveMinutes, 100 + index / 100))
+  const now = Math.floor((Date.now() - hour) / hour) * hour
+  const native = Array.from({ length: 96 }, (_, index) => nativeCandle(now - (95 - index) * hour, '1H', 100 + index / 100))
   let historyRequests = 0
   const fetcher: typeof fetch = async input => {
     const url = new URL(String(input))
@@ -1928,7 +1859,7 @@ test('list history repair remains runnable behind another chart and records an u
   }
   const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
   try {
-    await store.appendCandles(raw)
+    await store.appendCandles(native)
     service.replaceCatalog([{ instrument, ticker: { instId: instrument.instId, last: '103', open24h: '100', low24h: '90', high24h: '110' }, result: { eligible: true, turnover: 40_000_000, oiUSD: 6_000_000, spread: 0.01 }, change24h: 3 }])
     service.hasCompleteStoredStatistics = async () => true
     assert.equal(service.focusChart('ETH-USDT-SWAP', 1), true)
@@ -1938,7 +1869,7 @@ test('list history repair remains runnable behind another chart and records an u
       if (state.timer) { clearTimeout(state.timer); state.timer = null }
     }
     assert.equal(historyRequests, 3, 'The background repair is allowed even while an unrelated chart owns focus.')
-    assert.equal(service.historyBoundaries.get(instrument.instId), raw[0].timestamp)
+    assert.equal(service.historyBoundaries.get(service.seriesKey(instrument, '1H')), native[0].timestamp)
     assert.equal(state.status, 'ready')
     await service.warmListEntry(entry, '1H', state, new AbortController().signal)
     assert.equal(historyRequests, 3, 'The known listing boundary prevents an endless missing-history retry loop.')
@@ -1951,19 +1882,23 @@ test('a foreground chart hydration preempts a hung background list warm-up', asy
   let candleRequests = 0, backgroundAborts = 0
   const fetcher: typeof fetch = async (input, init) => {
     const url = new URL(String(input))
-    const discovery = url.pathname.endsWith('/market/candles') && url.searchParams.get('bar') === '5m' ? null : liquidCatalogueResponse(url)
-    if (discovery) return discovery
-    if (url.pathname.endsWith('/market/candles')) {
+    if (url.pathname.endsWith('/market/candles') && url.searchParams.has('bar')) {
+      // The refresh-time liquidity sample is not a cache warm-up. Let it
+      // complete so the background native 1H hydration is the hanging call.
+      if (url.searchParams.get('limit') === '25') return response(hourly)
       candleRequests += 1
-      if (candleRequests === 1) return new Promise<Response>((_resolve, reject) => {
+      if (url.searchParams.get('bar') === '1H' && candleRequests === 1) return new Promise<Response>((_resolve, reject) => {
         init?.signal?.addEventListener('abort', () => {
           backgroundAborts += 1
           reject(new DOMException('The request was aborted.', 'AbortError'))
         }, { once: true })
       })
-      const end = Math.floor((Date.now() - fiveMinutes) / fiveMinutes) * fiveMinutes
-      return response(Array.from({ length: 300 }, (_, index) => okxCandle(rawCandle(end - (299 - index) * fiveMinutes, 100 + index / 10))))
+      const timeframe = url.searchParams.get('bar')!, interval = timeframe === '1H' ? hour : timeframe === '15m' ? 3 * fiveMinutes : fiveMinutes
+      const end = Math.floor((Date.now() - interval) / interval) * interval
+      return response(Array.from({ length: 300 }, (_, index) => okxCandle(rawCandle(end - (299 - index) * interval, 100 + index / 10))))
     }
+    const discovery = liquidCatalogueResponse(url)
+    if (discovery) return discovery
     throw new Error(`Unexpected ${url.pathname}`)
   }
   const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 5_000 })
