@@ -393,3 +393,175 @@ test('older source gaps explain the OKX retention limit without plotting false z
   assert.equal(await chart.getByText('OKX 1h Taker history is limited to 60 days', { exact: true }).count(), 1)
   assert.equal(await chart.locator('[data-chart-taker="empty"]').count(), 1)
 })
+
+test('an unrelated preview revision cannot strand an interior statistics gap while both sources report loading', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  const targetEnd = fixture.end - 12 * fixture.intervalMS
+  await electron.evaluate(({ ipcMain }, { instId, targetEnd, intervalMS }) => {
+    const original = ipcMain._invokeHandlers.get('radar:request')
+    const race = { original, fullReads: 0, statusReads: 0, revision: 300_000, releasePreview: null }
+    const previewRelease = new Promise(resolve => { race.releasePreview = resolve })
+    const partial = response => ({
+      ...response, revision: 300_000,
+      bars: response.bars.map(bar => bar.hour >= targetEnd - 35 * intervalMS && bar.hour <= targetEnd - 26 * intervalMS
+        ? { ...bar, oi: null, buy: null, sell: null, statisticsSources: 0, statisticsObserved: false } : bar),
+      statisticsState: 'loading', oiState: 'loading', takerState: 'loading',
+    })
+    ipcMain.removeHandler('radar:request')
+    ipcMain.handle('radar:request', async (event, value) => {
+      if (value.chartInstId !== instId) return original(event, value)
+      if (value.preview && value.chartEndHour !== undefined) {
+        await previewRelease
+        // This genuine older chart range ends before the visible window.
+        // It advances the series revision without materializing that window.
+        return { ...await original(event, value), revision: 300_001 }
+      }
+      const response = await original(event, value)
+      if (!response.bars || value.preview) return response
+      if (value.chartEndHour === targetEnd) {
+        if (value.chartStatusOnly) {
+          race.statusReads += 1
+          return { ...response, bars: [], revision: race.revision, statisticsState: 'loading', oiState: 'loading', takerState: 'loading' }
+        }
+        race.fullReads += 1
+        return race.fullReads === 1 ? partial(response) : { ...response, revision: race.revision }
+      }
+      return partial(response)
+    })
+    globalThis.__partialChartStatisticsRace = race
+  }, { ...fixture, targetEnd })
+
+  try {
+    await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click()
+    const chart = page.locator(`[data-chart-inst="${fixture.instId}"]`)
+    await page.waitForFunction(({ instId, end }) => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+      return chart?.getAttribute('data-chart-end') === String(end) && chart.getAttribute('data-chart-oi-samples') === '86'
+    }, fixture)
+    await chart.locator('[data-chart-plot]').dispatchEvent('wheel', { deltaY: 144 })
+    await page.waitForFunction(({ instId, targetEnd }) => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+      return chart?.getAttribute('data-chart-statistics-end') === String(targetEnd)
+        && chart.getAttribute('data-chart-oi-samples') === '86'
+        && chart.getAttribute('data-chart-taker-samples') === '86'
+        && chart.getAttribute('data-chart-oi-state') === 'loading'
+        && chart.getAttribute('data-chart-taker-state') === 'loading'
+    }, { ...fixture, targetEnd })
+    await electron.evaluate(() => globalThis.__partialChartStatisticsRace.releasePreview())
+    await page.waitForFunction(({ instId, end, intervalMS }) => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+      return Number(chart?.getAttribute('data-chart-cache-start')) <= end - 900 * intervalMS
+    }, fixture)
+    // Only publish the newer progress revision after React has accepted the
+    // distant preview. Both source statuses deliberately remain Loading;
+    // the window's materialization revision must itself trigger a full read.
+    await electron.evaluate(() => { globalThis.__partialChartStatisticsRace.revision = 300_001 })
+    await page.waitForFunction(({ instId, targetEnd }) => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+      return chart?.getAttribute('data-chart-end') === String(targetEnd)
+        && chart.getAttribute('data-chart-oi-samples') === '96'
+        && chart.getAttribute('data-chart-taker-samples') === '96'
+        && chart.getAttribute('data-chart-statistics-state') === 'ready'
+        && chart.getAttribute('data-chart-loading') === 'false'
+    }, { ...fixture, targetEnd }, { timeout: 5_000 })
+    const race = await electron.evaluate(() => {
+      const race = globalThis.__partialChartStatisticsRace
+      return { fullReads: race.fullReads, statusReads: race.statusReads }
+    })
+    assert.ok(race.statusReads > 0)
+    assert.equal(race.fullReads, 2, 'One new active-window revision requires one materialized read.')
+    assert.equal(await chart.locator('[data-chart-oi="complete"]').count(), 1)
+    assert.equal(await chart.locator('[data-chart-taker="complete"]').count(), 1)
+  } finally {
+    await electron.evaluate(({ ipcMain }) => {
+      const race = globalThis.__partialChartStatisticsRace
+      race.releasePreview()
+      ipcMain.removeHandler('radar:request')
+      ipcMain.handle('radar:request', race.original)
+      delete globalThis.__partialChartStatisticsRace
+    })
+  }
+})
+
+test('a same-revision loading status periodically reconciles an incomplete visible snapshot', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  const targetEnd = fixture.end - 12 * fixture.intervalMS
+  await electron.evaluate(({ ipcMain }, { instId, targetEnd, intervalMS }) => {
+    const original = ipcMain._invokeHandlers.get('radar:request')
+    const { MarketService } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/services/market-service.js')
+    const originalGet = MarketService.prototype.get
+    const race = { original, MarketService, originalGet, fullReads: 0, statusReads: 0, sourceCalls: 0, firstReadAt: 0, refreshAfterMS: null }
+    MarketService.prototype.get = function (path, parameters, ...rest) {
+      if (parameters?.instId === instId && (path.endsWith('/open-interest-history') || path.endsWith('/taker-volume-contract'))) race.sourceCalls += 1
+      return originalGet.call(this, path, parameters, ...rest)
+    }
+    const partial = response => ({
+      ...response, revision: 400_000,
+      bars: response.bars.map(bar => bar.hour >= targetEnd - 35 * intervalMS && bar.hour <= targetEnd - 26 * intervalMS
+        ? { ...bar, oi: null, buy: null, sell: null, statisticsSources: 0, statisticsObserved: false } : bar),
+      statisticsState: 'loading', oiState: 'loading', takerState: 'loading',
+    })
+    ipcMain.removeHandler('radar:request')
+    ipcMain.handle('radar:request', async (event, value) => {
+      const response = await original(event, value)
+      if (value.chartInstId !== instId || !response.bars || value.preview) return response
+      if (value.chartEndHour === targetEnd) {
+        if (value.chartStatusOnly) {
+          race.statusReads += 1
+          return { ...response, bars: [], revision: 400_000, statisticsState: 'loading', oiState: 'loading', takerState: 'loading' }
+        }
+        race.fullReads += 1
+        if (race.fullReads === 1) {
+          race.firstReadAt = Date.now()
+          return partial(response)
+        }
+        race.refreshAfterMS = Date.now() - race.firstReadAt
+        return { ...response, revision: 400_000 }
+      }
+      return partial(response)
+    })
+    globalThis.__sameRevisionChartRace = race
+  }, { ...fixture, targetEnd })
+
+  try {
+    await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click()
+    const chart = page.locator(`[data-chart-inst="${fixture.instId}"]`)
+    await page.waitForFunction(({ instId, end }) => document.querySelector(`[data-chart-inst="${instId}"]`)?.getAttribute('data-chart-end') === String(end), fixture)
+    await chart.locator('[data-chart-plot]').dispatchEvent('wheel', { deltaY: 144 })
+    await page.waitForFunction(({ instId, targetEnd }) => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+      return chart?.getAttribute('data-chart-statistics-end') === String(targetEnd)
+        && chart.getAttribute('data-chart-oi-samples') === '86'
+        && chart.getAttribute('data-chart-taker-samples') === '86'
+    }, { ...fixture, targetEnd })
+    await page.waitForFunction(({ instId, targetEnd }) => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+      return chart?.getAttribute('data-chart-end') === String(targetEnd)
+        && chart.getAttribute('data-chart-oi-samples') === '96'
+        && chart.getAttribute('data-chart-taker-samples') === '96'
+        && chart.getAttribute('data-chart-statistics-state') === 'ready'
+        && chart.getAttribute('data-chart-loading') === 'false'
+    }, { ...fixture, targetEnd }, { timeout: 5_000 })
+    const race = await electron.evaluate(() => {
+      const race = globalThis.__sameRevisionChartRace
+      return { fullReads: race.fullReads, statusReads: race.statusReads, sourceCalls: race.sourceCalls, refreshAfterMS: race.refreshAfterMS }
+    })
+    assert.equal(race.fullReads, 2, 'A partial same-revision snapshot needs one bounded cache reread.')
+    assert.ok(race.statusReads > 0)
+    assert.equal(race.sourceCalls, 0, 'Reconciling a persisted gap must not download OI/Taker again.')
+    assert.ok(race.refreshAfterMS >= 1_000 && race.refreshAfterMS <= 1_500,
+      `The snapshot refresh must stay bounded; observed ${race.refreshAfterMS}ms.`)
+    assert.equal(await chart.locator('[data-chart-oi="complete"]').count(), 1)
+    assert.equal(await chart.locator('[data-chart-taker="complete"]').count(), 1)
+  } finally {
+    await electron.evaluate(({ ipcMain }) => {
+      const race = globalThis.__sameRevisionChartRace
+      race.MarketService.prototype.get = race.originalGet
+      ipcMain.removeHandler('radar:request')
+      ipcMain.handle('radar:request', race.original)
+      delete globalThis.__sameRevisionChartRace
+    })
+  }
+})

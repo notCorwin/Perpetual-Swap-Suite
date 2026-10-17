@@ -63,6 +63,7 @@ const latestHour = <TBar extends ChartSeriesBar>(bars: readonly TBar[]) => bars.
 export class ChartSeriesStore<TBar extends ChartSeriesBar, TStatus extends object> {
   private readonly entries = new Map<string, ChartSeriesEntry<TBar, TStatus>>()
   private readonly orders = new Map<string, SnapshotOrder>()
+  private readonly materialized = new Map<string, Map<number, { revision: number; readAt: number; confirmed: boolean }>>()
 
   get size() { return this.entries.size }
 
@@ -71,6 +72,24 @@ export class ChartSeriesStore<TBar extends ChartSeriesBar, TStatus extends objec
   hasBars(key: string) { return (this.entries.get(key)?.bars.length ?? 0) > 0 }
 
   latestKnownHour(key: string) { return this.entries.get(key)?.latestKnownHour ?? null }
+
+  /** A distant preview cannot advance the revision or read time of this window. */
+  materializedWindow(key: string, end: number, intervalMS: number, count = 96, allowPartial = false): { revision: number; readAt: number } | null {
+    const entry = this.entries.get(key), hours = this.materialized.get(key)
+    if (!entry || entry.serviceSession !== entry.barsServiceSession || !hours
+      || !Number.isFinite(end) || !Number.isFinite(intervalMS) || intervalMS <= 0 || !Number.isSafeInteger(count) || count <= 0) return null
+    let revision = Infinity, readAt = Infinity
+    for (let index = 0; index < count; index += 1) {
+      const snapshot = hours.get(end - index * intervalMS)
+      if (!snapshot) {
+        if (!allowPartial) return null
+        continue
+      }
+      revision = Math.min(revision, snapshot.revision)
+      readAt = Math.min(readAt, snapshot.readAt)
+    }
+    return Number.isFinite(revision) ? { revision, readAt } : null
+  }
 
   upsert(key: string, response: ChartSeriesResponse<TBar, TStatus>, loadedAt = Date.now()): ChartSeriesUpsert<TBar, TStatus> {
     const existing = this.entries.get(key)
@@ -87,6 +106,18 @@ export class ChartSeriesStore<TBar extends ChartSeriesBar, TStatus extends objec
 
     const hasIncomingBars = response.bars.length > 0
     const mustReplaceBars = hasIncomingBars && existing !== undefined && existing.barsServiceSession !== response.serviceSession
+    let materialized = this.materialized.get(key)
+    if (!materialized || existing?.serviceSession !== response.serviceSession || mustReplaceBars) {
+      materialized = new Map()
+      this.materialized.set(key, materialized)
+    }
+    const readAt = Date.now()
+    for (const bar of response.bars) {
+      // mergeChartBars retains confirmed data when an older live frame
+      // arrives. Such a rejected frame must not mark that hour as refreshed.
+      if (materialized.get(bar.hour)?.confirmed && !bar.confirmed) continue
+      materialized.set(bar.hour, { revision: response.revision, readAt, confirmed: bar.confirmed })
+    }
     const incoming = { bars: response.bars, revision: response.revision, serviceSession: response.serviceSession }
     const current = existing && { bars: existing.bars, revision: existing.barsRevision, serviceSession: existing.barsServiceSession }
     const bars = !hasIncomingBars

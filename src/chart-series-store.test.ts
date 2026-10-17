@@ -100,6 +100,46 @@ test('a failed materialized read remains pending across equal status-only revisi
   assert.equal(store.get(key)?.bars[0]?.oi, 2_001)
 })
 
+test('only materialized hours advance a visible window through distant previews and status polls', () => {
+  const store = new ChartSeriesStore<Bar, Status>()
+  const key = '5m:PEPE-USDT-SWAP'
+  store.upsert(key, response(10, [bar(1), bar(2), bar(3)]))
+  const first = store.materializedWindow(key, 3 * hour, hour, 3)
+  assert.equal(first?.revision, 10)
+  store.upsert(key, { ...response(11, [bar(100)]), statusAuthoritative: false })
+  assert.equal(store.get(key)?.barsRevision, 11)
+  assert.deepEqual(store.materializedWindow(key, 3 * hour, hour, 3), first)
+  store.upsert(key, response(12, [], { error: '', statisticsState: 'loading' }))
+  assert.deepEqual(store.materializedWindow(key, 3 * hour, hour, 3), first)
+  store.upsert(key, response(12, [bar(1), bar(2)]))
+  assert.equal(store.materializedWindow(key, 3 * hour, hour, 3)?.revision, 10, 'All hours in the visible window must be materialized at the new revision')
+  store.upsert(key, response(12, [bar(3)]))
+  assert.equal(store.materializedWindow(key, 3 * hour, hour, 3)?.revision, 12)
+  assert.equal(store.materializedWindow(key, 4 * hour, hour, 3), null, 'An absent hour cannot be treated as current')
+  const partial = store.materializedWindow(key, 4 * hour, hour, 3, true)
+  assert.equal(partial?.revision, 12, 'Candle repair may reuse the latest partial snapshot for cheap progress polling')
+  store.upsert(key, response(13, [], { error: '', candleState: 'loading' }))
+  assert.deepEqual(store.materializedWindow(key, 4 * hour, hour, 3, true), partial, 'Status-only polls must not postpone the bounded partial snapshot refresh')
+})
+
+test('window materialization resets with the collector and preserves accepted live-frame semantics', () => {
+  const store = new ChartSeriesStore<Bar, Status>()
+  const key = '5m:PEPE-USDT-SWAP'
+  store.upsert(key, response(10, [bar(1)]))
+  const confirmed = store.materializedWindow(key, hour, hour, 1)
+  store.upsert(key, response(11, [{ ...bar(1), confirmed: false, oi: null }]))
+  assert.deepEqual(store.materializedWindow(key, hour, hour, 1), confirmed)
+  store.upsert(key, response(12, [{ ...bar(2), confirmed: false }]))
+  assert.equal(store.materializedWindow(key, 2 * hour, hour, 1)?.revision, 12, 'A genuinely new live candle participates in the live polling fast path')
+  store.upsert(key, response(1, [], { error: '', statisticsState: 'loading' }, 'collector-b'))
+  assert.equal(store.hasBars(key), true)
+  assert.equal(store.materializedWindow(key, hour, hour, 1), null, 'Retained old-session bars have no new-session materialization')
+  store.upsert(key, response(13, [bar(1)], { error: '' }, 'collector-a'))
+  assert.equal(store.materializedWindow(key, hour, hour, 1), null)
+  store.upsert(key, response(2, [bar(1)], { error: '' }, 'collector-b'))
+  assert.equal(store.materializedWindow(key, hour, hour, 1)?.revision, 2)
+})
+
 test('a same-window cache preview cannot overwrite active statistics status', () => {
   const store = new ChartSeriesStore<Bar, Status>()
   const key = '1H:BTC-USDT-SWAP'

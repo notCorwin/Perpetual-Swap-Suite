@@ -67,6 +67,9 @@ const MAX_WHEEL_STEPS_PER_FRAME = 12
 // poll the foreground viewport quickly enough to display its sibling on the
 // next paint instead of leaving a durable result blank for half a second.
 const STATISTICS_PROGRESS_POLL_MS = 80
+// Status progress can lag a persisted page. Recheck an incomplete visible
+// snapshot on a bounded cadence even if its transport revision is unchanged.
+const STATISTICS_SNAPSHOT_REFRESH_MS = 1_000
 // Both direct OKX statistics endpoints expose their latest 1,440 periods.
 const STATISTICS_HISTORY_PERIODS = 1_440
 let nextChartFocusToken = 0
@@ -756,13 +759,21 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
       await pageVisible(); if (stopped) return
       try {
         const current = chartSeries.get(cacheKey)
-        const result = await window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken, sinceRevision: current?.barsRevision ?? -1, serviceSession: current?.serviceSession })
+        // A candle repair can leave fewer than 96 hours. Its most recent
+        // partial read still permits cheap status polling between rereads.
+        const materialized = chartSeries.materializedWindow(cacheKey, current?.latestKnownHour ?? 0, intervalMS, 96, true)
+        const result = await window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken, sinceRevision: materialized?.revision ?? -1, serviceSession: current?.serviceSession })
         if (stopped) return
         let status = "unchanged" in result ? chartResponse(chartSeries.get(cacheKey)) : result
         if (!("unchanged" in result)) {
           const stored = rememberVisibleChart(result, lastLoad)
+          const visibleSnapshot = result.statisticsEnd === undefined ? null : chartSeries.materializedWindow(cacheKey, result.statisticsEnd, intervalMS, 96, true)
+          const sourceLoading = result.oiState === 'loading' || result.takerState === 'loading'
+          const refreshIncomplete = result.statisticsEnd !== undefined && sourceLoading
+            && chartStatsNeedLoad(chartSeries.get(cacheKey)?.bars ?? [], result.statisticsEnd, 96, intervalMS)
+            && Date.now() - (visibleSnapshot?.readAt ?? 0) >= STATISTICS_SNAPSHOT_REFRESH_MS
           if (stored.accepted && result.bars.length === 0 && result.statisticsEnd !== undefined
-            && (result.revision !== current?.barsRevision || chartStatisticsSnapshotNeeded(chartSeries.get(cacheKey)?.bars ?? [], result.statisticsEnd, result, intervalMS))) {
+            && (result.revision !== visibleSnapshot?.revision || refreshIncomplete || chartStatisticsSnapshotNeeded(chartSeries.get(cacheKey)?.bars ?? [], result.statisticsEnd, result, intervalMS))) {
             const full = await window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken })
             if (stopped) return
             if (!("unchanged" in full) && rememberVisibleChart(full, lastLoad).accepted) status = full
@@ -881,13 +892,16 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
         // reply arrives. Discarding that reply must not discard this poll's
         // next turn as well: no render follows removal of the in-flight key.
         if ("unchanged" in result) { retry(STATISTICS_PROGRESS_POLL_MS); return }
-        const barsRevisionBefore = chartSeries.get(cacheKey)?.barsRevision
+        const visibleSnapshot = chartSeries.materializedWindow(cacheKey, historicalEnd, intervalMS, 96, true)
         let observed: ChartResponse = result
         if (!rememberVisibleChart(observed).accepted) { retry(STATISTICS_PROGRESS_POLL_MS); return }
         // A status-only reply may observe a just-committed source page. Keep
         // the bars on screen immediately, then perform exactly one complete
         // read to merge the new OI/Taker values into the retained series.
-        if (statusOnly && (observed.revision !== barsRevisionBefore
+        const refreshIncomplete = (observed.oiState === 'loading' || observed.takerState === 'loading')
+          && chartStatsNeedLoad(chartSeries.get(cacheKey)?.bars ?? [], historicalEnd, 96, intervalMS)
+          && Date.now() - (visibleSnapshot?.readAt ?? 0) >= STATISTICS_SNAPSHOT_REFRESH_MS
+        if (statusOnly && (observed.revision !== visibleSnapshot?.revision || refreshIncomplete
           || chartStatisticsSnapshotNeeded(chartSeries.get(cacheKey)?.bars ?? [], historicalEnd, observed, intervalMS))) {
           const full = await window.webkit.messageHandlers.radar.postMessage({
             chartInstId: instId, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken,
