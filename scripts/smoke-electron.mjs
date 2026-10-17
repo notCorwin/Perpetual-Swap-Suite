@@ -30,11 +30,11 @@ export async function smokeElectron({ app, revision, report: reportPath }) {
   const close = async () => {
     const running = electron
     if (!running) return
+    const child = running.process()
     try {
       await deadline(running.close(), 'Normal app shutdown', 20_000)
-      assert.equal(running.process().exitCode, 0, 'The app must exit normally.')
+      assert.equal(child.exitCode, 0, 'The app must exit normally.')
     } catch (error) {
-      const child = running.process()
       if (child.exitCode === null && child.signalCode === null) {
         const exited = once(child, 'exit')
         child.kill('SIGKILL')
