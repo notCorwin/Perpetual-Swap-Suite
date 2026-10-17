@@ -1,4 +1,5 @@
 import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
+import { mkdirSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -9,6 +10,13 @@ import { MarketService } from './services/market-service.js'
 const root = fileURLToPath(new URL('..', import.meta.url))
 const rendererURL = process.env.ELECTRON_RENDERER_URL
 const testMode = process.env.PERPETUAL_SWAP_E2E === '1'
+if (process.env.PERPETUAL_SWAP_USER_DATA) {
+  const userData = process.env.PERPETUAL_SWAP_USER_DATA
+  const sessionData = join(userData, 'Session')
+  mkdirSync(sessionData, { recursive: true })
+  app.setPath('userData', userData)
+  app.setPath('sessionData', sessionData)
+}
 const e2eLiveRefresh = testMode && process.env.PERPETUAL_SWAP_E2E_LIVE_REFRESH === '1'
 const settingsFile = () => join(app.getPath('userData'), 'settings.json')
 let window
@@ -198,7 +206,6 @@ async function createWindow() {
 }
 
 app.whenReady().then(async () => {
-  if (process.env.PERPETUAL_SWAP_USER_DATA) app.setPath('userData', process.env.PERPETUAL_SWAP_USER_DATA)
   // Discovery begins before the renderer's first snapshot, so hydrate the
   // persisted liquidity criteria before it decides which contracts belong in
   // the catalogue.
