@@ -42,8 +42,9 @@ const abortable = (promise, signal) => {
 
 /** OKX source adaptation; HistorySync alone schedules durable observations. */
 export class MarketHistory {
-  constructor({ store, metadata, get, parseCandle, persistCandles, persistStatistics, instrument, onReplace, onProgress, onLive, now = Date.now }) {
-    Object.assign(this, { store, metadata, get, parseCandle, persistCandles, persistStatistics, instrument, onReplace, onLive, now })
+  constructor({ store, metadata, get, parseCandle, persistCandles, persistStatistics, replaceCandles, instrument, onProgress, onLive, now = Date.now }) {
+    if (typeof replaceCandles !== 'function') throw new TypeError('MarketHistory needs a replacement mutation callback.')
+    Object.assign(this, { store, metadata, get, parseCandle, persistCandles, persistStatistics, replaceCandles, instrument, onLive, now })
     this.closed = false
     this.closeTask = null
     this.controllers = new Set()
@@ -52,14 +53,14 @@ export class MarketHistory {
     this.repairs = new Map()
     this.targets = new Set()
     const statistics = source => ({
-      inspect: query => this.inspectSource(query, source),
+      inspect: query => this.inspectSource(query),
       fetchGap: query => this.fetchStatistics(query, source),
     })
     this.sync = new HistorySync({
       metadata,
       store: { missingCandleRanges: (query, priority) => this.missingSource(query, priority) },
       sources: {
-        candles: { inspect: query => this.inspectSource(query, 'candles'), fetchGap: query => this.fetchPrices(query) },
+        candles: { inspect: query => this.inspectSource(query), fetchGap: query => this.fetchPrices(query) },
         oi: statistics('oi'),
         taker: statistics('taker'),
       },
@@ -98,7 +99,7 @@ export class MarketHistory {
     }
   }
 
-  inspectSource(query, source) {
+  inspectSource(query) {
     const { floor, through } = this.bounds(query.instrument, query.timeframe)
     const availableFrom = floor
     return {
@@ -113,8 +114,9 @@ export class MarketHistory {
     if (repair && !repair.written) return [{ from: query.from, through: query.through }]
     const rows = await this.store.candles(query, priority)
     const bit = query.source === 'oi' ? OI : TAKER
+    const observations = this.seeds.get(keyOf(query.instrument, query.timeframe))
     return missing(rows, query.from, query.through, query.intervalMS,
-      query.source === 'candles' ? pricePresent : row => pricePresent(row) && sourcePresent(row, bit, this.now()))
+      query.source === 'candles' ? row => pricePresent(row) && !observations?.has(row.timestamp) : row => pricePresent(row) && sourcePresent(row, bit, this.now()))
   }
 
   parsed(instId, timeframe, values) {
@@ -179,16 +181,25 @@ export class MarketHistory {
   async write(rows, task) {
     if (task.source === 'candles') {
       const repair = this.repairs.get(rangeKey(task))
-      if (repair) {
+      const observations = this.seeds.get(keyOf(task.instrument, task.timeframe))
+      if (repair && !repair.written) {
         // A corrupt/incompatible partition is replaced only after the entire
         // affected completed day has been obtained, never page by page.
         const range = { instrument: task.instrument, timeframe: task.timeframe, from: repair.replaceFrom, through: repair.replaceThrough }
-        const replacement = repair.records ?? rows
+        // The latest endpoint may revise a slot while its historical repair
+        // is in flight. Commit that explicit observation in the same complete
+        // replacement, so shared task coverage advances without losing it.
+        const replacement = (repair.records ?? rows).map(row => observations?.get(row.timestamp) ?? row)
         if (missing(replacement, task.from, task.through, CANDLE_INTERVALS[task.timeframe], pricePresent).length) throw new Error('A complete repair range is required before replacing the partition.')
-        await this.store.replaceCandles(range, replacement, task.priority)
+        await this.replaceCandles(range, replacement, task.priority)
+        for (const row of replacement) if (observations?.get(row.timestamp) === row) observations.delete(row.timestamp)
         repair.written = true
-        await this.onReplace?.(task.instrument, task.timeframe, { from: range.from, through: range.through })
-      } else await this.persistCandles(task.instrument, rows, { priority: task.priority })
+      } else {
+        await this.persistCandles(task.instrument, rows, { priority: task.priority })
+        // Only consumption of that explicit observation clears the refresh.
+        // An older HTTP page already in flight must not swallow its revision.
+        for (const row of rows) if (observations?.get(row.timestamp) === row) observations.delete(row.timestamp)
+      }
       return
     }
     const source = task.source === 'oi' ? OI : TAKER
@@ -227,17 +238,19 @@ export class MarketHistory {
     this.controllers.add(controller)
     const task = (async () => {
       await this.ready
-      const coverage = await this.store.coverage(instId, timeframe, priority)
       const values = await this.get('/market/candles', { instId, bar: timeframe, limit: 2 }, controller.signal, priority)
       const parsed = values.map(value => this.parseCandle(instId, timeframe, value)).filter(Boolean)
       const live = parsed.filter(row => !row.confirmed).sort((a, b) => b.timestamp - a.timestamp)[0] ?? null
       if (live) await this.onLive?.(instId, timeframe, live)
       const confirmed = this.parsed(instId, timeframe, values)
       this.seeds.set(key, new Map(confirmed.map(row => [row.timestamp, row])))
-      const { through, floor, interval } = this.bounds(instId, timeframe)
-      const first = confirmed.length ? Math.min(...confirmed.map(row => row.timestamp)) : through
-      const from = Math.max(floor ?? 0, coverage.last === null ? first : Math.min(first, coverage.last + interval))
-      if (from <= through) await this.request(instId, timeframe, 'candles', from, through, priority, controller.signal)
+      const { floor } = this.bounds(instId, timeframe)
+      // A latest response proves only the observations it actually contains.
+      // Empty/forming-only responses never invent a range to the local clock;
+      // history targets and window requests own all gap coverage decisions.
+      for (const row of confirmed.sort((a, b) => a.timestamp - b.timestamp)) {
+        await this.request(instId, timeframe, 'candles', row.timestamp, row.timestamp, 'foreground', controller.signal)
+      }
       return { live, floor }
     })().finally(() => {
       this.controllers.delete(controller)

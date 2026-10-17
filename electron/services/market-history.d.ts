@@ -6,7 +6,7 @@ type MaybePromise<T> = T | Promise<T>
 type Timeframe = '5m' | '15m' | '1H'
 type Instrument = { instId: string; listTime?: number | string; [key: string]: unknown }
 export type MarketHistoryOptions = {
-  store: Pick<MarketStore, 'candles' | 'coverage' | 'replaceCandles' | 'inspectCandles'>
+  store: Pick<MarketStore, 'candles' | 'coverage' | 'inspectCandles'>
   metadata: HistorySyncOptions['metadata'] & AuditMetadata
   get(path: string, parameters: Record<string, string | number>, signal: AbortSignal, priority: StorePriority): Promise<unknown[][]>
   // Raw API JSON is checked by the adapter before reaching durable storage.
@@ -15,7 +15,8 @@ export type MarketHistoryOptions = {
   persistStatistics(instrument: Instrument, timeframe: string, end: number, source: number, values: (number | null)[][],
     range: CandleRange & { intervalMS: number }, priority: StorePriority): MaybePromise<unknown>
   instrument?(instId: string): Instrument | undefined
-  onReplace?(instId: string, timeframe: string, range: CandleRange): MaybePromise<unknown>
+  /** Owner serializes replacement, statistics preservation and invalidation with every candle mutation. */
+  replaceCandles(range: CandleRange & { instrument: string; timeframe: string }, rows: CandleRecord[], priority: StorePriority): MaybePromise<unknown>
   onProgress?(task: HistoryTask): MaybePromise<void>
   onLive?(instId: string, timeframe: string, row: CandleRecord): MaybePromise<unknown>
   now?(): number

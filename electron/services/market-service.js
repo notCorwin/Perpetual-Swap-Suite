@@ -298,7 +298,7 @@ export class MarketService {
       persistStatistics: (instrument, timeframe, end, source, values, range, priority) => this.persistStatisticsSource(instrument, timeframe, end, source, values, this.shutdownController.signal, priority, false, { range }),
       instrument: instId => this.instruments.get(instId),
       onLive: (instId, timeframe, row) => this.setLive(instId, timeframe, row),
-      onReplace: (instId, timeframe) => this.onHistoryReplaced(instId, timeframe),
+      replaceCandles: (range, rows, priority) => this.replaceCandles(range, rows, priority),
       onProgress: task => this.onHistoryProgress(task),
     })
     await this.history.ready
@@ -628,6 +628,36 @@ export class MarketService {
       if (confirmed.some(row => row.timeframe === '5m')) void this.updateRanking(instrument).catch(() => undefined)
       if (projectList) this.scheduleListProjection(instrument)
       return true
+    })
+  }
+
+  async replaceCandles(range, candles, priority = 'foreground') {
+    await this.ready
+    return this.enqueueCandleMutation(range.instrument, async () => {
+      if (this.disposed) throw new Error('Market service is closed.')
+      let previous
+      try { previous = await this.store.candles(range, priority) }
+      catch (error) {
+        // Strict reads cannot recover statistics from corrupt or invalid data.
+        // Confirm a data defect before proceeding; operational I/O errors must
+        // still fail the repair rather than masquerading as missing metadata.
+        const inspection = await this.store.inspectCandles(range, priority)
+        if (!inspection.issues.some(issue => issue.repairable && issue.reason !== 'gap')) throw error
+        previous = []
+      }
+      const byTimestamp = new Map(previous.map(row => [row.timestamp, row]))
+      const replacement = candles.map(row => {
+        const prior = byTimestamp.get(row.timestamp)
+        if (!prior) return row
+        const merged = { ...row }
+        // Downloaded prices and volumes are authoritative. Only source
+        // statistics survive, with their existing observation leases intact.
+        for (const field of optionalCandleFields) if (merged[field] == null) merged[field] = prior[field] ?? null
+        // Validate Taker zero observations against the repaired traded volume.
+        return normalizedStatistics(merged)
+      })
+      await this.store.replaceCandles(range, replacement, priority)
+      this.onHistoryReplaced(range.instrument, range.timeframe)
     })
   }
 

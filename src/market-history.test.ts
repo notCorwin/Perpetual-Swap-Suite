@@ -28,7 +28,7 @@ class MemoryStore {
   async candles(query: CandleQuery) { return [...this.rows.values()].filter(row => row.instrument === query.instrument && row.timeframe === query.timeframe
     && row.timestamp >= (query.from ?? 0) && row.timestamp <= (query.through ?? Infinity)).sort((a, b) => a.timestamp - b.timestamp).map(row => structuredClone(row)) }
   async appendCandles(rows: CandleRecord[]) { for (const row of rows) this.rows.set(`${row.timeframe}:${row.timestamp}`, structuredClone(row)); return rows.length }
-  async replaceCandles(query: Query, rows: CandleRecord[]) {
+  async replaceCandles(query: Query, rows: CandleRecord[], _priority?: string) {
     this.replacements.push(query)
     for (const row of await this.candles(query)) this.rows.delete(`${row.timeframe}:${row.timestamp}`)
     return this.appendCandles(rows)
@@ -88,7 +88,8 @@ const setup = (options: { store?: MemoryStore | MarketStore; metadata?: MemoryMe
   }
   const history = new MarketHistory({ store, metadata, get, parseCandle, persistStatistics,
     persistCandles: (_instrument: string, rows: CandleRecord[]) => store.appendCandles(rows),
-    instrument: () => ({ instId, listTime: options.listing }), onLive: options.onLive, onReplace: options.onReplace, now })
+    replaceCandles: async (range, rows, priority) => { await store.replaceCandles(range, rows, priority); options.onReplace?.() },
+    instrument: () => ({ instId, listTime: options.listing }), onLive: options.onLive, now })
   return { history, store, metadata, calls }
 }
 
@@ -149,7 +150,7 @@ test('numeric statistics remain reusable while an empty sibling is retried only 
   } finally { await history.close() }
 })
 
-test('REST initialization uses two rows, leaves forming data in memory, and fills reconnect gaps through source tasks', async () => {
+test('REST initialization admits two explicit observations and leaves gap coverage to exact source tasks', async () => {
   const live: CandleRecord[] = []
   const now = base + 4 * interval
   const { history, store, calls } = setup({ now: () => now, onLive: (_instrument, _timeframe, row) => live.push(row),
@@ -161,6 +162,9 @@ test('REST initialization uses two rows, leaves forming data in memory, and fill
     const result = await history.latest(instId, '5m')
     assert.equal(result.live?.timestamp, now)
     assert.equal(live.length, 1)
+    assert.deepEqual((await store.candles({ instrument: instId, timeframe: '5m' })).map(row => row.timestamp), [base, base + 3 * interval])
+    assert.equal(calls.filter(call => call.path === '/market/history-candles').length, 0)
+    await history.ensurePrices(instId, '5m', base + interval, base + 2 * interval)
     assert.deepEqual((await store.candles({ instrument: instId, timeframe: '5m' })).map(row => row.timestamp), [base, base + interval, base + 2 * interval, base + 3 * interval])
     assert.equal(calls[0].parameters.limit, 2)
     assert.equal(calls.filter(call => call.path === '/market/history-candles').length, 1)
@@ -257,4 +261,84 @@ test('cancelling a repair aborts its source task before replacement and close wa
   assert.equal(aborted, true)
   assert.equal(store.replacements.length, 0)
   assert.equal(history.audit.get(job.id)!.status, 'cancelled')
+})
+
+test('an empty latest response with an old complete cache never invents a history target', async () => {
+  const now = base + 365 * day
+  const { history, store, calls } = setup({ now: () => now, get: async path => {
+    if (path === '/market/candles') return []
+    throw new Error('Empty latest data cannot prove a missing history range.')
+  } })
+  ;(history.sync as any).maxAttempts = 1
+  try {
+    await store.appendCandles(Array.from({ length: 3072 }, (_, index) => candle(base - (3071 - index) * interval)))
+    await assert.doesNotReject(history.latest(instId, '5m'))
+    assert.deepEqual(calls.map(call => call.path), ['/market/candles'])
+    assert.equal(history.sync.listTasks().length, 0)
+    assert.equal((await store.coverage(instId, '5m')).last, base)
+  } finally { await history.close() }
+})
+
+test('REST initialization publishes explicit confirmed close revisions through the source task even when price coverage is complete', async () => {
+  const revised = { ...candle(base), open: 199, high: 201, low: 198, close: 200 }
+  const { history, store, calls } = setup({ now: () => base + interval, get: async path => {
+    assert.equal(path, '/market/candles', 'The returned observation needs no historical redownload.')
+    return [values(revised)]
+  } })
+  try {
+    await store.appendCandles([candle(base)])
+    await history.latest(instId, '5m')
+    const [row] = await store.candles({ instrument: instId, timeframe: '5m' })
+    assert.equal(row.close, 200)
+    assert.deepEqual(calls.map(call => call.path), ['/market/candles'])
+    assert.ok(history.sync.listTasks().some(task => task.source === 'candles' && task.from === base && task.through === base && task.writtenRecords === 1))
+  } finally { await history.close() }
+})
+
+test('an exact-slot repair commits a concurrent latest revision without retrying their shared source task', async () => {
+  const downloaded = { ...candle(base), open: 149, high: 151, low: 148, close: 150 }
+  const latestRevision = { ...candle(base), open: 199, high: 201, low: 198, close: 200 }
+  let releaseHistory!: () => void, historyReached!: () => void, latestAdmitted!: () => void
+  const release = new Promise<void>(resolve => { releaseHistory = resolve })
+  const entered = new Promise<void>(resolve => { historyReached = resolve })
+  const admitted = new Promise<void>(resolve => { latestAdmitted = resolve })
+  const { history, store, calls } = setup({ now: () => base + interval, get: async path => {
+    if (path === '/market/candles') return [values(latestRevision)]
+    assert.equal(path, '/market/history-candles')
+    historyReached()
+    await release
+    return [values(downloaded)]
+  } })
+  ;(history.sync as any).maxAttempts = 1
+  const enqueue = history.sync.enqueue.bind(history.sync)
+  let admitLatest = false, latestTask: HistoryTask | undefined
+  history.sync.enqueue = async input => {
+    const task = await enqueue(input)
+    if (admitLatest) { latestTask = task; latestAdmitted() }
+    return task
+  }
+  let repair: Promise<unknown> | undefined, latest: Promise<unknown> | undefined
+  try {
+    await store.appendCandles([candle(base)])
+    repair = (history as any).repair({ instrument: instId, timeframe: '5m', source: 'candles', from: base, through: base,
+      reason: 'invalid-ohlc', repairable: true }, { signal: new AbortController().signal })
+    await entered
+    admitLatest = true
+    latest = history.latest(instId, '5m')
+    await admitted
+    releaseHistory()
+    await assert.doesNotReject(() => Promise.all([repair, latest]))
+    await history.sync.whenIdle()
+    const [row] = await store.candles({ instrument: instId, timeframe: '5m', from: base, through: base })
+    assert.equal(row.close, 200)
+    assert.equal((store as MemoryStore).replacements.length, 1)
+    assert.deepEqual(calls.map(call => call.path), ['/market/history-candles', '/market/candles'])
+    assert.equal(history.sync.listTasks().length, 1)
+    assert.equal(history.sync.getTask(latestTask!.id)?.status, 'completed')
+    assert.equal(history.sync.getTask(latestTask!.id)?.attempts, 0)
+  } finally {
+    releaseHistory()
+    await Promise.allSettled([repair, latest])
+    await history.close()
+  }
 })

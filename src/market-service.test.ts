@@ -435,3 +435,131 @@ test('refresh cadence follows scan start so a long scan does not extend the tick
     assert.equal(f.service.refreshTimer._idleTimeout, 1, 'An overlong scan immediately revalidates its expired observations.')
   } finally { await f.close() }
 })
+
+test('a repair shares the statistics read-merge-write critical section and preserves the newest statistics', async () => {
+  const timestamp = Math.floor(Date.now() / fiveMinutes) * fiveMinutes - fiveMinutes
+  const repaired = { ...rawCandle(timestamp, 200), volume: 20, baseVolume: 2, quoteVolume: 400 }
+  const f = await fixture(disabled(), async input => {
+    const url = new URL(String(input))
+    assert.ok(url.pathname.endsWith('/market/history-candles'))
+    return response([[String(timestamp), String(repaired.open), String(repaired.high), String(repaired.low), String(repaired.close), '20', '2', '400', '1']])
+  })
+  let releaseRead!: () => void
+  let statistics: Promise<unknown> | undefined, repair: Promise<unknown> | undefined
+  try {
+    await f.store.appendCandles([{ ...rawCandle(timestamp), oi: 10, buy: 20, sell: 30, statisticsVersion: 1 }])
+    const originalRead = f.store.candles.bind(f.store), originalReplace = f.store.replaceCandles.bind(f.store), originalWrite = f.service.history.write.bind(f.service.history)
+    let firstRead = true, replaceAdmitted = false
+    let readReached!: () => void, repairWriteReached!: () => void, replacementFinished!: () => void
+    const readGate = new Promise<void>(resolve => { readReached = resolve })
+    const writeGate = new Promise<void>(resolve => { repairWriteReached = resolve })
+    const replaced = new Promise<void>(resolve => { replacementFinished = resolve })
+    f.store.candles = async (...args) => {
+      const rows = await originalRead(...args)
+      if (firstRead) {
+        firstRead = false
+        readReached()
+        await new Promise<void>(resolve => { releaseRead = resolve })
+      }
+      return rows
+    }
+    f.store.replaceCandles = async (...args) => {
+      replaceAdmitted = true
+      const result = await originalReplace(...args)
+      replacementFinished()
+      return result
+    }
+    f.service.history.write = async (...args: any[]) => { repairWriteReached(); return originalWrite(...args) }
+    statistics = f.service.persistStatisticsSource(instrument, '5m', timestamp, 1, [[timestamp, 777]], undefined, 'foreground', false, { range: { from: timestamp, through: timestamp, intervalMS: fiveMinutes } })
+    await readGate
+    repair = f.service.history.repair({ instrument: instId, timeframe: '5m', source: 'candles', from: timestamp, through: timestamp, reason: 'invalid-ohlc', repairable: true }, { signal: new AbortController().signal })
+    await writeGate
+    await new Promise(resolve => setImmediate(resolve))
+    // If the repair bypasses the lock, force it to finish before releasing the
+    // stale statistics read. A serialized repair instead waits behind that read.
+    if (replaceAdmitted) await replaced
+    releaseRead()
+    await Promise.all([statistics, repair])
+    const [final] = await originalRead({ instrument: instId, timeframe: '5m', from: timestamp, through: timestamp })
+    assert.deepEqual([final.open, final.high, final.low, final.close, final.volume, final.baseVolume, final.quoteVolume], [repaired.open, repaired.high, repaired.low, repaired.close, 20, 2, 400])
+    assert.deepEqual([final.oi, final.buy, final.sell, final.statisticsVersion], [777, 20, 30, 1])
+  } finally {
+    releaseRead?.()
+    await Promise.allSettled([statistics, repair])
+    await f.close()
+  }
+})
+
+test('statistics queued behind a replacement merge against repaired OHLC', async () => {
+  const f = await fixture(), timestamp = Math.floor(Date.now() / fiveMinutes) * fiveMinutes - fiveMinutes
+  let release!: () => void
+  let replacement: Promise<unknown> | undefined, statistics: Promise<unknown> | undefined
+  try {
+    await f.store.appendCandles([{ ...rawCandle(timestamp), oi: 10, buy: 20, sell: 30, statisticsVersion: 1 }])
+    const original = f.store.replaceCandles.bind(f.store)
+    let started!: () => void
+    const entered = new Promise<void>(resolve => { started = resolve })
+    f.store.replaceCandles = async (...args) => { started(); await new Promise<void>(resolve => { release = resolve }); return original(...args) }
+    const range = { instrument: instId, timeframe: '5m', from: timestamp, through: timestamp }
+    replacement = f.service.replaceCandles(range, [rawCandle(timestamp, 200)])
+    await entered
+    statistics = f.service.persistStatisticsSource(instrument, '5m', timestamp, 2, [[timestamp, 333, 444]], undefined, 'foreground', false, { range: { ...range, intervalMS: fiveMinutes } })
+    release(); await Promise.all([replacement, statistics])
+    const [row] = await f.store.candles(range)
+    assert.deepEqual([row.close, row.oi, row.buy, row.sell], [200, 10, 444, 333])
+  } finally { release?.(); await Promise.allSettled([replacement, statistics]); await f.close() }
+})
+
+test('replacement retains bounded null leases and revalidates Taker zeros against repaired traded volume', async () => {
+  const f = await fixture(), timestamp = Math.floor(Date.now() / fiveMinutes) * fiveMinutes - 2 * fiveMinutes, expiry = Date.now() + 20_000
+  try {
+    await f.store.appendCandles([
+      { ...rawCandle(timestamp), volume: 0, baseVolume: 0, quoteVolume: 0, oi: 10, buy: 0, sell: 0, statisticsVersion: 1 },
+      { ...rawCandle(timestamp + fiveMinutes), oi: 11, buy: null, sell: null, statisticsVersion: 7, statisticsTakerExpiresAt: expiry },
+    ])
+    const range = { instrument: instId, timeframe: '5m', from: timestamp, through: timestamp + fiveMinutes }
+    await f.service.replaceCandles(range, [rawCandle(timestamp, 200), rawCandle(timestamp + fiveMinutes, 201)])
+    const [zero, leased] = await f.store.candles(range)
+    assert.deepEqual([zero.close, zero.oi, zero.buy, zero.sell], [200, 10, null, null])
+    assert.ok(Number(zero.statisticsTakerExpiresAt) < Date.now(), 'An invalidated zero placeholder needs source revalidation.')
+    assert.equal(leased.statisticsTakerExpiresAt, expiry, 'Price repair cannot extend the statistics observation lease.')
+    assert.equal(leased.oi, 11)
+  } finally { await f.close() }
+})
+
+test('replacement can repair proven unreadable data but propagates operational preservation-read errors', async () => {
+  const f = await fixture(), timestamp = Math.floor(Date.now() / fiveMinutes) * fiveMinutes - fiveMinutes
+  const range = { instrument: instId, timeframe: '5m', from: timestamp, through: timestamp }
+  const originalRead = f.store.candles.bind(f.store), originalInspect = f.store.inspectCandles.bind(f.store)
+  try {
+    for (const reason of ['corrupt-file', 'invalid-schema'] as const) {
+      f.store.candles = async () => { throw new Error('The partition cannot be read.') }
+      f.store.inspectCandles = async () => ({ issues: [{ ...range, source: 'candles', reason, repairable: true }], checkedRows: 0, files: 1, missingRanges: [] })
+      await f.service.replaceCandles(range, [rawCandle(timestamp, reason === 'corrupt-file' ? 200 : 201)])
+    }
+    f.store.candles = async () => { throw new Error('Read failed because storage is offline.') }
+    f.store.inspectCandles = async () => { throw new Error('Filesystem unavailable.') }
+    await assert.rejects(f.service.replaceCandles(range, [rawCandle(timestamp, 300)]), /Filesystem unavailable/)
+    const [row] = await originalRead(range)
+    assert.equal(row.close, 201)
+  } finally { f.store.candles = originalRead; f.store.inspectCandles = originalInspect; await f.close() }
+})
+
+test('an explicit REST confirmed revision invalidates the prepared generation and preserves its direct statistics', async () => {
+  const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes, timestamp = asOf - fiveMinutes
+  const revised = rawCandle(timestamp, 200)
+  const f = await fixture(disabled(), async input => {
+    const url = new URL(String(input))
+    assert.ok(url.pathname.endsWith('/market/candles'), 'Returned latest data does not need a second historical fetch.')
+    return response([[String(timestamp), String(revised.open), String(revised.high), String(revised.low), '200', '1', '1', '200', '1']])
+  })
+  try {
+    await f.store.appendCandles(Array.from({ length: 300 }, (_, index) => ({ ...rawCandle(timestamp - (299 - index) * fiveMinutes), oi: 10, buy: 20, sell: 30, statisticsVersion: 1 })))
+    const before = await f.service.localChartWindow(instId, '5m')
+    await f.service.history.latest(instId, '5m')
+    const after = await f.service.localChartWindow(instId, '5m')
+    assert.ok(after!.generation > before!.generation)
+    const bar = after!.bars.find(bar => bar.hour === timestamp)!
+    assert.deepEqual([bar.close, bar.oi, bar.buy, bar.sell], [200, 10, 20, 30])
+  } finally { await f.close() }
+})
