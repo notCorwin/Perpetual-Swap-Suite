@@ -267,6 +267,7 @@ export class MarketService {
     this.catalogUpdatedAt = null
     this.refreshing = null
     this.lastRefreshAt = 0
+    this.refreshStartedAt = 0
     this.error = ''
     this.closing = false
     this.disposed = false
@@ -713,7 +714,10 @@ export class MarketService {
 
   setLive(instId, timeframe, row) {
     if (this.disposed) return
-    const key = `${instId}:${timeframe}`
+    const key = `${instId}:${timeframe}`, current = this.liveCandles.get(key)
+    // REST initialization can resolve after a newer stream event. Same-volume
+    // price corrections remain valid; older timestamps/cumulative volume do not.
+    if (row && current && (row.timestamp < current.timestamp || row.timestamp === current.timestamp && row.volume < current.volume)) return Promise.resolve(null)
     if (row) this.liveCandles.set(key, row)
     else this.liveCandles.delete(key)
     return this.preparedCharts.setLive(instId, timeframe, row)
@@ -862,6 +866,8 @@ export class MarketService {
     if (this.refreshing) return this.refreshing
     const controller = new AbortController(), config = this.prefs().liquidity, configKey = JSON.stringify(config), asOf = closedBoundary('5m')
     this.refreshController = controller
+    const startedAt = Date.now()
+    this.refreshStartedAt = startedAt
     this.refreshing = (async () => {
       try {
         const [instruments, tickers] = await Promise.all([
@@ -880,7 +886,7 @@ export class MarketService {
         // A successful check publishes independently; the first row does not wait for the full exchange scan.
         await mapConcurrent(candidates, 4, instrument => this.checkCandidate(instrument, tickerByID.get(instrument.instId), config, configKey, asOf, controller.signal))
         if (!controller.signal.aborted && this.catalogCriteriaKey() === configKey) {
-          this.lastRefreshAt = Date.now()
+          this.lastRefreshAt = startedAt
           this.error = this.catalog.size ? '' : 'No contracts currently meet all enabled liquidity requirements.'
         }
       } catch (error) {
@@ -899,7 +905,8 @@ export class MarketService {
     if (this.refreshTimer) clearTimeout(this.refreshTimer)
     this.refreshTimer = null
     if (!this.autoRefresh || this.closing || this.disposed) return
-    const due = this.lastRefreshAt ? Math.max(1, this.lastRefreshAt + LATEST_CANDLE_REFRESH - Date.now()) : LATEST_CANDLE_REFRESH
+    const startedAt = this.refreshStartedAt || this.lastRefreshAt
+    const due = startedAt ? Math.max(1, startedAt + LATEST_CANDLE_REFRESH - Date.now()) : LATEST_CANDLE_REFRESH
     this.refreshTimer = setTimeout(() => { this.refreshTimer = null; this.track(this.refresh()) }, due)
     this.refreshTimer.unref?.()
   }
@@ -985,7 +992,7 @@ export class MarketService {
     this.pruneCatalog()
     const frame = this.ensureListRows(timeframe)
     if (!this.disposed && !this.closing) {
-      if (this.autoRefresh && !this.refreshing && Date.now() - this.lastRefreshAt >= LATEST_CANDLE_REFRESH) this.track(this.refresh())
+      if (this.autoRefresh && !this.refreshing && Date.now() - (this.refreshStartedAt || this.lastRefreshAt) >= LATEST_CANDLE_REFRESH) this.track(this.refresh())
       for (const instId of this.catalog.keys()) { this.track(this.projectListEntry(instId, frame)); this.track(this.updateRanking(instId)) }
     }
     return { rows: this.listRowsFor(frame), revision: this.revision, error: this.error, loading: this.refreshing !== null,

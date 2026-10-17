@@ -440,6 +440,8 @@ export class PreparedChartPipeline {
   }
 
   updateLive(state, candle) {
+    if (candle && state.live && (candle.timestamp < state.live.timestamp
+      || candle.timestamp === state.live.timestamp && candle.volume < state.live.volume)) return false
     const live = candle && !candle.confirmed && candle.timestamp > (this.latest(state) ?? -Infinity) ? candle : null
     if (sameRow(state.live, live) || state.live === live) return false
     state.live = live

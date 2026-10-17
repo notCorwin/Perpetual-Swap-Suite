@@ -378,6 +378,10 @@ test('live integration stays in memory and close drains accepted confirmation wh
     assert.equal(f.service.preparedCharts.cached(`${instId}:5m`).liveBar.close, 105)
     socket.candle(asOf, 106, false)
     await f.service.realtime.whenIdle()
+    await f.service.setLive(instId, '5m', { ...rawCandle(asOf - fiveMinutes, 101), volume: 100, confirmed: false })
+    await f.service.setLive(instId, '5m', { ...rawCandle(asOf, 101), volume: 5, confirmed: false })
+    assert.equal(f.service.liveCandles.get(`${instId}:5m`).close, 106, 'Delayed REST initialization cannot regress stream state.')
+    assert.equal(f.service.preparedCharts.series.get(`${instId}:5m`).live.close, 106)
     let releaseWrite!: () => void
     let writeStarted = false
     f.store.appendCandles = async (...args) => {
@@ -413,5 +417,21 @@ test('an explicit empty SWAP multiplier uses the documented product value withou
     await f.service.refresh()
     assert.equal((await f.service.snapshot()).rows.length, 1)
     assert.equal(f.service.catalog.get(instId).instrument.ctMult, '1')
+  } finally { await f.close() }
+})
+
+
+test('refresh cadence follows scan start so a long scan does not extend the ticker lease gap', async () => {
+  const f = await fixture()
+  try {
+    f.service.autoRefresh = true
+    f.service.lastRefreshAt = Date.now()
+    f.service.refreshStartedAt = Date.now() - 50_000
+    f.service.scheduleRefresh()
+    assert.ok(f.service.refreshTimer._idleTimeout <= 10_000)
+    assert.ok(f.service.refreshTimer._idleTimeout > 9_000)
+    f.service.refreshStartedAt = Date.now() - 90_000
+    f.service.scheduleRefresh()
+    assert.equal(f.service.refreshTimer._idleTimeout, 1, 'An overlong scan immediately revalidates its expired observations.')
   } finally { await f.close() }
 })
