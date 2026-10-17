@@ -1,27 +1,72 @@
 import { DuckDBInstance } from '@duckdb/node-api'
-import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 const quote = value => `'${String(value).replaceAll("'", "''")}'`
 const safeSegment = value => {
-  const result = String(value).replaceAll(/[^A-Za-z0-9._=-]/g, '_')
-  if (!result || result === '.' || result === '..') throw new Error('Invalid Parquet partition key.')
-  return result
+  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._=-]*$/.test(value)) throw new TypeError('Invalid Parquet partition key.')
+  return value
 }
-const numericCandleFields = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'quoteVolume', 'oi', 'buy', 'sell', 'statisticsVersion', 'statisticsOIExpiresAt', 'statisticsTakerExpiresAt', 'writtenAt']
-const normalizeCandleRow = row => {
-  const candle = Object.fromEntries(Object.entries(row).map(([key, value]) => [key, typeof value === 'bigint' ? Number(value) : value]))
-  // Parquet files are append-only and older parts may omit optional fields.
-  // DuckDB's union-by-name can then widen numeric columns to VARCHAR. Never
-  // leak that storage representation into indicators or chart rendering.
-  for (const field of numericCandleFields) {
-    const value = candle[field]
-    if (typeof value !== 'string' || !value.trim()) continue
-    const parsed = Number(value)
-    if (Number.isFinite(parsed)) candle[field] = parsed
-  }
-  if (typeof candle.confirmed === 'string') candle.confirmed = candle.confirmed === 'true' || candle.confirmed === '1'
+export const CANDLE_INTERVALS = Object.freeze({ '5m': 300_000, '15m': 900_000, '1H': 3_600_000 })
+const dayMS = 86_400_000
+const schema = Object.freeze({
+  instrument: 'VARCHAR', timeframe: 'VARCHAR', timestamp: 'BIGINT',
+  open: 'DOUBLE', high: 'DOUBLE', low: 'DOUBLE', close: 'DOUBLE',
+  volume: 'DOUBLE', baseVolume: 'DOUBLE', quoteVolume: 'DOUBLE',
+  confirmed: 'BOOLEAN', oi: 'DOUBLE', buy: 'DOUBLE', sell: 'DOUBLE',
+  statisticsVersion: 'INTEGER', statisticsOIExpiresAt: 'BIGINT', statisticsTakerExpiresAt: 'BIGINT', writtenAt: 'BIGINT',
+})
+const optionalNonnegative = ['baseVolume', 'quoteVolume', 'oi', 'buy', 'sell']
+const optionalInteger = ['statisticsVersion', 'statisticsOIExpiresAt', 'statisticsTakerExpiresAt', 'writtenAt']
+const number = value => typeof value === 'bigint' ? Number(value) : value
+const normalizeCandleRow = row => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, number(value)]))
+const validateQuery = ({ instrument, timeframe, from = 0, through = Date.now() }) => {
+  safeSegment(instrument)
+  if (!Object.hasOwn(CANDLE_INTERVALS, timeframe)) throw new TypeError('Unsupported candle timeframe.')
+  if (!Number.isSafeInteger(from) || from < 0 || !Number.isSafeInteger(through) || through < from) throw new TypeError('Invalid candle range.')
+  return { instrument, timeframe, from, through }
+}
+/** Validate source observations without inventing missing units or confirmation. */
+export function validateCandle(candle) {
+  if (!candle || typeof candle !== 'object') throw new TypeError('Invalid candle record.')
+  safeSegment(candle.instrument)
+  const interval = CANDLE_INTERVALS[candle.timeframe]
+  if (!interval) throw new TypeError('Unsupported candle timeframe.')
+  if (!Number.isSafeInteger(candle.timestamp) || candle.timestamp < 0 || candle.timestamp % interval !== 0) throw new TypeError('Candle timestamp must lie on its timeframe grid.')
+  if (candle.confirmed !== true) throw new TypeError('Only confirmed candles may be persisted.')
+  if (['open', 'high', 'low', 'close'].some(field => typeof candle[field] !== 'number' || !Number.isFinite(candle[field]) || candle[field] <= 0)
+    || candle.high < Math.max(candle.open, candle.close, candle.low) || candle.low > Math.min(candle.open, candle.close, candle.high)) throw new TypeError('Invalid candle OHLC values.')
+  if (typeof candle.volume !== 'number' || !Number.isFinite(candle.volume) || candle.volume < 0
+    || optionalNonnegative.some(field => candle[field] != null && (typeof candle[field] !== 'number' || !Number.isFinite(candle[field]) || candle[field] < 0))) throw new TypeError('Candle quantities must be finite and nonnegative.')
+  if (optionalInteger.some(field => candle[field] != null && (!Number.isSafeInteger(candle[field]) || candle[field] < 0))
+    || candle.statisticsVersion > 2_147_483_647) throw new TypeError('Invalid candle statistics metadata.')
   return candle
+}
+const storedCandle = (candle, writtenAt) => Object.fromEntries(Object.keys(schema).map(field => [field, field === 'writtenAt' ? writtenAt : candle[field] ?? null]))
+const sqlSchema = Object.entries(schema).map(([field, type]) => `${quote(field)}: ${quote(type)}`).join(', ')
+const isMissing = error => error?.code === 'ENOENT'
+function validatePhysicalSchema(columns) {
+  const types = new Map(columns.map(column => [column.column_name, column.column_type]))
+  for (const field of ['instrument', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'confirmed']) {
+    if (!types.has(field)) throw new TypeError(`Persisted candle schema is missing ${field}. Run a data audit.`)
+  }
+  // SQL rounds fractional values when casting to BIGINT, and numeric 2
+  // becomes BOOLEAN true. Physical schemas must not permit those coercions.
+  if (!/^(?:U?(?:TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT))$/.test(types.get('timestamp'))
+    || types.get('confirmed') !== 'BOOLEAN') throw new TypeError('Invalid persisted candle timestamp or confirmation schema. Run a data audit.')
+  for (const field of ['open', 'high', 'low', 'close', 'volume']) {
+    if (!/^(?:U?(?:TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT)|FLOAT|DOUBLE|DECIMAL\(\d+,\d+\))$/.test(types.get(field))) throw new TypeError(`Invalid persisted candle ${field} schema. Run a data audit.`)
+  }
+}
+const missingRanges = (stamps, from, through, interval) => {
+  const present = new Set(stamps), ranges = []
+  let start = null
+  for (let stamp = from; stamp <= through; stamp += interval) {
+    if (!present.has(stamp)) { start ??= stamp; continue }
+    if (start !== null) { ranges.push({ from: start, through: stamp - interval }); start = null }
+  }
+  if (start !== null) ranges.push({ from: start, through })
+  return ranges
 }
 
 /**
@@ -49,6 +94,7 @@ export class MarketStore {
     this.coverages = new Map()
     this.watermarks = new Map()
     this.chartSnapshotWrites = new Map()
+    this.writeMetrics = { partitions: 0, rowsSubmitted: 0, bytesRead: 0, bytesWritten: 0, durationMS: 0 }
   }
 
   // DuckDB connections are not a concurrent query coordinator. Keep every
@@ -89,84 +135,128 @@ export class MarketStore {
   async parquetFiles(instrument, timeframe, from, through) {
     const directory = join(this.root, 'candles', `timeframe=${safeSegment(timeframe)}`, `instrument=${safeSegment(instrument)}`)
     let dates
-    try { dates = await readdir(directory, { withFileTypes: true }) } catch { return [] }
+    try { dates = await readdir(directory, { withFileTypes: true }) } catch (error) { if (isMissing(error)) return []; throw error }
     const firstDate = Number.isFinite(from) ? new Date(from).toISOString().slice(0, 10) : null
     const lastDate = Number.isFinite(through) ? new Date(through).toISOString().slice(0, 10) : null
-    return dates.filter(entry => entry.isDirectory()
-      && (!firstDate || entry.name.slice(5) >= firstDate)
-      && (!lastDate || entry.name.slice(5) <= lastDate))
-      .map(entry => join(directory, entry.name, '*.parquet'))
+    const files = []
+    for (const entry of dates.sort((a, b) => a.name.localeCompare(b.name))) {
+      if (!entry.isDirectory() || !/^date=\d{4}-\d{2}-\d{2}$/.test(entry.name)
+        || firstDate && entry.name.slice(5) < firstDate || lastDate && entry.name.slice(5) > lastDate) continue
+      const day = join(directory, entry.name)
+      // An empty partition left by an interrupted first write is absence,
+      // whereas permissions and device errors must reach the caller.
+      let parts
+      try { parts = await readdir(day, { withFileTypes: true }) } catch (error) { if (isMissing(error)) continue; throw error }
+      files.push(...parts.filter(part => part.isFile() && part.name.endsWith('.parquet')).map(part => join(day, part.name)))
+    }
+    return files
   }
 
-  async appendCandles(candles, priority = 'background') {
-    if (!Array.isArray(candles) || candles.length === 0) return 0
-    // Parquet parts are append-only. The latest record wins during reads, so
-    // equal timestamps would make two concurrent writes nondeterministic.
-    const writtenAt = Math.max(Date.now(), this.lastWrittenAt + 1)
-    this.lastWrittenAt = writtenAt
-    candles = candles.map(candle => ({ ...candle, writtenAt }))
-    for (const candle of candles) {
-      if (!Number.isFinite(candle.timestamp) || !candle.instrument || !candle.timeframe) throw new Error('A candle needs instrument, timeframe, and timestamp.')
-    }
-    const write = async () => {
-      const batches = Map.groupBy(candles, candle => this.partition(candle.instrument, candle.timeframe, candle.timestamp))
-      for (const [directory, rows] of batches) {
-        await mkdir(directory, { recursive: true })
-        // A part per write makes every read scan a growing pile of files.
-        // Merge each write into the partition's single part instead: reads
-        // open one file per date while newest-written rows still win per
-        // timestamp. Old parts are removed only after the replacement is
-        // durably renamed in, so an interrupted write stays readable.
-        const parts = (await readdir(directory, { withFileTypes: true }).catch(() => []))
-          .filter(entry => entry.isFile() && entry.name.endsWith('.parquet'))
-          .map(entry => join(directory, entry.name))
-        const nonce = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
-        const source = join(directory, `.${nonce}.json`)
-        const target = join(directory, `part-${nonce}.parquet`)
-        const temporary = `${target}.tmp`
-        await writeFile(source, JSON.stringify(rows), { mode: 0o600 })
-        try {
-          if (parts.length) {
-            const list = `[${parts.map(quote).join(', ')}]`
-            await this.connection.run(`COPY (
-              SELECT * FROM (
-                SELECT * FROM read_parquet(${list}, union_by_name = true)
-                UNION ALL BY NAME
-                SELECT * FROM read_json_auto(${quote(source)})
-              ) QUALIFY row_number() OVER (PARTITION BY timestamp ORDER BY COALESCE(writtenAt, 0) DESC) = 1
-              ORDER BY timestamp
-            ) TO ${quote(temporary)} (FORMAT PARQUET, COMPRESSION ZSTD)`)
-          } else {
-            await this.connection.run(`COPY (SELECT * FROM read_json_auto(${quote(source)})) TO ${quote(temporary)} (FORMAT PARQUET, COMPRESSION ZSTD)`)
-          }
-          await rename(temporary, target)
-          await Promise.all(parts.map(part => rm(part, { force: true })))
-        } finally {
-          await rm(source, { force: true })
-          await rm(temporary, { force: true })
+  async parquetRelation(files) {
+    const relation = `read_parquet([${files.map(quote).join(', ')}], union_by_name = true, hive_partitioning = false)`
+    const columns = (await this.connection.runAndReadAll(`DESCRIBE SELECT * FROM ${relation}`)).getRowObjectsJS()
+    const existing = new Set(columns.map(column => column.column_name))
+    validatePhysicalSchema(columns)
+    const projection = Object.entries(schema).map(([field, type]) => `${existing.has(field) ? `CAST("${field}" AS ${type})` : `NULL::${type}`} AS "${field}"`).join(', ')
+    // Explicit casts happen at the storage boundary. Old files may omit base
+    // volume; that is a typed NULL, never quote volume divided by a price.
+    return `(SELECT ${projection} FROM ${relation})`
+  }
+
+  async publishPartition(directory, rows, { replaceFrom, replaceThrough, timeframe = rows[0]?.timeframe } = {}) {
+    await mkdir(directory, { recursive: true })
+    const parts = (await readdir(directory, { withFileTypes: true }))
+      .filter(entry => entry.isFile() && entry.name.endsWith('.parquet')).map(entry => join(directory, entry.name))
+    const nonce = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    const source = join(directory, `.${nonce}.json`), target = join(directory, `part-${nonce}.parquet`), temporary = `${target}.tmp`
+    const startedAt = performance.now(), interval = CANDLE_INTERVALS[timeframe]
+    let previousBytes = 0
+    for (const file of parts) previousBytes += (await stat(file)).size
+    await writeFile(source, JSON.stringify(rows), { mode: 0o600 })
+    try {
+      const incoming = `SELECT * FROM read_json(${quote(source)}, columns = {${sqlSchema}}, format = 'array')`
+      let previous = ''
+      if (parts.length) {
+        const dayStart = Date.parse(`${directory.slice(-10)}T00:00:00Z`)
+        // A corrupt file can only be discarded when its entire UTC day is
+        // explicitly replaced. Partial repairs always preserve other rows.
+        const fullDay = replaceFrom <= dayStart && replaceThrough >= dayStart + dayMS - interval
+        if (!fullDay) {
+          const relation = await this.parquetRelation(parts)
+          previous = `SELECT * FROM ${relation}${replaceFrom == null ? '' : ` WHERE timestamp < ${replaceFrom} OR timestamp >= ${replaceThrough + interval}`} UNION ALL BY NAME `
         }
       }
-      // Coverage only changes when rows are written. Invalidate per
-      // instrument so unrelated instruments keep serving cached scans.
-      for (const candle of candles) {
-        const key = `${candle.instrument}:${candle.timeframe}`
-        this.coverages.delete(key)
-        // An existing cached maximum includes all older partitions. Without
-        // it, the next validation reads the actual maximum from Parquet.
-        if (this.watermarks.has(key)) this.watermarks.set(key, Math.max(this.watermarks.get(key), writtenAt))
-      }
-      return candles.length
-    }
-    return this.enqueue(write, priority)
+      await this.connection.run(`COPY (SELECT * FROM (${previous}${incoming})
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY timestamp ORDER BY COALESCE(writtenAt, 0) DESC) = 1
+        ORDER BY timestamp) TO ${quote(temporary)} (FORMAT PARQUET, COMPRESSION ZSTD)`)
+      await rename(temporary, target)
+      await Promise.all(parts.map(part => rm(part, { force: true })))
+      const bytesWritten = (await stat(target)).size
+      this.writeMetrics = { partitions: this.writeMetrics.partitions + 1, rowsSubmitted: this.writeMetrics.rowsSubmitted + rows.length,
+        bytesRead: this.writeMetrics.bytesRead + previousBytes, bytesWritten: this.writeMetrics.bytesWritten + bytesWritten,
+        durationMS: this.writeMetrics.durationMS + performance.now() - startedAt }
+    } finally { await rm(source, { force: true }); await rm(temporary, { force: true }) }
   }
 
-  async candles({ instrument, timeframe, from = 0, through = Date.now() }, priority = 'background') {
+  invalidate(instrument, timeframe, writtenAt) {
+    const key = `${instrument}:${timeframe}`
+    this.coverages.delete(key)
+    if (writtenAt == null) this.watermarks.delete(key)
+    else if (this.watermarks.has(key)) this.watermarks.set(key, Math.max(this.watermarks.get(key), writtenAt))
+  }
+
+  getWriteMetrics() { return { ...this.writeMetrics } }
+
+  async appendCandles(candles, priority = 'background') {
+    if (!Array.isArray(candles)) throw new TypeError('Candles must be an array.')
+    if (!candles.length) return 0
+    candles.forEach(validateCandle)
+    const writtenAt = Math.max(Date.now(), this.lastWrittenAt + 1)
+    this.lastWrittenAt = writtenAt
+    const records = [...new Map(candles.map(candle => [`${candle.instrument}:${candle.timeframe}:${candle.timestamp}`, storedCandle(candle, writtenAt)])).values()]
+    return this.enqueue(async () => {
+      const batches = Map.groupBy(records, candle => this.partition(candle.instrument, candle.timeframe, candle.timestamp))
+      try { for (const [directory, rows] of batches) await this.publishPartition(directory, rows) }
+      finally { for (const candle of records) this.invalidate(candle.instrument, candle.timeframe, writtenAt) }
+      return records.length
+    }, priority)
+  }
+
+  async replaceCandles(query, candles, priority = 'background') {
+    const { instrument, timeframe, from, through } = validateQuery(query)
+    const interval = CANDLE_INTERVALS[timeframe]
+    if (from % interval || through % interval || !Array.isArray(candles)) throw new TypeError('Repair range must lie on the candle grid.')
+    candles.forEach(candle => {
+      validateCandle(candle)
+      if (candle.instrument !== instrument || candle.timeframe !== timeframe || candle.timestamp < from || candle.timestamp > through) throw new TypeError('Replacement candle lies outside its repair range.')
+    })
+    const writtenAt = Math.max(Date.now(), this.lastWrittenAt + 1)
+    this.lastWrittenAt = writtenAt
+    const records = [...new Map(candles.map(candle => [`${candle.instrument}:${candle.timeframe}:${candle.timestamp}`, storedCandle(candle, writtenAt)])).values()]
+    return this.enqueue(async () => {
+      try {
+        for (let day = Math.floor(from / dayMS) * dayMS; day <= through; day += dayMS) {
+          await this.publishPartition(this.partition(instrument, timeframe, day), records.filter(row => row.timestamp >= day && row.timestamp < day + dayMS), { replaceFrom: from, replaceThrough: through, timeframe })
+        }
+      } finally { this.invalidate(instrument, timeframe) }
+      return records.length
+    }, priority)
+  }
+
+  async candles(query, priority = 'background') {
+    const { instrument, timeframe, from, through } = validateQuery(query)
     return this.enqueue(async () => {
       const files = await this.parquetFiles(instrument, timeframe, from, through)
       if (!files.length) return []
-      const list = `[${files.map(quote).join(', ')}]`
-      const result = await this.connection.runAndReadAll(`SELECT * EXCLUDE (row_rank) FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY timestamp ORDER BY COALESCE(writtenAt, 0) DESC) AS row_rank FROM read_parquet(${list}, union_by_name = true) WHERE timestamp >= ${Number(from)} AND timestamp <= ${Number(through)}) WHERE row_rank = 1 ORDER BY timestamp`)
-      return result.getRowObjectsJS().map(normalizeCandleRow)
+      const relation = await this.parquetRelation(files)
+      const result = await this.connection.runAndReadAll(`SELECT * FROM ${relation} WHERE timestamp >= ${from} AND timestamp <= ${through}
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY timestamp ORDER BY COALESCE(writtenAt, 0) DESC) = 1 ORDER BY timestamp`)
+      const rows = result.getRowObjectsJS().map(normalizeCandleRow)
+      rows.forEach(candle => {
+        validateCandle(candle)
+        if (candle.instrument !== instrument || candle.timeframe !== timeframe) throw new TypeError('Persisted candle does not match its partition. Run a data audit.')
+      })
+      return rows
     }, priority)
   }
 
@@ -177,8 +267,7 @@ export class MarketStore {
       const files = await this.parquetFiles(instrument, timeframe)
       let watermark = 0
       if (files.length) {
-        const list = `[${files.map(quote).join(', ')}]`
-        const rows = (await this.connection.runAndReadAll(`SELECT MAX(COALESCE(writtenAt, 0)) AS watermark FROM read_parquet(${list}, union_by_name = true)`)).getRowObjectsJS()
+        const rows = (await this.connection.runAndReadAll(`SELECT MAX(COALESCE(writtenAt, 0)) AS watermark FROM ${await this.parquetRelation(files)}`)).getRowObjectsJS()
         watermark = Number(rows[0]?.watermark ?? 0)
       }
       this.watermarks.set(key, watermark)
@@ -192,7 +281,7 @@ export class MarketStore {
 
   async readChartSnapshot(instrument, timeframe) {
     try { return JSON.parse(await readFile(this.chartSnapshotFile(instrument, timeframe), 'utf8')) }
-    catch { return null }
+    catch (error) { if (isMissing(error) || error instanceof SyntaxError) return null; throw error }
   }
 
   writeChartSnapshot(instrument, timeframe, snapshot) {
@@ -214,60 +303,109 @@ export class MarketStore {
   // Gap detection only needs timestamp presence. Reading the timestamp
   // column alone keeps the frequent repair checks from decompressing every
   // candle field.
-  async candleTimestamps({ instrument, timeframe, from = 0, through = Date.now() }, priority = 'background') {
+  async candleTimestamps(query, priority = 'background') {
+    const { instrument, timeframe, from, through } = validateQuery(query)
     return this.enqueue(async () => {
       const files = await this.parquetFiles(instrument, timeframe, from, through)
       if (!files.length) return []
-      const list = `[${files.map(quote).join(', ')}]`
-      const result = await this.connection.runAndReadAll(`SELECT timestamp FROM (SELECT timestamp, ROW_NUMBER() OVER (PARTITION BY timestamp ORDER BY COALESCE(writtenAt, 0) DESC) AS row_rank FROM read_parquet(${list}, union_by_name = true) WHERE timestamp >= ${Number(from)} AND timestamp <= ${Number(through)}) WHERE row_rank = 1 ORDER BY timestamp`)
+      const relation = await this.parquetRelation(files)
+      const result = await this.connection.runAndReadAll(`SELECT DISTINCT timestamp FROM ${relation} WHERE confirmed = true AND timestamp >= ${from} AND timestamp <= ${through} ORDER BY timestamp`)
       return result.getRowObjectsJS().map(row => Number(row.timestamp))
     }, priority)
   }
 
   async coverage(instrument, timeframe, priority = 'background') {
-    // Coverage only changes when rows are written, and every write
-    // invalidates this cache. Repeat reads around one write — the chart poll,
-    // list projection, and statistics paths all ask — reuse one scan.
+    validateQuery({ instrument, timeframe })
     const key = `${instrument}:${timeframe}`
-    const cached = this.coverages.get(key)
-    if (cached) return { ...cached }
     return this.enqueue(async () => {
+      if (this.coverages.has(key)) return { ...this.coverages.get(key) }
       const files = await this.parquetFiles(instrument, timeframe)
       if (!files.length) return { count: 0, first: null, last: null }
-      const list = `[${files.map(quote).join(', ')}]`
-      const result = await this.connection.runAndReadAll(`SELECT COUNT(*) AS count, MIN(timestamp) AS first, MAX(timestamp) AS last FROM (SELECT timestamp, ROW_NUMBER() OVER (PARTITION BY timestamp ORDER BY COALESCE(writtenAt, 0) DESC) AS row_rank FROM read_parquet(${list}, union_by_name = true)) WHERE row_rank = 1`)
-      const row = result.getRowObjectsJS()[0] ?? {}
-      const number = value => typeof value === 'bigint' ? Number(value) : Number(value)
-      const coverage = {
-        count: Number.isFinite(number(row.count)) ? number(row.count) : 0,
-        first: Number.isFinite(number(row.first)) ? number(row.first) : null,
-        last: Number.isFinite(number(row.last)) ? number(row.last) : null,
-      }
+      const relation = await this.parquetRelation(files)
+      const result = await this.connection.runAndReadAll(`SELECT COUNT(DISTINCT timestamp) AS count, MIN(timestamp) AS first, MAX(timestamp) AS last FROM ${relation} WHERE confirmed = true`)
+      const row = result.getRowObjectsJS()[0]
+      const coverage = { count: Number(row.count), first: row.first == null ? null : Number(row.first), last: row.last == null ? null : Number(row.last) }
       this.coverages.set(key, coverage)
       return { ...coverage }
     }, priority)
   }
 
-  async missingCandleRanges({ instrument, timeframe = '5m', from, through, intervalMS = 300_000 }, priority = 'background') {
-    const first = Math.ceil(Number(from) / intervalMS) * intervalMS
-    const last = Math.floor(Number(through) / intervalMS) * intervalMS
-    if (!Number.isFinite(first) || !Number.isFinite(last) || first > last) return []
+  async missingCandleRanges({ instrument, timeframe = '5m', from, through, intervalMS = CANDLE_INTERVALS[timeframe] }, priority = 'background') {
+    validateQuery({ instrument, timeframe, from, through })
+    if (intervalMS !== CANDLE_INTERVALS[timeframe]) throw new TypeError('Candle interval must match timeframe.')
+    const first = Math.ceil(from / intervalMS) * intervalMS, last = Math.floor(through / intervalMS) * intervalMS
+    if (first > last) return []
     const stamps = await this.candleTimestamps({ instrument, timeframe, from: first, through: last }, priority)
-    const present = new Set(stamps)
-    const ranges = []
-    let rangeStart = null
-    for (let timestamp = first; timestamp <= last; timestamp += intervalMS) {
-      if (!present.has(timestamp)) {
-        if (rangeStart === null) rangeStart = timestamp
-        continue
+    return missingRanges(stamps, first, last, intervalMS)
+  }
+
+  async inspectCandles(query, priority = 'background') {
+    const { instrument, timeframe, from, through } = validateQuery(query), interval = CANDLE_INTERVALS[timeframe]
+    return this.enqueue(async () => {
+      const files = await this.parquetFiles(instrument, timeframe, from, through), issues = [], present = new Set(), seen = new Set(), corruptDays = []
+      let checkedRows = 0
+      const issue = (reason, first, last, file, detail) => issues.push({ instrument, timeframe, source: 'candles', from: first, through: last, reason, repairable: true, ...(file ? { file } : {}), ...(detail ? { detail } : {}) })
+      for (const file of files) {
+        const date = file.match(/date=(\d{4}-\d{2}-\d{2})/)?.[1], start = Date.parse(`${date}T00:00:00Z`), end = start + dayMS - interval
+        // Filesystem failures are operational errors, never a clean audit.
+        await stat(file)
+        let rows, columns
+        try {
+          const relation = `read_parquet(${quote(file)}, hive_partitioning = false)`
+          columns = (await this.connection.runAndReadAll(`DESCRIBE SELECT * FROM ${relation}`)).getRowObjectsJS()
+          rows = (await this.connection.runAndReadAll(`SELECT * FROM ${relation}`)).getRowObjectsJS().map(normalizeCandleRow)
+        }
+        catch (error) {
+          if (!/Invalid Input|Invalid Error|Conversion Error|Serialization Error|corrupt|parquet.*(?:magic|footer|metadata)|(?:magic|footer).*parquet/i.test(String(error?.message))) throw error
+          issue('corrupt-file', start, end, file, 'The Parquet partition cannot be decoded.')
+          corruptDays.push({ from: start, through: end }); continue
+        }
+        // A readable but incompatible physical schema requires republishing
+        // the whole file before strict reads or partial merges can succeed.
+        // Report it first so repair replaces the partition before row defects.
+        try { validatePhysicalSchema(columns) }
+        catch (error) { issue('invalid-schema', start, end, file, error.message) }
+        for (const row of rows) {
+          const stamp = row.timestamp
+          const knownStamp = typeof stamp === 'number' && Number.isFinite(stamp) && stamp >= start && stamp < start + dayMS
+          if (knownStamp && (stamp < Math.floor(from / interval) * interval || stamp >= Math.floor(through / interval) * interval + interval)) continue
+          checkedRows++
+          const validStamp = knownStamp && Number.isSafeInteger(stamp)
+          const first = knownStamp ? Math.floor(stamp / interval) * interval : start
+          const last = knownStamp ? first : end
+          if (!validStamp || stamp % interval !== 0) issue('invalid-grid', first, last, file)
+          if (row.instrument !== instrument || row.timeframe !== timeframe) issue('invalid-partition', first, last, file)
+          if (row.confirmed !== true) issue('unconfirmed', first, last, file)
+          if (['open', 'high', 'low', 'close'].some(field => typeof row[field] !== 'number' || !Number.isFinite(row[field]) || row[field] <= 0)
+            || row.high < Math.max(row.open, row.close, row.low) || row.low > Math.min(row.open, row.close, row.high)) issue('invalid-ohlc', first, last, file)
+          if (typeof row.volume !== 'number' || !Number.isFinite(row.volume) || row.volume < 0
+            || optionalNonnegative.some(field => row[field] != null && (typeof row[field] !== 'number' || !Number.isFinite(row[field]) || row[field] < 0))) issue('negative-volume', first, last, file)
+          if (row.baseVolume == null) issue('missing-base-volume', first, last, file, 'Base-asset volume is unavailable; refetch the source observation.')
+          if (optionalInteger.some(field => row[field] != null && (!Number.isSafeInteger(row[field]) || row[field] < 0))
+            || row.statisticsVersion > 2_147_483_647) issue('invalid-metadata', first, last, file)
+          if (validStamp && stamp % interval === 0) {
+            if (seen.has(stamp)) issue('duplicate', stamp, stamp, file)
+            seen.add(stamp)
+            // Invalid values at a real timestamp are their own anomalies,
+            // rather than a second, misleading report of missing candles.
+            present.add(stamp)
+          }
+        }
       }
-      if (rangeStart !== null) {
-        ranges.push({ from: rangeStart, through: timestamp - intervalMS })
-        rangeStart = null
+      // Corrupt days already have an explicit full-partition report. Their
+      // unknowable contents must not be reported again as invented gaps.
+      const first = Math.ceil(from / interval) * interval, last = Math.floor(through / interval) * interval
+      const gaps = []
+      let cursor = first
+      for (const corrupt of corruptDays.sort((a, b) => a.from - b.from)) {
+        if (corrupt.through < cursor || corrupt.from > last) continue
+        gaps.push(...missingRanges(present, cursor, Math.min(last, corrupt.from - interval), interval))
+        cursor = Math.max(cursor, corrupt.through + interval)
       }
-    }
-    if (rangeStart !== null) ranges.push({ from: rangeStart, through: last })
-    return ranges
+      gaps.push(...missingRanges(present, cursor, last, interval))
+      for (const range of gaps) issue('gap', range.from, range.through)
+      return { issues, checkedRows, files: files.length, missingRanges: gaps }
+    }, priority)
   }
 
   catalogFile() { return join(this.root, 'catalog.parquet') }
@@ -294,7 +432,7 @@ export class MarketStore {
       const target = this.catalogFile()
       await writeFile(source, JSON.stringify(rows), { mode: 0o600 })
       try {
-        await this.connection.run(`COPY (SELECT * FROM read_json_auto(${quote(source)})) TO ${quote(temporary)} (FORMAT PARQUET, COMPRESSION ZSTD)`)
+        await this.connection.run(`COPY (SELECT * FROM read_json(${quote(source)}, columns = {schemaVersion:'INTEGER',liquidityPolicyVersion:'INTEGER',criteriaKey:'VARCHAR',savedAt:'BIGINT',entriesJSON:'VARCHAR'}, format = 'array')) TO ${quote(temporary)} (FORMAT PARQUET, COMPRESSION ZSTD)`)
         await rename(temporary, target)
       } finally {
         await rm(source, { force: true })
@@ -307,14 +445,8 @@ export class MarketStore {
 
   async readCatalogSnapshot() {
     return this.enqueue(async () => {
-      let rows
-      try {
-        rows = (await this.connection.runAndReadAll(`SELECT * FROM read_parquet(${quote(this.catalogFile())})`)).getRowObjectsJS()
-      } catch {
-        // A missing or interrupted snapshot must never prevent candle data
-        // from opening. The next successful discovery atomically replaces it.
-        return null
-      }
+      try { await stat(this.catalogFile()) } catch (error) { if (isMissing(error)) return null; throw error }
+      const rows = (await this.connection.runAndReadAll(`SELECT * FROM read_parquet(${quote(this.catalogFile())})`)).getRowObjectsJS()
       if (rows.length !== 1) return null
       const row = rows[0]
       try {

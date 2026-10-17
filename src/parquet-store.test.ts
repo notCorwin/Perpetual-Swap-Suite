@@ -10,11 +10,11 @@ test('DuckDB writes partitioned Parquet candles and queries their range', async 
   const store = await MarketStore.open(root)
   try {
     await store.appendCandles([
-      { instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp: 1_700_000_000_000, open: 100, high: 110, low: 95, close: 105, volume: 42, confirmed: true },
-      { instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp: 1_700_000_300_000, open: 105, high: 115, low: 100, close: 110, volume: 43, confirmed: true },
+      { instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp: 1_700_000_100_000, open: 100, high: 110, low: 95, close: 105, volume: 42, confirmed: true },
+      { instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp: 1_700_000_400_000, open: 105, high: 115, low: 100, close: 110, volume: 43, confirmed: true },
     ])
-    const rows = await store.candles({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: 1_700_000_000_000, through: 1_700_000_000_000 })
-    assert.deepEqual(rows.map(row => ({ timestamp: row.timestamp, close: row.close, confirmed: row.confirmed })), [{ timestamp: 1_700_000_000_000, close: 105, confirmed: true }])
+    const rows = await store.candles({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: 1_700_000_100_000, through: 1_700_000_100_000 })
+    assert.deepEqual(rows.map(row => ({ timestamp: row.timestamp, close: row.close, confirmed: row.confirmed })), [{ timestamp: 1_700_000_100_000, close: 105, confirmed: true }])
     const timeframes = await readdir(join(root, 'candles'))
     assert.deepEqual(timeframes, ['timeframe=5m'])
   } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
@@ -43,7 +43,7 @@ test('repeated appends stay one part per partition with newest values winning', 
   const store = await MarketStore.open(root)
   try {
     const first = 1_700_000_100_000, second = first + 300_000, third = first + 600_000
-    const candle = (timestamp: number, close: number) => ({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp, open: 100, high: 111, low: 95, close, volume: 1, confirmed: true })
+    const candle = (timestamp: number, close: number) => ({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp, open: 100, high: Math.max(111, close), low: 95, close, volume: 1, confirmed: true })
     await store.appendCandles([candle(first, 105), candle(second, 110)])
     let coverage = await store.coverage('BTC-USDT-SWAP', '5m')
     assert.equal(coverage.count, 2)
