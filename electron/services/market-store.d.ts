@@ -16,7 +16,6 @@ export type CandleRecord = {
   confirmed: boolean
   [key: string]: unknown
 }
-export type CatalogSnapshot = { schemaVersion: number; liquidityPolicyVersion: number; criteriaKey: string; savedAt: number; entries: unknown[] }
 export type StorePriority = 'foreground' | 'background'
 export type CandleQuery = { instrument: string; timeframe: string; from?: number; through?: number }
 export type CandleRange = { from: number; through: number }
@@ -47,7 +46,5 @@ export class MarketStore {
   candleTimestamps(query: { instrument: string; timeframe: string; from?: number; through?: number }, priority?: StorePriority): Promise<number[]>
   coverage(instrument: string, timeframe: string, priority?: StorePriority): Promise<{ count: number; first: number | null; last: number | null }>
   missingCandleRanges(query: { instrument: string; timeframe?: string; from: number; through: number; intervalMS?: number }, priority?: StorePriority): Promise<Array<{ from: number; through: number }>>
-  writeCatalogSnapshot(snapshot: CatalogSnapshot): Promise<void>
-  readCatalogSnapshot(): Promise<CatalogSnapshot | null>
   close(): Promise<void>
 }

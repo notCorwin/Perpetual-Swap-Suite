@@ -60,6 +60,8 @@ test('history requests reject invalid grids, sources, priorities, and constructo
   assert.throws(() => create({ maxAttempts: 0 }), /maxAttempts/)
   assert.throws(() => create({ retryBaseMS: 10, maxRetryDelayMS: 5 }), /maxRetryDelayMS/)
   assert.throws(() => create({ minRequestIntervalMS: 2 ** 32 }), /2147483647/)
+  assert.throws(() => create({ maxRetainedTerminalTasks: 0 }), /maxRetainedTerminalTasks/)
+  assert.throws(() => create({ maxRetainedTerminalTasks: 1.5 }), /maxRetainedTerminalTasks/)
   const { sync } = create()
   try {
     await assert.rejects(sync.enqueue({ ...request, from: base + 1 }), /grid/)
@@ -372,6 +374,130 @@ test('source-specific coverage never treats existing candle prices as complete O
   } finally { await sync.close() }
 })
 
+test('rolling history targets retain bounded recent results in memory and persistent metadata', async () => {
+  let now = base + 60 * 86_400_000
+  const metadata = new MemoryMetadata()
+  const options: Partial<HistorySyncOptions> = { metadata, now: () => now, maxRetainedTerminalTasks: 8,
+    store: { async missingCandleRanges() { return [] } },
+    write() { throw new Error('Complete history must not be rewritten.') },
+    sources: { candles: { fetchGap() { throw new Error('Complete history must not be downloaded.') } } },
+  }
+  let sync = create(options).sync
+  let first!: HistoryTask, latest!: HistoryTask
+  try {
+    for (let index = 0; index < 256; index += 1) {
+      const target = await sync.enqueueTarget({ instrument: request.instrument, timeframe: '5m', source: 'candles', historyDays: 1, asOf: now, warmupCandles: 0 })
+      first ??= target.history
+      latest = target.history
+      assert.equal((await sync.waitFor(latest.id)).status, 'completed')
+      await sync.whenIdle()
+      assert.ok(sync.listTasks().length <= 8)
+      assert.ok(metadata.listSyncTasks().length <= 8)
+      now += intervalMS
+    }
+    assert.equal(sync.getTask(first.id), null)
+    assert.equal(metadata.getSyncTask(first.id), null)
+    assert.equal(sync.getTask(latest.id)?.status, 'completed')
+    await assert.rejects(sync.waitFor(first.id), /Unknown history task/)
+    await sync.close()
+    sync = create({ ...options, maxRetainedTerminalTasks: 3 }).sync
+    await sync.start()
+    assert.equal(sync.listTasks().length, 3)
+    assert.equal(metadata.listSyncTasks().length, 3)
+    assert.equal(sync.getTask(first.id), null)
+    assert.equal(sync.getTask(latest.id)?.status, 'completed')
+    const renewed = await sync.enqueue(first)
+    assert.equal((await sync.waitFor(renewed.id)).status, 'completed')
+    await sync.whenIdle()
+    assert.equal(metadata.listSyncTasks().length, 3)
+  } finally { await sync.close() }
+})
+
+test('result retention preserves active and queued work and delivers registered waiters before expiry', async () => {
+  let now = base
+  const entered = deferred(), release = deferred()
+  const { sync, metadata } = create({ now: () => now++, maxRetainedTerminalTasks: 1,
+    sources: { candles: { async fetchGap(query) {
+      if (query.instrument === 'ACTIVE-USDT-SWAP') { entered.resolve(); await release.promise }
+      return records(query)
+    } } },
+  })
+  try {
+    const active = await sync.enqueue({ ...request, instrument: 'ACTIVE-USDT-SWAP' })
+    const activeResult = sync.waitFor(active.id)
+    await entered.promise
+    const queued = await sync.enqueue({ ...request, instrument: 'QUEUED-USDT-SWAP' })
+    const queuedResult = sync.waitFor(queued.id)
+    const cancelled = await sync.enqueue({ ...request, instrument: 'CANCELLED-USDT-SWAP' })
+    const cancelledResult = sync.waitFor(cancelled.id)
+    await sync.cancel(cancelled.id)
+    for (let index = 0; index < 4; index += 1) {
+      const task = await sync.enqueue({ ...request, instrument: `EXPIRED${index}-USDT-SWAP` })
+      await sync.cancel(task.id)
+    }
+    assert.equal((await cancelledResult).status, 'cancelled')
+    assert.equal(sync.getTask(cancelled.id), null)
+    assert.equal(sync.getTask(active.id)?.status, 'running')
+    assert.equal(sync.getTask(queued.id)?.status, 'queued')
+    assert.equal(metadata.getSyncTask(active.id)?.status, 'running')
+    assert.equal(metadata.getSyncTask(queued.id)?.status, 'queued')
+    release.resolve()
+    assert.equal((await activeResult).status, 'completed')
+    assert.equal((await queuedResult).status, 'completed')
+    await sync.whenIdle()
+    assert.equal(sync.listTasks().length, 1)
+    assert.equal(metadata.listSyncTasks().length, 1)
+    assert.equal(sync.getTask(queued.id)?.status, 'completed')
+  } finally { release.resolve(); await sync.close() }
+})
+
+test('paused history survives rolling-result eviction and restart until explicitly resumed', async () => {
+  let now = base + 60 * 86_400_000, block = true, covered = false
+  const entered = deferred(), metadata = new MemoryMetadata()
+  const pausedInstrument = 'PAUSED-USDT-SWAP'
+  const options: Partial<HistorySyncOptions> = { metadata, now: () => now, maxRetainedTerminalTasks: 2,
+    store: { async missingCandleRanges(query) {
+      return query.instrument === pausedInstrument && !covered ? [{ from: query.from, through: query.through }] : []
+    } },
+    write(_rows, task) { if (task.instrument === pausedInstrument) covered = true },
+    sources: { candles: { async fetchGap(query) {
+      if (block) {
+        entered.resolve()
+        return new Promise<CandleRecord[]>((_, reject) => query.signal.addEventListener('abort', () => reject(query.signal.reason), { once: true }))
+      }
+      return records(query)
+    } } },
+  }
+  let sync = create(options).sync
+  try {
+    const paused = await sync.enqueue({ ...request, instrument: pausedInstrument })
+    await entered.promise
+    await sync.pause(paused.id)
+    await sync.whenIdle()
+    block = false
+    for (let index = 0; index < 128; index += 1) {
+      now += intervalMS
+      const { history } = await sync.enqueueTarget({ instrument: request.instrument, timeframe: '5m', source: 'candles', asOf: now, warmupCandles: 0 })
+      await sync.waitFor(history.id)
+      await sync.whenIdle()
+    }
+    assert.equal(sync.getTask(paused.id)?.status, 'paused')
+    assert.equal(metadata.getSyncTask(paused.id)?.status, 'paused')
+    assert.equal(sync.listTasks().length, 3)
+    await sync.close()
+    sync = create(options).sync
+    await sync.start()
+    assert.equal(sync.getTask(paused.id)?.status, 'paused')
+    assert.equal(metadata.getSyncTask(paused.id)?.status, 'paused')
+    await sync.resume(paused.id)
+    assert.equal((await sync.waitFor(paused.id)).status, 'completed')
+    assert.equal(covered, true)
+    await sync.whenIdle()
+    assert.equal(sync.listTasks().length, 2)
+    assert.equal(metadata.listSyncTasks().length, 2)
+  } finally { await sync.close() }
+})
+
 test('invalid source data and failed durable writes cannot mark missing history completed', async () => {
   let mode = 'unconfirmed', writes = 0
   const store = new MemoryStore()
@@ -400,21 +526,27 @@ test('SQLite task checkpoints and Parquet candles survive a real store restart',
   let metadata = await MetadataStore.open(root), store = await MarketStore.open(root)
   let fetches = 0
   const sources = { candles: { fetchGap(query: HistorySourceQuery) { fetches += 1; return records(query) } } }
-  let sync = new HistorySync({ metadata, store, sources, minRequestIntervalMS: 0 })
+  let sync = new HistorySync({ metadata, store, sources, minRequestIntervalMS: 0, maxRetainedTerminalTasks: 1 })
   try {
     const task = await sync.enqueue(request)
     assert.equal((await sync.waitFor(task.id)).status, 'completed')
+    const later = await sync.enqueue({ ...request, from: request.through + intervalMS, through: request.through + intervalMS })
+    assert.equal((await sync.waitFor(later.id)).status, 'completed')
+    await sync.whenIdle()
+    assert.equal(metadata.getSyncTask(task.id), null)
     await sync.close()
     await store.close()
     metadata.close()
     metadata = await MetadataStore.open(root)
     store = await MarketStore.open(root)
-    sync = new HistorySync({ metadata, store, sources, minRequestIntervalMS: 0 })
+    sync = new HistorySync({ metadata, store, sources, minRequestIntervalMS: 0, maxRetainedTerminalTasks: 1 })
     await sync.start()
+    assert.equal(sync.getTask(task.id), null)
+    assert.equal(sync.getTask(later.id)?.status, 'completed')
     await sync.enqueue(request)
     await sync.whenIdle()
     assert.equal(sync.getTask(task.id)?.status, 'completed')
-    assert.equal(fetches, 1)
+    assert.equal(fetches, 2)
     assert.equal((await store.candles(request)).length, 3)
   } finally { await sync.close(); await store.close(); metadata.close(); await rm(root, { recursive: true, force: true }) }
 })

@@ -2,7 +2,7 @@
 
 评估日期：2026-10-17。代码基线：`470916a`。依据：[AGENTS.md](../AGENTS.md) 及本次提出的工程原则。
 
-优先统一市场数据与指标的数学口径，再完成可配置筛选、独立排名、后台数据管理和双栏工作区。现有实现可以替换；不以保留旧接口、旧字段或现有测试断言为验收目标。本次交付为计划，不实施下列产品改造。
+优先统一市场数据与指标的数学口径，再完成可配置筛选、独立排名、后台数据管理和双栏工作区。现有实现可以替换；不以保留旧接口、旧字段或现有测试断言为验收目标。本文件保留原始评估；后续已按本计划实施，参见 [实施与验收记录](IMPLEMENTATION.md)。下列代码依据固定到原评估基线。
 
 ## 当前结论
 
@@ -16,24 +16,24 @@
 
 | 规范 | 当前状态及代码依据 | 改进目标 |
 | --- | --- | --- |
-| Electron 桌面容器 | 已实现，renderer 隔离；[main](../electron/main.js)、[preload](../electron/preload.cjs) | 保留隔离，统一一个受校验的桌面 API |
-| 最小 5m，支持 5m/15m/1h | 已实现；[timeframe](../src/timeframe.ts#L1) | 保留原生周期，默认图表改为 15m |
-| shadcn 默认风格，Base UI + CSS | 当前为 `radix-nova` 和 Radix，并有自定义玻璃材质；[配置](../components.json#L3)、[Button](../src/components/ui/button.tsx#L4) | 整体切换 Base UI 基础组件，收敛默认风格 |
-| Parquet 历史，DuckDB 查询，SQLite 频繁更新 | 前两项实际使用；配置为 JSON，catalog 为 Parquet 快照；[Store](../electron/services/market-store.js#L33)、[配置写入](../electron/main.js#L57) | SQLite 承担设置、当前资格和同步任务等可变元数据 |
-| 六项筛选独立启停、调参、持久化 | 只有 Volume Stability 开关；阈值及提前过滤写死；[阈值](../electron/services/market-service.js#L6)、[候选发现](../electron/services/market-service.js#L1276) | 一个筛选配置贯穿发现、计算、资格判定和缓存 |
-| USDT 永续且无休市机制 | 已筛选 live、USDT SWAP 和 `instCategory === '1'`；[属性筛选](../electron/services/market-service.js#L1276) | 用官方属性契约证明无休市，不能仅依据当前字段名推断 |
-| 全局等宽数字、指定涨跌色 | 已实现；[全局规则](../src/index.css#L342)、[明暗颜色](../src/index.css#L198) | 保留；补充灰度辨识和实际背景对比度验收 |
-| 左列表、右图表 | 选中后整页切换为图表；[页面分支](../src/App.tsx#L288) | 同一工作区持续显示两栏 |
-| 按独立时间窗口的变化率绝对值降序，默认 15m | 前端默认 Opportunity，服务端另有 24h 排序；[默认状态](../src/App.tsx#L167)、[排序键](../src/market-sort.ts#L7) | 独立 `rankingLookback`，与图表周期分别持久化 |
-| EMA200、BOLL20/2、VWAP14 | EMA/VWAP 已显示，BOLL 被 Log BB 替代；[公式](../electron/services/indicators.js#L40) | 恢复指定 BOLL，并固定 VWAP 的量纲与公式 |
-| ROC/MAROC、三 RSI、OI、Taker 面板 | 已实现；[图例与面板](../src/MarketChart.tsx#L328) | 保留，验证单位、初始化和跨入口一致性 |
-| 完成 K 线读持久化，未完成 K 线不落盘 | 业务链路已区分；[写入入口](../electron/services/market-service.js#L921)、[图表加载](../electron/services/prepared-chart-service.js#L375) | 将确认状态校验下沉到唯一写入边界，防止旁路 |
-| 增量补缺、不阻塞交互 | 已有缺口检测、请求合并、优先队列和计算 Worker；[缺口](../electron/services/market-store.js#L249) | 统一同步调度，并持久化任务，覆盖范围不再依赖打开哪个图表 |
-| 设置中手动完整性校验 | 没有对应入口；[当前设置](../src/App.tsx#L309) | 提供可取消、可恢复、可复验的后台审计与修复 |
-| 英语界面 | 常规控件为英语，但 AI 内置问题和回答指令为中文；[分析提示](../src/chart-analysis.ts#L5) | 所有内置文案、默认问题、生成语言指令和语言声明使用英语 |
-| 固定基准统一缩放 | 列表只缩小，普通图表比例恒为 1；[列表](../src/MarketListViewport.tsx#L28)、[图表](../src/ChartWorkspaceViewport.tsx#L9) | 一个工作区基准、一套比例及坐标转换 |
-| Signed Relative Change | 核心公式已用绝对值分母；零基线文案与服务行为不一致；[格式说明](../src/market-percent.ts#L4)、[计算](../electron/services/market-service.js#L136) | 统一公式、零基线、缺失值和百分比展示 |
-| GitHub Actions、构建安装并启动 App | 已有 main 发布流程，但没有 PR 门禁、lint 和安装产物 smoke；[workflow](../.github/workflows/release.yml#L3)、[打包](../scripts/package-electron.sh#L4) | 检查前移；本地交付验证 `/Applications` 中的新产物 |
+| Electron 桌面容器 | 已实现，renderer 隔离；[main](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/main.js)、[preload](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/preload.cjs) | 保留隔离，统一一个受校验的桌面 API |
+| 最小 5m，支持 5m/15m/1h | 已实现；[timeframe](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/src/timeframe.ts#L1) | 保留原生周期，默认图表改为 15m |
+| shadcn 默认风格，Base UI + CSS | 当前为 `radix-nova` 和 Radix，并有自定义玻璃材质；[配置](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/components.json#L3)、[Button](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/src/components/ui/button.tsx#L4) | 整体切换 Base UI 基础组件，收敛默认风格 |
+| Parquet 历史，DuckDB 查询，SQLite 频繁更新 | 前两项实际使用；配置为 JSON，catalog 为 Parquet 快照；[Store](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/services/market-store.js#L33)、[配置写入](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/main.js#L57) | SQLite 承担设置、当前资格和同步任务等可变元数据 |
+| 六项筛选独立启停、调参、持久化 | 只有 Volume Stability 开关；阈值及提前过滤写死；[阈值](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/services/market-service.js#L6)、[候选发现](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/services/market-service.js#L1276) | 一个筛选配置贯穿发现、计算、资格判定和缓存 |
+| USDT 永续且无休市机制 | 已筛选 live、USDT SWAP 和 `instCategory === '1'`；[属性筛选](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/services/market-service.js#L1276) | 用官方属性契约证明无休市，不能仅依据当前字段名推断 |
+| 全局等宽数字、指定涨跌色 | 已实现；[全局规则](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/src/index.css#L342)、[明暗颜色](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/src/index.css#L198) | 保留；补充灰度辨识和实际背景对比度验收 |
+| 左列表、右图表 | 选中后整页切换为图表；[页面分支](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/src/App.tsx#L288) | 同一工作区持续显示两栏 |
+| 按独立时间窗口的变化率绝对值降序，默认 15m | 前端默认 Opportunity，服务端另有 24h 排序；[默认状态](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/src/App.tsx#L167)、[排序键](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/src/market-sort.ts#L7) | 独立 `rankingLookback`，与图表周期分别持久化 |
+| EMA200、BOLL20/2、VWAP14 | EMA/VWAP 已显示，BOLL 被 Log BB 替代；[公式](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/services/indicators.js#L40) | 恢复指定 BOLL，并固定 VWAP 的量纲与公式 |
+| ROC/MAROC、三 RSI、OI、Taker 面板 | 已实现；[图例与面板](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/src/MarketChart.tsx#L328) | 保留，验证单位、初始化和跨入口一致性 |
+| 完成 K 线读持久化，未完成 K 线不落盘 | 业务链路已区分；[写入入口](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/services/market-service.js#L921)、[图表加载](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/services/prepared-chart-service.js#L375) | 将确认状态校验下沉到唯一写入边界，防止旁路 |
+| 增量补缺、不阻塞交互 | 已有缺口检测、请求合并、优先队列和计算 Worker；[缺口](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/services/market-store.js#L249) | 统一同步调度，并持久化任务，覆盖范围不再依赖打开哪个图表 |
+| 设置中手动完整性校验 | 没有对应入口；[当前设置](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/src/App.tsx#L309) | 提供可取消、可恢复、可复验的后台审计与修复 |
+| 英语界面 | 常规控件为英语，但 AI 内置问题和回答指令为中文；[分析提示](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/src/chart-analysis.ts#L5) | 所有内置文案、默认问题、生成语言指令和语言声明使用英语 |
+| 固定基准统一缩放 | 列表只缩小，普通图表比例恒为 1；[列表](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/src/MarketListViewport.tsx#L28)、[图表](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/src/ChartWorkspaceViewport.tsx#L9) | 一个工作区基准、一套比例及坐标转换 |
+| Signed Relative Change | 核心公式已用绝对值分母；零基线文案与服务行为不一致；[格式说明](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/src/market-percent.ts#L4)、[计算](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/services/market-service.js#L136) | 统一公式、零基线、缺失值和百分比展示 |
+| GitHub Actions、构建安装并启动 App | 已有 main 发布流程，但没有 PR 门禁、lint 和安装产物 smoke；[workflow](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/.github/workflows/release.yml#L3)、[打包](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/scripts/package-electron.sh#L4) | 检查前移；本地交付验证 `/Applications` 中的新产物 |
 
 ## 目标架构
 
@@ -55,9 +55,9 @@ Parquet 的现有原子发布、DuckDB 串行查询、缺口分段初始化、re
 **优先级 P0。依赖：无。**
 
 1. 固定公式、输入量纲、初始化起点、最早有效样本、缺口重启及修订规则，形成指标契约。递归指标的种子由同一 canonical 连续历史决定，不能由可见窗口或缓存长度决定。
-2. 删除列表的 201 根独立重算路径（[readListBars](../electron/services/market-service.js#L494)）；列表、图表和机会评分共享同一指标结果。历史扩展或修订后，从受影响的初始化边界重新生成并同时发布。
+2. 删除列表的 201 根独立重算路径（[readListBars](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/services/market-service.js#L494)）；列表、图表和机会评分共享同一指标结果。历史扩展或修订后，从受影响的初始化边界重新生成并同时发布。
 3. 将 Log BB 默认链路替换为 BOLL(20,2)：`middle = SMA(close,20)`，`upper/lower = middle ± 2 × populationStdDev(close,20)`。一并替换字段、图例和依赖该语义的评分；不保留旧字段别名或双算回退。
-4. VWAP 当前以 `quoteVolume` 再乘典型价格，形成另一种价格加权。[parser](../electron/services/market-service.js#L244) 也丢弃了基础币成交量。建议明确采用 14 根滚动 `sum(HLC3 × baseVolume) / sum(baseVolume)`，持久化所需基础量；如产品选择实际成交均价，则改用 `sum(quoteVolume) / sum(baseVolume)` 并明确命名。公式选择在本阶段编码前定稿，不能沿用 README 的现状描述作为授权。
+4. VWAP 当前以 `quoteVolume` 再乘典型价格，形成另一种价格加权。[parser](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/services/market-service.js#L244) 也丢弃了基础币成交量。建议明确采用 14 根滚动 `sum(HLC3 × baseVolume) / sum(baseVolume)`，持久化所需基础量；如产品选择实际成交均价，则改用 `sum(quoteVolume) / sum(baseVolume)` 并明确命名。公式选择在本阶段编码前定稿，不能沿用 README 的现状描述作为授权。
 5. Signed Relative Change 统一为 `(current - previous) / abs(previous) × 100%`；建议零基线返回 unavailable，展示 `—`，避免一处返回 null、另一处宣称无穷大。区分这种变化率与 Taker imbalance 等独立比例。
 6. EMA 使用 SMA200 初始化、乘数 `2/201`；ROC9、MAROC9 和 Wilder RSI 的首个有效位置必须明示。RSI 的全平、单边上涨、单边下跌等边界分别给出约定；禁止通过“未报错/非空”证明数学正确。
 7. 公式与输入 schema 更新后，明确提升 calculation version，作废旧派生快照。原始且单位明确的数据继续使用；无法证明单位正确的数据标记待重取，不做静默猜测。
@@ -73,12 +73,12 @@ Parquet 的现有原子发布、DuckDB 串行查询、缺口分段初始化、re
 
 **优先级 P1。配置与任务模型可和阶段一并行；指标派生发布依赖阶段一。**
 
-1. 用事务式 SQLite 设置仓库整体替换 [JSON read-merge-write](../electron/main.js#L57)。配置带 schema 与修订号，renderer 只管理表单草稿和提交结果；删除由前端分字段重试承担一致性的设计。
+1. 用事务式 SQLite 设置仓库整体替换 [JSON read-merge-write](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/main.js#L57)。配置带 schema 与修订号，renderer 只管理表单草稿和提交结果；删除由前端分字段重试承担一致性的设计。
 2. 明确每个合约、周期、数据源的目标覆盖起止范围。AGENTS 未规定历史起点或保留年限，这需要本阶段产品决策；指标热身范围与用户历史范围分别记录，不能用当前 96 根窗口充当历史完整性定义。
 3. 合并列表 warmup 与图表 repair 的重复任务状态，建立一套增量同步协调器。SQLite 保存任务、游标、重试时间和完成状态；重启可以继续，前台请求可以提升同一任务的优先级。
 4. 校验 ingestion contract：时间戳落在周期网格，OHLC 为正且高低关系成立，量非负、单位明确，只有 confirmed 数据可进入历史写入边界。读写失败、数据不存在、来源明确不提供必须分别表达。
 5. 完整性审计检查时间缺口、重复逻辑键、坏 OHLC/量、错误单位或周期、未确认记录和损坏文件；结果包含合约、周期、范围、来源与可修复性。设置中提供开始、进度、取消、修复与复验。
-6. Parquet 使用显式 schema，替换 JSON 自动推断及运行时字符串补救。当前 [每批写入都会重并当天分区](../electron/services/market-store.js#L109)，先合并同分区的批量更新并测量写放大及延迟，只有超出预算才增加有界压实。保留现有简单分区、原子发布和写后失效机制。
+6. Parquet 使用显式 schema，替换 JSON 自动推断及运行时字符串补救。当前 [每批写入都会重并当天分区](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/services/market-store.js#L109)，先合并同分区的批量更新并测量写放大及延迟，只有超出预算才增加有界压实。保留现有简单分区、原子发布和写后失效机制。
 
 **验收：**
 
@@ -93,7 +93,7 @@ Parquet 的现有原子发布、DuckDB 串行查询、缺口分段初始化、re
 **优先级 P1。依赖：阶段一的统一数据口径、阶段二的事务设置。**
 
 1. 六项条件分别定义 `enabled`、阈值及必要参数；Slippage 的交易名义金额独立配置，默认 100,000 USDT。配置必须贯穿候选发现、网络取数、最终判定、UI 和缓存身份。
-2. 删除候选发现中的硬编码 spread/turnover 排除（[位置](../electron/services/market-service.js#L1276)）。禁用条件后，任何前置优化都不能继续排除对应合约；启用条件全部满足才进入合格列表。
+2. 删除候选发现中的硬编码 spread/turnover 排除（[位置](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/services/market-service.js#L1276)）。禁用条件后，任何前置优化都不能继续排除对应合约；启用条件全部满足才进入合格列表。
 3. 修正严格边界：depth 要求单侧均 **大于** 100,000，而当前累计封顶 100,000 再按 `>=` 判断。单独计算可观察深度和固定名义金额滑点；有限档位不足以证明通过时返回 Unknown。
 4. 24h USDT 成交额不得以 `volCcy24h × latestPrice` 冒充实际成交额。核验 OKX 官方字段，采用真实 quote amount；若由本地 K 线汇总，必须覆盖完整滚动 24h，明确边界和未完成段的处理。
 5. Volume Stability 必须检查最近 24 个连续、已完成 1h 区间；保留零量并区分零量失败与缺样 Unknown。当前零量被过滤后会因样本不足返回 null，不属于误判通过；真正缺口是没有验证连续性及样本所属时间范围。
@@ -112,7 +112,7 @@ Parquet 的现有原子发布、DuckDB 串行查询、缺口分段初始化、re
 
 **优先级 P1。依赖：阶段二的统一同步协调器。**
 
-当前最新 K 线由每分钟 REST 刷新（[刷新间隔](../electron/services/market-service.js#L23)），与实时更新目标有差距。用 OKX 推送更新内存中的 forming candle，REST 负责初始化、断线补缺及已确认数据修正；这些职责不互相充当无限回退。
+当前最新 K 线由每分钟 REST 刷新（[刷新间隔](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/services/market-service.js#L23)），与实时更新目标有差距。用 OKX 推送更新内存中的 forming candle，REST 负责初始化、断线补缺及已确认数据修正；这些职责不互相充当无限回退。
 
 **验收：** 重复、乱序、断线重连和收盘确认都能正确处理；未完成 K 线始终不落盘；确认写入成功后，列表与图表统一读取持久化事实。显式显示连接状态和数据时间；在约定测试环境记录事件接收到绘制的延迟，并按阶段二形成的预算验收。
 
@@ -140,8 +140,8 @@ Parquet 的现有原子发布、DuckDB 串行查询、缺口分段初始化、re
 **优先级 P1/P2。可从阶段一同步启动；最终安装验收依赖全部产品改造。**
 
 1. 共享 command schema、请求和响应类型；验证允许窗口的 main frame 及 payload。禁止应用窗口导航到外部内容，外链限制允许协议。
-2. 统一 `window.radarDesktop` 或等价单一 API，删除 [webkit 兼容入口](../electron/preload.cjs#L10)、无效 ROC/MAROC 请求参数和返回成功却不执行的窗口操作。同步删除强制要求旧入口存在的源码正则测试。
-3. 补全 main、preload、services 与关键 scripts 的静态检查；清理 [失效的 ci-local.ts 引用](../tsconfig.node.json)。是否统一 TypeScript 由共享契约与维护收益决定，不为更换后缀重写代码。
+2. 统一 `window.radarDesktop` 或等价单一 API，删除 [webkit 兼容入口](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/electron/preload.cjs#L10)、无效 ROC/MAROC 请求参数和返回成功却不执行的窗口操作。同步删除强制要求旧入口存在的源码正则测试。
+3. 补全 main、preload、services 与关键 scripts 的静态检查；清理 [失效的 ci-local.ts 引用](https://github.com/notCorwin/Perpetual-Swap-Suite/blob/470916a/tsconfig.node.json)。是否统一 TypeScript 由共享契约与维护收益决定，不为更换后缀重写代码。
 4. GitHub Actions 增加 PR 验证：lint、类型检查、核心业务测试及必要 Electron E2E；main 发布依赖确定性验证和打包产物 smoke。实时 OKX 集成单列，区分外部不可用和业务错误。
 5. 提供本地 build → install → launch → smoke 命令：构建后替换 `/Applications/Perpetual Swap Suite.app`，从安装路径启动并验证当前 revision、窗口、preload、DuckDB、Worker 和正常退出。安装失败不得宣称交付完成，保留原 App 直至新产物校验通过。
 6. CI 对真正打包的 `.app` executable 跑小型 smoke；现有源码目录 E2E 不能证明原生依赖和 Worker 已打进包。签名策略与文档保持一致，不将未要求的公证流程设为额外阻断条件。

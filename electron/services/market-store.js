@@ -408,63 +408,6 @@ export class MarketStore {
     }, priority)
   }
 
-  catalogFile() { return join(this.root, 'catalog.parquet') }
-
-  // The liquid-instrument catalogue is not a second in-memory source of
-  // truth. It is a compact Parquet snapshot alongside the candle partitions,
-  // so an app restart can render already-verified cached observations before
-  // another network-wide liquidity scan finishes. Keep the whole snapshot in
-  // one atomic row: partial scans must never look like a complete catalogue.
-  async writeCatalogSnapshot(snapshot) {
-    if (!snapshot || typeof snapshot !== 'object' || !Array.isArray(snapshot.entries)) throw new Error('A catalog snapshot needs entries.')
-    const rows = [{
-      schemaVersion: Number(snapshot.schemaVersion),
-      liquidityPolicyVersion: Number(snapshot.liquidityPolicyVersion),
-      criteriaKey: String(snapshot.criteriaKey ?? ''),
-      savedAt: Number(snapshot.savedAt),
-      entriesJSON: JSON.stringify(snapshot.entries),
-    }]
-    if (!Number.isSafeInteger(rows[0].schemaVersion) || !Number.isSafeInteger(rows[0].liquidityPolicyVersion) || !rows[0].criteriaKey || !Number.isFinite(rows[0].savedAt)) throw new Error('Invalid catalog snapshot.')
-    const write = async () => {
-      const nonce = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
-      const source = join(this.root, `.${nonce}.catalog.json`)
-      const temporary = join(this.root, `.${nonce}.catalog.parquet`)
-      const target = this.catalogFile()
-      await writeFile(source, JSON.stringify(rows), { mode: 0o600 })
-      try {
-        await this.connection.run(`COPY (SELECT * FROM read_json(${quote(source)}, columns = {schemaVersion:'INTEGER',liquidityPolicyVersion:'INTEGER',criteriaKey:'VARCHAR',savedAt:'BIGINT',entriesJSON:'VARCHAR'}, format = 'array')) TO ${quote(temporary)} (FORMAT PARQUET, COMPRESSION ZSTD)`)
-        await rename(temporary, target)
-      } finally {
-        await rm(source, { force: true })
-        await rm(temporary, { force: true })
-      }
-      return undefined
-    }
-    return this.enqueue(write)
-  }
-
-  async readCatalogSnapshot() {
-    return this.enqueue(async () => {
-      try { await stat(this.catalogFile()) } catch (error) { if (isMissing(error)) return null; throw error }
-      const rows = (await this.connection.runAndReadAll(`SELECT * FROM read_parquet(${quote(this.catalogFile())})`)).getRowObjectsJS()
-      if (rows.length !== 1) return null
-      const row = rows[0]
-      try {
-        const snapshot = {
-          schemaVersion: Number(row.schemaVersion),
-          liquidityPolicyVersion: Number(row.liquidityPolicyVersion),
-          criteriaKey: String(row.criteriaKey ?? ''),
-          savedAt: Number(row.savedAt),
-          entries: JSON.parse(String(row.entriesJSON)),
-        }
-        return Number.isSafeInteger(snapshot.schemaVersion) && Number.isSafeInteger(snapshot.liquidityPolicyVersion)
-          && snapshot.criteriaKey && Number.isFinite(snapshot.savedAt) && Array.isArray(snapshot.entries) ? snapshot : null
-      } catch {
-        return null
-      }
-    })
-  }
-
   async close() {
     if (this.closeTask) return this.closeTask
     this.closed = true

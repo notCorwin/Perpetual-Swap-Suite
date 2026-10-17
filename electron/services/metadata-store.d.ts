@@ -1,24 +1,6 @@
-export type ChartTimeframe = '5m' | '15m' | '1H'
-export type Preferences = {
-  chartTimeframe: ChartTimeframe
-  rankingLookback: number
-  /** Whole days, from 1 through 3650 inclusive. */
-  historyDays: number
-  liquidity: {
-    spread: { enabled: boolean; maxPercent: number }
-    depth: { enabled: boolean; minUSDT: number }
-    slippage: { enabled: boolean; maxPercent: number; notionalUSDT: number }
-    volume24h: { enabled: boolean; minUSDT: number }
-    openInterest: { enabled: boolean; minUSDT: number }
-    volumeStability: { enabled: boolean; maxRatio: number }
-  }
-}
-export type PreferencesPatch = {
-  chartTimeframe?: ChartTimeframe
-  rankingLookback?: number
-  historyDays?: number
-  liquidity?: { [Rule in keyof Preferences['liquidity']]?: Partial<Preferences['liquidity'][Rule]> }
-}
+import type { ChartTimeframe, Preferences, PreferencesPatch } from './preferences.js'
+export type { ChartTimeframe, Preferences, PreferencesPatch } from './preferences.js'
+export { DEFAULT_PREFERENCES, validatePreferences } from './preferences.js'
 export type SettingsSnapshot = { schemaVersion: 1; revision: number; preferences: Preferences }
 export type JSONValue = string | number | boolean | null | JSONValue[] | { [key: string]: JSONValue }
 export type AnalysisSettings = { model?: string; apiKey?: string; [key: string]: JSONValue | undefined }
@@ -49,9 +31,6 @@ export type CatalogEntry = {
   preferencesRevision: number
   [key: string]: unknown
 }
-export const DEFAULT_PREFERENCES: Readonly<Preferences>
-/** Complete schema validation; throws TypeError and returns a detached copy. */
-export function validatePreferences(value: unknown): Preferences
 export class SettingsRevisionConflictError extends Error {
   constructor(expectedRevision: number, actualRevision: number)
   readonly code: 'SETTINGS_REVISION_CONFLICT'

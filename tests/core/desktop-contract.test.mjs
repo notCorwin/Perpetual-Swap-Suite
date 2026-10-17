@@ -72,7 +72,7 @@ test('required fields, action-specific fields, types, and numeric boundaries are
     { preferences: { action: 'save', values: {} } }, { preferences: { action: 'update' } },
     { preferences: { action: 'update', values: {} } },
     ...[0, -5, 7, 5.5, Infinity, '15'].map(rankingLookback => ({ preferences: { action: 'update', values: { rankingLookback } } })),
-    ...[0, -1, 1.5, NaN].map(historyDays => ({ preferences: { action: 'update', values: { historyDays } } })),
+    ...[0, -1, 1.5, 3651, NaN].map(historyDays => ({ preferences: { action: 'update', values: { historyDays } } })),
     { preferences: { action: 'update', values: { liquidity: { spread: { enabled: 1 } } } } },
     ...[0, -1, Infinity, '1'].map(maxPercent => ({ preferences: { action: 'update', values: { liquidity: { spread: { maxPercent } } } } })),
     { preferences: { action: 'update', values: { liquidity: { volumeStability: { maxRatio: 1 } } } } },

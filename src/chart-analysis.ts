@@ -1,5 +1,5 @@
 import type { ModelMessage } from 'ai'
-import type { ChartImage } from './chart-capture.ts'
+import type { ChartImage } from './desktop-contract.ts'
 
 export const DEFAULT_ANALYSIS_MODEL = 'openai/gpt-6.1-sol'
 export const ANALYSIS_PROMPTS = {

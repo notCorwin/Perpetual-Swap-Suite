@@ -81,6 +81,8 @@ export type HistorySyncOptions = {
   maxRetryDelayMS?: number
   /** Consecutive failures before a recoverable pause; defaults to 5. */
   maxAttempts?: number
+  /** Recent completed/unavailable/cancelled checkpoints to retain in memory and SQLite; defaults to 512, minimum 1. Paused and active tasks and registered waiters are never evicted. */
+  maxRetainedTerminalTasks?: number
 }
 export class HistorySync {
   constructor(options: HistorySyncOptions)
@@ -89,14 +91,14 @@ export class HistorySync {
   enqueue(request: HistoryRequest): Promise<HistoryTask>
   /** A 30-day completed-candle target plus a separate 200-candle EMA warmup. */
   enqueueTarget(request: Omit<HistoryRequest, 'from' | 'through' | 'purpose'> & { historyDays?: number; warmupCandles?: number; asOf?: number }): Promise<{ history: HistoryTask; warmup: HistoryTask | null }>
-  /** Read detached snapshots after start() has resolved. */
+  /** Read detached snapshots after start(). Old completed/unavailable/cancelled tasks can expire from the bounded result history and return null. Re-enqueue their range to recheck durable coverage. */
   getTask(id: string): HistoryTask | null
   listTasks(): HistoryTask[]
   pause(id: string): Promise<HistoryTask>
   cancel(id: string): Promise<HistoryTask>
   /** Resume retries/cancelled work; unavailable tasks recheck source metadata. */
   resume(id: string): Promise<HistoryTask>
-  /** Resolves when completed, unavailable, paused, or cancelled. */
+  /** Resolves when completed, unavailable, paused, or cancelled. Registered waiters survive result pruning; an already expired ID is unknown. */
   waitFor(id: string): Promise<HistoryTask>
   /** Includes scheduled retries; paused/cancelled/unavailable work is idle. */
   whenIdle(): Promise<void>

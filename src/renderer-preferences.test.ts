@@ -31,3 +31,14 @@ test('settings reject empty, nonfinite and invalid candle windows before saving'
   assert.deepEqual(Object.keys(validatePreferencesDraft(draft).errors).sort(), ['depth', 'historyDays', 'rankingLookback', 'slippageNotional'])
   assert.equal(validatePreferencesDraft(draft).values, undefined)
 })
+
+test('renderer and canonical settings agree on strict thresholds and supported ranges', () => {
+  for (const [key, value] of [['depth', '0'], ['volume24h', '0'], ['volumeStability', '1']]) {
+    const draft = preferencesDraft(DEFAULT_PREFERENCES)
+    draft.liquidity[key as keyof typeof draft.liquidity].threshold = value
+    assert.equal(validatePreferencesDraft(draft).values, undefined)
+  }
+  const draft = preferencesDraft(DEFAULT_PREFERENCES)
+  draft.historyDays = '3651'
+  assert.equal(validatePreferencesDraft(draft).values, undefined)
+})

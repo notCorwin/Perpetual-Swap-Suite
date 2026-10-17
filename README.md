@@ -1,132 +1,135 @@
 # Perpetual Swap Suite
 
-[![Publish macOS Release](https://github.com/notCorwin/Perpetual-Swap-Suite/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/notCorwin/Perpetual-Swap-Suite/actions/workflows/release.yml)
+[![Verify and Publish macOS](https://github.com/notCorwin/Perpetual-Swap-Suite/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/notCorwin/Perpetual-Swap-Suite/actions/workflows/release.yml)
 
-An Electron desktop app for screening and charting live OKX USDT perpetual contracts. The React dashboard uses an isolated preload bridge; the Electron main process collects public market data, stores completed observations in Parquet, and queries them with DuckDB. No OKX API key is required.
+An Electron desktop app that rebuilds OKX perpetual market data locally. Screen USDT perpetual contracts, rank completed price changes, and review candlestick charts with reproducible indicators. Public market data needs no OKX API key. The interface and optional AI analysis use English.
 
-## Features
+## Get started
 
-- A searchable, sortable market table with Long/Short Opportunity scores, price changes, high breakouts/low breakdowns, taker imbalance, open interest, ROC/MAROC, RSI, and Bollinger Band readings.
-- Liquidity screening for live, non-TradFi USDT perpetual contracts, with an optional hourly volume stability requirement.
-- Native OKX 5m, 15m, and 1h charts with 96 candles per window, historical scrolling, keyboard navigation, chart copying, and technical indicator panels.
-- Optional AI chart analysis through Vercel AI Gateway, with separate Long/Short prompts and follow-up conversations.
-- English interface controls, tabular numbers, system light/dark styles, and shared design tokens for background materials and components.
+Download `Perpetual.Swap.Suite.app.zip` from the [autobuild release](https://github.com/notCorwin/Perpetual-Swap-Suite/releases/tag/autobuild), extract it, and move `Perpetual Swap Suite.app` to `/Applications`. Local and CI packages use ad hoc signing.
 
-## Install or build
-
-Download `Perpetual.Swap.Suite.app.zip` from the [autobuild release](https://github.com/notCorwin/Perpetual-Swap-Suite/releases/tag/autobuild), extract it, and move `Perpetual Swap Suite.app` to `/Applications`. Local and CI packages are ad hoc signed.
-
-To build on Apple Silicon macOS, use Node.js 24.11+ and npm, with network access for dependencies and OKX public endpoints:
+To build and install from source on macOS, select **Node.js 24.22.0** from [.nvmrc](.nvmrc) and use **npm 12.2.0**:
 
 ```sh
 git clone https://github.com/notCorwin/Perpetual-Swap-Suite.git
 cd Perpetual-Swap-Suite
+npm install --global npm@12.2.0
 npm ci
-npm run app
-open "dist/mac-arm64/Perpetual Swap Suite.app"
+npm run app:deliver
+open "/Applications/Perpetual Swap Suite.app"
 ```
 
-`npm run app` builds the TypeScript/Vite renderer, packages Electron with electron-builder, and verifies the app signature. `npm run dev` starts Vite and Electron together for development. The renderer requires the Electron preload bridge; opening `dist/index.html` in an ordinary browser does not provide market data.
+`app:deliver` builds the app for the current macOS architecture, validates and smoke-tests the candidate, replaces `/Applications/Perpetual Swap Suite.app`, and smoke-tests the installed executable. It asks the old app to quit before replacement and restores it if installation or installed-app validation fails. Smoke checks use temporary user data and exercise the actual executable, build revision, window, preload isolation, DuckDB/Parquet I/O, indicator worker, normal exit, and persistence after restart.
 
-## Screen markets
+For development, run `npm run dev` to start Vite and Electron together. Opening the renderer in an ordinary browser does not provide the desktop data service.
 
-The collector includes live, non-TradFi USDT perpetuals that pass all mandatory checks:
+## Market workspace
 
-| Check | Requirement |
-| --- | --- |
-| Bid-ask spread | Below 0.05% |
-| Order book depth | At least 100,000 USDT on each side |
-| Estimated slippage | Below 0.10% on each side for a 100,000 USDT fill |
-| Estimated 24h turnover | Above 30,000,000 USDT |
-| Open interest notional | Above 5,000,000 USDT |
-| Hourly volume stability, optional | Maximum/minimum volume below 2 across 24 completed hours |
+The contract list stays on the left and the selected contract's chart stays on the right. The whole workspace, including dialogs, scales from a 1,600-pixel design width so both columns retain their proportions. Shared shadcn/ui components use Base UI and CSS design tokens, with system light/dark themes, tabular figures, and signed values and direction symbols alongside price colors.
 
-Enable **Settings → Require stable hourly volume** to apply the optional check; it is off by default and persists locally. The other thresholds are fixed in the data service. Estimated turnover is 24-hour base-currency volume multiplied by the latest price.
+The list shows only contracts that meet every enabled liquidity condition and the USDT perpetual/no-scheduled-closure requirements. Search narrows the visible results. Contracts are ordered by the **absolute signed price change**, largest first; the sign still shows whether the price rose or fell.
 
-Search narrows the market list. Column headings change the sort order. The default **Opportunity** ordering groups `Candidate`, `Watch`, `Overheated`, and `Incomplete` readings; open a score to inspect its components and missing inputs. These scores are heuristic rankings. Missing or warming indicator values display as `—`, and the collection status distinguishes cached data, loading, retries, and live observations.
+The default ranking lookback is **15 minutes**, calculated from completed native **5m** candle closes. Change it in **Settings → Ranking lookback (minutes)** using multiples of five minutes. Ranking lookback and chart timeframe are separate persisted settings: choosing a 1h chart does not change a 15-minute ranking window.
 
-## Review charts
+### Liquidity conditions
 
-Open a contract to view its chart and select **5m**, **15m**, or **1h**. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window's latest candle. Scroll through history; returning to the newest range resumes following.
+Open **Settings → Liquidity conditions** to enable or disable each condition and edit its parameters independently. Disabled conditions retain their saved parameters. The defaults are:
+
+| Condition | Default requirement | Enabled |
+| --- | --- | --- |
+| Bid-ask spread | Below 0.05% | Yes |
+| Order book depth | Strictly above 100,000 USDT on each side | Yes |
+| Slippage | Below 0.10% on each side for a 100,000 USDT trade | Yes |
+| 24h trading volume | Above 30,000,000 USDT | Yes |
+| Open interest | USDT notional above 5,000,000 USDT | Yes |
+| Volume stability | Maximum/minimum hourly volume below 2 over 24 completed 1h candles | No |
+
+The 24h trading-volume check sums actual quote volume from **288 completed 5m candles**. The slippage trade size is also configurable. A contract needs valid observations for every enabled condition; eligibility must be revalidated as its observations expire.
+
+## Charts and indicators
+
+Select a contract and choose **5m**, **15m**, or **1h**. The default chart timeframe is **15m**. The main chart contains candlesticks, EMA(200), BOLL(20, 2), and VWAP(14). Separate panels show ROC(9) + MAROC(9), RSI(6/12/24), Open Interest in contracts, and Taker Buy/Sell in contracts.
 
 | Control | Action |
 | --- | --- |
+| Primary mouse button, then drag | Inspect candles; release to return to the window end |
+| Scroll | Review history; return to the newest range to follow live updates |
 | Up / Down | Previous / next contract in the visible list, wrapping at either end |
-| Left | First contract in the current sorted search results |
+| Left | First contract in the visible ranking |
 | Right | Highest-turnover eligible contract, independent of search |
-| Copy chart | Copy the visible chart with an opaque theme background |
-| Analyze Long / Analyze Short | Start or reopen analysis of a chart snapshot |
+| Copy chart | Copy the chart with an opaque theme background |
+| Analyze Long / Analyze Short | Analyze a captured chart snapshot |
 
-Chart OHLCV uses the selected period's native OKX candles. Confirmed candles are read from persisted data; the forming candle remains in memory as a live overlay. Ticker prices do not fabricate candle OHLC. Open interest and taker Buy/Sell volumes use the matching contract and candle period in **contracts** (`unit=1`). Taker imbalance is `(Buy − Sell) / (Buy + Sell) × 100%`.
+Each chart presents a complete 96-candle window. While another range is being prepared, the previous complete chart remains visible with a **Preparing** label. Data collection, storage, and indicator preparation run outside renderer interactions.
 
-The chart statistics loader supports OKX's latest 1,440 periods: approximately 5 days at 5m, 15 days at 15m, or 60 days at 1h. Older locally saved statistics remain available; price candles alone cannot reconstruct them. Missing statistics are shown explicitly. A zero Buy/Sell pair that contradicts a positive-volume candle is treated as unavailable.
+Indicators use one canonical contiguous native candle series, independently of the visible window. EMA seeds from 200 closes; BOLL uses arithmetic prices and population deviation; VWAP weights typical prices by base-currency volume; RSI uses Wilder smoothing and returns 50 for a flat run. Missing periods restart initialization, and missing values display as `—`. Older source additions and corrections invalidate derived calculations. See the [indicator contract](docs/INDICATORS.md) for formulas, units, initialization, and boundary conditions.
 
-Each displayed chart is a complete 96-candle snapshot. If a requested range needs preparation, the previous complete chart stays visible with a **Preparing** label. The service coalesces scrolling requests, prewarms candidate contracts, reuses saved history, and repairs missing ranges without blocking renderer input. Prepared latest snapshots also persist with calculation versions and source-write watermarks so they can be validated after restart.
+Applicable relative changes use `(current − previous) / abs(previous) × 100%`. A missing, nonfinite, or zero baseline is unavailable. Taker imbalance uses `(Buy − Sell) / (Buy + Sell) × 100%`; its zero-total case is unavailable. Historical OI and taker availability depends on the provider; unavailable observations remain explicit gaps.
 
-### Indicator definitions
+## History and live updates
 
-A worker calculates indicators over the persisted contiguous series, independently of the visible window. Missing periods split the series and restart initialization. Unavailable warmup values remain null; corrections or older history rebuild the affected indicator generation.
+**Settings → History to retain (days)** controls the requested history coverage, defaulting to **30 days**, with a supported range of **1–3,650 whole days**. Synchronization also requests 200 earlier candles for indicator warmup. Available history depends on listing dates and source availability.
 
-| Indicator | Definition |
-| --- | --- |
-| EMA(200) | Seed with the arithmetic mean of 200 closes, then use multiplier `2 / 201` |
-| BOLL(20, 2) | Arithmetic mean of 20 closes ± two population standard deviations |
-| VWAP(14) | Base-volume-weighted typical price `(High + Low + Close) / 3` over 14 candles; undefined for missing weights or zero total volume |
-| ROC(9) | Signed relative close change over nine candles, as a percentage |
-| MAROC(9) | Arithmetic mean of nine ROC readings |
-| RSI(6), RSI(12), RSI(24) | Wilder smoothing, seeded with mean gains/losses over the period; a flat run gives 50; positive gains with zero losses gives 100 |
+Completed candles are written to Parquet and read through DuckDB for charts and indicators. WebSocket updates keep the forming candle in memory; confirmed data passes through durable ingestion before becoming completed history. Reconnection coordinates missing-range repair with the history synchronizer. Complete saved ranges are reused, and background jobs checkpoint their progress in SQLite.
 
-Applicable relative changes use `(current − previous) / abs(previous) × 100%`; a zero baseline is unavailable. Indicator comparisons require matching periods, source data, formulas, and warmup history. See the [indicator contract](docs/INDICATORS.md), [indicator calculations](electron/services/indicators.js) and [market metrics](electron/services/market-metrics.js) for implementation details.
+### Check and repair data
 
-## AI chart analysis
+In **Settings → Data integrity**:
 
-Open **Settings → Configure analysis**, enter a Vercel AI Gateway API key, and choose a model with image input support. The default model is `openai/gpt-6.1-sol`.
+1. Choose **Start audit** to inspect persisted history for gaps and invalid data.
+2. Follow the progress and issue list, or choose **Cancel audit** to stop the current run.
+3. Choose **Repair issues** for repairable findings. Repairs run in the background and are followed by verification of persisted data; unresolved issues remain visible.
 
-**Analyze Long** and **Analyze Short** capture the visible chart as an opaque PNG and send it through the Electron main process to Gateway. Responses stream in Chinese. Follow-up questions reuse the captured image and selected model; **New analysis** captures the current chart again. Conversations and drafts remain in memory until the app exits. **Stop**, changing contracts, or closing the panel cancels active generation. Failed requests retry automatically while the panel is open.
+## Optional AI chart analysis
 
-The API key is stored as plaintext in the local `settings.json` file with mode `0600`; settings responses expose whether a key is configured without returning the key. Charts and conversations are sent to Gateway only when analysis is requested.
+Open **Settings → Optional AI analysis → Configure analysis**, enter a Vercel AI Gateway key, and select a model with image input support. The default model is `openai/gpt-6.1-sol`. Market collection and charts work without AI credentials.
 
-## Local data
+**Analyze Long** and **Analyze Short** capture the chart as an opaque PNG and send it through the main process to Gateway. Responses stream in English. Follow-up questions reuse that snapshot and model; **New analysis** captures the current chart. Conversations and drafts stay in memory until exit. **Stop**, changing contracts, or closing the panel cancels generation. Failed requests retry while the panel remains open.
+
+The model and API key are stored in a private analysis record inside `metadata.sqlite`. The database has mode `0600`; the key is plaintext on disk and available only to the main process. Public settings responses report whether a key exists without returning it. Chart images and conversations are sent to Gateway when analysis is requested.
+
+## Local storage
 
 Paths are relative to `~/Library/Application Support/Perpetual Swap Suite/`:
 
 | Path | Contents |
 | --- | --- |
-| `MarketData/candles/` | Confirmed candle Parquet parts partitioned by timeframe, instrument, and UTC date |
-| `MarketData/catalog.parquet` | Cached liquid-contract catalog |
-| `MarketData/prepared-charts/` | Validated latest chart snapshots |
-| `settings.json` | Liquidity and appearance preferences, analysis model, and Gateway key |
+| `MarketData/candles/` | Completed candles in Parquet, partitioned by native timeframe, instrument, and UTC date |
+| `MarketData/prepared-charts/` | Derived chart snapshots with formula versions and source watermarks |
+| `metadata.sqlite` | Transactional preferences, eligibility catalog, synchronization checkpoints, audit reports, and private analysis settings |
 
-Parquet writes are serialized and published atomically. Corrections append newer observations; DuckDB selects the latest record for each timestamp. DuckDB uses an in-memory query connection rather than a separate durable database file. Unconfirmed candles stay in memory.
+DuckDB uses an in-memory query connection over Parquet. Writes validate completed candles and publish partitions atomically. The forming candle remains in memory. On the first migration, recognized values from an existing `settings.json` are imported once into SQLite. Retired glass and blur preferences are not part of the new settings schema.
 
-## Development and validation
+The renderer uses a single isolated `window.radarDesktop` bridge. The main process validates the caller and complete command before executing an operation; Node APIs and credentials stay outside the page context.
 
-| Path | Responsibility |
-| --- | --- |
-| [electron](electron) | Main process, isolated preload bridge, and desktop operations |
-| [electron/services](electron/services) | OKX collection, Parquet storage, DuckDB queries, chart preparation, and indicators |
-| [src](src) | React dashboard, charts, and analysis UI |
-| [src/components/ui](src/components/ui) | Shared shadcn/ui components |
-| [src/index.css](src/index.css) | Design tokens and shared surface materials |
-| [tests/e2e](tests/e2e) | Real Electron interaction and chart acceptance tests |
-| [scripts](scripts) | Development, packaging, benchmarks, and validation tools |
+## Development and checks
 
-Resolved dependencies are in [package-lock.json](package-lock.json). Use the commands in [package.json](package.json):
+Install the locked dependencies with `npm ci`. The shadcn CLI is a development dependency; `@shadcn/react` remains a runtime dependency for the analysis message scroller. Base components, styles, and tokens live in [src/components/ui](src/components/ui), [src/index.css](src/index.css), and [components.json](components.json).
 
 | Command | Purpose |
 | --- | --- |
-| `npm test` | Core TypeScript tests and Electron end-to-end checks |
-| `npm run test:renderer` | Indicators, market logic, chart controller, prepared cache, storage, and bridge contracts |
-| `npm run test:e2e` | Build and verify real Electron interactions and rendered chart snapshots |
-| `npm run lint` | Oxlint and shared component surface checks |
-| `npm run benchmark` | Parquet write and DuckDB query timings |
-| `npm run benchmark:chart` | Scrolling, reversals, large jumps, and delayed storage reads |
-| `npm run benchmark:instruments` | Contract prewarming, switching, and cache-pressure revisits |
-| `npm run test:okx:1h` | Live OKX hourly candle, open interest, and taker integration |
-| `npm run app` | Build and package the macOS app |
+| `npm run dev` | Run the Vite renderer and Electron host |
+| `npm run typecheck` | Check TypeScript projects |
+| `npm run check:desktop` | Check syntax of main, preload, services, and scripts without executing them |
+| `npm run lint` | Run source lint and shared design-token checks |
+| `npm run test:core` | Test core market, indicator, persistence, synchronization, audit, and protocol behavior |
+| `npm run test:e2e` | Build and test actual Electron interactions with isolated fixture data |
+| `npm test` | Run core tests and Electron E2E |
+| `npm run app` | Build, package, and verify a candidate macOS app |
+| `npm run app:deliver` | Build, smoke-test, install, and verify the installed app with rollback on failure |
+| `npm run app:smoke -- --app "/path/to/Perpetual Swap Suite.app" --revision <full-git-sha>` | Verify an existing packaged executable using isolated data |
+| `npm run test:okx:1h` | Run live public OKX candle/OI/taker integration with temporary storage |
+| `npm run benchmark` | Measure Parquet writes and DuckDB queries |
+| `npm run benchmark:chart` | Exercise chart scrolling, reversals, jumps, and delayed reads |
+| `npm run benchmark:instruments` | Exercise contract prewarming, switching, and revisits |
+| `PERPETUAL_SWAP_BENCHMARK_BACKGROUND=1 npm run benchmark:instruments` | Measure navigation while real synchronization and audit process an offline synthetic source |
+| `node scripts/workspace-visual-check.mjs` | Check light/dark, grayscale, scaling, and measured contrast after building |
+| `node scripts/benchmark-startup.mjs --app "/path/to/Perpetual Swap Suite.app"` | Measure three isolated process launches and process working sets |
 
-Chart acceptance compares committed 96-candle snapshots with a full-series numeric oracle and checks the rendered SVG metadata and OI/Taker geometry. Navigation checks include revisiting contracts beyond the deep-history cache and switching while an older history request is delayed.
+[GitHub Actions](.github/workflows/release.yml) checks pull requests with lint, desktop syntax checks, types, core tests, and Electron E2E. On `main`, successful validation is followed by packaging, executable smoke, and publication of the `autobuild` app and digest metadata. [Live OKX integration](.github/workflows/okx-live.yml) runs separately on a schedule or manual dispatch and records endpoint diagnostics to distinguish external unavailability from integration failures. Benchmarks can be run locally as needed.
 
-[GitHub Actions](.github/workflows/release.yml) runs tests, live OKX integration, and benchmarks for pushes to `main`, then packages the app and publishes the `autobuild` release with its digest metadata.
+## Help and contributions
 
-Before contributing, read [AGENTS.md](AGENTS.md). Keep data access behind the preload bridge, reuse shared components and design tokens, and run checks relevant to the change. Report bugs through [GitHub Issues](https://github.com/notCorwin/Perpetual-Swap-Suite/issues) with reproduction steps, macOS version, and the relevant error or data gap.
+Read [AGENTS.md](AGENTS.md) before contributing. Keep market access behind the desktop bridge, reuse shared components and design tokens, and test core behavior relevant to the change. See the [improvement plan](docs/IMPROVEMENT_PLAN.md) and [implementation status](docs/IMPLEMENTATION.md) for the original assessment and implementation evidence.
+
+Report bugs through [GitHub Issues](https://github.com/notCorwin/Perpetual-Swap-Suite/issues), including reproduction steps, macOS version, and the affected contract, timeframe, or data range. Repository maintainers and contributors review changes through GitHub.

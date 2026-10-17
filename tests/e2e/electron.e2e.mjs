@@ -145,7 +145,7 @@ test('Radar has no Research or Strategy workspace or desktop operations', async 
     { previewWindowBlur: 20 },
     { windowTint: '#ffffff' },
     { rocPeriod: 9, marocPeriod: 9, timeframe: '5m', sinceRevision: -1 },
-  ]) await assert.rejects(() => request(value), /Unsupported desktop bridge operation/)
+  ]) await assert.rejects(() => request(value), /Invalid desktop bridge request/)
   const current = await request({ snapshot: { timeframe: '5m', sinceRevision: -1 } })
   assert.equal(current.timeframe, previous.timeframe)
   for (const key of ['filterMetricsCatalog', 'filterFunctions', 'filterFunctionCatalog', 'filterLibraryPreferences',

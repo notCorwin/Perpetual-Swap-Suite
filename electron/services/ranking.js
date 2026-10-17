@@ -1,3 +1,5 @@
+import { signedRelativeChange } from './market-metrics.js'
+
 const FIVE_MINUTES_MS = 300_000
 
 const unavailable = () => ({ rankingChange: null, rankingAsOf: null })
@@ -46,12 +48,7 @@ export function rankingFromCandles(candles, lookbackMinutes, asOf) {
   const baseline = path.get(baselineOpen)
   if (baseline === 0) return unavailable()
   const current = path.get(latestOpen)
-  const difference = current - baseline
-  // Opposite finite extremes can overflow subtraction even when their relative
-  // change is finite. Divide first only in that case to preserve ordinary deltas.
-  const rankingChange = (Number.isFinite(difference)
-    ? difference / Math.abs(baseline)
-    : current / Math.abs(baseline) - Math.sign(baseline)) * 100
+  const rankingChange = signedRelativeChange(current, baseline)
   return Number.isFinite(rankingChange) ? { rankingChange, rankingAsOf } : unavailable()
 }
 

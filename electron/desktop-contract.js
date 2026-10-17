@@ -1,3 +1,5 @@
+import { validatePreferenceFields } from './services/preferences.js'
+
 const TIMEFRAMES = ['5m', '15m', '1H']
 
 export class DesktopRequestError extends Error {
@@ -116,8 +118,9 @@ function preferences(value) {
     if (input % 5 !== 0) invalid(`${valuesPath}.rankingLookback`, 'must be a multiple of 5 minutes')
     return input
   })
-  optional(result, values, 'historyDays', input => number(input, `${valuesPath}.historyDays`, 1, Number.MAX_SAFE_INTEGER, true))
+  optional(result, values, 'historyDays', input => number(input, `${valuesPath}.historyDays`, 1, 3650, true))
   optional(result, values, 'liquidity', liquidity)
+  try { validatePreferenceFields(result, true) } catch { invalid(valuesPath, 'must satisfy the preference schema') }
   return { action, values: result }
 }
 
@@ -168,7 +171,7 @@ function e2e(value) {
 function candle(value, index) {
   const path = `e2e.candles[${index}]`
   const base = ['instrument', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'confirmed']
-  const extras = ['quoteVolume', 'oi', 'buy', 'sell', 'statisticsVersion', 'statisticsOIExpiresAt', 'statisticsTakerExpiresAt']
+  const extras = ['baseVolume', 'quoteVolume', 'oi', 'buy', 'sell', 'statisticsVersion', 'statisticsOIExpiresAt', 'statisticsTakerExpiresAt']
   record(value, path, [...base, ...extras], base)
   const result = {
     instrument: text(value.instrument, `${path}.instrument`, { maximum: 256 }), timeframe: choice(value.timeframe, `${path}.timeframe`, TIMEFRAMES),

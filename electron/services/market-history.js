@@ -265,7 +265,7 @@ export class MarketHistory {
     await this.ready
     this.assertOpen()
     const tasks = await Promise.all(Object.keys(CANDLE_INTERVALS).map(timeframe => this.sync.enqueueTarget({
-      instrument: instId, timeframe, source: 'candles', historyDays, warmupCandles: 199, asOf, priority: 'background',
+      instrument: instId, timeframe, source: 'candles', historyDays, warmupCandles: 200, asOf, priority: 'background',
     })))
     // Statistics depend on durable price rows. Admit those source tasks after
     // their corresponding price target, without making callers await 30 days.

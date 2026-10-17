@@ -1,5 +1,5 @@
-export type ChartCaptureBounds = { x: number; y: number; width: number; height: number; backgroundRGB: number[] }
-export type ChartImage = { imageDataURL: string; width: number; height: number }
+import type { ChartCaptureBounds } from './desktop-contract.ts'
+export type { ChartCaptureBounds, ChartImage } from './desktop-contract.ts'
 
 export function chartCaptureBounds(element: HTMLElement): ChartCaptureBounds {
   const rect = element.getBoundingClientRect()

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 const intervals = { '5m': 300_000, '15m': 900_000, '1H': 3_600_000 }
 const statuses = new Set(['queued', 'running', 'retry', 'paused', 'cancelled', 'completed', 'unavailable'])
 const terminal = new Set(['paused', 'cancelled', 'completed', 'unavailable'])
+const expirable = new Set(['cancelled', 'completed', 'unavailable'])
 const foregroundReady = Symbol('Foreground history is ready for the source lane.')
 const clone = value => structuredClone(value)
 const integer = (value, name, minimum = 0) => {
@@ -74,6 +75,7 @@ export class HistorySync {
     this.retryBaseMS = integer(options.retryBaseMS ?? 1_000, 'retryBaseMS', 1)
     this.maxRetryDelayMS = integer(options.maxRetryDelayMS ?? 300_000, 'maxRetryDelayMS', this.retryBaseMS)
     this.maxAttempts = integer(options.maxAttempts ?? 5, 'maxAttempts', 1)
+    this.maxRetainedTerminalTasks = integer(options.maxRetainedTerminalTasks ?? 512, 'maxRetainedTerminalTasks', 1)
     if (this.minRequestIntervalMS > 2_147_483_647 || this.maxRetryDelayMS > 2_147_483_647) throw new TypeError('History delays cannot exceed 2147483647 milliseconds.')
     this.tasks = new Map()
     this.waiters = new Map()
@@ -129,6 +131,7 @@ export class HistorySync {
         await this.save(task)
       }
     }
+    await this.pruneTerminalTasks()
   }
 
   async enqueue(input) {
@@ -204,6 +207,7 @@ export class HistorySync {
     if (this.active?.id === task.id) this.active.controller.abort()
     await this.save(task)
     this.settle(task)
+    await this.pruneTerminalTasks()
     this.kick()
     return clone(task)
   }
@@ -266,6 +270,28 @@ export class HistorySync {
     return persistence.then(() => {
       try { Promise.resolve(this.onProgress?.(clone(snapshot))).catch(() => undefined) } catch { /* Observers cannot interrupt synchronization. */ }
     })
+  }
+
+  pruneTerminalTasks() {
+    // Coordination checkpoints are not historical market data. Retain a
+    // bounded recent result history; Parquet remains the coverage authority
+    // when an expired target is requested again.
+    const persistence = this.persistTail.then(async () => {
+      const candidates = [...this.tasks.values()].reverse().filter(task => expirable.has(task.status)
+        && task.id !== this.active?.id && !this.waiters.has(task.id))
+        .sort((left, right) => right.updatedAt - left.updatedAt || right.createdAt - left.createdAt)
+      for (const task of candidates.slice(this.maxRetainedTerminalTasks)) {
+        if (this.tasks.get(task.id) !== task || !expirable.has(task.status)
+          || task.id === this.active?.id || this.waiters.has(task.id)) continue
+        // Remove before awaiting persistence so a concurrent enqueue creates a
+        // fresh task whose save is ordered after this deletion.
+        this.tasks.delete(task.id)
+        try { await this.metadata.deleteSyncTask(task.id) }
+        catch (error) { if (!this.tasks.has(task.id)) this.tasks.set(task.id, task); throw error }
+      }
+    })
+    this.persistTail = persistence.catch(() => undefined)
+    return persistence
   }
 
   validateCursor(cursor) {
@@ -442,6 +468,7 @@ export class HistorySync {
     } finally {
       this.active = null
       this.settle(task)
+      await this.pruneTerminalTasks()
     }
   }
 

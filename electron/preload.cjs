@@ -7,7 +7,4 @@ ipcRenderer.on('radar:gateway-stream', (_event, detail) => {
 ipcRenderer.on('radar:chart-prepared', (_event, detail) => {
   window.dispatchEvent(new CustomEvent('radar-chart-prepared', { detail }))
 })
-// Preserve the existing renderer contract while keeping ipcRenderer out of
-// the untrusted page context. New renderer code should use window.radarDesktop.
 contextBridge.exposeInMainWorld('radarDesktop', { request })
-contextBridge.exposeInMainWorld('webkit', { messageHandlers: { radar: { postMessage: request } } })

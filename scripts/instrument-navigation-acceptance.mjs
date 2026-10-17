@@ -225,12 +225,23 @@ export async function exerciseInstrumentNavigation(electron, page, fixture) {
     const before = selectionRequests(await navigationRequests(electron)).length
     const result = await measureNavigation(page, trigger, options)
     const after = selectionRequests(await navigationRequests(electron)).length
-    assert.equal(after - before, 0, 'A prewarmed selection must not wait for chartLocal/chartWindow IPC.')
+    assert.equal(after - before, 0, `A prewarmed selection must not wait for chartLocal/chartWindow IPC: ${JSON.stringify({ result, requests: selectionRequests(await navigationRequests(electron)).slice(before) })}`)
     assert.ok(result.framesToCommit <= 1, `${result.instId} needed ${result.framesToCommit} animation frames to switch.`)
     return { ...result, selectionIPC: after - before }
   }
   for (const timeframe of [fixture.timeframe, ...fixture.timeframes.filter(frame => frame !== fixture.timeframe)]) {
     await page.locator('[data-market-list] [aria-label^="View "]').first().waitFor({ state: 'visible' })
+    // Switching periods releases the renderer's previous universe. A readiness
+    // event from an earlier visit does not prove that the new visit is warm.
+    if (await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-timeframe') !== timeframe) {
+      await electron.evaluate((_electron, frame) => {
+        const ready = globalThis.__instrumentNavigationProbe.ready
+        for (const key of ready) if (key.startsWith(`${frame}:`)) ready.delete(key)
+      }, timeframe)
+      await page.evaluate(frame => {
+        for (const key of window.__navigationPrepared) if (key.startsWith(`${frame}:`)) window.__navigationPrepared.delete(key)
+      }, timeframe)
+    }
     await selectTimeframe(page, timeframe)
     await assertWorkspaceLayout(page)
     const prewarm = await waitForUniverseReady(electron, page, fixture, timeframe)

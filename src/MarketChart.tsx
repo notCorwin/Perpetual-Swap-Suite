@@ -264,6 +264,7 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
         const itemStart = cursor
         cursor += widths[index] + gap
         return <g key={label} transform={`translate(${itemStart},0)`}>
+        {key === "taker" && <line data-chart-legend-outline={label} x1="0" x2="18" stroke="var(--foreground)" strokeWidth="3.5" strokeDasharray={dash} />}
         <line data-chart-legend={label} x1="0" x2="18" stroke={color} strokeWidth="2" strokeDasharray={dash} />
         <text x="26" dominantBaseline="middle" fill="var(--muted-foreground)">{label}</text>
         <text x={26 + legendWidth(label) + 10} dominantBaseline="middle" fill="var(--foreground)">{value}</text>
@@ -295,6 +296,7 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
       return <g key={tick}><line x1={columns.price[0]} x2={right} y1={tickY} y2={tickY} stroke="var(--border)" strokeOpacity="0.35" />{(tickY + tickHalfHeight < priceTagY || tickY - tickHalfHeight > priceTagY + scaledTagHeight) && lineLabel(axisStarts.price, tickY, axisPrice.format(tick))}</g>
     })}
     <line x1={right} x2={right} y1={panels.price[0]} y2={panels.taker[1]} stroke="var(--border)" strokeWidth="1" opacity="0.8" />
+    {tag.inViewport && <line data-chart-live-price-outline x1={columns.price[0]} x2={right + tagOffset * tagScale} y1={latestY} y2={latestY} stroke="var(--foreground)" strokeWidth="2.4" strokeDasharray="4 5" />}
     {tag.inViewport && <line data-chart-live-price x1={columns.price[0]} x2={right + tagOffset * tagScale} y1={latestY} y2={latestY} stroke={latestColor} strokeWidth="1.2" strokeDasharray="4 5" />}
     <path d={upWicks.join(" ")} fill="none" stroke="var(--foreground)" strokeWidth="2.2" />
     <path d={upWicks.join(" ")} fill="none" stroke="var(--positive)" strokeWidth="1.2" />
@@ -303,8 +305,8 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
     <path data-chart-candle-direction="up" data-chart-candle-fill="hollow" d={upBodies.join(" ")} fill="var(--chart-surface)" stroke="var(--positive)" strokeWidth="1.2" />
     <path data-chart-candle-direction="down" data-chart-candle-fill="solid" d={downBodies.join(" ")} fill="var(--negative)" />
     <g data-chart-taker={takerComplete ? "complete" : takerAvailable ? "partial" : "empty"} data-chart-taker-state={takerState}>
-      <path data-chart-taker-buy-samples={buys.length} d={buys.join(" ")} fill="var(--positive)" opacity="0.9" />
-      <path data-chart-taker-sell-samples={sells.length} d={sells.join(" ")} fill="var(--negative)" opacity="0.9" />
+      <path data-chart-taker-buy-samples={buys.length} d={buys.join(" ")} fill="var(--positive)" stroke="var(--foreground)" strokeWidth="0.7" opacity="0.9" />
+      <path data-chart-taker-sell-samples={sells.length} d={sells.join(" ")} fill="var(--negative)" stroke="var(--foreground)" strokeWidth="0.7" opacity="0.9" />
       <path d={sells.join(" ")} fill="url(#sell-hatch)" opacity="0.7" />
     </g>
     {lineStroke("bollUpper", priceLine("bollUpper"), "var(--chart-1)", indicatorWidth)}

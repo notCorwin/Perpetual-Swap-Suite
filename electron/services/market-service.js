@@ -994,7 +994,7 @@ export class MarketService {
       const preferences = this.prefs(), targets = []
       for (const instrument of this.instruments.values()) for (const timeframe of LIST_TIMEFRAMES) {
         const step = timeframeMilliseconds(timeframe), through = closedBoundary(timeframe) - step
-        const listedAt = Number(instrument.listTime), horizon = Math.max(0, through - preferences.historyDays * 86_400_000 + step - 199 * step)
+        const listedAt = Number(instrument.listTime), horizon = Math.max(0, through - preferences.historyDays * 86_400_000 + step - 200 * step)
         const from = Number.isFinite(listedAt) && listedAt > 0 ? Math.max(horizon, Math.ceil(listedAt / step) * step) : horizon
         if (from <= through) targets.push({ instrument: instrument.instId, timeframe, source: 'candles', from, through })
       }

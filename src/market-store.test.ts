@@ -43,21 +43,6 @@ test('candles normalize numeric statistics from heterogeneous Parquet parts', as
   } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-test('catalog snapshots atomically round-trip through their Parquet cache', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-store-'))
-  let store = await MarketStore.open(root)
-  const first = { schemaVersion: 1, liquidityPolicyVersion: 1, criteriaKey: 'hourlyVolumeStabilityEnabled=1', savedAt: 1_700_000_000_000, entries: [{ instrument: { instId: 'BTC-USDT-SWAP' }, ticker: { last: '100' }, result: { turnover: 40_000_000 }, change24h: 2.5 }] }
-  const second = { ...first, savedAt: first.savedAt + 1, entries: [{ instrument: { instId: 'ETH-USDT-SWAP' }, ticker: { last: '200' }, result: { turnover: 50_000_000 }, change24h: -3.5 }] }
-  try {
-    await store.writeCatalogSnapshot(first)
-    assert.deepEqual(await store.readCatalogSnapshot(), first)
-    await store.writeCatalogSnapshot(second)
-    await store.close()
-    store = await MarketStore.open(root)
-    assert.deepEqual(await store.readCatalogSnapshot(), second)
-  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
 test('close drains work already admitted to the DuckDB lane and rejects new work', async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-store-'))
   const store = await MarketStore.open(root)

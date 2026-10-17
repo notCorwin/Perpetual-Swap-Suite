@@ -1,15 +1,19 @@
 import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
 import { mkdirSync } from 'node:fs'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { readFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { parseDesktopRequest } from './desktop-contract.js'
+import { createDesktopSecurity } from './desktop-security.js'
 import { seedCachedListProjection, seedChartScrollBenchmark, seedHistoricalStatisticsBoundary, seedInstrumentNavigationBenchmark } from './e2e-fixtures.js'
+import { MetadataStore } from './services/metadata-store.js'
 import { MarketStore } from './services/market-store.js'
 import { MarketService } from './services/market-service.js'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
-const rendererURL = process.env.ELECTRON_RENDERER_URL
+const rendererURL = process.env.ELECTRON_RENDERER_URL || undefined
 const testMode = process.env.PERPETUAL_SWAP_E2E === '1'
+// Chromium initializes its profile during ready. Isolate both locations first.
 if (process.env.PERPETUAL_SWAP_USER_DATA) {
   const userData = process.env.PERPETUAL_SWAP_USER_DATA
   const sessionData = join(userData, 'Session')
@@ -17,224 +21,178 @@ if (process.env.PERPETUAL_SWAP_USER_DATA) {
   app.setPath('userData', userData)
   app.setPath('sessionData', sessionData)
 }
+const security = createDesktopSecurity({ rendererURL, rendererFile: join(root, 'dist', 'index.html') })
 const e2eLiveRefresh = testMode && process.env.PERPETUAL_SWAP_E2E_LIVE_REFRESH === '1'
-const settingsFile = () => join(app.getPath('userData'), 'settings.json')
 let window
+let metadata
 let marketStore
 let marketService
-let lastSnapshotTimeframe = '1H'
 const gatewayRequests = new Map()
 let shuttingDown = false
 let shutdownComplete = false
 let startupTask = Promise.resolve()
 
-// Electron E2E tests must never depend on OKX availability or mutate the
-// fixture while the renderer is asserting a loading/partial-data state.
-const offlineE2EFetch = async () => ({
-  status: 200,
-  ok: true,
-  headers: { get: () => null },
-  json: async () => ({ code: '0', data: [] }),
-})
-
-// This test-only fetcher keeps discovery in flight long enough to assert the
-// real startup ordering: cache restoration must render before an online scan
-// settles. It is deliberately opt-in so ordinary deterministic E2E fixtures
-// remain isolated from background network activity.
-const delayedOfflineE2EFetch = async (_input, init = {}) => {
-  const signal = init.signal
+const offlineE2EFetch = async () => ({ status: 200, ok: true, headers: { get: () => null }, json: async () => ({ code: '0', data: [] }) })
+const delayedOfflineE2EFetch = async (_input, { signal } = {}) => {
   await new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(new DOMException('The request was aborted.', 'AbortError')); return }
-    const timer = setTimeout(resolve, 10_000)
-    signal?.addEventListener('abort', () => {
-      clearTimeout(timer)
-      reject(new DOMException('The request was aborted.', 'AbortError'))
-    }, { once: true })
+    const abort = () => { clearTimeout(timer); reject(new DOMException('The request was aborted.', 'AbortError')) }
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve() }, 10_000)
+    signal?.addEventListener('abort', abort, { once: true })
   })
   return offlineE2EFetch()
 }
 
-const defaults = {
-  windowBlurRadius: 64,
-  floatingBlurRadius: 64,
-  frostedBackgroundEnabled: true,
-  frostedBackgroundOpacity: 0.3,
-  hourlyVolumeStabilityEnabled: false,
-}
-let settingsCache = { ...defaults }
-
-async function settings() {
-  try { settingsCache = { ...defaults, ...JSON.parse(await readFile(settingsFile(), 'utf8')) } }
-  catch { settingsCache = { ...defaults } }
-  return settingsCache
+function sendGateway(event, detail) {
+  if (!shuttingDown && !event.sender.isDestroyed()) event.sender.send('radar:gateway-stream', detail)
 }
 
-async function saveSettings(value) {
-  const next = { ...(await settings()), ...value }
-  settingsCache = next
-  await mkdir(dirname(settingsFile()), { recursive: true })
-  await writeFile(settingsFile(), JSON.stringify(next, null, 2), { mode: 0o600 })
-  return next
-}
-
-async function snapshot(timeframe) {
-  const frame = ['5m', '15m', '1H'].includes(timeframe) ? timeframe : lastSnapshotTimeframe
-  lastSnapshotTimeframe = frame
-  const saved = await settings()
-  const market = marketService ? await marketService.snapshot(frame) : { rows: [], revision: 0, error: 'Loading OKX market data…', loading: true, updatedAt: null, listProgress: { total: 0, completed: 0, pending: 0, retrying: 0, unavailable: 0 }, timeframe: frame, catalogSource: 'none' }
-  return {
-    ...Object.fromEntries(Object.keys(defaults).map(key => [key, saved[key]])),
-    rows: market.rows, updatedAt: market.updatedAt, error: market.error, revision: market.revision, timeframe: market.timeframe,
-    listProgress: market.listProgress, loading: market.loading, catalogSource: market.catalogSource,
+async function gatewayFetch(event, { id, body }) {
+  if (gatewayRequests.has(id)) throw new Error('A Gateway request with this ID is already running.')
+  const apiKey = metadata.getAnalysisSettings().apiKey
+  if (!apiKey) throw new Error('Save an AI Gateway API key in Configure analysis before starting analysis.')
+  const controller = new AbortController()
+  let finish
+  const finished = new Promise(resolve => { finish = resolve })
+  const owner = event.sender
+  const abort = () => controller.abort()
+  const navigation = details => { if (details.isMainFrame && !details.isSameDocument) abort() }
+  owner.once('destroyed', abort)
+  owner.on('did-start-navigation', navigation)
+  gatewayRequests.set(id, { controller, finished })
+  const release = () => {
+    owner.removeListener('destroyed', abort)
+    owner.removeListener('did-start-navigation', navigation)
+    gatewayRequests.delete(id)
+    finish()
   }
-}
-
-function headersFor(response) { return Object.fromEntries(response.headers.entries()) }
-
-async function gatewayFetch(event, value) {
-  const { id, body } = value
-  if (typeof id !== 'string' || typeof body !== 'string') throw new Error('Invalid Gateway request.')
-  const controller = new AbortController(); gatewayRequests.set(id, controller)
   try {
-    const saved = await settings()
-    const apiKey = saved.analysis?.apiKey
-    if (!apiKey) throw new Error('Save an AI Gateway API key in Configure analysis before starting analysis.')
-    const response = await fetch('https://ai-gateway.vercel.sh/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }, body, signal: controller.signal })
-    if (!response.body) return { status: response.status, headers: headersFor(response) }
-    void (async () => {
-      const reader = response.body.getReader()
-      try {
-        while (true) {
-          const { done, value: chunk } = await reader.read(); if (done) break
-          event.sender.send('radar:gateway-stream', { id, type: 'data', base64: Buffer.from(chunk).toString('base64') })
-        }
-        event.sender.send('radar:gateway-stream', { id, type: 'end' })
-      } catch (error) {
-        if (!controller.signal.aborted) event.sender.send('radar:gateway-stream', { id, type: 'error', message: error instanceof Error ? error.message : 'Gateway stream interrupted.' })
-      } finally { gatewayRequests.delete(id) }
-    })()
-    return { status: response.status, headers: headersFor(response) }
-  } catch (error) { gatewayRequests.delete(id); throw error }
+    const response = await fetch('https://ai-gateway.vercel.sh/v1/chat/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }, body, signal: controller.signal,
+    })
+    if (response.body) {
+      void (async () => {
+        const reader = response.body.getReader()
+        try {
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            sendGateway(event, { id, type: 'data', base64: Buffer.from(value).toString('base64') })
+          }
+          sendGateway(event, { id, type: 'end' })
+        } catch (error) {
+          if (!controller.signal.aborted) sendGateway(event, { id, type: 'error', message: error instanceof Error ? error.message : 'Gateway stream interrupted.' })
+        } finally { reader.releaseLock(); release() }
+      })()
+    } else release()
+    return { status: response.status, headers: Object.fromEntries(response.headers.entries()) }
+  } catch (error) { release(); throw error }
 }
 
-function unsupported(request) {
-  const operation = Object.keys(request).find(key => !['copyText', 'captureChart', 'analysisSettings', 'windowTintRGB', 'previewWindowBlur'].includes(key)) ?? 'request'
-  throw new Error(`Unsupported desktop bridge operation “${operation}”.`)
-}
-
-async function handleRequest(event, request) {
-  if (!request || typeof request !== 'object') throw new Error('Invalid desktop bridge request.')
-  if ('e2e' in request) {
-    if (!testMode) throw new Error('The E2E desktop API is unavailable outside tests.')
-    if (request.e2e.action === 'smokeStatus') {
-      const build = await readFile(join(process.resourcesPath, 'build-revision.json'), 'utf8').then(JSON.parse).catch(() => null)
-      return { revision: build?.revision ?? null, userData: app.getPath('userData'), preparedWorkerThreadId: marketService?.preparedCharts.worker?.threadId ?? null }
+async function handleRequest(event, payload) {
+  security.assertTrustedSender(event, window)
+  const request = parseDesktopRequest(payload, { allowE2E: testMode })
+  if (shuttingDown) throw new Error('The application is closing.')
+  if (request.preferences) {
+    if (request.preferences.action === 'update') {
+      const previous = metadata.getSettings().preferences
+      metadata.updateSettings(request.preferences.values)
+      await marketService.reconfigure(previous)
     }
-    if (request.e2e.action === 'seedCandles') return { written: await marketStore.appendCandles(request.e2e.candles ?? []) }
-    if (request.e2e.action === 'readCandles') {
-      const { instrument, timeframe, from, through } = request.e2e
-      return marketStore.candles({ instrument, timeframe, from, through })
-    }
-    if (request.e2e.action === 'seedCachedListProjection') return seedCachedListProjection(marketStore, marketService)
-    if (request.e2e.action === 'seedChartScrollBenchmark') return seedChartScrollBenchmark(marketStore, marketService)
-    if (request.e2e.action === 'seedHistoricalStatisticsBoundary') return seedHistoricalStatisticsBoundary(marketStore, marketService)
-    if (request.e2e.action === 'seedInstrumentNavigationBenchmark') return seedInstrumentNavigationBenchmark(marketStore, marketService)
-    if (request.e2e.action === 'settings') return settings()
-    throw new Error('Unknown E2E desktop action.')
+    return metadata.getSettings().preferences
   }
-  if ('rocPeriod' in request) return snapshot(request.timeframe)
-  if ('chartWindow' in request) {
-    const { instId, timeframe, endHour } = request.chartWindow ?? {}
-    if (typeof instId !== 'string' || !['5m', '15m', '1H'].includes(timeframe)
-      || endHour !== undefined && !Number.isSafeInteger(endHour)) throw new Error('Invalid chart window request.')
+  if (request.snapshot) return marketService.snapshot(request.snapshot.timeframe)
+  if (request.dataAudit) return marketService.dataAuditRequest(request.dataAudit)
+  if (request.chartWindow) {
+    const { instId, timeframe, endHour } = request.chartWindow
     return marketService.prepareChartWindow(instId, timeframe, endHour)
   }
-  if ('chartLocal' in request) {
-    const { instId, timeframe } = request.chartLocal ?? {}
-    if (typeof instId !== 'string' || !['5m', '15m', '1H'].includes(timeframe)) throw new Error('Invalid local chart request.')
-    return marketService.localChartWindow(instId, timeframe)
-  }
-  if ('chartUniverse' in request) {
-    const { instIds, timeframe, focusInstId } = request.chartUniverse ?? {}
-    if (!Array.isArray(instIds) || instIds.length > 1_000 || instIds.some(id => typeof id !== 'string')
-      || !['5m', '15m', '1H'].includes(timeframe)
-      || focusInstId !== undefined && typeof focusInstId !== 'string') throw new Error('Invalid chart navigation universe.')
+  if (request.chartLocal) return marketService.localChartWindow(request.chartLocal.instId, request.chartLocal.timeframe)
+  if (request.chartUniverse) {
+    const { instIds, timeframe, focusInstId } = request.chartUniverse
     return marketService.setChartUniverse(instIds, timeframe, focusInstId)
   }
-  if ('gatewayFetch' in request) return gatewayFetch(event, request.gatewayFetch)
-  if ('cancelGatewayFetch' in request) { gatewayRequests.get(request.cancelGatewayFetch)?.abort(); return { ok: true } }
-  if ('copyText' in request) { clipboard.writeText(String(request.copyText)); return { ok: true } }
-  if ('captureChart' in request) {
+  if (request.gatewayFetch) return gatewayFetch(event, request.gatewayFetch)
+  if (request.cancelGatewayFetch) { gatewayRequests.get(request.cancelGatewayFetch)?.controller.abort(); return { ok: true } }
+  if ('copyText' in request) { clipboard.writeText(request.copyText); return { ok: true } }
+  if (request.captureChart) {
     const { x, y, width, height, output } = request.captureChart
-    const image = await event.sender.capturePage({ x, y, width, height })
-    if (output === 'png') return { imageDataURL: `data:image/png;base64,${image.toPNG().toString('base64')}`, width: image.getSize().width, height: image.getSize().height }
-    clipboard.writeImage(image); return { ok: true }
+    const image = await event.sender.capturePage({ x: Math.floor(x), y: Math.floor(y), width: Math.ceil(x + width) - Math.floor(x), height: Math.ceil(y + height) - Math.floor(y) })
+    if (output === 'png') return { imageDataURL: `data:image/png;base64,${image.toPNG().toString('base64')}`, ...image.getSize() }
+    clipboard.writeImage(image)
+    return { ok: true }
   }
-  if ('analysisSettings' in request) {
-    const current = await settings()
+  if (request.analysisSettings) {
     const action = request.analysisSettings
-    if (action.action === 'save') {
-      await saveSettings({ analysis: { model: action.model, apiKey: action.apiKey } })
-      return { model: action.model, hasAPIKey: Boolean(action.apiKey) }
-    }
-    if (action.action === 'removeKey') {
-      await saveSettings({ analysis: { model: current.analysis?.model ?? '', apiKey: '' } })
-      return { model: current.analysis?.model ?? '', hasAPIKey: false }
-    }
-    return { model: current.analysis?.model ?? '', hasAPIKey: Boolean(current.analysis?.apiKey) }
+    if (action.action === 'save') metadata.updateAnalysisSettings({ model: action.model, apiKey: action.apiKey })
+    if (action.action === 'removeKey') metadata.updateAnalysisSettings({ apiKey: '' })
+    const current = metadata.getAnalysisSettings()
+    return { model: current.model ?? '', hasAPIKey: Boolean(current.apiKey) }
   }
-  if ('windowTintRGB' in request || 'previewWindowBlur' in request) return { ok: true }
-  const keys = Object.keys(request)
-  if (keys.length && keys.every(key => Object.hasOwn(defaults, key))) {
-    await saveSettings(request)
-    if ('hourlyVolumeStabilityEnabled' in request) marketService?.invalidate()
-    return snapshot()
+  if (request.e2e) {
+    const value = request.e2e
+    switch (value.action) {
+      case 'smokeStatus': {
+        const build = await readFile(join(process.resourcesPath, 'build-revision.json'), 'utf8').then(JSON.parse).catch(() => null)
+        return { revision: build?.revision ?? null, userData: app.getPath('userData'), preparedWorkerThreadId: marketService.preparedCharts.worker?.threadId ?? null }
+      }
+      case 'seedCandles': return { written: await marketStore.appendCandles(value.candles) }
+      case 'readCandles': return marketStore.candles(value)
+      case 'seedCachedListProjection': return seedCachedListProjection(marketStore, marketService)
+      case 'seedChartScrollBenchmark': return seedChartScrollBenchmark(marketStore, marketService)
+      case 'seedHistoricalStatisticsBoundary': return seedHistoricalStatisticsBoundary(marketStore, marketService)
+      case 'seedInstrumentNavigationBenchmark': return seedInstrumentNavigationBenchmark(marketStore, marketService)
+      case 'settings': return metadata.getSettings().preferences
+    }
   }
-  return unsupported(request)
+  throw new Error('Unsupported desktop request.')
 }
 
 async function createWindow() {
-  if (shuttingDown) return
+  if (shuttingDown || window && !window.isDestroyed()) return
   window = new BrowserWindow({
-    width: 1440, height: 900, minWidth: 400, minHeight: 300,
-    title: 'Perpetual Swap Suite',
-    backgroundColor: '#101114',
-    show: !testMode,
+    width: 1600, height: 1000, minWidth: 400, minHeight: 300,
+    title: 'Perpetual Swap Suite', backgroundColor: '#101114', show: !testMode,
     webPreferences: { preload: join(root, 'electron', 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
+  })
+  window.webContents.on('will-navigate', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
+  window.webContents.on('will-redirect', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
+  window.webContents.on('will-frame-navigate', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    if (security.isAllowedExternalURL(url)) void shell.openExternal(url).catch(error => console.error('Could not open external link:', error))
+    return { action: 'deny' }
   })
   if (rendererURL) await window.loadURL(rendererURL)
   else await window.loadFile(join(root, 'dist', 'index.html'))
-  window.webContents.setWindowOpenHandler(({ url }) => { void shell.openExternal(url); return { action: 'deny' } })
 }
 
 async function startDesktop() {
-  // Discovery begins before the renderer's first snapshot, so hydrate the
-  // persisted liquidity criteria before it decides which contracts belong in
-  // the catalogue.
-  await settings()
+  const userData = app.getPath('userData')
+  metadata = await MetadataStore.open(userData, { legacySettingsPath: join(userData, 'settings.json') })
   if (shuttingDown) return
-  marketStore = await MarketStore.open(join(app.getPath('userData'), 'MarketData'))
+  marketStore = await MarketStore.open(join(userData, 'MarketData'))
   if (shuttingDown) return
-  marketService = new MarketService(
-    marketStore,
-    () => ({ hourlyVolumeStabilityEnabled: settingsCache.hourlyVolumeStabilityEnabled }),
-    testMode ? e2eLiveRefresh ? delayedOfflineE2EFetch : offlineE2EFetch : fetch,
-    !testMode,
-  )
+  marketService = new MarketService(marketStore, () => metadata.getSettings().preferences,
+    testMode ? e2eLiveRefresh ? delayedOfflineE2EFetch : offlineE2EFetch : fetch, !testMode, { metadata })
+  await marketService.ready
+  if (shuttingDown) return
   marketService.subscribePreparedCharts(frame => {
     if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('radar:chart-prepared', frame)
   })
-  ipcMain.handle('radar:request', handleRequest)
   await marketService.restoreCatalog()
   if (shuttingDown) return
-  if (!testMode || e2eLiveRefresh) void marketService.refresh()
+  ipcMain.handle('radar:request', handleRequest)
+  if (!testMode || e2eLiveRefresh) void marketService.refresh().catch(error => console.error('Market refresh failed:', error))
   await createWindow()
-  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) void createWindow() })
 }
+
 app.whenReady().then(() => {
   if (!shuttingDown) startupTask = startDesktop()
   return startupTask
 }).catch(error => { console.error('Desktop startup failed:', error); app.quit() })
+app.on('activate', () => {
+  if (app.isReady() && !shuttingDown && BrowserWindow.getAllWindows().length === 0) void startupTask.then(createWindow).catch(error => console.error('Could not open application window:', error))
+})
 app.on('before-quit', event => {
   if (shutdownComplete) return
   event.preventDefault()
@@ -243,15 +201,16 @@ app.on('before-quit', event => {
   ipcMain.removeHandler('radar:request')
   void (async () => {
     try {
+      for (const { controller } of gatewayRequests.values()) controller.abort()
+      await Promise.allSettled([...gatewayRequests.values()].map(value => value.finished))
       await startupTask.catch(error => console.error('Desktop startup did not complete:', error))
       try { await marketService?.dispose() }
-      finally { await marketStore?.close() }
-    } catch (error) {
-      console.error('Desktop shutdown failed:', error)
-    } finally {
-      shutdownComplete = true
-      app.quit()
-    }
+      finally {
+        try { await marketStore?.close() }
+        finally { metadata?.close() }
+      }
+    } catch (error) { console.error('Desktop shutdown failed:', error) }
+    finally { shutdownComplete = true; app.quit() }
   })()
 })
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })

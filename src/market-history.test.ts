@@ -173,7 +173,7 @@ test('REST initialization admits two explicit observations and leaves gap covera
   } finally { await history.close() }
 })
 
-test('background targets include all timeframes plus 199 warmup bars and return before source completion', async () => {
+test('background targets include all timeframes plus 200 warmup bars and return before source completion', async () => {
   let started!: () => void
   const entered = new Promise<void>(resolve => { started = resolve })
   const { history } = setup({ now: () => base + 40 * day, get: async (_path, _parameters, signal) => {
@@ -187,7 +187,7 @@ test('background targets include all timeframes plus 199 warmup bars and return 
       assert.ok(warmup)
       const step = intervals[task.timeframe]
       assert.equal(task.through - task.from + step, 30 * day)
-      assert.equal(warmup.through - warmup.from + step, 199 * step)
+      assert.equal(warmup.through - warmup.from + step, 200 * step)
       assert.equal(warmup.through, task.from - step)
     }
     await entered
