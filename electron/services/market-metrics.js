@@ -15,7 +15,7 @@ const emptyBreak = { status: 'insufficient-history' }
 const noBreak = { status: 'none' }
 const timestamp = bar => finite(bar?.hour ?? bar?.timestamp)
 const width = bar => {
-  const upper = finite(bar?.logBBUpper), middle = finite(bar?.logBBMiddle), lower = finite(bar?.logBBLower)
+  const upper = finite(bar?.bollUpper), middle = finite(bar?.bollMiddle), lower = finite(bar?.bollLower)
   return upper === null || middle === null || lower === null || middle <= 0 ? null : (upper - lower) / middle * 100
 }
 
@@ -80,7 +80,7 @@ export function summarizeMarketBars(source) {
     oiChange: signedRelativeChange(latest?.oi, previous?.oi),
     highBreakout: recentBreak(bars, 48, 'high'), lowBreakdown: recentBreak(bars, 48, 'low'),
     highBreakout96: recentBreak(bars, 96, 'high'), lowBreakdown96: recentBreak(bars, 96, 'low'),
-    logBBExpansion: bandwidthExpansion(bars),
+    bollExpansion: bandwidthExpansion(bars),
     priorHigh48: prior(48, 'high', 'high'), priorLow48: prior(48, 'low', 'low'),
     priorHigh96: prior(96, 'high', 'high'), priorLow96: prior(96, 'low', 'low'),
   }
@@ -101,15 +101,15 @@ export function evaluateMarketOpportunity(input) {
   const direction = input.ema200Signal === 'Long' || input.ema200Signal === 'Short' ? input.ema200Signal : null
   const price = finite(input.priceChange), roc = finite(input.roc), maroc = finite(input.maroc)
   const rsi6 = finiteInRange(input.rsi6, 0, 100), rsi12 = finiteInRange(input.rsi12, 0, 100), rsi24 = finiteInRange(input.rsi24, 0, 100)
-  const band = input.logBBAboveBand == null ? undefined : bandRank[input.logBBAboveBand]
-  const expansion = input.logBBExpansion
+  const band = input.bollAboveBand == null ? undefined : bandRank[input.bollAboveBand]
+  const expansion = input.bollExpansion
   const validExpansion = expansion != null && Number.isSafeInteger(expansion.hours) && expansion.hours >= 0 && typeof expansion.complete === 'boolean' ? expansion : null
   const taker = finiteInRange(input.takerRatio, -100, 100), oi = finite(input.oiChange)
   const missing = []
   if (direction === null && input.ema200Signal !== 'Unsure') missing.push('EMA200 is unavailable or invalid.')
   for (const [label, value] of [['Price change', price], ['ROC', roc], ['MAROC', maroc], ['RSI6', rsi6], ['RSI12', rsi12], ['RSI24', rsi24]]) if (value === null) missing.push(`${label} is unavailable or invalid.`)
-  if (typeof band !== 'number') missing.push('Log BB position is unavailable or invalid.')
-  if (validExpansion === null) missing.push('Log BB expansion is unavailable or invalid.')
+  if (typeof band !== 'number') missing.push('BOLL(20, 2) position is unavailable or invalid.')
+  if (validExpansion === null) missing.push('BOLL(20, 2) expansion is unavailable or invalid.')
   const optionalReasons = []
   if (taker === null) optionalReasons.push('Taker imbalance is unavailable or invalid; its participation bonus is zero.')
   if (oi === null) optionalReasons.push('OI change is unavailable or non-finite; its participation bonus is zero.')
@@ -135,7 +135,7 @@ export function evaluateMarketOpportunity(input) {
   if (directionalMAROC > 0) reasons.push('MAROC supports the direction.')
   if (slow > 50) reasons.push('RSI24 supports the direction.')
   if (setup === 'Startup') reasons.push('Startup: strengthening momentum with a complete 1–3h expansion.')
-  else if (setup === 'Pullback') reasons.push('Pullback: RSI cooling inside Log BB with price and taker confirmation.')
+  else if (setup === 'Pullback') reasons.push('Pullback: RSI cooling inside BOLL(20, 2) with price and taker confirmation.')
   else reasons.push('No Startup or Pullback setup matches the live readings.')
   if (priceConfirms && takerConfirms) reasons.push('Price and taker flow both confirm the direction.')
   else if (priceConfirms || takerConfirms) reasons.push(`Only ${priceConfirms ? 'price' : 'taker flow'} confirms the direction.`)
@@ -158,7 +158,7 @@ export function evaluateMarketOpportunity(input) {
   let penalty = 0
   if (fast >= 70) { penalty += 10; reasons.push(`RSI6 ${direction === 'Long' ? '≥ 70' : '≤ 30'}: fast momentum is stretched (−10).`) }
   if (medium >= 65) { penalty += 10; reasons.push(`RSI12 ${direction === 'Long' ? '≥ 65' : '≤ 35'}: medium momentum is stretched (−10).`) }
-  if (position === 3) { penalty += 10; reasons.push(`Price is ${direction === 'Long' ? 'above the upper' : 'at or below the lower'} Log BB band (−10).`) }
+  if (position === 3) { penalty += 10; reasons.push(`Price is ${direction === 'Long' ? 'above the upper' : 'at or below the lower'} BOLL(20, 2) band (−10).`) }
   if (hours >= 4) { penalty += 10; reasons.push(`Expansion has lasted ${complete ? '' : 'at least '}${hours}h (−10).`) }
   const extremeRSI = fast >= 80 && medium >= 70, stretchedBand = position === 3 && fast >= 75, extendedBand = position === 3 && hours >= 6 && medium >= 65
   const overheated = extremeRSI || stretchedBand || extendedBand

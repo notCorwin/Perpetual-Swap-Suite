@@ -1,10 +1,10 @@
 import type { BreakResult } from "./market-breaks.ts"
-import { logBBBandRank, type BandWidthExpansion, type LogBBAboveBand } from "./market-logbb.ts"
+import { bollBandRank, type BandWidthExpansion, type BollingerAboveBand } from "./market-bollinger.ts"
 import { percentageNumber, type PercentageValue } from "./market-percent.ts"
 import { opportunityStatusRank, type OpportunityResult } from "./market-opportunity.ts"
 
 export type EMA200Signal = "Long" | "Short" | "Unsure"
-export type SortKey = "opportunity" | "turnover24hUSDT" | "highBreakout" | "highBreakoutPriorAge" | "lowBreakdown" | "lowBreakdownPriorAge" | "takerRatio" | "oiChange" | "roc" | "maroc" | "rsi6" | "rsi12" | "rsi24" | "logBBAboveBand" | "logBBExpansion"
+export type SortKey = "opportunity" | "turnover24hUSDT" | "highBreakout" | "highBreakoutPriorAge" | "lowBreakdown" | "lowBreakdownPriorAge" | "takerRatio" | "oiChange" | "roc" | "maroc" | "rsi6" | "rsi12" | "rsi24" | "bollAboveBand" | "bollExpansion"
 
 export type SortableRow = {
   instId: string
@@ -18,8 +18,8 @@ export type SortableRow = {
   rsi6: number | null
   rsi12: number | null
   rsi24: number | null
-  logBBAboveBand: LogBBAboveBand | null
-  logBBExpansion: BandWidthExpansion | null
+  bollAboveBand: BollingerAboveBand | null
+  bollExpansion: BandWidthExpansion | null
   opportunity?: OpportunityResult
 }
 
@@ -52,8 +52,8 @@ function sortValue(row: SortableRow, key: Exclude<SortKey, "opportunity">): numb
     case "lowBreakdown": return row.lowBreakdown.status === "event" ? row.lowBreakdown.hoursAgo : null
     case "highBreakoutPriorAge": return row.highBreakout.status === "event" ? row.highBreakout.priorAgeHours : null
     case "lowBreakdownPriorAge": return row.lowBreakdown.status === "event" ? row.lowBreakdown.priorAgeHours : null
-    case "logBBAboveBand": return row.logBBAboveBand === null ? null : logBBBandRank[row.logBBAboveBand]
-    case "logBBExpansion": return row.logBBExpansion?.hours ?? null
+    case "bollAboveBand": return row.bollAboveBand === null ? null : bollBandRank[row.bollAboveBand]
+    case "bollExpansion": return row.bollExpansion?.hours ?? null
     case "oiChange":
     case "roc":
     case "maroc": return percentageNumber(row[key])

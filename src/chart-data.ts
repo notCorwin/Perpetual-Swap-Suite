@@ -6,7 +6,7 @@ export type Bar = {
   statisticsSources?: number
   statisticsObserved?: boolean
   indicatorsObserved?: boolean
-  vwap: number | null; ema: number | null; logBBUpper: number | null; logBBMiddle: number | null; logBBLower: number | null
+  vwap: number | null; ema: number | null; bollUpper: number | null; bollMiddle: number | null; bollLower: number | null
   roc: PercentageValue; maroc: PercentageValue; rsi6: number | null; rsi12: number | null; rsi24: number | null
   oi: number | null; buy: number | null; sell: number | null
   oiUnavailableReason?: 'outside-retention' | 'not-published'

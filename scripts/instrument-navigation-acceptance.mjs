@@ -98,7 +98,7 @@ export async function startNavigationPaintProbe(page, fixture) {
   await page.evaluate(instruments => {
     const oracles = new Map(instruments.map(instrument => [instrument.instId,
       new Map(Object.entries(instrument.series).map(([timeframe, series]) => [timeframe, { intervalMS: series.intervalMS, bars: new Map(series.bars.map(bar => [bar.hour, bar])) }]))]))
-    const fields = ['open', 'high', 'low', 'close', 'ema', 'vwap', 'logBBUpper', 'logBBMiddle', 'logBBLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell']
+    const fields = ['open', 'high', 'low', 'close', 'ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell']
     const probe = { active: true, frames: 0, paints: 0, minimumBars: Infinity, violations: [], commits: [], previous: null, presentedSurface: null, raf: null, observer: null }
     const fail = message => { if (probe.violations.length < 20) probe.violations.push(message) }
     const sample = (presentedFrame = false) => {

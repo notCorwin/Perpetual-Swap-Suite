@@ -10,7 +10,7 @@ const response = (data: unknown) => new Response(JSON.stringify({ code: '0', dat
 const hourly = Array.from({ length: 24 }, (_, index) => [String(1_700_000_000_000 + index * 3_600_000), '99', '101', '98', '100', '1', '1000', '100000', '1'])
 const fiveMinutes = 300_000
 const hour = 3_600_000
-const rawCandle = (timestamp: number, close = 100) => ({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp, open: close - 1, high: close + 1, low: close - 2, close, volume: 1, quoteVolume: close, confirmed: true })
+const rawCandle = (timestamp: number, close = 100) => ({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp, open: close - 1, high: close + 1, low: close - 2, close, volume: 1, baseVolume: 1, quoteVolume: close, confirmed: true })
 const nativeCandle = (timestamp: number, timeframe: '5m' | '15m' | '1H', close = 100) => ({ ...rawCandle(timestamp, close), timeframe })
 const okxCandle = (value: ReturnType<typeof rawCandle>) => [String(value.timestamp), String(value.open), String(value.high), String(value.low), String(value.close), String(value.volume), '1', String(value.quoteVolume), '1']
 const waitFor = async (condition: () => boolean | Promise<boolean>, timeout = 2_000) => {
@@ -456,10 +456,10 @@ test('a persisted liquid catalog restores a base list immediately and projects c
     await store.close()
 
     store = await MarketStore.open(root)
-    const originalCoverage = store.coverage.bind(store)
+    const originalCoverage = store.candles.bind(store)
     const cacheProjectionGate = new Promise<void>(resolve => { releaseCacheProjection = resolve })
     let cacheProjectionStarted = false
-    store.coverage = async (...arguments_) => {
+    store.candles = async (...arguments_) => {
       cacheProjectionStarted = true
       await cacheProjectionGate
       return originalCoverage(...arguments_)
@@ -537,10 +537,10 @@ test('a live catalogue replacement reuses the in-flight cache projection for its
     result: { eligible: true, turnover: 40_000_000, oiUSD: 6_000_000, spread: 0.01 },
     change24h: 3,
   }
-  const originalCoverage = store.coverage.bind(store)
+  const originalCoverage = store.candles.bind(store)
   let releaseProjection: (() => void) | undefined, projectionStarted = false, coverageCalls = 0
   const projectionGate = new Promise<void>(resolve => { releaseProjection = resolve })
-  store.coverage = async (...arguments_) => {
+  store.candles = async (...arguments_) => {
     coverageCalls += 1
     if (coverageCalls === 1) {
       projectionStarted = true

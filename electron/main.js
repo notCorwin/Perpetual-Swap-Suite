@@ -117,6 +117,10 @@ async function handleRequest(event, request) {
   if (!request || typeof request !== 'object') throw new Error('Invalid desktop bridge request.')
   if ('e2e' in request) {
     if (!testMode) throw new Error('The E2E desktop API is unavailable outside tests.')
+    if (request.e2e.action === 'smokeStatus') {
+      const build = await readFile(join(process.resourcesPath, 'build-revision.json'), 'utf8').then(JSON.parse).catch(() => null)
+      return { revision: build?.revision ?? null, userData: app.getPath('userData'), preparedWorkerThreadId: marketService?.preparedCharts.worker?.threadId ?? null }
+    }
     if (request.e2e.action === 'seedCandles') return { written: await marketStore.appendCandles(request.e2e.candles ?? []) }
     if (request.e2e.action === 'readCandles') {
       const { instrument, timeframe, from, through } = request.e2e

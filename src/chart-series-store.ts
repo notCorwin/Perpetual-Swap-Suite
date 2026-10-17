@@ -2,7 +2,7 @@ import type { Bar, PreparedChartBar, PreparedChartMeta, PreparedChartResponse, R
 import { timeframeMilliseconds, type RadarTimeframe } from './timeframe.ts'
 
 const WINDOW_BARS = 96
-const indicatorFields = ['vwap', 'ema', 'logBBUpper', 'logBBMiddle', 'logBBLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24'] as const
+const indicatorFields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24'] as const
 const barFields = ['hour', 'open', 'high', 'low', 'close', 'confirmed', 'statisticsSources', 'statisticsObserved', 'indicatorsObserved', ...indicatorFields, 'oi', 'buy', 'sell', 'oiUnavailableReason', 'takerUnavailableReason'] as const
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
 const nullableNumber = (value: unknown) => value === null || finite(value)

@@ -13,8 +13,8 @@ const input: OpportunityInput = {
   rsi24: 58,
   takerRatio: 10,
   oiChange: 1,
-  logBBAboveBand: "middle",
-  logBBExpansion: { hours: 2, complete: true },
+  bollAboveBand: "middle",
+  bollExpansion: { hours: 2, complete: true },
   highBreakout: { status: "event", hour: 1, hoursAgo: 2, priorHour: 0, priorAgeHours: 30, priorPrice: 100, live: false },
   lowBreakdown: { status: "none" },
 }
@@ -30,7 +30,7 @@ test("renderer opportunity evaluation is the same canonical calculation used by 
 })
 
 test("non-finite snapshot percentages remain incomplete in both processes", () => {
-  const nonFinite: OpportunityInput = { ...input, priceChange: "Infinity" }
+  const nonFinite: OpportunityInput = { ...input, priceChange: Infinity }
 
   assert.deepEqual(evaluateMarketOpportunity(nonFinite), evaluateMainProcessOpportunity(nonFinite))
   assert.equal(evaluateMarketOpportunity(nonFinite).status, "Incomplete")

@@ -1,6 +1,6 @@
 import type { OpportunityResult } from "./market-opportunity.ts"
 import type { BreakResult } from "./market-breaks.ts"
-import type { BandWidthExpansion, LogBBAboveBand } from "./market-logbb.ts"
+import type { BandWidthExpansion, BollingerAboveBand } from "./market-bollinger.ts"
 import type { PercentageValue } from "./market-percent.ts"
 import type { EMA200Signal } from "./market-sort.ts"
 
@@ -26,8 +26,8 @@ export type MarketRow = {
   rsi6: number | null
   rsi12: number | null
   rsi24: number | null
-  logBBAboveBand: LogBBAboveBand | null
-  logBBExpansion: BandWidthExpansion | null
+  bollAboveBand: BollingerAboveBand | null
+  bollExpansion: BandWidthExpansion | null
   rocChange: PercentageValue
   marocChange: PercentageValue
 }

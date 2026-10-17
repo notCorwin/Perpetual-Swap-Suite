@@ -6,7 +6,7 @@ An Electron desktop app for screening and charting live OKX USDT perpetual contr
 
 ## Features
 
-- A searchable, sortable market table with Long/Short Opportunity scores, price changes, high breakouts/low breakdowns, taker imbalance, open interest, ROC/MAROC, RSI, and Log Bollinger Band readings.
+- A searchable, sortable market table with Long/Short Opportunity scores, price changes, high breakouts/low breakdowns, taker imbalance, open interest, ROC/MAROC, RSI, and Bollinger Band readings.
 - Liquidity screening for live, non-TradFi USDT perpetual contracts, with an optional hourly volume stability requirement.
 - Native OKX 5m, 15m, and 1h charts with 96 candles per window, historical scrolling, keyboard navigation, chart copying, and technical indicator panels.
 - Optional AI chart analysis through Vercel AI Gateway, with separate Long/Short prompts and follow-up conversations.
@@ -70,13 +70,13 @@ A worker calculates indicators over the persisted contiguous series, independent
 | Indicator | Definition |
 | --- | --- |
 | EMA(200) | Seed with the arithmetic mean of 200 closes, then use multiplier `2 / 201` |
-| Log BB(20, 2) | Mean and population standard deviation of 20 log closes; exponentiate the mean and mean ± two deviations |
-| VWAP(14) | Quote-volume-weighted typical price `(High + Low + Close) / 3` over 14 candles; undefined when total weight is zero |
+| BOLL(20, 2) | Arithmetic mean of 20 closes ± two population standard deviations |
+| VWAP(14) | Base-volume-weighted typical price `(High + Low + Close) / 3` over 14 candles; undefined for missing weights or zero total volume |
 | ROC(9) | Signed relative close change over nine candles, as a percentage |
 | MAROC(9) | Arithmetic mean of nine ROC readings |
-| RSI(6), RSI(12), RSI(24) | Wilder smoothing, seeded with mean gains/losses over the period; zero losses gives 100 |
+| RSI(6), RSI(12), RSI(24) | Wilder smoothing, seeded with mean gains/losses over the period; a flat run gives 50; positive gains with zero losses gives 100 |
 
-Applicable relative changes use `(current − previous) / abs(previous) × 100%`; a zero baseline is unavailable. Indicator comparisons require matching periods, source data, formulas, and warmup history. See [indicator calculations](electron/services/indicators.js) and [market metrics](electron/services/market-metrics.js) for implementation details.
+Applicable relative changes use `(current − previous) / abs(previous) × 100%`; a zero baseline is unavailable. Indicator comparisons require matching periods, source data, formulas, and warmup history. See the [indicator contract](docs/INDICATORS.md), [indicator calculations](electron/services/indicators.js) and [market metrics](electron/services/market-metrics.js) for implementation details.
 
 ## AI chart analysis
 

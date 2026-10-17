@@ -249,7 +249,7 @@ test('prepared native chart pages preserve canonical indicator values across eve
       assert.equal(visible.length, 96)
       for (const bar of visible) {
         const oracle = expected.get(bar.hour)
-        for (const field of ['open', 'high', 'low', 'close', 'vwap', 'ema', 'logBBUpper', 'logBBMiddle', 'logBBLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell']) {
+        for (const field of ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell']) {
           assert.ok(Number.isFinite(bar[field]), `${timeframe} ${bar.hour} ${field} must be initialized.`)
           assert.ok(Math.abs(bar[field] - oracle[field]) <= Math.max(1, Math.abs(oracle[field])) * 1e-10,
             `${timeframe} ${bar.hour} ${field} changed from its canonical initialization.`)
@@ -346,7 +346,7 @@ test('a late history response cannot overwrite a more recently selected timefram
 test('the live price overlay follows its actual price without changing the 96 completed candles', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   const visible = fixture.series[fixture.timeframe].bars.slice(-96)
-  const prices = visible.flatMap(bar => ['low', 'high', 'vwap', 'ema', 'logBBUpper', 'logBBMiddle', 'logBBLower'].map(field => bar[field]))
+  const prices = visible.flatMap(bar => ['low', 'high', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower'].map(field => bar[field]))
   // A geometric midpoint must land at the center of a logarithmic price axis,
   // including symmetric axis padding. This expectation does not reuse Plot.
   const livePrice = Math.sqrt(Math.min(...prices) * Math.max(...prices))

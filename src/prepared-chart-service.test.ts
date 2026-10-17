@@ -13,8 +13,8 @@ const step = 300_000
 const instId = 'BTC-USDT-SWAP'
 const response = (data: unknown) => new Response(JSON.stringify({ code: '0', data }), { headers: { 'Content-Type': 'application/json' } })
 const candle = (timestamp: number, index: number, timeframe = '1H') => ({ instrument: instId, timeframe, timestamp,
-  open: 100 + Math.sin(index / 9), high: 102 + Math.sin(index / 9), low: 98 + Math.sin(index / 9),
-  close: 100 + Math.sin(index / 9) + index / 1_000, volume: 10 + index / 100, quoteVolume: 1_000 + index,
+  open: 100 + Math.sin(index / 9), high: 102 + Math.sin(index / 9) + index / 1_000, low: 98 + Math.sin(index / 9),
+  close: 100 + Math.sin(index / 9) + index / 1_000, volume: 10 + index / 100, baseVolume: 10 + index / 100, quoteVolume: 1_000 + index,
   oi: 10_000 + index, buy: 40 + index, sell: 20 + index, statisticsVersion: 1, confirmed: true })
 const visible = (result: any, end: number, interval = hour) => result.bars.filter((bar: any) => bar.hour >= end - 95 * interval && bar.hour <= end)
 const waitFor = async (check: () => boolean) => { for (let i = 0; i < 300; i += 1) { if (check()) return; await new Promise(resolve => setTimeout(resolve, 10)) }; throw new Error('Timed out waiting for prepared source requests.') }
@@ -33,7 +33,7 @@ test('prepared windows use the entire canonical native series and reuse indicato
     assert.equal(visible(result, end).length, 96)
     const oracle = new Map(barsWithIndicators(source, hour).map((bar: any) => [bar.hour, bar]))
     for (const bar of visible(result, end)) {
-      for (const key of ['ema', 'rsi6', 'rsi12', 'rsi24', 'vwap', 'logBBUpper', 'roc', 'maroc']) assert.equal(bar[key], (oracle.get(bar.hour) as any)[key])
+      for (const key of ['ema', 'rsi6', 'rsi12', 'rsi24', 'vwap', 'bollUpper', 'roc', 'maroc']) assert.equal(bar[key], (oracle.get(bar.hour) as any)[key])
       assert.equal(bar.statisticsObserved, true)
       assert.equal(bar.indicatorsObserved, true)
     }
@@ -218,7 +218,7 @@ test('missing native history is persisted once and a cache edge never declares e
     const url = new URL(String(input)); calls.push(String(url))
     assert.ok(url.pathname.endsWith('/market/history-candles'))
     const after = Number(url.searchParams.get('after')), limit = Number(url.searchParams.get('limit'))
-    return response(source.filter(row => row.timestamp < after).slice(-limit).reverse().map(row => [String(row.timestamp), String(row.open), String(row.high), String(row.low), String(row.close), String(row.volume), '0', String(row.quoteVolume), '1']))
+    return response(source.filter(row => row.timestamp < after).slice(-limit).reverse().map(row => [String(row.timestamp), String(row.open), String(row.high), String(row.low), String(row.close), String(row.volume), String(row.baseVolume), String(row.quoteVolume), '1']))
   }, false)
   try {
     await store.appendCandles(source.slice(-100))
@@ -245,7 +245,7 @@ test('a far empty historical cursor discovers the actual provider floor rather t
     const url = new URL(String(input))
     assert.ok(url.pathname.endsWith('/market/history-candles'))
     const after = Number(url.searchParams.get('after')), limit = Number(url.searchParams.get('limit'))
-    return response(source.filter(row => row.timestamp < after).slice(-limit).reverse().map(row => [String(row.timestamp), String(row.open), String(row.high), String(row.low), String(row.close), String(row.volume), '0', String(row.quoteVolume), '1']))
+    return response(source.filter(row => row.timestamp < after).slice(-limit).reverse().map(row => [String(row.timestamp), String(row.open), String(row.high), String(row.low), String(row.close), String(row.volume), String(row.baseVolume), String(row.quoteVolume), '1']))
   }, false)
   try {
     await store.appendCandles(source.slice(-100))
@@ -277,7 +277,7 @@ test('inactive canonical series are evicted by LRU and row budget, and revisits 
     const reloaded = await service.prepareChartWindow(ids[0], '5m', source.at(-1)!.timestamp)
     assert.ok(reloaded.generation > original.generation)
     const oldBars = visible(original, original.endHour, step), newBars = visible(reloaded, reloaded.endHour!, step)
-    for (let i = 0; i < 96; i += 1) for (const field of ['ema', 'rsi6', 'rsi12', 'rsi24', 'vwap', 'logBBUpper']) assert.equal(newBars[i][field], oldBars[i][field])
+    for (let i = 0; i < 96; i += 1) for (const field of ['ema', 'rsi6', 'rsi12', 'rsi24', 'vwap', 'bollUpper']) assert.equal(newBars[i][field], oldBars[i][field])
     service.preparedCharts.maxRows = 700
     service.preparedCharts.trim()
     assert.equal(service.preparedCharts.series.size, 1)
@@ -468,7 +468,7 @@ test('compact and historical generations stay coherent after full-series evictio
     const url = new URL(String(input))
     assert.ok(url.pathname.endsWith('/market/history-candles'))
     const after = Number(url.searchParams.get('after')), limit = Number(url.searchParams.get('limit'))
-    return response(source.filter(row => row.timestamp < after).slice(-limit).reverse().map(row => [String(row.timestamp), String(row.open), String(row.high), String(row.low), String(row.close), String(row.volume), '0', String(row.quoteVolume), '1']))
+    return response(source.filter(row => row.timestamp < after).slice(-limit).reverse().map(row => [String(row.timestamp), String(row.open), String(row.high), String(row.low), String(row.close), String(row.volume), String(row.baseVolume), String(row.quoteVolume), '1']))
   }, false)
   try {
     await store.appendCandles(source.slice(-400))
@@ -511,7 +511,7 @@ test('an expired latest null lease keeps its in-memory close while independent r
   const published: any[] = []
   const service = new MarketService(store, undefined, async input => {
     const url = new URL(String(input))
-    if (url.pathname.endsWith('/market/candles')) return response(source.slice(-300).reverse().map(row => [String(row.timestamp), String(row.open), String(row.high), String(row.low), String(row.close), String(row.volume), '0', String(row.quoteVolume), '1']))
+    if (url.pathname.endsWith('/market/candles')) return response(source.slice(-300).reverse().map(row => [String(row.timestamp), String(row.open), String(row.high), String(row.low), String(row.close), String(row.volume), String(row.baseVolume), String(row.quoteVolume), '1']))
     statisticsCalls += 1
     const begin = Number(url.searchParams.get('begin')), end = Number(url.searchParams.get('end'))
     return response(source.filter(row => row.timestamp > begin && row.timestamp < end).map(row => url.pathname.endsWith('/open-interest-history') ? [String(row.timestamp), '1234'] : [String(row.timestamp), '20', '30']))
@@ -547,7 +547,7 @@ for (const mutation of ['price', 'statistics'] as const) test(`latest preparatio
   const service = new MarketService(store, undefined, async input => {
     const url = new URL(String(input))
     assert.ok(url.pathname.endsWith('/market/candles'))
-    return response(source.slice(-300).reverse().map(row => [String(row.timestamp), String(row.open), String(row.high), String(row.low), String(row.close), String(row.volume), '0', String(row.quoteVolume), '1']))
+    return response(source.slice(-300).reverse().map(row => [String(row.timestamp), String(row.open), String(row.high), String(row.low), String(row.close), String(row.volume), String(row.baseVolume), String(row.quoteVolume), '1']))
   }, false)
   const pipeline = service.preparedCharts
   const originalPrepare = pipeline.prepareState.bind(pipeline)

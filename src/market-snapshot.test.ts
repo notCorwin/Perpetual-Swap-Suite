@@ -11,7 +11,7 @@ test("bridge refreshes keep unchanged row identities while updating changed read
     highBreakout: { status: "none" }, lowBreakdown: { status: "none" },
     highBreakout96: { status: "none" }, lowBreakdown96: { status: "none" },
     roc: 2, maroc: 1, rocChange: 1, marocChange: 0.5,
-    rsi6: 60, rsi12: 55, rsi24: 50, logBBAboveBand: "middle", logBBExpansion: null,
+    rsi6: 60, rsi12: 55, rsi24: 50, bollAboveBand: "middle", bollExpansion: null,
     opportunity: { direction: "Long", setup: "Startup", status: "Candidate", score: 87, components: null, reasons: [] },
   }))
   assert.equal(reconcileMarketRows(previous, structuredClone(previous)), previous)

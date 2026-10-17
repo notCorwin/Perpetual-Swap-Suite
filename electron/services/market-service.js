@@ -1,5 +1,4 @@
-import { barsWithIndicators } from './indicators.js'
-import { evaluateMarketOpportunity, summarizeMarketBars } from './market-metrics.js'
+import { evaluateMarketOpportunity, summarizeMarketBars, signedRelativeChange as percent } from './market-metrics.js'
 import { PreparedChartPipeline } from './prepared-chart-service.js'
 
 const OKX_ORIGIN = 'https://www.okx.com/api/v5'
@@ -133,7 +132,6 @@ const statisticsVersionFor = (sources, values) => sources === STATISTICS_COMPLET
   && number(values?.oi) !== null && number(values?.buy) !== null && number(values?.sell) !== null
   ? STATISTICS_VERSION
   : STATISTICS_FORMAT | (sources & STATISTICS_COMPLETE)
-const percent = (current, previous) => current === null || previous === null || previous === 0 ? null : (current - previous) / Math.abs(previous) * 100
 const timeframeMilliseconds = timeframe => timeframe === '5m' ? FIVE_MINUTES : timeframe === '15m' ? 900_000 : 3_600_000
 const statisticsExpiryAt = (timeframe, end, observedAt = Date.now()) => observedAt
   + (end >= observedAt - timeframeMilliseconds(timeframe) * 2 ? LATEST_CANDLE_REFRESH : HISTORICAL_STATISTICS_REFRESH)
@@ -241,10 +239,10 @@ function liquidity(instrument, ticker, book, openInterest, hourly, criteria) {
 function candle(instrument, timeframe, value) {
   const timestamp = number(value[0]), open = number(value[1]), high = number(value[2]), low = number(value[3]), close = number(value[4])
   if ([timestamp, open, high, low, close].some(item => item === null)) return null
-  return { instrument, timeframe, timestamp, open, high, low, close, volume: number(value[5]) ?? 0, quoteVolume: number(value[7]) ?? 0, confirmed: value[8] === '1' }
+  return { instrument, timeframe, timestamp, open, high, low, close, volume: number(value[5]), baseVolume: number(value[6]), quoteVolume: number(value[7]), confirmed: value[8] === '1' }
 }
 
-const candleFields = ['instrument', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'quoteVolume', 'oi', 'buy', 'sell', 'statisticsVersion', 'statisticsOIExpiresAt', 'statisticsTakerExpiresAt', 'confirmed']
+const candleFields = ['instrument', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'baseVolume', 'quoteVolume', 'oi', 'buy', 'sell', 'statisticsVersion', 'statisticsOIExpiresAt', 'statisticsTakerExpiresAt', 'confirmed']
 const optionalCandleFields = new Set(['oi', 'buy', 'sell', 'statisticsVersion', 'statisticsOIExpiresAt', 'statisticsTakerExpiresAt'])
 
 function mergedCandle(previous, next) {
@@ -297,8 +295,8 @@ function marketRow(instrument, ticker, result, bars = []) {
     rsi6: latest?.rsi6 ?? null,
     rsi12: latest?.rsi12 ?? null,
     rsi24: latest?.rsi24 ?? null,
-    logBBAboveBand: latest?.bandPosition ?? null,
-    logBBExpansion: metrics.logBBExpansion,
+    bollAboveBand: latest?.bandPosition ?? null,
+    bollExpansion: metrics.bollExpansion,
   }
   return {
     ...row,
@@ -312,8 +310,8 @@ function marketRow(instrument, ticker, result, bars = []) {
       rsi24: row.rsi24,
       takerRatio: row.takerRatio,
       oiChange: row.oiChange,
-      logBBAboveBand: row.logBBAboveBand,
-      logBBExpansion: row.logBBExpansion,
+      bollAboveBand: row.bollAboveBand,
+      bollExpansion: row.bollExpansion,
       highBreakout: row.highBreakout,
       lowBreakdown: row.lowBreakdown,
     }),
@@ -493,14 +491,8 @@ export class MarketService {
 
   async readListBars(entry, timeframe) {
     const frame = this.listTimeframe(timeframe), instrument = entry.instrument
-    const coverage = await this.store.coverage(instrument.instId, frame)
-    if (coverage.last === null) return { bars: [], end: null, range: null }
-    const intervalMS = timeframeMilliseconds(frame), end = Math.floor(coverage.last / intervalMS) * intervalMS, range = listRawRange(frame, end)
-    const source = await this.store.candles({ instrument: instrument.instId, timeframe: frame, ...range })
-    const candles = source.map(normalizedStatistics)
-    const readings = barsWithIndicators(candles, intervalMS), byHour = new Map(readings.map(value => [value.hour, value])), bars = []
-    for (let hour = end; byHour.has(hour); hour -= intervalMS) bars.unshift(byHour.get(hour))
-    return { bars, end, range }
+    const projection = await this.preparedCharts.projectSeries(instrument.instId, frame)
+    return { ...projection, range: projection.end === null ? null : listRawRange(frame, projection.end) }
   }
 
   publishListProjection(instrument, timeframe, projection, updatedAt) {

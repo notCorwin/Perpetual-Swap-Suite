@@ -32,8 +32,13 @@ const finiteNumber = (value: unknown): value is number => typeof value === "numb
 const time = (hour: number) => chartTimeFormatter.format(hour)
 const hourLabel = time
 const chartPriceValues = (bars: readonly Bar[]) => bars.flatMap(bar => [
-  bar.low, bar.high, bar.vwap, bar.ema, bar.logBBUpper, bar.logBBMiddle, bar.logBBLower,
-].filter((value): value is number => finiteNumber(value) && value > 0))
+  bar.low, bar.high, bar.vwap, bar.ema, bar.bollUpper, bar.bollMiddle, bar.bollLower,
+].filter((value): value is number => finiteNumber(value)))
+const priceAxisFor = (values: number[], labels: number) => {
+  const min = Math.min(...values), max = Math.max(...values)
+  return min > 0 ? { ...logarithmicChartAxis(min, max, labels), logarithmic: true }
+    : { ...chartAxisForLabels(min, max, labels), logarithmic: false }
+}
 const rocAxisFor = (bars: readonly Bar[]) => {
   const values = bars.flatMap(bar => [finitePercentage(bar.roc), finitePercentage(bar.maroc)].filter((value): value is number => value !== null))
   const extent = values.length ? Math.max(...values.map(Math.abs)) || 1 : 1
@@ -87,7 +92,7 @@ const PriceCountdown = memo(function PriceCountdown({ hour, intervalMS, x, y, fo
 export const chartGutter = (bars: readonly Bar[], height: number, liveClose = bars[bars.length - 1].close) => {
   const { panels } = chartLayout(0, height)
   const values = chartPriceValues(bars)
-  const priceAxis = logarithmicChartAxis(Math.min(...values), Math.max(...values), axisLabelLimit(panels.price, 9))
+  const priceAxis = priceAxisFor(values, axisLabelLimit(panels.price, 9))
   const decimals = priceAxis.decimals
   const priceFormatter = new Intl.NumberFormat("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals })
   const rocAxis = rocAxisFor(bars)
@@ -119,8 +124,7 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
   const priceValues = chartPriceValues(bars)
   const oiComplete = n === 96 && bars.every(bar => finiteNumber(bar.oi))
   const takerComplete = n === 96 && bars.every(bar => finiteNumber(bar.buy) && finiteNumber(bar.sell))
-  const priceMin = Math.min(...priceValues), priceMax = Math.max(...priceValues)
-  const priceAxis = logarithmicChartAxis(priceMin, priceMax, axisLabelLimit(panels.price, 9))
+  const priceAxis = priceAxisFor(priceValues, axisLabelLimit(panels.price, 9))
   const highIndex = bars.findIndex(bar => bar.high === candleHigh), lowIndex = bars.findIndex(bar => bar.low === candleLow)
   const priceDecimals = priceAxis.decimals
   const axisPrice = new Intl.NumberFormat("en-US", { minimumFractionDigits: priceDecimals, maximumFractionDigits: priceDecimals })
@@ -139,7 +143,7 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
   const takerAxis = chartAxisForLabels(0, maxTaker, axisLabelLimit(panels.taker, 7))
   const scale = (value: number, min: number, max: number, panel: readonly [number, number]) =>
     panel[1] - (value - min) / (max - min || 1) * (panel[1] - panel[0])
-  const priceY = (value: number) => logarithmicY(value, priceAxis, panels.price)
+  const priceY = (value: number) => priceAxis.logarithmic ? logarithmicY(value, priceAxis as ReturnType<typeof logarithmicChartAxis>, panels.price) : scale(value, priceAxis.min, priceAxis.max, panels.price)
   const rsiY = (value: number) => scale(value, 0, 100, panels.rsi)
   const oiY = (value: number) => oiAxis ? logarithmicY(value, oiAxis, panels.oi) : NaN
   const takerY = (value: number) => scale(value, takerAxis.min, takerAxis.max, panels.taker)
@@ -199,22 +203,22 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
     return segments.join(" ")
   }
   const rocAreas = [rocArea("roc"), rocArea("maroc")]
-  const logBBBands: string[] = []
+  const bollBands: string[] = []
   let upper: string[] = [], lower: string[] = []
   const finishBand = () => {
-    if (upper.length > 1) logBBBands.push(`M${upper.join(" L")} L${lower.reverse().join(" L")} Z`)
+    if (upper.length > 1) bollBands.push(`M${upper.join(" L")} L${lower.reverse().join(" L")} Z`)
     upper = []; lower = []
   }
   bars.forEach((bar, index) => {
-    if (!finiteNumber(bar.logBBUpper) || !finiteNumber(bar.logBBLower) || bar.logBBUpper <= 0 || bar.logBBLower <= 0) { finishBand(); return }
+    if (!finiteNumber(bar.bollUpper) || !finiteNumber(bar.bollLower) || bar.bollUpper <= 0 || bar.bollLower <= 0) { finishBand(); return }
     if (index > 0 && bar.hour - bars[index - 1].hour !== intervalMS) finishBand()
     const pointX = x(index, "price").toFixed(1)
     if (index === 0 && firstAtLeft) {
-      upper.push(`${left} ${priceY(bar.logBBUpper).toFixed(1)}`)
-      lower.push(`${left} ${priceY(bar.logBBLower).toFixed(1)}`)
+      upper.push(`${left} ${priceY(bar.bollUpper).toFixed(1)}`)
+      lower.push(`${left} ${priceY(bar.bollLower).toFixed(1)}`)
     }
-    upper.push(`${pointX} ${priceY(bar.logBBUpper).toFixed(1)}`)
-    lower.push(`${pointX} ${priceY(bar.logBBLower).toFixed(1)}`)
+    upper.push(`${pointX} ${priceY(bar.bollUpper).toFixed(1)}`)
+    lower.push(`${pointX} ${priceY(bar.bollLower).toFixed(1)}`)
   })
   finishBand()
   const indicatorWidth = "var(--chart-indicator-line-width)"
@@ -272,7 +276,7 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
       <clipPath id={`${areaClipId}-positive`}><rect x={columns.roc[0]} y={panels.roc[0]} width={columns.roc[1] - columns.roc[0]} height={rocZeroY - panels.roc[0]} /></clipPath>
       <clipPath id={`${areaClipId}-negative`}><rect x={columns.roc[0]} y={rocZeroY} width={columns.roc[1] - columns.roc[0]} height={panels.roc[1] - rocZeroY} /></clipPath>
     </defs>
-    {logBBBands.map((d, index) => <path key={index} d={d} fill="var(--chart-1)" fillOpacity="0.1" />)}
+    {bollBands.map((d, index) => <path key={index} d={d} fill="var(--chart-1)" fillOpacity="0.1" />)}
     {rocAreas.map((area, index) => <g key={index}>
       <path d={area} fill="var(--chart-roc-positive-area)" clipPath={`url(#${areaClipId}-positive)`} />
       <path d={area} fill="var(--chart-roc-negative-area)" clipPath={`url(#${areaClipId}-negative)`} />
@@ -297,9 +301,9 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
       <path data-chart-taker-sell-samples={sells.length} d={sells.join(" ")} fill="var(--destructive)" opacity="0.9" />
       <path d={sells.join(" ")} fill="url(#sell-hatch)" opacity="0.7" />
     </g>
-    {lineStroke("logBBUpper", priceLine("logBBUpper"), "var(--chart-1)", indicatorWidth, 0.62)}
-    {lineStroke("logBBMiddle", priceLine("logBBMiddle"), "var(--chart-1)")}
-    {lineStroke("logBBLower", priceLine("logBBLower"), "var(--chart-1)", indicatorWidth, 0.62)}
+    {lineStroke("bollUpper", priceLine("bollUpper"), "var(--chart-1)", indicatorWidth, 0.62)}
+    {lineStroke("bollMiddle", priceLine("bollMiddle"), "var(--chart-1)")}
+    {lineStroke("bollLower", priceLine("bollLower"), "var(--chart-1)", indicatorWidth, 0.62)}
     {lineStroke("vwap", priceLine("vwap"), "var(--chart-2)")}
     {lineStroke("ema", priceLine("ema"), "var(--chart-3)", indicatorWidth, 0.9)}
     {lineStroke("rsi6", line("rsi6", "rsi", rsiY), "var(--chart-1)")}
@@ -325,7 +329,7 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
       <text x={tagOffset + (tagBoxWidth + tagStrokeWidth) / 2} y={tagPaddingY + tagLineHeight / 2} textAnchor="middle" dominantBaseline="middle" fill="var(--chart-price-tag-foreground)" fontSize={tagFontSize}>{latestPrice}</text>
       {showCountdown && <PriceCountdown hour={liveBar.hour} intervalMS={intervalMS} x={tagOffset + (tagBoxWidth + tagStrokeWidth) / 2} y={tagPaddingY + tagLineHeight * 1.5 + tagRowGap} fontSize={tagFontSize} />}
     </g>
-    {legend("price", [["VWAP14", price(active.vwap), "var(--chart-2)"], ["EMA200", price(active.ema), "var(--chart-3)"], ["Log BB(20)", `U ${price(active.logBBUpper)}\u00a0·\u00a0M ${price(active.logBBMiddle)}\u00a0·\u00a0L ${price(active.logBBLower)}`, "var(--chart-1)"]])}
+    {legend("price", [["VWAP14", price(active.vwap), "var(--chart-2)"], ["EMA200", price(active.ema), "var(--chart-3)"], ["BOLL(20, 2)", `U ${price(active.bollUpper)}\u00a0·\u00a0M ${price(active.bollMiddle)}\u00a0·\u00a0L ${price(active.bollLower)}`, "var(--chart-1)"]])}
     {legend("roc", [["ROC(9)", formatPercent(active.roc), "var(--chart-1)"], ["MAROC(9)", formatPercent(active.maroc), "var(--chart-2)"]])}
     {legend("rsi", [["RSI(6)", active.rsi6?.toFixed(1) ?? "—", "var(--chart-1)"], ["RSI(12)", active.rsi12?.toFixed(1) ?? "—", "var(--chart-2)"], ["RSI(24)", active.rsi24?.toFixed(1) ?? "—", "var(--chart-3)"]])}
     {legend("oi", [["OI (Contracts)", finiteNumber(active.oi) ? compact(active.oi) : "Unavailable", "var(--chart-2)"]])}

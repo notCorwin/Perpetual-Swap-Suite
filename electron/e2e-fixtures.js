@@ -23,7 +23,7 @@ export async function seedCachedListProjection(store, marketService) {
     source.push({
       instrument: instId, timeframe: '5m', timestamp,
       open: center - 0.06, high: center + 0.42, low: center - 0.48, close,
-      volume: 120 + index % 11, quoteVolume: (120 + index % 11) * close,
+      volume: 120 + index % 11, baseVolume: 120 + index % 11, quoteVolume: (120 + index % 11) * close,
       confirmed: true,
     })
   }
@@ -34,7 +34,7 @@ export async function seedCachedListProjection(store, marketService) {
     return {
       instrument: instId, timeframe, timestamp,
       open: close - 0.18, high: close + 0.51, low: close - 0.56, close,
-      volume: 1_600, quoteVolume: close * 1_600,
+      volume: 1_600, baseVolume: 1_600, quoteVolume: close * 1_600,
       oi: 2_000_000 + index * 4_000,
       buy: 12_000 + index * 17,
       sell: 8_000 + index * 11,
@@ -86,7 +86,7 @@ export async function seedChartScrollBenchmark(store, marketService) {
       return {
         instrument: instId, timeframe: frame, timestamp,
         open, high: Math.max(open, close) + .7, low: Math.min(open, close) - .7, close,
-        volume, quoteVolume: volume * close,
+        volume, baseVolume: volume, quoteVolume: volume * close,
         oi: 2_100_000 + index * 230,
         buy: 92_000 + index % 800,
         sell: 76_000 + (index * 3) % 900,
@@ -160,7 +160,7 @@ export async function seedInstrumentNavigationBenchmark(store, marketService) {
         return {
           instrument: instId, timeframe, timestamp: start + index * intervalMS,
           open, high: Math.max(open, close) + .6, low: Math.min(open, close) - .6, close,
-          volume, quoteVolume: volume * close,
+          volume, baseVolume: volume, quoteVolume: volume * close,
           oi: 2_000_000 + instrumentIndex * 150_000 + index * 219,
           buy: 60_000 + instrumentIndex * 1_300 + index % 700,
           sell: 48_000 + instrumentIndex * 1_100 + index % 900,

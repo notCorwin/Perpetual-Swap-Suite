@@ -1,4 +1,4 @@
-export type PercentageValue = number | "Infinity" | "-Infinity" | null
+export type PercentageValue = number | null
 export type OpportunityDirection = "Long" | "Short"
 export type OpportunitySetup = "Startup" | "Pullback"
 export type OpportunityStatus = "Candidate" | "Watch" | "Overheated" | "Incomplete"
@@ -23,8 +23,8 @@ export type OpportunityInput = {
   rsi24: number | null
   takerRatio: number | null
   oiChange: PercentageValue
-  logBBAboveBand: "upper" | "middle" | "lower" | "below" | null
-  logBBExpansion: { hours: number; complete: boolean } | null
+  bollAboveBand: "upper" | "middle" | "lower" | "below" | null
+  bollExpansion: { hours: number; complete: boolean } | null
   highBreakout: OpportunityBreakResult
   lowBreakdown: OpportunityBreakResult
 }

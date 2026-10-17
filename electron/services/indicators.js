@@ -1,5 +1,5 @@
+import { signedRelativeChange as change } from './market-metrics.js'
 const finite = value => typeof value === 'number' && Number.isFinite(value) ? value : null
-const change = (current, previous) => current === null || previous === null || previous === 0 ? null : (current - previous) / Math.abs(previous) * 100
 
 export function ema(candles, period = 200) {
   const values = new Map(), multiplier = 2 / (period + 1)
@@ -26,7 +26,7 @@ export function rsi(candles, period) {
   }
   gains /= period
   losses /= period
-  const calculate = () => losses === 0 ? 100 : 100 - 100 / (1 + gains / losses)
+  const calculate = () => gains === 0 && losses === 0 ? 50 : losses === 0 ? 100 : 100 - 100 / (1 + gains / losses)
   values.set(candles[period].timestamp, calculate())
   for (let index = period + 1; index < candles.length; index += 1) {
     const move = candles[index].close - candles[index - 1].close
@@ -42,9 +42,9 @@ export function bollinger(candles, period = 20) {
   for (let index = period - 1; index < candles.length; index += 1) {
     const window = candles.slice(index - period + 1, index + 1).map(candle => candle.close)
     if (window.some(value => value <= 0 || !Number.isFinite(value))) continue
-    const logs = window.map(Math.log), middleLog = logs.reduce((sum, value) => sum + value, 0) / period
-    const deviation = Math.sqrt(logs.reduce((sum, value) => sum + (value - middleLog) ** 2, 0) / period)
-    values.set(candles[index].timestamp, { upper: Math.exp(middleLog + 2 * deviation), middle: Math.exp(middleLog), lower: Math.exp(middleLog - 2 * deviation) })
+    const middle = window.reduce((sum, value) => sum + value, 0) / period
+    const deviation = Math.sqrt(window.reduce((sum, value) => sum + (value - middle) ** 2, 0) / period)
+    values.set(candles[index].timestamp, { upper: middle + 2 * deviation, middle, lower: middle - 2 * deviation })
   }
   return values
 }
@@ -53,8 +53,9 @@ export function vwap(candles, period = 14) {
   const values = new Map()
   for (let index = period - 1; index < candles.length; index += 1) {
     const window = candles.slice(index - period + 1, index + 1)
-    const volume = window.reduce((sum, candle) => sum + (finite(candle.quoteVolume) ?? 0), 0)
-    if (volume > 0) values.set(candles[index].timestamp, window.reduce((sum, candle) => sum + (candle.high + candle.low + candle.close) / 3 * (finite(candle.quoteVolume) ?? 0), 0) / volume)
+    if (window.some(candle => finite(candle.baseVolume) === null || candle.baseVolume < 0)) continue
+    const volume = window.reduce((sum, candle) => sum + candle.baseVolume, 0)
+    if (volume > 0) values.set(candles[index].timestamp, window.reduce((sum, candle) => sum + (candle.high + candle.low + candle.close) / 3 * candle.baseVolume, 0) / volume)
   }
   return values
 }
@@ -69,12 +70,12 @@ function indicatorBars(ordered) {
   const ema200 = ema(ordered), rsi6 = rsi(ordered, 6), rsi12 = rsi(ordered, 12), rsi24 = rsi(ordered, 24), bands = bollinger(ordered), vwaps = vwap(ordered), rocs = roc(ordered), marocValues = new Map()
   for (let index = 8; index < ordered.length; index += 1) {
     const window = ordered.slice(index - 8, index + 1).map(candle => rocs.get(candle.timestamp)).filter(value => value !== undefined)
-    if (window.length === 9) marocValues.set(ordered[index].timestamp, window.reduce((sum, value) => sum + value, 0) / 9)
+    if (window.length === 9 && window.every(Number.isFinite)) marocValues.set(ordered[index].timestamp, window.reduce((sum, value) => sum + value, 0) / 9)
   }
   return ordered.map((candle, index) => {
     const band = bands.get(candle.timestamp), price = candle.close, prior = ordered[index - 1], previousROC = prior ? rocs.get(prior.timestamp) : null, previousMAROC = prior ? marocValues.get(prior.timestamp) : null
     const bandPosition = !band ? null : price > band.upper ? 'upper' : price > band.middle ? 'middle' : price > band.lower ? 'lower' : 'below'
-    return { hour: candle.timestamp, quoteVolume: candle.quoteVolume ?? null, open: candle.open, high: candle.high, low: candle.low, close: price, confirmed: Boolean(candle.confirmed), statisticsSources: candle.statisticsSources, statisticsObserved: candle.statisticsObserved, vwap: vwaps.get(candle.timestamp) ?? null, ema: ema200.get(candle.timestamp) ?? null, logBBUpper: band?.upper ?? null, logBBMiddle: band?.middle ?? null, logBBLower: band?.lower ?? null, roc: rocs.get(candle.timestamp) ?? null, maroc: marocValues.get(candle.timestamp) ?? null, rsi6: rsi6.get(candle.timestamp) ?? null, rsi12: rsi12.get(candle.timestamp) ?? null, rsi24: rsi24.get(candle.timestamp) ?? null, oi: finite(candle.oi), buy: finite(candle.buy), sell: finite(candle.sell), bandPosition, rocChange: change(rocs.get(candle.timestamp) ?? null, previousROC ?? null), marocChange: change(marocValues.get(candle.timestamp) ?? null, previousMAROC ?? null) }
+    return { hour: candle.timestamp, quoteVolume: candle.quoteVolume ?? null, open: candle.open, high: candle.high, low: candle.low, close: price, confirmed: Boolean(candle.confirmed), statisticsSources: candle.statisticsSources, statisticsObserved: candle.statisticsObserved, vwap: vwaps.get(candle.timestamp) ?? null, ema: ema200.get(candle.timestamp) ?? null, bollUpper: band?.upper ?? null, bollMiddle: band?.middle ?? null, bollLower: band?.lower ?? null, roc: rocs.get(candle.timestamp) ?? null, maroc: marocValues.get(candle.timestamp) ?? null, rsi6: rsi6.get(candle.timestamp) ?? null, rsi12: rsi12.get(candle.timestamp) ?? null, rsi24: rsi24.get(candle.timestamp) ?? null, oi: finite(candle.oi), buy: finite(candle.buy), sell: finite(candle.sell), bandPosition, rocChange: change(rocs.get(candle.timestamp) ?? null, previousROC ?? null), marocChange: change(marocValues.get(candle.timestamp) ?? null, previousMAROC ?? null) }
   })
 }
 

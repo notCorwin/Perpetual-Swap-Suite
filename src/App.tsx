@@ -13,7 +13,7 @@ import { cn, pageVisible } from "@/lib/utils"
 import { compareMarketRows, compareMarketTurnover, defaultSortDescending, type SortKey } from "@/market-sort"
 import { PERCENT_CHANGE_DESCRIPTION, formatPercent, percentageNumber, type PercentageValue } from "@/market-percent"
 import { BREAK_DESCRIPTION, describeBreak, formatBreakPriorAge, formatBreakTime, type BreakDirection, type BreakResult } from "@/market-breaks"
-import { BANDWIDTH_EXPANSION_DESCRIPTION, LOG_BB_DESCRIPTION, formatBandWidthExpansion, formatLiveBand } from "@/market-logbb"
+import { BANDWIDTH_EXPANSION_DESCRIPTION, BOLL_DESCRIPTION, formatBandWidthExpansion, formatLiveBand } from "@/market-bollinger"
 import { MarketChart } from "@/MarketChart"
 import { chartController } from '@/chart-controller'
 import type { PreparedChartResponse } from '@/chart-data'
@@ -143,8 +143,8 @@ const MarketRowView = memo(function MarketRowView({ row, index, onSelect, timefr
     </TableCell>
     <TableCell className="text-center tabular-nums">
       <div className="flex flex-col items-center text-xs">
-        <div className="flex gap-1" title={LOG_BB_DESCRIPTION}><span className="text-muted-foreground">Live</span><span className={cn(row.logBBAboveBand === null ? "text-muted-foreground" : row.logBBAboveBand === "below" ? "text-destructive" : "text-positive")}>{formatLiveBand(row.logBBAboveBand)}</span></div>
-        <div className="flex gap-1" title={BANDWIDTH_EXPANSION_DESCRIPTION}><span className="text-muted-foreground">Expansion</span><span className={cn(row.logBBExpansion && row.logBBExpansion.hours > 0 ? "text-positive" : "text-muted-foreground")}>{formatBandWidthExpansion(row.logBBExpansion, timeframe)}</span></div>
+        <div className="flex gap-1" title={BOLL_DESCRIPTION}><span className="text-muted-foreground">Live</span><span className={cn(row.bollAboveBand === null ? "text-muted-foreground" : row.bollAboveBand === "below" ? "text-destructive" : "text-positive")}>{formatLiveBand(row.bollAboveBand)}</span></div>
+        <div className="flex gap-1" title={BANDWIDTH_EXPANSION_DESCRIPTION}><span className="text-muted-foreground">Expansion</span><span className={cn(row.bollExpansion && row.bollExpansion.hours > 0 ? "text-positive" : "text-muted-foreground")}>{formatBandWidthExpansion(row.bollExpansion, timeframe)}</span></div>
       </div>
     </TableCell>
   </TableRow>
@@ -385,10 +385,10 @@ function App() {
                   {RSI_PERIODS.map(period => <Fragment key={period}>{header(`RSI ${period}`, `rsi${period}`, indicatorFormula('RSI', period))}</Fragment>)}
                 </div>
               </TableHead>
-              <TableHead className="py-1.5 text-center" aria-sort={sort.startsWith("logBB") ? descending ? "descending" : "ascending" : "none"}>
+              <TableHead className="py-1.5 text-center" aria-sort={sort.startsWith("boll") ? descending ? "descending" : "ascending" : "none"}>
                 <div className="flex flex-col items-center">
-                  {header("Log BB · Live", "logBBAboveBand", undefined, LOG_BB_DESCRIPTION)}
-                  {header("Bandwidth expansion", "logBBExpansion", undefined, BANDWIDTH_EXPANSION_DESCRIPTION)}
+                  {header("BOLL(20, 2) · Live", "bollAboveBand", undefined, BOLL_DESCRIPTION)}
+                  {header("Bandwidth expansion", "bollExpansion", undefined, BANDWIDTH_EXPANSION_DESCRIPTION)}
                 </div>
               </TableHead>
             </TableRow>

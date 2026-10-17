@@ -6,10 +6,10 @@ const PRICE_PAGE = 300
 const STATISTICS_PAGE = 100
 const HISTORY_PERIODS = 1_440
 const SNAPSHOT_SCHEMA = 1
-const FORMULA_VERSION = 'native-ema200-wilder-rsi6-12-24-logbb20-2-vwap14-roc9-maroc9-v1'
+const FORMULA_VERSION = 'native-ema200-wilder-flat50-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v2'
 const REFRESH_MS = 60_000
-const priceFields = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'quoteVolume', 'confirmed']
-const indicatorFields = ['ema', 'vwap', 'logBBUpper', 'logBBMiddle', 'logBBLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24']
+const priceFields = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'baseVolume', 'quoteVolume', 'confirmed']
+const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24']
 const intervalFor = timeframe => timeframe === '5m' ? 300_000 : timeframe === '15m' ? 900_000 : 3_600_000
 const priceChanged = (left, right) => !left || priceFields.some(field => left[field] !== right[field])
 const extremeHour = (rows, minimum = false) => {
@@ -591,6 +591,29 @@ export class PreparedChartPipeline {
     })().finally(() => { if (state.calculation === task) state.calculation = null })
     state.calculation = task
     return task
+  }
+
+  // Every consumer projects the same full-history calculation. A list window
+  // only truncates the result; it can never choose a different recursive seed.
+  async projectSeries(instId, timeframe) {
+    const state = this.state(instId, timeframe)
+    state.active += 1
+    try {
+      await this.load(state, 'background')
+      while (!this.closed) {
+        const version = state.sourceVersion
+        await this.indicators(state, 'background')
+        if (version !== state.sourceVersion) continue
+        const end = this.latest(state), bars = []
+        for (let hour = end; hour !== null && state.rows.has(hour); hour -= state.intervalMS) {
+          const row = state.rows.get(hour), indicator = state.indicators.get(hour)
+          if (!indicator) break
+          bars.push({ ...indicator, oi: row.oi, buy: row.buy, sell: row.sell })
+        }
+        return { end, bars: bars.reverse() }
+      }
+      throw new Error('Prepared chart data service is closed.')
+    } finally { state.active -= 1; this.trim() }
   }
 
   bar(state, hour) {

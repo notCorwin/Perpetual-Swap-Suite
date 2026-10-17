@@ -34,7 +34,7 @@ export async function startPaintProbe(page, fixture) {
   await page.evaluate(({ instId, series }) => {
     const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
     if (!(chart instanceof HTMLElement)) throw new Error('No chart surface to inspect.')
-    const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'logBBUpper', 'logBBMiddle', 'logBBLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell']
+    const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell']
     const oracles = Object.fromEntries(Object.entries(series).map(([frame, entry]) => [frame, new Map(entry.bars.map(bar => [bar.hour, bar]))]))
     const probe = {
       active: true, frames: 0, paints: 0, minimumBars: Infinity, errors: [],
