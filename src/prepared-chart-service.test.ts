@@ -166,6 +166,127 @@ test('a cached complete 96-window never waits for observations outside its range
   } finally { await f.close() }
 })
 
+test('focused durable history hydrates thousands of immediately navigable candles without source work or snapshot writes', async () => {
+  const f = await fixture(), first = Date.UTC(2024, 0, 1)
+  const source = Array.from({ length: 5_000 }, (_, index) => candle(first + index * step, index, '5m'))
+  f.pipeline.history.latest = async () => { throw new Error('Local navigation must not refresh the network tail.') }
+  try {
+    await f.store.appendCandles(source)
+    const compact = await f.pipeline.local(instId, '5m')
+    assert.equal(compact.bars.length, 96)
+    const snapshot = await f.store.readChartSnapshot(instId, '5m')
+    f.store.writeChartSnapshot = async () => { throw new Error('Deep history must not replace the compact durable snapshot.') }
+    const emitted: any[] = [], unsubscribe = f.pipeline.subscribe((frame: any) => emitted.push(frame))
+    const frame = await f.pipeline.localHistory(instId, '5m')
+    unsubscribe()
+    assert.equal(frame.bars.length, source.length - 199, 'The unknown resident edge cannot seed recursive indicators.')
+    assert.equal(frame.endHour, source.at(-1)!.timestamp)
+    assert.equal(frame.latestEnd, frame.endHour)
+    assert.equal(frame.oldestHour, null); assert.equal(frame.historyExhausted, false)
+    assert.deepEqual(emitted, [], 'Focused history never expands universe notifications.')
+    assert.deepEqual(await f.store.readChartSnapshot(instId, '5m'), snapshot)
+    const renderer = new PreparedChartStore({ maxBarsPerSeries: 16_384 })
+    assert.equal(renderer.ingest(frame), true)
+    const oracle = new Map(barsWithIndicators(source, step).map((bar: any) => [bar.hour, bar]))
+    for (const index of [4_999, 1_499, 3_999, 294, 4_500]) {
+      const end = source[index].timestamp, ready = renderer.window(instId, '5m', end)
+      assert.ok(ready, `Navigation to candle ${index} must be synchronous after one local hydration.`)
+      assert.equal(ready.bars.length, 96)
+      assert.equal(ready.bars.at(-1)!.ema, (oracle.get(end) as any).ema)
+    }
+    const calculations = f.pipeline.nextCalculation
+    const historical = await f.pipeline.localHistory(instId, '5m', source[1_499].timestamp)
+    assert.equal(historical.endHour, source[1_499].timestamp)
+    assert.equal(f.pipeline.nextCalculation, calculations, 'Resident canonical calculations are reused across jumps.')
+    assert.equal(f.pipeline.cached(`${instId}:5m`).bars.length, 96)
+  } finally { await f.close() }
+})
+
+test('local history remains bounded with backward bias and fills available forward history near the resident edge', async () => {
+  const first = Date.UTC(2024, 0, 1), source = Array.from({ length: 17_000 }, (_, index) => candle(first + index * step, index, '5m'))
+  const pipeline = createPipeline({ async candles() { return source } })
+  try {
+    const latest = await pipeline.localHistory(instId, '5m')
+    assert.equal(latest.bars.length, 16_384)
+    assert.equal(latest.bars.at(-1).hour, source.at(-1)!.timestamp)
+    const historical = await pipeline.localHistory(instId, '5m', source[1_000].timestamp)
+    assert.equal(historical.bars.length, 16_384)
+    assert.equal(historical.bars[0].hour, source[199].timestamp)
+    assert.equal(historical.endHour, source[1_000].timestamp)
+    assert.equal(historical.latestEnd, source.at(-1)!.timestamp)
+    assert.ok(historical.bars.at(-1).hour > historical.endHour)
+    assert.equal(historical.oldestHour, null); assert.equal(historical.historyExhausted, false)
+  } finally { await pipeline.dispose() }
+})
+
+test('local history stops at unknown and expired source holes while retaining fresh explicit unavailable observations', async () => {
+  const f = await fixture(), first = Date.UTC(2024, 0, 1)
+  const source = Array.from({ length: 600 }, (_, index) => candle(first + index * hour, index))
+  source[350] = missingStatistics(source[350])
+  source[450] = { ...source[450], oi: null as any, buy: null as any, sell: null as any, statisticsVersion: 11,
+    statisticsOIExpiresAt: Date.now() + 60_000, statisticsTakerExpiresAt: Date.now() + 60_000 } as any
+  source[550] = { ...source[550], oi: null as any, buy: null as any, sell: null as any, statisticsVersion: 11,
+    statisticsOIExpiresAt: 1, statisticsTakerExpiresAt: 1 } as any
+  try {
+    await f.store.appendCandles(source)
+    const latest = await f.pipeline.localHistory(instId, '1H')
+    assert.equal(latest.endHour, source[549].timestamp, 'The latest pointer requires a complete fresh 96-candle window.')
+    assert.equal(latest.bars[0].hour, source[351].timestamp)
+    assert.equal(latest.bars.at(-1).hour, source[549].timestamp)
+    assert.equal(latest.bars.find((bar: any) => bar.hour === source[450].timestamp).oiUnavailableReason, 'not-published')
+    assert.equal(await f.pipeline.localHistory(instId, '1H', source[445].timestamp), null)
+    assert.equal(await f.pipeline.localHistory(instId, '1H', source[599].timestamp), null)
+    const earlier = await f.pipeline.localHistory(instId, '1H', source[349].timestamp)
+    assert.equal(earlier.bars.at(-1).hour, source[349].timestamp)
+    assert.equal(earlier.oldestHour, null); assert.equal(earlier.historyExhausted, false)
+  } finally { await f.close() }
+})
+
+test('local history retries canonical preparation when a correction arrives during its worker calculation', async () => {
+  const f = await fixture(), first = Date.UTC(2024, 0, 1), source = Array.from({ length: 600 }, (_, index) => candle(first + index * hour, index))
+  const release = deferred(); let reached = false
+  try {
+    await f.store.appendCandles(source)
+    const calculate = f.pipeline.calculate.bind(f.pipeline)
+    f.pipeline.calculate = async (...args: any[]) => {
+      const bars = await calculate(...args)
+      if (!reached) { reached = true; await release.promise }
+      return bars
+    }
+    const pending = f.pipeline.localHistory(instId, '1H')
+    await waitFor(() => reached)
+    const previousGeneration = f.pipeline.series.get(`${instId}:1H`).generation
+    source[400] = { ...source[400], close: 110, high: 112 }
+    await f.persist([source[400]])
+    release.resolve()
+    const frame = await pending
+    assert.ok(frame.generation > previousGeneration)
+    assert.equal(frame.bars.at(-1).ema, barsWithIndicators(source, hour).at(-1)?.ema)
+    assert.equal(frame.bars.find((bar: any) => bar.hour === source[400].timestamp).close, 110)
+  } finally { release.resolve(); await f.close() }
+})
+
+test('duplicate local history requests share their durable load and shutdown drains it before completing', async () => {
+  const first = Date.UTC(2024, 0, 1), source = Array.from({ length: 400 }, (_, index) => candle(first + index * hour, index))
+  const release = deferred(); let reads = 0, disposed = false
+  const pipeline = createPipeline({ async candles() { reads += 1; await release.promise; return source } })
+  const pending = assert.rejects(pipeline.localHistory(instId, '1H'), /closed/)
+  const duplicate = assert.rejects(pipeline.localHistory(instId, '1H'), /closed/)
+  try {
+    await waitFor(() => reads === 1)
+    assert.equal(pipeline.tasks.size, 1)
+    const closing = pipeline.dispose().then(() => { disposed = true })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(disposed, false, 'Disposal must join an accepted durable history read.')
+    release.resolve()
+    await Promise.all([pending, duplicate, closing])
+    assert.equal(reads, 1)
+    assert.equal(pipeline.nextCalculation, 0, 'A load finishing during shutdown must not admit a worker calculation.')
+    assert.equal(pipeline.worker, null); assert.equal(pipeline.tasks.size, 0)
+    assert.equal(pipeline.series.get(`${instId}:1H`).active, 0)
+  } finally { release.resolve(); await pipeline.dispose() }
+})
+
 test('listing metadata clamps history and preserves truthful undefined warmup indicators', async () => {
   const f = await fixture(), first = Date.UTC(2024, 0, 1)
   try {
@@ -175,6 +296,9 @@ test('listing metadata clamps history and preserves truthful undefined warmup in
     assert.equal(frame.oldestHour, first); assert.equal(frame.endHour, first + 95 * hour)
     assert.equal(frame.historyExhausted, true); assert.equal(frame.indicatorState, 'unavailable')
     assert.ok(visible(frame).every((bar: any) => bar.ema === null && bar.indicatorsObserved && bar.statisticsObserved))
+    const local = await f.pipeline.localHistory(instId, '1H')
+    assert.equal(local.bars.length, 120); assert.equal(local.oldestHour, first); assert.equal(local.historyExhausted, true)
+    assert.equal(await f.pipeline.localHistory(instId, '1H', first + 94 * hour), null, 'A proven listing floor cannot be crossed by local navigation.')
   } finally { await f.close() }
 })
 

@@ -665,6 +665,22 @@ test('close releases stats waiting for queued or writing candle dependencies bef
   }
 })
 
+test('source admission delays cannot shorten the next start interval or serialize HTTP completion', async () => {
+  let now = 1_000
+  const { sync } = create({ now: () => now, minRequestIntervalMS: 20 })
+  const starts: number[] = [], release = deferred()
+  const signal = new AbortController().signal
+  const lane = sync as any
+  lane.delay = async (milliseconds: number) => { now += milliseconds }
+  try {
+    const first = lane.callSource(() => { now += 7; starts.push(now); return release.promise }, signal, { priority: 'foreground' })
+    await lane.callSource(() => { starts.push(now); return {} }, signal, { priority: 'foreground' })
+    assert.deepEqual(starts, [1_007, 1_027], 'Pacing must start from the actual invocation, including time spent admitting the source.')
+    release.resolve()
+    await first
+  } finally { release.resolve(); await sync.close() }
+})
+
 test('concurrent inspections and HTTP fetches share the global request-start interval without awaiting HTTP completion', async () => {
   const storage = sourceStorage(), entered = deferred(), release = deferred(), calls: number[] = []
   let fetches = 0

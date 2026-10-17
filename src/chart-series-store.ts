@@ -15,6 +15,7 @@ export type ReadyChartBoundary = Readonly<{ firstEnd: number; lastEnd: number }>
 export type PreparedChartStoreLimits = { maxSeries?: number; maxBarsPerSeries?: number; maxWindowsPerSeries?: number }
 type CachedBar = { bar: PreparedChartBar; revision: number }
 type Series = {
+  epoch: number
   meta: PreparedChartMeta
   bars: Map<number, CachedBar>
   hours: number[]
@@ -46,6 +47,7 @@ function readyWindow(meta: PreparedChartMeta, bars: PreparedChartBar[], endHour:
 
 /** Only completed, prepared observations enter this cache. Rendering never reads a partial series. */
 export class PreparedChartStore {
+  private nextEpoch = 0
   private readonly series = new Map<string, Series>()
   private readonly latestFrames = new Map<string, { meta: PreparedChartMeta; window: ReadyChartWindow }>()
   // Keep only the numeric watermark after eviction so in-flight old generations cannot reenter this session.
@@ -56,7 +58,7 @@ export class PreparedChartStore {
   private readonly maxBarsPerSeries: number
   private readonly maxWindowsPerSeries: number
 
-  constructor({ maxSeries = 12, maxBarsPerSeries = 4_096, maxWindowsPerSeries = 512 }: PreparedChartStoreLimits = {}) {
+  constructor({ maxSeries = 12, maxBarsPerSeries = 16_384, maxWindowsPerSeries = 512 }: PreparedChartStoreLimits = {}) {
     if (![maxSeries, maxBarsPerSeries, maxWindowsPerSeries].every(value => Number.isSafeInteger(value) && value > 0) || maxBarsPerSeries < WINDOW_BARS) {
       throw new RangeError('Prepared chart cache limits must be positive integers and retain at least 96 candles per series.')
     }
@@ -78,6 +80,8 @@ export class PreparedChartStore {
 
   get size() { return this.series.size }
   get latestSize() { return this.latestFrames.size }
+  /** Changes when a full history entry is recreated after eviction. Compact frames do not count. */
+  historyEpoch(instId: string, timeframe: RadarTimeframe) { return this.series.get(keyFor(instId, timeframe))?.epoch ?? 0 }
   latestEnd(instId: string, timeframe: RadarTimeframe) { return this.snapshotMeta(instId, timeframe)?.latestEnd ?? null }
   oldestHour(instId: string, timeframe: RadarTimeframe) { return this.snapshotMeta(instId, timeframe)?.oldestHour ?? null }
   snapshotMeta(instId: string, timeframe: RadarTimeframe): PreparedChartMeta | null {
@@ -155,6 +159,7 @@ export class PreparedChartStore {
     const newGeneration = !entry || entry.meta.generation !== generation
     if (newGeneration) {
       entry = {
+        epoch: ++this.nextEpoch,
         meta: latest?.meta ?? Object.freeze({ key, instId, timeframe, intervalMS, generation, revision, latestEnd: null, oldestHour: null, historyExhausted: false, error: '' }),
         bars: new Map(latest?.window.bars.map(bar => [bar.hour, { bar, revision: latest.meta.revision }]) ?? []),
         hours: latest?.window.bars.map(bar => bar.hour) ?? [],

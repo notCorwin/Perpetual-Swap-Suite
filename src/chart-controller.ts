@@ -16,10 +16,12 @@ export type ChartView = {
 export type ChartTransport = {
   prepare: (target: ChartTarget) => Promise<PreparedChartResponse>
   local: (instId: string, timeframe: RadarTimeframe) => Promise<PreparedChartResponse | null>
+  history?: (target: ChartTarget) => Promise<PreparedChartResponse | null>
   universe: (instIds: string[], timeframe: RadarTimeframe, focusInstId?: string) => Promise<{ frames: PreparedChartResponse[] }>
 }
 const targetKey = (target: ChartTarget) => `${target.timeframe}:${target.instId}:${target.end ?? 'latest'}`
 const sameSeries = (left: ChartTarget, right: ChartTarget) => left.instId === right.instId && left.timeframe === right.timeframe
+const seriesKey = (target: ChartTarget) => `${target.timeframe}:${target.instId}`
 
 /** Local navigation never waits for provider work. Each remote lane keeps only the latest intent. */
 export class ChartController {
@@ -33,6 +35,9 @@ export class ChartController {
   private maintenanceTarget: ChartTarget | null = null
   private localWorking = false
   private localCheckedKey: string | null = null
+  private historyTargets = new Set<string>()
+  private historyChecked = new Map<string, string>()
+  private historyHydrated = new Map<string, string>()
   private universeIds: string[] = []
   private universeTimeframe: RadarTimeframe = '1H'
   private universeKey = ''
@@ -115,8 +120,7 @@ export class ChartController {
     this.failureCount = 0
     this.retryAt = 0
     this.localCheckedKey = null
-    this.publish({ ...this.view, requested: target, pending: true, error: '', unavailable: null })
-    this.commit()
+    this.commit(target)
     void this.pump()
   }
 
@@ -126,8 +130,7 @@ export class ChartController {
     for (const listener of this.listeners) listener()
   }
 
-  private commit() {
-    const requested = this.view.requested
+  private commit(requested = this.view.requested) {
     if (!requested) return false
     const meta = this.store.snapshotMeta(requested.instId, requested.timeframe)
     let target = requested
@@ -140,11 +143,11 @@ export class ChartController {
       requested: target,
       presented: ready ?? this.view.presented,
       pending: ready === null,
-      error: ready ? '' : this.view.error,
+      error: ready || requested !== this.view.requested ? '' : this.view.error,
       oldestHour: meta?.oldestHour ?? null,
       latestEnd: meta?.latestEnd ?? null,
       historyExhausted: meta?.historyExhausted ?? false,
-      unavailable: ready ? null : this.view.unavailable,
+      unavailable: ready || requested !== this.view.requested ? null : this.view.unavailable,
     })
     return ready !== null
   }
@@ -195,6 +198,21 @@ export class ChartController {
       if (!this.localWorking) void this.hydrateLocal(target)
       return
     }
+    // Focused durable history has its own lane. A slow provider request must
+    // never prevent an already saved range from entering the renderer cache.
+    const key = seriesKey(target)
+    const watermark = this.historyWatermark(target)
+    const historyKey = `${targetKey(target)}:${watermark}`
+    if (this.transport.history) {
+      if (this.historyTargets.has(key)) return
+      if (!ready && this.historyChecked.get(key) !== historyKey
+        || ready && this.historyHydrated.get(key) !== watermark) {
+        // Bound local work while allowing a newly selected series to bypass
+        // one older read. Further selections coalesce in view.requested.
+        if (this.historyTargets.size < 2) void this.hydrateHistory(target, historyKey, watermark)
+        return
+      }
+    }
     if (this.retryAt > Date.now()) { this.wake(this.retryAt - Date.now()); return }
     if (!ready || this.refresh) {
       if (this.demandTarget || this.maintenanceTarget && sameSeries(this.maintenanceTarget, target)) return
@@ -222,6 +240,34 @@ export class ChartController {
     }
   }
 
+  private historyWatermark(target: ChartTarget) {
+    const meta = this.store.snapshotMeta(target.instId, target.timeframe)
+    return `${meta?.generation ?? -1}:${meta?.revision ?? -1}:${meta?.latestEnd ?? -1}:${this.store.historyEpoch(target.instId, target.timeframe)}`
+  }
+
+  private async hydrateHistory(target: ChartTarget, checkedKey: string, watermark: string) {
+    const key = seriesKey(target)
+    this.historyTargets.add(key)
+    try {
+      const response = await this.transport.history!(target)
+      if (response) {
+        const accepted = this.store.ingest(response)
+        const meta = this.store.snapshotMeta(target.instId, target.timeframe)
+        // A newer compact notification can arrive while this bulk read is in
+        // flight. Its revision must not certify older historical observations.
+        if (accepted) this.historyHydrated.set(key, `${response.generation}:${response.revision}:${meta?.latestEnd ?? -1}:${this.store.historyEpoch(target.instId, target.timeframe)}`)
+        if (this.active) this.commit()
+      } else this.historyHydrated.set(key, watermark)
+    } catch {
+      // A failed local read cannot hold the independent source repair lane.
+      this.historyHydrated.set(key, watermark)
+    } finally {
+      this.historyChecked.set(key, checkedKey)
+      this.historyTargets.delete(key)
+      void this.pump()
+    }
+  }
+
   private async run(job: ChartTarget, kind: 'target' | 'refresh' | 'prefetch') {
     let failed = false
     let unavailableRetryAt: number | null = null
@@ -235,6 +281,7 @@ export class ChartController {
         } else if (kind === 'prefetch') this.prefetchAfter = Math.max(Date.now() + 5_000, response.unavailable.retryAt)
       } else {
         const accepted = this.store.ingest(response)
+        if (accepted && kind !== 'refresh') this.historyHydrated.delete(seriesKey(job))
         const prepared = this.store.window(job.instId, job.timeframe, response.endHour)
         if (accepted && !prepared) throw new Error('The selected range does not yet contain 96 complete source candles.')
         if (this.active) this.commit()
@@ -264,5 +311,6 @@ export class ChartController {
 export const chartController = new ChartController({
   prepare: target => window.radarDesktop.request({ chartWindow: { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } }),
   local: (instId, timeframe) => window.radarDesktop.request({ chartLocal: { instId, timeframe } }),
+  history: target => window.radarDesktop.request({ chartHistory: { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } }),
   universe: (instIds, timeframe, focusInstId) => window.radarDesktop.request({ chartUniverse: { instIds, timeframe, focusInstId } }),
 })

@@ -64,7 +64,7 @@ Select a contract and choose **5m**, **15m**, or **1h**. The default chart timef
 | Copy chart | Copy the chart with an opaque theme background |
 | Analyze Long / Analyze Short | Analyze a captured chart snapshot |
 
-Each chart presents a complete 96-candle window. While another range is being prepared, the previous complete chart remains visible with a **Preparing** label. Data collection, storage, and indicator preparation run outside renderer interactions.
+Each chart presents a complete 96-candle window. Selecting a contract preloads up to 16,384 contiguous, fully prepared local candles into the chart cache, enough for the default 30 days of 5m history. Scrolling within that cache switches synchronously without waiting for IPC or network requests. This focused local preload runs independently of source requests; the contract list keeps compact latest frames. Missing or expired source observations still need background preparation. While an uncached range is being prepared, the previous complete chart remains visible with a **Preparing** label. Data collection, storage, and indicator preparation run outside renderer interactions.
 
 Indicators use one canonical contiguous native candle series, independently of the visible window. EMA seeds from 200 closes; BOLL uses arithmetic prices and population deviation; VWAP weights typical prices by base-currency volume; RSI uses Wilder smoothing and returns 50 for a flat run. Missing periods restart initialization, and missing values display as `—`. Older source additions and corrections invalidate derived calculations. See the [indicator contract](docs/INDICATORS.md) for formulas, units, initialization, and boundary conditions.
 

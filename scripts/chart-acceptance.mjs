@@ -83,13 +83,19 @@ export async function startPaintProbe(page, fixture) {
         const requestedEnd = Number(chart.dataset.chartRequestedEnd)
         if (chart.dataset.chartLoading === 'false' && requestedEnd > 0 && requestedEnd !== bars.at(-1)?.hour) fail('The chart claims completion for a different requested range.')
       }
-      if (snapshot === probe.previousSnapshot) return
+      if (snapshot === probe.previousSnapshot) {
+        if (frame && probe.commits.at(-1)?.presentedAt === null) probe.commits.at(-1).presentedAt = performance.now()
+        return
+      }
       probe.previousSnapshot = snapshot
       probe.paints += 1
       const intervalMS = series[timeframe]?.intervalMS
       if (!Array.isArray(bars)) { fail('The rendered snapshot has no bars.'); return }
       probe.minimumBars = Math.min(probe.minimumBars, bars.length)
-      probe.commits.push({ at: performance.now(), end: bars.at(-1)?.hour, timeframe })
+      // A mutation is a React commit; the following animation frame is the
+      // first paint opportunity that includes that committed SVG. Keep both
+      // times so input latency does not mistake a DOM mutation for a frame.
+      probe.commits.push({ at: performance.now(), presentedAt: frame ? performance.now() : null, end: bars.at(-1)?.hour, timeframe })
       if (bars.length !== 96) fail(`Rendered ${bars.length} bars for ${timeframe}.`)
       if (snapshot.instId !== instId || svg.dataset.renderedInst !== instId) fail('Mixed instrument in the rendered surface.')
       if (svg.dataset.renderedTimeframe !== timeframe) fail('SVG and snapshot timeframes disagree.')
@@ -180,34 +186,93 @@ export async function wheelBurst(page, { frames = 1, eventsPerFrame = 1, deltaY 
   }, { frames, eventsPerFrame, deltaY, deltaX, deltaMode })
 }
 
-export async function installRequestProbe(electron, instId, { holdHistorical = false } = {}) {
-  await electron.evaluate(({ ipcMain }, { instId, holdHistorical }) => {
+export async function measurePaintLatency(page, { inputs, targets }) {
+  const latestInput = inputs.at(-1)
+  const expectedEnd = targets.at(-1)
+  await page.waitForFunction(({ latestInput, expectedEnd }) => window.__chartPaintProbe?.commits.some(commit =>
+    commit.end === expectedEnd && commit.at >= latestInput && commit.presentedAt !== null), { latestInput, expectedEnd })
+  return page.evaluate(({ inputs, targets }) => {
+    const commits = window.__chartPaintProbe.commits
+    const matching = inputs.map((input, index) => commits.find(commit => commit.end === targets[index] && commit.at >= input && commit.presentedAt !== null))
+    const latencies = matching.flatMap((commit, index) => commit ? [commit.presentedAt - inputs[index]] : []).sort((left, right) => left - right)
+    const percentile = ratio => Number((latencies[Math.min(latencies.length - 1, Math.floor(latencies.length * ratio))] ?? 0).toFixed(3))
+    const latest = matching.at(-1)
+    return {
+      committedInputs: latencies.length, supersededInputs: inputs.length - latencies.length,
+      p50InputToPaintMS: percentile(.5), p95InputToPaintMS: percentile(.95),
+      latestInputToPaintMS: Number((latest.presentedAt - inputs.at(-1)).toFixed(3)),
+      latestInputToCommitMS: Number((latest.at - inputs.at(-1)).toFixed(3)),
+    }
+  }, { inputs, targets })
+}
+
+export async function waitForLocalHistory(electron, page, fixture, timeframe = fixture.timeframe) {
+  const preparedBars = fixture.series[timeframe].bars.filter(bar => bar.ema !== null).length
+  const deadline = Date.now() + 20_000
+  while (true) {
+    const requests = await readRequestProbe(electron)
+    if (requests.historyResponses.some(response => response.timeframe === timeframe && response.bars === preparedBars)) break
+    assert.ok(Date.now() < deadline, `The focused ${timeframe} series did not preload its ${preparedBars} initialized durable candles: ${JSON.stringify(requests.historyResponses)}`)
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  // IPC counting happens in the main process. Let the renderer receive and
+  // synchronously ingest that response before starting the wheel measurement.
+  await page.evaluate(async () => {
+    for (let frame = 0; frame < 2; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve))
+  })
+  return preparedBars
+}
+
+export async function installRequestProbe(electron, instId, { holdHistorical = false, disableLocalHistory = false } = {}) {
+  await electron.evaluate(({ ipcMain }, { instId, holdHistorical, disableLocalHistory }) => {
     const original = ipcMain._invokeHandlers.get('radar:request')
     const { MarketService } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/services/market-service.js')
     const originalGet = MarketService.prototype.get
-    const probe = { original, MarketService, originalGet, calls: [], active: 0, maxActive: 0, sourceCalls: 0, sourceRequests: [], held: false, callsAtHold: null, release: null }
+    const probe = {
+      original, MarketService, originalGet, calls: [], active: 0, maxActive: 0,
+      historyCalls: [], historyResponses: [], transferredHistoryBars: 0, transferredWindowBars: 0,
+      sourceCalls: 0, sourceRequests: [], holdSource: false, holdLatest: false, latestHeld: false,
+      held: false, callsAtHold: null, release: null,
+    }
     const released = new Promise(resolve => { probe.release = resolve })
     MarketService.prototype.get = function (path, parameters, ...rest) {
-      if (parameters?.instId === instId) { probe.sourceCalls += 1; probe.sourceRequests.push({ path, parameters: { ...parameters } }) }
+      if (parameters?.instId === instId) {
+        probe.sourceCalls += 1
+        probe.sourceRequests.push({ path, parameters: { ...parameters } })
+        if (probe.holdSource) return released.then(() => originalGet.call(this, path, parameters, ...rest))
+      }
       return originalGet.call(this, path, parameters, ...rest)
     }
     ipcMain.removeHandler('radar:request')
     ipcMain.handle('radar:request', async (event, value) => {
+      if (value.chartHistory?.instId === instId) {
+        probe.historyCalls.push({ ...value.chartHistory })
+        const response = disableLocalHistory ? null : await original(event, value)
+        const bars = response?.bars.length ?? 0
+        probe.transferredHistoryBars += bars
+        probe.historyResponses.push({ ...value.chartHistory, bars })
+        return response
+      }
       if (value.chartWindow?.instId !== instId) return original(event, value)
       probe.calls.push({ ...value.chartWindow })
       probe.active += 1
       probe.maxActive = Math.max(probe.maxActive, probe.active)
       try {
-        if (holdHistorical && !probe.held && Number.isFinite(value.chartWindow.endHour)) {
+        if (probe.holdLatest && !Number.isFinite(value.chartWindow.endHour)) {
+          probe.latestHeld = true
+          await released
+        } else if (holdHistorical && !probe.held && Number.isFinite(value.chartWindow.endHour)) {
           probe.held = true
           probe.callsAtHold = probe.calls.length
           await released
         }
-        return await original(event, value)
+        const response = await original(event, value)
+        probe.transferredWindowBars += response?.bars.length ?? 0
+        return response
       } finally { probe.active -= 1 }
     })
     globalThis.__chartRequestProbe = probe
-  }, { instId, holdHistorical })
+  }, { instId, holdHistorical, disableLocalHistory })
 }
 
 export async function releaseRequestProbe(electron) {
@@ -217,7 +282,13 @@ export async function releaseRequestProbe(electron) {
 export async function readRequestProbe(electron) {
   return electron.evaluate(() => {
     const probe = globalThis.__chartRequestProbe
-    return { calls: probe.calls, active: probe.active, maxActive: probe.maxActive, sourceCalls: probe.sourceCalls, sourceRequests: probe.sourceRequests, held: probe.held, callsAtHold: probe.callsAtHold }
+    return {
+      calls: probe.calls, active: probe.active, maxActive: probe.maxActive,
+      historyCalls: probe.historyCalls, historyResponses: probe.historyResponses,
+      transferredHistoryBars: probe.transferredHistoryBars, transferredWindowBars: probe.transferredWindowBars,
+      transferredBars: probe.transferredHistoryBars + probe.transferredWindowBars,
+      sourceCalls: probe.sourceCalls, sourceRequests: probe.sourceRequests, held: probe.held, latestHeld: probe.latestHeld, callsAtHold: probe.callsAtHold,
+    }
   })
 }
 

@@ -45,6 +45,169 @@ function cached(first = 1_000, count = 200) {
   return store
 }
 
+test('focused durable history is hydrated once and deep scrolling commits synchronously without provider work', async () => {
+  const queue = transportQueue()
+  let localReads = 0
+  const store = new PreparedChartStore()
+  const bulk = prepared(btc, 8_999, { bars: bars(199, 8_801) })
+  store.ingest(prepared(btc, 8_999))
+  const controller = new ChartController({ ...queue.transport, history: async () => { localReads += 1; return bulk } }, store)
+  const close = controller.open(btc, '1H')
+  const pending: boolean[] = []
+  const unsubscribe = controller.subscribe(() => { pending.push(controller.getSnapshot().pending) })
+  try {
+    await settled()
+    assert.equal(localReads, 1)
+    assert.equal(queue.calls.length, 0, 'Resident history outside the prefetch horizon must not need a provider request.')
+    for (const steps of [-1_200, -4_000, 3_000, -2_000, 4_200]) {
+      const previous = controller.getSnapshot().presented!.endHour
+      controller.scroll(steps)
+      assert.equal(controller.getSnapshot().presented?.endHour, previous + steps * hour)
+      assert.equal(controller.getSnapshot().pending, false)
+    }
+    assert.ok(pending.every(value => value === false), 'A cached cursor must publish a complete view atomically, without flashing Preparing.')
+    assert.equal(localReads, 1, 'Wheel events must not repeatedly serialize the durable history.')
+    assert.equal(queue.calls.length, 0)
+  } finally { close(); unsubscribe() }
+})
+
+test('a durable historical read bypasses an unresolved same-series provider request', async () => {
+  const queue = transportQueue()
+  let reads = 0
+  const controller = new ChartController({ ...queue.transport, history: async target => {
+    reads += 1
+    return target.end === null ? null : prepared(btc, 599, { latestEnd: 1_199 * hour, bars: bars(199, 1_001) })
+  } }, cached())
+  const close = controller.open(btc, '1H')
+  try {
+    await settled()
+    assert.equal(queue.calls.length, 1, 'A provider prefetch is deliberately left unresolved.')
+    controller.scroll(-600)
+    await settled()
+    assert.equal(reads, 2)
+    assert.equal(controller.getSnapshot().presented?.endHour, 599 * hour)
+    assert.equal(controller.getSnapshot().pending, false)
+    assert.equal(queue.calls.length, 1, 'Saved history must not queue behind provider preparation.')
+  } finally { close() }
+})
+
+test('a local history miss falls through to source repair without a local retry loop', async () => {
+  const queue = transportQueue()
+  let reads = 0
+  const controller = new ChartController({ ...queue.transport, history: async () => { reads += 1; return null } })
+  const close = controller.open(btc, '1H')
+  try {
+    await settled()
+    assert.equal(reads, 1)
+    assert.equal(queue.calls.length, 1)
+    queue.calls[0].resolve(prepared(btc, 199, { bars: bars(0, 200), oldestHour: 0, historyExhausted: true }))
+    await settled()
+    assert.equal(controller.getSnapshot().pending, false)
+    assert.equal(reads, 2, 'Newly durable observations can warm the cache once after repair.')
+    await settled()
+    assert.equal(reads, 2)
+  } finally { close() }
+})
+
+test('a newly selected contract hydrates beside an unresolved local read with bounded concurrency', async () => {
+  const queue = transportQueue(), store = cached()
+  store.ingest(prepared(eth, 1_199))
+  const reads: { target: ChartTarget; resolve: (value: PreparedChartResponse | null) => void }[] = []
+  const controller = new ChartController({ ...queue.transport, history: target => new Promise(resolve => { reads.push({ target, resolve }) }) }, store)
+  const closeBTC = controller.open(btc, '1H')
+  const closeETH = controller.open(eth, '1H')
+  let closeSOL = () => {}
+  try {
+    assert.equal(reads.length, 2)
+    assert.equal(reads[1].target.instId, eth)
+    store.ingest(prepared('SOL-USDT-SWAP', 1_199))
+    closeSOL = controller.open('SOL-USDT-SWAP', '1H')
+    assert.equal(reads.length, 2, 'Further local selections coalesce behind the two admitted reads.')
+    assert.equal(queue.calls.length, 0, 'Waiting to preload local data must not start provider work.')
+    reads[1].resolve(prepared(eth, 1_199, { bars: bars(199, 1_001) }))
+    await settled()
+    assert.equal(reads.length, 3)
+    assert.equal(reads[2].target.instId, 'SOL-USDT-SWAP')
+    reads[2].resolve(prepared('SOL-USDT-SWAP', 1_199, { bars: bars(199, 1_001) }))
+    await settled()
+    controller.scroll(-100)
+    assert.equal(controller.getSnapshot().presented?.instId, 'SOL-USDT-SWAP')
+    assert.equal(controller.getSnapshot().presented?.endHour, 1_099 * hour)
+    reads[0].resolve(prepared(btc, 1_199, { bars: bars(199, 1_001) }))
+    await settled()
+    assert.equal(controller.getSnapshot().presented?.instId, 'SOL-USDT-SWAP')
+    assert.equal(queue.calls.length, 0)
+  } finally { closeBTC(); closeETH(); closeSOL() }
+})
+
+test('revisiting a market preloads again after history eviction while compact latest stays ready', async () => {
+  const queue = transportQueue(), store = new PreparedChartStore({ maxSeries: 1 })
+  const reads: string[] = []
+  const controller = new ChartController({ ...queue.transport,
+    universe: async ids => ({ frames: ids.map(id => prepared(id, 1_199)) }),
+    history: async target => { reads.push(target.instId); return prepared(target.instId, 1_199, { bars: bars(199, 1_001) }) },
+  }, store)
+  controller.setUniverse([btc, eth], '1H')
+  await settled()
+  const closeBTC = controller.open(btc, '1H')
+  await settled()
+  const firstEpoch = store.historyEpoch(btc, '1H')
+  const closeETH = controller.open(eth, '1H')
+  await settled()
+  assert.equal(store.historyEpoch(btc, '1H'), 0)
+  assert.ok(store.window(btc, '1H'), 'Compact latest survives history eviction.')
+  const revisitBTC = controller.open(btc, '1H')
+  try {
+    await settled()
+    assert.deepEqual(reads, [btc, eth, btc])
+    assert.ok(store.historyEpoch(btc, '1H') > firstEpoch)
+    controller.scroll(-100)
+    assert.equal(controller.getSnapshot().presented?.endHour, 1_099 * hour)
+    assert.equal(controller.getSnapshot().pending, false)
+    assert.equal(queue.calls.length, 0)
+  } finally { closeBTC(); closeETH(); revisitBTC() }
+})
+
+test('a same-generation statistics correction refreshes deep cached bars without reloading for identical notifications', async () => {
+  const queue = transportQueue(), store = new PreparedChartStore()
+  let revision = 1, reads = 0
+  const bulk = () => prepared(btc, 1_199, { revision, bars: bars(199, 1_001).map(bar => ({ ...bar, oi: revision === 1 ? null : 9_999 })) })
+  store.ingest(prepared(btc, 1_199))
+  const controller = new ChartController({ ...queue.transport, history: async () => { reads += 1; return bulk() } }, store)
+  const close = controller.open(btc, '1H')
+  try {
+    await settled()
+    assert.equal(store.window(btc, '1H', 599 * hour)?.bars.at(-1)?.oi, null)
+    revision = 2
+    const latest = prepared(btc, 1_199, { revision })
+    controller.ingestPrepared(latest)
+    await settled()
+    assert.equal(reads, 2)
+    assert.equal(store.window(btc, '1H', 599 * hour)?.bars.at(-1)?.oi, 9_999)
+    controller.ingestPrepared(latest)
+    await settled()
+    assert.equal(reads, 2, 'Identical data revisions must not serialize history again.')
+  } finally { close() }
+})
+
+test('a newer compact revision cannot certify an older bulk read still in flight', async () => {
+  const queue = transportQueue(), store = new PreparedChartStore()
+  const reads: ((value: PreparedChartResponse) => void)[] = []
+  store.ingest(prepared(btc, 1_199))
+  const controller = new ChartController({ ...queue.transport, history: () => new Promise(resolve => { reads.push(resolve) }) }, store)
+  const close = controller.open(btc, '1H')
+  try {
+    controller.ingestPrepared(prepared(btc, 1_199, { revision: 2 }))
+    reads[0](prepared(btc, 1_199, { bars: bars(199, 1_001) }))
+    await settled()
+    assert.equal(reads.length, 2, 'The stale bulk read must not consume the newer durable revision notification.')
+    reads[1](prepared(btc, 1_199, { revision: 2, bars: bars(199, 1_001).map(bar => ({ ...bar, oi: 9_999 })) }))
+    await settled()
+    assert.equal(store.window(btc, '1H', 599 * hour)?.bars.at(-1)?.oi, 9_999)
+    assert.equal(controller.getSnapshot().pending, false)
+  } finally { close() }
+})
+
 test('an initial chart becomes visible only as one complete prepared window', async () => {
   const queue = transportQueue()
   const controller = new ChartController(queue.transport)

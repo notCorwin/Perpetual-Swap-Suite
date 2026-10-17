@@ -28,6 +28,7 @@ export class MarketService {
   setChartUniverse(instIds: string[], timeframe: '5m' | '15m' | '1H', focusInstId?: string): Promise<{ frames: PreparedChartWindow[] }>
   subscribePreparedCharts(listener: (frame: PreparedChartWindow) => void): () => void
   localChartWindow(instId: string, timeframe: '5m' | '15m' | '1H'): Promise<PreparedChartWindow | null>
+  localChartHistory(instId: string, timeframe: '5m' | '15m' | '1H', end?: number): Promise<PreparedChartWindow | null>
   dispose(): Promise<void>
   snapshot(timeframe?: '5m' | '15m' | '1H'): Promise<{ rows: RankedMarketRow[]; revision: number; error: string; loading: boolean; updatedAt: number | null; timeframe: '5m' | '15m' | '1H'; realtimeState: 'connecting' | 'live' | 'reconnecting' | 'disconnected'; catalogSource: 'none' | 'cache' | 'live'; catalogProgress: CatalogProgress; listProgress: { total: number; completed: number; pending: number; retrying: number; unavailable: number } }>
 }

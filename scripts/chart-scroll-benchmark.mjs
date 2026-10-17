@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { assertCompletePaints, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, startPaintProbe, waitForRendered, wheelBurst } from './chart-acceptance.mjs'
+import { assertCompletePaints, finishPaintProbe, installRequestProbe, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from './chart-acceptance.mjs'
 
 const root = new URL('..', import.meta.url).pathname
 
@@ -18,7 +18,6 @@ async function withBenchmarkApp(run) {
     const page = await electron.firstWindow()
     await page.waitForLoadState('domcontentloaded')
     const fixture = await page.evaluate(() => window.radarDesktop.request({ e2e: { action: 'seedChartScrollBenchmark' } }))
-    await openChart(page, fixture)
     return await run(electron, page, fixture)
   } finally {
     await electron?.close()
@@ -28,12 +27,16 @@ async function withBenchmarkApp(run) {
 
 const performanceReport = await withBenchmarkApp(async (electron, page, fixture) => {
   const timeframes = []
-  for (const timeframe of fixture.timeframes) {
-    await selectTimeframe(page, timeframe)
-    await waitForRendered(page, fixture, timeframe)
-    await installRequestProbe(electron, fixture.instId)
-    await startPaintProbe(page, fixture)
-    try {
+  await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
+  try {
+    await openChart(page, fixture)
+    for (const timeframe of fixture.timeframes) {
+      await selectTimeframe(page, timeframe)
+      await waitForRendered(page, fixture, timeframe)
+      const residentHistoryBars = await waitForLocalHistory(electron, page, fixture, timeframe)
+      await electron.evaluate(() => { globalThis.__chartRequestProbe.holdSource = true; globalThis.__chartRequestProbe.holdLatest = true })
+      const beforeScrolling = await readRequestProbe(electron)
+      await startPaintProbe(page, fixture)
       const intervalMS = fixture.series[timeframe].intervalMS
       const phases = []
       let distance = 0
@@ -43,25 +46,11 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
         distance += candles
         const end = fixture.end - distance * intervalMS
         await waitForRendered(page, fixture, timeframe, end)
-        const observation = await page.evaluate(({ expectedEnd, inputs, targets }) => {
-          const commits = window.__chartPaintProbe.commits
-          const latencies = inputs.flatMap((input, index) => {
-            const commit = commits.find(commit => commit.end === targets[index] && commit.at >= input)
-            return commit ? [commit.at - input] : []
-          }).sort((left, right) => left - right)
-          const percentile = ratio => Number((latencies[Math.min(latencies.length - 1, Math.floor(latencies.length * ratio))] ?? 0).toFixed(3))
-          return {
-            paintedAt: commits.findLast(commit => commit.end === expectedEnd)?.at ?? performance.now(), settledAt: performance.now(),
-            committedInputs: latencies.length, supersededInputs: inputs.length - latencies.length,
-            p50InputToPaintMS: percentile(.5), p95InputToPaintMS: percentile(.95),
-          }
-        }, { expectedEnd: end, inputs, targets: inputs.map((_, index) => fixture.end - (startingDistance + candles / inputs.length * (index + 1)) * intervalMS) })
+        const observation = await measurePaintLatency(page, { inputs, targets: inputs.map((_, index) => fixture.end - (startingDistance + candles / inputs.length * (index + 1)) * intervalMS) })
+        assert.ok(observation.latestInputToPaintMS < 100, `Warm ${timeframe} ${name} took ${observation.latestInputToPaintMS} ms from latest input to its first paint opportunity.`)
         phases.push({
           name, frames: options.frames ?? 1, eventsPerFrame: options.eventsPerFrame ?? 1,
-          candles, end, committedInputs: observation.committedInputs, supersededInputs: observation.supersededInputs,
-          p50InputToPaintMS: observation.p50InputToPaintMS, p95InputToPaintMS: observation.p95InputToPaintMS,
-          latestInputToPaintMS: Number(Math.max(0, observation.paintedAt - inputs.at(-1)).toFixed(3)),
-          latestInputToSettledMS: Number(Math.max(0, observation.settledAt - inputs.at(-1)).toFixed(3)),
+          candles, end, ...observation,
         })
       }
       await sweep('resident', { frames: 18, eventsPerFrame: 3, deltaY: 12 }, 54)
@@ -73,28 +62,40 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
       const paint = await finishPaintProbe(page)
       assertCompletePaints(paint)
       const requests = await readRequestProbe(electron)
-      assert.equal(requests.maxActive, 1, 'The chart must serialize preparation and coalesce pending input.')
-      assert.equal(requests.sourceCalls, 0, `Scrolling complete durable data must not redownload it: ${JSON.stringify(requests.sourceRequests)}`)
+      const scrollingRequests = requests.calls.slice(beforeScrolling.calls.length)
+      const historicalRequests = scrollingRequests.filter(call => Number.isFinite(call.endHour))
+      assert.deepEqual(historicalRequests, [], `Warm scrolling must not prepare historical pages: ${JSON.stringify(historicalRequests)}`)
+      assert.equal(requests.sourceCalls, beforeScrolling.sourceCalls, `Warm scrolling must not attempt HTTP: ${JSON.stringify(requests.sourceRequests.slice(beforeScrolling.sourceCalls))}`)
+      assert.equal(requests.held, false, 'A warmed target must never wait for the deliberately held historical preparation lane.')
       timeframes.push({
         timeframe, phases, ...paint, commits: paint.commits.length,
-        preparedRequests: requests.calls.length, maxConcurrentRequests: requests.maxActive,
-        repeatedSourceDownloads: requests.sourceCalls,
+        preparedRequests: historicalRequests.length,
+        heldLatestRefreshRequests: scrollingRequests.length - historicalRequests.length,
+        localHistoryReads: requests.historyCalls.filter(call => call.timeframe === timeframe).length,
+        transferredHistoryBars: requests.historyResponses.filter(response => response.timeframe === timeframe).reduce((total, response) => total + response.bars, 0),
+        residentHistoryBars,
+        maxConcurrentRequests: requests.maxActive,
+        repeatedSourceDownloads: requests.sourceCalls - beforeScrolling.sourceCalls,
       })
-    } finally { await removeRequestProbe(electron) }
-  }
+    }
+  } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
   return { nativePeriods: fixture.timeframes, persistedPeriodsPerTimeframe: fixture.periods, timeframes }
 })
 
 const delayedHistory = await withBenchmarkApp(async (electron, page, fixture) => {
-  // Prime native latest snapshots before measuring history. A first visit
-  // legitimately checks the live tail and is not a duplicate history read.
-  for (const timeframe of fixture.timeframes) {
-    await selectTimeframe(page, timeframe)
-    await waitForRendered(page, fixture, timeframe)
-  }
-  await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
-  await startPaintProbe(page, fixture)
+  // This case intentionally disables the durable bulk lane before mounting
+  // React. Otherwise a 1200-candle jump is correctly an immediate local hit.
+  await installRequestProbe(electron, fixture.instId, { disableLocalHistory: true })
   try {
+    await openChart(page, fixture)
+    // Prime native latest snapshots before measuring the fallback path.
+    for (const timeframe of fixture.timeframes) {
+      await selectTimeframe(page, timeframe)
+      await waitForRendered(page, fixture, timeframe)
+    }
+    await removeRequestProbe(electron)
+    await installRequestProbe(electron, fixture.instId, { holdHistorical: true, disableLocalHistory: true })
+    await startPaintProbe(page, fixture)
     const started = Date.now()
     await wheelBurst(page, { deltaY: 14_400 })
     while (!(await readRequestProbe(electron)).held) {
@@ -124,6 +125,7 @@ const delayedHistory = await withBenchmarkApp(async (electron, page, fixture) =>
       heldForMS: 1_500, heldEnd, expectedEnd, latestIntentPreserved: true,
       ...paint, commits: paint.commits.length,
       preparedRequests: requests.calls.length, maxConcurrentRequests: requests.maxActive,
+      localHistoryReads: requests.historyCalls.length, transferredHistoryBars: requests.transferredHistoryBars,
       repeatedSourceDownloads: requests.sourceCalls,
     }
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
@@ -131,7 +133,7 @@ const delayedHistory = await withBenchmarkApp(async (electron, page, fixture) =>
 
 console.log(JSON.stringify({
   generatedAt: new Date().toISOString(),
-  mode: 'real-electron-svg-frame-correctness-and-controller-latency',
+  mode: 'real-electron-bulk-history-svg-frame-correctness-and-input-to-paint-opportunity',
   performance: performanceReport,
   delayedHistory,
 }, null, 2))

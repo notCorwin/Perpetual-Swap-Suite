@@ -412,8 +412,11 @@ export class HistorySync {
       // may depend on this background page, so cross-source yielding can starve.
       if (task.priority === 'background' && [...this.tasks.values()].some(value => value.source === task.source && value.priority === 'foreground'
         && (value.status === 'queued' || (value.status === 'retry' && value.nextAttemptAt <= this.timestamp())))) throw foregroundReady
-      this.lastRequestAt = this.timestamp()
-      response = operation()
+      // Record after synchronous admission so a CPU pause before the source
+      // starts cannot shorten the interval before the next request. HTTP
+      // completion remains independent of this start-only lane.
+      try { response = operation() }
+      finally { this.lastRequestAt = this.timestamp() }
     })
     // Serialize starts, never HTTP completion or a source's dependency wait.
     this.requestTail = admission.catch(() => undefined)

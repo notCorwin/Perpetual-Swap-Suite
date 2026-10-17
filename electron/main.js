@@ -109,6 +109,7 @@ async function handleRequest(event, payload) {
     return marketService.prepareChartWindow(instId, timeframe, endHour)
   }
   if (request.chartLocal) return marketService.localChartWindow(request.chartLocal.instId, request.chartLocal.timeframe)
+  if (request.chartHistory) return marketService.localChartHistory(request.chartHistory.instId, request.chartHistory.timeframe, request.chartHistory.endHour)
   if (request.chartUniverse) {
     const { instIds, timeframe, focusInstId } = request.chartUniverse
     return marketService.setChartUniverse(instIds, timeframe, focusInstId)

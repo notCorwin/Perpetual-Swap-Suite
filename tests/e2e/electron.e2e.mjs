@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { assertCompletePaints, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, startPaintProbe, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
+import { assertCompletePaints, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
 
 const root = new URL('../..', import.meta.url).pathname
 const userData = await mkdtemp(join(tmpdir(), 'perp-radar-e2e-'))
@@ -70,7 +70,7 @@ const installPreparedTransform = async options => electron.evaluate(({ ipcMain, 
     if (value.chartWindow?.instId === options.instId) probe.calls += 1
     const response = await original(event, value)
     return value.chartUniverse ? { ...response, frames: response.frames.map(transform) }
-      : value.chartLocal || value.chartWindow ? transform(response) : response
+      : value.chartLocal || value.chartHistory || value.chartWindow ? transform(response) : response
   })
   contents.send = function (channel, ...args) {
     if (channel === 'radar:chart-prepared') args[0] = transform(args[0])
@@ -283,30 +283,54 @@ test('the 1600 design workspace keeps both panels and chart selection when searc
   }
 })
 
-test('high velocity wheel bursts and reversals present only complete correct charts in 5m, 15m, and 1h', async () => {
+test('bulk-warmed history scrolls, reverses, and jumps within 100 ms without preparation or HTTP in every native timeframe', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  await openChart(page, fixture)
-  for (const timeframe of fixture.timeframes) {
-    await selectTimeframe(page, timeframe)
-    await waitForRendered(page, fixture, timeframe)
-    await startPaintProbe(page, fixture)
-    const intervalMS = fixture.series[timeframe].intervalMS
-    await wheelBurst(page, { frames: 6, eventsPerFrame: 32, deltaY: 36 })
-    await wheelBurst(page, { frames: 3, eventsPerFrame: 32, deltaY: -36 })
-    const expectedEnd = fixture.end - 288 * intervalMS
-    await waitForRendered(page, fixture, timeframe, expectedEnd)
-    await wheelBurst(page, { deltaY: 14_400 })
-    await waitForRendered(page, fixture, timeframe, expectedEnd - 1_200 * intervalMS)
-    assertCompletePaints(await finishPaintProbe(page))
-  }
+  // Any accidental historical preparation is held indefinitely. Source reads
+  // are also stalled after warming, so successful navigation proves that it
+  // depends only on the already transferred durable series.
+  await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
+  try {
+    await openChart(page, fixture)
+    for (const timeframe of fixture.timeframes) {
+      await selectTimeframe(page, timeframe)
+      await waitForRendered(page, fixture, timeframe)
+      const residentHistoryBars = await waitForLocalHistory(electron, page, fixture, timeframe)
+      await electron.evaluate(() => { globalThis.__chartRequestProbe.holdSource = true; globalThis.__chartRequestProbe.holdLatest = true })
+      const before = await readRequestProbe(electron)
+      await startPaintProbe(page, fixture)
+      const intervalMS = fixture.series[timeframe].intervalMS
+      let distance = 0
+      for (const phase of [
+        { name: 'high velocity', frames: 6, eventsPerFrame: 32, deltaY: 36, candles: 576 },
+        { name: 'reversal', frames: 3, eventsPerFrame: 32, deltaY: -36, candles: -288 },
+        { name: '1200-candle jump', deltaY: 14_400, candles: 1_200 },
+      ]) {
+        const inputs = await wheelBurst(page, phase)
+        const targets = inputs.map((_, index) => fixture.end - (distance + phase.candles / inputs.length * (index + 1)) * intervalMS)
+        distance += phase.candles
+        await waitForRendered(page, fixture, timeframe, targets.at(-1))
+        const latency = await measurePaintLatency(page, { inputs, targets })
+        assert.ok(latency.latestInputToPaintMS < 100, `${timeframe} ${phase.name} took ${latency.latestInputToPaintMS} ms from the latest wheel input to its first paint opportunity.`)
+      }
+      assertCompletePaints(await finishPaintProbe(page))
+      const after = await readRequestProbe(electron)
+      const historicalRequests = after.calls.slice(before.calls.length).filter(call => Number.isFinite(call.endHour))
+      assert.deepEqual(historicalRequests, [], `A warmed ${timeframe} scroll crossed the historical preparation IPC boundary: ${JSON.stringify(historicalRequests)}`)
+      assert.equal(after.sourceCalls, before.sourceCalls, `A warmed ${timeframe} scroll attempted HTTP: ${JSON.stringify(after.sourceRequests.slice(before.sourceCalls))}`)
+      assert.equal(after.held, false, 'Every tested target must already be resident; none may wait for the deliberately held preparation lane.')
+      assert.ok(after.transferredHistoryBars >= residentHistoryBars, 'The fixture must exercise a bulk durable-history transfer.')
+    }
+  } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
 
 test('a held history read keeps the last complete paint and coalesces every later wheel event into the latest target', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  await openChart(page, fixture)
-  await startPaintProbe(page, fixture)
-  await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
+  await installRequestProbe(electron, fixture.instId, { disableLocalHistory: true })
   try {
+    await openChart(page, fixture)
+    await removeRequestProbe(electron)
+    await installRequestProbe(electron, fixture.instId, { holdHistorical: true, disableLocalHistory: true })
+    await startPaintProbe(page, fixture)
     await wheelBurst(page, { deltaY: 14_400 })
     await waitFor(async () => (await readRequestProbe(electron)).held)
     await wheelBurst(page, { frames: 4, eventsPerFrame: 32, deltaY: 12 })
@@ -340,14 +364,16 @@ test('a held history read keeps the last complete paint and coalesces every late
 
 test('a late history response cannot overwrite a more recently selected timeframe', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  await openChart(page, fixture)
-  for (const timeframe of fixture.timeframes) {
-    await selectTimeframe(page, timeframe)
-    await waitForRendered(page, fixture, timeframe)
-  }
-  await startPaintProbe(page, fixture)
-  await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
+  await installRequestProbe(electron, fixture.instId, { disableLocalHistory: true })
   try {
+    await openChart(page, fixture)
+    for (const timeframe of fixture.timeframes) {
+      await selectTimeframe(page, timeframe)
+      await waitForRendered(page, fixture, timeframe)
+    }
+    await removeRequestProbe(electron)
+    await installRequestProbe(electron, fixture.instId, { holdHistorical: true, disableLocalHistory: true })
+    await startPaintProbe(page, fixture)
     await wheelBurst(page, { deltaY: 14_400 })
     await waitFor(async () => (await readRequestProbe(electron)).held)
     await selectTimeframe(page, '5m')

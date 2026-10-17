@@ -34,6 +34,7 @@ export type DesktopCommands = {
   captureChart: { input: ChartCaptureBounds & { output?: 'png' }; output: { ok: boolean } }
   chartWindow: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number }; output: PreparedChartResponse }
   chartLocal: { input: { instId: string; timeframe: RadarTimeframe }; output: PreparedChartResponse | null }
+  chartHistory: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number }; output: PreparedChartResponse | null }
   chartUniverse: { input: { instIds: string[]; timeframe: RadarTimeframe; focusInstId?: string }; output: { frames: PreparedChartResponse[] } }
 }
 export type DesktopRequest = { [K in keyof DesktopCommands]: { [P in K]: DesktopCommands[K]['input'] } }[keyof DesktopCommands]
@@ -51,6 +52,7 @@ export interface RadarDesktop {
   request(value: { captureChart: DesktopCommands['captureChart']['input'] }): Promise<DesktopCommands['captureChart']['output']>
   request(value: { chartWindow: DesktopCommands['chartWindow']['input'] }): Promise<DesktopCommands['chartWindow']['output']>
   request(value: { chartLocal: DesktopCommands['chartLocal']['input'] }): Promise<DesktopCommands['chartLocal']['output']>
+  request(value: { chartHistory: DesktopCommands['chartHistory']['input'] }): Promise<DesktopCommands['chartHistory']['output']>
   request(value: { chartUniverse: DesktopCommands['chartUniverse']['input'] }): Promise<DesktopCommands['chartUniverse']['output']>
 }
 declare global { interface Window { radarDesktop: RadarDesktop } }

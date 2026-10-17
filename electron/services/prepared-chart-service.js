@@ -3,6 +3,7 @@ import { statisticsMask } from './statistics-state.js'
 
 const VISIBLE = 96
 const WARMUP = 199
+const LOCAL_HISTORY_BARS = 16_384
 const SNAPSHOT_SCHEMA = 2
 const FORMULA_VERSION = 'native-ema200-wilder-flat50-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v2'
 const REFRESH_MS = 60_000
@@ -344,6 +345,62 @@ export class PreparedChartPipeline {
     })().finally(() => { if (this.localTasks.get(key) === task) this.localTasks.delete(key) })
     this.localTasks.set(key, task)
     return task
+  }
+
+  /** Hydrate focused navigation from durable observations without admitting source work. */
+  async localHistory(instId, timeframe, targetEnd) {
+    if (!['5m', '15m', '1H'].includes(timeframe)) throw new Error('Unsupported chart timeframe.')
+    if (targetEnd !== undefined && !Number.isFinite(targetEnd)) throw new Error('Invalid chart window end.')
+    if (this.closed) throw new Error('Prepared chart data service is closed.')
+    return this.job(`local-history:${seriesKey(instId, timeframe)}:${targetEnd ?? 'latest'}`, async () => {
+      const state = this.state(instId, timeframe), step = state.intervalMS
+      state.active += 1
+      this.trim()
+      try {
+        while (!this.closed) {
+          await this.load(state, 'foreground')
+          if (this.closed) throw new Error('Prepared chart data service is closed.')
+          this.listingFloor(state)
+          const version = state.sourceVersion, liveVersion = state.liveVersion, generation = state.generation
+          await this.indicators(state, 'foreground')
+          if (!state.loaded || version !== state.sourceVersion || liveVersion !== state.liveVersion || generation !== state.generation) continue
+          const ceiling = Math.floor(Date.now() / step) * step - step
+          let count = 0, prior = null, latestEnd = null
+          for (const hour of [...state.rows.keys()].sort((left, right) => right - left)) {
+            if (hour > ceiling || state.floor !== null && hour < state.floor) continue
+            const bar = this.bar(state, hour)
+            count = bar ? prior !== null && prior - hour === step ? count + 1 : 1 : 0
+            prior = hour
+            if (count === VISIBLE) { latestEnd = hour + (VISIBLE - 1) * step; break }
+          }
+          if (latestEnd === null) return null
+          const end = targetEnd === undefined ? latestEnd : Math.min(Math.floor(targetEnd / step) * step, ceiling)
+          const first = end - (VISIBLE - 1) * step
+          if (state.floor !== null && first < state.floor) return null
+          const central = Array.from({ length: VISIBLE }, (_, index) => this.bar(state, first + index * step))
+          if (central.some(bar => !bar)) return null
+          const before = [], after = [], remaining = LOCAL_HISTORY_BARS - VISIBLE
+          for (let hour = first - step; before.length < remaining && (state.floor === null || hour >= state.floor); hour -= step) {
+            const bar = this.bar(state, hour)
+            if (!bar) break
+            before.push(bar)
+          }
+          for (let hour = end + step; before.length + after.length < remaining && hour <= ceiling; hour += step) {
+            const bar = this.bar(state, hour)
+            if (!bar) break
+            after.push(bar)
+          }
+          const bars = [...before.reverse(), ...central, ...after]
+          return this.produced(state, { instId, timeframe, intervalMS: step, endHour: end, latestEnd, oldestHour: state.floor,
+            historyExhausted: state.floor !== null && bars[0].hour <= state.floor, generation, revision: this.revision(instId), bars,
+            oiState: central.every(bar => bar.oi !== null) ? 'ready' : 'unavailable',
+            takerState: central.every(bar => bar.buy !== null && bar.sell !== null) ? 'ready' : 'unavailable',
+            indicatorState: central.every(bar => indicatorFields.every(field => Number.isFinite(bar[field]))) ? 'ready' : 'unavailable',
+            liveBar: end === latestEnd && state.live?.timestamp === end + step ? state.indicators.get(state.live.timestamp) : undefined, error: '' }, version)
+        }
+        throw new Error('Prepared chart data service is closed.')
+      } finally { state.active -= 1; this.trim() }
+    })
   }
 
   observe(rows, previous) {

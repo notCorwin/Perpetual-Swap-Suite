@@ -17,11 +17,15 @@ export async function installNavigationProbe(electron, page, fixture) {
     const released = new Promise(resolve => { probe.release = resolve })
     ipcMain.removeHandler('radar:request')
     ipcMain.handle('radar:request', async (event, value) => {
-      const kind = ['chartUniverse', 'chartLocal', 'chartWindow'].find(key => key in value)
+      const kind = ['chartUniverse', 'chartLocal', 'chartHistory', 'chartWindow'].find(key => key in value)
       let held = false
       if (kind) {
         const parameters = value[kind]
         probe.requests.push({ kind, ...parameters, at: Date.now() })
+        // Keep this one instrument intentionally cold before its first visit.
+        // The test exercises switching away from a held preparation request;
+        // ordinary selected instruments still hydrate their durable history.
+        if (kind === 'chartHistory' && parameters.instId === probe.holdInstId) return null
         if (kind === 'chartWindow' && parameters.instId === probe.holdInstId && Number.isFinite(parameters.endHour) && !probe.held) {
           held = probe.held = true
           await released
@@ -253,7 +257,9 @@ export async function exerciseInstrumentNavigation(electron, page, fixture) {
     const firstVisit = await nextFrame(() => first.locator.click(), { expectedInstId: first.instId, timeframe })
     if (holdThisPhase) {
       heldStartedAt = Date.now()
-      await page.locator('[data-chart-plot]').dispatchEvent('wheel', { deltaY: 9_600 })
+      // 650 candles exceeds the compact pages while retaining 199 earlier
+      // observations for the canonical EMA200 seed in this 1024-row fixture.
+      await page.locator('[data-chart-plot]').dispatchEvent('wheel', { deltaY: 7_800 })
       while (!(await navigationRequests(electron)).held) {
         const elapsed = Date.now() - heldStartedAt
         if (elapsed >= 10_000) {

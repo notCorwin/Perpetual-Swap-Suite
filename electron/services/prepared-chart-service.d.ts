@@ -20,6 +20,8 @@ export class PreparedChartPipeline {
   })
   prepare(instId: string, timeframe: HistoryTimeframe, targetEnd?: number): Promise<PreparedChartResponse>
   local(instId: string, timeframe: HistoryTimeframe, options?: { force?: boolean; priority?: HistoryPriority }): Promise<PreparedChartResponse | null>
+  /** Fully prepared durable navigation history; never queues an HTTP request. */
+  localHistory(instId: string, timeframe: HistoryTimeframe, targetEnd?: number): Promise<PreparedChartResponse | null>
   projectSeries(instId: string, timeframe: HistoryTimeframe): Promise<{ end: number | null; bars: Bar[] }>
   setUniverse(instIds: string[], timeframe: HistoryTimeframe, focusInstId?: string): { frames: PreparedChartResponse[] }
   subscribe(listener: (frame: PreparedChartResponse) => void): () => void
