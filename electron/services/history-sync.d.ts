@@ -76,6 +76,9 @@ export type HistorySyncOptions = {
   onProgress?(task: HistoryTask): MaybePromise<void>
   onError?(error: unknown, task?: HistoryTask): MaybePromise<void>
   now?: () => number
+  /** Maximum simultaneous tasks, with at most one per source; defaults to 1. Each page yields to ready foreground work, then rotates behind equal-priority peers. */
+  maxConcurrentTasks?: number
+  /** Global minimum spacing between source inspect/fetch starts, including concurrent sources; defaults to 125. */
   minRequestIntervalMS?: number
   retryBaseMS?: number
   maxRetryDelayMS?: number
@@ -86,8 +89,9 @@ export type HistorySyncOptions = {
 }
 export class HistorySync {
   constructor(options: HistorySyncOptions)
-  /** Recover saved tasks, including interrupted running tasks; start the lane. */
+  /** Recover saved tasks, including interrupted running tasks; start the pool. */
   start(): Promise<this>
+  /** Deduplicate exact ranges for either priority; overlapping targets share durable coverage, never completion barriers. */
   enqueue(request: HistoryRequest): Promise<HistoryTask>
   /** A 30-day completed-candle target plus a separate 200-candle EMA warmup. */
   enqueueTarget(request: Omit<HistoryRequest, 'from' | 'through' | 'purpose'> & { historyDays?: number; warmupCandles?: number; asOf?: number }): Promise<{ history: HistoryTask; warmup: HistoryTask | null }>
@@ -102,6 +106,6 @@ export class HistorySync {
   waitFor(id: string): Promise<HistoryTask>
   /** Includes scheduled retries; paused/cancelled/unavailable work is idle. */
   whenIdle(): Promise<void>
-  /** Abort active fetches and preserve pending work for the next coordinator. */
+  /** Reject task/idle waiters and abort active fetches; drain accepted writes/checkpoints and preserve pending work for restart. */
   close(): Promise<void>
 }
