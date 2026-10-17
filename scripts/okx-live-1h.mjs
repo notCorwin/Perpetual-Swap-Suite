@@ -46,6 +46,11 @@ function hasStatistics(window) {
   return window.bars.every(bar => Number.isFinite(bar.oi) && Number.isFinite(bar.buy) && Number.isFinite(bar.sell))
 }
 
+function fixedWindow(result, end) {
+  const first = end - (VISIBLE_CANDLES - 1) * HOUR
+  return { end, bars: result.bars.filter(bar => bar.confirmed && bar.hour >= first && bar.hour <= end) }
+}
+
 async function waitForChart(service, focusToken) {
   const deadline = Date.now() + TEST_TIMEOUT
   let last = null
@@ -110,6 +115,42 @@ try {
   assert.ok(takerRequests.every(request => request.url.searchParams.get('period') === TIMEFRAME && request.url.searchParams.get('unit') === '1'), `Taker requests must use period=${TIMEFRAME} and unit=1.\n${requestSummary(takerRequests)}`)
   assert.equal(requests.some(request => request.status === 429), false, `OKX rate limited the live 1H integration test.\n${requestSummary(requests)}`)
 
+  // Match the renderer's maximum one-frame wheel geometry: 144px at
+  // 12px/candle moves the chart 12 one-hour periods. Return immediately,
+  // before the neighboring source page has any reason to settle. The chart
+  // must keep the original page resident instead of aborting and downloading
+  // it again (the root cause of the visible scroll-back gap).
+  const sourceCursor = window.end + HOUR
+  const scrolledEnd = window.end - 12 * HOUR
+  assert.equal(service.focusChart(INSTRUMENT_ID, 2), true)
+  const scrolled = await service.bars(INSTRUMENT_ID, TIMEFRAME, scrolledEnd, {
+    hydrate: false,
+    repair: false,
+    statistics: true,
+    foreground: true,
+    focusToken: 2,
+  })
+  assert.ok(isCompleteHourlyWindow(fixedWindow(scrolled, scrolledEnd)), 'The 12-candle historical viewport must retain 96 native 1H candles immediately.')
+  assert.equal(service.focusChart(INSTRUMENT_ID, 3), true)
+  const returned = await service.bars(INSTRUMENT_ID, TIMEFRAME, window.end, {
+    hydrate: false,
+    repair: false,
+    statistics: true,
+    foreground: true,
+    focusToken: 3,
+  })
+  const returnedWindow = fixedWindow(returned, window.end)
+  assert.ok(isCompleteHourlyWindow(returnedWindow), 'Returning from a one-frame scroll must preserve the rendered 1H window.')
+  assert.ok(hasStatistics(returnedWindow), 'Returning from a one-frame scroll must preserve OI and Taker samples without a gap.')
+  // Give queued adjacent work a chance to begin. Its endpoint cursor may be
+  // distinct, but the original page must remain exactly one request per
+  // source throughout the round trip.
+  await sleep(150)
+  const originalOI = requests.filter(request => request.url.pathname.endsWith('/rubik/stat/contracts/open-interest-history') && Number(request.url.searchParams.get('end')) === sourceCursor)
+  const originalTaker = requests.filter(request => request.url.pathname.endsWith('/rubik/stat/taker-volume-contract') && Number(request.url.searchParams.get('end')) === sourceCursor)
+  assert.equal(originalOI.length, 1, `The original OI page was downloaded more than once after E→E−12→E.\n${requestSummary(requests)}`)
+  assert.equal(originalTaker.length, 1, `The original Taker page was downloaded more than once after E→E−12→E.\n${requestSummary(requests)}`)
+
   console.log(JSON.stringify({
     integration: 'okx-live-1h',
     instrument: INSTRUMENT_ID,
@@ -117,6 +158,12 @@ try {
     visibleCandles: window.bars.length,
     visibleStart: new Date(window.bars[0].hour).toISOString(),
     visibleEnd: new Date(window.end).toISOString(),
+    scrollBack: {
+      movedEnd: new Date(scrolledEnd).toISOString(),
+      returnedRenderedCandles: returnedWindow.bars.length,
+      originalOIRequests: originalOI.length,
+      originalTakerRequests: originalTaker.length,
+    },
     requestCount: requests.length,
     requests: requests.map(request => ({ path: request.url.pathname, status: request.status, elapsedMS: request.elapsedMS })),
   }, null, 2))

@@ -335,7 +335,7 @@ test('legacy unversioned OI/Taker rows are rehydrated instead of accepted as com
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-test('a partial direct statistics response clears legacy fields and keeps the viewport retrying', async () => {
+test('a terminal empty statistic source clears legacy fields without retrying the viewport', async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
   const store = await MarketStore.open(root)
   const instrument = { instId: 'BTC-USDT-SWAP' }
@@ -365,17 +365,17 @@ test('a partial direct statistics response clears legacy fields and keeps the vi
     service.focusChart(instrument.instId, 1)
     service.activateChartViewport(instrument, '1H', end)
     service.requestStatistics(instrument, '1H', end)
-    await waitFor(() => service.statisticsState(instrument, '1H', end).status === 'retrying')
+    await waitFor(() => service.statisticsState(instrument, '1H', end).status === 'unavailable')
 
     assert.equal(oiCalls, 1)
     assert.equal(takerCalls, 1)
     const partial = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: first, through: end })
-    assert.ok(partial.every((bar: any) => bar.statisticsVersion === 1))
+    assert.ok(partial.every((bar: any) => bar.statisticsVersion === 7))
     assert.equal(partial[0]?.oi, 10_000)
     assert.equal(partial.at(-1)?.oi, 10_095)
     assert.ok(partial.every((bar: any) => bar.buy === null && bar.sell === null), 'Legacy unit=2 taker values must not be re-certified by a partial response.')
     assert.ok(partial.every((bar: any) => !('replaceStatistics' in bar)), 'The in-memory replacement marker must never reach Parquet.')
-    assert.equal(await service.hasCompleteStoredStatistics(instrument, '1H', end), false)
+    assert.equal(await service.hasCompleteStoredStatistics(instrument, '1H', end), true)
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
@@ -790,6 +790,40 @@ test('switching charts aborts stale OI/Taker work and immediately serves the new
     await waitFor(() => staleAborts > 0 && freshRequests === 2 && !service.statistics.has(service.statisticsKey(btc, '1H', end)) && service.statisticsState(eth, '1H', end).status === 'ready')
     assert.equal(service.statistics.has(service.statisticsKey(btc, '1H', end)), false)
     assert.equal(service.statisticsState(eth, '1H', end).status, 'ready')
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('switching a selected contract from 1H to 5m aborts stale statistics without reviving them', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 6, 2, 12)
+  const timestamps = Array.from({ length: 96 }, (_, index) => end - (95 - index) * hour)
+  let hourlyCalls = 0, hourlyAborts = 0
+  const fetcher: typeof fetch = async (input, init) => {
+    const url = new URL(String(input))
+    if (!url.pathname.includes('/rubik/stat/')) throw new Error(`Unexpected ${url}`)
+    if (url.searchParams.get('period') !== '1H') throw new Error(`Inactive 5m statistics must not be requested: ${url}`)
+    hourlyCalls += 1
+    return new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener('abort', () => {
+      hourlyAborts += 1
+      reject(new DOMException('The request was aborted.', 'AbortError'))
+    }, { once: true }))
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 5_000 })
+  try {
+    await store.appendCandles(timestamps.map(timestamp => nativeCandle(timestamp, '1H')))
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+    service.activateChartViewport(instrument, '1H', end)
+    service.requestStatistics(instrument, '1H', end)
+    await waitFor(() => hourlyCalls === 2)
+
+    service.focusChart(instrument.instId, 2)
+    service.activateChartViewport(instrument, '5m', end)
+    await waitFor(() => hourlyAborts === 2 && !service.statistics.has(service.statisticsKey(instrument, '1H', end)))
+    await new Promise(resolve => setTimeout(resolve, 550))
+    assert.equal(hourlyCalls, 2, 'An aborted 1H task must not restart after the selected timeframe becomes 5m.')
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
@@ -1288,8 +1322,10 @@ test('one-candle viewport scroll promotes a native 1H warm-up repair at its new 
     service.activateChartViewport(instrument, '1H', newEnd)
     assert.equal(service.candleRepairState(instrument.instId, '1H').currentPriority, 'warmup')
     await service.ensureChartRange(instrument, '1H', newEnd, 2)
-    await waitFor(async () => oldAborts === 1 && historyCalls >= 2
-      && (await store.candles({ instrument: instrument.instId, timeframe: '1H', from: newVisibleFrom, through: newVisibleFrom })).length === 1)
+    await waitFor(async () => oldAborts === 1 && historyCalls === 2
+      && (await store.candles({ instrument: instrument.instId, timeframe: '1H', from: newVisibleFrom, through: newVisibleFrom })).length === 1
+      && !service.candleRepairState(instrument.instId, '1H').ranges.some((range: { from: number; through: number }) => range.from <= newVisibleFrom && range.through >= newVisibleFrom))
+    assert.equal(historyCalls, 2)
     assert.equal(service.candleRepairState(instrument.instId, '1H').ranges.some((range: { from: number; through: number }) => range.from <= newVisibleFrom && range.through >= newVisibleFrom), false)
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
@@ -1324,6 +1360,38 @@ test('a newer same-instrument viewport cannot be retaken by a delayed older requ
     assert.equal(candlesCalls, 2, 'The stale and current viewports each read their native 1H sequence once.')
     assert.equal(service.activeChartViewport.end, newEnd)
   } finally { releaseCandles?.(); await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a repeated focus heartbeat leaves its active repair and viewport untouched', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const target = Date.UTC(2024, 10, 1)
+  const from = target - (95 + 199) * fiveMinutes
+  const gap = target - 20 * fiveMinutes
+  let calls = 0, aborts = 0
+  const fetcher: typeof fetch = async (_input, init) => {
+    calls += 1
+    return new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener('abort', () => {
+      aborts += 1
+      reject(new DOMException('The request was aborted.', 'AbortError'))
+    }, { once: true }))
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    await store.appendCandles(Array.from({ length: 295 }, (_, index) => rawCandle(from + index * fiveMinutes)).filter(value => value.timestamp !== gap))
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+    service.activateChartViewport(instrument, '5m', target)
+    await service.ensureChartRange(instrument, '5m', target, 1)
+    await waitFor(() => calls === 1)
+
+    assert.equal(service.focusChart(instrument.instId, 1), true)
+    await new Promise(resolve => setTimeout(resolve, 40))
+    assert.equal(aborts, 0)
+    assert.equal(calls, 1)
+    assert.equal(service.isActiveChartViewport(instrument.instId, '5m', target), true)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
 test('a focus transition does not revive a same-instrument repair before its next viewport activates', async () => {
@@ -1431,13 +1499,767 @@ test('an OI failure leaves the independent Taker lane running and persists its r
     service.focusChart(instrument.instId, 1)
     service.activateChartViewport(instrument, '1H', end)
     service.requestStatistics(instrument, '1H', end)
-    await waitFor(() => service.statisticsState(instrument, '1H', end).status === 'retrying')
+    await waitFor(() => {
+      const state = service.statisticsState(instrument, '1H', end)
+      return state.status === 'retrying' && state.takerState === 'ready'
+    })
     const stored = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: timestamps[0], through: end })
     assert.equal(oiCalls, 1)
     assert.equal(takerCalls, 1)
     assert.equal(takerAborts, 0)
     assert.ok(stored.every(value => value.oi === null && Number.isFinite(value.buy) && Number.isFinite(value.sell)))
     assert.equal(service.statisticsState(instrument, '1H', end).status, 'retrying')
+
+    // The throttled OI lane must not regress the independently durable Taker
+    // source while it waits for the server-directed retry deadline.
+    assert.equal(service.statisticsState(instrument, '1H', end).takerState, 'ready')
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('an OI retry starts on schedule while the Taker request is still held', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 9, 2)
+  const timestamps = Array.from({ length: 96 }, (_, index) => end - (95 - index) * hour)
+  let oiCalls = 0, takerCalls = 0
+  const fetcher: typeof fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname
+    if (path.endsWith('/open-interest-history')) {
+      oiCalls += 1
+      return new Response(null, { status: 429, headers: { 'retry-after': '0' } })
+    }
+    if (path.endsWith('/taker-volume-contract')) {
+      takerCalls += 1
+      return new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener('abort', () => {
+        reject(new DOMException('The request was aborted.', 'AbortError'))
+      }, { once: true }))
+    }
+    throw new Error(`Unexpected ${path}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 5_000 })
+  try {
+    await store.appendCandles(timestamps.map(timestamp => nativeCandle(timestamp, '1H')))
+    service.focusChart(instrument.instId, 1)
+    service.activateChartViewport(instrument, '1H', end)
+    service.requestStatistics(instrument, '1H', end)
+    await waitFor(() => {
+      const state = service.statisticsState(instrument, '1H', end)
+      return state.oiState === 'retrying' && state.takerState === 'loading'
+    }, 400)
+    await waitFor(() => takerCalls === 1, 400)
+    const state = service.statisticsState(instrument, '1H', end)
+    assert.equal(state.status, 'retrying')
+    assert.equal(takerCalls, 1)
+    assert.ok((state.retryAt ?? 0) - Date.now() >= 900)
+
+    // The parent page stays open for Taker, but the OI child retry must not
+    // wait for its sibling's five-second timeout.
+    await waitFor(() => oiCalls === 2, 1_500)
+    assert.equal(takerCalls, 1)
+    assert.equal(service.statisticsState(instrument, '1H', end).takerState, 'loading')
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('Taker statistics persist before a deliberately held OI response', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 9, 3, 12)
+  const timestamps = Array.from({ length: 96 }, (_, index) => end - (95 - index) * hour)
+  let oiStarted = false, takerStarted = false
+  const fetcher: typeof fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname
+    if (path.endsWith('/open-interest-history')) {
+      oiStarted = true
+      return new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener('abort', () => {
+        reject(new DOMException('The request was aborted.', 'AbortError'))
+      }, { once: true }))
+    }
+    if (path.endsWith('/taker-volume-contract')) {
+      takerStarted = true
+      return response(timestamps.map((timestamp, index) => [String(timestamp), String(10 + index), String(20 + index)]))
+    }
+    throw new Error(`Unexpected ${path}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 5_000 })
+  try {
+    await store.appendCandles(timestamps.map(timestamp => nativeCandle(timestamp, '1H')))
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+    service.activateChartViewport(instrument, '1H', end)
+    service.requestStatistics(instrument, '1H', end)
+    await waitFor(() => oiStarted && takerStarted)
+
+    // The OI request intentionally never completes. A Taker response is an
+    // independently useful native-contract result and must be committed as
+    // soon as it arrives, rather than being held by an all-settled barrier.
+    await waitFor(async () => {
+      const rows = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: timestamps[0], through: end }, 'foreground')
+      return rows.length === 96 && rows.every(value => Number.isFinite(value.buy) && Number.isFinite(value.sell))
+    }, 750)
+    const stored = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: timestamps[0], through: end }, 'foreground')
+    assert.ok(stored.every(value => Number.isFinite(value.buy) && Number.isFinite(value.sell)))
+    assert.ok(stored.every(value => value.oi === null || value.oi === undefined))
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('empty historic OI becomes terminal while complete Taker stays durable without repeat calls', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  // This deliberately old window models OKX history outside the OI retention
+  // horizon. Empty historical OI is a source boundary, not a transient error.
+  const end = Date.UTC(2024, 0, 3, 12)
+  const timestamps = Array.from({ length: 96 }, (_, index) => end - (95 - index) * hour)
+  let oiCalls = 0, takerCalls = 0
+  const fetcher: typeof fetch = async input => {
+    const path = new URL(String(input)).pathname
+    if (path.endsWith('/open-interest-history')) { oiCalls += 1; return response([]) }
+    if (path.endsWith('/taker-volume-contract')) {
+      takerCalls += 1
+      return response(timestamps.map((timestamp, index) => [String(timestamp), String(10 + index), String(20 + index)]))
+    }
+    throw new Error(`Unexpected ${path}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    await store.appendCandles(timestamps.map(timestamp => nativeCandle(timestamp, '1H')))
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+    service.activateChartViewport(instrument, '1H', end)
+    service.requestStatistics(instrument, '1H', end)
+    await waitFor(() => service.statisticsState(instrument, '1H', end).status !== 'loading')
+
+    const state = service.statisticsState(instrument, '1H', end)
+    const stored = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: timestamps[0], through: end }, 'foreground')
+    assert.equal(state.status, 'unavailable')
+    assert.equal(state.retryAt, null)
+    assert.equal(oiCalls, 1)
+    assert.equal(takerCalls, 1)
+    assert.ok(stored.every(value => value.oi === null || value.oi === undefined))
+    assert.ok(stored.every(value => Number.isFinite(value.buy) && Number.isFinite(value.sell)))
+
+    // A known historical boundary must survive both time and an explicit
+    // request; otherwise every revisit consumes the OI and Taker budgets.
+    await new Promise(resolve => setTimeout(resolve, 1_200))
+    service.requestStatistics(instrument, '1H', end)
+    await new Promise(resolve => setTimeout(resolve, 100))
+    assert.equal(oiCalls, 1)
+    assert.equal(takerCalls, 1)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a near-live empty statistics page revalidates after its bounded expiry instead of staying blank forever', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Math.floor((Date.now() - hour) / hour) * hour
+  const timestamps = Array.from({ length: 96 }, (_, index) => end - (95 - index) * hour)
+  let oiCalls = 0, takerCalls = 0
+  const fetcher: typeof fetch = async input => {
+    const path = new URL(String(input)).pathname
+    if (path.endsWith('/open-interest-history')) { oiCalls += 1; return response([]) }
+    if (path.endsWith('/taker-volume-contract')) { takerCalls += 1; return response([]) }
+    throw new Error(`Unexpected ${path}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    await store.appendCandles(timestamps.map(timestamp => nativeCandle(timestamp, '1H')))
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+    service.activateChartViewport(instrument, '1H', end)
+    await service.bars(instrument.instId, '1H', end, { hydrate: false, repair: false, foreground: true, focusToken: 1 })
+    await waitFor(() => service.statisticsState(instrument, '1H', end).status === 'unavailable')
+    assert.equal(oiCalls, 1)
+    assert.equal(takerCalls, 1)
+
+    // The visible terminal-null cache is reused during the cooldown rather
+    // than repeatedly hammering OKX on every 80ms renderer poll.
+    const immediate = await service.bars(instrument.instId, '1H', end, { hydrate: false, repair: false, foreground: true, focusToken: 1 })
+    assert.equal(immediate.statisticsState, 'unavailable')
+    assert.ok((immediate.statisticsRetryAt ?? 0) > Date.now())
+    await new Promise(resolve => setTimeout(resolve, 80))
+    assert.equal(oiCalls, 1)
+    assert.equal(takerCalls, 1)
+
+    // Once the bounded expiry elapses, the terminal null becomes a fresh
+    // foreground request. It must not be permanently masked by local bars.
+    // Expiry is source provenance now, rather than an aggregate viewport
+    // timer. Expire both direct observations to model their live lease
+    // elapsing without waiting a real minute.
+    const expired = service.statisticsState(instrument, '1H', end)
+    const expiredAt = Date.now() - 1
+    const persisted = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: timestamps[0], through: end }, 'foreground')
+    await store.appendCandles(persisted.map(value => ({
+      ...value,
+      statisticsOIExpiresAt: expiredAt,
+      statisticsTakerExpiresAt: expiredAt,
+    })), 'foreground')
+    expired.sources.oi.expiresAt = expiredAt
+    expired.sources.taker.expiresAt = expiredAt
+    service.syncStatisticsState(expired)
+    await service.bars(instrument.instId, '1H', end, { hydrate: false, repair: false, foreground: true, focusToken: 1 })
+    await waitFor(() => oiCalls === 2 && takerCalls === 2)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a near-live empty source lease follows a covered 1H neighbor and revalidates from the active follower', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Math.floor((Date.now() - hour) / hour) * hour
+  const followerEnd = end - 4 * hour
+  const page = Array.from({ length: 100 }, (_, index) => end - (99 - index) * hour)
+  const calls: Array<{ source: 'oi' | 'taker'; end: number }> = []
+  const sourceRows = (pageEnd: number, source: 'oi' | 'taker') => Array.from({ length: 100 }, (_, index) => {
+    const timestamp = pageEnd - (99 - index) * hour
+    return source === 'oi'
+      ? [String(timestamp), String(1_000 + index), '0', '0']
+      : [String(timestamp), String(10 + index), String(20 + index)]
+  })
+  const fetcher: typeof fetch = async input => {
+    const url = new URL(String(input))
+    const source = url.pathname.endsWith('/open-interest-history') ? 'oi' : url.pathname.endsWith('/taker-volume-contract') ? 'taker' : null
+    if (!source) throw new Error(`Unexpected ${url.pathname}`)
+    const pageEnd = Number(url.searchParams.get('end')) - hour
+    calls.push({ source, end: pageEnd })
+    // The latest page is a temporarily empty OKX observation. Once its
+    // source lease expires, querying the active older view returns its own
+    // now-available direct page.
+    return response(pageEnd === end ? [] : sourceRows(pageEnd, source))
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    await store.appendCandles(page.map(timestamp => nativeCandle(timestamp, '1H')))
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+    service.activateChartViewport(instrument, '1H', end)
+    service.requestStatistics(instrument, '1H', end)
+    await waitFor(() => service.statisticsState(instrument, '1H', end).status === 'unavailable')
+    const owner = service.statisticsState(instrument, '1H', end)
+    assert.ok(Number.isFinite(owner.sources.oi.expiresAt))
+    assert.ok(Number.isFinite(owner.sources.taker.expiresAt))
+
+    // The complete 100-row page covers E−4, so it must inherit the source
+    // lease rather than turn an observed near-live null into a timeless
+    // historical boundary.
+    service.focusChart(instrument.instId, 2)
+    service.activateChartViewport(instrument, '1H', followerEnd)
+    assert.equal(service.requestStatistics(instrument, '1H', followerEnd), owner)
+    const followerStatus = service.chartStatisticsStatus(instrument.instId, '1H', followerEnd)
+    assert.equal(followerStatus.statisticsState, 'unavailable')
+    assert.ok((followerStatus.statisticsRetryAt ?? 0) > Date.now())
+    assert.deepEqual(calls, [{ source: 'oi', end }, { source: 'taker', end }])
+
+    // Expire both the in-memory owner and the persisted direct observations.
+    // A fresh process sees only Parquet, so this specifically guards source
+    // provenance rather than the old aggregate viewport lease.
+    const expiredAt = Date.now() - 1
+    const persisted = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: page[0], through: end }, 'foreground')
+    await store.appendCandles(persisted.map(value => ({
+      ...value,
+      statisticsOIExpiresAt: expiredAt,
+      statisticsTakerExpiresAt: expiredAt,
+    })), 'foreground')
+    owner.sources.oi.expiresAt = expiredAt
+    owner.sources.taker.expiresAt = expiredAt
+    service.syncStatisticsState(owner)
+
+    // The active follower alone is enough to restart the direct endpoints;
+    // it must not require navigating back to the original near-live edge.
+    service.chartStatisticsStatus(instrument.instId, '1H', followerEnd)
+    await waitFor(() => calls.filter(call => call.end === followerEnd && call.source === 'oi').length === 1
+      && calls.filter(call => call.end === followerEnd && call.source === 'taker').length === 1)
+    await waitFor(() => service.statisticsState(instrument, '1H', followerEnd).status === 'ready')
+    const followerRows = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: followerEnd - 95 * hour, through: followerEnd }, 'foreground')
+    assert.ok(followerRows.every(value => Number.isFinite(value.oi) && Number.isFinite(value.buy) && Number.isFinite(value.sell)))
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('an empty near-live 1H page cannot erase an overlapping older direct source window', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Math.floor((Date.now() - hour) / hour) * hour
+  const olderEnd = end - 12 * hour
+  const timestamps = Array.from({ length: 112 }, (_, index) => end - (111 - index) * hour)
+  const calls: Array<{ source: 'oi' | 'taker'; end: number }> = []
+  const sourceRows = (pageEnd: number, source: 'oi' | 'taker') => Array.from({ length: 100 }, (_, index) => {
+    const timestamp = pageEnd - (99 - index) * hour
+    return source === 'oi'
+      ? [String(timestamp), String(2_000 + index), '0', '0']
+      : [String(timestamp), String(30 + index), String(40 + index)]
+  })
+  const fetcher: typeof fetch = async input => {
+    const url = new URL(String(input))
+    const source = url.pathname.endsWith('/open-interest-history') ? 'oi' : url.pathname.endsWith('/taker-volume-contract') ? 'taker' : null
+    if (!source) throw new Error(`Unexpected ${url.pathname}`)
+    const pageEnd = Number(url.searchParams.get('end')) - hour
+    calls.push({ source, end: pageEnd })
+    // A preceding historical request has good shared observations, while
+    // OKX temporarily returns an empty near-live page for the same 88 hours.
+    return response(pageEnd === olderEnd ? sourceRows(pageEnd, source) : [])
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    await store.appendCandles(timestamps.map(timestamp => nativeCandle(timestamp, '1H')))
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+    const options = { hydrate: false, repair: false, foreground: true, focusToken: 1 }
+
+    await service.bars(instrument.instId, '1H', olderEnd, options)
+    await waitFor(() => service.statisticsState(instrument, '1H', olderEnd).status === 'ready')
+    const visibleRange = { instrument: instrument.instId, timeframe: '1H', from: olderEnd - 95 * hour, through: olderEnd }
+    const initiallyLoaded = await store.candles(visibleRange, 'foreground')
+    assert.ok(initiallyLoaded.every(value => Number.isFinite(value.oi) && Number.isFinite(value.buy) && Number.isFinite(value.sell)))
+
+    await service.bars(instrument.instId, '1H', end, options)
+    await waitFor(() => service.statisticsState(instrument, '1H', end).status === 'unavailable')
+    const afterNearLiveEmpty = await store.candles(visibleRange, 'foreground')
+    assert.ok(afterNearLiveEmpty.every(value => Number.isFinite(value.oi) && Number.isFinite(value.buy) && Number.isFinite(value.sell)), 'The empty near-live page must not blank the 88 overlapping historical samples.')
+
+    // Returning to B must retain the usable direct values and avoid an
+    // unnecessary second endpoint round-trip. This catches both data loss and
+    // a stale neighbor owner being treated as a fresh gap.
+    await service.bars(instrument.instId, '1H', olderEnd, options)
+    await new Promise(resolve => setTimeout(resolve, 80))
+    assert.equal(service.statisticsState(instrument, '1H', olderEnd).status, 'ready')
+    assert.equal(calls.filter(call => call.source === 'oi' && call.end === olderEnd).length, 1)
+    assert.equal(calls.filter(call => call.source === 'taker' && call.end === olderEnd).length, 1)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a numeric near-live page reconciles a fully covered older terminal owner without refetching it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Math.floor((Date.now() - hour) / hour) * hour
+  const olderEnd = end - 4 * hour
+  const timestamps = Array.from({ length: 100 }, (_, index) => end - (99 - index) * hour)
+  const calls: Array<{ source: 'oi' | 'taker'; end: number }> = []
+  const sourceRows = (source: 'oi' | 'taker') => timestamps.map((timestamp, index) => source === 'oi'
+    ? [String(timestamp), String(3_000 + index), '0', '0']
+    : [String(timestamp), String(50 + index), String(60 + index)])
+  const fetcher: typeof fetch = async input => {
+    const url = new URL(String(input))
+    const source = url.pathname.endsWith('/open-interest-history') ? 'oi' : url.pathname.endsWith('/taker-volume-contract') ? 'taker' : null
+    if (!source) throw new Error(`Unexpected ${url.pathname}`)
+    const pageEnd = Number(url.searchParams.get('end')) - hour
+    calls.push({ source, end: pageEnd })
+    // B initially records an older terminal empty result. E is later able to
+    // provide all of B's visible 96 hours from its fully covering page.
+    return response(pageEnd === olderEnd ? [] : sourceRows(source))
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    await store.appendCandles(timestamps.map(timestamp => nativeCandle(timestamp, '1H')))
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+    const options = { hydrate: false, repair: false, foreground: true, focusToken: 1 }
+
+    await service.bars(instrument.instId, '1H', olderEnd, options)
+    await waitFor(() => service.statisticsState(instrument, '1H', olderEnd).status === 'unavailable')
+    assert.equal(service.chartStatisticsStatus(instrument.instId, '1H', olderEnd).statisticsState, 'unavailable')
+
+    await service.bars(instrument.instId, '1H', end, options)
+    await waitFor(() => service.statisticsState(instrument, '1H', end).status === 'ready')
+
+    // E's page [E−99, E] completely contains B's [E−99, E−4]. The retained
+    // B owner must be refreshed from this durable source write; otherwise a
+    // status-only B poll falsely says unavailable despite 96 numeric rows.
+    await service.bars(instrument.instId, '1H', olderEnd, options)
+    const status = service.chartStatisticsStatus(instrument.instId, '1H', olderEnd)
+    assert.equal(service.statisticsState(instrument, '1H', olderEnd).status, 'ready')
+    assert.equal(status.statisticsState, 'ready')
+    assert.equal(status.oiState, 'ready')
+    assert.equal(status.takerState, 'ready')
+    assert.equal(calls.filter(call => call.source === 'oi' && call.end === olderEnd).length, 1)
+    assert.equal(calls.filter(call => call.source === 'taker' && call.end === olderEnd).length, 1)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a one-frame 1H scroll retains overlapping E requests through E−12 and back', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 9, 6, 12)
+  const scrolledEnd = end - 12 * hour
+  const timestamps = Array.from({ length: 112 }, (_, index) => end - (111 - index) * hour)
+  const calls: Array<{ source: 'oi' | 'taker'; end: number }> = []
+  const aborts: Array<{ source: 'oi' | 'taker'; end: number }> = []
+  const releases: Array<() => void> = []
+  const sourceRows = (pageEnd: number, source: 'oi' | 'taker') => Array.from({ length: 100 }, (_, index) => {
+    const timestamp = pageEnd - (99 - index) * hour
+    return source === 'oi'
+      ? [String(timestamp), String(2_000 + index), '0', '0']
+      : [String(timestamp), String(30 + index), String(40 + index)]
+  })
+  const fetcher: typeof fetch = async (input, init) => {
+    const url = new URL(String(input))
+    const source = url.pathname.endsWith('/open-interest-history') ? 'oi' : url.pathname.endsWith('/taker-volume-contract') ? 'taker' : null
+    if (!source) throw new Error(`Unexpected ${url.pathname}`)
+    const pageEnd = Number(url.searchParams.get('end')) - hour
+    calls.push({ source, end: pageEnd })
+    // Hold the original E source long enough for the actual max wheel jump
+    // and immediate return. Other pages can settle normally after release.
+    if (pageEnd !== end) return response(sourceRows(pageEnd, source))
+    return new Promise<Response>((resolve, reject) => {
+      releases.push(() => resolve(response(sourceRows(pageEnd, source))))
+      init?.signal?.addEventListener('abort', () => {
+        aborts.push({ source, end: pageEnd })
+        reject(new DOMException('The request was aborted.', 'AbortError'))
+      }, { once: true })
+    })
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 5_000 })
+  try {
+    await store.appendCandles(timestamps.map(timestamp => nativeCandle(timestamp, '1H')))
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+    service.activateChartViewport(instrument, '1H', end)
+    service.requestStatistics(instrument, '1H', end)
+    await waitFor(() => calls.filter(call => call.end === end).length === 2)
+
+    // Benchmark geometry is 144px / 12px = 12 1H candles per animation
+    // frame. The two 100-row pages overlap even though neither fully covers
+    // the other; returning within that overlap must reuse the original work.
+    service.focusChart(instrument.instId, 2)
+    service.activateChartViewport(instrument, '1H', scrolledEnd)
+    service.requestStatistics(instrument, '1H', scrolledEnd)
+    service.focusChart(instrument.instId, 3)
+    service.activateChartViewport(instrument, '1H', end)
+    service.requestStatistics(instrument, '1H', end)
+    await new Promise(resolve => setTimeout(resolve, 120))
+    assert.deepEqual(calls.filter(call => call.end === end), [{ source: 'oi', end }, { source: 'taker', end }])
+    assert.deepEqual(aborts.filter(abort => abort.end === end), [])
+
+    releases.forEach(release => release())
+    await waitFor(() => service.statisticsState(instrument, '1H', end).status === 'ready')
+    assert.deepEqual(calls.filter(call => call.end === end), [{ source: 'oi', end }, { source: 'taker', end }])
+    assert.deepEqual(aborts.filter(abort => abort.end === end), [])
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a 100-bar statistics block survives adjacent fast scroll-back without aborting or reloading', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 9, 4, 12)
+  const adjacentEnd = end - 4 * hour
+  // With a cursor at end + 1h, OKX returns [end - 99h, end]. That one
+  // response completely covers both [end - 95h, end] and the four-candle
+  // adjacent viewport [end - 99h, end - 4h].
+  const block = Array.from({ length: 100 }, (_, index) => end - (99 - index) * hour)
+  let oiCalls = 0, takerCalls = 0, oiAborts = 0, takerAborts = 0
+  const releases: Array<() => void> = []
+  const held = (data: unknown[], signal: AbortSignal | undefined, onAbort: () => void) => new Promise<Response>((resolve, reject) => {
+    releases.push(() => resolve(response(data)))
+    // The test makes a real in-flight request visible. A fast same-block
+    // scroll must retain it; it must not be cancelled and restarted for a
+    // different viewport key.
+    signal?.addEventListener('abort', () => {
+      onAbort()
+      reject(new DOMException('The request was aborted.', 'AbortError'))
+    }, { once: true })
+  })
+  const fetcher: typeof fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname
+    if (path.endsWith('/open-interest-history')) {
+      oiCalls += 1
+      return held(block.map((timestamp, index) => [String(timestamp), String(1_000 + index), '0', '0']), init?.signal ?? undefined, () => { oiAborts += 1 })
+    }
+    if (path.endsWith('/taker-volume-contract')) {
+      takerCalls += 1
+      return held(block.map((timestamp, index) => [String(timestamp), String(10 + index), String(20 + index)]), init?.signal ?? undefined, () => { takerAborts += 1 })
+    }
+    throw new Error(`Unexpected ${path}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 5_000 })
+  try {
+    await store.appendCandles(block.map(timestamp => nativeCandle(timestamp, '1H')))
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+    service.activateChartViewport(instrument, '1H', end)
+    service.requestStatistics(instrument, '1H', end)
+    await waitFor(() => oiCalls === 1 && takerCalls === 1)
+
+    service.focusChart(instrument.instId, 2)
+    service.activateChartViewport(instrument, '1H', adjacentEnd)
+    service.requestStatistics(instrument, '1H', adjacentEnd)
+    service.focusChart(instrument.instId, 3)
+    service.activateChartViewport(instrument, '1H', end)
+    service.requestStatistics(instrument, '1H', end)
+    await new Promise(resolve => setTimeout(resolve, 550))
+    assert.equal(oiAborts, 0)
+    assert.equal(takerAborts, 0)
+    assert.equal(oiCalls, 1)
+    assert.equal(takerCalls, 1)
+
+    releases.forEach(release => release())
+    await waitFor(() => service.statisticsState(instrument, '1H', end).status === 'ready')
+    await waitFor(async () => {
+      const rows = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: block[0], through: adjacentEnd }, 'foreground')
+      return rows.length === 96 && rows.every(value => Number.isFinite(value.oi) && Number.isFinite(value.buy) && Number.isFinite(value.sell))
+    })
+
+    service.focusChart(instrument.instId, 4)
+    service.activateChartViewport(instrument, '1H', adjacentEnd)
+    service.requestStatistics(instrument, '1H', adjacentEnd)
+    await waitFor(() => service.statisticsState(instrument, '1H', adjacentEnd).status === 'ready')
+    assert.equal(oiCalls, 1)
+    assert.equal(takerCalls, 1)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a synchronous adjacent scroll waits for page classification without duplicate source calls', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 9, 4, 18)
+  const adjacentEnd = end - 4 * hour
+  const block = Array.from({ length: 100 }, (_, index) => end - (99 - index) * hour)
+  let oiCalls = 0, takerCalls = 0
+  const fetcher: typeof fetch = async input => {
+    const path = new URL(String(input)).pathname
+    if (path.endsWith('/open-interest-history')) {
+      oiCalls += 1
+      return response(block.map((timestamp, index) => [String(timestamp), String(1_000 + index), '0', '0']))
+    }
+    if (path.endsWith('/taker-volume-contract')) {
+      takerCalls += 1
+      return response(block.map((timestamp, index) => [String(timestamp), String(10 + index), String(20 + index)]))
+    }
+    throw new Error(`Unexpected ${path}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    await store.appendCandles(block.map(timestamp => nativeCandle(timestamp, '1H')))
+    service.focusChart(instrument.instId, 1)
+    service.activateChartViewport(instrument, '1H', end)
+    const owner = service.requestStatistics(instrument, '1H', end)
+
+    // No await here: an unknown source page must not be advertised as covered
+    // before its four-row prefetch edge is classified. Both views can begin
+    // their probe, but the later source request must reuse the first durable
+    // 100-row result rather than issue a duplicate endpoint call.
+    service.focusChart(instrument.instId, 2)
+    service.activateChartViewport(instrument, '1H', adjacentEnd)
+    const adjacent = service.requestStatistics(instrument, '1H', adjacentEnd)
+    assert.notEqual(adjacent, owner)
+    assert.equal(service.statistics.has(service.statisticsKey(instrument, '1H', adjacentEnd)), true)
+    await waitFor(() => oiCalls === 1 && takerCalls === 1)
+    await waitFor(() => adjacent.status === 'ready')
+    assert.equal(oiCalls, 1)
+    assert.equal(takerCalls, 1)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a coverage-only source fill never clears visible statistics that are already rendered', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 9, 5)
+  const block = Array.from({ length: 100 }, (_, index) => end - (99 - index) * hour)
+  let oiCalls = 0, takerCalls = 0
+  const existing = block.map((timestamp, index) => {
+    const base = nativeCandle(timestamp, '1H')
+    if (index < 4) return { ...base, oi: null, buy: 10 + index, sell: 20 + index, statisticsVersion: 0b110 }
+    return { ...base, oi: 1_000 + index, buy: 10 + index, sell: 20 + index, statisticsVersion: 1 }
+  })
+  const fetcher: typeof fetch = async input => {
+    const path = new URL(String(input)).pathname
+    if (path.endsWith('/open-interest-history')) { oiCalls += 1; return response([]) }
+    if (path.endsWith('/taker-volume-contract')) { takerCalls += 1; return response([]) }
+    throw new Error(`Unexpected ${path}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    await store.appendCandles(existing)
+    service.focusChart(instrument.instId, 1)
+    service.activateChartViewport(instrument, '1H', end)
+    service.requestStatistics(instrument, '1H', end)
+    await waitFor(() => oiCalls === 1 && service.statisticsState(instrument, '1H', end).status === 'ready')
+    const visible = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: block[4], through: end })
+    const older = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: block[0], through: block[3] })
+    assert.equal(takerCalls, 0)
+    assert.ok(visible.every(value => Number.isFinite(value.oi)), 'A four-bar backfill must not blank 96 rendered OI samples.')
+    assert.ok(older.every(value => value.oi === null), 'The missing page edge records the endpoint result without touching the visible window.')
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a partially covered page exposes delegated data promptly without duplicating its source page', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 9, 5, 12)
+  const adjacentEnd = end - 4 * hour
+  const block = Array.from({ length: 100 }, (_, index) => end - (99 - index) * hour)
+  const existing = block.map((timestamp, index) => index < 4
+    ? nativeCandle(timestamp, '1H')
+    : { ...nativeCandle(timestamp, '1H'), oi: 1_000 + index, statisticsVersion: 0b101 })
+  let oiCalls = 0, takerCalls = 0
+  const oiRelease = { current: null as (() => void) | null }
+  const takerRelease = { current: null as (() => void) | null }
+  const hold = (signal: AbortSignal | undefined, onHold?: (resolve: (value: Response) => void) => void) => new Promise<Response>((resolve, reject) => {
+    onHold?.(resolve)
+    signal?.addEventListener('abort', () => {
+      reject(new DOMException('The request was aborted.', 'AbortError'))
+    }, { once: true })
+  })
+  const fetcher: typeof fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname
+    if (path.endsWith('/open-interest-history')) {
+      oiCalls += 1
+      const pageEnd = Number(new URL(String(input)).searchParams.get('end')) - hour
+      const page = Array.from({ length: 100 }, (_, index) => [String(pageEnd - (99 - index) * hour), String(2_000 + index), '0', '0'])
+      if (oiCalls === 1) return hold(init?.signal ?? undefined, resolve => {
+        oiRelease.current = () => resolve(response(page))
+      })
+      return response(page)
+    }
+    if (path.endsWith('/taker-volume-contract')) {
+      takerCalls += 1
+      return hold(init?.signal ?? undefined, resolve => {
+        takerRelease.current = () => resolve(response(block.map((timestamp, index) => [String(timestamp), String(10 + index), String(20 + index)])))
+      })
+    }
+    throw new Error(`Unexpected ${path}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 5_000 })
+  try {
+    await store.appendCandles(existing)
+    service.focusChart(instrument.instId, 1)
+    service.activateChartViewport(instrument, '1H', end)
+    const owner = service.requestStatistics(instrument, '1H', end)
+    await waitFor(() => oiCalls === 1 && takerCalls === 1)
+
+    service.focusChart(instrument.instId, 2)
+    service.activateChartViewport(instrument, '1H', adjacentEnd)
+    const follower = service.requestStatistics(instrument, '1H', adjacentEnd)
+    await waitFor(() => follower.sources.oi.task !== null)
+    assert.notEqual(follower, owner)
+    assert.equal(follower.sources.taker.delegate?.state, owner)
+    assert.equal(oiCalls, 1, 'The neighbor OI request waits behind the in-flight coverage-only source.')
+    assert.equal(takerCalls, 1, 'The healthy Taker page is shared while only OI owns the neighbor page.')
+    assert.equal(follower.oiState, 'loading')
+
+    if (!takerRelease.current) throw new Error('The owner Taker request did not start.')
+    takerRelease.current()
+    await waitFor(() => owner.sources.taker.status === 'ready')
+
+    // Requesting the still-loading neighbor must project the completed
+    // delegated lane immediately; its held OI request must not hide Taker.
+    assert.equal(service.requestStatistics(instrument, '1H', adjacentEnd), follower)
+    assert.equal(follower.oiState, 'loading')
+    assert.equal(follower.takerState, 'ready')
+    assert.equal(takerCalls, 1, 'A ready delegated lane never issues a duplicate request.')
+
+    if (!oiRelease.current) throw new Error('The owner OI request did not start.')
+    oiRelease.current()
+    await waitFor(() => follower.oiState === 'ready')
+    assert.equal(oiCalls, 1, 'A queued neighbor source reuses the owner\'s durable 100-bar page.')
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('an adjacent 1H window inherits its covering statistics retry cooldown', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 9, 4, 12)
+  const adjacentEnd = end - 4 * hour
+  const block = Array.from({ length: 100 }, (_, index) => end - (99 - index) * hour)
+  let oiCalls = 0, takerCalls = 0
+  const fetcher: typeof fetch = async input => {
+    const path = new URL(String(input)).pathname
+    if (path.endsWith('/open-interest-history')) { oiCalls += 1; return new Response(null, { status: 429, headers: { 'retry-after': '60' } }) }
+    if (path.endsWith('/taker-volume-contract')) { takerCalls += 1; return new Response(null, { status: 429, headers: { 'retry-after': '60' } }) }
+    throw new Error(`Unexpected ${path}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    await store.appendCandles(block.map(timestamp => nativeCandle(timestamp, '1H')))
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+    service.activateChartViewport(instrument, '1H', end)
+    service.requestStatistics(instrument, '1H', end)
+    await waitFor(() => service.statisticsState(instrument, '1H', end).status === 'retrying')
+    const owner = service.statisticsState(instrument, '1H', end)
+
+    service.focusChart(instrument.instId, 2)
+    service.activateChartViewport(instrument, '1H', adjacentEnd)
+    const covered = service.requestStatistics(instrument, '1H', adjacentEnd)
+    assert.equal(covered, owner)
+    assert.equal(covered.status, 'retrying')
+    assert.equal(covered.retryAt, owner.retryAt)
+    assert.equal(service.statistics.has(service.statisticsKey(instrument, '1H', adjacentEnd)), false)
+    await new Promise(resolve => setTimeout(resolve, 120))
+    assert.equal(oiCalls, 1)
+    assert.equal(takerCalls, 1)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a non-overlapping jump releases an unrequested older statistics page promptly', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 9, 5, 12)
+  const adjacentEnd = end - 4 * hour
+  const olderEnd = end - 100 * hour
+  const timestamps = Array.from({ length: 200 }, (_, index) => end - (199 - index) * hour)
+  let oiCalls = 0, takerCalls = 0, oiAborts = 0, takerAborts = 0
+  const pageFor = (url: URL, kind: 'oi' | 'taker') => {
+    const pageEnd = Number(url.searchParams.get('end')) - hour
+    const page = Array.from({ length: 100 }, (_, index) => pageEnd - (99 - index) * hour)
+    return kind === 'oi'
+      ? page.map((timestamp, index) => [String(timestamp), String(1_000 + index), '0', '0'])
+      : page.map((timestamp, index) => [String(timestamp), String(10 + index), String(20 + index)])
+  }
+  const holdFirst = (_data: unknown[], signal: AbortSignal | undefined, onAbort: () => void) => new Promise<Response>((_resolve, reject) => {
+    signal?.addEventListener('abort', () => {
+      onAbort()
+      reject(new DOMException('The request was aborted.', 'AbortError'))
+    }, { once: true })
+  })
+  const fetcher: typeof fetch = async (input, init) => {
+    const url = new URL(String(input))
+    if (url.pathname.endsWith('/open-interest-history')) {
+      oiCalls += 1
+      const data = pageFor(url, 'oi')
+      return oiCalls === 1 ? holdFirst(data, init?.signal ?? undefined, () => { oiAborts += 1 }) : response(data)
+    }
+    if (url.pathname.endsWith('/taker-volume-contract')) {
+      takerCalls += 1
+      const data = pageFor(url, 'taker')
+      return takerCalls === 1 ? holdFirst(data, init?.signal ?? undefined, () => { takerAborts += 1 }) : response(data)
+    }
+    throw new Error(`Unexpected ${url}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 5_000 })
+  try {
+    await store.appendCandles(timestamps.map(timestamp => nativeCandle(timestamp, '1H')))
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+    service.activateChartViewport(instrument, '1H', end)
+    service.requestStatistics(instrument, '1H', end)
+    await waitFor(() => oiCalls === 1 && takerCalls === 1)
+
+    // E's page is [E-99, E] and validly covers E-4. A one-frame E-12
+    // movement still overlaps that page and keeps it resident, but E-100 has
+    // no shared candle at all. That genuinely distant jump must cancel E
+    // promptly and own a new page rather than wait for its timeout.
+    service.focusChart(instrument.instId, 2)
+    service.activateChartViewport(instrument, '1H', adjacentEnd)
+    service.requestStatistics(instrument, '1H', adjacentEnd)
+    service.focusChart(instrument.instId, 3)
+    service.activateChartViewport(instrument, '1H', olderEnd)
+    service.requestStatistics(instrument, '1H', olderEnd)
+    await waitFor(() => service.statisticsState(instrument, '1H', olderEnd).controller !== null)
+    assert.equal(service.statistics.has(service.statisticsKey(instrument, '1H', adjacentEnd)), false)
+    await waitFor(() => oiAborts === 1 && takerAborts === 1 && oiCalls === 2 && takerCalls === 2, 1_000)
+    await waitFor(() => service.statisticsState(instrument, '1H', olderEnd).status === 'ready')
+    assert.equal(oiCalls, 2)
+    assert.equal(takerCalls, 2)
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 

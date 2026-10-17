@@ -12,6 +12,8 @@ export type ChartSeriesResponse<TBar extends ChartSeriesBar, TStatus extends obj
   bars: TBar[]
   revision: number
   serviceSession?: string
+  /** Cache-only previews may update bars but must not replace active status. */
+  statusAuthoritative?: boolean
 }
 
 export type ChartSeriesEntry<TBar extends ChartSeriesBar, TStatus extends object> = {
@@ -19,6 +21,15 @@ export type ChartSeriesEntry<TBar extends ChartSeriesBar, TStatus extends object
   latestKnownHour: number | null
   /** The newest accepted transport revision, including status-only replies. */
   revision: number
+  /**
+   * Revision of the snapshot that actually supplied `bars`.
+   *
+   * Status-only replies intentionally advance `revision` without replacing
+   * the retained series. Keeping this separately lets the caller retry a
+   * materialized read after a transient failure instead of treating a later
+   * status poll at the same revision as already rendered data.
+   */
+  barsRevision: number
   /** The session that produced the newest accepted transport reply. */
   serviceSession?: string
   /** The session that produced the retained bars. It can trail serviceSession while a new session is loading. */
@@ -77,20 +88,25 @@ export class ChartSeriesStore<TBar extends ChartSeriesBar, TStatus extends objec
     const hasIncomingBars = response.bars.length > 0
     const mustReplaceBars = hasIncomingBars && existing !== undefined && existing.barsServiceSession !== response.serviceSession
     const incoming = { bars: response.bars, revision: response.revision, serviceSession: response.serviceSession }
-    const current = existing && { bars: existing.bars, revision: existing.revision, serviceSession: existing.barsServiceSession }
+    const current = existing && { bars: existing.bars, revision: existing.barsRevision, serviceSession: existing.barsServiceSession }
     const bars = !hasIncomingBars
       ? existing?.bars ?? []
       : mustReplaceBars || !current
         ? mergeChartBars(incoming, null)
         : mergeChartBars(incoming, current)
 
+    const statusAuthoritative = response.statusAuthoritative !== false
     const entry: ChartSeriesEntry<TBar, TStatus> = {
       bars,
       latestKnownHour: latestHour(bars),
       revision: response.revision,
+      barsRevision: hasIncomingBars ? response.revision : existing?.barsRevision ?? response.revision,
       serviceSession: response.serviceSession,
       barsServiceSession: hasIncomingBars ? response.serviceSession : existing?.barsServiceSession ?? response.serviceSession,
-      status: statusOf(response),
+      // A cache-only preview has no visibility into the foreground repair or
+      // OI/Taker task. Retain that task's status instead of converting a live
+      // loading/retrying chart into a false ready state.
+      status: !statusAuthoritative && existing ? existing.status : statusOf(response),
       loadedAt,
     }
     this.entries.set(key, entry)

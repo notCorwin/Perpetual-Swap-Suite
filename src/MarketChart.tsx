@@ -23,6 +23,10 @@ import { RADAR_TIMEFRAMES, timeframeLabel, timeframeMilliseconds, type RadarTime
 
 export type Bar = {
   hour: number; open: number; high: number; low: number; close: number; confirmed: boolean
+  /** Direct OKX source mask: OI=1, Taker=2. */
+  statisticsSources?: number
+  /** Both direct OKX statistic sources have answered for this period. */
+  statisticsObserved?: boolean
   vwap: number | null; ema: number | null; logBBUpper: number | null; logBBMiddle: number | null; logBBLower: number | null
   roc: PercentageValue; maroc: PercentageValue; rsi6: number | null; rsi12: number | null; rsi24: number | null
   oi: number | null; buy: number | null; sell: number | null
@@ -32,7 +36,7 @@ export type ChartStatisticsState = 'ready' | 'loading' | 'retrying' | 'unavailab
 export type ChartResponse = {
   bars: Bar[]; error: string; revision: number; timeframe?: RadarTimeframe; intervalMS?: number; serviceSession?: string; endHour?: number; oldestHour?: number | null; historyExhausted?: boolean; candleLoadFailed?: boolean
   candleState?: ChartCandleState; missingCandleRanges?: Array<{ from: number; through: number }>; candleRetryAt?: number | null
-  statisticsState?: ChartStatisticsState; statisticsRetryAt?: number | null
+  statisticsState?: ChartStatisticsState; statisticsRetryAt?: number | null; oiState?: ChartStatisticsState; takerState?: ChartStatisticsState; statisticsEnd?: number; statusAuthoritative?: boolean
 }
 export type ChartPollResponse = ChartResponse | { unchanged: true; error: string; revision: number; serviceSession?: string }
 type ChartSurface = {
@@ -59,6 +63,10 @@ const HISTORY_VIEWPORT_DEBOUNCE = 80
 const HISTORY_PREFETCH_CANDLES = 500
 const WHEEL_PIXELS_PER_CANDLE = 12
 const MAX_WHEEL_STEPS_PER_FRAME = 12
+// Direct OI and Taker sources commit independently. While one is in flight,
+// poll the foreground viewport quickly enough to display its sibling on the
+// next paint instead of leaving a durable result blank for half a second.
+const STATISTICS_PROGRESS_POLL_MS = 80
 let nextChartFocusToken = 0
 const chartKey = (id: string, timeframe: RadarTimeframe) => `${timeframe}:${id}`
 const chartResponse = (entry: ChartSeriesEntry<Bar, ChartStatus> | undefined): ChartResponse | null => entry
@@ -200,7 +208,7 @@ export const chartGutter = (bars: Bar[], height: number, liveClose = bars[bars.l
   return fitAxisPriceTag(axisGutter, priceTagWidth(price(liveClose), "00:00"), chartTokens.priceTagStrokeWidth, minimumScale)
 }
 
-export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height, now, endHour, intervalMS = 3_600_000 }: { bars: Bar[]; liveBar: Bar; inspected: number | null; width: number; height: number; now: number; endHour: number; intervalMS?: number }) {
+export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height, now, endHour, intervalMS = 3_600_000, oiState = 'ready', takerState = 'ready' }: { bars: Bar[]; liveBar: Bar; inspected: number | null; width: number; height: number; now: number; endHour: number; intervalMS?: number; oiState?: ChartStatisticsState; takerState?: ChartStatisticsState }) {
   const areaClipId = useId().replaceAll(":", "")
   const n = bars.length
   const active = bars[inspected ?? n - 1]
@@ -393,7 +401,7 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
     <path d={downWicks.join(" ")} fill="none" stroke="var(--destructive)" strokeWidth="1.2" />
     <path d={upBodies.join(" ")} fill="var(--positive)" />
     <path d={downBodies.join(" ")} fill="var(--destructive)" />
-    <g data-chart-taker={takerComplete ? "complete" : takerAvailable ? "partial" : "empty"}>
+    <g data-chart-taker={takerComplete ? "complete" : takerAvailable ? "partial" : "empty"} data-chart-taker-state={takerState}>
       <path data-chart-taker-buy-samples={buys.length} d={buys.join(" ")} fill="var(--positive)" opacity="0.9" />
       <path data-chart-taker-sell-samples={sells.length} d={sells.join(" ")} fill="var(--destructive)" opacity="0.9" />
       <path d={sells.join(" ")} fill="url(#sell-hatch)" opacity="0.7" />
@@ -406,10 +414,9 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
     {indicatorReady('rsi24') && lineStroke(line("rsi24", "rsi", rsiY), "var(--chart-3)", indicatorWidth, 1, "1 4")}
     {indicatorReady('roc') && lineStroke(line("roc", "roc", value => scale(value, rocAxis.min, rocAxis.max, panels.roc)), "var(--chart-1)")}
     {indicatorReady('maroc') && lineStroke(line("maroc", "roc", value => scale(value, rocAxis.min, rocAxis.max, panels.roc)), "var(--chart-2)", indicatorWidth, 1, "7 4")}
-    {oiAxis && <g data-chart-oi={oiComplete ? "complete" : "partial"} data-chart-oi-samples={oiSamples.length}>
-      {lineStroke(line("oi", "oi", oiY), "var(--chart-2)")}
-      {!oiComplete && oiSamples.map(sample => <circle key={bars[sample.index].hour} data-chart-oi-sample cx={x(sample.index, "oi")} cy={oiY(sample.value)} r="2" fill="var(--chart-2)" />)}
-    </g>}
+    <g data-chart-oi={oiAxis ? oiComplete ? "complete" : "partial" : "empty"} data-chart-oi-state={oiState} data-chart-oi-samples={oiSamples.length}>
+      {oiAxis && <>{lineStroke(line("oi", "oi", oiY), "var(--chart-2)")}{!oiComplete && oiSamples.map(sample => <circle key={bars[sample.index].hour} data-chart-oi-sample cx={x(sample.index, "oi")} cy={oiY(sample.value)} r="2" fill="var(--chart-2)" />)}</>}
+    </g>
     {inspected !== null && panelKeys.map(key => <line key={key} x1={x(inspected, key)} x2={x(inspected, key)} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--foreground)" strokeWidth="0.65" strokeDasharray="3 5" opacity="0.3" />)}
     {([[highIndex, candleHigh, "high"], [lowIndex, candleLow, "low"]] as const).map(([index, value, kind]) => {
       const markerX = x(index, "price"), label = price(value)
@@ -428,8 +435,8 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
     {legend("price", [["VWAP14", price(indicatorReady('vwap') ? active.vwap : null), "var(--chart-2)"], ["EMA200", price(indicatorReady('ema') ? active.ema : null), "var(--chart-3)"], ["Log BB(20)", bandsReady ? `U ${price(active.logBBUpper)}\u00a0·\u00a0M ${price(active.logBBMiddle)}\u00a0·\u00a0L ${price(active.logBBLower)}` : "—", "var(--chart-1)"]])}
     {legend("roc", [["ROC(9)", indicatorReady('roc') ? formatPercent(active.roc) : "—", "var(--chart-1)"], ["MAROC(9)", indicatorReady('maroc') ? formatPercent(active.maroc) : "—", "var(--chart-2)"]])}
     {legend("rsi", [["RSI(6)", indicatorReady('rsi6') ? active.rsi6?.toFixed(1) ?? "—" : "—", "var(--chart-1)"], ["RSI(12)", indicatorReady('rsi12') ? active.rsi12?.toFixed(1) ?? "—" : "—", "var(--chart-2)"], ["RSI(24)", indicatorReady('rsi24') ? active.rsi24?.toFixed(1) ?? "—" : "—", "var(--chart-3)"]])}
-    {legend("oi", [["OI (Contracts)", finiteNumber(active.oi) ? compact(active.oi) : oiValues.length ? "Loading…" : "—", "var(--chart-2)"]])}
-    {legend("taker", [["Taker Buy (Contracts)", finiteNumber(active.buy) ? compact(active.buy) : takerAvailable ? "Loading…" : "—", "var(--positive)"], ["Taker Sell (Contracts)", finiteNumber(active.sell) ? compact(active.sell) : takerAvailable ? "Loading…" : "—", "var(--destructive)"]])}
+    {legend("oi", [["OI (Contracts)", finiteNumber(active.oi) ? compact(active.oi) : oiState === 'unavailable' ? "Unavailable" : oiState === 'retrying' ? "Retrying…" : oiState === 'loading' || oiValues.length ? "Loading…" : "—", "var(--chart-2)"]])}
+    {legend("taker", [["Taker Buy (Contracts)", finiteNumber(active.buy) ? compact(active.buy) : takerState === 'unavailable' ? "Unavailable" : takerState === 'retrying' ? "Retrying…" : takerState === 'loading' || takerAvailable ? "Loading…" : "—", "var(--positive)"], ["Taker Sell (Contracts)", finiteNumber(active.sell) ? compact(active.sell) : takerState === 'unavailable' ? "Unavailable" : takerState === 'retrying' ? "Retrying…" : takerState === 'loading' || takerAvailable ? "Loading…" : "—", "var(--destructive)"]])}
     {panels.rsi[1] - panels.rsi[0] >= 35 && <>{lineLabel(axisStarts.rsi, panels.rsi[0], "100")}{lineLabel(axisStarts.rsi, panels.rsi[1], "0")}</>}
     {panels.roc[1] - panels.roc[0] >= 35 && <>{lineLabel(axisStarts.roc, panels.roc[0], formatPercent(rocAxis.max, rocAxis.decimals))}{lineLabel(axisStarts.roc, panels.roc[1], formatPercent(rocAxis.min, rocAxis.decimals))}</>}
     {oiAxis && panels.oi[1] - panels.oi[0] >= 35 && oiAxis.ticks.map(tick => <g key={tick}><line x1={columns.oi[0]} x2={right} y1={oiY(tick)} y2={oiY(tick)} stroke="var(--border)" strokeOpacity="0.25" />{lineLabel(axisStarts.oi, oiY(tick), compact(tick))}</g>)}
@@ -756,7 +763,7 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
         // While a foreground repair or direct-statistics request is active,
         // observe the result promptly instead of holding a 2-second idle poll.
         backoff = status?.candleState === 'loading' || status?.candleState === 'retrying'
-          || status?.statisticsState === 'loading' || status?.statisticsState === 'retrying' ? 250 : 2000
+          || status?.statisticsState === 'loading' || status?.statisticsState === 'retrying' ? STATISTICS_PROGRESS_POLL_MS : 2000
       } catch (cause) {
         if (!stopped) {
           showError(cause instanceof Error ? cause.message : "Cannot load chart")
@@ -804,12 +811,29 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
   const viewportRuns = useMemo(() => chartViewportRuns(cachedBars, intervalMS), [cachedBars, intervalMS])
   const viewportEnd = useMemo(() => renderableChartEndFromRuns(viewportRuns, requestedViewportEnd, intervalMS), [viewportRuns, requestedViewportEnd, intervalMS])
   const bars = useMemo(() => viewportEnd === null ? [] : visibleChartBars(cachedBars, viewportEnd, intervalMS), [cachedBars, viewportEnd, intervalMS])
-  const viewportResponse = chart
+  // A neighboring/preloaded response may update the shared canonical bars,
+  // but its source status must never be displayed for this viewport.
+  const viewportResponse = chart?.statusAuthoritative !== false && (chart?.statisticsEnd === undefined || chart.statisticsEnd === viewportEnd) ? chart : undefined
   const candleState = viewportEnd !== null && !chartIndicatorsNeedLoad(cachedBars, viewportEnd, 96, intervalMS) ? 'ready' : viewportResponse?.candleState ?? 'ready'
-  const statisticsState = viewportEnd !== null && !chartStatsNeedLoad(bars, viewportEnd, 96, intervalMS) ? 'ready' : viewportResponse?.statisticsState ?? 'ready'
+  const statisticsNeedLoad = viewportEnd !== null && chartStatsNeedLoad(bars, viewportEnd, 96, intervalMS)
+  const observedStatistics = !statisticsNeedLoad && bars.length === 96 && bars.every(bar => bar.statisticsObserved === true)
+  const localOIState: ChartStatisticsState = observedStatistics && bars.some(bar => bar.oi === null) ? 'unavailable' : 'ready'
+  const localTakerState: ChartStatisticsState = observedStatistics && bars.some(bar => bar.buy === null || bar.sell === null) ? 'unavailable' : 'ready'
+  // Near-live statistic feeds can lag candles. The main process may be
+  // revalidating an observed-but-empty source; do not let the local terminal
+  // null hide that authoritative progress state from the user.
+  const statisticsRefreshing = viewportResponse?.oiState === 'loading' || viewportResponse?.oiState === 'retrying'
+    || viewportResponse?.takerState === 'loading' || viewportResponse?.takerState === 'retrying'
+  const useLocalStatistics = observedStatistics && !statisticsRefreshing
+  const statisticsState: ChartStatisticsState = useLocalStatistics
+    ? localOIState === 'ready' && localTakerState === 'ready' ? 'ready' : 'unavailable'
+    : viewportResponse?.statisticsState ?? (statisticsNeedLoad ? 'loading' : 'ready')
+  const oiState: ChartStatisticsState = useLocalStatistics ? localOIState : viewportResponse?.oiState ?? (statisticsNeedLoad ? 'loading' : 'ready')
+  const takerState: ChartStatisticsState = useLocalStatistics ? localTakerState : viewportResponse?.takerState ?? (statisticsNeedLoad ? 'loading' : 'ready')
   const incompleteViewport = requestedViewportEnd > 0 && viewportEnd !== requestedViewportEnd
   useEffect(() => {
-    if (focusSession === null || focusToken === null || historicalEnd === null || settledHistoricalEnd !== historicalEnd || !chartStatisticsRequestable(bars, historicalEnd, viewportEnd, 96, intervalMS)) return
+    const hasStatisticsProgress = statisticsRefreshing || viewportResponse?.statisticsState === 'unavailable' && Number.isFinite(viewportResponse.statisticsRetryAt)
+    if (focusSession === null || focusToken === null || historicalEnd === null || settledHistoricalEnd !== historicalEnd || !chartStatisticsRequestable(bars, historicalEnd, viewportEnd, 96, intervalMS) && !hasStatisticsProgress) return
     const requestKey = chartRequestKey('statistics', cacheKey, historicalEnd, focusSession, focusToken)
     if (statisticsRequests.current.has(requestKey) || statisticsRetryTimers.current.has(requestKey)) return
     const viewportIsCurrent = () => mountedRef.current && isCurrentChartViewportGeneration(windowEndRef.current && committedFocusRef.current ? {
@@ -823,21 +847,46 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
       const timer = window.setTimeout(() => {
         statisticsRetryTimers.current.delete(requestKey)
         if (viewportIsCurrent()) setStatisticsRetry(value => value + 1)
-      }, Math.max(250, delay))
+      }, Math.max(STATISTICS_PROGRESS_POLL_MS, delay))
       statisticsRetryTimers.current.set(requestKey, timer)
     }
     const startRequest = () => {
       if (!currentViewport() || statisticsRequests.current.has(requestKey)) return
       statisticsRequests.current.add(requestKey)
-      const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken, chartEndHour: historicalEnd })
-      void request.then(result => {
+      // The first foreground request loads the canonical bar snapshot. Once
+      // it exists, progress polling only needs the independent source states.
+      // Returning another 500-bar indicator payload every 80ms was the hot
+      // path behind the visible stall while OI/Taker were waiting.
+      const statusOnly = viewportResponse?.statisticsEnd === historicalEnd
+      const request = window.webkit.messageHandlers.radar.postMessage({
+        chartInstId: instId, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken,
+        chartEndHour: historicalEnd, chartStatusOnly: statusOnly || undefined,
+      })
+      void request.then(async result => {
         if ("unchanged" in result || !currentViewport()) return
-        if (!rememberVisibleChart(result).accepted) return
-        if (result.statisticsState !== 'ready') retry(result.statisticsRetryAt === null || result.statisticsRetryAt === undefined ? 500 : result.statisticsRetryAt - Date.now())
-      }).catch(() => retry(500)).finally(() => statisticsRequests.current.delete(requestKey))
+        const barsRevisionBefore = chartSeries.get(cacheKey)?.barsRevision
+        let observed: ChartResponse = result
+        if (!rememberVisibleChart(observed).accepted) return
+        // A status-only reply may observe a just-committed source page. Keep
+        // the bars on screen immediately, then perform exactly one complete
+        // read to merge the new OI/Taker values into the retained series.
+        if (statusOnly && barsRevisionBefore !== undefined && observed.revision !== barsRevisionBefore) {
+          const full = await window.webkit.messageHandlers.radar.postMessage({
+            chartInstId: instId, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken,
+            chartEndHour: historicalEnd,
+          })
+          if ("unchanged" in full || !currentViewport()) return
+          observed = full
+          if (!rememberVisibleChart(observed).accepted) return
+        }
+        const sourceLoading = observed.oiState === 'loading' || observed.takerState === 'loading'
+        const sourceRetrying = observed.oiState === 'retrying' || observed.takerState === 'retrying'
+        if (sourceLoading) retry(STATISTICS_PROGRESS_POLL_MS)
+        else if (sourceRetrying || observed.statisticsState === 'unavailable' && Number.isFinite(observed.statisticsRetryAt)) retry(observed.statisticsRetryAt === null || observed.statisticsRetryAt === undefined ? STATISTICS_PROGRESS_POLL_MS : observed.statisticsRetryAt - Date.now())
+      }).catch(() => retry(STATISTICS_PROGRESS_POLL_MS)).finally(() => statisticsRequests.current.delete(requestKey))
     }
     startRequest()
-  }, [instId, cacheKey, timeframe, intervalMS, historicalEnd, settledHistoricalEnd, viewportEnd, bars, statisticsRetry, focusSession, focusToken, rememberVisibleChart])
+  }, [instId, cacheKey, timeframe, intervalMS, historicalEnd, settledHistoricalEnd, viewportEnd, bars, statisticsRetry, focusSession, focusToken, rememberVisibleChart, statisticsRefreshing, viewportResponse?.statisticsState, viewportResponse?.statisticsRetryAt, viewportResponse?.statisticsEnd])
   const inspectedIndex = inspection?.id === cacheKey ? bars.findIndex(bar => bar.hour === inspection.hour) : -1
   const inspected = inspectedIndex < 0 ? null : inspectedIndex
   const inspectAt = (target: SVGSVGElement, clientX: number) => {
@@ -949,7 +998,7 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}{historicalEnd !== null && ' Retrying automatically.'}</div>}
     {captureError && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{captureError}</p>}
     <div className="flex min-h-0 flex-1">
-    <section ref={chartRef} data-chart-inst={instId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-cache-start={cachedBars[0]?.hour} data-chart-requested-end={requestedViewportEnd || undefined} data-chart-rendered-bars={surface?.bars.length ?? 0} data-chart-target-bars={bars.length} data-chart-visual-stale={surfaceIsStale ? 'true' : 'false'} data-chart-candle-state={candleState} data-chart-statistics-state={statisticsState} data-chart-incomplete={incompleteViewport ? 'true' : 'false'} data-chart-loading={historyLoading === `${cacheKey}:${historicalEnd}` || candleState === 'loading' || candleState === 'retrying' || incompleteViewport || statisticsState === 'loading' || statisticsState === 'retrying' ? 'true' : 'false'} data-surface="panel" aria-label={`${instId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-chart-surface">
+    <section ref={chartRef} data-chart-inst={instId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-cache-start={cachedBars[0]?.hour} data-chart-requested-end={requestedViewportEnd || undefined} data-chart-rendered-bars={surface?.bars.length ?? 0} data-chart-target-bars={bars.length} data-chart-visual-stale={surfaceIsStale ? 'true' : 'false'} data-chart-candle-state={candleState} data-chart-statistics-state={statisticsState} data-chart-statistics-end={viewportResponse?.statisticsEnd} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={incompleteViewport ? 'true' : 'false'} data-chart-loading={historyLoading === `${cacheKey}:${historicalEnd}` || candleState === 'loading' || candleState === 'retrying' || incompleteViewport || oiState === 'loading' || oiState === 'retrying' || takerState === 'loading' || takerState === 'retrying' ? 'true' : 'false'} data-surface="panel" aria-label={`${instId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-chart-surface">
       {active && <div className="grid shrink-0 grid-cols-[minmax(9rem,1.2fr)_repeat(4,minmax(0,1fr))] items-center border-b px-4 py-1.5 text-[length:var(--chart-text-size)]" aria-live="off">
         <p className="min-w-0 truncate border-r pr-3"><span className="font-medium">{instId.replace(/-SWAP$/, "")}</span> · <span className="text-muted-foreground">{inspected === null ? historicalEnd === null ? "Latest" : "Window end" : "Selected"}</span> {time(active.hour)}{active.confirmed ? "" : " · Live"}</p>
         {([ ["Open", active.open], ["High", active.high], ["Low", active.low], ["Close", active.close] ] as const).map(([label, value]) => <div key={label} className="min-w-0 px-3">
@@ -981,13 +1030,14 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
           if (!(event.buttons & 1)) { endInspection(); return }
           inspectAt(event.currentTarget, event.clientX)
         }}>
-          <Plot bars={surface.bars} liveBar={surface.liveBar} inspected={surfaceIsStale ? null : inspected} width={plotSize.width} height={plotSize.height} now={1} endHour={surface.endHour} intervalMS={surface.intervalMS} />
+          <Plot bars={surface.bars} liveBar={surface.liveBar} inspected={surfaceIsStale ? null : inspected} width={plotSize.width} height={plotSize.height} now={1} endHour={surface.endHour} intervalMS={surface.intervalMS} oiState={oiState} takerState={takerState} />
         </svg> : null}
         {surfaceIsStale && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Loading {timeframeLabel(timeframe)} chart…</span>}
-        {historicalEnd !== null && historyLoading === `${cacheKey}:${historicalEnd}` && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Repairing missing candles…</span>}
-        {historyLoading !== `${cacheKey}:${historicalEnd}` && (candleState === 'loading' || candleState === 'retrying' || incompleteViewport) && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{candleState === 'retrying' ? 'Retrying missing candles…' : 'Repairing missing candles…'}</span>}
+        {historicalEnd !== null && historyLoading === `${cacheKey}:${historicalEnd}` && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Loading indicator warm-up history…</span>}
+        {historyLoading !== `${cacheKey}:${historicalEnd}` && (candleState === 'loading' || candleState === 'retrying' || incompleteViewport) && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{candleState === 'retrying' ? 'Retrying chart history…' : 'Loading chart history…'}</span>}
         {candleState === 'unavailable' && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{historicalEnd === null ? 'Latest source candles unavailable' : 'Missing source candles in this range'}</span>}
-        {statisticsState !== 'ready' && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-10 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{statisticsState === 'unavailable' ? 'OI and Taker data unavailable for this range' : statisticsState === 'retrying' ? 'Retrying OI and Taker data…' : 'Loading OI and Taker data…'}</span>}
+        {oiState !== 'ready' && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-10 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{oiState === 'unavailable' ? 'OI unavailable for this historical range' : oiState === 'retrying' ? 'Retrying OI data…' : 'Loading OI data…'}</span>}
+        {takerState !== 'ready' && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-20 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{takerState === 'unavailable' ? 'Taker data unavailable for this historical range' : takerState === 'retrying' ? 'Retrying Taker data…' : 'Loading Taker data…'}</span>}
         {atHistoryBoundary && <span role="status" data-surface="control" className="pointer-events-none absolute right-4 top-2 rounded-(--control-radius) border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Start of available history</span>}
         </div>
       </div>

@@ -1,5 +1,16 @@
 import type { SnapshotVersion } from './snapshot-order.ts'
 
+const OI_SOURCE = 0b001
+const TAKER_SOURCE = 0b010
+const COMPLETE_SOURCES = OI_SOURCE | TAKER_SOURCE
+
+const statisticsSources = (bar: object) => {
+  const value = bar as { statisticsSources?: unknown; statisticsObserved?: boolean }
+  const sources = Number(value.statisticsSources)
+  if (Number.isInteger(sources) && sources >= 0) return sources & COMPLETE_SOURCES
+  return value.statisticsObserved === true ? COMPLETE_SOURCES : 0
+}
+
 export function mergeChartBars<T extends { hour: number; confirmed: boolean }>(live: (SnapshotVersion & { bars: T[] }) | null, history: (SnapshotVersion & { bars: T[] }) | null): T[] {
   if (live?.serviceSession && history?.serviceSession && live.serviceSession !== history.serviceSession) return live.bars
   const [older, newer] = (live?.revision ?? -1) >= (history?.revision ?? -1) ? [history, live] : [live, history]
@@ -12,8 +23,20 @@ export function mergeChartBars<T extends { hour: number; confirmed: boolean }>(l
     // only around their viewport. A later adjacent response must not erase OI
     // or taker values already loaded for an overlapping hour with nulls.
     const merged: Record<string, unknown> = { ...previous, ...bar }
-    for (const key of ["oi", "buy", "sell"] as const) {
-      if (key in previous && (bar as T & Record<string, unknown>)[key] === null) merged[key] = (previous as T & Record<string, unknown>)[key]
+    const incomingSources = statisticsSources(bar)
+    const previousSources = statisticsSources(previous)
+    for (const [key, source] of [["oi", OI_SOURCE], ["buy", TAKER_SOURCE], ["sell", TAKER_SOURCE]] as const) {
+      // Source ownership is independent. A known OI terminal-null must erase
+      // a stale OI value even while Taker is still pending; conversely an
+      // unfetched Taker response must not erase a previously loaded value.
+      if (!(incomingSources & source) && key in previous && (bar as T & Record<string, unknown>)[key] === null) merged[key] = (previous as T & Record<string, unknown>)[key]
+    }
+    const mergedSources = incomingSources | previousSources
+    const carriesStatistics = 'statisticsSources' in (bar as object) || 'statisticsObserved' in (bar as object)
+      || 'statisticsSources' in (previous as object) || 'statisticsObserved' in (previous as object)
+    if (carriesStatistics) {
+      merged.statisticsSources = mergedSources
+      merged.statisticsObserved = mergedSources === COMPLETE_SOURCES
     }
     bars.set(bar.hour, merged as T)
   }

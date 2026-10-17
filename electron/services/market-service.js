@@ -23,6 +23,11 @@ const UNAVAILABLE_RETRY_DELAY = 30_000
 const LATEST_CANDLE_REFRESH = 60_000
 const HISTORY_BOUNDARY_EMPTY_RESPONSES = 3
 const REQUEST_TIMEOUT = 12_000
+// A queued request can become unnecessary while another viewport persists
+// the same source page. Keep that outcome distinct from an empty OKX result:
+// an empty result is a durable observed null, while this sentinel means no
+// network request happened and the caller must read the now-local page.
+const REQUEST_SKIPPED = Symbol('request-skipped')
 const REQUEST_PRIORITY = { background: 0, warmup: 1, statistics: 2, foreground: 3, repair: 4 }
 // OKX applies the relevant public limits per endpoint family. A single global
 // queue turns those independent budgets into artificial serial work: a candle
@@ -37,7 +42,17 @@ const requestLaneFor = path => path.includes('/rubik/stat/taker-volume-contract'
 // OI/Taker values are only reusable when they came from the current direct
 // endpoint contract. Earlier builds derived them from 5m/USDT data, which is
 // neither the requested timeframe nor the requested unit.
+// `1` is the prior fully-hydrated marker. Keep writing it for complete numeric
+// rows so an existing healthy cache remains valid. The format bit below is
+// used only where one source has observed a terminal null.
 const STATISTICS_VERSION = 1
+// statisticsVersion is otherwise a persisted source-observation bitset. The
+// format bit keeps it distinguishable from the previous `1` marker.
+const STATISTICS_FORMAT = 0b100
+const STATISTICS_OI = 0b001
+const STATISTICS_TAKER = 0b010
+const STATISTICS_COMPLETE = STATISTICS_OI | STATISTICS_TAKER
+const statisticsExpiryField = source => source === STATISTICS_OI ? 'statisticsOIExpiresAt' : 'statisticsTakerExpiresAt'
 // Bump this when liquidity eligibility semantics change. A cached catalogue
 // must never survive a policy change as if it had been checked by the new one.
 const CATALOG_SNAPSHOT_SCHEMA = 1
@@ -110,6 +125,18 @@ const number = value => {
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : null
 }
+const statisticsMask = value => {
+  const version = number(value?.statisticsVersion)
+  // Preserve good data written by the preceding format. It was only ever
+  // assigned after both direct endpoint values were present.
+  if (version === 1 && number(value?.oi) !== null && number(value?.buy) !== null && number(value?.sell) !== null) return STATISTICS_COMPLETE
+  return version !== null && (version & STATISTICS_FORMAT) === STATISTICS_FORMAT ? version & STATISTICS_COMPLETE : 0
+}
+const hasStatisticsSource = (value, source) => (statisticsMask(value) & source) === source
+const statisticsVersionFor = (sources, values) => sources === STATISTICS_COMPLETE
+  && number(values?.oi) !== null && number(values?.buy) !== null && number(values?.sell) !== null
+  ? STATISTICS_VERSION
+  : STATISTICS_FORMAT | (sources & STATISTICS_COMPLETE)
 const percent = (current, previous) => current === null || previous === null || previous === 0 ? null : (current - previous) / Math.abs(previous) * 100
 const timeframeMilliseconds = timeframe => timeframe === '5m' ? FIVE_MINUTES : timeframe === '15m' ? 900_000 : 3_600_000
 
@@ -135,6 +162,10 @@ const repairRangeClass = (range, visible) => visible && rangesOverlap(range, vis
 function chartBaseRange(timeframe, end) {
   const intervalMS = timeframeMilliseconds(timeframe)
   return {
+    // Indicators only need warm-up history immediately left of the 96
+    // visible candles. The wider retained history is fetched progressively;
+    // repairing all 499 cached periods here would turn one wheel tick into
+    // several needless network pages.
     from: end - (VISIBLE_CANDLES - 1 + EMA_WARMUP_CANDLES) * intervalMS,
     through: end,
   }
@@ -238,8 +269,8 @@ function candle(instrument, timeframe, value) {
   return { instrument, timeframe, timestamp, open, high, low, close, volume: number(value[5]) ?? 0, quoteVolume: number(value[7]) ?? 0, confirmed: value[8] === '1' }
 }
 
-const candleFields = ['instrument', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'quoteVolume', 'oi', 'buy', 'sell', 'statisticsVersion', 'confirmed']
-const optionalCandleFields = new Set(['oi', 'buy', 'sell', 'statisticsVersion'])
+const candleFields = ['instrument', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'quoteVolume', 'oi', 'buy', 'sell', 'statisticsVersion', 'statisticsOIExpiresAt', 'statisticsTakerExpiresAt', 'confirmed']
+const optionalCandleFields = new Set(['oi', 'buy', 'sell', 'statisticsVersion', 'statisticsOIExpiresAt', 'statisticsTakerExpiresAt'])
 
 function mergedCandle(previous, next) {
   // Raw/derived candle writes use null as “no new statistics”, so they must
@@ -818,6 +849,15 @@ export class MarketService {
           const scheduled = Math.max(Date.now(), lane.nextAt, lane.rateLimitedUntil)
           if (scheduled > Date.now()) await sleep(scheduled - Date.now(), this.shutdownController.signal, request.controller.signal)
           if (this.disposed || request.controller.signal.aborted) throw request.controller.signal.reason ?? new Error('Market service is closed.')
+          // A source page may have been persisted while this request waited
+          // in its endpoint lane. Recheck immediately before consuming the
+          // network budget so a fast scroll cannot download the same OI or
+          // Taker block twice.
+          const skip = request.beforeFetch && await abortable(Promise.resolve().then(() => request.beforeFetch()), request.controller.signal)
+          if (skip) {
+            request.resolve(REQUEST_SKIPPED)
+            continue
+          }
           lane.nextAt = Date.now() + lane.interval
           const timeout = setTimeout(() => request.controller.abort(new RequestTimeoutError(request.path, this.requestTimeout)), this.requestTimeout)
           timeout.unref?.()
@@ -842,6 +882,11 @@ export class MarketService {
               if (payload.code && payload.code !== '0') throw new Error(`OKX ${request.path}: ${payload.msg || payload.code}`)
               return payload.data ?? []
             }), request.controller.signal)
+            // Persist a chart statistics response before freeing this source
+            // lane. A neighboring viewport queued behind it can then observe
+            // the durable 100-row page in `beforeFetch` and skip its own
+            // redundant endpoint request.
+            if (request.afterData) await abortable(Promise.resolve().then(() => request.afterData(data)), request.controller.signal)
             request.resolve(data)
           } finally {
             clearTimeout(timeout)
@@ -866,7 +911,7 @@ export class MarketService {
     return Promise.all([...this.requestLanes.keys()].map(name => this.drainRequestLane(name)))
   }
 
-  get(path, parameters, requestSignal, priority = 'foreground') {
+  get(path, parameters, requestSignal, priority = 'foreground', { beforeFetch = null, afterData = null } = {}) {
     if (this.disposed || requestSignal?.aborted) throw new Error('Market service is closed.')
     const lane = requestLaneFor(path)
     // Foreground work may evict background work only from the same OKX
@@ -881,12 +926,18 @@ export class MarketService {
     if (priority === 'background') this.backgroundRequestControllers.set(controller, lane)
     let resolveRequest, rejectRequest
     const result = new Promise((resolve, reject) => { resolveRequest = resolve; rejectRequest = reject })
-    const request = { path, parameters, requestSignal, priority, lane, controller, abort, resolve: resolveRequest, reject: rejectRequest, cleaned: false, onAbort: null }
+    const queue = this.requestLane(lane)
+    // The storage recheck is only useful after another same-family request
+    // had a chance to persist overlapping data. Running it for an idle lane
+    // would add a DuckDB read to every first OI/Taker request and delay the
+    // two independent endpoints for no benefit.
+    const waitedForLane = queue.running || queue.queue.length > 0 || queue.nextAt > Date.now() || queue.rateLimitedUntil > Date.now()
+    const request = { path, parameters, requestSignal, priority, lane, controller, abort, beforeFetch: waitedForLane ? beforeFetch : null, afterData, resolve: resolveRequest, reject: rejectRequest, cleaned: false, onAbort: null }
     request.onAbort = () => this.rejectQueuedRequest(request)
     controller.signal.addEventListener('abort', request.onAbort, { once: true })
     if (controller.signal.aborted) request.onAbort()
     else {
-      this.requestLane(lane).queue.push(request)
+      queue.queue.push(request)
       void this.drainRequestLane(lane)
     }
     return result
@@ -960,44 +1011,344 @@ export class MarketService {
 
   isActiveChartInstrument(instrument) { return this.activeChartInstrument === null || this.activeChartInstrument === instrument.instId }
 
-  isActiveStatistics(instrument, timeframe, end) {
+  isActiveStatistics(instrument, timeframe) {
     if (!this.isActiveChartInstrument(instrument)) return false
-    // Once a chart has focus, statistics belong to its explicit viewport.
-    // During a focus transition there is deliberately no active viewport, so
-    // an aborted old task must not restart itself in that short interval.
-    if (this.activeChartInstrument !== null && this.activeChartViewport === null) return false
-    return this.activeChartViewport === null || this.activeChartViewport.instrument === instrument.instId && this.activeChartViewport.timeframe === timeframe && this.activeChartViewport.end === end
+    // Statistics use a 100-period page and must survive nearby scrolling. A
+    // task belongs to the selected instrument, not one exact viewport edge.
+    // focusChart deliberately clears the viewport before the next request;
+    // do not make that tiny transition abort a valid statistics page.
+    const viewport = this.activeChartViewport
+    return this.activeChartInstrument === null || viewport === null
+      || viewport.instrument === instrument.instId && viewport.timeframe === timeframe
   }
 
   statisticsState(instrument, timeframe, end) {
     const key = this.statisticsKey(instrument, timeframe, end)
     let state = this.statistics.get(key)
     if (!state) {
-      state = { status: 'ready', attempt: 0, retryAt: null, rateLimitLane: null, expiresAt: 0, timer: null, task: null, controller: null, lastError: '' }
+      const sourceState = source => ({ source, ownsPage: false, delegate: null, status: 'loading', coverageKnown: false, coverageOnly: false, attempt: 0, retryAt: null, rateLimitLane: null, timer: null, task: null, lastError: '', expiresAt: 0 })
+      state = {
+        instrument: instrument.instId,
+        timeframe,
+        end,
+        ownsPage: false,
+        status: 'ready',
+        oiState: 'loading',
+        takerState: 'loading',
+        retryAt: null,
+        rateLimitLane: null,
+        expiresAt: 0,
+        task: null,
+        controller: null,
+        lastError: '',
+        pageSources: { oi: false, taker: false },
+        sources: {
+          oi: sourceState(STATISTICS_OI),
+          taker: sourceState(STATISTICS_TAKER),
+        },
+      }
       this.statistics.set(key, state)
     }
     return state
   }
 
+  statisticsSource(state, source) { return source === STATISTICS_OI ? state.sources.oi : state.sources.taker }
+
+  statisticsSourceKey(source) { return source === STATISTICS_OI ? 'oi' : 'taker' }
+
+  effectiveStatisticsSource(source) {
+    let current = source
+    const visited = new Set()
+    while (current.delegate && !visited.has(current)) {
+      visited.add(current)
+      current = this.statisticsSource(current.delegate.state, current.delegate.source)
+    }
+    return current
+  }
+
+  statisticsSourceWindowState(window, source) { return source === STATISTICS_OI ? window.oiState : window.takerState }
+
+  statisticsSourceTerminal(status) { return status === 'ready' || status === 'unavailable' }
+
+  statisticsSourceWindowExpiry(window, source) {
+    if (this.statisticsSourceWindowState(window, source) !== 'unavailable') return Infinity
+    const expiry = statisticsExpiryField(source)
+    const incomplete = source === STATISTICS_OI
+      ? value => number(value.oi) === null
+      : value => number(value.buy) === null || number(value.sell) === null
+    // Expiry belongs to the direct observation, not to whichever viewport
+    // happens to read the cached null later. This is what lets a neighboring
+    // 1H window revalidate an empty near-live response instead of treating it
+    // as permanently historical data.
+    const leases = window.rows.filter(value => hasStatisticsSource(value, source) && incomplete(value))
+      .map(value => number(value[expiry]))
+      .filter(Number.isFinite)
+    return leases.length ? Math.max(...leases) : Infinity
+  }
+
+  statisticsSourceLeaseExpired(source, now = Date.now()) {
+    return source.status === 'unavailable' && Number.isFinite(source.expiresAt) && source.expiresAt <= now
+  }
+
+  statisticsHasWork(state, now = Date.now()) {
+    return Boolean(state?.task || Object.values(state?.sources ?? {}).some(source => {
+      const current = this.effectiveStatisticsSource(source)
+      return current.task || current.timer || Number.isFinite(current.retryAt) && current.retryAt > now
+    }))
+  }
+
+  statisticsOwnWork(state, now = Date.now()) {
+    return Boolean(state?.task || Object.values(state?.sources ?? {}).some(source => source.ownsPage && (source.task || source.timer || Number.isFinite(source.retryAt) && source.retryAt > now)))
+  }
+
+  statisticsSourceCoversPage(state, source, now = Date.now()) {
+    const key = this.statisticsSourceKey(source), current = this.statisticsSource(state, source)
+    // A normal source request always persists its entire 100-period page, so
+    // a nearby viewport may safely follow it while it is still loading or
+    // retrying. Coverage-only work is different: the current 96 rows are
+    // already complete and its extra four rows are not yet trustworthy.
+    return current.ownsPage && current.coverageKnown && !this.statisticsSourceLeaseExpired(current, now)
+      && (state.pageSources[key] || !current.coverageOnly && (state.task || current.task || current.timer || Number.isFinite(current.retryAt) && current.retryAt > now))
+  }
+
+  syncStatisticsState(state) {
+    const sources = [this.effectiveStatisticsSource(state.sources.oi), this.effectiveStatisticsSource(state.sources.taker)]
+    state.oiState = sources[0].status
+    state.takerState = sources[1].status
+    const pending = sources.filter(source => !this.statisticsSourceTerminal(source.status))
+    const retries = pending.filter(source => source.status === 'retrying')
+    if (!pending.length) {
+      state.status = sources.every(source => source.status === 'ready') ? 'ready' : 'unavailable'
+      state.retryAt = null
+      state.rateLimitLane = null
+      state.lastError = ''
+      // A terminal window inherits the longest direct-source lease. Do not
+      // recompute this from `state.end`: a near-live empty page can cover an
+      // older neighboring viewport, and that neighbor must retain the source
+      // observation's expiry rather than turn it into an eternal null.
+      const leases = sources.filter(source => source.status === 'unavailable')
+        .map(source => source.expiresAt)
+        .filter(Number.isFinite)
+      state.expiresAt = leases.length ? Math.max(...leases) : Infinity
+      return state
+    }
+    const nextRetry = retries
+      .filter(source => Number.isFinite(source.retryAt))
+      .sort((left, right) => left.retryAt - right.retryAt)[0]
+    state.status = retries.length ? 'retrying' : 'loading'
+    state.retryAt = nextRetry?.retryAt ?? null
+    state.rateLimitLane = nextRetry?.rateLimitLane ?? null
+    state.lastError = nextRetry?.lastError ?? ''
+    state.expiresAt = 0
+    return state
+  }
+
+  canContinueStatistics(state) {
+    if (state.controller?.signal.aborted || !this.isActiveStatistics({ instId: state.instrument }, state.timeframe)) return false
+    const viewport = this.activeChartViewport
+    // Latest polling first claims an intentionally end-less viewport while
+    // it reads the local native candle end. That sub-millisecond transition
+    // is not a history jump; treating it as one aborts an otherwise useful
+    // OI/Taker page whenever an endpoint completes between the two calls.
+    if (viewport === null || viewport?.instrument !== state.instrument || viewport.timeframe !== state.timeframe || !Number.isFinite(viewport.end) || state.end === viewport.end) return true
+    return Object.values(state.sources).some(source => source.ownsPage && this.statisticsPageOverlaps(state, state.timeframe, viewport.end))
+  }
+
+  retireStatisticsState(state) {
+    const key = this.statisticsKey({ instId: state.instrument }, state.timeframe, state.end)
+    if (this.statistics.get(key) !== state) return
+    state.ownsPage = false
+    for (const source of Object.values(state.sources)) {
+      if (!source.ownsPage) continue
+      source.ownsPage = false
+      if (source.timer) clearTimeout(source.timer)
+      source.timer = null
+    }
+    state.controller?.abort()
+    if (!this.statisticsOwnWork(state)) this.statistics.delete(key)
+  }
+
+  cleanupRetiredStatistics(state) {
+    if (state.controller?.signal.aborted || !this.canContinueStatistics(state)) this.retireStatisticsState(state)
+  }
+
+  shouldRefreshLiveStatistic(timeframe, end, status) {
+    return status === 'unavailable' && end >= Date.now() - timeframeMilliseconds(timeframe) * 2
+  }
+
+  restoreStatisticsSourceFromWindow(state, source, window, refreshUnavailable = false) {
+    const current = this.statisticsSource(state, source)
+    if (current.delegate || current.task || current.timer) return
+    const status = this.statisticsSourceWindowState(window, source)
+    if (refreshUnavailable && status === 'unavailable') {
+      current.status = 'loading'
+      current.coverageOnly = false
+      current.attempt = 0
+      current.retryAt = null
+      current.rateLimitLane = null
+      current.lastError = ''
+      current.expiresAt = 0
+      return
+    }
+    current.status = status
+    current.coverageOnly = false
+    current.expiresAt = status === 'unavailable' ? this.statisticsSourceWindowExpiry(window, source) : Infinity
+    if (this.statisticsSourceTerminal(current.status)) {
+      current.attempt = 0
+      current.retryAt = null
+      current.rateLimitLane = null
+      current.lastError = ''
+    }
+  }
+
+  statisticsWindow(rows, first, intervalMS) {
+    const candlesReady = this.completeCandleRows(rows, first, intervalMS)
+    if (!candlesReady) return { candlesReady: false, complete: false, status: 'loading', oiState: 'loading', takerState: 'loading' }
+    const sourceState = (source, fields) => {
+      if (!rows.every(value => hasStatisticsSource(value, source))) return 'loading'
+      return rows.every(value => fields.every(field => number(value[field]) !== null)) ? 'ready' : 'unavailable'
+    }
+    const oiState = sourceState(STATISTICS_OI, ['oi'])
+    const takerState = sourceState(STATISTICS_TAKER, ['buy', 'sell'])
+    const complete = oiState !== 'loading' && takerState !== 'loading'
+    return {
+      candlesReady,
+      complete,
+      oiState,
+      takerState,
+      // A source may have terminally empty historic rows while its sibling
+      // is useful. That is unavailable, not a retryable generic loading.
+      status: !complete ? 'loading' : oiState === 'ready' && takerState === 'ready' ? 'ready' : 'unavailable',
+    }
+  }
+
+  // A 100-row source response can also settle a neighboring active viewport.
+  // Keep that viewport's in-memory source state aligned with the committed
+  // rows. Without this, B can remain "unavailable" after a newer E page
+  // supplies numeric values for all of B, causing status-only polls to report
+  // a false gap even though the renderer has the data in Parquet.
+  reconcileOverlappingStatisticsSource(instrument, timeframe, page, source, rows) {
+    const byHour = new Map(rows.map(value => [value.timestamp, value]))
+    for (const state of this.statistics.values()) {
+      if (state.instrument !== instrument || state.timeframe !== timeframe) continue
+      const current = this.statisticsSource(state, source)
+      // Delegates derive from their owner, and coverage-only work is still
+      // filling its four-row prefetch tail. Neither should be promoted by a
+      // write that only happens to cover the visible 96 rows.
+      if (!current.ownsPage || current.delegate || current.coverageOnly) continue
+      const range = this.statisticsRange(timeframe, state.end)
+      if (range.from < page.from || range.through > page.through) continue
+      const windowRows = []
+      for (let timestamp = range.from; timestamp <= range.through; timestamp += range.intervalMS) {
+        const row = byHour.get(timestamp)
+        if (!row) break
+        windowRows.push(row)
+      }
+      if (windowRows.length !== VISIBLE_CANDLES) continue
+      const window = { ...this.statisticsWindow(windowRows, range.from, range.intervalMS), rows: windowRows }
+      const status = this.statisticsSourceWindowState(window, source)
+      if (!this.statisticsSourceTerminal(status)) continue
+      current.status = status
+      current.expiresAt = status === 'unavailable' ? this.statisticsSourceWindowExpiry(window, source) : Infinity
+      current.attempt = 0
+      current.retryAt = null
+      current.rateLimitLane = null
+      current.lastError = ''
+      if (current.timer) clearTimeout(current.timer)
+      current.timer = null
+      this.syncStatisticsState(state)
+    }
+  }
+
   completeStatisticsRows(rows, first, intervalMS) {
-    return rows.length === VISIBLE_CANDLES && rows.every((value, index) => value.timestamp === first + index * intervalMS
-      && number(value.oi) !== null && number(value.buy) !== null && number(value.sell) !== null
-      && number(value.statisticsVersion) === STATISTICS_VERSION)
+    return this.statisticsWindow(rows, first, intervalMS).complete
   }
 
   completeCandleRows(rows, first, intervalMS) {
-    return rows.length === VISIBLE_CANDLES && rows.every((value, index) => (value.timestamp ?? value.hour) === first + index * intervalMS && value.confirmed)
+    return this.completeCandleRowsOfLength(rows, first, intervalMS, VISIBLE_CANDLES)
+  }
+
+  completeCandleRowsOfLength(rows, first, intervalMS, length) {
+    return rows.length === length && rows.every((value, index) => (value.timestamp ?? value.hour) === first + index * intervalMS && value.confirmed)
   }
 
   hasCurrentStatistics(value) {
-    return number(value?.statisticsVersion) === STATISTICS_VERSION
+    return statisticsMask(value) !== 0
+  }
+
+  statisticsRange(timeframe, end) {
+    const intervalMS = timeframeMilliseconds(timeframe)
+    return { from: end - (VISIBLE_CANDLES - 1) * intervalMS, through: end, intervalMS }
+  }
+
+  statisticsPageRange(timeframe, end) {
+    const intervalMS = timeframeMilliseconds(timeframe)
+    return { from: end - 99 * intervalMS, through: end, intervalMS }
+  }
+
+  coveringStatisticsSource(instrument, timeframe, end, source, now = Date.now()) {
+    const target = this.statisticsRange(timeframe, end)
+    for (const state of this.statistics.values()) {
+      // Each source owns its own 100-period page. This preserves an already
+      // useful OI/Taker lane when its sibling has an older four-bar hole.
+      if (!state.ownsPage || state.controller?.signal.aborted || state.instrument !== instrument.instId || state.timeframe !== timeframe || state.end === end || !this.statisticsSourceCoversPage(state, source, now)) continue
+      const page = this.statisticsPageRange(timeframe, state.end)
+      if (page.from <= target.from && page.through >= target.through) return state
+    }
+    return null
+  }
+
+  coveringStatisticsTask(instrument, timeframe, end) {
+    const now = Date.now()
+    const oi = this.coveringStatisticsSource(instrument, timeframe, end, STATISTICS_OI, now)
+    const taker = this.coveringStatisticsSource(instrument, timeframe, end, STATISTICS_TAKER, now)
+    return oi && oi === taker ? oi : null
+  }
+
+  reconcileStatisticsDelegates(state) {
+    let changed = false
+    for (const source of [STATISTICS_OI, STATISTICS_TAKER]) {
+      const current = this.statisticsSource(state, source)
+      if (!current.delegate) continue
+      const owner = current.delegate.state
+      const ownerKey = this.statisticsKey({ instId: owner.instrument }, owner.timeframe, owner.end)
+      if (this.statistics.get(ownerKey) === owner && this.statisticsPageCovers(owner, state.timeframe, state.end) && this.statisticsSourceCoversPage(owner, source)) continue
+      current.delegate = null
+      current.ownsPage = true
+      current.status = 'loading'
+      current.coverageKnown = false
+      current.coverageOnly = false
+      current.retryAt = null
+      current.rateLimitLane = null
+      current.lastError = ''
+      changed = true
+    }
+    state.ownsPage = Object.values(state.sources).some(source => source.ownsPage)
+    if (changed) this.syncStatisticsState(state)
+    return changed
+  }
+
+  async storedStatisticsWindow(instrument, timeframe, end, priority = 'foreground') {
+    const range = this.statisticsRange(timeframe, end)
+    const rows = await this.store.candles({ instrument: instrument.instId, timeframe, from: range.from, through: range.through }, priority)
+    return { ...this.statisticsWindow(rows, range.from, range.intervalMS), rows, range }
+  }
+
+  async storedStatisticsPage(instrument, timeframe, end, priority = 'foreground') {
+    const range = this.statisticsPageRange(timeframe, end)
+    const rows = await this.store.candles({ instrument: instrument.instId, timeframe, from: range.from, through: range.through }, priority)
+    const candlesReady = this.completeCandleRowsOfLength(rows, range.from, range.intervalMS, 100)
+    return {
+      rows,
+      range,
+      candlesReady,
+      oi: candlesReady && rows.every(value => hasStatisticsSource(value, STATISTICS_OI)),
+      taker: candlesReady && rows.every(value => hasStatisticsSource(value, STATISTICS_TAKER)),
+    }
   }
 
   async hasCompleteStoredStatistics(instrument, timeframe, end, priority = 'foreground') {
-    const intervalMS = timeframeMilliseconds(timeframe)
-    const first = end - (VISIBLE_CANDLES - 1) * intervalMS
-    const rows = await this.store.candles({ instrument: instrument.instId, timeframe, from: first, through: end }, priority)
-    return this.completeStatisticsRows(rows, first, intervalMS)
+    return (await this.storedStatisticsWindow(instrument, timeframe, end, priority)).complete
   }
 
   async hasCompleteStoredCandles(instrument, timeframe, end, priority = 'foreground') {
@@ -1016,67 +1367,315 @@ export class MarketService {
     return Number.isFinite(state?.retryAt) && state.retryAt > now && Boolean(lane && lane.rateLimitedUntil > now)
   }
 
-  scheduleStatisticsRetry(instrument, timeframe, end, state, message, serverDelay, rateLimitLane = null) {
-    if (this.disposed || !this.isActiveStatistics(instrument, timeframe, end)) return
-    const plan = retryPlan(state.attempt, serverDelay)
-    state.attempt = plan.attempt
-    state.status = plan.unavailable ? 'unavailable' : 'retrying'
-    state.retryAt = Date.now() + plan.delay
-    state.rateLimitLane = rateLimitLane
-    state.lastError = message
-    if (state.timer) clearTimeout(state.timer)
+  scheduleStatisticsSourceRetry(state, source, message, serverDelay, rateLimitLane = null) {
+    if (this.disposed || !this.canContinueStatistics(state)) return
+    const current = this.statisticsSource(state, source), plan = retryPlan(current.attempt, serverDelay)
+    if (!current.ownsPage || current.delegate) return
+    current.attempt = plan.attempt
+    // A completed visible window may be filling only the four extra rows in
+    // its 100-period page. Keep that visible source rendered while its page
+    // coverage retries in the background; only a missing visible source gets
+    // a loading/retrying label.
+    if (!current.coverageOnly || !this.statisticsSourceTerminal(current.status)) current.status = plan.unavailable ? 'unavailable' : 'retrying'
+    current.retryAt = plan.unavailable ? null : Date.now() + plan.delay
+    current.rateLimitLane = rateLimitLane
+    current.lastError = message
+    if (current.timer) clearTimeout(current.timer)
+    if (plan.unavailable) {
+      current.timer = null
+      this.syncStatisticsState(state)
+      return
+    }
     const timer = setTimeout(() => {
-      state.timer = null
-      if (!this.disposed && this.isActiveStatistics(instrument, timeframe, end)) this.requestStatistics(instrument, timeframe, end)
+      current.timer = null
+      if (!this.disposed && this.canContinueStatistics(state)) this.startStatisticsSource(state, source)
+      else this.cleanupRetiredStatistics(state)
     }, plan.delay)
     timer.unref?.()
-    state.timer = timer
+    current.timer = timer
+    this.syncStatisticsState(state)
   }
 
-  requestStatistics(instrument, timeframe, end) {
-    if (this.disposed) return { status: 'unavailable', retryAt: null }
-    const state = this.statisticsState(instrument, timeframe, end), key = this.statisticsKey(instrument, timeframe, end), now = Date.now()
-    if (!this.isActiveStatistics(instrument, timeframe, end)) return state
-    if (state.task || state.timer || state.retryAt && state.retryAt > now || state.status === 'ready' && state.expiresAt > now) return state
-    state.status = 'loading'; state.retryAt = null; state.rateLimitLane = null; state.lastError = ''
-    const controller = new AbortController()
-    state.controller = controller
+  async persistStatisticsSource(instrument, timeframe, end, source, values, signal, priority = 'statistics', preserveExistingSource = false) {
+    const byHour = source === STATISTICS_OI
+      ? new Map(values.map(value => [Number(value[0]), number(value[1])]))
+      : new Map(values.map(value => [Number(value[0]), { sell: number(value[1]), buy: number(value[2]) }]))
+    const page = this.statisticsPageRange(timeframe, end)
+    const expiresAt = this.statisticsExpiry(timeframe, end)
+    const expiryField = statisticsExpiryField(source)
+    const storePriority = priority === 'background' ? 'background' : 'foreground'
+    const changed = await this.enqueueCandleMutation(instrument.instId, async () => {
+      if (this.disposed || signal?.aborted) return false
+      const local = await this.store.candles({ instrument: instrument.instId, timeframe, from: page.from, through: page.through }, storePriority)
+      const patched = local.filter(value => value.confirmed).map(value => {
+        const sourceAlreadyObserved = hasStatisticsSource(value, source)
+        const preserveSource = preserveExistingSource && sourceAlreadyObserved
+        const existingOI = number(value.oi)
+        const existingVolumes = { sell: number(value.sell), buy: number(value.buy) }
+        const incomingOI = source === STATISTICS_OI ? byHour.get(value.timestamp) ?? null : null
+        const incomingVolumes = source === STATISTICS_TAKER ? byHour.get(value.timestamp) ?? null : null
+        const incomingHasValue = source === STATISTICS_OI
+          ? incomingOI !== null
+          : incomingVolumes !== null && incomingVolumes.sell !== null && incomingVolumes.buy !== null
+        const existingHasValue = source === STATISTICS_OI
+          ? sourceAlreadyObserved && existingOI !== null
+          : sourceAlreadyObserved && existingVolumes.sell !== null && existingVolumes.buy !== null
+        // An empty current page is a useful direct observation for rows that
+        // were never observed, but it is not better data than a numeric
+        // direct observation from an overlapping page. Near the live edge
+        // OKX may return an empty 100-row page while its preceding cursor
+        // still has the shared 88 values. Clearing those values caused the
+        // back-scroll gaps seen in the chart, so only a concrete source value
+        // may replace an existing concrete source value.
+        const retainExistingValue = preserveSource || !incomingHasValue && existingHasValue
+        const sources = preserveSource ? statisticsMask(value) : statisticsMask(value) | source
+        const oi = source === STATISTICS_OI ? retainExistingValue ? existingOI : incomingOI
+          : hasStatisticsSource(value, STATISTICS_OI) ? existingOI : null
+        const volumes = source === STATISTICS_TAKER ? retainExistingValue ? existingVolumes : incomingVolumes
+          : hasStatisticsSource(value, STATISTICS_TAKER) ? existingVolumes : null
+        const sourceExpiry = preserveSource ? number(value[expiryField])
+          // Direct numeric values do not need an expiry. This also removes a
+          // stale lease from a prior empty page when a neighboring numeric
+          // observation is retained.
+          : incomingHasValue || existingHasValue ? null
+            : Number.isFinite(expiresAt) ? expiresAt : null
+        const next = {
+          ...value,
+          oi,
+          sell: volumes?.sell ?? null,
+          buy: volumes?.buy ?? null,
+          [expiryField]: sourceExpiry,
+        }
+        return { ...next, statisticsVersion: statisticsVersionFor(sources, next), replaceStatistics: true }
+      })
+      const written = await this.appendChangedCandlesLocked(patched, storePriority)
+      if (written.length) this.reconcileOverlappingStatisticsSource(instrument.instId, timeframe, page, source, patched)
+      return written.length > 0
+    })
+    if (changed) {
+      // OI and Taker commit separately. The renderer can therefore retain
+      // the completed lane even when its sibling is throttled or timing out.
+      this.markChartDataChanged(instrument.instId)
+      this.scheduleListProjection(instrument.instId)
+    }
+    return changed
+  }
+
+  startStatisticsSource(state, source, { priority = 'statistics', coverageOnly = this.statisticsSource(state, source).coverageOnly } = {}) {
+    const current = this.statisticsSource(state, source)
+    if (this.disposed || !this.canContinueStatistics(state) || !current.ownsPage || current.delegate || current.task || current.timer || this.statisticsSourceTerminal(current.status) && !coverageOnly) return current
+    const instrument = { instId: state.instrument }, { timeframe, end } = state
+    const statisticsEnd = end + timeframeMilliseconds(timeframe)
+    const preserveExistingSource = coverageOnly
+    current.coverageOnly = coverageOnly
+    if (!coverageOnly || !this.statisticsSourceTerminal(current.status)) current.status = 'loading'
+    current.expiresAt = 0
+    current.retryAt = null
+    current.rateLimitLane = null
+    current.lastError = ''
+    this.syncStatisticsState(state)
+    const path = source === STATISTICS_OI ? '/rubik/stat/contracts/open-interest-history' : '/rubik/stat/taker-volume-contract'
+    const parameters = source === STATISTICS_OI
+      ? { instId: state.instrument, period: timeframe, limit: 100, end: statisticsEnd }
+      : { instId: state.instrument, period: timeframe, unit: 1, limit: 100, end: statisticsEnd }
     let task
-    task = (async () => {
-      let changed = false
+    task = Promise.resolve().then(async () => {
+      try {
+        const sourceKey = this.statisticsSourceKey(source)
+        let persisted = false
+        const persist = async values => {
+          await this.persistStatisticsSource(instrument, timeframe, end, source, values, state.controller.signal, priority, preserveExistingSource)
+          persisted = true
+        }
+        const values = await this.get(path, parameters, state.controller.signal, priority, {
+          beforeFetch: async () => {
+            // A normal foreground source only needs the visible 96 rows to
+            // paint this viewport. If an overlapping owner committed those
+            // rows while this request was queued, skip the endpoint now even
+            // when this follower's four-row prefetch tail remains absent.
+            // Coverage-only work deliberately does not take this shortcut:
+            // it exists solely to fill that tail for the next scroll step.
+            if (coverageOnly) return false
+            const stored = await this.storedStatisticsWindow(instrument, timeframe, end)
+            const sourceState = this.statisticsSourceWindowState(stored, source)
+            const expiresAt = this.statisticsSourceWindowExpiry(stored, source)
+            const needsRevalidation = sourceState === 'unavailable'
+              && (Number.isFinite(expiresAt) ? expiresAt <= Date.now() : this.shouldRefreshLiveStatistic(timeframe, end, sourceState))
+            return stored.candlesReady && this.statisticsSourceTerminal(sourceState)
+              && !needsRevalidation
+          },
+          afterData: persist,
+        })
+        if (values !== REQUEST_SKIPPED && !persisted) await persist(values)
+        if (this.disposed || !this.canContinueStatistics(state)) return
+        const [stored, page] = await Promise.all([
+          this.storedStatisticsWindow(instrument, timeframe, end),
+          this.storedStatisticsPage(instrument, timeframe, end),
+        ])
+        if (this.disposed || !this.canContinueStatistics(state)) return
+        state.pageSources[sourceKey] = page[sourceKey]
+        current.coverageKnown = true
+        current.status = this.statisticsSourceWindowState(stored, source)
+        current.coverageOnly = false
+        current.expiresAt = current.status === 'unavailable' ? this.statisticsSourceWindowExpiry(stored, source) : Infinity
+        if (this.statisticsSourceTerminal(current.status)) {
+          current.attempt = 0
+          current.retryAt = null
+          current.rateLimitLane = null
+          current.lastError = ''
+        } else {
+          this.scheduleStatisticsSourceRetry(state, source, 'OKX did not publish a complete statistics source window.')
+        }
+      } catch (error) {
+        if (!state.controller.signal.aborted && !this.disposed && this.canContinueStatistics(state)) {
+          this.scheduleStatisticsSourceRetry(state, source, error instanceof Error ? error.message : 'Cannot load statistics data.', retryAfter(error), retryLane(error))
+        }
+      } finally {
+        if (current.task === task) current.task = null
+        this.syncStatisticsState(state)
+        this.cleanupRetiredStatistics(state)
+      }
+    })
+    current.task = task
+    return current
+  }
+
+  statisticsNeedsPreparation(state, now = Date.now()) {
+    return Object.values(state?.sources ?? {}).some(source => source.ownsPage && !source.delegate
+      && !source.task && !source.timer && !(Number.isFinite(source.retryAt) && source.retryAt > now)
+      && !this.statisticsSourceTerminal(source.status))
+  }
+
+  prepareStatistics(state) {
+    if (this.disposed || !state?.ownsPage || state.task || !this.canContinueStatistics(state)) return state?.task ?? null
+    const instrument = { instId: state.instrument }, { timeframe, end } = state
+    if (!state.controller || state.controller.signal.aborted) state.controller = new AbortController()
+    let task
+    task = Promise.resolve().then(async () => {
       try {
         // OI/Taker belongs to the visible native candle window. Do not send
         // either endpoint request while a candle repair still leaves that
         // 96-period window incomplete; repair completion promotes this state.
         const candlesReady = await this.hasCompleteStoredCandles(instrument, timeframe, end)
-        if (!candlesReady) return
-        if (this.disposed || controller.signal.aborted || !this.isActiveStatistics(instrument, timeframe, end)) return
-        // A process restart or a bounded in-memory state cache must not turn
-        // verified, current-contract OI/Taker into another pair of requests.
-        const stored = await this.hasCompleteStoredStatistics(instrument, timeframe, end)
-        if (this.disposed || controller.signal.aborted || !this.isActiveStatistics(instrument, timeframe, end)) return
-        const result = stored ? { changed: false, complete: true } : await this.hydrateStatistics(instrument, timeframe, end, controller.signal)
-        if (this.disposed || controller.signal.aborted || !this.isActiveStatistics(instrument, timeframe, end)) return
-        changed = result.changed
-        if (result.complete) {
-          state.status = 'ready'; state.attempt = 0; state.retryAt = null; state.rateLimitLane = null
-          state.expiresAt = this.statisticsExpiry(timeframe, end)
-        } else this.scheduleStatisticsRetry(instrument, timeframe, end, state, 'OKX has not published a complete OI/Taker window yet.')
+        if (!candlesReady || this.disposed || !this.canContinueStatistics(state)) return
+        const [stored, page] = await Promise.all([
+          this.storedStatisticsWindow(instrument, timeframe, end),
+          this.storedStatisticsPage(instrument, timeframe, end),
+        ])
+        if (this.disposed || !this.canContinueStatistics(state)) return
+        state.pageSources.oi = page.oi
+        state.pageSources.taker = page.taker
+        this.restoreStatisticsSourceFromWindow(state, STATISTICS_OI, stored)
+        this.restoreStatisticsSourceFromWindow(state, STATISTICS_TAKER, stored)
+        const refreshOI = this.statisticsSourceLeaseExpired(state.sources.oi)
+          || stored.oiState === 'unavailable' && !Number.isFinite(state.sources.oi.expiresAt)
+            && this.shouldRefreshLiveStatistic(timeframe, end, stored.oiState)
+        const refreshTaker = this.statisticsSourceLeaseExpired(state.sources.taker)
+          || stored.takerState === 'unavailable' && !Number.isFinite(state.sources.taker.expiresAt)
+            && this.shouldRefreshLiveStatistic(timeframe, end, stored.takerState)
+        if (refreshOI) this.restoreStatisticsSourceFromWindow(state, STATISTICS_OI, stored, true)
+        if (refreshTaker) this.restoreStatisticsSourceFromWindow(state, STATISTICS_TAKER, stored, true)
+        state.sources.oi.coverageKnown = true
+        state.sources.taker.coverageKnown = true
+        this.syncStatisticsState(state)
+        if (stored.oiState === 'loading' || refreshOI) this.startStatisticsSource(state, STATISTICS_OI, { coverageOnly: false })
+        else if (page.candlesReady && !page.oi) this.startStatisticsSource(state, STATISTICS_OI, { coverageOnly: true })
+        if (stored.takerState === 'loading' || refreshTaker) this.startStatisticsSource(state, STATISTICS_TAKER, { coverageOnly: false })
+        else if (page.candlesReady && !page.taker) this.startStatisticsSource(state, STATISTICS_TAKER, { coverageOnly: true })
       } catch (error) {
-        if (!controller.signal.aborted) this.scheduleStatisticsRetry(instrument, timeframe, end, state, error instanceof Error ? error.message : 'Cannot load OI/Taker data.', retryAfter(error), retryLane(error))
+        if (!state.controller.signal.aborted && !this.disposed && this.canContinueStatistics(state)) {
+          const message = error instanceof Error ? error.message : 'Cannot prepare statistics data.'
+          for (const source of [STATISTICS_OI, STATISTICS_TAKER]) {
+            const current = this.statisticsSource(state, source)
+            if (!this.statisticsSourceTerminal(current.status)) this.scheduleStatisticsSourceRetry(state, source, message, retryAfter(error), retryLane(error))
+          }
+        }
       } finally {
         if (state.task === task) state.task = null
-        if (state.controller === controller) state.controller = null
-        if (!this.isActiveStatistics(instrument, timeframe, end) && !(state.status === 'ready' && state.expiresAt > Date.now())) this.statistics.delete(key)
-        else if (controller.signal.aborted && !this.disposed) {
-          state.status = 'ready'; state.retryAt = null
-          queueMicrotask(() => { if (!this.disposed && this.isActiveStatistics(instrument, timeframe, end)) this.requestStatistics(instrument, timeframe, end) })
-        }
-        if (changed) this.markChartDataChanged(instrument.instId)
+        this.syncStatisticsState(state)
+        this.cleanupRetiredStatistics(state)
       }
-    })()
+    })
     state.task = task
+    this.syncStatisticsState(state)
+    return task
+  }
+
+  requestStatistics(instrument, timeframe, end) {
+    if (this.disposed) return { status: 'unavailable', oiState: 'unavailable', takerState: 'unavailable', retryAt: null }
+    const key = this.statisticsKey(instrument, timeframe, end), now = Date.now()
+    let existing = this.statistics.get(key)
+    if (!this.isActiveStatistics(instrument, timeframe)) return existing ?? { status: 'ready', oiState: 'ready', takerState: 'ready', retryAt: null }
+    if (existing) {
+      // Delegated source ownership can finish independently. Reconcile and
+      // project its current source states before deciding that this follower
+      // still has work, otherwise a held sibling keeps a ready lane painted
+      // as loading until the next unrelated transition.
+      this.reconcileStatisticsDelegates(existing)
+      this.syncStatisticsState(existing)
+    }
+    if (existing && this.statisticsNeedsPreparation(existing, now)) this.prepareStatistics(existing)
+    if (existing && (this.statisticsHasWork(existing, now) || this.statisticsSourceTerminal(existing.status) && existing.expiresAt > now)) return existing
+    const covering = this.coveringStatisticsTask(instrument, timeframe, end)
+    // A covered neighbor reads the owner directly. It never creates a second
+    // state pretending to own a different page, which keeps both task
+    // coverage and state cardinality bounded during wheel streams.
+    if (covering) return covering
+    const state = existing ?? this.statisticsState(instrument, timeframe, end)
+    for (const source of [STATISTICS_OI, STATISTICS_TAKER]) {
+      const current = this.statisticsSource(state, source)
+      if (current.delegate || current.ownsPage) continue
+      const owner = this.coveringStatisticsSource(instrument, timeframe, end, source, now)
+      if (owner) current.delegate = { state: owner, source }
+      else current.ownsPage = true
+    }
+    state.ownsPage = Object.values(state.sources).some(source => source.ownsPage)
+    // Two independently healthy source pages can cover this viewport even
+    // when they come from different owners. Keep a tiny follower state that
+    // derives each lane from its owner rather than issuing duplicate calls.
+    if (!state.ownsPage) {
+      this.syncStatisticsState(state)
+      return state
+    }
+    this.prepareStatistics(state)
     return state
+  }
+
+  chartStatisticsStatus(instId, timeframe, end) {
+    const instrument = this.instruments.get(instId)
+    if (!instrument || !Number.isFinite(end)) return { statisticsState: 'ready', statisticsRetryAt: null, oiState: 'ready', takerState: 'ready', statisticsEnd: end }
+    const state = this.requestStatistics(instrument, timeframe, end)
+    const statisticsRetryAt = state.retryAt ?? (state.status === 'unavailable' && Number.isFinite(state.expiresAt) ? state.expiresAt : null)
+    return {
+      statisticsState: state.status,
+      statisticsRetryAt,
+      oiState: state.oiState,
+      takerState: state.takerState,
+      statisticsEnd: end,
+    }
+  }
+
+  chartCandleStatus(instId, timeframe, end) {
+    const key = this.seriesKey(instId, timeframe)
+    const state = this.candleRepairs.get(key)
+    const retry = this.latestCandleRetries.get(key)
+    if (!Number.isFinite(end)) {
+      return {
+        candleState: retry?.status === 'ready' || retry?.status === undefined ? 'ready' : retry.status,
+        missingCandleRanges: [],
+        candleRetryAt: retry?.retryAt ?? null,
+      }
+    }
+    const range = chartRepairRange(timeframe, end, this.activeChartViewport?.instrument === instId && this.activeChartViewport.timeframe === timeframe
+      ? this.activeChartViewport.repairEnd ?? end : end)
+    const ranges = state?.ranges.filter(candidate => rangesOverlap(candidate, range)) ?? []
+    const active = ranges.filter(candidate => candidate.status !== 'exhausted')
+    const candleState = active.some(candidate => candidate.status === 'queued' || candidate.status === 'loading') ? 'loading'
+      : active.some(candidate => candidate.status === 'retrying') ? 'retrying'
+        : active.some(candidate => candidate.status === 'unavailable') ? 'unavailable'
+          : ranges.length ? 'exhausted' : 'ready'
+    const retryAt = active.map(candidate => candidate.retryAt).filter(Number.isFinite)
+    return { candleState, missingCandleRanges: ranges, candleRetryAt: retryAt.length ? Math.min(...retryAt) : null }
   }
 
   // Candle repair progress can complete the raw window an OI/Taker retry is
@@ -1086,94 +1685,72 @@ export class MarketService {
     const viewport = this.activeChartViewport
     if (this.disposed || viewport?.instrument !== instId || !Number.isFinite(viewport.end)) return
     const state = this.statistics.get(`${instId}:${viewport.timeframe}:${viewport.end}`)
-    if (state?.task || state?.timer || this.isRateLimitedRetry(state)) return
-    if (state) state.retryAt = null
+    if (this.statisticsHasWork(state) || this.isRateLimitedRetry(state)) return
     this.requestStatistics({ instId }, viewport.timeframe, viewport.end)
   }
 
   async hydrateStatistics(instrument, timeframe, end, signal, priority = 'statistics') {
-    if (this.disposed || signal?.aborted) return { changed: false, complete: false }
-    const intervalMS = timeframeMilliseconds(timeframe)
-    if (!await this.hasCompleteStoredCandles(instrument, timeframe, end, priority === 'background' ? 'background' : 'foreground')) return { changed: false, complete: false }
-    const statisticsEnd = end + intervalMS
-    // Background list warm-up shares this code path; its DuckDB work must
-    // stay behind foreground chart reads in the store lane.
+    if (this.disposed || signal?.aborted) return { changed: false, complete: false, status: 'loading', oiState: 'loading', takerState: 'loading' }
+    // The visible window decides what still needs a request. The actual write
+    // uses the wider 100-period page below, so its four older samples are
+    // immediately reusable when the user scrolls back one wheel tick.
+    const visible = await this.storedStatisticsWindow(instrument, timeframe, end, priority === 'background' ? 'background' : 'foreground')
+    if (!visible.candlesReady || visible.complete) return { changed: false, ...visible }
+    const { intervalMS } = visible.range
     const storePriority = priority === 'background' ? 'background' : 'foreground'
-    // These endpoints have independent OKX budgets and independent failure
-    // modes. Do not turn a failed OI request into an abort for Taker (or the
-    // reverse); a successful sibling is useful data and its lane must stay
-    // free to complete. Viewport cancellation still flows through `signal`
-    // to both requests.
-    const [openInterestResult, takerResult] = await Promise.allSettled([
-      this.get('/rubik/stat/contracts/open-interest-history', { instId: instrument.instId, period: timeframe, limit: 100, end: statisticsEnd }, signal, priority),
-      this.get('/rubik/stat/taker-volume-contract', { instId: instrument.instId, period: timeframe, unit: 1, limit: 100, end: statisticsEnd }, signal, priority),
-    ])
+    const statisticsEnd = end + intervalMS
+    const persistSource = async (source, values) => {
+      const changed = await this.persistStatisticsSource(instrument, timeframe, end, source, values, signal, priority)
+      // A background warm-up can overlap the focused page. Reconcile its
+      // independent source state rather than assigning the old aggregate
+      // booleans and making a durable sibling look pending again.
+      const state = this.statistics.get(this.statisticsKey(instrument, timeframe, end))
+      if (state) {
+        const storePriority = priority === 'background' ? 'background' : 'foreground'
+        const [current, page] = await Promise.all([
+          this.storedStatisticsWindow(instrument, timeframe, end, storePriority),
+          this.storedStatisticsPage(instrument, timeframe, end, storePriority),
+        ])
+        state.pageSources.oi = page.oi
+        state.pageSources.taker = page.taker
+        this.restoreStatisticsSourceFromWindow(state, STATISTICS_OI, current)
+        this.restoreStatisticsSourceFromWindow(state, STATISTICS_TAKER, current)
+        this.syncStatisticsState(state)
+      }
+      return changed
+    }
+    const operations = []
+    if (visible.oiState === 'loading') operations.push(this.get('/rubik/stat/contracts/open-interest-history', { instId: instrument.instId, period: timeframe, limit: 100, end: statisticsEnd }, signal, priority).then(values => persistSource(STATISTICS_OI, values)))
+    if (visible.takerState === 'loading') operations.push(this.get('/rubik/stat/taker-volume-contract', { instId: instrument.instId, period: timeframe, unit: 1, limit: 100, end: statisticsEnd }, signal, priority).then(values => persistSource(STATISTICS_TAKER, values)))
+    const settled = await Promise.allSettled(operations)
     if (this.disposed || signal?.aborted) throw signal?.reason ?? new Error('The statistics request was aborted.')
-    const openInterest = openInterestResult.status === 'fulfilled' ? openInterestResult.value : []
-    const taker = takerResult.status === 'fulfilled' ? takerResult.value : []
-    const requestError = openInterestResult.status === 'rejected' ? openInterestResult.reason
-      : takerResult.status === 'rejected' ? takerResult.reason : null
-    // Both endpoints report contracts here: OI is the first OI field and
-    // taker rows are [timestamp, sell contracts, buy contracts].
-    const oiByHour = new Map(openInterest.map(value => [Number(value[0]), number(value[1])]))
-    const takerByHour = new Map(taker.map(value => [Number(value[0]), { sell: number(value[1]), buy: number(value[2]) }]))
-    const first = end - (VISIBLE_CANDLES - 1) * intervalMS
-    const result = await this.enqueueCandleMutation(instrument.instId, async () => {
-      if (this.disposed || signal?.aborted) return { changed: false, complete: false }
-      const local = await this.store.candles({ instrument: instrument.instId, timeframe, from: first, through: end }, storePriority)
-      const patched = local.flatMap(value => {
-        // Map.has deliberately distinguishes a missing endpoint row from a
-        // row whose value is null. The former leaves a previously verified
-        // observation alone; the latter is an explicit current response and
-        // must not be backfilled from legacy unit=2 data.
-        const hasOI = oiByHour.has(value.timestamp)
-        const hasTaker = takerByHour.has(value.timestamp)
-        if (!hasOI && !hasTaker) return []
-        const current = this.hasCurrentStatistics(value)
-        const oi = hasOI ? oiByHour.get(value.timestamp) : current ? number(value.oi) : null
-        const volumes = hasTaker ? takerByHour.get(value.timestamp) : current ? { sell: number(value.sell), buy: number(value.buy) } : null
-        return [{
-          ...value,
-          oi: oi ?? null,
-          sell: volumes?.sell ?? null,
-          buy: volumes?.buy ?? null,
-          // Any field retained above is either from this direct request or
-          // from an earlier direct request using the same contract. Legacy
-          // 5m/USDT values are deliberately discarded rather than shown.
-          statisticsVersion: STATISTICS_VERSION,
-          replaceStatistics: true,
-        }]
-      })
-      const changed = await this.appendChangedCandlesLocked(patched, storePriority)
-      const stored = await this.store.candles({ instrument: instrument.instId, timeframe, from: first, through: end }, storePriority)
-      return { changed: changed.length > 0, complete: this.completeStatisticsRows(stored, first, intervalMS) }
-    })
-    if (result.changed) this.scheduleListProjection(instrument.instId)
-    // The caller cannot receive a normal result when one endpoint failed, but
-    // the successful sibling has already been persisted. Invalidate its chart
-    // immediately rather than hiding it until the failed endpoint retries.
-    if (requestError && result.changed) this.markChartDataChanged(instrument.instId)
-    if (requestError) throw requestError
-    return result
+    const current = await this.storedStatisticsWindow(instrument, timeframe, end, storePriority)
+    const error = settled.find(result => result.status === 'rejected')?.reason
+    return { changed: settled.some(result => result.status === 'fulfilled' && result.value), ...current, error }
   }
 
-  pauseInactiveStatistics(activeKey = null) {
-    const now = Date.now()
-    for (const [key, state] of this.statistics) {
-      if (key === activeKey) {
-        if (this.isRateLimitedRetry(state, now)) continue
-        if (state.timer) clearTimeout(state.timer)
-        state.timer = null
-        state.retryAt = null
-        continue
-      }
-      if (state.status === 'ready' && state.expiresAt > now) continue
-      if (this.isRateLimitedRetry(state, now)) continue
-      if (state.timer) clearTimeout(state.timer)
-      state.timer = null
-      state.retryAt = null
-      state.controller?.abort()
-      if (!state.task && !(state.status === 'ready' && state.expiresAt > now)) this.statistics.delete(key)
+  statisticsPageCovers(state, timeframe, end) {
+    if (!state.ownsPage || !Number.isFinite(end)) return false
+    const page = this.statisticsPageRange(timeframe, state.end)
+    const target = this.statisticsRange(timeframe, end)
+    return page.from <= target.from && page.through >= target.through
+  }
+
+  statisticsPageOverlaps(state, timeframe, end) {
+    if (!state.ownsPage || !Number.isFinite(end)) return false
+    return rangesOverlap(this.statisticsPageRange(timeframe, state.end), this.statisticsRange(timeframe, end))
+  }
+
+  pauseInactiveStatistics(activeInstrument = null, activeTimeframe = null, activeEnd = null) {
+    for (const state of this.statistics.values()) {
+      const sameSeries = state.instrument === activeInstrument && (activeTimeframe === null || state.timeframe === activeTimeframe)
+      // Keep an in-flight source while its 100-row response still overlaps
+      // the visible 96 rows. A real wheel frame can move 12 candles, which
+      // is beyond full-page coverage but still shares 88 observations. Killing
+      // that request creates the blank-on-scroll-back loop seen in practice.
+      // A non-overlapping jump still releases the endpoint lane promptly.
+      if (sameSeries && (activeEnd === null || state.end === activeEnd || Object.values(state.sources).some(source => source.ownsPage && this.statisticsPageOverlaps(state, state.timeframe, activeEnd)))) continue
+      this.retireStatisticsState(state)
     }
   }
 
@@ -1209,7 +1786,7 @@ export class MarketService {
     // still an intentional latest viewport for cancellation/retry purposes,
     // but must not run gap-priority math against a fake epoch timestamp.
     if (latest && !Number.isFinite(end)) return
-    this.pauseInactiveStatistics(this.statisticsKey(instrument, timeframe, end))
+    this.pauseInactiveStatistics(instrument.instId, timeframe, Number.isFinite(end) ? end : null)
     this.pauseInactiveLatestCandles(instrument.instId, timeframe)
     this.pauseInactiveCandleRepairs(instrument.instId, timeframe)
     const repairs = this.candleRepairs.get(this.seriesKey(instrument, timeframe))
@@ -1800,9 +2377,20 @@ export class MarketService {
         // Never display a legacy OI/Taker cache as if it were direct native
         // timeframe contract data. Preserve the price candle and rehydrate
         // statistics only after the complete visible candle window exists.
-        const candles = source.map(value => this.hasCurrentStatistics(value)
-          ? value
-          : { ...value, oi: null, buy: null, sell: null, statisticsVersion: null })
+        const candles = source.map(value => {
+          const sources = statisticsMask(value)
+          return sources ? {
+            ...value,
+            oi: sources & STATISTICS_OI ? number(value.oi) : null,
+            buy: sources & STATISTICS_TAKER ? number(value.buy) : null,
+            sell: sources & STATISTICS_TAKER ? number(value.sell) : null,
+            // A terminal empty historic OI is distinct from an unfetched OI.
+            // Preserve that fact for the renderer so it never creates a new
+            // request merely because a known value is null.
+            statisticsSources: sources,
+            statisticsObserved: sources === STATISTICS_COMPLETE,
+          } : { ...value, oi: null, buy: null, sell: null, statisticsVersion: null, statisticsSources: 0, statisticsObserved: false }
+        })
         if (staleForeground()) return staleResult()
         bars = barsWithIndicators(live ? [...candles, live] : candles, intervalMS).filter(value => value.hour >= outputFrom && value.hour <= through)
         // Never reinsert a chart that was read before a repair/statistics write.
@@ -1819,12 +2407,28 @@ export class MarketService {
     const firstStatisticsHour = chartEnd - (VISIBLE_CANDLES - 1) * intervalMS
     const visibleStatistics = bars.filter(value => value.hour >= firstStatisticsHour && value.hour <= chartEnd)
     const completeVisibleCandles = this.completeCandleRows(visibleStatistics, firstStatisticsHour, intervalMS)
-    const completeStatistics = completeVisibleCandles
-      && visibleStatistics.every(value => number(value.oi) !== null && number(value.buy) !== null && number(value.sell) !== null)
+    const statisticsObserved = completeVisibleCandles && visibleStatistics.every(value => value.statisticsObserved === true)
+    const localStatistics = statisticsObserved ? {
+      status: visibleStatistics.every(value => number(value.oi) !== null && number(value.buy) !== null && number(value.sell) !== null) ? 'ready' : 'unavailable',
+      oiState: visibleStatistics.every(value => number(value.oi) !== null) ? 'ready' : 'unavailable',
+      takerState: visibleStatistics.every(value => number(value.buy) !== null && number(value.sell) !== null) ? 'ready' : 'unavailable',
+      retryAt: null,
+    } : null
+    // An old historic empty response is terminal, but a near-live OKX page
+    // can be empty simply because the statistics feed is behind candles.
+    // Keep rendering the known nulls, then revalidate that small latest tail
+    // on a bounded cadence instead of freezing it forever.
     const statisticsState = metadata && statistics && ownsForeground
-      ? completeStatistics ? { status: 'ready', retryAt: null } : completeVisibleCandles && availability.visibleCandleReady ? this.requestStatistics(metadata, timeframe, chartEnd) : { status: 'loading', retryAt: null }
+      // An observed terminal null still needs a lightweight state object: it
+      // carries the persisted source lease across restarts and starts exactly
+      // one revalidation when that lease expires. Numeric local data remains
+      // a direct fast path with no state-machine work.
+      ? localStatistics?.status === 'ready' ? localStatistics
+        : completeVisibleCandles && availability.visibleCandleReady ? this.requestStatistics(metadata, timeframe, chartEnd)
+          : { status: 'loading', oiState: 'loading', takerState: 'loading', retryAt: null }
       : null
-    return { bars, revision, ...availability, statisticsState: statisticsState?.status ?? 'ready', statisticsRetryAt: statisticsState?.retryAt ?? null }
+    const statisticsRetryAt = statisticsState?.retryAt ?? (statisticsState?.status === 'unavailable' && Number.isFinite(statisticsState.expiresAt) ? statisticsState.expiresAt : null)
+    return { bars, revision, ...availability, statisticsState: statisticsState?.status ?? 'ready', statisticsRetryAt, oiState: statisticsState?.oiState ?? 'ready', takerState: statisticsState?.takerState ?? 'ready', statisticsEnd: chartEnd }
   }
 
   isHistoryExhausted(instrument, timeframe = this.activeChartViewport?.instrument === instrument ? this.activeChartViewport.timeframe : '5m') {
@@ -1836,28 +2440,34 @@ export class MarketService {
     const changed = token !== this.activeChartFocus || instrument !== this.activeChartInstrument
     this.activeChartFocus = token
     this.activeChartInstrument = instrument
-    if (changed) {
-      this.activeChartViewport = null
-      this.pauseInactiveStatistics()
-      this.pauseInactiveLatestCandles(instrument)
-      this.pauseInactiveCandleRepairs(instrument)
-      this.cancelBackgroundRequests()
-      for (const currentRepairs of this.candleRepairs.values()) {
-        if (currentRepairs.instrument !== instrument) continue
-        if (currentRepairs.timer && !this.isRateLimitedRetry(currentRepairs)) {
-          clearTimeout(currentRepairs.timer)
-          currentRepairs.timer = null
-        }
-        currentRepairs.controller?.abort()
-        for (const range of currentRepairs.ranges) {
-          if (range.status === 'loading') {
-            range.status = 'queued'
-            range.retryAt = null
-            range.lastError = ''
-          }
-        }
-        this.updateCandleRepairState(currentRepairs)
+    // The renderer repeats its current focus token while polling. That is a
+    // read-only heartbeat, not another scroll event: clearing the viewport
+    // here would abort the repair it is waiting to observe and defeat the
+    // main-process revision fast path.
+    if (!changed) return true
+    // A focus token changes on each wheel viewport. Parking candle repair is
+    // still useful before its replacement viewport activates, but OI/Taker
+    // pages are independent and stay alive for this instrument.
+    this.activeChartViewport = null
+    this.pauseInactiveStatistics(instrument)
+    this.pauseInactiveLatestCandles(instrument)
+    this.pauseInactiveCandleRepairs(instrument)
+    this.cancelBackgroundRequests()
+    for (const currentRepairs of this.candleRepairs.values()) {
+      if (currentRepairs.instrument !== instrument) continue
+      if (currentRepairs.timer && !this.isRateLimitedRetry(currentRepairs)) {
+        clearTimeout(currentRepairs.timer)
+        currentRepairs.timer = null
       }
+      currentRepairs.controller?.abort()
+      for (const range of currentRepairs.ranges) {
+        if (range.status === 'loading') {
+          range.status = 'queued'
+          range.retryAt = null
+          range.lastError = ''
+        }
+      }
+      this.updateCandleRepairState(currentRepairs)
     }
     return true
   }
@@ -1867,7 +2477,10 @@ export class MarketService {
     this.disposed = true
     for (const state of this.candleRepairs.values()) if (state.timer) clearTimeout(state.timer)
     for (const state of this.latestCandleRetries.values()) if (state.timer) clearTimeout(state.timer)
-    for (const state of this.statistics.values()) if (state.timer) clearTimeout(state.timer)
+    for (const state of this.statistics.values()) {
+      state.controller?.abort()
+      for (const source of Object.values(state.sources)) if (source.timer) clearTimeout(source.timer)
+    }
     for (const state of this.listWarmups.values()) {
       if (state.timer) clearTimeout(state.timer)
       state.controller?.abort()
@@ -1883,7 +2496,7 @@ export class MarketService {
       ...this.hydrating.values(),
       ...this.candleMutations.values(),
       ...[...this.candleRepairs.values()].map(state => state.task),
-      ...[...this.statistics.values()].map(state => state.task),
+      ...[...this.statistics.values()].flatMap(state => [state.task, ...Object.values(state.sources).map(source => source.task)]),
       ...[...this.listWarmups.values()].map(state => state.task),
       ...[...this.listProjectionTasks.values()].map(state => state.task),
       ...[...this.listCatalogProjectionTasks.values()].map(state => state.task),

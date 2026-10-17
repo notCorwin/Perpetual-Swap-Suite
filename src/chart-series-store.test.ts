@@ -3,7 +3,7 @@ import test from 'node:test'
 import { ChartSeriesStore, type ChartSeriesResponse } from './chart-series-store.ts'
 
 type Bar = { hour: number; confirmed: boolean; close: number; oi: number | null; buy: number | null; sell: number | null }
-type Status = { error: string; candleState?: 'ready' | 'loading' | 'retrying' }
+type Status = { error: string; candleState?: 'ready' | 'loading' | 'retrying'; candleRetryAt?: number | null; missingCandleRanges?: Array<{ from: number; through: number }>; statisticsState?: 'ready' | 'loading' | 'retrying'; oiState?: 'ready' | 'loading' | 'retrying'; takerState?: 'ready' | 'loading' | 'retrying' }
 type Response = ChartSeriesResponse<Bar, Status>
 
 const hour = 3_600_000
@@ -32,6 +32,7 @@ test('merges non-empty 1H responses into one canonical primary series', () => {
   assert.deepEqual(result.entry?.bars.map(value => [value.hour, value.close]), [[hour, 101], [2 * hour, 202], [3 * hour, 103]])
   assert.equal(result.entry?.latestKnownHour, 3 * hour)
   assert.equal(result.entry?.revision, 11)
+  assert.equal(result.entry?.barsRevision, 11)
   assert.equal(result.entry?.loadedAt, 2)
 })
 
@@ -45,9 +46,73 @@ test('an empty response updates status without blanking an already rendered seri
   assert.deepEqual(result.entry?.bars, [bar(1), bar(2)])
   assert.equal(result.entry?.latestKnownHour, 2 * hour)
   assert.equal(result.entry?.revision, 11)
+  assert.equal(result.entry?.barsRevision, 10)
   assert.equal(result.entry?.status.error, 'candle retry')
   assert.equal(result.entry?.status.candleState, 'retrying')
   assert.equal(store.hasBars(key), true)
+})
+
+test('a status-only same-revision poll preserves repair progress while advancing direct source state', () => {
+  const store = new ChartSeriesStore<Bar, Status>()
+  const key = '1H:BTC-USDT-SWAP'
+  const missing = [{ from: hour, through: 2 * hour }]
+  store.upsert(key, response(7, [bar(1), bar(2)], {
+    error: '', candleState: 'loading', candleRetryAt: 9_000, missingCandleRanges: missing,
+    statisticsState: 'loading', oiState: 'loading', takerState: 'loading',
+  }))
+
+  const result = store.upsert(key, response(7, [], {
+    error: '', candleState: 'loading', candleRetryAt: 9_000, missingCandleRanges: missing,
+    statisticsState: 'retrying', oiState: 'retrying', takerState: 'ready',
+  }))
+
+  assert.equal(result.accepted, true)
+  assert.deepEqual(result.entry?.bars, [bar(1), bar(2)])
+  assert.equal(result.entry?.status.candleState, 'loading')
+  assert.equal(result.entry?.status.candleRetryAt, 9_000)
+  assert.deepEqual(result.entry?.status.missingCandleRanges, missing)
+  assert.equal(result.entry?.status.statisticsState, 'retrying')
+  assert.equal(result.entry?.status.oiState, 'retrying')
+  assert.equal(result.entry?.status.takerState, 'ready')
+  assert.equal(result.entry?.barsRevision, 7)
+})
+
+test('a failed materialized read remains pending across equal status-only revisions', () => {
+  const store = new ChartSeriesStore<Bar, Status>()
+  const key = '1H:BTC-USDT-SWAP'
+  store.upsert(key, response(7, [bar(1, 101)]))
+
+  // The status endpoint sees a new persisted source page, but the complete
+  // read that would merge it into bars fails outside the store.
+  store.upsert(key, response(8, [], { error: '', statisticsState: 'ready', oiState: 'ready', takerState: 'ready' }))
+  const pending = store.get(key)
+  assert.equal(pending?.revision, 8)
+  assert.equal(pending?.barsRevision, 7)
+  assert.equal(pending?.bars[0]?.oi, 1_001)
+
+  // A later equal-revision status reply must still be distinguishable from
+  // the retained r7 bars, so the renderer retries the materialized read.
+  store.upsert(key, response(8, [], { error: '', statisticsState: 'ready', oiState: 'ready', takerState: 'ready' }))
+  assert.equal(store.get(key)?.barsRevision, 7)
+
+  store.upsert(key, response(8, [{ ...bar(1, 101), oi: 2_001 }]))
+  assert.equal(store.get(key)?.barsRevision, 8)
+  assert.equal(store.get(key)?.bars[0]?.oi, 2_001)
+})
+
+test('a same-window cache preview cannot overwrite active statistics status', () => {
+  const store = new ChartSeriesStore<Bar, Status>()
+  const key = '1H:BTC-USDT-SWAP'
+  store.upsert(key, response(10, [bar(1)], { error: '', statisticsState: 'loading', oiState: 'loading', takerState: 'ready' }))
+  const preview: Response = {
+    ...response(11, [bar(1, 202)], { error: '', statisticsState: 'ready', oiState: 'ready', takerState: 'ready' }),
+    statusAuthoritative: false,
+  }
+  const result = store.upsert(key, preview)
+  assert.equal(result.entry?.bars[0]?.close, 202)
+  assert.equal(result.entry?.status.statisticsState, 'loading')
+  assert.equal(result.entry?.status.oiState, 'loading')
+  assert.equal(result.entry?.status.takerState, 'ready')
 })
 
 test('retains every primary series instead of evicting a rendered 1H target for other keys', () => {

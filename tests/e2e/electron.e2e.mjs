@@ -186,3 +186,18 @@ test('partially cached OI and Taker samples remain visibly plotted while statist
   await taker.waitFor({ state: 'visible' })
   assert.ok((await taker.locator('path').first().getAttribute('d'))?.length)
 })
+
+test('a status-only chart poll retains bars in the renderer while reporting real repair state', async () => {
+  const fixture = await request({ e2e: { action: 'seedPartialStatisticsChart' } })
+  const full = await request({ chartInstId: fixture.instId, timeframe: fixture.timeframe, chartEndHour: fixture.end })
+  assert.ok(full.bars.length > 0, 'The ordinary chart request must provide the canonical bar snapshot.')
+
+  const status = await request({ chartInstId: fixture.instId, timeframe: fixture.timeframe, chartEndHour: fixture.end, chartStatusOnly: true })
+  assert.deepEqual(status.bars, [], 'A progress poll must not serialize the chart series again.')
+  assert.equal(status.statusAuthoritative, true)
+  // The fixture has an intentionally missing indicator warm-up range. A
+  // status-only response must report its real repair state, not replace it
+  // with a false `ready` value while the renderer is still waiting.
+  assert.notEqual(status.candleState, 'ready')
+  assert.ok(['loading', 'retrying', 'unavailable', 'ready'].includes(status.statisticsState))
+})

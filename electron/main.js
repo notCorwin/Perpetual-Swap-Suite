@@ -192,6 +192,18 @@ function unsupported(request) {
   throw new Error(`Electron data service does not yet implement “${operation}”. Configure the DuckDB/Parquet service before using market data.`)
 }
 
+function chartStatisticsStatusResponse(instId, timeframe, end) {
+  return {
+    // ChartSeriesStore treats an empty authoritative response as a status
+    // update and retains the already-rendered bars. This keeps 80ms source
+    // progress polling off the DuckDB/indicator/IPC hot path.
+    bars: [], error: '', revision: marketService.dataRevision(instId), timeframe,
+    ...marketService.chartCandleStatus(instId, timeframe, end),
+    ...marketService.chartStatisticsStatus(instId, timeframe, end),
+    statusAuthoritative: true,
+  }
+}
+
 async function handleRequest(event, request) {
   if (!request || typeof request !== 'object') throw new Error('Invalid desktop bridge request.')
   if ('e2e' in request) {
@@ -233,7 +245,12 @@ async function handleRequest(event, request) {
     // Chart data revisions are per instrument: an unrelated contract's write
     // must not force this chart to refetch.
     if (!request.preview && !focused.ok) return { unchanged: true, error: '', revision: marketService.dataRevision(request.chartInstId) }
+    if (!request.preview && request.chartStatusOnly && Number.isFinite(request.chartEndHour)) {
+      return chartStatisticsStatusResponse(request.chartInstId, timeframe, request.chartEndHour)
+    }
     if (request.chartEndHour === undefined && request.sinceRevision === marketService.dataRevision(request.chartInstId) && marketService.isActiveChartViewport(request.chartInstId, timeframe, undefined)) {
+      const activeEnd = marketService.activeChartViewport?.end
+      if (Number.isFinite(activeEnd)) return chartStatisticsStatusResponse(request.chartInstId, timeframe, activeEnd)
       return { unchanged: true, error: '', revision: marketService.dataRevision(request.chartInstId) }
     }
     // Neighbor previews may read the local cache, but must never enqueue
@@ -261,7 +278,11 @@ async function handleRequest(event, request) {
       bars, error: '', revision: chart.revision ?? marketService.dataRevision(request.chartInstId), timeframe, oldestHour,
       endHour, historyExhausted: requestedEnd !== undefined && minimumEnd !== null && requestedEnd <= minimumEnd && hasFixedHistoryBoundary,
       candleState: chart.candleState, missingCandleRanges: chart.missingCandleRanges, candleRetryAt: chart.candleRetryAt,
-      statisticsState: chart.statisticsState, statisticsRetryAt: chart.statisticsRetryAt,
+      statisticsState: chart.statisticsState, statisticsRetryAt: chart.statisticsRetryAt, oiState: chart.oiState, takerState: chart.takerState, statisticsEnd: chart.statisticsEnd,
+      // Preview reads are cache-only and cannot observe foreground work. The
+      // renderer may merge their bars, but must retain its active loading or
+      // retry status rather than accept these default-ready fields.
+      statusAuthoritative: !request.preview,
     }
   }
   if ('gatewayFetch' in request) return gatewayFetch(event, request.gatewayFetch)

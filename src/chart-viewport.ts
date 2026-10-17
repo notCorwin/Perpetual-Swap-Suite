@@ -119,16 +119,16 @@ export function chartScrollFloor(oldestCachedHour: number, oldestAvailableHour: 
   return Number.isFinite(oldestCachedHour) ? oldestCachedHour + (visibleHours - 1) * intervalMS : 0
 }
 
-export function chartStatsNeedLoad<T extends { hour: number; confirmed: boolean; oi: number | null; buy: number | null; sell: number | null }>(bars: T[], endHour: number, visibleHours = 96, intervalMS = hour): boolean {
+export function chartStatsNeedLoad<T extends { hour: number; confirmed: boolean; oi: number | null; buy: number | null; sell: number | null; statisticsObserved?: boolean }>(bars: T[], endHour: number, visibleHours = 96, intervalMS = hour): boolean {
   const visible = visibleChartBars(bars, endHour, intervalMS, visibleHours)
   return !hasCompleteChartWindow(visible, endHour, visibleHours, intervalMS) || visible.some(bar => bar.confirmed
-    && (bar.oi === null || bar.buy === null || bar.sell === null))
+    && (bar.statisticsObserved === false || bar.statisticsObserved === undefined && (bar.oi === null || bar.buy === null || bar.sell === null)))
 }
 
 // Source-candle repairs include indicator warm-up history to the left of the
 // visible chart. Statistics are independent direct timeframe values, so a
 // warm-up repair must not hold up OI/Taker once this 96-candle window is whole.
-export function chartStatisticsRequestable<T extends { hour: number; confirmed: boolean; oi: number | null; buy: number | null; sell: number | null }>(bars: T[], requestedEnd: number | null, renderedEnd: number | null, visibleHours = 96, intervalMS = hour): boolean {
+export function chartStatisticsRequestable<T extends { hour: number; confirmed: boolean; oi: number | null; buy: number | null; sell: number | null; statisticsObserved?: boolean }>(bars: T[], requestedEnd: number | null, renderedEnd: number | null, visibleHours = 96, intervalMS = hour): boolean {
   return requestedEnd !== null && renderedEnd === requestedEnd
     && hasCompleteChartWindow(bars, requestedEnd, visibleHours, intervalMS)
     && chartStatsNeedLoad(bars, requestedEnd, visibleHours, intervalMS)
