@@ -9,9 +9,11 @@ export type ChartImage = { imageDataURL: string; width: number; height: number }
 
 export type RankedMarketRow = NativeMarketRow & { rankingChange: number | null; rankingAsOf: number | null }
 export type ListProgress = { total: number; completed: number; pending: number; retrying: number; unavailable: number }
+export type CatalogProgress = { total: number; completed: number; verified: number; failed: number; unknown: number }
 export type MarketSnapshot = {
   rows: RankedMarketRow[]; updatedAt: number | null; error: string; revision: number
   loading?: boolean; listProgress?: ListProgress; catalogSource?: 'none' | 'cache' | 'live'
+  catalogProgress?: CatalogProgress
   serviceSession?: string; timeframe?: RadarTimeframe; realtimeState?: string
 }
 export type UnchangedSnapshot = Partial<Omit<MarketSnapshot, 'rows'>> & { unchanged: true; revision: number; error: string }

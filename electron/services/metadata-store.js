@@ -262,6 +262,27 @@ export class MetadataStore {
   getAudit(id) { const value = this.#get('audits', id); return value && validateJob(value, 'audit') }
   listAudits() { return this.#list('audits').map(value => validateJob(value, 'audit')) }
   putCatalogEntry(entry) { const value = validateCatalog(entry); return this.#put('catalog', value.instrumentID, value) }
+  saveCatalogRankings(entries) {
+    this.#assertOpen()
+    if (!Array.isArray(entries)) throw new TypeError('Catalog rankings must be an array.')
+    const values = entries.map(entry => {
+      keys(entry, ['instrumentID', 'lookback', 'rankingChange', 'rankingAsOf'], 'Catalog ranking')
+      identifier(entry.instrumentID, 'Catalog ranking instrumentID')
+      integer(entry.lookback, 'Catalog ranking lookback')
+      integer(entry.rankingAsOf, 'Catalog ranking asOf')
+      if (entry.lookback < 5 || entry.lookback % 5 || !Number.isSafeInteger(entry.lookback * 60_000)
+        || entry.rankingAsOf % 300_000 || typeof entry.rankingChange !== 'number' || !Number.isFinite(entry.rankingChange)) throw new TypeError('Invalid confirmed catalog ranking.')
+      return { instrumentID: entry.instrumentID, lookback: entry.lookback, rankingChange: entry.rankingChange, rankingAsOf: entry.rankingAsOf }
+    })
+    if (new Set(values.map(value => value.instrumentID)).size !== values.length) throw new TypeError('Catalog rankings contain duplicate instrument IDs.')
+    if (!values.length) return []
+    return this.#transaction(() => {
+      const update = this.#database.prepare("UPDATE catalog SET value = json_set(value, '$.lastRanking', json(?)) WHERE id = ?")
+      const updated = []
+      for (const { instrumentID, ...ranking } of values) if (update.run(JSON.stringify(ranking), instrumentID).changes) updated.push(instrumentID)
+      return updated
+    })
+  }
   getCatalogEntry(instrumentID) { const value = this.#get('catalog', instrumentID); return value && validateCatalog(value) }
   listCatalogEntries() { return this.#list('catalog').map(validateCatalog) }
   deleteCatalogEntry(instrumentID) { return this.#delete('catalog', instrumentID) }

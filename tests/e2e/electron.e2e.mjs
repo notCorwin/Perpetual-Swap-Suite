@@ -228,7 +228,7 @@ test('a restarted desktop restores cached catalog readings before a live scan co
   const snapshot = await request({ snapshot: { timeframe: '1H', sinceRevision: -1 } })
   assert.equal(snapshot.catalogSource, 'cache')
   assert.equal(snapshot.loading, true, 'The delayed production-style discovery must still be running.')
-  await page.locator('[data-market-list]').getByText('Cached', { exact: true }).waitFor()
+  await page.locator('[data-market-list]').getByText(/^Verifying \d+\/\d+$/).waitFor()
 
   // Do not let the deliberately delayed discovery leak into the following
   // fixture: restore a deterministic test-mode process after this assertion.

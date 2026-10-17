@@ -12,6 +12,7 @@ const OKX_ORIGIN = 'https://www.okx.com/api/v5'
 const FIVE_MINUTES = 300_000
 const LIST_TIMEFRAMES = ['5m', '15m', '1H']
 const OBSERVATION_TTL = 90_000
+const CATALOG_RENEW_INTERVAL = 30_000
 const LATEST_CANDLE_REFRESH = 60_000
 const HISTORICAL_STATISTICS_REFRESH = 6 * 3_600_000
 const REQUEST_TIMEOUT = 12_000
@@ -220,10 +221,25 @@ export class MarketService {
     this.webSocketFactory = webSocketFactory
     this.requestTimeout = Number.isFinite(requestTimeout) && requestTimeout > 0 ? requestTimeout : REQUEST_TIMEOUT
     this.catalog = new Map()
+    this.catalogChecks = new Map()
+    this.renewalTargets = new Map()
+    this.candidateTasks = new Map()
+    this.candidateIDs = null
+    this.tickerCache = null
+    this.tickerTask = null
+    this.renewing = null
+    this.renewalTimer = null
     this.instruments = new Map()
     this.observations = new Map()
     this.rankings = new Map()
     this.rankingTasks = new Map()
+    this.rankingWindows = new Map()
+    this.rankingVersions = new Map()
+    this.rankingReads = new Map()
+    this.rankingRepairs = new Map()
+    this.persistedRankings = new Map()
+    this.pendingRankings = new Map()
+    this.rankingPersistenceImmediate = null
     this.listRows = new Map()
     this.listUpdatedAt = new Map()
     this.listProjectionTasks = new Map()
@@ -296,7 +312,10 @@ export class MarketService {
       onState: () => { this.touchList() },
     })
     this.updateSubscriptions()
-    if (this.autoRefresh && !this.closing) { this.realtime.start(); this.scheduleRefresh() }
+    if (this.autoRefresh && !this.closing) {
+      this.realtime.start(); this.scheduleRefresh()
+      this.track(this.renewCatalog())
+    }
     return this
   }
 
@@ -310,6 +329,16 @@ export class MarketService {
     for (const entry of entries) {
       if (entry.instrument?.instId) this.instruments.set(entry.instrument.instId, entry.instrument)
       if (entry.observations) this.observations.set(entry.instrumentID, entry.observations)
+      const ranking = entry.lastRanking
+      if (ranking?.lookback === this.prefs().rankingLookback && typeof ranking.rankingChange === 'number' && Number.isFinite(ranking.rankingChange)
+        && Number.isSafeInteger(ranking.rankingAsOf) && ranking.rankingAsOf >= 0 && ranking.rankingAsOf % FIVE_MINUTES === 0 && ranking.rankingAsOf <= closedBoundary('5m')) {
+        this.rankings.set(entry.instrumentID, { lookback: ranking.lookback, rankingChange: ranking.rankingChange, rankingAsOf: ranking.rankingAsOf })
+        this.persistedRankings.set(entry.instrumentID, JSON.stringify(ranking))
+      }
+      if (entry.configKey === this.catalogCriteriaKey()) {
+        this.catalogChecks.set(entry.instrumentID, entry)
+        if (entry.status === 'verified' || entry.renewalTarget === true) this.renewalTargets.set(entry.instrumentID, entry.instrument)
+      }
     }
     const valid = entries.filter(entry => this.validCatalogEntry(entry))
     if (!valid.length) return false
@@ -328,7 +357,11 @@ export class MarketService {
 
   catalogRecord(entry, timestamp = Date.now()) {
     const configKey = entry.configKey ?? this.catalogCriteriaKey()
+    const ranking = this.rankings.get(entry.instrument.instId)
+    const lastRanking = ranking?.lookback === this.prefs().rankingLookback && ranking.rankingChange !== null
+      ? { lookback: ranking.lookback, rankingChange: ranking.rankingChange, rankingAsOf: ranking.rankingAsOf } : entry.lastRanking
     return { ...entry, instrumentID: entry.instrument.instId, schemaVersion: 1,
+      ...(lastRanking ? { lastRanking } : {}),
       status: entry.status ?? (entry.result?.eligible ? 'verified' : 'failed'),
       observedAt: entry.observedAt ?? timestamp, expiresAt: entry.expiresAt ?? timestamp + OBSERVATION_TTL,
       preferencesRevision: this.metadata?.getSettings().revision ?? 0, configKey }
@@ -355,8 +388,8 @@ export class MarketService {
   }
 
   listRowFor(entry, bars = []) {
-    const ranking = this.rankings.get(entry.instrument.instId)
-    return { ...marketRow(entry.instrument, entry.ticker, entry.result, bars), ...(ranking?.rankingAsOf === closedBoundary('5m') ? ranking : { rankingChange: null, rankingAsOf: null }) }
+    const { rankingChange, rankingAsOf } = this.cachedRanking(entry.instrument.instId)
+    return { ...marketRow(entry.instrument, entry.ticker, entry.result, bars), rankingChange, rankingAsOf }
   }
 
   ensureListRows(timeframe) {
@@ -424,21 +457,123 @@ export class MarketService {
     return this.listRowsFor(frame)
   }
 
+  cacheRankingCandles(instId, candles) {
+    const rows = this.rankingWindows.get(instId)?.rows ?? new Map()
+    const through = closedBoundary('5m') - FIVE_MINUTES
+    const from = Math.max(0, through - Math.max(1_440, this.prefs().rankingLookback) * 60_000)
+    let changed = false
+    for (const row of candles) {
+      if (row.instrument !== instId || row.timeframe !== '5m' || row.confirmed !== true || row.timestamp < from || row.timestamp > through) continue
+      const previous = rows.get(row.timestamp)
+      if (previous && Object.is(previous.close, row.close)) continue
+      rows.set(row.timestamp, { instrument: instId, timeframe: '5m', timestamp: row.timestamp, close: row.close, confirmed: true })
+      changed = true
+    }
+    for (const timestamp of rows.keys()) if (timestamp < from || timestamp > through) { rows.delete(timestamp); changed = true }
+    if (changed) {
+      this.rankingVersions.set(instId, (this.rankingVersions.get(instId) ?? 0) + 1)
+      this.rankingReads.delete(instId)
+      this.rankingWindows.set(instId, { rows })
+      if (this.catalog.has(instId)) this.publishRanking(instId, this.prefs().rankingLookback, closedBoundary('5m'))
+    }
+  }
+
+  cachedRanking(instId, lookback = this.prefs().rankingLookback, asOf = closedBoundary('5m')) {
+    const window = this.rankingWindows.get(instId), version = this.rankingVersions.get(instId) ?? 0
+    let result = window?.evaluation
+    if (!result || result.version !== version || result.lookback !== lookback || result.asOf !== asOf) {
+      result = { version, lookback, asOf, ...rankingFromCandles([...(window?.rows.values() ?? [])], lookback, asOf) }
+      if (window) window.evaluation = result
+    }
+    const previous = this.rankings.get(instId)
+    // A new completed boundary can arrive before its durable candle. Keep the
+    // last confirmed ordering with its original timestamp until repair catches up.
+    const ranking = result.rankingChange === null && previous?.lookback === lookback && previous.rankingChange !== null
+      ? previous : { rankingChange: result.rankingChange, rankingAsOf: result.rankingAsOf, lookback }
+    this.rankings.set(instId, ranking)
+    return ranking
+  }
+
+  publishRanking(instId, lookback, asOf) {
+    const { rankingChange, rankingAsOf } = this.cachedRanking(instId, lookback, asOf)
+    for (const frame of this.listRows.keys()) {
+      const previous = this.listRows.get(frame)?.get(instId)
+      if (previous) this.publishListRow(frame, { ...previous, rankingChange, rankingAsOf })
+    }
+    if (rankingChange !== null) {
+      const lastRanking = { lookback, rankingChange, rankingAsOf }, signature = JSON.stringify(lastRanking)
+      const current = this.catalog.get(instId)
+      if (current) current.lastRanking = lastRanking
+      if (this.persistedRankings.get(instId) === signature) this.pendingRankings.delete(instId)
+      else {
+        this.pendingRankings.set(instId, lastRanking)
+        if (!this.rankingPersistenceImmediate && !this.disposed) {
+          this.rankingPersistenceImmediate = setImmediate(() => {
+            this.rankingPersistenceImmediate = null
+            this.track(Promise.resolve().then(() => this.flushRankingPersistence()))
+          })
+          this.rankingPersistenceImmediate.unref?.()
+        }
+      }
+    }
+  }
+
+  flushRankingPersistence() {
+    if (this.rankingPersistenceImmediate) clearImmediate(this.rankingPersistenceImmediate)
+    this.rankingPersistenceImmediate = null
+    if (!this.pendingRankings.size || !this.metadata) return
+    const pending = this.pendingRankings
+    this.pendingRankings = new Map()
+    try {
+      // Update only ranking JSON inside one transaction. Qualification may have
+      // changed since publication; never replace its current observations.
+      const updated = this.metadata.saveCatalogRankings([...pending].map(([instrumentID, ranking]) => ({ instrumentID, ...ranking })))
+      for (const instId of updated) this.persistedRankings.set(instId, JSON.stringify(pending.get(instId)))
+    } catch (error) {
+      for (const [instId, ranking] of pending) if (!this.pendingRankings.has(instId)) this.pendingRankings.set(instId, ranking)
+      throw error
+    }
+  }
+
+  repairRanking(instId, lookback, asOf) {
+    const key = `${instId}:${lookback}:${asOf}`
+    if (this.rankingRepairs.has(key) || this.closing || this.disposed) return
+    const through = asOf - FIVE_MINUTES, from = Math.max(0, through - lookback * 60_000)
+    const task = Promise.resolve().then(() => this.history.ensurePrices(instId, '5m', from, through, 'background'))
+      .then(() => {
+        this.rankingReads.delete(instId)
+        return this.updateRanking(instId, { asOf })
+      }).finally(() => { if (this.rankingRepairs.get(key) === task) this.rankingRepairs.delete(key) })
+    this.rankingRepairs.set(key, task)
+    this.track(task)
+  }
+
   async updateRanking(instId, { ensure = false, asOf = closedBoundary('5m') } = {}) {
-    if (this.disposed) return
+    if (this.disposed || this.closing || asOf !== closedBoundary('5m')) return
     const lookback = this.prefs().rankingLookback, key = `${instId}:${lookback}:${asOf}`
+    this.publishRanking(instId, lookback, asOf)
+    const evaluation = this.rankingWindows.get(instId)?.evaluation
+    if (evaluation?.rankingChange !== null && evaluation?.rankingChange !== undefined) return
+    const version = this.rankingVersions.get(instId) ?? 0, read = this.rankingReads.get(instId)
+    if (read?.version === version && read.lookback === lookback && read.asOf === asOf) {
+      if (ensure) this.repairRanking(instId, lookback, asOf)
+      return
+    }
     if (this.rankingTasks.has(key)) return this.rankingTasks.get(key)
     const task = (async () => {
-      const through = asOf - FIVE_MINUTES, from = Math.max(0, through - lookback * 60_000)
-      if (ensure) await this.history.ensurePrices(instId, '5m', from, through, 'foreground')
+      const through = asOf - FIVE_MINUTES, from = Math.max(0, through - Math.max(1_440, lookback) * 60_000)
       const rows = await this.store.candles({ instrument: instId, timeframe: '5m', from, through }, 'background')
-      const ranking = rankingFromCandles(rows, lookback, asOf)
-      if (this.disposed || this.prefs().rankingLookback !== lookback || asOf !== closedBoundary('5m')) return
-      this.rankings.set(instId, ranking)
-      for (const frame of this.listRows.keys()) {
-        const previous = this.listRows.get(frame)?.get(instId)
-        if (previous) this.publishListRow(frame, { ...previous, ...ranking })
+      // A completed write that raced this read owns newer close observations.
+      if (this.disposed) return
+      if ((this.rankingVersions.get(instId) ?? 0) !== version) {
+        this.publishRanking(instId, this.prefs().rankingLookback, closedBoundary('5m'))
+        return
       }
+      this.cacheRankingCandles(instId, rows)
+      this.rankingReads.set(instId, { version: this.rankingVersions.get(instId) ?? 0, lookback, asOf })
+      if (this.prefs().rankingLookback !== lookback || asOf !== closedBoundary('5m')) return
+      this.publishRanking(instId, lookback, asOf)
+      if (this.rankingWindows.get(instId)?.evaluation?.rankingChange == null && (ensure || this.catalog.has(instId))) this.repairRanking(instId, lookback, asOf)
     })().finally(() => { if (this.rankingTasks.get(key) === task) this.rankingTasks.delete(key) })
     this.rankingTasks.set(key, task)
     return task
@@ -602,6 +737,7 @@ export class MarketService {
       const changed = await this.appendChangedCandlesLocked(confirmed, priority)
       if (!changed.length) return false
       this.markChartDataChanged(instrument)
+      this.cacheRankingCandles(instrument, changed)
       if (confirmed.some(row => row.timeframe === '5m')) void this.updateRanking(instrument).catch(() => undefined)
       if (projectList) this.scheduleListProjection(instrument)
       return true
@@ -742,7 +878,11 @@ export class MarketService {
   onHistoryReplaced(instId, timeframe) {
     this.markChartDataChanged(instId)
     this.preparedCharts.invalidate(instId, timeframe)
-    this.rankings.delete(instId)
+    if (timeframe === '5m') {
+      this.rankingWindows.delete(instId)
+      this.rankingReads.delete(instId)
+      this.rankingVersions.set(instId, (this.rankingVersions.get(instId) ?? 0) + 1)
+    }
     this.invalidateListProjection(instId)
     for (const frame of this.listRows.keys()) {
       const entry = this.catalog.get(instId)
@@ -795,33 +935,50 @@ export class MarketService {
     return value && Number.isSafeInteger(value.observedAt) && value.expiresAt > now ? value : null
   }
 
-  async checkCandidate(instrument, tickerObservation, config, configKey, asOf, signal) {
+  async tickerObservations(signal, priority = 'background', force = false) {
+    if (!force && this.tickerCache && Date.now() - this.tickerCache.observedAt < CATALOG_RENEW_INTERVAL) return this.tickerCache.values
+    if (this.tickerTask && !this.tickerTask.signal.aborted) return this.tickerTask.task
+    const task = this.get('/market/tickers', { instType: 'SWAP' }, signal, priority).then(values => {
+      if (!Array.isArray(values) || !values.length) throw new Error('OKX returned no swap tickers.')
+      const observedAt = Date.now()
+      const observations = new Map(values.map(value => [value.instId, { value, observedAt, expiresAt: observedAt + OBSERVATION_TTL }]))
+      if (!signal.aborted && !this.disposed) this.tickerCache = { values: observations, observedAt }
+      return observations
+    }).finally(() => { if (this.tickerTask?.task === task) this.tickerTask = null })
+    this.tickerTask = { signal, task }
+    return task
+  }
+
+  async checkCandidate(instrument, config, configKey, signal, priority = 'background') {
+    const key = `${configKey}:${JSON.stringify(instrument)}`
+    if (this.candidateTasks.has(key)) return this.candidateTasks.get(key)
+    const task = this.evaluateCandidate(instrument, config, configKey, signal, priority)
+      .finally(() => { if (this.candidateTasks.get(key) === task) this.candidateTasks.delete(key) })
+    this.candidateTasks.set(key, task)
+    return task
+  }
+
+  async evaluateCandidate(instrument, config, configKey, signal, priority) {
+    const asOf = closedBoundary('5m')
     const instId = instrument.instId, observations = { ...(this.observations.get(instId) ?? {}) }
+    const errors = {}
     const observe = async (key, operation) => {
       try {
         const value = await operation()
         if (signal.aborted || this.disposed) return
         const now = Date.now()
         observations[key] = { value, observedAt: now, expiresAt: now + OBSERVATION_TTL }
-      } catch { /* An unsuccessful attempt never extends an earlier observation. */ }
+      } catch (error) {
+        // Preserve a still-valid observation, never extend it on failure.
+        errors[key] = error instanceof Error ? error.message : String(error)
+      }
     }
-    const ticker = tickerObservation?.value
-    if (tickerObservation) observations.ticker = tickerObservation
     const tasks = []
-    if (config.depth.enabled || config.slippage.enabled) tasks.push(observe('book', async () => {
-      const value = (await this.get('/market/books', { instId, sz: 400 }, signal, 'background'))[0]
-      if (!value || !Array.isArray(value.bids) || !value.bids.length || !Array.isArray(value.asks) || !value.asks.length) throw new Error('Missing order-book observation.')
-      return value
-    }))
-    if (config.openInterest.enabled) tasks.push(observe('openInterest', async () => {
-      const value = (await this.get('/public/open-interest', { instType: 'SWAP', instId }, signal, 'background'))[0]
-      if (number(value?.oiUsd) === null || number(value?.oiUsd) < 0) throw new Error('Missing open-interest observation.')
-      return value
-    }))
     if (config.volume24h.enabled) tasks.push(observe('turnover', async () => {
       const through = asOf - FIVE_MINUTES, from = through - 287 * FIVE_MINUTES
       await this.history.ensurePrices(instId, '5m', from, through, 'foreground', signal)
       const candles = await this.store.candles({ instrument: instId, timeframe: '5m', from, through }, 'foreground')
+      this.cacheRankingCandles(instId, candles)
       const turnover = quoteTurnover24h(candles, asOf)
       if (turnover === null) throw new Error('The completed 24-hour quote-volume range is incomplete.')
       return { asOf, turnover }
@@ -834,14 +991,41 @@ export class MarketService {
       return { asOf: end, rows }
     }))
     await Promise.all(tasks)
-    if (this.disposed || signal.aborted || this.catalogCriteriaKey() !== configKey) return
+    if (!this.currentCandidate(instrument, configKey, signal)) return
+    const historicalAsOf = closedBoundary('5m')
+    const historicalResult = evaluateLiquidity({ instrument, config, asOf: historicalAsOf,
+      turnover24hUSDT: observations.turnover?.value.asOf === historicalAsOf ? this.observation(observations, 'turnover')?.value.turnover ?? null : null,
+      hourlyCandles: observations.hourly?.value.asOf === closedBoundary('1H', historicalAsOf) ? this.observation(observations, 'hourly')?.value.rows ?? [] : [] })
+    // Historical repairs can take minutes. Obtain live liquidity only after
+    // those repairs, and renew the bulk ticker independently of scan age.
+    // A known failing historical condition already excludes a contract; it
+    // must not consume the live request budget needed by qualified contracts.
+    const live = []
+    if (historicalResult.status !== 'failed') live.push(this.tickerObservations(signal, priority).then(values => {
+      const value = values.get(instId)
+      if (!value) throw new Error(`Missing ticker observation for ${instId}.`)
+      observations.ticker = value
+    }).catch(error => { errors.ticker = error instanceof Error ? error.message : String(error) }))
+    if (historicalResult.status !== 'failed' && (config.depth.enabled || config.slippage.enabled)) live.push(observe('book', async () => {
+      const value = (await this.get('/market/books', { instId, sz: 400 }, signal, priority))[0]
+      if (!value || !Array.isArray(value.bids) || !value.bids.length || !Array.isArray(value.asks) || !value.asks.length) throw new Error('Missing order-book observation.')
+      return value
+    }))
+    if (historicalResult.status !== 'failed' && config.openInterest.enabled) live.push(observe('openInterest', async () => {
+      const value = (await this.get('/public/open-interest', { instType: 'SWAP', instId }, signal, priority))[0]
+      if (number(value?.oiUsd) === null || number(value?.oiUsd) < 0) throw new Error('Missing open-interest observation.')
+      return value
+    }))
+    await Promise.all(live)
+    if (!this.currentCandidate(instrument, configKey, signal)) return
     this.observations.set(instId, observations)
     const now = Date.now(), fresh = key => this.observation(observations, key, now)
     const turnoverObservation = fresh('turnover'), hourlyObservation = fresh('hourly')
-    const turnover = turnoverObservation?.value.asOf === asOf ? turnoverObservation.value.turnover : null
-    const hourly = hourlyObservation?.value.asOf === closedBoundary('1H', asOf) ? hourlyObservation.value.rows : []
+    const currentAsOf = closedBoundary('5m')
+    const turnover = turnoverObservation?.value.asOf === currentAsOf ? turnoverObservation.value.turnover : null
+    const hourly = hourlyObservation?.value.asOf === closedBoundary('1H', currentAsOf) ? hourlyObservation.value.rows : []
     const result = evaluateLiquidity({ instrument, ticker: fresh('ticker')?.value ?? null, book: fresh('book')?.value ?? null,
-      openInterest: fresh('openInterest')?.value ?? null, hourlyCandles: hourly, turnover24hUSDT: turnover, asOf, config })
+      openInterest: fresh('openInterest')?.value ?? null, hourlyCandles: hourly, turnover24hUSDT: turnover, asOf: currentAsOf, config })
     const required = []
     if (config.spread.enabled) required.push('ticker')
     if (config.depth.enabled || config.slippage.enabled) required.push('book')
@@ -851,10 +1035,14 @@ export class MarketService {
     const validObservations = required.map(fresh)
     const complete = validObservations.every(Boolean)
     const status = result.status === 'verified' && complete ? 'verified' : result.status === 'failed' ? 'failed' : 'unknown'
-    const record = this.catalogRecord({ instrument, ticker: fresh('ticker')?.value ?? ticker ?? {}, result: { ...result, eligible: status === 'verified' },
-      status, configKey, observations, observedAt: validObservations.length && complete ? Math.min(...validObservations.map(value => value.observedAt)) : now,
+    const record = this.catalogRecord({ instrument, ticker: fresh('ticker')?.value ?? {}, result: { ...result, eligible: status === 'verified' },
+      status, configKey, observations, observationErrors: errors, renewalTarget: status === 'verified' || status === 'unknown' && this.renewalTargets.has(instId),
+      observedAt: validObservations.length && complete ? Math.min(...validObservations.map(value => value.observedAt)) : now,
       expiresAt: status === 'verified' ? validObservations.length ? Math.min(...validObservations.map(value => value.expiresAt)) : now + OBSERVATION_TTL : now })
     this.metadata.putCatalogEntry(record)
+    this.catalogChecks.set(instId, record)
+    if (status === 'verified') this.renewalTargets.set(instId, instrument)
+    else if (status === 'failed') this.renewalTargets.delete(instId)
     const next = new Map(this.catalog)
     if (status === 'verified') next.set(instId, record)
     else next.delete(instId)
@@ -862,39 +1050,95 @@ export class MarketService {
     this.catalogUpdatedAt = now
     this.replaceCatalog([...next.values()])
     if (status === 'verified') {
-      this.track(this.updateRanking(instId, { ensure: true, asOf }))
-      this.track(this.history.target(instId, { historyDays: this.prefs().historyDays, asOf }))
+      this.track(this.updateRanking(instId, { ensure: true, asOf: currentAsOf }))
+      this.track(this.history.target(instId, { historyDays: this.prefs().historyDays, asOf: currentAsOf }))
     }
+  }
+
+  currentCandidate(instrument, configKey, signal) {
+    const current = this.instruments.get(instrument.instId)
+    return !this.disposed && !signal.aborted && this.catalogCriteriaKey() === configKey
+      && (!this.candidateIDs || this.candidateIDs.has(instrument.instId))
+      && (!current || JSON.stringify(current) === JSON.stringify(instrument))
+  }
+
+  async discoverInstruments(configKey, signal, priority) {
+    const instruments = await this.get('/public/instruments', { instType: 'SWAP' }, signal, priority)
+    if (signal.aborted || this.catalogCriteriaKey() !== configKey) return []
+    if (!Array.isArray(instruments) || !instruments.length) throw new Error('OKX returned no swap instruments; market verification is unavailable.')
+    // Normalize only OKX's explicit empty multiplier for supported swaps.
+    const candidates = instruments.filter(eligibleInstrument).map(value => value.ctMult === '' ? { ...value, ctMult: '1' } : value)
+    if (!candidates.length) throw new Error('No supported swap instrument metadata could be verified. Retrying automatically.')
+    this.candidateIDs = new Set(candidates.map(value => value.instId))
+    for (const instId of this.renewalTargets.keys()) if (!this.candidateIDs.has(instId)) this.renewalTargets.delete(instId)
+    for (const instId of this.catalogChecks.keys()) if (!this.candidateIDs.has(instId)) this.catalogChecks.delete(instId)
+    for (const instrument of candidates) {
+      this.instruments.set(instrument.instId, instrument)
+      if (this.renewalTargets.has(instrument.instId)) this.renewalTargets.set(instrument.instId, instrument)
+    }
+    this.replaceCatalog([...this.catalog.values()].filter(entry => this.currentCandidate(entry.instrument, configKey, signal) && this.validCatalogEntry(entry)))
+    return candidates
+  }
+
+  async renewCatalog() {
+    await this.ready
+    if (this.closing || this.disposed) return
+    if (this.renewing) return this.renewing
+    const controller = new AbortController(), config = this.prefs().liquidity, configKey = JSON.stringify(config)
+    this.renewalController = controller
+    this.renewalStartedAt = Date.now()
+    this.renewing = (async () => {
+      if (!this.renewalTargets.size) return
+      // Renewal must verify current contract units and trading state as well
+      // as prices. An outage cannot keep extending old instrument metadata.
+      await this.discoverInstruments(configKey, controller.signal, 'foreground')
+      if (controller.signal.aborted || this.catalogCriteriaKey() !== configKey) return
+      await mapConcurrent([...this.renewalTargets.values()], 4,
+        instrument => this.checkCandidate(instrument, config, configKey, controller.signal, 'foreground'))
+      this.error = ''
+    })()
+      .catch(error => { if (!controller.signal.aborted) this.error = error instanceof Error ? error.message : String(error) })
+      .finally(() => {
+        this.renewing = null
+        if (this.renewalController === controller) this.renewalController = null
+        this.scheduleRenewal()
+      })
+    return this.renewing
+  }
+
+  scheduleRenewal() {
+    if (this.renewalTimer) clearTimeout(this.renewalTimer)
+    this.renewalTimer = null
+    if (!this.autoRefresh || this.closing || this.disposed) return
+    const due = Math.max(1, (this.renewalStartedAt ?? Date.now()) + CATALOG_RENEW_INTERVAL - Date.now())
+    this.renewalTimer = setTimeout(() => { this.renewalTimer = null; this.track(this.renewCatalog()) }, due)
+    this.renewalTimer.unref?.()
   }
 
   async refresh() {
     await this.ready
     if (this.closing || this.disposed) return
     if (this.refreshing) return this.refreshing
-    const controller = new AbortController(), config = this.prefs().liquidity, configKey = JSON.stringify(config), asOf = closedBoundary('5m')
+    const controller = new AbortController(), config = this.prefs().liquidity, configKey = JSON.stringify(config)
     this.refreshController = controller
     const startedAt = Date.now()
     this.refreshStartedAt = startedAt
     this.refreshing = (async () => {
       try {
-        const [instruments, tickers] = await Promise.all([
-          this.get('/public/instruments', { instType: 'SWAP' }, controller.signal, 'background'),
-          this.get('/market/tickers', { instType: 'SWAP' }, controller.signal, 'background').then(values => ({ values, observedAt: Date.now() })),
+        const [candidates] = await Promise.all([
+          this.discoverInstruments(configKey, controller.signal, 'background'),
+          this.tickerObservations(controller.signal, 'background', true),
         ])
-        // OKX documents all swap/futures contract multipliers as 1. The API
-        // sometimes omits that inapplicable variation as an empty string.
-        // Keep malformed or absent metadata unknown; only normalize this explicit
-        // empty field for verified USDT linear swaps, never options.
-        // https://www.okx.com/help/get-started-with-okx-options
-        const candidates = instruments.filter(eligibleInstrument).map(value => value.ctMult === '' ? { ...value, ctMult: '1' } : value), tickerByID = new Map(tickers.values.map(value => [value.instId, { value, observedAt: tickers.observedAt, expiresAt: tickers.observedAt + OBSERVATION_TTL }]))
-        const candidateIDs = new Set(candidates.map(value => value.instId))
-        for (const instrument of candidates) this.instruments.set(instrument.instId, instrument)
-        this.replaceCatalog([...this.catalog.values()].filter(entry => candidateIDs.has(entry.instrument.instId) && this.validCatalogEntry(entry)))
+        if (controller.signal.aborted || this.catalogCriteriaKey() !== configKey) return
+        this.catalogChecks.clear()
+        // Previously qualified contracts get checked first, independently of
+        // their position in the exchange's instrument response.
+        candidates.sort((a, b) => Number(this.renewalTargets.has(b.instId)) - Number(this.renewalTargets.has(a.instId)))
         // A successful check publishes independently; the first row does not wait for the full exchange scan.
-        await mapConcurrent(candidates, 4, instrument => this.checkCandidate(instrument, tickerByID.get(instrument.instId), config, configKey, asOf, controller.signal))
+        await mapConcurrent(candidates, 4, instrument => this.checkCandidate(instrument, config, configKey, controller.signal))
         if (!controller.signal.aborted && this.catalogCriteriaKey() === configKey) {
           this.lastRefreshAt = startedAt
-          this.error = this.catalog.size ? '' : 'No contracts currently meet all enabled liquidity requirements.'
+          this.error = ''
         }
       } catch (error) {
         if (!controller.signal.aborted && !this.disposed) this.error = error instanceof Error ? error.message : String(error)
@@ -923,13 +1167,14 @@ export class MarketService {
     const current = this.prefs(), previous = validatePreferences(previousPreferences)
     if (JSON.stringify(previous.liquidity) !== JSON.stringify(current.liquidity)) {
       this.refreshController?.abort()
-      if (this.refreshing) await this.refreshing
+      this.renewalController?.abort()
+      await Promise.allSettled([this.refreshing, this.renewing].filter(Boolean))
+      this.catalogChecks.clear(); this.renewalTargets.clear(); this.candidateIDs = null
       this.replaceCatalog([...this.catalog.values()].filter(entry => this.validCatalogEntry(entry)))
       this.lastRefreshAt = 0
       if (this.autoRefresh) this.track(this.refresh())
     }
     if (previous.rankingLookback !== current.rankingLookback) {
-      this.rankings.clear()
       for (const frame of this.listRows.keys()) this.ensureListRows(frame)
       for (const instId of this.catalog.keys()) this.track(this.updateRanking(instId, { ensure: true }))
     }
@@ -943,6 +1188,8 @@ export class MarketService {
 
   invalidate() {
     this.refreshController?.abort()
+    this.renewalController?.abort()
+    this.catalogChecks.clear(); this.renewalTargets.clear(); this.candidateIDs = null
     this.replaceCatalog([])
     this.lastRefreshAt = 0
     if (this.autoRefresh) this.track(this.refresh())
@@ -998,11 +1245,24 @@ export class MarketService {
     await this.ready
     this.pruneCatalog()
     const frame = this.ensureListRows(timeframe)
+    let refreshScheduled = false
     if (!this.disposed && !this.closing) {
-      if (this.autoRefresh && !this.refreshing && Date.now() - (this.refreshStartedAt || this.lastRefreshAt) >= LATEST_CANDLE_REFRESH) this.track(this.refresh())
+      if (this.autoRefresh && !this.refreshing && Date.now() - (this.refreshStartedAt || this.lastRefreshAt) >= LATEST_CANDLE_REFRESH) {
+        refreshScheduled = true
+        this.track(this.refresh())
+      }
       for (const instId of this.catalog.keys()) { this.track(this.projectListEntry(instId, frame)); this.track(this.updateRanking(instId)) }
     }
-    return { rows: this.listRowsFor(frame), revision: this.revision, error: this.error, loading: this.refreshing !== null,
+    const rows = this.listRowsFor(frame)
+    const catalogProgress = { total: this.candidateIDs?.size ?? this.catalogChecks.size, completed: this.catalogChecks.size, verified: 0, failed: 0, unknown: 0 }
+    for (const record of this.catalogChecks.values()) {
+      const status = record.status === 'verified' && !this.validCatalogEntry(record) ? 'unknown' : record.status
+      catalogProgress[status] += 1
+    }
+    const unavailable = !this.catalog.size && catalogProgress.unknown > 0
+      ? `Market verification is unavailable for ${catalogProgress.unknown} contracts because required observations are missing or expired. Retrying automatically.` : ''
+    return { rows, revision: this.revision, error: this.error || unavailable, loading: refreshScheduled || this.refreshing !== null || this.renewing !== null,
+      catalogProgress,
       updatedAt: this.listUpdatedAt.get(frame) ?? this.catalogUpdatedAt, listProgress: this.listProgress(frame), timeframe: frame,
       catalogSource: this.catalogSource, realtimeState: this.realtime?.getState().status ?? 'disconnected' }
   }
@@ -1011,18 +1271,21 @@ export class MarketService {
     if (this.disposeTask) return this.disposeTask
     this.closing = true
     if (this.refreshTimer) clearTimeout(this.refreshTimer)
+    if (this.renewalTimer) clearTimeout(this.renewalTimer)
     this.disposeTask = (async () => {
       try { await this.ready } catch { if (this.ownsMetadata) this.metadata?.close(); return }
       // A confirmed stream event resolves only after its durable write. Drain it before aborting source work.
       await this.realtime?.close()
       this.disposed = true
       this.refreshController?.abort()
+      this.renewalController?.abort()
       this.shutdownController.abort()
       for (const controller of this.abortControllers) controller.abort()
       await this.history.close()
       await this.preparedCharts.dispose()
-      await Promise.allSettled([this.refreshing, this.drainRequestQueues(), ...this.barTasks, ...this.backgroundTasks, ...this.rankingTasks.values(), ...this.candleMutations.values(), ...[...this.listProjectionTasks.values()].map(value => value.task)].filter(Boolean))
-      if (this.ownsMetadata) this.metadata.close()
+      await Promise.allSettled([this.refreshing, this.renewing, this.drainRequestQueues(), ...this.candidateTasks.values(), ...this.barTasks, ...this.backgroundTasks, ...this.rankingTasks.values(), ...this.candleMutations.values(), ...[...this.listProjectionTasks.values()].map(value => value.task)].filter(Boolean))
+      try { this.flushRankingPersistence() }
+      finally { if (this.ownsMetadata) this.metadata.close() }
     })()
     return this.disposeTask
   }

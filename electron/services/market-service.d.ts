@@ -1,6 +1,7 @@
 import type { MarketStore } from './market-store.js'
 import type { MetadataStore, Preferences } from './metadata-store.js'
 import type { WebSocketFactory } from './realtime-market.js'
+import type { CatalogProgress } from '../../src/desktop-contract.ts'
 import type { NativeMarketRow } from '../../src/market-row.ts'
 import type { PreparedChartResponse } from '../../src/chart-data.ts'
 export type { PreparedChartBar } from '../../src/chart-data.ts'
@@ -28,5 +29,5 @@ export class MarketService {
   subscribePreparedCharts(listener: (frame: PreparedChartWindow) => void): () => void
   localChartWindow(instId: string, timeframe: '5m' | '15m' | '1H'): Promise<PreparedChartWindow | null>
   dispose(): Promise<void>
-  snapshot(timeframe?: '5m' | '15m' | '1H'): Promise<{ rows: RankedMarketRow[]; revision: number; error: string; loading: boolean; updatedAt: number | null; timeframe: '5m' | '15m' | '1H'; realtimeState: 'connecting' | 'live' | 'reconnecting' | 'disconnected'; catalogSource: 'none' | 'cache' | 'live'; listProgress: { total: number; completed: number; pending: number; retrying: number; unavailable: number } }>
+  snapshot(timeframe?: '5m' | '15m' | '1H'): Promise<{ rows: RankedMarketRow[]; revision: number; error: string; loading: boolean; updatedAt: number | null; timeframe: '5m' | '15m' | '1H'; realtimeState: 'connecting' | 'live' | 'reconnecting' | 'disconnected'; catalogSource: 'none' | 'cache' | 'live'; catalogProgress: CatalogProgress; listProgress: { total: number; completed: number; pending: number; retrying: number; unavailable: number } }>
 }

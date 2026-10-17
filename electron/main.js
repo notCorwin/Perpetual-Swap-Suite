@@ -25,6 +25,7 @@ const security = createDesktopSecurity({ rendererURL, rendererFile: join(root, '
 const e2eLiveRefresh = testMode && process.env.PERPETUAL_SWAP_E2E_LIVE_REFRESH === '1'
 let window
 let metadata
+let marketPreferences
 let marketStore
 let marketService
 const gatewayRequests = new Map()
@@ -95,11 +96,11 @@ async function handleRequest(event, payload) {
   if (shuttingDown) throw new Error('The application is closing.')
   if (request.preferences) {
     if (request.preferences.action === 'update') {
-      const previous = metadata.getSettings().preferences
-      metadata.updateSettings(request.preferences.values)
+      const previous = marketPreferences
+      marketPreferences = metadata.updateSettings(request.preferences.values).preferences
       await marketService.reconfigure(previous)
     }
-    return metadata.getSettings().preferences
+    return marketPreferences
   }
   if (request.snapshot) return marketService.snapshot(request.snapshot.timeframe)
   if (request.dataAudit) return marketService.dataAuditRequest(request.dataAudit)
@@ -169,10 +170,11 @@ async function createWindow() {
 async function startDesktop() {
   const userData = app.getPath('userData')
   metadata = await MetadataStore.open(userData, { legacySettingsPath: join(userData, 'settings.json') })
+  marketPreferences = metadata.getSettings().preferences
   if (shuttingDown) return
   marketStore = await MarketStore.open(join(userData, 'MarketData'))
   if (shuttingDown) return
-  marketService = new MarketService(marketStore, () => metadata.getSettings().preferences,
+  marketService = new MarketService(marketStore, () => marketPreferences,
     testMode ? e2eLiveRefresh ? delayedOfflineE2EFetch : offlineE2EFetch : fetch, !testMode, { metadata })
   await marketService.ready
   if (shuttingDown) return

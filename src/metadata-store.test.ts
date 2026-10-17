@@ -193,3 +193,28 @@ test('catalog snapshots replace atomically and cannot silently renew observation
     assert.deepEqual(store.listCatalogEntries(), [])
   } finally { database.close(); store.close(); await rm(root, { recursive: true, force: true }) }
 })
+
+test('ranking batches preserve qualification observations, roll back together, and never recreate deleted contracts', async () => {
+  const root = await temporary(), store = await MetadataStore.open(root)
+  const database = new DatabaseSync(join(root, 'metadata.sqlite'))
+  try {
+    const first = catalogEntry(), second = catalogEntry('ETH-USDT-SWAP')
+    store.putCatalogEntry(first); store.putCatalogEntry(second)
+    const rankings = [
+      { instrumentID: first.instrumentID, lookback: 15, rankingChange: 12.5, rankingAsOf: 600_000 },
+      { instrumentID: second.instrumentID, lookback: 30, rankingChange: -4, rankingAsOf: 600_000 },
+    ]
+    assert.throws(() => store.saveCatalogRankings([rankings[0], { ...rankings[1], rankingAsOf: 1 }]), /Invalid confirmed/)
+    assert.deepEqual(store.getCatalogEntry(first.instrumentID), first)
+    database.exec("CREATE TRIGGER fail_rank_batch BEFORE UPDATE ON catalog WHEN NEW.id = 'ETH-USDT-SWAP' BEGIN SELECT RAISE(ABORT, 'Injected ranking failure'); END")
+    assert.throws(() => store.saveCatalogRankings(rankings), /Injected ranking failure/)
+    assert.deepEqual(store.getCatalogEntry(first.instrumentID), first, 'A later ranking failure must roll back earlier updates in the batch.')
+    database.exec('DROP TRIGGER fail_rank_batch')
+    const latest = { ...first, status: 'unknown' as const, observedAt: 3000, expiresAt: 3000, observations: { spread: 0.02 } }
+    store.putCatalogEntry(latest)
+    store.deleteCatalogEntry(second.instrumentID)
+    assert.deepEqual(store.saveCatalogRankings(rankings), [first.instrumentID])
+    assert.deepEqual(store.getCatalogEntry(first.instrumentID), { ...latest, lastRanking: { lookback: 15, rankingChange: 12.5, rankingAsOf: 600_000 } })
+    assert.equal(store.getCatalogEntry(second.instrumentID), null)
+  } finally { database.close(); store.close(); await rm(root, { recursive: true, force: true }) }
+})

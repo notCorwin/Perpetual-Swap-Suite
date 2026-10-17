@@ -56,6 +56,7 @@ export class MetadataStore {
   getAudit(id: string): AuditRecord | null
   listAudits(): AuditRecord[]
   putCatalogEntry<T extends CatalogEntry>(entry: T): T
+  saveCatalogRankings(entries: Array<{ instrumentID: string; lookback: number; rankingChange: number; rankingAsOf: number }>): string[]
   getCatalogEntry(instrumentID: string): CatalogEntry | null
   listCatalogEntries(): CatalogEntry[]
   deleteCatalogEntry(instrumentID: string): boolean

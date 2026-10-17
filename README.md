@@ -31,6 +31,8 @@ The list shows only contracts that meet every enabled liquidity condition and th
 
 The default ranking lookback is **15 minutes**, calculated from completed native **5m** candle closes. Change it in **Settings → Ranking lookback (minutes)** using multiples of five minutes. Ranking lookback and chart timeframe are separate persisted settings: choosing a 1h chart does not change a 15-minute ranking window.
 
+Rankings reuse completed candles in memory, and changing the lookback calculates immediately when that window is cached. Missing candles are repaired in the background. The previous confirmed ranking keeps its original timestamp until a newer complete window is available; the last confirmed ranking is also restored on restart.
+
 ### Liquidity conditions
 
 Open **Settings → Liquidity conditions** to enable or disable each condition and edit its parameters independently. Disabled conditions retain their saved parameters. The defaults are:
@@ -45,6 +47,8 @@ Open **Settings → Liquidity conditions** to enable or disable each condition a
 | Volume stability | Maximum/minimum hourly volume below 2 over 24 completed 1h candles | No |
 
 The 24h trading-volume check sums actual quote volume from **288 completed 5m candles**. The slippage trade size is also configurable. A contract needs valid observations for every enabled condition; eligibility must be revalidated as its observations expire.
+
+Qualified contracts are rechecked independently every 30 seconds while full-market discovery continues. Historical preparation finishes before live observations are collected. Missing or expired data is reported as unavailable verification, separately from confirmed filter rejections. During a temporary verification gap, the current chart and its live subscription remain available while the qualified list is rechecked.
 
 ## Charts and indicators
 

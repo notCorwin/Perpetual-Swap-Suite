@@ -21,6 +21,9 @@ import { cn, pageVisible } from '@/lib/utils'
 const priceFormatter = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 8 })
 const formatPrice = (value: number | null | undefined) => value == null ? '—' : priceFormatter.format(value)
 const collectorStatus = (snapshot: MarketSnapshot | UnchangedSnapshot) => {
+  const catalog = snapshot.catalogProgress
+  if (snapshot.loading && catalog && catalog.total > 0) return `Verifying ${catalog.completed}/${catalog.total}`
+  if (snapshot.error) return snapshot.catalogSource === 'none' ? 'Unavailable' : 'Incomplete'
   const progress = snapshot.listProgress
   if (progress && progress.total > 0 && progress.completed < progress.total) return `Loading ${progress.completed}/${progress.total}`
   if (snapshot.loading) return 'Refreshing'
@@ -49,6 +52,7 @@ function App() {
   const [selected, setSelected] = useState<string | null>(null)
   const [query, setQuery] = useState('')
   const [ready, setReady] = useState(false)
+  const [catalog, setCatalog] = useState<Pick<MarketSnapshot, 'loading' | 'catalogSource' | 'catalogProgress'>>({ loading: true, catalogSource: 'none' })
   const [status, setStatus] = useState('Connecting')
   const [realtime, setRealtime] = useState('Connecting')
   const [error, setError] = useState('')
@@ -87,11 +91,17 @@ function App() {
           revision.current = order.current.revision
           if (!('unchanged' in snapshot)) {
             setRows(current => reconcileMarketRows(current, snapshot.rows) as RankedMarketRow[])
-            setSelected(current => snapshot.rows.some(row => row.instId === current) ? current : snapshot.rows.reduce<RankedMarketRow | null>((first, row) => !first || compareRankingChange(row, first) < 0 ? row : first, null)?.instId ?? null)
+            const unverified = snapshot.loading || snapshot.error || snapshot.catalogSource === 'none' || (snapshot.catalogProgress?.unknown ?? 0) > 0
+            setSelected(current => snapshot.rows.some(row => row.instId === current) || (!snapshot.rows.length && unverified) ? current : snapshot.rows.reduce<RankedMarketRow | null>((first, row) => !first || compareRankingChange(row, first) < 0 ? row : first, null)?.instId ?? null)
             setReady(true)
           }
           setError(snapshot.error)
-          if (!('unchanged' in snapshot) || snapshot.catalogSource !== undefined || snapshot.listProgress !== undefined || snapshot.loading !== undefined) setStatus(collectorStatus(snapshot))
+          setCatalog(current => ({
+            loading: snapshot.loading ?? ('unchanged' in snapshot ? current.loading : false),
+            catalogSource: snapshot.catalogSource ?? current.catalogSource,
+            catalogProgress: snapshot.catalogProgress ?? ('unchanged' in snapshot ? current.catalogProgress : undefined),
+          }))
+          if (!('unchanged' in snapshot) || snapshot.catalogSource !== undefined || snapshot.catalogProgress !== undefined || snapshot.listProgress !== undefined || snapshot.loading !== undefined) setStatus(collectorStatus(snapshot))
           if (snapshot.updatedAt !== undefined) setUpdatedAt(snapshot.updatedAt)
           if (snapshot.realtimeState) setRealtime(snapshot.realtimeState)
         }
@@ -99,6 +109,7 @@ function App() {
       } catch (cause) {
         if (stopped) return
         setError(message(cause)); setStatus('Reconnecting'); setRealtime('Disconnected')
+        setCatalog(current => ({ ...current, loading: false }))
         backoff = Math.min(backoff * 2, 30_000)
       }
       if (!stopped) timer = window.setTimeout(load, backoff)
@@ -109,13 +120,22 @@ function App() {
 
   const ranked = useMemo(() => [...rows].sort(compareRankingChange), [rows])
   const visible = useMemo(() => ranked.filter(row => row.instId.toLowerCase().includes(query.trim().toLowerCase())), [ranked, query])
-  // Search changes the list without hiding the selected market. Qualification
-  // changes immediately choose the next qualified contract, or the empty state.
+  const verifying = Boolean(catalog.loading) || (!ready && !error)
+  const verificationUnavailable = !verifying && (Boolean(error) || catalog.catalogSource === 'none' || (catalog.catalogProgress?.unknown ?? 0) > 0)
+  const emptyTitle = verifying ? catalog.catalogSource === 'none' ? 'Loading contracts' : 'Verifying contracts' : verificationUnavailable ? 'Market verification unavailable' : 'No qualified contracts'
+  const emptyDescription = verifying
+    ? catalog.catalogProgress?.total ? `Checking enabled conditions: ${catalog.catalogProgress.completed} / ${catalog.catalogProgress.total} contracts completed.` : 'The data service is preparing and verifying the market list.'
+    : verificationUnavailable ? 'Market data could not verify the enabled conditions. The data service will retry automatically.' : 'Adjust the enabled liquidity conditions in Settings.'
+  const noSearchMatch = Boolean(query.trim()) && rows.length > 0
+  // Only confirmed exclusions clear the chart. A temporary verification gap
+  // clears the qualified list while preserving the current chart and its state.
   const selectedRow = rows.find(row => row.instId === selected) ?? ranked[0]
-  const selectedID = selectedRow?.instId ?? null
+  const retainedChart = !rows.length && Boolean(selected) && (verifying || verificationUnavailable)
+  const selectedID = selectedRow?.instId ?? (retainedChart ? selected : null)
+  useEffect(() => { if (ready && !rows.length && !verifying && !verificationUnavailable) setSelected(null) }, [ready, rows.length, verifying, verificationUnavailable])
   const listOrder = useMemo(() => ranked.map(row => row.instId), [ranked])
   const turnoverOrder = useMemo(() => [...rows].sort((a, b) => (b.turnover24hUSDT ?? -1) - (a.turnover24hUSDT ?? -1) || a.instId.localeCompare(b.instId, 'en')).map(row => row.instId), [rows])
-  useEffect(() => { chartController.setUniverse(ready ? listOrder : [], timeframe) }, [ready, listOrder, timeframe])
+  useEffect(() => { chartController.setUniverse(retainedChart && selectedID ? [selectedID] : ready ? listOrder : [], timeframe) }, [ready, listOrder, timeframe, retainedChart, selectedID])
   const savePreferences = useCallback(async (values: Partial<Preferences>) => {
     const write = ++preferenceWrite.current
     let saved: Preferences
@@ -124,8 +144,11 @@ function App() {
     if (write !== preferenceWrite.current) return
     revision.current = -1
     setPreferences(saved); setPreferencesError(''); setStatus('Refreshing'); setRefresh(current => current + 1)
-    if (values.liquidity || values.rankingLookback !== undefined) { setRows([]); setReady(false) }
-  }, [])
+    if (JSON.stringify(saved.liquidity) !== JSON.stringify(preferences.liquidity)) {
+      setRows([]); setReady(false); setError('')
+      setCatalog(current => ({ ...current, loading: true, catalogProgress: undefined }))
+    }
+  }, [preferences.liquidity])
   const changeTimeframe = useCallback((chartTimeframe: RadarTimeframe) => {
     void savePreferences({ chartTimeframe }).catch(cause => setPreferencesError(message(cause)))
   }, [savePreferences])
@@ -144,14 +167,14 @@ function App() {
           <colgroup><col className="w-[35%]" /><col className="w-[33%]" /><col className="w-[32%]" /></colgroup>
           <TableHeader className="sticky top-0 bg-background"><TableRow><TableHead>Contract</TableHead><TableHead className="text-right">Price</TableHead><TableHead className="text-right" aria-sort="descending" title="Sorted by absolute signed relative change, largest first">{preferences.rankingLookback}m change</TableHead></TableRow></TableHeader>
           {visible.length ? <MarketRowsViewport ids={visible.map(row => row.instId)}>{index => <MarketRowView row={visible[index]} index={index} selected={visible[index].instId === selectedID} lookback={preferences.rankingLookback} onSelect={setSelected} />}</MarketRowsViewport> : <TableBody><TableRow><TableCell colSpan={3}>
-            <Empty><EmptyHeader><EmptyTitle>{query ? 'No matching contracts' : ready ? 'No qualified contracts' : 'Loading contracts'}</EmptyTitle><EmptyDescription>{query ? 'Try another contract name.' : ready ? 'Adjust the enabled liquidity conditions in Settings.' : 'The data service is preparing the market list.'}</EmptyDescription></EmptyHeader></Empty>
+            <Empty><EmptyHeader><EmptyTitle>{noSearchMatch ? 'No matching contracts' : emptyTitle}</EmptyTitle><EmptyDescription>{noSearchMatch ? 'Try another contract name.' : emptyDescription}</EmptyDescription></EmptyHeader></Empty>
           </TableCell></TableRow></TableBody>}
         </Table>
       </section>
-      <footer className="flex flex-col gap-1 border-t p-4 text-xs text-muted-foreground" aria-live="polite"><span>Realtime: {realtime}</span><span>{updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data'}</span><span>Ranking: completed 5m closes · {preferences.rankingLookback}m lookback</span></footer>
+      <footer className="flex flex-col gap-1 border-t p-4 text-xs text-muted-foreground" aria-live="polite">{retainedChart && <span role="status">{verifying ? 'Rechecking qualification · Current chart remains available' : 'Qualification data unavailable · Current chart remains available'}</span>}<span>Realtime: {realtime}</span><span>{updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data'}</span><span>Ranking: completed 5m closes · {preferences.rankingLookback}m lookback</span></footer>
     </aside>
     <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
-      {selectedID ? <MarketChart instId={selectedID} timeframe={timeframe} onTimeframeChange={changeTimeframe} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{ready ? 'No qualified contracts' : 'Preparing market workspace'}</EmptyTitle><EmptyDescription>{ready ? 'Enable different liquidity conditions to view a chart.' : 'The chart will open when a qualified contract is available.'}</EmptyDescription></EmptyHeader></Empty></div>}
+      {selectedID ? <MarketChart instId={selectedID} timeframe={timeframe} onTimeframeChange={changeTimeframe} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
     </section>
   </WorkspaceViewport>
 }
