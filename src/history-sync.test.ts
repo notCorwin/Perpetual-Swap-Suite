@@ -107,7 +107,7 @@ test('containing requests share a task and partial overlaps fetch only the remai
   try {
     const first = await sync.enqueue(request)
     await entered.promise
-    const contained = await sync.enqueue({ ...request, from: base + intervalMS, priority: 'foreground' })
+    const contained = await sync.enqueue({ ...request, from: base + intervalMS })
     const overlap = await sync.enqueue({ ...request, from: base + intervalMS, through: base + 4 * intervalMS })
     assert.equal(contained.id, first.id)
     release.resolve()
@@ -117,6 +117,72 @@ test('containing requests share a task and partial overlaps fetch only the remai
       { from: base, through: base + 2 * intervalMS },
       { from: base + 3 * intervalMS, through: base + 4 * intervalMS },
     ])
+  } finally { release.resolve(); await sync.close() }
+})
+
+test('a foreground window completes before its containing background target and the background rechecks shared coverage', async () => {
+  const entered = deferred(), release = deferred(), nextPage = deferred<HistorySourceQuery>(), resumeBackground = deferred()
+  const queries: HistorySourceQuery[] = [], published: number[] = []
+  const store = new MemoryStore()
+  const { sync } = create({ store,
+    async write(values) { published.push(...values.map(value => value.timestamp)); await store.appendCandles(values) },
+    sources: { candles: { async fetchGap(query) {
+      queries.push(query)
+      if (queries.length === 1) {
+        entered.resolve()
+        await release.promise
+        return { records: [candle(query.from)], cursor: 'background-next' }
+      }
+      if (queries.length === 2) nextPage.resolve(query)
+      if (query.priority === 'background') await resumeBackground.promise
+      return records(query)
+    } } },
+  })
+  try {
+    const background = await sync.enqueue({ ...request, through: base + 5 * intervalMS, purpose: 'history' })
+    await entered.promise
+    const foreground = await sync.enqueue({ ...request, from: base + 2 * intervalMS, through: base + 3 * intervalMS, priority: 'foreground' })
+    assert.notEqual(foreground.id, background.id)
+    assert.equal(sync.getTask(background.id)?.priority, 'background')
+    assert.equal((await sync.enqueue({ ...foreground, priority: 'foreground' })).id, foreground.id)
+    release.resolve()
+    assert.equal((await nextPage.promise).priority, 'foreground')
+    assert.equal((await sync.waitFor(foreground.id)).status, 'completed')
+    assert.notEqual(sync.getTask(background.id)?.status, 'completed')
+    resumeBackground.resolve()
+    assert.equal((await sync.waitFor(background.id)).status, 'completed')
+    assert.deepEqual(queries.map(({ from, through, priority, cursor }) => ({ from, through, priority, cursor })), [
+      { from: base, through: base + 5 * intervalMS, priority: 'background', cursor: null },
+      { from: base + 2 * intervalMS, through: base + 3 * intervalMS, priority: 'foreground', cursor: null },
+      { from: base + intervalMS, through: base + intervalMS, priority: 'background', cursor: null },
+      { from: base + 4 * intervalMS, through: base + 5 * intervalMS, priority: 'background', cursor: null },
+    ])
+    assert.equal(published.length, 6)
+    assert.equal(new Set(published).size, 6)
+  } finally { release.resolve(); resumeBackground.resolve(); await sync.close() }
+})
+
+test('foreground work takes the next source call when it arrives during background inspection', async () => {
+  const entered = deferred(), release = deferred()
+  const calls: string[] = []
+  const { sync } = create({ sources: { candles: {
+    async inspect(query) {
+      calls.push(`inspect:${query.priority}`)
+      if (query.priority === 'background') { entered.resolve(); await release.promise }
+      return {}
+    },
+    fetchGap(query) { calls.push(`fetch:${query.priority}`); return records(query) },
+  } } })
+  try {
+    const background = await sync.enqueue({ ...request, through: base + 5 * intervalMS })
+    await entered.promise
+    const foreground = await sync.enqueue({ ...request, from: base + 2 * intervalMS, through: base + 3 * intervalMS, priority: 'foreground' })
+    release.resolve()
+    assert.equal((await sync.waitFor(foreground.id)).status, 'completed')
+    await sync.whenIdle()
+    assert.deepEqual(calls, ['inspect:background', 'inspect:foreground', 'fetch:foreground', 'fetch:background', 'fetch:background'])
+    assert.equal(sync.getTask(background.id)?.attempts, 0)
+    assert.equal(sync.getTask(background.id)?.lastError, null)
   } finally { release.resolve(); await sync.close() }
 })
 

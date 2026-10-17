@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 const intervals = { '5m': 300_000, '15m': 900_000, '1H': 3_600_000 }
 const statuses = new Set(['queued', 'running', 'retry', 'paused', 'cancelled', 'completed', 'unavailable'])
 const terminal = new Set(['paused', 'cancelled', 'completed', 'unavailable'])
+const foregroundReady = Symbol('Foreground history is ready for the source lane.')
 const clone = value => structuredClone(value)
 const integer = (value, name, minimum = 0) => {
   if (!Number.isSafeInteger(value) || value < minimum) throw new TypeError(`${name} must be a safe integer of at least ${minimum}.`)
@@ -140,12 +141,12 @@ export class HistorySync {
     const purpose = input.purpose ?? 'requested'
     if (!['requested', 'history', 'warmup'].includes(purpose)) throw new TypeError('Invalid history purpose.')
     const id = key({ ...identity, ...bounds })
-    // A containing task can satisfy a smaller request. Partially overlapping
-    // tasks share the request lane and recheck persisted gaps before each page.
-    let task = this.tasks.get(id) ?? [...this.tasks.values()].find(value => value.instrument === identity.instrument
+    // Foreground callers wait for their exact range, never a containing history
+    // target. All tasks still share the lane and recheck Parquet before each page.
+    let task = this.tasks.get(id) ?? (requestedPriority === 'background' ? [...this.tasks.values()].find(value => value.instrument === identity.instrument
       && value.timeframe === identity.timeframe && value.source === identity.source
       && value.from <= bounds.from && value.through >= bounds.through
-      && ['queued', 'running', 'retry'].includes(value.status))
+      && ['queued', 'running', 'retry'].includes(value.status)) : undefined)
     if (task) {
       if (requestedPriority === 'foreground') task.priority = 'foreground'
       if (['paused', 'cancelled', 'completed'].includes(task.status)) {
@@ -337,9 +338,13 @@ export class HistorySync {
     }
   }
 
-  async callSource(operation, signal) {
+  async callSource(operation, signal, task) {
     if (this.lastRequestAt !== null) await this.delay(Math.max(0, this.lastRequestAt + this.minRequestIntervalMS - this.timestamp()), signal)
     signal.throwIfAborted()
+    // A foreground request may arrive during inspection or rate-limit pacing.
+    // Yield before admitting the next HTTP call; an active page still finishes.
+    if (task.priority === 'background' && [...this.tasks.values()].some(value => value.priority === 'foreground'
+      && (value.status === 'queued' || (value.status === 'retry' && value.nextAttemptAt <= this.timestamp())))) throw foregroundReady
     this.lastRequestAt = this.timestamp()
     return operation()
   }
@@ -366,7 +371,7 @@ export class HistorySync {
       signal.throwIfAborted()
       const source = this.sources.get(task.source)
       if (gaps.length && source.inspect && !task.inspected) {
-        const inspection = await this.callSource(() => source.inspect({ instrument: task.instrument, timeframe: task.timeframe, source: task.source, priority: task.priority, from: task.from, through: task.through, signal, cursor: task.cursor }), signal)
+        const inspection = await this.callSource(() => source.inspect({ instrument: task.instrument, timeframe: task.timeframe, source: task.source, priority: task.priority, from: task.from, through: task.through, signal, cursor: task.cursor }), signal, task)
         signal.throwIfAborted()
         task.unavailableRanges.push(...this.unavailable(task, inspection))
         task.inspected = true
@@ -382,7 +387,7 @@ export class HistorySync {
         task.cursorRange = clone(gap)
       }
       const before = slots(gaps, intervalMS)
-      const response = await this.callSource(() => source.fetchGap({ instrument: task.instrument, timeframe: task.timeframe, source: task.source, priority: task.priority, ...gap, cursor: task.cursor, signal }), signal)
+      const response = await this.callSource(() => source.fetchGap({ instrument: task.instrument, timeframe: task.timeframe, source: task.source, priority: task.priority, ...gap, cursor: task.cursor, signal }), signal, task)
       signal.throwIfAborted()
       const result = Array.isArray(response) ? { records: response } : response
       if (!result || !Array.isArray(result.records)) throw new TypeError('fetchGap must return records or an object containing records.')
@@ -415,7 +420,7 @@ export class HistorySync {
       task.status = 'queued'
       await this.save(task)
     } catch (error) {
-      if (signal.aborted) {
+      if (signal.aborted || error === foregroundReady) {
         if (task.status === 'running') {
           task.status = 'queued'
           await this.save(task)
