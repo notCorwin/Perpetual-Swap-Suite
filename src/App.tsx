@@ -24,7 +24,8 @@ import { compareMarketRows, compareMarketTurnover, defaultSortDescending, type S
 import { PERCENT_CHANGE_DESCRIPTION, formatPercent, percentageNumber, type PercentageValue } from "@/market-percent"
 import { BREAK_DESCRIPTION, describeBreak, formatBreakPriorAge, formatBreakTime, type BreakDirection, type BreakResult } from "@/market-breaks"
 import { BANDWIDTH_EXPANSION_DESCRIPTION, LOG_BB_DESCRIPTION, formatBandWidthExpansion, formatLiveBand } from "@/market-logbb"
-import { MarketChart, type ChartPollResponse } from "@/MarketChart"
+import { MarketChart } from "@/MarketChart"
+import type { PreparedChartResponse } from '@/chart-data'
 import { OPPORTUNITY_DESCRIPTION } from "@/market-opportunity"
 import { MarketOpportunity } from "@/MarketOpportunity"
 import { MarketListViewport } from "@/MarketListViewport"
@@ -72,9 +73,7 @@ type NativeBridge = {
   postMessage(request: { captureChart: { x: number; y: number; width: number; height: number; backgroundRGB: number[] } }): Promise<{ ok: boolean }>
   postMessage(request: { windowTintRGB: number[] }): Promise<{ ok: boolean }>
   postMessage(request: { previewWindowBlur: number | null }): Promise<{ ok: boolean }>
-  postMessage(request: { chartSession: true }): Promise<{ session: number }>
-  postMessage(request: { chartFocus: { instId: string; session: number; token: number } }): Promise<{ ok: boolean }>
-  postMessage(request: { chartInstId: string; timeframe?: RadarTimeframe; loadChart?: boolean; preview?: boolean; chartFocusSession?: number; chartFocusToken?: number; sinceRevision?: number; chartEndHour?: number; chartStatusOnly?: boolean; serviceSession?: string }): Promise<ChartPollResponse>
+  postMessage(request: { chartWindow: { instId: string; timeframe: RadarTimeframe; endHour?: number } }): Promise<PreparedChartResponse>
 }
 declare global {
   interface Window { radarNotificationContract?: string; radarNotificationStrategy?: string; radarAppearance?: WindowAppearance & { nativeWindowBackground?: boolean }; webkit: { messageHandlers: { radar: NativeBridge } } }

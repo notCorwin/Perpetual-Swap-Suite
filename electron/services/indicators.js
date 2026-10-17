@@ -24,6 +24,8 @@ export function rsi(candles, period) {
     const move = candles[index].close - candles[index - 1].close
     gains += Math.max(move, 0); losses += Math.max(-move, 0)
   }
+  gains /= period
+  losses /= period
   const calculate = () => losses === 0 ? 100 : 100 - 100 / (1 + gains / losses)
   values.set(candles[period].timestamp, calculate())
   for (let index = period + 1; index < candles.length; index += 1) {
@@ -35,7 +37,7 @@ export function rsi(candles, period) {
   return values
 }
 
-export function bollinger(candles, period = 9) {
+export function bollinger(candles, period = 20) {
   const values = new Map()
   for (let index = period - 1; index < candles.length; index += 1) {
     const window = candles.slice(index - period + 1, index + 1).map(candle => candle.close)

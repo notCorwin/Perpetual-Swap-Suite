@@ -82,11 +82,16 @@ export class MarketStore {
     return join(this.root, 'candles', `timeframe=${safeSegment(timeframe)}`, `instrument=${safeSegment(instrument)}`, `date=${date}`)
   }
 
-  async parquetFiles(instrument, timeframe) {
+  async parquetFiles(instrument, timeframe, from, through) {
     const directory = join(this.root, 'candles', `timeframe=${safeSegment(timeframe)}`, `instrument=${safeSegment(instrument)}`)
     let dates
     try { dates = await readdir(directory, { withFileTypes: true }) } catch { return [] }
-    return dates.filter(entry => entry.isDirectory()).map(entry => join(directory, entry.name, '*.parquet'))
+    const firstDate = Number.isFinite(from) ? new Date(from).toISOString().slice(0, 10) : null
+    const lastDate = Number.isFinite(through) ? new Date(through).toISOString().slice(0, 10) : null
+    return dates.filter(entry => entry.isDirectory()
+      && (!firstDate || entry.name.slice(5) >= firstDate)
+      && (!lastDate || entry.name.slice(5) <= lastDate))
+      .map(entry => join(directory, entry.name, '*.parquet'))
   }
 
   async appendCandles(candles, priority = 'background') {
@@ -147,7 +152,7 @@ export class MarketStore {
 
   async candles({ instrument, timeframe, from = 0, through = Date.now() }, priority = 'background') {
     return this.enqueue(async () => {
-      const files = await this.parquetFiles(instrument, timeframe)
+      const files = await this.parquetFiles(instrument, timeframe, from, through)
       if (!files.length) return []
       const list = `[${files.map(quote).join(', ')}]`
       const result = await this.connection.runAndReadAll(`SELECT * EXCLUDE (row_rank) FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY timestamp ORDER BY COALESCE(writtenAt, 0) DESC) AS row_rank FROM read_parquet(${list}, union_by_name = true) WHERE timestamp >= ${Number(from)} AND timestamp <= ${Number(through)}) WHERE row_rank = 1 ORDER BY timestamp`)
@@ -160,7 +165,7 @@ export class MarketStore {
   // candle field.
   async candleTimestamps({ instrument, timeframe, from = 0, through = Date.now() }, priority = 'background') {
     return this.enqueue(async () => {
-      const files = await this.parquetFiles(instrument, timeframe)
+      const files = await this.parquetFiles(instrument, timeframe, from, through)
       if (!files.length) return []
       const list = `[${files.map(quote).join(', ')}]`
       const result = await this.connection.runAndReadAll(`SELECT timestamp FROM (SELECT timestamp, ROW_NUMBER() OVER (PARTITION BY timestamp ORDER BY COALESCE(writtenAt, 0) DESC) AS row_rank FROM read_parquet(${list}, union_by_name = true) WHERE timestamp >= ${Number(from)} AND timestamp <= ${Number(through)}) WHERE row_rank = 1 ORDER BY timestamp`)

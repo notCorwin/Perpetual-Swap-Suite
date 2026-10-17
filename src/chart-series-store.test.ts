@@ -1,205 +1,233 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { ChartSeriesStore, type ChartSeriesResponse } from './chart-series-store.ts'
-
-type Bar = { hour: number; confirmed: boolean; close: number; oi: number | null; buy: number | null; sell: number | null }
-type Status = { error: string; candleState?: 'ready' | 'loading' | 'retrying'; candleRetryAt?: number | null; missingCandleRanges?: Array<{ from: number; through: number }>; statisticsState?: 'ready' | 'loading' | 'retrying'; oiState?: 'ready' | 'loading' | 'retrying'; takerState?: 'ready' | 'loading' | 'retrying' }
-type Response = ChartSeriesResponse<Bar, Status>
+import type { Bar, PreparedChartBar, PreparedChartResponse } from './chart-data.ts'
+import { PreparedChartStore } from './chart-series-store.ts'
 
 const hour = 3_600_000
-const response = (revision: number, bars: Bar[], status: Status = { error: '', candleState: 'ready' }, serviceSession = 'collector-a'): Response => ({
-  ...status,
-  bars,
-  revision,
-  serviceSession,
+const instId = 'BTC-USDT-SWAP'
+const bar = (index: number, intervalMS = hour, overrides: Partial<PreparedChartBar> = {}): PreparedChartBar => ({
+  hour: index * intervalMS, open: 100, high: 102, low: 99, close: 101,
+  confirmed: true, statisticsSources: 3, statisticsObserved: true, indicatorsObserved: true,
+  vwap: 100, ema: 100, logBBUpper: 102, logBBMiddle: 100, logBBLower: 99,
+  roc: 1, maroc: .5, rsi6: 50, rsi12: 51, rsi24: 52, oi: 1_000, buy: 20, sell: 30,
+  ...overrides,
 })
-const bar = (index: number, close = 100 + index): Bar => ({
-  hour: index * hour,
-  confirmed: true,
-  close,
-  oi: 1_000 + index,
-  buy: 10 + index,
-  sell: 5 + index,
-})
-
-test('merges non-empty 1H responses into one canonical primary series', () => {
-  const store = new ChartSeriesStore<Bar, Status>()
-  const key = '1H:BTC-USDT-SWAP'
-  store.upsert(key, response(10, [bar(1), bar(2)]), 1)
-  const result = store.upsert(key, response(11, [bar(2, 202), bar(3)]), 2)
-
-  assert.equal(result.accepted, true)
-  assert.deepEqual(result.entry?.bars.map(value => [value.hour, value.close]), [[hour, 101], [2 * hour, 202], [3 * hour, 103]])
-  assert.equal(result.entry?.latestKnownHour, 3 * hour)
-  assert.equal(result.entry?.revision, 11)
-  assert.equal(result.entry?.barsRevision, 11)
-  assert.equal(result.entry?.loadedAt, 2)
+const bars = (start: number, count: number, intervalMS = hour) => Array.from({ length: count }, (_, index) => bar(start + index, intervalMS))
+const response = (values: PreparedChartBar[], overrides: Partial<PreparedChartResponse> = {}): PreparedChartResponse => ({
+  instId, timeframe: '1H', intervalMS: hour, generation: 1, revision: 1,
+  endHour: values.at(-1)?.hour ?? null, latestEnd: values.at(-1)?.hour ?? null,
+  oldestHour: values[0]?.hour ?? null, historyExhausted: false, bars: values,
+  oiState: 'ready', takerState: 'ready', indicatorState: 'ready', error: '', ...overrides,
 })
 
-test('an empty response updates status without blanking an already rendered series', () => {
-  const store = new ChartSeriesStore<Bar, Status>()
-  const key = '1H:BTC-USDT-SWAP'
-  store.upsert(key, response(10, [bar(1), bar(2)]), 1)
-  const result = store.upsert(key, response(11, [], { error: 'candle retry', candleState: 'retrying' }), 2)
-
-  assert.equal(result.accepted, true)
-  assert.deepEqual(result.entry?.bars, [bar(1), bar(2)])
-  assert.equal(result.entry?.latestKnownHour, 2 * hour)
-  assert.equal(result.entry?.revision, 11)
-  assert.equal(result.entry?.barsRevision, 10)
-  assert.equal(result.entry?.status.error, 'candle retry')
-  assert.equal(result.entry?.status.candleState, 'retrying')
-  assert.equal(store.hasBars(key), true)
-})
-
-test('a status-only same-revision poll preserves repair progress while advancing direct source state', () => {
-  const store = new ChartSeriesStore<Bar, Status>()
-  const key = '1H:BTC-USDT-SWAP'
-  const missing = [{ from: hour, through: 2 * hour }]
-  store.upsert(key, response(7, [bar(1), bar(2)], {
-    error: '', candleState: 'loading', candleRetryAt: 9_000, missingCandleRanges: missing,
-    statisticsState: 'loading', oiState: 'loading', takerState: 'loading',
-  }))
-
-  const result = store.upsert(key, response(7, [], {
-    error: '', candleState: 'loading', candleRetryAt: 9_000, missingCandleRanges: missing,
-    statisticsState: 'retrying', oiState: 'retrying', takerState: 'ready',
-  }))
-
-  assert.equal(result.accepted, true)
-  assert.deepEqual(result.entry?.bars, [bar(1), bar(2)])
-  assert.equal(result.entry?.status.candleState, 'loading')
-  assert.equal(result.entry?.status.candleRetryAt, 9_000)
-  assert.deepEqual(result.entry?.status.missingCandleRanges, missing)
-  assert.equal(result.entry?.status.statisticsState, 'retrying')
-  assert.equal(result.entry?.status.oiState, 'retrying')
-  assert.equal(result.entry?.status.takerState, 'ready')
-  assert.equal(result.entry?.barsRevision, 7)
-})
-
-test('a failed materialized read remains pending across equal status-only revisions', () => {
-  const store = new ChartSeriesStore<Bar, Status>()
-  const key = '1H:BTC-USDT-SWAP'
-  store.upsert(key, response(7, [bar(1, 101)]))
-
-  // The status endpoint sees a new persisted source page, but the complete
-  // read that would merge it into bars fails outside the store.
-  store.upsert(key, response(8, [], { error: '', statisticsState: 'ready', oiState: 'ready', takerState: 'ready' }))
-  const pending = store.get(key)
-  assert.equal(pending?.revision, 8)
-  assert.equal(pending?.barsRevision, 7)
-  assert.equal(pending?.bars[0]?.oi, 1_001)
-
-  // A later equal-revision status reply must still be distinguishable from
-  // the retained r7 bars, so the renderer retries the materialized read.
-  store.upsert(key, response(8, [], { error: '', statisticsState: 'ready', oiState: 'ready', takerState: 'ready' }))
-  assert.equal(store.get(key)?.barsRevision, 7)
-
-  store.upsert(key, response(8, [{ ...bar(1, 101), oi: 2_001 }]))
-  assert.equal(store.get(key)?.barsRevision, 8)
-  assert.equal(store.get(key)?.bars[0]?.oi, 2_001)
-})
-
-test('only materialized hours advance a visible window through distant previews and status polls', () => {
-  const store = new ChartSeriesStore<Bar, Status>()
-  const key = '5m:PEPE-USDT-SWAP'
-  store.upsert(key, response(10, [bar(1), bar(2), bar(3)]))
-  const first = store.materializedWindow(key, 3 * hour, hour, 3)
-  assert.equal(first?.revision, 10)
-  store.upsert(key, { ...response(11, [bar(100)]), statusAuthoritative: false })
-  assert.equal(store.get(key)?.barsRevision, 11)
-  assert.deepEqual(store.materializedWindow(key, 3 * hour, hour, 3), first)
-  store.upsert(key, response(12, [], { error: '', statisticsState: 'loading' }))
-  assert.deepEqual(store.materializedWindow(key, 3 * hour, hour, 3), first)
-  store.upsert(key, response(12, [bar(1), bar(2)]))
-  assert.equal(store.materializedWindow(key, 3 * hour, hour, 3)?.revision, 10, 'All hours in the visible window must be materialized at the new revision')
-  store.upsert(key, response(12, [bar(3)]))
-  assert.equal(store.materializedWindow(key, 3 * hour, hour, 3)?.revision, 12)
-  assert.equal(store.materializedWindow(key, 4 * hour, hour, 3), null, 'An absent hour cannot be treated as current')
-  const partial = store.materializedWindow(key, 4 * hour, hour, 3, true)
-  assert.equal(partial?.revision, 12, 'Candle repair may reuse the latest partial snapshot for cheap progress polling')
-  store.upsert(key, response(13, [], { error: '', candleState: 'loading' }))
-  assert.deepEqual(store.materializedWindow(key, 4 * hour, hour, 3, true), partial, 'Status-only polls must not postpone the bounded partial snapshot refresh')
-})
-
-test('window materialization resets with the collector and preserves accepted live-frame semantics', () => {
-  const store = new ChartSeriesStore<Bar, Status>()
-  const key = '5m:PEPE-USDT-SWAP'
-  store.upsert(key, response(10, [bar(1)]))
-  const confirmed = store.materializedWindow(key, hour, hour, 1)
-  store.upsert(key, response(11, [{ ...bar(1), confirmed: false, oi: null }]))
-  assert.deepEqual(store.materializedWindow(key, hour, hour, 1), confirmed)
-  store.upsert(key, response(12, [{ ...bar(2), confirmed: false }]))
-  assert.equal(store.materializedWindow(key, 2 * hour, hour, 1)?.revision, 12, 'A genuinely new live candle participates in the live polling fast path')
-  store.upsert(key, response(1, [], { error: '', statisticsState: 'loading' }, 'collector-b'))
-  assert.equal(store.hasBars(key), true)
-  assert.equal(store.materializedWindow(key, hour, hour, 1), null, 'Retained old-session bars have no new-session materialization')
-  store.upsert(key, response(13, [bar(1)], { error: '' }, 'collector-a'))
-  assert.equal(store.materializedWindow(key, hour, hour, 1), null)
-  store.upsert(key, response(2, [bar(1)], { error: '' }, 'collector-b'))
-  assert.equal(store.materializedWindow(key, hour, hour, 1)?.revision, 2)
-})
-
-test('a same-window cache preview cannot overwrite active statistics status', () => {
-  const store = new ChartSeriesStore<Bar, Status>()
-  const key = '1H:BTC-USDT-SWAP'
-  store.upsert(key, response(10, [bar(1)], { error: '', statisticsState: 'loading', oiState: 'loading', takerState: 'ready' }))
-  const preview: Response = {
-    ...response(11, [bar(1, 202)], { error: '', statisticsState: 'ready', oiState: 'ready', takerState: 'ready' }),
-    statusAuthoritative: false,
+test('only an exact contiguous prepared 96-candle window is renderable', () => {
+  const store = new PreparedChartStore()
+  store.ingest(response(bars(0, 95), { latestEnd: 95 * hour }))
+  assert.equal(store.window(instId, '1H'), null)
+  for (const invalid of [
+    { ...bar(95), confirmed: false },
+    { ...bar(95), statisticsSources: 1 },
+    { ...bar(95), indicatorsObserved: false },
+    { ...bar(95), statisticsObserved: false },
+    { ...bar(95), statisticsObserved: undefined },
+    { ...bar(95), high: 90 },
+  ]) {
+    store.ingest(response([invalid as PreparedChartBar], { revision: 2, latestEnd: 95 * hour }))
+    assert.equal(store.window(instId, '1H'), null, 'Aggregate ready statuses cannot authorize an unprepared sample.')
   }
-  const result = store.upsert(key, preview)
-  assert.equal(result.entry?.bars[0]?.close, 202)
-  assert.equal(result.entry?.status.statisticsState, 'loading')
-  assert.equal(result.entry?.status.oiState, 'loading')
-  assert.equal(result.entry?.status.takerState, 'ready')
+  store.ingest(response([bar(95)], { revision: 3 }))
+  const ready = store.window(instId, '1H')!
+  assert.equal(ready.bars.length, 96)
+  assert.deepEqual(ready.bars.map(value => value.hour), Array.from({ length: 96 }, (_, index) => index * hour))
+  assert.equal(store.window(instId, '1H', 96 * hour), null, 'The cache never substitutes a nearby window.')
 })
 
-test('retains every primary series instead of evicting a rendered 1H target for other keys', () => {
-  const store = new ChartSeriesStore<Bar, Status>()
-  const selected = '1H:BTC-USDT-SWAP'
-  store.upsert(selected, response(1, [bar(1)]))
-
-  for (let index = 0; index < 32; index++) {
-    store.upsert(`1H:PREVIEW-${index}-USDT-SWAP`, response(1, [bar(index + 10)]))
-  }
-
-  assert.equal(store.size, 33)
-  assert.equal(store.get(selected)?.bars[0]?.hour, hour)
-  assert.equal(store.hasBars(selected), true)
+test('availability belongs to each window and explicitly observed nulls are complete data', () => {
+  const store = new PreparedChartStore()
+  const values = bars(0, 200)
+  values[2] = bar(2, hour, { oi: null, ema: null })
+  values[3] = bar(3, hour, { buy: null, sell: null })
+  values[5] = bar(5, hour, { buy: 0, sell: 0 })
+  store.ingest(response(values, { oiState: 'unavailable', takerState: 'unavailable', indicatorState: 'unavailable' }))
+  const older = store.window(instId, '1H', 95 * hour)!
+  assert.equal(older.oiState, 'unavailable')
+  assert.equal(older.takerState, 'unavailable')
+  assert.equal(older.indicatorState, 'unavailable')
+  assert.deepEqual([older.bars[5].buy, older.bars[5].sell], [0, 0])
+  const latest = store.window(instId, '1H')!
+  assert.equal(latest.oiState, 'ready')
+  assert.equal(latest.takerState, 'ready')
+  assert.equal(latest.indicatorState, 'ready')
 })
 
-test('a new collector session keeps old bars through an empty reply, then replaces them atomically', () => {
-  const store = new ChartSeriesStore<Bar, Status>()
-  const key = '1H:BTC-USDT-SWAP'
-  store.upsert(key, response(20, [bar(1, 101), bar(2, 102)], { error: '' }, 'collector-a'))
-
-  const pending = store.upsert(key, response(1, [], { error: 'warming', candleState: 'loading' }, 'collector-b'))
-  assert.equal(pending.accepted, true)
-  assert.deepEqual(pending.entry?.bars.map(value => value.close), [101, 102])
-  assert.equal(pending.entry?.serviceSession, 'collector-b')
-  assert.equal(pending.entry?.barsServiceSession, 'collector-a')
-  assert.equal(pending.entry?.status.candleState, 'loading')
-
-  const lateOldSession = store.upsert(key, response(21, [bar(3, 999)], { error: '' }, 'collector-a'))
-  assert.equal(lateOldSession.accepted, false)
-  assert.deepEqual(lateOldSession.entry?.bars.map(value => value.close), [101, 102])
-
-  const refreshed = store.upsert(key, response(2, [bar(3, 303)], { error: '' }, 'collector-b'))
-  assert.equal(refreshed.accepted, true)
-  assert.deepEqual(refreshed.entry?.bars.map(value => value.close), [303])
-  assert.equal(refreshed.entry?.barsServiceSession, 'collector-b')
-  assert.equal(refreshed.entry?.latestKnownHour, 3 * hour)
+test('a newer indicator generation clears all old windows and rejects late old data', () => {
+  const store = new PreparedChartStore()
+  store.ingest(response(bars(0, 96), { generation: 10, revision: 50 }))
+  const prior = store.window(instId, '1H')!
+  store.ingest(response(bars(0, 48), { generation: 11, revision: 1, latestEnd: 95 * hour }))
+  assert.equal(store.window(instId, '1H'), null)
+  assert.equal(store.ingest(response(bars(0, 96), { generation: 9, revision: 1_000 })), false,
+    'A never-before-seen lower generation is stale as well.')
+  assert.equal(store.ingest(response(bars(0, 96), { generation: 10, revision: 1_001 })), false)
+  store.ingest(response(bars(48, 48).map(value => ({ ...value, ema: 200 })), { generation: 11, revision: 2 }))
+  const next = store.window(instId, '1H')!
+  assert.notEqual(next, prior)
+  assert.equal(next.bars.at(-1)?.ema, 200)
+  assert.equal(prior.bars.at(-1)?.ema, 100, 'An already presented immutable snapshot never changes underneath React.')
 })
 
-test('late replies from a retired session cannot overwrite the new canonical series', () => {
-  const store = new ChartSeriesStore<Bar, Status>()
-  const key = '1H:BTC-USDT-SWAP'
-  store.upsert(key, response(20, [bar(1, 101)], { error: '' }, 'collector-a'))
-  store.upsert(key, response(1, [bar(2, 202)], { error: '' }, 'collector-b'))
-  const stale = store.upsert(key, response(99, [bar(3, 999)], { error: '' }, 'collector-a'))
+test('reordered blocks can fill old ranges without overwriting newer observations', () => {
+  const store = new PreparedChartStore()
+  store.ingest(response(bars(0, 96), { revision: 10 }))
+  store.ingest(response([bar(50, hour, { close: 110, high: 111 })], { revision: 20 }))
+  store.ingest(response(bars(0, 201).map(value => ({ ...value, close: 105, high: 106 })), { revision: 11 }))
+  const window = store.window(instId, '1H', 95 * hour)!
+  assert.equal(window.bars[50].close, 110)
+  assert.equal(window.bars[49].close, 105)
+  assert.equal(store.latestEnd(instId, '1H'), 200 * hour)
+  assert.equal(store.snapshotMeta(instId, '1H')?.revision, 20)
+  assert.ok(store.window(instId, '1H', 200 * hour))
+})
 
-  assert.equal(stale.accepted, false)
-  assert.deepEqual(stale.entry?.bars.map(value => value.close), [202])
-  assert.equal(stale.entry?.serviceSession, 'collector-b')
+test('unchanged and distant blocks preserve memoized window identity and frozen data', () => {
+  const store = new PreparedChartStore()
+  let notifications = 0
+  const unsubscribe = store.subscribe(() => { notifications += 1 })
+  const incoming = bars(0, 96)
+  store.ingest(response(incoming))
+  const first = store.window(instId, '1H')!
+  incoming[0].close = 100.5
+  assert.equal(first.bars[0].close, 101, 'Incoming transport objects are copied before caching.')
+  store.ingest(response(bars(0, 96), { revision: 2 }))
+  assert.equal(store.window(instId, '1H'), first)
+  store.ingest(response(bars(300, 100), { revision: 3 }))
+  assert.equal(store.window(instId, '1H', 95 * hour), first)
+  store.ingest(response([bar(50, hour, { close: 110, high: 111 })], { revision: 4 }))
+  assert.notEqual(store.window(instId, '1H', 95 * hour), first)
+  assert.equal(first.bars[50].close, 101)
+  assert.ok(Object.isFrozen(first) && Object.isFrozen(first.bars) && Object.isFrozen(first.bars[0]))
+  assert.equal(notifications, 4)
+  unsubscribe()
+  store.ingest(response(bars(500, 96), { revision: 5 }))
+  assert.equal(notifications, 4)
+})
+
+test('live data stays separate from confirmed windows and never leaks into historical presentation', () => {
+  const store = new PreparedChartStore()
+  const live: Bar = { ...bar(100), confirmed: false, statisticsSources: 0, statisticsObserved: false, indicatorsObserved: false }
+  store.ingest(response(bars(0, 100), { revision: 10, liveBar: live }))
+  const historical = store.window(instId, '1H', 95 * hour)!
+  const latest = store.window(instId, '1H')!
+  assert.equal(historical.liveBar, undefined)
+  assert.equal(latest.endHour, 99 * hour)
+  assert.equal(latest.bars.at(-1)?.confirmed, true)
+  assert.equal(latest.liveBar?.confirmed, false)
+  store.ingest(response([], { revision: 11, liveBar: { ...live, close: 110, high: 111 } }))
+  assert.equal(store.window(instId, '1H', 95 * hour), historical)
+  assert.equal(store.window(instId, '1H')?.liveBar?.close, 110)
+  store.ingest(response([], { revision: 9, liveBar: live }))
+  assert.equal(store.window(instId, '1H')?.liveBar?.close, 110)
+  store.ingest(response([bar(100)], { revision: 12 }))
+  assert.equal(store.window(instId, '1H')?.endHour, 100 * hour)
+  assert.equal(store.window(instId, '1H')?.liveBar, undefined)
+})
+
+test('ready boundaries represent complete ranges and prefetch fills gaps without moving a window', () => {
+  const store = new PreparedChartStore()
+  store.ingest(response([...bars(0, 100), ...bars(200, 100)]))
+  const first = store.window(instId, '1H', 99 * hour)
+  assert.deepEqual(store.readyBoundaries(instId, '1H'), [
+    { firstEnd: 95 * hour, lastEnd: 99 * hour }, { firstEnd: 295 * hour, lastEnd: 299 * hour },
+  ])
+  assert.equal(store.hasRange(instId, '1H', 0, 99 * hour), true)
+  assert.equal(store.hasRange(instId, '1H', 0, 200 * hour), false)
+  assert.equal(store.window(instId, '1H', 180 * hour), null)
+  store.ingest(response(bars(100, 100), { revision: 2 }))
+  assert.deepEqual(store.readyBoundaries(instId, '1H'), [{ firstEnd: 95 * hour, lastEnd: 299 * hour }])
+  assert.equal(store.window(instId, '1H', 99 * hour), first)
+  assert.ok(store.window(instId, '1H', 180 * hour))
+})
+
+test('instrument and native timeframe caches have independent generations and history bounds', () => {
+  const store = new PreparedChartStore()
+  store.ingest(response(bars(0, 100), { generation: 20, historyExhausted: true }))
+  store.ingest(response(bars(0, 100, 300_000), { timeframe: '5m', intervalMS: 300_000, generation: 1, latestEnd: 99 * 300_000, oldestHour: 0 }))
+  store.ingest(response(bars(0, 100), { instId: 'ETH-USDT-SWAP', generation: 1 }))
+  assert.equal(store.size, 3)
+  assert.equal(store.window(instId, '5m')?.intervalMS, 300_000)
+  assert.equal(store.snapshotMeta(instId, '1H')?.historyExhausted, true)
+  assert.equal(store.snapshotMeta(instId, '5m')?.historyExhausted, false)
+  assert.equal(store.oldestHour(instId, '1H'), 0)
+  assert.equal(store.ingest(response(bars(0, 96), { timeframe: '5m', intervalMS: hour })), false)
+  assert.ok(store.window('ETH-USDT-SWAP', '1H'))
+})
+
+test('an updated source-unavailability reason replaces only the affected immutable window', () => {
+  const store = new PreparedChartStore()
+  const values = bars(0, 200)
+  values[10] = bar(10, hour, { oi: null, oiUnavailableReason: 'not-published' })
+  store.ingest(response(values))
+  const older = store.window(instId, '1H', 95 * hour)!
+  const latest = store.window(instId, '1H')
+  store.ingest(response([bar(10, hour, { oi: null, oiUnavailableReason: 'outside-retention' })], { revision: 2 }))
+  const updated = store.window(instId, '1H', 95 * hour)!
+  assert.notEqual(updated, older)
+  assert.equal(updated.bars[10].oiUnavailableReason, 'outside-retention')
+  assert.equal(older.bars[10].oiUnavailableReason, 'not-published')
+  assert.equal(store.window(instId, '1H'), latest)
+})
+
+test('bar pressure preserves the requested exact window and an evicted revisit never returns partial data', () => {
+  const store = new PreparedChartStore({ maxBarsPerSeries: 128 })
+  store.ingest(response(bars(0, 201), { endHour: 100 * hour, oldestHour: 0 }))
+  const held = store.window(instId, '1H', 100 * hour)!
+  assert.equal(held.bars.length, 96)
+  assert.equal(held.bars[0].hour, 5 * hour, 'The requested window must survive a wider response containing nearer future samples.')
+  assert.equal(store.hasRange(instId, '1H', 5 * hour, 100 * hour), true)
+  assert.equal(store.window(instId, '1H', 200 * hour), null)
+  store.ingest(response(bars(300, 201), { endHour: 400 * hour, revision: 2, oldestHour: 0 }))
+  assert.equal(store.window(instId, '1H', 100 * hour), null)
+  assert.equal(store.window(instId, '1H', 400 * hour)?.bars.length, 96)
+  assert.ok(store.readyBoundaries(instId, '1H').every(range => range.firstEnd > 100 * hour), 'Eviction must discard old ready boundaries and memoized windows.')
+  assert.equal(store.oldestHour(instId, '1H'), 0, 'A resident cache edge must not replace the proven provider boundary.')
+  store.ingest(response(bars(5, 96).map(value => ({ ...value, close: 110, high: 111 })), { revision: 3, endHour: 100 * hour, latestEnd: 500 * hour }))
+  const revisited = store.window(instId, '1H', 100 * hour)!
+  assert.equal(revisited.bars.length, 96)
+  assert.ok(revisited.bars.every(value => value.close === 110))
+  assert.ok(held.bars.every(value => value.close === 101))
+  assert.ok(Object.isFrozen(held) && Object.isFrozen(held.bars))
+})
+
+test('series LRU honors metadata and window reads while evicted snapshots stay immutable', () => {
+  const store = new PreparedChartStore({ maxSeries: 2 })
+  const eth = 'ETH-USDT-SWAP', sol = 'SOL-USDT-SWAP'
+  store.ingest(response(bars(0, 96)))
+  const btcWindow = store.window(instId, '1H')!
+  store.ingest(response(bars(100, 96), { instId: eth }))
+  const heldETH = store.window(eth, '1H')!
+  store.snapshotMeta(instId, '1H')
+  store.ingest(response(bars(200, 96), { instId: sol }))
+  assert.equal(store.size, 2)
+  assert.equal(store.window(eth, '1H'), null, 'A recently used BTC metadata view must keep BTC ahead of the older ETH series.')
+  assert.equal(store.window(instId, '1H'), btcWindow)
+  store.ingest(response(bars(100, 96).map(value => ({ ...value, close: 150, high: 151 })), { instId: eth, revision: 2 }))
+  assert.equal(store.size, 2)
+  assert.equal(store.window(sol, '1H'), null, 'Reading the BTC window must promote its series before the revisit.')
+  assert.ok(store.window(eth, '1H')?.bars.every(value => value.close === 150))
+  assert.ok(heldETH.bars.every(value => value.close === 101))
+})
+
+test('window memo LRU remains bounded without changing complete cached values', () => {
+  const store = new PreparedChartStore({ maxWindowsPerSeries: 2 })
+  store.ingest(response(bars(0, 100)))
+  const first = store.window(instId, '1H', 95 * hour)!
+  const second = store.window(instId, '1H', 96 * hour)!
+  assert.equal(store.window(instId, '1H', 95 * hour), first)
+  store.window(instId, '1H', 97 * hour)
+  assert.equal(store.window(instId, '1H', 95 * hour), first, 'A memo read promotes the active window.')
+  const revisited = store.window(instId, '1H', 96 * hour)!
+  assert.notEqual(revisited, second)
+  assert.deepEqual(revisited, second)
+  assert.equal(revisited.bars.length, 96)
+  assert.ok(revisited.bars.every(value => value.confirmed && value.statisticsObserved && value.indicatorsObserved))
 })

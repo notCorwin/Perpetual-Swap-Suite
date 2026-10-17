@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
+import { assertCompletePaints, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, startPaintProbe, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
 
 const root = new URL('../..', import.meta.url).pathname
 const userData = await mkdtemp(join(tmpdir(), 'perp-radar-e2e-'))
@@ -57,17 +58,12 @@ test('preferences persist in the Electron-owned user-data directory', async () =
   assert.equal(disk.notificationsEnabled, true)
 })
 
-test('completed candles round-trip through Parquet and chart IPC', async () => {
+test('completed candles round-trip through the Electron-owned Parquet store', async () => {
   const timestamp = Date.UTC(2024, 9, 16, 12, 0)
   const seed = await request({ e2e: { action: 'seedCandles', candles: [{ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp, open: 100, high: 112, low: 99, close: 108, volume: 1234, confirmed: true }] } })
   assert.equal(seed.written, 1)
-  const chart = await request({ chartInstId: 'BTC-USDT-SWAP', timeframe: '5m', loadChart: true })
-  assert.equal(chart.timeframe, '5m')
-  assert.deepEqual(chart.bars.map(bar => [bar.hour, bar.close, bar.confirmed]), [[timestamp, 108, true]])
-  const boundary = await request({ chartInstId: 'BTC-USDT-SWAP', timeframe: '5m', chartEndHour: timestamp - 300_000 })
-  assert.equal(boundary.historyExhausted, true)
-  assert.equal(boundary.oldestHour, timestamp)
-  assert.equal(boundary.endHour, timestamp)
+  const candles = await request({ e2e: { action: 'readCandles', instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: timestamp, through: timestamp } })
+  assert.deepEqual(candles.map(candle => [candle.timestamp, candle.close, candle.confirmed]), [[timestamp, 108, true]])
 })
 
 test('clipboard, screenshot capture, analysis settings, and safe gateway cancellation work', async () => {
@@ -158,410 +154,285 @@ test('a restarted desktop restores cached catalog readings before a live scan co
   await launchElectron()
 })
 
-test('partially cached OI and Taker samples remain visibly plotted while statistics are incomplete', async () => {
-  const fixture = await request({ e2e: { action: 'seedPartialStatisticsChart' } })
-  assert.equal(fixture.visibleBars, 96)
-  assert.equal(fixture.oiSamples, 8)
-  assert.equal(fixture.takerSamples, 8)
-
-  // Reload after the test-only main-process fixture is ready so this uses the
-  // same market-list selection path a user uses, rather than only chart IPC.
-  await page.reload({ waitUntil: 'domcontentloaded' })
-  const market = page.locator(`[aria-label="View ${fixture.instId} chart"]`)
-  await market.waitFor({ state: 'visible', timeout: 10_000 })
-  await market.click()
-
-  const chart = page.locator(`[data-chart-inst="${fixture.instId}"]`)
-  await chart.waitFor({ state: 'visible' })
-  await page.waitForFunction(({ instId, start, end }) => {
-    const element = document.querySelector(`[data-chart-inst="${instId}"]`)
-    return element?.getAttribute('data-chart-start') === String(start) && element.getAttribute('data-chart-end') === String(end)
-  }, fixture)
-
-  const oi = chart.locator('[data-chart-oi="partial"]')
-  await oi.waitFor({ state: 'visible' })
-  assert.equal(await oi.locator('[data-chart-oi-sample]').count(), fixture.oiSamples)
-
-  const taker = chart.locator('[data-chart-taker="partial"]')
-  await taker.waitFor({ state: 'visible' })
-  assert.ok((await taker.locator('path').first().getAttribute('d'))?.length)
-})
-
-test('a status-only chart poll retains bars in the renderer while reporting real repair state', async () => {
-  const fixture = await request({ e2e: { action: 'seedPartialStatisticsChart' } })
-  const full = await request({ chartInstId: fixture.instId, timeframe: fixture.timeframe, chartEndHour: fixture.end })
-  assert.ok(full.bars.length > 0, 'The ordinary chart request must provide the canonical bar snapshot.')
-
-  const status = await request({ chartInstId: fixture.instId, timeframe: fixture.timeframe, chartEndHour: fixture.end, chartStatusOnly: true })
-  assert.deepEqual(status.bars, [], 'A progress poll must not serialize the chart series again.')
-  assert.equal(status.statusAuthoritative, true)
-  // The fixture has an intentionally missing indicator warm-up range. A
-  // status-only response must report its real repair state, not replace it
-  // with a false `ready` value while the renderer is still waiting.
-  assert.notEqual(status.candleState, 'ready')
-  assert.ok(['loading', 'retrying', 'unavailable', 'ready'].includes(status.statisticsState))
-})
-
-test('historical statistics recover when a newer cache preview overtakes their in-flight response', async () => {
+test('prepared native chart pages preserve canonical indicator values across every timeframe', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  await page.reload({ waitUntil: 'domcontentloaded' })
-  const targetEnd = fixture.end - 12 * fixture.intervalMS
-
-  // Reorder real native-chart replies at the IPC boundary. The initial reply
-  // represents candles loaded before statistics arrived; a newer cache-only
-  // preview then overtakes the first historical foreground read. Its older
-  // range cannot hydrate the visible window, so rejecting the foreground
-  // response must leave a retry scheduled even if React already rendered.
-  await electron.evaluate(({ ipcMain }, { instId, targetEnd }) => {
-    const original = ipcMain._invokeHandlers.get('radar:request')
-    const race = {
-      original, historicalRequests: 0, previewDelivered: false, staleDelivered: false,
-      foregroundStarted: null, releaseForeground: null,
+  await installRequestProbe(electron, fixture.instId)
+  try {
+    for (const timeframe of fixture.timeframes) {
+      const prepared = await request({ chartWindow: { instId: fixture.instId, timeframe, endHour: fixture.end } })
+      const expected = new Map(fixture.series[timeframe].bars.map(bar => [bar.hour, bar]))
+      const visible = prepared.bars.filter(bar => bar.hour >= fixture.end - 95 * fixture.series[timeframe].intervalMS && bar.hour <= fixture.end)
+      assert.equal(visible.length, 96)
+      for (const bar of visible) {
+        const oracle = expected.get(bar.hour)
+        for (const field of ['open', 'high', 'low', 'close', 'vwap', 'ema', 'logBBUpper', 'logBBMiddle', 'logBBLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell']) {
+          assert.ok(Number.isFinite(bar[field]), `${timeframe} ${bar.hour} ${field} must be initialized.`)
+          assert.ok(Math.abs(bar[field] - oracle[field]) <= Math.max(1, Math.abs(oracle[field])) * 1e-10,
+            `${timeframe} ${bar.hour} ${field} changed from its canonical initialization.`)
+        }
+        assert.equal(bar.statisticsObserved, true)
+      }
     }
-    const foregroundStarted = new Promise(resolve => { race.foregroundStarted = resolve })
-    const foregroundRelease = new Promise(resolve => { race.releaseForeground = resolve })
-    const pending = (response, revision) => ({
-      ...response, revision,
-      bars: response.bars.map(bar => ({ ...bar, oi: null, buy: null, sell: null, statisticsSources: 0, statisticsObserved: false })),
-      statisticsState: 'loading', oiState: 'loading', takerState: 'loading',
-    })
-    ipcMain.removeHandler('radar:request')
-    ipcMain.handle('radar:request', async (event, value) => {
-      if (value.chartInstId !== instId) return original(event, value)
-      if (value.preview && Number.isFinite(value.chartEndHour)) {
-        await foregroundStarted
-        const response = await original(event, value)
-        race.previewDelivered = true
-        return pending(response, 100_001)
-      }
-      if (!value.preview && value.chartEndHour === targetEnd) {
-        race.historicalRequests += 1
-        const response = await original(event, value)
-        if (race.historicalRequests === 1) {
-          race.foregroundStarted()
-          await foregroundRelease
-          race.staleDelivered = true
-          return pending(response, 100_000)
-        }
-        return { ...response, revision: 100_001 }
-      }
-      const response = await original(event, value)
-      return response.bars ? pending(response, 100_000) : response
-    })
-    globalThis.__chartStatisticsRace = race
-  }, { instId: fixture.instId, targetEnd })
-
-  try {
-    const market = page.locator(`[aria-label="View ${fixture.instId} chart"]`)
-    await market.waitFor({ state: 'visible', timeout: 10_000 })
-    await market.click()
-    const chart = page.locator(`[data-chart-inst="${fixture.instId}"]`)
-    await chart.waitFor({ state: 'visible' })
-    await page.waitForFunction(({ instId, end }) => {
-      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
-      return chart?.getAttribute('data-chart-end') === String(end)
-        && chart.getAttribute('data-chart-oi-samples') === '0'
-    }, fixture)
-
-    await chart.locator('[data-chart-plot]').dispatchEvent('wheel', { deltaY: 144 })
-    await page.waitForFunction(({ instId, end, intervalMS, targetEnd }) => {
-      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
-      return chart?.getAttribute('data-chart-end') === String(targetEnd)
-        && Number(chart.getAttribute('data-chart-cache-start')) <= end - 900 * intervalMS
-    }, { ...fixture, targetEnd })
-
-    // The preview has now committed to React while the statistics request is
-    // still in flight. Releasing its obsolete reply reproduces the lost-wake
-    // condition without relying on timing or OKX/network availability.
-    await electron.evaluate(() => globalThis.__chartStatisticsRace.releaseForeground())
-    await page.waitForFunction(({ instId, targetEnd }) => {
-      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
-      return chart?.getAttribute('data-chart-end') === String(targetEnd)
-        && chart.getAttribute('data-chart-statistics-state') === 'ready'
-        && chart.getAttribute('data-chart-oi-samples') === '96'
-        && chart.getAttribute('data-chart-taker-samples') === '96'
-        && chart.getAttribute('data-chart-loading') === 'false'
-    }, { instId: fixture.instId, targetEnd }, { timeout: 5_000 })
-    const race = await electron.evaluate(() => {
-      const race = globalThis.__chartStatisticsRace
-      return { historicalRequests: race.historicalRequests, previewDelivered: race.previewDelivered, staleDelivered: race.staleDelivered }
-    })
-    assert.equal(race.previewDelivered, true)
-    assert.equal(race.staleDelivered, true)
-    assert.ok(race.historicalRequests >= 2, 'The obsolete reply must trigger another foreground read.')
-    assert.equal(await chart.locator('[data-chart-oi="complete"]').count(), 1)
-    assert.equal(await chart.locator('[data-chart-taker="complete"]').count(), 1)
-  } finally {
-    await electron.evaluate(({ ipcMain }) => {
-      const race = globalThis.__chartStatisticsRace
-      race.releaseForeground()
-      ipcMain.removeHandler('radar:request')
-      ipcMain.handle('radar:request', race.original)
-      delete globalThis.__chartStatisticsRace
-    })
-  }
+    assert.equal((await readRequestProbe(electron)).sourceCalls, 0, 'Complete durable periods must not be downloaded again.')
+  } finally { await removeRequestProbe(electron) }
 })
 
-test('live statistics retry a failed full snapshot after a status-only completion', async () => {
+test('high velocity wheel bursts and reversals present only complete correct charts in 5m, 15m, and 1h', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  await page.reload({ waitUntil: 'domcontentloaded' })
-  await electron.evaluate(({ ipcMain }, { instId }) => {
+  await openChart(page, fixture)
+  for (const timeframe of fixture.timeframes) {
+    await selectTimeframe(page, timeframe)
+    await waitForRendered(page, fixture, timeframe)
+    await startPaintProbe(page, fixture)
+    const intervalMS = fixture.series[timeframe].intervalMS
+    await wheelBurst(page, { frames: 6, eventsPerFrame: 32, deltaY: 36 })
+    await wheelBurst(page, { frames: 3, eventsPerFrame: 32, deltaY: -36 })
+    const expectedEnd = fixture.end - 288 * intervalMS
+    await waitForRendered(page, fixture, timeframe, expectedEnd)
+    await wheelBurst(page, { deltaY: 14_400 })
+    await waitForRendered(page, fixture, timeframe, expectedEnd - 1_200 * intervalMS)
+    assertCompletePaints(await finishPaintProbe(page))
+  }
+})
+
+test('a held history read keeps the last complete paint and coalesces every later wheel event into the latest target', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await openChart(page, fixture)
+  await startPaintProbe(page, fixture)
+  await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
+  try {
+    await wheelBurst(page, { deltaY: 14_400 })
+    await waitFor(async () => (await readRequestProbe(electron)).held)
+    await wheelBurst(page, { frames: 4, eventsPerFrame: 32, deltaY: 12 })
+    await wheelBurst(page, { frames: 2, eventsPerFrame: 32, deltaY: -12 })
+    const expectedEnd = fixture.end - 1_264 * fixture.intervalMS
+    await page.waitForFunction(({ instId, expectedEnd }) => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+      return Number(chart?.getAttribute('data-chart-requested-end')) === expectedEnd
+        && chart.getAttribute('data-chart-loading') === 'true'
+    }, { instId: fixture.instId, expectedEnd })
+    const held = await readRequestProbe(electron)
+    assert.equal(held.active, 1)
+    assert.equal(held.maxActive, 1, 'Wheel events may not create a parallel request storm.')
+    assert.equal(held.calls.length, 1, 'Only the active read may cross IPC while it is held.')
+    const svg = page.locator(`svg[data-rendered-inst="${fixture.instId}"]`)
+    assert.equal(Number(await svg.getAttribute('data-rendered-end')), fixture.end)
+    assert.match(await page.locator(`[data-chart-inst="${fixture.instId}"]`).textContent(), /Preparing/)
+    await releaseRequestProbe(electron)
+    await waitForRendered(page, fixture, fixture.timeframe, expectedEnd)
+    await page.evaluate(async () => { for (let index = 0; index < 8; index += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
+    const report = await finishPaintProbe(page)
+    assertCompletePaints(report)
+    assert.equal(report.commits.at(-1).end, expectedEnd)
+    const requests = await readRequestProbe(electron)
+    assert.equal(requests.maxActive, 1)
+    assert.equal(requests.sourceCalls, 0)
+    assert.ok(requests.calls.length <= 12, `Coalesced history work unexpectedly issued ${requests.calls.length} requests.`)
+    assert.ok(!report.commits.some(commit => commit.end === fixture.end - 1_200 * fixture.intervalMS), 'The obsolete held target was presented after a newer input.')
+  } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
+})
+
+test('a late history response cannot overwrite a more recently selected timeframe', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await openChart(page, fixture)
+  for (const timeframe of fixture.timeframes) {
+    await selectTimeframe(page, timeframe)
+    await waitForRendered(page, fixture, timeframe)
+  }
+  await startPaintProbe(page, fixture)
+  await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
+  try {
+    await wheelBurst(page, { deltaY: 14_400 })
+    await waitFor(async () => (await readRequestProbe(electron)).held)
+    await selectTimeframe(page, '5m')
+    await selectTimeframe(page, '15m')
+    await releaseRequestProbe(electron)
+    await waitForRendered(page, fixture, '15m')
+    await page.evaluate(async () => { for (let index = 0; index < 8; index += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
+    const report = await finishPaintProbe(page)
+    assertCompletePaints(report)
+    assert.equal(report.commits.at(-1).timeframe, '15m')
+    const final15m = report.commits.findIndex(commit => commit.timeframe === '15m')
+    assert.ok(final15m >= 0)
+    assert.ok(report.commits.slice(final15m).every(commit => commit.timeframe === '15m'), 'An older timeframe repainted after the selected chart was ready.')
+    assert.equal((await readRequestProbe(electron)).sourceCalls, 0)
+  } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
+})
+
+test('the live price overlay follows its actual price without changing the 96 completed candles', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  const visible = fixture.series[fixture.timeframe].bars.slice(-96)
+  const prices = visible.flatMap(bar => ['low', 'high', 'vwap', 'ema', 'logBBUpper', 'logBBMiddle', 'logBBLower'].map(field => bar[field]))
+  // A geometric midpoint must land at the center of a logarithmic price axis,
+  // including symmetric axis padding. This expectation does not reuse Plot.
+  const livePrice = Math.sqrt(Math.min(...prices) * Math.max(...prices))
+  await electron.evaluate(({ ipcMain }, { instId, livePrice }) => {
     const original = ipcMain._invokeHandlers.get('radar:request')
-    const race = { original, initialPoll: false, statusReplies: 0, fullFailures: 0, recoveredReads: 0 }
-    const pending = response => ({
-      ...response, revision: 200_000,
-      bars: response.bars.map(bar => ({ ...bar, oi: null, buy: null, sell: null, statisticsSources: 0, statisticsObserved: false })),
-      statisticsState: 'loading', oiState: 'loading', takerState: 'loading',
-    })
     ipcMain.removeHandler('radar:request')
     ipcMain.handle('radar:request', async (event, value) => {
-      if (value.chartInstId !== instId || value.preview || value.chartEndHour !== undefined) return original(event, value)
-      if (value.loadChart) return pending(await original(event, value))
-      if (value.sinceRevision !== undefined) {
-        const first = !race.initialPoll
-        race.initialPoll = true
-        const response = await original(event, value)
-        if (first) return pending(response)
-        race.statusReplies += 1
-        return {
-          ...response, bars: [], revision: 200_001,
-          statisticsState: 'ready', oiState: 'ready', takerState: 'ready', statusAuthoritative: true,
-        }
-      }
-      // Source completion has reached the status transport, but has not yet
-      // reached the renderer's bars. One transient full-read failure must not
-      // make the next poll claim that those newer bars were materialized.
-      if (race.statusReplies && !race.fullFailures) {
-        race.fullFailures += 1
-        throw new Error('Transient full chart snapshot failure')
-      }
       const response = await original(event, value)
-      race.recoveredReads += 1
-      return { ...response, revision: 200_001 }
+      if (value.chartWindow?.instId !== instId || value.chartWindow.endHour !== undefined) return response
+      const last = response.bars.find(bar => bar.hour === response.endHour)
+      return { ...response, liveBar: {
+        ...last, hour: response.endHour + response.intervalMS,
+        open: livePrice * .999, high: livePrice * 1.001, low: livePrice * .998, close: livePrice,
+        confirmed: false, statisticsObserved: false, oi: null, buy: null, sell: null,
+      } }
     })
-    globalThis.__liveChartStatisticsRace = race
-  }, fixture)
-
+    globalThis.__liveOverlayOriginal = original
+  }, { instId: fixture.instId, livePrice })
   try {
-    const market = page.locator(`[aria-label="View ${fixture.instId} chart"]`)
-    await market.waitFor({ state: 'visible', timeout: 10_000 })
-    await market.click()
-    const chart = page.locator(`[data-chart-inst="${fixture.instId}"]`)
-    await chart.waitFor({ state: 'visible' })
-    await page.waitForFunction(({ instId, end }) => {
-      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
-      return chart?.getAttribute('data-chart-end') === String(end)
-        && chart.getAttribute('data-chart-statistics-state') === 'ready'
-        && chart.getAttribute('data-chart-oi-samples') === '96'
-        && chart.getAttribute('data-chart-taker-samples') === '96'
-        && chart.getAttribute('data-chart-loading') === 'false'
-    }, fixture, { timeout: 5_000 })
-    const race = await electron.evaluate(() => {
-      const race = globalThis.__liveChartStatisticsRace
-      return { statusReplies: race.statusReplies, fullFailures: race.fullFailures, recoveredReads: race.recoveredReads }
+    await openChart(page, fixture)
+    await startPaintProbe(page, fixture)
+    const overlay = await page.evaluate(() => {
+      const chart = document.querySelector('[data-chart-inst]')
+      const svg = chart.querySelector('svg[data-rendered-inst]')
+      const snapshot = chart.__chartSnapshot
+      const horizontalBorders = [...svg.querySelectorAll(':scope > line')].filter(line =>
+        line.getAttribute('stroke') === 'var(--border)' && line.y1.baseVal.value === line.y2.baseVal.value
+        && line.x1.baseVal.value !== line.x2.baseVal.value)
+      const line = svg.querySelector('[data-chart-live-price]')
+      return {
+        bars: snapshot.bars.length, allConfirmed: snapshot.bars.every(bar => bar.confirmed),
+        liveConfirmed: snapshot.liveBar?.confirmed, liveHour: snapshot.liveBar?.hour,
+        lineY: Number(line?.getAttribute('y1')),
+        expectedY: (Number(horizontalBorders[0].getAttribute('y1')) + Number(horizontalBorders[1].getAttribute('y1'))) / 2,
+        countdown: svg.querySelector('[data-chart-countdown]')?.textContent,
+      }
     })
-    assert.equal(race.fullFailures, 1)
-    assert.ok(race.statusReplies >= 2, 'The renderer must poll again after the failed full read.')
-    assert.ok(race.recoveredReads >= 1, 'A later full read must materialize the completed statistics.')
-    assert.equal(await chart.locator('[data-chart-oi="complete"]').count(), 1)
-    assert.equal(await chart.locator('[data-chart-taker="complete"]').count(), 1)
+    assert.equal(overlay.bars, 96)
+    assert.equal(overlay.allConfirmed, true)
+    assert.equal(overlay.liveConfirmed, false)
+    assert.equal(overlay.liveHour, fixture.end + fixture.intervalMS)
+    assert.ok(Math.abs(overlay.lineY - overlay.expectedY) < 1e-6, `The live price line must use its logarithmic price coordinate: ${JSON.stringify(overlay)}`)
+    assert.match(overlay.countdown ?? '', /^\d{2}:\d{2}$/)
+    await wheelBurst(page, { deltaY: 12 })
+    await waitForRendered(page, fixture, fixture.timeframe, fixture.end - fixture.intervalMS)
+    assert.equal(await page.locator('[data-chart-countdown]').count(), 0, 'Historical charts must not display a live countdown.')
+    assert.equal(await page.evaluate(() => document.querySelector('[data-chart-inst]').__chartSnapshot.liveBar), undefined)
+    assertCompletePaints(await finishPaintProbe(page))
   } finally {
     await electron.evaluate(({ ipcMain }) => {
-      const race = globalThis.__liveChartStatisticsRace
       ipcMain.removeHandler('radar:request')
-      ipcMain.handle('radar:request', race.original)
-      delete globalThis.__liveChartStatisticsRace
+      ipcMain.handle('radar:request', globalThis.__liveOverlayOriginal)
+      delete globalThis.__liveOverlayOriginal
     })
   }
 })
 
-test('older source gaps explain the OKX retention limit without plotting false zero Taker volume', async () => {
+test('known RSI segments remain visible through indicator warm-up and internal missing samples', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  const first = fixture.end - 95 * fixture.intervalMS
+  const warmupThrough = first + 5 * fixture.intervalMS
+  const interiorGap = first + 50 * fixture.intervalMS
+  fixture.series[fixture.timeframe].bars = fixture.series[fixture.timeframe].bars.map(bar => ({
+    ...bar,
+    rsi6: bar.hour >= first && bar.hour <= warmupThrough ? null : bar.rsi6,
+    rsi12: bar.hour >= first && bar.hour <= warmupThrough || bar.hour === interiorGap ? null : bar.rsi12,
+  }))
+  await electron.evaluate(({ ipcMain }, { instId, timeframe, first, warmupThrough, interiorGap }) => {
+    const original = ipcMain._invokeHandlers.get('radar:request')
+    ipcMain.removeHandler('radar:request')
+    ipcMain.handle('radar:request', async (event, value) => {
+      const response = await original(event, value)
+      if (value.chartWindow?.instId !== instId || value.chartWindow.timeframe !== timeframe) return response
+      return { ...response, bars: response.bars.map(bar => ({
+        ...bar,
+        rsi6: bar.hour >= first && bar.hour <= warmupThrough ? null : bar.rsi6,
+        rsi12: bar.hour >= first && bar.hour <= warmupThrough || bar.hour === interiorGap ? null : bar.rsi12,
+      })) }
+    })
+    globalThis.__indicatorWarmupOriginal = original
+  }, { instId: fixture.instId, timeframe: fixture.timeframe, first, warmupThrough, interiorGap })
+  try {
+    await openChart(page, fixture)
+    await startPaintProbe(page, fixture)
+    const paths = await page.evaluate(() => {
+      const svg = document.querySelector('svg[data-rendered-inst]')
+      const path = key => svg.querySelector(`[data-chart-indicator="${key}"]`)?.getAttribute('d') ?? ''
+      const rsi6 = path('rsi6'), rsi12 = path('rsi12'), rsi24 = path('rsi24')
+      const rsi6Label = [...svg.querySelectorAll('text')].find(node => node.textContent === 'RSI(6)')
+      const commands = value => value.match(/[ML][^ML]+/g) ?? []
+      const x = command => Number.parseFloat(command.slice(1))
+      return {
+        rsi6, rsi12, rsi6Legend: rsi6Label?.parentElement?.querySelectorAll('text')[1]?.textContent,
+        rsi6Points: commands(rsi6).length, rsi12Points: commands(rsi12).length,
+        rsi6Segments: (rsi6.match(/M/g) ?? []).length, rsi12Segments: (rsi12.match(/M/g) ?? []).length,
+        firstKnownX: commands(rsi6).length ? x(commands(rsi6)[0]) : null,
+        expectedFirstKnownX: commands(rsi24).length >= 8 ? x(commands(rsi24)[7]) : null,
+      }
+    })
+    assert.ok(paths.rsi6.length > 0, 'Six initial nulls must not hide the following 90 known RSI values.')
+    assert.equal(paths.rsi6Points, 90)
+    assert.equal(paths.rsi6Segments, 1)
+    assert.equal(paths.rsi6Legend, fixture.series[fixture.timeframe].bars.at(-1).rsi6.toFixed(1), 'The latest known RSI reading must remain visible in its legend.')
+    assert.equal(paths.firstKnownX, paths.expectedFirstKnownX, 'The known curve must begin at candle 7 rather than extend over warm-up samples.')
+    assert.equal(paths.rsi12Points, 89)
+    assert.equal(paths.rsi12Segments, 2, 'The curve must start a new segment after an interior missing sample.')
+    assert.doesNotMatch(paths.rsi6 + paths.rsi12, /NaN|Infinity|undefined/)
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)))
+    assertCompletePaints(await finishPaintProbe(page))
+  } finally {
+    await electron.evaluate(({ ipcMain }) => {
+      ipcMain.removeHandler('radar:request')
+      ipcMain.handle('radar:request', globalThis.__indicatorWarmupOriginal)
+      delete globalThis.__indicatorWarmupOriginal
+    })
+  }
+})
+
+test('a newly listed contract with fewer than 96 completed candles explains the limit and stops retrying', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await electron.evaluate(({ ipcMain }, fixture) => {
+    const original = ipcMain._invokeHandlers.get('radar:request')
+    const probe = { original, calls: 0 }
+    ipcMain.removeHandler('radar:request')
+    ipcMain.handle('radar:request', (event, value) => {
+      if (value.chartWindow?.instId !== fixture.instId) return original(event, value)
+      probe.calls += 1
+      return {
+        instId: fixture.instId, timeframe: value.chartWindow.timeframe, intervalMS: fixture.intervalMS,
+        endHour: null, latestEnd: null, oldestHour: fixture.end - 11 * fixture.intervalMS,
+        historyExhausted: true, generation: 1, revision: 900_000, bars: [],
+        oiState: 'unavailable', takerState: 'unavailable', indicatorState: 'unavailable', error: '',
+        unavailable: { reason: 'insufficient-history', availableCandles: 12, requiredCandles: 96, retryAt: Date.now() + 60_000 },
+      }
+    })
+    globalThis.__insufficientChartProbe = probe
+  }, { instId: fixture.instId, end: fixture.end, intervalMS: fixture.intervalMS })
+  try {
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click({ timeout: 15_000 })
+    await selectTimeframe(page, fixture.timeframe)
+    const chart = page.locator(`[data-chart-inst="${fixture.instId}"]`)
+    await chart.getByText('SOL-USDT has 12 completed 1h candles. A complete chart requires 96.', { exact: true }).waitFor()
+    assert.equal(await chart.getAttribute('data-chart-loading'), 'false')
+    assert.equal(await chart.locator('svg[data-rendered-inst]').count(), 0)
+    assert.equal(await chart.locator('[data-slot="spinner"]').count(), 0)
+    await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 1_100)))
+    assert.equal(await electron.evaluate(() => globalThis.__insufficientChartProbe.calls), 1, 'Known insufficient history must not become a retry loop.')
+  } finally {
+    await electron.evaluate(({ ipcMain }) => {
+      const probe = globalThis.__insufficientChartProbe
+      ipcMain.removeHandler('radar:request')
+      ipcMain.handle('radar:request', probe.original)
+      delete globalThis.__insufficientChartProbe
+    })
+  }
+})
+
+test('historically unavailable statistics remain missing instead of becoming false zero volume', async () => {
   const fixture = await request({ e2e: { action: 'seedHistoricalStatisticsBoundary' } })
-  await page.reload({ waitUntil: 'domcontentloaded' })
-  await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click()
+  await openChart(page, fixture)
+  await startPaintProbe(page, fixture)
+  await page.evaluate(async () => { await new Promise(resolve => requestAnimationFrame(resolve)) })
   const chart = page.locator(`[data-chart-inst="${fixture.instId}"]`)
-  await page.waitForFunction(({ instId, end }) => {
-    const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
-    return chart?.getAttribute('data-chart-end') === String(end)
-      && chart.getAttribute('data-chart-oi-state') === 'unavailable'
-      && chart.getAttribute('data-chart-taker-state') === 'unavailable'
-      && chart.getAttribute('data-chart-oi-samples') === '0'
-      && chart.getAttribute('data-chart-taker-samples') === '0'
-      && chart.getAttribute('data-chart-loading') === 'false'
-  }, fixture)
+  assert.equal(await chart.getAttribute('data-chart-oi-state'), 'unavailable')
+  assert.equal(await chart.getAttribute('data-chart-taker-state'), 'unavailable')
+  assert.equal(await chart.getAttribute('data-chart-oi-samples'), '0')
+  assert.equal(await chart.getAttribute('data-chart-taker-samples'), '0')
+  assert.equal(await chart.locator('[data-chart-taker="empty"]').count(), 1)
   assert.equal(await chart.getByText('OKX 1h OI history is limited to 60 days', { exact: true }).count(), 1)
   assert.equal(await chart.getByText('OKX 1h Taker history is limited to 60 days', { exact: true }).count(), 1)
-  assert.equal(await chart.locator('[data-chart-taker="empty"]').count(), 1)
-})
-
-test('an unrelated preview revision cannot strand an interior statistics gap while both sources report loading', async () => {
-  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  await page.reload({ waitUntil: 'domcontentloaded' })
-  const targetEnd = fixture.end - 12 * fixture.intervalMS
-  await electron.evaluate(({ ipcMain }, { instId, targetEnd, intervalMS }) => {
-    const original = ipcMain._invokeHandlers.get('radar:request')
-    const race = { original, fullReads: 0, statusReads: 0, revision: 300_000, releasePreview: null }
-    const previewRelease = new Promise(resolve => { race.releasePreview = resolve })
-    const partial = response => ({
-      ...response, revision: 300_000,
-      bars: response.bars.map(bar => bar.hour >= targetEnd - 35 * intervalMS && bar.hour <= targetEnd - 26 * intervalMS
-        ? { ...bar, oi: null, buy: null, sell: null, statisticsSources: 0, statisticsObserved: false } : bar),
-      statisticsState: 'loading', oiState: 'loading', takerState: 'loading',
-    })
-    ipcMain.removeHandler('radar:request')
-    ipcMain.handle('radar:request', async (event, value) => {
-      if (value.chartInstId !== instId) return original(event, value)
-      if (value.preview && value.chartEndHour !== undefined) {
-        await previewRelease
-        // This genuine older chart range ends before the visible window.
-        // It advances the series revision without materializing that window.
-        return { ...await original(event, value), revision: 300_001 }
-      }
-      const response = await original(event, value)
-      if (!response.bars || value.preview) return response
-      if (value.chartEndHour === targetEnd) {
-        if (value.chartStatusOnly) {
-          race.statusReads += 1
-          return { ...response, bars: [], revision: race.revision, statisticsState: 'loading', oiState: 'loading', takerState: 'loading' }
-        }
-        race.fullReads += 1
-        return race.fullReads === 1 ? partial(response) : { ...response, revision: race.revision }
-      }
-      return partial(response)
-    })
-    globalThis.__partialChartStatisticsRace = race
-  }, { ...fixture, targetEnd })
-
-  try {
-    await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click()
-    const chart = page.locator(`[data-chart-inst="${fixture.instId}"]`)
-    await page.waitForFunction(({ instId, end }) => {
-      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
-      return chart?.getAttribute('data-chart-end') === String(end) && chart.getAttribute('data-chart-oi-samples') === '86'
-    }, fixture)
-    await chart.locator('[data-chart-plot]').dispatchEvent('wheel', { deltaY: 144 })
-    await page.waitForFunction(({ instId, targetEnd }) => {
-      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
-      return chart?.getAttribute('data-chart-statistics-end') === String(targetEnd)
-        && chart.getAttribute('data-chart-oi-samples') === '86'
-        && chart.getAttribute('data-chart-taker-samples') === '86'
-        && chart.getAttribute('data-chart-oi-state') === 'loading'
-        && chart.getAttribute('data-chart-taker-state') === 'loading'
-    }, { ...fixture, targetEnd })
-    await electron.evaluate(() => globalThis.__partialChartStatisticsRace.releasePreview())
-    await page.waitForFunction(({ instId, end, intervalMS }) => {
-      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
-      return Number(chart?.getAttribute('data-chart-cache-start')) <= end - 900 * intervalMS
-    }, fixture)
-    // Only publish the newer progress revision after React has accepted the
-    // distant preview. Both source statuses deliberately remain Loading;
-    // the window's materialization revision must itself trigger a full read.
-    await electron.evaluate(() => { globalThis.__partialChartStatisticsRace.revision = 300_001 })
-    await page.waitForFunction(({ instId, targetEnd }) => {
-      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
-      return chart?.getAttribute('data-chart-end') === String(targetEnd)
-        && chart.getAttribute('data-chart-oi-samples') === '96'
-        && chart.getAttribute('data-chart-taker-samples') === '96'
-        && chart.getAttribute('data-chart-statistics-state') === 'ready'
-        && chart.getAttribute('data-chart-loading') === 'false'
-    }, { ...fixture, targetEnd }, { timeout: 5_000 })
-    const race = await electron.evaluate(() => {
-      const race = globalThis.__partialChartStatisticsRace
-      return { fullReads: race.fullReads, statusReads: race.statusReads }
-    })
-    assert.ok(race.statusReads > 0)
-    assert.equal(race.fullReads, 2, 'One new active-window revision requires one materialized read.')
-    assert.equal(await chart.locator('[data-chart-oi="complete"]').count(), 1)
-    assert.equal(await chart.locator('[data-chart-taker="complete"]').count(), 1)
-  } finally {
-    await electron.evaluate(({ ipcMain }) => {
-      const race = globalThis.__partialChartStatisticsRace
-      race.releasePreview()
-      ipcMain.removeHandler('radar:request')
-      ipcMain.handle('radar:request', race.original)
-      delete globalThis.__partialChartStatisticsRace
-    })
-  }
-})
-
-test('a same-revision loading status periodically reconciles an incomplete visible snapshot', async () => {
-  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  await page.reload({ waitUntil: 'domcontentloaded' })
-  const targetEnd = fixture.end - 12 * fixture.intervalMS
-  await electron.evaluate(({ ipcMain }, { instId, targetEnd, intervalMS }) => {
-    const original = ipcMain._invokeHandlers.get('radar:request')
-    const { MarketService } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/services/market-service.js')
-    const originalGet = MarketService.prototype.get
-    const race = { original, MarketService, originalGet, fullReads: 0, statusReads: 0, sourceCalls: 0, firstReadAt: 0, refreshAfterMS: null }
-    MarketService.prototype.get = function (path, parameters, ...rest) {
-      if (parameters?.instId === instId && (path.endsWith('/open-interest-history') || path.endsWith('/taker-volume-contract'))) race.sourceCalls += 1
-      return originalGet.call(this, path, parameters, ...rest)
-    }
-    const partial = response => ({
-      ...response, revision: 400_000,
-      bars: response.bars.map(bar => bar.hour >= targetEnd - 35 * intervalMS && bar.hour <= targetEnd - 26 * intervalMS
-        ? { ...bar, oi: null, buy: null, sell: null, statisticsSources: 0, statisticsObserved: false } : bar),
-      statisticsState: 'loading', oiState: 'loading', takerState: 'loading',
-    })
-    ipcMain.removeHandler('radar:request')
-    ipcMain.handle('radar:request', async (event, value) => {
-      const response = await original(event, value)
-      if (value.chartInstId !== instId || !response.bars || value.preview) return response
-      if (value.chartEndHour === targetEnd) {
-        if (value.chartStatusOnly) {
-          race.statusReads += 1
-          return { ...response, bars: [], revision: 400_000, statisticsState: 'loading', oiState: 'loading', takerState: 'loading' }
-        }
-        race.fullReads += 1
-        if (race.fullReads === 1) {
-          race.firstReadAt = Date.now()
-          return partial(response)
-        }
-        race.refreshAfterMS = Date.now() - race.firstReadAt
-        return { ...response, revision: 400_000 }
-      }
-      return partial(response)
-    })
-    globalThis.__sameRevisionChartRace = race
-  }, { ...fixture, targetEnd })
-
-  try {
-    await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click()
-    const chart = page.locator(`[data-chart-inst="${fixture.instId}"]`)
-    await page.waitForFunction(({ instId, end }) => document.querySelector(`[data-chart-inst="${instId}"]`)?.getAttribute('data-chart-end') === String(end), fixture)
-    await chart.locator('[data-chart-plot]').dispatchEvent('wheel', { deltaY: 144 })
-    await page.waitForFunction(({ instId, targetEnd }) => {
-      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
-      return chart?.getAttribute('data-chart-statistics-end') === String(targetEnd)
-        && chart.getAttribute('data-chart-oi-samples') === '86'
-        && chart.getAttribute('data-chart-taker-samples') === '86'
-    }, { ...fixture, targetEnd })
-    await page.waitForFunction(({ instId, targetEnd }) => {
-      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
-      return chart?.getAttribute('data-chart-end') === String(targetEnd)
-        && chart.getAttribute('data-chart-oi-samples') === '96'
-        && chart.getAttribute('data-chart-taker-samples') === '96'
-        && chart.getAttribute('data-chart-statistics-state') === 'ready'
-        && chart.getAttribute('data-chart-loading') === 'false'
-    }, { ...fixture, targetEnd }, { timeout: 5_000 })
-    const race = await electron.evaluate(() => {
-      const race = globalThis.__sameRevisionChartRace
-      return { fullReads: race.fullReads, statusReads: race.statusReads, sourceCalls: race.sourceCalls, refreshAfterMS: race.refreshAfterMS }
-    })
-    assert.equal(race.fullReads, 2, 'A partial same-revision snapshot needs one bounded cache reread.')
-    assert.ok(race.statusReads > 0)
-    assert.equal(race.sourceCalls, 0, 'Reconciling a persisted gap must not download OI/Taker again.')
-    assert.ok(race.refreshAfterMS >= 1_000 && race.refreshAfterMS <= 1_500,
-      `The snapshot refresh must stay bounded; observed ${race.refreshAfterMS}ms.`)
-    assert.equal(await chart.locator('[data-chart-oi="complete"]').count(), 1)
-    assert.equal(await chart.locator('[data-chart-taker="complete"]').count(), 1)
-  } finally {
-    await electron.evaluate(({ ipcMain }) => {
-      const race = globalThis.__sameRevisionChartRace
-      race.MarketService.prototype.get = race.originalGet
-      ipcMain.removeHandler('radar:request')
-      ipcMain.handle('radar:request', race.original)
-      delete globalThis.__sameRevisionChartRace
-    })
-  }
+  assertCompletePaints(await finishPaintProbe(page))
 })

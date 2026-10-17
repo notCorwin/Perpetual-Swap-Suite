@@ -2,7 +2,6 @@ import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { ChartFocus } from './services/chart-focus.js'
 import { seedCachedListProjection, seedChartScrollBenchmark, seedHistoricalStatisticsBoundary } from './e2e-fixtures.js'
 import { MarketStore } from './services/market-store.js'
 import { MarketService } from './services/market-service.js'
@@ -11,18 +10,12 @@ const root = fileURLToPath(new URL('..', import.meta.url))
 const rendererURL = process.env.ELECTRON_RENDERER_URL
 const testMode = process.env.PERPETUAL_SWAP_E2E === '1'
 const e2eLiveRefresh = testMode && process.env.PERPETUAL_SWAP_E2E_LIVE_REFRESH === '1'
-const e2ePreviewDelayMS = testMode
-  ? Math.min(30_000, Math.max(0, Number(process.env.PERPETUAL_SWAP_E2E_PREVIEW_DELAY_MS) || 0))
-  : 0
-const FIVE_MINUTES = 300_000
-const HOUR = 3_600_000
 const settingsFile = () => join(app.getPath('userData'), 'settings.json')
 let window
 let marketStore
 let marketService
 let lastSnapshotTimeframe = '1H'
 const gatewayRequests = new Map()
-const chartFocus = new ChartFocus()
 let shuttingDown = false
 let shutdownComplete = false
 
@@ -78,18 +71,6 @@ async function saveSettings(value) {
   return next
 }
 
-function focusChart(instId, session, token) {
-  const accepted = chartFocus.focus(instId, session, token)
-  if (accepted.ok) marketService?.focusChart(instId, accepted.sequence)
-  return accepted
-}
-
-function focusLegacyChart(instId) {
-  const accepted = chartFocus.focusLegacy(instId)
-  if (accepted.ok) marketService?.focusChart(instId, accepted.sequence)
-  return accepted
-}
-
 function preferences(saved) {
   try { return saved.filterLibraryPreferencesJSON ? JSON.parse(saved.filterLibraryPreferencesJSON) : { favorites: [], recent: [], layout: 'sentences' } }
   catch { return { favorites: [], recent: [], layout: 'sentences' } }
@@ -137,71 +118,9 @@ async function gatewayFetch(event, value) {
   } catch (error) { gatewayRequests.delete(id); throw error }
 }
 
-async function seedPartialStatisticsChart() {
-  const instId = 'BTC-USDT-SWAP'
-  const timeframe = '1H'
-  const end = Date.UTC(2024, 11, 16, 12, 0)
-  const warmupHours = 199
-  const visibleBars = 96
-  const partialSamples = 8
-  const sourceStart = end - (visibleBars - 1 + warmupHours) * HOUR
-  const source = []
-  for (let timestamp = sourceStart; timestamp <= end + HOUR - FIVE_MINUTES; timestamp += FIVE_MINUTES) {
-    const index = (timestamp - sourceStart) / FIVE_MINUTES
-    const base = 100 + index * 0.01
-    source.push({
-      instrument: instId, timeframe: '5m', timestamp,
-      open: base, high: base + 1, low: base - 1, close: base + 0.25,
-      volume: 10, quoteVolume: 1_000, confirmed: true,
-    })
-  }
-  const statistics = Array.from({ length: visibleBars }, (_, index) => {
-    const sourceHour = warmupHours + index
-    const base = 100 + sourceHour * 0.12
-    const available = index >= visibleBars - partialSamples
-    return {
-      instrument: instId, timeframe, timestamp: end - (visibleBars - 1 - index) * HOUR,
-      open: base, high: base + 1.11, low: base - 1, close: base + 0.36,
-      volume: 120, quoteVolume: 12_000,
-      oi: available ? 1_000_000 + index * 1_000 : null,
-      buy: available ? 100_000 + index * 100 : null,
-      sell: available ? 80_000 + index * 100 : null,
-      statisticsVersion: available ? 1 : null,
-      confirmed: true,
-    }
-  })
-  await marketStore.appendCandles(source)
-  await marketStore.appendCandles(statistics)
-  const instrument = { instId, instCategory: '1', settleCcy: 'USDT', state: 'live', ctVal: '0.01', ctValCcy: 'BTC' }
-  const ticker = { instId, last: '135', open24h: '130', low24h: '99', high24h: '136', bidPx: '134.99', askPx: '135', volCcy24h: '300000' }
-  const result = { eligible: true, turnover: 40_000_000, oiUSD: 6_000_000, spread: 0.01 }
-  marketService.replaceCatalog([{ instrument, ticker, result, change24h: 3.8 }])
-  // The source fixture is already complete; keep the latest-candle fetcher
-  // out of this test so no live response can replace its deliberate gaps.
-  marketService.lastCandleHydration.set(instId, Date.now())
-  await marketService.ensureListTimeframe(timeframe)
-  await marketService.projectListEntry(instId, timeframe)
-  marketService.error = ''
-  marketService.lastRefreshAt = Date.now()
-  marketService.markChartDataChanged(instId)
-  return { instId, timeframe, end, start: end - (visibleBars - 1) * HOUR, visibleBars, oiSamples: partialSamples, takerSamples: partialSamples }
-}
-
 function unsupported(request) {
   const operation = Object.keys(request).find(key => !['copyText', 'captureChart', 'analysisSettings', 'windowTintRGB', 'previewWindowBlur'].includes(key)) ?? 'request'
   throw new Error(`Electron data service does not yet implement “${operation}”. Configure the DuckDB/Parquet service before using market data.`)
-}
-
-function chartStatisticsStatusResponse(instId, timeframe, end) {
-  return {
-    // ChartSeriesStore treats an empty authoritative response as a status
-    // update and retains the already-rendered bars. This keeps 80ms source
-    // progress polling off the DuckDB/indicator/IPC hot path.
-    bars: [], error: '', revision: marketService.dataRevision(instId), timeframe,
-    ...marketService.chartCandleStatus(instId, timeframe, end),
-    ...marketService.chartStatisticsStatus(instId, timeframe, end),
-    statusAuthoritative: true,
-  }
 }
 
 async function handleRequest(event, request) {
@@ -209,8 +128,11 @@ async function handleRequest(event, request) {
   if ('e2e' in request) {
     if (!testMode) throw new Error('The E2E desktop API is unavailable outside tests.')
     if (request.e2e.action === 'seedCandles') return { written: await marketStore.appendCandles(request.e2e.candles ?? []) }
+    if (request.e2e.action === 'readCandles') {
+      const { instrument, timeframe, from, through } = request.e2e
+      return marketStore.candles({ instrument, timeframe, from, through })
+    }
     if (request.e2e.action === 'seedCachedListProjection') return seedCachedListProjection(marketStore, marketService)
-    if (request.e2e.action === 'seedPartialStatisticsChart') return seedPartialStatisticsChart()
     if (request.e2e.action === 'seedChartScrollBenchmark') return seedChartScrollBenchmark(marketStore, marketService)
     if (request.e2e.action === 'seedHistoricalStatisticsBoundary') return seedHistoricalStatisticsBoundary(marketStore, marketService)
     if (request.e2e.action === 'settings') return settings()
@@ -229,62 +151,11 @@ async function handleRequest(event, request) {
   }
   if ('previewMarketFilters' in request) return { ...(await snapshot(request.previewMarketFilters.timeframe)), filterToken: request.previewMarketFilters.token, filterResults: {}, historyProgress: { pending: 0, completed: 0, error: '' } }
   if ('explainMarketFilters' in request) return { instId: request.explainMarketFilters.instId, filterToken: request.explainMarketFilters.token, revision: 0, trace: null }
-  if ('chartSession' in request) return { session: chartFocus.beginSession() }
-  if ('chartFocus' in request) return { ok: focusChart(request.chartFocus?.instId, request.chartFocus?.session, request.chartFocus?.token).ok }
-  if ('chartInstId' in request) {
-    const timeframe = request.timeframe ?? '1H'
-    let focused = { ok: false, sequence: undefined }
-    if (!request.preview) {
-      if (Number.isSafeInteger(request.chartFocusSession) && Number.isSafeInteger(request.chartFocusToken)) {
-        focused = focusChart(request.chartInstId, request.chartFocusSession, request.chartFocusToken)
-      } else {
-        focused = focusLegacyChart(request.chartInstId)
-      }
-    }
-    // A newer wheel position already owns this renderer session. Do not let a
-    // late IPC message add cache-only DuckDB work ahead of the visible window.
-    // Chart data revisions are per instrument: an unrelated contract's write
-    // must not force this chart to refetch.
-    if (!request.preview && !focused.ok) return { unchanged: true, error: '', revision: marketService.dataRevision(request.chartInstId) }
-    if (!request.preview && request.chartStatusOnly && Number.isFinite(request.chartEndHour)) {
-      return chartStatisticsStatusResponse(request.chartInstId, timeframe, request.chartEndHour)
-    }
-    if (request.chartEndHour === undefined && request.sinceRevision === marketService.dataRevision(request.chartInstId) && marketService.isActiveChartViewport(request.chartInstId, timeframe, undefined)) {
-      const activeEnd = marketService.activeChartViewport?.end
-      if (Number.isFinite(activeEnd)) return chartStatisticsStatusResponse(request.chartInstId, timeframe, activeEnd)
-      return { unchanged: true, error: '', revision: marketService.dataRevision(request.chartInstId) }
-    }
-    // Neighbor previews may read the local cache, but must never enqueue
-    // hydration, gap repair, or OI/Taker work ahead of the visible chart.
-    // A history preview is normally satisfied from the local store in a few
-    // milliseconds. The scroll regression needs to model a late response.
-    // Once the cursor stops at the floor, its foreground catch-up request
-    // follows the preview after a debounce, so delay both replies together.
-    // This branch is impossible outside the explicit Electron E2E mode.
-    if (e2ePreviewDelayMS && request.chartEndHour !== undefined) {
-      await new Promise(resolve => setTimeout(resolve, e2ePreviewDelayMS))
-    }
-    const chart = await marketService.bars(request.chartInstId, timeframe, request.chartEndHour, focused.ok ? { foreground: true, focusToken: focused.sequence } : { hydrate: false, repair: false, statistics: false })
-    if (chart.stale) return { unchanged: true, error: '', revision: marketService.dataRevision(request.chartInstId) }
-    const { bars } = chart
-    const intervalMS = timeframe === '5m' ? 300_000 : timeframe === '15m' ? 900_000 : 3_600_000
-    const oldestHour = bars[0]?.hour ?? null, latestHour = bars.at(-1)?.hour ?? null
-    const minimumEnd = oldestHour === null ? null : Math.min(latestHour ?? oldestHour, oldestHour + 95 * intervalMS)
-    const requestedEnd = request.chartEndHour
-    const hasFixedHistoryBoundary = chart.candleState === 'exhausted' || marketService.isHistoryExhausted(request.chartInstId)
-    const endHour = requestedEnd === undefined || minimumEnd === null || latestHour === null
-      ? undefined
-      : hasFixedHistoryBoundary ? Math.max(minimumEnd, Math.min(latestHour, requestedEnd)) : requestedEnd
-    return {
-      bars, error: '', revision: chart.revision ?? marketService.dataRevision(request.chartInstId), timeframe, oldestHour,
-      endHour, historyExhausted: requestedEnd !== undefined && minimumEnd !== null && requestedEnd <= minimumEnd && hasFixedHistoryBoundary,
-      candleState: chart.candleState, missingCandleRanges: chart.missingCandleRanges, candleRetryAt: chart.candleRetryAt,
-      statisticsState: chart.statisticsState, statisticsRetryAt: chart.statisticsRetryAt, oiState: chart.oiState, takerState: chart.takerState, statisticsEnd: chart.statisticsEnd,
-      // Preview reads are cache-only and cannot observe foreground work. The
-      // renderer may merge their bars, but must retain its active loading or
-      // retry status rather than accept these default-ready fields.
-      statusAuthoritative: !request.preview,
-    }
+  if ('chartWindow' in request) {
+    const { instId, timeframe, endHour } = request.chartWindow ?? {}
+    if (typeof instId !== 'string' || !['5m', '15m', '1H'].includes(timeframe)
+      || endHour !== undefined && !Number.isSafeInteger(endHour)) throw new Error('Invalid chart window request.')
+    return marketService.prepareChartWindow(instId, timeframe, endHour)
   }
   if ('gatewayFetch' in request) return gatewayFetch(event, request.gatewayFetch)
   if ('cancelGatewayFetch' in request) { gatewayRequests.get(request.cancelGatewayFetch)?.abort(); return { ok: true } }

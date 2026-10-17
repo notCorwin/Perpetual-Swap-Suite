@@ -8,170 +8,73 @@ import { MarketStore } from '../electron/services/market-store.js'
 const INSTRUMENT_ID = 'BTC-USDT-SWAP'
 const TIMEFRAME = '1H'
 const HOUR = 3_600_000
-const VISIBLE_CANDLES = 96
-const timeoutFromEnvironment = Number(process.env.OKX_LIVE_TIMEOUT_MS)
-const TEST_TIMEOUT = Number.isFinite(timeoutFromEnvironment) && timeoutFromEnvironment >= 10_000 ? timeoutFromEnvironment : 45_000
-const REQUEST_TIMEOUT = 12_000
-
-const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds))
-
-function requestURL(input) {
-  if (input instanceof Request) return new URL(input.url)
-  return new URL(String(input))
-}
-
-function requestSummary(requests) {
-  return requests.map(request => {
-    const search = request.url.searchParams.toString()
-    const status = request.status === null ? `error=${request.error}` : `status=${request.status}`
-    return `${request.url.pathname}${search ? `?${search}` : ''} ${status} ${request.elapsedMS}ms`
-  }).join('\n') || 'No OKX request was observed.'
-}
-
-function visibleWindow(result) {
-  const completed = result.bars.filter(bar => bar.confirmed)
-  const end = completed.at(-1)?.hour ?? null
-  if (!Number.isFinite(end)) return { end: null, bars: [] }
-  const first = end - (VISIBLE_CANDLES - 1) * HOUR
-  return { end, bars: completed.filter(bar => bar.hour >= first && bar.hour <= end) }
-}
-
-function isCompleteHourlyWindow(window) {
-  return window.end !== null
-    && window.bars.length === VISIBLE_CANDLES
-    && window.bars.every((bar, index) => bar.confirmed && bar.hour === window.end - (VISIBLE_CANDLES - 1 - index) * HOUR)
-}
-
-function hasStatistics(window) {
-  return window.bars.every(bar => Number.isFinite(bar.oi) && Number.isFinite(bar.buy) && Number.isFinite(bar.sell))
-}
-
-function fixedWindow(result, end) {
-  const first = end - (VISIBLE_CANDLES - 1) * HOUR
-  return { end, bars: result.bars.filter(bar => bar.confirmed && bar.hour >= first && bar.hour <= end) }
-}
-
-async function waitForChart(service, focusToken) {
-  const deadline = Date.now() + TEST_TIMEOUT
-  let last = null
-  while (Date.now() < deadline) {
-    const result = await service.bars(INSTRUMENT_ID, TIMEFRAME, undefined, {
-      hydrate: true,
-      repair: true,
-      statistics: true,
-      foreground: true,
-      focusToken,
-    })
-    const window = visibleWindow(result)
-    last = { result, window }
-    if (isCompleteHourlyWindow(window) && result.candleState === 'ready' && result.statisticsState === 'ready' && hasStatistics(window)) return last
-    await sleep(125)
-  }
-  const state = last
-    ? `candleState=${last.result.candleState}, statisticsState=${last.result.statisticsState}, visible=${last.window.bars.length}`
-    : 'the service did not return a chart result'
-  throw new Error(`Timed out after ${TEST_TIMEOUT}ms waiting for a complete ${TIMEFRAME} BTC chart (${state}).`)
-}
-
+const configuredTimeout = Number(process.env.OKX_LIVE_TIMEOUT_MS)
+const TEST_TIMEOUT = Number.isFinite(configuredTimeout) && configuredTimeout >= 10_000 ? configuredTimeout : 45_000
+const requests = []
 const root = await mkdtemp(join(tmpdir(), 'perp-radar-okx-live-1h-'))
 const store = await MarketStore.open(root)
-const requests = []
-const fetcher = async (input, init) => {
-  const url = requestURL(input)
-  const startedAt = Date.now()
+const fetcher = async (input, options) => {
+  const url = new URL(String(input)), started = Date.now()
   try {
-    const response = await fetch(input, init)
-    requests.push({ url, status: response.status, error: null, elapsedMS: Date.now() - startedAt })
+    const response = await fetch(input, options)
+    requests.push({ url, status: response.status, elapsedMS: Date.now() - started })
     return response
   } catch (error) {
-    requests.push({ url, status: null, error: error instanceof Error ? error.message : String(error), elapsedMS: Date.now() - startedAt })
+    requests.push({ url, error: error.message, elapsedMS: Date.now() - started })
     throw error
   }
 }
-const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: REQUEST_TIMEOUT })
-
+const service = new MarketService(store, undefined, fetcher, false, { requestTimeout: 12_000 })
+const windowBars = (result, end) => result.bars.filter(bar => bar.hour >= end - 95 * HOUR && bar.hour <= end)
+const assertPrepared = result => {
+  assert.equal(result.error, '')
+  assert.equal(result.unavailable, undefined)
+  const bars = windowBars(result, result.endHour)
+  assert.equal(bars.length, 96)
+  assert.ok(bars.every((bar, index) => bar.confirmed && bar.hour === result.endHour - (95 - index) * HOUR
+    && bar.statisticsObserved && bar.indicatorsObserved && bar.statisticsSources === 3))
+  // The most recent closed statistics feed may legitimately lag candles.
+  // Published values must be numeric; an observed null is explicitly unavailable.
+  assert.equal(result.oiState, bars.every(bar => Number.isFinite(bar.oi)) ? 'ready' : 'unavailable')
+  assert.equal(result.takerState, bars.every(bar => Number.isFinite(bar.buy) && Number.isFinite(bar.sell)) ? 'ready' : 'unavailable')
+  return bars
+}
+let timeout
 try {
-  // The public candle/statistics endpoints only need the instrument identity.
-  // Keeping this test at the service boundary avoids a cached catalogue or a
-  // synthetic transport hiding an incorrect native-timeframe request.
-  const instrument = { instId: INSTRUMENT_ID }
-  service.instruments.set(INSTRUMENT_ID, instrument)
-  const focusToken = 1
-  assert.equal(service.focusChart(INSTRUMENT_ID, focusToken), true)
-
-  const { window } = await waitForChart(service, focusToken)
-  assert.ok(isCompleteHourlyWindow(window), 'The visible 1H chart must contain exactly 96 contiguous confirmed candles.')
-  assert.ok(hasStatistics(window), 'Every visible 1H candle must have direct OI, buy, and sell contract data.')
-
+  const initial = await Promise.race([
+    service.prepareChartWindow(INSTRUMENT_ID, TIMEFRAME),
+    new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error(`Preparation exceeded ${TEST_TIMEOUT}ms.`)), TEST_TIMEOUT) }),
+  ])
+  clearTimeout(timeout)
+  const bars = assertPrepared(initial)
+  const originalCalls = requests.length
+  const returned = await service.prepareChartWindow(INSTRUMENT_ID, TIMEFRAME, initial.endHour)
+  assertPrepared(returned)
+  assert.equal(requests.length, originalCalls, 'Returning to a prepared window must reuse durable source pages.')
+  const adjacent = await service.prepareChartWindow(INSTRUMENT_ID, TIMEFRAME, initial.endHour - 12 * HOUR)
+  assertPrepared(adjacent)
+  const afterAdjacent = requests.length
+  assertPrepared(await service.prepareChartWindow(INSTRUMENT_ID, TIMEFRAME, initial.endHour))
+  assert.equal(requests.length, afterAdjacent, 'A scroll round trip must not redownload the original page.')
   const candleRequests = requests.filter(request => /\/market\/(?:candles|history-candles)$/.test(request.url.pathname))
-  const oiRequests = requests.filter(request => request.url.pathname.endsWith('/rubik/stat/contracts/open-interest-history'))
-  const takerRequests = requests.filter(request => request.url.pathname.endsWith('/rubik/stat/taker-volume-contract'))
-
-  assert.ok(candleRequests.some(request => request.url.searchParams.get('bar') === TIMEFRAME), `Expected an OKX candle request with bar=${TIMEFRAME}.\n${requestSummary(requests)}`)
-  assert.ok(candleRequests.every(request => request.url.searchParams.get('bar') === TIMEFRAME), `All chart candle requests must stay native ${TIMEFRAME}.\n${requestSummary(candleRequests)}`)
-  assert.ok(oiRequests.length > 0, `Expected an OKX open-interest request.\n${requestSummary(requests)}`)
-  assert.ok(oiRequests.every(request => request.url.searchParams.get('period') === TIMEFRAME), `Open-interest requests must use period=${TIMEFRAME}.\n${requestSummary(oiRequests)}`)
-  assert.ok(takerRequests.length > 0, `Expected an OKX taker-volume request.\n${requestSummary(requests)}`)
-  assert.ok(takerRequests.every(request => request.url.searchParams.get('period') === TIMEFRAME && request.url.searchParams.get('unit') === '1'), `Taker requests must use period=${TIMEFRAME} and unit=1.\n${requestSummary(takerRequests)}`)
-  assert.equal(requests.some(request => request.status === 429), false, `OKX rate limited the live 1H integration test.\n${requestSummary(requests)}`)
-
-  // Match the renderer's maximum one-frame wheel geometry: 144px at
-  // 12px/candle moves the chart 12 one-hour periods. Return immediately,
-  // before the neighboring source page has any reason to settle. The chart
-  // must keep the original page resident instead of aborting and downloading
-  // it again (the root cause of the visible scroll-back gap).
-  const sourceCursor = window.end + HOUR
-  const scrolledEnd = window.end - 12 * HOUR
-  assert.equal(service.focusChart(INSTRUMENT_ID, 2), true)
-  const scrolled = await service.bars(INSTRUMENT_ID, TIMEFRAME, scrolledEnd, {
-    hydrate: false,
-    repair: false,
-    statistics: true,
-    foreground: true,
-    focusToken: 2,
-  })
-  assert.ok(isCompleteHourlyWindow(fixedWindow(scrolled, scrolledEnd)), 'The 12-candle historical viewport must retain 96 native 1H candles immediately.')
-  assert.equal(service.focusChart(INSTRUMENT_ID, 3), true)
-  const returned = await service.bars(INSTRUMENT_ID, TIMEFRAME, window.end, {
-    hydrate: false,
-    repair: false,
-    statistics: true,
-    foreground: true,
-    focusToken: 3,
-  })
-  const returnedWindow = fixedWindow(returned, window.end)
-  assert.ok(isCompleteHourlyWindow(returnedWindow), 'Returning from a one-frame scroll must preserve the rendered 1H window.')
-  assert.ok(hasStatistics(returnedWindow), 'Returning from a one-frame scroll must preserve OI and Taker samples without a gap.')
-  // Give queued adjacent work a chance to begin. Its endpoint cursor may be
-  // distinct, but the original page must remain exactly one request per
-  // source throughout the round trip.
-  await sleep(150)
-  const originalOI = requests.filter(request => request.url.pathname.endsWith('/rubik/stat/contracts/open-interest-history') && Number(request.url.searchParams.get('end')) === sourceCursor)
-  const originalTaker = requests.filter(request => request.url.pathname.endsWith('/rubik/stat/taker-volume-contract') && Number(request.url.searchParams.get('end')) === sourceCursor)
-  assert.equal(originalOI.length, 1, `The original OI page was downloaded more than once after E→E−12→E.\n${requestSummary(requests)}`)
-  assert.equal(originalTaker.length, 1, `The original Taker page was downloaded more than once after E→E−12→E.\n${requestSummary(requests)}`)
-
-  console.log(JSON.stringify({
-    integration: 'okx-live-1h',
-    instrument: INSTRUMENT_ID,
-    timeframe: TIMEFRAME,
-    visibleCandles: window.bars.length,
-    visibleStart: new Date(window.bars[0].hour).toISOString(),
-    visibleEnd: new Date(window.end).toISOString(),
-    scrollBack: {
-      movedEnd: new Date(scrolledEnd).toISOString(),
-      returnedRenderedCandles: returnedWindow.bars.length,
-      originalOIRequests: originalOI.length,
-      originalTakerRequests: originalTaker.length,
-    },
-    requestCount: requests.length,
-    requests: requests.map(request => ({ path: request.url.pathname, status: request.status, elapsedMS: request.elapsedMS })),
+  assert.ok(candleRequests.length > 0)
+  assert.ok(candleRequests.every(request => request.url.searchParams.get('bar') === TIMEFRAME))
+  const sourceRequests = requests.filter(request => request.url.pathname.includes('/rubik/stat/'))
+  assert.ok(sourceRequests.some(request => request.url.pathname.endsWith('/open-interest-history')))
+  assert.ok(sourceRequests.some(request => request.url.pathname.endsWith('/taker-volume-contract')))
+  assert.ok(sourceRequests.every(request => request.url.searchParams.get('period') === TIMEFRAME))
+  assert.ok(sourceRequests.filter(request => request.url.pathname.endsWith('/taker-volume-contract')).every(request => request.url.searchParams.get('unit') === '1'))
+  assert.equal(requests.some(request => request.status === 429), false)
+  console.log(JSON.stringify({ integration: 'okx-prepared-1h', instrument: INSTRUMENT_ID, timeframe: TIMEFRAME,
+    visibleCandles: bars.length, visibleStart: new Date(bars[0].hour).toISOString(), visibleEnd: new Date(initial.endHour).toISOString(),
+    generation: initial.generation, oiState: initial.oiState, takerState: initial.takerState,
+    requests: requests.map(request => ({ path: request.url.pathname, query: request.url.search, status: request.status, error: request.error, elapsedMS: request.elapsedMS })),
   }, null, 2))
 } catch (error) {
-  const detail = `\nObserved OKX requests:\n${requestSummary(requests)}`
-  if (error instanceof Error) error.message += detail
+  if (error instanceof Error) error.message += `\nObserved requests:\n${requests.map(request => `${request.url} status=${request.status ?? request.error}`).join('\n')}`
   throw error
 } finally {
+  clearTimeout(timeout)
   await service.dispose()
   await store.close()
   await rm(root, { recursive: true, force: true })

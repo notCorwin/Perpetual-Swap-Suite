@@ -93,7 +93,7 @@ export function ResearchChart({ event, onNavigate }: { event: ResearchEvent; onN
         }} onPointerDown={e => { e.currentTarget.setPointerCapture(e.pointerId); inspect(e.clientX, e.currentTarget.getBoundingClientRect()) }} onPointerMove={e => {
           if (e.buttons & 1) { inspect(e.clientX, e.currentTarget.getBoundingClientRect()) }
         }} onPointerUp={() => setInspection(null)} onPointerCancel={() => setInspection(null)}>
-          <Plot bars={bars} liveBar={bars[bars.length - 1]} inspected={inspection} width={size.width} height={size.height} now={0} endHour={data.endHour} />
+          <Plot bars={bars} liveBar={bars[bars.length - 1]} inspected={inspection} width={size.width} height={size.height} endHour={data.endHour} />
           {data.signalHour >= data.endHour - 95 * RESEARCH_HOUR && data.signalHour <= data.endHour && (() => {
             const layout = chartLayout(size.width, size.height, chartGutter(bars, size.height).gutter)
             const x = chartHourX(data.signalHour, data.endHour, ...layout.columns.price)

@@ -1,5 +1,5 @@
 import type { StrategyProfile } from '@/suite-types'
-import type { ChartResponse } from '@/MarketChart'
+import type { ChartResponse } from '@/chart-data'
 import type { FilterMetric } from '@/rule-engine'
 import type { ExpressionTemplate } from '@/filter-expression'
 

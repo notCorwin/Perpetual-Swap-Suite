@@ -2,7 +2,7 @@
 
 [![Publish macOS Release](https://github.com/notCorwin/Perpetual-Swap-Suite/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/notCorwin/Perpetual-Swap-Suite/actions/workflows/release.yml)
 
-An Electron desktop app for discovering Bullish Setup signals on OKX perpetual swaps and researching their historical results. It covers live, non-TradFi USDT perpetual contracts. Radar supports 5m, 15m, and 1h candles from one authoritative 5m feed; Research keeps hourly execution semantics.
+An Electron desktop app for discovering Bullish Setup signals on OKX perpetual swaps and researching their historical results. It covers live, non-TradFi USDT perpetual contracts. Radar charts use native OKX 5m, 15m, and 1h candles; Research keeps hourly execution semantics.
 
 **Radar** discovers live signals. **Research** tests the same strategies against frozen data. Both modes share one strategy library, identity and revisions. Electron hosts the React dashboard behind a context-isolated preload bridge. The Electron main process stores completed market observations as partitioned Parquet files and uses DuckDB for queries. The interface is English-only. No OKX API key or local web server is required.
 
@@ -12,7 +12,7 @@ An Electron desktop app for discovering Bullish Setup signals on OKX perpetual s
 - **Visual and formula rules:** synchronized editors support AND/OR/NOT groups, calculations, candle-window conditions, event sequences, reusable values, and BTC market context. Inspect actual operands and data gaps with rule previews and market explanations.
 - **Shared strategy library:** save Universe and Bullish Setup rules together, monitor confirmed and provisional signals, and use the exact saved revisions in either mode.
 - **Reproducible research:** study Bullish Setup signals, compare frozen strategy versions, and calibrate Opportunity scores on matching setups. Review coverage, fixed-horizon Long returns, costs, funding, and signal evidence; pause, resume, and export CSVs.
-- **Interactive charts:** review 96 selected-period candles at a time with VWAP14, EMA200, Log BB, RSI, and ROC/MAROC. The 1h chart also includes OI and taker volume. Load older history, navigate contracts by keyboard, and copy charts to the clipboard.
+- **Interactive charts:** review 96 selected-period candles at a time with VWAP14, EMA200, Log BB, RSI, and ROC/MAROC. All three chart periods include native OI and taker contract volume when the source provides it. Load older history, navigate contracts by keyboard, and copy charts to the clipboard.
 - **Native macOS workflow:** optional background monitoring, menu bar controls, notifications, Start at Login, automatic updates, Light/Dark/System appearance, adjustable frosted backgrounds, and tabular numbers.
 
 ## Quick start
@@ -24,12 +24,12 @@ Running the app requires **macOS 14 or newer** and network access to OKX and Git
 The current `autobuild` package targets Apple Silicon (`arm64`). For Intel Macs, build from source.
 
 1. Open the [latest `autobuild` release](https://github.com/notCorwin/Perpetual-Swap-Suite/releases/tag/autobuild).
-2. Download and extract `Perpetual.Swap.Suite.app.tar`.
+2. Download and extract `Perpetual.Swap.Suite.app.zip`.
 3. Move `Perpetual Swap Suite.app` to Applications and launch it.
 
 The release contains an ad hoc signed app bundle. Each successful release build replaces the `autobuild` package.
 
-On first launch, the collector loads 5m history across the exchange universe and derives naturally aligned 15m and 1h candles locally. Markets and indicators appear as their data becomes available; missing readings display as `—`.
+On first launch, the collector loads market history in the background. Charts prepare native candles and statistics for the selected period. Markets and indicators appear as their data becomes available; missing readings display as `—`.
 
 ### Build the Electron app from source
 
@@ -43,7 +43,7 @@ git clone https://github.com/notCorwin/Perpetual-Swap-Suite.git
 cd Perpetual-Swap-Suite
 npm ci
 npm run app
-open "release/mac-arm64/Perpetual Swap Suite.app"
+open "dist/mac-arm64/Perpetual Swap Suite.app"
 ```
 
 `npm run app` builds the Vite renderer and packages a signed Electron `.app` with electron-builder. Use `npm run dev` for hot-reload development.
@@ -88,11 +88,15 @@ closed(every(RSI(14) > 50, 3))
 
 Click a symbol to open its chart. Hold the primary mouse button to inspect a candle, drag while holding to inspect others, and release to return to the displayed window's latest candle. Scroll to load older history; returning to the newest candle resumes automatic following.
 
-Taker Buy/Sell uses OKX's per-contract `1H` statistics in **contracts** (`unit=1`), accumulated within the selected hour. Compare the same perpetual contract, hour, and unit on OKX; coin or USDT amounts have a different scale. **Taker imbalance** is `(Buy − Sell) / (Buy + Sell) × 100%`, rather than the Buy/Sell quotient. Radar refreshes independent contracts concurrently, and the table, chart, and strategy readings share the newest observation. Unavailable current-hour data stays Unknown and is retried; completed-hour corrections are persisted, while live values stay in memory.
+Taker Buy/Sell uses OKX's per-contract statistics for the selected candle period in **contracts** (`unit=1`). Compare the same perpetual contract, period, and unit on OKX; coin or USDT amounts have a different scale. **Taker imbalance** is `(Buy − Sell) / (Buy + Sell) × 100%`, rather than the Buy/Sell quotient. Radar refreshes independent contracts concurrently, and the table, chart, and strategy readings share the newest observation. Unavailable current-hour data stays Unknown and is retried; completed-hour corrections are persisted, while live values stay in memory.
 
 OKX's [contract open-interest history](https://www.okx.com/docs-v5/en/#trading-statistics-rest-api-get-contract-open-interest-history) and [contract taker volume](https://www.okx.com/docs-v5/en/#trading-statistics-rest-api-get-contract-taker-volume) endpoints expose only their latest 1,440 periods: 5 days at 5m, 15 days at 15m, and 60 days at 1h. Older statistics remain available when already saved locally; older price candles alone cannot reconstruct them. The chart explains this limit when the selected range lacks statistics. A zero Buy/Sell pair that contradicts a positive-volume candle is treated as unavailable, rather than displayed as genuine zero activity.
 
-Latest trade prices and quotes use OKX's ticker stream with a REST fallback. Candle OHLCV comes only from OKX `5m` market candles over WebSocket/REST; a ticker never fabricates OHLC. Radar replaces repeated live 5m frames by timestamp, then derives 15m/1h Open, High, Low, Close, and summed volumes on natural UTC boundaries. A derived historical candle is accepted only when every required 5m source candle is present and confirmed. Completed corrections rebuild affected aggregates, invalidate derived indicators, and survive reopening the application.
+Candle OHLCV comes from OKX's native selected-period candle endpoints; ticker prices never fabricate OHLC. Only confirmed candles enter Parquet. The unconfirmed candle stays in memory as a separate live price overlay. Completed corrections invalidate the canonical indicator generation and survive reopening the application.
+
+Scrolling records all whole-candle movement once per animation frame and retains only the fractional remainder. The requested cursor and the displayed chart are separate: a ready target commits one immutable 96-candle snapshot; an uncached target keeps the previous complete chart visible with an explicit Preparing label. A single preparation job runs at a time, followed by the newest requested target. Intermediate requests are coalesced, and completed source work is never discarded because focus changed. Both renderer and calculation caches have explicit memory limits; inactive series are evicted and rebuilt from durable data without truncating recursive indicator history. Missing candle and statistics pages use stable 300/100-period boundaries, with shared requests and directional prefetch.
+
+A worker calculates indicators from the entire persisted contiguous native series, independently of viewport position. EMA200 starts with a 200-close arithmetic mean, then uses a multiplier of `2/201`. RSI uses Wilder smoothing with the initial mean gains/losses over its period; zero losses gives 100. Log BB(20, 2) uses the mean and population standard deviation of 20 log closes, exponentiated at mean ± two deviations. VWAP14 weights typical price `(High + Low + Close)/3` by quote volume; zero total volume is undefined. ROC9 uses signed relative close change, and MAROC9 is its nine-value arithmetic mean. Missing periods split indicator runs, and unavailable warmup values remain null. Older history or price corrections create a new generation; the renderer switches only when the current complete window has been rebuilt under that generation.
 
 **Estimated turnover** values OKX's 24-hour base-currency volume at the latest USDT trade price. It is an estimate, rather than the sum of each trade's actual notional. Indicator comparisons also require the same candle period, price source, formula, and warmup history; Log BB and VWAP14 retain this application's documented definitions.
 
@@ -180,7 +184,7 @@ Choose Light, Dark, or System in the native **Appearance** menu. **Settings** co
 | `~/Library/Application Support/Perpetual Swap Suite/MarketData/candles/` | Partitioned, immutable confirmed candle Parquet files by timeframe, instrument, and UTC date |
 | `~/Library/Application Support/Perpetual Swap Suite/settings.json` | Desktop preferences and local analysis credentials (mode `0600`) |
 
-Active quotes and the still-forming candle remain in memory. Completed periods are appended to Parquet; DuckDB scans only the required partitions for charts, indicators, and research. The Electron data service serializes writes so readers never observe a partial Parquet file.
+Active quotes and the still-forming candle remain in memory. Completed periods are appended to Parquet; DuckDB reads the selected instrument and timeframe; chart workers retain its persisted series for consistent recursive indicators. The Electron data service serializes writes so readers never observe a partial Parquet file.
 
 ## Development
 
@@ -198,39 +202,28 @@ Active quotes and the still-forming candle remain in memory. Completed periods a
 | [macos](macos) | Electron app icon assets |
 | [.github/workflows/release.yml](.github/workflows/release.yml) | Release build, packaging, and publication |
 
-Swift dependencies are declared in [Package.swift](Package.swift) and resolved in [Package.resolved](Package.resolved). Web dependencies and commands are in [package.json](package.json), with exact versions in [package-lock.json](package-lock.json).
-
-`npm run build` produces only the renderer in `dist/`. The dashboard requires the native WKWebView bridge; use `npm run app` to build the complete application.
+Web dependencies and commands are in [package.json](package.json), with resolved versions in [package-lock.json](package-lock.json). `npm run build` produces the renderer in `dist/`; the context-isolated Electron preload bridge is required to run it.
 
 ### Checks and release workflow
 
-Run the complete local CI before pushing:
-
-```sh
-npm run ci:local
-```
-
-This runs Swift and TypeScript tests, lint and surface-contract checks, a full macOS app build, real WKWebView interaction/material checks, and isolated monitor lifecycle tests. Every test runs in the background without taking focus, occupying visible displays, or creating Dock icons. Native test windows remain outside every connected display even when resized, centered, or reordered; runtime audits check window bounds, activation, and Dock eligibility.
-
-The CI runner enforces a 60-second wall-clock budget. It shares one optimized native build between the packaged app and the tests, runs independent checks concurrently, and partitions every discovered WebKit test across isolated processes. No checks are selected by changed files or silently skipped to meet the budget. The 250 ms menu benchmark runs alone before a bounded native test pool. SwiftPM and icon assets reuse validated build outputs; clearing caches can exceed the budget and will fail CI. Stage logs and a successful run's timings are saved in `.build/ci`; install dependencies with `npm ci` before running CI.
-
-For a fresh checkout or cleared build cache, run `CI=1 npm run app` and `scripts/build-native.sh --build-tests` once to prime compilation, then run `npm run ci:local`. Cache warm-up does not replace any CI check.
-
 | Command | Purpose |
 | --- | --- |
-| `npm test` | Swift tests in isolated preference/cache domains, then TypeScript tests |
-| `npm run lint` | Oxlint, shared component surface contracts, and the background-test contract |
-| `npm run test:ui` | Build the renderer and run native WKWebView interaction, material, and pixel checks offscreen |
-| `npm run test:ui:visual` | Run the focused material and chart pixel acceptance suite entirely offscreen |
+| `npm run test:renderer` | Core business logic, indicators, controller, prepared cache, data service, and Parquet storage |
+| `npm run test:e2e` | Build and test real Electron interactions, including every painted chart snapshot |
+| `npm run lint` | Oxlint and shared component surface contracts |
+| `npm run benchmark` | Parquet writes and DuckDB query timings |
+| `npm run benchmark:chart` | Native 5m/15m/1h high-speed scrolling, reversals, 1,200-candle jumps, and delayed storage reads |
+| `npm run test:okx:1h` | Live public OKX native-hourly candle, OI, and taker integration |
+| `npm run app` | Build and package the macOS Electron app |
 
-Asserted native material pixel captures are saved under `.build/ui-qa`. Functional checks, material checks, and native compositor pixel captures are all part of local CI. Screenshots capture only the test window, including real backdrop filters, without displaying it. Packaged lifecycle tests use isolated, re-signed app copies with `LSUIElement` set before launch, preventing a Dock icon before Swift starts. They hide the research window without invoking Dock animations; native miniaturize/deminiaturize callbacks are covered separately. There is no foreground test mode, including when `RADAR_VISUAL_TESTS=1`.
+Chart acceptance compares every committed 96-candle snapshot with a full-series numeric oracle and verifies its actual SVG metadata and OI/Taker geometry. It also checks that rapid input keeps at most one preparation request active, does not redownload complete durable history, and does not replay superseded cursor movement. Delayed reads preserve the prior complete chart until the requested replacement is ready. The benchmark reports input-to-paint latency separately from requests superseded before a paint.
 
-GitHub Actions handles **CD only**. Every push to `main` builds and packages the app, publishes `Perpetual.Swap.Suite.app.tar` and `update.json`, and moves the single `autobuild` release/tag to that commit. The workflow does not run the test or lint suites.
+GitHub Actions runs the tests, live OKX integration, and benchmarks before packaging each push to `main`. A successful build publishes `Perpetual.Swap.Suite.app.zip` and `update.json`, and moves the `autobuild` release/tag to that commit.
 
 ## Help and contributing
 
 Maintained by [notCorwin](https://github.com/notCorwin). Report bugs or request features through [GitHub Issues](https://github.com/notCorwin/Perpetual-Swap-Suite/issues); include your macOS version, build revision, reproduction steps, and the relevant error message or data gap.
 
-The in-app condition library and **Explain markets** describe supported rules and their readings. Developers can inspect the [native indicator/function catalog](Sources/PerpetualRadar/FilterCatalog.swift), [rule compiler](Sources/PerpetualRadar/FilterCompiler.swift), and [tests](Tests/PerpetualRadarTests) for executable examples.
+The in-app condition library and **Explain markets** describe supported rules and their readings. Developers can inspect the [rule engine](src/rule-engine.ts), [indicator formulas](electron/services/indicators.js), and core tests in `src/*.test.ts` for executable examples.
 
-Before contributing, read [AGENTS.md](AGENTS.md). Keep system services in Swift/native APIs, reuse shadcn/ui components, and follow the shared design tokens and `data-surface` material contract. Use current stable toolchains, run `npm run ci:local` before pushing, and keep GitHub Actions focused on release delivery. Submit focused pull requests with a description of the resulting behavior and local validation.
+Before contributing, read [AGENTS.md](AGENTS.md). Keep data services behind the Electron preload bridge, reuse shadcn/ui components, and follow the shared design tokens and `data-surface` material contract. Use current stable toolchains and run the relevant checks before pushing. Submit focused pull requests with a description of the resulting behavior and local validation.

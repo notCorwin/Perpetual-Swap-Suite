@@ -1,3 +1,5 @@
+import { barsWithIndicators } from './services/indicators.js'
+
 const FIVE_MINUTES = 300_000
 const HOUR = 3_600_000
 
@@ -67,7 +69,10 @@ export async function seedChartScrollBenchmark(store, marketService) {
   const instId = 'SOL-USDT-SWAP'
   const timeframe = '1H'
   const alternateTimeframe = '15m'
-  const periods = 2_048
+  const timeframes = ['5m', '15m', '1H']
+  // Leave durable history beyond the largest jump and the 600-candle
+  // prefetch horizon, so network assertions measure redundant downloads.
+  const periods = 3_072
   const end = Date.UTC(2025, 9, 17, 12, 0)
   const buildCandles = (frame, intervalMS) => {
     const start = end - (periods - 1) * intervalMS
@@ -85,16 +90,21 @@ export async function seedChartScrollBenchmark(store, marketService) {
         oi: 2_100_000 + index * 230,
         buy: 92_000 + index % 800,
         sell: 76_000 + (index * 3) % 900,
-        statisticsVersion: 1, confirmed: true,
+        statisticsVersion: 1, statisticsSources: 3, statisticsObserved: true, confirmed: true,
       }
     })
   }
-  // Keep both tested periods native. The production service must not derive
-  // a 1H chart from a 5m fixture; this makes the benchmark exercise exactly
-  // the persisted sequence and OKX period that the chart will use in-app.
-  const hourly = buildCandles(timeframe, HOUR)
-  const fifteenMinute = buildCandles(alternateTimeframe, 3 * FIVE_MINUTES)
-  await store.appendCandles([...hourly, ...fifteenMinute])
+  // Persist each native period independently. The oracle is calculated once
+  // from the complete durable sequence, including the canonical EMA/RSI seed,
+  // so a later page cannot silently change the value at an existing timestamp.
+  const intervals = { '5m': FIVE_MINUTES, '15m': 3 * FIVE_MINUTES, '1H': HOUR }
+  const candlesByFrame = Object.fromEntries(timeframes.map(frame => [frame, buildCandles(frame, intervals[frame])]))
+  const hourly = candlesByFrame[timeframe]
+  for (const frame of timeframes) await marketService.persistCandles(instId, candlesByFrame[frame].map(row => ({ ...row, replaceStatistics: true })), { projectList: false })
+  const series = Object.fromEntries(timeframes.map(frame => [frame, {
+    intervalMS: intervals[frame], start: candlesByFrame[frame][0].timestamp, end,
+    bars: barsWithIndicators(candlesByFrame[frame], intervals[frame]),
+  }]))
 
   const instrument = { instId, instCategory: '1', settleCcy: 'USDT', state: 'live', ctVal: '0.1', ctValCcy: 'SOL' }
   const ticker = { instId, last: String(hourly.at(-1).close), open24h: String(hourly.at(-25).open), low24h: '130', high24h: '180', bidPx: String(hourly.at(-1).close - .01), askPx: String(hourly.at(-1).close + .01), volCcy24h: '500000' }
@@ -104,16 +114,14 @@ export async function seedChartScrollBenchmark(store, marketService) {
   marketService.catalogUpdatedAt = savedAt
   marketService.catalogSource = 'live'
   marketService.instruments.set(instId, instrument)
-  for (const frame of [timeframe, alternateTimeframe]) marketService.lastCandleHydration.set(`${frame}:${instId}`, savedAt)
+  for (const frame of timeframes) marketService.lastCandleHydration.set(`${frame}:${instId}`, savedAt)
   marketService.replaceCatalog([entry])
   await marketService.ensureListTimeframe(timeframe)
   await marketService.projectListEntry(instId, timeframe)
   marketService.error = ''
   marketService.lastRefreshAt = savedAt
   marketService.markChartDataChanged(instId)
-  // 12 frames × 12 candles stays inside the resident chart range. The next
-  // 22-frame phase deliberately reaches its 96-candle history floor.
-  return { instId, timeframe, alternateTimeframe, intervalMS: HOUR, end, start: hourly[0].timestamp, periods, warmFrames: 12, boundaryFrames: 22 }
+  return { instId, timeframe, alternateTimeframe, timeframes, intervalMS: HOUR, end, start: hourly[0].timestamp, periods, series }
 }
 
 // Model the legacy cache at OKX's source retention boundary: prices exist,
@@ -121,7 +129,9 @@ export async function seedChartScrollBenchmark(store, marketService) {
 export async function seedHistoricalStatisticsBoundary(store, marketService) {
   const fixture = await seedChartScrollBenchmark(store, marketService)
   const rows = await store.candles({ instrument: fixture.instId, timeframe: fixture.timeframe, from: fixture.end - 95 * HOUR, through: fixture.end })
-  await store.appendCandles(rows.map(row => ({ ...row, oi: null, buy: 0, sell: 0, statisticsVersion: 7 })))
+  await marketService.persistCandles(fixture.instId, rows.map(row => ({ ...row, oi: null, buy: 0, sell: 0, statisticsVersion: 7, replaceStatistics: true })), { projectList: false })
   marketService.markChartDataChanged(fixture.instId)
+  fixture.series[fixture.timeframe].bars = fixture.series[fixture.timeframe].bars.map(bar => bar.hour >= fixture.end - 95 * HOUR
+    ? { ...bar, oi: null, buy: null, sell: null } : bar)
   return fixture
 }
