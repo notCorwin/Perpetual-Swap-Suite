@@ -45,7 +45,8 @@ export async function waitForUniverseReady(electron, page, fixture, timeframe = 
     const events = await page.evaluate(() => [...window.__navigationPrepared ?? []])
     ready = [...new Set([...hits, ...events])]
     if (fixture.instIds.every(id => ready.includes(`${timeframe}:${id}`))) {
-      const calls = (await navigationRequests(electron)).requests.filter(request => request.kind === 'chartUniverse' && request.timeframe === timeframe)
+      const calls = (await navigationRequests(electron)).requests.filter(request => request.kind === 'chartUniverse'
+        && request.timeframe === timeframe && fixture.instIds.every(id => request.instIds.includes(id)))
       await page.evaluate(async () => { await new Promise(resolve => requestAnimationFrame(resolve)); await new Promise(resolve => requestAnimationFrame(resolve)) })
       return { timeframe, candidateCount: fixture.instIds.length, readyCount: fixture.instIds.length, prewarmTotalMS: Date.now() - (calls[0]?.at ?? Date.now()), universeRequests: calls.length }
     }
