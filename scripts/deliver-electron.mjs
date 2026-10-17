@@ -44,7 +44,10 @@ async function launchUserApp(appPath) {
     }
     if (child) assert.equal(child.exitCode, 0, 'The production profile must quit normally.')
   }
-  await run('open', ['-a', appPath])
+  // `open` can inherit the host automation's run-as-Node flag. The installed
+  // app must start as Electron with its normal profile, including from T3.
+  await run('open', ['-n', '-a', appPath, '--env', 'ELECTRON_RUN_AS_NODE=',
+    '--env', 'ELECTRON_RENDERER_URL=', '--env', 'PERPETUAL_SWAP_E2E=0', '--env', 'PERPETUAL_SWAP_USER_DATA='])
   const executable = join(appPath, 'Contents/MacOS/Perpetual Swap Suite')
   const deadline = Date.now() + 20_000
   while (Date.now() < deadline) {
