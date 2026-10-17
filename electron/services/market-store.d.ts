@@ -11,12 +11,15 @@ export type CandleRecord = {
   [key: string]: unknown
 }
 export type CatalogSnapshot = { schemaVersion: number; liquidityPolicyVersion: number; criteriaKey: string; savedAt: number; entries: unknown[] }
+export type StorePriority = 'foreground' | 'background'
 export class MarketStore {
   static open(root: string): Promise<MarketStore>
-  appendCandles(candles: CandleRecord[]): Promise<number>
-  candles(query: { instrument: string; timeframe: string; from?: number; through?: number }): Promise<CandleRecord[]>
-  coverage(instrument: string, timeframe: string): Promise<{ count: number; first: number | null; last: number | null }>
-  missingCandleRanges(query: { instrument: string; timeframe?: string; from: number; through: number; intervalMS?: number }): Promise<Array<{ from: number; through: number }>>
+  enqueue<T>(operation: () => T | Promise<T>, priority?: StorePriority): Promise<T>
+  appendCandles(candles: CandleRecord[], priority?: StorePriority): Promise<number>
+  candles(query: { instrument: string; timeframe: string; from?: number; through?: number }, priority?: StorePriority): Promise<CandleRecord[]>
+  candleTimestamps(query: { instrument: string; timeframe: string; from?: number; through?: number }, priority?: StorePriority): Promise<number[]>
+  coverage(instrument: string, timeframe: string, priority?: StorePriority): Promise<{ count: number; first: number | null; last: number | null }>
+  missingCandleRanges(query: { instrument: string; timeframe?: string; from: number; through: number; intervalMS?: number }, priority?: StorePriority): Promise<Array<{ from: number; through: number }>>
   writeCatalogSnapshot(snapshot: CatalogSnapshot): Promise<void>
   readCatalogSnapshot(): Promise<CatalogSnapshot | null>
   close(): Promise<void>

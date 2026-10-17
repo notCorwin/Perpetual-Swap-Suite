@@ -483,16 +483,44 @@ test('a changed live candle invalidates cached chart results even when no 5m can
     await service.hydrate(instrument)
     const first = await service.bars(instrument.instId, '5m')
     assert.equal(first.bars.at(-1)?.close, 101)
-    service.chartResults.set('cached', [])
-    const revision = service.revision
+    service.chartResults.set('ETH-USDT-SWAP:5m:cached', [])
+    const revision = service.dataRevision(instrument.instId)
     service.lastCandleHydration.delete(instrument.instId)
     await service.hydrate(instrument)
     const second = await service.bars(instrument.instId, '5m')
     assert.equal(service.liveCandles.get(instrument.instId)?.close, 102)
     assert.equal(second.bars.at(-1)?.close, 102)
-    assert.equal(service.chartResults.has('cached'), false)
-    assert.ok(service.revision > revision)
+    assert.ok(service.dataRevision(instrument.instId) > revision)
+    // A live-candle change invalidates this instrument's cached charts, but
+    // another contract's cached chart must survive untouched.
+    assert.equal(service.chartResults.has('ETH-USDT-SWAP:5m:cached'), true)
   } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('statistics hydration starts while visible candles are still repairing', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 6, 1)
+  let oiCalls = 0, takerCalls = 0
+  const fetcher: typeof fetch = async input => {
+    const url = new URL(String(input))
+    if (url.pathname.endsWith('/market/history-candles')) return response([])
+    if (url.pathname.endsWith('/open-interest-history')) { oiCalls += 1; return response([]) }
+    if (url.pathname.endsWith('/taker-volume-contract')) { takerCalls += 1; return response([]) }
+    throw new Error(`Unexpected ${url}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    service.instruments.set(instrument.instId, instrument)
+    service.focusChart(instrument.instId, 1)
+    const chart = await service.bars(instrument.instId, '1H', end, { hydrate: false, repair: true, statistics: true, foreground: true, focusToken: 1 })
+    assert.equal(chart.visibleCandleReady, false)
+    // OKX publishes no 5m history, so the visible window can never fill.
+    // Direct OI/Taker hydration must still run instead of waiting for it.
+    await waitFor(() => oiCalls === 1 && takerCalls === 1)
+    assert.equal(chart.candleState, 'loading')
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
 test('a fresh internal gap repairs immediately while a different gap is backing off', async () => {
@@ -1291,31 +1319,31 @@ test('a newer same-instrument viewport cannot be retaken by a delayed older requ
   const store = await MarketStore.open(root)
   const instrument = { instId: 'BTC-USDT-SWAP' }
   const oldEnd = Date.UTC(2024, 8, 1), newEnd = oldEnd - hour
-  const originalCoverage = store.coverage.bind(store)
-  let coverageStarted = false, coverageCalls = 0, releaseCoverage: (() => void) | undefined
-  const coverageGate = new Promise<void>(resolve => { releaseCoverage = resolve })
-  store.coverage = async (...arguments_) => {
-    coverageCalls += 1
-    if (!coverageStarted) {
-      coverageStarted = true
-      await coverageGate
+  const originalCandles = store.candles.bind(store)
+  let candlesStarted = false, candlesCalls = 0, releaseCandles: (() => void) | undefined
+  const candlesGate = new Promise<void>(resolve => { releaseCandles = resolve })
+  store.candles = async (...arguments_) => {
+    candlesCalls += 1
+    if (!candlesStarted) {
+      candlesStarted = true
+      await candlesGate
     }
-    return originalCoverage(...arguments_)
+    return originalCandles(...arguments_)
   }
   const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
   try {
     service.instruments.set(instrument.instId, instrument)
     service.focusChart(instrument.instId, 1)
     const oldRequest = service.bars(instrument.instId, '1H', oldEnd, { hydrate: false, repair: false, statistics: false, foreground: true, focusToken: 1 })
-    await waitFor(() => coverageStarted)
+    await waitFor(() => candlesStarted)
     service.focusChart(instrument.instId, 2)
     await service.bars(instrument.instId, '1H', newEnd, { hydrate: false, repair: false, statistics: false, foreground: true, focusToken: 2 })
-    releaseCoverage?.()
+    releaseCandles?.()
     const old = await oldRequest
     assert.equal(old.stale, true)
-    assert.equal(coverageCalls, 2, 'The stale and current viewports each read raw coverage once.')
+    assert.equal(candlesCalls, 4, 'The stale and current viewports each read their 5m source and direct rows once.')
     assert.equal(service.activeChartViewport.end, newEnd)
-  } finally { releaseCoverage?.(); await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+  } finally { releaseCandles?.(); await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
 test('a focus transition does not revive a same-instrument repair before its next viewport activates', async () => {

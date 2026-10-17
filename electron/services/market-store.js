@@ -39,21 +39,42 @@ export class MarketStore {
   constructor(root, connection) {
     this.root = root
     this.connection = connection
-    this.pending = Promise.resolve()
+    this.queue = []
+    this.draining = false
     this.lastWrittenAt = 0
     this.closed = false
     this.closeTask = null
+    this.coverages = new Map()
   }
 
   // DuckDB connections are not a concurrent query coordinator. Keep every
   // query and write on this connection in one ordered lane, and close only
-  // after that lane has drained. This also makes a late background repair
-  // harmless during application shutdown instead of racing `closeSync()`.
-  enqueue(operation) {
+  // after that lane has drained. Foreground work (the focused chart) cuts in
+  // front of queued background reads so bulk list projections and warm-up
+  // repairs can never delay a chart load; background work keeps arrival
+  // order among itself.
+  enqueue(operation, priority = 'background') {
     if (this.closed) return Promise.reject(new Error('MarketStore is closed.'))
-    const task = this.pending.then(operation)
-    this.pending = task.then(() => undefined, () => undefined)
-    return task
+    return new Promise((resolve, reject) => {
+      const job = { operation, priority, resolve, reject }
+      if (priority === 'foreground') {
+        const firstBackground = this.queue.findIndex(queued => queued.priority !== 'foreground')
+        if (firstBackground < 0) this.queue.push(job)
+        else this.queue.splice(firstBackground, 0, job)
+      } else this.queue.push(job)
+      void this.drain()
+    })
+  }
+
+  async drain() {
+    if (this.draining) return
+    this.draining = true
+    try {
+      while (this.queue.length) {
+        const job = this.queue.shift()
+        try { job.resolve(await job.operation()) } catch (error) { job.reject(error) }
+      }
+    } finally { this.draining = false }
   }
 
   partition(instrument, timeframe, timestamp) {
@@ -68,7 +89,7 @@ export class MarketStore {
     return dates.filter(entry => entry.isDirectory()).map(entry => join(directory, entry.name, '*.parquet'))
   }
 
-  async appendCandles(candles) {
+  async appendCandles(candles, priority = 'background') {
     if (!Array.isArray(candles) || candles.length === 0) return 0
     // Parquet parts are append-only. The latest record wins during reads, so
     // equal timestamps would make two concurrent writes nondeterministic.
@@ -82,35 +103,78 @@ export class MarketStore {
       const batches = Map.groupBy(candles, candle => this.partition(candle.instrument, candle.timeframe, candle.timestamp))
       for (const [directory, rows] of batches) {
         await mkdir(directory, { recursive: true })
+        // A part per write makes every read scan a growing pile of files.
+        // Merge each write into the partition's single part instead: reads
+        // open one file per date while newest-written rows still win per
+        // timestamp. Old parts are removed only after the replacement is
+        // durably renamed in, so an interrupted write stays readable.
+        const parts = (await readdir(directory, { withFileTypes: true }).catch(() => []))
+          .filter(entry => entry.isFile() && entry.name.endsWith('.parquet'))
+          .map(entry => join(directory, entry.name))
         const nonce = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
         const source = join(directory, `.${nonce}.json`)
         const target = join(directory, `part-${nonce}.parquet`)
         const temporary = `${target}.tmp`
         await writeFile(source, JSON.stringify(rows), { mode: 0o600 })
         try {
-          await this.connection.run(`COPY (SELECT * FROM read_json_auto(${quote(source)})) TO ${quote(temporary)} (FORMAT PARQUET, COMPRESSION ZSTD)`)
+          if (parts.length) {
+            const list = `[${parts.map(quote).join(', ')}]`
+            await this.connection.run(`COPY (
+              SELECT * FROM (
+                SELECT * FROM read_parquet(${list}, union_by_name = true)
+                UNION ALL BY NAME
+                SELECT * FROM read_json_auto(${quote(source)})
+              ) QUALIFY row_number() OVER (PARTITION BY timestamp ORDER BY COALESCE(writtenAt, 0) DESC) = 1
+              ORDER BY timestamp
+            ) TO ${quote(temporary)} (FORMAT PARQUET, COMPRESSION ZSTD)`)
+          } else {
+            await this.connection.run(`COPY (SELECT * FROM read_json_auto(${quote(source)})) TO ${quote(temporary)} (FORMAT PARQUET, COMPRESSION ZSTD)`)
+          }
           await rename(temporary, target)
+          await Promise.all(parts.map(part => rm(part, { force: true })))
         } finally {
           await rm(source, { force: true })
           await rm(temporary, { force: true })
         }
       }
+      // Coverage only changes when rows are written. Invalidate per
+      // instrument so unrelated instruments keep serving cached scans.
+      for (const candle of candles) this.coverages.delete(`${candle.instrument}:${candle.timeframe}`)
       return candles.length
     }
-    return this.enqueue(write)
+    return this.enqueue(write, priority)
   }
 
-  async candles({ instrument, timeframe, from = 0, through = Date.now() }) {
+  async candles({ instrument, timeframe, from = 0, through = Date.now() }, priority = 'background') {
     return this.enqueue(async () => {
       const files = await this.parquetFiles(instrument, timeframe)
       if (!files.length) return []
       const list = `[${files.map(quote).join(', ')}]`
       const result = await this.connection.runAndReadAll(`SELECT * EXCLUDE (row_rank) FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY timestamp ORDER BY COALESCE(writtenAt, 0) DESC) AS row_rank FROM read_parquet(${list}, union_by_name = true) WHERE timestamp >= ${Number(from)} AND timestamp <= ${Number(through)}) WHERE row_rank = 1 ORDER BY timestamp`)
       return result.getRowObjectsJS().map(normalizeCandleRow)
-    })
+    }, priority)
   }
 
-  async coverage(instrument, timeframe) {
+  // Gap detection only needs timestamp presence. Reading the timestamp
+  // column alone keeps the frequent repair checks from decompressing every
+  // candle field.
+  async candleTimestamps({ instrument, timeframe, from = 0, through = Date.now() }, priority = 'background') {
+    return this.enqueue(async () => {
+      const files = await this.parquetFiles(instrument, timeframe)
+      if (!files.length) return []
+      const list = `[${files.map(quote).join(', ')}]`
+      const result = await this.connection.runAndReadAll(`SELECT timestamp FROM (SELECT timestamp, ROW_NUMBER() OVER (PARTITION BY timestamp ORDER BY COALESCE(writtenAt, 0) DESC) AS row_rank FROM read_parquet(${list}, union_by_name = true) WHERE timestamp >= ${Number(from)} AND timestamp <= ${Number(through)}) WHERE row_rank = 1 ORDER BY timestamp`)
+      return result.getRowObjectsJS().map(row => Number(row.timestamp))
+    }, priority)
+  }
+
+  async coverage(instrument, timeframe, priority = 'background') {
+    // Coverage only changes when rows are written, and every write
+    // invalidates this cache. Repeat reads around one write — the chart poll,
+    // list projection, and statistics paths all ask — reuse one scan.
+    const key = `${instrument}:${timeframe}`
+    const cached = this.coverages.get(key)
+    if (cached) return { ...cached }
     return this.enqueue(async () => {
       const files = await this.parquetFiles(instrument, timeframe)
       if (!files.length) return { count: 0, first: null, last: null }
@@ -118,20 +182,22 @@ export class MarketStore {
       const result = await this.connection.runAndReadAll(`SELECT COUNT(*) AS count, MIN(timestamp) AS first, MAX(timestamp) AS last FROM (SELECT timestamp, ROW_NUMBER() OVER (PARTITION BY timestamp ORDER BY COALESCE(writtenAt, 0) DESC) AS row_rank FROM read_parquet(${list}, union_by_name = true)) WHERE row_rank = 1`)
       const row = result.getRowObjectsJS()[0] ?? {}
       const number = value => typeof value === 'bigint' ? Number(value) : Number(value)
-      return {
+      const coverage = {
         count: Number.isFinite(number(row.count)) ? number(row.count) : 0,
         first: Number.isFinite(number(row.first)) ? number(row.first) : null,
         last: Number.isFinite(number(row.last)) ? number(row.last) : null,
       }
-    })
+      this.coverages.set(key, coverage)
+      return { ...coverage }
+    }, priority)
   }
 
-  async missingCandleRanges({ instrument, timeframe = '5m', from, through, intervalMS = 300_000 }) {
+  async missingCandleRanges({ instrument, timeframe = '5m', from, through, intervalMS = 300_000 }, priority = 'background') {
     const first = Math.ceil(Number(from) / intervalMS) * intervalMS
     const last = Math.floor(Number(through) / intervalMS) * intervalMS
     if (!Number.isFinite(first) || !Number.isFinite(last) || first > last) return []
-    const rows = await this.candles({ instrument, timeframe, from: first, through: last })
-    const present = new Set(rows.map(row => Number(row.timestamp)))
+    const stamps = await this.candleTimestamps({ instrument, timeframe, from: first, through: last }, priority)
+    const present = new Set(stamps)
     const ranges = []
     let rangeStart = null
     for (let timestamp = first; timestamp <= last; timestamp += intervalMS) {
@@ -214,7 +280,12 @@ export class MarketStore {
   async close() {
     if (this.closeTask) return this.closeTask
     this.closed = true
-    this.closeTask = this.pending.then(() => this.connection.closeSync())
+    this.closeTask = (async () => {
+      // A late background repair must finish before the connection closes,
+      // exactly as the old promise-chain lane guaranteed.
+      while (this.draining || this.queue.length) await new Promise(resolve => setImmediate(resolve))
+      this.connection.closeSync()
+    })()
     return this.closeTask
   }
 }

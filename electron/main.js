@@ -180,7 +180,7 @@ async function seedPartialStatisticsChart() {
   await marketService.projectListEntry(instId, timeframe)
   marketService.error = ''
   marketService.lastRefreshAt = Date.now()
-  marketService.markChartDataChanged()
+  marketService.markChartDataChanged(instId)
   return { instId, timeframe, end, start: end - (visibleBars - 1) * HOUR, visibleBars, oiSamples: partialSamples, takerSamples: partialSamples }
 }
 
@@ -226,14 +226,16 @@ async function handleRequest(event, request) {
     }
     // A newer wheel position already owns this renderer session. Do not let a
     // late IPC message add cache-only DuckDB work ahead of the visible window.
-    if (!request.preview && !focused.ok) return { unchanged: true, error: '', revision: marketService.revision }
-    if (request.chartEndHour === undefined && request.sinceRevision === marketService.revision && marketService.isActiveChartViewport(request.chartInstId, timeframe, undefined)) {
-      return { unchanged: true, error: '', revision: marketService.revision }
+    // Chart data revisions are per instrument: an unrelated contract's write
+    // must not force this chart to refetch.
+    if (!request.preview && !focused.ok) return { unchanged: true, error: '', revision: marketService.dataRevision(request.chartInstId) }
+    if (request.chartEndHour === undefined && request.sinceRevision === marketService.dataRevision(request.chartInstId) && marketService.isActiveChartViewport(request.chartInstId, timeframe, undefined)) {
+      return { unchanged: true, error: '', revision: marketService.dataRevision(request.chartInstId) }
     }
     // Neighbor previews may read the local cache, but must never enqueue
     // hydration, gap repair, or OI/Taker work ahead of the visible chart.
     const chart = await marketService.bars(request.chartInstId, timeframe, request.chartEndHour, focused.ok ? { foreground: true, focusToken: focused.sequence } : { hydrate: false, repair: false, statistics: false })
-    if (chart.stale) return { unchanged: true, error: '', revision: marketService.revision }
+    if (chart.stale) return { unchanged: true, error: '', revision: marketService.dataRevision(request.chartInstId) }
     const { bars } = chart
     const intervalMS = timeframe === '5m' ? 300_000 : timeframe === '15m' ? 900_000 : 3_600_000
     const oldestHour = bars[0]?.hour ?? null, latestHour = bars.at(-1)?.hour ?? null
@@ -244,7 +246,7 @@ async function handleRequest(event, request) {
       ? undefined
       : hasFixedHistoryBoundary ? Math.max(minimumEnd, Math.min(latestHour, requestedEnd)) : requestedEnd
     return {
-      bars, error: '', revision: chart.revision ?? marketService.revision, timeframe, oldestHour,
+      bars, error: '', revision: chart.revision ?? marketService.dataRevision(request.chartInstId), timeframe, oldestHour,
       endHour, historyExhausted: requestedEnd !== undefined && minimumEnd !== null && requestedEnd <= minimumEnd && hasFixedHistoryBoundary,
       candleState: chart.candleState, missingCandleRanges: chart.missingCandleRanges, candleRetryAt: chart.candleRetryAt,
       statisticsState: chart.statisticsState, statisticsRetryAt: chart.statisticsRetryAt,

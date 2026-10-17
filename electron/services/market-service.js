@@ -160,7 +160,7 @@ function chartRepairRange(timeframe, end, repairEnd = end) {
 // 15m/1H statistics row can exist before its complete raw source bucket does,
 // so it must never choose the latest chart end. Doing so makes the statistics
 // request target one interval to the right of the bar actually rendered.
-async function latestCompleteChartEnds(store, instrument, rawCoverage, timeframe) {
+async function latestCompleteChartEnds(store, instrument, rawCoverage, timeframe, priority = 'background') {
   const rawLast = rawCoverage.last
   if (rawLast === null) return { displayEnd: null, repairEnd: null }
   if (timeframe === '5m') return { displayEnd: rawLast, repairEnd: rawLast }
@@ -178,7 +178,7 @@ async function latestCompleteChartEnds(store, instrument, rawCoverage, timeframe
     timeframe: '5m',
     from: searchFrom,
     through: repairEnd + intervalMS - FIVE_MINUTES,
-  })
+  }, priority)
   const timestamps = new Set(source.map(value => value.timestamp))
   const complete = end => {
     for (let timestamp = end; timestamp < end + intervalMS; timestamp += FIVE_MINUTES) if (!timestamps.has(timestamp)) return false
@@ -373,11 +373,23 @@ export class MarketService {
     this.revision = 0; this.refreshing = null; this.error = ''; this.lastRefreshAt = 0; this.disposed = false
     this.hydrating = new Map(); this.lastCandleHydration = new Map(); this.instruments = new Map(); this.liveCandles = new Map(); this.nextRequestAt = 0; this.rateLimitedUntil = 0
     this.requestQueue = []; this.requestQueueTask = null; this.requestQueueRunning = false; this.activeRequest = null; this.backgroundRequestControllers = new Set(); this.refreshController = null
-    this.historyBoundaries = new Map(); this.candleMutations = new Map(); this.candleRepairs = new Map(); this.latestCandleRetries = new Map(); this.statistics = new Map(); this.chartResults = new Map(); this.activeChartInstrument = null; this.activeChartFocus = -1; this.activeChartViewport = null; this.shutdownController = new AbortController(); this.abortControllers = new Set(); this.barTasks = new Set(); this.disposeTask = null
+    this.historyBoundaries = new Map(); this.candleMutations = new Map(); this.candleRepairs = new Map(); this.latestCandleRetries = new Map(); this.statistics = new Map(); this.chartResults = new Map(); this.chartEnds = new Map(); this.dataRevisions = new Map(); this.activeChartInstrument = null; this.activeChartFocus = -1; this.activeChartViewport = null; this.shutdownController = new AbortController(); this.abortControllers = new Set(); this.barTasks = new Set(); this.disposeTask = null
     this.requestTimeout = Number.isFinite(requestTimeout) && requestTimeout > 0 ? requestTimeout : REQUEST_TIMEOUT
   }
 
   listTimeframe(timeframe) { return LIST_TIMEFRAMES.includes(timeframe) ? timeframe : DEFAULT_LIST_TIMEFRAME }
+
+  // The derived chart end only changes when 5m coverage changes: every write
+  // adds rows and rewrites never add or remove timestamps. Cache it per
+  // coverage identity so repeated loads and polls skip the large source scan.
+  async latestChartEnds(instrument, rawCoverage, timeframe, priority = 'background') {
+    const key = `${instrument}:${timeframe}`, coverageKey = `${rawCoverage.count}:${rawCoverage.first}:${rawCoverage.last}`
+    const cached = this.chartEnds.get(key)
+    if (cached?.coverageKey === coverageKey) return cached.ends
+    const ends = await latestCompleteChartEnds(this.store, instrument, rawCoverage, timeframe, priority)
+    this.chartEnds.set(key, { coverageKey, ends })
+    return ends
+  }
 
   listKey(instrument, timeframe) { return `${timeframe}:${instrument}` }
 
@@ -527,7 +539,7 @@ export class MarketService {
   async readListBars(entry, timeframe) {
     const frame = this.listTimeframe(timeframe), instrument = entry.instrument
     const coverage = await this.store.coverage(instrument.instId, '5m')
-    const ends = await latestCompleteChartEnds(this.store, instrument.instId, coverage, frame)
+    const ends = await this.latestChartEnds(instrument.instId, coverage, frame)
     if (ends.displayEnd === null) return { bars: [], end: null, repairEnd: ends.repairEnd, range: null }
     const intervalMS = timeframeMilliseconds(frame), range = listRawRange(frame, ends.displayEnd)
     let candles
@@ -905,46 +917,54 @@ export class MarketService {
     })
   }
 
-  async appendChangedCandlesLocked(candles) {
+  async appendChangedCandlesLocked(candles, priority = 'background') {
     if (!candles.length) return []
     const instrument = candles[0].instrument, timeframe = candles[0].timeframe
     const from = Math.min(...candles.map(value => value.timestamp)), through = Math.max(...candles.map(value => value.timestamp))
-    const existing = await this.store.candles({ instrument, timeframe, from, through })
+    const existing = await this.store.candles({ instrument, timeframe, from, through }, priority)
     const byTimestamp = new Map(existing.map(value => [value.timestamp, value]))
     const changed = candles.map(value => mergedCandle(byTimestamp.get(value.timestamp), value)).filter(value => !sameCandle(byTimestamp.get(value.timestamp) ?? {}, value))
-    if (changed.length) await this.store.appendCandles(changed)
+    if (changed.length) await this.store.appendCandles(changed, priority)
     return changed
   }
 
-  async rebuildDerivedLocked(instrument, changed) {
+  async rebuildDerivedLocked(instrument, changed, priority = 'background') {
     if (!changed.length) return
     const first = Math.min(...changed.map(value => value.timestamp)), last = Math.max(...changed.map(value => value.timestamp))
     for (const period of [900_000, 3_600_000]) {
       const from = Math.floor(first / period) * period
       const through = Math.floor(last / period) * period + period - FIVE_MINUTES
-      const source = await this.store.candles({ instrument, timeframe: '5m', from, through })
-      await this.appendChangedCandlesLocked(aggregate(source, period))
+      const source = await this.store.candles({ instrument, timeframe: '5m', from, through }, priority)
+      await this.appendChangedCandlesLocked(aggregate(source, period), priority)
     }
   }
 
-  async persistCandles(instrument, candles, { projectList = true } = {}) {
+  async persistCandles(instrument, candles, { projectList = true, priority = 'foreground' } = {}) {
     const confirmed = candles.filter(value => value.confirmed)
     if (this.disposed || !confirmed.length) return false
     return this.enqueueCandleMutation(instrument, async () => {
       if (this.disposed) return false
-      const changed = await this.appendChangedCandlesLocked(confirmed)
+      const changed = await this.appendChangedCandlesLocked(confirmed, priority)
       if (!changed.length) return false
-      await this.rebuildDerivedLocked(instrument, changed)
-      this.markChartDataChanged()
+      await this.rebuildDerivedLocked(instrument, changed, priority)
+      this.markChartDataChanged(instrument)
       if (projectList) this.scheduleListProjection(instrument)
       return true
     })
   }
 
-  markChartDataChanged() {
-    this.chartResults.clear()
-    this.revision += 1
+  markChartDataChanged(instrument) {
+    const instId = typeof instrument === 'string' ? instrument : instrument?.instId
+    // Chart results and revisions are per instrument. A list warm-up write
+    // for another contract must not invalidate the focused chart's cached
+    // bars or force its renderer to refetch data that has not changed.
+    if (instId) {
+      this.dataRevisions.set(instId, this.dataRevision(instId) + 1)
+      for (const key of this.chartResults.keys()) if (key.startsWith(`${instId}:`)) this.chartResults.delete(key)
+    }
   }
+
+  dataRevision(instId) { return this.dataRevisions.get(instId) ?? 0 }
 
   statisticsKey(instrument, timeframe, end) { return `${instrument.instId}:${timeframe}:${end}` }
 
@@ -963,7 +983,7 @@ export class MarketService {
     const key = this.statisticsKey(instrument, timeframe, end)
     let state = this.statistics.get(key)
     if (!state) {
-      state = { status: 'ready', attempt: 0, retryAt: null, expiresAt: 0, timer: null, task: null, controller: null, waitingForRepair: false, lastError: '' }
+      state = { status: 'ready', attempt: 0, retryAt: null, expiresAt: 0, timer: null, task: null, controller: null, lastError: '' }
       this.statistics.set(key, state)
     }
     return state
@@ -979,10 +999,10 @@ export class MarketService {
     return number(value?.statisticsVersion) === STATISTICS_VERSION
   }
 
-  async hasCompleteStoredStatistics(instrument, timeframe, end) {
+  async hasCompleteStoredStatistics(instrument, timeframe, end, priority = 'foreground') {
     const intervalMS = timeframeMilliseconds(timeframe)
     const first = end - (VISIBLE_CANDLES - 1) * intervalMS
-    const rows = await this.store.candles({ instrument: instrument.instId, timeframe, from: first, through: end })
+    const rows = await this.store.candles({ instrument: instrument.instId, timeframe, from: first, through: end }, priority)
     return this.completeStatisticsRows(rows, first, intervalMS)
   }
 
@@ -994,37 +1014,10 @@ export class MarketService {
     return Number.isFinite(state?.retryAt) && state.retryAt > now && this.rateLimitedUntil > now
   }
 
-  statisticsBlockedByRepair(instrument, timeframe, end) {
-    const state = this.candleRepairs.get(instrument.instId)
-    if (!state) return false
-    const range = chartVisibleRange(timeframe, end)
-    return state.ranges.some(repair => rangesOverlap(repair, range) && (repair.status === 'queued' || repair.status === 'loading'))
-  }
-
-  deferStatisticsForRepair(instrument, timeframe, end, state) {
-    if (!this.isActiveStatistics(instrument, timeframe, end) || !this.statisticsBlockedByRepair(instrument, timeframe, end)) return false
-    if (state.timer) clearTimeout(state.timer)
-    state.timer = null
-    state.status = 'loading'; state.retryAt = null; state.lastError = ''; state.waitingForRepair = true
-    return true
-  }
-
-  resumeDeferredStatistics(instrument) {
-    const viewport = this.activeChartViewport
-    if (this.disposed || viewport?.instrument !== instrument.instId || !Number.isFinite(viewport.end)) return
-    const state = this.statistics.get(this.statisticsKey(instrument, viewport.timeframe, viewport.end))
-    if (!state?.waitingForRepair || state.task || state.timer || this.statisticsBlockedByRepair(instrument, viewport.timeframe, viewport.end)) return
-    state.waitingForRepair = false
-    state.status = 'ready'; state.retryAt = null; state.lastError = ''
-    queueMicrotask(() => {
-      if (!this.disposed && this.isActiveStatistics(instrument, viewport.timeframe, viewport.end)) this.requestStatistics(instrument, viewport.timeframe, viewport.end)
-    })
-  }
-
   scheduleStatisticsRetry(instrument, timeframe, end, state, message, serverDelay) {
     if (this.disposed || !this.isActiveStatistics(instrument, timeframe, end)) return
     const plan = retryPlan(state.attempt, serverDelay)
-    state.waitingForRepair = false; state.attempt = plan.attempt
+    state.attempt = plan.attempt
     state.status = plan.unavailable ? 'unavailable' : 'retrying'
     state.retryAt = Date.now() + plan.delay
     state.lastError = message
@@ -1041,8 +1034,7 @@ export class MarketService {
     if (this.disposed) return { status: 'unavailable', retryAt: null }
     const state = this.statisticsState(instrument, timeframe, end), key = this.statisticsKey(instrument, timeframe, end), now = Date.now()
     if (!this.isActiveStatistics(instrument, timeframe, end)) return state
-    if (state.task || state.timer || state.waitingForRepair || state.retryAt && state.retryAt > now || state.status === 'ready' && state.expiresAt > now) return state
-    if (this.deferStatisticsForRepair(instrument, timeframe, end, state)) return state
+    if (state.task || state.timer || state.retryAt && state.retryAt > now || state.status === 'ready' && state.expiresAt > now) return state
     state.status = 'loading'; state.retryAt = null; state.lastError = ''
     const controller = new AbortController()
     state.controller = controller
@@ -1054,38 +1046,49 @@ export class MarketService {
         // verified, current-contract OI/Taker into another pair of requests.
         const stored = await this.hasCompleteStoredStatistics(instrument, timeframe, end)
         if (this.disposed || controller.signal.aborted || !this.isActiveStatistics(instrument, timeframe, end)) return
-        if (this.deferStatisticsForRepair(instrument, timeframe, end, state)) return
         const result = stored ? { changed: false, complete: true } : await this.hydrateStatistics(instrument, timeframe, end, controller.signal)
         if (this.disposed || controller.signal.aborted || !this.isActiveStatistics(instrument, timeframe, end)) return
         changed = result.changed
         if (result.complete) {
-          state.waitingForRepair = false; state.status = 'ready'; state.attempt = 0; state.retryAt = null
+          state.status = 'ready'; state.attempt = 0; state.retryAt = null
           state.expiresAt = this.statisticsExpiry(timeframe, end)
         } else this.scheduleStatisticsRetry(instrument, timeframe, end, state, 'OKX has not published a complete OI/Taker window yet.')
       } catch (error) {
-        if (!controller.signal.aborted && !(requestWasPreempted(error) && this.deferStatisticsForRepair(instrument, timeframe, end, state))) {
-          this.scheduleStatisticsRetry(instrument, timeframe, end, state, error instanceof Error ? error.message : 'Cannot load OI/Taker data.', retryAfter(error))
-        }
+        if (!controller.signal.aborted) this.scheduleStatisticsRetry(instrument, timeframe, end, state, error instanceof Error ? error.message : 'Cannot load OI/Taker data.', retryAfter(error))
       } finally {
         if (state.task === task) state.task = null
         if (state.controller === controller) state.controller = null
         if (!this.isActiveStatistics(instrument, timeframe, end) && !(state.status === 'ready' && state.expiresAt > Date.now())) this.statistics.delete(key)
         else if (controller.signal.aborted && !this.disposed) {
-          state.waitingForRepair = false; state.status = 'ready'; state.retryAt = null
+          state.status = 'ready'; state.retryAt = null
           queueMicrotask(() => { if (!this.disposed && this.isActiveStatistics(instrument, timeframe, end)) this.requestStatistics(instrument, timeframe, end) })
         }
-        else if (state.waitingForRepair) this.resumeDeferredStatistics(instrument)
-        if (changed) this.markChartDataChanged()
+        if (changed) this.markChartDataChanged(instrument.instId)
       }
     })()
     state.task = task
     return state
   }
 
+  // Candle repair progress can complete the raw window an OI/Taker retry is
+  // waiting for. Clearing the retry backoff lets statistics follow the data
+  // instead of a timer that no longer reflects OKX availability.
+  promoteStatistics(instId) {
+    const viewport = this.activeChartViewport
+    if (this.disposed || viewport?.instrument !== instId || !Number.isFinite(viewport.end)) return
+    const state = this.statistics.get(`${instId}:${viewport.timeframe}:${viewport.end}`)
+    if (!state || state.task || state.timer || this.isRateLimitedRetry(state)) return
+    state.retryAt = null
+    this.requestStatistics({ instId }, viewport.timeframe, viewport.end)
+  }
+
   async hydrateStatistics(instrument, timeframe, end, signal, priority = 'statistics') {
     if (this.disposed || signal?.aborted) return { changed: false, complete: false }
     const intervalMS = timeframeMilliseconds(timeframe)
     const statisticsEnd = end + intervalMS
+    // Background list warm-up shares this code path; its DuckDB work must
+    // stay behind foreground chart reads in the store lane.
+    const storePriority = priority === 'background' ? 'background' : 'foreground'
     const requests = new AbortController()
     const abort = () => requests.abort(signal?.reason)
     signal?.addEventListener('abort', abort, { once: true })
@@ -1119,10 +1122,10 @@ export class MarketService {
         timeframe: '5m',
         from: first,
         through: end + intervalMS - FIVE_MINUTES,
-      }), intervalMS).filter(value => value.timestamp >= first && value.timestamp <= end)
+      }, storePriority), intervalMS).filter(value => value.timestamp >= first && value.timestamp <= end)
       if (this.disposed || signal?.aborted || requests.signal.aborted) return { changed: false, complete: false }
-      const rebuiltChanged = rebuilt.length ? await this.appendChangedCandlesLocked(rebuilt) : []
-      const local = await this.store.candles({ instrument: instrument.instId, timeframe, from: first, through: end })
+      const rebuiltChanged = rebuilt.length ? await this.appendChangedCandlesLocked(rebuilt, storePriority) : []
+      const local = await this.store.candles({ instrument: instrument.instId, timeframe, from: first, through: end }, storePriority)
       const patched = local.flatMap(value => {
         // Map.has deliberately distinguishes a missing endpoint row from a
         // row whose value is null. The former leaves a previously verified
@@ -1146,9 +1149,9 @@ export class MarketService {
           replaceStatistics: true,
         }]
       })
-      const changed = await this.appendChangedCandlesLocked(patched)
-      if (timeframe === '5m' && changed.length) await this.rebuildDerivedLocked(instrument.instId, changed)
-      const stored = await this.store.candles({ instrument: instrument.instId, timeframe, from: first, through: end })
+      const changed = await this.appendChangedCandlesLocked(patched, storePriority)
+      if (timeframe === '5m' && changed.length) await this.rebuildDerivedLocked(instrument.instId, changed, storePriority)
+      const stored = await this.store.candles({ instrument: instrument.instId, timeframe, from: first, through: end }, storePriority)
       return { changed: rebuiltChanged.length > 0 || changed.length > 0, complete: this.completeStatisticsRows(stored, first, intervalMS) }
     })
     if (result.changed) this.scheduleListProjection(instrument.instId)
@@ -1439,19 +1442,13 @@ export class MarketService {
     range.lastError = message
   }
 
-  requestStatisticsWhenVisibleCandlesReady(instrument, repairs) {
-    const viewport = this.activeChartViewport
-    if (this.disposed || viewport?.instrument !== instrument.instId || !Number.isFinite(viewport.end)) return
-    const visible = chartVisibleRange(viewport.timeframe, viewport.end)
-    // Exhausted gaps count too: direct OI/Taker rows must never make an
-    // incomplete candle viewport look healthy.
-    if (repairs.ranges.some(range => rangesOverlap(range, visible))) return
-    this.requestStatistics(instrument, viewport.timeframe, viewport.end)
-  }
-
   async repairGap(instrument, gap, signal, priority = this.repairPriority(instrument, gap), allowOutsideActiveViewport = false) {
     let cursor = gap.through + FIVE_MINUTES, repaired = false, remaining = [gap]
     const initialSlots = rangeSlots(remaining)
+    // Visible-window repair drives the chart the user is looking at; warm-up
+    // repair serves indicator history. Only the former may cut ahead of
+    // queued background reads in the store lane.
+    const storePriority = priority === 'repair' ? 'foreground' : 'background'
     for (let pageNumber = 0; cursor > gap.from && pageNumber < MAX_REPAIR_PAGES; pageNumber += 1) {
       if (signal?.aborted || (!allowOutsideActiveViewport && !this.canRepairRange(instrument, gap))) return { repaired, exhausted: false, deferred: true, remaining }
       const page = await this.get('/market/history-candles', { instId: instrument.instId, bar: '5m', limit: 300, after: cursor }, signal, priority)
@@ -1463,7 +1460,7 @@ export class MarketService {
         // the coverage captured by the caller can be hundreds of candles newer
         // and would permanently hide repairable history from both list and
         // chart paths.
-        const currentCoverage = await this.store.coverage(instrument.instId, '5m')
+        const currentCoverage = await this.store.coverage(instrument.instId, '5m', storePriority)
         const unresolved = remaining.length ? remaining : [gap]
         if (currentCoverage.first !== null && unresolved.every(range => range.through < currentCoverage.first)) {
           gap.emptyResponses = (gap.emptyResponses ?? 0) + 1
@@ -1478,8 +1475,8 @@ export class MarketService {
       gap.emptyResponses = 0
       const oldest = Math.min(...older.map(value => value.timestamp))
       if (oldest >= cursor) throw new Error('OKX history cursor did not advance.')
-      await this.persistCandles(instrument.instId, older, { projectList: priority !== 'background' })
-      remaining = await this.store.missingCandleRanges({ instrument: instrument.instId, timeframe: '5m', ...gap, intervalMS: FIVE_MINUTES })
+      await this.persistCandles(instrument.instId, older, { projectList: priority !== 'background', priority: storePriority })
+      remaining = await this.store.missingCandleRanges({ instrument: instrument.instId, timeframe: '5m', ...gap, intervalMS: FIVE_MINUTES }, storePriority)
       repaired ||= rangeSlots(remaining) < initialSlots
       if (!remaining.length) return { repaired: true, exhausted: false, remaining }
       cursor = oldest
@@ -1500,12 +1497,11 @@ export class MarketService {
         const gap = next.range
         state.currentRange = gap
         state.currentPriority = null
-        const presentMissing = await this.store.missingCandleRanges({ instrument: instrument.instId, timeframe: '5m', ...gap, intervalMS: FIVE_MINUTES })
+        const presentMissing = await this.store.missingCandleRanges({ instrument: instrument.instId, timeframe: '5m', ...gap, intervalMS: FIVE_MINUTES }, 'foreground')
         if (!presentMissing.length) {
           this.replaceCandleRepairRange(state, gap, [], false, this.activeVisibleRepairRange(instrument))
           this.updateCandleRepairState(state)
-          this.resumeDeferredStatistics(instrument)
-          this.requestStatisticsWhenVisibleCandlesReady(instrument, state)
+          this.promoteStatistics(instrument.instId)
           continue
         }
         if (rangeSlots(presentMissing) !== rangeSlots([gap]) || presentMissing.length !== 1 || presentMissing[0].from !== gap.from || presentMissing[0].through !== gap.through) {
@@ -1516,8 +1512,7 @@ export class MarketService {
         gap.status = 'loading'; gap.retryAt = null; gap.lastError = ''
         state.currentPriority = this.repairPriority(instrument, gap)
         this.updateCandleRepairState(state)
-        this.markChartDataChanged()
-        this.resumeDeferredStatistics(instrument)
+        this.markChartDataChanged(instrument)
         let result
         try {
           result = await this.repairGap(instrument, gap, controller.signal)
@@ -1525,17 +1520,17 @@ export class MarketService {
           result = controller.signal.aborted ? { repaired: false, exhausted: false, deferred: true, remaining: [gap] } : {
             repaired: false,
             exhausted: false,
-            remaining: await this.store.missingCandleRanges({ instrument: instrument.instId, timeframe: '5m', ...gap, intervalMS: FIVE_MINUTES }),
+            remaining: await this.store.missingCandleRanges({ instrument: instrument.instId, timeframe: '5m', ...gap, intervalMS: FIVE_MINUTES }, 'foreground'),
             error: error instanceof Error ? error.message : 'Cannot repair missing candles.',
             retryAfter: retryAfter(error),
           }
         }
-        const remaining = result.remaining ?? await this.store.missingCandleRanges({ instrument: instrument.instId, timeframe: '5m', ...gap, intervalMS: FIVE_MINUTES })
+        const remaining = result.remaining ?? await this.store.missingCandleRanges({ instrument: instrument.instId, timeframe: '5m', ...gap, intervalMS: FIVE_MINUTES }, 'foreground')
         if (!remaining.length) this.replaceCandleRepairRange(state, gap, [], false, this.activeVisibleRepairRange(instrument))
         else if (result.deferred) {
           gap.status = 'queued'; gap.retryAt = null; gap.lastError = ''
           this.updateCandleRepairState(state)
-          this.markChartDataChanged()
+          this.markChartDataChanged(instrument)
           break
         }
         else if (result.exhausted) {
@@ -1546,16 +1541,15 @@ export class MarketService {
           retrying.forEach(range => this.retryCandleRepairRange(range, result.error ?? 'OKX did not return the missing candle range.', result.retryAfter))
         }
         this.updateCandleRepairState(state)
-        this.markChartDataChanged()
-        this.resumeDeferredStatistics(instrument)
-        this.requestStatisticsWhenVisibleCandlesReady(instrument, state)
+        this.markChartDataChanged(instrument)
+        this.promoteStatistics(instrument.instId)
       }
     } catch (error) {
       if (!this.disposed && !controller.signal.aborted) {
         const message = error instanceof Error ? error.message : 'Cannot inspect cached candle gaps.'
         for (const gap of state.ranges.filter(gap => gap.status === 'loading')) this.retryCandleRepairRange(gap, message, retryAfter(error))
         this.updateCandleRepairState(state)
-        this.markChartDataChanged()
+        this.markChartDataChanged(instrument)
       }
     } finally {
       if (state.controller === controller) state.controller = null
@@ -1564,17 +1558,16 @@ export class MarketService {
       state.running = false
       this.updateCandleRepairState(state)
       this.scheduleCandleRepair(instrument, state)
-      this.resumeDeferredStatistics(instrument)
-      this.requestStatisticsWhenVisibleCandlesReady(instrument, state)
+      this.promoteStatistics(instrument.instId)
     }
   }
 
-  async ensureChartRange(instrument, timeframe, end, focusToken, repairEnd = end) {
+  async ensureChartRange(instrument, timeframe, end, focusToken, repairEnd = end, priority = 'foreground') {
     const range = chartRepairRange(timeframe, end, repairEnd)
     const visibleRange = chartVisibleRange(timeframe, end)
     const state = this.candleRepairState(instrument.instId)
     this.repartitionCandleRepairRanges(state, visibleRange)
-    const missing = await this.store.missingCandleRanges({ instrument: instrument.instId, timeframe: '5m', ...range, intervalMS: FIVE_MINUTES })
+    const missing = await this.store.missingCandleRanges({ instrument: instrument.instId, timeframe: '5m', ...range, intervalMS: FIVE_MINUTES }, priority)
     if (focusToken !== undefined && !this.ownsForeground(instrument.instId, focusToken)) {
       return { stale: true, visibleCandleReady: false, candleState: 'ready', missingCandleRanges: [], candleRetryAt: null }
     }
@@ -1659,7 +1652,7 @@ export class MarketService {
     }, plan.delay)
     timer.unref?.()
     state.timer = timer
-    this.markChartDataChanged()
+    this.markChartDataChanged(instrument)
   }
 
   async hydrate(instrument, priority = 'foreground') {
@@ -1698,10 +1691,10 @@ export class MarketService {
         if (live) this.liveCandles.set(instrument.instId, live)
         else this.liveCandles.delete(instrument.instId)
         if (!confirmed.length) throw new Error('OKX returned no confirmed 5m candles.')
-        const persisted = await this.persistCandles(instrument.instId, confirmed)
+        const persisted = await this.persistCandles(instrument.instId, confirmed, { priority: priority === 'background' ? 'background' : 'foreground' })
         this.lastCandleHydration.set(instrument.instId, Date.now())
         state.status = 'ready'; state.attempt = 0; state.retryAt = null; state.lastError = ''
-        if (!persisted && (liveChanged || recovering)) this.markChartDataChanged()
+        if (!persisted && (liveChanged || recovering)) this.markChartDataChanged(instrument)
         return true
       } catch (error) {
         if (!controller.signal.aborted && !requestWasCancelled(error)) this.scheduleLatestCandleRetry(instrument, state, error instanceof Error ? error.message : 'Cannot refresh latest candles.', retryAfter(error), priority)
@@ -1729,7 +1722,7 @@ export class MarketService {
 
   async loadBars(instrument, timeframe, targetEnd, { hydrate = true, repair = true, statistics = true, foreground = false, focusToken } = {}) {
     const staleForeground = () => foreground && focusToken !== undefined && !this.ownsForeground(instrument, focusToken)
-    const staleResult = () => ({ stale: true, bars: [], revision: this.revision, candleState: 'ready', missingCandleRanges: [], candleRetryAt: null, statisticsState: 'ready', statisticsRetryAt: null })
+    const staleResult = () => ({ stale: true, bars: [], revision: this.dataRevision(instrument), candleState: 'ready', missingCandleRanges: [], candleRetryAt: null, statisticsState: 'ready', statisticsRetryAt: null })
     if (staleForeground()) return staleResult()
     const metadata = this.instruments.get(instrument)
     if (foreground && metadata && targetEnd !== undefined && this.ownsForeground(instrument, focusToken)) this.activateChartViewport(metadata, timeframe, targetEnd, false)
@@ -1744,12 +1737,15 @@ export class MarketService {
     }
     if (staleForeground()) return staleResult()
     const intervalMS = timeframeMilliseconds(timeframe)
-    const rawCoverage = await this.store.coverage(instrument, '5m')
+    // Neighbor previews and history windows read the store in the background
+    // lane; only a focused latest viewport may cut ahead of queued work.
+    const storePriority = foreground ? 'foreground' : 'background'
+    const rawCoverage = targetEnd === undefined ? await this.store.coverage(instrument, '5m', storePriority) : null
     // A rapid wheel stream can leave many messages in flight. Never enqueue a
     // second DuckDB read, a repair, or a chart calculation for a viewport that
     // has already lost foreground ownership.
     if (staleForeground()) return staleResult()
-    const latest = targetEnd === undefined ? await latestCompleteChartEnds(this.store, instrument, rawCoverage, timeframe) : null
+    const latest = targetEnd === undefined ? await this.latestChartEnds(instrument, rawCoverage, timeframe, storePriority) : null
     if (staleForeground()) return staleResult()
     const chartEnd = targetEnd ?? latest?.displayEnd ?? null
     const repairEnd = targetEnd ?? latest?.repairEnd ?? chartEnd
@@ -1762,13 +1758,14 @@ export class MarketService {
       if (targetEnd === undefined) this.activateChartViewport(metadata, timeframe, chartEnd, true, repairEnd)
       else currentForeground = this.isActiveChartViewport(instrument, timeframe, chartEnd)
     }
-    const availability = metadata && repair && currentForeground ? await this.ensureChartRange(metadata, timeframe, chartEnd, focusToken, repairEnd) : { visibleCandleReady: true, candleState: 'ready', missingCandleRanges: [], candleRetryAt: null }
+    const availability = metadata && repair && currentForeground ? await this.ensureChartRange(metadata, timeframe, chartEnd, focusToken, repairEnd, storePriority) : { visibleCandleReady: true, candleState: 'ready', missingCandleRanges: [], candleRetryAt: null }
     if (staleForeground() || availability.stale) return staleResult()
     const ownsForeground = currentForeground && this.ownsForeground(instrument, focusToken)
-    // OI/Taker comes from direct timeframe endpoints and only needs the
-    // visible 96-candle source window. Do not hold it behind an unrelated
-    // EMA warm-up repair hundreds of candles to the left.
-    const statisticsState = metadata && statistics && ownsForeground && availability.visibleCandleReady ? this.requestStatistics(metadata, timeframe, chartEnd) : null
+    // OI/Taker hydration starts with the viewport, not after candle repair.
+    // Its rows attach to whatever raw periods already exist, so statistics
+    // fill in progressively while repair continues instead of waiting for the
+    // whole visible window to finish.
+    const statisticsState = metadata && statistics && ownsForeground ? this.requestStatistics(metadata, timeframe, chartEnd) : null
     const live = timeframe === '5m' ? this.liveCandles.get(instrument) : undefined
     const through = targetEnd === undefined ? Math.max(chartEnd, live?.timestamp ?? chartEnd) : chartEnd + CHART_FUTURE_CANDLES * intervalMS
     // To aggregate a derived bar at `through`, read the complete 5m bucket
@@ -1782,16 +1779,16 @@ export class MarketService {
     let bars, revision
     while (true) {
       if (staleForeground()) return staleResult()
-      revision = this.revision
+      revision = this.dataRevision(instrument)
       bars = this.chartResults.get(key)
       if (!bars) {
         let candles
         if (timeframe === '5m') {
-          candles = await this.store.candles({ instrument, timeframe, from: calculationFrom, through })
+          candles = await this.store.candles({ instrument, timeframe, from: calculationFrom, through }, storePriority)
         } else {
           const [source, direct] = await Promise.all([
-            this.store.candles({ instrument, timeframe: '5m', from: calculationFrom, through: sourceThrough }),
-            this.store.candles({ instrument, timeframe, from: calculationFrom, through }),
+            this.store.candles({ instrument, timeframe: '5m', from: calculationFrom, through: sourceThrough }, storePriority),
+            this.store.candles({ instrument, timeframe, from: calculationFrom, through }, storePriority),
           ])
           const directStatistics = new Map(direct.map(value => [value.timestamp, value]))
           candles = aggregate(source, timeframe === '15m' ? 900_000 : 3_600_000).map(value => {
@@ -1810,7 +1807,7 @@ export class MarketService {
         if (staleForeground()) return staleResult()
         bars = barsWithIndicators(live ? [...candles, live] : candles, intervalMS).filter(value => value.hour >= outputFrom && value.hour <= through)
         // Never reinsert a chart that was read before a repair/statistics write.
-        if (revision !== this.revision) continue
+        if (revision !== this.dataRevision(instrument)) continue
         if (staleForeground()) return staleResult()
         this.chartResults.set(key, bars)
         if (this.chartResults.size > 24) this.chartResults.delete(this.chartResults.keys().next().value)
@@ -1890,6 +1887,8 @@ export class MarketService {
       this.listProjectionResults.clear()
       this.listProjectionDataVersions.clear()
       this.listCatalogProjectionTasks.clear()
+      this.chartEnds.clear()
+      this.dataRevisions.clear()
       this.activeChartInstrument = null
     })
     return this.disposeTask
