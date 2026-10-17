@@ -104,16 +104,17 @@ test('missing credentials and empty output produce actionable errors', async () 
   assert.match(empty.get('BTC')!.error, /empty answer/)
 })
 
-function nativeFixture(status: number, data: string, interrupted = false) {
+function nativeFixture(status: number, data: string, interrupted = false, beforeTerminal?: Promise<void>) {
   const events = new EventTarget(), bodies: string[] = [], cancelled: string[] = []
   const bridge = { async postMessage(request: { gatewayFetch?: { id: string; body: string }; cancelGatewayFetch?: string }) {
     if (request.cancelGatewayFetch) { cancelled.push(request.cancelGatewayFetch); return { ok: true } }
     const { id, body } = request.gatewayFetch!
     bodies.push(body)
-    setTimeout(() => {
+    setTimeout(async () => {
       const bytes = new TextEncoder().encode(data)
       // Deliberately split every multibyte Chinese character and SSE frame.
       for (const byte of bytes) events.dispatchEvent(new CustomEvent('radar-gateway-stream', { detail: { id, type: 'data', base64: btoa(String.fromCharCode(byte)) } satisfies GatewayEvent }))
+      if (beforeTerminal) await beforeTerminal
       events.dispatchEvent(new CustomEvent('radar-gateway-stream', { detail: { id, type: interrupted ? 'error' : 'end', message: 'Gateway stream interrupted.' } satisfies GatewayEvent }))
     }, 0)
     return { status, headers: { 'Content-Type': status === 200 ? 'text/event-stream' : 'application/json' } }
@@ -136,10 +137,17 @@ for (const direction of ['long', 'short'] as const) test(`actual compatible SDK 
   assert.equal(native.bodies.length, 1)
 })
 
-test('SDK preserves partial text on network and incomplete SSE failures without automatic retry', async () => {
+test('SDK preserves partial text on network and incomplete SSE failures without automatic retry', { timeout: 5_000 }, async () => {
   for (const interrupted of [false, true]) {
-    const native = nativeFixture(200, delta('部分回答'), interrupted)
-    const store = new ChartAnalysisStore(createAnalysisRunner(native.fetch), settings)
+    let releaseTerminal = () => {}
+    const beforeTerminal = new Promise<void>(resolve => { releaseTerminal = resolve })
+    const native = nativeFixture(200, delta('部分回答'), interrupted, interrupted ? beforeTerminal : undefined)
+    const runner = createAnalysisRunner(native.fetch)
+    const store = new ChartAnalysisStore((input, onText) => runner(input, text => {
+      onText(text)
+      // Network failure follows a visible partial answer, rather than racing SDK transforms.
+      releaseTerminal()
+    }), settings)
     await store.analyze('BTC', snapshot)
     assert.equal(store.get('BTC')?.phase, 'error')
     assert.equal(store.get('BTC')?.turns[0].text, '部分回答')
