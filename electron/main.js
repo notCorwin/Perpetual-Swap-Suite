@@ -50,9 +50,6 @@ const defaults = {
   floatingBlurRadius: 64,
   frostedBackgroundEnabled: true,
   frostedBackgroundOpacity: 0.3,
-  backgroundMonitoringEnabled: false,
-  notificationsEnabled: false,
-  monitoringPaused: false,
   hourlyVolumeStabilityEnabled: false,
 }
 let settingsCache = { ...defaults }
@@ -71,22 +68,15 @@ async function saveSettings(value) {
   return next
 }
 
-function preferences(saved) {
-  try { return saved.filterLibraryPreferencesJSON ? JSON.parse(saved.filterLibraryPreferencesJSON) : { favorites: [], recent: [], layout: 'sentences' } }
-  catch { return { favorites: [], recent: [], layout: 'sentences' } }
-}
-
 async function snapshot(timeframe) {
   const frame = ['5m', '15m', '1H'].includes(timeframe) ? timeframe : lastSnapshotTimeframe
   lastSnapshotTimeframe = frame
   const saved = await settings()
   const market = marketService ? await marketService.snapshot(frame) : { rows: [], revision: 0, error: 'Loading OKX market data…', loading: true, updatedAt: null, listProgress: { total: 0, completed: 0, pending: 0, retrying: 0, unavailable: 0 }, timeframe: frame, catalogSource: 'none' }
   return {
-    ...saved, rows: market.rows, updatedAt: market.updatedAt, error: market.error, revision: market.revision, timeframe: market.timeframe,
+    ...Object.fromEntries(Object.keys(defaults).map(key => [key, saved[key]])),
+    rows: market.rows, updatedAt: market.updatedAt, error: market.error, revision: market.revision, timeframe: market.timeframe,
     listProgress: market.listProgress, loading: market.loading, catalogSource: market.catalogSource,
-    filterMetricsCatalog: [], filterFunctions: [], filterFunctionCatalog: [],
-    filterLibraryPreferences: preferences(saved), notificationAuthorization: 'unavailable',
-    notificationError: '', backgroundMonitoringError: '', launchAtLogin: 'unavailable', launchAtLoginError: '',
   }
 }
 
@@ -120,7 +110,7 @@ async function gatewayFetch(event, value) {
 
 function unsupported(request) {
   const operation = Object.keys(request).find(key => !['copyText', 'captureChart', 'analysisSettings', 'windowTintRGB', 'previewWindowBlur'].includes(key)) ?? 'request'
-  throw new Error(`Electron data service does not yet implement “${operation}”. Configure the DuckDB/Parquet service before using market data.`)
+  throw new Error(`Unsupported desktop bridge operation “${operation}”.`)
 }
 
 async function handleRequest(event, request) {
@@ -139,19 +129,7 @@ async function handleRequest(event, request) {
     if (request.e2e.action === 'settings') return settings()
     throw new Error('Unknown E2E desktop action.')
   }
-  if ('suite' in request) {
-    return { profiles: [], selectedID: '', confirmed: [], provisional: [], rows: [], revision: 0, timeframe: request.suite.timeframe }
-  }
-  if ('research' in request) return { studies: [], job: null, ok: true }
-  if ('foregroundWorkspace' in request) return { ok: true }
   if ('rocPeriod' in request) return snapshot(request.timeframe)
-  if ('compileMarketFilters' in request) {
-    const source = request.compileMarketFilters
-    const configJSON = source.filtersJSON ?? source.previousJSON ?? ''
-    return { diagnostics: configJSON ? [] : ['A rule configuration is required.'], configJSON, expressions: {}, units: {}, requiredHours: 0 }
-  }
-  if ('previewMarketFilters' in request) return { ...(await snapshot(request.previewMarketFilters.timeframe)), filterToken: request.previewMarketFilters.token, filterResults: {}, historyProgress: { pending: 0, completed: 0, error: '' } }
-  if ('explainMarketFilters' in request) return { instId: request.explainMarketFilters.instId, filterToken: request.explainMarketFilters.token, revision: 0, trace: null }
   if ('chartWindow' in request) {
     const { instId, timeframe, endHour } = request.chartWindow ?? {}
     if (typeof instId !== 'string' || !['5m', '15m', '1H'].includes(timeframe)
@@ -194,7 +172,7 @@ async function handleRequest(event, request) {
   }
   if ('windowTintRGB' in request || 'previewWindowBlur' in request) return { ok: true }
   const keys = Object.keys(request)
-  if (keys.some(key => key in defaults || key === 'filterLibraryPreferencesJSON')) {
+  if (keys.length && keys.every(key => Object.hasOwn(defaults, key))) {
     await saveSettings(request)
     if ('hourlyVolumeStabilityEnabled' in request) marketService?.invalidate()
     return snapshot()

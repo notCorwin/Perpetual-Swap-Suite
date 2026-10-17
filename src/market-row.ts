@@ -1,25 +1,8 @@
+import type { OpportunityResult } from "./market-opportunity.ts"
 import type { BreakResult } from "./market-breaks.ts"
 import type { BandWidthExpansion, LogBBAboveBand } from "./market-logbb.ts"
 import type { PercentageValue } from "./market-percent.ts"
 import type { EMA200Signal } from "./market-sort.ts"
-
-export type MarketFilterMetrics = {
-  liveOpen: number | null
-  liveClose: number | null
-  ema200: number | null
-  previousEMA200: number | null
-  vwap14: number | null
-  bbUpper: number | null
-  bbMiddle: number | null
-  bbLower: number | null
-  priorHigh48: number | null
-  priorLow48: number | null
-  priorHigh96: number | null
-  priorLow96: number | null
-  oiUSD: number | null
-  spreadPercent: number | null
-  liveVolumeUSDT: number | null
-}
 
 export type MarketRow = {
   instId: string
@@ -47,5 +30,6 @@ export type MarketRow = {
   logBBExpansion: BandWidthExpansion | null
   rocChange: PercentageValue
   marocChange: PercentageValue
-  filterMetrics: MarketFilterMetrics
 }
+
+export type NativeMarketRow = MarketRow & { opportunity: OpportunityResult }

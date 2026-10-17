@@ -42,7 +42,6 @@ test('market discovery admits only a fully liquid USDT perpetual', async () => {
     assert.equal(snapshot.rows.length, 1)
     assert.equal(snapshot.rows[0].instId, 'BTC-USDT-SWAP')
     assert.equal(snapshot.rows[0].turnover24hUSDT, 40_000_000)
-    assert.equal(snapshot.rows[0].filterMetrics.oiUSD, 6_000_000)
   } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
@@ -419,7 +418,6 @@ test('refresh projects cached 1H indicators and direct OI/Taker statistics into 
     assert.equal(snapshot.timeframe, '1H')
     assert.equal(snapshot.listProgress.total, 1)
     assert.equal(row.ema200Signal, 'Long')
-    assert.ok(Number.isFinite(row.filterMetrics.ema200))
     assert.ok(Number.isFinite(row.roc))
     assert.ok(Number.isFinite(row.maroc))
     assert.ok(Number.isFinite(row.rsi6))
@@ -430,7 +428,7 @@ test('refresh projects cached 1H indicators and direct OI/Taker statistics into 
     assert.equal(row.sell, 3_000 + 95)
     assert.ok((row.takerRatio ?? 0) > 0)
     assert.notEqual(row.opportunity.status, 'Incomplete')
-    assert.equal(row.filterMetrics.liveClose, fixture.closeAt(fixture.ends['1H']))
+    assert.equal(row.price, fixture.closeAt(fixture.ends['1H']))
     assert.deepEqual(requests.sort(), [
       '/api/v5/market/books', '/api/v5/market/candles', '/api/v5/market/tickers', '/api/v5/public/instruments', '/api/v5/public/open-interest',
     ].sort(), 'A complete cached list must not fetch candles or statistics before displaying its readings.')

@@ -1,5 +1,5 @@
 import type { MarketStore } from './market-store.js'
-import type { NativeMarketRow } from '../../src/rule-engine.ts'
+import type { NativeMarketRow } from '../../src/market-row.ts'
 import type { PreparedChartResponse } from '../../src/chart-data.ts'
 export type { PreparedChartBar } from '../../src/chart-data.ts'
 export type PreparedChartWindow = PreparedChartResponse

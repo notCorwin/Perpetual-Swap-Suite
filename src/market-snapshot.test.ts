@@ -1,12 +1,19 @@
 import assert from "node:assert/strict"
-import { readFileSync } from "node:fs"
 import test from "node:test"
-import { keepSnapshotValue, reconcileMarketRows } from "./market-snapshot.ts"
-import type { NativeMarketRow } from "./rule-engine.ts"
+import { reconcileMarketRows } from "./market-snapshot.ts"
+import type { NativeMarketRow } from "./market-row.ts"
 
 test("bridge refreshes keep unchanged row identities while updating changed readings and opportunity", () => {
-  const fixtures = JSON.parse(readFileSync(new URL("./fixtures/filter-compatibility.json", import.meta.url), "utf8")) as { row: NativeMarketRow }[]
-  const previous = fixtures.slice(0, 3).map((fixture, index) => ({ ...fixture.row, instId: `MKT${index}` }))
+  const previous: NativeMarketRow[] = Array.from({ length: 3 }, (_, index) => ({
+    instId: `MKT${index}`, turnover24hUSDT: 40_000_000, ema200Signal: "Long",
+    price: 100, lastPrice: 101, priceChange: 1, currentLow: 99, currentHigh: 102,
+    buy: 100, sell: 90, takerRatio: 5, oiChange: 2,
+    highBreakout: { status: "none" }, lowBreakdown: { status: "none" },
+    highBreakout96: { status: "none" }, lowBreakdown96: { status: "none" },
+    roc: 2, maroc: 1, rocChange: 1, marocChange: 0.5,
+    rsi6: 60, rsi12: 55, rsi24: 50, logBBAboveBand: "middle", logBBExpansion: null,
+    opportunity: { direction: "Long", setup: "Startup", status: "Candidate", score: 87, components: null, reasons: [] },
+  }))
   assert.equal(reconcileMarketRows(previous, structuredClone(previous)), previous)
   const incoming = structuredClone(previous)
   incoming[1].oiChange = -4
@@ -18,12 +25,4 @@ test("bridge refreshes keep unchanged row identities while updating changed read
   assert.equal(next[1].oiChange, -4)
   assert.equal(next[2].opportunity.score, 21)
   assert.deepEqual(reconcileMarketRows(next, [incoming[2], incoming[0]]), [next[2], next[0]])
-})
-
-test("unchanged catalog and match results do not trigger editor or table updates", () => {
-  const results = { BTC: "true", ETH: "unknown" }
-  assert.equal(keepSnapshotValue(results, { ...results }), results)
-  assert.notEqual(keepSnapshotValue(results, { BTC: "false", ETH: "unknown" }), results)
-  const choices = [{ value: "rising", label: "Rising" }]
-  assert.equal(keepSnapshotValue(choices, structuredClone(choices)), choices)
 })

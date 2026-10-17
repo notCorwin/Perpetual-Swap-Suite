@@ -1,4 +1,4 @@
-import type { NativeMarketRow } from "./rule-engine.ts"
+import type { NativeMarketRow } from "./market-row.ts"
 
 function equalValue(a: unknown, b: unknown): boolean {
   if (Object.is(a, b)) return true
@@ -18,18 +18,4 @@ export function reconcileMarketRows(previous: NativeMarketRow[], incoming: Nativ
     return old && equalValue(old, row) ? old : row
   })
   return previous.length === next.length && next.every((row, index) => row === previous[index]) ? previous : next
-}
-
-export function keepSnapshotValue<T>(previous: T, incoming: T): T {
-  if (Object.is(previous, incoming)) return previous
-  if (!previous || !incoming || typeof previous !== 'object' || typeof incoming !== 'object') return incoming
-  const before = snapshotSignature(previous as object), after = snapshotSignature(incoming as object)
-  return before === after ? previous : incoming
-}
-
-const snapshotSignatures = new WeakMap<object, string>()
-function snapshotSignature(value: object): string {
-  let signature = snapshotSignatures.get(value)
-  if (signature === undefined) { signature = JSON.stringify(value); snapshotSignatures.set(value, signature) }
-  return signature
 }

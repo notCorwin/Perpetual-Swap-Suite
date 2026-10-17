@@ -270,7 +270,7 @@ function sameCandle(left, right) {
 }
 
 function marketRow(instrument, ticker, result, bars = []) {
-  const last = number(ticker.last), metrics = summarizeMarketBars(bars), { latest, previous } = metrics
+  const last = number(ticker.last), metrics = summarizeMarketBars(bars), { latest } = metrics
   const row = {
     instId: instrument.instId,
     turnover24hUSDT: result.turnover,
@@ -299,23 +299,6 @@ function marketRow(instrument, ticker, result, bars = []) {
     rsi24: latest?.rsi24 ?? null,
     logBBAboveBand: latest?.bandPosition ?? null,
     logBBExpansion: metrics.logBBExpansion,
-    filterMetrics: {
-      liveOpen: latest?.open ?? null,
-      liveClose: latest?.close ?? null,
-      ema200: latest?.ema ?? null,
-      previousEMA200: previous?.ema ?? null,
-      vwap14: latest?.vwap ?? null,
-      bbUpper: latest?.logBBUpper ?? null,
-      bbMiddle: latest?.logBBMiddle ?? null,
-      bbLower: latest?.logBBLower ?? null,
-      priorHigh48: metrics.priorHigh48,
-      priorLow48: metrics.priorLow48,
-      priorHigh96: metrics.priorHigh96,
-      priorLow96: metrics.priorLow96,
-      oiUSD: result.oiUSD,
-      spreadPercent: result.spread,
-      liveVolumeUSDT: latest?.quoteVolume ?? null,
-    },
   }
   return {
     ...row,
@@ -452,7 +435,6 @@ export class MarketService {
       instId: base.instId,
       turnover24hUSDT: base.turnover24hUSDT,
       lastPrice: base.lastPrice,
-      filterMetrics: { ...previous.filterMetrics, oiUSD: base.filterMetrics.oiUSD, spreadPercent: base.filterMetrics.spreadPercent },
     }
   }
 

@@ -2,41 +2,21 @@
 
 [![Publish macOS Release](https://github.com/notCorwin/Perpetual-Swap-Suite/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/notCorwin/Perpetual-Swap-Suite/actions/workflows/release.yml)
 
-An Electron desktop app for discovering Bullish Setup signals on OKX perpetual swaps and researching their historical results. It covers live, non-TradFi USDT perpetual contracts. Radar charts use native OKX 5m, 15m, and 1h candles; Research keeps hourly execution semantics.
-
-**Radar** discovers live signals. **Research** tests the same strategies against frozen data. Both modes share one strategy library, identity and revisions. Electron hosts the React dashboard behind a context-isolated preload bridge. The Electron main process stores completed market observations as partitioned Parquet files and uses DuckDB for queries. The interface is English-only. No OKX API key or local web server is required.
+An Electron desktop app for screening and charting live OKX USDT perpetual contracts. The React dashboard uses an isolated preload bridge; the Electron main process collects public market data, stores completed observations in Parquet, and queries them with DuckDB. No OKX API key is required.
 
 ## Features
 
-- **Live signal discovery:** a full-width Bullish Setup radar with separate confirmed and provisional readings and direct chart/evidence access. All markets retains sortable indicators, search, and Long/Short Opportunity rankings with score explanations. Indicators include EMA200, Log Bollinger Bands, RSI, ROC/MAROC, open interest, taker volume, and high breakouts/low breakdowns.
-- **Visual and formula rules:** synchronized editors support AND/OR/NOT groups, calculations, candle-window conditions, event sequences, reusable values, and BTC market context. Inspect actual operands and data gaps with rule previews and market explanations.
-- **Shared strategy library:** save Universe and Bullish Setup rules together, monitor confirmed and provisional signals, and use the exact saved revisions in either mode.
-- **Reproducible research:** study Bullish Setup signals, compare frozen strategy versions, and calibrate Opportunity scores on matching setups. Review coverage, fixed-horizon Long returns, costs, funding, and signal evidence; pause, resume, and export CSVs.
-- **Interactive charts:** review 96 selected-period candles at a time with VWAP14, EMA200, Log BB, RSI, and ROC/MAROC. All three chart periods include native OI and taker contract volume when the source provides it. Load older history, navigate contracts by keyboard, and copy charts to the clipboard.
-- **Native macOS workflow:** optional background monitoring, menu bar controls, notifications, Start at Login, automatic updates, Light/Dark/System appearance, adjustable frosted backgrounds, and tabular numbers.
+- A searchable, sortable market table with Long/Short Opportunity scores, price changes, high breakouts/low breakdowns, taker imbalance, open interest, ROC/MAROC, RSI, and Log Bollinger Band readings.
+- Liquidity screening for live, non-TradFi USDT perpetual contracts, with an optional hourly volume stability requirement.
+- Native OKX 5m, 15m, and 1h charts with 96 candles per window, historical scrolling, keyboard navigation, chart copying, and technical indicator panels.
+- Optional AI chart analysis through Vercel AI Gateway, with separate Long/Short prompts and follow-up conversations.
+- English interface controls, tabular numbers, system light/dark styles, and shared design tokens for background materials and components.
 
-## Quick start
+## Install or build
 
-### Install the app
+Download `Perpetual.Swap.Suite.app.zip` from the [autobuild release](https://github.com/notCorwin/Perpetual-Swap-Suite/releases/tag/autobuild), extract it, and move `Perpetual Swap Suite.app` to `/Applications`. Local and CI packages are ad hoc signed.
 
-Running the app requires **macOS 14 or newer** and network access to OKX and GitHub.
-
-The current `autobuild` package targets Apple Silicon (`arm64`). For Intel Macs, build from source.
-
-1. Open the [latest `autobuild` release](https://github.com/notCorwin/Perpetual-Swap-Suite/releases/tag/autobuild).
-2. Download and extract `Perpetual.Swap.Suite.app.zip`.
-3. Move `Perpetual Swap Suite.app` to Applications and launch it.
-
-The release contains an ad hoc signed app bundle. Each successful release build replaces the `autobuild` package.
-
-On first launch, the collector loads market history in the background. Charts prepare native candles and statistics for the selected period. Markets and indicators appear as their data becomes available; missing readings display as `—`.
-
-### Build the Electron app from source
-
-Use a macOS version supported by your Xcode installation, with:
-
-- **Node.js 22.18+ within the 22.x line, or Node.js 24.11+**, and npm. These minimums follow the current dependency lockfile.
-- Network access for npm dependencies, OKX public REST and WebSocket endpoints, and GitHub releases.
+To build on Apple Silicon macOS, use Node.js 24.11+ and npm, with network access for dependencies and OKX public endpoints:
 
 ```sh
 git clone https://github.com/notCorwin/Perpetual-Swap-Suite.git
@@ -46,187 +26,107 @@ npm run app
 open "dist/mac-arm64/Perpetual Swap Suite.app"
 ```
 
-`npm run app` builds the Vite renderer and packages a signed Electron `.app` with electron-builder. Use `npm run dev` for hot-reload development.
+`npm run app` builds the TypeScript/Vite renderer, packages Electron with electron-builder, and verifies the app signature. `npm run dev` starts Vite and Electron together for development. The renderer requires the Electron preload bridge; opening `dist/index.html` in an ordinary browser does not provide market data.
 
-## Using Radar
+## Screen markets
 
-### Screen markets
+The collector includes live, non-TradFi USDT perpetuals that pass all mandatory checks:
 
-Select an **Active strategy** from the shared library to show its **Signals** and **All markets** together on one Radar page. Choose **5m**, **15m**, or **1h**; each signal applies Universe and Bullish Setup rules to the same selected candle. **Both states**, **Confirmed**, and **Provisional** control which readings appear. Confirmed matches sort first, followed by 24-hour turnover; signals paginate in groups of 25. Chart navigation follows the signal list you opened.
+| Check | Requirement |
+| --- | --- |
+| Bid-ask spread | Below 0.05% |
+| Order book depth | At least 100,000 USDT on each side |
+| Estimated slippage | Below 0.10% on each side for a 100,000 USDT fill |
+| Estimated 24h turnover | Above 30,000,000 USDT |
+| Open interest notional | Above 5,000,000 USDT |
+| Hourly volume stability, optional | Maximum/minimum volume below 2 across 24 completed hours |
 
-**All markets** appears below Signals. With an active Strategy, it contains only contracts whose current Universe result is **True**, so liquidity and other eligibility rules screen the market list as well as signals. With no active Strategy, it exposes the full supported exchange universe. **Explain markets** still includes nonmatches and Unknown inputs. Search applies to both sections. **Test strategy** carries the exact saved version into Bullish Setup Research.
+Enable **Settings → Require stable hourly volume** to apply the optional check; it is off by default and persists locally. The other thresholds are fixed in the data service. Estimated turnover is 24-hour base-currency volume multiplied by the latest price.
 
-With **No active strategy**, Radar displays every contract in the supported exchange universe and offers **Strategy Library…** to create or activate a strategy. Signals and confirmed alerts require an active Strategy. Turnover, spread, listing age and every other restriction belong to the Strategy Universe; no independent Filter configuration or saved combination is applied.
+Search narrows the market list. Column headings change the sort order. The default **Opportunity** ordering groups `Candidate`, `Watch`, `Overheated`, and `Incomplete` readings; open a score to inspect its components and missing inputs. These scores are heuristic rankings. Missing or warming indicator values display as `—`, and the collection status distinguishes cached data, loading, retries, and live observations.
 
-Search narrows the visible list. Click column headings to sort; the default **Opportunity** ordering groups `Candidate`, `Watch`, `Overheated`, and `Incomplete` results. Open a score to inspect its components and missing inputs. Opportunity scores are heuristics; use Research to evaluate them against historical data.
+## Review charts
 
-### Build and save strategy rules
-
-1. In **Strategy Library**, choose a Strategy and its **Universe** or **Bullish Setup** rules, then open **Rules**, then **Add condition**. Search the condition library or choose a preset such as OI rising, Volume surge, or a BTC market context condition.
-2. Edit conditions in sentence rows or **Guided cards**. Select **Live** for the forming hour or **Closed** for completed-hour evaluation; combine conditions with groups, calculations, or time requirements.
-3. Use **Explain markets** to inspect matching, unmatched, and Unknown results.
-4. Choose **Save strategy** to save Universe and Bullish Setup together. In Radar’s **Universe rules** panel, **Save Universe** updates the active Strategy directly.
-
-Valid draft edits immediately preview rule matches and filter the All markets table. Alerts use the **active saved Strategy**. Invalid drafts retain the last valid preview and cannot be applied. Missing inputs evaluate as **Unknown**, including under NOT; only True Universe matches appear in All markets, and only True Universe and Bullish Setup matches become signals.
-
-New numeric conditions default to **Greater than >**. Numeric presets use strict **> / <** comparisons, with these choices first in the comparison menu. Inclusive comparisons remain available when selected explicitly.
-
-The optional **Formula** view edits the same rule tree. Try each example as a separate configuration:
-
-```text
-// Live quote volume exceeds twice the mean of the previous 20 closed hours
-let relativeVolume = Volume / mean(lag(Volume, 1), 20);
-relativeVolume > 2
-```
-
-```text
-// RSI14 exceeds 50 in each of the latest three completed hours
-closed(every(RSI(14) > 50, 3))
-```
-
-### Review charts
-
-Click a symbol to open its chart. Hold the primary mouse button to inspect a candle, drag while holding to inspect others, and release to return to the displayed window's latest candle. Scroll to load older history; returning to the newest candle resumes automatic following.
-
-Taker Buy/Sell uses OKX's per-contract statistics for the selected candle period in **contracts** (`unit=1`). Compare the same perpetual contract, period, and unit on OKX; coin or USDT amounts have a different scale. **Taker imbalance** is `(Buy − Sell) / (Buy + Sell) × 100%`, rather than the Buy/Sell quotient. Radar refreshes independent contracts concurrently, and the table, chart, and strategy readings share the newest observation. Unavailable current-hour data stays Unknown and is retried; completed-hour corrections are persisted, while live values stay in memory.
-
-OKX's [contract open-interest history](https://www.okx.com/docs-v5/en/#trading-statistics-rest-api-get-contract-open-interest-history) and [contract taker volume](https://www.okx.com/docs-v5/en/#trading-statistics-rest-api-get-contract-taker-volume) endpoints expose only their latest 1,440 periods: 5 days at 5m, 15 days at 15m, and 60 days at 1h. Older statistics remain available when already saved locally; older price candles alone cannot reconstruct them. The chart explains this limit when the selected range lacks statistics. A zero Buy/Sell pair that contradicts a positive-volume candle is treated as unavailable, rather than displayed as genuine zero activity.
-
-Candle OHLCV comes from OKX's native selected-period candle endpoints; ticker prices never fabricate OHLC. Only confirmed candles enter Parquet. The unconfirmed candle stays in memory as a separate live price overlay. Completed corrections invalidate the canonical indicator generation and survive reopening the application.
-
-Scrolling records all whole-candle movement once per animation frame and retains only the fractional remainder. The requested cursor and the displayed chart are separate: a ready target commits one immutable 96-candle snapshot; an uncached target keeps the previous complete chart visible with an explicit Preparing label. Intermediate requests are coalesced, and completed source work is never discarded because focus changed. Missing candle and statistics pages use stable 300/100-period boundaries, with shared requests and directional prefetch.
-
-Instrument charts are prepared while their market list is visible. Every navigation candidate retains a compact latest 96-candle snapshot independently of the bounded deep-history cache, so visiting many contracts does not evict earlier contracts' latest charts. A prepared selection reads renderer memory and commits within the next animation frame. Local preparation has its own lane; an older contract's network or history request cannot hold it up. Network freshness and historical prefetch run independently with bounded concurrency. Completed latest snapshots are cached on disk with their calculation version and source-write watermark, validated against persisted inputs before reuse after a restart. Unconfirmed candles remain memory-only. Background corrections replace complete snapshots atomically.
-
-A worker calculates indicators from the entire persisted contiguous native series, independently of viewport position. EMA200 starts with a 200-close arithmetic mean, then uses a multiplier of `2/201`. RSI uses Wilder smoothing with the initial mean gains/losses over its period; zero losses gives 100. Log BB(20, 2) uses the mean and population standard deviation of 20 log closes, exponentiated at mean ± two deviations. VWAP14 weights typical price `(High + Low + Close)/3` by quote volume; zero total volume is undefined. ROC9 uses signed relative close change, and MAROC9 is its nine-value arithmetic mean. Missing periods split indicator runs, and unavailable warmup values remain null. Older history or price corrections create a new generation; the renderer switches only when the current complete window has been rebuilt under that generation.
-
-**Estimated turnover** values OKX's 24-hour base-currency volume at the latest USDT trade price. It is an estimate, rather than the sum of each trade's actual notional. Indicator comparisons also require the same candle period, price source, formula, and warmup history; Log BB and VWAP14 retain this application's documented definitions.
+Open a contract to view its chart and select **5m**, **15m**, or **1h**. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window's latest candle. Scroll through history; returning to the newest range resumes following.
 
 | Control | Action |
 | --- | --- |
-| Up / Down | Previous / next contract in visible list order, wrapping at either end |
+| Up / Down | Previous / next contract in the visible list, wrapping at either end |
 | Left | First contract in the current sorted search results |
-| Right | Highest-turnover contract matching the valid rule preview, regardless of search |
-| Copy chart | Copy an image with an opaque theme background |
-| Analyze chart / Analysis | Analyze the visible chart or reopen its conversation |
+| Right | Highest-turnover eligible contract, independent of search |
+| Copy chart | Copy the visible chart with an opaque theme background |
+| Analyze Long / Analyze Short | Start or reopen analysis of a chart snapshot |
 
-Open **Settings → Configure analysis** to save a Vercel AI Gateway API Key locally for your macOS user and choose an image-capable model. The default is `openai/gpt-6.1-sol`. Chart analysis uses the OpenAI-compatible AI SDK provider with native URLSession networking.
+Chart OHLCV uses the selected period's native OKX candles. Confirmed candles are read from persisted data; the forming candle remains in memory as a live overlay. Ticker prices do not fabricate candle OHLC. Open interest and taker Buy/Sell volumes use the matching contract and candle period in **contracts** (`unit=1`). Taker imbalance is `(Buy − Sell) / (Buy + Sell) × 100%`.
 
-The key lives outside the app bundle in `~/Library/Application Support/PerpetualRadar/Credentials/ai-gateway.json`, with file permissions `0600` and directory permissions `0700`. It is stored as local plaintext protected by your macOS account's file permissions. App updates and repeated analyses use this record without Keychain authorization. Existing installations import their old Keychain key once; macOS may request authorization for that migration. A canceled or failed import can be retried, or bypassed by saving a new key. The local record then becomes authoritative, including after **Remove key**, so the unused legacy Keychain item is never reimported. Credential access runs off the main actor, and settings responses never contain the saved key.
+The chart statistics loader supports OKX's latest 1,440 periods: approximately 5 days at 5m, 15 days at 15m, or 60 days at 1h. Older locally saved statistics remain available; price candles alone cannot reconstruct them. Missing statistics are shown explicitly. A zero Buy/Sell pair that contradicts a positive-volume candle is treated as unavailable.
 
-**Analyze chart** opens the right-hand panel and sends an opaque PNG of the visible chart with the fixed long-entry question. Answers stream in Chinese. Follow-ups reuse that snapshot and the conversation's model; **New analysis** captures the current chart and starts over. Each contract's conversation and draft stay in memory until the app exits. Switching contracts, leaving the chart, closing the panel, or pressing **Stop** cancels an active request; retries are manual.
+Each displayed chart is a complete 96-candle snapshot. If a requested range needs preparation, the previous complete chart stays visible with a **Preparing** label. The service coalesces scrolling requests, prewarms candidate contracts, reuses saved history, and repairs missing ranges without blocking renderer input. Prepared latest snapshots also persist with calculation versions and source-write watermarks so they can be validated after restart.
 
-### Monitor Bullish Setup
+### Indicator definitions
 
-Open **Strategy Library** and configure **Universe** plus **Bullish Setup**. Universe may be unrestricted; Bullish Setup must contain valid, nonempty market rules before saving or activation. Radar monitors one activated saved strategy at a time. Saving from either mode updates that same strategy and revision. **Duplicate saved strategy** creates a separate strategy in the shared library. Unsaved drafts remain separate for each mode.
+A worker calculates indicators over the persisted contiguous series, independently of the visible window. Missing periods split the series and restart initialization. Unavailable warmup values remain null; corrections or older history rebuild the affected indicator generation.
 
-**Confirmed** results use the previous completed candle in the selected Radar timeframe; **Provisional** results use its forming candle and may retract. Both use the Universe evaluated at their own candle. Only definite matches become signals; missing inputs remain Unknown. OI and taker statistics currently remain 1h-only, so rules that require them are Unknown on 5m/15m.
-
-## Using Research
-
-Click the **Perpetual Swap Radar / Perpetual Swap Research** title to switch modes. Each mode keeps its draft, page, and scroll position. Live monitoring continues while Research prepares or evaluates data.
-
-1. Choose a **Research question**: Strategy signals, Opportunity, or Compare strategies. All three evaluate Bullish Setup together with its Strategy Universe and measure Long returns.
-2. Select saved/frozen Strategy versions, contracts, and a UTC date range. A blank start date requests the longest obtainable history. **Strategy Library** manages the shared strategies. Research initially selects the active Radar strategy. New saved revisions are surfaced explicitly; **Use latest saved revisions** updates the study configuration before preparing a new dataset.
-3. Select first-entry-per-episode or every-matching-hour sampling. Opportunity calibration uses every matching hour. Leave all three trading-cost fields blank for Gross results, or supply entry fee, exit fee, and per-side slippage in basis points, including explicit zero, for modeled Net results.
-4. Choose **Review data plan → Prepare Data → Run Study**. Review source coverage and gaps before downloading; inspect the frozen dataset once preparation finishes.
-5. Inspect reports, signal events, and frozen charts. Compare outcomes over 1, 3, 6, 12, 24, or 48 hours. Use **Studies & cache** to reopen or resume experiments, and export summary and event CSVs.
-
-**Use this version in Radar** activates the selected configuration or the primary strategy from the displayed result. If its saved rules have changed, the app restores the researched version as a separate shared strategy before activation. Existing strategies and completed results retain their versions.
-
-Research freezes rules, engine versions, input revisions, and a SHA-256 data manifest. Updating Radar rules or refreshing cached sources does not change an existing experiment. Historical evaluation runs at hourly close, with execution at the next hourly open; it does not use future candles or live EMA state.
-
-Research excludes bid/ask spread data and omits conditions that depend on spread, including reusable formulas, BTC references, and captured values. Data plans and reports list the omitted conditions. Remaining AND/OR conditions retain their logic; sequence stages retain their timing and independent captures. Research does not query or download order book archives, including when resuming older preparation plans. Recorded turnover, Opportunity scoring, fees, and configured slippage remain available. Shared strategy versions retain their original spread rules for Radar. Completed experiments retain their original results; copy an older frozen experiment to run it with the current engine.
-
-Missing prices, funding, or other required inputs remain Unknown or make affected results Incomplete. The data plan exposes public-history limits and gaps. Live BTC rules use an hourly approximation in historical studies. Fixed-horizon outcomes measure signals using next-hour opens and never infer actual positions.
-
-Downloaded inputs and checkpoints persist without automatic expiry. **Clear unreferenced cache** removes only inputs no longer referenced by experiments.
-
-Data plans are cached on disk for repeated configurations, including renamed studies, and reused after reopening the app. Changes to local inputs, instrument metadata, recorded Radar history, parser/engine versions, or the available completed-hour horizon invalidate the plan; source catalogs remain reusable. Explicit refresh bypasses the plan cache.
-
-**Prepare Data** uses one independent parser worker per available CPU core and overlaps archive transfers with parsing. Native downloads write received buffers directly to resumable partial files. REST pages, normalized batches, verified source completion records, and per-source checkpoints are saved as work completes. Resuming or preparing another study reuses completed imports. A failed source stops scheduling new work while other active sources finish and save their results.
-
-**Studies & cache** marks the current task separately from saved failures. Expand **Saved error** to read a study's complete previous error and its saved timestamp. **Resume** retries that study using its cached inputs.
-
-**Run Study** uses a CPU-sized calculation pool with independent per-contract checkpoints and a single batch writer. Frozen reads use the instrument/time index and reuse overlapping decoded inputs. Historical readings retain separate anchor-hour and earlier-hour EMA semantics; complete signal explanations are generated for saved events. Indicator batches are losslessly compressed, and reports materialize their signal rows and matched baselines once while preserving medians, funding/cost results and confidence intervals.
-
-Run `npm run benchmark:study -- STUDY_ID` to time the shipping worker against a consistent snapshot of the local research database. The command runs without application windows or network downloads, creates a new study in the snapshot, and measures calculation, durable writes and report generation together. It prints the snapshot directory and saves `benchmark-result.json` beside its complete study results. The installed application's studies remain untouched. An optional second argument selects a different research database.
-
-Planning reports each stage separately, including local history ranges, cached source files, and hourly input coverage. Local coverage checks run in bounded time ranges and report measured progress, the current instrument/input/range, and an estimate for the current stage. Pause stops between ranges; failures retain the last progress and a checkpoint error. Published archive catalog checks and file downloads use their own progress units and wording.
-
-OKX rate limits (`HTTP 429` or API code `50011`) keep Research active and automatically retry the current request. Requests share pacing and cooldowns, honor `Retry-After`, and use exponential backoff with jitter capped at 60 seconds unless OKX asks for a longer wait. The task panel shows the automatic retry countdown. Completed catalog pages, REST pages, and partial archive downloads remain reusable; Pause and Cancel interrupt the wait immediately.
-
-Older OKX candle archives may contain `None` for currency volumes while their prices and contract volumes are valid. Research imports complete hourly OHLC, converts available contract volume with verified contract metadata, and records missing quote-currency volume as Unknown. REST candle fallback requests only `5m` market candles and locally builds complete hourly OHLCV. Missing currency volume does not fail the entire archive; VWAP and volume-dependent readings require the corresponding actual inputs. Retrying after a parser update reuses cached originals.
-
-Archive minutes marked `confirm=0` are skipped and reported separately from malformed records. Missing required candle hours are supplemented with confirmed REST history; an inspected archive alone never makes those hours complete. API pacing follows each endpoint's published quota, including separate instrument quotas for funding, open interest, and taker volume.
-
-## Monitoring, notifications, and updates
-
-Choose the run mode under **Settings → Run mode**:
-
-| Mode | Closing the window or Cmd+Q |
+| Indicator | Definition |
 | --- | --- |
-| On-demand, the default | Checkpoints Research and stops collection and the helper. Reopen the app and explicitly resume paused studies. |
-| Background Monitoring | Keeps native collection and alerts running. Enables optional Start at Login. Use the menu bar's Quit Completely to stop both processes. |
+| EMA(200) | Seed with the arithmetic mean of 200 closes, then use multiplier `2 / 201` |
+| Log BB(20, 2) | Mean and population standard deviation of 20 log closes; exponentiate the mean and mean ± two deviations |
+| VWAP(14) | Quote-volume-weighted typical price `(High + Low + Close) / 3` over 14 candles; undefined when total weight is zero |
+| ROC(9) | Signed relative close change over nine candles, as a percentage |
+| MAROC(9) | Arithmetic mean of nine ROC readings |
+| RSI(6), RSI(12), RSI(24) | Wilder smoothing, seeded with mean gains/losses over the period; zero losses gives 100 |
 
-Minimizing keeps work running. **Pause Monitoring** stops collection and alerts; resuming establishes a quiet baseline.
+Applicable relative changes use `(current − previous) / abs(previous) × 100%`; a zero baseline is unavailable. Indicator comparisons require matching periods, source data, formulas, and warmup history. See [indicator calculations](electron/services/indicators.js) and [market metrics](electron/services/market-metrics.js) for implementation details.
 
-Enable **Settings → Strategy notifications** and allow notifications for **Perpetual Swap Suite Monitor**. Alerts report confirmed Bullish Setup membership changes from the active saved Strategy; drafts, search, and sort do not change their rules. Startup and rule changes establish quiet baselines, and Unknown readings preserve prior definite membership. Clicking a notification opens its contract and signal evidence. Notifications and Start at Login require the packaged `.app`.
+## AI chart analysis
 
-Automatic update installation is enabled by default. Use **Perpetual Swap Suite → Automatically Install Updates** to change it, or **Check for Updates** for a manual check. The helper verifies the release digest and source revision before installation; updates wait for active Research work and resume when it finishes, including while the Research page remains open. The update menu shows download progress, installation, and retry delays; hover over a failed update for the error. Downloads retry after 30 seconds without data, with a five-minute limit per attempt. When the server supports resuming, retries retain partial downloads for the same release.
+Open **Settings → Configure analysis**, enter a Vercel AI Gateway API key, and choose a model with image input support. The default model is `openai/gpt-6.1-sol`.
 
-Choose Light, Dark, or System in the native **Appearance** menu. **Settings** controls the frosted background and opacity; the initial appearance is Dark with opacity 0.3. Dropdown menus, popovers, dialogs, and research task overlays share dense frosted glass: a stable high-opacity tint over strong backdrop blur, with inset edges and shadows in both appearances and no gradient. This material stays independent of window opacity; the blur subtly diffuses underlying text and shapes while the dense tint keeps popup content steady and readable. Text and chart lines remain clear as background opacity changes.
+**Analyze Long** and **Analyze Short** capture the visible chart as an opaque PNG and send it through the Electron main process to Gateway. Responses stream in Chinese. Follow-up questions reuse the captured image and selected model; **New analysis** captures the current chart again. Conversations and drafts remain in memory until the app exits. **Stop**, changing contracts, or closing the panel cancels active generation. Failed requests retry automatically while the panel is open.
 
-**Window blur** controls the native blur behind the entire window, including the desktop. **Popover blur** controls app content behind menus, dialogs, and task overlays. Both default to 64 and can be adjusted independently from 0 to 160: sliders preview immediately and save on release, with errors and retry controls if persistence fails. Preferences survive window and monitor restarts. Window blur requires the frosted background to be on and background opacity below 1. Popover blur remains independent; increasing it alone cannot change the native desktop blur or make glass opaque.
+The API key is stored as plaintext in the local `settings.json` file with mode `0600`; settings responses expose whether a key is configured without returning the key. Charts and conversations are sent to Gateway only when analysis is requested.
 
 ## Local data
 
-| Location | Contents |
+Paths are relative to `~/Library/Application Support/Perpetual Swap Suite/`:
+
+| Path | Contents |
 | --- | --- |
-| `~/Library/Application Support/Perpetual Swap Suite/MarketData/candles/` | Partitioned, immutable confirmed candle Parquet files by timeframe, instrument, and UTC date |
-| `~/Library/Application Support/Perpetual Swap Suite/settings.json` | Desktop preferences and local analysis credentials (mode `0600`) |
+| `MarketData/candles/` | Confirmed candle Parquet parts partitioned by timeframe, instrument, and UTC date |
+| `MarketData/catalog.parquet` | Cached liquid-contract catalog |
+| `MarketData/prepared-charts/` | Validated latest chart snapshots |
+| `settings.json` | Liquidity and appearance preferences, analysis model, and Gateway key |
 
-Active quotes and the still-forming candle remain in memory. Completed periods are appended to Parquet; DuckDB reads the selected instrument and timeframe; chart workers retain its persisted series for consistent recursive indicators. The Electron data service serializes writes so readers never observe a partial Parquet file.
+Parquet writes are serialized and published atomically. Corrections append newer observations; DuckDB selects the latest record for each timestamp. DuckDB uses an in-memory query connection rather than a separate durable database file. Unconfirmed candles stay in memory.
 
-## Development
-
-### Project layout
+## Development and validation
 
 | Path | Responsibility |
 | --- | --- |
-| [electron](electron) | Electron main process and context-isolated preload bridge; no Node APIs are exposed to the renderer |
-| [electron/services](electron/services) | DuckDB query services and partitioned Parquet storage |
-| [src](src) | React/TypeScript dashboard, rule editors, charts, and Research views |
-| [src/components/ui](src/components/ui) | Shared shadcn/ui primitives |
-| [src/index.css](src/index.css) | Design tokens and component material contract; Tailwind CSS supplies layout and styling |
-| `src/*.test.ts` | TypeScript business, renderer, Electron bridge, and Parquet-store tests |
-| [scripts](scripts) | Electron development and renderer quality checks |
-| [macos](macos) | Electron app icon assets |
-| [.github/workflows/release.yml](.github/workflows/release.yml) | Release build, packaging, and publication |
+| [electron](electron) | Main process, isolated preload bridge, and desktop operations |
+| [electron/services](electron/services) | OKX collection, Parquet storage, DuckDB queries, chart preparation, and indicators |
+| [src](src) | React dashboard, charts, and analysis UI |
+| [src/components/ui](src/components/ui) | Shared shadcn/ui components |
+| [src/index.css](src/index.css) | Design tokens and shared surface materials |
+| [tests/e2e](tests/e2e) | Real Electron interaction and chart acceptance tests |
+| [scripts](scripts) | Development, packaging, benchmarks, and validation tools |
 
-Web dependencies and commands are in [package.json](package.json), with resolved versions in [package-lock.json](package-lock.json). `npm run build` produces the renderer in `dist/`; the context-isolated Electron preload bridge is required to run it.
-
-### Checks and release workflow
+Resolved dependencies are in [package-lock.json](package-lock.json). Use the commands in [package.json](package.json):
 
 | Command | Purpose |
 | --- | --- |
-| `npm run test:renderer` | Core business logic, indicators, controller, prepared cache, data service, and Parquet storage |
-| `npm run test:e2e` | Build and test real Electron interactions, including every painted chart snapshot |
-| `npm run lint` | Oxlint and shared component surface contracts |
-| `npm run benchmark` | Parquet writes and DuckDB query timings |
-| `npm run benchmark:chart` | Native 5m/15m/1h high-speed scrolling, reversals, 1,200-candle jumps, and delayed storage reads |
-| `npm run benchmark:instruments` | Candidate prewarming, next-frame contract switching, cache-pressure revisits, and switching during delayed history work |
-| `npm run test:okx:1h` | Live public OKX native-hourly candle, OI, and taker integration |
-| `npm run app` | Build and package the macOS Electron app |
+| `npm test` | Core TypeScript tests and Electron end-to-end checks |
+| `npm run test:renderer` | Indicators, market logic, chart controller, prepared cache, storage, and bridge contracts |
+| `npm run test:e2e` | Build and verify real Electron interactions and rendered chart snapshots |
+| `npm run lint` | Oxlint and shared component surface checks |
+| `npm run benchmark` | Parquet write and DuckDB query timings |
+| `npm run benchmark:chart` | Scrolling, reversals, large jumps, and delayed storage reads |
+| `npm run benchmark:instruments` | Contract prewarming, switching, and cache-pressure revisits |
+| `npm run test:okx:1h` | Live OKX hourly candle, open interest, and taker integration |
+| `npm run app` | Build and package the macOS app |
 
-Chart acceptance compares every committed 96-candle snapshot with a full-series numeric oracle and verifies its actual SVG metadata and OI/Taker geometry. It also checks that rapid input keeps at most one preparation request active per instrument and period, does not redownload complete durable history, and does not replay superseded cursor movement. Instrument navigation traverses 16 contracts in all three periods, revisits entries beyond the history-cache limit, and holds an old contract's history request open while verifying next-frame selection without chart-loading IPC. Delayed reads preserve the prior complete chart until the requested replacement is ready. The benchmarks report input-to-SVG commit latency and animation-frame counts separately from superseded requests.
+Chart acceptance compares committed 96-candle snapshots with a full-series numeric oracle and checks the rendered SVG metadata and OI/Taker geometry. Navigation checks include revisiting contracts beyond the deep-history cache and switching while an older history request is delayed.
 
-GitHub Actions runs the tests, live OKX integration, and benchmarks before packaging each push to `main`. A successful build publishes `Perpetual.Swap.Suite.app.zip` and `update.json`, and moves the `autobuild` release/tag to that commit.
+[GitHub Actions](.github/workflows/release.yml) runs tests, live OKX integration, and benchmarks for pushes to `main`, then packages the app and publishes the `autobuild` release with its digest metadata.
 
-## Help and contributing
-
-Maintained by [notCorwin](https://github.com/notCorwin). Report bugs or request features through [GitHub Issues](https://github.com/notCorwin/Perpetual-Swap-Suite/issues); include your macOS version, build revision, reproduction steps, and the relevant error message or data gap.
-
-The in-app condition library and **Explain markets** describe supported rules and their readings. Developers can inspect the [rule engine](src/rule-engine.ts), [indicator formulas](electron/services/indicators.js), and core tests in `src/*.test.ts` for executable examples.
-
-Before contributing, read [AGENTS.md](AGENTS.md). Keep data services behind the Electron preload bridge, reuse shadcn/ui components, and follow the shared design tokens and `data-surface` material contract. Use current stable toolchains and run the relevant checks before pushing. Submit focused pull requests with a description of the resulting behavior and local validation.
+Before contributing, read [AGENTS.md](AGENTS.md). Keep data access behind the preload bridge, reuse shared components and design tokens, and run checks relevant to the change. Report bugs through [GitHub Issues](https://github.com/notCorwin/Perpetual-Swap-Suite/issues) with reproduction steps, macOS version, and the relevant error or data gap.

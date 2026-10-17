@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { after, before, test } from 'node:test'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
@@ -88,6 +88,10 @@ const removePreparedTransform = async () => electron.evaluate(({ ipcMain }) => {
 })
 
 before(async () => {
+  await writeFile(join(userData, 'settings.json'), JSON.stringify({
+    notificationsEnabled: true, backgroundMonitoringEnabled: true, monitoringPaused: true,
+    filterLibraryPreferencesJSON: '{"favorites":["emaTrend"]}',
+  }))
   await launchElectron()
 })
 after(async () => { await electron?.close(); await rm(userData, { recursive: true, force: true }) })
@@ -102,13 +106,40 @@ test('desktop window loads the React workspace with a restricted renderer', asyn
 })
 
 test('preferences persist in the Electron-owned user-data directory', async () => {
-  const saved = await request({ windowBlurRadius: 17, floatingBlurRadius: 23, notificationsEnabled: true })
+  const saved = await request({ windowBlurRadius: 17, floatingBlurRadius: 23, hourlyVolumeStabilityEnabled: true })
   assert.equal(saved.windowBlurRadius, 17)
   assert.equal(saved.floatingBlurRadius, 23)
-  assert.equal(saved.notificationsEnabled, true)
+  assert.equal(saved.hourlyVolumeStabilityEnabled, true)
   const disk = JSON.parse(await readFile(join(userData, 'settings.json'), 'utf8'))
   assert.equal(disk.windowBlurRadius, 17)
-  assert.equal(disk.notificationsEnabled, true)
+  assert.equal(disk.hourlyVolumeStabilityEnabled, true)
+})
+
+test('Radar has no Research or Strategy workspace or desktop operations', async () => {
+  await page.getByRole('heading', { name: 'Perpetual Swap Radar', exact: true }).waitFor()
+  assert.equal(await page.getByRole('button', { name: /Research|Strategy|Signals|Rules|Universe/ }).count(), 0)
+  assert.equal(await page.locator('[data-mode-switch]').count(), 0)
+  const previous = await request({ rocPeriod: 9, marocPeriod: 9, timeframe: '5m', sinceRevision: -1 })
+  for (const value of [
+    { suite: { mode: 'radar', action: 'evaluate', timeframe: '5m' } },
+    { research: { action: 'list' } },
+    { foregroundWorkspace: 'research' },
+    { compileMarketFilters: { filtersJSON: '{}' } },
+    { previewMarketFilters: { filtersJSON: '{}', token: 'retired' } },
+    { explainMarketFilters: { instId: 'BTC-USDT-SWAP', filtersJSON: '{}', token: 'retired' } },
+    { filterLibraryPreferencesJSON: '{}' },
+    { notificationsEnabled: true },
+    { backgroundMonitoringEnabled: true },
+    { monitoringPaused: true },
+    { windowBlurRadius: 99, notificationsEnabled: true },
+  ]) await assert.rejects(() => request(value), /Unsupported desktop bridge operation/)
+  const current = await request({ rocPeriod: 9, marocPeriod: 9, timeframe: '5m', sinceRevision: -1 })
+  assert.equal(current.windowBlurRadius, previous.windowBlurRadius, 'A retired preference must not partially apply an appearance change.')
+  for (const key of ['filterMetricsCatalog', 'filterFunctions', 'filterFunctionCatalog', 'filterLibraryPreferences',
+    'notificationsEnabled', 'notificationAuthorization', 'notificationError', 'backgroundMonitoringEnabled',
+    'backgroundMonitoringError', 'monitoringPaused', 'launchAtLogin', 'launchAtLoginError']) {
+    assert.equal(key in current, false, `The retired ${key} setting must not appear in Radar snapshots.`)
+  }
 })
 
 test('completed candles round-trip through the Electron-owned Parquet store', async () => {
@@ -126,10 +157,10 @@ test('clipboard, screenshot capture, analysis settings, and safe gateway cancell
   assert.ok(image.width > 0 && image.height > 0)
   assert.deepEqual(await request({ analysisSettings: { action: 'save', model: 'test-model', apiKey: 'test-key' } }), { model: 'test-model', hasAPIKey: true })
   assert.deepEqual(await request({ analysisSettings: { action: 'read' } }), { model: 'test-model', hasAPIKey: true })
+  assert.equal('analysis' in await request({ rocPeriod: 9, marocPeriod: 9, timeframe: '5m', sinceRevision: -1 }), false)
   assert.deepEqual(await request({ analysisSettings: { action: 'removeKey' } }), { model: 'test-model', hasAPIKey: false })
   await assert.rejects(() => request({ gatewayFetch: { id: 'missing-key', body: '{}' } }), /Save an AI Gateway API key/)
   assert.deepEqual(await request({ cancelGatewayFetch: 'no-such-request' }), { ok: true })
-  assert.deepEqual(await request({ suite: { mode: 'radar', action: 'evaluate', timeframe: '5m' } }), { profiles: [], selectedID: '', confirmed: [], provisional: [], rows: [], revision: 0, timeframe: '5m' })
   const initial = await request({ rocPeriod: 9, marocPeriod: 9, timeframe: '5m', sinceRevision: -1 })
   assert.equal(initial.error, '')
   assert.deepEqual(initial.rows, [])

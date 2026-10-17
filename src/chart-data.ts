@@ -48,8 +48,3 @@ export type ReadyChartWindow = Readonly<{
   oiState: PreparedChartState; takerState: PreparedChartState; indicatorState: PreparedChartState
   liveBar?: Bar
 }>
-
-// Frozen research results share native bars, with no workspace loading protocol.
-export type ChartResponse = {
-  bars: Bar[]; error: string; revision: number
-}
