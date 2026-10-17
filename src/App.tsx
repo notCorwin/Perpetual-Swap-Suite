@@ -50,7 +50,8 @@ type WindowAppearance = BlurSettings & { frostedBackgroundEnabled: boolean; fros
 type NotificationSettings = { backgroundMonitoringEnabled: boolean; notificationsEnabled: boolean; notificationAuthorization: "notDetermined" | "denied" | "authorized" | "quiet" | "unavailable"; notificationError: string; backgroundMonitoringError: string; monitoringPaused: boolean; launchAtLogin: "enabled" | "disabled" | "requiresApproval" | "unavailable"; launchAtLoginError: string }
 type HistoryProgress = { pending: number; completed: number; error: string }
 type LiquiditySettings = { hourlyVolumeStabilityEnabled: boolean }
-type Snapshot = WindowAppearance & NotificationSettings & LiquiditySettings & { rows: NativeMarketRow[]; updatedAt: number | null; error: string; revision: number; serviceSession?: string; timeframe?: RadarTimeframe; intervalMS?: number; filterMetricsCatalog: FilterMetric[]; filterFunctions: string[]; filterFunctionCatalog: ExpressionTemplate[]; filterLibraryPreferences: FilterLibraryPreferences; }
+type ListProgress = { total: number; completed: number; pending: number; retrying: number; unavailable: number }
+type Snapshot = WindowAppearance & NotificationSettings & LiquiditySettings & { rows: NativeMarketRow[]; updatedAt: number | null; error: string; revision: number; loading?: boolean; listProgress?: ListProgress; catalogSource?: 'none' | 'cache' | 'live'; serviceSession?: string; timeframe?: RadarTimeframe; intervalMS?: number; filterMetricsCatalog: FilterMetric[]; filterFunctions: string[]; filterFunctionCatalog: ExpressionTemplate[]; filterLibraryPreferences: FilterLibraryPreferences; }
 type PreviewSnapshot = Snapshot & { filterResults: Record<string, FilterTruth>; filterToken: string; historyProgress: HistoryProgress }
 type UnchangedSnapshot = { unchanged: true; revision: number; error: string; serviceSession?: string }
 type SettingRequest = Partial<WindowAppearance & LiquiditySettings> & { backgroundMonitoringEnabled?: boolean; notificationsEnabled?: boolean; monitoringPaused?: boolean; launchAtLogin?: boolean; notificationAction?: "refresh" | "requestPermission" | "test" | "openSettings"; filterLibraryPreferencesJSON?: string }
@@ -84,6 +85,16 @@ const formatIndicator = (value: number | null) => value === null ? "—" : value
 const priceFormatter = new Intl.NumberFormat("en-US", { maximumSignificantDigits: 8 })
 const turnoverFormatter = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 2 })
 const formatPrice = (value: number | null) => value === null ? "—" : priceFormatter.format(value)
+const listCollectorStatus = (snapshot: Pick<Snapshot, "loading" | "listProgress" | "catalogSource">) => {
+  const progress = snapshot.listProgress
+  const cached = snapshot.catalogSource === 'cache'
+  if (progress && progress.total > 0 && progress.completed < progress.total) {
+    const work = progress.retrying || progress.unavailable ? `Retrying ${progress.completed}/${progress.total}` : `Loading ${progress.completed}/${progress.total}`
+    return cached ? `Cached · ${work}` : work
+  }
+  if (snapshot.loading) return cached ? "Cached · Refreshing" : "Refreshing"
+  return cached ? "Cached" : "Live"
+}
 const directionClass = (value: PercentageValue) => {
   const number = percentageNumber(value)
   return number === null ? "text-muted-foreground" : number > 0 ? "text-positive" : number < 0 ? "text-destructive" : ""
@@ -309,6 +320,7 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
     if (!librarySavePending.current) setLibraryPreferences(current => keepSnapshotValue(current, snapshot.filterLibraryPreferences ?? initialLibraryPreferences()))
     setUpdatedAt(snapshot.updatedAt)
     setError(snapshot.error)
+    setStatus(listCollectorStatus(snapshot))
     setReady(true)
     return true
   }
@@ -328,12 +340,10 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
         const snapshot = await window.webkit.messageHandlers.radar.postMessage({ rocPeriod: ROC_PERIOD, marocPeriod: MAROC_PERIOD, timeframe, sinceRevision: revision.current, serviceSession: serviceSession.current })
         if (stopped) return
         if ("unchanged" in snapshot) {
-          setStatus("Live")
           if (snapshotOrder.current.isCurrent(snapshot)) setError(snapshot.error)
           backoff = 2000
         } else {
           acceptSnapshot(snapshot)
-          setStatus("Live")
           backoff = 2000 // Reset to fast polling on changes
         }
       } catch (cause) {
@@ -390,7 +400,6 @@ function RadarApp({ active, onResearch, onDecisions, switchingMode }: { active: 
           setPreviewJSON(lastValidJSON)
           setPreviewStrategyID(activeStrategyID)
           setHistory(current => keepSnapshotValue(current, snapshot.historyProgress))
-          setStatus("Live")
           backoff = 2000
         })
       } catch (cause) {

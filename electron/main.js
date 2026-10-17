@@ -3,18 +3,21 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ChartFocus } from './services/chart-focus.js'
+import { seedCachedListProjection } from './e2e-fixtures.js'
 import { MarketStore } from './services/market-store.js'
 import { MarketService } from './services/market-service.js'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const rendererURL = process.env.ELECTRON_RENDERER_URL
 const testMode = process.env.PERPETUAL_SWAP_E2E === '1'
+const e2eLiveRefresh = testMode && process.env.PERPETUAL_SWAP_E2E_LIVE_REFRESH === '1'
 const FIVE_MINUTES = 300_000
 const HOUR = 3_600_000
 const settingsFile = () => join(app.getPath('userData'), 'settings.json')
 let window
 let marketStore
 let marketService
+let lastSnapshotTimeframe = '1H'
 const gatewayRequests = new Map()
 const chartFocus = new ChartFocus()
 let shuttingDown = false
@@ -28,6 +31,23 @@ const offlineE2EFetch = async () => ({
   headers: { get: () => null },
   json: async () => ({ code: '0', data: [] }),
 })
+
+// This test-only fetcher keeps discovery in flight long enough to assert the
+// real startup ordering: cache restoration must render before an online scan
+// settles. It is deliberately opt-in so ordinary deterministic E2E fixtures
+// remain isolated from background network activity.
+const delayedOfflineE2EFetch = async (_input, init = {}) => {
+  const signal = init.signal
+  await new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(new DOMException('The request was aborted.', 'AbortError')); return }
+    const timer = setTimeout(resolve, 10_000)
+    signal?.addEventListener('abort', () => {
+      clearTimeout(timer)
+      reject(new DOMException('The request was aborted.', 'AbortError'))
+    }, { once: true })
+  })
+  return offlineE2EFetch()
+}
 
 const defaults = {
   windowBlurRadius: 64,
@@ -72,10 +92,14 @@ function preferences(saved) {
   catch { return { favorites: [], recent: [], layout: 'sentences' } }
 }
 
-async function snapshot() {
-  const saved = await settings(), market = marketService?.snapshot() ?? { rows: [], revision: 0, error: 'Loading OKX market data…', loading: true }
+async function snapshot(timeframe) {
+  const frame = ['5m', '15m', '1H'].includes(timeframe) ? timeframe : lastSnapshotTimeframe
+  lastSnapshotTimeframe = frame
+  const saved = await settings()
+  const market = marketService ? await marketService.snapshot(frame) : { rows: [], revision: 0, error: 'Loading OKX market data…', loading: true, updatedAt: null, listProgress: { total: 0, completed: 0, pending: 0, retrying: 0, unavailable: 0 }, timeframe: frame, catalogSource: 'none' }
   return {
-    ...saved, rows: market.rows, updatedAt: market.rows.length ? Date.now() : null, error: market.error, revision: market.revision,
+    ...saved, rows: market.rows, updatedAt: market.updatedAt, error: market.error, revision: market.revision, timeframe: market.timeframe,
+    listProgress: market.listProgress, loading: market.loading, catalogSource: market.catalogSource,
     filterMetricsCatalog: [], filterFunctions: [], filterFunctionCatalog: [],
     filterLibraryPreferences: preferences(saved), notificationAuthorization: 'unavailable',
     notificationError: '', backgroundMonitoringError: '', launchAtLogin: 'unavailable', launchAtLoginError: '',
@@ -145,24 +169,15 @@ async function seedPartialStatisticsChart() {
   })
   await marketStore.appendCandles(source)
   await marketStore.appendCandles(statistics)
-  marketService.instruments.set(instId, { instId })
+  const instrument = { instId, instCategory: '1', settleCcy: 'USDT', state: 'live', ctVal: '0.01', ctValCcy: 'BTC' }
+  const ticker = { instId, last: '135', open24h: '130', low24h: '99', high24h: '136', bidPx: '134.99', askPx: '135', volCcy24h: '300000' }
+  const result = { eligible: true, turnover: 40_000_000, oiUSD: 6_000_000, spread: 0.01 }
+  marketService.replaceCatalog([{ instrument, ticker, result, change24h: 3.8 }])
   // The source fixture is already complete; keep the latest-candle fetcher
   // out of this test so no live response can replace its deliberate gaps.
   marketService.lastCandleHydration.set(instId, Date.now())
-  marketService.rows = [{
-    instId, turnover24hUSDT: 40_000_000, ema200Signal: null,
-    price: 135, lastPrice: 135, priceChange: 0, currentLow: 99, currentHigh: 136,
-    buy: null, sell: null, takerRatio: null, oiChange: null,
-    highBreakout: { status: 'none' }, lowBreakdown: { status: 'none' }, highBreakout96: { status: 'none' }, lowBreakdown96: { status: 'none' },
-    roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null,
-    logBBAboveBand: null, logBBExpansion: null, rocChange: null, marocChange: null,
-    filterMetrics: {
-      liveOpen: null, liveClose: null, ema200: null, previousEMA200: null, vwap14: null,
-      bbUpper: null, bbMiddle: null, bbLower: null, priorHigh48: null, priorLow48: null,
-      priorHigh96: null, priorLow96: null, oiUSD: null, spreadPercent: null, liveVolumeUSDT: null,
-    },
-    opportunity: { direction: null, setup: null, status: 'Incomplete', score: null, components: null, reasons: [] },
-  }]
+  await marketService.ensureListTimeframe(timeframe)
+  await marketService.projectListEntry(instId, timeframe)
   marketService.error = ''
   marketService.lastRefreshAt = Date.now()
   marketService.markChartDataChanged()
@@ -179,6 +194,7 @@ async function handleRequest(event, request) {
   if ('e2e' in request) {
     if (!testMode) throw new Error('The E2E desktop API is unavailable outside tests.')
     if (request.e2e.action === 'seedCandles') return { written: await marketStore.appendCandles(request.e2e.candles ?? []) }
+    if (request.e2e.action === 'seedCachedListProjection') return seedCachedListProjection(marketStore, marketService)
     if (request.e2e.action === 'seedPartialStatisticsChart') return seedPartialStatisticsChart()
     if (request.e2e.action === 'settings') return settings()
     throw new Error('Unknown E2E desktop action.')
@@ -188,13 +204,13 @@ async function handleRequest(event, request) {
   }
   if ('research' in request) return { studies: [], job: null, ok: true }
   if ('foregroundWorkspace' in request) return { ok: true }
-  if ('rocPeriod' in request) return snapshot()
+  if ('rocPeriod' in request) return snapshot(request.timeframe)
   if ('compileMarketFilters' in request) {
     const source = request.compileMarketFilters
     const configJSON = source.filtersJSON ?? source.previousJSON ?? ''
     return { diagnostics: configJSON ? [] : ['A rule configuration is required.'], configJSON, expressions: {}, units: {}, requiredHours: 0 }
   }
-  if ('previewMarketFilters' in request) return { ...(await snapshot()), filterToken: request.previewMarketFilters.token, filterResults: {}, historyProgress: { pending: 0, completed: 0, error: '' } }
+  if ('previewMarketFilters' in request) return { ...(await snapshot(request.previewMarketFilters.timeframe)), filterToken: request.previewMarketFilters.token, filterResults: {}, historyProgress: { pending: 0, completed: 0, error: '' } }
   if ('explainMarketFilters' in request) return { instId: request.explainMarketFilters.instId, filterToken: request.explainMarketFilters.token, revision: 0, trace: null }
   if ('chartSession' in request) return { session: chartFocus.beginSession() }
   if ('chartFocus' in request) return { ok: focusChart(request.chartFocus?.instId, request.chartFocus?.session, request.chartFocus?.token).ok }
@@ -281,14 +297,20 @@ async function createWindow() {
 
 app.whenReady().then(async () => {
   if (process.env.PERPETUAL_SWAP_USER_DATA) app.setPath('userData', process.env.PERPETUAL_SWAP_USER_DATA)
+  // Discovery begins before the renderer's first snapshot, so hydrate the
+  // persisted liquidity criteria before it decides which contracts belong in
+  // the catalogue.
+  await settings()
   marketStore = await MarketStore.open(join(app.getPath('userData'), 'MarketData'))
   marketService = new MarketService(
     marketStore,
     () => ({ hourlyVolumeStabilityEnabled: settingsCache.hourlyVolumeStabilityEnabled }),
-    testMode ? offlineE2EFetch : fetch,
+    testMode ? e2eLiveRefresh ? delayedOfflineE2EFetch : offlineE2EFetch : fetch,
     !testMode,
   )
   ipcMain.handle('radar:request', handleRequest)
+  await marketService.restoreCatalog()
+  if (!testMode || e2eLiveRefresh) void marketService.refresh()
   await createWindow()
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) void createWindow() })
 })

@@ -36,7 +36,7 @@ test('market discovery admits only a fully liquid USDT perpetual', async () => {
   try {
     const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher)
     await service.refresh()
-    const snapshot = service.snapshot()
+    const snapshot = await service.snapshot()
     assert.equal(snapshot.error, '')
     assert.equal(snapshot.rows.length, 1)
     assert.equal(snapshot.rows[0].instId, 'BTC-USDT-SWAP')
@@ -392,6 +392,41 @@ test('one empty history response before local coverage retries instead of fixing
     assert.equal(service.historyBoundaries.has(instrument.instId), false)
     assert.equal(service.isHistoryExhausted(instrument.instId), false)
   } finally { await service?.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a history boundary uses fresh coverage after a successful earlier-page repair', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const firstStored = Date.UTC(2024, 3, 1, 12)
+  const fetchedFirst = firstStored - 140 * fiveMinutes
+  const gapFrom = fetchedFirst - 60 * fiveMinutes
+  const gapThrough = firstStored - fiveMinutes
+  let historyRequests = 0
+  const fetcher: typeof fetch = async input => {
+    const url = new URL(String(input))
+    if (!url.pathname.endsWith('/market/history-candles')) throw new Error(`Unexpected ${url}`)
+    historyRequests += 1
+    if (historyRequests === 1) {
+      return response(Array.from({ length: 140 }, (_, index) => okxCandle(rawCandle(fetchedFirst + index * fiveMinutes, 100 + index))))
+    }
+    return response([])
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    await store.appendCandles(Array.from({ length: 24 }, (_, index) => rawCandle(firstStored + index * fiveMinutes, 300 + index)))
+    let gap: { from: number; through: number; emptyResponses?: number } = { from: gapFrom, through: gapThrough, emptyResponses: 0 }
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const result = await service.repairGap(instrument, gap, new AbortController().signal, 'background', true)
+      assert.equal(result.deferred, undefined)
+      assert.ok(result.remaining?.length)
+      // List warm-up preserves this counter by gap start while reconstructing
+      // missing ranges from Parquet on the next retry.
+      gap = { ...result.remaining[0], emptyResponses: gap.emptyResponses }
+    }
+    assert.equal(historyRequests, 4)
+    assert.equal(service.historyBoundaries.get(instrument.instId), fetchedFirst)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
 test('a historical gap repair never waits for an unrelated latest-candle refresh', async () => {
@@ -1387,5 +1422,481 @@ test('an OI failure cancels the queued taker request before retrying', async () 
     await waitFor(() => service.statisticsState(instrument, '1H', end).status === 'retrying')
     assert.equal(takerStarted, false)
     assert.equal(service.statisticsState(instrument, '1H', end).status, 'retrying')
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+// The market list must be a projection of the cache, not a catalogue-shaped
+// placeholder which only acquires readings after a user opens a chart.
+const listFixtureInstrument = { instId: 'BTC-USDT-SWAP', instCategory: '1', settleCcy: 'USDT', state: 'live', ctVal: '0.01', ctValCcy: 'BTC' }
+const completeListEnd = (rawLast: number, interval: number) => {
+  const bucket = Math.floor(rawLast / interval) * interval
+  return rawLast >= bucket + interval - fiveMinutes ? bucket : bucket - interval
+}
+
+const liquidCatalogueResponse = (url: URL) => {
+  if (url.pathname.endsWith('/public/instruments')) return response([listFixtureInstrument])
+  if (url.pathname.endsWith('/market/tickers')) return response([{
+    instId: listFixtureInstrument.instId, last: '250', bidPx: '249.99', askPx: '250', open24h: '245', high24h: '255', low24h: '240', volCcy24h: '200000',
+  }])
+  if (url.pathname.endsWith('/market/books')) return response([{ asks: [['250', '60000']], bids: [['249.99', '60000']] }])
+  if (url.pathname.endsWith('/public/open-interest')) return response([{ oiUsd: '6000000' }])
+  if (url.pathname.endsWith('/market/candles')) return response(hourly)
+  return null
+}
+
+const seedProjectedListCache = async (store: MarketStore) => {
+  // Keep the newest raw observation fresh. This means list warm-up verifies
+  // the cache rather than replacing this deterministic fixture over HTTP.
+  const rawLast = Math.floor((Date.now() - fiveMinutes) / fiveMinutes) * fiveMinutes
+  const oneHourEnd = completeListEnd(rawLast, hour)
+  const start = oneHourEnd - 200 * hour
+  const closeAt = (timestamp: number) => 100 + (timestamp - start) / fiveMinutes * 0.05
+  const raw = []
+  for (let timestamp = start; timestamp <= rawLast; timestamp += fiveMinutes) raw.push(rawCandle(timestamp, closeAt(timestamp)))
+  await store.appendCandles(raw)
+
+  const ends: Record<string, number> = {}
+  for (const [timeframe, interval, base] of [['5m', fiveMinutes, 1_000], ['15m', 3 * fiveMinutes, 2_000], ['1H', hour, 3_000]] as const) {
+    const end = completeListEnd(rawLast, interval)
+    ends[timeframe] = end
+    const statistics = Array.from({ length: 96 }, (_, index) => {
+      const timestamp = end - (95 - index) * interval
+      return {
+        ...rawCandle(timestamp, closeAt(timestamp)), timeframe,
+        oi: base + index * 11,
+        sell: base + index,
+        buy: base + 200 + index,
+        statisticsVersion: 1,
+      }
+    })
+    await store.appendCandles(statistics)
+  }
+  return { rawLast, start, ends, closeAt }
+}
+
+test('refresh projects cached 1H indicators and direct OI/Taker statistics into the list', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const requests: string[] = []
+  const fetcher: typeof fetch = async input => {
+    const url = new URL(String(input)); requests.push(url.pathname)
+    const result = liquidCatalogueResponse(url)
+    if (result) return result
+    throw new Error(`Unexpected list warm-up request: ${url.pathname}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    const fixture = await seedProjectedListCache(store)
+    await service.refresh()
+    const base = await service.snapshot('1H')
+    assert.ok(base.rows.find(value => value.instId === listFixtureInstrument.instId), 'A refresh must publish the liquid base row before its DuckDB projection settles.')
+    await waitFor(async () => {
+      const snapshot = await service.snapshot('1H')
+      const row = snapshot.rows.find(value => value.instId === listFixtureInstrument.instId)
+      return Boolean(row && Number.isFinite(row.roc) && row.oiChange !== null && row.takerRatio !== null)
+    })
+    const snapshot = await service.snapshot('1H')
+    const row = snapshot.rows.find(value => value.instId === listFixtureInstrument.instId)!
+    assert.equal(snapshot.timeframe, '1H')
+    assert.equal(snapshot.listProgress.total, 1)
+    assert.equal(row.ema200Signal, 'Long')
+    assert.ok(Number.isFinite(row.filterMetrics.ema200))
+    assert.ok(Number.isFinite(row.roc))
+    assert.ok(Number.isFinite(row.maroc))
+    assert.ok(Number.isFinite(row.rsi6))
+    assert.ok(Number.isFinite(row.rsi12))
+    assert.ok(Number.isFinite(row.rsi24))
+    assert.equal(row.oiChange, 11 / (3_000 + 94 * 11) * 100)
+    assert.equal(row.buy, 3_000 + 200 + 95)
+    assert.equal(row.sell, 3_000 + 95)
+    assert.ok((row.takerRatio ?? 0) > 0)
+    assert.notEqual(row.opportunity.status, 'Incomplete')
+    assert.equal(row.filterMetrics.liveClose, fixture.closeAt(fixture.ends['1H'] + hour - fiveMinutes))
+    assert.deepEqual(requests.sort(), [
+      '/api/v5/market/books', '/api/v5/market/candles', '/api/v5/market/tickers', '/api/v5/public/instruments', '/api/v5/public/open-interest',
+    ].sort(), 'A complete cached list must not fetch candles or statistics before displaying its readings.')
+    await waitFor(() => service.listProgress('1H').completed === 1)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a persisted liquid catalog restores a base list immediately and projects cached readings without discovery', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  let store = await MarketStore.open(root)
+  const discovery: typeof fetch = async input => {
+    const result = liquidCatalogueResponse(new URL(String(input)))
+    if (result) return result
+    throw new Error(`Unexpected discovery request: ${input}`)
+  }
+  let initial = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), discovery, false)
+  let restored: MarketService | undefined
+  let releaseCacheProjection: (() => void) | undefined
+  try {
+    await seedProjectedListCache(store)
+    await initial.refresh()
+    const savedAt = initial.catalogUpdatedAt
+    assert.ok(Number.isFinite(savedAt))
+    await initial.dispose()
+    await store.close()
+
+    store = await MarketStore.open(root)
+    const originalCoverage = store.coverage.bind(store)
+    const cacheProjectionGate = new Promise<void>(resolve => { releaseCacheProjection = resolve })
+    let cacheProjectionStarted = false
+    store.coverage = async (...arguments_) => {
+      cacheProjectionStarted = true
+      await cacheProjectionGate
+      return originalCoverage(...arguments_)
+    }
+    let requests = 0
+    restored = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), async () => {
+      requests += 1
+      throw new Error('A cache restore must not wait for discovery.')
+    }, false)
+    const restoring = restored.restoreCatalog()
+    await waitFor(() => cacheProjectionStarted)
+    assert.equal(await Promise.race([restoring, new Promise(resolve => setTimeout(() => resolve(false), 100))]), true, 'Restoring the catalogue must not wait for per-entry DuckDB projections.')
+    const initialSnapshot = await restored.snapshot('1H')
+    const initialRow = initialSnapshot.rows.find(value => value.instId === listFixtureInstrument.instId)
+    assert.equal(initialSnapshot.catalogSource, 'cache')
+    assert.equal(initialSnapshot.updatedAt, savedAt)
+    assert.equal(requests, 0)
+    assert.ok(initialRow, 'The restored catalogue makes a price/liquidity row available before cache projection finishes.')
+
+    if (!releaseCacheProjection) throw new Error('The cache projection gate was not installed.')
+    releaseCacheProjection()
+    await waitFor(async () => {
+      const snapshot = await restored!.snapshot('1H')
+      const row = snapshot.rows.find(value => value.instId === listFixtureInstrument.instId)
+      return Boolean(row && Number.isFinite(row.roc) && Number.isFinite(row.rsi6) && row.oiChange !== null && row.takerRatio !== null)
+    })
+    const snapshot = await restored.snapshot('1H')
+    const row = snapshot.rows.find(value => value.instId === listFixtureInstrument.instId)!
+    assert.ok(Number.isFinite(row.roc))
+    assert.ok(Number.isFinite(row.rsi6))
+    assert.notEqual(row.oiChange, null)
+    assert.notEqual(row.takerRatio, null)
+
+    // Startup starts live discovery after restoring the local catalogue. A
+    // failed discovery must report its error without erasing the last usable
+    // rows or relabelling cache data as live.
+    await restored.refresh()
+    const afterFailedDiscovery = await restored.snapshot('1H')
+    const retained = afterFailedDiscovery.rows.find(value => value.instId === listFixtureInstrument.instId)
+    assert.ok(requests > 0)
+    assert.equal(afterFailedDiscovery.catalogSource, 'cache')
+    assert.equal(afterFailedDiscovery.updatedAt, savedAt)
+    assert.ok(retained)
+    assert.notEqual(retained.oiChange, null)
+    assert.notEqual(retained.takerRatio, null)
+  } finally { releaseCacheProjection?.(); await restored?.dispose(); await initial.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('an unchanged catalogue keeps entry identity while a cache projection is in flight', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
+  const entry = {
+    instrument: { ...listFixtureInstrument },
+    ticker: { instId: listFixtureInstrument.instId, last: '103', open24h: '100', low24h: '90', high24h: '110' },
+    result: { eligible: true, turnover: 40_000_000, oiUSD: 6_000_000, spread: 0.01 },
+    change24h: 3,
+  }
+  try {
+    assert.equal(service.replaceCatalog([entry]), true)
+    const activeEntry = service.catalogEntry(listFixtureInstrument.instId)
+    assert.equal(service.replaceCatalog([JSON.parse(JSON.stringify(entry))]), false)
+    assert.equal(service.catalogEntry(listFixtureInstrument.instId), activeEntry, 'An identical refresh must not invalidate an in-flight projection by changing entry identity.')
+    assert.equal(service.catalogRevision, 1)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a live catalogue replacement reuses the in-flight cache projection for its current row', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
+  const entry = {
+    instrument: { ...listFixtureInstrument },
+    ticker: { instId: listFixtureInstrument.instId, last: '103', open24h: '100', low24h: '90', high24h: '110' },
+    result: { eligible: true, turnover: 40_000_000, oiUSD: 6_000_000, spread: 0.01 },
+    change24h: 3,
+  }
+  const originalCoverage = store.coverage.bind(store)
+  let releaseProjection: (() => void) | undefined, projectionStarted = false, coverageCalls = 0
+  const projectionGate = new Promise<void>(resolve => { releaseProjection = resolve })
+  store.coverage = async (...arguments_) => {
+    coverageCalls += 1
+    if (coverageCalls === 1) {
+      projectionStarted = true
+      await projectionGate
+    }
+    return originalCoverage(...arguments_)
+  }
+  try {
+    await seedProjectedListCache(store)
+    service.catalogSource = 'cache'
+    service.catalogUpdatedAt = Date.now()
+    service.replaceCatalog([entry])
+    await waitFor(() => projectionStarted)
+
+    const replacement = {
+      ...entry,
+      ticker: { ...entry.ticker, last: '104' },
+      result: { ...entry.result, turnover: 41_000_000 },
+      change24h: 4,
+    }
+    service.replaceCatalog([replacement])
+    const currentPrime = service.primeListRowsFromCache('1H')
+    if (!releaseProjection) throw new Error('The cache projection gate was not installed.')
+    releaseProjection()
+    await currentPrime
+
+    const row = service.listRowsFor('1H').find(value => value.instId === listFixtureInstrument.instId)
+    assert.ok(row, 'The replacement catalogue row should be published by the already-running cache projection.')
+    assert.equal(row.lastPrice, 104, 'The projected row must use the live replacement ticker, not its stale cache-era object.')
+    assert.ok(Number.isFinite(row.roc))
+    assert.ok(Number.isFinite(row.rsi6))
+    assert.notEqual(row.oiChange, null)
+    assert.notEqual(row.takerRatio, null)
+    assert.equal(service.listProjectionVersions.get('1H'), service.catalogRevision)
+    assert.equal(coverageCalls, 1, 'A metadata-only catalogue replacement must reuse the existing instrument projection instead of queueing a second DuckDB read.')
+  } finally { releaseProjection?.(); await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('disposing during a pending candle write never starts a late list projection', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
+  const entry = {
+    instrument: { ...listFixtureInstrument },
+    ticker: { instId: listFixtureInstrument.instId, last: '103', open24h: '100', low24h: '90', high24h: '110' },
+    result: { eligible: true, turnover: 40_000_000, oiUSD: 6_000_000, spread: 0.01 },
+    change24h: 3,
+  }
+  const originalAppend = store.appendCandles.bind(store), originalCoverage = store.coverage.bind(store)
+  let releaseWrite: (() => void) | undefined, writeStarted = false, appendCalls = 0, coverageCalls = 0
+  const writeGate = new Promise<void>(resolve => { releaseWrite = resolve })
+  store.appendCandles = async (...arguments_) => {
+    appendCalls += 1
+    if (appendCalls === 1) {
+      writeStarted = true
+      await writeGate
+    }
+    return originalAppend(...arguments_)
+  }
+  try {
+    service.replaceCatalog([entry])
+    await service.primeListRowsFromCache('1H')
+    store.coverage = async (...arguments_) => {
+      coverageCalls += 1
+      return originalCoverage(...arguments_)
+    }
+    const timestamp = Math.floor((Date.now() - fiveMinutes) / fiveMinutes) * fiveMinutes
+    const writing = service.persistCandles(listFixtureInstrument.instId, [rawCandle(timestamp, 101)])
+    await waitFor(() => writeStarted)
+    const disposing = service.dispose()
+    let disposed = false
+    void disposing.then(() => { disposed = true })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    assert.equal(disposed, false, 'dispose must wait for the admitted candle mutation before the Store can close.')
+    if (!releaseWrite) throw new Error('The candle write gate was not installed.')
+    releaseWrite()
+    await writing
+    await disposing
+    assert.equal(coverageCalls, 0, 'A continuation after dispose must not enqueue a new DuckDB list projection.')
+  } finally { releaseWrite?.(); await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a snapshot after disposal never restarts a cache projection', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
+  const entry = {
+    instrument: { ...listFixtureInstrument },
+    ticker: { instId: listFixtureInstrument.instId, last: '103', open24h: '100', low24h: '90', high24h: '110' },
+    result: { eligible: true, turnover: 40_000_000, oiUSD: 6_000_000, spread: 0.01 },
+    change24h: 3,
+  }
+  const originalCoverage = store.coverage.bind(store)
+  let coverageCalls = 0
+  try {
+    service.replaceCatalog([entry])
+    await service.primeListRowsFromCache('1H')
+    await service.dispose()
+    store.coverage = async (...arguments_) => {
+      coverageCalls += 1
+      return originalCoverage(...arguments_)
+    }
+    const snapshot = await service.snapshot('1H')
+    await service.primeListRowsFromCache('1H')
+    assert.equal(snapshot.rows.length, 1)
+    assert.equal(coverageCalls, 0, 'A late renderer poll cannot revive DuckDB work after service disposal.')
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('list snapshots project each selected timeframe instead of reusing the 1H row', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const fetcher: typeof fetch = async input => {
+    const result = liquidCatalogueResponse(new URL(String(input)))
+    if (result) return result
+    throw new Error(`Unexpected list warm-up request: ${input}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    const fixture = await seedProjectedListCache(store)
+    assert.equal((await store.coverage(listFixtureInstrument.instId, '5m')).last, fixture.rawLast)
+    await service.refresh()
+    const [fiveMinute, fifteenMinute, oneHour] = await Promise.all([
+      service.snapshot('5m'), service.snapshot('15m'), service.snapshot('1H'),
+    ])
+    assert.deepEqual([fiveMinute.timeframe, fifteenMinute.timeframe, oneHour.timeframe], ['5m', '15m', '1H'])
+    assert.ok([fiveMinute, fifteenMinute, oneHour].every(snapshot => snapshot.rows.some(value => value.instId === listFixtureInstrument.instId)), 'Each selected timeframe gets an immediate base row.')
+    await waitFor(async () => {
+      const snapshots = await Promise.all(['5m', '15m', '1H'].map(timeframe => service.snapshot(timeframe as '5m' | '15m' | '1H')))
+      return snapshots.every(snapshot => {
+        const row = snapshot.rows.find(value => value.instId === listFixtureInstrument.instId)
+        return Boolean(row && Number.isFinite(row.priceChange) && Number.isFinite(row.roc) && row.oiChange !== null && row.takerRatio !== null)
+      })
+    })
+    const settled = await Promise.all(['5m', '15m', '1H'].map(timeframe => service.snapshot(timeframe as '5m' | '15m' | '1H')))
+    const rows = settled.map(snapshot => snapshot.rows.find(value => value.instId === listFixtureInstrument.instId))
+    assert.ok(rows.every(Boolean))
+    const [five, fifteen, hourlyRow] = rows
+    assert.ok(Number.isFinite(five!.priceChange))
+    assert.ok(Number.isFinite(fifteen!.priceChange))
+    assert.ok(Number.isFinite(hourlyRow!.priceChange))
+    assert.notEqual(five!.priceChange, fifteen!.priceChange)
+    assert.notEqual(fifteen!.priceChange, hourlyRow!.priceChange)
+    assert.notEqual(five!.roc, hourlyRow!.roc)
+    assert.notEqual(five!.oiChange, fifteen!.oiChange)
+    assert.notEqual(fifteen!.oiChange, hourlyRow!.oiChange)
+    assert.notEqual(five!.takerRatio, null, '5m must keep its direct Taker statistics.')
+    const expectedFifteenEnd = completeListEnd((await store.coverage(listFixtureInstrument.instId, '5m')).last!, 3 * fiveMinutes)
+    const directFifteen = await store.candles({ instrument: listFixtureInstrument.instId, timeframe: '15m', from: expectedFifteenEnd - 95 * 3 * fiveMinutes, through: expectedFifteenEnd })
+    assert.equal(directFifteen.length, 96)
+    assert.ok(directFifteen.every(value => value.statisticsVersion === 1))
+    assert.notEqual(fifteen!.takerRatio, null, '15m must keep its direct Taker statistics.')
+    assert.notEqual(hourlyRow!.takerRatio, null, '1H must keep its direct Taker statistics.')
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a failed background list warm-up enters a scheduled retry instead of stopping permanently', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  let candleRequests = 0
+  const fetcher: typeof fetch = async input => {
+    const url = new URL(String(input))
+    const discovery = url.pathname.endsWith('/market/candles') && url.searchParams.get('bar') === '5m' ? null : liquidCatalogueResponse(url)
+    if (discovery) return discovery
+    if (url.pathname.endsWith('/market/candles')) {
+      candleRequests += 1
+      return new Response('temporarily unavailable', { status: 503 })
+    }
+    throw new Error(`Unexpected ${url.pathname}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 1_000 })
+  try {
+    await service.refresh()
+    await waitFor(() => service.listWarmupState(listFixtureInstrument.instId, '1H').status === 'retrying')
+    const state = service.listWarmupState(listFixtureInstrument.instId, '1H')
+    const snapshot = await service.snapshot('1H')
+    assert.ok(candleRequests >= 1)
+    assert.ok((state.retryAt ?? 0) > Date.now())
+    assert.equal(snapshot.listProgress.retrying, 1)
+    assert.equal(snapshot.listProgress.completed, 0)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('list warm-up follows a latest-candle Retry-After instead of retrying around it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  let candleRequests = 0
+  const fetcher: typeof fetch = async input => {
+    const url = new URL(String(input))
+    const discovery = url.pathname.endsWith('/market/candles') && url.searchParams.get('bar') === '5m' ? null : liquidCatalogueResponse(url)
+    if (discovery) return discovery
+    if (url.pathname.endsWith('/market/candles')) {
+      candleRequests += 1
+      return new Response(null, { status: 429, headers: { 'retry-after': '60' } })
+    }
+    throw new Error(`Unexpected ${url.pathname}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 1_000 })
+  try {
+    await service.refresh()
+    await waitFor(() => service.listWarmupState(listFixtureInstrument.instId, '1H').status === 'retrying')
+    const state = service.listWarmupState(listFixtureInstrument.instId, '1H')
+    assert.equal(candleRequests, 1)
+    assert.ok((state.retryAt ?? 0) - Date.now() >= 59_000)
+    assert.equal(state.attempt, 0, 'The list retry inherits the pending latest-candle cooldown rather than consuming its own attempts.')
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('list history repair remains runnable behind another chart and records an unavailable history boundary', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { ...listFixtureInstrument }
+  const now = Math.floor((Date.now() - fiveMinutes) / fiveMinutes) * fiveMinutes
+  const raw = Array.from({ length: 300 }, (_, index) => rawCandle(now - (299 - index) * fiveMinutes, 100 + index / 100))
+  let historyRequests = 0
+  const fetcher: typeof fetch = async input => {
+    const url = new URL(String(input))
+    if (url.pathname.endsWith('/market/history-candles')) { historyRequests += 1; return response([]) }
+    throw new Error(`Unexpected ${url.pathname}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    await store.appendCandles(raw)
+    service.replaceCatalog([{ instrument, ticker: { instId: instrument.instId, last: '103', open24h: '100', low24h: '90', high24h: '110' }, result: { eligible: true, turnover: 40_000_000, oiUSD: 6_000_000, spread: 0.01 }, change24h: 3 }])
+    service.hasCompleteStoredStatistics = async () => true
+    assert.equal(service.focusChart('ETH-USDT-SWAP', 1), true)
+    const entry = service.catalogEntry(instrument.instId), state = service.listWarmupState(instrument.instId, '1H')
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await service.warmListEntry(entry, '1H', state, new AbortController().signal)
+      if (state.timer) { clearTimeout(state.timer); state.timer = null }
+    }
+    assert.equal(historyRequests, 3, 'The background repair is allowed even while an unrelated chart owns focus.')
+    assert.equal(service.historyBoundaries.get(instrument.instId), raw[0].timestamp)
+    assert.equal(state.status, 'ready')
+    await service.warmListEntry(entry, '1H', state, new AbortController().signal)
+    assert.equal(historyRequests, 3, 'The known listing boundary prevents an endless missing-history retry loop.')
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a foreground chart hydration preempts a hung background list warm-up', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  let candleRequests = 0, backgroundAborts = 0
+  const fetcher: typeof fetch = async (input, init) => {
+    const url = new URL(String(input))
+    const discovery = url.pathname.endsWith('/market/candles') && url.searchParams.get('bar') === '5m' ? null : liquidCatalogueResponse(url)
+    if (discovery) return discovery
+    if (url.pathname.endsWith('/market/candles')) {
+      candleRequests += 1
+      if (candleRequests === 1) return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          backgroundAborts += 1
+          reject(new DOMException('The request was aborted.', 'AbortError'))
+        }, { once: true })
+      })
+      const end = Math.floor((Date.now() - fiveMinutes) / fiveMinutes) * fiveMinutes
+      return response(Array.from({ length: 300 }, (_, index) => okxCandle(rawCandle(end - (299 - index) * fiveMinutes, 100 + index / 10))))
+    }
+    throw new Error(`Unexpected ${url.pathname}`)
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false, { requestTimeout: 5_000 })
+  try {
+    await service.refresh()
+    await waitFor(() => candleRequests === 1)
+    assert.equal(service.focusChart(listFixtureInstrument.instId, 1), true)
+    const chart = await Promise.race([
+      service.bars(listFixtureInstrument.instId, '5m', undefined, { repair: false, statistics: false, foreground: true, focusToken: 1 }),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('Foreground hydration was blocked by the background list request.')), 1_500)),
+    ])
+    assert.equal(backgroundAborts, 1)
+    assert.ok(candleRequests >= 2)
+    assert.ok(chart.bars.length > 0)
+    await waitFor(() => service.listWarmupState(listFixtureInstrument.instId, '1H').status === 'retrying')
+    assert.ok((service.listWarmupState(listFixtureInstrument.instId, '1H').retryAt ?? 0) > Date.now(), 'A foreground cancellation defers the background list work instead of immediately requeueing it.')
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })

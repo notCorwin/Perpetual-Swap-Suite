@@ -10,11 +10,31 @@ const userData = await mkdtemp(join(tmpdir(), 'perp-radar-e2e-'))
 let electron
 let page
 const request = value => page.evaluate(value => window.radarDesktop.request(value), value)
-
-before(async () => {
-  electron = await _electron.launch({ args: ['.', '--headless', '--disable-gpu'], cwd: root, env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData } })
+const electronEnvironment = (liveRefresh = false) => ({
+  ...process.env,
+  ELECTRON_RUN_AS_NODE: undefined,
+  PERPETUAL_SWAP_E2E: '1',
+  PERPETUAL_SWAP_E2E_LIVE_REFRESH: liveRefresh ? '1' : '0',
+  PERPETUAL_SWAP_USER_DATA: userData,
+})
+const launchElectron = async (liveRefresh = false) => {
+  electron = await _electron.launch({ args: ['.', '--headless', '--disable-gpu'], cwd: root, env: electronEnvironment(liveRefresh) })
   page = await electron.firstWindow()
   await page.waitForLoadState('domcontentloaded')
+}
+const waitFor = async (read, timeout = 10_000) => {
+  const deadline = Date.now() + timeout
+  let last
+  while (Date.now() < deadline) {
+    last = await read()
+    if (last) return last
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  throw new Error('Timed out waiting for the expected Electron response.')
+}
+
+before(async () => {
+  await launchElectron()
 })
 after(async () => { await electron?.close(); await rm(userData, { recursive: true, force: true }) })
 
@@ -64,6 +84,78 @@ test('clipboard, screenshot capture, analysis settings, and safe gateway cancell
   const initial = await request({ rocPeriod: 9, marocPeriod: 9, timeframe: '5m', sinceRevision: -1 })
   assert.equal(initial.error, '')
   assert.deepEqual(initial.rows, [])
+})
+
+test('cached catalog projection renders real list OI, taker, and indicator readings', async () => {
+  const fixture = await request({ e2e: { action: 'seedCachedListProjection' } })
+  assert.equal(fixture.timeframe, '1H')
+
+  // This is the renderer's ordinary radar request.  The fixture only writes
+  // source/statistics cache rows and catalog context; it never injects a
+  // ready-made market row.
+  const projected = await waitFor(async () => {
+    const snapshot = await request({ rocPeriod: 9, marocPeriod: 9, timeframe: fixture.timeframe, sinceRevision: -1 })
+    const row = snapshot.rows?.find(value => value.instId === fixture.instId)
+    return row && row.oiChange !== null && row.takerRatio !== null && row.rsi6 !== null && row.ema200Signal !== null ? row : null
+  })
+  assert.notEqual(projected.oiChange, null)
+  assert.notEqual(projected.takerRatio, null)
+  assert.notEqual(projected.rsi6, null)
+  assert.notEqual(projected.ema200Signal, null)
+
+  // Reload so React obtains the row through exactly the same polling path as
+  // an app user, then inspect the rendered table instead of the IPC object.
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  const market = page.locator(`[aria-label="View ${fixture.instId} chart"]`)
+  await market.waitFor({ state: 'visible', timeout: 10_000 })
+  await page.waitForFunction(instId => {
+    const row = document.querySelector(`[aria-label="View ${instId} chart"]`)
+    const cells = row?.querySelectorAll('td')
+    return Boolean(cells && [3, 4, 5, 6].every(index => !cells[index].textContent?.includes('—')))
+  }, fixture.instId)
+
+  const cells = market.locator('td')
+  const taker = (await cells.nth(3).textContent())?.trim() ?? ''
+  const oi = (await cells.nth(4).textContent())?.trim() ?? ''
+  const roc = (await cells.nth(5).textContent())?.trim() ?? ''
+  const rsi = (await cells.nth(6).textContent())?.trim() ?? ''
+  assert.match(taker, /%/)
+  assert.match(oi, /%/)
+  assert.match(roc, /%/)
+  assert.match(rsi, /6\d+\.\d{2}/)
+  assert.match(await cells.nth(3).getAttribute('title') ?? '', /^Taker contracts/)
+})
+
+test('a restarted desktop restores cached catalog readings before a live scan completes', async () => {
+  // Seed inside this test so it remains valid under --test-name-pattern. Then
+  // recreate the entire Electron process to cover the production startup path,
+  // rather than a renderer reload against an already-warm main process.
+  const fixture = await request({ e2e: { action: 'seedCachedListProjection' } })
+  await electron.close()
+  await launchElectron(true)
+
+  const market = page.locator(`[aria-label="View ${fixture.instId} chart"]`)
+  await market.waitFor({ state: 'visible', timeout: 10_000 })
+  await page.waitForFunction(instId => {
+    const row = document.querySelector(`[aria-label="View ${instId} chart"]`)
+    const cells = row?.querySelectorAll('td')
+    return Boolean(cells && [3, 4, 5, 6].every(index => !cells[index].textContent?.includes('—')))
+  }, fixture.instId)
+
+  const cells = market.locator('td')
+  assert.match((await cells.nth(3).textContent())?.trim() ?? '', /%/)
+  assert.match((await cells.nth(4).textContent())?.trim() ?? '', /%/)
+  assert.match((await cells.nth(5).textContent())?.trim() ?? '', /%/)
+  assert.match((await cells.nth(6).textContent())?.trim() ?? '', /6\d+\.\d{2}/)
+  const snapshot = await request({ rocPeriod: 9, marocPeriod: 9, timeframe: '1H', sinceRevision: -1 })
+  assert.equal(snapshot.catalogSource, 'cache')
+  assert.equal(snapshot.loading, true, 'The delayed production-style discovery must still be running.')
+  await page.waitForFunction(() => document.querySelector('[aria-live="polite"]')?.textContent?.includes('Cached'))
+
+  // Do not let the deliberately delayed discovery leak into the following
+  // fixture: restore a deterministic test-mode process after this assertion.
+  await electron.close()
+  await launchElectron()
 })
 
 test('partially cached OI and Taker samples remain visibly plotted while statistics are incomplete', async () => {
