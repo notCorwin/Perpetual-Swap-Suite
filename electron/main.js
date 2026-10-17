@@ -26,6 +26,7 @@ let lastSnapshotTimeframe = '1H'
 const gatewayRequests = new Map()
 let shuttingDown = false
 let shutdownComplete = false
+let startupTask = Promise.resolve()
 
 // Electron E2E tests must never depend on OKX availability or mutate the
 // fixture while the renderer is asserting a loading/partial-data state.
@@ -193,6 +194,7 @@ async function handleRequest(event, request) {
 }
 
 async function createWindow() {
+  if (shuttingDown) return
   window = new BrowserWindow({
     width: 1440, height: 900, minWidth: 400, minHeight: 300,
     title: 'Perpetual Swap Suite',
@@ -205,12 +207,14 @@ async function createWindow() {
   window.webContents.setWindowOpenHandler(({ url }) => { void shell.openExternal(url); return { action: 'deny' } })
 }
 
-app.whenReady().then(async () => {
+async function startDesktop() {
   // Discovery begins before the renderer's first snapshot, so hydrate the
   // persisted liquidity criteria before it decides which contracts belong in
   // the catalogue.
   await settings()
+  if (shuttingDown) return
   marketStore = await MarketStore.open(join(app.getPath('userData'), 'MarketData'))
+  if (shuttingDown) return
   marketService = new MarketService(
     marketStore,
     () => ({ hourlyVolumeStabilityEnabled: settingsCache.hourlyVolumeStabilityEnabled }),
@@ -222,10 +226,15 @@ app.whenReady().then(async () => {
   })
   ipcMain.handle('radar:request', handleRequest)
   await marketService.restoreCatalog()
+  if (shuttingDown) return
   if (!testMode || e2eLiveRefresh) void marketService.refresh()
   await createWindow()
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) void createWindow() })
-})
+}
+app.whenReady().then(() => {
+  if (!shuttingDown) startupTask = startDesktop()
+  return startupTask
+}).catch(error => { console.error('Desktop startup failed:', error); app.quit() })
 app.on('before-quit', event => {
   if (shutdownComplete) return
   event.preventDefault()
@@ -234,8 +243,11 @@ app.on('before-quit', event => {
   ipcMain.removeHandler('radar:request')
   void (async () => {
     try {
-      await marketService?.dispose()
-      await marketStore?.close()
+      await startupTask.catch(error => console.error('Desktop startup did not complete:', error))
+      try { await marketService?.dispose() }
+      finally { await marketStore?.close() }
+    } catch (error) {
+      console.error('Desktop shutdown failed:', error)
     } finally {
       shutdownComplete = true
       app.quit()

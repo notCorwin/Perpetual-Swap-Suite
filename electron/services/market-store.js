@@ -33,12 +33,14 @@ export class MarketStore {
   static async open(root) {
     await mkdir(root, { recursive: true })
     const instance = await DuckDBInstance.create(':memory:')
-    return new MarketStore(root, await instance.connect())
+    try { return new MarketStore(root, await instance.connect(), instance) }
+    catch (error) { instance.closeSync(); throw error }
   }
 
-  constructor(root, connection) {
+  constructor(root, connection, instance) {
     this.root = root
     this.connection = connection
+    this.instance = instance
     this.queue = []
     this.draining = false
     this.lastWrittenAt = 0
@@ -340,6 +342,7 @@ export class MarketStore {
       while (this.draining || this.queue.length) await new Promise(resolve => setImmediate(resolve))
       await Promise.allSettled([...this.chartSnapshotWrites.values()])
       this.connection.closeSync()
+      this.instance?.closeSync()
     })()
     return this.closeTask
   }
