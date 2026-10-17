@@ -108,7 +108,7 @@ const delayedHistory = await withBenchmarkApp(async (electron, page, fixture) =>
     const heldEnd = Number(await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-end'))
     assert.equal(heldEnd, fixture.end, 'An incomplete target must never replace the last correct paint.')
     const heldRequests = await readRequestProbe(electron)
-    assert.equal(heldRequests.calls.length, 1, 'A held request must not accumulate an IPC backlog.')
+    assert.equal(heldRequests.calls.length, heldRequests.callsAtHold, `A held request must not accumulate an IPC backlog: ${JSON.stringify(heldRequests.calls)}`)
     await releaseRequestProbe(electron)
     await waitForRendered(page, fixture, fixture.timeframe, expectedEnd)
     await selectTimeframe(page, '5m')

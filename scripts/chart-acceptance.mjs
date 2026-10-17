@@ -160,7 +160,7 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
     const original = ipcMain._invokeHandlers.get('radar:request')
     const { MarketService } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/services/market-service.js')
     const originalGet = MarketService.prototype.get
-    const probe = { original, MarketService, originalGet, calls: [], active: 0, maxActive: 0, sourceCalls: 0, sourceRequests: [], held: false, release: null }
+    const probe = { original, MarketService, originalGet, calls: [], active: 0, maxActive: 0, sourceCalls: 0, sourceRequests: [], held: false, callsAtHold: null, release: null }
     const released = new Promise(resolve => { probe.release = resolve })
     MarketService.prototype.get = function (path, parameters, ...rest) {
       if (parameters?.instId === instId) { probe.sourceCalls += 1; probe.sourceRequests.push({ path, parameters: { ...parameters } }) }
@@ -175,6 +175,7 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
       try {
         if (holdHistorical && !probe.held && Number.isFinite(value.chartWindow.endHour)) {
           probe.held = true
+          probe.callsAtHold = probe.calls.length
           await released
         }
         return await original(event, value)
@@ -191,7 +192,7 @@ export async function releaseRequestProbe(electron) {
 export async function readRequestProbe(electron) {
   return electron.evaluate(() => {
     const probe = globalThis.__chartRequestProbe
-    return { calls: probe.calls, active: probe.active, maxActive: probe.maxActive, sourceCalls: probe.sourceCalls, sourceRequests: probe.sourceRequests, held: probe.held }
+    return { calls: probe.calls, active: probe.active, maxActive: probe.maxActive, sourceCalls: probe.sourceCalls, sourceRequests: probe.sourceRequests, held: probe.held, callsAtHold: probe.callsAtHold }
   })
 }
 

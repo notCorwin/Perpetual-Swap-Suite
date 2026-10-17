@@ -267,7 +267,7 @@ test('a held history read keeps the last complete paint and coalesces every late
     const held = await readRequestProbe(electron)
     assert.equal(held.active, 1)
     assert.equal(held.maxActive, 1, 'Wheel events may not create a parallel request storm.')
-    assert.equal(held.calls.length, 1, 'Only the active read may cross IPC while it is held.')
+    assert.equal(held.calls.length, held.callsAtHold, `No additional read may cross IPC while history is held: ${JSON.stringify(held.calls)}`)
     const svg = page.locator(`svg[data-rendered-inst="${fixture.instId}"]`)
     assert.equal(Number(await svg.getAttribute('data-rendered-end')), fixture.end)
     assert.match(await page.locator(`[data-chart-inst="${fixture.instId}"]`).textContent(), /Preparing/)

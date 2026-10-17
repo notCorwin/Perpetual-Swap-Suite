@@ -390,10 +390,13 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     if (wheelFrame.current !== null) window.cancelAnimationFrame(wheelFrame.current)
     if (navigationFrame.current !== null) window.cancelAnimationFrame(navigationFrame.current)
   }, [])
-  useEffect(() => {
+  useLayoutEffect(() => {
     const element = plotRef.current
     if (!element) return
-    const observer = new ResizeObserver(([entry]) => setPlotSize({ width: entry.contentRect.width, height: entry.contentRect.height }))
+    const measure = (width: number, height: number) => setPlotSize(current => current.width === width && current.height === height ? current : { width, height })
+    // Client dimensions stay in chart coordinates when the workspace is scaled.
+    measure(element.clientWidth, element.clientHeight)
+    const observer = new ResizeObserver(([entry]) => measure(entry.contentRect.width, entry.contentRect.height))
     const preventPageScroll = (event: WheelEvent) => event.preventDefault()
     observer.observe(element)
     element.addEventListener('wheel', preventPageScroll, { passive: false })
