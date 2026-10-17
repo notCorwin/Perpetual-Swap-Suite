@@ -40,6 +40,7 @@ export type ChartPollResponse = ChartResponse | { unchanged: true; error: string
 const chartCache = new Map<string, { data: ChartResponse; loadedAt: number }>()
 const chartLoads = new Map<string, Promise<ChartResponse>>()
 const chartPreviews = new Map<string, Promise<ChartResponse>>()
+const bandPreviews = new Map<string, Promise<ChartResponse>>()
 const chartOrders = new Map<string, SnapshotOrder>()
 const HISTORY_VIEWPORT_DEBOUNCE = 80
 let nextChartFocusToken = 0
@@ -69,19 +70,36 @@ function loadChart(id: string, timeframe: RadarTimeframe, focusSession: number, 
   chartLoads.set(requestKey, request)
   return request
 }
-function previewChart(id: string, timeframe: RadarTimeframe): Promise<ChartResponse> {
-  const key = chartKey(id, timeframe)
-  const cached = chartCache.get(key)
-  if (cached) return Promise.resolve(cached.data)
-  const pending = chartPreviews.get(key)
+function previewChart(id: string, timeframe: RadarTimeframe, endHour?: number): Promise<ChartResponse> {
+  // Latest previews warm the neighbor-chart cache. A history band preview
+  // pre-renders the next not-yet-visible 499-candle block; its result is
+  // merged into the chart's history bars and must not evict the latest
+  // snapshot cached under the plain id/timeframe key.
+  const latest = endHour === undefined
+  const key = latest ? chartKey(id, timeframe) : `${chartKey(id, timeframe)}:band:${endHour}`
+  if (latest) {
+    const cached = chartCache.get(key)
+    if (cached) return Promise.resolve(cached.data)
+  }
+  const pending = chartPreviews.get(key) ?? bandPreviews.get(key)
   if (pending) return pending
-  const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: id, timeframe, preview: true, sinceRevision: -1 }).then(result => {
+  if (!latest) {
+    const cachedBand = bandPreviews.get(key)
+    if (cachedBand) return cachedBand
+  }
+  const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: id, timeframe, preview: true, sinceRevision: -1, ...(latest ? {} : { chartEndHour: endHour }) }).then(result => {
     if ("unchanged" in result) throw new Error("No chart data returned")
-    rememberChart(key, result, chartCache.get(key)?.loadedAt ?? 0)
-    return chartCache.get(key)!.data
-  }).finally(() => chartPreviews.delete(key))
-  chartPreviews.set(key, request)
+    return latest ? rememberChart(key, result, chartCache.get(key)?.loadedAt ?? 0) : result
+  }).finally(() => { chartPreviews.delete(key); bandPreviews.delete(key) })
+  ;(latest ? chartPreviews : bandPreviews).set(key, request)
+  if (bandPreviews.size > 32) bandPreviews.delete(bandPreviews.keys().next().value!)
   return request
+}
+
+const barRangeCovers = (base: ChartResponse, band: ChartResponse) => {
+  if (!band.bars.length) return true
+  const hours = new Set(base.bars.map(bar => bar.hour))
+  return band.bars.every(bar => hours.has(bar.hour))
 }
 
 const compact = (value: number | null) => value === null ? "—" : new Intl.NumberFormat("en-US", { maximumSignificantDigits: 5, notation: "compact" }).format(value)
@@ -548,6 +566,22 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     element.addEventListener("wheel", preventPageScroll, { passive: false })
     return () => element.removeEventListener("wheel", preventPageScroll)
   }, [])
+  // History pre-renders even before it is visible: as soon as the latest
+  // window is on screen, the 499-candle block below it is fetched in the
+  // background and merged, so the first scroll-back paints instantly.
+  useEffect(() => {
+    if (focusSession === null || focusToken === null || historicalEnd !== null) return
+    const tailHour = chart?.bars.at(-1)?.hour
+    if (!tailHour || (chart?.bars.length ?? 0) < 96) return
+    const bandEnd = tailHour - 499 * intervalMS
+    void previewChart(instId, timeframe, bandEnd).then(band => {
+      setHistoryBars(current => {
+        const base = current?.id === cacheKey ? current.data : null
+        if (base && barRangeCovers(base, band)) return current
+        return { id: cacheKey, data: { ...(base ?? band), bars: mergeChartBars(base, band) } }
+      })
+    }).catch(() => {})
+  }, [instId, cacheKey, timeframe, intervalMS, focusSession, focusToken, historicalEnd, chart])
   useEffect(() => {
     const endWhenHidden = () => { if (document.hidden) endInspection() }
     window.addEventListener("blur", endInspection)
@@ -617,6 +651,19 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
         endInspection()
         setChartError({ id: cacheKey, message: result.error })
         setHistoryLoading(current => current === key ? null : current)
+        // Chain the next older band behind this one. When the user keeps
+        // scrolling, that viewport is already merged locally and paints
+        // without waiting for another request.
+        const nextBandEnd = historicalEnd - 499 * intervalMS
+        void previewChart(instId, timeframe, nextBandEnd).then(band => {
+          if (!currentViewport()) return
+          setHistoryBars(current => {
+            const base = current?.id === cacheKey ? current.data : null
+            if (!base) return current
+            if (barRangeCovers(base, band)) return current
+            return { id: cacheKey, data: { ...base, bars: mergeChartBars(base, band) } }
+          })
+        }).catch(() => {})
         const repaired = result.candleState === 'ready' && !chartIndicatorsNeedLoad(result.bars, historicalEnd, 96, intervalMS)
         if (!repaired && result.candleState !== 'exhausted') retryAutomatically(result.candleRetryAt === null || result.candleRetryAt === undefined ? 500 : result.candleRetryAt - Date.now())
         else historyRetryAttempts.current.delete(requestKey)

@@ -98,6 +98,117 @@ test('OI and Taker use contract units, the requested timeframe, and an inclusive
   } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
+test('a contiguous direct history viewport renders in one read without deriving from 5m', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  try {
+    const instId = 'BTC-USDT-SWAP'
+    const end = Date.UTC(2024, 5, 20, 12)
+    const directCandle = (index: number) => ({ instrument: instId, timeframe: '1H', timestamp: end - 699 * hour + index * hour, open: 100, high: 101, low: 99, close: 100 + index / 10, volume: 1, quoteVolume: 100, oi: 1_000 + index, buy: 100 + index, sell: 90 + index, statisticsVersion: 1, confirmed: true })
+    await store.appendCandles(Array.from({ length: 700 }, (_, index) => directCandle(index)))
+    const reads: Array<string> = []
+    const original = store.candles.bind(store)
+    store.candles = async (query, priority) => { reads.push(query!.timeframe); return original(query!, priority) }
+    const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
+    const chart = await service.bars(instId, '1H', end, { repair: false, statistics: false })
+    assert.deepEqual(reads.sort(), ['1H'], 'A contiguous direct window never opens the 5m partition.')
+    assert.equal(chart.bars.length, 500)
+    assert.deepEqual(chart.bars.map((value: any) => value.close)[0], directCandle(200).close)
+    // Finished periods carry the direct statistics without extra requests.
+    const last = chart.bars.at(-1)!
+    assert.equal(last.oi, 1_699)
+    assert.equal(last.buy, 799)
+    assert.equal(last.sell, 789)
+    // Indicators computed over the warmup leading edge are ready everywhere.
+    assert.equal(chart.bars.every((value: any) => value.ema !== null), true)
+    assert.deepEqual(chart.bars.slice(1).map((value: any, index: number) => value.hour - chart.bars[index].hour), Array.from({ length: 499 }, () => hour), 'A direct chart is contiguous across the visible window.')
+  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a broken direct window falls back to derivation and repairs the render', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  try {
+    const instId = 'BTC-USDT-SWAP'
+    const end = Date.UTC(2024, 5, 20, 12)
+    // A plausible but gapped direct partition: one hour row is missing in the
+    // EMA warmup and another inside the visible window.
+    const directCandle = (index: number) => ({ instrument: instId, timeframe: '1H', timestamp: end - 699 * hour + index * hour, open: 100, high: 101, low: 99, close: 100 + index / 10, volume: 1, quoteVolume: 100, oi: 1_000 + index, buy: 100 + index, sell: 90 + index, statisticsVersion: 1, confirmed: true })
+    const direct = Array.from({ length: 700 }, (_, index) => directCandle(index)).filter((_, index) => index !== 80 && index !== 450)
+    await store.appendCandles(direct)
+    const rawStart = end - 699 * hour
+    await store.appendCandles(Array.from({ length: 8400 }, (_, index) => rawCandle(rawStart + index * fiveMinutes, 100 + Math.floor(index / 12) / 10)))
+    const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
+    const chart = await service.bars(instId, '1H', end, { repair: false, statistics: false })
+    assert.equal(chart.bars.length, 500)
+    // Derived OHLC reconstructs the whole window regardless of the hole.
+    assert.deepEqual(chart.bars.slice(1).map((value: any, index: number) => value.hour - chart.bars[index].hour), Array.from({ length: 499 }, () => hour))
+    assert.equal(chart.bars.every((value: any) => value.close > 90 && value.close < 200), true)
+    // Direct statistics still attach to derived rows where both exist.
+    assert.equal(chart.bars.at(-1)!.oi, 1_699, 'Derivation inside a 1H window maps statistics onto 1H timestamps, not raw indexes.')
+    assert.equal(chart.bars.at(-1)!.buy, 799)
+    assert.equal(chart.bars.at(-1)!.sell, 789)
+  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('legacy statistics writes never render as current through the direct path', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  try {
+    const instId = 'BTC-USDT-SWAP'
+    const end = Date.UTC(2024, 5, 20, 12)
+    const directCandle = (index: number) => ({ instrument: instId, timeframe: '1H', timestamp: end - 699 * hour + index * hour, open: 100, high: 101, low: 99, close: 100, volume: 1, quoteVolume: 100, oi: 555, buy: 55, sell: 44, statisticsVersion: index < 500 ? 0 : 1, confirmed: true })
+    await store.appendCandles(Array.from({ length: 700 }, (_, index) => directCandle(index)))
+    const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
+    const chart = await service.bars(instId, '1H', end, { repair: false, statistics: false })
+    assert.equal(chart.bars[0].oi, null, 'A legacy statisticsVersion is not current contract data.')
+    assert.equal(chart.bars[0].buy, null)
+    assert.equal(chart.bars[0].sell, null)
+    assert.equal(chart.bars.at(-1)!.oi, 555, 'Current rows keep their statistics.')
+  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('repeated scrolled viewports return deterministic, byte-identical bars', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  try {
+    const instId = 'BTC-USDT-SWAP'
+    const end = Date.UTC(2024, 5, 20, 12)
+    // Seeded so the scrolled viewport end - 96h keeps its own EMA warmup:
+    // rows start exactly at that viewport's calculationFrom.
+    const older = end - 96 * hour
+    const directCandle = (index: number) => ({ instrument: instId, timeframe: '1H', timestamp: older - 699 * hour + index * hour, open: 100, high: 101, low: 99, close: 100 + (index % 12) / 10, volume: 1, quoteVolume: 100, oi: 1_000 + index, buy: 100 + index, sell: 90 + index, statisticsVersion: 1, confirmed: true })
+    await store.appendCandles(Array.from({ length: 988 }, (_, index) => directCandle(index)))
+    const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
+    const first = await service.bars(instId, '1H', older, { repair: false, statistics: false })
+    const second = await service.bars(instId, '1H', older, { repair: false, statistics: false })
+    assert.deepEqual(
+      JSON.stringify(second.bars), JSON.stringify(first.bars),
+      'A cached viewport replays exactly the same bars.')
+    assert.equal(first.bars.length, 749, 'The viewport keeps its whole warmup span and future margin.')
+  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('band pre-reads run in the background lane without hydration or statistics', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  try {
+    const instId = 'BTC-USDT-SWAP'
+    const end = Date.UTC(2024, 5, 20, 12)
+    const directCandle = (index: number) => ({ instrument: instId, timeframe: '1H', timestamp: end - 1200 * hour + index * hour, open: 100, high: 101, low: 99, close: 100 + (index % 12) / 10, volume: 1, quoteVolume: 100, oi: 1_000 + index, buy: 100 + index, sell: 90 + index, statisticsVersion: 1, confirmed: true })
+    await store.appendCandles(Array.from({ length: 1202 }, (_, index) => directCandle(index)))
+    const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetch, false)
+    const bandEnd = end - 499 * hour
+    const band = await service.bars(instId, '1H', bandEnd, { hydrate: false, repair: false, statistics: false })
+    assert.equal(band.bars.length, 749, 'The band preview serves the full derivable window with its merge margin.')
+    assert.equal(band.candleState, 'ready', 'A pre-read never proposes repair or loading states.')
+    assert.equal(band.statisticsState, 'ready')
+    // The pre-read must not move the active viewport or its hydration work.
+    assert.equal(service.isActiveChartViewport(instId, '1H'), false)
+    assert.equal(service.activeChartViewport, null)
+  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
 test('latest derived 15m/1H charts stop at a complete raw bucket and hydrate that visible window', async () => {
   const cases = [['15m', 15 * 60_000], ['1H', hour]] as const
   for (const [timeframe, interval] of cases) {
@@ -1066,7 +1177,9 @@ test('a same-instrument history viewport aborts a hanging latest request without
 
     service.focusChart(instrument.instId, 3)
     await service.bars(instrument.instId, '5m', undefined, { foreground: true, focusToken: 3, statistics: false })
-    assert.equal(latestCalls, 2)
+    // The latest load no longer awaits its hydration network round-trip; the
+    // request itself is what must be revived after the abort.
+    await waitFor(() => latestCalls === 2)
     assert.equal(service.activeChartViewport?.latest, true)
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })

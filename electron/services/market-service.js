@@ -156,6 +156,24 @@ function chartRepairRange(timeframe, end, repairEnd = end) {
   }
 }
 
+// Direct partition rows may render a completed-period window without
+// re-deriving it from 5m only when every slot from the EMA-warmup start
+// through the window end carries a confirmed OHLC row. Indicator math must
+// not know that two writers produced the bars, so the warmup leading edge is
+// part of the contract: one missing slot anywhere falls back to derivation.
+function contiguousDirectRows(rows, calculationFrom, chartEnd, intervalMS) {
+  const first = Number.isFinite(calculationFrom) ? calculationFrom : null
+  if (first === null || !Number.isFinite(chartEnd) || chartEnd < first) return false
+  const row = rows[0]
+  if (!row || row.timestamp !== first || !row.confirmed || !Number.isFinite(row.close)) return false
+  for (let index = 1; ; index += 1) {
+    const next = rows[index]
+    if (!next || !next.confirmed || !Number.isFinite(next.close)) return false
+    if (next.timestamp - rows[index - 1].timestamp !== intervalMS) return false
+    if (next.timestamp >= chartEnd) return true
+  }
+}
+
 // Derived periods are rendered from confirmed 5m source candles. A direct
 // 15m/1H statistics row can exist before its complete raw source bucket does,
 // so it must never choose the latest chart end. Doing so makes the statistics
@@ -1782,7 +1800,21 @@ export class MarketService {
     const sourceThrough = timeframe === '5m' ? through : through + intervalMS - FIVE_MINUTES
     const outputFrom = chartEnd - CHART_HISTORY_CANDLES * intervalMS
     const calculationFrom = outputFrom - EMA_WARMUP_CANDLES * intervalMS
-    const key = `${instrument}:${timeframe}:${chartEnd}:${through}`
+    // The latest viewport must end at its display end: direct rows beyond a
+    // complete bucket would otherwise be shown as a newer chart bar than the
+    // repair pipeline can vouch for (the live 5m candle still rides on top).
+    // A requested history viewport keeps its whole merge margin.
+    const trimThrough = targetEnd === undefined ? Math.max(chartEnd, live?.timestamp ?? chartEnd) : through
+    return this.computeBars(instrument, timeframe, chartEnd, { through, sourceThrough, trimThrough, intervalMS, storePriority, outputFrom, calculationFrom, live, staleForeground, staleResult, availability, statisticsState })
+  }
+
+  // The {timeframe} partition is the rendering source of truth for completed
+  // periods: OHLC always, plus OI/Taker once hydrated. A contiguous window
+  // renders in one read. Re-deriving 15m/1H bars from ~8,400 five-minute
+  // rows per viewport is the fallback for windows whose derived rows are
+  // missing or broken, not the steady-state scroll path.
+  async computeBars(instrument, timeframe, chartEnd, { through, sourceThrough, trimThrough, intervalMS, storePriority, outputFrom, calculationFrom, live, staleForeground, staleResult, availability, statisticsState }) {
+    const key = `${instrument}:${timeframe}:${chartEnd}:${trimThrough}`
     let bars, revision
     while (true) {
       if (staleForeground()) return staleResult()
@@ -1791,25 +1823,28 @@ export class MarketService {
       if (!bars) {
         let candles
         if (timeframe === '5m') {
-          candles = await this.store.candles({ instrument, timeframe, from: calculationFrom, through }, storePriority)
+          candles = await this.store.candles({ instrument, timeframe, from: calculationFrom, through: trimThrough }, storePriority)
         } else {
-          const [source, direct] = await Promise.all([
-            this.store.candles({ instrument, timeframe: '5m', from: calculationFrom, through: sourceThrough }, storePriority),
-            this.store.candles({ instrument, timeframe, from: calculationFrom, through }, storePriority),
-          ])
-          const directStatistics = new Map(direct.map(value => [value.timestamp, value]))
-          candles = aggregate(source, timeframe === '15m' ? 900_000 : 3_600_000).map(value => {
-            const statistics = directStatistics.get(value.timestamp)
-            // Never render the legacy 5m/USDT cache as if it were direct
-            // timeframe contract data. It is rehydrated in the foreground.
-            const current = this.hasCurrentStatistics(statistics)
-            return {
-              ...value,
-              oi: current ? number(statistics.oi) : null,
-              buy: current ? number(statistics.buy) : null,
-              sell: current ? number(statistics.sell) : null,
-            }
-          })
+          const direct = await this.store.candles({ instrument, timeframe, from: calculationFrom, through: trimThrough }, storePriority)
+          if (contiguousDirectRows(direct, calculationFrom, chartEnd, intervalMS)) {
+            candles = direct.map(directRow => {
+              // Never render a legacy statistics write as if it were current.
+              const current = this.hasCurrentStatistics(directRow)
+              return { ...directRow, oi: current ? number(directRow.oi) : null, buy: current ? number(directRow.buy) : null, sell: current ? number(directRow.sell) : null }
+            })
+          } else {
+            // Derived rows are missing or broken here: derive OHLC from 5m
+            // sources and attach the direct statistics, exactly as before.
+            // Repair and hydration re-persist full derived rows for later
+            // direct-first reads.
+            const source = await this.store.candles({ instrument, timeframe: '5m', from: calculationFrom, through: sourceThrough }, storePriority)
+            const statisticsByTimestamp = new Map(direct.map(value => [value.timestamp, value]))
+            candles = aggregate(source, intervalMS).map(value => {
+              const statistics = statisticsByTimestamp.get(value.timestamp)
+              const current = this.hasCurrentStatistics(statistics)
+              return { ...value, oi: current ? number(statistics.oi) : null, buy: current ? number(statistics.buy) : null, sell: current ? number(statistics.sell) : null }
+            })
+          }
         }
         if (staleForeground()) return staleResult()
         bars = barsWithIndicators(live ? [...candles, live] : candles, intervalMS).filter(value => value.hour >= outputFrom && value.hour <= through)
