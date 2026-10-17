@@ -233,6 +233,11 @@ export async function exerciseInstrumentNavigation(electron, page, fixture) {
   for (const timeframe of [fixture.timeframe, ...fixture.timeframes.filter(frame => frame !== fixture.timeframe)]) {
     if (await page.locator('svg[data-rendered-inst]').count()) await page.getByRole('button', { name: 'Markets', exact: true }).click()
     await page.locator('[aria-label="Radar timeframe"] button').filter({ hasText: new RegExp(`^${timeframe}$`, 'i') }).click()
+    // Opportunity scores can legitimately reorder while native list readings
+    // warm up. Use the fixture's fixed turnover ranking for the exact full-lap
+    // cache residency check, through the same sort control a user selects.
+    const turnoverSort = page.getByRole('button', { name: 'Sort by Turnover', exact: true })
+    if (await turnoverSort.getAttribute('aria-pressed') !== 'true') await turnoverSort.click()
     const prewarm = await waitForUniverseReady(electron, page, fixture, timeframe)
     const first = await firstVisibleMarket(page)
     const holdThisPhase = heldHistory === null
@@ -280,8 +285,9 @@ export async function exerciseInstrumentNavigation(electron, page, fixture) {
       keyboard.push(result)
       order.push(result.instId)
     }
-    assert.equal(new Set(order).size, fixture.instIds.length, 'Keyboard navigation must visit the entire prepared universe.')
-    assert.equal(order.at(-1), initial, 'Revisiting the first contract after more than twelve switches must remain immediate.')
+    const lap = JSON.stringify({ timeframe, order })
+    assert.equal(new Set(order).size, fixture.instIds.length, `Keyboard navigation must visit the entire prepared universe: ${lap}`)
+    assert.equal(order.at(-1), initial, `Revisiting the first contract after more than twelve switches must remain immediate: ${lap}`)
     const expectedInstId = order[37 % fixture.instIds.length]
     const beforeBurst = await page.evaluate(() => window.__navigationPaintProbe.commits.length)
     const rapid = await nextFrame(() => page.evaluate(() => {
