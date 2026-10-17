@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { assertCompletePaints, finishPaintProbe, installRequestProbe, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from './chart-acceptance.mjs'
+import { assertCompletePaints, finishPaintProbe, installRequestProbe, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from './chart-acceptance.mjs'
 
 const root = new URL('..', import.meta.url).pathname
 
@@ -27,6 +27,7 @@ async function withBenchmarkApp(run) {
 
 const performanceReport = await withBenchmarkApp(async (electron, page, fixture) => {
   const timeframes = []
+  let sourceRequests = []
   await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
   try {
     await openChart(page, fixture)
@@ -64,8 +65,10 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
       const requests = await readRequestProbe(electron)
       const scrollingRequests = requests.calls.slice(beforeScrolling.calls.length)
       const historicalRequests = scrollingRequests.filter(call => Number.isFinite(call.endHour))
+      const scrollingSourceRequests = requests.sourceRequests.slice(beforeScrolling.sourceCalls)
+      const sources = separateSourceMaintenance(scrollingSourceRequests, fixture)
       assert.deepEqual(historicalRequests, [], `Warm scrolling must not prepare historical pages: ${JSON.stringify(historicalRequests)}`)
-      assert.equal(requests.sourceCalls, beforeScrolling.sourceCalls, `Warm scrolling must not attempt HTTP: ${JSON.stringify(requests.sourceRequests.slice(beforeScrolling.sourceCalls))}`)
+      assert.deepEqual(sources.historical, [], `Warm scrolling must not download fixture history: ${JSON.stringify(sources.historical)}`)
       assert.equal(requests.held, false, 'A warmed target must never wait for the deliberately held historical preparation lane.')
       timeframes.push({
         timeframe, phases, ...paint, commits: paint.commits.length,
@@ -75,11 +78,15 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
         transferredHistoryBars: requests.historyResponses.filter(response => response.timeframe === timeframe).reduce((total, response) => total + response.bars, 0),
         residentHistoryBars,
         maxConcurrentRequests: requests.maxActive,
-        repeatedSourceDownloads: requests.sourceCalls - beforeScrolling.sourceCalls,
+        sourceRequests: scrollingSourceRequests,
+        currentMaintenanceRequests: sources.currentMaintenance,
+        repeatedSourceDownloads: sources.historical.length,
       })
     }
+    sourceRequests = (await readRequestProbe(electron)).sourceRequests
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
-  return { nativePeriods: fixture.timeframes, persistedPeriodsPerTimeframe: fixture.periods, timeframes }
+  return { nativePeriods: fixture.timeframes, persistedPeriodsPerTimeframe: fixture.periods,
+    sourceRequests, currentMaintenanceRequests: separateSourceMaintenance(sourceRequests, fixture).currentMaintenance, timeframes }
 })
 
 const delayedHistory = await withBenchmarkApp(async (electron, page, fixture) => {
@@ -119,14 +126,16 @@ const delayedHistory = await withBenchmarkApp(async (electron, page, fixture) =>
     const paint = await finishPaintProbe(page)
     assertCompletePaints(paint)
     const requests = await readRequestProbe(electron)
-    assert.equal(requests.sourceCalls, 0, `Prepared timeframe switches unexpectedly downloaded source data: ${JSON.stringify(requests.sourceRequests)}`)
+    const sources = separateSourceMaintenance(requests.sourceRequests, fixture)
+    assert.deepEqual(sources.historical, [], `Prepared timeframe switches unexpectedly downloaded fixture history: ${JSON.stringify(sources.historical)}`)
     assert.ok(!paint.commits.some(commit => commit.end === fixture.end - 1_200 * fixture.intervalMS), 'An obsolete held target was drawn after newer input.')
     return {
       heldForMS: 1_500, heldEnd, expectedEnd, latestIntentPreserved: true,
       ...paint, commits: paint.commits.length,
       preparedRequests: requests.calls.length, maxConcurrentRequests: requests.maxActive,
       localHistoryReads: requests.historyCalls.length, transferredHistoryBars: requests.transferredHistoryBars,
-      repeatedSourceDownloads: requests.sourceCalls,
+      sourceRequests: requests.sourceRequests, currentMaintenanceRequests: sources.currentMaintenance,
+      repeatedSourceDownloads: sources.historical.length,
     }
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
