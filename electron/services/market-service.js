@@ -1761,11 +1761,6 @@ export class MarketService {
     const availability = metadata && repair && currentForeground ? await this.ensureChartRange(metadata, timeframe, chartEnd, focusToken, repairEnd, storePriority) : { visibleCandleReady: true, candleState: 'ready', missingCandleRanges: [], candleRetryAt: null }
     if (staleForeground() || availability.stale) return staleResult()
     const ownsForeground = currentForeground && this.ownsForeground(instrument, focusToken)
-    // OI/Taker hydration starts with the viewport, not after candle repair.
-    // Its rows attach to whatever raw periods already exist, so statistics
-    // fill in progressively while repair continues instead of waiting for the
-    // whole visible window to finish.
-    const statisticsState = metadata && statistics && ownsForeground ? this.requestStatistics(metadata, timeframe, chartEnd) : null
     const live = timeframe === '5m' ? this.liveCandles.get(instrument) : undefined
     const through = targetEnd === undefined ? Math.max(chartEnd, live?.timestamp ?? chartEnd) : chartEnd + CHART_FUTURE_CANDLES * intervalMS
     // To aggregate a derived bar at `through`, read the complete 5m bucket
@@ -1784,7 +1779,13 @@ export class MarketService {
       if (!bars) {
         let candles
         if (timeframe === '5m') {
-          candles = await this.store.candles({ instrument, timeframe, from: calculationFrom, through }, storePriority)
+          const source = await this.store.candles({ instrument, timeframe, from: calculationFrom, through }, storePriority)
+          // The 5m store can contain legacy OI/Taker rows from a different
+          // unit or timeframe. Preserve the price candle, but never let those
+          // values render or satisfy the statistics-ready fast path.
+          candles = source.map(value => this.hasCurrentStatistics(value)
+            ? value
+            : { ...value, oi: null, buy: null, sell: null, statisticsVersion: null })
         } else {
           const [source, direct] = await Promise.all([
             this.store.candles({ instrument, timeframe: '5m', from: calculationFrom, through: sourceThrough }, storePriority),
@@ -1814,6 +1815,16 @@ export class MarketService {
       }
       break
     }
+    // The calculated chart only retains current-version direct statistics.
+    // When its visible values are complete, do not briefly report loading (or
+    // create a redundant task) only to rediscover the same 96 rows.
+    const firstStatisticsHour = chartEnd - (VISIBLE_CANDLES - 1) * intervalMS
+    const visibleStatistics = bars.filter(value => value.hour >= firstStatisticsHour && value.hour <= chartEnd)
+    const completeStatistics = visibleStatistics.length === VISIBLE_CANDLES
+      && visibleStatistics.every(value => number(value.oi) !== null && number(value.buy) !== null && number(value.sell) !== null)
+    const statisticsState = metadata && statistics && ownsForeground
+      ? completeStatistics ? { status: 'ready', retryAt: null } : this.requestStatistics(metadata, timeframe, chartEnd)
+      : null
     return { bars, revision, ...availability, statisticsState: statisticsState?.status ?? 'ready', statisticsRetryAt: statisticsState?.retryAt ?? null }
   }
 

@@ -27,6 +27,7 @@ jobs:
           npm ci
           npm test
           npm run benchmark
+          npm run benchmark:chart
       - name: Build release app
         run: npm run app
       - name: Package release app

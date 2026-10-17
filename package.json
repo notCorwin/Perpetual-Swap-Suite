@@ -12,8 +12,9 @@
     "dev": "scripts/dev-electron.sh",
     "electron:package": "scripts/package-electron.sh",
     "test:renderer": "node --experimental-strip-types --test src/*.test.ts",
-    "test:e2e": "node --test-concurrency=1 --test tests/e2e/*.e2e.mjs",
-    "benchmark": "node --experimental-strip-types scripts/benchmark.ts"
+    "test:e2e": "npm run build && node --test-concurrency=1 --test tests/e2e/*.e2e.mjs",
+    "benchmark": "node --experimental-strip-types scripts/benchmark.ts",
+    "benchmark:chart": "npm run build && node scripts/chart-scroll-benchmark.mjs"
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "3.0.67",

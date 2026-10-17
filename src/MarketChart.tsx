@@ -14,7 +14,7 @@ import { chartCaptureBounds } from '@/chart-capture'
 import { chartRequestKey, isCurrentChartViewportGeneration, retainViewportTimers } from '@/chart-request-key'
 import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicY } from "@/chart-axis"
 import { chartCandleWidth, chartHourX, chartLayout, fitAxisPriceTag, type ChartPanel as Panel } from "@/chart-layout"
-import { chartHistoryNeedsLoad, chartIndicatorsNeedLoad, chartScrollFloor, chartStatisticsRequestable, completeIndicatorSeries, hasCompleteChartWindow, livePriceTag, renderableChartEnd, scrollChartEnd, visibleChartBars } from "@/chart-viewport"
+import { chartHistoryNeedsLoad, chartIndicatorsNeedLoad, chartScrollFloor, chartStatisticsRequestable, chartStatsNeedLoad, chartViewportRuns, hasCompleteChartWindow, livePriceTag, renderableChartEndFromRuns, scrollChartEnd, visibleChartBars } from "@/chart-viewport"
 import { cn, pageVisible } from "@/lib/utils"
 import { chartNavigationTarget, wrappedMarket } from "@/market-sort"
 import { finitePercentage, formatPercent, type PercentageValue } from "@/market-percent"
@@ -42,6 +42,11 @@ const chartLoads = new Map<string, Promise<ChartResponse>>()
 const chartPreviews = new Map<string, Promise<ChartResponse>>()
 const chartOrders = new Map<string, SnapshotOrder>()
 const HISTORY_VIEWPORT_DEBOUNCE = 80
+const HISTORY_PREFETCH_CANDLES = 240
+const HISTORY_CACHE_CANDLES = 4_096
+const HISTORY_CACHE_CHARTS = 8
+const WHEEL_PIXELS_PER_CANDLE = 12
+const MAX_WHEEL_STEPS_PER_FRAME = 12
 let nextChartFocusToken = 0
 const chartKey = (id: string, timeframe: RadarTimeframe) => `${timeframe}:${id}`
 function rememberChart(key: string, data: ChartResponse, loadedAt: number) {
@@ -84,16 +89,28 @@ function previewChart(id: string, timeframe: RadarTimeframe): Promise<ChartRespo
   return request
 }
 
-const compact = (value: number | null) => value === null ? "—" : new Intl.NumberFormat("en-US", { maximumSignificantDigits: 5, notation: "compact" }).format(value)
-const price = (value: number | null) => value === null ? "—" : new Intl.NumberFormat("en-US", { maximumSignificantDigits: 8 }).format(value)
+const compactFormatter = new Intl.NumberFormat("en-US", { maximumSignificantDigits: 5, notation: "compact" })
+const priceFormatter = new Intl.NumberFormat("en-US", { maximumSignificantDigits: 8 })
+const chartTimeFormatter = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })
+const compact = (value: number | null) => value === null ? "—" : compactFormatter.format(value)
+const price = (value: number | null) => value === null ? "—" : priceFormatter.format(value)
 const finiteNumber = (value: number | null | undefined): value is number => typeof value === "number" && Number.isFinite(value)
-const time = (hour: number) => new Date(hour).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })
-const hourLabel = (hour: number) => new Date(hour).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })
-const chartPriceValues = (bars: Bar[]) => {
-  const include = (key: keyof Bar) => completeIndicatorSeries(bars, key)
+const time = (hour: number) => chartTimeFormatter.format(hour)
+const hourLabel = time
+const indicatorKeys = ['vwap', 'ema', 'logBBUpper', 'logBBMiddle', 'logBBLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell'] as const
+type IndicatorKey = typeof indicatorKeys[number]
+type IndicatorReadiness = Record<IndicatorKey, boolean>
+const indicatorReadiness = (bars: Bar[]): IndicatorReadiness => {
+  const ready = Object.fromEntries(indicatorKeys.map(key => [key, bars.length >= 96])) as IndicatorReadiness
+  for (const bar of bars) for (const key of indicatorKeys) {
+    if (typeof bar[key] !== 'number' || !Number.isFinite(bar[key])) ready[key] = false
+  }
+  return ready
+}
+const chartPriceValues = (bars: Bar[], ready = indicatorReadiness(bars)) => {
   return bars.flatMap(bar => [bar.low, bar.high,
-    ...(include('vwap') ? [bar.vwap] : []), ...(include('ema') ? [bar.ema] : []),
-    ...(include('logBBUpper') && include('logBBMiddle') && include('logBBLower') ? [bar.logBBUpper, bar.logBBMiddle, bar.logBBLower] : []),
+    ...(ready.vwap ? [bar.vwap] : []), ...(ready.ema ? [bar.ema] : []),
+    ...(ready.logBBUpper && ready.logBBMiddle && ready.logBBLower ? [bar.logBBUpper, bar.logBBMiddle, bar.logBBLower] : []),
   ].filter((value): value is number => value !== null && value > 0))
 }
 const rocAxisFor = (bars: Bar[]) => {
@@ -103,19 +120,37 @@ const rocAxisFor = (bars: Bar[]) => {
 }
 const axisLabelLimit = (panel: readonly [number, number], maximum: number) =>
   Math.min(maximum, Math.max(2, Math.floor((panel[1] - panel[0]) / 32) + 1))
-const legendContext = document.createElement("canvas").getContext("2d")
-const chartTextWidth = (text: string, fontSize: string) => {
-  if (!legendContext) return text.length * 7
-  const style = getComputedStyle(document.documentElement)
-  legendContext.font = `${fontSize} ${style.fontFamily}`
-  return legendContext.measureText(text.replace(/\d/g, "0")).width
+const chartStyle = getComputedStyle(document.documentElement)
+const chartTokenNumber = (token: string, fallback: number) => {
+  const value = Number.parseFloat(chartStyle.getPropertyValue(token))
+  return Number.isFinite(value) ? value : fallback
 }
-const legendWidth = (text: string) => chartTextWidth(text, getComputedStyle(document.documentElement).getPropertyValue("--chart-text-size").trim())
+const chartTokens = {
+  textSize: chartTokenNumber('--chart-text-size', 10),
+  legendGap: chartTokenNumber('--chart-legend-gap', 24),
+  priceTagPaddingX: chartTokenNumber('--chart-price-tag-padding-x', 12),
+  priceTagPaddingY: chartTokenNumber('--chart-price-tag-padding-y', 7),
+  priceTagRowGap: chartTokenNumber('--chart-price-tag-row-gap', 2),
+  priceTagTextSize: chartTokenNumber('--chart-price-tag-text-size', 12),
+  priceTagStrokeWidth: chartTokenNumber('--chart-price-tag-stroke-width', 1.5),
+  priceTagLineHeight: chartTokenNumber('--chart-price-tag-line-height', 1.1),
+} as const
+const legendContext = document.createElement("canvas").getContext("2d")
+const chartTextWidths = new Map<string, number>()
+const chartTextWidth = (text: string, fontSize: number = chartTokens.textSize) => {
+  const normalized = text.replace(/\d/g, "0")
+  const key = `${fontSize}:${normalized}`
+  const cached = chartTextWidths.get(key)
+  if (cached !== undefined) return cached
+  if (!legendContext) return normalized.length * fontSize * .7
+  legendContext.font = `${fontSize}px ${chartStyle.fontFamily || 'ui-sans-serif, system-ui, sans-serif'}`
+  const width = legendContext.measureText(normalized).width
+  chartTextWidths.set(key, width)
+  return width
+}
+const legendWidth = (text: string) => chartTextWidth(text)
 const priceTagWidth = (priceText: string, countdown: string) => {
-  const style = getComputedStyle(document.documentElement)
-  const padding = Number.parseFloat(style.getPropertyValue("--chart-price-tag-padding-x"))
-  const fontSize = style.getPropertyValue("--chart-price-tag-text-size").trim()
-  return Math.ceil(Math.max(chartTextWidth(priceText, fontSize), chartTextWidth(countdown, fontSize)) + padding * 2)
+  return Math.ceil(Math.max(chartTextWidth(priceText, chartTokens.priceTagTextSize), chartTextWidth(countdown, chartTokens.priceTagTextSize)) + chartTokens.priceTagPaddingX * 2)
 }
 
 const PriceCountdown = memo(function PriceCountdown({ hour, intervalMS, x, y, fontSize }: { hour: number; intervalMS: number; x: number; y: number; fontSize: string }) {
@@ -128,9 +163,9 @@ const PriceCountdown = memo(function PriceCountdown({ hour, intervalMS, x, y, fo
   const value = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`
   return <text x={x} y={y} textAnchor="middle" dominantBaseline="middle" fill="var(--chart-price-tag-foreground)" fontSize={fontSize}>{value}</text>
 })
-export const chartGutter = (bars: Bar[], height: number, liveClose = bars[bars.length - 1].close) => {
+export const chartGutter = (bars: Bar[], height: number, liveClose = bars[bars.length - 1].close, ready = indicatorReadiness(bars)) => {
   const { panels } = chartLayout(0, height)
-  const values = chartPriceValues(bars)
+  const values = chartPriceValues(bars, ready)
   const priceAxis = logarithmicChartAxis(Math.min(...values), Math.max(...values), axisLabelLimit(panels.price, 9))
   const decimals = priceAxis.decimals
   const priceFormatter = new Intl.NumberFormat("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals })
@@ -143,13 +178,9 @@ export const chartGutter = (bars: Bar[], height: number, liveClose = bars[bars.l
     ...(oiValues.length ? logarithmicChartAxis(Math.min(...oiValues), Math.max(...oiValues), axisLabelLimit(panels.oi, 7), true).ticks.map(compact) : []),
     ...takerAxis.ticks.map(compact),
   ]
-  const style = getComputedStyle(document.documentElement)
-  const tagStrokeWidth = Number.parseFloat(style.getPropertyValue("--chart-price-tag-stroke-width"))
-  const tagTextSize = Number.parseFloat(style.getPropertyValue("--chart-price-tag-text-size"))
-  const axisTextSize = Number.parseFloat(style.getPropertyValue("--chart-text-size"))
-  const minimumScale = Math.min(1, axisTextSize / tagTextSize)
+  const minimumScale = Math.min(1, chartTokens.textSize / chartTokens.priceTagTextSize)
   const axisGutter = Math.max(...labels.map(label => 8 + legendWidth(label)))
-  return fitAxisPriceTag(axisGutter, priceTagWidth(price(liveClose), "00:00"), tagStrokeWidth, minimumScale)
+  return fitAxisPriceTag(axisGutter, priceTagWidth(price(liveClose), "00:00"), chartTokens.priceTagStrokeWidth, minimumScale)
 }
 
 export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height, now, endHour, intervalMS = 3_600_000 }: { bars: Bar[]; liveBar: Bar; inspected: number | null; width: number; height: number; now: number; endHour: number; intervalMS?: number }) {
@@ -160,15 +191,16 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
   const firstHour = endHour - 95 * intervalMS
   const firstAtLeft = bars[0].hour === firstHour
   const candleHigh = Math.max(...bars.map(bar => bar.high)), candleLow = Math.min(...bars.map(bar => bar.low))
-  const { gutter, scale: tagScale, offset: tagOffset, boxWidth: tagBoxWidth } = chartGutter(bars, height, liveBar.close)
+  const ready = useMemo(() => indicatorReadiness(bars), [bars])
+  const { gutter, scale: tagScale, offset: tagOffset, boxWidth: tagBoxWidth } = chartGutter(bars, height, liveBar.close, ready)
   const { panels, columns, axisStarts, headerY, left, right } = chartLayout(width, height, gutter)
   const x = (index: number, panel: Panel) => chartHourX(bars[index].hour, latestHour, ...columns[panel], intervalMS)
   const barWidth = chartCandleWidth(right - left)
-  const priceValues = chartPriceValues(bars)
-  const indicatorReady = (key: keyof Bar) => completeIndicatorSeries(bars, key)
-  const bandsReady = indicatorReady('logBBUpper') && indicatorReady('logBBMiddle') && indicatorReady('logBBLower')
-  const oiComplete = indicatorReady('oi')
-  const takerComplete = indicatorReady('buy') && indicatorReady('sell')
+  const priceValues = chartPriceValues(bars, ready)
+  const indicatorReady = (key: IndicatorKey) => ready[key]
+  const bandsReady = ready.logBBUpper && ready.logBBMiddle && ready.logBBLower
+  const oiComplete = ready.oi
+  const takerComplete = ready.buy && ready.sell
   const priceMin = Math.min(...priceValues), priceMax = Math.max(...priceValues)
   const priceAxis = logarithmicChartAxis(priceMin, priceMax, axisLabelLimit(panels.price, 9))
   const highIndex = bars.findIndex(bar => bar.high === candleHigh), lowIndex = bars.findIndex(bar => bar.low === candleLow)
@@ -201,13 +233,12 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
   const latestColor = tag.rising ? "var(--positive)" : "var(--destructive)"
   const showCountdown = now > 0
   const latestPrice = price(tag.price)
-  const tagStyle = getComputedStyle(document.documentElement)
-  const tagFontSize = tagStyle.getPropertyValue("--chart-price-tag-text-size").trim()
-  const tagLineHeight = Number.parseFloat(tagFontSize) * Number.parseFloat(tagStyle.getPropertyValue("--chart-price-tag-line-height"))
-  const tagPaddingY = Number.parseFloat(tagStyle.getPropertyValue("--chart-price-tag-padding-y"))
-  const tagRowGap = Number.parseFloat(tagStyle.getPropertyValue("--chart-price-tag-row-gap"))
-  const tagStrokeWidth = Number.parseFloat(tagStyle.getPropertyValue("--chart-price-tag-stroke-width"))
-  const tickHalfHeight = Number.parseFloat(tagStyle.getPropertyValue("--chart-text-size")) / 2
+  const tagFontSize = `${chartTokens.priceTagTextSize}px`
+  const tagLineHeight = chartTokens.priceTagTextSize * chartTokens.priceTagLineHeight
+  const tagPaddingY = chartTokens.priceTagPaddingY
+  const tagRowGap = chartTokens.priceTagRowGap
+  const tagStrokeWidth = chartTokens.priceTagStrokeWidth
+  const tickHalfHeight = chartTokens.textSize / 2
   const tagHeight = tagLineHeight * (showCountdown ? 2 : 1) + (showCountdown ? tagRowGap : 0) + tagPaddingY * 2
   const scaledTagHeight = tagHeight * tagScale
   const priceTagY = tag.inViewport ? Math.max(panels.price[0], Math.min(latestY - scaledTagHeight / 2, panels.price[1] - scaledTagHeight)) : panels.price[0]
@@ -297,7 +328,7 @@ export const Plot = memo(function Plot({ bars, liveBar, inspected, width, height
   const grid = panelKeys.flatMap(key => panels[key].map((y, index) =>
     <line key={`${key}-${index}`} x1={columns[key][0]} x2={columns[key][1]} y1={y} y2={y} stroke="var(--border)" strokeWidth="1" opacity={index ? 0.32 : 0.55} />))
   const legend = (key: Panel, items: [string, string, string][]) => {
-    const gap = Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--chart-legend-gap"))
+    const gap = chartTokens.legendGap
     const start = columns[key][0] + gap / 2
     const widths = items.map(([label, value]) => legendWidth(label) + 10 + legendWidth(value))
     const available = right - start
@@ -398,6 +429,7 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
   const committedFocusRef = useRef<{ id: string; token: number } | null>(null)
   const [focusGeneration, setFocusGeneration] = useState<{ id: string; token: number } | null>(null)
   const mountedRef = useRef(true)
+  const currentCacheKey = useRef(cacheKey)
   const [focusSession, setFocusSession] = useState<number | null>(null)
   const analysis = useSyncExternalStore(chartAnalysis.subscribe, () => chartAnalysis.get(instId))
   const [analysisOpen, setAnalysisOpen] = useState(() => chartAnalysis.get(instId) !== null)
@@ -415,9 +447,10 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     return () => { stopped = true }
   }, [])
   const [displayed, setDisplayed] = useState<{ id: string; data: ChartResponse } | null>(null)
-  const [historyBars, setHistoryBars] = useState<{ id: string; data: ChartResponse } | null>(null)
+  const [historyCache, setHistoryCache] = useState(() => new Map<string, ChartResponse>())
   const [historyBoundary, setHistoryBoundary] = useState<{ id: string; oldestHour: number } | null>(null)
   const [windowEnd, setWindowEnd] = useState<{ id: string; hour: number } | null>(null)
+  const [settledWindowEnd, setSettledWindowEnd] = useState<{ id: string; hour: number } | null>(null)
   const [historyLoading, setHistoryLoading] = useState<string | null>(null)
   const [historyRetry, setHistoryRetry] = useState(0)
   // Only committed viewport state is allowed to own request generations and
@@ -427,7 +460,9 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
   const pendingWindowEndRef = useRef<{ id: string; hour: number } | null>(null)
   const wheelPixels = useRef(0)
   const wheelFrame = useRef<number | null>(null)
+  const flushWheelRef = useRef<() => void>(() => {})
   const historyRequests = useRef(new Map<string, Promise<ChartPollResponse>>())
+  const historyPrefetches = useRef(new Map<string, Promise<ChartPollResponse>>())
   const historyNextRefreshAt = useRef(new Map<string, number>())
   const historyRetryTimers = useRef(new Map<string, number>())
   const historyRetryAttempts = useRef(new Map<string, number>())
@@ -457,13 +492,21 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
   const beforePrevious = listPosition < 0 ? undefined : wrappedMarket(listOrder, listPosition - 2)
   const afterNext = listPosition < 0 ? undefined : wrappedMarket(listOrder, listPosition + 2)
   const historicalEnd = windowEnd?.id === cacheKey ? windowEnd.hour : null
-  // Every visible viewport owns a new foreground sequence. A request for an
-  // older wheel position must never retake service priority after a newer
-  // history position becomes visible.
-  const focusKey = `${cacheKey}:${historicalEnd ?? 'latest'}`
+  const settledHistoricalEnd = settledWindowEnd?.id === cacheKey ? settledWindowEnd.hour : null
+  // Input may move the visual cursor every frame. Foreground ownership only
+  // moves after the cursor settles, so a fast wheel burst cannot repeatedly
+  // cancel repair/statistics work in the main process.
+  const focusKey = `${cacheKey}:${settledHistoricalEnd ?? 'latest'}`
   const focusToken = focusGeneration?.id === focusKey ? focusGeneration.token : null
   useLayoutEffect(() => {
+    currentCacheKey.current = cacheKey
     windowEndRef.current = historicalEnd === null ? null : { id: cacheKey, hour: historicalEnd }
+  }, [cacheKey, historicalEnd])
+  useEffect(() => {
+    if (historicalEnd === null) return
+    const next = { id: cacheKey, hour: historicalEnd }
+    const timer = window.setTimeout(() => setSettledWindowEnd(current => current?.id === next.id && current.hour === next.hour ? current : next), HISTORY_VIEWPORT_DEBOUNCE)
+    return () => window.clearTimeout(timer)
   }, [cacheKey, historicalEnd])
   useLayoutEffect(() => {
     if (committedFocusRef.current?.id === focusKey) return
@@ -476,9 +519,12 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     void window.webkit.messageHandlers.radar.postMessage({ chartFocus: { instId, session: focusSession, token: focusToken } }).catch(() => {})
   }, [instId, focusSession, focusToken])
   const chart = chartCache.get(cacheKey)?.data ?? (displayed?.id === cacheKey ? displayed.data : null) ?? warmCharts.get(cacheKey) ?? null
-  const cachedBars = useMemo(() => {
-    return mergeChartBars(chart, historyBars?.id === cacheKey ? historyBars.data : null)
-  }, [chart, historyBars, cacheKey])
+  const history = historyCache.get(cacheKey) ?? null
+  // Do not let a renderer-local cache bridge collector restarts. It is safe
+  // to retain completed blocks across A → B → A navigation only within one
+  // service session.
+  const cachedHistory = chart?.serviceSession && history?.serviceSession && chart.serviceSession !== history.serviceSession ? null : history
+  const cachedBars = useMemo(() => mergeChartBars(chart, cachedHistory), [chart, cachedHistory])
   const oldestCachedHour = cachedBars[0]?.hour ?? Infinity
   const error = chartError?.id === cacheKey ? chartError.message : chart?.error ?? ""
   const captureStatus = capture.id === cacheKey ? capture.status : "idle"
@@ -488,23 +534,24 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     for (const timer of historyRetryTimers.current.values()) window.clearTimeout(timer)
     for (const timer of statisticsRetryTimers.current.values()) window.clearTimeout(timer)
     historyRetryTimers.current.clear(); historyRetryAttempts.current.clear(); historyExhaustedViewports.current.clear(); statisticsRetryTimers.current.clear(); statisticsRequests.current.clear()
-    windowEndRef.current = null; pendingWindowEndRef.current = null
-    setWindowEnd(null); setInspection(null)
-    setHistoryBars(null); setHistoryBoundary(null); setHistoryLoading(null)
+    windowEndRef.current = null; pendingWindowEndRef.current = null; historyPrefetches.current.clear()
+    setWindowEnd(null); setSettledWindowEnd(null); setInspection(null)
+    setHistoryBoundary(null); setHistoryLoading(null)
   }, [cacheKey, chart?.serviceSession])
   useEffect(() => () => {
     for (const timer of historyRetryTimers.current.values()) window.clearTimeout(timer)
     for (const timer of statisticsRetryTimers.current.values()) window.clearTimeout(timer)
   }, [])
   useEffect(() => {
-    const historyKey = historicalEnd === null || focusSession === null || focusToken === null ? null : chartRequestKey('history', cacheKey, historicalEnd, focusSession, focusToken)
-    const statisticsKey = historicalEnd === null || focusSession === null || focusToken === null ? null : chartRequestKey('statistics', cacheKey, historicalEnd, focusSession, focusToken)
+    const activeEnd = settledHistoricalEnd === historicalEnd ? historicalEnd : null
+    const historyKey = activeEnd === null || focusSession === null || focusToken === null ? null : chartRequestKey('history', cacheKey, activeEnd, focusSession, focusToken)
+    const statisticsKey = activeEnd === null || focusSession === null || focusToken === null ? null : chartRequestKey('statistics', cacheKey, activeEnd, focusSession, focusToken)
     retainViewportTimers(historyRetryTimers.current, historyKey, timer => window.clearTimeout(timer), key => {
       historyNextRefreshAt.current.delete(key)
       historyRetryAttempts.current.delete(key)
     })
     retainViewportTimers(statisticsRetryTimers.current, statisticsKey, timer => window.clearTimeout(timer))
-  }, [cacheKey, historicalEnd, focusSession, focusToken])
+  }, [cacheKey, historicalEnd, settledHistoricalEnd, focusSession, focusToken])
   useEffect(() => {
     if (capture.status !== "flashing") return
     const timer = window.setTimeout(() => setCapture(current => current === capture ? { ...current, status: "idle" } : current), 550)
@@ -521,6 +568,21 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
       setCapture({ id: cacheKey, status: "failed", error: cause instanceof Error ? cause.message : "Could not copy chart screenshot" })
     }
   }
+  const rememberHistory = useCallback((data: ChartResponse) => {
+    setHistoryCache(current => {
+      const merged = mergeChartBars(data, current.get(cacheKey) ?? null)
+      // Data already read from DuckDB remains resident while this chart is
+      // open or revisited. Keeping a bounded ordered series makes an A → B →
+      // A return a pure render operation instead of another IPC and range
+      // calculation.
+      const bars = merged.length > HISTORY_CACHE_CANDLES ? merged.slice(-HISTORY_CACHE_CANDLES) : merged
+      const next = new Map(current)
+      next.delete(cacheKey)
+      next.set(cacheKey, { ...data, bars })
+      if (next.size > HISTORY_CACHE_CHARTS) next.delete(next.keys().next().value!)
+      return next
+    })
+  }, [cacheKey])
   const warmChart = useCallback((id: string, data: ChartResponse, deferred = true) => {
     if (!data.bars.length) return
     const update = () => setWarmCharts(current => {
@@ -559,7 +621,7 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     }
   }, [cacheKey, endInspection])
   useEffect(() => {
-    if (focusSession === null || focusToken === null || historicalEnd === null) return
+    if (focusSession === null || focusToken === null || historicalEnd === null || settledHistoricalEnd !== historicalEnd) return
     const complete = hasCompleteChartWindow(cachedBars, historicalEnd, 96, intervalMS)
     const key = `${cacheKey}:${historicalEnd}`
     const requestKey = chartRequestKey('history', cacheKey, historicalEnd, focusSession, focusToken)
@@ -608,12 +670,7 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
             setWindowEnd(next)
           }
         }
-        setHistoryBars(current => {
-          const merged = mergeChartBars(result, current?.id === cacheKey ? current.data : null)
-          const first = historicalEnd - 499 * intervalMS
-          const last = historicalEnd + 249 * intervalMS
-          return { id: cacheKey, data: { ...result, bars: merged.filter(bar => bar.hour >= first && bar.hour <= last) } }
-        })
+        rememberHistory(result)
         endInspection()
         setChartError({ id: cacheKey, message: result.error })
         setHistoryLoading(current => current === key ? null : current)
@@ -629,13 +686,34 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
         if (historyRequests.current.get(requestKey) === request) historyRequests.current.delete(requestKey)
       })
     }
-    const timer = window.setTimeout(startRequest, HISTORY_VIEWPORT_DEBOUNCE)
-    return () => window.clearTimeout(timer)
-  }, [instId, cacheKey, timeframe, intervalMS, historicalEnd, oldestCachedHour, cachedBars, historyRetry, endInspection, focusSession, focusToken])
+    startRequest()
+  }, [instId, cacheKey, timeframe, intervalMS, historicalEnd, settledHistoricalEnd, oldestCachedHour, cachedBars, historyRetry, endInspection, focusSession, focusToken, rememberHistory])
   useEffect(() => {
-    wheelPixels.current = 0
-    if (wheelFrame.current !== null) window.cancelAnimationFrame(wheelFrame.current)
-    wheelFrame.current = null
+    if (historicalEnd === null || !Number.isFinite(oldestCachedHour)
+      || !chartHistoryNeedsLoad(historicalEnd, oldestCachedHour, 96, HISTORY_PREFETCH_CANDLES, intervalMS)) return
+    // A request at the oldest complete resident window extends the series by
+    // roughly one full backend block. It runs before the cursor reaches the
+    // cache edge and never claims foreground ownership.
+    const targetEnd = oldestCachedHour + 95 * intervalMS
+    const requestKey = `${cacheKey}:${targetEnd}`
+    if (historyPrefetches.current.has(requestKey)) return
+    const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, timeframe, chartEndHour: targetEnd, preview: true })
+    historyPrefetches.current.set(requestKey, request)
+    void request.then(result => {
+      if ("unchanged" in result || !mountedRef.current || currentCacheKey.current !== cacheKey) return
+      rememberHistory(result)
+    }).catch(() => {}).finally(() => {
+      if (historyPrefetches.current.get(requestKey) === request) historyPrefetches.current.delete(requestKey)
+    })
+  }, [instId, cacheKey, timeframe, intervalMS, historicalEnd, oldestCachedHour, rememberHistory])
+  useEffect(() => {
+    const cancelQueuedWheel = () => {
+      wheelPixels.current = 0
+      if (wheelFrame.current !== null) window.cancelAnimationFrame(wheelFrame.current)
+      wheelFrame.current = null
+    }
+    cancelQueuedWheel()
+    return cancelQueuedWheel
   }, [cacheKey])
   useEffect(() => {
     // The history effects above own network work while the user is inspecting
@@ -729,14 +807,15 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
   }, [listOrder, turnoverOrder, onSelect])
 
   const requestedViewportEnd = historicalEnd ?? chart?.bars.at(-1)?.hour ?? 0
-  const viewportEnd = useMemo(() => renderableChartEnd(cachedBars, requestedViewportEnd, intervalMS), [cachedBars, requestedViewportEnd, intervalMS])
+  const viewportRuns = useMemo(() => chartViewportRuns(cachedBars, intervalMS), [cachedBars, intervalMS])
+  const viewportEnd = useMemo(() => renderableChartEndFromRuns(viewportRuns, requestedViewportEnd, intervalMS), [viewportRuns, requestedViewportEnd, intervalMS])
   const bars = useMemo(() => viewportEnd === null ? [] : visibleChartBars(cachedBars, viewportEnd, intervalMS), [cachedBars, viewportEnd, intervalMS])
-  const viewportResponse = historicalEnd !== null && historyBars?.id === cacheKey ? historyBars.data : chart
-  const candleState = viewportResponse?.candleState ?? 'ready'
-  const statisticsState = viewportResponse?.statisticsState ?? 'ready'
+  const viewportResponse = historicalEnd !== null ? cachedHistory ?? chart : chart
+  const candleState = viewportEnd !== null && !chartIndicatorsNeedLoad(cachedBars, viewportEnd, 96, intervalMS) ? 'ready' : viewportResponse?.candleState ?? 'ready'
+  const statisticsState = viewportEnd !== null && !chartStatsNeedLoad(bars, viewportEnd, 96, intervalMS) ? 'ready' : viewportResponse?.statisticsState ?? 'ready'
   const incompleteViewport = requestedViewportEnd > 0 && viewportEnd !== requestedViewportEnd
   useEffect(() => {
-    if (focusSession === null || focusToken === null || historicalEnd === null || !chartStatisticsRequestable(bars, historicalEnd, viewportEnd, 96, intervalMS)) return
+    if (focusSession === null || focusToken === null || historicalEnd === null || settledHistoricalEnd !== historicalEnd || !chartStatisticsRequestable(bars, historicalEnd, viewportEnd, 96, intervalMS)) return
     const requestKey = chartRequestKey('statistics', cacheKey, historicalEnd, focusSession, focusToken)
     if (statisticsRequests.current.has(requestKey) || statisticsRetryTimers.current.has(requestKey)) return
     const viewportIsCurrent = () => mountedRef.current && isCurrentChartViewportGeneration(windowEndRef.current && committedFocusRef.current ? {
@@ -759,16 +838,12 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
       const request = window.webkit.messageHandlers.radar.postMessage({ chartInstId: instId, timeframe, chartFocusSession: focusSession, chartFocusToken: focusToken, chartEndHour: historicalEnd })
       void request.then(result => {
         if ("unchanged" in result || chartOrders.get(cacheKey)?.isRetiredSession(result.serviceSession) || !currentViewport()) return
-        setHistoryBars(current => {
-          const merged = mergeChartBars(result, current?.id === cacheKey ? current.data : null)
-          return { id: cacheKey, data: { ...result, bars: merged } }
-        })
+        rememberHistory(result)
         if (result.statisticsState !== 'ready') retry(result.statisticsRetryAt === null || result.statisticsRetryAt === undefined ? 500 : result.statisticsRetryAt - Date.now())
       }).catch(() => retry(500)).finally(() => statisticsRequests.current.delete(requestKey))
     }
-    const timer = window.setTimeout(startRequest, HISTORY_VIEWPORT_DEBOUNCE)
-    return () => window.clearTimeout(timer)
-  }, [instId, cacheKey, timeframe, intervalMS, historicalEnd, viewportEnd, bars, statisticsRetry, focusSession, focusToken])
+    startRequest()
+  }, [instId, cacheKey, timeframe, intervalMS, historicalEnd, settledHistoricalEnd, viewportEnd, bars, statisticsRetry, focusSession, focusToken, rememberHistory])
   const inspectedIndex = inspection?.id === cacheKey ? bars.findIndex(bar => bar.hour === inspection.hour) : -1
   const inspected = inspectedIndex < 0 ? null : inspectedIndex
   const inspectAt = (target: SVGSVGElement, clientX: number) => {
@@ -786,21 +861,54 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
   }
   const moveHistory = (steps: number) => {
     const latestHour = chartCache.get(cacheKey)?.data.bars.at(-1)?.hour ?? bars.at(-1)?.hour
-    if (latestHour === undefined || steps === 0) return
+    if (latestHour === undefined || steps === 0) return false
     const current = pendingWindowEndRef.current?.id === cacheKey ? pendingWindowEndRef.current.hour : historicalEnd
     const oldestAvailableHour = historyBoundary?.id === cacheKey ? historyBoundary.oldestHour : null
     const floor = Math.min(latestHour, chartScrollFloor(oldestCachedHour, oldestAvailableHour, 96, intervalMS))
-    if (steps < 0 && floor >= latestHour) { wheelPixels.current = 0; return }
+    if (steps < 0 && floor >= latestHour) { wheelPixels.current = 0; return false }
     const candidate = scrollChartEnd(current, latestHour, steps, 0, intervalMS)
     const nextHour = candidate === null ? null : Math.max(floor, candidate)
-    if (nextHour === current) { wheelPixels.current = 0; return }
+    if (nextHour === current) {
+      // Keep a fast backward fling queued at the temporary resident-cache
+      // floor. The cache-extension effect below resumes it as soon as the
+      // prefetched block arrives. A known exchange boundary and the latest
+      // edge are real endpoints, so there is nothing to preserve there.
+      if (oldestAvailableHour !== null || nextHour === null) wheelPixels.current = 0
+      return false
+    }
     const next = nextHour === null ? null : { id: cacheKey, hour: nextHour }
     pendingWindowEndRef.current = next
+    if (next === null) setSettledWindowEnd(null)
     // This is a tiny interaction state change; it must commit rather than be
     // interrupted, because its committed generation owns network retries.
     setWindowEnd(next)
     endInspection()
+    return true
   }
+  const flushWheel = () => {
+    wheelFrame.current = null
+    const steps = Math.max(-MAX_WHEEL_STEPS_PER_FRAME, Math.min(MAX_WHEEL_STEPS_PER_FRAME, Math.trunc(wheelPixels.current / WHEEL_PIXELS_PER_CANDLE)))
+    if (!steps) return
+    if (!moveHistory(steps)) return
+    wheelPixels.current -= steps * WHEEL_PIXELS_PER_CANDLE
+    if (wheelFrame.current === null && Math.abs(wheelPixels.current) >= WHEEL_PIXELS_PER_CANDLE) {
+      wheelFrame.current = window.requestAnimationFrame(() => flushWheelRef.current())
+    }
+  }
+  useLayoutEffect(() => {
+    flushWheelRef.current = flushWheel
+  })
+  const queueWheel = (pixels: number) => {
+    wheelPixels.current += pixels
+    if (wheelFrame.current === null && Math.abs(wheelPixels.current) >= WHEEL_PIXELS_PER_CANDLE) {
+      wheelFrame.current = window.requestAnimationFrame(() => flushWheelRef.current())
+    }
+  }
+  useEffect(() => {
+    if (wheelFrame.current === null && Math.abs(wheelPixels.current) >= WHEEL_PIXELS_PER_CANDLE) {
+      wheelFrame.current = window.requestAnimationFrame(() => flushWheelRef.current())
+    }
+  }, [cacheKey, oldestCachedHour, historyBoundary?.oldestHour])
   const active = bars[inspected ?? bars.length - 1]
   const atHistoryBoundary = historicalEnd !== null && historyBoundary?.id === cacheKey
     && historicalEnd === Math.min(chart?.bars.at(-1)?.hour ?? historicalEnd, historyBoundary.oldestHour + 95 * intervalMS)
@@ -845,7 +953,7 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}{historicalEnd !== null && ' Retrying automatically.'}</div>}
     {captureError && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{captureError}</p>}
     <div className="flex min-h-0 flex-1">
-    <section ref={chartRef} data-chart-inst={instId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-surface="panel" aria-label={`${instId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-chart-surface">
+    <section ref={chartRef} data-chart-inst={instId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-cache-start={cachedBars[0]?.hour} data-chart-requested-end={requestedViewportEnd || undefined} data-chart-rendered-bars={bars.length} data-chart-candle-state={candleState} data-chart-statistics-state={statisticsState} data-chart-incomplete={incompleteViewport ? 'true' : 'false'} data-chart-loading={historyLoading === `${cacheKey}:${historicalEnd}` || candleState === 'loading' || candleState === 'retrying' || incompleteViewport || statisticsState === 'loading' || statisticsState === 'retrying' ? 'true' : 'false'} data-surface="panel" aria-label={`${instId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-chart-surface">
       {active && <div className="grid shrink-0 grid-cols-[minmax(9rem,1.2fr)_repeat(4,minmax(0,1fr))] items-center border-b px-4 py-1.5 text-[length:var(--chart-text-size)]" aria-live="off">
         <p className="min-w-0 truncate border-r pr-3"><span className="font-medium">{instId.replace(/-SWAP$/, "")}</span> · <span className="text-muted-foreground">{inspected === null ? historicalEnd === null ? "Latest" : "Window end" : "Selected"}</span> {time(active.hour)}{active.confirmed ? "" : " · Live"}</p>
         {([ ["Open", active.open], ["High", active.high], ["Low", active.low], ["Close", active.close] ] as const).map(([label, value]) => <div key={label} className="min-w-0 px-3">
@@ -857,14 +965,7 @@ export function MarketChart({ instId, timeframe = '1H', onTimeframeChange, listO
         const horizontal = Math.abs(event.deltaX) > Math.abs(event.deltaY)
         const delta = horizontal ? event.deltaX : -event.deltaY
         const pixels = delta * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 240 : 1)
-        wheelPixels.current = Math.max(-144, Math.min(144, wheelPixels.current + pixels))
-        if (wheelFrame.current !== null || Math.abs(wheelPixels.current) < 12) return
-        wheelFrame.current = window.requestAnimationFrame(() => {
-          wheelFrame.current = null
-          const steps = Math.max(-12, Math.min(12, Math.trunc(wheelPixels.current / 12)))
-          wheelPixels.current -= steps * 12
-          moveHistory(steps)
-        })
+        queueWheel(pixels)
       }}>
         <div className="relative h-full w-full">
         {bars.length && plotSize.width > 0 ? [...surfaces].map(([id, data]) => <svg key={id} viewBox={`0 0 ${plotSize.width} ${plotSize.height}`} className={cn("absolute inset-0 h-full w-full text-[length:var(--chart-text-size)] select-none focus-visible:outline-2 focus-visible:outline-ring", id !== instId && "hidden")} role="img" tabIndex={id === instId ? 0 : -1} aria-hidden={id !== instId} aria-label={`${id} 96-candle ${timeframeLabel(timeframe)} chart with VWAP14, EMA200, Log BB, open interest contracts, and taker buy/sell contracts. Hold the primary mouse button to inspect a candle, drag while holding to inspect others, and release to return to the window end. Scroll to review history; returning to the latest candle resumes automatic following. Up and down arrows follow the visible market list order; left jumps to the first market in the current sorted search results and right jumps to the highest 24-hour turnover market satisfying Settings and applied indicator filters, regardless of search.`} onPointerDown={event => {

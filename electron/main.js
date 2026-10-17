@@ -3,7 +3,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ChartFocus } from './services/chart-focus.js'
-import { seedCachedListProjection } from './e2e-fixtures.js'
+import { seedCachedListProjection, seedChartScrollBenchmark } from './e2e-fixtures.js'
 import { MarketStore } from './services/market-store.js'
 import { MarketService } from './services/market-service.js'
 
@@ -196,6 +196,7 @@ async function handleRequest(event, request) {
     if (request.e2e.action === 'seedCandles') return { written: await marketStore.appendCandles(request.e2e.candles ?? []) }
     if (request.e2e.action === 'seedCachedListProjection') return seedCachedListProjection(marketStore, marketService)
     if (request.e2e.action === 'seedPartialStatisticsChart') return seedPartialStatisticsChart()
+    if (request.e2e.action === 'seedChartScrollBenchmark') return seedChartScrollBenchmark(marketStore, marketService)
     if (request.e2e.action === 'settings') return settings()
     throw new Error('Unknown E2E desktop action.')
   }

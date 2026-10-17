@@ -98,6 +98,60 @@ test('OI and Taker use contract units, the requested timeframe, and an inclusive
   } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
+test('a complete local chart does not schedule redundant OI or taker hydration', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 0, 2, 12)
+  let calls = 0
+  const fetcher: typeof fetch = async () => {
+    calls += 1
+    throw new Error('A complete local viewport must not fetch statistics again.')
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    const start = end - 499 * fiveMinutes
+    await store.appendCandles(Array.from({ length: 500 }, (_, index) => ({
+      ...rawCandle(start + index * fiveMinutes, 100 + index / 100),
+      oi: 50_000 + index, buy: 2_000 + index, sell: 1_500 + index, statisticsVersion: 1,
+    })))
+    service.instruments.set(instrument.instId, instrument)
+    assert.equal(service.focusChart(instrument.instId, 1), true)
+
+    const chart = await service.bars(instrument.instId, '5m', end, { hydrate: false, repair: false, foreground: true, focusToken: 1 })
+    assert.equal(chart.statisticsState, 'ready')
+    assert.equal(calls, 0)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a 5m chart does not treat legacy OI or taker values as current statistics', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-service-'))
+  const store = await MarketStore.open(root)
+  const instrument = { instId: 'BTC-USDT-SWAP' }
+  const end = Date.UTC(2024, 0, 2, 12)
+  let calls = 0
+  const fetcher: typeof fetch = async () => {
+    calls += 1
+    return response([])
+  }
+  const service = new MarketService(store, () => ({ hourlyVolumeStabilityEnabled: true }), fetcher, false)
+  try {
+    const start = end - 499 * fiveMinutes
+    await store.appendCandles(Array.from({ length: 500 }, (_, index) => ({
+      ...rawCandle(start + index * fiveMinutes, 100 + index / 100),
+      // Deliberately omit statisticsVersion: these values may be from the
+      // old 5m/USDT feed and must be hydrated from contract endpoints.
+      oi: 50_000 + index, buy: 2_000 + index, sell: 1_500 + index,
+    })))
+    service.instruments.set(instrument.instId, instrument)
+    assert.equal(service.focusChart(instrument.instId, 1), true)
+
+    const chart = await service.bars(instrument.instId, '5m', end, { hydrate: false, repair: false, foreground: true, focusToken: 1 })
+    assert.equal(chart.statisticsState, 'loading')
+    await waitFor(() => calls > 0)
+  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
 test('latest derived 15m/1H charts stop at a complete raw bucket and hydrate that visible window', async () => {
   const cases = [['15m', 15 * 60_000], ['1H', hour]] as const
   for (const [timeframe, interval] of cases) {

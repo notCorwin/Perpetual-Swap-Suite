@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chartHistoryNeedsLoad, chartIndicatorsNeedLoad, chartScrollFloor, chartStatisticsRequestable, chartStatsNeedLoad, completeIndicatorSeries, hasCompleteChartWindow, livePriceTag, renderableChartEnd, scrollChartEnd, visibleChartBars } from "./chart-viewport.ts"
+import { chartHistoryNeedsLoad, chartIndicatorsNeedLoad, chartScrollFloor, chartStatisticsRequestable, chartStatsNeedLoad, chartViewportRuns, completeIndicatorSeries, hasCompleteChartWindow, livePriceTag, renderableChartEnd, renderableChartEndFromRuns, scrollChartEnd, visibleChartBars } from "./chart-viewport.ts"
 
 const hour = 3_600_000
 test("live price and countdown do not change when the chart scrolls into history", () => {
@@ -52,6 +52,19 @@ test("a partial overlap is not a renderable chart window", () => {
   assert.equal(renderableChartEnd(bars.slice(0, 95), 94 * hour), null)
 })
 
+test("precomputed viewport runs preserve nearest complete-window selection", () => {
+  const bars = Array.from({ length: 360 }, (_, index) => ({ hour: index * hour })).filter(bar => bar.hour !== 180 * hour)
+  const runs = chartViewportRuns(bars)
+
+  assert.deepEqual(runs, [
+    { firstEnd: 95 * hour, lastEnd: 179 * hour },
+    { firstEnd: 276 * hour, lastEnd: 359 * hour },
+  ])
+  for (const requested of [0, 95, 148, 180, 220, 276, 359, 400].map(value => value * hour)) {
+    assert.equal(renderableChartEndFromRuns(runs, requested), renderableChartEnd(bars, requested))
+  }
+})
+
 test("indicators render only for a complete visible candle window", () => {
   const complete = Array.from({ length: 96 }, (_, index) => ({ ema: index + 1 }))
   assert.equal(completeIndicatorSeries(complete, 'ema'), true)
@@ -88,6 +101,7 @@ test("scrolling never requests an end below the earliest complete cached window"
 test("cached candles still request history when visible OI or taker data is missing", () => {
   const complete = Array.from({ length: 500 }, (_, index) => ({ hour: index * hour, confirmed: true, oi: 1, buy: 2, sell: 3 }))
   assert.equal(chartStatsNeedLoad(complete, 450 * hour), false)
+  assert.equal(chartStatsNeedLoad(complete.slice(0, 95), 94 * hour), true, "A partial viewport must never look statistics-ready")
   const missingOI = complete.map(bar => bar.hour === 420 * hour ? { ...bar, oi: null } : bar)
   assert.equal(chartStatsNeedLoad(missingOI, 450 * hour), true)
   const missingTaker = complete.map(bar => bar.hour === 420 * hour ? { ...bar, buy: null } : bar)
