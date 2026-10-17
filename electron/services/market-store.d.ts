@@ -16,6 +16,7 @@ export class MarketStore {
   static open(root: string): Promise<MarketStore>
   enqueue<T>(operation: () => T | Promise<T>, priority?: StorePriority): Promise<T>
   appendCandles(candles: CandleRecord[], priority?: StorePriority): Promise<number>
+  compactLegacyParts(): Promise<void>
   candles(query: { instrument: string; timeframe: string; from?: number; through?: number }, priority?: StorePriority): Promise<CandleRecord[]>
   candleTimestamps(query: { instrument: string; timeframe: string; from?: number; through?: number }, priority?: StorePriority): Promise<number[]>
   coverage(instrument: string, timeframe: string, priority?: StorePriority): Promise<{ count: number; first: number | null; last: number | null }>

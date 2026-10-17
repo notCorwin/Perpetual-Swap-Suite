@@ -1726,21 +1726,28 @@ export class MarketService {
     if (staleForeground()) return staleResult()
     const metadata = this.instruments.get(instrument)
     if (foreground && metadata && targetEnd !== undefined && this.ownsForeground(instrument, focusToken)) this.activateChartViewport(metadata, timeframe, targetEnd, false)
-    // A historical window is fully database-backed. Fetching the latest 5m
-    // page here only competes with its repair/statistics work.
+    const intervalMS = timeframeMilliseconds(timeframe)
+    // Neighbor previews and history windows read the store in the background
+    // lane; only a focused latest viewport may cut ahead of queued work.
+    const storePriority = foreground ? 'foreground' : 'background'
+    let rawCoverage = targetEnd === undefined ? await this.store.coverage(instrument, '5m', storePriority) : null
     if (metadata && hydrate && targetEnd === undefined) {
       // Claim a pending latest viewport before starting its network request.
       // This lets retry/finally distinguish an intentional latest load from
       // the no-viewport interval that follows a history focus transition.
       if (foreground && this.ownsForeground(instrument, focusToken)) this.activateChartViewport(metadata, timeframe, null, true)
-      await this.hydrate(metadata)
+      // A historical window is fully database-backed: fetch the latest 5m page
+      // only when the store has nothing to render, and otherwise let the
+      // hydration land in the background and bump the data revision for the
+      // next poll. Waiting here would hold the persisted chart hostage to the
+      // OKX round-trip on every open.
+      const hydration = this.hydrate(metadata)
+      if (rawCoverage.count === 0) {
+        await hydration
+        // The awaited page may have persisted the store's first candles.
+        rawCoverage = await this.store.coverage(instrument, '5m', storePriority)
+      }
     }
-    if (staleForeground()) return staleResult()
-    const intervalMS = timeframeMilliseconds(timeframe)
-    // Neighbor previews and history windows read the store in the background
-    // lane; only a focused latest viewport may cut ahead of queued work.
-    const storePriority = foreground ? 'foreground' : 'background'
-    const rawCoverage = targetEnd === undefined ? await this.store.coverage(instrument, '5m', storePriority) : null
     // A rapid wheel stream can leave many messages in flight. Never enqueue a
     // second DuckDB read, a repair, or a chart calculation for a viewport that
     // has already lost foreground ownership.

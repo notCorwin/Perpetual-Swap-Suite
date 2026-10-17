@@ -89,6 +89,39 @@ export class MarketStore {
     return dates.filter(entry => entry.isDirectory()).map(entry => join(directory, entry.name, '*.parquet'))
   }
 
+  // One part per date partition. Rows merge into the partition's existing
+  // parts during a single atomic COPY: readers open one file per date, the
+  // newest-written observation wins per timestamp, and an interrupted write
+  // leaves the previous part intact until the replacement is renamed in.
+  async writePartition(directory, rows) {
+    await mkdir(directory, { recursive: true })
+    const parts = (await readdir(directory, { withFileTypes: true }).catch(() => []))
+      .filter(entry => entry.isFile() && entry.name.endsWith('.parquet'))
+      .map(entry => join(directory, entry.name))
+    const nonce = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    const source = join(directory, `.${nonce}.json`)
+    const target = join(directory, `part-${nonce}.parquet`)
+    const temporary = `${target}.tmp`
+    if (rows.length) await writeFile(source, JSON.stringify(rows), { mode: 0o600 })
+    const sources = [
+      ...(parts.length ? [`SELECT * FROM read_parquet([${parts.map(quote).join(', ')}], union_by_name = true)`] : []),
+      ...(rows.length ? [`SELECT * FROM read_json_auto(${quote(source)})`] : []),
+    ]
+    if (!sources.length) return
+    try {
+      await this.connection.run(`COPY (
+        SELECT * FROM (${sources.join(' UNION ALL BY NAME ')})
+        QUALIFY row_number() OVER (PARTITION BY timestamp ORDER BY COALESCE(writtenAt, 0) DESC) = 1
+        ORDER BY timestamp
+      ) TO ${quote(temporary)} (FORMAT PARQUET, COMPRESSION ZSTD)`)
+      await rename(temporary, target)
+      await Promise.all(parts.map(part => rm(part, { force: true })))
+    } finally {
+      if (rows.length) await rm(source, { force: true })
+      await rm(temporary, { force: true })
+    }
+  }
+
   async appendCandles(candles, priority = 'background') {
     if (!Array.isArray(candles) || candles.length === 0) return 0
     // Parquet parts are append-only. The latest record wins during reads, so
@@ -101,48 +134,42 @@ export class MarketStore {
     }
     const write = async () => {
       const batches = Map.groupBy(candles, candle => this.partition(candle.instrument, candle.timeframe, candle.timestamp))
-      for (const [directory, rows] of batches) {
-        await mkdir(directory, { recursive: true })
-        // A part per write makes every read scan a growing pile of files.
-        // Merge each write into the partition's single part instead: reads
-        // open one file per date while newest-written rows still win per
-        // timestamp. Old parts are removed only after the replacement is
-        // durably renamed in, so an interrupted write stays readable.
-        const parts = (await readdir(directory, { withFileTypes: true }).catch(() => []))
-          .filter(entry => entry.isFile() && entry.name.endsWith('.parquet'))
-          .map(entry => join(directory, entry.name))
-        const nonce = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
-        const source = join(directory, `.${nonce}.json`)
-        const target = join(directory, `part-${nonce}.parquet`)
-        const temporary = `${target}.tmp`
-        await writeFile(source, JSON.stringify(rows), { mode: 0o600 })
-        try {
-          if (parts.length) {
-            const list = `[${parts.map(quote).join(', ')}]`
-            await this.connection.run(`COPY (
-              SELECT * FROM (
-                SELECT * FROM read_parquet(${list}, union_by_name = true)
-                UNION ALL BY NAME
-                SELECT * FROM read_json_auto(${quote(source)})
-              ) QUALIFY row_number() OVER (PARTITION BY timestamp ORDER BY COALESCE(writtenAt, 0) DESC) = 1
-              ORDER BY timestamp
-            ) TO ${quote(temporary)} (FORMAT PARQUET, COMPRESSION ZSTD)`)
-          } else {
-            await this.connection.run(`COPY (SELECT * FROM read_json_auto(${quote(source)})) TO ${quote(temporary)} (FORMAT PARQUET, COMPRESSION ZSTD)`)
-          }
-          await rename(temporary, target)
-          await Promise.all(parts.map(part => rm(part, { force: true })))
-        } finally {
-          await rm(source, { force: true })
-          await rm(temporary, { force: true })
-        }
-      }
+      for (const [directory, rows] of batches) await this.writePartition(directory, rows)
       // Coverage only changes when rows are written. Invalidate per
       // instrument so unrelated instruments keep serving cached scans.
       for (const candle of candles) this.coverages.delete(`${candle.instrument}:${candle.timeframe}`)
       return candles.length
     }
     return this.enqueue(write, priority)
+  }
+
+  // Legacy parts are one per write on now-superseded builds. Merging keeps
+  // them only until that date receives another write, and dates that never
+  // receive one stay fragmented forever while every continuing read opens the
+  // partition's whole pile of files. Fold each fragmented partition back to
+  // one part on open; coverage (count/min/max) is preserved because the merge
+  // deduplicates by timestamp exactly as reads do.
+  async compactLegacyParts() {
+    const candles = join(this.root, 'candles')
+    for (const frame of await readdir(candles).catch(() => [])) {
+      for (const instrument of await readdir(join(candles, frame)).catch(() => [])) {
+        const instrumentDirectory = join(candles, frame, instrument)
+        for (const date of await readdir(instrumentDirectory).catch(() => [])) {
+          const directory = join(instrumentDirectory, date)
+          const parts = (await readdir(directory, { withFileTypes: true }).catch(() => []))
+            .filter(entry => entry.isFile() && entry.name.endsWith('.parquet'))
+          if (parts.length <= 1) continue
+          try { await this.enqueue(() => this.writePartition(directory, []), 'background') }
+          catch (error) {
+            // Quitting in the middle of the sweep is routine; a fold that
+            // never happens leaves the existing parts readable.
+            if (this.closed) return
+            throw error
+          }
+        }
+      }
+    }
+    return undefined
   }
 
   async candles({ instrument, timeframe, from = 0, through = Date.now() }, priority = 'background') {

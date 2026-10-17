@@ -304,6 +304,10 @@ app.whenReady().then(async () => {
   // the catalogue.
   await settings()
   marketStore = await MarketStore.open(join(app.getPath('userData'), 'MarketData'))
+  // Superseded builds left one Parquet part per write. Opening the store is
+  // the moment to fold them back to one part per date, in the background, so
+  // every chart and repair scan stops paying for the historical pile.
+  void marketStore.compactLegacyParts()
   marketService = new MarketService(
     marketStore,
     () => ({ hourlyVolumeStabilityEnabled: settingsCache.hourlyVolumeStabilityEnabled }),

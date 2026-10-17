@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MarketStore } from '../electron/services/market-store.js'
@@ -77,4 +77,61 @@ test('close drains work already admitted to the DuckDB lane and rejects new work
     await closing
     assert.equal(closed, true)
   } finally { release?.(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('compaction folds superseded legacy parts back to one part per date', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-store-'))
+  const store = await MarketStore.open(root)
+  try {
+    const base = Date.UTC(2024, 0, 1)
+    const fullDay = (timestamp: number) => record(base + timestamp * fiveMinutes)
+    // A legacy build left one Parquet part per write. Reconstruct that shape
+    // by pairing appends in isolated roots with their produced parts into the
+    // audited date directory under distinct names.
+    const directory = join(root, 'candles', 'timeframe=5m', 'instrument=BTC-USDT-SWAP', 'date=2024-01-01')
+    const plantLegacyPart = async (candles: Array<Record<string, unknown>>, name: string) => {
+      const scratch = await mkdtemp(join(tmpdir(), 'perp-radar-legacy-'))
+      try {
+        const scratchStore = await MarketStore.open(scratch)
+        await scratchStore.appendCandles(candles as never)
+        await scratchStore.close()
+        // The date folder groups candles by UTC day; the single appended batch
+        // lands in exactly one partition directory.
+        const scratchRoot = join(scratch, 'candles', 'timeframe=5m', 'instrument=BTC-USDT-SWAP/date=2024-01-01')
+        const [part] = (await readdir(scratchRoot)).filter(name => name.endsWith('.parquet'))
+        await copyFile(join(scratchRoot, part), join(directory, name))
+      } finally { await rm(scratch, { recursive: true, force: true }) }
+    }
+    await mkdir(directory, { recursive: true })
+    await plantLegacyPart(Array.from({ length: 6 }, (_, index) => fullDay(index)).map(row => ({ ...row, close: 100 })), 'part-a.parquet')
+    await plantLegacyPart(Array.from({ length: 6 }, (_, index) => fullDay(index)).map(row => ({ ...row, close: 101 })), 'part-b.parquet')
+    await plantLegacyPart(Array.from({ length: 6 }, (_, index) => fullDay(index)).map(row => ({ ...row, close: 999, confirmed: false })), 'part-c.parquet')
+    await plantLegacyPart([{ ...fullDay(2), oi: 5_000, buy: 300, sell: 200 }], 'part-d.parquet')
+    const before = (await readdir(directory)).filter(name => name.endsWith('.parquet'))
+    assert.equal(before.length, 4)
+    await store.compactLegacyParts()
+    const after = (await readdir(directory)).filter(name => name.endsWith('.parquet'))
+    assert.equal(after.length, 1, 'Compaction folds the whole legacy pile into one part.')
+    let rows = await store.candles({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: base, through: base + 5 * fiveMinutes })
+    assert.equal(rows.length, 6)
+    // The newest written observation keeps winning per timestamp, including
+    // the statistics patch recorded before compaction.
+    assert.equal(rows[2].close, 100)
+    assert.equal(rows[2].confirmed, true)
+    assert.equal(rows[2].oi, 5_000)
+    // The seven rows now come from the compacted part plus the later append.
+    assert.equal(rows.filter(row => row.timestamp !== base + 2 * fiveMinutes && row.timestamp !== base + 6 * fiveMinutes).every(row => row.close === 999 && row.confirmed === false), true)
+    // Min/max/count coverage is unchanged by compaction, so cached scans stay valid.
+    let coverage = await store.coverage('BTC-USDT-SWAP', '5m')
+    assert.deepEqual([coverage.first, coverage.last], [base, base + 5 * fiveMinutes])
+    // Writes after compaction stay mergeable in one part.
+    await store.appendCandles([{ ...fullDay(6) }])
+    coverage = await store.coverage('BTC-USDT-SWAP', '5m')
+    assert.deepEqual([coverage.first, coverage.last], [base, base + 6 * fiveMinutes])
+    rows = await store.candles({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: base, through: base + 6 * fiveMinutes })
+    assert.equal(rows.length, 7)
+    assert.equal(rows.at(-1)!.close, 100)
+    const finalParts = (await readdir(directory)).filter(name => name.endsWith('.parquet'))
+    assert.equal(finalParts.length, 1, 'Writes after compaction keep the partition merged.')
+  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
 })
