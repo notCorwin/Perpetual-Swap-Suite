@@ -1,45 +1,89 @@
-name: Publish Electron macOS Release
+name: Verify and Publish Electron macOS
 
 on:
+  pull_request:
   push:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: autobuild-release
+  group: desktop-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 jobs:
-  publish-release:
-    runs-on: macos-latest
+  validate:
+    name: Lint, types, core, and Electron E2E
+    runs-on: macos-15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: actions/setup-node@v7
         with:
-          node-version: 'node'
+          node-version: '24'
           cache: npm
-      - name: Verify Electron app
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Check desktop syntax
+        run: node scripts/check-desktop.mjs
+      - name: Check types
+        run: node_modules/.bin/tsc -b
+      - name: Test core behavior
+        run: node --experimental-strip-types --test src/*.test.ts tests/core/*.test.mjs
+      - name: Build renderer
+        run: node_modules/.bin/vite build
+      - name: Test Electron with isolated fixtures
         run: |
-          npm ci
-          npm test
-          npm run test:okx:1h
-          npm run benchmark
-          npm run benchmark:chart
-          npm run benchmark:instruments
-      - name: Build release app
-        run: npm run app
-      - name: Package release app
+          mkdir -p artifacts
+          node --test-concurrency=1 --test tests/e2e/*.e2e.mjs 2>&1 | tee artifacts/electron-e2e.log
+      - name: Retain E2E diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: electron-e2e-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  package-smoke:
+    name: Package and smoke the macOS executable
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Build ad-hoc signed app
+        run: scripts/package-electron.sh
+      - name: Smoke packaged executable
+        id: smoke
         shell: bash
         run: |
-          app="$(find dist -path '*Perpetual Swap Suite.app' -type d -print -quit)"
+          mkdir -p artifacts
+          app="$(find dist -maxdepth 3 -type d -name 'Perpetual Swap Suite.app' -print)"
           test -n "$app"
           test -x "$app/Contents/MacOS/Perpetual Swap Suite"
-          test -f "$app/Contents/Resources/app.asar"
-          ditto -c -k --keepParent "$app" Perpetual.Swap.Suite.app.zip
+          node scripts/smoke-electron.mjs --app "$app" --revision "$GITHUB_SHA" --report artifacts/package-smoke.json 2>&1 | tee artifacts/package-smoke.log
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+      - name: Archive smoke-tested app
+        shell: bash
+        env:
+          APP_PATH: ${{ steps.smoke.outputs.app }}
+        run: |
+          ditto -c -k --keepParent "$APP_PATH" Perpetual.Swap.Suite.app.zip
           sha256="$(shasum -a 256 Perpetual.Swap.Suite.app.zip | cut -d' ' -f1)"
           built_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           repository_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
@@ -48,6 +92,39 @@ jobs:
           printf '{"revision":"%s","asset_url":"%s","digest":"sha256:%s","published_at":"%s","commit_date":"%s"}\n' \
             "$GITHUB_SHA" "$asset_url" "$sha256" "$built_at" "$commit_date" > update.json
           printf 'Latest Electron build from `main`.\n\n[Download Perpetual Swap Suite](%s)\n' "$asset_url" > release-notes.md
+      - name: Retain package smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: package-smoke-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Upload verified release files
+        uses: actions/upload-artifact@v7
+        with:
+          name: verified-release-${{ github.sha }}
+          path: |
+            Perpetual.Swap.Suite.app.zip
+            update.json
+            release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    name: Publish smoke-tested app
+    needs: package-smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: verified-release-${{ github.sha }}
       - name: Publish autobuild release
         shell: bash
         env:

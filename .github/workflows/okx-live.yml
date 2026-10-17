@@ -1,0 +1,98 @@
+name: Live OKX Integration
+
+on:
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: okx-live-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  okx-live:
+    name: Check live public OKX endpoints and integration
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Record public endpoint availability
+        run: |
+          mkdir -p artifacts
+          node --input-type=module <<'NODE'
+          import { writeFile } from 'node:fs/promises'
+          const paths = [
+            '/market/history-candles?instId=BTC-USDT-SWAP&bar=1H&limit=2',
+            '/rubik/stat/contracts/open-interest-history?instId=BTC-USDT-SWAP&period=1H&limit=2',
+            '/rubik/stat/taker-volume-contract?instId=BTC-USDT-SWAP&period=1H&unit=1&limit=2',
+          ]
+          const probes = await Promise.all(paths.map(async path => {
+            const url = `https://www.okx.com/api/v5${path}`
+            const startedAt = Date.now()
+            try {
+              const response = await fetch(url, { signal: AbortSignal.timeout(15_000) })
+              const body = await response.text()
+              let payload
+              try { payload = JSON.parse(body) } catch {}
+              return { url, status: response.status, code: payload?.code, elapsedMS: Date.now() - startedAt,
+                ok: response.ok && payload?.code === '0', body: body.slice(0, 8192) }
+            } catch (error) {
+              return { url, ok: false, elapsedMS: Date.now() - startedAt,
+                error: { name: error.name, message: error.message, cause: error.cause?.message, code: error.cause?.code } }
+            }
+          }))
+          const report = { revision: process.env.GITHUB_SHA, observedAt: new Date().toISOString(), probes }
+          await writeFile('artifacts/okx-endpoints.json', JSON.stringify(report, null, 2))
+          console.log(JSON.stringify(report, null, 2))
+          NODE
+      - name: Run live market integration with temporary storage
+        id: integration
+        env:
+          OKX_LIVE_TIMEOUT_MS: '120000'
+        shell: bash
+        run: |
+          set +e
+          node scripts/okx-live-1h.mjs 2>&1 | tee artifacts/okx-integration.log
+          status="${PIPESTATUS[0]}"
+          set -e
+          echo "exit-code=$status" >> "$GITHUB_OUTPUT"
+      - name: Classify live result
+        env:
+          INTEGRATION_EXIT_CODE: ${{ steps.integration.outputs.exit-code }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFile, readFile, writeFile } from 'node:fs/promises'
+          const report = JSON.parse(await readFile('artifacts/okx-endpoints.json', 'utf8'))
+          const externalFailures = report.probes.filter(probe => !probe.ok)
+          const passed = process.env.INTEGRATION_EXIT_CODE === '0'
+          const classification = passed ? 'passed' : externalFailures.length ? 'external-unavailable' : 'integration-failed'
+          const result = { revision: process.env.GITHUB_SHA, classification, integrationExitCode: process.env.INTEGRATION_EXIT_CODE,
+            externalFailures: externalFailures.map(({ url, status, code, error }) => ({ url, status, code, error })) }
+          await writeFile('artifacts/okx-result.json', JSON.stringify(result, null, 2))
+          await appendFile(process.env.GITHUB_STEP_SUMMARY,
+            `Live OKX result: **${classification}**. Revision: \`${process.env.GITHUB_SHA}\`.\n\n` +
+            (passed ? 'Live behavior checks passed.\n' : externalFailures.length
+              ? 'Public endpoint probes failed. See okx-endpoints.json for HTTP/API status, network error, and response body.\n'
+              : 'Public endpoints responded at probe time. Inspect okx-integration.log for the failing assertion and observed request statuses.\n'))
+          console.log(JSON.stringify(result, null, 2))
+          if (!passed) process.exitCode = 1
+          NODE
+      - name: Retain external and integration diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: okx-live-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
