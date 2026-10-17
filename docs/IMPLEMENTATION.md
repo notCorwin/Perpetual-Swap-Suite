@@ -4,8 +4,8 @@ The [improvement plan](IMPROVEMENT_PLAN.md) is being implemented in independentl
 
 | Batch | Scope | Verification |
 | --- | --- | --- |
-| 1 | One canonical full-history indicator calculation for lists/charts; arithmetic BOLL; base-quantity VWAP; flat RSI=50; unavailable zero baselines; formula-version invalidation | 139 core tests, 16 Electron E2E, production build and lint passed. macOS installation smoke is required before pushing this batch. |
-| 2 | Transaction settings, durable source sync, ingestion validation and manual integrity audit | In progress |
+| 1 | One canonical full-history indicator calculation for lists/charts; arithmetic BOLL; base-quantity VWAP; flat RSI=50; unavailable zero baselines; formula-version invalidation | 139 core tests and 16 Electron E2E passed. App revision `db04a86` installed, with actual executable, native store, worker, normal exit and restart verified. Pushed to main. |
+| 2 | Transaction settings, durable source sync, ingestion validation and manual integrity audit | Storage modules and 48 focused tests complete; explicit Parquet schema and strict ingestion active. Settings/sync/audit application integration remains in progress. |
 | 3 | Independently configurable liquidity filters, finite eligibility leases and independent 15m ranking | Pending |
 | 4 | WebSocket candle lifecycle and reconnect gap repair | Pending |
 | 5 | Base UI default components, two-column workspace, global scaling and English interface | In progress in an isolated checkout |
