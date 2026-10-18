@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { MarketStore } from '../electron/services/market-store.js'
 import { PreparedChartPipeline } from '../electron/services/prepared-chart-service.js'
 import { barsWithIndicators } from '../electron/services/indicators.js'
+import { bandwidthExpansion, summarizeMarketBars } from '../electron/services/market-metrics.js'
 import { PreparedChartStore } from './chart-series-store.ts'
 
 const hour = 3_600_000
@@ -551,6 +552,7 @@ test('shutdown prevents worker admission after an outstanding source task resolv
 
 test('a forming tick can build its first memory frame without writing a durable snapshot', async () => {
   const f = await fixture(), first = Date.UTC(2024, 0, 1), source = Array.from({ length: 400 }, (_, index) => candle(first + index * hour, index))
+  f.instruments.set(instId, { listTime: String(first) })
   let writes = 0
   const writeSnapshot = f.store.writeChartSnapshot.bind(f.store)
   f.store.writeChartSnapshot = async (...args: any[]) => { writes += 1; return writeSnapshot(args[0], args[1], args[2]) }
@@ -558,6 +560,7 @@ test('a forming tick can build its first memory frame without writing a durable 
     await f.store.appendCandles(source)
     const frame = await f.pipeline.setLive(instId, '1H', { ...candle(first + 400 * hour, 400), confirmed: false })
     assert.equal(frame.bars.length, 96); assert.equal(frame.liveBar.confirmed, false)
+    assert.equal(frame.oldestHour, first, 'The lightweight seed retains the proven listing floor.')
     assert.equal(writes, 0); assert.equal(await f.store.readChartSnapshot(instId, '1H'), null)
     assert.equal((await f.store.candles({ instrument: instId, timeframe: '1H' })).length, 400)
   } finally { await f.close() }
@@ -575,4 +578,168 @@ test('missing base-volume units in the warmup remain an explicit history gap unt
     assert.equal(requests, 2)
     assert.equal(visible(frame).at(-1).vwap, barsWithIndicators(source, hour).at(-1)?.vwap)
   } finally { await f.close() }
+})
+
+test('36 realtime series retain bounded seeds beyond the history LRU and never reload or post full histories for ticks', async () => {
+  const frames = ['5m', '15m', '1H'], ids = Array.from({ length: 12 }, (_, index) => `LIVE${index}-USDT-SWAP`)
+  const subscriptions = ids.flatMap(instId => frames.map(timeframe => ({ instId, timeframe })))
+  const sources = new Map<string, any[]>(), reads = new Map<string, number>()
+  let allowConfirmedSnapshot = false
+  const store = {
+    async candles({ instrument, timeframe }: any) { const key = `${instrument}:${timeframe}`; reads.set(key, (reads.get(key) ?? 0) + 1); return sources.get(key)! },
+    async candleWatermark() { return 'memory-watermark' },
+    async readChartSnapshot() { return null },
+    async writeChartSnapshot() { if (!allowConfirmedSnapshot) throw new Error('A forming tick must not persist a snapshot.') },
+  }
+  const pipeline = createPipeline(store), liveCandles = new Map<string, any>()
+  pipeline.setRealtimeSubscriptions(subscriptions)
+  try {
+    for (const { instId: id, timeframe } of subscriptions) {
+      const interval = timeframe === '5m' ? step : timeframe === '15m' ? 900_000 : hour
+      const end = Math.floor(Date.now() / interval) * interval - interval, key = `${id}:${timeframe}`
+      const source = Array.from({ length: 400 }, (_, index) => candle(end - (399 - index) * interval, index, timeframe, id))
+      sources.set(key, source)
+      const live = { ...candle(end + interval, 400, timeframe, id), confirmed: false }
+      liveCandles.set(key, live)
+      await pipeline.setLive(id, timeframe, live)
+    }
+    const calculations = pipeline.nextCalculation
+    assert.equal(calculations, 36)
+    assert.equal(pipeline.liveStates.size, 36)
+    assert.ok(pipeline.series.size <= 8)
+    for (const { instId: id, timeframe } of subscriptions) {
+      const key = `${id}:${timeframe}`, previous = liveCandles.get(key), live = { ...previous, close: previous.close + .25, high: previous.high + .25, volume: previous.volume + 1 }
+      const frame = await pipeline.setLive(id, timeframe, live)
+      const expected = barsWithIndicators([...sources.get(key)!, live], frame.intervalMS).at(-1)!
+      for (const field of ['ema', 'rsi6', 'rsi12', 'rsi24', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rocChange', 'marocChange'] as const) assert.equal(frame.liveBar[field], expected[field], `${key} ${field}`)
+      assert.equal(reads.get(key), 1, 'Warm ticks must not reload an evicted full history.')
+      assert.ok(pipeline.liveStates.get(key).rows.size <= 295)
+      assert.ok(pipeline.liveStates.get(key).indicators.size <= 296)
+    }
+    assert.equal(pipeline.nextCalculation, calculations, 'Live ticks must not enqueue a full-history worker calculation.')
+
+    // Confirmation advances the recursive seed even if the full state has been
+    // evicted. The next forming candle still needs no durable read or worker.
+    const target = subscriptions[0], key = `${target.instId}:${target.timeframe}`, source = sources.get(key)!
+    const confirmed = { ...liveCandles.get(key), confirmed: true }
+    allowConfirmedSnapshot = true
+    source.push(confirmed)
+    pipeline.observe([confirmed], new Map())
+    const live = { ...confirmed, timestamp: confirmed.timestamp + step, close: confirmed.close + .5, high: confirmed.high + .5, confirmed: false }
+    const frame = await pipeline.setLive(target.instId, target.timeframe, live)
+    assert.equal(frame.liveBar.ema, barsWithIndicators([...source, live], step).at(-1)?.ema)
+    assert.equal(reads.get(key), 1)
+    assert.equal(pipeline.nextCalculation, calculations)
+
+    // A historical price correction is the deliberate cold path: rebuild once
+    // from durable canonical input, then resume constant-sized live updates.
+    const previous = source[250], corrected = { ...previous, close: previous.close + 2, high: previous.high + 2 }
+    source[250] = corrected
+    pipeline.observe([corrected], new Map([[previous.timestamp, previous]]))
+    const revisedLive = { ...live, close: live.close + .25, high: live.high + .25, volume: live.volume + 1 }
+    const correctedFrame = await pipeline.setLive(target.instId, target.timeframe, revisedLive)
+    assert.equal(correctedFrame.liveBar.ema, barsWithIndicators([...source, revisedLive], step).at(-1)?.ema)
+    assert.equal(reads.get(key), 2, 'One correction reloads only its affected full history.')
+    assert.equal(pipeline.nextCalculation, calculations + 1)
+    await pipeline.setLive(target.instId, target.timeframe, { ...revisedLive, volume: revisedLive.volume + 1 })
+    assert.equal(reads.get(key), 2)
+    assert.equal(pipeline.nextCalculation, calculations + 1)
+    pipeline.setRealtimeSubscriptions(subscriptions.slice(3))
+    assert.equal(pipeline.liveStates.size, 33, 'Removed subscriptions release their lightweight seeds immediately.')
+  } finally { await pipeline.dispose() }
+})
+
+test('concurrent first ticks share one durable seed and publish the latest candle', async () => {
+  const release = deferred(), first = Date.UTC(2024, 0, 1)
+  const source = Array.from({ length: 400 }, (_, index) => candle(first + index * hour, index))
+  let reads = 0
+  const pipeline = createPipeline({
+    async candles() { reads += 1; await release.promise; return source },
+    async candleWatermark() { return 'memory-watermark' },
+    async readChartSnapshot() { return null },
+  })
+  try {
+    const firstLive = { ...candle(first + 400 * hour, 400), confirmed: false }
+    const pending = pipeline.setLive(instId, '1H', firstLive)
+    await waitFor(() => reads === 1)
+    const latest = { ...firstLive, close: firstLive.close + 1, high: firstLive.high + 1, volume: firstLive.volume + 1 }
+    const duplicate = pipeline.setLive(instId, '1H', latest)
+    release.resolve()
+    const frames = await Promise.all([pending, duplicate])
+    assert.equal(reads, 1); assert.equal(pipeline.nextCalculation, 1)
+    for (const frame of frames) assert.equal(frame.liveBar.close, latest.close)
+  } finally { release.resolve(); await pipeline.dispose() }
+})
+
+test('bounded list projections preserve full-history expansion runs and all breakout metrics after history eviction', async () => {
+  const first = Date.UTC(2024, 0, 1), ids = Array.from({ length: 12 }, (_, index) => `LIST${index}-USDT-SWAP`)
+  const source = Array.from({ length: 1_000 }, (_, index) => {
+    const close = 100 * Math.exp(index * index / 1_000_000)
+    return { ...candle(first + index * hour, index), open: close, high: close + 1, low: close - 1, close }
+  })
+  let reads = 0
+  const pipeline = createPipeline({ async candles({ instrument }: any) { reads += 1; return source.map(row => ({ ...row, instrument })) } })
+  pipeline.setRealtimeSubscriptions(ids.map(instId => ({ instId, timeframe: '1H' })))
+  const full = barsWithIndicators(source, hour), expectedExpansion = bandwidthExpansion(full)
+  assert.ok(expectedExpansion!.hours > 295, 'The fixture must exceed the retained source tail.')
+  try {
+    for (const id of ids) {
+      const projection = await pipeline.projectListSeries(id, '1H')
+      assert.equal(projection.bars.length, 295)
+      assert.deepEqual(projection.bollExpansion, expectedExpansion)
+      const expected = summarizeMarketBars(full), actual = summarizeMarketBars(projection.bars)
+      for (const field of ['highBreakout', 'lowBreakdown', 'highBreakout96', 'lowBreakdown96']) assert.deepEqual(actual[field], expected[field])
+    }
+    const calculations = pipeline.nextCalculation
+    assert.equal(reads, 12); assert.ok(pipeline.series.size <= 8)
+    for (const id of ids) assert.deepEqual((await pipeline.projectListSeries(id, '1H')).bollExpansion, expectedExpansion)
+    assert.equal(reads, 12); assert.equal(pipeline.nextCalculation, calculations)
+    const next = { ...source.at(-1)!, timestamp: source.at(-1)!.timestamp + hour, close: 100 * Math.exp(1_000 * 1_000 / 1_000_000), instrument: ids[0] }
+    pipeline.observe([next], new Map())
+    const projection = await pipeline.projectListSeries(ids[0], '1H')
+    assert.deepEqual(projection.bollExpansion, bandwidthExpansion(barsWithIndicators([...source, next], hour)))
+    assert.equal(reads, 12); assert.equal(pipeline.nextCalculation, calculations)
+  } finally { await pipeline.dispose() }
+})
+
+for (const mutation of ['append', 'price', 'statistics']) test(`a ${mutation} mutation during a cold live seed publishes only current durable math`, async () => {
+  const first = Date.UTC(2024, 0, 1), source = Array.from({ length: 400 }, (_, index) => candle(first + index * hour, index))
+  const release = deferred(), emitted: any[] = []
+  let reached = false, reads = 0
+  const pipeline = createPipeline({
+    async candles() { reads += 1; return source },
+    async candleWatermark() { return 'memory-watermark' },
+    async readChartSnapshot() { return null },
+    async writeChartSnapshot() { throw new Error('A live seed must stay in memory.') },
+  })
+  const calculate = pipeline.calculate.bind(pipeline)
+  pipeline.calculate = async (...args: any[]) => { const result = await calculate(...args); if (!reached) { reached = true; await release.promise }; return result }
+  pipeline.subscribe((frame: any) => emitted.push(frame))
+  let live = { ...candle(first + 400 * hour, 400), confirmed: false }
+  const pending = pipeline.setLive(instId, '1H', live)
+  try {
+    await waitFor(() => reached)
+    if (mutation === 'append') {
+      const confirmed = { ...live, confirmed: true }
+      source.push(confirmed)
+      pipeline.observe([confirmed], new Map())
+      live = { ...candle(first + 401 * hour, 401), confirmed: false }
+    } else {
+      const index = mutation === 'price' ? 250 : 399, previous = source[index]
+      source[index] = mutation === 'price' ? { ...previous, close: previous.close + 2, high: previous.high + 2 } : { ...previous, oi: 123_456 }
+      pipeline.observe([source[index]], new Map([[previous.timestamp, previous]]))
+    }
+    const latest = pipeline.setLive(instId, '1H', { ...live, volume: live.volume + 1 })
+    release.resolve()
+    const frames = await Promise.all([pending, latest])
+    const expected = barsWithIndicators([...source, live], hour).at(-1)!
+    for (const frame of [...frames, ...emitted]) {
+      assert.equal(frame.endHour, source.at(-1)!.timestamp)
+      assert.equal(frame.liveBar.hour, live.timestamp)
+      assert.equal(frame.liveBar.ema, expected.ema)
+      if (mutation === 'statistics') assert.equal(frame.bars.at(-1).oi, 123_456)
+    }
+    assert.equal(reads, 1)
+    assert.equal(pipeline.nextCalculation, mutation === 'statistics' ? 1 : 2)
+  } finally { release.resolve(); await pipeline.dispose() }
 })

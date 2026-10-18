@@ -23,7 +23,11 @@ export class PreparedChartPipeline {
   /** Fully prepared durable navigation history; never queues an HTTP request. */
   localHistory(instId: string, timeframe: HistoryTimeframe, targetEnd?: number): Promise<PreparedChartResponse | null>
   projectSeries(instId: string, timeframe: HistoryTimeframe): Promise<{ end: number | null; bars: Bar[] }>
+  /** Bounded canonical tail plus the untruncated BOLL expansion run for list metrics. */
+  projectListSeries(instId: string, timeframe: HistoryTimeframe): Promise<{ end: number | null; bars: Bar[]; bollExpansion: { hours: number; complete: boolean } | null }>
   setUniverse(instIds: string[], timeframe: HistoryTimeframe, focusInstId?: string): { frames: PreparedChartResponse[] }
+  /** Pins bounded recursive seeds for the realtime working set, independently of the full-history LRU. */
+  setRealtimeSubscriptions(subscriptions: { instId: string; timeframe: HistoryTimeframe }[]): void
   subscribe(listener: (frame: PreparedChartResponse) => void): () => void
   observe(rows: CandleRecord[], previous: Map<number, CandleRecord>): void
   /** Forming candles only change in-memory projections; confirmed writes use observe. */

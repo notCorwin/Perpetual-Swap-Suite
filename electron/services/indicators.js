@@ -1,94 +1,129 @@
 import { signedRelativeChange as change } from './market-metrics.js'
+
 const finite = value => typeof value === 'number' && Number.isFinite(value) ? value : null
+const EMA_PERIOD = 200
+const EMA_MULTIPLIER = 2 / (EMA_PERIOD + 1)
+const BOLL_PERIOD = 20
+const VWAP_PERIOD = 14
+const ROC_PERIOD = 9
+const MAROC_PERIOD = 9
+const RSI_PERIODS = [6, 12, 24]
 
-export function ema(candles, period = 200) {
-  const values = new Map(), multiplier = 2 / (period + 1)
-  let value = null
-  for (let index = 0; index < candles.length; index += 1) {
-    const close = finite(candles[index].close)
-    if (close === null) continue
-    if (value === null && index >= period - 1) {
-      const seed = candles.slice(index - period + 1, index + 1).map(candle => finite(candle.close))
-      if (seed.every(item => item !== null)) value = seed.reduce((sum, item) => sum + item, 0) / period
-    } else if (value !== null) value = close * multiplier + value * (1 - multiplier)
-    if (value !== null) values.set(candles[index].timestamp, value)
+// The state contains only recursive accumulators and bounded rolling windows.
+// It is plain data so workers can return a seed without retaining source history.
+export function createIndicatorState(intervalMS = 300_000) {
+  if (!Number.isFinite(intervalMS) || intervalMS <= 0) throw new RangeError('Indicator interval must be positive.')
+  return {
+    intervalMS, lastTimestamp: null, count: 0, previousClose: null,
+    emaSeedSum: 0, ema: null, closes: [], volumes: [], rocs: [],
+    previousROC: null, previousMAROC: null,
+    rsi: RSI_PERIODS.map(period => ({ period, gains: 0, losses: 0 })),
   }
-  return values
 }
 
-export function rsi(candles, period) {
-  const values = new Map()
-  if (candles.length <= period) return values
-  let gains = 0, losses = 0
-  for (let index = 1; index <= period; index += 1) {
-    const move = candles[index].close - candles[index - 1].close
-    gains += Math.max(move, 0); losses += Math.max(-move, 0)
+const rsiValue = ({ gains, losses }) => gains === 0 && losses === 0 ? 50 : losses === 0 ? 100 : 100 - 100 / (1 + gains / losses)
+
+// Append one immutable source observation. The caller builds confirmed state
+// from durable history; corrections and prepends require rebuilding that state.
+// A missing period resets every seed/window before accepting the next candle.
+export function appendIndicatorCandle(state, candle) {
+  if (finite(candle.timestamp) === null || finite(candle.close) === null) return null
+  if (state.lastTimestamp !== null) {
+    if (candle.timestamp <= state.lastTimestamp) throw new RangeError('Indicator corrections require rebuilding the confirmed state.')
+    if (candle.timestamp - state.lastTimestamp !== state.intervalMS) Object.assign(state, createIndicatorState(state.intervalMS))
   }
-  gains /= period
-  losses /= period
-  const calculate = () => gains === 0 && losses === 0 ? 50 : losses === 0 ? 100 : 100 - 100 / (1 + gains / losses)
-  values.set(candles[period].timestamp, calculate())
-  for (let index = period + 1; index < candles.length; index += 1) {
-    const move = candles[index].close - candles[index - 1].close
-    gains = (gains * (period - 1) + Math.max(move, 0)) / period
-    losses = (losses * (period - 1) + Math.max(-move, 0)) / period
-    values.set(candles[index].timestamp, calculate())
+  const index = state.count, price = candle.close
+  const currentROC = index >= ROC_PERIOD ? change(price, state.closes.at(-ROC_PERIOD)) : null
+
+  // EMA200 starts at the arithmetic mean of the first 200 contiguous closes.
+  // Thereafter its recursive value preserves the influence of all prior closes.
+  if (state.ema === null) {
+    state.emaSeedSum += price
+    if (index === EMA_PERIOD - 1) state.ema = state.emaSeedSum / EMA_PERIOD
+  } else state.ema = price * EMA_MULTIPLIER + state.ema * (1 - EMA_MULTIPLIER)
+
+  // Wilder RSI starts with period price changes, then smooths gain/loss means.
+  // Flat = 50; only gains = 100; only losses = 0. No value precedes the seed.
+  const rsis = []
+  for (const value of state.rsi) {
+    if (state.previousClose !== null) {
+      const move = price - state.previousClose, gain = Math.max(move, 0), loss = Math.max(-move, 0)
+      if (index <= value.period) {
+        value.gains += gain
+        value.losses += loss
+        if (index === value.period) { value.gains /= value.period; value.losses /= value.period }
+      } else {
+        value.gains = (value.gains * (value.period - 1) + gain) / value.period
+        value.losses = (value.losses * (value.period - 1) + loss) / value.period
+      }
+    }
+    rsis.push(index >= value.period ? rsiValue(value) : null)
   }
-  return values
+
+  state.closes.push(price)
+  if (state.closes.length > BOLL_PERIOD) state.closes.shift()
+  let band = null
+  if (state.closes.length === BOLL_PERIOD && state.closes.every(value => value > 0)) {
+    // Population deviation, recomputed from the small window rather than a
+    // cumulative sum of squares (which loses precision for nearly flat prices).
+    const middle = state.closes.reduce((sum, value) => sum + value, 0) / BOLL_PERIOD
+    const deviation = Math.sqrt(state.closes.reduce((sum, value) => sum + (value - middle) ** 2, 0) / BOLL_PERIOD)
+    band = { upper: middle + 2 * deviation, middle, lower: middle - 2 * deviation }
+  }
+
+  state.volumes.push({ typicalPrice: (candle.high + candle.low + price) / 3, volume: finite(candle.baseVolume) })
+  if (state.volumes.length > VWAP_PERIOD) state.volumes.shift()
+  let vwap = null
+  if (state.volumes.length === VWAP_PERIOD && state.volumes.every(value => value.volume !== null && value.volume >= 0 && Number.isFinite(value.typicalPrice))) {
+    // VWAP14 uses typical price and base quantity. Missing/negative quantity,
+    // invalid typical prices and an all-zero volume window are unavailable.
+    const volume = state.volumes.reduce((sum, value) => sum + value.volume, 0)
+    if (volume > 0) vwap = state.volumes.reduce((sum, value) => sum + value.typicalPrice * value.volume, 0) / volume
+  }
+
+  state.rocs.push(currentROC)
+  if (state.rocs.length > MAROC_PERIOD) state.rocs.shift()
+  const maroc = state.rocs.length === MAROC_PERIOD && state.rocs.every(value => value !== null && Number.isFinite(value))
+    ? state.rocs.reduce((sum, value) => sum + value, 0) / MAROC_PERIOD : null
+  const bandPosition = !band ? null : price > band.upper ? 'upper' : price > band.middle ? 'middle' : price > band.lower ? 'lower' : 'below'
+  const result = {
+    hour: candle.timestamp, quoteVolume: candle.quoteVolume ?? null,
+    open: candle.open, high: candle.high, low: candle.low, close: price, confirmed: Boolean(candle.confirmed),
+    statisticsSources: candle.statisticsSources, statisticsObserved: candle.statisticsObserved,
+    vwap, ema: state.ema, bollUpper: band?.upper ?? null, bollMiddle: band?.middle ?? null, bollLower: band?.lower ?? null,
+    roc: currentROC, maroc, rsi6: rsis[0], rsi12: rsis[1], rsi24: rsis[2],
+    oi: finite(candle.oi), buy: finite(candle.buy), sell: finite(candle.sell), bandPosition,
+    rocChange: change(currentROC, state.previousROC), marocChange: change(maroc, state.previousMAROC),
+  }
+  state.count += 1
+  state.lastTimestamp = candle.timestamp
+  state.previousClose = price
+  state.previousROC = currentROC
+  state.previousMAROC = maroc
+  return result
 }
 
-export function bollinger(candles, period = 20) {
-  const values = new Map()
-  for (let index = period - 1; index < candles.length; index += 1) {
-    const window = candles.slice(index - period + 1, index + 1).map(candle => candle.close)
-    if (window.some(value => value <= 0 || !Number.isFinite(value))) continue
-    const middle = window.reduce((sum, value) => sum + value, 0) / period
-    const deviation = Math.sqrt(window.reduce((sum, value) => sum + (value - middle) ** 2, 0) / period)
-    values.set(candles[index].timestamp, { upper: middle + 2 * deviation, middle, lower: middle - 2 * deviation })
-  }
-  return values
+// A forming candle is always projected from the same confirmed seed. Copying
+// only fixed-size windows prevents ticks from cloning/recomputing history and
+// keeps successive live revisions from changing EMA/RSI's confirmed state.
+export function projectIndicatorCandle(state, candle) {
+  return appendIndicatorCandle({
+    ...state, closes: [...state.closes], volumes: [...state.volumes], rocs: [...state.rocs],
+    rsi: state.rsi.map(value => ({ ...value })),
+  }, candle)
 }
 
-export function vwap(candles, period = 14) {
-  const values = new Map()
-  for (let index = period - 1; index < candles.length; index += 1) {
-    const window = candles.slice(index - period + 1, index + 1)
-    if (window.some(candle => finite(candle.baseVolume) === null || candle.baseVolume < 0)) continue
-    const volume = window.reduce((sum, candle) => sum + candle.baseVolume, 0)
-    if (volume > 0) values.set(candles[index].timestamp, window.reduce((sum, candle) => sum + (candle.high + candle.low + candle.close) / 3 * candle.baseVolume, 0) / volume)
-  }
-  return values
+export function buildIndicatorSeries(candles, intervalMS = 300_000) {
+  const state = createIndicatorState(intervalMS), bars = []
+  const unique = new Map()
+  for (const candle of candles) if (finite(candle.timestamp) !== null && finite(candle.close) !== null) unique.set(candle.timestamp, candle)
+  const ordered = [...unique.values()].sort((left, right) => left.timestamp - right.timestamp)
+  for (const candle of ordered) bars.push(appendIndicatorCandle(state, candle))
+  return { bars, state }
 }
 
-export function roc(candles, period = 9) {
-  const values = new Map()
-  for (let index = period; index < candles.length; index += 1) values.set(candles[index].timestamp, change(candles[index].close, candles[index - period].close))
-  return values
-}
-
-function indicatorBars(ordered) {
-  const ema200 = ema(ordered), rsi6 = rsi(ordered, 6), rsi12 = rsi(ordered, 12), rsi24 = rsi(ordered, 24), bands = bollinger(ordered), vwaps = vwap(ordered), rocs = roc(ordered), marocValues = new Map()
-  for (let index = 8; index < ordered.length; index += 1) {
-    const window = ordered.slice(index - 8, index + 1).map(candle => rocs.get(candle.timestamp)).filter(value => value !== undefined)
-    if (window.length === 9 && window.every(Number.isFinite)) marocValues.set(ordered[index].timestamp, window.reduce((sum, value) => sum + value, 0) / 9)
-  }
-  return ordered.map((candle, index) => {
-    const band = bands.get(candle.timestamp), price = candle.close, prior = ordered[index - 1], previousROC = prior ? rocs.get(prior.timestamp) : null, previousMAROC = prior ? marocValues.get(prior.timestamp) : null
-    const bandPosition = !band ? null : price > band.upper ? 'upper' : price > band.middle ? 'middle' : price > band.lower ? 'lower' : 'below'
-    return { hour: candle.timestamp, quoteVolume: candle.quoteVolume ?? null, open: candle.open, high: candle.high, low: candle.low, close: price, confirmed: Boolean(candle.confirmed), statisticsSources: candle.statisticsSources, statisticsObserved: candle.statisticsObserved, vwap: vwaps.get(candle.timestamp) ?? null, ema: ema200.get(candle.timestamp) ?? null, bollUpper: band?.upper ?? null, bollMiddle: band?.middle ?? null, bollLower: band?.lower ?? null, roc: rocs.get(candle.timestamp) ?? null, maroc: marocValues.get(candle.timestamp) ?? null, rsi6: rsi6.get(candle.timestamp) ?? null, rsi12: rsi12.get(candle.timestamp) ?? null, rsi24: rsi24.get(candle.timestamp) ?? null, oi: finite(candle.oi), buy: finite(candle.buy), sell: finite(candle.sell), bandPosition, rocChange: change(rocs.get(candle.timestamp) ?? null, previousROC ?? null), marocChange: change(marocValues.get(candle.timestamp) ?? null, previousMAROC ?? null) }
-  })
-}
-
-// Indicators may never span missing periods. Split the input into contiguous
-// runs so each calculation restarts after a gap instead of silently using an
-// old close as the seed for a newer time range.
+// Batch and incremental calculations share every formula and initialization
+// rule. Windows never choose a new recursive seed inside a contiguous run.
 export function barsWithIndicators(candles, intervalMS = 300_000) {
-  const ordered = [...candles].filter(candle => finite(candle.timestamp) !== null && finite(candle.close) !== null).sort((left, right) => left.timestamp - right.timestamp)
-  const runs = []
-  for (const candle of ordered) {
-    const current = runs.at(-1)
-    if (!current || candle.timestamp - current.at(-1).timestamp !== intervalMS) runs.push([candle])
-    else current.push(candle)
-  }
-  return runs.flatMap(indicatorBars)
+  return buildIndicatorSeries(candles, intervalMS).bars
 }

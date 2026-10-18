@@ -1,5 +1,7 @@
 import { Worker } from 'node:worker_threads'
 import { statisticsMask } from './statistics-state.js'
+import { appendIndicatorCandle, projectIndicatorCandle } from './indicators.js'
+import { bandwidthExpansion } from './market-metrics.js'
 
 const VISIBLE = 96
 const WARMUP = 199
@@ -24,6 +26,8 @@ const sourceFresh = (row, source, now = Date.now()) => sourcePresent(row, source
 const seriesKey = (instId, timeframe) => `${instId}:${timeframe}`
 const sourcePriority = value => value === 'background' || value === 'chartWarm' ? 'background' : 'foreground'
 const sameRow = (left, right) => left && right && Object.keys(left).length === Object.keys(right).length && Object.keys(left).every(field => Object.hasOwn(right, field) && Object.is(left[field], right[field]))
+const bandwidth = bar => !bar || ![bar.bollUpper, bar.bollMiddle, bar.bollLower].every(Number.isFinite) || bar.bollMiddle <= 0
+  ? null : (bar.bollUpper - bar.bollLower) / bar.bollMiddle * 100
 
 /** Durable source pages and canonical calculations are independent of UI focus. */
 export class PreparedChartPipeline {
@@ -54,6 +58,11 @@ export class PreparedChartPipeline {
     this.calculationQueue = []
     this.activeCalculation = null
     this.frameVersions = new WeakMap()
+    // Full navigation histories remain an LRU. A subscribed series retains only
+    // its recursive indicator seed and a bounded source tail between ticks.
+    this.liveStates = new Map()
+    this.liveSeeds = new Map()
+    this.realtimeKeys = new Set()
   }
 
   state(instId, timeframe) {
@@ -62,7 +71,7 @@ export class PreparedChartPipeline {
     if (!state) {
       state = { key, instId, timeframe, intervalMS: intervalFor(timeframe), rows: new Map(), loaded: false, loading: null,
         priceVersion: 0, sourceVersion: 0, calculatedVersion: -1, calculation: null, indicators: new Map(), generation: this.snapshots.get(key)?.valid ? this.snapshots.get(key).frame.generation : ++this.nextGeneration, active: 0,
-        floor: null, latestTask: null, latestAt: 0, live: null, liveVersion: 0, calculatedLiveVersion: -1 }
+        floor: null, latestTask: null, latestAt: 0, live: null, liveVersion: 0, calculatedLiveVersion: -1, indicatorState: null }
     }
     this.series.delete(key)
     this.series.set(key, state)
@@ -78,6 +87,58 @@ export class PreparedChartPipeline {
       rows -= state.rows.size
       this.series.delete(key)
     }
+    this.trimLiveStates()
+  }
+
+  setRealtimeSubscriptions(subscriptions) {
+    this.realtimeKeys = new Set(subscriptions.map(({ instId, timeframe }) => seriesKey(instId, timeframe)))
+    this.trimLiveStates(true)
+  }
+
+  trimLiveStates(removeUnsubscribed = false) {
+    let extra = [...this.liveStates.keys()].filter(key => !this.realtimeKeys.has(key) && !this.universe.has(key)).length
+    for (const [key] of this.liveStates) {
+      if (this.realtimeKeys.has(key) || this.universe.has(key) || this.liveSeeds.has(key)) continue
+      if (!removeUnsubscribed && extra <= 16) break
+      this.liveStates.delete(key)
+      extra -= 1
+    }
+  }
+
+  liveState(instId, timeframe) {
+    const key = seriesKey(instId, timeframe)
+    let state = this.liveStates.get(key)
+    if (!state) {
+      state = { key, instId, timeframe, intervalMS: intervalFor(timeframe), rows: new Map(), indicators: new Map(),
+        indicatorState: null, sourceVersion: 0, generation: 0, floor: null, live: null, liveVersion: 0 }
+      this.liveStates.set(key, state)
+    }
+    return state
+  }
+
+  retainLiveState(state) {
+    if (!state.indicatorState) return
+    const live = this.liveState(state.instId, state.timeframe)
+    const hours = [...state.rows.keys()].sort((left, right) => left - right).slice(-(VISIBLE + WARMUP))
+    live.rows = new Map(hours.map(hour => [hour, state.rows.get(hour)]))
+    live.indicators = new Map(hours.map(hour => [hour, state.indicators.get(hour)]).filter(([, bar]) => bar))
+    live.indicatorState = structuredClone(state.indicatorState)
+    live.sourceVersion = state.sourceVersion
+    live.generation = state.generation
+    live.floor = state.floor
+    live.bollExpansion = bandwidthExpansion(this.projectRows(state).bars)
+    if (state.live) this.updateLive(live, state.live)
+    this.projectLive(live)
+    this.trimLiveStates()
+  }
+
+  projectLive(state) {
+    const previous = state.projectedLiveHour
+    if (previous !== undefined && !state.rows.has(previous)) state.indicators.delete(previous)
+    state.projectedLiveHour = undefined
+    if (!state.indicatorState || !state.live || state.live.timestamp <= (state.indicatorState.lastTimestamp ?? -Infinity)) return
+    const bar = projectIndicatorCandle(state.indicatorState, state.live)
+    if (bar) { state.indicators.set(bar.hour, { ...bar, indicatorsObserved: true }); state.projectedLiveHour = bar.hour }
   }
 
   subscribe(listener) {
@@ -300,6 +361,15 @@ export class PreparedChartPipeline {
     if (cached && !force) return Promise.resolve(cached)
     if (this.localTasks.has(key)) return this.localTasks.get(key)
     const task = (async () => {
+      const live = this.liveStates.get(key)
+      if (live?.indicatorState) {
+        const frame = this.compactFrame(live)
+        if (frame) {
+          const saved = await this.saveCompact(live, this.produced(live, frame), undefined, { persist })
+          if (saved) return saved
+        }
+        if (cached) return cached
+      }
       if (!this.snapshots.has(key)) {
         const saved = await this.restoreSnapshot(instId, timeframe, priority)
         if (saved && !force) return saved
@@ -314,28 +384,10 @@ export class PreparedChartPipeline {
           const version = state.sourceVersion
           let frame = this.insufficientHistory(state)
           if (!frame) {
-            const hours = [...state.rows.keys()].sort((left, right) => right - left)
-            if (hours.length < VISIBLE) return null
-            // Source absence remains an explicit observation while its lease
-            // is revalidated independently. Unknown source holes never qualify.
-            let count = 0, prior = null, end = null
-            for (const hour of hours) {
-              const row = state.rows.get(hour)
-              count = prior === null || prior - hour === state.intervalMS ? count : 0
-              count = sourceFresh(row, 1) && sourceFresh(row, 2) ? count + 1 : 0
-              prior = hour
-              if (count === VISIBLE) { end = hour + 95 * state.intervalMS; break }
-            }
-            if (end === null) return this.cached(key)
             await this.indicators(state, priority)
-            const bars = Array.from({ length: VISIBLE }, (_, index) => this.bar(state, end - (95 - index) * state.intervalMS))
             if (version !== state.sourceVersion) continue
-            if (bars.some(bar => !bar)) return this.cached(key)
-            frame = { instId, timeframe, intervalMS: state.intervalMS, endHour: end, latestEnd: end, oldestHour: state.floor,
-              historyExhausted: state.floor !== null && bars[0].hour <= state.floor, generation: state.generation, revision: this.revision(instId), bars,
-              oiState: bars.every(bar => bar.oi !== null) ? 'ready' : 'unavailable', takerState: bars.every(bar => bar.buy !== null && bar.sell !== null) ? 'ready' : 'unavailable',
-              indicatorState: bars.every(bar => indicatorFields.every(field => Number.isFinite(bar[field]))) ? 'ready' : 'unavailable',
-              liveBar: state.live && state.live.timestamp === end + state.intervalMS ? state.indicators.get(state.live.timestamp) : undefined, error: '' }
+            frame = this.compactFrame(state)
+            if (!frame) return this.cached(key)
           }
           const saved = await this.saveCompact(state, this.produced(state, frame, version), undefined, { persist })
           if (saved) return saved
@@ -345,6 +397,28 @@ export class PreparedChartPipeline {
     })().finally(() => { if (this.localTasks.get(key) === task) this.localTasks.delete(key) })
     this.localTasks.set(key, task)
     return task
+  }
+
+  compactFrame(state) {
+    const frame = this.insufficientHistory(state)
+    if (frame) return frame
+    const hours = [...state.rows.keys()].sort((left, right) => right - left)
+    let count = 0, prior = null, end = null
+    for (const hour of hours) {
+      const row = state.rows.get(hour)
+      count = prior === null || prior - hour === state.intervalMS ? count : 0
+      count = sourceFresh(row, 1) && sourceFresh(row, 2) ? count + 1 : 0
+      prior = hour
+      if (count === VISIBLE) { end = hour + 95 * state.intervalMS; break }
+    }
+    if (end === null) return null
+    const bars = Array.from({ length: VISIBLE }, (_, index) => this.bar(state, end - (95 - index) * state.intervalMS))
+    if (bars.some(bar => !bar)) return null
+    return { instId: state.instId, timeframe: state.timeframe, intervalMS: state.intervalMS, endHour: end, latestEnd: end, oldestHour: state.floor,
+      historyExhausted: state.floor !== null && bars[0].hour <= state.floor, generation: state.generation, revision: this.revision(state.instId), bars,
+      oiState: bars.every(bar => bar.oi !== null) ? 'ready' : 'unavailable', takerState: bars.every(bar => bar.buy !== null && bar.sell !== null) ? 'ready' : 'unavailable',
+      indicatorState: bars.every(bar => indicatorFields.every(field => Number.isFinite(bar[field]))) ? 'ready' : 'unavailable',
+      liveBar: state.live?.timestamp === end + state.intervalMS ? state.indicators.get(state.live.timestamp) : undefined, error: '' }
   }
 
   /** Hydrate focused navigation from durable observations without admitting source work. */
@@ -405,11 +479,11 @@ export class PreparedChartPipeline {
 
   observe(rows, previous) {
     for (const [key, batch] of Map.groupBy(rows, row => `${row.instrument}:${row.timeframe}`)) {
-      const state = this.series.get(key)
+      const state = this.series.get(key), live = this.liveStates.get(key)
       this.sourceVersions.set(key, (this.sourceVersions.get(key) ?? 0) + 1)
       const snapshot = this.snapshots.get(key)
       let changed = false, reseed = false
-      const oldLatest = Math.max(state ? extremeHour(state.rows) ?? -Infinity : -Infinity, snapshot?.frame?.endHour ?? -Infinity)
+      const oldLatest = Math.max(state ? extremeHour(state.rows) ?? -Infinity : -Infinity, live?.indicatorState?.lastTimestamp ?? -Infinity, snapshot?.frame?.endHour ?? -Infinity)
       for (const row of batch) {
         const old = previous.get(row.timestamp)
         if (priceChanged(old, row)) {
@@ -425,6 +499,32 @@ export class PreparedChartPipeline {
         if (reseed) state.generation = ++this.nextGeneration
       }
       if (snapshot && reseed) snapshot.valid = false
+      if (live) {
+        live.sourceVersion += 1
+        if (reseed) {
+          live.indicatorState = null
+        } else if (live.indicatorState) {
+          for (const row of [...batch].sort((left, right) => left.timestamp - right.timestamp)) {
+            if (row.timestamp > live.indicatorState.lastTimestamp) {
+              const previousHour = live.indicatorState.lastTimestamp, previous = live.indicators.get(previousHour)
+              const indicator = appendIndicatorCandle(live.indicatorState, row)
+              if (indicator) {
+                const currentWidth = bandwidth(indicator), previousWidth = bandwidth(previous)
+                live.bollExpansion = currentWidth === null ? null
+                  : previousWidth === null || previousHour + live.intervalMS !== row.timestamp ? { hours: 0, complete: false }
+                    : currentWidth <= previousWidth ? { hours: 0, complete: true }
+                      : { hours: (live.bollExpansion?.hours ?? 0) + 1, complete: live.bollExpansion?.complete ?? false }
+                live.indicators.set(indicator.hour, { ...indicator, indicatorsObserved: true })
+              }
+            }
+            if (row.timestamp >= (extremeHour(live.rows, true) ?? -Infinity)) live.rows.set(row.timestamp, this.normalize(row))
+          }
+          const hours = [...live.rows.keys()].sort((left, right) => left - right)
+          for (const hour of hours.slice(0, Math.max(0, hours.length - VISIBLE - WARMUP))) { live.rows.delete(hour); live.indicators.delete(hour) }
+          if (live.live && live.live.timestamp <= live.indicatorState.lastTimestamp) this.updateLive(live, null)
+          this.projectLive(live)
+        }
+      }
       if (this.universe.has(key) || snapshot) this.queueLocal(batch[0].instrument, batch[0].timeframe, true)
     }
     this.trim()
@@ -432,6 +532,7 @@ export class PreparedChartPipeline {
 
   async load(state, priority = 'foreground') {
     if (state.loaded) return
+    if (state.loading) return state.loading
     return this.reload(state, priority)
   }
 
@@ -481,6 +582,8 @@ export class PreparedChartPipeline {
     const key = seriesKey(instId, timeframe), state = this.series.get(key)
     this.sourceVersions.set(key, (this.sourceVersions.get(key) ?? 0) + 1)
     const snapshot = this.snapshots.get(key)
+    const live = this.liveStates.get(key)
+    if (live) live.indicatorState = null
     if (snapshot) snapshot.valid = false
     else this.snapshots.set(key, { valid: false })
     if (state) {
@@ -492,6 +595,7 @@ export class PreparedChartPipeline {
       state.floor = null
       state.indicators.clear()
       state.latestAt = 0
+      state.indicatorState = null
     }
     if (this.universe.has(key) || snapshot) this.queueLocal(instId, timeframe, true)
   }
@@ -510,27 +614,31 @@ export class PreparedChartPipeline {
     if (this.closed) return null
     if (!['5m', '15m', '1H'].includes(timeframe)) throw new Error('Unsupported chart timeframe.')
     if (candle && (candle.confirmed || candle.instrument !== instId || candle.timeframe !== timeframe || !Number.isSafeInteger(candle.timestamp) || candle.timestamp % intervalFor(timeframe))) throw new Error('Invalid forming candle.')
-    const state = this.state(instId, timeframe)
-    if (!this.updateLive(state, candle)) return this.cached(state.key)
-    state.active += 1
-    try {
-      await this.load(state, 'background')
-      while (!this.closed) {
-        const version = state.sourceVersion, liveVersion = state.liveVersion
-        await this.indicators(state, 'foreground')
-        if (version !== state.sourceVersion || liveVersion !== state.liveVersion) continue
-        const snapshot = this.snapshots.get(state.key)
-        if (!snapshot?.valid) return this.local(instId, timeframe, { force: true, persist: false })
-        const liveBar = state.live?.timestamp === snapshot.frame.endHour + state.intervalMS ? state.indicators.get(state.live.timestamp) : undefined
-        const frame = { ...snapshot.frame, liveBar, revision: this.revision(instId) }
-        // The confirmed snapshot and watermark stay unchanged. A forming tick
-        // publishes an in-memory projection without a Parquet/snapshot write.
-        this.snapshots.set(state.key, { ...snapshot, frame })
-        this.emit(frame)
-        return frame
+    const live = this.liveState(instId, timeframe), state = this.series.get(live.key)
+    if (!this.updateLive(live, candle)) return this.cached(live.key)
+    if (state) this.updateLive(state, candle)
+    if (!live.indicatorState) {
+      let seed = this.liveSeeds.get(live.key)
+      if (!seed) {
+        const canonical = this.state(instId, timeframe)
+        this.updateLive(canonical, live.live)
+        canonical.active += 1
+        seed = (async () => { await this.load(canonical, 'background'); this.listingFloor(canonical); await this.indicators(canonical, 'foreground') })()
+          .finally(() => { canonical.active -= 1; this.liveSeeds.delete(live.key); this.trim() })
+        this.liveSeeds.set(live.key, seed)
       }
-      return null
-    } finally { state.active -= 1; this.trim() }
+      await seed
+    }
+    if (this.closed) return null
+    this.projectLive(live)
+    const snapshot = this.snapshots.get(live.key)
+    if (!snapshot?.valid) return this.local(instId, timeframe, { force: true, persist: false })
+    const completed = this.latest(live) > snapshot.frame.endHour ? this.compactFrame(live) ?? snapshot.frame : snapshot.frame
+    const liveBar = live.live?.timestamp === completed.endHour + live.intervalMS ? live.indicators.get(live.live.timestamp) : undefined
+    const frame = { ...completed, liveBar, revision: this.revision(instId) }
+    this.snapshots.set(live.key, { ...snapshot, frame })
+    this.emit(frame)
+    return frame
   }
 
   job(key, operation) {
@@ -603,13 +711,13 @@ export class PreparedChartPipeline {
     if (!this.worker) {
       this.worker = new Worker(new URL('./prepared-chart-worker.js', import.meta.url))
       this.worker.unref()
-      this.worker.on('message', ({ id, bars, error }) => {
+      this.worker.on('message', ({ id, bars, state, error }) => {
         const pending = this.calculations.get(id)
         if (!pending) return
         this.calculations.delete(id)
         this.activeCalculation = null
         if (error) pending.reject(new Error(error))
-        else pending.resolve(bars)
+        else pending.resolve({ bars, state })
         this.drainCalculations()
         if (!this.calculations.size) this.worker?.unref()
       })
@@ -642,16 +750,18 @@ export class PreparedChartPipeline {
   async indicators(state, priority = 'foreground') {
     if (state.calculation) return state.calculation
     const task = (async () => {
-      while (state.calculatedVersion !== state.priceVersion || state.calculatedLiveVersion !== state.liveVersion) {
-        const version = state.priceVersion, liveVersion = state.liveVersion
+      while (state.calculatedVersion !== state.priceVersion) {
+        const version = state.priceVersion
         const candles = [...state.rows.values()].map(row => Object.fromEntries(priceFields.map(field => [field, row[field]])))
-        if (state.live && !state.rows.has(state.live.timestamp)) candles.push(state.live)
-        const bars = await this.calculate(candles, state.intervalMS, priority)
-        if (version !== state.priceVersion || liveVersion !== state.liveVersion) continue
+        const { bars, state: indicatorState } = await this.calculate(candles, state.intervalMS, priority)
+        if (version !== state.priceVersion) continue
         state.indicators = new Map(bars.map(bar => [bar.hour, bar]))
+        state.indicatorState = indicatorState
         state.calculatedVersion = version
-        state.calculatedLiveVersion = liveVersion
       }
+      this.projectLive(state)
+      state.calculatedLiveVersion = state.liveVersion
+      this.retainLiveState(state)
     })().finally(() => { if (state.calculation === task) state.calculation = null })
     state.calculation = task
     return task
@@ -668,16 +778,31 @@ export class PreparedChartPipeline {
         const version = state.sourceVersion
         await this.indicators(state, 'background')
         if (version !== state.sourceVersion) continue
-        const end = this.latest(state), bars = []
-        for (let hour = end; hour !== null && state.rows.has(hour); hour -= state.intervalMS) {
-          const row = state.rows.get(hour), indicator = state.indicators.get(hour)
-          if (!indicator) break
-          bars.push({ ...indicator, oi: row.oi, buy: row.buy, sell: row.sell })
-        }
-        return { end, bars: bars.reverse() }
+        return this.projectRows(state)
       }
       throw new Error('Prepared chart data service is closed.')
     } finally { state.active -= 1; this.trim() }
+  }
+
+  projectRows(state) {
+    const end = this.latest(state), bars = []
+    for (let hour = end; hour !== null && state.rows.has(hour); hour -= state.intervalMS) {
+      const row = state.rows.get(hour), indicator = state.indicators.get(hour)
+      if (!indicator) break
+      bars.push({ ...indicator, oi: row.oi, buy: row.buy, sell: row.sell })
+    }
+    return { end, bars: bars.reverse() }
+  }
+
+  /** List metrics need a fixed tail; expansion carries its full-history run. */
+  async projectListSeries(instId, timeframe) {
+    let live = this.liveStates.get(seriesKey(instId, timeframe))
+    if (!live?.indicatorState) {
+      const projected = await this.projectSeries(instId, timeframe)
+      live = this.liveStates.get(seriesKey(instId, timeframe))
+      if (!live?.indicatorState) return { ...projected, bars: projected.bars.slice(-(VISIBLE + WARMUP)), bollExpansion: bandwidthExpansion(projected.bars) }
+    }
+    return { ...this.projectRows(live), bollExpansion: live.bollExpansion }
   }
 
   bar(state, hour) {
@@ -794,6 +919,7 @@ export class PreparedChartPipeline {
     const worker = this.worker
     this.worker = null
     if (worker) await worker.terminate()
-    await Promise.allSettled([this.localRunning, this.remoteRunning, ...this.localTasks.values(), ...this.tasks.values()].filter(Boolean))
+    await Promise.allSettled([this.localRunning, this.remoteRunning, ...this.localTasks.values(), ...this.tasks.values(), ...this.liveSeeds.values()].filter(Boolean))
+    this.liveStates.clear()
   }
 }

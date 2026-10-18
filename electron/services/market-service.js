@@ -156,7 +156,7 @@ function sameCandle(left, right) {
   })
 }
 
-function marketRow(instrument, ticker, result, bars = []) {
+function marketRow(instrument, ticker, result, bars = [], bollExpansion) {
   const last = number(ticker.last), metrics = summarizeMarketBars(bars), { latest } = metrics
   const row = {
     instId: instrument.instId,
@@ -185,7 +185,7 @@ function marketRow(instrument, ticker, result, bars = []) {
     rsi12: latest?.rsi12 ?? null,
     rsi24: latest?.rsi24 ?? null,
     bollAboveBand: latest?.bandPosition ?? null,
-    bollExpansion: metrics.bollExpansion,
+    bollExpansion: bollExpansion === undefined ? metrics.bollExpansion : bollExpansion,
   }
   return {
     ...row,
@@ -387,9 +387,9 @@ export class MarketService {
     if (valid.length !== this.catalog.size) this.replaceCatalog(valid)
   }
 
-  listRowFor(entry, bars = []) {
+  listRowFor(entry, bars = [], bollExpansion) {
     const { rankingChange, rankingAsOf } = this.cachedRanking(entry.instrument.instId)
-    return { ...marketRow(entry.instrument, entry.ticker, entry.result, bars), rankingChange, rankingAsOf }
+    return { ...marketRow(entry.instrument, entry.ticker, entry.result, bars, bollExpansion), rankingChange, rankingAsOf }
   }
 
   ensureListRows(timeframe) {
@@ -414,7 +414,7 @@ export class MarketService {
     return true
   }
 
-  async readListBars(entry, timeframe) { return this.preparedCharts.projectSeries(entry.instrument.instId, this.listTimeframe(timeframe)) }
+  async readListBars(entry, timeframe) { return this.preparedCharts.projectListSeries(entry.instrument.instId, this.listTimeframe(timeframe)) }
 
   invalidateListProjection(instId) {
     this.listProjectionDataVersions.set(instId, (this.listProjectionDataVersions.get(instId) ?? 0) + 1)
@@ -437,7 +437,7 @@ export class MarketService {
       this.listProjectionResults.set(key, { ...projection, version })
       const current = this.catalog.get(instId)
       if (!current) return null
-      const row = this.listRowFor(current, projection.bars)
+      const row = this.listRowFor(current, projection.bars, projection.bollExpansion)
       this.publishListRow(frame, row)
       return { ...projection, row }
     })().finally(() => { if (this.listProjectionTasks.get(key)?.task === task) this.listProjectionTasks.delete(key) })
@@ -896,7 +896,9 @@ export class MarketService {
     if (!this.realtime) return
     const subscriptions = new Map(this.chartSubscriptions.map(value => [`${value.instId}:${value.timeframe}`, value]))
     for (const instId of this.catalog.keys()) for (const timeframe of LIST_TIMEFRAMES) subscriptions.set(`${instId}:${timeframe}`, { instId, timeframe })
-    this.realtime.setSubscriptions([...subscriptions.values()])
+    const values = [...subscriptions.values()]
+    this.preparedCharts.setRealtimeSubscriptions(values)
+    this.realtime.setSubscriptions(values)
   }
 
   async reconcileRealtime(subscriptions, { signal } = {}) {
