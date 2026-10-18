@@ -417,11 +417,22 @@ for (const mode of ['gap', 'prepend']) test(`first historical acquisition keeps 
     // latest quote tail, then observe every later page after curves first appear.
     await probe({ action: 'acquisitionStep', source: 'prefix' })
     await waitForRendered(page, fixture, fixture.timeframe, fixture.targetEnd)
-    await page.waitForFunction(({ targetEnd, fields }) => {
-      const snapshot = document.querySelector('[data-chart-inst]')?.__chartSnapshot
-      return snapshot?.endHour === targetEnd && snapshot.bars.length === 96
-        && snapshot.bars.every(bar => fields.every(field => Number.isFinite(bar[field])))
-    }, { targetEnd: fixture.targetEnd, fields }, { timeout: 20_000 })
+    try {
+      await page.waitForFunction(({ targetEnd, fields }) => {
+        const snapshot = document.querySelector('[data-chart-inst]')?.__chartSnapshot
+        return snapshot?.endHour === targetEnd && snapshot.bars.length === 96
+          && snapshot.bars.every(bar => fields.every(field => Number.isFinite(bar[field])))
+      }, { targetEnd: fixture.targetEnd, fields }, { timeout: 20_000 })
+    } catch (error) {
+      context.diagnostic(`Historical acquisition stalled: ${JSON.stringify(await page.evaluate(fields => {
+        const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
+        return { loading: chart?.getAttribute('data-chart-loading'), instId: snapshot?.instId,
+          endHour: snapshot?.endHour, generation: snapshot?.generation, bars: snapshot?.bars.length,
+          sourceVersions: snapshot?.sourceVersions,
+          finiteValues: Object.fromEntries(fields.map(field => [field, snapshot?.bars.filter(bar => Number.isFinite(bar[field])).length ?? 0])) }
+      }, fields))}`)
+      throw error
+    }
     const firstEMA = await page.evaluate(() => document.querySelector('[data-chart-inst]').__chartSnapshot.bars.at(-1).ema)
     if (mode === 'prepend') assert.ok(Math.abs(firstEMA - desired.at(-1).ema) > 1e-6,
       'The absent earlier prefix must actually change the recursive result, so retaining a stale curve cannot pass this test.')

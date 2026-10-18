@@ -626,6 +626,41 @@ test('latest mode follows pushed frames atomically and never polls a successfull
   } finally { close() }
 })
 
+test('unchanged universe snapshots and background history pressure cannot strand the selected historical cursor', async () => {
+  const otherIds = [eth, 'SOL-USDT-SWAP']
+  const universe = [eth, btc, 'SOL-USDT-SWAP']
+  for (const maxSeries of [1, 2]) {
+    const queue = transportQueue(), store = new PreparedChartStore({ maxSeries })
+    store.ingest(prepared(btc, 1_199, { bars: bars(1_000, 200), oldestHour: 1_000 * hour, historyExhausted: true }))
+    let historyReads = 0
+    const controller = new ChartController({ ...queue.transport, history: async () => { historyReads += 1; return null } }, store)
+    await controller.setUniverse(universe, '1H', eth)
+    const close = controller.open(btc, '1H')
+    try {
+      controller.scroll(-1)
+      await settled()
+      const historical = controller.getSnapshot().presented!
+      assert.equal(historical.endHour, 1_198 * hour)
+      assert.equal(controller.getSnapshot().pending, false)
+      const reads = historyReads
+      // Full market snapshots supply the first ranked row as a startup hint.
+      // Unchanged membership must not move focus away from the selected row,
+      // and no incidental metadata/render read is needed to keep it resident.
+      await controller.setUniverse([...universe], '1H', eth)
+      for (const instId of otherIds) store.ingest(prepared(instId, 1_199, { bars: bars(1_000, 200) }))
+      controller.ingestPrepared({ type: 'live', instId: btc, timeframe: '1H', generation: 1, revision: 2,
+        endHour: 1_199 * hour, liveBar: { ...bars(1_200, 1)[0], confirmed: false, close: 101.5 } })
+      await settled()
+      assert.equal(controller.getSnapshot().pending, false,
+        'An ordinary live tick must not turn a complete historical view into an unresolved loading state.')
+      assert.equal(controller.getSnapshot().presented, historical)
+      assert.equal(historyReads, reads, 'The selected resident history must not need another durable read.')
+      assert.equal(queue.calls.length, 0, 'Unrelated cache pressure must not cause provider preparation.')
+      assert.equal(store.window(btc, '1H')?.liveBar?.close, 101.5)
+    } finally { close() }
+  }
+})
+
 test('forming-only subscription deltas update the visible overlay without history reads or preparation', async context => {
   context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
   const queue = transportQueue()

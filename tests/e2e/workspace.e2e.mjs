@@ -299,6 +299,44 @@ test('price-only list updates retain geometry observers and changed ranking stil
   }
 })
 
+test('unrelated historical updates cannot evict the selected historical viewport when its next live price arrives', async () => {
+  await page.locator('[aria-label="View BETA-USDT-SWAP chart"]').click()
+  const end = await page.evaluate(() => {
+    const snapshot = document.querySelector('[data-chart-inst]')?.__chartSnapshot
+    const historical = { ...snapshot, latestEnd: snapshot.endHour, endHour: snapshot.endHour - 64 * snapshot.intervalMS,
+      revision: 100, oldestHour: snapshot.bars[0].hour - 64 * snapshot.intervalMS, historyExhausted: true, error: '',
+      bars: snapshot.bars.map(bar => ({ ...bar, hour: bar.hour - 64 * snapshot.intervalMS })) }
+    window.__historicalPressureFrame = historical
+    window.dispatchEvent(new CustomEvent('radar-chart-prepared', { detail: historical }))
+    document.querySelector('[data-chart-plot]').dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: 64 * 12 }))
+    return historical.endHour
+  })
+  const chart = page.locator('[data-chart-inst="BETA-USDT-SWAP"]')
+  await page.waitForFunction(end => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.endHour === end, end)
+  try {
+    await page.evaluate(() => {
+      const historical = window.__historicalPressureFrame
+      // These are late ordinary history publications from previously visited
+      // contracts. They must not replace the viewport the user is reading.
+      for (let index = 0; index < 16; index++) window.dispatchEvent(new CustomEvent('radar-chart-prepared', {
+        detail: { ...historical, instId: `OTHER${index}-USDT-SWAP` },
+      }))
+      window.dispatchEvent(new CustomEvent('radar-chart-prepared', { detail: {
+        type: 'live', instId: historical.instId, timeframe: historical.timeframe, generation: historical.generation,
+        revision: 200, endHour: historical.latestEnd, liveBar: null, priceObservedAt: Date.now(),
+      } }))
+    })
+    await page.waitForTimeout(100)
+    assert.equal(await chart.getAttribute('data-chart-loading'), 'false', 'A live price must not leave the selected historical chart stuck loading after unrelated cache pressure.')
+    assert.equal(Number(await chart.getAttribute('data-chart-completed-end')), end)
+    assert.equal(await chart.getAttribute('data-chart-rendered-bars'), '96')
+  } finally {
+    await page.evaluate(() => { delete window.__historicalPressureFrame })
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]').waitFor()
+  }
+})
+
 test('snapshot failures retry with bounded backoff and stop scheduling after recovery', async () => {
   try {
     await page.evaluate(() => {

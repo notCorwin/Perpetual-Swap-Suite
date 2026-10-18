@@ -261,10 +261,6 @@ export class PreparedChartStore {
         liveBar: latest?.meta.generation === generation ? latest.window.liveBar : undefined, liveRevision: latest?.meta.generation === generation ? latest.meta.revision : -1,
       }
       this.setSeriesEntry(key, entry)
-      while (this.series.size > this.maxSeries) {
-        const evicted = this.series.keys().next().value!
-        this.setSeriesEntry(evicted, null)
-      }
     }
     const current = entry!
     let changed = newGeneration
@@ -338,6 +334,13 @@ export class PreparedChartStore {
         this.setLatestFrame(key, { meta: Object.freeze({ ...current.meta, latestEnd: window.endHour }), window })
         if (window !== previous?.window) changed = true
       }
+    }
+    // The selected history is a working set, not an expendable LRU candidate.
+    // Trim after ingestion so even a newly admitted background series can be
+    // evicted with its complete payload charge when only the focus fits.
+    for (const key of this.series.keys()) {
+      if (this.series.size <= this.maxSeries) break
+      if (key !== this.focusKey) this.setSeriesEntry(key, null)
     }
     this.trimBytes()
     if (changed) for (const listener of this.listeners) listener()
