@@ -22,13 +22,21 @@ try {
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData } })
   page = await electron.firstWindow()
   await page.waitForLoadState('domcontentloaded')
+  report.windowBeforeBenchmark = await electron.evaluate(({ BrowserWindow }) => { const window = BrowserWindow.getAllWindows()[0]; return { visible: window.isVisible(), focused: window.isFocused() } })
+  // Test-mode windows start hidden. A visible-paint budget requires an actual
+  // foreground window rather than the OS cadence of an occluded renderer.
+  await electron.evaluate(({ BrowserWindow, app }) => { const window = BrowserWindow.getAllWindows()[0]; window.show(); app.focus({ steal: true }); window.focus() })
+  await page.waitForFunction(() => document.visibilityState === 'visible' && document.hasFocus(), null, { timeout: 5_000 })
+  report.documentVisibility = await page.evaluate(() => ({ state: document.visibilityState, focused: document.hasFocus() }))
+  report.benchmarkWindow = await electron.evaluate(({ BrowserWindow }) => { const window = BrowserWindow.getAllWindows()[0]; return { visible: window.isVisible(), focused: window.isFocused() } })
+  assert.equal(report.benchmarkWindow.visible, true, 'The renderer paint benchmark requires a visible native window.')
   report.windowAvailableMS = Date.now() - launchedAt
   const fixture = await probe({ action: 'scaleSeed', count: 287, periods: 320 })
   report.fixture = fixture
   report.appMetricsAfterSeed = await electron.evaluate(({ app }) => app.getAppMetrics())
   assert.equal(fixture.rowsSeeded, 287 * 3 * 320)
   await page.evaluate(fixture => {
-    const state = window.__resourcePaint = { records: [], violations: [], indicatorValuesChecked: 0, previous: null }
+    const state = window.__resourcePaint = { records: [], violations: [], indicatorValuesChecked: 0, previous: null, frameGaps: [], previousFrame: null }
     const near = (actual, expected, description) => {
       if (expected === null ? actual !== null : typeof actual !== 'number' || Math.abs(actual - expected) > Math.max(1, Math.abs(expected)) * 1e-10) {
         if (state.violations.length < 40) state.violations.push(`${description}: ${actual} != ${expected}`)
@@ -68,7 +76,7 @@ try {
       requestAnimationFrame(() => { record.paintedAt = performance.timeOrigin + performance.now() })
     }
     new MutationObserver(sample).observe(document, { subtree: true, attributes: true, childList: true })
-    const frame = () => { sample(); requestAnimationFrame(frame) }
+    const frame = timestamp => { if (state.previousFrame !== null) state.frameGaps.push(timestamp - state.previousFrame); state.previousFrame = timestamp; sample(); requestAnimationFrame(frame) }
     requestAnimationFrame(frame)
   }, fixture)
   await page.waitForFunction(() => Number(document.querySelector('[data-total-market-count]')?.getAttribute('data-total-market-count')) === 287, null, { timeout: 60_000 })
@@ -105,6 +113,10 @@ try {
       nativeUpdates: update.nativeUpdates, expected: update.expected, label: paint.label })
   }
   for (let index = 0; index < 60; index += 1) await tickAndMeasure()
+  report.foregroundFrameCadence = await page.evaluate(() => {
+    const gaps = [...window.__resourcePaint.frameGaps].sort((left, right) => left - right)
+    return { frames: gaps.length, medianMS: gaps[Math.floor((gaps.length - 1) * .5)], p95MS: gaps[Math.floor((gaps.length - 1) * .95)], maxMS: gaps.at(-1), visibilityState: document.visibilityState, focused: document.hasFocus() }
+  })
   for (const index of [286, 175, 96, 14]) { await choose(fixture.instIds[index], 'cold bounded local selection'); await choose(focus, 'warm revisit') }
   const currentEnd = Math.floor(fixture.asOf / fixture.intervals[timeframe]) * fixture.intervals[timeframe] - fixture.intervals[timeframe]
   for (const distance of [64, -64]) {
