@@ -14,9 +14,14 @@ const fields = { instrument: 'VARCHAR', timeframe: 'VARCHAR', timestamp: 'BIGINT
 const partVersion = file => { const match = /^(base|delta)-(\d+)-[A-Za-z0-9-]+\.parquet$/.exec(basename(file)); return match ? { kind: match[1], generation: Number(match[2]) } : null }
 const activeParts = files => { const base = Math.max(0, ...files.map(file => { const version = partVersion(file); return version?.kind === 'base' ? version.generation : 0 })); return files.filter(file => { const version = partVersion(file); return !version ? base === 0 : version.kind === 'base' ? version.generation === base : version.generation > base }) }
 const directories = async path => { try { return (await readdir(path, { withFileTypes: true })).filter(value => value.isDirectory()).map(value => value.name).sort() } catch (error) { if (error.code === 'ENOENT') return []; throw error } }
-let engine, connection, sequence = 0, draining = false, complete = false
+let engine, connection, sequence = 0, draining = false, complete = false, stopping = false, resourcesClosed = false
 const queue = [], acknowledgments = new Map()
 const readyConnection = async () => { if (!connection) { const { DuckDBInstance } = await import('@duckdb/node-api'); engine = await DuckDBInstance.create(':memory:'); connection = await engine.connect() } return connection }
+const closeResources = () => {
+  if (resourcesClosed) return
+  connection?.closeSync(); engine?.closeSync(); manifest.close()
+  connection = null; engine = null; resourcesClosed = true
+}
 const send = payload => new Promise((resolve, reject) => { const id = ++sequence; acknowledgments.set(id, { resolve, reject }); parentPort.postMessage({ ...payload, sequence: id }) })
 
 async function importPartition(path, instrument, timeframe, priority, tolerateIssues) {
@@ -89,7 +94,7 @@ async function* partitions() {
 let background = partitions(), retryTimer = null, retryAt = 0
 const retryPartitions = []
 const retryLater = () => {
-  if (retryTimer) return
+  if (retryTimer || stopping) return
   retryAt = Date.now() + 5000
   retryTimer = setTimeout(() => { retryTimer = null; void drain() }, 5000)
 }
@@ -97,7 +102,7 @@ async function drain() {
   if (draining) return
   draining = true
   try {
-    while (true) {
+    while (!stopping) {
       const index = queue.findIndex(job => job.priority === 'foreground'), job = queue.splice(index < 0 ? 0 : index, 1)[0]
       if (job) {
         try { if (complete || await importQuery(job)) parentPort.postMessage({ id: job.id }); else queue.push(job) }
@@ -118,11 +123,11 @@ async function drain() {
           parentPort.postMessage({ warning: error.message })
           background = partitions(); retryLater(); break
         }
+        if (stopping) break
         if (next.done) {
           if (!complete) {
             await send({ complete: true }); complete = true
-            connection?.closeSync(); engine?.closeSync(); manifest.close()
-            connection = null; engine = null
+            closeResources()
           }
           break
         }
@@ -135,12 +140,27 @@ async function drain() {
         }
       }
     }
-  } finally { draining = false; if (queue.length) void drain() }
+  } finally {
+    draining = false
+    if (stopping) {
+      // Native work and its durable acknowledgment have settled. Terminating a
+      // worker while DuckDB is completing a N-API callback can abort the process.
+      clearTimeout(retryTimer)
+      queue.length = 0
+      closeResources()
+      parentPort.close()
+    } else if (queue.length) void drain()
+  }
 }
 parentPort.on('message', message => {
   if (message.ack) {
     const value = acknowledgments.get(message.ack)
     if (value) { acknowledgments.delete(message.ack); message.error ? value.reject(new Error(message.error)) : value.resolve() }
-  } else { queue.push(message); void drain() }
+  } else if (message.close) {
+    stopping = true
+    clearTimeout(retryTimer)
+    queue.length = 0
+    void drain()
+  } else if (!stopping) { queue.push(message); void drain() }
 })
 void drain()

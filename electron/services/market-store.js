@@ -165,6 +165,7 @@ export class MarketStore {
     if (this.closed) return
     const worker = new Worker(new URL('./market-store-migration.js', import.meta.url), { workerData: { root: this.root, path: this.path } })
     this.migration = worker
+    this.migrationExit = new Promise(resolve => worker.once('exit', resolve))
     worker.on('message', message => {
       if (message.import) {
         const { rows, partition } = message.import
@@ -202,6 +203,7 @@ export class MarketStore {
 
   async imported(query, priority, tolerateIssues = false) {
     await this.migrationReady
+    if (this.closed) throw new Error('MarketStore is closed.')
     if (this.migrationError) throw this.migrationError
     if (!this.migration || this.migrationComplete) return
     const id = ++this.nextMigrationID
@@ -210,7 +212,7 @@ export class MarketStore {
       this.migration.ref()
       this.migration.postMessage({ id, query: validateQuery(query), priority: priorityRank(priority) >= 3 ? 'foreground' : 'background', tolerateIssues })
     })
-    if (!this.migrationPending.size) this.migration.unref()
+    if (!this.migrationPending.size) this.migration?.unref()
   }
 
   read(command, query, priority = 'background', ...args) {
@@ -269,12 +271,15 @@ export class MarketStore {
     this.closeTask = (async () => {
       await this.migrationReady?.catch(() => undefined)
       // A read must not make shutdown finish a multi-year archive migration.
-      // Only already admitted durable transactions must drain before exit.
+      // Finish only the active partition and its durable acknowledgment. Native
+      // DuckDB callbacks must settle before the worker exits.
       if (this.migration) {
         const worker = this.migration; this.migration = null
         for (const pending of this.migrationPending.values()) pending.reject(new Error('MarketStore is closed.'))
         this.migrationPending.clear()
-        await worker.terminate()
+        worker.ref()
+        worker.postMessage({ close: true })
+        await this.migrationExit
       }
       await Promise.allSettled([...this.operations])
       await this.readers.close()

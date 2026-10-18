@@ -134,3 +134,52 @@ test('an operational import failure cannot certify cutover or erase its retryabl
     assert.equal((await store.candles(query))[0].close, 100)
   } finally { await chmod(directory, 0o700).catch(() => {}); await store?.close(); await rm(root, { recursive: true, force: true }) }
 })
+
+test('close drains the active native import and commit without cutting over the remaining archive', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-import-close-'))
+  let store: MarketStore | undefined
+  let release!: () => void
+  const commitGate = new Promise<void>(resolve => { release = resolve })
+  try {
+    await legacy(root, 'base-200-first.parquet', [row(0)])
+    const second = await legacy(root, 'base-200-second.parquet', [row(288)])
+    const directory = join(root, 'candles', 'timeframe=5m', 'instrument=BTC-USDT-SWAP', 'date=2024-01-02')
+    await mkdir(directory)
+    await rename(second, join(directory, 'base-200-second.parquet'))
+    store = await MarketStore.open(root)
+    const internal = store as any
+    // Hold the first imported transaction before acknowledging it to the native
+    // worker, so shutdown deterministically overlaps an active partition.
+    let admitted!: () => void
+    const admission = new Promise<void>(resolve => { admitted = resolve })
+    const request = internal.writer.request.bind(internal.writer)
+    internal.writer.request = async (command: string, args: any[] = [], priority?: string) => {
+      if (command === 'append' && args[1]?.importing) { admitted(); await commitGate }
+      return request(command, args, priority)
+    }
+    await internal.migrationReady
+    internal.migration.ref()
+    await admission
+    const worker = internal.migration
+    const exit = new Promise<number>(resolve => worker.once('exit', resolve))
+    const pendingRead = assert.rejects(store.candles(query), /closed/i)
+    await new Promise<void>(resolve => setImmediate(resolve))
+    assert.equal(internal.migrationPending.size, 1)
+    const closing = store.close()
+    assert.equal(store.close(), closing, 'Repeated close joins the same shutdown.')
+    await pendingRead
+    release()
+    await closing
+    assert.equal(await exit, 0, 'The importer must close native resources and exit naturally, not be terminated.')
+
+    const { DatabaseSync } = await import('node:sqlite')
+    const db = new DatabaseSync(join(root, 'market.sqlite'), { readOnly: true })
+    try {
+      assert.equal(db.prepare("SELECT COUNT(*) AS count FROM migration_partitions WHERE status='completed'").get()!.count, 1)
+      assert.equal(db.prepare("SELECT COUNT(*) AS count FROM migration_partitions WHERE path='__complete__'").get()!.count, 0)
+      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM candles').get()!.count, 1)
+    } finally { db.close() }
+    store = await MarketStore.open(root)
+    assert.equal((await store.candles({ ...query, through: base + 288 * step })).length, 2, 'Unfinished partitions remain resumable after shutdown.')
+  } finally { release(); await store?.close(); await rm(root, { recursive: true, force: true }) }
+})
