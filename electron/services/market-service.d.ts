@@ -14,6 +14,7 @@ export type DataAuditSnapshot = {
   error: string
 }
 export type RankedMarketRow = NativeMarketRow & { rankingChange: number | null; rankingAsOf: number | null }
+export type MarketServiceSnapshot = { rows: RankedMarketRow[]; revision: number; serviceSession: string; error: string; loading: boolean; updatedAt: number | null; timeframe: '5m' | '15m' | '1H'; realtimeState: 'connecting' | 'live' | 'reconnecting' | 'disconnected'; catalogSource: 'none' | 'cache' | 'live'; catalogProgress: CatalogProgress; listProgress: { total: number; completed: number; pending: number; retrying: number; unavailable: number } }
 export class MarketService {
   constructor(store: MarketStore, preferences?: () => Readonly<Preferences>, fetcher?: typeof fetch, autoRefresh?: boolean, options?: { metadata?: MetadataStore; requestTimeout?: number; webSocketFactory?: WebSocketFactory })
   [key: string]: any
@@ -30,5 +31,6 @@ export class MarketService {
   localChartWindow(instId: string, timeframe: '5m' | '15m' | '1H'): Promise<PreparedChartWindow | null>
   localChartHistory(instId: string, timeframe: '5m' | '15m' | '1H', end?: number): Promise<PreparedChartWindow | null>
   dispose(): Promise<void>
-  snapshot(timeframe?: '5m' | '15m' | '1H'): Promise<{ rows: RankedMarketRow[]; revision: number; error: string; loading: boolean; updatedAt: number | null; timeframe: '5m' | '15m' | '1H'; realtimeState: 'connecting' | 'live' | 'reconnecting' | 'disconnected'; catalogSource: 'none' | 'cache' | 'live'; catalogProgress: CatalogProgress; listProgress: { total: number; completed: number; pending: number; retrying: number; unavailable: number } }>
+  snapshot(timeframe?: '5m' | '15m' | '1H'): Promise<MarketServiceSnapshot>
+  snapshot(timeframe: '5m' | '15m' | '1H', version: { sinceRevision?: number; serviceSession?: string }): Promise<MarketServiceSnapshot | (Omit<MarketServiceSnapshot, 'rows'> & { unchanged: true })>
 }

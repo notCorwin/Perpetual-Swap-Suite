@@ -137,6 +137,51 @@ const fixture = async (preferences = disabled(), fetcher: typeof fetch = async (
 const localCatalog = (service: MarketService, ids = [instId]) => service.replaceCatalog(ids.map(id => ({
   instrument: { ...instrument, instId: id }, ticker: { ...ticker, instId: id }, result: { eligible: true, status: 'verified', turnover: 40_000_000 },
 })))
+
+test('snapshot versions omit unchanged rows, detect status changes, and isolate collector sessions', async () => {
+  const f = await fixture()
+  try {
+    f.service.history.sync.listTasks = () => { throw new Error('Polling must not clone historical tasks.') }
+    const first = await f.service.snapshot('15m')
+    assert.equal(typeof first.serviceSession, 'string')
+    const unchanged = await f.service.snapshot('15m', { sinceRevision: first.revision, serviceSession: first.serviceSession })
+    assert.equal('unchanged' in unchanged, true)
+    assert.equal('rows' in unchanged, false)
+    for (let tick = 1; tick <= 10; tick++) f.service.realtime.setState({ updatedAt: tick })
+    assert.equal('unchanged' in await f.service.snapshot('15m', { sinceRevision: first.revision, serviceSession: first.serviceSession }), true)
+    f.service.realtime.setState({ status: 'connecting' })
+    const connected = await f.service.snapshot('15m', { sinceRevision: first.revision, serviceSession: first.serviceSession })
+    assert.equal('rows' in connected, true)
+    assert.equal(connected.realtimeState, 'connecting')
+    f.service.error = 'Market source unavailable.'
+    const changed = await f.service.snapshot('15m', { sinceRevision: first.revision, serviceSession: first.serviceSession })
+    assert.equal('rows' in changed, true)
+    assert.ok(changed.revision > first.revision)
+    assert.equal(changed.error, 'Market source unavailable.')
+    const restarted = await f.service.snapshot('15m', { sinceRevision: changed.revision, serviceSession: 'retired-session' })
+    assert.equal('rows' in restarted, true)
+    const full = await f.service.snapshot('1H', { sinceRevision: -1, serviceSession: first.serviceSession })
+    assert.equal('rows' in full, true)
+    assert.equal(full.timeframe, '1H')
+  } finally { await f.close() }
+})
+
+test('history completion without a new durable mutation does not invalidate list projections', async () => {
+  const f = await fixture()
+  let projections = 0
+  try {
+    f.service.projectListEntry = async () => { projections++; return null }
+    localCatalog(f.service)
+    await f.service.persistCandles(instId, [rawCandle(Math.floor(Date.now() / fiveMinutes) * fiveMinutes - fiveMinutes)])
+    const before = projections
+    const task = { instrument: instId, timeframe: '5m', status: 'completed' }
+    for (let index = 0; index < 10; index++) f.service.onHistoryProgress(task)
+    assert.equal(projections, before)
+    const revision = f.service.revision
+    for (const status of ['queued', 'running', 'completed']) f.service.onHistoryProgress({ ...task, status })
+    assert.equal(f.service.revision, revision, 'Unobservable scheduler state must not invalidate row snapshots.')
+  } finally { await f.close() }
+})
 const discovery = (extra?: (url: URL) => Response | Promise<Response | null> | null): typeof fetch => async input => {
   const url = new URL(String(input))
   if (url.pathname.endsWith('/public/instruments')) return response([instrument])

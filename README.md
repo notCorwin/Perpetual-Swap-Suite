@@ -96,7 +96,7 @@ The model and API key are stored in a private analysis record inside `metadata.s
 
 ## Local storage
 
-Paths are relative to `~/Library/Application Support/Perpetual Swap Suite/`:
+Paths are relative to `~/Library/Application Support/perp-radar/`:
 
 | Path | Contents |
 | --- | --- |
@@ -104,7 +104,11 @@ Paths are relative to `~/Library/Application Support/Perpetual Swap Suite/`:
 | `MarketData/prepared-charts/` | Derived chart snapshots with formula versions and source watermarks |
 | `metadata.sqlite` | Transactional preferences, eligibility catalog, synchronization checkpoints, audit reports, and private analysis settings |
 
-DuckDB uses an in-memory query connection over Parquet. Writes validate completed candles and publish partitions atomically. The forming candle remains in memory. On the first migration, recognized values from an existing `settings.json` are imported once into SQLite. Retired glass and blur preferences are not part of the new settings schema.
+DuckDB uses an in-memory query connection over Parquet. Writes validate completed candles and atomically publish immutable delta files. Reaching eight active files compacts the UTC-day partition into one base; its generation excludes superseded files even after an interrupted cleanup. Repairs publish a new base, including when removing all rows. Derived snapshots identify their exact active source files.
+
+History and warmup targets have stable identities per instrument, period and source. Advancing a target updates its desired range; verified coverage is reused until the affected persisted range changes or an unavailable-statistics lease expires. Source checkpoints commit in batches. Live indicators project one forming candle from a bounded confirmed seed, without recomputing history or writing the forming candle. The full-history navigation cache is independent of these subscription seeds.
+
+On the first migration, recognized values from an existing `settings.json` are imported once into SQLite. Retired glass and blur preferences are not part of the new settings schema.
 
 The renderer uses a single isolated `window.radarDesktop` bridge. The main process validates the caller and complete command before executing an operation; Node APIs and credentials stay outside the page context.
 

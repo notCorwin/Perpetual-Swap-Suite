@@ -5,6 +5,7 @@ const statuses = new Set(['queued', 'running', 'retry', 'paused', 'cancelled', '
 const terminal = new Set(['paused', 'cancelled', 'completed', 'unavailable'])
 const expirable = new Set(['cancelled', 'completed', 'unavailable'])
 const foregroundReady = Symbol('Foreground history is ready for the source lane.')
+const targetChanged = Symbol('The rolling history target changed during an asynchronous operation.')
 const clone = value => structuredClone(value)
 const integer = (value, name, minimum = 0) => {
   if (!Number.isSafeInteger(value) || value < minimum) throw new TypeError(`${name} must be a safe integer of at least ${minimum}.`)
@@ -105,10 +106,14 @@ export class HistorySync {
     this.lastRequestAt = null
     this.requestTail = Promise.resolve()
     this.persistTail = Promise.resolve()
+    this.pendingCheckpoints = null
+    this.progressStatuses = new Map()
+    this.progressByTimeframe = new Map()
     this.fatalError = null
     // Process-local verification only. Restart always asks durable storage again.
     this.coverageChecks = new Map()
     this.coverageEpochs = new Map()
+    this.targetGenerations = new Map()
   }
 
   start() {
@@ -162,11 +167,16 @@ export class HistorySync {
     }
     // Publish canonical targets before deleting obsolete checkpoints, so an
     // interrupted cleanup is safe to run again on the next launch.
+    for (const task of this.tasks.values()) this.updateProgress(task)
     const targets = [...this.tasks.values()].filter(task => task.purpose !== 'requested')
-    if (this.metadata.putSyncTasks) await this.metadata.putSyncTasks(targets.map(clone))
-    else for (const task of targets) await this.save(task)
-    if (this.metadata.deleteSyncTasks) await this.metadata.deleteSyncTasks(obsolete)
-    else for (const id of obsolete) await this.metadata.deleteSyncTask(id)
+    if (targets.length) {
+      if (this.metadata.putSyncTasks) await this.metadata.putSyncTasks(targets.map(clone))
+      else for (const task of targets) await this.save(task)
+    }
+    if (obsolete.length) {
+      if (this.metadata.deleteSyncTasks) await this.metadata.deleteSyncTasks(obsolete)
+      else for (const id of obsolete) await this.metadata.deleteSyncTask(id)
+    }
     await this.pruneTerminalTasks()
   }
 
@@ -186,6 +196,7 @@ export class HistorySync {
       const promoted = requestedPriority === 'foreground' && task.priority !== 'foreground'
       if (promoted) task.priority = 'foreground'
       if (changedRange) {
+        this.targetGenerations.set(id, (this.targetGenerations.get(id) ?? 0) + 1)
         Object.assign(task, bounds)
         task.remaining = clipped(task.remaining, bounds)
         task.unavailableRanges = []
@@ -203,7 +214,10 @@ export class HistorySync {
         if (!this.store.coverageVersion) this.coverageChecks.delete(id)
         const gaps = await this.missing(task)
         if (!gaps.length) {
-          if (changedRange || promoted) await this.save(task, false)
+          const nextStatus = task.remaining.length ? 'unavailable' : 'completed'
+          const changedStatus = task.status !== nextStatus
+          task.status = nextStatus
+          if (changedRange || promoted || changedStatus) await this.save(task, changedStatus)
           return clone(task)
         }
       }
@@ -249,6 +263,39 @@ export class HistorySync {
   }
 
   listTasks() { return [...this.tasks.values()].map(clone) }
+
+  progressFor(instIds, timeframe) {
+    const statuses = this.progressByTimeframe.get(timeframe)
+    let retrying = 0, unavailable = 0
+    for (const instId of new Set(instIds)) {
+      const counts = statuses?.get(instId)
+      if (counts?.retrying) retrying++
+      if (counts?.unavailable) unavailable++
+    }
+    return { retrying, unavailable }
+  }
+
+  updateProgress(task, remove = false) {
+    const previous = this.progressStatuses.get(task.id)
+    const category = task.status === 'retry' ? 'retrying' : ['paused', 'unavailable'].includes(task.status) ? 'unavailable' : null
+    if (!remove && previous?.category === category && previous.instrument === task.instrument && previous.timeframe === task.timeframe) return
+    if (previous) {
+      const instruments = this.progressByTimeframe.get(previous.timeframe), counts = instruments?.get(previous.instrument)
+      if (counts) {
+        counts[previous.category]--
+        if (!counts.retrying && !counts.unavailable) instruments.delete(previous.instrument)
+        if (!instruments.size) this.progressByTimeframe.delete(previous.timeframe)
+      }
+      this.progressStatuses.delete(task.id)
+    }
+    if (remove || !category) return
+    const instruments = this.progressByTimeframe.get(task.timeframe) ?? new Map()
+    const counts = instruments.get(task.instrument) ?? { retrying: 0, unavailable: 0 }
+    counts[category]++
+    instruments.set(task.instrument, counts)
+    this.progressByTimeframe.set(task.timeframe, instruments)
+    this.progressStatuses.set(task.id, { instrument: task.instrument, timeframe: task.timeframe, category })
+  }
 
   async pause(id) { return this.control(id, 'paused') }
   async cancel(id) { return this.control(id, 'cancelled') }
@@ -321,12 +368,38 @@ export class HistorySync {
 
   save(task, notify = true) {
     task.updatedAt = this.timestamp()
+    this.updateProgress(task)
     const snapshot = clone(task)
-    const persistence = this.persistTail.then(() => this.metadata.putSyncTask(snapshot))
-    this.persistTail = persistence.catch(() => undefined)
-    return persistence.then(() => {
-      try { if (notify) Promise.resolve(this.onProgress?.(clone(snapshot))).catch(() => undefined) } catch { /* Observers cannot interrupt synchronization. */ }
-    })
+    let batch = this.pendingCheckpoints
+    if (!batch) {
+      batch = { entries: new Map() }
+      this.pendingCheckpoints = batch
+      // The predecessor preserves ordering with cleanup/deletion. Starting on
+      // a microtask coalesces simultaneous source state changes into one WAL
+      // transaction; each caller still waits for the durable batch commit.
+      const persistence = this.persistTail.then(async () => {
+        if (this.pendingCheckpoints === batch) this.pendingCheckpoints = null
+        const entries = [...batch.entries.values()]
+        try {
+          const snapshots = entries.map(entry => entry.snapshot)
+          if (this.metadata.putSyncTasks) await this.metadata.putSyncTasks(snapshots)
+          else for (const value of snapshots) await this.metadata.putSyncTask(value)
+          for (const entry of entries) {
+            try { if (entry.notify) Promise.resolve(this.onProgress?.(clone(entry.snapshot))).catch(() => undefined) } catch { /* Observers cannot interrupt synchronization. */ }
+            entry.waiters.forEach(waiter => waiter.resolve())
+          }
+        } catch (error) {
+          entries.forEach(entry => entry.waiters.forEach(waiter => waiter.reject(error)))
+          this.fail(error)
+          throw error
+        }
+      })
+      this.persistTail = persistence.catch(() => undefined)
+    }
+    const existing = batch.entries.get(task.id)
+    const entry = { snapshot, notify: notify || existing?.notify, waiters: existing?.waiters ?? [] }
+    batch.entries.set(task.id, entry)
+    return new Promise((resolve, reject) => entry.waiters.push({ resolve, reject }))
   }
 
   pruneTerminalTasks() {
@@ -337,15 +410,24 @@ export class HistorySync {
       const candidates = [...this.tasks.values()].reverse().filter(task => task.purpose === 'requested' && expirable.has(task.status)
         && task.id !== this.active.get(task.source)?.id && !this.waiters.has(task.id))
         .sort((left, right) => right.updatedAt - left.updatedAt || right.createdAt - left.createdAt)
+      const removed = []
       for (const task of candidates.slice(this.maxRetainedTerminalTasks)) {
         if (this.tasks.get(task.id) !== task || !expirable.has(task.status)
           || task.id === this.active.get(task.source)?.id || this.waiters.has(task.id)) continue
-        // Remove before awaiting persistence so a concurrent enqueue creates a
-        // fresh task whose save is ordered after this deletion.
+        // A later enqueue creates a fresh task and queues its save after this
+        // deletion transaction, even when its exact identity is reused.
         this.tasks.delete(task.id)
         this.coverageChecks.delete(task.id)
-        try { await this.metadata.deleteSyncTask(task.id) }
-        catch (error) { if (!this.tasks.has(task.id)) this.tasks.set(task.id, task); throw error }
+        this.updateProgress(task, true)
+        removed.push(task)
+      }
+      if (!removed.length) return
+      try {
+        if (this.metadata.deleteSyncTasks) await this.metadata.deleteSyncTasks(removed.map(task => task.id))
+        else for (const task of removed) await this.metadata.deleteSyncTask(task.id)
+      } catch (error) {
+        for (const task of removed) if (!this.tasks.has(task.id)) { this.tasks.set(task.id, task); this.updateProgress(task) }
+        throw error
       }
     })
     this.persistTail = persistence.catch(() => undefined)
@@ -538,18 +620,26 @@ export class HistorySync {
     task.status = 'running'
     task.nextAttemptAt = null
     await this.save(task)
+    const generation = this.targetGenerations.get(task.id) ?? 0
+    const changed = () => generation !== (this.targetGenerations.get(task.id) ?? 0)
+    const requireCurrent = () => { if (changed()) throw targetChanged }
     try {
       let gaps = await this.missing(task)
       signal.throwIfAborted()
+      requireCurrent()
       const source = this.sources.get(task.source)
       if (gaps.length && source.inspect && !task.inspected) {
-        const inspection = await this.callSource(() => source.inspect({ instrument: task.instrument, timeframe: task.timeframe, source: task.source, priority: task.priority, from: task.from, through: task.through, signal, cursor: task.cursor }), signal, task)
+        const inspectedTarget = clone(task)
+        const inspection = await this.callSource(() => source.inspect({ instrument: inspectedTarget.instrument, timeframe: inspectedTarget.timeframe, source: inspectedTarget.source, priority: inspectedTarget.priority, from: inspectedTarget.from, through: inspectedTarget.through, signal, cursor: inspectedTarget.cursor }), signal, task)
         signal.throwIfAborted()
-        task.unavailableRanges.push(...this.unavailable(task, inspection))
+        requireCurrent()
+        task.unavailableRanges.push(...this.unavailable(inspectedTarget, inspection))
         task.inspected = true
         gaps = await this.missing(task)
         signal.throwIfAborted()
+        requireCurrent()
         await this.save(task)
+        requireCurrent()
       }
       if (!gaps.length) return await this.finish(task)
       const intervalMS = intervals[task.timeframe]
@@ -558,7 +648,8 @@ export class HistorySync {
         task.cursor = null
         task.cursorRange = clone(gap)
       }
-      const response = await this.callSource(() => source.fetchGap({ instrument: task.instrument, timeframe: task.timeframe, source: task.source, priority: task.priority, ...gap, cursor: task.cursor, signal }), signal, task)
+      const pageTarget = clone(task)
+      const response = await this.callSource(() => source.fetchGap({ instrument: pageTarget.instrument, timeframe: pageTarget.timeframe, source: pageTarget.source, priority: pageTarget.priority, ...gap, cursor: pageTarget.cursor, signal }), signal, task)
       signal.throwIfAborted()
       const result = Array.isArray(response) ? { records: response } : response
       if (!result || !Array.isArray(result.records)) throw new TypeError('fetchGap must return records or an object containing records.')
@@ -569,16 +660,20 @@ export class HistorySync {
         return record.timestamp >= gap.from && record.timestamp <= gap.through
       })
       if (records.length) {
-        await this.write(records, clone(task))
-        this.invalidate({ ...task, from: Math.min(...records.map(record => record.timestamp)), through: Math.max(...records.map(record => record.timestamp)) })
+        await this.write(records, pageTarget)
+        this.invalidate({ ...pageTarget, from: Math.min(...records.map(record => record.timestamp)), through: Math.max(...records.map(record => record.timestamp)) })
         task.writtenRecords += records.length
       }
       // A cancelled request cannot publish a cursor or completion state. Any
       // already admitted Parquet write is recovered by the next coverage read.
       signal.throwIfAborted()
+      // The old page remains valid market data, but its availability bounds,
+      // cursor, and completion apply only to the target that requested it.
+      requireCurrent()
       if (result.unavailable !== undefined) task.unavailableRanges.push(...this.unavailable({ ...task, ...gap }, result))
       const after = await this.missing(task)
       signal.throwIfAborted()
+      requireCurrent()
       if (Object.hasOwn(result, 'cursor')) {
         this.validateCursor(result.cursor)
         task.cursor = result.cursor
@@ -592,7 +687,7 @@ export class HistorySync {
       task.status = 'queued'
       await this.save(task)
     } catch (error) {
-      if (signal.aborted || error === foregroundReady) {
+      if (signal.aborted || error === foregroundReady || error === targetChanged || changed()) {
         if (task.status === 'running') {
           task.status = 'queued'
           await this.save(task)

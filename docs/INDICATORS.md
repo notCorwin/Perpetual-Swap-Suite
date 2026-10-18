@@ -4,6 +4,8 @@ All calculations consume one canonical, timestamp-ordered native candle series. 
 
 The list and chart project the same calculation. Their visible windows cannot choose the seed. Older source additions and historical corrections invalidate the affected generation; formula or input-schema changes invalidate derived snapshots. Unknown volume remains unknown instead of being inferred from price.
 
+Batch initialization and incremental updates use the same formulas. Confirmed state retains the recursive EMA/Wilder accumulators and fixed rolling windows. Each forming revision projects from a copy of that bounded state, without advancing the confirmed seed. Missing periods reset it; historical corrections and prepends rebuild it from persisted history. Subscribed seeds survive eviction from the separate full-history navigation cache. List projections retain the full contiguous BOLL-expansion count alongside their bounded tail.
+
 | Indicator | Formula and initialization |
 | --- | --- |
 | EMA(200) | First value is the mean of the first 200 closes of a contiguous run. Subsequent values are `close × 2/201 + previousEMA × 199/201`. |

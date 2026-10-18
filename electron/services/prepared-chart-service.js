@@ -69,7 +69,7 @@ export class PreparedChartPipeline {
     const key = seriesKey(instId, timeframe)
     let state = this.series.get(key)
     if (!state) {
-      state = { key, instId, timeframe, intervalMS: intervalFor(timeframe), rows: new Map(), loaded: false, loading: null,
+      state = { key, instId, timeframe, intervalMS: intervalFor(timeframe), rows: new Map(), latestHour: null, loaded: false, loading: null,
         priceVersion: 0, sourceVersion: 0, calculatedVersion: -1, calculation: null, indicators: new Map(), generation: this.snapshots.get(key)?.valid ? this.snapshots.get(key).frame.generation : ++this.nextGeneration, active: 0,
         floor: null, latestTask: null, latestAt: 0, live: null, liveVersion: 0, calculatedLiveVersion: -1, indicatorState: null }
     }
@@ -109,7 +109,7 @@ export class PreparedChartPipeline {
     const key = seriesKey(instId, timeframe)
     let state = this.liveStates.get(key)
     if (!state) {
-      state = { key, instId, timeframe, intervalMS: intervalFor(timeframe), rows: new Map(), indicators: new Map(),
+      state = { key, instId, timeframe, intervalMS: intervalFor(timeframe), rows: new Map(), latestHour: null, indicators: new Map(),
         indicatorState: null, sourceVersion: 0, generation: 0, floor: null, live: null, liveVersion: 0 }
       this.liveStates.set(key, state)
     }
@@ -121,6 +121,7 @@ export class PreparedChartPipeline {
     const live = this.liveState(state.instId, state.timeframe)
     const hours = [...state.rows.keys()].sort((left, right) => left - right).slice(-(VISIBLE + WARMUP))
     live.rows = new Map(hours.map(hour => [hour, state.rows.get(hour)]))
+    live.latestHour = this.latest(state)
     live.indicators = new Map(hours.map(hour => [hour, state.indicators.get(hour)]).filter(([, bar]) => bar))
     live.indicatorState = structuredClone(state.indicatorState)
     live.sourceVersion = state.sourceVersion
@@ -490,7 +491,10 @@ export class PreparedChartPipeline {
           changed = true
           if (row.timestamp <= oldLatest) reseed = true
         }
-        if (state?.loaded) state.rows.set(row.timestamp, this.normalize(row))
+        if (state?.loaded) {
+          state.rows.set(row.timestamp, this.normalize(row))
+          state.latestHour = Math.max(state.latestHour ?? -Infinity, row.timestamp)
+        }
       }
       if (state) {
         state.sourceVersion += 1
@@ -517,7 +521,10 @@ export class PreparedChartPipeline {
                 live.indicators.set(indicator.hour, { ...indicator, indicatorsObserved: true })
               }
             }
-            if (row.timestamp >= (extremeHour(live.rows, true) ?? -Infinity)) live.rows.set(row.timestamp, this.normalize(row))
+            if (row.timestamp >= (extremeHour(live.rows, true) ?? -Infinity)) {
+              live.rows.set(row.timestamp, this.normalize(row))
+              live.latestHour = Math.max(live.latestHour ?? -Infinity, row.timestamp)
+            }
           }
           const hours = [...live.rows.keys()].sort((left, right) => left - right)
           for (const hour of hours.slice(0, Math.max(0, hours.length - VISIBLE - WARMUP))) { live.rows.delete(hour); live.indicators.delete(hour) }
@@ -558,6 +565,7 @@ export class PreparedChartPipeline {
         }
         for (const hour of state.rows.keys()) if (!next.has(hour)) { changed = true; prices = true; reseed = true }
         state.rows = next
+        state.latestHour = extremeHour(next)
         state.loaded = true
         if (changed) {
           state.sourceVersion += 1
@@ -591,6 +599,7 @@ export class PreparedChartPipeline {
       state.priceVersion += 1
       state.generation = ++this.nextGeneration
       state.rows.clear()
+      state.latestHour = null
       state.loaded = false
       state.floor = null
       state.indicators.clear()
@@ -652,7 +661,7 @@ export class PreparedChartPipeline {
     return task
   }
 
-  latest(state) { return extremeHour(state.rows) }
+  latest(state) { return state.latestHour }
 
   applyFloor(state, result) {
     const floor = result?.floor

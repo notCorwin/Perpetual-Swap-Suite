@@ -42,7 +42,7 @@ export class MarketStore {
   candleRevision(instrument: string, timeframe: string): number
   candleChangesSince(instrument: string, timeframe: string, revision: number): { revision: number; ranges: CandleRange[] | null }
   candles(query: { instrument: string; timeframe: string; from?: number; through?: number }, priority?: StorePriority): Promise<CandleRecord[]>
-  candleWatermark(instrument: string, timeframe: string, priority?: StorePriority): Promise<number>
+  candleWatermark(instrument: string, timeframe: string, priority?: StorePriority): Promise<string>
   readChartSnapshot(instrument: string, timeframe: string): Promise<unknown>
   writeChartSnapshot(instrument: string, timeframe: string, snapshot: unknown): Promise<void>
   candleTimestamps(query: { instrument: string; timeframe: string; from?: number; through?: number }, priority?: StorePriority): Promise<number[]>

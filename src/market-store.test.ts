@@ -161,6 +161,42 @@ test('audit reports physical duplicates, invalid values, off-grid records and re
   } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
+test('audit accepts distinct cross-part revisions and checks unavailable units on the latest observation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-revision-audit-'))
+  const store = await MarketStore.open(root), internal: any = store
+  const base = Date.UTC(2024, 0, 1), query = { instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: base, through: base }
+  try {
+    await store.appendCandles([record(base)])
+    await store.appendCandles([{ ...record(base), baseVolume: 2, oi: 100, buy: 10, sell: 5 }])
+    const clean = await store.inspectCandles(query)
+    assert.equal(clean.checkedRows, 2)
+    assert.deepEqual(clean.issues, [], 'An obsolete raw revision must not manufacture a missing-base-volume repair.')
+    const files = await internal.parquetFiles(query.instrument, query.timeframe)
+    const duplicate = join(internal.partition(query.instrument, query.timeframe, base), 'duplicate.parquet')
+    await store.enqueue(() => internal.connection.run(`COPY (SELECT * FROM read_parquet('${files[1]}', hive_partitioning=false)) TO '${duplicate}' (FORMAT PARQUET)`))
+    assert.deepEqual((await store.inspectCandles(query)).issues.map(issue => issue.reason), ['duplicate'], 'Equal revisions across files are ambiguous physical duplicates.')
+    await store.replaceCandles(query, [{ ...record(base), baseVolume: 2 }])
+    assert.deepEqual((await store.inspectCandles(query)).issues, [])
+  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('different revisions cannot duplicate a timestamp within one physical part', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-part-uniqueness-'))
+  const store = await MarketStore.open(root), internal: any = store
+  const base = Date.UTC(2024, 0, 1), query = { instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: base, through: base }
+  try {
+    await store.appendCandles([{ ...record(base), baseVolume: 1 }])
+    const [original] = await internal.parquetFiles(query.instrument, query.timeframe)
+    const duplicate = join(internal.partition(query.instrument, query.timeframe, base), 'duplicate.parquet')
+    await store.enqueue(() => internal.connection.run(`COPY (
+      SELECT * FROM read_parquet('${original}', hive_partitioning=false)
+      UNION ALL SELECT * REPLACE(writtenAt + 1 AS writtenAt) FROM read_parquet('${original}', hive_partitioning=false)
+    ) TO '${duplicate}' (FORMAT PARQUET)`))
+    await rm(original)
+    assert.deepEqual((await store.inspectCandles(query)).issues.map(issue => issue.reason), ['duplicate'])
+  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
 test('corrupt files report their exact partition and require a full-day repair', async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-radar-corruption-'))
   const store = await MarketStore.open(root), internal: any = store

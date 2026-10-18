@@ -102,7 +102,7 @@ async function handleRequest(event, payload) {
     }
     return marketPreferences
   }
-  if (request.snapshot) return marketService.snapshot(request.snapshot.timeframe)
+  if (request.snapshot) return marketService.snapshot(request.snapshot.timeframe, request.snapshot)
   if (request.dataAudit) return marketService.dataAuditRequest(request.dataAudit)
   if (request.chartWindow) {
     const { instId, timeframe, endHour } = request.chartWindow

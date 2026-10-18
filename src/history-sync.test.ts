@@ -1038,3 +1038,227 @@ test('startup collapses old rolling checkpoints to the latest window and preserv
     assert.ok(sync.listTasks().filter(task => task.purpose !== 'requested').every(task => task.id.startsWith('target-')))
   } finally { await sync.close() }
 })
+
+class BatchMemoryMetadata extends MemoryMetadata {
+  batches: HistoryTask[][] = []
+  deleted: string[][] = []
+  beforeCommit?: (tasks: HistoryTask[]) => Promise<void> | void
+  async putSyncTasks(tasks: HistoryTask[]) {
+    const snapshots = structuredClone(tasks)
+    this.batches.push(snapshots)
+    await this.beforeCommit?.(snapshots)
+    snapshots.forEach(task => super.putSyncTask(task))
+  }
+  deleteSyncTasks(ids: string[]) { this.deleted.push([...ids]); ids.forEach(id => this.deleteSyncTask(id)) }
+}
+
+test('simultaneous checkpoints use one batch and enqueue/close wait for its durable commit', async () => {
+  const metadata = new BatchMemoryMetadata(), entered = deferred(), release = deferred()
+  const { sync } = create({ metadata })
+  await sync.start()
+  metadata.batches.length = 0
+  metadata.beforeCommit = async () => { entered.resolve(); await release.promise }
+  let admitted = false, closed = false
+  const admission = Promise.all(['BTC', 'ETH', 'SOL'].map(instrument => sync.enqueue({ ...request, instrument }))).then(tasks => { admitted = true; return tasks })
+  try {
+    await within(entered.promise)
+    assert.equal(metadata.batches.length, 1)
+    assert.equal(metadata.batches[0].length, 3)
+    assert.equal(metadata.tasks.size, 0)
+    assert.equal(admitted, false)
+    const closing = sync.close().then(() => { closed = true })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(closed, false)
+    release.resolve()
+    const tasks = await within(admission)
+    await within(closing)
+    assert.ok(tasks.every(task => metadata.getSyncTask(task.id)?.status === 'queued'))
+    assert.equal(admitted, true)
+  } finally { release.resolve(); await sync.close() }
+})
+
+test('coalesced checkpoints publish the latest state once and resolve all durable waiters', async () => {
+  const metadata = new BatchMemoryMetadata(), progress: string[] = []
+  const { sync } = create({ metadata, onProgress(task) { progress.push(task.status) } })
+  try {
+    const task = await sync.enqueue(request)
+    await sync.waitFor(task.id); await sync.whenIdle()
+    metadata.batches.length = 0; progress.length = 0
+    const mutable = (sync as any).tasks.get(task.id) as HistoryTask
+    mutable.status = 'paused'
+    const first = (sync as any).save(mutable)
+    mutable.status = 'cancelled'
+    const last = (sync as any).save(mutable)
+    await Promise.all([first, last])
+    assert.equal(metadata.batches.length, 1)
+    assert.deepEqual(metadata.batches[0].map(task => task.status), ['cancelled'])
+    assert.equal(metadata.getSyncTask(task.id)?.status, 'cancelled')
+    assert.deepEqual(progress, ['cancelled'])
+  } finally { await sync.close() }
+})
+
+test('a failed completion batch rejects waiters and restart recovers already durable pages without downloading again', async () => {
+  const metadata = new BatchMemoryMetadata(), store = new VersionedMemoryStore()
+  let fetches = 0, failCommit = true
+  metadata.beforeCommit = tasks => { if (failCommit && tasks.some(task => task.status === 'completed')) throw new Error('Checkpoint transaction failed.') }
+  const options = { metadata, store, sources: { candles: { fetchGap(query: HistorySourceQuery) { fetches++; return records(query) } } } }
+  let sync = create(options).sync
+  try {
+    const task = await sync.enqueue(request)
+    await assert.rejects(within(sync.waitFor(task.id)), /Checkpoint transaction failed/)
+    await sync.close()
+    assert.equal(store.rows.size, 3)
+    assert.equal(metadata.getSyncTask(task.id)?.status, 'running')
+    failCommit = false
+    sync = create(options).sync
+    await sync.start()
+    assert.equal((await within(sync.waitFor(task.id))).status, 'completed')
+    assert.equal(fetches, 1)
+  } finally { await sync.close() }
+})
+
+test('progress counts unique instruments from the status index and updates across cancellation, pruning, and restart', async () => {
+  const metadata = new BatchMemoryMetadata()
+  const options = { metadata, maxRetainedTerminalTasks: 2, store: { async missingCandleRanges() { return [] } }, write() {},
+    sources: { candles: { fetchGap: records }, oi: { fetchGap: records }, taker: { fetchGap: records } } }
+  let sync = create(options).sync
+  try {
+    const tasks = await Promise.all(['oi', 'taker'].map(source => sync.enqueue({ ...request, source })))
+    await sync.whenIdle()
+    await Promise.all(tasks.map(task => sync.pause(task.id)))
+    assert.deepEqual(sync.progressFor([request.instrument, request.instrument], '5m'), { retrying: 0, unavailable: 1 })
+    assert.deepEqual(sync.progressFor(['OTHER'], '5m'), { retrying: 0, unavailable: 0 })
+    assert.deepEqual(sync.progressFor([request.instrument], '1H'), { retrying: 0, unavailable: 0 })
+    await sync.close()
+    sync = create(options).sync
+    await sync.start()
+    assert.deepEqual(sync.progressFor([request.instrument], '5m'), { retrying: 0, unavailable: 1 })
+    ;(sync as any).maxRetainedTerminalTasks = 1
+    await sync.cancel(tasks[0].id)
+    assert.deepEqual(sync.progressFor([request.instrument], '5m'), { retrying: 0, unavailable: 1 })
+    await sync.cancel(tasks[1].id)
+    await sync.whenIdle()
+    assert.deepEqual(sync.progressFor([request.instrument], '5m'), { retrying: 0, unavailable: 0 })
+    assert.equal(sync.listTasks().length, 1)
+    assert.ok(metadata.deleted.some(ids => ids.length > 0))
+    const map = (sync as any).tasks as Map<string, HistoryTask>
+    const values = map.values
+    map.values = () => { throw new Error('Progress must not scan task payloads.') }
+    try { assert.deepEqual(sync.progressFor([request.instrument], '5m'), { retrying: 0, unavailable: 0 }) }
+    finally { map.values = values }
+  } finally { await sync.close() }
+})
+
+test('retry progress counts a shared instrument once and clears when the tasks stop retrying', async () => {
+  const retried = deferred(), metadata = new BatchMemoryMetadata()
+  let retries = 0
+  const { sync } = create({ metadata, maxConcurrentTasks: 2, retryBaseMS: 10_000, maxRetryDelayMS: 10_000,
+    sources: { oi: { fetchGap() { throw new Error('Offline.') } }, taker: { fetchGap() { throw new Error('Offline.') } } },
+    onProgress(task) { if (task.status === 'retry' && ++retries === 2) retried.resolve() },
+  })
+  try {
+    const tasks = await Promise.all(['oi', 'taker'].map(source => sync.enqueue({ ...request, source })))
+    await within(retried.promise)
+    assert.deepEqual(sync.progressFor([request.instrument], '5m'), { retrying: 1, unavailable: 0 })
+    await Promise.all(tasks.map(task => sync.cancel(task.id)))
+    assert.deepEqual(sync.progressFor([request.instrument], '5m'), { retrying: 0, unavailable: 0 })
+  } finally { await sync.close() }
+})
+
+test('a rolling target becomes completed when its unavailable listing range leaves the requested window', async () => {
+  const store = new VersionedMemoryStore()
+  const { sync } = create({ store, sources: { candles: {
+    inspect() { return { availableFrom: base + intervalMS, reason: 'Before listing.' } }, fetchGap: records,
+  } } })
+  try {
+    const first = await sync.enqueue({ ...request, purpose: 'history' })
+    assert.equal((await sync.waitFor(first.id)).status, 'unavailable')
+    assert.deepEqual(sync.progressFor([request.instrument], '5m'), { retrying: 0, unavailable: 1 })
+    await store.appendCandles([candle(base + 3 * intervalMS)])
+    const rolled = await sync.enqueue({ ...request, purpose: 'history', from: base + intervalMS, through: base + 3 * intervalMS })
+    assert.equal(rolled.id, first.id)
+    assert.equal(rolled.status, 'completed')
+    assert.deepEqual(sync.progressFor([request.instrument], '5m'), { retrying: 0, unavailable: 0 })
+  } finally { await sync.close() }
+})
+
+test('an asynchronous inspection cannot mark a newly extended rolling tail unavailable', async () => {
+  const store = new VersionedMemoryStore(), entered = deferred(), release = deferred()
+  const inspected: HistoryRange[] = [], fetched: HistorySourceQuery[] = []
+  const { sync } = create({ store, sources: { candles: {
+    async inspect(query) {
+      inspected.push({ from: query.from, through: query.through })
+      if (inspected.length === 1) { entered.resolve(); await release.promise }
+      return { availableThrough: query.through, reason: 'Latest completed source period.' }
+    },
+    fetchGap(query) { fetched.push(query); return records(query) },
+  } } })
+  try {
+    const first = await sync.enqueue({ ...request, through: base + intervalMS, purpose: 'history' })
+    await within(entered.promise)
+    const moved = await sync.enqueue({ ...request, from: base + intervalMS, through: base + 2 * intervalMS, purpose: 'history' })
+    assert.equal(moved.id, first.id)
+    release.resolve()
+    const result = await within(sync.waitFor(first.id))
+    assert.equal(result.status, 'completed')
+    assert.deepEqual(result.unavailableRanges, [])
+    assert.ok(store.rows.has(`${request.instrument}:5m:${base + 2 * intervalMS}`))
+    assert.deepEqual(inspected, [{ from: base, through: base + intervalMS }, { from: base + intervalMS, through: base + 2 * intervalMS }])
+    assert.deepEqual(fetched.map(({ from, through }) => ({ from, through })), [{ from: base + intervalMS, through: base + 2 * intervalMS }])
+  } finally { release.resolve(); await sync.close() }
+})
+
+test('a page from an older rolling generation may persist observations but cannot publish its cursor or unavailable ranges', async () => {
+  const store = new VersionedMemoryStore(), entered = deferred(), release = deferred()
+  const queries: HistorySourceQuery[] = [], writeBounds: HistoryRange[] = []
+  const { sync } = create({ store, async write(values, task) {
+    writeBounds.push({ from: task.from, through: task.through })
+    await store.appendCandles(values)
+  }, sources: { candles: { async fetchGap(query) {
+    queries.push(query)
+    if (queries.length === 1) {
+      entered.resolve(); await release.promise
+      return { records: [candle(query.through)], cursor: 'old-target-page', unavailable: [{ from: query.from, through: query.through, reason: 'Old page boundary.' }] }
+    }
+    return records(query)
+  } } } })
+  try {
+    const first = await sync.enqueue({ ...request, through: base + intervalMS, purpose: 'history' })
+    await within(entered.promise)
+    await sync.enqueue({ ...request, from: base + intervalMS, through: base + 2 * intervalMS, purpose: 'history' })
+    release.resolve()
+    const result = await within(sync.waitFor(first.id))
+    assert.equal(result.status, 'completed')
+    assert.equal(result.attempts, 0)
+    assert.deepEqual(result.unavailableRanges, [])
+    assert.equal(queries.length, 2)
+    assert.equal(queries[1].cursor, null)
+    assert.equal(queries[1].from, base + 2 * intervalMS)
+    assert.deepEqual(writeBounds[0], { from: base, through: base + intervalMS }, 'The accepted page keeps its original mutation context.')
+    assert.ok(store.rows.has(`${request.instrument}:5m:${base + 2 * intervalMS}`))
+  } finally { release.resolve(); await sync.close() }
+})
+
+test('inspection generation checks also reject an old result after the target moves away and back to identical bounds', async () => {
+  const entered = deferred(), release = deferred(), store = new VersionedMemoryStore()
+  let inspections = 0
+  const { sync } = create({ store, sources: { candles: {
+    async inspect(query) {
+      if (++inspections === 1) { entered.resolve(); await release.promise; return { availableThrough: base, reason: 'Old observation.' } }
+      return { availableThrough: query.through }
+    }, fetchGap: records,
+  } } })
+  try {
+    const original = { ...request, through: base + intervalMS, purpose: 'history' as const }
+    const task = await sync.enqueue(original)
+    await within(entered.promise)
+    await sync.enqueue({ ...original, from: base + intervalMS, through: base + 2 * intervalMS })
+    await sync.enqueue(original)
+    release.resolve()
+    const result = await within(sync.waitFor(task.id))
+    assert.equal(result.status, 'completed')
+    assert.deepEqual(result.unavailableRanges, [])
+    assert.equal(inspections, 2)
+    assert.ok(store.rows.has(`${request.instrument}:5m:${base + intervalMS}`))
+  } finally { release.resolve(); await sync.close() }
+})

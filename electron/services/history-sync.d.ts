@@ -106,6 +106,8 @@ export class HistorySync {
   /** Read detached snapshots after start(). Old completed/unavailable/cancelled tasks can expire from the bounded result history and return null. Re-enqueue their range to recheck durable coverage. */
   getTask(id: string): HistoryTask | null
   listTasks(): HistoryTask[]
+  /** Count unique instruments with retrying or unavailable/paused work without cloning task payloads. */
+  progressFor(instIds: Iterable<string>, timeframe: HistoryTimeframe): { retrying: number; unavailable: number }
   /** Recheck an explicit observation or repair even before it changes storage. */
   invalidate(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string }): void
   pause(id: string): Promise<HistoryTask>

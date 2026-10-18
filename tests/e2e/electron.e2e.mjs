@@ -125,6 +125,16 @@ test('preferences persist through the single desktop entry point and survive a p
   await request({ preferences: { action: 'update', values: initial } })
 })
 
+test('snapshot IPC returns compact unchanged responses and refreshes rows for another collector session', async () => {
+  const first = await request({ snapshot: { timeframe: '5m', sinceRevision: -1 } })
+  assert.ok(first.serviceSession)
+  const same = await request({ snapshot: { timeframe: '5m', sinceRevision: first.revision, serviceSession: first.serviceSession } })
+  assert.equal(same.unchanged, true)
+  assert.equal('rows' in same, false)
+  const fresh = await request({ snapshot: { timeframe: '5m', sinceRevision: same.revision, serviceSession: 'previous-collector' } })
+  assert.ok(Array.isArray(fresh.rows))
+})
+
 test('Radar has no Research or Strategy workspace or desktop operations', async () => {
   await page.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).waitFor()
   assert.equal(await page.getByRole('button', { name: /Research|Strategy|Signals|Rules|Universe/ }).count(), 0)

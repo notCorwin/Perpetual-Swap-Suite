@@ -81,6 +81,9 @@ function App() {
     let stopped = false
     let timer: number
     let backoff = 2000
+    // The first request for each timeframe needs its rows, even when the
+    // collector revision has not changed since the previous timeframe.
+    revision.current = -1
     const load = async () => {
       await pageVisible()
       if (stopped) return

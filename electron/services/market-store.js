@@ -1,6 +1,7 @@
 import { DuckDBInstance } from '@duckdb/node-api'
+import { createHash } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 
 const quote = value => `'${String(value).replaceAll("'", "''")}'`
 const safeSegment = value => {
@@ -9,6 +10,8 @@ const safeSegment = value => {
 }
 export const CANDLE_INTERVALS = Object.freeze({ '5m': 300_000, '15m': 900_000, '1H': 3_600_000 })
 const dayMS = 86_400_000
+const maxPartitionParts = 8
+const maxSchemaEntries = 512
 const schema = Object.freeze({
   instrument: 'VARCHAR', timeframe: 'VARCHAR', timestamp: 'BIGINT',
   open: 'DOUBLE', high: 'DOUBLE', low: 'DOUBLE', close: 'DOUBLE',
@@ -44,7 +47,27 @@ export function validateCandle(candle) {
 }
 const storedCandle = (candle, writtenAt) => Object.fromEntries(Object.keys(schema).map(field => [field, field === 'writtenAt' ? writtenAt : candle[field] ?? null]))
 const sqlSchema = Object.entries(schema).map(([field, type]) => `${quote(field)}: ${quote(type)}`).join(', ')
+const canonicalProjection = Object.entries(schema).map(([field, type]) => `CAST("${field}" AS ${type}) AS "${field}"`).join(', ')
 const isMissing = error => error?.code === 'ENOENT'
+const partVersion = file => {
+  const match = /^(base|delta)-(\d+)-[A-Za-z0-9-]+\.parquet$/.exec(basename(file))
+  const generation = Number(match?.[2])
+  return match && Number.isSafeInteger(generation) && generation > 0 ? { kind: match[1], generation } : null
+}
+// The newest base is an atomic visibility boundary. Files from its generation
+// or earlier are already included (or intentionally deleted by a repair), so
+// interrupted cleanup can never resurrect a row or introduce duplicates.
+// A base owns the complete day. Unversioned input is included until the first
+// base; afterward only newer managed deltas belong to the dataset. Other
+// files are obsolete/orphan artifacts rather than additional observations.
+const activePartitionParts = files => {
+  const base = Math.max(0, ...files.map(file => { const version = partVersion(file); return version?.kind === 'base' ? version.generation : 0 }))
+  return files.filter(file => {
+    const version = partVersion(file)
+    if (!version) return base === 0
+    return version.kind === 'base' ? version.generation === base : version.generation > base
+  })
+}
 function validatePhysicalSchema(columns) {
   const types = new Map(columns.map(column => [column.column_name, column.column_type]))
   for (const field of ['instrument', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'confirmed']) {
@@ -96,6 +119,7 @@ export class MarketStore {
     this.mutations = new Map()
     this.watermarks = new Map()
     this.chartSnapshotWrites = new Map()
+    this.parquetSchemas = new Map()
     this.writeMetrics = { partitions: 0, rowsSubmitted: 0, bytesRead: 0, bytesWritten: 0, durationMS: 0 }
   }
 
@@ -134,6 +158,13 @@ export class MarketStore {
     return join(this.root, 'candles', `timeframe=${safeSegment(timeframe)}`, `instrument=${safeSegment(instrument)}`, `date=${date}`)
   }
 
+  async partitionFiles(directory) {
+    try {
+      return (await readdir(directory, { withFileTypes: true }))
+        .filter(entry => entry.isFile() && entry.name.endsWith('.parquet')).map(entry => join(directory, entry.name)).sort()
+    } catch (error) { if (isMissing(error)) return []; throw error }
+  }
+
   async parquetFiles(instrument, timeframe, from, through) {
     const directory = join(this.root, 'candles', `timeframe=${safeSegment(timeframe)}`, `instrument=${safeSegment(instrument)}`)
     let dates
@@ -147,19 +178,40 @@ export class MarketStore {
       const day = join(directory, entry.name)
       // An empty partition left by an interrupted first write is absence,
       // whereas permissions and device errors must reach the caller.
-      let parts
-      try { parts = await readdir(day, { withFileTypes: true }) } catch (error) { if (isMissing(error)) continue; throw error }
-      files.push(...parts.filter(part => part.isFile() && part.name.endsWith('.parquet')).map(part => join(day, part.name)))
+      files.push(...activePartitionParts(await this.partitionFiles(day)))
     }
     return files
   }
 
+  schemaKey(files) {
+    const hash = createHash('sha256')
+    for (const file of [...files].sort()) hash.update(file).update('\0')
+    return hash.digest('hex')
+  }
+
+  rememberParquetSchema(files, projection) {
+    const key = this.schemaKey(files)
+    this.parquetSchemas.delete(key)
+    this.parquetSchemas.set(key, projection)
+    if (this.parquetSchemas.size > maxSchemaEntries) this.parquetSchemas.delete(this.parquetSchemas.keys().next().value)
+  }
+
   async parquetRelation(files) {
-    const relation = `read_parquet([${files.map(quote).join(', ')}], union_by_name = true, hive_partitioning = false)`
-    const columns = (await this.connection.runAndReadAll(`DESCRIBE SELECT * FROM ${relation}`)).getRowObjectsJS()
-    const existing = new Set(columns.map(column => column.column_name))
-    validatePhysicalSchema(columns)
-    const projection = Object.entries(schema).map(([field, type]) => `${existing.has(field) ? `CAST("${field}" AS ${type})` : `NULL::${type}`} AS "${field}"`).join(', ')
+    const relation = `read_parquet([${files.map(quote).join(', ')}], union_by_name = true, hive_partitioning = false)`, key = this.schemaKey(files)
+    // App-published names are immutable. Imported/unmanaged files can change
+    // in place, so their physical types must be inspected on every read.
+    const immutable = files.every(file => partVersion(file) || /^part-\d+-\d+-[a-f0-9]+\.parquet$/.test(basename(file)))
+    let projection = immutable ? this.parquetSchemas.get(key) : undefined
+    if (projection) {
+      this.parquetSchemas.delete(key)
+      this.parquetSchemas.set(key, projection)
+    } else {
+      const columns = (await this.connection.runAndReadAll(`DESCRIBE SELECT * FROM ${relation}`)).getRowObjectsJS()
+      const existing = new Set(columns.map(column => column.column_name))
+      validatePhysicalSchema(columns)
+      projection = Object.entries(schema).map(([field, type]) => `${existing.has(field) ? `CAST("${field}" AS ${type})` : `NULL::${type}`} AS "${field}"`).join(', ')
+      if (immutable) this.rememberParquetSchema(files, projection)
+    }
     // Explicit casts happen at the storage boundary. Old files may omit base
     // volume; that is a typed NULL, never quote volume divided by a price.
     return `(SELECT ${projection} FROM ${relation})`
@@ -167,32 +219,43 @@ export class MarketStore {
 
   async publishPartition(directory, rows, { replaceFrom, replaceThrough, timeframe = rows[0]?.timeframe } = {}) {
     await mkdir(directory, { recursive: true })
-    const parts = (await readdir(directory, { withFileTypes: true }))
-      .filter(entry => entry.isFile() && entry.name.endsWith('.parquet')).map(entry => join(directory, entry.name))
-    const nonce = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
-    const source = join(directory, `.${nonce}.json`), target = join(directory, `part-${nonce}.parquet`), temporary = `${target}.tmp`
-    const startedAt = performance.now(), interval = CANDLE_INTERVALS[timeframe]
+    const allParts = await this.partitionFiles(directory), parts = activePartitionParts(allParts)
+    const startedAt = performance.now(), interval = CANDLE_INTERVALS[timeframe], repairing = replaceFrom != null
+    const compact = repairing || parts.length + 1 >= maxPartitionParts
+    const dayStart = Date.parse(`${directory.slice(-10)}T00:00:00Z`)
+    // A corrupt file can only be discarded when its entire UTC day is
+    // explicitly replaced. Partial repairs always preserve other rows.
+    const fullDay = repairing && replaceFrom <= dayStart && replaceThrough >= dayStart + dayMS - interval
+    let generation = Math.max(Date.now(), this.lastWrittenAt + 1, ...allParts.map(file => (partVersion(file)?.generation ?? 0) + 1))
+    let previousRelation = null
     let previousBytes = 0
-    for (const file of parts) previousBytes += (await stat(file)).size
+    if (parts.length && !fullDay && (compact || !parts.some(file => partVersion(file)))) {
+      previousRelation = await this.parquetRelation(parts)
+      for (const file of parts) previousBytes += (await stat(file)).size
+      // Existing unversioned Parquet is migrated on its first write. Reserve
+      // a revision after its durable watermark even after a clock rollback.
+      if (!parts.some(file => partVersion(file))) {
+        const watermarks = (await this.connection.runAndReadAll(`SELECT MAX(COALESCE(writtenAt, 0)) AS watermark FROM ${previousRelation}`)).getRowObjectsJS()
+        generation = Math.max(generation, Number(watermarks[0]?.watermark ?? 0) + 1)
+      }
+    }
+    this.lastWrittenAt = generation
+    for (const row of rows) row.writtenAt = generation
+    const nonce = `${process.pid}-${Math.random().toString(16).slice(2)}`
+    const source = join(directory, `.${generation}-${nonce}.json`), target = join(directory, `${compact ? 'base' : 'delta'}-${generation}-${nonce}.parquet`), temporary = `${target}.tmp`
     await writeFile(source, JSON.stringify(rows), { mode: 0o600 })
     try {
       const incoming = `SELECT * FROM read_json(${quote(source)}, columns = {${sqlSchema}}, format = 'array')`
       let previous = ''
-      if (parts.length) {
-        const dayStart = Date.parse(`${directory.slice(-10)}T00:00:00Z`)
-        // A corrupt file can only be discarded when its entire UTC day is
-        // explicitly replaced. Partial repairs always preserve other rows.
-        const fullDay = replaceFrom <= dayStart && replaceThrough >= dayStart + dayMS - interval
-        if (!fullDay) {
-          const relation = await this.parquetRelation(parts)
-          previous = `SELECT * FROM ${relation}${replaceFrom == null ? '' : ` WHERE timestamp < ${replaceFrom} OR timestamp >= ${replaceThrough + interval}`} UNION ALL BY NAME `
-        }
-      }
+      if (compact && parts.length && !fullDay) previous = `SELECT * FROM ${previousRelation}${!repairing ? '' : ` WHERE timestamp < ${replaceFrom} OR timestamp >= ${replaceThrough + interval}`} UNION ALL BY NAME `
       await this.connection.run(`COPY (SELECT * FROM (${previous}${incoming})
         QUALIFY ROW_NUMBER() OVER (PARTITION BY timestamp ORDER BY COALESCE(writtenAt, 0) DESC) = 1
         ORDER BY timestamp) TO ${quote(temporary)} (FORMAT PARQUET, COMPRESSION ZSTD)`)
       await rename(temporary, target)
-      await Promise.all(parts.map(part => rm(part, { force: true })))
+      this.rememberParquetSchema([target], canonicalProjection)
+      // Publishing the base already removed old files from the logical
+      // dataset. Cleanup is space reclamation, never a visibility operation.
+      if (compact) await Promise.all(allParts.map(part => rm(part, { force: true })))
       const bytesWritten = (await stat(target)).size
       this.writeMetrics = { partitions: this.writeMetrics.partitions + 1, rowsSubmitted: this.writeMetrics.rowsSubmitted + rows.length,
         bytesRead: this.writeMetrics.bytesRead + previousBytes, bytesWritten: this.writeMetrics.bytesWritten + bytesWritten,
@@ -200,7 +263,7 @@ export class MarketStore {
     } finally { await rm(source, { force: true }); await rm(temporary, { force: true }) }
   }
 
-  invalidate(instrument, timeframe, writtenAt, range = null) {
+  invalidate(instrument, timeframe, range = null) {
     const key = `${instrument}:${timeframe}`
     const revision = this.candleRevision(instrument, timeframe) + 1
     this.revisions.set(key, revision)
@@ -209,8 +272,7 @@ export class MarketStore {
     if (mutations.length > 256) mutations.shift()
     this.mutations.set(key, mutations)
     this.coverages.delete(key)
-    if (writtenAt == null) this.watermarks.delete(key)
-    else if (this.watermarks.has(key)) this.watermarks.set(key, Math.max(this.watermarks.get(key), writtenAt))
+    this.watermarks.delete(key)
   }
 
   getWriteMetrics() { return { ...this.writeMetrics } }
@@ -239,15 +301,13 @@ export class MarketStore {
     if (!Array.isArray(candles)) throw new TypeError('Candles must be an array.')
     if (!candles.length) return 0
     candles.forEach(validateCandle)
-    const writtenAt = Math.max(Date.now(), this.lastWrittenAt + 1)
-    this.lastWrittenAt = writtenAt
-    const records = [...new Map(candles.map(candle => [`${candle.instrument}:${candle.timeframe}:${candle.timestamp}`, storedCandle(candle, writtenAt)])).values()]
+    const records = [...new Map(candles.map(candle => [`${candle.instrument}:${candle.timeframe}:${candle.timestamp}`, storedCandle(candle, null)])).values()]
     return this.enqueue(async () => {
       const batches = Map.groupBy(records, candle => this.partition(candle.instrument, candle.timeframe, candle.timestamp))
       try { for (const [directory, rows] of batches) await this.publishPartition(directory, rows) }
       finally {
         for (const rows of Map.groupBy(records, row => `${row.instrument}:${row.timeframe}`).values()) {
-          this.invalidate(rows[0].instrument, rows[0].timeframe, writtenAt,
+          this.invalidate(rows[0].instrument, rows[0].timeframe,
             { from: Math.min(...rows.map(row => row.timestamp)), through: Math.max(...rows.map(row => row.timestamp)) })
         }
       }
@@ -263,15 +323,13 @@ export class MarketStore {
       validateCandle(candle)
       if (candle.instrument !== instrument || candle.timeframe !== timeframe || candle.timestamp < from || candle.timestamp > through) throw new TypeError('Replacement candle lies outside its repair range.')
     })
-    const writtenAt = Math.max(Date.now(), this.lastWrittenAt + 1)
-    this.lastWrittenAt = writtenAt
-    const records = [...new Map(candles.map(candle => [`${candle.instrument}:${candle.timeframe}:${candle.timestamp}`, storedCandle(candle, writtenAt)])).values()]
+    const records = [...new Map(candles.map(candle => [`${candle.instrument}:${candle.timeframe}:${candle.timestamp}`, storedCandle(candle, null)])).values()]
     return this.enqueue(async () => {
       try {
         for (let day = Math.floor(from / dayMS) * dayMS; day <= through; day += dayMS) {
           await this.publishPartition(this.partition(instrument, timeframe, day), records.filter(row => row.timestamp >= day && row.timestamp < day + dayMS), { replaceFrom: from, replaceThrough: through, timeframe })
         }
-      } finally { this.invalidate(instrument, timeframe, undefined, { from, through }) }
+      } finally { this.invalidate(instrument, timeframe, { from, through }) }
       return records.length
     }, priority)
   }
@@ -298,11 +356,10 @@ export class MarketStore {
     return this.enqueue(async () => {
       if (this.watermarks.has(key)) return this.watermarks.get(key)
       const files = await this.parquetFiles(instrument, timeframe)
-      let watermark = 0
-      if (files.length) {
-        const rows = (await this.connection.runAndReadAll(`SELECT MAX(COALESCE(writtenAt, 0)) AS watermark FROM ${await this.parquetRelation(files)}`)).getRowObjectsJS()
-        watermark = Number(rows[0]?.watermark ?? 0)
-      }
+      // Cache identity belongs to the committed file set, not the wall clock.
+      // A full repair can discard undecodable old files without reading their
+      // row watermarks, and clock rollback must never revive an old snapshot.
+      const watermark = this.schemaKey(files)
       this.watermarks.set(key, watermark)
       return watermark
     }, priority)
@@ -375,10 +432,11 @@ export class MarketStore {
   async inspectCandles(query, priority = 'background') {
     const { instrument, timeframe, from, through } = validateQuery(query), interval = CANDLE_INTERVALS[timeframe]
     return this.enqueue(async () => {
-      const files = await this.parquetFiles(instrument, timeframe, from, through), issues = [], present = new Set(), seen = new Set(), corruptDays = []
+      const files = await this.parquetFiles(instrument, timeframe, from, through), issues = [], present = new Set(), seen = new Map(), latest = new Map(), corruptDays = []
       let checkedRows = 0
       const issue = (reason, first, last, file, detail) => issues.push({ instrument, timeframe, source: 'candles', from: first, through: last, reason, repairable: true, ...(file ? { file } : {}), ...(detail ? { detail } : {}) })
       for (const file of files) {
+        const fileStamps = new Set()
         const date = file.match(/date=(\d{4}-\d{2}-\d{2})/)?.[1], start = Date.parse(`${date}T00:00:00Z`), end = start + dayMS - interval
         // Filesystem failures are operational errors, never a clean audit.
         await stat(file)
@@ -413,17 +471,29 @@ export class MarketStore {
             || row.high < Math.max(row.open, row.close, row.low) || row.low > Math.min(row.open, row.close, row.high)) issue('invalid-ohlc', first, last, file)
           if (typeof row.volume !== 'number' || !Number.isFinite(row.volume) || row.volume < 0
             || optionalNonnegative.some(field => row[field] != null && (typeof row[field] !== 'number' || !Number.isFinite(row[field]) || row[field] < 0))) issue('negative-volume', first, last, file)
-          if (row.baseVolume == null) issue('missing-base-volume', first, last, file, 'Base-asset volume is unavailable; refetch the source observation.')
           if (optionalInteger.some(field => row[field] != null && (!Number.isSafeInteger(row[field]) || row[field] < 0))
             || row.statisticsVersion > 2_147_483_647) issue('invalid-metadata', first, last, file)
+          const revision = Number.isSafeInteger(row.writtenAt) && row.writtenAt >= 0 ? row.writtenAt : 0
+          const current = latest.get(stamp)
+          if (!current || revision >= current.revision) latest.set(stamp, { row, first, last, file, revision })
           if (validStamp && stamp % interval === 0) {
-            if (seen.has(stamp)) issue('duplicate', stamp, stamp, file)
-            seen.add(stamp)
+            const revisions = seen.get(stamp) ?? new Set()
+            // Separate files can legitimately revise the same candle. A part
+            // is unique by timestamp; equal cross-part revisions are ambiguous.
+            if (fileStamps.has(stamp) || revisions.has(revision)) issue('duplicate', stamp, stamp, file)
+            fileStamps.add(stamp)
+            revisions.add(revision)
+            seen.set(stamp, revisions)
             // Invalid values at a real timestamp are their own anomalies,
             // rather than a second, misleading report of missing candles.
             present.add(stamp)
           }
         }
+      }
+      // Optional units may be absent before a later hydration. Audit the
+      // currently visible observation instead of refetching superseded rows.
+      for (const { row, first, last, file } of latest.values()) {
+        if (row.baseVolume == null) issue('missing-base-volume', first, last, file, 'Base-asset volume is unavailable; refetch the source observation.')
       }
       // Corrupt days already have an explicit full-partition report. Their
       // unknowable contents must not be reported again as invented gaps.

@@ -1,4 +1,5 @@
 import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { evaluateMarketOpportunity, summarizeMarketBars } from './market-metrics.js'
 import { PreparedChartPipeline } from './prepared-chart-service.js'
 import { MetadataStore, DEFAULT_PREFERENCES, validatePreferences } from './metadata-store.js'
@@ -245,6 +246,7 @@ export class MarketService {
     this.listProjectionTasks = new Map()
     this.listProjectionResults = new Map()
     this.listProjectionDataVersions = new Map()
+    this.listProjectionStoreRevisions = new Map()
     this.dataRevisions = new Map()
     this.liveCandles = new Map()
     this.candleMutations = new Map()
@@ -255,6 +257,8 @@ export class MarketService {
     this.abortControllers = new Set()
     this.shutdownController = new AbortController()
     this.revision = 0
+    this.serviceSession = randomUUID()
+    this.snapshotStatuses = new Map()
     this.catalogRevision = 0
     this.catalogSource = 'none'
     this.catalogUpdatedAt = null
@@ -309,7 +313,6 @@ export class MarketService {
         await this.updateRanking(row.instrument)
       },
       onReconnect: (subscriptions, context) => this.reconcileRealtime(subscriptions, context),
-      onState: () => { this.touchList() },
     })
     this.updateSubscriptions()
     if (this.autoRefresh && !this.closing) {
@@ -446,6 +449,7 @@ export class MarketService {
   }
 
   scheduleListProjection(instId) {
+    for (const timeframe of LIST_TIMEFRAMES) this.listProjectionStoreRevisions.set(`${instId}:${timeframe}`, this.store.candleRevision(instId, timeframe))
     this.invalidateListProjection(instId)
     for (const timeframe of this.listRows.keys()) this.track(this.projectListEntry(instId, timeframe))
   }
@@ -869,10 +873,10 @@ export class MarketService {
   onHistoryProgress(task) {
     if (this.disposed) return
     if (['completed', 'unavailable'].includes(task.status)) {
-      this.scheduleListProjection(task.instrument)
+      const key = `${task.instrument}:${task.timeframe}`, version = this.store.candleRevision(task.instrument, task.timeframe)
+      if (this.listProjectionStoreRevisions.get(key) !== version) this.scheduleListProjection(task.instrument)
       if (task.timeframe === '5m') this.track(this.updateRanking(task.instrument))
     }
-    this.touchList()
   }
 
   onHistoryReplaced(instId, timeframe) {
@@ -1242,14 +1246,13 @@ export class MarketService {
 
   listProgress(timeframe) {
     const frame = this.listTimeframe(timeframe), entries = [...this.catalog.keys()]
-    const tasks = this.history?.sync.listTasks().filter(task => entries.includes(task.instrument) && task.timeframe === frame) ?? []
     const completed = entries.filter(instId => this.listProjectionResults.has(this.listKey(instId, frame))).length
+    const progress = this.history?.sync.progressFor(entries, frame) ?? { retrying: 0, unavailable: 0 }
     return { total: entries.length, completed, pending: Math.max(0, entries.length - completed),
-      retrying: new Set(tasks.filter(task => task.status === 'retry').map(task => task.instrument)).size,
-      unavailable: new Set(tasks.filter(task => ['unavailable', 'paused'].includes(task.status)).map(task => task.instrument)).size }
+      ...progress }
   }
 
-  async snapshot(timeframe = this.prefs().chartTimeframe) {
+  async snapshot(timeframe = this.prefs().chartTimeframe, { sinceRevision, serviceSession } = {}) {
     await this.ready
     this.pruneCatalog()
     const frame = this.ensureListRows(timeframe)
@@ -1259,9 +1262,13 @@ export class MarketService {
         refreshScheduled = true
         this.track(this.refresh())
       }
-      for (const instId of this.catalog.keys()) { this.track(this.projectListEntry(instId, frame)); this.track(this.updateRanking(instId)) }
+      const asOf = closedBoundary('5m'), lookback = this.prefs().rankingLookback
+      for (const instId of this.catalog.keys()) {
+        if (this.listProjectionResults.get(this.listKey(instId, frame))?.version !== (this.listProjectionDataVersions.get(instId) ?? 0)) this.track(this.projectListEntry(instId, frame))
+        const ranking = this.rankingWindows.get(instId)?.evaluation
+        if (!ranking || ranking.asOf !== asOf || ranking.lookback !== lookback) this.track(this.updateRanking(instId))
+      }
     }
-    const rows = this.listRowsFor(frame)
     const catalogProgress = { total: this.candidateIDs?.size ?? this.catalogChecks.size, completed: this.catalogChecks.size, verified: 0, failed: 0, unknown: 0 }
     for (const record of this.catalogChecks.values()) {
       const status = record.status === 'verified' && !this.validCatalogEntry(record) ? 'unknown' : record.status
@@ -1269,10 +1276,15 @@ export class MarketService {
     }
     const unavailable = !this.catalog.size && catalogProgress.unknown > 0
       ? `Market verification is unavailable for ${catalogProgress.unknown} contracts because required observations are missing or expired. Retrying automatically.` : ''
-    return { rows, revision: this.revision, error: this.error || unavailable, loading: refreshScheduled || this.refreshing !== null || this.renewing !== null,
+    const status = { error: this.error || unavailable, loading: refreshScheduled || this.refreshing !== null || this.renewing !== null,
       catalogProgress,
       updatedAt: this.listUpdatedAt.get(frame) ?? this.catalogUpdatedAt, listProgress: this.listProgress(frame), timeframe: frame,
       catalogSource: this.catalogSource, realtimeState: this.realtime?.getState().status ?? 'disconnected' }
+    const signature = JSON.stringify(status)
+    if (this.snapshotStatuses.get(frame) !== signature) { this.snapshotStatuses.set(frame, signature); this.touchList() }
+    const metadata = { ...status, revision: this.revision, serviceSession: this.serviceSession }
+    if (serviceSession === this.serviceSession && sinceRevision === this.revision) return { ...metadata, unchanged: true }
+    return { ...metadata, rows: this.listRowsFor(frame) }
   }
 
   dispose() {

@@ -424,6 +424,50 @@ test('live projections emit current math and confirmation clears live only after
   } finally { await f.close() }
 })
 
+test('warm ticks never traverse a resident full history, including after a confirmed append', async () => {
+  const f = await fixture(), first = Date.UTC(2024, 0, 1)
+  const source = Array.from({ length: 1_000 }, (_, index) => candle(first + index * hour, index))
+  try {
+    await f.store.appendCandles(source)
+    await f.pipeline.local(instId, '1H')
+    const state = f.pipeline.series.get(`${instId}:1H`), keys = state.rows.keys
+    const calculations = f.pipeline.nextCalculation
+    const live = { ...candle(first + 1_000 * hour, 1_000), confirmed: false }
+    state.rows.keys = () => { throw new Error('A warm tick traversed the complete native history.') }
+    try {
+      for (const delta of [0, .1, .2]) {
+        const revised = { ...live, close: live.close + delta, high: live.high + delta, volume: live.volume + delta }
+        const frame = await f.pipeline.setLive(instId, '1H', revised)
+        assert.equal(frame.liveBar.ema, barsWithIndicators([...source, revised], hour).at(-1)?.ema)
+      }
+    } finally { state.rows.keys = keys }
+    assert.equal(f.pipeline.nextCalculation, calculations)
+
+    const confirmed = { ...live, confirmed: true }
+    source.push(confirmed)
+    await f.persist([confirmed])
+    assert.equal(f.pipeline.latest(state), confirmed.timestamp)
+    const next = { ...candle(confirmed.timestamp + hour, 1_001), confirmed: false }
+    state.rows.keys = () => { throw new Error('An appended confirmation caused a full-history scan on its next tick.') }
+    try {
+      const frame = await f.pipeline.setLive(instId, '1H', next)
+      assert.equal(frame.liveBar.ema, barsWithIndicators([...source, next], hour).at(-1)?.ema)
+    } finally { state.rows.keys = keys }
+    assert.equal(f.pipeline.nextCalculation, calculations)
+
+    source[500] = { ...source[500], close: 111, high: 112 }
+    await f.persist([source[500]])
+    const corrected = await f.pipeline.local(instId, '1H', { force: true })
+    assert.equal(corrected.endHour, confirmed.timestamp)
+    assert.equal(corrected.bars.at(-1).ema, barsWithIndicators(source, hour).at(-1)?.ema)
+    f.pipeline.invalidate(instId, '1H')
+    assert.equal(f.pipeline.latest(state), null)
+    const reloaded = await f.pipeline.local(instId, '1H', { force: true })
+    assert.equal(reloaded.endHour, confirmed.timestamp)
+    assert.equal(f.pipeline.latest(state), confirmed.timestamp)
+  } finally { await f.close() }
+})
+
 test('source corrections on disk invalidate snapshots across restarts', async () => {
   const f = await fixture(), first = Date.UTC(2024, 0, 1), source = Array.from({ length: 400 }, (_, index) => candle(first + index * hour, index))
   let restarted: any
