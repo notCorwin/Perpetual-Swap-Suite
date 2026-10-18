@@ -85,7 +85,7 @@ test('resource background readiness waits for committed LOAD candles after a clo
     loadWrite.release()
     const result = await ready
     assert.ok(result.writtenRecords > 0)
-    assert.ok(loadWritten(f.service) > 0)
+    await waitFor(() => loadWritten(f.service) > 0, 'History progress must catch up with the committed SQLite rows.')
     const counts = await Promise.all(['5m', '15m', '1H'].map(timeframe => f.store.coverage(loadInstrument, timeframe)))
     assert.ok(counts.some(coverage => coverage.count > 0), 'Readiness requires actual SQLite LOAD rows.')
     const final = await fixture.stop(); fixture = null
