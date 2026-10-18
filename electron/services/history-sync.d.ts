@@ -16,6 +16,8 @@ export type HistoryTask = HistoryRange & {
   status: HistoryTaskStatus
   createdAt: number
   updatedAt: number
+  /** Latest rolling goal admission, independent of page checkpoints and exact-range reuse. */
+  targetRequestedAt?: number
   nextAttemptAt: number | null
   attempts: number
   cursor: string | number | null

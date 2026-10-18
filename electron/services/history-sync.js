@@ -5,6 +5,7 @@ const statuses = new Set(['queued', 'running', 'retry', 'paused', 'cancelled', '
 const terminal = new Set(['paused', 'cancelled', 'completed', 'unavailable'])
 const expirable = new Set(['cancelled', 'completed', 'unavailable'])
 const foregroundReady = Symbol('Foreground history is ready for the source lane.')
+const foregroundBurst = 8
 const clone = value => structuredClone(value)
 const integer = (value, name, minimum = 0) => {
   if (!Number.isSafeInteger(value) || value < minimum) throw new TypeError(`${name} must be a safe integer of at least ${minimum}.`)
@@ -88,6 +89,7 @@ export class HistorySync {
     this.draining = null
     this.timer = null
     this.active = new Map()
+    this.foregroundPages = new Map()
     this.wakeDrain = null
     this.lastRequestAt = null
     this.requestTail = Promise.resolve()
@@ -116,6 +118,7 @@ export class HistorySync {
       integer(task.updatedAt, 'updatedAt')
       integer(task.attempts, 'attempts')
       integer(task.writtenRecords, 'writtenRecords')
+      if (task.targetRequestedAt !== undefined) integer(task.targetRequestedAt, 'targetRequestedAt')
       if (typeof task.inspected !== 'boolean' || (task.lastError !== null && typeof task.lastError !== 'string')) throw new TypeError('Invalid persisted history progress.')
       if (!this.sources.has(task.source)) throw new TypeError(`History source is unavailable: ${task.source}.`)
       if (task.nextAttemptAt !== null) integer(task.nextAttemptAt, 'nextAttemptAt')
@@ -135,7 +138,19 @@ export class HistorySync {
         await this.save(task)
       }
     }
-    await this.pruneTerminalTasks()
+    // Older versions admitted a new thirty-day target at every boundary.
+    // Restore only the newest rolling goal before any source starts; exact
+    // requests retain their independent completion and priority semantics.
+    const latest = new Map()
+    for (const task of this.tasks.values()) {
+      if (!this.isRollingTarget(task) || task.status === 'cancelled') continue
+      const identity = this.rollingTargetKey(task)
+      const previous = latest.get(identity)
+      const requestedAt = value => value.targetRequestedAt ?? value.createdAt
+      if (!previous || requestedAt(task) > requestedAt(previous)
+        || requestedAt(task) === requestedAt(previous) && task.through >= previous.through) latest.set(identity, task)
+    }
+    await this.supersedeRollingTargets(latest)
   }
 
   async enqueue(input) {
@@ -153,6 +168,9 @@ export class HistorySync {
     // barrier. Same-source pages still recheck durable coverage before fetching.
     let task = this.tasks.get(id)
     if (task) {
+      // An exact caller owns this completion even before it registers its
+      // waiter. A rolling goal must never retire that accepted request.
+      if (purpose === 'requested') task.purpose = 'requested'
       if (requestedPriority === 'foreground') task.priority = 'foreground'
       if (['paused', 'cancelled', 'completed'].includes(task.status)) {
         task.status = 'queued'
@@ -183,11 +201,55 @@ export class HistorySync {
     const asOf = integer(input.asOf ?? this.timestamp(), 'asOf', intervalMS)
     const through = Math.floor(asOf / intervalMS) * intervalMS - intervalMS
     const from = Math.max(0, through - historyDays * 86_400_000 + intervalMS)
-    const history = await this.enqueue({ ...identity, from, through, priority: input.priority, purpose: 'history' })
-    const warmup = warmupCandles && from >= intervalMS
-      ? await this.enqueue({ ...identity, from: Math.max(0, from - warmupCandles * intervalMS), through: from - intervalMS, priority: input.priority, purpose: 'warmup' })
-      : null
-    return { history, warmup }
+    await this.start()
+    // Serialize target admission, not fetching. A concurrent boundary or
+    // retention edit must finish replacing both goals before the next edit.
+    const admission = (this.targetTail ?? Promise.resolve()).then(async () => {
+      this.assertOpen()
+      const history = await this.enqueue({ ...identity, from, through, priority: input.priority, purpose: 'history' })
+      const warmup = warmupCandles && from >= intervalMS
+        ? await this.enqueue({ ...identity, from: Math.max(0, from - warmupCandles * intervalMS), through: from - intervalMS, priority: input.priority, purpose: 'warmup' })
+        : null
+      if ((input.priority ?? 'background') === 'background') {
+        // This marker tracks the goal request separately from page progress.
+        // Reusing an older exact range after a retention edit is still the
+        // newest intent, even though that task's createdAt remains unchanged.
+        const requestedAt = [...this.tasks.values()].reduce((latest, task) => Math.max(latest, (task.targetRequestedAt ?? 0) + 1), this.timestamp())
+        const latest = new Map(['history', 'warmup'].map(purpose => [this.rollingTargetKey({ ...identity, purpose }), null]))
+        for (const snapshot of [history, warmup].filter(Boolean)) {
+          const task = this.tasks.get(snapshot.id)
+          if (this.isRollingTarget(task)) {
+            task.targetRequestedAt = requestedAt
+            await this.save(task)
+          }
+          latest.set(this.rollingTargetKey({ ...identity, purpose: snapshot === history ? 'history' : 'warmup' }), task)
+        }
+        await this.supersedeRollingTargets(latest)
+      }
+      return { history, warmup }
+    })
+    this.targetTail = admission.catch(() => undefined)
+    return admission
+  }
+
+  isRollingTarget(task) { return task?.priority === 'background' && ['history', 'warmup'].includes(task.purpose) }
+
+  rollingTargetKey(task) { return JSON.stringify([task.instrument, task.timeframe, task.source, task.purpose]) }
+
+  async supersedeRollingTargets(latest) {
+    for (const task of this.tasks.values()) {
+      const identity = this.rollingTargetKey(task)
+      if (!this.isRollingTarget(task) || !latest.has(identity) || latest.get(identity)?.id === task.id
+        || expirable.has(task.status) || this.waiters.has(task.id)) continue
+      task.status = 'cancelled'
+      task.nextAttemptAt = null
+      const active = this.active.get(task.source)
+      if (active?.id === task.id) active.controller.abort()
+      await this.save(task)
+      this.settle(task)
+    }
+    await this.pruneTerminalTasks()
+    this.kick()
   }
 
   getTask(id) {
@@ -363,15 +425,18 @@ export class HistorySync {
         const timestamp = this.timestamp()
         const ready = [...this.tasks.values()].filter(task => !this.active.has(task.source)
           && (task.status === 'queued' || (task.status === 'retry' && task.nextAttemptAt <= timestamp)))
-          .sort((a, b) => Number(b.priority === 'foreground') - Number(a.priority === 'foreground'))
+          .sort((a, b) => this.admissionPriority(b) - this.admissionPriority(a))
         for (const task of ready) {
           if (this.active.size >= this.maxConcurrentTasks) break
           if (this.active.has(task.source)) continue
-          const entry = { id: task.id, controller: new AbortController(), promise: null }
+          const entry = { id: task.id, controller: new AbortController(), promise: null,
+            backgroundTurn: task.priority === 'background' && this.admissionPriority(task) === 2, yielded: false }
           this.active.set(task.source, entry)
           entry.promise = this.run(task, entry.controller).catch(error => this.fail(error)).finally(() => {
             this.settle(task)
             this.active.delete(task.source)
+            if (!entry.yielded) this.foregroundPages.set(task.source, task.priority === 'foreground'
+              ? Math.min(foregroundBurst, (this.foregroundPages.get(task.source) ?? 0) + 1) : 0)
             // Move the just-served target behind its peers even when every
             // page has the same createdAt or the target spans thirty days.
             this.tasks.delete(task.id)
@@ -399,6 +464,13 @@ export class HistorySync {
     }
   }
 
+  admissionPriority(task) {
+    // A continuously renewed foreground universe must leave room for durable
+    // history. The allowance is per source, so a busy candle lane cannot
+    // penalize OI or Taker, and each allowance covers only one bounded page.
+    return task.priority === 'foreground' ? 1 : (this.foregroundPages.get(task.source) ?? 0) >= foregroundBurst ? 2 : 0
+  }
+
   async callSource(operation, signal, task) {
     let response
     const admission = this.requestTail.then(async () => {
@@ -410,7 +482,8 @@ export class HistorySync {
       signal.throwIfAborted()
       // Foreground repairs preempt their own source only. Other active sources
       // may depend on this background page, so cross-source yielding can starve.
-      if (task.priority === 'background' && [...this.tasks.values()].some(value => value.source === task.source && value.priority === 'foreground'
+      if (task.priority === 'background' && !this.active.get(task.source)?.backgroundTurn
+        && [...this.tasks.values()].some(value => value.source === task.source && value.priority === 'foreground'
         && (value.status === 'queued' || (value.status === 'retry' && value.nextAttemptAt <= this.timestamp())))) throw foregroundReady
       // Record after synchronous admission so a CPU pause before the source
       // starts cannot shorten the interval before the next request. HTTP
@@ -495,6 +568,7 @@ export class HistorySync {
       await this.save(task)
     } catch (error) {
       if (signal.aborted || error === foregroundReady) {
+        if (error === foregroundReady) this.active.get(task.source).yielded = true
         if (task.status === 'running') {
           task.status = 'queued'
           await this.save(task)
@@ -565,6 +639,9 @@ export class HistorySync {
     this.idleWaiters.splice(0).forEach(waiter => waiter.reject(error))
     this.closing = (async () => {
       await this.started?.catch(() => undefined)
+      // An admitted goal can still checkpoint its request marker and retire
+      // previous ranges after enqueue() finishes its first persistence wait.
+      await this.targetTail
       await this.draining
       await this.persistTail
     })()

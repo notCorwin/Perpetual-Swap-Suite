@@ -286,6 +286,18 @@ test('REST initialization admits two explicit observations and leaves gap covera
   } finally { await history.close() }
 })
 
+test('background statistics promote only their bounded price dependency so their source lanes can finish', async () => {
+  const { history } = setup()
+  try {
+    await history.ensureStatistics(instId, '5m', base, base + 200 * interval, 'background')
+    const tasks = history.sync.listTasks()
+    const dependencies = tasks.filter(task => task.source === 'candles' && task.priority === 'foreground')
+    assert.ok(dependencies.length >= 3)
+    assert.ok(dependencies.every(task => (task.through - task.from) / interval < 100))
+    assert.ok(tasks.filter(task => task.source !== 'candles').every(task => task.priority === 'background' && task.status === 'completed'))
+  } finally { await history.close() }
+})
+
 test('background targets immediately admit every source and start three HTTP lanes before price history finishes', { timeout: 5_000 }, async () => {
   let started!: () => void
   const entered = new Promise<void>(resolve => { started = resolve })
