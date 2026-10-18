@@ -100,6 +100,7 @@ function App() {
       if (!visible()) { queued = true; return }
       working = true
       queued = false
+      let failed = false
       try {
         // Effect replacements share the outstanding IPC request until it
         // settles, but each response still belongs to its original effect.
@@ -135,6 +136,7 @@ function App() {
         backoff = 2000
       } catch (cause) {
         if (stopped) return
+        failed = true
         setError(message(cause)); setStatus('Reconnecting'); setRealtime('Disconnected')
         setCatalog(current => ({ ...current, loading: false }))
         backoff = Math.min(backoff * 2, 30_000)
@@ -142,7 +144,7 @@ function App() {
         working = false
         if (!stopped && visible()) {
           if (queued) void load()
-          else timer = window.setTimeout(load, backoff)
+          else if (failed) timer = window.setTimeout(load, backoff)
         }
       }
     }

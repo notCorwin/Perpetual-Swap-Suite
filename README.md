@@ -54,6 +54,8 @@ The 24h trading-volume check sums actual quote volume from **288 completed 5m ca
 
 All eligible USDT perpetual contracts receive live streams independently of liquidity filters, historical preparation, search, and chart selection. Prices publish immediately; fresh depth, spread, and open-interest observations recheck qualification in short batches. Exact depth/slippage calculations run in a worker, coalescing new observations while preserving each result's original freshness lease. Instrument metadata uses a bootstrap/reconnect REST snapshot plus the global SWAP instruments subscription. Incremental listing, parameter, suspension, and delisting events update the universe directly; healthy collection does not periodically rescan it. Missing or expired data stays unqualified while acquisition continues.
 
+The contract list loads once and then follows desktop change notifications. Healthy snapshots do not poll or start background requests; a hidden workspace resynchronizes when shown, and failed IPC reads keep bounded retries. Required observation leases and native candle boundaries invalidate qualification at their actual deadlines. A ranking whose current completed interval is missing stays unavailable until that close is persisted.
+
 ## Charts and indicators
 
 Select a contract and choose **5m**, **15m**, or **1h**. The default chart timeframe is **15m**. The main chart contains candlesticks, EMA(200), BOLL(20, 2), and VWAP(14). Separate panels show ROC(9) + MAROC(9), RSI(6/12/24), Open Interest in contracts, and Taker Buy/Sell in contracts.

@@ -17,7 +17,7 @@ before(async () => {
   await page.waitForLoadState('domcontentloaded')
   // Stub only the desktop boundary. These renderer checks remain independent
   // of source downloads, persistence workers, and any configured AI service.
-  await electron.evaluate(({ ipcMain }) => {
+  await electron.evaluate(({ ipcMain, BrowserWindow }) => {
     const preferences = { chartTimeframe: '15m', rankingLookback: 15, historyDays: 30, liquidity: {
       spread: { enabled: true, maxPercent: .05 }, depth: { enabled: true, minUSDT: 100_000 },
       slippage: { enabled: true, maxPercent: .1, notionalUSDT: 100_000 }, volume24h: { enabled: true, minUSDT: 30_000_000 },
@@ -27,8 +27,9 @@ before(async () => {
       instId: `${symbol}-USDT-SWAP`, price: 100, lastPrice: 100, rankingChange, rankingAsOf: 1_800_000_000_000,
       turnover24hUSDT: 50_000_000,
     }))
-    const state = globalThis.__workspaceFixture = { preferences, rows, initialRows: rows, requests: [], revision: 1, loading: false, error: '', catalogSource: 'live', catalogProgress: undefined, failNextSave: false, staleNextSnapshot: false, staleReplies: 0, chartGeneration: 1, bollMode: 'standard', holdNextSnapshot: false, releaseSnapshot: null, snapshotActive: 0, snapshotMaximum: 0,
+    const state = globalThis.__workspaceFixture = { preferences, rows, initialRows: rows, requests: [], revision: 1, loading: false, error: '', catalogSource: 'live', catalogProgress: undefined, failNextSave: false, failSnapshots: 0, staleNextSnapshot: false, staleReplies: 0, chartGeneration: 1, bollMode: 'standard', holdNextSnapshot: false, releaseSnapshot: null, snapshotActive: 0, snapshotMaximum: 0,
       audit: { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '' } }
+    state.notify = () => BrowserWindow.getAllWindows()[0].webContents.send('radar:market-changed')
     const prepared = ({ instId, timeframe }) => {
       const intervalMS = timeframe === '1H' ? 3_600_000 : timeframe === '15m' ? 900_000 : 300_000
       const endHour = Math.floor(Date.UTC(2026, 9, 18) / intervalMS) * intervalMS
@@ -55,6 +56,7 @@ before(async () => {
         return state.preferences
       }
       if (value.snapshot) {
+        if (state.failSnapshots > 0) { state.failSnapshots--; throw new Error('Snapshot temporarily unavailable.') }
         const stale = state.staleNextSnapshot
         state.staleNextSnapshot = false
         if (stale) state.staleReplies += 1
@@ -150,6 +152,68 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow).length), before, 'A pushed forming candle must update the prepared chart without a window request.')
 })
 
+test('a healthy idle market list makes no periodic snapshot requests', async () => {
+  await page.waitForFunction(() => document.querySelectorAll('[data-market-index]').length === 4)
+  const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length)
+  await new Promise(resolve => setTimeout(resolve, 2_250))
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before,
+    'Successful market reads must wait for a notification, action, or visibility change.')
+})
+
+test('snapshot failures retry with bounded backoff and stop scheduling after recovery', async () => {
+  try {
+    await page.evaluate(() => {
+      const timeout = window.setTimeout.bind(window), clear = window.clearTimeout.bind(window)
+      const pending = new Map(), delays = []
+      let next = 1_000_000_000
+      // Advance only the snapshot error deadlines. Other UI clocks and native
+      // event delivery keep running normally throughout this Electron test.
+      window.setTimeout = (handler, delay, ...args) => {
+        if (typeof handler !== 'function' || ![4_000, 8_000, 16_000, 30_000].includes(delay)) return timeout(handler, delay, ...args)
+        const id = ++next
+        delays.push(delay); pending.set(id, () => handler(...args))
+        return id
+      }
+      window.clearTimeout = id => { pending.delete(id); clear(id) }
+      globalThis.__snapshotRetryClock = { delays, pending, runNext() {
+        const [id, run] = pending.entries().next().value ?? []
+        if (!run) throw new Error('No snapshot retry deadline was scheduled.')
+        pending.delete(id); run()
+      }, restore() { window.setTimeout = timeout; window.clearTimeout = clear; pending.clear() } }
+    })
+    const before = await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      const before = state.requests.filter(value => value.snapshot).length
+      state.failSnapshots = 5
+      state.rows = state.rows.map(row => row.instId === 'BETA-USDT-SWAP' ? { ...row, lastPrice: 204 } : row)
+      state.revision += 1; state.notify()
+      return before
+    })
+    const delays = [4_000, 8_000, 16_000, 30_000, 30_000]
+    for (let index = 0; index < delays.length; index++) {
+      await page.waitForFunction(index => globalThis.__snapshotRetryClock.delays.length === index + 1 && globalThis.__snapshotRetryClock.pending.size === 1, index)
+      assert.deepEqual(await page.evaluate(() => globalThis.__snapshotRetryClock.delays), delays.slice(0, index + 1))
+      assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before + index + 1,
+        'A failed request must wait for its single retry deadline.')
+      await page.evaluate(() => globalThis.__snapshotRetryClock.runNext())
+    }
+    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '204')
+    await page.getByRole('alert').filter({ hasText: 'Snapshot temporarily unavailable.' }).waitFor({ state: 'hidden' })
+    assert.equal(await page.evaluate(() => globalThis.__snapshotRetryClock.pending.size), 0)
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before + 6)
+    await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.failSnapshots = 1; state.notify() })
+    await page.waitForFunction(() => globalThis.__snapshotRetryClock.delays.length === 6)
+    assert.equal(await page.evaluate(() => globalThis.__snapshotRetryClock.delays.at(-1)), 4_000, 'Recovery resets the error backoff.')
+    await page.evaluate(() => globalThis.__snapshotRetryClock.runNext())
+    await page.getByRole('alert').filter({ hasText: 'Snapshot temporarily unavailable.' }).waitFor({ state: 'hidden' })
+    assert.equal(await page.evaluate(() => globalThis.__snapshotRetryClock.pending.size), 0)
+  } finally {
+    await page.evaluate(() => { globalThis.__snapshotRetryClock?.restore(); delete globalThis.__snapshotRetryClock })
+    await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.failSnapshots = 0; state.rows = state.initialRows; state.revision += 1; state.notify() })
+    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100')
+  }
+})
+
 test('market notifications refresh immediately and coalesce changes arriving during one snapshot request', async () => {
   try {
     await electron.evaluate(({ BrowserWindow }) => {
@@ -162,7 +226,7 @@ test('market notifications refresh immediately and coalesce changes arriving dur
     })
     const deadline = Date.now() + 1_000
     while (!(await electron.evaluate(() => Boolean(globalThis.__workspaceFixture.releaseSnapshot)))) {
-      assert.ok(Date.now() < deadline, 'A market notification must request a snapshot before the two-second poll.')
+      assert.ok(Date.now() < deadline, 'A market notification must request a snapshot without waiting for a timer.')
       await new Promise(resolve => setTimeout(resolve, 10))
     }
     const blockedCount = await electron.evaluate(({ BrowserWindow }) => {
@@ -362,6 +426,7 @@ test('ranking changes keep the chosen chart while long lists retain keyboard and
     const state = globalThis.__workspaceFixture
     state.rows = state.rows.map(row => row.instId === 'ZETA-USDT-SWAP' ? { ...row, rankingChange: 4 } : row)
     state.revision += 1
+    state.notify()
   })
   await page.waitForFunction(() => document.querySelector('[data-market-index="0"]')?.getAttribute('aria-label') === 'View ZETA-USDT-SWAP chart')
   assert.equal(await selected().getAttribute('aria-label'), 'View BETA-USDT-SWAP chart', 'A ranking reorder must preserve the chosen contract.')
@@ -371,6 +436,7 @@ test('ranking changes keep the chosen chart while long lists retain keyboard and
       instId: `AUX${String(index).padStart(3, '0')}-USDT-SWAP`, price: 10, lastPrice: 10, rankingChange: 0, rankingAsOf: 1_800_000_000_000, turnover24hUSDT: 50_000_000,
     }))]
     state.revision += 1
+    state.notify()
   })
   await page.waitForFunction(() => document.querySelector('[data-total-market-count]')?.getAttribute('data-total-market-count') === '100')
   const headerBefore = await page.locator('[data-market-list] thead').boundingBox()
@@ -390,7 +456,7 @@ test('ranking changes keep the chosen chart while long lists retain keyboard and
   assert.equal(await page.locator('[data-market-index]').count(), 1, 'Filtering a scrolled virtual list must reveal its surviving row.')
   assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
   await page.getByRole('textbox', { name: 'Search contracts' }).fill('')
-  await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.rows = state.initialRows; state.revision += 1 })
+  await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.rows = state.initialRows; state.revision += 1; state.notify() })
   await page.waitForFunction(() => document.querySelector('[data-total-market-count]')?.getAttribute('data-total-market-count') === '4')
 })
 
@@ -415,11 +481,11 @@ test('constant Bollinger bands stay finite and negative lower bands explicitly s
   } finally { await publishMode('standard') }
 })
 
-test('a rejected old snapshot keeps polling, and qualification changes select the next contract or the empty state', async () => {
-  await electron.evaluate(() => { globalThis.__workspaceFixture.staleNextSnapshot = true })
+test('a rejected old snapshot preserves notification delivery and qualification changes select the next contract or the empty state', async () => {
+  await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.staleNextSnapshot = true; state.notify() })
   const deadline = Date.now() + 10_000
   while (!(await electron.evaluate(() => globalThis.__workspaceFixture.staleReplies))) {
-    assert.ok(Date.now() < deadline, 'The renderer did not poll the pending stale snapshot.')
+    assert.ok(Date.now() < deadline, 'The renderer did not read the notified stale snapshot.')
     await new Promise(resolve => setTimeout(resolve, 25))
   }
   assert.equal(await selected().getAttribute('aria-label'), 'View BETA-USDT-SWAP chart', 'An old empty snapshot cannot clear the current selection.')
@@ -427,12 +493,13 @@ test('a rejected old snapshot keeps polling, and qualification changes select th
     const state = globalThis.__workspaceFixture
     state.rows = state.rows.filter(row => row.instId !== 'BETA-USDT-SWAP')
     state.revision += 1
+    state.notify()
     return state.requests.filter(value => value.snapshot).length
   })
   await page.locator('[data-market-index][aria-selected="true"][aria-label="View ZETA-USDT-SWAP chart"]').waitFor()
-  assert.ok(await electron.evaluate((_electron, count) => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length > count, requestsAtStaleReply), 'Rejecting one stale snapshot must not stop subsequent polling.')
+  assert.ok(await electron.evaluate((_electron, count) => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length > count, requestsAtStaleReply), 'Rejecting one stale snapshot must not stop subsequent notifications.')
   await page.locator('[data-chart-inst="ZETA-USDT-SWAP"]').waitFor()
-  await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.rows = []; state.revision += 1 })
+  await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.rows = []; state.revision += 1; state.notify() })
   await page.locator('[data-market-list]').getByText('No qualified contracts', { exact: true }).waitFor()
   await page.locator('[data-chart-panel]').getByText('No qualified contracts', { exact: true }).waitFor()
   assert.equal(await page.locator('[data-chart-inst]').count(), 0)
@@ -445,6 +512,7 @@ test('empty snapshots distinguish startup, verification failures, confirmed excl
     const state = globalThis.__workspaceFixture
     Object.assign(state, values)
     state.revision += 1
+    state.notify()
   }, values)
   const assertEmpty = async title => {
     await page.locator('[data-market-list]').getByText(title, { exact: true }).waitFor()
@@ -498,6 +566,7 @@ test('completed unknown qualification does not report pending acquisition during
       state.catalogSource = 'live'
       state.catalogProgress = { total: 4, completed: 4, verified: 0, failed: 0, unknown: 4, pending: 0 }
       state.revision += 1
+      state.notify()
     })
     await page.locator('[data-market-list]').getByText('Market verification unavailable', { exact: true }).waitFor()
     await page.locator('[data-market-list]').getByText('Incomplete', { exact: true }).waitFor()
@@ -509,6 +578,7 @@ test('completed unknown qualification does not report pending acquisition during
       const state = globalThis.__workspaceFixture
       Object.assign(state, { rows: state.initialRows, loading: false, error: '', catalogSource: 'live', catalogProgress: undefined })
       state.revision += 1
+      state.notify()
     })
     await page.locator('[data-market-index]').first().waitFor({ state: 'visible' })
   }
@@ -519,6 +589,7 @@ test('temporary qualification gaps preserve the current chart and interaction un
     const state = globalThis.__workspaceFixture
     Object.assign(state, values)
     state.revision += 1
+    state.notify()
   }, values)
   const assertRetained = async (title, status) => {
     await page.locator('[data-market-list]').getByText(title, { exact: true }).waitFor()

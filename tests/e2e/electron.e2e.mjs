@@ -206,7 +206,7 @@ test('cached catalog projection retains statistics while the list shows contract
   assert.notEqual(projected.rsi6, null)
   assert.notEqual(projected.ema200Signal, null)
 
-  // Reload so React obtains the row through exactly the same polling path as
+  // Reload so React obtains the row through the same initial snapshot read as
   // an app user, then inspect the rendered table instead of the IPC object.
   await page.reload({ waitUntil: 'domcontentloaded' })
   const market = page.locator(`[aria-label="View ${fixture.instId} chart"]`)
@@ -266,7 +266,10 @@ test('prepared native chart pages preserve canonical indicator values across eve
       }
     }
     const requests = await readRequestProbe(electron)
-    assert.deepEqual(requests.sourceRequests.filter(call => call.path !== '/market/candles'), [], 'Complete durable periods must not be downloaded again; latest two-candle refreshes remain independent.')
+    const redundant = requests.sourceRequests.filter(call => call.path !== '/market/candles'
+      && !(call.path === '/market/history-candles' && call.parameters.bar === '5m'
+        && Number(call.parameters.after) - Number(call.parameters.limit) * 300_000 > fixture.end))
+    assert.deepEqual(redundant, [], 'Complete durable chart periods must not be downloaded again. Independent ranking admission may repair its missing current 5m window, beyond this historical fixture.')
   } finally { await removeRequestProbe(electron) }
 })
 
