@@ -77,10 +77,14 @@ test('an importer crash rejects pending legacy reads without killing SQLite or l
     store = await MarketStore.open(root)
     await (store as any).migrationReady
     const importer = (store as any).migration
+    assert.equal(importer.exitCode, null)
+    const exited = once(importer, 'exit')
     const read = store.candles(query)
-    const rejected = assert.rejects(read, /SIGKILL|exited|closed|EPIPE/i)
-    importer.kill('SIGKILL')
+    // The crash may reject through IPC or process exit, with OS-specific errors.
+    const rejected = assert.rejects(read, Error)
+    assert.equal(importer.kill('SIGKILL'), true)
     await rejected
+    assert.deepEqual(await exited, [null, 'SIGKILL'])
     await store.appendCandles([{ ...row(0, 250), oi: undefined, buy: undefined, sell: undefined, statisticsVersion: undefined }])
     assert.equal((await store.coverage(query.instrument, query.timeframe)).count, 1)
     assert.equal((await store.migrationStatus()).complete, false)
