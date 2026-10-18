@@ -55,15 +55,17 @@ export async function openChart(page, fixture, timeframe = fixture.timeframe) {
 // treating the requested viewport or an aggregate loading flag as a paint.
 // __chartSnapshot is a reference to the rendered object; it avoids serializing
 // 96 full bars into an attribute on every production animation frame.
-export async function startPaintProbe(page, fixture) {
-  await page.evaluate(({ instId, series }) => {
+export async function startPaintProbe(page, fixture, { requireMatureData = false } = {}) {
+  await page.evaluate(({ instId, series, requireMatureData }) => {
     const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
     if (!(chart instanceof HTMLElement)) throw new Error('No chart surface to inspect.')
     const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell']
+    const indicatorFields = fields.slice(4, 14), statisticFields = ['oi', 'buy', 'sell']
     const oracles = Object.fromEntries(Object.entries(series).map(([frame, entry]) => [frame, new Map(entry.bars.map(bar => [bar.hour, bar]))]))
     const probe = {
       active: true, frames: 0, pendingFrames: 0, paints: 0, minimumBars: Infinity, errors: [],
       frameGaps: [], commits: [], previousFrame: null, previousSnapshot: null,
+      phase: 'initial', quality: [], known: new Map(), geometry: new Map(),
       raf: null, observer: null,
     }
     const fail = message => { if (probe.errors.length < 20) probe.errors.push(message) }
@@ -85,6 +87,26 @@ export async function startPaintProbe(page, fixture) {
         const requestedEnd = Number(chart.dataset.chartRequestedEnd)
         if (chart.dataset.chartLoading === 'false' && requestedEnd > 0 && requestedEnd !== snapshot.endHour) fail('The chart claims completion for a different requested range.')
       }
+      // Plot geometry may change without a new snapshot (for example during
+      // an effect). Check actual paths before the immutable-snapshot shortcut.
+      if (Array.isArray(bars)) {
+        const firstAtLeft = bars[0]?.hour === bars.at(-1)?.hour - 95 * snapshot.intervalMS
+        for (const field of [...indicatorFields, 'oi']) {
+          const samples = bars.filter(bar => typeof bar[field] === 'number' && Number.isFinite(bar[field])).length
+          const path = svg.querySelector(`[data-chart-indicator="${field}"]`), d = path?.getAttribute('d') ?? ''
+          if (samples > 1 && !d) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} lost its ${field} SVG curve with ${samples} known samples.`)
+          if (probe.geometry.get(field) === d && snapshot === probe.previousSnapshot) continue
+          probe.geometry.set(field, d)
+          const points = (d.match(/[ML]/g) ?? []).length
+          const expectedPoints = samples + (firstAtLeft && Number.isFinite(bars[0]?.[field]) ? 1 : 0)
+          if (points !== expectedPoints) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${points} points for ${expectedPoints} known positions.`)
+        }
+        if (requireMatureData) {
+          for (const field of indicatorFields) if (!svg.querySelector(`[data-chart-indicator="${field}"]`)?.getAttribute('d')) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} has no ${field} SVG curve for mature local history.`)
+          if (svg.querySelector('[data-chart-oi]')?.getAttribute('data-chart-oi') !== 'complete') fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} lost complete OI geometry.`)
+          if (svg.querySelector('[data-chart-taker]')?.getAttribute('data-chart-taker') !== 'complete') fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} lost complete Taker geometry.`)
+        }
+      }
       if (snapshot === probe.previousSnapshot) {
         if (frame && probe.commits.at(-1)?.presentedAt === null) probe.commits.at(-1).presentedAt = performance.now()
         return
@@ -97,7 +119,9 @@ export async function startPaintProbe(page, fixture) {
       // A mutation is a React commit; the following animation frame is the
       // first paint opportunity that includes that committed SVG. Keep both
       // times so input latency does not mistake a DOM mutation for a frame.
-      probe.commits.push({ at: performance.now(), presentedAt: frame ? performance.now() : null, end: snapshot.endHour, timeframe })
+      probe.commits.push({ at: performance.now(), presentedAt: frame ? performance.now() : null, end: snapshot.endHour, timeframe, phase: probe.phase })
+      probe.quality.push({ phase: probe.phase, end: snapshot.endHour, timeframe, indicators: bars.filter(bar => indicatorFields.every(field => Number.isFinite(bar[field]))).length,
+        oi: bars.filter(bar => Number.isFinite(bar.oi)).length, taker: bars.filter(bar => Number.isFinite(bar.buy) && Number.isFinite(bar.sell)).length })
       if (bars.length !== 96) fail(`Rendered ${bars.length} bars for ${timeframe}.`)
       if (snapshot.instId !== instId || svg.dataset.renderedInst !== instId) fail('Mixed instrument in the rendered surface.')
       if (svg.dataset.renderedTimeframe !== timeframe) fail('SVG and snapshot timeframes disagree.')
@@ -107,7 +131,19 @@ export async function startPaintProbe(page, fixture) {
         const expected = oracles[timeframe]?.get(bar.hour)
         if (!expected) { fail(`Unexpected ${timeframe} timestamp ${bar.hour}.`); continue }
         if (index && bar.hour - bars[index - 1].hour !== intervalMS) fail(`Noncontiguous ${timeframe} candles at ${bar.hour}.`)
-        for (const field of fields.filter(field => ['open', 'high', 'low', 'close'].includes(field) || ['oi', 'buy', 'sell'].includes(field) ? !['oi', 'buy', 'sell'].includes(field) || bar.statisticsObserved : bar.indicatorsObserved)) {
+        const key = `${timeframe}:${snapshot.generation}:${bar.hour}`, previous = probe.known.get(key)
+        const samePrice = previous && ['open', 'high', 'low', 'close'].every(field => previous[field] === bar[field])
+        if (samePrice) for (const field of [...indicatorFields, ...statisticFields]) {
+          if (Number.isFinite(previous[field]) && !Number.isFinite(bar[field])) fail(`${probe.phase}: ${key} downgraded previously drawn ${field} from ${previous[field]} to ${bar[field]} without a price change.`)
+        }
+        probe.known.set(key, { ...bar })
+        for (const field of fields.filter(field => {
+          if (['open', 'high', 'low', 'close'].includes(field)) return true
+          if (requireMatureData && Number.isFinite(expected[field])) return true
+          if (field === 'oi') return bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)
+          if (field === 'buy' || field === 'sell') return bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2)
+          return bar.indicatorsObserved
+        })) {
           const actual = bar[field], wanted = expected[field]
           if (wanted === null) {
             if (actual !== null) fail(`${timeframe} ${bar.hour} ${field}: expected missing, got ${actual}.`)
@@ -139,7 +175,7 @@ export async function startPaintProbe(page, fixture) {
     sample()
     probe.raf = requestAnimationFrame(frame)
     window.__chartPaintProbe = probe
-  }, { instId: fixture.instId, series: fixture.series })
+  }, { instId: fixture.instId, series: fixture.series, requireMatureData })
 }
 
 export async function finishPaintProbe(page) {
@@ -156,7 +192,7 @@ export async function finishPaintProbe(page) {
     }
     return {
       frames: probe.frames, pendingFrames: probe.pendingFrames, paints: probe.paints, minimumBars: probe.minimumBars,
-      violations: probe.errors, commits: probe.commits,
+      violations: probe.errors, commits: probe.commits, quality: probe.quality,
       p95FrameGapMS: Number(percentile(probe.frameGaps, .95).toFixed(3)),
       maxFrameGapMS: Number(Math.max(0, ...probe.frameGaps).toFixed(3)),
       droppedFrames: probe.frameGaps.filter(gap => gap > 25).length,

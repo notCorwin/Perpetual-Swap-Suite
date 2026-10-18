@@ -304,3 +304,234 @@ test('in-flight local SQLite reads remain admitted while other series exceed the
     assert.ok(pipeline.series.size <= 1, 'Temporary in-flight admission is released after completion.')
   } finally { hold.resolve(); await pipeline.dispose() }
 })
+
+test('rows admitted behind an in-flight historical replay are eventually calculated exactly', async () => {
+  const rows = source(3500), { pipeline, store } = fixture(rows), hold = deferred(), reached = deferred()
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const write = store.writeIndicatorCheckpoint.bind(store)
+    let blocked = false
+    store.writeIndicatorCheckpoint = async (value: any) => {
+      if (!blocked && value.timestamp === rows[1023].timestamp) { blocked = true; reached.resolve(); await hold.promise }
+      return write(value)
+    }
+    await pipeline.localHistory(instId, '15m', rows[2000].timestamp)
+    await reached.promise
+    await pipeline.localHistory(instId, '15m', rows[600].timestamp)
+    hold.resolve(); await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`), frame = pipeline.historyFrame(state, rows[600].timestamp)
+    const oracle = new Map(buildIndicatorSeries(rows, interval).bars.map((value: any) => [value.hour, value]))
+    for (const value of frame.bars) {
+      assert.equal(value.indicatorsObserved, true, `Admitted candle ${value.hour} must not be stranded behind a completed chunk.`)
+      for (const key of indicatorFields) assert.equal(value[key], (oracle.get(value.hour) as any)[key])
+    }
+  } finally { hold.resolve(); await pipeline.dispose() }
+})
+
+test('historical replay cannot replace the exact latest recursive core or its known statistics', async () => {
+  const rows = source(4000), { pipeline } = fixture(rows)
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const current = { ...candle(end() + interval, 4000), high: 510, close: 501.5, confirmed: false }
+    await pipeline.setLive(instId, '15m', current)
+    const before = pipeline.cached(`${instId}:15m`)
+    await pipeline.localHistory(instId, '15m', rows[2000].timestamp); await finishSeed(pipeline)
+    const next = await pipeline.setLive(instId, '15m', { ...current, close: 501.6, volume: current.volume + 1 })
+    assert.equal(next.bars.length, 96, 'A historical navigation reserve must not publish an empty latest tail.')
+    assert.equal(next.bars.at(-1).oi, rows.at(-1)!.oi)
+    assert.equal(pipeline.liveStates.get(`${instId}:15m`).indicatorState.lastTimestamp, rows.at(-1)!.timestamp)
+    assert.equal(next.liveBar.indicatorsObserved, true)
+    const oracle = buildIndicatorSeries([...rows, { ...current, close: 501.6, volume: current.volume + 1 }], interval).bars.at(-1) as any
+    for (const key of indicatorFields) assert.equal(next.liveBar[key], oracle[key])
+    assert.equal(next.generation, before.generation)
+  } finally { await pipeline.dispose() }
+})
+
+test('price-only observations preserve independently known OI and Taker facts', async () => {
+  const { pipeline, store } = fixture()
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const previous = store.rows.at(-1)!, priceOnly = { ...previous, close: previous.close + 1, statisticsVersion: 0, oi: null, buy: null, sell: null }
+    pipeline.observe([priceOnly], new Map([[previous.timestamp, previous]]))
+    const frame = pipeline.cached(`${instId}:15m`), last = frame.bars.at(-1)
+    assert.equal(last.oi, previous.oi); assert.equal(last.buy, previous.buy); assert.equal(last.sell, previous.sell)
+    assert.equal(last.oiObserved, true); assert.equal(last.takerObserved, true)
+  } finally { await pipeline.dispose() }
+})
+
+test('a delayed statistics query cannot roll back canonical price fields or a newer statistic observation', async () => {
+  const { pipeline, store } = fixture(), hold = deferred(), started = deferred()
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const query = store.candles.bind(store), previous = store.rows.at(-1)!
+    let blocked = false
+    store.candles = async (value: any) => {
+      const result = await query(value)
+      if (!blocked) { blocked = true; started.resolve(); await hold.promise }
+      return result
+    }
+    const statistics = pipeline.observeStatistics(instId, '15m', previous.timestamp, previous.timestamp)
+    await started.promise
+    const corrected = { ...previous, close: previous.close + 1, oi: previous.oi + 100 }
+    const prior = store.change(corrected)
+    pipeline.observe([corrected], prior)
+    hold.resolve(); await statistics; await finishSeed(pipeline)
+    const last = pipeline.cached(`${instId}:15m`).bars.at(-1)
+    assert.equal(last.close, corrected.close); assert.equal(last.oi, corrected.oi)
+    const oracle = buildIndicatorSeries(store.rows, interval).bars.at(-1) as any
+    for (const key of indicatorFields) assert.equal(last[key], oracle[key])
+  } finally { hold.resolve(); await pipeline.dispose() }
+})
+
+test('restored latest cores do not share mutable recursive state and volume corrections invalidate derived values', async () => {
+  const rows = source(500), { pipeline, store } = fixture(rows)
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    pipeline.series.delete(`${instId}:15m`)
+    await pipeline.local(instId, '15m')
+    const state = pipeline.series.get(`${instId}:15m`), live = pipeline.liveStates.get(`${instId}:15m`)
+    assert.notEqual(state.indicatorState, live.indicatorState)
+    const next = candle(end() + interval, 500)
+    const prior = store.change(next)
+    pipeline.observe([next], prior)
+    assert.equal(state.indicatorState.lastTimestamp, next.timestamp)
+    assert.equal(live.indicatorState.lastTimestamp, next.timestamp)
+    const generation = state.generation, corrected = { ...rows[490], baseVolume: 10_000 }
+    pipeline.observe([corrected], store.change(corrected))
+    assert.ok(state.generation > generation, 'VWAP input changes invalidate derived values even when OHLC is unchanged.')
+    await finishSeed(pipeline)
+    const oracle = buildIndicatorSeries(store.rows, interval).bars.at(-1) as any
+    for (const key of indicatorFields) assert.equal(pipeline.cached(`${instId}:15m`).bars.at(-1)[key], oracle[key])
+  } finally { await pipeline.dispose() }
+})
+
+
+test('the requested historical viewport publishes exact indicators before its remaining reserve finishes', async () => {
+  const rows = source(3500), { pipeline } = fixture(rows), hold = deferred(), reached = deferred()
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const calculate = pipeline.calculate.bind(pipeline), target = rows[2000].timestamp
+    let blocked = false
+    pipeline.calculate = async (candles: any[], ...args: any[]) => {
+      if (!blocked && candles[0].timestamp === rows[0].timestamp) { blocked = true; reached.resolve(); await hold.promise }
+      return calculate(candles, ...args)
+    }
+    await pipeline.localHistory(instId, '15m', target)
+    await reached.promise
+    const frame = pipeline.historyFrame(pipeline.series.get(`${instId}:15m`), target)
+    const viewport = frame.bars.filter((value: any) => value.hour >= target - 95 * interval && value.hour <= target)
+    assert.equal(viewport.length, 96)
+    assert.equal(viewport.every((value: any) => value.indicatorsObserved && indicatorFields.every(field => Number.isFinite(value[field]))), true)
+    assert.equal(frame.bars.some((value: any) => !value.indicatorsObserved), true, 'The test must hold a genuinely unfinished surrounding reserve.')
+  } finally { hold.resolve(); await pipeline.dispose() }
+})
+
+test('a checkpoint lookup cannot attach an old recursive seed to a later durable price revision', async () => {
+  const rows = source(3500), { pipeline, store } = fixture(rows)
+  let restarted: any
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline); await pipeline.dispose()
+    const read = store.readIndicatorCheckpoint.bind(store)
+    let corrected = false
+    store.readIndicatorCheckpoint = async (query: any) => {
+      const result = await read(query)
+      if (!corrected) { corrected = true; store.change({ ...rows[100], close: rows[100].close + 20, baseVolume: 1000 }) }
+      return result
+    }
+    restarted = new PreparedChartPipeline({ store: store as any, history: {} as any, normalize: (row: any) => row, revision: () => 0, instrument: () => undefined })
+    await restarted.local(instId, '15m'); await finishSeed(restarted)
+    const oracle = new Map(buildIndicatorSeries(store.rows, interval).bars.map((value: any) => [value.hour, value]))
+    const frame = restarted.cached(`${instId}:15m`)
+    for (const value of frame.bars) for (const key of indicatorFields) assert.equal(value[key], (oracle.get(value.hour) as any)[key])
+    for (const checkpoint of store.checkpoints) assert.equal(checkpoint.state.ema, (oracle.get(checkpoint.timestamp) as any).ema, 'No stale recursive seed can be resurrected under a newer revision.')
+    assert.ok(restarted.nextCalculation < 20, 'A source fence reloads once instead of spinning on the invalidated chunk.')
+  } finally { await restarted?.dispose(); await pipeline.dispose() }
+})
+
+test('a rejected checkpoint write reloads changed canonical inputs before publishing calculated values', async () => {
+  const rows = source(1800), { pipeline, store } = fixture(rows)
+  let changed = false
+  const write = store.writeIndicatorCheckpoint.bind(store)
+  store.writeIndicatorCheckpoint = async (value: any) => {
+    if (!changed) { changed = true; store.change({ ...rows[1750], close: rows[1750].close + 30 }) }
+    return write(value)
+  }
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const frame = pipeline.cached(`${instId}:15m`), oracle = new Map(buildIndicatorSeries(store.rows, interval).bars.map((value: any) => [value.hour, value]))
+    for (const value of frame.bars) for (const key of indicatorFields) assert.equal(value[key], (oracle.get(value.hour) as any)[key])
+    assert.equal(frame.bars.find((value: any) => value.hour === rows[1750].timestamp).close, store.rows[1750].close)
+    assert.ok(pipeline.nextCalculation < 12)
+  } finally { await pipeline.dispose() }
+})
+
+test('a durable correction reloaded through the live tail keeps its historical series generation coherent', async () => {
+  const rows = source(3000), { pipeline, store } = fixture(rows)
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const historicalEnd = rows[1500].timestamp
+    await pipeline.localHistory(instId, '15m', historicalEnd); await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`), live = pipeline.liveStates.get(`${instId}:15m`)
+    assert.equal(state.rows.has(state.latestHour), false, 'The historical reserve must be independent of the retained latest tail.')
+    assert.equal(state.generation, live.generation)
+    // Model a committed correction whose observer has not arrived yet. The
+    // source-revision fence reloads history and then the independently kept tail.
+    store.change({ ...rows[2975], close: rows[2975].close + 1 })
+    const frames: any[] = []
+    pipeline.subscribe((frame: any) => frames.push(frame))
+    await pipeline.refreshChangedCanonical(state, state.priceVersion)
+    assert.equal(state.generation, live.generation, 'Reloading a live-tail correction must invalidate every projection of the same series.')
+    assert.ok(frames.some(frame => frame.endHour === historicalEnd))
+    assert.ok(frames.some(frame => frame.endHour === state.latestHour))
+    assert.ok(frames.every(frame => frame.generation === state.generation), 'A newer latest notification must never make the following historical frame obsolete.')
+    await pipeline.seed(state); await finishSeed(pipeline)
+    const oracle = new Map(buildIndicatorSeries(store.rows, interval).bars.map((value: any) => [value.hour, value]))
+    for (const value of pipeline.cached(`${instId}:15m`).bars) for (const field of indicatorFields) {
+      assert.equal(value[field], (oracle.get(value.hour) as any)[field])
+    }
+  } finally { await pipeline.dispose() }
+})
+
+
+test('a late historical SQL response cannot retarget or evict the newer requested viewport', async () => {
+  const rows = source(5000), { pipeline, store } = fixture(rows), hold = deferred(), started = deferred()
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const read = store.candles.bind(store), oldEnd = rows[1800].timestamp, newEnd = rows[3500].timestamp
+    let blocked = false
+    store.candles = async (query: any) => {
+      const result = await read(query)
+      if (!blocked && query.order === 'desc' && query.through === oldEnd + 256 * interval) { blocked = true; started.resolve(); await hold.promise }
+      return result
+    }
+    const older = pipeline.localHistory(instId, '15m', oldEnd)
+    await started.promise
+    await pipeline.localHistory(instId, '15m', newEnd)
+    hold.resolve(); await older; await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`), frame = pipeline.historyFrame(state, newEnd)
+    assert.equal(state.historyEnd, newEnd)
+    const viewport = frame.bars.filter((value: any) => value.hour >= newEnd - 95 * interval && value.hour <= newEnd)
+    assert.equal(viewport.length, 96); assert.equal(viewport.every((value: any) => value.indicatorsObserved), true)
+  } finally { hold.resolve(); await pipeline.dispose() }
+})
+
+test('an upgrade ignores poisoned v3 checkpoints even when they carry the current durable watermark', async () => {
+  const rows = source(3500), { pipeline, store } = fixture(rows)
+  const legacyVersion = 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v3'
+  const poisoned = structuredClone(buildIndicatorSeries(rows.slice(0, 3072), interval).state)
+  assert.notEqual(poisoned.ema, null)
+  poisoned.ema = poisoned.ema! + 10_000
+  poisoned.rsi[0].gains += 1000
+  await store.writeIndicatorCheckpoint({ instrument: instId, timeframe: '15m', timestamp: poisoned.lastTimestamp,
+    formulaVersion: legacyVersion, state: poisoned, sourceRevision: await store.priceWatermark() })
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const oracle = new Map(buildIndicatorSeries(rows, interval).bars.map((value: any) => [value.hour, value]))
+    for (const value of pipeline.cached(`${instId}:15m`).bars) for (const field of indicatorFields) {
+      assert.equal(value[field], (oracle.get(value.hour) as any)[field], `The upgraded producer must reconstruct ${field} from canonical candles.`)
+    }
+    assert.equal(store.queries.find(query => query.order === 'asc').from, 0, 'An unsafe producer checkpoint cannot establish the canonical prefix.')
+    assert.ok(store.checkpoints.some(value => value.formulaVersion.endsWith('-v4')))
+    assert.deepEqual(store.rows, rows, 'Only derived checkpoints are replaced; canonical market records remain unchanged.')
+  } finally { await pipeline.dispose() }
+})

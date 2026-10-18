@@ -351,6 +351,63 @@ test('historical prefetch covers 1500 ms of network latency before the cold boun
   await measureLatencyCoveredPrefetch(electron, page, fixture)
 })
 
+test('mature local indicators and statistics stay drawn from the first scroll through prefetch, push and scroll end', async context => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  const indicatorFields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24']
+  await installRequestProbe(electron, fixture.instId)
+  try {
+    await openChart(page, fixture)
+    for (const timeframe of fixture.timeframes) {
+      await selectTimeframe(page, timeframe)
+      await waitForRendered(page, fixture, timeframe)
+      // Establish a complete canonical starting frame. The regression concerns
+      // losing mature data during navigation, not first-time indicator seeding.
+      await page.waitForFunction(({ timeframe, fields }) => {
+        const snapshot = document.querySelector('[data-chart-inst]')?.__chartSnapshot
+        return snapshot?.timeframe === timeframe && snapshot.bars.length === 96
+          && snapshot.bars.every(bar => [...fields, 'oi', 'buy', 'sell'].every(field => Number.isFinite(bar[field])))
+      }, { timeframe, fields: indicatorFields }, { timeout: 20_000 })
+      await startPaintProbe(page, fixture, { requireMatureData: true })
+      const phase = value => page.evaluate(value => { window.__chartPaintProbe.phase = value }, value)
+      const settle = () => page.evaluate(async () => { for (let frame = 0; frame < 12; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
+      const intervalMS = fixture.series[timeframe].intervalMS
+      await phase('first wheel and local history admission')
+      await wheelBurst(page, { deltaY: 7_200 })
+      await waitForRendered(page, fixture, timeframe, fixture.end - 600 * intervalMS)
+      await waitFor(async () => (await readRequestProbe(electron)).historyResponses.some(response => response.timeframe === timeframe && response.bars > 96))
+      await phase('continuous scrolling and speculative prefetch')
+      await wheelBurst(page, { frames: 6, eventsPerFrame: 32, deltaY: 36 })
+      await waitForRendered(page, fixture, timeframe, fixture.end - 1_176 * intervalMS)
+      await wheelBurst(page, { deltaY: 7_200 })
+      const historicalEnd = fixture.end - 1_776 * intervalMS
+      await waitForRendered(page, fixture, timeframe, historicalEnd)
+      await phase('scroll end and asynchronous completions')
+      await settle()
+      await phase('ordinary latest push while viewing history')
+      // Forward an actual backend local frame through the ordinary event
+      // ingress. Its contents are unchanged; only delivery timing is controlled.
+      await electron.evaluate(async ({ BrowserWindow }, { instId, timeframe }) => {
+        const frame = await globalThis.__marketBackend.request({ chartLocal: { instId, timeframe } })
+        if (!frame) throw new Error('The active backend must retain its latest local frame.')
+        BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
+      }, { instId: fixture.instId, timeframe })
+      await settle()
+      assert.equal(Number(await page.locator('[data-chart-inst]').getAttribute('data-chart-completed-end')), historicalEnd, 'A latest publication must preserve the historical viewport.')
+      await phase('reverse to latest and stop')
+      await wheelBurst(page, { deltaY: -1_776 * 12 })
+      await waitForRendered(page, fixture, timeframe)
+      await settle()
+      const paint = await finishPaintProbe(page)
+      const incomplete = paint.quality.filter(frame => frame.indicators !== 96 || frame.oi !== 96 || frame.taker !== 96)
+      if (incomplete.length) context.diagnostic(`Incomplete local paints: ${JSON.stringify({ timeframe, frames: incomplete })}`)
+      assertCompletePaints(paint)
+      assert.ok(paint.commits.some(commit => commit.end === historicalEnd), 'The probe must inspect the deep historical viewport.')
+      assert.equal(incomplete.length, 0,
+        `${timeframe} lost a mature indicator or source panel during navigation: ${JSON.stringify(paint.quality)}`)
+    }
+  } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
+})
+
 test('a held history read keeps the last complete paint and coalesces every later wheel event into the latest target', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   await installRequestProbe(electron, fixture.instId, { disableLocalHistory: true, initialHistoryBars: 1_000, capHistoricalWindows: true })

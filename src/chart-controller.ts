@@ -180,17 +180,25 @@ export class ChartController {
       if (target.end < floor) target = { ...target, end: floor }
     }
     const ready = this.store.window(target.instId, target.timeframe, target.end)
+    const previous = this.view.presented
+    const calculatingHistory = target.end !== null && ready?.indicatorState === 'loading'
+      && previous?.instId === target.instId && previous.timeframe === target.timeframe
+      && previous.generation === ready.generation && previous.bars.some(bar => bar.indicatorsObserved)
+    // Initial prices stay independent of optional sources. Moving an already
+    // calculated chart into history switches its curves and prices together.
+    const presented = calculatingHistory ? previous : ready
+      ?? (previous?.instId === target.instId && previous.timeframe === target.timeframe ? previous : null)
     this.publish({
       requested: target,
-      presented: ready ?? (this.view.presented?.instId === target.instId && this.view.presented.timeframe === target.timeframe ? this.view.presented : null),
-      pending: ready === null,
+      presented,
+      pending: ready === null || Boolean(calculatingHistory),
       error: ready || requested !== this.view.requested ? '' : this.view.error,
       oldestHour: meta?.oldestHour ?? null,
       latestEnd: meta?.latestEnd ?? null,
       historyExhausted: meta?.historyExhausted ?? false,
       unavailable: ready || requested !== this.view.requested ? null : this.view.unavailable,
     })
-    return ready !== null
+    return ready !== null && !calculatingHistory
   }
 
   private prefetchTarget(target: ChartTarget): ChartPreparation | null {
@@ -278,6 +286,7 @@ export class ChartController {
       void this.run(target, ready ? 'refresh' : 'target')
       return
     }
+    if (ready && this.view.pending) return
     const job = target.end === null || this.maintenanceTarget || this.demandTargets.has(key) ? null : this.prefetchTarget(target)
     if (job) { this.maintenanceTarget = job; void this.run(job, 'prefetch') }
     const cooldown = this.prefetchAfter - Date.now()

@@ -88,6 +88,30 @@ test('focused durable history is hydrated once and deep scrolling commits synchr
   } finally { close(); unsubscribe() }
 })
 
+test('historical navigation keeps the calculated viewport until the requested local indicators are ready', async () => {
+  const queue = transportQueue(), store = cached()
+  const pendingBars = bars(504, 96).map(bar => ({ ...bar, indicatorsObserved: false,
+    vwap: null, ema: null, bollUpper: null, bollMiddle: null, bollLower: null,
+    roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null,
+  }))
+  const raw = prepared(btc, 599, { bars: pendingBars, latestEnd: 1199 * hour, revision: 2, indicatorState: 'loading' })
+  const controller = new ChartController({ ...queue.transport, history: async () => raw }, store)
+  const close = controller.open(btc, '1H')
+  try {
+    const original = controller.getSnapshot().presented!
+    controller.scroll(-600)
+    await settled()
+    assert.equal(controller.store.window(btc, '1H', 599 * hour)!.bars.length, 96, 'Raw local prices are already admitted independently.')
+    assert.equal(controller.getSnapshot().presented, original, 'Scrolling cannot erase the visible technical curves while their local calculation is pending.')
+    assert.equal(controller.getSnapshot().pending, true)
+    assert.equal(queue.calls.length, 0, 'Speculative preparation must not displace the requested calculation.')
+    controller.ingestPrepared(prepared(btc, 599, { latestEnd: 1199 * hour, revision: 3 }))
+    assert.equal(controller.getSnapshot().presented!.endHour, 599 * hour)
+    assert.equal(controller.getSnapshot().presented!.indicatorState, 'ready')
+    assert.equal(controller.getSnapshot().pending, false)
+  } finally { close() }
+})
+
 test('a durable historical read bypasses an unresolved same-series provider request', async () => {
   const queue = transportQueue()
   let reads = 0

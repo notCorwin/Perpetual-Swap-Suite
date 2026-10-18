@@ -1,4 +1,3 @@
-import { parentPort, workerData } from 'node:worker_threads'
 import { readdir, stat } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -6,7 +5,9 @@ import { DatabaseSync } from 'node:sqlite'
 import { CANDLE_INTERVALS, validateCandle } from './market-records.js'
 
 const DAY = 86_400_000, quote = value => `'${String(value).replaceAll("'", "''")}'`
-const manifest = new DatabaseSync(workerData.path, { readOnly: true })
+const [root, databasePath] = process.argv.slice(2)
+if (!root || !databasePath || !process.send) throw new Error('Market archive import requires its database path and parent IPC channel.')
+const manifest = new DatabaseSync(databasePath, { readOnly: true })
 manifest.exec('PRAGMA query_only=ON; PRAGMA busy_timeout=5000;')
 const saved = manifest.prepare('SELECT fingerprint,status FROM migration_partitions WHERE path=?')
 const countRange = manifest.prepare('SELECT COUNT(*) AS count FROM candles WHERE series_id=(SELECT id FROM series WHERE instrument=? AND timeframe=?) AND timestamp>=? AND timestamp<=?')
@@ -14,10 +15,18 @@ const fields = { instrument: 'VARCHAR', timeframe: 'VARCHAR', timestamp: 'BIGINT
 const partVersion = file => { const match = /^(base|delta)-(\d+)-[A-Za-z0-9-]+\.parquet$/.exec(basename(file)); return match ? { kind: match[1], generation: Number(match[2]) } : null }
 const activeParts = files => { const base = Math.max(0, ...files.map(file => { const version = partVersion(file); return version?.kind === 'base' ? version.generation : 0 })); return files.filter(file => { const version = partVersion(file); return !version ? base === 0 : version.kind === 'base' ? version.generation === base : version.generation > base }) }
 const directories = async path => { try { return (await readdir(path, { withFileTypes: true })).filter(value => value.isDirectory()).map(value => value.name).sort() } catch (error) { if (error.code === 'ENOENT') return []; throw error } }
-let engine, connection, sequence = 0, draining = false, complete = false
+let engine, connection, sequence = 0, draining = false, complete = false, stopping = false, released = false
 const queue = [], acknowledgments = new Map()
 const readyConnection = async () => { if (!connection) { const { DuckDBInstance } = await import('@duckdb/node-api'); engine = await DuckDBInstance.create(':memory:'); connection = await engine.connect() } return connection }
-const send = payload => new Promise((resolve, reject) => { const id = ++sequence; acknowledgments.set(id, { resolve, reject }); parentPort.postMessage({ ...payload, sequence: id }) })
+const post = message => { if (process.connected) process.send(message, () => {}) }
+const send = payload => new Promise((resolve, reject) => {
+  if (!process.connected) { reject(new Error('Market archive parent disconnected.')); return }
+  const id = ++sequence
+  acknowledgments.set(id, { resolve, reject })
+  process.send({ ...payload, sequence: id }, error => {
+    if (error) { acknowledgments.delete(id); reject(error) }
+  })
+})
 
 async function importPartition(path, instrument, timeframe, priority, tolerateIssues) {
   const previous = saved.get(path)
@@ -50,8 +59,9 @@ async function importPartition(path, instrument, timeframe, priority, tolerateIs
         .map(row => Object.fromEntries(Object.entries(row).map(([field, value]) => [field, typeof value === 'bigint' ? Number(value) : value])))
       for (const row of rows) { validateCandle(row); if (row.instrument !== instrument || row.timeframe !== timeframe || row.timestamp < from || row.timestamp > through) throw new TypeError('A legacy market candle does not match its partition.') }
     }
-    await send({ import: { rows, partition: { path, fingerprint } }, priority })
+    if (!stopping) await send({ import: { rows, partition: { path, fingerprint } }, priority })
   } catch (error) {
+    if (stopping) return
     await send({ failure: { path, fingerprint, instrument, timeframe, from, through, reason: error.reason ?? (error instanceof TypeError ? 'invalid-schema' : 'corrupt-file'), detail: error.message } })
     if (!tolerateIssues) throw error
   }
@@ -60,7 +70,7 @@ async function importPartition(path, instrument, timeframe, priority, tolerateIs
 async function importQuery(job) {
   const { query, priority, tolerateIssues } = job
   if (!job.dates) {
-    job.path = join(workerData.root, 'candles', `timeframe=${query.timeframe}`, `instrument=${query.instrument}`)
+    job.path = join(root, 'candles', `timeframe=${query.timeframe}`, `instrument=${query.instrument}`)
     const first = query.from > 0 ? new Date(query.from).toISOString().slice(0, 10) : null
     const last = query.through < 8_640_000_000_000_000 ? new Date(query.through).toISOString().slice(0, 10) : null
     job.dates = (await directories(job.path)).filter(date => /^date=\d{4}-\d{2}-\d{2}$/.test(date) && (!first || date.slice(5) >= first) && (!last || date.slice(5) <= last))
@@ -76,9 +86,9 @@ async function importQuery(job) {
 }
 
 async function* partitions() {
-  const root = join(workerData.root, 'candles')
+  const candlesRoot = join(root, 'candles')
   for (const timeframe of Object.keys(CANDLE_INTERVALS)) {
-    const frame = join(root, `timeframe=${timeframe}`)
+    const frame = join(candlesRoot, `timeframe=${timeframe}`)
     for (const instrumentDirectory of await directories(frame)) {
       if (!instrumentDirectory.startsWith('instrument=')) continue
       const instrument = instrumentDirectory.slice(11), path = join(frame, instrumentDirectory)
@@ -97,11 +107,11 @@ async function drain() {
   if (draining) return
   draining = true
   try {
-    while (true) {
+    while (!stopping) {
       const index = queue.findIndex(job => job.priority === 'foreground'), job = queue.splice(index < 0 ? 0 : index, 1)[0]
       if (job) {
-        try { if (complete || await importQuery(job)) parentPort.postMessage({ id: job.id }); else queue.push(job) }
-        catch (error) { parentPort.postMessage({ id: job.id, error: error.message }) }
+        try { if (complete || await importQuery(job)) post({ id: job.id }); else queue.push(job) }
+        catch (error) { post({ id: job.id, error: error.message }) }
       } else {
         if (retryPartitions.length && retryAt > Date.now()) { retryLater(); break }
         if (retryPartitions.length) {
@@ -115,14 +125,13 @@ async function drain() {
         catch (error) {
           // An operational directory failure is not proof of an empty archive.
           // Restart discovery later, retaining every committed partition marker.
-          parentPort.postMessage({ warning: error.message })
+          post({ warning: error.message })
           background = partitions(); retryLater(); break
         }
+        if (stopping) break
         if (next.done) {
           if (!complete) {
             await send({ complete: true }); complete = true
-            connection?.closeSync(); engine?.closeSync(); manifest.close()
-            connection = null; engine = null
           }
           break
         }
@@ -130,17 +139,35 @@ async function drain() {
         catch (error) {
           // Source corruption is persisted by importPartition. An error escaping
           // it is operational; it must prevent the global cutover until retried.
-          parentPort.postMessage({ warning: error.message })
+          post({ warning: error.message })
           retryPartitions.push(next.value); retryLater()
         }
       }
     }
-  } finally { draining = false; if (queue.length) void drain() }
+  } finally {
+    draining = false
+    if (!stopping && queue.length) void drain()
+    else if ((stopping || complete) && acknowledgments.size === 0 && !released) {
+      released = true
+      clearTimeout(retryTimer)
+      connection?.closeSync(); engine?.closeSync(); manifest.close()
+      connection = null; engine = null
+      if (process.connected) process.disconnect()
+    }
+  }
 }
-parentPort.on('message', message => {
+process.on('message', message => {
   if (message.ack) {
     const value = acknowledgments.get(message.ack)
     if (value) { acknowledgments.delete(message.ack); message.error ? value.reject(new Error(message.error)) : value.resolve() }
-  } else { queue.push(message); void drain() }
+  } else if (message.stop) {
+    stopping = true; queue.length = 0; clearTimeout(retryTimer); void drain()
+  } else if (!stopping && !released) { queue.push(message); void drain() }
+})
+process.on('disconnect', () => {
+  stopping = true; queue.length = 0; clearTimeout(retryTimer)
+  for (const pending of acknowledgments.values()) pending.reject(new Error('Market archive parent disconnected.'))
+  acknowledgments.clear()
+  if (!released) void drain()
 })
 void drain()

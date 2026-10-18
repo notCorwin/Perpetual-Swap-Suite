@@ -1,6 +1,8 @@
 import { Worker } from 'node:worker_threads'
+import { fork } from 'node:child_process'
 import { mkdir, stat } from 'node:fs/promises'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { CANDLE_INTERVALS, validateCandle, validateQuery } from './market-records.js'
 export { CANDLE_INTERVALS, validateCandle } from './market-records.js'
 
@@ -112,7 +114,7 @@ export class MarketStore {
   constructor(root, path, writer, readers) {
     this.root = root; this.path = path; this.closed = false; this.closeTask = null
     this.revisions = new Map(); this.mutations = new Map(); this.operations = new Set()
-    this.listeners = new Set(); this.migration = null; this.migrationPending = new Map(); this.nextMigrationID = 0
+    this.listeners = new Set(); this.migration = null; this.migrationPending = new Map(); this.migrationWrites = new Set(); this.nextMigrationID = 0
     this.writeMetrics = { partitions: 0, rowsSubmitted: 0, bytesRead: 0, bytesWritten: 0, durationMS: 0 }
     this.writer = new DatabaseWorkers([writer], (mutations, duration) => this.committed(mutations, duration))
     this.readers = new DatabaseWorkers(readers)
@@ -156,61 +158,84 @@ export class MarketStore {
     return { revision, ranges }
   }
   getWriteMetrics() { return { ...this.writeMetrics } }
-  getDiagnostics() { return { workerThreadIds: this.workerThreadIds, reads: { ...this.readers.metrics, queued: this.readers.queue.length }, writes: { ...this.writer.metrics, queued: this.writer.queue.length }, migrationComplete: this.migrationComplete ?? false } }
+  getDiagnostics() { return { workerThreadIds: this.workerThreadIds, reads: { ...this.readers.metrics, queued: this.readers.queue.length }, writes: { ...this.writer.metrics, queued: this.writer.queue.length }, migrationComplete: this.migrationComplete ?? false, migrationProcessId: this.migration?.pid ?? null } }
 
   async startMigration() {
     if (await this.writer.request('migrationState', ['__complete__'])) { this.migrationComplete = true; return }
     try { if (!(await stat(join(this.root, 'candles'))).isDirectory()) return }
     catch (error) { if (error.code === 'ENOENT') { this.migrationComplete = true; return } throw error }
     if (this.closed) return
-    const worker = new Worker(new URL('./market-store-migration.js', import.meta.url), { workerData: { root: this.root, path: this.path } })
-    this.migration = worker
-    worker.on('message', message => {
+    // DuckDB's native addon cannot safely survive worker-thread termination.
+    // A process owns its native lifetime; SQLite transactions remain here.
+    const child = fork(fileURLToPath(new URL('./market-store-migration.js', import.meta.url)), [this.root, this.path], {
+      execPath: process.execPath, execArgv: [], env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      serialization: 'advanced', stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+    })
+    this.migration = child
+    let stderr = ''
+    child.stderr.on('data', value => { stderr = (stderr + value).slice(-4096) })
+    const reply = message => { if (child.connected) child.send(message, () => {}) }
+    const commit = (task, sequence, accepted) => {
+      this.migrationWrites.add(task)
+      task.then(() => { accepted?.(); reply({ ack: sequence }) }, error => reply({ ack: sequence, error: error.message }))
+        .finally(() => this.migrationWrites.delete(task))
+    }
+    child.on('message', message => {
+      if (this.closed && message.sequence) { reply({ ack: message.sequence, error: 'MarketStore is closed.' }); return }
       if (message.import) {
         const { rows, partition } = message.import
-        const task = this.writer.request('append', [rows, { importing: true, partition }], message.priority)
-        task.then(() => { this.writeMetrics.partitions += 1; this.writeMetrics.rowsSubmitted += rows.length; worker.postMessage({ ack: message.sequence }) },
-          error => worker.postMessage({ ack: message.sequence, error: error.message }))
+        commit(this.writer.request('append', [rows, { importing: true, partition }], message.priority), message.sequence,
+          () => { this.writeMetrics.partitions += 1; this.writeMetrics.rowsSubmitted += rows.length })
       } else if (message.failure) {
-        this.writer.request('migrationFailure', [message.failure]).then(() => worker.postMessage({ ack: message.sequence }), error => worker.postMessage({ ack: message.sequence, error: error.message }))
+        commit(this.writer.request('migrationFailure', [message.failure]), message.sequence)
       } else if (message.complete) {
-        this.writer.request('migrationComplete').then(() => {
+        commit(this.writer.request('migrationComplete'), message.sequence, () => {
           this.migrationComplete = true
           this.migrationWarning = ''
           for (const pending of this.migrationPending.values()) pending.resolve()
           this.migrationPending.clear()
-          worker.postMessage({ ack: message.sequence })
-        }, error => worker.postMessage({ ack: message.sequence, error: error.message }))
+        })
       } else if (message.warning) this.migrationWarning = message.warning
       else if (message.id) {
         const pending = this.migrationPending.get(message.id)
         if (pending) { this.migrationPending.delete(message.id); message.error ? pending.reject(new Error(message.error)) : pending.resolve() }
       }
     })
-    worker.on('error', error => { this.migrationError = error; for (const task of this.migrationPending.values()) task.reject(error); this.migrationPending.clear() })
-    worker.on('exit', code => {
-      if (this.migration === worker) this.migration = null
-      if (!this.closed && (!this.migrationComplete || code !== 0)) {
-        const error = new Error(`Market archive importer exited before a successful cutover (${code}).`)
+    child.on('error', error => {
+      if (this.migrationComplete) { this.migrationWarning = error.message; return }
+      this.migrationError = error
+      for (const task of this.migrationPending.values()) task.reject(error)
+      this.migrationPending.clear()
+    })
+    this.migrationExit = new Promise(resolve => child.once('close', (code, signal) => {
+      if (this.migration === child) this.migration = null
+      if (!this.closed && !this.migrationComplete) {
+        const error = new Error(`Market archive importer exited before a successful cutover (${signal ?? code}).${stderr ? ` ${stderr.trim()}` : ''}`)
         this.migrationError = error
         for (const task of this.migrationPending.values()) task.reject(error)
         this.migrationPending.clear()
-      }
-    })
-    worker.unref()
+      } else if (!this.closed && (code !== 0 || signal)) this.migrationWarning = `Market archive importer stopped after durable cutover (${signal ?? code}).`
+      resolve({ code, signal })
+    }))
+    child.unref(); child.channel?.unref(); child.stderr.unref?.()
   }
 
   async imported(query, priority, tolerateIssues = false) {
     await this.migrationReady
+    if (this.migrationComplete) return
     if (this.migrationError) throw this.migrationError
-    if (!this.migration || this.migrationComplete) return
+    if (!this.migration) return
+    const child = this.migration
     const id = ++this.nextMigrationID
     await new Promise((resolve, reject) => {
       this.migrationPending.set(id, { resolve, reject })
-      this.migration.ref()
-      this.migration.postMessage({ id, query: validateQuery(query), priority: priorityRank(priority) >= 3 ? 'foreground' : 'background', tolerateIssues })
+      child.ref(); child.channel?.ref()
+      child.send({ id, query: validateQuery(query), priority: priorityRank(priority) >= 3 ? 'foreground' : 'background', tolerateIssues }, error => {
+        if (!error) return
+        this.migrationPending.delete(id); reject(error)
+      })
     })
-    if (!this.migrationPending.size) this.migration.unref()
+    if (!this.migrationPending.size) { child.unref(); child.channel?.unref() }
   }
 
   read(command, query, priority = 'background', ...args) {
@@ -218,7 +243,7 @@ export class MarketStore {
       validateQuery(query)
       // Metadata describes committed SQLite facts. Asking for a watermark or
       // a current tail must never make the viewport wait for the full archive.
-      if (!['coverage', 'watermark', 'checkpointRead', 'snapshotRead'].includes(command)) await this.imported(query, priority, command === 'inspect')
+      if (!['coverage', 'watermark', 'checkpointRead'].includes(command)) await this.imported(query, priority, command === 'inspect')
       return this.readers.request(command, [query, ...args], priority)
     })
   }
@@ -271,10 +296,16 @@ export class MarketStore {
       // A read must not make shutdown finish a multi-year archive migration.
       // Only already admitted durable transactions must drain before exit.
       if (this.migration) {
-        const worker = this.migration; this.migration = null
+        const child = this.migration
         for (const pending of this.migrationPending.values()) pending.reject(new Error('MarketStore is closed.'))
         this.migrationPending.clear()
-        await worker.terminate()
+        child.ref(); child.channel?.ref()
+        if (child.connected) child.send({ stop: true }, () => {})
+        // No new importer writes are admitted after closed=true. Finish every
+        // transaction already accepted before stopping native archive reads.
+        await Promise.allSettled([...this.migrationWrites])
+        const timeout = setTimeout(() => child.kill('SIGKILL'), 5000)
+        try { await this.migrationExit } finally { clearTimeout(timeout) }
       }
       await Promise.allSettled([...this.operations])
       await this.readers.close()

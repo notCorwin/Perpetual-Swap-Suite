@@ -10,6 +10,9 @@ const sameBar = (left: Bar | undefined, right: Bar) => left !== undefined && bar
 const validPrice = (bar: Bar) => [bar.open, bar.high, bar.low, bar.close].every(value => finite(value) && value > 0)
   && bar.high >= Math.max(bar.open, bar.close, bar.low) && bar.low <= Math.min(bar.open, bar.close, bar.high)
 const keyFor = (instId: string, timeframe: RadarTimeframe) => `${timeframe}:${instId}`
+const samePrices = (left: Bar, right: Bar) => (['hour', 'open', 'high', 'low', 'close', 'confirmed'] as const).every(field => left[field] === right[field])
+const observed = (bar: Bar, source: 1 | 2) => (source === 1 ? bar.oiObserved : bar.takerObserved)
+  ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & source)
 
 export type ReadyChartBoundary = Readonly<{ firstEnd: number; lastEnd: number }>
 export type PreparedChartStoreLimits = { maxSeries?: number; maxBarsPerSeries?: number; maxWindowsPerSeries?: number; maxBytes?: number }
@@ -26,19 +29,40 @@ type Series = {
   liveRevision: number
 }
 
-function preparedBar(bar: PreparedChartBar, intervalMS: number): PreparedChartBar | null {
+function preparedBar(bar: PreparedChartBar, intervalMS: number, previous?: PreparedChartBar): PreparedChartBar | null {
   if (!Number.isSafeInteger(bar.hour) || bar.hour % intervalMS !== 0 || !bar.confirmed || !validPrice(bar)
     || ![bar.oi, bar.buy, bar.sell].every(value => nullableNumber(value) && (value === null || value >= 0))
     || (bar.buy === null) !== (bar.sell === null)
     || !indicatorFields.every(field => nullableNumber(bar[field]) || (field === 'roc' || field === 'maroc') && (bar[field] === 'Infinity' || bar[field] === '-Infinity'))) return null
-  return Object.freeze({ ...bar })
+  const next = { ...bar }
+  // A price projection is not a retraction of independently prepared sources.
+  // Generation changes discard the prior series before this merge; changed
+  // prices cannot reuse old recursive results, and calculated nulls are final.
+  if (previous && samePrices(previous, bar) && previous.indicatorsObserved && !bar.indicatorsObserved) {
+    Object.assign(next, Object.fromEntries(indicatorFields.map(field => [field, previous[field]])), { indicatorsObserved: true })
+  }
+  let retainedStatistics = false
+  if (previous && !observed(bar, 1) && observed(previous, 1) && finite(previous.oi)) {
+    next.oi = previous.oi; next.oiObserved = true
+    next.statisticsSources = (next.statisticsSources ?? 0) | 1
+    delete next.oiUnavailableReason
+    retainedStatistics = true
+  }
+  if (previous && !observed(bar, 2) && observed(previous, 2) && finite(previous.buy) && finite(previous.sell)) {
+    next.buy = previous.buy; next.sell = previous.sell; next.takerObserved = true
+    next.statisticsSources = (next.statisticsSources ?? 0) | 2
+    delete next.takerUnavailableReason
+    retainedStatistics = true
+  }
+  if (retainedStatistics) next.statisticsObserved = observed(next, 1) && observed(next, 2)
+  return Object.freeze(next)
 }
 
 function readyWindow(meta: PreparedChartMeta, bars: PreparedChartBar[], endHour: number, liveBar?: Bar, previous?: ReadyChartWindow): ReadyChartWindow {
   const sameBars = previous && bars.length === previous.bars.length && bars.every((bar, index) => previous.bars[index] === bar)
   if (sameBars && previous.liveBar === liveBar && previous.realtimeState === meta.realtimeState && previous.priceObservedAt === meta.priceObservedAt && JSON.stringify(previous.sourceVersions) === JSON.stringify(meta.sourceVersions)) return previous
   return Object.freeze({
-    key: meta.key, instId: meta.instId, timeframe: meta.timeframe, intervalMS: meta.intervalMS, bars: sameBars ? previous.bars : Object.freeze(bars), endHour,
+    key: meta.key, instId: meta.instId, timeframe: meta.timeframe, intervalMS: meta.intervalMS, generation: meta.generation, bars: sameBars ? previous.bars : Object.freeze(bars), endHour,
     oiState: bars.length && bars.every(bar => bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)) ? bars.every(bar => finite(bar.oi)) ? 'ready' : 'unavailable' : 'loading',
     takerState: bars.length && bars.every(bar => bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2)) ? bars.every(bar => finite(bar.buy) && finite(bar.sell)) ? 'ready' : 'unavailable' : 'loading',
     indicatorState: bars.length && bars.every(bar => bar.indicatorsObserved) ? bars.every(bar => indicatorFields.every(field => finite(bar[field]))) ? 'ready' : 'unavailable' : 'loading',
@@ -154,13 +178,15 @@ export class PreparedChartStore {
     const previous = this.latestFrames.get(key)
     if (previous && (revision < previous.meta.revision || endHour < previous.window.endHour)) return false
     const incoming = new Map(response.bars.map(bar => [bar.hour, bar]))
+    const previousBars = new Map(previous?.window.bars.map(bar => [bar.hour, bar]))
     const bars: PreparedChartBar[] = []
     for (let index = WINDOW_BARS - 1; index >= 0; index -= 1) {
       const hour = endHour - index * intervalMS, value = incoming.get(hour)
       if (!value) continue
-      const bar = preparedBar(value, intervalMS)
+      const previousBar = previousBars.get(hour)
+      const bar = preparedBar(value, intervalMS, previousBar)
       if (!bar) continue
-      const oldBar = previous?.window.bars[WINDOW_BARS - index - 1]
+      const oldBar = previousBar
       bars.push(sameBar(oldBar, bar) ? oldBar! : bar)
     }
     if ((!bars.length || !incoming.has(endHour)) && !response.liveBar) return false
@@ -211,7 +237,7 @@ export class PreparedChartStore {
     for (const incoming of response.bars) {
       const previous = current.bars.get(incoming.hour)
       if (previous && previous.revision > revision) continue
-      const bar = preparedBar(incoming, intervalMS)
+      const bar = preparedBar(incoming, intervalMS, previous?.bar)
       if (!bar) continue
       if (sameBar(previous?.bar, bar)) {
         previous!.revision = Math.max(previous!.revision, revision)

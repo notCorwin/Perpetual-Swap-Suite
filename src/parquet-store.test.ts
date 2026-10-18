@@ -1,4 +1,5 @@
 import { test } from 'node:test'
+import { once } from 'node:events'
 import { strict as assert } from 'node:assert'
 import { chmod, mkdtemp, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -42,6 +43,79 @@ test('legacy Parquet is imported read-only with newest base visibility and durab
     assert.equal(await store.candleWatermark(query.instrument, query.timeframe), watermark)
     assert.equal((await readdir(join(root, 'candles', 'timeframe=5m', 'instrument=BTC-USDT-SWAP', 'date=2024-01-01'))).length, 2)
   } finally { await store?.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('one-time native import runs in a separate process, exits normally and is skipped after cutover', { timeout: 15_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-import-process-'))
+  let store: MarketStore | undefined
+  try {
+    await legacy(root, 'base-200-data.parquet', [row(0)])
+    store = await MarketStore.open(root)
+    await (store as any).migrationReady
+    const importer = (store as any).migration
+    assert.ok(Number.isSafeInteger(importer.pid) && importer.pid !== process.pid)
+    const exited = once(importer, 'exit')
+    const closed = once(importer, 'close')
+    assert.equal((await store.candles(query))[0].close, 100)
+    assert.deepEqual(await exited, [0, null])
+    assert.deepEqual(await closed, [0, null])
+    assert.equal(store.getDiagnostics().migrationProcessId, null)
+    assert.equal((await store.migrationStatus()).complete, true)
+    assert.equal((await store.candles(query))[0].close, 100)
+    await store.close(); store = await MarketStore.open(root)
+    await (store as any).migrationReady
+    assert.equal(store.getDiagnostics().migrationProcessId, null)
+    assert.equal((await store.candles(query))[0].close, 100)
+  } finally { await store?.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('an importer crash rejects pending legacy reads without killing SQLite or losing new facts', { timeout: 15_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-import-crash-'))
+  let store: MarketStore | undefined
+  try {
+    await legacy(root, 'base-200-data.parquet', [row(0)])
+    store = await MarketStore.open(root)
+    await (store as any).migrationReady
+    const importer = (store as any).migration
+    const read = store.candles(query)
+    const rejected = assert.rejects(read, /SIGKILL|exited|closed|EPIPE/i)
+    importer.kill('SIGKILL')
+    await rejected
+    await store.appendCandles([{ ...row(0, 250), oi: undefined, buy: undefined, sell: undefined, statisticsVersion: undefined }])
+    assert.equal((await store.coverage(query.instrument, query.timeframe)).count, 1)
+    assert.equal((await store.migrationStatus()).complete, false)
+    await store.close(); store = await MarketStore.open(root)
+    assert.equal((await store.candles(query))[0].close, 250)
+  } finally { await store?.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('shutdown cancels pending archive reads and drains accepted SQLite import transactions before child exit', { timeout: 15_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-import-drain-'))
+  let store: MarketStore | undefined, release!: () => void
+  try {
+    await legacy(root, 'base-200-data.parquet', [row(0)])
+    store = await MarketStore.open(root)
+    const internal = store as any, request = internal.writer.request.bind(internal.writer)
+    let admitted!: () => void
+    const accepted = new Promise<void>(resolve => { admitted = resolve })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    internal.writer.request = (command: string, args: any[], priority: string) => {
+      if (command !== 'append' || !args[1]?.importing) return request(command, args, priority)
+      admitted()
+      return gate.then(() => request(command, args, priority))
+    }
+    const pendingRead = assert.rejects(store.candles(query), /closed/i)
+    await accepted
+    let finished = false
+    const closing = store.close().then(() => { finished = true })
+    await pendingRead
+    assert.equal(finished, false)
+    release()
+    await closing
+    store = await MarketStore.open(root)
+    assert.equal((await store.candles(query))[0].close, 100)
+    assert.deepEqual(await store.integrityCheck(), ['ok'])
+  } finally { release?.(); await store?.close(); await rm(root, { recursive: true, force: true }) }
 })
 test('old imports cannot overwrite newly collected prices or source statistics', async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-import-live-'))

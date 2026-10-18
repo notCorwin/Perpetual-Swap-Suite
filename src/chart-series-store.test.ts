@@ -54,6 +54,38 @@ test('availability belongs to each window and explicitly observed nulls are comp
   assert.equal(latest.indicatorState, 'ready')
 })
 
+test('price-only history refreshes cannot erase calculated indicators or observed statistics in the same canonical generation', () => {
+  const store = new PreparedChartStore()
+  store.setUniverse([instId], '1H', instId)
+  store.ingest(response(bars(0, 150), { revision: 10 }))
+  const original = store.window(instId, '1H', 100 * hour)!
+  const pending = bars(0, 150).map(value => ({ ...value,
+    indicatorsObserved: false, statisticsObserved: false, oiObserved: false, takerObserved: false, statisticsSources: 0,
+    vwap: null, ema: null, bollUpper: null, bollMiddle: null, bollLower: null,
+    roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, oi: null, buy: null, sell: null,
+  }))
+  store.ingest(response(pending, { revision: 11, indicatorState: 'loading', oiState: 'loading', takerState: 'loading' }))
+  const next = store.window(instId, '1H', 100 * hour)!
+  for (const [index, value] of next.bars.entries()) for (const field of ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell'] as const) assert.equal(value[field], original.bars[index][field])
+  assert.equal(next.indicatorState, 'ready')
+  assert.equal(next.oiState, 'ready')
+  assert.equal(next.takerState, 'ready')
+  assert.equal(store.window(instId, '1H')!.indicatorState, 'ready')
+})
+
+test('a changed canonical price and explicitly calculated nulls remain authoritative over prior indicators', () => {
+  const store = new PreparedChartStore()
+  store.ingest(response(bars(0, 96)))
+  store.ingest(response([bar(95, hour, { close: 102, indicatorsObserved: false, ema: null })], { revision: 2 }))
+  assert.equal(store.window(instId, '1H')!.bars.at(-1)!.ema, null)
+  store.ingest(response([bar(95, hour, { close: 102, indicatorsObserved: true, ema: null, oi: null, oiObserved: true,
+    buy: null, sell: null, takerObserved: true })], { revision: 3 }))
+  const latest = store.window(instId, '1H')!
+  assert.equal(latest.bars.at(-1)!.ema, null)
+  assert.equal(latest.oiState, 'unavailable')
+  assert.equal(latest.takerState, 'unavailable')
+})
+
 test('a newer indicator generation clears all old windows and rejects late old data', () => {
   const store = new PreparedChartStore()
   store.ingest(response(bars(0, 96), { generation: 10, revision: 50 }))

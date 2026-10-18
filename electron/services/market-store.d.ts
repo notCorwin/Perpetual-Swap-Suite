@@ -52,7 +52,7 @@ export class MarketStore {
   replaceCandles(query: CandleQuery & CandleRange, candles: CandleRecord[], priority?: StorePriority): Promise<number>
   inspectCandles(query: CandleQuery & CandleRange, priority?: StorePriority): Promise<CandleInspection>
   getWriteMetrics(): { partitions: number; rowsSubmitted: number; bytesRead: number; bytesWritten: number; durationMS: number }
-  getDiagnostics(): { workerThreadIds: { writer: number; readers: number[] }; reads: Record<string, number>; writes: Record<string, number>; migrationComplete: boolean }
+  getDiagnostics(): { workerThreadIds: { writer: number; readers: number[] }; reads: Record<string, number>; writes: Record<string, number>; migrationComplete: boolean; migrationProcessId: number | null }
   candleRevision(instrument: string, timeframe: string): number
   candleChangesSince(instrument: string, timeframe: string, revision: number): { revision: number; ranges: CandleRange[] | null }
   candles(query: CandleQuery, priority?: StorePriority): Promise<CandleRecord[]>

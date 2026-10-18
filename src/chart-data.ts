@@ -68,6 +68,7 @@ export type PreparedChartMeta = Readonly<{
 
 export type ReadyChartWindow = Readonly<{
   key: string; instId: string; timeframe: RadarTimeframe; intervalMS: number
+  generation: PreparedChartGeneration
   bars: readonly PreparedChartBar[]; endHour: number
   oiState: PreparedChartState; takerState: PreparedChartState; indicatorState: PreparedChartState
   liveBar?: Bar

@@ -1,10 +1,12 @@
 import { Worker } from 'node:worker_threads'
 import { availableParallelism } from 'node:os'
-import { statisticsMask } from './statistics-state.js'
+import { statisticsMask, statisticsVersionFor } from './statistics-state.js'
 import { appendIndicatorCandle, projectIndicatorCandle } from './indicators.js'
 
 const VISIBLE = 96, TAIL = 128, CHUNK = 1024, HISTORY = 1536
-const FORMULA_VERSION = 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v3'
+// v4 also identifies the verified checkpoint producer. Older producers could
+// persist a stale recursive core under a newer source revision.
+const FORMULA_VERSION = 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v4'
 const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24']
 const priceFields = ['open', 'high', 'low', 'close', 'volume', 'baseVolume', 'quoteVolume', 'confirmed']
 const intervalFor = timeframe => ({ '5m': 300_000, '15m': 900_000, '1H': 3_600_000 })[timeframe]
@@ -16,6 +18,21 @@ const sourceState = (rows, bit) => rows.length && rows.every(row => sourceFresh(
   ? rows.every(row => bit === 1 ? numeric(row.oi) : numeric(row.buy) && numeric(row.sell)) ? 'ready' : 'unavailable' : 'loading'
 const changedSource = (left, right, bit) => !left || (statisticsMask(left) & bit) !== (statisticsMask(right) & bit)
   || (bit === 1 ? ['oi', 'statisticsOIExpiresAt'] : ['buy', 'sell', 'statisticsTakerExpiresAt']).some(field => !Object.is(left[field], right[field]))
+const statisticsFields = ['oi', 'buy', 'sell', 'statisticsVersion', 'statisticsOIExpiresAt', 'statisticsTakerExpiresAt']
+// Price records and either statistic family have independent write lifetimes.
+// An unobserved family is not an instruction to erase an existing observation.
+const mergeStatistics = (previous, incoming, allowed = 3) => {
+  const value = { ...incoming }, priorMask = statisticsMask(previous), incomingMask = statisticsMask(incoming)
+  let sources = 0
+  for (const bit of [1, 2]) {
+    const accept = !previous || Boolean(allowed & bit) && Boolean(incomingMask & bit)
+    const source = accept ? incoming : previous
+    if ((accept ? incomingMask : priorMask) & bit) sources |= bit
+    for (const field of bit === 1 ? ['oi', 'statisticsOIExpiresAt'] : ['buy', 'sell', 'statisticsTakerExpiresAt']) value[field] = source?.[field] ?? null
+  }
+  value.statisticsVersion = statisticsVersionFor(sources, value)
+  return value
+}
 const blankIndicators = Object.fromEntries(indicatorFields.map(field => [field, null]))
 const bar = (row, calculated) => ({ ...blankIndicators, ...calculated,
   hour: row.timestamp, open: row.open, high: row.high, low: row.low, close: row.close, confirmed: Boolean(row.confirmed),
@@ -62,8 +79,8 @@ export class PreparedChartPipeline {
       const live = this.liveStates.get(key)
       state = { key, instId, timeframe, intervalMS: intervalFor(timeframe), rows: new Map(), indicators: new Map(),
         generation: live?.generation || ++this.nextGeneration, sourceVersion: live?.sourceVersion ?? 0, priceVersion: live?.priceVersion ?? 0, oiVersion: live?.oiVersion ?? 0, takerVersion: live?.takerVersion ?? 0,
-        indicatorState: live?.indicatorState ?? null, live: live?.live ?? null, observedAt: live?.observedAt ?? null,
-        floor: null, active: 0, latestHour: null, historyEnd: null, loaded: false, calculation: null }
+        indicatorState: live?.indicatorState ? structuredClone(live.indicatorState) : null, live: live?.live ?? null, observedAt: live?.observedAt ?? null,
+        floor: live?.floor ?? null, active: 0, latestHour: live?.latestHour ?? null, historyEnd: null, loaded: false, calculation: null }
     }
     this.series.delete(key); this.series.set(key, state)
     return state
@@ -153,6 +170,8 @@ export class PreparedChartPipeline {
   sourceStateChanged() { this.scheduleRefresh() }
 
   frame(state, end = state.latestHour) {
+    const latest = this.liveStates.get(state.key)
+    if (end === state.latestHour && !state.rows.has(end) && latest !== state && latest?.rows.has(end)) return this.frame(latest, end)
     const rows = [...state.rows.values()].filter(row => end === null || row.timestamp <= end && row.timestamp >= end - (VISIBLE - 1) * state.intervalMS).sort((a, b) => a.timestamp - b.timestamp)
     const cacheKey = `${end}:${state.sourceVersion}:${state.indicatorVersion ?? 0}:${state.generation}:${sourceState(rows, 1)}:${sourceState(rows, 2)}`
     state.barCaches ??= new Map()
@@ -161,7 +180,8 @@ export class PreparedChartPipeline {
     state.barCaches.delete(end); state.barCaches.set(end, { key: cacheKey, bars })
     while (state.barCaches.size > 4) state.barCaches.delete(state.barCaches.keys().next().value)
     const live = state.live && (end === state.latestHour || end === null) ? state.live : null
-    const liveBar = live ? bar(live, state.indicatorState?.lastTimestamp < live.timestamp ? projectIndicatorCandle(state.indicatorState, live) : undefined) : undefined
+    const core = latest?.indicatorState?.lastTimestamp === state.latestHour ? latest.indicatorState : state.indicatorState
+    const liveBar = live ? bar(live, core?.lastTimestamp + state.intervalMS === live.timestamp ? projectIndicatorCandle(core, live) : undefined) : undefined
     const currentBoundary = Math.floor(Date.now() / state.intervalMS) * state.intervalMS
     const realtime = Boolean(liveBar && live.timestamp === currentBoundary && state.observedAt !== null && Date.now() - state.observedAt < 30_000 && this.streaming(state.instId, state.timeframe))
     return { instId: state.instId, timeframe: state.timeframe, intervalMS: state.intervalMS, endHour: end,
@@ -213,15 +233,14 @@ export class PreparedChartPipeline {
     const ceiling = Math.floor(Date.now() / state.intervalMS) * state.intervalMS - state.intervalMS
     const through = end === undefined || end === null ? ceiling : Math.min(end + 256 * state.intervalMS, ceiling)
     const from = end === undefined || end === null ? undefined : Math.max(0, end - (limit - 257) * state.intervalMS)
+    const admittedPrice = state.priceVersion, admittedOI = state.oiVersion, admittedTaker = state.takerVersion
     const rows = await this.store.candles({ instrument: state.instId, timeframe: state.timeframe, from, through, limit, order: 'desc' }, priority)
     if (this.closed) return
-    let pricesChanged = false, observationsChanged = false, reseed = false, oiChanged = false, takerChanged = false
+    if (admittedPrice !== state.priceVersion) return this.readRows(state, end, limit, priority)
+    let pricesChanged = false, observationsChanged = false, changedFrom = Infinity, oiChanged = false, takerChanged = false
     for (const row of rows) if (row.confirmed) {
-      const previous = state.rows.get(row.timestamp), value = this.normalize(row)
-      if (previous && !samePrice(previous, value)) {
-        pricesChanged = true
-        if (row.timestamp <= (state.indicatorState?.lastTimestamp ?? -Infinity)) reseed = true
-      }
+      const previous = state.rows.get(row.timestamp), value = mergeStatistics(previous, this.normalize(row), (admittedOI === state.oiVersion ? 1 : 0) | (admittedTaker === state.takerVersion ? 2 : 0))
+      if (previous && !samePrice(previous, value)) { pricesChanged = true; changedFrom = Math.min(changedFrom, row.timestamp) }
       if (JSON.stringify(previous) !== JSON.stringify(value)) observationsChanged = true
       if (changedSource(previous, value, 1)) oiChanged = true
       if (changedSource(previous, value, 2)) takerChanged = true
@@ -231,22 +250,52 @@ export class PreparedChartPipeline {
     if (observationsChanged) state.sourceVersion += 1
     if (oiChanged) state.oiVersion = (state.oiVersion ?? 0) + 1
     if (takerChanged) state.takerVersion = (state.takerVersion ?? 0) + 1
-    if (reseed) { state.generation = ++this.nextGeneration; state.indicatorState = null; state.indicators.clear() }
+    if (pricesChanged) this.invalidateDerived(state, changedFrom)
     const sorted = [...state.rows.keys()].sort((a, b) => a - b)
-    const anchor = end ?? sorted.at(-1)
+    const anchor = state.historyEnd ?? sorted.at(-1)
     if (sorted.length > HISTORY) {
       const retain = sorted.toSorted((a, b) => Math.abs(a - anchor) - Math.abs(b - anchor)).slice(0, HISTORY)
       const keep = new Set(retain)
       for (const hour of sorted) if (!keep.has(hour)) { state.rows.delete(hour); state.indicators.delete(hour) }
     }
     const coverage = await this.store.coverage(state.instId, state.timeframe, priority)
-    state.latestHour = coverage.last
+    state.latestHour = coverage.last === null ? state.latestHour : Math.max(state.latestHour ?? -Infinity, coverage.last)
     const listing = Number(this.instrument(state.instId)?.listTime)
     state.floor = Number.isFinite(listing) && listing > 0 ? Math.floor(listing / state.intervalMS) * state.intervalMS : null
     state.loaded = true
     this.updateMemory(state)
     const live = this.liveStates.get(state.key)
     if (live?.live) { state.live = live.live; state.observedAt = live.observedAt }
+    this.syncLive(state)
+  }
+
+  invalidateDerived(state, from) {
+    const generation = ++this.nextGeneration
+    for (const current of new Set([state, this.series.get(state.key), this.liveStates.get(state.key)].filter(Boolean))) {
+      current.generation = generation
+      if ((current.indicatorState?.lastTimestamp ?? -Infinity) >= from) current.indicatorState = null
+      for (const hour of current.indicators.keys()) if (hour >= from) current.indicators.delete(hour)
+      current.indicatorVersion = (current.indicatorVersion ?? 0) + 1
+    }
+  }
+
+  syncLive(state) {
+    const live = this.liveState(state.instId, state.timeframe)
+    if (live === state) return live
+    // Historical reserves cannot replace the separately retained latest tail.
+    for (const [hour, row] of state.rows) if (hour >= state.latestHour - (TAIL - 1) * state.intervalMS) {
+      const previous = live.rows.get(hour)
+      if (previous && !samePrice(previous, row)) live.indicators.delete(hour)
+      live.rows.set(hour, row)
+      if (state.indicators.has(hour)) live.indicators.set(hour, state.indicators.get(hour))
+    }
+    for (const hour of live.rows.keys()) if (hour < state.latestHour - (TAIL - 1) * state.intervalMS) { live.rows.delete(hour); live.indicators.delete(hour) }
+    if (state.indicatorState && (!live.indicatorState || state.indicatorState.lastTimestamp > live.indicatorState.lastTimestamp)) live.indicatorState = structuredClone(state.indicatorState)
+    live.latestHour = state.latestHour; live.floor = state.floor; live.generation = state.generation
+    for (const field of ['sourceVersion', 'priceVersion', 'oiVersion', 'takerVersion', 'indicatorVersion']) live[field] = Math.max(live[field] ?? 0, state[field] ?? 0)
+    live.bollExpansion = live.indicatorState?.bollExpansion ?? null
+    this.updateMemory(live)
+    return live
   }
 
   async local(instId, timeframe, { priority = 'foreground' } = {}) {
@@ -255,6 +304,7 @@ export class PreparedChartPipeline {
     const key = seriesKey(instId, timeframe)
     if (priority === 'foreground') this.focusKey = key
     const state = this.state(instId, timeframe)
+    state.historyRequest = (state.historyRequest ?? 0) + 1
     state.historyEnd = null
     if (!state.loaded || !state.rows.has(state.latestHour)) await this.job(`local:${key}`, () => this.read(state, undefined, TAIL, priority))
     this.seed(state, priority)
@@ -268,12 +318,15 @@ export class PreparedChartPipeline {
     if (this.closed) throw new Error('Prepared chart data service is closed.')
     this.focusKey = seriesKey(instId, timeframe)
     const state = this.state(instId, timeframe)
-    await this.job(`history:${state.key}:${targetEnd ?? 'latest'}`, () => this.read(state, targetEnd, HISTORY))
+    const request = state.historyRequest = (state.historyRequest ?? 0) + 1
     state.historyEnd = targetEnd ?? state.latestHour
+    await this.job(`history:${state.key}:${targetEnd ?? 'latest'}`, () => this.read(state, targetEnd, HISTORY))
+    if (request === state.historyRequest) state.historyEnd = targetEnd ?? state.latestHour
     this.seed(state, 'foreground')
     this.refreshObservations(state, targetEnd)
-    const frame = this.historyFrame(state, state.historyEnd)
-    state.publishedHistoryKey = this.historyKey(state, state.historyEnd)
+    const end = targetEnd ?? state.latestHour
+    const frame = this.historyFrame(state, end)
+    if (request === state.historyRequest) state.publishedHistoryKey = this.historyKey(state, end)
     return frame.bars.length || frame.liveBar ? frame : null
   }
 
@@ -302,8 +355,7 @@ export class PreparedChartPipeline {
     if (statisticsMissing && typeof this.history.ensureStatistics === 'function') {
       this.sourceJob(`statistics:${state.key}:${from}:${end}`, async () => {
         await this.history.ensureStatistics(instId, timeframe, from, end, 'background')
-        await this.read(state, targetEnd, targetEnd === undefined ? TAIL : HISTORY, 'background')
-        this.publish(state)
+        await this.observeStatistics(instId, timeframe, from, end)
         for (let hour = from; hour <= end; hour += step) { const row = state.rows.get(hour); if (!row || !sourceFresh(row, 1) || !sourceFresh(row, 2)) return false }
         return true
       })?.catch(() => {})
@@ -379,45 +431,101 @@ export class PreparedChartPipeline {
     this.refreshTimer.unref?.()
   }
 
-  seed(state, priority = 'background') {
-    if (this.closed || !state.rows.size) return Promise.resolve()
-    if (state.calculation) return state.calculation
-    const end = Math.max(...state.rows.keys()), first = Math.min(...state.rows.keys())
-    if (state.indicatorState?.lastTimestamp === end && [...state.rows.keys()].every(hour => state.indicators.has(hour))) return Promise.resolve()
-    const version = state.priceVersion, generation = state.generation
-    state.active += 1
-    const task = (async () => {
-      const checkpoint = await this.store.readIndicatorCheckpoint?.({ instrument: state.instId, timeframe: state.timeframe, before: first - state.intervalMS, formulaVersion: FORMULA_VERSION }, priority)
-      let calculated = checkpoint?.state ?? null, cursor = checkpoint ? checkpoint.timestamp + state.intervalMS : 0
-      const sourceRevision = await (this.store.priceWatermark?.(state.instId, state.timeframe, priority) ?? this.store.candleWatermark(state.instId, state.timeframe, priority))
-      const prepared = new Map()
-      while (!this.closed && cursor <= end) {
-        const rows = await this.store.candles({ instrument: state.instId, timeframe: state.timeframe, from: cursor, through: end, limit: CHUNK, order: 'asc' }, priority)
-        if (!rows.length) break
-        const result = await this.calculate(rows, state.intervalMS, state.key === this.focusKey ? 'foreground' : priority, calculated)
-        if (version !== state.priceVersion || generation !== state.generation) return
-        calculated = result.state
-        for (const value of result.bars) if (state.rows.has(value.hour)) prepared.set(value.hour, value)
-        cursor = rows.at(-1).timestamp + state.intervalMS
-        await this.store.writeIndicatorCheckpoint?.({ instrument: state.instId, timeframe: state.timeframe, timestamp: calculated.lastTimestamp, formulaVersion: FORMULA_VERSION, state: calculated, sourceRevision, bollExpansion: calculated.bollExpansion }, priority)
+  reconcileCanonical(state, rows) {
+    let changedFrom = Infinity
+    for (const current of new Set([state, this.liveStates.get(state.key)].filter(Boolean))) {
+      let changed = false
+      for (const row of rows) {
+        const previous = current.rows.get(row.timestamp), value = this.normalize(row)
+        if (!previous || samePrice(previous, value)) continue
+        current.rows.set(row.timestamp, mergeStatistics(previous, value))
+        changedFrom = Math.min(changedFrom, row.timestamp); changed = true
       }
-      if (this.closed || version !== state.priceVersion || generation !== state.generation || !calculated) return
-      for (const [hour, value] of prepared) state.indicators.set(hour, value)
-      state.indicatorState = calculated
-      state.indicatorVersion = (state.indicatorVersion ?? 0) + 1
-      const live = this.liveState(state.instId, state.timeframe)
-      live.rows = new Map([...state.rows].sort(([a], [b]) => a - b).slice(-TAIL))
-      live.indicators = new Map([...state.indicators].filter(([hour]) => live.rows.has(hour)))
-      live.indicatorState = structuredClone(calculated); live.generation = state.generation; live.latestHour = state.latestHour
-      live.bollExpansion = calculated.bollExpansion
-      live.sourceVersion = state.sourceVersion; live.priceVersion = state.priceVersion; live.oiVersion = state.oiVersion; live.takerVersion = state.takerVersion
-      this.updateMemory(state); this.updateMemory(live)
-      this.publish(state)
+      if (changed) { current.priceVersion += 1; current.sourceVersion += 1 }
+    }
+    if (changedFrom === Infinity) return false
+    this.invalidateDerived(state, changedFrom)
+    this.publish(state)
+    return true
+  }
+
+  async refreshChangedCanonical(state, version) {
+    if (this.closed || state.priceVersion !== version) return
+    // SQLite may have committed a correction before its observer message is
+    // delivered. No calculated state can be certified by that later revision.
+    state.priceVersion += 1; state.sourceVersion += 1
+    this.invalidateDerived(state, -Infinity)
+    await this.read(state, state.historyEnd ?? undefined, state.historyEnd == null ? TAIL : HISTORY)
+    const live = this.liveStates.get(state.key)
+    if (live?.rows.size) await this.read(live, undefined, TAIL)
+    this.publish(state)
+  }
+
+  seed(state, priority = 'background') {
+    if (this.closed || !state.rows.size && !this.liveStates.get(state.key)?.rows.size) return Promise.resolve()
+    if (state.calculation) return state.calculation
+    const live = this.syncLive(state)
+    const missing = current => [...current.rows.keys()].filter(hour => !current.indicators.has(hour)).sort((a, b) => a - b)
+    const needed = () => {
+      const resident = missing(state), end = state.historyEnd ?? state.latestHour
+      const viewport = resident.filter(hour => hour >= end - (VISIBLE - 1) * state.intervalMS && hour <= end)
+      if (viewport.length) return viewport
+      // A correction also rebuilds the live seed, without waiting for a second
+      // historical reserve to finish or replacing it with an older replay.
+      const tail = missing(live)
+      return tail.length ? tail : resident
+    }
+    if (!needed().length) return Promise.resolve()
+    state.active += 1
+    let restart = false
+    const task = (async () => {
+      while (!this.closed) {
+        const demand = needed()
+        if (!demand.length) break
+        const first = demand[0], end = demand.at(-1), version = state.priceVersion, generation = state.generation
+        const watermark = () => this.store.priceWatermark?.(state.instId, state.timeframe, priority) ?? this.store.candleWatermark(state.instId, state.timeframe, priority)
+        // Fence the checkpoint lookup as well as the candle chunks. A correction
+        // cannot pair an old recursive seed with a newer durable source revision.
+        const sourceRevision = await watermark()
+        const checkpoint = await this.store.readIndicatorCheckpoint?.({ instrument: state.instId, timeframe: state.timeframe, before: first - state.intervalMS, formulaVersion: FORMULA_VERSION }, priority)
+        if (version !== state.priceVersion || generation !== state.generation) { restart = true; return }
+        if (sourceRevision !== await watermark()) { await this.refreshChangedCanonical(state, version); restart = true; return }
+        let calculated = checkpoint?.state ?? null, cursor = checkpoint ? checkpoint.timestamp + state.intervalMS : 0, progressed = false
+        while (!this.closed && cursor <= end) {
+          const rows = await this.store.candles({ instrument: state.instId, timeframe: state.timeframe, from: cursor, through: end, limit: CHUNK, order: 'asc' }, priority)
+          if (!rows.length) break
+          const result = await this.calculate(rows, state.intervalMS, state.key === this.focusKey ? 'foreground' : priority, calculated)
+          if (version !== state.priceVersion || generation !== state.generation) { restart = true; return }
+          if (sourceRevision !== await watermark()) { await this.refreshChangedCanonical(state, version); restart = true; return }
+          if (this.reconcileCanonical(state, rows)) { restart = true; return }
+          calculated = result.state
+          const saved = await this.store.writeIndicatorCheckpoint?.({ instrument: state.instId, timeframe: state.timeframe, timestamp: calculated.lastTimestamp, formulaVersion: FORMULA_VERSION, state: calculated, sourceRevision, bollExpansion: calculated.bollExpansion }, priority)
+          if (saved === false) { await this.refreshChangedCanonical(state, version); restart = true; return }
+          if (version !== state.priceVersion || generation !== state.generation) { restart = true; return }
+          if (sourceRevision !== await watermark()) { await this.refreshChangedCanonical(state, version); restart = true; return }
+          let changed = false
+          for (const value of result.bars) for (const current of [state, live]) if (current.rows.has(value.hour)) {
+            current.indicators.set(value.hour, value); changed = true; progressed = true
+          }
+          for (const current of [state, live]) if (!current.indicatorState || calculated.lastTimestamp > current.indicatorState.lastTimestamp) {
+            current.indicatorState = structuredClone(calculated); current.bollExpansion = calculated.bollExpansion
+          }
+          if (changed) {
+            state.indicatorVersion = (state.indicatorVersion ?? 0) + 1
+            live.indicatorVersion = state.indicatorVersion
+            this.updateMemory(state); this.updateMemory(live); this.publish(state)
+          }
+          cursor = rows.at(-1).timestamp + state.intervalMS
+        }
+        // Invalid source rows cannot cause a busy loop. A later actual source
+        // update retries them; every calculated warm-up null is still observed.
+        if (!progressed) break
+      }
     })().catch(error => { state.indicatorError = error.message }).finally(() => {
       state.active -= 1
       if (state.calculation === task) state.calculation = null
       this.liveSeeds.delete(state.key); this.trim()
-      if (!this.closed && version !== state.priceVersion) this.seed(state, priority)
+      if (!this.closed && restart) this.seed(state, priority)
     })
     state.calculation = task; this.liveSeeds.set(state.key, task)
     return task
@@ -426,12 +534,15 @@ export class PreparedChartPipeline {
   async projectSeries(instId, timeframe) {
     const state = this.state(instId, timeframe)
     if (!state.loaded) await this.read(state, undefined, TAIL, 'background')
+    const live = this.liveState(instId, timeframe)
+    if (state.latestHour !== null && !state.rows.has(state.latestHour) && !live.rows.has(state.latestHour)) await this.read(live, undefined, TAIL, 'background')
     await this.seed(state)
-    return { end: state.latestHour, bars: [...state.rows.values()].sort((a, b) => a.timestamp - b.timestamp).map(row => bar(row, state.indicators.get(row.timestamp))) }
+    const current = live.rows.has(state.latestHour) ? live : state
+    return { end: state.latestHour, bars: [...current.rows.values()].sort((a, b) => a.timestamp - b.timestamp).slice(-TAIL).map(row => bar(row, current.indicators.get(row.timestamp))) }
   }
   async projectListSeries(instId, timeframe) {
     const live = this.liveStates.get(seriesKey(instId, timeframe))
-    if (live?.indicatorState && live.rows.size) return { end: live.latestHour, bars: [...live.rows.values()].sort((a, b) => a.timestamp - b.timestamp).map(row => bar(row, live.indicators.get(row.timestamp))), bollExpansion: live.bollExpansion ?? null }
+    if (live?.indicatorState && live.indicatorState.lastTimestamp === live.latestHour && live.rows.size && [...live.rows.keys()].every(hour => live.indicators.has(hour))) return { end: live.latestHour, bars: [...live.rows.values()].sort((a, b) => a.timestamp - b.timestamp).map(row => bar(row, live.indicators.get(row.timestamp))), bollExpansion: live.bollExpansion ?? null }
     const projected = await this.projectSeries(instId, timeframe)
     return { ...projected, bollExpansion: this.liveStates.get(seriesKey(instId, timeframe))?.bollExpansion ?? null }
   }
@@ -439,13 +550,13 @@ export class PreparedChartPipeline {
   observe(rows, previous) {
     for (const [key, batch] of Map.groupBy(rows, row => seriesKey(row.instrument, row.timeframe))) {
       const state = this.series.get(key), live = this.liveStates.get(key)
+      let changedFrom = Infinity
       for (const current of [state, live].filter(Boolean)) {
-        let correction = false
         for (const row of batch.toSorted((a, b) => a.timestamp - b.timestamp)) {
           const changed = !samePrice(previous.get(row.timestamp), row)
           if (changed) {
             current.priceVersion += 1
-            if (row.timestamp <= (current.latestHour ?? -Infinity)) correction = true
+            if (row.timestamp <= (current.latestHour ?? -Infinity)) changedFrom = Math.min(changedFrom, row.timestamp)
             else if (current.indicatorState) {
               const value = appendConfirmed(current.indicatorState, row)
               current.bollExpansion = current.indicatorState.bollExpansion
@@ -454,42 +565,34 @@ export class PreparedChartPipeline {
           }
           if (changedSource(previous.get(row.timestamp), row, 1)) current.oiVersion = (current.oiVersion ?? 0) + 1
           if (changedSource(previous.get(row.timestamp), row, 2)) current.takerVersion = (current.takerVersion ?? 0) + 1
-          current.rows.set(row.timestamp, this.normalize(row)); current.latestHour = Math.max(current.latestHour ?? -Infinity, row.timestamp)
+          current.rows.set(row.timestamp, mergeStatistics(current.rows.get(row.timestamp), this.normalize(row))); current.latestHour = Math.max(current.latestHour ?? -Infinity, row.timestamp)
           current.sourceVersion += 1
           if (current.live?.timestamp <= row.timestamp) current.live = null
         }
-        if (correction) { current.generation = ++this.nextGeneration; current.indicatorState = null; current.indicators.clear() }
         const rowLimit = current === live ? TAIL : HISTORY
         if (current.rows.size > rowLimit) for (const hour of [...current.rows.keys()].sort((a, b) => a - b).slice(0, current.rows.size - rowLimit)) { current.rows.delete(hour); current.indicators.delete(hour) }
         this.updateMemory(current)
       }
+      if (changedFrom < Infinity) this.invalidateDerived(state ?? live, changedFrom)
       if (state) {
         this.publish(state); this.seed(state, key === this.focusKey ? 'foreground' : 'background')
-        if (state.indicatorState?.count % CHUNK === 0) this.persistCheckpoint(state)
       }
       else if (live && this.universe.has(key)) this.publish(live)
     }
   }
 
-  persistCheckpoint(state) {
-    if (!this.store.writeIndicatorCheckpoint || !state.indicatorState) return
-    const checkpoint = structuredClone(state.indicatorState), generation = state.generation
-    this.job(`checkpoint:${state.key}:${checkpoint.lastTimestamp}`, async () => {
-      const sourceRevision = await (this.store.priceWatermark?.(state.instId, state.timeframe, 'background') ?? this.store.candleWatermark(state.instId, state.timeframe, 'background'))
-      if (generation !== state.generation) return
-      await this.store.writeIndicatorCheckpoint({ instrument: state.instId, timeframe: state.timeframe, timestamp: checkpoint.lastTimestamp,
-        formulaVersion: FORMULA_VERSION, state: checkpoint, sourceRevision, bollExpansion: checkpoint.bollExpansion }, 'background')
-    }).catch(() => {})
-  }
 
   async observeStatistics(instId, timeframe, from, through) {
     const key = seriesKey(instId, timeframe), state = this.series.get(key), live = this.liveStates.get(key)
     for (const current of [state, live].filter(Boolean)) {
       const hours = [...current.rows.keys()].filter(hour => hour >= from && hour <= through)
       if (!hours.length) continue
+      const admittedOI = current.oiVersion, admittedTaker = current.takerVersion
       const rows = await this.store.candles({ instrument: instId, timeframe, from: Math.min(...hours), through: Math.max(...hours), limit: HISTORY, order: 'asc' }, 'background')
+      const allowed = (admittedOI === current.oiVersion ? 1 : 0) | (admittedTaker === current.takerVersion ? 2 : 0)
       for (const row of rows) if (current.rows.has(row.timestamp)) {
-        const previous = current.rows.get(row.timestamp), value = this.normalize(row)
+        const previous = current.rows.get(row.timestamp), normalized = this.normalize(row)
+        const value = mergeStatistics(previous, { ...previous, ...Object.fromEntries(statisticsFields.map(field => [field, normalized[field]])) }, allowed)
         if (changedSource(previous, value, 1)) current.oiVersion = (current.oiVersion ?? 0) + 1
         if (changedSource(previous, value, 2)) current.takerVersion = (current.takerVersion ?? 0) + 1
         current.rows.set(row.timestamp, value)

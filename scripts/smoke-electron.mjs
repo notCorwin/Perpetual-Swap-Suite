@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { _electron } from 'playwright'
 import { once } from 'node:events'
+import { DuckDBInstance } from '@duckdb/node-api'
 import { inspectApp } from './electron-delivery.mjs'
 
 async function deadline(work, label, milliseconds = 60_000) {
@@ -27,6 +28,9 @@ export async function smokeElectron({ app, revision, report: reportPath }) {
   let page
   const errors = []
   const request = value => deadline(page.evaluate(value => window.radarDesktop.request(value), value), 'Desktop request')
+  const legacy = { instrument: 'LEGACY-USDT-SWAP', timeframe: '5m', timestamp: Date.UTC(2024, 0, 1), expiresAt: Date.UTC(2024, 0, 2) }
+  const legacyDirectory = join(userData, 'MarketData', 'candles', 'timeframe=5m', 'instrument=LEGACY-USDT-SWAP', 'date=2024-01-01')
+  const legacyFile = join(legacyDirectory, 'base-200-smoke.parquet')
   const close = async () => {
     const running = electron
     if (!running) return
@@ -95,8 +99,44 @@ export async function smokeElectron({ app, revision, report: reportPath }) {
     return status
   }
   try {
+    // Build the previous format in the Node smoke controller. The candidate
+    // must import it through its own packaged Electron-as-Node child process.
+    await mkdir(legacyDirectory, { recursive: true })
+    const legacyEngine = await DuckDBInstance.create(':memory:'), legacyDB = await legacyEngine.connect()
+    try {
+      const destination = `'${legacyFile.replaceAll("'", "''")}'`
+      await legacyDB.run(`COPY(SELECT 'LEGACY-USDT-SWAP'::VARCHAR AS instrument, '5m'::VARCHAR AS timeframe,
+        ${legacy.timestamp}::BIGINT AS timestamp, 100::DOUBLE AS open, 103::DOUBLE AS high, 99::DOUBLE AS low, 102::DOUBLE AS close,
+        20::DOUBLE AS volume, 0.2::DOUBLE AS baseVolume, 20.4::DOUBLE AS quoteVolume, true AS confirmed,
+        1234::DOUBLE AS oi, 8::DOUBLE AS buy, 12::DOUBLE AS sell, 1::INTEGER AS statisticsVersion,
+        ${legacy.expiresAt}::BIGINT AS statisticsOIExpiresAt, ${legacy.expiresAt}::BIGINT AS statisticsTakerExpiresAt,
+        ${legacy.timestamp + 300_000}::BIGINT AS writtenAt
+        UNION ALL SELECT 'LEGACY-USDT-SWAP'::VARCHAR, '5m'::VARCHAR, ${legacy.timestamp + 300_000}::BIGINT,
+        100::DOUBLE, 103::DOUBLE, 99::DOUBLE, 102::DOUBLE, 20::DOUBLE, 0.2::DOUBLE, 20.4::DOUBLE, true,
+        NULL::DOUBLE, NULL::DOUBLE, NULL::DOUBLE, 11::INTEGER, ${legacy.expiresAt}::BIGINT, ${legacy.expiresAt}::BIGINT,
+        ${legacy.timestamp + 600_000}::BIGINT) TO ${destination} (FORMAT PARQUET)`)
+    } finally { legacyDB.closeSync(); legacyEngine.closeSync() }
     await launch()
     report.checks.push('packaged executable, revision, window, preload isolation')
+    const readLegacy = async () => {
+      const rows = await request({ e2e: { action: 'readCandles', instrument: legacy.instrument,
+        timeframe: legacy.timeframe, from: legacy.timestamp, through: legacy.timestamp + 300_000 } })
+      assert.equal(rows.length, 2, 'The packaged native importer must return numeric facts and unavailable-source evidence.')
+      for (const [index, row] of rows.entries()) {
+        for (const [field, expected] of Object.entries({ timestamp: legacy.timestamp + index * 300_000, open: 100, high: 103, low: 99, close: 102,
+          volume: 20, baseVolume: 0.2, quoteVolume: 20.4, confirmed: true })) assert.equal(row[field], expected, `Imported ${field} must preserve its original value and unit.`)
+        assert.ok(Math.abs(row.quoteVolume / row.baseVolume - row.close) < 1e-12)
+      }
+      const [numeric, unavailable] = rows
+      for (const [field, expected] of Object.entries({ oi: 1234, buy: 8, sell: 12, statisticsVersion: 1,
+        statisticsOIExpiresAt: null, statisticsTakerExpiresAt: null })) assert.equal(numeric[field], expected, `Numeric ${field} must follow the canonical non-expiring facts contract.`)
+      assert.equal(numeric.buy + numeric.sell, numeric.volume)
+      for (const [field, expected] of Object.entries({ oi: null, buy: null, sell: null, statisticsVersion: 11,
+        statisticsOIExpiresAt: legacy.expiresAt, statisticsTakerExpiresAt: legacy.expiresAt })) assert.equal(unavailable[field], expected, `Unavailable ${field} must preserve its original expired observation proof.`)
+      return rows
+    }
+    const importedLegacy = await readLegacy()
+    report.checks.push('packaged Electron-as-Node native import: OHLC, contract/base/quote units and original statistics proof')
     const streamingLiquidity = await deadline(electron.evaluate(async ({ app: desktopApp }) => {
       const { join: joinPath } = process.getBuiltinModule('node:path')
       const { pathToFileURL, fileURLToPath } = process.getBuiltinModule('node:url')
@@ -161,8 +201,10 @@ export async function smokeElectron({ app, revision, report: reportPath }) {
     report.checks.push('packaged chart worker and initialized indicators')
     await close()
     report.checks.push('normal exit')
+    await writeFile(legacyFile, 'Retained recovery source intentionally invalidated after durable import.')
     await launch()
     assert.deepEqual(await readCandles(), saved, 'Completed candles must survive process restart.')
+    assert.deepEqual(await readLegacy(), importedLegacy, 'Restart must reuse SQLite facts without rereading the retained archive.')
     await close()
     assert.deepEqual(errors, [], 'The packaged renderer must not raise page errors.')
     report.checks.push('restart, revision, and persistent history')
