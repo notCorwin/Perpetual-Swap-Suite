@@ -29,6 +29,8 @@ The contract list stays on the left and the selected contract's chart stays on t
 
 The list shows only contracts that meet every enabled liquidity condition and the USDT perpetual/no-scheduled-closure requirements. Search narrows the visible results. Contracts are ordered by the **absolute signed price change**, largest first; the sign still shows whether the price rose or fell.
 
+Changing liquidity thresholds immediately reevaluates fresh observations in memory. Source updates and missing history continue in the background; contracts with missing or expired required observations stay unqualified. Completed volume windows are reused until their next candle boundary or a durable source correction.
+
 The default ranking lookback is **15 minutes**, calculated from completed native **5m** candle closes. Change it in **Settings → Ranking lookback (minutes)** using multiples of five minutes. Ranking lookback and chart timeframe are separate persisted settings: choosing a 1h chart does not change a 15-minute ranking window.
 
 Rankings reuse completed candles in memory, and changing the lookback calculates immediately when that window is cached. Missing candles are repaired in the background. The previous confirmed ranking keeps its original timestamp until a newer complete window is available; the last confirmed ranking is also restored on restart.

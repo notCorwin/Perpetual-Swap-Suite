@@ -255,7 +255,7 @@ test('failed and empty observations retain an existing valid lease without exten
     const retained = f.service.metadata.getCatalogEntry(instId)
     assert.equal(retained.status, 'verified')
     assert.equal(retained.observations.openInterest.observedAt, initial.observations.openInterest.observedAt)
-    assert.equal(retained.expiresAt, initial.expiresAt)
+    assert.ok(retained.expiresAt <= initial.observations.openInterest.expiresAt, 'Renewed instrument metadata cannot extend the retained open-interest source lease.')
     f.service.catalog.get(instId).expiresAt = Date.now() - 1
     assert.equal((await f.service.snapshot()).rows.length, 0)
   } finally { await f.close() }
@@ -284,9 +284,9 @@ test('qualified contracts renew independently while discovery waits for another 
     f.service.updateRanking = async () => undefined
     const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
     await f.store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 200_000 })))
-    f.service.history.ensurePrices = async (id: string) => {
+    f.service.history.ensurePrices = async (id: string, timeframe: string, from: number, through: number) => {
       if (id === otherID) { blocked = true; await historyGate }
-      return { rows: [] }
+      return { rows: await f.store.candles({ instrument: id, timeframe, from, through }) }
     }
     await f.service.refresh()
     assert.equal(f.service.catalog.has(instId), true)
@@ -354,7 +354,10 @@ test('historical preparation completes before live liquidity and refreshes a tic
     f.service.updateRanking = async () => undefined
     const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
     await f.store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 200_000 })))
-    f.service.history.ensurePrices = async () => { preparing = true; await historyGate; return { rows: [] } }
+    f.service.history.ensurePrices = async (id: string, timeframe: string, from: number, through: number) => {
+      preparing = true; await historyGate
+      return { rows: await f.store.candles({ instrument: id, timeframe, from, through }) }
+    }
     refresh = f.service.refresh()
     await waitFor(() => preparing)
     assert.deepEqual([tickerCalls, bookCalls, oiCalls], [1, 0, 0])
@@ -383,6 +386,8 @@ test('overlapping discovery and renewal checks share one instrument observation 
     f.service.updateRanking = async () => undefined
     const put = f.service.metadata.putCatalogEntry.bind(f.service.metadata)
     f.service.metadata.putCatalogEntry = (record: unknown) => { writes += 1; return put(record) }
+    const observedAt = Date.now()
+    f.service.instrumentObservations.set(instId, { observedAt, expiresAt: observedAt + 90_000 })
     const key = JSON.stringify(configuration.liquidity)
     first = f.service.checkCandidate(instrument, configuration.liquidity, key, new AbortController().signal)
     await waitFor(() => oiCalls === 1)
@@ -444,7 +449,7 @@ test('known failing historical turnover does not consume live liquidity requests
   try {
     const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
     await f.store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 1 })))
-    f.service.history.ensurePrices = async () => ({ rows: [] })
+    f.service.history.ensurePrices = async (id: string, timeframe: string, from: number, through: number) => ({ rows: await f.store.candles({ instrument: id, timeframe, from, through }) })
     await f.service.refresh()
     assert.equal(liveCalls, 0)
     const snapshot = await f.service.snapshot()
@@ -985,4 +990,291 @@ test('an explicit REST confirmed revision invalidates the prepared generation an
     const bar = after!.bars.find(bar => bar.hour === timestamp)!
     assert.deepEqual([bar.close, bar.oi, bar.buy, bar.sell], [200, 10, 20, 30])
   } finally { await f.close() }
+})
+
+const isolateQualification = (service: MarketService) => {
+  service.projectListEntry = async () => null
+  service.updateRanking = async () => undefined
+  service.readListBars = async () => ({ bars: [] })
+  service.scheduleListProjection = () => undefined
+  for (const lane of service.requestLanes.values()) lane.interval = 0
+}
+
+test('liquidity threshold edits immediately reuse valid observations without network, storage reads, or catalog writes', async () => {
+  const configuration = disabled()
+  configuration.liquidity.spread.enabled = true
+  configuration.liquidity.openInterest.enabled = true
+  let fetches = 0, reads = 0, writes = 0
+  const source = discovery(url => url.pathname.endsWith('/public/open-interest') ? response([{ oiUsd: '6000000' }]) : null)
+  const f = await fixture(configuration, async (...args) => { fetches += 1; return source(...args) })
+  try {
+    isolateQualification(f.service)
+    await f.service.refresh()
+    assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
+    const fetchesBefore = fetches
+    const observationBefore = structuredClone(f.service.observations.get(instId))
+    f.store.candles = async () => { reads += 1; throw new Error('Threshold verification must use memory.') }
+    f.service.metadata.putCatalogEntry = () => { writes += 1; throw new Error('Threshold verification must not persist a fresh lease.') }
+
+    let previous = structuredClone(configuration)
+    configuration.liquidity.openInterest.minUSDT = 7_000_000
+    await f.service.reconfigure(previous)
+    assert.deepEqual(f.service.listRowsFor('15m'), [])
+    previous = structuredClone(configuration)
+    configuration.liquidity.openInterest.minUSDT = 5_000_000
+    await f.service.reconfigure(previous)
+    assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
+    previous = structuredClone(configuration)
+    configuration.liquidity.spread.maxPercent = 0.001
+    await f.service.reconfigure(previous)
+    assert.deepEqual(f.service.listRowsFor('15m'), [])
+    previous = structuredClone(configuration)
+    configuration.liquidity.spread.enabled = false
+    await f.service.reconfigure(previous)
+    assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
+    assert.deepEqual([fetches - fetchesBefore, reads, writes], [0, 0, 0])
+    assert.deepEqual(f.service.observations.get(instId), observationBefore, 'Changing a threshold must not refresh observation timestamps or expiry.')
+  } finally { await f.close() }
+})
+
+test('a liquidity edit does not wait for a previous candidate source that ignores cancellation', async () => {
+  const configuration = disabled(); configuration.liquidity.openInterest.enabled = true
+  const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response([{ oiUsd: '6000000' }]) : null))
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let blocked = false, refresh: Promise<void> | undefined, reconfigured: Promise<void> | undefined
+  try {
+    isolateQualification(f.service)
+    await f.service.refresh()
+    const get = f.service.get.bind(f.service)
+    f.service.get = async (path: string, ...args: unknown[]) => {
+      if (path === '/public/open-interest') {
+        blocked = true
+        await gate
+        return [{ oiUsd: '1' }]
+      }
+      return get(path, ...args)
+    }
+    refresh = f.service.refresh()
+    await waitFor(() => blocked)
+    const previous = structuredClone(configuration)
+    configuration.liquidity.openInterest.minUSDT = 4_000_000
+    reconfigured = f.service.reconfigure(previous)
+    const immediate = await Promise.race([
+      reconfigured.then(() => true),
+      new Promise<boolean>(resolve => setImmediate(() => resolve(false))),
+    ])
+    assert.equal(immediate, true, 'Cached verification must finish while the obsolete source is still blocked.')
+    assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
+    release(); await refresh
+    assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId], 'The obsolete result must not overwrite the new configuration.')
+  } finally { release(); await Promise.allSettled([refresh, reconfigured]); await f.close() }
+})
+
+test('in-memory verification rejects expired observations without extending either valid or expired leases', async () => {
+  const configuration = disabled(); configuration.liquidity.openInterest.enabled = true
+  const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response([{ oiUsd: '6000000' }]) : null))
+  try {
+    isolateQualification(f.service)
+    await f.service.refresh()
+    const observations = f.service.observations.get(instId)
+    const original = structuredClone(observations.openInterest)
+    f.service.verifyCatalog()
+    assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
+    assert.deepEqual(observations.openInterest, original)
+    assert.ok(f.service.catalog.get(instId).expiresAt <= original.expiresAt)
+    observations.openInterest.expiresAt = Date.now() - 1
+    const expired = structuredClone(observations.openInterest)
+    f.service.verifyCatalog()
+    assert.deepEqual(f.service.listRowsFor('15m'), [])
+    assert.equal(f.service.catalogChecks.get(instId).status, 'unknown')
+    assert.deepEqual(observations.openInterest, expired, 'Verification cannot turn an expired source into a fresh observation.')
+    delete observations.openInterest
+    f.service.verifyCatalog()
+    assert.deepEqual(f.service.listRowsFor('15m'), [])
+    assert.equal(f.service.catalogChecks.get(instId).status, 'unknown')
+  } finally { await f.close() }
+})
+
+test('qualification reuses completed historical windows until the 5m or hourly boundary changes', async context => {
+  let now = Math.floor(Date.now() / hour) * hour + 17 * 60_000
+  context.mock.method(Date, 'now', () => now)
+  const configuration = disabled()
+  configuration.liquidity.volume24h.enabled = true
+  configuration.liquidity.volumeStability.enabled = true
+  const f = await fixture(configuration, discovery())
+  const calls: string[] = []
+  try {
+    isolateQualification(f.service)
+    const asOf = Math.floor(now / fiveMinutes) * fiveMinutes, hourlyEnd = Math.floor(now / hour) * hour
+    await f.store.appendCandles([
+      ...Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 200_000 })),
+      ...Array.from({ length: 24 }, (_, index) => ({ ...nativeCandle(hourlyEnd - (24 - index) * hour, '1H'), quoteVolume: 2_000_000 })),
+    ])
+    f.service.history.ensurePrices = async (id: string, timeframe: string, from: number, through: number) => {
+      calls.push(timeframe)
+      return { rows: await f.store.candles({ instrument: id, timeframe, from, through }) }
+    }
+    await f.service.refresh()
+    assert.deepEqual(calls.sort(), ['1H', '5m'])
+    await f.service.refresh()
+    assert.equal(calls.length, 2, 'The unchanged completed windows must not repeat historical preparation.')
+    assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
+
+    now += fiveMinutes
+    f.service.verifyCatalog()
+    assert.deepEqual(f.service.listRowsFor('15m'), [], 'The previous 24h window cannot qualify the next completed 5m boundary.')
+    await f.store.appendCandles([{ ...rawCandle(asOf), quoteVolume: 200_000 }])
+    await f.service.refresh()
+    assert.deepEqual(calls.sort(), ['1H', '5m', '5m'], 'Only the 5m window rolled over.')
+    assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
+
+    now = hourlyEnd + hour + 2 * 60_000
+    const nextAsOf = Math.floor(now / fiveMinutes) * fiveMinutes
+    await f.store.appendCandles([
+      ...Array.from({ length: (nextAsOf - asOf) / fiveMinutes }, (_, index) => ({ ...rawCandle(asOf + index * fiveMinutes), quoteVolume: 200_000 })),
+      { ...nativeCandle(hourlyEnd, '1H'), quoteVolume: 2_000_000 },
+    ])
+    await f.service.refresh()
+    assert.deepEqual(calls.sort(), ['1H', '1H', '5m', '5m', '5m'], 'Both completed windows rolled over at the next hour.')
+    assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
+  } finally { await f.close() }
+})
+
+test('durable volume corrections and replacements invalidate cached qualification facts', async () => {
+  const configuration = disabled(); configuration.liquidity.volume24h.enabled = true
+  const f = await fixture(configuration, discovery())
+  let preparations = 0
+  try {
+    isolateQualification(f.service)
+    const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes, timestamp = asOf - fiveMinutes
+    await f.store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 200_000 })))
+    f.service.history.ensurePrices = async (id: string, timeframe: string, from: number, through: number) => {
+      preparations += 1
+      return { rows: await f.store.candles({ instrument: id, timeframe, from, through }) }
+    }
+    await f.service.refresh()
+    assert.equal(f.service.catalog.get(instId).result.turnover, 57_600_000)
+    await f.service.persistCandles(instId, [{ ...rawCandle(timestamp), quoteVolume: 400_000 }])
+    assert.deepEqual((await f.service.snapshot()).rows, [], 'A corrected historical fact must immediately hide the previous qualification before recomputation.')
+    assert.equal(f.service.metadata.getCatalogEntry(instId).observations.turnover, undefined, 'Restart must not restore the invalidated persisted qualification fact.')
+    assert.equal(f.service.catalogChecks.get(instId).status, 'unknown')
+    await f.service.refresh()
+    assert.equal(preparations, 2, 'A durable quote-volume correction must invalidate the cached 24h total.')
+    assert.equal(f.service.catalog.get(instId).result.turnover, 57_800_000)
+    await f.service.replaceCandles({ instrument: instId, timeframe: '5m', from: timestamp, through: timestamp }, [{ ...rawCandle(timestamp), quoteVolume: 600_000 }])
+    assert.deepEqual((await f.service.snapshot()).rows, [], 'A replacement must immediately hide the previous qualification before recomputation.')
+    assert.equal(f.service.metadata.getCatalogEntry(instId).observations.turnover, undefined)
+    await f.service.refresh()
+    assert.equal(preparations, 3, 'A replacement must invalidate the same cached qualification facts.')
+    assert.equal(f.service.catalog.get(instId).result.turnover, 58_000_000)
+  } finally { await f.close() }
+})
+
+test('a historical correction during a live observation cannot restore the previous qualification total', async () => {
+  const configuration = disabled()
+  configuration.liquidity.volume24h.enabled = true
+  configuration.liquidity.volume24h.minUSDT = 57_500_000
+  configuration.liquidity.openInterest.enabled = true
+  let blockOI = false, blocked = false, preparations = 0
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const f = await fixture(configuration, discovery(async url => {
+    if (!url.pathname.endsWith('/public/open-interest')) return null
+    if (blockOI) { blocked = true; await gate }
+    return response([{ oiUsd: '6000000' }])
+  }))
+  let refresh: Promise<void> | undefined
+  try {
+    isolateQualification(f.service)
+    const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes, timestamp = asOf - fiveMinutes
+    await f.store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 200_000 })))
+    f.service.history.ensurePrices = async (id: string, timeframe: string, from: number, through: number) => {
+      preparations += 1
+      return { rows: await f.store.candles({ instrument: id, timeframe, from, through }) }
+    }
+    await f.service.refresh()
+    assert.equal(f.service.catalog.get(instId).result.turnover, 57_600_000)
+    blockOI = true
+    refresh = f.service.refresh()
+    await waitFor(() => blocked)
+    assert.equal(preparations, 1, 'The pending check starts with the cached completed historical window.')
+    await f.service.persistCandles(instId, [{ ...rawCandle(timestamp), quoteVolume: 0 }])
+    assert.deepEqual((await f.service.snapshot()).rows, [])
+    release(); await refresh
+    const invalidated = f.service.metadata.getCatalogEntry(instId)
+    assert.equal(invalidated.status, 'unknown')
+    assert.equal(invalidated.result.turnover, null, 'Completing a live request must not republish a historical total invalidated during that request.')
+    assert.deepEqual((await f.service.snapshot()).rows, [])
+    blockOI = false
+    await f.service.refresh()
+    const recomputed = f.service.metadata.getCatalogEntry(instId)
+    assert.equal(preparations, 2)
+    assert.equal(recomputed.status, 'failed')
+    assert.equal(recomputed.result.turnover, 57_400_000)
+    assert.deepEqual((await f.service.snapshot()).rows, [])
+  } finally { release(); await refresh; await f.close() }
+})
+
+test('a historical correction after acquisition reads but before it returns cannot publish the obsolete total', async () => {
+  const configuration = disabled(); configuration.liquidity.volume24h.enabled = true
+  const f = await fixture(configuration, discovery())
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let readStarted = false, preparations = 0, refresh: Promise<void> | undefined
+  const publishedTotals: Array<number | null> = []
+  try {
+    isolateQualification(f.service)
+    const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes, timestamp = asOf - fiveMinutes
+    await f.store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 200_000 })))
+    f.service.history.ensurePrices = async (id: string, timeframe: string, from: number, through: number) => {
+      preparations += 1
+      const rows = await f.store.candles({ instrument: id, timeframe, from, through })
+      readStarted = true
+      await gate
+      return { rows }
+    }
+    const put = f.service.metadata.putCatalogEntry.bind(f.service.metadata)
+    f.service.metadata.putCatalogEntry = (record: any) => {
+      publishedTotals.push(record.result.turnover)
+      return put(record)
+    }
+    refresh = f.service.refresh()
+    await waitFor(() => readStarted)
+    assert.equal(f.service.observations.get(instId)?.turnover, undefined, 'The first historical observation is not available yet.')
+    await f.service.persistCandles(instId, [{ ...rawCandle(timestamp), quoteVolume: 400_000 }])
+    release(); await refresh
+    assert.equal(preparations, 1, 'A durable correction needs a local reread, without repeating historical acquisition.')
+    assert.equal(f.service.observations.get(instId).turnover.value.turnover, 57_800_000)
+    assert.equal(f.service.catalog.get(instId).result.turnover, 57_800_000)
+    assert.deepEqual(publishedTotals, [57_800_000], 'The original acquired rows must never become a persisted qualification fact.')
+  } finally { release(); await refresh; await f.close() }
+})
+
+test('a rejected contract restored with fresh instrument and liquidity observations qualifies offline after relaxing its threshold', async () => {
+  const configuration = disabled()
+  configuration.liquidity.openInterest.enabled = true
+  configuration.liquidity.openInterest.minUSDT = 7_000_000
+  const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response([{ oiUsd: '6000000' }]) : null))
+  let restored: MarketService | undefined, fetches = 0, reads = 0
+  try {
+    isolateQualification(f.service)
+    await f.service.refresh()
+    const rejected = f.service.metadata.getCatalogEntry(instId)
+    assert.equal(rejected.status, 'failed')
+    assert.ok(rejected.instrumentObservation.expiresAt > Date.now(), 'A rejected criterion must preserve its independently fresh instrument metadata.')
+    await f.service.dispose()
+    restored = new MarketService(f.store, () => configuration, async () => { fetches += 1; throw new Error('Offline') }, false)
+    await restored.ready
+    isolateQualification(restored)
+    f.store.candles = async () => { reads += 1; throw new Error('Restored verification must use its saved observations.') }
+    assert.deepEqual(restored.listRowsFor('15m'), [])
+    const previous = structuredClone(configuration)
+    configuration.liquidity.openInterest.minUSDT = 5_000_000
+    await restored.reconfigure(previous)
+    assert.deepEqual(restored.listRowsFor('15m').map(row => row.instId), [instId])
+    assert.deepEqual([fetches, reads], [0, 0])
+    assert.deepEqual(restored.observations.get(instId).openInterest, rejected.observations.openInterest)
+    assert.deepEqual(restored.instrumentObservations.get(instId), rejected.instrumentObservation)
+  } finally { await restored?.dispose(); await f.close() }
 })

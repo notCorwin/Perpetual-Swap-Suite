@@ -135,26 +135,45 @@ function bookSide(levels, instrument, side) {
     const amount = multiply(contracts, units)
     const quote = denomination === 'USDT' ? amount : multiply(amount, price)
     depth = add(depth, quote)
-    if (contracts.n > 0n) parsed.push({ price, quote })
+    if (contracts.n > 0n) parsed.push({ price, quote, through: depth })
   }
   return { levels: parsed, depth }
 }
 
 function sideSlippage(side, target, direction) {
-  if (!side?.levels.length || !target) return null
-  let remaining = target, baseQuantity = ZERO
-  for (const level of side.levels) {
-    const take = compare(level.quote, remaining) < 0 ? level.quote : remaining
-    baseQuantity = add(baseQuantity, divide(take, level.price))
-    remaining = subtract(remaining, take)
-    if (remaining.n === 0n) break
+  if (!side?.levels.length || !target || compare(side.depth, target) < 0) return null
+  // Find the terminal fill level, then reuse exact quantities for fully
+  // consumed levels. A trade-size edit only recalculates its partial fill.
+  let first = 0, last = side.levels.length - 1
+  while (first < last) {
+    const middle = Math.floor((first + last) / 2)
+    if (compare(side.levels[middle].through, target) < 0) first = middle + 1
+    else last = middle
   }
-  if (remaining.n !== 0n || baseQuantity.n <= 0n) return null
+  const prefix = side.baseQuantities ??= [ZERO]
+  while (prefix.length <= first) {
+    const level = side.levels[prefix.length - 1]
+    prefix.push(add(prefix.at(-1), divide(level.quote, level.price)))
+  }
+  const level = side.levels[first], remaining = subtract(target, first ? side.levels[first - 1].through : ZERO)
+  const baseQuantity = add(prefix[first], divide(remaining, level.price))
+  if (baseQuantity.n <= 0n) return null
   const average = divide(target, baseQuantity), reference = side.levels[0].price
   return multiply(divide(direction === 'ask' ? subtract(average, reference) : subtract(reference, average), reference), HUNDRED)
 }
 
 export function evaluateLiquidity(input) {
+  return evaluateLiquiditySnapshot(input)
+}
+
+// Market observations are immutable snapshots. Cache their exact fractions,
+// never rounded output values, while comparing every new threshold afresh.
+export function createLiquidityEvaluator() {
+  const books = new WeakMap()
+  return input => evaluateLiquiditySnapshot(input, books)
+}
+
+function evaluateLiquiditySnapshot(input, books) {
   const { instrument, ticker, book, openInterest, hourlyCandles, turnover24hUSDT, asOf, config } = input ?? {}
   const metadata = instrumentCheck(instrument)
   const checks = [{ key: 'instrument', ...metadata, value: null }]
@@ -181,13 +200,22 @@ export function evaluateLiquidity(input) {
     return threshold(spread, configured(criterion, 'maxPercent'), comparison => comparison < 0, `Spread must be strictly below ${criterion.maxPercent}%.`)
   })
 
-  let bidSide, askSide
+  let bidSide, askSide, snapshot
   const loadBook = () => {
     if (bidSide === undefined) {
-      bidSide = bookSide(book?.bids, instrument, 'bid')
-      askSide = bookSide(book?.asks, instrument, 'ask')
-      // A crossed snapshot cannot support either depth or fill calculations.
-      if (bidSide?.levels.length && askSide?.levels.length && compare(bidSide.levels[0].price, askSide.levels[0].price) > 0) bidSide = askSide = null
+      const units = [instrument?.instId, instrument?.ctVal, instrument?.ctMult, instrument?.ctValCcy].join('|')
+      const cacheable = book && typeof book === 'object'
+      snapshot = cacheable ? books?.get(book) : null
+      if (!snapshot || snapshot.units !== units) {
+        bidSide = bookSide(book?.bids, instrument, 'bid')
+        askSide = bookSide(book?.asks, instrument, 'ask')
+        // A crossed snapshot cannot support either depth or fill calculations.
+        if (bidSide?.levels.length && askSide?.levels.length && compare(bidSide.levels[0].price, askSide.levels[0].price) > 0) bidSide = askSide = null
+        snapshot = { units, bidSide, askSide }
+        if (cacheable) books?.set(book, snapshot)
+      }
+      bidSide = snapshot.bidSide
+      askSide = snapshot.askSide
       result.depthBid = numeric(bidSide?.depth)
       result.depthAsk = numeric(askSide?.depth)
     }
@@ -207,7 +235,11 @@ export function evaluateLiquidity(input) {
     loadBook()
     const target = configured(criterion, 'notionalUSDT'), maximum = configured(criterion, 'maxPercent')
     if (!target || !maximum) return unknown('Slippage requires finite positive notionalUSDT and maxPercent.')
-    const ask = sideSlippage(askSide, target, 'ask'), bid = sideSlippage(bidSide, target, 'bid')
+    if (!snapshot.slippage || snapshot.slippage.notionalUSDT !== criterion.notionalUSDT) snapshot.slippage = {
+      notionalUSDT: criterion.notionalUSDT,
+      ask: sideSlippage(askSide, target, 'ask'), bid: sideSlippage(bidSide, target, 'bid'),
+    }
+    const { ask, bid } = snapshot.slippage
     result.askSlippage = numeric(ask)
     result.bidSlippage = numeric(bid)
     if (ask && compare(ask, maximum) >= 0 || bid && compare(bid, maximum) >= 0) {
