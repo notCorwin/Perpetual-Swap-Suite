@@ -830,3 +830,70 @@ test('a missing durable mutation event cannot authorize rebasing even a later-pr
     }
   } finally { hold.resolve(); await f.close() }
 })
+
+test('cold adjacent acquisition retains its full 1280-before and 256-ahead reserve and reuses the active admission', async context => {
+  const rows = source(8192), target = rows.at(-1)!.timestamp - 905 * interval
+  let f: ReturnType<typeof fixture>
+  f = fixture(rows.slice(-1000), {
+    async ensurePrices(_id: string, _timeframe: string, from: number, through: number) {
+      const page = rows.filter(row => row.timestamp >= from && row.timestamp <= through), prior = new Map()
+      for (const row of page) for (const [hour, value] of f.store.change(row)) prior.set(hour, value)
+      f.pipeline.observe(page, prior)
+    },
+  })
+  const { pipeline, store } = f
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await pipeline.prepare(instId, '15m', target, 1280); await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`), keys = [...state.rows.keys()].sort((a: number, b: number) => a - b)
+    const first = target - 1279 * interval, last = target + 256 * interval, admitted = state.historyRange
+    const reads = store.queries.length
+    await pipeline.localHistory(instId, '15m', target - interval); await finishSeed(pipeline)
+    context.diagnostic(JSON.stringify({ retainedFirst: keys[0], expectedFirst: first, retainedLast: keys.at(-1), expectedLast: last,
+      retained: keys.length, admitted, revisitReads: store.queries.length - reads }))
+    assert.equal(keys[0], first, 'Older acquired reserve pages must remain resident instead of competing with excess newer rows.')
+    assert.equal(keys.at(-1), last)
+    assert.equal(keys.length, 1536)
+    assert.ok(admitted.from <= first && admitted.through >= last, 'A subpage read cannot replace the active reserve admission.')
+    assert.equal(store.queries.length, reads, 'A neighboring resident viewport must reuse the acquired canonical reserve.')
+    assert.ok(pipeline.liveStates.get(state.key).rows.size <= 128)
+  } finally { await pipeline.dispose() }
+})
+
+test('a latest-boundary history admission is reusable when its end is implicit', async () => {
+  const rows = source(8192), { pipeline, store } = fixture(rows)
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await pipeline.localHistory(instId, '15m', undefined); await finishSeed(pipeline)
+    const reads = store.queries.length
+    await pipeline.localHistory(instId, '15m', rows.at(-2)!.timestamp); await finishSeed(pipeline)
+    assert.equal(store.queries.length, reads, 'An implicit latest end must retain the same canonical admission proof as an explicit end.')
+  } finally { await pipeline.dispose() }
+})
+
+test('returning to latest while one reserve page is held retires the obsolete older-page loop', async () => {
+  const rows = source(8192), target = rows.at(-1)!.timestamp - 905 * interval, hold = deferred(), reached = deferred(), calls: number[] = []
+  let f: ReturnType<typeof fixture>, preparation: Promise<unknown> | undefined
+  f = fixture(rows.slice(-1000), {
+    async ensurePrices(_id: string, _timeframe: string, from: number, through: number) {
+      calls.push(through)
+      if (through === target - 300 * interval) { reached.resolve(); await hold.promise }
+      const page = rows.filter(row => row.timestamp >= from && row.timestamp <= through), prior = new Map()
+      for (const row of page) for (const [hour, value] of f.store.change(row)) prior.set(hour, value)
+      f.pipeline.observe(page, prior)
+    },
+  })
+  const { pipeline } = f
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    preparation = pipeline.prepare(instId, '15m', target, 1280)
+    await reached.promise
+    await pipeline.local(instId, '15m')
+    hold.resolve(); await preparation; await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`)
+    assert.equal(state.historyEnd, null)
+    assert.deepEqual(calls, [target, target - 300 * interval], 'The accepted page may finish, but a retired viewport cannot acquire further older reserve pages.')
+    assert.equal(pipeline.cached(state.key).endHour, rows.at(-1)!.timestamp)
+    assert.equal(state.active, 0)
+  } finally { hold.resolve(); await preparation; await pipeline.dispose() }
+})

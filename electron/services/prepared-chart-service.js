@@ -261,16 +261,18 @@ export class PreparedChartPipeline {
     if (oiChanged) state.oiVersion = (state.oiVersion ?? 0) + 1
     if (takerChanged) state.takerVersion = (state.takerVersion ?? 0) + 1
     if (pricesChanged) this.invalidateDerived(state, changedFrom)
-    this.retainRows(state, HISTORY)
+    this.retainRows(state, this.liveStates.get(state.key) === state ? TAIL : HISTORY)
     const coverage = await this.store.coverage(state.instId, state.timeframe, priority)
     state.latestHour = coverage.last === null ? state.latestHour : Math.max(state.latestHour ?? -Infinity, coverage.last)
     const listing = Number(this.instrument(state.instId)?.listTime)
     state.floor = Number.isFinite(listing) && listing > 0 ? Math.floor(listing / state.intervalMS) * state.intervalMS : null
     state.loaded = true
     if (limit === HISTORY) {
-      const hours = rows.filter(row => row.confirmed).map(row => row.timestamp)
-      state.historyRange = hours.length ? { from: Math.min(...hours), through: Math.max(...hours),
-        revision: residentRevision === this.store.candleRevision?.(state.instId, state.timeframe) ? residentRevision : null } : null
+      const hours = rows.filter(row => row.confirmed && state.rows.has(row.timestamp)).map(row => row.timestamp)
+      // Admission follows the returned facts, including an implicit latest
+      // query. An obsolete subpage cannot certify another active viewport.
+      if (hours.includes(state.historyEnd)) state.historyRange = { from: Math.min(...hours), through: Math.max(...hours),
+        revision: residentRevision === this.store.candleRevision?.(state.instId, state.timeframe) ? residentRevision : null }
     }
     this.updateMemory(state)
     const live = this.liveStates.get(state.key)
@@ -279,12 +281,11 @@ export class PreparedChartPipeline {
   }
 
   retainRows(state, limit) {
-    if (state.rows.size <= limit) return
-    // The resident reserve belongs to the current navigation cursor. Collector
-    // and archive batches cannot turn it into another copy of the latest tail.
-    const anchor = state.historyEnd ?? state.latestHour ?? Math.max(...state.rows.keys())
-    const keep = new Set([...state.rows.keys()].sort((a, b) => Math.abs(a - anchor) - Math.abs(b - anchor) || a - b).slice(0, limit))
-    for (const hour of state.rows.keys()) if (!keep.has(hour)) { state.rows.delete(hour); state.indicators.delete(hour) }
+    if (!state.rows.size) return
+    const historical = state.historyEnd !== null && state.historyEnd !== undefined
+    const anchor = historical ? state.historyEnd : Math.max(...state.rows.keys()), ahead = historical ? HISTORY_AHEAD : 0
+    const first = anchor - (limit - ahead - 1) * state.intervalMS, last = anchor + ahead * state.intervalMS
+    for (const hour of state.rows.keys()) if (hour < first || hour > last) { state.rows.delete(hour); state.indicators.delete(hour) }
   }
 
   invalidateDerived(state, from) {
@@ -363,23 +364,29 @@ export class PreparedChartPipeline {
     let frame = targetEnd === undefined ? await this.local(instId, timeframe) : await this.localHistory(instId, timeframe, targetEnd)
     const state = this.state(instId, timeframe)
     state.active += 1
+    const current = () => !this.closed && this.focusKey === state.key && state.historyEnd === targetEnd
     try {
+      if (targetEnd !== undefined && !current()) return this.historyFrame(state, targetEnd)
       const prices = this.refreshObservations(state, targetEnd, VISIBLE, targetEnd === undefined ? VISIBLE : HISTORY_PAGE)
       if (targetEnd !== undefined) {
         // One native page makes the nearest viewport usable, including the
         // recursive indicators' warmup. Publish it before downloading farther
         // reserve pages; the renderer can advance while this request continues.
         await prices
+        if (!current()) return this.historyFrame(state, targetEnd)
         await this.seed(state, 'foreground')
-        while (!this.closed && state.calculation) await state.calculation
+        while (current() && state.calculation) await state.calculation
+        if (!current()) return this.historyFrame(state, targetEnd)
         this.publish(state)
         const reserve = Math.max(HISTORY_PAGE, Math.min(HISTORY - HISTORY_AHEAD, historyBars))
-        for (let loaded = HISTORY_PAGE; !this.closed && loaded < reserve; loaded += HISTORY_PAGE) {
+        for (let loaded = HISTORY_PAGE; current() && loaded < reserve; loaded += HISTORY_PAGE) {
           const through = targetEnd - loaded * state.intervalMS
           if (through < Math.max(0, state.floor ?? 0)) break
           await this.refreshObservations(state, through, Math.min(HISTORY_PAGE, reserve - loaded))
+          if (!current()) break
           await this.seed(state, 'foreground')
-          while (!this.closed && state.calculation) await state.calculation
+          while (current() && state.calculation) await state.calculation
+          if (!current()) break
           this.publish(state)
         }
         frame = this.historyFrame(state, targetEnd)
@@ -419,7 +426,10 @@ export class PreparedChartPipeline {
         const result = await this.history.latest(instId, timeframe, 'foreground')
         if (result?.live) await this.setLive(instId, timeframe, result.live)
       } else if (typeof this.history.ensurePrices === 'function') await this.history.ensurePrices(instId, timeframe, priceFrom, end, 'foreground')
-      await this.read(state, targetEnd, targetEnd === undefined ? TAIL : HISTORY)
+      // Acquisition pages are source work. Their completion refreshes the
+      // active navigation reserve, never admits an obsolete subpage instead.
+      const cursor = state.historyEnd ?? undefined
+      await this.read(state, cursor, cursor === undefined ? TAIL : HISTORY)
       this.seed(state, 'foreground'); this.publish(state)
       for (let hour = priceFrom; hour <= end; hour += step) if (!numeric(state.rows.get(hour)?.baseVolume)) return false
       return true
