@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { assertCompletePaints, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
+import { assertCompletePaints, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, measureLatencyCoveredPrefetch, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
 
 const root = new URL('../..', import.meta.url).pathname
 const userData = await mkdtemp(join(tmpdir(), 'perp-radar-e2e-'))
@@ -293,11 +293,11 @@ test('the 1600 design workspace keeps both panels and chart selection when searc
   }
 })
 
-test('bulk-warmed history scrolls, reverses, and jumps within 100 ms without historical preparation or downloads in every native timeframe', async () => {
+test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while speculative preparation is stalled in every native timeframe', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  // Any accidental historical preparation is held indefinitely. Source reads
-  // are also stalled after warming, so successful navigation proves that it
-  // depends only on the already transferred durable series.
+  // Adaptive speculative preparation is held indefinitely. Source reads are
+  // also stalled after warming, so navigation must stay independent of both
+  // lanes and use the already transferred durable series.
   await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
   try {
     await openChart(page, fixture)
@@ -322,21 +322,28 @@ test('bulk-warmed history scrolls, reverses, and jumps within 100 ms without his
         const latency = await measurePaintLatency(page, { inputs, targets })
         assert.ok(latency.latestInputToPaintMS < 100, `${timeframe} ${phase.name} took ${latency.latestInputToPaintMS} ms from the latest wheel input to its first paint opportunity.`)
       }
-      assertCompletePaints(await finishPaintProbe(page))
+      const paint = await finishPaintProbe(page)
+      assertCompletePaints(paint)
+      assert.equal(paint.pendingFrames, 0, 'Resident navigation must never wait for the stalled speculative preparation.')
       const after = await readRequestProbe(electron)
       const historicalRequests = after.calls.slice(before.calls.length).filter(call => Number.isFinite(call.endHour))
-      assert.deepEqual(historicalRequests, [], `A warmed ${timeframe} scroll crossed the historical preparation IPC boundary: ${JSON.stringify(historicalRequests)}`)
+      assert.ok(historicalRequests.every(call => call.historyBars > 96), `Resident ${timeframe} targets must only issue bulk speculative preparation: ${JSON.stringify(historicalRequests)}`)
       const sources = separateSourceMaintenance(after.sourceRequests.slice(before.sourceCalls), fixture)
       assert.deepEqual(sources.historical, [], `A warmed ${timeframe} scroll attempted a historical download: ${JSON.stringify(sources.historical)}`)
-      assert.equal(after.held, false, 'Every tested target must already be resident; none may wait for the deliberately held preparation lane.')
+      assert.ok(after.maxHistoricalActive <= 1, 'Resident targets must never queue foreground work behind the stalled speculative preparation.')
       assert.ok(after.transferredHistoryBars >= residentHistoryBars, 'The fixture must exercise a bulk durable-history transfer.')
     }
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
 
+test('historical prefetch covers 1500 ms of network latency before the cold boundary during continuous wheel input', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await measureLatencyCoveredPrefetch(electron, page, fixture)
+})
+
 test('a held history read keeps the last complete paint and coalesces every later wheel event into the latest target', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  await installRequestProbe(electron, fixture.instId, { disableLocalHistory: true })
+  await installRequestProbe(electron, fixture.instId, { disableLocalHistory: true, initialHistoryBars: 1_000, capHistoricalWindows: true })
   try {
     await openChart(page, fixture)
     await removeRequestProbe(electron)
@@ -367,7 +374,7 @@ test('a held history read keeps the last complete paint and coalesces every late
     assert.equal(report.commits.at(-1).end, expectedEnd)
     const requests = await readRequestProbe(electron)
     assert.equal(requests.maxActive, 1)
-    assert.deepEqual(requests.sourceRequests.filter(call => call.path !== '/market/candles'), [], 'Scrolling must reuse durable history, independently of latest-candle refresh timing.')
+    assert.deepEqual(separateSourceMaintenance(requests.sourceRequests, fixture).historical, [], 'Scrolling must reuse durable history, independently of latest-candle refresh timing.')
     assert.ok(requests.calls.length <= 12, `Coalesced history work unexpectedly issued ${requests.calls.length} requests.`)
     assert.ok(!report.commits.some(commit => commit.end === fixture.end - 1_200 * fixture.intervalMS), 'The obsolete held target was presented after a newer input.')
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
@@ -375,7 +382,7 @@ test('a held history read keeps the last complete paint and coalesces every late
 
 test('a late history response cannot overwrite a more recently selected timeframe', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  await installRequestProbe(electron, fixture.instId, { disableLocalHistory: true })
+  await installRequestProbe(electron, fixture.instId, { disableLocalHistory: true, initialHistoryBars: 1_000, capHistoricalWindows: true })
   try {
     await openChart(page, fixture)
     for (const timeframe of fixture.timeframes) {
@@ -399,7 +406,7 @@ test('a late history response cannot overwrite a more recently selected timefram
     assert.ok(final15m >= 0)
     assert.ok(report.commits.slice(final15m).every(commit => commit.timeframe === '15m'), 'An older timeframe repainted after the selected chart was ready.')
     const requests = await readRequestProbe(electron)
-    assert.deepEqual(requests.sourceRequests.filter(call => call.path !== '/market/candles'), [], 'A fully local timeframe switch must reuse historical candles and statistics. Periodic latest two-candle refreshes are independent.')
+    assert.deepEqual(separateSourceMaintenance(requests.sourceRequests, fixture).historical, [], 'A fully local timeframe switch must reuse historical candles and statistics. Periodic latest two-candle refreshes are independent.')
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
 

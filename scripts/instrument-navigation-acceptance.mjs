@@ -257,8 +257,8 @@ export async function exerciseInstrumentNavigation(electron, page, fixture) {
     const firstVisit = await nextFrame(() => first.locator.click(), { expectedInstId: first.instId, timeframe })
     if (holdThisPhase) {
       heldStartedAt = Date.now()
-      // 650 candles exceeds the compact pages while retaining 199 earlier
-      // observations for the canonical EMA200 seed in this 1024-row fixture.
+      // 650 candles exceeds the compact pages. The fixture also covers the
+      // bulk prefetch reserve and 199 earlier observations for EMA200.
       await page.locator('[data-chart-plot]').dispatchEvent('wheel', { deltaY: 7_800 })
       while (!(await navigationRequests(electron)).held) {
         const elapsed = Date.now() - heldStartedAt

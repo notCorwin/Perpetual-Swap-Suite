@@ -22,7 +22,9 @@ test('list and chart share the full-history EMA seed through corrections, evicti
     const chart = await service.prepareChartWindow(instrument.instId, '5m', rows.at(-1)!.timestamp)
     const byHour = new Map(list.bars.map((bar: { hour: number }) => [bar.hour, bar]))
     assert.equal(chart.bars.filter(bar => bar.hour >= rows.at(-1)!.timestamp - 95 * step && bar.hour <= rows.at(-1)!.timestamp).length, 96)
-    for (const bar of chart.bars) for (const field of ['ema', 'rsi6', 'rsi12', 'rsi24', 'vwap', 'bollMiddle'] as const) {
+    const shared = chart.bars.filter(bar => byHour.has(bar.hour))
+    assert.equal(shared.length, list.bars.length, 'The chart navigation history must contain the full bounded list projection.')
+    for (const bar of shared) for (const field of ['ema', 'rsi6', 'rsi12', 'rsi24', 'vwap', 'bollMiddle'] as const) {
       assert.equal(bar[field], (byHour.get(bar.hour) as any)[field], `${field} at ${bar.hour}`)
     }
     return list.bars.at(-1)

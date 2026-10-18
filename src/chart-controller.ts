@@ -3,6 +3,7 @@ import type { PreparedChartResponse, ReadyChartWindow } from './chart-data.ts'
 import { timeframeMilliseconds, type RadarTimeframe } from './timeframe.ts'
 
 export type ChartTarget = { instId: string; timeframe: RadarTimeframe; end: number | null }
+export type ChartPreparation = ChartTarget & { historyBars?: number }
 export type ChartView = {
   requested: ChartTarget | null
   presented: ReadyChartWindow | null
@@ -14,7 +15,7 @@ export type ChartView = {
   unavailable: PreparedChartResponse['unavailable'] | null
 }
 export type ChartTransport = {
-  prepare: (target: ChartTarget) => Promise<PreparedChartResponse>
+  prepare: (target: ChartPreparation) => Promise<PreparedChartResponse>
   local: (instId: string, timeframe: RadarTimeframe) => Promise<PreparedChartResponse | null>
   history?: (target: ChartTarget) => Promise<PreparedChartResponse | null>
   universe: (instIds: string[], timeframe: RadarTimeframe, focusInstId?: string) => Promise<{ frames: PreparedChartResponse[] }>
@@ -32,7 +33,7 @@ export class ChartController {
   private owner = 0
   private active = false
   private demandTargets = new Set<string>()
-  private maintenanceTarget: ChartTarget | null = null
+  private maintenanceTarget: ChartPreparation | null = null
   private localTargets = new Set<string>()
   private localCheckedKey: string | null = null
   private historyTargets = new Set<string>()
@@ -47,6 +48,9 @@ export class ChartController {
   private failureCount = 0
   private retryAt = 0
   private direction = -1
+  private scrollAt = 0
+  private scrollSpeed = 0
+  private preparationMS = 3_000
 
   constructor(transport: ChartTransport, store = new PreparedChartStore()) {
     this.transport = transport
@@ -86,6 +90,10 @@ export class ChartController {
     this.refresh = false
     this.failureCount = 0
     this.retryAt = 0
+    this.scrollAt = 0
+    this.scrollSpeed = 0
+    this.direction = -1
+    this.prefetchAfter = 0
     this.clearTimer()
     this.store.setUniverse(this.universeTimeframe === timeframe ? this.universeIds : [], timeframe, instId)
     this.publish({ ...this.view, unavailable: null })
@@ -106,7 +114,13 @@ export class ChartController {
     const meta = this.store.snapshotMeta(target.instId, target.timeframe)
     const floor = meta?.historyExhausted && meta.oldestHour !== null ? Math.min(latest, meta.oldestHour + 95 * interval) : 95 * interval
     const end = Math.max(floor, Math.min(latest, (target.end ?? latest) + Math.trunc(steps) * interval))
-    this.direction = Math.sign(steps)
+    const now = performance.now()
+    const direction = Math.sign(steps)
+    const elapsed = this.scrollAt ? now - this.scrollAt : Infinity
+    const speed = Math.abs(Math.trunc(steps)) / Math.max(16, Math.min(200, elapsed))
+    this.scrollSpeed = direction !== this.direction || elapsed > 500 ? speed : Math.max(speed, this.scrollSpeed * .8 + speed * .2)
+    this.scrollAt = now
+    this.direction = direction
     this.setTarget({ ...target, end: end >= latest ? null : end })
   }
 
@@ -152,7 +166,7 @@ export class ChartController {
     return ready !== null
   }
 
-  private prefetchTarget(target: ChartTarget): ChartTarget | null {
+  private prefetchTarget(target: ChartTarget): ChartPreparation | null {
     if (Date.now() < this.prefetchAfter) return null
     const window = this.store.window(target.instId, target.timeframe, target.end)
     if (!window) return null
@@ -161,12 +175,17 @@ export class ChartController {
     if (!range) return null
     const meta = this.store.snapshotMeta(target.instId, target.timeframe)
     const earliest = meta?.historyExhausted && meta.oldestHour !== null ? meta.oldestHour + 95 * interval : 95 * interval
-    const candidates = this.direction > 0 ? [range.lastEnd + 96 * interval, range.firstEnd - 96 * interval] : [range.firstEnd - 96 * interval, range.lastEnd + 96 * interval]
-    for (const end of candidates) {
-      if (end < earliest || end > (meta?.latestEnd ?? window.endHour) || Math.abs(end - window.endHour) > 700 * interval) continue
-      const next = { ...target, end }
-      if (this.store.window(next.instId, next.timeframe, end)) continue
-      return next
+    // Reserve enough resident candles for two observed preparation times. Start
+    // with a conservative network budget before the first response is measured.
+    const speed = performance.now() - this.scrollAt <= 500 ? this.scrollSpeed : 0
+    const runway = Math.min(3_072, Math.max(384, Math.ceil(speed * Math.max(3_000, this.preparationMS * 2))))
+    const batch = Math.min(4_000, Math.max(768, runway * 2))
+    for (const direction of [this.direction, -this.direction]) {
+      const distance = direction < 0 ? window.endHour - range.firstEnd : range.lastEnd - window.endHour
+      if (distance > runway * interval) continue
+      const end = direction < 0 ? range.firstEnd - interval : Math.min(meta?.latestEnd ?? window.endHour, range.lastEnd + batch * interval)
+      if (end < earliest || end > (meta?.latestEnd ?? window.endHour) || this.store.window(target.instId, target.timeframe, end)) continue
+      return { ...target, end, historyBars: direction < 0 ? Math.min(4_096, batch + 95) : Math.min(4_096, (end - range.lastEnd) / interval + 95) }
     }
     return null
   }
@@ -204,18 +223,27 @@ export class ChartController {
     const watermark = this.historyWatermark(target)
     const historyKey = `${targetKey(target)}:${watermark}`
     if (this.transport.history) {
-      if (this.historyTargets.has(key)) return
-      if (!ready && this.historyChecked.get(key) !== historyKey
-        || ready && this.historyHydrated.get(key) !== watermark) {
+      const needsHistory = !ready && this.historyChecked.get(key) !== historyKey
+        || ready && this.historyHydrated.get(key) !== watermark
+      if (needsHistory) {
         // Bound local work while allowing a newly selected series to bypass
         // one older read. Further selections coalesce in view.requested.
-        if (this.historyTargets.size < 2) void this.hydrateHistory(target, historyKey, watermark)
-        return
+        if (!this.historyTargets.has(key) && this.historyTargets.size < 2) void this.hydrateHistory(target, historyKey, watermark)
       }
+      // Give the first durable read at this revision a chance to satisfy the
+      // request. Later moving cursors may read locally alongside source work:
+      // requiring an exact cursor miss after every read would defer downloads
+      // until input stopped changing the target.
+      if ((needsHistory || this.historyTargets.has(key)) && (ready || this.historyHydrated.get(key) !== watermark)) return
     }
     if (this.retryAt > Date.now()) { this.wake(this.retryAt - Date.now()); return }
     if (!ready || this.refresh) {
-      if (this.demandTargets.has(key) || this.demandTargets.size >= 2 || this.maintenanceTarget && sameSeries(this.maintenanceTarget, target)) return
+      if (this.demandTargets.has(key) || this.demandTargets.size >= 2) return
+      const maintenance = this.maintenanceTarget
+      // Share a page already covering this cursor. A jump beyond it gets its
+      // own bounded foreground lane instead of waiting for an obsolete page.
+      if (maintenance && sameSeries(maintenance, target) && maintenance.end !== null && target.end !== null
+        && target.end <= maintenance.end && target.end >= maintenance.end - ((maintenance.historyBars ?? 96) - 96) * timeframeMilliseconds(target.timeframe)) return
       // One slow previous selection cannot hold the current contract behind
       // its provider response. Further selections retain only the latest intent.
       this.demandTargets.add(key)
@@ -271,11 +299,14 @@ export class ChartController {
     }
   }
 
-  private async run(job: ChartTarget, kind: 'target' | 'refresh' | 'prefetch') {
+  private async run(job: ChartPreparation, kind: 'target' | 'refresh' | 'prefetch') {
     let failed = false
     let unavailableRetryAt: number | null = null
+    const startedAt = performance.now()
     try {
       const response = await this.transport.prepare(job)
+      const elapsed = performance.now() - startedAt
+      this.preparationMS = Math.max(elapsed, this.preparationMS * .75 + elapsed * .25)
       if (response.error) throw new Error(response.error)
       if (response.unavailable) {
         if (this.active && this.view.requested && targetKey(this.view.requested) === targetKey(job)) {
@@ -284,7 +315,12 @@ export class ChartController {
         } else if (kind === 'prefetch') this.prefetchAfter = Math.max(Date.now() + 5_000, response.unavailable.retryAt)
       } else {
         const accepted = this.store.ingest(response)
-        if (accepted && kind !== 'refresh') this.historyHydrated.delete(seriesKey(job))
+        if (accepted && job.end !== null) {
+          // Historical responses already carry the bounded durable navigation
+          // range. Do not immediately serialize the same bulk history again.
+          const meta = this.store.snapshotMeta(job.instId, job.timeframe)
+          this.historyHydrated.set(seriesKey(job), `${response.generation}:${response.revision}:${meta?.latestEnd ?? -1}:${this.store.historyEpoch(job.instId, job.timeframe)}`)
+        } else if (accepted && kind !== 'refresh') this.historyHydrated.delete(seriesKey(job))
         const prepared = this.store.window(job.instId, job.timeframe, response.endHour)
         if (accepted && !prepared) throw new Error('The selected range does not yet contain 96 complete source candles.')
         if (this.active) this.commit()
@@ -312,7 +348,7 @@ export class ChartController {
 }
 
 export const chartController = new ChartController({
-  prepare: target => window.radarDesktop.request({ chartWindow: { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } }),
+  prepare: target => window.radarDesktop.request({ chartWindow: { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined, historyBars: target.historyBars } }),
   local: (instId, timeframe) => window.radarDesktop.request({ chartLocal: { instId, timeframe } }),
   history: target => window.radarDesktop.request({ chartHistory: { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } }),
   universe: (instIds, timeframe, focusInstId) => window.radarDesktop.request({ chartUniverse: { instIds, timeframe, focusInstId } }),

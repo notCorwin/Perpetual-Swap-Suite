@@ -32,7 +32,7 @@ export type DesktopCommands = {
   cancelGatewayFetch: { input: string; output: { ok: boolean } }
   copyText: { input: string; output: { ok: boolean } }
   captureChart: { input: ChartCaptureBounds & { output?: 'png' }; output: { ok: boolean } }
-  chartWindow: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number }; output: PreparedChartResponse }
+  chartWindow: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number; historyBars?: number }; output: PreparedChartResponse }
   chartLocal: { input: { instId: string; timeframe: RadarTimeframe }; output: PreparedChartResponse | null }
   chartHistory: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number }; output: PreparedChartResponse | null }
   chartUniverse: { input: { instIds: string[]; timeframe: RadarTimeframe; focusInstId?: string }; output: { frames: PreparedChartResponse[] } }

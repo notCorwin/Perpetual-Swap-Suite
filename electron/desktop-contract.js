@@ -65,8 +65,9 @@ function optional(target, source, key, parse) {
 }
 
 function chart(value, path, window = false) {
-  record(value, path, window ? ['instId', 'timeframe', 'endHour'] : ['instId', 'timeframe'], ['instId', 'timeframe'])
+  record(value, path, window ? ['instId', 'timeframe', 'endHour', ...(path === 'chartWindow' ? ['historyBars'] : [])] : ['instId', 'timeframe'], ['instId', 'timeframe'])
   const result = { instId: text(value.instId, `${path}.instId`, { maximum: 256 }), timeframe: choice(value.timeframe, `${path}.timeframe`, TIMEFRAMES) }
+  optional(result, value, 'historyBars', input => number(input, `${path}.historyBars`, 96, 4_096, true))
   return optional(result, value, 'endHour', input => number(input, `${path}.endHour`, 0, Number.MAX_SAFE_INTEGER, true))
 }
 

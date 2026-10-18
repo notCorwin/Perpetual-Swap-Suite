@@ -162,7 +162,9 @@ export async function seedInstrumentNavigationBenchmark(store, marketService) {
   const instIds = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'ADA', 'AVAX', 'LINK', 'DOT', 'LTC', 'BCH', 'SUI', 'APT', 'NEAR', 'TRX', 'TON'].map(symbol => `${symbol}-USDT-SWAP`)
   const timeframes = ['5m', '15m', '1H']
   const intervals = { '5m': FIVE_MINUTES, '15m': 3 * FIVE_MINUTES, '1H': HOUR }
-  const periods = 1_024
+  // Cover the initial bulk prefetch and its canonical indicator warmup so
+  // the held-navigation test measures IPC latency with fully durable sources.
+  const periods = 1_280
   const end = Date.UTC(2025, 9, 17, 12, 0)
   const instruments = []
   const catalog = []

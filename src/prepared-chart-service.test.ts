@@ -59,7 +59,7 @@ test('canonical windows and list projections share full-history math; statistics
     const end = source.at(-1)!.timestamp - 200 * hour
     const original = await f.pipeline.prepare(instId, '1H', end)
     assert.equal(visible(original).length, 96)
-    assert.ok(original.bars.length <= 200)
+    assert.equal(original.bars.length, source.length - 199)
     const oracle = new Map(barsWithIndicators(source, hour).map((bar: any) => [bar.hour, bar]))
     for (const bar of visible(original)) for (const key of ['ema', 'rsi6', 'rsi12', 'rsi24', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc']) assert.equal(bar[key], (oracle.get(bar.hour) as any)[key])
     const projected = await f.pipeline.projectSeries(instId, '1H')
@@ -134,6 +134,67 @@ test('concurrent statistics requests share a task and publish only committed obs
     const older = await f.store.candles({ instrument: instId, timeframe: '5m', through: end - 96 * step })
     assert.ok(older.every(row => !row.statisticsVersion), 'Unrequested observations stay unknown.')
   } finally { release.resolve(); await f.close() }
+})
+
+test('cold directional history overlaps independent source requests and prepares the full requested reserve', async () => {
+  const f = await fixture(), first = Date.UTC(2024, 0, 1), source = Array.from({ length: 700 }, (_, index) => candle(first + index * hour, index))
+  const release = deferred(), pricesWritten = deferred(), priceCalls: any[] = [], statisticsCalls: any[] = []
+  f.instruments.set(instId, { listTime: first })
+  f.pipeline.history = { ...cachedHistory(), async ensurePrices(...args: any[]) {
+    priceCalls.push(args)
+    await release.promise
+    await f.persist(source.filter(row => row.timestamp >= args[2] && row.timestamp <= args[3]).map(missingStatistics))
+    pricesWritten.resolve()
+    return { floor: first }
+  }, async ensureStatistics(...args: any[]) {
+    statisticsCalls.push(args)
+    await pricesWritten.promise
+    await f.persist(source.filter(row => row.timestamp >= args[2] && row.timestamp <= args[3]))
+  } }
+  try {
+    const end = source.at(-1)!.timestamp
+    const pending = f.pipeline.prepare(instId, '1H', end, 512)
+    await waitFor(() => priceCalls.length === 1 && statisticsCalls.length === 1)
+    assert.deepEqual(priceCalls, [[instId, '1H', first, end, 'foreground']])
+    assert.deepEqual(statisticsCalls, [[instId, '1H', end - 511 * hour, end, 'foreground']])
+    release.resolve()
+    const frame = await pending
+    assert.equal(frame.endHour, end)
+    assert.equal(frame.bars.length, 512)
+    assert.equal(frame.bars[0].hour, end - 511 * hour)
+    assert.ok(frame.bars.every((bar: any) => bar.statisticsObserved && bar.statisticsSources === 3))
+    const renderer = new PreparedChartStore()
+    renderer.ingest(frame)
+    for (const offset of [0, 100, 300, 416]) assert.ok(renderer.window(instId, '1H', end - offset * hour), `The ${offset}-bar navigation must already be prepared.`)
+    await f.pipeline.prepare(instId, '1H', end - 200 * hour)
+    assert.equal(priceCalls.length, 1)
+    assert.equal(statisticsCalls.length, 1, 'Navigation inside the reserve must not redownload statistics.')
+  } finally { release.resolve(); pricesWritten.resolve(); await f.close() }
+})
+
+test('an older price extension returns the current viewport in its new canonical generation', async () => {
+  const f = await fixture(), first = Date.UTC(2024, 0, 1), source = Array.from({ length: 1_200 }, (_, index) => candle(first + index * hour, index))
+  const pricesWritten = deferred()
+  f.instruments.set(instId, { listTime: first })
+  f.pipeline.history = { ...cachedHistory(), async ensurePrices(_id: string, _tf: string, from: number, through: number) {
+    await f.persist(source.filter(row => row.timestamp >= from && row.timestamp <= through))
+    pricesWritten.resolve()
+    return { floor: first }
+  }, async ensureStatistics() { await pricesWritten.promise } }
+  try {
+    await f.store.appendCandles(source.slice(600))
+    const current = await f.pipeline.local(instId, '1H')
+    assert.equal(current.bars.length, 96)
+    const frame = await f.pipeline.prepare(instId, '1H', source[999].timestamp, 800)
+    assert.ok(frame.generation > current.generation, 'Older source candles change the recursive indicator seed.')
+    assert.equal(frame.latestEnd, current.endHour)
+    assert.equal(visible(frame, current.endHour).length, 96, 'The replacement generation must retain the complete painted viewport.')
+    const durable = await f.store.candles({ instrument: instId, timeframe: '1H' })
+    const oracle = new Map(barsWithIndicators(durable, hour).map((bar: any) => [bar.hour, bar]))
+    for (const bar of visible(frame, current.endHour)) assert.equal(bar.ema, (oracle.get(bar.hour) as any).ema)
+    assert.equal((await f.pipeline.local(instId, '1H')).bars.length, 96, 'Universe and latest notifications stay compact.')
+    for (const historyBars of [95, 4_097, 96.5]) await assert.rejects(f.pipeline.prepare(instId, '1H', source[999].timestamp, historyBars), /history size/)
+  } finally { pricesWritten.resolve(); await f.close() }
 })
 
 test('transport failures leave statistics unknown; successful empty observations carry truthful leases', async () => {
@@ -217,6 +278,20 @@ test('local history remains bounded with backward bias and fills available forwa
     assert.equal(historical.latestEnd, source.at(-1)!.timestamp)
     assert.ok(historical.bars.at(-1).hour > historical.endHour)
     assert.equal(historical.oldestHour, null); assert.equal(historical.historyExhausted, false)
+  } finally { await pipeline.dispose() }
+})
+
+test('a bounded historical response retains the newer viewport beside a deep resident cache edge', async () => {
+  const first = Date.UTC(2024, 0, 1), source = Array.from({ length: 40_000 }, (_, index) => candle(first + index * step, index, '5m'))
+  const pipeline = createPipeline({ async candles() { return source } })
+  try {
+    const resident = await pipeline.localHistory(instId, '5m')
+    assert.equal(resident.bars.length, 16_384)
+    const firstEnd = resident.bars[95].hour, target = firstEnd - 96 * step
+    const frame = await pipeline.prepare(instId, '5m', target, 3_072)
+    assert.equal(frame.bars.length, 16_384)
+    assert.equal(visible(frame, target + 3_000 * step).length, 96, 'A prefetch must leave room for the complete viewport that is still moving ahead of it.')
+    assert.equal(visible(frame, target - 2_976 * step).length, 96, 'The complete requested backward reserve remains available too.')
   } finally { await pipeline.dispose() }
 })
 
@@ -317,10 +392,13 @@ for (const count of [0, 20]) test(`a new listing with ${count} completed candles
 
 test('only a history task proven provider floor restricts navigation', async () => {
   const f = await fixture(), first = Date.UTC(2024, 0, 1), source = Array.from({ length: 900 }, (_, index) => candle(first + index * hour, index))
-  f.pipeline.history = { ...cachedHistory(), async ensurePrices() { await f.store.appendCandles(source); return { floor: first } } }
+  f.pipeline.history = { ...cachedHistory(), async ensurePrices() { await f.store.appendCandles(source); return { floor: first } },
+    // The independently started statistics source clips its out-of-history
+    // request; the price response then proves the corrected window's floor.
+    async ensureStatistics() {} }
   try {
     await f.store.appendCandles(source.slice(-100))
-    const frame = await f.pipeline.prepare(instId, '1H', first - 500 * hour)
+    const frame = await f.pipeline.prepare(instId, '1H', first - 500 * hour, 512)
     assert.equal(frame.oldestHour, first); assert.equal(frame.endHour, first + 95 * hour)
     assert.equal(frame.historyExhausted, true); assert.equal(frame.indicatorState, 'unavailable')
   } finally { await f.close() }

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { ChartController, type ChartTarget } from './chart-controller.ts'
+import { ChartController, type ChartPreparation } from './chart-controller.ts'
 import type { PreparedChartBar, PreparedChartResponse } from './chart-data.ts'
 import { PreparedChartStore } from './chart-series-store.ts'
 
@@ -27,9 +27,9 @@ const waitFor = async (predicate: () => boolean, timeout = 500) => {
   }
 }
 function transportQueue() {
-  const calls: Array<{ target: ChartTarget; requestedAt: number; resolve: (response: PreparedChartResponse) => void; reject: (error: Error) => void }> = []
+  const calls: Array<{ target: ChartPreparation; requestedAt: number; resolve: (response: PreparedChartResponse) => void; reject: (error: Error) => void }> = []
   let active = 0, maximumActive = 0
-  const prepare = (target: ChartTarget) => {
+  const prepare = (target: ChartPreparation) => {
     active += 1
     maximumActive = Math.max(maximumActive, active)
     return new Promise<PreparedChartResponse>((resolve, reject) => {
@@ -109,10 +109,27 @@ test('a local history miss falls through to source repair without a local retry 
   } finally { close() }
 })
 
+test('a bulk prefetch does not immediately transfer the same durable history again', async () => {
+  const queue = transportQueue()
+  let reads = 0
+  const controller = new ChartController({ ...queue.transport, history: async () => { reads += 1; return null } }, cached())
+  const close = controller.open(btc, '1H')
+  try {
+    await settled()
+    assert.equal(reads, 1)
+    queue.calls[0].resolve(prepared(btc, 1_094, { latestEnd: 1_199 * hour, bars: bars(199, 1_001) }))
+    await settled()
+    assert.equal(reads, 1, 'The bulk preparation response already hydrated this durable revision.')
+    controller.scroll(-200)
+    assert.equal(controller.getSnapshot().pending, false)
+    assert.equal(reads, 1)
+  } finally { close() }
+})
+
 test('a newly selected contract hydrates beside an unresolved local read with bounded concurrency', async () => {
   const queue = transportQueue(), store = cached()
   store.ingest(prepared(eth, 1_199))
-  const reads: { target: ChartTarget; resolve: (value: PreparedChartResponse | null) => void }[] = []
+  const reads: { target: ChartPreparation; resolve: (value: PreparedChartResponse | null) => void }[] = []
   const controller = new ChartController({ ...queue.transport, history: target => new Promise(resolve => { reads.push({ target, resolve }) }) }, store)
   const closeBTC = controller.open(btc, '1H')
   const closeETH = controller.open(eth, '1H')
@@ -136,7 +153,7 @@ test('a newly selected contract hydrates beside an unresolved local read with bo
     reads[0].resolve(prepared(btc, 1_199, { bars: bars(199, 1_001) }))
     await settled()
     assert.equal(controller.getSnapshot().presented?.instId, 'SOL-USDT-SWAP')
-    assert.equal(queue.calls.length, 0)
+    assert.ok(queue.calls.every(call => (call.target.historyBars ?? 96) > 96), 'Fast cached input may prefetch, but never needs foreground preparation.')
   } finally { closeBTC(); closeETH(); closeSOL() }
 })
 
@@ -164,7 +181,7 @@ test('revisiting a market preloads again after history eviction while compact la
     controller.scroll(-100)
     assert.equal(controller.getSnapshot().presented?.endHour, 1_099 * hour)
     assert.equal(controller.getSnapshot().pending, false)
-    assert.equal(queue.calls.length, 0)
+    assert.ok(queue.calls.every(call => (call.target.historyBars ?? 96) > 96), 'Cached navigation may replenish its reserve without blocking the selected window.')
   } finally { closeBTC(); closeETH(); revisitBTC() }
 })
 
@@ -239,6 +256,101 @@ test('cached scrolling commits synchronously while a background request remains 
     assert.equal(view.pending, false)
     assert.notEqual(view.presented, original)
     assert.equal(queue.maximumActive(), 1)
+  } finally { close() }
+})
+
+test('accelerating scrolling starts a bounded bulk prefetch before the ready edge without waiting for input to stop', async t => {
+  let now = 1_000
+  t.mock.method(performance, 'now', () => now)
+  const queue = transportQueue()
+  const controller = new ChartController(queue.transport, cached(1_000, 1_200))
+  const close = controller.open(btc, '1H')
+  try {
+    assert.equal(queue.calls.length, 0, 'Distant history does not need network preparation while idle.')
+    controller.scroll(-1)
+    assert.equal(queue.calls.length, 0)
+    now += 16
+    controller.scroll(-24)
+    assert.equal(queue.calls.length, 1)
+    assert.equal(queue.calls[0].target.end, 1_094 * hour, 'The next page overlaps the earliest resident window.')
+    assert.ok(queue.calls[0].target.historyBars! > 96)
+    assert.ok(queue.calls[0].target.historyBars! <= 4_096)
+    assert.ok(controller.getSnapshot().presented!.endHour - 1_095 * hour > 1_000 * hour, 'Fast input gets more than a thousand candles of runway.')
+    for (let frame = 0; frame < 40; frame += 1) {
+      now += 16
+      controller.scroll(-10)
+      assert.equal(controller.getSnapshot().pending, false)
+    }
+    assert.equal(queue.calls.length, 1, 'Ongoing input shares its in-flight prefetch.')
+    now += 1_500
+    queue.calls[0].resolve(prepared(btc, 1_094, { generation: 2, latestEnd: 2_199 * hour, bars: bars(199, 2_001) }))
+    await settled()
+    assert.equal(controller.getSnapshot().pending, false)
+    const end = controller.getSnapshot().presented!.endHour
+    controller.scroll(-800)
+    assert.equal(controller.getSnapshot().presented?.endHour, end - 800 * hour)
+    assert.equal(controller.getSnapshot().pending, false, 'Crossing the former edge reads the prefetched generation synchronously.')
+  } finally { close() }
+})
+
+test('moving uncached cursors do not starve downloads behind repeated local history misses', async () => {
+  const queue = transportQueue()
+  const reads: ((value: PreparedChartResponse | null) => void)[] = []
+  const controller = new ChartController({ ...queue.transport, history: () => new Promise(resolve => { reads.push(resolve) }) }, cached(1_000, 1_200))
+  const close = controller.open(btc, '1H')
+  try {
+    controller.scroll(-1_500)
+    controller.scroll(-20)
+    assert.equal(queue.calls.length, 0, 'The first durable read can still satisfy the selected cursor.')
+    reads[0](null)
+    await settled()
+    assert.equal(reads.length, 2, 'The current cursor can independently check durable storage.')
+    assert.equal(queue.calls.length, 1, 'Source work starts despite the moving cursor and unresolved second local read.')
+    assert.equal(queue.calls[0].target.end, 679 * hour)
+    controller.scroll(-20)
+    reads[1](null)
+    await settled()
+    assert.equal(queue.calls.length, 1, 'Continuous movement coalesces into the bounded source lane.')
+  } finally { close() }
+})
+
+test('measured slow preparation increases the reserve for later scrolling', async t => {
+  let now = 1_000
+  t.mock.method(performance, 'now', () => now)
+  const queue = transportQueue()
+  const controller = new ChartController(queue.transport, cached())
+  const close = controller.open(btc, '1H')
+  try {
+    now += 8_000
+    queue.calls[0].resolve(prepared(btc, 1_094, { latestEnd: 1_199 * hour, bars: bars(199, 1_001) }))
+    await settled()
+    assert.equal(queue.calls.length, 1, 'The expanded cache has enough idle reserve.')
+    now += 1_000
+    controller.scroll(-20)
+    assert.equal(queue.calls.length, 2, 'An eight-second source response moves the trigger beyond the initial network budget.')
+    assert.equal(queue.calls[1].target.end, 293 * hour)
+    assert.ok(queue.calls[1].target.historyBars! > queue.calls[0].target.historyBars!)
+    assert.equal(controller.getSnapshot().pending, false)
+  } finally { close() }
+})
+
+test('an uncached jump beyond a slow prefetch starts foreground work immediately with bounded concurrency', async () => {
+  const queue = transportQueue()
+  const controller = new ChartController(queue.transport, cached())
+  const close = controller.open(btc, '1H')
+  try {
+    assert.equal(queue.calls.length, 1)
+    controller.scroll(-1_000)
+    assert.equal(queue.calls.length, 2, 'A distant cursor must not wait for the unrelated prefetch response.')
+    assert.equal(queue.calls[1].target.end, 199 * hour)
+    controller.scroll(-20)
+    controller.scroll(-20)
+    assert.equal(queue.calls.length, 2, 'Later misses coalesce behind the bounded foreground lane.')
+    queue.calls[1].resolve(prepared(btc, 199, { latestEnd: 1_199 * hour, bars: bars(0, 200), oldestHour: 0, historyExhausted: true }))
+    await settled()
+    assert.equal(controller.getSnapshot().presented?.endHour, 159 * hour)
+    assert.equal(controller.getSnapshot().pending, false, 'The requested chart completes while the obsolete prefetch remains unresolved.')
+    assert.equal(queue.maximumActive(), 2)
   } finally { close() }
 })
 

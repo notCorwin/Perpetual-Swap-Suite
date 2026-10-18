@@ -25,7 +25,7 @@ export class MarketService {
   restoreCatalog(): Promise<boolean>
   refresh(): Promise<void>
   listRowsFor(timeframe: '5m' | '15m' | '1H'): RankedMarketRow[]
-  prepareChartWindow(instId: string, timeframe: '5m' | '15m' | '1H', end?: number): Promise<PreparedChartWindow>
+  prepareChartWindow(instId: string, timeframe: '5m' | '15m' | '1H', end?: number, historyBars?: number): Promise<PreparedChartWindow>
   setChartUniverse(instIds: string[], timeframe: '5m' | '15m' | '1H', focusInstId?: string): Promise<{ frames: PreparedChartWindow[] }>
   subscribePreparedCharts(listener: (frame: PreparedChartWindow) => void): () => void
   subscribeMarket(listener: () => void): () => void

@@ -15,3 +15,21 @@ test('scroll validation distinguishes bounded latest maintenance from historical
   assert.deepEqual(result.currentMaintenance, [latest])
   assert.deepEqual(result.historical, requests.slice(1))
 })
+
+test('speculative history extensions cannot hide source downloads overlapping saved candles', () => {
+  const first = 3_600_000
+  const fixture = { end: first * 10, series: { '1H': { intervalMS: first, bars: [{ hour: first }] } } }
+  const older = [
+    { path: '/market/history-candles', parameters: { bar: '1H', limit: 100, after: first } },
+    { path: '/rubik/stat/contracts/open-interest-history', parameters: { period: '1H', begin: 0, end: first } },
+  ]
+  const overlapping = [
+    { path: '/market/history-candles', parameters: { bar: '1H', limit: 100, after: first + 1 } },
+    { path: '/rubik/stat/contracts/open-interest-history', parameters: { period: '1H', begin: 0, end: first + 1 } },
+    { path: '/market/history-candles', parameters: { bar: 'unknown', limit: 100, after: first } },
+  ]
+  const result = separateSourceMaintenance([...older, ...overlapping], fixture)
+  assert.deepEqual(result.historicalExtensions, older)
+  assert.deepEqual(result.historical, overlapping)
+  assert.deepEqual(result.currentMaintenance, [])
+})

@@ -105,8 +105,8 @@ async function handleRequest(event, payload) {
   if (request.snapshot) return marketService.snapshot(request.snapshot.timeframe, request.snapshot)
   if (request.dataAudit) return marketService.dataAuditRequest(request.dataAudit)
   if (request.chartWindow) {
-    const { instId, timeframe, endHour } = request.chartWindow
-    return marketService.prepareChartWindow(instId, timeframe, endHour)
+    const { instId, timeframe, endHour, historyBars } = request.chartWindow
+    return marketService.prepareChartWindow(instId, timeframe, endHour, historyBars)
   }
   if (request.chartLocal) return marketService.localChartWindow(request.chartLocal.instId, request.chartLocal.timeframe)
   if (request.chartHistory) return marketService.localChartHistory(request.chartHistory.instId, request.chartHistory.timeframe, request.chartHistory.endHour)

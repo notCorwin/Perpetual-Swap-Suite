@@ -268,6 +268,20 @@ test('ready latest does not advance to an unprepared raw tail and generation cha
   assert.ok(held.bars.every(value => value.ema === 100))
 })
 
+test('a historical bulk response replaces the latest indicator generation atomically', () => {
+  const store = new PreparedChartStore()
+  store.setUniverse([instId], '1H')
+  store.ingestLatest(response(bars(104, 96)))
+  const previous = store.window(instId, '1H')!
+  store.ingest(response(bars(0, 200).map(bar => ({ ...bar, ema: 200 })), {
+    generation: 2, endHour: 100 * hour, latestEnd: 199 * hour,
+  }))
+  assert.equal(store.window(instId, '1H')?.endHour, 199 * hour)
+  assert.ok(store.window(instId, '1H')?.bars.every(bar => bar.ema === 200))
+  assert.ok(previous.bars.every(bar => bar.ema === 100), 'The previously painted snapshot remains immutable.')
+  assert.ok(store.window(instId, '1H', 100 * hour)?.bars.every(bar => bar.ema === 200))
+})
+
 test('complete cache eviction retains the session generation watermark against late replies', () => {
   const store = new PreparedChartStore({ maxSeries: 1 })
   const eth = 'ETH-USDT-SWAP'

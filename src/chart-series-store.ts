@@ -227,8 +227,10 @@ export class PreparedChartStore {
     }
     if (this.universe.has(key)) {
       const previous = this.latestFrames.get(key)
-      const end = response.endHour === response.latestEnd && finite(response.endHour)
-        ? Math.max(previous?.window.endHour ?? -Infinity, response.endHour) : previous?.window.endHour
+      // A historical batch can carry a new indicator generation and a fully
+      // rebuilt latest window together. Repin that window in the same ingest.
+      const end = finite(response.latestEnd) && this.hasRange(instId, timeframe, response.latestEnd - (WINDOW_BARS - 1) * intervalMS, response.latestEnd)
+        ? Math.max(previous?.window.endHour ?? -Infinity, response.latestEnd) : previous?.window.endHour
       const window = end === undefined ? null : this.seriesWindow(current, end)
       if (window) {
         this.latestFrames.set(key, { meta: Object.freeze({ ...current.meta, latestEnd: window.endHour }), window })

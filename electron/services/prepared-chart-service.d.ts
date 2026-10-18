@@ -18,7 +18,7 @@ export class PreparedChartPipeline {
     revision(instId: string): number
     instrument(instId: string): { listTime?: string | number } | undefined
   })
-  prepare(instId: string, timeframe: HistoryTimeframe, targetEnd?: number): Promise<PreparedChartResponse>
+  prepare(instId: string, timeframe: HistoryTimeframe, targetEnd?: number, historyBars?: number): Promise<PreparedChartResponse>
   local(instId: string, timeframe: HistoryTimeframe, options?: { force?: boolean; priority?: HistoryPriority }): Promise<PreparedChartResponse | null>
   /** Fully prepared durable navigation history; never queues an HTTP request. */
   localHistory(instId: string, timeframe: HistoryTimeframe, targetEnd?: number): Promise<PreparedChartResponse | null>

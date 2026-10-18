@@ -477,18 +477,7 @@ export class PreparedChartPipeline {
           if (state.floor !== null && first < state.floor) return null
           const central = Array.from({ length: VISIBLE }, (_, index) => this.bar(state, first + index * step))
           if (central.some(bar => !bar)) return null
-          const before = [], after = [], remaining = LOCAL_HISTORY_BARS - VISIBLE
-          for (let hour = first - step; before.length < remaining && (state.floor === null || hour >= state.floor); hour -= step) {
-            const bar = this.bar(state, hour)
-            if (!bar) break
-            before.push(bar)
-          }
-          for (let hour = end + step; before.length + after.length < remaining && hour <= ceiling; hour += step) {
-            const bar = this.bar(state, hour)
-            if (!bar) break
-            after.push(bar)
-          }
-          const bars = [...before.reverse(), ...central, ...after]
+          const bars = this.navigationBars(state, central, end)
           return this.produced(state, { instId, timeframe, intervalMS: step, endHour: end, latestEnd, oldestHour: state.floor,
             historyExhausted: state.floor !== null && bars[0].hour <= state.floor, generation, revision: this.revision(instId), bars,
             oiState: central.every(bar => bar.oi !== null) ? 'ready' : 'unavailable',
@@ -727,7 +716,7 @@ export class PreparedChartPipeline {
     const missing = []
     for (let hour = from; hour <= through; hour += state.intervalMS) {
       const row = state.rows.get(hour)
-      if (row && (!sourceFresh(row, 1) || !sourceFresh(row, 2))) missing.push(hour)
+      if (!row || !sourceFresh(row, 1) || !sourceFresh(row, 2)) missing.push(hour)
     }
     if (!missing.length) return
     const first = missing[0], end = missing.at(-1)
@@ -851,9 +840,34 @@ export class PreparedChartPipeline {
       takerUnavailableReason: raw.buy === null || raw.sell === null ? 'not-published' : undefined }
   }
 
-  async prepare(instId, timeframe, targetEnd) {
+  navigationBars(state, central, end) {
+    const before = [], after = [], remaining = LOCAL_HISTORY_BARS - central.length, step = state.intervalMS
+    const first = central[0].hour, ceiling = Math.floor(Date.now() / step) * step - step
+    let previous = first - step
+    const extendBefore = limit => {
+      while (before.length < limit && (state.floor === null || previous >= state.floor)) {
+        const bar = this.bar(state, previous)
+        if (!bar) break
+        before.push(bar)
+        previous -= step
+      }
+    }
+    // Leave room on both sides so a prefetch response in a new indicator
+    // generation still contains the viewport that triggered that request.
+    extendBefore(Math.floor(remaining / 2))
+    for (let hour = end + step; before.length + after.length < remaining && hour <= ceiling; hour += step) {
+      const bar = this.bar(state, hour)
+      if (!bar) break
+      after.push(bar)
+    }
+    extendBefore(remaining - after.length)
+    return [...before.reverse(), ...central, ...after]
+  }
+
+  async prepare(instId, timeframe, targetEnd, historyBars = VISIBLE) {
     if (!['5m', '15m', '1H'].includes(timeframe)) throw new Error('Unsupported chart timeframe.')
     if (targetEnd !== undefined && !Number.isFinite(targetEnd)) throw new Error('Invalid chart window end.')
+    if (!Number.isSafeInteger(historyBars) || historyBars < VISIBLE || historyBars > 4_096) throw new Error('Invalid chart history size.')
     if (targetEnd === undefined) {
       const local = await this.local(instId, timeframe)
       if (local) { this.queueRemote(instId, timeframe); return local }
@@ -863,7 +877,7 @@ export class PreparedChartPipeline {
     this.trim()
     try {
       while (!this.closed) {
-        const frame = await this.prepareState(state, targetEnd)
+        const frame = await this.prepareState(state, targetEnd, { historyBars })
         if (targetEnd === undefined) {
           const saved = await this.saveCompact(state, this.compact(frame))
           if (saved) return saved
@@ -877,7 +891,7 @@ export class PreparedChartPipeline {
     finally { state.active -= 1; this.trim() }
   }
 
-  async prepareState(state, targetEnd, { priority = 'prepared' } = {}) {
+  async prepareState(state, targetEnd, { priority = 'prepared', historyBars = VISIBLE } = {}) {
     const { instId, timeframe, intervalMS: step } = state
     await this.load(state, priority === 'chartWarm' ? 'background' : 'foreground')
     this.listingFloor(state)
@@ -899,13 +913,22 @@ export class PreparedChartPipeline {
     let end = Math.min(targetEnd === undefined ? latestEnd : Math.floor(targetEnd / step) * step, ceiling)
     if (state.floor !== null) end = Math.max(end, state.floor + (VISIBLE - 1) * step)
     if (latestEnd !== null && targetEnd === undefined) end = Math.min(end, latestEnd)
-    await this.ensurePrices(state, Math.max(end - (VISIBLE - 1 + WARMUP) * step, state.floor ?? -Infinity), end, priority)
+    const acquire = async () => {
+      const first = Math.max(0, end - (historyBars - 1) * step, state.floor ?? -Infinity)
+      // Statistics start their network reads immediately and coordinate their
+      // own durable price dependencies. Independent source latency overlaps.
+      await Promise.all([
+        this.ensurePrices(state, Math.max(0, first - WARMUP * step, state.floor ?? -Infinity), end, priority),
+        this.ensureStatistics(state, first, end, priority),
+      ])
+    }
+    await acquire()
     latestEnd = this.latest(state)
     if (state.floor !== null) {
       const clampedEnd = Math.min(latestEnd, Math.max(end, state.floor + (VISIBLE - 1) * step))
       if (clampedEnd !== end) {
         end = clampedEnd
-        await this.ensurePrices(state, Math.max(end - (VISIBLE - 1 + WARMUP) * step, state.floor), end, priority)
+        await acquire()
         latestEnd = this.latest(state)
       }
     }
@@ -915,25 +938,25 @@ export class PreparedChartPipeline {
       if (!state.rows.has(hour) || !Number.isFinite(state.rows.get(hour).baseVolume)) throw new Error('A complete 96-candle source window is not available.')
       available.push(state.rows.get(hour))
     }
-    await this.ensureStatistics(state, first, end, priority)
-    if (!state.loaded) return this.prepareState(state, targetEnd, { priority })
+    if (!state.loaded) return this.prepareState(state, targetEnd, { priority, historyBars })
     do { await this.indicators(state, priority === 'chartWarm' ? 'background' : 'foreground') }
     while (state.calculatedVersion !== state.priceVersion || state.calculatedLiveVersion !== state.liveVersion)
-    if (!state.loaded) return this.prepareState(state, targetEnd, { priority })
+    if (!state.loaded) return this.prepareState(state, targetEnd, { priority, historyBars })
     const generation = state.generation
     const central = available.map(row => this.bar(state, row.timestamp))
     if (central.some(bar => !bar)) throw new Error('Chart statistics have not completed preparation.')
+    for (let hour = Math.max(0, end - (historyBars - 1) * step, state.floor ?? -Infinity); hour < first; hour += step) {
+      if (!this.bar(state, hour)) throw new Error('Chart history has not completed preparation.')
+    }
     // Include only contiguous, fully observed neighbors. Prepared data may be
     // navigated immediately; unknown source rows never enter the renderer cache.
-    const before = [], after = []
-    for (let hour = first - step; before.length < 52; hour -= step) { const bar = this.bar(state, hour); if (!bar) break; before.unshift(bar) }
-    for (let hour = end + step; after.length < 52; hour += step) { const bar = this.bar(state, hour); if (!bar) break; after.push(bar) }
+    const bars = targetEnd === undefined ? central : this.navigationBars(state, central, end)
     const oiState = central.every(bar => bar.oi !== null) ? 'ready' : 'unavailable'
     const takerState = central.every(bar => bar.buy !== null && bar.sell !== null) ? 'ready' : 'unavailable'
     const indicatorState = central.every(bar => indicatorFields.every(field => Number.isFinite(bar[field]))) ? 'ready' : 'unavailable'
     return this.produced(state, { instId, timeframe, intervalMS: step, endHour: end, latestEnd, oldestHour: state.floor,
-      historyExhausted: state.floor !== null && first <= state.floor, generation, revision: this.revision(instId),
-      bars: [...before, ...central, ...after], oiState, takerState, indicatorState,
+      historyExhausted: state.floor !== null && bars[0].hour <= state.floor, generation, revision: this.revision(instId),
+      bars, oiState, takerState, indicatorState,
       liveBar: targetEnd === undefined && state.live?.timestamp === end + step ? state.indicators.get(state.live.timestamp) : undefined, error: '' })
   }
 

@@ -959,9 +959,9 @@ export class MarketService {
     if (failed) throw failed.reason
   }
 
-  prepareChartWindow(instId, timeframe, end) {
+  prepareChartWindow(instId, timeframe, end, historyBars = 96) {
     if (this.closing || this.disposed) return Promise.reject(new Error('Market service is closed.'))
-    const task = this.ready.then(() => this.preparedCharts.prepare(instId, timeframe, end))
+    const task = this.ready.then(() => this.preparedCharts.prepare(instId, timeframe, end, historyBars))
     this.barTasks.add(task)
     return task.finally(() => this.barTasks.delete(task))
   }

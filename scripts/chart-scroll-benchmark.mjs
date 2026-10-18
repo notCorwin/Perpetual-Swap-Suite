@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { assertCompletePaints, finishPaintProbe, installRequestProbe, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from './chart-acceptance.mjs'
+import { assertCompletePaints, finishPaintProbe, installRequestProbe, measureLatencyCoveredPrefetch, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from './chart-acceptance.mjs'
 
 const root = new URL('..', import.meta.url).pathname
 
@@ -62,17 +62,19 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
       await sweep('line-mode', { deltaY: -9, deltaMode: 1 }, -12)
       const paint = await finishPaintProbe(page)
       assertCompletePaints(paint)
+      assert.equal(paint.pendingFrames, 0, 'Resident navigation must never wait for stalled speculative preparation.')
       const requests = await readRequestProbe(electron)
       const scrollingRequests = requests.calls.slice(beforeScrolling.calls.length)
       const historicalRequests = scrollingRequests.filter(call => Number.isFinite(call.endHour))
       const scrollingSourceRequests = requests.sourceRequests.slice(beforeScrolling.sourceCalls)
       const sources = separateSourceMaintenance(scrollingSourceRequests, fixture)
-      assert.deepEqual(historicalRequests, [], `Warm scrolling must not prepare historical pages: ${JSON.stringify(historicalRequests)}`)
+      assert.ok(historicalRequests.every(call => call.historyBars > 96), `Resident targets must only issue bulk speculative preparation: ${JSON.stringify(historicalRequests)}`)
       assert.deepEqual(sources.historical, [], `Warm scrolling must not download fixture history: ${JSON.stringify(sources.historical)}`)
-      assert.equal(requests.held, false, 'A warmed target must never wait for the deliberately held historical preparation lane.')
+      assert.ok(requests.maxHistoricalActive <= 1, 'Resident targets must stay independent of the stalled speculative preparation lane.')
       timeframes.push({
         timeframe, phases, ...paint, commits: paint.commits.length,
         preparedRequests: historicalRequests.length,
+        stalledSpeculativePreparation: requests.held,
         heldLatestRefreshRequests: scrollingRequests.length - historicalRequests.length,
         localHistoryReads: requests.historyCalls.filter(call => call.timeframe === timeframe).length,
         transferredHistoryBars: requests.historyResponses.filter(response => response.timeframe === timeframe).reduce((total, response) => total + response.bars, 0),
@@ -92,7 +94,7 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
 const delayedHistory = await withBenchmarkApp(async (electron, page, fixture) => {
   // This case intentionally disables the durable bulk lane before mounting
   // React. Otherwise a 1200-candle jump is correctly an immediate local hit.
-  await installRequestProbe(electron, fixture.instId, { disableLocalHistory: true })
+  await installRequestProbe(electron, fixture.instId, { disableLocalHistory: true, initialHistoryBars: 1_000, capHistoricalWindows: true })
   try {
     await openChart(page, fixture)
     // Prime native latest snapshots before measuring the fallback path.
@@ -140,9 +142,12 @@ const delayedHistory = await withBenchmarkApp(async (electron, page, fixture) =>
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
 
+const latencyCoveredPrefetch = await withBenchmarkApp(measureLatencyCoveredPrefetch)
+
 console.log(JSON.stringify({
   generatedAt: new Date().toISOString(),
   mode: 'real-electron-bulk-history-svg-frame-correctness-and-input-to-paint-opportunity',
   performance: performanceReport,
   delayedHistory,
+  latencyCoveredPrefetch,
 }, null, 2))
