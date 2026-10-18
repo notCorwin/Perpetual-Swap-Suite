@@ -5,7 +5,6 @@ const statuses = new Set(['queued', 'running', 'retry', 'paused', 'cancelled', '
 const terminal = new Set(['paused', 'cancelled', 'completed', 'unavailable'])
 const expirable = new Set(['cancelled', 'completed', 'unavailable'])
 const foregroundReady = Symbol('Foreground history is ready for the source lane.')
-const foregroundBurst = 8
 const clone = value => structuredClone(value)
 const integer = (value, name, minimum = 0) => {
   if (!Number.isSafeInteger(value) || value < minimum) throw new TypeError(`${name} must be a safe integer of at least ${minimum}.`)
@@ -44,7 +43,8 @@ const subtract = (ranges, exclusions, intervalMS) => exclusions.reduce((remainin
 
 /**
  * A bounded pool shared by background targets and foreground repairs, with
- * one active page per source and fair rotation between pages.
+ * configurable source concurrency. Foreground work always runs before
+ * background pages; equal-priority targets rotate between pages.
  * SQLite stores coordination only; every coverage decision is read from the
  * injected Parquet store, including after a crash between write and checkpoint.
  */
@@ -74,6 +74,15 @@ export class HistorySync {
     this.onError = onError
     this.now = now
     this.maxConcurrentTasks = integer(options.maxConcurrentTasks ?? 1, 'maxConcurrentTasks', 1)
+    const sourceLimits = options.maxConcurrentPerSource ?? 1
+    if (typeof sourceLimits !== 'number' && (!sourceLimits || typeof sourceLimits !== 'object' || Array.isArray(sourceLimits))) throw new TypeError('maxConcurrentPerSource must be a positive integer or a source-limit object.')
+    if (typeof sourceLimits === 'number') integer(sourceLimits, 'maxConcurrentPerSource', 1)
+    else for (const [source, limit] of Object.entries(sourceLimits)) {
+      if (!this.sources.has(source)) throw new TypeError(`Unknown maxConcurrentPerSource source: ${source}.`)
+      integer(limit, `maxConcurrentPerSource.${source}`, 1)
+    }
+    this.maxConcurrentPerSource = new Map([...this.sources.keys()].map(source => [source,
+      typeof sourceLimits === 'number' ? sourceLimits : sourceLimits[source] ?? 1]))
     this.minRequestIntervalMS = integer(options.minRequestIntervalMS ?? 125, 'minRequestIntervalMS')
     this.retryBaseMS = integer(options.retryBaseMS ?? 1_000, 'retryBaseMS', 1)
     this.maxRetryDelayMS = integer(options.maxRetryDelayMS ?? 300_000, 'maxRetryDelayMS', this.retryBaseMS)
@@ -89,7 +98,6 @@ export class HistorySync {
     this.draining = null
     this.timer = null
     this.active = new Map()
-    this.foregroundPages = new Map()
     this.wakeDrain = null
     this.lastRequestAt = null
     this.requestTail = Promise.resolve()
@@ -243,8 +251,7 @@ export class HistorySync {
         || expirable.has(task.status) || this.waiters.has(task.id)) continue
       task.status = 'cancelled'
       task.nextAttemptAt = null
-      const active = this.active.get(task.source)
-      if (active?.id === task.id) active.controller.abort()
+      this.active.get(task.id)?.controller.abort()
       await this.save(task)
       this.settle(task)
     }
@@ -268,8 +275,7 @@ export class HistorySync {
     const task = this.requireTask(id)
     task.status = status
     task.nextAttemptAt = null
-    const active = this.active.get(task.source)
-    if (active?.id === task.id) active.controller.abort()
+    this.active.get(task.id)?.controller.abort()
     await this.save(task)
     this.settle(task)
     await this.pruneTerminalTasks()
@@ -343,11 +349,11 @@ export class HistorySync {
     // when an expired target is requested again.
     const persistence = this.persistTail.then(async () => {
       const candidates = [...this.tasks.values()].reverse().filter(task => expirable.has(task.status)
-        && task.id !== this.active.get(task.source)?.id && !this.waiters.has(task.id))
+        && !this.active.has(task.id) && !this.waiters.has(task.id))
         .sort((left, right) => right.updatedAt - left.updatedAt || right.createdAt - left.createdAt)
       for (const task of candidates.slice(this.maxRetainedTerminalTasks)) {
         if (this.tasks.get(task.id) !== task || !expirable.has(task.status)
-          || task.id === this.active.get(task.source)?.id || this.waiters.has(task.id)) continue
+          || this.active.has(task.id) || this.waiters.has(task.id)) continue
         // Remove before awaiting persistence so a concurrent enqueue creates a
         // fresh task whose save is ordered after this deletion.
         this.tasks.delete(task.id)
@@ -419,24 +425,36 @@ export class HistorySync {
     }
   }
 
+  canAdmit(task, timestamp) {
+    if (this.active.has(task.id)) return false
+    const active = [...this.active.values()].filter(entry => entry.source === task.source)
+    if (active.length >= this.maxConcurrentPerSource.get(task.source)) return false
+    // Parallel contracts may share a source, while overlapping windows still
+    // serialize their coverage checks and publication to avoid duplicate gaps.
+    if (active.some(entry => entry.task.instrument === task.instrument && entry.task.timeframe === task.timeframe && intersects(entry.task, task))) return false
+    if (task.priority === 'background') {
+      if (active.some(entry => entry.task.priority === 'background')) return false
+      if ([...this.tasks.values()].some(value => value.source === task.source && value.priority === 'foreground' && !this.active.has(value.id)
+        && (value.status === 'queued' || (value.status === 'retry' && value.nextAttemptAt <= timestamp)))) return false
+    }
+    return true
+  }
+
   async drain() {
     try {
       while (!this.closed && !this.fatalError) {
         const timestamp = this.timestamp()
-        const ready = [...this.tasks.values()].filter(task => !this.active.has(task.source)
+        const ready = [...this.tasks.values()].filter(task => !this.active.has(task.id)
           && (task.status === 'queued' || (task.status === 'retry' && task.nextAttemptAt <= timestamp)))
-          .sort((a, b) => this.admissionPriority(b) - this.admissionPriority(a))
+          .sort((a, b) => Number(b.priority === 'foreground') - Number(a.priority === 'foreground'))
         for (const task of ready) {
           if (this.active.size >= this.maxConcurrentTasks) break
-          if (this.active.has(task.source)) continue
-          const entry = { id: task.id, controller: new AbortController(), promise: null,
-            backgroundTurn: task.priority === 'background' && this.admissionPriority(task) === 2, yielded: false }
-          this.active.set(task.source, entry)
+          if (!this.canAdmit(task, timestamp)) continue
+          const entry = { id: task.id, source: task.source, task, controller: new AbortController(), promise: null }
+          this.active.set(task.id, entry)
           entry.promise = this.run(task, entry.controller).catch(error => this.fail(error)).finally(() => {
             this.settle(task)
-            this.active.delete(task.source)
-            if (!entry.yielded) this.foregroundPages.set(task.source, task.priority === 'foreground'
-              ? Math.min(foregroundBurst, (this.foregroundPages.get(task.source) ?? 0) + 1) : 0)
+            this.active.delete(task.id)
             // Move the just-served target behind its peers even when every
             // page has the same createdAt or the target spans thirty days.
             this.tasks.delete(task.id)
@@ -448,7 +466,7 @@ export class HistorySync {
         // candle task that was added after the other sources began fetching.
         let wake
         const changed = new Promise(resolve => { wake = resolve; this.wakeDrain = resolve })
-        const retries = [...this.tasks.values()].filter(task => task.status === 'retry' && !this.active.has(task.source))
+        const retries = [...this.tasks.values()].filter(task => task.status === 'retry' && this.canAdmit(task, timestamp))
         const deadline = this.active.size < this.maxConcurrentTasks && retries.length
           ? setTimeout(wake, Math.min(2_147_483_647, Math.max(1, Math.min(...retries.map(task => task.nextAttemptAt)) - this.timestamp()))) : null
         try { await Promise.race([changed, ...[...this.active.values()].map(entry => entry.promise)]) }
@@ -464,13 +482,6 @@ export class HistorySync {
     }
   }
 
-  admissionPriority(task) {
-    // A continuously renewed foreground universe must leave room for durable
-    // history. The allowance is per source, so a busy candle lane cannot
-    // penalize OI or Taker, and each allowance covers only one bounded page.
-    return task.priority === 'foreground' ? 1 : (this.foregroundPages.get(task.source) ?? 0) >= foregroundBurst ? 2 : 0
-  }
-
   async callSource(operation, signal, task) {
     let response
     const admission = this.requestTail.then(async () => {
@@ -482,7 +493,7 @@ export class HistorySync {
       signal.throwIfAborted()
       // Foreground repairs preempt their own source only. Other active sources
       // may depend on this background page, so cross-source yielding can starve.
-      if (task.priority === 'background' && !this.active.get(task.source)?.backgroundTurn
+      if (task.priority === 'background'
         && [...this.tasks.values()].some(value => value.source === task.source && value.priority === 'foreground'
         && (value.status === 'queued' || (value.status === 'retry' && value.nextAttemptAt <= this.timestamp())))) throw foregroundReady
       // Record after synchronous admission so a CPU pause before the source
@@ -568,7 +579,6 @@ export class HistorySync {
       await this.save(task)
     } catch (error) {
       if (signal.aborted || error === foregroundReady) {
-        if (error === foregroundReady) this.active.get(task.source).yielded = true
         if (task.status === 'running') {
           task.status = 'queued'
           await this.save(task)

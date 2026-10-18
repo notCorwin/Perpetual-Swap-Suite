@@ -88,7 +88,6 @@ export class MarketStore {
     this.instance = instance
     this.queue = []
     this.draining = false
-    this.foregroundJobs = 0
     this.lastWrittenAt = 0
     this.closed = false
     this.closeTask = null
@@ -101,9 +100,8 @@ export class MarketStore {
   // DuckDB connections are not a concurrent query coordinator. Keep every
   // query and write on this connection in one ordered lane, and close only
   // after that lane has drained. Foreground work (the focused chart) cuts in
-  // front of queued background reads, with one background turn after a
-  // bounded burst so history writes survive continuous market verification.
-  // Background work keeps arrival order among itself.
+  // front of all queued background work. An active write completes before
+  // the next job starts; background work keeps arrival order among itself.
   enqueue(operation, priority = 'background') {
     if (this.closed) return Promise.reject(new Error('MarketStore is closed.'))
     return new Promise((resolve, reject) => {
@@ -122,9 +120,7 @@ export class MarketStore {
     this.draining = true
     try {
       while (this.queue.length) {
-        const background = this.foregroundJobs >= 8 ? this.queue.findIndex(job => job.priority !== 'foreground') : -1
-        const [job] = this.queue.splice(background < 0 ? 0 : background, 1)
-        this.foregroundJobs = job.priority === 'foreground' ? Math.min(8, this.foregroundJobs + 1) : 0
+        const job = this.queue.shift()
         try { job.resolve(await job.operation()) } catch (error) { job.reject(error) }
       }
     } finally { this.draining = false }

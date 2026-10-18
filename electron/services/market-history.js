@@ -63,7 +63,8 @@ export class MarketHistory {
       now,
       // MarketService.get already meters each independent OKX endpoint family.
       minRequestIntervalMS: 0,
-      maxConcurrentTasks: 3,
+      maxConcurrentTasks: 8,
+      maxConcurrentPerSource: { candles: 4, oi: 2, taker: 2 },
     })
     this.audit = new DataAudit({ metadata, now,
       inspect: async (target, { signal }) => {

@@ -20,14 +20,14 @@ import { cn, pageVisible } from '@/lib/utils'
 
 const priceFormatter = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 8 })
 const formatPrice = (value: number | null | undefined) => value == null ? '—' : priceFormatter.format(value)
-const qualificationPending = (progress: MarketSnapshot['catalogProgress']) => !progress || progress.total === 0 || progress.completed < progress.total || progress.unknown > 0
+const qualificationPending = (progress: MarketSnapshot['catalogProgress']) => !progress || progress.total === 0 || progress.completed < progress.total || progress.pending > 0
 const collectorStatus = (snapshot: MarketSnapshot | UnchangedSnapshot) => {
   const catalog = snapshot.catalogProgress
   if (snapshot.loading && catalog && catalog.total > 0) {
     if (catalog.completed < catalog.total) return `Verifying ${catalog.completed}/${catalog.total}`
-    if (catalog.unknown > 0) return `Updating ${catalog.unknown} contracts`
+    if (catalog.pending > 0) return `Updating ${catalog.pending} contracts`
   }
-  if (snapshot.error) return snapshot.catalogSource === 'none' ? 'Unavailable' : 'Incomplete'
+  if (snapshot.error || catalog && catalog.unknown > 0) return snapshot.catalogSource === 'none' ? 'Unavailable' : 'Incomplete'
   const progress = snapshot.listProgress
   if (progress && progress.total > 0 && progress.completed < progress.total) return `Loading ${progress.completed}/${progress.total}`
   if (snapshot.loading) return 'Refreshing'
@@ -125,7 +125,7 @@ function App() {
   const ranked = useMemo(() => [...rows].sort(compareRankingChange), [rows])
   const visible = useMemo(() => ranked.filter(row => row.instId.toLowerCase().includes(query.trim().toLowerCase())), [ranked, query])
   const verifying = Boolean(catalog.loading) && qualificationPending(catalog.catalogProgress) || (!ready && !error)
-  const awaitingObservations = Boolean(catalog.loading && catalog.catalogProgress && catalog.catalogProgress.completed === catalog.catalogProgress.total && catalog.catalogProgress.unknown > 0)
+  const awaitingObservations = Boolean(catalog.loading && catalog.catalogProgress && catalog.catalogProgress.completed === catalog.catalogProgress.total && catalog.catalogProgress.pending > 0)
   const verificationUnavailable = !verifying && (Boolean(error) || catalog.catalogSource === 'none' || (catalog.catalogProgress?.unknown ?? 0) > 0)
   const emptyTitle = verifying ? catalog.catalogSource === 'none' ? 'Loading contracts' : awaitingObservations ? 'Updating market data' : 'Verifying contracts' : verificationUnavailable ? 'Market verification unavailable' : 'No qualified contracts'
   const emptyDescription = verifying

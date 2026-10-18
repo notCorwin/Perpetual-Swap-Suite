@@ -112,19 +112,6 @@ function requestURL(path, parameters = {}) {
   return `${OKX_ORIGIN}${path}?${query}`
 }
 
-async function mapConcurrent(values, limit, operation) {
-  const output = [], workers = Math.min(limit, values.length)
-  let next = 0
-  await Promise.all(Array.from({ length: workers }, async () => {
-    while (next < values.length) {
-      const index = next++
-      const result = await operation(values[index])
-      if (result !== undefined) output.push(result)
-    }
-  }))
-  return output
-}
-
 function candle(instrument, timeframe, value) {
   const timestamp = number(value[0]), open = number(value[1]), high = number(value[2]), low = number(value[3]), close = number(value[4])
   if ([timestamp, open, high, low, close].some(item => item === null)) return null
@@ -224,6 +211,9 @@ export class MarketService {
     this.catalogChecks = new Map()
     this.renewalTargets = new Map()
     this.candidateTasks = new Map()
+    this.pendingCandidates = new Map()
+    this.catalogControllers = new Set()
+    this.qualificationReads = new Set()
     this.candidateIDs = null
     this.tickerCache = null
     this.tickerTask = null
@@ -253,8 +243,7 @@ export class MarketService {
     this.candleMutations = new Map()
     this.barTasks = new Set()
     this.backgroundTasks = new Set()
-    this.requestLanes = new Map(Object.entries(REQUEST_LANE_INTERVALS).map(([name, interval]) => [name, { name, interval, queue: [], task: null, running: false, active: null, nextAt: 0, rateLimitedUntil: 0 }]))
-    this.backgroundRequestControllers = new Map()
+    this.requestLanes = new Map(Object.entries(REQUEST_LANE_INTERVALS).map(([name, interval]) => [name, { name, interval, queue: [], task: null, running: false, active: new Map(), wake: null, nextAt: 0, rateLimitedUntil: 0 }]))
     this.abortControllers = new Set()
     this.shutdownController = new AbortController()
     this.revision = 0
@@ -612,7 +601,6 @@ export class MarketService {
     request.requestSignal?.removeEventListener('abort', request.abort)
     request.controller.signal.removeEventListener('abort', request.onAbort)
     this.abortControllers.delete(request.controller)
-    this.backgroundRequestControllers.delete(request.controller)
   }
 
   rejectQueuedRequest(request) {
@@ -622,6 +610,54 @@ export class MarketService {
     lane.queue.splice(index, 1)
     request.reject(request.controller.signal.reason ?? new Error('The request was aborted.'))
     this.cleanupRequest(request)
+    lane.wake?.()
+  }
+
+  waitRequestLane(lane, delay) {
+    return new Promise(resolve => {
+      let timer
+      const finish = () => {
+        clearTimeout(timer)
+        if (lane.wake === finish) lane.wake = null
+        resolve()
+      }
+      lane.wake = finish
+      if (delay !== undefined) timer = setTimeout(finish, delay)
+    })
+  }
+
+  async performRequest(lane, request) {
+    try {
+      if (this.disposed || request.controller.signal.aborted) throw request.controller.signal.reason ?? new Error('Market service is closed.')
+      const timeout = setTimeout(() => request.controller.abort(new RequestTimeoutError(request.path, this.requestTimeout)), this.requestTimeout)
+      timeout.unref?.()
+      try {
+        const data = await abortable(Promise.resolve().then(async () => {
+          // A request can be preempted after its lane delay but before the
+          // microtask that starts fetch. Do not let that race create a
+          // network call which no active viewport can consume.
+          if (request.controller.signal.aborted) throw request.controller.signal.reason ?? new Error('The request was aborted.')
+          const response = await this.fetcher(requestURL(request.path, request.parameters), { headers: { Accept: 'application/json' }, signal: request.controller.signal })
+          if (request.controller.signal.aborted) throw request.controller.signal.reason ?? new Error('The request was aborted.')
+          if (response.status === 429) {
+            const serverDelay = retryAfterDelay(response.headers.get('retry-after'))
+            // A 429 cools only the endpoint family that returned it. OI
+            // must never freeze an unrelated candle repair or Taker read.
+            lane.rateLimitedUntil = Math.max(lane.rateLimitedUntil, Date.now() + (serverDelay ?? RETRY_DELAYS[0]))
+            throw new RetryAfterError(request.path, serverDelay, lane.name)
+          }
+          if (!response.ok) throw new Error(`OKX ${request.path} failed (${response.status}).`)
+          const payload = await response.json()
+          if (request.controller.signal.aborted) throw request.controller.signal.reason ?? new Error('The request was aborted.')
+          if (payload.code && payload.code !== '0') throw new Error(`OKX ${request.path}: ${payload.msg || payload.code}`)
+          return payload.data ?? []
+        }), request.controller.signal)
+        request.resolve(data)
+      } finally {
+        clearTimeout(timeout)
+      }
+    } catch (error) { request.reject(error) }
+    finally { this.cleanupRequest(request) }
   }
 
   async drainRequestLane(name) {
@@ -629,48 +665,21 @@ export class MarketService {
     if (lane.running) return lane.task
     lane.running = true
     const task = (async () => {
-      while (lane.queue.length) {
+      while (lane.queue.length || lane.active.size) {
+        const backgroundActive = [...lane.active.values()].some(request => requestPriority(request.priority) === 0)
+        const canStart = lane.active.size < 4 && lane.queue.some(request => requestPriority(request.priority) > 0 || !backgroundActive)
+        if (!canStart) { await this.waitRequestLane(lane); continue }
+        const delay = Math.max(lane.nextAt, lane.rateLimitedUntil) - Date.now()
+        if (delay > 0) { await this.waitRequestLane(lane, delay); continue }
+        // Choose at admission time so newly queued chart/qualification work
+        // passes downloads that were waiting for the endpoint's rate budget.
         const request = this.nextQueuedRequest(lane)
-        lane.active = request
-        try {
-          if (this.disposed || request.controller.signal.aborted) throw request.controller.signal.reason ?? new Error('Market service is closed.')
-          const scheduled = Math.max(Date.now(), lane.nextAt, lane.rateLimitedUntil)
-          if (scheduled > Date.now()) await sleep(scheduled - Date.now(), this.shutdownController.signal, request.controller.signal)
-          if (this.disposed || request.controller.signal.aborted) throw request.controller.signal.reason ?? new Error('Market service is closed.')
-          lane.nextAt = Date.now() + lane.interval
-          const timeout = setTimeout(() => request.controller.abort(new RequestTimeoutError(request.path, this.requestTimeout)), this.requestTimeout)
-          timeout.unref?.()
-          try {
-            const data = await abortable(Promise.resolve().then(async () => {
-              // A request can be preempted after its lane delay but before the
-              // microtask that starts fetch. Do not let that race create a
-              // network call which no active viewport can consume.
-              if (request.controller.signal.aborted) throw request.controller.signal.reason ?? new Error('The request was aborted.')
-              const response = await this.fetcher(requestURL(request.path, request.parameters), { headers: { Accept: 'application/json' }, signal: request.controller.signal })
-              if (request.controller.signal.aborted) throw request.controller.signal.reason ?? new Error('The request was aborted.')
-              if (response.status === 429) {
-                const serverDelay = retryAfterDelay(response.headers.get('retry-after'))
-                // A 429 cools only the endpoint family that returned it. OI
-                // must never freeze an unrelated candle repair or Taker read.
-                lane.rateLimitedUntil = Math.max(lane.rateLimitedUntil, Date.now() + (serverDelay ?? RETRY_DELAYS[0]))
-                throw new RetryAfterError(request.path, serverDelay, lane.name)
-              }
-              if (!response.ok) throw new Error(`OKX ${request.path} failed (${response.status}).`)
-              const payload = await response.json()
-              if (request.controller.signal.aborted) throw request.controller.signal.reason ?? new Error('The request was aborted.')
-              if (payload.code && payload.code !== '0') throw new Error(`OKX ${request.path}: ${payload.msg || payload.code}`)
-              return payload.data ?? []
-            }), request.controller.signal)
-            request.resolve(data)
-          } finally {
-            clearTimeout(timeout)
-          }
-        } catch (error) {
-          request.reject(error)
-        } finally {
-          if (lane.active === request) lane.active = null
-          this.cleanupRequest(request)
-        }
+        lane.nextAt = Date.now() + lane.interval
+        const active = this.performRequest(lane, request).finally(() => {
+          lane.active.delete(active)
+          lane.wake?.()
+        })
+        lane.active.set(active, request)
       }
     })().finally(() => {
       lane.running = false
@@ -688,14 +697,13 @@ export class MarketService {
   get(path, parameters, requestSignal, priority = 'foreground') {
     if (this.disposed || requestSignal?.aborted) throw new Error('Market service is closed.')
     const lane = requestLaneFor(path)
-    // Foreground work may evict background work only from the same OKX
-    // budget. In particular, a candle repair cannot cancel OI or Taker.
+    // Independent endpoint budgets reserve capacity for chart and Verify
+    // requests. At most one download occupies a lane's concurrent slots.
     const controller = new AbortController()
     const abort = () => controller.abort()
     this.shutdownController.signal.addEventListener('abort', abort, { once: true })
     requestSignal?.addEventListener('abort', abort, { once: true })
     this.abortControllers.add(controller)
-    if (priority === 'background') this.backgroundRequestControllers.set(controller, lane)
     let resolveRequest, rejectRequest
     const result = new Promise((resolve, reject) => { resolveRequest = resolve; rejectRequest = reject })
     const queue = this.requestLane(lane)
@@ -705,6 +713,7 @@ export class MarketService {
     if (controller.signal.aborted) request.onAbort()
     else {
       queue.queue.push(request)
+      queue.wake?.()
       void this.drainRequestLane(lane)
     }
     return result
@@ -1046,13 +1055,31 @@ export class MarketService {
     return task
   }
 
-  async checkCandidate(instrument, config, configKey, signal, priority = 'background') {
+  async checkCandidate(instrument, config, configKey, signal, priority = 'foreground') {
     const key = `${configKey}:${JSON.stringify(instrument)}`
     if (this.candidateTasks.has(key)) return this.candidateTasks.get(key)
+    this.pendingCandidates.set(key, { instId: instrument.instId, configKey })
+    this.touchList()
     const task = this.evaluateCandidate(instrument, config, configKey, signal, priority)
-      .finally(() => { if (this.candidateTasks.get(key) === task) this.candidateTasks.delete(key) })
+      .finally(() => {
+        if (this.candidateTasks.get(key) === task) {
+          this.candidateTasks.delete(key); this.pendingCandidates.delete(key); this.touchList()
+        }
+      })
     this.candidateTasks.set(key, task)
     return task
+  }
+
+  async readQualificationCandles(query, signal) {
+    // Bound only local I/O, never an acquisition's network/history wait. Keep
+    // the highest-priority store queue short enough for chart interactions.
+    while (this.qualificationReads.size >= 4) await abortable(Promise.race(this.qualificationReads), signal)
+    signal.throwIfAborted()
+    const read = this.store.candles(query, 'foreground')
+    const pending = read.then(() => undefined, () => undefined)
+    this.qualificationReads.add(pending)
+    try { return await read }
+    finally { this.qualificationReads.delete(pending) }
   }
 
   async evaluateCandidate(instrument, config, configKey, signal, priority) {
@@ -1077,16 +1104,31 @@ export class MarketService {
       try {
         const step = timeframeMilliseconds(timeframe), through = end - step, from = end - count * step
         let revision = this.liquidityHistoryRevision(instId, timeframe)
-        let { rows } = await this.history.ensurePrices(instId, timeframe, from, through, priority, signal)
-        // A source write may finish after ensurePrices read its return value.
-        // Reuse that read when stable; otherwise read the corrected durable range.
+        let rows, value
+        try {
+          rows = await this.readQualificationCandles({ instrument: instId, timeframe, from, through }, signal)
+          while (revision !== this.liquidityHistoryRevision(instId, timeframe)) {
+            signal.throwIfAborted()
+            revision = this.liquidityHistoryRevision(instId, timeframe)
+            rows = await this.readQualificationCandles({ instrument: instId, timeframe, from, through }, signal)
+          }
+          value = calculate(rows, from, through)
+        } catch {
+          signal.throwIfAborted()
+          revision = this.liquidityHistoryRevision(instId, timeframe)
+          // Qualification needs only its recent window. Admit missing slots
+          // ahead of rolling multi-day targets, without blocking the renderer.
+          const prepared = await this.history.ensurePrices(instId, timeframe, from, through, 'foreground', signal)
+          rows = prepared.rows
+        }
         while (revision !== this.liquidityHistoryRevision(instId, timeframe)) {
           signal.throwIfAborted()
           revision = this.liquidityHistoryRevision(instId, timeframe)
-          rows = await this.store.candles({ instrument: instId, timeframe, from, through }, priority)
+          rows = await this.readQualificationCandles({ instrument: instId, timeframe, from, through }, signal)
+          value = undefined
         }
         if (!this.currentCandidate(instrument, configKey, signal)) return
-        const value = calculate(rows, from, through)
+        value ??= calculate(rows, from, through)
         observations[key] = { value: { asOf: end, ...value }, observedAt: Date.now(), expiresAt: end + step }
       } catch (error) { errors[key] = error instanceof Error ? error.message : String(error) }
     }
@@ -1188,19 +1230,29 @@ export class MarketService {
     if (this.renewing) return this.renewing
     const controller = new AbortController(), config = this.prefs().liquidity, configKey = JSON.stringify(config)
     this.renewalController = controller
+    this.catalogControllers.add(controller)
     this.renewalStartedAt = Date.now()
+    let collecting = false
     this.renewing = (async () => {
-      if (!this.renewalTargets.size) return
       // Renewal must verify current contract units and trading state as well
       // as prices. An outage cannot keep extending old instrument metadata.
-      await this.discoverInstruments(configKey, controller.signal, 'foreground')
+      await Promise.all([
+        this.discoverInstruments(configKey, controller.signal, 'foreground'),
+        this.tickerObservations(controller.signal, 'foreground'),
+      ])
       if (controller.signal.aborted || this.catalogCriteriaKey() !== configKey) return
-      await mapConcurrent([...this.renewalTargets.values()], 4,
+      this.verifyCatalog()
+      // Global metadata/ticker renewal has its own cadence. A pending history
+      // range must not hold that lease renewal or other candidate admissions.
+      const checks = [...this.renewalTargets.values()].map(
         instrument => this.checkCandidate(instrument, config, configKey, controller.signal, 'foreground'))
+      collecting = true
+      this.track(Promise.allSettled(checks).finally(() => this.catalogControllers.delete(controller)))
       this.error = ''
     })()
       .catch(error => { if (!controller.signal.aborted) this.error = error instanceof Error ? error.message : String(error) })
       .finally(() => {
+        if (!collecting) this.catalogControllers.delete(controller)
         this.renewing = null
         if (this.renewalController === controller) this.renewalController = null
         this.scheduleRenewal()
@@ -1223,14 +1275,15 @@ export class MarketService {
     if (this.refreshing) return this.refreshing
     const controller = new AbortController(), config = this.prefs().liquidity, configKey = JSON.stringify(config)
     this.refreshController = controller
+    this.catalogControllers.add(controller)
     const startedAt = Date.now()
     this.refreshStartedAt = startedAt
     this.refreshing = (async () => {
       try {
         this.verifyCatalog()
         const [candidates] = await Promise.all([
-          this.discoverInstruments(configKey, controller.signal, 'background'),
-          this.tickerObservations(controller.signal, 'background', true),
+          this.discoverInstruments(configKey, controller.signal, 'foreground'),
+          this.tickerObservations(controller.signal, 'foreground', true),
         ])
         if (controller.signal.aborted || this.catalogCriteriaKey() !== configKey) return
         this.verifyCatalog()
@@ -1238,7 +1291,7 @@ export class MarketService {
         // their position in the exchange's instrument response.
         candidates.sort((a, b) => Number(this.renewalTargets.has(b.instId)) - Number(this.renewalTargets.has(a.instId)))
         // A successful check publishes independently; the first row does not wait for the full exchange scan.
-        await mapConcurrent(candidates, 4, instrument => this.checkCandidate(instrument, config, configKey, controller.signal))
+        await Promise.all(candidates.map(instrument => this.checkCandidate(instrument, config, configKey, controller.signal)))
         if (!controller.signal.aborted && this.catalogCriteriaKey() === configKey) {
           this.lastRefreshAt = startedAt
           this.error = ''
@@ -1246,6 +1299,7 @@ export class MarketService {
       } catch (error) {
         if (!controller.signal.aborted && !this.disposed) this.error = error instanceof Error ? error.message : String(error)
       } finally {
+        this.catalogControllers.delete(controller)
         this.pruneCatalog()
         if (this.refreshController === controller) this.refreshController = null
         this.refreshing = null
@@ -1271,6 +1325,7 @@ export class MarketService {
     if (JSON.stringify(previous.liquidity) !== JSON.stringify(current.liquidity)) {
       this.refreshController?.abort()
       this.renewalController?.abort()
+      for (const controller of this.catalogControllers) controller.abort()
       this.catalogChecks.clear(); this.renewalTargets.clear()
       this.verifyCatalog()
       this.lastRefreshAt = 0
@@ -1294,6 +1349,7 @@ export class MarketService {
   invalidate() {
     this.refreshController?.abort()
     this.renewalController?.abort()
+    for (const controller of this.catalogControllers) controller.abort()
     this.catalogChecks.clear(); this.renewalTargets.clear(); this.candidateIDs = null
     this.replaceCatalog([])
     this.lastRefreshAt = 0
@@ -1359,14 +1415,16 @@ export class MarketService {
       for (const instId of this.catalog.keys()) { this.track(this.projectListEntry(instId, frame)); this.track(this.updateRanking(instId)) }
     }
     const rows = this.listRowsFor(frame)
-    const catalogProgress = { total: this.candidateIDs?.size ?? this.catalogChecks.size, completed: this.catalogChecks.size, verified: 0, failed: 0, unknown: 0 }
+    const configKey = this.catalogCriteriaKey()
+    const pending = new Set([...this.pendingCandidates.values()].filter(value => value.configKey === configKey).map(value => value.instId)).size
+    const catalogProgress = { total: this.candidateIDs?.size ?? this.catalogChecks.size, completed: this.catalogChecks.size, pending, verified: 0, failed: 0, unknown: 0 }
     for (const record of this.catalogChecks.values()) {
       const status = record.status === 'verified' && !this.validCatalogEntry(record) ? 'unknown' : record.status
       catalogProgress[status] += 1
     }
     const unavailable = !this.catalog.size && catalogProgress.unknown > 0
       ? `Market verification is unavailable for ${catalogProgress.unknown} contracts because required observations are missing or expired. Retrying automatically.` : ''
-    return { rows, revision: this.revision, error: this.error || unavailable, loading: refreshScheduled || this.refreshing !== null || this.renewing !== null,
+    return { rows, revision: this.revision, error: this.error || unavailable, loading: refreshScheduled || this.refreshing !== null || this.renewing !== null || pending > 0,
       catalogProgress,
       updatedAt: this.listUpdatedAt.get(frame) ?? this.catalogUpdatedAt, listProgress: this.listProgress(frame), timeframe: frame,
       catalogSource: this.catalogSource, realtimeState: this.realtime?.getState().status ?? 'disconnected' }
@@ -1384,6 +1442,7 @@ export class MarketService {
       this.disposed = true
       this.refreshController?.abort()
       this.renewalController?.abort()
+      for (const controller of this.catalogControllers) controller.abort()
       this.shutdownController.abort()
       for (const controller of this.abortControllers) controller.abort()
       await this.history.close()
