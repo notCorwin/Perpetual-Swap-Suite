@@ -61,6 +61,7 @@ const chartTokens = {
   priceLabelHeight: chartTokenNumber('--chart-price-label-height', 18),
   countdownTextSize: chartTokenNumber('--chart-countdown-text-size', 9),
   countdownGap: chartTokenNumber('--chart-countdown-gap', 3),
+  countdownPaddingY: chartTokenNumber('--chart-countdown-padding-y', 2),
 } as const
 const legendContext = document.createElement("canvas").getContext("2d")
 const chartTextWidths = new Map<string, number>()
@@ -151,7 +152,7 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
   const latestColor = tag.rising ? "var(--positive)" : "var(--negative)"
   const latestPrice = `${price(tag.price)} ${tag.rising ? '↑' : '↓'}`
   const priceLabel = chartPriceLabelLayout(latestY, panels.price, chartTokens.priceLabelHeight,
-    chartTokens.countdownTextSize * 1.2, chartTokens.countdownGap, liveOverlay)
+    chartTokens.countdownTextSize * 1.2 + chartTokens.countdownPaddingY * 2, chartTokens.countdownGap, liveOverlay)
   const tickHalfHeight = chartTokens.textSize / 2
   const line = (key: keyof Bar, panelKey: Panel, y: (value: number) => number) => {
     const segments: string[] = []
@@ -320,8 +321,7 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
       </g>
     })}
     {tag.inViewport && <g data-chart-price-label>
-      <rect data-chart-price-label-background x={right} y={priceLabel.priceTop} width={gutter} height={priceLabel.priceHeight} fill="var(--chart-annotation)" />
-      <rect x={right} y={priceLabel.priceTop} width="2" height={priceLabel.priceHeight} fill={latestColor} />
+      <rect data-chart-price-label-background x={right} y={priceLabel.top} width={gutter} height={priceLabel.bottom - priceLabel.top} fill="var(--chart-annotation)" />
       <text data-chart-price-label-value x={axisStarts.price} y={latestY} dominantBaseline="middle" fill="var(--foreground)">{latestPrice}</text>
       {priceLabel.countdownY !== null && <PriceCountdown hour={liveBar.hour} intervalMS={intervalMS} x={axisStarts.price} y={priceLabel.countdownY} />}
     </g>}

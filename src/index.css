@@ -68,6 +68,7 @@
   --chart-price-label-height: 18px;
   --chart-countdown-text-size: 9px;
   --chart-countdown-gap: 3px;
+  --chart-countdown-padding-y: 2px;
   --chart-capture-flash: #fff;
   --radius: 0.625rem;
   --background: oklch(1 0 0);

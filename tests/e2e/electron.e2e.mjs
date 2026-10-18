@@ -496,17 +496,20 @@ test('live prices outside the saved domain keep their axis labels inside the pri
           livePrice: document.querySelector('[data-chart-inst]').__chartSnapshot.liveBar?.close,
           lineY: Number(svg.querySelector('[data-chart-live-price]').getAttribute('y1')),
           labelY: Number(svg.querySelector('[data-chart-price-label-value]').getAttribute('y')),
-          label: bounds('[data-chart-price-label-value]'), row: bounds('[data-chart-price-label-background]'),
+          label: bounds('[data-chart-price-label-value]'), background: bounds('[data-chart-price-label-background]'),
           countdown: bounds('[data-chart-countdown]'),
         }
       })
       assert.equal(geometry.livePrice, livePrice)
       assert.equal(geometry.labelY, geometry.lineY)
       assert.ok(geometry.lineY >= geometry.panel[0] && geometry.lineY <= geometry.panel[1])
-      for (const bounds of [geometry.label, geometry.row, geometry.countdown]) {
+      for (const bounds of [geometry.label, geometry.background, geometry.countdown]) {
         assert.ok(bounds[0] >= geometry.panel[0] && bounds[1] <= geometry.panel[1], `Axis text must stay in the price panel: ${JSON.stringify(geometry)}`)
       }
-      assert.ok(geometry.countdown[1] <= geometry.row[0] || geometry.countdown[0] >= geometry.row[1], 'The countdown must not overlap the price row.')
+      for (const bounds of [geometry.label, geometry.countdown]) {
+        assert.ok(bounds[0] >= geometry.background[0] && bounds[1] <= geometry.background[1], 'Price and countdown text must share the same background.')
+      }
+      assert.ok(geometry.countdown[1] <= geometry.label[0] || geometry.countdown[0] >= geometry.label[1], 'The countdown must not overlap the price text.')
     } finally { await removePreparedTransform() }
   }
 })
