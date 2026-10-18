@@ -243,6 +243,8 @@ export class MarketService {
     this.abortControllers = new Set()
     this.shutdownController = new AbortController()
     this.revision = 0
+    this.marketListeners = new Set()
+    this.marketPublicationTimer = null
     this.serviceSession = randomUUID()
     this.snapshotStatuses = new Map()
     this.catalogRevision = 0
@@ -269,7 +271,21 @@ export class MarketService {
   listKey(instId, timeframe) { return `${timeframe}:${instId}` }
   catalogCriteriaKey() { return JSON.stringify(this.prefs().liquidity) }
   catalogEntry(instId) { return this.catalog.get(instId) }
-  touchList() { this.revision += 1 }
+  touchList() {
+    this.revision += 1
+    if (!this.marketListeners.size || this.marketPublicationTimer || this.closing) return
+    // Coalesce a batch of source/projection changes into one renderer wakeup.
+    this.marketPublicationTimer = setTimeout(() => {
+      this.marketPublicationTimer = null
+      for (const listener of this.marketListeners) { try { listener() } catch { /* A disconnected renderer cannot stop collection. */ } }
+    }, 16)
+    this.marketPublicationTimer.unref?.()
+  }
+
+  subscribeMarket(listener) {
+    this.marketListeners.add(listener)
+    return () => this.marketListeners.delete(listener)
+  }
 
   async initialize() {
     this.metadata ??= await MetadataStore.open(join(this.store.root, 'Metadata'))
@@ -290,6 +306,9 @@ export class MarketService {
     this.readCatalog()
     this.realtime = new RealtimeMarket({
       parseCandle: candle,
+      onState: state => {
+        if (this.realtimeStatus !== state.status) { this.realtimeStatus = state.status; this.touchList() }
+      },
       ...(this.webSocketFactory ? { webSocketFactory: this.webSocketFactory } : {}),
       onForming: row => this.setLive(row.instrument, row.timeframe, row),
       onConfirmed: async row => {
@@ -300,6 +319,7 @@ export class MarketService {
       },
       onReconnect: (subscriptions, context) => this.reconcileRealtime(subscriptions, context),
     })
+    this.realtimeStatus = this.realtime.getState().status
     this.updateSubscriptions()
     if (this.autoRefresh && !this.closing) {
       this.realtime.start(); this.scheduleRefresh()
@@ -1347,6 +1367,7 @@ export class MarketService {
         if (!collecting) this.catalogControllers.delete(controller)
         this.renewing = null
         if (this.renewalController === controller) this.renewalController = null
+        this.touchList()
         this.scheduleRenewal()
       })
     return this.renewing
@@ -1396,6 +1417,7 @@ export class MarketService {
         this.pruneCatalog()
         if (this.refreshController === controller) this.refreshController = null
         this.refreshing = null
+        this.touchList()
         this.scheduleRefresh()
       }
     })()
@@ -1526,7 +1548,9 @@ export class MarketService {
       updatedAt: this.listUpdatedAt.get(frame) ?? this.catalogUpdatedAt, listProgress: this.listProgress(frame), timeframe: frame,
       catalogSource: this.catalogSource, realtimeState: this.realtime?.getState().status ?? 'disconnected' }
     const signature = JSON.stringify(status)
-    if (this.snapshotStatuses.get(frame) !== signature) { this.snapshotStatuses.set(frame, signature); this.touchList() }
+    // The caller already receives this status; reading it must not trigger
+    // another invalidation request back to the same renderer.
+    if (this.snapshotStatuses.get(frame) !== signature) { this.snapshotStatuses.set(frame, signature); this.revision += 1 }
     const metadata = { ...status, revision: this.revision, serviceSession: this.serviceSession }
     if (serviceSession === this.serviceSession && sinceRevision === this.revision) return { ...metadata, unchanged: true }
     return { ...metadata, rows: this.listRowsFor(frame) }
@@ -1539,6 +1563,8 @@ export class MarketService {
     if (this.renewalTimer) clearTimeout(this.renewalTimer)
     if (this.boundaryTimer) clearTimeout(this.boundaryTimer)
     if (this.qualificationImmediate) clearImmediate(this.qualificationImmediate)
+    if (this.marketPublicationTimer) clearTimeout(this.marketPublicationTimer)
+    this.marketListeners.clear()
     this.qualificationQueue.clear()
     this.disposeTask = (async () => {
       try { await this.ready } catch { if (this.ownsMetadata) this.metadata?.close(); return }

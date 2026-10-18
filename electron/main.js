@@ -182,6 +182,9 @@ async function startDesktop() {
   marketService.subscribePreparedCharts(frame => {
     if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('radar:chart-prepared', frame)
   })
+  marketService.subscribeMarket(() => {
+    if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('radar:market-changed')
+  })
   ipcMain.handle('radar:request', handleRequest)
   if (e2eLiveRefresh) void marketService.refresh().catch(error => console.error('Market refresh failed:', error))
   await createWindow()

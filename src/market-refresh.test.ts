@@ -306,3 +306,50 @@ test('a superseded queued assessment cannot replace its newer failure or start h
     assert.equal(targets, 0, 'A superseded successful assessment must not consume historical request capacity.')
   } finally { await f.close() }
 })
+
+test('market subscribers receive the final bulk change together and stop receiving updates after unsubscribe or disposal', async context => {
+  const now = Date.now()
+  context.mock.method(Date, 'now', () => now)
+  const instruments = Array.from({ length: 150 }, (_, index) => instrument(`COIN${index}`))
+  let price = 100
+  const f = await fixture(preferences('spread'), async input => {
+    const path = new URL(String(input)).pathname
+    if (path.endsWith('/public/instruments')) return response(instruments)
+    if (path.endsWith('/market/tickers')) return response(instruments.map(value => ticker(value.instId, price)))
+    throw new Error(`Unexpected endpoint: ${path}`)
+  })
+  try {
+    await f.service.refresh()
+    const before = await f.service.snapshot()
+    let notifications = 0
+    let reading: ReturnType<typeof f.service.snapshot> | undefined
+    const unsubscribe = f.service.subscribeMarket(() => {
+      notifications += 1
+      reading = f.service.snapshot('15m', { sinceRevision: before.revision, serviceSession: before.serviceSession })
+    })
+    price = 200
+    await f.service.refresh()
+    await waitFor(() => notifications > 0)
+    assert.ok(reading)
+    const changed = await reading
+    assert.ok('rows' in changed)
+    assert.ok(changed.revision > before.revision)
+    assert.equal(changed.rows.length, 150)
+    assert.ok(changed.rows.every(row => row.lastPrice === 200), 'The subscriber must read the complete changed source batch.')
+    await new Promise(resolve => setTimeout(resolve, 50))
+    assert.equal(notifications, 1, 'One source batch must not wake the renderer separately for all 150 contracts.')
+
+    unsubscribe()
+    price = 300
+    await f.service.refresh()
+    await new Promise(resolve => setTimeout(resolve, 50))
+    assert.equal(notifications, 1)
+
+    let afterDisposal = 0
+    f.service.subscribeMarket(() => { afterDisposal += 1 })
+    f.service.touchList()
+    await f.service.dispose()
+    await new Promise(resolve => setTimeout(resolve, 50))
+    assert.equal(afterDisposal, 0, 'Disposal must cancel an already queued renderer wakeup.')
+  } finally { await f.close() }
+})

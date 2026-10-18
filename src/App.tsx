@@ -16,7 +16,7 @@ import { DEFAULT_PREFERENCES, type Preferences } from '@/renderer-preferences'
 import type { MarketSnapshot, RankedMarketRow, UnchangedSnapshot } from '@/desktop-contract'
 import type { PreparedChartResponse } from '@/chart-data'
 import type { RadarTimeframe } from '@/timeframe'
-import { cn, pageVisible } from '@/lib/utils'
+import { cn } from '@/lib/utils'
 
 const priceFormatter = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 8 })
 const formatPrice = (value: number | null | undefined) => value == null ? '—' : priceFormatter.format(value)
@@ -64,6 +64,7 @@ function App() {
   const [refresh, setRefresh] = useState(0)
   const order = useRef(new SnapshotOrder())
   const revision = useRef(-1)
+  const snapshotInFlight = useRef<Promise<MarketSnapshot | UnchangedSnapshot> | null>(null)
   const preferenceWrite = useRef(0)
   const timeframe = preferences.chartTimeframe
 
@@ -83,16 +84,35 @@ function App() {
   useEffect(() => {
     if (!preferencesLoaded) return
     let stopped = false
-    let timer: number
+    let timer: number | undefined
+    let working = false
+    let queued = false
     let backoff = 2000
     // The first request for each timeframe needs its rows, even when the
     // collector revision has not changed since the previous timeframe.
     revision.current = -1
+    const clearTimer = () => { clearTimeout(timer); timer = undefined }
+    const visible = () => document.visibilityState !== 'hidden'
     const load = async () => {
-      await pageVisible()
       if (stopped) return
+      clearTimer()
+      if (working) { queued = true; return }
+      if (!visible()) { queued = true; return }
+      working = true
+      queued = false
       try {
-        const snapshot = await window.radarDesktop.request({ snapshot: { timeframe, sinceRevision: revision.current, serviceSession: order.current.serviceSession } })
+        // Effect replacements share the outstanding IPC request until it
+        // settles, but each response still belongs to its original effect.
+        while (snapshotInFlight.current) {
+          await snapshotInFlight.current.catch(() => undefined)
+          if (stopped) return
+        }
+        if (!visible()) { queued = true; return }
+        const request = window.radarDesktop.request({ snapshot: { timeframe, sinceRevision: revision.current, serviceSession: order.current.serviceSession } })
+        snapshotInFlight.current = request
+        let snapshot: MarketSnapshot | UnchangedSnapshot
+        try { snapshot = await request }
+        finally { if (snapshotInFlight.current === request) snapshotInFlight.current = null }
         if (stopped) return
         if ((!snapshot.timeframe || snapshot.timeframe === timeframe) && order.current.accept(snapshot)) {
           revision.current = order.current.revision
@@ -118,11 +138,25 @@ function App() {
         setError(message(cause)); setStatus('Reconnecting'); setRealtime('Disconnected')
         setCatalog(current => ({ ...current, loading: false }))
         backoff = Math.min(backoff * 2, 30_000)
+      } finally {
+        working = false
+        if (!stopped && visible()) {
+          if (queued) void load()
+          else timer = window.setTimeout(load, backoff)
+        }
       }
-      if (!stopped) timer = window.setTimeout(load, backoff)
     }
+    const changed = () => { void load() }
+    const shown = () => { if (visible()) void load() }
+    window.addEventListener('radar-market-changed', changed)
+    document.addEventListener('visibilitychange', shown)
     void load()
-    return () => { stopped = true; clearTimeout(timer) }
+    return () => {
+      stopped = true
+      clearTimer()
+      window.removeEventListener('radar-market-changed', changed)
+      document.removeEventListener('visibilitychange', shown)
+    }
   }, [preferencesLoaded, timeframe, refresh])
 
   const ranked = useMemo(() => [...rows].sort(compareRankingChange), [rows])

@@ -28,6 +28,7 @@ export class MarketService {
   prepareChartWindow(instId: string, timeframe: '5m' | '15m' | '1H', end?: number): Promise<PreparedChartWindow>
   setChartUniverse(instIds: string[], timeframe: '5m' | '15m' | '1H', focusInstId?: string): Promise<{ frames: PreparedChartWindow[] }>
   subscribePreparedCharts(listener: (frame: PreparedChartWindow) => void): () => void
+  subscribeMarket(listener: () => void): () => void
   localChartWindow(instId: string, timeframe: '5m' | '15m' | '1H'): Promise<PreparedChartWindow | null>
   localChartHistory(instId: string, timeframe: '5m' | '15m' | '1H', end?: number): Promise<PreparedChartWindow | null>
   dispose(): Promise<void>

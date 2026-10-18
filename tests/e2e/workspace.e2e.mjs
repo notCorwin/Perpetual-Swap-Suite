@@ -27,7 +27,7 @@ before(async () => {
       instId: `${symbol}-USDT-SWAP`, price: 100, lastPrice: 100, rankingChange, rankingAsOf: 1_800_000_000_000,
       turnover24hUSDT: 50_000_000,
     }))
-    const state = globalThis.__workspaceFixture = { preferences, rows, initialRows: rows, requests: [], revision: 1, loading: false, error: '', catalogSource: 'live', catalogProgress: undefined, failNextSave: false, staleNextSnapshot: false, staleReplies: 0, chartGeneration: 1, bollMode: 'standard',
+    const state = globalThis.__workspaceFixture = { preferences, rows, initialRows: rows, requests: [], revision: 1, loading: false, error: '', catalogSource: 'live', catalogProgress: undefined, failNextSave: false, staleNextSnapshot: false, staleReplies: 0, chartGeneration: 1, bollMode: 'standard', holdNextSnapshot: false, releaseSnapshot: null, snapshotActive: 0, snapshotMaximum: 0,
       audit: { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '' } }
     const prepared = ({ instId, timeframe }) => {
       const intervalMS = timeframe === '1H' ? 3_600_000 : timeframe === '15m' ? 900_000 : 300_000
@@ -58,9 +58,19 @@ before(async () => {
         const stale = state.staleNextSnapshot
         state.staleNextSnapshot = false
         if (stale) state.staleReplies += 1
-        return { rows: stale ? [] : state.rows, revision: state.revision - (stale ? 1 : 0), serviceSession: 'renderer-fixture',
+        const snapshot = { rows: stale ? [] : state.rows, revision: state.revision - (stale ? 1 : 0), serviceSession: 'renderer-fixture',
           timeframe: value.snapshot.timeframe, realtimeState: 'Connected', updatedAt: 1_800_000_000_000,
           catalogSource: state.catalogSource, catalogProgress: state.catalogProgress, error: state.error, loading: state.loading }
+        state.snapshotActive += 1
+        state.snapshotMaximum = Math.max(state.snapshotMaximum, state.snapshotActive)
+        try {
+          if (state.holdNextSnapshot) {
+            state.holdNextSnapshot = false
+            await new Promise(resolve => { state.releaseSnapshot = resolve })
+            state.releaseSnapshot = null
+          }
+          return snapshot
+        } finally { state.snapshotActive -= 1 }
       }
       if (value.chartUniverse) return { frames: value.chartUniverse.instIds.map(instId => prepared({ instId, timeframe: value.chartUniverse.timeframe })) }
       if (value.chartLocal) return prepared(value.chartLocal)
@@ -118,6 +128,79 @@ test('default selection uses absolute completed-candle change with nulls last an
   assert.match(changes[1], /↑.*\+3\.00%/)
   assert.equal(changes[3].trim(), '—')
   await assertWorkspaceLayout(page)
+})
+
+test('market notifications refresh immediately and coalesce changes arriving during one snapshot request', async () => {
+  try {
+    await electron.evaluate(({ BrowserWindow }) => {
+      const state = globalThis.__workspaceFixture
+      state.holdNextSnapshot = true
+      state.snapshotMaximum = state.snapshotActive
+      state.rows = state.rows.map(row => row.instId === 'BETA-USDT-SWAP' ? { ...row, lastPrice: 201 } : row)
+      state.revision += 1
+      BrowserWindow.getAllWindows()[0].webContents.send('radar:market-changed')
+    })
+    const deadline = Date.now() + 1_000
+    while (!(await electron.evaluate(() => Boolean(globalThis.__workspaceFixture.releaseSnapshot)))) {
+      assert.ok(Date.now() < deadline, 'A market notification must request a snapshot before the two-second poll.')
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    const blockedCount = await electron.evaluate(({ BrowserWindow }) => {
+      const state = globalThis.__workspaceFixture
+      state.rows = state.rows.map(row => row.instId === 'BETA-USDT-SWAP' ? { ...row, lastPrice: 202 } : row)
+      state.revision += 1
+      for (let index = 0; index < 20; index += 1) BrowserWindow.getAllWindows()[0].webContents.send('radar:market-changed')
+      return state.requests.filter(value => value.snapshot).length
+    })
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), blockedCount, 'Notifications during a request must coalesce rather than start concurrent snapshots.')
+    await electron.evaluate(() => { globalThis.__workspaceFixture.releaseSnapshot() })
+    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '202', null, { timeout: 1_000 })
+    assert.deepEqual(await electron.evaluate(() => ({ maximum: globalThis.__workspaceFixture.snapshotMaximum, count: globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length })), { maximum: 1, count: blockedCount + 1 }, 'Queued changes need exactly one immediate follow-up snapshot.')
+  } finally {
+    await electron.evaluate(({ BrowserWindow }) => {
+      const state = globalThis.__workspaceFixture
+      state.holdNextSnapshot = false
+      state.releaseSnapshot?.()
+      state.rows = state.initialRows
+      state.revision += 1
+      BrowserWindow.getAllWindows()[0].webContents.send('radar:market-changed')
+    })
+    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100')
+  }
+})
+
+test('market notifications wait while hidden and refresh immediately when the workspace becomes visible', async () => {
+  try {
+    await page.evaluate(() => {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' })
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
+    const before = await electron.evaluate(({ BrowserWindow }) => {
+      const state = globalThis.__workspaceFixture
+      state.rows = state.rows.map(row => row.instId === 'BETA-USDT-SWAP' ? { ...row, lastPrice: 203 } : row)
+      state.revision += 1
+      for (let index = 0; index < 20; index += 1) BrowserWindow.getAllWindows()[0].webContents.send('radar:market-changed')
+      return state.requests.filter(value => value.snapshot).length
+    })
+    await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 100)))
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before, 'Hidden notifications cannot start snapshot requests.')
+    await page.evaluate(() => {
+      delete document.visibilityState
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
+    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '203', null, { timeout: 1_000 })
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before + 1, 'Visibility resumes one coalesced refresh immediately.')
+  } finally {
+    await page.evaluate(() => { delete document.visibilityState; document.dispatchEvent(new Event('visibilitychange')) })
+    await electron.evaluate(({ BrowserWindow }) => {
+      const state = globalThis.__workspaceFixture
+      state.rows = state.initialRows
+      state.revision += 1
+      BrowserWindow.getAllWindows()[0].webContents.send('radar:market-changed')
+    })
+    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100')
+  }
 })
 
 test('search preserves selection while six width/DPR combinations share portal, pointer, and capture coordinates', async () => {
