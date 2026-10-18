@@ -17,6 +17,8 @@ export class PreparedChartPipeline {
     normalize(row: CandleRecord): CandleRecord
     revision(instId: string): number
     instrument(instId: string): { listTime?: string | number } | undefined
+    /** Acknowledged current candle subscription; persisted coverage is checked separately. */
+    streaming?(instId: string, timeframe: HistoryTimeframe): boolean
   })
   prepare(instId: string, timeframe: HistoryTimeframe, targetEnd?: number, historyBars?: number): Promise<PreparedChartResponse>
   local(instId: string, timeframe: HistoryTimeframe, options?: { force?: boolean; priority?: HistoryPriority }): Promise<PreparedChartResponse | null>
@@ -28,6 +30,8 @@ export class PreparedChartPipeline {
   setUniverse(instIds: string[], timeframe: HistoryTimeframe, focusInstId?: string): { frames: PreparedChartResponse[] }
   /** Pins bounded recursive seeds for the realtime working set, independently of the full-history LRU. */
   setRealtimeSubscriptions(subscriptions: { instId: string; timeframe: HistoryTimeframe }[]): void
+  /** Reassess actual source deadlines after connection or subscription changes. */
+  sourceStateChanged(): void
   subscribe(listener: (frame: PreparedChartResponse) => void): () => void
   observe(rows: CandleRecord[], previous: Map<number, CandleRecord>): void
   /** Forming candles only change in-memory projections; confirmed writes use observe. */

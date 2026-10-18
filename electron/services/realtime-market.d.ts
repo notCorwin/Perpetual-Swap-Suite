@@ -69,6 +69,8 @@ export class RealtimeMarket<Candle extends CandleRecord = CandleRecord> {
   start(): void
   getState(): RealtimeMarketState
   getTelemetry(): RealtimeMarketTelemetry
+  /** Exact current connection acknowledgement; unrelated pending subscriptions do not affect it. */
+  isSubscribed(instId: string, timeframe: RadarTimeframe): boolean
   getForming(instId: string, timeframe: RadarTimeframe): Candle | null
   /** Drains accepted decoding, recovery and consumer callbacks; does not close. */
   whenIdle(): Promise<void>

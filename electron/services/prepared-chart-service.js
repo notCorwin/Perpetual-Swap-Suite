@@ -8,7 +8,8 @@ const WARMUP = 199
 const LOCAL_HISTORY_BARS = 16_384
 const SNAPSHOT_SCHEMA = 2
 const FORMULA_VERSION = 'native-ema200-wilder-flat50-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v2'
-const REFRESH_MS = 60_000
+const SOURCE_RETRY_MS = 5_000
+const CONFIRMATION_GRACE_MS = 1_000
 const REMOTE_CONCURRENCY = 4
 const priceFields = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'baseVolume', 'quoteVolume', 'confirmed']
 const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24']
@@ -32,8 +33,8 @@ const bandwidth = bar => !bar || ![bar.bollUpper, bar.bollMiddle, bar.bollLower]
 
 /** Durable source pages and canonical calculations are independent of UI focus. */
 export class PreparedChartPipeline {
-  constructor({ store, history, normalize, revision, instrument }) {
-    Object.assign(this, { store, history, normalize, revision, instrument })
+  constructor({ store, history, normalize, revision, instrument, streaming = () => false }) {
+    Object.assign(this, { store, history, normalize, revision, instrument, streaming })
     this.series = new Map()
     this.nextGeneration = 0
     this.maxSeries = 8
@@ -168,7 +169,7 @@ export class PreparedChartPipeline {
       const frame = this.cached(key)
       if (frame) frames.push(frame)
       else this.queueLocal(target.instId, timeframe)
-      this.queueRemote(target.instId, timeframe, false)
+      if (this.sourceDeadline(target) <= Date.now()) this.queueRemote(target.instId, timeframe, false)
     }
     if (!this.localQueue.size && this.remoteQueue.size) {
       const first = this.universe.get(this.focusKey) ?? this.universe.values().next().value
@@ -238,21 +239,46 @@ export class PreparedChartPipeline {
     this.scheduleRefresh()
   }
 
+  sourceDeadline({ instId, timeframe }, now = Date.now()) {
+    const key = seriesKey(instId, timeframe), snapshot = this.snapshots.get(key)
+    let deadline = now
+    if (snapshot?.valid) {
+      if (snapshot.frame.unavailable) deadline = snapshot.frame.unavailable.retryAt
+      else {
+        const step = intervalFor(timeframe), boundary = Math.floor(now / step) * step
+        const latest = snapshot.frame.endHour ?? -Infinity
+        // A price-only confirmation does not advance prepared coverage until
+        // its native statistics are observed too. Keep their recovery deadline
+        // even while the previous complete window remains visible.
+        deadline = latest < boundary - step ? boundary + CONFIRMATION_GRACE_MS : boundary + step + CONFIRMATION_GRACE_MS
+        if (snapshot.validUntil !== null) deadline = Math.min(deadline, snapshot.validUntil)
+      }
+    }
+    return Math.max(deadline, this.remoteAttempts.get(key) ?? 0)
+  }
+
+  sourceStateChanged() {
+    if (this.closed) return
+    for (const target of this.universe.values()) if (this.sourceDeadline(target) <= Date.now()) this.queueRemote(target.instId, target.timeframe, false)
+    if (!this.localRunning && !this.localQueue.size) void this.drainRemote()
+    this.scheduleRefresh()
+  }
+
   scheduleRefresh() {
     if (this.refreshTimer !== null) clearTimeout(this.refreshTimer)
     this.refreshTimer = null
     if (this.closed || !this.universe.size) return
     // Active and queued series already own their next attempt. Scheduling
     // their expired deadlines would poll a held source every second.
-    const idle = [...this.universe.keys()].filter(key => !this.remoteActive.has(key) && !this.remoteQueue.has(key))
+    const idle = [...this.universe].filter(([key]) => !this.remoteActive.has(key) && !this.remoteQueue.has(key)).map(([, target]) => target)
     if (!idle.length) return
-    const next = Math.min(...idle.map(key => this.remoteAttempts.get(key) ?? Date.now() + REFRESH_MS))
+    const next = Math.min(...idle.map(target => this.sourceDeadline(target)))
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = null
-      for (const [key, target] of this.universe) if (!this.remoteActive.has(key) && (this.remoteAttempts.get(key) ?? 0) <= Date.now()) this.remoteQueue.set(key, target)
+      for (const [key, target] of this.universe) if (!this.remoteActive.has(key) && this.sourceDeadline(target) <= Date.now()) this.remoteQueue.set(key, target)
       if (!this.localRunning && !this.localQueue.size) void this.drainRemote()
       this.scheduleRefresh()
-    }, Math.max(1_000, next - Date.now()))
+    }, Math.max(1, Math.min(2_147_483_647, next - Date.now())))
     this.refreshTimer.unref?.()
   }
 
@@ -268,8 +294,9 @@ export class PreparedChartPipeline {
       if (key === undefined) break
       const target = this.remoteQueue.get(key)
       this.remoteQueue.delete(key)
+      if (!this.universe.has(key) || this.sourceDeadline(target) > Date.now()) continue
       this.remoteActive.add(key)
-      this.remoteAttempts.set(key, Date.now() + REFRESH_MS)
+      this.remoteAttempts.delete(key)
       const state = this.state(target.instId, target.timeframe)
       state.active += 1
       this.trim()
@@ -277,10 +304,16 @@ export class PreparedChartPipeline {
         try {
           while (!this.closed) {
             const frame = await this.prepareState(state, undefined, { priority: 'chartWarm' })
-            if (await this.saveCompact(state, this.compact(frame))) break
+            if (await this.saveCompact(state, this.compact(frame))) {
+              // A successful HTTP response may still lack a closed candle or
+              // a renewed statistics lease. Retry that unresolved gap, never
+              // turn its already-expired deadline into a busy loop.
+              if (this.universe.has(key) && this.sourceDeadline(target) <= Date.now()) this.remoteAttempts.set(key, Date.now() + SOURCE_RETRY_MS)
+              break
+            }
           }
         } catch {
-          this.remoteAttempts.set(key, Date.now() + 5_000)
+          if (this.universe.has(key)) this.remoteAttempts.set(key, Date.now() + SOURCE_RETRY_MS)
         } finally {
           this.remoteActive.delete(key)
           state.active -= 1
@@ -295,6 +328,11 @@ export class PreparedChartPipeline {
           this.scheduleRefresh()
         }
       })()
+    }
+    if (!this.remoteActive.size && this.remoteRunning === running) {
+      this.remoteRunning = null
+      this.remoteFinish()
+      this.remoteFinish = null
     }
     this.scheduleRefresh()
     return running
@@ -336,6 +374,7 @@ export class PreparedChartPipeline {
     const changed = !existing?.valid || JSON.stringify(existing.frame) !== JSON.stringify(frame)
     this.snapshots.set(state.key, { ...snapshot, valid: true })
     this.trimSnapshots()
+    this.scheduleRefresh()
     if (changed) this.emit(frame)
     return frame
   }
@@ -358,6 +397,7 @@ export class PreparedChartPipeline {
     this.snapshots.set(key, { ...snapshot, frame: restored, valid: true })
     this.emit(restored)
     this.trimSnapshots()
+    this.scheduleRefresh()
     return restored
   }
 
@@ -493,6 +533,7 @@ export class PreparedChartPipeline {
   observe(rows, previous) {
     for (const [key, batch] of Map.groupBy(rows, row => `${row.instrument}:${row.timeframe}`)) {
       const state = this.series.get(key), live = this.liveStates.get(key)
+      this.remoteAttempts.delete(key)
       this.sourceVersions.set(key, (this.sourceVersions.get(key) ?? 0) + 1)
       const snapshot = this.snapshots.get(key)
       let changed = false, reseed = false
@@ -682,7 +723,9 @@ export class PreparedChartPipeline {
 
   async refreshLatest(state, priority = 'prepared') {
     if (state.latestTask) return state.latestTask
-    if (state.latestAt + REFRESH_MS > Date.now()) return
+    const boundary = Math.floor(Date.now() / state.intervalMS) * state.intervalMS
+    if (this.latest(state) !== null && this.latest(state) >= boundary - state.intervalMS
+      && (this.streaming(state.instId, state.timeframe) || state.latestAt >= boundary)) return
     state.latestTask = (async () => {
       const result = await this.history.latest(state.instId, state.timeframe, sourcePriority(priority))
       if (this.closed) throw new Error('Prepared chart data service is closed.')
@@ -964,6 +1007,8 @@ export class PreparedChartPipeline {
     this.closed = true
     if (this.warmTimer !== null) clearTimeout(this.warmTimer)
     if (this.refreshTimer !== null) clearTimeout(this.refreshTimer)
+    this.warmTimer = null
+    this.refreshTimer = null
     this.localQueue.clear()
     this.remoteQueue.clear()
     this.listeners.clear()

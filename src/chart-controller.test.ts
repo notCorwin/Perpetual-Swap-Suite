@@ -503,7 +503,8 @@ test('a new calculation generation from prefetch retains the painted frame until
   } finally { close() }
 })
 
-test('latest mode refreshes atomically while retaining the complete live frame during the request', async () => {
+test('latest mode follows pushed frames atomically and never polls a successfully prepared idle chart', async context => {
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
   const queue = transportQueue()
   const store = new PreparedChartStore()
   store.ingest(prepared(btc, 199, { bars: bars(0, 200), oldestHour: 0, historyExhausted: true }))
@@ -511,35 +512,49 @@ test('latest mode refreshes atomically while retaining the complete live frame d
   const close = controller.open(btc, '1H')
   try {
     const previous = controller.getSnapshot().presented
-    await waitFor(() => queue.calls.length > 0, 4_000)
-    assert.equal(queue.calls[0].target.end, null)
+    context.mock.timers.tick(60_000)
+    await settled()
+    assert.equal(queue.calls.length, 0, 'Elapsed idle time must not request the latest window again.')
     assert.equal(controller.getSnapshot().presented, previous)
     assert.equal(controller.getSnapshot().pending, false)
-    queue.calls[0].resolve(prepared(btc, 200, { revision: 2, oldestHour: 0, historyExhausted: true }))
+    controller.ingestPrepared(prepared(btc, 200, { revision: 2, oldestHour: 0, historyExhausted: true }))
     await settled()
     assert.equal(controller.getSnapshot().presented?.endHour, 200 * hour)
     assert.equal(controller.getSnapshot().presented?.bars.length, 96)
     assert.equal(controller.getSnapshot().pending, false)
+    assert.equal(previous?.endHour, 199 * hour, 'The previously painted frame remains immutable.')
+    context.mock.timers.tick(600_000)
+    await settled()
+    assert.equal(queue.calls.length, 0, 'Successful pushed frames must not restart periodic preparation.')
   } finally { close() }
 })
 
-test('an idle historical window incorporates a persisted correction without moving its cursor', async () => {
+test('a pushed persisted correction hydrates deep cached history without moving its cursor', async () => {
   const queue = transportQueue()
   const store = new PreparedChartStore()
   store.ingest(prepared(btc, 199, { bars: bars(0, 200), oldestHour: 0, historyExhausted: true }))
-  const controller = new ChartController(queue.transport, store)
+  let reads = 0
+  const pending: Array<(response: PreparedChartResponse) => void> = []
+  const controller = new ChartController({ ...queue.transport, history: async () => {
+    reads += 1
+    if (reads === 1) return prepared(btc, 199, { bars: bars(0, 200), oldestHour: 0, historyExhausted: true })
+    return new Promise<PreparedChartResponse>(resolve => { pending.push(resolve) })
+  } }, store)
   const close = controller.open(btc, '1H')
   try {
+    await settled()
     controller.scroll(-10)
     const previous = controller.getSnapshot().presented!
     assert.equal(previous.endHour, 189 * hour)
-    await waitFor(() => queue.calls.length > 0, 4_000)
-    assert.equal(queue.calls[0].target.end, 189 * hour, 'Historical revalidation reads the fixed cursor rather than fetching latest history.')
+    controller.ingestPrepared(prepared(btc, 199, { generation: 2, revision: 2, oldestHour: 0, historyExhausted: true }))
+    await settled()
+    assert.equal(pending.length, 1, 'A pushed new generation admits one durable history read.')
     assert.equal(controller.getSnapshot().presented, previous)
-    assert.equal(controller.getSnapshot().pending, false)
-    queue.calls[0].resolve(prepared(btc, 189, {
-      generation: 2, revision: 2, latestEnd: 199 * hour, oldestHour: 0, historyExhausted: true,
-      bars: bars(94, 96).map(bar => ({ ...bar, ema: 200, oi: 2_000 })),
+    assert.equal(controller.getSnapshot().requested?.end, 189 * hour)
+    assert.equal(queue.calls.length, 0, 'Persisted corrections must not wait for provider preparation.')
+    pending[0](prepared(btc, 199, {
+      generation: 2, revision: 2, oldestHour: 0, historyExhausted: true,
+      bars: bars(0, 200).map(bar => ({ ...bar, ema: 200, oi: 2_000 })),
     }))
     await settled()
     const next = controller.getSnapshot().presented!
@@ -550,7 +565,53 @@ test('an idle historical window incorporates a persisted correction without movi
     assert.ok(next.bars.every(bar => bar.ema === 200 && bar.oi === 2_000))
     assert.ok(previous.bars.every(bar => bar.ema === 100 && bar.oi === 1_000))
     assert.equal(controller.getSnapshot().pending, false)
-    assert.equal(queue.maximumActive(), 1)
+    assert.equal(reads, 2)
+    assert.equal(queue.calls.length, 0)
+  } finally { close() }
+})
+
+test('prefetch cooldown resumes prefetch at its deadline without refreshing the successful current target', async context => {
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
+  const queue = transportQueue(), controller = new ChartController(queue.transport, cached())
+  const close = controller.open(btc, '1H')
+  try {
+    const original = controller.getSnapshot().presented
+    assert.equal(queue.calls.length, 1)
+    const first = queue.calls[0].target
+    assert.notEqual(first.end, null)
+    queue.calls[0].reject(new Error('Background history source is temporarily unavailable.'))
+    await settled()
+    context.mock.timers.tick(4_999)
+    await settled()
+    assert.equal(queue.calls.length, 1)
+    context.mock.timers.tick(1)
+    await settled()
+    assert.equal(queue.calls.length, 2)
+    assert.deepEqual(queue.calls[1].target, first, 'Cooldown expiry retries the missing reserve, not the current latest target.')
+    assert.equal(controller.getSnapshot().presented, original)
+    queue.calls[1].resolve(prepared(btc, first.end! / hour, { latestEnd: 1_199 * hour, bars: bars(199, 1_001) }))
+    await settled()
+    context.mock.timers.tick(60_000)
+    await settled()
+    assert.equal(queue.calls.length, 2, 'Successful reserve preparation leaves no idle polling timer.')
+  } finally { close() }
+})
+
+test('a pushed recovery cancels an outstanding failed-target retry', async context => {
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
+  const queue = transportQueue(), controller = new ChartController(queue.transport)
+  const close = controller.open(btc, '1H')
+  try {
+    await settled()
+    queue.calls[0].reject(new Error('Source is temporarily unavailable.'))
+    await settled()
+    controller.ingestPrepared(prepared(btc, 199, { oldestHour: 104 * hour, historyExhausted: true }))
+    await settled()
+    assert.equal(controller.getSnapshot().error, '')
+    assert.equal(controller.getSnapshot().pending, false)
+    context.mock.timers.tick(60_000)
+    await settled()
+    assert.equal(queue.calls.length, 1, 'A complete pushed frame satisfies the demand and retires its retry timer.')
   } finally { close() }
 })
 

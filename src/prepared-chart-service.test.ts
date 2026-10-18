@@ -22,6 +22,13 @@ const waitFor = async (check: () => boolean) => {
   for (let i = 0; i < 300; i += 1) { if (check()) return; await new Promise(resolve => setTimeout(resolve, 10)) }
   throw new Error('Timed out waiting for prepared data.')
 }
+const waitForIO = async (check: () => boolean) => {
+  const deadline = performance.now() + 5_000
+  while (!check()) {
+    if (performance.now() >= deadline) throw new Error('Timed out waiting for chart source work.')
+    await new Promise(resolve => setImmediate(resolve))
+  }
+}
 const deferred = () => {
   let resolve = () => {}
   const promise = new Promise<void>(done => { resolve = done })
@@ -487,51 +494,182 @@ test('a slow chart source does not block other contracts and remote preparation 
   } finally { for (const gate of gates.values()) gate.resolve(); await f.close() }
 })
 
-test('healthy chart refreshes keep their timer cadence while another source remains blocked', async context => {
-  const f = await fixture(), first = Date.UTC(2024, 0, 1), held = 'HELD-USDT-SWAP', healthy = 'HEALTHY-USDT-SWAP'
-  const release = deferred(), calls: string[] = []
-  const settle = async (check: () => boolean) => {
-    const deadline = performance.now() + 3_000
-    while (!check()) {
-      if (performance.now() >= deadline) throw new Error('Timed out waiting for the refresh cadence.')
-      await new Promise(resolve => setImmediate(resolve))
-    }
-  }
+test('current streamed charts issue no minute refreshes while a different gap repair is held', async context => {
+  const f = await fixture(), boundary = Math.floor(Date.now() / hour) * hour, now = boundary + 600_000
+  const held = 'HELD-USDT-SWAP', healthy = 'HEALTHY-USDT-SWAP', release = deferred(), calls: string[] = []
   try {
-    await f.store.appendCandles([held, healthy].flatMap(id => Array.from({ length: 400 }, (_, index) => candle(first + index * hour, index, '1H', id))))
-    await f.pipeline.local(held, '1H')
-    await f.pipeline.local(healthy, '1H')
-    f.pipeline.history.latest = async (id: string) => { calls.push(id); if (id === held) await release.promise; return {} }
-    context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
-    const scheduling = context.mock.method(f.pipeline, 'scheduleRefresh')
+    context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
+    f.pipeline.streaming = () => true
+    await f.store.appendCandles([held, healthy].flatMap(id => Array.from({ length: id === held ? 399 : 400 }, (_, index) => candle(boundary - (400 - index) * hour, index, '1H', id))))
+    await f.pipeline.local(held, '1H'); await f.pipeline.local(healthy, '1H')
+    f.pipeline.history.latest = async (id: string) => { calls.push(id); await release.promise; return {} }
     f.pipeline.setUniverse([held, healthy], '1H', held)
     context.mock.timers.tick(0)
-    await settle(() => calls.length === 2 && !f.pipeline.remoteActive.has(`${healthy}:1H`))
-    for (let cycle = 0; cycle < 2; cycle += 1) {
-      assert.notEqual(f.pipeline.refreshTimer, null, 'Healthy contracts keep a future timer while another source is held.')
-      const scheduled = scheduling.mock.callCount()
-      context.mock.timers.tick(59_999)
+    await waitForIO(() => calls.length === 1)
+    for (let cycle = 0; cycle < 2; cycle++) {
+      context.mock.timers.tick(60_000)
       await new Promise(resolve => setImmediate(resolve))
-      assert.equal(calls.filter(id => id === healthy).length, cycle + 1)
-      assert.equal(scheduling.mock.callCount(), scheduled, 'A held source cannot create one-second timer polling.')
-      context.mock.timers.tick(1)
-      await settle(() => calls.filter(id => id === healthy).length === cycle + 2 && !f.pipeline.remoteActive.has(`${healthy}:1H`))
-      assert.equal(calls.filter(id => id === held).length, 1, 'An active source must never be queued for a duplicate refresh.')
-      assert.equal(f.pipeline.remoteActive.size, 1, 'The healthy series can repeatedly reuse an idle source lane.')
+      assert.deepEqual(calls, [held], 'Only the actual gap owns source work; healthy series do not poll.')
+      assert.equal(f.pipeline.remoteActive.size, 1)
     }
+    f.pipeline.sourceStateChanged()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(calls, [held], 'Connection notifications cannot duplicate a held repair.')
+    f.pipeline.setUniverse([], '1H')
+    assert.equal(f.pipeline.refreshTimer, null)
     const closing = f.pipeline.dispose()
-    const scheduled = scheduling.mock.callCount()
     context.mock.timers.tick(60_000)
-    assert.equal(calls.length, 4, 'Shutdown cannot admit another scheduled refresh.')
-    assert.equal(scheduling.mock.callCount(), scheduled, 'Shutdown clears the next refresh timer.')
+    assert.deepEqual(calls, [held])
+    release.resolve(); await closing
+  } finally { release.resolve(); context.mock.timers.reset(); await f.close() }
+})
+
+test('a quiet subscribed series with a missing confirmation repairs only its own close after the boundary grace', async context => {
+  const f = await fixture(), boundary = Math.floor(Date.now() / hour) * hour, now = boundary + 600_000
+  const missing = 'MISSING-USDT-SWAP', healthy = 'HEALTHY-USDT-SWAP', release = deferred(), calls: string[] = []
+  try {
+    context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
+    f.pipeline.streaming = () => true
+    await f.store.appendCandles([missing, healthy].flatMap(id => Array.from({ length: 400 }, (_, index) => candle(boundary - (400 - index) * hour, index, '1H', id))))
+    await f.pipeline.local(missing, '1H'); await f.pipeline.local(healthy, '1H')
+    f.pipeline.history.latest = async (id: string) => {
+      calls.push(id); await release.promise
+      await f.persist([candle(boundary, 400, '1H', id)])
+      return {}
+    }
+    f.pipeline.setUniverse([missing, healthy], '1H')
+    f.pipeline.sourceStateChanged()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(calls, [])
+    context.mock.timers.tick(hour - 600_000)
+    await f.persist([candle(boundary, 400, '1H', healthy)])
+    context.mock.timers.tick(999)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(calls, [])
+    context.mock.timers.tick(1)
+    await waitForIO(() => calls.length === 1)
+    assert.deepEqual(calls, [missing])
+    context.mock.timers.tick(5_000)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(calls, [missing], 'A held repair has no repeating deadline admission.')
     release.resolve()
-    await closing
-  } finally {
-    release.resolve()
+    await waitForIO(() => !f.pipeline.remoteActive.size)
+    assert.equal(f.pipeline.cached(`${missing}:1H`)?.endHour, boundary)
+    assert.equal(f.pipeline.cached(`${healthy}:1H`)?.endHour, boundary)
+  } finally { release.resolve(); context.mock.timers.reset(); await f.close() }
+})
+
+test('a price-only confirmation keeps its current close deadline until native statistics are repaired', async context => {
+  const f = await fixture(), boundary = Math.floor(Date.now() / hour) * hour, now = boundary + 600_000
+  let calls = 0
+  try {
+    context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
+    f.pipeline.streaming = () => true
+    const source = Array.from({ length: 400 }, (_, index) => candle(boundary - (400 - index) * hour, index))
+    await f.store.appendCandles(source)
+    await f.pipeline.local(instId, '1H')
+    f.pipeline.history = { ...cachedHistory(), async latest() { throw new Error('The price close is already durable and subscribed.') },
+      async ensureStatistics(_id: string, _tf: string, from: number, through: number) {
+        calls++
+        assert.equal(from, boundary); assert.equal(through, boundary)
+        await f.persist([candle(boundary, 400)])
+      } }
+    f.pipeline.setUniverse([instId], '1H')
+    context.mock.timers.tick(hour - 600_000)
+    await f.persist([missingStatistics(candle(boundary, 400))])
+    context.mock.timers.tick(0)
+    await waitForIO(() => !f.pipeline.localRunning && !f.pipeline.localQueue.size)
+    assert.equal(f.pipeline.cached(`${instId}:1H`)?.endHour, boundary - hour)
+    context.mock.timers.tick(999)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(calls, 0)
+    context.mock.timers.tick(1)
+    await waitForIO(() => f.pipeline.cached(`${instId}:1H`)?.endHour === boundary && !f.pipeline.remoteActive.size)
+    assert.equal(calls, 1)
+  } finally { context.mock.timers.reset(); await f.close() }
+})
+
+for (const restored of [false, true]) test(`native-stat leases schedule their own expiry after ${restored ? 'snapshot restore' : 'local snapshot save'}`, async context => {
+  const f = await fixture(), boundary = Math.floor(Date.now() / hour) * hour, now = boundary + 600_000, expiresAt = now + 1_500
+  let pipeline = f.pipeline, calls = 0
+  const source = Array.from({ length: 400 }, (_, index) => ({ ...candle(boundary - (400 - index) * hour, index),
+    ...(index === 399 ? { oi: null, buy: null, sell: null, statisticsVersion: 11, statisticsOIExpiresAt: expiresAt, statisticsTakerExpiresAt: expiresAt } : {}) }))
+  const history = { ...cachedHistory(), async latest() { throw new Error('A current acknowledged stream must not poll latest candles.') },
+    async ensureStatistics(_id: string, _tf: string, from: number, through: number) {
+      calls++
+      const previous = new Map((await f.store.candles({ instrument: instId, timeframe: '1H' })).map(row => [row.timestamp, row]))
+      const rows = source.filter(row => row.timestamp >= from && row.timestamp <= through).map(row => ({ ...row, oi: 1_234, buy: 30, sell: 20, statisticsVersion: 1 }))
+      await f.store.appendCandles(rows); pipeline.observe(rows, previous)
+    } }
+  try {
+    context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
+    await f.store.appendCandles(source)
+    pipeline.history = history; pipeline.streaming = () => true
+    if (!restored) pipeline.universe = new Map([[`${instId}:1H`, { instId, timeframe: '1H' }]])
+    await pipeline.local(instId, '1H')
+    if (restored) {
+      await pipeline.dispose()
+      pipeline = createPipeline(f.store, history, f.instruments); pipeline.streaming = () => true
+      pipeline.universe = new Map([[`${instId}:1H`, { instId, timeframe: '1H' }]])
+      assert.equal((await pipeline.local(instId, '1H')).bars.at(-1).oi, null)
+    }
+    assert.notEqual(pipeline.refreshTimer, null, 'Saving or restoring a snapshot registers its native-stat expiry immediately.')
+    pipeline.setUniverse([instId], '1H')
+    context.mock.timers.tick(1_499)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(calls, 0)
+    context.mock.timers.tick(1)
+    await waitForIO(() => pipeline.cached(`${instId}:1H`)?.oiState === 'ready' && !pipeline.remoteActive.size)
+    assert.equal(calls, 1)
+    assert.equal((await f.store.readChartSnapshot(instId, '1H') as any).validUntil, null)
+    context.mock.timers.tick(120_000)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(calls, 1, 'Numeric native statistics have no periodic source refresh.')
+    pipeline.setUniverse([], '1H')
+    assert.equal(pipeline.refreshTimer, null)
+  } finally { context.mock.timers.reset(); if (pipeline !== f.pipeline) await pipeline.dispose(); await f.close() }
+})
+
+test('listing availability uses its actual retry deadline rather than a successful refresh cadence', async context => {
+  const f = await fixture(), boundary = Math.floor(Date.now() / hour) * hour, now = boundary + 600_000, first = boundary - 95 * hour
+  let calls = 0
+  try {
+    context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
+    f.instruments.set(instId, { listTime: String(first) })
+    await f.store.appendCandles(Array.from({ length: 95 }, (_, index) => candle(first + index * hour, index)))
+    f.pipeline.history.latest = async () => { calls++; throw new Error('Source temporarily unavailable.') }
+    const frame = await f.pipeline.local(instId, '1H')
+    const retryAt = frame.unavailable.retryAt
+    f.pipeline.setUniverse([instId], '1H')
+    context.mock.timers.tick(retryAt - now - 1)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(calls, 0)
+    context.mock.timers.tick(1)
+    await waitForIO(() => calls === 1 && !f.pipeline.remoteActive.size)
+    context.mock.timers.tick(4_999)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(calls, 1)
+    context.mock.timers.tick(1)
+    await waitForIO(() => calls === 2 && !f.pipeline.remoteActive.size)
+    f.pipeline.setUniverse([], '1H')
+  } finally { context.mock.timers.reset(); await f.close() }
+})
+
+test('a queued source check made obsolete by current local streaming coverage settles its drain and shutdown', async () => {
+  const f = await fixture(), boundary = Math.floor(Date.now() / hour) * hour
+  try {
+    f.pipeline.streaming = () => true
+    f.pipeline.history.latest = async () => { throw new Error('No source request is necessary.') }
+    f.pipeline.universe = new Map([[`${instId}:1H`, { instId, timeframe: '1H' }]])
+    f.pipeline.queueRemote(instId, '1H', false)
+    await f.store.appendCandles(Array.from({ length: 400 }, (_, index) => candle(boundary - (400 - index) * hour, index)))
+    await f.pipeline.local(instId, '1H')
+    await f.pipeline.drainRemote()
+    assert.equal(f.pipeline.remoteRunning, null)
+    assert.equal(f.pipeline.remoteQueue.size, 0)
+    assert.equal(f.pipeline.remoteActive.size, 0)
     await f.pipeline.dispose()
-    context.mock.timers.reset()
-    await f.close()
-  }
+  } finally { await f.close() }
 })
 
 test('disposing a parallel chart refresh joins accepted work without admitting queued contracts', async () => {

@@ -79,7 +79,12 @@ export class ChartController {
     if (!this.store.ingestLatest(response)) return
     const target = this.view.requested
     if (this.active && target?.instId === response.instId && target.timeframe === response.timeframe) {
-      this.commit()
+      if (this.commit()) {
+        this.failureCount = 0
+        this.retryAt = 0
+        this.refresh = false
+        this.clearTimer()
+      }
       void this.pump()
     }
   }
@@ -195,12 +200,12 @@ export class ChartController {
     this.timer = null
   }
 
-  private wake(delay: number) {
+  private wake(delay: number, retryTarget = false) {
     this.clearTimer()
     this.timer = setTimeout(() => {
       this.timer = null
       if (!this.active) return
-      this.refresh = true
+      this.refresh = retryTarget
       void this.pump()
     }, delay)
   }
@@ -208,7 +213,7 @@ export class ChartController {
   private async pump() {
     if (!this.active || !this.view.requested) return
     if (this.view.unavailable && this.view.unavailable.retryAt > Date.now()) {
-      if (this.timer === null) this.wake(this.view.unavailable.retryAt - Date.now())
+      if (this.timer === null) this.wake(this.view.unavailable.retryAt - Date.now(), true)
       return
     }
     const target = this.view.requested
@@ -236,7 +241,7 @@ export class ChartController {
       // until input stopped changing the target.
       if ((needsHistory || this.historyTargets.has(key)) && (ready || this.historyHydrated.get(key) !== watermark)) return
     }
-    if (this.retryAt > Date.now()) { this.wake(this.retryAt - Date.now()); return }
+    if (this.retryAt > Date.now()) { this.wake(this.retryAt - Date.now(), true); return }
     if (!ready || this.refresh) {
       if (this.demandTargets.has(key) || this.demandTargets.size >= 2) return
       const maintenance = this.maintenanceTarget
@@ -254,7 +259,7 @@ export class ChartController {
     const job = this.maintenanceTarget || this.demandTargets.has(key) ? null : this.prefetchTarget(target)
     if (job) { this.maintenanceTarget = job; void this.run(job, 'prefetch') }
     const cooldown = this.prefetchAfter - Date.now()
-    if (this.timer === null) this.wake(cooldown > 0 ? Math.min(2_000, cooldown) : 2_000)
+    if (cooldown > 0 && this.timer === null) this.wake(cooldown)
   }
 
   private async hydrateLocal(target: ChartTarget) {
@@ -341,8 +346,8 @@ export class ChartController {
     }
     if (!this.active) return
     const changed = this.view.requested && targetKey(this.view.requested) !== targetKey(job)
-    if (unavailableRetryAt !== null && !changed) this.wake(Math.max(0, unavailableRetryAt - Date.now()))
-    else if (failed && !changed && kind !== 'prefetch') this.wake(Math.max(0, this.retryAt - Date.now()))
+    if (unavailableRetryAt !== null && !changed) this.wake(Math.max(0, unavailableRetryAt - Date.now()), true)
+    else if (failed && !changed && kind !== 'prefetch') this.wake(Math.max(0, this.retryAt - Date.now()), true)
     else queueMicrotask(() => { void this.pump() })
   }
 }

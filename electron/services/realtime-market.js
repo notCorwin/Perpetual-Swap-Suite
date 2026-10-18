@@ -63,6 +63,12 @@ export class RealtimeMarket {
 
   getState() { return copy(this.state) }
   getTelemetry() { return copy(this.telemetry) }
+  isSubscribed(instId, timeframe) {
+    const connection = this.connection, key = keyFor({ instId, timeframe })
+    const subscription = this.subscriptions.get(key)
+    return Boolean(connection && this.active(connection) && connection.opened && connection.socket.readyState === 1
+      && subscription && connection.sent.get(key) === subscription && !connection.pending.has(key))
+  }
   getForming(instId, timeframe) {
     const candle = this.series.get(keyFor({ instId, timeframe }))?.forming?.candle
     return candle ? copy(candle) : null

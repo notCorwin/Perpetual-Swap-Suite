@@ -278,7 +278,8 @@ export class MarketService {
     this.latestAuditID = null
     // The proxy admits no historical work until durable metadata has opened.
     const history = Object.fromEntries(['ensurePrices', 'ensureStatistics', 'latest'].map(method => [method, async (...args) => { await this.ready; return this.history[method](...args) }]))
-    this.preparedCharts = new PreparedChartPipeline({ store, history, normalize: normalizedStatistics, revision: instId => this.dataRevision(instId), instrument: instId => this.instruments.get(instId) })
+    this.preparedCharts = new PreparedChartPipeline({ store, history, normalize: normalizedStatistics, revision: instId => this.dataRevision(instId), instrument: instId => this.instruments.get(instId),
+      streaming: (instId, timeframe) => this.realtime?.isSubscribed(instId, timeframe) ?? false })
     this.ready = this.initialize()
   }
 
@@ -323,7 +324,10 @@ export class MarketService {
     this.realtime = new RealtimeMarket({
       parseCandle: candle,
       onState: state => {
-        if (this.realtimeStatus !== state.status) { this.realtimeStatus = state.status; this.touchList() }
+        if (this.realtimeStatus !== state.status) {
+          this.realtimeStatus = state.status; this.touchList()
+          if (!this.closing) this.preparedCharts.sourceStateChanged()
+        }
       },
       ...(this.webSocketFactory ? { webSocketFactory: this.webSocketFactory } : {}),
       onForming: row => this.setLive(row.instrument, row.timeframe, row),
@@ -1121,6 +1125,7 @@ export class MarketService {
     for (const instId of ids) for (const timeframe of LIST_TIMEFRAMES) subscriptions.set(`${instId}:${timeframe}`, { instId, timeframe })
     this.realtime.setSubscriptions([...subscriptions.values()])
     this.publicRealtime?.setSubscriptions([...ids])
+    if (!this.closing) this.preparedCharts.sourceStateChanged()
   }
 
   async reconcileRealtime(subscriptions, { signal } = {}) {

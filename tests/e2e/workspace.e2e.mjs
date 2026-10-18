@@ -130,6 +130,26 @@ test('default selection uses absolute completed-candle change with nulls last an
   await assertWorkspaceLayout(page)
 })
 
+test('a prepared idle chart makes no periodic window requests and accepts a pushed forming candle', async () => {
+  const chart = page.locator('[data-chart-inst="BETA-USDT-SWAP"]')
+  await page.waitForFunction(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.dataset.chartLoading === 'false')
+  const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow).length)
+  await new Promise(resolve => setTimeout(resolve, 2_250))
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow).length), before, 'A successfully prepared chart must stay idle until an event or actual retry deadline.')
+  await electron.evaluate(async ({ ipcMain, BrowserWindow }) => {
+    const state = globalThis.__workspaceFixture
+    state.chartGeneration += 1
+    const frame = await ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
+    const last = frame.bars.at(-1)
+    frame.liveBar = { ...last, hour: frame.endHour + frame.intervalMS, open: 133, high: 134, low: 132, close: 133,
+      confirmed: false, statisticsObserved: false, oi: null, buy: null, sell: null }
+    BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
+  })
+  await page.waitForFunction(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 133)
+  assert.equal(Number(await chart.getAttribute('data-chart-rendered-bars')), 96)
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow).length), before, 'A pushed forming candle must update the prepared chart without a window request.')
+})
+
 test('market notifications refresh immediately and coalesce changes arriving during one snapshot request', async () => {
   try {
     await electron.evaluate(({ BrowserWindow }) => {
