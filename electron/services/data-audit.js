@@ -121,13 +121,15 @@ function verificationRanges(repaired, issues) {
 
 /** A durable background audit of Parquet facts; SQLite stores only this report. */
 export class DataAudit {
-  constructor({ store, metadata, inspect, repair, now = Date.now, chunkMilliseconds = DAY }) {
+  constructor({ store, metadata, inspect, repair, onCheckpoint, now = Date.now, chunkMilliseconds = DAY }) {
     if (!metadata || typeof metadata.saveAudit !== 'function' || typeof metadata.listAudits !== 'function') throw new TypeError('DataAudit needs a metadata store.')
     if (!inspect && typeof store?.inspectCandles !== 'function') throw new TypeError('DataAudit needs a candle inspector.')
     if (!Number.isSafeInteger(chunkMilliseconds) || chunkMilliseconds < INTERVALS['1H']) throw new TypeError('Audit chunks must span at least one hour.')
+    if (onCheckpoint !== undefined && typeof onCheckpoint !== 'function') throw new TypeError('Audit onCheckpoint must be a function.')
     this.metadata = metadata
     this.inspect = inspect ?? ((target, _options) => store.inspectCandles(target, 'background'))
     this.repairRange = repair
+    this.onCheckpoint = onCheckpoint
     this.now = now
     this.chunkMilliseconds = chunkMilliseconds
     this.jobs = new Map()
@@ -165,6 +167,10 @@ export class DataAudit {
       repairFailed: job.issues.filter(issue => issue.status === 'open' && issue.repairStatus === 'failed').length,
     }
     this.metadata.saveAudit(clone(job))
+    // Actions can publish before replacing jobs.get(id). The saved payload,
+    // rather than a subsequent read, is the authoritative checkpoint.
+    try { Promise.resolve(this.onCheckpoint?.(clone(job))).catch(() => undefined) }
+    catch { /* Observer failures cannot change durable audit progress. */ }
   }
 
   start(request) {

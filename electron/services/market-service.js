@@ -268,6 +268,9 @@ export class MarketService {
     this.marketListeners = new Set()
     this.marketPublicationTimer = null
     this.serviceSession = randomUUID()
+    this.auditListeners = new Set()
+    this.auditRevision = 0
+    this.auditReport = { ...emptyAudit(), revision: 0, serviceSession: this.serviceSession }
     this.catalogRevision = 0
     this.catalogSource = 'none'
     this.catalogUpdatedAt = null
@@ -320,10 +323,12 @@ export class MarketService {
       onLive: (instId, timeframe, row) => this.setLive(instId, timeframe, row),
       replaceCandles: (range, rows, priority) => this.replaceCandles(range, rows, priority),
       onProgress: task => this.onHistoryProgress(task),
+      onAuditCheckpoint: job => this.onAuditCheckpoint(job),
     })
     await this.history.ready
     const audits = this.history.audit.list().sort((a, b) => b.updatedAt - a.updatedAt)
     this.latestAuditID = audits[0]?.id ?? null
+    if (audits.length) this.publishAudit(this.auditSnapshot(audits[0]))
     this.readCatalog()
     this.realtime = new RealtimeMarket({
       parseCandle: candle,
@@ -1866,13 +1871,31 @@ export class MarketService {
       issues: job.issues.filter(issue => issue.status === 'open').map(({ instrument, timeframe, from, through, reason, repairable }) => ({ instrument, timeframe, from, through, reason, repairable })), error: job.error ?? '' }
   }
 
-  async dataAuditRequest({ action, id } = {}) {
+  publishAudit(report) {
+    if (this.closing) return
+    this.auditReport = { ...structuredClone(report), revision: ++this.auditRevision, serviceSession: this.serviceSession }
+    for (const listener of this.auditListeners) {
+      try { Promise.resolve(listener(structuredClone(this.auditReport))).catch(() => undefined) }
+      catch { /* A disconnected renderer cannot stop an audit. */ }
+    }
+  }
+
+  onAuditCheckpoint(job) {
+    if (job.id === this.latestAuditID) this.publishAudit(this.auditSnapshot(job))
+  }
+
+  subscribeAudit(listener) {
+    if (!this.closing) this.auditListeners.add(listener)
+    return () => this.auditListeners.delete(listener)
+  }
+
+  async dataAuditRequest({ action } = {}) {
     await this.ready
     const audit = this.history.audit
-    const currentID = id ?? this.latestAuditID
+    const currentID = this.latestAuditID
     if (action === 'start') {
       const existing = currentID ? audit.get(currentID) : null
-      if (existing && ['queued', 'running'].includes(existing.status)) return this.auditSnapshot(existing)
+      if (existing && ['queued', 'running'].includes(existing.status)) return structuredClone(this.auditReport)
       const preferences = this.prefs(), targets = []
       for (const instrument of this.instruments.values()) for (const timeframe of LIST_TIMEFRAMES) {
         const step = timeframeMilliseconds(timeframe), through = closedBoundary(timeframe) - step
@@ -1880,14 +1903,20 @@ export class MarketService {
         const from = Number.isFinite(listedAt) && listedAt > 0 ? Math.max(horizon, Math.ceil(listedAt / step) * step) : horizon
         if (from <= through) targets.push({ instrument: instrument.instId, timeframe, source: 'candles', from, through })
       }
-      if (!targets.length) return { ...emptyAudit(), phase: 'completed' }
-      const job = audit.start({ targets }); this.latestAuditID = job.id
-      return this.auditSnapshot(job)
+      if (!targets.length) {
+        this.latestAuditID = null
+        this.publishAudit({ ...emptyAudit(), phase: 'completed' })
+      } else {
+        const job = audit.start({ targets }); this.latestAuditID = job.id
+        // start saves before selection; later checkpoints arrive through the hook.
+        this.publishAudit(this.auditSnapshot(job))
+      }
+      return structuredClone(this.auditReport)
     }
     if (!['status', 'cancel', 'repair'].includes(action)) throw new TypeError('Unknown data audit action.')
-    if (!currentID) return emptyAudit()
-    const job = action === 'cancel' ? audit.cancel(currentID) : action === 'repair' ? audit.repair(currentID) : audit.get(currentID)
-    return this.auditSnapshot(job)
+    if (currentID && action === 'cancel') audit.cancel(currentID)
+    if (currentID && action === 'repair') audit.repair(currentID)
+    return structuredClone(this.auditReport)
   }
 
   listProgress(timeframe, entries = [...this.catalog.keys()]) {
@@ -1937,6 +1966,7 @@ export class MarketService {
     if (this.streamQualificationTimer) clearTimeout(this.streamQualificationTimer)
     if (this.liveStatisticsTimer) clearTimeout(this.liveStatisticsTimer)
     this.marketListeners.clear()
+    this.auditListeners.clear()
     this.qualificationQueue.clear()
     this.disposeTask = (async () => {
       try { await this.ready } catch { if (this.ownsMetadata) this.metadata?.close(); return }

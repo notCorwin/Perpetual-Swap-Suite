@@ -10,4 +10,7 @@ ipcRenderer.on('radar:chart-prepared', (_event, detail) => {
 ipcRenderer.on('radar:market-changed', () => {
   window.dispatchEvent(new CustomEvent('radar-market-changed'))
 })
+ipcRenderer.on('radar:audit-changed', (_event, detail) => {
+  window.dispatchEvent(new CustomEvent('radar-audit-changed', { detail }))
+})
 contextBridge.exposeInMainWorld('radarDesktop', { request })

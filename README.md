@@ -98,6 +98,8 @@ In **Settings → Data integrity**:
 2. Follow the progress and issue list, or choose **Cancel audit** to stop the current run.
 3. Choose **Repair issues** for repairable findings. Repairs run in the background and are followed by verification of persisted data; unresolved issues remain visible.
 
+Audit progress and findings are pushed after each durable checkpoint. Settings reads the current report when opened and then follows ordered updates without periodic status requests. Reopening resynchronizes any updates received while Settings was closed.
+
 ## Optional AI chart analysis
 
 Open **Settings → Optional AI analysis → Configure analysis**, enter a Vercel AI Gateway key, and select a model with image input support. The default model is `openai/gpt-6.1-sol`. Market collection and charts work without AI credentials.

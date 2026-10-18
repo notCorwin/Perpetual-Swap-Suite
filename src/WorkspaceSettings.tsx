@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Settings2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
@@ -12,8 +12,9 @@ import { AnalysisSettingsButton } from '@/AnalysisSettingsDialog'
 import { LIQUIDITY_FIELDS, preferencesDraft, validatePreferencesDraft, type Preferences } from '@/renderer-preferences'
 import type { DataAudit } from '@/desktop-contract'
 import { RADAR_TIMEFRAMES, type RadarTimeframe } from '@/timeframe'
+import { SnapshotOrder } from '@/snapshot-order'
 
-const emptyAudit: DataAudit = { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '' }
+const emptyAudit: DataAudit = { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '', revision: 0, serviceSession: '' }
 const errorMessage = (cause: unknown) => cause instanceof Error ? cause.message : 'The desktop service could not complete this request.'
 
 export function WorkspaceSettings({ preferences, loadError, onSave }: { preferences: Preferences; loadError: string; onSave: (values: Preferences) => Promise<void> }) {
@@ -24,36 +25,44 @@ export function WorkspaceSettings({ preferences, loadError, onSave }: { preferen
   const [saveError, setSaveError] = useState('')
   const [audit, setAudit] = useState<DataAudit>(emptyAudit)
   const [auditError, setAuditError] = useState('')
-  const [auditPollError, setAuditPollError] = useState('')
-  const auditActionPending = useRef(false)
+  const [auditStatusError, setAuditStatusError] = useState('')
   const [auditBusy, setAuditBusy] = useState(false)
   const auditSequence = useRef(0)
+  const auditLifecycle = useRef(0)
+  const auditAccepted = useRef(0)
+  const auditOrder = useRef(new SnapshotOrder())
+  const acceptAudit = useCallback((value: DataAudit) => {
+    if (!auditOrder.current.accept(value)) return
+    auditAccepted.current += 1
+    setAudit(value); setAuditStatusError('')
+  }, [])
   useEffect(() => {
     if (!open) return
-    const sequences = auditSequence
-    let stopped = false
-    let timer: number
+    const lifecycle = ++auditLifecycle.current
+    const accepted = auditAccepted.current
+    setAuditBusy(false); setAuditError(''); setAuditStatusError('')
+    const published = (event: Event) => acceptAudit((event as CustomEvent<DataAudit>).detail)
+    window.addEventListener('radar-audit-changed', published)
     const status = async () => {
-      if (auditActionPending.current) { timer = window.setTimeout(status, 1500); return }
-      const sequence = ++auditSequence.current
       try {
         const value = await window.radarDesktop.request({ dataAudit: { action: 'status' } })
-        if (!stopped && sequence === auditSequence.current) { setAudit(value); setAuditPollError('') }
-      } catch (cause) { if (!stopped && sequence === auditSequence.current) setAuditPollError(errorMessage(cause)) }
-      if (!stopped) timer = window.setTimeout(status, 1500)
+        if (lifecycle === auditLifecycle.current) acceptAudit(value)
+      } catch (cause) {
+        if (lifecycle === auditLifecycle.current && accepted === auditAccepted.current) setAuditStatusError(errorMessage(cause))
+      }
     }
     void status()
-    return () => { stopped = true; clearTimeout(timer); sequences.current++ }
-  }, [open])
+    return () => { window.removeEventListener('radar-audit-changed', published); auditLifecycle.current++ }
+  }, [open, acceptAudit])
   const auditAction = async (action: 'start' | 'cancel' | 'repair') => {
+    const lifecycle = auditLifecycle.current
     const sequence = ++auditSequence.current
-    auditActionPending.current = true
     setAuditBusy(true); setAuditError('')
     try {
       const value = await window.radarDesktop.request({ dataAudit: { action } })
-      if (sequence === auditSequence.current) setAudit(value)
-    } catch (cause) { if (sequence === auditSequence.current) setAuditError(errorMessage(cause)) }
-    finally { auditActionPending.current = false; setAuditBusy(false) }
+      if (lifecycle === auditLifecycle.current && sequence === auditSequence.current) acceptAudit(value)
+    } catch (cause) { if (lifecycle === auditLifecycle.current && sequence === auditSequence.current) setAuditError(errorMessage(cause)) }
+    finally { if (lifecycle === auditLifecycle.current && sequence === auditSequence.current) setAuditBusy(false) }
   }
   const changeNumber = (key: 'rankingLookback' | 'historyDays' | 'slippageNotional', value: string) => {
     setDraft(current => ({ ...current, [key]: value })); setErrors(current => ({ ...current, [key]: '' })); setSaveError('')
@@ -131,7 +140,7 @@ export function WorkspaceSettings({ preferences, loadError, onSave }: { preferen
             <Button type="button" variant="outline" onClick={() => void auditAction('cancel')} disabled={auditBusy || audit.phase !== 'running'}>Cancel audit</Button>
             <Button type="button" variant="outline" onClick={() => void auditAction('repair')} disabled={auditBusy || audit.phase === 'running' || !audit.issues.some(issue => issue.repairable)}>Repair issues</Button>
           </div>
-          {(auditError || auditPollError || audit.error) && <p role="alert" className="text-sm text-destructive">{auditError || auditPollError || audit.error}</p>}
+          {(auditError || auditStatusError || audit.error) && <p role="alert" className="text-sm text-destructive">{auditError || auditStatusError || audit.error}</p>}
           {audit.issues.length > 0 && <ul className="flex max-h-48 flex-col gap-2 overflow-y-auto text-sm" aria-label="Data audit issues">{audit.issues.map((issue, index) => <li key={`${issue.instrument}-${issue.timeframe}-${issue.from}-${index}`}>
             <strong>{issue.instrument} · {issue.timeframe}</strong><p>{new Date(issue.from).toLocaleString('en-US')} – {new Date(issue.through).toLocaleString('en-US')}</p><p>{issue.reason} · {issue.repairable ? 'Repairable' : 'Review required'}</p>
           </li>)}</ul>}

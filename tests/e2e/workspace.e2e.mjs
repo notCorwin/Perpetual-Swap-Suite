@@ -28,8 +28,15 @@ before(async () => {
       turnover24hUSDT: 50_000_000,
     }))
     const state = globalThis.__workspaceFixture = { preferences, rows, initialRows: rows, requests: [], revision: 1, loading: false, error: '', catalogSource: 'live', catalogProgress: undefined, failNextSave: false, failSnapshots: 0, staleNextSnapshot: false, staleReplies: 0, chartGeneration: 1, bollMode: 'standard', holdNextSnapshot: false, releaseSnapshot: null, snapshotActive: 0, snapshotMaximum: 0,
-      audit: { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '' } }
+      holdAuditAction: null, releaseAudit: null, heldAuditReply: null,
+      audit: { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '', revision: 0, serviceSession: 'audit-fixture' } }
     state.notify = () => BrowserWindow.getAllWindows()[0].webContents.send('radar:market-changed')
+    state.publishAudit = values => {
+      state.audit = { ...state.audit, ...structuredClone(values), revision: state.audit.revision + 1 }
+      const report = structuredClone(state.audit)
+      BrowserWindow.getAllWindows()[0].webContents.send('radar:audit-changed', report)
+      return report
+    }
     const prepared = ({ instId, timeframe }) => {
       const intervalMS = timeframe === '1H' ? 3_600_000 : timeframe === '15m' ? 900_000 : 300_000
       const endHour = Math.floor(Date.UTC(2026, 9, 18) / intervalMS) * intervalMS
@@ -80,10 +87,17 @@ before(async () => {
       if (value.captureChart) return { ok: true }
       if (value.analysisSettings) return { model: '', hasAPIKey: false }
       if (value.dataAudit) {
-        if (value.dataAudit.action === 'start') state.audit = { id: 'audit-1', phase: 'running', progress: { completed: 1, total: 3 }, issues: [], error: '' }
-        if (value.dataAudit.action === 'cancel') state.audit = { ...state.audit, phase: 'cancelled', issues: [{ instrument: 'BETA-USDT-SWAP', timeframe: '5m', from: 1_800_000_000_000, through: 1_800_000_300_000, reason: 'Missing completed candle', repairable: true }] }
-        if (value.dataAudit.action === 'repair') state.audit = { ...state.audit, phase: 'completed', progress: { completed: 3, total: 3 }, issues: [] }
-        return state.audit
+        const action = value.dataAudit.action
+        if (action === 'start') state.publishAudit({ id: 'audit-1', phase: 'running', progress: { completed: 1, total: 3 }, issues: [], error: '' })
+        if (action === 'cancel') state.publishAudit({ phase: 'cancelled', issues: [{ instrument: 'BETA-USDT-SWAP', timeframe: '5m', from: 1_800_000_000_000, through: 1_800_000_300_000, reason: 'Missing completed candle', repairable: true }] })
+        if (action === 'repair') state.publishAudit({ phase: 'completed', progress: { completed: 3, total: 3 }, issues: [] })
+        const report = structuredClone(state.audit)
+        if (state.holdAuditAction === action) {
+          state.holdAuditAction = null; state.heldAuditReply = report
+          await new Promise(resolve => { state.releaseAudit = resolve })
+          state.releaseAudit = null
+        }
+        return report
       }
       throw new Error(`Unsupported renderer fixture operation: ${Object.keys(value).join(', ')}`)
     })
@@ -402,24 +416,87 @@ test('saving only the ranking lookback keeps the current qualified rows and char
   await page.evaluate(() => { delete globalThis.__rankingChart })
 })
 
-test('settings starts, polls, cancels, and repairs an audit while keeping its progress and issues visible', async () => {
+const waitForAuditFixture = async (predicate, argument) => {
+  const deadline = Date.now() + 2_000
+  while (!(await electron.evaluate(predicate, argument))) {
+    assert.ok(Date.now() < deadline, 'The audit fixture did not receive its expected request.')
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+}
+
+test('audit checkpoints push progress and actions without idle status polling, and reopening reads once', async () => {
+  const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length)
   await page.getByRole('button', { name: 'Settings', exact: true }).click()
   const dialog = page.getByRole('dialog', { name: 'Settings', exact: true })
+  await dialog.waitFor({ state: 'visible' })
+  await dialog.getByRole('status').filter({ hasText: 'idle · 0 / 0' }).waitFor()
+  await waitForAuditFixture((_electron, expected) => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length === expected, before + 1)
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length), before + 1)
   await dialog.getByRole('button', { name: 'Start audit', exact: true }).click()
   await dialog.getByRole('status').filter({ hasText: 'running · 1 / 3' }).waitFor()
-  await electron.evaluate(() => { globalThis.__workspaceFixture.audit.progress.completed = 2 })
+  await electron.evaluate(() => { globalThis.__workspaceFixture.publishAudit({ progress: { completed: 2, total: 3 } }) })
   await dialog.getByRole('status').filter({ hasText: 'running · 2 / 3' }).waitFor()
   await dialog.getByRole('button', { name: 'Cancel audit', exact: true }).click()
   await dialog.getByRole('list', { name: 'Data audit issues' }).getByText('Missing completed candle · Repairable', { exact: true }).waitFor()
   await dialog.getByRole('button', { name: 'Repair issues', exact: true }).click()
   await dialog.getByRole('status').filter({ hasText: 'completed · 3 / 3' }).waitFor()
   assert.equal(await dialog.getByRole('list', { name: 'Data audit issues' }).count(), 0)
+  await new Promise(resolve => setTimeout(resolve, 1_750))
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length), before + 1, 'A successful audit dialog must wait for checkpoints rather than poll.')
   const actions = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit).map(value => value.dataAudit.action))
-  assert.ok(actions.includes('status'))
   assert.deepEqual(actions.filter(action => action !== 'status'), ['start', 'cancel', 'repair'])
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await dialog.waitFor({ state: 'hidden' })
+  await page.getByRole('button', { name: 'Settings', exact: true }).click()
+  await dialog.getByRole('status').filter({ hasText: 'completed · 3 / 3' }).waitFor()
+  await waitForAuditFixture((_electron, expected) => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length === expected, before + 2)
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length), before + 2, 'Reopening performs one fresh status read.')
   await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
 })
 
+test('new audit pushes win over held initial and action replies across dialog reopen', async () => {
+  const dialog = page.getByRole('dialog', { name: 'Settings', exact: true })
+  try {
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.publishAudit({ phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '' })
+      state.holdAuditAction = 'status'
+    })
+    await page.getByRole('button', { name: 'Settings', exact: true }).click()
+    await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseAudit))
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.publishAudit({ phase: 'running', progress: { completed: 2, total: 3 } })
+      state.publishAudit({ phase: 'completed', progress: { completed: 7, total: 7 } })
+    })
+    await dialog.getByRole('status').filter({ hasText: 'completed · 7 / 7' }).waitFor()
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.heldAuditReply.phase), 'idle', 'The held initial reply must remain its detached older report.')
+    await electron.evaluate(() => { globalThis.__workspaceFixture.releaseAudit() })
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    await dialog.getByRole('status').filter({ hasText: 'completed · 7 / 7' }).waitFor()
+    const beforeReopen = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length)
+    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
+    await dialog.waitFor({ state: 'hidden' })
+    await page.getByRole('button', { name: 'Settings', exact: true }).click()
+    await dialog.getByRole('status').filter({ hasText: 'completed · 7 / 7' }).waitFor()
+    await waitForAuditFixture((_electron, expected) => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length === expected, beforeReopen + 1)
+    await electron.evaluate(() => { globalThis.__workspaceFixture.holdAuditAction = 'start' })
+    await dialog.getByRole('button', { name: 'Start audit', exact: true }).click()
+    await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseAudit))
+    await dialog.getByRole('status').filter({ hasText: 'running · 1 / 3' }).waitFor()
+    await electron.evaluate(() => { globalThis.__workspaceFixture.publishAudit({ phase: 'completed', progress: { completed: 3, total: 3 } }) })
+    await dialog.getByRole('status').filter({ hasText: 'completed · 3 / 3' }).waitFor()
+    assert.equal(await dialog.getByRole('button', { name: 'Start audit', exact: true }).isDisabled(), true, 'A push must not release an action that is still in flight.')
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.heldAuditReply.phase), 'running', 'The held action reply must remain its detached older report.')
+    await electron.evaluate(() => { globalThis.__workspaceFixture.releaseAudit() })
+    await dialog.getByRole('button', { name: 'Start audit', exact: true }).waitFor({ state: 'visible' })
+    await page.waitForFunction(() => ![...document.querySelectorAll('[role="dialog"] button')].find(button => button.textContent === 'Start audit')?.disabled)
+    await dialog.getByRole('status').filter({ hasText: 'completed · 3 / 3' }).waitFor()
+  } finally {
+    await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.holdAuditAction = null; state.releaseAudit?.() })
+    await page.keyboard.press('Escape')
+  }
+})
 
 test('ranking changes keep the chosen chart while long lists retain keyboard and search access', async () => {
   await electron.evaluate(() => {

@@ -7,6 +7,7 @@ import { MarketStore } from '../electron/services/market-store.js'
 import { MarketService } from '../electron/services/market-service.js'
 import { MetadataStore, DEFAULT_PREFERENCES } from '../electron/services/metadata-store.js'
 import type { LiquidityInput } from '../electron/services/liquidity.js'
+import type { DataAuditSnapshot } from '../electron/services/market-service.js'
 
 const response = (data: unknown) => new Response(JSON.stringify({ code: '0', data }), { headers: { 'Content-Type': 'application/json' } })
 const fiveMinutes = 300_000
@@ -1032,6 +1033,8 @@ test('dispose aborts noncooperative HTTP and Retry-After pacing before closing s
 
 test('manual audit scans, repairs only its findings, and invalidates canonical generations', async () => {
   const f = await fixture()
+  const reports: DataAuditSnapshot[] = []
+  f.service.subscribeAudit(report => { reports.push(report) })
   try {
     const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
     f.service.instruments.set(instId, { ...instrument, listTime: String(asOf - fiveMinutes) })
@@ -1044,13 +1047,129 @@ test('manual audit scans, repairs only its findings, and invalidates canonical g
     const checked = await f.service.dataAuditRequest({ action: 'status' })
     assert.equal(checked.phase, 'completed')
     assert.ok(checked.issues.length > 0)
-    await f.service.dataAuditRequest({ action: 'repair' })
+    const repairing = await f.service.dataAuditRequest({ action: 'repair' })
+    assert.equal(repairing.phase, 'running')
+    assert.ok(repairing.revision > checked.revision)
+    assert.deepEqual(reports.find(report => report.revision === repairing.revision), repairing, 'An action returns its saved checkpoint, before jobs.set replaces the old completed job.')
     await f.service.history.audit.whenIdle()
     const repaired = await f.service.dataAuditRequest({ action: 'status' })
     assert.equal(repaired.issues.length, 0)
     assert.equal(calls.length, checked.issues.length)
     assert.ok(f.service.dataRevision(instId) > 0)
   } finally { await f.close() }
+})
+
+test('audit checkpoints push detached ordered reports while status reads remain observational', async () => {
+  const f = await fixture()
+  const release = deferred(), reports: DataAuditSnapshot[] = []
+  let inspecting = false
+  try {
+    const idle = await f.service.dataAuditRequest({ action: 'status' })
+    assert.equal(idle.revision, 0)
+    assert.equal(idle.serviceSession, f.service.serviceSession)
+    f.service.subscribeAudit(report => { report.progress.total = -1; throw new Error('Renderer closed.') })
+    f.service.subscribeAudit(async () => { throw new Error('Async renderer closed.') })
+    const unsubscribe = f.service.subscribeAudit(report => { reports.push(report) })
+    const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
+    f.service.instruments.set(instId, { ...instrument, listTime: String(asOf - fiveMinutes) })
+    f.service.history.audit.inspect = async () => { inspecting = true; await release.promise; return { issues: [], checkedRows: 0, files: 0 } }
+    const started = await f.service.dataAuditRequest({ action: 'start' })
+    assert.equal(started.phase, 'running')
+    assert.ok(started.progress.total > 0)
+    assert.deepEqual(reports.find(report => report.revision === started.revision), started)
+    await waitFor(() => inspecting)
+    const beforeRead = reports.length
+    const status = await f.service.dataAuditRequest({ action: 'status' })
+    assert.deepEqual(await f.service.dataAuditRequest({ action: 'status' }), status)
+    assert.deepEqual(await f.service.dataAuditRequest({ action: 'start' }), status, 'Starting an active selected audit is also observational.')
+    assert.equal(reports.length, beforeRead)
+    status.progress.total = -100
+    assert.ok((await f.service.dataAuditRequest({ action: 'status' })).progress.total > 0)
+    const cancelled = await f.service.dataAuditRequest({ action: 'cancel' })
+    assert.equal(cancelled.phase, 'cancelled')
+    assert.deepEqual(reports.at(-1), cancelled)
+    assert.deepEqual(await f.service.dataAuditRequest({ action: 'cancel' }), cancelled)
+    assert.equal(f.service.history.audit.get(started.id).status, 'cancelled')
+    release.resolve(); await f.service.history.audit.whenIdle()
+    assert.deepEqual(await f.service.dataAuditRequest({ action: 'status' }), cancelled)
+    assert.ok(reports.every((report, index) => index === 0 || report.revision > reports[index - 1].revision))
+    assert.ok(reports.every(report => report.serviceSession === idle.serviceSession))
+    unsubscribe()
+    const count = reports.length
+    await f.service.dataAuditRequest({ action: 'start' })
+    await f.service.history.audit.whenIdle()
+    assert.equal(reports.length, count)
+  } finally { release.resolve(); await f.close() }
+})
+
+test('late checkpoints cannot replace the selected audit or an empty-target completed report', async () => {
+  const f = await fixture()
+  const release = deferred(), reports: DataAuditSnapshot[] = []
+  let inspecting = false
+  try {
+    const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
+    f.service.instruments.set(instId, { ...instrument, listTime: String(asOf - fiveMinutes) })
+    f.service.history.audit.inspect = async () => { inspecting = true; await release.promise; return { issues: [], checkedRows: 0, files: 0 } }
+    f.service.subscribeAudit(report => { reports.push(report) })
+    const old = await f.service.dataAuditRequest({ action: 'start' })
+    await waitFor(() => inspecting)
+    await f.service.dataAuditRequest({ action: 'cancel' })
+    const selected = await f.service.dataAuditRequest({ action: 'start' })
+    assert.notEqual(selected.id, old.id)
+    const count = reports.length
+    f.service.onAuditCheckpoint({ ...f.service.history.audit.get(old.id), status: 'completed' })
+    assert.equal(reports.length, count)
+    assert.deepEqual(await f.service.dataAuditRequest({ action: 'status' }), selected)
+    await f.service.dataAuditRequest({ action: 'cancel' })
+    f.service.instruments.clear()
+    const empty = await f.service.dataAuditRequest({ action: 'start' })
+    assert.equal(empty.id, undefined)
+    assert.equal(empty.phase, 'completed')
+    assert.deepEqual(empty.progress, { completed: 0, total: 0 })
+    assert.deepEqual(reports.at(-1), empty)
+    assert.ok(empty.revision > selected.revision)
+    f.service.onAuditCheckpoint({ ...f.service.history.audit.get(selected.id), status: 'completed' })
+    assert.deepEqual(await f.service.dataAuditRequest({ action: 'status' }), empty)
+    release.resolve(); await f.service.history.audit.whenIdle()
+    assert.deepEqual(await f.service.dataAuditRequest({ action: 'status' }), empty)
+  } finally { release.resolve(); await f.close() }
+})
+
+test('audit startup restores one versioned selected report and shutdown stops publications', async () => {
+  const f = await fixture()
+  let reopened: MarketService | undefined
+  const release = deferred()
+  try {
+    const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
+    f.service.instruments.set(instId, { ...instrument, listTime: String(asOf - fiveMinutes) })
+    f.service.history.audit.inspect = async () => ({ issues: [], checkedRows: 0, files: 0 })
+    await f.service.dataAuditRequest({ action: 'start' })
+    await f.service.history.audit.whenIdle()
+    const saved = await f.service.dataAuditRequest({ action: 'status' })
+    await f.service.dispose()
+    reopened = new MarketService(f.store, () => f.preferences, async () => { throw new Error('Unexpected network request.') }, false)
+    const restored = await reopened.dataAuditRequest({ action: 'status' })
+    assert.equal(restored.id, saved.id)
+    assert.equal(restored.phase, 'completed')
+    assert.equal(restored.revision, 1)
+    assert.notEqual(restored.serviceSession, saved.serviceSession)
+    assert.deepEqual(await reopened.dataAuditRequest({ action: 'status' }), restored)
+    reopened.instruments.set(instId, { ...instrument, listTime: String(asOf - fiveMinutes) })
+    let inspecting = false
+    reopened.history.audit.inspect = async () => { inspecting = true; await release.promise; return { issues: [], checkedRows: 0, files: 0 } }
+    let published = 0
+    reopened.subscribeAudit(() => { published += 1 })
+    const started = await reopened.dataAuditRequest({ action: 'start' })
+    await waitFor(() => inspecting)
+    const count = published
+    const closing = reopened.dispose()
+    reopened.onAuditCheckpoint(reopened.history.audit.get(started.id))
+    assert.equal(published, count)
+    release.resolve(); await closing
+    reopened.subscribeAudit(() => { published += 1 })
+    reopened.onAuditCheckpoint(reopened.history.audit.get(started.id))
+    assert.equal(published, count)
+  } finally { release.resolve(); await reopened?.dispose(); await f.close() }
 })
 
 class TestSocket extends EventTarget {

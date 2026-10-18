@@ -37,7 +37,7 @@ const abortable = (promise, signal) => {
 
 /** OKX source adaptation; HistorySync alone schedules durable observations. */
 export class MarketHistory {
-  constructor({ store, metadata, get, parseCandle, persistCandles, persistStatistics, replaceCandles, instrument, onProgress, onLive, now = Date.now }) {
+  constructor({ store, metadata, get, parseCandle, persistCandles, persistStatistics, replaceCandles, instrument, onProgress, onLive, onAuditCheckpoint, now = Date.now }) {
     if (typeof replaceCandles !== 'function') throw new TypeError('MarketHistory needs a replacement mutation callback.')
     Object.assign(this, { store, metadata, get, parseCandle, persistCandles, persistStatistics, replaceCandles, instrument, onLive, now })
     this.closed = false
@@ -74,7 +74,7 @@ export class MarketHistory {
       maxConcurrentTasks: 8,
       maxConcurrentPerSource: { candles: 4, oi: 2, taker: 2 },
     })
-    this.audit = new DataAudit({ metadata, now,
+    this.audit = new DataAudit({ metadata, now, onCheckpoint: onAuditCheckpoint,
       inspect: async (target, { signal }) => {
         signal.throwIfAborted()
         const bounds = this.bounds(target.instrument, target.timeframe)

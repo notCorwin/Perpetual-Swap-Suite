@@ -64,6 +64,8 @@ export class DataAudit {
     inspect?: AuditInspect
     /** Repair is explicit; unavailable observations are never synthesized. */
     repair?: AuditRepair
+    /** Detached exact checkpoint after durable persistence; observers are isolated and never awaited. */
+    onCheckpoint?(job: AuditJob): void | Promise<void>
     now?: () => number
     /** Defaults to one day; yields between chunks on the background lane. */
     chunkMilliseconds?: number

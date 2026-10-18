@@ -24,6 +24,92 @@ class MemoryMetadata {
   listAudits() { return [...this.records.values()].map(job => structuredClone(job)) }
 }
 
+test('checkpoints publish the exact saved job and isolate observer mutation, throws, and pending promises', async () => {
+  const metadata = new MemoryMetadata(), reports: AuditJob[] = [], observer = deferred<void>()
+  let audit: DataAudit, timeout: ReturnType<typeof setTimeout> | undefined
+  audit = new DataAudit({ metadata, now: () => 17, inspect: async () => inspected([finding('gap', 0)]), onCheckpoint: job => {
+    assert.deepEqual(job, metadata.records.get(job.id), 'An observer must see the successfully committed checkpoint.')
+    reports.push(structuredClone(job))
+    if (job.status === 'queued') assert.equal(audit.get(job.id), null, 'The payload exists even before start installs its in-memory job.')
+    const status = job.status
+    job.status = 'failed'; job.cursor.targetIndex = 99; job.issues.length = 0
+    if (status === 'queued') throw new Error('Observer failed synchronously.')
+    if (status === 'running' && !reports.at(-1)!.checkedRows) return Promise.reject(new Error('Observer failed asynchronously.'))
+    return observer.promise
+  } })
+  try {
+    const started = audit.start({ id: 'checkpoints', targets: [target()] })
+    assert.equal(started.status, 'queued')
+    await Promise.race([audit.whenIdle(), new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('An observer blocked audit progress.')), 1_000) })])
+    const saved = metadata.records.get(started.id)!
+    assert.equal(saved.status, 'completed')
+    assert.equal(saved.cursor.targetIndex, 1)
+    assert.equal(saved.issues.length, 1)
+    assert.deepEqual(audit.get(started.id), saved)
+    assert.deepEqual(reports.map(job => job.status), ['queued', 'running', 'running', 'completed'])
+    assert.deepEqual(reports.at(-1), saved)
+  } finally { clearTimeout(timeout); observer.resolve(); await audit.close() }
+})
+
+test('a failed durable save publishes no checkpoint and cannot install an unsaved job', async () => {
+  const metadata = new MemoryMetadata(), reports: AuditJob[] = []
+  const audit = new DataAudit({ metadata, inspect: async () => inspected(), onCheckpoint: job => { reports.push(job) } })
+  metadata.saveAudit = () => { throw new Error('SQLite write failed.') }
+  try {
+    assert.throws(() => audit.start({ id: 'unsaved', targets: [target()] }), /SQLite write failed/)
+    assert.deepEqual(reports, [])
+    assert.equal(metadata.records.size, 0)
+    assert.equal(audit.get('unsaved'), null)
+  } finally { await audit.close() }
+})
+
+test('cancellation and resumption publish their new saved payload before replacing the in-memory job', async () => {
+  const metadata = new MemoryMetadata(), entered = deferred<void>(), release = deferred<void>()
+  const reports: AuditJob[] = [], previousStatuses: (AuditJob['status'] | null)[] = []
+  let calls = 0, audit: DataAudit
+  audit = new DataAudit({ metadata, inspect: async () => {
+    if (++calls === 1) { entered.resolve(); await release.promise }
+    return inspected()
+  }, onCheckpoint: job => {
+    assert.deepEqual(job, metadata.records.get(job.id))
+    reports.push(job); previousStatuses.push(audit.get(job.id)?.status ?? null)
+  } })
+  try {
+    const { id } = audit.start({ targets: [target()] })
+    await entered.promise
+    const cancelled = audit.cancel(id)
+    assert.deepEqual(reports.at(-1), cancelled)
+    assert.equal(previousStatuses.at(-1), 'running')
+    release.resolve(); await audit.whenIdle()
+    const resumed = audit.resume(id)
+    assert.deepEqual(reports.at(-1), resumed)
+    assert.equal(previousStatuses.at(-1), 'cancelled')
+    await audit.whenIdle()
+    assert.equal(reports.at(-1)?.status, 'completed')
+    assert.deepEqual(reports.at(-1), metadata.records.get(id))
+  } finally { release.resolve(); await audit.close() }
+})
+
+test('restart publishes its durable queued recovery checkpoint before background work completes', async () => {
+  const metadata = new MemoryMetadata()
+  const original = new DataAudit({ metadata, inspect: async () => inspected() })
+  const { id } = original.start({ targets: [target()] })
+  original.cancel(id)
+  await original.close()
+  metadata.saveAudit({ ...metadata.records.get(id)!, status: 'running' })
+  const reports: AuditJob[] = []
+  const restored = new DataAudit({ metadata, inspect: async () => inspected(), onCheckpoint: job => {
+    assert.deepEqual(job, metadata.records.get(id)); reports.push(job)
+  } })
+  try {
+    assert.equal(reports[0].status, 'queued')
+    assert.equal(reports[0].cursor.nextFrom, 0)
+    await restored.whenIdle()
+    assert.equal(reports.at(-1)?.status, 'completed')
+    assert.deepEqual(reports.at(-1), restored.get(id))
+  } finally { await restored.close() }
+})
+
 test('audit runs on the background lane, reports exact defect ranges, and returns detached reports', async () => {
   const metadata = new MemoryMetadata()
   const calls: AuditTarget[] = []

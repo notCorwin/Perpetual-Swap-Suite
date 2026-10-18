@@ -1,6 +1,6 @@
 import type { CandleRecord, CandleRange, MarketStore, StorePriority } from './market-store.js'
 import type { HistorySync, HistoryTask, HistorySyncOptions } from './history-sync.js'
-import type { DataAudit, AuditMetadata } from './data-audit.js'
+import type { DataAudit, AuditJob, AuditMetadata } from './data-audit.js'
 
 type MaybePromise<T> = T | Promise<T>
 type Timeframe = '5m' | '15m' | '1H'
@@ -18,6 +18,8 @@ export type MarketHistoryOptions = {
   /** Owner serializes replacement, statistics preservation and invalidation with every candle mutation. */
   replaceCandles(range: CandleRange & { instrument: string; timeframe: string }, rows: CandleRecord[], priority: StorePriority): MaybePromise<unknown>
   onProgress?(task: HistoryTask): MaybePromise<void>
+  /** Exact saved audit checkpoints; observer failures cannot interrupt auditing. */
+  onAuditCheckpoint?(job: AuditJob): MaybePromise<void>
   onLive?(instId: string, timeframe: string, row: CandleRecord): MaybePromise<unknown>
   now?(): number
 }

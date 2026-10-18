@@ -82,7 +82,7 @@ class MemoryMetadata {
 type Parameters = Record<string, number | string>
 type Get = (path: string, parameters: Parameters, signal: AbortSignal, priority: string) => Promise<unknown[][]>
 const setup = (options: { store?: MemoryStore | MarketStore; metadata?: MemoryMetadata | MetadataStore; get?: Get; now?: () => number;
-  listing?: number; onLive?: (instrument: string, timeframe: string, row: CandleRecord) => void; onReplace?: () => void } = {}) => {
+  listing?: number; onLive?: (instrument: string, timeframe: string, row: CandleRecord) => void; onReplace?: () => void; onAuditCheckpoint?: (job: AuditJob) => void | Promise<void> } = {}) => {
   const store = options.store ?? new MemoryStore(), metadata = options.metadata ?? new MemoryMetadata()
   const now = options.now ?? (() => base + day)
   const calls: { path: string; parameters: Parameters; priority: string }[] = []
@@ -131,9 +131,28 @@ const setup = (options: { store?: MemoryStore | MarketStore; metadata?: MemoryMe
       await store.appendCandles(rows.map(row => ({ ...prior.get(row.timestamp), ...row })))
     }),
     replaceCandles: async (range, rows, priority) => { await store.replaceCandles(range, rows, priority); options.onReplace?.() },
-    instrument: () => ({ instId, listTime: options.listing }), onLive: options.onLive, now })
+    instrument: () => ({ instId, listTime: options.listing }), onLive: options.onLive, onAuditCheckpoint: options.onAuditCheckpoint, now })
   return { history, store, metadata, calls }
 }
+
+test('history forwards detached durable audit checkpoints without adding source requests', async () => {
+  const metadata = new MemoryMetadata(), reports: AuditJob[] = []
+  const { history, calls } = setup({ metadata, onAuditCheckpoint: job => {
+    assert.deepEqual(job, metadata.audits.get(job.id))
+    reports.push(structuredClone(job))
+    job.cursor.targetIndex = 99
+  } })
+  try {
+    await history.ready
+    const { id } = history.audit.start({ targets: [{ instrument: instId, timeframe: '5m', from: base, through: base }] })
+    await history.audit.whenIdle()
+    assert.equal(reports[0].status, 'queued')
+    assert.equal(reports.at(-1)?.status, 'completed')
+    assert.deepEqual(reports.at(-1), history.audit.get(id))
+    assert.equal(history.audit.get(id)?.cursor.targetIndex, 1)
+    assert.deepEqual(calls, [])
+  } finally { await history.close() }
+})
 
 test('durable price coverage is reused and missing base volume refetches only its exact slot', async () => {
   const { history, store, calls } = setup()

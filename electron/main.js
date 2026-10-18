@@ -185,6 +185,9 @@ async function startDesktop() {
   marketService.subscribeMarket(() => {
     if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('radar:market-changed')
   })
+  marketService.subscribeAudit(report => {
+    if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('radar:audit-changed', report)
+  })
   ipcMain.handle('radar:request', handleRequest)
   if (e2eLiveRefresh) void marketService.refresh().catch(error => console.error('Market refresh failed:', error))
   await createWindow()
