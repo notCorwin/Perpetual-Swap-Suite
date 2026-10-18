@@ -243,12 +243,16 @@ test('discovery follows enabled conditions and publishes before a slower candida
   let slowStarted = false
   const configuration = disabled()
   configuration.liquidity.openInterest.enabled = true
+  configuration.liquidity.depth.enabled = true
   const fetcher: typeof fetch = async input => {
     const url = new URL(String(input))
     if (url.pathname.endsWith('/public/instruments')) return response([instrument, { ...instrument, instId: 'ETH-USDT-SWAP' }])
     if (url.pathname.endsWith('/market/tickers')) return response([ticker, { ...ticker, instId: 'ETH-USDT-SWAP' }])
     if (url.pathname.endsWith('/public/open-interest')) {
-      if (url.searchParams.get('instId') === instId) return response([{ oiUsd: '6000000' }])
+      return response([{ instId, oiUsd: '6000000' }, { instId: 'ETH-USDT-SWAP', oiUsd: '1' }])
+    }
+    if (url.pathname.endsWith('/market/books')) {
+      if (url.searchParams.get('instId') === instId) return response([{ asks: [['100', '200001']], bids: [['99.99', '200001']] }])
       slowStarted = true
       return new Promise(resolve => { resolveSlow = resolve })
     }
@@ -261,7 +265,7 @@ test('discovery follows enabled conditions and publishes before a slower candida
     await waitFor(() => slowStarted && f.service.catalog.has(instId))
     assert.equal((await f.service.snapshot()).rows[0].instId, instId)
     assert.equal(f.service.refreshing !== null, true)
-    resolveSlow(response([{ oiUsd: '1' }]))
+    resolveSlow(response([{ asks: [['100', '200001']], bids: [['99.99', '200001']] }]))
     await refresh
     assert.deepEqual((await f.service.snapshot()).rows.map(row => row.instId), [instId])
   } finally { resolveSlow?.(response([])); await f.close() }
@@ -302,7 +306,7 @@ test('missing 24-hour source data remains unknown instead of manufacturing zero 
 test('failed and empty observations retain an existing valid lease without extending it', async () => {
   const configuration = disabled(); configuration.liquidity.openInterest.enabled = true
   let empty = false
-  const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response(empty ? [] : [{ oiUsd: '6000000' }]) : null))
+  const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response(empty ? [] : [{ instId, oiUsd: '6000000' }]) : null))
   try {
     await f.service.refresh()
     const initial = f.service.metadata.getCatalogEntry(instId)
@@ -330,8 +334,8 @@ test('qualified contracts renew independently while discovery waits for another 
     if (url.pathname.endsWith('/public/instruments')) return response(discoverOther ? [instrument, { ...instrument, instId: otherID }] : [instrument])
     if (url.pathname.endsWith('/market/tickers')) return response([ticker, { ...ticker, instId: otherID }])
     if (url.pathname.endsWith('/public/open-interest')) {
-      if (url.searchParams.get('instId') === instId) oiCalls += 1
-      return response([{ oiUsd: '6000000' }])
+      oiCalls += 1
+      return response([{ instId, oiUsd: '6000000' }, { instId: otherID, oiUsd: '6000000' }])
     }
     throw new Error(`Unexpected ${url}`)
   })
@@ -365,7 +369,7 @@ test('qualified contracts renew independently while discovery waits for another 
 test('expired qualification stays hidden after unavailable observations and recovers through independent renewal', async () => {
   const configuration = disabled(); configuration.liquidity.openInterest.enabled = true
   let unavailable = false
-  const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response(unavailable ? [] : [{ oiUsd: '6000000' }]) : null))
+  const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response(unavailable ? [] : [{ instId, oiUsd: '6000000' }]) : null))
   try {
     f.service.updateRanking = async () => undefined
     await f.service.refresh()
@@ -405,7 +409,7 @@ test('historical preparation completes before live liquidity and refreshes a tic
     if (url.pathname.endsWith('/public/instruments')) return response([instrument])
     if (url.pathname.endsWith('/market/tickers')) { tickerCalls += 1; return response([{ ...ticker, last: tickerCalls === 1 ? '99' : '100' }]) }
     if (url.pathname.endsWith('/market/books')) { bookCalls += 1; return response([{ asks: [['100', '200001']], bids: [['99.99', '200001']] }]) }
-    if (url.pathname.endsWith('/public/open-interest')) { oiCalls += 1; return response([{ oiUsd: '6000000' }]) }
+    if (url.pathname.endsWith('/public/open-interest')) { oiCalls += 1; return response([{ instId, oiUsd: '6000000' }]) }
     throw new Error(`Unexpected ${url}`)
   })
   let refresh: Promise<void> | undefined
@@ -439,7 +443,7 @@ test('overlapping discovery and renewal checks share one instrument observation 
     if (!url.pathname.endsWith('/public/open-interest')) return null
     oiCalls += 1
     await oiGate
-    return response([{ oiUsd: '6000000' }])
+    return response([{ instId, oiUsd: '6000000' }])
   }))
   let first: Promise<unknown> | undefined, second: Promise<unknown> | undefined
   try {
@@ -521,7 +525,7 @@ test('known failing historical turnover does not consume live liquidity requests
 
 test('a genuine liquidity rejection has a completed failed check and no data error', async () => {
   const configuration = disabled(); configuration.liquidity.openInterest.enabled = true
-  const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response([{ oiUsd: '1' }]) : null))
+  const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response([{ instId, oiUsd: '1' }]) : null))
   try {
     await f.service.refresh()
     const snapshot = await f.service.snapshot()
@@ -1144,7 +1148,7 @@ test('liquidity threshold edits immediately reuse valid observations without net
   configuration.liquidity.spread.enabled = true
   configuration.liquidity.openInterest.enabled = true
   let fetches = 0, reads = 0, writes = 0
-  const source = discovery(url => url.pathname.endsWith('/public/open-interest') ? response([{ oiUsd: '6000000' }]) : null)
+  const source = discovery(url => url.pathname.endsWith('/public/open-interest') ? response([{ instId, oiUsd: '6000000' }]) : null)
   const f = await fixture(configuration, async (...args) => { fetches += 1; return source(...args) })
   try {
     isolateQualification(f.service)
@@ -1178,7 +1182,7 @@ test('liquidity threshold edits immediately reuse valid observations without net
 
 test('a liquidity edit does not wait for a previous candidate source that ignores cancellation', async () => {
   const configuration = disabled(); configuration.liquidity.openInterest.enabled = true
-  const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response([{ oiUsd: '6000000' }]) : null))
+  const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response([{ instId, oiUsd: '6000000' }]) : null))
   let release!: () => void
   const gate = new Promise<void>(resolve => { release = resolve })
   let blocked = false, refresh: Promise<void> | undefined, reconfigured: Promise<void> | undefined
@@ -1190,7 +1194,7 @@ test('a liquidity edit does not wait for a previous candidate source that ignore
       if (path === '/public/open-interest') {
         blocked = true
         await gate
-        return [{ oiUsd: '1' }]
+        return [{ instId, oiUsd: '1' }]
       }
       return get(path, ...args)
     }
@@ -1212,7 +1216,7 @@ test('a liquidity edit does not wait for a previous candidate source that ignore
 
 test('in-memory verification rejects expired observations without extending either valid or expired leases', async () => {
   const configuration = disabled(); configuration.liquidity.openInterest.enabled = true
-  const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response([{ oiUsd: '6000000' }]) : null))
+  const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response([{ instId, oiUsd: '6000000' }]) : null))
   try {
     isolateQualification(f.service)
     await f.service.refresh()
@@ -1324,7 +1328,7 @@ test('a historical correction during a live observation cannot restore the previ
   const f = await fixture(configuration, discovery(async url => {
     if (!url.pathname.endsWith('/public/open-interest')) return null
     if (blockOI) { blocked = true; await gate }
-    return response([{ oiUsd: '6000000' }])
+    return response([{ instId, oiUsd: '6000000' }])
   }))
   let refresh: Promise<void> | undefined
   try {
@@ -1398,7 +1402,7 @@ test('a rejected contract restored with fresh instrument and liquidity observati
   const configuration = disabled()
   configuration.liquidity.openInterest.enabled = true
   configuration.liquidity.openInterest.minUSDT = 7_000_000
-  const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response([{ oiUsd: '6000000' }]) : null))
+  const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response([{ instId, oiUsd: '6000000' }]) : null))
   let restored: MarketService | undefined, fetches = 0, reads = 0
   try {
     isolateQualification(f.service)
@@ -1494,6 +1498,7 @@ test('renewal refreshes metadata and bulk tickers even when it starts with no qu
     assert.equal(f.service.renewalTargets.size, 0)
     await f.service.renewCatalog()
     assert.deepEqual([metadataRequests, tickerRequests], [1, 1])
+    await Promise.all([...f.service.candidateTasks.values()])
     assert.ok(f.service.instrumentObservations.get(instId).expiresAt > Date.now())
     assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
     assert.equal((await f.service.snapshot()).catalogProgress.pending, 0)

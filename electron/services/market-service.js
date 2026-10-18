@@ -7,6 +7,7 @@ import { MarketHistory } from './market-history.js'
 import { eligibleInstrument, evaluateLiquidity, createLiquidityEvaluator, quoteTurnover24h } from './liquidity.js'
 import { rankingFromCandles, compareRanking } from './ranking.js'
 import { RealtimeMarket } from './realtime-market.js'
+import { MarketOpenInterest } from './market-open-interest.js'
 import { statisticsMask, statisticsVersionFor, validTakerVolumes, STATISTICS_OI, STATISTICS_TAKER } from './statistics-state.js'
 
 const OKX_ORIGIN = 'https://www.okx.com/api/v5'
@@ -19,10 +20,16 @@ const HISTORICAL_STATISTICS_REFRESH = 6 * 3_600_000
 const REQUEST_TIMEOUT = 12_000
 const RETRY_DELAYS = [1_000]
 const REQUEST_PRIORITY = { background: 0, chartWarm: 0, statistics: 1, foreground: 2, repair: 2, prepared: 2 }
-const REQUEST_LANE_INTERVALS = Object.freeze({ candles: 100, oi: 200, taker: 400, market: 80 })
-const requestLaneFor = path => path.includes('/rubik/stat/taker-volume-contract') ? 'taker'
-  : path.includes('/rubik/stat/contracts/open-interest-history') ? 'oi'
-    : path.includes('/market/candles') || path.includes('/market/history-candles') ? 'candles' : 'market'
+const REQUEST_LANE_INTERVALS = Object.freeze({ candles: 100, oi: 200, taker: 400, books: 50, instruments: 100, tickers: 100, openInterest: 100, market: 80 })
+const requestLaneFor = path => {
+  if (path.includes('/rubik/stat/taker-volume-contract')) return 'taker'
+  if (path.includes('/rubik/stat/contracts/open-interest-history')) return 'oi'
+  if (path === '/market/books') return 'books'
+  if (path === '/public/instruments') return 'instruments'
+  if (path === '/market/tickers') return 'tickers'
+  if (path === '/public/open-interest') return 'openInterest'
+  return path.includes('/market/candles') || path.includes('/market/history-candles') ? 'candles' : 'market'
+}
 const statisticsExpiryField = source => source === STATISTICS_OI ? 'statisticsOIExpiresAt' : 'statisticsTakerExpiresAt'
 const closedBoundary = (timeframe, now = Date.now()) => Math.floor(now / timeframeMilliseconds(timeframe)) * timeframeMilliseconds(timeframe)
 const emptyAudit = () => ({ phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '' })
@@ -189,6 +196,8 @@ export class MarketService {
     this.webSocketFactory = webSocketFactory
     this.requestTimeout = Number.isFinite(requestTimeout) && requestTimeout > 0 ? requestTimeout : REQUEST_TIMEOUT
     this.catalog = new Map()
+    this.catalogPublications = new Map()
+    this.catalogPublicationTask = null
     this.catalogChecks = new Map()
     this.renewalTargets = new Map()
     this.candidateTasks = new Map()
@@ -198,10 +207,15 @@ export class MarketService {
     this.candidateIDs = null
     this.tickerCache = null
     this.tickerTask = null
+    this.openInterest = new MarketOpenInterest((...args) => this.get(...args))
+    this.qualificationQueue = new Set()
+    this.qualificationImmediate = null
+    this.boundaryTimer = null
     this.renewing = null
     this.renewalTimer = null
     this.instruments = new Map()
     this.instrumentObservations = new Map()
+    this.instrumentTask = null
     this.observations = new Map()
     this.liquidityHistoryRevisions = new Map()
     this.evaluateLiquidity = createLiquidityEvaluator()
@@ -289,7 +303,9 @@ export class MarketService {
     this.updateSubscriptions()
     if (this.autoRefresh && !this.closing) {
       this.realtime.start(); this.scheduleRefresh()
-      this.track(this.renewCatalog())
+      this.scheduleBoundary()
+      this.scheduleRenewal()
+      this.track(this.refresh())
     }
     return this
   }
@@ -651,7 +667,7 @@ export class MarketService {
     const task = (async () => {
       while (lane.queue.length || lane.active.size) {
         const backgroundActive = [...lane.active.values()].some(request => requestPriority(request.priority) === 0)
-        const canStart = lane.active.size < 4 && lane.queue.some(request => requestPriority(request.priority) > 0 || !backgroundActive)
+        const canStart = lane.active.size < (name === 'books' ? 16 : 4) && lane.queue.some(request => requestPriority(request.priority) > 0 || !backgroundActive)
         if (!canStart) { await this.waitRequestLane(lane); continue }
         const delay = Math.max(lane.nextAt, lane.rateLimitedUntil) - Date.now()
         if (delay > 0) { await this.waitRequestLane(lane, delay); continue }
@@ -738,6 +754,7 @@ export class MarketService {
       this.invalidateLiquidityHistory(instrument, changed)
       this.markChartDataChanged(instrument)
       this.cacheRankingCandles(instrument, changed)
+      for (const timeframe of new Set(changed.map(row => row.timeframe))) this.scheduleQualification(instrument, timeframe)
       if (confirmed.some(row => row.timeframe === '5m')) void this.updateRanking(instrument).catch(() => undefined)
       if (projectList) this.scheduleListProjection(instrument)
       return true
@@ -890,13 +907,16 @@ export class MarketService {
       if (entry) this.publishListRow(frame, this.listRowFor(entry))
     }
     this.scheduleListProjection(instId)
+    this.scheduleQualification(instId, timeframe)
     if (timeframe === '5m') this.track(this.updateRanking(instId))
   }
 
   updateSubscriptions() {
     if (!this.realtime) return
     const subscriptions = new Map(this.chartSubscriptions.map(value => [`${value.instId}:${value.timeframe}`, value]))
-    for (const instId of this.catalog.keys()) for (const timeframe of LIST_TIMEFRAMES) subscriptions.set(`${instId}:${timeframe}`, { instId, timeframe })
+    // A temporary observation gap must not unsubscribe the final candle that
+    // closes that gap. Confirmed failures and delistings remove renewal targets.
+    for (const instId of new Set([...this.catalog.keys(), ...this.renewalTargets.keys()])) for (const timeframe of LIST_TIMEFRAMES) subscriptions.set(`${instId}:${timeframe}`, { instId, timeframe })
     const values = [...subscriptions.values()]
     this.preparedCharts.setRealtimeSubscriptions(values)
     this.realtime.setSubscriptions(values)
@@ -904,7 +924,9 @@ export class MarketService {
 
   async reconcileRealtime(subscriptions, { signal } = {}) {
     await this.ready
-    for (const { instId, timeframe } of subscriptions) {
+    // HistorySync bounds source concurrency and request lanes enforce rates.
+    // Admit every independent series before waiting for network recovery.
+    const results = await Promise.allSettled(subscriptions.map(async ({ instId, timeframe }) => {
       if (this.closing || signal?.aborted) return
       const step = timeframeMilliseconds(timeframe), through = closedBoundary(timeframe) - step
       const coverage = await this.store.coverage(instId, timeframe, 'background')
@@ -912,7 +934,9 @@ export class MarketService {
       await this.history.ensurePrices(instId, timeframe, from, through, 'foreground', signal)
       if (signal?.aborted) return
       await this.history.ensureStatistics(instId, timeframe, from, through, 'foreground', signal)
-    }
+    }))
+    const failed = results.find(result => result.status === 'rejected')
+    if (failed) throw failed.reason
   }
 
   prepareChartWindow(instId, timeframe, end) {
@@ -978,6 +1002,40 @@ export class MarketService {
 
   liquidityHistoryRevision(instId, timeframe) { return this.liquidityHistoryRevisions.get(`${instId}:${timeframe}`) ?? 0 }
 
+  scheduleQualification(instId, timeframe) {
+    if (!this.autoRefresh || this.closing || this.disposed || !this.catalogChecks.has(instId)) return
+    const config = this.prefs().liquidity
+    if (!config.volume24h.enabled && !config.volumeStability.enabled) return
+    if (timeframe && !(timeframe === '5m' && config.volume24h.enabled || timeframe === '1H' && config.volumeStability.enabled)) return
+    this.qualificationQueue.add(instId)
+    if (this.qualificationImmediate) return
+    // Coalesce durable writes, then read committed windows outside their write
+    // locks. Every contract is admitted together; none waits for another source.
+    this.qualificationImmediate = setImmediate(() => {
+      this.qualificationImmediate = null
+      const ids = [...this.qualificationQueue]; this.qualificationQueue.clear()
+      const config = this.prefs().liquidity, key = JSON.stringify(config)
+      this.track(Promise.allSettled(ids.map(id => {
+        const instrument = this.instruments.get(id)
+        return instrument && this.checkCandidate(instrument, config, key, this.shutdownController.signal, 'foreground', { localOnly: true })
+      })))
+    })
+  }
+
+  scheduleBoundary() {
+    if (this.boundaryTimer) clearTimeout(this.boundaryTimer)
+    this.boundaryTimer = null
+    if (!this.autoRefresh || this.closing || this.disposed) return
+    const config = this.prefs().liquidity
+    if (!config.volume24h.enabled && !config.volumeStability.enabled) return
+    this.boundaryTimer = setTimeout(() => {
+      this.boundaryTimer = null
+      for (const instId of this.catalogChecks.keys()) this.scheduleQualification(instId)
+      this.scheduleBoundary()
+    }, closedBoundary('5m') + FIVE_MINUTES - Date.now())
+    this.boundaryTimer.unref?.()
+  }
+
   observedCandidate(instrument, config, configKey, observations, errors = {}, now = Date.now()) {
     const fresh = key => this.observation(observations, key, now)
     const asOf = closedBoundary('5m', now)
@@ -1041,12 +1099,12 @@ export class MarketService {
     return task
   }
 
-  async checkCandidate(instrument, config, configKey, signal, priority = 'foreground') {
-    const key = `${configKey}:${JSON.stringify(instrument)}`
+  async checkCandidate(instrument, config, configKey, signal, priority = 'foreground', options = {}) {
+    const key = `${configKey}:${JSON.stringify(instrument)}:${options.localOnly ? 'local' : 'remote'}`
     if (this.candidateTasks.has(key)) return this.candidateTasks.get(key)
     this.pendingCandidates.set(key, { instId: instrument.instId, configKey })
     this.touchList()
-    const task = this.evaluateCandidate(instrument, config, configKey, signal, priority)
+    const task = this.evaluateCandidate(instrument, config, configKey, signal, priority, options)
       .finally(() => {
         if (this.candidateTasks.get(key) === task) {
           this.candidateTasks.delete(key); this.pendingCandidates.delete(key); this.touchList()
@@ -1068,17 +1126,26 @@ export class MarketService {
     finally { this.qualificationReads.delete(pending) }
   }
 
-  async evaluateCandidate(instrument, config, configKey, signal, priority) {
+  async evaluateCandidate(instrument, config, configKey, signal, priority, { localOnly = false, sources = {} } = {}) {
+    if (!this.currentCandidate(instrument, configKey, signal)) return
     const asOf = closedBoundary('5m')
-    const instId = instrument.instId, observations = { ...(this.observations.get(instId) ?? {}) }
+    const instId = instrument.instId, observations = this.observations.get(instId) ?? {}
     // Keep in-flight historical facts in the same object that durable writes
     // invalidate. A correction during a live request cannot resurrect a copy.
     if (this.currentCandidate(instrument, configKey, signal)) this.observations.set(instId, observations)
     const errors = {}
+    const ticker = this.tickerCache?.values.get(instId)
+    if (ticker?.expiresAt > Date.now()) observations.ticker = ticker
+    // Bulk spread observations can exclude a contract immediately. Never
+    // download history or books to prove conditions that cannot admit it.
+    const early = this.observedCandidate(instrument, config, configKey, { ticker: observations.ticker })
+    if (early.status === 'failed') {
+      return this.publishCandidate(instrument, config, configKey, signal, observations, errors)
+    }
     const observe = async (key, operation) => {
       try {
         const value = await operation()
-        if (signal.aborted || this.disposed) return
+        if (!this.currentCandidate(instrument, configKey, signal)) return
         const now = Date.now()
         observations[key] = { value, observedAt: now, expiresAt: now + OBSERVATION_TTL }
       } catch (error) {
@@ -1101,6 +1168,7 @@ export class MarketService {
           value = calculate(rows, from, through)
         } catch {
           signal.throwIfAborted()
+          if (localOnly) throw new Error('The completed qualification window is not yet durable.')
           revision = this.liquidityHistoryRevision(instId, timeframe)
           // Qualification needs only its recent window. Admit missing slots
           // ahead of rolling multi-day targets, without blocking the renderer.
@@ -1114,6 +1182,7 @@ export class MarketService {
           value = undefined
         }
         if (!this.currentCandidate(instrument, configKey, signal)) return
+        if (end !== closedBoundary(timeframe)) return
         value ??= calculate(rows, from, through)
         observations[key] = { value: { asOf: end, ...value }, observedAt: Date.now(), expiresAt: end + step }
       } catch (error) { errors[key] = error instanceof Error ? error.message : String(error) }
@@ -1140,23 +1209,41 @@ export class MarketService {
     // A known failing historical condition already excludes a contract; it
     // must not consume the live request budget needed by qualified contracts.
     const live = []
-    if (historicalResult.status !== 'failed') live.push(this.tickerObservations(signal, priority).then(values => {
+    if (!localOnly && historicalResult.status !== 'failed') live.push(this.tickerObservations(signal, priority).then(values => {
       const value = values.get(instId)
       if (!value) throw new Error(`Missing ticker observation for ${instId}.`)
-      observations.ticker = value
+      if (this.currentCandidate(instrument, configKey, signal)) observations.ticker = value
     }).catch(error => { errors.ticker = error instanceof Error ? error.message : String(error) }))
-    if (historicalResult.status !== 'failed' && (config.depth.enabled || config.slippage.enabled)) live.push(observe('book', async () => {
+    if (!localOnly && historicalResult.status !== 'failed' && (config.depth.enabled || config.slippage.enabled)) live.push(observe('book', async () => {
       const value = (await this.get('/market/books', { instId, sz: 400 }, signal, priority))[0]
       if (!value || !Array.isArray(value.bids) || !value.bids.length || !Array.isArray(value.asks) || !value.asks.length) throw new Error('Missing order-book observation.')
       return value
     }))
-    if (historicalResult.status !== 'failed' && config.openInterest.enabled) live.push(observe('openInterest', async () => {
-      const value = (await this.get('/public/open-interest', { instType: 'SWAP', instId }, signal, priority))[0]
-      if (number(value?.oiUsd) === null || number(value?.oiUsd) < 0) throw new Error('Missing open-interest observation.')
-      return value
-    }))
+    if (!localOnly && historicalResult.status !== 'failed' && config.openInterest.enabled) live.push((async () => {
+      try {
+        // One explicit source snapshot is shared by the whole refresh round.
+        // A candidate delayed by history renews it if its lease has elapsed.
+        if (!sources.openInterest) {
+          const task = this.openInterest.observe(signal, priority, true).catch(error => {
+            if (sources.openInterest === task) sources.openInterest = null
+            throw error
+          })
+          sources.openInterest = task
+        }
+        let values = await sources.openInterest
+        if (values.values().next().value?.expiresAt <= Date.now()) values = await this.openInterest.observe(signal, priority)
+        const observation = values.get(instId)
+        if (!observation) throw new Error(`Missing open-interest observation for ${instId}.`)
+        if (this.currentCandidate(instrument, configKey, signal)) observations.openInterest = observation
+      } catch (error) { errors.openInterest = error instanceof Error ? error.message : String(error) }
+    })())
     await Promise.all(live)
+    return this.publishCandidate(instrument, config, configKey, signal, observations, errors)
+  }
+
+  async publishCandidate(instrument, config, configKey, signal, observations, errors) {
     if (!this.currentCandidate(instrument, configKey, signal)) return
+    const instId = instrument.instId
     this.observations.set(instId, observations)
     const now = Date.now()
     const currentAsOf = closedBoundary('5m')
@@ -1167,13 +1254,26 @@ export class MarketService {
     this.catalogChecks.set(instId, record)
     if (status === 'verified') this.renewalTargets.set(instId, instrument)
     else if (status === 'failed') this.renewalTargets.delete(instId)
-    const next = new Map(this.catalog)
-    if (status === 'verified') next.set(instId, record)
-    else next.delete(instId)
-    this.catalogSource = 'live'
-    this.catalogUpdatedAt = now
-    this.replaceCatalog([...next.values()])
-    if (status === 'verified') {
+    this.catalogPublications.set(instId, { record, signal })
+    // A bulk snapshot completes many candidates in the same turn. Publish
+    // them together instead of rebuilding every row and subscription N times.
+    this.catalogPublicationTask ??= Promise.resolve().then(() => {
+      this.catalogPublicationTask = null
+      const records = [...this.catalogPublications.values()]; this.catalogPublications.clear()
+      if (this.disposed) return
+      const next = new Map(this.catalog)
+      for (const { record, signal } of records) {
+        if (this.catalogChecks.get(record.instrumentID) !== record || !this.currentCandidate(record.instrument, record.configKey, signal)) continue
+        if (this.validCatalogEntry(record)) next.set(record.instrumentID, record)
+        else next.delete(record.instrumentID)
+      }
+      this.catalogSource = 'live'
+      this.catalogUpdatedAt = Date.now()
+      this.replaceCatalog([...next.values()])
+    })
+    await this.catalogPublicationTask
+    if (this.catalogChecks.get(instId) !== record || !this.currentCandidate(instrument, configKey, signal)) return
+    if (status === 'verified' && this.validCatalogEntry(record)) {
       this.track(this.updateRanking(instId, { ensure: true, asOf: currentAsOf }))
       this.track(this.history.target(instId, { historyDays: this.prefs().historyDays, asOf: currentAsOf }))
     }
@@ -1187,7 +1287,12 @@ export class MarketService {
   }
 
   async discoverInstruments(configKey, signal, priority) {
-    const instruments = await this.get('/public/instruments', { instType: 'SWAP' }, signal, priority)
+    if (!this.instrumentTask || this.instrumentTask.signal.aborted) {
+      const task = this.get('/public/instruments', { instType: 'SWAP' }, signal, priority)
+        .finally(() => { if (this.instrumentTask?.task === task) this.instrumentTask = null })
+      this.instrumentTask = { signal, task }
+    }
+    const instruments = await abortable(this.instrumentTask.task, signal)
     if (signal.aborted || this.catalogCriteriaKey() !== configKey) return []
     if (!Array.isArray(instruments) || !instruments.length) throw new Error('OKX returned no swap instruments; market verification is unavailable.')
     // Normalize only OKX's explicit empty multiplier for supported swaps.
@@ -1230,8 +1335,9 @@ export class MarketService {
       this.verifyCatalog()
       // Global metadata/ticker renewal has its own cadence. A pending history
       // range must not hold that lease renewal or other candidate admissions.
+      const sources = {}
       const checks = [...this.renewalTargets.values()].map(
-        instrument => this.checkCandidate(instrument, config, configKey, controller.signal, 'foreground'))
+        instrument => this.checkCandidate(instrument, config, configKey, controller.signal, 'foreground', { sources }))
       collecting = true
       this.track(Promise.allSettled(checks).finally(() => this.catalogControllers.delete(controller)))
       this.error = ''
@@ -1277,7 +1383,8 @@ export class MarketService {
         // their position in the exchange's instrument response.
         candidates.sort((a, b) => Number(this.renewalTargets.has(b.instId)) - Number(this.renewalTargets.has(a.instId)))
         // A successful check publishes independently; the first row does not wait for the full exchange scan.
-        await Promise.all(candidates.map(instrument => this.checkCandidate(instrument, config, configKey, controller.signal)))
+        const sources = {}
+        await Promise.all(candidates.map(instrument => this.checkCandidate(instrument, config, configKey, controller.signal, 'foreground', { sources })))
         if (!controller.signal.aborted && this.catalogCriteriaKey() === configKey) {
           this.lastRefreshAt = startedAt
           this.error = ''
@@ -1314,6 +1421,7 @@ export class MarketService {
       for (const controller of this.catalogControllers) controller.abort()
       this.catalogChecks.clear(); this.renewalTargets.clear()
       this.verifyCatalog()
+      this.scheduleBoundary()
       this.lastRefreshAt = 0
       const configKey = JSON.stringify(current.liquidity)
       if (this.autoRefresh) this.track(Promise.allSettled([this.refreshing, this.renewing].filter(Boolean)).then(() => {
@@ -1429,6 +1537,9 @@ export class MarketService {
     this.closing = true
     if (this.refreshTimer) clearTimeout(this.refreshTimer)
     if (this.renewalTimer) clearTimeout(this.renewalTimer)
+    if (this.boundaryTimer) clearTimeout(this.boundaryTimer)
+    if (this.qualificationImmediate) clearImmediate(this.qualificationImmediate)
+    this.qualificationQueue.clear()
     this.disposeTask = (async () => {
       try { await this.ready } catch { if (this.ownsMetadata) this.metadata?.close(); return }
       // A confirmed stream event resolves only after its durable write. Drain it before aborting source work.

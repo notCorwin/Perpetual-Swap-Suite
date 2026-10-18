@@ -31,9 +31,9 @@ export class ChartController {
   private view: ChartView = { requested: null, presented: null, pending: false, error: '', oldestHour: null, latestEnd: null, historyExhausted: false, unavailable: null }
   private owner = 0
   private active = false
-  private demandTarget: ChartTarget | null = null
+  private demandTargets = new Set<string>()
   private maintenanceTarget: ChartTarget | null = null
-  private localWorking = false
+  private localTargets = new Set<string>()
   private localCheckedKey: string | null = null
   private historyTargets = new Set<string>()
   private historyChecked = new Map<string, string>()
@@ -193,14 +193,14 @@ export class ChartController {
       return
     }
     const target = this.view.requested
+    const key = seriesKey(target)
     const ready = this.store.window(target.instId, target.timeframe, target.end)
     if (!ready && target.end === null && this.localCheckedKey !== targetKey(target)) {
-      if (!this.localWorking) void this.hydrateLocal(target)
+      if (!this.localTargets.has(key) && this.localTargets.size < 2) void this.hydrateLocal(target)
       return
     }
     // Focused durable history has its own lane. A slow provider request must
     // never prevent an already saved range from entering the renderer cache.
-    const key = seriesKey(target)
     const watermark = this.historyWatermark(target)
     const historyKey = `${targetKey(target)}:${watermark}`
     if (this.transport.history) {
@@ -215,26 +215,29 @@ export class ChartController {
     }
     if (this.retryAt > Date.now()) { this.wake(this.retryAt - Date.now()); return }
     if (!ready || this.refresh) {
-      if (this.demandTarget || this.maintenanceTarget && sameSeries(this.maintenanceTarget, target)) return
-      this.demandTarget = target
+      if (this.demandTargets.has(key) || this.demandTargets.size >= 2 || this.maintenanceTarget && sameSeries(this.maintenanceTarget, target)) return
+      // One slow previous selection cannot hold the current contract behind
+      // its provider response. Further selections retain only the latest intent.
+      this.demandTargets.add(key)
       this.refresh = false
       void this.run(target, ready ? 'refresh' : 'target')
       return
     }
-    const job = this.maintenanceTarget || this.demandTarget && sameSeries(this.demandTarget, target) ? null : this.prefetchTarget(target)
+    const job = this.maintenanceTarget || this.demandTargets.has(key) ? null : this.prefetchTarget(target)
     if (job) { this.maintenanceTarget = job; void this.run(job, 'prefetch') }
     const cooldown = this.prefetchAfter - Date.now()
     if (this.timer === null) this.wake(cooldown > 0 ? Math.min(2_000, cooldown) : 2_000)
   }
 
   private async hydrateLocal(target: ChartTarget) {
-    this.localWorking = true
+    const key = seriesKey(target)
+    this.localTargets.add(key)
     try {
       const response = await this.transport.local(target.instId, target.timeframe)
       if (response) this.ingestPrepared(response)
     } catch { /* A local miss still has the independent foreground preparation lane. */ }
     finally {
-      this.localWorking = false
+      this.localTargets.delete(key)
       if (this.view.requested && targetKey(this.view.requested) === targetKey(target)) this.localCheckedKey = targetKey(target)
       void this.pump()
     }
@@ -298,7 +301,7 @@ export class ChartController {
       }
     } finally {
       if (kind === 'prefetch') this.maintenanceTarget = null
-      else this.demandTarget = null
+      else this.demandTargets.delete(seriesKey(job))
     }
     if (!this.active) return
     const changed = this.view.requested && targetKey(this.view.requested) !== targetKey(job)

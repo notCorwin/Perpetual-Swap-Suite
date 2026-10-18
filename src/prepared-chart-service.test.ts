@@ -375,6 +375,106 @@ test('the whole chart universe prepares local frames before source refresh and s
   } finally { unsubscribe(); release.resolve(); await f.close() }
 })
 
+test('a slow chart source does not block other contracts and remote preparation stays bounded', async () => {
+  const f = await fixture(), first = Date.UTC(2024, 0, 1), ids = Array.from({ length: 7 }, (_, index) => `PARALLEL${index}-USDT-SWAP`)
+  const gates = new Map(ids.map(id => [id, deferred()])), calls: string[] = []
+  let active = 0, maximum = 0
+  f.pipeline.history.latest = async (id: string) => {
+    calls.push(id)
+    active += 1
+    maximum = Math.max(maximum, active)
+    try { await gates.get(id)!.promise; return {} }
+    finally { active -= 1 }
+  }
+  try {
+    await f.store.appendCandles(ids.flatMap(id => Array.from({ length: 400 }, (_, index) => candle(first + index * hour, index, '1H', id))))
+    f.pipeline.setUniverse(ids.slice(0, 6), '1H', ids[0])
+    await waitFor(() => calls.length === 4)
+    assert.deepEqual(calls, ids.slice(0, 4), 'The focused series leads a bounded batch without waiting for its network response.')
+    gates.get(ids[1])!.resolve()
+    await waitFor(() => calls.length === 5)
+    assert.equal(calls[4], ids[4], 'A free lane admits the next contract while the first remains blocked.')
+    gates.get(ids[2])!.resolve()
+    await waitFor(() => calls.length === 6)
+    assert.equal(maximum, 4)
+    for (const id of ids.slice(3, 6)) gates.get(id)!.resolve()
+    await waitFor(() => active === 1)
+    f.pipeline.setUniverse(ids, '1H', ids[6])
+    await waitFor(() => calls.length === 7)
+    assert.equal(calls[6], ids[6], 'A new universe can reuse idle lanes without waiting for an older blocked contract.')
+    assert.equal(new Set(calls).size, ids.length, 'Concurrent lanes must not duplicate a series refresh.')
+    for (const gate of gates.values()) gate.resolve()
+    await waitFor(() => f.pipeline.remoteRunning === null)
+    assert.ok(ids.every(id => f.pipeline.cached(`${id}:1H`)), 'Every successful source refresh retains a complete prepared frame.')
+  } finally { for (const gate of gates.values()) gate.resolve(); await f.close() }
+})
+
+test('healthy chart refreshes keep their timer cadence while another source remains blocked', async context => {
+  const f = await fixture(), first = Date.UTC(2024, 0, 1), held = 'HELD-USDT-SWAP', healthy = 'HEALTHY-USDT-SWAP'
+  const release = deferred(), calls: string[] = []
+  const settle = async (check: () => boolean) => {
+    const deadline = performance.now() + 3_000
+    while (!check()) {
+      if (performance.now() >= deadline) throw new Error('Timed out waiting for the refresh cadence.')
+      await new Promise(resolve => setImmediate(resolve))
+    }
+  }
+  try {
+    await f.store.appendCandles([held, healthy].flatMap(id => Array.from({ length: 400 }, (_, index) => candle(first + index * hour, index, '1H', id))))
+    await f.pipeline.local(held, '1H')
+    await f.pipeline.local(healthy, '1H')
+    f.pipeline.history.latest = async (id: string) => { calls.push(id); if (id === held) await release.promise; return {} }
+    context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
+    const scheduling = context.mock.method(f.pipeline, 'scheduleRefresh')
+    f.pipeline.setUniverse([held, healthy], '1H', held)
+    context.mock.timers.tick(0)
+    await settle(() => calls.length === 2 && !f.pipeline.remoteActive.has(`${healthy}:1H`))
+    for (let cycle = 0; cycle < 2; cycle += 1) {
+      assert.notEqual(f.pipeline.refreshTimer, null, 'Healthy contracts keep a future timer while another source is held.')
+      const scheduled = scheduling.mock.callCount()
+      context.mock.timers.tick(59_999)
+      await new Promise(resolve => setImmediate(resolve))
+      assert.equal(calls.filter(id => id === healthy).length, cycle + 1)
+      assert.equal(scheduling.mock.callCount(), scheduled, 'A held source cannot create one-second timer polling.')
+      context.mock.timers.tick(1)
+      await settle(() => calls.filter(id => id === healthy).length === cycle + 2 && !f.pipeline.remoteActive.has(`${healthy}:1H`))
+      assert.equal(calls.filter(id => id === held).length, 1, 'An active source must never be queued for a duplicate refresh.')
+      assert.equal(f.pipeline.remoteActive.size, 1, 'The healthy series can repeatedly reuse an idle source lane.')
+    }
+    const closing = f.pipeline.dispose()
+    const scheduled = scheduling.mock.callCount()
+    context.mock.timers.tick(60_000)
+    assert.equal(calls.length, 4, 'Shutdown cannot admit another scheduled refresh.')
+    assert.equal(scheduling.mock.callCount(), scheduled, 'Shutdown clears the next refresh timer.')
+    release.resolve()
+    await closing
+  } finally {
+    release.resolve()
+    await f.pipeline.dispose()
+    context.mock.timers.reset()
+    await f.close()
+  }
+})
+
+test('disposing a parallel chart refresh joins accepted work without admitting queued contracts', async () => {
+  const f = await fixture(), first = Date.UTC(2024, 0, 1), ids = Array.from({ length: 6 }, (_, index) => `CLOSE${index}-USDT-SWAP`)
+  const release = deferred(), calls: string[] = []
+  let disposed = false
+  f.pipeline.history.latest = async (id: string) => { calls.push(id); await release.promise; return {} }
+  try {
+    await f.store.appendCandles(ids.flatMap(id => Array.from({ length: 400 }, (_, index) => candle(first + index * hour, index, '1H', id))))
+    f.pipeline.setUniverse(ids, '1H', ids[0])
+    await waitFor(() => calls.length === 4)
+    const closing = f.pipeline.dispose().then(() => { disposed = true })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(disposed, false, 'Disposal must join all already accepted source work.')
+    release.resolve()
+    await closing
+    assert.equal(calls.length, 4, 'Queued contracts must not start source requests after disposal.')
+    assert.equal(f.pipeline.remoteActive.size, 0)
+  } finally { release.resolve(); await f.close() }
+})
+
 test('durable snapshots restart without a full-series read and never restore forming candles', async () => {
   const f = await fixture(), first = Date.UTC(2024, 0, 1), source = Array.from({ length: 400 }, (_, index) => candle(first + index * hour, index))
   let restarted: any

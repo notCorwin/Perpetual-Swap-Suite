@@ -38,6 +38,48 @@ test('foreground store work cuts ahead of queued background reads', async () => 
   } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
+test('partition scans overlap bounded filesystem reads and retain chronological candle order', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-partition-scan-')), store = await MarketStore.open(root), internal: any = store
+  let releaseFirst!: () => void, releaseOthers!: () => void
+  const firstGate = new Promise<void>(resolve => { releaseFirst = resolve })
+  const otherGate = new Promise<void>(resolve => { releaseOthers = resolve })
+  const entered: string[] = []
+  let active = 0, maximum = 0
+  const waitFor = async (check: () => boolean) => {
+    for (let attempt = 0; attempt < 500; attempt += 1) { if (check()) return; await new Promise(resolve => setTimeout(resolve, 10)) }
+    throw new Error('Timed out waiting for partition reads.')
+  }
+  let reading: Promise<any[]> | undefined
+  try {
+    const first = Date.UTC(2024, 0, 1), rows = Array.from({ length: 24 }, (_, index) => ({
+      instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp: first + index * 86_400_000,
+      open: 100, high: 110, low: 95, close: 100 + index / 10, volume: 1, confirmed: true,
+    }))
+    await store.appendCandles(rows)
+    const partitionFiles = internal.partitionFiles.bind(store)
+    internal.partitionFiles = async (directory: string) => {
+      const index = entered.length
+      entered.push(directory)
+      active += 1
+      maximum = Math.max(maximum, active)
+      try { await (index === 0 ? firstGate : otherGate); return await partitionFiles(directory) }
+      finally { active -= 1 }
+    }
+    reading = store.candles({ instrument: 'BTC-USDT-SWAP', timeframe: '5m' })
+    await waitFor(() => entered.length === 8)
+    assert.equal(active, 8, 'Independent partition metadata should overlap without flooding the filesystem.')
+    releaseOthers()
+    await waitFor(() => entered.length === rows.length)
+    assert.equal(active, 1, 'A slow first partition must not stop remaining partitions from being scanned.')
+    assert.equal(maximum, 8)
+    releaseFirst()
+    assert.deepEqual((await reading).map(row => row.timestamp), rows.map(row => row.timestamp))
+    const files: string[] = await internal.parquetFiles('BTC-USDT-SWAP', '5m', rows[5].timestamp, rows[9].timestamp)
+    assert.equal(files.length, 5, 'Parallel scans retain inclusive date bounds.')
+    assert.deepEqual(files, [...files].sort(), 'Completion order cannot reorder the canonical file list.')
+  } finally { releaseFirst(); releaseOthers(); await reading?.catch(() => {}); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
 test('immutable appends retain bounded parts with newest values winning', async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-radar-parquet-'))
   const store = await MarketStore.open(root)

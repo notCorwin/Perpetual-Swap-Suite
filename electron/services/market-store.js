@@ -12,6 +12,7 @@ export const CANDLE_INTERVALS = Object.freeze({ '5m': 300_000, '15m': 900_000, '
 const dayMS = 86_400_000
 const maxPartitionParts = 8
 const maxSchemaEntries = 512
+const maxFilesystemReads = 8
 const schema = Object.freeze({
   instrument: 'VARCHAR', timeframe: 'VARCHAR', timestamp: 'BIGINT',
   open: 'DOUBLE', high: 'DOUBLE', low: 'DOUBLE', close: 'DOUBLE',
@@ -170,16 +171,22 @@ export class MarketStore {
     try { dates = await readdir(directory, { withFileTypes: true }) } catch (error) { if (isMissing(error)) return []; throw error }
     const firstDate = Number.isFinite(from) ? new Date(from).toISOString().slice(0, 10) : null
     const lastDate = Number.isFinite(through) ? new Date(through).toISOString().slice(0, 10) : null
-    const files = []
-    for (const entry of dates.sort((a, b) => a.name.localeCompare(b.name))) {
-      if (!entry.isDirectory() || !/^date=\d{4}-\d{2}-\d{2}$/.test(entry.name)
-        || firstDate && entry.name.slice(5) < firstDate || lastDate && entry.name.slice(5) > lastDate) continue
-      const day = join(directory, entry.name)
-      // An empty partition left by an interrupted first write is absence,
-      // whereas permissions and device errors must reach the caller.
-      files.push(...activePartitionParts(await this.partitionFiles(day)))
-    }
-    return files
+    const partitions = dates.filter(entry => entry.isDirectory() && /^date=\d{4}-\d{2}-\d{2}$/.test(entry.name)
+      && (!firstDate || entry.name.slice(5) >= firstDate) && (!lastDate || entry.name.slice(5) <= lastDate))
+      .sort((a, b) => a.name.localeCompare(b.name))
+    const files = new Array(partitions.length)
+    let next = 0
+    // Directory reads are independent; SQL and partition publication remain
+    // on the single DuckDB lane. Retain chronological order regardless of
+    // which filesystem read finishes first.
+    await Promise.all(Array.from({ length: Math.min(maxFilesystemReads, partitions.length) }, async () => {
+      for (let index = next++; index < partitions.length; index = next++) {
+        // An empty partition left by an interrupted first write is absence,
+        // whereas permissions and device errors must reach the caller.
+        files[index] = activePartitionParts(await this.partitionFiles(join(directory, partitions[index].name)))
+      }
+    }))
+    return files.flat()
   }
 
   schemaKey(files) {

@@ -9,6 +9,7 @@ const LOCAL_HISTORY_BARS = 16_384
 const SNAPSHOT_SCHEMA = 2
 const FORMULA_VERSION = 'native-ema200-wilder-flat50-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v2'
 const REFRESH_MS = 60_000
+const REMOTE_CONCURRENCY = 4
 const priceFields = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'baseVolume', 'quoteVolume', 'confirmed']
 const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24']
 const intervalFor = timeframe => timeframe === '5m' ? 300_000 : timeframe === '15m' ? 900_000 : 3_600_000
@@ -53,6 +54,8 @@ export class PreparedChartPipeline {
     this.remoteAttempts = new Map()
     this.localRunning = null
     this.remoteRunning = null
+    this.remoteFinish = null
+    this.remoteActive = new Set()
     this.warmTimer = null
     this.refreshTimer = null
     this.calculationQueue = []
@@ -226,7 +229,7 @@ export class PreparedChartPipeline {
   queueRemote(instId, timeframe, schedule = true) {
     if (this.closed) return
     const key = seriesKey(instId, timeframe)
-    if ((this.remoteAttempts.get(key) ?? 0) <= Date.now()) this.remoteQueue.set(key, { instId, timeframe })
+    if (!this.remoteActive.has(key) && (this.remoteAttempts.get(key) ?? 0) <= Date.now()) this.remoteQueue.set(key, { instId, timeframe })
     if (!schedule) return
     if (!this.localRunning && !this.localQueue.size) {
       // Give a universe update its complete local pass before starting HTTP.
@@ -239,26 +242,38 @@ export class PreparedChartPipeline {
     if (this.refreshTimer !== null) clearTimeout(this.refreshTimer)
     this.refreshTimer = null
     if (this.closed || !this.universe.size) return
-    const next = Math.min(...[...this.universe.keys()].map(key => this.remoteAttempts.get(key) ?? Date.now() + REFRESH_MS))
+    // Active and queued series already own their next attempt. Scheduling
+    // their expired deadlines would poll a held source every second.
+    const idle = [...this.universe.keys()].filter(key => !this.remoteActive.has(key) && !this.remoteQueue.has(key))
+    if (!idle.length) return
+    const next = Math.min(...idle.map(key => this.remoteAttempts.get(key) ?? Date.now() + REFRESH_MS))
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = null
-      for (const [key, target] of this.universe) if ((this.remoteAttempts.get(key) ?? 0) <= Date.now()) this.remoteQueue.set(key, target)
+      for (const [key, target] of this.universe) if (!this.remoteActive.has(key) && (this.remoteAttempts.get(key) ?? 0) <= Date.now()) this.remoteQueue.set(key, target)
       if (!this.localRunning && !this.localQueue.size) void this.drainRemote()
+      this.scheduleRefresh()
     }, Math.max(1_000, next - Date.now()))
     this.refreshTimer.unref?.()
   }
 
   drainRemote() {
-    if (this.remoteRunning || this.localRunning || this.localQueue.size || this.closed) return this.remoteRunning
-    const task = (async () => {
-      while (this.remoteQueue.size && !this.localQueue.size && !this.localRunning && !this.closed) {
-        const key = this.remoteQueue.has(this.focusKey) ? this.focusKey : this.remoteQueue.keys().next().value
-        const target = this.remoteQueue.get(key)
-        this.remoteQueue.delete(key)
-        this.remoteAttempts.set(key, Date.now() + REFRESH_MS)
-        const state = this.state(target.instId, target.timeframe)
-        state.active += 1
-        this.trim()
+    if (this.localRunning || this.localQueue.size || this.closed || !this.remoteQueue.size) return this.remoteRunning
+    if (!this.remoteRunning) this.remoteRunning = new Promise(resolve => { this.remoteFinish = resolve })
+    const running = this.remoteRunning
+    while (this.remoteActive.size < REMOTE_CONCURRENCY) {
+      // Source latency belongs to this series. A later universe update can
+      // fill idle lanes even while an older contract is still waiting.
+      const keys = [...this.remoteQueue.keys()].filter(key => !this.remoteActive.has(key))
+      const key = keys.includes(this.focusKey) ? this.focusKey : keys[0]
+      if (key === undefined) break
+      const target = this.remoteQueue.get(key)
+      this.remoteQueue.delete(key)
+      this.remoteActive.add(key)
+      this.remoteAttempts.set(key, Date.now() + REFRESH_MS)
+      const state = this.state(target.instId, target.timeframe)
+      state.active += 1
+      this.trim()
+      void (async () => {
         try {
           while (!this.closed) {
             const frame = await this.prepareState(state, undefined, { priority: 'chartWarm' })
@@ -266,15 +281,23 @@ export class PreparedChartPipeline {
           }
         } catch {
           this.remoteAttempts.set(key, Date.now() + 5_000)
-        } finally { state.active -= 1; this.trim() }
-      }
-    })().finally(() => {
-      if (this.remoteRunning === task) this.remoteRunning = null
-      this.scheduleRefresh()
-      if (!this.closed && this.localQueue.size) void this.drainLocal()
-    })
-    this.remoteRunning = task
-    return task
+        } finally {
+          this.remoteActive.delete(key)
+          state.active -= 1
+          this.trim()
+          if (!this.remoteActive.size) {
+            this.remoteRunning = null
+            this.remoteFinish()
+            this.remoteFinish = null
+          }
+          if (!this.closed && this.localQueue.size) void this.drainLocal()
+          else if (!this.closed && !this.localRunning && this.remoteQueue.size) void this.drainRemote()
+          this.scheduleRefresh()
+        }
+      })()
+    }
+    this.scheduleRefresh()
+    return running
   }
 
   compact(frame) {

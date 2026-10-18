@@ -588,7 +588,7 @@ test('local selection and latest intent remain independent of a held old foregro
   } finally { closeBTC(); closeETH() }
 })
 
-test('rapid cold selections hydrate only the active local call and the final queued instrument', async () => {
+test('cold selections bypass a held old local read and coalesce after two admitted series', async () => {
   const queue = transportQueue()
   const sol = 'SOL-USDT-SWAP'
   const localCalls: Array<{ instId: string; resolve: (response: PreparedChartResponse | null) => void }> = []
@@ -601,17 +601,47 @@ test('rapid cold selections hydrate only the active local call and the final que
   const closeETH = controller.open(eth, '1H')
   const closeSOL = controller.open(sol, '1H')
   try {
-    assert.deepEqual(localCalls.map(call => call.instId), [btc])
-    localCalls[0].resolve(prepared(btc, 199))
+    assert.deepEqual(localCalls.map(call => call.instId), [btc, eth])
+    localCalls[1].resolve(prepared(eth, 199))
     await settled()
-    assert.deepEqual(localCalls.map(call => call.instId), [btc, sol])
+    assert.deepEqual(localCalls.map(call => call.instId), [btc, eth, sol], 'The next local read starts while the first contract remains blocked.')
     assert.equal(controller.getSnapshot().requested?.instId, sol)
     assert.equal(controller.getSnapshot().presented, null, 'A completed obsolete local read must not paint its instrument for the current request.')
-    localCalls[1].resolve(prepared(sol, 299))
+    localCalls[2].resolve(prepared(sol, 299))
     await settled()
     assert.equal(controller.getSnapshot().presented?.instId, sol)
     assert.equal(controller.getSnapshot().presented?.bars.length, 96)
     assert.equal(controller.getSnapshot().pending, false)
     assert.ok(queue.calls.every(call => call.target.instId === sol))
+    localCalls[0].resolve(prepared(btc, 199))
+    await settled()
+    assert.equal(controller.getSnapshot().presented?.instId, sol, 'A late obsolete read cannot replace the selected chart.')
+  } finally { closeBTC(); closeETH(); closeSOL() }
+})
+
+test('cold provider selections bypass a held old demand with bounded independent series', async () => {
+  const queue = transportQueue(), sol = 'SOL-USDT-SWAP'
+  const controller = new ChartController(queue.transport)
+  const closeBTC = controller.open(btc, '1H')
+  await settled()
+  const closeETH = controller.open(eth, '1H')
+  await settled()
+  const closeSOL = controller.open(sol, '1H')
+  try {
+    await settled()
+    assert.deepEqual(queue.calls.map(call => call.target.instId), [btc, eth], 'Two independent cold contracts can prepare without awaiting the first response.')
+    queue.calls[1].resolve(prepared(eth, 299, { oldestHour: 204 * hour, historyExhausted: true }))
+    await settled()
+    assert.deepEqual(queue.calls.map(call => call.target.instId), [btc, eth, sol], 'The final queued selection uses the freed lane while BTC remains blocked.')
+    assert.equal(controller.getSnapshot().presented, null)
+    queue.calls[2].resolve(prepared(sol, 399, { oldestHour: 304 * hour, historyExhausted: true }))
+    await settled()
+    assert.equal(controller.getSnapshot().presented?.instId, sol)
+    assert.equal(controller.getSnapshot().pending, false)
+    queue.calls[0].reject(new Error('Obsolete blocked contract failed'))
+    await settled()
+    assert.equal(controller.getSnapshot().presented?.instId, sol)
+    assert.equal(controller.getSnapshot().error, '')
+    assert.equal(queue.maximumActive(), 2)
   } finally { closeBTC(); closeETH(); closeSOL() }
 })
