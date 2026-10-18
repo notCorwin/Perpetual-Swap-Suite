@@ -7,10 +7,13 @@ const VISIBLE = 96
 const WARMUP = 199
 const LOCAL_HISTORY_BARS = 16_384
 const SNAPSHOT_SCHEMA = 2
+const CHECKPOINT_SCHEMA = 1
 const FORMULA_VERSION = 'native-ema200-wilder-flat50-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v2'
 const SOURCE_RETRY_MS = 5_000
 const CONFIRMATION_GRACE_MS = 1_000
 const REMOTE_CONCURRENCY = 4
+const LOCAL_CONCURRENCY = 4
+const RESTORE_CONCURRENCY = 16
 const priceFields = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'baseVolume', 'quoteVolume', 'confirmed']
 const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24']
 const intervalFor = timeframe => timeframe === '5m' ? 300_000 : timeframe === '15m' ? 900_000 : 3_600_000
@@ -30,6 +33,8 @@ const sourcePriority = value => value === 'background' || value === 'chartWarm' 
 const sameRow = (left, right) => left && right && Object.keys(left).length === Object.keys(right).length && Object.keys(left).every(field => Object.hasOwn(right, field) && Object.is(left[field], right[field]))
 const bandwidth = bar => !bar || ![bar.bollUpper, bar.bollMiddle, bar.bollLower].every(Number.isFinite) || bar.bollMiddle <= 0
   ? null : (bar.bollUpper - bar.bollLower) / bar.bollMiddle * 100
+const nullableNumber = value => value === null || Number.isFinite(value)
+const positive = value => Number.isFinite(value) && value > 0
 
 /** Durable source pages and canonical calculations are independent of UI focus. */
 export class PreparedChartPipeline {
@@ -49,11 +54,26 @@ export class PreparedChartPipeline {
     this.sourceVersions = new Map()
     this.listeners = new Set()
     this.universe = new Map()
+    this.warmUniverse = new Map()
+    this.requestedUniverse = new Map()
+    this.requestedIDs = null
+    this.preferredTimeframe = null
     this.focusKey = null
     this.localQueue = new Map()
+    this.restoreQueue = new Map()
+    this.restoreTasks = new Map()
+    this.restoredKeys = new Set()
+    this.restoreRunning = null
+    this.restoreActive = new Set()
+    this.restoreFinish = null
+    this.canonicalQueue = []
+    this.canonicalActive = 0
+    this.canonicalTasks = new Set()
     this.remoteQueue = new Map()
     this.remoteAttempts = new Map()
     this.localRunning = null
+    this.localFinish = null
+    this.localActive = new Set()
     this.remoteRunning = null
     this.remoteFinish = null
     this.remoteActive = new Set()
@@ -95,7 +115,11 @@ export class PreparedChartPipeline {
   }
 
   setRealtimeSubscriptions(subscriptions) {
-    this.realtimeKeys = new Set(subscriptions.map(({ instId, timeframe }) => seriesKey(instId, timeframe)))
+    const keys = new Set(subscriptions.map(({ instId, timeframe }) => seriesKey(instId, timeframe)))
+    if (keys.size === this.realtimeKeys.size && [...keys].every(key => this.realtimeKeys.has(key))) return
+    this.realtimeKeys = keys
+    this.warmUniverse = new Map(subscriptions.map(target => [seriesKey(target.instId, target.timeframe), target]))
+    this.updateUniverse()
     this.trimLiveStates(true)
   }
 
@@ -159,17 +183,26 @@ export class PreparedChartPipeline {
 
   setUniverse(instIds, timeframe, focusInstId) {
     if (!['5m', '15m', '1H'].includes(timeframe) || !Array.isArray(instIds) || instIds.some(instId => typeof instId !== 'string' || !instId)) throw new Error('Invalid chart universe.')
-    this.universe = new Map([...new Set(instIds)].map(instId => [seriesKey(instId, timeframe), { instId, timeframe }]))
+    this.requestedUniverse = new Map([...new Set(instIds)].map(instId => [seriesKey(instId, timeframe), { instId, timeframe }]))
+    this.requestedIDs = new Set([...instIds, ...(focusInstId ? [focusInstId] : [])])
+    this.preferredTimeframe = timeframe
     this.focusKey = focusInstId ? seriesKey(focusInstId, timeframe) : null
+    this.updateUniverse()
+    const frames = [...this.snapshots.keys()].map(key => this.cached(key)).filter(frame => frame && this.requestedIDs.has(frame.instId))
+      .sort((left, right) => Number(right.timeframe === timeframe) - Number(left.timeframe === timeframe))
+    return { frames }
+  }
+
+  updateUniverse() {
+    this.universe = new Map([...this.warmUniverse, ...this.requestedUniverse])
     for (const [key] of this.localQueue) if (!this.universe.has(key)) this.localQueue.delete(key)
+    for (const [key] of this.restoreQueue) if (!this.universe.has(key)) this.restoreQueue.delete(key)
     for (const [key] of this.remoteQueue) if (!this.universe.has(key)) this.remoteQueue.delete(key)
     for (const [key] of this.remoteAttempts) if (!this.universe.has(key)) this.remoteAttempts.delete(key)
-    const frames = []
     for (const [key, target] of this.universe) {
       const frame = this.cached(key)
-      if (frame) frames.push(frame)
-      else this.queueLocal(target.instId, timeframe)
-      if (this.sourceDeadline(target) <= Date.now()) this.queueRemote(target.instId, timeframe, false)
+      if (!frame || !this.liveStates.get(key)?.indicatorState) this.queueLocal(target.instId, target.timeframe, Boolean(frame))
+      if (this.sourceDeadline(target) <= Date.now()) this.queueRemote(target.instId, target.timeframe, false)
     }
     if (!this.localQueue.size && this.remoteQueue.size) {
       const first = this.universe.get(this.focusKey) ?? this.universe.values().next().value
@@ -177,17 +210,16 @@ export class PreparedChartPipeline {
     }
     this.scheduleRefresh()
     this.trimSnapshots()
-    const remaining = frames.splice(16)
-    const publishBatch = () => {
-      if (this.closed) return
-      for (const frame of remaining.splice(0, 16)) if (this.universe.has(seriesKey(frame.instId, frame.timeframe))) this.emit(frame)
-      if (remaining.length) setImmediate(publishBatch)
-    }
-    if (remaining.length) setImmediate(publishBatch)
-    return { frames }
+  }
+
+  nextKey(queue, eligible = () => true) {
+    const keys = [...queue.keys()].filter(eligible)
+    return keys.includes(this.focusKey) ? this.focusKey
+      : keys.find(key => queue.get(key).timeframe === this.preferredTimeframe) ?? keys[0]
   }
 
   emit(frame) {
+    if (this.requestedIDs && !this.requestedIDs.has(frame.instId)) return
     for (const listener of this.listeners) { try { listener(frame) } catch { /* Disconnected renderers do not stop preparation. */ } }
   }
 
@@ -203,28 +235,92 @@ export class PreparedChartPipeline {
     if (this.closed) return
     const key = seriesKey(instId, timeframe), previous = this.localQueue.get(key)
     this.localQueue.set(key, { instId, timeframe, force: force || previous?.force || false })
+    if (!this.restoredKeys.has(key) && !this.snapshots.has(key) && !this.restoreTasks.has(key)) this.restoreQueue.set(key, { instId, timeframe })
     if (this.warmTimer === null) {
-      this.warmTimer = setTimeout(() => { this.warmTimer = null; void this.drainLocal() }, 0)
+      this.warmTimer = setTimeout(() => { this.warmTimer = null; void this.drainRestores(); void this.drainLocal() }, 0)
       this.warmTimer.unref?.()
     }
   }
 
+  restoreOnce(instId, timeframe, priority) {
+    const key = seriesKey(instId, timeframe)
+    if (this.restoreTasks.has(key)) return this.restoreTasks.get(key)
+    const task = this.restoreSnapshot(instId, timeframe, priority).finally(() => {
+      this.restoredKeys.add(key)
+      if (this.restoreTasks.get(key) === task) this.restoreTasks.delete(key)
+    })
+    this.restoreTasks.set(key, task)
+    return task
+  }
+
+  drainRestores() {
+    if (this.closed || this.nextKey(this.restoreQueue, key => !this.restoreActive.has(key)) === undefined) return this.restoreRunning
+    if (!this.restoreRunning) this.restoreRunning = new Promise(resolve => { this.restoreFinish = resolve })
+    const running = this.restoreRunning
+    while (this.restoreActive.size < RESTORE_CONCURRENCY) {
+      const key = this.nextKey(this.restoreQueue, key => !this.restoreActive.has(key))
+      if (key === undefined) break
+      const target = this.restoreQueue.get(key)
+      this.restoreQueue.delete(key)
+      this.restoreActive.add(key)
+      void (async () => {
+        try { await this.restoreOnce(target.instId, target.timeframe, key === this.focusKey ? 'foreground' : 'background') }
+        catch { /* Rebuild a missing or invalid derived checkpoint from durable source rows. */ }
+        finally {
+          this.restoreActive.delete(key)
+          if (!this.restoreActive.size) { this.restoreRunning = null; this.restoreFinish(); this.restoreFinish = null }
+          if (!this.closed) { void this.drainRestores(); void this.drainLocal(); void this.drainRemote() }
+        }
+      })()
+    }
+    return running
+  }
+
+  localEligible(key) { return !this.localActive.has(key) && (this.restoredKeys.has(key) || this.snapshots.has(key)) }
+
+  canonical(instId, timeframe, priority, operation) {
+    if (this.closed) return Promise.reject(new Error('Prepared chart data service is closed.'))
+    const task = new Promise((resolve, reject) => {
+      this.canonicalQueue.push({ key: seriesKey(instId, timeframe), timeframe, priority, operation, resolve, reject })
+      this.drainCanonical()
+    })
+    this.canonicalTasks.add(task)
+    task.then(() => this.canonicalTasks.delete(task), () => this.canonicalTasks.delete(task))
+    return task
+  }
+
+  drainCanonical() {
+    while (!this.closed && this.canonicalActive < LOCAL_CONCURRENCY && this.canonicalQueue.length) {
+      let index = this.canonicalQueue.findIndex(job => job.key === this.focusKey)
+      if (index < 0) index = this.canonicalQueue.findIndex(job => job.priority === 'foreground')
+      if (index < 0) index = this.canonicalQueue.findIndex(job => job.timeframe === this.preferredTimeframe)
+      const [job] = this.canonicalQueue.splice(Math.max(0, index), 1)
+      this.canonicalActive += 1
+      void Promise.resolve().then(job.operation).then(job.resolve, job.reject).finally(() => { this.canonicalActive -= 1; this.drainCanonical() })
+    }
+  }
+
   drainLocal() {
-    if (this.localRunning || this.closed) return this.localRunning
-    const task = (async () => {
-      while (this.localQueue.size && !this.closed) {
-        const key = this.localQueue.has(this.focusKey) ? this.focusKey : this.localQueue.keys().next().value
-        const target = this.localQueue.get(key)
-        this.localQueue.delete(key)
+    if (this.closed || this.nextKey(this.localQueue, key => this.localEligible(key)) === undefined) return this.localRunning
+    if (!this.localRunning) this.localRunning = new Promise(resolve => { this.localFinish = resolve })
+    const running = this.localRunning
+    while (this.localActive.size < LOCAL_CONCURRENCY) {
+      const key = this.nextKey(this.localQueue, key => this.localEligible(key))
+      if (key === undefined) break
+      const target = this.localQueue.get(key)
+      this.localQueue.delete(key)
+      this.localActive.add(key)
+      void (async () => {
         try { await this.local(target.instId, target.timeframe, { force: target.force, priority: key === this.focusKey ? 'foreground' : 'background' }) }
         catch { /* A local read failure leaves this candidate for independent source preparation. */ }
-      }
-    })().finally(() => {
-      if (this.localRunning === task) this.localRunning = null
-      if (!this.closed) { if (this.localQueue.size) void this.drainLocal(); else void this.drainRemote() }
-    })
-    this.localRunning = task
-    return task
+        finally {
+          this.localActive.delete(key)
+          if (!this.localActive.size) { this.localRunning = null; this.localFinish(); this.localFinish = null }
+          if (!this.closed) { void this.drainLocal(); void this.drainRemote() }
+        }
+      })()
+    }
+    return running
   }
 
   queueRemote(instId, timeframe, schedule = true) {
@@ -232,10 +328,8 @@ export class PreparedChartPipeline {
     const key = seriesKey(instId, timeframe)
     if (!this.remoteActive.has(key) && (this.remoteAttempts.get(key) ?? 0) <= Date.now()) this.remoteQueue.set(key, { instId, timeframe })
     if (!schedule) return
-    if (!this.localRunning && !this.localQueue.size) {
-      // Give a universe update its complete local pass before starting HTTP.
-      if (this.warmTimer === null) this.queueLocal(instId, timeframe)
-    }
+    if (!this.localTasks.has(key) && !this.localActive.has(key) && !this.localQueue.has(key) && !this.snapshots.has(key)) this.queueLocal(instId, timeframe)
+    void this.drainRemote()
     this.scheduleRefresh()
   }
 
@@ -260,7 +354,7 @@ export class PreparedChartPipeline {
   sourceStateChanged() {
     if (this.closed) return
     for (const target of this.universe.values()) if (this.sourceDeadline(target) <= Date.now()) this.queueRemote(target.instId, target.timeframe, false)
-    if (!this.localRunning && !this.localQueue.size) void this.drainRemote()
+    void this.drainRemote()
     this.scheduleRefresh()
   }
 
@@ -276,21 +370,20 @@ export class PreparedChartPipeline {
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = null
       for (const [key, target] of this.universe) if (!this.remoteActive.has(key) && this.sourceDeadline(target) <= Date.now()) this.remoteQueue.set(key, target)
-      if (!this.localRunning && !this.localQueue.size) void this.drainRemote()
+      void this.drainRemote()
       this.scheduleRefresh()
     }, Math.max(1, Math.min(2_147_483_647, next - Date.now())))
     this.refreshTimer.unref?.()
   }
 
   drainRemote() {
-    if (this.localRunning || this.localQueue.size || this.closed || !this.remoteQueue.size) return this.remoteRunning
+    if (this.closed || !this.remoteQueue.size) return this.remoteRunning
     if (!this.remoteRunning) this.remoteRunning = new Promise(resolve => { this.remoteFinish = resolve })
     const running = this.remoteRunning
     while (this.remoteActive.size < REMOTE_CONCURRENCY) {
       // Source latency belongs to this series. A later universe update can
       // fill idle lanes even while an older contract is still waiting.
-      const keys = [...this.remoteQueue.keys()].filter(key => !this.remoteActive.has(key))
-      const key = keys.includes(this.focusKey) ? this.focusKey : keys[0]
+      const key = this.nextKey(this.remoteQueue, key => !this.remoteActive.has(key) && !this.localActive.has(key) && !this.localQueue.has(key) && !this.localTasks.has(key))
       if (key === undefined) break
       const target = this.remoteQueue.get(key)
       this.remoteQueue.delete(key)
@@ -324,7 +417,7 @@ export class PreparedChartPipeline {
             this.remoteFinish = null
           }
           if (!this.closed && this.localQueue.size) void this.drainLocal()
-          else if (!this.closed && !this.localRunning && this.remoteQueue.size) void this.drainRemote()
+          if (!this.closed && this.remoteQueue.size) void this.drainRemote()
           this.scheduleRefresh()
         }
       })()
@@ -350,10 +443,59 @@ export class PreparedChartPipeline {
     return frame
   }
 
+  checkpoint(state) {
+    if (!state.indicatorState) return null
+    const hours = [...state.rows.keys()].sort((left, right) => left - right).slice(-(VISIBLE + WARMUP))
+    if (hours.at(-1) !== state.indicatorState.lastTimestamp) return null
+    const retained = this.liveStates.get(state.key)
+    return structuredClone({ version: CHECKPOINT_SCHEMA,
+      rows: hours.map(hour => state.rows.get(hour)),
+      indicators: hours.map(hour => state.indicators.get(hour)),
+      indicatorState: state.indicatorState, floor: state.floor,
+      bollExpansion: retained?.indicatorState?.lastTimestamp === state.indicatorState.lastTimestamp ? retained.bollExpansion : state.bollExpansion,
+    })
+  }
+
+  restoreCheckpoint(checkpoint, instId, timeframe, frame) {
+    const state = checkpoint?.indicatorState, rows = checkpoint?.rows, indicators = checkpoint?.indicators, step = intervalFor(timeframe)
+    if (checkpoint?.version !== CHECKPOINT_SCHEMA || !state || state.intervalMS !== step || !Number.isSafeInteger(state.lastTimestamp) || state.lastTimestamp % step || !Number.isSafeInteger(state.count) || state.count < 1
+      || !positive(state.previousClose) || !Number.isFinite(state.emaSeedSum) || !nullableNumber(state.ema) || !nullableNumber(state.previousROC) || !nullableNumber(state.previousMAROC)
+      || !Array.isArray(state.closes) || state.closes.length !== Math.min(state.count, 20) || !state.closes.every(positive) || state.closes.at(-1) !== state.previousClose
+      || !Array.isArray(state.volumes) || state.volumes.length !== Math.min(state.count, 14) || !state.volumes.every(value => value && positive(value.typicalPrice) && (value.volume === null || Number.isFinite(value.volume) && value.volume >= 0))
+      || !Array.isArray(state.rocs) || state.rocs.length !== Math.min(state.count, 9) || !state.rocs.every(nullableNumber)
+      || !Array.isArray(state.rsi) || state.rsi.length !== 3 || !state.rsi.every((value, index) => value && value.period === [6, 12, 24][index] && Number.isFinite(value.gains) && value.gains >= 0 && Number.isFinite(value.losses) && value.losses >= 0)
+      || !Array.isArray(rows) || rows.length < VISIBLE || rows.length > VISIBLE + WARMUP || !Array.isArray(indicators) || indicators.length !== rows.length
+      || checkpoint.floor !== null && (!Number.isSafeInteger(checkpoint.floor) || checkpoint.floor < 0 || checkpoint.floor % step)) return null
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index], bar = indicators[index]
+      if (!row || row.instrument !== instId || row.timeframe !== timeframe || row.confirmed !== true || !Number.isSafeInteger(row.timestamp) || row.timestamp % step
+        || index > 0 && row.timestamp <= rows[index - 1].timestamp || !['open', 'high', 'low', 'close'].every(field => positive(row[field]))
+        || !bar || bar.hour !== row.timestamp || bar.confirmed !== true || !indicatorFields.every(field => nullableNumber(bar[field])) || bar.close !== row.close) return null
+    }
+    if (rows.at(-1).timestamp !== state.lastTimestamp || rows.at(-1).close !== state.previousClose || indicators.at(-1).ema !== state.ema
+      || rows[0].timestamp > frame.bars[0].hour || state.lastTimestamp < frame.endHour) return null
+    let contiguous = 1
+    for (let index = rows.length - 1; index > 0 && rows[index].timestamp - rows[index - 1].timestamp === step; index -= 1) contiguous += 1
+    if (state.count < contiguous || state.volumes.at(-1).volume !== (rows.at(-1).baseVolume ?? null)) return null
+    const raw = new Map(rows.map(row => [row.timestamp, row])), calculated = new Map(indicators.map(bar => [bar.hour, bar]))
+    if (frame.bars.some(bar => !raw.has(bar.hour) || !calculated.has(bar.hour)
+      || ['open', 'high', 'low', 'close', ...indicatorFields].some(field => !Object.is(bar[field], (indicatorFields.includes(field) ? calculated : raw).get(bar.hour)[field])))) return null
+    const live = this.liveState(instId, timeframe)
+    live.rows = new Map(rows.map(row => [row.timestamp, this.normalize(row)]))
+    live.indicators = new Map(indicators.map(bar => [bar.hour, bar]))
+    live.indicatorState = structuredClone(state)
+    live.latestHour = state.lastTimestamp
+    live.floor = checkpoint.floor
+    live.generation = frame.generation
+    live.bollExpansion = checkpoint.bollExpansion ?? null
+    this.projectLive(live)
+    return live
+  }
+
   async saveCompact(state, frame, version = this.frameVersions.get(frame), { persist = true } = {}) {
-    if (!version || state.sourceVersion !== version.sourceVersion || state.liveVersion !== version.liveVersion || frame.generation !== state.generation) return null
+    if (!version || state.sourceVersion !== version.sourceVersion || frame.generation !== state.generation) return null
     const watermark = await this.store.candleWatermark(state.instId, state.timeframe, 'background')
-    if (this.closed || state.sourceVersion !== version.sourceVersion || state.liveVersion !== version.liveVersion || frame.generation !== state.generation) return null
+    if (this.closed || state.sourceVersion !== version.sourceVersion || frame.generation !== state.generation) return null
     const existing = this.snapshots.get(state.key)
     if (existing?.valid && (existing.frame.generation > frame.generation || existing.frame.generation === frame.generation && existing.frame.revision > frame.revision)) return existing.frame
     // A lease may expire before its replacement observation is published.
@@ -366,17 +508,21 @@ export class PreparedChartPipeline {
       return [1, 2].filter(source => sourceMissing(row, source)).map(source => Number(row[expiryField(source)]) || 0)
     })
     const validUntil = leases.length ? Math.min(...leases) : null
-    const snapshot = { schemaVersion: SNAPSHOT_SCHEMA, formulaVersion: FORMULA_VERSION, watermark, validUntil, frame }
+    const snapshot = { schemaVersion: SNAPSHOT_SCHEMA, formulaVersion: FORMULA_VERSION, watermark, validUntil, frame, checkpoint: frame.unavailable ? null : this.checkpoint(state) }
     // Live candles are an in-memory overlay, never a durable observation.
     const { liveBar: _liveBar, ...confirmedFrame } = frame
     if (persist) await this.store.writeChartSnapshot(state.instId, state.timeframe, { ...snapshot, frame: confirmedFrame })
-    if (this.closed || state.sourceVersion !== version.sourceVersion || state.liveVersion !== version.liveVersion || frame.generation !== state.generation) return null
-    const changed = !existing?.valid || JSON.stringify(existing.frame) !== JSON.stringify(frame)
-    this.snapshots.set(state.key, { ...snapshot, valid: true })
+    if (this.closed || state.sourceVersion !== version.sourceVersion || frame.generation !== state.generation) return null
+    const live = this.liveStates.get(state.key) ?? state
+    const liveBar = live.live?.timestamp === frame.endHour + live.intervalMS ? live.indicators.get(live.live.timestamp) : undefined
+    const published = frame.liveBar === liveBar ? frame : { ...frame, liveBar }
+    const changed = !existing?.valid || JSON.stringify(existing.frame) !== JSON.stringify(published)
+    const { checkpoint: _checkpoint, ...resident } = snapshot
+    this.snapshots.set(state.key, { ...resident, frame: published, valid: true })
     this.trimSnapshots()
     this.scheduleRefresh()
-    if (changed) this.emit(frame)
-    return frame
+    if (changed) this.emit(published)
+    return published
   }
 
   async restoreSnapshot(instId, timeframe, priority) {
@@ -394,10 +540,17 @@ export class PreparedChartPipeline {
     if (snapshot.watermark !== watermark || version !== (this.sourceVersions.get(key) ?? 0) || this.closed) return null
     const state = this.series.get(key)
     const restored = { ...frame, generation: state?.generation ?? ++this.nextGeneration, revision: this.revision(instId) }
-    this.snapshots.set(key, { ...snapshot, frame: restored, valid: true })
+    if (!frame.unavailable) {
+      const live = this.restoreCheckpoint(snapshot.checkpoint, instId, timeframe, restored)
+      if (live && live.live?.timestamp === restored.endHour + live.intervalMS) restored.liveBar = live.indicators.get(live.live.timestamp)
+    }
+    const { checkpoint: _checkpoint, ...resident } = snapshot
+    this.snapshots.set(key, { ...resident, frame: restored, valid: true })
     this.emit(restored)
     this.trimSnapshots()
+    this.trimLiveStates()
     this.scheduleRefresh()
+    if (!frame.unavailable && !this.liveStates.get(key)?.indicatorState && this.universe.has(key)) this.queueLocal(instId, timeframe, true)
     return restored
   }
 
@@ -434,30 +587,32 @@ export class PreparedChartPipeline {
         }
         if (cached) return cached
       }
-      if (!this.snapshots.has(key)) {
-        const saved = await this.restoreSnapshot(instId, timeframe, priority)
+      if (!this.snapshots.has(key) && !this.restoredKeys.has(key)) {
+        const saved = await this.restoreOnce(instId, timeframe, priority)
         if (saved && !force) return saved
       }
-      const state = this.state(instId, timeframe)
-      state.active += 1
-      this.trim()
-      try {
-        await this.load(state, priority)
-        this.listingFloor(state)
-        while (!this.closed) {
-          const version = state.sourceVersion
-          let frame = this.insufficientHistory(state)
-          if (!frame) {
-            await this.indicators(state, priority)
-            if (version !== state.sourceVersion) continue
-            frame = this.compactFrame(state)
-            if (!frame) return this.cached(key)
+      return this.canonical(instId, timeframe, priority, async () => {
+        const state = this.state(instId, timeframe)
+        state.active += 1
+        this.trim()
+        try {
+          await this.load(state, priority)
+          this.listingFloor(state)
+          while (!this.closed) {
+            const version = state.sourceVersion
+            let frame = this.insufficientHistory(state)
+            if (!frame) {
+              await this.indicators(state, priority)
+              if (version !== state.sourceVersion) continue
+              frame = this.compactFrame(state)
+              if (!frame) return this.cached(key)
+            }
+            const saved = await this.saveCompact(state, this.produced(state, frame, version), undefined, { persist })
+            if (saved) return saved
           }
-          const saved = await this.saveCompact(state, this.produced(state, frame, version), undefined, { persist })
-          if (saved) return saved
-        }
-        return null
-      } finally { state.active -= 1; this.trim() }
+          return null
+        } finally { state.active -= 1; this.trim() }
+      })
     })().finally(() => { if (this.localTasks.get(key) === task) this.localTasks.delete(key) })
     this.localTasks.set(key, task)
     return task
@@ -680,6 +835,10 @@ export class PreparedChartPipeline {
     if (!this.updateLive(live, candle)) return this.cached(live.key)
     if (state) this.updateLive(state, candle)
     if (!live.indicatorState) {
+      if (this.universe.has(live.key)) {
+        this.queueLocal(instId, timeframe, Boolean(this.cached(live.key)))
+        return this.cached(live.key)
+      }
       let seed = this.liveSeeds.get(live.key)
       if (!seed) {
         const canonical = this.state(instId, timeframe)
@@ -834,18 +993,20 @@ export class PreparedChartPipeline {
   // Every consumer projects the same full-history calculation. A list window
   // only truncates the result; it can never choose a different recursive seed.
   async projectSeries(instId, timeframe) {
-    const state = this.state(instId, timeframe)
-    state.active += 1
-    try {
-      await this.load(state, 'background')
-      while (!this.closed) {
-        const version = state.sourceVersion
-        await this.indicators(state, 'background')
-        if (version !== state.sourceVersion) continue
-        return this.projectRows(state)
-      }
-      throw new Error('Prepared chart data service is closed.')
-    } finally { state.active -= 1; this.trim() }
+    return this.canonical(instId, timeframe, 'background', async () => {
+      const state = this.state(instId, timeframe)
+      state.active += 1
+      try {
+        await this.load(state, 'background')
+        while (!this.closed) {
+          const version = state.sourceVersion
+          await this.indicators(state, 'background')
+          if (version !== state.sourceVersion) continue
+          return this.projectRows(state)
+        }
+        throw new Error('Prepared chart data service is closed.')
+      } finally { state.active -= 1; this.trim() }
+    })
   }
 
   projectRows(state) {
@@ -861,6 +1022,12 @@ export class PreparedChartPipeline {
   /** List metrics need a fixed tail; expansion carries its full-history run. */
   async projectListSeries(instId, timeframe) {
     let live = this.liveStates.get(seriesKey(instId, timeframe))
+    const key = seriesKey(instId, timeframe)
+    if (!live?.indicatorState && !this.restoredKeys.has(key) && typeof this.store.readChartSnapshot === 'function') {
+      try { await this.restoreOnce(instId, timeframe, 'background') }
+      catch { /* Canonical source history can rebuild an invalid derived checkpoint. */ }
+      live = this.liveStates.get(key)
+    }
     if (!live?.indicatorState) {
       const projected = await this.projectSeries(instId, timeframe)
       live = this.liveStates.get(seriesKey(instId, timeframe))
@@ -1010,6 +1177,9 @@ export class PreparedChartPipeline {
     this.warmTimer = null
     this.refreshTimer = null
     this.localQueue.clear()
+    this.restoreQueue.clear()
+    for (const job of this.canonicalQueue) job.reject(new Error('Prepared chart data service is closed.'))
+    this.canonicalQueue = []
     this.remoteQueue.clear()
     this.listeners.clear()
     for (const pending of this.calculations.values()) pending.reject(new Error('Prepared chart data service is closed.'))
@@ -1019,7 +1189,7 @@ export class PreparedChartPipeline {
     const worker = this.worker
     this.worker = null
     if (worker) await worker.terminate()
-    await Promise.allSettled([this.localRunning, this.remoteRunning, ...this.localTasks.values(), ...this.tasks.values(), ...this.liveSeeds.values()].filter(Boolean))
+    await Promise.allSettled([this.restoreRunning, this.localRunning, this.remoteRunning, ...this.canonicalTasks, ...this.restoreTasks.values(), ...this.localTasks.values(), ...this.tasks.values(), ...this.liveSeeds.values()].filter(Boolean))
     this.liveStates.clear()
   }
 }

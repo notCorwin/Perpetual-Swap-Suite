@@ -444,7 +444,7 @@ test('active canonical series cannot be evicted while awaiting a source task', a
   } finally { release.resolve(); await f.close() }
 })
 
-test('the whole chart universe prepares local frames before source refresh and survives canonical eviction', async () => {
+test('each chart prepares its local frame before its source refresh and survives canonical eviction', async () => {
   const f = await fixture(), first = Date.UTC(2024, 0, 1), ids = Array.from({ length: 12 }, (_, index) => `LOCAL${index}-USDT-SWAP`)
   const frames = new Map<string, any>(), release = deferred(); let readyAtRequest = -1
   f.pipeline.history.latest = async () => { readyAtRequest = frames.size; await release.promise; return {} }
@@ -453,7 +453,7 @@ test('the whole chart universe prepares local frames before source refresh and s
     await f.store.appendCandles(ids.flatMap(id => Array.from({ length: 400 }, (_, index) => candle(first + index * hour, index, '1H', id))))
     assert.deepEqual(f.pipeline.setUniverse(ids, '1H', ids.at(-1)), { frames: [] })
     await waitFor(() => frames.size === ids.length && readyAtRequest >= 0)
-    assert.equal(readyAtRequest, ids.length)
+    assert.ok(readyAtRequest > 0 && readyAtRequest < ids.length, 'A ready contract starts its own gap repair while other local histories still prepare.')
     const cold = ids.find(id => !f.pipeline.series.has(`${id}:1H`))!, calculations = f.pipeline.nextCalculation
     assert.equal(await f.pipeline.local(cold, '1H'), frames.get(cold))
     assert.equal(f.pipeline.nextCalculation, calculations)
@@ -715,6 +715,11 @@ test('durable snapshots restart without a full-series read and never restore for
     const restored = await restarted.local(instId, '1H')
     assert.deepEqual(restored.bars, JSON.parse(JSON.stringify(original.bars)))
     assert.equal(restored.liveBar, undefined); assert.equal(restarted.nextCalculation, 0); assert.equal(restarted.series.size, 0)
+    const resumed = await restarted.setLive(instId, '1H', live)
+    assert.equal(resumed.liveBar.ema, barsWithIndicators([...source, live], hour).at(-1)?.ema)
+    assert.equal(restarted.nextCalculation, 0, 'A verified recursive checkpoint resumes native ticks without replaying history.')
+    assert.equal(snapshotWrites, 0)
+    assert.equal('checkpoint' in restarted.snapshots.get(`${instId}:1H`), false, 'Only the working tail owns the in-memory seed.')
   } finally { await restarted?.dispose(); await f.close() }
 })
 
@@ -944,7 +949,7 @@ test('36 realtime series retain bounded seeds beyond the history LRU and never r
   const frames = ['5m', '15m', '1H'], ids = Array.from({ length: 12 }, (_, index) => `LIVE${index}-USDT-SWAP`)
   const subscriptions = ids.flatMap(instId => frames.map(timeframe => ({ instId, timeframe })))
   const sources = new Map<string, any[]>(), reads = new Map<string, number>()
-  let allowConfirmedSnapshot = false
+  let allowConfirmedSnapshot = true
   const store = {
     async candles({ instrument, timeframe }: any) { const key = `${instrument}:${timeframe}`; reads.set(key, (reads.get(key) ?? 0) + 1); return sources.get(key)! },
     async candleWatermark() { return 'memory-watermark' },
@@ -952,7 +957,6 @@ test('36 realtime series retain bounded seeds beyond the history LRU and never r
     async writeChartSnapshot() { if (!allowConfirmedSnapshot) throw new Error('A forming tick must not persist a snapshot.') },
   }
   const pipeline = createPipeline(store), liveCandles = new Map<string, any>()
-  pipeline.setRealtimeSubscriptions(subscriptions)
   try {
     for (const { instId: id, timeframe } of subscriptions) {
       const interval = timeframe === '5m' ? step : timeframe === '15m' ? 900_000 : hour
@@ -961,8 +965,9 @@ test('36 realtime series retain bounded seeds beyond the history LRU and never r
       sources.set(key, source)
       const live = { ...candle(end + interval, 400, timeframe, id), confirmed: false }
       liveCandles.set(key, live)
-      await pipeline.setLive(id, timeframe, live)
     }
+    pipeline.setRealtimeSubscriptions(subscriptions)
+    await waitFor(() => subscriptions.every(({ instId, timeframe }) => pipeline.cached(`${instId}:${timeframe}`)))
     const calculations = pipeline.nextCalculation
     assert.equal(calculations, 36)
     assert.equal(pipeline.liveStates.size, 36)
@@ -997,7 +1002,9 @@ test('36 realtime series retain bounded seeds beyond the history LRU and never r
     source[250] = corrected
     pipeline.observe([corrected], new Map([[previous.timestamp, previous]]))
     const revisedLive = { ...live, close: live.close + .25, high: live.high + .25, volume: live.volume + 1 }
-    const correctedFrame = await pipeline.setLive(target.instId, target.timeframe, revisedLive)
+    await pipeline.setLive(target.instId, target.timeframe, revisedLive)
+    await waitFor(() => pipeline.cached(key)?.liveBar?.ema === barsWithIndicators([...source, revisedLive], step).at(-1)?.ema)
+    const correctedFrame = pipeline.cached(key)
     assert.equal(correctedFrame.liveBar.ema, barsWithIndicators([...source, revisedLive], step).at(-1)?.ema)
     assert.equal(reads.get(key), 2, 'One correction reloads only its affected full history.')
     assert.equal(pipeline.nextCalculation, calculations + 1)
@@ -1050,15 +1057,17 @@ test('bounded list projections preserve full-history expansion runs and all brea
       const expected = summarizeMarketBars(full), actual = summarizeMarketBars(projection.bars)
       for (const field of ['highBreakout', 'lowBreakdown', 'highBreakout96', 'lowBreakdown96']) assert.deepEqual(actual[field], expected[field])
     }
+    await waitFor(() => pipeline.localRunning === null && pipeline.restoreRunning === null)
     const calculations = pipeline.nextCalculation
-    assert.equal(reads, 12); assert.ok(pipeline.series.size <= 8)
+    const warmedReads = reads
+    assert.ok(warmedReads >= 12); assert.ok(pipeline.series.size <= 8)
     for (const id of ids) assert.deepEqual((await pipeline.projectListSeries(id, '1H')).bollExpansion, expectedExpansion)
-    assert.equal(reads, 12); assert.equal(pipeline.nextCalculation, calculations)
+    assert.equal(reads, warmedReads); assert.equal(pipeline.nextCalculation, calculations)
     const next = { ...source.at(-1)!, timestamp: source.at(-1)!.timestamp + hour, close: 100 * Math.exp(1_000 * 1_000 / 1_000_000), instrument: ids[0] }
     pipeline.observe([next], new Map())
     const projection = await pipeline.projectListSeries(ids[0], '1H')
     assert.deepEqual(projection.bollExpansion, bandwidthExpansion(barsWithIndicators([...source, next], hour)))
-    assert.equal(reads, 12); assert.equal(pipeline.nextCalculation, calculations)
+    assert.equal(reads, warmedReads); assert.equal(pipeline.nextCalculation, calculations)
   } finally { await pipeline.dispose() }
 })
 
@@ -1102,4 +1111,137 @@ for (const mutation of ['append', 'price', 'statistics']) test(`a ${mutation} mu
     assert.equal(reads, 1)
     assert.equal(pipeline.nextCalculation, mutation === 'statistics' ? 1 : 2)
   } finally { release.resolve(); await pipeline.dispose() }
+})
+
+test('native subscription admission prepares every contract and timeframe before renderer selection', async () => {
+  const f = await fixture(), ids = [instId, 'ETH-USDT-SWAP'], frames = ['5m', '15m', '1H']
+  const subscriptions = ids.flatMap(instId => frames.map(timeframe => ({ instId, timeframe })))
+  const emitted: any[] = [], sourceCalls: any[] = []
+  f.pipeline.streaming = () => true
+  f.pipeline.history.latest = async (...args: any[]) => { sourceCalls.push(args); return {} }
+  f.pipeline.subscribe((frame: any) => emitted.push(frame))
+  try {
+    await f.store.appendCandles(subscriptions.flatMap(({ instId: id, timeframe }) => {
+      const interval = timeframe === '5m' ? step : timeframe === '15m' ? 900_000 : hour
+      const end = Math.floor(Date.now() / interval) * interval - interval
+      return Array.from({ length: 400 }, (_, index) => candle(end - (399 - index) * interval, index, timeframe, id))
+    }))
+    f.pipeline.setRealtimeSubscriptions(subscriptions)
+    await waitFor(() => subscriptions.every(({ instId, timeframe }) => f.pipeline.cached(`${instId}:${timeframe}`)))
+    assert.equal(f.pipeline.universe.size, 6)
+    assert.deepEqual(sourceCalls, [], 'Complete native subscriptions do not start successful REST refreshes.')
+    const response = f.pipeline.setUniverse([instId], '15m', instId)
+    assert.equal(response.frames.length, 3)
+    assert.equal(response.frames[0].timeframe, '15m')
+    f.pipeline.setUniverse([instId], '5m', instId)
+    assert.equal(f.pipeline.universe.size, 6, 'Changing renderer focus preserves all native working series.')
+    const before = emitted.length, other = f.pipeline.cached('ETH-USDT-SWAP:1H'), live = { ...candle(other.endHour + hour, 400, '1H', 'ETH-USDT-SWAP'), confirmed: false }
+    await f.pipeline.setLive('ETH-USDT-SWAP', '1H', live)
+    assert.equal(emitted.length, before, 'Unlisted native series stay current without sending full charts to the renderer.')
+    assert.equal(f.pipeline.cached('ETH-USDT-SWAP:1H').liveBar.close, live.close)
+    assert.equal(f.pipeline.setUniverse(['ETH-USDT-SWAP'], '1H').frames.find((frame: any) => frame.timeframe === '1H').liveBar.close, live.close)
+  } finally { await f.close() }
+})
+
+test('cached compact restoration bypasses unrelated held canonical rebuilds', async () => {
+  const f = await fixture(), release = deferred(), missing = Array.from({ length: 4 }, (_, index) => `COLD${index}-USDT-SWAP`)
+  const end = Math.floor(Date.now() / hour) * hour - hour, source = Array.from({ length: 400 }, (_, index) => candle(end - (399 - index) * hour, index))
+  let restarted: any, active = 0
+  try {
+    await f.store.appendCandles(source)
+    const original = await f.pipeline.local(instId, '1H')
+    await f.pipeline.dispose()
+    const read = f.store.candles.bind(f.store)
+    f.store.candles = async (query: any, priority: any) => {
+      if (query.instrument === instId) throw new Error('A saved compact chart must not join canonical history work.')
+      active += 1
+      await release.promise
+      return read(query, priority)
+    }
+    restarted = createPipeline(f.store)
+    restarted.streaming = () => true
+    restarted.setRealtimeSubscriptions([...missing, instId].map(instId => ({ instId, timeframe: '1H' })))
+    await waitFor(() => active === 4 && restarted.cached(`${instId}:1H`))
+    assert.equal(restarted.cached(`${instId}:1H`).endHour, original.endHour)
+    assert.equal(restarted.nextCalculation, 0)
+    assert.equal(restarted.liveStates.get(`${instId}:1H`).indicatorState.lastTimestamp, end)
+    release.resolve()
+  } finally { release.resolve(); await restarted?.dispose(); await f.close() }
+})
+
+for (const seed of ['missing', 'invalid']) test(`${seed} recursive checkpoints preserve valid compact charts while exact seed rebuilding is bounded`, async () => {
+  const f = await fixture(), release = deferred(), end = Math.floor(Date.now() / hour) * hour - hour
+  const source = Array.from({ length: 400 }, (_, index) => candle(end - (399 - index) * hour, index))
+  let restarted: any, reads = 0
+  try {
+    await f.store.appendCandles(source)
+    const original = await f.pipeline.local(instId, '1H'), disk = await f.store.readChartSnapshot(instId, '1H') as any
+    if (seed === 'missing') delete disk.checkpoint
+    else disk.checkpoint.indicatorState.volumes[0] = null
+    await f.store.writeChartSnapshot(instId, '1H', disk)
+    await f.pipeline.dispose()
+    const read = f.store.candles.bind(f.store)
+    f.store.candles = async (...args: any[]) => { reads += 1; await release.promise; return read(args[0], args[1]) }
+    restarted = createPipeline(f.store)
+    restarted.streaming = () => true
+    restarted.setRealtimeSubscriptions([{ instId, timeframe: '1H' }])
+    await waitFor(() => restarted.cached(`${instId}:1H`) && reads === 1)
+    assert.equal(restarted.cached(`${instId}:1H`).endHour, original.endHour)
+    assert.equal(restarted.nextCalculation, 0)
+    const live = { ...candle(end + hour, 400), confirmed: false }
+    await restarted.setLive(instId, '1H', live)
+    assert.equal(reads, 1)
+    release.resolve()
+    await waitFor(() => restarted.cached(`${instId}:1H`)?.liveBar?.ema === barsWithIndicators([...source, live], hour).at(-1)?.ema)
+    assert.equal(restarted.nextCalculation, 1)
+  } finally { release.resolve(); await restarted?.dispose(); await f.close() }
+})
+
+test('confirmed checkpoint publication survives forming updates during its durable write', async () => {
+  const f = await fixture(), release = deferred(), end = Math.floor(Date.now() / hour) * hour - hour
+  const source = Array.from({ length: 400 }, (_, index) => candle(end - (399 - index) * hour, index))
+  let writes = 0
+  try {
+    await f.store.appendCandles(source)
+    await f.pipeline.local(instId, '1H')
+    const write = f.store.writeChartSnapshot.bind(f.store)
+    f.store.writeChartSnapshot = async (...args: any[]) => { writes += 1; await release.promise; return write(args[0], args[1], args[2]) }
+    const pending = f.pipeline.local(instId, '1H', { force: true })
+    await waitFor(() => writes === 1)
+    let live: any
+    for (let index = 0; index < 20; index += 1) {
+      live = { ...candle(end + hour, 400), confirmed: false, close: 101 + index / 100, volume: 20 + index }
+      await f.pipeline.setLive(instId, '1H', live)
+    }
+    release.resolve()
+    const published = await pending
+    assert.equal(writes, 1)
+    assert.equal(published.liveBar.close, live.close)
+    const disk = await f.store.readChartSnapshot(instId, '1H') as any
+    assert.equal(disk.checkpoint.indicatorState.lastTimestamp, end)
+    assert.equal('liveBar' in disk.frame, false)
+  } finally { release.resolve(); await f.close() }
+})
+
+test('a newly subscribed cached chart reuses idle restore lanes while an older file read remains held', async () => {
+  const f = await fixture(), release = deferred(), end = Math.floor(Date.now() / hour) * hour - hour
+  const source = Array.from({ length: 400 }, (_, index) => candle(end - (399 - index) * hour, index))
+  let restarted: any, held = false
+  try {
+    await f.store.appendCandles(source)
+    await f.pipeline.local(instId, '1H')
+    await f.pipeline.dispose()
+    const read = f.store.readChartSnapshot.bind(f.store)
+    f.store.readChartSnapshot = async (id: string, timeframe: string) => {
+      if (id === 'HELD-USDT-SWAP') { held = true; await release.promise; return null }
+      return read(id, timeframe)
+    }
+    restarted = createPipeline(f.store)
+    restarted.streaming = () => true
+    restarted.setRealtimeSubscriptions([{ instId: 'HELD-USDT-SWAP', timeframe: '1H' }])
+    await waitFor(() => held)
+    restarted.setRealtimeSubscriptions([{ instId: 'HELD-USDT-SWAP', timeframe: '1H' }, { instId, timeframe: '1H' }])
+    await waitFor(() => Boolean(restarted.cached(`${instId}:1H`)))
+    assert.equal(restarted.restoreActive.size, 1, 'The unrelated file remains held while the new chart is already available.')
+  } finally { release.resolve(); await restarted?.dispose(); await f.close() }
 })

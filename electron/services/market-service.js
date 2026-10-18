@@ -1342,9 +1342,9 @@ export class MarketService {
     // A temporary observation gap must not unsubscribe the final candle that
     // closes that gap. Confirmed failures and delistings remove renewal targets.
     for (const instId of new Set([...this.catalog.keys(), ...this.renewalTargets.keys()])) for (const timeframe of LIST_TIMEFRAMES) subscriptions.set(`${instId}:${timeframe}`, { instId, timeframe })
-    this.preparedCharts.setRealtimeSubscriptions([...subscriptions.values()])
     const ids = this.candidateIDs ?? new Set([...this.instruments.values()].filter(eligibleInstrument).map(value => value.instId))
     for (const instId of ids) for (const timeframe of LIST_TIMEFRAMES) subscriptions.set(`${instId}:${timeframe}`, { instId, timeframe })
+    this.preparedCharts.setRealtimeSubscriptions([...subscriptions.values()])
     this.realtime.setSubscriptions([...subscriptions.values()])
     this.publicRealtime?.setSubscriptions([...ids])
     if (!this.closing) this.preparedCharts.sourceStateChanged()
