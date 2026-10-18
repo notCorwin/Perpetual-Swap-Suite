@@ -18,7 +18,7 @@ before(async () => {
     chartTimeframe: '15m', rankingLookback: 15, historyDays: 30,
     notificationsEnabled: true, backgroundMonitoringEnabled: true, monitoringPaused: true,
   }))
-  electron = await _electron.launch({ args: ['.', '--headless', '--disable-gpu'], cwd: root,
+  electron = await _electron.launch({ args: ['.'], cwd: root,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1',
       PERPETUAL_SWAP_E2E_LIVE_REFRESH: '0', PERPETUAL_SWAP_USER_DATA: userData } })
   page = await electron.firstWindow()
@@ -36,7 +36,7 @@ test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while specu
     const restored = await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isVisible())
     assert.equal(restored, foreground.previous.visible, 'The latency test must restore the native window visibility.')
   })
-  context.diagnostic(`Native paint window: ${JSON.stringify({ before: foreground.previous, during: foreground.native })}`)
+  context.diagnostic(`Native paint window: ${JSON.stringify({ before: foreground.previous, during: foreground.native, environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence })}`)
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   // Adaptive speculative preparation is held indefinitely. Source reads are
   // also stalled after warming, so navigation must stay independent of both

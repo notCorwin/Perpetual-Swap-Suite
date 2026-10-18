@@ -26,7 +26,34 @@ export async function foregroundPaintWindow(electron, page) {
       return { visible: window.isVisible(), focused: window.isFocused(), minimized: window.isMinimized() }
     }, previous.id)
     assert.deepEqual(native, { visible: true, focused: true, minimized: false }, 'Paint latency requires a visible, focused native window.')
-    return { previous, native, restore }
+    const environment = await electron.evaluate(async ({ app, screen, BrowserWindow }, id) => {
+      const window = BrowserWindow.fromId(id), display = screen.getDisplayMatching(window.getBounds())
+      const gpuInfo = await app.getGPUInfo('basic')
+      return { electron: process.versions.electron, chromium: process.versions.chrome, arch: process.arch,
+        headless: app.commandLine.hasSwitch('headless'), disableGPU: app.commandLine.hasSwitch('disable-gpu'),
+        hardwareAcceleration: app.isHardwareAccelerationEnabled(), gpuFeatureStatus: app.getGPUFeatureStatus(), gpuDevices: gpuInfo.gpuDevice,
+        backgroundThrottling: window.webContents.getBackgroundThrottling(), offscreen: window.webContents.isOffscreen(),
+        display: { frequency: display.displayFrequency, scaleFactor: display.scaleFactor, size: display.size } }
+    }, previous.id)
+    assert.equal(environment.headless, false, 'Foreground paint must use the normal Electron compositor.')
+    assert.equal(environment.disableGPU, false, 'Foreground paint must use the production GPU configuration.')
+    const idleFrameCadence = await page.evaluate(() => new Promise((resolve, reject) => {
+      const startedAt = performance.now(), gaps = []
+      let previous = null, raf
+      const deadline = setTimeout(() => { cancelAnimationFrame(raf); reject(new Error('Foreground animation frames did not advance within 5 seconds.')) }, 5000)
+      const frame = timestamp => {
+        if (previous !== null) gaps.push(timestamp - previous)
+        previous = timestamp
+        if (timestamp - startedAt < 1000) { raf = requestAnimationFrame(frame); return }
+        clearTimeout(deadline)
+        gaps.sort((left, right) => left - right)
+        resolve({ phase: 'before scenario setup', frames: gaps.length, durationMS: timestamp - startedAt,
+          medianMS: gaps[Math.floor((gaps.length - 1) * .5)] ?? null,
+          p95MS: gaps[Math.floor((gaps.length - 1) * .95)] ?? null, maxMS: gaps.at(-1) ?? null })
+      }
+      raf = requestAnimationFrame(frame)
+    }))
+    return { previous, native, environment, idleFrameCadence, restore }
   } catch (error) {
     await restore()
     throw error
@@ -100,7 +127,23 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       active: true, frames: 0, pendingFrames: 0, paints: 0, minimumBars: Infinity, errors: [],
       frameGaps: [], frameSamples: [], validationSamples: [], inputBursts: [], commits: [], previousFrame: null, previousSnapshot: null, previousBars: null,
       phase: 'initial', quality: [], known: new Map(), geometry: new Map(),
-      raf: null, observer: null,
+      raf: null, observer: null, schedulerObservers: [],
+      scheduler: { counts: {}, entries: [], supportedEntryTypes: PerformanceObserver.supportedEntryTypes },
+    }
+    for (const type of ['longtask', 'long-animation-frame']) if (probe.scheduler.supportedEntryTypes.includes(type)) {
+      const record = entries => {
+        for (const entry of entries) {
+          probe.scheduler.counts[type] = (probe.scheduler.counts[type] ?? 0) + 1
+          probe.scheduler.entries.push({ type, startTime: entry.startTime, duration: entry.duration,
+            blockingDuration: entry.blockingDuration, renderStart: entry.renderStart, styleAndLayoutStart: entry.styleAndLayoutStart,
+            scripts: [...(entry.scripts ?? [])].slice(0, 5).map(script => ({ sourceURL: script.sourceURL, invoker: script.invoker,
+              invokerType: script.invokerType, duration: script.duration, forcedStyleAndLayoutDuration: script.forcedStyleAndLayoutDuration })) })
+        }
+        probe.scheduler.entries = probe.scheduler.entries.slice(-50)
+      }
+      const observer = new PerformanceObserver(list => record(list.getEntries()))
+      observer.observe({ type })
+      probe.schedulerObservers.push({ observer, record })
     }
     const fail = message => { if (probe.errors.length < 20) probe.errors.push(message) }
     const validateSample = (frame, timestamp, sampledAt) => {
@@ -245,6 +288,7 @@ export async function finishPaintProbe(page) {
     probe.active = false
     cancelAnimationFrame(probe.raf)
     probe.observer.disconnect()
+    for (const { observer, record } of probe.schedulerObservers) { record(observer.takeRecords()); observer.disconnect() }
     delete window.__chartPaintProbe
     const percentile = (values, ratio) => {
       const sorted = [...values].sort((left, right) => left - right)
@@ -252,7 +296,7 @@ export async function finishPaintProbe(page) {
     }
     return {
       frames: probe.frames, pendingFrames: probe.pendingFrames, paints: probe.paints, minimumBars: probe.minimumBars,
-      violations: probe.errors, commits: probe.commits, quality: probe.quality,
+      violations: probe.errors, commits: probe.commits, quality: probe.quality, scheduler: probe.scheduler,
       p95FrameGapMS: Number(percentile(probe.frameGaps, .95).toFixed(3)),
       maxFrameGapMS: Number(Math.max(0, ...probe.frameGaps).toFixed(3)),
       droppedFrames: probe.frameGaps.filter(gap => gap > 25).length,
@@ -300,6 +344,7 @@ export async function measurePaintLatency(page, { inputs, targets }) {
   return page.evaluate(({ inputs, targets }) => {
     if (document.visibilityState !== 'visible' || !document.hasFocus()) throw new Error('Foreground paint latency lost its visible, focused window.')
     const probe = window.__chartPaintProbe, commits = probe.commits
+    for (const { observer, record } of probe.schedulerObservers) record(observer.takeRecords())
     const matching = inputs.map((input, index) => commits.find(commit => commit.end === targets[index] && commit.at >= input && commit.presentedAt !== null))
     const latencies = matching.flatMap((commit, index) => commit ? [commit.presentedAt - inputs[index]] : []).sort((left, right) => left - right)
     const percentile = ratio => Number((latencies[Math.min(latencies.length - 1, Math.floor(latencies.length * ratio))] ?? 0).toFixed(3))
@@ -315,6 +360,7 @@ export async function measurePaintLatency(page, { inputs, targets }) {
     }
     return {
       documentVisibility: document.visibilityState, documentFocused: document.hasFocus(),
+      scheduler: probe.scheduler.entries.filter(entry => entry.startTime + entry.duration >= startedAt && entry.startTime <= latest.presentedAt),
       committedInputs: latencies.length, supersededInputs: inputs.length - latencies.length,
       p50InputToPaintMS: percentile(.5), p95InputToPaintMS: percentile(.95),
       latestInputToPaintMS: Number((latest.presentedAt - inputs.at(-1)).toFixed(3)),
@@ -560,7 +606,7 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
     assertCompletePaints(paint)
     const requests = await readRequestProbe(electron)
     assert.equal(paint.pendingFrames, 0, `Latency-covered scrolling must never expose an unprepared requested viewport: ${JSON.stringify({ calls: requests.calls, sourceRequests: requests.sourceRequests, historyResponses: requests.historyResponses.length, inputDurationMS: inputs.at(-1) - inputs[0], pendingFrames: paint.pendingFrames })}`)
-    assert.ok(latency.latestInputToPaintMS < 100, `The latest wheel input took ${latency.latestInputToPaintMS} ms to paint.`)
+    assert.ok(latency.latestInputToPaintMS < 100, `The latest wheel input took ${latency.latestInputToPaintMS} ms to paint. ${JSON.stringify(latency)}`)
     const historical = requests.calls.filter(call => Number.isFinite(call.endHour))
     const first = historical[0]
     assert.ok(first, 'Approaching the cold boundary must issue a historical prefetch.')
@@ -581,7 +627,7 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
     const sources = separateSourceMaintenance(requests.sourceRequests, fixture)
     assert.deepEqual(sources.historical, [], 'Prefetch must reuse persisted source candles and statistics within the latency test range.')
     return {
-      foregroundWindow: foreground.native, initialHistoryBars, historicalDelayMS, continuousWheelFrames: frames,
+      foregroundWindow: foreground.native, environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence, initialHistoryBars, historicalDelayMS, continuousWheelFrames: frames,
       scrolledCandles: frames * candlesPerFrame, crossedInitialBoundary: true,
       runwayAtRequest, prefetchHistoryBars: first.historyBars,
       prefetchStartedDuringGesture: true, prefetchCompletedDuringGesture: true,
@@ -601,7 +647,7 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
 // price/indicator viewport crosses every production boundary and reaches SVG.
 export async function measureNativeColdBoundary(electron, page, options = {}) {
   const foreground = await foregroundPaintWindow(electron, page)
-  try { return await nativeColdBoundary(electron, page, options) }
+  try { return { ...await nativeColdBoundary(electron, page, options), environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence } }
   finally { await foreground.restore() }
 }
 
@@ -643,7 +689,7 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m' } = {}) {
         && missing && missing.oi === null && missing.buy === null && missing.sell === null
     }, { targetEnd: fixture.targetEnd, firstMissingEnd: fixture.firstMissingEnd, indicatorFields }, { timeout: 10_000 })
     const latency = await measurePaintLatency(page, { inputs, targets: [fixture.targetEnd] })
-    assert.ok(latency.latestInputToPaintMS < 100, `The freshly acquired nearest viewport took ${latency.latestInputToPaintMS} ms after its boundary gesture.`)
+    assert.ok(latency.latestInputToPaintMS < 100, `The freshly acquired nearest viewport took ${latency.latestInputToPaintMS} ms after its boundary gesture. ${JSON.stringify(latency)}`)
     sources = await probe({ action: 'coldBoundaryRead' })
     const nearest = sources.requests.find(request => request.source === 'candles' && request.through === fixture.firstMissingEnd)
     assert.ok(nearest?.completedAt !== null && nearest?.completedAt !== undefined,

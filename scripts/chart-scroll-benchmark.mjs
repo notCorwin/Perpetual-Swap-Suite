@@ -12,7 +12,7 @@ async function withBenchmarkApp(run) {
   let electron
   try {
     electron = await _electron.launch({
-      args: ['.', '--headless', '--disable-gpu'], cwd: root,
+      args: ['.'], cwd: root,
       env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData },
     })
     const page = await electron.firstWindow()
@@ -101,7 +101,7 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
     try { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
     finally { await foreground.restore() }
   }
-  return { foregroundWindow: foreground.native, nativePeriods: fixture.timeframes, persistedPeriodsPerTimeframe: fixture.periods,
+  return { foregroundWindow: foreground.native, environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence, nativePeriods: fixture.timeframes, persistedPeriodsPerTimeframe: fixture.periods,
     sourceRequests, currentMaintenanceRequests: separateSourceMaintenance(sourceRequests, fixture).currentMaintenance, timeframes }
 })
 
