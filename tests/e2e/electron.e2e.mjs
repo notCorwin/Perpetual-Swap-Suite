@@ -408,6 +408,60 @@ test('mature local indicators and statistics stay drawn from the first scroll th
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
 
+for (const mode of ['gap', 'prepend']) test(`first historical acquisition keeps every calculated curve and source panel while ${mode === 'gap' ? 'later gaps fill' : 'an earlier prefix changes the exact recursive seed'}`, async context => {
+  const probe = value => electron.evaluate((_, value) => globalThis.__marketBackend.probe(value), value)
+  const fixture = await probe({ action: 'acquisitionInstall', timeframe: '15m', mode })
+  const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell']
+  const desired = fixture.series[fixture.timeframe].bars.filter(bar => bar.hour >= fixture.targetEnd - 95 * fixture.intervalMS && bar.hour <= fixture.targetEnd)
+  const settle = () => page.evaluate(async () => { for (let frame = 0; frame < 8; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
+  try {
+    await openChart(page, fixture)
+    await wheelBurst(page, { deltaY: (fixture.end - fixture.targetEnd) / fixture.intervalMS * 12 })
+    // At this point the requested historical period has never existed locally.
+    // Acquire it through real native source-page writers, independently of the
+    // latest quote tail, then observe every later page after curves first appear.
+    await probe({ action: 'acquisitionStep', source: 'prefix' })
+    await waitForRendered(page, fixture, fixture.timeframe, fixture.targetEnd)
+    await page.waitForFunction(({ targetEnd, fields }) => {
+      const snapshot = document.querySelector('[data-chart-inst]')?.__chartSnapshot
+      return snapshot?.endHour === targetEnd && snapshot.bars.length === 96
+        && snapshot.bars.every(bar => fields.every(field => Number.isFinite(bar[field])))
+    }, { targetEnd: fixture.targetEnd, fields }, { timeout: 20_000 })
+    const firstEMA = await page.evaluate(() => document.querySelector('[data-chart-inst]').__chartSnapshot.bars.at(-1).ema)
+    if (mode === 'prepend') assert.ok(Math.abs(firstEMA - desired.at(-1).ema) > 1e-6,
+      'The absent earlier prefix must actually change the recursive result, so retaining a stale curve cannot pass this test.')
+    await startPaintProbe(page, fixture, { requireMatureData: true, verifyIndicatorValues: mode === 'gap' })
+    const sourceCounts = { candles: 0, oi: 0, taker: 0 }
+    const pageCounts = { candles: 0, oi: 0, taker: 0 }
+    const complete = new Set()
+    while (complete.size < 3) {
+      for (const source of ['candles', 'oi', 'taker']) if (!complete.has(source)) {
+        await page.evaluate(phase => { window.__chartPaintProbe.phase = phase }, `${mode}: native ${source} page ${pageCounts[source] + 1}`)
+        const response = await probe({ action: 'acquisitionStep', source })
+        pageCounts[source] += 1
+        sourceCounts[source] += response.count
+        if (response.done) complete.add(source)
+        await settle()
+      }
+    }
+    // The prefix variant must adopt the new correct numbers without ever
+    // clearing its already visible curves or independent statistic panels.
+    await page.waitForFunction(({ desired, fields }) => {
+      const bars = document.querySelector('[data-chart-inst]')?.__chartSnapshot?.bars
+      return bars?.length === desired.length && bars.every((bar, index) => bar.hour === desired[index].hour
+        && fields.every(field => Number.isFinite(bar[field]) && Math.abs(bar[field] - desired[index][field]) <= Math.max(1, Math.abs(desired[index][field])) * 1e-10))
+    }, { desired, fields }, { timeout: 20_000 })
+    await settle()
+    const paint = await finishPaintProbe(page)
+    context.diagnostic(`First acquisition ${mode}: ${JSON.stringify({ sourceCounts, paints: paint.paints, quality: paint.quality })}`)
+    assertCompletePaints(paint)
+    assert.ok(paint.quality.every(frame => frame.indicators === 96 && frame.oi === 96 && frame.taker === 96),
+      'Every mature curve and statistic panel must remain visible through native page ingestion, even when the canonical generation changes.')
+  } finally {
+    await page.evaluate(() => { const probe = window.__chartPaintProbe; if (probe) { probe.active = false; cancelAnimationFrame(probe.raf); probe.observer.disconnect(); delete window.__chartPaintProbe } })
+  }
+})
+
 test('a held history read keeps the last complete paint and coalesces every later wheel event into the latest target', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   await installRequestProbe(electron, fixture.instId, { disableLocalHistory: true, initialHistoryBars: 1_000, capHistoricalWindows: true })

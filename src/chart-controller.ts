@@ -181,9 +181,13 @@ export class ChartController {
     }
     const ready = this.store.window(target.instId, target.timeframe, target.end)
     const previous = this.view.presented
-    const calculatingHistory = target.end !== null && ready?.indicatorState === 'loading'
+    const expectedFirst = ready ? Math.max(ready.endHour - 95 * ready.intervalMS, meta?.historyExhausted ? meta.oldestHour ?? -Infinity : -Infinity) : null
+    const completeHistoricalPrices = ready && expectedFirst !== null && ready.bars.length === (ready.endHour - expectedFirst) / ready.intervalMS + 1
+      && ready.bars.every((bar, index) => bar.hour === expectedFirst + index * ready.intervalMS)
+    const calculatingHistory = target.end !== null && ready
+      && (ready.indicatorState === 'loading' || !completeHistoricalPrices)
       && previous?.instId === target.instId && previous.timeframe === target.timeframe
-      && previous.generation === ready.generation && previous.bars.some(bar => bar.indicatorsObserved)
+      && previous.bars.some(bar => bar.indicatorsObserved)
     // Initial prices stay independent of optional sources. Moving an already
     // calculated chart into history switches its curves and prices together.
     const presented = calculatingHistory ? previous : ready

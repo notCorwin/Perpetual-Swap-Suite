@@ -458,3 +458,53 @@ test('live freshness metadata reaches retained history and an old bulk read cann
   assert.deepEqual(store.snapshotMeta(instId, '1H')?.sourceVersions, { price: 5, oi: 4, taker: 6 })
   assert.equal(store.window(instId, '1H')?.liveBar?.hour, 200 * hour)
 })
+
+test('price generation resets retain bounded independent statistics without certifying old prices or technical fields', () => {
+  const store = new PreparedChartStore({ maxBarsPerSeries: 200 })
+  store.setUniverse([instId], '1H', instId)
+  store.ingest(response(bars(0, 200)))
+  const previous = store.window(instId, '1H', 95 * hour)!
+  const raw = (values: PreparedChartBar[]) => values.map(value => ({ ...value,
+    indicatorsObserved: false, statisticsObserved: false, oiObserved: false, takerObserved: false, statisticsSources: 0,
+    vwap: null, ema: null, bollUpper: null, bollMiddle: null, bollLower: null,
+    roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, oi: null, buy: null, sell: null,
+  }))
+  store.ingestLatest(response(raw(bars(104, 96)), { generation: 2, revision: 2 }))
+  const latest = store.window(instId, '1H')!
+  assert.equal(latest.generation, 2); assert.equal(latest.indicatorState, 'loading')
+  assert.ok(latest.bars.every(value => value.ema === null && value.oi === 1_000 && value.buy === 20 && value.sell === 30))
+  assert.equal(store.window(instId, '1H', 95 * hour), null, 'Old-generation prices cannot establish a new-generation window.')
+  assert.equal(store.hasRange(instId, '1H', 0, 95 * hour), false)
+  assert.deepEqual(store.readyBoundaries(instId, '1H'), [{ firstEnd: 104 * hour, lastEnd: 199 * hour }])
+  store.ingest(response(raw(bars(0, 96)), { generation: 2, revision: 3, endHour: 95 * hour, latestEnd: 199 * hour }))
+  const historical = store.window(instId, '1H', 95 * hour)!
+  assert.equal(historical.generation, 2); assert.equal(historical.indicatorState, 'loading')
+  assert.ok(historical.bars.every(value => value.ema === null && !value.indicatorsObserved && value.oi === 1_000 && value.buy === 20 && value.sell === 30))
+  assert.equal(historical.oiState, 'ready'); assert.equal(historical.takerState, 'ready')
+  assert.deepEqual(store.readyBoundaries(instId, '1H'), [{ firstEnd: 0, lastEnd: 95 * hour }, { firstEnd: 104 * hour, lastEnd: 199 * hour }], 'Promoting an old statistics carrier also updates price-range provenance.')
+  assert.ok(previous.bars.every(value => value.ema === 100 && value.indicatorsObserved), 'An immutable prior presentation is retained separately from new-generation validity.')
+  assert.equal(store.size, 1, 'Statistical provenance reuses the bounded series instead of a second cache.')
+})
+
+test('compact latest generation changes retain proven statistics but accept explicit source corrections', () => {
+  const store = new PreparedChartStore()
+  store.setUniverse([instId], '1H')
+  store.ingestLatest(response(bars(104, 96)))
+  const raw = bars(104, 96).map(value => ({ ...value, close: 102,
+    indicatorsObserved: false, statisticsObserved: false, oiObserved: false, takerObserved: false, statisticsSources: 0,
+    vwap: null, ema: null, bollUpper: null, bollMiddle: null, bollLower: null,
+    roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, oi: null, buy: null, sell: null,
+  }))
+  store.ingestLatest(response(raw, { generation: 2, revision: 2 }))
+  const pending = store.window(instId, '1H')!
+  assert.equal(pending.generation, 2)
+  assert.ok(pending.bars.every(value => value.close === 102 && value.ema === null && value.oi === 1_000 && value.buy === 20 && value.sell === 30))
+  assert.equal(store.size, 0, 'A compact-only key stays compact across a generation reset.')
+  store.ingestLatest(response(raw.map(value => ({ ...value, oiObserved: true, takerObserved: true, statisticsSources: 3, statisticsObserved: true })), { generation: 3, revision: 3 }))
+  const unavailable = store.window(instId, '1H')!
+  assert.equal(unavailable.oiState, 'unavailable'); assert.equal(unavailable.takerState, 'unavailable')
+  assert.ok(unavailable.bars.every(value => value.oi === null && value.buy === null && value.sell === null))
+  assert.equal(store.ingestLatest(response(bars(104, 96), { generation: 2, revision: 100 })), false)
+  store.ingestLatest(response(bars(104, 96).map(value => ({ ...value, oi: 2_000, buy: 40, sell: 60 })), { generation: 3, revision: 4 }))
+  assert.ok(store.window(instId, '1H')!.bars.every(value => value.oi === 2_000 && value.buy === 40 && value.sell === 60))
+})
