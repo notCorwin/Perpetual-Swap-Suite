@@ -93,6 +93,31 @@ test('subscribe-before-snapshot reconciliation merges buffered listing, delistin
   } finally { held.resolve([]); await synchronizing; await f.close() }
 })
 
+test('reconnect snapshot preserves fields omitted from buffered partial instrument deltas', async () => {
+  const held = deferred<unknown[]>(), began = deferred()
+  let snapshots = 0
+  const f = await fixture([], async () => {
+    if (++snapshots === 1) return [instrument()]
+    began.resolve(); return held.promise
+  })
+  let reconciling: Promise<void> | undefined
+  try {
+    const first = await synchronized(f.service)
+    first.controller.abort(); f.service.instrumentStreamDisconnected(first.context)
+    const context = { signal: new AbortController().signal, receivedAt: Date.now() }
+    reconciling = f.service.synchronizeInstruments(context)
+    await began.promise
+    f.service.receiveInstruments([{ instId: btc, tickSz: '0.1' }], context)
+    f.service.receiveInstruments([{ instId: btc, lotSz: '1' }], context)
+    held.resolve([{ ...instrument(), ctVal: '0.02', tickSz: '0.01', lotSz: '2' }])
+    await reconciling; await settle(f.service)
+    const current = f.service.instruments.get(btc)
+    assert.equal(current.ctVal, '0.02', 'A buffered patch cannot restore a field from the previous socket session.')
+    assert.equal(current.tickSz, '0.1')
+    assert.equal(current.lotSz, '1')
+  } finally { held.resolve([]); await reconciling; await f.close() }
+})
+
 test('live metadata additions and delistings update list membership and subscriptions without another discovery request', async () => {
   const f = await fixture()
   try {

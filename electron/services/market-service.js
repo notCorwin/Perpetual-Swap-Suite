@@ -1577,9 +1577,10 @@ export class MarketService {
     const definitions = new Map(this.instrumentDefinitions), changed = []
     for (const value of records) {
       if (typeof value?.instId !== 'string' || !/^[A-Z0-9]+-[A-Z0-9]+-SWAP$/.test(value.instId)) continue
-      const merged = { ...(definitions.get(value.instId) ?? this.instrumentDeltas.get(value.instId)?.value ?? {}), ...value }
+      const patch = { ...(this.instrumentDeltas.get(value.instId)?.value ?? {}), ...value }
+      const merged = { ...(definitions.get(value.instId) ?? {}), ...patch }
       definitions.set(value.instId, merged)
-      this.instrumentDeltas.set(value.instId, { version: ++this.instrumentEventVersion, value: merged })
+      this.instrumentDeltas.set(value.instId, { version: ++this.instrumentEventVersion, value: patch })
       changed.push(value.instId)
     }
     if (!changed.length) return
