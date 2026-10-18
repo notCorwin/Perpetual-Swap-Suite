@@ -186,6 +186,7 @@ export class MarketService {
     this.pendingCandidates = new Map()
     this.catalogControllers = new Set()
     this.qualificationReads = new Set()
+    this.historicalSourceReads = new Map()
     this.candidateIDs = null
     this.tickerCache = null
     this.tickerTask = null
@@ -1528,14 +1529,17 @@ export class MarketService {
     const task = (async () => {
       try {
         if (recovery.source === 'turnover' || recovery.source === 'hourly') {
-          const timeframe = recovery.source === 'turnover' ? '5m' : '1H', count = timeframe === '5m' ? 288 : 24
-          const step = timeframeMilliseconds(timeframe), end = closedBoundary(timeframe)
-          await this.history.ensurePrices(recovery.instId, timeframe, end - count * step, end - step, 'continuity', signal)
-          const config = this.prefs().liquidity, instrument = this.instruments.get(recovery.instId)
-          if (instrument) await this.checkCandidate(instrument, config, JSON.stringify(config), signal, 'continuity', { localOnly: true })
+          const observations = this.observations.get(recovery.instId) ?? {}
+          this.observations.set(recovery.instId, observations)
+          await this.observeHistoricalSource(recovery.instId, recovery.source, observations, signal, true,
+            () => !this.closing && this.sourceRecoveries.get(recovery.key) === recovery && this.requiredRecoveryCurrent(recovery))
+          if (signal.aborted || this.sourceRecoveries.get(recovery.key) !== recovery) return
+          if (!this.requiredRecoveryCurrent(recovery) && !this.observation(this.observations.get(recovery.instId) ?? {}, recovery.source)) { this.cancelRequiredRecovery(recovery.key); return }
           if (!this.observation(this.observations.get(recovery.instId) ?? {}, recovery.source)) throw new Error(`The completed ${recovery.source} range is not available.`)
-          this.sourceRecoveries.delete(recovery.key)
-          this.sourceError(recovery.key, null)
+          this.cancelRequiredRecovery(recovery.key)
+          // Source availability is independent of the other qualification
+          // criteria, including a known spread rejection or an in-flight check.
+          this.queueStreamQualification(recovery.instId)
           return
         }
         const observation = recovery.source === 'book'
@@ -1686,6 +1690,66 @@ export class MarketService {
     finally { this.qualificationReads.delete(pending) }
   }
 
+  async observeHistoricalSource(instId, key, observations, signal, acquire, current) {
+    const timeframe = key === 'turnover' ? '5m' : '1H', count = key === 'turnover' ? 288 : 24, step = timeframeMilliseconds(timeframe)
+    const calculate = (rows, end, from) => {
+      if (key === 'turnover') {
+        const turnover = quoteTurnover24h(rows, end)
+        if (turnover === null) throw new Error('The completed 24-hour quote-volume range is incomplete.')
+        return { turnover }
+      }
+      if (rows.length !== 24 || rows.some((row, index) => row.timestamp !== from + index * step || !row.confirmed || number(row.quoteVolume) === null)) throw new Error('Incomplete hourly source range.')
+      return { rows }
+    }
+    while (current()) {
+      signal.throwIfAborted()
+      const end = closedBoundary(timeframe), from = end - count * step, through = end - step
+      const cached = this.observation(observations, key)
+      if (cached?.value.asOf === end) return cached
+      let revision = this.liquidityHistoryRevision(instId, timeframe), rows, value
+      const read = () => {
+        const identity = `${instId}:${key}:${end}:${revision}`
+        let task = this.historicalSourceReads.get(identity)
+        if (!task) {
+          task = this.readQualificationCandles({ instrument: instId, timeframe, from, through }, this.shutdownController.signal)
+            .then(rows => ({ rows, value: calculate(rows, end, from) }))
+            .finally(() => { if (this.historicalSourceReads.get(identity) === task) this.historicalSourceReads.delete(identity) })
+          this.historicalSourceReads.set(identity, task)
+          this.track(task)
+        }
+        // One caller retiring cannot cancel another caller's canonical read.
+        return abortable(task, signal)
+      }
+      try {
+        ;({ rows, value } = await read())
+        while (revision !== this.liquidityHistoryRevision(instId, timeframe)) {
+          signal.throwIfAborted(); revision = this.liquidityHistoryRevision(instId, timeframe)
+          ;({ rows, value } = await read())
+        }
+      } catch {
+        signal.throwIfAborted()
+        value = undefined
+        if (revision !== this.liquidityHistoryRevision(instId, timeframe)) continue
+        if (!acquire) throw new Error('The completed qualification window is not yet durable.')
+        revision = this.liquidityHistoryRevision(instId, timeframe)
+        rows = (await this.history.ensurePrices(instId, timeframe, from, through, 'continuity', signal)).rows
+      }
+      while (revision !== this.liquidityHistoryRevision(instId, timeframe)) {
+        signal.throwIfAborted(); revision = this.liquidityHistoryRevision(instId, timeframe)
+        ;({ rows, value } = await read())
+      }
+      signal.throwIfAborted()
+      if (!current() || this.observations.get(instId) !== observations) return null
+      if (end !== closedBoundary(timeframe)) continue
+      value ??= calculate(rows, end, from)
+      if (key === 'turnover') this.cacheRankingCandles(instId, rows)
+      const observation = { value: { asOf: end, ...value }, observedAt: Date.now(), expiresAt: end + step }
+      observations[key] = observation
+      return observation
+    }
+    return null
+  }
+
   async evaluateCandidate(instrument, config, configKey, signal, priority, { localOnly = false, sources = {} } = {}) {
     if (!this.currentCandidate(instrument, configKey, signal)) return
     const asOf = closedBoundary('5m')
@@ -1714,51 +1778,13 @@ export class MarketService {
         errors[key] = error instanceof Error ? error.message : String(error)
       }
     }
-    const observeHistory = async (key, timeframe, end, count, calculate) => {
-      try {
-        const step = timeframeMilliseconds(timeframe), through = end - step, from = end - count * step
-        let revision = this.liquidityHistoryRevision(instId, timeframe)
-        let rows, value
-        try {
-          rows = await this.readQualificationCandles({ instrument: instId, timeframe, from, through }, signal)
-          while (revision !== this.liquidityHistoryRevision(instId, timeframe)) {
-            signal.throwIfAborted()
-            revision = this.liquidityHistoryRevision(instId, timeframe)
-            rows = await this.readQualificationCandles({ instrument: instId, timeframe, from, through }, signal)
-          }
-          value = calculate(rows, from, through)
-        } catch {
-          signal.throwIfAborted()
-          if (localOnly) throw new Error('The completed qualification window is not yet durable.')
-          revision = this.liquidityHistoryRevision(instId, timeframe)
-          // Qualification needs only its recent window. Admit missing slots
-          // ahead of rolling multi-day targets, without blocking the renderer.
-          const prepared = await this.history.ensurePrices(instId, timeframe, from, through, 'continuity', signal)
-          rows = prepared.rows
-        }
-        while (revision !== this.liquidityHistoryRevision(instId, timeframe)) {
-          signal.throwIfAborted()
-          revision = this.liquidityHistoryRevision(instId, timeframe)
-          rows = await this.readQualificationCandles({ instrument: instId, timeframe, from, through }, signal)
-          value = undefined
-        }
-        if (!this.currentCandidate(instrument, configKey, signal)) return
-        if (end !== closedBoundary(timeframe)) return
-        value ??= calculate(rows, from, through)
-        observations[key] = { value: { asOf: end, ...value }, observedAt: Date.now(), expiresAt: end + step }
-      } catch (error) { errors[key] = error instanceof Error ? error.message : String(error) }
+    const observeHistory = async key => {
+      try { await this.observeHistoricalSource(instId, key, observations, signal, !localOnly, () => this.currentCandidate(instrument, configKey, signal)) }
+      catch (error) { errors[key] = error instanceof Error ? error.message : String(error) }
     }
     const tasks = []
-    if (config.volume24h.enabled && !(this.observation(observations, 'turnover')?.value.asOf === asOf)) tasks.push(observeHistory('turnover', '5m', asOf, 288, candles => {
-      this.cacheRankingCandles(instId, candles)
-      const turnover = quoteTurnover24h(candles, asOf)
-      if (turnover === null) throw new Error('The completed 24-hour quote-volume range is incomplete.')
-      return { turnover }
-    }))
-    if (config.volumeStability.enabled && !(this.observation(observations, 'hourly')?.value.asOf === closedBoundary('1H', asOf))) tasks.push(observeHistory('hourly', '1H', closedBoundary('1H', asOf), 24, (rows, from) => {
-      if (rows.length !== 24 || rows.some((row, index) => row.timestamp !== from + index * 3_600_000 || !row.confirmed || number(row.quoteVolume) === null)) throw new Error('Incomplete hourly source range.')
-      return { rows }
-    }))
+    if (config.volume24h.enabled && !(this.observation(observations, 'turnover')?.value.asOf === asOf)) tasks.push(observeHistory('turnover'))
+    if (config.volumeStability.enabled && !(this.observation(observations, 'hourly')?.value.asOf === closedBoundary('1H', asOf))) tasks.push(observeHistory('hourly'))
     await Promise.all(tasks)
     if (!this.currentCandidate(instrument, configKey, signal)) return
     const historicalAsOf = closedBoundary('5m')

@@ -4,11 +4,11 @@ import { MetadataStore } from './metadata-store.js'
 import { MarketStore } from './market-store.js'
 import { MarketService } from './market-service.js'
 import { ChartNotificationEncoder } from './chart-notifications.js'
-import { seedCachedListProjection, seedChartScrollBenchmark, seedHistoricalStatisticsBoundary, seedInstrumentNavigationBenchmark } from '../e2e-fixtures.js'
+import { createChartAcquisitionFixture, seedCachedListProjection, seedChartScrollBenchmark, seedHistoricalStatisticsBoundary, seedInstrumentNavigationBenchmark } from '../e2e-fixtures.js'
 import { backgroundArchiveRows, seedMarketResources, startBackgroundArchive } from '../market-resource-fixtures.js'
 
 let metadata, store, service, preferences, sourceProbe
-let resourceFixture
+let resourceFixture, acquisitionFixture
 const emit = (name, value) => parentPort.postMessage({ type: 'event', name, value })
 const offline = async (_input, { signal } = {}) => {
   if (workerData.e2eLiveRefresh) await new Promise((resolve, reject) => {
@@ -77,6 +77,14 @@ async function request(value) {
 
 async function probe(input) {
   if (!workerData.testMode) throw new Error('Backend probes are unavailable outside tests.')
+  if (input.action === 'acquisitionInstall') {
+    acquisitionFixture = await createChartAcquisitionFixture(store, service, input)
+    return acquisitionFixture.fixture
+  }
+  if (input.action === 'acquisitionStep') {
+    if (!acquisitionFixture) throw new Error('Chart acquisition fixture is not installed.')
+    return acquisitionFixture.step(input.source)
+  }
   if (input.action === 'scaleSeed') {
     const previous = preferences
     preferences = metadata.updateSettings({ liquidity: Object.fromEntries(Object.entries(preferences.liquidity).map(([key, value]) => [key, { ...value, enabled: false }])) }).preferences

@@ -1001,3 +1001,70 @@ test('cold provider selections bypass a held old demand with bounded independent
     assert.equal(queue.maximumActive(), 2)
   } finally { closeBTC(); closeETH(); closeSOL() }
 })
+
+test('staged first acquisition retains a whole calculated historical presentation across canonical generations', async () => {
+  const queue = transportQueue(), store = cached(), controller = new ChartController(queue.transport, store)
+  const close = controller.open(btc, '1H')
+  const raw = (generation: number, revision: number, corrected = false) => prepared(btc, 599, { generation, revision, latestEnd: 1199 * hour,
+    bars: bars(504, 96).map(value => ({ ...value, ...(corrected ? { close: 111, high: 112 } : {}),
+      indicatorsObserved: false, statisticsObserved: false, oiObserved: false, takerObserved: false, statisticsSources: 0,
+      vwap: null, ema: null, bollUpper: null, bollMiddle: null, bollLower: null,
+      roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, oi: null, buy: null, sell: null,
+    })), indicatorState: 'loading', oiState: 'loading', takerState: 'loading',
+  })
+  try {
+    controller.scroll(-600)
+    controller.ingestPrepared(prepared(btc, 599, { latestEnd: 1199 * hour, revision: 2 }))
+    const first = controller.getSnapshot().presented!
+    controller.ingestPrepared(raw(2, 3))
+    assert.equal(controller.getSnapshot().presented, first)
+    assert.equal(controller.getSnapshot().pending, true)
+    const pending = store.window(btc, '1H', 599 * hour)!
+    assert.equal(pending.generation, 2)
+    assert.ok(pending.bars.every(value => value.ema === null && !value.indicatorsObserved), 'Old technical fields never become valid in a new canonical generation.')
+    controller.ingestPrepared(prepared(btc, 599, { generation: 2, revision: 4, latestEnd: 1199 * hour, bars: bars(504, 96).map(value => ({ ...value, ema: 200 })) }))
+    const second = controller.getSnapshot().presented!
+    assert.equal(second.generation, 2); assert.equal(controller.getSnapshot().pending, false)
+    assert.ok(second.bars.every(value => value.ema === 200))
+    controller.ingestPrepared(raw(3, 5, true))
+    assert.equal(controller.getSnapshot().presented, second); assert.equal(controller.getSnapshot().pending, true)
+    assert.ok(store.window(btc, '1H', 599 * hour)!.bars.every(value => value.close === 111 && value.ema === null))
+    assert.ok(second.bars.every(value => value.close === 101 && value.ema === 200), 'The old whole presentation stays internally consistent while new prices are recalculated.')
+    controller.ingestPrepared(prepared(btc, 599, { generation: 3, revision: 6, latestEnd: 1199 * hour,
+      bars: bars(504, 96).map(value => ({ ...value, close: 111, high: 112, ema: 300 })),
+    }))
+    assert.ok(controller.getSnapshot().presented!.bars.every(value => value.close === 111 && value.ema === 300))
+    assert.equal(controller.getSnapshot().pending, false)
+  } finally { close() }
+})
+
+test('first acquisition still presents short listing prices and observed warmup nulls without a statistics barrier', async () => {
+  const queue = transportQueue(), store = new PreparedChartStore()
+  const partial = (end: number, generation: number, revision: number, observed = false) => prepared(btc, end, { generation, revision,
+    latestEnd: 199 * hour, oldestHour: (end - 11) * hour, historyExhausted: true,
+    bars: bars(end - 11, 12).map(value => ({ ...value,
+      indicatorsObserved: observed, statisticsObserved: false, oiObserved: false, takerObserved: false, statisticsSources: 0,
+      vwap: null, ema: null, bollUpper: null, bollMiddle: null, bollLower: null,
+      roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, oi: null, buy: null, sell: null,
+    })), indicatorState: observed ? 'unavailable' : 'loading', oiState: 'loading', takerState: 'loading',
+  })
+  const controller = new ChartController({ ...queue.transport, local: async () => partial(199, 1, 1) }, store)
+  controller.setUniverse([btc], '1H')
+  const close = controller.open(btc, '1H')
+  try {
+    await settled()
+    assert.equal(controller.getSnapshot().presented!.bars.length, 12)
+    assert.equal(controller.getSnapshot().presented!.indicatorState, 'loading')
+    assert.equal(controller.getSnapshot().pending, false, 'The first local prices remain usable before calculation.')
+    controller.ingestPrepared(partial(199, 1, 2, true))
+    controller.scroll(-1)
+    const previous = controller.getSnapshot().presented!
+    controller.ingestPrepared(partial(198, 2, 3))
+    assert.equal(controller.getSnapshot().presented, previous); assert.equal(controller.getSnapshot().pending, true)
+    controller.ingestPrepared(partial(198, 2, 4, true))
+    const next = controller.getSnapshot().presented!
+    assert.equal(next.generation, 2); assert.equal(next.bars.length, 12)
+    assert.equal(next.indicatorState, 'unavailable'); assert.equal(next.oiState, 'loading'); assert.equal(next.takerState, 'loading')
+    assert.equal(controller.getSnapshot().pending, false, 'A proven listing floor and observed warmup nulls are a complete historical presentation.')
+  } finally { close() }
+})

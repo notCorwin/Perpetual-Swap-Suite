@@ -55,8 +55,8 @@ export async function openChart(page, fixture, timeframe = fixture.timeframe) {
 // treating the requested viewport or an aggregate loading flag as a paint.
 // __chartSnapshot is a reference to the rendered object; it avoids serializing
 // 96 full bars into an attribute on every production animation frame.
-export async function startPaintProbe(page, fixture, { requireMatureData = false } = {}) {
-  await page.evaluate(({ instId, series, requireMatureData }) => {
+export async function startPaintProbe(page, fixture, { requireMatureData = false, verifyIndicatorValues = true } = {}) {
+  await page.evaluate(({ instId, series, requireMatureData, verifyIndicatorValues }) => {
     const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
     if (!(chart instanceof HTMLElement)) throw new Error('No chart surface to inspect.')
     const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell']
@@ -145,6 +145,13 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
           return bar.indicatorsObserved
         })) {
           const actual = bar[field], wanted = expected[field]
+          // When an earlier prefix is still arriving, exact recursive results
+          // legitimately change. Require continuous finite geometry here; the
+          // acquisition test checks the final complete-prefix oracle separately.
+          if (!verifyIndicatorValues && indicatorFields.includes(field)) {
+            if (!Number.isFinite(actual)) fail(`${probe.phase}: ${timeframe} ${bar.hour} ${field} retracted to ${actual} during prefix acquisition.`)
+            continue
+          }
           if (wanted === null) {
             if (actual !== null) fail(`${timeframe} ${bar.hour} ${field}: expected missing, got ${actual}.`)
           } else if (typeof actual !== 'number' || !Number.isFinite(actual)
@@ -175,7 +182,7 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
     sample()
     probe.raf = requestAnimationFrame(frame)
     window.__chartPaintProbe = probe
-  }, { instId: fixture.instId, series: fixture.series, requireMatureData })
+  }, { instId: fixture.instId, series: fixture.series, requireMatureData, verifyIndicatorValues })
 }
 
 export async function finishPaintProbe(page) {

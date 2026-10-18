@@ -399,10 +399,15 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { aw
     assert.equal(new Set(order).size, fixture.instIds.length, `Keyboard navigation must visit the entire prepared universe: ${lap}`)
     assert.equal(order.at(-1), initial, `Revisiting the first contract after more than twelve switches must remain immediate: ${lap}`)
     const expectedInstId = order[37 % fixture.instIds.length]
-    const beforeBurst = await page.evaluate(() => window.__navigationPaintProbe.commits.length)
-    const rapid = await nextFrame(() => page.evaluate(() => {
+    let beforeBurst
+    const rapid = await nextFrame(async () => { beforeBurst = await page.evaluate(() => {
+      // Capture the boundary in the same task as the actual input. A benign
+      // current-contract publication during measurement setup precedes this
+      // burst and cannot be mistaken for an intermediate keyboard selection.
+      const offset = window.__navigationPaintProbe.commits.length
       for (let index = 0; index < 37; index += 1) window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }))
-    }), { expectedInstId, timeframe, maximumMS: 100 })
+      return offset
+    }) }, { expectedInstId, timeframe, maximumMS: 100 })
     const rapidPaints = await page.evaluate(offset => window.__navigationPaintProbe.commits.slice(offset), beforeBurst)
     assert.ok(rapidPaints.every(paint => paint.instId === expectedInstId), 'A coalesced key burst must only present its final requested instrument.')
     phases.push({ timeframe, prewarm, timeframeSwitch, firstVisit, mouseSwitch, keyboard, rapid, distinctContracts: new Set(order).size })

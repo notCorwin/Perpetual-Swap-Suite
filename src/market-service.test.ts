@@ -1938,3 +1938,155 @@ test('a delayed bootstrap ticker failure cannot create a wildcard fault for a kn
     assert.equal(f.service.tickerFaults.size, 0)
   } finally { fail(new Error('Disposed.')); await f.close() }
 })
+
+const turnoverRecovery = (service: MarketService) => {
+  isolateQualification(service)
+  service.instruments.set(instId, instrument)
+  service.candidateIDs = new Set([instId])
+  service.instrumentObservations.set(instId, { observedAt: Date.now(), expiresAt: Date.now() + 60_000 })
+  service.observations.set(instId, { ticker: { value: { ...ticker, bidPx: '99', askPx: '101' }, observedAt: Date.now(), expiresAt: Date.now() + 60_000 } })
+  const recovery = { key: `${instId}:turnover`, instId, source: 'turnover', attempts: 0, retryAt: 0, task: null, controller: new AbortController() }
+  service.sourceRecoveries.set(recovery.key, recovery)
+  return recovery
+}
+
+test('turnover source recovery succeeds from complete durable facts even when another liquidity criterion rejects the contract', async () => {
+  const configuration = disabled(); configuration.liquidity.volume24h.enabled = true; configuration.liquidity.spread.enabled = true
+  const f = await fixture(configuration)
+  try {
+    const recovery = turnoverRecovery(f.service), asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
+    await f.store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 200_000 })))
+    let acquisitions = 0
+    f.service.history.ensurePrices = async (_id: string, timeframe: string, from: number, through: number) => { acquisitions += 1; return { rows: await f.store.candles({ instrument: instId, timeframe, from, through }) } }
+    f.service.sourceError(recovery.key, new Error('Previous source fault.'))
+    await f.service.repairRequiredSource(recovery)
+    assert.equal(f.service.error, '', 'A rejected spread cannot manufacture an unavailable turnover-source error.')
+    assert.equal(f.service.observations.get(instId).turnover.value.turnover, 57_600_000)
+    assert.equal(acquisitions, 0, 'Complete canonical rows require no provider request or history acquisition.')
+    assert.equal(f.service.sourceRecoveries.has(recovery.key), false)
+    f.service.flushStreamQualifications()
+    assert.equal(f.service.catalogChecks.get(instId).status, 'failed', 'Recovering a source does not bypass the genuine spread rejection.')
+  } finally { await f.close() }
+})
+
+test('a genuine missing turnover slot remains a source failure without a fabricated observation', async () => {
+  const configuration = disabled(); configuration.liquidity.volume24h.enabled = true
+  const f = await fixture(configuration)
+  try {
+    const recovery = turnoverRecovery(f.service), asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
+    await f.store.appendCandles(Array.from({ length: 287 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 200_000 })))
+    f.service.history.ensurePrices = async (_id: string, timeframe: string, from: number, through: number) => ({ rows: await f.store.candles({ instrument: instId, timeframe, from, through }) })
+    await f.service.repairRequiredSource(recovery)
+    assert.match(f.service.error, /incomplete|not available|not yet durable/i)
+    assert.equal(f.service.observations.get(instId).turnover, undefined)
+    assert.equal(recovery.attempts, 1)
+  } finally { await f.close() }
+})
+
+test('turnover source recovery rereads a durable correction and cannot publish an aborted earlier recovery', async () => {
+  const configuration = disabled(); configuration.liquidity.volume24h.enabled = true
+  const f = await fixture(configuration), hold = deferred(), started = deferred()
+  try {
+    const recovery = turnoverRecovery(f.service), asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes, latest = asOf - fiveMinutes
+    await f.store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 200_000 })))
+    const read = f.store.candles.bind(f.store)
+    let blocked = false
+    f.store.candles = async (query, priority) => {
+      const rows = await read(query, priority)
+      if (!blocked) { blocked = true; started.resolve(); await hold.promise }
+      return rows
+    }
+    const pending = f.service.repairRequiredSource(recovery)
+    await started.promise
+    await f.service.persistCandles(instId, [{ ...rawCandle(latest), quoteVolume: 400_000 }], { projectList: false })
+    hold.resolve(); await pending
+    assert.equal(f.service.observations.get(instId).turnover.value.turnover, 57_800_000)
+    delete f.service.observations.get(instId).turnover
+    const retired = turnoverRecovery(f.service), cancelled = deferred(), entered = deferred()
+    blocked = false
+    f.store.candles = async (query, priority) => {
+      const rows = await read(query, priority)
+      if (!blocked) { blocked = true; entered.resolve(); await cancelled.promise }
+      return rows
+    }
+    const old = f.service.repairRequiredSource(retired)
+    await entered.promise
+    f.service.cancelRequiredRecovery(retired.key)
+    cancelled.resolve(); await old
+    assert.equal(f.service.observations.get(instId).turnover, undefined)
+    assert.equal(f.service.sourceRecoveries.has(retired.key), false)
+  } finally { hold.resolve(); await f.close() }
+})
+
+test('concurrent historical source consumers share one local read and calculation while cancellation retires only its consumer', async () => {
+  const configuration = disabled(); configuration.liquidity.volume24h.enabled = true
+  const f = await fixture(configuration), hold = deferred(), started = deferred()
+  try {
+    turnoverRecovery(f.service)
+    const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
+    await f.store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 200_000 })))
+    const read = f.store.candles.bind(f.store)
+    let reads = 0
+    f.store.candles = async (query, priority) => { reads += 1; const rows = await read(query, priority); started.resolve(); await hold.promise; return rows }
+    const observations = f.service.observations.get(instId), retiring = new AbortController(), remaining = new AbortController()
+    const first = f.service.observeHistoricalSource(instId, 'turnover', observations, retiring.signal, false, () => true)
+    const rejected = assert.rejects(first, /abort/i)
+    await started.promise
+    const second = f.service.observeHistoricalSource(instId, 'turnover', observations, remaining.signal, false, () => true)
+    retiring.abort(); await rejected
+    hold.resolve(); await second
+    assert.equal(reads, 1)
+    assert.equal(observations.turnover.value.turnover, 57_600_000)
+    await f.service.observeHistoricalSource(instId, 'turnover', observations, remaining.signal, false, () => true)
+    assert.equal(reads, 1, 'A still-current source observation requires neither another local read nor recalculation.')
+    assert.equal(f.service.historicalSourceReads.size, 0)
+  } finally { hold.resolve(); await f.close() }
+})
+
+test('turnover source recovery crossing a native boundary acquires only the newly missing current range and never renews the old proof', async context => {
+  let now = Math.floor(Date.now() / hour) * hour + 17 * 60_000
+  context.mock.method(Date, 'now', () => now)
+  const configuration = disabled(); configuration.liquidity.volume24h.enabled = true
+  const f = await fixture(configuration), hold = deferred(), started = deferred(), requests: number[] = []
+  try {
+    const recovery = turnoverRecovery(f.service), oldEnd = Math.floor(now / fiveMinutes) * fiveMinutes
+    await f.store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(oldEnd - (288 - index) * fiveMinutes), quoteVolume: 200_000 })))
+    const read = f.store.candles.bind(f.store)
+    let blocked = false
+    f.store.candles = async (query, priority) => { const rows = await read(query, priority); if (!blocked) { blocked = true; started.resolve(); await hold.promise } return rows }
+    f.service.history.ensurePrices = async (id: string, timeframe: string, from: number, through: number) => {
+      requests.push(through)
+      await f.service.persistCandles(id, [{ ...rawCandle(through), quoteVolume: 400_000 }], { projectList: false })
+      return { rows: await read({ instrument: id, timeframe, from, through }) }
+    }
+    const pending = f.service.repairRequiredSource(recovery)
+    await started.promise
+    now += fiveMinutes
+    hold.resolve(); await pending
+    assert.deepEqual(requests, [oldEnd])
+    const observation = f.service.observations.get(instId).turnover
+    assert.equal(observation.value.asOf, oldEnd + fiveMinutes)
+    assert.equal(observation.value.turnover, 57_800_000)
+    assert.equal(observation.expiresAt, oldEnd + 2 * fiveMinutes)
+    assert.equal(f.service.error, '')
+  } finally { hold.resolve(); await f.close() }
+})
+
+test('a failed newer historical source read cannot renew the aggregate calculated from its earlier complete window', async () => {
+  const configuration = disabled(); configuration.liquidity.volume24h.enabled = true
+  const f = await fixture(configuration), hold = deferred(), started = deferred()
+  try {
+    const recovery = turnoverRecovery(f.service), asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes, latest = asOf - fiveMinutes
+    await f.store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 200_000 })))
+    const read = f.store.candles.bind(f.store)
+    let blocked = false
+    f.store.candles = async (query, priority) => { const rows = await read(query, priority); if (!blocked) { blocked = true; started.resolve(); await hold.promise } return rows }
+    f.service.history.ensurePrices = async (_id: string, timeframe: string, from: number, through: number) => ({ rows: await read({ instrument: instId, timeframe, from, through }) })
+    const pending = f.service.repairRequiredSource(recovery)
+    await started.promise
+    await f.service.persistCandles(instId, [{ ...rawCandle(latest), quoteVolume: null }], { projectList: false })
+    hold.resolve(); await pending
+    assert.equal(f.service.observations.get(instId).turnover, undefined, 'A stale previous aggregate cannot certify the newly incomplete source window.')
+    assert.match(f.service.error, /incomplete/i)
+  } finally { hold.resolve(); await f.close() }
+})

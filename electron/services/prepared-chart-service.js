@@ -69,6 +69,15 @@ export class PreparedChartPipeline {
     this.workers = []; this.calculations = new Map(); this.calculationQueue = []
     this.workerLimit = Math.max(1, Math.min(8, availableParallelism() - 2))
     this.sourceAttempts = new Map()
+    this.priceJournal = new Map()
+    this.unsubscribeStore = store.subscribe?.(change => {
+      const key = seriesKey(change.instrument, change.timeframe)
+      if (!this.series.has(key) || change.priceFrom === null || !Number.isSafeInteger(change.priceRevision)) return
+      const journal = this.priceJournal.get(key) ?? []
+      journal.push({ revision: change.priceRevision, from: change.priceFrom })
+      if (journal.length > 256) journal.shift()
+      this.priceJournal.set(key, journal)
+    })
     this.closed = false; this.focusKey = null; this.requestedIDs = new Set(); this.refreshTimer = null
   }
 
@@ -126,7 +135,7 @@ export class PreparedChartPipeline {
     for (const [key, state] of this.series) {
       if (this.series.size <= this.maxSeries && bytes <= this.maxBytes) break
       if (state.active || key === this.focusKey) continue
-      this.series.delete(key); bytes -= state.byteSize ?? 0
+      this.series.delete(key); this.priceJournal.delete(key); bytes -= state.byteSize ?? 0
     }
     for (const [key] of this.snapshots) if (!this.universe.has(key) && !this.series.has(key)) this.snapshots.delete(key)
     const snapshotBytes = value => {
@@ -251,13 +260,7 @@ export class PreparedChartPipeline {
     if (oiChanged) state.oiVersion = (state.oiVersion ?? 0) + 1
     if (takerChanged) state.takerVersion = (state.takerVersion ?? 0) + 1
     if (pricesChanged) this.invalidateDerived(state, changedFrom)
-    const sorted = [...state.rows.keys()].sort((a, b) => a - b)
-    const anchor = state.historyEnd ?? sorted.at(-1)
-    if (sorted.length > HISTORY) {
-      const retain = sorted.toSorted((a, b) => Math.abs(a - anchor) - Math.abs(b - anchor)).slice(0, HISTORY)
-      const keep = new Set(retain)
-      for (const hour of sorted) if (!keep.has(hour)) { state.rows.delete(hour); state.indicators.delete(hour) }
-    }
+    this.retainRows(state, HISTORY)
     const coverage = await this.store.coverage(state.instId, state.timeframe, priority)
     state.latestHour = coverage.last === null ? state.latestHour : Math.max(state.latestHour ?? -Infinity, coverage.last)
     const listing = Number(this.instrument(state.instId)?.listTime)
@@ -267,6 +270,15 @@ export class PreparedChartPipeline {
     const live = this.liveStates.get(state.key)
     if (live?.live) { state.live = live.live; state.observedAt = live.observedAt }
     this.syncLive(state)
+  }
+
+  retainRows(state, limit) {
+    if (state.rows.size <= limit) return
+    // The resident reserve belongs to the current navigation cursor. Collector
+    // and archive batches cannot turn it into another copy of the latest tail.
+    const anchor = state.historyEnd ?? state.latestHour ?? Math.max(...state.rows.keys())
+    const keep = new Set([...state.rows.keys()].sort((a, b) => Math.abs(a - anchor) - Math.abs(b - anchor) || a - b).slice(0, limit))
+    for (const hour of state.rows.keys()) if (!keep.has(hour)) { state.rows.delete(hour); state.indicators.delete(hour) }
   }
 
   invalidateDerived(state, from) {
@@ -461,6 +473,15 @@ export class PreparedChartPipeline {
     this.publish(state)
   }
 
+  unchangedPrefix(state, before, after, end) {
+    const first = /^sqlite:(\d+):(\d+)$/.exec(before), last = /^sqlite:(\d+):(\d+)$/.exec(after)
+    if (!first || !last || first[1] !== last[1]) return false
+    const from = Number(first[2]), through = Number(last[2])
+    if (!Number.isSafeInteger(from) || !Number.isSafeInteger(through) || through <= from || through - from > 256) return false
+    const changes = (this.priceJournal.get(state.key) ?? []).filter(change => change.revision > from && change.revision <= through)
+    return changes.length === through - from && changes.every((change, index) => change.revision === from + index + 1 && change.from > end)
+  }
+
   seed(state, priority = 'background') {
     if (this.closed || !state.rows.size && !this.liveStates.get(state.key)?.rows.size) return Promise.resolve()
     if (state.calculation) return state.calculation
@@ -482,27 +503,42 @@ export class PreparedChartPipeline {
       while (!this.closed) {
         const demand = needed()
         if (!demand.length) break
-        const first = demand[0], end = demand.at(-1), version = state.priceVersion, generation = state.generation
+        const first = demand[0], end = demand.at(-1)
+        let version = state.priceVersion, generation = state.generation
         const watermark = () => this.store.priceWatermark?.(state.instId, state.timeframe, priority) ?? this.store.candleWatermark(state.instId, state.timeframe, priority)
         // Fence the checkpoint lookup as well as the candle chunks. A correction
         // cannot pair an old recursive seed with a newer durable source revision.
-        const sourceRevision = await watermark()
+        let sourceRevision = await watermark()
+        const currentBasis = async () => {
+          const current = await watermark()
+          if (sourceRevision === current && version === state.priceVersion && generation === state.generation) return true
+          // Only a complete durable mutation journal can prove that later facts
+          // leave this recursive prefix unchanged. Missing/racing events retain
+          // the strict fence used for checkpoint and source correctness.
+          if (this.unchangedPrefix(state, sourceRevision, current, end)) {
+            sourceRevision = current; version = state.priceVersion; generation = state.generation
+            return true
+          }
+          restart = true
+          if (version === state.priceVersion && generation === state.generation) await this.refreshChangedCanonical(state, version)
+          return false
+        }
         const checkpoint = await this.store.readIndicatorCheckpoint?.({ instrument: state.instId, timeframe: state.timeframe, before: first - state.intervalMS, formulaVersion: FORMULA_VERSION }, priority)
-        if (version !== state.priceVersion || generation !== state.generation) { restart = true; return }
-        if (sourceRevision !== await watermark()) { await this.refreshChangedCanonical(state, version); restart = true; return }
+        if (!await currentBasis()) return
         let calculated = checkpoint?.state ?? null, cursor = checkpoint ? checkpoint.timestamp + state.intervalMS : 0, progressed = false
         while (!this.closed && cursor <= end) {
           const rows = await this.store.candles({ instrument: state.instId, timeframe: state.timeframe, from: cursor, through: end, limit: CHUNK, order: 'asc' }, priority)
           if (!rows.length) break
           const result = await this.calculate(rows, state.intervalMS, state.key === this.focusKey ? 'foreground' : priority, calculated)
-          if (version !== state.priceVersion || generation !== state.generation) { restart = true; return }
-          if (sourceRevision !== await watermark()) { await this.refreshChangedCanonical(state, version); restart = true; return }
+          if (!await currentBasis()) return
           if (this.reconcileCanonical(state, rows)) { restart = true; return }
           calculated = result.state
-          const saved = await this.store.writeIndicatorCheckpoint?.({ instrument: state.instId, timeframe: state.timeframe, timestamp: calculated.lastTimestamp, formulaVersion: FORMULA_VERSION, state: calculated, sourceRevision, bollExpansion: calculated.bollExpansion }, priority)
-          if (saved === false) { await this.refreshChangedCanonical(state, version); restart = true; return }
-          if (version !== state.priceVersion || generation !== state.generation) { restart = true; return }
-          if (sourceRevision !== await watermark()) { await this.refreshChangedCanonical(state, version); restart = true; return }
+          const save = () => this.store.writeIndicatorCheckpoint?.({ instrument: state.instId, timeframe: state.timeframe, timestamp: calculated.lastTimestamp, formulaVersion: FORMULA_VERSION, state: calculated, sourceRevision, bollExpansion: calculated.bollExpansion }, priority)
+          if (await save() === false) {
+            if (!await currentBasis()) return
+            if (await save() === false) { await this.refreshChangedCanonical(state, version); restart = true; return }
+          }
+          if (!await currentBasis()) return
           let changed = false
           for (const value of result.bars) for (const current of [state, live]) if (current.rows.has(value.hour)) {
             current.indicators.set(value.hour, value); changed = true; progressed = true
@@ -570,7 +606,7 @@ export class PreparedChartPipeline {
           if (current.live?.timestamp <= row.timestamp) current.live = null
         }
         const rowLimit = current === live ? TAIL : HISTORY
-        if (current.rows.size > rowLimit) for (const hour of [...current.rows.keys()].sort((a, b) => a - b).slice(0, current.rows.size - rowLimit)) { current.rows.delete(hour); current.indicators.delete(hour) }
+        this.retainRows(current, rowLimit)
         this.updateMemory(current)
       }
       if (changedFrom < Infinity) this.invalidateDerived(state ?? live, changedFrom)
@@ -671,6 +707,7 @@ export class PreparedChartPipeline {
 
   async dispose() {
     this.closed = true
+    this.unsubscribeStore?.(); this.priceJournal.clear()
     if (this.refreshTimer !== null) clearTimeout(this.refreshTimer)
     for (const pending of this.calculations.values()) pending.reject(new Error('Prepared chart data service is closed.'))
     this.calculations.clear(); this.calculationQueue = []

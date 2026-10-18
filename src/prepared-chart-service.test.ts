@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { PreparedChartPipeline } from '../electron/services/prepared-chart-service.js'
+import { MarketStore } from '../electron/services/market-store.js'
 import { buildIndicatorSeries } from '../electron/services/indicators.js'
 
 const interval = 900_000, instId = 'BTC-USDT-SWAP'
@@ -48,6 +52,12 @@ const fixture = (rows = source(400), history: any = {}) => {
 }
 const finishSeed = async (pipeline: any) => { while (pipeline.liveSeeds.size) await Promise.all([...pipeline.liveSeeds.values()]) }
 const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24']
+const sqliteFixture = async (rows: any[]) => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-prefix-fence-')), store = await MarketStore.open(root)
+  await store.appendCandles(rows)
+  const pipeline: any = new PreparedChartPipeline({ store, history: {} as any, normalize: (row: any) => row, revision: () => 0, instrument: () => undefined })
+  return { store, pipeline, async close() { await pipeline.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) } }
+}
 
 test('fresh OHLC and forming price publish while both statistic requests are held', async () => {
   const hold = deferred(), rows = source(400).map(row => ({ ...row, oi: null, buy: null, sell: null, statisticsVersion: null }))
@@ -538,4 +548,149 @@ test('an upgrade ignores poisoned v3 checkpoints even when they carry the curren
     assert.ok(store.checkpoints.some(value => value.formulaVersion.endsWith('-v4')))
     assert.deepEqual(store.rows, rows, 'Only derived checkpoints are replaced; canonical market records remain unchanged.')
   } finally { await pipeline.dispose() }
+})
+
+test('new archive pages after an open historical viewport cannot evict its prices, statistics or unaffected exact indicators', async () => {
+  const all = source(5000), { pipeline, store } = fixture(all.filter((_, index) => index < 2100 || index >= 4000))
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const target = all[1800].timestamp
+    await pipeline.localHistory(instId, '15m', target); await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`), first = target - 95 * interval
+    const original = new Map([...state.indicators].filter(([hour]: any) => hour >= first && hour <= target))
+    assert.equal(original.size, 96)
+    for (let offset = 2100; offset < 3600; offset += 300) {
+      const page = all.slice(offset, offset + 300), prior = new Map()
+      for (const row of page) for (const [hour, value] of store.change(row)) prior.set(hour, value)
+      pipeline.observe(page, prior)
+      const visible = pipeline.historyFrame(state, target).bars.filter((value: any) => value.hour >= first && value.hour <= target)
+      assert.equal(visible.length, 96, 'A later downloaded page must not evict the selected historical bars.')
+      assert.equal(visible.every((value: any) => value.indicatorsObserved && value.oi === 5000 && value.buy === 70 && value.sell === 30), true)
+      for (const [hour, value] of original) assert.equal(state.indicators.get(hour), value, 'Inputs after this historical prefix cannot invalidate its derived observations.')
+      assert.ok(state.rows.size <= 1536)
+      assert.ok(pipeline.liveStates.get(state.key).rows.size <= 128)
+    }
+    await finishSeed(pipeline)
+  } finally { await pipeline.dispose() }
+})
+
+test('newly downloaded older prefixes invalidate recursive descendants without discarding independent statistic facts', async () => {
+  const all = source(1100), { pipeline, store } = fixture(all.slice(600)), target = all[1000].timestamp
+  try {
+    await pipeline.localHistory(instId, '15m', target); await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`)
+    for (const page of [all.slice(300, 600), all.slice(0, 300)]) {
+      const generation = state.generation, prior = new Map()
+      for (const row of page) for (const [hour, value] of store.change(row)) prior.set(hour, value)
+      pipeline.observe(page, prior)
+      assert.ok(state.generation > generation, 'Extending the canonical recursive prefix requires a new exact basis.')
+      const pending = pipeline.historyFrame(state, target).bars.filter((value: any) => value.hour >= target - 95 * interval && value.hour <= target)
+      assert.equal(pending.length, 96)
+      assert.equal(pending.every((value: any) => value.oiObserved && value.takerObserved && value.oi === 5000 && value.buy === 70 && value.sell === 30), true)
+      await finishSeed(pipeline)
+      const oracle = new Map(buildIndicatorSeries(store.rows, interval).bars.map((value: any) => [value.hour, value]))
+      const actual = pipeline.historyFrame(state, target).bars.filter((value: any) => value.hour >= target - 95 * interval && value.hour <= target)
+      for (const value of actual) for (const key of indicatorFields) assert.equal(value[key], (oracle.get(value.hour) as any)[key])
+    }
+  } finally { await pipeline.dispose() }
+})
+
+test('durable later-price changes do not restart an unaffected historical replay or clear its already prepared prefix', async () => {
+  const rows = source(3500), f = await sqliteFixture(rows), { pipeline, store } = f, hold = deferred(), started = deferred()
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const target = rows[1800].timestamp, calculate = pipeline.calculate.bind(pipeline), inputs: string[] = []
+    let blocked = false, reloads = 0
+    const reload = pipeline.refreshChangedCanonical.bind(pipeline)
+    pipeline.refreshChangedCanonical = (...args: any[]) => { reloads += 1; return reload(...args) }
+    pipeline.calculate = async (input: any[], ...args: any[]) => {
+      inputs.push(`${input[0].timestamp}:${input.at(-1).timestamp}`)
+      if (!blocked) { blocked = true; started.resolve(); await hold.promise }
+      return calculate(input, ...args)
+    }
+    await pipeline.localHistory(instId, '15m', target)
+    await started.promise
+    const corrected = { ...rows[3400], close: rows[3400].close + .5 }
+    await store.appendCandles([corrected])
+    pipeline.observe([corrected], new Map([[corrected.timestamp, rows[3400]]]))
+    const later = { ...rows[3401], close: rows[3401].close + .5 }, write = store.writeIndicatorCheckpoint.bind(store)
+    let guardChanged = false
+    store.writeIndicatorCheckpoint = async (value: any, priority?: any) => {
+      if (!guardChanged && value.timestamp === target) {
+        guardChanged = true
+        await store.appendCandles([later])
+        pipeline.observe([later], new Map([[later.timestamp, rows[3401]]]))
+      }
+      return write(value, priority)
+    }
+    hold.resolve(); await finishSeed(pipeline)
+    assert.equal(guardChanged, true, 'A second later mutation must also race the checkpoint guard.')
+    assert.equal(reloads, 0, 'A contiguous durable journal proves that this historical recursive prefix did not change.')
+    assert.equal(inputs.filter(value => value.endsWith(`:${target}`)).length, 1, 'The completed historical calculation must be reused across an unrelated later mutation.')
+    const oracleRows = rows.map(row => row.timestamp === corrected.timestamp ? corrected : row.timestamp === later.timestamp ? later : row)
+    const oracle = new Map(buildIndicatorSeries(oracleRows, interval).bars.map((value: any) => [value.hour, value]))
+    const state = pipeline.series.get(`${instId}:15m`)
+    for (const value of pipeline.historyFrame(state, target).bars) if (value.indicatorsObserved) for (const key of indicatorFields) assert.equal(value[key], (oracle.get(value.hour) as any)[key])
+    for (let index = 0; index < 260; index += 1) await store.appendCandles([{ ...corrected, baseVolume: 200 + index }])
+    assert.equal(pipeline.priceJournal.get(state.key).length, 256)
+    pipeline.maxSeries = 1
+    await store.appendCandles([{ ...rows.at(-1)!, instrument: 'ETH-USDT-SWAP' }])
+    await pipeline.local('ETH-USDT-SWAP', '15m'); await finishSeed(pipeline)
+    assert.equal(pipeline.priceJournal.has(state.key), false, 'Evicting the resident reserve also releases its bounded mutation journal.')
+  } finally { hold.resolve(); await f.close() }
+})
+
+test('a durable prefix correction with a late observer retains the strict fence and cannot certify stale recursive state', async () => {
+  const rows = source(3500), f = await sqliteFixture(rows), { pipeline, store } = f, hold = deferred(), started = deferred()
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const target = rows[1800].timestamp, calculate = pipeline.calculate.bind(pipeline)
+    let blocked = false, reloads = 0
+    const reload = pipeline.refreshChangedCanonical.bind(pipeline)
+    pipeline.refreshChangedCanonical = (...args: any[]) => { reloads += 1; return reload(...args) }
+    pipeline.calculate = async (input: any[], ...args: any[]) => {
+      if (!blocked) { blocked = true; started.resolve(); await hold.promise }
+      return calculate(input, ...args)
+    }
+    await pipeline.localHistory(instId, '15m', target)
+    await started.promise
+    const corrected = { ...rows[1000], close: rows[1000].close + .5, baseVolume: 500 }
+    await store.appendCandles([corrected]) // Deliberately withhold pipeline.observe.
+    hold.resolve(); await finishSeed(pipeline)
+    assert.ok(reloads > 0, 'A dependency mutation cannot be rebased merely because its observer is late.')
+    const oracle = new Map(buildIndicatorSeries(rows.map(row => row.timestamp === corrected.timestamp ? corrected : row), interval).bars.map((value: any) => [value.hour, value]))
+    const actual = pipeline.historyFrame(pipeline.series.get(`${instId}:15m`), target).bars
+    for (const value of actual) if (value.indicatorsObserved) for (const key of indicatorFields) assert.equal(value[key], (oracle.get(value.hour) as any)[key])
+    assert.equal(actual.filter((value: any) => value.hour >= target - 95 * interval && value.hour <= target && value.indicatorsObserved).length, 96)
+    const checkpoint = await store.readIndicatorCheckpoint({ instrument: instId, timeframe: '15m', before: target,
+      formulaVersion: 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v4' })
+    assert.ok(checkpoint)
+    assert.equal(checkpoint.state.ema, (oracle.get(checkpoint.timestamp) as any).ema)
+  } finally { hold.resolve(); await f.close() }
+})
+
+test('a missing durable mutation event cannot authorize rebasing even a later-price change', async () => {
+  const rows = source(3500), f = await sqliteFixture(rows), { pipeline, store } = f, hold = deferred(), started = deferred()
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const target = rows[1800].timestamp, calculate = pipeline.calculate.bind(pipeline)
+    let blocked = false, reloads = 0
+    const reload = pipeline.refreshChangedCanonical.bind(pipeline)
+    pipeline.refreshChangedCanonical = (...args: any[]) => { reloads += 1; return reload(...args) }
+    pipeline.calculate = async (input: any[], ...args: any[]) => {
+      if (!blocked) { blocked = true; started.resolve(); await hold.promise }
+      return calculate(input, ...args)
+    }
+    await pipeline.localHistory(instId, '15m', target)
+    await started.promise
+    pipeline.unsubscribeStore()
+    const corrected = { ...rows[3400], close: rows[3400].close + .5 }
+    await store.appendCandles([corrected])
+    hold.resolve(); await finishSeed(pipeline)
+    assert.ok(reloads > 0, 'A durable watermark alone provides no dependency-range proof.')
+    const oracle = new Map(buildIndicatorSeries(rows.map(row => row.timestamp === corrected.timestamp ? corrected : row), interval).bars.map((value: any) => [value.hour, value]))
+    for (const value of pipeline.historyFrame(pipeline.series.get(`${instId}:15m`), target).bars) if (value.indicatorsObserved) {
+      for (const key of indicatorFields) assert.equal(value[key], (oracle.get(value.hour) as any)[key])
+    }
+  } finally { hold.resolve(); await f.close() }
 })

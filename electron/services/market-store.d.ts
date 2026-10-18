@@ -42,7 +42,7 @@ export class MarketStore {
   root: string
   path: string
   workerThreadIds: { writer: number; readers: number[] }
-  subscribe(listener: (change: { instrument: string; timeframe: string; from: number; through: number; priceFrom: number | null; priceThrough: number | null; revision: number; imported: boolean }) => void): () => void
+  subscribe(listener: (change: { instrument: string; timeframe: string; from: number; through: number; priceFrom: number | null; priceThrough: number | null; revision: number; priceRevision: number; imported: boolean }) => void): () => void
   appendCandles(candles: CandleRecord[], priority?: StorePriority): Promise<number>
   appendStatistics(page: StatisticsPage, priority?: StorePriority): Promise<number>
   statistics(query: CandleQuery & { source?: 'oi' | 'taker' }, priority?: StorePriority): Promise<StatisticsRecord[]>
