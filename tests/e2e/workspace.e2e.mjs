@@ -117,6 +117,19 @@ afterEach(async context => {
 after(async () => { await electron?.close(); await rm(userData, { recursive: true, force: true }) })
 
 const selected = () => page.locator('[data-market-index][aria-selected="true"]')
+const emaCandleTarget = async (slot, fixture) => {
+  const target = await page.locator('svg[data-rendered-inst]').evaluate((svg, { slot, intervalMS }) => {
+    const commands = svg.querySelector('[data-chart-indicator="ema"]').getAttribute('d').match(/[ML][^ML]+/g)
+    if (commands.length !== 97) throw new Error('The fixture must draw 96 EMA samples and their leading left-edge extension.')
+    const x = Number.parseFloat(commands[slot + 1].slice(1))
+    const rect = svg.getBoundingClientRect()
+    return { x: rect.x + x / svg.viewBox.baseVal.width * rect.width, y: rect.y + rect.height * .1,
+      hour: Number(svg.dataset.renderedStart) + slot * intervalMS }
+  }, { slot, intervalMS: fixture.intervalMS })
+  const expected = [...fixture.bars, ...(fixture.liveBar ? [fixture.liveBar] : [])].find(bar => bar.hour === target.hour)
+  assert.ok(expected, 'The drawn candle must have an independent desktop-fixture observation.')
+  return { ...target, close: expected.close }
+}
 const clickByRect = async locator => {
   await locator.scrollIntoViewIfNeeded()
   const bounds = await locator.boundingBox()
@@ -178,6 +191,45 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   assert.match(await chart.locator('[data-chart-price-label-value]').textContent(), /^135 /)
   assert.equal(await page.evaluate(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot.bars === globalThis.__completedSubscriptionBars), true)
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Live-only subscriptions must reuse the completed frame without a follow-up read.')
+})
+
+test('pointer inspection selects the drawn first, middle, and latest candle before and after a forming candle shifts the window', async () => {
+  await selectTimeframe(page, '15m')
+  const publish = forming => electron.evaluate(async ({ ipcMain, BrowserWindow }, forming) => {
+    const state = globalThis.__workspaceFixture
+    state.chartGeneration += 1
+    const frame = await ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
+    if (forming) frame.liveBar = { ...frame.bars.at(-1), hour: frame.endHour + frame.intervalMS,
+      open: 133, high: 138, low: 132, close: 137, confirmed: false, statisticsObserved: false, oi: null, buy: null, sell: null }
+    BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
+    return frame
+  }, forming)
+  const waitForFrame = frame => page.waitForFunction(({ generation, end }) => {
+    const chart = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')
+    return chart?.__chartSnapshot.generation === generation && Number(chart.dataset.chartEnd) === end
+  }, { generation: frame.generation, end: frame.liveBar?.hour ?? frame.endHour })
+  try {
+    for (const forming of [false, true]) {
+      const frame = await publish(forming)
+      await waitForFrame(frame)
+      for (const slot of [0, 24, 95]) {
+        const target = await emaCandleTarget(slot, frame)
+        const fixtureIndex = slot + Number(forming)
+        assert.equal(target.hour, frame.bars[0].hour + fixtureIndex * frame.intervalMS)
+        assert.equal(target.close, fixtureIndex === 96 ? 137 : 100 + fixtureIndex * .01)
+        await page.mouse.move(target.x, target.y)
+        await page.mouse.down()
+        await page.waitForFunction(() => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
+        const close = await page.locator('[data-chart-inst] [aria-live="off"] > div:last-child span[title]').getAttribute('title')
+        assert.equal(Number(close), target.close, `${forming ? 'The forming' : 'The completed-only'} window must inspect its drawn candle at slot ${slot}.`)
+        await page.mouse.up()
+        await page.waitForFunction(() => !document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
+      }
+    }
+  } finally {
+    await page.mouse.up()
+    await waitForFrame(await publish(false))
+  }
 })
 
 test('a healthy idle market list makes no periodic snapshot requests', async () => {
@@ -318,22 +370,18 @@ test('market notifications wait while hidden and refresh immediately when the wo
 test('search preserves selection while six width/DPR combinations share portal, pointer, and capture coordinates', async () => {
   const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }))
   const client = await page.context().newCDPSession(page)
+  const fixture = await electron.evaluate(({ ipcMain }) => ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } }))
   try {
     for (const deviceScaleFactor of [1, 2]) for (const width of [1_200, 1_600, 2_000]) {
       await client.send('Emulation.setDeviceMetricsOverride', { width, height: 1_000, deviceScaleFactor, mobile: false })
       await page.waitForFunction(({ width, deviceScaleFactor }) => innerWidth === width && devicePixelRatio === deviceScaleFactor && Number(document.querySelector('[data-layout="market-workspace"]')?.dataset.uiScale) === width / 1_600, { width, deviceScaleFactor })
       await assertWorkspaceLayout(page)
-      const target = await page.locator('svg[data-rendered-inst]').evaluate(svg => {
-        const commands = svg.querySelector('[data-chart-indicator="ema"]').getAttribute('d').match(/[ML][^ML]+/g)
-        const x = Number.parseFloat(commands[25].slice(1)) // Actual candle 25, after the leading left-edge extension.
-        const rect = svg.getBoundingClientRect()
-        return { x: rect.x + x / svg.viewBox.baseVal.width * rect.width, y: rect.y + rect.height * .1 }
-      })
+      const target = await emaCandleTarget(24, fixture)
       await page.mouse.move(target.x, target.y)
       await page.mouse.down()
       await page.waitForFunction(() => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
       const hoveredClose = await page.locator('[data-chart-inst] [aria-live="off"] > div:last-child span[title]').getAttribute('title')
-      assert.equal(hoveredClose, '100.24', 'Screen-space pointer input must inspect the candle drawn beneath it at every UI scale and DPR.')
+      assert.equal(Number(hoveredClose), target.close, 'Screen-space pointer input must inspect the candle drawn beneath it at every UI scale and DPR.')
       await page.mouse.up()
       await page.waitForFunction(() => !document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
       const captureBounds = await page.locator('[data-chart-inst]').boundingBox()

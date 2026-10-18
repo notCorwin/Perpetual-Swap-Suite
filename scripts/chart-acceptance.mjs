@@ -1,5 +1,65 @@
 import assert from 'node:assert/strict'
 
+// A foreground paint budget requires a native foreground window. A hidden
+// BrowserWindow can still report document.visibilityState === 'visible' while
+// macOS schedules its animation frames at an occluded-window cadence.
+export async function foregroundPaintWindow(electron, page) {
+  const previous = await electron.evaluate(({ BrowserWindow, app }) => {
+    const window = BrowserWindow.getAllWindows()[0]
+    const state = { id: window.id, visible: window.isVisible(), focused: window.isFocused(), minimized: window.isMinimized() }
+    if (state.minimized) window.restore()
+    window.show()
+    app.focus({ steal: true })
+    window.focus()
+    return state
+  })
+  const restore = () => electron.evaluate(({ BrowserWindow }, previous) => {
+    const window = BrowserWindow.fromId(previous.id)
+    if (previous.minimized) window.minimize()
+    else if (!previous.visible) window.hide()
+    else if (!previous.focused) window.blur()
+  }, previous)
+  try {
+    await page.waitForFunction(() => document.visibilityState === 'visible' && document.hasFocus(), null, { timeout: 5_000 })
+    const native = await electron.evaluate(({ BrowserWindow }, id) => {
+      const window = BrowserWindow.fromId(id)
+      return { visible: window.isVisible(), focused: window.isFocused(), minimized: window.isMinimized() }
+    }, previous.id)
+    assert.deepEqual(native, { visible: true, focused: true, minimized: false }, 'Paint latency requires a visible, focused native window.')
+    const environment = await electron.evaluate(async ({ app, screen, BrowserWindow }, id) => {
+      const window = BrowserWindow.fromId(id), display = screen.getDisplayMatching(window.getBounds())
+      const gpuInfo = await app.getGPUInfo('basic')
+      return { electron: process.versions.electron, chromium: process.versions.chrome, arch: process.arch,
+        headless: app.commandLine.hasSwitch('headless'), disableGPU: app.commandLine.hasSwitch('disable-gpu'),
+        hardwareAcceleration: app.isHardwareAccelerationEnabled(), gpuFeatureStatus: app.getGPUFeatureStatus(), gpuDevices: gpuInfo.gpuDevice,
+        backgroundThrottling: window.webContents.getBackgroundThrottling(), offscreen: window.webContents.isOffscreen(),
+        display: { frequency: display.displayFrequency, scaleFactor: display.scaleFactor, size: display.size } }
+    }, previous.id)
+    assert.equal(environment.headless, false, 'Foreground paint must use the normal Electron compositor.')
+    assert.equal(environment.disableGPU, false, 'Foreground paint must use the production GPU configuration.')
+    const idleFrameCadence = await page.evaluate(() => new Promise((resolve, reject) => {
+      const startedAt = performance.now(), gaps = []
+      let previous = null, raf
+      const deadline = setTimeout(() => { cancelAnimationFrame(raf); reject(new Error('Foreground animation frames did not advance within 5 seconds.')) }, 5000)
+      const frame = timestamp => {
+        if (previous !== null) gaps.push(timestamp - previous)
+        previous = timestamp
+        if (timestamp - startedAt < 1000) { raf = requestAnimationFrame(frame); return }
+        clearTimeout(deadline)
+        gaps.sort((left, right) => left - right)
+        resolve({ phase: 'before scenario setup', frames: gaps.length, durationMS: timestamp - startedAt,
+          medianMS: gaps[Math.floor((gaps.length - 1) * .5)] ?? null,
+          p95MS: gaps[Math.floor((gaps.length - 1) * .95)] ?? null, maxMS: gaps.at(-1) ?? null })
+      }
+      raf = requestAnimationFrame(frame)
+    }))
+    return { previous, native, environment, idleFrameCadence, restore }
+  } catch (error) {
+    await restore()
+    throw error
+  }
+}
+
 export async function selectTimeframe(page, timeframe) {
   const button = page.locator('[aria-label="Chart timeframe"] button')
     .filter({ hasText: new RegExp(`^${timeframe}$`, 'i') })
@@ -61,19 +121,40 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
     if (!(chart instanceof HTMLElement)) throw new Error('No chart surface to inspect.')
     const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell']
     const indicatorFields = fields.slice(4, 14), statisticFields = ['oi', 'buy', 'sell']
+    const curveFields = [...indicatorFields, 'oi'], expectedGeometry = new WeakMap()
     const oracles = Object.fromEntries(Object.entries(series).map(([frame, entry]) => [frame, new Map(entry.bars.map(bar => [bar.hour, bar]))]))
     const probe = {
       active: true, frames: 0, pendingFrames: 0, paints: 0, minimumBars: Infinity, errors: [],
-      frameGaps: [], commits: [], previousFrame: null, previousSnapshot: null,
+      frameGaps: [], frameSamples: [], validationSamples: [], inputBursts: [], commits: [], previousFrame: null, previousSnapshot: null, previousBars: null,
       phase: 'initial', quality: [], known: new Map(), geometry: new Map(),
-      raf: null, observer: null,
+      raf: null, observer: null, schedulerObservers: [],
+      scheduler: { counts: {}, entries: [], supportedEntryTypes: PerformanceObserver.supportedEntryTypes },
+    }
+    for (const type of ['longtask', 'long-animation-frame']) if (probe.scheduler.supportedEntryTypes.includes(type)) {
+      const record = entries => {
+        for (const entry of entries) {
+          probe.scheduler.counts[type] = (probe.scheduler.counts[type] ?? 0) + 1
+          probe.scheduler.entries.push({ type, startTime: entry.startTime, duration: entry.duration,
+            blockingDuration: entry.blockingDuration, renderStart: entry.renderStart, styleAndLayoutStart: entry.styleAndLayoutStart,
+            scripts: [...(entry.scripts ?? [])].slice(0, 5).map(script => ({ sourceURL: script.sourceURL, invoker: script.invoker,
+              invokerType: script.invokerType, duration: script.duration, forcedStyleAndLayoutDuration: script.forcedStyleAndLayoutDuration })) })
+        }
+        probe.scheduler.entries = probe.scheduler.entries.slice(-50)
+      }
+      const observer = new PerformanceObserver(list => record(list.getEntries()))
+      observer.observe({ type })
+      probe.schedulerObservers.push({ observer, record })
     }
     const fail = message => { if (probe.errors.length < 20) probe.errors.push(message) }
-    const sample = (frame = false, timestamp = performance.now()) => {
+    const validateSample = (frame, timestamp, sampledAt) => {
       if (frame) {
         probe.frames += 1
         if (chart.dataset.chartLoading === 'true') probe.pendingFrames += 1
-        if (probe.previousFrame !== null) probe.frameGaps.push(timestamp - probe.previousFrame)
+        if (probe.previousFrame !== null) {
+          const gapMS = timestamp - probe.previousFrame
+          probe.frameGaps.push(gapMS)
+          probe.frameSamples.push({ at: sampledAt, gapMS })
+        }
         probe.previousFrame = timestamp
       }
       const snapshot = chart.__chartSnapshot
@@ -90,16 +171,25 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       // Plot geometry may change without a new snapshot (for example during
       // an effect). Check actual paths before the immutable-snapshot shortcut.
       if (Array.isArray(bars)) {
-        const firstAtLeft = bars[0]?.hour === bars.at(-1)?.hour - 95 * snapshot.intervalMS
-        for (const field of [...indicatorFields, 'oi']) {
-          const samples = bars.filter(bar => typeof bar[field] === 'number' && Number.isFinite(bar[field])).length
+        let expected = expectedGeometry.get(bars)
+        if (!expected || expected.intervalMS !== snapshot.intervalMS) {
+          const firstAtLeft = bars[0]?.hour === bars.at(-1)?.hour - 95 * snapshot.intervalMS
+          expected = { intervalMS: snapshot.intervalMS, curves: new Map(curveFields.map(field => {
+            const samples = bars.filter(bar => typeof bar[field] === 'number' && Number.isFinite(bar[field])).length
+            return [field, { samples, points: samples + (firstAtLeft && Number.isFinite(bars[0]?.[field]) ? 1 : 0) }]
+          })) }
+          expectedGeometry.set(bars, expected)
+        }
+        for (const field of curveFields) {
           const path = svg.querySelector(`[data-chart-indicator="${field}"]`), d = path?.getAttribute('d') ?? ''
+          const previous = probe.geometry.get(field)
+          if (previous?.d === d && previous.expected === expected) continue
+          probe.geometry.set(field, { d, expected })
+          const { samples, points: expectedPoints } = expected.curves.get(field)
           if (samples > 1 && !d) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} lost its ${field} SVG curve with ${samples} known samples.`)
-          if (probe.geometry.get(field) === d && snapshot === probe.previousSnapshot) continue
-          probe.geometry.set(field, d)
           const points = (d.match(/[ML]/g) ?? []).length
-          const expectedPoints = samples + (firstAtLeft && Number.isFinite(bars[0]?.[field]) ? 1 : 0)
           if (points !== expectedPoints) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${points} points for ${expectedPoints} known positions.`)
+          if (/NaN|Infinity|undefined/.test(d)) fail('Nonfinite SVG geometry.')
         }
         if (requireMatureData) {
           for (const field of indicatorFields) if (!svg.querySelector(`[data-chart-indicator="${field}"]`)?.getAttribute('d')) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} has no ${field} SVG curve for mature local history.`)
@@ -107,11 +197,12 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
           if (svg.querySelector('[data-chart-taker]')?.getAttribute('data-chart-taker') !== 'complete') fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} lost complete Taker geometry.`)
         }
       }
-      if (snapshot === probe.previousSnapshot) {
-        if (frame && probe.commits.at(-1)?.presentedAt === null) probe.commits.at(-1).presentedAt = performance.now()
+      if (snapshot === probe.previousSnapshot && bars === probe.previousBars) {
+        if (frame && probe.commits.at(-1)?.presentedAt === null) probe.commits.at(-1).presentedAt = sampledAt
         return
       }
       probe.previousSnapshot = snapshot
+      probe.previousBars = bars
       probe.paints += 1
       const intervalMS = series[timeframe]?.intervalMS
       if (!Array.isArray(bars)) { fail('The rendered snapshot has no bars.'); return }
@@ -119,7 +210,7 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       // A mutation is a React commit; the following animation frame is the
       // first paint opportunity that includes that committed SVG. Keep both
       // times so input latency does not mistake a DOM mutation for a frame.
-      probe.commits.push({ at: performance.now(), presentedAt: frame ? performance.now() : null, end: snapshot.endHour, timeframe, phase: probe.phase })
+      probe.commits.push({ at: sampledAt, presentedAt: frame ? sampledAt : null, end: snapshot.endHour, timeframe, phase: probe.phase })
       probe.quality.push({ phase: probe.phase, end: snapshot.endHour, timeframe, indicators: bars.filter(bar => indicatorFields.every(field => Number.isFinite(bar[field]))).length,
         oi: bars.filter(bar => Number.isFinite(bar.oi)).length, taker: bars.filter(bar => Number.isFinite(bar.buy) && Number.isFinite(bar.sell)).length })
       if (bars.length !== 96) fail(`Rendered ${bars.length} bars for ${timeframe}.`)
@@ -172,6 +263,11 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       if (Number(taker?.querySelector('[data-chart-taker-sell-samples]')?.getAttribute('data-chart-taker-sell-samples')) !== sellRectangles) fail('The actual Taker sell geometry does not cover the snapshot.')
       for (const path of svg.querySelectorAll('path[d]')) if (/NaN|Infinity|undefined/.test(path.getAttribute('d'))) fail('Nonfinite SVG geometry.')
     }
+    const sample = (frame = false, timestamp) => {
+      const sampledAt = performance.now()
+      try { validateSample(frame, timestamp ?? sampledAt, sampledAt) }
+      finally { probe.validationSamples.push({ at: sampledAt, durationMS: performance.now() - sampledAt }) }
+    }
     probe.observer = new MutationObserver(() => sample())
     probe.observer.observe(chart, { subtree: true, childList: true, attributes: true })
     const frame = timestamp => {
@@ -192,6 +288,7 @@ export async function finishPaintProbe(page) {
     probe.active = false
     cancelAnimationFrame(probe.raf)
     probe.observer.disconnect()
+    for (const { observer, record } of probe.schedulerObservers) { record(observer.takeRecords()); observer.disconnect() }
     delete window.__chartPaintProbe
     const percentile = (values, ratio) => {
       const sorted = [...values].sort((left, right) => left - right)
@@ -199,10 +296,14 @@ export async function finishPaintProbe(page) {
     }
     return {
       frames: probe.frames, pendingFrames: probe.pendingFrames, paints: probe.paints, minimumBars: probe.minimumBars,
-      violations: probe.errors, commits: probe.commits, quality: probe.quality,
+      violations: probe.errors, commits: probe.commits, quality: probe.quality, scheduler: probe.scheduler,
       p95FrameGapMS: Number(percentile(probe.frameGaps, .95).toFixed(3)),
       maxFrameGapMS: Number(Math.max(0, ...probe.frameGaps).toFixed(3)),
       droppedFrames: probe.frameGaps.filter(gap => gap > 25).length,
+      probeValidationSamples: probe.validationSamples.length,
+      totalProbeValidationMS: Number(probe.validationSamples.reduce((sum, sample) => sum + sample.durationMS, 0).toFixed(3)),
+      p95ProbeValidationMS: Number(percentile(probe.validationSamples.map(sample => sample.durationMS), .95).toFixed(3)),
+      maxProbeValidationMS: Number(Math.max(0, ...probe.validationSamples.map(sample => sample.durationMS)).toFixed(3)),
     }
   })
 }
@@ -221,10 +322,15 @@ export async function wheelBurst(page, { frames = 1, eventsPerFrame = 1, deltaY 
     const inputs = []
     for (let frame = 0; frame < options.frames; frame += 1) {
       await new Promise(resolve => requestAnimationFrame(resolve))
-      inputs.push(performance.now())
+      let firstAt, lastAt
       for (let event = 0; event < options.eventsPerFrame; event += 1) {
-        plot.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: options.deltaY, deltaX: options.deltaX, deltaMode: options.deltaMode }))
+        const input = new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: options.deltaY, deltaX: options.deltaX, deltaMode: options.deltaMode })
+        lastAt = performance.now()
+        firstAt ??= lastAt
+        plot.dispatchEvent(input)
       }
+      inputs.push(lastAt)
+      window.__chartPaintProbe?.inputBursts.push({ firstAt, lastAt, events: options.eventsPerFrame })
     }
     return inputs
   }, { frames, eventsPerFrame, deltaY, deltaX, deltaMode })
@@ -236,31 +342,71 @@ export async function measurePaintLatency(page, { inputs, targets }) {
   await page.waitForFunction(({ latestInput, expectedEnd }) => window.__chartPaintProbe?.commits.some(commit =>
     commit.end === expectedEnd && commit.at >= latestInput && commit.presentedAt !== null), { latestInput, expectedEnd })
   return page.evaluate(({ inputs, targets }) => {
-    const commits = window.__chartPaintProbe.commits
+    if (document.visibilityState !== 'visible' || !document.hasFocus()) throw new Error('Foreground paint latency lost its visible, focused window.')
+    const probe = window.__chartPaintProbe, commits = probe.commits
+    for (const { observer, record } of probe.schedulerObservers) record(observer.takeRecords())
     const matching = inputs.map((input, index) => commits.find(commit => commit.end === targets[index] && commit.at >= input && commit.presentedAt !== null))
     const latencies = matching.flatMap((commit, index) => commit ? [commit.presentedAt - inputs[index]] : []).sort((left, right) => left - right)
     const percentile = ratio => Number((latencies[Math.min(latencies.length - 1, Math.floor(latencies.length * ratio))] ?? 0).toFixed(3))
     const latest = matching.at(-1)
+    const bursts = inputs.map(input => probe.inputBursts.find(burst => burst.lastAt === input))
+    if (bursts.some(burst => !burst)) throw new Error('Every measured wheel burst must include its first and final input timestamps.')
+    const latestBurst = bursts.at(-1), startedAt = bursts[0].firstAt
+    const frameGaps = probe.frameSamples.filter(sample => sample.at >= startedAt && sample.at <= latest.presentedAt).map(sample => sample.gapMS)
+    const validation = probe.validationSamples.filter(sample => sample.at >= startedAt && sample.at <= latest.presentedAt).map(sample => sample.durationMS)
+    const percentileOf = (values, ratio) => {
+      const sorted = [...values].sort((left, right) => left - right)
+      return Number((sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * ratio))] ?? 0).toFixed(3))
+    }
     return {
+      documentVisibility: document.visibilityState, documentFocused: document.hasFocus(),
+      scheduler: probe.scheduler.entries.filter(entry => entry.startTime + entry.duration >= startedAt && entry.startTime <= latest.presentedAt),
       committedInputs: latencies.length, supersededInputs: inputs.length - latencies.length,
       p50InputToPaintMS: percentile(.5), p95InputToPaintMS: percentile(.95),
       latestInputToPaintMS: Number((latest.presentedAt - inputs.at(-1)).toFixed(3)),
       latestInputToCommitMS: Number((latest.at - inputs.at(-1)).toFixed(3)),
+      latestCommitToPaintMS: Number((latest.presentedAt - latest.at).toFixed(3)),
+      latestBurstStartToPaintMS: Number((latest.presentedAt - latestBurst.firstAt).toFixed(3)),
+      latestBurstStartToCommitMS: Number((latest.at - latestBurst.firstAt).toFixed(3)),
+      latestBurstDispatchMS: Number((latestBurst.lastAt - latestBurst.firstAt).toFixed(3)),
+      latestBurstEvents: latestBurst.events,
+      maxBurstDispatchMS: Number(Math.max(0, ...bursts.map(burst => burst.lastAt - burst.firstAt)).toFixed(3)),
+      p95FrameGapMS: percentileOf(frameGaps, .95), maxFrameGapMS: Number(Math.max(0, ...frameGaps).toFixed(3)),
+      probeValidationSamples: validation.length,
+      totalProbeValidationMS: Number(validation.reduce((sum, duration) => sum + duration, 0).toFixed(3)),
+      p95ProbeValidationMS: percentileOf(validation, .95), maxProbeValidationMS: Number(Math.max(0, ...validation).toFixed(3)),
     }
   }, { inputs, targets })
 }
 
-export async function waitForLocalHistory(electron, page, fixture, timeframe = fixture.timeframe) {
+export async function waitForLocalHistory(electron, page, fixture, timeframe = fixture.timeframe, { requireIndicators = false } = {}) {
   await wheelBurst(page, { deltaY: 12 })
   const deadline = Date.now() + 20_000
-  let resident = 0
+  const intervalMS = fixture.series[timeframe].intervalMS, warmEnd = fixture.end - intervalMS
+  let resident = 0, historyFrame
+  const calculatedReserve = () => historyFrame && historyFrame.bars >= resident && historyFrame.calculated === historyFrame.bars
+    && historyFrame.first <= warmEnd - 95 * intervalMS && historyFrame.end >= warmEnd
   while (Date.now() < deadline) {
     const requests = await readRequestProbe(electron)
     resident = requests.historyResponses.filter(response => response.timeframe === timeframe).at(-1)?.bars ?? 0
-    if (resident > 96) break
+    historyFrame = requests.historyFrames[timeframe]
+    if (resident > 96 && (!requireIndicators || calculatedReserve())) break
     await new Promise(resolve => setTimeout(resolve, 20))
   }
   assert.ok(resident > 96 && resident <= 1536, `History hydration must return a bounded price reserve: ${resident}`)
+  if (requireIndicators) {
+    assert.ok(calculatedReserve(), `The resident ${timeframe} reserve must finish canonical indicator preparation: ${JSON.stringify(historyFrame)}`)
+    // Keep the historical target active until both the calculated reserve and
+    // its real viewport are ready. Returning to latest clears history publishing.
+    await page.waitForFunction(({ instId, timeframe, end }) => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`), snapshot = chart?.__chartSnapshot
+      const bars = chart?.__chartRenderedBars ?? snapshot?.bars
+      const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24']
+      return snapshot?.instId === instId && snapshot.timeframe === timeframe && snapshot.endHour === end
+        && snapshot.indicatorState === 'ready' && chart.dataset.chartLoading === 'false' && bars?.length === 96
+        && bars.every(bar => bar.indicatorsObserved && fields.every(field => Number.isFinite(bar[field])))
+    }, { instId: fixture.instId, timeframe, end: warmEnd }, { timeout: Math.max(1, deadline - Date.now()) })
+  }
   await page.evaluate(async () => { for (let frame = 0; frame < 2; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
   await wheelBurst(page, { deltaY: -12 })
   await waitForRendered(page, fixture, timeframe)
@@ -311,9 +457,19 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
     const probe = {
       original, contents, originalSend, calls: [], active: 0, maxActive: 0,
       historicalActive: 0, maxHistoricalActive: 0,
-      historyCalls: [], historyResponses: [], transferredHistoryBars: 0, transferredWindowBars: 0,
-      sourceCalls: 0, sourceRequests: [], holdSource: false, holdLatest: false, latestHeld: false,
+      historyCalls: [], historyResponses: [], historyFrames: new Map(), transferredHistoryBars: 0, transferredWindowBars: 0,
+      sourceCalls: 0, sourceRequests: [], holdLatest: false, latestHeld: false,
       held: false, callsAtHold: null, release: null,
+    }
+    const rememberHistory = response => {
+      if (response?.instId !== instId || !['5m', '15m', '1H'].includes(response.timeframe) || !Array.isArray(response.bars) || response.bars.length <= 96) return
+      const previous = probe.historyFrames.get(response.timeframe)
+      if (previous && (previous.generation > response.generation || previous.generation === response.generation && previous.revision > response.revision)) return
+      probe.historyFrames.set(response.timeframe, {
+        bars: response.bars.length, calculated: response.bars.filter(bar => bar.indicatorsObserved).length,
+        first: response.bars[0].hour, end: response.bars.at(-1).hour, endHour: response.endHour,
+        generation: response.generation, revision: response.revision,
+      })
     }
     // Model a durable range that has not reached the renderer yet. Every
     // compact/local ingress observes the same cutoff, including pushed data,
@@ -324,7 +480,7 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
       return { ...response, bars: response.bars.filter(bar => bar.hour >= first) }
     }
     contents.send = function (channel, ...args) {
-      if (channel === 'radar:chart-prepared') args[0] = initialRange(args[0])
+      if (channel === 'radar:chart-prepared') { args[0] = initialRange(args[0]); rememberHistory(args[0]) }
       return originalSend.call(this, channel, ...args)
     }
     const released = new Promise(resolve => { probe.release = resolve })
@@ -336,6 +492,7 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
         const bars = response?.bars.length ?? 0
         probe.transferredHistoryBars += bars
         probe.historyResponses.push({ ...value.chartHistory, bars })
+        rememberHistory(response)
         return response
       }
       if (value.chartWindow?.instId !== instId) {
@@ -364,7 +521,9 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
         if (historical && historicalDelayMS > 0) await new Promise(resolve => setTimeout(resolve, historicalDelayMS))
         const response = await original(event, value)
         probe.transferredWindowBars += response?.bars.length ?? 0
-        return historical && !capHistoricalWindows ? response : initialRange(response)
+        const result = historical && !capHistoricalWindows ? response : initialRange(response)
+        if (historical) rememberHistory(result)
+        return result
       } finally {
         call.completedAt = Date.now()
         probe.active -= 1
@@ -386,7 +545,7 @@ export async function readRequestProbe(electron) {
     return {
       calls: probe.calls, active: probe.active, maxActive: probe.maxActive,
       historicalActive: probe.historicalActive, maxHistoricalActive: probe.maxHistoricalActive,
-      historyCalls: probe.historyCalls, historyResponses: probe.historyResponses,
+      historyCalls: probe.historyCalls, historyResponses: probe.historyResponses, historyFrames: Object.fromEntries(probe.historyFrames),
       transferredHistoryBars: probe.transferredHistoryBars, transferredWindowBars: probe.transferredWindowBars,
       transferredBars: probe.transferredHistoryBars + probe.transferredWindowBars,
       sourceCalls: sourceRequests.length, sourceRequests, held: probe.held, latestHeld: probe.latestHeld, callsAtHold: probe.callsAtHold,
@@ -415,8 +574,9 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
   const historicalDelayMS = 1_500
   const frames = 576
   const candlesPerFrame = 2
-  await installRequestProbe(electron, fixture.instId, { initialHistoryBars, historicalDelayMS })
+  const foreground = await foregroundPaintWindow(electron, page)
   try {
+    await installRequestProbe(electron, fixture.instId, { initialHistoryBars, historicalDelayMS })
     await openChart(page, fixture)
     // Admit the bounded durable range through an actual history gesture;
     // opening latest deliberately performs no deep-history IPC.
@@ -446,7 +606,7 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
     assertCompletePaints(paint)
     const requests = await readRequestProbe(electron)
     assert.equal(paint.pendingFrames, 0, `Latency-covered scrolling must never expose an unprepared requested viewport: ${JSON.stringify({ calls: requests.calls, sourceRequests: requests.sourceRequests, historyResponses: requests.historyResponses.length, inputDurationMS: inputs.at(-1) - inputs[0], pendingFrames: paint.pendingFrames })}`)
-    assert.ok(latency.latestInputToPaintMS < 100, `The latest wheel input took ${latency.latestInputToPaintMS} ms to paint.`)
+    assert.ok(latency.latestInputToPaintMS < 100, `The latest wheel input took ${latency.latestInputToPaintMS} ms to paint. ${JSON.stringify(latency)}`)
     const historical = requests.calls.filter(call => Number.isFinite(call.endHour))
     const first = historical[0]
     assert.ok(first, 'Approaching the cold boundary must issue a historical prefetch.')
@@ -467,7 +627,7 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
     const sources = separateSourceMaintenance(requests.sourceRequests, fixture)
     assert.deepEqual(sources.historical, [], 'Prefetch must reuse persisted source candles and statistics within the latency test range.')
     return {
-      initialHistoryBars, historicalDelayMS, continuousWheelFrames: frames,
+      foregroundWindow: foreground.native, environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence, initialHistoryBars, historicalDelayMS, continuousWheelFrames: frames,
       scrolledCandles: frames * candlesPerFrame, crossedInitialBoundary: true,
       runwayAtRequest, prefetchHistoryBars: first.historyBars,
       prefetchStartedDuringGesture: true, prefetchCompletedDuringGesture: true,
@@ -476,13 +636,22 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
       repeatedSourceDownloads: sources.historical.length,
       ...latency, ...paint, commits: paint.commits.length,
     }
-  } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
+  } finally {
+    try { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
+    finally { await foreground.restore() }
+  }
 }
 
 // A genuinely absent SQLite range, rather than a capped renderer response.
 // Keep farther source pages and OI/Taker unresolved while the nearest complete
 // price/indicator viewport crosses every production boundary and reaches SVG.
-export async function measureNativeColdBoundary(electron, page, { timeframe = '15m' } = {}) {
+export async function measureNativeColdBoundary(electron, page, options = {}) {
+  const foreground = await foregroundPaintWindow(electron, page)
+  try { return { ...await nativeColdBoundary(electron, page, options), environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence } }
+  finally { await foreground.restore() }
+}
+
+async function nativeColdBoundary(electron, page, { timeframe = '15m' } = {}) {
   const probe = value => electron.evaluate((_, value) => globalThis.__marketBackend.probe(value), value)
   const fixture = await probe({ action: 'coldBoundaryInstall', timeframe })
   let paintStarted = false
@@ -520,7 +689,7 @@ export async function measureNativeColdBoundary(electron, page, { timeframe = '1
         && missing && missing.oi === null && missing.buy === null && missing.sell === null
     }, { targetEnd: fixture.targetEnd, firstMissingEnd: fixture.firstMissingEnd, indicatorFields }, { timeout: 10_000 })
     const latency = await measurePaintLatency(page, { inputs, targets: [fixture.targetEnd] })
-    assert.ok(latency.latestInputToPaintMS < 100, `The freshly acquired nearest viewport took ${latency.latestInputToPaintMS} ms after its boundary gesture.`)
+    assert.ok(latency.latestInputToPaintMS < 100, `The freshly acquired nearest viewport took ${latency.latestInputToPaintMS} ms after its boundary gesture. ${JSON.stringify(latency)}`)
     sources = await probe({ action: 'coldBoundaryRead' })
     const nearest = sources.requests.find(request => request.source === 'candles' && request.through === fixture.firstMissingEnd)
     assert.ok(nearest?.completedAt !== null && nearest?.completedAt !== undefined,

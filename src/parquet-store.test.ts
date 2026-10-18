@@ -212,3 +212,104 @@ test('an operational import failure cannot certify cutover or erase its retryabl
     assert.equal((await store.candles(query))[0].close, 100)
   } finally { await chmod(directory, 0o700).catch(() => {}); await store?.close(); await rm(root, { recursive: true, force: true }) }
 })
+
+test('an admitted read that resumes after shutdown begins rejects without holding close open', { timeout: 15_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-import-read-close-'))
+  let store: MarketStore | undefined
+  let resume!: () => void, releaseCommit!: () => void
+  const delayedReady = new Promise<void>(resolve => { resume = resolve })
+  const commitGate = new Promise<void>(resolve => { releaseCommit = resolve })
+  try {
+    await legacy(root, 'base-200-data.parquet', [row(0)])
+    store = await MarketStore.open(root)
+    const internal = store as any
+    const request = internal.writer.request.bind(internal.writer)
+    let admitted!: () => void
+    const accepted = new Promise<void>(resolve => { admitted = resolve })
+    internal.writer.request = async (command: string, args: any[] = [], priority?: string) => {
+      if (command === 'append' && args[1]?.importing) { admitted(); await commitGate }
+      return request(command, args, priority)
+    }
+    await internal.migrationReady
+    const importer = internal.migration
+    importer.ref(); importer.channel?.ref()
+    await accepted
+    const ready = internal.migrationReady
+    // Admit the read, then delay its readiness continuation until shutdown has
+    // already cleared pending imports. Shutdown itself uses completed startup.
+    internal.migrationReady = delayedReady
+    const pendingRead = assert.rejects(store.candles(query), /closed/i)
+    await new Promise<void>(resolve => setImmediate(resolve))
+    internal.migrationReady = ready
+    const closing = store.close()
+    await new Promise<void>(resolve => setImmediate(resolve))
+    assert.equal(internal.closed, true)
+    assert.equal(internal.migrationPending.size, 0)
+    resume()
+    await new Promise<void>(resolve => setImmediate(resolve))
+    assert.equal(internal.migrationPending.size, 0, 'A resumed read must not enqueue work after the importer was stopped.')
+    await pendingRead
+    releaseCommit()
+    await closing
+    assert.equal(internal.operations.size, 0)
+  } finally {
+    // Also let shutdown finish when the regression assertion detects an
+    // incorrectly admitted post-stop request.
+    const internal = store as any
+    for (const pending of internal?.migrationPending.values() ?? []) pending.reject(new Error('MarketStore is closed.'))
+    internal?.migrationPending.clear()
+    resume(); releaseCommit()
+    await store?.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('close drains the active import commit without cutting over the remaining archive', { timeout: 15_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-import-close-'))
+  let store: MarketStore | undefined
+  let release!: () => void
+  const commitGate = new Promise<void>(resolve => { release = resolve })
+  try {
+    await legacy(root, 'base-200-first.parquet', [row(0)])
+    const second = await legacy(root, 'base-200-second.parquet', [row(288)])
+    const directory = join(root, 'candles', 'timeframe=5m', 'instrument=BTC-USDT-SWAP', 'date=2024-01-02')
+    await mkdir(directory)
+    await rename(second, join(directory, 'base-200-second.parquet'))
+    store = await MarketStore.open(root)
+    const internal = store as any
+    // Hold the first imported transaction before acknowledging it to the child,
+    // so shutdown deterministically overlaps an accepted partition commit.
+    let admitted!: () => void
+    const admission = new Promise<void>(resolve => { admitted = resolve })
+    const request = internal.writer.request.bind(internal.writer)
+    internal.writer.request = async (command: string, args: any[] = [], priority?: string) => {
+      if (command === 'append' && args[1]?.importing) { admitted(); await commitGate }
+      return request(command, args, priority)
+    }
+    await internal.migrationReady
+    const importer = internal.migration
+    assert.ok(Number.isSafeInteger(importer.pid) && importer.pid !== process.pid)
+    importer.ref(); importer.channel?.ref()
+    await admission
+    const closed = once(importer, 'close')
+    const pendingRead = assert.rejects(store.candles(query), /closed/i)
+    await new Promise<void>(resolve => setImmediate(resolve))
+    assert.equal(internal.migrationPending.size, 1)
+    const closing = store.close()
+    assert.equal(store.close(), closing, 'Repeated close joins the same shutdown.')
+    await pendingRead
+    release()
+    await closing
+    assert.deepEqual(await closed, [0, null], 'The importer must close native resources and exit naturally.')
+
+    const { DatabaseSync } = await import('node:sqlite')
+    const db = new DatabaseSync(join(root, 'market.sqlite'), { readOnly: true })
+    try {
+      assert.equal(db.prepare("SELECT COUNT(*) AS count FROM migration_partitions WHERE status='completed'").get()!.count, 1)
+      assert.equal(db.prepare("SELECT COUNT(*) AS count FROM migration_partitions WHERE path='__complete__'").get()!.count, 0)
+      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM candles').get()!.count, 1)
+    } finally { db.close() }
+    store = await MarketStore.open(root)
+    assert.equal((await store.candles({ ...query, through: base + 288 * step })).length, 2, 'Unfinished partitions remain resumable after shutdown.')
+  } finally { release(); await store?.close(); await rm(root, { recursive: true, force: true }) }
+})

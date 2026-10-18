@@ -131,7 +131,7 @@ try {
   await choose(focus, 'first local selection')
   await selectTimeframe(page, timeframe)
   await page.waitForFunction(({ focus, timeframe }) => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.instId === focus && document.querySelector('[data-chart-inst]')?.__chartSnapshot?.timeframe === timeframe, { focus, timeframe })
-  await probe({ action: 'backgroundStart' })
+  report.backgroundReady = await probe({ action: 'backgroundStart' })
   report.backgroundStarted = true
   const tickAndMeasure = async () => {
     const update = await probe({ action: 'scaleTick', sequence: ++sequence, focusInstId: focus, timeframe })
@@ -175,6 +175,7 @@ try {
   assert.equal(report.final.minimumRowsPerSeries, fixture.periods)
   assert.ok(report.final.heldStatistics > 0, 'The benchmark must actually hold native statistics requests.')
   assert.ok(report.background.writtenRecords > 0, 'The benchmark must perform background archive writes.')
+  assert.ok(report.background.archiveRows > report.backgroundReady.writtenRecords, 'Background archive writes must continue during the measured workload.')
   assert.ok(report.receiptToPaintP95MS <= 100, `Receipt-to-renderer-paint p95 ${report.receiptToPaintP95MS} ms exceeded 100 ms.`)
   report.outcome = 'passed'
 } catch (error) {

@@ -222,6 +222,7 @@ export class MarketStore {
 
   async imported(query, priority, tolerateIssues = false) {
     await this.migrationReady
+    if (this.closed) throw new Error('MarketStore is closed.')
     if (this.migrationComplete) return
     if (this.migrationError) throw this.migrationError
     if (!this.migration) return

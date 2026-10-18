@@ -205,7 +205,9 @@ test('cache existence never certifies realtime when stream continuity or observa
 })
 
 test('failed statistic sources use independent exponential deadlines while prices stay available', async context => {
-  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
+  // Exercise source deadlines without also crossing a native candle boundary.
+  const now = Math.floor(Date.now() / interval) * interval + 1000
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
   const rows = source(400).map(row => ({ ...row, oi: null, buy: null, sell: null, statisticsVersion: null }))
   let attempts = 0
   const { pipeline } = fixture(rows as any, { async ensureStatistics() { attempts += 1; throw new Error('Statistics offline') } })
@@ -223,7 +225,9 @@ test('failed statistic sources use independent exponential deadlines while price
 })
 
 test('successful unavailable observations renew only at their actual lease deadline', async context => {
-  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Math.floor(Date.now() / interval) * interval + 1000 })
+  // Exercise source deadlines without also crossing a native candle boundary.
+  const now = Math.floor(Date.now() / interval) * interval + 1000
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
   const rows: any[] = source(400), expiresAt = Date.now() + 10_000
   rows[399] = { ...rows[399], oi: null, buy: null, sell: null, statisticsVersion: 11, statisticsOIExpiresAt: expiresAt, statisticsTakerExpiresAt: expiresAt }
   let attempts = 0

@@ -4,7 +4,8 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { assertCompletePaints, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, measureLatencyCoveredPrefetch, measureNativeColdBoundary, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
+import { assertCompletePaints, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
+
 
 const root = new URL('../..', import.meta.url).pathname
 const userData = await mkdtemp(join(tmpdir(), 'perp-radar-e2e-'))
@@ -306,59 +307,43 @@ test('the 1600 design workspace keeps both panels and chart selection when searc
   }
 })
 
-test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while speculative preparation is stalled in every native timeframe', async () => {
+test('the paint probe catches changed indicator geometry without a new snapshot and retains the violation', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  // Adaptive speculative preparation is held indefinitely. Source reads are
-  // also stalled after warming, so navigation must stay independent of both
-  // lanes and use the already transferred durable series.
-  await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
+  await openChart(page, fixture)
+  await startPaintProbe(page, fixture)
+  let report
   try {
-    await openChart(page, fixture)
-    for (const timeframe of fixture.timeframes) {
-      await selectTimeframe(page, timeframe)
-      await waitForRendered(page, fixture, timeframe)
-      const residentHistoryBars = await waitForLocalHistory(electron, page, fixture, timeframe)
-      await electron.evaluate(() => { globalThis.__chartRequestProbe.holdSource = true; globalThis.__chartRequestProbe.holdLatest = true })
-      const before = await readRequestProbe(electron)
-      await startPaintProbe(page, fixture)
-      const intervalMS = fixture.series[timeframe].intervalMS
-      let distance = 0
-      for (const phase of [
-        { name: 'high velocity', frames: 6, eventsPerFrame: 32, deltaY: 36, candles: 576 },
-        { name: 'reversal', frames: 3, eventsPerFrame: 32, deltaY: -36, candles: -288 },
-        { name: '600-candle jump inside the bounded reserve', deltaY: 7_200, candles: 600 },
-      ]) {
-        const inputs = await wheelBurst(page, phase)
-        const targets = inputs.map((_, index) => fixture.end - (distance + phase.candles / inputs.length * (index + 1)) * intervalMS)
-        distance += phase.candles
-        await waitForRendered(page, fixture, timeframe, targets.at(-1))
-        const latency = await measurePaintLatency(page, { inputs, targets })
-        assert.ok(latency.latestInputToPaintMS < 100, `${timeframe} ${phase.name} took ${latency.latestInputToPaintMS} ms from the latest wheel input to its first paint opportunity.`)
-      }
-      const paint = await finishPaintProbe(page)
-      assertCompletePaints(paint)
-      assert.equal(paint.pendingFrames, 0, 'Resident navigation must never wait for the stalled speculative preparation.')
-      const after = await readRequestProbe(electron)
-      const historicalRequests = after.calls.slice(before.calls.length).filter(call => Number.isFinite(call.endHour))
-      assert.ok(historicalRequests.every(call => call.historyBars > 96), `Resident ${timeframe} targets must only issue bulk speculative preparation: ${JSON.stringify(historicalRequests)}`)
-      const sources = separateSourceMaintenance(after.sourceRequests.slice(before.sourceCalls), fixture)
-      assert.deepEqual(sources.historical, [], `A warmed ${timeframe} scroll attempted a historical download: ${JSON.stringify(sources.historical)}`)
-      assert.ok(after.maxHistoricalActive <= 1, 'Resident targets must never queue foreground work behind the stalled speculative preparation.')
-      assert.ok(after.transferredHistoryBars >= residentHistoryBars, 'The fixture must exercise a bulk durable-history transfer.')
-    }
-  } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
-})
+    const observation = await page.evaluate(async instId => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+      const snapshot = chart.__chartSnapshot
+      const path = chart.querySelector('[data-chart-indicator="rsi12"]')
+      const original = path.getAttribute('d')
+      const initiallyValid = window.__chartPaintProbe.errors.length === 0
+      try {
+        path.setAttribute('d', 'M0,0')
+        // Mutation observers run before the next task, with the same rendered
+        // data. Further frames then exercise the unchanged corrupted path.
+        await Promise.resolve()
+        const detected = window.__chartPaintProbe.errors.find(error => /rsi12 SVG has 1 points/.test(error))
+        const sameSnapshot = chart.__chartSnapshot === snapshot
+        for (let frame = 0; frame < 3; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve))
+        return {
+          initiallyValid, detected, sameSnapshot,
+          sameCorruptedGeometry: path.getAttribute('d') === 'M0,0',
+          retained: window.__chartPaintProbe.errors.includes(detected),
+        }
+      } finally { path.setAttribute('d', original) }
+    }, fixture.instId)
+    await page.evaluate(async () => { for (let frame = 0; frame < 2; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
+    report = await finishPaintProbe(page)
+    assert.equal(observation.initiallyValid, true)
+    assert.equal(observation.sameSnapshot, true, 'The corrupted curve must be checked without a data publication.')
+    assert.match(observation.detected ?? '', /rsi12 SVG has 1 points/)
+    assert.equal(observation.sameCorruptedGeometry, true)
+    assert.equal(observation.retained, true, 'Repeated unchanged geometry must retain the detected violation.')
+    assert.ok(report.violations.includes(observation.detected), 'Restoring valid geometry must not erase an earlier incorrect paint.')
+  } finally { if (!report) await finishPaintProbe(page) }
 
-test('historical prefetch covers 1500 ms of network latency before the cold boundary during continuous wheel input', async () => {
-  // The preceding warm case releases an intentionally held preparation task.
-  // A distinct durable series keeps that task's completion outside this case.
-  const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark', instId: 'PREFETCH-USDT-SWAP' }))
-  await measureLatencyCoveredPrefetch(electron, page, fixture)
-})
-
-test('a never-downloaded native price page paints before the farther reserve and optional statistics finish', async context => {
-  const report = await measureNativeColdBoundary(electron, page)
-  context.diagnostic(`Native cold boundary: ${JSON.stringify(report)}`)
 })
 
 test('mature local indicators and statistics stay drawn from the first scroll through prefetch, push and scroll end', async context => {
