@@ -347,3 +347,119 @@ test('shard reconnects are paced and disconnect/subscription callbacks identify 
   assert.equal(f.market.getTelemetry().tickerEvents, 1)
   assert.equal(f.market.getState().status, 'live')
 })
+
+test('global instruments acknowledgements use their SWAP namespace and bootstrap never blocks market or delta events', async t => {
+  const bootstrap = deferred(), ready = deferred(), deltaSeen = deferred(), tickerSeen = deferred()
+  const received: unknown[] = [], marketAcks: string[] = []
+  let readiness = 0
+  const f = fixture({
+    onInstrumentsReady: async context => { readiness++; assert.equal(context.signal.aborted, false); assert.equal(context.receivedAt, f.clock.now()); ready.resolve(); await bootstrap.promise },
+    onInstruments: (records, context) => { assert.equal(context.signal.aborted, false); received.push(records); deltaSeen.resolve() },
+    onSubscribed: (instId, channel) => { marketAcks.push(`${instId}:${channel}`) },
+    onTicker: () => { tickerSeen.resolve() },
+  })
+  t.after(() => f.market.close())
+  f.market.setSubscriptions([btc])
+  f.market.start()
+  const socket = f.sockets[0]
+  socket.autoAck = false
+  socket.open()
+  await f.market.whenIdle()
+  const command = socket.commands()[0]
+  assert.deepEqual(command.args.find((arg: { channel: string }) => arg.channel === 'instruments'), { channel: 'instruments', instType: 'SWAP' })
+  for (const arg of command.args.filter((arg: { channel: string }) => arg.channel !== 'instruments')) socket.message({ id: command.id, event: 'subscribe', arg })
+  socket.message({ id: command.id, event: 'subscribe', arg: { channel: 'instruments', instType: 'SPOT' } })
+  socket.message({ id: 'obsolete', event: 'subscribe', arg: { channel: 'instruments', instType: 'SWAP' } })
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().status, 'connecting')
+  assert.equal(readiness, 0)
+  socket.message({ id: command.id, event: 'subscribe', arg: { channel: 'instruments', instType: 'SWAP' } })
+  await ready.promise
+  assert.equal(f.market.getState().status, 'live')
+  socket.message({ id: command.id, event: 'subscribe', arg: { channel: 'instruments', instType: 'SWAP' } })
+  socket.message({ arg: { channel: 'instruments', instType: 'SPOT' }, data: [{ instId: 'SPOT' }] })
+  const updates = [{ instId: 'NEW-USDT-SWAP', state: 'live' }, { instId: btc, state: 'suspend' }]
+  socket.message({ arg: { channel: 'instruments', instType: 'SWAP' }, data: updates })
+  push(socket, 'tickers', [{ last: '100' }])
+  await Promise.all([deltaSeen.promise, tickerSeen.promise])
+  assert.equal(readiness, 1)
+  assert.deepEqual(received, [updates])
+  assert.equal(marketAcks.length, 4, 'Control acknowledgements never enter the instrument-specific market callback.')
+  bootstrap.resolve()
+  await f.market.whenIdle()
+})
+
+test('instruments control survives an empty universe, shares the first shard, and bootstraps again after reconnect', async t => {
+  const readySignals: AbortSignal[] = [], disconnectSignals: AbortSignal[] = [], batches: unknown[] = [], disconnectedIDs: string[][] = []
+  const f = fixture({
+    onInstruments: records => { batches.push(records) },
+    onInstrumentsReady: context => { readySignals.push(context.signal) },
+    onInstrumentsDisconnect: context => { assert.equal(context.receivedAt, f.clock.now()); disconnectSignals.push(context.signal) },
+    onDisconnect: ids => { disconnectedIDs.push(ids) },
+  })
+  t.after(() => f.market.close())
+  f.market.start()
+  const socket = f.sockets[0]
+  socket.open()
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().status, 'live')
+  assert.equal(f.market.instruments.size, 0)
+  assert.deepEqual([...f.market.subscriptions.values()], [{ channel: 'instruments', instType: 'SWAP' }])
+  assert.equal(readySignals.length, 1)
+  f.market.setSubscriptions([btc])
+  await f.market.whenIdle()
+  assert.equal(f.sockets.length, 1)
+  assert.equal(f.market.subscriptions.size, 5)
+  assert.equal(readySignals.length, 1, 'Changing eligible IDs preserves the fixed control subscription.')
+  f.market.setSubscriptions([])
+  await f.market.whenIdle()
+  assert.equal(socket.readyState, 1)
+  assert.equal(f.market.subscriptions.size, 1)
+  assert.equal(f.market.getState().status, 'live')
+  const metadata = [{ instId: 'NEW-USDT-SWAP', state: 'live' }]
+  socket.message({ arg: { channel: 'instruments', instType: 'SWAP' }, data: metadata })
+  await f.market.whenIdle()
+  assert.deepEqual(batches, [metadata])
+  socket.finishClose(1006)
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().status, 'reconnecting')
+  assert.equal(disconnectSignals.length, 1)
+  assert.equal(disconnectSignals[0], readySignals[0])
+  assert.equal(disconnectSignals[0].aborted, true)
+  assert.deepEqual(disconnectedIDs, [[]], 'Control subscriptions must not introduce undefined instrument IDs.')
+  await f.clock.advance(1000)
+  const replacement = f.sockets.at(-1)!
+  replacement.open()
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().status, 'live')
+  assert.equal(readySignals.length, 2)
+  assert.equal(readySignals[1].aborted, false)
+  assert.deepEqual(replacement.commands()[0].args, [{ channel: 'instruments', instType: 'SWAP' }])
+})
+
+test('instruments disconnect is delivered before acknowledgement and zero-ID close cancels all recovery', async () => {
+  const disconnected: AbortSignal[] = []
+  let readiness = 0
+  const f = fixture({
+    onInstruments: () => {},
+    onInstrumentsReady: () => { readiness++ },
+    onInstrumentsDisconnect: ({ signal }) => { disconnected.push(signal) },
+  })
+  f.market.start()
+  const socket = f.sockets[0]
+  socket.autoAck = false
+  socket.open()
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().status, 'connecting')
+  socket.finishClose(1006)
+  await f.market.whenIdle()
+  assert.equal(readiness, 0)
+  assert.equal(disconnected.length, 1)
+  assert.equal(disconnected[0].aborted, true)
+  assert.equal(f.market.getState().status, 'reconnecting')
+  await f.market.close()
+  await f.clock.advance(30_000)
+  assert.equal(f.sockets.length, 1)
+  assert.equal(f.clock.timers.size, 0)
+  assert.equal(f.market.getState().status, 'disconnected')
+})

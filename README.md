@@ -52,7 +52,7 @@ Open **Settings → Liquidity conditions** to enable or disable each condition a
 
 The 24h trading-volume check sums actual quote volume from **288 completed 5m candles**. The slippage trade size is also configurable. A contract needs valid observations for every enabled condition; eligibility must be revalidated as its observations expire.
 
-All eligible USDT perpetual contracts receive live streams independently of liquidity filters, historical preparation, search, and chart selection. Prices publish immediately; fresh depth, spread, and open-interest observations recheck qualification in short batches. Exact depth/slippage calculations run in a worker, coalescing new observations while preserving each result's original freshness lease. Instrument metadata renews every 30 seconds, with REST snapshots used when stream observations are unavailable. Missing or expired data stays unqualified while acquisition continues.
+All eligible USDT perpetual contracts receive live streams independently of liquidity filters, historical preparation, search, and chart selection. Prices publish immediately; fresh depth, spread, and open-interest observations recheck qualification in short batches. Exact depth/slippage calculations run in a worker, coalescing new observations while preserving each result's original freshness lease. Instrument metadata uses a bootstrap/reconnect REST snapshot plus the global SWAP instruments subscription. Incremental listing, parameter, suspension, and delisting events update the universe directly; healthy collection does not periodically rescan it. Missing or expired data stays unqualified while acquisition continues.
 
 ## Charts and indicators
 

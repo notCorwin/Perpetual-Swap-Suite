@@ -20,6 +20,7 @@ const candleSeries = new Set(), candleAcknowledgements = new Set()
 const connections = new Map(), errors = []
 const started = Date.now()
 let formingEvents = 0, confirmedEvents = 0
+let instrumentAcknowledgements = 0
 const webSocketFactory = url => {
   connections.set(url, (connections.get(url) ?? 0) + 1)
   const socket = new WebSocket(url)
@@ -50,6 +51,8 @@ const candles = new RealtimeMarket({
 const market = new RealtimePublicMarket({
   webSocketFactory,
   logger,
+  onInstruments: () => {},
+  onInstrumentsReady: () => { instrumentAcknowledgements++ },
   onSubscribed: (instId, channel) => { acknowledgements.get(channel).add(instId) },
   onTicker: instId => { observations.get('tickers').add(instId) },
   onOpenInterest: instId => { observations.get('open-interest').add(instId) },
@@ -60,6 +63,7 @@ const market = new RealtimePublicMarket({
   onTrades: (instId, values) => { if (values.length) observations.get('trades').add(instId) },
 })
 const complete = () => market.getState().status === 'live' && candles.getState().status === 'live'
+  && instrumentAcknowledgements === 1
   && ['tickers', 'open-interest', 'books'].every(channel => observations.get(channel).size === instIds.length)
   && CHANNELS.every(channel => acknowledgements.get(channel).size === instIds.length)
   && candleSeries.size === instIds.length * TIMEFRAMES.length
@@ -85,6 +89,7 @@ try {
     integration: 'okx-all-contract-streams',
     elapsedMs: Date.now() - started,
     contracts: instIds.length,
+    instrumentAcknowledgements,
     publicConnections: connections.get(OKX_PUBLIC_WEBSOCKET_URL) ?? 0,
     expectedPublicConnections: Math.ceil(instIds.length / PUBLIC_MARKET_CONTRACTS_PER_CONNECTION),
     candleConnections: connections.get(OKX_BUSINESS_WEBSOCKET_URL) ?? 0,

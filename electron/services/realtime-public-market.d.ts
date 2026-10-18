@@ -4,6 +4,8 @@ export const OKX_PUBLIC_WEBSOCKET_URL: 'wss://ws.okx.com/ws/v5/public'
 export const PUBLIC_MARKET_CONTRACTS_PER_CONNECTION: 25
 export type PublicMarketChannel = 'tickers' | 'open-interest' | 'books' | 'trades'
 export type PublicMarketRawRecord = Record<string, string | number>
+export type PublicInstrumentRecord = Record<string, unknown>
+export type PublicMarketSubscription = { instId: string; channel: PublicMarketChannel } | { channel: 'instruments'; instType: 'SWAP' }
 export type PublicMarketBook = { bids: string[][]; asks: string[][]; ts: string; seqId: number }
 export type PublicMarketEventContext = { signal: AbortSignal; receivedAt: number }
 export type RealtimePublicMarketTelemetry = {
@@ -19,6 +21,12 @@ export type RealtimePublicMarketTelemetry = {
   lastReceivedAt: number | null
 }
 export type RealtimePublicMarketOptions = {
+  /** Enables the global SWAP instruments stream, retained when the universe is empty. */
+  onInstruments?: (raw: PublicInstrumentRecord[], context: PublicMarketEventContext) => void | Promise<void>
+  /** Fires after each matching instruments ack; bootstrap work does not block events. */
+  onInstrumentsReady?: (context: PublicMarketEventContext) => void | Promise<void>
+  /** Fires when the control socket retires, even before its acknowledgement. */
+  onInstrumentsDisconnect?: (context: PublicMarketEventContext) => void | Promise<void>
   onTicker: (instId: string, raw: PublicMarketRawRecord, context: PublicMarketEventContext) => void | Promise<void>
   onOpenInterest: (instId: string, raw: PublicMarketRawRecord, context: PublicMarketEventContext) => void | Promise<void>
   /** Full 400-level book, reconstructed from native snapshots and updates. */
@@ -49,7 +57,7 @@ export type RealtimePublicMarketOptions = {
 export class RealtimePublicMarket {
   constructor(options: RealtimePublicMarketOptions)
   readonly instruments: Set<string>
-  readonly subscriptions: Map<string, { instId: string; channel: PublicMarketChannel }>
+  readonly subscriptions: Map<string, PublicMarketSubscription>
   /** Subscribes every instrument to tickers, open-interest, books, and trades. */
   setSubscriptions(instIds: string[]): void
   start(): void

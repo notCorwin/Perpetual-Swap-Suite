@@ -989,18 +989,17 @@ test('an explicit empty SWAP multiplier uses the documented product value withou
 })
 
 
-test('refresh cadence follows scan start so a long scan does not extend the ticker lease gap', async () => {
-  const f = await fixture()
+test('successful source checks leave no periodic discovery or renewal timers', async () => {
+  const f = await fixture(disabled(), async input => {
+    const path = new URL(String(input)).pathname
+    if (path.endsWith('/public/instruments')) return response([instrument])
+    if (path.endsWith('/market/tickers')) return response([ticker])
+    throw new Error(`Unexpected ${path}`)
+  })
   try {
-    f.service.autoRefresh = true
-    f.service.lastRefreshAt = Date.now()
-    f.service.refreshStartedAt = Date.now() - 50_000
-    f.service.scheduleRefresh()
-    assert.ok(f.service.refreshTimer._idleTimeout <= 10_000)
-    assert.ok(f.service.refreshTimer._idleTimeout > 9_000)
-    f.service.refreshStartedAt = Date.now() - 90_000
-    f.service.scheduleRefresh()
-    assert.equal(f.service.refreshTimer._idleTimeout, 1, 'An overlong scan immediately revalidates its expired observations.')
+    await f.service.refresh()
+    assert.equal(f.service.refreshTimer, undefined)
+    assert.equal(f.service.renewalTimer, undefined)
   } finally { await f.close() }
 })
 

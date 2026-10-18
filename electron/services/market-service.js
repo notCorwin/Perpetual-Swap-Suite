@@ -215,8 +215,12 @@ export class MarketService {
     this.qualificationImmediate = null
     this.boundaryTimer = null
     this.renewing = null
-    this.renewalTimer = null
     this.instruments = new Map()
+    this.instrumentDefinitions = new Map()
+    this.instrumentDeltas = new Map()
+    this.instrumentEventVersion = 0
+    this.instrumentStream = null
+    this.instrumentRetryTimer = null
     this.instrumentObservations = new Map()
     this.instrumentTask = null
     this.observations = new Map()
@@ -269,7 +273,6 @@ export class MarketService {
     this.closing = false
     this.disposed = false
     this.disposeTask = null
-    this.refreshTimer = null
     this.chartSubscriptions = []
     this.latestAuditID = null
     // The proxy admits no historical work until durable metadata has opened.
@@ -337,6 +340,11 @@ export class MarketService {
     this.realtimeStatus = this.realtime.getState().status
     this.publicRealtime = new RealtimePublicMarket({
       ...(this.webSocketFactory ? { webSocketFactory: this.webSocketFactory } : {}),
+      ...(this.autoRefresh ? {
+        onInstruments: (records, context) => this.receiveInstruments(records, context),
+        onInstrumentsReady: context => this.synchronizeInstruments(context),
+        onInstrumentsDisconnect: context => this.instrumentStreamDisconnected(context),
+      } : {}),
       onSubscribed: (instId, channel, context) => {
         if (channel === 'trades') this.liveStatistics.start(instId, context.receivedAt)
       },
@@ -363,9 +371,8 @@ export class MarketService {
     })
     this.updateSubscriptions()
     if (this.autoRefresh && !this.closing) {
-      this.realtime.start(); this.publicRealtime.start(); this.scheduleRefresh()
+      this.realtime.start(); this.publicRealtime.start()
       this.scheduleBoundary()
-      this.scheduleRenewal()
       this.track(this.refresh())
     }
     return this
@@ -379,6 +386,9 @@ export class MarketService {
   readCatalog() {
     const entries = this.metadata.listCatalogEntries()
     for (const entry of entries) {
+      // Live metadata continuity belongs to one socket session. A checkpoint
+      // can restore only its original bounded REST/metadata observation lease.
+      if (entry.instrumentObservation) entry.expiresAt = Math.min(entry.expiresAt, entry.instrumentObservation.expiresAt)
       if (entry.instrument?.instId) {
         this.instruments.set(entry.instrument.instId, entry.instrument)
         if (entry.instrumentObservation) this.instrumentObservations.set(entry.instrument.instId, entry.instrumentObservation)
@@ -817,6 +827,7 @@ export class MarketService {
       this.cacheRankingCandles(instrument, changed)
       for (const timeframe of new Set(changed.map(row => row.timeframe))) this.scheduleQualification(instrument, timeframe)
       if (confirmed.some(row => row.timeframe === '5m')) void this.updateRanking(instrument).catch(() => undefined)
+      if (this.candidateIDs?.has(instrument) && changed.some(row => row.timeframe === '5m')) this.advanceHistoryTarget(instrument)
       if (projectList) this.scheduleListProjection(instrument)
       return true
     })
@@ -1251,11 +1262,12 @@ export class MarketService {
     if (config.volume24h.enabled) required.push('turnover')
     if (config.volumeStability.enabled) required.push('hourly')
     const instrumentObservation = this.instrumentObservations.get(instrument.instId)
-    const metadataFresh = instrumentObservation?.expiresAt > now
+    const continuousMetadata = this.instrumentStream?.synchronized && !this.instrumentStream.signal.aborted && this.candidateIDs?.has(instrument.instId)
+    const metadataFresh = continuousMetadata || instrumentObservation?.expiresAt > now
     const validObservations = required.map(fresh)
     const complete = metadataFresh && validObservations.every(Boolean)
     const status = !metadataFresh ? 'unknown' : result.status === 'verified' && complete ? 'verified' : result.status === 'failed' ? 'failed' : 'unknown'
-    const leases = complete ? [instrumentObservation, ...validObservations] : []
+    const leases = complete ? [continuousMetadata ? { ...instrumentObservation, expiresAt: Number.MAX_SAFE_INTEGER } : instrumentObservation, ...validObservations] : []
     return this.catalogRecord({ instrument, ...(instrumentObservation ? { instrumentObservation } : {}),
       ticker: fresh('ticker')?.value ?? {}, result: { ...result, eligible: status === 'verified' },
       status, configKey, observations, observationErrors: errors,
@@ -1494,16 +1506,27 @@ export class MarketService {
 
   async discoverInstruments(configKey, signal, priority) {
     if (!this.instrumentTask || this.instrumentTask.signal.aborted) {
+      const version = this.instrumentEventVersion
       const task = this.get('/public/instruments', { instType: 'SWAP' }, signal, priority)
         .finally(() => { if (this.instrumentTask?.task === task) this.instrumentTask = null })
-      this.instrumentTask = { signal, task }
+      this.instrumentTask = { signal, task, version }
     }
-    const instruments = await abortable(this.instrumentTask.task, signal)
-    if (signal.aborted || this.catalogCriteriaKey() !== configKey) return []
+    const acquisition = this.instrumentTask
+    const instruments = await abortable(acquisition.task, signal)
+    signal.throwIfAborted()
     if (!Array.isArray(instruments) || !instruments.length) throw new Error('OKX returned no swap instruments; market verification is unavailable.')
-    // Normalize only OKX's explicit empty multiplier for supported swaps.
-    const candidates = instruments.filter(eligibleInstrument).map(value => value.ctMult === '' ? { ...value, ctMult: '1' } : value)
-    if (!candidates.length) throw new Error('No supported swap instrument metadata could be verified. Retrying automatically.')
+    const definitions = new Map(instruments.map(value => [value.instId, value]))
+    // A REST cache may be older than a delta received during this acquisition.
+    for (const [instId, delta] of this.instrumentDeltas) if (this.instrumentStream && !this.instrumentStream.signal.aborted || delta.version > acquisition.version) {
+      definitions.set(instId, { ...(definitions.get(instId) ?? {}), ...delta.value })
+    }
+    if (![...definitions.values()].some(eligibleInstrument)) throw new Error('No supported swap instrument metadata could be verified. Retrying automatically.')
+    return this.installInstruments(definitions)
+  }
+
+  installInstruments(definitions, observedIDs) {
+    this.instrumentDefinitions = definitions
+    const candidates = [...definitions.values()].filter(eligibleInstrument).map(value => value.ctMult === '' ? { ...value, ctMult: '1' } : value)
     const nextIDs = new Set(candidates.map(value => value.instId))
     const removedIDs = [...(this.candidateIDs ?? [])].filter(id => !nextIDs.has(id))
     this.liveStatistics.remove(removedIDs)
@@ -1513,8 +1536,8 @@ export class MarketService {
       this.tickerCache?.values.delete(instId)
     }
     this.candidateIDs = nextIDs
-    for (const instId of this.renewalTargets.keys()) if (!this.candidateIDs.has(instId)) this.renewalTargets.delete(instId)
-    for (const instId of this.catalogChecks.keys()) if (!this.candidateIDs.has(instId)) this.catalogChecks.delete(instId)
+    for (const instId of this.renewalTargets.keys()) if (!nextIDs.has(instId)) this.renewalTargets.delete(instId)
+    for (const instId of this.catalogChecks.keys()) if (!nextIDs.has(instId)) this.catalogChecks.delete(instId)
     for (const instrument of candidates) {
       const previous = this.instruments.get(instrument.instId)
       if (previous && JSON.stringify(previous) !== JSON.stringify(instrument)) {
@@ -1522,25 +1545,87 @@ export class MarketService {
         if (observations) delete observations.book
       }
       this.instruments.set(instrument.instId, instrument)
-      this.instrumentObservations.set(instrument.instId, { observedAt: Date.now(), expiresAt: Date.now() + OBSERVATION_TTL })
+      if (!observedIDs || observedIDs.has(instrument.instId)) this.instrumentObservations.set(instrument.instId, { observedAt: Date.now(), expiresAt: Date.now() + OBSERVATION_TTL })
       if (this.renewalTargets.has(instrument.instId)) this.renewalTargets.set(instrument.instId, instrument)
     }
-    // Start the full universe before any filter's historical window can delay it.
     this.updateSubscriptions()
-    for (const key of this.liveCandles.keys()) if (!this.candidateIDs.has(key.slice(0, key.lastIndexOf(':')))) {
+    for (const key of this.liveCandles.keys()) if (!nextIDs.has(key.slice(0, key.lastIndexOf(':')))) {
       this.liveCandles.delete(key); this.liveCandleSources.delete(key)
     }
-    for (const instId of this.historyTargets.keys()) if (!this.candidateIDs.has(instId)) this.historyTargets.delete(instId)
-    const asOf = closedBoundary('5m'), historyDays = this.prefs().historyDays, targetKey = `${historyDays}:${asOf}`
-    for (const instrument of candidates) if (this.historyTargets.get(instrument.instId) !== targetKey) {
-      this.historyTargets.set(instrument.instId, targetKey)
-      this.track(this.history.target(instrument.instId, { historyDays, asOf }).catch(error => {
-        if (this.historyTargets.get(instrument.instId) === targetKey) this.historyTargets.delete(instrument.instId)
-        throw error
-      }))
-    }
+    for (const instId of this.historyTargets.keys()) if (!nextIDs.has(instId)) this.historyTargets.delete(instId)
+    for (const { instId } of candidates) this.advanceHistoryTarget(instId)
+    const configKey = this.catalogCriteriaKey(), signal = this.shutdownController.signal
     this.replaceCatalog([...this.catalog.values()].filter(entry => this.currentCandidate(entry.instrument, configKey, signal) && this.validCatalogEntry(entry)))
     return candidates
+  }
+
+  advanceHistoryTarget(instId) {
+    if (this.closing || this.disposed || !this.candidateIDs?.has(instId)) return
+    const asOf = closedBoundary('5m'), historyDays = this.prefs().historyDays, targetKey = `${historyDays}:${asOf}`
+    if (this.historyTargets.get(instId) === targetKey) return
+    this.historyTargets.set(instId, targetKey)
+    this.track(this.history.target(instId, { historyDays, asOf }).catch(error => {
+      if (this.historyTargets.get(instId) === targetKey) this.historyTargets.delete(instId)
+      throw error
+    }))
+  }
+
+  receiveInstruments(records, context) {
+    if (this.closing || this.disposed || context.signal.aborted || this.instrumentStream?.signal !== context.signal) return
+    const definitions = new Map(this.instrumentDefinitions), changed = []
+    for (const value of records) {
+      if (typeof value?.instId !== 'string' || !/^[A-Z0-9]+-[A-Z0-9]+-SWAP$/.test(value.instId)) continue
+      const merged = { ...(definitions.get(value.instId) ?? {}), ...value }
+      definitions.set(value.instId, merged)
+      this.instrumentDeltas.set(value.instId, { version: ++this.instrumentEventVersion, value: merged })
+      changed.push(value.instId)
+    }
+    if (!changed.length) return
+    this.installInstruments(definitions, new Set(changed))
+    for (const instId of changed) this.queueStreamQualification(instId)
+    this.touchList()
+  }
+
+  async synchronizeInstruments(context) {
+    if (this.closing || context.signal.aborted) return
+    if (this.instrumentRetryTimer) clearTimeout(this.instrumentRetryTimer)
+    this.instrumentRetryTimer = null
+    const stream = { signal: context.signal, synchronized: false, delay: 1_000 }
+    this.instrumentStream = stream
+    this.instrumentDeltas.clear()
+    const synchronize = async () => {
+      try {
+        // Start the authoritative snapshot after acknowledgement. This closes
+        // the gap before subscription; deltas received during HTTP are merged.
+        await this.instrumentTask?.task.catch(() => undefined)
+        if (this.closing || stream.signal.aborted || this.instrumentStream !== stream) return
+        const signal = AbortSignal.any([stream.signal, this.shutdownController.signal])
+        const candidates = await this.discoverInstruments(this.catalogCriteriaKey(), signal, 'foreground')
+        if (this.closing || stream.signal.aborted || this.instrumentStream !== stream) return
+        stream.synchronized = true
+        this.verifyCatalog()
+        const config = this.prefs().liquidity, key = JSON.stringify(config), sources = {}
+        this.track(Promise.allSettled(candidates.map(instrument => this.checkCandidate(instrument, config, key, signal, 'foreground', { sources }))))
+        this.error = ''; this.touchList()
+      } catch (error) {
+        if (this.closing || stream.signal.aborted || this.instrumentStream !== stream) return
+        this.error = error instanceof Error ? error.message : String(error)
+        this.touchList()
+        this.instrumentRetryTimer = setTimeout(() => { this.instrumentRetryTimer = null; this.track(synchronize()) }, stream.delay)
+        stream.delay = Math.min(30_000, stream.delay * 2)
+        this.instrumentRetryTimer.unref?.()
+      }
+    }
+    return synchronize()
+  }
+
+  instrumentStreamDisconnected(context) {
+    if (this.instrumentStream?.signal !== context.signal) return
+    this.instrumentStream = null
+    this.instrumentDeltas.clear()
+    if (this.instrumentRetryTimer) clearTimeout(this.instrumentRetryTimer)
+    this.instrumentRetryTimer = null
+    if (!this.closing && !this.disposed) { this.verifyCatalog(); this.touchList() }
   }
 
   async renewCatalog() {
@@ -1576,18 +1661,8 @@ export class MarketService {
         this.renewing = null
         if (this.renewalController === controller) this.renewalController = null
         this.touchList()
-        this.scheduleRenewal()
       })
     return this.renewing
-  }
-
-  scheduleRenewal() {
-    if (this.renewalTimer) clearTimeout(this.renewalTimer)
-    this.renewalTimer = null
-    if (!this.autoRefresh || this.closing || this.disposed) return
-    const due = Math.max(1, (this.renewalStartedAt ?? Date.now()) + CATALOG_RENEW_INTERVAL - Date.now())
-    this.renewalTimer = setTimeout(() => { this.renewalTimer = null; this.track(this.renewCatalog()) }, due)
-    this.renewalTimer.unref?.()
   }
 
   async refresh() {
@@ -1626,20 +1701,9 @@ export class MarketService {
         if (this.refreshController === controller) this.refreshController = null
         this.refreshing = null
         this.touchList()
-        this.scheduleRefresh()
       }
     })()
     return this.refreshing
-  }
-
-  scheduleRefresh() {
-    if (this.refreshTimer) clearTimeout(this.refreshTimer)
-    this.refreshTimer = null
-    if (!this.autoRefresh || this.closing || this.disposed) return
-    const startedAt = this.refreshStartedAt || this.lastRefreshAt
-    const due = startedAt ? Math.max(1, startedAt + LATEST_CANDLE_REFRESH - Date.now()) : LATEST_CANDLE_REFRESH
-    this.refreshTimer = setTimeout(() => { this.refreshTimer = null; this.track(this.refresh()) }, due)
-    this.refreshTimer.unref?.()
   }
 
   async reconfigure(previousPreferences) {
@@ -1729,12 +1793,7 @@ export class MarketService {
     await this.ready
     this.pruneCatalog()
     const frame = this.ensureListRows(timeframe)
-    let refreshScheduled = false
     if (!this.disposed && !this.closing) {
-      if (this.autoRefresh && !this.refreshing && Date.now() - (this.refreshStartedAt || this.lastRefreshAt) >= LATEST_CANDLE_REFRESH) {
-        refreshScheduled = true
-        this.track(this.refresh())
-      }
       const asOf = closedBoundary('5m'), lookback = this.prefs().rankingLookback
       for (const instId of this.catalog.keys()) {
         if (this.listProjectionResults.get(this.listKey(instId, frame))?.version !== (this.listProjectionDataVersions.get(instId) ?? 0)) this.track(this.projectListEntry(instId, frame))
@@ -1751,7 +1810,7 @@ export class MarketService {
     }
     const unavailable = !this.catalog.size && catalogProgress.unknown > 0
       ? `Market verification is unavailable for ${catalogProgress.unknown} contracts because required observations are missing or expired. Retrying automatically.` : ''
-    const status = { error: this.error || unavailable, loading: refreshScheduled || this.refreshing !== null || this.renewing !== null || pending > 0,
+    const status = { error: this.error || unavailable, loading: this.refreshing !== null || this.renewing !== null || pending > 0,
       catalogProgress,
       updatedAt: this.listUpdatedAt.get(frame) ?? this.catalogUpdatedAt, listProgress: this.listProgress(frame), timeframe: frame,
       catalogSource: this.catalogSource, realtimeState: this.realtimeState() }
@@ -1774,8 +1833,7 @@ export class MarketService {
   dispose() {
     if (this.disposeTask) return this.disposeTask
     this.closing = true
-    if (this.refreshTimer) clearTimeout(this.refreshTimer)
-    if (this.renewalTimer) clearTimeout(this.renewalTimer)
+    if (this.instrumentRetryTimer) clearTimeout(this.instrumentRetryTimer)
     if (this.boundaryTimer) clearTimeout(this.boundaryTimer)
     if (this.qualificationImmediate) clearImmediate(this.qualificationImmediate)
     if (this.marketPublicationTimer) clearTimeout(this.marketPublicationTimer)

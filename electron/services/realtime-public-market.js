@@ -4,7 +4,7 @@ export const OKX_PUBLIC_WEBSOCKET_URL = 'wss://ws.okx.com/ws/v5/public'
 export const PUBLIC_MARKET_CONTRACTS_PER_CONNECTION = 25
 
 const channels = ['tickers', 'open-interest', 'books', 'trades']
-const keyFor = ({ instId, channel }) => `${channel}:${instId}`
+const keyFor = ({ instId, instType, channel }) => `${channel}:${channel === 'instruments' ? instType : instId}`
 const hour = 3_600_000
 const copy = value => ({ ...value })
 
@@ -62,6 +62,10 @@ class PublicMarketConnection {
     if (this.closed) throw new Error('Realtime public market is closed.')
     const instruments = new Set()
     const next = new Map()
+    if (this.options.instrumentsControl) {
+      const value = { channel: 'instruments', instType: 'SWAP' }, key = keyFor(value)
+      next.set(key, this.subscriptions.get(key) ?? value)
+    }
     for (const instId of instIds) {
       if (typeof instId !== 'string' || !/^[A-Za-z0-9-]{1,128}$/.test(instId)) throw new TypeError('Invalid public market subscription.')
       instruments.add(instId)
@@ -222,7 +226,7 @@ class PublicMarketConnection {
           else { connection.sent.delete(key); connection.pending.delete(key) }
         }
         try {
-          connection.socket.send(JSON.stringify({ id, op, args: chunk.map(([, value]) => ({ channel: value.channel, instId: value.instId })) }))
+          connection.socket.send(JSON.stringify({ id, op, args: chunk.map(([, value]) => ({ ...value })) }))
           connection.commands.push(now)
         } catch (error) { this.lost(connection, 'WebSocket subscription failed.', error); return }
       }
@@ -289,13 +293,23 @@ class PublicMarketConnection {
       this.lost(connection, `OKX WebSocket ${message.event} (${message.code ?? 'unknown'}): ${message.msg ?? 'No details.'}`)
       return
     }
-    const key = keyFor({ instId: message.arg?.instId, channel: message.arg?.channel })
+    const key = keyFor(message.arg ?? {})
     const subscription = this.subscriptions.get(key)
     if (!subscription || connection.sent.get(key) !== subscription) return
     if (message.event === 'subscribe') {
       if (connection.pending.get(key)?.id !== message.id) return
       connection.pending.delete(key)
-      if (this.options.onSubscribed) {
+      if (subscription.channel === 'instruments') {
+        try {
+          const result = this.options.onInstrumentsReady?.({ signal: connection.controller.signal, receivedAt })
+          // A REST bootstrap can remain outstanding while deltas and market
+          // events keep arriving. The consumer owns buffering during bootstrap.
+          if (result?.then) this.track(Promise.resolve(result).catch(error => {
+            if (this.active(connection)) this.report('Instruments readiness callback failed.', error)
+            else if (error?.name !== 'AbortError') this.report('Instruments readiness callback failed.', error, 'log')
+          }))
+        } catch (error) { this.report('Instruments readiness callback failed.', error) }
+      } else if (this.options.onSubscribed) {
         try {
           const result = this.options.onSubscribed(subscription.instId, subscription.channel, { signal: connection.controller.signal, receivedAt })
           if (result?.then) this.track(Promise.resolve(result).catch(error => this.report('Subscription callback failed.', error)))
@@ -317,7 +331,9 @@ class PublicMarketConnection {
       if (!await connection.readyTask || !this.active(connection) || this.subscriptions.get(key) !== subscription) return
       const context = { signal: connection.controller.signal, receivedAt }
       const { instId, channel } = subscription
-      if (channel === 'trades') {
+      if (channel === 'instruments') {
+        await this.options.onInstruments(message.data, context)
+      } else if (channel === 'trades') {
         await this.options.onTrades(instId, message.data, context)
         this.telemetry.tradeEvents += message.data.length
       } else for (const raw of message.data) {
@@ -405,9 +421,15 @@ class PublicMarketConnection {
     if (connection.retired) return
     connection.retired = true
     connection.controller.abort()
+    if (this.options.instrumentsControl && this.options.onInstrumentsDisconnect) {
+      try {
+        const result = this.options.onInstrumentsDisconnect({ signal: connection.controller.signal, receivedAt: this.now() })
+        if (result?.then) this.track(Promise.resolve(result).catch(error => this.report('Instruments disconnect callback failed.', error, 'log')))
+      } catch (error) { this.report('Instruments disconnect callback failed.', error, 'log') }
+    }
     if (this.options.onDisconnect) {
       try {
-        const result = this.options.onDisconnect([...new Set([...connection.sent.values()].map(value => value.instId))], { signal: connection.controller.signal })
+        const result = this.options.onDisconnect([...new Set([...connection.sent.values()].filter(value => value.channel !== 'instruments').map(value => value.instId))], { signal: connection.controller.signal })
         if (result?.then) this.track(Promise.resolve(result).catch(error => this.report('Disconnect callback failed.', error, 'log')))
       } catch (error) { this.report('Disconnect callback failed.', error, 'log') }
     }
@@ -477,6 +499,12 @@ export class RealtimePublicMarket {
     this.closed = false
     this.closePromise = null
     this.changing = false
+    this.controlShard = null
+    if (typeof options.onInstruments === 'function') {
+      this.controlShard = this.makeShard(true)
+      this.controlShard.setSubscriptions([])
+      this.subscriptions = new Map(this.controlShard.subscriptions)
+    }
   }
 
   scheduleConnect(callback) {
@@ -501,8 +529,8 @@ export class RealtimePublicMarket {
     this.flushConnections()
   }
 
-  makeShard() {
-    const market = new PublicMarketConnection({ ...this.options, scheduleConnect: callback => this.scheduleConnect(callback), onState: () => this.publishState() })
+  makeShard(instrumentsControl = false) {
+    const market = new PublicMarketConnection({ ...this.options, instrumentsControl, scheduleConnect: callback => this.scheduleConnect(callback), onState: () => this.publishState() })
     this.shards.push(market)
     return market
   }
@@ -527,7 +555,7 @@ export class RealtimePublicMarket {
     }
     for (const { market, ids } of allocations) {
       market.setSubscriptions(ids)
-      if (!ids.length) {
+      if (!ids.length && market !== this.controlShard) {
         this.shards = this.shards.filter(value => value !== market)
         const closing = market.close().then(() => {
           this.addTelemetry(this.retiredTelemetry, market.getTelemetry())
