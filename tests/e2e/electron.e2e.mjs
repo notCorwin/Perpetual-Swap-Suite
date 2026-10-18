@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { _electron } from 'playwright'
 import { assertCompletePaints, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
 
+
 const root = new URL('../..', import.meta.url).pathname
 const userData = await mkdtemp(join(tmpdir(), 'perp-radar-e2e-'))
 let electron
@@ -342,6 +343,7 @@ test('the paint probe catches changed indicator geometry without a new snapshot 
     assert.equal(observation.retained, true, 'Repeated unchanged geometry must retain the detected violation.')
     assert.ok(report.violations.includes(observation.detected), 'Restoring valid geometry must not erase an earlier incorrect paint.')
   } finally { if (!report) await finishPaintProbe(page) }
+
 })
 
 test('mature local indicators and statistics stay drawn from the first scroll through prefetch, push and scroll end', async context => {

@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from './chart-acceptance.mjs'
+import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureNativeColdBoundary, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from './chart-acceptance.mjs'
 
 const root = new URL('..', import.meta.url).pathname
 
@@ -147,6 +147,7 @@ const delayedHistory = await withBenchmarkApp(async (electron, page, fixture) =>
 })
 
 const latencyCoveredPrefetch = await withBenchmarkApp(measureLatencyCoveredPrefetch)
+const nativeColdBoundary = await withBenchmarkApp((electron, page) => measureNativeColdBoundary(electron, page))
 
 console.log(JSON.stringify({
   generatedAt: new Date().toISOString(),
@@ -154,4 +155,5 @@ console.log(JSON.stringify({
   performance: performanceReport,
   delayedHistory,
   latencyCoveredPrefetch,
+  nativeColdBoundary,
 }, null, 2))

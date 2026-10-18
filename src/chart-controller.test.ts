@@ -112,6 +112,41 @@ test('historical navigation keeps the calculated viewport until the requested lo
   } finally { close() }
 })
 
+test('a partial resident viewport repairs missing prices instead of waiting forever for calculation', async () => {
+  const queue = transportQueue(), store = cached()
+  const controller = new ChartController({ ...queue.transport, history: async () => null }, store)
+  const close = controller.open(btc, '1H')
+  try {
+    const previous = controller.getSnapshot().presented
+    controller.scroll(-150)
+    await settled()
+    assert.equal(store.window(btc, '1H', 1_049 * hour)!.bars.length, 50)
+    assert.equal(controller.getSnapshot().presented, previous)
+    assert.equal(controller.getSnapshot().pending, true)
+    assert.equal(queue.calls.length, 1, 'A present end candle must not suppress acquisition of the missing preceding candles.')
+    assert.equal(queue.calls[0].target.end, 1_049 * hour)
+    queue.calls[0].resolve(prepared(btc, 1_049, { latestEnd: 1_199 * hour }))
+    await settled()
+    assert.equal(controller.getSnapshot().presented!.endHour, 1_049 * hour)
+    assert.equal(controller.getSnapshot().presented!.bars.length, 96)
+    assert.equal(controller.getSnapshot().pending, false)
+  } finally { close() }
+})
+
+test('prefetch starts before the complete viewport boundary even when its end candle is resident', () => {
+  const queue = transportQueue(), store = cached(1_000, 500)
+  const controller = new ChartController(queue.transport, store)
+  const close = controller.open(btc, '1H')
+  try {
+    assert.equal(queue.calls.length, 0)
+    controller.scroll(-30)
+    assert.equal(queue.calls.length, 1, 'The 95-candle viewport prefix is excluded from available runway.')
+    assert.equal(queue.calls[0].target.end, 1_094 * hour)
+    assert.equal(store.window(btc, '1H', 1_094 * hour)!.bars.length, 95)
+    assert.equal(controller.getSnapshot().pending, false)
+  } finally { close() }
+})
+
 test('a durable historical read bypasses an unresolved same-series provider request', async () => {
   const queue = transportQueue()
   let reads = 0
@@ -321,7 +356,7 @@ test('accelerating scrolling starts a bounded bulk prefetch before the ready edg
     now += 16
     controller.scroll(-24)
     assert.equal(queue.calls.length, 1)
-    assert.equal(queue.calls[0].target.end, 999 * hour, 'The next page starts before the earliest resident candle.')
+    assert.equal(queue.calls[0].target.end, 1_094 * hour, 'The next page ends just before the earliest complete viewport.')
     assert.ok(queue.calls[0].target.historyBars! > 96)
     assert.ok(queue.calls[0].target.historyBars! <= 4_096)
     assert.ok(controller.getSnapshot().presented!.endHour - 1_095 * hour > 1_000 * hour, 'Fast input gets more than a thousand candles of runway.')
@@ -379,7 +414,7 @@ test('measured slow preparation increases the reserve for later scrolling', asyn
     now += 1_000
     controller.scroll(-20)
     assert.equal(queue.calls.length, 2, 'An eight-second source response moves the trigger beyond the initial network budget.')
-    assert.equal(queue.calls[1].target.end, 198 * hour)
+    assert.equal(queue.calls[1].target.end, 293 * hour)
     assert.ok(queue.calls[1].target.historyBars! > queue.calls[0].target.historyBars!)
     assert.equal(controller.getSnapshot().pending, false)
   } finally { close() }

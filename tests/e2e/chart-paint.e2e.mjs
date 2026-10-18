@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
+import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureNativeColdBoundary, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
 
 // Foreground paint tests own their process. Hiding a previously shown native
 // window can suspend its animation frames, so functional tests use another app.
@@ -82,6 +82,11 @@ test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while specu
 })
 
 test('historical prefetch covers 1500 ms of network latency before the cold boundary during continuous wheel input', { timeout: 90_000 }, async () => {
-  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark', instId: 'PREFETCH-USDT-SWAP' }))
   await measureLatencyCoveredPrefetch(electron, page, fixture)
+})
+
+test('a never-downloaded native price page paints before the farther reserve and optional statistics finish', async context => {
+  const report = await measureNativeColdBoundary(electron, page)
+  context.diagnostic(`Native cold boundary: ${JSON.stringify(report)}`)
 })

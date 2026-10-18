@@ -289,3 +289,73 @@ export async function createChartAcquisitionFixture(store, marketService, { time
     return { ...await write(source, page), done: queue.length === 0, writes: writes.length }
   } }
 }
+
+// Unlike a delayed chart IPC response, these requests cross the real native
+// source adapter, history scheduler and SQLite page writer. Only the latest
+// tail exists initially; older reserve pages and both optional sources can be
+// held independently after the nearest price page has arrived.
+export async function createChartColdBoundaryFixture(store, marketService, { timeframe = '15m' } = {}) {
+  if (!['5m', '15m', '1H'].includes(timeframe)) throw new TypeError('Invalid cold-boundary timeframe.')
+  const instId = `COLD-${timeframe.toUpperCase()}-USDT-SWAP`
+  const intervalMS = { '5m': FIVE_MINUTES, '15m': 3 * FIVE_MINUTES, '1H': HOUR }[timeframe]
+  const periods = 8192, initialHistoryBars = 1000, targetDistance = initialHistoryBars - 95, sourceDelayMS = 100
+  const end = Math.floor(Date.now() / intervalMS) * intervalMS - intervalMS
+  const start = end - (periods - 1) * intervalMS, targetEnd = end - targetDistance * intervalMS
+  const firstMissingEnd = end - initialHistoryBars * intervalMS
+  const rows = Array.from({ length: periods }, (_, index) => {
+    const open = 130 + index * .009 + Math.sin(index / 19) * 1.1
+    const close = open + Math.cos(index / 7) * .31, volume = 3000 + index % 401
+    return { instrument: instId, timeframe, timestamp: start + index * intervalMS,
+      open, high: Math.max(open, close) + .6, low: Math.min(open, close) - .6, close,
+      volume, baseVolume: volume, quoteVolume: volume * close, confirmed: true,
+      oi: 2_000_000 + index * 113, buy: 70_000 + index % 701, sell: 60_000 + index % 601,
+      statisticsVersion: 1, statisticsSources: 3, statisticsObserved: true }
+  })
+  const original = marketService.get.bind(marketService), requests = []
+  let release
+  const released = new Promise(resolve => { release = resolve })
+  let holding = true
+  marketService.get = async (path, parameters, signal, priority) => {
+    if (parameters?.instId !== instId) return original(path, parameters, signal, priority)
+    const source = path === '/market/history-candles' ? 'candles'
+      : path === '/rubik/stat/contracts/open-interest-history' ? 'oi'
+        : path === '/rubik/stat/taker-volume-contract' ? 'taker' : null
+    if (!source || (source === 'candles' ? parameters.bar : parameters.period) !== timeframe) return original(path, parameters, signal, priority)
+    const through = source === 'candles' ? Number(parameters.after) - intervalMS : Number(parameters.end) - intervalMS
+    const from = source === 'candles' ? through - (Number(parameters.limit) - 1) * intervalMS : Number(parameters.begin) + intervalMS
+    const held = source !== 'candles' || through < firstMissingEnd
+    const request = { source, path, parameters: { ...parameters }, from, through, priority, held: held && holding,
+      startedAt: Date.now(), completedAt: null }
+    requests.push(request)
+    if (held && holding) await new Promise((resolve, reject) => {
+      const abort = () => { signal?.removeEventListener('abort', abort); reject(signal.reason ?? new Error('Cold-boundary request aborted.')) }
+      if (signal?.aborted) return abort()
+      signal?.addEventListener('abort', abort, { once: true })
+      released.then(() => { signal?.removeEventListener('abort', abort); resolve() })
+    })
+    await new Promise(resolve => setTimeout(resolve, sourceDelayMS))
+    signal?.throwIfAborted()
+    const page = rows.filter(row => row.timestamp >= from && row.timestamp <= through).reverse()
+    request.completedAt = Date.now()
+    return page.map(row => source === 'candles'
+      ? [row.timestamp, row.open, row.high, row.low, row.close, row.volume, row.baseVolume, row.quoteVolume, '1'].map(String)
+      : (source === 'oi' ? [row.timestamp, row.oi] : [row.timestamp, row.sell, row.buy]).map(String))
+  }
+  await persistNativeFixture(store, marketService, rows.slice(-initialHistoryBars))
+  const instrument = { instId, instCategory: '1', settleCcy: 'USDT', state: 'live', ctVal: '0.1', ctValCcy: 'COLD', listTime: String(start) }
+  const ticker = { instId, last: String(rows.at(-1).close), open24h: String(rows.at(-25).open), low24h: '100', high24h: '230',
+    bidPx: String(rows.at(-1).close - .01), askPx: String(rows.at(-1).close + .01), volCcy24h: '500000' }
+  marketService.instruments.set(instId, instrument)
+  marketService.catalogUpdatedAt = Date.now(); marketService.catalogSource = 'live'
+  marketService.replaceCatalog([{ instrument, ticker, result: { eligible: true, turnover: 90_000_000, oiUSD: 8_000_000,
+    spread: .01, depth: 300_000, slippage: .02 }, change24h: 5.2 }])
+  await marketService.ensureListTimeframe(timeframe)
+  await marketService.projectListEntry(instId, timeframe)
+  marketService.error = ''; marketService.lastRefreshAt = Date.now()
+  const fixture = { instId, timeframe, timeframes: [timeframe], intervalMS, end, start, periods,
+    initialHistoryBars, targetDistance, targetEnd, firstMissingEnd, sourceDelayMS,
+    series: { [timeframe]: { intervalMS, start, end, bars: barsWithIndicators(rows, intervalMS) } } }
+  return { fixture, read: () => ({ holding, requests: requests.map(request => ({ ...request })) }),
+    release: () => { holding = false; release() },
+    remove: () => { holding = false; release(); marketService.get = original } }
+}

@@ -529,6 +529,146 @@ test('a late historical SQL response cannot retarget or evict the newer requeste
   } finally { hold.resolve(); await pipeline.dispose() }
 })
 
+test('resident historical viewports reuse their canonical rows without another SQLite read', async () => {
+  const rows = source(3500), { pipeline, store } = fixture(rows)
+  try {
+    await pipeline.localHistory(instId, '15m', rows[2000].timestamp); await finishSeed(pipeline)
+    const reads = store.queries.length
+    const next = await pipeline.localHistory(instId, '15m', rows[1999].timestamp)
+    const viewport = next.bars.filter((value: any) => value.hour >= rows[1904].timestamp && value.hour <= rows[1999].timestamp)
+    assert.equal(viewport.length, 96)
+    assert.equal(viewport.every((value: any) => value.indicatorsObserved), true)
+    assert.equal(store.queries.length, reads, 'A resident cursor move must reuse rows and exact derived values.')
+  } finally { await pipeline.dispose() }
+})
+
+test('the first history gesture expands a resident latest tail into its durable navigation reserve', async () => {
+  const rows = source(3500), { pipeline, store } = fixture(rows)
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`)
+    assert.equal(state.rows.size, 128)
+    const before = store.queries.length
+    const historical = await pipeline.localHistory(instId, '15m', rows.at(-2)!.timestamp)
+    assert.ok(historical.bars.length >= 1280, 'A complete 96-candle viewport cannot substitute for the first bulk history admission.')
+    assert.ok(store.queries.slice(before).some(query => query.order === 'desc' && query.limit === 1536))
+    await finishSeed(pipeline)
+    const reads = store.queries.length
+    await pipeline.localHistory(instId, '15m', rows.at(-3)!.timestamp)
+    assert.equal(store.queries.length, reads, 'Later resident gestures reuse the admitted historical reserve.')
+
+    await pipeline.localHistory(instId, '15m', rows[1200].timestamp); await finishSeed(pipeline)
+    assert.ok(state.historyRange.through < rows.at(-96)!.timestamp)
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const tail = [...state.rows.values()].filter((row: any) => row.timestamp >= rows.at(-128)!.timestamp)
+    assert.equal(tail.length, 128, 'Returning from deep history restores only the latest tail.')
+    const afterDeepHistory = store.queries.length
+    const returned = await pipeline.localHistory(instId, '15m', rows.at(-2)!.timestamp)
+    assert.ok(returned.bars.filter((bar: any) => bar.hour >= rows.at(-1280)!.timestamp).length >= 1280,
+      'A deep-history interval cannot certify the latest navigation reserve.')
+    assert.ok(store.queries.slice(afterDeepHistory).some(query => query.order === 'desc' && query.limit === 1536))
+    await finishSeed(pipeline)
+    const admittedAgain = store.queries.length
+    await pipeline.localHistory(instId, '15m', rows.at(-3)!.timestamp)
+    assert.equal(store.queries.length, admittedAgain)
+
+    await pipeline.local(instId, '15m')
+    pipeline.invalidate(instId, '15m')
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    assert.equal(state.rows.size, 128)
+    const afterInvalidation = store.queries.length
+    const restored = await pipeline.localHistory(instId, '15m', rows.at(-2)!.timestamp)
+    assert.ok(restored.bars.length >= 1280, 'Invalidation also retires the previous bulk-history admission.')
+    assert.ok(store.queries.slice(afterInvalidation).some(query => query.order === 'desc' && query.limit === 1536))
+  } finally { await pipeline.dispose() }
+})
+
+test('a committed mutation invalidates resident history before its normal observer arrives', async () => {
+  const rows = source(2500), fixtureValue = await sqliteFixture(rows), { pipeline, store } = fixtureValue
+  try {
+    const target = rows[1800].timestamp
+    await pipeline.localHistory(instId, '15m', target); await finishSeed(pipeline)
+    const corrected = { ...rows[1750], close: rows[1750].close + .5 }
+    await store.appendCandles([corrected]) // Deliberately withhold pipeline.observe.
+    const next = await pipeline.localHistory(instId, '15m', target)
+    assert.equal(next.bars.find((value: any) => value.hour === corrected.timestamp).close, corrected.close)
+    await finishSeed(pipeline)
+    const oracle = new Map(buildIndicatorSeries(rows.map(row => row.timestamp === corrected.timestamp ? corrected : row), interval).bars.map((value: any) => [value.hour, value]))
+    for (const value of pipeline.historyFrame(pipeline.series.get(`${instId}:15m`), target).bars) if (value.indicatorsObserved) {
+      for (const field of indicatorFields) assert.equal(value[field], (oracle.get(value.hour) as any)[field])
+    }
+  } finally { await fixtureValue.close() }
+})
+
+test('a delayed historical SQL result reloads a durable correction before merging stale observations', async () => {
+  const rows = source(2500), fixtureValue = await sqliteFixture(rows), { pipeline, store } = fixtureValue
+  const hold = deferred(), started = deferred()
+  let reading: Promise<void> | undefined
+  try {
+    const target = rows[1800].timestamp
+    await pipeline.localHistory(instId, '15m', target); await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`), read = store.candles.bind(store)
+    let reads = 0
+    store.candles = async (query: any, priority: any) => {
+      const result = await read(query, priority)
+      if (query.order === 'desc') {
+        reads += 1
+        if (reads === 1) { started.resolve(); await hold.promise }
+      }
+      return result
+    }
+    reading = pipeline.read(state, target, 1536)
+    await started.promise
+    const corrected = { ...rows[1750], close: rows[1750].close + .5 }
+    await store.appendCandles([corrected]) // The normal observer is deliberately late.
+    hold.resolve(); await reading
+    assert.equal(reads, 2, 'A durable revision change rejects the delayed SQL snapshot before it enters the cache.')
+    assert.equal(state.rows.get(corrected.timestamp).close, corrected.close)
+    await pipeline.seed(state); await finishSeed(pipeline)
+    const oracle = new Map(buildIndicatorSeries(rows.map(row => row.timestamp === corrected.timestamp ? corrected : row), interval).bars.map((value: any) => [value.hour, value]))
+    for (const value of pipeline.historyFrame(state, target).bars) if (value.indicatorsObserved) {
+      for (const field of indicatorFields) assert.equal(value[field], (oracle.get(value.hour) as any)[field])
+    }
+  } finally { hold.resolve(); await reading; await fixtureValue.close() }
+})
+
+test('cold history publishes a mature nearest viewport before farther reserve pages or optional statistics finish', async () => {
+  const rows = source(2500), target = rows[1800].timestamp, hold = deferred(), reached = deferred()
+  const calls: { from: number; through: number }[] = [], frames: any[] = []
+  let fixtureValue: ReturnType<typeof fixture>, finished = false
+  fixtureValue = fixture(rows.slice(2100), {
+    async ensurePrices(_instrument: string, _timeframe: string, from: number, through: number) {
+      calls.push({ from, through })
+      if (through < target) { reached.resolve(); await hold.promise }
+      const page = rows.filter(row => row.timestamp >= from && row.timestamp <= through).map(row => ({ ...row, oi: null, buy: null, sell: null, statisticsVersion: null })), prior = new Map()
+      for (const row of page) for (const [hour, value] of fixtureValue.store.change(row)) prior.set(hour, value)
+      fixtureValue.pipeline.observe(page, prior)
+    },
+    async ensureStatistics() { await hold.promise },
+  })
+  const { pipeline, store } = fixtureValue
+  let preparation: Promise<unknown> | undefined
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    pipeline.subscribe((frame: any) => frames.push(frame))
+    preparation = pipeline.prepare(instId, '15m', target, 4096).then(() => { finished = true })
+    await reached.promise
+    const ready = frames.find(frame => frame.endHour === target && frame.indicatorState === 'ready')
+    assert.ok(ready, 'The nearest requested viewport must publish exact mature curves before another source page starts.')
+    const viewport = ready.bars.filter((value: any) => value.hour >= target - 95 * interval && value.hour <= target)
+    assert.equal(viewport.length, 96)
+    assert.equal(ready.oiState, 'loading'); assert.equal(ready.takerState, 'loading')
+    const oracle = new Map(buildIndicatorSeries(store.rows, interval).bars.map((value: any) => [value.hour, value]))
+    for (const value of viewport) for (const field of indicatorFields) assert.equal(value[field], (oracle.get(value.hour) as any)[field])
+    assert.deepEqual(calls[0], { from: target - 299 * interval, through: target })
+    assert.equal(calls[1].through, target - 300 * interval)
+    assert.equal(finished, false, 'The bulk request retains ownership of its unfinished reserve.')
+    hold.resolve(); await preparation; await finishSeed(pipeline)
+    assert.equal(calls.at(-1)!.from, target - 1279 * interval, 'The resident limit also includes its 256 newer candles.')
+    assert.ok(calls.every(call => (call.through - call.from) / interval + 1 <= 300))
+  } finally { hold.resolve(); await preparation; await pipeline.dispose() }
+})
+
 test('an upgrade ignores poisoned v3 checkpoints even when they carry the current durable watermark', async () => {
   const rows = source(3500), { pipeline, store } = fixture(rows)
   const legacyVersion = 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v3'

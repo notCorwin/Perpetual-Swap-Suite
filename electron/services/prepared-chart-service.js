@@ -3,7 +3,7 @@ import { availableParallelism } from 'node:os'
 import { statisticsMask, statisticsVersionFor } from './statistics-state.js'
 import { appendIndicatorCandle, projectIndicatorCandle } from './indicators.js'
 
-const VISIBLE = 96, TAIL = 128, CHUNK = 1024, HISTORY = 1536
+const VISIBLE = 96, TAIL = 128, CHUNK = 1024, HISTORY = 1536, HISTORY_AHEAD = 256, HISTORY_PAGE = 300
 // v4 also identifies the verified checkpoint producer. Older producers could
 // persist a stale recursive core under a newer source revision.
 const FORMULA_VERSION = 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v4'
@@ -240,12 +240,13 @@ export class PreparedChartPipeline {
 
   async readRows(state, end, limit, priority) {
     const ceiling = Math.floor(Date.now() / state.intervalMS) * state.intervalMS - state.intervalMS
-    const through = end === undefined || end === null ? ceiling : Math.min(end + 256 * state.intervalMS, ceiling)
-    const from = end === undefined || end === null ? undefined : Math.max(0, end - (limit - 257) * state.intervalMS)
+    const through = end === undefined || end === null ? ceiling : Math.min(end + HISTORY_AHEAD * state.intervalMS, ceiling)
+    const from = end === undefined || end === null ? undefined : Math.max(0, end - (limit - HISTORY_AHEAD - 1) * state.intervalMS)
     const admittedPrice = state.priceVersion, admittedOI = state.oiVersion, admittedTaker = state.takerVersion
+    const residentRevision = this.store.candleRevision?.(state.instId, state.timeframe)
     const rows = await this.store.candles({ instrument: state.instId, timeframe: state.timeframe, from, through, limit, order: 'desc' }, priority)
     if (this.closed) return
-    if (admittedPrice !== state.priceVersion) return this.readRows(state, end, limit, priority)
+    if (admittedPrice !== state.priceVersion || residentRevision !== this.store.candleRevision?.(state.instId, state.timeframe)) return this.readRows(state, end, limit, priority)
     let pricesChanged = false, observationsChanged = false, changedFrom = Infinity, oiChanged = false, takerChanged = false
     for (const row of rows) if (row.confirmed) {
       const previous = state.rows.get(row.timestamp), value = mergeStatistics(previous, this.normalize(row), (admittedOI === state.oiVersion ? 1 : 0) | (admittedTaker === state.takerVersion ? 2 : 0))
@@ -266,6 +267,11 @@ export class PreparedChartPipeline {
     const listing = Number(this.instrument(state.instId)?.listTime)
     state.floor = Number.isFinite(listing) && listing > 0 ? Math.floor(listing / state.intervalMS) * state.intervalMS : null
     state.loaded = true
+    if (limit === HISTORY) {
+      const hours = rows.filter(row => row.confirmed).map(row => row.timestamp)
+      state.historyRange = hours.length ? { from: Math.min(...hours), through: Math.max(...hours),
+        revision: residentRevision === this.store.candleRevision?.(state.instId, state.timeframe) ? residentRevision : null } : null
+    }
     this.updateMemory(state)
     const live = this.liveStates.get(state.key)
     if (live?.live) { state.live = live.live; state.observedAt = live.observedAt }
@@ -332,13 +338,23 @@ export class PreparedChartPipeline {
     const state = this.state(instId, timeframe)
     const request = state.historyRequest = (state.historyRequest ?? 0) + 1
     state.historyEnd = targetEnd ?? state.latestHour
-    await this.job(`history:${state.key}:${targetEnd ?? 'latest'}`, () => this.read(state, targetEnd, HISTORY))
+    const end = targetEnd ?? state.latestHour
+    const from = Math.max(0, end - (VISIBLE - 1) * state.intervalMS, state.floor ?? 0)
+    // The local mutation counter also fences a commit whose normal observer
+    // has not arrived yet. Reuse never certifies an older durable observation.
+    // A latest tail is only 128 rows. A bulk admission belongs to the actual
+    // returned interval; a previous deep-history read cannot certify that tail.
+    const admitted = state.historyRange
+    let resident = Boolean(state.loaded && admitted && end !== null && from >= admitted.from && end <= admitted.through
+      && admitted.revision === this.store.candleRevision?.(instId, timeframe))
+    for (let hour = from; resident && hour <= end; hour += state.intervalMS) resident = numeric(state.rows.get(hour)?.baseVolume)
+    if (!resident) await this.job(`history:${state.key}:${targetEnd ?? 'latest'}`, () => this.read(state, targetEnd, HISTORY))
     if (request === state.historyRequest) state.historyEnd = targetEnd ?? state.latestHour
     this.seed(state, 'foreground')
-    this.refreshObservations(state, targetEnd)
-    const end = targetEnd ?? state.latestHour
-    const frame = this.historyFrame(state, end)
-    if (request === state.historyRequest) state.publishedHistoryKey = this.historyKey(state, end)
+    this.refreshObservations(state, targetEnd, VISIBLE, targetEnd === undefined ? VISIBLE : HISTORY_PAGE)
+    const currentEnd = targetEnd ?? state.latestHour
+    const frame = this.historyFrame(state, currentEnd)
+    if (request === state.historyRequest) state.publishedHistoryKey = this.historyKey(state, currentEnd)
     return frame.bars.length || frame.liveBar ? frame : null
   }
 
@@ -346,22 +362,47 @@ export class PreparedChartPipeline {
     if (!intervalFor(timeframe) || targetEnd !== undefined && !Number.isFinite(targetEnd)) throw new Error('Invalid chart target.')
     let frame = targetEnd === undefined ? await this.local(instId, timeframe) : await this.localHistory(instId, timeframe, targetEnd)
     const state = this.state(instId, timeframe)
-    const prices = this.refreshObservations(state, targetEnd, Math.min(4096, historyBars))
-    if (!frame?.bars.length && !frame?.liveBar && prices) {
-      await prices
-      frame = targetEnd === undefined ? this.frame(state) : this.historyFrame(state, targetEnd)
+    state.active += 1
+    try {
+      const prices = this.refreshObservations(state, targetEnd, VISIBLE, targetEnd === undefined ? VISIBLE : HISTORY_PAGE)
+      if (targetEnd !== undefined) {
+        // One native page makes the nearest viewport usable, including the
+        // recursive indicators' warmup. Publish it before downloading farther
+        // reserve pages; the renderer can advance while this request continues.
+        await prices
+        await this.seed(state, 'foreground')
+        while (!this.closed && state.calculation) await state.calculation
+        this.publish(state)
+        const reserve = Math.max(HISTORY_PAGE, Math.min(HISTORY - HISTORY_AHEAD, historyBars))
+        for (let loaded = HISTORY_PAGE; !this.closed && loaded < reserve; loaded += HISTORY_PAGE) {
+          const through = targetEnd - loaded * state.intervalMS
+          if (through < Math.max(0, state.floor ?? 0)) break
+          await this.refreshObservations(state, through, Math.min(HISTORY_PAGE, reserve - loaded))
+          await this.seed(state, 'foreground')
+          while (!this.closed && state.calculation) await state.calculation
+          this.publish(state)
+        }
+        frame = this.historyFrame(state, targetEnd)
+      } else if (!frame?.bars.length && !frame?.liveBar && prices) {
+        await prices
+        frame = this.frame(state)
+      }
+      return frame ?? this.frame(state)
+    } finally {
+      state.active -= 1
+      this.trim()
     }
-    return frame ?? this.frame(state)
   }
 
-  refreshObservations(state, targetEnd, historyBars = VISIBLE) {
+  refreshObservations(state, targetEnd, historyBars = VISIBLE, priceBars = historyBars) {
     const { instId, timeframe, intervalMS: step } = state
     const end = targetEnd ?? Math.floor(Date.now() / step) * step - step
     const from = Math.max(0, end - (historyBars - 1) * step, state.floor ?? 0)
+    const priceFrom = Math.max(0, end - (priceBars - 1) * step, state.floor ?? 0)
     let pricesMissing = false, statisticsMissing = false
+    for (let hour = priceFrom; hour <= end; hour += step) if (!numeric(state.rows.get(hour)?.baseVolume)) { pricesMissing = true; break }
     for (let hour = from; hour <= end; hour += step) {
       const row = state.rows.get(hour)
-      if (!row || !numeric(row.baseVolume)) pricesMissing = true
       if (!row || !sourceFresh(row, 1) || !sourceFresh(row, 2)) statisticsMissing = true
     }
     if (statisticsMissing && typeof this.history.ensureStatistics === 'function') {
@@ -372,15 +413,15 @@ export class PreparedChartPipeline {
         return true
       })?.catch(() => {})
     }
-    if (!pricesMissing) return null
-    const task = this.sourceJob(`prices:${state.key}:${from}:${end}`, async () => {
+    if (!pricesMissing || !this.history.ensurePrices && !this.history.latest) return null
+    const task = this.sourceJob(`prices:${state.key}:${priceFrom}:${end}`, async () => {
       if (targetEnd === undefined && state.latestHour < end && typeof this.history.latest === 'function') {
         const result = await this.history.latest(instId, timeframe, 'foreground')
         if (result?.live) await this.setLive(instId, timeframe, result.live)
-      } else if (typeof this.history.ensurePrices === 'function') await this.history.ensurePrices(instId, timeframe, from, end, 'foreground')
+      } else if (typeof this.history.ensurePrices === 'function') await this.history.ensurePrices(instId, timeframe, priceFrom, end, 'foreground')
       await this.read(state, targetEnd, targetEnd === undefined ? TAIL : HISTORY)
       this.seed(state, 'foreground'); this.publish(state)
-      for (let hour = from; hour <= end; hour += step) if (!numeric(state.rows.get(hour)?.baseVolume)) return false
+      for (let hour = priceFrom; hour <= end; hour += step) if (!numeric(state.rows.get(hour)?.baseVolume)) return false
       return true
     })
     task?.catch(() => {})
@@ -643,7 +684,7 @@ export class PreparedChartPipeline {
   invalidate(instId, timeframe) {
     const state = this.series.get(seriesKey(instId, timeframe)), live = this.liveStates.get(seriesKey(instId, timeframe))
     for (const current of [state, live].filter(Boolean)) {
-      current.priceVersion += 1; current.generation = ++this.nextGeneration; current.indicatorState = null; current.indicators.clear(); current.loaded = false; current.rows.clear(); current.latestHour = null
+      current.priceVersion += 1; current.generation = ++this.nextGeneration; current.indicatorState = null; current.indicators.clear(); current.loaded = false; current.historyRange = null; current.rows.clear(); current.latestHour = null
     }
     this.snapshots.delete(seriesKey(instId, timeframe))
     if (state) (state.historyEnd != null ? this.localHistory(instId, timeframe, state.historyEnd) : this.local(instId, timeframe)).catch(() => {})

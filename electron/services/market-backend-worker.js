@@ -4,11 +4,11 @@ import { MetadataStore } from './metadata-store.js'
 import { MarketStore } from './market-store.js'
 import { MarketService } from './market-service.js'
 import { ChartNotificationEncoder } from './chart-notifications.js'
-import { createChartAcquisitionFixture, seedCachedListProjection, seedChartScrollBenchmark, seedHistoricalStatisticsBoundary, seedInstrumentNavigationBenchmark } from '../e2e-fixtures.js'
+import { createChartAcquisitionFixture, createChartColdBoundaryFixture, seedCachedListProjection, seedChartScrollBenchmark, seedHistoricalStatisticsBoundary, seedInstrumentNavigationBenchmark } from '../e2e-fixtures.js'
 import { backgroundArchiveRows, seedMarketResources, startBackgroundArchive } from '../market-resource-fixtures.js'
 
 let metadata, store, service, preferences, sourceProbe
-let resourceFixture, acquisitionFixture
+let resourceFixture, acquisitionFixture, coldBoundaryFixture
 const emit = (name, value) => parentPort.postMessage({ type: 'event', name, value })
 const offline = async (_input, { signal } = {}) => {
   if (workerData.e2eLiveRefresh) await new Promise((resolve, reject) => {
@@ -77,6 +77,15 @@ async function request(value) {
 
 async function probe(input) {
   if (!workerData.testMode) throw new Error('Backend probes are unavailable outside tests.')
+  if (input.action === 'seedChartScrollBenchmark') return seedChartScrollBenchmark(store, service, { instId: input.instId })
+  if (input.action === 'coldBoundaryInstall') {
+    coldBoundaryFixture?.remove()
+    coldBoundaryFixture = await createChartColdBoundaryFixture(store, service, input)
+    return coldBoundaryFixture.fixture
+  }
+  if (input.action === 'coldBoundaryRead') return coldBoundaryFixture?.read() ?? null
+  if (input.action === 'coldBoundaryRelease') { coldBoundaryFixture?.release(); return { ok: true } }
+  if (input.action === 'coldBoundaryRemove') { coldBoundaryFixture?.remove(); coldBoundaryFixture = null; return { ok: true } }
   if (input.action === 'acquisitionInstall') {
     acquisitionFixture = await createChartAcquisitionFixture(store, service, input)
     return acquisitionFixture.fixture
