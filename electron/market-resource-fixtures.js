@@ -91,3 +91,32 @@ export async function seedMarketResources(store, service, { count = 287, periods
     },
   }
 }
+
+export const backgroundArchiveRows = async store => (await Promise.all(Object.keys(intervals).map(timeframe => store.coverage('LOAD-USDT-SWAP', timeframe))))
+  .reduce((sum, value) => sum + value.count, 0)
+
+/** Admit real archive work before starting the timed renderer measurements. */
+export async function startBackgroundArchive(store, service, { timeoutMS = 180_000, pollMS = 100 } = {}) {
+  const initialRows = await backgroundArchiveRows(store)
+  const original = service.get.bind(service)
+  service.get = async (path, parameters, ...rest) => {
+    if (parameters?.instId !== 'LOAD-USDT-SWAP') return original(path, parameters, ...rest)
+    if (path !== '/market/history-candles') return []
+    const step = intervals[parameters.bar]
+    const end = Math.floor((Number(parameters.after) - 1) / step) * step
+    return Array.from({ length: Number(parameters.limit) }, (_, index) => [String(end - index * step), '100', '102', '99', '101', '100', '100', '10100', '1'])
+  }
+  service.instruments.set('LOAD-USDT-SWAP', { instId: 'LOAD-USDT-SWAP' })
+  await service.history.target('LOAD-USDT-SWAP', { historyDays: 30 })
+  await service.dataAuditRequest({ action: 'start' })
+  // Enqueueing is not evidence of load: a native candle boundary can put
+  // hundreds of existing series ahead of LOAD in the fair background queue.
+  const deadline = performance.now() + timeoutMS
+  while (true) {
+    service.shutdownController.signal.throwIfAborted()
+    const writtenRecords = await backgroundArchiveRows(store)
+    if (writtenRecords > initialRows) return { ok: true, initialRows, writtenRecords }
+    if (performance.now() >= deadline) throw new Error(`Background archive readiness timed out after ${timeoutMS} ms without a new LOAD candle commit.`)
+    await new Promise(resolve => setTimeout(resolve, Math.min(pollMS, Math.max(1, deadline - performance.now()))))
+  }
+}

@@ -5,7 +5,7 @@ import { MarketStore } from './market-store.js'
 import { MarketService } from './market-service.js'
 import { ChartNotificationEncoder } from './chart-notifications.js'
 import { seedCachedListProjection, seedChartScrollBenchmark, seedHistoricalStatisticsBoundary, seedInstrumentNavigationBenchmark } from '../e2e-fixtures.js'
-import { seedMarketResources } from '../market-resource-fixtures.js'
+import { backgroundArchiveRows, seedMarketResources, startBackgroundArchive } from '../market-resource-fixtures.js'
 
 let metadata, store, service, preferences, sourceProbe
 let resourceFixture
@@ -116,25 +116,12 @@ async function probe(input) {
     return { ok: true }
   }
   if (input.action === 'diagnostics') return { backendThreadId: threadId, tasks: service.history.sync.listTasks(), writeMetrics: store.getWriteMetrics() }
-  if (input.action === 'backgroundStart') {
-    const original = service.get.bind(service)
-    service.get = async (path, parameters, ...rest) => {
-      if (parameters?.instId !== 'LOAD-USDT-SWAP') return original(path, parameters, ...rest)
-      if (path !== '/market/history-candles') return []
-      const step = { '5m': 300_000, '15m': 900_000, '1H': 3_600_000 }[parameters.bar]
-      const end = Math.floor((Number(parameters.after) - 1) / step) * step
-      return Array.from({ length: Number(parameters.limit) }, (_, index) => [String(end - index * step), '100', '102', '99', '101', '100', '100', '10100', '1'])
-    }
-    service.instruments.set('LOAD-USDT-SWAP', { instId: 'LOAD-USDT-SWAP' })
-    await service.history.target('LOAD-USDT-SWAP', { historyDays: 30 })
-    await service.dataAuditRequest({ action: 'start' })
-    return { ok: true }
-  }
+  if (input.action === 'backgroundStart') return startBackgroundArchive(store, service)
   if (input.action === 'backgroundStatus') {
     const audit = await service.dataAuditRequest({ action: 'status' }), tasks = service.history.sync.listTasks()
     const result = { source: 'offline synthetic source; worker backend, HistorySync and SQLite WAL',
       audit: { phase: audit.phase, progress: audit.progress }, tasks: tasks.length,
-      writtenRecords: tasks.reduce((sum, task) => sum + (task.writtenRecords ?? 0), 0), writeMetrics: store.getWriteMetrics() }
+      writtenRecords: tasks.reduce((sum, task) => sum + (task.writtenRecords ?? 0), 0), archiveRows: await backgroundArchiveRows(store), writeMetrics: store.getWriteMetrics() }
     await service.dataAuditRequest({ action: 'cancel' })
     return result
   }
