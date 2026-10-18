@@ -96,6 +96,40 @@ export async function smokeElectron({ app, revision, report: reportPath }) {
   try {
     await launch()
     report.checks.push('packaged executable, revision, window, preload isolation')
+    const streamingLiquidity = await deadline(electron.evaluate(async ({ app: desktopApp }) => {
+      const { join: joinPath } = process.getBuiltinModule('node:path')
+      const { pathToFileURL, fileURLToPath } = process.getBuiltinModule('node:url')
+      const requireModule = process.getBuiltinModule('node:module').createRequire(joinPath(desktopApp.getAppPath(), 'package.json'))
+      const serviceURL = pathToFileURL(joinPath(desktopApp.getAppPath(), 'electron/services/stream-liquidity.js')).href
+      const preferencesURL = pathToFileURL(joinPath(desktopApp.getAppPath(), 'electron/services/preferences.js')).href
+      const { StreamLiquidityEvaluator } = requireModule(fileURLToPath(serviceURL))
+      const { DEFAULT_PREFERENCES } = requireModule(fileURLToPath(preferencesURL))
+      const config = structuredClone(DEFAULT_PREFERENCES.liquidity)
+      for (const [key, criterion] of Object.entries(config)) criterion.enabled = key === 'depth' || key === 'slippage'
+      const evaluator = new StreamLiquidityEvaluator()
+      try {
+        const result = await evaluator.evaluate({
+          instrument: {
+            instId: 'BTC-USDT-SWAP', instType: 'SWAP', instCategory: '1', settleCcy: 'USDT', ctType: 'linear',
+            state: 'live', ruleType: 'normal', ctVal: '0.01', ctMult: '1', ctValCcy: 'BTC',
+          },
+          ticker: { last: '100', bidPx: '99.99', askPx: '100' },
+          book: { bids: [['99.99', '1000000']], asks: [['100', '1000000']] },
+          config,
+        })
+        return { serviceURL, threadId: evaluator.worker?.threadId, result }
+      } finally { await evaluator.close() }
+    }), 'Packaged streaming liquidity worker', 20_000)
+    assert.ok(streamingLiquidity.serviceURL.includes('/app.asar/electron/services/stream-liquidity.js'), 'Streaming liquidity must load from the candidate app archive.')
+    assert.ok(Number.isSafeInteger(streamingLiquidity.threadId) && streamingLiquidity.threadId > 0, 'Streaming liquidity must execute in a packaged worker thread.')
+    assert.equal(streamingLiquidity.result.eligible, true)
+    assert.equal(streamingLiquidity.result.status, 'verified')
+    assert.equal(streamingLiquidity.result.depthBid, 999_900, 'Contract sizes must convert to USDT depth using the explicit contract value.')
+    assert.equal(streamingLiquidity.result.depthAsk, 1_000_000)
+    assert.equal(streamingLiquidity.result.bidSlippage, 0)
+    assert.equal(streamingLiquidity.result.askSlippage, 0)
+    assert.deepEqual(streamingLiquidity.result.checks.filter(check => ['depth', 'slippage'].includes(check.key)).map(check => check.status), ['verified', 'verified'])
+    report.checks.push('packaged streaming liquidity worker')
     const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
     assert.equal(typeof fixture.instId, 'string')
     assert.ok(Number.isSafeInteger(fixture.end))

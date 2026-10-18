@@ -40,7 +40,9 @@ export type RealtimeMarketOptions<Candle extends CandleRecord = CandleRecord> = 
   onForming: (candle: Candle, context: RealtimeEventContext) => void | Promise<void>
   /** Must resolve after durable ingestion/publication. Close drains, rather than aborts, accepted writes. */
   onConfirmed: (candle: Candle, context: RealtimeEventContext) => void | Promise<void>
-  /** A new connection waits for gap repair before publishing its candle events. */
+  /** Repairs gaps alongside live delivery; failures retry without closing a healthy socket.
+   * Must coordinate durable mutations with onConfirmed. Close aborts and drains repairs.
+   */
   onReconnect: (subscriptions: RealtimeSubscription[], context: { signal: AbortSignal }) => void | Promise<void>
   onState?: (state: RealtimeMarketState) => void | Promise<void>
   webSocketFactory?: WebSocketFactory

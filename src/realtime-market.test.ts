@@ -237,15 +237,16 @@ test('subscription acknowledgements have independent deadlines and stale acknowl
   assert.match(f.market.getState().error, /acknowledgement timed out/)
 })
 
-test('reconnect drains old writes, repairs gaps, resubscribes native channels, and cancels obsolete streams', async t => {
+test('reconnect streams immediately during gap repair and keeps old writes as a barrier only for their own series', async t => {
   const write = deferred(), repair = deferred(), repairs: RealtimeSubscription[][] = [], order: string[] = []
   const f = fixture({
     onConfirmed: async () => { order.push('write'); await write.promise; order.push('durable') },
     onReconnect: async subscriptions => { repairs.push(subscriptions); order.push('repair'); await repair.promise },
   })
-  t.after(() => f.market.close())
-  const first = await f.open()
+  t.after(async () => { write.resolve(); repair.resolve(); await f.market.close() })
+  const first = await f.open([btc, eth])
   push(first, raw(epoch, 101, 1, true))
+  push(first, raw(epoch + 300_000, 199))
   await turn()
   first.finishClose(1006, 'Connection lost')
   assert.equal(f.market.getState().status, 'reconnecting')
@@ -256,21 +257,26 @@ test('reconnect drains old writes, repairs gaps, resubscribes native channels, a
   const second = f.sockets[1]
   second.open()
   push(second, raw(epoch + 300_000, 102))
+  push(second, raw(epoch, 104), eth)
   await turn()
-  assert.deepEqual(order, ['write'])
-  assert.equal(f.forming.length, 0)
+  assert.deepEqual(order, ['write', 'repair'])
+  assert.deepEqual(f.forming.map(candle => [candle.instrument, candle.close]), [[eth.instId, 104]])
+  assert.equal(f.market.getState().status, 'live')
+  assert.equal(f.market.getState().error, '')
   write.resolve()
   await turn()
-  assert.deepEqual(order, ['write', 'durable', 'repair'])
-  assert.match(f.market.getState().error, /Connection lost/)
+  assert.deepEqual(order, ['write', 'repair', 'durable'])
+  assert.equal(f.market.getForming(btc.instId, btc.timeframe)?.close, 102)
   f.market.setSubscriptions([btc, eth, sol])
+  push(second, raw(epoch, 105), sol)
   await turn()
-  assert.equal(f.market.getState().status, 'reconnecting')
+  assert.equal(f.market.getState().status, 'live')
+  assert.equal(f.market.getForming(sol.instId, sol.timeframe)?.close, 105)
   repair.resolve()
   await f.market.whenIdle()
-  assert.deepEqual(repairs, [[btc], [eth, sol]])
+  assert.deepEqual(repairs, [[btc, eth], [sol]])
   assert.equal(f.market.getState().status, 'live')
-  assert.equal(f.forming.length, 1)
+  assert.equal(f.forming.length, 3)
   assert.deepEqual(second.commands().filter(message => message.op === 'subscribe').flatMap(message => message.args.map((arg: { channel: string }) => arg.channel)), ['candle5m', 'candle1H', 'candle15m'])
   f.market.setSubscriptions([eth, sol])
   push(second, raw(epoch + 300_000, 103))
@@ -279,7 +285,7 @@ test('reconnect drains old writes, repairs gaps, resubscribes native channels, a
   assert.equal(second.commands().at(-1).op, 'unsubscribe')
   assert.deepEqual(second.commands().at(-1).args, [{ channel: 'candle5m', instId: btc.instId }])
   assert.equal(f.market.getForming(btc.instId, btc.timeframe), null)
-  assert.equal(f.forming.length, 1)
+  assert.equal(f.forming.length, 3)
   assert.equal(f.market.getTelemetry().reconnects, 1)
   second.message({ event: 'notice', code: '64008', msg: 'Reconnect for upgrade.' })
   await f.market.whenIdle()
@@ -288,6 +294,45 @@ test('reconnect drains old writes, repairs gaps, resubscribes native channels, a
   await f.clock.advance(60_000)
   assert.equal(f.sockets.length, 2)
   assert.equal(f.market.getState().status, 'disconnected')
+})
+
+test('failed gap repair retries with bounded backoff while healthy live events continue', async t => {
+  let calls = 0
+  const repaired = deferred()
+  const f = fixture({ reconnectBaseMs: 100, reconnectMaxMs: 250, onReconnect: async () => {
+    if (++calls <= 3) throw new Error('History is unavailable.')
+    await repaired.promise
+  } })
+  t.after(async () => { repaired.resolve(); await f.market.close() })
+  const first = await f.open()
+  first.finishClose(1006)
+  await f.clock.advance(100)
+  const second = f.sockets[1]
+  second.open()
+  await f.market.whenIdle()
+  assert.equal(calls, 1)
+  assert.equal(f.market.getState().status, 'live')
+  assert.match(f.market.getState().error, /History is unavailable/)
+  push(second, raw(epoch, 101))
+  await f.market.whenIdle()
+  assert.equal(f.forming.length, 1)
+  assert.match(f.market.getState().error, /History is unavailable/)
+  await f.clock.advance(99)
+  assert.equal(calls, 1)
+  await f.clock.advance(1)
+  assert.equal(calls, 2)
+  await f.clock.advance(200)
+  assert.equal(calls, 3)
+  await f.clock.advance(250)
+  assert.equal(calls, 4)
+  push(second, raw(epoch, 102, 2))
+  await turn()
+  assert.equal(f.market.getForming(btc.instId, btc.timeframe)?.close, 102)
+  assert.equal(f.sockets.length, 2, 'Historical failures must not reconnect a healthy transport.')
+  repaired.resolve()
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().error, '')
+  assert.equal(f.market.getState().status, 'live')
 })
 
 test('connection failures back off to a bounded delay, and an empty universe cancels retry', async () => {
@@ -403,7 +448,7 @@ test('native decoding preserves receive order and shutdown drains decoding and c
   assert.equal(r.clock.timers.size, 0)
 })
 
-test('repeated disconnects serialize recovery callbacks even when no candle event has queued', async t => {
+test('repeated disconnects serialize repairs while the newest transport continues delivering candles', async t => {
   const firstRepair = deferred()
   let calls = 0, active = 0, maxActive = 0
   const signals: AbortSignal[] = []
@@ -414,7 +459,7 @@ test('repeated disconnects serialize recovery callbacks even when no candle even
     if (calls === 1) await firstRepair.promise
     active--
   } })
-  t.after(() => f.market.close())
+  t.after(async () => { firstRepair.resolve(); await f.market.close() })
   const first = await f.open()
   first.finishClose(1006)
   await f.clock.advance(1_000)
@@ -428,6 +473,10 @@ test('repeated disconnects serialize recovery callbacks even when no candle even
   await turn()
   assert.equal(signals[0].aborted, true)
   assert.equal(calls, 1)
+  push(f.sockets[2], raw(epoch, 103))
+  await turn()
+  assert.equal(f.market.getForming(btc.instId, btc.timeframe)?.close, 103)
+  assert.equal(f.market.getState().status, 'live')
   firstRepair.resolve()
   await f.market.whenIdle()
   assert.equal(calls, 2)

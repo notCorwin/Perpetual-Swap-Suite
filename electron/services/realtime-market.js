@@ -44,7 +44,6 @@ export class RealtimeMarket {
     this.series = new Map()
     this.tasks = new Set()
     this.retirements = new Set()
-    this.controller = new AbortController()
     this.durableController = new AbortController()
     this.started = false
     this.closed = false
@@ -108,6 +107,9 @@ export class RealtimeMarket {
   }
 
   async whenIdle() {
+    // Synchronous socket operations may enqueue their acknowledgements as
+    // microtasks. Include decoding admitted by those operations in this drain.
+    await Promise.resolve()
     while (this.tasks.size) await Promise.allSettled([...this.tasks])
   }
 
@@ -177,37 +179,43 @@ export class RealtimeMarket {
     this.hasOpened = true
     if (connection.wasReconnect) this.telemetry.reconnects++
     this.clearConnectionTimer(connection, 'connect')
-    const priorTails = [...this.series.values()].map(series => series.tail)
-    const priorRecovery = this.recoveryTail
-    // Queue incoming events behind gap repair, including events that arrive
-    // synchronously from an injected socket during subscribe().
-    connection.readyTask = this.track(Promise.resolve().then(async () => {
-      if (connection.wasReconnect && this.active(connection)) {
-        // Aborting an older repair does not prove its durable work has stopped.
-        await priorRecovery
-        // Finish accepted writes from the previous connection before REST gap
-        // repair can revise the same periods. Capture before new events queue.
-        await Promise.allSettled(priorTails)
-        const repaired = new Set()
-        while (this.active(connection)) {
-          const missing = [...this.subscriptions.values()].filter(value => !repaired.has(value))
-          if (!missing.length) break
-          await this.options.onReconnect(missing.map(copy), { signal: connection.controller.signal })
-          missing.forEach(value => repaired.add(value))
-        }
-      }
-      if (!this.active(connection)) return false
-      connection.ready = true
-      this.maybeLive(connection)
-      return true
-    }).catch(error => {
-      if (this.active(connection)) this.lost(connection, 'Reconnect gap repair failed.', error)
-      else if (error?.name !== 'AbortError') this.report('Reconnect gap repair failed.', error, 'log')
-      return false
-    }))
-    this.recoveryTail = connection.readyTask
+    // Live delivery has only its own series' accepted-callback barrier. A
+    // missing historical range must never hold every instrument's next tick.
+    // The consumer coordinates historical and live durable mutations.
+    connection.ready = true
+    connection.repaired = new Set()
+    connection.recoveryAttempt = 0
+    connection.recoveryError = ''
+    if (connection.wasReconnect) this.recover(connection)
     this.flushSubscriptions(connection)
     this.armHeartbeat(connection)
+  }
+
+  recover(connection) {
+    if (!this.active(connection) || connection.recoveryTask) return
+    const previous = this.recoveryTail
+    const task = Promise.resolve(previous).then(async () => {
+      // Cancellation does not prove the previous consumer has finished its
+      // durable work. Serialize repairs without delaying live callbacks.
+      while (this.active(connection)) {
+        const missing = [...this.subscriptions.values()].filter(value => !connection.repaired.has(value))
+        if (!missing.length) break
+        await this.options.onReconnect(missing.map(copy), { signal: connection.controller.signal })
+        missing.forEach(value => connection.repaired.add(value))
+      }
+      if (!this.active(connection)) return
+      connection.recoveryAttempt = 0
+      connection.recoveryError = ''
+      this.maybeLive(connection)
+    }).catch(error => {
+      if (this.active(connection)) {
+        connection.recoveryError = this.report('Reconnect gap repair failed.', error)
+        const delay = Math.min(this.maxDelay, this.baseDelay * 2 ** Math.min(connection.recoveryAttempt++, 30))
+        if (this.active(connection)) this.timer(connection, 'recovery', delay, () => this.recover(connection))
+      } else if (error?.name !== 'AbortError') this.report('Reconnect gap repair failed.', error, 'log')
+    }).finally(() => { connection.recoveryTask = null })
+    connection.recoveryTask = this.track(task)
+    this.recoveryTail = task
   }
 
   flushSubscriptions(connection) {
@@ -255,7 +263,7 @@ export class RealtimeMarket {
     const live = connection.ready && !connection.pending.size && this.subscriptions.size > 0
       && [...this.subscriptions].every(([key, value]) => connection.sent.get(key) === value)
     if (live) this.attempt = 0
-    this.setState({ status: live ? 'live' : connection.wasReconnect ? 'reconnecting' : 'connecting', ...(live ? { error: '' } : {}) })
+    this.setState({ status: live ? 'live' : connection.wasReconnect ? 'reconnecting' : 'connecting', ...(live ? { error: connection.recoveryError } : {}) })
   }
 
   armHeartbeat(connection) {
@@ -329,11 +337,10 @@ export class RealtimeMarket {
     series.pending++
     this.telemetry.pendingEvents++
     const task = series.tail.then(async () => {
-      if (!await connection.readyTask) return
       // A confirmed event accepted before cancellation still needs durable
-      // ingestion. Obsolete forming events must not reappear after unsubscribe.
-      if (raw?.[8] !== '1' && (this.closed || this.subscriptions.get(key) !== subscription)) return
-      await this.process(series, subscription, raw, receivedAt)
+      // ingestion. Retired transports must not publish queued forming events.
+      if (raw?.[8] !== '1' && (!this.active(connection) || this.subscriptions.get(key) !== subscription)) return
+      await this.process(connection, series, subscription, raw, receivedAt)
     }).catch(error => this.report('Candle callback failed.', error, this.active(connection) ? true : 'log')).then(() => {
       series.pending--
       this.telemetry.pendingEvents--
@@ -343,7 +350,7 @@ export class RealtimeMarket {
     this.track(task)
   }
 
-  async process(series, subscription, raw, receivedAt) {
+  async process(connection, series, subscription, raw, receivedAt) {
     if (!Array.isArray(raw) || raw.length < 9 || !['0', '1'].includes(raw[8]) || raw.slice(0, 8).some(value => typeof value !== 'string' || !value.trim() || !Number.isFinite(Number(value))) || volumes(raw).some(value => value < 0)) {
       this.telemetry.rejectedEvents++
       this.report('Invalid OKX candle payload.')
@@ -367,7 +374,7 @@ export class RealtimeMarket {
     }
     this.telemetry.lastDispatchLatencyMs = Math.max(0, this.now() - receivedAt)
     this.telemetry.maxDispatchLatencyMs = Math.max(this.telemetry.maxDispatchLatencyMs, this.telemetry.lastDispatchLatencyMs)
-    const context = { signal: candle.confirmed ? this.durableController.signal : this.controller.signal, receivedAt }
+    const context = { signal: candle.confirmed ? this.durableController.signal : connection.controller.signal, receivedAt }
     if (candle.confirmed) {
       await this.options.onConfirmed(copy(candle), context)
       // Commit memory state only AFTER persistence succeeds. A failed write can
@@ -387,7 +394,7 @@ export class RealtimeMarket {
     }
     this.telemetry.lastCallbackLatencyMs = Math.max(0, this.now() - receivedAt)
     this.telemetry.maxCallbackLatencyMs = Math.max(this.telemetry.maxCallbackLatencyMs, this.telemetry.lastCallbackLatencyMs)
-    this.setState({ updatedAt: Math.max(this.state.updatedAt ?? -Infinity, receivedAt), ...(this.state.status === 'live' ? { error: '' } : {}) })
+    this.setState({ updatedAt: Math.max(this.state.updatedAt ?? -Infinity, receivedAt), ...(this.state.status === 'live' ? { error: this.connection?.recoveryError ?? '' } : {}) })
   }
 
   cleanupSeries(key, series) {
@@ -457,7 +464,6 @@ export class RealtimeMarket {
       this.series.clear()
     })
     this.closed = true
-    this.controller.abort()
     this.cancelRetry()
     if (this.connection) this.retire(this.connection)
     this.setState({ status: 'disconnected' })

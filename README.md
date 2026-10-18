@@ -52,7 +52,7 @@ Open **Settings → Liquidity conditions** to enable or disable each condition a
 
 The 24h trading-volume check sums actual quote volume from **288 completed 5m candles**. The slippage trade size is also configurable. A contract needs valid observations for every enabled condition; eligibility must be revalidated as its observations expire.
 
-Qualified contracts are rechecked independently every 30 seconds while full-market discovery continues. Historical preparation finishes before live observations are collected. Missing or expired data is reported as unavailable verification, separately from confirmed filter rejections. During a temporary verification gap, the current chart and its live subscription remain available while the qualified list is rechecked.
+All eligible USDT perpetual contracts receive live streams independently of liquidity filters, historical preparation, search, and chart selection. Prices publish immediately; fresh depth, spread, and open-interest observations recheck qualification in short batches. Exact depth/slippage calculations run in a worker, coalescing new observations while preserving each result's original freshness lease. Instrument metadata renews every 30 seconds, with REST snapshots used when stream observations are unavailable. Missing or expired data stays unqualified while acquisition continues.
 
 ## Charts and indicators
 
@@ -80,7 +80,9 @@ Applicable relative changes use `(current − previous) / abs(previous) × 100%`
 
 **Settings → History to retain (days)** controls the requested history coverage, defaulting to **30 days**, with a supported range of **1–3,650 whole days**. Synchronization also requests 200 earlier candles for indicator warmup. Available history depends on listing dates and source availability.
 
-Completed candles are written to Parquet and read through DuckDB for charts and indicators. WebSocket updates keep the forming candle in memory; confirmed data passes through durable ingestion before becoming completed history. Reconnection coordinates missing-range repair with the history synchronizer. Complete saved ranges are reused, and background jobs checkpoint their progress in SQLite.
+Every eligible contract subscribes to native 5m, 15m, and 1h candles and public ticker, 400-level order-book, open-interest, and trade channels. Public connections carry at most 25 contracts each, with paced connection starts. Books are reconstructed from snapshots and sequence-checked incremental updates; a gap rebuilds the affected connection without stopping the others.
+
+Completed candles are written to Parquet and read through DuckDB for charts and indicators. Forming candles and their live contract OI/taker observations stay in memory. Taker totals require continuous trade coverage from the native period's start; startup and reconnect gaps remain unavailable until a complete period can be observed. Historical OI/taker values continue to use their direct native sources. Reconnection repairs historical gaps alongside immediate live delivery. History targets cover every eligible contract, complete saved ranges are reused, and background jobs checkpoint their progress in SQLite.
 
 Price, OI and Taker history start on independent paced source lanes. Statistics wait only for their matching price page to be durable. Each statistics page explicitly specifies `begin` and `end`; availability is evaluated from the source response, without a shared local retention cutoff. Missing values and Taker zero placeholders inconsistent with actual traded volume remain unavailable with a bounded retry lease. See [historical source behavior](docs/STATISTICS_SOURCES.md) for the dated API observations and pagination rules.
 
@@ -135,6 +137,7 @@ Install the locked dependencies with `npm ci`. The shadcn CLI is a development d
 | `npm run app:deliver` | Build, smoke-test, install, and verify the installed app with rollback on failure |
 | `npm run app:smoke -- --app "/path/to/Perpetual Swap Suite.app" --revision <full-git-sha>` | Verify an existing packaged executable using isolated data |
 | `npm run test:okx:1h` | Run live public OKX candle/OI/taker integration with temporary storage |
+| `npm run test:okx:streams` | Verify every eligible contract's public streams and three native candle subscriptions against OKX |
 | `node scripts/okx-live-statistics.mjs --report .build/okx-statistics.json` | Check bounded older OI/Taker requests, zero placeholders, reuse and persistence against actual public responses |
 | `npm run benchmark` | Measure Parquet writes and DuckDB queries |
 | `npm run benchmark:chart` | Exercise chart scrolling, reversals, jumps, and delayed reads |

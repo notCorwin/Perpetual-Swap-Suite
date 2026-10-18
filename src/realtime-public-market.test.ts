@@ -1,0 +1,349 @@
+import { test } from 'node:test'
+import { strict as assert } from 'node:assert'
+import { setImmediate } from 'node:timers/promises'
+import { OKX_PUBLIC_WEBSOCKET_URL, RealtimePublicMarket } from '../electron/services/realtime-public-market.js'
+import type { PublicMarketBook, RealtimePublicMarketOptions } from '../electron/services/realtime-public-market.js'
+import type { RealtimeWebSocket } from '../electron/services/realtime-market.js'
+
+const turn = () => setImmediate()
+const deferred = <T = void>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>(done => { resolve = done })
+  return { promise, resolve }
+}
+
+class Clock {
+  time = 1_800_000_000_000
+  next = 0
+  timers = new Map<number, { at: number; callback: () => void }>()
+  now = () => this.time
+  setTimeout = (callback: () => void, delay: number) => {
+    const id = ++this.next
+    this.timers.set(id, { at: this.time + delay, callback })
+    return id
+  }
+  clearTimeout = (id: unknown) => { this.timers.delete(Number(id)) }
+  async advance(ms: number) {
+    const end = this.time + ms
+    while (true) {
+      const next = [...this.timers].filter(([, timer]) => timer.at <= end).sort((a, b) => a[1].at - b[1].at || a[0] - b[0])[0]
+      if (!next) break
+      this.time = next[1].at
+      this.timers.delete(next[0])
+      next[1].callback()
+      await turn()
+    }
+    this.time = end
+    await turn()
+  }
+}
+
+class Socket extends EventTarget implements RealtimeWebSocket {
+  readyState = 0
+  sent: string[] = []
+  autoAck = true
+  autoClose = true
+  open() { this.readyState = 1; this.dispatchEvent(new Event('open')) }
+  data(value: unknown) { this.dispatchEvent(new MessageEvent('message', { data: value })) }
+  message(value: unknown) { this.data(typeof value === 'string' ? value : JSON.stringify(value)) }
+  send(value: string) {
+    assert.equal(this.readyState, 1)
+    this.sent.push(value)
+    if (value === 'ping') return
+    const message = JSON.parse(value)
+    if (this.autoAck) for (const arg of message.args) queueMicrotask(() => this.message({ id: message.id, event: message.op, arg }))
+  }
+  close() {
+    if (this.readyState === 3) return
+    this.readyState = 2
+    if (this.autoClose) queueMicrotask(() => this.finishClose())
+  }
+  finishClose(code = 1000, reason = '') {
+    this.readyState = 3
+    this.dispatchEvent(Object.assign(new Event('close'), { code, reason }))
+  }
+  commands() { return this.sent.filter(value => value !== 'ping').map(value => JSON.parse(value)) }
+}
+
+const btc = 'BTC-USDT-SWAP', eth = 'ETH-USDT-SWAP'
+const push = (socket: Socket, channel: string, data: unknown[], instId = btc, action?: string) => socket.message({ arg: { channel, instId }, data, ...(action ? { action } : {}) })
+const level = (price: number, size = 1) => [String(price), String(size), '0', '1']
+const book = (seqId: number, prevSeqId = -1, bids = [level(100), level(99)], asks = [level(101), level(102)]) => ({ seqId, prevSeqId, ts: '1800000000000', bids, asks })
+
+function fixture(overrides: Partial<RealtimePublicMarketOptions> = {}) {
+  const clock = new Clock(), sockets: Socket[] = [], urls: string[] = [], tickers: string[] = [], oi: string[] = [], books: PublicMarketBook[] = [], trades: unknown[] = [], errors: string[] = []
+  const market = new RealtimePublicMarket({
+    onTicker: (instId, raw) => { tickers.push(`${instId}:${raw.last}`) },
+    onOpenInterest: (instId, raw) => { oi.push(`${instId}:${raw.oi}`) },
+    onBook: (_instId, value) => { books.push(value) },
+    onTrades: (_instId, value) => { trades.push(value) },
+    webSocketFactory: url => { urls.push(url); const socket = new Socket(); sockets.push(socket); return socket },
+    now: clock.now, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, reconnectJitter: 0,
+    logger: { error: message => { errors.push(String(message)) } },
+    ...overrides,
+  })
+  const open = async (instIds = [btc]) => {
+    market.setSubscriptions(instIds)
+    market.start()
+    const expected = Math.ceil(new Set(instIds).size / 25)
+    for (let index = 0; index < expected; index++) {
+      if (!sockets[index]) await clock.advance(500)
+      sockets[index].open()
+    }
+    await market.whenIdle()
+    assert.equal(market.getState().status, 'live')
+    return sockets[0]
+  }
+  return { market, clock, sockets, urls, tickers, oi, books, trades, errors, open }
+}
+
+test('all contracts subscribe to all four native channels concurrently in bounded requests', async t => {
+  const f = fixture()
+  t.after(() => f.market.close())
+  const instIds = Array.from({ length: 350 }, (_, index) => `TOKEN${index}-USDT-SWAP`)
+  await f.open(instIds)
+  assert.equal(f.sockets.length, 14)
+  assert.ok(f.urls.every(url => url === OKX_PUBLIC_WEBSOCKET_URL))
+  assert.equal(OKX_PUBLIC_WEBSOCKET_URL, 'wss://ws.okx.com/ws/v5/public')
+  const commands = f.sockets.flatMap(socket => socket.commands())
+  assert.equal(commands.length, 14)
+  assert.ok(commands.every(command => command.args.length <= 100 && Buffer.byteLength(JSON.stringify(command)) < 64 * 1024))
+  for (const instId of instIds) assert.deepEqual(commands.flatMap(command => command.args).filter(arg => arg.instId === instId).map(arg => arg.channel).sort(), ['books', 'open-interest', 'tickers', 'trades'])
+  f.market.setSubscriptions([...instIds, instIds[0]])
+  assert.equal(f.sockets.flatMap(socket => socket.commands()).length, 14)
+  assert.equal(f.market.instruments.size, 350)
+  assert.equal(f.market.subscriptions.size, 1400)
+  assert.ok(f.sockets.every(socket => new Set(socket.commands().flatMap(command => command.args).map(arg => arg.instId)).size === 25))
+  push(f.sockets[0], 'tickers', [{ last: '100' }], instIds[0])
+  push(f.sockets.at(-1)!, 'open-interest', [{ oi: '1000' }], instIds.at(-1))
+  push(f.sockets[0], 'trades', [{ side: 'buy', sz: '3', tradeId: '1' }, { side: 'sell', sz: '4', tradeId: '2' }], instIds[20])
+  await f.market.whenIdle()
+  assert.deepEqual(f.tickers, [`${instIds[0]}:100`])
+  assert.deepEqual(f.oi, [`${instIds.at(-1)}:1000`])
+  assert.equal(f.trades.length, 1)
+  assert.equal(f.market.getTelemetry().tradeEvents, 2)
+})
+
+test('order book snapshots replace all levels; updates insert, replace, delete and sort both sides', async t => {
+  const f = fixture()
+  t.after(() => f.market.close())
+  const socket = await f.open()
+  push(socket, 'books', [book(10)], btc, 'snapshot')
+  push(socket, 'books', [book(11, 10, [level(100, 0), level(99, 8), level(98, 4)], [level(102, 0), level(100.5, 2)])], btc, 'update')
+  // Empty updates with equal sequence IDs are OKX keepalive messages.
+  push(socket, 'books', [book(11, 11, [], [])], btc, 'update')
+  push(socket, 'books', [book(20, -1, [level(50)], [level(51)])], btc, 'snapshot')
+  await f.market.whenIdle()
+  assert.deepEqual(f.books[0].bids, [level(100), level(99)])
+  assert.deepEqual(f.books[1].bids, [level(99, 8), level(98, 4)])
+  assert.deepEqual(f.books[1].asks, [level(100.5, 2), level(101)])
+  assert.deepEqual(f.books[2], f.books[1])
+  assert.deepEqual(f.books[3].bids, [level(50)])
+  assert.deepEqual(f.books[3].asks, [level(51)])
+  assert.equal(f.market.getTelemetry().bookEvents, 4)
+  assert.equal(f.market.getState().updatedAt, f.clock.time)
+  assert.equal(f.books[0].bids[0][1], '1', 'later updates cannot mutate prior callback snapshots')
+})
+
+test('book depth stays at 400 levels and equivalent numeric price spellings replace the same level', async t => {
+  const f = fixture()
+  t.after(() => f.market.close())
+  const socket = await f.open()
+  push(socket, 'books', [book(1, -1, Array.from({ length: 410 }, (_, i) => level(1000 - i)), Array.from({ length: 410 }, (_, i) => level(1001 + i)))], btc, 'snapshot')
+  push(socket, 'books', [book(2, 1, [['1000.0', '9', '0', '1']], [])], btc, 'update')
+  await f.market.whenIdle()
+  assert.equal(f.books[0].bids.length, 400)
+  assert.equal(f.books[0].asks.length, 400)
+  assert.equal(f.books[1].bids.length, 400)
+  assert.deepEqual(f.books[1].bids[0], ['1000.0', '9', '0', '1'])
+})
+
+test('a missing initial snapshot, sequence gap, reset or invalid level forces a fresh connection', async t => {
+  for (const invalid of [
+    { initial: false, value: book(2, 1) },
+    { initial: true, value: book(12, 9) },
+    { initial: true, value: book(2, 10) },
+    { initial: true, value: book(11, 10, [['100', '-1']], []) },
+  ]) {
+    const f = fixture()
+    t.after(() => f.market.close())
+    const socket = await f.open()
+    if (invalid.initial) push(socket, 'books', [book(10)], btc, 'snapshot')
+    push(socket, 'books', [invalid.value], btc, 'update')
+    await f.market.whenIdle()
+    assert.equal(f.market.getState().status, 'reconnecting')
+    assert.equal(f.market.getTelemetry().rejectedEvents, 1)
+    assert.equal(f.books.length, invalid.initial ? 1 : 0)
+    await f.clock.advance(1000)
+    const replacement = f.sockets.at(-1)!
+    replacement.open()
+    await f.market.whenIdle()
+    push(replacement, 'books', [book(100)], btc, 'snapshot')
+    await f.market.whenIdle()
+    assert.equal(f.books.at(-1)?.seqId, 100)
+    assert.equal(f.market.getTelemetry().reconnects, 1)
+  }
+})
+
+test('subscription generation rejects stale acknowledgements and late unsubscribed data', async t => {
+  const f = fixture()
+  t.after(() => f.market.close())
+  f.market.setSubscriptions([btc, eth])
+  f.market.start()
+  const socket = f.sockets[0]
+  socket.autoAck = false
+  socket.open()
+  await f.market.whenIdle()
+  const initial = socket.commands()[0]
+  f.market.setSubscriptions([eth])
+  f.market.setSubscriptions([btc, eth])
+  const resubscription = socket.commands().at(-1)
+  for (const arg of initial.args) socket.message({ id: initial.id, event: 'subscribe', arg })
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().status, 'connecting')
+  for (const arg of resubscription.args) socket.message({ id: resubscription.id, event: 'subscribe', arg })
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().status, 'live')
+  f.market.setSubscriptions([eth])
+  push(socket, 'tickers', [{ last: '100' }])
+  push(socket, 'tickers', [{ last: '200' }], eth)
+  await f.market.whenIdle()
+  assert.deepEqual(f.tickers, [`${eth}:200`])
+  f.market.setSubscriptions([])
+  assert.equal(f.market.getState().status, 'disconnected')
+  await turn()
+  assert.equal(socket.readyState, 3)
+})
+
+test('heartbeat and acknowledgement deadlines reconnect stalled transports', async t => {
+  const f = fixture()
+  t.after(() => f.market.close())
+  const socket = await f.open()
+  await f.clock.advance(15_000)
+  assert.equal(socket.sent.at(-1), 'ping')
+  socket.message('pong')
+  await f.market.whenIdle()
+  await f.clock.advance(15_000)
+  assert.equal(socket.sent.at(-1), 'ping')
+  await f.clock.advance(10_000)
+  assert.equal(f.market.getState().status, 'reconnecting')
+  assert.match(f.market.getState().error, /pong timed out/)
+  await f.clock.advance(1000)
+  const replacement = f.sockets.at(-1)!
+  replacement.autoAck = false
+  replacement.open()
+  await f.market.whenIdle()
+  await f.clock.advance(15_000)
+  assert.match(f.market.getState().error, /acknowledgement timed out/)
+})
+
+test('reconnect waits for recovery, while independent streams can continue past a slow consumer', async t => {
+  const repair = deferred(), repairBegan = deferred(), callback = deferred(), callbackBegan = deferred(), recovered: string[][] = []
+  const f = fixture({
+    onReconnect: async (instIds, { signal }) => { recovered.push(instIds); assert.equal(signal.aborted, false); repairBegan.resolve(); await repair.promise },
+    onTicker: async instId => { if (instId === btc) { callbackBegan.resolve(); await callback.promise } },
+  })
+  t.after(() => f.market.close())
+  const socket = await f.open([btc, eth])
+  push(socket, 'tickers', [{ last: '100' }])
+  push(socket, 'open-interest', [{ oi: '200' }], eth)
+  await callbackBegan.promise
+  await turn()
+  assert.deepEqual(f.oi, [`${eth}:200`])
+  socket.finishClose(1006)
+  await f.clock.advance(1000)
+  const replacement = f.sockets.at(-1)!
+  replacement.open()
+  await turn()
+  assert.deepEqual(recovered, [], 'recovery waits for callbacks accepted on the old connection')
+  callback.resolve()
+  await repairBegan.promise
+  push(replacement, 'open-interest', [{ oi: '300' }], eth)
+  await turn()
+  assert.deepEqual(f.oi, [`${eth}:200`])
+  assert.equal(f.market.getState().status, 'reconnecting')
+  repair.resolve()
+  await f.market.whenIdle()
+  assert.deepEqual(recovered, [[btc, eth]])
+  assert.deepEqual(f.oi, [`${eth}:200`, `${eth}:300`])
+  assert.equal(f.market.getState().status, 'live')
+})
+
+test('close aborts contexts, drains active callbacks and asynchronous decoding, and is idempotent', async () => {
+  const callback = deferred(), began = deferred(), decode = deferred<string>()
+  let signal: AbortSignal | undefined, closed = false
+  const f = fixture({ onTicker: async (_instId, _raw, context) => { signal = context.signal; began.resolve(); await callback.promise } })
+  const socket = await f.open()
+  push(socket, 'tickers', [{ last: '100' }])
+  await began.promise
+  socket.data({ text: () => decode.promise })
+  await turn()
+  const closing = f.market.close()
+  assert.equal(f.market.close(), closing)
+  void closing.then(() => { closed = true })
+  assert.equal(signal?.aborted, true)
+  callback.resolve()
+  await turn()
+  assert.equal(closed, false)
+  decode.resolve('pong')
+  await closing
+  assert.equal(closed, true)
+  assert.equal(f.market.getState().status, 'disconnected')
+  assert.equal(f.clock.timers.size, 0)
+  assert.throws(() => f.market.start(), /closed/)
+  assert.throws(() => f.market.setSubscriptions([btc]), /closed/)
+})
+
+test('shard reconnects are paced and disconnect/subscription callbacks identify exactly the affected contracts', async t => {
+  const disconnected: string[][] = [], subscribed: string[] = [], starts: number[] = [], clock = new Clock(), sockets: Socket[] = []
+  const f = fixture({
+    now: clock.now, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+    webSocketFactory: () => { starts.push(clock.time); const socket = new Socket(); sockets.push(socket); return socket },
+    onSubscribed: (instId, channel, context) => { assert.equal(context.signal.aborted, false); subscribed.push(`${instId}:${channel}`) },
+    onDisconnect: (instIds, { signal }) => { assert.equal(signal.aborted, true); disconnected.push(instIds) },
+  })
+  t.after(() => f.market.close())
+  const instIds = Array.from({ length: 60 }, (_, index) => `TOKEN${index}-USDT-SWAP`)
+  f.market.setSubscriptions(instIds)
+  f.market.start()
+  assert.equal(sockets.length, 1)
+  sockets[0].open()
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().status, 'connecting')
+  await clock.advance(499)
+  assert.equal(sockets.length, 1)
+  await clock.advance(1)
+  sockets[1].open()
+  await clock.advance(500)
+  sockets[2].open()
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().status, 'live')
+  assert.equal(subscribed.length, 240)
+  assert.deepEqual(starts.map(time => time - starts[0]), [0, 500, 1000])
+  sockets[0].finishClose(1006)
+  sockets[1].finishClose(1006)
+  await f.market.whenIdle()
+  assert.deepEqual(disconnected, [instIds.slice(0, 25), instIds.slice(25, 50)])
+  assert.equal(f.market.getState().status, 'reconnecting')
+  // The remaining socket continues dispatching while other shards reconnect.
+  push(sockets[2], 'tickers', [{ last: '8' }], instIds[59])
+  await f.market.whenIdle()
+  assert.deepEqual(f.tickers, [`${instIds[59]}:8`])
+  await clock.advance(1000)
+  assert.equal(sockets.length, 4)
+  sockets[3].open()
+  await clock.advance(500)
+  assert.equal(sockets.length, 5)
+  sockets[4].open()
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().status, 'live')
+  assert.equal(subscribed.length, 440)
+  assert.ok(starts.slice(1).every((time, index) => time - starts[index] >= 500))
+  f.market.setSubscriptions(instIds.slice(50))
+  await f.market.whenIdle()
+  assert.equal(f.market.instruments.size, 10)
+  assert.equal(f.market.subscriptions.size, 40)
+  assert.equal(f.market.getTelemetry().reconnects, 2)
+  assert.equal(f.market.getTelemetry().tickerEvents, 1)
+  assert.equal(f.market.getState().status, 'live')
+})
