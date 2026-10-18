@@ -7,7 +7,7 @@ export type PublicMarketRawRecord = Record<string, string | number>
 export type PublicInstrumentRecord = Record<string, unknown>
 export type PublicMarketSubscription = { instId: string; channel: PublicMarketChannel } | { channel: 'instruments'; instType: 'SWAP' }
 export type PublicMarketBook = { bids: string[][]; asks: string[][]; ts: string; seqId: number }
-export type PublicMarketEventContext = { signal: AbortSignal; receivedAt: number }
+export type PublicMarketEventContext = { signal: AbortSignal; receivedAt: number; /** Subscription proof captured before callback queuing. */ acknowledged?: boolean }
 export type RealtimePublicMarketTelemetry = {
   receivedEvents: number
   tickerEvents: number
@@ -33,6 +33,8 @@ export type RealtimePublicMarketOptions = {
   onBook: (instId: string, book: PublicMarketBook, context: PublicMarketEventContext) => void | Promise<void>
   onTrades: (instId: string, raw: PublicMarketRawRecord[], context: PublicMarketEventContext) => void | Promise<void>
   onSubscribed?: (instId: string, channel: PublicMarketChannel, context: PublicMarketEventContext) => void | Promise<void>
+  /** Synchronous notification when the desired subscription generation is removed. */
+  onUnsubscribed?: (instId: string, channel: PublicMarketChannel, context: PublicMarketEventContext) => void | Promise<void>
   /** Called only for the contracts on the retired socket; its signal is aborted. */
   onDisconnect?: (instIds: string[], context: { signal: AbortSignal }) => void | Promise<void>
   /** New-connection events wait until this recovery callback completes. */

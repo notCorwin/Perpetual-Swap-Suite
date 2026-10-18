@@ -74,8 +74,15 @@ class PublicMarketConnection {
         next.set(key, this.subscriptions.get(key) ?? value)
       }
     }
+    const removed = [...this.subscriptions].filter(([key, value]) => next.get(key) !== value && value.channel !== 'instruments')
     this.instruments = instruments
     this.subscriptions = next
+    if (this.connection && this.options.onUnsubscribed) for (const [, value] of removed) {
+      try {
+        const result = this.options.onUnsubscribed(value.instId, value.channel, { signal: this.connection.controller.signal, receivedAt: this.now(), acknowledged: false })
+        if (result?.then) this.track(Promise.resolve(result).catch(error => this.report('Unsubscription callback failed.', error)))
+      } catch (error) { this.report('Unsubscription callback failed.', error) }
+    }
     for (const instId of this.books.keys()) if (!instruments.has(instId)) this.books.delete(instId)
     if (!next.size) {
       this.cancelRetry()
@@ -311,7 +318,7 @@ class PublicMarketConnection {
         } catch (error) { this.report('Instruments readiness callback failed.', error) }
       } else if (this.options.onSubscribed) {
         try {
-          const result = this.options.onSubscribed(subscription.instId, subscription.channel, { signal: connection.controller.signal, receivedAt })
+          const result = this.options.onSubscribed(subscription.instId, subscription.channel, { signal: connection.controller.signal, receivedAt, acknowledged: true })
           if (result?.then) this.track(Promise.resolve(result).catch(error => this.report('Subscription callback failed.', error)))
         } catch (error) { this.report('Subscription callback failed.', error) }
       }
@@ -327,9 +334,10 @@ class PublicMarketConnection {
     this.telemetry.lastReceivedAt = receivedAt
     this.telemetry.pendingEvents++
     const key = keyFor(subscription)
+    const acknowledged = !connection.pending.has(key)
     const task = (this.tails.get(key) ?? Promise.resolve()).then(async () => {
       if (!await connection.readyTask || !this.active(connection) || this.subscriptions.get(key) !== subscription) return
-      const context = { signal: connection.controller.signal, receivedAt }
+      const context = { signal: connection.controller.signal, receivedAt, acknowledged }
       const { instId, channel } = subscription
       if (channel === 'instruments') {
         await this.options.onInstruments(message.data, context)

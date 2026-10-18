@@ -463,3 +463,33 @@ test('instruments disconnect is delivered before acknowledgement and zero-ID clo
   assert.equal(f.clock.timers.size, 0)
   assert.equal(f.market.getState().status, 'disconnected')
 })
+
+test('native event acknowledgement proof is captured at admission before queued callbacks run', async t => {
+  const accepted: (boolean | undefined)[] = []
+  const f = fixture({ onTicker: (_id, _value, context) => { accepted.push(context.acknowledged) } })
+  t.after(() => f.market.close())
+  f.market.setSubscriptions([btc]); f.market.start()
+  const socket = f.sockets[0]
+  socket.autoAck = false
+  socket.open()
+  await f.market.whenIdle()
+  const command = socket.commands()[0]
+  push(socket, 'tickers', [{ last: '100' }])
+  for (const arg of command.args) socket.message({ id: command.id, event: 'subscribe', arg })
+  push(socket, 'tickers', [{ last: '101' }])
+  await f.market.whenIdle()
+  assert.deepEqual(accepted, [false, true], 'Same-millisecond ACKs cannot retrospectively certify a pre-ACK event.')
+})
+
+test('same-socket removal notifies consumers synchronously without retiring healthy neighbors', async t => {
+  const removed: string[] = []
+  const f = fixture({ onUnsubscribed: (instId, channel, context) => { assert.equal(context.signal.aborted, false); removed.push(`${channel}:${instId}`) } })
+  t.after(() => f.market.close())
+  const socket = await f.open([btc, eth])
+  f.market.setSubscriptions([eth])
+  assert.equal(removed.length, 4)
+  assert.ok(removed.every(value => value.endsWith(`:${btc}`)))
+  assert.equal(socket.readyState, 1)
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().status, 'live')
+})

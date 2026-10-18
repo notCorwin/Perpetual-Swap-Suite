@@ -196,7 +196,11 @@ test('delayed REST ticker and book responses cannot regress newer WebSocket obse
   let checking: Promise<unknown> | undefined
   try {
     await f.discover(); await f.open()
-    checking = f.service.checkCandidate(value, f.service.prefs().liquidity, f.service.catalogCriteriaKey(), new AbortController().signal)
+    const signal = new AbortController().signal
+    checking = Promise.all([
+      f.service.tickerObservations(signal, 'foreground', true),
+      f.service.checkCandidate(value, f.service.prefs().liquidity, f.service.catalogCriteriaKey(), signal),
+    ])
     await waitFor(() => tickerStarted && bookStarted)
     f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'tickers', [ticker(value.instId, 200)])
     f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'books', [{ asks: [['200', '200001']], bids: [['199.99', '200001']], ts: String(Date.now()), seqId: 99, prevSeqId: -1 }], 'snapshot')

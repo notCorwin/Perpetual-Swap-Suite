@@ -443,16 +443,17 @@ test('expired qualification stays hidden after unavailable observations and reco
   } finally { await f.close() }
 })
 
-test('historical preparation completes before live liquidity and refreshes a ticker aged during the wait', async () => {
+test('historical preparation completes before live liquidity and repairs only the ticker aged during the wait', async () => {
   const configuration = disabled()
   for (const key of ['spread', 'depth', 'slippage', 'volume24h', 'openInterest'] as const) configuration.liquidity[key].enabled = true
-  let preparing = false, tickerCalls = 0, bookCalls = 0, oiCalls = 0
+  let preparing = false, tickerCalls = 0, targetedTickerCalls = 0, bookCalls = 0, oiCalls = 0
   let release!: () => void
   const historyGate = new Promise<void>(resolve => { release = resolve })
   const f = await fixture(configuration, async input => {
     const url = new URL(String(input))
     if (url.pathname.endsWith('/public/instruments')) return response([instrument])
     if (url.pathname.endsWith('/market/tickers')) { tickerCalls += 1; return response([{ ...ticker, last: tickerCalls === 1 ? '99' : '100' }]) }
+    if (url.pathname.endsWith('/market/ticker')) { targetedTickerCalls += 1; assert.equal(url.searchParams.get('instId'), instId); return response([{ ...ticker, last: '100' }]) }
     if (url.pathname.endsWith('/market/books')) { bookCalls += 1; return response([{ asks: [['100', '200001']], bids: [['99.99', '200001']] }]) }
     if (url.pathname.endsWith('/public/open-interest')) { oiCalls += 1; return response([{ instId, oiUsd: '6000000' }]) }
     throw new Error(`Unexpected ${url}`)
@@ -473,7 +474,7 @@ test('historical preparation completes before live liquidity and refreshes a tic
     f.service.tickerCache.observedAt = Date.now() - 90_001
     for (const value of f.service.tickerCache.values.values()) value.expiresAt = Date.now() - 1
     release(); await refresh
-    assert.deepEqual([tickerCalls, bookCalls, oiCalls], [2, 1, 1])
+    assert.deepEqual([tickerCalls, targetedTickerCalls, bookCalls, oiCalls], [1, 1, 1, 1])
     assert.equal(f.service.metadata.getCatalogEntry(instId).status, 'verified')
     assert.equal((await f.service.snapshot()).rows[0].lastPrice, 100)
   } finally { release(); await refresh; await f.close() }
@@ -1838,4 +1839,148 @@ test('global renewal finishes and runs again while an earlier candidate historic
     assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
     assert.equal((await f.service.snapshot()).catalogProgress.pending, 0)
   } finally { release(); await f.close() }
+})
+
+test('repeated malformed native tickers cannot reset targeted failure backoff', async t => {
+  const f = await fixture()
+  let now = Math.floor(Date.now() / fiveMinutes) * fiveMinutes + 10_000, calls = 0
+  t.mock.method(Date, 'now', () => now)
+  try {
+    isolateQualification(f.service)
+    f.service.installInstruments(new Map([[instId, instrument]]))
+    const context = { signal: new AbortController().signal, receivedAt: now, acknowledged: true }
+    f.service.tickerSubscribed(instId, context)
+    f.service.receivePublicObservation(instId, 'ticker', ticker, context)
+    f.service.get = async (path: string) => { assert.equal(path, '/market/ticker'); calls++; throw new Error('Targeted ticker offline.') }
+    f.service.receivePublicObservation(instId, 'ticker', { last: '0' }, context)
+    f.service.processMarketDeadline()
+    await Promise.all([...f.service.backgroundTasks])
+    const firstRetry = f.service.tickerRecoveries.get(instId).retryAt
+    assert.equal(calls, 1)
+    assert.equal(firstRetry, now + 1_000)
+    now += 500
+    for (let event = 0; event < 20; event++) f.service.receivePublicObservation(instId, 'ticker', { last: '0' }, { ...context, receivedAt: now })
+    assert.equal(f.service.tickerRecoveries.get(instId).retryAt, firstRetry)
+    f.service.processMarketDeadline()
+    await Promise.all([...f.service.backgroundTasks])
+    assert.equal(calls, 1)
+    now = firstRetry
+    f.service.processMarketDeadline()
+    await Promise.all([...f.service.backgroundTasks])
+    assert.equal(calls, 2)
+    assert.equal(f.service.tickerRecoveries.get(instId).retryAt, now + 2_000)
+  } finally { t.mock.restoreAll(); await f.close() }
+})
+
+test('a bounded REST ticker fallback expires into scoped recovery even with spread disabled', async t => {
+  const f = await fixture()
+  let now = Math.floor(Date.now() / fiveMinutes) * fiveMinutes + 10_000, calls = 0
+  t.mock.method(Date, 'now', () => now)
+  try {
+    isolateQualification(f.service)
+    f.service.installInstruments(new Map([[instId, instrument]]))
+    const context = { signal: new AbortController().signal, receivedAt: now, acknowledged: true }
+    f.service.tickerSubscribed(instId, context)
+    f.service.receivePublicObservation(instId, 'ticker', ticker, context)
+    f.service.get = async (path: string) => { assert.equal(path, '/market/ticker'); calls++; return [{ ...ticker, ts: String(now) }] }
+    f.service.receivePublicObservation(instId, 'ticker', { last: '0' }, context)
+    f.service.processMarketDeadline()
+    await Promise.all([...f.service.backgroundTasks])
+    const first = f.service.tickerCache.values.get(instId)
+    assert.equal(calls, 1)
+    assert.equal(f.service.tickerRecoveries.get(instId).retryAt, first.expiresAt)
+    now = first.expiresAt - 1
+    f.service.processMarketDeadline()
+    await Promise.all([...f.service.backgroundTasks])
+    assert.equal(calls, 1, 'A finite usable HTTP fallback has no minute renewal loop.')
+    now = first.expiresAt
+    f.service.processMarketDeadline()
+    await Promise.all([...f.service.backgroundTasks])
+    assert.equal(calls, 2)
+    assert.equal(f.service.tickerCache.values.get(instId).observedAt, now)
+    assert.equal(first.expiresAt, context.receivedAt + 90_000, 'Recovery never changes an earlier observation lease.')
+  } finally { t.mock.restoreAll(); await f.close() }
+})
+
+for (const nativeFirst of [false, true]) test(`native ticker recovery clears only its bootstrap HTTP error ${nativeFirst ? 'before' : 'after'} the failed request settles`, async () => {
+  const configuration = disabled(); configuration.liquidity.spread.enabled = true
+  const f = await fixture(configuration)
+  let release!: (value: unknown) => void, reject!: (reason: Error) => void
+  const held = new Promise((resolve, fail) => { release = resolve; reject = fail })
+  let began!: () => void
+  const started = new Promise<void>(resolve => { began = resolve })
+  let refreshing: Promise<void> | undefined
+  try {
+    isolateQualification(f.service)
+    f.service.get = async (path: string) => {
+      if (path === '/public/instruments') return [instrument]
+      assert.equal(path, '/market/tickers'); began(); return held
+    }
+    refreshing = f.service.refresh()
+    await started
+    const context = { signal: new AbortController().signal, receivedAt: Date.now() }
+    await f.service.synchronizeInstruments(context)
+    if (nativeFirst) f.service.receivePublicObservation(instId, 'ticker', ticker, context)
+    reject(new Error('Initial ticker HTTP unavailable.'))
+    await refreshing
+    await Promise.all([...f.service.backgroundTasks])
+    if (!nativeFirst) {
+      assert.match(f.service.error, /Initial ticker HTTP unavailable/)
+      f.service.sourceError('liquidity', new Error('Independent calculation fault.'))
+      f.service.receivePublicObservation(instId, 'ticker', ticker, context)
+    }
+    f.service.flushStreamQualifications()
+    assert.deepEqual((await f.service.snapshot()).rows.map(row => row.instId), [instId])
+    assert.equal(f.service.error, nativeFirst ? '' : 'Independent calculation fault.')
+  } finally { release([]); await refreshing; await f.close() }
+})
+
+test('an older malformed native ticker is ignored before source-fault policy', async () => {
+  const configuration = disabled(); configuration.liquidity.spread.enabled = true
+  const f = await fixture(configuration)
+  try {
+    isolateQualification(f.service)
+    f.service.installInstruments(new Map([[instId, instrument]]))
+    const context = { signal: new AbortController().signal, receivedAt: Date.now(), acknowledged: true }
+    f.service.tickerSubscribed(instId, context)
+    f.service.receivePublicObservation(instId, 'ticker', { ...ticker, ts: '200' }, context)
+    const accepted = f.service.tickerCache.values.get(instId)
+    f.service.receivePublicObservation(instId, 'ticker', { last: '0', ts: '100' }, context)
+    assert.equal(f.service.tickerCache.values.get(instId), accepted)
+    assert.equal(f.service.observationExpiry(accepted, 'ticker', instId), Number.MAX_SAFE_INTEGER)
+    assert.equal(f.service.tickerRecoveries.size, 0)
+    assert.equal(f.service.error, '')
+  } finally { await f.close() }
+})
+
+for (const keepRecovered of [true, false]) test(`an early bootstrap ticker fault retires when ${keepRecovered ? 'the last missing contract delists' : 'the eligible universe becomes empty'}`, async () => {
+  const f = await fixture()
+  try {
+    isolateQualification(f.service)
+    f.service.get = async (path: string) => { assert.equal(path, '/market/tickers'); throw new Error('Initial ticker HTTP unavailable.') }
+    await assert.rejects(f.service.tickerObservations(new AbortController().signal), /Initial ticker HTTP unavailable/)
+    assert.match((await f.service.snapshot()).error, /Initial ticker HTTP unavailable/)
+    const missing = { ...instrument, instId: 'ETH-USDT-SWAP', ctValCcy: 'ETH' }
+    f.service.installInstruments(new Map([[instId, instrument], [missing.instId, missing]]))
+    f.service.receivePublicObservation(instId, 'ticker', ticker)
+    assert.match((await f.service.snapshot()).error, /Initial ticker HTTP unavailable/, 'A still-missing eligible contract retains its source fault.')
+    f.service.installInstruments(new Map(keepRecovered ? [[instId, instrument]] : []))
+    assert.equal((await f.service.snapshot()).error, '')
+  } finally { await f.close() }
+})
+
+test('a delayed bootstrap ticker failure cannot create a wildcard fault for a known empty universe', async () => {
+  const f = await fixture()
+  let fail!: (error: Error) => void
+  const held = new Promise<never>((_, reject) => { fail = reject })
+  try {
+    isolateQualification(f.service)
+    f.service.get = async () => held
+    const acquisition = f.service.tickerObservations(new AbortController().signal)
+    f.service.installInstruments(new Map())
+    fail(new Error('Retired bootstrap request failed.'))
+    await assert.rejects(acquisition, /Retired bootstrap request failed/)
+    assert.equal((await f.service.snapshot()).error, '')
+    assert.equal(f.service.tickerFaults.size, 0)
+  } finally { fail(new Error('Disposed.')); await f.close() }
 })
