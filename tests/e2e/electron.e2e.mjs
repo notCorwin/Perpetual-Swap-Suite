@@ -60,10 +60,13 @@ const installPreparedTransform = async options => electron.evaluate(({ ipcMain, 
       const last = lastConfirmed ?? probe.confirmed.get(`${response.instId}:${response.timeframe}`)
       if (!last) return response
       const intervalMS = response.intervalMS ?? ({ '5m': 300_000, '15m': 900_000, '1H': 3_600_000 })[response.timeframe]
+      const { oi = null, buy = null, sell = null } = options.liveStatistics ?? {}
+      const oiObserved = Number.isFinite(oi), takerObserved = Number.isFinite(buy) && Number.isFinite(sell)
       return { ...response, liveBar: {
         ...last, hour: response.endHour + intervalMS,
         open: options.livePrice * .999, high: options.livePrice * 1.001, low: options.livePrice * .998, close: options.livePrice,
-        confirmed: false, statisticsObserved: false, oi: null, buy: null, sell: null,
+        confirmed: false, statisticsSources: Number(oiObserved) | (Number(takerObserved) << 1),
+        statisticsObserved: oiObserved && takerObserved, oiObserved, takerObserved, oi, buy, sell,
       } }
     }
     return response
@@ -595,6 +598,83 @@ test('the live price overlay follows its actual price without changing the 96 co
     assertCompletePaints(await finishPaintProbe(page))
   } finally {
     await removePreparedTransform()
+  }
+})
+
+test('latest OI and Taker legends retain their last observed values after scrolling and inspect missing live values exactly', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  const completed = fixture.series[fixture.timeframe].bars.at(-1)
+  const compact = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 5, notation: 'compact' })
+  const readLegends = () => page.evaluate(() => {
+    const svg = document.querySelector('svg[data-rendered-inst]')
+    return Object.fromEntries(['OI (Contracts)', '↑ Taker Buy (Contracts)', '↓ Taker Sell (Contracts)'].map(label => {
+      const line = [...svg.querySelectorAll('[data-chart-legend]')].find(node => node.getAttribute('data-chart-legend') === label)
+      const group = line.parentElement
+      const context = group.querySelector('[data-chart-legend-source-context]')
+      return [label, {
+        value: group.querySelectorAll('text')[1].childNodes[0]?.textContent,
+        sourceHour: Number(group.getAttribute('data-chart-legend-source-hour')),
+        context: context?.textContent ?? '',
+        contextFill: context ? getComputedStyle(context).fill : null,
+        labelFill: getComputedStyle(group.querySelector('text')).fill,
+      }]
+    }))
+  })
+  const labels = ['OI (Contracts)', '↑ Taker Buy (Contracts)', '↓ Taker Sell (Contracts)']
+  const assertLatest = async (liveStatistics = {}) => {
+    const legends = await readLegends()
+    const takerLive = Number.isFinite(liveStatistics.buy) && Number.isFinite(liveStatistics.sell)
+    for (const [index, key] of ['oi', 'buy', 'sell'].entries()) {
+      const current = index === 0 ? Number.isFinite(liveStatistics.oi) : takerLive
+      const reading = legends[labels[index]]
+      assert.equal(reading.value, compact.format(current ? liveStatistics[key] : completed[key]))
+      assert.equal(reading.sourceHour, fixture.end + (current ? fixture.intervalMS : 0))
+      if (current) assert.equal(reading.context, '', 'A current observation needs no older-source timestamp.')
+      else {
+        assert.match(reading.context, /as of [A-Z][a-z]{2} \d{1,2}, \d{2}:\d{2}/)
+        assert.equal(reading.contextFill, reading.labelFill, 'Older observations must show their timestamp in the muted label color.')
+      }
+    }
+  }
+  await installPreparedTransform({ mode: 'live', instId: fixture.instId, livePrice: completed.close })
+  try {
+    await openChart(page, fixture)
+    await assertLatest()
+    await wheelBurst(page, { deltaY: 12 })
+    await waitForRendered(page, fixture, fixture.timeframe, fixture.end - fixture.intervalMS)
+    const historical = await readLegends()
+    for (const label of labels) {
+      assert.equal(historical[label].sourceHour, fixture.end - fixture.intervalMS)
+      assert.equal(historical[label].context, '')
+      assert.notEqual(historical[label].value, 'Unavailable')
+    }
+    await wheelBurst(page, { deltaY: -12 })
+    await waitForRendered(page, fixture)
+    await assertLatest()
+    const bounds = await page.locator('svg[data-rendered-inst]').boundingBox()
+    await page.mouse.move(bounds.x + bounds.width - 2, bounds.y + bounds.height * .1)
+    await page.mouse.down()
+    await page.waitForFunction(() => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
+    const inspected = await readLegends()
+    for (const label of labels) {
+      assert.equal(inspected[label].value, 'Unavailable', 'Inspection must show the missing value at the selected candle.')
+      assert.equal(inspected[label].context, '')
+    }
+    await page.mouse.up()
+    await page.waitForFunction(() => !document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
+    await assertLatest()
+  } finally {
+    await page.mouse.up()
+    await removePreparedTransform()
+  }
+  // The two source families advance independently; genuine zero observations
+  // must supersede older nonzero values without acquiring an older timestamp.
+  for (const liveStatistics of [{ oi: 0 }, { buy: 0, sell: 0 }]) {
+    await installPreparedTransform({ mode: 'live', instId: fixture.instId, livePrice: completed.close, liveStatistics })
+    try {
+      await openChart(page, fixture)
+      await assertLatest(liveStatistics)
+    } finally { await removePreparedTransform() }
   }
 })
 
