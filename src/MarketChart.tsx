@@ -56,12 +56,12 @@ const chartTokenNumber = (token: string, fallback: number) => {
 }
 const chartTokens = {
   textSize: chartTokenNumber('--chart-text-size', 10),
+  lineWidth: chartTokenNumber('--chart-line-width', 1),
   legendGap: chartTokenNumber('--chart-legend-gap', 24),
   priceTagPaddingX: chartTokenNumber('--chart-price-tag-padding-x', 12),
   priceTagPaddingY: chartTokenNumber('--chart-price-tag-padding-y', 7),
   priceTagRowGap: chartTokenNumber('--chart-price-tag-row-gap', 2),
   priceTagTextSize: chartTokenNumber('--chart-price-tag-text-size', 12),
-  priceTagStrokeWidth: chartTokenNumber('--chart-price-tag-stroke-width', 1.5),
   priceTagLineHeight: chartTokenNumber('--chart-price-tag-line-height', 1.1),
 } as const
 const legendContext = document.createElement("canvas").getContext("2d")
@@ -108,7 +108,7 @@ const chartGutter = (bars: readonly Bar[], height: number, liveClose = bars[bars
   ]
   const minimumScale = Math.min(1, chartTokens.textSize / chartTokens.priceTagTextSize)
   const axisGutter = Math.max(...labels.map(label => 8 + legendWidth(label)))
-  return fitAxisPriceTag(axisGutter, priceTagWidth(`↑ ${price(liveClose)}`, "00:00"), chartTokens.priceTagStrokeWidth, minimumScale)
+  return fitAxisPriceTag(axisGutter, priceTagWidth(`↑ ${price(liveClose)}`, "00:00"), chartTokens.lineWidth, minimumScale)
 }
 
 export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, inspected, width, height, endHour, intervalMS = 900_000, oiState = 'ready', takerState = 'ready' }: { bars: readonly Bar[]; liveBar: Bar; liveOverlay?: boolean; inspected: number | null; width: number; height: number; endHour: number; intervalMS?: number; oiState?: PreparedChartState; takerState?: PreparedChartState }) {
@@ -160,7 +160,7 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
   const tagLineHeight = chartTokens.priceTagTextSize * chartTokens.priceTagLineHeight
   const tagPaddingY = chartTokens.priceTagPaddingY
   const tagRowGap = chartTokens.priceTagRowGap
-  const tagStrokeWidth = chartTokens.priceTagStrokeWidth
+  const tagStrokeWidth = chartTokens.lineWidth
   const tickHalfHeight = chartTokens.textSize / 2
   const tagHeight = tagLineHeight * (showCountdown ? 2 : 1) + (showCountdown ? tagRowGap : 0) + tagPaddingY * 2
   const scaledTagHeight = tagHeight * tagScale
@@ -224,8 +224,7 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
     lower.push(`${pointX} ${priceY(bar.bollLower).toFixed(1)}`)
   })
   finishBand()
-  const indicatorWidth = "var(--chart-indicator-line-width)"
-  const lineStroke = (key: keyof Bar, d: string, color: string, width = indicatorWidth, opacity = 1, dash?: string) => <path data-chart-indicator={key} d={d} fill="none" stroke={color} strokeWidth={width} strokeLinecap="round" strokeLinejoin="round" strokeDasharray={dash} opacity={opacity} />
+  const lineStroke = (key: keyof Bar, d: string, color: string, dash?: string) => <path data-chart-indicator={key} d={d} fill="none" stroke={color} strokeLinecap="round" strokeLinejoin="round" strokeDasharray={dash} />
   const lineLabel = (x: number, y: number, label: string, color = "var(--muted-foreground)") =>
     <text x={x} y={y} dominantBaseline="middle" fill={color}>{label}</text>
   const rectangle = (x: number, y: number, width: number, height: number) => `M${x} ${y}h${width}v${height}h${-width}Z`
@@ -249,7 +248,7 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
   }
   const panelKeys: Panel[] = ["price", "roc", "rsi", "oi", "taker"]
   const grid = panelKeys.flatMap(key => panels[key].map((y, index) =>
-    <line key={`${key}-${index}`} x1={columns[key][0]} x2={columns[key][1]} y1={y} y2={y} stroke="var(--border)" strokeWidth="1" opacity={index ? 0.32 : 0.55} />))
+    <line key={`${key}-${index}`} x1={columns[key][0]} x2={columns[key][1]} y1={y} y2={y} stroke="var(--border)" opacity={index ? 0.32 : 0.55} />))
   const legend = (key: Panel, items: [string, string, string, string?][]) => {
     const gap = chartTokens.legendGap
     const start = columns[key][0] + gap / 2
@@ -264,8 +263,8 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
         const itemStart = cursor
         cursor += widths[index] + gap
         return <g key={label} transform={`translate(${itemStart},0)`}>
-        {key === "taker" && <line data-chart-legend-outline={label} x1="0" x2="18" stroke="var(--foreground)" strokeWidth="3.5" strokeDasharray={dash} />}
-        <line data-chart-legend={label} x1="0" x2="18" stroke={color} strokeWidth="2" strokeDasharray={dash} />
+        {key === "taker" && !dash && <line data-chart-legend-outline={label} x1="0" x2="18" stroke="var(--foreground)" />}
+        <line data-chart-legend={label} x1="0" x2="18" stroke={color} strokeDasharray={key === "taker" && !dash ? "2 3" : dash} />
         <text x="26" dominantBaseline="middle" fill="var(--muted-foreground)">{label}</text>
         <text x={26 + legendWidth(label) + 10} dominantBaseline="middle" fill="var(--foreground)">{value}</text>
         </g>
@@ -276,7 +275,7 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
   return <>
     <defs>
       <pattern id="sell-hatch" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
-        <line x1="0" x2="0" y1="0" y2="4" stroke="var(--background)" strokeWidth="1" opacity="0.55" />
+        <line x1="0" x2="0" y1="0" y2="4" stroke="var(--background)" opacity="0.55" />
       </pattern>
       <clipPath id={`${areaClipId}-positive`}><rect x={columns.roc[0]} y={panels.roc[0]} width={columns.roc[1] - columns.roc[0]} height={rocZeroY - panels.roc[0]} /></clipPath>
       <clipPath id={`${areaClipId}-negative`}><rect x={columns.roc[0]} y={rocZeroY} width={columns.roc[1] - columns.roc[0]} height={panels.roc[1] - rocZeroY} /></clipPath>
@@ -288,52 +287,53 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
     </g>)}
     <rect x={columns.rsi[0]} y={rsiY(70)} width={columns.rsi[1] - columns.rsi[0]} height={rsiY(30) - rsiY(70)} fill="var(--chart-rsi-area)" />
     {grid}
-    {rocZeroY > panels.roc[0] && rocZeroY < panels.roc[1] && <line x1={columns.roc[0]} x2={columns.roc[1]} y1={rocZeroY} y2={rocZeroY} stroke="var(--muted-foreground)" strokeWidth="1" strokeOpacity="0.5" />}
+    {rocZeroY > panels.roc[0] && rocZeroY < panels.roc[1] && <line x1={columns.roc[0]} x2={columns.roc[1]} y1={rocZeroY} y2={rocZeroY} stroke="var(--muted-foreground)" strokeOpacity="0.5" />}
     {bars.flatMap((bar, index) => (bar.hour - firstHour) % (12 * intervalMS) === 0 ? panelKeys.map(key => <line key={`${bar.hour}-${key}`} x1={x(index, key)} x2={x(index, key)} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--border)" strokeOpacity="0.22" />) : [])}
     {bars.map((bar, index) => ({ bar, index })).filter(({ bar, index }) => index === n - 1 || (bar.hour - firstHour) % (24 * intervalMS) === 0).map(({ bar, index }) => <text key={bar.hour} x={x(index, "taker")} y={height - 7} textAnchor={index === 0 ? "start" : index === n - 1 ? "end" : "middle"} fill="var(--muted-foreground)">{hourLabel(bar.hour)}</text>)}
     {priceAxis.ticks.map(tick => {
       const tickY = priceY(tick)
       return <g key={tick}><line x1={columns.price[0]} x2={right} y1={tickY} y2={tickY} stroke="var(--border)" strokeOpacity="0.35" />{(tickY + tickHalfHeight < priceTagY || tickY - tickHalfHeight > priceTagY + scaledTagHeight) && lineLabel(axisStarts.price, tickY, axisPrice.format(tick))}</g>
     })}
-    <line x1={right} x2={right} y1={panels.price[0]} y2={panels.taker[1]} stroke="var(--border)" strokeWidth="1" opacity="0.8" />
-    {tag.inViewport && <line data-chart-live-price-outline x1={columns.price[0]} x2={right + tagOffset * tagScale} y1={latestY} y2={latestY} stroke="var(--foreground)" strokeWidth="2.4" strokeDasharray="4 5" />}
-    {tag.inViewport && <line data-chart-live-price x1={columns.price[0]} x2={right + tagOffset * tagScale} y1={latestY} y2={latestY} stroke={latestColor} strokeWidth="1.2" strokeDasharray="4 5" />}
-    <path d={upWicks.join(" ")} fill="none" stroke="var(--foreground)" strokeWidth="2.2" />
-    <path d={upWicks.join(" ")} fill="none" stroke="var(--positive)" strokeWidth="1.2" />
-    <path d={downWicks.join(" ")} fill="none" stroke="var(--negative)" strokeWidth="1.2" />
-    <path d={upBodies.join(" ")} fill="var(--chart-surface)" stroke="var(--foreground)" strokeWidth="2.2" />
-    <path data-chart-candle-direction="up" data-chart-candle-fill="hollow" d={upBodies.join(" ")} fill="var(--chart-surface)" stroke="var(--positive)" strokeWidth="1.2" />
+    <line x1={right} x2={right} y1={panels.price[0]} y2={panels.taker[1]} stroke="var(--border)" opacity="0.8" />
+    {tag.inViewport && tag.rising && <line data-chart-live-price-outline x1={columns.price[0]} x2={right + tagOffset * tagScale} y1={latestY} y2={latestY} stroke="var(--foreground)" />}
+    {tag.inViewport && <line data-chart-live-price x1={columns.price[0]} x2={right + tagOffset * tagScale} y1={latestY} y2={latestY} stroke={latestColor} strokeDasharray="4 5" />}
+    {/* Expose contrasting segments within the same 1px stroke for the mandated light green. */}
+    <path d={upWicks.join(" ")} fill="none" stroke="var(--foreground)" />
+    <path d={upWicks.join(" ")} fill="none" stroke="var(--positive)" strokeDasharray="2 3" />
+    <path d={downWicks.join(" ")} fill="none" stroke="var(--negative)" />
+    <path d={upBodies.join(" ")} fill="var(--chart-surface)" stroke="var(--foreground)" />
+    <path data-chart-candle-direction="up" data-chart-candle-fill="hollow" d={upBodies.join(" ")} fill="none" stroke="var(--positive)" strokeDasharray="2 3" />
     <path data-chart-candle-direction="down" data-chart-candle-fill="solid" d={downBodies.join(" ")} fill="var(--negative)" />
     <g data-chart-taker={takerComplete ? "complete" : takerAvailable ? "partial" : "empty"} data-chart-taker-state={takerState}>
-      <path data-chart-taker-buy-samples={buys.length} d={buys.join(" ")} fill="var(--positive)" stroke="var(--foreground)" strokeWidth="0.7" opacity="0.9" />
-      <path data-chart-taker-sell-samples={sells.length} d={sells.join(" ")} fill="var(--negative)" stroke="var(--foreground)" strokeWidth="0.7" opacity="0.9" />
+      <path data-chart-taker-buy-samples={buys.length} d={buys.join(" ")} fill="var(--positive)" stroke="var(--foreground)" opacity="0.9" />
+      <path data-chart-taker-sell-samples={sells.length} d={sells.join(" ")} fill="var(--negative)" stroke="var(--foreground)" opacity="0.9" />
       <path d={sells.join(" ")} fill="url(#sell-hatch)" opacity="0.7" />
     </g>
-    {lineStroke("bollUpper", priceLine("bollUpper"), "var(--chart-1)", indicatorWidth)}
+    {lineStroke("bollUpper", priceLine("bollUpper"), "var(--chart-1)")}
     {lineStroke("bollMiddle", priceLine("bollMiddle"), "var(--chart-1)")}
-    {lineStroke("bollLower", priceLine("bollLower"), "var(--chart-1)", indicatorWidth)}
-    {lineStroke("vwap", priceLine("vwap"), "var(--chart-2)", indicatorWidth, 1, "2 3")}
-    {lineStroke("ema", priceLine("ema"), "var(--chart-3)", indicatorWidth, 1, "7 4")}
+    {lineStroke("bollLower", priceLine("bollLower"), "var(--chart-1)")}
+    {lineStroke("vwap", priceLine("vwap"), "var(--chart-2)", "2 3")}
+    {lineStroke("ema", priceLine("ema"), "var(--chart-3)", "7 4")}
     {lineStroke("rsi6", line("rsi6", "rsi", rsiY), "var(--chart-1)")}
-    {lineStroke("rsi12", line("rsi12", "rsi", rsiY), "var(--chart-2)", indicatorWidth, 1, "7 4")}
-    {lineStroke("rsi24", line("rsi24", "rsi", rsiY), "var(--chart-3)", indicatorWidth, 1, "1 4")}
+    {lineStroke("rsi12", line("rsi12", "rsi", rsiY), "var(--chart-2)", "7 4")}
+    {lineStroke("rsi24", line("rsi24", "rsi", rsiY), "var(--chart-3)", "1 4")}
     {lineStroke("roc", line("roc", "roc", value => scale(value, rocAxis.min, rocAxis.max, panels.roc)), "var(--chart-1)")}
-    {lineStroke("maroc", line("maroc", "roc", value => scale(value, rocAxis.min, rocAxis.max, panels.roc)), "var(--chart-2)", indicatorWidth, 1, "7 4")}
+    {lineStroke("maroc", line("maroc", "roc", value => scale(value, rocAxis.min, rocAxis.max, panels.roc)), "var(--chart-2)", "7 4")}
     <g data-chart-oi={oiAxis ? oiComplete ? "complete" : "partial" : "empty"} data-chart-oi-state={oiState} data-chart-oi-samples={oiSamples.length}>
       {oiAxis && <>{lineStroke("oi", line("oi", "oi", oiY), "var(--chart-2)")}{!oiComplete && oiSamples.map(sample => <circle key={bars[sample.index].hour} data-chart-oi-sample cx={x(sample.index, "oi")} cy={oiY(sample.value)} r="2" fill="var(--chart-2)" />)}</>}
     </g>
-    {inspected !== null && panelKeys.map(key => <line key={key} x1={x(inspected, key)} x2={x(inspected, key)} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--foreground)" strokeWidth="0.65" strokeDasharray="3 5" opacity="0.3" />)}
+    {inspected !== null && panelKeys.map(key => <line key={key} x1={x(inspected, key)} x2={x(inspected, key)} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--foreground)" strokeDasharray="3 5" opacity="0.3" />)}
     {([[highIndex, candleHigh, "high"], [lowIndex, candleLow, "low"]] as const).map(([index, value, kind]) => {
       const markerX = x(index, "price"), label = price(value)
       const labelWidth = label.length * 6.5 + 8
       const start = index < n / 2 ? markerX + 10 : markerX - labelWidth - 10
       return <g key={kind}>
-        <line x1={markerX} x2={index < n / 2 ? markerX + 10 : markerX - 10} y1={priceY(value)} y2={priceY(value)} stroke="var(--foreground)" strokeWidth="1" />
+        <line x1={markerX} x2={index < n / 2 ? markerX + 10 : markerX - 10} y1={priceY(value)} y2={priceY(value)} stroke="var(--foreground)" />
         {lineLabel(start, priceY(value), label, "var(--foreground)")}
       </g>
     })}
     <g transform={`translate(${tagX},${priceTagY}) scale(${tagScale})`}>
-      <rect x={tagOffset + tagStrokeWidth / 2} width={tagBoxWidth} height={tagHeight} rx="4" fill="var(--chart-surface)" stroke={latestColor} strokeWidth="var(--chart-price-tag-stroke-width)" />
+      <rect x={tagOffset + tagStrokeWidth / 2} width={tagBoxWidth} height={tagHeight} rx="4" fill="var(--chart-surface)" stroke={latestColor} />
       <text x={tagOffset + (tagBoxWidth + tagStrokeWidth) / 2} y={tagPaddingY + tagLineHeight / 2} textAnchor="middle" dominantBaseline="middle" fill="var(--foreground)" fontSize={tagFontSize}>{latestPrice}</text>
       {showCountdown && <PriceCountdown hour={liveBar.hour} intervalMS={intervalMS} x={tagOffset + (tagBoxWidth + tagStrokeWidth) / 2} y={tagPaddingY + tagLineHeight * 1.5 + tagRowGap} fontSize={tagFontSize} />}
     </g>
@@ -515,7 +515,7 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
         const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : -event.deltaY
         queueWheel(delta * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 240 : 1))
       }}>
-        {surface && plotSize.width > 0 ? <svg key={surface.key} data-rendered-inst={surface.instId} data-rendered-timeframe={surface.timeframe} data-rendered-start={bars[0]!.hour} data-rendered-end={surface.endHour} viewBox={`0 0 ${plotSize.width} ${plotSize.height}`} className={cn('absolute inset-0 h-full w-full text-[length:var(--chart-text-size)] select-none focus-visible:outline-2 focus-visible:outline-ring', !matchesSelection && 'pointer-events-none')} role="img" tabIndex={matchesSelection ? 0 : -1} aria-label={`${surface.instId} complete 96-candle ${timeframeLabel(surface.timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end. Scroll to review history. Arrow keys navigate markets.`} onPointerDown={event => {
+        {surface && plotSize.width > 0 ? <svg key={surface.key} strokeWidth="var(--chart-line-width)" data-rendered-inst={surface.instId} data-rendered-timeframe={surface.timeframe} data-rendered-start={bars[0]!.hour} data-rendered-end={surface.endHour} viewBox={`0 0 ${plotSize.width} ${plotSize.height}`} className={cn('absolute inset-0 h-full w-full text-[length:var(--chart-text-size)] select-none focus-visible:outline-2 focus-visible:outline-ring', !matchesSelection && 'pointer-events-none')} role="img" tabIndex={matchesSelection ? 0 : -1} aria-label={`${surface.instId} complete 96-candle ${timeframeLabel(surface.timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end. Scroll to review history. Arrow keys navigate markets.`} onPointerDown={event => {
           if (!matchesSelection || event.button !== 0 || heldPointer.current) return
           event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId)
           heldPointer.current = { pointerId: event.pointerId, target: event.currentTarget }

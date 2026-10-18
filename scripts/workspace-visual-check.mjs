@@ -143,9 +143,21 @@ try {
       if (previous instanceof SVGGeometryElement && previous.tagName === element.tagName) {
         const previousStyle = getComputedStyle(previous)
         const geometry = element instanceof SVGLineElement ? ['x1', 'y1', 'x2', 'y2'] : element instanceof SVGPathElement ? ['d'] : []
+        const width = Number.parseFloat(style.strokeWidth), previousWidth = Number.parseFloat(previousStyle.strokeWidth)
+        const dashes = style.strokeDasharray.split(/[ ,]+/).map(Number.parseFloat)
+        // Each candle is a separate M subpath, where the dash pattern restarts.
+        const lengths = element instanceof SVGPathElement ? (element.getAttribute('d')?.match(/[Mm][^Mm]*/g) ?? []).map(d => {
+          const path = element.cloneNode(false)
+          path.setAttribute('d', d)
+          return path.getTotalLength()
+        }) : [element.getTotalLength()]
+        const exposedSegments = previousWidth === width && previousStyle.strokeDasharray === 'none'
+          && Number.parseFloat(style.strokeDashoffset) === 0
+          && dashes.length === 2 && dashes.every(Number.isFinite) && dashes[0] > 0 && dashes[1] > width
+          && lengths.length > 0 && lengths.every(length => length > dashes[0] + width)
+        // Equal-width paint only qualifies when real gaps expose the stroke below.
         if (geometry.length && geometry.every(attribute => previous.getAttribute(attribute) === element.getAttribute(attribute))
-          && previousStyle.strokeDasharray === style.strokeDasharray && previousStyle.stroke !== 'none'
-          && Number.parseFloat(previousStyle.strokeWidth) > Number.parseFloat(style.strokeWidth)) addBoundary(previous, 'matching wider stroke beneath paint')
+          && previousStyle.stroke !== 'none' && exposedSegments) addBoundary(previous, 'matching stroke visible through dashed paint')
       }
       const boundaryContrast = boundaries.length ? Math.max(...boundaries.map(boundary => boundary.contrastAgainstSurface)) : null
       const effectiveContrast = Math.max(paintRatio, boundaryContrast ?? 0)
