@@ -18,7 +18,7 @@ const probe = input => electron.evaluate((_electron, value) => globalThis.__mark
 
 try {
   const launchedAt = Date.now()
-  electron = await _electron.launch({ args: ['.', '--headless', '--disable-gpu'], cwd: root,
+  electron = await _electron.launch({ args: ['.'], cwd: root,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData } })
   page = await electron.firstWindow()
   await page.waitForLoadState('domcontentloaded')
@@ -31,6 +31,37 @@ try {
   report.benchmarkWindow = await electron.evaluate(({ BrowserWindow }) => { const window = BrowserWindow.getAllWindows()[0]; return { visible: window.isVisible(), focused: window.isFocused() } })
   assert.equal(report.benchmarkWindow.visible, true, 'The renderer paint benchmark requires a visible native window.')
   report.windowAvailableMS = Date.now() - launchedAt
+  report.gpuFeatureStatus = await electron.evaluate(({ app }) => app.getGPUFeatureStatus())
+  report.appMetricsAtStart = await electron.evaluate(({ app }) => app.getAppMetrics())
+  await page.evaluate(() => {
+    const state = window.__resourceScheduler = { timeOrigin: performance.timeOrigin, supportedEntryTypes: PerformanceObserver.supportedEntryTypes,
+      counts: {}, entries: { longtask: [], 'long-animation-frame': [] } }
+    for (const type of Object.keys(state.entries)) if (state.supportedEntryTypes.includes(type)) {
+      new PerformanceObserver(list => { for (const entry of list.getEntries()) {
+        state.counts[type] = (state.counts[type] ?? 0) + 1
+        if (state.entries[type].length >= 50) continue
+        state.entries[type].push({ name: entry.name, startTime: entry.startTime, duration: entry.duration,
+          blockingDuration: entry.blockingDuration, renderStart: entry.renderStart, styleAndLayoutStart: entry.styleAndLayoutStart,
+          scripts: [...(entry.scripts ?? [])].slice(0, 5).map(script => ({ sourceURL: script.sourceURL, invoker: script.invoker,
+            invokerType: script.invokerType, duration: script.duration, executionStart: script.executionStart,
+            forcedStyleAndLayoutDuration: script.forcedStyleAndLayoutDuration })) })
+      } }).observe({ type, buffered: true })
+    }
+  })
+  report.idleFrameCadence = await page.evaluate(() => new Promise(resolve => {
+    const startedAt = performance.now(), gaps = []
+    let previous = null
+    const frame = timestamp => {
+      if (previous !== null) gaps.push(timestamp - previous)
+      previous = timestamp
+      if (timestamp - startedAt < 1000) { requestAnimationFrame(frame); return }
+      gaps.sort((left, right) => left - right)
+      resolve({ startedAt, durationMS: timestamp - startedAt, frames: gaps.length,
+        medianMS: gaps[Math.floor((gaps.length - 1) * .5)] ?? null, p95MS: gaps[Math.floor((gaps.length - 1) * .95)] ?? null,
+        maxMS: gaps.at(-1) ?? null, visibilityState: document.visibilityState, focused: document.hasFocus() })
+    }
+    requestAnimationFrame(frame)
+  }))
   const fixture = await probe({ action: 'scaleSeed', count: 287, periods: 320 })
   report.fixture = fixture
   report.appMetricsAfterSeed = await electron.evaluate(({ app }) => app.getAppMetrics())
@@ -117,6 +148,7 @@ try {
     const gaps = [...window.__resourcePaint.frameGaps].sort((left, right) => left - right)
     return { frames: gaps.length, medianMS: gaps[Math.floor((gaps.length - 1) * .5)], p95MS: gaps[Math.floor((gaps.length - 1) * .95)], maxMS: gaps.at(-1), visibilityState: document.visibilityState, focused: document.hasFocus() }
   })
+  report.schedulerAfterTicks = await page.evaluate(() => window.__resourceScheduler)
   for (const index of [286, 175, 96, 14]) { await choose(fixture.instIds[index], 'cold bounded local selection'); await choose(focus, 'warm revisit') }
   const currentEnd = Math.floor(fixture.asOf / fixture.intervals[timeframe]) * fixture.intervals[timeframe] - fixture.intervals[timeframe]
   for (const distance of [64, -64]) {
@@ -134,6 +166,7 @@ try {
   report.correctness = await page.evaluate(() => ({ violations: window.__resourcePaint.violations, indicatorValuesChecked: window.__resourcePaint.indicatorValuesChecked, rendererCommits: window.__resourcePaint.records.length }))
   report.background = await probe({ action: 'backgroundStatus' })
   report.appMetricsAfterLoad = await electron.evaluate(({ app }) => app.getAppMetrics())
+  report.schedulerAfterLoad = await page.evaluate(() => window.__resourceScheduler)
   report.rendererMemoryAfterLoad = await page.evaluate(() => performance.memory ? { usedJSHeapSize: performance.memory.usedJSHeapSize, totalJSHeapSize: performance.memory.totalJSHeapSize, jsHeapSizeLimit: performance.memory.jsHeapSizeLimit } : null)
   report.final = await probe({ action: 'scaleStop' }); stopped = true
   report.receiptToPaintP95MS = percentile(report.samples.map(sample => sample.receiptToPaintMS))

@@ -516,3 +516,70 @@ test('compact latest generation changes retain proven statistics but accept expl
   store.ingestLatest(response(bars(104, 96).map(value => ({ ...value, oi: 2_000, buy: 40, sell: 60 })), { generation: 3, revision: 4 }))
   assert.ok(store.window(instId, '1H')!.bars.every(value => value.oi === 2_000 && value.buy === 40 && value.sell === 60))
 })
+
+test('byte ownership remains exact across promotion, generation carriers, replacement and both eviction limits', () => {
+  const store = new PreparedChartStore({ maxSeries: 2, maxBarsPerSeries: 128, maxBytes: 10_000_000 })
+  const eth = 'ETH-USDT-SWAP', sol = 'SOL-USDT-SWAP'
+  const accounting = store as unknown as {
+    seriesBytes: number; latestBytes: number
+    series: Map<string, { byteSize: number; bars: Map<number, { bar: PreparedChartBar }> }>
+    latestFrames: Map<string, { window: { bars: readonly PreparedChartBar[] } }>
+  }
+  const bytes = (values: readonly PreparedChartBar[]) => values.reduce((total, value) => total + JSON.stringify(value).length * 2, 0)
+  const verify = () => {
+    let history = 0, latest = 0
+    for (const entry of accounting.series.values()) {
+      const actual = bytes([...entry.bars.values()].map(value => value.bar))
+      assert.equal(entry.byteSize, actual)
+      history += actual
+    }
+    for (const entry of accounting.latestFrames.values()) latest += bytes(entry.window.bars)
+    assert.equal(accounting.seriesBytes, history); assert.equal(accounting.latestBytes, latest)
+    assert.ok(history >= 0 && latest >= 0)
+  }
+  store.setUniverse([instId, eth], '1H', instId)
+  store.ingestLatest(response(bars(104, 96))); verify()
+  const immutable = store.window(instId, '1H')!
+  store.ingest(response(bars(0, 200))); verify()
+  assert.equal(accounting.series.size, 1)
+  assert.ok(accounting.seriesBytes > 0 && accounting.latestBytes > 0, 'History and compact projections each retain their own logical payload charge.')
+  store.ingestLatest(response([bar(199, hour, { indicatorsObserved: false, ema: null, oi: null, buy: null, sell: null,
+    statisticsSources: 0, statisticsObserved: false, oiObserved: false, takerObserved: false })], { generation: 2, revision: 2 }))
+  verify()
+  assert.equal(store.window(instId, '1H')!.bars.at(-1)!.oi, 1_000)
+  const beforePromotion = accounting.seriesBytes
+  store.ingest(response([bar(198)], { generation: 2, revision: 3, latestEnd: 199 * hour })); verify()
+  assert.equal(accounting.seriesBytes, beforePromotion, 'A provenance-only promotion keeps the existing payload charge.')
+  store.ingest(response([bar(198, hour, { oi: 12_345_678, close: 110, high: 111 })], { generation: 2, revision: 4, latestEnd: 199 * hour })); verify()
+  store.ingest(response(bars(200, 201), { generation: 2, revision: 5 })); verify()
+  assert.equal([...accounting.series.values()][0].bars.size, 128)
+  store.ingest(response(bars(0, 150), { instId: eth })); verify()
+  store.snapshotMeta(instId, '1H')
+  store.ingest(response(bars(0, 96), { instId: sol })); verify()
+  assert.equal(store.size, 2); assert.equal(store.window(eth, '1H', 95 * hour), null)
+  store.setUniverse([instId], '1H', instId); verify()
+  assert.equal(store.latestSize, 1)
+  assert.ok(immutable.bars.every(value => value.ema === 100 && value.oi === 1_000), 'Eviction/accounting cannot mutate an already presented frame.')
+})
+
+test('repeated full and compact forming frames preserve the byte budget and evict only unpinned candidates when it grows', () => {
+  const eth = 'ETH-USDT-SWAP', sol = 'SOL-USDT-SWAP', completed = bars(104, 96)
+  const payload = completed.reduce((total, value) => total + JSON.stringify(value).length * 2, 0)
+  const store = new PreparedChartStore({ maxBytes: 2 * payload + 1000 })
+  store.setUniverse([instId, eth, sol], '1H', instId)
+  store.ingestLatest(response(completed))
+  store.ingestLatest(response(completed, { instId: eth }))
+  const live: Bar = { ...bar(200), confirmed: false }
+  for (let revision = 2; revision <= 300; revision += 1) {
+    const update = { ...live, close: 101 + revision / 1000 }
+    if (revision % 2) store.ingestLatest(response(completed, { revision, liveBar: update }))
+    else store.ingestLive({ type: 'live', instId, timeframe: '1H', generation: 1, revision, endHour: 199 * hour, liveBar: update })
+  }
+  assert.equal(store.size, 0); assert.equal(store.latestSize, 2)
+  assert.ok(store.window(eth, '1H'), 'Repeated updates of the same completed payload cannot accumulate byte charges.')
+  store.ingestLatest(response(completed, { instId: sol }))
+  assert.equal(store.latestSize, 2)
+  assert.ok(store.window(instId, '1H'), 'The active compact frame stays pinned.')
+  assert.equal(store.window(eth, '1H'), null)
+  assert.ok(store.window(sol, '1H'))
+})
