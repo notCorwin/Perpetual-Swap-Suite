@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { assertCompletePaints, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, measureLatencyCoveredPrefetch, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
+import { assertCompletePaints, assertWorkspaceLayout, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
 
 const root = new URL('../..', import.meta.url).pathname
 const userData = await mkdtemp(join(tmpdir(), 'perp-radar-e2e-'))
@@ -345,6 +345,13 @@ test('the paint probe catches changed indicator geometry without a new snapshot 
 })
 
 test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while speculative preparation is stalled in every native timeframe', async context => {
+  const foreground = await foregroundPaintWindow(electron, page)
+  context.after(async () => {
+    await foreground.restore()
+    const restored = await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isVisible())
+    assert.equal(restored, foreground.previous.visible, 'The latency test must restore the native window visibility.')
+  })
+  context.diagnostic(`Native paint window: ${JSON.stringify({ before: foreground.previous, during: foreground.native })}`)
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   // Adaptive speculative preparation is held indefinitely. Source reads are
   // also stalled after warming, so navigation must stay independent of both

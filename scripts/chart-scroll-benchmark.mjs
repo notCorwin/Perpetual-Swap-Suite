@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { assertCompletePaints, finishPaintProbe, installRequestProbe, measureLatencyCoveredPrefetch, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from './chart-acceptance.mjs'
+import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from './chart-acceptance.mjs'
 
 const root = new URL('..', import.meta.url).pathname
 
@@ -28,8 +28,9 @@ async function withBenchmarkApp(run) {
 const performanceReport = await withBenchmarkApp(async (electron, page, fixture) => {
   const timeframes = []
   let sourceRequests = []
-  await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
+  const foreground = await foregroundPaintWindow(electron, page)
   try {
+    await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
     await openChart(page, fixture)
     for (const timeframe of fixture.timeframes) {
       await selectTimeframe(page, timeframe)
@@ -86,8 +87,11 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
       })
     }
     sourceRequests = (await readRequestProbe(electron)).sourceRequests
-  } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
-  return { nativePeriods: fixture.timeframes, persistedPeriodsPerTimeframe: fixture.periods,
+  } finally {
+    try { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
+    finally { await foreground.restore() }
+  }
+  return { foregroundWindow: foreground.native, nativePeriods: fixture.timeframes, persistedPeriodsPerTimeframe: fixture.periods,
     sourceRequests, currentMaintenanceRequests: separateSourceMaintenance(sourceRequests, fixture).currentMaintenance, timeframes }
 })
 

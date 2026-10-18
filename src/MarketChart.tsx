@@ -30,7 +30,6 @@ const PriceStatus = memo(function PriceStatus({ observedAt, realtime }: { observ
 })
 
 const chartTimeFormatter = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })
-const finiteNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value)
 const time = (hour: number) => chartTimeFormatter.format(hour)
 const hourLabel = time
 const chartStyle = getComputedStyle(document.documentElement)

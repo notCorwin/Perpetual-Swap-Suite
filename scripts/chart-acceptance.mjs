@@ -1,5 +1,38 @@
 import assert from 'node:assert/strict'
 
+// A foreground paint budget requires a native foreground window. A hidden
+// BrowserWindow can still report document.visibilityState === 'visible' while
+// macOS schedules its animation frames at an occluded-window cadence.
+export async function foregroundPaintWindow(electron, page) {
+  const previous = await electron.evaluate(({ BrowserWindow, app }) => {
+    const window = BrowserWindow.getAllWindows()[0]
+    const state = { id: window.id, visible: window.isVisible(), focused: window.isFocused(), minimized: window.isMinimized() }
+    if (state.minimized) window.restore()
+    window.show()
+    app.focus({ steal: true })
+    window.focus()
+    return state
+  })
+  const restore = () => electron.evaluate(({ BrowserWindow }, previous) => {
+    const window = BrowserWindow.fromId(previous.id)
+    if (previous.minimized) window.minimize()
+    else if (!previous.visible) window.hide()
+    else if (!previous.focused) window.blur()
+  }, previous)
+  try {
+    await page.waitForFunction(() => document.visibilityState === 'visible' && document.hasFocus(), null, { timeout: 5_000 })
+    const native = await electron.evaluate(({ BrowserWindow }, id) => {
+      const window = BrowserWindow.fromId(id)
+      return { visible: window.isVisible(), focused: window.isFocused(), minimized: window.isMinimized() }
+    }, previous.id)
+    assert.deepEqual(native, { visible: true, focused: true, minimized: false }, 'Paint latency requires a visible, focused native window.')
+    return { previous, native, restore }
+  } catch (error) {
+    await restore()
+    throw error
+  }
+}
+
 export async function selectTimeframe(page, timeframe) {
   const button = page.locator('[aria-label="Chart timeframe"] button')
     .filter({ hasText: new RegExp(`^${timeframe}$`, 'i') })
@@ -265,6 +298,7 @@ export async function measurePaintLatency(page, { inputs, targets }) {
   await page.waitForFunction(({ latestInput, expectedEnd }) => window.__chartPaintProbe?.commits.some(commit =>
     commit.end === expectedEnd && commit.at >= latestInput && commit.presentedAt !== null), { latestInput, expectedEnd })
   return page.evaluate(({ inputs, targets }) => {
+    if (document.visibilityState !== 'visible' || !document.hasFocus()) throw new Error('Foreground paint latency lost its visible, focused window.')
     const probe = window.__chartPaintProbe, commits = probe.commits
     const matching = inputs.map((input, index) => commits.find(commit => commit.end === targets[index] && commit.at >= input && commit.presentedAt !== null))
     const latencies = matching.flatMap((commit, index) => commit ? [commit.presentedAt - inputs[index]] : []).sort((left, right) => left - right)
@@ -280,6 +314,7 @@ export async function measurePaintLatency(page, { inputs, targets }) {
       return Number((sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * ratio))] ?? 0).toFixed(3))
     }
     return {
+      documentVisibility: document.visibilityState, documentFocused: document.hasFocus(),
       committedInputs: latencies.length, supersededInputs: inputs.length - latencies.length,
       p50InputToPaintMS: percentile(.5), p95InputToPaintMS: percentile(.95),
       latestInputToPaintMS: Number((latest.presentedAt - inputs.at(-1)).toFixed(3)),
@@ -463,8 +498,9 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
   const historicalDelayMS = 1_500
   const frames = 576
   const candlesPerFrame = 2
-  await installRequestProbe(electron, fixture.instId, { initialHistoryBars, historicalDelayMS })
+  const foreground = await foregroundPaintWindow(electron, page)
   try {
+    await installRequestProbe(electron, fixture.instId, { initialHistoryBars, historicalDelayMS })
     await openChart(page, fixture)
     // Admit the bounded durable range through an actual history gesture;
     // opening latest deliberately performs no deep-history IPC.
@@ -515,7 +551,7 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
     const sources = separateSourceMaintenance(requests.sourceRequests, fixture)
     assert.deepEqual(sources.historical, [], 'Prefetch must reuse persisted source candles and statistics within the latency test range.')
     return {
-      initialHistoryBars, historicalDelayMS, continuousWheelFrames: frames,
+      foregroundWindow: foreground.native, initialHistoryBars, historicalDelayMS, continuousWheelFrames: frames,
       scrolledCandles: frames * candlesPerFrame, crossedInitialBoundary: true,
       runwayAtRequest, prefetchHistoryBars: first.historyBars,
       prefetchStartedDuringGesture: true, prefetchCompletedDuringGesture: true,
@@ -524,5 +560,8 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
       repeatedSourceDownloads: sources.historical.length,
       ...latency, ...paint, commits: paint.commits.length,
     }
-  } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
+  } finally {
+    try { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
+    finally { await foreground.restore() }
+  }
 }
