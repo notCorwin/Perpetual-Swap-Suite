@@ -9,7 +9,6 @@
   --font-heading: var(--font-sans);
   --color-positive: var(--positive);
   --color-negative: var(--negative);
-  --color-chart-surface: var(--chart-surface);
   --color-chart-annotation: var(--chart-annotation);
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -56,8 +55,6 @@
   --positive: rgb(142 188 57);
   --negative: rgb(232 85 168);
   --analysis-panel-width: 400px;
-  --chart-surface: var(--card);
-  --chart-snapshot-background: var(--card);
   --chart-annotation: var(--muted);
   --chart-rsi-area: color-mix(in srgb, var(--foreground) 5%, transparent);
   --chart-roc-positive-area: color-mix(in srgb, var(--positive) 12%, transparent);
