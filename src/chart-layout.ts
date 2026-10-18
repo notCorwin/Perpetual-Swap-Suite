@@ -11,12 +11,22 @@ export function chartHourX(hour: number, latestHour: number, start: number, end:
   return start + candleWidth / 2 + (hour - (latestHour - 95 * intervalMS)) * (end - start - candleWidth) / (95 * intervalMS)
 }
 
-export function fitAxisPriceTag(axisGutter: number, tagWidth: number, strokeWidth: number, minimumScale: number) {
-  const leadingInset = 2, trailingInset = 4
-  const fullTagWidth = tagWidth + strokeWidth
-  const gutter = Math.ceil(Math.max(axisGutter, leadingInset + trailingInset + fullTagWidth * minimumScale))
-  const scale = Math.min(1, (gutter - leadingInset - trailingInset) / fullTagWidth)
-  return { gutter, scale, offset: leadingInset / scale, boxWidth: (gutter - leadingInset - trailingInset) / scale - strokeWidth }
+export function chartPriceLabelLayout(priceY: number, panel: Range, rowHeight: number, countdownHeight: number, gap: number, showCountdown: boolean) {
+  // Clip the background at panel edges while the price text keeps its true y.
+  const priceTop = Math.max(panel[0], priceY - rowHeight / 2)
+  const priceBottom = Math.min(panel[1], priceY + rowHeight / 2)
+  const below = priceBottom + gap + countdownHeight / 2
+  const above = priceTop - gap - countdownHeight / 2
+  const countdownY = !showCountdown ? null
+    : below + countdownHeight / 2 <= panel[1] ? below
+      : above - countdownHeight / 2 >= panel[0] ? above : null
+  return {
+    priceTop,
+    priceHeight: priceBottom - priceTop,
+    countdownY,
+    top: countdownY === null ? priceTop : Math.min(priceTop, countdownY - countdownHeight / 2),
+    bottom: countdownY === null ? priceBottom : Math.max(priceBottom, countdownY + countdownHeight / 2),
+  }
 }
 
 export function chartLayout(width: number, height: number, labelGutter = 64) {

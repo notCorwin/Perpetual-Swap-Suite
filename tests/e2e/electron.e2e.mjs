@@ -429,12 +429,25 @@ test('the live price overlay follows its actual price without changing the 96 co
         line.getAttribute('stroke') === 'var(--border)' && line.y1.baseVal.value === line.y2.baseVal.value
         && line.x1.baseVal.value !== line.x2.baseVal.value)
       const line = svg.querySelector('[data-chart-live-price]')
+      const label = svg.querySelector('[data-chart-price-label-value]')
+      const tick = svg.querySelector('[data-chart-price-tick] text')
+      const countdown = svg.querySelector('[data-chart-countdown]')
+      const labelBounds = label.getBBox()
       return {
         bars: snapshot.bars.length, allConfirmed: snapshot.bars.every(bar => bar.confirmed),
         liveConfirmed: snapshot.liveBar?.confirmed, liveHour: snapshot.liveBar?.hour,
         lineY: Number(line?.getAttribute('y1')),
         expectedY: (Number(horizontalBorders[0].getAttribute('y1')) + Number(horizontalBorders[1].getAttribute('y1'))) / 2,
-        countdown: svg.querySelector('[data-chart-countdown]')?.textContent,
+        countdown: countdown?.textContent,
+        labelX: Number(label.getAttribute('x')), tickX: Number(tick.getAttribute('x')),
+        labelY: Number(label.getAttribute('y')),
+        backgroundX: Number(svg.querySelector('[data-chart-price-label-background]').getAttribute('x')),
+        lineEndX: Number(line.getAttribute('x2')),
+        labelBounds: [labelBounds.x, labelBounds.x + labelBounds.width], svgWidth: svg.viewBox.baseVal.width,
+        labelFont: getComputedStyle(label).fontSize, tickFont: getComputedStyle(tick).fontSize,
+        countdownFont: getComputedStyle(countdown).fontSize,
+        countdownFill: getComputedStyle(countdown).fill, tickFill: getComputedStyle(tick).fill,
+        labelFill: getComputedStyle(label).fill,
       }
     })
     assert.equal(overlay.bars, 96)
@@ -443,6 +456,14 @@ test('the live price overlay follows its actual price without changing the 96 co
     assert.equal(overlay.liveHour, fixture.end + fixture.intervalMS)
     assert.ok(Math.abs(overlay.lineY - overlay.expectedY) < 1e-6, `The live price line must use its logarithmic price coordinate: ${JSON.stringify(overlay)}`)
     assert.match(overlay.countdown ?? '', /^\d{2}:\d{2}$/)
+    assert.equal(overlay.labelX, overlay.tickX, 'The price value must share the axis tick alignment.')
+    assert.equal(overlay.labelY, overlay.lineY, 'Countdown placement must not shift the price anchor.')
+    assert.equal(overlay.backgroundX, overlay.lineEndX, 'The price highlight must meet the plot axis.')
+    assert.ok(overlay.labelBounds[0] >= 0 && overlay.labelBounds[1] <= overlay.svgWidth, 'The complete price value must fit inside the SVG.')
+    assert.equal(overlay.labelFont, overlay.tickFont)
+    assert.ok(parseFloat(overlay.countdownFont) < parseFloat(overlay.labelFont))
+    assert.equal(overlay.countdownFill, overlay.tickFill, 'The countdown must use the muted axis text color.')
+    assert.notEqual(overlay.countdownFill, overlay.labelFill)
     await wheelBurst(page, { deltaY: 12 })
     await waitForRendered(page, fixture, fixture.timeframe, fixture.end - fixture.intervalMS)
     assert.equal(await page.locator('[data-chart-countdown]').count(), 0, 'Historical charts must not display a live countdown.')
@@ -450,6 +471,43 @@ test('the live price overlay follows its actual price without changing the 96 co
     assertCompletePaints(await finishPaintProbe(page))
   } finally {
     await removePreparedTransform()
+  }
+})
+
+test('live prices outside the saved domain keep their axis labels inside the price panel', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  const visible = fixture.series[fixture.timeframe].bars.slice(-96)
+  const extremes = [Math.max(...visible.map(bar => bar.high)) * 10, Math.min(...visible.map(bar => bar.low)) / 10]
+  for (const livePrice of extremes) {
+    await installPreparedTransform({ mode: 'live', instId: fixture.instId, livePrice })
+    try {
+      await openChart(page, fixture)
+      const geometry = await page.evaluate(() => {
+        const svg = document.querySelector('svg[data-rendered-inst]')
+        const borders = [...svg.querySelectorAll(':scope > line')].filter(line =>
+          line.getAttribute('stroke') === 'var(--border)' && line.y1.baseVal.value === line.y2.baseVal.value
+          && line.x1.baseVal.value !== line.x2.baseVal.value)
+        const bounds = selector => {
+          const box = svg.querySelector(selector).getBBox()
+          return [box.y, box.y + box.height]
+        }
+        return {
+          panel: borders.slice(0, 2).map(line => Number(line.getAttribute('y1'))),
+          livePrice: document.querySelector('[data-chart-inst]').__chartSnapshot.liveBar?.close,
+          lineY: Number(svg.querySelector('[data-chart-live-price]').getAttribute('y1')),
+          labelY: Number(svg.querySelector('[data-chart-price-label-value]').getAttribute('y')),
+          label: bounds('[data-chart-price-label-value]'), row: bounds('[data-chart-price-label-background]'),
+          countdown: bounds('[data-chart-countdown]'),
+        }
+      })
+      assert.equal(geometry.livePrice, livePrice)
+      assert.equal(geometry.labelY, geometry.lineY)
+      assert.ok(geometry.lineY >= geometry.panel[0] && geometry.lineY <= geometry.panel[1])
+      for (const bounds of [geometry.label, geometry.row, geometry.countdown]) {
+        assert.ok(bounds[0] >= geometry.panel[0] && bounds[1] <= geometry.panel[1], `Axis text must stay in the price panel: ${JSON.stringify(geometry)}`)
+      }
+      assert.ok(geometry.countdown[1] <= geometry.row[0] || geometry.countdown[0] >= geometry.row[1], 'The countdown must not overlap the price row.')
+    } finally { await removePreparedTransform() }
   }
 })
 

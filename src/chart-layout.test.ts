@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chartCandleWidth, chartHourX, chartLayout, fitAxisPriceTag, type ChartPanel } from "./chart-layout.ts"
+import { chartCandleWidth, chartHourX, chartLayout, chartPriceLabelLayout, type ChartPanel } from "./chart-layout.ts"
 
 test("stacked chart layout stays aligned and bounded", () => {
   const order: ChartPanel[] = ["price", "roc", "rsi", "oi", "taker"]
@@ -30,24 +30,44 @@ test("chart hours retain their position when candles are missing", () => {
   assert.equal(chartHourX(10 * hour, 95 * hour, 0, 960), first + (last - first) * 10 / 95)
 })
 
-test("price tag rests inside the axis gutter without clipping or shrinking below axis text", () => {
-  const stroke = 1.5, intrinsicWidth = 90, minimumScale = 10 / 12
-  const closeTo = (actual: number, expected: number) => assert.ok(Math.abs(actual - expected) < 1e-9)
-  const narrow = fitAxisPriceTag(42, intrinsicWidth, stroke, minimumScale)
-  assert.ok(narrow.scale >= minimumScale)
-  assert.ok(narrow.gutter < intrinsicWidth + stroke + 6)
-  closeTo(narrow.offset * narrow.scale, 2)
-  closeTo((narrow.boxWidth + stroke) * narrow.scale, narrow.gutter - 6)
+test("axis price row preserves its size and places countdown below in open space", () => {
+  assert.deepEqual(chartPriceLabelLayout(60, [10, 110], 20, 12, 3, true), {
+    priceTop: 50, priceHeight: 20, countdownY: 79, top: 50, bottom: 85,
+  })
+})
 
-  const medium = fitAxisPriceTag(85, intrinsicWidth, stroke, minimumScale)
-  assert.equal(medium.gutter, 85)
-  assert.ok(medium.scale > narrow.scale && medium.scale < 1)
-  closeTo(medium.offset * medium.scale, 2)
-  closeTo((medium.boxWidth + stroke) * medium.scale, medium.gutter - 6)
+test("countdown flips above near the lower boundary without moving the price row", () => {
+  assert.deepEqual(chartPriceLabelLayout(100, [10, 110], 20, 12, 3, true), {
+    priceTop: 90, priceHeight: 20, countdownY: 81, top: 75, bottom: 110,
+  })
+  assert.deepEqual(chartPriceLabelLayout(110, [10, 110], 20, 12, 3, true), {
+    priceTop: 100, priceHeight: 10, countdownY: 91, top: 85, bottom: 110,
+  })
+})
 
-  const wide = fitAxisPriceTag(120, intrinsicWidth, stroke, minimumScale)
-  assert.equal(wide.gutter, 120)
-  assert.equal(wide.scale, 1)
-  assert.equal(wide.offset, 2)
-  assert.equal(wide.boxWidth + stroke, wide.gutter - 6)
+test("price background clips at the upper boundary and leaves countdown below", () => {
+  assert.deepEqual(chartPriceLabelLayout(10, [10, 110], 20, 12, 3, true), {
+    priceTop: 10, priceHeight: 10, countdownY: 29, top: 10, bottom: 35,
+  })
+})
+
+test("historical axis labels occupy only their price row", () => {
+  assert.deepEqual(chartPriceLabelLayout(60, [10, 110], 20, 12, 3, false), {
+    priceTop: 50, priceHeight: 20, countdownY: null, top: 50, bottom: 70,
+  })
+})
+
+test("countdown is omitted when neither side fits inside a small panel", () => {
+  assert.deepEqual(chartPriceLabelLayout(20, [10, 30], 20, 12, 3, true), {
+    priceTop: 10, priceHeight: 20, countdownY: null, top: 10, bottom: 30,
+  })
+  assert.deepEqual(chartPriceLabelLayout(12, [10, 14], 20, 12, 3, true), {
+    priceTop: 10, priceHeight: 4, countdownY: null, top: 10, bottom: 14,
+  })
+})
+
+test("a countdown that exactly fits a panel edge remains visible", () => {
+  assert.deepEqual(chartPriceLabelLayout(85, [10, 110], 20, 12, 3, true), {
+    priceTop: 75, priceHeight: 20, countdownY: 104, top: 75, bottom: 110,
+  })
 })
