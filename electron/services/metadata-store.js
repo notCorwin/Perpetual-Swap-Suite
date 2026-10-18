@@ -255,9 +255,19 @@ export class MetadataStore {
   }
 
   putSyncTask(task) { const value = validateJob(task, 'sync'); return this.#put('sync_tasks', value.id, value) }
+  putSyncTasks(tasks) {
+    if (!Array.isArray(tasks)) throw new TypeError('Sync tasks must be an array.')
+    const values = tasks.map(task => validateJob(task, 'sync'))
+    return this.#transaction(() => values.map(value => this.#put('sync_tasks', value.id, value)))
+  }
   getSyncTask(id) { const value = this.#get('sync_tasks', id); return value && validateJob(value, 'sync') }
   listSyncTasks() { return this.#list('sync_tasks').map(value => validateJob(value, 'sync')) }
   deleteSyncTask(id) { return this.#delete('sync_tasks', id) }
+  deleteSyncTasks(ids) {
+    if (!Array.isArray(ids)) throw new TypeError('Sync task IDs must be an array.')
+    ids.forEach(id => identifier(id, 'Sync task ID'))
+    return this.#transaction(() => ids.reduce((deleted, id) => deleted + Number(this.#delete('sync_tasks', id)), 0))
+  }
   saveAudit(audit) { const value = validateJob(audit, 'audit'); return this.#put('audits', value.id, value) }
   getAudit(id) { const value = this.#get('audits', id); return value && validateJob(value, 'audit') }
   listAudits() { return this.#list('audits').map(value => validateJob(value, 'audit')) }

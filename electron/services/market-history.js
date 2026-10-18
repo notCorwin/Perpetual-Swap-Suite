@@ -46,13 +46,21 @@ export class MarketHistory {
     this.latestTasks = new Map()
     this.seeds = new Map()
     this.repairs = new Map()
+    this.coverageLeases = new Map()
     const statistics = source => ({
       inspect: query => this.inspectSource(query),
       fetchGap: query => this.fetchStatistics(query, source),
     })
     this.sync = new HistorySync({
       metadata,
-      store: { missingCandleRanges: (query, priority) => this.missingSource(query, priority) },
+      store: {
+        missingCandleRanges: (query, priority) => this.missingSource(query, priority),
+        ...(typeof store.candleRevision === 'function' ? {
+          coverageVersion: query => store.candleRevision(query.instrument, query.timeframe),
+          ...(typeof store.candleChangesSince === 'function' ? { coverageChanges: (query, revision) => store.candleChangesSince(query.instrument, query.timeframe, revision) } : {}),
+        } : {}),
+        coverageExpiry: query => this.coverageLeases.get(`${rangeKey(query)}:${query.source}`) ?? null,
+      },
       sources: {
         candles: { inspect: query => this.inspectSource(query), fetchGap: query => this.fetchPrices(query) },
         oi: statistics('oi'),
@@ -110,6 +118,14 @@ export class MarketHistory {
     const rows = await this.store.candles(query, priority)
     const bit = query.source === 'oi' ? OI : TAKER
     const observations = this.seeds.get(keyOf(query.instrument, query.timeframe))
+    const leases = query.source === 'candles' ? [] : rows.filter(row => sourcePresent(row, bit, this.now()))
+      .map(row => Number(row[expiryField(bit)])).filter(expiry => expiry > this.now())
+    const leaseKey = `${rangeKey(query)}:${query.source}`
+    // Only the caller's immediately following coverageExpiry lookup needs this
+    // value. Bound retained query metadata independently of historical windows.
+    this.coverageLeases.delete(leaseKey)
+    this.coverageLeases.set(leaseKey, leases.length ? Math.min(...leases) : null)
+    while (this.coverageLeases.size > 512) this.coverageLeases.delete(this.coverageLeases.keys().next().value)
     return missing(rows, query.from, query.through, query.intervalMS,
       query.source === 'candles' ? row => pricePresent(row) && !observations?.has(row.timestamp) : row => pricePresent(row) && sourcePresent(row, bit, this.now()))
   }
@@ -251,6 +267,7 @@ export class MarketHistory {
       if (live) await this.onLive?.(instId, timeframe, live)
       const confirmed = this.parsed(instId, timeframe, values)
       this.seeds.set(key, new Map(confirmed.map(row => [row.timestamp, row])))
+      for (const row of confirmed) this.sync.invalidate({ instrument: instId, timeframe, source: 'candles', from: row.timestamp, through: row.timestamp })
       const { floor } = this.bounds(instId, timeframe)
       // A latest response proves only the observations it actually contains.
       // Empty/forming-only responses never invent a range to the local clock;
@@ -291,6 +308,7 @@ export class MarketHistory {
       replaceFrom: wholeDay ? Math.floor(issue.from / DAY) * DAY : from,
       replaceThrough: wholeDay ? Math.floor(issue.through / DAY) * DAY + DAY - interval : through }
     this.repairs.set(key, repair)
+    this.sync.invalidate({ ...target, source: 'candles' })
     let task
     const abort = () => { if (task) void this.sync.cancel(task.id).catch(() => undefined) }
     signal.addEventListener('abort', abort, { once: true })

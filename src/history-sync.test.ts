@@ -1,4 +1,5 @@
 import { test } from 'node:test'
+import { createHash } from 'node:crypto'
 import { strict as assert } from 'node:assert'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -28,8 +29,9 @@ const within = async <T>(promise: Promise<T>): Promise<T> => {
   finally { clearTimeout(timer) }
 }
 class MemoryMetadata {
+  writes = 0
   tasks = new Map<string, HistoryTask>()
-  putSyncTask(task: HistoryTask) { this.tasks.set(task.id, structuredClone(task)); return structuredClone(task) }
+  putSyncTask(task: HistoryTask) { this.writes++; this.tasks.set(task.id, structuredClone(task)); return structuredClone(task) }
   getSyncTask(id: string) { return structuredClone(this.tasks.get(id) ?? null) }
   listSyncTasks() { return [...this.tasks.values()].map(value => structuredClone(value)) }
   deleteSyncTask(id: string) { return this.tasks.delete(id) }
@@ -51,6 +53,23 @@ class MemoryStore {
       else if (first !== null) { result.push({ from: first, through: timestamp - query.intervalMS }); first = null }
     }
     if (first !== null) result.push({ from: first, through: query.through })
+    return result
+  }
+}
+class VersionedMemoryStore extends MemoryStore {
+  revision = 0
+  changes: { revision: number; from: number; through: number }[] = []
+  coverageVersion() { return this.revision }
+  coverageChanges(_query: HistoryRange, revision: number) {
+    return { revision: this.revision, ranges: revision < (this.changes[0]?.revision ?? 1) - 1 ? null : this.changes.filter(change => change.revision > revision).map(({ from, through }) => ({ from, through })) }
+  }
+  changed(from: number, through = from) {
+    this.changes.push({ revision: ++this.revision, from, through })
+    if (this.changes.length > 256) this.changes.shift()
+  }
+  override async appendCandles(values: CandleRecord[]) {
+    const result = await super.appendCandles(values)
+    if (values.length) this.changed(Math.min(...values.map(row => row.timestamp)), Math.max(...values.map(row => row.timestamp)))
     return result
   }
 }
@@ -750,42 +769,35 @@ test('result eviction protects all concurrent cancelled writers and registered w
   } finally { release.resolve(); await sync.close() }
 })
 
-test('rolling history targets retain bounded recent results in memory and persistent metadata', async () => {
+test('rolling history and warmup keep stable identities and only verify newly exposed tails', async () => {
   let now = base + 60 * 86_400_000
-  const metadata = new MemoryMetadata()
-  const options: Partial<HistorySyncOptions> = { metadata, now: () => now, maxRetainedTerminalTasks: 8,
-    store: { async missingCandleRanges() { return [] } },
-    write() { throw new Error('Complete history must not be rewritten.') },
-    sources: { candles: { fetchGap() { throw new Error('Complete history must not be downloaded.') } } },
-  }
-  let sync = create(options).sync
-  let first!: HistoryTask, latest!: HistoryTask
+  const metadata = new MemoryMetadata(), store = new VersionedMemoryStore()
+  const queries: CoverageQuery[] = []
+  store.missingCandleRanges = async query => { queries.push(query); return [] }
+  let sync = create({ metadata, store, now: () => now }).sync
+  let first!: { history: HistoryTask; warmup: HistoryTask | null }
   try {
-    for (let index = 0; index < 256; index += 1) {
-      const target = await sync.enqueueTarget({ instrument: request.instrument, timeframe: '5m', source: 'candles', historyDays: 1, asOf: now, warmupCandles: 0 })
-      first ??= target.history
-      latest = target.history
-      assert.equal((await sync.waitFor(latest.id)).status, 'completed')
+    for (let index = 0; index < 128; index += 1) {
+      const target = await sync.enqueueTarget({ instrument: request.instrument, timeframe: '5m', source: 'candles', historyDays: 1, asOf: now, warmupCandles: 200 })
+      first ??= target
+      assert.equal(target.history.id, first.history.id)
+      assert.equal(target.warmup!.id, first.warmup!.id)
       await sync.whenIdle()
-      assert.ok(sync.listTasks().length <= 8)
-      assert.ok(metadata.listSyncTasks().length <= 8)
+      assert.equal(sync.listTasks().length, 2)
+      assert.equal(metadata.listSyncTasks().length, 2)
       now += intervalMS
     }
-    assert.equal(sync.getTask(first.id), null)
-    assert.equal(metadata.getSyncTask(first.id), null)
-    assert.equal(sync.getTask(latest.id)?.status, 'completed')
-    await assert.rejects(sync.waitFor(first.id), /Unknown history task/)
+    assert.equal(queries.filter(query => query.through > query.from).length, 2, 'Only the initial history and warmup windows need full checks.')
+    assert.equal(queries.length, 2 + 2 * 127)
+    assert.equal(sync.getTask(first.history.id)?.through, now - 2 * intervalMS)
     await sync.close()
-    sync = create({ ...options, maxRetainedTerminalTasks: 3 }).sync
+    sync = create({ metadata, store, now: () => now }).sync
     await sync.start()
-    assert.equal(sync.listTasks().length, 3)
-    assert.equal(metadata.listSyncTasks().length, 3)
-    assert.equal(sync.getTask(first.id), null)
-    assert.equal(sync.getTask(latest.id)?.status, 'completed')
-    const renewed = await sync.enqueue(first)
-    assert.equal((await sync.waitFor(renewed.id)).status, 'completed')
-    await sync.whenIdle()
-    assert.equal(metadata.listSyncTasks().length, 3)
+    assert.equal(sync.listTasks().length, 2)
+    const before = queries.length
+    const target = sync.getTask(first.history.id)!
+    await sync.enqueue(target)
+    assert.equal(queries.length, before + 1, 'A new process validates the persisted window again.')
   } finally { await sync.close() }
 })
 
@@ -859,7 +871,7 @@ test('paused history survives rolling-result eviction and restart until explicit
     }
     assert.equal(sync.getTask(paused.id)?.status, 'paused')
     assert.equal(metadata.getSyncTask(paused.id)?.status, 'paused')
-    assert.equal(sync.listTasks().length, 3)
+    assert.equal(sync.listTasks().length, 2)
     await sync.close()
     sync = create(options).sync
     await sync.start()
@@ -925,4 +937,104 @@ test('SQLite task checkpoints and Parquet candles survive a real store restart',
     assert.equal(fetches, 2)
     assert.equal((await store.candles(request)).length, 3)
   } finally { await sync.close(); await store.close(); metadata.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('verified completion performs no new coverage reads, checkpoints, or progress events until storage changes', async () => {
+  const store = new VersionedMemoryStore(), metadata = new MemoryMetadata()
+  let progress = 0, fetches = 0
+  const { sync } = create({ store, metadata, onProgress() { progress++ }, sources: { candles: { fetchGap(query) { fetches++; return records(query) } } } })
+  try {
+    const task = await sync.enqueue(request)
+    await sync.waitFor(task.id); await sync.whenIdle()
+    const before = { reads: store.queries.length, writes: metadata.writes, progress }
+    for (let index = 0; index < 20; index++) await sync.enqueue(request)
+    await sync.whenIdle()
+    assert.deepEqual({ reads: store.queries.length, writes: metadata.writes, progress }, before)
+    store.rows.delete(`${request.instrument}:${request.timeframe}:${base + intervalMS}`)
+    store.changed(base + intervalMS)
+    await sync.enqueue(request); await sync.whenIdle()
+    assert.equal(fetches, 2)
+    assert.ok(store.queries.slice(before.reads).every(query => query.from === base + intervalMS && query.through === base + intervalMS))
+    assert.equal(store.rows.size, 3)
+  } finally { await sync.close() }
+})
+
+test('pagination verifies one initial window and durable page ranges instead of rescanning the full target', async () => {
+  const store = new VersionedMemoryStore()
+  const pages: HistoryRange[] = []
+  const { sync } = create({ store, sources: { candles: { fetchGap(query) {
+    const page = { ...query, from: Math.max(query.from, query.through - 99 * intervalMS) }
+    pages.push(page)
+    return records(page)
+  } } } })
+  try {
+    const target = { ...request, through: base + 999 * intervalMS }
+    const task = await sync.enqueue(target)
+    await sync.waitFor(task.id); await sync.whenIdle()
+    assert.equal(pages.length, 10)
+    assert.equal(store.queries.filter(query => query.through - query.from === 999 * intervalMS).length, 1)
+    assert.ok(store.queries.slice(1).every(query => query.through - query.from <= 99 * intervalMS))
+    assert.equal(store.rows.size, 1_000)
+  } finally { await sync.close() }
+})
+
+test('a rolling window can move while a page is active and cancellation survives subsequent target updates', async () => {
+  const store = new VersionedMemoryStore(), entered = deferred(), release = deferred()
+  let calls = 0
+  const { sync } = create({ store, sources: { candles: { async fetchGap(query) {
+    if (++calls === 1) { entered.resolve(); await release.promise }
+    return records(query)
+  } } } })
+  const target = { instrument: request.instrument, timeframe: request.timeframe, source: request.source, historyDays: 1, warmupCandles: 0, asOf: base + 60 * 86_400_000 }
+  try {
+    const first = (await sync.enqueueTarget(target)).history
+    await within(entered.promise)
+    const latest = (await sync.enqueueTarget({ ...target, asOf: target.asOf + 128 * intervalMS })).history
+    assert.equal(latest.id, first.id)
+    assert.equal(sync.listTasks().length, 1)
+    release.resolve()
+    const result = await within(sync.waitFor(first.id))
+    assert.equal(result.through, latest.through)
+    assert.equal(result.status, 'completed')
+    assert.equal(calls, 2)
+    await sync.cancel(first.id)
+    const stopped = (await sync.enqueueTarget({ ...target, asOf: target.asOf + 129 * intervalMS })).history
+    assert.equal(stopped.status, 'cancelled')
+    await sync.whenIdle()
+    assert.equal(calls, 2)
+    await sync.resume(first.id)
+    assert.equal((await sync.waitFor(first.id)).status, 'completed')
+    assert.equal(calls, 3)
+  } finally { release.resolve(); await sync.close() }
+})
+
+test('startup collapses old rolling checkpoints to the latest window and preserves exact foreground requests', async () => {
+  const metadata = new MemoryMetadata()
+  const seed = create({ metadata }).sync
+  const exact = await seed.enqueue({ ...request, priority: 'foreground' })
+  await seed.waitFor(exact.id); await seed.close()
+  const template = metadata.getSyncTask(exact.id)!
+  for (const purpose of ['history', 'warmup'] as const) for (let index = 0; index < 100; index++) {
+    const from = base + index * intervalMS, through = from + 2 * intervalMS
+    const id = createHash('sha256').update(JSON.stringify([request.instrument, request.timeframe, request.source, from, through])).digest('hex')
+    // The old format could not have two purposes at the same exact range.
+    const shifted = purpose === 'warmup' ? 100 * intervalMS : 0
+    const bounds = { from: from + shifted, through: through + shifted }
+    const oldID = shifted ? createHash('sha256').update(JSON.stringify([request.instrument, request.timeframe, request.source, bounds.from, bounds.through])).digest('hex') : id
+    metadata.putSyncTask({ ...template, ...bounds, id: oldID, purpose, priority: 'background', status: 'queued', createdAt: base + index, updatedAt: base + index, remaining: [bounds] })
+  }
+  // Keep the independent requested checkpoint at another range.
+  const requested = { ...template, instrument: 'FOREGROUND-USDT-SWAP' }
+  requested.id = createHash('sha256').update(JSON.stringify([requested.instrument, requested.timeframe, requested.source, requested.from, requested.through])).digest('hex')
+  metadata.putSyncTask(requested)
+  const { sync } = create({ metadata, store: { async missingCandleRanges() { return [] } }, write() {} })
+  try {
+    await sync.start(); await sync.whenIdle()
+    assert.equal(sync.listTasks().length, 3)
+    assert.equal(metadata.listSyncTasks().length, 3)
+    assert.equal(sync.listTasks().find(task => task.purpose === 'history')?.from, base + 99 * intervalMS)
+    assert.equal(sync.listTasks().find(task => task.purpose === 'warmup')?.from, base + 199 * intervalMS)
+    assert.equal(sync.getTask(requested.id)?.priority, 'foreground')
+    assert.ok(sync.listTasks().filter(task => task.purpose !== 'requested').every(task => task.id.startsWith('target-')))
+  } finally { await sync.close() }
 })

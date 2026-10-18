@@ -6,7 +6,7 @@ type MaybePromise<T> = T | Promise<T>
 type Timeframe = '5m' | '15m' | '1H'
 type Instrument = { instId: string; listTime?: number | string; [key: string]: unknown }
 export type MarketHistoryOptions = {
-  store: Pick<MarketStore, 'candles' | 'coverage' | 'inspectCandles'>
+  store: Pick<MarketStore, 'candles' | 'coverage' | 'inspectCandles'> & Partial<Pick<MarketStore, 'candleRevision' | 'candleChangesSince'>>
   metadata: HistorySyncOptions['metadata'] & AuditMetadata
   get(path: string, parameters: Record<string, string | number>, signal: AbortSignal, priority: StorePriority): Promise<unknown[][]>
   // Raw API JSON is checked by the adapter before reaching durable storage.

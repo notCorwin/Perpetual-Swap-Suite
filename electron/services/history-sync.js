@@ -30,7 +30,20 @@ const descriptor = input => {
   if (!Object.hasOwn(intervals, input.timeframe)) throw new TypeError('timeframe must be 5m, 15m, or 1H.')
   return { instrument, source, timeframe: input.timeframe }
 }
-const key = task => createHash('sha256').update(JSON.stringify([task.instrument, task.timeframe, task.source, task.from, task.through])).digest('hex')
+const exactKey = task => createHash('sha256').update(JSON.stringify([task.instrument, task.timeframe, task.source, task.from, task.through])).digest('hex')
+const key = task => task.purpose === 'history' || task.purpose === 'warmup'
+  ? `target-${createHash('sha256').update(JSON.stringify([task.instrument, task.timeframe, task.source, task.purpose])).digest('hex')}` : exactKey(task)
+const seriesKey = task => JSON.stringify([task.instrument, task.timeframe, task.source])
+const clipped = (values, bounds) => values.filter(value => intersects(value, bounds)).map(value => ({ from: Math.max(value.from, bounds.from), through: Math.min(value.through, bounds.through) }))
+const merged = (values, intervalMS) => {
+  const result = []
+  for (const value of [...values].sort((a, b) => a.from - b.from)) {
+    const prior = result.at(-1)
+    if (prior && value.from <= prior.through + intervalMS) prior.through = Math.max(prior.through, value.through)
+    else result.push({ ...value })
+  }
+  return result
+}
 const slots = (ranges, intervalMS) => ranges.reduce((total, value) => total + (value.through - value.from) / intervalMS + 1, 0)
 const intersects = (left, right) => left.from <= right.through && left.through >= right.from
 const subtract = (ranges, exclusions, intervalMS) => exclusions.reduce((remaining, exclusion) => remaining.flatMap(value => {
@@ -93,6 +106,9 @@ export class HistorySync {
     this.requestTail = Promise.resolve()
     this.persistTail = Promise.resolve()
     this.fatalError = null
+    // Process-local verification only. Restart always asks durable storage again.
+    this.coverageChecks = new Map()
+    this.coverageEpochs = new Map()
   }
 
   start() {
@@ -104,6 +120,7 @@ export class HistorySync {
   async restore() {
     const tasks = await this.metadata.listSyncTasks()
     if (!Array.isArray(tasks)) throw new TypeError('metadata.listSyncTasks must return an array.')
+    const obsolete = []
     for (const saved of tasks) {
       const task = clone(saved)
       descriptor(task)
@@ -126,15 +143,30 @@ export class HistorySync {
         range(bounds, intervals[task.timeframe])
         if (bounds.from < task.from || bounds.through > task.through) throw new TypeError('Persisted progress is outside its history target.')
       }
-      if (task.id !== key(task)) throw new TypeError('Persisted history task ID does not match its target.')
-      if (this.tasks.has(task.id)) throw new TypeError('Duplicate persisted history task ID.')
+      const canonicalID = key(task)
+      if (task.id !== canonicalID && task.id !== exactKey(task)) throw new TypeError('Persisted history task ID does not match its target.')
+      if (task.id !== canonicalID) obsolete.push(task.id)
+      const existing = this.tasks.get(canonicalID)
+      // Replace the old range-keyed rolling queue with the latest desired
+      // window. These are coordination rows, never market observations.
+      if (existing && task.purpose !== 'requested') {
+        if (task.through < existing.through || task.through === existing.through && task.updatedAt <= existing.updatedAt) continue
+      } else if (existing) throw new TypeError('Duplicate persisted history task ID.')
+      task.id = canonicalID
       this.tasks.set(task.id, task)
       if (task.status === 'running') {
         task.status = 'queued'
         task.nextAttemptAt = null
-        await this.save(task)
+        if (task.purpose === 'requested') await this.save(task)
       }
     }
+    // Publish canonical targets before deleting obsolete checkpoints, so an
+    // interrupted cleanup is safe to run again on the next launch.
+    const targets = [...this.tasks.values()].filter(task => task.purpose !== 'requested')
+    if (this.metadata.putSyncTasks) await this.metadata.putSyncTasks(targets.map(clone))
+    else for (const task of targets) await this.save(task)
+    if (this.metadata.deleteSyncTasks) await this.metadata.deleteSyncTasks(obsolete)
+    else for (const id of obsolete) await this.metadata.deleteSyncTask(id)
     await this.pruneTerminalTasks()
   }
 
@@ -147,19 +179,40 @@ export class HistorySync {
     const requestedPriority = priority(input.priority ?? 'background')
     const purpose = input.purpose ?? 'requested'
     if (!['requested', 'history', 'warmup'].includes(purpose)) throw new TypeError('Invalid history purpose.')
-    const id = key({ ...identity, ...bounds })
-    // Dependencies wait for their exact range regardless of priority. Reusing
-    // a containing history target would turn a page repair into a full backfill
-    // barrier. Same-source pages still recheck durable coverage before fetching.
+    const id = key({ ...identity, ...bounds, purpose })
     let task = this.tasks.get(id)
     if (task) {
-      if (requestedPriority === 'foreground') task.priority = 'foreground'
-      if (['paused', 'cancelled', 'completed'].includes(task.status)) {
+      const changedRange = task.from !== bounds.from || task.through !== bounds.through
+      const promoted = requestedPriority === 'foreground' && task.priority !== 'foreground'
+      if (promoted) task.priority = 'foreground'
+      if (changedRange) {
+        Object.assign(task, bounds)
+        task.remaining = clipped(task.remaining, bounds)
+        task.unavailableRanges = []
+        task.inspected = false
+        task.cursor = null
+        task.cursorRange = null
+      }
+      // A recurring target must not undo the user's pause or cancellation.
+      if (purpose !== 'requested' && ['paused', 'cancelled'].includes(task.status)) {
+        if (changedRange || promoted) await this.save(task)
+        return clone(task)
+      }
+      if (['completed', 'unavailable'].includes(task.status)) {
+        // Unversioned adapters cannot prove that storage stayed unchanged.
+        if (!this.store.coverageVersion) this.coverageChecks.delete(id)
+        const gaps = await this.missing(task)
+        if (!gaps.length) {
+          if (changedRange || promoted) await this.save(task, false)
+          return clone(task)
+        }
+      }
+      if (['paused', 'cancelled', 'completed', 'unavailable'].includes(task.status)) {
         task.status = 'queued'
         task.attempts = 0
         task.nextAttemptAt = null
         task.lastError = null
-      }
+      } else if (!changedRange && !promoted) return clone(task)
       await this.save(task)
     } else {
       const timestamp = this.timestamp()
@@ -220,6 +273,7 @@ export class HistorySync {
     this.assertOpen()
     const task = this.requireTask(id)
     if (task.status === 'running') return clone(task)
+    this.coverageChecks.delete(task.id)
     if (task.status === 'unavailable') {
       task.unavailableRanges = []
       task.inspected = false
@@ -265,13 +319,13 @@ export class HistorySync {
 
   timestamp() { return integer(this.now(), 'now()') }
 
-  save(task) {
+  save(task, notify = true) {
     task.updatedAt = this.timestamp()
     const snapshot = clone(task)
     const persistence = this.persistTail.then(() => this.metadata.putSyncTask(snapshot))
     this.persistTail = persistence.catch(() => undefined)
     return persistence.then(() => {
-      try { Promise.resolve(this.onProgress?.(clone(snapshot))).catch(() => undefined) } catch { /* Observers cannot interrupt synchronization. */ }
+      try { if (notify) Promise.resolve(this.onProgress?.(clone(snapshot))).catch(() => undefined) } catch { /* Observers cannot interrupt synchronization. */ }
     })
   }
 
@@ -280,7 +334,7 @@ export class HistorySync {
     // bounded recent result history; Parquet remains the coverage authority
     // when an expired target is requested again.
     const persistence = this.persistTail.then(async () => {
-      const candidates = [...this.tasks.values()].reverse().filter(task => expirable.has(task.status)
+      const candidates = [...this.tasks.values()].reverse().filter(task => task.purpose === 'requested' && expirable.has(task.status)
         && task.id !== this.active.get(task.source)?.id && !this.waiters.has(task.id))
         .sort((left, right) => right.updatedAt - left.updatedAt || right.createdAt - left.createdAt)
       for (const task of candidates.slice(this.maxRetainedTerminalTasks)) {
@@ -289,6 +343,7 @@ export class HistorySync {
         // Remove before awaiting persistence so a concurrent enqueue creates a
         // fresh task whose save is ordered after this deletion.
         this.tasks.delete(task.id)
+        this.coverageChecks.delete(task.id)
         try { await this.metadata.deleteSyncTask(task.id) }
         catch (error) { if (!this.tasks.has(task.id)) this.tasks.set(task.id, task); throw error }
       }
@@ -320,18 +375,61 @@ export class HistorySync {
     }))
   }
 
+  /** Invalidate explicit observations (latest REST seeds and repairs) even
+   * when they have not produced a storage mutation yet. */
+  invalidate(query) {
+    const key = seriesKey(query)
+    this.coverageEpochs.set(key, (this.coverageEpochs.get(key) ?? 0) + 1)
+    for (const [id, check] of this.coverageChecks) {
+      const task = this.tasks.get(id)
+      if (task && seriesKey(task) === seriesKey(query) && intersects(check, query)) {
+        check.dirty = merged([...check.dirty, ...clipped([query], check)], intervals[task.timeframe])
+      }
+    }
+  }
+
   async missing(task) {
     const intervalMS = intervals[task.timeframe]
-    const values = await this.store.missingCandleRanges({ instrument: task.instrument, timeframe: task.timeframe, source: task.source, from: task.from, through: task.through, intervalMS }, task.priority)
-    if (!Array.isArray(values)) throw new TypeError('store.missingCandleRanges must return an array.')
-    const sorted = values.map(value => range(value, intervalMS)).sort((a, b) => a.from - b.from)
-    let previous = null
-    for (const value of sorted) {
-      if (value.from < task.from || value.through > task.through || (previous && value.from <= previous.through)) throw new TypeError('Store gaps must be disjoint and inside the requested range.')
-      previous = value
+    const query = { instrument: task.instrument, timeframe: task.timeframe, source: task.source, from: task.from, through: task.through, intervalMS }
+    const epoch = this.coverageEpochs.get(seriesKey(query)) ?? 0
+    const version = await this.store.coverageVersion?.(query)
+    const previous = this.coverageChecks.get(task.id)
+    let refresh = [query], missing = [], expiresAt = null
+    if (previous) {
+      missing = clipped(previous.remaining, query)
+      expiresAt = previous.expiresAt
+      refresh = [...subtract([query], [previous], intervalMS), ...clipped(previous.dirty, query)]
+      if (previous.expiresAt !== null && previous.expiresAt <= this.timestamp()) refresh = [query]
+      else if (previous.version !== version) {
+        const changes = await this.store.coverageChanges?.(query, previous.version)
+        refresh.push(...(changes?.ranges === null || !changes ? [query] : clipped(changes.ranges, query)))
+      }
     }
-    task.remaining = sorted
-    return subtract(sorted, task.unavailableRanges, intervalMS)
+    refresh = merged(refresh, intervalMS)
+    // Lease expiry is recomputed by the authoritative full check. Partial
+    // refreshes conservatively retain the earliest existing lease.
+    if (refresh.length === 1 && refresh[0].from === query.from && refresh[0].through === query.through) expiresAt = null
+    for (const bounds of refresh) {
+      const values = await this.store.missingCandleRanges({ ...query, ...bounds }, task.priority)
+      if (!Array.isArray(values)) throw new TypeError('store.missingCandleRanges must return an array.')
+      const sorted = values.map(value => range(value, intervalMS)).sort((a, b) => a.from - b.from)
+      let prior = null
+      for (const value of sorted) {
+        if (value.from < bounds.from || value.through > bounds.through || prior && value.from <= prior.through) throw new TypeError('Store gaps must be disjoint and inside the requested range.')
+        prior = value
+      }
+      missing = merged([...subtract(missing, [bounds], intervalMS), ...sorted], intervalMS)
+      const expiry = this.store.coverageExpiry?.({ ...query, ...bounds })
+      if (expiry != null) expiresAt = Math.min(expiresAt ?? Infinity, expiry)
+    }
+    // Keep the revision from before the reads: a racing mutation is checked
+    // again through the bounded change journal, never blessed by a stale read.
+    const check = { from: query.from, through: query.through, version, expiresAt, remaining: missing, dirty: [] }
+    this.coverageChecks.set(task.id, check)
+    if (epoch !== (this.coverageEpochs.get(seriesKey(query)) ?? 0)) check.dirty = [query]
+    if (check.dirty.length || query.from !== task.from || query.through !== task.through) return this.missing(task)
+    task.remaining = missing
+    return subtract(missing, task.unavailableRanges, intervalMS)
   }
 
   kick() {
@@ -460,7 +558,6 @@ export class HistorySync {
         task.cursor = null
         task.cursorRange = clone(gap)
       }
-      const before = slots(gaps, intervalMS)
       const response = await this.callSource(() => source.fetchGap({ instrument: task.instrument, timeframe: task.timeframe, source: task.source, priority: task.priority, ...gap, cursor: task.cursor, signal }), signal, task)
       signal.throwIfAborted()
       const result = Array.isArray(response) ? { records: response } : response
@@ -473,6 +570,7 @@ export class HistorySync {
       })
       if (records.length) {
         await this.write(records, clone(task))
+        this.invalidate({ ...task, from: Math.min(...records.map(record => record.timestamp)), through: Math.max(...records.map(record => record.timestamp)) })
         task.writtenRecords += records.length
       }
       // A cancelled request cannot publish a cursor or completion state. Any
@@ -488,7 +586,7 @@ export class HistorySync {
       task.cursorRange = clone(after.find(value => intersects(value, gap)) ?? null)
       if (!task.cursorRange) task.cursor = null
       if (!after.length) return await this.finish(task)
-      if (slots(after, intervalMS) >= before) throw new Error('The history source made no persisted coverage progress.')
+      if (slots(clipped(after, gap), intervalMS) >= slots(clipped(gaps, gap), intervalMS)) throw new Error('The history source made no persisted coverage progress.')
       task.attempts = 0
       task.lastError = null
       task.status = 'queued'
@@ -517,6 +615,12 @@ export class HistorySync {
   }
 
   async finish(task) {
+    const checked = this.coverageChecks.get(task.id)
+    if (!checked || checked.from !== task.from || checked.through !== task.through || checked.dirty.length) {
+      task.status = 'queued'
+      await this.save(task)
+      return
+    }
     task.status = task.remaining.length ? 'unavailable' : 'completed'
     task.cursor = null
     task.cursorRange = null

@@ -40,6 +40,35 @@ class MemoryStore {
   }
   async inspectCandles(_query: Query) { return { issues: [], checkedRows: 0, files: 0, missingRanges: [] } }
 }
+class VersionedMemoryStore extends MemoryStore {
+  revisions = new Map<string, number>()
+  changes = new Map<string, { revision: number; from: number; through: number }[]>()
+  queries: CandleQuery[] = []
+  candleRevision(instrument: string, timeframe: string) { return this.revisions.get(`${instrument}:${timeframe}`) ?? 0 }
+  candleChangesSince(instrument: string, timeframe: string, revision: number) {
+    const changes = this.changes.get(`${instrument}:${timeframe}`) ?? []
+    return { revision: this.candleRevision(instrument, timeframe), ranges: revision < (changes[0]?.revision ?? 1) - 1 ? null : changes.filter(change => change.revision > revision).map(({ from, through }) => ({ from, through })) }
+  }
+  override async candles(query: CandleQuery) { this.queries.push(structuredClone(query)); return super.candles(query) }
+  override async appendCandles(rows: CandleRecord[]) {
+    const result = await super.appendCandles(rows)
+    const batches = new Map<string, CandleRecord[]>()
+    for (const row of rows) {
+      const key = `${row.instrument}:${row.timeframe}`
+      const batch = batches.get(key) ?? []
+      batch.push(row); batches.set(key, batch)
+    }
+    for (const [key, values] of batches) {
+      const revision = this.candleRevision(values[0].instrument, values[0].timeframe) + 1
+      this.revisions.set(key, revision)
+      const changes = this.changes.get(key) ?? []
+      changes.push({ revision, from: Math.min(...values.map(row => row.timestamp)), through: Math.max(...values.map(row => row.timestamp)) })
+      if (changes.length > 256) changes.shift()
+      this.changes.set(key, changes)
+    }
+    return result
+  }
+}
 class MemoryMetadata {
   tasks = new Map<string, HistoryTask>()
   audits = new Map<string, AuditJob>()
@@ -459,4 +488,40 @@ test('an exact-slot repair commits a concurrent latest revision without retrying
     await Promise.allSettled([repair, latest])
     await history.close()
   }
+})
+
+
+test('versioned completed observations retain numeric siblings and revalidate empty-source leases on expiry', async () => {
+  let now = base + 10 * interval
+  const store = new VersionedMemoryStore()
+  const { history, calls } = setup({ store, now: () => now, get: async path => path.includes('open-interest') ? [[String(base), '50']] : [] })
+  try {
+    await store.appendCandles([candle(base)])
+    await history.ensureStatistics(instId, '5m', base, base)
+    assert.equal(calls.length, 2)
+    // First renewal also consumes any sibling mutations from the revision journal.
+    await history.ensureStatistics(instId, '5m', base, base)
+    store.queries.length = 0
+    await history.ensureStatistics(instId, '5m', base, base)
+    assert.equal(store.queries.length, 1, 'Only the caller result needs a read; unchanged coverage is already verified.')
+    now += 60_001
+    await history.ensureStatistics(instId, '5m', base, base)
+    assert.equal(calls.filter(call => call.path.includes('open-interest')).length, 1)
+    assert.equal(calls.filter(call => call.path.includes('taker')).length, 2)
+  } finally { await history.close() }
+})
+
+test('versioned statistics backfill reads each completed page instead of the whole requested window', async () => {
+  const now = base + 1_500 * interval, through = now - interval, from = base
+  const store = new VersionedMemoryStore()
+  const { history } = setup({ store, now: () => now })
+  try {
+    await store.appendCandles(Array.from({ length: 1_500 }, (_, index) => candle(from + index * interval)))
+    store.queries.length = 0
+    const { rows } = await history.ensureStatistics(instId, '5m', from, through)
+    assert.equal(rows.length, 1_500)
+    const full = store.queries.filter(query => query.from === from && query.through === through)
+    assert.ok(full.length <= 4, `Expected initial checks plus final result, got ${full.length} full reads.`)
+    assert.ok(store.queries.filter(query => query.from !== from || query.through !== through).every(query => Number(query.through) - Number(query.from) <= 99 * interval))
+  } finally { await history.close() }
 })

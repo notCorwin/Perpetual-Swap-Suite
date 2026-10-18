@@ -39,6 +39,8 @@ export class MarketStore {
   replaceCandles(query: CandleQuery & CandleRange, candles: CandleRecord[], priority?: StorePriority): Promise<number>
   inspectCandles(query: CandleQuery & CandleRange, priority?: StorePriority): Promise<CandleInspection>
   getWriteMetrics(): { partitions: number; rowsSubmitted: number; bytesRead: number; bytesWritten: number; durationMS: number }
+  candleRevision(instrument: string, timeframe: string): number
+  candleChangesSince(instrument: string, timeframe: string, revision: number): { revision: number; ranges: CandleRange[] | null }
   candles(query: { instrument: string; timeframe: string; from?: number; through?: number }, priority?: StorePriority): Promise<CandleRecord[]>
   candleWatermark(instrument: string, timeframe: string, priority?: StorePriority): Promise<number>
   readChartSnapshot(instrument: string, timeframe: string): Promise<unknown>

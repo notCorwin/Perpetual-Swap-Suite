@@ -14,6 +14,18 @@ const syncTask = (id = 'history-1') => ({
 })
 const catalogEntry = (instrumentID = 'BTC-USDT-SWAP') => ({ instrumentID, status: 'verified' as const, observedAt: 1000, expiresAt: 2000, preferencesRevision: 2, observations: { spread: 0.01 } })
 
+test('sync checkpoint batches validate atomically and delete in one transaction', async () => {
+  const root = await temporary(), store = await MetadataStore.open(root)
+  try {
+    store.putSyncTasks([syncTask('one'), syncTask('two')])
+    assert.equal(store.listSyncTasks().length, 2)
+    assert.throws(() => store.putSyncTasks([syncTask('three'), { ...syncTask('invalid'), through: -1 }]), TypeError)
+    assert.equal(store.getSyncTask('three'), null)
+    assert.equal(store.deleteSyncTasks(['one', 'two', 'absent']), 2)
+    assert.deepEqual(store.listSyncTasks(), [])
+  } finally { store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
 test('preference schema has exact defaults, validates nested rules, and returns detached values', () => {
   const preferences = validatePreferences(DEFAULT_PREFERENCES)
   assert.deepEqual(preferences, {

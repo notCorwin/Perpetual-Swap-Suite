@@ -49,9 +49,11 @@ export class MetadataStore {
   /** Main process only. */
   updateAnalysisSettings(patch: AnalysisSettings): AnalysisSettings
   putSyncTask<T extends SyncTaskRecord>(task: T): T
+  putSyncTasks<T extends SyncTaskRecord>(tasks: T[]): T[]
   getSyncTask(id: string): SyncTaskRecord | null
   listSyncTasks(): SyncTaskRecord[]
   deleteSyncTask(id: string): boolean
+  deleteSyncTasks(ids: string[]): number
   saveAudit<T extends AuditRecord>(audit: T): T
   getAudit(id: string): AuditRecord | null
   listAudits(): AuditRecord[]

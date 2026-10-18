@@ -92,6 +92,8 @@ export class MarketStore {
     this.closed = false
     this.closeTask = null
     this.coverages = new Map()
+    this.revisions = new Map()
+    this.mutations = new Map()
     this.watermarks = new Map()
     this.chartSnapshotWrites = new Map()
     this.writeMetrics = { partitions: 0, rowsSubmitted: 0, bytesRead: 0, bytesWritten: 0, durationMS: 0 }
@@ -198,14 +200,40 @@ export class MarketStore {
     } finally { await rm(source, { force: true }); await rm(temporary, { force: true }) }
   }
 
-  invalidate(instrument, timeframe, writtenAt) {
+  invalidate(instrument, timeframe, writtenAt, range = null) {
     const key = `${instrument}:${timeframe}`
+    const revision = this.candleRevision(instrument, timeframe) + 1
+    this.revisions.set(key, revision)
+    const mutations = this.mutations.get(key) ?? []
+    mutations.push({ revision, range })
+    if (mutations.length > 256) mutations.shift()
+    this.mutations.set(key, mutations)
     this.coverages.delete(key)
     if (writtenAt == null) this.watermarks.delete(key)
     else if (this.watermarks.has(key)) this.watermarks.set(key, Math.max(this.watermarks.get(key), writtenAt))
   }
 
   getWriteMetrics() { return { ...this.writeMetrics } }
+
+  // Process-local invalidation token. Recovery always verifies Parquet anew.
+  candleRevision(instrument, timeframe) { return this.revisions.get(`${instrument}:${timeframe}`) ?? 0 }
+
+  candleChangesSince(instrument, timeframe, previousRevision) {
+    const revision = this.candleRevision(instrument, timeframe)
+    if (previousRevision === revision) return { revision, ranges: [] }
+    const changes = this.mutations.get(`${instrument}:${timeframe}`) ?? []
+    if (!Number.isSafeInteger(previousRevision) || previousRevision < 0 || previousRevision > revision
+      || !changes.length || previousRevision < changes[0].revision - 1) return { revision, ranges: null }
+    const ranges = changes.filter(change => change.revision > previousRevision).map(change => change.range)
+    if (ranges.some(range => range === null)) return { revision, ranges: null }
+    const merged = []
+    for (const range of ranges.sort((a, b) => a.from - b.from)) {
+      const last = merged.at(-1)
+      if (last && range.from <= last.through) last.through = Math.max(last.through, range.through)
+      else merged.push({ ...range })
+    }
+    return { revision, ranges: merged }
+  }
 
   async appendCandles(candles, priority = 'background') {
     if (!Array.isArray(candles)) throw new TypeError('Candles must be an array.')
@@ -217,7 +245,12 @@ export class MarketStore {
     return this.enqueue(async () => {
       const batches = Map.groupBy(records, candle => this.partition(candle.instrument, candle.timeframe, candle.timestamp))
       try { for (const [directory, rows] of batches) await this.publishPartition(directory, rows) }
-      finally { for (const candle of records) this.invalidate(candle.instrument, candle.timeframe, writtenAt) }
+      finally {
+        for (const rows of Map.groupBy(records, row => `${row.instrument}:${row.timeframe}`).values()) {
+          this.invalidate(rows[0].instrument, rows[0].timeframe, writtenAt,
+            { from: Math.min(...rows.map(row => row.timestamp)), through: Math.max(...rows.map(row => row.timestamp)) })
+        }
+      }
       return records.length
     }, priority)
   }
@@ -238,7 +271,7 @@ export class MarketStore {
         for (let day = Math.floor(from / dayMS) * dayMS; day <= through; day += dayMS) {
           await this.publishPartition(this.partition(instrument, timeframe, day), records.filter(row => row.timestamp >= day && row.timestamp < day + dayMS), { replaceFrom: from, replaceThrough: through, timeframe })
         }
-      } finally { this.invalidate(instrument, timeframe) }
+      } finally { this.invalidate(instrument, timeframe, undefined, { from, through }) }
       return records.length
     }, priority)
   }

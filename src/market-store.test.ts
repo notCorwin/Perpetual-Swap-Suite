@@ -8,6 +8,25 @@ import { MarketStore } from '../electron/services/market-store.js'
 const fiveMinutes = 300_000
 const record = (timestamp: number) => ({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp, open: 100, high: 101, low: 99, close: 100, volume: 1, quoteVolume: 100, confirmed: true })
 
+test('coverage invalidation reports only durable mutation ranges and resets after restart', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-coverage-version-'))
+  let store = await MarketStore.open(root)
+  const base = Date.UTC(2024, 0, 1)
+  try {
+    assert.deepEqual(store.candleChangesSince('BTC-USDT-SWAP', '5m', 0), { revision: 0, ranges: [] })
+    await store.appendCandles([record(base), record(base + fiveMinutes)])
+    assert.deepEqual(store.candleChangesSince('BTC-USDT-SWAP', '5m', 0), {
+      revision: 1, ranges: [{ from: base, through: base + fiveMinutes }],
+    })
+    await store.replaceCandles({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: base, through: base }, [])
+    assert.deepEqual(store.candleChangesSince('BTC-USDT-SWAP', '5m', 1), { revision: 2, ranges: [{ from: base, through: base }] })
+    assert.deepEqual(store.candleChangesSince('BTC-USDT-SWAP', '5m', 2), { revision: 2, ranges: [] })
+    await store.close(); store = await MarketStore.open(root)
+    assert.deepEqual(store.candleChangesSince('BTC-USDT-SWAP', '5m', 2), { revision: 0, ranges: null })
+    assert.equal((await store.candles({ instrument: 'BTC-USDT-SWAP', timeframe: '5m' })).length, 1)
+  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
 test('missingCandleRanges reports only contiguous gaps inside the requested 5m range', async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-radar-market-store-'))
   const store = await MarketStore.open(root)

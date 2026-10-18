@@ -65,9 +65,17 @@ export type HistorySyncOptions = {
     getSyncTask(id: string): MaybePromise<unknown>
     listSyncTasks(): MaybePromise<unknown[]>
     deleteSyncTask(id: string): MaybePromise<unknown>
+    putSyncTasks?(tasks: HistoryTask[]): MaybePromise<unknown>
+    deleteSyncTasks?(ids: string[]): MaybePromise<unknown>
   }
   store: {
     missingCandleRanges(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string; intervalMS: number }, priority?: HistoryPriority): Promise<HistoryRange[]>
+    /** Process-local mutation revision. Without one, completed enqueues revalidate storage. */
+    coverageVersion?(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string }): MaybePromise<number>
+    /** Null ranges mean the journal no longer covers the requested revision. */
+    coverageChanges?(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string }, revision: number): MaybePromise<{ revision: number; ranges: HistoryRange[] | null }>
+    /** Earliest observation lease from the immediately preceding coverage read. */
+    coverageExpiry?(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string }): number | null
     appendCandles?(records: CandleRecord[], priority?: HistoryPriority): Promise<number>
   }
   sources: Record<string, HistorySource>
@@ -84,20 +92,22 @@ export type HistorySyncOptions = {
   maxRetryDelayMS?: number
   /** Consecutive failures before a recoverable pause; defaults to 5. */
   maxAttempts?: number
-  /** Recent completed/unavailable/cancelled checkpoints to retain in memory and SQLite; defaults to 512, minimum 1. Paused and active tasks and registered waiters are never evicted. */
+  /** Recent requested completed/unavailable/cancelled checkpoints to retain in memory and SQLite; defaults to 512, minimum 1. Paused and active tasks and registered waiters are never evicted. */
   maxRetainedTerminalTasks?: number
 }
 export class HistorySync {
   constructor(options: HistorySyncOptions)
   /** Recover saved tasks, including interrupted running tasks; start the pool. */
   start(): Promise<this>
-  /** Deduplicate exact ranges for either priority; overlapping targets share durable coverage, never completion barriers. */
+  /** Requested ranges retain exact identities; rolling history/warmup use one stable identity each per instrument/timeframe/source. Completed verified ranges are reused until a mutation or observation expiry. */
   enqueue(request: HistoryRequest): Promise<HistoryTask>
-  /** A 30-day completed-candle target plus a separate 200-candle EMA warmup. */
+  /** Replace the current rolling history and warmup windows without accumulating obsolete targets. Explicitly paused/cancelled targets stay stopped. */
   enqueueTarget(request: Omit<HistoryRequest, 'from' | 'through' | 'purpose'> & { historyDays?: number; warmupCandles?: number; asOf?: number }): Promise<{ history: HistoryTask; warmup: HistoryTask | null }>
   /** Read detached snapshots after start(). Old completed/unavailable/cancelled tasks can expire from the bounded result history and return null. Re-enqueue their range to recheck durable coverage. */
   getTask(id: string): HistoryTask | null
   listTasks(): HistoryTask[]
+  /** Recheck an explicit observation or repair even before it changes storage. */
+  invalidate(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string }): void
   pause(id: string): Promise<HistoryTask>
   cancel(id: string): Promise<HistoryTask>
   /** Resume retries/cancelled work; unavailable tasks recheck source metadata. */
