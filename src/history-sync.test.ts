@@ -1713,3 +1713,126 @@ test('parallel source slots keep an old active page serialized when its stable t
     assert.equal(queries.filter(query => query.instrument === request.instrument && query.from === request.from).length, 1)
   } finally { release.resolve(); await sync.close() }
 })
+
+class LeaseMemoryStore extends VersionedMemoryStore {
+  leases = new Map<number, number>()
+  now: () => number
+  constructor(now: () => number) { super(); this.now = now }
+  override async missingCandleRanges(query: CoverageQuery) {
+    this.queries.push(structuredClone(query))
+    const result: HistoryRange[] = []
+    let first: number | null = null
+    for (let timestamp = query.from; timestamp <= query.through; timestamp += query.intervalMS) {
+      const expiry = this.leases.get(timestamp)
+      const present = this.rows.has(`${query.instrument}:${query.timeframe}:${timestamp}`) && (expiry === undefined || expiry > this.now())
+      if (!present) first ??= timestamp
+      else if (first !== null) { result.push({ from: first, through: timestamp - query.intervalMS }); first = null }
+    }
+    if (first !== null) result.push({ from: first, through: query.through })
+    return result
+  }
+  coverageLeases(query: HistoryRange) {
+    return [...this.leases].filter(([timestamp, expiry]) => timestamp >= query.from && timestamp <= query.through && expiry > this.now())
+      .map(([timestamp, expiresAt]) => ({ from: timestamp, through: timestamp, expiresAt }))
+  }
+}
+
+const leaseFixture = async (count: number, now: () => number) => {
+  const store = new LeaseMemoryStore(now)
+  const through = base + (count - 1) * intervalMS
+  await store.appendCandles(Array.from({ length: count }, (_, index) => candle(base + index * intervalMS)))
+  return { store, query: { ...request, source: 'oi', through } }
+}
+
+test('one expired observation in a large verified window rechecks and repairs only its own slot', async () => {
+  let now = base + 20_000 * intervalMS
+  const { store, query } = await leaseFixture(10_000, () => now)
+  const stamp = base + 7_500 * intervalMS
+  store.leases.set(stamp, now + 10)
+  let fetches = 0
+  const { sync } = create({ store, now: () => now,
+    async write(rows) { rows.forEach(row => store.leases.delete(row.timestamp)); return store.appendCandles(rows) },
+    sources: { oi: { fetchGap(query) { fetches++; return records(query) } } },
+  })
+  try {
+    const task = await sync.enqueue(query)
+    await sync.waitFor(task.id); await sync.whenIdle()
+    const before = store.queries.length
+    now += 11
+    await sync.enqueue(query); await sync.whenIdle()
+    assert.equal(fetches, 1)
+    assert.ok(store.queries.slice(before).every(query => query.from === stamp && query.through === stamp))
+    const reads = store.queries.length
+    now += 1_000_000
+    await sync.enqueue(query); await sync.whenIdle()
+    assert.equal(store.queries.length, reads, 'The numeric replacement never expires with the previous empty observation.')
+    assert.equal(sync.getTask(task.id)?.status, 'completed')
+  } finally { await sync.close() }
+})
+
+test('separate lease deadlines renew only their own contiguous ranges and retain a later renewal', async () => {
+  let now = base + 2_000 * intervalMS
+  const startedAt = now, { store, query } = await leaseFixture(1_000, () => now)
+  const early = { from: base + 100 * intervalMS, through: base + 101 * intervalMS }
+  const late = { from: base + 900 * intervalMS, through: base + 901 * intervalMS }
+  for (const stamp of [early.from, early.through]) store.leases.set(stamp, now + 10)
+  for (const stamp of [late.from, late.through]) store.leases.set(stamp, now + 20)
+  const fetched: HistoryRange[] = []
+  const { sync } = create({ store, now: () => now,
+    async write(rows) { rows.forEach(row => store.leases.set(row.timestamp, now + 30)); return store.appendCandles(rows) },
+    sources: { oi: { fetchGap(query) { fetched.push({ from: query.from, through: query.through }); return records(query) } } },
+  })
+  try {
+    const task = await sync.enqueue(query)
+    await sync.waitFor(task.id); await sync.whenIdle()
+    for (const offset of [11, 21, 42]) { now = startedAt + offset; await sync.enqueue(query); await sync.whenIdle() }
+    assert.deepEqual(fetched, [early, late, early])
+    assert.ok(store.queries.slice(1).every(query => query.through - query.from <= intervalMS))
+    assert.equal(sync.getTask(task.id)?.status, 'completed')
+  } finally { await sync.close() }
+})
+
+test('a partial numeric update splits an existing lease so its numeric middle is never revalidated on expiry', async () => {
+  let now = base + 2_000 * intervalMS
+  const { store, query } = await leaseFixture(1_000, () => now)
+  for (let index = 100; index <= 109; index++) store.leases.set(base + index * intervalMS, now + 10)
+  const fetched: HistoryRange[] = []
+  const { sync } = create({ store, now: () => now,
+    async write(rows) { rows.forEach(row => store.leases.delete(row.timestamp)); return store.appendCandles(rows) },
+    sources: { oi: { fetchGap(query) { fetched.push({ from: query.from, through: query.through }); return records(query) } } },
+  })
+  try {
+    const task = await sync.enqueue(query)
+    await sync.waitFor(task.id); await sync.whenIdle()
+    const middle = [104, 105].map(index => candle(base + index * intervalMS))
+    middle.forEach(row => store.leases.delete(row.timestamp))
+    await store.appendCandles(middle)
+    await sync.enqueue(query); await sync.whenIdle()
+    const before = store.queries.length
+    now += 11
+    await sync.enqueue(query); await sync.whenIdle()
+    assert.deepEqual(fetched, [
+      { from: base + 100 * intervalMS, through: base + 103 * intervalMS },
+      { from: base + 106 * intervalMS, through: base + 109 * intervalMS },
+    ])
+    assert.ok(store.queries.slice(before).every(query => query.through < middle[0].timestamp || query.from > middle[1].timestamp))
+  } finally { await sync.close() }
+})
+
+test('a rolling window drops leases outside its new bounds instead of rechecking them when their deadline arrives', async () => {
+  let now = base + 2_000 * intervalMS
+  const { store, query } = await leaseFixture(1_001, () => now)
+  store.leases.set(base + 100 * intervalMS, now + 10)
+  const { sync } = create({ store, now: () => now, sources: { oi: { fetchGap() { throw new Error('The new window contains only numeric observations.') } } } })
+  try {
+    const original = await sync.enqueue({ ...query, through: base + 999 * intervalMS, purpose: 'history' })
+    await sync.waitFor(original.id); await sync.whenIdle()
+    const moved = { ...query, from: base + 101 * intervalMS, purpose: 'history' as const }
+    await sync.enqueue(moved); await sync.whenIdle()
+    const reads = store.queries.length
+    now += 11
+    await sync.enqueue(moved); await sync.whenIdle()
+    assert.equal(store.queries.length, reads)
+    assert.equal(sync.getTask(original.id)?.status, 'completed')
+  } finally { await sync.close() }
+})

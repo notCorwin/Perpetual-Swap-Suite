@@ -45,6 +45,20 @@ const merged = (values, intervalMS) => {
   }
   return result
 }
+const clippedLeases = (values, bounds) => values.filter(value => intersects(value, bounds)).map(value => ({
+  from: Math.max(value.from, bounds.from), through: Math.min(value.through, bounds.through), expiresAt: value.expiresAt,
+}))
+const mergedLeases = (values, intervalMS) => {
+  const result = []
+  for (const value of [...values].sort((a, b) => a.from - b.from)) {
+    const prior = result.at(-1)
+    if (prior && prior.expiresAt === value.expiresAt && value.from <= prior.through + intervalMS) prior.through = Math.max(prior.through, value.through)
+    else result.push({ ...value })
+  }
+  return result
+}
+const subtractLeases = (leases, exclusions, intervalMS) => leases.flatMap(lease =>
+  subtract([{ from: lease.from, through: lease.through }], exclusions, intervalMS).map(bounds => ({ ...bounds, expiresAt: lease.expiresAt })))
 const slots = (ranges, intervalMS) => ranges.reduce((total, value) => total + (value.through - value.from) / intervalMS + 1, 0)
 const intersects = (left, right) => left.from <= right.through && left.through >= right.from
 const subtract = (ranges, exclusions, intervalMS) => exclusions.reduce((remaining, exclusion) => remaining.flatMap(value => {
@@ -525,21 +539,18 @@ export class HistorySync {
     const epoch = this.coverageEpochs.get(seriesKey(query)) ?? 0
     const version = await this.store.coverageVersion?.(query)
     const previous = this.coverageChecks.get(task.id)
-    let refresh = [query], missing = [], expiresAt = null
+    let refresh = [query], missing = [], leases = []
     if (previous) {
       missing = clipped(previous.remaining, query)
-      expiresAt = previous.expiresAt
-      refresh = [...subtract([query], [previous], intervalMS), ...clipped(previous.dirty, query)]
-      if (previous.expiresAt !== null && previous.expiresAt <= this.timestamp()) refresh = [query]
-      else if (previous.version !== version) {
+      leases = clippedLeases(previous.leases, query)
+      refresh = [...subtract([query], [previous], intervalMS), ...clipped(previous.dirty, query),
+        ...clipped(leases.filter(lease => lease.expiresAt <= this.timestamp()), query)]
+      if (previous.version !== version) {
         const changes = await this.store.coverageChanges?.(query, previous.version)
         refresh.push(...(changes?.ranges === null || !changes ? [query] : clipped(changes.ranges, query)))
       }
     }
     refresh = merged(refresh, intervalMS)
-    // Lease expiry is recomputed by the authoritative full check. Partial
-    // refreshes conservatively retain the earliest existing lease.
-    if (refresh.length === 1 && refresh[0].from === query.from && refresh[0].through === query.through) expiresAt = null
     for (const bounds of refresh) {
       const values = await this.store.missingCandleRanges({ ...query, ...bounds }, task.priority)
       if (!Array.isArray(values)) throw new TypeError('store.missingCandleRanges must return an array.')
@@ -550,12 +561,22 @@ export class HistorySync {
         prior = value
       }
       missing = merged([...subtract(missing, [bounds], intervalMS), ...sorted], intervalMS)
-      const expiry = this.store.coverageExpiry?.({ ...query, ...bounds })
-      if (expiry != null) expiresAt = Math.min(expiresAt ?? Infinity, expiry)
+      const observedLeases = this.store.coverageLeases?.({ ...query, ...bounds }) ?? []
+      if (!Array.isArray(observedLeases)) throw new TypeError('store.coverageLeases must return an array.')
+      let priorLease = null
+      const nextLeases = observedLeases.map(value => ({ ...range(value, intervalMS), expiresAt: integer(value.expiresAt, 'expiresAt') }))
+        .sort((a, b) => a.from - b.from)
+      for (const lease of nextLeases) {
+        if (lease.from < bounds.from || lease.through > bounds.through || priorLease && lease.from <= priorLease.through) throw new TypeError('Coverage leases must be disjoint and inside the verified range.')
+        priorLease = lease
+      }
+      // Replacing only this range removes expired observations without losing
+      // neighboring leases with a different source observation deadline.
+      leases = mergedLeases([...subtractLeases(leases, [bounds], intervalMS), ...nextLeases], intervalMS)
     }
     // Keep the revision from before the reads: a racing mutation is checked
     // again through the bounded change journal, never blessed by a stale read.
-    const check = { from: query.from, through: query.through, version, expiresAt, remaining: missing, dirty: [] }
+    const check = { from: query.from, through: query.through, version, leases, remaining: missing, dirty: [] }
     this.coverageChecks.set(task.id, check)
     if (epoch !== (this.coverageEpochs.get(seriesKey(query)) ?? 0)) check.dirty = [query]
     if (check.dirty.length || query.from !== task.from || query.through !== task.through) return this.missing(task)

@@ -537,3 +537,32 @@ test('versioned statistics backfill reads each completed page instead of the who
     assert.ok(store.queries.filter(query => query.from !== from || query.through !== through).every(query => Number(query.through) - Number(query.from) <= 99 * interval))
   } finally { await history.close() }
 })
+
+test('a thirty-day statistics window revalidates only an expired empty slot and ignores numeric lease metadata', async () => {
+  let now = base + 40 * day
+  const store = new VersionedMemoryStore(), through = base + (8_640 - 1) * interval, empty = base + 4_000 * interval
+  const rows = Array.from({ length: 8_640 }, (_, index) => ({ ...candle(base + index * interval), oi: 50, buy: 30, sell: 20, statisticsVersion: 11 } as CandleRecord))
+  rows[4_000] = { ...rows[4_000], buy: null, sell: null, statisticsTakerExpiresAt: now + 10 }
+  rows[2] = { ...rows[2], statisticsOIExpiresAt: now + 1 }
+  rows[3] = { ...rows[3], statisticsTakerExpiresAt: now + 1 }
+  await store.appendCandles(rows)
+  const { history, calls } = setup({ store, now: () => now })
+  try {
+    await history.ensureStatistics(instId, '5m', base, through)
+    assert.equal(calls.length, 0)
+    store.queries.length = 0
+    now += 11
+    const result = await history.ensureStatistics(instId, '5m', base, through)
+    assert.equal(result.rows.length, 8_640)
+    assert.deepEqual(calls.map(call => call.path), ['/rubik/stat/taker-volume-contract'])
+    assert.equal(calls[0].parameters.begin, empty - interval)
+    assert.equal(calls[0].parameters.end, empty + interval)
+    const fullReads = store.queries.filter(query => query.from === base && query.through === through)
+    assert.equal(fullReads.length, 1, 'The full requested rows are read only for the caller result, never for lease coverage checks.')
+    assert.ok(store.queries.filter(query => query.from !== base || query.through !== through).every(query => query.from === empty && query.through === empty))
+    store.queries.length = 0
+    now += day
+    await history.ensureStatistics(instId, '5m', base, through)
+    assert.equal(calls.length, 1, 'Numeric replacements and numeric siblings never acquire empty-observation leases.')
+  } finally { await history.close() }
+})

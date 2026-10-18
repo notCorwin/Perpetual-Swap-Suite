@@ -46,7 +46,7 @@ export class MarketHistory {
     this.latestTasks = new Map()
     this.seeds = new Map()
     this.repairs = new Map()
-    this.coverageLeases = new Map()
+    this.coverageLeaseReads = new Map()
     const statistics = source => ({
       inspect: query => this.inspectSource(query),
       fetchGap: query => this.fetchStatistics(query, source),
@@ -59,7 +59,7 @@ export class MarketHistory {
           coverageVersion: query => store.candleRevision(query.instrument, query.timeframe),
           ...(typeof store.candleChangesSince === 'function' ? { coverageChanges: (query, revision) => store.candleChangesSince(query.instrument, query.timeframe, revision) } : {}),
         } : {}),
-        coverageExpiry: query => this.coverageLeases.get(`${rangeKey(query)}:${query.source}`) ?? null,
+        coverageLeases: query => this.coverageLeaseReads.get(`${rangeKey(query)}:${query.source}`) ?? [],
       },
       sources: {
         candles: { inspect: query => this.inspectSource(query), fetchGap: query => this.fetchPrices(query) },
@@ -118,17 +118,24 @@ export class MarketHistory {
     if (repair && !repair.written) return [{ from: query.from, through: query.through }]
     const rows = await this.store.candles(query, priority)
     const bit = query.source === 'oi' ? OI : TAKER
-    const observations = this.seeds.get(keyOf(query.instrument, query.timeframe))
-    const leases = query.source === 'candles' ? [] : rows.filter(row => sourcePresent(row, bit, this.now()))
-      .map(row => Number(row[expiryField(bit)])).filter(expiry => expiry > this.now())
+    const observations = this.seeds.get(keyOf(query.instrument, query.timeframe)), observedAt = this.now()
+    const leases = []
+    if (query.source !== 'candles') for (const row of rows) {
+      const numericObservation = bit === OI ? nonnegative(row.oi) : validTakerVolumes(row)
+      const expiresAt = Number(row[expiryField(bit)])
+      if (!pricePresent(row) || !(statisticsMask(row) & bit) || numericObservation || expiresAt <= observedAt || !Number.isSafeInteger(expiresAt)) continue
+      const previous = leases.at(-1)
+      if (previous?.expiresAt === expiresAt && row.timestamp === previous.through + query.intervalMS) previous.through = row.timestamp
+      else leases.push({ from: row.timestamp, through: row.timestamp, expiresAt })
+    }
     const leaseKey = `${rangeKey(query)}:${query.source}`
-    // Only the caller's immediately following coverageExpiry lookup needs this
-    // value. Bound retained query metadata independently of historical windows.
-    this.coverageLeases.delete(leaseKey)
-    this.coverageLeases.set(leaseKey, leases.length ? Math.min(...leases) : null)
-    while (this.coverageLeases.size > 512) this.coverageLeases.delete(this.coverageLeases.keys().next().value)
+    // Only the caller's immediately following coverageLeases lookup needs
+    // these ranges. Retain bounded query metadata, never source candle rows.
+    this.coverageLeaseReads.delete(leaseKey)
+    this.coverageLeaseReads.set(leaseKey, leases)
+    while (this.coverageLeaseReads.size > 512) this.coverageLeaseReads.delete(this.coverageLeaseReads.keys().next().value)
     return missing(rows, query.from, query.through, query.intervalMS,
-      query.source === 'candles' ? row => pricePresent(row) && !observations?.has(row.timestamp) : row => pricePresent(row) && sourcePresent(row, bit, this.now()))
+      query.source === 'candles' ? row => pricePresent(row) && !observations?.has(row.timestamp) : row => pricePresent(row) && sourcePresent(row, bit, observedAt))
   }
 
   parsed(instId, timeframe, values) {

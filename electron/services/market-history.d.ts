@@ -27,6 +27,7 @@ export class MarketHistory {
   readonly sync: HistorySync
   readonly audit: DataAudit
   ensurePrices(instId: string, timeframe: Timeframe, from: number, through: number, priority?: StorePriority, signal?: AbortSignal): Promise<{ rows: CandleRecord[]; floor?: number }>
+  /** Numeric observations remain reusable; direct empty observations revalidate only their expired native-period ranges. */
   ensureStatistics(instId: string, timeframe: Timeframe, from: number, through: number, priority?: StorePriority, signal?: AbortSignal): Promise<{ rows: CandleRecord[] }>
   latest(instId: string, timeframe: Timeframe, priority?: StorePriority): Promise<{ live: CandleRecord | null; floor?: number }>
   target(instId: string, options?: { historyDays?: number; asOf?: number }): Promise<Array<{ history: HistoryTask; warmup: HistoryTask | null }>>

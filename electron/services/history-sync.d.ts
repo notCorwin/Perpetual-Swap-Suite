@@ -3,6 +3,7 @@ import type { CandleRecord } from './market-store.js'
 export type HistoryTimeframe = '5m' | '15m' | '1H'
 export type HistoryPriority = 'foreground' | 'background'
 export type HistoryRange = { from: number; through: number }
+export type HistoryCoverageLease = HistoryRange & { expiresAt: number }
 export type UnavailableHistoryRange = HistoryRange & { reason: string }
 export type HistoryTaskStatus = 'queued' | 'running' | 'retry' | 'paused' | 'cancelled' | 'completed' | 'unavailable'
 export type HistoryTask = HistoryRange & {
@@ -74,8 +75,8 @@ export type HistorySyncOptions = {
     coverageVersion?(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string }): MaybePromise<number>
     /** Null ranges mean the journal no longer covers the requested revision. */
     coverageChanges?(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string }, revision: number): MaybePromise<{ revision: number; ranges: HistoryRange[] | null }>
-    /** Earliest observation lease from the immediately preceding coverage read. */
-    coverageExpiry?(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string }): number | null
+    /** Direct empty-observation leases from the immediately preceding coverage read. Numeric observations have no lease. */
+    coverageLeases?(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string }): HistoryCoverageLease[]
     appendCandles?(records: CandleRecord[], priority?: HistoryPriority): Promise<number>
   }
   sources: Record<string, HistorySource>
