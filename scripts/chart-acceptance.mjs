@@ -61,19 +61,24 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
     if (!(chart instanceof HTMLElement)) throw new Error('No chart surface to inspect.')
     const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell']
     const indicatorFields = fields.slice(4, 14), statisticFields = ['oi', 'buy', 'sell']
+    const curveFields = [...indicatorFields, 'oi'], expectedGeometry = new WeakMap()
     const oracles = Object.fromEntries(Object.entries(series).map(([frame, entry]) => [frame, new Map(entry.bars.map(bar => [bar.hour, bar]))]))
     const probe = {
       active: true, frames: 0, pendingFrames: 0, paints: 0, minimumBars: Infinity, errors: [],
-      frameGaps: [], commits: [], previousFrame: null, previousSnapshot: null,
+      frameGaps: [], frameSamples: [], validationSamples: [], inputBursts: [], commits: [], previousFrame: null, previousSnapshot: null, previousBars: null,
       phase: 'initial', quality: [], known: new Map(), geometry: new Map(),
       raf: null, observer: null,
     }
     const fail = message => { if (probe.errors.length < 20) probe.errors.push(message) }
-    const sample = (frame = false, timestamp = performance.now()) => {
+    const validateSample = (frame, timestamp, sampledAt) => {
       if (frame) {
         probe.frames += 1
         if (chart.dataset.chartLoading === 'true') probe.pendingFrames += 1
-        if (probe.previousFrame !== null) probe.frameGaps.push(timestamp - probe.previousFrame)
+        if (probe.previousFrame !== null) {
+          const gapMS = timestamp - probe.previousFrame
+          probe.frameGaps.push(gapMS)
+          probe.frameSamples.push({ at: sampledAt, gapMS })
+        }
         probe.previousFrame = timestamp
       }
       const snapshot = chart.__chartSnapshot
@@ -90,16 +95,25 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       // Plot geometry may change without a new snapshot (for example during
       // an effect). Check actual paths before the immutable-snapshot shortcut.
       if (Array.isArray(bars)) {
-        const firstAtLeft = bars[0]?.hour === bars.at(-1)?.hour - 95 * snapshot.intervalMS
-        for (const field of [...indicatorFields, 'oi']) {
-          const samples = bars.filter(bar => typeof bar[field] === 'number' && Number.isFinite(bar[field])).length
+        let expected = expectedGeometry.get(bars)
+        if (!expected || expected.intervalMS !== snapshot.intervalMS) {
+          const firstAtLeft = bars[0]?.hour === bars.at(-1)?.hour - 95 * snapshot.intervalMS
+          expected = { intervalMS: snapshot.intervalMS, curves: new Map(curveFields.map(field => {
+            const samples = bars.filter(bar => typeof bar[field] === 'number' && Number.isFinite(bar[field])).length
+            return [field, { samples, points: samples + (firstAtLeft && Number.isFinite(bars[0]?.[field]) ? 1 : 0) }]
+          })) }
+          expectedGeometry.set(bars, expected)
+        }
+        for (const field of curveFields) {
           const path = svg.querySelector(`[data-chart-indicator="${field}"]`), d = path?.getAttribute('d') ?? ''
+          const previous = probe.geometry.get(field)
+          if (previous?.d === d && previous.expected === expected) continue
+          probe.geometry.set(field, { d, expected })
+          const { samples, points: expectedPoints } = expected.curves.get(field)
           if (samples > 1 && !d) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} lost its ${field} SVG curve with ${samples} known samples.`)
-          if (probe.geometry.get(field) === d && snapshot === probe.previousSnapshot) continue
-          probe.geometry.set(field, d)
           const points = (d.match(/[ML]/g) ?? []).length
-          const expectedPoints = samples + (firstAtLeft && Number.isFinite(bars[0]?.[field]) ? 1 : 0)
           if (points !== expectedPoints) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${points} points for ${expectedPoints} known positions.`)
+          if (/NaN|Infinity|undefined/.test(d)) fail('Nonfinite SVG geometry.')
         }
         if (requireMatureData) {
           for (const field of indicatorFields) if (!svg.querySelector(`[data-chart-indicator="${field}"]`)?.getAttribute('d')) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} has no ${field} SVG curve for mature local history.`)
@@ -107,11 +121,12 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
           if (svg.querySelector('[data-chart-taker]')?.getAttribute('data-chart-taker') !== 'complete') fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} lost complete Taker geometry.`)
         }
       }
-      if (snapshot === probe.previousSnapshot) {
-        if (frame && probe.commits.at(-1)?.presentedAt === null) probe.commits.at(-1).presentedAt = performance.now()
+      if (snapshot === probe.previousSnapshot && bars === probe.previousBars) {
+        if (frame && probe.commits.at(-1)?.presentedAt === null) probe.commits.at(-1).presentedAt = sampledAt
         return
       }
       probe.previousSnapshot = snapshot
+      probe.previousBars = bars
       probe.paints += 1
       const intervalMS = series[timeframe]?.intervalMS
       if (!Array.isArray(bars)) { fail('The rendered snapshot has no bars.'); return }
@@ -119,7 +134,7 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       // A mutation is a React commit; the following animation frame is the
       // first paint opportunity that includes that committed SVG. Keep both
       // times so input latency does not mistake a DOM mutation for a frame.
-      probe.commits.push({ at: performance.now(), presentedAt: frame ? performance.now() : null, end: snapshot.endHour, timeframe, phase: probe.phase })
+      probe.commits.push({ at: sampledAt, presentedAt: frame ? sampledAt : null, end: snapshot.endHour, timeframe, phase: probe.phase })
       probe.quality.push({ phase: probe.phase, end: snapshot.endHour, timeframe, indicators: bars.filter(bar => indicatorFields.every(field => Number.isFinite(bar[field]))).length,
         oi: bars.filter(bar => Number.isFinite(bar.oi)).length, taker: bars.filter(bar => Number.isFinite(bar.buy) && Number.isFinite(bar.sell)).length })
       if (bars.length !== 96) fail(`Rendered ${bars.length} bars for ${timeframe}.`)
@@ -172,6 +187,11 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       if (Number(taker?.querySelector('[data-chart-taker-sell-samples]')?.getAttribute('data-chart-taker-sell-samples')) !== sellRectangles) fail('The actual Taker sell geometry does not cover the snapshot.')
       for (const path of svg.querySelectorAll('path[d]')) if (/NaN|Infinity|undefined/.test(path.getAttribute('d'))) fail('Nonfinite SVG geometry.')
     }
+    const sample = (frame = false, timestamp) => {
+      const sampledAt = performance.now()
+      try { validateSample(frame, timestamp ?? sampledAt, sampledAt) }
+      finally { probe.validationSamples.push({ at: sampledAt, durationMS: performance.now() - sampledAt }) }
+    }
     probe.observer = new MutationObserver(() => sample())
     probe.observer.observe(chart, { subtree: true, childList: true, attributes: true })
     const frame = timestamp => {
@@ -203,6 +223,10 @@ export async function finishPaintProbe(page) {
       p95FrameGapMS: Number(percentile(probe.frameGaps, .95).toFixed(3)),
       maxFrameGapMS: Number(Math.max(0, ...probe.frameGaps).toFixed(3)),
       droppedFrames: probe.frameGaps.filter(gap => gap > 25).length,
+      probeValidationSamples: probe.validationSamples.length,
+      totalProbeValidationMS: Number(probe.validationSamples.reduce((sum, sample) => sum + sample.durationMS, 0).toFixed(3)),
+      p95ProbeValidationMS: Number(percentile(probe.validationSamples.map(sample => sample.durationMS), .95).toFixed(3)),
+      maxProbeValidationMS: Number(Math.max(0, ...probe.validationSamples.map(sample => sample.durationMS)).toFixed(3)),
     }
   })
 }
@@ -221,10 +245,15 @@ export async function wheelBurst(page, { frames = 1, eventsPerFrame = 1, deltaY 
     const inputs = []
     for (let frame = 0; frame < options.frames; frame += 1) {
       await new Promise(resolve => requestAnimationFrame(resolve))
-      inputs.push(performance.now())
+      let firstAt, lastAt
       for (let event = 0; event < options.eventsPerFrame; event += 1) {
-        plot.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: options.deltaY, deltaX: options.deltaX, deltaMode: options.deltaMode }))
+        const input = new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: options.deltaY, deltaX: options.deltaX, deltaMode: options.deltaMode })
+        lastAt = performance.now()
+        firstAt ??= lastAt
+        plot.dispatchEvent(input)
       }
+      inputs.push(lastAt)
+      window.__chartPaintProbe?.inputBursts.push({ firstAt, lastAt, events: options.eventsPerFrame })
     }
     return inputs
   }, { frames, eventsPerFrame, deltaY, deltaX, deltaMode })
@@ -236,16 +265,35 @@ export async function measurePaintLatency(page, { inputs, targets }) {
   await page.waitForFunction(({ latestInput, expectedEnd }) => window.__chartPaintProbe?.commits.some(commit =>
     commit.end === expectedEnd && commit.at >= latestInput && commit.presentedAt !== null), { latestInput, expectedEnd })
   return page.evaluate(({ inputs, targets }) => {
-    const commits = window.__chartPaintProbe.commits
+    const probe = window.__chartPaintProbe, commits = probe.commits
     const matching = inputs.map((input, index) => commits.find(commit => commit.end === targets[index] && commit.at >= input && commit.presentedAt !== null))
     const latencies = matching.flatMap((commit, index) => commit ? [commit.presentedAt - inputs[index]] : []).sort((left, right) => left - right)
     const percentile = ratio => Number((latencies[Math.min(latencies.length - 1, Math.floor(latencies.length * ratio))] ?? 0).toFixed(3))
     const latest = matching.at(-1)
+    const bursts = inputs.map(input => probe.inputBursts.find(burst => burst.lastAt === input))
+    if (bursts.some(burst => !burst)) throw new Error('Every measured wheel burst must include its first and final input timestamps.')
+    const latestBurst = bursts.at(-1), startedAt = bursts[0].firstAt
+    const frameGaps = probe.frameSamples.filter(sample => sample.at >= startedAt && sample.at <= latest.presentedAt).map(sample => sample.gapMS)
+    const validation = probe.validationSamples.filter(sample => sample.at >= startedAt && sample.at <= latest.presentedAt).map(sample => sample.durationMS)
+    const percentileOf = (values, ratio) => {
+      const sorted = [...values].sort((left, right) => left - right)
+      return Number((sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * ratio))] ?? 0).toFixed(3))
+    }
     return {
       committedInputs: latencies.length, supersededInputs: inputs.length - latencies.length,
       p50InputToPaintMS: percentile(.5), p95InputToPaintMS: percentile(.95),
       latestInputToPaintMS: Number((latest.presentedAt - inputs.at(-1)).toFixed(3)),
       latestInputToCommitMS: Number((latest.at - inputs.at(-1)).toFixed(3)),
+      latestCommitToPaintMS: Number((latest.presentedAt - latest.at).toFixed(3)),
+      latestBurstStartToPaintMS: Number((latest.presentedAt - latestBurst.firstAt).toFixed(3)),
+      latestBurstStartToCommitMS: Number((latest.at - latestBurst.firstAt).toFixed(3)),
+      latestBurstDispatchMS: Number((latestBurst.lastAt - latestBurst.firstAt).toFixed(3)),
+      latestBurstEvents: latestBurst.events,
+      maxBurstDispatchMS: Number(Math.max(0, ...bursts.map(burst => burst.lastAt - burst.firstAt)).toFixed(3)),
+      p95FrameGapMS: percentileOf(frameGaps, .95), maxFrameGapMS: Number(Math.max(0, ...frameGaps).toFixed(3)),
+      probeValidationSamples: validation.length,
+      totalProbeValidationMS: Number(validation.reduce((sum, duration) => sum + duration, 0).toFixed(3)),
+      p95ProbeValidationMS: percentileOf(validation, .95), maxProbeValidationMS: Number(Math.max(0, ...validation).toFixed(3)),
     }
   }, { inputs, targets })
 }

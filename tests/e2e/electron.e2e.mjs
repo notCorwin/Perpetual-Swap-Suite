@@ -303,7 +303,45 @@ test('the 1600 design workspace keeps both panels and chart selection when searc
   }
 })
 
-test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while speculative preparation is stalled in every native timeframe', async () => {
+test('the paint probe catches changed indicator geometry without a new snapshot and retains the violation', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await openChart(page, fixture)
+  await startPaintProbe(page, fixture)
+  let report
+  try {
+    const observation = await page.evaluate(async instId => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+      const snapshot = chart.__chartSnapshot
+      const path = chart.querySelector('[data-chart-indicator="rsi12"]')
+      const original = path.getAttribute('d')
+      const initiallyValid = window.__chartPaintProbe.errors.length === 0
+      try {
+        path.setAttribute('d', 'M0,0')
+        // Mutation observers run before the next task, with the same rendered
+        // data. Further frames then exercise the unchanged corrupted path.
+        await Promise.resolve()
+        const detected = window.__chartPaintProbe.errors.find(error => /rsi12 SVG has 1 points/.test(error))
+        const sameSnapshot = chart.__chartSnapshot === snapshot
+        for (let frame = 0; frame < 3; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve))
+        return {
+          initiallyValid, detected, sameSnapshot,
+          sameCorruptedGeometry: path.getAttribute('d') === 'M0,0',
+          retained: window.__chartPaintProbe.errors.includes(detected),
+        }
+      } finally { path.setAttribute('d', original) }
+    }, fixture.instId)
+    await page.evaluate(async () => { for (let frame = 0; frame < 2; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
+    report = await finishPaintProbe(page)
+    assert.equal(observation.initiallyValid, true)
+    assert.equal(observation.sameSnapshot, true, 'The corrupted curve must be checked without a data publication.')
+    assert.match(observation.detected ?? '', /rsi12 SVG has 1 points/)
+    assert.equal(observation.sameCorruptedGeometry, true)
+    assert.equal(observation.retained, true, 'Repeated unchanged geometry must retain the detected violation.')
+    assert.ok(report.violations.includes(observation.detected), 'Restoring valid geometry must not erase an earlier incorrect paint.')
+  } finally { if (!report) await finishPaintProbe(page) }
+})
+
+test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while speculative preparation is stalled in every native timeframe', async context => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   // Adaptive speculative preparation is held indefinitely. Source reads are
   // also stalled after warming, so navigation must stay independent of both
@@ -330,7 +368,9 @@ test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while specu
         distance += phase.candles
         await waitForRendered(page, fixture, timeframe, targets.at(-1))
         const latency = await measurePaintLatency(page, { inputs, targets })
-        assert.ok(latency.latestInputToPaintMS < 100, `${timeframe} ${phase.name} took ${latency.latestInputToPaintMS} ms from the latest wheel input to its first paint opportunity.`)
+        context.diagnostic(JSON.stringify({ timeframe, phase: phase.name, ...latency }))
+        assert.ok(latency.latestInputToPaintMS < 100, `${timeframe} ${phase.name} took ${latency.latestInputToPaintMS} ms from the latest wheel input to its first paint opportunity. ${JSON.stringify(latency)}`)
+        assert.ok(latency.latestBurstStartToPaintMS < 100, `${timeframe} ${phase.name} took ${latency.latestBurstStartToPaintMS} ms from the first wheel input in the latest burst to its first paint opportunity. ${JSON.stringify(latency)}`)
       }
       const paint = await finishPaintProbe(page)
       assertCompletePaints(paint)
