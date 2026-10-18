@@ -355,13 +355,15 @@ test('empty snapshots distinguish startup, verification failures, confirmed excl
     await assertEmpty('Loading contracts')
     // A full initial snapshot is not proof that qualification has finished.
     await page.waitForFunction(() => document.querySelector('[data-market-list] [data-slot="badge"]')?.textContent.includes('Refreshing'))
-    await publish({ catalogSource: 'live', catalogProgress: { total: 4, completed: 2, verified: 0, failed: 1, unknown: 1 } })
+    await publish({ catalogSource: 'live', catalogProgress: { total: 4, completed: 2, verified: 0, failed: 1, unknown: 1, pending: 2 } })
     await assertEmpty('Verifying contracts')
     await page.locator('[data-market-list]').getByText('Checking enabled conditions: 2 / 4 contracts completed.', { exact: true }).waitFor()
-    await publish({ catalogProgress: { total: 4, completed: 4, verified: 0, failed: 0, unknown: 4 } })
+    await publish({ catalogProgress: { total: 4, completed: 4, verified: 0, failed: 0, unknown: 4, pending: 4 } })
     await assertEmpty('Updating market data')
     await page.locator('[data-market-list]').getByText('Updating 4 contracts', { exact: true }).waitFor()
-    await publish({ loading: false, error: 'Order book data is unavailable. Qualification could not be verified.', catalogProgress: { total: 4, completed: 4, verified: 0, failed: 0, unknown: 4 } })
+    await publish({ catalogProgress: { total: 4, completed: 4, verified: 0, failed: 0, unknown: 4, pending: 2 } })
+    await page.locator('[data-market-list]').getByText('Updating 2 contracts', { exact: true }).waitFor()
+    await publish({ loading: false, error: 'Order book data is unavailable. Qualification could not be verified.', catalogProgress: { total: 4, completed: 4, verified: 0, failed: 0, unknown: 4, pending: 0 } })
     await assertEmpty('Market verification unavailable')
     await page.getByRole('alert').filter({ hasText: 'Order book data is unavailable.' }).waitFor()
     await publish({ error: '' })
@@ -370,9 +372,9 @@ test('empty snapshots distinguish startup, verification failures, confirmed excl
     await publish({ catalogSource: 'none', catalogProgress: undefined })
     await page.waitForFunction(() => document.querySelector('[data-market-list] [data-slot="badge"]')?.textContent.includes('Waiting'))
     await assertEmpty('Market verification unavailable')
-    await publish({ loading: true, catalogSource: 'live', catalogProgress: { total: 4, completed: 4, verified: 0, failed: 4, unknown: 0 } })
+    await publish({ loading: true, catalogSource: 'live', catalogProgress: { total: 4, completed: 4, verified: 0, failed: 4, unknown: 0, pending: 0 } })
     await assertEmpty('No qualified contracts')
-    await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), catalogProgress: { total: 4, completed: 4, verified: 4, failed: 0, unknown: 0 } })
+    await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), catalogProgress: { total: 4, completed: 4, verified: 4, failed: 0, unknown: 0, pending: 0 } })
     await page.locator('[data-market-index][aria-selected="true"][aria-label="View BETA-USDT-SWAP chart"]').waitFor()
     await page.locator('[data-chart-inst="BETA-USDT-SWAP"]').waitFor()
     assert.equal(await page.getByText('No qualified contracts', { exact: true }).count(), 0)
@@ -382,6 +384,32 @@ test('empty snapshots distinguish startup, verification failures, confirmed excl
   }
 })
 
+
+test('completed unknown qualification does not report pending acquisition during unrelated background work', async () => {
+  try {
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.rows = []
+      state.loading = true
+      state.error = ''
+      state.catalogSource = 'live'
+      state.catalogProgress = { total: 4, completed: 4, verified: 0, failed: 0, unknown: 4, pending: 0 }
+      state.revision += 1
+    })
+    await page.locator('[data-market-list]').getByText('Market verification unavailable', { exact: true }).waitFor()
+    await page.locator('[data-market-list]').getByText('Incomplete', { exact: true }).waitFor()
+    assert.equal(await page.locator('[data-market-list]').getByText(/^Updating \d+ contracts$/).count(), 0, 'Completed but unproven observations are not pending acquisition.')
+    assert.equal(await page.getByText('Updating market data', { exact: true }).count(), 0)
+    assert.equal(await page.getByText('Verifying contracts', { exact: true }).count(), 0)
+  } finally {
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      Object.assign(state, { rows: state.initialRows, loading: false, error: '', catalogSource: 'live', catalogProgress: undefined })
+      state.revision += 1
+    })
+    await page.locator('[data-market-index]').first().waitFor({ state: 'visible' })
+  }
+})
 
 test('temporary qualification gaps preserve the current chart and interaction until exclusions are confirmed', async () => {
   const publish = async values => electron.evaluate((_electron, values) => {
@@ -409,19 +437,19 @@ test('temporary qualification gaps preserve the current chart and interaction un
     await page.mouse.move(bounds.x + bounds.width * .4, bounds.y + bounds.height * .1)
     await page.mouse.down()
     await page.waitForFunction(() => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
-    await publish({ rows: [], loading: true, error: '', catalogSource: 'live', catalogProgress: { total: 4, completed: 0, verified: 0, failed: 0, unknown: 0 } })
+    await publish({ rows: [], loading: true, error: '', catalogSource: 'live', catalogProgress: { total: 4, completed: 0, verified: 0, failed: 0, unknown: 0, pending: 4 } })
     await assertRetained('Verifying contracts', 'Rechecking qualification · Current chart remains available')
-    await publish({ loading: false, error: 'Order book observations are temporarily unavailable.', catalogProgress: { total: 4, completed: 4, verified: 0, failed: 0, unknown: 4 } })
+    await publish({ loading: false, error: 'Order book observations are temporarily unavailable.', catalogProgress: { total: 4, completed: 4, verified: 0, failed: 0, unknown: 4, pending: 0 } })
     await assertRetained('Market verification unavailable', 'Qualification data unavailable · Current chart remains available')
     await publish({ error: '', catalogSource: 'none', catalogProgress: undefined })
     await page.waitForFunction(() => document.querySelector('[data-market-list] [data-slot="badge"]')?.textContent.includes('Waiting'))
     await assertRetained('Market verification unavailable', 'Qualification data unavailable · Current chart remains available')
-    await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), catalogSource: 'live', catalogProgress: { total: 4, completed: 4, verified: 4, failed: 0, unknown: 0 } })
+    await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), catalogSource: 'live', catalogProgress: { total: 4, completed: 4, verified: 4, failed: 0, unknown: 0, pending: 0 } })
     await page.locator('[data-market-index][aria-selected="true"][aria-label="View BETA-USDT-SWAP chart"]').waitFor()
     assert.equal(await page.evaluate(() => globalThis.__continuityChart === document.querySelector('[data-chart-inst]') && globalThis.__continuitySVG === document.querySelector('svg[data-rendered-inst]')), true, 'Recovery of the selected contract must not remount the chart.')
     assert.match(await page.locator('[data-chart-inst] [aria-live="off"] p').textContent(), /Selected/)
     await page.mouse.up()
-    await publish({ rows: [], catalogProgress: { total: 4, completed: 4, verified: 0, failed: 4, unknown: 0 } })
+    await publish({ rows: [], loading: true, catalogProgress: { total: 4, completed: 4, verified: 0, failed: 4, unknown: 0, pending: 0 } })
     await page.locator('[data-chart-panel]').getByText('No qualified contracts', { exact: true }).waitFor()
     assert.equal(await page.locator('[data-chart-inst]').count(), 0, 'A confirmed complete exclusion must clear the chart.')
     assert.deepEqual(await electron.evaluate(() => globalThis.__workspaceFixture.requests.findLast(value => value.chartUniverse)?.chartUniverse.instIds), [], 'Confirmed exclusions must remove the retained chart subscription.')

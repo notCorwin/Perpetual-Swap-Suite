@@ -7,7 +7,7 @@ import { HistorySync } from '../electron/services/history-sync.js'
 import { MarketStore } from '../electron/services/market-store.js'
 import type { HistoryTask } from '../electron/services/history-sync.js'
 
-test('durable history makes progress before a busy foreground universe drains', { timeout: 5_000 }, async () => {
+test('every queued foreground history request precedes background history and warmup pages', { timeout: 5_000 }, async () => {
   const saved = new Map<string, HistoryTask>(), covered = new Set<string>(), calls: string[] = []
   let release!: () => void, started!: () => void
   const gate = new Promise<void>(resolve => { release = resolve })
@@ -38,26 +38,27 @@ test('durable history makes progress before a busy foreground universe drains', 
     for (let index = 0; index < 24; index += 1) await sync.enqueue({ ...query, instrument: `LIVE-${index}`, priority: 'foreground' })
     release()
     await sync.whenIdle()
-    assert.equal(calls[1], 'LIVE-0', 'A newly focused foreground request still goes first.')
-    assert.ok(calls.indexOf('HISTORY') <= 8, 'History must publish a page while foreground work remains queued.')
-    assert.ok(calls.indexOf('WARMUP') <= 17, 'Background peers both receive bounded turns.')
+    assert.deepEqual(calls, ['FIRST', ...Array.from({ length: 24 }, (_, index) => `LIVE-${index}`), 'HISTORY', 'WARMUP'],
+      'Background downloads must wait for all foreground pages, including requests beyond the former burst limit.')
     assert.equal(covered.size, 27)
     assert.ok(sync.listTasks().every(task => task.status === 'completed'))
   } finally { release(); await sync.close() }
 })
 
-test('queued background storage is serviced during continuous foreground reads', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-history-storage-fairness-'))
+test('foreground storage runs after the active durable job and before every queued background job', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-history-storage-priority-'))
   const store = await MarketStore.open(root), calls: string[] = []
   let release!: () => void
   const gate = new Promise<void>(resolve => { release = resolve })
   try {
-    const first = store.enqueue(() => gate, 'foreground')
+    const first = store.enqueue(async () => { calls.push('active-write:start'); await gate; calls.push('active-write:end') })
     const background = store.enqueue(() => { calls.push('history-write') })
+    const checkpoint = store.enqueue(() => { calls.push('history-checkpoint') })
     const foreground = Array.from({ length: 24 }, (_, index) => store.enqueue(() => { calls.push(`read-${index}`) }, 'foreground'))
+    assert.deepEqual(calls, ['active-write:start'], 'Foreground admission must not interrupt an active durable operation.')
     release()
-    await Promise.all([first, background, ...foreground])
-    assert.equal(calls[0], 'read-0', 'Foreground reads retain their normal preference.')
-    assert.ok(calls.indexOf('history-write') < 8, 'Accepted history storage must finish before all foreground reads.')
+    await Promise.all([first, background, checkpoint, ...foreground])
+    assert.deepEqual(calls, ['active-write:start', 'active-write:end', ...Array.from({ length: 24 }, (_, index) => `read-${index}`), 'history-write', 'history-checkpoint'],
+      'Every foreground job must precede queued background work while preserving each priority group’s arrival order.')
   } finally { release(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })

@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { assertCompletePaints, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
+import { assertCompletePaints, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
 
 const root = new URL('../..', import.meta.url).pathname
 const userData = await mkdtemp(join(tmpdir(), 'perp-radar-e2e-'))
@@ -293,7 +293,7 @@ test('the 1600 design workspace keeps both panels and chart selection when searc
   }
 })
 
-test('bulk-warmed history scrolls, reverses, and jumps within 100 ms without preparation or HTTP in every native timeframe', async () => {
+test('bulk-warmed history scrolls, reverses, and jumps within 100 ms without historical preparation or downloads in every native timeframe', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   // Any accidental historical preparation is held indefinitely. Source reads
   // are also stalled after warming, so successful navigation proves that it
@@ -326,7 +326,8 @@ test('bulk-warmed history scrolls, reverses, and jumps within 100 ms without pre
       const after = await readRequestProbe(electron)
       const historicalRequests = after.calls.slice(before.calls.length).filter(call => Number.isFinite(call.endHour))
       assert.deepEqual(historicalRequests, [], `A warmed ${timeframe} scroll crossed the historical preparation IPC boundary: ${JSON.stringify(historicalRequests)}`)
-      assert.equal(after.sourceCalls, before.sourceCalls, `A warmed ${timeframe} scroll attempted HTTP: ${JSON.stringify(after.sourceRequests.slice(before.sourceCalls))}`)
+      const sources = separateSourceMaintenance(after.sourceRequests.slice(before.sourceCalls), fixture)
+      assert.deepEqual(sources.historical, [], `A warmed ${timeframe} scroll attempted a historical download: ${JSON.stringify(sources.historical)}`)
       assert.equal(after.held, false, 'Every tested target must already be resident; none may wait for the deliberately held preparation lane.')
       assert.ok(after.transferredHistoryBars >= residentHistoryBars, 'The fixture must exercise a bulk durable-history transfer.')
     }

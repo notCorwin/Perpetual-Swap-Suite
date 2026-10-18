@@ -96,6 +96,9 @@ test('history requests reject invalid grids, sources, priorities, and constructo
   assert.throws(() => create({ maxAttempts: 0 }), /maxAttempts/)
   assert.throws(() => create({ maxConcurrentTasks: 0 }), /maxConcurrentTasks/)
   assert.throws(() => create({ maxConcurrentTasks: 1.5 }), /maxConcurrentTasks/)
+  for (const maxConcurrentPerSource of [0, -1, 1.5, NaN, { candles: 0 }, { candles: 1.5 }, { missing: 2 }, []]) {
+    assert.throws(() => create({ maxConcurrentPerSource: maxConcurrentPerSource as number }), /maxConcurrentPerSource/)
+  }
   assert.throws(() => create({ retryBaseMS: 10, maxRetryDelayMS: 5 }), /maxRetryDelayMS/)
   assert.throws(() => create({ minRequestIntervalMS: 2 ** 32 }), /2147483647/)
   assert.throws(() => create({ maxRetainedTerminalTasks: 0 }), /maxRetainedTerminalTasks/)
@@ -136,19 +139,19 @@ test('concurrent foreground and background requests share one durable task and c
   } finally { await sync.close() }
 })
 
-test('contained and overlapping requests keep exact task identities and fetch only remaining persisted gaps', async () => {
+test('contained and overlapping requests share coverage even when their source allows parallel foreground pages', async () => {
   const entered = deferred(), release = deferred()
   const queries: HistorySourceQuery[] = []
-  const { sync } = create({ sources: { candles: { async fetchGap(query) {
+  const { sync } = create({ maxConcurrentTasks: 4, maxConcurrentPerSource: { candles: 4 }, sources: { candles: { async fetchGap(query) {
     queries.push(query)
     if (queries.length === 1) { entered.resolve(); await release.promise }
     return records(query)
   } } } })
   try {
-    const first = await sync.enqueue(request)
+    const first = await sync.enqueue({ ...request, priority: 'foreground' })
     await entered.promise
-    const contained = await sync.enqueue({ ...request, from: base + intervalMS })
-    const overlap = await sync.enqueue({ ...request, from: base + intervalMS, through: base + 4 * intervalMS })
+    const contained = await sync.enqueue({ ...request, from: base + intervalMS, priority: 'foreground' })
+    const overlap = await sync.enqueue({ ...request, from: base + intervalMS, through: base + 4 * intervalMS, priority: 'foreground' })
     assert.notEqual(contained.id, first.id)
     assert.equal((await sync.enqueue({ ...request, from: base + intervalMS })).id, contained.id)
     release.resolve()
@@ -482,6 +485,93 @@ test('three sources overlap their HTTP pages while each source admits only one t
     assert.ok(sync.listTasks().every(task => task.status === 'completed'))
     assert.ok([...storage.stores.values()].every(store => store.rows.size === 6))
   } finally { release.resolve(); await sync.close() }
+})
+
+test('four foreground candle pages overlap while OI and taker retain independent single-page limits', async () => {
+  const storage = sourceStorage(), entered = deferred(), release = deferred()
+  const active = new Map<string, number>(), peaks = new Map<string, number>(), calls = new Map<string, number>()
+  let peak = 0
+  const { sync } = create({ ...storage, maxConcurrentTasks: 6, maxConcurrentPerSource: { candles: 4, oi: 1, taker: 1 },
+    sources: Object.fromEntries(['candles', 'oi', 'taker'].map(source => [source, { async fetchGap(query: HistorySourceQuery) {
+      active.set(source, (active.get(source) ?? 0) + 1)
+      peaks.set(source, Math.max(peaks.get(source) ?? 0, active.get(source)!))
+      calls.set(source, (calls.get(source) ?? 0) + 1)
+      const simultaneous = [...active.values()].reduce((sum, value) => sum + value, 0)
+      peak = Math.max(peak, simultaneous)
+      if (simultaneous === 6) entered.resolve()
+      try { await release.promise; return records(query) }
+      finally { active.set(source, active.get(source)! - 1) }
+    } }])),
+  })
+  try {
+    await Promise.all(['candles', 'oi', 'taker'].flatMap(source => Array.from({ length: source === 'candles' ? 8 : 2 }, (_, index) =>
+      sync.enqueue({ ...request, source, instrument: `${source.toUpperCase()}-${index}`, priority: 'foreground' }))))
+    await within(entered.promise)
+    assert.deepEqual(Object.fromEntries(active), { candles: 4, oi: 1, taker: 1 })
+    assert.deepEqual(Object.fromEntries(calls), { candles: 4, oi: 1, taker: 1 }, 'Queued pages must wait for their own source capacity.')
+    release.resolve()
+    await within(sync.whenIdle())
+    assert.deepEqual(Object.fromEntries(peaks), { candles: 4, oi: 1, taker: 1 })
+    assert.equal(peak, 6)
+    assert.deepEqual(Object.fromEntries(calls), { candles: 8, oi: 2, taker: 2 })
+    assert.ok(sync.listTasks().every(task => task.status === 'completed'))
+  } finally { release.resolve(); await sync.close() }
+})
+
+test('parallel source capacity serves every queued foreground page before admitting one background page at a time', async () => {
+  const entered = deferred(), release = deferred(), calls: string[] = []
+  let foreground = 0, background = 0, backgroundPeak = 0
+  const { sync } = create({ maxConcurrentTasks: 4, maxConcurrentPerSource: 4,
+    sources: { candles: { async fetchGap(query) {
+      calls.push(query.instrument)
+      if (query.priority === 'foreground') {
+        foreground += 1
+        if (foreground === 4) entered.resolve()
+        await release.promise
+      } else {
+        background += 1
+        backgroundPeak = Math.max(backgroundPeak, background)
+        await Promise.resolve()
+        background -= 1
+      }
+      return records(query)
+    } } },
+  })
+  try {
+    await Promise.all([
+      ...['HISTORY', 'WARMUP'].map(instrument => sync.enqueue({ ...request, instrument, purpose: 'history' })),
+      ...Array.from({ length: 8 }, (_, index) => sync.enqueue({ ...request, instrument: `FOREGROUND-${index}`, priority: 'foreground' })),
+    ])
+    await within(entered.promise)
+    assert.deepEqual(calls, Array.from({ length: 4 }, (_, index) => `FOREGROUND-${index}`), 'Background work must not consume the extra source slots while foreground work is queued.')
+    release.resolve()
+    await within(sync.whenIdle())
+    assert.deepEqual(calls, [...Array.from({ length: 8 }, (_, index) => `FOREGROUND-${index}`), 'HISTORY', 'WARMUP'])
+    assert.equal(backgroundPeak, 1, 'Increasing foreground concurrency must not parallelize background downloads.')
+  } finally { release.resolve(); await sync.close() }
+})
+
+test('cancelling one parallel source task leaves its peers running and close aborts the remaining fetches', async () => {
+  const entered = deferred(), aborted: string[] = []
+  let calls = 0
+  const { sync } = create({ maxConcurrentTasks: 4, maxConcurrentPerSource: { candles: 4 }, sources: { candles: { fetchGap(query) {
+    calls += 1
+    if (calls === 4) entered.resolve()
+    return new Promise((_resolve, reject) => query.signal.addEventListener('abort', () => {
+      aborted.push(query.instrument)
+      reject(query.signal.reason)
+    }, { once: true }))
+  } } } })
+  try {
+    const tasks = await Promise.all(Array.from({ length: 4 }, (_, index) => sync.enqueue({ ...request, instrument: `PARALLEL-${index}`, priority: 'foreground' })))
+    await within(entered.promise)
+    await sync.cancel(tasks[1].id)
+    assert.deepEqual(aborted, ['PARALLEL-1'])
+    assert.equal(sync.getTask(tasks[1].id)?.status, 'cancelled')
+    assert.ok(tasks.filter((_, index) => index !== 1).every(task => sync.getTask(task.id)?.status === 'running'))
+    await within(sync.close())
+    assert.deepEqual(aborted.sort(), ['PARALLEL-0', 'PARALLEL-1', 'PARALLEL-2', 'PARALLEL-3'])
+  } finally { await sync.close() }
 })
 
 test('the pool enforces a configured bound smaller than the number of ready sources', async () => {
@@ -1595,5 +1685,31 @@ test('a rolling window moved during an old coverage read can quit and restart be
     await sync.start()
     assert.equal((await within(sync.waitFor(original.id))).status, 'completed')
     assert.ok(store.rows.has(`${request.instrument}:5m:${bounds.through}`))
+  } finally { release.resolve(); await sync.close() }
+})
+
+test('parallel source slots keep an old active page serialized when its stable target moves to a disjoint window', async () => {
+  const entered = deferred(), release = deferred(), independent = deferred(), queries: HistorySourceQuery[] = []
+  const store = new VersionedMemoryStore()
+  const { sync } = create({ store, maxConcurrentTasks: 2, maxConcurrentPerSource: { candles: 2 }, sources: { candles: { async fetchGap(query) {
+    queries.push(query)
+    if (queries.length === 1) { entered.resolve(); await release.promise }
+    if (query.instrument === 'INDEPENDENT') independent.resolve()
+    return records(query)
+  } } } })
+  try {
+    const original = await sync.enqueue({ ...request, purpose: 'history', priority: 'foreground' })
+    await within(entered.promise)
+    await sync.enqueue({ ...request, from: base + 100 * intervalMS, through: base + 102 * intervalMS, purpose: 'history', priority: 'foreground' })
+    const exact = await sync.enqueue({ ...request, priority: 'foreground' })
+    await sync.enqueue({ ...request, instrument: 'INDEPENDENT', priority: 'foreground' })
+    await within(independent.promise)
+    assert.equal(queries.filter(query => query.instrument === request.instrument && query.from === request.from).length, 1,
+      'The exact old window waits for the old page even though the rolling task now points elsewhere.')
+    assert.equal(sync.getTask(exact.id)?.status, 'queued')
+    release.resolve()
+    assert.equal((await within(sync.waitFor(original.id))).status, 'completed')
+    assert.equal((await within(sync.waitFor(exact.id))).status, 'completed')
+    assert.equal(queries.filter(query => query.instrument === request.instrument && query.from === request.from).length, 1)
   } finally { release.resolve(); await sync.close() }
 })

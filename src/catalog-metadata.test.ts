@@ -43,10 +43,12 @@ test('renewal uses changed contract units even when the new metadata cannot prov
     assert.equal(f.service.catalog.has(instId), true)
     currentInstrument = { ...instrument, ctVal: '0.01' }
     await f.service.renewCatalog()
+    await Promise.all([...f.service.candidateTasks.values()])
     assert.equal(f.service.renewalTargets.get(instId).ctVal, '0.01')
     assert.equal(f.service.metadata.getCatalogEntry(instId).status, 'unknown')
     assert.equal((await f.service.snapshot()).rows.length, 0)
     await f.service.renewCatalog()
+    await Promise.all([...f.service.candidateTasks.values()])
     assert.equal(f.service.metadata.getCatalogEntry(instId).instrument.ctVal, '0.01')
     assert.equal(f.service.metadata.getCatalogEntry(instId).status, 'unknown', 'An old, larger contract value must not restore qualification.')
     assert.equal((await f.service.snapshot()).rows.length, 0)
@@ -70,7 +72,7 @@ test('a candidate with obsolete units cannot overwrite a newer check after histo
   try {
     f.preferences.liquidity.volume24h.enabled = true
     const step = 300_000, asOf = Math.floor(Date.now() / step) * step
-    await f.store.appendCandles(Array.from({ length: 288 }, (_, index) => ({
+    await f.store.appendCandles(Array.from({ length: 287 }, (_, index) => ({
       instrument: instId, timeframe: '5m', timestamp: asOf - (288 - index) * step,
       open: 100, high: 100, low: 100, close: 100, volume: 1, baseVolume: 1, quoteVolume: 200_000, confirmed: true,
     })))

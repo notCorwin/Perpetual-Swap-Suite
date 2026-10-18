@@ -149,6 +149,17 @@ test('snapshot versions omit unchanged rows, detect status changes, and isolate 
     assert.equal('rows' in unchanged, false)
     for (let tick = 1; tick <= 10; tick++) f.service.realtime.setState({ updatedAt: tick })
     assert.equal('unchanged' in await f.service.snapshot('15m', { sinceRevision: first.revision, serviceSession: first.serviceSession }), true)
+    f.service.pendingCandidates.set('pending-qualification', { instId, configKey: f.service.catalogCriteriaKey() })
+    const pending = await f.service.snapshot('15m', { sinceRevision: first.revision, serviceSession: first.serviceSession })
+    assert.equal('rows' in pending, true)
+    assert.equal(pending.catalogProgress.pending, 1)
+    assert.equal(pending.loading, true)
+    assert.equal('unchanged' in await f.service.snapshot('15m', { sinceRevision: pending.revision, serviceSession: pending.serviceSession }), true, 'Stable qualification work must not invalidate every poll.')
+    f.service.pendingCandidates.delete('pending-qualification')
+    const settled = await f.service.snapshot('15m', { sinceRevision: pending.revision, serviceSession: pending.serviceSession })
+    assert.equal('rows' in settled, true)
+    assert.equal(settled.catalogProgress.pending, 0)
+    assert.equal(settled.loading, false)
     f.service.realtime.setState({ status: 'connecting' })
     const connected = await f.service.snapshot('15m', { sinceRevision: first.revision, serviceSession: first.serviceSession })
     assert.equal('rows' in connected, true)
@@ -343,6 +354,7 @@ test('qualified contracts renew independently while discovery waits for another 
     assert.equal((await f.service.snapshot()).rows.length, 0, 'An expired contract is never displayed as currently qualified.')
     f.service.tickerCache.observedAt = Date.now() - 90_001
     await f.service.renewCatalog()
+    await waitFor(() => oiCalls === 3 && f.service.candidateTasks.size === 1)
     assert.equal(f.service.refreshing !== null, true, 'Renewal must finish without waiting for full discovery.')
     assert.equal(oiCalls, 3)
     assert.deepEqual((await f.service.snapshot()).rows.map(row => row.instId), [instId])
@@ -364,6 +376,7 @@ test('expired qualification stays hidden after unavailable observations and reco
     assert.equal(f.service.renewalTargets.has(instId), true)
     unavailable = true
     await f.service.renewCatalog()
+    await waitFor(() => f.service.metadata.getCatalogEntry(instId).status === 'unknown' && f.service.candidateTasks.size === 0)
     const missing = await f.service.snapshot()
     assert.equal(missing.rows.length, 0)
     assert.equal(missing.catalogProgress.unknown, 1)
@@ -373,6 +386,7 @@ test('expired qualification stays hidden after unavailable observations and reco
     assert.equal(f.service.renewalTargets.has(instId), true, 'Missing data must not remove a previously qualified contract from renewal.')
     unavailable = false
     await f.service.renewCatalog()
+    await waitFor(() => f.service.catalog.has(instId) && f.service.candidateTasks.size === 0)
     const recovered = await f.service.snapshot()
     assert.deepEqual(recovered.rows.map(row => row.instId), [instId])
     assert.equal(recovered.catalogProgress.verified, 1)
@@ -398,9 +412,10 @@ test('historical preparation completes before live liquidity and refreshes a tic
   try {
     f.service.updateRanking = async () => undefined
     const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
-    await f.store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 200_000 })))
+    await f.store.appendCandles(Array.from({ length: 287 }, (_, index) => ({ ...rawCandle(asOf - (287 - index) * fiveMinutes), quoteVolume: 200_000 })))
     f.service.history.ensurePrices = async (id: string, timeframe: string, from: number, through: number) => {
       preparing = true; await historyGate
+      await f.service.persistCandles(id, [{ ...rawCandle(from), quoteVolume: 200_000 }])
       return { rows: await f.store.candles({ instrument: id, timeframe, from, through }) }
     }
     refresh = f.service.refresh()
@@ -512,7 +527,7 @@ test('a genuine liquidity rejection has a completed failed check and no data err
     const snapshot = await f.service.snapshot()
     assert.equal(snapshot.rows.length, 0)
     assert.equal(snapshot.error, '')
-    assert.deepEqual(snapshot.catalogProgress, { total: 1, completed: 1, verified: 0, failed: 1, unknown: 0 })
+    assert.deepEqual(snapshot.catalogProgress, { total: 1, completed: 1, verified: 0, failed: 1, unknown: 0, pending: 0 })
     assert.equal(f.service.renewalTargets.has(instId), false)
   } finally { await f.close() }
 })
@@ -774,6 +789,85 @@ test('candle, OI and Taker HTTP families proceed independently and Taker keeps c
     assert.equal(calls.find(url => url.pathname.endsWith('/taker-volume-contract'))?.searchParams.get('unit'), '1')
     releaseOI(response([])); await oi
   } finally { releaseOI?.(response([])); await f.close() }
+})
+
+test('paced HTTP lanes reserve foreground slots and admit queued Verify and chart requests ahead of downloads', async context => {
+  const starts: Array<{ id: string; at: number }> = []
+  const releases = new Map<string, (value: Response) => void>()
+  const signals = new Map<string, AbortSignal | null | undefined>()
+  const requests: Promise<unknown>[] = []
+  let active = 0, maximumActive = 0
+  const f = await fixture(disabled(), async (input, init) => {
+    const id = new URL(String(input)).searchParams.get('id')!
+    starts.push({ id, at: Date.now() })
+    signals.set(id, init?.signal)
+    active += 1
+    maximumActive = Math.max(maximumActive, active)
+    return new Promise(resolve => releases.set(id, value => { active -= 1; resolve(value) }))
+  })
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
+  const tick = async (milliseconds: number) => {
+    context.mock.timers.tick(milliseconds)
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  const issue = (id: string, priority: string) => {
+    const request = f.service.get('/market/history-candles', { id }, undefined, priority)
+    requests.push(request)
+    void request.catch(() => undefined)
+  }
+  const complete = (id: string) => {
+    const release = releases.get(id)
+    assert.ok(release, `${id} has not started.`)
+    releases.delete(id)
+    release(response([]))
+  }
+  try {
+    issue('download-1', 'background')
+    await tick(0)
+    issue('download-2', 'background')
+    await tick(99)
+    assert.deepEqual(starts.map(start => start.id), ['download-1'], 'A second background request cannot occupy a reserved foreground slot.')
+    issue('statistics', 'statistics')
+    issue('verify-1', 'foreground')
+    issue('chart', 'prepared')
+    issue('verify-2', 'foreground')
+    issue('verify-3', 'foreground')
+    await tick(1)
+    assert.deepEqual(starts.map(start => start.id), ['download-1', 'verify-1'], 'Highest-priority work is chosen when the next pacing slot opens.')
+    assert.equal(signals.get('download-1')?.aborted, false, 'Foreground admission must not cancel the background fetch that is already in flight.')
+    await tick(99)
+    assert.equal(starts.length, 2, 'Concurrent capacity cannot bypass the minimum request-start interval.')
+    await tick(1)
+    assert.equal(starts[2].id, 'chart')
+    await tick(100)
+    assert.equal(starts[3].id, 'verify-2')
+    assert.equal(active, 4)
+    await tick(100)
+    assert.equal(starts.length, 4, 'A fifth in-flight request must wait for an active slot to finish.')
+    complete('chart')
+    await tick(0)
+    assert.equal(starts[4].id, 'verify-3')
+    assert.equal(active, 4)
+    complete('download-1')
+    complete('verify-1')
+    complete('verify-2')
+    await tick(100)
+    assert.equal(starts[5].id, 'statistics', 'A queued download must yield to the remaining foreground source request.')
+    await tick(100)
+    assert.equal(starts[6].id, 'download-2')
+    assert.equal(maximumActive, 4)
+    for (let index = 1; index < starts.length; index += 1) assert.ok(starts[index].at - starts[index - 1].at >= 100, 'Every request start must respect the candle endpoint pacing interval.')
+    complete('verify-3')
+    complete('statistics')
+    complete('download-2')
+    await tick(0)
+    await Promise.all(requests)
+  } finally {
+    for (const release of releases.values()) release(response([]))
+    context.mock.timers.reset()
+    await f.close()
+    await Promise.allSettled(requests)
+  }
 })
 
 test('dispose aborts noncooperative HTTP and Retry-After pacing before closing stores', async () => {
@@ -1148,7 +1242,7 @@ test('qualification reuses completed historical windows until the 5m or hourly b
   configuration.liquidity.volume24h.enabled = true
   configuration.liquidity.volumeStability.enabled = true
   const f = await fixture(configuration, discovery())
-  const calls: string[] = []
+  const reads: string[] = [], acquisitions: string[] = []
   try {
     isolateQualification(f.service)
     const asOf = Math.floor(now / fiveMinutes) * fiveMinutes, hourlyEnd = Math.floor(now / hour) * hour
@@ -1156,14 +1250,16 @@ test('qualification reuses completed historical windows until the 5m or hourly b
       ...Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 200_000 })),
       ...Array.from({ length: 24 }, (_, index) => ({ ...nativeCandle(hourlyEnd - (24 - index) * hour, '1H'), quoteVolume: 2_000_000 })),
     ])
-    f.service.history.ensurePrices = async (id: string, timeframe: string, from: number, through: number) => {
-      calls.push(timeframe)
-      return { rows: await f.store.candles({ instrument: id, timeframe, from, through }) }
+    const read = f.store.candles.bind(f.store)
+    f.store.candles = async (query, priority) => { reads.push(query.timeframe); return read(query, priority) }
+    f.service.history.ensurePrices = async (_id: string, timeframe: string) => {
+      acquisitions.push(timeframe)
+      throw new Error('Complete durable windows must be used before history acquisition.')
     }
     await f.service.refresh()
-    assert.deepEqual(calls.sort(), ['1H', '5m'])
+    assert.deepEqual(reads.sort(), ['1H', '5m'])
     await f.service.refresh()
-    assert.equal(calls.length, 2, 'The unchanged completed windows must not repeat historical preparation.')
+    assert.equal(reads.length, 2, 'The unchanged completed windows must not repeat local historical reads.')
     assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
 
     now += fiveMinutes
@@ -1171,7 +1267,7 @@ test('qualification reuses completed historical windows until the 5m or hourly b
     assert.deepEqual(f.service.listRowsFor('15m'), [], 'The previous 24h window cannot qualify the next completed 5m boundary.')
     await f.store.appendCandles([{ ...rawCandle(asOf), quoteVolume: 200_000 }])
     await f.service.refresh()
-    assert.deepEqual(calls.sort(), ['1H', '5m', '5m'], 'Only the 5m window rolled over.')
+    assert.deepEqual(reads.sort(), ['1H', '5m', '5m'], 'Only the 5m window rolled over.')
     assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
 
     now = hourlyEnd + hour + 2 * 60_000
@@ -1181,7 +1277,8 @@ test('qualification reuses completed historical windows until the 5m or hourly b
       { ...nativeCandle(hourlyEnd, '1H'), quoteVolume: 2_000_000 },
     ])
     await f.service.refresh()
-    assert.deepEqual(calls.sort(), ['1H', '1H', '5m', '5m', '5m'], 'Both completed windows rolled over at the next hour.')
+    assert.deepEqual(reads.sort(), ['1H', '1H', '5m', '5m', '5m'], 'Both completed windows rolled over at the next hour.')
+    assert.deepEqual(acquisitions, [], 'Complete local history must never wait for a synchronization job.')
     assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
   } finally { await f.close() }
 })
@@ -1205,13 +1302,13 @@ test('durable volume corrections and replacements invalidate cached qualificatio
     assert.equal(f.service.metadata.getCatalogEntry(instId).observations.turnover, undefined, 'Restart must not restore the invalidated persisted qualification fact.')
     assert.equal(f.service.catalogChecks.get(instId).status, 'unknown')
     await f.service.refresh()
-    assert.equal(preparations, 2, 'A durable quote-volume correction must invalidate the cached 24h total.')
+    assert.equal(preparations, 0, 'A durable correction must recompute from complete local candles without history acquisition.')
     assert.equal(f.service.catalog.get(instId).result.turnover, 57_800_000)
     await f.service.replaceCandles({ instrument: instId, timeframe: '5m', from: timestamp, through: timestamp }, [{ ...rawCandle(timestamp), quoteVolume: 600_000 }])
     assert.deepEqual((await f.service.snapshot()).rows, [], 'A replacement must immediately hide the previous qualification before recomputation.')
     assert.equal(f.service.metadata.getCatalogEntry(instId).observations.turnover, undefined)
     await f.service.refresh()
-    assert.equal(preparations, 3, 'A replacement must invalidate the same cached qualification facts.')
+    assert.equal(preparations, 0, 'A replacement must recompute from complete local candles without history acquisition.')
     assert.equal(f.service.catalog.get(instId).result.turnover, 58_000_000)
   } finally { await f.close() }
 })
@@ -1243,7 +1340,7 @@ test('a historical correction during a live observation cannot restore the previ
     blockOI = true
     refresh = f.service.refresh()
     await waitFor(() => blocked)
-    assert.equal(preparations, 1, 'The pending check starts with the cached completed historical window.')
+    assert.equal(preparations, 0, 'The pending check starts with the cached completed historical window.')
     await f.service.persistCandles(instId, [{ ...rawCandle(timestamp), quoteVolume: 0 }])
     assert.deepEqual((await f.service.snapshot()).rows, [])
     release(); await refresh
@@ -1254,7 +1351,7 @@ test('a historical correction during a live observation cannot restore the previ
     blockOI = false
     await f.service.refresh()
     const recomputed = f.service.metadata.getCatalogEntry(instId)
-    assert.equal(preparations, 2)
+    assert.equal(preparations, 0, 'The corrected complete local range must not enqueue historical acquisition.')
     assert.equal(recomputed.status, 'failed')
     assert.equal(recomputed.result.turnover, 57_400_000)
     assert.deepEqual((await f.service.snapshot()).rows, [])
@@ -1271,9 +1368,10 @@ test('a historical correction after acquisition reads but before it returns cann
   try {
     isolateQualification(f.service)
     const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes, timestamp = asOf - fiveMinutes
-    await f.store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 200_000 })))
+    await f.store.appendCandles(Array.from({ length: 287 }, (_, index) => ({ ...rawCandle(asOf - (287 - index) * fiveMinutes), quoteVolume: 200_000 })))
     f.service.history.ensurePrices = async (id: string, timeframe: string, from: number, through: number) => {
       preparations += 1
+      await f.service.persistCandles(id, [{ ...rawCandle(from), quoteVolume: 200_000 }])
       const rows = await f.store.candles({ instrument: id, timeframe, from, through })
       readStarted = true
       await gate
@@ -1322,4 +1420,158 @@ test('a rejected contract restored with fresh instrument and liquidity observati
     assert.deepEqual(restored.observations.get(instId).openInterest, rejected.observations.openInterest)
     assert.deepEqual(restored.instrumentObservations.get(instId), rejected.instrumentObservation)
   } finally { await restored?.dispose(); await f.close() }
+})
+
+test('missing qualification history requests foreground acquisition after inspecting the local durable window', async () => {
+  const configuration = disabled()
+  configuration.liquidity.volume24h.enabled = true
+  configuration.liquidity.volumeStability.enabled = true
+  const f = await fixture(configuration, discovery())
+  const requests: Array<[string, string]> = []
+  try {
+    isolateQualification(f.service)
+    f.service.history.ensurePrices = async (id: string, timeframe: '5m' | '1H', from: number, through: number, priority: string) => {
+      requests.push([timeframe, priority])
+      const step = timeframe === '5m' ? fiveMinutes : hour
+      const records = Array.from({ length: (through - from) / step + 1 }, (_, index) => ({ ...nativeCandle(from + index * step, timeframe), quoteVolume: timeframe === '5m' ? 200_000 : 2_000_000 }))
+      await f.service.persistCandles(id, records)
+      return { rows: await f.store.candles({ instrument: id, timeframe, from, through }) }
+    }
+    await f.service.refresh()
+    assert.deepEqual(requests.sort(), [['1H', 'foreground'], ['5m', 'foreground']], 'Qualification cannot queue missing windows behind broad historical backfills.')
+    assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
+    assert.equal(f.service.catalog.get(instId).result.turnover, 57_600_000)
+  } finally { await f.close() }
+})
+
+test('a fifth candidate with complete local history qualifies while four earlier historical acquisitions are blocked', async () => {
+  const configuration = disabled(); configuration.liquidity.volume24h.enabled = true
+  const ids = ['AAA', 'BBB', 'CCC', 'DDD', 'EEE'].map(base => `${base}-USDT-SWAP`), availableID = ids[4]
+  const blocked = new Set<string>()
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const f = await fixture(configuration, async input => {
+    const url = new URL(String(input))
+    if (url.pathname.endsWith('/public/instruments')) return response(ids.map(id => ({ ...instrument, instId: id, ctValCcy: id.split('-')[0] })))
+    if (url.pathname.endsWith('/market/tickers')) return response(ids.map(id => ({ ...ticker, instId: id })))
+    throw new Error(`Unexpected ${url}`)
+  })
+  let refresh: Promise<void> | undefined
+  try {
+    isolateQualification(f.service)
+    const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
+    await f.store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), instrument: availableID, quoteVolume: 200_000 })))
+    f.service.history.ensurePrices = async (id: string) => {
+      assert.notEqual(id, availableID, 'The complete local candidate must not request history acquisition.')
+      blocked.add(id)
+      await gate
+      return { rows: [] }
+    }
+    refresh = f.service.refresh()
+    await waitFor(() => blocked.size === 4 && f.service.catalog.has(availableID))
+    const pending = await f.service.snapshot()
+    assert.deepEqual(pending.rows.map(row => row.instId), [availableID])
+    assert.equal(pending.catalogProgress.pending, 4, 'Only distinct candidate acquisitions still in progress count as pending.')
+    assert.equal(f.service.refreshing !== null, true)
+    release(); await refresh
+    const finished = await f.service.snapshot()
+    assert.equal(finished.catalogProgress.pending, 0)
+    assert.equal(finished.catalogProgress.unknown, 4)
+    assert.equal(finished.catalogProgress.verified, 1)
+  } finally { release(); await refresh; await f.close() }
+})
+
+test('renewal refreshes metadata and bulk tickers even when it starts with no qualified renewal targets', async () => {
+  let metadataRequests = 0, tickerRequests = 0
+  const f = await fixture(disabled(), async input => {
+    const url = new URL(String(input))
+    if (url.pathname.endsWith('/public/instruments')) { metadataRequests += 1; return response([instrument]) }
+    if (url.pathname.endsWith('/market/tickers')) { tickerRequests += 1; return response([ticker]) }
+    throw new Error(`Unexpected ${url}`)
+  })
+  try {
+    isolateQualification(f.service)
+    assert.equal(f.service.renewalTargets.size, 0)
+    await f.service.renewCatalog()
+    assert.deepEqual([metadataRequests, tickerRequests], [1, 1])
+    assert.ok(f.service.instrumentObservations.get(instId).expiresAt > Date.now())
+    assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
+    assert.equal((await f.service.snapshot()).catalogProgress.pending, 0)
+  } finally { await f.close() }
+})
+
+test('a completed unavailable check has no pending candidate while unrelated metadata renewal is blocked', async () => {
+  const configuration = disabled(); configuration.liquidity.openInterest.enabled = true
+  let blockMetadata = false, metadataBlocked = false
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const f = await fixture(configuration, async input => {
+    const url = new URL(String(input))
+    if (url.pathname.endsWith('/public/instruments')) {
+      if (blockMetadata) { metadataBlocked = true; await gate }
+      return response([instrument])
+    }
+    if (url.pathname.endsWith('/market/tickers')) return response([ticker])
+    if (url.pathname.endsWith('/public/open-interest')) return response([])
+    throw new Error(`Unexpected ${url}`)
+  })
+  let renewal: Promise<void> | undefined
+  try {
+    isolateQualification(f.service)
+    await f.service.refresh()
+    assert.equal(f.service.renewalTargets.size, 0)
+    const completed = await f.service.snapshot()
+    assert.equal(completed.catalogProgress.unknown, 1)
+    assert.equal(completed.catalogProgress.pending, 0)
+    blockMetadata = true
+    renewal = f.service.renewCatalog()
+    await waitFor(() => metadataBlocked)
+    const duringRenewal = await f.service.snapshot()
+    assert.equal(duringRenewal.loading, true)
+    assert.equal(duringRenewal.catalogProgress.unknown, 1)
+    assert.equal(duringRenewal.catalogProgress.pending, 0, 'Unknown observations must not masquerade as candidate work that is still running.')
+    assert.deepEqual(duringRenewal.rows, [])
+  } finally { release(); await renewal; await f.close() }
+})
+
+test('global renewal finishes and runs again while an earlier candidate historical acquisition remains blocked', async () => {
+  const configuration = disabled(); configuration.liquidity.volume24h.enabled = true
+  let metadataRequests = 0, historyBlocked = false, acquisitions = 0
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const f = await fixture(configuration, async input => {
+    const url = new URL(String(input))
+    if (url.pathname.endsWith('/public/instruments')) { metadataRequests += 1; return response([instrument]) }
+    if (url.pathname.endsWith('/market/tickers')) return response([ticker])
+    throw new Error(`Unexpected ${url}`)
+  })
+  try {
+    isolateQualification(f.service)
+    const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes, timestamp = asOf - fiveMinutes
+    await f.store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 200_000 })))
+    await f.service.refresh()
+    await f.service.replaceCandles({ instrument: instId, timeframe: '5m', from: timestamp, through: timestamp }, [])
+    f.service.history.ensurePrices = async (id: string, timeframe: string, from: number, through: number) => {
+      acquisitions += 1
+      historyBlocked = true
+      await gate
+      await f.service.persistCandles(id, [{ ...rawCandle(timestamp), quoteVolume: 200_000 }])
+      return { rows: await f.store.candles({ instrument: id, timeframe, from, through }) }
+    }
+    const discoveriesBefore = metadataRequests
+    const first = f.service.renewCatalog()
+    await waitFor(() => historyBlocked)
+    const firstFinished = await Promise.race([first.then(() => true), new Promise<boolean>(resolve => setImmediate(() => resolve(false)))])
+    assert.equal(firstFinished, true, 'Global lease renewal must not wait for a candidate historical acquisition.')
+    assert.equal(f.service.renewing, null)
+    assert.equal((await f.service.snapshot()).catalogProgress.pending, 1)
+    await f.service.renewCatalog()
+    assert.equal(f.service.renewing, null)
+    assert.equal(metadataRequests, discoveriesBefore + 2, 'A second global metadata renewal must run while the first acquisition is pending.')
+    assert.equal(acquisitions, 1, 'Independent global renewal must still deduplicate the same candidate acquisition.')
+    release()
+    await waitFor(() => f.service.candidateTasks.size === 0)
+    assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
+    assert.equal((await f.service.snapshot()).catalogProgress.pending, 0)
+  } finally { release(); await f.close() }
 })

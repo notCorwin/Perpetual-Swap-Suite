@@ -84,8 +84,10 @@ export type HistorySyncOptions = {
   onProgress?(task: HistoryTask): MaybePromise<void>
   onError?(error: unknown, task?: HistoryTask): MaybePromise<void>
   now?: () => number
-  /** Maximum simultaneous tasks, with at most one per source; defaults to 1. Foreground work takes priority for up to eight pages per source, then one bounded background page runs; equal-priority peers rotate after each page. */
+  /** Maximum simultaneous tasks across all sources; defaults to 1. Foreground work precedes queued background pages; equal-priority peers rotate after each page. */
   maxConcurrentTasks?: number
+  /** Foreground concurrency per source; defaults to 1. Background pages remain limited to one per source. Overlapping ranges on the same instrument/timeframe/source serialize. */
+  maxConcurrentPerSource?: number | Record<string, number>
   /** Global minimum spacing between source inspect/fetch starts, including concurrent sources; defaults to 125. */
   minRequestIntervalMS?: number
   retryBaseMS?: number

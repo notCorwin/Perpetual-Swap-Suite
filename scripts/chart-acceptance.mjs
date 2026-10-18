@@ -230,6 +230,8 @@ export function separateSourceMaintenance(sourceRequests, fixture) {
     const parameters = request.parameters ?? {}
     const after = Number(parameters.after), limit = Number(parameters.limit)
     const intervalMS = fixture.series[parameters.bar]?.intervalMS
+    const latestCandles = request.path === '/market/candles' && limit === 2 && Number.isFinite(intervalMS)
+      && parameters.after == null && parameters.before == null
     // Ranking refreshes read four recent 5m closes. Exclude them only when
     // their entire requested window is provably later than the chart fixture.
     const currentCandles = request.path === '/market/history-candles' && limit === 4
@@ -237,7 +239,7 @@ export function separateSourceMaintenance(sourceRequests, fixture) {
       && after > fixture.end + maxIntervalMS && after - limit * intervalMS > fixture.end
     const begin = Number(parameters.begin), end = Number(parameters.end)
     const currentRange = Number.isFinite(begin) && Number.isFinite(end) && end >= begin && begin > fixture.end
-    if (currentCandles || currentRange) currentMaintenance.push(request)
+    if (latestCandles || currentCandles || currentRange) currentMaintenance.push(request)
     else historical.push(request)
   }
   // Unknown paths, unbounded requests, and ambiguous ranges remain subject to
