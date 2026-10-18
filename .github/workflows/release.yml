@@ -40,6 +40,7 @@ jobs:
       - name: Build renderer
         run: node_modules/.bin/vite build
       - name: Test Electron with isolated fixtures
+        shell: bash
         run: |
           mkdir -p artifacts
           node --test-concurrency=1 --test tests/e2e/*.e2e.mjs 2>&1 | tee artifacts/electron-e2e.log
