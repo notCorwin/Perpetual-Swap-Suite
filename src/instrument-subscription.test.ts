@@ -80,6 +80,7 @@ test('subscribe-before-snapshot reconciliation merges buffered listing, delistin
     await began.promise
     f.service.receiveInstruments([{ instId: btc, ctVal: '0.02' }], context)
     f.service.receiveInstruments([{ instId: eth, state: 'expired' }, instrument(sol)], context)
+    assert.equal(f.service.candidateIDs, null, 'Buffered deltas cannot be mistaken for a complete initial universe.')
     held.resolve([instrument(), instrument(eth)])
     await synchronizing
     await settle(f.service)

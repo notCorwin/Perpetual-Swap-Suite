@@ -217,6 +217,7 @@ export class MarketService {
     this.renewing = null
     this.instruments = new Map()
     this.instrumentDefinitions = new Map()
+    this.instrumentSnapshotReady = false
     this.instrumentDeltas = new Map()
     this.instrumentEventVersion = 0
     this.instrumentStream = null
@@ -1521,6 +1522,7 @@ export class MarketService {
       definitions.set(instId, { ...(definitions.get(instId) ?? {}), ...delta.value })
     }
     if (![...definitions.values()].some(eligibleInstrument)) throw new Error('No supported swap instrument metadata could be verified. Retrying automatically.')
+    this.instrumentSnapshotReady = true
     return this.installInstruments(definitions)
   }
 
@@ -1575,12 +1577,15 @@ export class MarketService {
     const definitions = new Map(this.instrumentDefinitions), changed = []
     for (const value of records) {
       if (typeof value?.instId !== 'string' || !/^[A-Z0-9]+-[A-Z0-9]+-SWAP$/.test(value.instId)) continue
-      const merged = { ...(definitions.get(value.instId) ?? {}), ...value }
+      const merged = { ...(definitions.get(value.instId) ?? this.instrumentDeltas.get(value.instId)?.value ?? {}), ...value }
       definitions.set(value.instId, merged)
       this.instrumentDeltas.set(value.instId, { version: ++this.instrumentEventVersion, value: merged })
       changed.push(value.instId)
     }
     if (!changed.length) return
+    // An incremental message cannot define the complete initial universe.
+    // Keep it buffered until the first authoritative REST snapshot arrives.
+    if (!this.instrumentSnapshotReady) return
     this.installInstruments(definitions, new Set(changed))
     for (const instId of changed) this.queueStreamQualification(instId)
     this.touchList()
