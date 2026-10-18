@@ -80,6 +80,8 @@ export class PreparedChartStore {
   private universe = new Set<string>()
   private focusKey: string | null = null
   private readonly byteSizes = new WeakMap<object, number>()
+  private seriesBytes = 0
+  private latestBytes = 0
   private readonly listeners = new Set<() => void>()
   private readonly maxSeries: number
   private readonly maxBarsPerSeries: number
@@ -94,6 +96,30 @@ export class PreparedChartStore {
     this.maxSeries = maxSeries
     this.maxBarsPerSeries = maxBarsPerSeries
     this.maxWindowsPerSeries = maxWindowsPerSeries
+  }
+
+  private setSeriesEntry(key: string, entry: Series | null) {
+    this.seriesBytes += (entry?.byteSize ?? 0) - (this.series.get(key)?.byteSize ?? 0)
+    if (entry) this.series.set(key, entry)
+    else this.series.delete(key)
+  }
+
+  private setLatestFrame(key: string, value: { meta: PreparedChartMeta; window: ReadyChartWindow } | null) {
+    const previous = this.latestFrames.get(key)
+    if (previous?.window.bars !== value?.window.bars) {
+      this.latestBytes += (value ? this.sizeOfBars(value.window.bars) : 0) - (previous ? this.sizeOfBars(previous.window.bars) : 0)
+    }
+    if (value) this.latestFrames.set(key, value)
+    else this.latestFrames.delete(key)
+  }
+
+  private setSeriesBar(entry: Series, hour: number, value: CachedBar | null) {
+    const previous = entry.bars.get(hour)
+    const delta = (value ? this.sizeOfBar(value.bar) : 0) - (previous ? this.sizeOfBar(previous.bar) : 0)
+    entry.byteSize += delta
+    this.seriesBytes += delta
+    if (value) entry.bars.set(hour, value)
+    else entry.bars.delete(hour)
   }
 
   private access(key: string): Series | undefined {
@@ -127,12 +153,13 @@ export class PreparedChartStore {
   setUniverse(instIds: readonly string[], _timeframe: RadarTimeframe, focusInstId?: string) {
     if (focusInstId) this.focusKey = keyFor(focusInstId, _timeframe)
     this.universe = new Set([...instIds, ...(focusInstId ? [focusInstId] : [])].flatMap(instId => RADAR_TIMEFRAMES.map(({ value }) => keyFor(instId, value))))
-    for (const key of this.latestFrames.keys()) if (!this.universe.has(key)) this.latestFrames.delete(key)
+    for (const key of this.latestFrames.keys()) if (!this.universe.has(key)) this.setLatestFrame(key, null)
     for (const [key, entry] of this.series) {
       if (!this.universe.has(key) || this.latestFrame(key) || entry.meta.latestEnd === null) continue
       const window = this.seriesWindow(entry, entry.meta.latestEnd)
-      if (window) this.latestFrames.set(key, { meta: entry.meta, window })
+      if (window) this.setLatestFrame(key, { meta: entry.meta, window })
     }
+    this.trimBytes()
   }
 
   private acceptGeneration(key: string, generation: number) {
@@ -166,7 +193,7 @@ export class PreparedChartStore {
       entry.liveBar = liveBar
       entry.liveRevision = update.revision
     }
-    this.latestFrames.set(key, { meta, window })
+    this.setLatestFrame(key, { meta, window })
     if (window !== previous.window || meta !== previous.meta) for (const listener of this.listeners) listener()
     return true
   }
@@ -207,7 +234,7 @@ export class PreparedChartStore {
       && Number.isSafeInteger(live.hour) && live.hour % intervalMS === 0
       ? sameBar(previous?.window.liveBar, live) ? previous!.window.liveBar : Object.freeze({ ...live }) : undefined
     const window = readyWindow(meta, bars, endHour, liveBar, previous?.window)
-    this.latestFrames.set(key, { meta, window })
+    this.setLatestFrame(key, { meta, window })
     this.trimBytes()
     if (window !== previous?.window || revision !== previous?.meta.revision) for (const listener of this.listeners) listener()
     return true
@@ -224,17 +251,17 @@ export class PreparedChartStore {
     const newGeneration = !entry || entry.meta.generation !== generation
     if (newGeneration) {
       entry = {
-        epoch: ++this.nextEpoch, byteSize: 0,
+        epoch: ++this.nextEpoch, byteSize: entry?.byteSize ?? (latest ? this.sizeOfBars(latest.window.bars) : 0),
         meta: Object.freeze({ ...(entry?.meta ?? latest?.meta), key, instId, timeframe, intervalMS, generation, revision, latestEnd: entry?.meta.latestEnd ?? latest?.meta.latestEnd ?? null, oldestHour: entry?.meta.oldestHour ?? latest?.meta.oldestHour ?? null, historyExhausted: entry?.meta.historyExhausted ?? latest?.meta.historyExhausted ?? false, error: '' }),
         bars: entry?.bars ?? new Map(latest?.window.bars.map(bar => [bar.hour, { bar, revision: latest.meta.revision, generation: latest.meta.generation }]) ?? []),
         hours: entry?.hours ?? latest?.window.bars.map(bar => bar.hour) ?? [],
         windows: latest?.meta.generation === generation ? new Map([[latest.window.endHour, latest.window]]) : new Map(), boundaries: null,
         liveBar: latest?.meta.generation === generation ? latest.window.liveBar : undefined, liveRevision: latest?.meta.generation === generation ? latest.meta.revision : -1,
       }
-      this.series.set(key, entry)
+      this.setSeriesEntry(key, entry)
       while (this.series.size > this.maxSeries) {
         const evicted = this.series.keys().next().value!
-        this.series.delete(evicted)
+        this.setSeriesEntry(evicted, null)
       }
     }
     const current = entry!
@@ -253,7 +280,7 @@ export class PreparedChartStore {
         continue
       }
       if (!previous) addedHours.push(bar.hour)
-      current.bars.set(bar.hour, { bar, revision, generation })
+      this.setSeriesBar(current, bar.hour, { bar, revision, generation })
       changed = true
     }
     if (addedHours.length) {
@@ -292,7 +319,7 @@ export class PreparedChartStore {
       const removable = current.hours.filter(hour => hour < first || hour > anchor)
         .sort((left, right) => Math.abs(right - anchor) - Math.abs(left - anchor) || left - right)
       const excess = current.bars.size - this.maxBarsPerSeries
-      for (const hour of removable.slice(0, excess)) current.bars.delete(hour)
+      for (const hour of removable.slice(0, excess)) this.setSeriesBar(current, hour, null)
       current.hours = current.hours.filter(hour => current.bars.has(hour))
       current.windows.clear()
       current.boundaries = null
@@ -306,40 +333,40 @@ export class PreparedChartStore {
         ? Math.max(previous?.window.endHour ?? -Infinity, response.latestEnd) : previous?.window.endHour
       const window = end === undefined ? null : this.seriesWindow(current, end)
       if (window) {
-        this.latestFrames.set(key, { meta: Object.freeze({ ...current.meta, latestEnd: window.endHour }), window })
+        this.setLatestFrame(key, { meta: Object.freeze({ ...current.meta, latestEnd: window.endHour }), window })
         if (window !== previous?.window) changed = true
       }
     }
-    current.byteSize = this.sizeOfBars([...current.bars.values()].map(value => value.bar))
     this.trimBytes()
     if (changed) for (const listener of this.listeners) listener()
     return true
   }
 
+  private sizeOfBar(bar: PreparedChartBar): number {
+    const cached = this.byteSizes.get(bar)
+    if (cached !== undefined) return cached
+    const bytes = JSON.stringify(bar).length * 2
+    this.byteSizes.set(bar, bytes)
+    return bytes
+  }
+
   private sizeOfBars(bars: readonly PreparedChartBar[]): number {
     const cached = this.byteSizes.get(bars)
     if (cached !== undefined) return cached
-    const size = bars.reduce((sum, bar) => {
-      let bytes = this.byteSizes.get(bar)
-      if (bytes === undefined) { bytes = JSON.stringify(bar).length * 2; this.byteSizes.set(bar, bytes) }
-      return sum + bytes
-    }, 0)
-    this.byteSizes.set(bars, size)
-    return size
+    const bytes = bars.reduce((sum, bar) => sum + this.sizeOfBar(bar), 0)
+    this.byteSizes.set(bars, bytes)
+    return bytes
   }
 
   private trimBytes() {
-    let bytes = [...this.series.values()].reduce((sum, entry) => sum + entry.byteSize, 0)
-      + [...this.latestFrames.values()].reduce((sum, entry) => sum + this.sizeOfBars(entry.window.bars), 0)
-    for (const [key, entry] of this.series) {
-      if (bytes <= this.maxBytes) break
-      if (key === this.focusKey) continue
-      bytes -= entry.byteSize; this.series.delete(key)
+    if (this.seriesBytes + this.latestBytes <= this.maxBytes) return
+    for (const key of this.series.keys()) {
+      if (this.seriesBytes + this.latestBytes <= this.maxBytes) break
+      if (key !== this.focusKey) this.setSeriesEntry(key, null)
     }
-    for (const [key, entry] of this.latestFrames) {
-      if (bytes <= this.maxBytes) break
-      if (key === this.focusKey) continue
-      bytes -= this.sizeOfBars(entry.window.bars); this.latestFrames.delete(key)
+    for (const key of this.latestFrames.keys()) {
+      if (this.seriesBytes + this.latestBytes <= this.maxBytes) break
+      if (key !== this.focusKey) this.setLatestFrame(key, null)
     }
   }
 
