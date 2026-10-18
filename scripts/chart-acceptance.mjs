@@ -456,8 +456,8 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
       'Historical work must start and finish during the ongoing wheel gesture, without waiting for scroll end.')
     assert.ok(first.completedAt - first.startedAt >= historicalDelayMS,
       'The measured historical request must include the full artificial network latency.')
-    const firstMissingEnd = fixture.end - initialHistoryBars * fixture.intervalMS
-    assert.equal(first.endHour, firstMissingEnd, 'Prefetch must extend the adjacent complete viewport rather than skip a 96-candle page.')
+    const firstMissingViewportEnd = fixture.end - (initialHistoryBars - 95) * fixture.intervalMS
+    assert.equal(first.endHour, firstMissingViewportEnd, 'Prefetch must extend the adjacent complete viewport rather than skip a 96-candle page.')
     assert.ok(first.historyBars > 96, 'A latency-covered prefetch must prepare a bulk range.')
     const inputsAtRequest = inputs.filter(input => input <= requestTime).length
     const runwayAtRequest = initialHistoryBars - 96 - inputsAtRequest * candlesPerFrame
@@ -477,4 +477,77 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
       ...latency, ...paint, commits: paint.commits.length,
     }
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
+}
+
+// A genuinely absent SQLite range, rather than a capped renderer response.
+// Keep farther source pages and OI/Taker unresolved while the nearest complete
+// price/indicator viewport crosses every production boundary and reaches SVG.
+export async function measureNativeColdBoundary(electron, page, { timeframe = '15m' } = {}) {
+  const probe = value => electron.evaluate((_, value) => globalThis.__marketBackend.probe(value), value)
+  const fixture = await probe({ action: 'coldBoundaryInstall', timeframe })
+  let paintStarted = false
+  try {
+    const before = await electron.evaluate((_, fixture) => globalThis.__marketBackend.request({ e2e: {
+      action: 'readCandles', instrument: fixture.instId, timeframe: fixture.timeframe,
+      from: fixture.targetEnd - 95 * fixture.intervalMS, through: fixture.targetEnd,
+    } }), fixture)
+    assert.equal(before.length, 95, 'The first boundary viewport must contain exactly one never-downloaded candle.')
+    assert.ok(before.every(row => row.timestamp > fixture.firstMissingEnd), 'The missing boundary candle must not already exist in SQLite.')
+    await openChart(page, fixture)
+    await startPaintProbe(page, fixture, { verifyIndicatorValues: false })
+    paintStarted = true
+    const approachDistance = fixture.initialHistoryBars - 96 - 256
+    const approachInputs = await wheelBurst(page, { deltaY: approachDistance * 12 })
+    await waitForRendered(page, fixture, timeframe, fixture.end - approachDistance * fixture.intervalMS)
+    const deadline = Date.now() + 10_000
+    let sources
+    do {
+      sources = await probe({ action: 'coldBoundaryRead' })
+      if (sources.requests.some(request => request.source === 'candles' && request.completedAt !== null)
+        && sources.requests.some(request => request.source === 'candles' && request.held && request.completedAt === null)
+        && sources.requests.some(request => request.source !== 'candles' && request.held && request.completedAt === null)) break
+      assert.ok(Date.now() < deadline, `Native prefetch did not publish its nearest page before the held reserve: ${JSON.stringify(sources)}`)
+      await new Promise(resolve => setTimeout(resolve, 20))
+    } while (true)
+    const inputs = await wheelBurst(page, { deltaY: (fixture.targetDistance - approachDistance) * 12 })
+    await waitForRendered(page, fixture, timeframe, fixture.targetEnd)
+    const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24']
+    await page.waitForFunction(({ targetEnd, firstMissingEnd, indicatorFields }) => {
+      const snapshot = document.querySelector('[data-chart-inst]')?.__chartSnapshot
+      const missing = snapshot?.bars.find(bar => bar.hour === firstMissingEnd)
+      return snapshot?.endHour === targetEnd && snapshot.bars.length === 96
+        && snapshot.bars.every(bar => indicatorFields.every(field => Number.isFinite(bar[field])))
+        && missing && missing.oi === null && missing.buy === null && missing.sell === null
+    }, { targetEnd: fixture.targetEnd, firstMissingEnd: fixture.firstMissingEnd, indicatorFields }, { timeout: 10_000 })
+    const latency = await measurePaintLatency(page, { inputs, targets: [fixture.targetEnd] })
+    assert.ok(latency.latestInputToPaintMS < 100, `The freshly acquired nearest viewport took ${latency.latestInputToPaintMS} ms after its boundary gesture.`)
+    sources = await probe({ action: 'coldBoundaryRead' })
+    const nearest = sources.requests.find(request => request.source === 'candles' && request.through === fixture.firstMissingEnd)
+    assert.ok(nearest?.completedAt !== null && nearest?.completedAt !== undefined,
+      `The first download must end at the adjacent missing viewport, without a skipped 96-candle page: ${JSON.stringify(sources.requests)}`)
+    assert.equal(Number(nearest.parameters.limit), 205, 'Nearest preparation must reuse the saved 95-candle suffix and fetch only its missing 205-candle warmup prefix.')
+    assert.ok(nearest.completedAt - nearest.startedAt >= fixture.sourceDelayMS, 'The real source page must include the configured network latency.')
+    const heldReserve = sources.requests.filter(request => request.source === 'candles' && request.held && request.completedAt === null)
+    const heldStatistics = sources.requests.filter(request => request.source !== 'candles' && request.held && request.completedAt === null)
+    assert.ok(sources.holding && heldReserve.length && heldStatistics.length,
+      'The target must paint while both the farther price reserve and optional statistics remain unresolved.')
+    const keys = sources.requests.map(request => `${request.source}:${request.from}:${request.through}`)
+    assert.equal(new Set(keys).size, keys.length, `Concurrent consumers must reuse the same native source page: ${JSON.stringify(sources.requests)}`)
+    const paint = await finishPaintProbe(page)
+    paintStarted = false
+    assertCompletePaints(paint)
+    const timeOrigin = await page.evaluate(() => performance.timeOrigin)
+    const targetPaint = paint.commits.find(commit => commit.end === fixture.targetEnd && commit.presentedAt !== null)
+    const nativePageToPaintMS = Number((timeOrigin + targetPaint.presentedAt - nearest.completedAt).toFixed(3))
+    assert.ok(nativePageToPaintMS < 1_000, `The nearest native page waited ${nativePageToPaintMS} ms to paint despite its complete prices and indicator warmup.`)
+    return { timeframe, initialHistoryBars: fixture.initialHistoryBars, sourceDelayMS: fixture.sourceDelayMS,
+      initiallyMissingCandles: 96 - before.length, nearestSourceCandles: Number(nearest.parameters.limit),
+      nativePageToPaintMS,
+      nativeSourceRequests: sources.requests.length, heldReservePages: heldReserve.length, heldStatisticsPages: heldStatistics.length,
+      targetPaintedBeforeReserveAndStatistics: true, duplicateSourcePages: 0,
+      ...latency, ...paint, commits: paint.commits.length, approachInput: approachInputs[0] }
+  } finally {
+    if (paintStarted) await finishPaintProbe(page)
+    await probe({ action: 'coldBoundaryRemove' })
+  }
 }

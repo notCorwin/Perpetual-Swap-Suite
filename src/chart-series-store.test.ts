@@ -231,13 +231,13 @@ test('ready boundaries represent complete ranges and prefetch fills gaps without
   store.ingest(response([...bars(0, 100), ...bars(200, 100)]))
   const first = store.window(instId, '1H', 99 * hour)
   assert.deepEqual(store.readyBoundaries(instId, '1H'), [
-    { firstEnd: 0, lastEnd: 99 * hour }, { firstEnd: 200 * hour, lastEnd: 299 * hour },
+    { firstEnd: 95 * hour, lastEnd: 99 * hour }, { firstEnd: 295 * hour, lastEnd: 299 * hour },
   ])
   assert.equal(store.hasRange(instId, '1H', 0, 99 * hour), true)
   assert.equal(store.hasRange(instId, '1H', 0, 200 * hour), false)
   assert.equal(store.window(instId, '1H', 180 * hour), null)
   store.ingest(response(bars(100, 100), { revision: 2 }))
-  assert.deepEqual(store.readyBoundaries(instId, '1H'), [{ firstEnd: 0, lastEnd: 299 * hour }])
+  assert.deepEqual(store.readyBoundaries(instId, '1H'), [{ firstEnd: 95 * hour, lastEnd: 299 * hour }])
   assert.equal(store.window(instId, '1H', 99 * hour), first)
   assert.ok(store.window(instId, '1H', 180 * hour))
 })
@@ -254,6 +254,14 @@ test('instrument and native timeframe caches have independent generations and hi
   assert.equal(store.oldestHour(instId, '1H'), 0)
   assert.equal(store.ingest(response(bars(0, 96), { timeframe: '5m', intervalMS: hour })), false)
   assert.ok(store.window('ETH-USDT-SWAP', '1H'))
+})
+
+test('only a proven listing floor admits short viewports into ready boundaries', () => {
+  const store = new PreparedChartStore()
+  store.ingest(response(bars(100, 12)))
+  assert.deepEqual(store.readyBoundaries(instId, '1H'), [])
+  store.ingest(response(bars(100, 12), { revision: 2, historyExhausted: true }))
+  assert.deepEqual(store.readyBoundaries(instId, '1H'), [{ firstEnd: 100 * hour, lastEnd: 111 * hour }], 'A new floor proof invalidates the cached boundaries even when prices are identical.')
 })
 
 test('a new source-unavailability annotation replaces only the affected immutable window', () => {
@@ -475,13 +483,13 @@ test('price generation resets retain bounded independent statistics without cert
   assert.ok(latest.bars.every(value => value.ema === null && value.oi === 1_000 && value.buy === 20 && value.sell === 30))
   assert.equal(store.window(instId, '1H', 95 * hour), null, 'Old-generation prices cannot establish a new-generation window.')
   assert.equal(store.hasRange(instId, '1H', 0, 95 * hour), false)
-  assert.deepEqual(store.readyBoundaries(instId, '1H'), [{ firstEnd: 104 * hour, lastEnd: 199 * hour }])
+  assert.deepEqual(store.readyBoundaries(instId, '1H'), [{ firstEnd: 199 * hour, lastEnd: 199 * hour }])
   store.ingest(response(raw(bars(0, 96)), { generation: 2, revision: 3, endHour: 95 * hour, latestEnd: 199 * hour }))
   const historical = store.window(instId, '1H', 95 * hour)!
   assert.equal(historical.generation, 2); assert.equal(historical.indicatorState, 'loading')
   assert.ok(historical.bars.every(value => value.ema === null && !value.indicatorsObserved && value.oi === 1_000 && value.buy === 20 && value.sell === 30))
   assert.equal(historical.oiState, 'ready'); assert.equal(historical.takerState, 'ready')
-  assert.deepEqual(store.readyBoundaries(instId, '1H'), [{ firstEnd: 0, lastEnd: 95 * hour }, { firstEnd: 104 * hour, lastEnd: 199 * hour }], 'Promoting an old statistics carrier also updates price-range provenance.')
+  assert.deepEqual(store.readyBoundaries(instId, '1H'), [{ firstEnd: 95 * hour, lastEnd: 95 * hour }, { firstEnd: 199 * hour, lastEnd: 199 * hour }], 'Promoting an old statistics carrier also updates price-range provenance.')
   assert.ok(previous.bars.every(value => value.ema === 100 && value.indicatorsObserved), 'An immutable prior presentation is retained separately from new-generation validity.')
   assert.equal(store.size, 1, 'Statistical provenance reuses the bounded series instead of a second cache.')
 })

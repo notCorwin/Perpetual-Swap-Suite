@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { assertCompletePaints, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, measureLatencyCoveredPrefetch, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
+import { assertCompletePaints, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, measureLatencyCoveredPrefetch, measureNativeColdBoundary, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
 
 const root = new URL('../..', import.meta.url).pathname
 const userData = await mkdtemp(join(tmpdir(), 'perp-radar-e2e-'))
@@ -347,8 +347,15 @@ test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while specu
 })
 
 test('historical prefetch covers 1500 ms of network latency before the cold boundary during continuous wheel input', async () => {
-  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  // The preceding warm case releases an intentionally held preparation task.
+  // A distinct durable series keeps that task's completion outside this case.
+  const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark', instId: 'PREFETCH-USDT-SWAP' }))
   await measureLatencyCoveredPrefetch(electron, page, fixture)
+})
+
+test('a never-downloaded native price page paints before the farther reserve and optional statistics finish', async context => {
+  const report = await measureNativeColdBoundary(electron, page)
+  context.diagnostic(`Native cold boundary: ${JSON.stringify(report)}`)
 })
 
 test('mature local indicators and statistics stay drawn from the first scroll through prefetch, push and scroll end', async context => {

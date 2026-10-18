@@ -23,6 +23,8 @@ export type ChartTransport = {
 const targetKey = (target: ChartTarget) => `${target.timeframe}:${target.instId}:${target.end ?? 'latest'}`
 const sameSeries = (left: ChartTarget, right: ChartTarget) => left.instId === right.instId && left.timeframe === right.timeframe
 const seriesKey = (target: Pick<ChartTarget, 'instId' | 'timeframe'>) => `${target.timeframe}:${target.instId}`
+// The backend retains 1,536 candles, including 256 newer than its cursor.
+const HISTORY_RESERVE = 1_280
 
 /** Local navigation never waits for provider work. Each remote lane keeps only the latest intent. */
 export class ChartController {
@@ -171,6 +173,13 @@ export class ChartController {
     for (const listener of this.listeners) listener()
   }
 
+  private completePrices(window: ReadyChartWindow) {
+    const meta = this.store.snapshotMeta(window.instId, window.timeframe)
+    const first = Math.max(window.endHour - 95 * window.intervalMS, meta?.historyExhausted ? meta.oldestHour ?? -Infinity : -Infinity)
+    return window.bars.length === (window.endHour - first) / window.intervalMS + 1
+      && window.bars.every((bar, index) => bar.hour === first + index * window.intervalMS)
+  }
+
   private commit(requested = this.view.requested) {
     if (!requested) return false
     const meta = this.store.snapshotMeta(requested.instId, requested.timeframe)
@@ -181,9 +190,7 @@ export class ChartController {
     }
     const ready = this.store.window(target.instId, target.timeframe, target.end)
     const previous = this.view.presented
-    const expectedFirst = ready ? Math.max(ready.endHour - 95 * ready.intervalMS, meta?.historyExhausted ? meta.oldestHour ?? -Infinity : -Infinity) : null
-    const completeHistoricalPrices = ready && expectedFirst !== null && ready.bars.length === (ready.endHour - expectedFirst) / ready.intervalMS + 1
-      && ready.bars.every((bar, index) => bar.hour === expectedFirst + index * ready.intervalMS)
+    const completeHistoricalPrices = ready && this.completePrices(ready)
     const calculatingHistory = target.end !== null && ready
       && (ready.indicatorState === 'loading' || !completeHistoricalPrices)
       && previous?.instId === target.instId && previous.timeframe === target.timeframe
@@ -218,13 +225,15 @@ export class ChartController {
     // with a conservative network budget before the first response is measured.
     const speed = performance.now() - this.scrollAt <= 500 ? this.scrollSpeed : 0
     const runway = Math.min(3_072, Math.max(384, Math.ceil(speed * Math.max(3_000, this.preparationMS * 2))))
-    const batch = Math.min(4_000, Math.max(768, runway * 2))
+    const batch = Math.min(HISTORY_RESERVE - 95, Math.max(768, runway * 2))
     for (const direction of [this.direction, -this.direction]) {
       const distance = direction < 0 ? window.endHour - range.firstEnd : range.lastEnd - window.endHour
       if (distance > runway * interval) continue
       const end = direction < 0 ? range.firstEnd - interval : Math.min(meta?.latestEnd ?? window.endHour, range.lastEnd + batch * interval)
-      if (end < earliest || end > (meta?.latestEnd ?? window.endHour) || this.store.window(target.instId, target.timeframe, end)) continue
-      return { ...target, end, historyBars: direction < 0 ? Math.min(4_096, batch + 95) : Math.min(4_096, (end - range.lastEnd) / interval + 95) }
+      if (end < earliest || end > (meta?.latestEnd ?? window.endHour)) continue
+      const existing = this.store.window(target.instId, target.timeframe, end)
+      if (existing && this.completePrices(existing)) continue
+      return { ...target, end, historyBars: direction < 0 ? batch + 95 : (end - range.lastEnd) / interval + 95 }
     }
     return null
   }
@@ -252,7 +261,11 @@ export class ChartController {
     }
     const target = this.view.requested
     const key = seriesKey(target)
-    const ready = this.store.window(target.instId, target.timeframe, target.end)
+    const window = this.store.window(target.instId, target.timeframe, target.end)
+    // A resident end candle does not prove the preceding viewport exists.
+    // Missing prices still need source repair while calculated prices can wait
+    // independently for their indicator worker.
+    const ready = window && (target.end === null || this.completePrices(window)) ? window : null
     if (target.end === null && this.localCheckedKey !== targetKey(target)) {
       if (!this.localTargets.has(key) && this.localTargets.size < 2) void this.hydrateLocal(target)
       if (!ready) return

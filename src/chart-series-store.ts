@@ -273,6 +273,7 @@ export class PreparedChartStore {
       error: newestMeta ? response.error : current.meta.error,
     }
     if (Object.keys(nextMeta).some(field => nextMeta[field as keyof PreparedChartMeta] !== current.meta[field as keyof PreparedChartMeta])) {
+      if (nextMeta.oldestHour !== current.meta.oldestHour || nextMeta.historyExhausted !== current.meta.historyExhausted) current.boundaries = null
       current.meta = Object.freeze(nextMeta)
       changed = true
     }
@@ -393,7 +394,14 @@ export class PreparedChartStore {
     let start = 0
     for (let index = 1; index <= hours.length; index += 1) {
       if (index < hours.length && hours[index] === hours[index - 1] + entry.meta.intervalMS) continue
-      if (index > start) runs.push(Object.freeze({ firstEnd: hours[start], lastEnd: hours[index - 1] }))
+      if (index > start) {
+        const first = hours[start], lastEnd = hours[index - 1]
+        // Navigation consumes a whole viewport. Counting the first 95 candles
+        // as available runway postpones acquisition until the chart is stuck.
+        const firstEnd = entry.meta.historyExhausted && first === entry.meta.oldestHour
+          ? first : first + (WINDOW_BARS - 1) * entry.meta.intervalMS
+        if (firstEnd <= lastEnd) runs.push(Object.freeze({ firstEnd, lastEnd }))
+      }
       start = index
     }
     entry.boundaries = Object.freeze(runs)
