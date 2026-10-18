@@ -182,34 +182,6 @@ test('forming-only subscription deltas retain the exact frozen completed window 
   assert.equal(next.liveBar?.close, 101, 'Clearing a newer overlay preserves the prior immutable view.')
 })
 
-test('forming and freshness updates reuse completed availability until a correction or generation replaces its inputs', () => {
-  const store = new PreparedChartStore()
-  store.setUniverse([instId], '1H')
-  const values = bars(104, 96)
-  values[0] = bar(104, hour, { oi: null, oiObserved: true, indicatorsObserved: false, ema: null,
-    takerObserved: false, statisticsObserved: false, statisticsSources: 1, buy: null, sell: null })
-  store.ingestLatest(response(values))
-  const completed = store.window(instId, '1H')!
-  assert.deepEqual([completed.oiState, completed.takerState, completed.indicatorState], ['unavailable', 'loading', 'loading'])
-  store.ingestLive({ type: 'live', instId, timeframe: '1H', generation: 1, revision: 2, endHour: 199 * hour,
-    liveBar: { ...bar(200), confirmed: false }, priceObservedAt: 12_345, realtimeState: 'live' })
-  const updated = store.window(instId, '1H')!
-  assert.equal(updated.bars, completed.bars)
-  assert.deepEqual([updated.oiState, updated.takerState, updated.indicatorState], ['unavailable', 'loading', 'loading'])
-  assert.equal(updated.priceObservedAt, 12_345)
-  assert.equal(updated.realtimeState, 'live')
-  store.ingestLatest(response(bars(104, 96), { revision: 3 }))
-  const corrected = store.window(instId, '1H')!
-  assert.notEqual(corrected.bars, completed.bars)
-  assert.deepEqual([corrected.oiState, corrected.takerState, corrected.indicatorState], ['ready', 'ready', 'ready'])
-  store.ingestLatest(response(values, { generation: 2, revision: 1 }))
-  const regenerated = store.window(instId, '1H')!
-  assert.equal(regenerated.generation, 2)
-  assert.equal(regenerated.oiState, 'unavailable')
-  assert.equal(regenerated.indicatorState, 'loading')
-  assert.deepEqual([completed.oiState, completed.takerState, completed.indicatorState], ['unavailable', 'loading', 'loading'])
-})
-
 test('forming deltas require an existing exact generation and completed end and reject stale or malformed input', () => {
   const store = new PreparedChartStore()
   store.setUniverse([instId], '1H')
@@ -345,32 +317,6 @@ test('series LRU honors metadata and window reads while evicted snapshots stay i
   assert.equal(store.window(sol, '1H'), null, 'Reading the BTC window must promote its series before the revisit.')
   assert.ok(store.window(eth, '1H')?.bars.every(value => value.close === 150))
   assert.ok(heldETH.bars.every(value => value.close === 101))
-})
-
-test('series pressure keeps the focused historical window while compact candidate and live updates continue', () => {
-  const others = ['ETH-USDT-SWAP', 'SOL-USDT-SWAP']
-  for (const maxSeries of [1, 2]) {
-    const store = new PreparedChartStore({ maxSeries })
-    store.setUniverse([instId, ...others], '1H', instId)
-    store.ingest(response(bars(0, 200)))
-    const historical = store.window(instId, '1H', 95 * hour)!
-    for (let revision = 2; revision <= 5; revision += 1) for (const other of others) {
-      store.ingest(response(bars(0, 200), { instId: other, revision }))
-      assert.equal(store.window(instId, '1H', 95 * hour), historical,
-        'Background source updates must not evict the selected historical series.')
-      assert.ok(store.size <= maxSeries)
-      assert.ok(store.window(other, '1H'), 'An evicted background history still exposes its compact latest frame.')
-    }
-    store.ingestLive({ type: 'live', instId, timeframe: '1H', generation: 1, revision: 6,
-      endHour: 199 * hour, liveBar: { ...bar(200), confirmed: false, close: 101.5 }, priceObservedAt: 12_345 })
-    assert.equal(store.window(instId, '1H', 95 * hour), historical)
-    assert.equal(store.window(instId, '1H')?.liveBar?.close, 101.5)
-    assert.equal(store.window(instId, '1H')?.priceObservedAt, 12_345)
-
-    const accounting = store as unknown as { seriesBytes: number; series: Map<string, { byteSize: number }> }
-    assert.equal(accounting.seriesBytes, [...accounting.series.values()].reduce((total, entry) => total + entry.byteSize, 0),
-      'An unselected incoming series that cannot stay resident must release its complete payload charge.')
-  }
 })
 
 test('window memo LRU remains bounded without changing complete cached values', () => {

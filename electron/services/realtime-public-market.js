@@ -385,7 +385,6 @@ class PublicMarketConnection {
     // prices, insert new ones, and remove a level when its size is zero.
     const book = action === 'snapshot' ? { bids: new Map(), asks: new Map(), seqId } : previous
     for (const side of ['bids', 'asks']) {
-      let inserted = false
       for (const level of raw[side]) {
         const price = Number(level?.[0]), size = Number(level?.[1])
         if (!Array.isArray(level) || level.length < 2 || typeof level[0] !== 'string' || !level[0].trim() || typeof level[1] !== 'string' || !level[1].trim() || !Number.isFinite(price) || price <= 0 || !Number.isFinite(size) || size < 0) {
@@ -394,17 +393,10 @@ class PublicMarketConnection {
           return null
         }
         if (size === 0) book[side].delete(price)
-        else {
-          inserted ||= !book[side].has(price)
-          book[side].set(price, [...level])
-        }
+        else book[side].set(price, [...level])
       }
-      // Map replacement/deletion preserves its existing price order. Only
-      // newly inserted price keys can require sorting and depth truncation.
-      if (inserted) {
-        const sorted = [...book[side]].sort((a, b) => side === 'bids' ? b[0] - a[0] : a[0] - b[0])
-        book[side] = new Map(sorted.slice(0, 400))
-      }
+      const sorted = [...book[side]].sort((a, b) => side === 'bids' ? b[0] - a[0] : a[0] - b[0])
+      book[side] = new Map(sorted.slice(0, 400))
     }
     book.seqId = seqId
     this.books.set(instId, book)

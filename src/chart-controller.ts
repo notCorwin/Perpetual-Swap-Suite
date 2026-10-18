@@ -69,11 +69,7 @@ export class ChartController {
     const ids = [...new Set(instIds.filter(Boolean))]
     const key = JSON.stringify(ids.toSorted())
     this.universeIds = ids
-    const requested = this.view.requested
-    // The first ranked contract is only a startup/replacement hint. Ordinary
-    // market snapshots cannot take the active historical chart's cache pin.
-    const focus = this.active && requested?.timeframe === timeframe && (ids.includes(requested.instId) || focusInstId === undefined)
-      ? requested.instId : focusInstId
+    const focus = focusInstId ?? (this.view.requested?.timeframe === timeframe ? this.view.requested.instId : undefined)
     this.store.setUniverse(ids, timeframe, focus)
     if (key === this.universeKey) return this.universeTask
     this.universeKey = key

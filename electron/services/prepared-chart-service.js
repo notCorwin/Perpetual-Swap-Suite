@@ -178,48 +178,29 @@ export class PreparedChartPipeline {
   }
   sourceStateChanged() { this.scheduleRefresh() }
 
-  confirmedWindow(state, end, now) {
-    const inputKey = `${end}:${state.sourceVersion}:${state.indicatorVersion ?? 0}:${state.generation}:${state.rows.size}:${state.indicators.size}`
-    state.barCaches ??= new Map()
-    const previous = state.barCaches.get(end)
-    let cached = previous
-    if (cached?.inputKey !== inputKey || now < cached.checkedAt || now >= cached.expiresAt) {
-      const rows = [...state.rows.values()].filter(row => end === null || row.timestamp <= end && row.timestamp >= end - (VISIBLE - 1) * state.intervalMS).sort((a, b) => a.timestamp - b.timestamp)
-      const oiState = sourceState(rows, 1), takerState = sourceState(rows, 2)
-      const key = `${inputKey}:${oiState}:${takerState}`
-      const bars = previous?.key === key ? previous.bars : rows.map(row => bar(row, state.indicators.get(row.timestamp)))
-      let expiresAt = Infinity
-      for (const row of rows) for (const bit of [1, 2]) {
-        if (!(statisticsMask(row) & bit) || (bit === 1 ? numeric(row.oi) : numeric(row.buy) && numeric(row.sell))) continue
-        const expiry = Number(row[bit === 1 ? 'statisticsOIExpiresAt' : 'statisticsTakerExpiresAt'])
-        if (expiry > now) expiresAt = Math.min(expiresAt, expiry)
-      }
-      cached = { inputKey, key, bars, checkedAt: now, expiresAt, oiState, takerState,
-        indicatorState: bars.length && bars.every(value => value.indicatorsObserved) ? bars.every(value => indicatorFields.every(field => numeric(value[field]))) ? 'ready' : 'unavailable' : 'loading' }
-    }
-    // A forming tick does not change confirmed inputs. Reuse the complete
-    // window summary until a source/indicator revision or actual lease expiry.
-    state.barCaches.delete(end); state.barCaches.set(end, cached)
-    while (state.barCaches.size > 4) state.barCaches.delete(state.barCaches.keys().next().value)
-    return cached
-  }
-
   frame(state, end = state.latestHour) {
     const latest = this.liveStates.get(state.key)
     if (end === state.latestHour && !state.rows.has(end) && latest !== state && latest?.rows.has(end)) return this.frame(latest, end)
-    const now = Date.now(), { bars, oiState, takerState, indicatorState } = this.confirmedWindow(state, end, now)
+    const rows = [...state.rows.values()].filter(row => end === null || row.timestamp <= end && row.timestamp >= end - (VISIBLE - 1) * state.intervalMS).sort((a, b) => a.timestamp - b.timestamp)
+    const cacheKey = `${end}:${state.sourceVersion}:${state.indicatorVersion ?? 0}:${state.generation}:${sourceState(rows, 1)}:${sourceState(rows, 2)}`
+    state.barCaches ??= new Map()
+    const cached = state.barCaches.get(end)
+    const bars = cached?.key === cacheKey ? cached.bars : rows.map(row => bar(row, state.indicators.get(row.timestamp)))
+    state.barCaches.delete(end); state.barCaches.set(end, { key: cacheKey, bars })
+    while (state.barCaches.size > 4) state.barCaches.delete(state.barCaches.keys().next().value)
     const live = state.live && (end === state.latestHour || end === null) ? state.live : null
     const core = latest?.indicatorState?.lastTimestamp === state.latestHour ? latest.indicatorState : state.indicatorState
     const liveBar = live ? bar(live, core?.lastTimestamp + state.intervalMS === live.timestamp ? projectIndicatorCandle(core, live) : undefined) : undefined
     const currentBoundary = Math.floor(Date.now() / state.intervalMS) * state.intervalMS
     const realtime = Boolean(liveBar && live.timestamp === currentBoundary && state.observedAt !== null && Date.now() - state.observedAt < 30_000 && this.streaming(state.instId, state.timeframe))
     return { instId: state.instId, timeframe: state.timeframe, intervalMS: state.intervalMS, endHour: end,
-      latestEnd: state.latestHour, oldestHour: state.floor, historyExhausted: state.floor !== null && (bars[0]?.hour ?? Infinity) <= state.floor,
+      latestEnd: state.latestHour, oldestHour: state.floor, historyExhausted: state.floor !== null && (rows[0]?.timestamp ?? Infinity) <= state.floor,
       generation: state.generation, revision: this.nextRevision = Math.max(this.nextRevision + 1, this.revision(state.instId)), bars,
-      priceState: bars.length || liveBar ? bars.length < VISIBLE ? 'partial' : 'ready' : 'loading', priceAsOf: live?.timestamp ?? bars.at(-1)?.hour ?? null,
+      priceState: bars.length || liveBar ? bars.length < VISIBLE ? 'partial' : 'ready' : 'loading', priceAsOf: live?.timestamp ?? rows.at(-1)?.timestamp ?? null,
       priceObservedAt: state.observedAt, realtimeState: realtime ? 'live' : 'stale',
       sourceVersions: { price: state.priceVersion, oi: state.oiVersion ?? 0, taker: state.takerVersion ?? 0 },
-      oiState, takerState, indicatorState,
+      oiState: sourceState(rows, 1), takerState: sourceState(rows, 2),
+      indicatorState: bars.length && bars.every(value => value.indicatorsObserved) ? bars.every(value => indicatorFields.every(field => numeric(value[field]))) ? 'ready' : 'unavailable' : 'loading',
       liveBar, error: '' }
   }
 

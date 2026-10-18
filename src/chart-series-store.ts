@@ -58,16 +58,14 @@ function preparedBar(bar: PreparedChartBar, intervalMS: number, previous?: Prepa
   return Object.freeze(next)
 }
 
-function readyWindow(meta: PreparedChartMeta, bars: readonly PreparedChartBar[], endHour: number, liveBar?: Bar, previous?: ReadyChartWindow): ReadyChartWindow {
-  const sameBars = previous && previous.generation === meta.generation && (bars === previous.bars || bars.length === previous.bars.length && bars.every((bar, index) => previous.bars[index] === bar))
+function readyWindow(meta: PreparedChartMeta, bars: PreparedChartBar[], endHour: number, liveBar?: Bar, previous?: ReadyChartWindow): ReadyChartWindow {
+  const sameBars = previous && previous.generation === meta.generation && bars.length === previous.bars.length && bars.every((bar, index) => previous.bars[index] === bar)
   if (sameBars && previous.liveBar === liveBar && previous.realtimeState === meta.realtimeState && previous.priceObservedAt === meta.priceObservedAt && JSON.stringify(previous.sourceVersions) === JSON.stringify(meta.sourceVersions)) return previous
   return Object.freeze({
     key: meta.key, instId: meta.instId, timeframe: meta.timeframe, intervalMS: meta.intervalMS, generation: meta.generation, bars: sameBars ? previous.bars : Object.freeze(bars), endHour,
-    // Availability belongs to the immutable completed observations. A forming
-    // candle or freshness update cannot invalidate those derived results.
-    oiState: sameBars ? previous.oiState : bars.length && bars.every(bar => bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)) ? bars.every(bar => finite(bar.oi)) ? 'ready' : 'unavailable' : 'loading',
-    takerState: sameBars ? previous.takerState : bars.length && bars.every(bar => bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2)) ? bars.every(bar => finite(bar.buy) && finite(bar.sell)) ? 'ready' : 'unavailable' : 'loading',
-    indicatorState: sameBars ? previous.indicatorState : bars.length && bars.every(bar => bar.indicatorsObserved) ? bars.every(bar => indicatorFields.every(field => finite(bar[field]))) ? 'ready' : 'unavailable' : 'loading',
+    oiState: bars.length && bars.every(bar => bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)) ? bars.every(bar => finite(bar.oi)) ? 'ready' : 'unavailable' : 'loading',
+    takerState: bars.length && bars.every(bar => bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2)) ? bars.every(bar => finite(bar.buy) && finite(bar.sell)) ? 'ready' : 'unavailable' : 'loading',
+    indicatorState: bars.length && bars.every(bar => bar.indicatorsObserved) ? bars.every(bar => indicatorFields.every(field => finite(bar[field]))) ? 'ready' : 'unavailable' : 'loading',
     ...(liveBar ? { liveBar } : {}), priceState: bars.length || liveBar ? bars.length < WINDOW_BARS ? 'partial' : 'ready' : 'loading', priceAsOf: meta.priceAsOf, priceObservedAt: meta.priceObservedAt, realtimeState: meta.realtimeState ?? 'stale', sourceVersions: meta.sourceVersions,
   })
 }
@@ -187,7 +185,7 @@ export class PreparedChartStore {
       || incoming.hour % previous.meta.intervalMS !== 0 || incoming.hour <= update.endHour)) return false
     const liveBar = incoming === null ? undefined : sameBar(previous.window.liveBar, incoming) ? previous.window.liveBar : Object.freeze({ ...incoming })
     const meta = Object.freeze({ ...previous.meta, revision: update.revision, priceObservedAt: update.priceObservedAt ?? previous.meta.priceObservedAt, priceAsOf: update.priceAsOf ?? previous.meta.priceAsOf, realtimeState: update.realtimeState ?? previous.meta.realtimeState, sourceVersions: update.sourceVersions ?? previous.meta.sourceVersions })
-    const window = readyWindow(meta, previous.window.bars, update.endHour, liveBar, previous.window)
+    const window = readyWindow(meta, [...previous.window.bars], update.endHour, liveBar, previous.window)
     const entry = this.series.get(key)
     if (entry) {
       entry.meta = Object.freeze({ ...entry.meta, revision: Math.max(entry.meta.revision, update.revision),
@@ -261,6 +259,10 @@ export class PreparedChartStore {
         liveBar: latest?.meta.generation === generation ? latest.window.liveBar : undefined, liveRevision: latest?.meta.generation === generation ? latest.meta.revision : -1,
       }
       this.setSeriesEntry(key, entry)
+      while (this.series.size > this.maxSeries) {
+        const evicted = this.series.keys().next().value!
+        this.setSeriesEntry(evicted, null)
+      }
     }
     const current = entry!
     let changed = newGeneration
@@ -334,13 +336,6 @@ export class PreparedChartStore {
         this.setLatestFrame(key, { meta: Object.freeze({ ...current.meta, latestEnd: window.endHour }), window })
         if (window !== previous?.window) changed = true
       }
-    }
-    // The selected history is a working set, not an expendable LRU candidate.
-    // Trim after ingestion so even a newly admitted background series can be
-    // evicted with its complete payload charge when only the focus fits.
-    for (const key of this.series.keys()) {
-      if (this.series.size <= this.maxSeries) break
-      if (key !== this.focusKey) this.setSeriesEntry(key, null)
     }
     this.trimBytes()
     if (changed) for (const listener of this.listeners) listener()

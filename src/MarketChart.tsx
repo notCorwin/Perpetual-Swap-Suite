@@ -188,10 +188,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   </>
 })
 
-type MarketChartProps = { instId: string; timeframe?: RadarTimeframe; onTimeframeChange?: (value: RadarTimeframe) => void; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }
-const sameOrder = (left: readonly string[], right: readonly string[]) => left === right || left.length === right.length && left.every((id, index) => right[index] === id)
-
-export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m', onTimeframeChange, listOrder, turnoverOrder, onSelect }: MarketChartProps) {
+export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, listOrder, turnoverOrder, onSelect }: { instId: string; timeframe?: RadarTimeframe; onTimeframeChange?: (value: RadarTimeframe) => void; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
   const view = useSyncExternalStore(chartController.subscribe, chartController.getSnapshot)
   useLayoutEffect(() => chartController.open(instId, timeframe), [instId, timeframe])
   const surface = view.presented
@@ -318,9 +315,7 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
       if (Math.abs(plotGeometry.x[index] - svgX)
         < Math.abs(plotGeometry.x[nearest] - svgX)) nearest = index
     }
-    const hour = bars[nearest].hour
-    setInspection(current => current?.instId === surface.instId && current.timeframe === surface.timeframe && current.hour === hour
-      ? current : { instId: surface.instId, timeframe: surface.timeframe, hour })
+    setInspection({ instId: surface.instId, timeframe: surface.timeframe, hour: bars[nearest].hour })
   }
   const captureChart = async () => {
     if (pending || !surface || !chartRef.current) return
@@ -396,6 +391,4 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
     {analysisOpen && <ChartAnalysisPanel instId={instId} timeframe={timeframeLabel(timeframe)} session={analysis} ready={!pending && bars.length > 0 && plotSize.width > 0 && captureStatus !== 'copying'} onNew={() => analyzeChart(analysis?.direction ?? 'long')} onClose={() => { chartAnalysis.stop(instId); setAnalysisOpen(false) }} />}
     </div>
   </section>
-}, (previous, next) => previous.instId === next.instId && previous.timeframe === next.timeframe
-  && previous.onTimeframeChange === next.onTimeframeChange && previous.onSelect === next.onSelect
-  && sameOrder(previous.listOrder, next.listOrder) && sameOrder(previous.turnoverOrder, next.turnoverOrder))
+}

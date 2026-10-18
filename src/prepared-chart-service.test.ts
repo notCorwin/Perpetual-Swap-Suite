@@ -160,13 +160,12 @@ test('statistics changes refresh only their observations without recalculating p
   } finally { await pipeline.dispose() }
 })
 
-test('warm forming ticks preserve exact confirmed state without rescanning, reading or replaying history', async context => {
+test('warm forming ticks preserve exact confirmed state and never read or replay history', async () => {
   const rows = source(400), { pipeline, store } = fixture(rows)
   try {
     await pipeline.local(instId, '15m'); await finishSeed(pipeline)
     const reads = store.queries.length, calculations = pipeline.nextCalculation, writes = store.checkpoints.length
     const completed = pipeline.cached(`${instId}:15m`).bars
-    const state = pipeline.series.get(`${instId}:15m`), scans = context.mock.method(state.rows, 'values')
     let last: any
     for (let index = 0; index < 40; index += 1) {
       last = { ...candle(end() + interval, 400), high: 150, close: 141 + index / 100, confirmed: false, volume: 100 + index }
@@ -177,64 +176,6 @@ test('warm forming ticks preserve exact confirmed state without rescanning, read
     assert.equal(frame.liveBar.close, last.close)
     for (const key of indicatorFields) assert.equal(frame.liveBar[key], oracle[key])
     assert.equal(store.queries.length, reads); assert.equal(pipeline.nextCalculation, calculations); assert.equal(store.checkpoints.length, writes)
-    assert.equal(scans.mock.callCount(), 0, 'Forming prices reuse the completed window and source/indicator status summaries.')
-  } finally { await pipeline.dispose() }
-})
-
-test('completed-window summaries expire at each source lease and recover after the clock moves backward', async context => {
-  let now = Math.floor(Date.now() / interval) * interval + 1000
-  context.mock.method(Date, 'now', () => now)
-  const rows: any[] = source(96).map(row => ({ ...row, oi: null, buy: null, sell: null, statisticsVersion: 11,
-    statisticsOIExpiresAt: now + 10_000, statisticsTakerExpiresAt: now + 20_000 }))
-  const { pipeline } = fixture(rows)
-  try {
-    const state = pipeline.state(instId, '15m')
-    state.rows = new Map(rows.map(row => [row.timestamp, row])); state.latestHour = rows.at(-1)!.timestamp; state.floor = rows[0].timestamp
-    const initial = pipeline.frame(state)
-    assert.equal(initial.oiState, 'unavailable'); assert.equal(initial.takerState, 'unavailable')
-    assert.equal(initial.historyExhausted, true); assert.equal(initial.priceAsOf, rows.at(-1)!.timestamp)
-    now += 9_999
-    assert.equal(pipeline.frame(state).bars, initial.bars)
-    now += 1
-    const expiredOI = pipeline.frame(state)
-    assert.equal(expiredOI.oiState, 'loading'); assert.equal(expiredOI.takerState, 'unavailable')
-    assert.equal(expiredOI.bars.at(-1).oiObserved, false); assert.equal(expiredOI.bars.at(-1).takerObserved, true)
-    now += 10_000
-    const expiredBoth = pipeline.frame(state)
-    assert.equal(expiredBoth.oiState, 'loading'); assert.equal(expiredBoth.takerState, 'loading')
-    assert.equal(expiredBoth.bars.at(-1).takerObserved, false)
-    now -= 20_000
-    const restored = pipeline.frame(state)
-    assert.equal(restored.oiState, 'unavailable'); assert.equal(restored.takerState, 'unavailable')
-    assert.deepEqual(restored.bars, initial.bars)
-  } finally { await pipeline.dispose() }
-})
-
-test('confirmed source corrections, indicator revisions, generations and retained ranges invalidate independent cached ends', async () => {
-  const rows = source(120), { pipeline } = fixture(rows)
-  try {
-    const state = pipeline.state(instId, '15m'), tail = rows.at(-1)!, olderEnd = rows.at(-25)!.timestamp
-    state.rows = new Map(rows.map(row => [row.timestamp, row])); state.latestHour = tail.timestamp; state.floor = rows[0].timestamp
-    const latest = pipeline.frame(state), historical = pipeline.frame(state, olderEnd)
-    assert.equal(latest.bars.length, 96); assert.equal(historical.bars.length, 96)
-    assert.equal(latest.historyExhausted, false); assert.equal(historical.historyExhausted, true)
-    assert.equal(pipeline.frame(state).bars, latest.bars); assert.equal(pipeline.frame(state, olderEnd).bars, historical.bars)
-
-    state.rows.set(tail.timestamp, { ...tail, oi: 7_000 }); state.sourceVersion++
-    const corrected = pipeline.frame(state)
-    assert.equal(corrected.bars.at(-1).oi, 7_000); assert.notEqual(corrected.bars, latest.bars)
-    assert.deepEqual(pipeline.frame(state, olderEnd).bars, historical.bars)
-
-    const calculated = buildIndicatorSeries(rows, interval).bars.at(-1)
-    state.indicators.set(tail.timestamp, { ...calculated, ema: 999 }); state.indicatorVersion = 1
-    assert.equal(pipeline.frame(state).bars.at(-1).ema, 999)
-    state.indicators.set(tail.timestamp, { ...calculated, ema: 888 }); state.generation++
-    assert.equal(pipeline.frame(state).bars.at(-1).ema, 888)
-
-    for (const row of rows.slice(0, 30)) state.rows.delete(row.timestamp)
-    const truncated = pipeline.frame(state, olderEnd)
-    assert.equal(truncated.bars.length, 66); assert.equal(truncated.bars[0].hour, rows[30].timestamp)
-    assert.equal(truncated.historyExhausted, false)
   } finally { await pipeline.dispose() }
 })
 
