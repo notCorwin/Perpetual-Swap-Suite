@@ -131,6 +131,8 @@ Existing Parquet is imported once in a separate Node child process, with durable
 
 Market writes update keyed rows rather than republishing a day's files. Price corrections invalidate affected later indicator checkpoints atomically; statistics updates have their own revisions and do not invalidate price calculations. Checkpoints retain exact recursive state, formula version, and a source revision. Derived renderer and chart projections are bounded memory caches; they can be rebuilt from SQLite. A cached projection alone does not establish that a price is live.
 
+Forming-candle updates reuse confirmed chart windows and their availability summaries until the source, indicators, generation, or observation lease changes. Price-only list updates retain layout observers and chart navigation state. Order-book replacements and deletions preserve the already sorted price levels; new prices still trigger sorting and depth truncation. These optimizations retain collection, publication, and persistence behavior.
+
 History days describes requested coverage, not automatic deletion of already downloaded facts. Listing dates, actual provider availability, available disk space, and initial synchronization time still limit obtainable history. Large archives use bounded reads and calculations; the supported day setting is not a measured capacity guarantee.
 
 On the first migration, recognized values from an existing `settings.json` are imported once into SQLite. Retired glass and blur preferences are not part of the new settings schema.
@@ -160,6 +162,7 @@ Install the locked dependencies with `npm ci`. The shadcn CLI is a development d
 | `npm run benchmark:chart` | Exercise chart scrolling, reversals, jumps, and delayed reads |
 | `npm run benchmark:instruments` | Exercise local chart admission, switching, and revisits |
 | `npm run benchmark:market` | Build and measure 287 contracts × 3 native periods with real SQLite/renderer work, synthetic intake, blocked statistics, and concurrent archive I/O; save `.build/resource-benchmark.json` |
+| `node scripts/energy-work-benchmark.mjs --source-root . --rounds 32 --report .build/energy-work.json` | Measure deterministic chart-frame CPU work; use the same script against another checkout and compare correctness digests before CPU results. Excludes setup and checks; does not measure whole-app energy. |
 | `PERPETUAL_SWAP_BENCHMARK_BACKGROUND=1 npm run benchmark:instruments` | Measure navigation while real synchronization and audit process an offline synthetic source |
 | `node scripts/workspace-visual-check.mjs` | Check light/dark, grayscale, scaling, and measured contrast after building |
 | `node scripts/benchmark-startup.mjs --app "/path/to/Perpetual Swap Suite.app"` | Measure three isolated process launches and process working sets |

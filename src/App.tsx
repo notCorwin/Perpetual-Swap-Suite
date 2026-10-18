@@ -170,6 +170,7 @@ function App() {
 
   const ranked = useMemo(() => [...rows].sort(compareRankingChange), [rows])
   const visible = useMemo(() => ranked.filter(row => row.instId.toLowerCase().includes(query.trim().toLowerCase())), [ranked, query])
+  const visibleIds = useMemo(() => visible.map(row => row.instId), [visible])
   const verifying = Boolean(catalog.loading) && qualificationPending(catalog.catalogProgress) || (!ready && !error)
   const awaitingObservations = Boolean(catalog.loading && catalog.catalogProgress && catalog.catalogProgress.completed === catalog.catalogProgress.total && catalog.catalogProgress.pending > 0)
   const verificationUnavailable = !verifying && (Boolean(error) || catalog.catalogSource === 'none' || (catalog.catalogProgress?.unknown ?? 0) > 0)
@@ -222,7 +223,7 @@ function App() {
         <Table className="table-fixed" data-market-count={visible.length} data-total-market-count={rows.length} aria-rowcount={visible.length + 1}>
           <colgroup><col className="w-[35%]" /><col className="w-[33%]" /><col className="w-[32%]" /></colgroup>
           <TableHeader className="sticky top-0 bg-background"><TableRow><TableHead>Contract</TableHead><TableHead className="text-right">Price</TableHead><TableHead className="text-right" aria-sort="descending" title="Sorted by absolute signed relative change, largest first">{preferences.rankingLookback}m change</TableHead></TableRow></TableHeader>
-          {visible.length ? <MarketRowsViewport ids={visible.map(row => row.instId)}>{index => <MarketRowView row={visible[index]} index={index} selected={visible[index].instId === selectedID} lookback={preferences.rankingLookback} onSelect={setSelected} />}</MarketRowsViewport> : <TableBody><TableRow><TableCell colSpan={3}>
+          {visible.length ? <MarketRowsViewport ids={visibleIds}>{index => <MarketRowView row={visible[index]} index={index} selected={visible[index].instId === selectedID} lookback={preferences.rankingLookback} onSelect={setSelected} />}</MarketRowsViewport> : <TableBody><TableRow><TableCell colSpan={3}>
             <Empty><EmptyHeader><EmptyTitle>{noSearchMatch ? 'No matching contracts' : emptyTitle}</EmptyTitle><EmptyDescription>{noSearchMatch ? 'Try another contract name.' : emptyDescription}</EmptyDescription></EmptyHeader></Empty>
           </TableCell></TableRow></TableBody>}
         </Table>

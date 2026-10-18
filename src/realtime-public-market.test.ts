@@ -158,6 +158,46 @@ test('book depth stays at 400 levels and equivalent numeric price spellings repl
   assert.deepEqual(f.books[1].bids[0], ['1000.0', '9', '0', '1'])
 })
 
+test('mixed dense book deltas preserve exact snapshot ordering, depth and callback isolation', async t => {
+  const f = fixture(), expected: PublicMarketBook[] = []
+  t.after(() => f.market.close())
+  const socket = await f.open(), reference = { bids: new Map<number, string[]>(), asks: new Map<number, string[]>() }
+  for (let index = 0; index < 80; index++) {
+    const snapshot = index % 27 === 0
+    const value = snapshot ? book(index + 1, -1,
+      Array.from({ length: 405 }, (_, offset) => level(1000 - offset)),
+      Array.from({ length: 405 }, (_, offset) => level(1001 + offset)))
+      : book(index + 1, index, [], [])
+    if (!snapshot) for (const side of ['bids', 'asks'] as const) {
+      const direction = side === 'bids' ? -1 : 1, start = side === 'bids' ? 1000 : 1001
+      // Existing-price replacements, deletions, insertions, numeric aliases,
+      // delete/reinsert in one event, and empty keepalives share one sequence.
+      if (index % 11 !== 0) {
+        const price = start + direction * (index * 19 % 400)
+        value[side] = [[price.toFixed(1), String(index + 1)], level(start + direction * (index * 7 % 400), 0)]
+        if (index % 3 === 0) value[side].push(level(start - direction * index / 10))
+        if (index % 5 === 0) value[side].push(level(price, 0), level(price, index + 2))
+      }
+    }
+    for (const side of ['bids', 'asks'] as const) {
+      if (snapshot) reference[side].clear()
+      for (const entry of value[side]) {
+        if (Number(entry[1]) === 0) reference[side].delete(Number(entry[0]))
+        else reference[side].set(Number(entry[0]), [...entry])
+      }
+      reference[side] = new Map([...reference[side]].sort((a, b) => side === 'bids' ? b[0] - a[0] : a[0] - b[0]).slice(0, 400))
+    }
+    expected.push({ bids: [...reference.bids.values()].map(entry => [...entry]), asks: [...reference.asks.values()].map(entry => [...entry]), ts: value.ts, seqId: value.seqId })
+    push(socket, 'books', [value], btc, snapshot ? 'snapshot' : 'update')
+  }
+  await f.market.whenIdle()
+  assert.deepEqual(f.books, expected)
+  f.books.at(-1)!.bids[0][1] = '999999'
+  push(socket, 'books', [book(81, 80, [], [])], btc, 'update')
+  await f.market.whenIdle()
+  assert.deepEqual(f.books.at(-1), { ...expected.at(-1), seqId: 81 }, 'A consumer cannot mutate the reconstructed native book through a callback snapshot.')
+})
+
 test('a missing initial snapshot, sequence gap, reset or invalid level forces a fresh connection', async t => {
   for (const invalid of [
     { initial: false, value: book(2, 1) },

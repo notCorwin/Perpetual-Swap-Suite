@@ -240,6 +240,65 @@ test('a healthy idle market list makes no periodic snapshot requests', async () 
     'Successful market reads must wait for a notification, action, or visibility change.')
 })
 
+test('price-only list updates retain geometry observers and changed ranking still updates chart navigation', async () => {
+  const chart = page.locator('[data-chart-inst="BETA-USDT-SWAP"]')
+  const plotMarkup = () => chart.locator('svg[data-rendered-inst]').evaluate(svg => {
+    const plot = svg.cloneNode(true)
+    plot.querySelectorAll('[data-chart-countdown]').forEach(element => element.remove())
+    return plot.outerHTML
+  })
+  const before = await plotMarkup()
+  await page.evaluate(() => {
+    const original = window.ResizeObserver
+    const counter = globalThis.__marketGeometryObservers = { original, observed: 0 }
+    window.ResizeObserver = class extends original {
+      observe(element, options) {
+        if (element.matches('[data-market-scroll]')) counter.observed += 1
+        super.observe(element, options)
+      }
+    }
+  })
+  try {
+    const chartReads = await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      const reads = state.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory || value.chartUniverse).length
+      state.rows = state.rows.map(row => row.instId === 'BETA-USDT-SWAP' ? { ...row, lastPrice: 123.456 } : row)
+      state.revision += 1; state.notify()
+      return reads
+    })
+    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '123.456')
+    assert.equal(await page.evaluate(() => globalThis.__marketGeometryObservers.observed), 0,
+      'An unchanged instrument order must retain its geometry observer rather than remeasure the table after every price update.')
+    assert.equal(await plotMarkup(), before, 'A list-price update preserves the displayed candle chart and its values independently of its normal countdown ticks.')
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory || value.chartUniverse).length), chartReads)
+
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.rows = state.rows.map(row => row.instId === 'ALPHA-USDT-SWAP' ? { ...row, rankingChange: 20 }
+        : row.instId === 'NULL-USDT-SWAP' ? { ...row, turnover24hUSDT: 90_000_000 } : row)
+      state.revision += 1; state.notify()
+    })
+    await page.waitForFunction(() => document.querySelector('[data-market-index]')?.getAttribute('aria-label') === 'View ALPHA-USDT-SWAP chart')
+    assert.ok(await page.evaluate(() => globalThis.__marketGeometryObservers.observed > 0), 'A changed instrument order invalidates geometry and focus mappings.')
+    await page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]').focus()
+    await page.keyboard.press('ArrowLeft')
+    await page.locator('svg[data-rendered-inst="ALPHA-USDT-SWAP"]').waitFor()
+    assert.equal(await selected().getAttribute('aria-label'), 'View ALPHA-USDT-SWAP chart')
+    await page.keyboard.press('ArrowRight')
+    await page.locator('svg[data-rendered-inst="NULL-USDT-SWAP"]').waitFor()
+    assert.equal(await selected().getAttribute('aria-label'), 'View NULL-USDT-SWAP chart')
+  } finally {
+    await page.evaluate(() => { window.ResizeObserver = globalThis.__marketGeometryObservers.original; delete globalThis.__marketGeometryObservers })
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.rows = state.initialRows; state.revision += 1; state.notify()
+    })
+    await page.waitForFunction(() => document.querySelector('[data-market-index]')?.getAttribute('aria-label') === 'View BETA-USDT-SWAP chart')
+    await page.locator('[aria-label="View BETA-USDT-SWAP chart"]').click()
+    await page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]').waitFor()
+  }
+})
+
 test('snapshot failures retry with bounded backoff and stop scheduling after recovery', async () => {
   try {
     await page.evaluate(() => {

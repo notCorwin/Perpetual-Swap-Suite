@@ -1,9 +1,13 @@
-import { Fragment, memo, useLayoutEffect, useRef, useState, type ReactNode } from "react"
+import { Fragment, memo, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { TableBody, TableCell, TableRow } from "@/components/ui/table"
 
 // The list is scaled as a complete macOS window layout. Measure in screen pixels
 // for scrolling, then convert spacer heights back into the original design size.
-export const MarketRowsViewport = memo(function MarketRowsViewport({ ids, children }: { ids: string[]; children: (index: number) => ReactNode }) {
+export const MarketRowsViewport = memo(function MarketRowsViewport({ ids: incomingIds, children }: { ids: string[]; children: (index: number) => ReactNode }) {
+  // Fresh market rows can carry the same order. Only membership/order changes
+  // invalidate these geometry and focus observers, not price-only updates.
+  const order = JSON.stringify(incomingIds)
+  const ids = useMemo<string[]>(() => JSON.parse(order), [order])
   const body = useRef<HTMLTableSectionElement>(null)
   const geometry = useRef({ top: 0, rowSize: 56, scroller: null as HTMLElement | null })
   const focusRequest = useRef<number | null>(null)
