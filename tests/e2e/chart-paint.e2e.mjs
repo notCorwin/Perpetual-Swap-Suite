@@ -44,11 +44,21 @@ test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while specu
   await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
   try {
     await openChart(page, fixture)
+    const warmedHistory = new Map()
     for (const timeframe of fixture.timeframes) {
       await selectTimeframe(page, timeframe)
       await waitForRendered(page, fixture, timeframe)
-      const residentHistoryBars = await waitForLocalHistory(electron, page, fixture, timeframe)
-      await electron.evaluate(() => { globalThis.__chartRequestProbe.holdSource = true; globalThis.__chartRequestProbe.holdLatest = true })
+      warmedHistory.set(timeframe, await waitForLocalHistory(electron, page, fixture, timeframe, { requireIndicators: true }))
+    }
+    context.diagnostic(`Resident history before stalls: ${JSON.stringify(Object.fromEntries(warmedHistory))}`)
+    await electron.evaluate(async () => {
+      globalThis.__chartRequestProbe.holdLatest = true
+      await globalThis.__marketBackend.probe({ action: 'sourceHold', hold: true })
+    })
+    for (const timeframe of fixture.timeframes) {
+      await selectTimeframe(page, timeframe)
+      await waitForRendered(page, fixture, timeframe)
+      const residentHistoryBars = warmedHistory.get(timeframe)
       const before = await readRequestProbe(electron)
       await startPaintProbe(page, fixture)
       const intervalMS = fixture.series[timeframe].intervalMS

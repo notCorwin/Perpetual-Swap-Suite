@@ -333,17 +333,34 @@ export async function measurePaintLatency(page, { inputs, targets }) {
   }, { inputs, targets })
 }
 
-export async function waitForLocalHistory(electron, page, fixture, timeframe = fixture.timeframe) {
+export async function waitForLocalHistory(electron, page, fixture, timeframe = fixture.timeframe, { requireIndicators = false } = {}) {
   await wheelBurst(page, { deltaY: 12 })
   const deadline = Date.now() + 20_000
-  let resident = 0
+  const intervalMS = fixture.series[timeframe].intervalMS, warmEnd = fixture.end - intervalMS
+  let resident = 0, historyFrame
+  const calculatedReserve = () => historyFrame && historyFrame.bars >= resident && historyFrame.calculated === historyFrame.bars
+    && historyFrame.first <= warmEnd - 95 * intervalMS && historyFrame.end >= warmEnd
   while (Date.now() < deadline) {
     const requests = await readRequestProbe(electron)
     resident = requests.historyResponses.filter(response => response.timeframe === timeframe).at(-1)?.bars ?? 0
-    if (resident > 96) break
+    historyFrame = requests.historyFrames[timeframe]
+    if (resident > 96 && (!requireIndicators || calculatedReserve())) break
     await new Promise(resolve => setTimeout(resolve, 20))
   }
   assert.ok(resident > 96 && resident <= 1536, `History hydration must return a bounded price reserve: ${resident}`)
+  if (requireIndicators) {
+    assert.ok(calculatedReserve(), `The resident ${timeframe} reserve must finish canonical indicator preparation: ${JSON.stringify(historyFrame)}`)
+    // Keep the historical target active until both the calculated reserve and
+    // its real viewport are ready. Returning to latest clears history publishing.
+    await page.waitForFunction(({ instId, timeframe, end }) => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`), snapshot = chart?.__chartSnapshot
+      const bars = chart?.__chartRenderedBars ?? snapshot?.bars
+      const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24']
+      return snapshot?.instId === instId && snapshot.timeframe === timeframe && snapshot.endHour === end
+        && snapshot.indicatorState === 'ready' && chart.dataset.chartLoading === 'false' && bars?.length === 96
+        && bars.every(bar => bar.indicatorsObserved && fields.every(field => Number.isFinite(bar[field])))
+    }, { instId: fixture.instId, timeframe, end: warmEnd }, { timeout: Math.max(1, deadline - Date.now()) })
+  }
   await page.evaluate(async () => { for (let frame = 0; frame < 2; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
   await wheelBurst(page, { deltaY: -12 })
   await waitForRendered(page, fixture, timeframe)
@@ -394,9 +411,19 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
     const probe = {
       original, contents, originalSend, calls: [], active: 0, maxActive: 0,
       historicalActive: 0, maxHistoricalActive: 0,
-      historyCalls: [], historyResponses: [], transferredHistoryBars: 0, transferredWindowBars: 0,
-      sourceCalls: 0, sourceRequests: [], holdSource: false, holdLatest: false, latestHeld: false,
+      historyCalls: [], historyResponses: [], historyFrames: new Map(), transferredHistoryBars: 0, transferredWindowBars: 0,
+      sourceCalls: 0, sourceRequests: [], holdLatest: false, latestHeld: false,
       held: false, callsAtHold: null, release: null,
+    }
+    const rememberHistory = response => {
+      if (response?.instId !== instId || !['5m', '15m', '1H'].includes(response.timeframe) || !Array.isArray(response.bars) || response.bars.length <= 96) return
+      const previous = probe.historyFrames.get(response.timeframe)
+      if (previous && (previous.generation > response.generation || previous.generation === response.generation && previous.revision > response.revision)) return
+      probe.historyFrames.set(response.timeframe, {
+        bars: response.bars.length, calculated: response.bars.filter(bar => bar.indicatorsObserved).length,
+        first: response.bars[0].hour, end: response.bars.at(-1).hour, endHour: response.endHour,
+        generation: response.generation, revision: response.revision,
+      })
     }
     // Model a durable range that has not reached the renderer yet. Every
     // compact/local ingress observes the same cutoff, including pushed data,
@@ -407,7 +434,7 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
       return { ...response, bars: response.bars.filter(bar => bar.hour >= first) }
     }
     contents.send = function (channel, ...args) {
-      if (channel === 'radar:chart-prepared') args[0] = initialRange(args[0])
+      if (channel === 'radar:chart-prepared') { args[0] = initialRange(args[0]); rememberHistory(args[0]) }
       return originalSend.call(this, channel, ...args)
     }
     const released = new Promise(resolve => { probe.release = resolve })
@@ -419,6 +446,7 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
         const bars = response?.bars.length ?? 0
         probe.transferredHistoryBars += bars
         probe.historyResponses.push({ ...value.chartHistory, bars })
+        rememberHistory(response)
         return response
       }
       if (value.chartWindow?.instId !== instId) {
@@ -447,7 +475,9 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
         if (historical && historicalDelayMS > 0) await new Promise(resolve => setTimeout(resolve, historicalDelayMS))
         const response = await original(event, value)
         probe.transferredWindowBars += response?.bars.length ?? 0
-        return historical && !capHistoricalWindows ? response : initialRange(response)
+        const result = historical && !capHistoricalWindows ? response : initialRange(response)
+        if (historical) rememberHistory(result)
+        return result
       } finally {
         call.completedAt = Date.now()
         probe.active -= 1
@@ -469,7 +499,7 @@ export async function readRequestProbe(electron) {
     return {
       calls: probe.calls, active: probe.active, maxActive: probe.maxActive,
       historicalActive: probe.historicalActive, maxHistoricalActive: probe.maxHistoricalActive,
-      historyCalls: probe.historyCalls, historyResponses: probe.historyResponses,
+      historyCalls: probe.historyCalls, historyResponses: probe.historyResponses, historyFrames: Object.fromEntries(probe.historyFrames),
       transferredHistoryBars: probe.transferredHistoryBars, transferredWindowBars: probe.transferredWindowBars,
       transferredBars: probe.transferredHistoryBars + probe.transferredWindowBars,
       sourceCalls: sourceRequests.length, sourceRequests, held: probe.held, latestHeld: probe.latestHeld, callsAtHold: probe.callsAtHold,

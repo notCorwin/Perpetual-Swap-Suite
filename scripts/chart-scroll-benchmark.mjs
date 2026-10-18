@@ -32,17 +32,27 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
   try {
     await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
     await openChart(page, fixture)
+    const warmedHistory = new Map()
     for (const timeframe of fixture.timeframes) {
       await selectTimeframe(page, timeframe)
       await waitForRendered(page, fixture, timeframe)
-      const residentHistoryBars = await waitForLocalHistory(electron, page, fixture, timeframe)
-      await electron.evaluate(async () => { globalThis.__chartRequestProbe.holdLatest = true; await globalThis.__marketBackend.probe({ action: 'sourceHold', hold: true }) })
+      warmedHistory.set(timeframe, await waitForLocalHistory(electron, page, fixture, timeframe, { requireIndicators: true }))
+    }
+    await electron.evaluate(async () => {
+      globalThis.__chartRequestProbe.holdLatest = true
+      await globalThis.__marketBackend.probe({ action: 'sourceHold', hold: true })
+    })
+    for (const timeframe of fixture.timeframes) {
+      await selectTimeframe(page, timeframe)
+      await waitForRendered(page, fixture, timeframe)
+      const residentHistoryBars = warmedHistory.get(timeframe)
       const beforeScrolling = await readRequestProbe(electron)
       await startPaintProbe(page, fixture)
       const intervalMS = fixture.series[timeframe].intervalMS
       const phases = []
       let distance = 0
       const sweep = async (name, options, candles) => {
+        assert.ok(distance + candles <= residentHistoryBars - 96, 'A warm phase must stay within complete resident viewports.')
         const startingDistance = distance
         const inputs = await wheelBurst(page, options)
         distance += candles
@@ -58,7 +68,7 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
       await sweep('resident', { frames: 18, eventsPerFrame: 3, deltaY: 12 }, 54)
       await sweep('high-velocity', { frames: 12, eventsPerFrame: 32, deltaY: 24 }, 768)
       await sweep('reversal', { frames: 6, eventsPerFrame: 32, deltaY: -24 }, -384)
-      await sweep('one-frame-1200-candle-jump', { deltaY: 14_400 }, 1_200)
+      await sweep('one-frame-600-candle-jump', { deltaY: 7_200 }, 600)
       await sweep('horizontal-reversal', { deltaX: 2_400, deltaY: 0 }, -200)
       await sweep('line-mode', { deltaY: -9, deltaMode: 1 }, -12)
       const paint = await finishPaintProbe(page)
