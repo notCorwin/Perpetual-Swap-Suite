@@ -477,7 +477,7 @@ test('a confirmed candle requests its exact statistics slot while subsequent for
     f.push(OKX_BUSINESS_WEBSOCKET_URL, value.instId, 'candle5m', [raw(closed, 101, 1, true), raw(now, 102, 1)])
     await f.idle()
     assert.equal(calls.length, 1)
-    assert.deepEqual(calls[0].slice(0, 5), [value.instId, '5m', closed, closed, 'foreground'])
+    assert.deepEqual(calls[0].slice(0, 5), [value.instId, '5m', closed, closed, 'continuity'])
     assert.ok(calls[0][5] instanceof AbortSignal)
     assert.equal(finished, false)
     assert.equal(f.service.liveCandles.get(`${value.instId}:5m`).close, 102)

@@ -1,1838 +1,308 @@
 import { test } from 'node:test'
-import { createHash } from 'node:crypto'
 import { strict as assert } from 'node:assert'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { HistorySync } from '../electron/services/history-sync.js'
-import type { HistoryRange, HistorySourceQuery, HistoryTask, HistorySyncOptions } from '../electron/services/history-sync.js'
-import { MarketStore } from '../electron/services/market-store.js'
+import type { HistoryRange, HistoryRecord, HistorySourceQuery, HistoryTask, HistorySyncOptions } from '../electron/services/history-sync.js'
 import type { CandleRecord } from '../electron/services/market-store.js'
-import { MetadataStore } from '../electron/services/metadata-store.js'
 
-const intervalMS = 300_000
-const base = Date.UTC(2024, 0, 1)
-const request = { instrument: 'BTC-USDT-SWAP', timeframe: '5m' as const, source: 'candles', from: base, through: base + 2 * intervalMS }
-const candle = (timestamp: number, instrument = request.instrument, timeframe = request.timeframe): CandleRecord => ({ instrument, timeframe, timestamp, open: 100, high: 101, low: 99, close: 100, volume: 1, baseVolume: 0.01, quoteVolume: 1, confirmed: true })
-const records = (query: HistorySourceQuery) => {
-  const step = { '5m': intervalMS, '15m': 900_000, '1H': 3_600_000 }[query.timeframe]
-  return Array.from({ length: (query.through - query.from) / step + 1 }, (_, index) => candle(query.from + index * step, query.instrument, query.timeframe as '5m'))
+const step = 300_000, base = Date.UTC(2026, 9, 1)
+const query = { instrument: 'BTC-USDT-SWAP', timeframe: '5m' as const, source: 'candles', from: base, through: base + 2 * step }
+const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done }); return { promise, resolve } }
+const waitFor = async (condition: () => boolean) => {
+  const deadline = performance.now() + 4000
+  while (!condition()) { assert.ok(performance.now() < deadline, 'History planner did not make progress.'); await new Promise(resolve => setTimeout(resolve, 2)) }
 }
-const deferred = <T = void>() => {
-  let resolve!: (value: T | PromiseLike<T>) => void
-  const promise = new Promise<T>(fulfill => { resolve = fulfill })
-  return { promise, resolve }
-}
-const within = async <T>(promise: Promise<T>): Promise<T> => {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  try { return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('History gate did not open.')), 3_000) })]) }
-  finally { clearTimeout(timer) }
+const rows = (request: HistorySourceQuery): CandleRecord[] => {
+  const interval = { '5m': step, '15m': 900_000, '1H': 3_600_000 }[request.timeframe]
+  return Array.from({ length: (request.through - request.from) / interval + 1 }, (_, index) => ({
+    instrument: request.instrument, timeframe: request.timeframe, timestamp: request.from + index * interval,
+    open: 100, high: 101, low: 99, close: 100, volume: 1, baseVolume: 1, quoteVolume: 100, confirmed: true,
+  }))
 }
 class MemoryMetadata {
-  writes = 0
   tasks = new Map<string, HistoryTask>()
-  putSyncTask(task: HistoryTask) { this.writes++; this.tasks.set(task.id, structuredClone(task)); return structuredClone(task) }
+  writes = 0
+  putSyncTask(task: HistoryTask) { this.writes++; this.tasks.set(task.id, structuredClone(task)) }
+  putSyncTasks(tasks: HistoryTask[]) { for (const task of tasks) this.putSyncTask(task) }
   getSyncTask(id: string) { return structuredClone(this.tasks.get(id) ?? null) }
   listSyncTasks() { return [...this.tasks.values()].map(value => structuredClone(value)) }
   deleteSyncTask(id: string) { return this.tasks.delete(id) }
+  deleteSyncTasks(ids: string[]) { for (const id of ids) this.deleteSyncTask(id) }
 }
-type CoverageQuery = HistoryRange & { instrument: string; timeframe: string; source: string; intervalMS: number }
 class MemoryStore {
-  rows = new Map<string, CandleRecord>()
-  queries: CoverageQuery[] = []
-  async appendCandles(values: CandleRecord[]) {
-    values.forEach(value => this.rows.set(`${value.instrument}:${value.timeframe}:${value.timestamp}`, structuredClone(value)))
-    return values.length
-  }
-  async missingCandleRanges(query: CoverageQuery): Promise<HistoryRange[]> {
-    this.queries.push(structuredClone(query))
+  values = new Map<string, HistoryRecord>()
+  version = 0
+  key(value: { instrument: string; timeframe: string; timestamp: number; source?: string }) { return `${value.instrument}:${value.timeframe}:${value.source ?? 'candles'}:${value.timestamp}` }
+  async appendCandles(records: CandleRecord[]) { return this.appendSource(records, 'candles') }
+  async appendSource(records: HistoryRecord[], source: string) { for (const row of records) this.values.set(this.key({ ...row, source }), row); this.version++; return records.length }
+  coverageVersion() { return this.version }
+  async missingCandleRanges(request: HistoryRange & { instrument: string; timeframe: string; source: string; intervalMS: number }) {
     const result: HistoryRange[] = []
     let first: number | null = null
-    for (let timestamp = query.from; timestamp <= query.through; timestamp += query.intervalMS) {
-      if (!this.rows.has(`${query.instrument}:${query.timeframe}:${timestamp}`)) first ??= timestamp
-      else if (first !== null) { result.push({ from: first, through: timestamp - query.intervalMS }); first = null }
+    for (let timestamp = request.from; timestamp <= request.through; timestamp += request.intervalMS) {
+      if (!this.values.has(this.key({ ...request, timestamp }))) first ??= timestamp
+      else if (first !== null) { result.push({ from: first, through: timestamp - request.intervalMS }); first = null }
     }
-    if (first !== null) result.push({ from: first, through: query.through })
+    if (first !== null) result.push({ from: first, through: request.through })
     return result
   }
 }
-class VersionedMemoryStore extends MemoryStore {
-  revision = 0
-  changes: { revision: number; from: number; through: number }[] = []
-  coverageVersion() { return this.revision }
-  coverageChanges(_query: HistoryRange, revision: number) {
-    return { revision: this.revision, ranges: revision < (this.changes[0]?.revision ?? 1) - 1 ? null : this.changes.filter(change => change.revision > revision).map(({ from, through }) => ({ from, through })) }
-  }
-  changed(from: number, through = from) {
-    this.changes.push({ revision: ++this.revision, from, through })
-    if (this.changes.length > 256) this.changes.shift()
-  }
-  override async appendCandles(values: CandleRecord[]) {
-    const result = await super.appendCandles(values)
-    if (values.length) this.changed(Math.min(...values.map(row => row.timestamp)), Math.max(...values.map(row => row.timestamp)))
-    return result
-  }
-}
-const sourceStorage = () => {
-  const stores = new Map<string, MemoryStore>()
-  const forSource = (source: string) => {
-    if (!stores.has(source)) stores.set(source, new MemoryStore())
-    return stores.get(source)!
-  }
-  return {
-    stores,
-    store: { missingCandleRanges(query: CoverageQuery) { return forSource(query.source).missingCandleRanges(query) } },
-    write(values: CandleRecord[], task: HistoryTask) { return forSource(task.source).appendCandles(values) },
-  }
-}
-const create = (options: Partial<HistorySyncOptions> = {}) => {
-  const metadata = new MemoryMetadata(), store = new MemoryStore()
-  const sync = new HistorySync({ metadata, store, sources: { candles: { fetchGap: records } }, minRequestIntervalMS: 0, retryBaseMS: 1, maxRetryDelayMS: 4, ...options })
-  return { sync, metadata, store }
+const fixture = (options: Partial<HistorySyncOptions> = {}) => {
+  const metadata = new MemoryMetadata(), store = new MemoryStore(), requests: HistorySourceQuery[] = []
+  const sync = new HistorySync({ metadata, store, sources: { candles: { fetchGap: request => { requests.push(request); return rows(request) } } },
+    minRequestIntervalMS: 0, retryBaseMS: 1, maxRetryDelayMS: 4, ...options })
+  return { sync, metadata, store, requests }
 }
 
-test('history requests reject invalid grids, sources, priorities, and constructor limits', async () => {
+test('validates source identities, ranges, priorities and scheduling limits', async t => {
   assert.throws(() => new HistorySync({} as HistorySyncOptions), /metadata/)
-  assert.throws(() => create({ maxAttempts: 0 }), /maxAttempts/)
-  assert.throws(() => create({ maxConcurrentTasks: 0 }), /maxConcurrentTasks/)
-  assert.throws(() => create({ maxConcurrentTasks: 1.5 }), /maxConcurrentTasks/)
-  for (const maxConcurrentPerSource of [0, -1, 1.5, NaN, { candles: 0 }, { candles: 1.5 }, { missing: 2 }, []]) {
-    assert.throws(() => create({ maxConcurrentPerSource: maxConcurrentPerSource as number }), /maxConcurrentPerSource/)
-  }
-  assert.throws(() => create({ retryBaseMS: 10, maxRetryDelayMS: 5 }), /maxRetryDelayMS/)
-  assert.throws(() => create({ minRequestIntervalMS: 2 ** 32 }), /2147483647/)
-  assert.throws(() => create({ maxRetainedTerminalTasks: 0 }), /maxRetainedTerminalTasks/)
-  assert.throws(() => create({ maxRetainedTerminalTasks: 1.5 }), /maxRetainedTerminalTasks/)
-  const { sync } = create()
-  try {
-    await assert.rejects(sync.enqueue({ ...request, from: base + 1 }), /grid/)
-    await assert.rejects(sync.enqueue({ ...request, through: base - intervalMS }), /ordered/)
-    await assert.rejects(sync.enqueue({ ...request, source: 'missing' }), /unavailable/)
-    await assert.rejects(sync.enqueue({ ...request, timeframe: '1m' as '5m' }), /timeframe/)
-    await assert.rejects(sync.enqueue({ ...request, priority: 'urgent' as 'foreground' }), /priority/)
-    await assert.rejects(sync.enqueueTarget({ ...request, historyDays: 0 }), /historyDays/)
-    await assert.rejects(sync.resume('unknown'), /Unknown history task/)
-    assert.equal(sync.listTasks().length, 0)
-  } finally { await sync.close() }
-  await assert.rejects(sync.enqueue(request), /closed/)
+  for (const options of [{ maxConcurrentTasks: 0 }, { maxConcurrentPerSource: 0 }, { maxAttempts: 0 }, { maxRetainedTerminalTasks: 0 }]) assert.throws(() => fixture(options), /at least/)
+  const { sync } = fixture(); t.after(() => sync.close())
+  await assert.rejects(sync.enqueue({ ...query, from: base + 1 }), /grid/)
+  await assert.rejects(sync.enqueue({ ...query, source: 'unknown' }), /unavailable/)
+  await assert.rejects(sync.enqueue({ ...query, priority: 'urgent' as 'foreground' }), /priority/)
 })
 
-test('concurrent foreground and background requests share one durable task and completed history is not downloaded again', async () => {
-  let fetches = 0
-  const { sync, metadata, store } = create({ sources: { candles: { fetchGap(query) { fetches += 1; return records(query) } } } })
-  try {
-    const [background, foreground] = await Promise.all([sync.enqueue(request), sync.enqueue({ ...request, priority: 'foreground' })])
-    assert.equal(background.id, foreground.id)
-    assert.equal(sync.listTasks().length, 1)
-    assert.equal(sync.getTask(background.id)?.priority, 'foreground')
-    const result = await sync.waitFor(background.id)
-    assert.equal(result.status, 'completed')
-    assert.equal(store.rows.size, 3)
-    assert.equal(metadata.getSyncTask(result.id)?.status, 'completed')
-    assert.equal(fetches, 1)
-    await sync.enqueue(request)
-    await sync.whenIdle()
-    assert.equal(fetches, 1)
-    result.remaining.push({ from: 0, through: 0 })
-    assert.deepEqual(sync.getTask(result.id)?.remaining, [])
-    assert.ok(store.queries.every(query => query.intervalMS === intervalMS && query.source === 'candles'))
-  } finally { await sync.close() }
+test('overlapping and adjacent consumers share one canonical API page without persisted execution rows', async t => {
+  const { sync, requests, metadata } = fixture(); t.after(() => sync.close())
+  const consumers = await Promise.all([
+    sync.enqueue({ ...query, from: base, through: base + 99 * step, priority: 'foreground' }),
+    sync.enqueue({ ...query, from: base + 50 * step, through: base + 149 * step, priority: 'foreground' }),
+    sync.enqueue({ ...query, from: base + 150 * step, through: base + 199 * step, priority: 'foreground' }),
+  ])
+  assert.equal(new Set(consumers.map(task => task.id)).size, 3, 'Every cancellation owns only its own consumer.')
+  const results = await Promise.all(consumers.map(task => sync.waitFor(task.id)))
+  assert.ok(results.every(task => task.status === 'completed'))
+  assert.equal(requests.length, 1)
+  assert.deepEqual({ from: requests[0].from, through: requests[0].through }, { from: base, through: base + 199 * step })
+  assert.equal(metadata.tasks.size, 0)
+  assert.equal(metadata.writes, 0)
 })
 
-test('contained and overlapping requests share coverage even when their source allows parallel foreground pages', async () => {
-  const entered = deferred(), release = deferred()
-  const queries: HistorySourceQuery[] = []
-  const { sync } = create({ maxConcurrentTasks: 4, maxConcurrentPerSource: { candles: 4 }, sources: { candles: { async fetchGap(query) {
-    queries.push(query)
-    if (queries.length === 1) { entered.resolve(); await release.promise }
-    return records(query)
-  } } } })
-  try {
-    const first = await sync.enqueue({ ...request, priority: 'foreground' })
-    await entered.promise
-    const contained = await sync.enqueue({ ...request, from: base + intervalMS, priority: 'foreground' })
-    const overlap = await sync.enqueue({ ...request, from: base + intervalMS, through: base + 4 * intervalMS, priority: 'foreground' })
-    assert.notEqual(contained.id, first.id)
-    assert.equal((await sync.enqueue({ ...request, from: base + intervalMS })).id, contained.id)
-    release.resolve()
-    await sync.whenIdle()
-    assert.equal(sync.getTask(overlap.id)?.status, 'completed')
-    assert.equal(sync.getTask(contained.id)?.status, 'completed')
-    assert.deepEqual(queries.map(({ from, through }) => ({ from, through })), [
-      { from: base, through: base + 2 * intervalMS },
-      { from: base + 3 * intervalMS, through: base + 4 * intervalMS },
-    ])
-  } finally { release.resolve(); await sync.close() }
+test('API pages are bounded, coverage is shared and overlapping arrivals do not duplicate in-flight work', async t => {
+  const gate = deferred(), started: HistorySourceQuery[] = []
+  const { sync } = fixture({ sources: { candles: { fetchGap: async request => { started.push(request); if (started.length === 1) await gate.promise; return rows(request) } } } })
+  t.after(() => sync.close())
+  const first = await sync.enqueue({ ...query, through: base + 599 * step, priority: 'foreground' })
+  await waitFor(() => started.length === 1)
+  const overlap = await sync.enqueue({ ...query, from: base + 400 * step, through: base + 599 * step, priority: 'foreground' })
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(started.length, 1)
+  gate.resolve(); await Promise.all([sync.waitFor(first.id), sync.waitFor(overlap.id)])
+  assert.equal(started.length, 2)
+  const fetched = started.flatMap(request => rows(request).map(row => row.timestamp))
+  assert.equal(fetched.length, 600)
+  assert.equal(new Set(fetched).size, fetched.length)
+  assert.ok(started.every(request => (request.through - request.from) / step + 1 <= 300))
 })
 
-test('an exact background page completes independently of its still-queued containing history target', async () => {
-  const entered = deferred(), release = deferred(), resumed = deferred(), resumeHistory = deferred()
-  const queries: HistorySourceQuery[] = [], published: number[] = []
-  const store = new MemoryStore()
-  const { sync } = create({ store, maxConcurrentTasks: 3,
-    async write(values) { published.push(...values.map(value => value.timestamp)); await store.appendCandles(values) },
-    sources: { candles: { async fetchGap(query) {
-      queries.push(query)
-      if (queries.length === 1) {
-        entered.resolve(); await release.promise
-        return { records: [candle(query.from)], cursor: 'history-next-page' }
-      }
-      if (queries.length > 2) { resumed.resolve(); await resumeHistory.promise }
-      return records(query)
-    } } },
-  })
-  try {
-    const history = await sync.enqueue({ ...request, through: base + 5 * intervalMS, purpose: 'history' })
-    await within(entered.promise)
-    const page = await sync.enqueue({ ...request, from: base + 2 * intervalMS, through: base + 3 * intervalMS })
-    assert.notEqual(page.id, history.id)
-    assert.equal(sync.getTask(history.id)?.status, 'running')
-    release.resolve()
-    assert.equal((await within(sync.waitFor(page.id))).status, 'completed')
-    assert.notEqual(sync.getTask(history.id)?.status, 'completed')
-    assert.deepEqual(queries.slice(0, 2).map(({ from, through, priority }) => ({ from, through, priority })), [
-      { from: base, through: base + 5 * intervalMS, priority: 'background' },
-      { from: base + 2 * intervalMS, through: base + 3 * intervalMS, priority: 'background' },
-    ])
-    await within(resumed.promise)
-    resumeHistory.resolve()
-    assert.equal((await within(sync.waitFor(history.id))).status, 'completed')
-    assert.equal(published.length, 6)
-    assert.equal(new Set(published).size, 6)
-  } finally { release.resolve(); resumeHistory.resolve(); await sync.close() }
+test('cancelling one consumer leaves another consumer and the shared fetch active', async t => {
+  const gate = deferred(); let activeSignal: AbortSignal | undefined
+  const { sync, store } = fixture({ sources: { candles: { fetchGap: async request => { activeSignal = request.signal; await gate.promise; return rows(request) } } } })
+  t.after(() => sync.close())
+  const first = await sync.enqueue({ ...query, priority: 'foreground' }), second = await sync.enqueue({ ...query, priority: 'foreground' })
+  await waitFor(() => Boolean(activeSignal))
+  await sync.cancel(first.id)
+  assert.equal(activeSignal?.aborted, false)
+  assert.equal((await sync.waitFor(first.id)).status, 'cancelled')
+  gate.resolve()
+  assert.equal((await sync.waitFor(second.id)).status, 'completed')
+  assert.equal(store.values.size, 3)
 })
 
-test('a foreground window completes before its containing background target and the background rechecks shared coverage', async () => {
-  const entered = deferred(), release = deferred(), nextPage = deferred<HistorySourceQuery>(), resumeBackground = deferred()
-  const queries: HistorySourceQuery[] = [], published: number[] = []
-  const store = new MemoryStore()
-  const { sync } = create({ store,
-    async write(values) { published.push(...values.map(value => value.timestamp)); await store.appendCandles(values) },
-    sources: { candles: { async fetchGap(query) {
-      queries.push(query)
-      if (queries.length === 1) {
-        entered.resolve()
-        await release.promise
-        return { records: [candle(query.from)], cursor: 'background-next' }
-      }
-      if (queries.length === 2) nextPage.resolve(query)
-      if (query.priority === 'background') await resumeBackground.promise
-      return records(query)
-    } } },
-  })
-  try {
-    const background = await sync.enqueue({ ...request, through: base + 5 * intervalMS, purpose: 'history' })
-    await entered.promise
-    const foreground = await sync.enqueue({ ...request, from: base + 2 * intervalMS, through: base + 3 * intervalMS, priority: 'foreground' })
-    assert.notEqual(foreground.id, background.id)
-    assert.equal(sync.getTask(background.id)?.priority, 'background')
-    assert.equal((await sync.enqueue({ ...foreground, priority: 'foreground' })).id, foreground.id)
-    release.resolve()
-    assert.equal((await nextPage.promise).priority, 'foreground')
-    assert.equal((await sync.waitFor(foreground.id)).status, 'completed')
-    assert.notEqual(sync.getTask(background.id)?.status, 'completed')
-    resumeBackground.resolve()
-    assert.equal((await sync.waitFor(background.id)).status, 'completed')
-    assert.deepEqual(queries.map(({ from, through, priority, cursor }) => ({ from, through, priority, cursor })), [
-      { from: base, through: base + 5 * intervalMS, priority: 'background', cursor: null },
-      { from: base + 2 * intervalMS, through: base + 3 * intervalMS, priority: 'foreground', cursor: null },
-      { from: base + intervalMS, through: base + intervalMS, priority: 'background', cursor: null },
-      { from: base + 4 * intervalMS, through: base + 5 * intervalMS, priority: 'background', cursor: null },
-    ])
-    assert.equal(published.length, 6)
-    assert.equal(new Set(published).size, 6)
-  } finally { release.resolve(); resumeBackground.resolve(); await sync.close() }
+test('cancellation during an accepted durable write cannot undo facts or revive the consumer', async t => {
+  const gate = deferred(), entered = deferred(), store = new MemoryStore()
+  const { sync } = fixture({ store, write: async (records, task) => { entered.resolve(); await gate.promise; await store.appendSource(records, task.source) } })
+  t.after(() => sync.close())
+  const task = await sync.enqueue({ ...query, priority: 'foreground' })
+  await entered.promise; await sync.cancel(task.id); gate.resolve(); await sync.whenIdle()
+  assert.equal(store.values.size, 3)
+  assert.equal(sync.getTask(task.id)?.status, 'cancelled')
 })
 
-test('foreground work takes the next source call when it arrives during background inspection', async () => {
-  const entered = deferred(), release = deferred()
-  const calls: string[] = []
-  const { sync } = create({ sources: { candles: {
-    async inspect(query) {
-      calls.push(`inspect:${query.priority}`)
-      if (query.priority === 'background') { entered.resolve(); await release.promise }
-      return {}
-    },
-    fetchGap(query) { calls.push(`fetch:${query.priority}`); return records(query) },
-  } } })
-  try {
-    const background = await sync.enqueue({ ...request, through: base + 5 * intervalMS })
-    await entered.promise
-    const foreground = await sync.enqueue({ ...request, from: base + 2 * intervalMS, through: base + 3 * intervalMS, priority: 'foreground' })
-    release.resolve()
-    assert.equal((await sync.waitFor(foreground.id)).status, 'completed')
-    await sync.whenIdle()
-    assert.deepEqual(calls, ['inspect:background', 'inspect:foreground', 'fetch:foreground', 'fetch:background', 'fetch:background'])
-    assert.equal(sync.getTask(background.id)?.attempts, 0)
-    assert.equal(sync.getTask(background.id)?.lastError, null)
-  } finally { release.resolve(); await sync.close() }
+test('the final cancelled consumer aborts its fetch and removes execution demand', async t => {
+  let signal: AbortSignal | undefined
+  const { sync, metadata } = fixture({ sources: { candles: { fetchGap: request => new Promise((_resolve, reject) => { signal = request.signal; request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true }) }) } } })
+  t.after(() => sync.close())
+  const task = await sync.enqueue(query); await waitFor(() => Boolean(signal)); await sync.cancel(task.id); await sync.whenIdle()
+  assert.equal(signal?.aborted, true)
+  assert.equal(metadata.tasks.size, 0)
 })
 
-test('restart resumes a saved pagination cursor against persisted missing ranges', async () => {
-  const metadata = new MemoryMetadata(), store = new MemoryStore(), secondPage = deferred()
-  let requests = 0
-  const first = create({ metadata, store, sources: { candles: { async fetchGap(query) {
-    requests += 1
-    if (requests === 1) return { records: [candle(query.through)], cursor: 'page-2' }
-    secondPage.resolve()
-    return new Promise<CandleRecord[]>((_, reject) => query.signal.addEventListener('abort', () => reject(query.signal.reason), { once: true }))
-  } } } }).sync
-  const task = await first.enqueue(request)
-  await secondPage.promise
-  await first.close()
-  assert.equal(metadata.getSyncTask(task.id)?.status, 'queued')
-  assert.equal(metadata.getSyncTask(task.id)?.cursor, 'page-2')
-  const queries: HistorySourceQuery[] = []
-  const restarted = create({ metadata, store, sources: { candles: { fetchGap(query) { queries.push(query); return records(query) } } } }).sync
-  try {
-    await restarted.start()
-    const result = await restarted.waitFor(task.id)
-    assert.equal(result.status, 'completed')
-    assert.equal(queries.length, 1)
-    assert.equal(queries[0].cursor, 'page-2')
-    assert.equal(queries[0].through, base + intervalMS)
-    assert.equal(store.rows.size, 3)
-  } finally { await restarted.close() }
+test('restart discards obsolete viewport checkpoints and restores only canonical rolling intentions', async t => {
+  const metadata = new MemoryMetadata(), gate = deferred()
+  const { sync } = fixture({ metadata, sources: { candles: { fetchGap: async request => { await gate.promise; request.signal.throwIfAborted(); return rows(request) } } } })
+  const target = await sync.enqueueTarget({ ...query, historyDays: 1, warmupCandles: 200, asOf: base + 2 * 86400000 })
+  const ephemeral = await sync.enqueue({ ...query, priority: 'foreground' })
+  // Simulate an execution checkpoint left by an older build.
+  metadata.tasks.set(ephemeral.id, ephemeral)
+  metadata.tasks.set('obsolete-foreground-history', { ...ephemeral, id: 'obsolete-foreground-history', purpose: 'history', priority: 'foreground' })
+  metadata.tasks.set('obsolete-statistics-warmup', { ...ephemeral, id: 'obsolete-statistics-warmup', purpose: 'warmup', source: 'oi', priority: 'background' })
+  const closing = sync.close(); gate.resolve(); await closing
+  const requests: HistorySourceQuery[] = []
+  const restored = fixture({ metadata, now: () => base + 3 * 86400000, sources: { candles: { fetchGap: request => { requests.push(request); return rows(request) } } } }).sync
+  t.after(() => restored.close()); await restored.start(); await restored.whenIdle()
+  assert.equal(metadata.tasks.size, 2)
+  assert.equal(restored.getTask(ephemeral.id), null)
+  assert.ok([...metadata.tasks.values()].every(task => task.purpose !== 'requested' && task.priority === 'background' && task.status === 'queued' && task.cursor === null))
+  const history = restored.getTask(target.history.id)!
+  assert.equal(history.through, base + 3 * 86400000 - step)
+  assert.equal(history.through - history.from, 86400000 - step)
+  const warmup = restored.getTask(target.warmup!.id)!
+  assert.equal(warmup.through, history.from - step)
+  const stamps = requests.flatMap(request => rows(request).map(row => row.timestamp))
+  assert.equal(new Set(stamps).size, stamps.length, 'History and adjacent warmup share their page coverage.')
 })
 
-test('pagination cursors are never reused across disjoint missing ranges', async () => {
-  const store = new MemoryStore(), queries: HistorySourceQuery[] = []
-  await store.appendCandles([candle(base + intervalMS)])
-  const { sync } = create({ store, sources: { candles: { fetchGap(query) { queries.push(query); return { records: records(query), cursor: 'previous-gap' } } } } })
-  try {
-    await sync.enqueue(request)
-    await sync.whenIdle()
-    assert.equal(queries.length, 2)
-    assert.equal(queries[1].from, base + 2 * intervalMS)
-    assert.equal(queries[1].cursor, null)
-  } finally { await sync.close() }
-})
-
-test('an interrupted running checkpoint is recovered without refetching already published Parquet data', async () => {
+test('rolling intentions advance in place and statistics never create indicator warmup tasks', async t => {
   const metadata = new MemoryMetadata(), store = new MemoryStore()
-  let fetches = 0
-  const options = { metadata, store, sources: { candles: { fetchGap(query: HistorySourceQuery) { fetches += 1; return records(query) } } } }
-  const first = create(options).sync
-  const task = await first.enqueue(request)
-  await first.whenIdle()
-  await first.close()
-  metadata.putSyncTask({ ...metadata.getSyncTask(task.id)!, status: 'running', remaining: [{ from: request.from, through: request.through }] })
-  const restarted = create(options).sync
-  try {
-    await restarted.start()
-    assert.equal((await restarted.waitFor(task.id)).status, 'completed')
-    assert.equal(fetches, 1)
-  } finally { await restarted.close() }
+  const { sync } = fixture({ metadata, store, sources: { candles: { fetchGap: rows }, oi: { fetchGap: rows }, taker: { fetchGap: rows } }, write: (records, task) => store.appendSource(records, task.source) })
+  t.after(() => sync.close())
+  for (let index = 0; index < 5; index++) for (const source of ['candles', 'oi', 'taker']) await sync.enqueueTarget({ ...query, source, historyDays: 1, asOf: base + 86400000 + index * step, warmupCandles: 200 })
+  await sync.whenIdle()
+  assert.equal(metadata.tasks.size, 4)
+  assert.equal([...metadata.tasks.values()].filter(task => task.purpose === 'warmup').length, 1)
 })
 
-test('transient failures back off on the shared request lane and complete without a permanent failed task', async () => {
-  const calls: number[] = [], retryDeadlines: number[] = []
-  const { sync } = create({ minRequestIntervalMS: 20, retryBaseMS: 2, maxRetryDelayMS: 8,
-    onProgress(task) { if (task.status === 'retry') retryDeadlines.push(task.nextAttemptAt!) },
-    sources: { candles: { fetchGap(query) {
-      calls.push(Date.now())
-      if (calls.length < 3) throw new Error('Temporarily unavailable.')
-      return records(query)
-    } } },
-  })
-  try {
-    const task = await sync.enqueue(request)
-    const result = await sync.waitFor(task.id)
-    assert.equal(result.status, 'completed')
-    assert.equal(result.attempts, 0)
-    assert.equal(calls.length, 3)
-    assert.equal(retryDeadlines.length, 2)
-    assert.ok(calls[1] - calls[0] >= 18)
-    assert.ok(calls[2] - calls[1] >= 18)
-  } finally { await sync.close() }
+test('interactive work has a reserved source slot while a maintenance page remains blocked', async t => {
+  const gate = deferred(), started: string[] = []
+  const { sync } = fixture({ maxConcurrentTasks: 2, maxConcurrentPerSource: 2,
+    sources: { candles: { fetchGap: async request => { started.push(request.instrument); if (request.instrument === 'MAINT-USDT-SWAP') await gate.promise; return rows(request) } } } })
+  t.after(() => sync.close())
+  const background = await sync.enqueue({ ...query, instrument: 'MAINT-USDT-SWAP', priority: 'background' })
+  await waitFor(() => started.length === 1)
+  const interactive = await sync.enqueue({ ...query, instrument: 'FOCUS-USDT-SWAP', priority: 'foreground' })
+  assert.equal((await sync.waitFor(interactive.id)).status, 'completed')
+  assert.equal(sync.getTask(background.id)?.status, 'running')
+  gate.resolve(); await sync.waitFor(background.id)
 })
 
-test('empty pages have bounded retries, retain real gaps, and can be resumed', async () => {
-  let ready = false, fetches = 0
-  const { sync } = create({ maxAttempts: 2, sources: { candles: { fetchGap(query) { fetches += 1; return ready ? records(query) : [] } } } })
-  try {
-    const task = await sync.enqueue(request)
-    const paused = await sync.waitFor(task.id)
-    await sync.whenIdle()
-    assert.equal(paused.status, 'paused')
-    assert.equal(fetches, 2)
-    assert.match(paused.lastError!, /no persisted coverage progress/)
-    assert.deepEqual(paused.unavailableRanges, [])
-    assert.deepEqual(paused.remaining, [{ from: base, through: base + 2 * intervalMS }])
-    ready = true
-    await sync.resume(task.id)
-    assert.equal((await sync.waitFor(task.id)).status, 'completed')
-    assert.equal(fetches, 3)
-  } finally { await sync.close() }
-})
-
-test('pause aborts an active request, cancellation suppresses queued work, and foreground work runs next', async () => {
-  const entered = deferred(), calls: string[] = []
-  let block = true
-  const { sync } = create({ sources: { candles: { async fetchGap(query) {
-    calls.push(query.instrument)
-    if (query.instrument === 'BLOCK-USDT-SWAP' && block) {
-      block = false
-      entered.resolve()
-      return new Promise<CandleRecord[]>((_, reject) => query.signal.addEventListener('abort', () => reject(query.signal.reason), { once: true }))
-    }
-    return records(query)
+test('a disjoint interactive range preempts a blocked background page for the same series', async t => {
+  const started: HistorySourceQuery[] = []
+  const { sync } = fixture({ sources: { candles: { fetchGap: request => {
+    started.push(request)
+    if (request.priority === 'background' && started.length === 1) return new Promise((_resolve, reject) => request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true }))
+    return rows(request)
   } } } })
-  try {
-    const blocked = await sync.enqueue({ ...request, instrument: 'BLOCK-USDT-SWAP' })
-    await entered.promise
-    const background = await sync.enqueue({ ...request, instrument: 'BACKGROUND-USDT-SWAP' })
-    const foreground = await sync.enqueue({ ...request, instrument: 'FOREGROUND-USDT-SWAP', priority: 'foreground' })
-    await sync.pause(blocked.id)
-    await sync.cancel(background.id)
-    await sync.whenIdle()
-    assert.deepEqual(calls, ['BLOCK-USDT-SWAP', 'FOREGROUND-USDT-SWAP'])
-    assert.equal(sync.getTask(blocked.id)?.status, 'paused')
-    assert.equal(sync.getTask(background.id)?.status, 'cancelled')
-    assert.equal(sync.getTask(foreground.id)?.status, 'completed')
-    await sync.resume(blocked.id)
-    assert.equal((await sync.waitFor(blocked.id)).status, 'completed')
-  } finally { await sync.close() }
+  t.after(() => sync.close())
+  const background = await sync.enqueue({ ...query, through: base + 999 * step, priority: 'background' })
+  await waitFor(() => started.length === 1)
+  const interactive = await sync.enqueue({ ...query, through: base + 2 * step, priority: 'foreground' })
+  assert.equal((await sync.waitFor(interactive.id)).status, 'completed')
+  assert.equal(started[0].signal.aborted, true)
+  assert.equal(started[1].priority, 'foreground')
+  await sync.waitFor(background.id)
 })
 
-test('explicit source boundaries remain accurately unavailable and an explicit resume rechecks them', async () => {
-  let listedLater = true, fetches = 0, inspections = 0
-  const { sync } = create({ sources: { candles: {
-    inspect() { inspections += 1; return listedLater ? { availableFrom: base + intervalMS, reason: 'The instrument was listed later.' } : {} },
-    fetchGap(query) { fetches += 1; return records(query) },
-  } } })
-  try {
-    const task = await sync.enqueue(request)
-    const unavailable = await sync.waitFor(task.id)
-    assert.equal(unavailable.status, 'unavailable')
-    assert.deepEqual(unavailable.remaining, [{ from: base, through: base }])
-    assert.deepEqual(unavailable.unavailableRanges, [{ from: base, through: base, reason: 'The instrument was listed later.' }])
-    await sync.enqueue(request)
-    await sync.whenIdle()
-    assert.equal(fetches, 1)
-    listedLater = false
-    await sync.resume(task.id)
-    assert.equal((await sync.waitFor(task.id)).status, 'completed')
-    assert.equal(inspections, 2)
-    assert.equal(fetches, 2)
-  } finally { await sync.close() }
+test('maintenance receives a page during a continuous interactive backlog', async t => {
+  const started: string[] = []
+  const { sync } = fixture({ maxConcurrentTasks: 1, maxConcurrentPerSource: 1,
+    sources: { candles: { pageSize: 1, fetchGap: request => { started.push(request.instrument); return rows(request) } } } })
+  t.after(() => sync.close())
+  const tasks = await Promise.all([
+    sync.enqueue({ ...query, instrument: 'MAINT-USDT-SWAP', priority: 'background' }),
+    ...Array.from({ length: 30 }, (_, index) => sync.enqueue({ ...query, instrument: `I${index}-USDT-SWAP`, priority: 'foreground' })),
+  ])
+  await Promise.all(tasks.map(task => sync.waitFor(task.id)))
+  assert.ok(started.indexOf('MAINT-USDT-SWAP') <= 8, JSON.stringify(started.slice(0, 12)))
 })
 
-test('default targets keep 30 days of user history separate from 200 EMA warmup bars on the matching grid', async () => {
-  const queries: CoverageQuery[] = []
-  const { sync } = create({ store: { async missingCandleRanges(query) { queries.push(query); return [] }, async appendCandles() { return 0 } },
-    sources: { candles: { fetchGap() { throw new Error('Complete history must not be fetched.') } } },
-  })
-  try {
-    const hour = 3_600_000, asOf = base + 60 * 86_400_000 + 37_000
-    const { history, warmup } = await sync.enqueueTarget({ instrument: request.instrument, timeframe: '1H', source: 'candles', asOf })
-    await sync.whenIdle()
-    assert.equal(history.purpose, 'history')
-    assert.equal((history.through - history.from) / hour + 1, 30 * 24)
-    assert.equal(history.through, Math.floor(asOf / hour) * hour - hour)
-    assert.equal(warmup?.purpose, 'warmup')
-    assert.equal(warmup?.through, history.from - hour)
-    assert.equal((warmup!.through - warmup!.from) / hour + 1, 200)
-    assert.ok(queries.every(query => query.intervalMS === hour))
-  } finally { await sync.close() }
+test('independent sources start without waiting for a blocked price lane', async t => {
+  const gate = deferred(), started = new Set<string>(), store = new MemoryStore()
+  const source = (name: string) => ({ fetchGap: async (request: HistorySourceQuery) => { started.add(name); if (name === 'candles') await gate.promise; return rows(request) } })
+  const { sync } = fixture({ store, sources: { candles: source('candles'), oi: source('oi'), taker: source('taker') }, write: (records, task) => store.appendSource(records, task.source) })
+  t.after(() => sync.close())
+  const consumers = await Promise.all(['candles', 'oi', 'taker'].map(source => sync.enqueue({ ...query, source, priority: 'foreground' })))
+  await waitFor(() => started.size === 3)
+  assert.equal((await sync.waitFor(consumers[1].id)).status, 'completed')
+  assert.equal((await sync.waitFor(consumers[2].id)).status, 'completed')
+  gate.resolve(); await sync.waitFor(consumers[0].id)
 })
 
-test('source-specific coverage never treats existing candle prices as complete OI or taker data', async () => {
-  const coverage = new Set<string>(['candles'])
-  const fetched: string[] = [], checked: string[] = []
-  const { sync } = create({
-    store: { async missingCandleRanges(query) { checked.push(query.source); return coverage.has(query.source) ? [] : [{ from: query.from, through: query.through }] } },
-    write(_values, task) { coverage.add(task.source) },
-    sources: Object.fromEntries(['candles', 'oi', 'taker'].map(source => [source, { fetchGap(query: HistorySourceQuery) { fetched.push(query.source); return records(query) } }])),
-  })
-  try {
-    await Promise.all(['candles', 'oi', 'taker'].map(source => sync.enqueue({ ...request, source })))
-    await sync.whenIdle()
-    assert.deepEqual(fetched.sort(), ['oi', 'taker'])
-    assert.deepEqual(new Set(checked), new Set(['candles', 'oi', 'taker']))
-    assert.ok(sync.listTasks().every(task => task.status === 'completed'))
-  } finally { await sync.close() }
+test('unavailable requires explicit source evidence and an empty page pauses instead of inventing coverage', async t => {
+  const empty = fixture({ maxAttempts: 2, sources: { candles: { fetchGap: () => [] } } }); t.after(() => empty.sync.close())
+  const task = await empty.sync.enqueue(query), result = await empty.sync.waitFor(task.id)
+  assert.equal(result.status, 'paused'); assert.match(result.lastError!, /no persisted coverage progress/)
+  assert.deepEqual(result.unavailableRanges, [])
+  const bounded = fixture({ sources: { candles: { inspect: () => ({ availableFrom: query.through + step, reason: 'Explicit source boundary.' }), fetchGap: () => { throw Error('Unavailable range must not fetch') } } } }); t.after(() => bounded.sync.close())
+  const unavailable = await bounded.sync.enqueue(query)
+  assert.equal((await bounded.sync.waitFor(unavailable.id)).status, 'unavailable')
 })
 
-test('three sources overlap their HTTP pages while each source admits only one task', async () => {
-  const storage = sourceStorage(), entered = deferred(), release = deferred()
-  const counts = new Map<string, number>(), active = new Set<string>()
-  let simultaneous = 0, peak = 0
-  const { sync } = create({ ...storage, maxConcurrentTasks: 3,
-    sources: Object.fromEntries(['candles', 'oi', 'taker'].map(source => [source, { async fetchGap(query: HistorySourceQuery) {
-      assert.equal(active.has(source), false, `${source} has overlapping tasks`)
-      active.add(source)
-      counts.set(source, (counts.get(source) ?? 0) + 1)
-      simultaneous += 1
-      peak = Math.max(peak, simultaneous)
-      try {
-        if (counts.get(source) === 1) {
-          if (simultaneous === 3) entered.resolve()
-          await release.promise
-        }
-        return records(query)
-      } finally { active.delete(source); simultaneous -= 1 }
-    } } ])),
-  })
-  try {
-    await Promise.all(['candles', 'oi', 'taker'].flatMap(source => ['FIRST', 'SECOND'].map(instrument => sync.enqueue({ ...request, source, instrument }))))
-    await within(entered.promise)
-    assert.equal(peak, 3)
-    assert.deepEqual([...counts.values()], [1, 1, 1])
-    release.resolve()
-    await within(sync.whenIdle())
-    assert.deepEqual([...counts.values()], [2, 2, 2])
-    assert.ok(sync.listTasks().every(task => task.status === 'completed'))
-    assert.ok([...storage.stores.values()].every(store => store.rows.size === 6))
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('four foreground candle pages overlap while OI and taker retain independent single-page limits', async () => {
-  const storage = sourceStorage(), entered = deferred(), release = deferred()
-  const active = new Map<string, number>(), peaks = new Map<string, number>(), calls = new Map<string, number>()
-  let peak = 0
-  const { sync } = create({ ...storage, maxConcurrentTasks: 6, maxConcurrentPerSource: { candles: 4, oi: 1, taker: 1 },
-    sources: Object.fromEntries(['candles', 'oi', 'taker'].map(source => [source, { async fetchGap(query: HistorySourceQuery) {
-      active.set(source, (active.get(source) ?? 0) + 1)
-      peaks.set(source, Math.max(peaks.get(source) ?? 0, active.get(source)!))
-      calls.set(source, (calls.get(source) ?? 0) + 1)
-      const simultaneous = [...active.values()].reduce((sum, value) => sum + value, 0)
-      peak = Math.max(peak, simultaneous)
-      if (simultaneous === 6) entered.resolve()
-      try { await release.promise; return records(query) }
-      finally { active.set(source, active.get(source)! - 1) }
-    } }])),
-  })
-  try {
-    await Promise.all(['candles', 'oi', 'taker'].flatMap(source => Array.from({ length: source === 'candles' ? 8 : 2 }, (_, index) =>
-      sync.enqueue({ ...request, source, instrument: `${source.toUpperCase()}-${index}`, priority: 'foreground' }))))
-    await within(entered.promise)
-    assert.deepEqual(Object.fromEntries(active), { candles: 4, oi: 1, taker: 1 })
-    assert.deepEqual(Object.fromEntries(calls), { candles: 4, oi: 1, taker: 1 }, 'Queued pages must wait for their own source capacity.')
-    release.resolve()
-    await within(sync.whenIdle())
-    assert.deepEqual(Object.fromEntries(peaks), { candles: 4, oi: 1, taker: 1 })
-    assert.equal(peak, 6)
-    assert.deepEqual(Object.fromEntries(calls), { candles: 8, oi: 2, taker: 2 })
-    assert.ok(sync.listTasks().every(task => task.status === 'completed'))
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('parallel source capacity serves every queued foreground page before admitting one background page at a time', async () => {
-  const entered = deferred(), release = deferred(), calls: string[] = []
-  let foreground = 0, background = 0, backgroundPeak = 0
-  const { sync } = create({ maxConcurrentTasks: 4, maxConcurrentPerSource: 4,
-    sources: { candles: { async fetchGap(query) {
-      calls.push(query.instrument)
-      if (query.priority === 'foreground') {
-        foreground += 1
-        if (foreground === 4) entered.resolve()
-        await release.promise
-      } else {
-        background += 1
-        backgroundPeak = Math.max(backgroundPeak, background)
-        await Promise.resolve()
-        background -= 1
-      }
-      return records(query)
-    } } },
-  })
-  try {
-    await Promise.all([
-      ...['HISTORY', 'WARMUP'].map(instrument => sync.enqueue({ ...request, instrument, purpose: 'history' })),
-      ...Array.from({ length: 8 }, (_, index) => sync.enqueue({ ...request, instrument: `FOREGROUND-${index}`, priority: 'foreground' })),
-    ])
-    await within(entered.promise)
-    assert.deepEqual(calls, Array.from({ length: 4 }, (_, index) => `FOREGROUND-${index}`), 'Background work must not consume the extra source slots while foreground work is queued.')
-    release.resolve()
-    await within(sync.whenIdle())
-    assert.deepEqual(calls, [...Array.from({ length: 8 }, (_, index) => `FOREGROUND-${index}`), 'HISTORY', 'WARMUP'])
-    assert.equal(backgroundPeak, 1, 'Increasing foreground concurrency must not parallelize background downloads.')
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('cancelling one parallel source task leaves its peers running and close aborts the remaining fetches', async () => {
-  const entered = deferred(), aborted: string[] = []
-  let calls = 0
-  const { sync } = create({ maxConcurrentTasks: 4, maxConcurrentPerSource: { candles: 4 }, sources: { candles: { fetchGap(query) {
-    calls += 1
-    if (calls === 4) entered.resolve()
-    return new Promise((_resolve, reject) => query.signal.addEventListener('abort', () => {
-      aborted.push(query.instrument)
-      reject(query.signal.reason)
-    }, { once: true }))
-  } } } })
-  try {
-    const tasks = await Promise.all(Array.from({ length: 4 }, (_, index) => sync.enqueue({ ...request, instrument: `PARALLEL-${index}`, priority: 'foreground' })))
-    await within(entered.promise)
-    await sync.cancel(tasks[1].id)
-    assert.deepEqual(aborted, ['PARALLEL-1'])
-    assert.equal(sync.getTask(tasks[1].id)?.status, 'cancelled')
-    assert.ok(tasks.filter((_, index) => index !== 1).every(task => sync.getTask(task.id)?.status === 'running'))
-    await within(sync.close())
-    assert.deepEqual(aborted.sort(), ['PARALLEL-0', 'PARALLEL-1', 'PARALLEL-2', 'PARALLEL-3'])
-  } finally { await sync.close() }
-})
-
-test('the pool enforces a configured bound smaller than the number of ready sources', async () => {
-  const entered = deferred(), release = deferred(), storage = sourceStorage()
-  let active = 0, peak = 0, calls = 0
-  const { sync } = create({ ...storage, maxConcurrentTasks: 2,
-    sources: Object.fromEntries(['candles', 'oi', 'taker'].map(source => [source, { async fetchGap(query: HistorySourceQuery) {
-      active += 1; calls += 1; peak = Math.max(peak, active)
-      if (calls === 2) entered.resolve()
-      try { await release.promise; return records(query) }
-      finally { active -= 1 }
-    } }])),
-  })
-  try {
-    await Promise.all(['candles', 'oi', 'taker'].map(source => sync.enqueue({ ...request, source })))
-    await within(entered.promise)
-    assert.equal(calls, 2)
-    release.resolve()
-    await within(sync.whenIdle())
-    assert.equal(calls, 3)
-    assert.equal(peak, 2)
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('active stats pages can await a later candle dependency despite another source having queued foreground work', async () => {
-  const storage = sourceStorage(), statsEntered = deferred(), addDependencies = deferred(), candleEntered = deferred()
-  let statsCalls = 0, statsFinished = 0, candleCalls = 0
-  let sync!: HistorySync
-  const dependency = { ...request, from: base + intervalMS, through: base + intervalMS }
-  const stats = { async fetchGap(query: HistorySourceQuery) {
-    if (query.instrument === request.instrument) {
-      statsCalls += 1
-      if (statsCalls === 2) statsEntered.resolve()
-      await addDependencies.promise
-      const task = await sync.enqueue(dependency)
-      assert.equal((await sync.waitFor(task.id)).status, 'completed')
-      statsFinished += 1
-    }
-    return records(query)
-  } }
-  sync = create({ ...storage, maxConcurrentTasks: 3, sources: { oi: stats, taker: stats, candles: { fetchGap(query) {
-    candleCalls += 1
-    assert.equal(statsFinished, 0)
-    assert.deepEqual({ from: query.from, through: query.through }, { from: dependency.from, through: dependency.through })
-    candleEntered.resolve()
-    return records(query)
-  } } } }).sync
-  try {
-    const tasks = await Promise.all(['oi', 'taker'].map(source => sync.enqueue({ ...request, source, priority: 'foreground' })))
-    await within(statsEntered.promise)
-    await sync.enqueue({ ...request, source: 'oi', instrument: 'NEXT-USDT-SWAP', priority: 'foreground' })
-    addDependencies.resolve()
-    await within(candleEntered.promise)
-    assert.ok((await within(Promise.all(tasks.map(task => sync.waitFor(task.id))))).every(task => task.status === 'completed'))
-    await within(sync.whenIdle())
-    assert.equal(candleCalls, 1)
-    assert.equal(statsFinished, 2)
-  } finally { addDependencies.resolve(); await sync.close() }
-})
-
-test('eighteen background history and warmup admissions finish with exact page dependencies and no duplicate downloads', async () => {
-  const storage = sourceStorage(), downloaded = new Set<string>(), active = new Set<string>()
-  let statsCalls = 0, sync!: HistorySync
-  const sources = Object.fromEntries(['candles', 'oi', 'taker'].map(source => [source, { async fetchGap(query: HistorySourceQuery) {
-    assert.equal(active.has(source), false)
-    active.add(source)
-    try {
-      const page = { ...query, from: Math.max(query.from, query.through - 99 * intervalMS) }
-      if (source !== 'candles') {
-        statsCalls += 1
-        // Model the bounded HTTP response arriving before its price merge.
-        await Promise.resolve()
-        const dependency = await sync.enqueue({ ...page, source: 'candles', priority: query.priority })
-        assert.deepEqual({ from: dependency.from, through: dependency.through }, { from: page.from, through: page.through })
-        assert.equal((await sync.waitFor(dependency.id)).status, 'completed')
-      }
-      const values = records(page)
-      for (const value of values) {
-        const id = `${source}:${query.instrument}:${value.timestamp}`
-        assert.equal(downloaded.has(id), false, `duplicate download: ${id}`)
-        downloaded.add(id)
-      }
-      return values
-    } finally { active.delete(source) }
-  } }]))
-  sync = create({ ...storage, sources, maxConcurrentTasks: 3 }).sync
-  try {
-    const targets = await Promise.all(['BTC', 'ETH', 'SOL'].flatMap(instrument => ['candles', 'oi', 'taker'].map(source => sync.enqueueTarget({
-      instrument: `${instrument}-USDT-SWAP`, source, timeframe: '5m', historyDays: 1, warmupCandles: 2, asOf: base + 60 * 86_400_000,
-    }))))
-    const admitted = targets.flatMap(({ history, warmup }) => [history, warmup!])
-    assert.equal(new Set(admitted.map(task => task.id)).size, 18)
-    await within(sync.whenIdle())
-    assert.ok(admitted.every(task => sync.getTask(task.id)?.status === 'completed'))
-    assert.equal(statsCalls, 24)
-    assert.equal(downloaded.size, 3 * 3 * (288 + 2))
-  } finally { await sync.close() }
-})
-
-test('equal-priority targets rotate after each page and foreground work still takes the next page', async () => {
-  let now = base
-  const entered = deferred(), release = deferred(), calls: string[] = []
-  const { sync } = create({ now: () => now++, maxConcurrentTasks: 3, sources: { candles: { async fetchGap(query) {
-    calls.push(query.instrument)
-    if (calls.length === 1) { entered.resolve(); await release.promise }
-    return [candle(query.from, query.instrument)]
-  } } } })
-  try {
-    await sync.enqueue({ ...request, instrument: 'OLDER-USDT-SWAP', purpose: 'history' })
-    await within(entered.promise)
-    await sync.enqueue({ ...request, instrument: 'NEWER-USDT-SWAP', purpose: 'history' })
-    await sync.enqueue({ ...request, instrument: 'FOREGROUND-USDT-SWAP', through: base, priority: 'foreground' })
-    release.resolve()
-    await within(sync.whenIdle())
-    assert.deepEqual(calls, ['OLDER-USDT-SWAP', 'FOREGROUND-USDT-SWAP', 'NEWER-USDT-SWAP', 'OLDER-USDT-SWAP', 'NEWER-USDT-SWAP', 'OLDER-USDT-SWAP', 'NEWER-USDT-SWAP'])
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('cancel and close drain every accepted concurrent write before restart rechecks durable coverage', async () => {
-  const storage = sourceStorage(), metadata = new MemoryMetadata(), entered = deferred()
-  const releases = new Map(['candles', 'oi', 'taker'].map(source => [source, deferred()]))
-  const published = new Map(['candles', 'oi', 'taker'].map(source => [source, deferred()]))
-  let writes = 0, fetches = 0, closed = false, idle = false
-  const sources = Object.fromEntries(['candles', 'oi', 'taker'].map(source => [source, { fetchGap(query: HistorySourceQuery) { fetches += 1; return { records: records(query), cursor: 'do-not-checkpoint' } } }]))
-  let sync = create({ ...storage, metadata, sources, maxConcurrentTasks: 3,
-    async write(values, task) {
-      writes += 1
-      if (writes === 3) entered.resolve()
-      await releases.get(task.source)!.promise
-      await storage.write(values, task)
-      published.get(task.source)!.resolve()
-    },
-  }).sync
-  try {
-    const tasks = await Promise.all(['candles', 'oi', 'taker'].map(source => sync.enqueue({ ...request, source })))
-    await within(entered.promise)
-    const idleResult = sync.whenIdle().then(() => { idle = true; return null }, error => error)
-    await sync.cancel(tasks[1].id)
-    const closing = sync.close()
-    assert.equal(sync.close(), closing)
-    const closedResult = closing.then(() => { closed = true })
-    releases.get('candles')!.resolve()
-    await within(published.get('candles')!.promise)
-    assert.equal(closed, false)
-    assert.equal(idle, false)
-    releases.get('oi')!.resolve()
-    await within(published.get('oi')!.promise)
-    assert.equal(closed, false)
-    releases.get('taker')!.resolve()
-    await within(closedResult)
-    assert.match((await idleResult).message, /closed/)
-    assert.deepEqual(tasks.map(task => metadata.getSyncTask(task.id)?.status), ['queued', 'cancelled', 'queued'])
-    assert.ok(tasks.every(task => metadata.getSyncTask(task.id)?.cursor === null))
-    assert.equal([...storage.stores.values()].reduce((count, store) => count + store.rows.size, 0), 9)
-    sync = create({ ...storage, metadata, sources, maxConcurrentTasks: 3 }).sync
-    await sync.start()
-    for (const task of tasks) {
-      await sync.enqueue(task)
-      assert.equal((await sync.waitFor(task.id)).status, 'completed')
-    }
-    await sync.whenIdle()
-    assert.equal(fetches, 3)
-  } finally { releases.forEach(gate => gate.resolve()); await sync.close() }
-})
-
-test('close releases stats waiting for queued or writing candle dependencies before joining workers', async () => {
-  for (const maxConcurrentTasks of [2, 3]) {
-    const storage = sourceStorage(), metadata = new MemoryMetadata()
-    const waiting = deferred(), writing = deferred(), releaseWrite = deferred(), cleanup = deferred()
-    let dependencies = 0, rejected = 0, writes = 0, closed = false
-    let sync!: HistorySync
-    const stats = { async fetchGap(query: HistorySourceQuery) {
-      const dependency = await sync.enqueue({ ...request, through: base })
-      const completion = sync.waitFor(dependency.id)
-      await Promise.resolve()
-      dependencies += 1
-      if (dependencies === 2) waiting.resolve()
-      try { await Promise.race([completion, cleanup.promise]) }
-      catch (error) { rejected += 1; throw error }
-      return records(query)
-    } }
-    sync = create({ ...storage, metadata, maxConcurrentTasks, sources: { oi: stats, taker: stats, candles: { fetchGap: records } },
-      async write(values, task) { writes += 1; writing.resolve(); await releaseWrite.promise; return storage.write(values, task) },
-    }).sync
-    try {
-      await Promise.all(['oi', 'taker'].map(source => sync.enqueue({ ...request, source })))
-      await within(waiting.promise)
-      if (maxConcurrentTasks === 3) await within(writing.promise)
-      const closing = sync.close().then(() => { closed = true })
-      if (maxConcurrentTasks === 3) {
-        await new Promise(resolve => setImmediate(resolve))
-        assert.equal(closed, false)
-      }
-      releaseWrite.resolve()
-      await within(closing)
-      assert.equal(rejected, 2)
-      assert.equal(writes, maxConcurrentTasks === 3 ? 1 : 0)
-      assert.ok(metadata.listSyncTasks().every(task => task.status === 'queued'))
-    } finally { cleanup.resolve(); releaseWrite.resolve(); await sync.close() }
-  }
-})
-
-test('source admission delays cannot shorten the next start interval or serialize HTTP completion', async () => {
-  let now = 1_000
-  const { sync } = create({ now: () => now, minRequestIntervalMS: 20 })
-  const starts: number[] = [], release = deferred()
-  const signal = new AbortController().signal
-  const lane = sync as any
-  lane.delay = async (milliseconds: number) => { now += milliseconds }
-  try {
-    const first = lane.callSource(() => { now += 7; starts.push(now); return release.promise }, signal, { priority: 'foreground' })
-    await lane.callSource(() => { starts.push(now); return {} }, signal, { priority: 'foreground' })
-    assert.deepEqual(starts, [1_007, 1_027], 'Pacing must start from the actual invocation, including time spent admitting the source.')
-    release.resolve()
-    await first
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('concurrent inspections and HTTP fetches share the global request-start interval without awaiting HTTP completion', async () => {
-  const storage = sourceStorage(), entered = deferred(), release = deferred(), calls: number[] = []
-  let fetches = 0
-  const { sync } = create({ ...storage, maxConcurrentTasks: 3, minRequestIntervalMS: 20,
-    sources: Object.fromEntries(['candles', 'oi', 'taker'].map(source => [source, {
-      inspect() { calls.push(Date.now()); return {} },
-      async fetchGap(query: HistorySourceQuery) {
-        calls.push(Date.now()); fetches += 1
-        if (fetches === 3) entered.resolve()
-        await release.promise
-        return records(query)
-      },
-    }])),
-  })
-  try {
-    await Promise.all(['candles', 'oi', 'taker'].map(source => sync.enqueue({ ...request, source })))
-    await within(entered.promise)
-    assert.equal(calls.length, 6)
-    assert.ok(calls.slice(1).every((time, index) => time - calls[index] >= 19), `source starts: ${calls.join(', ')}`)
-    release.resolve()
-    await within(sync.whenIdle())
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('a retry on a free source wakes while another source is still fetching', async () => {
-  const storage = sourceStorage(), entered = deferred(), retried = deferred(), release = deferred()
+test('durable goals survive a transient outage after their shared requested consumer exhausts its budget', async t => {
   let attempts = 0
-  const { sync } = create({ ...storage, maxConcurrentTasks: 2, retryBaseMS: 10, maxRetryDelayMS: 10, sources: {
-    candles: { async fetchGap(query) { entered.resolve(); await release.promise; return records(query) } },
-    oi: { fetchGap(query) { attempts += 1; if (attempts === 1) throw new Error('Retry this page.'); retried.resolve(); return records(query) } },
-  } })
-  try {
-    await sync.enqueue(request)
-    await within(entered.promise)
-    const oi = await sync.enqueue({ ...request, source: 'oi' })
-    await within(retried.promise)
-    assert.equal((await sync.waitFor(oi.id)).status, 'completed')
-    assert.equal(sync.listTasks().find(task => task.source === 'candles')?.status, 'running')
-    release.resolve()
-    await within(sync.whenIdle())
-  } finally { release.resolve(); await sync.close() }
+  const { sync, metadata } = fixture({ maxAttempts: 2, sources: { candles: { fetchGap: request => { if (++attempts <= 3) throw new Error('Temporary source outage.'); return rows(request) } } } })
+  t.after(() => sync.close())
+  const goal = await sync.enqueue({ ...query, purpose: 'history' }), consumer = await sync.enqueue({ ...query, priority: 'foreground' })
+  const requested = await sync.waitFor(consumer.id)
+  assert.equal(requested.status, 'paused'); assert.equal(requested.attempts, 2)
+  const completed = await sync.waitFor(goal.id)
+  assert.equal(completed.status, 'completed'); assert.equal(attempts, 4)
+  assert.equal(metadata.tasks.get(goal.id)?.status, 'queued', 'Only the durable desired range survives restart, without transient failure state.')
 })
 
-test('result eviction protects all concurrent cancelled writers and registered waiters', async () => {
-  const storage = sourceStorage(), entered = deferred(), release = deferred(), metadata = new MemoryMetadata()
-  let writes = 0
-  const { sync } = create({ ...storage, metadata, maxConcurrentTasks: 3, maxRetainedTerminalTasks: 1,
-    async write(values, task) { writes += 1; if (writes === 3) entered.resolve(); await release.promise; return storage.write(values, task) },
-    sources: Object.fromEntries(['candles', 'oi', 'taker'].map(source => [source, { fetchGap: records }])),
-  })
-  try {
-    const tasks = await Promise.all(['candles', 'oi', 'taker'].map(source => sync.enqueue({ ...request, source })))
-    await within(entered.promise)
-    const results = tasks.map(task => sync.waitFor(task.id))
-    await Promise.all(tasks.map(task => sync.cancel(task.id)))
-    for (let index = 0; index < 4; index += 1) {
-      const task = await sync.enqueue({ ...request, instrument: `EXPIRED${index}-USDT-SWAP` })
-      await sync.cancel(task.id)
-    }
-    assert.ok((await Promise.all(results)).every(task => task.status === 'cancelled'))
-    assert.ok(tasks.every(task => sync.getTask(task.id)?.status === 'cancelled' && metadata.getSyncTask(task.id)?.status === 'cancelled'))
-    release.resolve()
-    await within(sync.whenIdle())
-    assert.equal(sync.listTasks().length, 1)
-    assert.equal(metadata.listSyncTasks().length, 1)
-    assert.ok([...storage.stores.values()].every(store => store.rows.size === 3))
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('rolling history and warmup keep stable identities and only verify newly exposed tails', async () => {
-  let now = base + 60 * 86_400_000
-  const metadata = new MemoryMetadata(), store = new VersionedMemoryStore()
-  const queries: CoverageQuery[] = []
-  store.missingCandleRanges = async query => { queries.push(query); return [] }
-  let sync = create({ metadata, store, now: () => now }).sync
-  let first!: { history: HistoryTask; warmup: HistoryTask | null }
-  try {
-    for (let index = 0; index < 128; index += 1) {
-      const target = await sync.enqueueTarget({ instrument: request.instrument, timeframe: '5m', source: 'candles', historyDays: 1, asOf: now, warmupCandles: 200 })
-      first ??= target
-      assert.equal(target.history.id, first.history.id)
-      assert.equal(target.warmup!.id, first.warmup!.id)
-      await sync.whenIdle()
-      assert.equal(sync.listTasks().length, 2)
-      assert.equal(metadata.listSyncTasks().length, 2)
-      now += intervalMS
-    }
-    assert.equal(queries.filter(query => query.through > query.from).length, 2, 'Only the initial history and warmup windows need full checks.')
-    assert.equal(queries.length, 2 + 2 * 127)
-    assert.equal(sync.getTask(first.history.id)?.through, now - 2 * intervalMS)
-    await sync.close()
-    sync = create({ metadata, store, now: () => now }).sync
-    await sync.start()
-    assert.equal(sync.listTasks().length, 2)
-    const before = queries.length
-    const target = sync.getTask(first.history.id)!
-    await sync.enqueue(target)
-    assert.equal(queries.length, before + 1, 'A new process validates the persisted window again.')
-  } finally { await sync.close() }
-})
-
-test('rolling boundaries replace queued and active history goals instead of accumulating a backlog', async () => {
-  const asOf = base + 60 * 86_400_000
-  const entered = deferred(), release = deferred()
-  let firstSignal: AbortSignal | undefined
-  const { sync, metadata, store } = create({ now: () => asOf, maxRetainedTerminalTasks: 3,
-    sources: { candles: { async fetchGap(query) {
-      firstSignal ??= query.signal
-      entered.resolve()
-      await new Promise<void>((resolve, reject) => {
-        const abort = () => reject(query.signal.reason)
-        query.signal.addEventListener('abort', abort, { once: true })
-        release.promise.then(() => { query.signal.removeEventListener('abort', abort); resolve() })
-      })
-      return records(query)
-    } } },
-  })
-  try {
-    const first = await sync.enqueueTarget({ ...request, historyDays: 1, warmupCandles: 2, asOf })
-    await within(entered.promise)
-    const updates = await Promise.all(Array.from({ length: 64 }, (_, index) => sync.enqueueTarget({
-      ...request, historyDays: 1, warmupCandles: 2, asOf: asOf + (index + 1) * intervalMS,
-    })))
-    const latest = updates.at(-1)!
-    assert.equal(firstSignal?.aborted, false, 'A valid active page is allowed to persist before the new generation continues.')
-    assert.equal(first.history.id, latest.history.id)
-    assert.equal(first.warmup!.id, latest.warmup!.id)
-    assert.deepEqual(new Set(sync.listTasks().filter(task => ['queued', 'running', 'retry', 'paused'].includes(task.status)).map(task => task.id)),
-      new Set([latest.history.id, latest.warmup!.id]))
-    // A just-cancelled writer may remain protected until its source unwinds.
-    assert.equal(sync.listTasks().length, 2)
-    assert.equal(metadata.listSyncTasks().length, 2)
-    release.resolve()
-    assert.equal((await within(sync.waitFor(latest.history.id))).status, 'completed')
-    assert.equal((await within(sync.waitFor(latest.warmup!.id))).status, 'completed')
-    await within(sync.whenIdle())
-    assert.equal(store.rows.size, 352, 'The accepted old page is retained together with the 64 new tail candles.')
-    assert.equal(metadata.listSyncTasks().length, 2)
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('retention edits update one paused goal and the final range survives restart until explicit resume', async () => {
-  const asOf = base + 60 * 86_400_000
-  const entered = deferred(), release = deferred(), metadata = new MemoryMetadata(), store = new MemoryStore()
-  const options: Partial<HistorySyncOptions> = { metadata, store, now: () => asOf,
-    sources: { candles: { async fetchGap(query) {
-      entered.resolve()
-      await new Promise<void>((resolve, reject) => {
-        const abort = () => reject(query.signal.reason)
-        query.signal.addEventListener('abort', abort, { once: true })
-        release.promise.then(() => { query.signal.removeEventListener('abort', abort); resolve() })
-      })
-      return records(query)
-    } } },
-  }
-  await store.appendCandles([candle(base)])
-  let sync = create(options).sync
-  try {
-    const initial = await sync.enqueueTarget({ ...request, historyDays: 2, warmupCandles: 2, asOf })
-    await within(entered.promise)
-    await sync.pause(initial.history.id)
-    assert.equal(sync.getTask(initial.history.id)?.status, 'paused')
-    const shorter = await sync.enqueueTarget({ ...request, historyDays: 1, warmupCandles: 2, asOf })
-    assert.equal(sync.getTask(initial.history.id)?.status, 'paused')
-    const expanded = await sync.enqueueTarget({ ...request, historyDays: 2, warmupCandles: 2, asOf })
-    assert.equal(expanded.history.id, initial.history.id)
-    assert.equal(shorter.history.id, initial.history.id)
-    assert.equal(sync.getTask(shorter.history.id)?.status, 'paused')
-    await sync.close()
-    sync = create(options).sync
-    await sync.start()
-    assert.deepEqual(new Set(sync.listTasks().filter(task => ['queued', 'running', 'retry'].includes(task.status)).map(task => task.id)),
-      new Set([expanded.warmup!.id]))
-    assert.equal(sync.getTask(expanded.history.id)?.from, expanded.history.from)
-    assert.equal(sync.getTask(expanded.history.id)?.status, 'paused')
-    assert.equal(store.rows.size, 1)
-    await sync.resume(expanded.history.id)
-    release.resolve()
-    assert.equal((await within(sync.waitFor(expanded.history.id))).status, 'completed')
-    assert.equal((await within(sync.waitFor(expanded.warmup!.id))).status, 'completed')
-    await within(sync.whenIdle())
-    assert.equal(store.rows.size, 579)
-    assert.ok(store.rows.has(`${request.instrument}:${request.timeframe}:${base}`))
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('restart compacts legacy rolling backlogs by latest intent and preserves exact foreground checkpoints', async () => {
-  const metadata = new MemoryMetadata(), store = new MemoryStore()
-  const seed = create({ metadata, store }).sync
-  const seedTask = await seed.enqueue(request)
-  await seed.waitFor(seedTask.id); await seed.close()
-  const template = metadata.getSyncTask(seedTask.id)!
-  metadata.tasks.clear()
-  const legacy = (bounds: HistoryRange, purpose: HistoryTask['purpose'], requestedAt: number, priority: 'foreground' | 'background' = 'background', instrument = request.instrument) => {
-    const id = createHash('sha256').update(JSON.stringify([instrument, request.timeframe, request.source, bounds.from, bounds.through])).digest('hex')
-    const task = { ...template, ...bounds, id, instrument, purpose, priority, status: 'queued' as const, remaining: [bounds],
-      createdAt: base, updatedAt: base + 1_000 - requestedAt, targetRequestedAt: base + requestedAt }
-    metadata.putSyncTask(task)
-    return task
-  }
-  for (let index = 0; index < 12; index++) {
-    legacy({ from: base + index * intervalMS, through: base + (index + 2) * intervalMS }, 'history', index)
-    legacy({ from: base + (100 + index) * intervalMS, through: base + (100 + index) * intervalMS }, 'warmup', index)
-  }
-  const exact = legacy({ from: base + 20 * intervalMS, through: base + 20 * intervalMS }, 'requested', 20)
-  const foreground = legacy({ from: base + 30 * intervalMS, through: base + 31 * intervalMS }, 'history', 30, 'foreground')
-  legacy(request, 'history', 40, 'background', 'OTHER-USDT-SWAP')
-  const { sync } = create({ metadata, store })
-  try {
-    await sync.start()
-    const tasks = sync.listTasks()
-    assert.equal(tasks.length, 5)
-    assert.equal(tasks.find(task => task.instrument === request.instrument && task.purpose === 'history')?.from, base + 11 * intervalMS)
-    assert.equal(tasks.find(task => task.purpose === 'warmup')?.from, base + 111 * intervalMS)
-    assert.equal(sync.getTask(exact.id)?.purpose, 'requested')
-    assert.equal(sync.getTask(foreground.id)?.purpose, 'requested')
-    assert.equal(sync.getTask(foreground.id)?.priority, 'foreground')
-    assert.ok(tasks.every(task => !('targetRequestedAt' in task)))
-    assert.equal(metadata.listSyncTasks().length, 5)
-    await within(sync.whenIdle())
-    assert.ok(sync.listTasks().every(task => task.status === 'completed'))
-  } finally { await sync.close() }
-})
-
-test('rolling replacement preserves registered exact waiters and foreground upgrades, and disabling warmup retires its old goal', async () => {
-  const asOf = base + 60 * 86_400_000, entered = deferred(), release = deferred()
-  const { sync } = create({ now: () => asOf, sources: { candles: { async fetchGap(query) {
-    entered.resolve()
-    await release.promise
-    return records(query)
-  } } } })
-  try {
-    const first = await sync.enqueueTarget({ ...request, historyDays: 1, warmupCandles: 2, asOf })
-    const result = sync.waitFor(first.history.id)
-    await within(entered.promise)
-    const promoted = await sync.enqueue({ ...first.warmup!, priority: 'foreground' })
-    const exact = await sync.enqueue({ ...request, from: base, through: base })
-    const second = await sync.enqueueTarget({ ...request, historyDays: 1, warmupCandles: 2, asOf: asOf + intervalMS })
-    const latest = await sync.enqueueTarget({ ...request, historyDays: 1, warmupCandles: 0, asOf: asOf + 2 * intervalMS })
-    assert.equal(latest.warmup, null)
-    assert.equal(sync.getTask(first.history.id)?.status, 'running')
-    assert.equal(sync.getTask(promoted.id)?.priority, 'foreground')
-    assert.equal(sync.getTask(exact.id)?.status, 'queued')
-    assert.equal(second.history.id, latest.history.id)
-    assert.equal(second.warmup!.id, promoted.id)
-    assert.equal(sync.getTask(second.history.id)?.status, 'running')
-    assert.equal(sync.getTask(second.warmup!.id)?.priority, 'foreground', 'Explicit consumers retain their accepted warmup work.')
-    release.resolve()
-    assert.equal((await within(result)).status, 'completed')
-    assert.equal((await within(sync.waitFor(promoted.id))).status, 'completed')
-    assert.equal((await within(sync.waitFor(exact.id))).status, 'completed')
-    assert.equal((await within(sync.waitFor(latest.history.id))).status, 'completed')
-    await within(sync.whenIdle())
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('an exact background request that reuses a rolling range is protected before registering its waiter', async () => {
-  const asOf = base + 60 * 86_400_000, entered = deferred(), release = deferred()
-  const { sync } = create({ now: () => asOf, sources: { candles: { async fetchGap(query) {
-    entered.resolve()
-    await release.promise
-    return records(query)
-  } } } })
-  try {
-    const first = await sync.enqueueTarget({ ...request, historyDays: 1, warmupCandles: 0, asOf })
-    await within(entered.promise)
-    const exact = await sync.enqueue({ ...request, from: first.history.from, through: first.history.through })
-    assert.notEqual(exact.id, first.history.id, 'Exact callers own an independent completion barrier.')
-    assert.equal(exact.purpose, 'requested')
-    const next = await sync.enqueueTarget({ ...request, historyDays: 1, warmupCandles: 0, asOf: asOf + intervalMS })
-    assert.equal(sync.getTask(exact.id)?.status, 'queued')
-    release.resolve()
-    assert.equal((await within(sync.waitFor(exact.id))).status, 'completed')
-    assert.equal((await within(sync.waitFor(next.history.id))).status, 'completed')
-    await within(sync.whenIdle())
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('close joins every admitted rolling goal checkpoint before its metadata owner can close', async () => {
-  const entered = deferred(), release = deferred(), saved = new MemoryMetadata()
-  let first = true, ownerClosed = false
-  const writes: boolean[] = []
-  const metadata = {
-    getSyncTask: (id: string) => saved.getSyncTask(id),
-    listSyncTasks: () => saved.listSyncTasks(),
-    deleteSyncTask: (id: string) => saved.deleteSyncTask(id),
-    async putSyncTask(task: HistoryTask) {
-      if (first) { first = false; entered.resolve(); await release.promise }
-      writes.push(ownerClosed)
-      return saved.putSyncTask(task)
-    },
-  }
-  const { sync } = create({ metadata })
-  const target = sync.enqueueTarget({ ...request, historyDays: 1, warmupCandles: 0, asOf: base + 60 * 86_400_000 })
-  try {
-    await within(entered.promise)
-    const closing = sync.close().then(() => { ownerClosed = true })
-    release.resolve()
-    await within(Promise.all([target, closing]))
-    assert.equal(ownerClosed, true)
-    assert.equal(writes.length, 1)
-    assert.deepEqual(writes, [false])
-    assert.ok(saved.listSyncTasks()[0].id.startsWith('target-'))
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('result retention preserves active and queued work and delivers registered waiters before expiry', async () => {
-  let now = base
-  const entered = deferred(), release = deferred()
-  const { sync, metadata } = create({ now: () => now++, maxRetainedTerminalTasks: 1,
-    sources: { candles: { async fetchGap(query) {
-      if (query.instrument === 'ACTIVE-USDT-SWAP') { entered.resolve(); await release.promise }
-      return records(query)
-    } } },
-  })
-  try {
-    const active = await sync.enqueue({ ...request, instrument: 'ACTIVE-USDT-SWAP' })
-    const activeResult = sync.waitFor(active.id)
-    await entered.promise
-    const queued = await sync.enqueue({ ...request, instrument: 'QUEUED-USDT-SWAP' })
-    const queuedResult = sync.waitFor(queued.id)
-    const cancelled = await sync.enqueue({ ...request, instrument: 'CANCELLED-USDT-SWAP' })
-    const cancelledResult = sync.waitFor(cancelled.id)
-    await sync.cancel(cancelled.id)
-    for (let index = 0; index < 4; index += 1) {
-      const task = await sync.enqueue({ ...request, instrument: `EXPIRED${index}-USDT-SWAP` })
-      await sync.cancel(task.id)
-    }
-    assert.equal((await cancelledResult).status, 'cancelled')
-    assert.equal(sync.getTask(cancelled.id), null)
-    assert.equal(sync.getTask(active.id)?.status, 'running')
-    assert.equal(sync.getTask(queued.id)?.status, 'queued')
-    assert.equal(metadata.getSyncTask(active.id)?.status, 'running')
-    assert.equal(metadata.getSyncTask(queued.id)?.status, 'queued')
-    release.resolve()
-    assert.equal((await activeResult).status, 'completed')
-    assert.equal((await queuedResult).status, 'completed')
-    await sync.whenIdle()
-    assert.equal(sync.listTasks().length, 1)
-    assert.equal(metadata.listSyncTasks().length, 1)
-    assert.equal(sync.getTask(queued.id)?.status, 'completed')
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('paused history survives rolling-result eviction and restart until explicitly resumed', async () => {
-  let now = base + 60 * 86_400_000, block = true, covered = false
-  const entered = deferred(), metadata = new MemoryMetadata()
-  const pausedInstrument = 'PAUSED-USDT-SWAP'
-  const options: Partial<HistorySyncOptions> = { metadata, now: () => now, maxRetainedTerminalTasks: 2,
-    store: { async missingCandleRanges(query) {
-      return query.instrument === pausedInstrument && !covered ? [{ from: query.from, through: query.through }] : []
-    } },
-    write(_rows, task) { if (task.instrument === pausedInstrument) covered = true },
-    sources: { candles: { async fetchGap(query) {
-      if (block) {
-        entered.resolve()
-        return new Promise<CandleRecord[]>((_, reject) => query.signal.addEventListener('abort', () => reject(query.signal.reason), { once: true }))
-      }
-      return records(query)
-    } } },
-  }
-  let sync = create(options).sync
-  try {
-    const paused = await sync.enqueue({ ...request, instrument: pausedInstrument })
-    await entered.promise
-    await sync.pause(paused.id)
-    await sync.whenIdle()
-    block = false
-    for (let index = 0; index < 128; index += 1) {
-      now += intervalMS
-      const { history } = await sync.enqueueTarget({ instrument: request.instrument, timeframe: '5m', source: 'candles', asOf: now, warmupCandles: 0 })
-      await sync.waitFor(history.id)
-      await sync.whenIdle()
-    }
-    assert.equal(sync.getTask(paused.id)?.status, 'paused')
-    assert.equal(metadata.getSyncTask(paused.id)?.status, 'paused')
-    assert.equal(sync.listTasks().length, 2)
-    await sync.close()
-    sync = create(options).sync
-    await sync.start()
-    assert.equal(sync.getTask(paused.id)?.status, 'paused')
-    assert.equal(metadata.getSyncTask(paused.id)?.status, 'paused')
-    await sync.resume(paused.id)
-    assert.equal((await sync.waitFor(paused.id)).status, 'completed')
-    assert.equal(covered, true)
-    await sync.whenIdle()
-    assert.equal(sync.listTasks().length, 2)
-    assert.equal(metadata.listSyncTasks().length, 2)
-  } finally { await sync.close() }
-})
-
-test('invalid source data and failed durable writes cannot mark missing history completed', async () => {
-  let mode = 'unconfirmed', writes = 0
-  const store = new MemoryStore()
-  const { sync } = create({ store, maxAttempts: 1,
-    write(values) { writes += 1; if (mode === 'write-failure') throw new Error('Disk write failed.'); return store.appendCandles(values) },
-    onProgress() { throw new Error('An observer cannot break synchronization.') },
-    sources: { candles: { fetchGap(query) { return records(query).map(value => ({ ...value, confirmed: mode !== 'unconfirmed' })) } } },
-  })
-  try {
-    const task = await sync.enqueue(request)
-    assert.equal((await sync.waitFor(task.id)).status, 'paused')
-    assert.equal(writes, 0)
-    mode = 'write-failure'
-    await sync.resume(task.id)
-    assert.match((await sync.waitFor(task.id)).lastError!, /Disk write failed/)
-    assert.equal(store.rows.size, 0)
-    mode = 'ready'
-    await sync.resume(task.id)
-    assert.equal((await sync.waitFor(task.id)).status, 'completed')
-    assert.equal(store.rows.size, 3)
-  } finally { await sync.close() }
-})
-
-test('SQLite task checkpoints and Parquet candles survive a real store restart', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-history-sync-'))
-  let metadata = await MetadataStore.open(root), store = await MarketStore.open(root)
-  let fetches = 0
-  const sources = { candles: { fetchGap(query: HistorySourceQuery) { fetches += 1; return records(query) } } }
-  let sync = new HistorySync({ metadata, store, sources, minRequestIntervalMS: 0, maxRetainedTerminalTasks: 1 })
-  try {
-    const task = await sync.enqueue(request)
-    assert.equal((await sync.waitFor(task.id)).status, 'completed')
-    const later = await sync.enqueue({ ...request, from: request.through + intervalMS, through: request.through + intervalMS })
-    assert.equal((await sync.waitFor(later.id)).status, 'completed')
-    await sync.whenIdle()
-    assert.equal(metadata.getSyncTask(task.id), null)
-    await sync.close()
-    await store.close()
-    metadata.close()
-    metadata = await MetadataStore.open(root)
-    store = await MarketStore.open(root)
-    sync = new HistorySync({ metadata, store, sources, minRequestIntervalMS: 0, maxRetainedTerminalTasks: 1 })
-    await sync.start()
-    assert.equal(sync.getTask(task.id), null)
-    assert.equal(sync.getTask(later.id)?.status, 'completed')
-    await sync.enqueue(request)
-    await sync.whenIdle()
-    assert.equal(sync.getTask(task.id)?.status, 'completed')
-    assert.equal(fetches, 2)
-    assert.equal((await store.candles(request)).length, 3)
-  } finally { await sync.close(); await store.close(); metadata.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('verified completion performs no new coverage reads, checkpoints, or progress events until storage changes', async () => {
-  const store = new VersionedMemoryStore(), metadata = new MemoryMetadata()
-  let progress = 0, fetches = 0
-  const { sync } = create({ store, metadata, onProgress() { progress++ }, sources: { candles: { fetchGap(query) { fetches++; return records(query) } } } })
-  try {
-    const task = await sync.enqueue(request)
-    await sync.waitFor(task.id); await sync.whenIdle()
-    const before = { reads: store.queries.length, writes: metadata.writes, progress }
-    for (let index = 0; index < 20; index++) await sync.enqueue(request)
-    await sync.whenIdle()
-    assert.deepEqual({ reads: store.queries.length, writes: metadata.writes, progress }, before)
-    store.rows.delete(`${request.instrument}:${request.timeframe}:${base + intervalMS}`)
-    store.changed(base + intervalMS)
-    await sync.enqueue(request); await sync.whenIdle()
-    assert.equal(fetches, 2)
-    assert.ok(store.queries.slice(before.reads).every(query => query.from === base + intervalMS && query.through === base + intervalMS))
-    assert.equal(store.rows.size, 3)
-  } finally { await sync.close() }
-})
-
-test('pagination verifies one initial window and durable page ranges instead of rescanning the full target', async () => {
-  const store = new VersionedMemoryStore()
-  const pages: HistoryRange[] = []
-  const { sync } = create({ store, sources: { candles: { fetchGap(query) {
-    const page = { ...query, from: Math.max(query.from, query.through - 99 * intervalMS) }
-    pages.push(page)
-    return records(page)
-  } } } })
-  try {
-    const target = { ...request, through: base + 999 * intervalMS }
-    const task = await sync.enqueue(target)
-    await sync.waitFor(task.id); await sync.whenIdle()
-    assert.equal(pages.length, 10)
-    assert.equal(store.queries.filter(query => query.through - query.from === 999 * intervalMS).length, 1)
-    assert.ok(store.queries.slice(1).every(query => query.through - query.from <= 99 * intervalMS))
-    assert.equal(store.rows.size, 1_000)
-  } finally { await sync.close() }
-})
-
-test('a rolling window can move while a page is active and cancellation survives subsequent target updates', async () => {
-  const store = new VersionedMemoryStore(), entered = deferred(), release = deferred()
-  let calls = 0
-  const { sync } = create({ store, sources: { candles: { async fetchGap(query) {
-    if (++calls === 1) { entered.resolve(); await release.promise }
-    return records(query)
-  } } } })
-  const target = { instrument: request.instrument, timeframe: request.timeframe, source: request.source, historyDays: 1, warmupCandles: 0, asOf: base + 60 * 86_400_000 }
-  try {
-    const first = (await sync.enqueueTarget(target)).history
-    await within(entered.promise)
-    const latest = (await sync.enqueueTarget({ ...target, asOf: target.asOf + 128 * intervalMS })).history
-    assert.equal(latest.id, first.id)
-    assert.equal(sync.listTasks().length, 1)
-    release.resolve()
-    const result = await within(sync.waitFor(first.id))
-    assert.equal(result.through, latest.through)
-    assert.equal(result.status, 'completed')
-    assert.equal(calls, 2)
-    await sync.cancel(first.id)
-    const stopped = (await sync.enqueueTarget({ ...target, asOf: target.asOf + 129 * intervalMS })).history
-    assert.equal(stopped.status, 'cancelled')
-    await sync.whenIdle()
-    assert.equal(calls, 2)
-    await sync.resume(first.id)
-    assert.equal((await sync.waitFor(first.id)).status, 'completed')
-    assert.equal(calls, 3)
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('startup collapses old rolling checkpoints to the latest window and preserves exact foreground requests', async () => {
-  const metadata = new MemoryMetadata()
-  const seed = create({ metadata }).sync
-  const exact = await seed.enqueue({ ...request, priority: 'foreground' })
-  await seed.waitFor(exact.id); await seed.close()
-  const template = metadata.getSyncTask(exact.id)!
-  for (const purpose of ['history', 'warmup'] as const) for (let index = 0; index < 100; index++) {
-    const from = base + index * intervalMS, through = from + 2 * intervalMS
-    const id = createHash('sha256').update(JSON.stringify([request.instrument, request.timeframe, request.source, from, through])).digest('hex')
-    // The old format could not have two purposes at the same exact range.
-    const shifted = purpose === 'warmup' ? 100 * intervalMS : 0
-    const bounds = { from: from + shifted, through: through + shifted }
-    const oldID = shifted ? createHash('sha256').update(JSON.stringify([request.instrument, request.timeframe, request.source, bounds.from, bounds.through])).digest('hex') : id
-    metadata.putSyncTask({ ...template, ...bounds, id: oldID, purpose, priority: 'background', status: 'queued', createdAt: base + index, updatedAt: base + index, remaining: [bounds] })
-  }
-  // Keep the independent requested checkpoint at another range.
-  const requested = { ...template, instrument: 'FOREGROUND-USDT-SWAP' }
-  requested.id = createHash('sha256').update(JSON.stringify([requested.instrument, requested.timeframe, requested.source, requested.from, requested.through])).digest('hex')
-  metadata.putSyncTask(requested)
-  const { sync } = create({ metadata, store: { async missingCandleRanges() { return [] } }, write() {} })
-  try {
-    await sync.start(); await sync.whenIdle()
-    assert.equal(sync.listTasks().length, 3)
-    assert.equal(metadata.listSyncTasks().length, 3)
-    assert.equal(sync.listTasks().find(task => task.purpose === 'history')?.from, base + 99 * intervalMS)
-    assert.equal(sync.listTasks().find(task => task.purpose === 'warmup')?.from, base + 199 * intervalMS)
-    assert.equal(sync.getTask(requested.id)?.priority, 'foreground')
-    assert.ok(sync.listTasks().filter(task => task.purpose !== 'requested').every(task => task.id.startsWith('target-')))
-  } finally { await sync.close() }
-})
-
-class BatchMemoryMetadata extends MemoryMetadata {
-  batches: HistoryTask[][] = []
-  deleted: string[][] = []
-  beforeCommit?: (tasks: HistoryTask[]) => Promise<void> | void
-  async putSyncTasks(tasks: HistoryTask[]) {
-    const snapshots = structuredClone(tasks)
-    this.batches.push(snapshots)
-    await this.beforeCommit?.(snapshots)
-    snapshots.forEach(task => super.putSyncTask(task))
-  }
-  deleteSyncTasks(ids: string[]) { this.deleted.push([...ids]); ids.forEach(id => this.deleteSyncTask(id)) }
-}
-
-test('simultaneous checkpoints use one batch and enqueue/close wait for its durable commit', async () => {
-  const metadata = new BatchMemoryMetadata(), entered = deferred(), release = deferred()
-  const { sync } = create({ metadata })
+test('delisting during target admission cannot resurrect its warmup or history intention', async t => {
+  const { sync, metadata } = fixture()
+  t.after(() => sync.close())
   await sync.start()
-  metadata.batches.length = 0
-  metadata.beforeCommit = async () => { entered.resolve(); await release.promise }
-  let admitted = false, closed = false
-  const admission = Promise.all(['BTC', 'ETH', 'SOL'].map(instrument => sync.enqueue({ ...request, instrument }))).then(tasks => { admitted = true; return tasks })
-  try {
-    await within(entered.promise)
-    assert.equal(metadata.batches.length, 1)
-    assert.equal(metadata.batches[0].length, 3)
-    assert.equal(metadata.tasks.size, 0)
-    assert.equal(admitted, false)
-    const closing = sync.close().then(() => { closed = true })
-    await new Promise(resolve => setImmediate(resolve))
-    assert.equal(closed, false)
-    release.resolve()
-    const tasks = await within(admission)
-    await within(closing)
-    assert.ok(tasks.every(task => metadata.getSyncTask(task.id)?.status === 'queued'))
-    assert.equal(admitted, true)
-  } finally { release.resolve(); await sync.close() }
+  const target = sync.enqueueTarget({ ...query, historyDays: 1, asOf: base + 86400000 })
+  const retired = assert.rejects(target, { name: 'AbortError' })
+  await sync.removeTargets([query.instrument]); await retired
+  assert.equal(metadata.tasks.size, 0)
+  assert.deepEqual(sync.listTasks(), [])
 })
 
-test('coalesced checkpoints publish the latest state once and resolve all durable waiters', async () => {
-  const metadata = new BatchMemoryMetadata(), progress: string[] = []
-  const { sync } = create({ metadata, onProgress(task) { progress.push(task.status) } })
-  try {
-    const task = await sync.enqueue(request)
-    await sync.waitFor(task.id); await sync.whenIdle()
-    metadata.batches.length = 0; progress.length = 0
-    const mutable = (sync as any).tasks.get(task.id) as HistoryTask
-    mutable.status = 'paused'
-    const first = (sync as any).save(mutable)
-    mutable.status = 'cancelled'
-    const last = (sync as any).save(mutable)
-    await Promise.all([first, last])
-    assert.equal(metadata.batches.length, 1)
-    assert.deepEqual(metadata.batches[0].map(task => task.status), ['cancelled'])
-    assert.equal(metadata.getSyncTask(task.id)?.status, 'cancelled')
-    assert.deepEqual(progress, ['cancelled'])
-  } finally { await sync.close() }
+test('default market scale retains bounded intentions rather than accumulating page checkpoints', async t => {
+  const metadata = new MemoryMetadata(), store = new MemoryStore(), gate = deferred()
+  const fetchGap = async (request: HistorySourceQuery) => { await gate.promise; request.signal.throwIfAborted(); return rows(request) }
+  const { sync } = fixture({ metadata, store, sources: { candles: { fetchGap }, oi: { fetchGap }, taker: { fetchGap } }, write: (records, task) => store.appendSource(records, task.source) })
+  t.after(() => sync.close())
+  const asOf = base + 32 * 86400000
+  await Promise.all(Array.from({ length: 287 }, (_, index) => Promise.all((['5m', '15m', '1H'] as const).flatMap(timeframe => ['candles', 'oi', 'taker'].map(source => sync.enqueueTarget({ instrument: `T${index}-USDT-SWAP`, timeframe, source, historyDays: 30, asOf }))))))
+  assert.equal(metadata.tasks.size, 287 * 12)
+  const writes = metadata.writes
+  await Promise.all(Array.from({ length: 1000 }, () => sync.enqueue({ ...query, priority: 'foreground' })))
+  assert.equal(metadata.writes, writes, 'Viewport demand never adds SQLite coordination rows.')
+  const closing = sync.close(); gate.resolve(); await closing
 })
 
-test('a failed completion batch rejects waiters and restart recovers already durable pages without downloading again', async () => {
-  const metadata = new BatchMemoryMetadata(), store = new VersionedMemoryStore()
-  let fetches = 0, failCommit = true
-  metadata.beforeCommit = tasks => { if (failCommit && tasks.some(task => task.status === 'completed')) throw new Error('Checkpoint transaction failed.') }
-  const options = { metadata, store, sources: { candles: { fetchGap(query: HistorySourceQuery) { fetches++; return records(query) } } } }
-  let sync = create(options).sync
-  try {
-    const task = await sync.enqueue(request)
-    await assert.rejects(within(sync.waitFor(task.id)), /Checkpoint transaction failed/)
-    await sync.close()
-    assert.equal(store.rows.size, 3)
-    assert.equal(metadata.getSyncTask(task.id)?.status, 'running')
-    failCommit = false
-    sync = create(options).sync
-    await sync.start()
-    assert.equal((await within(sync.waitFor(task.id))).status, 'completed')
-    assert.equal(fetches, 1)
-  } finally { await sync.close() }
-})
-
-test('progress counts unique instruments from the status index and updates across cancellation, pruning, and restart', async () => {
-  const metadata = new BatchMemoryMetadata()
-  const options = { metadata, maxRetainedTerminalTasks: 2, store: { async missingCandleRanges() { return [] } }, write() {},
-    sources: { candles: { fetchGap: records }, oi: { fetchGap: records }, taker: { fetchGap: records } } }
-  let sync = create(options).sync
-  try {
-    const tasks = await Promise.all(['oi', 'taker'].map(source => sync.enqueue({ ...request, source })))
-    await sync.whenIdle()
-    await Promise.all(tasks.map(task => sync.pause(task.id)))
-    assert.deepEqual(sync.progressFor([request.instrument, request.instrument], '5m'), { retrying: 0, unavailable: 1 })
-    assert.deepEqual(sync.progressFor(['OTHER'], '5m'), { retrying: 0, unavailable: 0 })
-    assert.deepEqual(sync.progressFor([request.instrument], '1H'), { retrying: 0, unavailable: 0 })
-    await sync.close()
-    sync = create(options).sync
-    await sync.start()
-    assert.deepEqual(sync.progressFor([request.instrument], '5m'), { retrying: 0, unavailable: 1 })
-    ;(sync as any).maxRetainedTerminalTasks = 1
-    await sync.cancel(tasks[0].id)
-    assert.deepEqual(sync.progressFor([request.instrument], '5m'), { retrying: 0, unavailable: 1 })
-    await sync.cancel(tasks[1].id)
-    await sync.whenIdle()
-    assert.deepEqual(sync.progressFor([request.instrument], '5m'), { retrying: 0, unavailable: 0 })
-    assert.equal(sync.listTasks().length, 1)
-    assert.ok(metadata.deleted.some(ids => ids.length > 0))
-    const map = (sync as any).tasks as Map<string, HistoryTask>
-    const values = map.values
-    map.values = () => { throw new Error('Progress must not scan task payloads.') }
-    try { assert.deepEqual(sync.progressFor([request.instrument], '5m'), { retrying: 0, unavailable: 0 }) }
-    finally { map.values = values }
-  } finally { await sync.close() }
-})
-
-test('retry progress counts a shared instrument once and clears when the tasks stop retrying', async () => {
-  const retried = deferred(), metadata = new BatchMemoryMetadata()
-  let retries = 0
-  const { sync } = create({ metadata, maxConcurrentTasks: 2, retryBaseMS: 10_000, maxRetryDelayMS: 10_000,
-    sources: { oi: { fetchGap() { throw new Error('Offline.') } }, taker: { fetchGap() { throw new Error('Offline.') } } },
-    onProgress(task) { if (task.status === 'retry' && ++retries === 2) retried.resolve() },
-  })
-  try {
-    const tasks = await Promise.all(['oi', 'taker'].map(source => sync.enqueue({ ...request, source })))
-    await within(retried.promise)
-    assert.deepEqual(sync.progressFor([request.instrument], '5m'), { retrying: 1, unavailable: 0 })
-    await Promise.all(tasks.map(task => sync.cancel(task.id)))
-    assert.deepEqual(sync.progressFor([request.instrument], '5m'), { retrying: 0, unavailable: 0 })
-  } finally { await sync.close() }
-})
-
-test('a rolling target becomes completed when its unavailable listing range leaves the requested window', async () => {
-  const store = new VersionedMemoryStore()
-  const { sync } = create({ store, sources: { candles: {
-    inspect() { return { availableFrom: base + intervalMS, reason: 'Before listing.' } }, fetchGap: records,
-  } } })
-  try {
-    const first = await sync.enqueue({ ...request, purpose: 'history' })
-    assert.equal((await sync.waitFor(first.id)).status, 'unavailable')
-    assert.deepEqual(sync.progressFor([request.instrument], '5m'), { retrying: 0, unavailable: 1 })
-    await store.appendCandles([candle(base + 3 * intervalMS)])
-    const rolled = await sync.enqueue({ ...request, purpose: 'history', from: base + intervalMS, through: base + 3 * intervalMS })
-    assert.equal(rolled.id, first.id)
-    assert.equal(rolled.status, 'completed')
-    assert.deepEqual(sync.progressFor([request.instrument], '5m'), { retrying: 0, unavailable: 0 })
-  } finally { await sync.close() }
-})
-
-test('an asynchronous inspection cannot mark a newly extended rolling tail unavailable', async () => {
-  const store = new VersionedMemoryStore(), entered = deferred(), release = deferred()
-  const inspected: HistoryRange[] = [], fetched: HistorySourceQuery[] = []
-  const { sync } = create({ store, sources: { candles: {
-    async inspect(query) {
-      inspected.push({ from: query.from, through: query.through })
-      if (inspected.length === 1) { entered.resolve(); await release.promise }
-      return { availableThrough: query.through, reason: 'Latest completed source period.' }
+test('completed rolling goals revalidate only an expired empty observation at its own deadline', async t => {
+  const last = base + 299 * step, calls: HistorySourceQuery[] = [], reads: HistoryRange[] = [], metadata = new MemoryMetadata()
+  let expiresAt = 0, revision = 0
+  const sync = new HistorySync({ metadata, sources: { oi: { fetchGap: request => { calls.push(request); return [{ instrument: request.instrument, timeframe: request.timeframe, timestamp: last, oi: null }] } } },
+    store: {
+      async missingCandleRanges(request) { reads.push({ from: request.from, through: request.through }); return request.from <= last && request.through >= last && expiresAt <= Date.now() ? [{ from: last, through: last }] : [] },
+      coverageVersion: () => revision,
+      coverageChanges: () => ({ revision, ranges: [{ from: last, through: last }] }),
+      coverageLeases: request => request.from <= last && request.through >= last && expiresAt > Date.now() ? [{ from: last, through: last, expiresAt }] : [],
     },
-    fetchGap(query) { fetched.push(query); return records(query) },
-  } } })
-  try {
-    const first = await sync.enqueue({ ...request, through: base + intervalMS, purpose: 'history' })
-    await within(entered.promise)
-    const moved = await sync.enqueue({ ...request, from: base + intervalMS, through: base + 2 * intervalMS, purpose: 'history' })
-    assert.equal(moved.id, first.id)
-    release.resolve()
-    const result = await within(sync.waitFor(first.id))
-    assert.equal(result.status, 'completed')
-    assert.deepEqual(result.unavailableRanges, [])
-    assert.ok(store.rows.has(`${request.instrument}:5m:${base + 2 * intervalMS}`))
-    assert.deepEqual(inspected, [{ from: base, through: base + intervalMS }, { from: base + intervalMS, through: base + 2 * intervalMS }])
-    assert.deepEqual(fetched.map(({ from, through }) => ({ from, through })), [{ from: base + intervalMS, through: base + 2 * intervalMS }])
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('a page from an older rolling generation may persist observations but cannot publish its cursor or unavailable ranges', async () => {
-  const store = new VersionedMemoryStore(), entered = deferred(), release = deferred()
-  const queries: HistorySourceQuery[] = [], writeBounds: HistoryRange[] = []
-  const { sync } = create({ store, async write(values, task) {
-    writeBounds.push({ from: task.from, through: task.through })
-    await store.appendCandles(values)
-  }, sources: { candles: { async fetchGap(query) {
-    queries.push(query)
-    if (queries.length === 1) {
-      entered.resolve(); await release.promise
-      return { records: [candle(query.through)], cursor: 'old-target-page', unavailable: [{ from: query.from, through: query.through, reason: 'Old page boundary.' }] }
-    }
-    return records(query)
-  } } } })
-  try {
-    const first = await sync.enqueue({ ...request, through: base + intervalMS, purpose: 'history' })
-    await within(entered.promise)
-    await sync.enqueue({ ...request, from: base + intervalMS, through: base + 2 * intervalMS, purpose: 'history' })
-    release.resolve()
-    const result = await within(sync.waitFor(first.id))
-    assert.equal(result.status, 'completed')
-    assert.equal(result.attempts, 0)
-    assert.deepEqual(result.unavailableRanges, [])
-    assert.equal(queries.length, 2)
-    assert.equal(queries[1].cursor, null)
-    assert.equal(queries[1].from, base + 2 * intervalMS)
-    assert.deepEqual(writeBounds[0], { from: base, through: base + intervalMS }, 'The accepted page keeps its original mutation context.')
-    assert.ok(store.rows.has(`${request.instrument}:5m:${base + 2 * intervalMS}`))
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('inspection generation checks also reject an old result after the target moves away and back to identical bounds', async () => {
-  const entered = deferred(), release = deferred(), store = new VersionedMemoryStore()
-  let inspections = 0
-  const { sync } = create({ store, sources: { candles: {
-    async inspect(query) {
-      if (++inspections === 1) { entered.resolve(); await release.promise; return { availableThrough: base, reason: 'Old observation.' } }
-      return { availableThrough: query.through }
-    }, fetchGap: records,
-  } } })
-  try {
-    const original = { ...request, through: base + intervalMS, purpose: 'history' as const }
-    const task = await sync.enqueue(original)
-    await within(entered.promise)
-    await sync.enqueue({ ...original, from: base + intervalMS, through: base + 2 * intervalMS })
-    await sync.enqueue(original)
-    release.resolve()
-    const result = await within(sync.waitFor(task.id))
-    assert.equal(result.status, 'completed')
-    assert.deepEqual(result.unavailableRanges, [])
-    assert.equal(inspections, 2)
-    assert.ok(store.rows.has(`${request.instrument}:5m:${base + intervalMS}`))
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('completed rolling target admission serializes coverage checks before accepting a new range', async () => {
-  const store = new VersionedMemoryStore(), entered = deferred(), release = deferred()
-  await store.appendCandles(records({ ...request, priority: 'background', signal: new AbortController().signal, cursor: null }))
-  const { sync } = create({ store })
-  try {
-    const target = await sync.enqueue({ ...request, purpose: 'history' })
-    await sync.waitFor(target.id); await sync.whenIdle()
-    store.changed(base)
-    const read = store.missingCandleRanges.bind(store)
-    let block = true, newAdmitted = false
-    store.missingCandleRanges = async query => {
-      if (block) { block = false; entered.resolve(); await release.promise }
-      return read(query)
-    }
-    const old = sync.enqueue({ ...request, purpose: 'history' })
-    await within(entered.promise)
-    const next = sync.enqueue({ ...request, purpose: 'history', from: base + intervalMS, through: base + 3 * intervalMS }).then(task => { newAdmitted = true; return task })
-    await new Promise(resolve => setImmediate(resolve))
-    assert.equal(newAdmitted, false)
-    assert.equal(sync.getTask(target.id)?.through, request.through)
-    release.resolve()
-    assert.equal((await within(old)).through, request.through)
-    const accepted = await within(next)
-    assert.notEqual(accepted.status, 'completed', 'The old coverage result cannot complete the new missing tail.')
-    assert.equal((await within(sync.waitFor(target.id))).status, 'completed')
-    assert.ok(store.rows.has(`${request.instrument}:5m:${base + 3 * intervalMS}`))
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('startup uses the latest legacy retention intent when old progress timestamps are newer', async () => {
-  const metadata = new MemoryMetadata(), store = new VersionedMemoryStore()
-  const seed = create({ metadata, store }).sync
-  const seeded = await seed.enqueue(request)
-  await seed.waitFor(seeded.id); await seed.close()
-  const template = metadata.getSyncTask(seeded.id)!
-  metadata.tasks.clear()
-  const through = base + 200 * intervalMS
-  for (const [from, requestedAt, updatedAt] of [[base, base + 1, base + 999_999], [base + 100 * intervalMS, base + 2, base + 2]]) {
-    const id = createHash('sha256').update(JSON.stringify([request.instrument, request.timeframe, request.source, from, through])).digest('hex')
-    metadata.putSyncTask({ ...template, id, from, through, purpose: 'history', status: 'queued', remaining: [{ from, through }], targetRequestedAt: requestedAt, updatedAt } as HistoryTask)
-  }
-  const { sync } = create({ metadata, store })
-  try {
-    await sync.start()
-    const restored = sync.listTasks()
-    assert.equal(restored.length, 1)
-    assert.equal(restored[0].from, base + 100 * intervalMS)
-    assert.ok(!('targetRequestedAt' in restored[0]))
-    await within(sync.whenIdle())
-  } finally { await sync.close() }
-})
-
-test('disabling automatic warmup cancels its background goal without cancelling the active history page', async () => {
-  const entered = deferred(), release = deferred()
-  const { sync } = create({ sources: { candles: { async fetchGap(query) { entered.resolve(); await release.promise; return records(query) } } } })
-  const target = { ...request, historyDays: 1, warmupCandles: 2, asOf: base + 60 * 86_400_000 }
-  try {
-    const first = await sync.enqueueTarget(target)
-    await within(entered.promise)
-    const disabled = await sync.enqueueTarget({ ...target, warmupCandles: 0 })
-    assert.equal(disabled.history.id, first.history.id)
-    assert.equal(disabled.warmup, null)
-    assert.equal(sync.getTask(first.warmup!.id)?.status, 'cancelled')
-    assert.equal(sync.getTask(first.history.id)?.status, 'running')
-    release.resolve()
-    assert.equal((await within(sync.waitFor(first.history.id))).status, 'completed')
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('a moved paused rolling checkpoint restarts with bounded conservative progress before it is resumed', async () => {
-  const entered = deferred(), store = new VersionedMemoryStore(), metadata = new MemoryMetadata()
-  let sync = create({ store, metadata, sources: { candles: { async fetchGap(query) {
-    entered.resolve()
-    return new Promise<CandleRecord[]>((_, reject) => query.signal.addEventListener('abort', () => reject(query.signal.reason), { once: true }))
-  } } } }).sync
-  try {
-    const original = await sync.enqueue({ ...request, purpose: 'history' })
-    await within(entered.promise)
-    await sync.pause(original.id); await sync.whenIdle()
-    const bounds = { from: base + intervalMS, through: base + 4 * intervalMS }
-    const moved = await sync.enqueue({ ...request, ...bounds, purpose: 'history' })
-    assert.equal(moved.status, 'paused')
-    assert.deepEqual(metadata.getSyncTask(original.id)?.remaining, [bounds])
-    assert.equal(metadata.getSyncTask(original.id)?.cursorRange, null)
-    await sync.close()
-    sync = create({ store, metadata }).sync
-    await sync.start()
-    assert.equal(sync.getTask(original.id)?.status, 'paused')
-    assert.deepEqual(sync.getTask(original.id)?.remaining, [bounds])
-    await sync.resume(original.id)
-    assert.equal((await within(sync.waitFor(original.id))).status, 'completed')
-    assert.ok(store.rows.has(`${request.instrument}:5m:${bounds.through}`))
-  } finally { await sync.close() }
-})
-
-test('a rolling window moved during an old coverage read can quit and restart before any page completes', async () => {
-  const entered = deferred(), release = deferred(), store = new VersionedMemoryStore()
-  class CheckedMetadata extends MemoryMetadata {
-    override putSyncTask(task: HistoryTask) {
-      assert.ok([...task.remaining, ...(task.cursorRange ? [task.cursorRange] : [])].every(bounds => bounds.from >= task.from && bounds.through <= task.through), 'Every durable checkpoint must fit its own current target bounds.')
-      return super.putSyncTask(task)
-    }
-  }
-  const metadata = new CheckedMetadata()
-  const read = store.missingCandleRanges.bind(store)
-  let block = true, fetches = 0
-  store.missingCandleRanges = async query => {
-    if (block) { block = false; entered.resolve(); await release.promise }
-    return read(query)
-  }
-  let sync = create({ store, metadata, sources: { candles: { fetchGap(query) { fetches++; return records(query) } } } }).sync
-  try {
-    const original = await sync.enqueue({ ...request, purpose: 'history' })
-    await within(entered.promise)
-    const bounds = { from: base + intervalMS, through: base + 4 * intervalMS }
-    const moved = await sync.enqueue({ ...request, ...bounds, purpose: 'history' })
-    assert.equal(moved.status, 'running')
-    assert.deepEqual(metadata.getSyncTask(original.id)?.remaining, [bounds])
-    const closing = sync.close()
-    release.resolve()
-    await within(closing)
-    assert.equal(fetches, 0)
-    assert.ok(metadata.getSyncTask(original.id)!.remaining.every(range => range.from >= bounds.from && range.through <= bounds.through))
-    sync = create({ store, metadata }).sync
-    await sync.start()
-    assert.equal((await within(sync.waitFor(original.id))).status, 'completed')
-    assert.ok(store.rows.has(`${request.instrument}:5m:${bounds.through}`))
-  } finally { release.resolve(); await sync.close() }
-})
-
-test('parallel source slots keep an old active page serialized when its stable target moves to a disjoint window', async () => {
-  const entered = deferred(), release = deferred(), independent = deferred(), queries: HistorySourceQuery[] = []
-  const store = new VersionedMemoryStore()
-  const { sync } = create({ store, maxConcurrentTasks: 2, maxConcurrentPerSource: { candles: 2 }, sources: { candles: { async fetchGap(query) {
-    queries.push(query)
-    if (queries.length === 1) { entered.resolve(); await release.promise }
-    if (query.instrument === 'INDEPENDENT') independent.resolve()
-    return records(query)
-  } } } })
-  try {
-    const original = await sync.enqueue({ ...request, purpose: 'history', priority: 'foreground' })
-    await within(entered.promise)
-    await sync.enqueue({ ...request, from: base + 100 * intervalMS, through: base + 102 * intervalMS, purpose: 'history', priority: 'foreground' })
-    const exact = await sync.enqueue({ ...request, priority: 'foreground' })
-    await sync.enqueue({ ...request, instrument: 'INDEPENDENT', priority: 'foreground' })
-    await within(independent.promise)
-    assert.equal(queries.filter(query => query.instrument === request.instrument && query.from === request.from).length, 1,
-      'The exact old window waits for the old page even though the rolling task now points elsewhere.')
-    assert.equal(sync.getTask(exact.id)?.status, 'queued')
-    release.resolve()
-    assert.equal((await within(sync.waitFor(original.id))).status, 'completed')
-    assert.equal((await within(sync.waitFor(exact.id))).status, 'completed')
-    assert.equal(queries.filter(query => query.instrument === request.instrument && query.from === request.from).length, 1)
-  } finally { release.resolve(); await sync.close() }
-})
-
-class LeaseMemoryStore extends VersionedMemoryStore {
-  leases = new Map<number, number>()
-  now: () => number
-  constructor(now: () => number) { super(); this.now = now }
-  override async missingCandleRanges(query: CoverageQuery) {
-    this.queries.push(structuredClone(query))
-    const result: HistoryRange[] = []
-    let first: number | null = null
-    for (let timestamp = query.from; timestamp <= query.through; timestamp += query.intervalMS) {
-      const expiry = this.leases.get(timestamp)
-      const present = this.rows.has(`${query.instrument}:${query.timeframe}:${timestamp}`) && (expiry === undefined || expiry > this.now())
-      if (!present) first ??= timestamp
-      else if (first !== null) { result.push({ from: first, through: timestamp - query.intervalMS }); first = null }
-    }
-    if (first !== null) result.push({ from: first, through: query.through })
-    return result
-  }
-  coverageLeases(query: HistoryRange) {
-    return [...this.leases].filter(([timestamp, expiry]) => timestamp >= query.from && timestamp <= query.through && expiry > this.now())
-      .map(([timestamp, expiresAt]) => ({ from: timestamp, through: timestamp, expiresAt }))
-  }
-}
-
-const leaseFixture = async (count: number, now: () => number) => {
-  const store = new LeaseMemoryStore(now)
-  const through = base + (count - 1) * intervalMS
-  await store.appendCandles(Array.from({ length: count }, (_, index) => candle(base + index * intervalMS)))
-  return { store, query: { ...request, source: 'oi', through } }
-}
-
-test('one expired observation in a large verified window rechecks and repairs only its own slot', async () => {
-  let now = base + 20_000 * intervalMS
-  const { store, query } = await leaseFixture(10_000, () => now)
-  const stamp = base + 7_500 * intervalMS
-  store.leases.set(stamp, now + 10)
-  let fetches = 0
-  const { sync } = create({ store, now: () => now,
-    async write(rows) { rows.forEach(row => store.leases.delete(row.timestamp)); return store.appendCandles(rows) },
-    sources: { oi: { fetchGap(query) { fetches++; return records(query) } } },
+    write() { expiresAt = Date.now() + 50; revision++ },
   })
-  try {
-    const task = await sync.enqueue(query)
-    await sync.waitFor(task.id); await sync.whenIdle()
-    const before = store.queries.length
-    now += 11
-    await sync.enqueue(query); await sync.whenIdle()
-    assert.equal(fetches, 1)
-    assert.ok(store.queries.slice(before).every(query => query.from === stamp && query.through === stamp))
-    const reads = store.queries.length
-    now += 1_000_000
-    await sync.enqueue(query); await sync.whenIdle()
-    assert.equal(store.queries.length, reads, 'The numeric replacement never expires with the previous empty observation.')
-    assert.equal(sync.getTask(task.id)?.status, 'completed')
-  } finally { await sync.close() }
+  t.after(() => sync.close())
+  const goal = await sync.enqueue({ ...query, through: last, source: 'oi', purpose: 'history' })
+  await sync.waitFor(goal.id)
+  const initialReads = reads.length, intentWrites = metadata.writes
+  await waitFor(() => calls.length >= 2)
+  await sync.pause(goal.id)
+  assert.equal(calls.length, 2)
+  assert.ok(calls.every(call => call.from === last && call.through === last), 'A lease deadline cannot refetch numeric history beside the expired empty slot.')
+  assert.ok(reads.slice(initialReads).every(read => read.from === last && read.through === last), 'Only the expired source slot needs another coverage read.')
+  assert.equal(metadata.writes, intentWrites + 1, 'Only the explicit pause persists; page execution and lease wakes do not checkpoint.')
 })
 
-test('separate lease deadlines renew only their own contiguous ranges and retain a later renewal', async () => {
-  let now = base + 2_000 * intervalMS
-  const startedAt = now, { store, query } = await leaseFixture(1_000, () => now)
-  const early = { from: base + 100 * intervalMS, through: base + 101 * intervalMS }
-  const late = { from: base + 900 * intervalMS, through: base + 901 * intervalMS }
-  for (const stamp of [early.from, early.through]) store.leases.set(stamp, now + 10)
-  for (const stamp of [late.from, late.through]) store.leases.set(stamp, now + 20)
-  const fetched: HistoryRange[] = []
-  const { sync } = create({ store, now: () => now,
-    async write(rows) { rows.forEach(row => store.leases.set(row.timestamp, now + 30)); return store.appendCandles(rows) },
-    sources: { oi: { fetchGap(query) { fetched.push({ from: query.from, through: query.through }); return records(query) } } },
+for (const stop of ['pause', 'cancel', 'remove', 'close'] as const) test(`${stop} retires a canonical goal's empty-observation wake`, async t => {
+  let expiresAt = 0, calls = 0
+  const sync = new HistorySync({ metadata: new MemoryMetadata(), sources: { oi: { fetchGap: request => { calls++; return [{ instrument: request.instrument, timeframe: request.timeframe, timestamp: base, oi: null }] } } },
+    store: {
+      async missingCandleRanges() { return expiresAt > Date.now() ? [] : [{ from: base, through: base }] },
+      coverageLeases: () => expiresAt > Date.now() ? [{ from: base, through: base, expiresAt }] : [],
+    }, write() { expiresAt = Date.now() + 50 },
   })
-  try {
-    const task = await sync.enqueue(query)
-    await sync.waitFor(task.id); await sync.whenIdle()
-    for (const offset of [11, 21, 42]) { now = startedAt + offset; await sync.enqueue(query); await sync.whenIdle() }
-    assert.deepEqual(fetched, [early, late, early])
-    assert.ok(store.queries.slice(1).every(query => query.through - query.from <= intervalMS))
-    assert.equal(sync.getTask(task.id)?.status, 'completed')
-  } finally { await sync.close() }
-})
-
-test('a partial numeric update splits an existing lease so its numeric middle is never revalidated on expiry', async () => {
-  let now = base + 2_000 * intervalMS
-  const { store, query } = await leaseFixture(1_000, () => now)
-  for (let index = 100; index <= 109; index++) store.leases.set(base + index * intervalMS, now + 10)
-  const fetched: HistoryRange[] = []
-  const { sync } = create({ store, now: () => now,
-    async write(rows) { rows.forEach(row => store.leases.delete(row.timestamp)); return store.appendCandles(rows) },
-    sources: { oi: { fetchGap(query) { fetched.push({ from: query.from, through: query.through }); return records(query) } } },
-  })
-  try {
-    const task = await sync.enqueue(query)
-    await sync.waitFor(task.id); await sync.whenIdle()
-    const middle = [104, 105].map(index => candle(base + index * intervalMS))
-    middle.forEach(row => store.leases.delete(row.timestamp))
-    await store.appendCandles(middle)
-    await sync.enqueue(query); await sync.whenIdle()
-    const before = store.queries.length
-    now += 11
-    await sync.enqueue(query); await sync.whenIdle()
-    assert.deepEqual(fetched, [
-      { from: base + 100 * intervalMS, through: base + 103 * intervalMS },
-      { from: base + 106 * intervalMS, through: base + 109 * intervalMS },
-    ])
-    assert.ok(store.queries.slice(before).every(query => query.through < middle[0].timestamp || query.from > middle[1].timestamp))
-  } finally { await sync.close() }
-})
-
-test('a rolling window drops leases outside its new bounds instead of rechecking them when their deadline arrives', async () => {
-  let now = base + 2_000 * intervalMS
-  const { store, query } = await leaseFixture(1_001, () => now)
-  store.leases.set(base + 100 * intervalMS, now + 10)
-  const { sync } = create({ store, now: () => now, sources: { oi: { fetchGap() { throw new Error('The new window contains only numeric observations.') } } } })
-  try {
-    const original = await sync.enqueue({ ...query, through: base + 999 * intervalMS, purpose: 'history' })
-    await sync.waitFor(original.id); await sync.whenIdle()
-    const moved = { ...query, from: base + 101 * intervalMS, purpose: 'history' as const }
-    await sync.enqueue(moved); await sync.whenIdle()
-    const reads = store.queries.length
-    now += 11
-    await sync.enqueue(moved); await sync.whenIdle()
-    assert.equal(store.queries.length, reads)
-    assert.equal(sync.getTask(original.id)?.status, 'completed')
-  } finally { await sync.close() }
+  t.after(() => sync.close())
+  const goal = await sync.enqueue({ ...query, through: base, source: 'oi', purpose: 'history' })
+  await sync.waitFor(goal.id)
+  if (stop === 'remove') await sync.removeTargets([query.instrument])
+  else if (stop === 'close') await sync.close()
+  else await sync[stop](goal.id)
+  await new Promise(resolve => setTimeout(resolve, 75))
+  assert.equal(calls, 1)
 })

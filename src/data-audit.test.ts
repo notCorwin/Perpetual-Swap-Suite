@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
-import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { DatabaseSync } from 'node:sqlite'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DataAudit } from '../electron/services/data-audit.js'
@@ -372,8 +373,8 @@ test('an inspector I/O failure is a resumable failure, not a gap or a clean repo
   } finally { await audit.close() }
 })
 
-test('a partial-day request preserves and repairs the full corrupt Parquet partition', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-audit-parquet-'))
+test('a SQLite audit repairs a defective observation without replacing unrelated source history', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-audit-sqlite-'))
   const store = await MarketStore.open(root)
   const base = Date.UTC(2024, 0, 1)
   const through = base + day - interval
@@ -381,20 +382,19 @@ test('a partial-day request preserves and repairs the full corrupt Parquet parti
   const repairs: Array<[number, number]> = []
   const audit = new DataAudit({ metadata: new MemoryMetadata(), store, repair: async issue => {
     repairs.push([issue.from, issue.through])
-    await store.replaceCandles(issue, Array.from({ length: 288 }, (_, index) => candle(base + index * interval)))
+    await store.replaceCandles(issue, [candle(issue.from)])
   } })
   try {
-    await store.appendCandles([candle(base)])
-    const directory = join(root, 'candles', 'timeframe=5m', 'instrument=BTC-USDT-SWAP', 'date=2024-01-01')
-    const [file] = (await readdir(directory)).filter(name => name.endsWith('.parquet'))
-    await writeFile(join(directory, file), 'broken parquet')
-    const { id } = audit.start({ targets: [target(base + 12 * 3_600_000, base + 12 * 3_600_000)] })
+    await store.appendCandles(Array.from({ length: 288 }, (_, index) => candle(base + index * interval)))
+    const defect = base + 12 * 3_600_000, database = new DatabaseSync(store.path)
+    try { database.prepare('UPDATE candles SET high=90 WHERE timestamp=?').run(defect) } finally { database.close() }
+    const { id } = audit.start({ targets: [target(defect, defect)] })
     await audit.whenIdle()
     assert.equal(audit.get(id)!.status, 'completed')
-    assert.deepEqual(audit.get(id)!.issues.map(issue => [issue.reason, issue.from, issue.through]), [['corrupt-file', base, through]])
+    assert.deepEqual(audit.get(id)!.issues.map(issue => [issue.reason, issue.from, issue.through]), [['invalid-ohlc', defect, defect]])
     audit.repair(id)
     await audit.whenIdle()
-    assert.deepEqual(repairs, [[base, through]])
+    assert.deepEqual(repairs, [[defect, defect]])
     assert.deepEqual(audit.get(id)!.summary, { open: 0, resolved: 1, repairFailed: 0 })
     assert.equal((await store.candles({ ...target(base, through) })).length, 288)
   } finally { await audit.close(); await store.close(); await rm(root, { recursive: true, force: true }) }

@@ -23,7 +23,7 @@ const LATEST_CANDLE_REFRESH = 60_000
 const HISTORICAL_STATISTICS_REFRESH = 6 * 3_600_000
 const REQUEST_TIMEOUT = 12_000
 const RETRY_DELAYS = [1_000]
-const REQUEST_PRIORITY = { background: 0, chartWarm: 0, statistics: 1, foreground: 2, repair: 2, prepared: 2 }
+const REQUEST_PRIORITY = { background: 0, chartWarm: 0, prefetch: 1, statistics: 2, continuity: 2, foreground: 3, repair: 3, prepared: 3, interactive: 4 }
 const REQUEST_LANE_INTERVALS = Object.freeze({ candles: 100, oi: 200, taker: 400, books: 50, instruments: 100, tickers: 100, openInterest: 100, market: 80 })
 const requestLaneFor = path => {
   if (path.includes('/rubik/stat/taker-volume-contract')) return 'taker'
@@ -69,7 +69,6 @@ const number = value => {
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : null
 }
-const hasStatisticsSource = (value, source) => (statisticsMask(value) & source) === source
 const timeframeMilliseconds = timeframe => timeframe === '5m' ? FIVE_MINUTES : timeframe === '15m' ? 900_000 : 3_600_000
 const statisticsExpiryAt = (timeframe, end, observedAt = Date.now()) => observedAt
   + (end >= observedAt - timeframeMilliseconds(timeframe) * 2 ? LATEST_CANDLE_REFRESH : HISTORICAL_STATISTICS_REFRESH)
@@ -110,30 +109,9 @@ function candle(instrument, timeframe, value) {
   return { instrument, timeframe, timestamp, open, high, low, close, volume: number(value[5]), baseVolume: number(value[6]), quoteVolume: number(value[7]), confirmed: value[8] === '1' }
 }
 
-const candleFields = ['instrument', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'baseVolume', 'quoteVolume', 'oi', 'buy', 'sell', 'statisticsVersion', 'statisticsOIExpiresAt', 'statisticsTakerExpiresAt', 'confirmed']
-const optionalCandleFields = new Set(['oi', 'buy', 'sell', 'statisticsVersion', 'statisticsOIExpiresAt', 'statisticsTakerExpiresAt'])
-
-function mergedCandle(previous, next) {
-  // Raw/derived candle writes use null as “no new statistics”, so they must
-  // preserve the direct statistics already attached to that timestamp.
-  // Statistics hydration is different: an explicit null from the current
-  // direct endpoint is authoritative and must clear any legacy value. Keep
-  // that one-shot replacement instruction out of the Parquet record itself.
-  const replaceStatistics = next.replaceStatistics === true
-  const { replaceStatistics: _replaceStatistics, ...candidate } = next
-  if (!previous) return candidate
-  const merged = { ...previous, ...candidate }
-  if (!replaceStatistics) for (const field of optionalCandleFields) if (candidate[field] === null || candidate[field] === undefined) merged[field] = previous[field] ?? null
-  return merged
-}
-
-function sameCandle(left, right) {
-  return candleFields.every(field => {
-    const leftValue = optionalCandleFields.has(field) ? left[field] ?? null : left[field]
-    const rightValue = optionalCandleFields.has(field) ? right[field] ?? null : right[field]
-    return Object.is(leftValue, rightValue)
-  })
-}
+const candleFields = ['instrument', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'baseVolume', 'quoteVolume', 'confirmed']
+const priceRecord = row => Object.fromEntries(candleFields.map(field => [field, row[field] ?? null]))
+const sameCandle = (left, right) => candleFields.every(field => Object.is(left[field] ?? null, right[field] ?? null))
 
 function marketRow(instrument, ticker, result, bars = [], bollExpansion) {
   const last = number(ticker.last), metrics = summarizeMarketBars(bars), { latest } = metrics
@@ -258,6 +236,8 @@ export class MarketService {
     this.dataRevisions = new Map()
     this.liveCandles = new Map()
     this.liveCandleSources = new Map()
+    this.liveReceivedAt = new Map()
+    this.sourceRecoveries = new Map()
     this.liveStatistics = new LiveStatistics()
     this.streamQualifications = new Set()
     this.streamQualificationTimer = null
@@ -296,6 +276,17 @@ export class MarketService {
     this.preparedCharts = new PreparedChartPipeline({ store, history, normalize: normalizedStatistics, revision: instId => this.dataRevision(instId), instrument: instId => this.instruments.get(instId),
       streaming: (instId, timeframe) => this.realtime?.isSubscribed(instId, timeframe) ?? false })
     this.ready = this.initialize()
+    this.unsubscribeStore = this.store.subscribe?.(change => {
+      if (!change.imported || this.closing) return
+      this.markChartDataChanged(change.instrument)
+      if (change.priceFrom !== null) {
+        this.preparedCharts.invalidate(change.instrument, change.timeframe)
+        this.invalidateLiquidityHistory(change.instrument, null, change.timeframe)
+        this.scheduleQualification(change.instrument, change.timeframe)
+        if (change.timeframe === '5m') this.track(this.updateRanking(change.instrument))
+      } else this.track(this.preparedCharts.observeStatistics(change.instrument, change.timeframe, change.from, change.through))
+      this.scheduleListProjection(change.instrument)
+    })
   }
 
   prefs() { return validatePreferences(this.preferences()) }
@@ -347,15 +338,15 @@ export class MarketService {
         }
       },
       ...(this.webSocketFactory ? { webSocketFactory: this.webSocketFactory } : {}),
-      onForming: row => this.setLive(row.instrument, row.timeframe, row),
+      onForming: (row, context) => { this.track(Promise.resolve(this.setLive(row.instrument, row.timeframe, row, context))) },
       onConfirmed: async row => {
         await this.persistCandles(row.instrument, [row])
         // Native statistics remain authoritative for completed periods. Repair
         // this just-closed slot ahead of the multi-day background archive.
-        this.track(this.history.ensureStatistics(row.instrument, row.timeframe, row.timestamp, row.timestamp, 'foreground', this.shutdownController.signal))
+        this.track(this.history.ensureStatistics(row.instrument, row.timeframe, row.timestamp, row.timestamp, 'continuity', this.shutdownController.signal))
         const live = this.liveCandles.get(`${row.instrument}:${row.timeframe}`)
-        if (!live || live.timestamp <= row.timestamp) await this.setLive(row.instrument, row.timeframe, null)
-        await this.updateRanking(row.instrument)
+        if (!live || live.timestamp <= row.timestamp) this.track(Promise.resolve(this.setLive(row.instrument, row.timeframe, null)))
+        this.track(this.updateRanking(row.instrument))
       },
       onReconnect: (subscriptions, context) => this.reconcileRealtime(subscriptions, context),
     })
@@ -714,10 +705,19 @@ export class MarketService {
     return lane
   }
 
-  nextQueuedRequest(lane) {
-    let next = 0
-    for (let index = 1; index < lane.queue.length; index += 1) {
-      if (requestPriority(lane.queue[index].priority) > requestPriority(lane.queue[next].priority)) next = index
+  nextQueuedRequest(lane, eligible = () => true) {
+    // Reserve service for interactive work while ageing maintenance instead
+    // of starving an archive behind an endless stream of closes.
+    const now = Date.now()
+    const score = request => requestPriority(request.priority) + Math.min(5, (now - (request.enqueuedAt ?? now)) / 5_000)
+    const candidates = lane.queue.map((request, index) => ({ request, index })).filter(({ request }) => eligible(request))
+    if (!candidates.length) return null
+    let next = candidates[0].index
+    for (const { request, index } of candidates) if (score(request) > score(lane.queue[next])) next = index
+    lane.served = (lane.served ?? 0) + 1
+    if (lane.served % 8 === 0) {
+      const background = candidates.find(({ request }) => requestPriority(request.priority) <= 1)?.index ?? -1
+      if (background >= 0) next = background
     }
     return lane.queue.splice(next, 1)[0]
   }
@@ -755,6 +755,7 @@ export class MarketService {
   }
 
   async performRequest(lane, request) {
+    const startedAt = performance.now()
     try {
       if (this.disposed || request.controller.signal.aborted) throw request.controller.signal.reason ?? new Error('Market service is closed.')
       const timeout = setTimeout(() => request.controller.abort(new RequestTimeoutError(request.path, this.requestTimeout)), this.requestTimeout)
@@ -772,6 +773,7 @@ export class MarketService {
             // A 429 cools only the endpoint family that returned it. OI
             // must never freeze an unrelated candle repair or Taker read.
             lane.rateLimitedUntil = Math.max(lane.rateLimitedUntil, Date.now() + (serverDelay ?? RETRY_DELAYS[0]))
+            lane.concurrency = Math.max(2, Math.floor((lane.concurrency ?? 4) / 2))
             throw new RetryAfterError(request.path, serverDelay, lane.name)
           }
           if (!response.ok) throw new Error(`OKX ${request.path} failed (${response.status}).`)
@@ -780,6 +782,15 @@ export class MarketService {
           if (payload.code && payload.code !== '0') throw new Error(`OKX ${request.path}: ${payload.msg || payload.code}`)
           return payload.data ?? []
         }), request.controller.signal)
+        lane.latencyMS = lane.latencyMS === undefined ? performance.now() - startedAt : lane.latencyMS * 0.8 + (performance.now() - startedAt) * 0.2
+        lane.completed = (lane.completed ?? 0) + 1
+        if (lane.interval > 0) {
+          lane.concurrency = Math.max(2, Math.min(lane.name === 'books' ? 16 : 8, Math.ceil(lane.latencyMS / lane.interval) + 1))
+          if (this.history?.sync.maxConcurrentPerSource.has(lane.name)) {
+            this.history.sync.maxConcurrentPerSource.set(lane.name, lane.concurrency)
+            this.history.sync.maxConcurrentTasks = Math.min(24, [...this.history.sync.maxConcurrentPerSource.values()].reduce((sum, count) => sum + count, 0))
+          }
+        }
         request.resolve(data)
       } finally {
         clearTimeout(timeout)
@@ -794,14 +805,16 @@ export class MarketService {
     lane.running = true
     const task = (async () => {
       while (lane.queue.length || lane.active.size) {
-        const backgroundActive = [...lane.active.values()].some(request => requestPriority(request.priority) === 0)
-        const canStart = lane.active.size < (name === 'books' ? 16 : 4) && lane.queue.some(request => requestPriority(request.priority) > 0 || !backgroundActive)
+        const limit = lane.concurrency ?? (name === 'books' ? 16 : 4)
+        const maintenanceActive = [...lane.active.values()].filter(request => requestPriority(request.priority) < 3).length
+        const eligible = request => requestPriority(request.priority) >= 3 || maintenanceActive < Math.max(1, limit - 1)
+        const canStart = lane.active.size < limit && lane.queue.some(eligible)
         if (!canStart) { await this.waitRequestLane(lane); continue }
         const delay = Math.max(lane.nextAt, lane.rateLimitedUntil) - Date.now()
         if (delay > 0) { await this.waitRequestLane(lane, delay); continue }
         // Choose at admission time so newly queued chart/qualification work
         // passes downloads that were waiting for the endpoint's rate budget.
-        const request = this.nextQueuedRequest(lane)
+        const request = this.nextQueuedRequest(lane, eligible)
         lane.nextAt = Date.now() + lane.interval
         const active = this.performRequest(lane, request).finally(() => {
           lane.active.delete(active)
@@ -835,7 +848,7 @@ export class MarketService {
     let resolveRequest, rejectRequest
     const result = new Promise((resolve, reject) => { resolveRequest = resolve; rejectRequest = reject })
     const queue = this.requestLane(lane)
-    const request = { path, parameters, requestSignal, priority, lane, controller, abort, resolve: resolveRequest, reject: rejectRequest, cleaned: false, onAbort: null }
+    const request = { path, parameters, requestSignal, priority, lane, controller, abort, enqueuedAt: Date.now(), resolve: resolveRequest, reject: rejectRequest, cleaned: false, onAbort: null }
     request.onAbort = () => this.rejectQueuedRequest(request)
     controller.signal.addEventListener('abort', request.onAbort, { once: true })
     if (controller.signal.aborted) request.onAbort()
@@ -863,10 +876,13 @@ export class MarketService {
     const from = Math.min(...candles.map(value => value.timestamp)), through = Math.max(...candles.map(value => value.timestamp))
     const existing = await this.store.candles({ instrument, timeframe, from, through }, priority)
     const byTimestamp = new Map(existing.map(value => [value.timestamp, value]))
-    const changed = candles.map(value => mergedCandle(byTimestamp.get(value.timestamp), value)).filter(value => !sameCandle(byTimestamp.get(value.timestamp) ?? {}, value))
+    const changed = candles.filter(value => !sameCandle(byTimestamp.get(value.timestamp) ?? {}, value)).map(priceRecord)
     if (changed.length) {
       await this.store.appendCandles(changed, priority)
-      this.preparedCharts.observe(changed, byTimestamp)
+      const timestamps = new Set(changed.map(row => row.timestamp))
+      const committed = (await this.store.candles({ instrument, timeframe, from, through }, priority)).filter(row => timestamps.has(row.timestamp))
+      this.preparedCharts.observe(committed, byTimestamp)
+      return committed
     }
     return changed
   }
@@ -894,28 +910,9 @@ export class MarketService {
     await this.ready
     return this.enqueueCandleMutation(range.instrument, async () => {
       if (this.disposed) throw new Error('Market service is closed.')
-      let previous
-      try { previous = await this.store.candles(range, priority) }
-      catch (error) {
-        // Strict reads cannot recover statistics from corrupt or invalid data.
-        // Confirm a data defect before proceeding; operational I/O errors must
-        // still fail the repair rather than masquerading as missing metadata.
-        const inspection = await this.store.inspectCandles(range, priority)
-        if (!inspection.issues.some(issue => issue.repairable && issue.reason !== 'gap')) throw error
-        previous = []
-      }
-      const byTimestamp = new Map(previous.map(row => [row.timestamp, row]))
-      const replacement = candles.map(row => {
-        const prior = byTimestamp.get(row.timestamp)
-        if (!prior) return row
-        const merged = { ...row }
-        // Downloaded prices and volumes are authoritative. Only source
-        // statistics survive, with their existing observation leases intact.
-        for (const field of optionalCandleFields) if (merged[field] == null) merged[field] = prior[field] ?? null
-        // Validate Taker zero observations against the repaired traded volume.
-        return normalizedStatistics(merged)
-      })
-      await this.store.replaceCandles(range, replacement, priority)
+      // Statistics belong to their own sources. Replacing prices must never
+      // replay an earlier read over a newer independent statistic commit.
+      await this.store.replaceCandles(range, candles.map(priceRecord), priority)
       this.onHistoryReplaced(range.instrument, range.timeframe)
     })
   }
@@ -939,75 +936,28 @@ export class MarketService {
 
   async persistStatisticsSource(instrument, timeframe, end, source, values, signal, priority = 'statistics', preserveExistingSource = false, { range, projectList = true } = {}) {
     await this.ready
-    const byHour = source === STATISTICS_OI
-      ? new Map(values.map(value => [Number(value[0]), number(value[1])]))
-      : new Map(values.map(value => [Number(value[0]), { sell: number(value[1]), buy: number(value[2]) }]))
+    if (this.disposed || signal?.aborted) return false
     const page = range ?? this.statisticsPageRange(timeframe, end)
-    const expiresAt = this.statisticsExpiry(timeframe, end)
-    const expiryField = statisticsExpiryField(source)
-    const storePriority = priority === 'background' || priority === 'chartWarm' ? 'background' : 'foreground'
-    const changed = await this.enqueueCandleMutation(instrument.instId, async () => {
-      if (this.disposed || signal?.aborted) return false
-      const local = (await this.store.candles({ instrument: instrument.instId, timeframe, from: page.from, through: page.through }, storePriority)).map(normalizedStatistics)
-      const patched = local.filter(value => value.confirmed).map(value => {
-        const sourceAlreadyObserved = hasStatisticsSource(value, source)
-        const preserveSource = preserveExistingSource && sourceAlreadyObserved
-        const existingOI = number(value.oi)
-        const existingVolumes = { sell: number(value.sell), buy: number(value.buy) }
-        const incomingOI = source === STATISTICS_OI ? byHour.get(value.timestamp) ?? null : null
-        const incomingVolumes = source === STATISTICS_TAKER ? validTakerVolumes(value, byHour.get(value.timestamp) ?? null) : null
-        const incomingHasValue = source === STATISTICS_OI
-          ? incomingOI !== null
-          : incomingVolumes !== null && incomingVolumes.sell !== null && incomingVolumes.buy !== null
-        const existingHasValue = source === STATISTICS_OI
-          ? sourceAlreadyObserved && existingOI !== null
-          : sourceAlreadyObserved && existingVolumes.sell !== null && existingVolumes.buy !== null
-        // An empty current page is a useful direct observation for rows that
-        // were never observed, but it is not better data than a numeric
-        // direct observation from an overlapping page. Near the live edge
-        // OKX may return an empty 100-row page while its preceding cursor
-        // still has the shared 88 values. Clearing those values caused the
-        // back-scroll gaps seen in the chart, so only a concrete source value
-        // may replace an existing concrete source value.
-        const retainExistingValue = preserveSource || !incomingHasValue && existingHasValue
-        const sources = preserveSource ? statisticsMask(value) : statisticsMask(value) | source
-        const oi = source === STATISTICS_OI ? retainExistingValue ? existingOI : incomingOI
-          : hasStatisticsSource(value, STATISTICS_OI) ? existingOI : null
-        const volumes = source === STATISTICS_TAKER ? retainExistingValue ? existingVolumes : incomingVolumes
-          : hasStatisticsSource(value, STATISTICS_TAKER) ? existingVolumes : null
-        const sourceExpiry = preserveSource ? number(value[expiryField])
-          // Direct numeric values do not need an expiry. This also removes a
-          // stale lease from a prior empty page when a neighboring numeric
-          // observation is retained.
-          : incomingHasValue || existingHasValue ? null
-            : Number.isFinite(expiresAt) ? expiresAt : null
-        const next = {
-          ...value,
-          oi,
-          sell: volumes?.sell ?? null,
-          buy: volumes?.buy ?? null,
-          [expiryField]: sourceExpiry,
-        }
-        return { ...next, statisticsVersion: statisticsVersionFor(sources, next), replaceStatistics: true }
-      })
-      const written = await this.appendChangedCandlesLocked(patched, storePriority)
-      return written.length > 0
-    })
+    const changed = await this.store.appendStatistics({ instrument: instrument.instId, timeframe,
+      source: source === STATISTICS_OI ? 'oi' : 'taker', from: page.from, through: page.through,
+      values: values.map(value => value.map(number)), expiresAt: this.statisticsExpiry(timeframe, end), preserveExistingSource }, priority)
     if (changed) {
       this.markChartDataChanged(instrument.instId)
+      this.track(this.preparedCharts.observeStatistics(instrument.instId, timeframe, page.from, page.through))
       if (projectList) this.scheduleListProjection(instrument.instId)
     }
-    return changed
+    return changed > 0
   }
 
 
-  setLive(instId, timeframe, row) {
+  setLive(instId, timeframe, row, { receivedAt } = {}) {
     if (this.disposed) return
     const key = `${instId}:${timeframe}`, current = this.liveCandles.get(key)
     // REST initialization can resolve after a newer stream event. Same-volume
     // price corrections remain valid; older timestamps/cumulative volume do not.
     if (row && current && (row.timestamp < current.timestamp || row.timestamp === current.timestamp && row.volume < current.volume)) return Promise.resolve(null)
     if (row) {
+      this.liveReceivedAt.set(key, receivedAt ?? this.liveReceivedAt.get(key) ?? Date.now())
       this.liveCandleSources.set(key, row)
       row = this.liveStatistics.enrich(row)
       this.liveCandles.set(key, row)
@@ -1019,7 +969,7 @@ export class MarketService {
     // indicator projections; an undisplayed contract must not seed a chart on every tick.
     const chartKey = `${instId}:${timeframe}`
     if (!this.preparedCharts.realtimeKeys.has(chartKey) && !this.preparedCharts.series.has(chartKey) && !this.preparedCharts.snapshots.has(chartKey)) return
-    return this.preparedCharts.setLive(instId, timeframe, row)
+    return this.preparedCharts.setLive(instId, timeframe, row, { receivedAt: this.liveReceivedAt.get(key) })
   }
 
   scheduleLiveStatistics(instId) {
@@ -1050,6 +1000,7 @@ export class MarketService {
     if (key === 'openInterest' && (number(value.oiUsd) === null || number(value.oiUsd) < 0)) return
     observations[key] = { value, source: 'websocket', sourceTimestamp, observedAt: receivedAt, expiresAt: receivedAt + OBSERVATION_TTL }
     this.observations.set(instId, observations)
+    this.cancelRequiredRecovery(`${instId}:${key}`)
     if (key === 'ticker') {
       const session = this.tickerSubscriptions.get(instId)
       if (acknowledged !== false && session && session.signal === signal && !signal.aborted && receivedAt >= session.receivedAt && session.subscription === this.publicRealtime.subscriptions.get(`tickers:${instId}`)) {
@@ -1359,9 +1310,9 @@ export class MarketService {
       const step = timeframeMilliseconds(timeframe), through = closedBoundary(timeframe) - step
       const coverage = await this.store.coverage(instId, timeframe, 'background')
       const from = Math.max(0, coverage.last === null ? through - step : Math.min(through, coverage.last + step))
-      await this.history.ensurePrices(instId, timeframe, from, through, 'foreground', signal)
+      await this.history.ensurePrices(instId, timeframe, from, through, 'continuity', signal)
       if (signal?.aborted) return
-      await this.history.ensureStatistics(instId, timeframe, from, through, 'foreground', signal)
+      await this.history.ensureStatistics(instId, timeframe, from, through, 'continuity', signal)
     }))
     const failed = results.find(result => result.status === 'rejected')
     if (failed) throw failed.reason
@@ -1379,7 +1330,7 @@ export class MarketService {
     if (this.closing || this.disposed) throw new Error('Market service is closed.')
     this.chartSubscriptions = [...new Set(instIds)].map(instId => ({ instId, timeframe }))
     this.updateSubscriptions()
-    return this.preparedCharts.backfillUniverse(instIds, timeframe, focusInstId)
+    return this.preparedCharts.setUniverse(instIds, timeframe, focusInstId)
   }
 
   subscribePreparedCharts(listener) { return this.preparedCharts.subscribe(listener) }
@@ -1463,6 +1414,7 @@ export class MarketService {
 
   scheduleMarketDeadline() {
     if (this.closing || this.disposed || this.processingMarketDeadline) return
+    for (const recovery of this.sourceRecoveries.values()) if (!this.requiredRecoveryCurrent(recovery)) this.cancelRequiredRecovery(recovery.key)
     const now = Date.now()
     // A due callback owns the captured deadlines even if another observation
     // arrives before the timer gets its event-loop turn.
@@ -1488,7 +1440,8 @@ export class MarketService {
     const retries = [...this.listProjectionFailures.values()].filter(value => this.catalog.has(value.instId) && !this.listProjectionTasks.has(this.listKey(value.instId, value.timeframe))).map(value => value.retryAt)
     const boundary = ids.size ? closedBoundary('5m', now) + FIVE_MINUTES : Infinity
     const tickerRetries = [...this.tickerRecoveries].filter(([id, value]) => this.candidateIDs?.has(id) && !value.signal.aborted && !value.task).map(([, value]) => value.retryAt)
-    const next = Math.min(boundary, ...deadlines.values(), ...retries, ...tickerRetries)
+    const sourceRetries = [...this.sourceRecoveries.values()].filter(value => !value.task).map(value => value.retryAt)
+    const next = Math.min(boundary, ...deadlines.values(), ...retries, ...tickerRetries, ...sourceRetries)
     if (this.marketDeadlineAt === next) return
     if (this.marketDeadlineTimer) clearTimeout(this.marketDeadlineTimer)
     this.marketDeadlineTimer = null
@@ -1509,6 +1462,7 @@ export class MarketService {
       if (asOf !== this.marketBoundary) {
         this.marketBoundary = asOf
         this.touchList()
+        for (const instId of this.candidateIDs ?? []) this.advanceHistoryTarget(instId)
         for (const instId of this.catalog.keys()) this.track(this.updateRanking(instId, { asOf }))
         for (const instId of this.catalogChecks.keys()) this.scheduleQualification(instId)
       }
@@ -1520,6 +1474,7 @@ export class MarketService {
         if (record) this.catalogChecks.set(instId, { ...record, status: 'unknown', result: { ...record.result, eligible: false }, expiresAt: now })
         this.streamQualifications.add(instId)
         this.scheduleQualification(instId)
+        this.recoverRequiredSources(instId)
       }
       if (due.size) { this.flushStreamQualifications(); this.touchList() }
       for (const instId of due) {
@@ -1529,11 +1484,89 @@ export class MarketService {
         }
       }
       for (const [instId, recovery] of this.tickerRecoveries) if (!recovery.task && recovery.retryAt <= now) this.track(this.repairTicker(instId, recovery))
+      for (const recovery of this.sourceRecoveries.values()) if (!recovery.task && recovery.retryAt <= now) this.track(this.repairRequiredSource(recovery))
       for (const failure of this.listProjectionFailures.values()) if (failure.retryAt <= now && this.catalog.has(failure.instId)) this.track(this.projectListEntry(failure.instId, failure.timeframe))
     } finally {
       this.processingMarketDeadline = false
       this.scheduleMarketDeadline()
     }
+  }
+
+  recoverRequiredSources(instId) {
+    if (!this.autoRefresh || this.closing || !this.candidateIDs?.has(instId)) return
+    const config = this.prefs().liquidity, observations = this.observations.get(instId) ?? {}
+    for (const source of ['book', 'openInterest', 'turnover', 'hourly']) {
+      const enabled = source === 'book' ? config.depth.enabled || config.slippage.enabled
+        : source === 'openInterest' ? config.openInterest.enabled : source === 'turnover' ? config.volume24h.enabled : config.volumeStability.enabled
+      const key = `${instId}:${source}`
+      if (!enabled || this.observation(observations, source)) { this.cancelRequiredRecovery(key); continue }
+      if (!this.sourceRecoveries.has(key)) this.sourceRecoveries.set(key, { key, instId, source, attempts: 0, retryAt: Date.now(), task: null, controller: new AbortController() })
+    }
+    this.scheduleMarketDeadline()
+  }
+
+  requiredRecoveryCurrent(recovery) {
+    if (!this.candidateIDs?.has(recovery.instId)) return false
+    const config = this.prefs().liquidity
+    const enabled = recovery.source === 'book' ? config.depth.enabled || config.slippage.enabled
+      : recovery.source === 'openInterest' ? config.openInterest.enabled : recovery.source === 'turnover' ? config.volume24h.enabled : config.volumeStability.enabled
+    return enabled && !this.observation(this.observations.get(recovery.instId) ?? {}, recovery.source)
+  }
+
+  cancelRequiredRecovery(key) {
+    const recovery = this.sourceRecoveries.get(key)
+    if (!recovery) return
+    this.sourceRecoveries.delete(key)
+    recovery.controller?.abort()
+    this.sourceError(key, null)
+  }
+
+  async repairRequiredSource(recovery) {
+    if (recovery.task || this.closing || this.sourceRecoveries.get(recovery.key) !== recovery) return
+    if (!this.requiredRecoveryCurrent(recovery)) { this.cancelRequiredRecovery(recovery.key); return }
+    const requestedAt = Date.now(), signal = AbortSignal.any([this.shutdownController.signal, recovery.controller.signal])
+    const task = (async () => {
+      try {
+        if (recovery.source === 'turnover' || recovery.source === 'hourly') {
+          const timeframe = recovery.source === 'turnover' ? '5m' : '1H', count = timeframe === '5m' ? 288 : 24
+          const step = timeframeMilliseconds(timeframe), end = closedBoundary(timeframe)
+          await this.history.ensurePrices(recovery.instId, timeframe, end - count * step, end - step, 'continuity', signal)
+          const config = this.prefs().liquidity, instrument = this.instruments.get(recovery.instId)
+          if (instrument) await this.checkCandidate(instrument, config, JSON.stringify(config), signal, 'continuity', { localOnly: true })
+          if (!this.observation(this.observations.get(recovery.instId) ?? {}, recovery.source)) throw new Error(`The completed ${recovery.source} range is not available.`)
+          this.sourceRecoveries.delete(recovery.key)
+          this.sourceError(recovery.key, null)
+          return
+        }
+        const observation = recovery.source === 'book'
+          ? await this.get('/market/books', { instId: recovery.instId, sz: 400 }, signal, 'continuity').then(values => {
+            const value = values[0]
+            if (!value?.bids?.length || !value?.asks?.length) throw new Error('Missing order-book observation.')
+            const observedAt = Date.now()
+            return { value, source: 'rest', sourceTimestamp: number(value.ts), observedAt, expiresAt: observedAt + OBSERVATION_TTL }
+          })
+          : (await this.openInterest.observe(signal, 'continuity')).get(recovery.instId)
+        if (!observation) throw new Error(`Missing ${recovery.source} observation for ${recovery.instId}.`)
+        if (this.closing || signal.aborted || this.sourceRecoveries.get(recovery.key) !== recovery) return
+        const observations = this.observations.get(recovery.instId) ?? {}
+        const previous = observations[recovery.source]
+        const previousTimestamp = number(previous?.sourceTimestamp ?? previous?.value?.ts)
+        const sourceTimestamp = number(observation.sourceTimestamp ?? observation.value?.ts)
+        if (previousTimestamp !== null && sourceTimestamp !== null && sourceTimestamp < previousTimestamp) throw new Error(`${recovery.source} recovery returned an older observation for ${recovery.instId}.`)
+        if (!previous || previous.observedAt < requestedAt) observations[recovery.source] = { ...observation, sourceTimestamp }
+        this.observations.set(recovery.instId, observations)
+        this.sourceRecoveries.delete(recovery.key)
+        this.sourceError(recovery.key, null)
+        this.queueStreamQualification(recovery.instId)
+      } catch (error) {
+        if (!signal.aborted && this.sourceRecoveries.get(recovery.key) === recovery) {
+          recovery.retryAt = Date.now() + Math.min(30_000, 1_000 * 2 ** Math.min(5, recovery.attempts++))
+          this.sourceError(recovery.key, error)
+        }
+      }
+    })().finally(() => { recovery.task = null; this.scheduleMarketDeadline() })
+    recovery.task = task
+    return task
   }
 
   liquidityInput(instrument, config, observations, now = Date.now()) {
@@ -1700,7 +1733,7 @@ export class MarketService {
           revision = this.liquidityHistoryRevision(instId, timeframe)
           // Qualification needs only its recent window. Admit missing slots
           // ahead of rolling multi-day targets, without blocking the renderer.
-          const prepared = await this.history.ensurePrices(instId, timeframe, from, through, 'foreground', signal)
+          const prepared = await this.history.ensurePrices(instId, timeframe, from, through, 'continuity', signal)
           rows = prepared.rows
         }
         while (revision !== this.liquidityHistoryRevision(instId, timeframe)) {
@@ -1777,6 +1810,7 @@ export class MarketService {
     const record = this.observedCandidate(instrument, config, configKey, observations, errors, now)
     record.preferencesRevision = this.metadata.getSettings().revision
     const { status } = record
+    if (status === 'unknown') this.recoverRequiredSources(instId)
     this.metadata.putCatalogEntry(record)
     this.catalogChecks.set(instId, record)
     if (status === 'verified') this.renewalTargets.set(instId, instrument)
@@ -1846,8 +1880,10 @@ export class MarketService {
     const candidates = [...definitions.values()].filter(eligibleInstrument).map(value => value.ctMult === '' ? { ...value, ctMult: '1' } : value)
     const nextIDs = new Set(candidates.map(value => value.instId))
     const removedIDs = [...(this.candidateIDs ?? [])].filter(id => !nextIDs.has(id))
+    if (removedIDs.length) this.track(this.history.removeTargets(removedIDs))
     this.liveStatistics.remove(removedIDs)
     for (const instId of removedIDs) {
+      for (const recovery of this.sourceRecoveries.values()) if (recovery.instId === instId) this.cancelRequiredRecovery(recovery.key)
       this.tickerSubscriptions.delete(instId)
       this.cancelTickerRecovery(instId)
       this.clearTickerFault(instId)
@@ -2146,14 +2182,17 @@ export class MarketService {
     await this.ready
     const frame = this.listTimeframe(timeframe), rows = this.listRowsFor(frame)
     const configKey = this.catalogCriteriaKey()
-    const pending = new Set([...this.pendingCandidates.values()].filter(value => value.configKey === configKey).map(value => value.instId)).size
+    const pendingIDs = new Set([...this.pendingCandidates.values()].filter(value => value.configKey === configKey).map(value => value.instId))
+    for (const recovery of this.sourceRecoveries.values()) pendingIDs.add(recovery.instId)
+    for (const instId of this.tickerRecoveries.keys()) pendingIDs.add(instId)
+    const pending = pendingIDs.size
     const catalogProgress = { total: this.candidateIDs?.size ?? this.catalogChecks.size, completed: this.catalogChecks.size, pending, verified: 0, failed: 0, unknown: 0 }
     for (const record of this.catalogChecks.values()) {
       const status = record.status === 'verified' && !this.validCatalogEntry(record) ? 'unknown' : record.status
       catalogProgress[status] += 1
     }
     const unavailable = !rows.length && catalogProgress.unknown > 0
-      ? `Market verification is unavailable for ${catalogProgress.unknown} contracts because required observations are missing or expired. Retrying automatically.` : ''
+      ? `Market verification is unavailable for ${catalogProgress.unknown} contracts because required observations are missing or expired.${pending > 0 || this.refreshing || this.renewing ? ' Acquiring current observations.' : ''}` : ''
     const projectionError = [...this.listProjectionFailures.values()].find(value => value.timeframe === frame && this.catalog.has(value.instId))?.error
     const status = { error: this.error || projectionError || unavailable, loading: this.refreshing !== null || this.renewing !== null || pending > 0,
       catalogProgress,
@@ -2174,6 +2213,8 @@ export class MarketService {
   dispose() {
     if (this.disposeTask) return this.disposeTask
     this.closing = true
+    for (const recovery of this.sourceRecoveries.values()) this.cancelRequiredRecovery(recovery.key)
+    this.unsubscribeStore?.()
     for (const instId of this.tickerRecoveries.keys()) this.cancelTickerRecovery(instId)
     this.tickerSubscriptions.clear()
     if (this.instrumentRetryTimer) clearTimeout(this.instrumentRetryTimer)

@@ -1,10 +1,10 @@
 # Indicator contract
 
-All calculations consume one canonical, timestamp-ordered native candle series. Completed candles come from Parquet. A forming candle may be appended in memory for the live overlay; it never replaces a completed candle or enters historical storage. A missing period starts a new contiguous run and restarts initialization.
+All calculations consume one canonical, timestamp-ordered native candle series. Completed candles come from the authoritative SQLite native-period store. A forming candle may be appended in memory for the live overlay; it never replaces a completed candle or enters historical storage. A missing period starts a new contiguous run and restarts initialization.
 
-The list and chart project the same calculation. Their visible windows cannot choose the seed. Older source additions and historical corrections invalidate the affected generation; formula or input-schema changes invalidate derived snapshots. Unknown volume remains unknown instead of being inferred from price.
+The list and chart project the same calculation. Their visible windows cannot choose the seed. Older price additions and historical price corrections invalidate the affected generation and later checkpoints; formula or input-schema changes invalidate incompatible derived state. OI/Taker revisions do not invalidate price indicators. Unknown volume remains unknown instead of being inferred from price.
 
-Batch initialization and incremental updates use the same formulas. Confirmed state retains the recursive EMA/Wilder accumulators and fixed rolling windows. Each forming revision projects from a copy of that bounded state, without advancing the confirmed seed. Missing periods reset it; historical corrections and prepends rebuild it from persisted history. Subscribed seeds survive eviction from the separate full-history navigation cache. List projections retain the full contiguous BOLL-expansion count alongside their bounded tail.
+Batch initialization and incremental updates use the same formulas. Confirmed state retains the recursive EMA/Wilder accumulators and fixed rolling windows. Each forming revision projects from a copy of that bounded state, without advancing the confirmed seed. Missing periods reset it. Historical corrections and prepends resume exact rebuilding from the nearest valid earlier checkpoint. Resident seeds and navigation ranges are bounded; the canonical prefix is read in chunks rather than retained or transferred as a full history. Checkpoints also retain the contiguous BOLL-expansion summary, independently of the displayed tail.
 
 | Indicator | Formula and initialization |
 | --- | --- |
@@ -18,3 +18,11 @@ Batch initialization and incremental updates use the same formulas. Confirmed st
 | Taker imbalance | `(buyContracts − sellContracts) / (buyContracts + sellContracts) × 100%`. A zero total gives no value. This is a participation ratio, not a relative change. |
 
 OI and Taker Buy/Sell retain contract units and native candle periods. Unavailable statistics remain explicit gaps, never fabricated zeroes. Floating-point assertions use independent expected values with a stated tolerance; agreement with a second invocation of production code is not proof of mathematical correctness.
+
+## Checkpoint correctness
+
+A checkpoint stores the confirmed native timestamp, complete recursive state and rolling windows, formula version, source price revision, and BOLL-expansion state. The writer rejects a checkpoint calculated against an obsolete price revision. Price correction, prepend, or replacement atomically invalidates checkpoints at and after the affected timestamp; appending later prices leaves earlier checkpoints valid. Statistics changes preserve price checkpoints.
+
+Replay starts from the nearest valid checkpoint before the required range and processes bounded chronological chunks with the same append function used for live confirmations. Without a valid checkpoint, exact initialization can require the available canonical prefix. The 200 earlier price candles requested for warmup establish an initial coverage reserve; they cannot replace the influence of earlier inputs to a previously initialized EMA or Wilder RSI. A viewport or retention boundary never silently chooses a new seed.
+
+OHLC publication does not wait for this replay. Indicator values remain unavailable while exact state is being rebuilt; OI/Taker readiness is independent as well. Forming updates continue to project from a copied confirmed state, and no forming revision is persisted as a confirmed observation.

@@ -135,11 +135,42 @@ test('public settings and market responses never contain the saved analysis cred
     ]
     for (const response of responses) {
       const serialized = JSON.stringify(response)
-      assert.equal(serialized.includes(apiKey), false, 'The saved API key must stay in the main process.')
+      assert.equal(serialized.includes(apiKey), false, 'The saved API key must remain outside the renderer.')
       assert.doesNotMatch(serialized, /"(?:apiKey|analysis)"\s*:/)
     }
     assert.deepEqual(responses[0], { model, hasAPIKey: true })
   } finally { await request({ analysisSettings: { action: 'removeKey' } }) }
+})
+
+test('Gateway cancellation and duplicate ownership apply while private credentials are still loading', async () => {
+  await electron.evaluate(() => {
+    const probe = globalThis.__gatewayCredentialProbe = { original: globalThis.__marketBackend.credentials, originalFetch: globalThis.fetch, entered: false, requests: 0 }
+    globalThis.__marketBackend.credentials = () => { probe.entered = true; return new Promise(resolve => { probe.release = () => resolve('fixture-key') }) }
+    globalThis.fetch = async () => { probe.requests++; return new Response() }
+  })
+  try {
+    await page.evaluate(() => { window.__pendingGateway = window.radarDesktop.request({ gatewayFetch: { id: 'credential-owner', body: '{}' } }).then(() => 'completed', error => error.message) })
+    await electron.evaluate(async () => {
+      const deadline = Date.now() + 2000
+      while (!globalThis.__gatewayCredentialProbe.entered) {
+        if (Date.now() >= deadline) throw new Error('The pending credential request was not admitted.')
+        await new Promise(resolve => setImmediate(resolve))
+      }
+    })
+    await assert.rejects(request({ gatewayFetch: { id: 'credential-owner', body: '{}' } }), /already running/)
+    await request({ cancelGatewayFetch: 'credential-owner' })
+    await electron.evaluate(() => globalThis.__gatewayCredentialProbe.release())
+    assert.match(await page.evaluate(() => window.__pendingGateway), /abort/i)
+    assert.equal(await electron.evaluate(() => globalThis.__gatewayCredentialProbe.requests), 0)
+  } finally {
+    await electron.evaluate(() => {
+      const probe = globalThis.__gatewayCredentialProbe
+      probe.release?.()
+      globalThis.__marketBackend.credentials = probe.original
+      globalThis.fetch = probe.originalFetch
+      delete globalThis.__gatewayCredentialProbe
+    })
+  }
 })
 
 test('navigating away cancels and drains the owning renderer Gateway stream', async () => {

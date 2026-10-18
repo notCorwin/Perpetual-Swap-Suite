@@ -15,6 +15,7 @@
     "benchmark": "node --experimental-strip-types scripts/benchmark.ts",
     "benchmark:chart": "npm run build && node scripts/chart-scroll-benchmark.mjs",
     "benchmark:instruments": "npm run build && node scripts/instrument-navigation-benchmark.mjs",
+    "benchmark:market": "npm run build && node scripts/market-resource-benchmark.mjs",
     "test:okx:1h": "node scripts/okx-live-1h.mjs",
     "test:okx:streams": "node scripts/okx-live-streams.mjs",
     "typecheck": "tsc -b",

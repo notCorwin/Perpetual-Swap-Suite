@@ -63,6 +63,12 @@ export class RealtimeMarket {
 
   getState() { return copy(this.state) }
   getTelemetry() { return copy(this.telemetry) }
+  getProgress(instId, timeframe) {
+    const series = this.series.get(keyFor({ instId, timeframe }))
+    const timestamp = value => Number.isFinite(value) ? value : null
+    return { receivedThrough: timestamp(series?.latestTimestamp), confirmedThrough: timestamp(series?.confirmedThrough),
+      committedThrough: timestamp(series?.committedThrough), pendingConfirmations: series?.pendingConfirmations.size ?? 0 }
+  }
   isSubscribed(instId, timeframe) {
     const connection = this.connection, key = keyFor({ instId, timeframe })
     const subscription = this.subscriptions.get(key)
@@ -337,7 +343,8 @@ export class RealtimeMarket {
     const key = keyFor(subscription)
     let series = this.series.get(key)
     if (!series) {
-      series = { tail: Promise.resolve(), pending: 0, forming: null, latestTimestamp: -Infinity, confirmedThrough: -Infinity, confirmations: new Map() }
+      series = { tail: Promise.resolve(), durableTail: Promise.resolve(), pending: 0, forming: null, latestTimestamp: -Infinity,
+        confirmedThrough: -Infinity, committedThrough: -Infinity, confirmations: new Map(), pendingConfirmations: new Map() }
       this.series.set(key, series)
     }
     series.pending++
@@ -370,7 +377,7 @@ export class RealtimeMarket {
     }
     const fingerprint = signature(raw), cumulative = volumes(raw), timestamp = candle.timestamp
     if (candle.confirmed) {
-      if (series.confirmations.has(fingerprint)) { this.telemetry.ignoredEvents++; return }
+      if (series.confirmations.has(fingerprint) || series.pendingConfirmations.has(fingerprint)) { this.telemetry.ignoredEvents++; return }
     } else {
       const previous = series.forming
       if (timestamp <= series.confirmedThrough || timestamp < series.latestTimestamp || previous?.published && previous.fingerprint === fingerprint || previous?.candle.timestamp === timestamp && cumulative.some((value, index) => value < previous.volumes[index])) {
@@ -380,20 +387,29 @@ export class RealtimeMarket {
     }
     this.telemetry.lastDispatchLatencyMs = Math.max(0, this.now() - receivedAt)
     this.telemetry.maxDispatchLatencyMs = Math.max(this.telemetry.maxDispatchLatencyMs, this.telemetry.lastDispatchLatencyMs)
+    series.latestTimestamp = Math.max(series.latestTimestamp, timestamp)
     const context = { signal: candle.confirmed ? this.durableController.signal : connection.controller.signal, receivedAt }
     if (candle.confirmed) {
-      await this.options.onConfirmed(copy(candle), context)
-      // Commit memory state only AFTER persistence succeeds. A failed write can
-      // retry the exact same event; it has not been marked as a duplicate.
-      series.confirmations.set(fingerprint, true)
-      while (series.confirmations.size > this.confirmationCacheSize) series.confirmations.delete(series.confirmations.keys().next().value)
+      // Exchange confirmation and local durability are independent progress.
+      // Preserve correction order without putting live delivery behind fsync.
       series.confirmedThrough = Math.max(series.confirmedThrough, timestamp)
       if (series.forming && series.forming.candle.timestamp <= timestamp) series.forming = null
-      this.telemetry.confirmedEvents++
+      const durable = series.durableTail.then(() => this.options.onConfirmed(copy(candle), context)).then(() => {
+        series.confirmations.set(fingerprint, true)
+        while (series.confirmations.size > this.confirmationCacheSize) series.confirmations.delete(series.confirmations.keys().next().value)
+        series.committedThrough = Math.max(series.committedThrough, timestamp)
+        this.telemetry.confirmedEvents++
+        this.setState({ updatedAt: Math.max(this.state.updatedAt ?? -Infinity, receivedAt), error: this.connection?.recoveryError ?? '' })
+      }).catch(error => {
+        // Failure never creates durable coverage; the same source revision can retry.
+        this.report('Confirmed candle persistence failed.', error, this.active(connection) ? true : 'log')
+      }).finally(() => { series.pendingConfirmations.delete(fingerprint) })
+      series.pendingConfirmations.set(fingerprint, durable)
+      series.durableTail = durable
+      this.track(durable)
     } else {
       const forming = { candle: copy(candle), fingerprint, volumes: cumulative, published: false }
       series.forming = forming
-      series.latestTimestamp = Math.max(series.latestTimestamp, timestamp)
       await this.options.onForming(copy(candle), context)
       forming.published = true
       this.telemetry.formingEvents++

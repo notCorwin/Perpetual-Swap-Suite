@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react"
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
 import { flushSync } from "react-dom"
 import { Camera, Radio } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
@@ -21,6 +21,12 @@ import { chartController } from '@/chart-controller'
 import type { Bar, PreparedChartState } from '@/chart-data'
 
 const EMPTY_BARS: readonly Bar[] = []
+const PriceStatus = memo(function PriceStatus({ observedAt, realtime }: { observedAt?: number | null; realtime?: 'live' | 'stale' }) {
+  const [now, setNow] = useState(Date.now)
+  useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer) }, [])
+  const fresh = realtime === 'live' && observedAt != null && now - observedAt < 30_000
+  return <Badge variant="secondary" role="status" title={observedAt ? `Last price observation ${new Date(observedAt).toLocaleTimeString('en-US')}` : 'Waiting for a current price observation'}>{fresh ? 'Live price' : 'Cached price'}</Badge>
+})
 
 const compactFormatter = new Intl.NumberFormat("en-US", { maximumSignificantDigits: 5, notation: "compact" })
 const priceFormatter = new Intl.NumberFormat("en-US", { maximumSignificantDigits: 8 })
@@ -117,8 +123,8 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
   const { panels, columns, axisStarts, headerY, left, right } = chartLayout(width, height, gutter)
   const x = (index: number, panel: Panel) => chartHourX(bars[index].hour, latestHour, ...columns[panel], intervalMS)
   const barWidth = chartCandleWidth(right - left)
-  const oiComplete = n === 96 && bars.every(bar => finiteNumber(bar.oi))
-  const takerComplete = n === 96 && bars.every(bar => finiteNumber(bar.buy) && finiteNumber(bar.sell))
+  const oiComplete = bars.every(bar => finiteNumber(bar.oi))
+  const takerComplete = bars.every(bar => finiteNumber(bar.buy) && finiteNumber(bar.sell))
   const priceAxis = chartPriceAxis(bars, axisLabelLimit(panels.price, 9), liveClose)
   const highIndex = bars.findIndex(bar => bar.high === candleHigh), lowIndex = bars.findIndex(bar => bar.low === candleLow)
   const priceDecimals = priceAxis.decimals
@@ -341,7 +347,7 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
   const pending = view.pending || !matchesSelection
   const unavailable = view.requested?.instId === instId && view.requested.timeframe === timeframe ? view.unavailable : null
   const unavailableText = unavailable ? `${instId.replace(/-SWAP$/, '')} has ${unavailable.availableCandles} completed ${timeframeLabel(timeframe)} candles. A complete chart requires ${unavailable.requiredCandles}.` : ''
-  const bars = surface?.bars ?? EMPTY_BARS
+  const bars = useMemo(() => surface?.liveBar ? [...surface.bars.filter(bar => bar.hour < surface.liveBar!.hour), surface.liveBar].slice(-96) : surface?.bars ?? EMPTY_BARS, [surface])
   const intervalMS = surface?.intervalMS ?? timeframeMilliseconds(timeframe)
   const displayedId = surface?.instId ?? instId
   const displayedFrame = surface?.timeframe ?? timeframe
@@ -351,8 +357,9 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
   const chartRef = useRef<HTMLElement>(null)
   const plotRef = useRef<HTMLDivElement>(null)
   const [plotSize, setPlotSize] = useState({ width: 0, height: 0 })
-  const [inspection, setInspection] = useState<{ surface: typeof surface; index: number } | null>(null)
-  const inspected = inspection?.surface === surface ? inspection?.index ?? null : null
+  const [inspection, setInspection] = useState<{ instId: string; timeframe: RadarTimeframe; hour: number } | null>(null)
+  const inspectedIndex = inspection?.instId === surface?.instId && inspection?.timeframe === surface?.timeframe ? bars.findIndex(bar => bar.hour === inspection?.hour) : -1
+  const inspected = inspectedIndex >= 0 ? inspectedIndex : null
   const heldPointer = useRef<{ pointerId: number; target: SVGSVGElement } | null>(null)
   const releaseInspection = useCallback(() => {
     const held = heldPointer.current
@@ -379,10 +386,12 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
     releaseInspection()
   }, [instId, timeframe, releaseInspection])
   useLayoutEffect(() => {
-    releaseInspection()
     const element = chartRef.current
-    if (element) Object.defineProperty(element, '__chartSnapshot', { configurable: true, value: surface })
-  }, [surface, releaseInspection])
+    if (element) {
+      Object.defineProperty(element, '__chartSnapshot', { configurable: true, value: surface })
+      Object.defineProperty(element, '__chartRenderedBars', { configurable: true, value: bars })
+    }
+  }, [surface, bars])
   useEffect(() => () => {
     if (wheelFrame.current !== null) window.cancelAnimationFrame(wheelFrame.current)
     navigationTask.current = null
@@ -453,7 +462,7 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
       if (Math.abs(chartHourX(bars[index].hour, surface.endHour, ...columns.price, intervalMS) - svgX)
         < Math.abs(chartHourX(bars[nearest].hour, surface.endHour, ...columns.price, intervalMS) - svgX)) nearest = index
     }
-    setInspection({ surface, index: nearest })
+    setInspection({ instId: surface.instId, timeframe: surface.timeframe, hour: bars[nearest].hour })
   }
   const captureChart = async () => {
     if (pending || !surface || !chartRef.current) return
@@ -489,11 +498,12 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
       <ButtonGroup aria-label="Chart analysis actions">{(['long', 'short'] as const).map(direction => <Button key={direction} variant="outline" size="sm" disabled={captureStatus === 'copying' || (analysis?.direction !== direction && (analysisBusy || pending || !bars.length || plotSize.width <= 0))} title={analysis?.direction === direction ? `Open existing ${direction} analysis` : undefined} onClick={() => { if (analysis?.direction === direction) setAnalysisOpen(true); else analyzeChart(direction) }}>{analysisBusy && analysis?.direction === direction && <Spinner data-icon="inline-start" />}Analyze {direction === 'long' ? 'Long' : 'Short'}</Button>)}</ButtonGroup>
       <span role="status" className="sr-only">{captureStatus === 'flashing' ? 'Chart copied to clipboard' : ''}</span>
       <Badge variant="secondary"><Radio data-icon="inline-start" aria-hidden="true" />{historical ? `${timeframeLabel(displayedFrame)} history` : `${timeframeLabel(displayedFrame)} chart`}</Badge>
+      {!historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} />}
     </header>
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}</div>}
     {capture.error && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{capture.error}</p>}
     <div className="flex min-h-0 flex-1">
-    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={surface ? 'ready' : 'loading'} data-chart-statistics-state={surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete="false" data-chart-loading={pending && !unavailable ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-chart-surface">
+    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={surface?.priceState ?? (bars.length ? 'ready' : 'loading')} data-chart-statistics-state={surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={bars.length < 96 || bars.some((bar, index) => index > 0 && bar.hour - bars[index - 1].hour !== intervalMS) ? 'true' : 'false'} data-chart-loading={pending && !unavailable ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-chart-surface">
       {active && <div className="grid shrink-0 grid-cols-[minmax(9rem,1.2fr)_repeat(4,minmax(0,1fr))] items-center border-b px-4 py-1.5 text-[length:var(--chart-text-size)]" aria-live="off">
         <p className="min-w-0 truncate border-r pr-3"><span className="font-medium">{displayedId.replace(/-SWAP$/, '')}</span> · <span className="text-muted-foreground">{inspected === null ? historical ? 'Window end' : 'Latest' : 'Selected'}</span> {time(active.hour)}</p>
         {([['Open', active.open], ['High', active.high], ['Low', active.low], ['Close', active.close]] as const).map(([label, value]) => <div key={label} className="min-w-0 px-3"><span className="text-muted-foreground">{label} </span><span title={price(value)}>{price(value)}</span></div>)}
@@ -504,7 +514,7 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
         const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : -event.deltaY
         queueWheel(delta * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 240 : 1))
       }}>
-        {surface && plotSize.width > 0 ? <svg key={surface.key} strokeWidth="var(--chart-line-width)" data-rendered-inst={surface.instId} data-rendered-timeframe={surface.timeframe} data-rendered-start={bars[0]!.hour} data-rendered-end={surface.endHour} viewBox={`0 0 ${plotSize.width} ${plotSize.height}`} className={cn('absolute inset-0 h-full w-full text-[length:var(--chart-text-size)] select-none focus-visible:outline-2 focus-visible:outline-ring', !matchesSelection && 'pointer-events-none')} role="img" tabIndex={matchesSelection ? 0 : -1} aria-label={`${surface.instId} complete 96-candle ${timeframeLabel(surface.timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end. Scroll to review history. Arrow keys navigate markets.`} onPointerDown={event => {
+        {surface && bars.length > 0 && plotSize.width > 0 ? <svg key={surface.key} strokeWidth="var(--chart-line-width)" data-rendered-inst={surface.instId} data-rendered-timeframe={surface.timeframe} data-rendered-start={bars[0]!.hour} data-rendered-end={bars.at(-1)!.hour} viewBox={`0 0 ${plotSize.width} ${plotSize.height}`} className={cn('absolute inset-0 h-full w-full text-[length:var(--chart-text-size)] select-none focus-visible:outline-2 focus-visible:outline-ring', !matchesSelection && 'pointer-events-none')} role="img" tabIndex={matchesSelection ? 0 : -1} aria-label={`${surface.instId} ${bars.length}-candle ${timeframeLabel(surface.timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end. Scroll to review history. Arrow keys navigate markets.`} onPointerDown={event => {
           if (!matchesSelection || event.button !== 0 || heldPointer.current) return
           event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId)
           heldPointer.current = { pointerId: event.pointerId, target: event.currentTarget }
@@ -513,16 +523,19 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
           if (!matchesSelection || heldPointer.current?.pointerId !== event.pointerId) return
           if (!(event.buttons & 1)) { endInspection(); return }
           inspectAt(event.currentTarget, event.clientX)
-        }}><Plot bars={bars} liveBar={surface.liveBar ?? bars.at(-1)!} liveOverlay={!!surface.liveBar} inspected={inspected} width={plotSize.width} height={plotSize.height} endHour={surface.endHour} intervalMS={surface.intervalMS} oiState={oiState} takerState={takerState} /></svg> : <div role="status" className="flex h-full items-center justify-center gap-2 text-muted-foreground">{unavailable ? unavailableText : <><Spinner />Preparing complete chart…</>}</div>}
+        }}><Plot bars={bars} liveBar={surface.liveBar ?? bars.at(-1)!} liveOverlay={!!surface.liveBar} inspected={inspected} width={plotSize.width} height={plotSize.height} endHour={bars.at(-1)!.hour} intervalMS={surface.intervalMS} oiState={oiState} takerState={takerState} /></svg> : <div role="status" className="flex h-full items-center justify-center gap-2 text-muted-foreground">{unavailable ? unavailableText : <><Spinner />Loading local prices…</>}</div>}
         {pending && surface && !unavailable && <span role="status" className="pointer-events-none absolute right-4 top-2 rounded-md border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Preparing {instId.replace(/-SWAP$/, '')} {timeframeLabel(timeframe)}{requestedEnd !== null ? ` · ${time(requestedEnd)}` : ''}…</span>}
         {unavailable && surface && <span role="status" className="pointer-events-none absolute right-4 top-2 max-w-md rounded-md border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{unavailableText}</span>}
+        {surface?.indicatorState === 'loading' && <Badge variant="secondary" role="status" className="pointer-events-none absolute right-4 bottom-2">Calculating indicators…</Badge>}
+        {oiState === 'loading' && <Badge variant="secondary" role="status" className="pointer-events-none absolute right-4 top-10">Loading OI history…</Badge>}
+        {takerState === 'loading' && <Badge variant="secondary" role="status" className="pointer-events-none absolute right-4 top-20">Loading taker history…</Badge>}
         {oiState === 'unavailable' && <span role="status" className="pointer-events-none absolute right-4 top-10 rounded-md border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{`OKX ${timeframeLabel(displayedFrame)} OI history is incomplete for this range`}</span>}
         {takerState === 'unavailable' && <span role="status" className="pointer-events-none absolute right-4 top-20 rounded-md border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{`OKX ${timeframeLabel(displayedFrame)} Taker history is incomplete for this range`}</span>}
         {atBoundary && !pending && <span role="status" className="pointer-events-none absolute right-4 top-2 rounded-md border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Start of available history</span>}
       </div>
       {captureStatus === 'flashing' && <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
     </section>
-    {analysisOpen && <ChartAnalysisPanel instId={instId} timeframe={timeframeLabel(timeframe)} session={analysis} ready={!pending && bars.length === 96 && plotSize.width > 0 && captureStatus !== 'copying'} onNew={() => analyzeChart(analysis?.direction ?? 'long')} onClose={() => { chartAnalysis.stop(instId); setAnalysisOpen(false) }} />}
+    {analysisOpen && <ChartAnalysisPanel instId={instId} timeframe={timeframeLabel(timeframe)} session={analysis} ready={!pending && bars.length > 0 && plotSize.width > 0 && captureStatus !== 'copying'} onNew={() => analyzeChart(analysis?.direction ?? 'long')} onClose={() => { chartAnalysis.stop(instId); setAnalysisOpen(false) }} />}
     </div>
   </section>
 }

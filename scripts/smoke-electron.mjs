@@ -91,6 +91,7 @@ export async function smokeElectron({ app, revision, report: reportPath }) {
     const status = await request({ e2e: { action: 'smokeStatus' } })
     assert.equal(status.revision, revision, 'The running main process must report the packaged build revision.')
     assert.equal(resolve(status.userData), resolve(userData), 'Smoke must use only its isolated user data.')
+    assert.ok(status.backendThreadId > 0, 'Market coordination must run outside Electron main.')
     return status
   }
   try {
@@ -147,8 +148,8 @@ export async function smokeElectron({ app, revision, report: reportPath }) {
     }
     const saved = await readCandles()
     const files = await readdir(userData, { recursive: true })
-    assert.ok(files.some(file => file.endsWith('.parquet')), 'The durable fixture must create Parquet files.')
-    report.checks.push('DuckDB writes and reads durable Parquet')
+    assert.ok(files.some(file => file.endsWith('market.sqlite')), 'The durable fixture must create the canonical SQLite database.')
+    report.checks.push('SQLite WAL writes and reads in dedicated workers')
     const prepared = await request({ chartWindow: { instId: fixture.instId, timeframe: fixture.timeframe, endHour: fixture.end } })
     assert.ok(prepared.bars.length >= 96, 'The packaged worker must prepare a complete chart.')
     const latest = prepared.bars.find(bar => bar.hour === fixture.end)

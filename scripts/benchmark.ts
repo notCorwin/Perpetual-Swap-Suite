@@ -29,9 +29,9 @@ try {
   }
   const window = { instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: base - day, through: base }
   const results = [
-    await benchmark('Parquet append (1,000 candles)', 5, async () => { await store.appendCandles(candles) }),
-    await benchmark('DuckDB range query (1,000 candles)', 20, async () => { await store.candles({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: base, through: base + 999 * 300_000 }) }),
-    await benchmark('DuckDB chart window (15 days of appends)', 20, async () => { await store.candles(window) }),
+    await benchmark('SQLite worker append (1,000 candles)', 5, async () => { await store.appendCandles(candles) }),
+    await benchmark('SQLite worker range query (1,000 candles)', 20, async () => { await store.candles({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: base, through: base + 999 * 300_000 }) }),
+    await benchmark('SQLite chart window (15 days of appends)', 20, async () => { await store.candles(window) }),
     await benchmark('Coverage (15 days of appends)', 20, async () => { await store.coverage('BTC-USDT-SWAP', '5m') }),
     await benchmark('Gap detection, 295 slots (15 days of appends)', 20, async () => { await store.missingCandleRanges({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: base - day, through: base - day + 294 * 300_000 }) }),
   ]

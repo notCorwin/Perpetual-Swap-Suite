@@ -124,7 +124,7 @@ function App() {
             // frames; background history preparation remains independent.
             const first = snapshot.rows.reduce<RankedMarketRow | null>((best, row) => !best || compareRankingChange(row, best) < 0 ? row : best, null)
             const retained = !snapshot.rows.length && unverified ? chartController.getSnapshot().requested?.instId : undefined
-            await chartController.setUniverse(retained ? [retained] : snapshot.rows.map(row => row.instId), timeframe, retained ?? first?.instId)
+            void chartController.setUniverse(retained ? [retained] : snapshot.rows.map(row => row.instId), timeframe, retained ?? first?.instId)
             if (stopped) return
             setRows(current => reconcileMarketRows(current, snapshot.rows) as RankedMarketRow[])
             setSelected(current => snapshot.rows.some(row => row.instId === current) || (!snapshot.rows.length && unverified) ? current : snapshot.rows.reduce<RankedMarketRow | null>((first, row) => !first || compareRankingChange(row, first) < 0 ? row : first, null)?.instId ?? null)

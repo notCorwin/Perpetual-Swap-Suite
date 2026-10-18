@@ -133,7 +133,7 @@ test('forming candles stay in memory; receive order and cumulative volume handle
   assert.equal(f.confirmed.length, 3)
 })
 
-test('a durable confirmation is a per-series barrier while other instruments keep updating', async t => {
+test('pending durability preserves corrections while live delivery continues on the same series', async t => {
   const write = deferred(), began = deferred(), seen: string[] = []
   const f = fixture({ onConfirmed: async candle => { seen.push(`write:${candle.timestamp}`); began.resolve(); await write.promise; seen.push('durable') } })
   t.after(() => f.market.close())
@@ -145,10 +145,12 @@ test('a durable confirmation is a per-series barrier while other instruments kee
   push(socket, raw(epoch, 104), eth)
   await began.promise
   await turn()
-  assert.equal(f.market.getForming(btc.instId, btc.timeframe)?.timestamp, epoch)
+  assert.equal(f.market.getForming(btc.instId, btc.timeframe)?.timestamp, epoch + 300_000)
+  assert.equal(f.market.getProgress(btc.instId, btc.timeframe).committedThrough, null)
+  assert.equal(f.market.getProgress(btc.instId, btc.timeframe).pendingConfirmations, 1)
   assert.equal(f.market.getForming(eth.instId, eth.timeframe)?.close, 104)
   assert.equal(f.market.getTelemetry().confirmedEvents, 0)
-  assert.deepEqual(f.forming.map(candle => candle.instrument), [btc.instId, eth.instId])
+  assert.deepEqual(f.forming.map(candle => candle.instrument), [btc.instId, btc.instId, eth.instId])
   write.resolve()
   await f.market.whenIdle()
   assert.deepEqual(seen, [`write:${epoch}`, 'durable'])
@@ -156,21 +158,35 @@ test('a durable confirmation is a per-series barrier while other instruments kee
   assert.equal(f.market.getTelemetry().confirmedEvents, 1)
 })
 
-test('a failed durable write retains forming state, reports its error, and allows the same confirmation to retry', async t => {
+test('a confirmation without a preceding forming update advances receipt before durable coverage', async t => {
+  const write = deferred(), began = deferred()
+  const f = fixture({ onConfirmed: async () => { began.resolve(); await write.promise } })
+  t.after(async () => { write.resolve(); await f.market.close() })
+  const socket = await f.open()
+  push(socket, raw(epoch, 102, 2, true))
+  await began.promise
+  assert.deepEqual(f.market.getProgress(btc.instId, btc.timeframe), {
+    receivedThrough: epoch, confirmedThrough: epoch, committedThrough: null, pendingConfirmations: 1,
+  })
+  write.resolve()
+  await f.market.whenIdle()
+  assert.equal(f.market.getProgress(btc.instId, btc.timeframe).committedThrough, epoch)
+})
+
+test('a failed durable write never advances committed coverage and allows the same confirmation to retry', async t => {
   let writes = 0
   const f = fixture({ onConfirmed: async () => { if (++writes === 1) throw new Error('Disk is full.') } })
   t.after(() => f.market.close())
   const socket = await f.open()
   push(socket, raw())
   await f.market.whenIdle()
-  const updatedAt = f.market.getState().updatedAt
   await f.clock.advance(10)
   push(socket, raw(epoch, 102, 2, true))
   await f.market.whenIdle()
   assert.match(f.market.getState().error, /Disk is full/)
   assert.match(f.errors.join('\n'), /Disk is full/)
-  assert.equal(f.market.getState().updatedAt, updatedAt)
-  assert.equal(f.market.getForming(btc.instId, btc.timeframe)?.close, 101)
+  assert.equal(f.market.getProgress(btc.instId, btc.timeframe).committedThrough, null)
+  assert.equal(f.market.getForming(btc.instId, btc.timeframe), null)
   push(socket, raw(epoch, 102, 2, true))
   push(socket, raw(epoch, 102, 2, true))
   await f.market.whenIdle()
@@ -244,7 +260,7 @@ test('subscription acknowledgements have independent deadlines and stale acknowl
   assert.match(f.market.getState().error, /acknowledgement timed out/)
 })
 
-test('reconnect streams immediately during gap repair and keeps old writes as a barrier only for their own series', async t => {
+test('reconnect streams immediately during gap repair and pending old writes', async t => {
   const write = deferred(), repair = deferred(), repairs: RealtimeSubscription[][] = [], order: string[] = []
   const f = fixture({
     onConfirmed: async () => { order.push('write'); await write.promise; order.push('durable') },
@@ -267,7 +283,7 @@ test('reconnect streams immediately during gap repair and keeps old writes as a 
   push(second, raw(epoch, 104), eth)
   await turn()
   assert.deepEqual(order, ['write', 'repair'])
-  assert.deepEqual(f.forming.map(candle => [candle.instrument, candle.close]), [[eth.instId, 104]])
+  assert.deepEqual(f.forming.map(candle => [candle.instrument, candle.close]), [[btc.instId, 199], [btc.instId, 102], [eth.instId, 104]])
   assert.equal(f.market.getState().status, 'live')
   assert.equal(f.market.getState().error, '')
   write.resolve()
@@ -283,7 +299,7 @@ test('reconnect streams immediately during gap repair and keeps old writes as a 
   await f.market.whenIdle()
   assert.deepEqual(repairs, [[btc, eth], [sol]])
   assert.equal(f.market.getState().status, 'live')
-  assert.equal(f.forming.length, 3)
+  assert.equal(f.forming.length, 4)
   assert.deepEqual(second.commands().filter(message => message.op === 'subscribe').flatMap(message => message.args.map((arg: { channel: string }) => arg.channel)), ['candle5m', 'candle1H', 'candle15m'])
   f.market.setSubscriptions([eth, sol])
   push(second, raw(epoch + 300_000, 103))
@@ -292,7 +308,7 @@ test('reconnect streams immediately during gap repair and keeps old writes as a 
   assert.equal(second.commands().at(-1).op, 'unsubscribe')
   assert.deepEqual(second.commands().at(-1).args, [{ channel: 'candle5m', instId: btc.instId }])
   assert.equal(f.market.getForming(btc.instId, btc.timeframe), null)
-  assert.equal(f.forming.length, 3)
+  assert.equal(f.forming.length, 4)
   assert.equal(f.market.getTelemetry().reconnects, 1)
   second.message({ event: 'notice', code: '64008', msg: 'Reconnect for upgrade.' })
   await f.market.whenIdle()

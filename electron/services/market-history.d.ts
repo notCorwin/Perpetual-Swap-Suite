@@ -6,7 +6,7 @@ type MaybePromise<T> = T | Promise<T>
 type Timeframe = '5m' | '15m' | '1H'
 type Instrument = { instId: string; listTime?: number | string; [key: string]: unknown }
 export type MarketHistoryOptions = {
-  store: Pick<MarketStore, 'candles' | 'coverage' | 'inspectCandles'> & Partial<Pick<MarketStore, 'candleRevision' | 'candleChangesSince'>>
+  store: Pick<MarketStore, 'candles' | 'coverage' | 'inspectCandles' | 'statistics'> & Partial<Pick<MarketStore, 'candleRevision' | 'candleChangesSince'>>
   metadata: HistorySyncOptions['metadata'] & AuditMetadata
   get(path: string, parameters: Record<string, string | number>, signal: AbortSignal, priority: StorePriority): Promise<unknown[][]>
   // Raw API JSON is checked by the adapter before reaching durable storage.
@@ -29,9 +29,10 @@ export class MarketHistory {
   readonly sync: HistorySync
   readonly audit: DataAudit
   ensurePrices(instId: string, timeframe: Timeframe, from: number, through: number, priority?: StorePriority, signal?: AbortSignal): Promise<{ rows: CandleRecord[]; floor?: number }>
-  /** Numeric observations remain reusable; direct empty observations revalidate only their expired native-period ranges. */
+  /** OI and Taker are acquired and persisted independently of price rows. Numeric observations remain reusable; direct empty observations revalidate only their expired native-period ranges. */
   ensureStatistics(instId: string, timeframe: Timeframe, from: number, through: number, priority?: StorePriority, signal?: AbortSignal): Promise<{ rows: CandleRecord[] }>
   latest(instId: string, timeframe: Timeframe, priority?: StorePriority): Promise<{ live: CandleRecord | null; floor?: number }>
   target(instId: string, options?: { historyDays?: number; asOf?: number }): Promise<Array<{ history: HistoryTask; warmup: HistoryTask | null }>>
+  removeTargets(instIds: Iterable<string>): Promise<void>
   close(): Promise<void>
 }

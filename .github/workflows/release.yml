@@ -47,6 +47,10 @@ jobs:
         env:
           PERPETUAL_SWAP_UI_VISUAL_OUTPUT: artifacts/workspace-visual
         run: node scripts/workspace-visual-check.mjs
+      - name: Verify full-market intake under held statistics and archive writes
+        env:
+          PERPETUAL_SWAP_RESOURCE_REPORT: artifacts/market-resources.json
+        run: node scripts/market-resource-benchmark.mjs
       - name: Retain E2E diagnostics
         if: always()
         uses: actions/upload-artifact@v7

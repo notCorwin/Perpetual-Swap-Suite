@@ -1,247 +1,136 @@
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DuckDBInstance } from '@duckdb/node-api'
 import { MarketStore } from '../electron/services/market-store.js'
 
-test('DuckDB writes partitioned Parquet candles and queries their range', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-parquet-'))
-  const store = await MarketStore.open(root)
+const base = Date.UTC(2024, 0, 1), step = 300_000
+const query = { instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: base, through: base + step }
+const row = (index: number, close = 100) => ({ instrument: query.instrument, timeframe: query.timeframe, timestamp: base + index * step,
+  open: 100, high: Math.max(close, 101), low: 99, close, volume: 1, baseVolume: 2, quoteVolume: 200,
+  oi: 1_000, sell: 20, buy: 30, statisticsVersion: 1, confirmed: true, writtenAt: 100 + index })
+const quote = (value: string) => `'${value.replaceAll("'", "''")}'`
+const legacy = async (root: string, name: string, values: any[]) => {
+  const directory = join(root, 'candles', 'timeframe=5m', 'instrument=BTC-USDT-SWAP', 'date=2024-01-01')
+  await mkdir(directory, { recursive: true })
+  const source = join(root, 'input.json'), path = join(directory, name), engine = await DuckDBInstance.create(':memory:'), db = await engine.connect()
   try {
-    await store.appendCandles([
-      { instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp: 1_700_000_100_000, open: 100, high: 110, low: 95, close: 105, volume: 42, confirmed: true },
-      { instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp: 1_700_000_400_000, open: 105, high: 115, low: 100, close: 110, volume: 43, confirmed: true },
-    ])
-    const rows = await store.candles({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: 1_700_000_100_000, through: 1_700_000_100_000 })
-    assert.deepEqual(rows.map(row => ({ timestamp: row.timestamp, close: row.close, confirmed: row.confirmed })), [{ timestamp: 1_700_000_100_000, close: 105, confirmed: true }])
-    const timeframes = await readdir(join(root, 'candles'))
-    assert.deepEqual(timeframes, ['timeframe=5m'])
-  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
-})
+    await writeFile(source, JSON.stringify(values))
+    const columns = `instrument:'VARCHAR',timeframe:'VARCHAR',timestamp:'BIGINT',open:'DOUBLE',high:'DOUBLE',low:'DOUBLE',close:'DOUBLE',volume:'DOUBLE',baseVolume:'DOUBLE',quoteVolume:'DOUBLE',oi:'DOUBLE',sell:'DOUBLE',buy:'DOUBLE',statisticsVersion:'INTEGER',confirmed:'BOOLEAN',writtenAt:'BIGINT'`
+    await db.run(`COPY(SELECT * FROM read_json(${quote(source)},columns={${columns}},format='array')) TO ${quote(path)} (FORMAT PARQUET)`)
+    return path
+  } finally { db.closeSync(); engine.closeSync(); await rm(source, { force: true }) }
+}
 
-test('foreground store work cuts ahead of queued background reads', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-parquet-'))
-  const store = await MarketStore.open(root)
+test('legacy Parquet is imported read-only with newest base visibility and durable resumability', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-legacy-import-'))
+  let store: MarketStore | undefined
   try {
-    let releaseHold: (() => void) | undefined
-    const holdGate = new Promise<void>(resolve => { releaseHold = resolve })
-    const order: string[] = []
-    const hold = store.enqueue(async () => { await holdGate; order.push('hold') })
-    store.enqueue(async () => { order.push('background-1') })
-    store.enqueue(async () => { order.push('background-2') })
-    const foreground = store.enqueue(async () => { order.push('foreground') }, 'foreground')
-    releaseHold?.()
-    await Promise.all([hold, foreground])
-    await store.enqueue(async () => undefined)
-    assert.deepEqual(order, ['hold', 'foreground', 'background-1', 'background-2'])
-  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('partition scans overlap bounded filesystem reads and retain chronological candle order', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-partition-scan-')), store = await MarketStore.open(root), internal: any = store
-  let releaseFirst!: () => void, releaseOthers!: () => void
-  const firstGate = new Promise<void>(resolve => { releaseFirst = resolve })
-  const otherGate = new Promise<void>(resolve => { releaseOthers = resolve })
-  const entered: string[] = []
-  let active = 0, maximum = 0
-  const waitFor = async (check: () => boolean) => {
-    for (let attempt = 0; attempt < 500; attempt += 1) { if (check()) return; await new Promise(resolve => setTimeout(resolve, 10)) }
-    throw new Error('Timed out waiting for partition reads.')
-  }
-  let reading: Promise<any[]> | undefined
-  try {
-    const first = Date.UTC(2024, 0, 1), rows = Array.from({ length: 24 }, (_, index) => ({
-      instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp: first + index * 86_400_000,
-      open: 100, high: 110, low: 95, close: 100 + index / 10, volume: 1, confirmed: true,
-    }))
-    await store.appendCandles(rows)
-    const partitionFiles = internal.partitionFiles.bind(store)
-    internal.partitionFiles = async (directory: string) => {
-      const index = entered.length
-      entered.push(directory)
-      active += 1
-      maximum = Math.max(maximum, active)
-      try { await (index === 0 ? firstGate : otherGate); return await partitionFiles(directory) }
-      finally { active -= 1 }
-    }
-    reading = store.candles({ instrument: 'BTC-USDT-SWAP', timeframe: '5m' })
-    await waitFor(() => entered.length === 8)
-    assert.equal(active, 8, 'Independent partition metadata should overlap without flooding the filesystem.')
-    releaseOthers()
-    await waitFor(() => entered.length === rows.length && active === 1)
-    assert.equal(active, 1, 'A slow first partition must not stop remaining partitions from being scanned.')
-    assert.equal(maximum, 8)
-    releaseFirst()
-    assert.deepEqual((await reading).map(row => row.timestamp), rows.map(row => row.timestamp))
-    const files: string[] = await internal.parquetFiles('BTC-USDT-SWAP', '5m', rows[5].timestamp, rows[9].timestamp)
-    assert.equal(files.length, 5, 'Parallel scans retain inclusive date bounds.')
-    assert.deepEqual(files, [...files].sort(), 'Completion order cannot reorder the canonical file list.')
-  } finally { releaseFirst(); releaseOthers(); await reading?.catch(() => {}); await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('immutable appends retain bounded parts with newest values winning', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-parquet-'))
-  const store = await MarketStore.open(root)
-  try {
-    const first = 1_700_000_100_000, second = first + 300_000, third = first + 600_000
-    const candle = (timestamp: number, close: number) => ({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp, open: 100, high: Math.max(111, close), low: 95, close, volume: 1, confirmed: true })
-    await store.appendCandles([candle(first, 105), candle(second, 110)])
-    let coverage = await store.coverage('BTC-USDT-SWAP', '5m')
-    assert.equal(coverage.count, 2)
-    // A statistics patch overwrites the first timestamp and adds a third.
-    await store.appendCandles([candle(first, 106), candle(third, 111)])
-    coverage = await store.coverage('BTC-USDT-SWAP', '5m')
-    assert.equal(coverage.count, 3, 'Every write invalidates the cached coverage scan.')
-    const directory = join(root, 'candles', 'timeframe=5m', 'instrument=BTC-USDT-SWAP', 'date=2023-11-14')
-    const parts = (await readdir(directory)).filter(name => name.endsWith('.parquet'))
-    assert.equal(parts.length, 2, 'An append publishes only incoming rows without rewriting the prior part.')
-    assert.equal(store.getWriteMetrics().bytesRead, 0)
-    const rows = await store.candles({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: first, through: third })
-    assert.deepEqual(rows.map(row => row.close), [106, 110, 111])
-    const missing = await store.missingCandleRanges({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: first, through: third })
-    assert.deepEqual(missing, [], 'A complete window reports no gaps across versioned parts.')
-    const fourth = third + 600_000
-    await store.appendCandles([candle(fourth, 112)])
-    const holes = await store.missingCandleRanges({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: first, through: fourth })
-    assert.deepEqual(holes, [{ from: third + 300_000, through: third + 300_000 }])
-  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-const dayStart = Date.UTC(2024, 0, 1), step = 300_000
-const row = (index: number, close = 100 + index / 3) => ({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp: dayStart + index * step, open: close - 1, high: close + 2, low: close - 2, close, volume: index + 1, baseVolume: index + 1, quoteVolume: close * (index + 1), confirmed: true })
-const dayQuery = { instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: dayStart, through: dayStart + 287 * step }
-
-test('small revisions write only incoming rows and compact at eight active parts', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-deltas-'))
-  const store = await MarketStore.open(root), internal: any = store
-  try {
-    await store.appendCandles(Array.from({ length: 288 }, (_, index) => row(index)))
-    let compactionReads = 0
-    for (let revision = 1; revision <= 30; revision += 1) {
-      const before = store.getWriteMetrics(), filesBefore = await internal.parquetFiles(dayQuery.instrument, dayQuery.timeframe)
-      await store.appendCandles([row(100, 500 + revision)])
-      const after = store.getWriteMetrics(), files = await internal.parquetFiles(dayQuery.instrument, dayQuery.timeframe)
-      assert.ok(files.length < 8, 'Reaching eight parts must publish one compacted base.')
-      if (filesBefore.length === 7) {
-        compactionReads += 1
-        assert.equal(files.length, 1)
-        assert.ok(after.bytesRead > before.bytesRead)
-      } else {
-        assert.equal(after.bytesRead, before.bytesRead, 'A normal append must not read existing history.')
-        const newest = files.find((file: string) => !filesBefore.includes(file))
-        const count = await store.enqueue(async () => (await internal.connection.runAndReadAll(`SELECT COUNT(*) AS count FROM read_parquet('${newest}', hive_partitioning=false)`)).getRowObjectsJS()[0].count)
-        assert.equal(Number(count), 1, 'A delta stores one incoming candle rather than a full-day rewrite.')
-      }
-      const rows = await store.candles(dayQuery)
-      assert.equal(rows.length, 288)
-      assert.equal(rows[100].close, 500 + revision)
-      assert.deepEqual((await store.inspectCandles(dayQuery)).issues, [])
-    }
-    assert.equal(compactionReads, 4, 'Thirty small revisions should read history four times instead of thirty.')
-    const directory = internal.partition(dayQuery.instrument, dayQuery.timeframe, dayStart)
-    assert.ok((await readdir(directory)).filter(name => name.endsWith('.parquet')).length < 8)
-  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('published base generations hide pre-compaction files left by an interrupted cleanup', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-base-recovery-'))
-  let store = await MarketStore.open(root)
-  const internal: any = store
-  try {
-    await store.appendCandles([row(0), row(1)])
-    await store.appendCandles([row(0, 250)])
-    const oldFiles = await internal.parquetFiles(dayQuery.instrument, dayQuery.timeframe)
-    const oldParts = await Promise.all(oldFiles.map(async (file: string) => ({ file, bytes: await readFile(file) })))
-    const before = await store.candleWatermark(dayQuery.instrument, dayQuery.timeframe)
-    await store.replaceCandles({ ...dayQuery, through: dayStart }, [])
-    const deletion = await store.candleWatermark(dayQuery.instrument, dayQuery.timeframe)
-    assert.notEqual(deletion, before, 'A deletion must change the durable watermark even when no incoming candle exists.')
-    // Recreate precisely the files a process kill after base publication but
-    // before cleanup would leave. They must be invisible, even after restart.
-    await Promise.all(oldParts.map(({ file, bytes }) => writeFile(file, bytes)))
+    await legacy(root, 'delta-100-old.parquet', [row(0, 150), row(1)])
+    const active = await legacy(root, 'base-200-current.parquet', [{ ...row(1, 110), writtenAt: 200 }])
+    const original = await readFile(active)
+    store = await MarketStore.open(root)
+    const rows = await store.candles(query)
+    assert.deepEqual(rows.map(value => value.timestamp), [base + step], 'An obsolete delta cannot resurrect a row deleted by a repair base.')
+    assert.equal(rows[0].close, 110); assert.equal(rows[0].oi, 1_000)
+    assert.deepEqual(await readFile(active), original)
+    const watermark = await store.candleWatermark(query.instrument, query.timeframe)
     await store.close(); store = await MarketStore.open(root)
-    assert.deepEqual((await store.candles(dayQuery)).map(candle => candle.timestamp), [dayStart + step])
-    const report = await store.inspectCandles({ ...dayQuery, through: dayStart + step })
-    assert.deepEqual(report.issues.map(issue => issue.reason), ['gap'])
-    assert.equal(await store.candleWatermark(dayQuery.instrument, dayQuery.timeframe), deletion)
-    const retained = await (store as any).parquetFiles(dayQuery.instrument, dayQuery.timeframe)
-    const retainedParts = await Promise.all(retained.map(async (file: string) => ({ file, bytes: await readFile(file) })))
-    await store.replaceCandles(dayQuery, [])
-    const emptyWatermark = await store.candleWatermark(dayQuery.instrument, dayQuery.timeframe)
-    await Promise.all([...oldParts, ...retainedParts].map(({ file, bytes }) => writeFile(file, bytes)))
+    assert.equal((await store.candles(query))[0].close, 110)
+    assert.equal(await store.candleWatermark(query.instrument, query.timeframe), watermark)
+    assert.equal((await readdir(join(root, 'candles', 'timeframe=5m', 'instrument=BTC-USDT-SWAP', 'date=2024-01-01'))).length, 2)
+  } finally { await store?.close(); await rm(root, { recursive: true, force: true }) }
+})
+test('old imports cannot overwrite newly collected prices or source statistics', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-import-live-'))
+  let store: MarketStore | undefined
+  try {
+    await legacy(root, 'base-10000000000000-old.parquet', [{ ...row(0), writtenAt: 10_000_000_000_000 }])
+    store = await MarketStore.open(root)
+    await store.appendCandles([{ ...row(0, 250), oi: undefined, buy: undefined, sell: undefined, statisticsVersion: undefined }])
+    await store.appendStatistics({ ...query, through: base, source: 'oi', values: [[base, 5_000]], expiresAt: null })
+    const [value] = await store.candles(query)
+    assert.equal(value.close, 250); assert.equal(value.oi, 5_000)
+    assert.equal(value.sell, 20, 'An imported independent source can fill a newly collected price.')
+    await store.replaceCandles({ ...query, through: base }, [])
     await store.close(); store = await MarketStore.open(root)
-    assert.deepEqual(await store.candles(dayQuery), [], 'An empty repair base must hide old bases and old deltas.')
-    assert.equal(await store.candleWatermark(dayQuery.instrument, dayQuery.timeframe), emptyWatermark)
-  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
+    assert.deepEqual(await store.candles(query), [], 'Source files retained on disk do not resurrect deleted SQLite facts.')
+  } finally { await store?.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-test('restart after a clock rollback still publishes the newest candle revision', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-revision-restart-'))
-  let store = await MarketStore.open(root)
-  const realNow = Date.now
+test('expired absence is not renewed during import and SQLite becomes the sole source after cutover', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-import-audit-'))
+  let store: MarketStore | undefined
   try {
-    const future = realNow() + 1_000_000
-    Date.now = () => future
-    await store.appendCandles([row(0)])
-    const before = await store.candleWatermark(dayQuery.instrument, dayQuery.timeframe)
-    // A base introduces a cutoff as well as a row revision. A new process
-    // must reserve after it rather than trusting a regressed wall clock.
-    await store.replaceCandles({ ...dayQuery, through: dayStart }, [row(0, 250)])
-    await store.close(); store = await MarketStore.open(root)
-    Date.now = () => future - 10_000
-    await store.appendCandles([row(0, 500)])
-    assert.equal((await store.candles(dayQuery))[0].close, 500)
-    assert.notEqual(await store.candleWatermark(dayQuery.instrument, dayQuery.timeframe), before)
-    await store.close(); store = await MarketStore.open(root)
-    assert.equal((await store.candles(dayQuery))[0].close, 500)
-  } finally { Date.now = realNow; await store.close(); await rm(root, { recursive: true, force: true }) }
+    const file = await legacy(root, 'base-200-data.parquet', [{ ...row(0), oi: null, buy: null, sell: null, statisticsVersion: 11 }])
+    store = await MarketStore.open(root)
+    const observations = await store.statistics(query)
+    assert.equal(observations[0].oi, null)
+    assert.equal(observations[0].statisticsOIExpiresAt, null)
+    assert.deepEqual(await store.statisticsMissingRanges({ ...query, through: base, source: 'oi' }), [{ from: base, through: base }])
+    await store.close(); await writeFile(file, 'broken parquet'); store = await MarketStore.open(root)
+    assert.equal((await store.candles(query))[0].close, 100, 'Retained Parquet becomes an immutable recovery artifact after import.')
+  } finally { await store?.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-test('a full legacy repair cannot reuse a stale snapshot identity after clock rollback', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-legacy-repair-clock-'))
-  let store = await MarketStore.open(root)
-  const realNow = Date.now
+test('an unreadable legacy partition is recorded for audit and can be repaired in SQLite', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-import-corrupt-'))
+  let store: MarketStore | undefined
   try {
-    const clock = realNow() + 1_000_000
-    Date.now = () => clock
-    await store.appendCandles([row(0)])
-    const internal: any = store, [original] = await internal.parquetFiles(dayQuery.instrument, dayQuery.timeframe)
-    const legacy = join(internal.partition(dayQuery.instrument, dayQuery.timeframe, dayStart), `part-1-${clock}-abc.parquet`)
-    await writeFile(legacy, await readFile(original)); await rm(original)
-    const before = await store.candleWatermark(dayQuery.instrument, dayQuery.timeframe)
-    await store.writeChartSnapshot(dayQuery.instrument, dayQuery.timeframe, { watermark: before, frame: { oldPrice: 100 } })
-    Date.now = () => clock + 10_000
-    await store.close(); store = await MarketStore.open(root)
-    Date.now = () => clock
-    await store.replaceCandles(dayQuery, [row(0, 500)])
-    assert.equal((await store.candles(dayQuery))[0].writtenAt, clock, 'The replacement can legitimately reuse an old numeric row watermark.')
-    const repaired = await store.candleWatermark(dayQuery.instrument, dayQuery.timeframe)
-    assert.notEqual(repaired, before, 'Committed file identity must change even when numeric row watermarks collide.')
-    await store.close(); store = await MarketStore.open(root)
-    assert.equal(await store.candleWatermark(dayQuery.instrument, dayQuery.timeframe), repaired)
-    const snapshot = await store.readChartSnapshot(dayQuery.instrument, dayQuery.timeframe) as { watermark: string }
-    assert.notEqual(snapshot.watermark, repaired, 'Snapshot restore must reject pre-repair data on restart.')
-    assert.equal((await store.candles(dayQuery))[0].close, 500)
-  } finally { Date.now = realNow; await store.close(); await rm(root, { recursive: true, force: true }) }
+    const file = await legacy(root, 'base-200-data.parquet', [row(0)])
+    await writeFile(file, 'broken parquet')
+    store = await MarketStore.open(root)
+    const issues = (await store.inspectCandles(query)).issues
+    assert.ok(issues.some(issue => issue.reason === 'corrupt-file'))
+    await store.replaceCandles({ ...query, through: base + 287 * step }, [row(0), row(1)])
+    assert.ok(!(await store.inspectCandles(query)).issues.some(issue => issue.reason === 'corrupt-file'))
+    assert.equal((await store.candles(query)).length, 2)
+  } finally { await store?.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-test('stable immutable file sets reuse schema inspection while audits always examine physical files', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-radar-schema-cache-'))
-  let store = await MarketStore.open(root)
+test('bounded latest reads and metadata never wait for unrelated legacy partitions', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-import-latest-'))
+  let store: MarketStore | undefined
   try {
-    await store.appendCandles([row(0)])
-    await store.appendCandles([row(1)])
-    await store.close(); store = await MarketStore.open(root)
-    const connection = (store as any).connection, read = connection.runAndReadAll.bind(connection)
-    let describes = 0
-    connection.runAndReadAll = (sql: string) => { if (sql.startsWith('DESCRIBE')) describes += 1; return read(sql) }
-    for (let index = 0; index < 5; index += 1) {
-      await store.candles(dayQuery)
-      await store.candleTimestamps(dayQuery)
-    }
-    assert.equal(describes, 1, 'Repeated reads of the same immutable file set must not redescribe Parquet.')
-    assert.deepEqual((await store.inspectCandles({ ...dayQuery, through: dayStart + step })).issues, [])
-    assert.equal(describes, 3, 'Manual audits must inspect each physical schema independently of the read cache.')
-  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
+    const corrupt = await legacy(root, 'base-100-old.parquet', [row(0)])
+    const recent = await legacy(root, 'base-200-recent.parquet', [row(288)])
+    const directory = join(root, 'candles', 'timeframe=5m', 'instrument=BTC-USDT-SWAP', 'date=2024-01-02')
+    await mkdir(directory)
+    await rename(recent, join(directory, 'base-200-recent.parquet'))
+    await writeFile(corrupt, 'broken parquet')
+    store = await MarketStore.open(root)
+    await store.coverage(query.instrument, query.timeframe)
+    await store.priceWatermark(query.instrument, query.timeframe)
+    const latest = await store.candles({ instrument: query.instrument, timeframe: query.timeframe, limit: 1, order: 'desc' }, 'interactive')
+    assert.equal(latest[0].timestamp, base + 86_400_000)
+  } finally { await store?.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('ambiguous equal-revision legacy rows are retained for audit rather than chosen arbitrarily', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-import-duplicate-'))
+  let store: MarketStore | undefined
+  try {
+    await legacy(root, 'base-200-first.parquet', [row(0)])
+    await legacy(root, 'delta-201-conflict.parquet', [row(0, 150)])
+    store = await MarketStore.open(root)
+    assert.ok((await store.inspectCandles(query)).issues.some(issue => issue.reason === 'duplicate'))
+    assert.equal((await readdir(join(root, 'candles', 'timeframe=5m', 'instrument=BTC-USDT-SWAP', 'date=2024-01-01'))).length, 2)
+  } finally { await store?.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('an operational import failure cannot certify cutover or erase its retryable source', { skip: process.getuid?.() === 0 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-import-permission-'))
+  const directory = join(root, 'candles', 'timeframe=5m', 'instrument=BTC-USDT-SWAP')
+  let store: MarketStore | undefined
+  try {
+    await legacy(root, 'base-200-first.parquet', [row(0)])
+    await chmod(directory, 0)
+    store = await MarketStore.open(root)
+    await assert.rejects(store.candles(query), /EACCES|permission/i)
+    assert.equal((await store.migrationStatus()).complete, false)
+    await chmod(directory, 0o700)
+    assert.equal((await store.candles(query))[0].close, 100)
+  } finally { await chmod(directory, 0o700).catch(() => {}); await store?.close(); await rm(root, { recursive: true, force: true }) }
 })

@@ -41,24 +41,27 @@ const installPreparedTransform = async options => electron.evaluate(({ ipcMain, 
   const original = ipcMain._invokeHandlers.get('radar:request')
   const contents = BrowserWindow.getAllWindows()[0].webContents
   const originalSend = contents.send
-  const probe = { original, contents, originalSend, calls: 0 }
+  const probe = { original, contents, originalSend, calls: 0, confirmed: new Map() }
   const transform = response => {
     if (response?.instId !== options.instId || options.timeframe && response.timeframe !== options.timeframe) return response
-    if (options.mode === 'terminal') return {
-      ...response, endHour: null, latestEnd: null, oldestHour: options.end - 11 * options.intervalMS,
-      historyExhausted: true, revision: 900_000, bars: [],
-      oiState: 'unavailable', takerState: 'unavailable', indicatorState: 'unavailable', error: '',
-      unavailable: { reason: 'insufficient-history', availableCandles: 12, requiredCandles: 96, retryAt: Date.now() + 60_000 },
+    if (options.mode === 'partial' && Array.isArray(response.bars)) return {
+      ...response, oldestHour: options.end - 11 * options.intervalMS, historyExhausted: true, revision: 900_000,
+      bars: response.bars.filter(bar => bar.hour >= options.end - 11 * options.intervalMS && bar.hour <= options.end).map(bar => ({ ...bar, statisticsSources: 0, statisticsObserved: false, oiObserved: false, takerObserved: false, oi: null, buy: null, sell: null })),
+      priceState: 'partial', oiState: 'loading', takerState: 'loading', error: '',
     }
-    if (options.mode === 'warmup') return { ...response, bars: response.bars.map(bar => ({
+    if (options.mode === 'warmup' && Array.isArray(response.bars)) return { ...response, bars: response.bars.map(bar => ({
       ...bar,
       rsi6: bar.hour >= options.first && bar.hour <= options.warmupThrough ? null : bar.rsi6,
       rsi12: bar.hour >= options.first && bar.hour <= options.warmupThrough || bar.hour === options.interiorGap ? null : bar.rsi12,
     })) }
-    if (options.mode === 'live' && response.endHour === response.latestEnd) {
-      const last = response.bars.find(bar => bar.hour === response.endHour)
+    const lastConfirmed = response.bars?.find(bar => bar.hour === response.endHour)
+    if (lastConfirmed) probe.confirmed.set(`${response.instId}:${response.timeframe}`, lastConfirmed)
+    if (options.mode === 'live' && (response.type === 'live' || response.endHour === response.latestEnd)) {
+      const last = lastConfirmed ?? probe.confirmed.get(`${response.instId}:${response.timeframe}`)
+      if (!last) return response
+      const intervalMS = response.intervalMS ?? ({ '5m': 300_000, '15m': 900_000, '1H': 3_600_000 })[response.timeframe]
       return { ...response, liveBar: {
-        ...last, hour: response.endHour + response.intervalMS,
+        ...last, hour: response.endHour + intervalMS,
         open: options.livePrice * .999, high: options.livePrice * 1.001, low: options.livePrice * .998, close: options.livePrice,
         confirmed: false, statisticsObserved: false, oi: null, buy: null, sell: null,
       } }
@@ -165,7 +168,7 @@ test('Radar has no Research or Strategy workspace or desktop operations', async 
   }
 })
 
-test('completed candles round-trip through the Electron-owned Parquet store', async () => {
+test('completed candles round-trip through the Electron-owned SQLite store', async () => {
   const timestamp = Date.UTC(2024, 9, 16, 12, 0)
   const seed = await request({ e2e: { action: 'seedCandles', candles: [{ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp, open: 100, high: 112, low: 99, close: 108, volume: 1234, confirmed: true }] } })
   assert.equal(seed.written, 1)
@@ -252,7 +255,10 @@ test('prepared native chart pages preserve canonical indicator values across eve
   await installRequestProbe(electron, fixture.instId)
   try {
     for (const timeframe of fixture.timeframes) {
-      const prepared = await request({ chartWindow: { instId: fixture.instId, timeframe, endHour: fixture.end } })
+      const prepared = await waitFor(async () => {
+        const frame = await request({ chartWindow: { instId: fixture.instId, timeframe, endHour: fixture.end } })
+        return frame.indicatorState !== 'loading' ? frame : null
+      })
       const expected = new Map(fixture.series[timeframe].bars.map(bar => [bar.hour, bar]))
       const visible = prepared.bars.filter(bar => bar.hour >= fixture.end - 95 * fixture.series[timeframe].intervalMS && bar.hour <= fixture.end)
       assert.equal(visible.length, 96)
@@ -317,7 +323,7 @@ test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while specu
       for (const phase of [
         { name: 'high velocity', frames: 6, eventsPerFrame: 32, deltaY: 36, candles: 576 },
         { name: 'reversal', frames: 3, eventsPerFrame: 32, deltaY: -36, candles: -288 },
-        { name: '1200-candle jump', deltaY: 14_400, candles: 1_200 },
+        { name: '600-candle jump inside the bounded reserve', deltaY: 7_200, candles: 600 },
       ]) {
         const inputs = await wheelBurst(page, phase)
         const targets = inputs.map((_, index) => fixture.end - (distance + phase.candles / inputs.length * (index + 1)) * intervalMS)
@@ -424,6 +430,7 @@ test('the live price overlay follows its actual price without changing the 96 co
   await installPreparedTransform({ mode: 'live', instId: fixture.instId, livePrice })
   try {
     await openChart(page, fixture)
+    await page.waitForFunction(() => Boolean(document.querySelector('[data-chart-inst]')?.__chartSnapshot?.liveBar))
     await startPaintProbe(page, fixture)
     const overlay = await page.evaluate(() => {
       const chart = document.querySelector('[data-chart-inst]')
@@ -449,9 +456,9 @@ test('the live price overlay follows its actual price without changing the 96 co
         lineEndX: Number(line.getAttribute('x2')),
         labelBounds: [labelBounds.x, labelBounds.x + labelBounds.width], svgWidth: svg.viewBox.baseVal.width,
         labelFont: getComputedStyle(label).fontSize, tickFont: getComputedStyle(tick).fontSize,
-        countdownFont: getComputedStyle(countdown).fontSize,
-        countdownY: Number(countdown.getAttribute('y')),
-        countdownFill: getComputedStyle(countdown).fill, tickFill: getComputedStyle(tick).fill,
+        countdownFont: countdown ? getComputedStyle(countdown).fontSize : null,
+        countdownY: Number(countdown?.getAttribute('y')),
+        countdownFill: countdown ? getComputedStyle(countdown).fill : null, tickFill: getComputedStyle(tick).fill,
         labelFill: getComputedStyle(label).fill,
       }
     })
@@ -566,24 +573,22 @@ test('known RSI segments remain visible through indicator warm-up and internal m
   }
 })
 
-test('a newly listed contract with fewer than 96 completed candles explains the limit and stops retrying', async () => {
+test('a listing with twelve prices remains usable while statistics are unknown', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  await installPreparedTransform({ mode: 'terminal', instId: fixture.instId, end: fixture.end, intervalMS: fixture.intervalMS })
+  await installPreparedTransform({ mode: 'partial', instId: fixture.instId, end: fixture.end, intervalMS: fixture.intervalMS })
   try {
     await page.reload({ waitUntil: 'domcontentloaded' })
-    await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click({ timeout: 15_000 })
+    await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click()
     await selectTimeframe(page, fixture.timeframe)
     const chart = page.locator(`[data-chart-inst="${fixture.instId}"]`)
-    await chart.getByText('SOL-USDT has 12 completed 1h candles. A complete chart requires 96.', { exact: true }).waitFor()
+    await page.waitForFunction(() => document.querySelector('[data-chart-inst]')?.dataset.chartRenderedBars === '12')
     assert.equal(await chart.getAttribute('data-chart-loading'), 'false')
-    assert.equal(await chart.locator('svg[data-rendered-inst]').count(), 0)
-    assert.equal(await chart.locator('[data-slot="spinner"]').count(), 0)
-    const callsAtTerminal = await electron.evaluate(() => globalThis.__preparedTransform.calls)
-    await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 1_100)))
-    assert.equal(await electron.evaluate(() => globalThis.__preparedTransform.calls), callsAtTerminal, 'Known insufficient history must not become a retry loop after selecting the native timeframe.')
-  } finally {
-    await removePreparedTransform()
-  }
+    assert.equal(await chart.locator('svg[data-rendered-inst]').count(), 1)
+    assert.equal(await chart.getAttribute('data-chart-oi-state'), 'loading')
+    assert.equal(await chart.getAttribute('data-chart-taker-state'), 'loading')
+    assert.equal(await chart.getAttribute('data-chart-incomplete'), 'true')
+    assert.match(await chart.locator('[aria-live="off"]').textContent(), /Close/)
+  } finally { await removePreparedTransform() }
 })
 
 test('historically unavailable statistics remain missing instead of becoming false zero volume', async () => {

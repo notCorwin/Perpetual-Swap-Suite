@@ -297,7 +297,7 @@ test('accelerating scrolling starts a bounded bulk prefetch before the ready edg
     now += 16
     controller.scroll(-24)
     assert.equal(queue.calls.length, 1)
-    assert.equal(queue.calls[0].target.end, 1_094 * hour, 'The next page overlaps the earliest resident window.')
+    assert.equal(queue.calls[0].target.end, 999 * hour, 'The next page starts before the earliest resident candle.')
     assert.ok(queue.calls[0].target.historyBars! > 96)
     assert.ok(queue.calls[0].target.historyBars! <= 4_096)
     assert.ok(controller.getSnapshot().presented!.endHour - 1_095 * hour > 1_000 * hour, 'Fast input gets more than a thousand candles of runway.')
@@ -355,7 +355,7 @@ test('measured slow preparation increases the reserve for later scrolling', asyn
     now += 1_000
     controller.scroll(-20)
     assert.equal(queue.calls.length, 2, 'An eight-second source response moves the trigger beyond the initial network budget.')
-    assert.equal(queue.calls[1].target.end, 293 * hour)
+    assert.equal(queue.calls[1].target.end, 198 * hour)
     assert.ok(queue.calls[1].target.historyBars! > queue.calls[0].target.historyBars!)
     assert.equal(controller.getSnapshot().pending, false)
   } finally { close() }
@@ -439,15 +439,15 @@ test('a proven history boundary clamps the cursor once and never replays discard
   try {
     controller.scroll(-10_000)
     assert.equal(controller.getSnapshot().requested?.end, 95 * hour, 'The resident cache edge must not clamp uncached intent.')
-    queue.calls[0].resolve(prepared(btc, 1_105, { latestEnd: 1_199 * hour, oldestHour: 1_010 * hour, historyExhausted: true }))
+    queue.calls[0].resolve(prepared(btc, 1_105, { latestEnd: 1_199 * hour, oldestHour: 1_010 * hour, historyExhausted: true, bars: bars(1_010, 190) }))
     await settled()
-    assert.equal(controller.getSnapshot().requested?.end, 1_105 * hour)
-    assert.equal(controller.getSnapshot().presented?.endHour, 1_105 * hour)
+    assert.equal(controller.getSnapshot().requested?.end, 1_010 * hour)
+    assert.equal(controller.getSnapshot().presented?.endHour, 1_010 * hour)
     assert.equal(controller.getSnapshot().pending, false)
     controller.scroll(-10_000)
     await settled()
-    assert.equal(controller.getSnapshot().requested?.end, 1_105 * hour)
-    assert.equal(controller.getSnapshot().presented?.endHour, 1_105 * hour)
+    assert.equal(controller.getSnapshot().requested?.end, 1_010 * hour)
+    assert.equal(controller.getSnapshot().presented?.endHour, 1_010 * hour)
   } finally { close() }
 })
 
@@ -462,7 +462,8 @@ test('late failures and an old component release cannot replace or deactivate a 
   closeBTC()
   try {
     assert.equal(controller.getSnapshot().requested?.instId, eth)
-    assert.equal(controller.getSnapshot().presented, previous)
+    assert.equal(controller.getSnapshot().presented, null, 'A different selected contract must not display the previous contract price.')
+    assert.equal(previous?.instId, btc)
     queue.calls[0].reject(new Error('Old BTC background failure'))
     await settled()
     assert.equal(controller.getSnapshot().error, '')
@@ -591,7 +592,7 @@ test('forming-only subscription deltas update the visible overlay without histor
     assert.equal(controller.getSnapshot().presented?.liveBar, undefined)
     context.mock.timers.tick(600_000)
     await settled()
-    assert.equal(localCalls, 0)
+    assert.equal(localCalls, 1, 'A bounded selected-series read refreshes cached price projection independently of pushes.')
     assert.equal(historyCalls, 0)
     assert.equal(queue.calls.length, 0)
   } finally { close() }
@@ -699,7 +700,8 @@ test('a listing with insufficient history stops preparation until its meaningful
     await settled()
     assert.equal(controller.getSnapshot().pending, false)
     assert.deepEqual(controller.getSnapshot().unavailable, unavailable)
-    assert.equal(controller.getSnapshot().presented, previous, 'The prior immutable chart stays intact without pretending to show the new listing.')
+    assert.equal(controller.getSnapshot().presented, null, 'A different selected contract has an explicit loading state.')
+    assert.equal(previous?.instId, btc)
     assert.equal(controller.getSnapshot().error, '')
     assert.ok(queue.calls.slice(1).every(call => call.requestedAt >= unavailable.retryAt), 'An unavailable result must not immediately enter the retry pump.')
     assert.equal(controller.store.snapshotMeta(eth, '1H'), null, 'An empty unavailable result is not prepared chart data.')
@@ -740,7 +742,7 @@ test('a stale unavailable response cannot replace the latest requested range', a
   } finally { close() }
 })
 
-test('all candidate native timeframes switch synchronously beyond the history LRU without selection IPC', async () => {
+test('cached native prices switch synchronously while selected-series hydration stays bounded', async () => {
   const queue = transportQueue()
   const ids = Array.from({ length: 283 }, (_, index) => `NAV${index}-USDT-SWAP`)
   const timeframes = ['5m', '15m', '1H'] as const
@@ -750,7 +752,7 @@ test('all candidate native timeframes switch synchronously beyond the history LR
     local: async () => { localCalls += 1; return null },
     history: async () => { historyCalls += 1; return null },
     universe: async () => { universeCalls += 1; return { frames: ids.flatMap((id, index) => timeframes.map(frame => nativePrepared(id, 199, frame, 200 + index))) } },
-  }, new PreparedChartStore({ maxSeries: 1 }))
+  }, new PreparedChartStore({ maxSeries: 1, maxBytes: 256 * 1024 * 1024 }))
   await controller.setUniverse(ids, '1H')
   ids.forEach((id, index) => controller.store.ingest(nativePrepared(id, 199, '1H', 200 + index)))
   assert.equal(controller.store.size, 1, 'Deep history must actually exceed its LRU capacity.')
@@ -772,7 +774,7 @@ test('all candidate native timeframes switch synchronously beyond the history LR
     releases.push(controller.open(ids[0], '1H'))
     assert.equal(controller.getSnapshot().presented?.instId, ids[0])
     assert.equal(controller.getSnapshot().pending, false)
-    assert.equal(localCalls, 0)
+    assert.ok(localCalls > 0 && localCalls <= 8, 'Rapid selections coalesce bounded local reads instead of warming every candidate.')
     assert.equal(historyCalls, 0, 'Selection and timeframe changes do not serialize deep history.')
     await controller.setUniverse(ids.toReversed(), '1H')
     await settled()

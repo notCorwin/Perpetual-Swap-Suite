@@ -174,6 +174,8 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   assert.equal('bars' in liveUpdate, false, 'A forming update must not transfer completed candles.')
   await electron.evaluate(({ BrowserWindow }, update) => BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', update), liveUpdate)
   await page.waitForFunction(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 135)
+  assert.match(await chart.locator('[aria-live="off"]').textContent(), /Close\s+135/)
+  assert.match(await chart.locator('[data-chart-price-label-value]').textContent(), /^135 /)
   assert.equal(await page.evaluate(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot.bars === globalThis.__completedSubscriptionBars), true)
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Live-only subscriptions must reuse the completed frame without a follow-up read.')
 })

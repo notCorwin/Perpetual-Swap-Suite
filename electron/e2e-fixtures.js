@@ -4,6 +4,16 @@ import { quoteTurnover24h } from './services/liquidity.js'
 const FIVE_MINUTES = 300_000
 const HOUR = 3_600_000
 
+// Fixtures use the same independent price/statistic ledgers as production.
+async function persistNativeFixture(store, marketService, rows) {
+  const { instrument, timeframe } = rows[0]
+  await marketService.persistCandles(instrument, rows, { projectList: false })
+  const range = { instrument, timeframe, from: rows[0].timestamp, through: rows.at(-1).timestamp, expiresAt: Date.now() + 60_000 }
+  await store.appendStatistics({ ...range, source: 'oi', values: rows.filter(row => row.oi != null).map(row => [row.timestamp, row.oi]) })
+  await store.appendStatistics({ ...range, source: 'taker', values: rows.filter(row => row.buy != null && row.sell != null).map(row => [row.timestamp, row.sell, row.buy]) })
+  await marketService.preparedCharts.observeStatistics(instrument, timeframe, range.from, range.through)
+}
+
 // Keep this fixture at the data boundary.  It intentionally registers only a
 // market catalog entry plus durable source/statistics observations: the
 // production list projection is responsible for building the visible row.
@@ -85,8 +95,7 @@ export async function seedCachedListProjection(store, marketService) {
 // A dense, fully local chart fixture for renderer benchmarks. It writes the
 // same durable rows that the production chart uses; no synthetic IPC response
 // or network timing is involved.
-export async function seedChartScrollBenchmark(store, marketService) {
-  const instId = 'SOL-USDT-SWAP'
+export async function seedChartScrollBenchmark(store, marketService, { instId = 'SOL-USDT-SWAP', unavailableStatistics = false } = {}) {
   const timeframe = '1H'
   const alternateTimeframe = '15m'
   const timeframes = ['5m', '15m', '1H']
@@ -120,7 +129,7 @@ export async function seedChartScrollBenchmark(store, marketService) {
   const intervals = { '5m': FIVE_MINUTES, '15m': 3 * FIVE_MINUTES, '1H': HOUR }
   const candlesByFrame = Object.fromEntries(timeframes.map(frame => [frame, buildCandles(frame, intervals[frame])]))
   const hourly = candlesByFrame[timeframe]
-  for (const frame of timeframes) await marketService.persistCandles(instId, candlesByFrame[frame].map(row => ({ ...row, replaceStatistics: true })), { projectList: false })
+  for (const frame of timeframes) await persistNativeFixture(store, marketService, candlesByFrame[frame].map(row => unavailableStatistics && frame === timeframe ? { ...row, oi: null, buy: null, sell: null } : row))
   const series = Object.fromEntries(timeframes.map(frame => [frame, {
     intervalMS: intervals[frame], start: candlesByFrame[frame][0].timestamp, end,
     bars: barsWithIndicators(candlesByFrame[frame], intervals[frame]),
@@ -146,9 +155,7 @@ export async function seedChartScrollBenchmark(store, marketService) {
 // Model successful empty source observations: prices exist,
 // but OI is empty and Taker returned zero placeholders despite real trades.
 export async function seedHistoricalStatisticsBoundary(store, marketService) {
-  const fixture = await seedChartScrollBenchmark(store, marketService)
-  const rows = await store.candles({ instrument: fixture.instId, timeframe: fixture.timeframe, from: fixture.end - 95 * HOUR, through: fixture.end })
-  await marketService.persistCandles(fixture.instId, rows.map(row => ({ ...row, oi: null, buy: 0, sell: 0, statisticsVersion: 11, statisticsOIExpiresAt: Date.now() + 60_000, statisticsTakerExpiresAt: Date.now() + 60_000, replaceStatistics: true })), { projectList: false })
+  const fixture = await seedChartScrollBenchmark(store, marketService, { instId: 'EMPTY-USDT-SWAP', unavailableStatistics: true })
   marketService.markChartDataChanged(fixture.instId)
   fixture.series[fixture.timeframe].bars = fixture.series[fixture.timeframe].bars.map(bar => bar.hour >= fixture.end - 95 * HOUR
     ? { ...bar, oi: null, buy: null, sell: null } : bar)
@@ -188,7 +195,7 @@ export async function seedInstrumentNavigationBenchmark(store, marketService) {
           statisticsVersion: 1, statisticsSources: 3, statisticsObserved: true, confirmed: true,
         }
       })
-      await marketService.persistCandles(instId, candles.map(row => ({ ...row, replaceStatistics: true })), { projectList: false })
+      await persistNativeFixture(store, marketService, candles)
       series[timeframe] = { intervalMS, start, end, bars: barsWithIndicators(candles, intervalMS) }
     }
     const latest = series['1H'].bars.at(-1)

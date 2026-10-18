@@ -5,6 +5,8 @@ export type Bar = {
   hour: number; open: number; high: number; low: number; close: number; confirmed: boolean
   statisticsSources?: number
   statisticsObserved?: boolean
+  oiObserved?: boolean
+  takerObserved?: boolean
   indicatorsObserved?: boolean
   vwap: number | null; ema: number | null; bollUpper: number | null; bollMiddle: number | null; bollLower: number | null
   roc: PercentageValue; maroc: PercentageValue; rsi6: number | null; rsi12: number | null; rsi24: number | null
@@ -13,8 +15,8 @@ export type Bar = {
   takerUnavailableReason?: 'not-published'
 }
 
-export type PreparedChartState = 'ready' | 'unavailable'
-export type PreparedChartBar = Bar & { confirmed: true; statisticsSources: 3; statisticsObserved: true; indicatorsObserved: true }
+export type PreparedChartState = 'ready' | 'partial' | 'loading' | 'stale' | 'unavailable'
+export type PreparedChartBar = Bar & { confirmed: true }
 export type PreparedChartGeneration = number
 export type ChartUnavailable = Readonly<{ reason: 'insufficient-history'; availableCandles: number; requiredCandles: 96; retryAt: number }>
 export type PreparedChartResponse = {
@@ -32,6 +34,11 @@ export type PreparedChartResponse = {
   takerState: PreparedChartState
   indicatorState: PreparedChartState
   liveBar?: Bar
+  priceState?: PreparedChartState
+  priceAsOf?: number | null
+  priceObservedAt?: number | null
+  realtimeState?: 'live' | 'stale'
+  sourceVersions?: { price: number; oi: number; taker: number }
   unavailable?: ChartUnavailable
   error: string
 }
@@ -44,6 +51,11 @@ export type PreparedChartLiveUpdate = {
   revision: number
   endHour: number
   liveBar: Bar | null
+  priceObservedAt?: number | null
+  realtimeState?: 'live' | 'stale'
+  priceState?: PreparedChartState
+  priceAsOf?: number | null
+  sourceVersions?: { price: number; oi: number; taker: number }
 }
 export type PreparedChartNotification = PreparedChartResponse | PreparedChartLiveUpdate
 
@@ -51,6 +63,7 @@ export type PreparedChartMeta = Readonly<{
   key: string; instId: string; timeframe: RadarTimeframe; intervalMS: number
   generation: PreparedChartGeneration; revision: number
   latestEnd: number | null; oldestHour: number | null; historyExhausted: boolean; error: string
+  priceAsOf?: number | null; priceObservedAt?: number | null; realtimeState?: 'live' | 'stale'; sourceVersions?: { price: number; oi: number; taker: number }
 }>
 
 export type ReadyChartWindow = Readonly<{
@@ -58,4 +71,9 @@ export type ReadyChartWindow = Readonly<{
   bars: readonly PreparedChartBar[]; endHour: number
   oiState: PreparedChartState; takerState: PreparedChartState; indicatorState: PreparedChartState
   liveBar?: Bar
+  priceState?: PreparedChartState
+  priceAsOf?: number | null
+  priceObservedAt?: number | null
+  realtimeState?: 'live' | 'stale'
+  sourceVersions?: { price: number; oi: number; taker: number }
 }>

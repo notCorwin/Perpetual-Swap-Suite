@@ -12,7 +12,7 @@ export async function waitForRendered(page, fixture, timeframe = fixture.timefra
     const svg = chart?.querySelector('svg[data-rendered-inst]')
     return svg?.getAttribute('data-rendered-inst') === instId
       && svg.getAttribute('data-rendered-timeframe') === timeframe
-      && Number(svg.getAttribute('data-rendered-end')) === end
+      && Number(chart.getAttribute('data-chart-completed-end') ?? svg.getAttribute('data-rendered-end')) === end
       && chart.getAttribute('data-chart-rendered-bars') === '96'
       && chart.getAttribute('data-chart-loading') === 'false'
   }, { instId: fixture.instId, timeframe, end }, { timeout: 20_000 })
@@ -77,12 +77,13 @@ export async function startPaintProbe(page, fixture) {
       const snapshot = chart.__chartSnapshot
       const svg = chart.querySelector('svg[data-rendered-inst]')
       if (!snapshot || !svg) { fail('A presented chart disappeared.'); return }
-      const { bars, timeframe } = snapshot
+      const { timeframe } = snapshot
+      const bars = chart.__chartRenderedBars ?? snapshot.bars
       if (Array.isArray(bars)) {
         if (Number(svg.dataset.renderedStart) !== bars[0]?.hour || Number(svg.dataset.renderedEnd) !== bars.at(-1)?.hour) fail('SVG labels and the drawn range disagree.')
         if (Number(chart.dataset.chartStart) !== bars[0]?.hour || Number(chart.dataset.chartEnd) !== bars.at(-1)?.hour) fail('Header and actual plot refer to different ranges.')
         const requestedEnd = Number(chart.dataset.chartRequestedEnd)
-        if (chart.dataset.chartLoading === 'false' && requestedEnd > 0 && requestedEnd !== bars.at(-1)?.hour) fail('The chart claims completion for a different requested range.')
+        if (chart.dataset.chartLoading === 'false' && requestedEnd > 0 && requestedEnd !== snapshot.endHour) fail('The chart claims completion for a different requested range.')
       }
       if (snapshot === probe.previousSnapshot) {
         if (frame && probe.commits.at(-1)?.presentedAt === null) probe.commits.at(-1).presentedAt = performance.now()
@@ -96,16 +97,17 @@ export async function startPaintProbe(page, fixture) {
       // A mutation is a React commit; the following animation frame is the
       // first paint opportunity that includes that committed SVG. Keep both
       // times so input latency does not mistake a DOM mutation for a frame.
-      probe.commits.push({ at: performance.now(), presentedAt: frame ? performance.now() : null, end: bars.at(-1)?.hour, timeframe })
+      probe.commits.push({ at: performance.now(), presentedAt: frame ? performance.now() : null, end: snapshot.endHour, timeframe })
       if (bars.length !== 96) fail(`Rendered ${bars.length} bars for ${timeframe}.`)
       if (snapshot.instId !== instId || svg.dataset.renderedInst !== instId) fail('Mixed instrument in the rendered surface.')
       if (svg.dataset.renderedTimeframe !== timeframe) fail('SVG and snapshot timeframes disagree.')
       for (let index = 0; index < bars.length; index += 1) {
         const bar = bars[index]
+        if (!bar.confirmed) continue // Forming values are checked against the live payload, independently of the closed-bar oracle.
         const expected = oracles[timeframe]?.get(bar.hour)
         if (!expected) { fail(`Unexpected ${timeframe} timestamp ${bar.hour}.`); continue }
         if (index && bar.hour - bars[index - 1].hour !== intervalMS) fail(`Noncontiguous ${timeframe} candles at ${bar.hour}.`)
-        for (const field of fields) {
+        for (const field of fields.filter(field => ['open', 'high', 'low', 'close'].includes(field) || ['oi', 'buy', 'sell'].includes(field) ? !['oi', 'buy', 'sell'].includes(field) || bar.statisticsObserved : bar.indicatorsObserved)) {
           const actual = bar[field], wanted = expected[field]
           if (wanted === null) {
             if (actual !== null) fail(`${timeframe} ${bar.hour} ${field}: expected missing, got ${actual}.`)
@@ -114,8 +116,6 @@ export async function startPaintProbe(page, fixture) {
             fail(`${timeframe} ${bar.hour} ${field}: expected ${wanted}, got ${actual}.`)
           }
         }
-        if (bar.confirmed && bar.statisticsObserved !== true) fail(`Unobserved statistics published at ${bar.hour}.`)
-        if (bar.indicatorsObserved !== true) fail(`Unprepared indicators published at ${bar.hour}.`)
       }
       const oiCount = bars.filter(bar => bar.oi !== null).length
       const takerCount = bars.filter(bar => bar.buy !== null && bar.sell !== null).length
@@ -208,25 +208,20 @@ export async function measurePaintLatency(page, { inputs, targets }) {
 }
 
 export async function waitForLocalHistory(electron, page, fixture, timeframe = fixture.timeframe) {
-  const preparedBars = fixture.series[timeframe].bars.filter(bar => bar.ema !== null).length
-  // Latest selection consumes only its subscribed compact frame. Request
-  // historical navigation with the same wheel gesture a user would make.
   await wheelBurst(page, { deltaY: 12 })
   const deadline = Date.now() + 20_000
-  while (true) {
+  let resident = 0
+  while (Date.now() < deadline) {
     const requests = await readRequestProbe(electron)
-    if (requests.historyResponses.some(response => response.timeframe === timeframe && response.bars === preparedBars)) break
-    assert.ok(Date.now() < deadline, `The focused ${timeframe} series did not preload its ${preparedBars} initialized durable candles: ${JSON.stringify(requests.historyResponses)}`)
+    resident = requests.historyResponses.filter(response => response.timeframe === timeframe).at(-1)?.bars ?? 0
+    if (resident > 96) break
     await new Promise(resolve => setTimeout(resolve, 20))
   }
-  // IPC counting happens in the main process. Let the renderer receive and
-  // synchronously ingest that response before starting the wheel measurement.
-  await page.evaluate(async () => {
-    for (let frame = 0; frame < 2; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve))
-  })
+  assert.ok(resident > 96 && resident <= 1536, `History hydration must return a bounded price reserve: ${resident}`)
+  await page.evaluate(async () => { for (let frame = 0; frame < 2; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
   await wheelBurst(page, { deltaY: -12 })
   await waitForRendered(page, fixture, timeframe)
-  return preparedBars
+  return resident
 }
 
 export function separateSourceMaintenance(sourceRequests, fixture) {
@@ -265,14 +260,13 @@ export function separateSourceMaintenance(sourceRequests, fixture) {
 }
 
 export async function installRequestProbe(electron, instId, { holdHistorical = false, disableLocalHistory = false, initialHistoryBars = null, capHistoricalWindows = false, historicalDelayMS = 0 } = {}) {
-  await electron.evaluate(({ ipcMain, BrowserWindow }, { instId, holdHistorical, disableLocalHistory, initialHistoryBars, capHistoricalWindows, historicalDelayMS }) => {
+  await electron.evaluate(async ({ ipcMain, BrowserWindow }, { instId, holdHistorical, disableLocalHistory, initialHistoryBars, capHistoricalWindows, historicalDelayMS }) => {
     const original = ipcMain._invokeHandlers.get('radar:request')
     const contents = BrowserWindow.getAllWindows()[0].webContents
     const originalSend = contents.send
-    const { MarketService } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/services/market-service.js')
-    const originalGet = MarketService.prototype.get
+    await globalThis.__marketBackend.probe({ action: 'sourceInstall', instId })
     const probe = {
-      original, contents, originalSend, MarketService, originalGet, calls: [], active: 0, maxActive: 0,
+      original, contents, originalSend, calls: [], active: 0, maxActive: 0,
       historicalActive: 0, maxHistoricalActive: 0,
       historyCalls: [], historyResponses: [], transferredHistoryBars: 0, transferredWindowBars: 0,
       sourceCalls: 0, sourceRequests: [], holdSource: false, holdLatest: false, latestHeld: false,
@@ -291,14 +285,6 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
       return originalSend.call(this, channel, ...args)
     }
     const released = new Promise(resolve => { probe.release = resolve })
-    MarketService.prototype.get = function (path, parameters, ...rest) {
-      if (parameters?.instId === instId) {
-        probe.sourceCalls += 1
-        probe.sourceRequests.push({ path, parameters: { ...parameters } })
-        if (probe.holdSource) return released.then(() => originalGet.call(this, path, parameters, ...rest))
-      }
-      return originalGet.call(this, path, parameters, ...rest)
-    }
     ipcMain.removeHandler('radar:request')
     ipcMain.handle('radar:request', async (event, value) => {
       if (value.chartHistory?.instId === instId) {
@@ -347,29 +333,30 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
 }
 
 export async function releaseRequestProbe(electron) {
-  await electron.evaluate(() => globalThis.__chartRequestProbe?.release())
+  await electron.evaluate(async () => { globalThis.__chartRequestProbe?.release(); await globalThis.__marketBackend.probe({ action: 'sourceRelease' }) })
 }
 
 export async function readRequestProbe(electron) {
-  return electron.evaluate(() => {
+  return electron.evaluate(async () => {
     const probe = globalThis.__chartRequestProbe
+    const sourceRequests = await globalThis.__marketBackend.probe({ action: 'sourceRead' })
     return {
       calls: probe.calls, active: probe.active, maxActive: probe.maxActive,
       historicalActive: probe.historicalActive, maxHistoricalActive: probe.maxHistoricalActive,
       historyCalls: probe.historyCalls, historyResponses: probe.historyResponses,
       transferredHistoryBars: probe.transferredHistoryBars, transferredWindowBars: probe.transferredWindowBars,
       transferredBars: probe.transferredHistoryBars + probe.transferredWindowBars,
-      sourceCalls: probe.sourceCalls, sourceRequests: probe.sourceRequests, held: probe.held, latestHeld: probe.latestHeld, callsAtHold: probe.callsAtHold,
+      sourceCalls: sourceRequests.length, sourceRequests, held: probe.held, latestHeld: probe.latestHeld, callsAtHold: probe.callsAtHold,
     }
   })
 }
 
 export async function removeRequestProbe(electron) {
-  await electron.evaluate(({ ipcMain }) => {
+  await electron.evaluate(async ({ ipcMain }) => {
     const probe = globalThis.__chartRequestProbe
     if (!probe) return
     probe.release()
-    probe.MarketService.prototype.get = probe.originalGet
+    await globalThis.__marketBackend.probe({ action: 'sourceRemove' })
     probe.contents.send = probe.originalSend
     ipcMain.removeHandler('radar:request')
     ipcMain.handle('radar:request', probe.original)
@@ -426,7 +413,7 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
       'Historical work must start and finish during the ongoing wheel gesture, without waiting for scroll end.')
     assert.ok(first.completedAt - first.startedAt >= historicalDelayMS,
       'The measured historical request must include the full artificial network latency.')
-    const firstMissingEnd = fixture.end - (initialHistoryBars - 95) * fixture.intervalMS
+    const firstMissingEnd = fixture.end - initialHistoryBars * fixture.intervalMS
     assert.equal(first.endHour, firstMissingEnd, 'Prefetch must extend the adjacent complete viewport rather than skip a 96-candle page.')
     assert.ok(first.historyBars > 96, 'A latency-covered prefetch must prepare a bulk range.')
     const inputsAtRequest = inputs.filter(input => input <= requestTime).length

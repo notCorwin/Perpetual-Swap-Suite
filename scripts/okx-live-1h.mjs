@@ -39,23 +39,44 @@ const assertPrepared = result => {
   assert.equal(result.takerState, bars.every(bar => Number.isFinite(bar.buy) && Number.isFinite(bar.sell)) ? 'ready' : 'unavailable')
   return bars
 }
-let timeout
-try {
-  const initial = await Promise.race([
-    service.prepareChartWindow(INSTRUMENT_ID, TIMEFRAME),
-    new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error(`Preparation exceeded ${TEST_TIMEOUT}ms.`)), TEST_TIMEOUT) }),
+const complete = result => {
+  const bars = windowBars(result, result.endHour)
+  return bars.length === 96 && bars.every(bar => bar.confirmed && bar.statisticsObserved && bar.indicatorsObserved && bar.statisticsSources === 3)
+}
+async function converge(end) {
+  // Acquisition and final math are checked separately from the initial price
+  // presentation. A progressive price frame is not a failed prepared frame.
+  await Promise.all([
+    service.history.ensurePrices(INSTRUMENT_ID, TIMEFRAME, end - 294 * HOUR, end, 'foreground'),
+    service.history.ensureStatistics(INSTRUMENT_ID, TIMEFRAME, end - 95 * HOUR, end, 'foreground'),
   ])
+  while (true) {
+    const result = await service.prepareChartWindow(INSTRUMENT_ID, TIMEFRAME, end)
+    if (complete(result)) return result
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+}
+let timeout, run
+try {
+  let initial, prepared, bars
+  run = (async () => {
+    initial = await service.prepareChartWindow(INSTRUMENT_ID, TIMEFRAME)
+    assert.equal(initial.error, '')
+    assert.ok(initial.bars.length || initial.liveBar, 'Current OHLC/forming prices must publish before complete auxiliary preparation.')
+    assert.ok([...initial.bars, ...(initial.liveBar ? [initial.liveBar] : [])].every(bar => ['open','high','low','close'].every(field => Number.isFinite(bar[field]) && bar[field] > 0)))
+    const end = initial.endHour ?? Math.floor(Date.now() / HOUR) * HOUR - HOUR
+    prepared = await converge(end)
+    bars = assertPrepared(prepared)
+    const originalCalls = requests.length
+    assertPrepared(await service.prepareChartWindow(INSTRUMENT_ID, TIMEFRAME, end))
+    assert.equal(requests.length, originalCalls, 'Returning to a converged window must reuse durable source pages.')
+    assertPrepared(await converge(end - 12 * HOUR))
+    const afterAdjacent = requests.length
+    assertPrepared(await service.prepareChartWindow(INSTRUMENT_ID, TIMEFRAME, end))
+    assert.equal(requests.length, afterAdjacent, 'A scroll round trip must not redownload the original page.')
+  })()
+  await Promise.race([run, new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error(`Convergence exceeded ${TEST_TIMEOUT}ms.`)), TEST_TIMEOUT) })])
   clearTimeout(timeout)
-  const bars = assertPrepared(initial)
-  const originalCalls = requests.length
-  const returned = await service.prepareChartWindow(INSTRUMENT_ID, TIMEFRAME, initial.endHour)
-  assertPrepared(returned)
-  assert.equal(requests.length, originalCalls, 'Returning to a prepared window must reuse durable source pages.')
-  const adjacent = await service.prepareChartWindow(INSTRUMENT_ID, TIMEFRAME, initial.endHour - 12 * HOUR)
-  assertPrepared(adjacent)
-  const afterAdjacent = requests.length
-  assertPrepared(await service.prepareChartWindow(INSTRUMENT_ID, TIMEFRAME, initial.endHour))
-  assert.equal(requests.length, afterAdjacent, 'A scroll round trip must not redownload the original page.')
   const candleRequests = requests.filter(request => /\/market\/(?:candles|history-candles)$/.test(request.url.pathname))
   assert.ok(candleRequests.length > 0)
   assert.ok(candleRequests.every(request => request.url.searchParams.get('bar') === TIMEFRAME))
@@ -66,8 +87,9 @@ try {
   assert.ok(sourceRequests.filter(request => request.url.pathname.endsWith('/taker-volume-contract')).every(request => request.url.searchParams.get('unit') === '1'))
   assert.equal(requests.some(request => request.status === 429), false)
   console.log(JSON.stringify({ integration: 'okx-prepared-1h', instrument: INSTRUMENT_ID, timeframe: TIMEFRAME,
-    visibleCandles: bars.length, visibleStart: new Date(bars[0].hour).toISOString(), visibleEnd: new Date(initial.endHour).toISOString(),
-    generation: initial.generation, oiState: initial.oiState, takerState: initial.takerState,
+    initialPriceFrame: { candles: initial.bars.length, forming: Boolean(initial.liveBar), oiState: initial.oiState, takerState: initial.takerState, indicatorState: initial.indicatorState },
+    visibleCandles: bars.length, visibleStart: new Date(bars[0].hour).toISOString(), visibleEnd: new Date(prepared.endHour).toISOString(),
+    generation: prepared.generation, oiState: prepared.oiState, takerState: prepared.takerState,
     requests: requests.map(request => ({ path: request.url.pathname, query: request.url.search, status: request.status, error: request.error, elapsedMS: request.elapsedMS })),
   }, null, 2))
 } catch (error) {
@@ -76,6 +98,7 @@ try {
 } finally {
   clearTimeout(timeout)
   await service.dispose()
+  await run?.catch(() => {})
   await store.close()
   await rm(root, { recursive: true, force: true })
 }

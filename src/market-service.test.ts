@@ -105,7 +105,8 @@ test('Taker zero placeholders become unavailable without erasing genuine zero-vo
       index === 1 ? '-1' : [0, 97, 98].includes(index) ? '0' : '20',
       index === 2 ? '' : [0, 97, 98].includes(index) ? '0' : '30',
     ])
-    await service.persistStatisticsSource(instrument, '1H', end, 2, values)
+    await assert.rejects(service.persistStatisticsSource(instrument, '1H', end, 2, values), /statistics quantities/i, 'Malformed source quantities cannot certify an empty observation.')
+    await service.persistStatisticsSource(instrument, '1H', end, 2, values.filter((_value, index) => index !== 1 && index !== 2))
     const rows = await store.candles({ instrument: instrument.instId, timeframe: '1H', from: timestamps[0], through: end })
     for (const index of [0, 1, 2]) {
       assert.equal(rows[index].buy, null)
@@ -152,7 +153,7 @@ const localCatalog = (service: MarketService, ids = [instId]) => service.replace
   instrument: { ...instrument, instId: id }, ticker: { ...ticker, instId: id }, result: { eligible: true, status: 'verified', turnover: 40_000_000 },
 })))
 
-test('all candidate contracts prepare every native chart timeframe independently of qualification and selection', async () => {
+test('all candidate contracts retain native collection while unselected contracts avoid chart preparation', async () => {
   const f = await fixture(), other = 'ETH-USDT-SWAP', frames = ['5m', '15m', '1H']
   try {
     f.service.instruments.set(other, { ...instrument, instId: other })
@@ -169,7 +170,9 @@ test('all candidate contracts prepare every native chart timeframe independently
     const row = { ...nativeCandle(timestamp, '1H', 123), instrument: other, confirmed: false }
     await f.service.realtime.options.onForming(row, { signal: new AbortController().signal, receivedAt: Date.now() })
     assert.equal(f.service.liveCandles.get(`${other}:1H`).close, 123)
-    assert.equal(f.service.preparedCharts.liveStates.get(`${other}:1H`).live.close, 123, 'An unselected contract reaches the exact chart working set through the native callback.')
+    assert.equal(f.service.preparedCharts.liveStates.get(`${other}:1H`).live.close, 123, 'An unselected contract retains only its lightweight current candle.')
+    assert.equal(f.service.preparedCharts.series.has(`${other}:1H`), false, 'Collector membership cannot initialize a full historical chart.')
+    assert.equal(f.service.preparedCharts.liveSeeds.has(`${other}:1H`), false)
     await f.service.setChartUniverse([instId], '15m', instId)
     assert.deepEqual([...f.service.preparedCharts.realtimeKeys].sort(), expected, 'Focusing a qualified chart cannot remove any candidate subscription.')
   } finally { await f.close() }
@@ -701,7 +704,10 @@ test('confirmed candle cache gives the first list row and lookback changes immed
     const correction = rawCandle(asOf - fiveMinutes, 110)
     await f.service.persistCandles(instId, [correction], { projectList: false })
     assert.equal(f.service.listRowsFor('15m')[0].rankingChange, 10, 'A confirmed close correction invalidates the memoized ranking immediately.')
-    assert.equal(reads, 1, 'Only the persistence merge reads the corrected slot; ranking uses its new cache value.')
+    const persistenceReads = reads
+    await f.service.updateRanking(instId)
+    await f.service.snapshot()
+    assert.equal(reads, persistenceReads, 'Ranking reuses the committed correction cache without admitting another database read.')
   } finally { await f.close() }
 })
 
@@ -972,82 +978,35 @@ test('candle, OI and Taker HTTP families proceed independently and Taker keeps c
   } finally { releaseOI?.(response([])); await f.close() }
 })
 
-test('paced HTTP lanes reserve foreground slots and admit queued Verify and chart requests ahead of downloads', async context => {
-  const starts: Array<{ id: string; at: number }> = []
-  const releases = new Map<string, (value: Response) => void>()
-  const signals = new Map<string, AbortSignal | null | undefined>()
+test('paced HTTP lanes reserve interactive capacity and preserve pacing when RTT changes their concurrency', async context => {
+  const starts: Array<{ id: string; at: number }> = [], releases = new Map<string, (value: Response) => void>()
   const requests: Promise<unknown>[] = []
-  let active = 0, maximumActive = 0
-  const f = await fixture(disabled(), async (input, init) => {
+  const f = await fixture(disabled(), async input => {
     const id = new URL(String(input)).searchParams.get('id')!
     starts.push({ id, at: Date.now() })
-    signals.set(id, init?.signal)
-    active += 1
-    maximumActive = Math.max(maximumActive, active)
-    return new Promise(resolve => releases.set(id, value => { active -= 1; resolve(value) }))
+    return new Promise(resolve => releases.set(id, resolve))
   })
   context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
-  const tick = async (milliseconds: number) => {
-    context.mock.timers.tick(milliseconds)
-    await new Promise(resolve => setImmediate(resolve))
-  }
-  const issue = (id: string, priority: string) => {
-    const request = f.service.get('/market/history-candles', { id }, undefined, priority)
-    requests.push(request)
-    void request.catch(() => undefined)
-  }
-  const complete = (id: string) => {
-    const release = releases.get(id)
-    assert.ok(release, `${id} has not started.`)
-    releases.delete(id)
-    release(response([]))
-  }
+  const tick = async (milliseconds: number) => { context.mock.timers.tick(milliseconds); await new Promise(resolve => setImmediate(resolve)) }
+  const issue = (id: string, priority: string) => { const pending = f.service.get('/market/history-candles', { id }, undefined, priority); requests.push(pending); void pending.catch(() => undefined) }
+  const complete = (id: string) => { const release = releases.get(id); assert.ok(release, `${id} has not started.`); releases.delete(id); release(response([])) }
   try {
-    issue('download-1', 'background')
+    for (const id of ['download-1', 'download-2', 'download-3', 'download-4']) issue(id, 'background')
+    await tick(0); await tick(100); await tick(100); await tick(100)
+    assert.deepEqual(starts.map(start => start.id), ['download-1', 'download-2', 'download-3'], 'Maintenance may use three of four slots while leaving one interactive slot.')
+    issue('verify', 'interactive'); issue('chart', 'prepared')
     await tick(0)
-    issue('download-2', 'background')
-    await tick(99)
-    assert.deepEqual(starts.map(start => start.id), ['download-1'], 'A second background request cannot occupy a reserved foreground slot.')
-    issue('statistics', 'statistics')
-    issue('verify-1', 'foreground')
-    issue('chart', 'prepared')
-    issue('verify-2', 'foreground')
-    issue('verify-3', 'foreground')
-    await tick(1)
-    assert.deepEqual(starts.map(start => start.id), ['download-1', 'verify-1'], 'Highest-priority work is chosen when the next pacing slot opens.')
-    assert.equal(signals.get('download-1')?.aborted, false, 'Foreground admission must not cancel the background fetch that is already in flight.')
-    await tick(99)
-    assert.equal(starts.length, 2, 'Concurrent capacity cannot bypass the minimum request-start interval.')
-    await tick(1)
-    assert.equal(starts[2].id, 'chart')
-    await tick(100)
-    assert.equal(starts[3].id, 'verify-2')
-    assert.equal(active, 4)
-    await tick(100)
-    assert.equal(starts.length, 4, 'A fifth in-flight request must wait for an active slot to finish.')
-    complete('chart')
-    await tick(0)
-    assert.equal(starts[4].id, 'verify-3')
-    assert.equal(active, 4)
-    complete('download-1')
-    complete('verify-1')
-    complete('verify-2')
-    await tick(100)
-    assert.equal(starts[5].id, 'statistics', 'A queued download must yield to the remaining foreground source request.')
-    await tick(100)
-    assert.equal(starts[6].id, 'download-2')
-    assert.equal(maximumActive, 4)
-    for (let index = 1; index < starts.length; index += 1) assert.ok(starts[index].at - starts[index - 1].at >= 100, 'Every request start must respect the candle endpoint pacing interval.')
-    complete('verify-3')
-    complete('statistics')
-    complete('download-2')
-    await tick(0)
-    await Promise.all(requests)
+    assert.equal(starts[3].id, 'verify', 'An interactive request uses the reserved slot without cancelling active downloads.')
+    complete('verify'); await tick(0)
+    complete('download-1'); complete('download-2'); await tick(100)
+    assert.equal(starts[4].id, 'chart', 'Queued interactive work retains priority after RTT reduces the lane concurrency.')
+    complete('chart'); complete('download-3'); await tick(100)
+    assert.equal(starts[5].id, 'download-4')
+    for (let index = 1; index < starts.length; index++) assert.ok(starts[index].at - starts[index - 1].at >= 100, 'Concurrent capacity cannot bypass endpoint request-start pacing.')
+    complete('download-4'); await tick(0); await Promise.all(requests)
   } finally {
     for (const release of releases.values()) release(response([]))
-    context.mock.timers.reset()
-    await f.close()
-    await Promise.allSettled(requests)
+    context.mock.timers.reset(); await f.close(); await Promise.allSettled(requests)
   }
 })
 
@@ -1299,58 +1258,23 @@ test('successful source checks leave no periodic discovery or renewal timers', a
   } finally { await f.close() }
 })
 
-test('a repair shares the statistics read-merge-write critical section and preserves the newest statistics', async () => {
+test('concurrent price repair and independent statistics commit preserve both source facts', async () => {
   const timestamp = Math.floor(Date.now() / fiveMinutes) * fiveMinutes - fiveMinutes
   const repaired = { ...rawCandle(timestamp, 200), volume: 20, baseVolume: 2, quoteVolume: 400 }
   const f = await fixture(disabled(), async input => {
-    const url = new URL(String(input))
-    assert.ok(url.pathname.endsWith('/market/history-candles'))
+    assert.ok(new URL(String(input)).pathname.endsWith('/market/history-candles'))
     return response([[String(timestamp), String(repaired.open), String(repaired.high), String(repaired.low), String(repaired.close), '20', '2', '400', '1']])
   })
-  let releaseRead!: () => void
-  let statistics: Promise<unknown> | undefined, repair: Promise<unknown> | undefined
   try {
     await f.store.appendCandles([{ ...rawCandle(timestamp), oi: 10, buy: 20, sell: 30, statisticsVersion: 1 }])
-    const originalRead = f.store.candles.bind(f.store), originalReplace = f.store.replaceCandles.bind(f.store), originalWrite = f.service.history.write.bind(f.service.history)
-    let firstRead = true, replaceAdmitted = false
-    let readReached!: () => void, repairWriteReached!: () => void, replacementFinished!: () => void
-    const readGate = new Promise<void>(resolve => { readReached = resolve })
-    const writeGate = new Promise<void>(resolve => { repairWriteReached = resolve })
-    const replaced = new Promise<void>(resolve => { replacementFinished = resolve })
-    f.store.candles = async (...args) => {
-      const rows = await originalRead(...args)
-      if (firstRead) {
-        firstRead = false
-        readReached()
-        await new Promise<void>(resolve => { releaseRead = resolve })
-      }
-      return rows
-    }
-    f.store.replaceCandles = async (...args) => {
-      replaceAdmitted = true
-      const result = await originalReplace(...args)
-      replacementFinished()
-      return result
-    }
-    f.service.history.write = async (...args: any[]) => { repairWriteReached(); return originalWrite(...args) }
-    statistics = f.service.persistStatisticsSource(instrument, '5m', timestamp, 1, [[timestamp, 777]], undefined, 'foreground', false, { range: { from: timestamp, through: timestamp, intervalMS: fiveMinutes } })
-    await readGate
-    repair = f.service.history.repair({ instrument: instId, timeframe: '5m', source: 'candles', from: timestamp, through: timestamp, reason: 'invalid-ohlc', repairable: true }, { signal: new AbortController().signal })
-    await writeGate
-    await new Promise(resolve => setImmediate(resolve))
-    // If the repair bypasses the lock, force it to finish before releasing the
-    // stale statistics read. A serialized repair instead waits behind that read.
-    if (replaceAdmitted) await replaced
-    releaseRead()
-    await Promise.all([statistics, repair])
-    const [final] = await originalRead({ instrument: instId, timeframe: '5m', from: timestamp, through: timestamp })
+    await Promise.all([
+      f.service.persistStatisticsSource(instrument, '5m', timestamp, 1, [[timestamp, 777]], undefined, 'foreground', false, { range: { from: timestamp, through: timestamp, intervalMS: fiveMinutes } }),
+      f.service.history.repair({ instrument: instId, timeframe: '5m', source: 'candles', from: timestamp, through: timestamp, reason: 'invalid-ohlc', repairable: true }, { signal: new AbortController().signal }),
+    ])
+    const [final] = await f.store.candles({ instrument: instId, timeframe: '5m', from: timestamp, through: timestamp })
     assert.deepEqual([final.open, final.high, final.low, final.close, final.volume, final.baseVolume, final.quoteVolume], [repaired.open, repaired.high, repaired.low, repaired.close, 20, 2, 400])
     assert.deepEqual([final.oi, final.buy, final.sell, final.statisticsVersion], [777, 20, 30, 1])
-  } finally {
-    releaseRead?.()
-    await Promise.allSettled([statistics, repair])
-    await f.close()
-  }
+  } finally { await f.close() }
 })
 
 test('statistics queued behind a replacement merge against repaired OHLC', async () => {
@@ -1393,22 +1317,16 @@ test('replacement retains bounded null leases and revalidates Taker zeros agains
   } finally { await f.close() }
 })
 
-test('replacement can repair proven unreadable data but propagates operational preservation-read errors', async () => {
+test('a failed SQLite replacement transaction propagates its error and preserves committed source facts', async () => {
   const f = await fixture(), timestamp = Math.floor(Date.now() / fiveMinutes) * fiveMinutes - fiveMinutes
-  const range = { instrument: instId, timeframe: '5m', from: timestamp, through: timestamp }
-  const originalRead = f.store.candles.bind(f.store), originalInspect = f.store.inspectCandles.bind(f.store)
+  const range = { instrument: instId, timeframe: '5m', from: timestamp, through: timestamp }, originalReplace = f.store.replaceCandles.bind(f.store)
   try {
-    for (const reason of ['corrupt-file', 'invalid-schema'] as const) {
-      f.store.candles = async () => { throw new Error('The partition cannot be read.') }
-      f.store.inspectCandles = async () => ({ issues: [{ ...range, source: 'candles', reason, repairable: true }], checkedRows: 0, files: 1, missingRanges: [] })
-      await f.service.replaceCandles(range, [rawCandle(timestamp, reason === 'corrupt-file' ? 200 : 201)])
-    }
-    f.store.candles = async () => { throw new Error('Read failed because storage is offline.') }
-    f.store.inspectCandles = async () => { throw new Error('Filesystem unavailable.') }
-    await assert.rejects(f.service.replaceCandles(range, [rawCandle(timestamp, 300)]), /Filesystem unavailable/)
-    const [row] = await originalRead(range)
-    assert.equal(row.close, 201)
-  } finally { f.store.candles = originalRead; f.store.inspectCandles = originalInspect; await f.close() }
+    await f.store.appendCandles([{ ...rawCandle(timestamp), oi: 10, buy: 20, sell: 30, statisticsVersion: 1 }])
+    f.store.replaceCandles = async () => { throw new Error('SQLite transaction could not commit.') }
+    await assert.rejects(f.service.replaceCandles(range, [rawCandle(timestamp, 300)]), /SQLite transaction could not commit/)
+    const [row] = await f.store.candles(range)
+    assert.deepEqual([row.close, row.oi, row.buy, row.sell], [100, 10, 20, 30])
+  } finally { f.store.replaceCandles = originalReplace; await f.close() }
 })
 
 test('an explicit REST confirmed revision invalidates the prepared generation and preserves its direct statistics', async () => {
@@ -1722,7 +1640,7 @@ test('a rejected contract restored with fresh instrument and liquidity observati
   } finally { await restored?.dispose(); await f.close() }
 })
 
-test('missing qualification history requests foreground acquisition after inspecting the local durable window', async () => {
+test('missing qualification history requests continuity acquisition after inspecting the local durable window', async () => {
   const configuration = disabled()
   configuration.liquidity.volume24h.enabled = true
   configuration.liquidity.volumeStability.enabled = true
@@ -1738,7 +1656,7 @@ test('missing qualification history requests foreground acquisition after inspec
       return { rows: await f.store.candles({ instrument: id, timeframe, from, through }) }
     }
     await f.service.refresh()
-    assert.deepEqual(requests.sort(), [['1H', 'foreground'], ['5m', 'foreground']], 'Qualification cannot queue missing windows behind broad historical backfills.')
+    assert.deepEqual(requests.sort(), [['1H', 'continuity'], ['5m', 'continuity']], 'Qualification cannot queue missing windows behind broad historical backfills.')
     assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
     assert.equal(f.service.catalog.get(instId).result.turnover, 57_600_000)
   } finally { await f.close() }

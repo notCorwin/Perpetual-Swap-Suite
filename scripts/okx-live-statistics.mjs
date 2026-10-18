@@ -106,8 +106,13 @@ try {
   const run = (async () => {
     await service.ready
     for (const target of targets) {
-      const result = await service.history.ensureStatistics(INSTRUMENT, target.timeframe, target.from, target.through, 'foreground', controller.signal)
-      const rows = result.rows.sort((a, b) => a.timestamp - b.timestamp)
+      // Native statistics are independent facts. Ask for prices separately;
+      // neither source's ingestion is allowed to depend on the other's rows.
+      await Promise.all([
+        service.history.ensurePrices(INSTRUMENT, target.timeframe, target.from, target.through, 'foreground', controller.signal),
+        service.history.ensureStatistics(INSTRUMENT, target.timeframe, target.from, target.through, 'foreground', controller.signal),
+      ])
+      const rows = (await store.candles(target)).sort((a, b) => a.timestamp - b.timestamp)
       results.push(validateRows(target, rows))
       const requestCount = requests.length
       await service.history.ensureStatistics(INSTRUMENT, target.timeframe, target.from, target.through, 'foreground', controller.signal)
@@ -119,7 +124,7 @@ try {
     store = await MarketStore.open(root)
     for (const [index, target] of targets.entries()) {
       const rows = (await store.candles(target)).sort((a, b) => a.timestamp - b.timestamp)
-      assert.deepEqual(validateRows(target, rows), results[index], `${target.timeframe}: closing and reopening DuckDB must preserve source observations.`)
+      assert.deepEqual(validateRows(target, rows), results[index], `${target.timeframe}: closing and reopening SQLite must preserve source observations.`)
     }
     assert.equal(requests.some(request => request.status === 429), false, 'The regression must respect source request pacing.')
   })()
@@ -157,7 +162,7 @@ try {
   clearTimeout(timer)
   controller.abort()
   // Source tasks may still be unwinding after a timeout. Drain accepted writes
-  // and all callers before deleting the temporary Parquet/SQLite directory.
+  // and all callers before deleting the temporary SQLite directory.
   await service?.dispose()
   await Promise.allSettled(operations)
   await store?.close()

@@ -5,10 +5,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseDesktopRequest } from './desktop-contract.js'
 import { createDesktopSecurity } from './desktop-security.js'
-import { seedCachedListProjection, seedChartScrollBenchmark, seedHistoricalStatisticsBoundary, seedInstrumentNavigationBenchmark } from './e2e-fixtures.js'
-import { MetadataStore } from './services/metadata-store.js'
-import { MarketStore } from './services/market-store.js'
-import { MarketService } from './services/market-service.js'
+import { MarketBackend } from './services/market-backend.js'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const rendererURL = process.env.ELECTRON_RENDERER_URL || undefined
@@ -24,25 +21,12 @@ if (process.env.PERPETUAL_SWAP_USER_DATA) {
 const security = createDesktopSecurity({ rendererURL, rendererFile: join(root, 'dist', 'index.html') })
 const e2eLiveRefresh = testMode && process.env.PERPETUAL_SWAP_E2E_LIVE_REFRESH === '1'
 let window
-let metadata
-let marketPreferences
-let marketStore
-let marketService
+let backend
 const gatewayRequests = new Map()
 let shuttingDown = false
 let shutdownComplete = false
 let startupTask = Promise.resolve()
 
-const offlineE2EFetch = async () => ({ status: 200, ok: true, headers: { get: () => null }, json: async () => ({ code: '0', data: [] }) })
-const delayedOfflineE2EFetch = async (_input, { signal } = {}) => {
-  await new Promise((resolve, reject) => {
-    if (signal?.aborted) { reject(new DOMException('The request was aborted.', 'AbortError')); return }
-    const abort = () => { clearTimeout(timer); reject(new DOMException('The request was aborted.', 'AbortError')) }
-    const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve() }, 10_000)
-    signal?.addEventListener('abort', abort, { once: true })
-  })
-  return offlineE2EFetch()
-}
 
 function sendGateway(event, detail) {
   if (!shuttingDown && !event.sender.isDestroyed()) event.sender.send('radar:gateway-stream', detail)
@@ -50,8 +34,6 @@ function sendGateway(event, detail) {
 
 async function gatewayFetch(event, { id, body }) {
   if (gatewayRequests.has(id)) throw new Error('A Gateway request with this ID is already running.')
-  const apiKey = metadata.getAnalysisSettings().apiKey
-  if (!apiKey) throw new Error('Save an AI Gateway API key in Configure analysis before starting analysis.')
   const controller = new AbortController()
   let finish
   const finished = new Promise(resolve => { finish = resolve })
@@ -68,6 +50,9 @@ async function gatewayFetch(event, { id, body }) {
     finish()
   }
   try {
+    const apiKey = await backend.credentials()
+    controller.signal.throwIfAborted()
+    if (!apiKey) throw new Error('Save an AI Gateway API key in Configure analysis before starting analysis.')
     const response = await fetch('https://ai-gateway.vercel.sh/v1/chat/completions', {
       method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }, body, signal: controller.signal,
     })
@@ -94,26 +79,6 @@ async function handleRequest(event, payload) {
   security.assertTrustedSender(event, window)
   const request = parseDesktopRequest(payload, { allowE2E: testMode })
   if (shuttingDown) throw new Error('The application is closing.')
-  if (request.preferences) {
-    if (request.preferences.action === 'update') {
-      const previous = marketPreferences
-      marketPreferences = metadata.updateSettings(request.preferences.values).preferences
-      await marketService.reconfigure(previous)
-    }
-    return marketPreferences
-  }
-  if (request.snapshot) return marketService.snapshot(request.snapshot.timeframe, request.snapshot)
-  if (request.dataAudit) return marketService.dataAuditRequest(request.dataAudit)
-  if (request.chartWindow) {
-    const { instId, timeframe, endHour, historyBars } = request.chartWindow
-    return marketService.prepareChartWindow(instId, timeframe, endHour, historyBars)
-  }
-  if (request.chartLocal) return marketService.localChartWindow(request.chartLocal.instId, request.chartLocal.timeframe)
-  if (request.chartHistory) return marketService.localChartHistory(request.chartHistory.instId, request.chartHistory.timeframe, request.chartHistory.endHour)
-  if (request.chartUniverse) {
-    const { instIds, timeframe, focusInstId } = request.chartUniverse
-    return marketService.setChartUniverse(instIds, timeframe, focusInstId)
-  }
   if (request.gatewayFetch) return gatewayFetch(event, request.gatewayFetch)
   if (request.cancelGatewayFetch) { gatewayRequests.get(request.cancelGatewayFetch)?.controller.abort(); return { ok: true } }
   if ('copyText' in request) { clipboard.writeText(request.copyText); return { ok: true } }
@@ -124,30 +89,12 @@ async function handleRequest(event, payload) {
     clipboard.writeImage(image)
     return { ok: true }
   }
-  if (request.analysisSettings) {
-    const action = request.analysisSettings
-    if (action.action === 'save') metadata.updateAnalysisSettings({ model: action.model, apiKey: action.apiKey })
-    if (action.action === 'removeKey') metadata.updateAnalysisSettings({ apiKey: '' })
-    const current = metadata.getAnalysisSettings()
-    return { model: current.model ?? '', hasAPIKey: Boolean(current.apiKey) }
+  const response = await backend.request(request)
+  if (request.e2e?.action === 'smokeStatus') {
+    const build = await readFile(join(process.resourcesPath, 'build-revision.json'), 'utf8').then(JSON.parse).catch(() => null)
+    return { ...response, revision: build?.revision ?? null }
   }
-  if (request.e2e) {
-    const value = request.e2e
-    switch (value.action) {
-      case 'smokeStatus': {
-        const build = await readFile(join(process.resourcesPath, 'build-revision.json'), 'utf8').then(JSON.parse).catch(() => null)
-        return { revision: build?.revision ?? null, userData: app.getPath('userData'), preparedWorkerThreadId: marketService.preparedCharts.worker?.threadId ?? null }
-      }
-      case 'seedCandles': return { written: await marketStore.appendCandles(value.candles) }
-      case 'readCandles': return marketStore.candles(value)
-      case 'seedCachedListProjection': return seedCachedListProjection(marketStore, marketService)
-      case 'seedChartScrollBenchmark': return seedChartScrollBenchmark(marketStore, marketService)
-      case 'seedHistoricalStatisticsBoundary': return seedHistoricalStatisticsBoundary(marketStore, marketService)
-      case 'seedInstrumentNavigationBenchmark': return seedInstrumentNavigationBenchmark(marketStore, marketService)
-      case 'settings': return metadata.getSettings().preferences
-    }
-  }
-  throw new Error('Unsupported desktop request.')
+  return response
 }
 
 async function createWindow() {
@@ -169,39 +116,17 @@ async function createWindow() {
 }
 
 async function startDesktop() {
-  const userData = app.getPath('userData')
-  metadata = await MetadataStore.open(userData, { legacySettingsPath: join(userData, 'settings.json') })
-  marketPreferences = metadata.getSettings().preferences
-  if (shuttingDown) return
-  marketStore = await MarketStore.open(join(userData, 'MarketData'))
-  if (shuttingDown) return
-  marketService = new MarketService(marketStore, () => marketPreferences,
-    testMode ? e2eLiveRefresh ? delayedOfflineE2EFetch : offlineE2EFetch : fetch, !testMode, { metadata })
-  await marketService.ready
-  if (shuttingDown) return
-  const preparedFrames = new Map()
-  let preparedUniverse = marketService.preparedCharts.universe
-  const confirmedFields = ['generation', 'endHour', 'latestEnd', 'oldestHour', 'historyExhausted', 'oiState', 'takerState', 'indicatorState', 'error', 'unavailable']
-  marketService.subscribePreparedCharts(frame => {
-    const key = `${frame.instId}:${frame.timeframe}`, previous = preparedFrames.get(key)
-    const liveOnly = Number.isSafeInteger(frame.endHour) && previous && previous.bars === frame.bars && confirmedFields.every(field => previous[field] === frame[field])
-    preparedFrames.set(key, frame)
-    if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('radar:chart-prepared', liveOnly
-      ? { type: 'live', instId: frame.instId, timeframe: frame.timeframe, generation: frame.generation, revision: frame.revision, endHour: frame.endHour, liveBar: frame.liveBar ?? null }
-      : frame)
-  })
-  marketService.subscribeMarket(() => {
-    if (preparedUniverse !== marketService.preparedCharts.universe) {
-      preparedUniverse = marketService.preparedCharts.universe
-      for (const key of preparedFrames.keys()) if (!preparedUniverse.has(key)) preparedFrames.delete(key)
-    }
-    if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('radar:market-changed')
-  })
-  marketService.subscribeAudit(report => {
-    if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('radar:audit-changed', report)
-  })
+  backend = new MarketBackend({ userData: app.getPath('userData'), testMode, e2eLiveRefresh })
+  if (testMode) globalThis.__marketBackend = backend
+  const send = (channel, value) => {
+    if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(channel, value)
+  }
+  backend.on('chart', frame => send('radar:chart-prepared', frame))
+  backend.on('market', () => send('radar:market-changed'))
+  backend.on('audit', report => send('radar:audit-changed', report))
+  backend.on('failure', error => { console.error('Market backend failed:', error); send('radar:market-changed') })
   ipcMain.handle('radar:request', handleRequest)
-  if (e2eLiveRefresh) void marketService.refresh().catch(error => console.error('Market refresh failed:', error))
+  // Windows and input become available while data restores in its own worker.
   await createWindow()
 }
 
@@ -223,11 +148,7 @@ app.on('before-quit', event => {
       for (const { controller } of gatewayRequests.values()) controller.abort()
       await Promise.allSettled([...gatewayRequests.values()].map(value => value.finished))
       await startupTask.catch(error => console.error('Desktop startup did not complete:', error))
-      try { await marketService?.dispose() }
-      finally {
-        try { await marketStore?.close() }
-        finally { metadata?.close() }
-      }
+      await backend?.dispose()
     } catch (error) { console.error('Desktop shutdown failed:', error) }
     finally { shutdownComplete = true; app.quit() }
   })()

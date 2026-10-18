@@ -21,26 +21,19 @@ const response = (values: PreparedChartBar[], overrides: Partial<PreparedChartRe
   oiState: 'ready', takerState: 'ready', indicatorState: 'ready', error: '', ...overrides,
 })
 
-test('only an exact contiguous prepared 96-candle window is renderable', () => {
+test('partial price windows render independently of unknown indicators and statistics', () => {
   const store = new PreparedChartStore()
-  store.ingest(response(bars(0, 95), { latestEnd: 95 * hour }))
-  assert.equal(store.window(instId, '1H'), null)
-  for (const invalid of [
-    { ...bar(95), confirmed: false },
-    { ...bar(95), statisticsSources: 1 },
-    { ...bar(95), indicatorsObserved: false },
-    { ...bar(95), statisticsObserved: false },
-    { ...bar(95), statisticsObserved: undefined },
-    { ...bar(95), high: 90 },
-  ]) {
-    store.ingest(response([invalid as PreparedChartBar], { revision: 2, latestEnd: 95 * hour }))
-    assert.equal(store.window(instId, '1H'), null, 'Aggregate ready statuses cannot authorize an unprepared sample.')
-  }
-  store.ingest(response([bar(95)], { revision: 3 }))
+  store.ingest(response(bars(0, 12).map(value => ({ ...value, statisticsSources: 0, statisticsObserved: false, indicatorsObserved: false,
+    oi: null, buy: null, sell: null, ema: null }))))
   const ready = store.window(instId, '1H')!
-  assert.equal(ready.bars.length, 96)
-  assert.deepEqual(ready.bars.map(value => value.hour), Array.from({ length: 96 }, (_, index) => index * hour))
-  assert.equal(store.window(instId, '1H', 96 * hour), null, 'The cache never substitutes a nearby window.')
+  assert.equal(ready.bars.length, 12)
+  assert.equal(ready.priceState, 'partial'); assert.equal(ready.oiState, 'loading'); assert.equal(ready.takerState, 'loading')
+  assert.equal(ready.indicatorState, 'loading'); assert.equal(ready.realtimeState, 'stale')
+  store.ingest(response([{ ...bar(12), confirmed: false } as PreparedChartBar], { latestEnd: 12 * hour, revision: 2 }))
+  assert.equal(store.window(instId, '1H'), null, 'An unconfirmed row cannot masquerade as a persisted completed candle.')
+  store.ingest(response([bar(12)], { revision: 3 }))
+  assert.equal(store.window(instId, '1H')?.bars.length, 13)
+  assert.equal(store.window(instId, '1H', 13 * hour), null, 'An absent requested end remains a real price gap.')
 })
 
 test('availability belongs to each window and explicitly observed nulls are complete data', () => {
@@ -206,13 +199,13 @@ test('ready boundaries represent complete ranges and prefetch fills gaps without
   store.ingest(response([...bars(0, 100), ...bars(200, 100)]))
   const first = store.window(instId, '1H', 99 * hour)
   assert.deepEqual(store.readyBoundaries(instId, '1H'), [
-    { firstEnd: 95 * hour, lastEnd: 99 * hour }, { firstEnd: 295 * hour, lastEnd: 299 * hour },
+    { firstEnd: 0, lastEnd: 99 * hour }, { firstEnd: 200 * hour, lastEnd: 299 * hour },
   ])
   assert.equal(store.hasRange(instId, '1H', 0, 99 * hour), true)
   assert.equal(store.hasRange(instId, '1H', 0, 200 * hour), false)
   assert.equal(store.window(instId, '1H', 180 * hour), null)
   store.ingest(response(bars(100, 100), { revision: 2 }))
-  assert.deepEqual(store.readyBoundaries(instId, '1H'), [{ firstEnd: 95 * hour, lastEnd: 299 * hour }])
+  assert.deepEqual(store.readyBoundaries(instId, '1H'), [{ firstEnd: 0, lastEnd: 299 * hour }])
   assert.equal(store.window(instId, '1H', 99 * hour), first)
   assert.ok(store.window(instId, '1H', 180 * hour))
 })
@@ -246,7 +239,7 @@ test('a new source-unavailability annotation replaces only the affected immutabl
   assert.equal(store.window(instId, '1H'), latest)
 })
 
-test('bar pressure preserves the requested exact window and an evicted revisit never returns partial data', () => {
+test('bar pressure preserves the requested viewport and evicted ends require a fresh local read', () => {
   const store = new PreparedChartStore({ maxBarsPerSeries: 128 })
   store.ingest(response(bars(0, 201), { endHour: 100 * hour, oldestHour: 0 }))
   const held = store.window(instId, '1H', 100 * hour)!
@@ -404,4 +397,32 @@ test('complete cache eviction retains the session generation watermark against l
   assert.equal(store.ingest(corrected), true, 'An evicted key may be rehydrated at its current or a newer generation.')
   assert.ok(store.window(instId, '1H')?.bars.every(value => value.ema === 200))
   assert.ok(held.bars.every(value => value.ema === 100))
+})
+
+
+test('latest candidate frames obey a byte budget independently of candidate membership', () => {
+  const store = new PreparedChartStore({ maxBytes: 300_000 })
+  const ids = Array.from({ length: 80 }, (_, index) => `BYTE${index}-USDT-SWAP`)
+  store.setUniverse(ids, '1H', ids[0])
+  for (const id of ids) store.ingestLatest(response(bars(104, 96), { instId: id }))
+  assert.ok(store.latestSize <= 5, 'Pinned candidate membership cannot make history retention grow without a byte limit.')
+  assert.ok(store.window(ids[0], '1H'), 'The selected frame survives background candidate pressure.')
+  assert.equal(store.window(ids[1], '1H'), null, 'Evicted price windows are restored through a bounded local query.')
+})
+
+test('live freshness metadata reaches retained history and an old bulk read cannot rewind it', () => {
+  const store = new PreparedChartStore()
+  store.setUniverse([instId], '1H', instId)
+  store.ingest(response(bars(0, 200), { revision: 5, sourceVersions: { price: 5, oi: 2, taker: 3 }, priceObservedAt: 1000, realtimeState: 'stale' }))
+  store.ingestLive({ type: 'live', instId, timeframe: '1H', generation: 1, revision: 10, endHour: 199 * hour,
+    liveBar: { ...bar(200), confirmed: false }, priceObservedAt: 2000, priceAsOf: 200 * hour,
+    realtimeState: 'live', sourceVersions: { price: 5, oi: 4, taker: 6 } })
+  assert.equal(store.snapshotMeta(instId, '1H')?.priceObservedAt, 2000)
+  assert.equal(store.snapshotMeta(instId, '1H')?.realtimeState, 'live')
+  assert.deepEqual(store.snapshotMeta(instId, '1H')?.sourceVersions, { price: 5, oi: 4, taker: 6 })
+  store.ingest(response(bars(0, 100), { revision: 6, latestEnd: 199 * hour, priceObservedAt: 1100, realtimeState: 'stale', sourceVersions: { price: 4, oi: 1, taker: 2 } }))
+  assert.equal(store.snapshotMeta(instId, '1H')?.priceObservedAt, 2000)
+  assert.equal(store.snapshotMeta(instId, '1H')?.realtimeState, 'live')
+  assert.deepEqual(store.snapshotMeta(instId, '1H')?.sourceVersions, { price: 5, oi: 4, taker: 6 })
+  assert.equal(store.window(instId, '1H')?.liveBar?.hour, 200 * hour)
 })

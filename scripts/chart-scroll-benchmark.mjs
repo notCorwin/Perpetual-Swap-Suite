@@ -35,7 +35,7 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
       await selectTimeframe(page, timeframe)
       await waitForRendered(page, fixture, timeframe)
       const residentHistoryBars = await waitForLocalHistory(electron, page, fixture, timeframe)
-      await electron.evaluate(() => { globalThis.__chartRequestProbe.holdSource = true; globalThis.__chartRequestProbe.holdLatest = true })
+      await electron.evaluate(async () => { globalThis.__chartRequestProbe.holdLatest = true; await globalThis.__marketBackend.probe({ action: 'sourceHold', hold: true }) })
       const beforeScrolling = await readRequestProbe(electron)
       await startPaintProbe(page, fixture)
       const intervalMS = fixture.series[timeframe].intervalMS

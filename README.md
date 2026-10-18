@@ -19,7 +19,7 @@ npm run app:deliver
 open "/Applications/Perpetual Swap Suite.app"
 ```
 
-`app:deliver` builds the app for the current macOS architecture, validates and smoke-tests the candidate, replaces `/Applications/Perpetual Swap Suite.app`, and smoke-tests the installed executable. It asks the old app to quit before replacement and restores it if installation or installed-app validation fails. Smoke checks use temporary user data and exercise the actual executable, build revision, window, preload isolation, DuckDB/Parquet I/O, indicator worker, normal exit, and persistence after restart.
+`app:deliver` builds the app for the current macOS architecture, validates and smoke-tests the candidate, replaces `/Applications/Perpetual Swap Suite.app`, and smoke-tests the installed executable. It asks the old app to quit before replacement and restores it if installation or installed-app validation fails. Smoke checks use temporary user data and exercise the actual executable, build revision, window, preload isolation, SQLite worker I/O, indicator workers, normal exit, and persistence after restart.
 
 For development, run `npm run dev` to start Vite and Electron together. Opening the renderer in an ordinary browser does not provide the desktop data service.
 
@@ -31,7 +31,7 @@ The list shows only contracts that meet every enabled liquidity condition and th
 
 Changing liquidity thresholds immediately reevaluates fresh observations in memory. Source updates and missing history continue in the background; contracts with missing or expired required observations stay unqualified. Completed volume windows are reused until their next candle boundary or a durable source correction.
 
-Chart scrolling and contract verification have the highest scheduling priority. Background downloads use idle capacity and yield at page and storage-job boundaries. The Updating count tracks outstanding acquisitions, separately from contracts whose observations cannot prove qualification.
+Current chart demand, live continuity, prefetch, and historical archiving have separate scheduling priorities. Endpoint and storage queues reserve opportunities for interactive work while giving background work a bounded share. Independent endpoint budgets and adaptive concurrency overlap network latency without removing rate limits. The Updating count tracks outstanding acquisitions, separately from contracts whose observations cannot prove qualification.
 
 The default ranking lookback is **15 minutes**, calculated from completed native **5m** candle closes. Change it in **Settings → Ranking lookback (minutes)** using multiples of five minutes. Ranking lookback and chart timeframe are separate persisted settings: choosing a 1h chart does not change a 15-minute ranking window.
 
@@ -70,11 +70,13 @@ Select a contract and choose **5m**, **15m**, or **1h**. The default chart timef
 | Copy chart | Copy the chart with an opaque theme background |
 | Analyze Long / Analyze Short | Analyze a captured chart snapshot |
 
-Each chart presents a complete 96-candle window. The renderer retains compact latest windows for every listed contract in all three native timeframes, independently of its deep-history cache. Cached contract and timeframe changes display on the next paint without chart IPC or provider work. Forming-candle notifications carry only the live overlay and reuse the completed candles. Historical navigation loads up to 16,384 contiguous prepared local candles on demand; scrolling within that cache is synchronous. Missing history stays in background preparation, with the last complete chart visible and a **Preparing** label. Data collection, storage, and indicator preparation run outside renderer interactions.
+A normal viewport shows 96 candles, but any available prices can render immediately, including a new listing with fewer observations. OHLC, forming prices, OI, Taker, and recursive indicators have independent readiness. Missing or expired statistics leave gaps in their own panels; they do not hide prices, block history, or force the chart back to an older complete window. Stored data is labeled stale until current source observations and stream continuity establish freshness.
 
-Every eligible contract's native 5m, 15m, and 1h series stays subscribed and prepares compact latest charts independently of selection and liquidity filters. Bounded snapshot restoration publishes saved 96-candle frames before full-history work, while exact persisted recursive indicator checkpoints resume live calculations without replaying history. The renderer receives the listed contracts' prepared frames and live updates directly. A complete idle chart does not poll the desktop bridge or refresh its market tail every minute. First loads and real gaps still use REST; a native close deadline checks for a missing confirmation even when its subscription stays quiet. Source failures, unavailable-statistics leases, and listing availability retain their own retry deadlines.
+Contract and timeframe changes reuse bounded renderer caches. Uncached selections read an indexed local tail; historical navigation reads bounded local ranges before acquiring missing source pages. The renderer retains a separate bounded history cache, so movement inside a saved range is synchronous. **Preparing** identifies a price range that is still being acquired. Indicator computation and auxiliary-source requests continue independently after prices appear.
 
-Approaching a cache boundary starts bulk prefetch during scrolling. The reserve grows with scroll speed and measured preparation time, with a conservative initial network budget; each request prepares up to 4,096 candles. Price warmup and OI/Taker acquisition overlap, and saved observations are reused. A jump beyond an in-flight prefetch starts an independent bounded foreground request, while additional input coalesces into the latest cursor. Prefetch hides latency while its reserve is sufficient; a jump into data that has not arrived still shows **Preparing**.
+Every eligible contract keeps its native 5m, 15m, and 1h subscriptions, but subscription membership does not eagerly build or restore charts for the whole exchange. Chart projections are prepared for requested series, and warm forming updates project from their existing confirmed indicator state. Independent source versions prevent a delayed statistics update from overwriting newer prices.
+
+Approaching a cache boundary starts directional prefetch. Requests and results remain bounded, and repeated input coalesces around the newest cursor. Local history remains usable across OI/Taker holes. A jump beyond downloaded prices still requires acquisition; neither caching nor this scheduler can remove actual network latency.
 
 Indicators use one canonical contiguous native candle series, independently of the visible window. EMA seeds from 200 closes; BOLL uses arithmetic prices and population deviation; VWAP weights typical prices by base-currency volume; RSI uses Wilder smoothing and returns 50 for a flat run. Missing periods restart initialization, and missing values display as `—`. Older source additions and corrections invalidate derived calculations. See the [indicator contract](docs/INDICATORS.md) for formulas, units, initialization, and boundary conditions.
 
@@ -82,13 +84,15 @@ Applicable relative changes use `(current − previous) / abs(previous) × 100%`
 
 ## History and live updates
 
-**Settings → History to retain (days)** controls the requested history coverage, defaulting to **30 days**, with a supported range of **1–3,650 whole days**. Synchronization also requests 200 earlier candles for indicator warmup. Available history depends on listing dates and source availability.
+**Settings → History to retain (days)** controls the requested history coverage, defaulting to **30 days**, with a supported range of **1–3,650 whole days**. Synchronization also requests 200 earlier **price** candles for initial indicator coverage; statistics do not need indicator warmup. Exact recursive calculations reuse durable checkpoints or replay the available canonical prefix, rather than treating those 200 candles as a substitute for earlier input. Available history depends on listing dates and source availability.
 
 Every eligible contract subscribes to native 5m, 15m, and 1h candles and public ticker, 400-level order-book, open-interest, and trade channels. Public connections carry at most 25 contracts each, with paced connection starts. Books are reconstructed from snapshots and sequence-checked incremental updates; a gap rebuilds the affected connection without stopping the others.
 
-Completed candles are written to Parquet and read through DuckDB for charts and indicators. Forming candles and their live contract OI/taker observations stay in memory. Taker totals require continuous trade coverage from the native period's start; startup and reconnect gaps remain unavailable until a complete period can be observed. Historical OI/taker values continue to use their direct native sources. Reconnection repairs historical gaps alongside immediate live delivery. History targets cover every eligible contract, complete saved ranges are reused, and background jobs checkpoint their progress in SQLite.
+Completed native candles, independent OI/Taker observations, source coverage evidence, and recursive indicator checkpoints are stored in SQLite WAL. One dedicated writer worker commits facts and their versions atomically; two reader workers serve indexed range queries. A dedicated market coordinator worker owns MarketService, network scheduling, and metadata. The Electron main process handles windows, security, and IPC; separate database and indicator workers execute market SQL and calculations. Forming candles and their live OI/Taker observations remain in memory.
 
-Price, OI and Taker history start on independent paced source lanes. Statistics wait only for their matching price page to be durable. Each statistics page explicitly specifies `begin` and `end`; availability is evaluated from the source response, without a shared local retention cutoff. Missing values and Taker zero placeholders inconsistent with actual traded volume remain unavailable with a bounded retry lease. See [historical source behavior](docs/STATISTICS_SOURCES.md) for the dated API observations and pagination rules.
+Taker totals require continuous trade coverage from the native period's start; startup and reconnect gaps remain unavailable until a complete period can be observed. Reconnection repairs bounded gaps alongside immediate live delivery. A coordinator timer advances current desired ranges at native boundaries, including a global 5-minute boundary, and wakes acquisition when unavailable source leases expire. Historical scheduling persists desired coverage ranges, not old viewport requests, HTTP cursors, or a growing queue of past single-candle repairs. Overlapping consumers share source acquisition, and restarts plan from committed facts.
+
+Price, OI, and Taker pages run independently with per-endpoint pacing, concurrency limits, and backoff. A statistics response is committed even if its price candle has not arrived. Each statistics page specifies `begin` and `end`; availability comes from its source response. Missing values and Taker zero placeholders inconsistent with traded volume remain unavailable with a bounded retry lease. Only a new source response can renew that lease. See [historical source behavior](docs/STATISTICS_SOURCES.md) for the dated API observations and pagination rules.
 
 ### Check and repair data
 
@@ -114,13 +118,16 @@ Paths are relative to `~/Library/Application Support/perp-radar/`:
 
 | Path | Contents |
 | --- | --- |
-| `MarketData/candles/` | Completed candles in Parquet, partitioned by native timeframe, instrument, and UTC date |
-| `MarketData/prepared-charts/` | Derived chart snapshots with formula versions and source watermarks |
-| `metadata.sqlite` | Transactional preferences, eligibility catalog, synchronization checkpoints, audit reports, and private analysis settings |
+| `MarketData/market.sqlite` | Authoritative completed native candles, independent OI/Taker observations, per-series versions, indicator checkpoints, and migration/audit evidence |
+| `MarketData/market.sqlite-wal`, `market.sqlite-shm` | SQLite WAL coordination files while connections are open |
+| `MarketData/candles/` | Previous Parquet data retained as a read-only migration/recovery source; new observations are not written here |
+| `metadata.sqlite` | Transactional preferences, qualification catalog, desired synchronization ranges, audit reports, and private analysis settings |
 
-DuckDB uses an in-memory query connection over Parquet. Writes validate completed candles and atomically publish immutable delta files. Reaching eight active files compacts the UTC-day partition into one base; its generation excludes superseded files even after an interrupted cleanup. Repairs publish a new base, including when removing all rows. Derived snapshots identify their exact active source files.
+Existing Parquet is imported once in a separate worker, with durable per-partition progress. First access prioritizes the required series/range, and bounded latest queries import recent partitions first. The importer honors the newest base and later deltas, resolves source revisions, validates observations, and never overwrites newer SQLite facts with old imported data. Original files remain unchanged. Corrupt or incompatible partitions become explicit repairable audit findings. After the import cutover, retained Parquet is no longer consulted; there is no permanent dual authority.
 
-History and warmup targets have stable identities per instrument, period and source. Advancing a target updates its desired range; verified coverage is reused, and only changed or expired unavailable-statistics ranges are rechecked. Numeric statistics do not expire. Source checkpoints commit in batches. Live indicators project one forming candle from a bounded confirmed seed, without recomputing history or writing the forming candle. The full-history navigation cache is independent of these subscription seeds.
+Market writes update keyed rows rather than republishing a day's files. Price corrections invalidate affected later indicator checkpoints atomically; statistics updates have their own revisions and do not invalidate price calculations. Checkpoints retain exact recursive state, formula version, and a source revision. Derived renderer and chart projections are bounded memory caches; they can be rebuilt from SQLite. A cached projection alone does not establish that a price is live.
+
+History days describes requested coverage, not automatic deletion of already downloaded facts. Listing dates, actual provider availability, available disk space, and initial synchronization time still limit obtainable history. Large archives use bounded reads and calculations; the supported day setting is not a measured capacity guarantee.
 
 On the first migration, recognized values from an existing `settings.json` are imported once into SQLite. Retired glass and blur preferences are not part of the new settings schema.
 
@@ -145,9 +152,10 @@ Install the locked dependencies with `npm ci`. The shadcn CLI is a development d
 | `npm run test:okx:1h` | Run live public OKX candle/OI/taker integration with temporary storage |
 | `npm run test:okx:streams` | Verify every eligible contract's public streams and three native candle subscriptions against OKX |
 | `node scripts/okx-live-statistics.mjs --report .build/okx-statistics.json` | Check bounded older OI/Taker requests, zero placeholders, reuse and persistence against actual public responses |
-| `npm run benchmark` | Measure Parquet writes and DuckDB queries |
+| `npm run benchmark` | Measure SQLite worker writes, range queries, coverage, and gap detection |
 | `npm run benchmark:chart` | Exercise chart scrolling, reversals, jumps, and delayed reads |
-| `npm run benchmark:instruments` | Exercise contract prewarming, switching, and revisits |
+| `npm run benchmark:instruments` | Exercise local chart admission, switching, and revisits |
+| `npm run benchmark:market` | Build and measure 287 contracts × 3 native periods with real SQLite/renderer work, synthetic intake, blocked statistics, and concurrent archive I/O; save `.build/resource-benchmark.json` |
 | `PERPETUAL_SWAP_BENCHMARK_BACKGROUND=1 npm run benchmark:instruments` | Measure navigation while real synchronization and audit process an offline synthetic source |
 | `node scripts/workspace-visual-check.mjs` | Check light/dark, grayscale, scaling, and measured contrast after building |
 | `node scripts/benchmark-startup.mjs --app "/path/to/Perpetual Swap Suite.app"` | Measure three isolated process launches and process working sets |

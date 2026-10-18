@@ -3,7 +3,6 @@ import { DataAudit } from './data-audit.js'
 import { CANDLE_INTERVALS, validateCandle } from './market-store.js'
 import { statisticsMask, STATISTICS_OI as OI, STATISTICS_TAKER as TAKER, validTakerVolumes } from './statistics-state.js'
 
-const DAY = 86_400_000
 const keyOf = (instrument, timeframe) => `${instrument}:${timeframe}`
 const rangeKey = value => `${keyOf(value.instrument, value.timeframe)}:${value.from}:${value.through}`
 const numeric = value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value)) ? Number(value) : null
@@ -25,6 +24,20 @@ const missing = (rows, from, through, interval, present) => {
   if (first !== null) result.push({ from: first, through })
   return result
 }
+const mergedRanges = (ranges, interval) => {
+  const result = []
+  for (const value of [...ranges].sort((a, b) => a.from - b.from)) {
+    const previous = result.at(-1)
+    if (previous && value.from <= previous.through + interval) previous.through = Math.max(previous.through, value.through)
+    else result.push({ ...value })
+  }
+  return result
+}
+const subtractRange = (ranges, observed, interval) => ranges.flatMap(value => {
+  if (observed.from > value.through || observed.through < value.from) return [value]
+  return [...(value.from < observed.from ? [{ from: value.from, through: observed.from - interval }] : []),
+    ...(value.through > observed.through ? [{ from: observed.through + interval, through: value.through }] : [])]
+})
 const abortable = (promise, signal) => {
   if (!signal) return promise
   signal.throwIfAborted()
@@ -114,16 +127,14 @@ export class MarketHistory {
   }
 
   async missingSource(query, priority) {
-    const repair = query.source === 'candles' && this.repairs.get(rangeKey(query))
-    if (repair && !repair.written) return [{ from: query.from, through: query.through }]
-    const rows = await this.store.candles(query, priority)
+    const rows = query.source === 'candles' ? await this.store.candles(query, priority) : await this.store.statistics(query, priority)
     const bit = query.source === 'oi' ? OI : TAKER
     const observations = this.seeds.get(keyOf(query.instrument, query.timeframe)), observedAt = this.now()
     const leases = []
     if (query.source !== 'candles') for (const row of rows) {
       const numericObservation = bit === OI ? nonnegative(row.oi) : validTakerVolumes(row)
       const expiresAt = Number(row[expiryField(bit)])
-      if (!pricePresent(row) || !(statisticsMask(row) & bit) || numericObservation || expiresAt <= observedAt || !Number.isSafeInteger(expiresAt)) continue
+      if (!(statisticsMask(row) & bit) || numericObservation || expiresAt <= observedAt || !Number.isSafeInteger(expiresAt)) continue
       const previous = leases.at(-1)
       if (previous?.expiresAt === expiresAt && row.timestamp === previous.through + query.intervalMS) previous.through = row.timestamp
       else leases.push({ from: row.timestamp, through: row.timestamp, expiresAt })
@@ -134,8 +145,13 @@ export class MarketHistory {
     this.coverageLeaseReads.delete(leaseKey)
     this.coverageLeaseReads.set(leaseKey, leases)
     while (this.coverageLeaseReads.size > 512) this.coverageLeaseReads.delete(this.coverageLeaseReads.keys().next().value)
-    return missing(rows, query.from, query.through, query.intervalMS,
-      query.source === 'candles' ? row => pricePresent(row) && !observations?.has(row.timestamp) : row => pricePresent(row) && sourcePresent(row, bit, observedAt))
+    const gaps = missing(rows, query.from, query.through, query.intervalMS,
+      query.source === 'candles' ? row => pricePresent(row) && !observations?.has(row.timestamp) : row => sourcePresent(row, bit, observedAt))
+    if (query.source === 'candles') for (const repair of this.repairs.values()) {
+      if (repair.instrument !== query.instrument || repair.timeframe !== query.timeframe) continue
+      for (const bounds of repair.remaining) if (bounds.from <= query.through && bounds.through >= query.from) gaps.push({ from: Math.max(bounds.from, query.from), through: Math.min(bounds.through, query.through) })
+    }
+    return mergedRanges(gaps, query.intervalMS)
   }
 
   parsed(instId, timeframe, values) {
@@ -150,26 +166,6 @@ export class MarketHistory {
   async fetchPrices(query) {
     const { instrument, timeframe, from, through, signal, priority } = query
     const interval = CANDLE_INTERVALS[timeframe]
-    const repair = [...this.repairs.values()].find(value => value.instrument === instrument && value.timeframe === timeframe
-      && from >= value.from && through <= value.through && !value.written)
-    if (repair) {
-      const rows = new Map()
-      let cursor = through + interval
-      while (cursor > from) {
-        signal.throwIfAborted()
-        const page = this.parsed(instrument, timeframe, await this.get('/market/history-candles', { instId: instrument, bar: timeframe, limit: Math.min(300, (cursor - from) / interval), after: cursor }, signal, priority))
-          .filter(row => row.timestamp >= from && row.timestamp <= through)
-        if (!page.length) throw new Error('The repair source did not return the complete affected range.')
-        for (const row of page) rows.set(row.timestamp, row)
-        const oldest = Math.min(...page.map(row => row.timestamp))
-        if (oldest >= cursor) throw new Error('The repair history cursor did not advance.')
-        cursor = oldest
-      }
-      const records = [...rows.values()].sort((a, b) => a.timestamp - b.timestamp)
-      if (missing(records, from, through, interval, pricePresent).length) throw new Error('The repair source did not return the complete affected range.')
-      repair.records = records
-      return { records, cursor: null }
-    }
     const seeded = [...(this.seeds.get(keyOf(instrument, timeframe))?.values() ?? [])].filter(row => row.timestamp >= from && row.timestamp <= through)
     if (seeded.length) return { records: seeded, cursor: null }
     const cursor = Math.min(numeric(query.cursor) ?? through + interval, through + interval)
@@ -199,39 +195,39 @@ export class MarketHistory {
       if (previous && previous.some((amount, index) => amount !== observation[index])) throw new TypeError('OKX statistics contain conflicting observations for one period.')
       byTimestamp.set(timestamp, observation)
     }
-    // Network work starts independently. Only merging this page waits for its
-    // durable price rows, never for an entire multi-day history target.
-    // This bounded page is a dependency of an already admitted source, even
-    // when that source is backfilling. Let it finish alongside foreground
-    // qualification instead of holding the statistics lane behind bulk work.
-    const { rows } = await this.ensurePrices(instrument, timeframe, pageFrom, through, 'foreground', signal)
-    return rows.filter(pricePresent).map(row => {
-      const value = byTimestamp.get(row.timestamp)
-      return source === 'oi' ? { ...row, oi: numeric(value?.[1]) }
-        : { ...row, sell: numeric(value?.[1]), buy: numeric(value?.[2]) }
+    // Statistics own their native timestamp slots independently of price history.
+    // An empty response is a bounded direct observation, never an availability boundary.
+    return Array.from({ length: (through - pageFrom) / interval + 1 }, (_, index) => {
+      const timestamp = pageFrom + index * interval, value = byTimestamp.get(timestamp)
+      return { instrument, timeframe, timestamp, ...(source === 'oi'
+        ? { oi: numeric(value?.[1]) } : { sell: numeric(value?.[1]), buy: numeric(value?.[2]) }) }
     })
   }
 
   async write(rows, task) {
     if (task.source === 'candles') {
-      const repair = this.repairs.get(rangeKey(task))
       const observations = this.seeds.get(keyOf(task.instrument, task.timeframe))
-      if (repair && !repair.written) {
-        // A corrupt/incompatible partition is replaced only after the entire
-        // affected completed day has been obtained, never page by page.
-        const range = { instrument: task.instrument, timeframe: task.timeframe, from: repair.replaceFrom, through: repair.replaceThrough }
-        // The latest endpoint may revise a slot while its historical repair
-        // is in flight. Commit that explicit observation in the same complete
-        // replacement, so shared task coverage advances without losing it.
-        const replacement = (repair.records ?? rows).map(row => observations?.get(row.timestamp) ?? row)
-        if (missing(replacement, task.from, task.through, CANDLE_INTERVALS[task.timeframe], pricePresent).length) throw new Error('A complete repair range is required before replacing the partition.')
-        await this.replaceCandles(range, replacement, task.priority)
+      const repairs = [...this.repairs.values()].filter(value => value.instrument === task.instrument && value.timeframe === task.timeframe
+        && value.remaining.some(bounds => bounds.from <= task.through && bounds.through >= task.from))
+      if (repairs.length) {
+        const interval = CANDLE_INTERVALS[task.timeframe]
+        const replacement = [...new Map(rows.map(row => [row.timestamp, observations?.get(row.timestamp) ?? row])).values()].sort((a, b) => a.timestamp - b.timestamp)
+        // SQL ranges can be replaced independently. Never erase an unobserved slot
+        // merely because the source returned a partial page around it.
+        const runs = []
+        for (const row of replacement) {
+          const run = runs.at(-1)
+          if (run && row.timestamp === run.at(-1).timestamp + interval) run.push(row)
+          else runs.push([row])
+        }
+        for (const run of runs) {
+          const bounds = { instrument: task.instrument, timeframe: task.timeframe, from: run[0].timestamp, through: run.at(-1).timestamp }
+          await this.replaceCandles(bounds, run, task.priority)
+          for (const repair of repairs) { repair.remaining = subtractRange(repair.remaining, bounds, interval); repair.written = repair.remaining.length === 0 }
+        }
         for (const row of replacement) if (observations?.get(row.timestamp) === row) observations.delete(row.timestamp)
-        repair.written = true
       } else {
         await this.persistCandles(task.instrument, rows, { priority: task.priority })
-        // Only consumption of that explicit observation clears the refresh.
-        // An older HTTP page already in flight must not swallow its revision.
         for (const row of rows) if (observations?.get(row.timestamp) === row) observations.delete(row.timestamp)
       }
       return
@@ -247,9 +243,14 @@ export class MarketHistory {
     this.assertOpen()
     signal?.throwIfAborted()
     const task = await this.sync.enqueue({ instrument: instId, timeframe, source, from, through, priority })
-    const result = await abortable(this.sync.waitFor(task.id), signal)
-    if (!['completed', 'unavailable'].includes(result.status)) throw new Error(result.lastError || `History ${source} task was ${result.status}.`)
-    return result
+    const abort = () => { void this.sync.cancel(task.id).catch(() => undefined) }
+    signal?.addEventListener('abort', abort, { once: true })
+    try {
+      if (signal?.aborted) { abort(); signal.throwIfAborted() }
+      const result = await abortable(this.sync.waitFor(task.id), signal)
+      if (!['completed', 'unavailable'].includes(result.status)) throw new Error(result.lastError || `History ${source} task was ${result.status}.`)
+      return result
+    } finally { signal?.removeEventListener('abort', abort) }
   }
 
   async ensurePrices(instId, timeframe, from, through, priority = 'foreground', signal) {
@@ -260,7 +261,7 @@ export class MarketHistory {
 
   async ensureStatistics(instId, timeframe, from, through, priority = 'foreground', signal) {
     await abortable(this.ready, signal)
-    await Promise.all(['candles', 'oi', 'taker'].map(source => this.request(instId, timeframe, source, from, through, priority, signal)))
+    await Promise.all(['oi', 'taker'].map(source => this.request(instId, timeframe, source, from, through, priority, signal)))
     return { rows: await abortable(this.store.candles({ instrument: instId, timeframe, from, through }, priority), signal) }
   }
 
@@ -300,24 +301,23 @@ export class MarketHistory {
     await this.ready
     this.assertOpen()
     return Promise.all(Object.keys(CANDLE_INTERVALS).flatMap(timeframe => ['candles', 'oi', 'taker'].map(source => this.sync.enqueueTarget({
-      instrument: instId, timeframe, source, historyDays, warmupCandles: 200, asOf, priority: 'background',
+      instrument: instId, timeframe, source, historyDays, warmupCandles: source === 'candles' ? 200 : 0, asOf, priority: 'background',
     }))))
   }
+
+  async removeTargets(instIds) { await this.ready; return this.sync.removeTargets(instIds) }
 
   async repair(issue, { signal }) {
     await this.ready
     this.assertOpen()
     signal.throwIfAborted()
     const interval = CANDLE_INTERVALS[issue.timeframe]
-    const wholeDay = issue.reason === 'corrupt-file' || issue.reason === 'invalid-schema'
     const bounds = this.bounds(issue.instrument, issue.timeframe)
-    const from = Math.max(bounds.floor ?? 0, wholeDay ? Math.floor(issue.from / DAY) * DAY : Math.floor(issue.from / interval) * interval)
-    const through = Math.min(bounds.through, wholeDay ? Math.floor(issue.through / DAY) * DAY + DAY - interval : Math.floor(issue.through / interval) * interval)
+    const from = Math.max(bounds.floor ?? 0, Math.floor(issue.from / interval) * interval)
+    const through = Math.min(bounds.through, Math.floor(issue.through / interval) * interval)
     if (from > through) throw new Error('The affected partition has no available completed source candles.')
     const target = { instrument: issue.instrument, timeframe: issue.timeframe, from, through }
-    const key = rangeKey(target), repair = { ...target, written: false, records: null,
-      replaceFrom: wholeDay ? Math.floor(issue.from / DAY) * DAY : from,
-      replaceThrough: wholeDay ? Math.floor(issue.through / DAY) * DAY + DAY - interval : through }
+    const key = rangeKey(target), repair = { ...target, written: false, remaining: [{ from, through }] }
     this.repairs.set(key, repair)
     this.sync.invalidate({ ...target, source: 'candles' })
     let task

@@ -84,7 +84,7 @@ export class ChartController {
   ingestPrepared(response: PreparedChartNotification) {
     if ('type' in response) {
       if (!this.store.ingestLive(response)) return
-    } else if (!this.store.ingestLatest(response)) return
+    } else if (!(response.endHour !== response.latestEnd ? this.store.ingest(response) : this.store.ingestLatest(response))) return
     this.notificationVersions.set(seriesKey(response), ++this.notificationVersion)
     const live = 'type' in response
     this.preparedChanged(response, live)
@@ -139,7 +139,7 @@ export class ChartController {
     if (latest === null) return
     const interval = timeframeMilliseconds(target.timeframe)
     const meta = this.store.snapshotMeta(target.instId, target.timeframe)
-    const floor = meta?.historyExhausted && meta.oldestHour !== null ? Math.min(latest, meta.oldestHour + 95 * interval) : 95 * interval
+    const floor = meta?.historyExhausted && meta.oldestHour !== null ? Math.min(latest, meta.oldestHour) : 95 * interval
     const end = Math.max(floor, Math.min(latest, (target.end ?? latest) + Math.trunc(steps) * interval))
     const now = performance.now()
     const direction = Math.sign(steps)
@@ -176,13 +176,13 @@ export class ChartController {
     const meta = this.store.snapshotMeta(requested.instId, requested.timeframe)
     let target = requested
     if (target.end !== null && meta?.historyExhausted && meta.oldestHour !== null && meta.latestEnd !== null) {
-      const floor = Math.min(meta.latestEnd, meta.oldestHour + 95 * timeframeMilliseconds(target.timeframe))
+      const floor = Math.min(meta.latestEnd, meta.oldestHour)
       if (target.end < floor) target = { ...target, end: floor }
     }
     const ready = this.store.window(target.instId, target.timeframe, target.end)
     this.publish({
       requested: target,
-      presented: ready ?? this.view.presented,
+      presented: ready ?? (this.view.presented?.instId === target.instId && this.view.presented.timeframe === target.timeframe ? this.view.presented : null),
       pending: ready === null,
       error: ready || requested !== this.view.requested ? '' : this.view.error,
       oldestHour: meta?.oldestHour ?? null,
@@ -201,7 +201,7 @@ export class ChartController {
     const range = this.store.readyBoundaries(target.instId, target.timeframe).find(range => range.firstEnd <= window.endHour && range.lastEnd >= window.endHour)
     if (!range) return null
     const meta = this.store.snapshotMeta(target.instId, target.timeframe)
-    const earliest = meta?.historyExhausted && meta.oldestHour !== null ? meta.oldestHour + 95 * interval : 95 * interval
+    const earliest = meta?.historyExhausted && meta.oldestHour !== null ? meta.oldestHour : 95 * interval
     // Reserve enough resident candles for two observed preparation times. Start
     // with a conservative network budget before the first response is measured.
     const speed = performance.now() - this.scrollAt <= 500 ? this.scrollSpeed : 0
@@ -241,9 +241,9 @@ export class ChartController {
     const target = this.view.requested
     const key = seriesKey(target)
     const ready = this.store.window(target.instId, target.timeframe, target.end)
-    if (!ready && target.end === null && this.localCheckedKey !== targetKey(target)) {
+    if (target.end === null && this.localCheckedKey !== targetKey(target)) {
       if (!this.localTargets.has(key) && this.localTargets.size < 2) void this.hydrateLocal(target)
-      return
+      if (!ready) return
     }
     // Focused durable history has its own lane. A slow provider request must
     // never prevent an already saved range from entering the renderer cache.
@@ -301,7 +301,7 @@ export class ChartController {
 
   private historyWatermark(target: ChartTarget) {
     const meta = this.store.snapshotMeta(target.instId, target.timeframe)
-    return `${meta?.generation ?? -1}:${meta?.revision ?? -1}:${meta?.latestEnd ?? -1}:${this.store.historyEpoch(target.instId, target.timeframe)}`
+    return `${meta?.generation ?? -1}:${JSON.stringify(meta?.sourceVersions ?? meta?.revision ?? -1)}:${meta?.latestEnd ?? -1}:${this.store.historyEpoch(target.instId, target.timeframe)}`
   }
 
   private async hydrateHistory(target: ChartTarget, checkedKey: string, watermark: string) {
@@ -315,7 +315,7 @@ export class ChartController {
         const meta = this.store.snapshotMeta(target.instId, target.timeframe)
         // A newer compact notification can arrive while this bulk read is in
         // flight. Its revision must not certify older historical observations.
-        if (accepted) this.historyHydrated.set(key, `${response.generation}:${response.revision}:${meta?.latestEnd ?? -1}:${this.store.historyEpoch(target.instId, target.timeframe)}`)
+        if (accepted) this.historyHydrated.set(key, `${response.generation}:${JSON.stringify(response.sourceVersions ?? response.revision)}:${meta?.latestEnd ?? -1}:${this.store.historyEpoch(target.instId, target.timeframe)}`)
         if (this.active) this.commit()
       } else this.historyHydrated.set(key, watermark)
     } catch {
@@ -348,11 +348,10 @@ export class ChartController {
         if (accepted && job.end !== null) {
           // Historical responses already carry the bounded durable navigation
           // range. Do not immediately serialize the same bulk history again.
-          const meta = this.store.snapshotMeta(job.instId, job.timeframe)
-          this.historyHydrated.set(seriesKey(job), `${response.generation}:${response.revision}:${meta?.latestEnd ?? -1}:${this.store.historyEpoch(job.instId, job.timeframe)}`)
+          this.historyHydrated.set(seriesKey(job), this.historyWatermark(job))
         } else if (accepted && kind !== 'refresh') this.historyHydrated.delete(seriesKey(job))
         const prepared = this.store.window(job.instId, job.timeframe, response.endHour)
-        if (accepted && !prepared) throw new Error('The selected range does not yet contain 96 complete source candles.')
+        if (accepted && !prepared) throw new Error('No local prices are available for this range yet.')
         if (this.active) this.commit()
       }
       if (this.view.requested && targetKey(this.view.requested) === targetKey(job)) { this.failureCount = 0; this.retryAt = 0 }

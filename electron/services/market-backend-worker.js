@@ -1,0 +1,161 @@
+import { parentPort, workerData, threadId } from 'node:worker_threads'
+import { join } from 'node:path'
+import { MetadataStore } from './metadata-store.js'
+import { MarketStore } from './market-store.js'
+import { MarketService } from './market-service.js'
+import { ChartNotificationEncoder } from './chart-notifications.js'
+import { seedCachedListProjection, seedChartScrollBenchmark, seedHistoricalStatisticsBoundary, seedInstrumentNavigationBenchmark } from '../e2e-fixtures.js'
+import { seedMarketResources } from '../market-resource-fixtures.js'
+
+let metadata, store, service, preferences, sourceProbe
+let resourceFixture
+const emit = (name, value) => parentPort.postMessage({ type: 'event', name, value })
+const offline = async (_input, { signal } = {}) => {
+  if (workerData.e2eLiveRefresh) await new Promise((resolve, reject) => {
+    const abort = () => { clearTimeout(timer); reject(signal.reason ?? new Error('Request cancelled.')) }
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve() }, 10_000)
+    if (signal?.aborted) abort()
+    else signal?.addEventListener('abort', abort, { once: true })
+  })
+  return new Response(JSON.stringify({ code: '0', data: [] }))
+}
+const initialize = (async () => {
+  metadata = await MetadataStore.open(workerData.userData, { legacySettingsPath: join(workerData.userData, 'settings.json') })
+  preferences = metadata.getSettings().preferences
+  store = await MarketStore.open(join(workerData.userData, 'MarketData'))
+  service = new MarketService(store, () => preferences, workerData.testMode ? offline : fetch, !workerData.testMode, { metadata })
+  await service.ready
+  const notifications = new ChartNotificationEncoder()
+  service.subscribePreparedCharts(frame => emit('chart', notifications.encode(frame)))
+  service.subscribeMarket(() => emit('market'))
+  service.subscribeAudit(report => emit('audit', report))
+  if (workerData.e2eLiveRefresh) void service.refresh().catch(error => console.error(error))
+  parentPort.postMessage({ type: 'ready' })
+})()
+
+async function request(value) {
+  if (value.preferences) {
+    if (value.preferences.action === 'update') {
+      const previous = preferences
+      preferences = metadata.updateSettings(value.preferences.values).preferences
+      await service.reconfigure(previous)
+    }
+    return preferences
+  }
+  if (value.snapshot) return service.snapshot(value.snapshot.timeframe, value.snapshot)
+  if (value.dataAudit) return service.dataAuditRequest(value.dataAudit)
+  if (value.chartWindow) {
+    const { instId, timeframe, endHour, historyBars } = value.chartWindow
+    return service.prepareChartWindow(instId, timeframe, endHour, historyBars)
+  }
+  if (value.chartLocal) return service.localChartWindow(value.chartLocal.instId, value.chartLocal.timeframe)
+  if (value.chartHistory) return service.localChartHistory(value.chartHistory.instId, value.chartHistory.timeframe, value.chartHistory.endHour)
+  if (value.chartUniverse) return service.setChartUniverse(value.chartUniverse.instIds, value.chartUniverse.timeframe, value.chartUniverse.focusInstId)
+  if (value.analysisSettings) {
+    const input = value.analysisSettings
+    if (input.action === 'save') metadata.updateAnalysisSettings({ model: input.model, apiKey: input.apiKey })
+    if (input.action === 'removeKey') metadata.updateAnalysisSettings({ apiKey: '' })
+    const current = metadata.getAnalysisSettings()
+    return { model: current.model ?? '', hasAPIKey: Boolean(current.apiKey) }
+  }
+  if (value.e2e && workerData.testMode) {
+    const input = value.e2e
+    switch (input.action) {
+      case 'smokeStatus': return { userData: workerData.userData, backendThreadId: threadId,
+        preparedWorkerThreadId: service.preparedCharts.worker?.threadId ?? service.preparedCharts.workers?.[0]?.threadId ?? null }
+      case 'seedCandles': return { written: await store.appendCandles(input.candles) }
+      case 'readCandles': return store.candles(input)
+      case 'seedCachedListProjection': return seedCachedListProjection(store, service)
+      case 'seedChartScrollBenchmark': return seedChartScrollBenchmark(store, service)
+      case 'seedHistoricalStatisticsBoundary': return seedHistoricalStatisticsBoundary(store, service)
+      case 'seedInstrumentNavigationBenchmark': return seedInstrumentNavigationBenchmark(store, service)
+      case 'settings': return preferences
+    }
+  }
+  throw new Error('Unsupported market backend request.')
+}
+
+async function probe(input) {
+  if (!workerData.testMode) throw new Error('Backend probes are unavailable outside tests.')
+  if (input.action === 'scaleSeed') {
+    const previous = preferences
+    preferences = metadata.updateSettings({ liquidity: Object.fromEntries(Object.entries(preferences.liquidity).map(([key, value]) => [key, { ...value, enabled: false }])) }).preferences
+    await service.reconfigure(previous)
+    resourceFixture = await seedMarketResources(store, service, input)
+    return { ...resourceFixture.fixture, backendThreadId: threadId, diagnostics: store.getDiagnostics() }
+  }
+  if (input.action === 'scaleTick') { if (!resourceFixture) throw new Error('Resource benchmark is not seeded.'); return resourceFixture.tick(input) }
+  if (input.action === 'scaleStop') { if (!resourceFixture) throw new Error('Resource benchmark is not seeded.'); return resourceFixture.stop() }
+  if (input.action === 'persistNavigationCatalog') {
+    const lease = { observedAt: Date.now(), expiresAt: Date.now() + 90_000 }
+    await service.persistCatalog([...service.catalog.values()].map(entry => ({ ...entry, ...lease,
+      instrumentObservation: lease, observations: { ticker: { value: entry.ticker, ...lease } } })))
+    return service.catalog.size
+  }
+  if (input.action === 'sourceInstall') {
+    const original = service.get.bind(service)
+    let release
+    const released = new Promise(resolve => { release = resolve })
+    sourceProbe = { original, requests: [], hold: false, release }
+    service.get = async (path, parameters, ...rest) => {
+      if (parameters?.instId === input.instId) {
+        sourceProbe.requests.push({ path, parameters: { ...parameters } })
+        if (sourceProbe.hold) await released
+      }
+      return original(path, parameters, ...rest)
+    }
+    return { ok: true }
+  }
+  if (input.action === 'sourceHold') { if (sourceProbe) sourceProbe.hold = input.hold; return { ok: true } }
+  if (input.action === 'sourceRead') return sourceProbe?.requests ?? []
+  if (input.action === 'sourceRelease') { sourceProbe?.release(); return { ok: true } }
+  if (input.action === 'sourceRemove') {
+    sourceProbe?.release()
+    if (sourceProbe) service.get = sourceProbe.original
+    sourceProbe = null
+    return { ok: true }
+  }
+  if (input.action === 'diagnostics') return { backendThreadId: threadId, tasks: service.history.sync.listTasks(), writeMetrics: store.getWriteMetrics() }
+  if (input.action === 'backgroundStart') {
+    const original = service.get.bind(service)
+    service.get = async (path, parameters, ...rest) => {
+      if (parameters?.instId !== 'LOAD-USDT-SWAP') return original(path, parameters, ...rest)
+      if (path !== '/market/history-candles') return []
+      const step = { '5m': 300_000, '15m': 900_000, '1H': 3_600_000 }[parameters.bar]
+      const end = Math.floor((Number(parameters.after) - 1) / step) * step
+      return Array.from({ length: Number(parameters.limit) }, (_, index) => [String(end - index * step), '100', '102', '99', '101', '100', '100', '10100', '1'])
+    }
+    service.instruments.set('LOAD-USDT-SWAP', { instId: 'LOAD-USDT-SWAP' })
+    await service.history.target('LOAD-USDT-SWAP', { historyDays: 30 })
+    await service.dataAuditRequest({ action: 'start' })
+    return { ok: true }
+  }
+  if (input.action === 'backgroundStatus') {
+    const audit = await service.dataAuditRequest({ action: 'status' }), tasks = service.history.sync.listTasks()
+    const result = { source: 'offline synthetic source; worker backend, HistorySync and SQLite WAL',
+      audit: { phase: audit.phase, progress: audit.progress }, tasks: tasks.length,
+      writtenRecords: tasks.reduce((sum, task) => sum + (task.writtenRecords ?? 0), 0), writeMetrics: store.getWriteMetrics() }
+    await service.dataAuditRequest({ action: 'cancel' })
+    return result
+  }
+  throw new Error('Unsupported backend probe.')
+}
+
+parentPort.on('message', async ({ id, method, value }) => {
+  try {
+    await initialize
+    let result
+    if (method === 'request') result = await request(value)
+    else if (method === 'credentials') result = metadata.getAnalysisSettings().apiKey ?? ''
+    else if (method === 'probe') result = await probe(value)
+    else if (method === 'dispose') {
+      sourceProbe?.release()
+      await service.dispose()
+      await store.close()
+      metadata.close()
+      result = { ok: true }
+    } else throw new Error('Unsupported backend operation.')
+    parentPort.postMessage({ id, value: result })
+  } catch (error) { parentPort.postMessage({ id, error: { message: error.message, code: error.code } }) }
+})
+initialize.catch(error => parentPort.postMessage({ type: 'fatal', error: error.message }))
