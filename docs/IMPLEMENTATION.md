@@ -29,7 +29,10 @@ The [original plan](IMPROVEMENT_PLAN.md) describes baseline `470916a`. Its six i
 
 macOS arm64; supported tooling Node 24.22.0 and npm 12.2.0; Electron 44.9.0. A clean `npm ci` succeeds with the committed lockfile.
 
-- Core: **276/276**. Actual Electron E2E: **30/30**. Type checking, desktop syntax and design-token checks pass. Lint has no errors and seven existing shadcn Fast Refresh export warnings.
+- Core: **371/371**. Actual Electron E2E: **34/34**. Type checking, desktop syntax and design-token checks pass. Lint has no errors; existing Fast Refresh export and effect warnings remain. Visual acceptance produces **28** screenshots with zero text or critical-graphic contrast failures.
+
+The timing, live-source and dependency-audit figures below are earlier baselines, rather than measurements of the energy fixes.
+
 - Live OKX 1H integration passes against public price, OI and Taker endpoints. It checks native period/contract units, complete prepared windows and reuse without repeated source downloads. This is a dated external integration result, not a permanent provider-availability guarantee.
 - The bounded older-statistics regression also passes: six HTTP 200/API 0 requests for the same hour 30 days earlier at 5m and 1H, overlapping source starts, no HTTP on repeated requests, and identical persisted observations after DuckDB reopen. Actual 5m OI is empty and Taker returns inconsistent 0/0 placeholders; actual 1H OI/Taker values remain available. The result validates truthful source handling rather than assuming all periods have equal availability.
 - Visual acceptance generates **28** PNGs with actual pixel dimensions verified, including DPR 2. Both themes have zero measured non-exempt text/critical-graphic contrast failures. Light ordinary text minimum is **4.623:1**, dark **5.857:1**. Required financial RGB colors are retained; low-contrast light fills/lines have verified foreground boundaries. Grayscale retains hollow/solid candles, different EMA/VWAP line styles and Taker hatch.

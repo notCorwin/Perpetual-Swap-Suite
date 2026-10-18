@@ -1,4 +1,5 @@
 import { barsWithIndicators } from './services/indicators.js'
+import { quoteTurnover24h } from './services/liquidity.js'
 
 const FIVE_MINUTES = 300_000
 const HOUR = 3_600_000
@@ -9,7 +10,9 @@ const HOUR = 3_600_000
 export async function seedCachedListProjection(store, marketService) {
   const instId = 'ETH-USDT-SWAP'
   const timeframe = '1H'
-  const latestRaw = Math.floor((Date.now() - FIVE_MINUTES) / FIVE_MINUTES) * FIVE_MINUTES
+  const savedAt = Date.now()
+  const asOf = Math.floor(savedAt / FIVE_MINUTES) * FIVE_MINUTES
+  const latestRaw = asOf - FIVE_MINUTES
   const currentBucket = Math.floor(latestRaw / HOUR) * HOUR
   const end = latestRaw >= currentBucket + HOUR - FIVE_MINUTES ? currentBucket : currentBucket - HOUR
   const periods = 201
@@ -20,10 +23,11 @@ export async function seedCachedListProjection(store, marketService) {
     const index = (timestamp - start) / FIVE_MINUTES
     const center = 200 + index * 0.007 + Math.sin(index / 13) * 0.45
     const close = center + Math.sin(index / 5) * 0.08
+    const volume = (120 + index % 11) * 10
     source.push({
       instrument: instId, timeframe: '5m', timestamp,
       open: center - 0.06, high: center + 0.42, low: center - 0.48, close,
-      volume: 120 + index % 11, baseVolume: 120 + index % 11, quoteVolume: (120 + index % 11) * close,
+      volume, baseVolume: volume, quoteVolume: volume * close,
       confirmed: true,
     })
   }
@@ -34,7 +38,7 @@ export async function seedCachedListProjection(store, marketService) {
     return {
       instrument: instId, timeframe, timestamp,
       open: close - 0.18, high: close + 0.51, low: close - 0.56, close,
-      volume: 1_600, baseVolume: 1_600, quoteVolume: close * 1_600,
+      volume: 16_000, baseVolume: 16_000, quoteVolume: close * 16_000,
       oi: 2_000_000 + index * 4_000,
       buy: 12_000 + index * 17,
       sell: 8_000 + index * 11,
@@ -44,15 +48,32 @@ export async function seedCachedListProjection(store, marketService) {
   })
 
   await store.appendCandles([...source, ...statistics])
-  const instrument = { instId, instCategory: '1', settleCcy: 'USDT', state: 'live', ctVal: '0.01', ctValCcy: 'ETH' }
+  const instrument = { instId, instType: 'SWAP', ctType: 'linear', instCategory: '1', settleCcy: 'USDT', state: 'live', ctVal: '0.01', ctMult: '1', ctValCcy: 'ETH', ruleType: 'normal' }
   const ticker = { instId, last: String(statistics.at(-1).close), open24h: '198', low24h: '196', high24h: '220', bidPx: '216.79', askPx: '216.80', volCcy24h: '300000' }
-  const result = { eligible: true, turnover: 65_000_000, oiUSD: 6_500_000, spread: 0.005, depth: 250_000, slippage: 0.02 }
+  const lease = { observedAt: savedAt, expiresAt: savedAt + 90_000 }
+  const hourlyAsOf = Math.floor(savedAt / HOUR) * HOUR
+  const nativeCandles = await store.candles({ instrument: instId, timeframe: '5m', from: asOf - 288 * FIVE_MINUTES, through: latestRaw })
+  const hourlyCandles = await store.candles({ instrument: instId, timeframe: '1H', from: hourlyAsOf - 24 * HOUR, through: hourlyAsOf - HOUR })
+  const turnover = quoteTurnover24h(nativeCandles, asOf)
+  const observations = {
+    ticker: { value: ticker, ...lease },
+    book: { value: { bids: [['216.79', '200000']], asks: [['216.80', '200000']] }, ...lease },
+    openInterest: { value: { oiUsd: '6500000' }, ...lease },
+    turnover: { value: { asOf, turnover }, observedAt: savedAt, expiresAt: asOf + FIVE_MINUTES },
+    hourly: { value: { asOf: hourlyAsOf, rows: hourlyCandles }, observedAt: savedAt, expiresAt: hourlyAsOf + HOUR },
+  }
 
-  const entry = { instrument, ticker, result, change24h: 4.2 }
-  const savedAt = Date.now()
+  marketService.instrumentObservations.set(instId, lease)
+  marketService.observations.set(instId, observations)
+  const config = marketService.prefs().liquidity
+  const entry = marketService.observedCandidate(instrument, config, JSON.stringify(config), observations, {}, savedAt)
+  if (entry.status !== 'verified') throw new Error(`Cached projection fixture does not satisfy the enabled conditions: ${entry.result.reasons.join(' ')}`)
+  entry.preferencesRevision = marketService.metadata.getSettings().revision
   marketService.catalogUpdatedAt = savedAt
   marketService.catalogSource = 'live'
   marketService.instruments.set(instId, instrument)
+  marketService.catalogChecks.set(instId, entry)
+  marketService.renewalTargets.set(instId, instrument)
   marketService.replaceCatalog([entry])
   await marketService.persistCatalog([entry], savedAt)
   await marketService.ensureListTimeframe(timeframe)

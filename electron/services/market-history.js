@@ -193,7 +193,10 @@ export class MarketHistory {
     }
     // Network work starts independently. Only merging this page waits for its
     // durable price rows, never for an entire multi-day history target.
-    const { rows } = await this.ensurePrices(instrument, timeframe, pageFrom, through, priority, signal)
+    // This bounded page is a dependency of an already admitted source, even
+    // when that source is backfilling. Let it finish alongside foreground
+    // qualification instead of holding the statistics lane behind bulk work.
+    const { rows } = await this.ensurePrices(instrument, timeframe, pageFrom, through, 'foreground', signal)
     return rows.filter(pricePresent).map(row => {
       const value = byTimestamp.get(row.timestamp)
       return source === 'oi' ? { ...row, oi: numeric(value?.[1]) }

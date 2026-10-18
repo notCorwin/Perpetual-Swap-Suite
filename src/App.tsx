@@ -20,9 +20,13 @@ import { cn, pageVisible } from '@/lib/utils'
 
 const priceFormatter = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 8 })
 const formatPrice = (value: number | null | undefined) => value == null ? '—' : priceFormatter.format(value)
+const qualificationPending = (progress: MarketSnapshot['catalogProgress']) => !progress || progress.total === 0 || progress.completed < progress.total || progress.unknown > 0
 const collectorStatus = (snapshot: MarketSnapshot | UnchangedSnapshot) => {
   const catalog = snapshot.catalogProgress
-  if (snapshot.loading && catalog && catalog.total > 0) return `Verifying ${catalog.completed}/${catalog.total}`
+  if (snapshot.loading && catalog && catalog.total > 0) {
+    if (catalog.completed < catalog.total) return `Verifying ${catalog.completed}/${catalog.total}`
+    if (catalog.unknown > 0) return `Updating ${catalog.unknown} contracts`
+  }
   if (snapshot.error) return snapshot.catalogSource === 'none' ? 'Unavailable' : 'Incomplete'
   const progress = snapshot.listProgress
   if (progress && progress.total > 0 && progress.completed < progress.total) return `Loading ${progress.completed}/${progress.total}`
@@ -94,7 +98,7 @@ function App() {
           revision.current = order.current.revision
           if (!('unchanged' in snapshot)) {
             setRows(current => reconcileMarketRows(current, snapshot.rows) as RankedMarketRow[])
-            const unverified = snapshot.loading || snapshot.error || snapshot.catalogSource === 'none' || (snapshot.catalogProgress?.unknown ?? 0) > 0
+            const unverified = snapshot.loading && qualificationPending(snapshot.catalogProgress) || snapshot.error || snapshot.catalogSource === 'none' || (snapshot.catalogProgress?.unknown ?? 0) > 0
             setSelected(current => snapshot.rows.some(row => row.instId === current) || (!snapshot.rows.length && unverified) ? current : snapshot.rows.reduce<RankedMarketRow | null>((first, row) => !first || compareRankingChange(row, first) < 0 ? row : first, null)?.instId ?? null)
             setReady(true)
           }
@@ -123,11 +127,12 @@ function App() {
 
   const ranked = useMemo(() => [...rows].sort(compareRankingChange), [rows])
   const visible = useMemo(() => ranked.filter(row => row.instId.toLowerCase().includes(query.trim().toLowerCase())), [ranked, query])
-  const verifying = Boolean(catalog.loading) || (!ready && !error)
+  const verifying = Boolean(catalog.loading) && qualificationPending(catalog.catalogProgress) || (!ready && !error)
+  const awaitingObservations = Boolean(catalog.loading && catalog.catalogProgress && catalog.catalogProgress.completed === catalog.catalogProgress.total && catalog.catalogProgress.unknown > 0)
   const verificationUnavailable = !verifying && (Boolean(error) || catalog.catalogSource === 'none' || (catalog.catalogProgress?.unknown ?? 0) > 0)
-  const emptyTitle = verifying ? catalog.catalogSource === 'none' ? 'Loading contracts' : 'Verifying contracts' : verificationUnavailable ? 'Market verification unavailable' : 'No qualified contracts'
+  const emptyTitle = verifying ? catalog.catalogSource === 'none' ? 'Loading contracts' : awaitingObservations ? 'Updating market data' : 'Verifying contracts' : verificationUnavailable ? 'Market verification unavailable' : 'No qualified contracts'
   const emptyDescription = verifying
-    ? catalog.catalogProgress?.total ? `Checking enabled conditions: ${catalog.catalogProgress.completed} / ${catalog.catalogProgress.total} contracts completed.` : 'The data service is preparing and verifying the market list.'
+    ? awaitingObservations ? 'Waiting for fresh observations. Market data collection continues in the background.' : catalog.catalogProgress?.total ? `Checking enabled conditions: ${catalog.catalogProgress.completed} / ${catalog.catalogProgress.total} contracts completed.` : 'The data service is preparing and verifying the market list.'
     : verificationUnavailable ? 'Market data could not verify the enabled conditions. The data service will retry automatically.' : 'Adjust the enabled liquidity conditions in Settings.'
   const noSearchMatch = Boolean(query.trim()) && rows.length > 0
   // Only confirmed exclusions clear the chart. A temporary verification gap

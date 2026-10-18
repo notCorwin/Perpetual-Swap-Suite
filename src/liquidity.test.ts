@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { eligibleInstrument, evaluateLiquidity, quoteTurnover24h, type LiquidityConfig, type LiquidityInput, type QuoteVolumeCandle } from '../electron/services/liquidity.js'
+import { createLiquidityEvaluator, eligibleInstrument, evaluateLiquidity, quoteTurnover24h, type LiquidityConfig, type LiquidityInput, type QuoteVolumeCandle } from '../electron/services/liquidity.js'
 
 const fiveMinutes = 300_000
 const hour = 3_600_000
@@ -172,6 +172,96 @@ test('slippage exact threshold fails, and changing notional never changes observ
   assert.equal(high.askSlippage, 0.1)
   assert.equal(low.depthAsk, high.depthAsk)
   assert.equal(low.depthBid, high.depthBid)
+})
+
+const assertCachedLiquidity = (evaluate: ReturnType<typeof createLiquidityEvaluator>, input: LiquidityInput) => {
+  const before = structuredClone(input)
+  const expected = evaluateLiquidity(input)
+  const actual = evaluate(input)
+  assert.deepEqual(actual, expected)
+  assert.deepEqual(input, before, 'Neither evaluator may mutate the observed snapshot, instrument, or preferences.')
+  return actual
+}
+const freezeBook = (book: NonNullable<LiquidityInput['book']>) => {
+  for (const levels of [book.bids, book.asks]) {
+    for (const level of levels ?? []) Object.freeze(level)
+    if (levels) Object.freeze(levels)
+  }
+  return Object.freeze(book)
+}
+
+test('cached book evaluation preserves exact strict thresholds and recomputes fills when trade notional changes', () => {
+  const evaluate = createLiquidityEvaluator(), config = only('slippage')
+  config.depth.enabled = true
+  config.depth.minUSDT = 200
+  config.slippage.notionalUSDT = 200.2
+  const book = freezeBook({ asks: [['100', '1'], ['100.2', '1']], bids: [['100', '3']] })
+  const input = fixture({ instrument: { ...instrument, ctVal: '1' }, book, config })
+  for (const [maximum, status] of [[0.099999, 'failed'], [0.1, 'failed'], [0.100001, 'verified']] as const) {
+    config.slippage.maxPercent = maximum
+    const result = assertCachedLiquidity(evaluate, input)
+    assert.equal(result.askSlippage, 0.1)
+    assert.equal(result.status, status, 'A cached exact 0.1% fill must retain the strict decimal comparison.')
+  }
+  for (const [minimum, status] of [[200.199999, 'verified'], [200.2, 'unknown'], [200.200001, 'unknown']] as const) {
+    config.depth.minUSDT = minimum
+    const result = assertCachedLiquidity(evaluate, input)
+    assert.equal(result.checks.find(check => check.key === 'depth')?.status, status)
+  }
+  config.depth.enabled = false
+  config.slippage.maxPercent = 10
+  for (const [notional, slippage] of [[100, 0], [200.2, 0.1], [250, null], [200.2, 0.1]] as const) {
+    config.slippage.notionalUSDT = notional
+    const result = assertCachedLiquidity(evaluate, input)
+    assert.equal(result.askSlippage, slippage)
+    assert.equal(result.depthAsk, 200.2, 'Changing trade size cannot change the observed depth.')
+  }
+  config.slippage.enabled = false
+  assert.equal(assertCachedLiquidity(evaluate, input).status, 'verified')
+  config.slippage.enabled = true
+  assert.equal(assertCachedLiquidity(evaluate, input).askSlippage, 0.1)
+})
+
+test('cached book evaluation respects changed contract units, denomination, instrument identity, and new snapshots', () => {
+  const evaluate = createLiquidityEvaluator(), config = only('slippage')
+  config.depth.enabled = true
+  config.depth.minUSDT = 1
+  config.slippage.notionalUSDT = 150
+  config.slippage.maxPercent = 50
+  const metadata = { ...instrument, ctVal: '1' }
+  const book = freezeBook({ asks: [['100', '1'], ['110', '1']], bids: [['100', '1'], ['90', '1']] })
+  const input = fixture({ instrument: metadata, book, config })
+  const baseline = assertCachedLiquidity(evaluate, input)
+  assert.deepEqual([baseline.depthBid, baseline.depthAsk], [190, 210])
+  for (const units of [
+    { instId: 'BTC-USDT-SWAP', ctVal: '2', ctMult: '1', ctValCcy: 'BTC' },
+    { instId: 'BTC-USDT-SWAP', ctVal: '1', ctMult: '3', ctValCcy: 'BTC' },
+    { instId: 'BTC-USDT-SWAP', ctVal: '100', ctMult: '1', ctValCcy: 'USDT' },
+    { instId: 'BTC-USDT-SWAP', ctVal: '1', ctMult: '', ctValCcy: 'BTC' },
+    { instId: 'ETH-USDT-SWAP', ctVal: '1', ctMult: '1', ctValCcy: 'BTC' },
+    { instId: 'ETH-USDT-SWAP', ctVal: '1', ctMult: '1', ctValCcy: 'ETH' },
+    { instId: 'BTC-USDT-SWAP', ctVal: '1', ctMult: '1', ctValCcy: 'BTC' },
+  ]) {
+    Object.assign(metadata, units)
+    assertCachedLiquidity(evaluate, input)
+  }
+  assert.deepEqual(assertCachedLiquidity(evaluate, input), baseline)
+  const replacement = freezeBook({ asks: [['100', '4']], bids: [['100', '4']] })
+  const updated = assertCachedLiquidity(evaluate, { ...input, book: replacement })
+  assert.deepEqual([updated.depthBid, updated.depthAsk, updated.askSlippage, updated.bidSlippage], [400, 400, 0, 0])
+  const crossed = freezeBook({ asks: [['99', '4']], bids: [['100', '4']] })
+  assert.equal(assertCachedLiquidity(evaluate, { ...input, book: crossed }).status, 'unknown')
+  assert.deepEqual(assertCachedLiquidity(evaluate, input), baseline, 'Revisiting an older immutable snapshot must retain its own exact calculations.')
+})
+
+test('the pure liquidity evaluator recomputes a mutable book without retaining snapshot cache state', () => {
+  const book = { asks: [['100', '200000']], bids: [['100', '200000']] }
+  const input = fixture({ config: only('depth'), book })
+  assert.equal(evaluateLiquidity(input).depthAsk, 200_000)
+  book.asks[0][1] = '300000'
+  const before = structuredClone(input)
+  assert.equal(evaluateLiquidity(input).depthAsk, 300_000)
+  assert.deepEqual(input, before)
 })
 
 test('quote-denominated fill averages convert quote to base rather than counting contracts as coins', () => {

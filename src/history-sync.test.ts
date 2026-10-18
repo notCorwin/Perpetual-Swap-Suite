@@ -801,6 +801,211 @@ test('rolling history and warmup keep stable identities and only verify newly ex
   } finally { await sync.close() }
 })
 
+test('rolling boundaries replace queued and active history goals instead of accumulating a backlog', async () => {
+  const asOf = base + 60 * 86_400_000
+  const entered = deferred(), release = deferred()
+  let firstSignal: AbortSignal | undefined
+  const { sync, metadata, store } = create({ now: () => asOf, maxRetainedTerminalTasks: 3,
+    sources: { candles: { async fetchGap(query) {
+      firstSignal ??= query.signal
+      entered.resolve()
+      await new Promise<void>((resolve, reject) => {
+        const abort = () => reject(query.signal.reason)
+        query.signal.addEventListener('abort', abort, { once: true })
+        release.promise.then(() => { query.signal.removeEventListener('abort', abort); resolve() })
+      })
+      return records(query)
+    } } },
+  })
+  try {
+    const first = await sync.enqueueTarget({ ...request, historyDays: 1, warmupCandles: 2, asOf })
+    await within(entered.promise)
+    const updates = await Promise.all(Array.from({ length: 64 }, (_, index) => sync.enqueueTarget({
+      ...request, historyDays: 1, warmupCandles: 2, asOf: asOf + (index + 1) * intervalMS,
+    })))
+    const latest = updates.at(-1)!
+    assert.equal(firstSignal?.aborted, false, 'A valid active page is allowed to persist before the new generation continues.')
+    assert.equal(first.history.id, latest.history.id)
+    assert.equal(first.warmup!.id, latest.warmup!.id)
+    assert.deepEqual(new Set(sync.listTasks().filter(task => ['queued', 'running', 'retry', 'paused'].includes(task.status)).map(task => task.id)),
+      new Set([latest.history.id, latest.warmup!.id]))
+    // A just-cancelled writer may remain protected until its source unwinds.
+    assert.equal(sync.listTasks().length, 2)
+    assert.equal(metadata.listSyncTasks().length, 2)
+    release.resolve()
+    assert.equal((await within(sync.waitFor(latest.history.id))).status, 'completed')
+    assert.equal((await within(sync.waitFor(latest.warmup!.id))).status, 'completed')
+    await within(sync.whenIdle())
+    assert.equal(store.rows.size, 352, 'The accepted old page is retained together with the 64 new tail candles.')
+    assert.equal(metadata.listSyncTasks().length, 2)
+  } finally { release.resolve(); await sync.close() }
+})
+
+test('retention edits update one paused goal and the final range survives restart until explicit resume', async () => {
+  const asOf = base + 60 * 86_400_000
+  const entered = deferred(), release = deferred(), metadata = new MemoryMetadata(), store = new MemoryStore()
+  const options: Partial<HistorySyncOptions> = { metadata, store, now: () => asOf,
+    sources: { candles: { async fetchGap(query) {
+      entered.resolve()
+      await new Promise<void>((resolve, reject) => {
+        const abort = () => reject(query.signal.reason)
+        query.signal.addEventListener('abort', abort, { once: true })
+        release.promise.then(() => { query.signal.removeEventListener('abort', abort); resolve() })
+      })
+      return records(query)
+    } } },
+  }
+  await store.appendCandles([candle(base)])
+  let sync = create(options).sync
+  try {
+    const initial = await sync.enqueueTarget({ ...request, historyDays: 2, warmupCandles: 2, asOf })
+    await within(entered.promise)
+    await sync.pause(initial.history.id)
+    assert.equal(sync.getTask(initial.history.id)?.status, 'paused')
+    const shorter = await sync.enqueueTarget({ ...request, historyDays: 1, warmupCandles: 2, asOf })
+    assert.equal(sync.getTask(initial.history.id)?.status, 'paused')
+    const expanded = await sync.enqueueTarget({ ...request, historyDays: 2, warmupCandles: 2, asOf })
+    assert.equal(expanded.history.id, initial.history.id)
+    assert.equal(shorter.history.id, initial.history.id)
+    assert.equal(sync.getTask(shorter.history.id)?.status, 'paused')
+    await sync.close()
+    sync = create(options).sync
+    await sync.start()
+    assert.deepEqual(new Set(sync.listTasks().filter(task => ['queued', 'running', 'retry'].includes(task.status)).map(task => task.id)),
+      new Set([expanded.warmup!.id]))
+    assert.equal(sync.getTask(expanded.history.id)?.from, expanded.history.from)
+    assert.equal(sync.getTask(expanded.history.id)?.status, 'paused')
+    assert.equal(store.rows.size, 1)
+    await sync.resume(expanded.history.id)
+    release.resolve()
+    assert.equal((await within(sync.waitFor(expanded.history.id))).status, 'completed')
+    assert.equal((await within(sync.waitFor(expanded.warmup!.id))).status, 'completed')
+    await within(sync.whenIdle())
+    assert.equal(store.rows.size, 579)
+    assert.ok(store.rows.has(`${request.instrument}:${request.timeframe}:${base}`))
+  } finally { release.resolve(); await sync.close() }
+})
+
+test('restart compacts legacy rolling backlogs by latest intent and preserves exact foreground checkpoints', async () => {
+  const metadata = new MemoryMetadata(), store = new MemoryStore()
+  const seed = create({ metadata, store }).sync
+  const seedTask = await seed.enqueue(request)
+  await seed.waitFor(seedTask.id); await seed.close()
+  const template = metadata.getSyncTask(seedTask.id)!
+  metadata.tasks.clear()
+  const legacy = (bounds: HistoryRange, purpose: HistoryTask['purpose'], requestedAt: number, priority: 'foreground' | 'background' = 'background', instrument = request.instrument) => {
+    const id = createHash('sha256').update(JSON.stringify([instrument, request.timeframe, request.source, bounds.from, bounds.through])).digest('hex')
+    const task = { ...template, ...bounds, id, instrument, purpose, priority, status: 'queued' as const, remaining: [bounds],
+      createdAt: base, updatedAt: base + 1_000 - requestedAt, targetRequestedAt: base + requestedAt }
+    metadata.putSyncTask(task)
+    return task
+  }
+  for (let index = 0; index < 12; index++) {
+    legacy({ from: base + index * intervalMS, through: base + (index + 2) * intervalMS }, 'history', index)
+    legacy({ from: base + (100 + index) * intervalMS, through: base + (100 + index) * intervalMS }, 'warmup', index)
+  }
+  const exact = legacy({ from: base + 20 * intervalMS, through: base + 20 * intervalMS }, 'requested', 20)
+  const foreground = legacy({ from: base + 30 * intervalMS, through: base + 31 * intervalMS }, 'history', 30, 'foreground')
+  legacy(request, 'history', 40, 'background', 'OTHER-USDT-SWAP')
+  const { sync } = create({ metadata, store })
+  try {
+    await sync.start()
+    const tasks = sync.listTasks()
+    assert.equal(tasks.length, 5)
+    assert.equal(tasks.find(task => task.instrument === request.instrument && task.purpose === 'history')?.from, base + 11 * intervalMS)
+    assert.equal(tasks.find(task => task.purpose === 'warmup')?.from, base + 111 * intervalMS)
+    assert.equal(sync.getTask(exact.id)?.purpose, 'requested')
+    assert.equal(sync.getTask(foreground.id)?.purpose, 'requested')
+    assert.equal(sync.getTask(foreground.id)?.priority, 'foreground')
+    assert.ok(tasks.every(task => !('targetRequestedAt' in task)))
+    assert.equal(metadata.listSyncTasks().length, 5)
+    await within(sync.whenIdle())
+    assert.ok(sync.listTasks().every(task => task.status === 'completed'))
+  } finally { await sync.close() }
+})
+
+test('rolling replacement preserves registered exact waiters and foreground upgrades, and disabling warmup retires its old goal', async () => {
+  const asOf = base + 60 * 86_400_000, entered = deferred(), release = deferred()
+  const { sync } = create({ now: () => asOf, sources: { candles: { async fetchGap(query) {
+    entered.resolve()
+    await release.promise
+    return records(query)
+  } } } })
+  try {
+    const first = await sync.enqueueTarget({ ...request, historyDays: 1, warmupCandles: 2, asOf })
+    const result = sync.waitFor(first.history.id)
+    await within(entered.promise)
+    const promoted = await sync.enqueue({ ...first.warmup!, priority: 'foreground' })
+    const exact = await sync.enqueue({ ...request, from: base, through: base })
+    const second = await sync.enqueueTarget({ ...request, historyDays: 1, warmupCandles: 2, asOf: asOf + intervalMS })
+    const latest = await sync.enqueueTarget({ ...request, historyDays: 1, warmupCandles: 0, asOf: asOf + 2 * intervalMS })
+    assert.equal(latest.warmup, null)
+    assert.equal(sync.getTask(first.history.id)?.status, 'running')
+    assert.equal(sync.getTask(promoted.id)?.priority, 'foreground')
+    assert.equal(sync.getTask(exact.id)?.status, 'queued')
+    assert.equal(second.history.id, latest.history.id)
+    assert.equal(second.warmup!.id, promoted.id)
+    assert.equal(sync.getTask(second.history.id)?.status, 'running')
+    assert.equal(sync.getTask(second.warmup!.id)?.priority, 'foreground', 'Explicit consumers retain their accepted warmup work.')
+    release.resolve()
+    assert.equal((await within(result)).status, 'completed')
+    assert.equal((await within(sync.waitFor(promoted.id))).status, 'completed')
+    assert.equal((await within(sync.waitFor(exact.id))).status, 'completed')
+    assert.equal((await within(sync.waitFor(latest.history.id))).status, 'completed')
+    await within(sync.whenIdle())
+  } finally { release.resolve(); await sync.close() }
+})
+
+test('an exact background request that reuses a rolling range is protected before registering its waiter', async () => {
+  const asOf = base + 60 * 86_400_000, entered = deferred(), release = deferred()
+  const { sync } = create({ now: () => asOf, sources: { candles: { async fetchGap(query) {
+    entered.resolve()
+    await release.promise
+    return records(query)
+  } } } })
+  try {
+    const first = await sync.enqueueTarget({ ...request, historyDays: 1, warmupCandles: 0, asOf })
+    await within(entered.promise)
+    const exact = await sync.enqueue({ ...request, from: first.history.from, through: first.history.through })
+    assert.notEqual(exact.id, first.history.id, 'Exact callers own an independent completion barrier.')
+    assert.equal(exact.purpose, 'requested')
+    const next = await sync.enqueueTarget({ ...request, historyDays: 1, warmupCandles: 0, asOf: asOf + intervalMS })
+    assert.equal(sync.getTask(exact.id)?.status, 'queued')
+    release.resolve()
+    assert.equal((await within(sync.waitFor(exact.id))).status, 'completed')
+    assert.equal((await within(sync.waitFor(next.history.id))).status, 'completed')
+    await within(sync.whenIdle())
+  } finally { release.resolve(); await sync.close() }
+})
+
+test('close joins every admitted rolling goal checkpoint before its metadata owner can close', async () => {
+  const entered = deferred(), release = deferred(), saved = new MemoryMetadata()
+  let first = true, ownerClosed = false
+  const writes: boolean[] = []
+  const metadata = {
+    getSyncTask: (id: string) => saved.getSyncTask(id),
+    listSyncTasks: () => saved.listSyncTasks(),
+    deleteSyncTask: (id: string) => saved.deleteSyncTask(id),
+    async putSyncTask(task: HistoryTask) {
+      if (first) { first = false; entered.resolve(); await release.promise }
+      writes.push(ownerClosed)
+      return saved.putSyncTask(task)
+    },
+  }
+  const { sync } = create({ metadata })
+  const target = sync.enqueueTarget({ ...request, historyDays: 1, warmupCandles: 0, asOf: base + 60 * 86_400_000 })
+  try {
+    await within(entered.promise)
+    const closing = sync.close().then(() => { ownerClosed = true })
+    release.resolve()
+    await within(Promise.all([target, closing]))
+    assert.equal(ownerClosed, true)
+    assert.equal(writes.length, 1)
+    assert.deepEqual(writes, [false])
+    assert.ok(saved.listSyncTasks()[0].id.startsWith('target-'))
+  } finally { release.resolve(); await sync.close() }
+})
+
 test('result retention preserves active and queued work and delivers registered waiters before expiry', async () => {
   let now = base
   const entered = deferred(), release = deferred()
@@ -1260,5 +1465,135 @@ test('inspection generation checks also reject an old result after the target mo
     assert.deepEqual(result.unavailableRanges, [])
     assert.equal(inspections, 2)
     assert.ok(store.rows.has(`${request.instrument}:5m:${base + intervalMS}`))
+  } finally { release.resolve(); await sync.close() }
+})
+
+test('completed rolling target admission serializes coverage checks before accepting a new range', async () => {
+  const store = new VersionedMemoryStore(), entered = deferred(), release = deferred()
+  await store.appendCandles(records({ ...request, priority: 'background', signal: new AbortController().signal, cursor: null }))
+  const { sync } = create({ store })
+  try {
+    const target = await sync.enqueue({ ...request, purpose: 'history' })
+    await sync.waitFor(target.id); await sync.whenIdle()
+    store.changed(base)
+    const read = store.missingCandleRanges.bind(store)
+    let block = true, newAdmitted = false
+    store.missingCandleRanges = async query => {
+      if (block) { block = false; entered.resolve(); await release.promise }
+      return read(query)
+    }
+    const old = sync.enqueue({ ...request, purpose: 'history' })
+    await within(entered.promise)
+    const next = sync.enqueue({ ...request, purpose: 'history', from: base + intervalMS, through: base + 3 * intervalMS }).then(task => { newAdmitted = true; return task })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(newAdmitted, false)
+    assert.equal(sync.getTask(target.id)?.through, request.through)
+    release.resolve()
+    assert.equal((await within(old)).through, request.through)
+    const accepted = await within(next)
+    assert.notEqual(accepted.status, 'completed', 'The old coverage result cannot complete the new missing tail.')
+    assert.equal((await within(sync.waitFor(target.id))).status, 'completed')
+    assert.ok(store.rows.has(`${request.instrument}:5m:${base + 3 * intervalMS}`))
+  } finally { release.resolve(); await sync.close() }
+})
+
+test('startup uses the latest legacy retention intent when old progress timestamps are newer', async () => {
+  const metadata = new MemoryMetadata(), store = new VersionedMemoryStore()
+  const seed = create({ metadata, store }).sync
+  const seeded = await seed.enqueue(request)
+  await seed.waitFor(seeded.id); await seed.close()
+  const template = metadata.getSyncTask(seeded.id)!
+  metadata.tasks.clear()
+  const through = base + 200 * intervalMS
+  for (const [from, requestedAt, updatedAt] of [[base, base + 1, base + 999_999], [base + 100 * intervalMS, base + 2, base + 2]]) {
+    const id = createHash('sha256').update(JSON.stringify([request.instrument, request.timeframe, request.source, from, through])).digest('hex')
+    metadata.putSyncTask({ ...template, id, from, through, purpose: 'history', status: 'queued', remaining: [{ from, through }], targetRequestedAt: requestedAt, updatedAt } as HistoryTask)
+  }
+  const { sync } = create({ metadata, store })
+  try {
+    await sync.start()
+    const restored = sync.listTasks()
+    assert.equal(restored.length, 1)
+    assert.equal(restored[0].from, base + 100 * intervalMS)
+    assert.ok(!('targetRequestedAt' in restored[0]))
+    await within(sync.whenIdle())
+  } finally { await sync.close() }
+})
+
+test('disabling automatic warmup cancels its background goal without cancelling the active history page', async () => {
+  const entered = deferred(), release = deferred()
+  const { sync } = create({ sources: { candles: { async fetchGap(query) { entered.resolve(); await release.promise; return records(query) } } } })
+  const target = { ...request, historyDays: 1, warmupCandles: 2, asOf: base + 60 * 86_400_000 }
+  try {
+    const first = await sync.enqueueTarget(target)
+    await within(entered.promise)
+    const disabled = await sync.enqueueTarget({ ...target, warmupCandles: 0 })
+    assert.equal(disabled.history.id, first.history.id)
+    assert.equal(disabled.warmup, null)
+    assert.equal(sync.getTask(first.warmup!.id)?.status, 'cancelled')
+    assert.equal(sync.getTask(first.history.id)?.status, 'running')
+    release.resolve()
+    assert.equal((await within(sync.waitFor(first.history.id))).status, 'completed')
+  } finally { release.resolve(); await sync.close() }
+})
+
+test('a moved paused rolling checkpoint restarts with bounded conservative progress before it is resumed', async () => {
+  const entered = deferred(), store = new VersionedMemoryStore(), metadata = new MemoryMetadata()
+  let sync = create({ store, metadata, sources: { candles: { async fetchGap(query) {
+    entered.resolve()
+    return new Promise<CandleRecord[]>((_, reject) => query.signal.addEventListener('abort', () => reject(query.signal.reason), { once: true }))
+  } } } }).sync
+  try {
+    const original = await sync.enqueue({ ...request, purpose: 'history' })
+    await within(entered.promise)
+    await sync.pause(original.id); await sync.whenIdle()
+    const bounds = { from: base + intervalMS, through: base + 4 * intervalMS }
+    const moved = await sync.enqueue({ ...request, ...bounds, purpose: 'history' })
+    assert.equal(moved.status, 'paused')
+    assert.deepEqual(metadata.getSyncTask(original.id)?.remaining, [bounds])
+    assert.equal(metadata.getSyncTask(original.id)?.cursorRange, null)
+    await sync.close()
+    sync = create({ store, metadata }).sync
+    await sync.start()
+    assert.equal(sync.getTask(original.id)?.status, 'paused')
+    assert.deepEqual(sync.getTask(original.id)?.remaining, [bounds])
+    await sync.resume(original.id)
+    assert.equal((await within(sync.waitFor(original.id))).status, 'completed')
+    assert.ok(store.rows.has(`${request.instrument}:5m:${bounds.through}`))
+  } finally { await sync.close() }
+})
+
+test('a rolling window moved during an old coverage read can quit and restart before any page completes', async () => {
+  const entered = deferred(), release = deferred(), store = new VersionedMemoryStore()
+  class CheckedMetadata extends MemoryMetadata {
+    override putSyncTask(task: HistoryTask) {
+      assert.ok([...task.remaining, ...(task.cursorRange ? [task.cursorRange] : [])].every(bounds => bounds.from >= task.from && bounds.through <= task.through), 'Every durable checkpoint must fit its own current target bounds.')
+      return super.putSyncTask(task)
+    }
+  }
+  const metadata = new CheckedMetadata()
+  const read = store.missingCandleRanges.bind(store)
+  let block = true, fetches = 0
+  store.missingCandleRanges = async query => {
+    if (block) { block = false; entered.resolve(); await release.promise }
+    return read(query)
+  }
+  let sync = create({ store, metadata, sources: { candles: { fetchGap(query) { fetches++; return records(query) } } } }).sync
+  try {
+    const original = await sync.enqueue({ ...request, purpose: 'history' })
+    await within(entered.promise)
+    const bounds = { from: base + intervalMS, through: base + 4 * intervalMS }
+    const moved = await sync.enqueue({ ...request, ...bounds, purpose: 'history' })
+    assert.equal(moved.status, 'running')
+    assert.deepEqual(metadata.getSyncTask(original.id)?.remaining, [bounds])
+    const closing = sync.close()
+    release.resolve()
+    await within(closing)
+    assert.equal(fetches, 0)
+    assert.ok(metadata.getSyncTask(original.id)!.remaining.every(range => range.from >= bounds.from && range.through <= bounds.through))
+    sync = create({ store, metadata }).sync
+    await sync.start()
+    assert.equal((await within(sync.waitFor(original.id))).status, 'completed')
+    assert.ok(store.rows.has(`${request.instrument}:5m:${bounds.through}`))
   } finally { release.resolve(); await sync.close() }
 })

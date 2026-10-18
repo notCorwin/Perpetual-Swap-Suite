@@ -5,6 +5,7 @@ const statuses = new Set(['queued', 'running', 'retry', 'paused', 'cancelled', '
 const terminal = new Set(['paused', 'cancelled', 'completed', 'unavailable'])
 const expirable = new Set(['cancelled', 'completed', 'unavailable'])
 const foregroundReady = Symbol('Foreground history is ready for the source lane.')
+const foregroundBurst = 8
 const targetChanged = Symbol('The rolling history target changed during an asynchronous operation.')
 const clone = value => structuredClone(value)
 const integer = (value, name, minimum = 0) => {
@@ -102,6 +103,9 @@ export class HistorySync {
     this.draining = null
     this.timer = null
     this.active = new Map()
+    this.foregroundPages = new Map()
+    this.targetAdmissions = new Map()
+    this.rollingAdmissions = new Map()
     this.wakeDrain = null
     this.lastRequestAt = null
     this.requestTail = Promise.resolve()
@@ -125,7 +129,7 @@ export class HistorySync {
   async restore() {
     const tasks = await this.metadata.listSyncTasks()
     if (!Array.isArray(tasks)) throw new TypeError('metadata.listSyncTasks must return an array.')
-    const obsolete = []
+    const obsolete = [], restoredIntent = new Map()
     for (const saved of tasks) {
       const task = clone(saved)
       descriptor(task)
@@ -148,15 +152,24 @@ export class HistorySync {
         range(bounds, intervals[task.timeframe])
         if (bounds.from < task.from || bounds.through > task.through) throw new TypeError('Persisted progress is outside its history target.')
       }
+      // Old foreground range checkpoints are accepted exact consumers; only
+      // background goals migrate to stable rolling identities.
+      if (task.priority === 'foreground' && task.purpose !== 'requested' && task.id === exactKey(task)) task.purpose = 'requested'
       const canonicalID = key(task)
       if (task.id !== canonicalID && task.id !== exactKey(task)) throw new TypeError('Persisted history task ID does not match its target.')
       if (task.id !== canonicalID) obsolete.push(task.id)
       const existing = this.tasks.get(canonicalID)
       // Replace the old range-keyed rolling queue with the latest desired
       // window. These are coordination rows, never market observations.
+      const intent = { canonical: task.id === canonicalID, requestedAt: task.targetRequestedAt ?? task.createdAt }
+      if (task.targetRequestedAt !== undefined) integer(task.targetRequestedAt, 'targetRequestedAt')
       if (existing && task.purpose !== 'requested') {
-        if (task.through < existing.through || task.through === existing.through && task.updatedAt <= existing.updatedAt) continue
+        const previous = restoredIntent.get(canonicalID)
+        if (Number(intent.canonical) < Number(previous.canonical) || intent.canonical === previous.canonical
+          && (intent.requestedAt < previous.requestedAt || intent.requestedAt === previous.requestedAt && task.through < existing.through)) continue
       } else if (existing) throw new TypeError('Duplicate persisted history task ID.')
+      restoredIntent.set(canonicalID, intent)
+      delete task.targetRequestedAt
       task.id = canonicalID
       this.tasks.set(task.id, task)
       if (task.status === 'running') {
@@ -180,7 +193,24 @@ export class HistorySync {
     await this.pruneTerminalTasks()
   }
 
+  admit(admissions, identity, operation) {
+    const admission = (admissions.get(identity) ?? Promise.resolve()).then(operation)
+    const tail = admission.catch(() => undefined)
+    admissions.set(identity, tail)
+    void tail.then(() => { if (admissions.get(identity) === tail) admissions.delete(identity) })
+    return admission
+  }
+
   async enqueue(input) {
+    if (input?.purpose === 'history' || input?.purpose === 'warmup') {
+      const identity = descriptor(input)
+      await this.start()
+      return this.admit(this.rollingAdmissions, key({ ...identity, purpose: input.purpose }), () => this.enqueueRequest(input))
+    }
+    return this.enqueueRequest(input)
+  }
+
+  async enqueueRequest(input) {
     await this.start()
     this.assertOpen()
     const identity = descriptor(input)
@@ -198,7 +228,9 @@ export class HistorySync {
       if (changedRange) {
         this.targetGenerations.set(id, (this.targetGenerations.get(id) ?? 0) + 1)
         Object.assign(task, bounds)
-        task.remaining = clipped(task.remaining, bounds)
+        // The replacement window has not been verified yet. Persist its full
+        // bounds conservatively; the process-local cache will refine them.
+        task.remaining = [{ ...bounds }]
         task.unavailableRanges = []
         task.inspected = false
         task.cursor = null
@@ -250,11 +282,21 @@ export class HistorySync {
     const asOf = integer(input.asOf ?? this.timestamp(), 'asOf', intervalMS)
     const through = Math.floor(asOf / intervalMS) * intervalMS - intervalMS
     const from = Math.max(0, through - historyDays * 86_400_000 + intervalMS)
-    const history = await this.enqueue({ ...identity, from, through, priority: input.priority, purpose: 'history' })
-    const warmup = warmupCandles && from >= intervalMS
-      ? await this.enqueue({ ...identity, from: Math.max(0, from - warmupCandles * intervalMS), through: from - intervalMS, priority: input.priority, purpose: 'warmup' })
-      : null
-    return { history, warmup }
+    await this.start()
+    // Only admissions for this source/series serialize. Independent targets
+    // still checkpoint together, and no range-keyed cancellation layer remains.
+    return this.admit(this.targetAdmissions, seriesKey(identity), async () => {
+      this.assertOpen()
+      const history = await this.enqueue({ ...identity, from, through, priority: input.priority, purpose: 'history' })
+      const warmup = warmupCandles && from >= intervalMS
+        ? await this.enqueue({ ...identity, from: Math.max(0, from - warmupCandles * intervalMS), through: from - intervalMS, priority: input.priority, purpose: 'warmup' }) : null
+      if (!warmup) {
+        const previous = this.tasks.get(key({ ...identity, purpose: 'warmup' }))
+        if (previous && previous.priority === 'background' && !this.waiters.has(previous.id)
+          && !['completed', 'unavailable', 'cancelled'].includes(previous.status)) await this.cancel(previous.id)
+      }
+      return { history, warmup }
+    })
   }
 
   getTask(id) {
@@ -543,15 +585,18 @@ export class HistorySync {
         const timestamp = this.timestamp()
         const ready = [...this.tasks.values()].filter(task => !this.active.has(task.source)
           && (task.status === 'queued' || (task.status === 'retry' && task.nextAttemptAt <= timestamp)))
-          .sort((a, b) => Number(b.priority === 'foreground') - Number(a.priority === 'foreground'))
+          .sort((a, b) => this.admissionPriority(b) - this.admissionPriority(a))
         for (const task of ready) {
           if (this.active.size >= this.maxConcurrentTasks) break
           if (this.active.has(task.source)) continue
-          const entry = { id: task.id, controller: new AbortController(), promise: null }
+          const entry = { id: task.id, controller: new AbortController(), promise: null,
+            backgroundTurn: task.priority === 'background' && this.admissionPriority(task) === 2, yielded: false }
           this.active.set(task.source, entry)
           entry.promise = this.run(task, entry.controller).catch(error => this.fail(error)).finally(() => {
             this.settle(task)
             this.active.delete(task.source)
+            if (!entry.yielded) this.foregroundPages.set(task.source, task.priority === 'foreground'
+              ? Math.min(foregroundBurst, (this.foregroundPages.get(task.source) ?? 0) + 1) : 0)
             // Move the just-served target behind its peers even when every
             // page has the same createdAt or the target spans thirty days.
             this.tasks.delete(task.id)
@@ -579,6 +624,11 @@ export class HistorySync {
     }
   }
 
+  admissionPriority(task) {
+    // Eight foreground pages buy one bounded background turn on that source.
+    return task.priority === 'foreground' ? 1 : (this.foregroundPages.get(task.source) ?? 0) >= foregroundBurst ? 2 : 0
+  }
+
   async callSource(operation, signal, task) {
     let response
     const admission = this.requestTail.then(async () => {
@@ -590,7 +640,8 @@ export class HistorySync {
       signal.throwIfAborted()
       // Foreground repairs preempt their own source only. Other active sources
       // may depend on this background page, so cross-source yielding can starve.
-      if (task.priority === 'background' && [...this.tasks.values()].some(value => value.source === task.source && value.priority === 'foreground'
+      if (task.priority === 'background' && !this.active.get(task.source)?.backgroundTurn
+        && [...this.tasks.values()].some(value => value.source === task.source && value.priority === 'foreground'
         && (value.status === 'queued' || (value.status === 'retry' && value.nextAttemptAt <= this.timestamp())))) throw foregroundReady
       // Record after synchronous admission so a CPU pause before the source
       // starts cannot shorten the interval before the next request. HTTP
@@ -688,6 +739,7 @@ export class HistorySync {
       await this.save(task)
     } catch (error) {
       if (signal.aborted || error === foregroundReady || error === targetChanged || changed()) {
+        if (error === foregroundReady) this.active.get(task.source).yielded = true
         if (task.status === 'running') {
           task.status = 'queued'
           await this.save(task)
@@ -764,6 +816,7 @@ export class HistorySync {
     this.idleWaiters.splice(0).forEach(waiter => waiter.reject(error))
     this.closing = (async () => {
       await this.started?.catch(() => undefined)
+      await Promise.all([...this.targetAdmissions.values(), ...this.rollingAdmissions.values()])
       await this.draining
       await this.persistTail
     })()
