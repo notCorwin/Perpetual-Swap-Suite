@@ -39,6 +39,8 @@ const fixture = async (now: number) => {
     if (path.endsWith('/public/open-interest')) return response([{ instId, oiUsd: '6000000' }])
     throw new Error(`Unexpected endpoint: ${path}`)
   }, false)
+  // Measure qualification renewal independently of automatic chart-history preparation.
+  service.preparedCharts.setRealtimeSubscriptions = () => undefined
   await service.ready
   service.projectListEntry = async () => null
   service.updateRanking = async () => undefined

@@ -1,5 +1,5 @@
-import type { Bar, PreparedChartBar, PreparedChartMeta, PreparedChartResponse, ReadyChartWindow } from './chart-data.ts'
-import { timeframeMilliseconds, type RadarTimeframe } from './timeframe.ts'
+import type { Bar, PreparedChartBar, PreparedChartLiveUpdate, PreparedChartMeta, PreparedChartResponse, ReadyChartWindow } from './chart-data.ts'
+import { RADAR_TIMEFRAMES, timeframeMilliseconds, type RadarTimeframe } from './timeframe.ts'
 
 const WINDOW_BARS = 96
 const indicatorFields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24'] as const
@@ -35,9 +35,10 @@ function preparedBar(bar: PreparedChartBar, intervalMS: number): PreparedChartBa
 }
 
 function readyWindow(meta: PreparedChartMeta, bars: PreparedChartBar[], endHour: number, liveBar?: Bar, previous?: ReadyChartWindow): ReadyChartWindow {
-  if (previous && previous.liveBar === liveBar && bars.every((bar, index) => previous.bars[index] === bar)) return previous
+  const sameBars = previous && bars.every((bar, index) => previous.bars[index] === bar)
+  if (sameBars && previous.liveBar === liveBar) return previous
   return Object.freeze({
-    key: meta.key, instId: meta.instId, timeframe: meta.timeframe, intervalMS: meta.intervalMS, bars: Object.freeze(bars), endHour,
+    key: meta.key, instId: meta.instId, timeframe: meta.timeframe, intervalMS: meta.intervalMS, bars: sameBars ? previous.bars : Object.freeze(bars), endHour,
     oiState: bars.every(bar => finite(bar.oi)) ? 'ready' : 'unavailable',
     takerState: bars.every(bar => finite(bar.buy) && finite(bar.sell)) ? 'ready' : 'unavailable',
     indicatorState: bars.every(bar => indicatorFields.every(field => finite(bar[field]))) ? 'ready' : 'unavailable',
@@ -91,8 +92,8 @@ export class PreparedChartStore {
   }
 
   /** Compact latest frames belong to navigation candidates, independently of the history LRU. */
-  setUniverse(instIds: readonly string[], timeframe: RadarTimeframe, focusInstId?: string) {
-    this.universe = new Set([...instIds, ...(focusInstId ? [focusInstId] : [])].map(instId => keyFor(instId, timeframe)))
+  setUniverse(instIds: readonly string[], _timeframe: RadarTimeframe, focusInstId?: string) {
+    this.universe = new Set([...instIds, ...(focusInstId ? [focusInstId] : [])].flatMap(instId => RADAR_TIMEFRAMES.map(({ value }) => keyFor(instId, value))))
     for (const key of this.latestFrames.keys()) if (!this.universe.has(key)) this.latestFrames.delete(key)
     for (const [key, entry] of this.series) {
       if (!this.universe.has(key) || this.latestFrames.has(key) || entry.meta.latestEnd === null) continue
@@ -109,6 +110,28 @@ export class PreparedChartStore {
       this.latestFrames.delete(key)
     }
     this.generations.set(key, generation)
+    return true
+  }
+
+  /** Latest-ready notifications never allocate a deep-history cache entry. */
+  ingestLive(update: PreparedChartLiveUpdate): boolean {
+    const key = keyFor(update.instId, update.timeframe), previous = this.latestFrames.get(key)
+    if (!this.universe.has(key) || !previous || update.generation !== previous.meta.generation
+      || !Number.isSafeInteger(update.revision) || update.revision < previous.meta.revision || update.endHour !== previous.window.endHour) return false
+    const incoming = update.liveBar
+    if (incoming !== null && (incoming.confirmed || !validPrice(incoming) || !Number.isSafeInteger(incoming.hour)
+      || incoming.hour % previous.meta.intervalMS !== 0 || incoming.hour <= update.endHour)) return false
+    const liveBar = incoming === null ? undefined : sameBar(previous.window.liveBar, incoming) ? previous.window.liveBar : Object.freeze({ ...incoming })
+    const meta = update.revision === previous.meta.revision ? previous.meta : Object.freeze({ ...previous.meta, revision: update.revision })
+    const window = readyWindow(meta, [...previous.window.bars], update.endHour, liveBar, previous.window)
+    const entry = this.series.get(key)
+    if (entry) {
+      entry.meta = Object.freeze({ ...entry.meta, revision: Math.max(entry.meta.revision, update.revision) })
+      entry.liveBar = liveBar
+      entry.liveRevision = update.revision
+    }
+    this.latestFrames.set(key, { meta, window })
+    if (window !== previous.window || meta !== previous.meta) for (const listener of this.listeners) listener()
     return true
   }
 

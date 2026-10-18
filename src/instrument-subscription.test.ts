@@ -53,6 +53,8 @@ async function fixture(definitions = [instrument()], acquire?: () => Promise<unk
     throw new Error(`Unexpected network acquisition: ${url.pathname}`)
   }
   const service = new MarketService(store, () => preferences, fetcher, false)
+  // Metadata/history-target assertions exclude independent chart-history preparation.
+  service.preparedCharts.setRealtimeSubscriptions = () => undefined
   await service.ready
   projectionIsolation(service)
   const targets: { instId: string; historyDays: number; asOf: number }[] = []

@@ -475,14 +475,15 @@ test('a slow chart source does not block other contracts and remote preparation 
     await f.store.appendCandles(ids.flatMap(id => Array.from({ length: 400 }, (_, index) => candle(first + index * hour, index, '1H', id))))
     f.pipeline.setUniverse(ids.slice(0, 6), '1H', ids[0])
     await waitFor(() => calls.length === 4)
-    assert.deepEqual(calls, ids.slice(0, 4), 'The focused series leads a bounded batch without waiting for its network response.')
-    gates.get(ids[1])!.resolve()
+    const held = calls[0], initial = new Set(calls)
+    assert.equal(initial.size, 4, 'Independent local completion admits four distinct source repairs without waiting for their responses.')
+    gates.get(calls[1])!.resolve()
     await waitFor(() => calls.length === 5)
-    assert.equal(calls[4], ids[4], 'A free lane admits the next contract while the first remains blocked.')
-    gates.get(ids[2])!.resolve()
+    assert.equal(initial.has(calls[4]), false, 'A free lane admits another contract while the first remains blocked.')
+    gates.get(calls[2])!.resolve()
     await waitFor(() => calls.length === 6)
     assert.equal(maximum, 4)
-    for (const id of ids.slice(3, 6)) gates.get(id)!.resolve()
+    for (const id of ids.slice(0, 6)) if (id !== held) gates.get(id)!.resolve()
     await waitFor(() => active === 1)
     f.pipeline.setUniverse(ids, '1H', ids[6])
     await waitFor(() => calls.length === 7)
@@ -1244,4 +1245,95 @@ test('a newly subscribed cached chart reuses idle restore lanes while an older f
     await waitFor(() => Boolean(restarted.cached(`${instId}:1H`)))
     assert.equal(restarted.restoreActive.size, 1, 'The unrelated file remains held while the new chart is already available.')
   } finally { release.resolve(); await restarted?.dispose(); await f.close() }
+})
+
+test('renderer backfill waits for every requested compact file while unrelated canonical and source work stays held', async () => {
+  const f = await fixture(), canonical = deferred(), file = deferred(), frames = ['5m', '15m', '1H']
+  const cold = Array.from({ length: 4 }, (_, index) => `BACKFILL${index}-USDT-SWAP`)
+  let restarted: any, active = 0, fileHeld = false, settled = false
+  try {
+    await f.store.appendCandles(frames.flatMap(timeframe => {
+      const interval = timeframe === '5m' ? step : timeframe === '15m' ? 900_000 : hour
+      const end = Math.floor(Date.now() / interval) * interval - interval
+      return Array.from({ length: 400 }, (_, index) => candle(end - (399 - index) * interval, index, timeframe))
+    }))
+    for (const timeframe of frames) await f.pipeline.local(instId, timeframe)
+    await f.pipeline.dispose()
+    const read = f.store.readChartSnapshot.bind(f.store), candles = f.store.candles.bind(f.store)
+    f.store.readChartSnapshot = async (id: string, timeframe: string) => {
+      if (id === instId && timeframe === '15m') { fileHeld = true; await file.promise }
+      return read(id, timeframe)
+    }
+    f.store.candles = async (query: any, priority: any) => {
+      if (query.instrument === instId) throw new Error('Compact backfill cannot replay canonical history.')
+      active += 1; await canonical.promise
+      return candles(query, priority)
+    }
+    restarted = createPipeline(f.store)
+    restarted.streaming = () => true
+    restarted.setRealtimeSubscriptions([...cold.map(instId => ({ instId, timeframe: '1H' })), ...frames.map(timeframe => ({ instId, timeframe }))])
+    await waitFor(() => active === 4 && fileHeld)
+    const pending = restarted.backfillUniverse([instId], '15m', instId).then((response: any) => { settled = true; return response })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(settled, false, 'An in-flight requested compact file must join the renderer handshake.')
+    file.resolve()
+    const response = await pending
+    assert.deepEqual(response.frames.map((frame: any) => frame.timeframe).sort(), frames.toSorted())
+    assert.equal(response.frames[0].timeframe, '15m')
+    assert.equal(active, 4, 'Backfill completes while every unrelated canonical lane remains held.')
+    assert.equal(restarted.nextCalculation, 0)
+  } finally { file.resolve(); canonical.resolve(); await restarted?.dispose(); await f.close() }
+})
+
+test('renderer backfill resolves missing artifacts without waiting for a held source request', async () => {
+  const f = await fixture(), release = deferred()
+  let started = false
+  f.pipeline.history.latest = async () => { started = true; await release.promise; return {} }
+  try {
+    f.pipeline.setUniverse([instId], '1H', instId)
+    await waitFor(() => started)
+    const response = await f.pipeline.backfillUniverse([instId], '1H', instId)
+    assert.deepEqual(response, { frames: [] })
+    assert.equal(f.pipeline.remoteActive.size, 1, 'The source stays pending independently of renderer admission.')
+    assert.equal(f.pipeline.restoreWaiters.size, 0)
+  } finally { release.resolve(); await f.close() }
+})
+
+test('a newer renderer universe cannot strand an older queued restore handshake or restore its membership', async () => {
+  const release = deferred(), ids = Array.from({ length: 16 }, (_, index) => `RESTOREHELD${index}-USDT-SWAP`)
+  let active = 0
+  const pipeline = createPipeline({
+    async readChartSnapshot(id: string) { if (id.startsWith('RESTOREHELD')) { active += 1; await release.promise }; return null },
+    async candles() { return [] },
+  })
+  try {
+    pipeline.setRealtimeSubscriptions(ids.map(instId => ({ instId, timeframe: '1H' })))
+    await waitFor(() => active === 16)
+    const older = pipeline.backfillUniverse([instId], '15m', instId)
+    assert.equal(pipeline.restoreWaiters.size, 3)
+    const newer = pipeline.backfillUniverse([], '1H')
+    assert.deepEqual(await newer, { frames: [] })
+    release.resolve()
+    assert.deepEqual(await older, { frames: [] })
+    assert.deepEqual([...pipeline.requestedIDs], [], 'Finishing an old request never reapplies its captured membership.')
+    assert.equal(pipeline.restoreWaiters.size, 0)
+  } finally { release.resolve(); await pipeline.dispose() }
+})
+
+test('shutdown settles a queued renderer backfill before unrelated active file reads finish', async () => {
+  const release = deferred(), ids = Array.from({ length: 16 }, (_, index) => `SHUTDOWNHELD${index}-USDT-SWAP`)
+  let active = 0
+  const pipeline = createPipeline({ async readChartSnapshot() { active += 1; await release.promise; return null } })
+  try {
+    pipeline.setRealtimeSubscriptions(ids.map(instId => ({ instId, timeframe: '1H' })))
+    await waitFor(() => active === 16)
+    const pending = pipeline.backfillUniverse([instId], '15m', instId)
+    const rejected = assert.rejects(pending, /closed/)
+    const closing = pipeline.dispose()
+    await rejected
+    assert.equal(pipeline.restoreWaiters.size, 0)
+    assert.equal(active, 16)
+    release.resolve()
+    await closing
+  } finally { release.resolve(); await pipeline.dispose() }
 })

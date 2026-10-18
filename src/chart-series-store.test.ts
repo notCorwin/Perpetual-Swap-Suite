@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import type { Bar, PreparedChartBar, PreparedChartResponse } from './chart-data.ts'
+import type { Bar, PreparedChartBar, PreparedChartLiveUpdate, PreparedChartResponse } from './chart-data.ts'
 import { PreparedChartStore } from './chart-series-store.ts'
+import { timeframeMilliseconds } from './timeframe.ts'
 
 const hour = 3_600_000
 const instId = 'BTC-USDT-SWAP'
@@ -132,6 +133,74 @@ test('live data stays separate from confirmed windows and never leaks into histo
   assert.equal(store.window(instId, '1H')?.liveBar, undefined)
 })
 
+test('forming-only subscription deltas retain the exact frozen completed window and clear their overlay', () => {
+  const store = new PreparedChartStore()
+  store.setUniverse([instId], '1H')
+  store.ingestLatest(response(bars(104, 96)))
+  const completed = store.window(instId, '1H')!
+  const live: Bar = { ...bar(200), confirmed: false }
+  const delta: PreparedChartLiveUpdate = { type: 'live', instId, timeframe: '1H', generation: 1, revision: 2, endHour: 199 * hour, liveBar: live }
+  assert.equal(store.ingestLive(delta), true)
+  const next = store.window(instId, '1H')!
+  assert.equal(next.bars, completed.bars, 'A forming update does not clone or rebuild any completed observation.')
+  assert.equal(next.endHour, completed.endHour)
+  assert.ok(next.bars.every((bar, index) => bar === completed.bars[index]))
+  assert.equal(completed.liveBar, undefined)
+  assert.equal(next.liveBar?.close, 101)
+  live.close = 100.5
+  assert.equal(next.liveBar?.close, 101, 'Transport objects cannot mutate a presented overlay.')
+  assert.ok(Object.isFrozen(next) && Object.isFrozen(next.liveBar) && Object.isFrozen(next.bars))
+  assert.equal(store.size, 0, 'Forming updates do not allocate deep navigation history.')
+  assert.equal(store.ingestLive({ ...delta, revision: 3, liveBar: null }), true)
+  assert.equal(store.window(instId, '1H')?.bars, completed.bars)
+  assert.equal(store.window(instId, '1H')?.liveBar, undefined)
+  assert.equal(next.liveBar?.close, 101, 'Clearing a newer overlay preserves the prior immutable view.')
+})
+
+test('forming deltas require an existing exact generation and completed end and reject stale or malformed input', () => {
+  const store = new PreparedChartStore()
+  store.setUniverse([instId], '1H')
+  const live: Bar = { ...bar(200), confirmed: false }
+  const delta: PreparedChartLiveUpdate = { type: 'live', instId, timeframe: '1H', generation: 1, revision: 10, endHour: 199 * hour, liveBar: live }
+  assert.equal(store.ingestLive(delta), false, 'A delta cannot authorize its own completed source frame.')
+  store.ingestLatest(response(bars(104, 96), { revision: 10 }))
+  const previous = store.window(instId, '1H')
+  for (const invalid of [
+    { ...delta, generation: 2 },
+    { ...delta, generation: 0 },
+    { ...delta, revision: 9 },
+    { ...delta, revision: 10.5 },
+    { ...delta, endHour: 198 * hour },
+    { ...delta, liveBar: { ...live, hour: 199 * hour } },
+    { ...delta, liveBar: { ...live, hour: 200 * hour + 1 } },
+    { ...delta, liveBar: { ...live, confirmed: true } },
+    { ...delta, liveBar: { ...live, close: 200 } },
+  ]) {
+    assert.equal(store.ingestLive(invalid), false)
+    assert.equal(store.window(instId, '1H'), previous)
+  }
+  assert.equal(store.ingestLatest(response(bars(104, 96), { generation: 2 })), true, 'A rejected delta cannot poison a later complete generation.')
+  assert.equal(store.ingestLive({ ...delta, generation: 2 }), true)
+  assert.equal(store.size, 0)
+})
+
+test('forming deltas preserve deep durable history bounds when compact latest outlives raw bar pressure', () => {
+  const store = new PreparedChartStore({ maxBarsPerSeries: 96 })
+  store.setUniverse([instId], '1H')
+  store.ingestLatest(response(bars(104, 96), { oldestHour: null }))
+  store.ingest(response(bars(0, 96), { endHour: 95 * hour, latestEnd: 199 * hour, oldestHour: 0, historyExhausted: true, revision: 2 }))
+  const historical = store.window(instId, '1H', 95 * hour)!
+  assert.equal(store.snapshotMeta(instId, '1H')?.oldestHour, 0)
+  assert.equal(store.snapshotMeta(instId, '1H')?.historyExhausted, true)
+  assert.equal(store.ingestLive({ type: 'live', instId, timeframe: '1H', generation: 1, revision: 3, endHour: 199 * hour,
+    liveBar: { ...bar(200), confirmed: false } }), true)
+  assert.equal(store.snapshotMeta(instId, '1H')?.oldestHour, 0, 'A compact overlay cannot erase a durable listing boundary.')
+  assert.equal(store.snapshotMeta(instId, '1H')?.historyExhausted, true)
+  assert.equal(store.snapshotMeta(instId, '1H')?.revision, 3)
+  assert.equal(store.window(instId, '1H', 95 * hour), historical)
+  assert.equal(historical.liveBar, undefined)
+})
+
 test('ready boundaries represent complete ranges and prefetch fills gaps without moving a window', () => {
   const store = new PreparedChartStore()
   store.ingest(response([...bars(0, 100), ...bars(200, 100)]))
@@ -247,6 +316,38 @@ test('the complete navigation universe retains compact latest frames independent
   store.setUniverse([ids[0]], '1H')
   assert.equal(store.latestSize, 1, 'Candidates removed from navigation release their compact memory.')
   assert.ok(held.bars.every(value => value.close === 200))
+})
+
+test('native timeframe changes retain every candidate compact frame and release removed membership', () => {
+  const store = new PreparedChartStore({ maxSeries: 2 })
+  const ids = Array.from({ length: 20 }, (_, index) => `NATIVE${index}-USDT-SWAP`)
+  const frames = ['5m', '15m', '1H'] as const
+  store.setUniverse(ids, '15m')
+  for (const [index, id] of ids.entries()) for (const timeframe of frames) {
+    const intervalMS = timeframeMilliseconds(timeframe)
+    assert.equal(store.ingestLatest(response(bars(104, 96, intervalMS).map(bar => ({ ...bar, close: 200 + index, high: 201 + index })), {
+      instId: id, timeframe, intervalMS,
+    })), true)
+  }
+  assert.equal(store.latestSize, ids.length * frames.length)
+  assert.equal(store.size, 0, 'Pinning native frames does not allocate navigation histories.')
+  const held = store.window(ids[0], '15m')!
+  for (const timeframe of frames) {
+    store.setUniverse(ids.toReversed(), timeframe)
+    for (const [index, id] of ids.entries()) for (const native of frames) {
+      const ready = store.window(id, native)!
+      assert.equal(ready.timeframe, native)
+      assert.equal(ready.bars.length, 96)
+      assert.ok(ready.bars.every(bar => bar.close === 200 + index))
+    }
+  }
+  assert.equal(store.window(ids[0], '15m'), held, 'Period changes preserve immutable compact window identity.')
+  store.setUniverse([ids[0]], '5m')
+  assert.equal(store.latestSize, 3)
+  for (const timeframe of frames) {
+    assert.equal(store.window(ids[1], timeframe), null)
+    assert.ok(store.window(ids[0], timeframe))
+  }
 })
 
 test('ready latest does not advance to an unprepared raw tail and generation changes invalidate both caches', () => {

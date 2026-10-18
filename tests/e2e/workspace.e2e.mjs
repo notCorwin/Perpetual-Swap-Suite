@@ -164,6 +164,18 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   await page.waitForFunction(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 133)
   assert.equal(Number(await chart.getAttribute('data-chart-rendered-bars')), 96)
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow).length), before, 'A pushed forming candle must update the prepared chart without a window request.')
+  const liveUpdate = await page.evaluate(() => {
+    const snapshot = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot
+    globalThis.__completedSubscriptionBars = snapshot.bars
+    return { type: 'live', instId: snapshot.instId, timeframe: snapshot.timeframe, generation: 2, revision: 2,
+      endHour: snapshot.endHour, liveBar: { ...snapshot.liveBar, high: 136, close: 135 } }
+  })
+  const reads = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length)
+  assert.equal('bars' in liveUpdate, false, 'A forming update must not transfer completed candles.')
+  await electron.evaluate(({ BrowserWindow }, update) => BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', update), liveUpdate)
+  await page.waitForFunction(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 135)
+  assert.equal(await page.evaluate(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot.bars === globalThis.__completedSubscriptionBars), true)
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Live-only subscriptions must reuse the completed frame without a follow-up read.')
 })
 
 test('a healthy idle market list makes no periodic snapshot requests', async () => {

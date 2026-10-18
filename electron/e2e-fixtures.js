@@ -197,8 +197,16 @@ export async function seedInstrumentNavigationBenchmark(store, marketService) {
     const ticker = { instId, last: String(latest.close), open24h: String(series['1H'].bars.at(-25).open), low24h: String(latest.low - 2), high24h: String(latest.high + 2), bidPx: String(latest.close - .01), askPx: String(latest.close + .01), volCcy24h: '500000' }
     const result = { eligible: true, turnover: 90_000_000 + instrumentIndex * 1_000_000, oiUSD: 8_000_000, spread: .005, depth: 300_000, slippage: .02 }
     marketService.instruments.set(instId, instrument)
-    catalog.push({ instrument, ticker, result, change24h: instrumentIndex + .1 })
-    instruments.push({ instId, series })
+    // Source freshness has dedicated acceptance tests. Keep this synthetic
+    // market available while all 48 first-ever canonical checkpoints are built,
+    // including under an intentionally busy storage/indicator worker.
+    catalog.push({ instrument, ticker, result, change24h: instrumentIndex + .1,
+      observedAt: savedAt, expiresAt: savedAt + 10 * 60_000 })
+    // The navigation acceptance only draws latest windows. Keep the oracle's
+    // full canonical calculation above, then send its 96 visible values rather
+    // than transferring all 61,440 history bars through the measurement driver.
+    instruments.push({ instId, series: Object.fromEntries(Object.entries(series).map(([frame, value]) => [frame,
+      { ...value, bars: value.bars.slice(-96) }])) })
     marketService.markChartDataChanged(instId)
   }
   marketService.catalogUpdatedAt = savedAt
@@ -208,5 +216,6 @@ export async function seedInstrumentNavigationBenchmark(store, marketService) {
   for (const instId of instIds) await marketService.projectListEntry(instId, '1H')
   marketService.error = ''
   marketService.lastRefreshAt = savedAt
-  return { instIds, timeframes, timeframe: '1H', intervalMS: HOUR, end, periods, instruments }
+  return { instIds, timeframes, timeframe: '1H', intervalMS: HOUR, end, periods, instruments,
+    seedStartedAt: savedAt, seedCompletedAt: Date.now() }
 }

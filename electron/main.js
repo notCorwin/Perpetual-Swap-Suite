@@ -179,10 +179,22 @@ async function startDesktop() {
     testMode ? e2eLiveRefresh ? delayedOfflineE2EFetch : offlineE2EFetch : fetch, !testMode, { metadata })
   await marketService.ready
   if (shuttingDown) return
+  const preparedFrames = new Map()
+  let preparedUniverse = marketService.preparedCharts.universe
+  const confirmedFields = ['generation', 'endHour', 'latestEnd', 'oldestHour', 'historyExhausted', 'oiState', 'takerState', 'indicatorState', 'error', 'unavailable']
   marketService.subscribePreparedCharts(frame => {
-    if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('radar:chart-prepared', frame)
+    const key = `${frame.instId}:${frame.timeframe}`, previous = preparedFrames.get(key)
+    const liveOnly = Number.isSafeInteger(frame.endHour) && previous && previous.bars === frame.bars && confirmedFields.every(field => previous[field] === frame[field])
+    preparedFrames.set(key, frame)
+    if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('radar:chart-prepared', liveOnly
+      ? { type: 'live', instId: frame.instId, timeframe: frame.timeframe, generation: frame.generation, revision: frame.revision, endHour: frame.endHour, liveBar: frame.liveBar ?? null }
+      : frame)
   })
   marketService.subscribeMarket(() => {
+    if (preparedUniverse !== marketService.preparedCharts.universe) {
+      preparedUniverse = marketService.preparedCharts.universe
+      for (const key of preparedFrames.keys()) if (!preparedUniverse.has(key)) preparedFrames.delete(key)
+    }
     if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('radar:market-changed')
   })
   marketService.subscribeAudit(report => {

@@ -24,6 +24,8 @@ const fixture = async () => {
   for (const rule of Object.values(preferences.liquidity)) rule.enabled = false
   let requests = 0
   const service = new MarketService(store, () => preferences, async () => { requests++; throw new Error('Unexpected source request.') }, false)
+  // These tests observe qualification events, not independent chart-history preparation.
+  service.preparedCharts.setRealtimeSubscriptions = () => undefined
   await service.ready
   service.projectListEntry = async () => null
   service.updateRanking = async () => undefined

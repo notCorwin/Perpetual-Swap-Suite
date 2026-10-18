@@ -29,6 +29,8 @@ export class PreparedChartPipeline {
   projectListSeries(instId: string, timeframe: HistoryTimeframe): Promise<{ end: number | null; bars: Bar[]; bollExpansion: { hours: number; complete: boolean } | null }>
   /** Set renderer priorities and return all cached native frames for its contracts. */
   setUniverse(instIds: string[], timeframe: HistoryTimeframe, focusInstId?: string): { frames: PreparedChartResponse[] }
+  /** Wait only for requested contracts' compact file restoration, never canonical calculation or source acquisition. */
+  backfillUniverse(instIds: string[], timeframe: HistoryTimeframe, focusInstId?: string): Promise<{ frames: PreparedChartResponse[] }>
   /** Proactively restores and prepares all subscribed series, independently of renderer selection and the full-history LRU. */
   setRealtimeSubscriptions(subscriptions: { instId: string; timeframe: HistoryTimeframe }[]): void
   /** Reassess actual source deadlines after connection or subscription changes. */

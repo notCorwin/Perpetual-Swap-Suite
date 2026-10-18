@@ -14,7 +14,7 @@ import { reconcileMarketRows } from '@/market-snapshot'
 import { SnapshotOrder } from '@/snapshot-order'
 import { DEFAULT_PREFERENCES, type Preferences } from '@/renderer-preferences'
 import type { MarketSnapshot, RankedMarketRow, UnchangedSnapshot } from '@/desktop-contract'
-import type { PreparedChartResponse } from '@/chart-data'
+import type { PreparedChartNotification } from '@/chart-data'
 import type { RadarTimeframe } from '@/timeframe'
 import { cn } from '@/lib/utils'
 
@@ -69,7 +69,7 @@ function App() {
   const timeframe = preferences.chartTimeframe
 
   useEffect(() => {
-    const receive = (event: Event) => chartController.ingestPrepared((event as CustomEvent<PreparedChartResponse>).detail)
+    const receive = (event: Event) => chartController.ingestPrepared((event as CustomEvent<PreparedChartNotification>).detail)
     window.addEventListener('radar-chart-prepared', receive)
     return () => window.removeEventListener('radar-chart-prepared', receive)
   }, [])
@@ -118,8 +118,15 @@ function App() {
         if ((!snapshot.timeframe || snapshot.timeframe === timeframe) && order.current.accept(snapshot)) {
           revision.current = order.current.revision
           if (!('unchanged' in snapshot)) {
-            setRows(current => reconcileMarketRows(current, snapshot.rows) as RankedMarketRow[])
             const unverified = snapshot.loading && qualificationPending(snapshot.catalogProgress) || snapshot.error || snapshot.catalogSource === 'none' || (snapshot.catalogProgress?.unknown ?? 0) > 0
+            // Admit every native timeframe and recover missed startup pushes
+            // before exposing selectable rows. This reads existing compact
+            // frames; background history preparation remains independent.
+            const first = snapshot.rows.reduce<RankedMarketRow | null>((best, row) => !best || compareRankingChange(row, best) < 0 ? row : best, null)
+            const retained = !snapshot.rows.length && unverified ? chartController.getSnapshot().requested?.instId : undefined
+            await chartController.setUniverse(retained ? [retained] : snapshot.rows.map(row => row.instId), timeframe, retained ?? first?.instId)
+            if (stopped) return
+            setRows(current => reconcileMarketRows(current, snapshot.rows) as RankedMarketRow[])
             setSelected(current => snapshot.rows.some(row => row.instId === current) || (!snapshot.rows.length && unverified) ? current : snapshot.rows.reduce<RankedMarketRow | null>((first, row) => !first || compareRankingChange(row, first) < 0 ? row : first, null)?.instId ?? null)
             setReady(true)
           }
@@ -194,8 +201,13 @@ function App() {
     }
   }, [preferences.liquidity])
   const changeTimeframe = useCallback((chartTimeframe: RadarTimeframe) => {
-    void savePreferences({ chartTimeframe }).catch(cause => setPreferencesError(message(cause)))
-  }, [savePreferences])
+    const previous = preferences.chartTimeframe
+    setPreferences(current => ({ ...current, chartTimeframe }))
+    void savePreferences({ chartTimeframe }).catch(cause => {
+      setPreferences(current => current.chartTimeframe === chartTimeframe ? { ...current, chartTimeframe: previous } : current)
+      setPreferencesError(message(cause))
+    })
+  }, [preferences.chartTimeframe, savePreferences])
 
   return <WorkspaceViewport>
     <aside data-market-list className="flex h-full w-[420px] shrink-0 flex-col border-r" aria-label="Contract list">

@@ -36,6 +36,17 @@ export type PreparedChartResponse = {
   error: string
 }
 
+export type PreparedChartLiveUpdate = {
+  type: 'live'
+  instId: string
+  timeframe: RadarTimeframe
+  generation: PreparedChartGeneration
+  revision: number
+  endHour: number
+  liveBar: Bar | null
+}
+export type PreparedChartNotification = PreparedChartResponse | PreparedChartLiveUpdate
+
 export type PreparedChartMeta = Readonly<{
   key: string; instId: string; timeframe: RadarTimeframe; intervalMS: number
   generation: PreparedChartGeneration; revision: number

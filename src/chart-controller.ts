@@ -1,5 +1,5 @@
 import { PreparedChartStore } from './chart-series-store.ts'
-import type { PreparedChartResponse, ReadyChartWindow } from './chart-data.ts'
+import type { PreparedChartNotification, PreparedChartResponse, ReadyChartWindow } from './chart-data.ts'
 import { timeframeMilliseconds, type RadarTimeframe } from './timeframe.ts'
 
 export type ChartTarget = { instId: string; timeframe: RadarTimeframe; end: number | null }
@@ -22,7 +22,7 @@ export type ChartTransport = {
 }
 const targetKey = (target: ChartTarget) => `${target.timeframe}:${target.instId}:${target.end ?? 'latest'}`
 const sameSeries = (left: ChartTarget, right: ChartTarget) => left.instId === right.instId && left.timeframe === right.timeframe
-const seriesKey = (target: ChartTarget) => `${target.timeframe}:${target.instId}`
+const seriesKey = (target: Pick<ChartTarget, 'instId' | 'timeframe'>) => `${target.timeframe}:${target.instId}`
 
 /** Local navigation never waits for provider work. Each remote lane keeps only the latest intent. */
 export class ChartController {
@@ -40,8 +40,11 @@ export class ChartController {
   private historyChecked = new Map<string, string>()
   private historyHydrated = new Map<string, string>()
   private universeIds: string[] = []
-  private universeTimeframe: RadarTimeframe = '1H'
   private universeKey = ''
+  private universeRequest = 0
+  private universeTask: Promise<void> = Promise.resolve()
+  private notificationVersion = 0
+  private notificationVersions = new Map<string, number>()
   private refresh = false
   private timer: ReturnType<typeof setTimeout> | null = null
   private prefetchAfter = 0
@@ -62,21 +65,40 @@ export class ChartController {
 
   setUniverse(instIds: readonly string[], timeframe: RadarTimeframe, focusInstId?: string) {
     const ids = [...new Set(instIds.filter(Boolean))]
-    const key = JSON.stringify([timeframe, ...ids.toSorted()])
+    const key = JSON.stringify(ids.toSorted())
     this.universeIds = ids
-    this.universeTimeframe = timeframe
     const focus = focusInstId ?? (this.view.requested?.timeframe === timeframe ? this.view.requested.instId : undefined)
     this.store.setUniverse(ids, timeframe, focus)
-    if (key === this.universeKey) return
+    if (key === this.universeKey) return this.universeTask
     this.universeKey = key
-    void this.transport.universe(ids, timeframe, focus).then(({ frames }) => {
-      for (const frame of frames) this.store.ingestLatest(frame)
+    const request = ++this.universeRequest
+    const admittedAt = this.notificationVersion
+    this.universeTask = this.transport.universe(ids, timeframe, focus).then(({ frames }) => {
+      if (request !== this.universeRequest) return
+      for (const frame of frames) this.store.ingestLatest(this.preservePushedLive(frame, admittedAt))
       if (this.active) { this.commit(); void this.pump() }
-    }).catch(() => {})
+    }).catch(() => { if (request === this.universeRequest) this.universeKey = '' })
+    return this.universeTask
   }
 
-  ingestPrepared(response: PreparedChartResponse) {
-    if (!this.store.ingestLatest(response)) return
+  ingestPrepared(response: PreparedChartNotification) {
+    if ('type' in response) {
+      if (!this.store.ingestLive(response)) return
+    } else if (!this.store.ingestLatest(response)) return
+    this.notificationVersions.set(seriesKey(response), ++this.notificationVersion)
+    const live = 'type' in response
+    this.preparedChanged(response, live)
+  }
+
+  private preservePushedLive(response: PreparedChartResponse, admittedAt: number): PreparedChartResponse {
+    if ((this.notificationVersions.get(seriesKey(response)) ?? 0) <= admittedAt) return response
+    const meta = this.store.snapshotMeta(response.instId, response.timeframe)
+    const latest = this.store.window(response.instId, response.timeframe)
+    return meta?.generation === response.generation && meta.revision >= response.revision && latest?.endHour === response.latestEnd
+      ? { ...response, liveBar: latest.liveBar } : response
+  }
+
+  private preparedChanged(response: Pick<PreparedChartResponse, 'instId' | 'timeframe'>, live = false) {
     const target = this.view.requested
     if (this.active && target?.instId === response.instId && target.timeframe === response.timeframe) {
       if (this.commit()) {
@@ -85,7 +107,7 @@ export class ChartController {
         this.refresh = false
         this.clearTimer()
       }
-      void this.pump()
+      if (!live) void this.pump()
     }
   }
 
@@ -100,7 +122,7 @@ export class ChartController {
     this.direction = -1
     this.prefetchAfter = 0
     this.clearTimer()
-    this.store.setUniverse(this.universeTimeframe === timeframe ? this.universeIds : [], timeframe, instId)
+    this.store.setUniverse(this.universeIds, timeframe, instId)
     this.publish({ ...this.view, unavailable: null })
     this.setTarget({ instId, timeframe, end: null })
     return () => {
@@ -227,9 +249,9 @@ export class ChartController {
     // never prevent an already saved range from entering the renderer cache.
     const watermark = this.historyWatermark(target)
     const historyKey = `${targetKey(target)}:${watermark}`
-    if (this.transport.history) {
-      const needsHistory = !ready && this.historyChecked.get(key) !== historyKey
-        || ready && this.historyHydrated.get(key) !== watermark
+    if (this.transport.history && (!ready || target.end !== null)) {
+      const needsHistory = this.historyHydrated.get(key) !== watermark
+        || !ready && this.historyChecked.get(key) !== historyKey
       if (needsHistory) {
         // Bound local work while allowing a newly selected series to bypass
         // one older read. Further selections coalesce in view.requested.
@@ -256,7 +278,7 @@ export class ChartController {
       void this.run(target, ready ? 'refresh' : 'target')
       return
     }
-    const job = this.maintenanceTarget || this.demandTargets.has(key) ? null : this.prefetchTarget(target)
+    const job = target.end === null || this.maintenanceTarget || this.demandTargets.has(key) ? null : this.prefetchTarget(target)
     if (job) { this.maintenanceTarget = job; void this.run(job, 'prefetch') }
     const cooldown = this.prefetchAfter - Date.now()
     if (cooldown > 0 && this.timer === null) this.wake(cooldown)
@@ -265,9 +287,10 @@ export class ChartController {
   private async hydrateLocal(target: ChartTarget) {
     const key = seriesKey(target)
     this.localTargets.add(key)
+    const admittedAt = this.notificationVersion
     try {
       const response = await this.transport.local(target.instId, target.timeframe)
-      if (response) this.ingestPrepared(response)
+      if (response && this.store.ingestLatest(this.preservePushedLive(response, admittedAt))) this.preparedChanged(response)
     } catch { /* A local miss still has the independent foreground preparation lane. */ }
     finally {
       this.localTargets.delete(key)
@@ -284,10 +307,11 @@ export class ChartController {
   private async hydrateHistory(target: ChartTarget, checkedKey: string, watermark: string) {
     const key = seriesKey(target)
     this.historyTargets.add(key)
+    const admittedAt = this.notificationVersion
     try {
       const response = await this.transport.history!(target)
       if (response) {
-        const accepted = this.store.ingest(response)
+        const accepted = this.store.ingest(this.preservePushedLive(response, admittedAt))
         const meta = this.store.snapshotMeta(target.instId, target.timeframe)
         // A newer compact notification can arrive while this bulk read is in
         // flight. Its revision must not certify older historical observations.
@@ -308,6 +332,7 @@ export class ChartController {
     let failed = false
     let unavailableRetryAt: number | null = null
     const startedAt = performance.now()
+    const admittedAt = this.notificationVersion
     try {
       const response = await this.transport.prepare(job)
       const elapsed = performance.now() - startedAt
@@ -319,7 +344,7 @@ export class ChartController {
           unavailableRetryAt = response.unavailable.retryAt
         } else if (kind === 'prefetch') this.prefetchAfter = Math.max(Date.now() + 5_000, response.unavailable.retryAt)
       } else {
-        const accepted = this.store.ingest(response)
+        const accepted = this.store.ingest(this.preservePushedLive(response, admittedAt))
         if (accepted && job.end !== null) {
           // Historical responses already carry the bounded durable navigation
           // range. Do not immediately serialize the same bulk history again.

@@ -209,6 +209,9 @@ export async function measurePaintLatency(page, { inputs, targets }) {
 
 export async function waitForLocalHistory(electron, page, fixture, timeframe = fixture.timeframe) {
   const preparedBars = fixture.series[timeframe].bars.filter(bar => bar.ema !== null).length
+  // Latest selection consumes only its subscribed compact frame. Request
+  // historical navigation with the same wheel gesture a user would make.
+  await wheelBurst(page, { deltaY: 12 })
   const deadline = Date.now() + 20_000
   while (true) {
     const requests = await readRequestProbe(electron)
@@ -221,6 +224,8 @@ export async function waitForLocalHistory(electron, page, fixture, timeframe = f
   await page.evaluate(async () => {
     for (let frame = 0; frame < 2; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve))
   })
+  await wheelBurst(page, { deltaY: -12 })
+  await waitForRendered(page, fixture, timeframe)
   return preparedBars
 }
 
@@ -383,6 +388,9 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
   await installRequestProbe(electron, fixture.instId, { initialHistoryBars, historicalDelayMS })
   try {
     await openChart(page, fixture)
+    // Admit the bounded durable range through an actual history gesture;
+    // opening latest deliberately performs no deep-history IPC.
+    await wheelBurst(page, { deltaY: 12 })
     const timeOrigin = await page.evaluate(() => performance.timeOrigin)
     const deadline = Date.now() + 20_000
     let initial
@@ -393,6 +401,8 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
       await new Promise(resolve => setTimeout(resolve, 20))
     } while (true)
     await page.evaluate(async () => { for (let index = 0; index < 2; index += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
+    await wheelBurst(page, { deltaY: -12 })
+    await waitForRendered(page, fixture)
     assert.deepEqual(initial.calls.filter(call => Number.isFinite(call.endHour)), [],
       'The cold boundary must still be beyond the idle prefetch runway before wheel input.')
     await startPaintProbe(page, fixture)

@@ -76,6 +76,8 @@ const fixture = async (config: ReturnType<typeof preferences>, fetcher: typeof f
       return socket
     },
   })
+  // Raw collection assertions exclude independent chart-history preparation.
+  service.preparedCharts.setRealtimeSubscriptions = () => undefined
   await service.ready
   service.projectListEntry = async () => null
   service.updateRanking = async () => undefined

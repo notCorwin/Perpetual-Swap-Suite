@@ -131,19 +131,49 @@ const disabled = () => {
 const instId = 'BTC-USDT-SWAP'
 const instrument = { instId, instType: 'SWAP', instCategory: '1', settleCcy: 'USDT', ctType: 'linear', state: 'live', ctVal: '0.01', ctMult: '1', ctValCcy: 'BTC', ruleType: 'normal' }
 const ticker = { instId, last: '100', bidPx: '99.99', askPx: '100', open24h: '90', high24h: '110', low24h: '80', volCcy24h: '999999999' }
+const isolateChartPreparation = (service: MarketService) => {
+  // Qualification/ranking assertions measure their own I/O, independently of chart background work.
+  service.preparedCharts.setRealtimeSubscriptions = () => undefined
+}
 const fixture = async (preferences = disabled(), fetcher: typeof fetch = async () => { throw new Error('Unexpected network request.') }, options = {}) => {
   const root = await mkdtemp(join(tmpdir(), 'perp-service-integrated-'))
   const store = await MarketStore.open(root)
   const service = new MarketService(store, () => preferences, fetcher, false, options)
+  const prepareSubscriptions = service.preparedCharts.setRealtimeSubscriptions.bind(service.preparedCharts)
+  isolateChartPreparation(service)
   await service.ready
   // Broad background targets are tested by MarketHistory; service tests control their source universe explicitly.
   service.history.target = async () => []
   const close = async () => { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
-  return { root, store, service, preferences, close }
+  const resumeChartPreparation = () => { service.preparedCharts.setRealtimeSubscriptions = prepareSubscriptions; service.updateSubscriptions() }
+  return { root, store, service, preferences, close, resumeChartPreparation }
 }
 const localCatalog = (service: MarketService, ids = [instId]) => service.replaceCatalog(ids.map(id => ({
   instrument: { ...instrument, instId: id }, ticker: { ...ticker, instId: id }, result: { eligible: true, status: 'verified', turnover: 40_000_000 },
 })))
+
+test('all candidate contracts prepare every native chart timeframe independently of qualification and selection', async () => {
+  const f = await fixture(), other = 'ETH-USDT-SWAP', frames = ['5m', '15m', '1H']
+  try {
+    f.service.instruments.set(other, { ...instrument, instId: other })
+    f.service.candidateIDs = new Set([instId, other])
+    localCatalog(f.service)
+    f.resumeChartPreparation()
+    const expected = [instId, other].flatMap(id => frames.map(timeframe => `${id}:${timeframe}`)).sort()
+    assert.deepEqual([...f.service.preparedCharts.realtimeKeys].sort(), expected)
+    assert.deepEqual([...f.service.realtime.subscriptions.values()].map(({ instId, timeframe }: any) => `${instId}:${timeframe}`).sort(), expected)
+    assert.equal(f.service.catalog.has(other), false, 'The second contract has no qualified list row or chart selection.')
+    assert.deepEqual(f.service.chartSubscriptions, [])
+
+    const timestamp = Math.floor(Date.now() / hour) * hour
+    const row = { ...nativeCandle(timestamp, '1H', 123), instrument: other, confirmed: false }
+    await f.service.realtime.options.onForming(row, { signal: new AbortController().signal, receivedAt: Date.now() })
+    assert.equal(f.service.liveCandles.get(`${other}:1H`).close, 123)
+    assert.equal(f.service.preparedCharts.liveStates.get(`${other}:1H`).live.close, 123, 'An unselected contract reaches the exact chart working set through the native callback.')
+    await f.service.setChartUniverse([instId], '15m', instId)
+    assert.deepEqual([...f.service.preparedCharts.realtimeKeys].sort(), expected, 'Focusing a qualified chart cannot remove any candidate subscription.')
+  } finally { await f.close() }
+})
 
 test('snapshot versions omit unchanged rows, detect status changes, and isolate collector sessions', async () => {
   const f = await fixture()
@@ -541,6 +571,7 @@ test('restored renewal targets include prior qualification without turning every
     ])
     await f.service.dispose()
     restored = new MarketService(f.store, () => f.preferences, async () => { throw new Error('Offline') }, false)
+    isolateChartPreparation(restored)
     await restored.ready
     assert.deepEqual((await restored.snapshot()).rows, [], 'Cached expired or unknown contracts remain hidden.')
     assert.deepEqual([...restored.renewalTargets.keys()].sort(), [instId, priorID].sort())
@@ -592,6 +623,7 @@ test('SQLite catalogue restore enforces config key and expiry while historical c
     await f.service.persistCandles(instId, Array.from({ length: 300 }, (_, index) => ({ ...rawCandle(first + index * fiveMinutes), oi: 100, buy: 10, sell: 8, statisticsVersion: 1 })))
     await f.service.dispose()
     restored = new MarketService(f.store, () => f.preferences, async () => { throw new Error('Offline') }, false)
+    isolateChartPreparation(restored)
     await restored.ready
     assert.equal((await restored.snapshot()).rows.length, 1)
     restored.catalog.get(instId).expiresAt = Date.now() - 1
@@ -841,6 +873,7 @@ test('persisted confirmed ranking is available on restart and never reused for a
     let requests = 0
     const offline: typeof fetch = async () => { requests += 1; throw new Error('Offline') }
     restored = new MarketService(f.store, () => f.preferences, offline, false)
+    isolateChartPreparation(restored)
     restored.projectListEntry = async () => null
     await restored.ready
     assert.equal(restored.listRowsFor('15m')[0].rankingChange, ranking.rankingChange)
@@ -849,6 +882,7 @@ test('persisted confirmed ranking is available on restart and never reused for a
     await restored.dispose()
     f.preferences.rankingLookback = 30
     restored = new MarketService(f.store, () => f.preferences, offline, false)
+    isolateChartPreparation(restored)
     restored.projectListEntry = async () => null
     await restored.ready
     assert.equal(restored.listRowsFor('15m')[0].rankingChange, null)
@@ -1149,6 +1183,7 @@ test('audit startup restores one versioned selected report and shutdown stops pu
     const saved = await f.service.dataAuditRequest({ action: 'status' })
     await f.service.dispose()
     reopened = new MarketService(f.store, () => f.preferences, async () => { throw new Error('Unexpected network request.') }, false)
+    isolateChartPreparation(reopened)
     const restored = await reopened.dataAuditRequest({ action: 'status' })
     assert.equal(restored.id, saved.id)
     assert.equal(restored.phase, 'completed')
@@ -1672,6 +1707,7 @@ test('a rejected contract restored with fresh instrument and liquidity observati
     assert.ok(rejected.instrumentObservation.expiresAt > Date.now(), 'A rejected criterion must preserve its independently fresh instrument metadata.')
     await f.service.dispose()
     restored = new MarketService(f.store, () => configuration, async () => { fetches += 1; throw new Error('Offline') }, false)
+    isolateChartPreparation(restored)
     await restored.ready
     isolateQualification(restored)
     f.store.candles = async () => { reads += 1; throw new Error('Restored verification must use its saved observations.') }

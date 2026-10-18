@@ -3,6 +3,7 @@ import test from 'node:test'
 import { ChartController, type ChartPreparation } from './chart-controller.ts'
 import type { PreparedChartBar, PreparedChartResponse } from './chart-data.ts'
 import { PreparedChartStore } from './chart-series-store.ts'
+import { timeframeMilliseconds, type RadarTimeframe } from './timeframe.ts'
 
 const hour = 3_600_000
 const btc = 'BTC-USDT-SWAP'
@@ -18,7 +19,22 @@ const prepared = (instId: string, end: number, overrides: Partial<PreparedChartR
   oldestHour: null, historyExhausted: false, generation: 1, revision: 1,
   bars: bars(end - 95, 96), oiState: 'ready', takerState: 'ready', indicatorState: 'ready', error: '', ...overrides,
 })
+const nativePrepared = (instId: string, end: number, timeframe: RadarTimeframe, close: number): PreparedChartResponse => {
+  const intervalMS = timeframeMilliseconds(timeframe)
+  return prepared(instId, end, {
+    timeframe, intervalMS, endHour: end * intervalMS, latestEnd: end * intervalMS,
+    bars: bars(end - 95, 96).map(bar => ({ ...bar, hour: bar.hour / hour * intervalMS, close, high: close + 1 })),
+  })
+}
 const settled = () => new Promise<void>(resolve => setImmediate(resolve))
+// Inspecting older candles explicitly admits durable history and its reserve.
+// Returning to latest keeps that already requested work independent of focus.
+const inspectHistory = async (controller: ChartController) => {
+  controller.scroll(-1)
+  await settled()
+  controller.scroll(1)
+  await settled()
+}
 const waitFor = async (predicate: () => boolean, timeout = 500) => {
   const deadline = Date.now() + timeout
   while (!predicate()) {
@@ -56,8 +72,9 @@ test('focused durable history is hydrated once and deep scrolling commits synchr
   const pending: boolean[] = []
   const unsubscribe = controller.subscribe(() => { pending.push(controller.getSnapshot().pending) })
   try {
-    await settled()
+    await inspectHistory(controller)
     assert.equal(localReads, 1)
+    pending.length = 0
     assert.equal(queue.calls.length, 0, 'Resident history outside the prefetch horizon must not need a provider request.')
     for (const steps of [-1_200, -4_000, 3_000, -2_000, 4_200]) {
       const previous = controller.getSnapshot().presented!.endHour
@@ -74,13 +91,13 @@ test('focused durable history is hydrated once and deep scrolling commits synchr
 test('a durable historical read bypasses an unresolved same-series provider request', async () => {
   const queue = transportQueue()
   let reads = 0
-  const controller = new ChartController({ ...queue.transport, history: async target => {
+  const controller = new ChartController({ ...queue.transport, history: async () => {
     reads += 1
-    return target.end === null ? null : prepared(btc, 599, { latestEnd: 1_199 * hour, bars: bars(199, 1_001) })
+    return reads === 1 ? null : prepared(btc, 599, { latestEnd: 1_199 * hour, bars: bars(199, 1_001) })
   } }, cached())
   const close = controller.open(btc, '1H')
   try {
-    await settled()
+    await inspectHistory(controller)
     assert.equal(queue.calls.length, 1, 'A provider prefetch is deliberately left unresolved.')
     controller.scroll(-600)
     await settled()
@@ -103,7 +120,9 @@ test('a local history miss falls through to source repair without a local retry 
     queue.calls[0].resolve(prepared(btc, 199, { bars: bars(0, 200), oldestHour: 0, historyExhausted: true }))
     await settled()
     assert.equal(controller.getSnapshot().pending, false)
-    assert.equal(reads, 2, 'Newly durable observations can warm the cache once after repair.')
+    assert.equal(reads, 1, 'A successful latest frame must not serialize deep history before a scroll gesture.')
+    await inspectHistory(controller)
+    assert.equal(reads, 2, 'Explicit history navigation can read the newly durable revision once.')
     await settled()
     assert.equal(reads, 2)
   } finally { close() }
@@ -115,7 +134,7 @@ test('a bulk prefetch does not immediately transfer the same durable history aga
   const controller = new ChartController({ ...queue.transport, history: async () => { reads += 1; return null } }, cached())
   const close = controller.open(btc, '1H')
   try {
-    await settled()
+    await inspectHistory(controller)
     assert.equal(reads, 1)
     queue.calls[0].resolve(prepared(btc, 1_094, { latestEnd: 1_199 * hour, bars: bars(199, 1_001) }))
     await settled()
@@ -132,13 +151,16 @@ test('a newly selected contract hydrates beside an unresolved local read with bo
   const reads: { target: ChartPreparation; resolve: (value: PreparedChartResponse | null) => void }[] = []
   const controller = new ChartController({ ...queue.transport, history: target => new Promise(resolve => { reads.push({ target, resolve }) }) }, store)
   const closeBTC = controller.open(btc, '1H')
+  controller.scroll(-1)
   const closeETH = controller.open(eth, '1H')
+  controller.scroll(-1)
   let closeSOL = () => {}
   try {
     assert.equal(reads.length, 2)
     assert.equal(reads[1].target.instId, eth)
     store.ingest(prepared('SOL-USDT-SWAP', 1_199))
     closeSOL = controller.open('SOL-USDT-SWAP', '1H')
+    controller.scroll(-1)
     assert.equal(reads.length, 2, 'Further local selections coalesce behind the two admitted reads.')
     assert.equal(queue.calls.length, 0, 'Waiting to preload local data must not start provider work.')
     reads[1].resolve(prepared(eth, 1_199, { bars: bars(199, 1_001) }))
@@ -149,7 +171,7 @@ test('a newly selected contract hydrates beside an unresolved local read with bo
     await settled()
     controller.scroll(-100)
     assert.equal(controller.getSnapshot().presented?.instId, 'SOL-USDT-SWAP')
-    assert.equal(controller.getSnapshot().presented?.endHour, 1_099 * hour)
+    assert.equal(controller.getSnapshot().presented?.endHour, 1_098 * hour)
     reads[0].resolve(prepared(btc, 1_199, { bars: bars(199, 1_001) }))
     await settled()
     assert.equal(controller.getSnapshot().presented?.instId, 'SOL-USDT-SWAP')
@@ -167,15 +189,15 @@ test('revisiting a market preloads again after history eviction while compact la
   controller.setUniverse([btc, eth], '1H')
   await settled()
   const closeBTC = controller.open(btc, '1H')
-  await settled()
+  await inspectHistory(controller)
   const firstEpoch = store.historyEpoch(btc, '1H')
   const closeETH = controller.open(eth, '1H')
-  await settled()
+  await inspectHistory(controller)
   assert.equal(store.historyEpoch(btc, '1H'), 0)
   assert.ok(store.window(btc, '1H'), 'Compact latest survives history eviction.')
   const revisitBTC = controller.open(btc, '1H')
   try {
-    await settled()
+    await inspectHistory(controller)
     assert.deepEqual(reads, [btc, eth, btc])
     assert.ok(store.historyEpoch(btc, '1H') > firstEpoch)
     controller.scroll(-100)
@@ -193,8 +215,10 @@ test('a same-generation statistics correction refreshes deep cached bars without
   const controller = new ChartController({ ...queue.transport, history: async () => { reads += 1; return bulk() } }, store)
   const close = controller.open(btc, '1H')
   try {
-    await settled()
+    await inspectHistory(controller)
     assert.equal(store.window(btc, '1H', 599 * hour)?.bars.at(-1)?.oi, null)
+    controller.scroll(-600)
+    assert.equal(controller.getSnapshot().presented?.endHour, 599 * hour)
     revision = 2
     const latest = prepared(btc, 1_199, { revision })
     controller.ingestPrepared(latest)
@@ -214,6 +238,7 @@ test('a newer compact revision cannot certify an older bulk read still in flight
   const controller = new ChartController({ ...queue.transport, history: () => new Promise(resolve => { reads.push(resolve) }) }, store)
   const close = controller.open(btc, '1H')
   try {
+    controller.scroll(-1)
     controller.ingestPrepared(prepared(btc, 1_199, { revision: 2 }))
     reads[0](prepared(btc, 1_199, { bars: bars(199, 1_001) }))
     await settled()
@@ -320,6 +345,8 @@ test('measured slow preparation increases the reserve for later scrolling', asyn
   const queue = transportQueue()
   const controller = new ChartController(queue.transport, cached())
   const close = controller.open(btc, '1H')
+  controller.scroll(-1)
+  controller.scroll(1)
   try {
     now += 8_000
     queue.calls[0].resolve(prepared(btc, 1_094, { latestEnd: 1_199 * hour, bars: bars(199, 1_001) }))
@@ -338,6 +365,8 @@ test('an uncached jump beyond a slow prefetch starts foreground work immediately
   const queue = transportQueue()
   const controller = new ChartController(queue.transport, cached())
   const close = controller.open(btc, '1H')
+  controller.scroll(-1)
+  controller.scroll(1)
   try {
     assert.equal(queue.calls.length, 1)
     controller.scroll(-1_000)
@@ -358,6 +387,8 @@ test('rapid uncached scrolling preserves the complete frame and prepares only th
   const queue = transportQueue()
   const controller = new ChartController(queue.transport, cached())
   const close = controller.open(btc, '1H')
+  controller.scroll(-1)
+  controller.scroll(1)
   try {
     const original = controller.getSnapshot().presented
     controller.scroll(-600)
@@ -384,6 +415,8 @@ test('reversing to latest cancels obsolete intent without replaying it when olde
   const queue = transportQueue()
   const controller = new ChartController(queue.transport, cached())
   const close = controller.open(btc, '1H')
+  controller.scroll(-1)
+  controller.scroll(1)
   try {
     const latest = controller.getSnapshot().presented
     controller.scroll(-600)
@@ -422,6 +455,8 @@ test('late failures and an old component release cannot replace or deactivate a 
   const queue = transportQueue()
   const controller = new ChartController(queue.transport, cached())
   const closeBTC = controller.open(btc, '1H')
+  controller.scroll(-1)
+  controller.scroll(1)
   const previous = controller.getSnapshot().presented
   const closeETH = controller.open(eth, '1H')
   closeBTC()
@@ -483,6 +518,8 @@ test('a new calculation generation from prefetch retains the painted frame until
   const queue = transportQueue()
   const controller = new ChartController(queue.transport, cached())
   const close = controller.open(btc, '1H')
+  controller.scroll(-1)
+  controller.scroll(1)
   try {
     const previous = controller.getSnapshot().presented!
     queue.calls[0].resolve(prepared(btc, 999, { generation: 2, latestEnd: 1_199 * hour }))
@@ -526,6 +563,37 @@ test('latest mode follows pushed frames atomically and never polls a successfull
     context.mock.timers.tick(600_000)
     await settled()
     assert.equal(queue.calls.length, 0, 'Successful pushed frames must not restart periodic preparation.')
+  } finally { close() }
+})
+
+test('forming-only subscription deltas update the visible overlay without history reads or preparation', async context => {
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
+  const queue = transportQueue()
+  let localCalls = 0, historyCalls = 0
+  const controller = new ChartController({ ...queue.transport,
+    local: async () => { localCalls += 1; return null },
+    history: async () => { historyCalls += 1; return null },
+    universe: async () => ({ frames: [prepared(btc, 199)] }),
+  })
+  await controller.setUniverse([btc], '1H')
+  const close = controller.open(btc, '1H')
+  try {
+    const previous = controller.getSnapshot().presented!
+    controller.ingestPrepared({ type: 'live', instId: btc, timeframe: '1H', generation: 1, revision: 2, endHour: 199 * hour,
+      liveBar: { ...bars(200, 1)[0], confirmed: false, close: 101.5 } })
+    const current = controller.getSnapshot().presented!
+    assert.equal(current.bars, previous.bars)
+    assert.equal(current.liveBar?.close, 101.5)
+    assert.equal(controller.getSnapshot().pending, false)
+    controller.ingestPrepared({ type: 'live', instId: btc, timeframe: '1H', generation: 2, revision: 3, endHour: 199 * hour, liveBar: null })
+    assert.equal(controller.getSnapshot().presented, current, 'A delta cannot replace the completed calculation generation.')
+    controller.ingestPrepared({ type: 'live', instId: btc, timeframe: '1H', generation: 1, revision: 3, endHour: 199 * hour, liveBar: null })
+    assert.equal(controller.getSnapshot().presented?.liveBar, undefined)
+    context.mock.timers.tick(600_000)
+    await settled()
+    assert.equal(localCalls, 0)
+    assert.equal(historyCalls, 0)
+    assert.equal(queue.calls.length, 0)
   } finally { close() }
 })
 
@@ -574,6 +642,7 @@ test('prefetch cooldown resumes prefetch at its deadline without refreshing the 
   context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
   const queue = transportQueue(), controller = new ChartController(queue.transport, cached())
   const close = controller.open(btc, '1H')
+  controller.scroll(-1)
   try {
     const original = controller.getSnapshot().presented
     assert.equal(queue.calls.length, 1)
@@ -650,6 +719,8 @@ test('a stale unavailable response cannot replace the latest requested range', a
   const queue = transportQueue()
   const controller = new ChartController(queue.transport, cached())
   const close = controller.open(btc, '1H')
+  controller.scroll(-1)
+  controller.scroll(1)
   try {
     const previous = controller.getSnapshot().presented
     controller.scroll(-600)
@@ -669,36 +740,118 @@ test('a stale unavailable response cannot replace the latest requested range', a
   } finally { close() }
 })
 
-test('all candidate latest frames switch synchronously beyond the history LRU without resending reordered universes', async () => {
+test('all candidate native timeframes switch synchronously beyond the history LRU without selection IPC', async () => {
   const queue = transportQueue()
-  const ids = Array.from({ length: 20 }, (_, index) => `NAV${index}-USDT-SWAP`)
-  let universeCalls = 0, localCalls = 0
+  const ids = Array.from({ length: 283 }, (_, index) => `NAV${index}-USDT-SWAP`)
+  const timeframes = ['5m', '15m', '1H'] as const
+  let universeCalls = 0, localCalls = 0, historyCalls = 0
   const controller = new ChartController({
     ...queue.transport,
     local: async () => { localCalls += 1; return null },
-    universe: async () => { universeCalls += 1; return { frames: ids.map((id, index) => prepared(id, 199, { bars: bars(104, 96).map(bar => ({ ...bar, close: 200 + index, high: 201 + index })) })) } },
-  })
-  controller.setUniverse(ids, '1H')
-  await settled()
+    history: async () => { historyCalls += 1; return null },
+    universe: async () => { universeCalls += 1; return { frames: ids.flatMap((id, index) => timeframes.map(frame => nativePrepared(id, 199, frame, 200 + index))) } },
+  }, new PreparedChartStore({ maxSeries: 1 }))
+  await controller.setUniverse(ids, '1H')
+  ids.forEach((id, index) => controller.store.ingest(nativePrepared(id, 199, '1H', 200 + index)))
+  assert.equal(controller.store.size, 1, 'Deep history must actually exceed its LRU capacity.')
+  assert.equal(controller.store.latestSize, 849, 'All native latest frames remain pinned independently of history.')
   const releases: Array<() => void> = []
   try {
-    for (const [index, id] of ids.entries()) {
-      releases.push(controller.open(id, '1H'))
-      const view = controller.getSnapshot()
-      assert.equal(view.presented?.instId, id)
-      assert.equal(view.presented?.bars.length, 96)
-      assert.ok(view.presented?.bars.every(bar => bar.close === 200 + index))
-      assert.equal(view.pending, false)
+    for (const timeframe of timeframes) {
+      await controller.setUniverse(ids.toReversed(), timeframe)
+      for (const [index, id] of ids.entries()) {
+        releases.push(controller.open(id, timeframe))
+        const view = controller.getSnapshot()
+        assert.equal(view.presented?.instId, id)
+        assert.equal(view.presented?.timeframe, timeframe)
+        assert.equal(view.presented?.bars.length, 96)
+        assert.ok(view.presented?.bars.every(bar => bar.close === 200 + index))
+        assert.equal(view.pending, false)
+      }
     }
     releases.push(controller.open(ids[0], '1H'))
     assert.equal(controller.getSnapshot().presented?.instId, ids[0])
     assert.equal(controller.getSnapshot().pending, false)
     assert.equal(localCalls, 0)
-    controller.setUniverse(ids.toReversed(), '1H')
+    assert.equal(historyCalls, 0, 'Selection and timeframe changes do not serialize deep history.')
+    await controller.setUniverse(ids.toReversed(), '1H')
     await settled()
     assert.equal(universeCalls, 1, 'Live list reordering must not serialize the whole prepared universe again.')
-    assert.equal(queue.calls.length, 1, 'The held maintenance request does not create a network queue for every selected instrument.')
+    assert.equal(queue.calls.length, 0, 'Warm latest selection does not request history or provider preparation.')
   } finally { releases.forEach(release => release()) }
+})
+
+test('a superseded universe handshake cannot overwrite retained frames or their generation proof', async () => {
+  const queue = transportQueue()
+  const replies: Array<(response: { frames: PreparedChartResponse[] }) => void> = []
+  const controller = new ChartController({ ...queue.transport, universe: () => new Promise(resolve => { replies.push(resolve) }) })
+  const oldHandshake = controller.setUniverse([btc, eth], '1H')
+  const currentHandshake = controller.setUniverse([eth], '15m')
+  replies[1]({ frames: [nativePrepared(eth, 199, '15m', 200)] })
+  await currentHandshake
+  const close = controller.open(eth, '15m')
+  try {
+    const current = controller.getSnapshot().presented!
+    replies[0]({ frames: [
+      { ...nativePrepared(eth, 199, '15m', 300), generation: 999 },
+      nativePrepared(btc, 199, '1H', 400),
+    ] })
+    await oldHandshake
+    assert.equal(controller.getSnapshot().presented, current)
+    assert.equal(controller.store.window(btc, '1H'), null, 'Removed membership cannot be resurrected by an old handshake.')
+    controller.ingestPrepared({ ...nativePrepared(eth, 199, '15m', 201), generation: 2 })
+    assert.ok(controller.getSnapshot().presented?.bars.every(bar => bar.close === 201), 'The discarded reply cannot poison the current generation watermark.')
+    assert.equal(queue.calls.length, 0)
+  } finally { close() }
+})
+
+test('a failed universe handshake can retry unchanged membership without restarting a successful subscription', async () => {
+  const queue = transportQueue()
+  let handshakes = 0
+  const controller = new ChartController({ ...queue.transport, universe: async () => {
+    handshakes += 1
+    if (handshakes === 1) throw new Error('Desktop temporarily unavailable')
+    return { frames: [nativePrepared(btc, 199, '1H', 200)] }
+  } })
+  await controller.setUniverse([btc], '1H')
+  assert.equal(controller.store.window(btc, '1H'), null)
+  await controller.setUniverse([btc], '1H')
+  assert.equal(handshakes, 2, 'An actual failed subscription handshake must remain retryable.')
+  const close = controller.open(btc, '1H')
+  try {
+    assert.equal(controller.getSnapshot().pending, false)
+    await controller.setUniverse([btc], '15m')
+    assert.equal(handshakes, 2, 'Healthy membership does not resubscribe when changing native periods.')
+    assert.equal(queue.calls.length, 0)
+  } finally { close() }
+})
+
+test('a held full-frame handshake cannot rewind or resurrect a newer subscribed forming overlay', async () => {
+  const queue = transportQueue()
+  const replies: Array<(response: { frames: PreparedChartResponse[] }) => void> = []
+  const controller = new ChartController({ ...queue.transport, universe: () => new Promise(resolve => { replies.push(resolve) }) })
+  const stale = prepared(btc, 199, { liveBar: { ...bars(200, 1)[0], confirmed: false, close: 100.5 } })
+  const firstHandshake = controller.setUniverse([btc], '1H')
+  controller.ingestPrepared(prepared(btc, 199))
+  const close = controller.open(btc, '1H')
+  try {
+    controller.ingestPrepared({ type: 'live', instId: btc, timeframe: '1H', generation: 1, revision: 1, endHour: 199 * hour,
+      liveBar: { ...bars(200, 1)[0], confirmed: false, close: 101.5 } })
+    const current = controller.getSnapshot().presented!
+    replies[0]({ frames: [stale] })
+    await firstHandshake
+    assert.equal(controller.getSnapshot().presented?.liveBar, current.liveBar, 'The newer socket observation owns an otherwise identical confirmed frame.')
+    assert.equal(controller.getSnapshot().presented?.liveBar?.close, 101.5)
+
+    const secondHandshake = controller.setUniverse([btc, eth], '1H')
+    controller.ingestPrepared({ type: 'live', instId: btc, timeframe: '1H', generation: 1, revision: 1, endHour: 199 * hour, liveBar: null })
+    replies[1]({ frames: [stale] })
+    await secondHandshake
+    assert.equal(controller.getSnapshot().presented?.liveBar, undefined, 'A late full response cannot resurrect an overlay already cleared by the subscription.')
+    assert.equal(controller.getSnapshot().presented?.bars.length, 96)
+    assert.equal(controller.getSnapshot().pending, false)
+    assert.equal(queue.calls.length, 0)
+  } finally { close() }
 })
 
 test('a local ready selection commits while an old history request remains unresolved', async () => {
@@ -706,6 +859,8 @@ test('a local ready selection commits while an old history request remains unres
   const controller = new ChartController({ ...queue.transport, local: async id => id === eth ? prepared(eth, 299) : null }, cached())
   controller.setUniverse([btc, eth], '1H')
   const closeBTC = controller.open(btc, '1H')
+  controller.scroll(-1)
+  controller.scroll(1)
   const closeETH = controller.open(eth, '1H')
   try {
     assert.equal(queue.calls[0].target.instId, btc)
@@ -723,6 +878,8 @@ test('an uncached different instrument can prepare beside an unresolved old hist
   const controller = new ChartController(queue.transport, cached())
   controller.setUniverse([btc, eth], '1H')
   const closeBTC = controller.open(btc, '1H')
+  controller.scroll(-1)
+  controller.scroll(1)
   const closeETH = controller.open(eth, '1H')
   try {
     await settled()

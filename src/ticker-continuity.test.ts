@@ -92,6 +92,8 @@ const fixture = async (context: TestContext, instruments = [instrument()], optio
   }
   const factory = (url: string) => { const socket = new Socket(url, heldAcknowledgements); sockets.push(socket); return socket }
   const service = new MarketService(store, () => config, fetcher, true, { webSocketFactory: factory, ...(options.requestTimeout ? { requestTimeout: options.requestTimeout } : {}) })
+  // Keep real ticker/candle transport while excluding independent chart-history acquisition.
+  service.preparedCharts.setRealtimeSubscriptions = () => undefined
   const services = new Set([service])
   const prepare = (value: MarketService) => {
     value.history.target = async () => []
@@ -143,6 +145,7 @@ const fixture = async (context: TestContext, instruments = [instrument()], optio
   const qualify = async () => { await advance(100); await waitFor(() => service.streamEvaluations.size === 0 && service.pendingCandidates.size === 0) }
   const reopen = async () => {
     const next = new MarketService(store, () => config, fetcher, false, { webSocketFactory: factory })
+    next.preparedCharts.setRealtimeSubscriptions = () => undefined
     services.add(next); await next.ready; prepare(next)
     next.publicRealtime.start(); next.realtime.start(); await open()
     return next

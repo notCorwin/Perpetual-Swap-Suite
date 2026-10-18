@@ -368,10 +368,11 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
   const wheelPixels = useRef(0)
   const wheelFrame = useRef<number | null>(null)
   const navigationId = useRef(instId)
-  const navigationFrame = useRef<number | null>(null)
+  const navigationTask = useRef<object | null>(null)
   useEffect(() => () => chartAnalysis.stop(instId), [instId, timeframe])
   useLayoutEffect(() => {
     navigationId.current = instId
+    navigationTask.current = null
     wheelPixels.current = 0
     if (wheelFrame.current !== null) window.cancelAnimationFrame(wheelFrame.current)
     wheelFrame.current = null
@@ -384,7 +385,7 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
   }, [surface, releaseInspection])
   useEffect(() => () => {
     if (wheelFrame.current !== null) window.cancelAnimationFrame(wheelFrame.current)
-    if (navigationFrame.current !== null) window.cancelAnimationFrame(navigationFrame.current)
+    navigationTask.current = null
   }, [])
   useLayoutEffect(() => {
     const element = plotRef.current
@@ -419,10 +420,14 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
       const id = chartNavigationTarget(listOrder, turnoverOrder, navigationId.current, event.key)
       if (!id || id === navigationId.current) return
       navigationId.current = id
-      if (navigationFrame.current === null) navigationFrame.current = window.requestAnimationFrame(() => {
-        navigationFrame.current = null
-        flushSync(() => onSelect(navigationId.current))
-      })
+      if (navigationTask.current === null) {
+        const task = navigationTask.current = {}
+        queueMicrotask(() => {
+          if (navigationTask.current !== task) return
+          navigationTask.current = null
+          flushSync(() => onSelect(navigationId.current))
+        })
+      }
     }
     window.addEventListener('keydown', navigate)
     return () => window.removeEventListener('keydown', navigate)

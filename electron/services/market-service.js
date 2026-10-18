@@ -1379,7 +1379,7 @@ export class MarketService {
     if (this.closing || this.disposed) throw new Error('Market service is closed.')
     this.chartSubscriptions = [...new Set(instIds)].map(instId => ({ instId, timeframe }))
     this.updateSubscriptions()
-    return this.preparedCharts.setUniverse(instIds, timeframe, focusInstId)
+    return this.preparedCharts.backfillUniverse(instIds, timeframe, focusInstId)
   }
 
   subscribePreparedCharts(listener) { return this.preparedCharts.subscribe(listener) }

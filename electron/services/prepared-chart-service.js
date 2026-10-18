@@ -62,6 +62,7 @@ export class PreparedChartPipeline {
     this.localQueue = new Map()
     this.restoreQueue = new Map()
     this.restoreTasks = new Map()
+    this.restoreWaiters = new Map()
     this.restoredKeys = new Set()
     this.restoreRunning = null
     this.restoreActive = new Set()
@@ -188,15 +189,44 @@ export class PreparedChartPipeline {
     this.preferredTimeframe = timeframe
     this.focusKey = focusInstId ? seriesKey(focusInstId, timeframe) : null
     this.updateUniverse()
-    const frames = [...this.snapshots.keys()].map(key => this.cached(key)).filter(frame => frame && this.requestedIDs.has(frame.instId))
+    return this.cachedFrames(this.requestedIDs, timeframe)
+  }
+
+  cachedFrames(instIds, timeframe) {
+    const frames = [...this.snapshots.keys()].map(key => this.cached(key)).filter(frame => frame && instIds.has(frame.instId))
       .sort((left, right) => Number(right.timeframe === timeframe) - Number(left.timeframe === timeframe))
     return { frames }
+  }
+
+  /** Backfill renderer admission from compact files only, independently of all source preparation. */
+  async backfillUniverse(instIds, timeframe, focusInstId) {
+    if (this.closed) throw new Error('Prepared chart data service is closed.')
+    this.setUniverse(instIds, timeframe, focusInstId)
+    const requested = new Set([...instIds, ...(focusInstId ? [focusInstId] : [])])
+    const frames = [timeframe, ...['5m', '15m', '1H'].filter(value => value !== timeframe)]
+    const pending = frames.flatMap(timeframe => [...requested].map(instId => {
+      const key = seriesKey(instId, timeframe)
+      if (this.cached(key)) return
+      const active = this.restoreTasks.get(key)
+      if (active) return active.catch(() => undefined)
+      if (this.restoredKeys.has(key)) return
+      return new Promise(resolve => {
+        const waiting = this.restoreWaiters.get(key) ?? new Set()
+        waiting.add(resolve)
+        this.restoreWaiters.set(key, waiting)
+        this.restoreQueue.set(key, { instId, timeframe })
+      })
+    }))
+    void this.drainRestores()
+    await Promise.all(pending)
+    if (this.closed) throw new Error('Prepared chart data service is closed.')
+    return this.cachedFrames(requested, timeframe)
   }
 
   updateUniverse() {
     this.universe = new Map([...this.warmUniverse, ...this.requestedUniverse])
     for (const [key] of this.localQueue) if (!this.universe.has(key)) this.localQueue.delete(key)
-    for (const [key] of this.restoreQueue) if (!this.universe.has(key)) this.restoreQueue.delete(key)
+    for (const [key] of this.restoreQueue) if (!this.universe.has(key) && !this.restoreWaiters.has(key)) this.restoreQueue.delete(key)
     for (const [key] of this.remoteQueue) if (!this.universe.has(key)) this.remoteQueue.delete(key)
     for (const [key] of this.remoteAttempts) if (!this.universe.has(key)) this.remoteAttempts.delete(key)
     for (const [key, target] of this.universe) {
@@ -214,8 +244,10 @@ export class PreparedChartPipeline {
 
   nextKey(queue, eligible = () => true) {
     const keys = [...queue.keys()].filter(eligible)
-    return keys.includes(this.focusKey) ? this.focusKey
-      : keys.find(key => queue.get(key).timeframe === this.preferredTimeframe) ?? keys[0]
+    if (keys.includes(this.focusKey)) return this.focusKey
+    return keys.find(key => this.requestedIDs?.has(queue.get(key).instId) && queue.get(key).timeframe === this.preferredTimeframe)
+      ?? keys.find(key => this.requestedIDs?.has(queue.get(key).instId))
+      ?? keys.find(key => queue.get(key).timeframe === this.preferredTimeframe) ?? keys[0]
   }
 
   emit(frame) {
@@ -248,6 +280,8 @@ export class PreparedChartPipeline {
     const task = this.restoreSnapshot(instId, timeframe, priority).finally(() => {
       this.restoredKeys.add(key)
       if (this.restoreTasks.get(key) === task) this.restoreTasks.delete(key)
+      for (const resolve of this.restoreWaiters.get(key) ?? []) resolve()
+      this.restoreWaiters.delete(key)
     })
     this.restoreTasks.set(key, task)
     return task
@@ -264,7 +298,7 @@ export class PreparedChartPipeline {
       this.restoreQueue.delete(key)
       this.restoreActive.add(key)
       void (async () => {
-        try { await this.restoreOnce(target.instId, target.timeframe, key === this.focusKey ? 'foreground' : 'background') }
+        try { await this.restoreOnce(target.instId, target.timeframe, this.requestedIDs?.has(target.instId) ? 'foreground' : 'background') }
         catch { /* Rebuild a missing or invalid derived checkpoint from durable source rows. */ }
         finally {
           this.restoreActive.delete(key)
@@ -1178,6 +1212,8 @@ export class PreparedChartPipeline {
     this.refreshTimer = null
     this.localQueue.clear()
     this.restoreQueue.clear()
+    for (const waiting of this.restoreWaiters.values()) for (const resolve of waiting) resolve()
+    this.restoreWaiters.clear()
     for (const job of this.canonicalQueue) job.reject(new Error('Prepared chart data service is closed.'))
     this.canonicalQueue = []
     this.remoteQueue.clear()

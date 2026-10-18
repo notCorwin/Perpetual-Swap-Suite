@@ -69,7 +69,7 @@ test('partition scans overlap bounded filesystem reads and retain chronological 
     await waitFor(() => entered.length === 8)
     assert.equal(active, 8, 'Independent partition metadata should overlap without flooding the filesystem.')
     releaseOthers()
-    await waitFor(() => entered.length === rows.length)
+    await waitFor(() => entered.length === rows.length && active === 1)
     assert.equal(active, 1, 'A slow first partition must not stop remaining partitions from being scanned.')
     assert.equal(maximum, 8)
     releaseFirst()
