@@ -30,44 +30,47 @@ test("chart hours retain their position when candles are missing", () => {
   assert.equal(chartHourX(10 * hour, 95 * hour, 0, 960), first + (last - first) * 10 / 95)
 })
 
-test("axis price row preserves its size and places countdown below in open space", () => {
-  assert.deepEqual(chartPriceLabelLayout(60, [10, 110], 20, 12, 3, true), {
-    priceTop: 50, priceHeight: 20, countdownY: 79, top: 50, bottom: 85,
+test("axis price and countdown share one-line spacing and outer padding", () => {
+  assert.deepEqual(chartPriceLabelLayout(60, [10, 110], 10, 2, true), {
+    countdownY: 70, top: 53, bottom: 77,
   })
 })
 
-test("countdown flips above near the lower boundary without moving the price row", () => {
-  assert.deepEqual(chartPriceLabelLayout(100, [10, 110], 20, 12, 3, true), {
-    priceTop: 90, priceHeight: 20, countdownY: 81, top: 75, bottom: 110,
+test("countdown flips above with the same spacing near the lower boundary", () => {
+  assert.deepEqual(chartPriceLabelLayout(100, [10, 110], 10, 2, true), {
+    countdownY: 90, top: 83, bottom: 107,
   })
-  assert.deepEqual(chartPriceLabelLayout(110, [10, 110], 20, 12, 3, true), {
-    priceTop: 100, priceHeight: 10, countdownY: 91, top: 85, bottom: 110,
+  assert.deepEqual(chartPriceLabelLayout(110, [10, 110], 10, 2, true), {
+    countdownY: 100, top: 93, bottom: 110,
   })
 })
 
 test("price background clips at the upper boundary and leaves countdown below", () => {
-  assert.deepEqual(chartPriceLabelLayout(10, [10, 110], 20, 12, 3, true), {
-    priceTop: 10, priceHeight: 10, countdownY: 29, top: 10, bottom: 35,
+  assert.deepEqual(chartPriceLabelLayout(10, [10, 110], 10, 2, true), {
+    countdownY: 20, top: 10, bottom: 27,
   })
 })
 
-test("historical axis labels occupy only their price row", () => {
-  assert.deepEqual(chartPriceLabelLayout(60, [10, 110], 20, 12, 3, false), {
-    priceTop: 50, priceHeight: 20, countdownY: null, top: 50, bottom: 70,
+test("historical axis labels occupy one padded line", () => {
+  assert.deepEqual(chartPriceLabelLayout(60, [10, 110], 10, 2, false), {
+    countdownY: null, top: 53, bottom: 67,
   })
 })
 
 test("countdown is omitted when neither side fits inside a small panel", () => {
-  assert.deepEqual(chartPriceLabelLayout(20, [10, 30], 20, 12, 3, true), {
-    priceTop: 10, priceHeight: 20, countdownY: null, top: 10, bottom: 30,
+  assert.deepEqual(chartPriceLabelLayout(20, [10, 30], 10, 2, true), {
+    countdownY: null, top: 13, bottom: 27,
   })
-  assert.deepEqual(chartPriceLabelLayout(12, [10, 14], 20, 12, 3, true), {
-    priceTop: 10, priceHeight: 4, countdownY: null, top: 10, bottom: 14,
+  assert.deepEqual(chartPriceLabelLayout(12, [10, 14], 10, 2, true), {
+    countdownY: null, top: 10, bottom: 14,
   })
 })
 
-test("a countdown that exactly fits a panel edge remains visible", () => {
-  assert.deepEqual(chartPriceLabelLayout(85, [10, 110], 20, 12, 3, true), {
-    priceTop: 75, priceHeight: 20, countdownY: 104, top: 75, bottom: 110,
+test("a countdown including its padding remains visible at an exact fit", () => {
+  assert.deepEqual(chartPriceLabelLayout(93, [10, 110], 10, 2, true), {
+    countdownY: 103, top: 86, bottom: 110,
+  })
+  assert.deepEqual(chartPriceLabelLayout(27, [10, 40], 10, 2, true), {
+    countdownY: 17, top: 10, bottom: 34,
   })
 })

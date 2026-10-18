@@ -58,10 +58,7 @@ const chartTokenNumber = (token: string, fallback: number) => {
 const chartTokens = {
   textSize: chartTokenNumber('--chart-text-size', 10),
   legendGap: chartTokenNumber('--chart-legend-gap', 24),
-  priceLabelHeight: chartTokenNumber('--chart-price-label-height', 18),
-  countdownTextSize: chartTokenNumber('--chart-countdown-text-size', 9),
-  countdownGap: chartTokenNumber('--chart-countdown-gap', 3),
-  countdownPaddingY: chartTokenNumber('--chart-countdown-padding-y', 2),
+  priceLabelPaddingY: chartTokenNumber('--chart-price-label-padding-y', 3),
 } as const
 const legendContext = document.createElement("canvas").getContext("2d")
 const chartTextWidths = new Map<string, number>()
@@ -85,7 +82,7 @@ const PriceCountdown = memo(function PriceCountdown({ hour, intervalMS, x, y }: 
   }, [])
   const seconds = Math.max(0, Math.floor((hour + intervalMS - now) / 1000))
   const value = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`
-  return <text data-chart-countdown x={x} y={y} dominantBaseline="middle" fill="var(--muted-foreground)" fontSize={chartTokens.countdownTextSize}>{value}</text>
+  return <text data-chart-countdown x={x} y={y} dominantBaseline="middle" fill="var(--muted-foreground)">{value}</text>
 })
 const chartGutter = (bars: readonly Bar[], height: number, liveClose?: number) => {
   const { panels } = chartLayout(0, height)
@@ -151,8 +148,7 @@ export const Plot = memo(function Plot({ bars, liveBar, liveOverlay = false, ins
   const latestY = priceY(tag.price)
   const latestColor = tag.rising ? "var(--positive)" : "var(--negative)"
   const latestPrice = `${price(tag.price)} ${tag.rising ? '↑' : '↓'}`
-  const priceLabel = chartPriceLabelLayout(latestY, panels.price, chartTokens.priceLabelHeight,
-    chartTokens.countdownTextSize * 1.2 + chartTokens.countdownPaddingY * 2, chartTokens.countdownGap, liveOverlay)
+  const priceLabel = chartPriceLabelLayout(latestY, panels.price, chartTokens.textSize, chartTokens.priceLabelPaddingY, liveOverlay)
   const tickHalfHeight = chartTokens.textSize / 2
   const line = (key: keyof Bar, panelKey: Panel, y: (value: number) => number) => {
     const segments: string[] = []

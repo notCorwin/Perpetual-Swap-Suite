@@ -446,6 +446,7 @@ test('the live price overlay follows its actual price without changing the 96 co
         labelBounds: [labelBounds.x, labelBounds.x + labelBounds.width], svgWidth: svg.viewBox.baseVal.width,
         labelFont: getComputedStyle(label).fontSize, tickFont: getComputedStyle(tick).fontSize,
         countdownFont: getComputedStyle(countdown).fontSize,
+        countdownY: Number(countdown.getAttribute('y')),
         countdownFill: getComputedStyle(countdown).fill, tickFill: getComputedStyle(tick).fill,
         labelFill: getComputedStyle(label).fill,
       }
@@ -461,7 +462,8 @@ test('the live price overlay follows its actual price without changing the 96 co
     assert.equal(overlay.backgroundX, overlay.lineEndX, 'The price highlight must meet the plot axis.')
     assert.ok(overlay.labelBounds[0] >= 0 && overlay.labelBounds[1] <= overlay.svgWidth, 'The complete price value must fit inside the SVG.')
     assert.equal(overlay.labelFont, overlay.tickFont)
-    assert.ok(parseFloat(overlay.countdownFont) < parseFloat(overlay.labelFont))
+    assert.equal(overlay.countdownFont, overlay.labelFont, 'Price and countdown must use the same font size.')
+    assert.ok(Math.abs(Math.abs(overlay.countdownY - overlay.labelY) - parseFloat(overlay.labelFont)) < 1e-6, 'The two lines must use single line spacing.')
     assert.equal(overlay.countdownFill, overlay.tickFill, 'The countdown must use the muted axis text color.')
     assert.notEqual(overlay.countdownFill, overlay.labelFill)
     await wheelBurst(page, { deltaY: 12 })
@@ -498,6 +500,8 @@ test('live prices outside the saved domain keep their axis labels inside the pri
           labelY: Number(svg.querySelector('[data-chart-price-label-value]').getAttribute('y')),
           label: bounds('[data-chart-price-label-value]'), background: bounds('[data-chart-price-label-background]'),
           countdown: bounds('[data-chart-countdown]'),
+          countdownY: Number(svg.querySelector('[data-chart-countdown]').getAttribute('y')),
+          fontSize: parseFloat(getComputedStyle(svg.querySelector('[data-chart-price-label-value]')).fontSize),
         }
       })
       assert.equal(geometry.livePrice, livePrice)
@@ -509,7 +513,7 @@ test('live prices outside the saved domain keep their axis labels inside the pri
       for (const bounds of [geometry.label, geometry.countdown]) {
         assert.ok(bounds[0] >= geometry.background[0] && bounds[1] <= geometry.background[1], 'Price and countdown text must share the same background.')
       }
-      assert.ok(geometry.countdown[1] <= geometry.label[0] || geometry.countdown[0] >= geometry.label[1], 'The countdown must not overlap the price text.')
+      assert.ok(Math.abs(Math.abs(geometry.countdownY - geometry.labelY) - geometry.fontSize) < 1e-6, 'Single line spacing must be preserved when the countdown changes sides.')
     } finally { await removePreparedTransform() }
   }
 })
