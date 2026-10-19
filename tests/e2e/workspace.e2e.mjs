@@ -27,7 +27,7 @@ before(async () => {
       instId: `${symbol}-USDT-SWAP`, price: 100, lastPrice: 100, rankingChange, rankingAsOf: 1_800_000_000_000,
       turnover24hUSDT: 50_000_000,
     }))
-    const state = globalThis.__workspaceFixture = { preferences, rows, initialRows: rows, requests: [], revision: 1, loading: false, error: '', catalogSource: 'live', catalogProgress: undefined, failNextSave: false, failSnapshots: 0, staleNextSnapshot: false, staleReplies: 0, chartGeneration: 1, bollMode: 'standard', holdNextSnapshot: false, releaseSnapshot: null, snapshotActive: 0, snapshotMaximum: 0,
+    const state = globalThis.__workspaceFixture = { preferences, analysisSettings: { model: 'fixture/vision', hasAPIKey: false }, rows, initialRows: rows, requests: [], revision: 1, loading: false, error: '', catalogSource: 'live', catalogProgress: undefined, failNextSave: false, failSnapshots: 0, staleNextSnapshot: false, staleReplies: 0, chartGeneration: 1, bollMode: 'standard', holdNextSnapshot: false, releaseSnapshot: null, snapshotActive: 0, snapshotMaximum: 0,
       holdAuditAction: null, releaseAudit: null, heldAuditReply: null,
       holdDownloadAction: null, releaseDownload: null, heldDownloadReply: null,
       historyDownload: { phase: 'idle', startedAt: null, updatedAt: null, finishedAt: null,
@@ -96,7 +96,13 @@ before(async () => {
       if (value.chartLocal) return prepared(value.chartLocal)
       if (value.chartWindow) return prepared(value.chartWindow)
       if (value.captureChart) return { ok: true }
-      if (value.analysisSettings) return { model: '', hasAPIKey: false }
+      if (value.analysisSettings) {
+        if (value.analysisSettings.action === 'save') state.analysisSettings = {
+          model: value.analysisSettings.model, hasAPIKey: Boolean(value.analysisSettings.apiKey) || state.analysisSettings.hasAPIKey,
+        }
+        if (value.analysisSettings.action === 'removeKey') state.analysisSettings.hasAPIKey = false
+        return { ...state.analysisSettings }
+      }
       if (value.historyDownload) {
         const action = value.historyDownload.action
         if (action === 'start') state.publishDownload({ id: 'download-1', phase: 'running', startedAt: 1_800_000_000_000, updatedAt: 1_800_000_001_000, finishedAt: null,
@@ -140,10 +146,50 @@ afterEach(async context => {
   if (process.env.PERPETUAL_SWAP_UI_SCREENSHOTS) await page.screenshot({ path: join(process.env.PERPETUAL_SWAP_UI_SCREENSHOTS, `checkpoint-${context.name.slice(0, 35).replace(/[^a-z0-9]/gi, '-')}.png`) })
   await page.mouse.up()
   await page.keyboard.press('Escape')
+  if (await settingsPage().isVisible()) {
+    const discard = settingsPage().getByRole('button', { name: 'Discard changes', exact: true })
+    if (await discard.isVisible() && await discard.isEnabled()) await discard.click()
+    const acceptDiscard = dialog => void dialog.accept()
+    page.on('dialog', acceptDiscard)
+    try { await backToMarkets() }
+    finally { page.off('dialog', acceptDiscard) }
+  }
 })
-after(async () => { await electron?.close(); await rm(userData, { recursive: true, force: true }) })
+after(async () => {
+  try {
+    if (page && process.env.PERPETUAL_SWAP_SETTINGS_SCREENSHOTS) {
+      const directory = process.env.PERPETUAL_SWAP_SETTINGS_SCREENSHOTS
+      await mkdir(directory, { recursive: true })
+      await page.setViewportSize({ width: 1_600, height: 1_000 })
+      await openSettings()
+      for (const [category, file] of [['Workspace', 'workspace'], ['Liquidity filters', 'liquidity'], ['Market data', 'data'], ['AI analysis', 'analysis']]) {
+        await chooseSettingsCategory(category)
+        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+        await page.screenshot({ path: join(directory, `settings-page-${file}.png`) })
+      }
+    }
+  } finally { await electron?.close(); await rm(userData, { recursive: true, force: true }) }
+})
 
 const selected = () => page.locator('[data-market-index][aria-selected="true"]')
+const settingsPage = () => page.getByRole('main', { name: 'Settings', exact: true })
+const chooseSettingsCategory = async category => {
+  const settings = settingsPage()
+  await settings.getByRole('navigation', { name: 'Settings categories' }).getByRole('link', { name: category, exact: true }).click()
+  await settings.getByRole('heading', { name: category, exact: true, level: 2 }).waitFor()
+}
+const openSettings = async (category = 'Workspace') => {
+  await page.getByRole('link', { name: 'Settings', exact: true }).click()
+  const settings = settingsPage()
+  await settings.waitFor({ state: 'visible' })
+  await chooseSettingsCategory(category)
+  return settings
+}
+const backToMarkets = async () => {
+  await settingsPage().getByRole('link', { name: 'Back to markets', exact: true }).click()
+  await settingsPage().waitFor({ state: 'hidden' })
+  await page.getByRole('textbox', { name: 'Search contracts' }).waitFor({ state: 'visible' })
+}
 const emaCandleTarget = async (slot, fixture) => {
   const target = await page.locator('svg[data-rendered-inst]').evaluate((svg, { slot, intervalMS }) => {
     const commands = svg.querySelector('[data-chart-indicator="ema"]').getAttribute('d').match(/[ML][^ML]+/g)
@@ -164,8 +210,7 @@ const clickByRect = async locator => {
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)))
   const hitTest = await locator.evaluate(element => {
     const rect = element.getBoundingClientRect(), target = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)
-    const dialog = element.closest('[role=dialog]'), form = element.closest('form'), d = dialog?.getBoundingClientRect()
-    return { acceptsPointer: target === element || element.contains(target), target: target?.tagName, role: target?.getAttribute('role'), x: rect.x, y: rect.y, width: rect.width, height: rect.height, dialog: d ? { x: d.x, y: d.y, width: d.width, height: d.height, clientWidth: dialog.clientWidth, offsetWidth: dialog.offsetWidth, scrollWidth: dialog.scrollWidth, scrollTop: dialog.scrollTop, gutter: getComputedStyle(dialog).scrollbarGutter, formWidth: form?.getBoundingClientRect().width } : null }
+    return { acceptsPointer: target === element || element.contains(target), target: target?.tagName, role: target?.getAttribute('role'), x: rect.x, y: rect.y, width: rect.width, height: rect.height }
   })
   assert.equal(hitTest.acceptsPointer, true, `The control must receive pointer input at its drawn center: ${JSON.stringify(hitTest)}`)
   const target = await locator.boundingBox()
@@ -449,7 +494,7 @@ test('market notifications wait while hidden and refresh immediately when the wo
   }
 })
 
-test('search preserves selection while six width/DPR combinations share portal, pointer, and capture coordinates', async () => {
+test('search preserves selection while six width/DPR combinations share page, pointer, and capture coordinates', async () => {
   const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }))
   const client = await page.context().newCDPSession(page)
   const fixture = await electron.evaluate(({ ipcMain }) => ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } }))
@@ -472,24 +517,19 @@ test('search preserves selection while six width/DPR combinations share portal, 
       const request = await electron.evaluate(() => globalThis.__workspaceFixture.requests.findLast(value => value.captureChart).captureChart)
       for (const key of ['x', 'y', 'width', 'height']) assert.ok(Math.abs(request[key] - captureBounds[key]) < 1, `Capture ${key} must use the drawn CSS-pixel bounds, independent of DPR.`)
       if (process.env.PERPETUAL_SWAP_UI_SCREENSHOTS) await page.screenshot({ path: join(process.env.PERPETUAL_SWAP_UI_SCREENSHOTS, `workspace-${width}-dpr${deviceScaleFactor}.png`) })
-      const settings = await page.getByRole('button', { name: 'Settings', exact: true }).boundingBox()
-      await page.mouse.click(settings.x + settings.width / 2, settings.y + settings.height / 2)
-      const dialog = page.getByRole('dialog', { name: 'Settings', exact: true })
-      await dialog.waitFor({ state: 'visible' })
+      const settings = await openSettings()
       await page.waitForFunction(() => {
-        const dialog = document.querySelector('[role="dialog"]'), scale = Number(document.querySelector('[data-layout="market-workspace"]').dataset.uiScale)
-        const rect = dialog?.getBoundingClientRect()
-        return rect && Math.abs(rect.width / dialog.offsetWidth - scale) < .01 && Math.abs(rect.x + rect.width / 2 - innerWidth / 2) < 2 && Math.abs(rect.y + rect.height / 2 - innerHeight / 2) < 2
+        const settings = document.querySelector('main[aria-label="Settings"]'), scale = Number(document.querySelector('[data-layout="market-workspace"]').dataset.uiScale)
+        return settings && Math.abs(settings.getBoundingClientRect().width / settings.offsetWidth - scale) < .01
       })
-      const bounds = await dialog.boundingBox()
-      assert.ok(bounds.y >= 0 && bounds.y + bounds.height <= 1_001, 'Scaled portal content must stay within the viewport.')
-      const ranking = dialog.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' })
+      const bounds = await settings.boundingBox()
+      assert.ok(bounds.x >= 0 && bounds.y >= 0 && bounds.x + bounds.width <= width + 1 && bounds.y + bounds.height <= 1_001, 'The settings page must stay within the scaled viewport.')
+      const ranking = settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' })
       const input = await ranking.boundingBox()
       await page.mouse.click(input.x + input.width / 2, input.y + input.height / 2)
-      assert.equal(await ranking.evaluate(element => element === document.activeElement), true, 'Portaled controls must accept screen-space pointer coordinates.')
+      assert.equal(await ranking.evaluate(element => element === document.activeElement), true, 'Settings controls must accept screen-space pointer coordinates.')
       if (process.env.PERPETUAL_SWAP_UI_SCREENSHOTS) await page.screenshot({ path: join(process.env.PERPETUAL_SWAP_UI_SCREENSHOTS, `settings-${width}-dpr${deviceScaleFactor}.png`) })
-      await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
-      await dialog.waitFor({ state: 'hidden' })
+      await backToMarkets()
     }
     await page.getByRole('textbox', { name: 'Search contracts' }).fill('ALPHA')
     assert.equal(await page.locator('[data-market-index]').count(), 1)
@@ -500,6 +540,7 @@ test('search preserves selection while six width/DPR combinations share portal, 
   } finally {
     await page.mouse.up()
     await page.keyboard.press('Escape')
+    if (await settingsPage().isVisible()) await backToMarkets()
     await page.getByRole('textbox', { name: 'Search contracts' }).fill('')
     await client.send('Emulation.clearDeviceMetricsOverride')
     await client.detach()
@@ -509,55 +550,191 @@ test('search preserves selection while six width/DPR combinations share portal, 
   }
 })
 
-test('independent liquidity controls show validation and save failures before persisting a corrected preference set', async () => {
-  await page.getByRole('button', { name: 'Settings', exact: true }).click()
-  const dialog = page.getByRole('dialog', { name: 'Settings', exact: true })
-  await dialog.waitFor({ state: 'visible' })
-  await page.waitForFunction(() => {
-    const dialog = document.querySelector('[role="dialog"]')
-    return dialog && Math.abs(dialog.getBoundingClientRect().width / dialog.offsetWidth - Number(document.querySelector('[data-layout="market-workspace"]').dataset.uiScale)) < .01
-  })
-  assert.equal(await dialog.getByRole('switch').count(), 6)
-  await dialog.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).fill('7')
-  await dialog.getByRole('button', { name: 'Save settings', exact: true }).click()
-  await dialog.getByText('Use a multiple of 5 minutes.', { exact: true }).waitFor()
-  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.preferences?.action === 'update').length), 0)
-  await dialog.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).fill('30')
-  const spread = dialog.getByRole('switch', { name: 'Bid-ask spread', exact: true })
+test('settings is a separate grouped page with keyboard navigation and a retained market workspace', async () => {
+  await page.getByRole('textbox', { name: 'Search contracts' }).fill('ALPHA')
+  const before = {
+    contract: await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'),
+    timeframe: await page.locator('[aria-label="Chart timeframe"] button[aria-pressed="true"]').textContent(),
+  }
+  await page.getByRole('link', { name: 'Settings', exact: true }).focus()
+  await page.keyboard.press('Enter')
+  const settings = settingsPage()
+  await settings.getByRole('heading', { name: 'Settings', level: 1, exact: true }).waitFor()
+  assert.equal(await page.getByRole('dialog', { name: 'Settings', exact: true }).count(), 0)
+  assert.equal(await page.getByRole('textbox', { name: 'Search contracts' }).isVisible(), false)
+  const categories = settings.getByRole('navigation', { name: 'Settings categories' })
+  assert.deepEqual(await categories.getByRole('link').allTextContents(), ['Workspace', 'Liquidity filters', 'Market data', 'AI analysis'])
+  assert.equal(await categories.getByRole('link', { name: 'Workspace', exact: true }).getAttribute('aria-current'), 'page')
+  assert.equal(await settings.getByRole('spinbutton', { name: 'Data audit lookback (days)' }).count(), 0)
+  await categories.getByRole('link', { name: 'Market data', exact: true }).focus()
+  await page.keyboard.press('Enter')
+  await settings.getByRole('heading', { name: 'Market data', level: 2, exact: true }).waitFor()
+  assert.equal(await categories.getByRole('link', { name: 'Market data', exact: true }).getAttribute('aria-current'), 'page')
+  assert.equal(await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).count(), 0)
+  await settings.getByRole('spinbutton', { name: 'Data audit lookback (days)' }).waitFor()
+  await settings.getByRole('button', { name: 'Download all qualified history', exact: true }).waitFor()
+  await settings.getByRole('button', { name: 'Start audit', exact: true }).waitFor()
+  await page.goBack()
+  await settings.getByRole('heading', { name: 'Workspace', level: 2, exact: true }).waitFor()
+  await page.keyboard.press('Escape')
+  assert.equal(await settings.isVisible(), true, 'Escape must not dismiss an independent page.')
+  await settings.getByRole('link', { name: 'Back to markets', exact: true }).focus()
+  await page.keyboard.press('Enter')
+  await settings.waitFor({ state: 'hidden' })
+  assert.equal(await page.getByRole('textbox', { name: 'Search contracts' }).inputValue(), 'ALPHA')
+  assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), before.contract)
+  assert.equal(await page.locator('[aria-label="Chart timeframe"] button[aria-pressed="true"]').textContent(), before.timeframe)
+  await page.getByRole('textbox', { name: 'Search contracts' }).fill('')
+})
+
+test('preference drafts survive category changes and validation returns to the first invalid group', async () => {
+  const settings = await openSettings()
+  await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).fill('7')
+  await chooseSettingsCategory('Liquidity filters')
+  assert.equal(await settings.getByRole('switch').count(), 6)
+  assert.equal(await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).count(), 0)
+  const spread = settings.getByRole('switch', { name: 'Bid-ask spread', exact: true })
   await clickByRect(spread)
   assert.equal(await spread.getAttribute('aria-checked'), 'false')
-  const stability = dialog.getByRole('switch', { name: 'Volume stability', exact: true })
+  const stability = settings.getByRole('switch', { name: 'Volume stability', exact: true })
   await clickByRect(stability)
   assert.equal(await stability.getAttribute('aria-checked'), 'true')
-  await dialog.getByRole('spinbutton', { name: 'Maximum hourly volume ratio', exact: true }).fill('2.5')
+  await settings.getByRole('spinbutton', { name: 'Maximum hourly volume ratio', exact: true }).fill('2.5')
+  await settings.getByRole('button', { name: 'Save settings', exact: true }).click()
+  await settings.getByRole('heading', { name: 'Workspace', level: 2, exact: true }).waitFor()
+  await settings.getByText('Use a multiple of 5 minutes.', { exact: true }).waitFor()
+  assert.equal(await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).inputValue(), '7')
+  assert.equal(await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).evaluate(element => element === document.activeElement), true)
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.preferences?.action === 'update').length), 0)
+  await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).fill('30')
+  await chooseSettingsCategory('Liquidity filters')
+  assert.equal(await spread.getAttribute('aria-checked'), 'false')
+  assert.equal(await stability.getAttribute('aria-checked'), 'true')
+  assert.equal(await settings.getByRole('spinbutton', { name: 'Maximum hourly volume ratio', exact: true }).inputValue(), '2.5')
   await electron.evaluate(() => { globalThis.__workspaceFixture.failNextSave = true })
-  await dialog.getByRole('button', { name: 'Save settings', exact: true }).click()
-  await dialog.getByRole('alert').filter({ hasText: 'The preferences could not be saved.' }).waitFor()
-  assert.equal(await dialog.isVisible(), true)
-  await dialog.getByRole('button', { name: 'Save settings', exact: true }).click()
-  await dialog.waitFor({ state: 'hidden' })
+  await settings.getByRole('button', { name: 'Save settings', exact: true }).click()
+  await settings.getByRole('alert').filter({ hasText: 'The preferences could not be saved.' }).waitFor()
+  assert.equal(await settings.isVisible(), true)
+  await settings.getByRole('button', { name: 'Save settings', exact: true }).click()
+  await settings.getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
+  assert.equal(await settings.isVisible(), true, 'Saving preferences must keep the settings page open.')
   const preferences = await electron.evaluate(() => globalThis.__workspaceFixture.preferences)
   assert.equal(preferences.rankingLookback, 30)
   assert.equal(preferences.liquidity.spread.enabled, false)
   assert.deepEqual(preferences.liquidity.volumeStability, { enabled: true, maxRatio: 2.5 })
+  await backToMarkets()
   await page.getByRole('columnheader', { name: '30m change', exact: true }).waitFor()
   await selectTimeframe(page, '5m')
   await page.waitForFunction(() => document.querySelector('[aria-label="Chart timeframe"] button[aria-pressed="true"]')?.textContent === '5m')
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.preferences.rankingLookback), 30, 'Chart timeframe must not change the independent ranking window.')
 })
 
-test('saving only the ranking lookback keeps the current qualified rows and chart mounted', async () => {
+test('discarding changes resets all preference groups without saving', async () => {
+  const settings = await openSettings()
+  const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.preferences?.action === 'update').length)
+  await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).fill('60')
+  await chooseSettingsCategory('Market data')
+  await settings.getByRole('spinbutton', { name: 'Data audit lookback (days)' }).fill('120')
+  await settings.getByRole('button', { name: 'Discard changes', exact: true }).click()
+  assert.equal(await settings.getByRole('spinbutton', { name: 'Data audit lookback (days)' }).inputValue(), '30')
+  await chooseSettingsCategory('Workspace')
+  assert.equal(await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).inputValue(), '30')
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.preferences?.action === 'update').length), before)
+  await backToMarkets()
+})
+
+test('settings validation returns to Market data for a fractional audit lookback entered before changing groups', async () => {
+  const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.preferences?.action === 'update').length)
+  const settings = await openSettings('Market data')
+  const lookback = settings.getByRole('spinbutton', { name: 'Data audit lookback (days)', exact: true })
+  await lookback.fill('1.5')
+  await chooseSettingsCategory('Workspace')
+  await settings.getByRole('button', { name: 'Save settings', exact: true }).click()
+  await settings.getByRole('heading', { name: 'Market data', level: 2, exact: true }).waitFor()
+  await settings.getByText('Enter a whole number of at least 1.', { exact: true }).waitFor()
+  assert.equal(await lookback.inputValue(), '1.5')
+  assert.equal(await lookback.getAttribute('aria-invalid'), 'true')
+  assert.equal(await lookback.evaluate(element => element === document.activeElement), true, 'Validation must reveal and focus an invalid input in another category.')
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.preferences?.action === 'update').length), before)
+  await settings.getByRole('button', { name: 'Discard changes', exact: true }).click()
+  assert.equal(await lookback.inputValue(), '30')
+  await backToMarkets()
+})
+
+test('leaving settings confirms before discarding an unsaved preference draft', async () => {
+  const settings = await openSettings()
+  const ranking = settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' })
+  await ranking.fill('60')
+  const rejectedDialog = page.waitForEvent('dialog')
+  const rejectedNavigation = settings.getByRole('link', { name: 'Back to markets', exact: true }).click()
+  const rejected = await rejectedDialog
+  assert.equal(rejected.type(), 'confirm')
+  await rejected.dismiss()
+  await rejectedNavigation
+  assert.equal(await settings.isVisible(), true)
+  assert.equal(await ranking.inputValue(), '60')
+  const acceptedDialog = page.waitForEvent('dialog')
+  const acceptedNavigation = settings.getByRole('link', { name: 'Back to markets', exact: true }).click()
+  const accepted = await acceptedDialog
+  assert.equal(accepted.type(), 'confirm')
+  await accepted.accept()
+  await acceptedNavigation
+  await settings.waitFor({ state: 'hidden' })
+  const reopened = await openSettings()
+  assert.equal(await reopened.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).inputValue(), '30')
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.preferences.rankingLookback), 30)
+  await backToMarkets()
+})
+
+test('AI configuration is inline and retains its draft and loaded settings across groups', async () => {
+  const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.analysisSettings?.action === 'read').length)
+  const settings = await openSettings('AI analysis')
+  const model = settings.getByRole('textbox', { name: 'Model', exact: true })
+  await page.waitForFunction(() => document.getElementById('analysis-model')?.value === 'fixture/vision')
+  assert.equal(await page.getByRole('dialog').count(), 0)
+  const key = settings.getByLabel('Gateway API Key', { exact: true })
+  assert.equal(await key.getAttribute('type'), 'password')
+  await model.fill('')
+  await settings.getByRole('button', { name: 'Save analysis settings', exact: true }).click()
+  await settings.getByText('Enter a model ID.', { exact: true }).waitFor()
+  assert.equal(await model.getAttribute('aria-invalid'), 'true')
+  await model.fill('fixture/vision-v2')
+  await key.fill('renderer-fixture-key')
+  await chooseSettingsCategory('Workspace')
+  await chooseSettingsCategory('AI analysis')
+  assert.equal(await model.inputValue(), 'fixture/vision-v2')
+  assert.equal(await key.inputValue(), 'renderer-fixture-key')
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.analysisSettings?.action === 'read').length), before + 1)
+  const confirmDialog = page.waitForEvent('dialog')
+  const attemptedLeave = settings.getByRole('link', { name: 'Back to markets', exact: true }).click()
+  const confirm = await confirmDialog
+  await confirm.dismiss()
+  await attemptedLeave
+  assert.equal(await settings.isVisible(), true)
+  assert.equal(await key.inputValue(), 'renderer-fixture-key')
+  await settings.getByRole('button', { name: 'Save analysis settings', exact: true }).click()
+  await settings.getByRole('status').filter({ hasText: 'Analysis settings saved.' }).waitFor()
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.analysisSettings.model), 'fixture/vision-v2')
+  assert.equal(await key.inputValue(), '', 'Saving must clear the editable key field.')
+  assert.equal(await settings.isVisible(), true)
+  await settings.getByRole('button', { name: 'Remove key', exact: true }).click()
+  await settings.getByRole('status').filter({ hasText: 'Saved API key removed.' }).waitFor()
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.analysisSettings.hasAPIKey), false)
+  await backToMarkets()
+})
+
+test('saving only the ranking lookback keeps the chosen chart and qualified market state', async () => {
   await page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]').waitFor({ state: 'visible' })
-  await page.evaluate(() => { globalThis.__rankingChart = document.querySelector('[data-chart-inst]') })
-  await page.getByRole('button', { name: 'Settings', exact: true }).click()
-  const dialog = page.getByRole('dialog', { name: 'Settings', exact: true })
-  await dialog.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).fill('45')
-  await dialog.getByRole('button', { name: 'Save settings', exact: true }).click()
-  await dialog.waitFor({ state: 'hidden' })
+  const settings = await openSettings()
+  await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).fill('45')
+  await settings.getByRole('button', { name: 'Save settings', exact: true }).click()
+  await settings.getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
+  await backToMarkets()
   await page.getByRole('columnheader', { name: '45m change', exact: true }).waitFor()
   assert.equal(await selected().getAttribute('aria-label'), 'View BETA-USDT-SWAP chart')
-  assert.equal(await page.evaluate(() => globalThis.__rankingChart === document.querySelector('[data-chart-inst]')), true, 'Changing the ranking window must not clear the qualified universe and remount its chart.')
-  await page.evaluate(() => { delete globalThis.__rankingChart })
+  assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
+  assert.equal(await page.locator('[aria-label="Chart timeframe"] button[aria-pressed="true"]').textContent(), '5m')
+  assert.equal(await page.locator('[data-market-index]').count(), 4, 'Saving the ranking window must preserve the qualified universe.')
 })
 
 const waitForAuditFixture = async (predicate, argument) => {
@@ -570,149 +747,154 @@ const waitForAuditFixture = async (predicate, argument) => {
 
 test('audit checkpoints push progress and actions without idle status polling, and reopening reads once', async () => {
   const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length)
-  await page.getByRole('button', { name: 'Settings', exact: true }).click()
-  const dialog = page.getByRole('dialog', { name: 'Settings', exact: true })
-  await dialog.waitFor({ state: 'visible' })
-  await dialog.getByRole('status').filter({ hasText: 'idle · 0 / 0' }).waitFor()
+  await openSettings('Market data')
+  const settings = settingsPage()
+  await settings.waitFor({ state: 'visible' })
+  await settings.getByRole('status').filter({ hasText: 'idle · 0 / 0' }).waitFor()
   await waitForAuditFixture((_electron, expected) => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length === expected, before + 1)
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length), before + 1)
-  await dialog.getByRole('button', { name: 'Start audit', exact: true }).click()
-  await dialog.getByRole('status').filter({ hasText: 'running · 1 / 3' }).waitFor()
+  await settings.getByRole('button', { name: 'Start audit', exact: true }).click()
+  await settings.getByRole('status').filter({ hasText: 'running · 1 / 3' }).waitFor()
   await electron.evaluate(() => { globalThis.__workspaceFixture.publishAudit({ progress: { completed: 2, total: 3 } }) })
-  await dialog.getByRole('status').filter({ hasText: 'running · 2 / 3' }).waitFor()
-  await dialog.getByRole('button', { name: 'Cancel audit', exact: true }).click()
-  await dialog.getByRole('list', { name: 'Data audit issues' }).getByText('Missing completed candle · Repairable', { exact: true }).waitFor()
-  await dialog.getByRole('button', { name: 'Repair issues', exact: true }).click()
-  await dialog.getByRole('status').filter({ hasText: 'completed · 3 / 3' }).waitFor()
-  assert.equal(await dialog.getByRole('list', { name: 'Data audit issues' }).count(), 0)
+  await settings.getByRole('status').filter({ hasText: 'running · 2 / 3' }).waitFor()
+  await chooseSettingsCategory('Workspace')
+  await electron.evaluate(() => { globalThis.__workspaceFixture.publishAudit({ progress: { completed: 3, total: 3 } }) })
+  await chooseSettingsCategory('Market data')
+  await settings.getByRole('status').filter({ hasText: 'running · 3 / 3' }).waitFor()
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length), before + 1, 'Changing settings groups must reuse the status subscription and its latest checkpoint.')
+  await settings.getByRole('button', { name: 'Cancel audit', exact: true }).click()
+  await settings.getByRole('list', { name: 'Data audit issues' }).getByText('Missing completed candle · Repairable', { exact: true }).waitFor()
+  await settings.getByRole('button', { name: 'Repair issues', exact: true }).click()
+  await settings.getByRole('status').filter({ hasText: 'completed · 3 / 3' }).waitFor()
+  assert.equal(await settings.getByRole('list', { name: 'Data audit issues' }).count(), 0)
   await new Promise(resolve => setTimeout(resolve, 1_750))
-  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length), before + 1, 'A successful audit dialog must wait for checkpoints rather than poll.')
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length), before + 1, 'A successful audit settings page must wait for checkpoints rather than poll.')
   const actions = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit).map(value => value.dataAudit.action))
   assert.deepEqual(actions.filter(action => action !== 'status'), ['start', 'cancel', 'repair'])
-  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
-  await dialog.waitFor({ state: 'hidden' })
-  await page.getByRole('button', { name: 'Settings', exact: true }).click()
-  await dialog.getByRole('status').filter({ hasText: 'completed · 3 / 3' }).waitFor()
+  await backToMarkets()
+  await settings.waitFor({ state: 'hidden' })
+  await openSettings('Market data')
+  await settings.getByRole('status').filter({ hasText: 'completed · 3 / 3' }).waitFor()
   await waitForAuditFixture((_electron, expected) => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length === expected, before + 2)
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length), before + 2, 'Reopening performs one fresh status read.')
-  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await backToMarkets()
 })
 
-test('new audit pushes win over held initial and action replies across dialog reopen', async () => {
-  const dialog = page.getByRole('dialog', { name: 'Settings', exact: true })
+test('new audit pushes win over held initial and action replies across page reopen', async () => {
+  const settings = settingsPage()
   try {
     await electron.evaluate(() => {
       const state = globalThis.__workspaceFixture
       state.publishAudit({ phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '' })
       state.holdAuditAction = 'status'
     })
-    await page.getByRole('button', { name: 'Settings', exact: true }).click()
+    await openSettings('Market data')
     await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseAudit))
     await electron.evaluate(() => {
       const state = globalThis.__workspaceFixture
       state.publishAudit({ phase: 'running', progress: { completed: 2, total: 3 } })
       state.publishAudit({ phase: 'completed', progress: { completed: 7, total: 7 } })
     })
-    await dialog.getByRole('status').filter({ hasText: 'completed · 7 / 7' }).waitFor()
+    await settings.getByRole('status').filter({ hasText: 'completed · 7 / 7' }).waitFor()
     assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.heldAuditReply.phase), 'idle', 'The held initial reply must remain its detached older report.')
     await electron.evaluate(() => { globalThis.__workspaceFixture.releaseAudit() })
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
-    await dialog.getByRole('status').filter({ hasText: 'completed · 7 / 7' }).waitFor()
+    await settings.getByRole('status').filter({ hasText: 'completed · 7 / 7' }).waitFor()
     const beforeReopen = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length)
-    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
-    await dialog.waitFor({ state: 'hidden' })
-    await page.getByRole('button', { name: 'Settings', exact: true }).click()
-    await dialog.getByRole('status').filter({ hasText: 'completed · 7 / 7' }).waitFor()
+    await backToMarkets()
+    await settings.waitFor({ state: 'hidden' })
+    await openSettings('Market data')
+    await settings.getByRole('status').filter({ hasText: 'completed · 7 / 7' }).waitFor()
     await waitForAuditFixture((_electron, expected) => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length === expected, beforeReopen + 1)
     await electron.evaluate(() => { globalThis.__workspaceFixture.holdAuditAction = 'start' })
-    await dialog.getByRole('button', { name: 'Start audit', exact: true }).click()
+    await settings.getByRole('button', { name: 'Start audit', exact: true }).click()
     await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseAudit))
-    await dialog.getByRole('status').filter({ hasText: 'running · 1 / 3' }).waitFor()
+    await settings.getByRole('status').filter({ hasText: 'running · 1 / 3' }).waitFor()
     await electron.evaluate(() => { globalThis.__workspaceFixture.publishAudit({ phase: 'completed', progress: { completed: 3, total: 3 } }) })
-    await dialog.getByRole('status').filter({ hasText: 'completed · 3 / 3' }).waitFor()
-    assert.equal(await dialog.getByRole('button', { name: 'Start audit', exact: true }).isDisabled(), true, 'A push must not release an action that is still in flight.')
+    await settings.getByRole('status').filter({ hasText: 'completed · 3 / 3' }).waitFor()
+    assert.equal(await settings.getByRole('button', { name: 'Start audit', exact: true }).isDisabled(), true, 'A push must not release an action that is still in flight.')
     assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.heldAuditReply.phase), 'running', 'The held action reply must remain its detached older report.')
     await electron.evaluate(() => { globalThis.__workspaceFixture.releaseAudit() })
-    await dialog.getByRole('button', { name: 'Start audit', exact: true }).waitFor({ state: 'visible' })
-    await page.waitForFunction(() => ![...document.querySelectorAll('[role="dialog"] button')].find(button => button.textContent === 'Start audit')?.disabled)
-    await dialog.getByRole('status').filter({ hasText: 'completed · 3 / 3' }).waitFor()
+    await settings.getByRole('button', { name: 'Start audit', exact: true }).waitFor({ state: 'visible' })
+    await page.waitForFunction(() => ![...document.querySelectorAll('main[aria-label="Settings"] button')].find(button => button.textContent === 'Start audit')?.disabled)
+    await settings.getByRole('status').filter({ hasText: 'completed · 3 / 3' }).waitFor()
   } finally {
     await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.holdAuditAction = null; state.releaseAudit?.() })
-    await page.keyboard.press('Escape')
+    if (await settings.isVisible()) await backToMarkets()
   }
 })
 
-test('manual history downloads show exact pushed progress and retry details, continue across settings close, and cancel without polling', async () => {
+test('manual history downloads show exact pushed progress and retry details, continue after leaving settings, and cancel without polling', async () => {
   const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.historyDownload?.action === 'status').length)
-  await page.getByRole('button', { name: 'Settings', exact: true }).click()
-  const dialog = page.getByRole('dialog', { name: 'Settings', exact: true })
-  await dialog.getByRole('status').filter({ hasText: 'Ready to download · 0.0%' }).waitFor()
-  await dialog.getByRole('button', { name: 'Download all qualified history', exact: true }).click()
-  await dialog.getByRole('status').filter({ hasText: 'Downloading history · 10.0%' }).waitFor()
-  const details = dialog.locator('[aria-label="History download details"]')
+  await openSettings('Market data')
+  const settings = settingsPage()
+  await settings.getByRole('status').filter({ hasText: 'Ready to download · 0.0%' }).waitFor()
+  await settings.getByRole('button', { name: 'Download all qualified history', exact: true }).click()
+  await settings.getByRole('status').filter({ hasText: 'Downloading history · 10.0%' }).waitFor()
+  const details = settings.locator('[aria-label="History download details"]')
   await details.getByText('100 / 1,000', { exact: true }).waitFor()
   await details.getByText('1 / 18', { exact: true }).waitFor()
-  const active = dialog.getByRole('list', { name: 'Active history downloads' })
+  const active = settings.getByRole('list', { name: 'Active history downloads' })
   await active.getByText('BETA-USDT-SWAP · 15m · oi', { exact: true }).waitFor()
   await active.getByText(/retrying · Consecutive failures: 2 · Next retry:/).waitFor()
   await active.getByText('Temporary source limit.', { exact: true }).waitFor()
   await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({
     progress: { completed: 999_999, total: 1_000_000, available: 900_000, unavailable: 99_999, reused: 300_000, pending: 1 },
   }) })
-  await dialog.getByRole('status').filter({ hasText: 'Downloading history · 99.9%' }).waitFor()
+  await settings.getByRole('status').filter({ hasText: 'Downloading history · 99.9%' }).waitFor()
   await details.getByText('999,999 / 1,000,000', { exact: true }).waitFor()
   await details.getByText('99,999', { exact: true }).waitFor()
   await details.getByText('300,000', { exact: true }).waitFor()
-  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
-  await dialog.waitFor({ state: 'hidden' })
+  await backToMarkets()
+  await settings.waitFor({ state: 'hidden' })
   await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({
     progress: { completed: 1_000_000, total: 1_000_000, available: 900_001, unavailable: 99_999, reused: 300_000, pending: 0 },
   }) })
-  await page.getByRole('button', { name: 'Settings', exact: true }).click()
-  await dialog.getByRole('status').filter({ hasText: 'Downloading history · 100.0%' }).waitFor()
-  await dialog.getByRole('button', { name: 'Cancel download', exact: true }).click()
-  await dialog.getByRole('status').filter({ hasText: 'Download cancelled · 100.0%' }).waitFor()
-  assert.equal(await dialog.getByRole('list', { name: 'Active history downloads' }).count(), 0)
+  await openSettings('Market data')
+  await settings.getByRole('status').filter({ hasText: 'Downloading history · 100.0%' }).waitFor()
+  await settings.getByRole('button', { name: 'Cancel download', exact: true }).click()
+  await settings.getByRole('status').filter({ hasText: 'Download cancelled · 100.0%' }).waitFor()
+  assert.equal(await settings.getByRole('list', { name: 'Active history downloads' }).count(), 0)
   await new Promise(resolve => setTimeout(resolve, 1_750))
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.historyDownload?.action === 'status').length), before + 2)
   assert.deepEqual(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.historyDownload && value.historyDownload.action !== 'status').map(value => value.historyDownload.action)), ['start', 'cancel'])
-  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await backToMarkets()
 })
 
 test('new download pushes win over held replies and completion distinguishes unavailable data', async () => {
-  const dialog = page.getByRole('dialog', { name: 'Settings', exact: true })
+  const settings = settingsPage()
   try {
     await electron.evaluate(() => {
       const state = globalThis.__workspaceFixture
       state.publishDownload({ phase: 'idle', progress: { completed: 0, total: 0, available: 0, unavailable: 0, reused: 0, pending: 0 }, error: '' })
       state.holdDownloadAction = 'status'
     })
-    await page.getByRole('button', { name: 'Settings', exact: true }).click()
+    await openSettings('Market data')
     await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseDownload))
     await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({ phase: 'completed',
       progress: { completed: 1_000_000, total: 1_000_000, available: 900_001, unavailable: 99_999, reused: 300_000, pending: 0 },
       contracts: { completed: 2, total: 2 }, streams: { completed: 18, total: 18 }, active: [],
     }) })
-    await dialog.getByRole('status').filter({ hasText: 'Completed with unavailable data · 100.0%' }).waitFor()
+    await settings.getByRole('status').filter({ hasText: 'Completed with unavailable data · 100.0%' }).waitFor()
     await electron.evaluate(() => { globalThis.__workspaceFixture.releaseDownload() })
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
-    await dialog.getByRole('status').filter({ hasText: 'Completed with unavailable data · 100.0%' }).waitFor()
+    await settings.getByRole('status').filter({ hasText: 'Completed with unavailable data · 100.0%' }).waitFor()
     await electron.evaluate(() => { globalThis.__workspaceFixture.holdDownloadAction = 'start' })
-    await dialog.getByRole('button', { name: 'Download all qualified history', exact: true }).click()
+    await settings.getByRole('button', { name: 'Download all qualified history', exact: true }).click()
     await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseDownload))
     await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({ phase: 'completed',
       progress: { completed: 1_000, total: 1_000, available: 1_000, unavailable: 0, reused: 80, pending: 0 },
       contracts: { completed: 2, total: 2 }, streams: { completed: 18, total: 18 }, active: [],
     }) })
-    await dialog.getByRole('status').filter({ hasText: 'Download complete · 100.0%' }).waitFor()
-    assert.equal(await dialog.getByRole('button', { name: /Download all qualified history/ }).isDisabled(), true)
+    await settings.getByRole('status').filter({ hasText: 'Download complete · 100.0%' }).waitFor()
+    assert.equal(await settings.getByRole('button', { name: /Download all qualified history/ }).isDisabled(), true)
     assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.heldDownloadReply.phase), 'running')
     await electron.evaluate(() => { globalThis.__workspaceFixture.releaseDownload() })
-    await page.waitForFunction(() => ![...document.querySelectorAll('[role="dialog"] button')].find(button => button.textContent === 'Download all qualified history')?.disabled)
-    await dialog.getByRole('status').filter({ hasText: 'Download complete · 100.0%' }).waitFor()
+    await page.waitForFunction(() => ![...document.querySelectorAll('main[aria-label="Settings"] button')].find(button => button.textContent === 'Download all qualified history')?.disabled)
+    await settings.getByRole('status').filter({ hasText: 'Download complete · 100.0%' }).waitFor()
   } finally {
     await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.holdDownloadAction = null; state.releaseDownload?.() })
-    await page.keyboard.press('Escape')
+    if (await settings.isVisible()) await backToMarkets()
   }
 })
 

@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Radio } from 'lucide-react'
+import { Radio, Settings2 } from 'lucide-react'
+import { buttonVariants } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
@@ -8,6 +9,7 @@ import { MarketChart } from '@/MarketChart'
 import { MarketRowsViewport } from '@/MarketRowsViewport'
 import { WorkspaceViewport } from '@/WorkspaceViewport'
 import { WorkspaceSettings } from '@/WorkspaceSettings'
+import { settingsHref, useSettingsSection, type SettingsNavigationState } from '@/settings-navigation'
 import { chartController } from '@/chart-controller'
 import { compareRankingChange } from '@/market-ranking'
 import { reconcileMarketRows } from '@/market-snapshot'
@@ -49,6 +51,15 @@ const MarketRowView = memo(function MarketRowView({ row, index, selected, lookba
 })
 
 function App() {
+  const settingsGuard = useRef<SettingsNavigationState>({ dirty: false, busy: false })
+  const settingsSection = useSettingsSection(settingsGuard)
+  const settingsLauncher = useRef<HTMLAnchorElement>(null)
+  const lastSettingsSection = useRef(settingsSection)
+  const updateSettingsGuard = useCallback((value: SettingsNavigationState) => { settingsGuard.current = value }, [])
+  useEffect(() => {
+    if (lastSettingsSection.current && !settingsSection) settingsLauncher.current?.focus()
+    lastSettingsSection.current = settingsSection
+  }, [settingsSection])
   const [preferences, setPreferences] = useState<Preferences>(DEFAULT_PREFERENCES)
   const [preferencesLoaded, setPreferencesLoaded] = useState(false)
   const [preferencesError, setPreferencesError] = useState('')
@@ -210,9 +221,10 @@ function App() {
   }, [preferences.chartTimeframe, savePreferences])
 
   return <WorkspaceViewport>
+    <div hidden={settingsSection !== null} inert={settingsSection !== null} className={cn('h-full min-w-0 flex-1', settingsSection === null ? 'flex' : 'hidden')}>
     <aside data-market-list className="flex h-full w-[420px] shrink-0 flex-col border-r" aria-label="Contract list">
       <header className="flex flex-col gap-4 border-b p-4">
-        <div className="flex items-center justify-between gap-2"><h1 className="text-base font-semibold">Perpetual Swap Suite</h1><WorkspaceSettings preferences={preferences} loadError={preferencesError} onSave={savePreferences} /></div>
+        <div className="flex items-center justify-between gap-2"><h1 className="text-base font-semibold">Perpetual Swap Suite</h1><a ref={settingsLauncher} href={settingsHref('workspace')} className={buttonVariants({ variant: 'outline', size: 'sm' })}><Settings2 aria-hidden="true" data-icon="inline-start" />Settings</a></div>
         <Input aria-label="Search contracts" placeholder="Search contracts…" value={query} onChange={event => setQuery(event.target.value)} />
         <div className="flex items-center justify-between gap-2"><span className="text-xs text-muted-foreground">{visible.length} / {rows.length} contracts</span><Badge variant="outline"><Radio aria-hidden="true" />{status}</Badge></div>
       </header>
@@ -230,8 +242,10 @@ function App() {
       <footer className="flex flex-col gap-1 border-t p-4 text-xs text-muted-foreground" aria-live="polite">{retainedChart && <span role="status">{verifying ? 'Rechecking qualification · Current chart remains available' : 'Qualification data unavailable · Current chart remains available'}</span>}<span>Realtime: {realtime}</span><span>{updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data'}</span><span>Ranking: completed 5m closes · {preferences.rankingLookback}m lookback</span></footer>
     </aside>
     <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
-      {selectedID ? <MarketChart instId={selectedID} timeframe={timeframe} onTimeframeChange={changeTimeframe} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
+      {selectedID ? <MarketChart active={settingsSection === null} instId={selectedID} timeframe={timeframe} onTimeframeChange={changeTimeframe} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
     </section>
+    </div>
+    {settingsSection && <WorkspaceSettings section={settingsSection} preferences={preferences} loaded={preferencesLoaded} loadError={preferencesError} onSave={savePreferences} onNavigationStateChange={updateSettingsGuard} />}
   </WorkspaceViewport>
 }
 export default App

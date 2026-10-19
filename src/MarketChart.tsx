@@ -197,7 +197,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   })
 })
 
-export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, listOrder, turnoverOrder, onSelect }: { instId: string; timeframe?: RadarTimeframe; onTimeframeChange?: (value: RadarTimeframe) => void; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
+export function MarketChart({ instId, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect }: { instId: string; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
   const view = useSyncExternalStore(chartController.subscribe, chartController.getSnapshot)
   useLayoutEffect(() => chartController.open(instId, timeframe), [instId, timeframe])
   const surface = view.presented
@@ -247,7 +247,7 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
     if (wheelFrame.current !== null) window.cancelAnimationFrame(wheelFrame.current)
     wheelFrame.current = null
     releaseInspection()
-  }, [instId, timeframe, releaseInspection])
+  }, [isActive, instId, timeframe, releaseInspection])
   useLayoutEffect(() => {
     const element = chartRef.current
     if (element) {
@@ -262,7 +262,11 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
   useLayoutEffect(() => {
     const element = plotRef.current
     if (!element) return
-    const measure = (width: number, height: number) => setPlotSize(current => current.width === width && current.height === height ? current : { width, height })
+    const measure = (width: number, height: number) => {
+      // Keep the rendered chart intact while its workspace is hidden.
+      if (!(width > 0 && height > 0)) return
+      setPlotSize(current => current.width === width && current.height === height ? current : { width, height })
+    }
     // Client dimensions stay in chart coordinates when the workspace is scaled.
     measure(element.clientWidth, element.clientHeight)
     const observer = new ResizeObserver(([entry]) => measure(entry.contentRect.width, entry.contentRect.height))
@@ -282,7 +286,8 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
     const timer = window.setTimeout(() => setCapture({ status: 'idle', error: '' }), 550)
     return () => window.clearTimeout(timer)
   }, [capture.status])
-  useEffect(() => {
+  useLayoutEffect(() => {
+    if (!isActive) return
     const navigate = (event: KeyboardEvent) => {
       if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.defaultPrevented || event.isComposing || event.keyCode === 229) return
       const target = event.target instanceof Element ? event.target : document.activeElement
@@ -303,7 +308,7 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
     }
     window.addEventListener('keydown', navigate)
     return () => window.removeEventListener('keydown', navigate)
-  }, [listOrder, turnoverOrder, onSelect])
+  }, [isActive, listOrder, turnoverOrder, onSelect])
   const queueWheel = (pixels: number) => {
     wheelPixels.current += pixels
     if (wheelFrame.current !== null) return
@@ -405,7 +410,7 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
       </div>
       {captureStatus === 'flashing' && <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
     </section>
-    {analysisOpen && <ChartAnalysisPanel instId={instId} timeframe={timeframeLabel(timeframe)} session={analysis} ready={!pending && bars.length > 0 && plotSize.width > 0 && captureStatus !== 'copying'} onNew={() => analyzeChart(analysis?.direction ?? 'long')} onClose={() => { chartAnalysis.stop(instId); setAnalysisOpen(false) }} />}
+    {analysisOpen && <ChartAnalysisPanel instId={instId} timeframe={timeframeLabel(timeframe)} session={analysis} ready={isActive && !pending && bars.length > 0 && plotSize.width > 0 && captureStatus !== 'copying'} onNew={() => analyzeChart(analysis?.direction ?? 'long')} onClose={() => { chartAnalysis.stop(instId); setAnalysisOpen(false) }} />}
     </div>
   </section>
 }

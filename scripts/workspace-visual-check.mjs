@@ -210,16 +210,16 @@ try {
           assert.deepEqual(legend.swatchColor, index === 0 ? measured.semantics.positive : measured.semantics.negative, 'Taker swatches must preserve the mandated market colors.')
         }
         report.measurements.push({ theme, surface: 'workspace', ...measured })
-        await page.getByRole('button', { name: 'Settings', exact: true }).click()
-        const dialog = page.getByRole('dialog', { name: 'Settings', exact: true })
-        await dialog.waitFor({ state: 'visible' })
+        await page.getByRole('link', { name: 'Settings', exact: true }).click()
+        const settings = page.getByRole('main', { name: 'Settings', exact: true })
+        await settings.waitFor({ state: 'visible' })
         await screenshot(`settings-${theme}-top`, width, 1000, dpr)
         report.measurements.push({ theme, surface: 'settings-top', ...await measure() })
-        await dialog.locator('form').evaluate(form => { form.scrollTop = form.scrollHeight })
+        await settings.getByRole('link', { name: 'Market data', exact: true }).click()
         await screenshot(`settings-${theme}-bottom`, width, 1000, dpr)
         report.measurements.push({ theme, surface: 'settings-bottom', ...await measure() })
-        await page.keyboard.press('Escape')
-        await dialog.waitFor({ state: 'hidden' })
+        await settings.getByRole('link', { name: 'Back to markets', exact: true }).click()
+        await settings.waitFor({ state: 'hidden' })
       }
     }
   }

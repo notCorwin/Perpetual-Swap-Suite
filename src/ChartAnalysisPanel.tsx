@@ -9,7 +9,7 @@ import { Message, MessageContent, MessageFooter } from '@/components/ui/message'
 import { MessageScroller, MessageScrollerButton, MessageScrollerContent, MessageScrollerItem, MessageScrollerProvider, MessageScrollerViewport } from '@/components/ui/message-scroller'
 import { Bubble, BubbleContent } from '@/components/ui/bubble'
 import { Spinner } from '@/components/ui/spinner'
-import { AnalysisSettingsButton } from '@/AnalysisSettingsDialog'
+import { AnalysisSettingsButton } from '@/AnalysisSettings'
 import { chartAnalysis } from '@/analysis-service'
 import { ANALYSIS_PROMPTS, type AnalysisSession } from '@/chart-analysis'
 
@@ -27,13 +27,14 @@ export function ChartAnalysisPanel({ instId, timeframe = '15m', session, ready, 
   useEffect(() => { retryAttempt.current = 0 }, [instId])
   useEffect(() => {
     if (session?.phase !== 'error') { if (session?.phase === 'ready') retryAttempt.current = 0; return }
+    if (!session.turns.length && !ready) return
     const attempt = ++retryAttempt.current
     const timer = window.setTimeout(() => {
       if (session.turns.length) void chartAnalysis.retry(instId)
       else onNewRef.current()
     }, Math.min(30_000, 2_000 * 2 ** Math.min(attempt - 1, 4)))
     return () => window.clearTimeout(timer)
-  }, [instId, session?.phase, session?.error, session?.turns.length])
+  }, [instId, ready, session?.phase, session?.error, session?.turns.length])
   const copy = async (id: string, text: string) => {
     try {
       const result = await window.radarDesktop.request({ copyText: text })

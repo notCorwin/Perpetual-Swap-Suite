@@ -1,14 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { Settings2 } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { ArrowLeft, ChevronRight, Database, Settings2, SlidersHorizontal, Sparkles } from 'lucide-react'
+import { Button, buttonVariants } from '@/components/ui/button'
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegend, FieldSet } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Spinner } from '@/components/ui/spinner'
 import { Progress } from '@/components/ui/progress'
-import { AnalysisSettingsButton } from '@/AnalysisSettingsDialog'
+import { AnalysisSettings } from '@/AnalysisSettings'
+import { Separator } from '@/components/ui/separator'
+import { SETTINGS_SECTIONS, settingsHref, type SettingsNavigationState, type SettingsSection } from '@/settings-navigation'
 import { LIQUIDITY_FIELDS, preferencesDraft, validatePreferencesDraft, type Preferences } from '@/renderer-preferences'
 import type { DataAudit, HistoryDownload } from '@/desktop-contract'
 import { RADAR_TIMEFRAMES, type RadarTimeframe } from '@/timeframe'
@@ -108,12 +109,49 @@ function HistoryDownloadSettings({ open }: { open: boolean }) {
   </FieldSet>
 }
 
-export function WorkspaceSettings({ preferences, loadError, onSave }: { preferences: Preferences; loadError: string; onSave: (values: Preferences) => Promise<void> }) {
-  const [open, setOpen] = useState(false)
+type WorkspaceSettingsProps = {
+  section: SettingsSection
+  preferences: Preferences
+  loaded: boolean
+  loadError: string
+  onSave: (values: Preferences) => Promise<void>
+  onNavigationStateChange: (state: SettingsNavigationState) => void
+}
+const sectionIcons = { workspace: Settings2, liquidity: SlidersHorizontal, data: Database, analysis: Sparkles }
+
+export function WorkspaceSettings({ section, preferences, loaded, loadError, onSave, onNavigationStateChange }: WorkspaceSettingsProps) {
   const [draft, setDraft] = useState(() => preferencesDraft(preferences))
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
+  const [savedMessage, setSavedMessage] = useState('')
+  const [analysisDirty, setAnalysisDirty] = useState(false)
+  const [analysisBusy, setAnalysisBusy] = useState(false)
+  const [visited, setVisited] = useState(() => new Set<SettingsSection>([section]))
+  const heading = useRef<HTMLHeadingElement>(null)
+  const scroll = useRef<HTMLDivElement>(null)
+  const scrollPositions = useRef(new Map<SettingsSection, number>())
+  const focusAfterValidation = useRef<string | null>(null)
+  const previousPreferences = useRef(preferences)
+  const dirty = JSON.stringify(draft) !== JSON.stringify(preferencesDraft(preferences))
+  const dataMounted = visited.has('data') || section === 'data'
+  const analysisMounted = visited.has('analysis') || section === 'analysis'
+  const preferenceDisabled = saving || !loaded || Boolean(loadError)
+  useEffect(() => {
+    const previous = previousPreferences.current
+    previousPreferences.current = preferences
+    setDraft(current => JSON.stringify(current) === JSON.stringify(preferencesDraft(previous)) ? preferencesDraft(preferences) : current)
+  }, [preferences])
+  useLayoutEffect(() => {
+    setVisited(current => current.has(section) ? current : new Set([...current, section]))
+    scroll.current?.scrollTo(0, scrollPositions.current.get(section) ?? 0)
+    if (focusAfterValidation.current) {
+      document.getElementById(focusAfterValidation.current)?.focus()
+      focusAfterValidation.current = null
+    } else heading.current?.focus({ preventScroll: true })
+  }, [section])
+  useEffect(() => { onNavigationStateChange({ dirty: dirty || analysisDirty, busy: saving || analysisBusy }) }, [dirty, analysisDirty, saving, analysisBusy, onNavigationStateChange])
+  useEffect(() => () => onNavigationStateChange({ dirty: false, busy: false }), [onNavigationStateChange])
   const [audit, setAudit] = useState<DataAudit>(emptyAudit)
   const [auditError, setAuditError] = useState('')
   const [auditStatusError, setAuditStatusError] = useState('')
@@ -128,7 +166,7 @@ export function WorkspaceSettings({ preferences, loadError, onSave }: { preferen
     setAudit(value); setAuditStatusError('')
   }, [])
   useEffect(() => {
-    if (!open) return
+    if (!dataMounted) return
     const lifecycle = ++auditLifecycle.current
     const accepted = auditAccepted.current
     setAuditBusy(false); setAuditError(''); setAuditStatusError('')
@@ -144,7 +182,7 @@ export function WorkspaceSettings({ preferences, loadError, onSave }: { preferen
     }
     void status()
     return () => { window.removeEventListener('radar-audit-changed', published); auditLifecycle.current++ }
-  }, [open, acceptAudit])
+  }, [dataMounted, acceptAudit])
   const auditAction = async (action: 'start' | 'cancel' | 'repair') => {
     const lifecycle = auditLifecycle.current
     const sequence = ++auditSequence.current
@@ -156,38 +194,53 @@ export function WorkspaceSettings({ preferences, loadError, onSave }: { preferen
     finally { if (lifecycle === auditLifecycle.current && sequence === auditSequence.current) setAuditBusy(false) }
   }
   const changeNumber = (key: 'rankingLookback' | 'historyDays' | 'slippageNotional', value: string) => {
-    setDraft(current => ({ ...current, [key]: value })); setErrors(current => ({ ...current, [key]: '' })); setSaveError('')
+    setDraft(current => ({ ...current, [key]: value })); setErrors(current => ({ ...current, [key]: '' })); setSaveError(''); setSavedMessage('')
   }
   const save = async () => {
     const checked = validatePreferencesDraft(draft)
-    setErrors(checked.errors); setSaveError('')
+    setErrors(checked.errors); setSaveError(''); setSavedMessage('')
     if (!checked.values) {
       const key = Object.keys(checked.errors)[0]
-      document.getElementById(LIQUIDITY_FIELDS.some(field => field.key === key) ? `threshold-${key}` : key)?.focus()
+      const invalidSection: SettingsSection = key === 'historyDays' ? 'data' : key === 'slippageNotional' || LIQUIDITY_FIELDS.some(field => field.key === key) ? 'liquidity' : 'workspace'
+      const target = LIQUIDITY_FIELDS.some(field => field.key === key) ? `threshold-${key}` : key
+      if (invalidSection === section) document.getElementById(target)?.focus()
+      else { focusAfterValidation.current = target; window.location.hash = settingsHref(invalidSection) }
       return
     }
     setSaving(true)
-    try { await onSave(checked.values); setOpen(false) }
+    try { await onSave(checked.values); setDraft(preferencesDraft(checked.values)); setSavedMessage('Settings saved.') }
     catch (cause) { setSaveError(errorMessage(cause)) }
     finally { setSaving(false) }
   }
   const numericField = (key: 'rankingLookback' | 'historyDays' | 'slippageNotional', label: string, description?: string) => <Field data-invalid={Boolean(errors[key])}>
     <FieldLabel htmlFor={key}>{label}</FieldLabel>
-    <Input id={key} name={key} autoComplete="off" type="number" step={key === 'slippageNotional' ? 'any' : 1} inputMode="decimal" value={draft[key]} onChange={event => changeNumber(key, event.target.value)} aria-invalid={Boolean(errors[key])} aria-describedby={errors[key] ? `${key}-error` : undefined} disabled={saving} />
+    <Input id={key} name={key} autoComplete="off" type="number" step={key === 'slippageNotional' ? 'any' : 1} inputMode="decimal" value={draft[key]} onChange={event => changeNumber(key, event.target.value)} aria-invalid={Boolean(errors[key])} aria-describedby={errors[key] ? `${key}-error` : undefined} disabled={preferenceDisabled} />
     {description && <FieldDescription>{description}</FieldDescription>}
     {errors[key] && <FieldError id={`${key}-error`}>{errors[key]}</FieldError>}
   </Field>
-  return <Dialog open={open} onOpenChange={value => {
-    if (saving) return
-    if (value) { setDraft(preferencesDraft(preferences)); setErrors({}); setSaveError('') }
-    setOpen(value)
-  }}>
-    <DialogTrigger render={<Button variant="outline" size="sm" />}><Settings2 data-icon="inline-start" />Settings</DialogTrigger>
-    <DialogContent className="flex max-h-[calc(var(--workspace-height)*0.85)] flex-col overflow-hidden sm:max-w-2xl">
-      <DialogHeader><DialogTitle>Settings</DialogTitle><DialogDescription>Screen USDT perpetual swaps and manage local market data.</DialogDescription></DialogHeader>
-      <form onSubmit={event => { event.preventDefault(); void save() }} className="flex min-h-0 min-w-0 flex-1 flex-col gap-6 overflow-y-auto pr-6 [scrollbar-gutter:stable]">
-        {(loadError || saveError) && <p role="alert" className="text-sm text-destructive">{saveError || loadError}</p>}
-        <FieldSet disabled={saving}>
+  const currentSection = SETTINGS_SECTIONS.find(value => value.id === section)!
+  return <main aria-label="Settings" data-layout="settings-workspace" className="flex h-full min-w-0 flex-1 flex-col bg-background">
+    <header className="flex items-center justify-between gap-6 border-b px-8 py-6">
+      <div className="flex flex-col gap-1"><h1 className="text-2xl font-semibold">Settings</h1><p className="text-sm text-muted-foreground">Manage your workspace, screening rules and local market data.</p></div>
+      <a href="#/" className={buttonVariants({ variant: 'outline' })}><ArrowLeft aria-hidden="true" data-icon="inline-start" />Back to markets</a>
+    </header>
+    <div className="flex min-h-0 flex-1">
+      <nav aria-label="Settings categories" className="flex w-64 shrink-0 flex-col gap-2 overflow-y-auto border-r p-6">
+        {SETTINGS_SECTIONS.map(item => {
+          const Icon = sectionIcons[item.id]
+          return <a key={item.id} href={settingsHref(item.id)} aria-current={item.id === section ? 'page' : undefined} className={buttonVariants({ variant: item.id === section ? 'secondary' : 'ghost', className: 'min-h-10 justify-start gap-3 px-3' })}><Icon aria-hidden="true" data-icon="inline-start" />{item.label}{item.id === section && <ChevronRight aria-hidden="true" data-icon="inline-end" className="ml-auto" />}</a>
+        })}
+      </nav>
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <div ref={scroll} onScroll={event => scrollPositions.current.set(section, event.currentTarget.scrollTop)} className="min-h-0 flex-1 overflow-y-auto px-12 py-8 [scrollbar-gutter:stable]">
+          <div className="mx-auto flex w-full max-w-3xl flex-col gap-8">
+            <header className="flex flex-col gap-2"><h2 ref={heading} tabIndex={-1} className="text-xl font-semibold">{currentSection.label}</h2><p className="text-sm text-muted-foreground">{currentSection.description}</p></header>
+            <Separator />
+            {(loadError || saveError) && <p role="alert" className="text-sm text-destructive">{saveError || loadError}</p>}
+            {!loaded && <p role="status" className="text-sm text-muted-foreground">Loading saved settings…</p>}
+            <form id="workspace-settings-form" noValidate onSubmit={event => { event.preventDefault(); void save() }}>
+              <div hidden={section !== 'workspace'} className="flex flex-col gap-8">
+        <FieldSet disabled={preferenceDisabled}>
           <FieldLegend>Market workspace</FieldLegend>
           <FieldGroup>
             <Field><FieldLabel htmlFor="default-chart-timeframe">Chart timeframe</FieldLabel>
@@ -197,10 +250,11 @@ export function WorkspaceSettings({ preferences, loadError, onSave }: { preferen
               </Select>
             </Field>
             {numericField('rankingLookback', 'Ranking lookback (minutes)', 'Uses completed 5m candle closes. This window is independent of the chart timeframe.')}
-            {numericField('historyDays', 'Data audit lookback (days)', 'Limits the integrity audit range. Full history downloads always start at listing.')}
           </FieldGroup>
         </FieldSet>
-        <FieldSet disabled={saving}>
+              </div>
+              <div hidden={section !== 'liquidity'} className="flex flex-col gap-8">
+        <FieldSet disabled={preferenceDisabled}>
           <FieldLegend>Liquidity conditions</FieldLegend>
           <FieldDescription>Only contracts meeting every enabled condition appear in the list.</FieldDescription>
           <FieldGroup>
@@ -212,7 +266,7 @@ export function WorkspaceSettings({ preferences, loadError, onSave }: { preferen
                 <FieldLabel htmlFor={`threshold-${field.key}`}>{field.parameterLabel}</FieldLabel>
                 <Input id={`threshold-${field.key}`} name={`threshold-${field.key}`} autoComplete="off" type="number" inputMode="decimal" step="any" value={draft.liquidity[field.key].threshold} aria-invalid={Boolean(errors[field.key])} aria-describedby={`description-${field.key}${errors[field.key] ? ` error-${field.key}` : ''}`} onChange={event => {
                   const threshold = event.target.value
-                  setDraft(current => ({ ...current, liquidity: { ...current.liquidity, [field.key]: { ...current.liquidity[field.key], threshold } } })); setErrors(current => ({ ...current, [field.key]: '' }))
+                  setDraft(current => ({ ...current, liquidity: { ...current.liquidity, [field.key]: { ...current.liquidity[field.key], threshold } } })); setErrors(current => ({ ...current, [field.key]: '' })); setSavedMessage('')
                 }} />
                 <FieldDescription id={`description-${field.key}`}>{field.description}</FieldDescription>
                 {errors[field.key] && <FieldError id={`error-${field.key}`}>{errors[field.key]}</FieldError>}
@@ -221,7 +275,14 @@ export function WorkspaceSettings({ preferences, loadError, onSave }: { preferen
             </FieldSet>)}
           </FieldGroup>
         </FieldSet>
-        <HistoryDownloadSettings open={open} />
+              </div>
+              <div hidden={section !== 'data'} className="flex flex-col gap-8">
+                <FieldSet disabled={preferenceDisabled}><FieldLegend>Integrity audit range</FieldLegend><FieldGroup>
+                  {numericField('historyDays', 'Data audit lookback (days)', 'Limits the integrity audit range. Full history downloads always start at listing.')}
+                </FieldGroup></FieldSet>
+                <Separator />
+        <HistoryDownloadSettings open={dataMounted} />
+        <Separator />
         <FieldSet>
           <FieldLegend>Data integrity</FieldLegend>
           <FieldDescription>Check persisted history for gaps and invalid data. Repair downloads missing intervals in the background.</FieldDescription>
@@ -237,9 +298,18 @@ export function WorkspaceSettings({ preferences, loadError, onSave }: { preferen
             <strong>{issue.instrument} · {issue.timeframe}</strong><p>{new Date(issue.from).toLocaleString('en-US')} – {new Date(issue.through).toLocaleString('en-US')}</p><p>{issue.reason} · {issue.repairable ? 'Repairable' : 'Review required'}</p>
           </li>)}</ul>}
         </FieldSet>
-        <FieldSet><FieldLegend>Optional AI analysis</FieldLegend><FieldDescription>Configure a model to analyze chart images.</FieldDescription><AnalysisSettingsButton /></FieldSet>
-        <DialogFooter><Button type="button" variant="outline" onClick={() => setOpen(false)} disabled={saving}>Cancel</Button><Button type="submit" disabled={saving}>{saving && <Spinner data-icon="inline-start" />}Save settings</Button></DialogFooter>
-      </form>
-    </DialogContent>
-  </Dialog>
+              </div>
+            </form>
+            <section hidden={section !== 'analysis'} aria-label="AI connection">
+              {analysisMounted && <AnalysisSettings onDirtyChange={setAnalysisDirty} onBusyChange={setAnalysisBusy} />}
+            </section>
+          </div>
+        </div>
+        {section !== 'analysis' && <footer className="shrink-0 border-t px-12 py-4"><div className="mx-auto flex w-full max-w-3xl items-center justify-between gap-4">
+          <p role="status" className="text-sm text-muted-foreground">{saving ? 'Saving settings…' : dirty ? 'Unsaved changes' : savedMessage || 'Changes apply after saving.'}</p>
+          <div className="flex gap-2"><Button type="button" variant="outline" disabled={preferenceDisabled || !dirty} onClick={() => { setDraft(preferencesDraft(preferences)); setErrors({}); setSaveError(''); setSavedMessage('') }}>Discard changes</Button><Button type="submit" form="workspace-settings-form" disabled={preferenceDisabled}>{saving && <Spinner data-icon="inline-start" />}Save settings</Button></div>
+        </div></footer>}
+      </div>
+    </div>
+  </main>
 }
