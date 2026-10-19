@@ -9,8 +9,9 @@ import { createDesktopSecurity } from './desktop-security.js'
 import { testPresentation } from './test-presentation.js'
 import { initializeOperationRecording, closeOperationRecording, closeExternalOperationSource } from './services/operation-runtime.js'
 import { startGraphicsRecording } from './services/operation-graphics.js'
-import { beginOperation, measureOperation, recordOperation, runWithOperationContext } from './services/operations.js'
+import { beginOperation, measureOperation, recordOperation, runWithOperationContext, withOperationSuppressed } from './services/operations.js'
 import { createRendererOperationReceiver } from './services/renderer-operations.js'
+import { createOperationSession, enforceOperationRetention } from './services/operation-retention.js'
 import { MarketBackend } from './services/market-backend.js'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
@@ -26,10 +27,23 @@ if (process.env.PERPETUAL_SWAP_USER_DATA) {
   app.setPath('userData', userData)
   app.setPath('sessionData', sessionData)
 }
-if (!process.env.PERPETUAL_SWAP_OPERATION_DIR) {
-  process.env.PERPETUAL_SWAP_OPERATION_DIR = join(app.getPath('userData'), 'Operations', `${Date.now()}-${process.pid}`)
+const operationSessionRoot = join(app.getPath('userData'), 'Operations')
+const operationSession = !process.env.PERPETUAL_SWAP_OPERATION_DIR
+  ? await withOperationSuppressed(() => createOperationSession({ root: operationSessionRoot })) : undefined
+if (operationSession) process.env.PERPETUAL_SWAP_OPERATION_DIR = operationSession.directory
+let retentionTask = Promise.resolve()
+const maintainOperationRetention = () => {
+  if (!operationSession) return retentionTask
+  retentionTask = retentionTask.catch(() => {}).then(() => withOperationSuppressed(async () => {
+    await operationSession.heartbeat()
+    return enforceOperationRetention(operationSessionRoot)
+  })).catch(error => { console.error('Operation retention failed:', error.message) })
+  return retentionTask
 }
+await maintainOperationRetention()
 const operationRecording = initializeOperationRecording({ label: 'electron-main' })
+const retentionTimer = operationSession ? setInterval(maintainOperationRetention, 60_000) : undefined
+retentionTimer?.unref()
 const rendererOperations = createRendererOperationReceiver()
 let stopGraphicsRecording
 const security = createDesktopSecurity({ rendererURL, rendererFile: join(root, 'dist', 'index.html') })
@@ -229,6 +243,7 @@ app.on('before-quit', event => {
   shuttingDown = true
   ipcMain.removeHandler('radar:request')
   void (async () => {
+    let recordingComplete = false
     try {
       for (const { controller } of gatewayRequests.values()) controller.abort()
       await Promise.allSettled([...gatewayRequests.values()].map(value => value.finished))
@@ -240,8 +255,21 @@ app.on('before-quit', event => {
       }
       await stopGraphicsRecording?.()
       await closeOperationRecording()
+      recordingComplete = true
     } catch (error) { console.error('Desktop shutdown failed:', error) }
-    finally { shutdownComplete = true; app.quit() }
+    finally {
+      clearInterval(retentionTimer)
+      if (operationSession) {
+        try {
+          await retentionTask
+          await withOperationSuppressed(async () => {
+            await operationSession.close({ complete: recordingComplete })
+            await enforceOperationRetention(operationSessionRoot)
+          })
+        } catch (error) { console.error('Operation session did not close cleanly:', error.message) }
+      }
+      shutdownComplete = true; app.quit()
+    }
   })()
 })
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
