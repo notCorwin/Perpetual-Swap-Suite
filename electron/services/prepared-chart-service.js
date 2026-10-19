@@ -81,7 +81,7 @@ export class PreparedChartPipeline {
       if (journal.length > 256) journal.shift()
       this.priceJournal.set(key, journal)
     })
-    this.closed = false; this.disposeTask = null; this.focusKey = null; this.requestedIDs = new Set(); this.refreshTimer = null
+    this.closed = false; this.disposeTask = null; this.focusKey = null; this.acquisition = null; this.requestedIDs = new Set(); this.refreshTimer = null
   }
 
   state(instId, timeframe) {
@@ -174,7 +174,11 @@ export class PreparedChartPipeline {
     if (!intervalFor(timeframe)) throw new Error('Unsupported chart timeframe.')
     this.requestedIDs = new Set(instIds)
     this.universe = new Map(instIds.flatMap(instId => ['5m', '15m', '1H'].map(timeframe => [seriesKey(instId, timeframe), { instId, timeframe }])))
-    if (focusInstId) this.focusKey = seriesKey(focusInstId, timeframe)
+    if (focusInstId) {
+      const key = seriesKey(focusInstId, timeframe)
+      if (this.acquisition?.key !== key) this.acquisition = null
+      this.focusKey = key
+    }
     this.trim()
     // Each selected series restores independently. No universe-wide startup barrier.
     return { frames: [...this.snapshots.values()].map(value => value.frame).filter(frame => this.requestedIDs.has(frame.instId)) }
@@ -342,6 +346,7 @@ export class PreparedChartPipeline {
     const key = seriesKey(instId, timeframe)
     if (priority === 'foreground') this.focusKey = key
     const state = this.state(instId, timeframe)
+    if (priority === 'foreground' || this.acquisition?.key === key) this.acquisition = null
     state.historyRequest = (state.historyRequest ?? 0) + 1
     state.historyEnd = null
     if (!state.loaded || !state.rows.has(state.latestHour)) await this.job(`local:${key}`, () => this.read(state, undefined, TAIL, priority))
@@ -352,10 +357,14 @@ export class PreparedChartPipeline {
     return frame.bars.length || frame.liveBar ? frame : null
   }
 
-  async localHistory(instId, timeframe, targetEnd) {
+  async localHistory(instId, timeframe, targetEnd, { acquisition = null } = {}) {
     if (this.closed) throw new Error('Prepared chart data service is closed.')
     this.focusKey = seriesKey(instId, timeframe)
     const state = this.state(instId, timeframe)
+    const active = this.acquisition
+    // A generation refresh of the admitted viewport does not supersede its
+    // prefetch. A different navigation intent retires that ownership for good.
+    if (!acquisition && active && (active.key !== state.key || targetEnd !== active.navigationEnd && targetEnd !== active.targetEnd)) this.acquisition = null
     const request = state.historyRequest = (state.historyRequest ?? 0) + 1
     state.historyEnd = targetEnd ?? state.latestHour
     const end = targetEnd ?? state.latestHour
@@ -380,11 +389,15 @@ export class PreparedChartPipeline {
 
   async prepare(instId, timeframe, targetEnd, historyBars = VISIBLE) {
     if (!intervalFor(timeframe) || targetEnd !== undefined && !Number.isFinite(targetEnd)) throw new Error('Invalid chart target.')
-    let frame = targetEnd === undefined ? await this.local(instId, timeframe) : await this.localHistory(instId, timeframe, targetEnd)
     const state = this.state(instId, timeframe)
+    // Admit before the first local read: an older SQL response cannot claim
+    // ownership back from a newer preparation while either read is pending.
+    const acquisition = targetEnd === undefined ? null : { key: state.key, targetEnd, navigationEnd: state.historyEnd }
+    if (acquisition) this.acquisition = acquisition
     state.active += 1
-    const current = () => !this.closed && this.focusKey === state.key && state.historyEnd === targetEnd
+    const current = () => !this.closed && this.focusKey === state.key && this.acquisition === acquisition && state.historyEnd !== null
     try {
+      let frame = targetEnd === undefined ? await this.local(instId, timeframe) : await this.localHistory(instId, timeframe, targetEnd, { acquisition })
       if (targetEnd !== undefined && !current()) return this.historyFrame(state, targetEnd)
       const prices = this.refreshObservations(state, targetEnd, VISIBLE, targetEnd === undefined ? VISIBLE : HISTORY_PAGE)
       if (targetEnd !== undefined) {
@@ -398,10 +411,13 @@ export class PreparedChartPipeline {
         if (!current()) return this.historyFrame(state, targetEnd)
         this.publish(state)
         const reserve = Math.max(HISTORY_PAGE, Math.min(HISTORY - HISTORY_AHEAD, historyBars))
-        for (let loaded = HISTORY_PAGE; current() && loaded < reserve; loaded += HISTORY_PAGE) {
+        for (let loaded = HISTORY_PAGE; current() && loaded < reserve;) {
           const through = targetEnd - loaded * state.intervalMS
-          if (through < Math.max(0, state.floor ?? 0)) break
-          await this.refreshObservations(state, through, Math.min(HISTORY_PAGE, reserve - loaded))
+          const firstRetained = Math.max(0, state.floor ?? 0, state.historyEnd - (HISTORY - HISTORY_AHEAD - 1) * state.intervalMS)
+          const count = Math.min(HISTORY_PAGE, reserve - loaded, (through - firstRetained) / state.intervalMS + 1)
+          if (count <= 0) break
+          await this.refreshObservations(state, through, count)
+          loaded += count
           if (!current()) break
           await this.seed(state, 'foreground')
           while (current() && state.calculation) await state.calculation
@@ -416,6 +432,7 @@ export class PreparedChartPipeline {
       return frame ?? this.frame(state)
     } finally {
       state.active -= 1
+      if (this.acquisition === acquisition) this.acquisition = null
       this.trim()
     }
   }

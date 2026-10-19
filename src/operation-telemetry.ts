@@ -13,7 +13,7 @@ type TelemetryHost = {
   onFlush: (callback: () => Promise<void>) => () => void
 }
 
-const BATCH_SIZE = 128, FLUSH_MS = 250, MAX_PENDING = 8_192
+const BATCH_SIZE = 128, MAX_BATCH_SIZE = 2_048, FLUSH_MS = 250, MAX_PENDING = 8_192
 
 /** Retain each lifecycle record until the main process acknowledges durable storage. */
 export async function initializeOperationTelemetry(host: TelemetryHost = {
@@ -46,7 +46,9 @@ export async function initializeOperationTelemetry(host: TelemetryHost = {
     flushing = (async () => {
       while (pending.length) {
         if (!batch) {
-          const events = pending.slice(0, BATCH_SIZE)
+          // Keep prompt small flushes, but amortize durable IPC when native
+          // market notifications accumulate while the previous ACK is pending.
+          const events = pending.slice(0, MAX_BATCH_SIZE)
           batch = { executionId: events[0].executionId, batchId: `${events[0].executionId}:batch:${++nextBatch}`,
             firstSequence: events[0].sequence, events }
         }

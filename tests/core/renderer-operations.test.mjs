@@ -47,5 +47,20 @@ test('renderer batches preserve source IDs and only acknowledge durable, replay-
     assert.throws(() => receiver.receive(8, batch), /Unknown renderer/)
     await assert.rejects(receiver.receive(7, { ...batch, batchId: 'gap', firstSequence: 4, events: [event(4, 'start')] }), /out of sequence/)
     await assert.rejects(receiver.receive(7, { ...batch, events: batch.events.map(value => ({ ...value, name: 'changed' })) }), /different records/)
+    const backlog = Array.from({ length: 2_048 }, (_, index) => ({
+      ...event(index + 3, index % 2 ? 'end' : 'start'), id: `${identity.executionId}:${Math.floor(index / 2) + 2}`,
+    }))
+    const largeBatch = { ...batch, batchId: 'fixture-backlog', firstSequence: 3, events: backlog }
+    assert.throws(() => receiver.receive(7, { ...largeBatch, events: [...backlog, event(2_051, 'start')] }), /Invalid renderer operation batch/)
+    const draining = receiver.receive(7, largeBatch)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(persisted.length, 2_050)
+    release()
+    assert.deepEqual(await draining, { batchId: 'fixture-backlog', lastSequence: 2_050 })
+    const replay = receiver.receive(7, largeBatch)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(persisted.length, 2_050, 'A full-size lost-ACK retry must not duplicate retained records.')
+    release()
+    assert.deepEqual(await replay, { batchId: 'fixture-backlog', lastSequence: 2_050 })
   } finally { unsubscribe() }
 })
