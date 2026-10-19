@@ -2,6 +2,16 @@ const time = value => Number.isFinite(value) && value > 0
 const matching = (arg, instId, channel) => arg?.instId === instId && arg.channel === channel
 const business = connection => { try { return new URL(connection.url).pathname === '/ws/v5/business' } catch { return false } }
 
+/** Local scope/cap violations invalidate the check even after successful market
+ * assertions. Recovered upstream failures do not establish a local defect. */
+export function chartOutcomeWithRelayErrors(outcome, source) {
+  const errors = source?.errors ?? []
+  const violation = errors.find(value => value.kind === 'app-scope-escape') ?? errors.find(value => value.kind === 'harness-bound')
+  if (!violation) return outcome
+  return { ...outcome, classification: violation.kind === 'app-scope-escape' ? 'app-failure' : 'harness-failure',
+    localRelayFailure: violation, error: outcome.error ?? { name: 'RelayLocalViolation', message: violation.message } }
+}
+
 /** Absence of a witness cannot establish an external outage on its own. */
 export function missingCandleEvidence(source, { instId, channel = 'candle5m', sinceOrder } = {}) {
   const connection = (source?.connections ?? []).filter(business).at(-1)

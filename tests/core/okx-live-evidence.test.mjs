@@ -1,9 +1,33 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { missingCandleEvidence, requiredMarketInputFailures } from '../../scripts/okx-live-evidence.mjs'
+import { chartOutcomeWithRelayErrors, missingCandleEvidence, requiredMarketInputFailures } from '../../scripts/okx-live-evidence.mjs'
 
 const instId = 'BTC-USDT-SWAP', arg = { instId, channel: 'candle5m' }
 const options = { instId, sinceOrder: 10 }
+
+test('four successful chart observations cannot erase proven local relay failures, including errors discovered while closing', async t => {
+  const passed = { classification: 'passed', observations: ['cold', 'later native update', 'contract switch', 'warm return'] }
+  for (const [kind, expected] of [['harness-bound', 'harness-failure'], ['app-scope-escape', 'app-failure']]) await t.test(kind, () => {
+    const violation = { kind, message: 'Independently observed local relay violation.' }
+    const result = chartOutcomeWithRelayErrors(passed, { errors: [violation] })
+    assert.equal(result.classification, expected); assert.equal(result.observations.length, 4)
+    assert.deepEqual(result.localRelayFailure, violation)
+    assert.equal(result.error.name, 'RelayLocalViolation')
+  })
+  const source = { errors: [] }
+  const observed = chartOutcomeWithRelayErrors(passed, source)
+  assert.equal(observed.classification, 'passed')
+  source.errors.push({ kind: 'harness-bound', message: 'Late error after the last successful observation.' })
+  assert.equal(chartOutcomeWithRelayErrors(observed, source).classification, 'harness-failure', 'The final source snapshot must be checked again after relay.close().')
+  assert.equal(chartOutcomeWithRelayErrors(passed, { errors: [{ kind: 'harness-bound' }, { kind: 'app-scope-escape' }] }).classification, 'app-failure')
+  assert.equal(chartOutcomeWithRelayErrors(passed, { errors: [{ kind: 'upstream-http' }, { kind: 'upstream-websocket' }] }).classification, 'passed',
+    'Recoverable external source errors cannot invent a local failure.')
+  for (const classification of ['app-failure', 'harness-failure', 'integration-failed', 'external-unavailable']) {
+    const failure = { classification, error: { name: 'OriginalFailure', message: 'Preserve the demonstrated failure.' } }
+    assert.deepEqual(chartOutcomeWithRelayErrors(failure, { errors: [] }), failure)
+    assert.notEqual(chartOutcomeWithRelayErrors(failure, { errors: [{ kind: 'harness-bound' }] }).classification, 'passed')
+  }
+})
 const subscribed = () => ({ url: 'wss://ws.okx.com/ws/v5/business', startedAt: 100,
   commands: [{ id: 'native-1', op: 'subscribe', args: [arg], receivedAt: 100, forwardedAt: 100, forwardedOrder: 2 }],
   acknowledgements: [{ id: 'native-1', event: 'subscribe', arg, receivedAt: 100, receivedOrder: 3, forwardedAt: 100, forwardedOrder: 4 }] })

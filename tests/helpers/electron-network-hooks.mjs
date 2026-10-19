@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { app, net, session } from 'electron'
 import { createServer } from 'node:http'
+import { createConnection } from 'node:net'
 import { once } from 'node:events'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -10,6 +11,7 @@ import { installOperationHooks, installElectronOperationHooks, getOperationHookC
 import { attachOperationSink, configureOperationContext, configureOperationPropagation, withOperationSuppressed } from '../../electron/services/operations.js'
 import { initializeOperationRecording, closeOperationRecording } from '../../electron/services/operation-runtime.js'
 import { createNativeExchange } from './native-exchange.mjs'
+import { ownFixtureServer } from './fixture-server.mjs'
 
 if (process.platform === 'darwin') app.setActivationPolicy('accessory')
 const userData = await mkdtemp(join(tmpdir(), 'perp-electron-net-proof-'))
@@ -24,12 +26,14 @@ if(!recording){
 attachOperationSink(value => events.push(value))
 installOperationHooks()
 const preReady = installElectronOperationHooks({ app, net, session })
-let server, exchange
+let server, ownedServer, exchange, result, failed = false
+const phases = []
+function phase(name) { phases.push(name); console.error(`[native-network-fixture] ${name}`) }
 async function proof() {
 try {
+  phase('app-ready')
   assert.equal(preReady.find(value=>value.api==='electron.net.fetch').enabled,false)
   await app.whenReady()
-  const deadline = setTimeout(() => { console.error('proof: timeout'); app.exit(1) }, 15_000); deadline.unref()
   const originalSocket = net.WebSocket
   const capabilities = installElectronOperationHooks({ app, net, session })
   assert.deepEqual(installElectronOperationHooks({ app, net, session }), capabilities)
@@ -44,23 +48,35 @@ try {
     let text = ''; request.on('data', chunk => text += chunk)
     request.on('end', () => response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ size: Buffer.byteLength(text) })))
   }))
+  ownedServer = ownFixtureServer(server)
   await withOperationSuppressed(() => new Promise(resolve => server.listen(0, '127.0.0.1', resolve)))
   const origin = `http://127.0.0.1:${server.address().port}`
+  // Keep one accepted socket with no request. Chromium's connection pool can
+  // produce this state; teardown must own it rather than wait for its timeout.
+  await withOperationSuppressed(async () => {
+    const accepted = once(server, 'connection'), socket = createConnection(server.address().port, '127.0.0.1')
+    socket.on('error', () => {})
+    await Promise.all([once(socket, 'connect'), accepted])
+  })
   events.length = 0
+  phase('http-fetch-body')
   const response = await net.fetch(origin + '/held')
   assert.equal(response.bodyUsed, false)
   assert.equal(events.some(value => value.name === 'electron.net.fetch'), false)
   release(); assert.deepEqual(await response.json(), { answer: 42 })
   assert.equal(events.find(value => value.name === 'electron.net.fetch').attributes.receivedBytes, 13)
   const controller = new AbortController()
+  phase('http-fetch-abort')
   const aborted = await net.fetch(origin + '/held', { signal: controller.signal })
   controller.abort()
   await assert.rejects(aborted.text())
   release()
   assert.ok(events.some(value => value.name === 'electron.net.fetch' && value.status === 'cancelled'))
+  phase('session-fetch-and-resolve')
   const isolated = session.fromPartition(`native-proof-${Date.now()}`)
   assert.deepEqual(await (await isolated.fetch(origin + '/session')).json(), { size: 0 })
   await net.resolveHost('localhost'); await isolated.resolveHost('localhost')
+  phase('http-request-post')
   await new Promise((resolve, reject) => {
     const request = net.request({ url: origin + '/private-path?credential=secret', method: 'POST' })
     request.on('response', response => {
@@ -74,6 +90,7 @@ try {
     request.write('abc'); request.end('de')
   })
   const beforeHeldRequest = events.filter(value => value.name === 'electron.net.request').length
+  phase('http-request-held-body')
   const heldRequest = net.request(origin + '/held')
   const incoming = new Promise((resolve, reject) => { heldRequest.once('response', resolve); heldRequest.once('error', reject) })
   heldRequest.end()
@@ -84,6 +101,7 @@ try {
   assert.ok(events.some(value => value.name === 'electron.net.request' && value.status === 'ok' && value.attributes.receivedBytes === 13))
   const request = events.find(value => value.name === 'electron.net.request' && value.status === 'ok' && value.attributes.sentBytes === 5)
   assert.equal(request.attributes.sentBytes, 5); assert.equal(request.attributes.receivedBytes, 10)
+  phase('network-gates')
   await assert.rejects(net.fetch('https://private-no-outbound.invalid/secret'), error => error.code === 'SANDBOX_NETWORK_BLOCKED')
   await assert.rejects(net.fetch(origin + '/redirect'))
   assert.throws(() => net.request('https://private-no-outbound.invalid/secret'), error => error.code === 'SANDBOX_NETWORK_BLOCKED')
@@ -93,6 +111,7 @@ try {
   assert.equal(events.filter(value => value.name === 'electron.session.resolveHost' && value.status === 'ok').length, 1)
   assert.equal(events.filter(value => value.name === 'node.http.request' || value.name === 'socket.connect' || value.name === 'fetch.request').length, 0)
   if (capabilities.find(value => value.api === 'electron.net.WebSocket')?.enabled) {
+    phase('websocket')
     exchange = await withOperationSuppressed(() => createNativeExchange())
     const socket = new net.WebSocket(exchange.environment.PERPETUAL_SWAP_E2E_WEBSOCKET_ORIGIN + '/ws/v5/public')
     assert.ok(socket instanceof originalSocket)
@@ -104,15 +123,27 @@ try {
     assert.ok(events.some(value => value.name === 'websocket.receive' && value.attributes.stream === 'electron-native' && value.attributes.source === 'native'))
   }
   assert.doesNotMatch(JSON.stringify(events), /private-path|credential|private-no-outbound|secret/)
-  console.log(JSON.stringify({passed:true,visibleWindows:0,names:[...new Set(events.map(value=>value.name))],capabilities:capabilities.filter(value=>value.api.startsWith('electron'))}))
+  phase('assertions-passed')
+  result = {passed:true,visibleWindows:0,names:[...new Set(events.map(value=>value.name))],capabilities:capabilities.filter(value=>value.api.startsWith('electron'))}
 } catch (error) {
-  console.error(error.stack ?? error); globalThis.proofFailed = true
+  console.error(error.stack ?? error); failed = true
 } finally {
-  await withOperationSuppressed(() => exchange?.close())
-  if (server) await withOperationSuppressed(() => new Promise(resolve => server.close(resolve)))
-  await withOperationSuppressed(() => rm(userData, { recursive: true, force: true }))
-  await closeOperationRecording().catch(error=>{console.error(error.stack);globalThis.proofFailed=true})
-  if (globalThis.proofFailed) app.exit(1); else app.quit()
+  const cleanup = async (name, action) => {
+    phase(name)
+    try { await withOperationSuppressed(action) } catch (error) { console.error(error.stack ?? error); failed = true }
+  }
+  await cleanup('cleanup-exchange', () => exchange?.close())
+  const connectionsBeforeClose = ownedServer?.connections ?? 0
+  await cleanup('cleanup-http', () => ownedServer?.close())
+  await cleanup('cleanup-user-data', () => rm(userData, { recursive: true, force: true }))
+  phase('cleanup-recorder')
+  await closeOperationRecording().catch(error => { console.error(error.stack); failed = true })
+  if (failed) app.exit(1)
+  else {
+    phase('complete')
+    console.log(JSON.stringify({...result,cleanupComplete:true,connectionsBeforeClose,phases}))
+    app.quit()
+  }
 }
 }
 void proof()

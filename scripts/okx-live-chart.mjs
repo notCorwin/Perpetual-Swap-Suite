@@ -5,7 +5,7 @@ import { resolve, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { _electron } from 'playwright'
 import { createOKXRelay } from './okx-relay.mjs'
-import { missingCandleEvidence, requiredMarketInputFailures } from './okx-live-evidence.mjs'
+import { chartOutcomeWithRelayErrors, missingCandleEvidence, requiredMarketInputFailures } from './okx-live-evidence.mjs'
 
 const root = process.cwd(), directory = resolve(root, process.env.OKX_LIVE_CHART_OUTPUT ?? `.build/okx-live-chart/${new Date().toISOString().replaceAll(':', '').replaceAll('.', '')}`)
 await mkdir(directory, { recursive: true })
@@ -135,9 +135,8 @@ try {
   report.classification = 'passed'
 } catch (error) {
   report.classification = error.classification ?? (assertionActive || stage === 'launch-app' ? 'app-failure' : stage === 'clock-probe' ? 'external-unavailable' : 'harness-failure')
-  if (relay?.errors.some(value => value.kind === 'harness-bound')) report.classification = 'harness-failure'
-  if (relay?.errors.some(value => value.kind === 'app-scope-escape')) report.classification = 'app-failure'
   report.error = { name: error.name, message: error.message, code: error.cause?.code }
+  Object.assign(report, chartOutcomeWithRelayErrors(report, relay?.snapshot()))
   if (page) try { report.lastChart = await readChart() } catch {}
   process.exitCode = 1
 } finally {
@@ -163,6 +162,8 @@ try {
   }
   await relay?.close()
   report.source = relay?.snapshot(); report.endedAt = new Date().toISOString()
+  Object.assign(report, chartOutcomeWithRelayErrors(report, report.source))
+  if (report.classification !== 'passed') process.exitCode = 1
   if (exited) {
     try { report.health = await Promise.all((await readdir(operations)).filter(file => file.endsWith('.health.json')).map(async file => JSON.parse(await readFile(join(operations, file), 'utf8')))) }
     catch (error) { report.recordingError = error.name }

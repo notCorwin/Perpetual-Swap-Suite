@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
 import { once } from 'node:events'
+import { ownFixtureServer } from './fixture-server.mjs'
 
 export const nativeIntervals = { '5m': 300_000, '15m': 900_000, '1H': 3_600_000 }
 const frame = (value, opcode = 1) => {
@@ -81,6 +82,7 @@ export async function createNativeExchange() {
     errors.push(`Unexpected native exchange HTTP endpoint: ${request.url}`)
     response.writeHead(500, { 'Content-Type': 'application/json' }).end(JSON.stringify({ code: 'fixture-error', msg: 'Unsupported loopback exchange endpoint', data: [] }))
   })
+  const ownedServer = ownFixtureServer(server)
   const send = (client, value) => { if (!client.socket.destroyed) client.socket.write(frame(typeof value === 'string' ? value : JSON.stringify(value))) }
   const snapshot = (client, arg) => {
     const { instId, channel } = arg
@@ -124,6 +126,7 @@ export async function createNativeExchange() {
     }
   }
   server.on('upgrade', (request, socket, head) => {
+    if (ownedServer.closing) { socket.destroy(); return }
     if (!['/ws/v5/public', '/ws/v5/business'].includes(request.url) || typeof request.headers['sec-websocket-key'] !== 'string') { socket.destroy(); return }
     const accept = createHash('sha1').update(request.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
     socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
@@ -188,8 +191,7 @@ export async function createNativeExchange() {
     async close() {
       holdLatest = false
       for (const value of held) value.response.destroy()
-      for (const client of clients) client.socket.destroy()
-      await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+      await ownedServer.close()
     },
   }
 }

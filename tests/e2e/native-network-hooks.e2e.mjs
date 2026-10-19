@@ -13,12 +13,15 @@ test('real Electron after-ready hooks cover Chromium fetch/session/request/resol
   const result=await new Promise((resolve,reject)=>{
     const child=spawn(executable,[fixture],{env,stdio:['ignore','pipe','pipe']})
     let stdout='',stderr=''
-    const deadline=setTimeout(()=>{child.kill();reject(new Error('Electron native fixture timed out'))},15000)
+    const deadline=setTimeout(()=>{child.kill();reject(new Error(`Electron native fixture timed out: ${stderr}\nstdout: ${stdout}`))},15000)
     child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr=(stderr+chunk).slice(-24000))
     child.once('error',error=>{clearTimeout(deadline);reject(error)})
-    child.once('exit',code=>{clearTimeout(deadline);if(code!==0){reject(new Error(`Electron native fixture failed (${code}): ${stderr}`));return}try{resolve(JSON.parse(stdout))}catch(error){reject(new Error(`${error.message}: ${stdout} ${stderr}`))}})
+    child.once('close',code=>{clearTimeout(deadline);if(code!==0){reject(new Error(`Electron native fixture failed (${code}): ${stderr}`));return}try{resolve(JSON.parse(stdout))}catch(error){reject(new Error(`${error.message}: ${stdout} ${stderr}`))}})
   })
   assert.equal(result.passed,true);assert.equal(result.visibleWindows,0)
+  assert.equal(result.cleanupComplete,true)
+  assert.ok(result.connectionsBeforeClose>=1,'Shutdown must close the accepted socket without an HTTP request.')
+  assert.equal(result.phases.at(-1),'complete')
   for(const api of ['electron.net.fetch','electron.net.request','electron.net.resolveHost','electron.session.fetch','electron.session.resolveHost','electron.net.WebSocket'])assert.equal(result.capabilities.find(entry=>entry.api===api)?.enabled,true,api)
   assert.ok(result.names.includes('websocket.receive'))
 })
