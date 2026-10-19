@@ -14,6 +14,7 @@
     "test:e2e": "node scripts/test-sandbox.mjs e2e",
     "test:foreground": "node scripts/test-sandbox.mjs foreground",
     "benchmark": "node scripts/test-sandbox.mjs command -- node --experimental-strip-types scripts/benchmark.ts",
+    "benchmark:operations": "node scripts/operation-overhead.mjs",
     "benchmark:chart:foreground": "node scripts/test-sandbox.mjs command --foreground -- node scripts/chart-scroll-benchmark.mjs",
     "benchmark:instruments": "npm run build && node scripts/test-sandbox.mjs command -- node scripts/instrument-navigation-benchmark.mjs",
     "benchmark:market:foreground": "node scripts/test-sandbox.mjs command --foreground -- node scripts/market-resource-benchmark.mjs",

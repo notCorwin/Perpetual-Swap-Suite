@@ -110,7 +110,9 @@ test('subscription changes immediately republish quote status from cached projec
     await finishSeed(pipeline)
     const live = { ...candle(end() + interval), confirmed: false }
     await pipeline.setLive(instId, '15m', live)
+    await pipeline.local(other, '15m')
     await pipeline.setLive(other, '15m', { ...live, instrument: other })
+    pipeline.series.delete(`${other}:15m`) // Previously opened compact cache outlives its history LRU.
     const focused = pipeline.cached(`${instId}:15m`), cached = pipeline.cached(`${other}:15m`)
     assert.equal(focused.realtimeState, 'stale')
     assert.equal(cached.realtimeState, 'stale')
@@ -151,6 +153,73 @@ test('candidate subscription and renderer admission perform no eager source rest
     const response = await pipeline.setUniverse(ids, '15m', ids[0])
     assert.deepEqual(response, { frames: [] }); assert.equal(pipeline.realtimeKeys.size, 861)
     assert.equal(store.queries.length, 0); assert.equal(pipeline.nextCalculation, 0); assert.equal(pipeline.series.size, 0)
+  } finally { await pipeline.dispose() }
+})
+
+test('full-universe forming intake retains raw prices without publishing charts that were never requested', async () => {
+  const { pipeline, store } = fixture([]), frames: any[] = [], operations: OperationEvent[] = []
+  const ids = Array.from({ length: 287 }, (_, index) => `CANDIDATE${index}-USDT-SWAP`)
+  const timeframes = [['5m', 300000], ['15m', 900000], ['1H', 3600000]] as const
+  pipeline.setRealtimeSubscriptions(ids.flatMap(instId => timeframes.map(([timeframe]) => ({ instId, timeframe }))))
+  pipeline.setUniverse(ids, '15m')
+  pipeline.subscribe((frame: any) => frames.push(frame))
+  const unsubscribe = attachOperationSink(operation => operations.push(operation))
+  const tick = async (sequence: number) => {
+    for (const [index, instrument] of ids.entries()) for (const [timeframe, step] of timeframes) {
+      await pipeline.setLive(instrument, timeframe, { ...candle(Math.floor(Date.now() / step) * step), instrument, timeframe,
+        close: 100 + sequence + index / 1000, volume: 100 + sequence, confirmed: false })
+    }
+  }
+  try {
+    for (let sequence = 1; sequence <= 60; sequence++) await tick(sequence)
+    assert.equal(pipeline.liveStates.size, 861)
+    assert.equal(pipeline.snapshots.size, 0)
+    assert.equal(pipeline.series.size, 0)
+    assert.equal(pipeline.nextCalculation, 0)
+    assert.equal(store.queries.length, 0)
+    assert.equal(frames.length, 0, 'Collector membership alone cannot produce 51,660 unused chart notifications.')
+    assert.equal(operations.filter(operation => operation.name === 'chart.frame').length, 0)
+    const selected = ids[178], opened = await pipeline.local(selected, '1H')
+    assert.equal(opened.liveBar.close, 160.178, 'Opening a cold chart reads the latest retained native price immediately.')
+    assert.equal(opened.realtimeState, 'live')
+    frames.length = 0; operations.length = 0
+    await tick(61)
+    assert.equal(frames.length, 1, 'Only the explicitly materialized chart receives the next full-market revision.')
+    assert.equal(frames[0].instId, selected)
+    assert.equal(frames[0].timeframe, '1H')
+    assert.equal(frames[0].liveBar.close, 161.178)
+    assert.equal(operations.filter(operation => operation.name === 'chart.frame').length, 1)
+    pipeline.maxSeries = 1
+    await pipeline.local(ids[179], '5m')
+    assert.equal(pipeline.series.has(`${selected}:1H`), false)
+    const reads = store.queries.length
+    frames.length = 0
+    await tick(62)
+    assert.equal(frames.length, 2, 'A previously materialized compact cache stays current after history LRU eviction.')
+    assert.equal(frames.find(frame => frame.instId === selected).liveBar.close, 162.178)
+    assert.equal(store.queries.length, reads, 'Maintaining compact cached prices cannot restore their evicted history.')
+    assert.equal(pipeline.realtimeKeys.size, 861, 'Publication demand cannot remove background market collection.')
+  } finally { unsubscribe(); await pipeline.dispose() }
+})
+
+test('list-indicator reuse cannot materialize chart snapshots or notifications before a chart is opened', async () => {
+  const { pipeline } = fixture(), frames: any[] = []
+  pipeline.setUniverse([instId], '15m')
+  pipeline.subscribe((frame: any) => frames.push(frame))
+  try {
+    const projected = await pipeline.projectListSeries(instId, '15m')
+    assert.ok(projected.bars.length > 0)
+    assert.ok(pipeline.series.has(`${instId}:15m`))
+    assert.equal(pipeline.snapshots.size, 0, 'Indicator residency is reusable source data, not an implicit chart subscription.')
+    assert.equal(frames.length, 0)
+    const calculations = pipeline.nextCalculation
+    await pipeline.setLive(instId, '15m', { ...candle(end() + interval), confirmed: false, close: 250 })
+    assert.equal(frames.length, 0)
+    const opened = await pipeline.local(instId, '15m')
+    assert.equal(opened.liveBar.close, 250)
+    assert.equal(opened.indicatorState, 'ready')
+    assert.equal(pipeline.nextCalculation, calculations, 'Opening reuses the existing exact recursive calculation.')
+    assert.equal(frames.length, 1)
   } finally { await pipeline.dispose() }
 })
 

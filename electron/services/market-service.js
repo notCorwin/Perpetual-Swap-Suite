@@ -19,6 +19,10 @@ import { statisticsMask, statisticsVersionFor, validTakerVolumes, STATISTICS_OI,
 const OKX_ORIGIN = 'https://www.okx.com/api/v5'
 const FIVE_MINUTES = 300_000
 const LIST_TIMEFRAMES = ['5m', '15m', '1H']
+const LIQUIDITY_SOURCE_CRITERIA = {
+  ticker: ['spread'], book: ['depth', 'slippage'], openInterest: ['openInterest'],
+  turnover: ['volume24h'], hourly: ['volumeStability'],
+}
 const OBSERVATION_TTL = 90_000
 const TICKER_BOOTSTRAP_MS = 10_000
 const CANDLE_DELIVERY_MS = 10_000
@@ -1132,7 +1136,7 @@ export class MarketService {
         if (row) this.publishListRow(frame, { ...row, lastPrice: number(value.last) }, receivedAt)
       }
     }
-    this.queueStreamQualification(instId)
+    this.queueStreamQualification(instId, key)
   }
 
   validTicker(value) {
@@ -1285,8 +1289,15 @@ export class MarketService {
     return observation
   }
 
-  queueStreamQualification(instId) {
+  queueStreamQualification(instId, source) {
     if (this.closing || this.disposed) return
+    if (source && LIQUIDITY_SOURCE_CRITERIA[source]) {
+      // Keep collecting the observation and publishing trade prices. Reuse an
+      // assessment when this source is absent from its enabled dependencies.
+      const config = this.preferences().liquidity, record = this.catalogChecks.get(instId)
+      if (record && record.instrument === this.instruments.get(instId) && record.configKey === JSON.stringify(config)
+        && LIQUIDITY_SOURCE_CRITERIA[source].every(key => config[key].enabled === false)) return
+    }
     this.streamQualifications.add(instId)
     if (this.streamQualificationTimer) return
     this.streamQualificationTimer = setTimeout(() => this.flushStreamQualifications(), 100)
@@ -1311,14 +1322,14 @@ export class MarketService {
         // replaces pending observations instead of growing the worker backlog.
         if (this.streamEvaluations.has(instId)) continue
         this.streamLiquidity ??= new StreamLiquidityEvaluator()
+        const capturedSources = Object.entries(LIQUIDITY_SOURCE_CRITERIA).filter(([, criteria]) => criteria.some(key => config[key].enabled)).map(([source]) => source)
         const task = this.streamLiquidity.evaluate(input).then(result => {
           if (this.closing || !this.currentCandidate(instrument, configKey, this.shutdownController.signal)
             || this.instrumentObservations.get(instId) !== instrumentObservation) return
           const current = this.observations.get(instId) ?? {}, now = Date.now()
-          if (current.turnover !== observations.turnover || current.hourly !== observations.hourly) return
+          if (config.volume24h.enabled && current.turnover !== observations.turnover
+            || config.volumeStability.enabled && current.hourly !== observations.hourly) return
           const currentInput = this.liquidityInput(instrument, config, current, now)
-          const capturedSources = ['book', ...(config.spread.enabled ? ['ticker'] : []), ...(config.openInterest.enabled ? ['openInterest'] : []),
-            ...(config.volume24h.enabled ? ['turnover'] : []), ...(config.volumeStability.enabled ? ['hourly'] : [])]
           const expiredSource = capturedSources.some(key => observations[key] && !this.observation(observations, key, now))
           const record = expiredSource || this.cheapLiquidity(currentInput).status === 'failed'
             ? this.observedCandidate(instrument, config, configKey, current, {}, now, this.evaluateLiquidity({ ...currentInput, book: null }))
@@ -1331,7 +1342,7 @@ export class MarketService {
         }).finally(() => {
           this.streamEvaluations.delete(instId)
           const current = this.observations.get(instId) ?? {}
-          if (this.instrumentObservations.get(instId) !== instrumentObservation || ['ticker', 'book', 'openInterest', 'turnover', 'hourly'].some(key => current[key] !== observations[key])) this.queueStreamQualification(instId)
+          if (this.instrumentObservations.get(instId) !== instrumentObservation || capturedSources.some(key => current[key] !== observations[key])) this.queueStreamQualification(instId)
         })
         this.streamEvaluations.set(instId, task)
         this.track(task)

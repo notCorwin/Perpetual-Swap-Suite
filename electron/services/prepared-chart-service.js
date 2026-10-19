@@ -222,6 +222,9 @@ export class PreparedChartPipeline {
   }
 
   publish(state) {
+    // Collection and list-indicator residency do not constitute chart demand.
+    // Retain their latest raw candles; materialize a frame when a chart opens.
+    if (!state.chartRequested && state.key !== this.focusKey && !this.snapshots.has(state.key)) return null
     const frame = this.frame(state), previous = this.snapshots.get(state.key)
     this.snapshots.set(state.key, { valid: true, frame })
     if (previous?.frame.bars !== frame.bars) { this.updateMemory(state); this.trim() }
@@ -342,6 +345,7 @@ export class PreparedChartPipeline {
     const key = seriesKey(instId, timeframe)
     if (priority === 'foreground') this.focusKey = key
     const state = this.state(instId, timeframe)
+    state.chartRequested = true
     state.historyRequest = (state.historyRequest ?? 0) + 1
     state.historyEnd = null
     if (!state.loaded || !state.rows.has(state.latestHour)) await this.job(`local:${key}`, () => this.read(state, undefined, TAIL, priority))
@@ -356,6 +360,7 @@ export class PreparedChartPipeline {
     if (this.closed) throw new Error('Prepared chart data service is closed.')
     this.focusKey = seriesKey(instId, timeframe)
     const state = this.state(instId, timeframe)
+    state.chartRequested = true
     const request = state.historyRequest = (state.historyRequest ?? 0) + 1
     state.historyEnd = targetEnd ?? state.latestHour
     const end = targetEnd ?? state.latestHour

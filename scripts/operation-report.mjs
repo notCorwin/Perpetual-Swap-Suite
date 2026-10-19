@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-import { createReadStream } from 'node:fs'
 import { mkdir, opendir, readFile, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { isOperationJournal, operationJournalExecutionId, readOperationJournal } from '../electron/services/operation-journal.js'
 
 export const operationCategories = ['cpu', 'gpu', 'network', 'database', 'io', 'ipc']
 export function operationRequirementKey(value) {
@@ -38,7 +38,7 @@ function finish(value) {
   const { buckets: _buckets, ...result } = value
   return { ...result, averageMS: value.count ? value.totalMS / value.count : 0, p95UpperBoundMS }
 }
-const recordingFile = path => /\.(jsonl|health\.json|participant\.json)$/.test(path) || /chromium-[^/]+\.status\.json$/.test(path)
+const recordingFile = path => isOperationJournal(path) || /\.(health\.json|participant\.json)$/.test(path) || /chromium-[^/]+\.status\.json$/.test(path)
 async function* traceFiles(path, depth = 0) {
   const info = await stat(path)
   if (info.isFile()) { if (recordingFile(path)) yield path; return }
@@ -76,9 +76,10 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
   const healthRecords = new Map(), executions = new Map(), participants = new Map(), actualCategories = new Set()
   const missingOperations = new Map(requireOperations.map(value => [operationRequirementKey(value), value]))
   let journalRecords = 0, substantiveOperations = 0, visitedFiles = 0, abandonedOverflow = 0
+  const storage = { storedBytes: 0, decodedBytes: 0, compressedFiles: 0, plainFiles: 0 }
   const diagnostics = { files: 0, lines: 0, malformed: 0, oversized: 0, unterminated: 0, incomplete: 0, groupedOverflow: 0,
-    recorderHealthFiles: 0, persistenceFailures: 0, pendingRecords: 0, undurableRecords: 0, sourceFailures: 0, omittedRecords: 0, activeOperations: 0,
-    unclosedExecutions: 0, recorderCountMismatches: 0, missingRecords: 0,
+    recorderHealthFiles: 0, persistenceFailures: 0, journalReadFailures: 0, pendingRecords: 0, undurableRecords: 0, sourceFailures: 0, omittedRecords: 0, activeOperations: 0,
+    unclosedExecutions: 0, recorderCountMismatches: 0, recorderByteMismatches: 0, missingRecords: 0,
     sequenceGaps: 0, duplicateSequences: 0, duplicateOperationIds: 0, unmatchedEnds: 0, unclosedOperations: 0, mismatchedLifecycles: 0,
     lifecycleLimitReached: 0, missingParticipantHealth: 0, missingParticipantJournals: 0, unclaimedParticipants: 0, missingParticipantRegistrations: 0,
     nativeGpuStatusFiles: 0, incompleteNativeGpuTraces: 0, emptyRecording: 0, missingRequiredCategories: 0, missingRequiredRoles: 0, missingRequiredOperations: 0,
@@ -118,7 +119,7 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
   }
   for await (const file of traceFiles(resolve(path))) {
     if (visitedFiles++ >= maxFiles) { diagnostics.fileLimitReached = true; break }
-    if (!file.endsWith('.jsonl')) {
+    if (!isOperationJournal(file)) {
       try {
         const metadata = await readMetadata(file, maxLineBytes)
         if (file.endsWith('.participant.json')) {
@@ -131,6 +132,7 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
           if (healthRecords.has(executionId)) problem('malformed', file, 1, 'Duplicate execution health')
           healthRecords.set(executionId, { executionId, file, participantId: metadata.participantId, role: label(metadata.role),
             recorded: metadata.recorded, recordedOperations: metadata.recordedOperations, persisted: metadata.persisted, durableRecords: metadata.durableRecords,
+            journalBytes: metadata.journalBytes, uncompressedBytes: metadata.uncompressedBytes,
             failed: metadata.failed, pending: metadata.pending, closed: metadata.closed,
             sourceFailures: metadata.sourceFailures, omittedRecords: metadata.omittedRecords, activeOperations: metadata.activeOperations,
             durability: label(metadata.durability),
@@ -151,8 +153,11 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
       continue
     }
     diagnostics.files++
+    const storedBytes = (await stat(file)).size
+    storage.storedBytes += storedBytes
+    storage[file.endsWith('.gz') ? 'compressedFiles' : 'plainFiles']++
     const active = new Map(), recentlyEnded = new Set()
-    let fileExecutionId = basename(file, '.jsonl'), rawCount = 0, endCount = 0, previousSequence = 0
+    let fileExecutionId = operationJournalExecutionId(basename(file)), rawCount = 0, endCount = 0, previousSequence = 0, decodedBytes = 0
     const consume = (buffer, line) => {
       diagnostics.lines++
       if (!buffer.length) return
@@ -184,7 +189,8 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
       completed(event)
     }
     let pending = Buffer.alloc(0), oversized = false, line = 1
-    for await (const chunk of createReadStream(file)) {
+    try { for await (const chunk of readOperationJournal(file)) {
+      decodedBytes += chunk.length; storage.decodedBytes += chunk.length
       let from = 0
       while (from < chunk.length) {
         const newline = chunk.indexOf(10, from), through = newline < 0 ? chunk.length : newline, piece = chunk.subarray(from, through)
@@ -196,11 +202,11 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
         if (!oversized) consume(pending, line)
         pending = Buffer.alloc(0); oversized = false; line++; from = newline + 1
       }
-    }
+    } } catch (error) { problem('journalReadFailures', file, line, error.code ?? error.name) }
     if (pending.length || oversized) { problem('unterminated', file, line); if (!oversized) consume(pending, line) }
     for (const event of active.values()) { problem('unclosedOperations', file, 0, event.name); abandon(event) }
     if (executions.has(fileExecutionId)) problem('malformed', file, 0, 'Multiple journals for one execution')
-    executions.set(fileExecutionId, { rawCount, endCount, file })
+    executions.set(fileExecutionId, { rawCount, endCount, file, storedBytes, decodedBytes })
   }
   for (const [id, health] of healthRecords) {
     const execution = executions.get(id), actual = execution?.rawCount ?? 0
@@ -214,6 +220,9 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
     if (health.closed !== true) problem('unclosedExecutions', health.file, 0)
     if (!execution) problem('missingParticipantJournals', health.file, 0)
     if (health.recorded !== actual || health.persisted !== actual || Number.isFinite(health.recordedOperations) && health.recordedOperations !== execution?.endCount) problem('recorderCountMismatches', health.file, 0)
+    for (const [declared, measured] of [['journalBytes', 'storedBytes'], ['uncompressedBytes', 'decodedBytes']]) {
+      if (health[declared] !== undefined && (!Number.isSafeInteger(health[declared]) || health[declared] < 0 || health[declared] !== execution?.[measured])) problem('recorderByteMismatches', health.file, 0, declared)
+    }
     diagnostics.missingRecords += Number.isFinite(health.recorded) ? Math.max(0, health.recorded - actual) : 0
     if (health.participantId && !participants.has(health.participantId)) problem('missingParticipantRegistrations', health.file, 0)
   }
@@ -242,7 +251,7 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
       .map(category => ({ category, name: '[other operation names]', ...finish(operationOverflow[category]) }))).sort((left, right) => right.totalMS - left.totalMS),
     groups: [...groups.values()].map(finish).concat(operationCategories.filter(category => overflow[category].count)
       .map(category => ({ category, name: '[other operations]', resource: '', ...finish(overflow[category]) }))).sort((left, right) => right.totalMS - left.totalMS),
-    abandonedOperations: [...abandoned.values()], abandonedOverflow, slowest, nativeTraces, diagnostics,
+    abandonedOperations: [...abandoned.values()], abandonedOverflow, slowest, nativeTraces, diagnostics, storage,
     coverage: { allowEmpty, requireCategories, requireRoles, requireOperations, substantiveOperations, actualCategories: [...actualCategories].sort(), actualRoles: [...roles].sort(),
       missingCategories, missingRoles, missingOperations: [...missingOperations.values()], participants: participantCoverage },
     measurement: 'Elapsed times overlap across nested/concurrent boundaries and are not process wall time. Work counters are totals at each recorded boundary, not unique business facts. Database calls count hooked native API calls; queryCount counts exec/all/get/run/iterate execution batches, not parsed SQL statements. CPU time uses the current thread clock when supported. GPU submission/capture times and process peaks are not hardware kernel timings. p95UpperBoundMS uses exponential duration buckets. Raw traceId/parentId/scenarioId fields preserve correlation.' }
@@ -252,6 +261,7 @@ const ms = value => Number(value.toFixed(3)).toLocaleString('en-US')
 const escape = value => String(value).replaceAll('|', '\\|').replaceAll('\n', ' ').replaceAll('\r', ' ')
 export function operationReportMarkdown(report) {
   return ['# Expensive operations', '', `${report.totals.count.toLocaleString('en-US')} completed operations; ${report.journalRecords.toLocaleString('en-US')} lifecycle records; ${report.totals.errors} errors; ${report.totals.cancelled} cancelled.`, '',
+    `Journal storage: ${report.storage.storedBytes.toLocaleString('en-US')} bytes stored; ${report.storage.decodedBytes.toLocaleString('en-US')} bytes decoded; ${report.storage.compressedFiles} compressed / ${report.storage.plainFiles} plain journals.`, '',
     '| Category | Operations | Errors | Cancelled | Total ms | Max ms |', '| --- | ---: | ---: | ---: | ---: | ---: |',
     ...report.categories.map(value => `| ${value.category} | ${value.count} | ${value.errors} | ${value.cancelled} | ${ms(value.totalMS)} | ${ms(value.maxMS)} |`), '',
     '## Highest cumulative operation costs', '', '| Category | Operation | Count | Total ms | Calls | Query batches | Rows | Changes | Bytes | Sent bytes | Received bytes |', '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
@@ -281,8 +291,8 @@ export async function writeOperationReport(directory, { source = directory, cove
   return report
 }
 export function operationReportHasFailures(report) {
-  return report.diagnostics.fileLimitReached || ['malformed', 'oversized', 'unterminated', 'incomplete', 'persistenceFailures', 'pendingRecords', 'undurableRecords', 'sourceFailures', 'omittedRecords', 'activeOperations', 'unclosedExecutions',
-    'recorderCountMismatches', 'missingRecords', 'incompleteNativeGpuTraces', 'sequenceGaps', 'duplicateSequences', 'duplicateOperationIds', 'unmatchedEnds',
+  return report.diagnostics.fileLimitReached || ['malformed', 'oversized', 'unterminated', 'incomplete', 'persistenceFailures', 'journalReadFailures', 'pendingRecords', 'undurableRecords', 'sourceFailures', 'omittedRecords', 'activeOperations', 'unclosedExecutions',
+    'recorderCountMismatches', 'recorderByteMismatches', 'missingRecords', 'incompleteNativeGpuTraces', 'sequenceGaps', 'duplicateSequences', 'duplicateOperationIds', 'unmatchedEnds',
     'unclosedOperations', 'mismatchedLifecycles', 'lifecycleLimitReached', 'missingParticipantHealth', 'missingParticipantJournals', 'unclaimedParticipants',
     'missingParticipantRegistrations', 'emptyRecording', 'missingRequiredCategories', 'missingRequiredRoles', 'missingRequiredOperations'].some(key => report.diagnostics[key] > 0)
 }

@@ -10,9 +10,14 @@ const allowedAttributes = new Set(['count', 'rows', 'bytes', 'sentBytes', 'recei
 const safeText = (value, maximum = 160) => typeof value === 'string' && value.length > 0 && value.length <= maximum && !value.includes('\0')
 const safeID = value => safeText(value, 256) && /^[\w.:/-]+$/.test(value)
 function attributes(value) {
-  return Object.fromEntries(Object.entries(value ?? {}).filter(([key, item]) => allowedAttributes.has(key)
-    && (item === null || typeof item === 'boolean' || typeof item === 'number' && Number.isFinite(item)
-      || typeof item === 'string' && item.length <= 160)))
+  const result = {}
+  for (const key of Object.keys(value ?? {})) {
+    if (!allowedAttributes.has(key)) continue
+    const item = value[key]
+    if (item === null || typeof item === 'boolean' || typeof item === 'number' && Number.isFinite(item)
+      || typeof item === 'string' && item.length <= 160) result[key] = item
+  }
+  return result
 }
 const current = () => propagation?.get() ?? synchronousContext
 const runContext = (context, operation) => {

@@ -3,6 +3,7 @@ import { mkdir, readdir, lstat, realpath, open, rename, unlink, rmdir } from 'no
 import { basename, dirname, join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { withOperationSuppressed } from './operations.js'
+import { isOperationJournal, operationJournalExecutionId } from './operation-journal.js'
 
 export const DEFAULT_OPERATION_RETENTION = Object.freeze({ maxAgeMS: 7 * 86_400_000, maxBytes: 512 * 1024 * 1024 })
 const kind = 'perpetual-swap-operation-session', statusKind = 'perpetual-swap-operation-retention'
@@ -20,7 +21,7 @@ const timestamp = value => typeof value === 'number' && Number.isFinite(value) &
 const validPID = value => Number.isSafeInteger(value) && value > 0
 const alive = pid => { try { process.kill(pid, 0); return true } catch (error) { return error.code !== 'ESRCH' } }
 const fileKind = name => name === manifestName ? 'manifest' : name.endsWith('.health.json') && execution.test(name.slice(0, -12)) ? 'health'
-  : name.endsWith('.jsonl') && execution.test(name.slice(0, -6)) ? 'journal' : participantName.test(name) ? 'participant' : graphicsName.test(name) ? 'graphics' : null
+  : isOperationJournal(name) && execution.test(operationJournalExecutionId(name)) ? 'journal' : participantName.test(name) ? 'participant' : graphicsName.test(name) ? 'graphics' : null
 
 async function safeRoot(path) {
   const absolute = resolve(path)
@@ -109,7 +110,7 @@ async function inspectSession(root, name, isProcessAlive) {
     } catch { healthy = false }
   }
   const journals = result.files.filter(file => file.kind === 'journal')
-  if (!journals.length || journals.length !== health.size || journals.some(file => !health.has(file.name.slice(0, -6)))) healthy = false
+  if (!journals.length || journals.length !== health.size || journals.some(file => !health.has(operationJournalExecutionId(file.name)))) healthy = false
   for (const [id, value] of health) {
     if (value.schemaVersion === 2) {
       const participant = participants.get(value.participantId)

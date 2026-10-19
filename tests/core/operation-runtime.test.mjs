@@ -4,6 +4,7 @@ import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { gunzipSync } from 'node:zlib'
 
 const runtime = new URL('../../electron/services/operation-runtime.js', import.meta.url).href
 const operations = new URL('../../electron/services/operations.js', import.meta.url).href
@@ -21,10 +22,10 @@ async function execute(directory, source, environment = {}) {
     child.once('error', reject)
     child.once('close', (code, signal) => code === 0 ? resolve() : reject(new Error(`Recorder child failed (${code ?? signal}): ${diagnostics}`)))
   })
-  const files = (await readdir(directory)).filter(file => file.endsWith('.jsonl'))
+  const files = (await readdir(directory)).filter(file => file.endsWith('.jsonl.gz'))
   return Promise.all(files.map(async file => ({
-    events: (await readFile(join(directory, file), 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line)),
-    health: JSON.parse(await readFile(join(directory, file.replace(/\.jsonl$/, '.health.json')), 'utf8')),
+    events: gunzipSync(await readFile(join(directory, file))).toString('utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)),
+    health: JSON.parse(await readFile(join(directory, file.replace(/\.jsonl\.gz$/, '.health.json')), 'utf8')),
   })))
 }
 
@@ -68,6 +69,37 @@ test('pressure writes preserve event order, retry short writes, and close drains
     assert.equal(health.failed, 0)
     assert.equal(health.pending, 0)
     assert.equal(health.closed, true)
+    assert.equal(health.durableRecords, events.length)
+    assert.ok(health.journalBytes < health.uncompressedBytes / 5, 'The journal retains every Unicode record while bounding repeated JSON storage overhead.')
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('repeated durable flushes of unchanged journals do no additional disk synchronization or metadata writes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-operation-runtime-clean-'))
+  try {
+    await execute(directory, `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const fdatasync = fs.fdatasync, writeFileSync = fs.writeFileSync;
+      let synchronizations = 0, healthWrites = 0;
+      fs.fdatasync = (...args) => { synchronizations++; return fdatasync(...args) };
+      fs.writeFileSync = (path, ...args) => { if (String(path).endsWith('.health.json')) healthWrites++; return writeFileSync(path, ...args) };
+      syncBuiltinESMExports();
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      const { measureOperation } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording();
+      measureOperation({ category: 'cpu', name: 'runtime.one-real-operation' }, () => 42);
+      await recording.flush();
+      const expected = { synchronizations, healthWrites };
+      await Promise.all([recording.flush(), recording.flush(), recording.flush()]);
+      assert.deepEqual({ synchronizations, healthWrites }, expected, 'An unchanged durability high-water mark must reuse its proof.');
+      measureOperation({ category: 'cpu', name: 'runtime.changed-operation' }, () => 43);
+      await recording.flush();
+      assert.ok(synchronizations > expected.synchronizations);
+      assert.ok(healthWrites > expected.healthWrites);
+      await recording.close();
+    `)
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 

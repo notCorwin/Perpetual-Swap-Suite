@@ -19,7 +19,8 @@ test('renderer batches preserve source IDs and only acknowledge durable, replay-
   const persisted = [], receiver = createRendererOperationReceiver({
     register: role => { assert.equal(role, 'renderer'); registrations++; return { id: 'fixture-participant' } },
     claim: (_participant, executionId) => { registerOperationImportSource(executionId, 'fixture-session'); return { executionId, sessionId: 'fixture-session' } },
-    flush: async () => {
+    flush: async executionId => {
+      assert.equal(executionId, identity.executionId, 'A renderer batch flushes exactly its registered source.')
       if (persistenceFailure) throw new Error('Fixture disk failure')
       await new Promise(resolve => { release = resolve })
     },

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
 import { summarizeOperations } from '../../scripts/operation-report.mjs'
+import { gunzipSync } from 'node:zlib'
 
 test('Electron persists actual renderer, graphics and database work across worker shutdown', { timeout: 60_000 }, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'operation-desktop-'))
@@ -50,7 +51,7 @@ test('Electron persists actual renderer, graphics and database work across worke
   const health = await Promise.all(files.filter(file => file.endsWith('.health.json')).map(async file => JSON.parse(await readFile(join(operations, file), 'utf8'))))
   assert.ok(health.length >= 4, 'Main/backend/database/compute workers need distinct execution journals.')
   assert.ok(health.every(value => value.closed && value.pending === 0 && value.failed === 0))
-  const records = (await Promise.all(files.filter(file => file.endsWith('.jsonl')).map(async file => (await readFile(join(operations, file), 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line))))).flat()
+  const records = (await Promise.all(files.filter(file => file.endsWith('.jsonl.gz')).map(async file => gunzipSync(await readFile(join(operations, file))).toString('utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))))).flat()
   assert.ok(records.every(record => record.schemaVersion === 2 && ['start', 'end'].includes(record.phase)))
   if (process.env.PERPETUAL_SWAP_OPERATION_SCENARIO) assert.ok(records.every(record => record.scenarioId === process.env.PERPETUAL_SWAP_OPERATION_SCENARIO), 'Every execution must retain the sandbox scenario identity.')
   const completed = new Map(records.filter(record => record.phase === 'end').map(record => [record.id, record]))

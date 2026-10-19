@@ -49,6 +49,10 @@ jobs:
         env:
           PERPETUAL_SWAP_RESOURCE_REPORT: artifacts/market-resources.json
         run: npm run sandbox -- command --foreground --output artifacts/sandbox -- node scripts/market-resource-benchmark.mjs
+      - name: Enforce paired operation recording overhead budgets
+        # The harness owns isolated recording-disabled and enabled children.
+        # An outer recorder would invalidate its disabled baseline.
+        run: npm run benchmark:operations -- --output artifacts/operation-overhead
       - name: Retain sandbox recordings and diagnostics
         if: always()
         uses: actions/upload-artifact@v7

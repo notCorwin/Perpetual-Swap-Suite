@@ -5,6 +5,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { threadId, workerData } from 'node:worker_threads'
 import { installSandboxNetworkBoundary } from './sandbox-network.js'
 import { installOperationHooks } from './operation-hooks.js'
+import { encodeOperationJournal, operationJournalSuffix } from './operation-journal.js'
 import { attachOperationJournalSink, configureOperationContext, configureOperationPropagation, finishActiveOperations,
   registerOperationImportSource, withOperationSuppressed } from './operations.js'
 
@@ -34,18 +35,31 @@ const jsonWrite = (path, value) => suppress(() => {
 })
 
 function journalWriter(directory, sessionId, executionId, participant, hooks) {
-  const file = join(directory, `${executionId}.jsonl`), healthFile = join(directory, `${executionId}.health.json`)
+  const file = join(directory, `${executionId}${operationJournalSuffix}`), healthFile = join(directory, `${executionId}.health.json`)
   const descriptor = suppress(() => openSync(file, 'wx', 0o600))
-  const counts = { recorded: 0, persisted: 0, durableRecords: 0, failed: 0, recordedOperations: 0, startedOperations: 0, sourceFailures: 0, omittedRecords: 0 }
+  const prefix = suppress(() => encodeOperationJournal(Buffer.alloc(0)))
+  suppress(() => {
+    let offset = 0
+    while (offset < prefix.length) {
+      const written = writeSync(descriptor, prefix, offset, prefix.length - offset, offset)
+      if (!written) throw new Error('Operation journal write made no progress.')
+      offset += written
+    }
+  })
+  const counts = { recorded: 0, persisted: 0, durableRecords: 0, uncompressedBytes: 0, journalBytes: prefix.length,
+    failed: 0, recordedOperations: 0, startedOperations: 0, sourceFailures: 0, omittedRecords: 0 }
   let lastDurableAt = null
-  let queue = [], bytes = 0, position = 0, timer, writing, accepting = true, closed = false, closing, flushBarrier = Promise.resolve()
+  let queue = [], bytes = 0, position = prefix.length, timer, writing, accepting = true, closed = false, closing, flushBarrier = Promise.resolve(), lastHealthState
   const health = () => ({ schemaVersion: 2, ...counts, pending: counts.recorded - counts.persisted,
     activeOperations: counts.startedOperations - counts.recordedOperations, executionId, sessionId, participantId: participant.id,
-    role: participant.role, closed, enabledHooks: hooks, durability: 'fdatasync-on-flush-and-5s-checkpoint', updatedAt: Date.now(), lastDurableAt,
+    role: participant.role, closed, enabledHooks: hooks, encoding: 'gzip-members-level1',
+    durability: 'fdatasync-on-flush-and-5s-checkpoint', updatedAt: Date.now(), lastDurableAt,
     runtime: { node: process.version, electron: process.versions.electron ?? null, v8: process.versions.v8 } })
   const failed = error => { counts.failed++; suppress(() => console.error(`Operation journal failed (${error.code ?? error.name}).`)) }
   const writeHealth = () => {
-    try { jsonWrite(healthFile, health()) }
+    const value = health(), state = JSON.stringify({ ...value, updatedAt: undefined })
+    if (state === lastHealthState) return
+    try { jsonWrite(healthFile, value); lastHealthState = state }
     catch (error) { failed(error); throw error }
   }
   const serializeFlush = operation => {
@@ -57,7 +71,10 @@ function journalWriter(directory, sessionId, executionId, participant, hooks) {
   }
   const take = () => {
     clearTimeout(timer); timer = undefined
-    const batch = { count: queue.length, buffer: Buffer.from(queue.join('')), offset: position }
+    if (!queue.length) return { count: 0, buffer: Buffer.alloc(0), offset: position }
+    const raw = Buffer.from(queue.join('')), buffer = encodeOperationJournal(raw)
+    const batch = { count: queue.length, buffer, offset: position }
+    counts.uncompressedBytes += raw.length; counts.journalBytes += buffer.length
     queue = []; bytes = 0; position += batch.buffer.length; return batch
   }
   const pressureWrite = () => suppress(() => {
@@ -98,7 +115,7 @@ function journalWriter(directory, sessionId, executionId, participant, hooks) {
     return serializeFlush(() => suppress(async () => {
       do { await startWrite() } while (counts.persisted < target && (writing || queue.length))
       if (writing) await writing
-      if (durable && !closed) {
+      if (durable && !closed && counts.durableRecords < target) {
         try {
           await new Promise((resolve, reject) => fdatasync(descriptor, error => error ? reject(error) : resolve()))
           counts.durableRecords = Math.max(counts.durableRecords, Math.min(target, counts.persisted)); lastDurableAt = Date.now()
@@ -109,7 +126,7 @@ function journalWriter(directory, sessionId, executionId, participant, hooks) {
       if (counts.failed || counts.persisted < target || counts.sourceFailures || counts.omittedRecords) throw new Error('Operation journal persistence did not complete.')
     }))
   }
-  const enqueue = entry => suppress(() => {
+  const enqueue = entry => {
     if (!accepting) {
       counts.sourceFailures++; counts.omittedRecords++; writeHealth()
       throw new Error('A closing or closed operation journal cannot accept records.')
@@ -119,7 +136,7 @@ function journalWriter(directory, sessionId, executionId, participant, hooks) {
     queue.push(line); bytes += Buffer.byteLength(line)
     if (bytes >= 256 * 1024) pressureWrite()
     else if (!timer && !writing) { timer = setTimeout(startWrite, 250); timer.unref() }
-  })
+  }
   const exit = () => { pressureWrite(); writeHealth() }
   const markIncomplete = (reason, count = 1) => {
     counts.sourceFailures++; counts.omittedRecords += Number.isSafeInteger(count) && count > 0 ? count : 0
@@ -221,6 +238,12 @@ export function markExternalOperationSourceIncomplete(executionId, reason, count
   current?.writers.get(executionId)?.markIncomplete(reason, count)
 }
 export function closeExternalOperationSource(executionId) { return current?.writers.get(executionId)?.close() ?? Promise.resolve() }
+/** A renderer ACK promises durability for that registered source only. */
+export async function flushExternalOperationSource(executionId) {
+  const writer = current?.writers.get(executionId)
+  if (!writer || executionId === current.executionId) throw new TypeError('Unknown external operation source.')
+  await writer.flush()
+}
 export function flushOperationRecording(options) { return current?.flush(options) ?? Promise.resolve() }
 export function closeOperationRecording() { return current?.close() ?? Promise.resolve() }
 initializeOperationRecording()

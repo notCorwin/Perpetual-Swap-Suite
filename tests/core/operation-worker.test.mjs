@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import { stopOperationWorker } from '../../electron/services/operation-worker.js'
 import { attachOperationSink } from '../../electron/services/operations.js'
 import { PreparedChartPipeline } from '../../electron/services/prepared-chart-service.js'
+import { gunzipSync } from 'node:zlib'
 
 test('worker shutdown persists its final calculation before acknowledging and terminating', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'perp-operation-worker-'))
@@ -31,7 +32,7 @@ test('worker shutdown persists its final calculation before acknowledging and te
     assert.equal(health.pending, 0)
     assert.ok(health.recorded >= 6)
     assert.equal(health.persisted, health.recorded)
-    const events = (await readFile(join(directory, files.find(file => file.endsWith('.jsonl'))), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    const events = gunzipSync(await readFile(join(directory, files.find(file => file.endsWith('.jsonl.gz'))))).toString('utf8').trim().split('\n').map(line => JSON.parse(line))
     const replay = events.find(event => event.name === 'indicators.replay' && event.phase === 'end')
     assert.equal(replay.attributes.candles, 220)
     assert.equal(replay.schemaVersion, 2)

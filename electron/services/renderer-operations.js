@@ -1,10 +1,10 @@
 import { randomUUID, createHash } from 'node:crypto'
 import { importOperationEvents } from './operations.js'
-import { registerOperationParticipant, claimExternalOperationParticipant, markExternalOperationSourceIncomplete, flushOperationRecording } from './operation-runtime.js'
+import { registerOperationParticipant, claimExternalOperationParticipant, markExternalOperationSourceIncomplete, flushExternalOperationSource } from './operation-runtime.js'
 
 /** Trusted IPC source ownership and replay-safe durable batch acknowledgments. */
 export function createRendererOperationReceiver({ register = registerOperationParticipant, claim = claimExternalOperationParticipant,
-  importEvents = importOperationEvents, flush = flushOperationRecording, incomplete = markExternalOperationSourceIncomplete } = {}) {
+  importEvents = importOperationEvents, flush = flushExternalOperationSource, incomplete = markExternalOperationSourceIncomplete } = {}) {
   const sources = new Map(), initializations = new Map()
   const sourceFor = (owner, executionId) => {
     const source = sources.get(executionId)
@@ -35,7 +35,7 @@ export function createRendererOperationReceiver({ register = registerOperationPa
         if (source.lastBatch?.id === batch.batchId && source.lastBatch.signature !== signature) throw new Error('A renderer operation batch ID was reused with different records.')
         const result = importEvents(batch.events)
         if (result.rejected || result.accepted + result.duplicates !== batch.events.length) throw new Error('Renderer operation records are invalid or out of sequence.')
-        await flush()
+        await flush(source.executionId)
         source.lastSequence = batch.events.at(-1).sequence
         source.lastBatch = { id: batch.batchId, signature }
         return { batchId: batch.batchId, lastSequence: source.lastSequence }

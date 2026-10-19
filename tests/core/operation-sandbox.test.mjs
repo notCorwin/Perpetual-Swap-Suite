@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
+import { gzipSync } from 'node:zlib'
 import { operationReportHasFailures, operationReportMarkdown, summarizeOperations } from '../../scripts/operation-report.mjs'
 import { sandboxCoverage } from '../../scripts/test-sandbox.mjs'
 
@@ -281,5 +282,28 @@ test('a closed journal cannot claim complete recording before its admitted entri
     assert.equal(operationReportHasFailures(pending), true)
     await recording(directory, [event()], { health: { durableRecords: 2 } })
     assert.equal(operationReportHasFailures(await summarizeOperations(directory)), false)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('reports stream lossless gzip members and reject a torn or corrupt compressed journal', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'operation-report-gzip-'))
+  try {
+    await recording(directory, [event()])
+    const raw = await readFile(join(directory, 'execution.jsonl'))
+    const split = raw.indexOf(10) + 1
+    const compressed = Buffer.concat([gzipSync(raw.subarray(0, split)), gzipSync(raw.subarray(split))])
+    await rm(join(directory, 'execution.jsonl'))
+    await writeFile(join(directory, 'execution.jsonl.gz'), compressed)
+    const complete = await summarizeOperations(directory)
+    assert.equal(complete.totals.count, 1)
+    assert.equal(complete.journalRecords, 2)
+    assert.equal(operationReportHasFailures(complete), false)
+    await writeFile(join(directory, 'execution.jsonl.gz'), compressed.subarray(0, compressed.length - 4))
+    const torn = await summarizeOperations(directory)
+    assert.equal(torn.diagnostics.journalReadFailures, 1)
+    assert.equal(operationReportHasFailures(torn), true)
+    const corrupt = Buffer.from(compressed); corrupt[corrupt.length - 8] ^= 1
+    await writeFile(join(directory, 'execution.jsonl.gz'), corrupt)
+    assert.equal((await summarizeOperations(directory)).diagnostics.journalReadFailures, 1)
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
