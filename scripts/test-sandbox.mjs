@@ -7,6 +7,7 @@ import { arch, platform } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { operationCategories, operationRequirementKey, operationReportHasFailures, writeOperationReport } from './operation-report.mjs'
+import { requireForegroundTests } from '../electron/test-presentation.js'
 
 const projectRoot = fileURLToPath(new URL('../', import.meta.url))
 const registration = fileURLToPath(new URL('./sandbox-register.mjs', import.meta.url))
@@ -80,6 +81,8 @@ function execute(command, { environment, logPath, onChild }) {
 
 export async function runSandbox({ mode = 'core', args = [], output, allowNetwork = false, gpuTrace = false, foreground = false,
   allowEmpty = false, requireCategories = [], requireRoles = [], scenario = mode } = {}) {
+  const presentation = foreground || mode === 'foreground' ? 'foreground' : 'background'
+  if (presentation === 'foreground') requireForegroundTests({ ...process.env, PERPETUAL_SWAP_TEST_UI: presentation })
   const coverage = sandboxCoverage(mode, { allowEmpty, requireCategories, requireRoles })
   if (typeof scenario !== 'string' || !scenario || scenario.length > 160) throw new Error('Scenario must be a nonempty label of at most 160 characters.')
   const commands = await sandboxCommands(mode, args)
@@ -87,8 +90,8 @@ export async function runSandbox({ mode = 'core', args = [], output, allowNetwor
   const directory = output ? resolve(output, id) : join(projectRoot, '.build/sandbox', id)
   const operations = join(directory, 'operations'), temporary = join(directory, 'tmp'), userData = join(directory, 'user-data')
   await Promise.all([operations, temporary, userData].map(path => mkdir(path, { recursive: true })))
-  const presentation = foreground || mode === 'foreground' ? 'foreground' : 'background'
   const environment = { ...process.env, PERPETUAL_SWAP_SANDBOX: '1', PERPETUAL_SWAP_TEST_UI: presentation, PERPETUAL_SWAP_ALLOW_NETWORK: allowNetwork ? '1' : '0',
+    PERPETUAL_SWAP_TEST_OWNER_PID: String(process.pid),
     PERPETUAL_SWAP_GPU_TRACE: gpuTrace ? '1' : '0', PERPETUAL_SWAP_OPERATION_DIR: operations, PERPETUAL_SWAP_OPERATION_SESSION: id, PERPETUAL_SWAP_OPERATION_SCENARIO: scenario,
     PERPETUAL_SWAP_USER_DATA: userData, TMPDIR: temporary, TMP: temporary, TEMP: temporary }
   const manifest = { schemaVersion: 2, id, mode, scenario, coverage, startedAt: new Date().toISOString(), directory,
@@ -99,13 +102,13 @@ export async function runSandbox({ mode = 'core', args = [], output, allowNetwor
   const save = () => writeFile(join(directory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
   await save()
   console.log(`Sandbox: ${directory}`)
-  console.log(`Test windows: ${presentation}${presentation === 'background' ? '; native foreground paint acceptance is separate (npm run test:foreground)' : ' (may show windows and take focus)'}.`)
+  console.log(`Test windows: ${presentation}${presentation === 'background' ? '; native foreground paint acceptance runs only in GitHub-hosted macOS CI' : ' (dedicated GitHub-hosted macOS CI)'}.`)
   let exitCode = 0, activeChild = null, interrupted = null, killTimer
   const stopChild = signal => {
     if (!activeChild?.pid) return
     try {
-      // A test may own Electron and native helper grandchildren. Stop its
-      // dedicated group so cancellation cannot leave market work running.
+      // Stop the command group. Playwright detaches Electron into another
+      // group; the app also watches this runner and its direct launch parent.
       if (process.platform === 'win32') activeChild.kill(signal)
       else process.kill(-activeChild.pid, signal)
     } catch (error) { if (error.code !== 'ESRCH') console.error(`Sandbox shutdown: ${error.message}`) }

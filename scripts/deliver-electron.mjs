@@ -24,7 +24,7 @@ async function launchUserApp(appPath) {
       args: ['--disable-gpu'], timeout: 45_000,
       env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, ELECTRON_RENDERER_URL: undefined,
         PERPETUAL_SWAP_E2E: '0', PERPETUAL_SWAP_E2E_LIVE_REFRESH: '0', PERPETUAL_SWAP_USER_DATA: undefined,
-        PERPETUAL_SWAP_TEST_UI: 'background' } })
+        PERPETUAL_SWAP_TEST_UI: 'background', PERPETUAL_SWAP_TEST_OWNER_PID: String(process.pid) } })
     const page = await electron.firstWindow({ timeout: 30_000 })
     await page.waitForFunction(() => document.querySelector('[data-layout="market-workspace"]'))
     const preferences = await page.evaluate(() => window.radarDesktop.request({ preferences: { action: 'read' } }))
@@ -49,7 +49,7 @@ async function launchUserApp(appPath) {
   // window or activating the app. Verification processes exit afterwards.
   await run('open', ['-g', '-n', '-a', appPath, '--env', 'ELECTRON_RUN_AS_NODE=',
     '--env', 'ELECTRON_RENDERER_URL=', '--env', 'PERPETUAL_SWAP_E2E=0', '--env', 'PERPETUAL_SWAP_USER_DATA=',
-    '--env', 'PERPETUAL_SWAP_TEST_UI=background'])
+    '--env', 'PERPETUAL_SWAP_TEST_UI=background', '--env', `PERPETUAL_SWAP_TEST_OWNER_PID=${process.pid}`])
   const executable = join(appPath, 'Contents/MacOS/Perpetual Swap Suite')
   const deadline = Date.now() + 20_000
   while (Date.now() < deadline) {

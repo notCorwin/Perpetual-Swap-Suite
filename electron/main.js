@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto'
 import { parseDesktopRequest } from './desktop-contract.js'
 import { createDesktopSecurity } from './desktop-security.js'
 import { testPresentation } from './test-presentation.js'
+import { startTestOwnerWatchdog } from './test-owner.js'
 import { initializeOperationRecording, closeOperationRecording, closeExternalOperationSource } from './services/operation-runtime.js'
 import { startGraphicsRecording } from './services/operation-graphics.js'
 import { beginOperation, measureOperation, recordOperation, runWithOperationContext, withOperationSuppressed } from './services/operations.js'
@@ -17,6 +18,7 @@ import { MarketBackend } from './services/market-backend.js'
 const root = fileURLToPath(new URL('..', import.meta.url))
 const rendererURL = process.env.ELECTRON_RENDERER_URL || undefined
 const testMode = process.env.PERPETUAL_SWAP_E2E === '1'
+const testLaunchParentPID = process.ppid
 const backgroundTests = testPresentation() === 'background'
 if (backgroundTests && process.platform === 'darwin') app.setActivationPolicy('accessory')
 // Chromium initializes its profile during ready. Isolate both locations first.
@@ -55,6 +57,8 @@ const desktopRequests = new Set()
 let shuttingDown = false
 let shutdownComplete = false
 let startupTask = Promise.resolve()
+let stopTestOwner = () => {}
+let testOwnerExitTimer
 
 
 function sendGateway(event, detail) {
@@ -229,10 +233,18 @@ async function startDesktop() {
 }
 
 app.whenReady().then(() => {
+  if (testMode || process.env.PERPETUAL_SWAP_SANDBOX === '1' || process.env.PERPETUAL_SWAP_TEST_UI !== undefined) {
+    stopTestOwner = startTestOwnerWatchdog({ parentPID: testLaunchParentPID, onOwnerLost: () => {
+      app.quit()
+      testOwnerExitTimer = setTimeout(() => app.exit(1), 10_000)
+      testOwnerExitTimer.unref()
+    } })
+  }
   if (backgroundTests && process.platform === 'darwin') app.dock.hide()
   if (!shuttingDown) startupTask = startDesktop()
   return startupTask
 }).catch(error => { console.error('Desktop startup failed:', error); app.quit() })
+app.once('will-quit', () => { stopTestOwner(); clearTimeout(testOwnerExitTimer) })
 app.on('activate', () => {
   if (app.isReady() && !shuttingDown && BrowserWindow.getAllWindows().length === 0) void startupTask.then(createWindow).catch(error => console.error('Could not open application window:', error))
 })
