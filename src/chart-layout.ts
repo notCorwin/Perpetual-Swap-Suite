@@ -27,9 +27,9 @@ export function chartPriceLabelLayout(priceY: number, panel: Range, fontSize: nu
   }
 }
 
-export function chartLayout(width: number, height: number, labelGutter = 64) {
+export function chartLayout(width: number, height: number, labelGutter = 64, leftLabelGutter = 0) {
   const rightMargin = 4, top = 4, headerHeight = 24, rowGap = 3, bottomAxis = 22
-  const right = width - rightMargin - labelGutter, column: Range = [0, right]
+  const right = width - rightMargin - labelGutter, column: Range = [leftLabelGutter, right]
   const order = CHART_PANELS
   const availableHeight = Math.max(1, height - top - bottomAxis - headerHeight * order.length - rowGap * (order.length - 1))
   const weights: Record<ChartPanel, number> = { price: 0.4, roc: 0.12, rsi: 0.12, atr: 0.12, oi: 0.12, taker: 0.12 }

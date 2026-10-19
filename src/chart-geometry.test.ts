@@ -54,25 +54,47 @@ test('missing periods and unavailable observations break paths and filled areas 
   }
 })
 
-test('ATR% and BBW share a nonnegative percentage axis sized for both series', () => {
+test('ATR% and BBW use independent nonnegative percentage axes in one panel', () => {
   const bars = rows().map((bar, index) => ({ ...bar, atrPercent: index === 0 ? 0 : 0.5, bbw: index === 0 ? 0 : 8 }))
   const get = createChartGeometryCache(text => text.length * 6)
   const geometry = get(bars, viewport)
   const panel = geometry.layout.panels.atr
   assert.equal(geometry.atrAxis.min, 0)
-  assert.ok(geometry.atrAxis.max >= 8)
+  assert.ok(geometry.atrAxis.max >= 0.5 && geometry.atrAxis.max < 8)
+  assert.equal(geometry.bbwAxis.min, 0)
+  assert.ok(geometry.bbwAxis.max >= 8)
   close(geometry.atrY(0), panel[1])
   close(geometry.atrY(geometry.atrAxis.max), panel[0])
+  close(geometry.bbwY(0), panel[1])
+  close(geometry.bbwY(geometry.bbwAxis.max), panel[0])
   for (const field of ['atrPercent', 'bbw'] as const) {
     const coordinates = [...geometry.lines[field].matchAll(/[ML]([\d.-]+) ([\d.-]+)/g)].map(([, x, y]) => [Number(x), Number(y)])
     assert.equal(coordinates.length, 97)
     assert.ok(coordinates.every(([, y]) => y >= panel[0] - 0.05 && y <= panel[1] + 0.05))
   }
-  assert.ok(geometry.atrTicks.every(tick => /^\d+(?:\.\d+)?%$/.test(tick.label)))
+  assert.ok([...geometry.atrTicks, ...geometry.bbwTicks].every(tick => /^\d+(?:\.\d+)?%$/.test(tick.label)))
+  assert.ok(geometry.layout.left >= Math.max(...geometry.atrTicks.map(tick => tick.label.length * 6)) + 16)
   const missing = get(bars.map(bar => ({ ...bar, atrPercent: null, bbw: null })), viewport)
   assert.equal(missing.lines.atrPercent, '')
   assert.equal(missing.lines.bbw, '')
   assert.ok(Number.isFinite(missing.atrY(0)))
+  assert.ok(Number.isFinite(missing.bbwY(0)))
+
+  const higherBBW = get(bars.map(bar => ({ ...bar, bbw: bar.bbw * 100 })), viewport)
+  assert.deepEqual(higherBBW.atrAxis, geometry.atrAxis, 'BBW cannot alter the ATR% domain.')
+  close(higherBBW.atrY(0.5), geometry.atrY(0.5))
+  assert.ok(higherBBW.bbwAxis.max >= 800)
+  const higherATR = get(bars.map(bar => ({ ...bar, atrPercent: bar.atrPercent * 100 })), viewport)
+  assert.deepEqual(higherATR.bbwAxis, geometry.bbwAxis, 'ATR% cannot alter the BBW domain.')
+  close(higherATR.bbwY(8), geometry.bbwY(8))
+  assert.ok(higherATR.atrAxis.max >= 50)
+
+  const missingBBW = get(bars.map(bar => ({ ...bar, bbw: null })), viewport)
+  assert.deepEqual(missingBBW.atrAxis, geometry.atrAxis)
+  assert.equal(missingBBW.lines.bbw, '')
+  const missingATR = get(bars.map(bar => ({ ...bar, atrPercent: null })), viewport)
+  assert.deepEqual(missingATR.bbwAxis, geometry.bbwAxis)
+  assert.equal(missingATR.lines.atrPercent, '')
 })
 
 test('Bollinger values crossing zero retain a linear domain and genuine warmup gaps', () => {
