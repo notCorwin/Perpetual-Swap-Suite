@@ -16,6 +16,7 @@ const participantName = new RegExp(`^(${uuid})\\.participant\\.json$`)
 const graphicsName = new RegExp(`^chromium-[1-9]\\d*-${uuid}\\.(?:status|trace)\\.json$`)
 const errorCode = error => error?.code ?? error?.name ?? 'Error'
 const number = value => Number.isSafeInteger(value) && value >= 0
+const timestamp = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER
 const validPID = value => Number.isSafeInteger(value) && value > 0
 const alive = pid => { try { process.kill(pid, 0); return true } catch (error) { return error.code !== 'ESRCH' } }
 const fileKind = name => name === manifestName ? 'manifest' : name.endsWith('.health.json') && execution.test(name.slice(0, -12)) ? 'health'
@@ -54,7 +55,7 @@ async function atomicJSON(path, value) {
 const validManifest = (value, id) => value?.schemaVersion === 1 && value.kind === kind && value.id === id
   && (sessionName.test(id) || legacyName.test(id)) && typeof value.token === 'string' && new RegExp(`^${uuid}$`).test(value.token)
   && validPID(value.pid) && number(value.createdAt) && number(value.updatedAt) && ['active', 'closed', 'interrupted'].includes(value.state)
-  && (value.state !== 'closed' || number(value.closedAt))
+  && (value.state !== 'closed' || timestamp(value.closedAt))
 
 async function inspectSession(root, name, isProcessAlive) {
   const path = join(root, name), info = await lstat(path)

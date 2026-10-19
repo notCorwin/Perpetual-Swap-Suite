@@ -65,6 +65,24 @@ test('leases preserve active and crashed sessions and surface protected over-bud
   assert.deepEqual(await readFile(join(active.directory, (await readdir(active.directory)).find(name => name.endsWith('.jsonl')))), before)
 })
 
+test('fractional filesystem times remain valid across interrupted legacy cleanup and retry', async t => {
+  const root = await temporary(t), id = `${now - day}-765432`, token = randomUUID()
+  await fixture(join(root, id), { schema: 1, at: now - day + 0.625 })
+  const initial = await enforceOperationRetention(root, { now: () => now, maxBytes: 0, isProcessAlive: dead })
+  assert.deepEqual(initial.pruned.map(value => value.id), [id], 'Actual filesystem mtimes may contain fractional milliseconds.')
+  assert.deepEqual(initial.failures, [])
+  const quarantine = join(root, `.pruning-${token}`)
+  await fixture(quarantine, { schema: 1, at: now - day + 0.625 })
+  await writeFile(join(quarantine, 'session.retention.json'), JSON.stringify({ schemaVersion: 1,
+    kind: 'perpetual-swap-operation-session', id, token: randomUUID(), pid: 765432,
+    createdAt: now - day, updatedAt: now, state: 'closed', closedAt: now - day + 0.625,
+    prune: { token, reason: 'capacity', requestedAt: now } }))
+  const recovered = await enforceOperationRetention(root, { now: () => now, maxBytes: Number.MAX_SAFE_INTEGER, isProcessAlive: dead })
+  assert.deepEqual(recovered.pruned.map(value => [value.id, value.reason]), [[id, 'interrupted-prune']])
+  assert.equal(await exists(quarantine), false)
+  assert.deepEqual(recovered.failures, [])
+})
+
 test('session heartbeat and close serialize atomically and completion requires every recorder to close durably', async t => {
   const root = await temporary(t), session = await createOperationSession({ root, now: () => now })
   await fixture(session.directory, { pid: process.pid, health: { durableRecords: 2 } })
