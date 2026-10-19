@@ -1,3 +1,6 @@
+import { closeOperationRecording } from './operation-runtime.js'
+import { openRecordedDatabase } from './recorded-database.js'
+import { measureOperation } from './operations.js'
 import { readdir, stat } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -7,7 +10,7 @@ import { CANDLE_INTERVALS, validateCandle } from './market-records.js'
 const DAY = 86_400_000, quote = value => `'${String(value).replaceAll("'", "''")}'`
 const [root, databasePath] = process.argv.slice(2)
 if (!root || !databasePath || !process.send) throw new Error('Market archive import requires its database path and parent IPC channel.')
-const manifest = new DatabaseSync(databasePath, { readOnly: true })
+const manifest = openRecordedDatabase(DatabaseSync, databasePath, { readOnly: true }, 'migration-manifest')
 manifest.exec('PRAGMA query_only=ON; PRAGMA busy_timeout=5000;')
 const saved = manifest.prepare('SELECT fingerprint,status FROM migration_partitions WHERE path=?')
 const countRange = manifest.prepare('SELECT COUNT(*) AS count FROM candles WHERE series_id=(SELECT id FROM series WHERE instrument=? AND timeframe=?) AND timestamp>=? AND timestamp<=?')
@@ -17,7 +20,7 @@ const activeParts = files => { const base = Math.max(0, ...files.map(file => { c
 const directories = async path => { try { return (await readdir(path, { withFileTypes: true })).filter(value => value.isDirectory()).map(value => value.name).sort() } catch (error) { if (error.code === 'ENOENT') return []; throw error } }
 let engine, connection, sequence = 0, draining = false, complete = false, stopping = false, released = false
 const queue = [], acknowledgments = new Map()
-const readyConnection = async () => { if (!connection) { const { DuckDBInstance } = await import('@duckdb/node-api'); engine = await DuckDBInstance.create(':memory:'); connection = await engine.connect() } return connection }
+const readyConnection = async () => { if (!connection) { const { DuckDBInstance } = await import('@duckdb/node-api'); engine = await measureOperation({ category: 'database', name: 'duckdb.open' }, () => DuckDBInstance.create(':memory:')); connection = await measureOperation({ category: 'database', name: 'duckdb.connect' }, () => engine.connect()) } return connection }
 const post = message => { if (process.connected) process.send(message, () => {}) }
 const send = payload => new Promise((resolve, reject) => {
   if (!process.connected) { reject(new Error('Market archive parent disconnected.')); return }
@@ -47,15 +50,15 @@ async function importPartition(path, instrument, timeframe, priority, tolerateIs
     let rows = []
     if (files.length) {
       const db = await readyConnection(), relation = `read_parquet([${files.map(quote).join(',')}],union_by_name=true,hive_partitioning=false)`
-      const columns = (await db.runAndReadAll(`DESCRIBE SELECT * FROM ${relation}`)).getRowObjectsJS(), types = new Map(columns.map(column => [column.column_name, column.column_type]))
+      const columns = (await measureOperation({ category: 'database', name: 'duckdb.describe' }, () => db.runAndReadAll(`DESCRIBE SELECT * FROM ${relation}`))).getRowObjectsJS(), types = new Map(columns.map(column => [column.column_name, column.column_type]))
       for (const field of ['instrument', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'confirmed']) if (!types.has(field)) throw new TypeError(`Legacy market schema is missing ${field}.`)
       if (!/^(?:U?(?:TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT))$/.test(types.get('timestamp')) || types.get('confirmed') !== 'BOOLEAN') throw new TypeError('Invalid legacy timestamp or confirmation schema.')
       for (const field of ['open', 'high', 'low', 'close', 'volume']) if (!/^(?:U?(?:TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT)|FLOAT|DOUBLE|DECIMAL\(\d+,\d+\))$/.test(types.get(field))) throw new TypeError(`Invalid legacy ${field} schema.`)
       const projection = Object.entries(fields).map(([field, type]) => `${types.has(field) ? `CAST("${field}" AS ${type})` : `NULL::${type}`} AS "${field}"`).join(',')
       const projected = `(SELECT ${projection} FROM ${relation})`
-      const duplicate = (await db.runAndReadAll(`SELECT timestamp FROM ${projected} GROUP BY timestamp,COALESCE(writtenAt,0) HAVING COUNT(*)>1 LIMIT 1`)).getRowObjectsJS()[0]
+      const duplicate = (await measureOperation({ category: 'database', name: 'duckdb.duplicates' }, () => db.runAndReadAll(`SELECT timestamp FROM ${projected} GROUP BY timestamp,COALESCE(writtenAt,0) HAVING COUNT(*)>1 LIMIT 1`))).getRowObjectsJS()[0]
       if (duplicate) { const error = new Error('Ambiguous equal-revision legacy candle observations.'); error.reason = 'duplicate'; throw error }
-      rows = (await db.runAndReadAll(`SELECT * FROM ${projected} QUALIFY ROW_NUMBER() OVER(PARTITION BY timestamp ORDER BY COALESCE(writtenAt,0) DESC)=1 ORDER BY timestamp`)).getRowObjectsJS()
+      rows = (await measureOperation({ category: 'database', name: 'duckdb.read' }, () => db.runAndReadAll(`SELECT * FROM ${projected} QUALIFY ROW_NUMBER() OVER(PARTITION BY timestamp ORDER BY COALESCE(writtenAt,0) DESC)=1 ORDER BY timestamp`))).getRowObjectsJS()
         .map(row => Object.fromEntries(Object.entries(row).map(([field, value]) => [field, typeof value === 'bigint' ? Number(value) : value])))
       for (const row of rows) { validateCandle(row); if (row.instrument !== instrument || row.timeframe !== timeframe || row.timestamp < from || row.timestamp > through) throw new TypeError('A legacy market candle does not match its partition.') }
     }
@@ -152,6 +155,7 @@ async function drain() {
       clearTimeout(retryTimer)
       connection?.closeSync(); engine?.closeSync(); manifest.close()
       connection = null; engine = null
+      await closeOperationRecording()
       if (process.connected) process.disconnect()
     }
   }

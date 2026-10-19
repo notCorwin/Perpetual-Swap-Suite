@@ -1,4 +1,5 @@
 import { Worker } from 'node:worker_threads'
+import { stopOperationWorker } from './operation-worker.js'
 
 /** Exact streaming qualification runs outside Electron's main event loop. */
 export class StreamLiquidityEvaluator {
@@ -64,7 +65,7 @@ export class StreamLiquidityEvaluator {
     this.worker = null
     for (const request of this.pending.values()) request.reject(new Error('Streaming liquidity evaluator is closed.'))
     this.pending.clear()
-    this.closeTask = worker ? worker.terminate().then(() => undefined) : Promise.resolve()
+    this.closeTask = worker ? stopOperationWorker(worker, 'stream-liquidity') : Promise.resolve()
     return this.closeTask
   }
 }

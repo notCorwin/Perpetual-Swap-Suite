@@ -2,6 +2,7 @@ import { chartAxis, chartAxisForLabels, logarithmicChartAxis, type LogChartAxis 
 import { chartCandleWidth, chartHourX, chartLayout } from './chart-layout.ts'
 import type { Bar } from './chart-data.ts'
 import { finitePercentage, formatPercent } from './market-percent.ts'
+import { measureOperation } from '../electron/services/operations.js'
 
 const compactFormatter = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 5, notation: 'compact' })
 const priceFormatter = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 8 })
@@ -196,7 +197,9 @@ export function createChartGeometryCache(measureText: (text: string) => number) 
       resident.delete(value); resident.set(value, variants)
       return value
     }
-    const value = buildGeometry(bars, { ...options, liveClose }, measureText)
+    const value = measureOperation({ category: 'cpu', name: 'chart.geometry', attributes: {
+      candles: bars.length, width: options.width, height: options.height, intervalMS: options.intervalMS,
+    } }, () => buildGeometry(bars, { ...options, liveClose }, measureText))
     variants.push(value)
     if (variants.length > 4) resident.delete(variants.shift()!)
     cache.set(bars, variants)

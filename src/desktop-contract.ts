@@ -42,6 +42,7 @@ export type DesktopRequest = { [K in keyof DesktopCommands]: { [P in K]: Desktop
 export type DesktopResponse<Request extends DesktopRequest> = Request extends { captureChart: { output: 'png' } }
   ? ChartImage : { [K in keyof DesktopCommands]: Request extends Record<K, unknown> ? DesktopCommands[K]['output'] : never }[keyof DesktopCommands]
 export interface RadarDesktop {
+  recordOperations(events: import('../electron/services/operations.js').OperationEvent[]): void
   request(value: { preferences: DesktopCommands['preferences']['input'] }): Promise<DesktopCommands['preferences']['output']>
   request(value: { snapshot: DesktopCommands['snapshot']['input'] }): Promise<DesktopCommands['snapshot']['output']>
   request(value: { dataAudit: DesktopCommands['dataAudit']['input'] }): Promise<DesktopCommands['dataAudit']['output']>

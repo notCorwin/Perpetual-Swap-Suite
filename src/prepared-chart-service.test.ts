@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { PreparedChartPipeline } from '../electron/services/prepared-chart-service.js'
 import { MarketStore } from '../electron/services/market-store.js'
 import { buildIndicatorSeries } from '../electron/services/indicators.js'
+import { attachOperationSink, type OperationEvent } from '../electron/services/operations.js'
 
 const interval = 900_000, instId = 'BTC-USDT-SWAP'
 const end = () => Math.floor(Date.now() / interval) * interval - interval
@@ -162,8 +163,12 @@ test('statistics changes refresh only their observations without recalculating p
 
 test('warm forming ticks preserve exact confirmed state and never read or replay history', async () => {
   const rows = source(400), { pipeline, store } = fixture(rows)
+  const operations: OperationEvent[] = []
+  const detach = attachOperationSink(operation => operations.push(operation))
   try {
     await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    assert.ok(operations.some(operation => operation.name === 'chart.project'), 'Cold chart work is observable through the shared operation recorder.')
+    operations.length = 0
     const reads = store.queries.length, calculations = pipeline.nextCalculation, writes = store.checkpoints.length
     const completed = pipeline.cached(`${instId}:15m`).bars
     let last: any
@@ -172,11 +177,14 @@ test('warm forming ticks preserve exact confirmed state and never read or replay
       const frame = await pipeline.setLive(instId, '15m', last)
       assert.equal(frame.bars, completed, 'Live-only deltas reuse immutable confirmed bars.')
     }
+    assert.deepEqual(operations.filter(operation => ['chart.project', 'indicators.build', 'indicators.observe'].includes(operation.name)), [],
+      'Warm ticks must reuse confirmed projections and canonical indicator state without expensive recomputation.')
+    detach()
     const frame = pipeline.cached(`${instId}:15m`), oracle = buildIndicatorSeries([...rows, last], interval).bars.at(-1) as any
     assert.equal(frame.liveBar.close, last.close)
     for (const key of indicatorFields) assert.equal(frame.liveBar[key], oracle[key])
     assert.equal(store.queries.length, reads); assert.equal(pipeline.nextCalculation, calculations); assert.equal(store.checkpoints.length, writes)
-  } finally { await pipeline.dispose() }
+  } finally { detach(); await pipeline.dispose() }
 })
 
 test('bounded local historical prices remain navigable across unknown and expired statistic holes', async () => {

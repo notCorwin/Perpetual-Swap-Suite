@@ -1,3 +1,5 @@
+import { measureOperation } from './operations.js'
+
 const FIVE_MINUTES = 300_000
 const HOUR = 3_600_000
 const HUNDRED = { n: 100n, d: 1n }
@@ -174,6 +176,8 @@ export function createLiquidityEvaluator() {
 }
 
 function evaluateLiquiditySnapshot(input, books) {
+  return measureOperation({ category: 'cpu', name: 'liquidity.evaluate', resource: input?.instrument?.instId,
+    attributes: { bidLevels: input?.book?.bids?.length ?? 0, askLevels: input?.book?.asks?.length ?? 0, bookResident: Boolean(books?.has(input?.book)) } }, () => {
   const { instrument, ticker, book, openInterest, hourlyCandles, turnover24hUSDT, asOf, config } = input ?? {}
   const metadata = instrumentCheck(instrument)
   const checks = [{ key: 'instrument', ...metadata, value: null }]
@@ -278,4 +282,5 @@ function evaluateLiquiditySnapshot(input, books) {
 
   const status = checks.some(item => item.status === 'failed') ? 'failed' : checks.some(item => item.status === 'unknown') ? 'unknown' : 'verified'
   return { eligible: status === 'verified', status, reasons: checks.filter(item => item.status === 'failed' || item.status === 'unknown').map(item => item.reason), ...result, checks }
+  })
 }

@@ -1,3 +1,4 @@
+import { openRecordedDatabase } from './recorded-database.js'
 import { DEFAULT_PREFERENCES, validatePreferenceFields, validatePreferences } from './preferences.js'
 export { DEFAULT_PREFERENCES, validatePreferences } from './preferences.js'
 
@@ -126,7 +127,7 @@ export class MetadataStore {
     const [{ DatabaseSync }, { mkdir, readFile, chmod }, { join }] = await Promise.all([import('node:sqlite'), import('node:fs/promises'), import('node:path')])
     await mkdir(root, { recursive: true })
     const path = join(root, 'metadata.sqlite')
-    const database = new DatabaseSync(path)
+    const database = openRecordedDatabase(DatabaseSync, path, undefined, 'metadata')
     const store = new MetadataStore(database)
     try {
       await chmod(path, 0o600)

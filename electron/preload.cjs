@@ -13,4 +13,4 @@ ipcRenderer.on('radar:market-changed', () => {
 ipcRenderer.on('radar:audit-changed', (_event, detail) => {
   window.dispatchEvent(new CustomEvent('radar-audit-changed', { detail }))
 })
-contextBridge.exposeInMainWorld('radarDesktop', { request })
+contextBridge.exposeInMainWorld('radarDesktop', { request, recordOperations: events => ipcRenderer.send('radar:operations', events) })

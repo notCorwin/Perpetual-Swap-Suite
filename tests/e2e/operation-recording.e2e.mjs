@@ -1,0 +1,55 @@
+import assert from 'node:assert/strict'
+import { test } from 'node:test'
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { _electron } from 'playwright'
+import { summarizeOperations } from '../../scripts/operation-report.mjs'
+
+test('Electron persists actual renderer, graphics and database work across worker shutdown', { timeout: 60_000 }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'operation-desktop-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const operations = process.env.PERPETUAL_SWAP_OPERATION_DIR
+    ? join(process.env.PERPETUAL_SWAP_OPERATION_DIR, 'desktop-recording-test') : join(directory, 'operations')
+  const electron = await _electron.launch({ args: ['.', '--headless'], cwd: new URL('../..', import.meta.url).pathname,
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1',
+      PERPETUAL_SWAP_USER_DATA: join(directory, 'user-data'), PERPETUAL_SWAP_OPERATION_DIR: operations,
+      PERPETUAL_SWAP_GPU_TRACE: '1' } })
+  let closed = false
+  t.after(async () => { if (!closed) await electron.close() })
+  const page = await electron.firstWindow()
+  await page.waitForLoadState('domcontentloaded')
+  const request = value => page.evaluate(value => window.radarDesktop.request(value), value)
+  const step = 300_000, through = Math.floor(Date.now() / step) * step - step
+  const candles = Array.from({ length: 250 }, (_, index) => ({ instrument: 'BTC-USDT-SWAP', timeframe: '5m',
+    timestamp: through - (249 - index) * step, open: 100, high: 102, low: 99, close: 101, volume: 10, baseVolume: 1, quoteVolume: 1000, confirmed: true }))
+  await request({ e2e: { action: 'seedCandles', candles } })
+  await request({ chartWindow: { instId: 'BTC-USDT-SWAP', timeframe: '5m', historyBars: 96 } })
+  const capture = await request({ captureChart: { x: 0, y: 0, width: 160, height: 100, output: 'png' } })
+  assert.ok(capture.imageDataURL.startsWith('data:image/png;base64,'))
+  // This records an observed renderer span through the real preload and trusted
+  // IPC path, independently of optional browser PerformanceObserver support.
+  await page.evaluate(() => window.radarDesktop.recordOperations([{ schemaVersion: 1, id: 'ignored', executionId: 'renderer', sessionId: 'ignored',
+    category: 'cpu', name: 'renderer.test-observation', startedAt: performance.timeOrigin + performance.now(), durationMS: 1, status: 'ok', attributes: { measurement: 'test' } }]))
+  // Exercise the app's normal quit contract so backend, native graphics and
+  // journal shutdown finish before inspecting their durable output.
+  const exited = new Promise(resolve => electron.once('close', resolve))
+  await electron.evaluate(({ app }) => { app.quit() })
+  await exited; closed = true
+  const report = await summarizeOperations(operations)
+  assert.equal(report.diagnostics.malformed, 0)
+  assert.equal(report.diagnostics.pendingRecords, 0)
+  assert.equal(report.diagnostics.persistenceFailures, 0)
+  for (const name of ['market.append', 'indicators.replay', 'chart.capture', 'chart.encode-png', 'renderer.test-observation']) {
+    assert.ok(report.groups.some(group => group.name === name && group.count > 0), `Missing ${name} in durable operation log.`)
+  }
+  const files = await readdir(operations)
+  const health = await Promise.all(files.filter(file => file.endsWith('.health.json')).map(async file => JSON.parse(await readFile(join(operations, file), 'utf8'))))
+  assert.ok(health.length >= 4, 'Main/backend/database/compute workers need distinct execution journals.')
+  assert.ok(health.every(value => value.closed && value.pending === 0 && value.failed === 0))
+  const graphics = await Promise.all(files.filter(file => file.endsWith('.status.json')).map(async file => JSON.parse(await readFile(join(operations, file), 'utf8'))))
+  assert.equal(graphics.length, 1)
+  assert.equal(graphics[0].enabled, true)
+  assert.equal(graphics[0].complete, true)
+  assert.ok(files.some(file => file.endsWith('.trace.json')))
+})

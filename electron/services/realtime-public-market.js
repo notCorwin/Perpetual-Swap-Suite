@@ -1,5 +1,7 @@
 // Native OKX public streams cover the entire eligible universe independently of
 // chart selection. https://www.okx.com/docs-v5/en/#order-book-trading-market-data
+import { recordedWebSocketFactory } from './network-operations.js'
+
 export const OKX_PUBLIC_WEBSOCKET_URL = 'wss://ws.okx.com/ws/v5/public'
 export const PUBLIC_MARKET_CONTRACTS_PER_CONNECTION = 25
 
@@ -16,7 +18,7 @@ class PublicMarketConnection {
     }
     this.options = options
     this.url = options.url ?? OKX_PUBLIC_WEBSOCKET_URL
-    this.factory = options.webSocketFactory ?? (url => new globalThis.WebSocket(url))
+    this.factory = recordedWebSocketFactory(options.webSocketFactory ?? (url => new globalThis.WebSocket(url)), 'okx.public')
     this.now = options.now ?? Date.now
     this.setTimer = options.setTimeout ?? globalThis.setTimeout
     this.clearTimer = options.clearTimeout ?? globalThis.clearTimeout

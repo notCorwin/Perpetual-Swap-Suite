@@ -20,6 +20,7 @@ import { RADAR_TIMEFRAMES, timeframeLabel, timeframeMilliseconds, type RadarTime
 
 import { chartController } from '@/chart-controller'
 import type { Bar, PreparedChartState } from '@/chart-data'
+import { measureOperation } from '../electron/services/operations.js'
 
 const EMPTY_BARS: readonly Bar[] = []
 const PriceStatus = memo(function PriceStatus({ observedAt, realtime }: { observedAt?: number | null; realtime?: 'live' | 'stale' }) {
@@ -70,6 +71,7 @@ const chartGeometry = createChartGeometryCache(legendWidth)
 
 export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = false, inspected, oiState = 'ready', takerState = 'ready' }: { bars: readonly Bar[]; geometry: ChartGeometry; liveBar: Bar; liveOverlay?: boolean; inspected: number | null; oiState?: PreparedChartState; takerState?: PreparedChartState }) {
   const areaClipId = useId().replaceAll(":", "")
+  return measureOperation({ category: 'cpu', name: 'chart.svg.construct', attributes: { candles: bars.length, inspected: inspected !== null } }, () => {
   const n = bars.length
   const active = bars[inspected ?? n - 1]
   const statistics = chartStatisticsSamples(bars, inspected)
@@ -192,6 +194,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {oiAxis && panels.oi[1] - panels.oi[0] >= 35 && geometry.oiTicks.map(({ y, label }, index) => <g key={index}><line x1={columns.oi[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.25" />{lineLabel(axisStarts.oi, y, label)}</g>)}
     {panels.taker[1] - panels.taker[0] >= 35 && geometry.takerTicks.map(({ y, label }, index) => <g key={index}>{lineLabel(axisStarts.taker, y, label)}</g>)}
   </>
+  })
 })
 
 export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, listOrder, turnoverOrder, onSelect }: { instId: string; timeframe?: RadarTimeframe; onTimeframeChange?: (value: RadarTimeframe) => void; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {

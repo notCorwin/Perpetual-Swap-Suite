@@ -1,10 +1,12 @@
+import { closeOperationRecording } from './operation-runtime.js'
+import { databaseOperation, openRecordedDatabase } from './recorded-database.js'
 import { parentPort, workerData } from 'node:worker_threads'
 import { DatabaseSync } from 'node:sqlite'
 import { performance } from 'node:perf_hooks'
 import { CANDLE_INTERVALS, validateCandle, validateQuery } from './market-records.js'
 import { statisticsMask, validTakerVolumes } from './statistics-state.js'
 
-const database = new DatabaseSync(workerData.path, { readOnly: workerData.reader === true })
+const database = openRecordedDatabase(DatabaseSync, workerData.path, { readOnly: workerData.reader === true }, workerData.reader ? 'market-reader' : 'market-writer')
 database.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA cache_size=-8192;')
 if (workerData.reader) database.exec('PRAGMA query_only=ON;')
 else {
@@ -295,11 +297,12 @@ const commands = {
   close: () => { if (!workerData.reader) database.exec('PRAGMA wal_checkpoint(PASSIVE)'); database.close(); return { result: undefined } },
 }
 
-parentPort.on('message', ({ id, command, args }) => {
+parentPort.on('message', async ({ id, command, args }) => {
   const started = performance.now()
   try {
     if (!commands[command]) throw new Error(`Unknown market store operation: ${command}`)
-    const response = commands[command](...args)
+    const response = databaseOperation(`market.${command}`, () => commands[command](...args), { role: workerData.reader ? 'reader' : 'writer' })
+    if (command === 'close') await closeOperationRecording()
     parentPort.postMessage({ id, ...response, durationMS: performance.now() - started })
   } catch (error) { parentPort.postMessage({ id, error: { message: error.message, name: error.name, code: error.code } }) }
 })

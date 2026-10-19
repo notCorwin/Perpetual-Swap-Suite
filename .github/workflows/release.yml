@@ -36,23 +36,18 @@ jobs:
       - name: Check types
         run: node_modules/.bin/tsc -b
       - name: Test core behavior
-        run: node --experimental-strip-types --test src/*.test.ts tests/core/*.test.mjs
-      - name: Build renderer
-        run: node_modules/.bin/vite build
+        run: npm run test:core -- --output artifacts/sandbox
       - name: Test Electron with isolated fixtures
-        shell: bash
-        run: |
-          mkdir -p artifacts
-          node --test-concurrency=1 --test tests/e2e/*.e2e.mjs 2>&1 | tee artifacts/electron-e2e.log
+        run: npm run test:e2e -- --output artifacts/sandbox
       - name: Verify workspace scaling and contrast
         env:
           PERPETUAL_SWAP_UI_VISUAL_OUTPUT: artifacts/workspace-visual
-        run: node scripts/workspace-visual-check.mjs
+        run: npm run sandbox -- command --output artifacts/sandbox -- node scripts/workspace-visual-check.mjs
       - name: Verify full-market intake under held statistics and archive writes
         env:
           PERPETUAL_SWAP_RESOURCE_REPORT: artifacts/market-resources.json
-        run: node scripts/market-resource-benchmark.mjs
-      - name: Retain E2E diagnostics
+        run: npm run sandbox -- command --output artifacts/sandbox -- node scripts/market-resource-benchmark.mjs
+      - name: Retain sandbox recordings and diagnostics
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -89,7 +84,7 @@ jobs:
           app="$(find dist -maxdepth 3 -type d -name 'Perpetual Swap Suite.app' -print)"
           test -n "$app"
           test -x "$app/Contents/MacOS/Perpetual Swap Suite"
-          node scripts/smoke-electron.mjs --app "$app" --revision "$GITHUB_SHA" --report artifacts/package-smoke.json 2>&1 | tee artifacts/package-smoke.log
+          node scripts/test-sandbox.mjs command --output artifacts/sandbox -- node scripts/smoke-electron.mjs --app "$app" --revision "$GITHUB_SHA" --report artifacts/package-smoke.json 2>&1 | tee artifacts/package-smoke.log
           echo "app=$app" >> "$GITHUB_OUTPUT"
       - name: Archive smoke-tested app
         shell: bash

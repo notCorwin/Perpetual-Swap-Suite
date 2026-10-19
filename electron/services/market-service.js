@@ -1,5 +1,7 @@
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { beginOperation, measureOperation } from './operations.js'
+import { networkResource } from './network-operations.js'
 import { evaluateMarketOpportunity, summarizeMarketBars } from './market-metrics.js'
 import { PreparedChartPipeline } from './prepared-chart-service.js'
 import { MetadataStore, DEFAULT_PREFERENCES, validatePreferences } from './metadata-store.js'
@@ -485,10 +487,14 @@ export class MarketService {
 
   listRowFor(entry, bars = [], bollExpansion) {
     const { rankingChange, rankingAsOf } = this.cachedRanking(entry.instrument.instId)
-    return { ...marketRow(entry.instrument, entry.ticker, entry.result, bars, bollExpansion), rankingChange, rankingAsOf }
+    const row = bars.length ? measureOperation({ category: 'cpu', name: 'market.list.summarize', resource: entry.instrument.instId,
+      attributes: { inputRows: bars.length } }, () => marketRow(entry.instrument, entry.ticker, entry.result, bars, bollExpansion))
+      : marketRow(entry.instrument, entry.ticker, entry.result, bars, bollExpansion)
+    return { ...row, rankingChange, rankingAsOf }
   }
 
   ensureListRows(timeframe) {
+    return measureOperation({ category: 'cpu', name: 'market.list.reconcile', attributes: { inputRows: this.catalog.size } }, () => {
     const frame = this.listTimeframe(timeframe), current = this.listRows.get(frame) ?? new Map(), next = new Map()
     for (const entry of this.catalog.values()) {
       const base = this.listRowFor(entry), previous = current.get(entry.instrument.instId)
@@ -498,17 +504,18 @@ export class MarketService {
       this.listRows.set(frame, next); this.listUpdatedAt.set(frame, Date.now()); this.touchList()
     } else if (!this.listRows.has(frame)) this.listRows.set(frame, next)
     return frame
+    })
   }
 
   listRowsFor(timeframe, now = Date.now()) {
     const frame = this.listTimeframe(timeframe), cached = this.listRows.get(frame)
     const lookback = this.prefs().rankingLookback, asOf = closedBoundary('5m', now)
-    return [...this.catalog.values()].filter(entry => this.validCatalogEntry(entry, now)).map(entry => {
+    return measureOperation({ category: 'cpu', name: 'market.list.sort', attributes: { inputRows: this.catalog.size } }, () => [...this.catalog.values()].filter(entry => this.validCatalogEntry(entry, now)).map(entry => {
       const instId = entry.instrument.instId, ranking = this.rankings.get(instId)
       const current = ranking?.lookback === lookback && ranking.rankingAsOf === asOf
       return { ...(cached?.get(instId) ?? marketRow(entry.instrument, entry.ticker, entry.result, [])),
         rankingChange: current ? ranking.rankingChange : null, rankingAsOf: current ? ranking.rankingAsOf : null }
-    }).sort(compareRanking)
+    }).sort(compareRanking))
   }
 
   publishListRow(timeframe, row, updatedAt = Date.now()) {
@@ -838,21 +845,42 @@ export class MarketService {
           // microtask that starts fetch. Do not let that race create a
           // network call which no active viewport can consume.
           if (request.controller.signal.aborted) throw request.controller.signal.reason ?? new Error('The request was aborted.')
-          const response = await this.fetcher(requestURL(request.path, request.parameters), { headers: { Accept: 'application/json' }, signal: request.controller.signal })
-          if (request.controller.signal.aborted) throw request.controller.signal.reason ?? new Error('The request was aborted.')
-          if (response.status === 429) {
-            const serverDelay = retryAfterDelay(response.headers.get('retry-after'))
-            // A 429 cools only the endpoint family that returned it. OI
-            // must never freeze an unrelated candle repair or Taker read.
-            lane.rateLimitedUntil = Math.max(lane.rateLimitedUntil, Date.now() + (serverDelay ?? RETRY_DELAYS[0]))
-            lane.concurrency = Math.max(2, Math.floor((lane.concurrency ?? 4) / 2))
-            throw new RetryAfterError(request.path, serverDelay, lane.name)
+          const url = requestURL(request.path, request.parameters), signal = request.controller.signal
+          const operation = beginOperation({ category: 'network', name: 'http.request', resource: networkResource(url),
+            attributes: { transport: 'http', method: 'GET', path: request.path, lane: lane.name, priority: request.priority } })
+          const attributes = {}
+          let finished = false
+          const finish = status => {
+            if (finished) return
+            finished = true
+            operation.end({ status, attributes })
           }
-          if (!response.ok) throw new Error(`OKX ${request.path} failed (${response.status}).`)
-          const payload = await response.json()
-          if (request.controller.signal.aborted) throw request.controller.signal.reason ?? new Error('The request was aborted.')
-          if (payload.code && payload.code !== '0') throw new Error(`OKX ${request.path}: ${payload.msg || payload.code}`)
-          return payload.data ?? []
+          const abort = () => { attributes.timedOut = signal.reason instanceof RequestTimeoutError; finish(attributes.timedOut ? 'error' : 'cancelled') }
+          signal.addEventListener('abort', abort, { once: true })
+          try {
+            const response = await this.fetcher(url, { headers: { Accept: 'application/json' }, signal })
+            attributes.httpStatus = response.status
+            const contentLength = response.headers?.get('content-length')
+            if (contentLength !== null && contentLength !== undefined && /^\d+$/.test(contentLength) && Number.isSafeInteger(Number(contentLength))) attributes.declaredResponseBytes = Number(contentLength)
+            if (signal.aborted) throw signal.reason ?? new Error('The request was aborted.')
+            if (response.status === 429) {
+              const serverDelay = retryAfterDelay(response.headers.get('retry-after'))
+              // A 429 cools only the endpoint family that returned it. OI
+              // must never freeze an unrelated candle repair or Taker read.
+              lane.rateLimitedUntil = Math.max(lane.rateLimitedUntil, Date.now() + (serverDelay ?? RETRY_DELAYS[0]))
+              lane.concurrency = Math.max(2, Math.floor((lane.concurrency ?? 4) / 2))
+              throw new RetryAfterError(request.path, serverDelay, lane.name)
+            }
+            if (!response.ok) throw new Error(`OKX ${request.path} failed (${response.status}).`)
+            const payload = await response.json()
+            if (signal.aborted) throw signal.reason ?? new Error('The request was aborted.')
+            if (payload.code && payload.code !== '0') throw new Error(`OKX ${request.path}: ${payload.msg || payload.code}`)
+            const data = payload.data ?? []
+            if (Array.isArray(data)) attributes.rows = data.length
+            finish('ok')
+            return data
+          } catch (error) { finish(signal.aborted && !(signal.reason instanceof RequestTimeoutError) ? 'cancelled' : 'error'); throw error }
+          finally { signal.removeEventListener('abort', abort) }
         }), request.controller.signal)
         lane.latencyMS = lane.latencyMS === undefined ? performance.now() - startedAt : lane.latencyMS * 0.8 + (performance.now() - startedAt) * 0.2
         lane.completed = (lane.completed ?? 0) + 1

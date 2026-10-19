@@ -1,4 +1,5 @@
 import { signedRelativeChange as change } from './market-metrics.js'
+import { measureOperation } from './operations.js'
 
 const finite = value => typeof value === 'number' && Number.isFinite(value) ? value : null
 const EMA_PERIOD = 200
@@ -125,19 +126,21 @@ export function appendIndicatorCandle(state, candle) {
 // only fixed-size windows prevents ticks from cloning/recomputing history and
 // keeps successive live revisions from changing EMA/RSI/ATR's confirmed state.
 export function projectIndicatorCandle(state, candle) {
-  return appendIndicatorCandle({
+  return measureOperation({ category: 'cpu', name: 'indicators.project', attributes: { candles: 1, intervalMS: state.intervalMS } }, () => appendIndicatorCandle({
     ...state, closes: [...state.closes], volumes: [...state.volumes], rocs: [...state.rocs],
     rsi: state.rsi.map(value => ({ ...value })),
-  }, candle)
+  }, candle))
 }
 
 export function buildIndicatorSeries(candles, intervalMS = 300_000) {
+  return measureOperation({ category: 'cpu', name: 'indicators.build', attributes: { candles: candles.length, intervalMS } }, () => {
   const state = createIndicatorState(intervalMS), bars = []
   const unique = new Map()
   for (const candle of candles) if (finite(candle.timestamp) !== null && finite(candle.close) !== null) unique.set(candle.timestamp, candle)
   const ordered = [...unique.values()].sort((left, right) => left.timestamp - right.timestamp)
   for (const candle of ordered) bars.push(appendIndicatorCandle(state, candle))
   return { bars, state }
+  })
 }
 
 // Batch and incremental calculations share every formula and initialization

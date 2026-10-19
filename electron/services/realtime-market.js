@@ -1,3 +1,5 @@
+import { recordedWebSocketFactory } from './network-operations.js'
+
 // OKX business WebSocket: https://www.okx.com/docs-v5/en/#order-book-trading-market-data-ws-candlesticks-channel
 // Port 8443 retires on 2026-10-31: https://www.okx.com/docs-v5/log_en/
 export const OKX_BUSINESS_WEBSOCKET_URL = 'wss://ws.okx.com/ws/v5/business'
@@ -23,7 +25,7 @@ export class RealtimeMarket {
     }
     this.options = options
     this.url = options.url ?? OKX_BUSINESS_WEBSOCKET_URL
-    this.factory = options.webSocketFactory ?? (url => new globalThis.WebSocket(url))
+    this.factory = recordedWebSocketFactory(options.webSocketFactory ?? (url => new globalThis.WebSocket(url)), 'okx.business')
     this.now = options.now ?? Date.now
     this.setTimer = options.setTimeout ?? globalThis.setTimeout
     this.clearTimer = options.clearTimeout ?? globalThis.clearTimeout

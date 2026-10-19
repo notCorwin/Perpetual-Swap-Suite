@@ -1,3 +1,4 @@
+import { closeOperationRecording } from './operation-runtime.js'
 import { parentPort, workerData, threadId } from 'node:worker_threads'
 import { join } from 'node:path'
 import { MetadataStore } from './metadata-store.js'
@@ -157,6 +158,7 @@ parentPort.on('message', async ({ id, method, value }) => {
       await service.dispose()
       await store.close()
       metadata.close()
+      await closeOperationRecording()
       result = { ok: true }
     } else throw new Error('Unsupported backend operation.')
     parentPort.postMessage({ id, value: result })

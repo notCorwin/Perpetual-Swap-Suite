@@ -2,6 +2,8 @@ import { Worker } from 'node:worker_threads'
 import { availableParallelism } from 'node:os'
 import { statisticsMask, statisticsVersionFor } from './statistics-state.js'
 import { appendIndicatorCandle, projectIndicatorCandle } from './indicators.js'
+import { measureOperation } from './operations.js'
+import { stopOperationWorker } from './operation-worker.js'
 
 const VISIBLE = 96, TAIL = 128, CHUNK = 1024, HISTORY = 1536, HISTORY_AHEAD = 256, HISTORY_PAGE = 300
 // Formula versions identify the complete recursive state and verified producer.
@@ -77,7 +79,7 @@ export class PreparedChartPipeline {
       if (journal.length > 256) journal.shift()
       this.priceJournal.set(key, journal)
     })
-    this.closed = false; this.focusKey = null; this.requestedIDs = new Set(); this.refreshTimer = null
+    this.closed = false; this.disposeTask = null; this.focusKey = null; this.requestedIDs = new Set(); this.refreshTimer = null
   }
 
   state(instId, timeframe) {
@@ -184,7 +186,8 @@ export class PreparedChartPipeline {
     const cacheKey = `${end}:${state.sourceVersion}:${state.indicatorVersion ?? 0}:${state.generation}:${sourceState(rows, 1)}:${sourceState(rows, 2)}`
     state.barCaches ??= new Map()
     const cached = state.barCaches.get(end)
-    const bars = cached?.key === cacheKey ? cached.bars : rows.map(row => bar(row, state.indicators.get(row.timestamp)))
+    const bars = cached?.key === cacheKey ? cached.bars : measureOperation({ category: 'cpu', name: 'chart.project', resource: state.instId,
+      attributes: { candles: rows.length, intervalMS: state.intervalMS, projection: 'viewport' } }, () => rows.map(row => bar(row, state.indicators.get(row.timestamp))))
     state.barCaches.delete(end); state.barCaches.set(end, { key: cacheKey, bars })
     while (state.barCaches.size > 4) state.barCaches.delete(state.barCaches.keys().next().value)
     const live = state.live && (end === state.latestHour || end === null) ? state.live : null
@@ -222,7 +225,9 @@ export class PreparedChartPipeline {
     // A bounded navigation reserve, not a transfer of the full canonical history.
     const key = this.historyKey(state, end)
     if (state.historyBarsCache?.key !== key) {
-      state.historyBarsCache = { key, bars: [...state.rows.values()].sort((a, b) => a.timestamp - b.timestamp).map(row => bar(row, state.indicators.get(row.timestamp))) }
+      state.historyBarsCache = { key, bars: measureOperation({ category: 'cpu', name: 'chart.project', resource: state.instId,
+        attributes: { candles: state.rows.size, intervalMS: state.intervalMS, projection: 'history' } },
+      () => [...state.rows.values()].sort((a, b) => a.timestamp - b.timestamp).map(row => bar(row, state.indicators.get(row.timestamp)))) }
       this.updateMemory(state)
     }
     frame.bars = state.historyBarsCache.bars
@@ -634,6 +639,7 @@ export class PreparedChartPipeline {
   }
 
   observe(rows, previous) {
+    return measureOperation({ category: 'cpu', name: 'indicators.observe', attributes: { candles: rows.length, execution: 'inline' } }, () => {
     for (const [key, batch] of Map.groupBy(rows, row => seriesKey(row.instrument, row.timeframe))) {
       const state = this.series.get(key), live = this.liveStates.get(key)
       let changedFrom = Infinity
@@ -665,6 +671,7 @@ export class PreparedChartPipeline {
       }
       else if (live && this.universe.has(key)) this.publish(live)
     }
+    })
   }
 
 
@@ -755,14 +762,20 @@ export class PreparedChartPipeline {
     }
   }
 
-  async dispose() {
+  dispose() {
+    if (this.disposeTask) return this.disposeTask
     this.closed = true
     this.unsubscribeStore?.(); this.priceJournal.clear()
     if (this.refreshTimer !== null) clearTimeout(this.refreshTimer)
     for (const pending of this.calculations.values()) pending.reject(new Error('Prepared chart data service is closed.'))
     this.calculations.clear(); this.calculationQueue = []
-    await Promise.allSettled(this.workers.map(slot => slot.worker.terminate()))
-    await Promise.allSettled([...this.tasks.values(), ...this.liveSeeds.values()])
-    this.listeners.clear()
+    const workers = this.workers
+    this.workers = []
+    this.disposeTask = (async () => {
+      await Promise.allSettled(workers.map(slot => stopOperationWorker(slot.worker, 'prepared-chart')))
+      await Promise.allSettled([...this.tasks.values(), ...this.liveSeeds.values()])
+      this.listeners.clear()
+    })()
+    return this.disposeTask
   }
 }

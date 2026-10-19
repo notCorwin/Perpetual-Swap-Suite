@@ -65,9 +65,9 @@ jobs:
         shell: bash
         run: |
           set +e
-          node scripts/okx-live-1h.mjs 2>&1 | tee artifacts/okx-integration.log
+          npm run sandbox -- command --allow-network --output artifacts/sandbox -- node scripts/okx-live-1h.mjs 2>&1 | tee artifacts/okx-integration.log
           status="${PIPESTATUS[0]}"
-          node scripts/okx-live-statistics.mjs --report artifacts/okx-statistics.json 2>&1 | tee artifacts/okx-statistics.log
+          npm run sandbox -- command --allow-network --output artifacts/sandbox -- node scripts/okx-live-statistics.mjs --report artifacts/okx-statistics.json 2>&1 | tee artifacts/okx-statistics.log
           statistics_status="${PIPESTATUS[0]}"
           if [ "$statistics_status" -ne 0 ]; then status="$statistics_status"; fi
           set -e
