@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
+import { requireForegroundTests } from '../electron/test-presentation.js'
 
 // A foreground paint budget requires a native foreground window. A hidden
 // BrowserWindow can still report document.visibilityState === 'visible' while
 // macOS schedules its animation frames at an occluded-window cadence.
 export async function foregroundPaintWindow(electron, page) {
+  requireForegroundTests()
   const previous = await electron.evaluate(({ BrowserWindow, app }) => {
     const window = BrowserWindow.getAllWindows()[0]
     const state = { id: window.id, visible: window.isVisible(), focused: window.isFocused(), minimized: window.isMinimized() }

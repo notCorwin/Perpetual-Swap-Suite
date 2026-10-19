@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseDesktopRequest } from './desktop-contract.js'
 import { createDesktopSecurity } from './desktop-security.js'
+import { testPresentation } from './test-presentation.js'
 import { initializeOperationRecording, closeOperationRecording } from './services/operation-runtime.js'
 import { startGraphicsRecording } from './services/operation-graphics.js'
 import { beginOperation, measureOperation, recordOperation } from './services/operations.js'
@@ -13,6 +14,8 @@ import { MarketBackend } from './services/market-backend.js'
 const root = fileURLToPath(new URL('..', import.meta.url))
 const rendererURL = process.env.ELECTRON_RENDERER_URL || undefined
 const testMode = process.env.PERPETUAL_SWAP_E2E === '1'
+const backgroundTests = testPresentation() === 'background'
+if (backgroundTests && process.platform === 'darwin') app.setActivationPolicy('accessory')
 // Chromium initializes its profile during ready. Isolate both locations first.
 if (process.env.PERPETUAL_SWAP_USER_DATA) {
   const userData = process.env.PERPETUAL_SWAP_USER_DATA
@@ -115,7 +118,8 @@ async function createWindow() {
   if (shuttingDown || window && !window.isDestroyed()) return
   window = new BrowserWindow({
     width: 1600, height: 1000, minWidth: 400, minHeight: 300,
-    title: 'Perpetual Swap Suite', backgroundColor: '#101114', show: !testMode,
+    title: 'Perpetual Swap Suite', backgroundColor: '#101114', show: !testMode && !backgroundTests,
+    focusable: !backgroundTests,
     webPreferences: { preload: join(root, 'electron', 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   })
   window.webContents.on('will-navigate', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
@@ -160,6 +164,7 @@ async function startDesktop() {
 }
 
 app.whenReady().then(() => {
+  if (backgroundTests && process.platform === 'darwin') app.dock.hide()
   if (!shuttingDown) startupTask = startDesktop()
   return startupTask
 }).catch(error => { console.error('Desktop startup failed:', error); app.quit() })

@@ -5,6 +5,9 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { _electron } from 'playwright'
 import { selectTimeframe } from './chart-acceptance.mjs'
+import { requireForegroundTests } from '../electron/test-presentation.js'
+
+requireForegroundTests()
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const reportPath = resolve(root, process.env.PERPETUAL_SWAP_RESOURCE_REPORT ?? '.build/resource-benchmark.json')

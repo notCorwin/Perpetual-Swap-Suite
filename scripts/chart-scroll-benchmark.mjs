@@ -3,7 +3,10 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
+import { requireForegroundTests } from '../electron/test-presentation.js'
 import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureNativeColdBoundary, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from './chart-acceptance.mjs'
+
+requireForegroundTests()
 
 const root = new URL('..', import.meta.url).pathname
 

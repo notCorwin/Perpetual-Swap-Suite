@@ -15,6 +15,7 @@ const environment = (directory, testMode) => ({
   ELECTRON_RUN_AS_NODE: undefined,
   ELECTRON_RENDERER_URL: undefined,
   PERPETUAL_SWAP_E2E: testMode ? '1' : '0',
+  PERPETUAL_SWAP_TEST_UI: process.env.PERPETUAL_SWAP_TEST_UI ?? 'background',
   PERPETUAL_SWAP_E2E_LIVE_REFRESH: '0',
   PERPETUAL_SWAP_USER_DATA: directory,
 })
@@ -226,6 +227,13 @@ test('fixture operations are rejected by a separately launched production-mode a
   })
   const productionPage = await production.firstWindow()
   await productionPage.waitForLoadState('domcontentloaded')
+  if (process.env.PERPETUAL_SWAP_TEST_UI !== 'foreground') {
+    const native = await production.evaluate(({ BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows()[0]
+      return { visible: window.isVisible(), focused: window.isFocused(), focusable: window.isFocusable() }
+    })
+    assert.deepEqual(native, { visible: false, focused: false, focusable: false }, 'Production security checks must stay hidden without enabling fixture mode.')
+  }
   const productionRequest = value => productionPage.evaluate(value => window.radarDesktop.request(value), value)
   const previous = await productionRequest({ preferences: { action: 'read' } })
   for (const action of ['settings', 'smokeStatus', 'seedCachedListProjection']) {

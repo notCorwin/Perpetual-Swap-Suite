@@ -39,6 +39,8 @@ jobs:
         run: npm run test:core -- --output artifacts/sandbox
       - name: Test Electron with isolated fixtures
         run: npm run test:e2e -- --output artifacts/sandbox
+      - name: Test native foreground chart painting
+        run: npm run test:foreground -- --output artifacts/sandbox
       - name: Verify workspace scaling and contrast
         env:
           PERPETUAL_SWAP_UI_VISUAL_OUTPUT: artifacts/workspace-visual
@@ -46,7 +48,7 @@ jobs:
       - name: Verify full-market intake under held statistics and archive writes
         env:
           PERPETUAL_SWAP_RESOURCE_REPORT: artifacts/market-resources.json
-        run: npm run sandbox -- command --output artifacts/sandbox -- node scripts/market-resource-benchmark.mjs
+        run: npm run sandbox -- command --foreground --output artifacts/sandbox -- node scripts/market-resource-benchmark.mjs
       - name: Retain sandbox recordings and diagnostics
         if: always()
         uses: actions/upload-artifact@v7

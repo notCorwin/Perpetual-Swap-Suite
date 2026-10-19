@@ -19,7 +19,7 @@ npm run app:deliver
 open "/Applications/Perpetual Swap Suite.app"
 ```
 
-`app:deliver` builds the app for the current macOS architecture, validates and smoke-tests the candidate, replaces `/Applications/Perpetual Swap Suite.app`, and smoke-tests the installed executable. It asks the old app to quit before replacement and restores it if installation or installed-app validation fails. Smoke checks use temporary user data and exercise the actual executable, build revision, window, preload isolation, SQLite worker I/O, indicator workers, normal exit, and persistence after restart.
+`app:deliver` builds the app for the current macOS architecture, validates and smoke-tests the candidate, replaces `/Applications/Perpetual Swap Suite.app`, and smoke-tests the installed executable. It asks the old app to quit before replacement and restores it if installation or installed-app validation fails. Smoke checks use temporary user data and exercise the actual executable, build revision, window, preload isolation, SQLite worker I/O, indicator workers, normal exit, and persistence after restart. Installation checks keep windows hidden, verify a background Finder launch with the production profile, and exit their verification processes afterwards.
 
 For development, run `npm run dev` to start Vite and Electron together. Opening the renderer in an ordinary browser does not provide the desktop data service.
 
@@ -156,8 +156,9 @@ Install the locked dependencies with `npm ci`. The shadcn CLI is a development d
 | `npm run check:desktop` | Check syntax of main, preload, services, and scripts without executing them |
 | `npm run lint` | Run source lint and shared design-token checks |
 | `npm run test:core` | Run existing core business suites in the recorded, offline expensive-operation sandbox |
-| `npm run test:e2e` | Build and test actual Electron interactions with isolated fixture data and operation recording |
-| `npm test` | Run core tests and Electron E2E in one isolated, recorded sandbox |
+| `npm run test:e2e` | Build and test actual Electron interactions invisibly with isolated fixture data and operation recording |
+| `npm test` | Run core tests and invisible functional Electron E2E in one isolated, recorded sandbox |
+| `npm run test:foreground` | Explicitly show and focus Electron for native chart-paint performance tests; required separately in macOS CI |
 | `npm run sandbox -- command -- node scripts/example.mjs` | Record a custom offline test or benchmark command |
 | `npm run operations:report -- .build/sandbox/<run>` | Rebuild an offline cost summary from persisted operation records |
 | `npm run app` | Build, package, and verify a candidate macOS app |
@@ -167,20 +168,24 @@ Install the locked dependencies with `npm ci`. The shadcn CLI is a development d
 | `npm run test:okx:streams` | Verify every eligible contract's public streams and three native candle subscriptions against OKX |
 | `node scripts/okx-live-statistics.mjs --report .build/okx-statistics.json` | Check bounded older OI/Taker requests, zero placeholders, reuse and persistence against actual public responses |
 | `npm run benchmark` | Measure SQLite worker writes, range queries, coverage, and gap detection |
-| `npm run benchmark:chart` | Exercise chart scrolling, reversals, jumps, and delayed reads |
+| `npm run benchmark:chart:foreground` | Explicitly show and focus Electron to measure chart scrolling, reversals, jumps, and delayed reads |
 | `npm run benchmark:instruments` | Exercise local chart admission, switching, and revisits |
-| `npm run benchmark:market` | Build and measure 287 contracts × 3 native periods with real SQLite/renderer work, synthetic intake, blocked statistics, and concurrent archive I/O; save `.build/resource-benchmark.json` |
+| `npm run benchmark:market:foreground` | Explicitly show and focus Electron to build and measure 287 contracts × 3 native periods with real SQLite/renderer work, synthetic intake, blocked statistics, and concurrent archive I/O; save `.build/resource-benchmark.json` |
 | `PERPETUAL_SWAP_BENCHMARK_BACKGROUND=1 npm run benchmark:instruments` | Measure navigation while real synchronization and audit process an offline synthetic source |
 | `node scripts/workspace-visual-check.mjs` | Check light/dark, grayscale, scaling, and measured contrast after building |
 | `npm run benchmark:startup -- --app "/path/to/Perpetual Swap Suite.app"` | Record three isolated process launches and process working sets |
 
-[GitHub Actions](.github/workflows/release.yml) checks pull requests with lint, desktop syntax checks, types, sandboxed core tests, Electron E2E, and the full-market benchmark. Every test and benchmark run retains its operation journal, command logs, manifest, and summary in the CI `artifacts/` upload, including failed runs. On `main`, successful validation is followed by packaging, executable smoke, and publication of the `autobuild` app and digest metadata. [Live OKX integration](.github/workflows/okx-live.yml) runs separately on a schedule or manual dispatch and records endpoint diagnostics to distinguish external unavailability from integration failures. Benchmarks can be run locally as needed.
+`npm test` and `npm run test:e2e` keep native Electron windows invisible and unable to take desktop focus. They still use the real Electron host, preload, IPC, and workers. Foreground paint-performance measurements require a visible, focused window, so run them explicitly with `npm run test:foreground` or a benchmark whose command ends in `:foreground`.
+
+[GitHub Actions](.github/workflows/release.yml) checks pull requests with lint, desktop syntax checks, types, sandboxed core tests, functional Electron E2E, a separate required foreground chart-paint suite, and the full-market foreground benchmark. Every test and benchmark run retains its operation journal, command logs, manifest, and summary in the CI `artifacts/` upload, including failed runs. On `main`, successful validation is followed by packaging, executable smoke, and publication of the `autobuild` app and digest metadata. [Live OKX integration](.github/workflows/okx-live.yml) runs separately on a schedule or manual dispatch and records endpoint diagnostics to distinguish external unavailability from integration failures. Benchmarks can be run locally as needed.
 
 ### Expensive-operation sandbox
 
 Tests stay with their existing business suites. Their shared runner records the same CPU, GPU/graphics, network, and database boundaries used by the app, so regression assertions and performance review share one source of evidence. Existing chart reuse checks also assert that warm forming ticks emit no repeated canonical calculation or confirmed-chart projection. Injected test sources remain deterministic; recording does not replace correctness assertions.
 
 Every run creates `.build/sandbox/<timestamp>-<id>/` with independent temporary files and Electron user data. The runner sets `PERPETUAL_SWAP_SANDBOX=1`, blocks external network in the application transports by default, and permits local servers and injected fixtures. This is an application test sandbox, not operating-system process confinement; arbitrary commands can access the host filesystem and their own transports. Existing live OKX commands explicitly enable external network and still record their work. For another live integration, opt in with `npm run sandbox -- command --allow-network -- node scripts/example.mjs`.
+
+Custom sandbox commands also default to invisible Electron windows without native focus. Add `--foreground` before the command separator `--` only when the scenario needs to show and focus a native window, for example `npm run sandbox -- command --foreground -- node scripts/market-resource-benchmark.mjs`. Native paint benchmarks reject background mode instead of reporting hidden-window timing as foreground performance.
 
 The run directory contains:
 
@@ -197,7 +202,7 @@ Use `npm run operations:report -- <run-or-operations-directory> [--out <director
 
 Desktop operation journals are saved under the app's `Operations/` directory. Records contain execution IDs, category, operation name, safe resource identity, start time, elapsed duration, result, and allowed scalar work counts. Request bodies, response bodies, SQL parameters, credentials, and error text are excluded. Network records represent physical requests/transmissions; reuse and request coalescing do not invent extra network work. Database records describe worker-side execution separately from caller queue/wait boundaries. CPU records cover canonical indicator work, qualification, chart projection, and renderer construction rather than each arithmetic primitive.
 
-Elapsed durations can overlap across threads and nested boundaries, so their sum is not process wall time. CPU time is included where the runtime provides a thread CPU clock. Graphics capture/submission timing and GPU-process resource samples do not claim GPU hardware execution time. For native Chromium graphics tracing, use `npm run test:e2e -- --gpu-trace`, or `npm run sandbox -- command --gpu-trace -- node scripts/market-resource-benchmark.mjs` after building; the app saves `chromium-*.json` alongside its operation journal for offline trace inspection. Native tracing is opt-in because capturing a full graphics trace adds overhead.
+Elapsed durations can overlap across threads and nested boundaries, so their sum is not process wall time. CPU time is included where the runtime provides a thread CPU clock. Graphics capture/submission timing and GPU-process resource samples do not claim GPU hardware execution time. For native Chromium graphics tracing, use `npm run test:e2e -- --gpu-trace`, or `npm run sandbox -- command --foreground --gpu-trace -- node scripts/market-resource-benchmark.mjs` after building; the app saves `chromium-*.json` alongside its operation journal for offline trace inspection. Native tracing is opt-in because capturing a full graphics trace adds overhead.
 
 To instrument a new expensive boundary, use `measureOperation({ category, name, resource, attributes }, operation)` for synchronous or asynchronous work, or `beginOperation(...).end(...)` for a lifecycle such as a stream connection. Choose stable names and bounded resource identities; only actual work belongs inside the boundary. Core tests can attach `attachOperationSink` to assert counts, failure/cancellation outcomes, and absence of repeated work without brittle machine-speed thresholds. All Node test/benchmark entrypoints install recording before importing app modules; desktop and worker entrypoints initialize their own inherited recording directory.
 

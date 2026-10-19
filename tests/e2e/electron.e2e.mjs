@@ -106,7 +106,15 @@ before(async () => {
 after(async () => { await electron?.close(); await rm(userData, { recursive: true, force: true }) })
 
 test('desktop window loads the React workspace with a restricted renderer', async () => {
-  assert.equal(await page.title(), 'Perpetual Swap Radar')
+  if (process.env.PERPETUAL_SWAP_TEST_UI !== 'foreground') {
+    const native = await electron.evaluate(({ app, BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows()[0]
+      return { visible: window.isVisible(), focused: window.isFocused(), focusable: window.isFocusable(),
+        dockVisible: process.platform === 'darwin' ? app.dock.isVisible() : false }
+    })
+    assert.deepEqual(native, { visible: false, focused: false, focusable: false, dockVisible: false }, 'Background tests must not show a native window or acquire desktop focus.')
+  }
+  await page.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).waitFor()
   await page.locator('#root').waitFor({ state: 'attached' })
   assert.equal(await page.evaluate(() => document.visibilityState), 'visible')
   assert.equal(await page.evaluate(() => typeof window.require), 'undefined')

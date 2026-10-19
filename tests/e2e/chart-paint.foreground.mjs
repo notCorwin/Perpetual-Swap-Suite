@@ -4,7 +4,10 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
+import { requireForegroundTests } from '../../electron/test-presentation.js'
 import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureNativeColdBoundary, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
+
+requireForegroundTests()
 
 // Foreground paint tests own their process. Hiding a previously shown native
 // window can suspend its animation frames, so functional tests use another app.

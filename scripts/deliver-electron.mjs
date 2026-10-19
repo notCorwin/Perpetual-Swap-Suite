@@ -23,7 +23,8 @@ async function launchUserApp(appPath) {
     electron = await _electron.launch({ executablePath: join(appPath, 'Contents/MacOS/Perpetual Swap Suite'),
       args: ['--disable-gpu'], timeout: 45_000,
       env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, ELECTRON_RENDERER_URL: undefined,
-        PERPETUAL_SWAP_E2E: '0', PERPETUAL_SWAP_E2E_LIVE_REFRESH: '0', PERPETUAL_SWAP_USER_DATA: undefined } })
+        PERPETUAL_SWAP_E2E: '0', PERPETUAL_SWAP_E2E_LIVE_REFRESH: '0', PERPETUAL_SWAP_USER_DATA: undefined,
+        PERPETUAL_SWAP_TEST_UI: 'background' } })
     const page = await electron.firstWindow({ timeout: 30_000 })
     await page.waitForFunction(() => document.querySelector('[data-layout="market-workspace"]'))
     const preferences = await page.evaluate(() => window.radarDesktop.request({ preferences: { action: 'read' } }))
@@ -44,15 +45,19 @@ async function launchUserApp(appPath) {
     }
     if (child) assert.equal(child.exitCode, 0, 'The production profile must quit normally.')
   }
-  // `open` can inherit the host automation's run-as-Node flag. The installed
-  // app must start as Electron with its normal profile, including from T3.
-  await run('open', ['-n', '-a', appPath, '--env', 'ELECTRON_RUN_AS_NODE=',
-    '--env', 'ELECTRON_RENDERER_URL=', '--env', 'PERPETUAL_SWAP_E2E=0', '--env', 'PERPETUAL_SWAP_USER_DATA='])
+  // Verify a Finder launch with the normal data profile, without presenting a
+  // window or activating the app. Verification processes exit afterwards.
+  await run('open', ['-g', '-n', '-a', appPath, '--env', 'ELECTRON_RUN_AS_NODE=',
+    '--env', 'ELECTRON_RENDERER_URL=', '--env', 'PERPETUAL_SWAP_E2E=0', '--env', 'PERPETUAL_SWAP_USER_DATA=',
+    '--env', 'PERPETUAL_SWAP_TEST_UI=background'])
   const executable = join(appPath, 'Contents/MacOS/Perpetual Swap Suite')
   const deadline = Date.now() + 20_000
   while (Date.now() < deadline) {
     const { stdout } = await execute('ps', ['-axww', '-o', 'comm='])
-    if (stdout.split('\n').some(command => command.trim() === executable)) return
+    if (stdout.split('\n').some(command => command.trim() === executable)) {
+      await quitInstalledApp(appPath)
+      return
+    }
     await new Promise(resolve => setTimeout(resolve, 100))
   }
   throw new Error('The installed app did not restart.')
@@ -71,7 +76,7 @@ const report = await installApp({
     if (app === destination) {
       try {
         await launchUserApp(app)
-        report.checks.push('production user profile, normal exit, and Finder restart')
+        report.checks.push('production user profile, normal exit, and background Finder restart')
         report.finishedAt = new Date().toISOString()
         await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`)
       } catch (error) {
