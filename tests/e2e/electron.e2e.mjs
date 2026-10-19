@@ -109,10 +109,10 @@ test('desktop window loads the React workspace with a restricted renderer', asyn
   if (process.env.PERPETUAL_SWAP_TEST_UI !== 'foreground') {
     const native = await electron.evaluate(({ app, BrowserWindow }) => {
       const window = BrowserWindow.getAllWindows()[0]
-      return { visible: window.isVisible(), focused: window.isFocused(), focusable: window.isFocusable(),
+      return { visible: window.isVisible(), focused: window.isFocused(), focusable: window.isFocusable(), alwaysOnTop: window.isAlwaysOnTop(),
         dockVisible: process.platform === 'darwin' ? app.dock.isVisible() : false }
     })
-    assert.deepEqual(native, { visible: false, focused: false, focusable: false, dockVisible: false }, 'Background tests must not show a native window or acquire desktop focus.')
+    assert.deepEqual(native, { visible: false, focused: false, focusable: false, alwaysOnTop: false, dockVisible: false }, 'Background tests must not show a native window, stay on top, or acquire desktop focus.')
   }
   await page.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).waitFor()
   await page.locator('#root').waitFor({ state: 'attached' })

@@ -1,4 +1,4 @@
-import { mkdirSync, openSync, readFileSync, writeFileSync, writeSync, write, closeSync, fdatasync } from 'node:fs'
+import { mkdirSync, openSync, readFileSync, writeFileSync, writeSync, write, closeSync, fdatasync, fdatasyncSync, renameSync, unlinkSync } from 'node:fs'
 import { join, basename, dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
@@ -18,16 +18,30 @@ installSandboxNetworkBoundary()
 let current
 const suppress = withOperationSuppressed
 const validID = value => typeof value === 'string' && /^[\w.:-]{1,256}$/.test(value)
-const jsonWrite = (path, value) => suppress(() => writeFileSync(path, `${JSON.stringify(value)}\n`, { mode: 0o600 }))
+const jsonWrite = (path, value) => suppress(() => {
+  const temporary = join(dirname(path), `.tmp-${randomUUID()}-${basename(path)}`)
+  let descriptor
+  try {
+    writeFileSync(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' })
+    descriptor = openSync(temporary, 'r')
+    fdatasyncSync(descriptor)
+    closeSync(descriptor); descriptor = undefined
+    renameSync(temporary, path)
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor)
+    try { unlinkSync(temporary) } catch (error) { if (error.code !== 'ENOENT') throw error }
+  }
+})
 
 function journalWriter(directory, sessionId, executionId, participant, hooks) {
   const file = join(directory, `${executionId}.jsonl`), healthFile = join(directory, `${executionId}.health.json`)
   const descriptor = suppress(() => openSync(file, 'wx', 0o600))
-  const counts = { recorded: 0, persisted: 0, failed: 0, recordedOperations: 0, startedOperations: 0, sourceFailures: 0, omittedRecords: 0 }
+  const counts = { recorded: 0, persisted: 0, durableRecords: 0, failed: 0, recordedOperations: 0, startedOperations: 0, sourceFailures: 0, omittedRecords: 0 }
+  let lastDurableAt = null
   let queue = [], bytes = 0, position = 0, timer, writing, accepting = true, closed = false, closing, flushBarrier = Promise.resolve()
   const health = () => ({ schemaVersion: 2, ...counts, pending: counts.recorded - counts.persisted,
     activeOperations: counts.startedOperations - counts.recordedOperations, executionId, sessionId, participantId: participant.id,
-    role: participant.role, closed, enabledHooks: hooks, durability: 'fdatasync-on-explicit-flush',
+    role: participant.role, closed, enabledHooks: hooks, durability: 'fdatasync-on-flush-and-5s-checkpoint', updatedAt: Date.now(), lastDurableAt,
     runtime: { node: process.version, electron: process.versions.electron ?? null, v8: process.versions.v8 } })
   const failed = error => { counts.failed++; suppress(() => console.error(`Operation journal failed (${error.code ?? error.name}).`)) }
   const writeHealth = () => {
@@ -85,7 +99,10 @@ function journalWriter(directory, sessionId, executionId, participant, hooks) {
       do { await startWrite() } while (counts.persisted < target && (writing || queue.length))
       if (writing) await writing
       if (durable && !closed) {
-        try { await new Promise((resolve, reject) => fdatasync(descriptor, error => error ? reject(error) : resolve())) }
+        try {
+          await new Promise((resolve, reject) => fdatasync(descriptor, error => error ? reject(error) : resolve()))
+          counts.durableRecords = Math.max(counts.durableRecords, Math.min(target, counts.persisted)); lastDurableAt = Date.now()
+        }
         catch (error) { failed(error) }
       }
       writeHealth()
@@ -111,6 +128,7 @@ function journalWriter(directory, sessionId, executionId, participant, hooks) {
   const close = () => {
     if (!closing) {
       accepting = false
+      clearInterval(checkpointTimer)
       closing = (async () => {
         try {
           await flush()
@@ -125,6 +143,10 @@ function journalWriter(directory, sessionId, executionId, participant, hooks) {
     }
     return closing
   }
+  // A long-lived worker must leave fresh durable progress even when it never
+  // receives a renderer ACK or an explicit diagnostics request.
+  const checkpointTimer = setInterval(() => { if (accepting) void flush().catch(() => {}) }, 5000)
+  checkpointTimer.unref()
   writeHealth()
   return { enqueue, flush, close, exit, health, markIncomplete }
 }

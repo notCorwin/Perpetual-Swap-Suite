@@ -958,3 +958,154 @@ test('returning to latest while one reserve page is held retires the obsolete ol
     assert.equal(state.active, 0)
   } finally { hold.resolve(); await preparation; await pipeline.dispose() }
 })
+
+test('rehydrating the admitted viewport preserves cold acquisition within the active retention bounds', async () => {
+  const rows = source(8192), target = rows.at(-1)!.timestamp - 905 * interval, visible = rows.at(-1)!.timestamp - 648 * interval
+  const first = deferred(), started = deferred(), reserve = deferred(), reached = deferred(), calls: { from: number; through: number }[] = []
+  let f: ReturnType<typeof fixture>, preparation: Promise<unknown> | undefined
+  f = fixture(rows.slice(-1000), {
+    async ensurePrices(id: string, _timeframe: string, from: number, through: number) {
+      if (id !== instId) return
+      calls.push({ from, through })
+      if (through === target) { started.resolve(); await first.promise }
+      else { reached.resolve(); await reserve.promise }
+      const page = rows.filter(row => row.timestamp >= from && row.timestamp <= through), prior = new Map()
+      for (const row of page) for (const [hour, value] of f.store.change(row)) prior.set(hour, value)
+      f.pipeline.observe(page, prior)
+    },
+  })
+  const { pipeline } = f
+  try {
+    await pipeline.localHistory(instId, '15m', visible); await finishSeed(pipeline)
+    preparation = pipeline.prepare(instId, '15m', target, 1280)
+    await started.promise
+    const owner = pipeline.acquisition
+    await pipeline.local('OTHER-USDT-SWAP', '15m', { priority: 'background' })
+    assert.equal(pipeline.acquisition, owner, 'An unrelated background local read cannot retire the focused acquisition.')
+    await pipeline.localHistory(instId, '15m', visible)
+    first.resolve()
+    const outcome = await Promise.race([reached.promise.then(() => 'reserve'), preparation!.then(() => 'returned')])
+    assert.equal(outcome, 'reserve', 'Refreshing the same visible cursor must not end acquisition after its nearest page.')
+    reserve.resolve(); await preparation; await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`), firstRetained = visible - 1279 * interval
+    assert.equal(state.historyEnd, visible, 'Acquisition must not restore its older cursor over the visible viewport.')
+    assert.ok(state.rows.size <= 1536)
+    assert.ok(pipeline.liveStates.get(state.key).rows.size <= 128)
+    assert.equal(calls.at(-1)!.from, firstRetained)
+    assert.ok(calls.every(call => call.from >= firstRetained), 'Later pages must stay inside the active navigation reserve.')
+    const oracle = new Map(buildIndicatorSeries(f.store.rows, interval).bars.map((value: any) => [value.hour, value]))
+    for (const end of [visible, target]) {
+      const viewport = pipeline.historyFrame(state, end).bars.filter((value: any) => value.hour >= end - 95 * interval && value.hour <= end)
+      assert.equal(viewport.length, 96)
+      assert.ok(viewport.every((value: any) => value.indicatorsObserved), 'Both visible and nearest prefetched viewports retain exact curves.')
+      for (const value of viewport) for (const field of indicatorFields) assert.equal(value[field], (oracle.get(value.hour) as any)[field])
+    }
+  } finally { first.resolve(); reserve.resolve(); await preparation; await pipeline.dispose() }
+})
+
+for (const navigation of ['latest', 'different cursor and back', 'focus away and back']) {
+  test(`cold acquisition is permanently retired by ${navigation}`, async () => {
+    const rows = source(8192), target = rows.at(-1)!.timestamp - 905 * interval, visible = rows.at(-1)!.timestamp - 648 * interval
+    const first = deferred(), started = deferred(), calls: number[] = []
+    let f: ReturnType<typeof fixture>, preparation: Promise<unknown> | undefined
+    f = fixture(rows.slice(-1000), {
+      async ensurePrices(_id: string, _timeframe: string, from: number, through: number) {
+        calls.push(through); started.resolve(); await first.promise
+        const page = rows.filter(row => row.timestamp >= from && row.timestamp <= through), prior = new Map()
+        for (const row of page) for (const [hour, value] of f.store.change(row)) prior.set(hour, value)
+        f.pipeline.observe(page, prior)
+      },
+    })
+    const { pipeline } = f
+    try {
+      await pipeline.localHistory(instId, '15m', visible); await finishSeed(pipeline)
+      preparation = pipeline.prepare(instId, '15m', target, 1280)
+      await started.promise
+      if (navigation === 'latest') await pipeline.local(instId, '15m')
+      if (navigation === 'different cursor and back') {
+        await pipeline.localHistory(instId, '15m', visible - interval)
+        await pipeline.localHistory(instId, '15m', visible)
+      }
+      if (navigation === 'focus away and back') {
+        pipeline.setUniverse([instId, 'OTHER-USDT-SWAP'], '15m', 'OTHER-USDT-SWAP')
+        pipeline.setUniverse([instId], '15m', instId)
+      }
+      first.resolve(); await preparation; await finishSeed(pipeline)
+      assert.deepEqual(calls, [target], 'An admitted page may finish, but a retired acquisition cannot start another page.')
+      assert.equal(pipeline.acquisition, null)
+    } finally { first.resolve(); await preparation; await pipeline.dispose() }
+  })
+}
+
+test('a newer preparation owns acquisition before an older initial SQL read completes', async () => {
+  const rows = source(5000), { pipeline, store } = fixture(rows), hold = deferred(), started = deferred(), seedHold = deferred()
+  let older: Promise<unknown> | undefined, newer: Promise<unknown> | undefined
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const read = store.candles.bind(store), oldEnd = rows[1800].timestamp, newEnd = rows[3500].timestamp
+    let blocked = false
+    store.candles = async (query: any) => {
+      const result = await read(query)
+      if (!blocked && query.order === 'desc' && query.through === oldEnd + 256 * interval) { blocked = true; started.resolve(); await hold.promise }
+      return result
+    }
+    older = pipeline.prepare(instId, '15m', oldEnd, 1280)
+    await started.promise
+    const seed = pipeline.seed.bind(pipeline)
+    pipeline.seed = async (...args: any[]) => { if (args[0].historyEnd === newEnd) await seedHold.promise; return seed(...args) }
+    newer = pipeline.prepare(instId, '15m', newEnd, 1280)
+    const owner = pipeline.acquisition
+    assert.equal(owner.targetEnd, newEnd)
+    hold.resolve(); await older
+    assert.equal(pipeline.acquisition, owner, 'An older completion must not clear newer acquisition ownership.')
+    assert.equal(pipeline.series.get(`${instId}:15m`).historyEnd, newEnd)
+    seedHold.resolve(); await newer; await finishSeed(pipeline)
+    assert.equal(pipeline.acquisition, null)
+  } finally { hold.resolve(); seedHold.resolve(); await older; await newer; await pipeline.dispose() }
+})
+
+test('an initial historical read failure releases acquisition admission', async () => {
+  const { pipeline, store } = fixture()
+  try {
+    store.candles = async () => { throw new Error('Historical read failed.') }
+    await assert.rejects(pipeline.prepare(instId, '15m', end(), 1280), /Historical read failed/)
+    assert.equal(pipeline.acquisition, null)
+    assert.equal(pipeline.series.get(`${instId}:15m`).active, 0)
+  } finally { await pipeline.dispose() }
+})
+
+test('returning to the acquisition target after a clipped reserve page does not skip older candles', async () => {
+  const rows = source(8192), target = rows.at(-1)!.timestamp - 905 * interval, visible = target + 257 * interval
+  const first = deferred(), started = deferred(), clipped = deferred(), reached = deferred(), calls: { from: number; through: number }[] = []
+  let f: ReturnType<typeof fixture>, preparation: Promise<unknown> | undefined
+  f = fixture(rows.slice(-1000), {
+    async ensurePrices(_id: string, _timeframe: string, from: number, through: number) {
+      calls.push({ from, through })
+      if (through === target) { started.resolve(); await first.promise }
+      if (through === target - 900 * interval) { reached.resolve(); await clipped.promise }
+      const page = rows.filter(row => row.timestamp >= from && row.timestamp <= through), prior = new Map()
+      for (const row of page) for (const [hour, value] of f.store.change(row)) prior.set(hour, value)
+      f.pipeline.observe(page, prior)
+    },
+  })
+  const { pipeline } = f
+  try {
+    await pipeline.localHistory(instId, '15m', visible); await finishSeed(pipeline)
+    preparation = pipeline.prepare(instId, '15m', target, 1280)
+    await started.promise
+    await pipeline.localHistory(instId, '15m', visible)
+    first.resolve(); await reached.promise
+    assert.deepEqual(calls.at(-1), { from: target - 1022 * interval, through: target - 900 * interval })
+    await pipeline.localHistory(instId, '15m', target)
+    clipped.resolve(); await preparation; await finishSeed(pipeline)
+    for (let index = 1; index < calls.length; index++) {
+      assert.equal(calls[index].through, calls[index - 1].from - interval, 'A clipped page must advance by its actual candle count.')
+    }
+    const state = pipeline.series.get(`${instId}:15m`)
+    for (let offset = 0; offset < 1280; offset++) assert.ok(state.rows.has(target - offset * interval), `Acquisition skipped candle ${offset}.`)
+    assert.equal(state.historyEnd, target)
+    assert.equal(state.rows.size, 1536)
+    assert.ok(pipeline.liveStates.get(state.key).rows.size <= 128)
+    assert.equal(pipeline.acquisition, null)
+  } finally { first.resolve(); clipped.resolve(); await preparation; await pipeline.dispose() }
+})

@@ -270,3 +270,16 @@ test('report reads operation files without inspecting application database trees
     assert.equal(operationReportHasFailures(report), false)
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
+
+test('a closed journal cannot claim complete recording before its admitted entries are durable', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'operation-report-durability-'))
+  try {
+    await recording(directory, [event()], { health: { durableRecords: 1 } })
+    const pending = await summarizeOperations(directory)
+    assert.equal(pending.diagnostics.pendingRecords, 0, 'OS writes and durable checkpoints are separate evidence.')
+    assert.equal(pending.diagnostics.undurableRecords, 1)
+    assert.equal(operationReportHasFailures(pending), true)
+    await recording(directory, [event()], { health: { durableRecords: 2 } })
+    assert.equal(operationReportHasFailures(await summarizeOperations(directory)), false)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { test } from 'node:test'
@@ -86,4 +86,37 @@ test('a killed execution leaves a durable named unfinished operation', { timeout
     assert.ok(JSON.stringify(report).includes('core.interrupted-computation'))
     assert.ok(report.abandonedOperations.some(value => value.name === 'core.interrupted-computation' && value.count === 1))
   } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('a long-running execution checkpoints an unfinished operation without an explicit flush', { timeout: 12_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'operation-automatic-checkpoint-'))
+  let child
+  try {
+    const source = `import ${JSON.stringify(new URL('../../electron/services/operation-runtime.js', import.meta.url).href)};
+      import { beginOperation } from ${JSON.stringify(new URL('../../electron/services/operations.js', import.meta.url).href)};
+      beginOperation({ category: 'cpu', name: 'core.automatically-checkpointed' });
+      setInterval(() => {}, 1000);`
+    child = spawn(process.execPath, ['--input-type=module', '-e', source], { env: { ...process.env,
+      PERPETUAL_SWAP_OPERATION_DIR: directory, PERPETUAL_SWAP_OPERATION_PARTICIPANT: '', PERPETUAL_SWAP_OPERATION_SESSION: 'automatic-checkpoint' },
+    stdio: ['ignore', 'ignore', 'pipe'] })
+    const exited = new Promise((resolve, reject) => { child.once('error', reject); child.once('close', (code, signal) => resolve({ code, signal })) })
+    const deadline = Date.now() + 9000
+    let health
+    while (Date.now() < deadline) {
+      const file = (await readdir(directory)).find(file => file.endsWith('.health.json') && !file.startsWith('.'))
+      if (file) health = JSON.parse(await readFile(join(directory, file), 'utf8'))
+      if (health?.durableRecords > 0) break
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    assert.ok(health?.durableRecords > 0, 'Periodic persistence must not depend on renderer activity or normal shutdown.')
+    assert.ok(health.lastDurableAt >= health.updatedAt - 1000)
+    child.kill('SIGKILL')
+    assert.equal((await exited).signal, 'SIGKILL')
+    const report = await summarizeOperations(directory)
+    assert.equal(operationReportHasFailures(report), true)
+    assert.ok(report.abandonedOperations.some(value => value.name === 'core.automatically-checkpointed'))
+  } finally {
+    if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    await rm(directory, { recursive: true, force: true })
+  }
 })

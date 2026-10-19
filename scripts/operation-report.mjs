@@ -77,7 +77,7 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
   const missingOperations = new Map(requireOperations.map(value => [operationRequirementKey(value), value]))
   let journalRecords = 0, substantiveOperations = 0, visitedFiles = 0, abandonedOverflow = 0
   const diagnostics = { files: 0, lines: 0, malformed: 0, oversized: 0, unterminated: 0, incomplete: 0, groupedOverflow: 0,
-    recorderHealthFiles: 0, persistenceFailures: 0, pendingRecords: 0, sourceFailures: 0, omittedRecords: 0, activeOperations: 0,
+    recorderHealthFiles: 0, persistenceFailures: 0, pendingRecords: 0, undurableRecords: 0, sourceFailures: 0, omittedRecords: 0, activeOperations: 0,
     unclosedExecutions: 0, recorderCountMismatches: 0, missingRecords: 0,
     sequenceGaps: 0, duplicateSequences: 0, duplicateOperationIds: 0, unmatchedEnds: 0, unclosedOperations: 0, mismatchedLifecycles: 0,
     lifecycleLimitReached: 0, missingParticipantHealth: 0, missingParticipantJournals: 0, unclaimedParticipants: 0, missingParticipantRegistrations: 0,
@@ -130,7 +130,7 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
           const executionId = metadata.executionId ?? basename(file, '.health.json')
           if (healthRecords.has(executionId)) problem('malformed', file, 1, 'Duplicate execution health')
           healthRecords.set(executionId, { executionId, file, participantId: metadata.participantId, role: label(metadata.role),
-            recorded: metadata.recorded, recordedOperations: metadata.recordedOperations, persisted: metadata.persisted,
+            recorded: metadata.recorded, recordedOperations: metadata.recordedOperations, persisted: metadata.persisted, durableRecords: metadata.durableRecords,
             failed: metadata.failed, pending: metadata.pending, closed: metadata.closed,
             sourceFailures: metadata.sourceFailures, omittedRecords: metadata.omittedRecords, activeOperations: metadata.activeOperations,
             durability: label(metadata.durability),
@@ -206,6 +206,10 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
     const execution = executions.get(id), actual = execution?.rawCount ?? 0
     diagnostics.persistenceFailures += Number.isFinite(health.failed) && health.failed > 0 ? health.failed : 0
     diagnostics.pendingRecords += Number.isFinite(health.pending) && health.pending > 0 ? health.pending : 0
+    if (health.durableRecords !== undefined) {
+      if (!Number.isSafeInteger(health.durableRecords) || health.durableRecords < 0 || health.durableRecords > health.persisted) problem('malformed', health.file, 0, 'Invalid durable record count')
+      else diagnostics.undurableRecords += Math.max(0, actual - health.durableRecords)
+    }
     for (const key of ['sourceFailures', 'omittedRecords', 'activeOperations']) diagnostics[key] += Number.isFinite(health[key]) && health[key] > 0 ? health[key] : 0
     if (health.closed !== true) problem('unclosedExecutions', health.file, 0)
     if (!execution) problem('missingParticipantJournals', health.file, 0)
@@ -277,7 +281,7 @@ export async function writeOperationReport(directory, { source = directory, cove
   return report
 }
 export function operationReportHasFailures(report) {
-  return report.diagnostics.fileLimitReached || ['malformed', 'oversized', 'unterminated', 'incomplete', 'persistenceFailures', 'pendingRecords', 'sourceFailures', 'omittedRecords', 'activeOperations', 'unclosedExecutions',
+  return report.diagnostics.fileLimitReached || ['malformed', 'oversized', 'unterminated', 'incomplete', 'persistenceFailures', 'pendingRecords', 'undurableRecords', 'sourceFailures', 'omittedRecords', 'activeOperations', 'unclosedExecutions',
     'recorderCountMismatches', 'missingRecords', 'incompleteNativeGpuTraces', 'sequenceGaps', 'duplicateSequences', 'duplicateOperationIds', 'unmatchedEnds',
     'unclosedOperations', 'mismatchedLifecycles', 'lifecycleLimitReached', 'missingParticipantHealth', 'missingParticipantJournals', 'unclaimedParticipants',
     'missingParticipantRegistrations', 'emptyRecording', 'missingRequiredCategories', 'missingRequiredRoles', 'missingRequiredOperations'].some(key => report.diagnostics[key] > 0)
