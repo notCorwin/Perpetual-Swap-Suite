@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 import { operationReportHasFailures, operationReportMarkdown, summarizeOperations } from '../../scripts/operation-report.mjs'
+import { sandboxCoverage } from '../../scripts/test-sandbox.mjs'
 
 const event = (overrides = {}) => ({ schemaVersion: 2, phase: 'end', id: 'execution:1', traceId: 'trace:1', sessionId: 'session', executionId: 'execution',
   category: 'cpu', name: 'indicators.replay', resource: 'BTC-USDT-SWAP', startedAt: 1_700_000_000_000, durationMS: 4, status: 'ok', attributes: {}, ...overrides })
@@ -106,16 +107,96 @@ test('coverage contracts reject empty recordings and missing roles/categories an
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
+test('standard suites reject incidental filesystem recording while custom I/O commands remain valid', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'operation-standard-coverage-'))
+  try {
+    await recording(directory, [event({ category: 'io', name: 'fs.readFileSync' })])
+    for (const mode of ['core', 'e2e', 'foreground', 'all']) {
+      const coverage = sandboxCoverage(mode)
+      const report = await summarizeOperations(directory, coverage)
+      assert.ok(report.coverage.substantiveOperations > 0)
+      assert.ok(report.diagnostics.missingRequiredCategories > 0, mode)
+      assert.ok(report.diagnostics.missingRequiredRoles > 0, mode)
+      assert.ok(report.diagnostics.missingRequiredOperations > 0, mode)
+      assert.equal(operationReportHasFailures(report), true, mode)
+      assert.ok(coverage.requireOperations.includes('market.append'), mode)
+      const extended = sandboxCoverage(mode, { allowEmpty: true, requireCategories: ['io'], requireRoles: ['extra-role'] })
+      assert.ok(coverage.requireCategories.every(category => extended.requireCategories.includes(category)))
+      assert.ok(coverage.requireRoles.every(role => extended.requireRoles.includes(role)))
+      assert.ok(extended.requireRoles.includes('extra-role'))
+      assert.equal(operationReportHasFailures(await summarizeOperations(directory, extended)), true, '--allow-empty cannot weaken standard suite requirements.')
+    }
+    assert.ok(sandboxCoverage('core').requireCategories.includes('network'))
+    assert.ok(!sandboxCoverage('core').requireCategories.includes('gpu'))
+    assert.ok(sandboxCoverage('e2e').requireOperations.includes('chart.capture'))
+    assert.ok(!sandboxCoverage('foreground').requireOperations.includes('chart.capture'))
+    assert.ok(sandboxCoverage('e2e').requireCategories.includes('network'))
+    assert.ok(!sandboxCoverage('foreground').requireCategories.includes('network'))
+    assert.ok(sandboxCoverage('e2e').requireOperations.some(value => value.name === 'fetch.request' && value.source === 'native'))
+    assert.ok(sandboxCoverage('e2e').requireOperations.some(value => value.name === 'websocket.receive' && value.source === 'native'))
+    const combined = sandboxCoverage('all')
+    for (const mode of ['core', 'e2e']) for (const key of ['requireCategories', 'requireRoles', 'requireOperations']) {
+      assert.ok(sandboxCoverage(mode)[key].every(value => combined[key].some(known => JSON.stringify(known) === JSON.stringify(value))), `${mode} ${key}`)
+    }
+    const custom = sandboxCoverage('command')
+    assert.deepEqual(custom, { allowEmpty: false, requireCategories: [], requireRoles: [], requireOperations: [] })
+    assert.equal(operationReportHasFailures(await summarizeOperations(directory, custom)), false)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('native transport requirements reject injected traffic and failed native requests', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'operation-native-coverage-'))
+  const requirements = ['fetch.request', 'websocket.receive'].map(name => ({ name, source: 'native' }))
+  try {
+    await recording(directory, [
+      event({ name: 'fetch.request', category: 'network', attributes: { source: 'injected' } }),
+      event({ id: 'execution:2', name: 'websocket.receive', category: 'network', attributes: { source: 'injected' } }),
+      event({ id: 'execution:3', name: 'fetch.request', category: 'network', status: 'error', attributes: { source: 'native' } }),
+    ])
+    const missing = await summarizeOperations(directory, { requireOperations: requirements })
+    assert.deepEqual(missing.coverage.missingOperations, requirements)
+    assert.equal(operationReportHasFailures(missing), true)
+    assert.match(operationReportMarkdown(missing), /websocket\.receive \[source=native\]/)
+    await recording(directory, requirements.map((requirement, index) => event({ id: `execution:${index + 1}`, name: requirement.name, category: 'network', attributes: { source: 'native' } })))
+    const complete = await summarizeOperations(directory, { requireOperations: requirements })
+    assert.deepEqual(complete.coverage.missingOperations, [])
+    assert.equal(operationReportHasFailures(complete), false)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('required business operations need successful completion and survive report-name overflow', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'operation-required-path-'))
+  try {
+    const coverage = { requireCategories: ['database'], requireRoles: ['fixture'], requireOperations: ['market.append'] }
+    await recording(directory, [event({ category: 'database', name: 'market.append', status: 'error' })])
+    const failed = await summarizeOperations(directory, coverage)
+    assert.equal(failed.diagnostics.missingRequiredCategories, 0)
+    assert.equal(failed.diagnostics.missingRequiredRoles, 0)
+    assert.deepEqual(failed.coverage.missingOperations, ['market.append'])
+    assert.equal(operationReportHasFailures(failed), true)
+    assert.match(operationReportMarkdown(failed), /Missing successful required operations: market\.append/)
+    await recording(directory, [
+      ...Array.from({ length: 260 }, (_, index) => event({ id: `execution:${index + 1}`, name: `loader.operation${index}` })),
+      event({ id: 'execution:261', category: 'database', name: 'market.append' }),
+    ])
+    const complete = await summarizeOperations(directory, coverage)
+    assert.ok(!complete.operations.some(value => value.name === 'market.append'), 'The required name should be beyond the bounded display list.')
+    assert.equal(complete.diagnostics.missingRequiredOperations, 0)
+    assert.deepEqual(complete.coverage.missingOperations, [])
+    assert.equal(operationReportHasFailures(complete), false)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
 test('sandbox runs isolate data, enforce declared coverage, record lifecycle pairs, and preserve command failures', async () => {
   const output = await mkdtemp(join(tmpdir(), 'operation-sandbox-'))
   const runner = fileURLToPath(new URL('../../scripts/test-sandbox.mjs', import.meta.url))
   const recorder = new URL('../../electron/services/operations.js', import.meta.url).href
-  const run = (exitCode, flags = [], extra = '') => new Promise((resolve, reject) => {
+  const run = (exitCode, flags = [], extra = '', onlyIO = false) => new Promise((resolve, reject) => {
     const source = `import { writeFile, mkdir } from 'node:fs/promises'; import { tmpdir } from 'node:os';
       import { join } from 'node:path'; import { measureOperation } from ${JSON.stringify(recorder)};
       await mkdir(process.env.PERPETUAL_SWAP_USER_DATA, { recursive: true });
       await writeFile(join(tmpdir(), 'isolation.json'), JSON.stringify({ temporary: tmpdir(), userData: process.env.PERPETUAL_SWAP_USER_DATA, sandbox: process.env.PERPETUAL_SWAP_SANDBOX, network: process.env.PERPETUAL_SWAP_ALLOW_NETWORK }));
-      measureOperation({ category: 'cpu', name: 'sandbox.fixture', attributes: { count: 1 } }, () => 42);
+      if (!${onlyIO}) measureOperation({ category: 'cpu', name: 'sandbox.fixture', attributes: { count: 1 } }, () => 42);
       ${extra}
       process.exitCode = ${exitCode};`
     const child = spawn(process.execPath, [runner, 'command', '--output', output, '--scenario', 'sandbox-contract', ...flags, '--', process.execPath, '--input-type=module', '-e', source], { env: process.env, stdio: ['ignore', 'pipe', 'pipe'] })
@@ -132,8 +213,10 @@ test('sandbox runs isolate data, enforce declared coverage, record lifecycle pai
     assert.equal(corrupt.code, 1)
     const missing = await run(0, ['--require-role', 'absent-worker'])
     assert.equal(missing.code, 1)
+    const onlyIO = await run(0, [], '', true)
+    assert.equal(onlyIO.code, 0, onlyIO.diagnostics)
     const directories = (await readdir(output)).sort(), manifests = []
-    assert.equal(directories.length, 4)
+    assert.equal(directories.length, 5)
     for (const entry of directories) {
       const directory = join(output, entry), manifest = JSON.parse(await readFile(join(directory, 'manifest.json'), 'utf8'))
       manifests.push(manifest)
@@ -145,12 +228,13 @@ test('sandbox runs isolate data, enforce declared coverage, record lifecycle pai
       assert.ok(manifest.recordedOperations >= 1)
       assert.equal(manifest.journalRecords, manifest.recordedOperations * 2)
       const report = JSON.parse(await readFile(join(directory, 'summary.json'), 'utf8'))
-      assert.ok(report.operations.some(operation => operation.name === 'sandbox.fixture'))
+      assert.ok(report.operations.some(operation => operation.name === 'sandbox.fixture') || report.coverage.actualCategories.every(category => category === 'io'))
+      assert.deepEqual(manifest.coverage.requireOperations, [], 'Custom commands have no implicit business-path requirement.')
       assert.equal(report.diagnostics.persistenceFailures, 0)
       assert.equal(report.diagnostics.pendingRecords, 0)
       assert.equal(operationReportHasFailures(report), manifest.outcome.exitCode === 1)
     }
-    assert.deepEqual(manifests.map(value => value.outcome.exitCode).sort((left, right) => left - right), [0, 1, 1, 23])
+    assert.deepEqual(manifests.map(value => value.outcome.exitCode).sort((left, right) => left - right), [0, 0, 1, 1, 23])
     assert.notEqual(manifests[0].environment.userDataDirectory, manifests[1].environment.userDataDirectory)
   } finally { await rm(output, { recursive: true, force: true }) }
 })

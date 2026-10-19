@@ -5,6 +5,12 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const operationCategories = ['cpu', 'gpu', 'network', 'database', 'io', 'ipc']
+export function operationRequirementKey(value) {
+  const name = typeof value === 'string' ? value : value?.name
+  const source = typeof value === 'string' ? undefined : value?.source
+  if (typeof name !== 'string' || !name || name.length > 160 || source !== undefined && source !== 'native') throw new Error('Required operations need a name of at most 160 characters and an optional native source.')
+  return JSON.stringify([name, source ?? null])
+}
 const statuses = new Set(['ok', 'error', 'cancelled'])
 const counters = ['calls', 'queryCount', 'rows', 'changes', 'bytes', 'sentBytes', 'receivedBytes']
 const peaks = ['residentKB', 'cpuPercent']
@@ -60,7 +66,7 @@ function validEvent(event) {
 // Journal streaming, lifecycle tracking, metadata indexes and aggregate
 // cardinality all have explicit bounds. A limit makes the report fail closed.
 export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes = 128 * 1024, slowestLimit = 20,
-  maxFiles = 10_000, maxOpenOperations = 4096, allowEmpty = false, requireCategories = [], requireRoles = [] } = {}) {
+  maxFiles = 10_000, maxOpenOperations = 4096, allowEmpty = false, requireCategories = [], requireRoles = [], requireOperations = [] } = {}) {
   for (const [name, value] of Object.entries({ maxGroups, maxLineBytes, maxFiles, maxOpenOperations })) if (!Number.isInteger(value) || value < 1) throw new Error(`${name} must be a positive integer.`)
   if (!Number.isInteger(slowestLimit) || slowestLimit < 0) throw new Error('slowestLimit must be a nonnegative integer.')
   if (requireCategories.some(category => !operationCategories.includes(category))) throw new Error('Unknown required operation category.')
@@ -68,13 +74,14 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
   const groups = new Map(), operations = new Map(), overflow = Object.fromEntries(operationCategories.map(category => [category, aggregate()])),
     operationOverflow = Object.fromEntries(operationCategories.map(category => [category, aggregate()])), slowest = [], nativeTraces = [], abandoned = new Map()
   const healthRecords = new Map(), executions = new Map(), participants = new Map(), actualCategories = new Set()
+  const missingOperations = new Map(requireOperations.map(value => [operationRequirementKey(value), value]))
   let journalRecords = 0, substantiveOperations = 0, visitedFiles = 0, abandonedOverflow = 0
   const diagnostics = { files: 0, lines: 0, malformed: 0, oversized: 0, unterminated: 0, incomplete: 0, groupedOverflow: 0,
     recorderHealthFiles: 0, persistenceFailures: 0, pendingRecords: 0, sourceFailures: 0, omittedRecords: 0, activeOperations: 0,
     unclosedExecutions: 0, recorderCountMismatches: 0, missingRecords: 0,
     sequenceGaps: 0, duplicateSequences: 0, duplicateOperationIds: 0, unmatchedEnds: 0, unclosedOperations: 0, mismatchedLifecycles: 0,
     lifecycleLimitReached: 0, missingParticipantHealth: 0, missingParticipantJournals: 0, unclaimedParticipants: 0, missingParticipantRegistrations: 0,
-    nativeGpuStatusFiles: 0, incompleteNativeGpuTraces: 0, emptyRecording: 0, missingRequiredCategories: 0, missingRequiredRoles: 0,
+    nativeGpuStatusFiles: 0, incompleteNativeGpuTraces: 0, emptyRecording: 0, missingRequiredCategories: 0, missingRequiredRoles: 0, missingRequiredOperations: 0,
     fileLimitReached: false, examples: [] }
   const problem = (kind, file, line, detail) => {
     diagnostics[kind]++
@@ -89,6 +96,10 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
   const completed = event => {
     add(total, event); add(byCategory[event.category], event)
     if (substantive(event)) { substantiveOperations++; actualCategories.add(event.category) }
+    if (event.status === 'ok' && event.attributes?.incomplete !== true && event.attributes?.interrupted !== true) {
+      missingOperations.delete(JSON.stringify([event.name, null]))
+      if (event.attributes?.source === 'native') missingOperations.delete(JSON.stringify([event.name, 'native']))
+    }
     const name = label(event.name), resource = label(event.resource), key = JSON.stringify([event.category, name, resource])
     const operationKey = JSON.stringify([event.category, name])
     let operation = operations.get(operationKey)
@@ -220,7 +231,7 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
   const missingCategories = [...new Set(requireCategories)].filter(category => !actualCategories.has(category))
   const missingRoles = [...new Set(requireRoles)].filter(role => !roles.has(role))
   diagnostics.emptyRecording = Number(!allowEmpty && substantiveOperations === 0)
-  diagnostics.missingRequiredCategories = missingCategories.length; diagnostics.missingRequiredRoles = missingRoles.length
+  diagnostics.missingRequiredCategories = missingCategories.length; diagnostics.missingRequiredRoles = missingRoles.length; diagnostics.missingRequiredOperations = missingOperations.size
   return { schemaVersion: 2, generatedAt: new Date().toISOString(), source: resolve(path), journalRecords,
     totals: finish(total), categories: operationCategories.map(category => ({ category, ...finish(byCategory[category]) })),
     operations: [...operations.values()].map(finish).concat(operationCategories.filter(category => operationOverflow[category].count)
@@ -228,8 +239,8 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
     groups: [...groups.values()].map(finish).concat(operationCategories.filter(category => overflow[category].count)
       .map(category => ({ category, name: '[other operations]', resource: '', ...finish(overflow[category]) }))).sort((left, right) => right.totalMS - left.totalMS),
     abandonedOperations: [...abandoned.values()], abandonedOverflow, slowest, nativeTraces, diagnostics,
-    coverage: { allowEmpty, requireCategories, requireRoles, substantiveOperations, actualCategories: [...actualCategories].sort(), actualRoles: [...roles].sort(),
-      missingCategories, missingRoles, participants: participantCoverage },
+    coverage: { allowEmpty, requireCategories, requireRoles, requireOperations, substantiveOperations, actualCategories: [...actualCategories].sort(), actualRoles: [...roles].sort(),
+      missingCategories, missingRoles, missingOperations: [...missingOperations.values()], participants: participantCoverage },
     measurement: 'Elapsed times overlap across nested/concurrent boundaries and are not process wall time. Work counters are totals at each recorded boundary, not unique business facts. Database calls count hooked native API calls; queryCount counts exec/all/get/run/iterate execution batches, not parsed SQL statements. CPU time uses the current thread clock when supported. GPU submission/capture times and process peaks are not hardware kernel timings. p95UpperBoundMS uses exponential duration buckets. Raw traceId/parentId/scenarioId fields preserve correlation.' }
 }
 
@@ -246,7 +257,8 @@ export function operationReportMarkdown(report) {
     `GPU/process peaks: ${report.totals.peaks.residentKB ?? 'unavailable'} resident KB; ${report.totals.peaks.cpuPercent ?? 'unavailable'} CPU %.`, '',
     '## Coverage', '', `Substantive operations: ${report.coverage.substantiveOperations}. Categories: ${report.coverage.actualCategories.join(', ') || 'none'}. Healthy roles: ${report.coverage.actualRoles.join(', ') || 'none'}.`,
     ...(report.coverage.missingCategories.length ? [`Missing required categories: ${report.coverage.missingCategories.join(', ')}.`] : []),
-    ...(report.coverage.missingRoles.length ? [`Missing required roles: ${report.coverage.missingRoles.join(', ')}.`] : []), '',
+    ...(report.coverage.missingRoles.length ? [`Missing required roles: ${report.coverage.missingRoles.join(', ')}.`] : []),
+    ...(report.coverage.missingOperations.length ? [`Missing successful required operations: ${report.coverage.missingOperations.map(value => typeof value === 'string' ? value : `${value.name} [source=${value.source}]`).join(', ')}.`] : []), '',
     '| Participant | Role | Claimed | Enabled hooks |', '| --- | --- | --- | --- |',
     ...report.coverage.participants.slice(0, 100).map(value => `| ${escape(value.id)} | ${escape(value.role)} | ${value.claimed} | ${escape(value.enabledHooks.join(', '))} |`), '',
     '## Abandoned operations', '', ...report.abandonedOperations.map(value => `- ${escape(value.category)} / ${escape(value.name)} / ${escape(value.resource)}: ${value.count}`), '',
@@ -268,7 +280,7 @@ export function operationReportHasFailures(report) {
   return report.diagnostics.fileLimitReached || ['malformed', 'oversized', 'unterminated', 'incomplete', 'persistenceFailures', 'pendingRecords', 'sourceFailures', 'omittedRecords', 'activeOperations', 'unclosedExecutions',
     'recorderCountMismatches', 'missingRecords', 'incompleteNativeGpuTraces', 'sequenceGaps', 'duplicateSequences', 'duplicateOperationIds', 'unmatchedEnds',
     'unclosedOperations', 'mismatchedLifecycles', 'lifecycleLimitReached', 'missingParticipantHealth', 'missingParticipantJournals', 'unclaimedParticipants',
-    'missingParticipantRegistrations', 'emptyRecording', 'missingRequiredCategories', 'missingRequiredRoles'].some(key => report.diagnostics[key] > 0)
+    'missingParticipantRegistrations', 'emptyRecording', 'missingRequiredCategories', 'missingRequiredRoles', 'missingRequiredOperations'].some(key => report.diagnostics[key] > 0)
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {

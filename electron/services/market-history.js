@@ -50,9 +50,9 @@ const abortable = (promise, signal) => {
 
 /** OKX source adaptation; HistorySync alone schedules durable observations. */
 export class MarketHistory {
-  constructor({ store, metadata, get, awaitRealtimeCandle, parseCandle, persistCandles, persistStatistics, replaceCandles, instrument, onProgress, onLive, onAuditCheckpoint, now = Date.now }) {
+  constructor({ store, metadata, get, awaitRealtimeCandle, parseCandle, persistCandles, persistStatistics, replaceCandles, instrument, onProgress, onLive, liveRevision, onAuditCheckpoint, now = Date.now }) {
     if (typeof replaceCandles !== 'function') throw new TypeError('MarketHistory needs a replacement mutation callback.')
-    Object.assign(this, { store, metadata, get, awaitRealtimeCandle, parseCandle, persistCandles, persistStatistics, replaceCandles, instrument, onLive, now })
+    Object.assign(this, { store, metadata, get, awaitRealtimeCandle, parseCandle, persistCandles, persistStatistics, replaceCandles, instrument, onLive, liveRevision, now })
     this.closed = false
     this.closeTask = null
     this.controllers = new Set()
@@ -276,16 +276,19 @@ export class MarketHistory {
     this.assertOpen()
     const key = keyOf(instId, timeframe)
     if (this.latestTasks.has(key)) return this.latestTasks.get(key)
+    const liveRevision = this.liveRevision?.(instId, timeframe)
     const controller = new AbortController()
     this.controllers.add(controller)
     const task = (async () => {
       await this.ready
       const bounds = this.bounds(instId, timeframe)
-      if (await this.awaitRealtimeCandle?.({ instrument: instId, timeframe, from: bounds.through, through: bounds.through, signal: controller.signal, priority })) return { live: null, floor: bounds.floor }
+      if (await this.awaitRealtimeCandle?.({ instrument: instId, timeframe, from: bounds.through, through: bounds.through, signal: controller.signal, priority })) return { floor: bounds.floor }
       const values = await this.get('/market/candles', { instId, bar: timeframe, limit: 2 }, controller.signal, priority)
       const parsed = values.map(value => this.parseCandle(instId, timeframe, value)).filter(Boolean)
       const live = parsed.filter(row => !row.confirmed).sort((a, b) => b.timestamp - a.timestamp)[0] ?? null
-      if (live) await this.onLive?.(instId, timeframe, live)
+      // The stream can advance while source acquisition waits. Equal volumes
+      // do not prove that the REST close is newer than an accepted native tick.
+      if (live && liveRevision === this.liveRevision?.(instId, timeframe)) await this.onLive?.(instId, timeframe, live)
       const confirmed = this.parsed(instId, timeframe, values)
       this.seeds.set(key, new Map(confirmed.map(row => [row.timestamp, row])))
       for (const row of confirmed) this.sync.invalidate({ instrument: instId, timeframe, source: 'candles', from: row.timestamp, through: row.timestamp })
@@ -296,7 +299,7 @@ export class MarketHistory {
       for (const row of confirmed.sort((a, b) => a.timestamp - b.timestamp)) {
         await this.request(instId, timeframe, 'candles', row.timestamp, row.timestamp, 'foreground', controller.signal)
       }
-      return { live, floor }
+      return { floor }
     })().finally(() => {
       this.controllers.delete(controller)
       this.seeds.delete(key)

@@ -4,11 +4,12 @@ import type { HistoryPriority, HistoryTimeframe } from './history-sync.js'
 import type { Bar, PreparedChartResponse } from '../../src/chart-data.ts'
 
 export type PreparedPriceSourceResult = { rows?: CandleRecord[]; floor?: number | null }
-export type PreparedLatestSourceResult = PreparedPriceSourceResult & { live?: CandleRecord | null }
+export type PreparedLatestSourceResult = PreparedPriceSourceResult
 /** All source methods resolve after their confirmed records have been durably committed. */
 export type PreparedChartHistory = {
   ensurePrices(instId: string, timeframe: HistoryTimeframe, from: number, through: number, priority: HistoryPriority): Promise<PreparedPriceSourceResult | void>
   ensureStatistics(instId: string, timeframe: HistoryTimeframe, from: number, through: number, priority: HistoryPriority): Promise<{ rows?: CandleRecord[] } | void>
+  /** Owns guarded publication of its forming source observation. */
   latest(instId: string, timeframe: HistoryTimeframe, priority: HistoryPriority): Promise<PreparedLatestSourceResult | void>
 }
 export class PreparedChartPipeline {

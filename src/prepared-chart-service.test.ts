@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PreparedChartPipeline } from '../electron/services/prepared-chart-service.js'
+import { ChartNotificationEncoder } from '../electron/services/chart-notifications.js'
 import { MarketStore } from '../electron/services/market-store.js'
 import { buildIndicatorSeries } from '../electron/services/indicators.js'
 import { attachOperationSink, type OperationEvent } from '../electron/services/operations.js'
@@ -94,6 +95,51 @@ test('cold forming prices are visible without any historical candle or recursive
     await pipeline.setLive(instId, '15m', { ...candle(end() + interval), confirmed: false, close: 101.5 })
     const frame = await pipeline.local(instId, '15m')
     assert.equal(frame.bars.length, 0); assert.equal(frame.liveBar.close, 101.5); assert.equal(frame.indicatorState, 'loading')
+  } finally { await pipeline.dispose() }
+})
+
+test('subscription changes immediately republish quote status from cached projections without source or calculation work', async () => {
+  const { pipeline, store } = fixture(), other = 'ETH-USDT-SWAP'
+  let connected = false
+  pipeline.streaming = () => connected
+  const encoder = new ChartNotificationEncoder(), notifications: any[] = []
+  pipeline.subscribe((frame: any) => notifications.push(encoder.encode(frame)))
+  try {
+    pipeline.setUniverse([instId, other], '15m', instId)
+    await pipeline.local(instId, '15m')
+    await finishSeed(pipeline)
+    const live = { ...candle(end() + interval), confirmed: false }
+    await pipeline.setLive(instId, '15m', live)
+    await pipeline.setLive(other, '15m', { ...live, instrument: other })
+    const focused = pipeline.cached(`${instId}:15m`), cached = pipeline.cached(`${other}:15m`)
+    assert.equal(focused.realtimeState, 'stale')
+    assert.equal(cached.realtimeState, 'stale')
+    const reads = store.queries.length, calculations = pipeline.nextCalculation, entries = pipeline.series.size
+    const operations: OperationEvent[] = [], unsubscribe = attachOperationSink(operation => operations.push(operation))
+    try {
+      notifications.length = 0
+      connected = true; pipeline.sourceStateChanged()
+      assert.equal(pipeline.cached(`${instId}:15m`).realtimeState, 'live')
+      assert.equal(pipeline.cached(`${other}:15m`).realtimeState, 'live')
+      assert.equal(notifications.length, 2)
+      assert.equal(notifications.find(frame => frame.instId === instId)?.type, 'live', 'Known completed bars retain compact metadata publication.')
+      connected = false; pipeline.sourceStateChanged()
+      assert.equal(pipeline.cached(`${instId}:15m`).realtimeState, 'stale', 'Disconnect revokes the quote lease immediately.')
+      assert.equal(pipeline.cached(`${other}:15m`).realtimeState, 'stale')
+      assert.equal(notifications.length, 4)
+      pipeline.sourceStateChanged()
+      assert.equal(notifications.length, 4, 'Unchanged source status needs no repeated publication.')
+      for (const [key, previous] of [[`${instId}:15m`, focused], [`${other}:15m`, cached]] as const) {
+        assert.equal(pipeline.cached(key).bars, previous.bars)
+        assert.equal(pipeline.cached(key).liveBar, previous.liveBar)
+        assert.equal(pipeline.cached(key).generation, previous.generation)
+        assert.ok(pipeline.cached(key).revision > previous.revision)
+      }
+      assert.equal(store.queries.length, reads)
+      assert.equal(pipeline.nextCalculation, calculations)
+      assert.equal(pipeline.series.size, entries, 'A cached-only quote must not restore a chart series.')
+      assert.deepEqual(operations, [], 'Source status updates reuse the existing calculations and projections.')
+    } finally { unsubscribe() }
   } finally { await pipeline.dispose() }
 })
 

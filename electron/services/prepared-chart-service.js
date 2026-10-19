@@ -14,6 +14,8 @@ const priceFields = ['open', 'high', 'low', 'close', 'volume', 'baseVolume', 'qu
 const intervalFor = timeframe => ({ '5m': 300_000, '15m': 900_000, '1H': 3_600_000 })[timeframe]
 const seriesKey = (instId, timeframe) => `${instId}:${timeframe}`
 const numeric = value => typeof value === 'number' && Number.isFinite(value)
+const freshQuote = (timestamp, observedAt, intervalMS, now = Date.now()) => timestamp === Math.floor(now / intervalMS) * intervalMS
+  && observedAt != null && now - observedAt < 30_000
 const samePrice = (left, right) => left && priceFields.every(field => Object.is(left[field], right[field]))
 const sourceFresh = (row, bit) => Boolean(statisticsMask(row) & bit) && (bit === 1 ? numeric(row.oi) || Number(row.statisticsOIExpiresAt) > Date.now() : numeric(row.buy) && numeric(row.sell) || Number(row.statisticsTakerExpiresAt) > Date.now())
 const sourceState = (rows, bit) => rows.length && rows.every(row => sourceFresh(row, bit))
@@ -177,7 +179,21 @@ export class PreparedChartPipeline {
     // Each selected series restores independently. No universe-wide startup barrier.
     return { frames: [...this.snapshots.values()].map(value => value.frame).filter(frame => this.requestedIDs.has(frame.instId)) }
   }
-  sourceStateChanged() { this.scheduleRefresh() }
+  sourceStateChanged() {
+    // Source continuity changes the quote lease, not the cached calculation.
+    // Publish status immediately even when a quiet series sends no next tick.
+    for (const [key, snapshot] of this.snapshots) {
+      const { frame } = snapshot
+      const realtimeState = freshQuote(frame.liveBar?.hour, frame.priceObservedAt, frame.intervalMS)
+        && this.streaming(frame.instId, frame.timeframe) ? 'live' : 'stale'
+      if (realtimeState === frame.realtimeState) continue
+      const next = { ...frame, realtimeState,
+        revision: this.nextRevision = Math.max(this.nextRevision + 1, this.revision(frame.instId)) }
+      this.snapshots.set(key, { ...snapshot, frame: next })
+      this.emit(next)
+    }
+    this.scheduleRefresh()
+  }
 
   frame(state, end = state.latestHour) {
     const latest = this.liveStates.get(state.key)
@@ -193,8 +209,7 @@ export class PreparedChartPipeline {
     const live = state.live && (end === state.latestHour || end === null) ? state.live : null
     const core = latest?.indicatorState?.lastTimestamp === state.latestHour ? latest.indicatorState : state.indicatorState
     const liveBar = live ? bar(live, core?.lastTimestamp + state.intervalMS === live.timestamp ? projectIndicatorCandle(core, live) : undefined) : undefined
-    const currentBoundary = Math.floor(Date.now() / state.intervalMS) * state.intervalMS
-    const realtime = Boolean(liveBar && live.timestamp === currentBoundary && state.observedAt !== null && Date.now() - state.observedAt < 30_000 && this.streaming(state.instId, state.timeframe))
+    const realtime = freshQuote(live?.timestamp, state.observedAt, state.intervalMS) && this.streaming(state.instId, state.timeframe)
     return { instId: state.instId, timeframe: state.timeframe, intervalMS: state.intervalMS, endHour: end,
       latestEnd: state.latestHour, oldestHour: state.floor, historyExhausted: state.floor !== null && (rows[0]?.timestamp ?? Infinity) <= state.floor,
       generation: state.generation, revision: this.nextRevision = Math.max(this.nextRevision + 1, this.revision(state.instId)), bars,
@@ -427,8 +442,7 @@ export class PreparedChartPipeline {
     if (!pricesMissing || !this.history.ensurePrices && !this.history.latest) return null
     const task = this.sourceJob(`prices:${state.key}:${priceFrom}:${end}`, async () => {
       if (targetEnd === undefined && state.latestHour < end && typeof this.history.latest === 'function') {
-        const result = await this.history.latest(instId, timeframe, 'foreground')
-        if (result?.live) await this.setLive(instId, timeframe, result.live)
+        await this.history.latest(instId, timeframe, 'foreground')
       } else if (typeof this.history.ensurePrices === 'function') await this.history.ensurePrices(instId, timeframe, priceFrom, end, 'foreground')
       // Acquisition pages are source work. Their completion refreshes the
       // active navigation reserve, never admits an obsolete subpage instead.

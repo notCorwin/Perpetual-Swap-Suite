@@ -6,7 +6,7 @@ import { mkdir, readdir, writeFile } from 'node:fs/promises'
 import { arch, platform } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { operationCategories, operationReportHasFailures, writeOperationReport } from './operation-report.mjs'
+import { operationCategories, operationRequirementKey, operationReportHasFailures, writeOperationReport } from './operation-report.mjs'
 
 const projectRoot = fileURLToPath(new URL('../', import.meta.url))
 const registration = fileURLToPath(new URL('./sandbox-register.mjs', import.meta.url))
@@ -14,6 +14,32 @@ const signalExit = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143, SIGKILL: 137 }
 const git = args => { const result = spawnSync('git', args, { cwd: projectRoot, encoding: 'utf8' }); return result.status === 0 ? result.stdout.trim() : null }
 const node = args => [process.execPath, '--import', registration, ...args]
 const npm = args => [process.platform === 'win32' ? 'npm.cmd' : 'npm', ...args]
+const coreCoverage = {
+  requireCategories: ['cpu', 'network', 'database', 'io', 'ipc'],
+  requireRoles: ['node', 'market-backend', 'market-reader', 'market-writer', 'market-migration', 'prepared-chart', 'stream-liquidity'],
+  requireOperations: ['indicators.build', 'liquidity.evaluate', 'market.append', 'worker.execute', 'chart.geometry', 'websocket.receive'],
+}
+const desktopCoverage = {
+  requireCategories: ['cpu', 'gpu', 'database', 'io', 'ipc'],
+  requireRoles: ['electron-main', 'renderer', 'market-backend', 'market-reader', 'market-writer', 'prepared-chart'],
+  requireOperations: ['market.append', 'indicators.replay', 'chart.geometry', 'chart.svg.construct', 'desktop.request', 'desktop.request.execute', 'worker.execute'],
+}
+
+/** Standard suites must exercise their known app boundaries, beyond loader I/O. */
+export function sandboxCoverage(mode, { allowEmpty = false, requireCategories = [], requireRoles = [], requireOperations = [] } = {}) {
+  const contracts = mode === 'all' ? [coreCoverage, desktopCoverage]
+    : mode === 'core' ? [coreCoverage] : ['e2e', 'foreground'].includes(mode) ? [desktopCoverage] : []
+  const coverage = { allowEmpty, requireCategories, requireRoles, requireOperations }
+  for (const key of ['requireCategories', 'requireRoles', 'requireOperations']) coverage[key] = [...new Set([...contracts.flatMap(contract => contract[key]), ...coverage[key]])]
+  if (mode === 'e2e' || mode === 'all') {
+    coverage.requireCategories = [...new Set([...coverage.requireCategories, 'network'])]
+    coverage.requireOperations.push('chart.capture', { name: 'fetch.request', source: 'native' }, { name: 'websocket.receive', source: 'native' })
+  }
+  coverage.requireOperations = [...new Map(coverage.requireOperations.map(value => [operationRequirementKey(value), value])).values()]
+  if (coverage.requireCategories.some(category => !operationCategories.includes(category))) throw new Error('Unknown required operation category.')
+  if (coverage.requireRoles.some(value => typeof value !== 'string' || !value || value.length > 160)) throw new Error('requireRoles must contain nonempty names of at most 160 characters.')
+  return coverage
+}
 
 async function testFiles(directory, suffix) {
   const files = (await readdir(join(projectRoot, directory))).filter(file => file.endsWith(suffix)).sort().map(file => join(directory, file))
@@ -54,8 +80,7 @@ function execute(command, { environment, logPath, onChild }) {
 
 export async function runSandbox({ mode = 'core', args = [], output, allowNetwork = false, gpuTrace = false, foreground = false,
   allowEmpty = false, requireCategories = [], requireRoles = [], scenario = mode } = {}) {
-  if (requireCategories.some(category => !operationCategories.includes(category))) throw new Error('Unknown required operation category.')
-  if (requireRoles.some(role => typeof role !== 'string' || !role || role.length > 160)) throw new Error('Required roles must be nonempty strings of at most 160 characters.')
+  const coverage = sandboxCoverage(mode, { allowEmpty, requireCategories, requireRoles })
   if (typeof scenario !== 'string' || !scenario || scenario.length > 160) throw new Error('Scenario must be a nonempty label of at most 160 characters.')
   const commands = await sandboxCommands(mode, args)
   const id = `${new Date().toISOString().replaceAll(':', '').replaceAll('.', '')}-${randomUUID().slice(0, 8)}`
@@ -66,7 +91,6 @@ export async function runSandbox({ mode = 'core', args = [], output, allowNetwor
   const environment = { ...process.env, PERPETUAL_SWAP_SANDBOX: '1', PERPETUAL_SWAP_TEST_UI: presentation, PERPETUAL_SWAP_ALLOW_NETWORK: allowNetwork ? '1' : '0',
     PERPETUAL_SWAP_GPU_TRACE: gpuTrace ? '1' : '0', PERPETUAL_SWAP_OPERATION_DIR: operations, PERPETUAL_SWAP_OPERATION_SESSION: id, PERPETUAL_SWAP_OPERATION_SCENARIO: scenario,
     PERPETUAL_SWAP_USER_DATA: userData, TMPDIR: temporary, TMP: temporary, TEMP: temporary }
-  const coverage = { allowEmpty, requireCategories: [...new Set(requireCategories)], requireRoles: [...new Set(requireRoles)] }
   const manifest = { schemaVersion: 2, id, mode, scenario, coverage, startedAt: new Date().toISOString(), directory,
     revision: git(['rev-parse', 'HEAD']), dirty: Boolean(git(['status', '--porcelain'])),
     runtime: { node: process.version, electron: process.versions.electron ?? null, platform: platform(), arch: arch() },

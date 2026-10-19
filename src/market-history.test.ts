@@ -146,7 +146,8 @@ test('latest initialization publishes actual observations without inventing miss
   const live = { ...row(base + step), close: 101, confirmed: false }, published: CandleRecord[] = []
   const { history, store, calls } = await fixture(t, { get: async path => path === '/market/candles' ? [raw(live), raw(row(base))] : [], onLive: value => published.push(value) })
   const result = await history.latest(instId, '5m')
-  assert.equal(result.live?.timestamp, live.timestamp); assert.equal(published.length, 1)
+  assert.equal(published[0]?.timestamp, live.timestamp); assert.equal(published.length, 1)
+  assert.ok(!('live' in result), 'The guarded publication is the single owner of forming source delivery.')
   assert.equal((await store.coverage(instId, '5m')).count, 1)
   assert.equal(calls.length, 1)
   assert.equal(history.sync.listTasks()[0].writtenRecords, 1)

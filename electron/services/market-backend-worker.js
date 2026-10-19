@@ -20,11 +20,43 @@ const offline = async (_input, { signal } = {}) => {
   })
   return new Response(JSON.stringify({ code: '0', data: [] }))
 }
+// Exercise the production parsers and native transports against an isolated
+// loopback exchange. This fixture is unavailable outside the E2E runtime.
+function nativeExchangeFixture() {
+  if (!workerData.testMode) return null
+  const httpOrigin = process.env.PERPETUAL_SWAP_E2E_HTTP_ORIGIN
+  const socketOrigin = process.env.PERPETUAL_SWAP_E2E_WEBSOCKET_ORIGIN
+  if (!httpOrigin && !socketOrigin) return null
+  const validate = (value, protocol) => {
+    const origin = new URL(value)
+    if (origin.protocol !== protocol || !['127.0.0.1', '[::1]'].includes(origin.hostname)
+      || origin.username || origin.password || origin.pathname !== '/' || origin.search || origin.hash) {
+      throw new TypeError('Native exchange fixtures require a loopback origin with the expected protocol.')
+    }
+    return origin
+  }
+  const http = validate(httpOrigin, 'http:'), socket = validate(socketOrigin, 'ws:')
+  return {
+    fetcher: (input, options) => {
+      const source = new URL(input)
+      if (source.origin !== 'https://www.okx.com' || !source.pathname.startsWith('/api/v5/')) throw new TypeError('Unsupported exchange fixture HTTP endpoint.')
+      return fetch(new URL(`${source.pathname}${source.search}`, http), options)
+    },
+    webSocketFactory: input => {
+      const source = new URL(input)
+      if (source.origin !== 'wss://ws.okx.com' || !['/ws/v5/public', '/ws/v5/business'].includes(source.pathname)
+        || source.search || source.hash) throw new TypeError('Unsupported exchange fixture WebSocket endpoint.')
+      return new WebSocket(new URL(source.pathname, socket))
+    },
+  }
+}
 const initialize = runWorkerInitialization('market-backend', async () => {
   metadata = await MetadataStore.open(workerData.userData, { legacySettingsPath: join(workerData.userData, 'settings.json') })
   preferences = metadata.getSettings().preferences
   store = await MarketStore.open(join(workerData.userData, 'MarketData'))
-  service = new MarketService(store, () => preferences, workerData.testMode ? offline : fetch, !workerData.testMode, { metadata })
+  const exchange = nativeExchangeFixture()
+  service = new MarketService(store, () => preferences, exchange?.fetcher ?? (workerData.testMode ? offline : fetch),
+    !workerData.testMode || Boolean(exchange), { metadata, ...(exchange ? { webSocketFactory: exchange.webSocketFactory } : {}) })
   await service.ready
   const notifications = new ChartNotificationEncoder()
   service.subscribePreparedCharts(frame => emit('chart', notifications.encode(frame)))

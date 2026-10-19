@@ -23,6 +23,8 @@ export type MarketHistoryOptions = {
   /** Exact saved audit checkpoints; observer failures cannot interrupt auditing. */
   onAuditCheckpoint?(job: AuditJob): MaybePromise<void>
   onLive?(instId: string, timeframe: string, row: CandleRecord): MaybePromise<unknown>
+  /** Monotonic accepted price-source revision; statistics enrichment does not advance it. */
+  liveRevision?(instId: string, timeframe: string): number
   now?(): number
 }
 export class MarketHistory {
@@ -33,7 +35,8 @@ export class MarketHistory {
   ensurePrices(instId: string, timeframe: Timeframe, from: number, through: number, priority?: StorePriority, signal?: AbortSignal): Promise<{ rows: CandleRecord[]; floor?: number }>
   /** OI and Taker are acquired and persisted independently of price rows. Numeric observations remain reusable; direct empty observations revalidate only their expired native-period ranges. */
   ensureStatistics(instId: string, timeframe: Timeframe, from: number, through: number, priority?: StorePriority, signal?: AbortSignal): Promise<{ rows: CandleRecord[] }>
-  latest(instId: string, timeframe: Timeframe, priority?: StorePriority): Promise<{ live: CandleRecord | null; floor?: number }>
+  /** Publishes its forming observation through onLive only if the admitted live revision remains current. */
+  latest(instId: string, timeframe: Timeframe, priority?: StorePriority): Promise<{ floor?: number }>
   removeTargets(instIds: Iterable<string>): Promise<void>
   close(): Promise<void>
 }

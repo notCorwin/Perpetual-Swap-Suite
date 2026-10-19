@@ -97,7 +97,8 @@ export class ChartController {
     const meta = this.store.snapshotMeta(response.instId, response.timeframe)
     const latest = this.store.window(response.instId, response.timeframe)
     return meta?.generation === response.generation && meta.revision >= response.revision && latest?.endHour === response.latestEnd
-      ? { ...response, liveBar: latest.liveBar } : response
+      ? { ...response, liveBar: latest.liveBar, priceObservedAt: latest.priceObservedAt, priceAsOf: latest.priceAsOf,
+        realtimeState: latest.realtimeState, priceState: latest.priceState, sourceVersions: latest.sourceVersions } : response
   }
 
   private preparedChanged(response: Pick<PreparedChartResponse, 'instId' | 'timeframe'>, live = false) {

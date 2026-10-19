@@ -891,18 +891,23 @@ test('a held full-frame handshake cannot rewind or resurrect a newer subscribed 
   const queue = transportQueue()
   const replies: Array<(response: { frames: PreparedChartResponse[] }) => void> = []
   const controller = new ChartController({ ...queue.transport, universe: () => new Promise(resolve => { replies.push(resolve) }) })
-  const stale = prepared(btc, 199, { liveBar: { ...bars(200, 1)[0], confirmed: false, close: 100.5 } })
+  const stale = prepared(btc, 199, { liveBar: { ...bars(200, 1)[0], confirmed: false, close: 100.5 },
+    priceObservedAt: 1000, priceAsOf: 200 * hour, realtimeState: 'stale', sourceVersions: { price: 1, oi: 1, taker: 1 } })
   const firstHandshake = controller.setUniverse([btc], '1H')
   controller.ingestPrepared(prepared(btc, 199))
   const close = controller.open(btc, '1H')
   try {
     controller.ingestPrepared({ type: 'live', instId: btc, timeframe: '1H', generation: 1, revision: 1, endHour: 199 * hour,
-      liveBar: { ...bars(200, 1)[0], confirmed: false, close: 101.5 } })
+      liveBar: { ...bars(200, 1)[0], confirmed: false, close: 101.5 },
+      priceObservedAt: 2000, priceAsOf: 200 * hour, realtimeState: 'live', sourceVersions: { price: 1, oi: 2, taker: 2 } })
     const current = controller.getSnapshot().presented!
     replies[0]({ frames: [stale] })
     await firstHandshake
     assert.equal(controller.getSnapshot().presented?.liveBar, current.liveBar, 'The newer socket observation owns an otherwise identical confirmed frame.')
     assert.equal(controller.getSnapshot().presented?.liveBar?.close, 101.5)
+    assert.equal(controller.getSnapshot().presented?.priceObservedAt, 2000, 'The price and its freshness proof must retain the same pushed observation.')
+    assert.equal(controller.getSnapshot().presented?.realtimeState, 'live')
+    assert.deepEqual(controller.getSnapshot().presented?.sourceVersions, { price: 1, oi: 2, taker: 2 })
 
     const secondHandshake = controller.setUniverse([btc, eth], '1H')
     controller.ingestPrepared({ type: 'live', instId: btc, timeframe: '1H', generation: 1, revision: 1, endHour: 199 * hour, liveBar: null })

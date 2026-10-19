@@ -242,6 +242,7 @@ export class MarketService {
     this.liveCandles = new Map()
     this.liveCandleSources = new Map()
     this.liveReceivedAt = new Map()
+    this.liveSourceRevisions = new Map()
     this.sourceRecoveries = new Map()
     this.liveStatistics = new LiveStatistics()
     this.streamQualifications = new Set()
@@ -328,6 +329,7 @@ export class MarketService {
       persistCandles: (instId, rows, options) => this.persistCandles(instId, rows, typeof options === 'string' ? { priority: options } : options),
       persistStatistics: (instrument, timeframe, end, source, values, range, priority) => this.persistStatisticsSource(instrument, timeframe, end, source, values, this.shutdownController.signal, priority, false, { range }),
       instrument: instId => this.instruments.get(instId),
+      liveRevision: (instId, timeframe) => this.liveSourceRevisions.get(`${instId}:${timeframe}`) ?? 0,
       onLive: (instId, timeframe, row) => this.setLive(instId, timeframe, row),
       replaceCandles: (range, rows, priority) => this.replaceCandles(range, rows, priority),
       onProgress: task => this.onHistoryProgress(task),
@@ -1060,6 +1062,9 @@ export class MarketService {
     // REST initialization can resolve after a newer stream event. Same-volume
     // price corrections remain valid; older timestamps/cumulative volume do not.
     if (row && current && (row.timestamp < current.timestamp || row.timestamp === current.timestamp && row.volume < current.volume)) return Promise.resolve(null)
+    // A source revision also fences equal-volume price corrections and clears.
+    // Re-enriching this exact source with live statistics is not a new price.
+    if (!row || this.liveCandleSources.get(key) !== row) this.liveSourceRevisions.set(key, (this.liveSourceRevisions.get(key) ?? 0) + 1)
     if (row) {
       this.liveReceivedAt.set(key, receivedAt ?? this.liveReceivedAt.get(key) ?? Date.now())
       this.liveCandleSources.set(key, row)
@@ -2014,6 +2019,12 @@ export class MarketService {
     if (removedIDs.length) this.track(this.history.removeTargets(removedIDs))
     this.liveStatistics.remove(removedIDs)
     for (const instId of removedIDs) {
+      // Invalidate in-flight latest reads even before this series has ever
+      // received a forming candle. Re-listing retains the newer source epoch.
+      for (const timeframe of LIST_TIMEFRAMES) {
+        const key = `${instId}:${timeframe}`
+        this.liveSourceRevisions.set(key, (this.liveSourceRevisions.get(key) ?? 0) + 1)
+      }
       for (const recovery of this.sourceRecoveries.values()) if (recovery.instId === instId) this.cancelRequiredRecovery(recovery.key)
       this.tickerSubscriptions.delete(instId)
       this.cancelTickerRecovery(instId)
