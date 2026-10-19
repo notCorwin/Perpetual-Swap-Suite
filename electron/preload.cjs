@@ -2,7 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron')
 
 let operationHooks
 const operationNonce = Array.from(globalThis.crypto.getRandomValues(new Uint8Array(16)), value => value.toString(16).padStart(2, '0')).join('')
-const request = value => {
+const request = async value => {
   const operation = operationHooks?.beginRequest(Object.keys(value ?? {})[0] ?? 'invalid')
   return ipcRenderer.invoke('radar:request', value, operation?.context).then(result => {
     if (operation) operationHooks.endRequest(operation.id, 'ok')

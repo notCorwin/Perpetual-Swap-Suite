@@ -47,7 +47,11 @@ export function createRendererOperationReceiver({ register = registerOperationPa
     fail(owner, value) {
       const source = sourceFor(owner, value?.executionId)
       if (typeof value.reason !== 'string' || value.reason.length > 160 || !Number.isSafeInteger(value.omitted) || value.omitted < 0) throw new TypeError('Invalid renderer operation failure.')
-      incomplete(source.executionId, value.reason, value.omitted)
+      // The renderer sends its lifetime omission high-water mark. A lost IPC
+      // acknowledgment can replay the same report without counting loss twice.
+      if (source.omittedHighWater !== undefined && value.omitted <= source.omittedHighWater) return
+      incomplete(source.executionId, value.reason, value.omitted - (source.omittedHighWater ?? 0))
+      source.omittedHighWater = value.omitted
     },
     markIncomplete(owner, reason) { for (const source of sources.values()) if (source.owner === owner) incomplete(source.executionId, reason) },
     sourcesFor(owner) { return [...sources.values()].filter(source => source.owner === owner).map(source => source.executionId) },

@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { threadId, workerData } from 'node:worker_threads'
 import { installSandboxNetworkBoundary } from './sandbox-network.js'
-import { installOperationHooks } from './operation-hooks.js'
+import { installOperationHooks, getOperationHookCapabilities, getInstalledOperationHooks } from './operation-hooks.js'
 import { encodeOperationJournal, operationJournalSuffix } from './operation-journal.js'
 import { attachOperationJournalSink, configureOperationContext, configureOperationPropagation, finishActiveOperations,
   registerOperationImportSource, withOperationSuppressed } from './operations.js'
@@ -34,7 +34,7 @@ const jsonWrite = (path, value) => suppress(() => {
   }
 })
 
-function journalWriter(directory, sessionId, executionId, participant, hooks) {
+function journalWriter(directory, sessionId, executionId, participant, hooks, capabilities = () => []) {
   const file = join(directory, `${executionId}${operationJournalSuffix}`), healthFile = join(directory, `${executionId}.health.json`)
   const descriptor = suppress(() => openSync(file, 'wx', 0o600))
   const prefix = suppress(() => encodeOperationJournal(Buffer.alloc(0)))
@@ -52,7 +52,8 @@ function journalWriter(directory, sessionId, executionId, participant, hooks) {
   let queue = [], bytes = 0, position = prefix.length, timer, writing, accepting = true, closed = false, closing, flushBarrier = Promise.resolve(), lastHealthState
   const health = () => ({ schemaVersion: 2, ...counts, pending: counts.recorded - counts.persisted,
     activeOperations: counts.startedOperations - counts.recordedOperations, executionId, sessionId, participantId: participant.id,
-    role: participant.role, closed, enabledHooks: hooks, encoding: 'gzip-members-level1',
+    role: participant.role, closed, enabledHooks: typeof hooks === 'function' ? hooks() : hooks,
+    hookCapabilities: capabilities(), encoding: 'gzip-members-level1',
     durability: 'fdatasync-on-flush-and-5s-checkpoint', updatedAt: Date.now(), lastDurableAt,
     runtime: { node: process.version, electron: process.versions.electron ?? null, v8: process.versions.v8 } })
   const failed = error => { counts.failed++; suppress(() => console.error(`Operation journal failed (${error.code ?? error.name}).`)) }
@@ -184,9 +185,8 @@ export function initializeOperationRecording({ directory = process.env.PERPETUAL
   jsonWrite(join(directory, `${participant.id}.participant.json`), participant)
   configureOperationContext({ sessionId, executionId, ...(process.env.PERPETUAL_SWAP_OPERATION_SCENARIO ? { scenarioId: process.env.PERPETUAL_SWAP_OPERATION_SCENARIO } : {}) }, process.threadCpuUsage
     ? () => { const value = process.threadCpuUsage(); return (value.user + value.system) / 1000 } : undefined)
-  const hooks = suppress(() => installOperationHooks())
-  const enabledHooks = Array.isArray(hooks) ? hooks : hooks?.enabledHooks ?? []
-  const writers = new Map([[executionId, journalWriter(directory, sessionId, executionId, participant, enabledHooks)]])
+  suppress(() => installOperationHooks())
+  const writers = new Map([[executionId, journalWriter(directory, sessionId, executionId, participant, getInstalledOperationHooks, getOperationHookCapabilities)]])
   let closed = false, closeTask
   const unsubscribe = attachOperationJournalSink(entry => {
     const writer = writers.get(entry.executionId)
@@ -195,7 +195,7 @@ export function initializeOperationRecording({ directory = process.env.PERPETUAL
   })
   const flush = async options => { await Promise.all([...writers.values()].map(writer => writer.flush(options))) }
   const exit = () => { if (!closed) { finishActiveOperations(); for (const writer of writers.values()) writer.exit() } }
-  current = { directory, sessionId, executionId, writers, enabledHooks, flush, health: () => writers.get(executionId).health(), close() {
+  current = { directory, sessionId, executionId, writers, get enabledHooks() { return getInstalledOperationHooks() }, flush, health: () => writers.get(executionId).health(), close() {
     if (!closeTask) closeTask = (async () => {
       finishActiveOperations()
       const flushed = await Promise.allSettled([...writers.values()].map(writer => writer.flush()))
@@ -228,7 +228,11 @@ export function claimExternalOperationParticipant(participantId, executionId) {
     || participant.executionId && participant.executionId !== executionId) throw new Error('Invalid external operation participant claim.')
   if (!current.writers.has(executionId)) {
     Object.assign(participant, { executionId, status: 'ready' }); jsonWrite(path, participant)
-    current.writers.set(executionId, journalWriter(current.directory, current.sessionId, executionId, participant, ['renderer-ipc', 'performance-observer']))
+    current.writers.set(executionId, journalWriter(current.directory, current.sessionId, executionId, participant, ['renderer-ipc', 'performance-observer'], () => [
+      { api: 'preload.request', enabled: true, scope: 'renderer bridge request lifecycle' },
+      { api: 'preload.notification', enabled: true, scope: 'renderer bridge event delivery' },
+      { api: 'PerformanceObserver', enabled: false, scope: 'optional browser entry types', reason: 'entry availability is browser dependent' },
+    ]))
     registerOperationImportSource(executionId, current.sessionId)
   }
   return { sessionId: current.sessionId, executionId,

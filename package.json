@@ -12,6 +12,8 @@
     "dev": "scripts/dev-electron.sh",
     "electron:package": "scripts/package-electron.sh",
     "test:e2e": "node scripts/test-sandbox.mjs e2e",
+    "test:gpu": "node scripts/test-sandbox.mjs gpu",
+    "test:gpu:metal": "node scripts/gpu/build-metal-provider.mjs --tests && PERPETUAL_SWAP_METAL_NATIVE_TESTS=1 node --test tests/core/metal-provider.test.mjs && node scripts/test-sandbox.mjs gpu --metal --require-gpu-hardware-timing",
     "test:foreground": "node scripts/test-sandbox.mjs foreground",
     "benchmark": "node scripts/test-sandbox.mjs command -- node --experimental-strip-types scripts/benchmark.ts",
     "benchmark:operations": "node scripts/operation-overhead.mjs",

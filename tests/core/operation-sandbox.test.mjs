@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 import { gzipSync } from 'node:zlib'
 import { operationReportHasFailures, operationReportMarkdown, summarizeOperations } from '../../scripts/operation-report.mjs'
-import { sandboxCoverage } from '../../scripts/test-sandbox.mjs'
+import { sandboxCommands, sandboxCoverage } from '../../scripts/test-sandbox.mjs'
 
 const event = (overrides = {}) => ({ schemaVersion: 2, phase: 'end', id: 'execution:1', traceId: 'trace:1', sessionId: 'session', executionId: 'execution',
   category: 'cpu', name: 'indicators.replay', resource: 'BTC-USDT-SWAP', startedAt: 1_700_000_000_000, durationMS: 4, status: 'ok', attributes: {}, ...overrides })
@@ -15,11 +15,29 @@ const lifecycle = events => events.flatMap((value, index) => [
   { ...value, phase: 'start', sequence: index * 2 + 1, durationMS: 0, status: 'running', cpuTimeMS: undefined },
   { ...value, sequence: index * 2 + 2 },
 ])
+
+test('dedicated GPU discovery and policies cannot silently weaken or enter functional suites', async () => {
+  const gpu = sandboxCoverage('gpu')
+  assert.deepEqual(gpu.graphics, { policy: 'auto', provider: 'chromium' })
+  assert.ok(gpu.requireRoles.includes('node') && gpu.requireRoles.includes('electron-main'))
+  assert.ok(!gpu.requireRoles.includes('prepared-chart'), 'Confirmed unsupported hosts do not require workers they never exercised.')
+  assert.deepEqual(sandboxCoverage('all').graphics, gpu.graphics)
+  assert.equal(sandboxCoverage('e2e').graphics, undefined)
+  assert.deepEqual(sandboxCoverage('gpu', { graphicsPolicy: 'require-hardware-timing', graphicsProvider: 'metal' }).graphics,
+    { policy: 'require-hardware-timing', provider: 'metal' })
+  assert.throws(() => sandboxCoverage('gpu', { graphicsPolicy: 'require-hardware-timing' }), /requires --metal/)
+  assert.throws(() => sandboxCoverage('e2e', { graphicsProvider: 'metal' }), /gpu or all/)
+  const dedicated = await sandboxCommands('gpu'), functional = await sandboxCommands('e2e'), all = await sandboxCommands('all')
+  assert.ok(dedicated.at(-1).some(value => value.endsWith('graphics.gpu.mjs')))
+  assert.ok(!functional.flat().some(value => value.endsWith('.gpu.mjs')))
+  assert.ok(all.at(-1).some(value => value.endsWith('graphics.gpu.mjs')))
+  assert.equal(all.filter(command => command.join(' ').includes('npm run build')).length, 1)
+})
 async function recording(directory, records, { health = {}, raw = false, ending = '\n', suffix = '' } = {}) {
   const journal = raw ? records : lifecycle(records)
   await writeFile(join(directory, 'execution.jsonl'), journal.map(value => JSON.stringify(value)).join('\n') + ending + suffix)
   await writeFile(join(directory, 'execution.health.json'), JSON.stringify({ schemaVersion: 2, executionId: 'execution', participantId: 'participant-execution', role: 'fixture', enabledHooks: ['fixture.cpu'],
-    recorded: journal.length, recordedOperations: journal.filter(value => value.phase === 'end').length, persisted: journal.length, failed: 0, pending: 0, closed: true, ...health }))
+    recorded: journal.length, recordedOperations: journal.filter(value => value.phase === 'end').length, persisted: journal.length, failed: 0, pending: 0, sourceFailures: 0, omittedRecords: 0, activeOperations: 0, closed: true, ...health }))
   await writeFile(join(directory, 'participant-execution.participant.json'), JSON.stringify({ schemaVersion: 2, id: 'participant-execution', executionId: 'execution', role: 'fixture', status: 'ready', registeredAt: 1_700_000_000_000 }))
 }
 
@@ -244,8 +262,8 @@ test('reports expose killed executions, missing raw records and incomplete opt-i
   const directory = await mkdtemp(join(tmpdir(), 'operation-interrupted-'))
   try {
     await recording(directory, [event()], { health: { recorded: 3, persisted: 3, closed: false, sourceFailures: 2, omittedRecords: 4, activeOperations: 1 } })
-    await writeFile(join(directory, 'chromium-disabled.status.json'), JSON.stringify({ enabled: false, complete: false }))
-    await writeFile(join(directory, 'chromium-truncated.status.json'), JSON.stringify({ enabled: true, complete: false, file: 'chromium-truncated.trace.json', bufferUsage: { percentage: 1 } }))
+    await writeFile(join(directory, 'chromium-disabled.status.json'), JSON.stringify({ schemaVersion: 2, requested: false, enabled: false, complete: false, system: {} }))
+    await writeFile(join(directory, 'chromium-truncated.status.json'), JSON.stringify({ schemaVersion: 2, requested: true, enabled: true, complete: false, system: {}, file: 'chromium-truncated.trace.json', bufferUsage: { percentage: 1 } }))
     const report = await summarizeOperations(directory)
     assert.equal(report.diagnostics.unclosedExecutions, 1)
     assert.equal(report.diagnostics.recorderCountMismatches, 1)

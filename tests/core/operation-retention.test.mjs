@@ -167,3 +167,19 @@ test('a live cleanup lock blocks another sweeper without mutating sessions or cl
   assert.equal(finished.pruned.length, 1, 'A dead valid cleanup lease is reclaimed.')
   assert.deepEqual(DEFAULT_OPERATION_RETENTION, { maxAgeMS: 7 * day, maxBytes: 512 * 1024 * 1024 })
 })
+
+
+test('retention validates portable graphics paths and preserves incomplete native captures', async t => {
+  const root = await temporary(t), ids = [`${now - day}-765432`, `${now - day}-765433`]
+  for (const [index, id] of ids.entries()) {
+    const directory = join(root, id), prefix = `chromium-765432-${randomUUID()}`
+    await fixture(directory)
+    await writeFile(join(directory, `${prefix}.trace.json`), '{}')
+    await writeFile(join(directory, `${prefix}.status.json`), JSON.stringify({ schemaVersion: 2,
+      enabled: true, complete: index === 0, file: `${prefix}.trace.json` }))
+  }
+  const result = await enforceOperationRetention(root, { now: () => now, maxBytes: 0, isProcessAlive: dead })
+  assert.deepEqual(result.pruned.map(value => value.id), [ids[0]])
+  assert.equal(result.sessions.find(value => value.id === ids[1]).state, 'interrupted')
+  assert.equal(await exists(join(root, ids[1])), true)
+})

@@ -50,3 +50,26 @@ test('renderer batches preserve source IDs and only acknowledge durable, replay-
     await assert.rejects(receiver.receive(7, { ...batch, events: batch.events.map(value => ({ ...value, name: 'changed' })) }), /different records/)
   } finally { unsubscribe() }
 })
+
+
+test('renderer omission high-water marks survive lost acknowledgments without duplicating loss counts', () => {
+  const losses = [], receiver = createRendererOperationReceiver({
+    register: () => ({ id: 'failure-participant' }),
+    claim: (_, executionId) => ({ executionId, sessionId: 'failure-session' }),
+    incomplete: (executionId, reason, omitted) => losses.push({ executionId, reason, omitted }),
+  })
+  const source = receiver.initialize(19, 'failure-source')
+  const report = omitted => receiver.fail(19, { executionId: source.executionId, reason: 'renderer-buffer-exhausted', omitted })
+  report(208)
+  report(208) // Main accepted the first request, but its IPC acknowledgment was lost.
+  report(210)
+  report(208) // A delayed older report cannot roll back the durable high-water mark.
+  report(210)
+  assert.deepEqual(losses.map(value => value.omitted), [208, 2])
+  assert.equal(losses.reduce((sum, value) => sum + value.omitted, 0), 210)
+  const empty = receiver.initialize(20, 'zero-omission-source')
+  const zero = { executionId: empty.executionId, reason: 'source-detached', omitted: 0 }
+  receiver.fail(20, zero)
+  receiver.fail(20, zero)
+  assert.deepEqual(losses.map(value => value.omitted), [208, 2, 0], 'A zero-omission source failure is recorded once.')
+})

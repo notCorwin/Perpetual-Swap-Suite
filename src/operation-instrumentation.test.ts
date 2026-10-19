@@ -5,7 +5,7 @@ import { createLiquidityEvaluator, type LiquidityInput } from '../electron/servi
 import { attachOperationSink, measureOperation, type OperationEvent, type OperationJournalEvent } from '../electron/services/operations.js'
 import { createChartGeometryCache } from './chart-geometry.ts'
 import { initializeOperationTelemetry } from './operation-telemetry.ts'
-import type { OperationBatch } from './desktop-contract.ts'
+import type { OperationBatch, OperationBridgeHooks, OperationSourceIdentity } from './desktop-contract.ts'
 
 const candles = Array.from({ length: 220 }, (_, index) => ({ timestamp: index * 300_000,
   open: 100, close: 100, high: 101, low: 99, baseVolume: 1, confirmed: true }))
@@ -70,16 +70,21 @@ test('live indicator revisions record the fixed-size projection without replayin
 function telemetryHost() {
   const batches: OperationBatch[] = [], attempts: OperationBatch[] = [], failures: { omitted: number }[] = []
   const timers = new Map<number, () => void>()
-  let nextTimer = 0, flush: (() => Promise<void>) | undefined
+  let nextTimer = 0, flush: (() => Promise<void>) | undefined, detach: (() => Promise<void>) | undefined
+  let hooks: OperationBridgeHooks | undefined
   let fail = false, blocked = false, hold = false, release: (() => void) | undefined
   return {
     batches, attempts, timers, failures,
     flush: () => flush?.() ?? Promise.resolve(),
+    detach: () => detach?.() ?? Promise.resolve(),
+    hooks: () => hooks!,
     failNext: () => { fail = true },
     block: (value: boolean) => { blocked = value },
     holdNext: () => { hold = true },
     release: () => release?.(),
     host: {
+      // Keep the enclosing sandbox's source identity while exercising bridge hooks.
+      initialize: async (value: OperationBridgeHooks) => { hooks = value; return undefined as unknown as OperationSourceIdentity },
       recordOperations: async (batch: OperationBatch) => {
         attempts.push(structuredClone(batch))
         if (fail || blocked) { fail = false; throw new Error('Transient IPC failure') }
@@ -92,6 +97,7 @@ function telemetryHost() {
       schedule: (callback: () => void) => { const id = ++nextTimer; timers.set(id, callback); return id },
       cancel: (id: number) => { timers.delete(id) },
       onFlush: (callback: () => Promise<void>) => { flush = callback; return () => { flush = undefined } },
+      onStop: (callback: () => Promise<void>) => { detach = callback; return () => { detach = undefined } },
     },
   }
 }
@@ -131,6 +137,67 @@ test('renderer retains lifecycle records until acknowledgment and retries the sa
   assert.equal(harness.timers.size, 0)
 })
 
+test('leaving a renderer submits cancelled requests before an earlier durable ACK can resume the document', async () => {
+  const harness = telemetryHost(), persisted = new Map<number, OperationJournalEvent>()
+  let tail = Promise.resolve(), release: (() => void) | undefined, first = true
+  const recordOperations = (batch: OperationBatch) => {
+    harness.attempts.push(structuredClone(batch))
+    const task = tail.then(async () => {
+      if (first) { first = false; await new Promise<void>(resolve => { release = resolve }) }
+      for (const event of batch.events) {
+        const previous = persisted.get(event.sequence)
+        if (previous) assert.deepEqual(event, previous, 'A replay retains exactly the same operation lifecycle record.')
+        else persisted.set(event.sequence, event)
+      }
+      return { batchId: batch.batchId, lastSequence: batch.events.at(-1)!.sequence }
+    })
+    tail = task.then(() => {})
+    return task
+  }
+  const stop = await initializeOperationTelemetry({ ...harness.host, recordOperations })
+  try {
+    for (let index = 0; index < 63; index++) measureOperation({ category: 'cpu', name: 'fixture.compute' }, () => index)
+    const history = harness.hooks().beginRequest('chartWindow')
+    const universe = harness.hooks().beginRequest('chartUniverse')
+    assert.equal(harness.attempts.length, 1)
+    await Promise.resolve()
+    let acknowledged = false
+    const detached = harness.detach().then(() => { acknowledged = true })
+    const finalAttempts = harness.attempts.slice(1)
+    assert.deepEqual(finalAttempts[0], harness.attempts[0], 'The in-flight batch can be replayed during final handoff.')
+    assert.deepEqual(ended(finalAttempts).filter(event => event.name === 'desktop.request').map(event => [event.resource, event.status, event.attributes!.reason]), [
+      ['chartWindow', 'cancelled', 'renderer-detached'], ['chartUniverse', 'cancelled', 'renderer-detached'],
+    ], 'All cancellation records must be submitted synchronously, while the first durable ACK is still blocked.')
+    assert.equal(persisted.size, 0)
+    assert.equal(acknowledged, false)
+    assert.throws(() => harness.hooks().beginRequest('snapshot'), { name: 'AbortError' })
+    assert.doesNotThrow(() => harness.hooks().receive('radar:chart-prepared', {}, undefined), 'A detached document must not dispatch more business work.')
+    harness.hooks().endRequest(history.id, 'ok')
+    harness.hooks().endRequest(universe.id, 'error')
+    release!()
+    await detached
+    assert.equal(persisted.size, 130)
+    const requests = [...persisted.values()].filter(event => event.name === 'desktop.request')
+    assert.equal(requests.length, 4)
+    for (const start of requests.filter(event => event.phase === 'start')) {
+      assert.equal(requests.filter(event => event.id === start.id && event.phase === 'end' && event.status === 'cancelled').length, 1)
+    }
+    assert.equal(harness.timers.size, 0)
+  } finally { release?.(); await stop() }
+})
+
+test('a failed terminal handoff retries the retained immutable cancellation records', async () => {
+  const harness = telemetryHost(), stop = await initializeOperationTelemetry(harness.host)
+  harness.hooks().beginRequest('chartWindow')
+  harness.failNext()
+  await assert.rejects(harness.detach(), /Transient IPC failure/)
+  const failedBatch = harness.attempts.at(-1)!
+  assert.deepEqual(failedBatch.events.map(event => [event.phase, event.status]), [['start', 'running'], ['end', 'cancelled']])
+  await stop()
+  assert.deepEqual(harness.attempts.at(-1), failedBatch)
+  assert.equal(harness.failures.length, 0)
+})
+
 test('persistent renderer handoff failure retains a contiguous bounded prefix and explicitly fails its source', async () => {
   const harness = telemetryHost()
   harness.block(true)
@@ -145,7 +212,59 @@ test('persistent renderer handoff failure retains a contiguous bounded prefix an
     assert.ok(records.every((event, index) => !index || event.sequence === records[index - 1].sequence + 1))
     assert.equal(harness.failures.length, 1)
     assert.equal(harness.failures[0].omitted, 208)
+    for (let index = 0; index < 2; index++) measureOperation({ category: 'cpu', name: 'fixture.after-overflow' }, () => index)
+    await assert.rejects(harness.flush(), /incomplete/)
+    assert.deepEqual(harness.failures.map(value => value.omitted), [208, 212], 'Later reports carry the cumulative source total, so IPC replays can be deduplicated.')
   } finally { await assert.rejects(stop(), /incomplete/) }
+})
+
+test('leaving an exhausted renderer submits omitted evidence before held batch acknowledgments', async () => {
+  const harness = telemetryHost(), reports: { omitted: number }[] = []
+  let releaseReport: (() => void) | undefined
+  const stop = await initializeOperationTelemetry({ ...harness.host, reportFailure: value => {
+    reports.push(value)
+    return new Promise<void>(resolve => { releaseReport = resolve })
+  } })
+  harness.holdNext()
+  for (let index = 0; index < 4_200; index++) measureOperation({ category: 'cpu', name: 'fixture.compute' }, () => index)
+  let completed = false
+  const detached = harness.detach().finally(() => { completed = true })
+  // Attach the rejection handler immediately: this source must fail even though
+  // the 8192 retained records form a perfectly paired sequence of operations.
+  const rejected = assert.rejects(detached, /incomplete/)
+  const repeated = assert.rejects(stop(), /incomplete/)
+  assert.equal(reports.length, 1, 'Shutdown must submit failure evidence without waiting for a batch ACK.')
+  assert.equal(reports[0].omitted, 208)
+  assert.equal(completed, false)
+  harness.release()
+  await Promise.resolve()
+  assert.equal(completed, false, 'A final flush must also await the omitted-evidence acknowledgment.')
+  releaseReport!()
+  await Promise.all([rejected, repeated])
+  await assert.rejects(stop(), /incomplete/)
+  assert.equal(reports.length, 1, 'Concurrent drains and repeated shutdown do not count the same omissions again.')
+  const records = new Map(harness.batches.flatMap(batch => batch.events).map(event => [event.sequence, event]))
+  assert.equal(records.size, 8_192)
+  assert.equal([...records.values()].filter(event => event.phase === 'start').length, 4_096)
+  assert.equal([...records.values()].filter(event => event.phase === 'end').length, 4_096)
+})
+
+test('terminal omission evidence retries a failed cumulative report without resending an acknowledged total', async () => {
+  const harness = telemetryHost(), reports: { omitted: number }[] = []
+  let fail = true
+  const stop = await initializeOperationTelemetry({ ...harness.host, reportFailure: async value => {
+    reports.push(value)
+    if (fail) { fail = false; throw new Error('Failure-report transport unavailable') }
+  } })
+  harness.holdNext()
+  for (let index = 0; index < 4_100; index++) measureOperation({ category: 'cpu', name: 'fixture.compute' }, () => index)
+  const detached = assert.rejects(harness.detach(), /Failure-report transport unavailable/)
+  assert.deepEqual(reports.map(value => value.omitted), [8])
+  harness.release()
+  await detached
+  await assert.rejects(stop(), /incomplete/)
+  await assert.rejects(stop(), /incomplete/)
+  assert.deepEqual(reports.map(value => value.omitted), [8, 8], 'An unsuccessful submission retries the same cumulative total; an acknowledged total is never submitted again.')
 })
 
 test('renderer long-frame observations and undelivered shutdown entries preserve their elapsed timing', async () => {

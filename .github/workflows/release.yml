@@ -39,6 +39,10 @@ jobs:
         run: npm run test:core -- --output artifacts/sandbox
       - name: Test Electron with isolated fixtures
         run: npm run test:e2e -- --output artifacts/sandbox
+      - name: Probe native GPU capabilities and verify accelerated chart work when available
+        # Hosted runners may expose software rendering. The dedicated report
+        # distinguishes confirmed unsupported hardware from a passed GPU check.
+        run: npm run test:gpu -- --output artifacts/sandbox
       - name: Test native foreground chart painting
         run: npm run test:foreground -- --output artifacts/sandbox
       - name: Verify workspace scaling and contrast

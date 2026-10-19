@@ -104,8 +104,9 @@ async function inspectSession(root, name, isProcessAlive) {
         const pid = Number(value.executionId?.split('-')[0]); if (validPID(pid)) pids.add(pid)
       } else if (file.kind === 'graphics' && file.name.endsWith('.status.json')) {
         const value = await readJSON(file.path)
-        if (value.error || value.enabled && (!value.complete || dirname(resolve(value.file ?? '')) !== path
-          || !result.files.some(file => file.path === resolve(value.file)))) healthy = false
+        const tracePath = resolve(path, value.file ?? '')
+        if (value.error || value.enabled && (!value.complete || dirname(tracePath) !== path
+          || !result.files.some(file => file.path === tracePath))) healthy = false
       }
     } catch { healthy = false }
   }

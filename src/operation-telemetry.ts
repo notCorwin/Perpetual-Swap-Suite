@@ -11,6 +11,7 @@ type TelemetryHost = {
   schedule: (callback: () => void, delay: number) => number
   cancel: (handle: number) => void
   onFlush: (callback: () => Promise<void>) => () => void
+  onStop?: (callback: () => Promise<void>) => () => void
 }
 
 const BATCH_SIZE = 128, FLUSH_MS = 250, MAX_PENDING = 8_192
@@ -26,44 +27,89 @@ export async function initializeOperationTelemetry(host: TelemetryHost = {
   cancel: handle => window.clearTimeout(handle),
   onFlush: callback => {
     const flush = () => { void callback().catch(() => {}) }
-    window.addEventListener('pagehide', flush)
-    return () => window.removeEventListener('pagehide', flush)
+    window.addEventListener('radar-operations-flush', flush)
+    return () => window.removeEventListener('radar-operations-flush', flush)
+  },
+  onStop: callback => {
+    const stop = () => { void callback().catch(() => {}) }
+    window.addEventListener('pagehide', stop)
+    return () => window.removeEventListener('pagehide', stop)
   },
 }): Promise<() => Promise<void>> {
   const pending: OperationJournalEvent[] = [], observers: PerformanceObserver[] = []
   const requests = new Map<string, OperationSpan>()
   let timer: number | undefined, flushing: Promise<void> | undefined, batch: OperationBatch | undefined
+  let finalFlushing: Promise<void> | undefined, finalBatches: OperationBatch[] | undefined
+  let reportingFailure: Promise<void> | undefined
   let stopped = false, failedSource = false, omitted = 0, reportedOmitted = 0, nextBatch = 0
   let source: OperationSourceIdentity | undefined
-  let unsubscribe = () => {}, removeFlush = () => {}
+  let unsubscribe = () => {}, removeFlush = () => {}, removeStop = () => {}
   const schedule = () => {
     if (!stopped && !failedSource && timer === undefined) timer = host.schedule(() => { timer = undefined; void flush().catch(schedule) }, FLUSH_MS)
+  }
+  const createBatch = (events: OperationJournalEvent[]): OperationBatch => ({ executionId: events[0].executionId,
+    batchId: `${events[0].executionId}:batch:${++nextBatch}`, firstSequence: events[0].sequence, events })
+  const acknowledge = (sent: OperationBatch, acknowledgment: OperationAcknowledgment) => {
+    const lastSequence = sent.events.at(-1)!.sequence
+    if (acknowledgment.batchId !== sent.batchId || acknowledgment.lastSequence !== lastSequence) throw new Error('Operation journal acknowledgment does not match the retained batch.')
+    // A terminal handoff may replay a batch that is already waiting for its ACK.
+    // Either ACK can arrive first; removing by source sequence keeps both idempotent.
+    let count = 0
+    while (count < pending.length && pending[count].sequence <= lastSequence) count++
+    pending.splice(0, count)
+    if (batch?.batchId === sent.batchId) batch = undefined
+  }
+  const reportOmissions = (): Promise<void> => {
+    if (reportingFailure) return reportingFailure
+    if (omitted <= reportedOmitted) return Promise.resolve()
+    const count = omitted
+    try {
+      // Send a cumulative high-water mark so an ACK lost during navigation can
+      // replay the same report without counting its omissions a second time.
+      reportingFailure = host.reportFailure({ executionId: source?.executionId ?? 'renderer', reason: 'renderer-buffer-exhausted', omitted: count })
+        .then(() => { reportedOmitted = Math.max(reportedOmitted, count) }).finally(() => { reportingFailure = undefined })
+      return reportingFailure
+    } catch (error) { return Promise.reject(error) }
+  }
+  const assertComplete = async () => {
+    if (!failedSource) return
+    while (omitted > reportedOmitted) await reportOmissions()
+    throw new Error('Renderer operation recording is incomplete because its retained queue was exhausted.')
+  }
+  const flushFinal = (): Promise<void> => {
+    if (finalFlushing) return finalFlushing
+    if (!finalBatches) {
+      finalBatches = batch ? [batch] : []
+      const offset = batch?.events.length ?? 0
+      for (let index = offset; index < pending.length; index += BATCH_SIZE) finalBatches.push(createBatch(pending.slice(index, index + BATCH_SIZE)))
+    }
+    finalBatches = finalBatches.filter(value => pending.some(event => event.sequence === value.firstSequence))
+    // Submit every retained batch synchronously, including an immutable replay of
+    // the in-flight batch. A destroyed document cannot resume after awaiting its
+    // ACK. The main receiver owns ordered admission, replay deduplication and fsync.
+    const deliveries = finalBatches.map(sent => {
+      try { return host.recordOperations(sent).then(ack => acknowledge(sent, ack)) }
+      catch (error) { return Promise.reject(error) }
+    })
+    // Failure evidence must also leave the document before any ACK is awaited.
+    // A paired retained prefix alone cannot reveal records omitted after it.
+    finalFlushing = Promise.allSettled([...deliveries, assertComplete()]).then(results => {
+      const failure = results.find(result => result.status === 'rejected')
+      if (failure?.status === 'rejected') throw failure.reason
+    }).finally(() => { finalFlushing = undefined })
+    return finalFlushing
   }
   const flush = (): Promise<void> => {
     if (timer !== undefined) host.cancel(timer)
     timer = undefined
+    if (stopped) return flushFinal()
     if (flushing) return flushing
     flushing = (async () => {
-      while (pending.length) {
-        if (!batch) {
-          const events = pending.slice(0, BATCH_SIZE)
-          batch = { executionId: events[0].executionId, batchId: `${events[0].executionId}:batch:${++nextBatch}`,
-            firstSequence: events[0].sequence, events }
-        }
-        const acknowledgment = await host.recordOperations(batch)
-        const lastSequence = batch.events.at(-1)!.sequence
-        if (acknowledgment.batchId !== batch.batchId || acknowledgment.lastSequence !== lastSequence) throw new Error('Operation journal acknowledgment does not match the retained batch.')
-        pending.splice(0, batch.events.length)
-        batch = undefined
+      while (pending.length && !stopped) {
+        const sent = batch ??= createBatch(pending.slice(0, BATCH_SIZE))
+        acknowledge(sent, await host.recordOperations(sent))
       }
-      if (failedSource) {
-        if (omitted > reportedOmitted) {
-          const count = omitted
-          await host.reportFailure({ executionId: source?.executionId ?? 'renderer', reason: 'renderer-buffer-exhausted', omitted: count - reportedOmitted })
-          reportedOmitted = count
-        }
-        throw new Error('Renderer operation recording is incomplete because its retained queue was exhausted.')
-      }
+      await assertComplete()
     })().finally(() => { flushing = undefined })
     return flushing
   }
@@ -86,11 +132,12 @@ export async function initializeOperationTelemetry(host: TelemetryHost = {
     requests.clear()
     for (const observer of observers) { recordEntries(observer.takeRecords()); observer.disconnect() }
     observers.length = 0
-    unsubscribe(); removeFlush()
+    unsubscribe(); removeFlush(); removeStop()
     return flush()
   }
   const hooks: OperationBridgeHooks = {
     beginRequest(command) {
+      if (stopped) throw Object.assign(new Error('The renderer document is detached.'), { name: 'AbortError' })
       const operation = beginOperation({ category: 'ipc', name: 'desktop.request', resource: command })
       const id = operation.context.parentId ?? `unrecorded:${requests.size}`
       requests.set(id, operation)
@@ -98,6 +145,7 @@ export async function initializeOperationTelemetry(host: TelemetryHost = {
     },
     endRequest(id, status) { requests.get(id)?.end({ status }); requests.delete(id) },
     receive(channel, detail, context) {
+      if (stopped) return
       runWithOperationContext(context, () => {
         const operation = beginOperation({ category: 'ipc', name: 'desktop.notification.receive', resource: channel })
         try { operation.run(() => window.dispatchEvent(new CustomEvent(channel.replace(':', '-'), { detail }))) }
@@ -111,7 +159,7 @@ export async function initializeOperationTelemetry(host: TelemetryHost = {
   unsubscribe = attachOperationJournalSink(event => {
     if (failedSource || pending.length >= MAX_PENDING) { failedSource = true; omitted++; return }
     pending.push(event)
-    if (pending.length >= BATCH_SIZE) void flush().catch(schedule)
+    if (!stopped && pending.length >= BATCH_SIZE) void flush().catch(schedule)
     else schedule()
   })
   for (const type of ['longtask', 'long-animation-frame']) {
@@ -122,5 +170,6 @@ export async function initializeOperationTelemetry(host: TelemetryHost = {
     } catch { /* Optional browser entry types differ across Chromium builds. */ }
   }
   removeFlush = host.onFlush(flushObserved)
+  removeStop = host.onStop?.(detachRequests) ?? (() => {})
   return async () => { await detachRequests() }
 }

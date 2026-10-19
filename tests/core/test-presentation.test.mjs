@@ -24,9 +24,10 @@ test('test windows default to background independently of production fixture acc
 test('ordinary test commands exclude native foreground acceptance and the explicit suite retains it', async () => {
   for (const mode of ['e2e', 'all']) {
     const commands = await sandboxCommands(mode)
-    const files = commands.at(-1)
+    const files = commands.flat()
     assert.ok(files.includes('tests/e2e/desktop-security.e2e.mjs'))
     assert.ok(files.includes('tests/e2e/operation-recording.e2e.mjs'))
+    assert.equal(files.includes('tests/e2e/graphics.gpu.mjs'), mode === 'all')
     assert.ok(files.every(file => !file.endsWith('.foreground.mjs')))
   }
   const commands = await sandboxCommands('foreground')

@@ -280,3 +280,22 @@ test('raw TCP and native WebSocket hooks retain receivers and injected adapter d
   assert.ok(result.names.includes('websocket.closed'))
   assert.ok(result.names.includes('socket.closed'))
 })
+
+
+test('SQLite capability readback detects replaced native constructor without contaminating other processes', async () => {
+  const result=await execute(`
+    import sqlite, { DatabaseSync as OriginalNamedConstructor } from 'node:sqlite';
+    import { getOperationHookCapabilities, getInstalledOperationHooks } from ${JSON.stringify(hooksURL)};
+    const installed=sqlite.DatabaseSync;
+    const capability=()=>getOperationHookCapabilities().find(entry=>entry.api==='node:sqlite.DatabaseSync');
+    assert.equal(capability().enabled,true);
+    sqlite.DatabaseSync=OriginalNamedConstructor;
+    assert.equal(capability().enabled,false);
+    assert.equal(capability().reason,'hook-replaced-after-installation');
+    assert.equal(getInstalledOperationHooks().includes('sqlite'),false);
+    sqlite.DatabaseSync=installed;
+    assert.equal(capability().enabled,true);
+    console.log(JSON.stringify({restored:capability().enabled}));
+  `)
+  assert.equal(result.restored,true)
+})

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, contentTracing, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, clipboard, contentTracing, ipcMain, net, session, shell } from 'electron'
 import { mkdirSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -13,6 +13,7 @@ import { startGraphicsRecording } from './services/operation-graphics.js'
 import { beginOperation, measureOperation, recordOperation, runWithOperationContext, withOperationSuppressed } from './services/operations.js'
 import { createRendererOperationReceiver } from './services/renderer-operations.js'
 import { createOperationSession, enforceOperationRetention } from './services/operation-retention.js'
+import { installElectronOperationHooks } from './services/operation-hooks.js'
 import { MarketBackend } from './services/market-backend.js'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
@@ -233,6 +234,10 @@ async function startDesktop() {
 }
 
 app.whenReady().then(() => {
+  if (operationRecording) {
+    installElectronOperationHooks({ app, net, session })
+    void operationRecording.flush().catch(error => console.error('Operation hook checkpoint failed:', error.message))
+  }
   if (testMode || process.env.PERPETUAL_SWAP_SANDBOX === '1' || process.env.PERPETUAL_SWAP_TEST_UI !== undefined) {
     stopTestOwner = startTestOwnerWatchdog({ parentPID: testLaunchParentPID, onOwnerLost: () => {
       app.quit()
