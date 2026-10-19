@@ -1,3 +1,4 @@
+import { hookOperationMethods } from './operations.js'
 import { recordedWebSocketFactory } from './network-operations.js'
 
 // OKX business WebSocket: https://www.okx.com/docs-v5/en/#order-book-trading-market-data-ws-candlesticks-channel
@@ -494,3 +495,7 @@ export class RealtimeMarket {
     return this.closePromise
   }
 }
+
+hookOperationMethods(RealtimeMarket.prototype, {
+  consume: { category: 'cpu', name: 'market.websocket.decode', attributes: { stream: 'okx.business' } },
+})

@@ -1,4 +1,4 @@
-import { Worker } from 'node:worker_threads'
+import { createOperationWorker, createWorkerRequest } from './worker-operations.js'
 import { stopOperationWorker } from './operation-worker.js'
 
 /** Exact streaming qualification runs outside Electron's main event loop. */
@@ -12,7 +12,7 @@ export class StreamLiquidityEvaluator {
   }
 
   startWorker() {
-    const worker = new Worker(new URL('./stream-liquidity-worker.js', import.meta.url))
+    const worker = createOperationWorker(new URL('./stream-liquidity-worker.js', import.meta.url), {}, 'stream-liquidity')
     this.worker = worker
     worker.unref()
     worker.on('message', ({ id, result, error }) => {
@@ -43,17 +43,18 @@ export class StreamLiquidityEvaluator {
     return new Promise((resolve, reject) => {
       let worker
       const id = ++this.nextID
+      const request = createWorkerRequest('stream-liquidity', 'evaluate', resolve, reject)
       try {
         worker = this.worker ?? this.startWorker()
-        this.pending.set(id, { resolve, reject })
+        this.pending.set(id, request)
         worker.ref()
         // postMessage captures this input synchronously. Later observations
         // cannot change which snapshot the returned result describes.
-        worker.postMessage({ id, input })
+        request.dispatch(worker, { id, input })
       } catch (error) {
         this.pending.delete(id)
         if (worker && !this.pending.size) worker.unref()
-        reject(error)
+        request.reject(error)
       }
     })
   }

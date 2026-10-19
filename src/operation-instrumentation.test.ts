@@ -2,9 +2,10 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { barsWithIndicators, buildIndicatorSeries, projectIndicatorCandle } from '../electron/services/indicators.js'
 import { createLiquidityEvaluator, type LiquidityInput } from '../electron/services/liquidity.js'
-import { attachOperationSink, measureOperation, type OperationEvent } from '../electron/services/operations.js'
+import { attachOperationSink, measureOperation, type OperationEvent, type OperationJournalEvent } from '../electron/services/operations.js'
 import { createChartGeometryCache } from './chart-geometry.ts'
 import { initializeOperationTelemetry } from './operation-telemetry.ts'
+import type { OperationBatch } from './desktop-contract.ts'
 
 const candles = Array.from({ length: 220 }, (_, index) => ({ timestamp: index * 300_000,
   open: 100, close: 100, high: 101, low: 99, baseVolume: 1, confirmed: true }))
@@ -67,74 +68,88 @@ test('live indicator revisions record the fixed-size projection without replayin
 })
 
 function telemetryHost() {
-  const batches: OperationEvent[][] = []
+  const batches: OperationBatch[] = [], attempts: OperationBatch[] = [], failures: { omitted: number }[] = []
   const timers = new Map<number, () => void>()
-  let nextTimer = 0, flush: (() => void) | undefined
-  let fail = false, blocked = false
+  let nextTimer = 0, flush: (() => Promise<void>) | undefined
+  let fail = false, blocked = false, hold = false, release: (() => void) | undefined
   return {
-    batches, timers,
-    flush: () => flush?.(),
+    batches, attempts, timers, failures,
+    flush: () => flush?.() ?? Promise.resolve(),
     failNext: () => { fail = true },
     block: (value: boolean) => { blocked = value },
+    holdNext: () => { hold = true },
+    release: () => release?.(),
     host: {
-      recordOperations: (events: OperationEvent[]) => { if (fail || blocked) { fail = false; throw new Error('Transient IPC failure') }; batches.push(events) },
+      recordOperations: async (batch: OperationBatch) => {
+        attempts.push(structuredClone(batch))
+        if (fail || blocked) { fail = false; throw new Error('Transient IPC failure') }
+        if (hold) { hold = false; await new Promise<void>(resolve => { release = resolve }) }
+        batches.push(structuredClone(batch))
+        return { batchId: batch.batchId, lastSequence: batch.events.at(-1)!.sequence }
+      },
+      reportFailure: async (value: { omitted: number }) => { failures.push(value) },
       timeOrigin: 1_000,
       schedule: (callback: () => void) => { const id = ++nextTimer; timers.set(id, callback); return id },
       cancel: (id: number) => { timers.delete(id) },
-      onFlush: (callback: () => void) => { flush = callback; return () => { flush = undefined } },
+      onFlush: (callback: () => Promise<void>) => { flush = callback; return () => { flush = undefined } },
     },
   }
 }
 
-test('renderer batches operations, retries a failed handoff and flushes pending work before shutdown', () => {
-  const harness = telemetryHost()
-  const stop = initializeOperationTelemetry(harness.host)
+const ended = (batches: OperationBatch[]): OperationJournalEvent[] => batches.flatMap(batch => batch.events).filter(event => event.phase === 'end')
+
+test('renderer retains lifecycle records until acknowledgment and retries the same immutable batch', async () => {
+  const harness = telemetryHost(), stop = await initializeOperationTelemetry(harness.host)
   try {
-    for (let index = 0; index < 127; index++) measureOperation({ category: 'cpu', name: 'fixture.compute' }, () => index * index)
-    assert.equal(harness.batches.length, 0)
+    for (let index = 0; index < 63; index++) measureOperation({ category: 'cpu', name: 'fixture.compute' }, () => index * index)
+    assert.equal(harness.attempts.length, 0)
     assert.equal(harness.timers.size, 1)
+    harness.holdNext()
     measureOperation({ category: 'cpu', name: 'fixture.compute' }, () => 1)
-    assert.equal(harness.batches[0].length, 128)
-    assert.equal(harness.timers.size, 0)
-    measureOperation({ category: 'cpu', name: 'fixture.last' }, () => 1)
+    assert.equal(harness.attempts[0].events.length, 128)
+    measureOperation({ category: 'cpu', name: 'fixture.during-handoff' }, () => 1)
+    let acknowledged = false
+    const draining = harness.flush().then(() => { acknowledged = true })
+    await Promise.resolve()
+    assert.equal(acknowledged, false, 'Flush must wait for the durable acknowledgment.')
+    assert.equal(harness.batches.length, 0)
+    harness.release()
+    await draining
+    assert.equal(ended(harness.batches).length, 65)
+    measureOperation({ category: 'cpu', name: 'fixture.retry' }, () => 1)
     harness.failNext()
-    harness.flush()
-    assert.equal(harness.batches.length, 1)
-    assert.equal(harness.timers.size, 1, 'A transient transport failure retains its events for retry.')
-    harness.flush()
-    assert.equal(harness.batches[1][0].name, 'fixture.last')
+    await assert.rejects(harness.flush(), /Transient IPC failure/)
+    const failedBatch = harness.attempts.at(-1)!
+    await harness.flush()
+    assert.deepEqual(harness.attempts.at(-1), failedBatch, 'Retries retain batch IDs, sequence numbers and source operation IDs.')
     measureOperation({ category: 'cpu', name: 'fixture.shutdown' }, () => 1)
-  } finally { stop() }
-  assert.equal(harness.batches[2][0].name, 'fixture.shutdown')
+  } finally { await stop() }
+  assert.equal(ended(harness.batches).at(-1)!.name, 'fixture.shutdown')
+  const records = harness.batches.flatMap(batch => batch.events)
+  assert.equal(records.length, 134)
+  assert.equal(new Set(records.map(event => `${event.id}:${event.phase}`)).size, 134)
   assert.equal(harness.timers.size, 0)
-  assert.equal(new Set(harness.batches.flat().map(event => event.id)).size, 130)
 })
 
-test('persistent renderer transport failure has bounded memory and explicit omitted-operation accounting', () => {
+test('persistent renderer handoff failure retains a contiguous bounded prefix and explicitly fails its source', async () => {
   const harness = telemetryHost()
   harness.block(true)
-  const stop = initializeOperationTelemetry(harness.host)
+  const stop = await initializeOperationTelemetry(harness.host)
   try {
-    for (let index = 0; index < 5_000; index++) measureOperation({ category: 'cpu', name: 'fixture.compute' }, () => index)
-    assert.equal(harness.batches.length, 0)
-    assert.equal(harness.timers.size, 1)
+    for (let index = 0; index < 4_200; index++) measureOperation({ category: 'cpu', name: 'fixture.compute' }, () => index)
+    await assert.rejects(harness.flush(), /Transient IPC failure/)
     harness.block(false)
-    harness.flush()
-    const events = harness.batches.flat()
-    assert.equal(events.length, 4_096)
-    const overflow = events.find(event => event.name === 'diagnostics.renderer.overflow')!
-    assert.equal(overflow.status, 'error')
-    assert.equal(overflow.attributes!.incomplete, true)
-    assert.equal(overflow.attributes!.count, 905)
-    assert.equal(events.filter(event => event.name === 'fixture.compute').length + Number(overflow.attributes!.count), 5_000)
-  } finally { stop() }
+    await assert.rejects(harness.flush(), /incomplete/)
+    const records = harness.batches.flatMap(batch => batch.events)
+    assert.equal(records.length, 8_192)
+    assert.ok(records.every((event, index) => !index || event.sequence === records[index - 1].sequence + 1))
+    assert.equal(harness.failures.length, 1)
+    assert.equal(harness.failures[0].omitted, 208)
+  } finally { await assert.rejects(stop(), /incomplete/) }
 })
 
-test('renderer long frame observations preserve elapsed timing without reporting GPU execution', () => {
-  const harness = telemetryHost()
-  const callbacks: PerformanceObserverCallback[] = []
-  const observed: string[] = []
-  const queued: PerformanceEntry[] = []
+test('renderer long-frame observations and undelivered shutdown entries preserve their elapsed timing', async () => {
+  const harness = telemetryHost(), callbacks: PerformanceObserverCallback[] = [], observed: string[] = [], queued: PerformanceEntry[] = []
   class Observer {
     static supportedEntryTypes = ['long-animation-frame']
     constructor(callback: PerformanceObserverCallback) { callbacks.push(callback) }
@@ -142,12 +157,12 @@ test('renderer long frame observations preserve elapsed timing without reporting
     takeRecords() { return queued.splice(0) }
     disconnect() {}
   }
-  const stop = initializeOperationTelemetry({ ...harness.host, Observer: Observer as unknown as typeof PerformanceObserver })
+  const stop = await initializeOperationTelemetry({ ...harness.host, Observer: Observer as unknown as typeof PerformanceObserver })
   try {
     assert.deepEqual(observed, ['long-animation-frame'])
     callbacks[0]({ getEntries: () => [{ entryType: 'long-animation-frame', startTime: 10, duration: 75, blockingDuration: 25, renderStart: 60 }] } as unknown as PerformanceObserverEntryList, {} as PerformanceObserver)
-    harness.flush()
-    const event = harness.batches[0][0]
+    await harness.flush()
+    const event = ended(harness.batches)[0]
     assert.equal(event.name, 'renderer.long-animation-frame')
     assert.equal(event.startedAt, 1_010)
     assert.equal(event.durationMS, 75)
@@ -157,6 +172,6 @@ test('renderer long frame observations preserve elapsed timing without reporting
     assert.equal(event.attributes!.blockingDurationMS, 25)
     assert.equal(event.attributes!.renderDurationMS, 25)
     queued.push({ entryType: 'long-animation-frame', startTime: 100, duration: 80 } as PerformanceEntry)
-  } finally { stop() }
-  assert.equal(harness.batches[1][0].startedAt, 1_100, 'Shutdown drains observations that Chromium has not delivered yet.')
+  } finally { await stop() }
+  assert.equal(ended(harness.batches).at(-1)!.startedAt, 1_100)
 })

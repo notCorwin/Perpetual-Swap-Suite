@@ -1,5 +1,4 @@
-import { Worker } from 'node:worker_threads'
-import { fork } from 'node:child_process'
+import { createOperationWorker, createOperationProcess, createWorkerRequest } from './worker-operations.js'
 import { mkdir, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -19,6 +18,7 @@ class DatabaseWorkers {
     this.nextID = 0
     this.foregroundBurst = 0
     this.failed = null
+    this.closing = false
     this.metrics = { requests: 0, completed: 0, failed: 0, maximumQueued: 0, rowsReturned: 0, durationMS: 0 }
     for (const worker of workers) {
       worker.busy = false
@@ -41,7 +41,7 @@ class DatabaseWorkers {
         if (!worker.busy) worker.unref()
       })
       worker.on('error', error => this.fail(error))
-      worker.on('exit', code => { if (code !== 0) this.fail(new Error(`Market database worker exited (${code}).`)) })
+      worker.on('exit', code => { if (!this.closing) this.fail(new Error(`Market database worker exited (${code}).`)) })
       worker.unref()
     }
   }
@@ -53,7 +53,8 @@ class DatabaseWorkers {
   request(command, args = [], priority = 'background') {
     if (this.failed) return Promise.reject(this.failed)
     const task = new Promise((resolve, reject) => {
-      this.queue.push({ id: ++this.nextID, command, args, priority, resolve, reject })
+      const request = createWorkerRequest('market-store', command, resolve, reject, { priority })
+      this.queue.push({ id: ++this.nextID, command, args, priority, ...request })
       this.metrics.requests += 1; this.metrics.maximumQueued = Math.max(this.metrics.maximumQueued, this.queue.length)
       this.drain()
     })
@@ -72,24 +73,27 @@ class DatabaseWorkers {
       const [job] = this.queue.splice(Math.max(0, index), 1)
       this.foregroundBurst = priorityRank(job.priority) >= 3 ? this.foregroundBurst + 1 : 0
       worker.busy = true; worker.current = job; worker.ref()
-      worker.postMessage({ id: job.id, command: job.command, args: job.args })
+      try { job.dispatch(worker, { id: job.id, command: job.command, args: job.args }) }
+      catch (error) { worker.current = null; worker.busy = false; worker.unref(); job.reject(error); queueMicrotask(() => this.drain()) }
     }
   }
   async close() {
     // The owner joins admitted work before calling this method.
     await Promise.allSettled([...this.tasks])
+    this.closing = true
     try {
       await Promise.all(this.workers.map(worker => new Promise((resolve, reject) => {
         const id = ++this.nextID
-        worker.current = { id, resolve, reject }; worker.busy = true; worker.ref()
-        worker.postMessage({ id, command: 'close', args: [] })
+        const request = createWorkerRequest('market-store', 'close', resolve, reject)
+        worker.current = { id, ...request }; worker.busy = true; worker.ref()
+        request.dispatch(worker, { id, command: 'close', args: [] })
       })))
     } finally { await Promise.all(this.workers.map(worker => worker.terminate())) }
   }
 }
 
 async function createDatabaseWorker(path, reader = false) {
-  const worker = new Worker(new URL('./market-store-worker.js', import.meta.url), { workerData: { path, reader } })
+  const worker = createOperationWorker(new URL('./market-store-worker.js', import.meta.url), { workerData: { path, reader } }, reader ? 'market-reader' : 'market-writer')
   await new Promise((resolve, reject) => {
     const ready = message => { if (message.ready) { worker.off('error', reject); worker.off('message', ready); resolve() } }
     worker.on('message', ready); worker.once('error', reject)
@@ -167,10 +171,10 @@ export class MarketStore {
     if (this.closed) return
     // DuckDB's native addon cannot safely survive worker-thread termination.
     // A process owns its native lifetime; SQLite transactions remain here.
-    const child = fork(fileURLToPath(new URL('./market-store-migration.js', import.meta.url)), [this.root, this.path], {
+    const child = createOperationProcess(fileURLToPath(new URL('./market-store-migration.js', import.meta.url)), [this.root, this.path], {
       execPath: process.execPath, execArgv: [], env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
       serialization: 'advanced', stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
-    })
+    }, 'market-migration')
     this.migration = child
     let stderr = ''
     child.stderr.on('data', value => { stderr = (stderr + value).slice(-4096) })
@@ -229,11 +233,12 @@ export class MarketStore {
     const child = this.migration
     const id = ++this.nextMigrationID
     await new Promise((resolve, reject) => {
-      this.migrationPending.set(id, { resolve, reject })
+      const request = createWorkerRequest('market-migration', 'import', resolve, reject, { priority })
+      this.migrationPending.set(id, request)
       child.ref(); child.channel?.ref()
-      child.send({ id, query: validateQuery(query), priority: priorityRank(priority) >= 3 ? 'foreground' : 'background', tolerateIssues }, error => {
+      request.dispatch(child, { id, query: validateQuery(query), priority: priorityRank(priority) >= 3 ? 'foreground' : 'background', tolerateIssues }, error => {
         if (!error) return
-        this.migrationPending.delete(id); reject(error)
+        this.migrationPending.delete(id); request.reject(error)
       })
     })
     if (!this.migrationPending.size) { child.unref(); child.channel?.unref() }

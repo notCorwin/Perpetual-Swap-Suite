@@ -1,15 +1,13 @@
 import { parentPort } from 'node:worker_threads'
 import { appendIndicatorCandle, createIndicatorState } from './indicators.js'
 import { measureOperation } from './operations.js'
-import { closeOperationRecording } from './operation-runtime.js'
+import { onOperationMessage } from './worker-operations.js'
 
 // One bounded chunk is a scheduling unit. Recursive state is passed explicitly,
 // so yielding to another series cannot change any formula or initialization.
-parentPort.on('message', async ({ type, id, candles, intervalMS, checkpoint }) => {
+onOperationMessage(parentPort, 'prepared-chart', ({ type, id, candles, intervalMS, checkpoint }) => {
   if (type === 'closeOperations') {
-    try { await closeOperationRecording(); parentPort.postMessage({ type: 'operationsClosed' }) }
-    catch { parentPort.postMessage({ type: 'operationsClosed', error: true }) }
-    return
+    return { type: 'operationsClosed' }
   }
   try {
     const { state, bars } = measureOperation({ category: 'cpu', name: 'indicators.replay', resource: candles[0]?.instrument,
@@ -29,8 +27,8 @@ parentPort.on('message', async ({ type, id, candles, intervalMS, checkpoint }) =
     }
     return { state, bars }
     })
-    parentPort.postMessage({ id, state, bars })
+    return { id, state, bars }
   } catch (error) {
-    parentPort.postMessage({ id, error: error instanceof Error ? error.message : String(error) })
+    return { id, error: error instanceof Error ? error.message : String(error) }
   }
-})
+}, { closeWhen: message => message.type === 'closeOperations' })

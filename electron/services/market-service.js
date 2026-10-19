@@ -851,7 +851,7 @@ export class MarketService {
           // network call which no active viewport can consume.
           if (request.controller.signal.aborted) throw request.controller.signal.reason ?? new Error('The request was aborted.')
           const url = requestURL(request.path, request.parameters), signal = request.controller.signal
-          const operation = beginOperation({ category: 'network', name: 'http.request', resource: networkResource(url),
+          const operation = beginOperation({ category: 'ipc', name: 'http.request', resource: networkResource(url),
             attributes: { transport: 'http', method: 'GET', path: request.path, lane: lane.name, priority: request.priority } })
           const attributes = {}
           let finished = false

@@ -1,3 +1,4 @@
+import { hookOperationMethods } from './operations.js'
 // Native OKX public streams cover the entire eligible universe independently of
 // chart selection. https://www.okx.com/docs-v5/en/#order-book-trading-market-data
 import { recordedWebSocketFactory } from './network-operations.js'
@@ -652,3 +653,9 @@ export class RealtimePublicMarket {
     return this.closePromise
   }
 }
+
+hookOperationMethods(PublicMarketConnection.prototype, {
+  consume: { category: 'cpu', name: 'market.websocket.decode', attributes: { stream: 'okx.public' } },
+  updateBook: (_connection, instId, _action, raw) => ({ category: 'cpu', name: 'market.book.reconstruct', resource: instId,
+    attributes: { bidLevels: raw?.bids?.length ?? 0, askLevels: raw?.asks?.length ?? 0 } }),
+})

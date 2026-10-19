@@ -2,7 +2,7 @@ import { beginOperation } from './operations.js'
 
 /** Stop a worker only after its operation journal has acknowledged shutdown. */
 export async function stopOperationWorker(worker, resource, timeoutMS = 2_000) {
-  const span = beginOperation({ category: 'cpu', name: 'diagnostics.worker.flush', resource,
+  const span = beginOperation({ category: 'ipc', name: 'diagnostics.worker.flush', resource,
     attributes: { measurement: 'shutdown-wait', threadId: worker.threadId } })
   const outcome = await new Promise(resolve => {
     const finished = reason => {
@@ -22,7 +22,7 @@ export async function stopOperationWorker(worker, resource, timeoutMS = 2_000) {
     worker.ref()
     if (worker.threadId === -1) finished('worker-exited')
     else {
-      try { worker.postMessage({ type: 'closeOperations' }) }
+      try { span.run(() => worker.postMessage({ type: 'closeOperations' })) }
       catch { finished('worker-unreachable') }
     }
   })

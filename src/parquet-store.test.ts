@@ -1,5 +1,7 @@
 import { test } from 'node:test'
 import { once } from 'node:events'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { strict as assert } from 'node:assert'
 import { chmod, mkdtemp, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -73,6 +75,24 @@ test('one-time native import runs in a separate process, exits normally and is s
 })
 
 test('an importer crash rejects pending legacy reads without killing SQLite or losing new facts', { timeout: 15_000 }, async () => {
+  if (process.env.PERPETUAL_SWAP_IMPORT_CRASH_FIXTURE !== '1') {
+    const operations = await mkdtemp(join(tmpdir(), 'perp-expected-import-crash-'))
+    const environment: NodeJS.ProcessEnv = { ...process.env, PERPETUAL_SWAP_OPERATION_DIR: operations, PERPETUAL_SWAP_IMPORT_CRASH_FIXTURE: '1' }
+    delete environment.PERPETUAL_SWAP_OPERATION_PARTICIPANT
+    delete environment.NODE_TEST_CONTEXT
+    try {
+      const result = spawnSync(process.execPath, ['--import', fileURLToPath(new URL('../scripts/sandbox-register.mjs', import.meta.url)),
+        '--experimental-strip-types', '--test', '--test-name-pattern=^an importer crash', fileURLToPath(import.meta.url)], { env: environment, encoding: 'utf8' })
+      assert.equal(result.status, 0, result.stdout + result.stderr)
+      assert.ok(result.stdout.includes('an importer crash rejects pending legacy reads'), result.stdout)
+      const moduleURL = new URL('../scripts/operation-report.mjs', import.meta.url).href
+      const { summarizeOperations } = await import(moduleURL)
+      const report = await summarizeOperations(operations)
+      assert.ok(report.diagnostics.unclaimedParticipants + report.diagnostics.unclosedExecutions + report.diagnostics.unclosedOperations > 0,
+        'SIGKILL must leave explicit evidence of an unclaimed or interrupted recorder.')
+    } finally { await rm(operations, { recursive: true, force: true }) }
+    return
+  }
   const root = await mkdtemp(join(tmpdir(), 'perp-import-crash-'))
   let store: MarketStore | undefined
   try {

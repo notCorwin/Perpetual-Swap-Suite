@@ -35,7 +35,7 @@ test('recording accepts diagnostic scalars and excludes arbitrary payloads', t =
   assert.equal(measureOperation({ category: 'cpu', name: 'test.safe' }, () => 42), 42)
 })
 
-test('a bulk database operation counts statements and rows without recording bound values', t => {
+test('a bulk database operation separates API calls from execution batches without recording bound values', t => {
   const events: OperationEvent[] = [], unsubscribe = attachOperationSink(event => events.push(event))
   t.after(unsubscribe)
   const database = openRecordedDatabase(DatabaseSync, ':memory:', {}, 'fixture')
@@ -52,8 +52,52 @@ test('a bulk database operation counts statements and rows without recording bou
   })
   assert.equal(events.length, 1)
   assert.equal(events[0].name, 'market.append')
-  assert.deepEqual(events[0].attributes, { queryCount: 6, rows: 2, changes: 2 })
+  assert.deepEqual(events[0].attributes, { calls: 6, queryCount: 5, rows: 2, changes: 2 })
   assert.equal(JSON.stringify(events).includes('credential'), false)
   assert.throws(() => databaseOperation('market.failed', () => database.exec('SELECT missing FROM data')))
   assert.equal(events.at(-1)?.status, 'error')
+})
+
+test('database counters exclude metadata rows and count multi-statement exec as one execution batch', t => {
+  const events: OperationEvent[] = [], unsubscribe = attachOperationSink(event => events.push(event))
+  t.after(unsubscribe)
+  const database = openRecordedDatabase(DatabaseSync, ':memory:', {}, 'fixture')
+  t.after(() => database.close())
+  assert.deepEqual(events[0].attributes, { role: 'fixture', calls: 1, queryCount: 0, rows: 0, changes: 0 })
+  database.exec('CREATE TABLE data (value INTEGER); INSERT INTO data VALUES (1), (2)')
+  assert.equal(events.at(-1)?.attributes?.queryCount, 1)
+  events.length = 0
+  databaseOperation('market.inspect', () => {
+    const statement = database.prepare('SELECT value, 99 AS changes FROM data ORDER BY value')
+    assert.equal(statement.columns().length, 2)
+    assert.equal(statement.get().changes, 99)
+    for (const row of statement.iterate()) { assert.equal(row.value, 1); break }
+    database.exec('UPDATE data SET value = value + 1; UPDATE data SET value = value - 1')
+  })
+  assert.equal(events.length, 1)
+  assert.deepEqual(events[0].attributes, { calls: 5, queryCount: 3, rows: 2, changes: 0 })
+})
+
+test('grouped iterators count consumed rows and record escaped consumption without changing completed groups', t => {
+  const events: OperationEvent[] = [], unsubscribe = attachOperationSink(event => events.push(event))
+  t.after(unsubscribe)
+  const database = openRecordedDatabase(DatabaseSync, ':memory:', {}, 'fixture')
+  t.after(() => database.close())
+  database.exec('CREATE TABLE data (value INTEGER); INSERT INTO data VALUES (1), (2)')
+  const statement = database.prepare('SELECT value FROM data ORDER BY value')
+  events.length = 0
+  let iterator!: Iterator<{ value: number }>
+  databaseOperation('market.partial', () => {
+    iterator = statement.iterate()
+    assert.equal(iterator.next().value.value, 1)
+  })
+  const group = events[0]
+  assert.equal(events.length, 1)
+  assert.deepEqual(group.attributes, { calls: 1, queryCount: 1, rows: 1, changes: 0 })
+  assert.equal(iterator.next().value.value, 2)
+  assert.equal(events.length, 1, 'The escaped iterator remains lazy until completion.')
+  assert.equal(iterator.next().done, true)
+  assert.equal(events.length, 2)
+  assert.deepEqual(group.attributes, { calls: 1, queryCount: 1, rows: 1, changes: 0 })
+  assert.deepEqual(events[1].attributes, { role: 'fixture', measurement: 'iterator-consumption', calls: 0, queryCount: 0, rows: 1, changes: 0 })
 })

@@ -3,6 +3,17 @@ import type { PreparedChartResponse } from './chart-data.ts'
 import type { NativeMarketRow } from './market-row.ts'
 import type { Preferences, PreferencesPatch } from '../electron/services/preferences.js'
 import type { RadarTimeframe } from './timeframe.ts'
+import type { OperationContext, OperationJournalEvent } from '../electron/services/operations.js'
+
+export type OperationSourceIdentity = { sessionId: string; executionId: string; scenarioId?: string }
+export type OperationBatch = { executionId: string; batchId: string; firstSequence: number; events: OperationJournalEvent[] }
+export type OperationAcknowledgment = { batchId: string; lastSequence: number }
+export type OperationBridgeHooks = {
+  beginRequest(command: string): { id: string; context: OperationContext }
+  endRequest(id: string, status: 'ok' | 'error'): void
+  receive(channel: string, detail: unknown, context?: OperationContext): void
+  flush(): Promise<void>
+}
 
 export type ChartCaptureBounds = { x: number; y: number; width: number; height: number; backgroundRGB: number[] }
 export type ChartImage = { imageDataURL: string; width: number; height: number }
@@ -54,7 +65,9 @@ export type DesktopRequest = { [K in keyof DesktopCommands]: { [P in K]: Desktop
 export type DesktopResponse<Request extends DesktopRequest> = Request extends { captureChart: { output: 'png' } }
   ? ChartImage : { [K in keyof DesktopCommands]: Request extends Record<K, unknown> ? DesktopCommands[K]['output'] : never }[keyof DesktopCommands]
 export interface RadarDesktop {
-  recordOperations(events: import('../electron/services/operations.js').OperationEvent[]): void
+  initializeOperations(hooks: OperationBridgeHooks): Promise<OperationSourceIdentity>
+  recordOperations(batch: OperationBatch): Promise<OperationAcknowledgment>
+  operationSourceFailure(value: { executionId: string; reason: string; omitted: number }): Promise<void>
   request(value: { preferences: DesktopCommands['preferences']['input'] }): Promise<DesktopCommands['preferences']['output']>
   request(value: { snapshot: DesktopCommands['snapshot']['input'] }): Promise<DesktopCommands['snapshot']['output']>
   request(value: { dataAudit: DesktopCommands['dataAudit']['input'] }): Promise<DesktopCommands['dataAudit']['output']>

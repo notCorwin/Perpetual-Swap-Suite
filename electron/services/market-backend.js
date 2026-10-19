@@ -1,4 +1,4 @@
-import { Worker } from 'node:worker_threads'
+import { createOperationWorker, createWorkerRequest } from './worker-operations.js'
 import { EventEmitter } from 'node:events'
 
 /** Electron owns windows; this worker owns market coordination and metadata. */
@@ -10,7 +10,7 @@ export class MarketBackend extends EventEmitter {
     this.closed = false
     this.ready = new Promise((resolve, reject) => { this.resolveReady = resolve; this.rejectReady = reject })
     this.ready.catch(() => {})
-    this.worker = new Worker(new URL('./market-backend-worker.js', import.meta.url), { workerData: options })
+    this.worker = createOperationWorker(new URL('./market-backend-worker.js', import.meta.url), { workerData: options }, 'market-backend')
     this.worker.on('message', message => {
       if (message.type === 'ready') { this.resolveReady(); return }
       if (message.type === 'event') { this.emit(message.name, message.value); return }
@@ -35,15 +35,17 @@ export class MarketBackend extends EventEmitter {
     this.emit('failure', error)
   }
 
-  async call(method, value) {
-    await this.ready
-    if (this.failure) throw this.failure
-    if (this.closed) throw new Error('Market backend is closed.')
+  call(method, value) {
     const id = ++this.sequence
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
-      try { this.worker.postMessage({ id, method, value }) }
-      catch (error) { this.pending.delete(id); reject(error) }
+      const request = createWorkerRequest('market-backend', method, resolve, reject)
+      void this.ready.then(() => {
+        if (this.failure) throw this.failure
+        if (this.closed) throw new Error('Market backend is closed.')
+        this.pending.set(id, request)
+        try { request.dispatch(this.worker, { id, method, value }) }
+        catch (error) { this.pending.delete(id); request.reject(error) }
+      }).catch(request.reject)
     })
   }
 

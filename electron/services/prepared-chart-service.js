@@ -1,8 +1,8 @@
-import { Worker } from 'node:worker_threads'
+import { createOperationWorker, createWorkerRequest } from './worker-operations.js'
 import { availableParallelism } from 'node:os'
 import { statisticsMask, statisticsVersionFor } from './statistics-state.js'
 import { appendIndicatorCandle, projectIndicatorCandle } from './indicators.js'
-import { measureOperation } from './operations.js'
+import { hookOperationMethods, measureOperation } from './operations.js'
 import { stopOperationWorker } from './operation-worker.js'
 
 const VISIBLE = 96, TAIL = 128, CHUNK = 1024, HISTORY = 1536, HISTORY_AHEAD = 256, HISTORY_PAGE = 300
@@ -729,14 +729,15 @@ export class PreparedChartPipeline {
     if (this.closed) return Promise.reject(new Error('Prepared chart data service is closed.'))
     const id = ++this.nextCalculation
     return new Promise((resolve, reject) => {
-      this.calculations.set(id, { id, candles, intervalMS, checkpoint, priority, resolve, reject })
+      const operation = createWorkerRequest('prepared-chart', 'calculate', resolve, reject, { priority, inputRows: candles.length })
+      this.calculations.set(id, { id, candles, intervalMS, checkpoint, priority, ...operation })
       this.calculationQueue.push(id); this.drainCalculations()
     })
   }
   drainCalculations() {
     if (this.closed) return
     while (this.workers.length < this.workerLimit && this.workers.length < this.calculationQueue.length + this.workers.filter(slot => slot.busy !== null).length) {
-      const slot = { worker: new Worker(new URL('./prepared-chart-worker.js', import.meta.url)), busy: null }
+      const slot = { worker: createOperationWorker(new URL('./prepared-chart-worker.js', import.meta.url), {}, 'prepared-chart'), busy: null }
       slot.worker.unref()
       slot.worker.on('message', ({ id, bars, state, error }) => {
         const pending = this.calculations.get(id)
@@ -745,11 +746,14 @@ export class PreparedChartPipeline {
         if (error) pending.reject(new Error(error)); else pending.resolve({ bars, state })
         this.drainCalculations()
       })
-      slot.worker.on('error', error => {
+      const failed = error => {
+        if (!this.workers.includes(slot)) return
         const pending = this.calculations.get(slot.busy)
         if (pending) { this.calculations.delete(slot.busy); pending.reject(error) }
         this.workers = this.workers.filter(value => value !== slot); this.drainCalculations()
-      })
+      }
+      slot.worker.on('error', failed)
+      slot.worker.on('exit', code => failed(new Error(`Prepared chart worker exited (${code}).`)))
       this.workers.push(slot)
       slot.worker.unref()
     }
@@ -758,7 +762,11 @@ export class PreparedChartPipeline {
       const index = this.calculationQueue.findIndex(id => this.calculations.get(id)?.priority === 'foreground')
       const [id] = this.calculationQueue.splice(index < 0 ? 0 : index, 1), pending = this.calculations.get(id)
       slot.busy = id; slot.worker.ref()
-      slot.worker.postMessage({ id, candles: pending.candles, intervalMS: pending.intervalMS, checkpoint: pending.checkpoint })
+      try { pending.dispatch(slot.worker, { id, candles: pending.candles, intervalMS: pending.intervalMS, checkpoint: pending.checkpoint }) }
+      catch (error) {
+        this.calculations.delete(id); slot.busy = null; slot.worker.unref(); pending.reject(error)
+        queueMicrotask(() => this.drainCalculations())
+      }
     }
   }
 
@@ -779,3 +787,10 @@ export class PreparedChartPipeline {
     return this.disposeTask
   }
 }
+
+hookOperationMethods(PreparedChartPipeline.prototype, {
+  frame: state => ({ category: 'cpu', name: 'chart.frame', resource: state.instId,
+    attributes: { inputRows: state.rows.size, intervalMS: state.intervalMS, generation: state.generation } }),
+  reconcileCanonical: (state, rows) => ({ category: 'cpu', name: 'chart.reconcile', resource: state.instId,
+    attributes: { inputRows: rows.length, intervalMS: state.intervalMS } }),
+})

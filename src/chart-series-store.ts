@@ -1,3 +1,4 @@
+import { hookOperationMethods } from '../electron/services/operations.js'
 import type { Bar, PreparedChartBar, PreparedChartLiveUpdate, PreparedChartMeta, PreparedChartResponse, ReadyChartWindow } from './chart-data.ts'
 import { RADAR_TIMEFRAMES, timeframeMilliseconds, type RadarTimeframe } from './timeframe.ts'
 
@@ -435,3 +436,9 @@ export class PreparedChartStore {
     return entry.boundaries
   }
 }
+
+hookOperationMethods(PreparedChartStore.prototype, {
+  ingest: (response: PreparedChartResponse) => ({ category: 'cpu', name: 'chart.series.ingest', resource: response.instId,
+    attributes: { inputRows: response.bars?.length ?? 0 } }),
+  ingestLive: (response: PreparedChartLiveUpdate) => ({ category: 'cpu', name: 'chart.series.live', resource: response.instId }),
+})

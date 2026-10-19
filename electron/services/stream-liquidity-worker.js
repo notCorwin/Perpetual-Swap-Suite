@@ -1,17 +1,15 @@
 import { parentPort } from 'node:worker_threads'
 import { createLiquidityEvaluator } from './liquidity.js'
-import { closeOperationRecording } from './operation-runtime.js'
+import { onOperationMessage } from './worker-operations.js'
 import { measureOperation } from './operations.js'
 
 const evaluate = createLiquidityEvaluator()
 const books = new Map()
 const MAX_BOOK_SNAPSHOTS = 512
 
-parentPort.on('message', async ({ type, id, input }) => {
+onOperationMessage(parentPort, 'stream-liquidity', ({ type, id, input }) => {
   if (type === 'closeOperations') {
-    try { await closeOperationRecording(); parentPort.postMessage({ type: 'operationsClosed' }) }
-    catch { parentPort.postMessage({ type: 'operationsClosed', error: true }) }
-    return
+    return { type: 'operationsClosed' }
   }
   try {
     const instId = input?.instrument?.instId
@@ -27,8 +25,8 @@ parentPort.on('message', async ({ type, id, input }) => {
       if (books.size > MAX_BOOK_SNAPSHOTS) books.delete(books.keys().next().value)
       input = { ...input, book: snapshot.book }
     }
-    parentPort.postMessage({ id, result: evaluate(input) })
+    return { id, result: evaluate(input) }
   } catch (error) {
-    parentPort.postMessage({ id, error: error instanceof Error ? error.message : String(error) })
+    return { id, error: error instanceof Error ? error.message : String(error) }
   }
-})
+}, { closeWhen: message => message.type === 'closeOperations' })

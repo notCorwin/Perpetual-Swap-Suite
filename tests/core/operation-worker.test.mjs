@@ -11,12 +11,15 @@ import { PreparedChartPipeline } from '../../electron/services/prepared-chart-se
 
 test('worker shutdown persists its final calculation before acknowledging and terminating', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'perp-operation-worker-'))
+  const environment = { ...process.env, PERPETUAL_SWAP_OPERATION_DIR: directory, PERPETUAL_SWAP_OPERATION_ROLE: 'prepared-chart' }
+  delete environment.PERPETUAL_SWAP_OPERATION_PARTICIPANT
   const worker = new Worker(new URL('../../electron/services/prepared-chart-worker.js', import.meta.url), {
-    env: { ...process.env, PERPETUAL_SWAP_OPERATION_DIR: directory },
+    env: environment,
   })
   try {
     const response = new Promise((resolve, reject) => { worker.once('message', resolve); worker.once('error', reject) })
-    worker.postMessage({ id: 1, intervalMS: 300_000,
+    worker.postMessage({ id: 1, intervalMS: 300_000, operationContext: { traceId: 'fixture-trace', parentId: 'fixture-admission' },
+      operationDispatchedAt: performance.timeOrigin + performance.now(),
       candles: Array.from({ length: 220 }, (_, index) => ({ timestamp: index * 300_000, open: 100, close: 100, high: 101, low: 99, baseVolume: 1, confirmed: true })) })
     const result = await response
     assert.equal(result.bars.length, 220)
@@ -26,11 +29,17 @@ test('worker shutdown persists its final calculation before acknowledging and te
     assert.equal(health.closed, true)
     assert.equal(health.failed, 0)
     assert.equal(health.pending, 0)
-    assert.equal(health.recorded, 1)
-    assert.equal(health.persisted, 1)
+    assert.ok(health.recorded >= 6)
+    assert.equal(health.persisted, health.recorded)
     const events = (await readFile(join(directory, files.find(file => file.endsWith('.jsonl'))), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
-    assert.equal(events[0].name, 'indicators.replay')
-    assert.equal(events[0].attributes.candles, 220)
+    const replay = events.find(event => event.name === 'indicators.replay' && event.phase === 'end')
+    assert.equal(replay.attributes.candles, 220)
+    assert.equal(replay.schemaVersion, 2)
+    assert.equal(replay.traceId, 'fixture-trace')
+    assert.ok(replay.parentId)
+    assert.equal(events.filter(event => event.phase === 'start').length, events.filter(event => event.phase === 'end').length)
+    assert.ok(events.some(event => event.name === 'worker.execute' && event.phase === 'end'))
+    assert.ok(events.some(event => event.name === 'worker.transport.queue' && event.phase === 'end' && event.durationMS >= 0))
   } finally { await worker.terminate(); await rm(directory, { recursive: true, force: true }) }
 })
 

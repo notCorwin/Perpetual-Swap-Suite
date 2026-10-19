@@ -178,7 +178,10 @@ for (const connection of ['connected', 'disconnected'] as const) test(`a failed 
     f.socket.candle(candle(f.asOf, 400_000))
     await writing.promise
     context.mock.timers.tick(10_000)
-    assert.equal([...f.service.candleWaits.values()][0]?.deadline, Infinity)
+    // Recovery checks run after stream microtasks. Observe that phase before
+    // asserting the accepted write still owns recovery across the deadline.
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(f.service.realtime.getProgress(instId, '5m').pendingConfirmations, 1)
     if (connection === 'disconnected') {
       f.socket.close()
       await settle(() => !f.service.realtime.isSubscribed(instId, '5m'))

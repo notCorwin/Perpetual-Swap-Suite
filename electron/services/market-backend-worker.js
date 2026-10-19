@@ -1,4 +1,4 @@
-import { closeOperationRecording } from './operation-runtime.js'
+import { onOperationMessage, runWorkerInitialization } from './worker-operations.js'
 import { parentPort, workerData, threadId } from 'node:worker_threads'
 import { join } from 'node:path'
 import { MetadataStore } from './metadata-store.js'
@@ -20,7 +20,7 @@ const offline = async (_input, { signal } = {}) => {
   })
   return new Response(JSON.stringify({ code: '0', data: [] }))
 }
-const initialize = (async () => {
+const initialize = runWorkerInitialization('market-backend', async () => {
   metadata = await MetadataStore.open(workerData.userData, { legacySettingsPath: join(workerData.userData, 'settings.json') })
   preferences = metadata.getSettings().preferences
   store = await MarketStore.open(join(workerData.userData, 'MarketData'))
@@ -33,7 +33,7 @@ const initialize = (async () => {
   service.subscribeHistoryDownload(report => emit('history-download', report))
   if (workerData.e2eLiveRefresh) void service.refresh().catch(error => console.error(error))
   parentPort.postMessage({ type: 'ready' })
-})()
+})
 
 async function request(value) {
   if (value.preferences) {
@@ -148,7 +148,7 @@ async function probe(input) {
   throw new Error('Unsupported backend probe.')
 }
 
-parentPort.on('message', async ({ id, method, value }) => {
+onOperationMessage(parentPort, 'market-backend', async ({ id, method, value }) => {
   try {
     await initialize
     let result
@@ -160,10 +160,9 @@ parentPort.on('message', async ({ id, method, value }) => {
       await service.dispose()
       await store.close()
       metadata.close()
-      await closeOperationRecording()
       result = { ok: true }
     } else throw new Error('Unsupported backend operation.')
-    parentPort.postMessage({ id, value: result })
-  } catch (error) { parentPort.postMessage({ id, error: { message: error.message, code: error.code } }) }
-})
+    return { id, value: result }
+  } catch (error) { return { id, error: { message: error.message, code: error.code } } }
+}, { closeWhen: message => message.method === 'dispose' })
 initialize.catch(error => parentPort.postMessage({ type: 'fatal', error: error.message }))

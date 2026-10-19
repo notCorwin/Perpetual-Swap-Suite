@@ -1,0 +1,282 @@
+import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import test from 'node:test'
+
+const hooksURL = new URL('../../electron/services/operation-hooks.js', import.meta.url).href
+const operationsURL = new URL('../../electron/services/operations.js', import.meta.url).href
+const databaseURL = new URL('../../electron/services/recorded-database.js', import.meta.url).href
+const networkURL = new URL('../../electron/services/network-operations.js', import.meta.url).href
+
+async function execute(source) {
+  const prefix = `
+    import assert from 'node:assert/strict';
+    import { AsyncLocalStorage } from 'node:async_hooks';
+    import { installOperationHooks } from ${JSON.stringify(hooksURL)};
+    import { attachOperationSink, attachOperationJournalSink, configureOperationContext, configureOperationPropagation, withOperationSuppressed, measureOperation } from ${JSON.stringify(operationsURL)};
+    const context = new AsyncLocalStorage();
+    configureOperationPropagation({ get: () => context.getStore(), run: (value, operation) => context.run(value, operation) });
+    configureOperationContext({ executionId: 'automatic-hooks', sessionId: 'fixture' }, () => { const value = process.threadCpuUsage(); return (value.user + value.system) / 1000; });
+    const events = [];
+    const journal = [];
+    const unsubscribe = attachOperationSink(event => events.push(event));
+    attachOperationJournalSink(event => journal.push(event));
+    const enabled = installOperationHooks();
+    assert.deepEqual(installOperationHooks(), enabled, 'Installation is idempotent.');
+  `
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', `${prefix}\n${source}`], {
+      env: { ...process.env, PERPETUAL_SWAP_OPERATION_DIR: '', PERPETUAL_SWAP_SANDBOX: '1', PERPETUAL_SWAP_ALLOW_NETWORK: '0' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = '', stderr = ''
+    child.stdout.on('data', chunk => { stdout += chunk })
+    child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-24_000) })
+    child.once('error', reject)
+    child.once('close', code => {
+      if (code !== 0) { reject(new Error(`Automatic hook fixture failed (${code}): ${stderr}`)); return }
+      try { resolve(JSON.parse(stdout)) } catch (error) { reject(new Error(`${error.message}: ${stdout}\n${stderr}`)) }
+    })
+  })
+}
+
+test('automatic hooks observe builtin I/O, native computation and raw SQLite without application adapters', async () => {
+  const result = await execute(`
+    import fs, { readFile as namedReadFile } from 'node:fs';
+    import fsp from 'node:fs/promises';
+    import crypto, { pbkdf2Sync, scrypt } from 'node:crypto';
+    import { gzipSync, createGzip } from 'node:zlib';
+    import sqlite, { DatabaseSync } from 'node:sqlite';
+    import { promisify } from 'node:util';
+    import { once } from 'node:events';
+    import { tmpdir } from 'node:os';
+    import { join } from 'node:path';
+    import { databaseOperation, openRecordedDatabase } from ${JSON.stringify(databaseURL)};
+    const directory = await fsp.mkdtemp(join(tmpdir(), 'perp-auto-hooks-'));
+    const file = join(directory, 'private-name.txt');
+    try {
+      fs.writeFileSync(file, 'sensitive-payload');
+      assert.equal(fs.readFileSync(file, 'utf8'), 'sensitive-payload');
+      await new Promise((resolve, reject) => namedReadFile(file, (error, value) => {
+        if (error) { reject(error); return; }
+        assert.equal(value.toString(), 'sensitive-payload');
+        fs.statSync(file); // Application callbacks must escape internal I/O suppression.
+        resolve();
+      }));
+      assert.equal(await fsp.readFile(file, 'utf8'), 'sensitive-payload');
+      const handle = await fsp.open(file, 'r');
+      assert.equal((await handle.readFile()).toString(), 'sensitive-payload');
+      await handle.close();
+      let streamed = '';
+      for await (const chunk of fs.createReadStream(file)) streamed += chunk;
+      assert.equal(streamed, 'sensitive-payload');
+      const before = events.length;
+      await withOperationSuppressed(async () => { await fsp.readFile(file); fs.statSync(file); });
+      assert.equal(events.length, before, 'Recorder suppression includes asynchronous filesystem work.');
+      pbkdf2Sync('private-password', 'private-salt', 100, 32, 'sha256');
+      await promisify(scrypt)('private-password', 'private-salt', 16);
+      assert.equal(crypto.createHash('sha256').update('sensitive-payload').digest().length, 32);
+      const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+      const input = Buffer.from('sensitive-payload');
+      const signature = crypto.sign(null, input, privateKey);
+      assert.equal(crypto.verify(null, input, publicKey, signature), true);
+      assert.deepEqual(await promisify(crypto.sign)(null, input, privateKey), signature);
+      assert.equal(await promisify(crypto.verify)(null, input, publicKey, signature), true);
+      assert.throws(() => crypto.sign(null, input, () => {}));
+      assert.throws(() => crypto.verify(null, input, publicKey, () => {}));
+      for (const entry of journal.filter(event => ['crypto.sign', 'crypto.verify'].includes(event.name) && event.phase === 'start')) {
+        assert.ok(journal.some(event => event.id === entry.id && event.phase === 'end'), 'Invalid function-valued key/signature arguments do not masquerade as callbacks.');
+      }
+      assert.ok(gzipSync('sensitive-payload').length > 0);
+      const gzip = createGzip(); gzip.resume(); gzip.end('sensitive-payload'); await once(gzip, 'end');
+      const raw = new DatabaseSync(':memory:');
+      raw.exec('CREATE TABLE secrets (value TEXT); INSERT INTO secrets VALUES ("private-record")'.replaceAll('"', "'"));
+      assert.equal(raw.prepare('SELECT value FROM secrets').get().value, 'private-record');
+      assert.deepEqual([...raw.prepare('SELECT value FROM secrets').iterate()].map(row => row.value), ['private-record']);
+      databaseOperation('fixture.native.group', () => {
+        const statement = raw.prepare('SELECT value FROM secrets');
+        assert.equal(statement.columns().length, 1);
+        assert.equal([...statement.iterate()].length, 1);
+      });
+      assert.deepEqual(events.find(event => event.name === 'fixture.native.group').attributes, { calls: 3, queryCount: 1, rows: 1, changes: 0 });
+      raw.close();
+      const explicit = openRecordedDatabase(sqlite.DatabaseSync, ':memory:', {}, 'metadata');
+      assert.equal(explicit.prepare('SELECT 42 AS value').get().value, 42);
+      const tags = explicit.createTagStore();
+      assert.equal(tags.get\`SELECT 43 AS value\`.value, 43);
+      const session = explicit.createSession(); session.changeset(); session.close();
+      await sqlite.backup(explicit, join(directory, 'copy.sqlite'));
+      explicit.close();
+      const descriptor = fs.openSync(file, 'r+');
+      assert.equal(fs.writeSync(descriptor, Buffer.from('ab'), 0, 2, 0), 2);
+      assert.equal(fs.readSync(descriptor, Buffer.alloc(2), 0, 2, 0), 2);
+      const readResult = await promisify(fs.read)(descriptor, Buffer.alloc(3), 0, 3, 0);
+      assert.equal(readResult.bytesRead, 3);
+      await promisify(fs.write)(descriptor, Buffer.from('c'), 0, 1, 0);
+      fs.closeSync(descriptor);
+      assert.equal(events.find(event => event.name === 'fs.writeSync').attributes.bytes, 2);
+      assert.equal(events.find(event => event.name === 'fs.readSync').attributes.bytes, 2);
+      assert.ok(events.some(event => event.name === 'fs.read' && event.attributes.bytes === 3));
+      assert.equal(events.find(event => event.name === 'fs.write').attributes.bytes, 1);
+      assert.throws(() => fs.readFileSync(join(directory, 'missing.txt')));
+      const io = events.filter(event => event.category === 'io');
+      assert.equal(io.filter(event => event.name === 'fs.readFile').length, 1);
+      assert.equal(io.filter(event => event.name === 'fs.statSync').length, 1);
+      assert.ok(events.find(event => event.name === 'crypto.pbkdf2Sync').cpuTimeMS >= 0);
+      assert.equal(events.find(event => event.name === 'crypto.scrypt').cpuTimeMS, undefined);
+      assert.ok(events.find(event => event.name === 'sqlite.get').cpuTimeMS >= 0);
+      assert.equal(events.filter(event => event.name === 'sqlite.open').length, 1, 'Centralized/default SQLite opens are not counted twice.');
+      for (const name of ['sqlite.open', 'sqlite.prepare', 'sqlite.close', 'sqlite.session.close', 'sqlite.backup']) {
+        const event = events.find(event => event.name === name);
+        assert.equal(event.attributes.calls, 1, name);
+        assert.equal(event.attributes.queryCount, 0, name);
+        assert.equal(event.attributes.rows, 0, name);
+      }
+      for (const name of ['sqlite.exec', 'sqlite.get', 'sqlite.iterate']) {
+        const event = events.find(event => event.name === name);
+        assert.equal(event.attributes.calls, 1, name);
+        assert.equal(event.attributes.queryCount, 1, name);
+      }
+      assert.doesNotMatch(JSON.stringify(events), /private-password|private-salt|sensitive-payload|private-record|private-name/);
+    } finally { await fsp.rm(directory, { recursive: true, force: true }); }
+    unsubscribe();
+    console.log(JSON.stringify({ names: [...new Set(events.map(event => event.name))], errors: events.filter(event => event.status === 'error').length, enabled }));
+  `)
+  for (const name of ['fs.readFileSync', 'fs.readFile', 'fs.promises.readFile', 'fs.handle.readFile', 'fs.createReadStream', 'crypto.pbkdf2Sync', 'crypto.scrypt', 'crypto.hash.update', 'crypto.hash.digest', 'zlib.gzipSync', 'zlib.createGzip', 'sqlite.get', 'sqlite.iterate']) assert.ok(result.names.includes(name), name)
+  assert.equal(result.errors, 3)
+})
+
+test('HTTP hooks preserve lazy body consumption, cancellation, callback contexts and one physical request per layer', async () => {
+  const result = await execute(`
+    import http, { get as namedGet } from 'node:http';
+    import https from 'node:https';
+    import net from 'node:net';
+    import tls from 'node:tls';
+    let release;
+    const server = http.createServer((request, response) => {
+      if (request.url.startsWith('/held')) { response.writeHead(200, { 'Content-Type': 'application/json' }); response.write('{"answer":'); release = () => response.end('42}'); }
+      else if (request.url === '/cancel') { response.write('first'); const timeout = setTimeout(() => response.end('last'), 100); response.on('close', () => clearTimeout(timeout)); }
+      else if (request.url === '/post') { let bytes = 0; request.on('data', chunk => bytes += chunk.length); request.on('end', () => response.end(String(bytes))); }
+      else response.end('sensitive-payload');
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const origin = 'http://127.0.0.1:' + server.address().port;
+    try {
+      const held = await fetch(origin + '/held?credential=private');
+      assert.equal(held.bodyUsed, false);
+      assert.equal(events.filter(event => event.name === 'fetch.request').length, 0, 'Headers do not finish the body operation.');
+      const body = held.json(); release(); assert.deepEqual(await body, { answer: 42 });
+      assert.equal(events.find(event => event.name === 'fetch.request').attributes.receivedBytes, 13);
+      const cloned = await fetch(origin + '/clone'); const clone = cloned.clone();
+      assert.equal(await clone.text(), 'sensitive-payload'); assert.equal(await cloned.text(), 'sensitive-payload');
+      const bytes = await fetch(origin + '/bytes'); assert.equal((await bytes.arrayBuffer()).byteLength, 17);
+      const streamed = await fetch(origin + '/stream'); let size = 0;
+      for await (const chunk of streamed.body) size += chunk.byteLength;
+      assert.equal(size, 17);
+      const resumed = await fetch(origin + '/resume'); const iterator = resumed.body.values({ preventCancel: true });
+      await iterator.next(); await iterator.return();
+      const reader = resumed.body.getReader(); while (!(await reader.read()).done) {};
+      const cancelled = await fetch(origin + '/cancel'); const cancelledReader = cancelled.body.getReader();
+      await cancelledReader.read(); await cancelledReader.cancel();
+      await new Promise((resolve, reject) => namedGet(origin + '/native', response => {
+        response.resume(); response.once('end', () => {
+          fetch(origin + '/nested').then(value => value.text()).then(resolve, reject);
+        });
+      }).on('error', reject));
+      await new Promise((resolve, reject) => {
+        const request = http.request(new URL(origin + '/post'), { method: 'POST' }, response => {
+          let text = ''; response.on('data', value => text += value); response.once('end', () => { assert.equal(text, '5'); resolve(); });
+        });
+        let calls = 0; const listener = () => calls++;
+        for (let index = 0; index < 2; index++) {
+          request.once('fixture', listener); assert.equal(request.listeners('fixture')[0], listener);
+          request.emit('fixture'); assert.equal(request.listenerCount('fixture'), 0);
+        }
+        request.on('fixture', listener); request.off('fixture', listener); assert.equal(request.listenerCount('fixture'), 0);
+        request.on('fixture', listener); request.removeAllListeners('fixture'); assert.equal(request.listenerCount('fixture'), 0);
+        request.emit('fixture'); assert.equal(calls, 2);
+        request.once('error', reject); request.write('abc'); request.end('de');
+      });
+      const post = events.find(event => event.name === 'node.http.request' && event.resource.endsWith('/post'));
+      assert.equal(post.attributes.sentBytes, 5); assert.equal(post.attributes.receivedBytes, 1); assert.equal(post.attributes.method, 'POST');
+      const blocked = error => error.code === 'SANDBOX_NETWORK_BLOCKED';
+      await assert.rejects(fetch('https://no-outbound.invalid/?key=private'), blocked);
+      assert.throws(() => http.get('http://no-outbound.invalid/'), blocked);
+      assert.throws(() => https.request('https://no-outbound.invalid/'), blocked);
+      assert.throws(() => net.connect(443, 'no-outbound.invalid'), blocked);
+      assert.throws(() => tls.connect(443, { host: 'no-outbound.invalid' }), blocked);
+      assert.throws(() => new WebSocket('wss://no-outbound.invalid/'), blocked);
+      const successful = events.filter(event => event.name === 'fetch.request' && event.status === 'ok');
+      assert.equal(successful.length, 6);
+      assert.equal(events.filter(event => event.name === 'fetch.request' && event.status === 'cancelled').length, 1);
+      assert.equal(events.filter(event => event.name === 'node.http.request' && event.status === 'ok').length, 2);
+      assert.equal(events.filter(event => event.name === 'socket.connect' && event.status === 'ok').length, 0, 'HTTP/fetch connections do not create duplicate TCP operations.');
+      assert.doesNotMatch(JSON.stringify(events), /credential|sensitive-payload|key=private/);
+    } finally { release?.(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+    unsubscribe(); console.log(JSON.stringify({ network: events.filter(event => event.category === 'network').map(event => ({ name: event.name, status: event.status })) }));
+  `)
+  assert.ok(result.network.length >= 14)
+})
+
+test('raw TCP and native WebSocket hooks retain receivers and injected adapter deduplication', async () => {
+  const result = await execute(`
+    import http from 'node:http';
+    import net from 'node:net';
+    import { createHash } from 'node:crypto';
+    import { recordedWebSocketFactory } from ${JSON.stringify(networkURL)};
+    const server = http.createServer((_request, response) => response.end('ok'));
+    server.on('upgrade', (request, socket) => {
+      const accept = createHash('sha1').update(request.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+      socket.write('HTTP/1.1 101 Switching Protocols\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\nSec-WebSocket-Accept: ' + accept + '\\r\\n\\r\\n');
+      let pending = Buffer.alloc(0);
+      socket.on('data', chunk => {
+        pending = Buffer.concat([pending, chunk]);
+        while (pending.length >= 2) {
+          const length = pending[1] & 127, offset = 2 + (pending[1] & 128 ? 4 : 0);
+          if (length >= 126 || pending.length < offset + length) return;
+          const opcode = pending[0] & 15;
+          pending = pending.subarray(offset + length);
+          if (opcode === 8) socket.end(Buffer.from([136, 2, 3, 232]));
+          else if (opcode === 1) socket.write(Buffer.from([129, 2, 111, 107]));
+        }
+      });
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const origin = 'http://127.0.0.1:' + server.address().port;
+    try {
+      await new Promise((resolve, reject) => {
+        const socket = recordedWebSocketFactory(url => new WebSocket(url), 'fixture')(origin.replace('http:', 'ws:') + '/socket?credential=private');
+        assert.ok(socket instanceof WebSocket);
+        let fixtures = 0; const fixture = () => fixtures++;
+        for (let index = 0; index < 2; index++) { socket.addEventListener('fixture', fixture, { once: true }); socket.dispatchEvent(new Event('fixture')); }
+        socket.addEventListener('fixture', fixture); socket.removeEventListener('fixture', fixture); socket.dispatchEvent(new Event('fixture')); assert.equal(fixtures, 2);
+        socket.addEventListener('open', () => socket.send('sensitive-payload'));
+        const message = event => {
+          assert.equal(event.data, 'ok');
+          fetch(origin + '/after-message').then(response => response.text()).then(() => socket.close(), reject);
+        };
+        socket.onmessage = message; assert.equal(socket.onmessage, message);
+        socket.addEventListener('close', resolve, { once: true });
+        socket.addEventListener('error', reject, { once: true });
+      });
+      assert.equal(events.filter(event => event.name === 'websocket.connect').length, 1);
+      assert.equal(events.filter(event => event.name === 'websocket.send').length, 1);
+      assert.equal(events.filter(event => event.name === 'websocket.receive').length, 1);
+      assert.equal(events.filter(event => event.name === 'fetch.request').length, 1, 'WebSocket callbacks restore application hook context.');
+      const tcp = net.createServer(socket => { socket.on('data', () => {}); socket.end('fixture'); });
+      await new Promise(resolve => tcp.listen(0, '127.0.0.1', resolve));
+      await new Promise((resolve, reject) => {
+        const socket = net.connect(tcp.address().port, '127.0.0.1', () => socket.write('sensitive-payload'));
+        socket.on('data', chunk => assert.equal(chunk.toString(), 'fixture'));
+        socket.once('error', reject); socket.once('close', resolve);
+      });
+      await new Promise(resolve => tcp.close(resolve));
+      assert.equal(events.filter(event => event.name === 'socket.connect').length, 1);
+      assert.equal(events.filter(event => event.name === 'socket.write').length, 1);
+      assert.ok(events.some(event => event.name === 'socket.receive' && event.attributes.bytes === 7));
+      assert.doesNotMatch(JSON.stringify(events), /credential|sensitive-payload/);
+    } finally { await new Promise(resolve => server.close(resolve)); }
+    unsubscribe(); console.log(JSON.stringify({ names: events.filter(event => event.category === 'network').map(event => event.name) }));
+  `)
+  assert.ok(result.names.includes('websocket.closed'))
+  assert.ok(result.names.includes('socket.closed'))
+})

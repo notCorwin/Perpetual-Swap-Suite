@@ -1,6 +1,7 @@
 import { closeOperationRecording } from './operation-runtime.js'
 import { openRecordedDatabase } from './recorded-database.js'
-import { measureOperation } from './operations.js'
+import { getOperationContext, measureOperation, recordOperation, runWithOperationContext } from './operations.js'
+import { createWorkerRequest, onOperationMessage } from './worker-operations.js'
 import { readdir, stat } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -25,9 +26,10 @@ const post = message => { if (process.connected) process.send(message, () => {})
 const send = payload => new Promise((resolve, reject) => {
   if (!process.connected) { reject(new Error('Market archive parent disconnected.')); return }
   const id = ++sequence
-  acknowledgments.set(id, { resolve, reject })
-  process.send({ ...payload, sequence: id }, error => {
-    if (error) { acknowledgments.delete(id); reject(error) }
+  const request = createWorkerRequest('market-migration-parent', 'commit', resolve, reject)
+  acknowledgments.set(id, request)
+  request.dispatch(process, { ...payload, sequence: id }, error => {
+    if (error) { acknowledgments.delete(id); request.reject(error) }
   })
 })
 
@@ -113,8 +115,15 @@ async function drain() {
     while (!stopping) {
       const index = queue.findIndex(job => job.priority === 'foreground'), job = queue.splice(index < 0 ? 0 : index, 1)[0]
       if (job) {
-        try { if (complete || await importQuery(job)) post({ id: job.id }); else queue.push(job) }
-        catch (error) { post({ id: job.id, error: error.message }) }
+        await runWithOperationContext(job.operationContext, async () => {
+          const startedAt = performance.timeOrigin + performance.now()
+          recordOperation({ category: 'ipc', name: 'worker.queue', resource: 'market-migration', startedAt: job.queuedAt,
+            durationMS: Math.max(0, startedAt - job.queuedAt), status: 'ok', attributes: { priority: job.priority } })
+          try {
+            if (complete || await importQuery(job)) job.resolve({ id: job.id })
+            else { job.queuedAt = performance.timeOrigin + performance.now(); queue.push(job) }
+          } catch (error) { job.resolve({ id: job.id, error: error.message }) }
+        })
       } else {
         if (retryPartitions.length && retryAt > Date.now()) { retryLater(); break }
         if (retryPartitions.length) {
@@ -155,21 +164,30 @@ async function drain() {
       clearTimeout(retryTimer)
       connection?.closeSync(); engine?.closeSync(); manifest.close()
       connection = null; engine = null
+      // Let async message handlers publish their final execution records first.
+      await new Promise(resolve => setImmediate(resolve))
       await closeOperationRecording()
       if (process.connected) process.disconnect()
     }
   }
 }
-process.on('message', message => {
+onOperationMessage(process, 'market-migration', message => {
   if (message.ack) {
     const value = acknowledgments.get(message.ack)
     if (value) { acknowledgments.delete(message.ack); message.error ? value.reject(new Error(message.error)) : value.resolve() }
   } else if (message.stop) {
-    stopping = true; queue.length = 0; clearTimeout(retryTimer); void drain()
-  } else if (!stopping && !released) { queue.push(message); void drain() }
+    stopping = true
+    for (const job of queue.splice(0)) job.resolve({ id: job.id, error: 'Market archive import stopped.' })
+    clearTimeout(retryTimer); setImmediate(() => { void drain() })
+  } else if (!stopping && !released) return new Promise(resolve => {
+    queue.push({ ...message, resolve, operationContext: getOperationContext(), queuedAt: performance.timeOrigin + performance.now() })
+    void drain()
+  })
 })
 process.on('disconnect', () => {
-  stopping = true; queue.length = 0; clearTimeout(retryTimer)
+  stopping = true
+  for (const job of queue.splice(0)) job.resolve(undefined)
+  clearTimeout(retryTimer)
   for (const pending of acknowledgments.values()) pending.reject(new Error('Market archive parent disconnected.'))
   acknowledgments.clear()
   if (!released) void drain()
