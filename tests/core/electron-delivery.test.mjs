@@ -3,7 +3,21 @@ import { mkdtemp, mkdir, readFile, readdir, writeFile, cp, rm } from 'node:fs/pr
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { installApp } from '../../scripts/electron-delivery.mjs'
+import { fingerprintInputs, installApp } from '../../scripts/electron-delivery.mjs'
+
+test('packaging fingerprints ignore Finder metadata while detecting changed application inputs', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'perpetual-swap-fingerprint-test-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  for (const path of ['electron', 'dist/assets']) await mkdir(join(root, path), { recursive: true })
+  for (const path of ['package.json', 'package-lock.json', 'electron/main.js', 'dist/assets/chart.js']) await writeFile(join(root, path), path)
+  const fingerprint = await fingerprintInputs(root)
+  for (const path of ['electron/.DS_Store', 'dist/.DS_Store', 'dist/assets/.DS_Store']) await writeFile(join(root, path), 'Finder state')
+  assert.equal(await fingerprintInputs(root), fingerprint)
+  await writeFile(join(root, 'dist/.DS_Store'), 'Updated Finder state')
+  assert.equal(await fingerprintInputs(root), fingerprint)
+  await writeFile(join(root, 'dist/assets/chart.js'), 'Updated chart')
+  assert.notEqual(await fingerprintInputs(root), fingerprint)
+})
 
 async function setup(t) {
   const root = await mkdtemp(join(tmpdir(), 'perpetual-swap-install-test-'))

@@ -15,6 +15,9 @@ export async function fingerprintInputs(root) {
     const info = await lstat(path)
     if (info.isDirectory()) {
       for (const name of (await readdir(path)).sort()) {
+        // Finder metadata is not a packaging input and can change while an
+        // output directory is open without changing the built application.
+        if (name === '.DS_Store') continue
         if (relative === 'dist' && (/^mac(?:-|$)/.test(name) || name.startsWith('builder-') || /\.(?:dmg|zip|blockmap)$/.test(name))) continue
         await visit(join(path, name), `${relative}/${name}`)
       }
