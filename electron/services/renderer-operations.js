@@ -25,7 +25,7 @@ export function createRendererOperationReceiver({ register = registerOperationPa
     receive(owner, batch) {
       const source = sourceFor(owner, batch?.executionId)
       if (!batch || typeof batch.batchId !== 'string' || batch.batchId.length > 256 || !Array.isArray(batch.events)
-        || !batch.events.length || batch.events.length > 128 || !Number.isSafeInteger(batch.firstSequence)
+        || !batch.events.length || batch.events.length > 2_048 || !Number.isSafeInteger(batch.firstSequence)
         || batch.firstSequence !== batch.events[0]?.sequence
         || batch.events.some((event, index) => event?.executionId !== source.executionId || event.sessionId !== source.sessionId || event.sequence !== batch.firstSequence + index)) {
         throw new TypeError('Invalid renderer operation batch.')

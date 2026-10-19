@@ -71,19 +71,20 @@ function telemetryHost() {
   const batches: OperationBatch[] = [], attempts: OperationBatch[] = [], failures: { omitted: number }[] = []
   const timers = new Map<number, () => void>()
   let nextTimer = 0, flush: (() => Promise<void>) | undefined
-  let fail = false, blocked = false, hold = false, release: (() => void) | undefined
+  let fail = false, blocked = false, hold = false, holdEvery = false, release: (() => void) | undefined
   return {
     batches, attempts, timers, failures,
     flush: () => flush?.() ?? Promise.resolve(),
     failNext: () => { fail = true },
     block: (value: boolean) => { blocked = value },
     holdNext: () => { hold = true },
+    holdEvery: (value: boolean) => { holdEvery = value },
     release: () => release?.(),
     host: {
       recordOperations: async (batch: OperationBatch) => {
         attempts.push(structuredClone(batch))
         if (fail || blocked) { fail = false; throw new Error('Transient IPC failure') }
-        if (hold) { hold = false; await new Promise<void>(resolve => { release = resolve }) }
+        if (hold || holdEvery) { hold = false; await new Promise<void>(resolve => { release = resolve }) }
         batches.push(structuredClone(batch))
         return { batchId: batch.batchId, lastSequence: batch.events.at(-1)!.sequence }
       },
@@ -146,6 +147,39 @@ test('persistent renderer handoff failure retains a contiguous bounded prefix an
     assert.equal(harness.failures.length, 1)
     assert.equal(harness.failures[0].omitted, 208)
   } finally { await assert.rejects(stop(), /incomplete/) }
+})
+
+test('renderer drains full-market bursts with delayed durable acknowledgments without losing records', async () => {
+  const harness = telemetryHost(), stop = await initializeOperationTelemetry(harness.host)
+  harness.holdEvery(true)
+  try {
+    // The foreground benchmark produces 287 contracts x 3 periods per tick.
+    // Hold the first two ticks, then permit only one durable ACK between ticks,
+    // without machine-speed limits. The queue must catch up within its old cap.
+    for (let tick = 0; tick < 60; tick++) {
+      for (let index = 0; index < 287 * 3; index++) {
+        measureOperation({ category: 'ipc', name: 'fixture.market-notification' }, () => {})
+      }
+      if (tick > 0) {
+        harness.release()
+        await new Promise<void>(resolve => setImmediate(resolve))
+      }
+    }
+    harness.holdEvery(false)
+    harness.release()
+    await harness.flush()
+    const records = harness.batches.flatMap(batch => batch.events)
+    assert.equal(records.length, 60 * 287 * 3 * 2)
+    assert.ok(records.every((event, index) => !index || event.sequence === records[index - 1].sequence + 1))
+    assert.equal(new Set(records.map(event => `${event.id}:${event.phase}`)).size, records.length)
+    assert.ok(harness.batches.some(batch => batch.events.length === 2_048), 'Backlog must amortize durable IPC across full-sized batches.')
+    assert.ok(harness.batches.every(batch => batch.events.length <= 2_048))
+    assert.deepEqual(harness.failures, [])
+  } finally {
+    harness.holdEvery(false)
+    harness.release()
+    await stop()
+  }
 })
 
 test('renderer long-frame observations and undelivered shutdown entries preserve their elapsed timing', async () => {
