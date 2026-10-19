@@ -180,9 +180,19 @@ const timingSummary = (value, count) => value?.count === count && integer(count)
 
 export function graphicsCapabilities(status, metal) {
   const system = status.system, trace = status.trace
+  const softwareRenderer = /swiftshader|llvmpipe|softpipe|software/i.test(system?.renderer ?? '')
+  const appleParavirtual = /^ANGLE \(Apple, ANGLE Metal Renderer: Apple Paravirtual device(?:,|\))/.test(system?.renderer ?? '')
+  const identifiedDevice = Boolean(system?.devices?.some(device => device.active && device.vendorId > 0))
+  // A virtual Mac exposes an accelerated Metal device without PCI vendor/device
+  // IDs. Zero IDs alone establish nothing: require Apple's active guest driver,
+  // the actual ANGLE Metal renderer, and its enabled Graphite Metal path.
+  const paravirtualMetal = appleParavirtual && system.displayType === 'ANGLE_METAL' && system.backend === 'GraphiteDawnMetal'
+    && enabled(system.features?.opengl) && enabled(system.features?.skia_graphite)
+    && Boolean(system.devices?.some(device => device.active && device.driverVendor === 'Apple' && device.vendorId === 0 && device.deviceId === 0))
+  const adapterKind = softwareRenderer ? 'software' : appleParavirtual ? 'apple-paravirtual' : identifiedDevice ? 'identified' : 'unknown'
   const hardwareAcceleration = system?.probe?.state === 'ready' && system.hardwareAccelerationEnabled === true && enabled(system.features?.gpu_compositing)
-    && enabled(system.features?.rasterization) && Boolean(system.devices?.some(device => device.active && device.vendorId > 0))
-    && Boolean(system.renderer) && !/swiftshader|llvmpipe|softpipe|software/i.test(system.renderer)
+    && enabled(system.features?.rasterization) && Boolean(system.renderer) && !softwareRenderer
+    && (appleParavirtual ? paravirtualMetal : identifiedDevice)
   const nativeTrace = status.enabled === true && status.complete === true && (trace?.completedTasks ?? 0) > 0
   const nativeServiceTasks = nativeTrace && trace.gpuProcessTasks > 0 && trace.gpuProcessVizTasks > 0
     && trace.gpuProcessServiceTasks > 0 && trace.relevantGpuTasks > 0
@@ -204,7 +214,7 @@ export function graphicsCapabilities(status, metal) {
         && value.limited === false && value.pending === 0 && value.nativeErrors === 0 && Array.isArray(value.issues) && value.issues.length === 0
         && timingSummary(value.timing, value.timing?.count)))
     && pids.reduce((sum, pid) => sum + processes.find(value => value.pid === pid).timing.count, 0) === metal.timing.count)
-  return { hardwareAcceleration, nativeTrace, nativeServiceTasks, hardwareTiming,
+  return { adapterKind, hardwareAcceleration, nativeTrace, nativeServiceTasks, hardwareTiming,
     hardwareTimingReason: hardwareTiming ? 'Validated completed Metal command-buffer timestamps were observed for the actual accelerated GPU process.'
       : 'No validated hardware device-clock timing was observed for this rendering backend and capture.' }
 }
@@ -213,7 +223,8 @@ export function graphicsCapabilities(status, metal) {
 export function graphicsAccelerationSupport(status) {
   const system = status?.system
   if (system?.probe?.state !== 'ready') return { state: 'unknown', reason: system?.probe?.reason ?? 'gpu-information-not-ready' }
-  if (graphicsCapabilities(status).hardwareAcceleration) return { state: 'available', reason: 'hardware-acceleration-observed' }
+  const capabilities = graphicsCapabilities(status)
+  if (capabilities.hardwareAcceleration) return { state: 'available', reason: capabilities.adapterKind === 'apple-paravirtual' ? 'apple-paravirtual-metal-acceleration-observed' : 'hardware-acceleration-observed', adapterKind: capabilities.adapterKind }
   if (system.hardwareAccelerationEnabled === false) return { state: 'unsupported', reason: 'hardware-acceleration-disabled' }
   if (/swiftshader|llvmpipe|softpipe|software/i.test(system.renderer ?? '')
     || /^(?:disabled|unavailable)_software$/.test(system.features?.gpu_compositing ?? '')

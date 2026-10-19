@@ -29,7 +29,8 @@
     "app:smoke": "node scripts/test-sandbox.mjs command -- node scripts/smoke-electron.mjs",
     "sandbox": "node scripts/test-sandbox.mjs",
     "operations:report": "node scripts/operation-report.mjs",
-    "benchmark:startup": "node scripts/test-sandbox.mjs command -- node scripts/benchmark-startup.mjs"
+    "benchmark:startup": "node scripts/test-sandbox.mjs command -- node scripts/benchmark-startup.mjs",
+    "test:okx:chart": "npm run build && node scripts/test-sandbox.mjs command --allow-network --scenario okx-live-chart --require-category network --require-category database --require-category cpu --require-category io --require-category ipc --require-role electron-main --require-role renderer --require-role market-backend --require-role market-reader --require-role market-writer --require-role prepared-chart -- node scripts/okx-live-chart.mjs"
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "3.0.71",

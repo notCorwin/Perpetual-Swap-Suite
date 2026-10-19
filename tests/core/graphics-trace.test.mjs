@@ -212,3 +212,34 @@ test('duration and buffer limits remain incomplete despite valid native tasks an
     assert.deepEqual(graphicsRequirementFailures(result, { requireNativeTasks: true }), ['native-gpu-service-tasks-missing'])
   }
 })
+
+
+test('Apple paravirtual Metal uses explicit guest-driver evidence instead of assuming positive PCI identifiers', async () => {
+  const virtualGPU = { auxAttributes: { glRenderer: 'ANGLE (Apple, ANGLE Metal Renderer: Apple Paravirtual device, Version 15.7.9 (Build 24G830))',
+    skiaBackendType: 'GraphiteDawnMetal', displayType: 'ANGLE_METAL' },
+    gpuDevice: [{ active: true, vendorId: 0, deviceId: 0, driverVendor: 'Apple', driverVersion: '15.7.9' }] }
+  const virtualApp = { ...app, getGPUFeatureStatus: () => ({ gpu_compositing: 'enabled', rasterization: 'enabled', opengl: 'enabled_on', skia_graphite: 'enabled_on', webgl: 'enabled', webgpu: 'enabled' }) }
+  const summary = await inspectGraphicsTrace(trace([event({ ph: 'X', dur: 5 })]))
+  const status = { enabled: true, complete: true, system: graphicsSystemSnapshot(virtualApp, virtualGPU), trace: summary }
+  const capabilities = graphicsCapabilities(status)
+  assert.equal(capabilities.adapterKind, 'apple-paravirtual')
+  assert.equal(capabilities.hardwareAcceleration, true)
+  assert.deepEqual(graphicsAccelerationSupport(status), { state: 'available', reason: 'apple-paravirtual-metal-acceleration-observed', adapterKind: 'apple-paravirtual' })
+  assert.equal(capabilities.hardwareTiming, false, 'Virtualized acceleration does not invent a validated hardware-clock provider.')
+  assert.deepEqual(graphicsRequirementFailures(status, { requireHardwareTiming: true }), ['hardware-gpu-timing-unavailable'])
+  assert.equal(graphicsCapabilities({ system: graphicsSystemSnapshot(app, gpu) }).adapterKind, 'identified')
+  for(const change of [
+    value => { value.renderer = '' }, value => { value.renderer = 'unknown renderer' }, value => { value.renderer = 'ANGLE Metal Renderer: Apple M3' },
+    value => { value.displayType = '' }, value => { value.backend = '' }, value => { value.backend = 'GraphiteDawnVulkan' },
+    value => { value.devices[0].driverVendor = '' }, value => { value.devices[0].driverVendor = 'Other' }, value => { value.devices[0].active = false },
+    value => { value.devices[0].deviceId = 17 }, value => { value.devices = [] }, value => { value.probe.state = 'pending' },
+    value => { value.features.opengl = 'unknown' }, value => { value.features.skia_graphite = 'unknown' }, value => { value.features.gpu_compositing = 'unknown' },
+  ]) {
+    const system = structuredClone(status.system); change(system)
+    assert.equal(graphicsCapabilities({ ...status, system }).hardwareAcceleration, false, JSON.stringify(system))
+    assert.equal(graphicsAccelerationSupport({ ...status, system }).state, system.devices.length ? 'unknown' : 'unsupported', JSON.stringify(system))
+  }
+  const software = structuredClone(status.system); software.renderer = 'ANGLE (Google, Vulkan SwiftShader Device)'
+  assert.equal(graphicsCapabilities({ system: software }).adapterKind, 'software')
+  assert.equal(graphicsAccelerationSupport({ system: software }).state, 'unsupported')
+})

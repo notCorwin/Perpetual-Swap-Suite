@@ -29,6 +29,8 @@ jobs:
         run: npm install --global npm@12.2.0
       - name: Install locked dependencies
         run: npm ci
+      - name: Build the renderer for the native source-to-SVG check
+        run: npm run build
       - name: Record public endpoint availability
         run: |
           mkdir -p artifacts
@@ -66,33 +68,39 @@ jobs:
         run: |
           set +e
           npm run sandbox -- command --allow-network --output artifacts/sandbox -- node scripts/okx-live-1h.mjs 2>&1 | tee artifacts/okx-integration.log
-          status="${PIPESTATUS[0]}"
+          history_status="${PIPESTATUS[0]}"
           npm run sandbox -- command --allow-network --output artifacts/sandbox -- node scripts/okx-live-statistics.mjs --report artifacts/okx-statistics.json 2>&1 | tee artifacts/okx-statistics.log
           statistics_status="${PIPESTATUS[0]}"
-          if [ "$statistics_status" -ne 0 ]; then status="$statistics_status"; fi
           set -e
-          echo "exit-code=$status" >> "$GITHUB_OUTPUT"
-      - name: Classify live result
-        env:
-          INTEGRATION_EXIT_CODE: ${{ steps.integration.outputs.exit-code }}
+          echo "history-exit-code=$history_status" >> "$GITHUB_OUTPUT"
+          echo "statistics-exit-code=$statistics_status" >> "$GITHUB_OUTPUT"
+      - name: Check real native WebSocket subscriptions for every eligible contract
+        id: streams
+        shell: bash
         run: |
-          node --input-type=module <<'NODE'
-          import { appendFile, readFile, writeFile } from 'node:fs/promises'
-          const report = JSON.parse(await readFile('artifacts/okx-endpoints.json', 'utf8'))
-          const externalFailures = report.probes.filter(probe => !probe.ok)
-          const passed = process.env.INTEGRATION_EXIT_CODE === '0'
-          const classification = passed ? 'passed' : externalFailures.length ? 'external-unavailable' : 'integration-failed'
-          const result = { revision: process.env.GITHUB_SHA, classification, integrationExitCode: process.env.INTEGRATION_EXIT_CODE,
-            externalFailures: externalFailures.map(({ url, status, code, error }) => ({ url, status, code, error })) }
-          await writeFile('artifacts/okx-result.json', JSON.stringify(result, null, 2))
-          await appendFile(process.env.GITHUB_STEP_SUMMARY,
-            `Live OKX result: **${classification}**. Revision: \`${process.env.GITHUB_SHA}\`.\n\n` +
-            (passed ? 'Live behavior checks passed.\n' : externalFailures.length
-              ? 'Public endpoint probes failed. See okx-endpoints.json for HTTP/API status, network error, and response body.\n'
-              : 'Public endpoints responded at probe time. Inspect okx-integration.log and okx-statistics.log for failing assertions and observed request statuses.\n'))
-          console.log(JSON.stringify(result, null, 2))
-          if (!passed) process.exitCode = 1
-          NODE
+          set +e
+          npm run sandbox -- command --allow-network --scenario okx-all-contract-streams --output artifacts/sandbox -- node scripts/okx-live-streams.mjs 2>&1 | tee artifacts/okx-streams.log
+          streams_status="${PIPESTATUS[0]}"
+          set -e
+          echo "exit-code=$streams_status" >> "$GITHUB_OUTPUT"
+      - name: Check real OKX prices in the hidden native app
+        id: chart
+        env:
+          OKX_LIVE_CHART_OUTPUT: artifacts/okx-live-chart
+        shell: bash
+        run: |
+          set +e
+          npm run sandbox -- command --allow-network --scenario okx-live-chart --output artifacts/sandbox --require-category network --require-category database --require-category cpu --require-category io --require-category ipc --require-role electron-main --require-role renderer --require-role market-backend --require-role market-reader --require-role market-writer --require-role prepared-chart -- node scripts/okx-live-chart.mjs 2>&1 | tee artifacts/okx-chart.log
+          chart_status="${PIPESTATUS[0]}"
+          set -e
+          echo "exit-code=$chart_status" >> "$GITHUB_OUTPUT"
+      - name: Classify independent live checks
+        env:
+          HISTORY_EXIT_CODE: ${{ steps.integration.outputs.history-exit-code }}
+          STATISTICS_EXIT_CODE: ${{ steps.integration.outputs.statistics-exit-code }}
+          STREAMS_EXIT_CODE: ${{ steps.streams.outputs.exit-code }}
+          CHART_EXIT_CODE: ${{ steps.chart.outputs.exit-code }}
+        run: node scripts/okx-live-classify.mjs --artifacts artifacts
       - name: Retain external and integration diagnostics
         if: always()
         uses: actions/upload-artifact@v7
