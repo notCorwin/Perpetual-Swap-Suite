@@ -47,7 +47,8 @@ async function* traceFiles(path, depth = 0) {
 export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes = 128 * 1024, slowestLimit = 20, maxFiles = 10_000 } = {}) {
   if (!Number.isInteger(maxGroups) || maxGroups < 1 || !Number.isInteger(maxLineBytes) || maxLineBytes < 1 || !Number.isInteger(slowestLimit) || slowestLimit < 0 || !Number.isInteger(maxFiles) || maxFiles < 1) throw new Error('Report limits must be positive integers (slowestLimit may be zero).')
   const total = aggregate(), byCategory = Object.fromEntries(categories.map(category => [category, aggregate()]))
-  const groups = new Map(), overflow = Object.fromEntries(categories.map(category => [category, aggregate()])), slowest = [], nativeTraces = []
+  const groups = new Map(), operations = new Map(), overflow = Object.fromEntries(categories.map(category => [category, aggregate()])),
+    operationOverflow = Object.fromEntries(categories.map(category => [category, aggregate()])), slowest = [], nativeTraces = []
   const diagnostics = { files: 0, lines: 0, malformed: 0, oversized: 0, unterminated: 0, incomplete: 0, groupedOverflow: 0,
     recorderHealthFiles: 0, persistenceFailures: 0, pendingRecords: 0, unclosedExecutions: 0, recorderCountMismatches: 0, missingRecords: 0,
     nativeGpuStatusFiles: 0, incompleteNativeGpuTraces: 0, fileLimitReached: false, examples: [] }
@@ -61,6 +62,12 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
     if (event?.schemaVersion !== 1 || !categories.includes(event.category) || !statuses.has(event.status) || typeof event.id !== 'string' || !event.id || typeof event.sessionId !== 'string' || typeof event.executionId !== 'string' || typeof event.name !== 'string' || !event.name || !Number.isFinite(event.startedAt) || !Number.isFinite(event.durationMS) || event.durationMS < 0) { problem('malformed', file, line); return }
     add(total, event); add(byCategory[event.category], event)
     const name = label(event.name), resource = label(event.resource), key = JSON.stringify([event.category, name, resource])
+    // Contract cardinality must never hide a known operation's total cost.
+    // Keep a separate bounded index whose identity excludes the resource.
+    const operationKey = JSON.stringify([event.category, name])
+    let operation = operations.get(operationKey)
+    if (!operation && operations.size < 256) { operation = { category: event.category, name, ...aggregate() }; operations.set(operationKey, operation) }
+    add(operation ?? operationOverflow[event.category], event)
     let group = groups.get(key)
     if (!group && groups.size < maxGroups) { group = { category: event.category, name, resource, ...aggregate() }; groups.set(key, group) }
     if (group) add(group, event)
@@ -129,6 +136,8 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
   }
   return { schemaVersion: 1, generatedAt: new Date().toISOString(), source: resolve(path),
     totals: finish(total), categories: categories.map(category => ({ category, ...finish(byCategory[category]) })),
+    operations: [...operations.values()].map(finish).concat(categories.filter(category => operationOverflow[category].count)
+      .map(category => ({ category, name: '[other operation names]', ...finish(operationOverflow[category]) }))).sort((left, right) => right.totalMS - left.totalMS),
     groups: [...groups.values()].map(finish).concat(categories.filter(category => overflow[category].count).map(category => ({ category, name: '[other operations]', resource: '', ...finish(overflow[category]) }))).sort((left, right) => right.totalMS - left.totalMS),
     slowest, nativeTraces, diagnostics,
     measurement: 'Elapsed operation time can overlap across threads and nested operations; totals are not process wall time. CPU time, when present, uses the current thread CPU clock. GPU records describe graphics submission/capture boundaries and GPU-process samples, not hardware kernel timings. p95UpperBoundMS uses fixed exponential duration buckets.' }
@@ -140,7 +149,9 @@ export function operationReportMarkdown(report) {
   const lines = ['# Expensive operations', '', `${report.totals.count.toLocaleString('en-US')} recorded operations; ${report.totals.errors} errors; ${report.totals.cancelled} cancelled.`, '',
     '| Category | Operations | Errors | Cancelled | Total ms | Max ms |', '| --- | ---: | ---: | ---: | ---: | ---: |',
     ...report.categories.map(value => `| ${value.category} | ${value.count} | ${value.errors} | ${value.cancelled} | ${ms(value.totalMS)} | ${ms(value.maxMS)} |`), '',
-    '## Highest cumulative costs', '', '| Category | Operation | Resource | Count | Total ms | Max ms |', '| --- | --- | --- | ---: | ---: | ---: |',
+    '## Highest cumulative operation costs', '', '| Category | Operation | Count | Total ms | Max ms |', '| --- | --- | ---: | ---: | ---: |',
+    ...report.operations.slice(0, 30).map(value => `| ${value.category} | ${escape(value.name)} | ${value.count} | ${ms(value.totalMS)} | ${ms(value.maxMS)} |`), '',
+    '## Resource details', '', '| Category | Operation | Resource | Count | Total ms | Max ms |', '| --- | --- | --- | ---: | ---: | ---: |',
     ...report.groups.slice(0, 30).map(value => `| ${value.category} | ${escape(value.name)} | ${escape(value.resource)} | ${value.count} | ${ms(value.totalMS)} | ${ms(value.maxMS)} |`), '',
     `Trace diagnostics: ${report.diagnostics.files} files, ${report.diagnostics.malformed} malformed records, ${report.diagnostics.oversized} oversized lines, ${report.diagnostics.unterminated} unfinished final lines, ${report.diagnostics.incomplete} interrupted operations, ${report.diagnostics.persistenceFailures} persistence failures, ${report.diagnostics.pendingRecords} unpersisted records, ${report.diagnostics.unclosedExecutions} unclosed executions, ${report.diagnostics.recorderCountMismatches} recorder count mismatches, ${report.diagnostics.missingRecords} missing records, ${report.diagnostics.incompleteNativeGpuTraces} incomplete native GPU traces, ${report.diagnostics.groupedOverflow} events grouped into overflow.${report.diagnostics.fileLimitReached ? ' File limit reached; this report is partial.' : ''}`, '', report.measurement, '']
   return lines.join('\n')
