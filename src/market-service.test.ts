@@ -144,7 +144,6 @@ const fixture = async (preferences = disabled(), fetcher: typeof fetch = async (
   isolateChartPreparation(service)
   await service.ready
   // Broad background targets are tested by MarketHistory; service tests control their source universe explicitly.
-  service.history.target = async () => []
   const close = async () => { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
   const resumeChartPreparation = () => { service.preparedCharts.setRealtimeSubscriptions = prepareSubscriptions; service.updateSubscriptions() }
   return { root, store, service, preferences, close, resumeChartPreparation }
@@ -2090,4 +2089,110 @@ test('a failed newer historical source read cannot renew the aggregate calculate
     assert.equal(f.service.observations.get(instId).turnover, undefined, 'A stale previous aggregate cannot certify the newly incomplete source window.')
     assert.match(f.service.error, /incomplete/i)
   } finally { hold.resolve(); await f.close() }
+})
+
+test('manual history downloads select only currently verified saved-filter matches', async () => {
+  const f = await fixture()
+  try {
+    isolateQualification(f.service)
+    const now = Date.now(), listing = String(Date.UTC(2020, 0, 1))
+    const entry = (id: string, overrides: Record<string, unknown> = {}) => f.service.catalogRecord({
+      instrument: { ...instrument, instId: id, listTime: listing }, ticker: { ...ticker, instId: id },
+      result: { eligible: true, status: 'verified' }, status: 'verified', expiresAt: now + 60_000, ...overrides,
+    })
+    const entries = [entry(instId), entry('EXPIRED-USDT-SWAP', { expiresAt: now - 1 }),
+      entry('REJECTED-USDT-SWAP', { result: { eligible: false, status: 'failed' } }),
+      entry('UNKNOWN-USDT-SWAP', { status: 'unknown' }), entry('OLD-FILTER-USDT-SWAP', { configKey: 'obsolete' }),
+      entry('NO-TICKER-USDT-SWAP', { ticker: null })]
+    f.service.catalog = new Map(entries.map(value => [value.instrumentID, value]))
+    f.service.instruments.set(instId, { ...instrument, listTime: listing })
+    const targets: unknown[][] = []
+    f.service.historyDownload.start = (values: unknown[]) => { targets.push(structuredClone(values)) }
+    await f.service.historyDownloadRequest({ action: 'start' })
+    assert.deepEqual(targets, [[{ ...instrument, listTime: listing }]], 'Expired, rejected, unknown and old-filter entries must not acquire full history.')
+  } finally { await f.close() }
+})
+
+test('a manual download freezes listing-to-start scope across every native timeframe and source', async () => {
+  const configuration = disabled(); configuration.historyDays = 1
+  const f = await fixture(configuration), hold = deferred()
+  try {
+    isolateQualification(f.service)
+    const listing = Date.UTC(2020, 0, 1, 0, 2), startedAt = Date.UTC(2026, 9, 19, 12, 7)
+    f.service.replaceCatalog([{ instrument: { ...instrument, listTime: String(listing) }, ticker,
+      result: { eligible: true, status: 'verified' } }])
+    f.service.historyDownload.now = () => startedAt
+    f.service.historyDownload.run = () => hold.promise
+    const started = await f.service.historyDownloadRequest({ action: 'start' })
+    const scope = structuredClone(f.service.historyDownload.job.streams)
+    assert.equal(started.phase, 'running')
+    assert.equal(started.contracts.total, 1)
+    assert.equal(started.streams.total, 9)
+    assert.deepEqual(scope.map((stream: any) => `${stream.timeframe}:${stream.source}`).sort(),
+      ['5m', '15m', '1H'].flatMap(timeframe => ['candles', 'oi', 'taker'].map(source => `${timeframe}:${source}`)).sort())
+    for (const stream of scope) {
+      const step = stream.timeframe === '1H' ? hour : stream.timeframe === '15m' ? 3 * fiveMinutes : fiveMinutes
+      assert.equal(stream.from, Math.ceil(listing / step) * step)
+      assert.equal(stream.through, Math.floor(startedAt / step) * step - step)
+      assert.ok(stream.from < startedAt - 365 * 24 * hour, 'The saved one-day audit lookback cannot cap full history.')
+    }
+    assert.equal(started.progress.total, scope.reduce((sum: number, stream: any) => sum + (stream.through - stream.from) / stream.step + 1, 0))
+    configuration.liquidity.spread.enabled = true
+    f.service.catalog.clear()
+    f.service.instruments.set(instId, { ...instrument, listTime: String(startedAt) })
+    const current = await f.service.historyDownloadRequest({ action: 'status' })
+    assert.equal(current.progress.total, started.progress.total)
+    assert.deepEqual(f.service.historyDownload.job.streams, scope, 'Later filters, catalog and listing updates cannot move an active download denominator.')
+    hold.resolve()
+    await f.service.historyDownloadRequest({ action: 'cancel' })
+  } finally { hold.resolve(); await f.close() }
+})
+
+test('instrument installation, catalog persistence, settings and market deadlines never start silent archives', async () => {
+  const configuration = disabled(), f = await fixture(configuration)
+  try {
+    isolateQualification(f.service)
+    let starts = 0, enqueues = 0
+    f.service.historyDownload.start = () => { starts++ }
+    f.service.history.audit.start = async () => { starts++; throw new Error('Unexpected automatic audit.') }
+    const enqueue = f.service.history.sync.enqueue.bind(f.service.history.sync)
+    f.service.history.sync.enqueue = (...args: unknown[]) => { enqueues++; return enqueue(...args) }
+    const definition = { ...instrument, listTime: String(Date.UTC(2020, 0, 1)) }
+    f.service.installInstruments(new Map([[instId, definition]]))
+    f.service.replaceCatalog([{ instrument: definition, ticker, result: { eligible: true, status: 'verified' } }])
+    await f.service.persistCatalog([...f.service.catalog.values()])
+    const previous = structuredClone(configuration)
+    configuration.historyDays = 3650
+    await f.service.reconfigure(previous)
+    f.service.marketBoundary -= fiveMinutes
+    f.service.processMarketDeadline()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual({ starts, enqueues }, { starts: 0, enqueues: 0 })
+    assert.deepEqual(f.service.history.sync.listTasks(), [])
+    assert.equal((await f.service.historyDownloadRequest({ action: 'status' })).phase, 'idle')
+  } finally { await f.close() }
+})
+
+test('history download checkpoints and replies carry detached snapshots with monotonic service revisions', async () => {
+  const f = await fixture()
+  try {
+    const observed: import('./desktop-contract.ts').HistoryDownload[] = []
+    const unsubscribeMutation = f.service.subscribeHistoryDownload(report => { report.progress.completed = 999 })
+    const unsubscribe = f.service.subscribeHistoryDownload(report => { observed.push(report) })
+    f.service.subscribeHistoryDownload(() => { throw new Error('Disconnected renderer.') })
+    f.service.subscribeHistoryDownload(async () => { throw new Error('Disconnected async renderer.') })
+    const initial = await f.service.historyDownloadRequest({ action: 'status' })
+    f.service.historyDownload.report = { ...f.service.historyDownload.snapshot(), phase: 'running',
+      progress: { completed: 2, total: 5, available: 1, unavailable: 1, reused: 1, pending: 3 } }
+    f.service.publishHistoryDownload(f.service.historyDownload.snapshot())
+    const current = await f.service.historyDownloadRequest({ action: 'status' })
+    assert.equal(initial.phase, 'idle')
+    assert.equal(initial.progress.completed, 0, 'A previously returned reply must remain detached from later checkpoints and listeners.')
+    assert.equal(current.progress.completed, 2)
+    assert.equal(current.serviceSession, initial.serviceSession)
+    assert.ok(observed.length >= 3)
+    assert.ok(observed.every((report, index) => report.serviceSession === initial.serviceSession && (index === 0 || report.revision > observed[index - 1].revision)))
+    assert.ok(current.revision > initial.revision)
+    unsubscribeMutation(); unsubscribe()
+  } finally { await f.close() }
 })

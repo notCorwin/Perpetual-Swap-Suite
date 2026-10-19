@@ -57,6 +57,8 @@ export class MetadataStore {
   saveAudit<T extends AuditRecord>(audit: T): T
   getAudit(id: string): AuditRecord | null
   listAudits(): AuditRecord[]
+  getHistoryDownload(): Omit<import('../../src/desktop-contract.ts').HistoryDownload, 'revision' | 'serviceSession'> | null
+  saveHistoryDownload(report: Omit<import('../../src/desktop-contract.ts').HistoryDownload, 'revision' | 'serviceSession'>): void
   putCatalogEntry<T extends CatalogEntry>(entry: T): T
   saveCatalogRankings(entries: Array<{ instrumentID: string; lookback: number; rankingChange: number; rankingAsOf: number }>): string[]
   getCatalogEntry(instrumentID: string): CatalogEntry | null

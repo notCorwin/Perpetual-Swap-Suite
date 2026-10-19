@@ -21,7 +21,6 @@ const fixture = async (fetcher: typeof fetch) => {
   const service = new MarketService(store, () => preferences, fetcher, false)
   await service.ready
   // These tests exercise qualification, without scheduling unrelated chart or history work.
-  service.history.target = async () => []
   service.updateRanking = async () => undefined
   service.readListBars = async () => ({ bars: [] })
   for (const lane of service.requestLanes.values()) lane.interval = 0

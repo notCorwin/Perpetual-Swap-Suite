@@ -152,13 +152,16 @@ test('latest initialization publishes actual observations without inventing miss
   assert.equal(history.sync.listTasks()[0].writtenRecords, 1)
 })
 
-test('delisting removes rolling intentions and active consumer demand without deleting source facts', async t => {
+test('delisting removes finite consumer demand without deleting source facts', async t => {
   const gate = deferred()
   const { history, metadata, store } = await fixture(t, { get: async (path, parameters, signal, priority) => { await gate.promise; signal.throwIfAborted(); return source(path, parameters, signal, priority) } })
   await store.appendCandles([row(base)])
-  await history.target(instId, { historyDays: 1, asOf: base + day })
-  assert.equal(metadata.tasks.size, 12)
+  const task = await history.sync.enqueue({ instrument: instId, timeframe: '5m', source: 'candles', from: base + step, through: base + 2 * step })
+  assert.equal(history.sync.listTasks().length, 1)
+  assert.equal(metadata.tasks.size, 0)
+  const cancelled = history.sync.waitFor(task.id)
   await history.removeTargets([instId]); gate.resolve(); await history.sync.whenIdle()
+  assert.equal((await cancelled).status, 'cancelled')
   assert.equal(metadata.tasks.size, 0); assert.equal(history.sync.listTasks().length, 0)
   assert.equal((await store.coverage(instId, '5m')).count, 1)
 })

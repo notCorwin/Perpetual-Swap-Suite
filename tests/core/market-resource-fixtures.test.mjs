@@ -39,7 +39,7 @@ async function openFixture(fetcher = async () => new Response(JSON.stringify({ c
   } }
 }
 
-test('resource background readiness waits for committed LOAD candles after a clock-boundary backlog', async context => {
+test('resource background readiness waits for committed LOAD candles after an explicitly requested backlog', async context => {
   const realNow = Date.now.bind(Date)
   // Keep timers real while advancing the service clock across a known 5m edge.
   // This also keeps the regression independent of when CI happens to start it.
@@ -65,8 +65,13 @@ test('resource background readiness waits for committed LOAD candles after a clo
     }
     offset += 300_000
     f.service.processMarketDeadline()
-    await waitFor(() => heldScaleCandles === 3, 'The boundary must occupy the three background candle slots before LOAD starts.')
-    assert.ok(f.service.history.sync.listTasks().some(task => task.instrument.startsWith('SCALE') && task.purpose === 'history'))
+    // Archive load is explicit; a market boundary no longer admits archives.
+    for (const [timeframe, step] of Object.entries({ '5m': 300_000, '15m': 900_000, '1H': 3_600_000 })) {
+      const through = Math.floor(Date.now() / step) * step - step
+      await f.service.history.sync.enqueue({ instrument: fixture.fixture.instIds[0], timeframe, source: 'candles',
+        from: through - 300 * step, through, priority: 'background' })
+    }
+    await waitFor(() => heldScaleCandles === 3, 'The explicit backlog must occupy the three background candle slots before LOAD starts.')
     ready = startBackgroundArchive(f.store, f.service, { timeoutMS: 5_000, pollMS: 5 })
     ready.then(() => { settled = true }, () => { settled = true })
     await waitFor(() => f.service.history.sync.listTasks().some(task => task.instrument === loadInstrument), 'LOAD targets must be enqueued.')

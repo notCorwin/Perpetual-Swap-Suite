@@ -29,12 +29,23 @@ before(async () => {
     }))
     const state = globalThis.__workspaceFixture = { preferences, rows, initialRows: rows, requests: [], revision: 1, loading: false, error: '', catalogSource: 'live', catalogProgress: undefined, failNextSave: false, failSnapshots: 0, staleNextSnapshot: false, staleReplies: 0, chartGeneration: 1, bollMode: 'standard', holdNextSnapshot: false, releaseSnapshot: null, snapshotActive: 0, snapshotMaximum: 0,
       holdAuditAction: null, releaseAudit: null, heldAuditReply: null,
+      holdDownloadAction: null, releaseDownload: null, heldDownloadReply: null,
+      historyDownload: { phase: 'idle', startedAt: null, updatedAt: null, finishedAt: null,
+        contracts: { completed: 0, total: 0 }, streams: { completed: 0, total: 0 },
+        progress: { completed: 0, total: 0, available: 0, unavailable: 0, reused: 0, pending: 0 },
+        active: [], failures: [], error: '', revision: 0, serviceSession: 'download-fixture' },
       audit: { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '', revision: 0, serviceSession: 'audit-fixture' } }
     state.notify = () => BrowserWindow.getAllWindows()[0].webContents.send('radar:market-changed')
     state.publishAudit = values => {
       state.audit = { ...state.audit, ...structuredClone(values), revision: state.audit.revision + 1 }
       const report = structuredClone(state.audit)
       BrowserWindow.getAllWindows()[0].webContents.send('radar:audit-changed', report)
+      return report
+    }
+    state.publishDownload = values => {
+      state.historyDownload = { ...state.historyDownload, ...structuredClone(values), revision: state.historyDownload.revision + 1 }
+      const report = structuredClone(state.historyDownload)
+      BrowserWindow.getAllWindows()[0].webContents.send('radar:history-download-changed', report)
       return report
     }
     const prepared = ({ instId, timeframe }) => {
@@ -86,6 +97,22 @@ before(async () => {
       if (value.chartWindow) return prepared(value.chartWindow)
       if (value.captureChart) return { ok: true }
       if (value.analysisSettings) return { model: '', hasAPIKey: false }
+      if (value.historyDownload) {
+        const action = value.historyDownload.action
+        if (action === 'start') state.publishDownload({ id: 'download-1', phase: 'running', startedAt: 1_800_000_000_000, updatedAt: 1_800_000_001_000, finishedAt: null,
+          contracts: { completed: 0, total: 2 }, streams: { completed: 1, total: 18 },
+          progress: { completed: 100, total: 1_000, available: 90, unavailable: 10, reused: 80, pending: 900 }, failures: [], error: '',
+          active: [{ instrument: 'BETA-USDT-SWAP', timeframe: '15m', source: 'oi', from: 1_799_990_100_000, through: 1_799_991_000_000,
+            status: 'retrying', attempts: 2, nextAttemptAt: 1_800_000_005_000, error: 'Temporary source limit.' }] })
+        if (action === 'cancel') state.publishDownload({ phase: 'cancelled', active: [], finishedAt: 1_800_000_010_000 })
+        const report = structuredClone(state.historyDownload)
+        if (state.holdDownloadAction === action) {
+          state.holdDownloadAction = null; state.heldDownloadReply = report
+          await new Promise(resolve => { state.releaseDownload = resolve })
+          state.releaseDownload = null
+        }
+        return report
+      }
       if (value.dataAudit) {
         const action = value.dataAudit.action
         if (action === 'start') state.publishAudit({ id: 'audit-1', phase: 'running', progress: { completed: 1, total: 3 }, issues: [], error: '' })
@@ -611,6 +638,80 @@ test('new audit pushes win over held initial and action replies across dialog re
     await dialog.getByRole('status').filter({ hasText: 'completed · 3 / 3' }).waitFor()
   } finally {
     await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.holdAuditAction = null; state.releaseAudit?.() })
+    await page.keyboard.press('Escape')
+  }
+})
+
+test('manual history downloads show exact pushed progress and retry details, continue across settings close, and cancel without polling', async () => {
+  const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.historyDownload?.action === 'status').length)
+  await page.getByRole('button', { name: 'Settings', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Settings', exact: true })
+  await dialog.getByRole('status').filter({ hasText: 'Ready to download · 0.0%' }).waitFor()
+  await dialog.getByRole('button', { name: 'Download all qualified history', exact: true }).click()
+  await dialog.getByRole('status').filter({ hasText: 'Downloading history · 10.0%' }).waitFor()
+  const details = dialog.locator('[aria-label="History download details"]')
+  await details.getByText('100 / 1,000', { exact: true }).waitFor()
+  await details.getByText('1 / 18', { exact: true }).waitFor()
+  const active = dialog.getByRole('list', { name: 'Active history downloads' })
+  await active.getByText('BETA-USDT-SWAP · 15m · oi', { exact: true }).waitFor()
+  await active.getByText(/retrying · Consecutive failures: 2 · Next retry:/).waitFor()
+  await active.getByText('Temporary source limit.', { exact: true }).waitFor()
+  await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({
+    progress: { completed: 999_999, total: 1_000_000, available: 900_000, unavailable: 99_999, reused: 300_000, pending: 1 },
+  }) })
+  await dialog.getByRole('status').filter({ hasText: 'Downloading history · 99.9%' }).waitFor()
+  await details.getByText('999,999 / 1,000,000', { exact: true }).waitFor()
+  await details.getByText('99,999', { exact: true }).waitFor()
+  await details.getByText('300,000', { exact: true }).waitFor()
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await dialog.waitFor({ state: 'hidden' })
+  await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({
+    progress: { completed: 1_000_000, total: 1_000_000, available: 900_001, unavailable: 99_999, reused: 300_000, pending: 0 },
+  }) })
+  await page.getByRole('button', { name: 'Settings', exact: true }).click()
+  await dialog.getByRole('status').filter({ hasText: 'Downloading history · 100.0%' }).waitFor()
+  await dialog.getByRole('button', { name: 'Cancel download', exact: true }).click()
+  await dialog.getByRole('status').filter({ hasText: 'Download cancelled · 100.0%' }).waitFor()
+  assert.equal(await dialog.getByRole('list', { name: 'Active history downloads' }).count(), 0)
+  await new Promise(resolve => setTimeout(resolve, 1_750))
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.historyDownload?.action === 'status').length), before + 2)
+  assert.deepEqual(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.historyDownload && value.historyDownload.action !== 'status').map(value => value.historyDownload.action)), ['start', 'cancel'])
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
+})
+
+test('new download pushes win over held replies and completion distinguishes unavailable data', async () => {
+  const dialog = page.getByRole('dialog', { name: 'Settings', exact: true })
+  try {
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.publishDownload({ phase: 'idle', progress: { completed: 0, total: 0, available: 0, unavailable: 0, reused: 0, pending: 0 }, error: '' })
+      state.holdDownloadAction = 'status'
+    })
+    await page.getByRole('button', { name: 'Settings', exact: true }).click()
+    await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseDownload))
+    await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({ phase: 'completed',
+      progress: { completed: 1_000_000, total: 1_000_000, available: 900_001, unavailable: 99_999, reused: 300_000, pending: 0 },
+      contracts: { completed: 2, total: 2 }, streams: { completed: 18, total: 18 }, active: [],
+    }) })
+    await dialog.getByRole('status').filter({ hasText: 'Completed with unavailable data · 100.0%' }).waitFor()
+    await electron.evaluate(() => { globalThis.__workspaceFixture.releaseDownload() })
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    await dialog.getByRole('status').filter({ hasText: 'Completed with unavailable data · 100.0%' }).waitFor()
+    await electron.evaluate(() => { globalThis.__workspaceFixture.holdDownloadAction = 'start' })
+    await dialog.getByRole('button', { name: 'Download all qualified history', exact: true }).click()
+    await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseDownload))
+    await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({ phase: 'completed',
+      progress: { completed: 1_000, total: 1_000, available: 1_000, unavailable: 0, reused: 80, pending: 0 },
+      contracts: { completed: 2, total: 2 }, streams: { completed: 18, total: 18 }, active: [],
+    }) })
+    await dialog.getByRole('status').filter({ hasText: 'Download complete · 100.0%' }).waitFor()
+    assert.equal(await dialog.getByRole('button', { name: /Download all qualified history/ }).isDisabled(), true)
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.heldDownloadReply.phase), 'running')
+    await electron.evaluate(() => { globalThis.__workspaceFixture.releaseDownload() })
+    await page.waitForFunction(() => ![...document.querySelectorAll('[role="dialog"] button')].find(button => button.textContent === 'Download all qualified history')?.disabled)
+    await dialog.getByRole('status').filter({ hasText: 'Download complete · 100.0%' }).waitFor()
+  } finally {
+    await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.holdDownloadAction = null; state.releaseDownload?.() })
     await page.keyboard.press('Escape')
   }
 })

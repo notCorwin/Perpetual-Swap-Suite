@@ -60,7 +60,6 @@ const fixture = async (now: number, options: { webSocketFactory?: WebSocketFacto
   service.projectListEntry = async () => null
   service.updateRanking = async () => undefined
   service.scheduleListProjection = () => undefined
-  service.history.target = async () => []
   const ensurePrices = service.history.ensurePrices.bind(service.history)
   service.history.ensurePrices = async () => { throw new Error('Complete durable qualification data must not need acquisition.') }
   service.scheduleRefresh = () => undefined
@@ -95,9 +94,6 @@ const streamingFixture = async (now: number) => {
     return get(path, parameters, ...rest)
   }
   f.service.history.ensurePrices = f.ensurePrices
-  // Exercise the same durable background target planner on the 5m source;
-  // unrelated native periods/statistics are outside this rollover fixture.
-  f.service.history.target = async (id: string, { asOf }: { asOf: number }) => [await f.service.history.sync.enqueueTarget({ instrument: id, timeframe: '5m', source: 'candles', historyDays: 1, warmupCandles: 0, asOf })]
   f.service.history.ensureStatistics = async () => ({ rows: [] })
   f.service.realtime.start(); socket.open()
   await f.service.realtime.whenIdle()
@@ -106,7 +102,7 @@ const streamingFixture = async (now: number) => {
   return { ...f, socket, priceRequests }
 }
 
-test('the confirmed stream closes qualification, background history and chart requests only after its durable commit', async context => {
+test('the confirmed stream closes qualification and chart requests only after its durable commit', async context => {
   const now = Math.floor(Date.now() / hour) * hour + 4 * 60_000 + 45_000
   context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
   const f = await streamingFixture(now), held = deferred(), writing = deferred()

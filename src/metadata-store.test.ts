@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { DEFAULT_PREFERENCES, MetadataStore, SettingsRevisionConflictError, validatePreferences } from '../electron/services/metadata-store.js'
+import { emptyHistoryDownload } from '../electron/services/history-download.js'
 
 const temporary = () => mkdtemp(join(tmpdir(), 'perp-metadata-'))
 const syncTask = (id = 'history-1') => ({
@@ -150,7 +151,7 @@ test('malformed legacy input is preserved without error snippets and can be retr
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
-test('sync and audit checkpoints persist across restart and reject malformed ranges and payloads', async () => {
+test('legacy sync, audit and manual download checkpoints persist across restart', async () => {
   const root = await temporary()
   let store = await MetadataStore.open(root)
   try {
@@ -158,6 +159,8 @@ test('sync and audit checkpoints persist across restart and reject malformed ran
     store.putSyncTask(task)
     const checkpoint = { id: 'audit-1', schemaVersion: 1 as const, status: 'running' as const, phase: 'inspect' as const, targets: [{ instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: 0, through: 600_000 }], cursor: { targetIndex: 0, nextFrom: 300_000 }, issues: [{ type: 'off-grid', timeframe: 'invalid', from: 42, through: 42 }], checkedRows: 2, createdAt: 1, updatedAt: 2, completedAt: null }
     store.saveAudit(checkpoint)
+    const download = { ...emptyHistoryDownload(), phase: 'cancelled' as const, startedAt: 1, finishedAt: 2 }
+    store.saveHistoryDownload(download)
     task.remaining.length = 0
     assert.deepEqual(store.getSyncTask(task.id)?.remaining, [{ from: 0, through: 600_000 }])
     assert.throws(() => store.putSyncTask({ ...syncTask(), from: 1 }), /grid/)
@@ -170,13 +173,14 @@ test('sync and audit checkpoints persist across restart and reject malformed ran
     assert.equal(store.listSyncTasks().length, 1)
     assert.deepEqual(store.getAudit(checkpoint.id), checkpoint)
     assert.equal(store.listAudits().length, 1)
+    assert.deepEqual(store.getHistoryDownload(), download)
     assert.equal(store.getSyncTask('missing'), null)
     assert.equal(store.deleteSyncTask(task.id), true)
     assert.equal(store.deleteSyncTask(task.id), false)
     const database = new DatabaseSync(join(root, 'metadata.sqlite'))
     try {
       const tables = database.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all().map(row => row.name)
-      assert.deepEqual(tables, ['analysis_settings', 'audits', 'catalog', 'migrations', 'settings', 'sync_tasks'])
+      assert.deepEqual(tables, ['analysis_settings', 'audits', 'catalog', 'history_download', 'migrations', 'settings', 'sync_tasks'])
     } finally { database.close() }
   } finally { store.close(); await rm(root, { recursive: true, force: true }) }
 })

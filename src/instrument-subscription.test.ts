@@ -53,14 +53,12 @@ async function fixture(definitions = [instrument()], acquire?: () => Promise<unk
     throw new Error(`Unexpected network acquisition: ${url.pathname}`)
   }
   const service = new MarketService(store, () => preferences, fetcher, false)
-  // Metadata/history-target assertions exclude independent chart-history preparation.
+  // Collection assertions exclude independent chart-history preparation.
   service.preparedCharts.setRealtimeSubscriptions = () => undefined
   await service.ready
   projectionIsolation(service)
-  const targets: { instId: string; historyDays: number; asOf: number }[] = []
-  service.history.target = async (instId: string, target: { historyDays: number; asOf: number }) => { targets.push({ instId, ...target }); return [] }
   const close = async () => { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
-  return { root, store, service, preferences, fetcher, requests, targets, close }
+  return { root, store, service, preferences, fetcher, requests, close }
 }
 
 const synchronized = async (service: MarketService) => {
@@ -206,23 +204,22 @@ test('metadata synchronization schedules no idle 30-second or 60-second REST ren
   } finally { t.mock.timers.reset(); await f.close() }
 })
 
-test('a newly durable 5m candle advances only its instrument history target without a REST scan', async t => {
+test('a newly durable 5m candle persists without starting bulk history downloads', async t => {
   const f = await fixture([instrument(), instrument(eth)])
   try {
     await synchronized(f.service)
     const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
-    assert.deepEqual(f.targets.map(target => target.instId).sort(), [btc, eth])
-    f.targets.length = 0
+    assert.deepEqual(f.service.history.sync.listTasks(), [])
     const requests = f.requests.length
     t.mock.method(Date, 'now', () => asOf + fiveMinutes + 1)
     const row = { instrument: btc, timeframe: '5m', timestamp: asOf, open: 100, high: 102, low: 99, close: 101, volume: 1, baseVolume: 0.01, quoteVolume: 101, confirmed: true }
     await f.service.persistCandles(btc, [row])
     await settle(f.service)
-    assert.deepEqual(f.targets, [{ instId: btc, historyDays: f.preferences.historyDays, asOf: asOf + fiveMinutes }])
+    assert.deepEqual(f.service.history.sync.listTasks(), [])
     const [stored] = await f.store.candles({ instrument: btc, timeframe: '5m', from: asOf, through: asOf })
     assert.equal(stored.close, 101)
     await f.service.persistCandles(btc, [row])
-    assert.equal(f.targets.length, 1, 'An unchanged confirmed revision cannot advance an already current target twice.')
+    assert.deepEqual(f.service.history.sync.listTasks(), [], 'An unchanged confirmed revision must not start an archive either.')
     assert.equal(f.requests.length, requests)
   } finally { t.mock.restoreAll(); await f.close() }
 })

@@ -24,10 +24,22 @@ export type DataAudit = {
   issues: { instrument: string; timeframe: string; from: number; through: number; reason: string; repairable: boolean }[]
   error: string
 }
+export type HistoryDownload = {
+  revision: number; serviceSession: string
+  id?: string; phase: 'idle' | 'running' | 'completed' | 'cancelled' | 'failed'
+  startedAt: number | null; updatedAt: number | null; finishedAt: number | null
+  contracts: { completed: number; total: number }
+  streams: { completed: number; total: number }
+  progress: { completed: number; total: number; available: number; unavailable: number; reused: number; pending: number }
+  active: { instrument: string; timeframe: string; source: string; from: number; through: number; status: string; attempts: number; nextAttemptAt: number | null; error: string }[]
+  failures: { instrument: string; timeframe: string; source: string; from: number; through: number; error: string }[]
+  error: string
+}
 export type DesktopCommands = {
   preferences: { input: { action: 'read' } | { action: 'update'; values: PreferencesPatch }; output: Preferences }
   snapshot: { input: { timeframe: RadarTimeframe; sinceRevision?: number; serviceSession?: string }; output: MarketSnapshot | UnchangedSnapshot }
   dataAudit: { input: { action: 'start' | 'cancel' | 'status' | 'repair' }; output: DataAudit }
+  historyDownload: { input: { action: 'start' | 'cancel' | 'status' }; output: HistoryDownload }
   analysisSettings: { input: AnalysisSettingsRequest; output: AnalysisSettings }
   gatewayFetch: { input: { id: string; body: string }; output: { status: number; headers: Record<string, string> } }
   cancelGatewayFetch: { input: string; output: { ok: boolean } }
@@ -46,6 +58,7 @@ export interface RadarDesktop {
   request(value: { preferences: DesktopCommands['preferences']['input'] }): Promise<DesktopCommands['preferences']['output']>
   request(value: { snapshot: DesktopCommands['snapshot']['input'] }): Promise<DesktopCommands['snapshot']['output']>
   request(value: { dataAudit: DesktopCommands['dataAudit']['input'] }): Promise<DesktopCommands['dataAudit']['output']>
+  request(value: { historyDownload: DesktopCommands['historyDownload']['input'] }): Promise<DesktopCommands['historyDownload']['output']>
   request(value: { analysisSettings: DesktopCommands['analysisSettings']['input'] }): Promise<DesktopCommands['analysisSettings']['output']>
   request(value: { gatewayFetch: DesktopCommands['gatewayFetch']['input'] }): Promise<DesktopCommands['gatewayFetch']['output']>
   request(value: { cancelGatewayFetch: DesktopCommands['cancelGatewayFetch']['input'] }): Promise<DesktopCommands['cancelGatewayFetch']['output']>

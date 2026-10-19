@@ -30,6 +30,7 @@ const initialize = (async () => {
   service.subscribePreparedCharts(frame => emit('chart', notifications.encode(frame)))
   service.subscribeMarket(() => emit('market'))
   service.subscribeAudit(report => emit('audit', report))
+  service.subscribeHistoryDownload(report => emit('history-download', report))
   if (workerData.e2eLiveRefresh) void service.refresh().catch(error => console.error(error))
   parentPort.postMessage({ type: 'ready' })
 })()
@@ -45,6 +46,7 @@ async function request(value) {
   }
   if (value.snapshot) return service.snapshot(value.snapshot.timeframe, value.snapshot)
   if (value.dataAudit) return service.dataAuditRequest(value.dataAudit)
+  if (value.historyDownload) return service.historyDownloadRequest(value.historyDownload)
   if (value.chartWindow) {
     const { instId, timeframe, endHour, historyBars } = value.chartWindow
     return service.prepareChartWindow(instId, timeframe, endHour, historyBars)

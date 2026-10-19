@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 
 const intervals = { '5m': 300_000, '15m': 900_000, '1H': 3_600_000 }
 const terminal = new Set(['paused', 'cancelled', 'completed', 'unavailable'])
@@ -26,7 +26,6 @@ const priority = value => {
   return value
 }
 const seriesKey = value => JSON.stringify([value.instrument, value.timeframe, value.source])
-const targetKey = value => `target-${createHash('sha256').update(JSON.stringify([value.instrument, value.timeframe, value.source, value.purpose])).digest('hex')}`
 const intersects = (a, b) => a.from <= b.through && a.through >= b.from
 const clipped = (values, bounds) => values.filter(value => intersects(value, bounds)).map(value => ({ ...value, from: Math.max(value.from, bounds.from), through: Math.min(value.through, bounds.through) }))
 const merged = (values, step) => {
@@ -45,13 +44,11 @@ const subtract = (values, exclusions, step) => exclusions.reduce((remaining, exc
 }), values)
 const slots = (values, step) => values.reduce((total, value) => total + (value.through - value.from) / step + 1, 0)
 
-/** Desired ranges are durable intentions; pages, cursors and consumers are process-local.
- * One planner per series/source shares coverage and a single in-flight API page.
- */
+/** Finite process-local consumers share durable source coverage and one in-flight page per series/source. */
 export class HistorySync {
   constructor(options) {
     const { metadata, store, sources, write, onProgress, onError, now = Date.now } = options ?? {}
-    for (const name of ['putSyncTask', 'listSyncTasks', 'deleteSyncTask']) if (typeof metadata?.[name] !== 'function') throw new TypeError(`metadata.${name} is required.`)
+    for (const name of ['listSyncTasks', 'deleteSyncTask']) if (typeof metadata?.[name] !== 'function') throw new TypeError(`metadata.${name} is required.`)
     if (typeof store?.missingCandleRanges !== 'function') throw new TypeError('store.missingCandleRanges is required.')
     if (!write && typeof store.appendCandles !== 'function') throw new TypeError('store.appendCandles or write is required.')
     if (!sources || !Object.keys(sources).length) throw new TypeError('At least one history source is required.')
@@ -74,55 +71,27 @@ export class HistorySync {
     this.maxAttempts = integer(options.maxAttempts ?? 5, 'maxAttempts', 1)
     this.maxRetainedTerminalTasks = integer(options.maxRetainedTerminalTasks ?? 512, 'maxRetainedTerminalTasks', 1)
     if (this.minRequestIntervalMS > 2147483647 || this.maxRetryDelayMS > 2147483647) throw new TypeError('History delays cannot exceed 2147483647 milliseconds.')
-    this.tasks = new Map(); this.groups = new Map(); this.waiters = new Map(); this.idleWaiters = []
-    this.active = new Map(); this.coverageChecks = new Map(); this.coverageEpochs = new Map(); this.leaseDeadlines = new Map()
-    this.closed = false; this.started = null; this.closing = null; this.timer = null; this.leaseTimer = null; this.leaseDeadline = null; this.draining = false
-    this.persistTail = Promise.resolve(); this.pendingIntents = null; this.requestTail = Promise.resolve(); this.lastRequestAt = null
+    this.tasks = new Map(); this.groups = new Map(); this.waiters = new Map(); this.controls = new Map(); this.idleWaiters = []
+    this.active = new Map(); this.coverageChecks = new Map(); this.coverageEpochs = new Map()
+    this.closed = false; this.started = null; this.closing = null; this.timer = null; this.draining = false
+    this.requestTail = Promise.resolve(); this.lastRequestAt = null
     this.turn = 0; this.urgentTurns = 0; this.fatalError = null; this.instrumentEpochs = new Map()
   }
 
   start() {
     if (this.closed) return Promise.reject(new Error('HistorySync is closed.'))
-    this.started ??= this.restore().then(() => { this.kick(); return this })
+    this.started ??= this.removeLegacyTasks().then(() => { this.kick(); return this })
     return this.started
   }
 
-  async restore() {
-    const saved = await this.metadata.listSyncTasks(), targets = new Map(), obsolete = new Set()
+  async removeLegacyTasks() {
+    const saved = await this.metadata.listSyncTasks()
     if (!Array.isArray(saved)) throw new TypeError('metadata.listSyncTasks must return an array.')
-    for (const value of saved) {
-      // Viewport requests and their old execution checkpoints are not restart intentions.
-      if (value?.priority !== 'background' || !['history', 'warmup'].includes(value?.purpose) || value.purpose === 'warmup' && value.source !== 'candles') {
-        if (value?.id) obsolete.add(value.id)
-        continue
-      }
-      const identity = descriptor(value), bounds = range(value, intervals[value.timeframe])
-      if (!this.sources.has(identity.source)) { obsolete.add(value.id); continue }
-      const id = targetKey(value), previous = targets.get(id)
-      if (value.id !== id) obsolete.add(value.id)
-      if (!previous || (value.updatedAt ?? 0) > (previous.updatedAt ?? 0)) targets.set(id, { ...clone(value), ...identity, ...bounds, id, priority: 'background' })
-    }
-    for (const task of [...targets.values()].sort((a, b) => Number(a.purpose === 'warmup') - Number(b.purpose === 'warmup'))) {
-      // A saved intention records a window size, not yesterday's execution cursor.
-      const step = intervals[task.timeframe], history = targets.get(targetKey({ ...task, purpose: 'history' }))
-      const width = task.through - task.from
-      const through = task.purpose === 'warmup' && history ? history.from - step : Math.floor(this.now() / step) * step - step
-      if (through < 0) { obsolete.add(task.id); continue }
-      task.from = Math.max(0, through - width); task.through = through
-      if (!['paused', 'cancelled'].includes(task.status)) task.status = 'queued'
-      task.remaining = [{ from: task.from, through: task.through }]; task.unavailableRanges = []
-      task.cursor = null; task.cursorRange = null; task.attempts = 0; task.nextAttemptAt = null; task.inspected = false
-      this.tasks.set(task.id, task); this.group(task).tasks.add(task.id)
-    }
-    const intentions = [...this.tasks.values()].map(clone)
-    if (intentions.length) {
-      if (this.metadata.putSyncTasks) await this.metadata.putSyncTasks(intentions)
-      else for (const task of intentions) await this.metadata.putSyncTask(task)
-    }
-    for (const id of this.tasks.keys()) obsolete.delete(id)
-    if (obsolete.size) {
-      if (this.metadata.deleteSyncTasks) await this.metadata.deleteSyncTasks([...obsolete])
-      else for (const id of obsolete) await this.metadata.deleteSyncTask(id)
+    // Old rolling archive goals must never restart merely because the app opens.
+    const ids = [...new Set(saved.map(task => task?.id).filter(id => typeof id === 'string' && id))]
+    if (ids.length) {
+      if (this.metadata.deleteSyncTasks) await this.metadata.deleteSyncTasks(ids)
+      else for (const id of ids) await this.metadata.deleteSyncTask(id)
     }
   }
 
@@ -138,99 +107,35 @@ export class HistorySync {
     if (epoch !== (this.instrumentEpochs.get(input?.instrument) ?? 0)) throw new DOMException('The instrument history demand was retired.', 'AbortError')
     const identity = descriptor(input), bounds = range(input, intervals[identity.timeframe])
     if (!this.sources.has(identity.source)) throw new TypeError(`History source is unavailable: ${identity.source}.`)
-    const purpose = input.purpose ?? 'requested'
-    if (!['requested', 'history', 'warmup'].includes(purpose)) throw new TypeError('Invalid history purpose.')
-    const requestedPriority = priority(input.priority ?? 'background')
-    if (purpose === 'warmup' && identity.source !== 'candles') throw new TypeError('Only price history needs indicator warmup.')
-    const id = purpose === 'requested' ? `consumer-${randomUUID()}` : targetKey({ ...identity, purpose })
-    let task = this.tasks.get(id)
-    if (task) {
-      const changed = task.from !== bounds.from || task.through !== bounds.through
-      Object.assign(task, bounds)
-      if (changed && !['paused', 'cancelled'].includes(task.status)) { task.status = 'queued'; task.nextAttemptAt = null; task.attempts = 0 }
-      if (!changed) return clone(task)
-      task.remaining = [bounds]; task.unavailableRanges = []; task.cursor = null; task.cursorRange = null
-    } else {
-      const timestamp = integer(this.now(), 'now()')
-      task = { schemaVersion: 1, id, ...identity, ...bounds, purpose, priority: purpose === 'requested' ? requestedPriority : 'background',
-        status: 'queued', createdAt: timestamp, updatedAt: timestamp, nextAttemptAt: null, attempts: 0, cursor: null, cursorRange: null,
-        unavailableRanges: [], remaining: [bounds], writtenRecords: 0, inspected: false, lastError: null }
-      this.tasks.set(id, task); this.group(task).tasks.add(id)
-    }
-    if (purpose !== 'requested') await this.saveIntent(task)
+    if (input.purpose !== undefined && input.purpose !== 'requested') throw new TypeError('Invalid history purpose.')
+    const id = `consumer-${randomUUID()}`, timestamp = integer(this.now(), 'now()')
+    const task = { schemaVersion: 1, id, ...identity, ...bounds, purpose: 'requested', priority: priority(input.priority ?? 'background'),
+      status: 'queued', createdAt: timestamp, updatedAt: timestamp, nextAttemptAt: null, attempts: 0, cursor: null, cursorRange: null,
+      unavailableRanges: [], remaining: [bounds], writtenRecords: 0, coveredRecords: 0, unavailableRecords: 0, localRecords: 0, inspected: false, lastError: null }
+    this.tasks.set(id, task); this.group(task).tasks.add(id)
     const active = this.group(task).active
     if (active && active.rank < priorities.continuity && priorities[task.priority] >= priorities.continuity
       && (!active.bounds || !intersects(task, active.bounds))) active.controller.abort()
-    this.notify(task); this.scheduleLeaseWake(this.group(task)); this.kick()
+    this.notify(task); this.kick()
     return clone(task)
   }
 
-  async enqueueTarget(input) {
-    const epoch = this.instrumentEpochs.get(input?.instrument) ?? 0
-    const identity = descriptor(input), step = intervals[identity.timeframe]
-    const days = integer(input.historyDays ?? 30, 'historyDays', 1), warmup = integer(input.warmupCandles ?? (identity.source === 'candles' ? 200 : 0), 'warmupCandles')
-    if (days > 3650 || warmup > 100000) throw new TypeError('History target is too large.')
-    const asOf = integer(input.asOf ?? this.now(), 'asOf', step), through = Math.floor(asOf / step) * step - step
-    const from = Math.max(0, through - days * 86400000 + step)
-    const history = await this.enqueue({ ...identity, from, through, purpose: 'history', priority: 'background' })
-    if (epoch !== (this.instrumentEpochs.get(identity.instrument) ?? 0)) throw new DOMException('The instrument history target was retired.', 'AbortError')
-    const extra = identity.source === 'candles' && warmup && from >= step
-      ? await this.enqueue({ ...identity, from: Math.max(0, from - warmup * step), through: from - step, purpose: 'warmup', priority: 'background' }) : null
-    if (!extra) {
-      const old = this.tasks.get(targetKey({ ...identity, purpose: 'warmup' }))
-      if (old) { await this.cancel(old.id); this.tasks.delete(old.id); this.group(old).tasks.delete(old.id); await this.deleteIntent(old.id) }
-    }
-    return { history, warmup: extra }
-  }
-
   async removeTargets(instIds) {
-    const removed = new Set(instIds), persisted = []
+    const removed = new Set(instIds)
     for (const id of removed) this.instrumentEpochs.set(id, (this.instrumentEpochs.get(id) ?? 0) + 1)
     await this.start(); this.assertOpen()
-    for (const task of [...this.tasks.values()]) if (removed.has(task.instrument)) {
-      task.status = 'cancelled'; task.nextAttemptAt = null
-      this.notify(task); this.settle(task)
-      if (task.purpose !== 'requested') persisted.push(task.id)
+    const tasks = [...this.tasks.values()].filter(task => removed.has(task.instrument))
+    await Promise.all(tasks.filter(task => !terminal.has(task.status) || this.controls.has(task.id)).map(task => this.cancel(task.id)))
+    for (const task of tasks) {
       this.tasks.delete(task.id); this.group(task).tasks.delete(task.id)
     }
     for (const group of this.groups.values()) if (removed.has(group.instrument)) {
       group.active?.controller.abort(); this.coverageChecks.delete(group.key)
       if (!group.active) this.groups.delete(group.key)
     }
-    const pending = this.persistTail.then(async () => {
-      if (this.metadata.deleteSyncTasks) await this.metadata.deleteSyncTasks(persisted)
-      else for (const id of persisted) await this.metadata.deleteSyncTask(id)
-    })
-    this.persistTail = pending.catch(error => this.fail(error))
-    await pending; this.scheduleLeaseWake(); this.kick(); this.settleIdle()
+    this.kick(); this.settleIdle()
   }
 
-  saveIntent(task) {
-    const snapshot = clone(task)
-    // Persist only desired bounds and explicit stop state. Execution progress is rebuilt from coverage.
-    snapshot.status = ['paused', 'cancelled'].includes(task.status) ? task.status : 'queued'
-    snapshot.remaining = [{ from: task.from, through: task.through }]; snapshot.unavailableRanges = []
-    snapshot.cursor = null; snapshot.cursorRange = null; snapshot.nextAttemptAt = null; snapshot.attempts = 0; snapshot.writtenRecords = 0; snapshot.inspected = false; snapshot.lastError = null
-    let batch = this.pendingIntents
-    if (!batch) {
-      batch = { entries: new Map(), waiters: [] }
-      this.pendingIntents = batch
-      const pending = this.persistTail.then(async () => {
-        if (this.pendingIntents === batch) this.pendingIntents = null
-        try {
-          const values = [...batch.entries.values()]
-          if (this.metadata.putSyncTasks) await this.metadata.putSyncTasks(values)
-          else for (const value of values) await this.metadata.putSyncTask(value)
-          for (const waiter of batch.waiters) waiter.resolve()
-        } catch (error) { for (const waiter of batch.waiters) waiter.reject(error); throw error }
-      })
-      this.persistTail = pending.catch(error => this.fail(error))
-    }
-    batch.entries.set(snapshot.id, snapshot)
-    return new Promise((resolve, reject) => batch.waiters.push({ resolve, reject }))
-  }
-
-  deleteIntent(id) { const pending = this.persistTail.then(() => this.metadata.deleteSyncTask(id)); this.persistTail = pending.catch(error => this.fail(error)); return pending }
   getTask(id) { const task = this.tasks.get(text(id, 'task ID')); return task ? clone(task) : null }
   listTasks() { return [...this.tasks.values()].map(clone) }
   progressFor(ids, timeframe) {
@@ -247,26 +152,49 @@ export class HistorySync {
   async cancel(id) { return this.control(id, 'cancelled') }
   async control(id, status) {
     await this.start(); this.assertOpen()
+    const pending = this.controls.get(id)
+    if (pending) {
+      const result = await pending
+      if (result.status === status) return result
+    }
     const task = this.requireTask(id); task.status = status; task.nextAttemptAt = null
-    if (task.purpose !== 'requested') await this.saveIntent(task)
-    const group = this.group(task)
+    const group = this.group(task), entry = group.active
     // Cancelling one consumer never cancels another consumer's shared page.
-    if (group.active && !this.demands(group).some(value => !group.active.bounds || intersects(value, group.active.bounds))) group.active.controller.abort()
-    this.notify(task); this.settle(task); this.prune(); this.scheduleLeaseWake(group); this.kick()
-    return clone(task)
+    if (entry && !this.demands(group).some(value => !entry.bounds || intersects(value, entry.bounds))) entry.controller.abort()
+    if (!entry?.writing || !intersects(task, entry.bounds)) {
+      this.notify(task); this.settle(task); this.prune(); this.kick()
+      return clone(task)
+    }
+    // An admitted durable mutation owns its completion even after its last
+    // consumer stops. Never wait for a shared page still on the network.
+    const stopped = Promise.resolve().then(async () => {
+      try {
+        await entry.writePromise.catch(() => undefined)
+        await this.missing(task, task.priority)
+        this.measure(task, this.coverageChecks.get(group.key), [...task.unavailableRanges, ...entry.unavailable])
+      } finally {
+        this.controls.delete(id)
+        this.notify(task); this.settle(task); this.prune(); this.kick(); this.settleIdle()
+      }
+      return clone(task)
+    })
+    this.controls.set(id, stopped)
+    return stopped
   }
+
   async resume(id) {
     await this.start(); this.assertOpen()
+    const stopping = this.controls.get(id)
+    if (stopping) await stopping
     const task = this.requireTask(id)
     task.status = 'queued'; task.nextAttemptAt = null; task.attempts = 0; task.lastError = null; task.unavailableRanges = []
     this.invalidate(task)
-    if (task.purpose !== 'requested') await this.saveIntent(task)
-    this.notify(task); this.scheduleLeaseWake(this.group(task)); this.kick(); return clone(task)
+    this.notify(task); this.kick(); return clone(task)
   }
   async waitFor(id) {
     await this.start(); this.assertOpen()
     const task = this.requireTask(id)
-    if (terminal.has(task.status)) return clone(task)
+    if (terminal.has(task.status) && !this.controls.has(task.id)) return clone(task)
     return new Promise((resolve, reject) => { const values = this.waiters.get(id) ?? []; values.push({ resolve, reject }); this.waiters.set(id, values) })
   }
   async whenIdle() { await this.start(); this.assertOpen(); if (this.isIdle()) return; return new Promise((resolve, reject) => this.idleWaiters.push({ resolve, reject })) }
@@ -281,8 +209,8 @@ export class HistorySync {
   async missing(query, requestPriority) {
     const key = seriesKey(query), step = intervals[query.timeframe], previous = this.coverageChecks.get(key)
     const epoch = this.coverageEpochs.get(key) ?? 0, version = await this.store.coverageVersion?.(query)
-    // A series has one coverage cache, shared by all consumers and rolling goals.
-    const retained = [...this.group(query).tasks].map(id => this.tasks.get(id)).filter(task => task && (task.purpose !== 'requested' || !terminal.has(task.status)))
+    // A series has one coverage cache shared by every active consumer.
+    const retained = [...this.group(query).tasks].map(id => this.tasks.get(id)).filter(task => task && (!terminal.has(task.status) || this.controls.has(task.id)))
     const bounds = { from: Math.min(query.from, ...retained.map(task => task.from)), through: Math.max(query.through, ...retained.map(task => task.through)) }
     let gaps = clipped(previous?.remaining ?? [], bounds), leases = clipped(previous?.leases ?? [], bounds)
     let refresh = previous ? [...subtract([bounds], [previous], step), ...clipped(previous.dirty, bounds), ...leases.filter(lease => lease.expiresAt <= this.now())] : [bounds]
@@ -325,65 +253,6 @@ export class HistorySync {
     return clipped(values.map(value => ({ ...range(value, step), reason: text(value.reason, 'unavailable reason') })), query)
   }
 
-  scheduleLeaseWake(changedGroup) {
-    if (this.closed || this.fatalError) return
-    const deadlineFor = group => {
-      const goals = [...group.tasks].map(id => this.tasks.get(id)).filter(task => task && task.purpose !== 'requested' && ['completed', 'unavailable'].includes(task.status))
-      if (!goals.length) return Infinity
-      let deadline = Infinity
-      for (const lease of this.coverageChecks.get(group.key)?.leases ?? []) if (goals.some(goal => intersects(goal, lease))) deadline = Math.min(deadline, lease.expiresAt)
-      return deadline
-    }
-    if (changedGroup) {
-      const previous = this.leaseDeadlines.get(changedGroup.key) ?? Infinity, next = deadlineFor(changedGroup)
-      if (previous === next) return
-      if (Number.isFinite(next)) this.leaseDeadlines.set(changedGroup.key, next)
-      else this.leaseDeadlines.delete(changedGroup.key)
-      if (next > (this.leaseDeadline ?? Infinity) && previous !== this.leaseDeadline) return
-    } else {
-      this.leaseDeadlines.clear()
-      for (const group of this.groups.values()) {
-        const deadline = deadlineFor(group)
-        if (Number.isFinite(deadline)) this.leaseDeadlines.set(group.key, deadline)
-      }
-    }
-    const deadline = Math.min(Infinity, ...this.leaseDeadlines.values())
-    if (this.leaseDeadline === deadline) return
-    clearTimeout(this.leaseTimer); this.leaseTimer = null; this.leaseDeadline = deadline
-    if (!Number.isFinite(deadline)) return
-    this.leaseTimer = setTimeout(() => this.processLeaseDeadline(), Math.min(2147483647, Math.max(1, deadline - this.now())))
-    this.leaseTimer.unref?.()
-  }
-
-  processLeaseDeadline() {
-    clearTimeout(this.leaseTimer); this.leaseTimer = null; this.leaseDeadline = null
-    if (this.closed || this.fatalError) return
-    const now = this.now()
-    for (const [key, deadline] of this.leaseDeadlines) {
-      if (deadline > now) continue
-      this.leaseDeadlines.delete(key)
-      const group = this.groups.get(key), cached = this.coverageChecks.get(key)
-      if (!group || !cached) continue
-      const expired = cached.leases.filter(lease => lease.expiresAt <= now)
-      for (const id of group.tasks) {
-        const task = this.tasks.get(id)
-        if (!task || task.purpose === 'requested' || !['completed', 'unavailable'].includes(task.status)) continue
-        const portions = clipped(expired, task)
-        if (!portions.length) continue
-        cached.dirty = merged([...cached.dirty, ...portions], intervals[group.timeframe])
-        task.status = 'queued'; task.nextAttemptAt = null
-        this.notify(task)
-      }
-    }
-    this.kick()
-    const future = Math.min(Infinity, ...this.leaseDeadlines.values())
-    this.leaseDeadline = future
-    if (Number.isFinite(future)) {
-      this.leaseTimer = setTimeout(() => this.processLeaseDeadline(), Math.min(2147483647, Math.max(1, future - now)))
-      this.leaseTimer.unref?.()
-    }
-  }
-
   kick() {
     if (this.closed || this.fatalError || this.draining) return
     clearTimeout(this.timer)
@@ -414,7 +283,7 @@ export class HistorySync {
         const { group, rank } = candidates[0]
         this.urgentTurns = rank >= priorities.continuity ? this.urgentTurns + 1 : 0
         group.lastServed = ++this.turn
-        const entry = { group, rank, bounds: null, controller: new AbortController(), promise: null }
+        const entry = { group, rank, bounds: null, controller: new AbortController(), promise: null, writing: false, writePromise: null, unavailable: [] }
         group.active = entry; this.active.set(group.key, entry)
         entry.promise = this.run(entry).catch(error => this.fail(error)).finally(() => {
           group.active = null; this.active.delete(group.key); this.prune(); this.kick(); this.settleIdle()
@@ -450,13 +319,13 @@ export class HistorySync {
     const initial = this.ready(group)
     const bounds = merged(initial, step), source = this.sources.get(group.source)
     try {
-      let gaps = [], unavailable = []
+      let gaps = [], unavailable = initial.flatMap(task => task.unavailableRanges)
       for (const portion of bounds) {
         const query = { instrument: group.instrument, timeframe: group.timeframe, source: group.source, ...portion }
         const raw = await this.missing(query, initial[0].priority)
         signal.throwIfAborted()
         const excluded = source.inspect ? this.unavailable(query, await source.inspect({ ...query, priority: initial[0].priority, cursor: null, signal })) : []
-        unavailable.push(...excluded); gaps.push(...subtract(raw, excluded, step))
+        unavailable.push(...excluded); gaps.push(...subtract(raw, unavailable, step))
       }
       this.assess(group, unavailable)
       const ready = this.ready(group).sort((a, b) => priorities[b.priority] - priorities[a.priority] || a.createdAt - b.createdAt)
@@ -483,20 +352,27 @@ export class HistorySync {
         return record.timestamp >= page.from && record.timestamp <= page.through
       })
       const before = slots(clipped(gaps, page), step)
+      entry.unavailable = unavailable
+      const commit = async () => {
+        if (records.length) {
+          // Once a write is admitted, cancellation cannot abandon its durable facts.
+          await this.write(records, { ...clone(selected), ...page })
+          this.invalidate({ ...query, from: Math.min(...records.map(row => row.timestamp)), through: Math.max(...records.map(row => row.timestamp)) })
+          for (const task of participants) task.writtenRecords += records.filter(row => row.timestamp >= task.from && row.timestamp <= task.through).length
+        }
+        const after = await this.missing(query, selected.priority)
+        if (result.unavailable) unavailable.push(...this.unavailable(query, result))
+        for (const task of participants) if (!terminal.has(task.status)) task.status = 'queued'
+        this.assess(group, unavailable)
+        if (slots(subtract(after, unavailable, step), step) >= before && this.demands(group).some(task => intersects(task, page))) throw new Error('The history source made no persisted coverage progress.')
+        for (const task of participants) if (!terminal.has(task.status)) { task.attempts = 0; task.lastError = null }
+      }
       if (records.length) {
-        // Once a write is admitted, cancellation cannot abandon its durable facts.
-        await this.write(records, { ...clone(selected), ...page })
-        this.invalidate({ ...query, from: Math.min(...records.map(row => row.timestamp)), through: Math.max(...records.map(row => row.timestamp)) })
-        for (const task of participants) task.writtenRecords += records.filter(row => row.timestamp >= task.from && row.timestamp <= task.through).length
-      }
-      const after = await this.missing(query, selected.priority)
-      if (result.unavailable) unavailable.push(...this.unavailable(query, result))
-      for (const task of participants) if (!terminal.has(task.status)) {
-        task.status = 'queued'
-      }
-      this.assess(group, unavailable)
-      if (slots(subtract(after, unavailable, step), step) >= before && this.demands(group).some(task => intersects(task, page))) throw new Error('The history source made no persisted coverage progress.')
-      for (const task of participants) if (!terminal.has(task.status)) { task.attempts = 0; task.lastError = null }
+        entry.writing = true
+        entry.writePromise = commit().finally(() => { entry.writing = false })
+        await entry.writePromise
+      } else await commit()
+
     } catch (error) {
       if (signal.aborted || this.closed) {
         for (const task of this.demands(group)) if (task.status === 'running') task.status = 'queued'
@@ -504,7 +380,7 @@ export class HistorySync {
       }
       for (const task of this.demands(group).filter(task => !entry.bounds || intersects(task, entry.bounds))) {
         task.attempts++; task.lastError = error instanceof Error ? error.message : String(error)
-        task.status = task.purpose === 'requested' && task.attempts >= this.maxAttempts ? 'paused' : 'retry'
+        task.status = task.attempts >= this.maxAttempts ? 'paused' : 'retry'
         task.nextAttemptAt = task.status === 'retry' ? this.now() + Math.min(this.maxRetryDelayMS, this.retryBaseMS * 2 ** Math.min(30, task.attempts - 1)) : null
         this.notify(task); this.settle(task)
       }
@@ -518,32 +394,43 @@ export class HistorySync {
     for (const task of this.demands(group)) {
       // A newly admitted consumer outside this coverage read remains queued.
       if (task.from < cached.from || task.through > cached.through) continue
-      task.remaining = clipped(cached.remaining, task)
-      task.unavailableRanges = clipped(unavailable, task); task.inspected = true
-      if (!subtract(task.remaining, task.unavailableRanges, intervals[task.timeframe]).length) {
+      this.measure(task, cached, unavailable)
+      const step = intervals[task.timeframe]
+      if (!subtract(task.remaining, task.unavailableRanges, step).length) {
         task.status = task.remaining.length ? 'unavailable' : 'completed'; task.nextAttemptAt = null; task.attempts = 0; task.lastError = null
       }
       this.notify(task); this.settle(task)
     }
-    this.scheduleLeaseWake(group)
+  }
+  measure(task, cached, unavailable) {
+    if (!cached || task.from < cached.from || task.through > cached.through) return
+    const step = intervals[task.timeframe]
+    task.remaining = clipped(cached.remaining, task)
+    task.unavailableRanges = [...new Map(clipped(unavailable, task).map(value => [JSON.stringify(value), value])).values()]
+    const coveredLeases = subtract(merged(clipped(cached.leases.filter(lease => lease.expiresAt > this.now()), task), step), task.remaining, step)
+    const unavailableMissing = task.remaining.flatMap(portion => clipped(task.unavailableRanges, portion))
+    task.coveredRecords = slots([task], step) - slots(task.remaining, step) - slots(coveredLeases, step)
+    task.unavailableRecords = slots(merged([...coveredLeases, ...unavailableMissing], step), step)
+    if (!task.inspected) task.localRecords = task.coveredRecords
+    task.inspected = true
   }
   notify(task) { task.updatedAt = this.now(); try { Promise.resolve(this.onProgress?.(clone(task))).catch(() => undefined) } catch { /* Detached observer. */ } }
-  settle(task) { if (!terminal.has(task.status)) return; const waiters = this.waiters.get(task.id) ?? []; this.waiters.delete(task.id); for (const waiter of waiters) waiter.resolve(clone(task)) }
+  settle(task) { if (!terminal.has(task.status) || this.controls.has(task.id)) return; const waiters = this.waiters.get(task.id) ?? []; this.waiters.delete(task.id); for (const waiter of waiters) waiter.resolve(clone(task)) }
   prune() {
-    const finished = [...this.tasks.values()].filter(task => task.purpose === 'requested' && terminal.has(task.status) && !this.waiters.has(task.id))
+    const finished = [...this.tasks.values()].filter(task => terminal.has(task.status) && !this.waiters.has(task.id) && !this.controls.has(task.id))
     for (const task of finished.slice(0, Math.max(0, finished.length - this.maxRetainedTerminalTasks))) { this.tasks.delete(task.id); this.group(task).tasks.delete(task.id) }
   }
-  isIdle() { return !this.active.size && ![...this.tasks.values()].some(task => !terminal.has(task.status)) }
+  isIdle() { return !this.active.size && !this.controls.size && ![...this.tasks.values()].some(task => !terminal.has(task.status)) }
   settleIdle() { if (this.isIdle()) for (const waiter of this.idleWaiters.splice(0)) waiter.resolve() }
-  fail(error) { this.fatalError = error; clearTimeout(this.leaseTimer); this.leaseTimer = null; this.leaseDeadlines.clear(); for (const entry of this.active.values()) entry.controller.abort(); for (const waiters of this.waiters.values()) for (const waiter of waiters) waiter.reject(error); this.waiters.clear(); for (const waiter of this.idleWaiters.splice(0)) waiter.reject(error) }
+  fail(error) { this.fatalError = error; for (const entry of this.active.values()) entry.controller.abort(); for (const waiters of this.waiters.values()) for (const waiter of waiters) waiter.reject(error); this.waiters.clear(); for (const waiter of this.idleWaiters.splice(0)) waiter.reject(error) }
   close() {
     if (this.closing) return this.closing
-    this.closed = true; clearTimeout(this.timer); clearTimeout(this.leaseTimer); this.leaseTimer = null; this.leaseDeadline = null; this.leaseDeadlines.clear()
+    this.closed = true; clearTimeout(this.timer)
     for (const entry of this.active.values()) entry.controller.abort()
     const error = new Error('HistorySync is closed.')
     for (const values of this.waiters.values()) for (const waiter of values) waiter.reject(error)
     this.waiters.clear(); for (const waiter of this.idleWaiters.splice(0)) waiter.reject(error)
-    this.closing = (async () => { await this.started?.catch(() => undefined); await Promise.all([...this.active.values()].map(entry => entry.promise)); await this.persistTail })()
+    this.closing = (async () => { await this.started?.catch(() => undefined); await Promise.all([...this.active.values()].map(entry => entry.promise)); await Promise.allSettled([...this.controls.values()]) })()
     return this.closing
   }
 }

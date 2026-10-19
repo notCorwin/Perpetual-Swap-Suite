@@ -29,7 +29,6 @@ const fixture = async () => {
   await service.ready
   service.projectListEntry = async () => null
   service.updateRanking = async () => undefined
-  service.history.target = async () => []
   const admit = (expiresAt = Date.now() + 90_000) => {
     service.instruments.set(instrument.instId, instrument)
     service.candidateIDs = new Set([instrument.instId])

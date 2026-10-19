@@ -10,12 +10,103 @@ import { Spinner } from '@/components/ui/spinner'
 import { Progress } from '@/components/ui/progress'
 import { AnalysisSettingsButton } from '@/AnalysisSettingsDialog'
 import { LIQUIDITY_FIELDS, preferencesDraft, validatePreferencesDraft, type Preferences } from '@/renderer-preferences'
-import type { DataAudit } from '@/desktop-contract'
+import type { DataAudit, HistoryDownload } from '@/desktop-contract'
 import { RADAR_TIMEFRAMES, type RadarTimeframe } from '@/timeframe'
 import { SnapshotOrder } from '@/snapshot-order'
 
 const emptyAudit: DataAudit = { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '', revision: 0, serviceSession: '' }
 const errorMessage = (cause: unknown) => cause instanceof Error ? cause.message : 'The desktop service could not complete this request.'
+const emptyDownload: HistoryDownload = {
+  revision: 0, serviceSession: '', phase: 'idle', startedAt: null, updatedAt: null, finishedAt: null,
+  contracts: { completed: 0, total: 0 }, streams: { completed: 0, total: 0 },
+  progress: { completed: 0, total: 0, available: 0, unavailable: 0, reused: 0, pending: 0 },
+  active: [], failures: [], error: '',
+}
+const count = (value: number) => value.toLocaleString('en-US')
+const downloadTime = (value: number) => `${new Date(value).toLocaleString('en-US', { timeZone: 'UTC', hour12: false })} UTC`
+
+function HistoryDownloadSettings({ open }: { open: boolean }) {
+  const [download, setDownload] = useState<HistoryDownload>(emptyDownload)
+  const [ready, setReady] = useState(false)
+  const [busy, setBusy] = useState<'start' | 'cancel' | 'status' | null>(null)
+  const [requestError, setRequestError] = useState('')
+  const [statusError, setStatusError] = useState('')
+  const lifecycle = useRef(0)
+  const sequence = useRef(0)
+  const accepted = useRef(0)
+  const order = useRef(new SnapshotOrder())
+  const accept = useCallback((value: HistoryDownload) => {
+    if (!order.current.accept(value)) return
+    accepted.current += 1
+    setDownload(value); setReady(true); setStatusError('')
+  }, [])
+  const request = useCallback(async (action: 'start' | 'cancel' | 'status') => {
+    const currentLifecycle = lifecycle.current
+    const currentSequence = ++sequence.current
+    const before = accepted.current
+    setBusy(action); setRequestError(''); setStatusError('')
+    try {
+      const value = await window.radarDesktop.request({ historyDownload: { action } })
+      if (currentLifecycle === lifecycle.current && currentSequence === sequence.current) accept(value)
+    } catch (cause) {
+      if (currentLifecycle !== lifecycle.current || currentSequence !== sequence.current) return
+      if (action === 'status') {
+        if (before === accepted.current) setStatusError(errorMessage(cause))
+      } else setRequestError(errorMessage(cause))
+    } finally {
+      if (currentLifecycle === lifecycle.current && currentSequence === sequence.current) setBusy(null)
+    }
+  }, [accept])
+  useEffect(() => {
+    if (!open) return
+    lifecycle.current++
+    setReady(false)
+    const published = (event: Event) => accept((event as CustomEvent<HistoryDownload>).detail)
+    window.addEventListener('radar-history-download-changed', published)
+    void request('status')
+    return () => { window.removeEventListener('radar-history-download-changed', published); lifecycle.current++ }
+  }, [open, accept, request])
+  const { progress, contracts, streams } = download
+  const percent = progress.total ? Math.min(100, progress.completed / progress.total * 100) : 0
+  const percentLabel = (Math.floor(percent * 10) / 10).toFixed(1)
+  const phase = download.phase === 'completed'
+    ? progress.unavailable > 0 ? 'Completed with unavailable data' : 'Download complete'
+    : { idle: 'Ready to download', running: 'Downloading history', cancelled: 'Download cancelled', failed: 'Download failed' }[download.phase]
+  return <FieldSet>
+    <FieldLegend>Qualified contract history</FieldLegend>
+    <FieldDescription>Download all available history for contracts meeting the saved filters when the download starts. Save settings first to apply filter changes. The contract list and end time stay fixed for this download.</FieldDescription>
+    <FieldDescription>Includes 5m, 15m and 1H candles, open interest and taker buy/sell data, from listing through the latest completed interval. The audit lookback does not limit this download. Sources may not provide the full listing history. Existing valid data is reused.</FieldDescription>
+    <p role="status" className="text-sm">{!ready ? busy === 'status' ? 'Reading download status…' : 'Download status unavailable' : `${phase} · ${percentLabel}%`}</p>
+    <Progress aria-label="History download progress" aria-valuetext={`${count(progress.completed)} of ${count(progress.total)} source timestamps checked; ${count(progress.unavailable)} unavailable`} value={download.phase === 'running' && progress.total === 0 ? null : percent} />
+    <dl className="grid grid-cols-[1fr_auto] gap-x-4 gap-y-1 text-sm tabular-nums" aria-label="History download details">
+      <dt>Checked source timestamps</dt><dd>{count(progress.completed)} / {count(progress.total)}</dd>
+      <dt>Available</dt><dd>{count(progress.available)}</dd>
+      <dt>Unavailable from source</dt><dd>{count(progress.unavailable)}</dd>
+      <dt>Reused from local data</dt><dd>{count(progress.reused)}</dd>
+      <dt>Pending source timestamps</dt><dd>{count(progress.pending)}</dd>
+      <dt>Contracts finished</dt><dd>{count(contracts.completed)} / {count(contracts.total)}</dd>
+      <dt>Data streams finished</dt><dd>{count(streams.completed)} / {count(streams.total)}</dd>
+    </dl>
+    <FieldDescription>Progress counts verified source timestamps, including confirmed unavailable intervals. Unavailable data is not stored as successful market data. The download continues when you close settings.</FieldDescription>
+    <div className="flex flex-wrap gap-2">
+      <Button type="button" variant="outline" onClick={() => void request('start')} disabled={!ready || Boolean(busy) || download.phase === 'running'}>{busy === 'start' && <Spinner data-icon="inline-start" />}Download all qualified history</Button>
+      <Button type="button" variant="outline" onClick={() => void request('cancel')} disabled={!ready || Boolean(busy) || download.phase !== 'running'}>{busy === 'cancel' && <Spinner data-icon="inline-start" />}Cancel download</Button>
+      {statusError && <Button type="button" variant="outline" onClick={() => void request('status')} disabled={Boolean(busy)}>Retry status</Button>}
+    </div>
+    {(requestError || statusError || download.error) && <p role="alert" className="text-sm text-destructive">{requestError || statusError || download.error}</p>}
+    {download.startedAt !== null && <p className="text-sm text-muted-foreground">Started {downloadTime(download.startedAt)}{download.updatedAt !== null && ` · Updated ${downloadTime(download.updatedAt)}`}{download.finishedAt !== null && ` · Finished ${downloadTime(download.finishedAt)}`}</p>}
+    {download.active.length > 0 && <ul className="flex max-h-48 flex-col gap-2 overflow-y-auto text-sm" aria-label="Active history downloads">{download.active.map(task => <li key={`${task.instrument}-${task.timeframe}-${task.source}-${task.from}-${task.through}`}>
+      <strong>{task.instrument} · {task.timeframe} · {task.source}</strong>
+      <p>{downloadTime(task.from)} – {downloadTime(task.through)}</p>
+      <p>{task.status} · Consecutive failures: {count(task.attempts)}{task.nextAttemptAt !== null && ` · Next retry: ${downloadTime(task.nextAttemptAt)}`}</p>
+      {task.error && <p>{task.error}</p>}
+    </li>)}</ul>}
+    {download.failures.length > 0 && <ul className="flex max-h-48 flex-col gap-2 overflow-y-auto text-sm" aria-label="History download failures">{download.failures.map((failure, index) => <li key={`${failure.instrument}-${failure.timeframe}-${failure.source}-${failure.from}-${index}`}>
+      <strong>{failure.instrument} · {failure.timeframe} · {failure.source}</strong>
+      <p>{downloadTime(failure.from)} – {downloadTime(failure.through)}</p><p>{failure.error}</p>
+    </li>)}</ul>}
+  </FieldSet>
+}
 
 export function WorkspaceSettings({ preferences, loadError, onSave }: { preferences: Preferences; loadError: string; onSave: (values: Preferences) => Promise<void> }) {
   const [open, setOpen] = useState(false)
@@ -106,7 +197,7 @@ export function WorkspaceSettings({ preferences, loadError, onSave }: { preferen
               </Select>
             </Field>
             {numericField('rankingLookback', 'Ranking lookback (minutes)', 'Uses completed 5m candle closes. This window is independent of the chart timeframe.')}
-            {numericField('historyDays', 'History to retain (days)')}
+            {numericField('historyDays', 'Data audit lookback (days)', 'Limits the integrity audit range. Full history downloads always start at listing.')}
           </FieldGroup>
         </FieldSet>
         <FieldSet disabled={saving}>
@@ -130,6 +221,7 @@ export function WorkspaceSettings({ preferences, loadError, onSave }: { preferen
             </FieldSet>)}
           </FieldGroup>
         </FieldSet>
+        <HistoryDownloadSettings open={open} />
         <FieldSet>
           <FieldLegend>Data integrity</FieldLegend>
           <FieldDescription>Check persisted history for gaps and invalid data. Repair downloads missing intervals in the background.</FieldDescription>

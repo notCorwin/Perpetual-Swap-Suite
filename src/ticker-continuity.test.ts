@@ -96,7 +96,6 @@ const fixture = async (context: TestContext, instruments = [instrument()], optio
   service.preparedCharts.setRealtimeSubscriptions = () => undefined
   const services = new Set([service])
   const prepare = (value: MarketService) => {
-    value.history.target = async () => []
     value.projectListEntry = async () => null
     value.scheduleListProjection = () => undefined
     value.updateRanking = async () => undefined

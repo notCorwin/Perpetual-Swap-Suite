@@ -306,14 +306,6 @@ export class MarketHistory {
     return task
   }
 
-  async target(instId, { historyDays = 30, asOf = this.now() } = {}) {
-    await this.ready
-    this.assertOpen()
-    return Promise.all(Object.keys(CANDLE_INTERVALS).flatMap(timeframe => ['candles', 'oi', 'taker'].map(source => this.sync.enqueueTarget({
-      instrument: instId, timeframe, source, historyDays, warmupCandles: source === 'candles' ? 200 : 0, asOf, priority: 'background',
-    }))))
-  }
-
   async removeTargets(instIds) { await this.ready; return this.sync.removeTargets(instIds) }
 
   async repair(issue, { signal }) {

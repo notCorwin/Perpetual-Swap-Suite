@@ -34,7 +34,6 @@ export class MarketHistory {
   /** OI and Taker are acquired and persisted independently of price rows. Numeric observations remain reusable; direct empty observations revalidate only their expired native-period ranges. */
   ensureStatistics(instId: string, timeframe: Timeframe, from: number, through: number, priority?: StorePriority, signal?: AbortSignal): Promise<{ rows: CandleRecord[] }>
   latest(instId: string, timeframe: Timeframe, priority?: StorePriority): Promise<{ live: CandleRecord | null; floor?: number }>
-  target(instId: string, options?: { historyDays?: number; asOf?: number }): Promise<Array<{ history: HistoryTask; warmup: HistoryTask | null }>>
   removeTargets(instIds: Iterable<string>): Promise<void>
   close(): Promise<void>
 }

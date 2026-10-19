@@ -107,7 +107,12 @@ export async function startBackgroundArchive(store, service, { timeoutMS = 180_0
     return Array.from({ length: Number(parameters.limit) }, (_, index) => [String(end - index * step), '100', '102', '99', '101', '100', '100', '10100', '1'])
   }
   service.instruments.set('LOAD-USDT-SWAP', { instId: 'LOAD-USDT-SWAP' })
-  await service.history.target('LOAD-USDT-SWAP', { historyDays: 30 })
+  const asOf = Date.now()
+  for (const [timeframe, step] of Object.entries(intervals)) {
+    const through = Math.floor(asOf / step) * step - step
+    await service.history.sync.enqueue({ instrument: 'LOAD-USDT-SWAP', timeframe, source: 'candles',
+      from: through - 30 * 86_400_000 + step, through, priority: 'background' })
+  }
   await service.dataAuditRequest({ action: 'start' })
   // Enqueueing is not evidence of load: a native candle boundary can put
   // hundreds of existing series ahead of LOAD in the fair background queue.

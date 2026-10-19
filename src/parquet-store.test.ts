@@ -57,6 +57,9 @@ test('one-time native import runs in a separate process, exits normally and is s
     const exited = once(importer, 'exit')
     const closed = once(importer, 'close')
     assert.equal((await store.candles(query))[0].close, 100)
+    // Reads release the importer's refs once demand is served. This test also
+    // awaits its process lifecycle, so retain it until exit and close arrive.
+    importer.ref(); importer.channel?.ref()
     assert.deepEqual(await exited, [0, null])
     assert.deepEqual(await closed, [0, null])
     assert.equal(store.getDiagnostics().migrationProcessId, null)

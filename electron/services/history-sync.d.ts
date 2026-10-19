@@ -12,7 +12,7 @@ export type HistoryTask = HistoryRange & {
   instrument: string
   timeframe: HistoryTimeframe
   source: string
-  purpose: 'requested' | 'history' | 'warmup'
+  purpose: 'requested'
   priority: HistoryPriority
   status: HistoryTaskStatus
   createdAt: number
@@ -25,6 +25,12 @@ export type HistoryTask = HistoryRange & {
   /** Actual missing source slots, including explicitly unavailable history. */
   remaining: HistoryRange[]
   writtenRecords: number
+  /** Durable numeric source slots, excluding missing slots and leased empty observations. */
+  coveredRecords: number
+  /** Union of covered empty-observation leases and explicitly unavailable missing slots. */
+  unavailableRecords: number
+  /** Numeric coverage observed at the consumer's first durable inspection. */
+  localRecords: number
   inspected: boolean
   lastError: string | null
 }
@@ -65,11 +71,8 @@ export type HistorySource = {
 }
 export type HistorySyncOptions = {
   metadata: {
-    putSyncTask(task: HistoryTask): MaybePromise<unknown>
-    getSyncTask(id: string): MaybePromise<unknown>
     listSyncTasks(): MaybePromise<unknown[]>
     deleteSyncTask(id: string): MaybePromise<unknown>
-    putSyncTasks?(tasks: HistoryTask[]): MaybePromise<unknown>
     deleteSyncTasks?(ids: string[]): MaybePromise<unknown>
   }
   store: {
@@ -96,28 +99,27 @@ export type HistorySyncOptions = {
   minRequestIntervalMS?: number
   retryBaseMS?: number
   maxRetryDelayMS?: number
-  /** Consecutive failures before a requested consumer pauses; defaults to 5. Durable rolling intentions keep retrying at capped backoff until explicitly stopped. */
+  /** Consecutive failures before a consumer pauses; defaults to 5. */
   maxAttempts?: number
-  /** Recent terminal consumer handles retained in memory only; defaults to 512. SQLite stores rolling desired ranges only. */
+  /** Recent terminal consumer handles retained in memory only; defaults to 512. */
   maxRetainedTerminalTasks?: number
 }
 export class HistorySync {
   constructor(options: HistorySyncOptions)
-  /** Restore canonical rolling intentions and discard obsolete execution checkpoints; replan from durable coverage. */
+  /** Delete legacy persisted archive goals without admitting any source work. */
   start(): Promise<this>
-  /** Create a process-local consumer handle. Overlapping and adjacent consumers share canonical source coverage and API pages; cancelling a handle removes only that consumer. Rolling history/warmup use stable persisted identities. */
+  /** Create a finite process-local consumer. Overlapping and adjacent consumers share source coverage and API pages; cancellation removes only that consumer. */
   enqueue(request: HistoryRequest): Promise<HistoryTask>
-  /** Replace the current rolling history and warmup windows without accumulating obsolete targets. Explicitly paused/cancelled targets stay stopped. */
-  enqueueTarget(request: Omit<HistoryRequest, 'from' | 'through' | 'purpose'> & { historyDays?: number; warmupCandles?: number; asOf?: number }): Promise<{ history: HistoryTask; warmup: HistoryTask | null }>
-  /** Read detached snapshots after start(). Old completed/unavailable/cancelled tasks can expire from the bounded result history and return null. Re-enqueue their range to recheck durable coverage. */
-  /** Remove delisted instruments' desired ranges and consumers without deleting durable facts. */
+  /** Remove delisted instruments' consumers without deleting durable facts. */
   removeTargets(instIds: Iterable<string>): Promise<void>
+  /** Read detached snapshots. Terminal handles can expire from bounded result history. */
   getTask(id: string): HistoryTask | null
   listTasks(): HistoryTask[]
   /** Count unique instruments with retrying or unavailable/paused source demand. */
   progressFor(instIds: Iterable<string>, timeframe: HistoryTimeframe): { retrying: number; unavailable: number }
   /** Recheck an explicit observation or repair even before it changes storage. */
   invalidate(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string }): void
+  /** Stop demand immediately; resolve after an already admitted durable write and coverage verification finish. Shared network fetches are never awaited. */
   pause(id: string): Promise<HistoryTask>
   cancel(id: string): Promise<HistoryTask>
   /** Resume retries/cancelled work; unavailable tasks recheck source metadata. */
@@ -126,6 +128,6 @@ export class HistorySync {
   waitFor(id: string): Promise<HistoryTask>
   /** Includes scheduled retries; paused/cancelled/unavailable work is idle. */
   whenIdle(): Promise<void>
-  /** Reject task/idle waiters and abort active fetches; drain accepted writes and preserve rolling intentions for restart. Viewport requests never restart. */
+  /** Reject waiters and abort active fetches; drain accepted writes. Consumers never restart. */
   close(): Promise<void>
 }

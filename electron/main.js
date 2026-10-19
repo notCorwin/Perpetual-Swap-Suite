@@ -143,6 +143,7 @@ async function startDesktop() {
   backend.on('chart', frame => send('radar:chart-prepared', frame))
   backend.on('market', () => send('radar:market-changed'))
   backend.on('audit', report => send('radar:audit-changed', report))
+  backend.on('history-download', report => send('radar:history-download-changed', report))
   backend.on('failure', error => { console.error('Market backend failed:', error); send('radar:market-changed') })
   ipcMain.handle('radar:request', handleRequest)
   ipcMain.on('radar:operations', (event, entries) => {

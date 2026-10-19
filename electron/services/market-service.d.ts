@@ -1,7 +1,7 @@
 import type { MarketStore } from './market-store.js'
 import type { MetadataStore, Preferences } from './metadata-store.js'
 import type { WebSocketFactory } from './realtime-market.js'
-import type { CatalogProgress, DataAudit } from '../../src/desktop-contract.ts'
+import type { CatalogProgress, DataAudit, HistoryDownload } from '../../src/desktop-contract.ts'
 import type { NativeMarketRow } from '../../src/market-row.ts'
 import type { PreparedChartResponse } from '../../src/chart-data.ts'
 export type { PreparedChartBar } from '../../src/chart-data.ts'
@@ -16,6 +16,8 @@ export class MarketService {
   reconfigure(previousPreferences: Preferences): Promise<void>
   dataAuditRequest(request: { action: 'start' | 'status' | 'cancel' | 'repair' }): Promise<DataAuditSnapshot>
   subscribeAudit(listener: (report: DataAuditSnapshot) => void | Promise<void>): () => void
+  historyDownloadRequest(request: { action: 'start' | 'status' | 'cancel' }): Promise<HistoryDownload>
+  subscribeHistoryDownload(listener: (report: HistoryDownload) => void | Promise<void>): () => void
   invalidate(): void
   restoreCatalog(): Promise<boolean>
   refresh(): Promise<void>

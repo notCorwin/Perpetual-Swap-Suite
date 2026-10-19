@@ -1,16 +1,15 @@
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
 import { HistorySync } from '../electron/services/history-sync.js'
-import type { HistoryTask } from '../electron/services/history-sync.js'
 
 // Scheduling is a domain policy. Storage worker scheduling is exercised through
 // actual SQLite reads/writes in market-store tests, without exposing a generic queue.
 test('maintenance is bounded while continuity and interactive work retain independent source capacity', async t => {
-  const saved = new Map<string, HistoryTask>(), covered = new Set<string>(), calls: string[] = []
+  const covered = new Set<string>(), calls: string[] = []
   let release!: () => void
   const gate = new Promise<void>(resolve => { release = resolve })
   const sync = new HistorySync({
-    metadata: { putSyncTask(task) { saved.set(task.id, structuredClone(task)) }, getSyncTask(id) { return saved.get(id) ?? null }, listSyncTasks() { return [] }, deleteSyncTask(id) { saved.delete(id) } },
+    metadata: { listSyncTasks() { return [] }, deleteSyncTask() {} },
     store: { async missingCandleRanges(query) { return covered.has(`${query.source}:${query.instrument}`) ? [] : [{ from: query.from, through: query.through }] } },
     write(records, task) { for (const row of records) covered.add(`${task.source}:${row.instrument}`) },
     maxConcurrentTasks: 3, maxConcurrentPerSource: { candles: 2, oi: 1 },

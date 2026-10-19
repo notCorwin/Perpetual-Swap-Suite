@@ -141,6 +141,7 @@ export class MetadataStore {
           CREATE TABLE IF NOT EXISTS migrations (id TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (json_valid(value)));
           CREATE TABLE IF NOT EXISTS sync_tasks (id TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (json_valid(value)));
           CREATE TABLE IF NOT EXISTS audits (id TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (json_valid(value)));
+          CREATE TABLE IF NOT EXISTS history_download (id TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (json_valid(value)));
           CREATE TABLE IF NOT EXISTS catalog (id TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (json_valid(value)));
           PRAGMA user_version = 1;
         `)
@@ -272,6 +273,8 @@ export class MetadataStore {
   saveAudit(audit) { const value = validateJob(audit, 'audit'); return this.#put('audits', value.id, value) }
   getAudit(id) { const value = this.#get('audits', id); return value && validateJob(value, 'audit') }
   listAudits() { return this.#list('audits').map(value => validateJob(value, 'audit')) }
+  getHistoryDownload() { return this.#get('history_download', 'latest') }
+  saveHistoryDownload(report) { return this.#put('history_download', 'latest', structuredClone(report)) }
   putCatalogEntry(entry) { const value = validateCatalog(entry); return this.#put('catalog', value.instrumentID, value) }
   saveCatalogRankings(entries) {
     this.#assertOpen()

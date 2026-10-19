@@ -6,6 +6,7 @@ import { evaluateMarketOpportunity, summarizeMarketBars } from './market-metrics
 import { PreparedChartPipeline } from './prepared-chart-service.js'
 import { MetadataStore, DEFAULT_PREFERENCES, validatePreferences } from './metadata-store.js'
 import { MarketHistory } from './market-history.js'
+import { HistoryDownload } from './history-download.js'
 import { eligibleInstrument, evaluateLiquidity, createLiquidityEvaluator, quoteTurnover24h } from './liquidity.js'
 import { rankingFromCandles, compareRanking } from './ranking.js'
 import { RealtimeMarket } from './realtime-market.js'
@@ -249,7 +250,6 @@ export class MarketService {
     this.streamLiquidity = null
     this.liveStatisticsQueue = new Set()
     this.liveStatisticsTimer = null
-    this.historyTargets = new Map()
     this.candleWaits = new Map()
     this.candleWaitImmediate = null
     this.candleMutations = new Map()
@@ -264,6 +264,8 @@ export class MarketService {
     this.serviceSession = randomUUID()
     this.auditListeners = new Set()
     this.auditRevision = 0
+    this.downloadListeners = new Set()
+    this.downloadRevision = 0
     this.auditReport = { ...emptyAudit(), revision: 0, serviceSession: this.serviceSession }
     this.catalogRevision = 0
     this.catalogSource = 'none'
@@ -332,6 +334,9 @@ export class MarketService {
       onAuditCheckpoint: job => this.onAuditCheckpoint(job),
     })
     await this.history.ready
+    this.historyDownload = new HistoryDownload({ sync: this.history.sync, metadata: this.metadata,
+      onChange: report => this.publishHistoryDownload(report) })
+    this.publishHistoryDownload(this.historyDownload.snapshot())
     const audits = this.history.audit.list().sort((a, b) => b.updatedAt - a.updatedAt)
     this.latestAuditID = audits[0]?.id ?? null
     if (audits.length) this.publishAudit(this.auditSnapshot(audits[0]))
@@ -1000,7 +1005,6 @@ export class MarketService {
       this.cacheRankingCandles(instrument, changed)
       for (const timeframe of new Set(changed.map(row => row.timeframe))) this.scheduleQualification(instrument, timeframe)
       if (confirmed.some(row => row.timeframe === '5m')) void this.updateRanking(instrument).catch(() => undefined)
-      if (this.candidateIDs?.has(instrument) && changed.some(row => row.timeframe === '5m')) this.advanceHistoryTarget(instrument)
       if (projectList) this.scheduleListProjection(instrument)
       return true
     })
@@ -1360,6 +1364,7 @@ export class MarketService {
 
   onHistoryProgress(task) {
     if (this.disposed) return
+    this.historyDownload?.observe(task)
     this.touchList()
     if (['completed', 'unavailable'].includes(task.status)) {
       const key = `${task.instrument}:${task.timeframe}`, version = this.store.candleRevision(task.instrument, task.timeframe)
@@ -1564,7 +1569,6 @@ export class MarketService {
       if (asOf !== this.marketBoundary) {
         this.marketBoundary = asOf
         this.touchList()
-        for (const instId of this.candidateIDs ?? []) this.advanceHistoryTarget(instId)
         for (const instId of this.catalog.keys()) this.track(this.updateRanking(instId, { asOf }))
         for (const instId of this.catalogChecks.keys()) this.scheduleQualification(instId)
       }
@@ -2036,22 +2040,9 @@ export class MarketService {
     for (const key of this.liveCandles.keys()) if (!nextIDs.has(key.slice(0, key.lastIndexOf(':')))) {
       this.liveCandles.delete(key); this.liveCandleSources.delete(key)
     }
-    for (const instId of this.historyTargets.keys()) if (!nextIDs.has(instId)) this.historyTargets.delete(instId)
-    for (const { instId } of candidates) this.advanceHistoryTarget(instId)
     const configKey = this.catalogCriteriaKey(), signal = this.shutdownController.signal
     this.replaceCatalog([...this.catalog.values()].filter(entry => this.currentCandidate(entry.instrument, configKey, signal) && this.validCatalogEntry(entry)))
     return candidates
-  }
-
-  advanceHistoryTarget(instId) {
-    if (this.closing || this.disposed || !this.candidateIDs?.has(instId)) return
-    const asOf = closedBoundary('5m'), historyDays = this.prefs().historyDays, targetKey = `${historyDays}:${asOf}`
-    if (this.historyTargets.get(instId) === targetKey) return
-    this.historyTargets.set(instId, targetKey)
-    this.track(this.history.target(instId, { historyDays, asOf }).catch(error => {
-      if (this.historyTargets.get(instId) === targetKey) this.historyTargets.delete(instId)
-      throw error
-    }))
   }
 
   receiveInstruments(records, context) {
@@ -2217,7 +2208,6 @@ export class MarketService {
       for (const frame of this.listRows.keys()) this.ensureListRows(frame)
       for (const instId of this.catalog.keys()) this.track(this.updateRanking(instId, { ensure: true }))
     }
-    if (previous.historyDays !== current.historyDays) for (const instId of this.candidateIDs ?? this.instruments.keys()) this.track(this.history.target(instId, { historyDays: current.historyDays, asOf: closedBoundary('5m') }))
     if (previous.chartTimeframe !== current.chartTimeframe) {
       this.ensureListRows(current.chartTimeframe)
       for (const instId of this.catalog.keys()) this.track(this.projectListEntry(instId, current.chartTimeframe))
@@ -2234,6 +2224,34 @@ export class MarketService {
     this.replaceCatalog([])
     this.lastRefreshAt = 0
     if (this.autoRefresh) this.track(this.refresh())
+  }
+
+  publishHistoryDownload(report) {
+    this.downloadReport = { ...structuredClone(report), revision: ++this.downloadRevision, serviceSession: this.serviceSession }
+    for (const listener of this.downloadListeners) {
+      try { Promise.resolve(listener(structuredClone(this.downloadReport))).catch(() => undefined) }
+      catch { /* Disconnected renderers cannot stop explicit downloads. */ }
+    }
+  }
+
+  subscribeHistoryDownload(listener) {
+    if (!this.closing) this.downloadListeners.add(listener)
+    return () => this.downloadListeners.delete(listener)
+  }
+
+  async historyDownloadRequest({ action } = {}) {
+    await this.ready
+    if (this.closing) throw new Error('Market service is closing.')
+    if (action === 'start') {
+      const now = Date.now()
+      const instruments = [...this.catalog.values()].filter(entry => this.validCatalogEntry(entry, now)).map(entry => this.instruments.get(entry.instrumentID) ?? entry.instrument)
+      this.historyDownload.start(instruments)
+    } else if (action === 'cancel') await this.historyDownload.cancel()
+    else if (action !== 'status') throw new TypeError('Unknown history download action.')
+    // Assign a new revision to this read so a delayed earlier IPC response
+    // cannot overwrite a more recent checkpoint with the same revision.
+    this.publishHistoryDownload(this.historyDownload.snapshot())
+    return structuredClone(this.downloadReport)
   }
 
   auditSnapshot(job) {
@@ -2365,6 +2383,7 @@ export class MarketService {
     if (this.liveStatisticsTimer) clearTimeout(this.liveStatisticsTimer)
     this.marketListeners.clear()
     this.auditListeners.clear()
+    this.downloadListeners.clear()
     this.qualificationQueue.clear()
     this.disposeTask = (async () => {
       try { await this.ready } catch { if (this.ownsMetadata) this.metadata?.close(); return }
@@ -2377,6 +2396,7 @@ export class MarketService {
       for (const controller of this.catalogControllers) controller.abort()
       this.shutdownController.abort()
       for (const controller of this.abortControllers) controller.abort()
+      await this.historyDownload.close()
       await this.history.close()
       await this.preparedCharts.dispose()
       await Promise.allSettled([this.refreshing, this.renewing, this.drainRequestQueues(), ...this.candidateTasks.values(), ...this.barTasks, ...this.backgroundTasks, ...this.rankingTasks.values(), ...this.candleMutations.values(), ...[...this.listProjectionTasks.values()].map(value => value.task)].filter(Boolean))

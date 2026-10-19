@@ -82,7 +82,6 @@ const fixture = async (config: ReturnType<typeof preferences>, fetcher: typeof f
   service.projectListEntry = async () => null
   service.updateRanking = async () => undefined
   service.scheduleListProjection = () => undefined
-  service.history.target = async () => []
   for (const lane of service.requestLanes.values()) lane.interval = 0
   service.publicRealtime.start()
   service.realtime.start()
@@ -105,10 +104,10 @@ const fixture = async (config: ReturnType<typeof preferences>, fetcher: typeof f
   return { service, store, sockets, idle, open, subscriptions, push, discover, close }
 }
 
-test('discovery subscribes all eligible contracts before history completes, including failed and unknown filters', async () => {
+test('discovery subscribes candidates including failed and unknown filters without starting a bulk archive', async () => {
   const instruments = [instrument(), instrument('ETH'), instrument('SOL'), instrument('XRP')]
   const invalid = [{ ...instrument('USDC'), settleCcy: 'USDC' }, { ...instrument('CLOSED'), state: 'suspend' }]
-  const paths: string[] = [], targets: string[] = [], gate = deferred()
+  const paths: string[] = []
   const f = await fixture(preferences('spread', 'volume24h'), async input => {
     const path = new URL(String(input)).pathname
     paths.push(path)
@@ -119,7 +118,6 @@ test('discovery subscribes all eligible contracts before history completes, incl
     f.service.catalogChecks.set(instruments[0].instId, { status: 'failed', reason: 'Spread is too wide.' })
     f.service.catalogChecks.set(instruments[1].instId, { status: 'failed', reason: 'Historical volume is too low.' })
     f.service.catalogChecks.set(instruments[2].instId, { status: 'unknown', reason: 'Historical observations are unavailable.' })
-    f.service.history.target = async (instId: string) => { targets.push(instId); await gate.promise; return [] }
     const discovery = f.discover()
     await waitFor(() => f.service.candidateIDs?.size === instruments.length)
     await discovery
@@ -127,10 +125,10 @@ test('discovery subscribes all eligible contracts before history completes, incl
     const ids = instruments.map(value => value.instId)
     assert.deepEqual(f.subscriptions(OKX_BUSINESS_WEBSOCKET_URL), ids.flatMap(instId => ['5m', '15m', '1H'].map(frame => `candle${frame}:${instId}`)).sort())
     assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), ids.flatMap(instId => ['tickers', 'open-interest', 'books', 'trades'].map(channel => `${channel}:${instId}`)).sort())
-    assert.deepEqual(new Set(targets), new Set(ids), 'Background history must cover candidates excluded from the visible list too.')
+    assert.deepEqual(f.service.history.sync.listTasks(), [], 'Discovery must not start bulk history downloads.')
     assert.equal(f.service.catalog.size, 0)
     assert.deepEqual(paths, ['/api/v5/public/instruments'])
-  } finally { gate.resolve(); await f.close() }
+  } finally { await f.close() }
 })
 
 test('a streamed ticker changes every published list price without waiting for history or screening', async () => {

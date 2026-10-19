@@ -38,7 +38,6 @@ const fixture = async (config: ReturnType<typeof preferences>, fetcher: typeof f
   service.projectListEntry = async () => null
   service.updateRanking = async () => undefined
   service.scheduleListProjection = () => undefined
-  service.history.target = async () => []
   for (const lane of service.requestLanes.values()) lane.interval = 0
   const close = async () => { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
   return { service, store, close }
@@ -275,26 +274,22 @@ test('canceling a queued candidate publication prevents the deferred batch from 
     const value = instrument(), now = Date.now(), controller = new AbortController()
     f.service.instruments.set(value.instId, value)
     f.service.instrumentObservations.set(value.instId, { observedAt: now, expiresAt: now + 90_000 })
-    let targets = 0
-    f.service.history.target = async () => { targets += 1; return [] }
     const publication = f.service.publishCandidate(value, f.service.prefs().liquidity, f.service.catalogCriteriaKey(), controller.signal, {}, {})
     assert.equal(f.service.catalog.size, 0, 'Candidate results publish only when their shared batch flushes.')
     controller.abort()
     await publication
     assert.equal(f.service.catalog.size, 0, 'The batch must retain and honor the original publisher signal.')
-    assert.equal(targets, 0)
+    assert.deepEqual(f.service.history.sync.listTasks(), [])
   } finally { await f.close() }
 })
 
-test('a superseded queued assessment cannot replace its newer failure or start historical targets', async () => {
+test('a superseded queued assessment cannot replace its newer failure or start historical requests', async () => {
   const f = await fixture(preferences('spread'))
   try {
     const value = instrument(), now = Date.now()
     f.service.instruments.set(value.instId, value)
     f.service.instrumentObservations.set(value.instId, { observedAt: now, expiresAt: now + 90_000 })
     const observations = { ticker: { value: ticker(value.instId), observedAt: now, expiresAt: now + 90_000 } }
-    let targets = 0
-    f.service.history.target = async () => { targets += 1; return [] }
     const publication = f.service.publishCandidate(value, f.service.prefs().liquidity, f.service.catalogCriteriaKey(), new AbortController().signal, observations, {})
     assert.equal(f.service.catalogChecks.get(value.instId).status, 'verified')
     observations.ticker = { ...observations.ticker, value: { ...ticker(value.instId), bidPx: '99', askPx: '100' } }
@@ -303,7 +298,7 @@ test('a superseded queued assessment cannot replace its newer failure or start h
     await publication
     assert.equal(f.service.catalog.size, 0, 'The queued older assessment must not override a newer verification result.')
     assert.equal(f.service.catalogChecks.get(value.instId).status, 'failed')
-    assert.equal(targets, 0, 'A superseded successful assessment must not consume historical request capacity.')
+    assert.deepEqual(f.service.history.sync.listTasks(), [], 'A superseded assessment must not consume historical request capacity.')
   } finally { await f.close() }
 })
 
