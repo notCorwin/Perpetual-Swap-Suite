@@ -51,7 +51,7 @@ const fixture = (rows = source(400), history: any = {}) => {
   return { store, pipeline }
 }
 const finishSeed = async (pipeline: any) => { while (pipeline.liveSeeds.size) await Promise.all([...pipeline.liveSeeds.values()]) }
-const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24']
+const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
 const sqliteFixture = async (rows: any[]) => {
   const root = await mkdtemp(join(tmpdir(), 'perp-prefix-fence-')), store = await MarketStore.open(root)
   await store.appendCandles(rows)
@@ -669,13 +669,16 @@ test('cold history publishes a mature nearest viewport before farther reserve pa
   } finally { hold.resolve(); await preparation; await pipeline.dispose() }
 })
 
-test('an upgrade ignores poisoned v3 checkpoints even when they carry the current durable watermark', async () => {
+test('an ATR upgrade ignores v4 checkpoints without ATR state even when they carry the current durable watermark', async () => {
   const rows = source(3500), { pipeline, store } = fixture(rows)
-  const legacyVersion = 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v3'
+  const legacyVersion = 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v4'
   const poisoned = structuredClone(buildIndicatorSeries(rows.slice(0, 3072), interval).state)
   assert.notEqual(poisoned.ema, null)
   poisoned.ema = poisoned.ema! + 10_000
   poisoned.rsi[0].gains += 1000
+  delete (poisoned as any).atr
+  delete (poisoned as any).atrCount
+  delete (poisoned as any).atrSeedSum
   await store.writeIndicatorCheckpoint({ instrument: instId, timeframe: '15m', timestamp: poisoned.lastTimestamp,
     formulaVersion: legacyVersion, state: poisoned, sourceRevision: await store.priceWatermark() })
   try {
@@ -685,7 +688,7 @@ test('an upgrade ignores poisoned v3 checkpoints even when they carry the curren
       assert.equal(value[field], (oracle.get(value.hour) as any)[field], `The upgraded producer must reconstruct ${field} from canonical candles.`)
     }
     assert.equal(store.queries.find(query => query.order === 'asc').from, 0, 'An unsafe producer checkpoint cannot establish the canonical prefix.')
-    assert.ok(store.checkpoints.some(value => value.formulaVersion.endsWith('-v4')))
+    assert.ok(store.checkpoints.some(value => value.formulaVersion.endsWith('-v5')))
     assert.deepEqual(store.rows, rows, 'Only derived checkpoints are replaced; canonical market records remain unchanged.')
   } finally { await pipeline.dispose() }
 })
@@ -803,7 +806,7 @@ test('a durable prefix correction with a late observer retains the strict fence 
     for (const value of actual) if (value.indicatorsObserved) for (const key of indicatorFields) assert.equal(value[key], (oracle.get(value.hour) as any)[key])
     assert.equal(actual.filter((value: any) => value.hour >= target - 95 * interval && value.hour <= target && value.indicatorsObserved).length, 96)
     const checkpoint = await store.readIndicatorCheckpoint({ instrument: instId, timeframe: '15m', before: target,
-      formulaVersion: 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v4' })
+      formulaVersion: 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-wilder-atr14-percent-bbw20-2-v5' })
     assert.ok(checkpoint)
     assert.equal(checkpoint.state.ema, (oracle.get(checkpoint.timestamp) as any).ema)
   } finally { hold.resolve(); await f.close() }

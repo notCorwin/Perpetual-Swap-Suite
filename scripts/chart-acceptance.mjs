@@ -102,6 +102,50 @@ export async function assertWorkspaceLayout(page) {
   return layout
 }
 
+export async function assertIndicatorLegends(page) {
+  const reading = await page.locator('svg[data-rendered-inst]').evaluate(svg => {
+    const fields = {
+      'VWAP(14)': 'vwap', 'EMA(200)': 'ema', 'BOLL(20,2)': 'bollMiddle',
+      'ROC(9)': 'roc', 'MAROC(9)': 'maroc', 'RSI(6)': 'rsi6', 'RSI(12)': 'rsi12', 'RSI(24)': 'rsi24',
+      'ATR%(14)': 'atrPercent', 'BBW(20,2)': 'bbw', 'OI (Contracts)': 'oi',
+    }
+    return {
+      foreground: getComputedStyle(document.body).color,
+      panels: [...svg.querySelectorAll('[data-chart-panel-header]')].map(header => ({ key: header.dataset.chartPanelHeader, y: header.getBBox().y })),
+      legends: Object.entries(fields).map(([label, field]) => {
+        const swatch = [...svg.querySelectorAll('[data-chart-legend]')].find(node => node.dataset.chartLegend === label)
+        const group = swatch?.parentElement, texts = group?.querySelectorAll('text')
+        const curve = svg.querySelector(`[data-chart-indicator="${field}"]`)
+        return { label, field, panel: group?.closest('[data-chart-panel-header]')?.getAttribute('data-chart-panel-header'),
+          labelFill: texts?.[0] ? getComputedStyle(texts[0]).fill : null,
+          valueFill: texts?.[1] ? getComputedStyle(texts[1]).fill : null,
+          swatchStroke: swatch ? getComputedStyle(swatch).stroke : null,
+          curveStroke: curve ? getComputedStyle(curve).stroke : null,
+          curveWidth: curve ? Number.parseFloat(getComputedStyle(curve).strokeWidth) : null,
+          curveDash: curve ? getComputedStyle(curve).strokeDasharray : null,
+          curve: curve?.getAttribute('d') ?? '', value: texts?.[1]?.textContent ?? '',
+        }
+      }),
+    }
+  })
+  assert.deepEqual(reading.panels.map(panel => panel.key), ['price', 'roc', 'rsi', 'atr', 'oi', 'taker'])
+  assert.ok(reading.panels.every((panel, index) => index === 0 || panel.y > reading.panels[index - 1].y), 'Panel titles must follow their visual order, with ATR% and BBW between RSI and OI.')
+  for (const legend of reading.legends) {
+    assert.ok(legend.curve, `${legend.label} must have a drawn curve.`)
+    assert.equal(legend.labelFill, legend.curveStroke, `${legend.label} title must show its curve color.`)
+    assert.equal(legend.swatchStroke, legend.curveStroke, `${legend.label} swatch must match its curve.`)
+    assert.equal(legend.valueFill, reading.foreground, `${legend.label} numeric value must retain the foreground text color.`)
+    assert.equal(legend.curveWidth, 1, `${legend.label} must use a 1 px stroke.`)
+    if (legend.field === 'atrPercent' || legend.field === 'bbw') {
+      assert.equal(legend.panel, 'atr', 'ATR% and BBW must share one indicator panel.')
+      assert.match(legend.value, /^\d+\.\d{2}%$/, `${legend.label} must show its percentage without a positive change sign.`)
+    }
+  }
+  assert.equal(reading.legends.find(legend => legend.field === 'atrPercent').curveDash, 'none')
+  assert.notEqual(reading.legends.find(legend => legend.field === 'bbw').curveDash, 'none', 'BBW must remain distinguishable by its dash pattern.')
+  return reading
+}
+
 export async function openChart(page, fixture, timeframe = fixture.timeframe) {
   await page.reload({ waitUntil: 'domcontentloaded' })
   await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click({ timeout: 15_000 })
@@ -119,8 +163,8 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
   await page.evaluate(({ instId, series, requireMatureData, verifyIndicatorValues }) => {
     const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
     if (!(chart instanceof HTMLElement)) throw new Error('No chart surface to inspect.')
-    const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell']
-    const indicatorFields = fields.slice(4, 14), statisticFields = ['oi', 'buy', 'sell']
+    const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
+    const indicatorFields = fields.slice(4, -3), statisticFields = ['oi', 'buy', 'sell']
     const curveFields = [...indicatorFields, 'oi'], expectedGeometry = new WeakMap()
     const oracles = Object.fromEntries(Object.entries(series).map(([frame, entry]) => [frame, new Map(entry.bars.map(bar => [bar.hour, bar]))]))
     const probe = {
@@ -401,7 +445,7 @@ export async function waitForLocalHistory(electron, page, fixture, timeframe = f
     await page.waitForFunction(({ instId, timeframe, end }) => {
       const chart = document.querySelector(`[data-chart-inst="${instId}"]`), snapshot = chart?.__chartSnapshot
       const bars = chart?.__chartRenderedBars ?? snapshot?.bars
-      const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24']
+      const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
       return snapshot?.instId === instId && snapshot.timeframe === timeframe && snapshot.endHour === end
         && snapshot.indicatorState === 'ready' && chart.dataset.chartLoading === 'false' && bars?.length === 96
         && bars.every(bar => bar.indicatorsObserved && fields.every(field => Number.isFinite(bar[field])))
@@ -680,7 +724,7 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m' } = {}) {
     } while (true)
     const inputs = await wheelBurst(page, { deltaY: (fixture.targetDistance - approachDistance) * 12 })
     await waitForRendered(page, fixture, timeframe, fixture.targetEnd)
-    const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24']
+    const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
     await page.waitForFunction(({ targetEnd, firstMissingEnd, indicatorFields }) => {
       const snapshot = document.querySelector('[data-chart-inst]')?.__chartSnapshot
       const missing = snapshot?.bars.find(bar => bar.hour === firstMissingEnd)

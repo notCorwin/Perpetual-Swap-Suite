@@ -4,10 +4,10 @@ import { statisticsMask, statisticsVersionFor } from './statistics-state.js'
 import { appendIndicatorCandle, projectIndicatorCandle } from './indicators.js'
 
 const VISIBLE = 96, TAIL = 128, CHUNK = 1024, HISTORY = 1536, HISTORY_AHEAD = 256, HISTORY_PAGE = 300
-// v4 also identifies the verified checkpoint producer. Older producers could
-// persist a stale recursive core under a newer source revision.
-const FORMULA_VERSION = 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v4'
-const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24']
+// Formula versions identify the complete recursive state and verified producer.
+// Older checkpoints do not contain ATR14's Wilder accumulator and SMA seed.
+const FORMULA_VERSION = 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-wilder-atr14-percent-bbw20-2-v5'
+const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
 const priceFields = ['open', 'high', 'low', 'close', 'volume', 'baseVolume', 'quoteVolume', 'confirmed']
 const intervalFor = timeframe => ({ '5m': 300_000, '15m': 900_000, '1H': 3_600_000 })[timeframe]
 const seriesKey = (instId, timeframe) => `${instId}:${timeframe}`
@@ -48,8 +48,7 @@ const appendConfirmed = (state, candle) => {
   const previousHour = state.lastTimestamp, previousWidth = state.previousBandWidth ?? null
   const value = appendIndicatorCandle(state, candle)
   if (!value) return null
-  const width = numeric(value.bollMiddle) && value.bollMiddle > 0 && numeric(value.bollUpper) && numeric(value.bollLower)
-    ? (value.bollUpper - value.bollLower) / value.bollMiddle * 100 : null
+  const width = value.bbw
   state.bollExpansion = width === null ? null : previousWidth === null || previousHour + state.intervalMS !== candle.timestamp
     ? { hours: 0, complete: false } : width <= previousWidth ? { hours: 0, complete: true }
       : { hours: (state.bollExpansion?.hours ?? 0) + 1, complete: state.bollExpansion?.complete ?? false }

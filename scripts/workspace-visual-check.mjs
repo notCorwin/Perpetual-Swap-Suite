@@ -7,7 +7,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { _electron } from 'playwright'
-import { assertWorkspaceLayout } from './chart-acceptance.mjs'
+import { assertIndicatorLegends, assertWorkspaceLayout } from './chart-acceptance.mjs'
 
 const root = new URL('..', import.meta.url).pathname
 const output = resolve(process.env.PERPETUAL_SWAP_UI_VISUAL_OUTPUT ?? '.build/ui-review/visual')
@@ -37,7 +37,7 @@ try {
         return { hour: endHour - (95 - index) * intervalMS, open: close + (index % 2 ? -.05 : .05), high: close + .2, low: close - .2, close,
           confirmed: true, statisticsSources: 3, statisticsObserved: true, indicatorsObserved: true,
           ema: close, vwap: close - .02, bollUpper: close + .5, bollMiddle: close, bollLower: close - .5,
-          roc: .5, maroc: .25, rsi6: 50, rsi12: 55, rsi24: 60, oi: 1_000_000 + index, buy: 12_000, sell: 10_000 }
+          roc: .5, maroc: .25, rsi6: 50, rsi12: 55, rsi24: 60, atrPercent: .4 / close * 100, bbw: 1 / close * 100, oi: 1_000_000 + index, buy: 12_000, sell: 10_000 }
       })
       return { instId, timeframe, intervalMS, endHour, latestEnd: endHour, oldestHour: bars[0].hour, historyExhausted: true,
         generation: 1, revision: 1, bars, oiState: 'ready', takerState: 'ready', indicatorState: 'ready', error: '' }
@@ -166,12 +166,18 @@ try {
         ratio: effectiveContrast, effectiveContrast, paintRatio, boundaryContrast, boundaries, threshold: decorative ? null : 3,
         exemption: decorative ? 'Decorative arrow; signed numeric value conveys direction' : undefined, strokeDasharray: style.strokeDasharray, candleFill: element.dataset.chartCandleFill }
     })
+    const chartLineDash = field => {
+      const line = document.querySelector(`[data-chart-indicator="${field}"]`)
+      return line ? getComputedStyle(line).strokeDasharray : null
+    }
     const rootStyle = getComputedStyle(document.documentElement)
     const semantics = { positive: rgba(rootStyle.getPropertyValue('--positive')).slice(0, 3), negative: rgba(rootStyle.getPropertyValue('--negative')).slice(0, 3),
+      positiveLabel: rgba(rootStyle.getPropertyValue('--chart-positive-label')).slice(0, 3), negativeLabel: rgba(rootStyle.getPropertyValue('--chart-negative-label')).slice(0, 3),
+      takerLegends: [...document.querySelectorAll('[data-chart-panel-header="taker"] [data-chart-legend]')].map(swatch => ({ label: swatch.dataset.chartLegend,
+        labelColor: rgba(getComputedStyle(swatch.parentElement.querySelector('text')).fill).slice(0, 3), swatchColor: rgba(getComputedStyle(swatch).stroke).slice(0, 3) })),
       upFill: document.querySelector('[data-chart-candle-direction="up"]')?.dataset.chartCandleFill,
       downFill: document.querySelector('[data-chart-candle-direction="down"]')?.dataset.chartCandleFill,
-      emaDash: getComputedStyle(document.querySelector('[data-chart-indicator="ema"]')).strokeDasharray,
-      vwapDash: getComputedStyle(document.querySelector('[data-chart-indicator="vwap"]')).strokeDasharray }
+      emaDash: chartLineDash('ema'), vwapDash: chartLineDash('vwap') }
     return { texts, graphics, semantics }
   })
   for (const theme of ['light', 'dark']) {
@@ -187,12 +193,18 @@ try {
       await screenshot(`workspace-${theme}-gray-${width}-dpr${dpr}`, width, 1000, dpr)
       await client.send('Emulation.setEmulatedVisionDeficiency', { type: 'none' })
       if (width === 1600 && dpr === 1) {
+        await assertIndicatorLegends(page)
         const measured = await measure()
         assert.deepEqual(measured.semantics.positive, theme === 'light' ? [142, 188, 57] : [202, 253, 92])
         assert.deepEqual(measured.semantics.negative, [232, 85, 168])
         assert.equal(measured.semantics.upFill, 'hollow')
         assert.equal(measured.semantics.downFill, 'solid')
         assert.notEqual(measured.semantics.emaDash, measured.semantics.vwapDash)
+        assert.equal(measured.semantics.takerLegends.length, 2)
+        for (const [index, legend] of measured.semantics.takerLegends.entries()) {
+          assert.deepEqual(legend.labelColor, index === 0 ? measured.semantics.positiveLabel : measured.semantics.negativeLabel, 'Taker titles must use the accessible financial label tokens.')
+          assert.deepEqual(legend.swatchColor, index === 0 ? measured.semantics.positive : measured.semantics.negative, 'Taker swatches must preserve the mandated market colors.')
+        }
         report.measurements.push({ theme, surface: 'workspace', ...measured })
         await page.getByRole('button', { name: 'Settings', exact: true }).click()
         const dialog = page.getByRole('dialog', { name: 'Settings', exact: true })

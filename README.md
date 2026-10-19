@@ -58,7 +58,7 @@ The contract list loads once and then follows desktop change notifications. Heal
 
 ## Charts and indicators
 
-Select a contract and choose **5m**, **15m**, or **1h**. The default chart timeframe is **15m**. The main chart contains candlesticks, EMA(200), BOLL(20, 2), and VWAP(14). Separate panels show ROC(9) + MAROC(9), RSI(6/12/24), Open Interest in contracts, and Taker Buy/Sell in contracts.
+Select a contract and choose **5m**, **15m**, or **1h**. The default chart timeframe is **15m**. The main chart contains candlesticks, EMA(200), BOLL(20, 2), and VWAP(14). Separate panels show ROC(9) + MAROC(9), RSI(6/12/24), ATR%(14) + BBW(20, 2), Open Interest in contracts, and Taker Buy/Sell in contracts.
 
 | Control | Action |
 | --- | --- |
@@ -84,7 +84,7 @@ Every eligible contract keeps its native 5m, 15m, and 1h subscriptions, but subs
 
 Approaching a cache boundary starts directional prefetch. Requests and results remain bounded, and repeated input coalesces around the newest cursor. Local history remains usable across OI/Taker holes. A jump beyond downloaded prices still requires acquisition; neither caching nor this scheduler can remove actual network latency.
 
-Indicators use one canonical contiguous native candle series, independently of the visible window. EMA seeds from 200 closes; BOLL uses arithmetic prices and population deviation; VWAP weights typical prices by base-currency volume; RSI uses Wilder smoothing and returns 50 for a flat run. Missing periods restart initialization, and missing values display as `—`. Older source additions and corrections invalidate derived calculations. See the [indicator contract](docs/INDICATORS.md) for formulas, units, initialization, and boundary conditions.
+Indicators use one canonical contiguous native candle series, independently of the visible window. EMA seeds from 200 closes; BOLL uses arithmetic prices and population deviation; VWAP weights typical prices by base-currency volume; RSI uses Wilder smoothing and returns 50 for a flat run. ATR%(14) normalizes Wilder-smoothed true range by the current close, while BBW(20, 2) divides the existing BOLL band width by its middle band; both share a percentage panel between RSI and Open Interest. Missing periods restart initialization, and missing values display as `—`. Older source additions and corrections invalidate derived calculations. See the [indicator contract](docs/INDICATORS.md) for formulas, units, initialization, and boundary conditions.
 
 Applicable relative changes use `(current − previous) / abs(previous) × 100%`. A missing, nonfinite, or zero baseline is unavailable. Taker imbalance uses `(Buy − Sell) / (Buy + Sell) × 100%`; its zero-total case is unavailable. Historical OI and taker availability depends on the provider; unavailable observations remain explicit gaps.
 

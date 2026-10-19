@@ -46,7 +46,7 @@ before(async () => {
           confirmed: true, statisticsSources: 3, statisticsObserved: true, indicatorsObserved: true,
           ema: close, vwap: close - .02, bollUpper: state.bollMode === 'constant' ? 100 : close + .5,
           bollMiddle: state.bollMode === 'constant' ? 100 : close, bollLower: state.bollMode === 'negative' ? -1 : state.bollMode === 'constant' ? 100 : close - .5,
-          roc: .5, maroc: .25, rsi6: 50, rsi12: 55, rsi24: 60, oi: 1_000_000 + index, buy: 12_000, sell: 10_000 }
+          roc: .5, maroc: .25, rsi6: 50, rsi12: 55, rsi24: 60, atrPercent: .4 / close * 100, bbw: state.bollMode === 'constant' ? 0 : state.bollMode === 'negative' ? (close + 1.5) / close * 100 : 1 / close * 100, oi: 1_000_000 + index, buy: 12_000, sell: 10_000 }
       })
       return { instId, timeframe, intervalMS, endHour, latestEnd: endHour, oldestHour: bars[0].hour, historyExhausted: true,
         generation: state.chartGeneration, revision: state.chartGeneration, bars, oiState: 'ready', takerState: 'ready', indicatorState: 'ready', error: '' }

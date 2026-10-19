@@ -19,9 +19,20 @@ test('EMA200 has an independent SMA seed and recursive continuation', () => {
 test('BOLL(20,2) uses arithmetic closes and population deviation including a negative lower band', () => {
   const bars = barsWithIndicators(Array.from({ length: 20 }, (_, index) => candle(index + 1, index)))
   assert.equal(bars[18].bollMiddle, null)
+  assert.equal(bars[18].bbw, null)
   near(bars[19].bollMiddle, 10.5)
   near(bars[19].bollUpper, 10.5 + 2 * Math.sqrt(399 / 12))
   near(bars[19].bollLower, 10.5 - 2 * Math.sqrt(399 / 12))
+  near(bars[19].bbw, 4 * Math.sqrt(399 / 12) / 10.5 * 100)
+})
+
+test('BBW reuses the BOLL20 population bands and preserves flat zero while rejecting an unavailable baseline', () => {
+  const flat = Array.from({ length: 20 }, (_, index) => candle(100, index))
+  near(barsWithIndicators(flat).at(-1)!.bbw, 0)
+  for (const close of [0, -1]) assert.equal(barsWithIndicators(flat.map(row => ({ ...row, close }))).at(-1)!.bbw, null)
+  const source = Array.from({ length: 21 }, (_, index) => candle(index + 1, index))
+  // Candle 21 drops close=1: mean(2..21)=11.5 with unchanged deviation.
+  near(barsWithIndicators(source).at(-1)!.bbw, 4 * Math.sqrt(399 / 12) / 11.5 * 100)
 })
 
 test('rolling VWAP14 weights typical price by base quantity, never quote amount', () => {
@@ -58,14 +69,47 @@ test('Wilder RSI uses mean gain/loss seeds and explicit flat and one-sided bound
   }
 })
 
+test('ATR%14 seeds fourteen true ranges and uses Wilder smoothing for price gaps', () => {
+  const source = Array.from({ length: 14 }, (_, index) => ({ ...candle(100, index), high: 100 + (index + 1) / 2, low: 100 - (index + 1) / 2 }))
+  source.push({ ...candle(120, 14), high: 121, low: 119 }, { ...candle(80, 15), high: 81, low: 79 })
+  const bars = barsWithIndicators(source)
+  assert.ok(bars.slice(0, 13).every(bar => bar.atrPercent === null))
+  // The first fourteen true ranges are 1..14, including high-low on candle 1.
+  near(bars[13].atrPercent, 7.5)
+  // Upward gap: TR=max(2, |121-100|, |119-100|)=21.
+  const upwardATR = (7.5 * 13 + 21) / 14
+  near(bars[14].atrPercent, upwardATR / 120 * 100)
+  // Downward gap: TR=max(2, |81-120|, |79-120|)=41.
+  near(bars[15].atrPercent, (upwardATR * 13 + 41) / 14 / 80 * 100)
+})
+
+test('ATR% preserves a flat zero, rejects nonpositive normalization and restarts after invalid ranges', () => {
+  const flat = Array.from({ length: 30 }, (_, index) => candle(100, index))
+  near(barsWithIndicators(flat).at(-1)!.atrPercent, 0)
+  for (const close of [0, -1]) {
+    const source = [...flat, { ...candle(close, 30), high: close + 1, low: close - 1 }]
+    assert.equal(barsWithIndicators(source).at(-1)!.atrPercent, null)
+  }
+  for (const badRange of [{ high: NaN, low: 99 }, { high: 101, low: Infinity }, { high: 99, low: 98 }, { high: 102, low: 101 }]) {
+    const source = [...flat, { ...candle(100, 30), ...badRange },
+      ...Array.from({ length: 14 }, (_, index) => ({ ...candle(100, 31 + index), high: 102, low: 98 }))]
+    const bars = barsWithIndicators(source)
+    assert.ok(bars.slice(30, 44).every(bar => bar.atrPercent === null))
+    near(bars[44].atrPercent, 4)
+    near(bars[30].rsi24, 50)
+  }
+})
+
 test('a source gap restarts recursive and windowed indicator initialization', () => {
   const before = Array.from({ length: 220 }, (_, index) => candle(100 + index, index))
   const after = Array.from({ length: 12 }, (_, index) => candle(200 + index, 300 + index))
   const bar = barsWithIndicators([...before, ...after]).at(-1)!
   assert.equal(bar.ema, null)
   assert.equal(bar.rsi24, null)
+  assert.equal(bar.atrPercent, null)
   assert.equal(bar.vwap, null)
   assert.equal(bar.bollMiddle, null)
+  assert.equal(bar.bbw, null)
   assert.equal(bar.maroc, null)
 })
 
@@ -89,7 +133,7 @@ test('incremental confirmed appends and repeated live projections equal canonica
       const revision = { ...confirmed, close: confirmed.close + offset, high: confirmed.high + Math.max(offset, 0), low: confirmed.low + Math.min(offset, 0), confirmed: false }
       const projected = projectIndicatorCandle(state, revision)
       assert.deepEqual(projected, barsWithIndicators([...source.slice(0, index), revision]).at(-1), `live revision ${offset} at ${index}`)
-      assert.deepEqual(state, snapshot, 'A forming update must never change the durable EMA/RSI seed or rolling windows.')
+      assert.deepEqual(state, snapshot, 'A forming update must never change the durable EMA/RSI/ATR seed or rolling windows.')
     }
     assert.deepEqual(appendIndicatorCandle(state, confirmed), canonical[index], `confirmed candle ${index}`)
   }

@@ -8,6 +8,7 @@ const VWAP_PERIOD = 14
 const ROC_PERIOD = 9
 const MAROC_PERIOD = 9
 const RSI_PERIODS = [6, 12, 24]
+const ATR_PERIOD = 14
 
 // The state contains only recursive accumulators and bounded rolling windows.
 // It is plain data so workers can return a seed without retaining source history.
@@ -18,6 +19,7 @@ export function createIndicatorState(intervalMS = 300_000) {
     emaSeedSum: 0, ema: null, closes: [], volumes: [], rocs: [],
     previousROC: null, previousMAROC: null,
     rsi: RSI_PERIODS.map(period => ({ period, gains: 0, losses: 0 })),
+    atrCount: 0, atrSeedSum: 0, atr: null,
   }
 }
 
@@ -60,6 +62,21 @@ export function appendIndicatorCandle(state, candle) {
     rsis.push(index >= value.period ? rsiValue(value) : null)
   }
 
+  // Wilder ATR14 includes the first candle's high-low range in its SMA seed.
+  // Later true ranges include gaps from the preceding close. Invalid ranges
+  // restart only ATR; a nonpositive close cannot normalize ATR to a percent.
+  let atrPercent = null
+  if (finite(candle.high) !== null && finite(candle.low) !== null && candle.high >= price && candle.low <= price) {
+    const range = state.atrCount === 0 ? candle.high - candle.low
+      : Math.max(candle.high - candle.low, Math.abs(candle.high - state.previousClose), Math.abs(candle.low - state.previousClose))
+    if (state.atr === null) {
+      state.atrSeedSum += range
+      if (state.atrCount === ATR_PERIOD - 1) state.atr = state.atrSeedSum / ATR_PERIOD
+    } else state.atr = (state.atr * (ATR_PERIOD - 1) + range) / ATR_PERIOD
+    state.atrCount += 1
+    if (state.atr !== null && price > 0) atrPercent = state.atr / price * 100
+  } else { state.atrCount = 0; state.atrSeedSum = 0; state.atr = null }
+
   state.closes.push(price)
   if (state.closes.length > BOLL_PERIOD) state.closes.shift()
   let band = null
@@ -86,12 +103,13 @@ export function appendIndicatorCandle(state, candle) {
   const maroc = state.rocs.length === MAROC_PERIOD && state.rocs.every(value => value !== null && Number.isFinite(value))
     ? state.rocs.reduce((sum, value) => sum + value, 0) / MAROC_PERIOD : null
   const bandPosition = !band ? null : price > band.upper ? 'upper' : price > band.middle ? 'middle' : price > band.lower ? 'lower' : 'below'
+  const bbw = band && band.middle > 0 ? finite((band.upper - band.lower) / band.middle * 100) : null
   const result = {
     hour: candle.timestamp, quoteVolume: candle.quoteVolume ?? null,
     open: candle.open, high: candle.high, low: candle.low, close: price, confirmed: Boolean(candle.confirmed),
     statisticsSources: candle.statisticsSources, statisticsObserved: candle.statisticsObserved,
     vwap, ema: state.ema, bollUpper: band?.upper ?? null, bollMiddle: band?.middle ?? null, bollLower: band?.lower ?? null,
-    roc: currentROC, maroc, rsi6: rsis[0], rsi12: rsis[1], rsi24: rsis[2],
+    roc: currentROC, maroc, rsi6: rsis[0], rsi12: rsis[1], rsi24: rsis[2], atrPercent, bbw,
     oi: finite(candle.oi), buy: finite(candle.buy), sell: finite(candle.sell), bandPosition,
     rocChange: change(currentROC, state.previousROC), marocChange: change(maroc, state.previousMAROC),
   }
@@ -105,7 +123,7 @@ export function appendIndicatorCandle(state, candle) {
 
 // A forming candle is always projected from the same confirmed seed. Copying
 // only fixed-size windows prevents ticks from cloning/recomputing history and
-// keeps successive live revisions from changing EMA/RSI's confirmed state.
+// keeps successive live revisions from changing EMA/RSI/ATR's confirmed state.
 export function projectIndicatorCandle(state, candle) {
   return appendIndicatorCandle({
     ...state, closes: [...state.closes], volumes: [...state.volumes], rocs: [...state.rocs],

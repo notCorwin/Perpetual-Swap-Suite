@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { assertCompletePaints, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
+import { assertCompletePaints, assertIndicatorLegends, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
 
 
 const root = new URL('../..', import.meta.url).pathname
@@ -54,6 +54,8 @@ const installPreparedTransform = async options => electron.evaluate(({ ipcMain, 
       ...bar,
       rsi6: bar.hour >= options.first && bar.hour <= options.warmupThrough ? null : bar.rsi6,
       rsi12: bar.hour >= options.first && bar.hour <= options.warmupThrough || bar.hour === options.interiorGap ? null : bar.rsi12,
+      atrPercent: bar.hour >= options.first && bar.hour <= options.warmupThrough || bar.hour === options.interiorGap ? null : bar.atrPercent,
+      bbw: bar.hour >= options.first && bar.hour <= options.warmupThrough || bar.hour === options.interiorGap ? null : bar.bbw,
     })) }
     const lastConfirmed = response.bars?.find(bar => bar.hour === response.endHour)
     if (lastConfirmed) probe.confirmed.set(`${response.instId}:${response.timeframe}`, lastConfirmed)
@@ -268,7 +270,7 @@ test('prepared native chart pages preserve canonical indicator values across eve
       assert.equal(visible.length, 96)
       for (const bar of visible) {
         const oracle = expected.get(bar.hour)
-        for (const field of ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell']) {
+        for (const field of ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']) {
           assert.ok(Number.isFinite(bar[field]), `${timeframe} ${bar.hour} ${field} must be initialized.`)
           assert.ok(Math.abs(bar[field] - oracle[field]) <= Math.max(1, Math.abs(oracle[field])) * 1e-10,
             `${timeframe} ${bar.hour} ${field} changed from its canonical initialization.`)
@@ -282,6 +284,42 @@ test('prepared native chart pages preserve canonical indicator values across eve
         && Number(call.parameters.after) - Number(call.parameters.limit) * 300_000 > fixture.end))
     assert.deepEqual(redundant, [], 'Complete durable chart periods must not be downloaded again. Independent ranking admission may repair its missing current 5m window, beyond this historical fixture.')
   } finally { await removeRequestProbe(electron) }
+})
+
+test('ATR% and BBW share the panel between RSI and OI, with colored titles and exact candle inspection', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await openChart(page, fixture)
+  const legendValue = label => page.locator(`[data-chart-legend="${label}"]`).evaluate(line => line.parentElement.querySelectorAll('text')[1].textContent)
+  try {
+    for (const timeframe of fixture.timeframes) {
+      await selectTimeframe(page, timeframe)
+      await waitForRendered(page, fixture, timeframe)
+      await page.waitForFunction(() => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.bars.every(bar => Number.isFinite(bar.atrPercent) && Number.isFinite(bar.bbw)))
+      await assertIndicatorLegends(page)
+      const expected = fixture.series[timeframe].bars.at(-1)
+      assert.equal(await legendValue('ATR%(14)'), `${expected.atrPercent.toFixed(2)}%`)
+      assert.equal(await legendValue('BBW(20,2)'), `${expected.bbw.toFixed(2)}%`)
+      const target = await page.locator('svg[data-rendered-inst]').evaluate(svg => {
+        const commands = svg.querySelector('[data-chart-indicator="atrPercent"]').getAttribute('d').match(/[ML][^ML]+/g)
+        if (commands.length !== 97) throw new Error('The mature ATR% curve must cover all 96 candles and its left-edge extension.')
+        const [x, y] = commands[39].slice(1).trim().split(/\s+/).map(Number)
+        const rect = svg.getBoundingClientRect(), view = svg.viewBox.baseVal
+        return { x: rect.x + x / view.width * rect.width, y: rect.y + y / view.height * rect.height,
+          hour: Number(svg.dataset.renderedStart) + 38 * ({ '5m': 300_000, '15m': 900_000, '1H': 3_600_000 })[svg.dataset.renderedTimeframe] }
+      })
+      const inspected = fixture.series[timeframe].bars.find(bar => bar.hour === target.hour)
+      assert.ok(inspected)
+      await page.mouse.move(target.x, target.y)
+      await page.mouse.down()
+      await page.waitForFunction(() => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
+      assert.equal(await legendValue('ATR%(14)'), `${inspected.atrPercent.toFixed(2)}%`, 'ATR% inspection must read the selected native candle.')
+      assert.equal(await legendValue('BBW(20,2)'), `${inspected.bbw.toFixed(2)}%`, 'BBW inspection must read the same selected native candle.')
+      await page.mouse.up()
+      await page.waitForFunction(() => !document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
+      assert.equal(await legendValue('ATR%(14)'), `${expected.atrPercent.toFixed(2)}%`)
+      assert.equal(await legendValue('BBW(20,2)'), `${expected.bbw.toFixed(2)}%`)
+    }
+  } finally { await page.mouse.up() }
 })
 
 test('the 1600 design workspace keeps both panels and chart selection when search hides the selected row', async () => {
@@ -348,7 +386,7 @@ test('the paint probe catches changed indicator geometry without a new snapshot 
 
 test('mature local indicators and statistics stay drawn from the first scroll through prefetch, push and scroll end', async context => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  const indicatorFields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24']
+  const indicatorFields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
   await installRequestProbe(electron, fixture.instId)
   try {
     await openChart(page, fixture)
@@ -406,7 +444,7 @@ test('mature local indicators and statistics stay drawn from the first scroll th
 for (const mode of ['gap', 'prepend']) test(`first historical acquisition keeps every calculated curve and source panel while ${mode === 'gap' ? 'later gaps fill' : 'an earlier prefix changes the exact recursive seed'}`, async context => {
   const probe = value => electron.evaluate((_, value) => globalThis.__marketBackend.probe(value), value)
   const fixture = await probe({ action: 'acquisitionInstall', timeframe: '15m', mode })
-  const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell']
+  const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
   const desired = fixture.series[fixture.timeframe].bars.filter(bar => bar.hour >= fixture.targetEnd - 95 * fixture.intervalMS && bar.hour <= fixture.targetEnd)
   const settle = () => page.evaluate(async () => { for (let frame = 0; frame < 8; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
   try {
@@ -608,7 +646,7 @@ test('latest OI and Taker legends retain their last observed values after scroll
         sourceHour: Number(group.getAttribute('data-chart-legend-source-hour')),
         context: context?.textContent ?? '',
         contextFill: context ? getComputedStyle(context).fill : null,
-        labelFill: getComputedStyle(group.querySelector('text')).fill,
+        mutedFill: getComputedStyle(document.querySelector('[data-chart-status]')).color,
       }]
     }))
   })
@@ -624,7 +662,7 @@ test('latest OI and Taker legends retain their last observed values after scroll
       if (current) assert.equal(reading.context, '', 'A current observation needs no older-source timestamp.')
       else {
         assert.match(reading.context, /as of [A-Z][a-z]{2} \d{1,2}, \d{2}:\d{2}/)
-        assert.equal(reading.contextFill, reading.labelFill, 'Older observations must show their timestamp in the muted label color.')
+        assert.equal(reading.contextFill, reading.mutedFill, 'Older observations must show their timestamp in the muted text color.')
       }
     }
   }
@@ -712,7 +750,7 @@ test('live prices outside the saved domain keep their axis labels inside the pri
   }
 })
 
-test('known RSI segments remain visible through indicator warm-up and internal missing samples', async () => {
+test('known RSI, ATR% and BBW segments remain visible through indicator warm-up and internal missing samples', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   const first = fixture.end - 95 * fixture.intervalMS
   const warmupThrough = first + 5 * fixture.intervalMS
@@ -721,6 +759,8 @@ test('known RSI segments remain visible through indicator warm-up and internal m
     ...bar,
     rsi6: bar.hour >= first && bar.hour <= warmupThrough ? null : bar.rsi6,
     rsi12: bar.hour >= first && bar.hour <= warmupThrough || bar.hour === interiorGap ? null : bar.rsi12,
+    atrPercent: bar.hour >= first && bar.hour <= warmupThrough || bar.hour === interiorGap ? null : bar.atrPercent,
+    bbw: bar.hour >= first && bar.hour <= warmupThrough || bar.hour === interiorGap ? null : bar.bbw,
   }))
   await installPreparedTransform({ mode: 'warmup', instId: fixture.instId, timeframe: fixture.timeframe, first, warmupThrough, interiorGap })
   try {
@@ -729,14 +769,16 @@ test('known RSI segments remain visible through indicator warm-up and internal m
     const paths = await page.evaluate(() => {
       const svg = document.querySelector('svg[data-rendered-inst]')
       const path = key => svg.querySelector(`[data-chart-indicator="${key}"]`)?.getAttribute('d') ?? ''
-      const rsi6 = path('rsi6'), rsi12 = path('rsi12'), rsi24 = path('rsi24')
+      const rsi6 = path('rsi6'), rsi12 = path('rsi12'), rsi24 = path('rsi24'), atrPercent = path('atrPercent'), bbw = path('bbw')
       const rsi6Label = [...svg.querySelectorAll('text')].find(node => node.textContent === 'RSI(6)')
       const commands = value => value.match(/[ML][^ML]+/g) ?? []
       const x = command => Number.parseFloat(command.slice(1))
       return {
-        rsi6, rsi12, rsi6Legend: rsi6Label?.parentElement?.querySelectorAll('text')[1]?.textContent,
+        rsi6, rsi12, atrPercent, bbw, rsi6Legend: rsi6Label?.parentElement?.querySelectorAll('text')[1]?.textContent,
         rsi6Points: commands(rsi6).length, rsi12Points: commands(rsi12).length,
         rsi6Segments: (rsi6.match(/M/g) ?? []).length, rsi12Segments: (rsi12.match(/M/g) ?? []).length,
+        atrPoints: commands(atrPercent).length, bbwPoints: commands(bbw).length,
+        atrSegments: (atrPercent.match(/M/g) ?? []).length, bbwSegments: (bbw.match(/M/g) ?? []).length,
         firstKnownX: commands(rsi6).length ? x(commands(rsi6)[0]) : null,
         expectedFirstKnownX: commands(rsi24).length >= 8 ? x(commands(rsi24)[7]) : null,
       }
@@ -748,7 +790,11 @@ test('known RSI segments remain visible through indicator warm-up and internal m
     assert.equal(paths.firstKnownX, paths.expectedFirstKnownX, 'The known curve must begin at candle 7 rather than extend over warm-up samples.')
     assert.equal(paths.rsi12Points, 89)
     assert.equal(paths.rsi12Segments, 2, 'The curve must start a new segment after an interior missing sample.')
-    assert.doesNotMatch(paths.rsi6 + paths.rsi12, /NaN|Infinity|undefined/)
+    assert.equal(paths.atrPoints, 89)
+    assert.equal(paths.bbwPoints, 89)
+    assert.equal(paths.atrSegments, 2, 'ATR% must preserve known segments around a missing native candle.')
+    assert.equal(paths.bbwSegments, 2, 'BBW must preserve known segments around a missing native candle.')
+    assert.doesNotMatch(paths.rsi6 + paths.rsi12 + paths.atrPercent + paths.bbw, /NaN|Infinity|undefined/)
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)))
     assertCompletePaints(await finishPaintProbe(page))
   } finally {

@@ -7,7 +7,7 @@ import { createChartGeometryCache } from './chart-geometry.ts'
 const intervalMS = 900_000
 const candle = (index: number): Bar => ({ hour: index * intervalMS, open: 100, high: 103, low: 99, close: 102, confirmed: true,
   vwap: 101, ema: 100, bollUpper: 104, bollMiddle: 101, bollLower: 98,
-  roc: index - 3, maroc: index - 4, rsi6: 25, rsi12: 50, rsi24: 75, oi: index * 10, buy: 7, sell: 3 })
+  roc: index - 3, maroc: index - 4, rsi6: 25, rsi12: 50, rsi24: 75, atrPercent: 2.5, bbw: 6, oi: index * 10, buy: 7, sell: 3 })
 const rows = () => Object.freeze(Array.from({ length: 96 }, (_, index) => Object.freeze(candle(index))))
 const viewport = { width: 960, height: 700, endHour: 95 * intervalMS, intervalMS }
 const close = (actual: number, expected: number) => assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} != ${expected}`)
@@ -34,10 +34,13 @@ test('shared viewport coordinates preserve time gaps and logarithmic price and z
 
 test('missing periods and unavailable observations break paths and filled areas without inventing zero samples', () => {
   const bars = [0, 1, 3, 4, 5].map(index => ({ ...candle(index), ema: index === 3 ? null : 100,
+    atrPercent: index === 3 ? null : 2.5, bbw: index === 3 ? null : 6,
     buy: index === 3 ? null : 7, sell: index === 3 ? null : 3, oi: index === 3 ? null : index * 10 }))
   const geometry = createChartGeometryCache(text => text.length * 6)(bars, viewport)
   assert.equal((geometry.lines.ema.match(/M/g) ?? []).length, 2)
   assert.equal((geometry.lines.oi.match(/M/g) ?? []).length, 2)
+  assert.equal((geometry.lines.atrPercent.match(/M/g) ?? []).length, 2)
+  assert.equal((geometry.lines.bbw.match(/M/g) ?? []).length, 2)
   assert.equal(geometry.bollBands.length, 2)
   assert.equal((geometry.rocAreas[0].match(/Z/g) ?? []).length, 2)
   assert.equal(geometry.oiSamples.length, 4)
@@ -49,6 +52,27 @@ test('missing periods and unavailable observations break paths and filled areas 
   for (const path of [...Object.values(geometry.lines), ...geometry.bollBands, ...geometry.rocAreas, geometry.buys, geometry.sells]) {
     assert.doesNotMatch(path, /NaN|Infinity|undefined/)
   }
+})
+
+test('ATR% and BBW share a nonnegative percentage axis sized for both series', () => {
+  const bars = rows().map((bar, index) => ({ ...bar, atrPercent: index === 0 ? 0 : 0.5, bbw: index === 0 ? 0 : 8 }))
+  const get = createChartGeometryCache(text => text.length * 6)
+  const geometry = get(bars, viewport)
+  const panel = geometry.layout.panels.atr
+  assert.equal(geometry.atrAxis.min, 0)
+  assert.ok(geometry.atrAxis.max >= 8)
+  close(geometry.atrY(0), panel[1])
+  close(geometry.atrY(geometry.atrAxis.max), panel[0])
+  for (const field of ['atrPercent', 'bbw'] as const) {
+    const coordinates = [...geometry.lines[field].matchAll(/[ML]([\d.-]+) ([\d.-]+)/g)].map(([, x, y]) => [Number(x), Number(y)])
+    assert.equal(coordinates.length, 97)
+    assert.ok(coordinates.every(([, y]) => y >= panel[0] - 0.05 && y <= panel[1] + 0.05))
+  }
+  assert.ok(geometry.atrTicks.every(tick => /^\d+(?:\.\d+)?%$/.test(tick.label)))
+  const missing = get(bars.map(bar => ({ ...bar, atrPercent: null, bbw: null })), viewport)
+  assert.equal(missing.lines.atrPercent, '')
+  assert.equal(missing.lines.bbw, '')
+  assert.ok(Number.isFinite(missing.atrY(0)))
 })
 
 test('Bollinger values crossing zero retain a linear domain and genuine warmup gaps', () => {

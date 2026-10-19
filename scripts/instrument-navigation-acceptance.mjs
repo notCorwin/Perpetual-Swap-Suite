@@ -63,7 +63,7 @@ export async function startupNavigationReport(page, launchedAt, fixture) {
   await page.waitForFunction(() => window.__navigationStartup && window.__navigationStartup.paintAt !== null, null, { timeout: 10_000 })
   return page.evaluate(({ launchedAt, instruments }) => {
     const probe = window.__navigationStartup
-    const fields = ['open', 'high', 'low', 'close', 'ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell']
+    const fields = ['open', 'high', 'low', 'close', 'ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
     const oracle = new Map(instruments.map(({ instId, series }) => [instId, new Map(Object.entries(series).map(([frame, value]) => [frame, new Map(value.bars.map(bar => [bar.hour, bar]))]))]))
     for (const snapshot of probe.samples) for (const bar of snapshot.bars) {
       const expected = oracle.get(snapshot.instId)?.get(snapshot.timeframe)?.get(bar.hour)
@@ -197,7 +197,7 @@ export async function startNavigationPaintProbe(page, fixture) {
   await page.evaluate(instruments => {
     const oracles = new Map(instruments.map(instrument => [instrument.instId,
       new Map(Object.entries(instrument.series).map(([timeframe, series]) => [timeframe, { intervalMS: series.intervalMS, bars: new Map(series.bars.map(bar => [bar.hour, bar])) }]))]))
-    const fields = ['open', 'high', 'low', 'close', 'ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'oi', 'buy', 'sell']
+    const fields = ['open', 'high', 'low', 'close', 'ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
     const probe = { active: true, frames: 0, paints: 0, minimumBars: Infinity, violations: [], commits: [], previous: null, presentedSurface: null, raf: null, observer: null }
     const fail = message => { if (probe.violations.length < 20) probe.violations.push(message) }
     const sample = (presentedFrame = false) => {

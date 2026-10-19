@@ -24,7 +24,7 @@ test('list and chart share the full-history EMA seed through corrections, evicti
     assert.equal(chart.bars.filter(bar => bar.hour >= rows.at(-1)!.timestamp - 95 * step && bar.hour <= rows.at(-1)!.timestamp).length, 96)
     const shared = chart.bars.filter(bar => byHour.has(bar.hour))
     assert.equal(shared.length, list.bars.length, 'The chart navigation history must contain the full bounded list projection.')
-    for (const bar of shared) for (const field of ['ema', 'rsi6', 'rsi12', 'rsi24', 'vwap', 'bollMiddle'] as const) {
+    for (const bar of shared) for (const field of ['ema', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'vwap', 'bollMiddle'] as const) {
       assert.equal(bar[field], (byHour.get(bar.hour) as any)[field], `${field} at ${bar.hour}`)
     }
     return list.bars.at(-1)
@@ -36,6 +36,9 @@ test('list and chart share the full-history EMA seed through corrections, evicti
     const expected = 100 + 900 * (199 / 201) ** 201
     assert.ok(Math.abs(latest.ema - expected) < 1e-9)
     assert.notEqual(latest.ema, 100, 'Truncating to 201 candles would silently reseed at 100.')
+    const expectedATRPercent = 900 / 14 * (13 / 14) ** 200
+    assert.ok(Math.abs(latest.atrPercent - expectedATRPercent) < 1e-10, 'ATR% must retain the native price gap through Wilder smoothing.')
+    assert.equal(latest.bbw, 0, 'The last twenty identical closes have zero BOLL width.')
     await service.persistCandles(instrument.instId, [{ ...rows[500], close: 900, open: 900, high: 900, low: 900 }])
     await verify()
     service.preparedCharts.maxSeries = 1

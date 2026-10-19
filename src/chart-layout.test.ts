@@ -3,11 +3,11 @@ import test from "node:test"
 import { chartCandleWidth, chartHourX, chartLayout, chartPriceLabelLayout, type ChartPanel } from "./chart-layout.ts"
 
 test("stacked chart layout stays aligned and bounded", () => {
-  const order: ChartPanel[] = ["price", "roc", "rsi", "oi", "taker"]
+  const order: ChartPanel[] = ["price", "roc", "rsi", "atr", "oi", "taker"]
   for (const [width, height] of [[900, 700], [1440, 900], [2560, 900]]) {
     const layout = chartLayout(width, height, 48)
     assert.equal(layout.right + 48, width - 4)
-    assert.ok(Math.abs((layout.panels.price[1] - layout.panels.price[0]) / (layout.panels.roc[1] - layout.panels.roc[0]) - 40 / 15) < 0.001)
+    assert.ok(Math.abs((layout.panels.price[1] - layout.panels.price[0]) / (layout.panels.roc[1] - layout.panels.roc[0]) - 40 / 12) < 0.001)
     for (const [index, key] of order.entries()) {
       assert.deepEqual(layout.columns[key], layout.columns.price)
       assert.ok(layout.axisStarts[key] - layout.columns[key][1] >= 8)

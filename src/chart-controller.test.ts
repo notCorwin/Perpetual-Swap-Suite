@@ -12,7 +12,7 @@ const bars = (first: number, count: number): PreparedChartBar[] => Array.from({ 
   hour: (first + index) * hour, open: 100, high: 102, low: 99, close: 101,
   confirmed: true, statisticsSources: 3, statisticsObserved: true, indicatorsObserved: true,
   vwap: 100, ema: 100, bollUpper: 102, bollMiddle: 100, bollLower: 99,
-  roc: 1, maroc: .5, rsi6: 50, rsi12: 51, rsi24: 52, oi: 1_000, buy: 20, sell: 30,
+  roc: 1, maroc: .5, rsi6: 50, rsi12: 51, rsi24: 52, atrPercent: 2.5, bbw: 6, oi: 1_000, buy: 20, sell: 30,
 }))
 const prepared = (instId: string, end: number, overrides: Partial<PreparedChartResponse> = {}): PreparedChartResponse => ({
   instId, timeframe: '1H', intervalMS: hour, endHour: end * hour, latestEnd: end * hour,
@@ -92,7 +92,7 @@ test('historical navigation keeps the calculated viewport until the requested lo
   const queue = transportQueue(), store = cached()
   const pendingBars = bars(504, 96).map(bar => ({ ...bar, indicatorsObserved: false,
     vwap: null, ema: null, bollUpper: null, bollMiddle: null, bollLower: null,
-    roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null,
+    roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, atrPercent: null, bbw: null,
   }))
   const raw = prepared(btc, 599, { bars: pendingBars, latestEnd: 1199 * hour, revision: 2, indicatorState: 'loading' })
   const controller = new ChartController({ ...queue.transport, history: async () => raw }, store)
@@ -1044,7 +1044,7 @@ test('staged first acquisition retains a whole calculated historical presentatio
     bars: bars(504, 96).map(value => ({ ...value, ...(corrected ? { close: 111, high: 112 } : {}),
       indicatorsObserved: false, statisticsObserved: false, oiObserved: false, takerObserved: false, statisticsSources: 0,
       vwap: null, ema: null, bollUpper: null, bollMiddle: null, bollLower: null,
-      roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, oi: null, buy: null, sell: null,
+      roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, atrPercent: null, bbw: null, oi: null, buy: null, sell: null,
     })), indicatorState: 'loading', oiState: 'loading', takerState: 'loading',
   })
   try {
@@ -1080,7 +1080,7 @@ test('first acquisition still presents short listing prices and observed warmup 
     bars: bars(end - 11, 12).map(value => ({ ...value,
       indicatorsObserved: observed, statisticsObserved: false, oiObserved: false, takerObserved: false, statisticsSources: 0,
       vwap: null, ema: null, bollUpper: null, bollMiddle: null, bollLower: null,
-      roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, oi: null, buy: null, sell: null,
+      roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, atrPercent: null, bbw: null, oi: null, buy: null, sell: null,
     })), indicatorState: observed ? 'unavailable' : 'loading', oiState: 'loading', takerState: 'loading',
   })
   const controller = new ChartController({ ...queue.transport, local: async () => partial(199, 1, 1) }, store)

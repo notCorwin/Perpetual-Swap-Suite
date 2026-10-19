@@ -8,9 +8,10 @@ const priceFormatter = new Intl.NumberFormat('en-US', { maximumSignificantDigits
 const axisFormatters = new Map<number, Intl.NumberFormat>()
 export const chartCompact = (value: number | null) => value === null ? '—' : compactFormatter.format(value)
 export const chartPrice = (value: number | null) => value === null ? '—' : priceFormatter.format(value)
+export const chartPercent = (value: number | null, decimals = 2) => value === null ? '—' : `${value.toFixed(decimals)}%`
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
 const priceFields = ['low', 'high', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower'] as const
-const lineFields = ['bollUpper', 'bollMiddle', 'bollLower', 'vwap', 'ema', 'rsi6', 'rsi12', 'rsi24', 'roc', 'maroc', 'oi'] as const
+const lineFields = ['bollUpper', 'bollMiddle', 'bollLower', 'vwap', 'ema', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'roc', 'maroc', 'oi'] as const
 const axisLabelLimit = (panel: readonly [number, number], maximum: number) =>
   Math.min(maximum, Math.max(2, Math.floor((panel[1] - panel[0]) / 32) + 1))
 const axisFormatter = (decimals: number) => {
@@ -38,7 +39,7 @@ const logScale = (axis: LogChartAxis, panel: Range) => {
 function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, measureText: (text: string) => number) {
   const { width, height, endHour, intervalMS, liveClose } = options
   const firstHour = endHour - 95 * intervalMS, firstAtLeft = bars[0].hour === firstHour
-  let priceMin = Infinity, priceMax = -Infinity, rocExtent = 0, maxTaker = 1
+  let priceMin = Infinity, priceMax = -Infinity, rocExtent = 0, maxATR = 0, maxTaker = 1
   let candleHigh = -Infinity, candleLow = Infinity, highIndex = 0, lowIndex = 0
   const oiSamples: { index: number; value: number }[] = []
   for (const [index, bar] of bars.entries()) {
@@ -47,6 +48,7 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
       if (finite(value)) { priceMin = Math.min(priceMin, value); priceMax = Math.max(priceMax, value) }
     }
     for (const value of [finitePercentage(bar.roc), finitePercentage(bar.maroc)]) if (value !== null) rocExtent = Math.max(rocExtent, Math.abs(value))
+    for (const value of [bar.atrPercent, bar.bbw]) if (finite(value)) maxATR = Math.max(maxATR, value)
     if (finite(bar.oi)) oiSamples.push({ index, value: bar.oi })
     maxTaker = Math.max(maxTaker, (finite(bar.buy) ? bar.buy : 0) + (finite(bar.sell) ? bar.sell : 0))
     if (bar.high > candleHigh) { candleHigh = bar.high; highIndex = index }
@@ -62,15 +64,17 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
     : { ...logarithmicChartAxis(priceMin, priceMax, priceLabels), kind: 'logarithmic' as const }
   const axisPrice = axisFormatter(priceAxis.decimals)
   const rocAxis = chartAxis(-(rocExtent || 1), rocExtent || 1, 8)
+  const atrAxis = chartAxisForLabels(0, maxATR || 1, axisLabelLimit(panels.atr, 5))
   const oiValues = oiSamples.map(sample => sample.value)
   const oiAxis = oiValues.length ? logarithmicChartAxis(Math.min(...oiValues), Math.max(...oiValues), axisLabelLimit(panels.oi, 7), true) : null
   const takerAxis = chartAxisForLabels(0, maxTaker, axisLabelLimit(panels.taker, 7))
   const priceLabelsText = priceAxis.ticks.map(tick => axisPrice.format(tick))
+  const atrLabelsText = atrAxis.ticks.map(value => chartPercent(value, atrAxis.decimals))
   const oiLabelsText = oiAxis?.ticks.map(chartCompact) ?? [], takerLabelsText = takerAxis.ticks.map(chartCompact)
   const labels = [
     ...priceLabelsText,
     formatPercent(rocAxis.max, rocAxis.decimals), formatPercent(rocAxis.min, rocAxis.decimals), '100', '0',
-    ...oiLabelsText, ...takerLabelsText,
+    ...atrLabelsText, ...oiLabelsText, ...takerLabelsText,
     `${chartPrice(liveClose ?? bars.at(-1)!.close)} ↑`, '00:00',
   ]
   const gutter = Math.ceil(Math.max(...labels.map(measureText)) + 16)
@@ -79,6 +83,7 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
   const barWidth = chartCandleWidth(right - left)
   const priceY = priceAxis.kind === 'linear' ? linearScale(priceAxis.min, priceAxis.max, panels.price) : logScale(priceAxis, panels.price)
   const rsiY = linearScale(0, 100, panels.rsi), rocY = linearScale(rocAxis.min, rocAxis.max, panels.roc)
+  const atrY = linearScale(atrAxis.min, atrAxis.max, panels.atr)
   const oiY = oiAxis ? logScale(oiAxis, panels.oi) : () => NaN
   const takerY = linearScale(takerAxis.min, takerAxis.max, panels.taker), rocZeroY = rocY(0)
   const line = (key: typeof lineFields[number], y: (value: number) => number) => {
@@ -98,7 +103,7 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
     return segments.join(' ')
   }
   const lines = Object.fromEntries(lineFields.map(field => [field, line(field,
-    field.startsWith('rsi') ? rsiY : field === 'roc' || field === 'maroc' ? rocY : field === 'oi' ? oiY : priceY)])) as Record<typeof lineFields[number], string>
+    field.startsWith('rsi') ? rsiY : field === 'atrPercent' || field === 'bbw' ? atrY : field === 'roc' || field === 'maroc' ? rocY : field === 'oi' ? oiY : priceY)])) as Record<typeof lineFields[number], string>
   const rocArea = (key: 'roc' | 'maroc') => {
     const segments: string[] = []
     let points: [number, number][] = []
@@ -155,8 +160,9 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
     if (takerAvailable && sell > 0) sells.push(rectangle(center - barWidth / 2, totalY, barWidth, buyY - totalY))
   }
   return Object.freeze({
-    ...options, layout, gutter, x, priceAxis, rocAxis, oiAxis, takerAxis, priceY, rsiY, rocY, oiY, takerY, rocZeroY,
+    ...options, layout, gutter, x, priceAxis, rocAxis, atrAxis, oiAxis, takerAxis, priceY, rsiY, rocY, atrY, oiY, takerY, rocZeroY,
     priceTicks: priceAxis.ticks.map((value, index) => ({ y: priceY(value), label: priceLabelsText[index] })),
+    atrTicks: atrAxis.ticks.map((value, index) => ({ y: atrY(value), label: atrLabelsText[index] })),
     oiTicks: oiAxis?.ticks.map((value, index) => ({ y: oiY(value), label: oiLabelsText[index] })) ?? [],
     takerTicks: takerAxis.ticks.map((value, index) => ({ y: takerY(value), label: takerLabelsText[index] })),
     firstHour, candleHigh, candleLow, highIndex, lowIndex, oiSamples, takerAvailable,

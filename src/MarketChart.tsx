@@ -10,8 +10,8 @@ import { ChartAnalysisPanel } from '@/ChartAnalysisPanel'
 import { chartAnalysis } from '@/analysis-service'
 import { type AnalysisDirection } from '@/chart-analysis'
 import { chartCaptureBounds } from '@/chart-capture'
-import { chartPriceLabelLayout, type ChartPanel as Panel } from "@/chart-layout"
-import { chartCompact as compact, chartPrice as price, createChartGeometryCache, type ChartGeometry } from "@/chart-geometry"
+import { CHART_PANELS, chartPriceLabelLayout, type ChartPanel as Panel } from "@/chart-layout"
+import { chartCompact as compact, chartPrice as price, chartPercent, createChartGeometryCache, type ChartGeometry } from "@/chart-geometry"
 import { chartStatisticsSamples } from '@/chart-legend'
 import { cn } from "@/lib/utils"
 import { chartNavigationTarget } from "@/market-sort"
@@ -86,7 +86,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const lineStroke = (key: keyof Bar, d: string, color: string, dash?: string) => <path data-chart-indicator={key} d={d} fill="none" stroke={color} strokeLinecap="round" strokeLinejoin="round" strokeDasharray={dash} />
   const lineLabel = (x: number, y: number, label: string, color = "var(--muted-foreground)") =>
     <text x={x} y={y} dominantBaseline="middle" fill={color}>{label}</text>
-  const panelKeys: Panel[] = ["price", "roc", "rsi", "oi", "taker"]
+  const panelKeys = CHART_PANELS
   const grid = panelKeys.flatMap(key => panels[key].map((y, index) =>
     <line key={`${key}-${index}`} x1={columns[key][0]} x2={columns[key][1]} y1={y} y2={y} stroke="var(--border)" opacity={index ? 0.32 : 0.55} />))
   const legend = (key: Panel, items: [string, string, string, string?, number?][]) => {
@@ -98,15 +98,16 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     const required = widths.reduce((sum, itemWidth) => sum + itemWidth, 0) + gap * (items.length - 1)
     const shrink = Math.min(1, available / required)
     let cursor = 0
-    return <g key={key}>
+    return <g key={key} data-chart-panel-header={key}>
       <g transform={`translate(${start},${headerY[key]}) scale(${shrink})`}>
       {items.map(([label, value, color, dash, sourceHour], index) => {
         const itemStart = cursor
         cursor += widths[index] + gap
+        const labelColor = key === "taker" ? index === 0 ? "var(--chart-positive-label)" : "var(--chart-negative-label)" : color
         return <g key={label} transform={`translate(${itemStart},0)`} data-chart-legend-source-hour={sourceHour}>
         {key === "taker" && !dash && <line data-chart-legend-outline={label} x1="0" x2="18" stroke="var(--foreground)" />}
         <line data-chart-legend={label} x1="0" x2="18" stroke={color} strokeDasharray={key === "taker" && !dash ? "2 3" : dash} />
-        <text x="26" dominantBaseline="middle" fill="var(--muted-foreground)">{label}</text>
+        <text x="26" dominantBaseline="middle" fill={labelColor}>{label}</text>
         <text x={26 + legendWidth(label) + 10} dominantBaseline="middle" fill="var(--foreground)">{value}</text>
         {contexts[index] && <text data-chart-legend-source-context x={26 + legendWidth(label) + 10 + legendWidth(value)} dominantBaseline="middle" fill="var(--muted-foreground)">{contexts[index]}</text>}
         </g>
@@ -156,6 +157,8 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {lineStroke("rsi6", lines.rsi6, "var(--chart-1)")}
     {lineStroke("rsi12", lines.rsi12, "var(--chart-2)", "7 4")}
     {lineStroke("rsi24", lines.rsi24, "var(--chart-3)", "1 4")}
+    {lineStroke("atrPercent", lines.atrPercent, "var(--chart-3)")}
+    {lineStroke("bbw", lines.bbw, "var(--chart-1)", "7 4")}
     {lineStroke("roc", lines.roc, "var(--chart-1)")}
     {lineStroke("maroc", lines.maroc, "var(--chart-2)", "7 4")}
     <g data-chart-oi={oiAxis ? oiComplete ? "complete" : "partial" : "empty"} data-chart-oi-state={oiState} data-chart-oi-samples={oiSamples.length}>
@@ -177,12 +180,14 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       {priceLabel.countdownY !== null && <PriceCountdown hour={liveBar.hour} intervalMS={intervalMS} x={axisStarts.price} y={priceLabel.countdownY} />}
     </g>}
     {legend("price", [["VWAP(14)", price(active.vwap), "var(--chart-2)", "2 3"], ["EMA(200)", price(active.ema), "var(--chart-3)", "7 4"], ["BOLL(20,2)", `U ${price(active.bollUpper)}\u00a0·\u00a0M ${price(active.bollMiddle)}\u00a0·\u00a0L ${price(active.bollLower)}`, "var(--chart-1)"]])}
-    {legend("roc", [["ROC(9)", formatPercent(active.roc), "var(--chart-1)"], ["MAROC(9)", formatPercent(active.maroc), "var(--chart-2)"]])}
-    {legend("rsi", [["RSI(6)", active.rsi6?.toFixed(1) ?? "—", "var(--chart-1)"], ["RSI(12)", active.rsi12?.toFixed(1) ?? "—", "var(--chart-2)"], ["RSI(24)", active.rsi24?.toFixed(1) ?? "—", "var(--chart-3)"]])}
+    {legend("roc", [["ROC(9)", formatPercent(active.roc), "var(--chart-1)"], ["MAROC(9)", formatPercent(active.maroc), "var(--chart-2)", "7 4"]])}
+    {legend("rsi", [["RSI(6)", active.rsi6?.toFixed(1) ?? "—", "var(--chart-1)"], ["RSI(12)", active.rsi12?.toFixed(1) ?? "—", "var(--chart-2)", "7 4"], ["RSI(24)", active.rsi24?.toFixed(1) ?? "—", "var(--chart-3)", "1 4"]])}
+    {legend("atr", [["ATR%(14)", chartPercent(active.atrPercent), "var(--chart-3)"], ["BBW(20,2)", chartPercent(active.bbw), "var(--chart-1)", "7 4"]])}
     {legend("oi", [["OI (Contracts)", statistics.oi ? compact(statistics.oi.oi) : "Unavailable", "var(--chart-2)", undefined, statistics.oi?.hour]])}
     {legend("taker", [["↑ Taker Buy (Contracts)", statistics.taker ? compact(statistics.taker.buy) : "Unavailable", "var(--positive)", undefined, statistics.taker?.hour], ["↓ Taker Sell (Contracts)", statistics.taker ? compact(statistics.taker.sell) : "Unavailable", "var(--negative)", "2 3", statistics.taker?.hour]])}
     {panels.rsi[1] - panels.rsi[0] >= 35 && <>{lineLabel(axisStarts.rsi, panels.rsi[0], "100")}{lineLabel(axisStarts.rsi, panels.rsi[1], "0")}</>}
     {panels.roc[1] - panels.roc[0] >= 35 && <>{lineLabel(axisStarts.roc, panels.roc[0], formatPercent(rocAxis.max, rocAxis.decimals))}{lineLabel(axisStarts.roc, panels.roc[1], formatPercent(rocAxis.min, rocAxis.decimals))}</>}
+    {panels.atr[1] - panels.atr[0] >= 35 && geometry.atrTicks.map(({ y, label }, index) => <g key={index}><line x1={columns.atr[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.25" />{lineLabel(axisStarts.atr, y, label)}</g>)}
     {oiAxis && panels.oi[1] - panels.oi[0] >= 35 && geometry.oiTicks.map(({ y, label }, index) => <g key={index}><line x1={columns.oi[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.25" />{lineLabel(axisStarts.oi, y, label)}</g>)}
     {panels.taker[1] - panels.taker[0] >= 35 && geometry.takerTicks.map(({ y, label }, index) => <g key={index}>{lineLabel(axisStarts.taker, y, label)}</g>)}
   </>

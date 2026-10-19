@@ -1,4 +1,5 @@
-export type ChartPanel = "price" | "rsi" | "roc" | "oi" | "taker"
+export const CHART_PANELS = ["price", "roc", "rsi", "atr", "oi", "taker"] as const
+export type ChartPanel = typeof CHART_PANELS[number]
 
 type Range = readonly [number, number]
 
@@ -29,9 +30,9 @@ export function chartPriceLabelLayout(priceY: number, panel: Range, fontSize: nu
 export function chartLayout(width: number, height: number, labelGutter = 64) {
   const rightMargin = 4, top = 4, headerHeight = 24, rowGap = 3, bottomAxis = 22
   const right = width - rightMargin - labelGutter, column: Range = [0, right]
-  const availableHeight = Math.max(1, height - top - bottomAxis - headerHeight * 5 - rowGap * 4)
-  const order: ChartPanel[] = ["price", "roc", "rsi", "oi", "taker"]
-  const weights: Record<ChartPanel, number> = { price: 0.4, roc: 0.15, rsi: 0.15, oi: 0.15, taker: 0.15 }
+  const order = CHART_PANELS
+  const availableHeight = Math.max(1, height - top - bottomAxis - headerHeight * order.length - rowGap * (order.length - 1))
+  const weights: Record<ChartPanel, number> = { price: 0.4, roc: 0.12, rsi: 0.12, atr: 0.12, oi: 0.12, taker: 0.12 }
   const panels = {} as Record<ChartPanel, Range>
   const headerY = {} as Record<ChartPanel, number>
   let cursor = top
