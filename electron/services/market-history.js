@@ -50,9 +50,9 @@ const abortable = (promise, signal) => {
 
 /** OKX source adaptation; HistorySync alone schedules durable observations. */
 export class MarketHistory {
-  constructor({ store, metadata, get, parseCandle, persistCandles, persistStatistics, replaceCandles, instrument, onProgress, onLive, onAuditCheckpoint, now = Date.now }) {
+  constructor({ store, metadata, get, awaitRealtimeCandle, parseCandle, persistCandles, persistStatistics, replaceCandles, instrument, onProgress, onLive, onAuditCheckpoint, now = Date.now }) {
     if (typeof replaceCandles !== 'function') throw new TypeError('MarketHistory needs a replacement mutation callback.')
-    Object.assign(this, { store, metadata, get, parseCandle, persistCandles, persistStatistics, replaceCandles, instrument, onLive, now })
+    Object.assign(this, { store, metadata, get, awaitRealtimeCandle, parseCandle, persistCandles, persistStatistics, replaceCandles, instrument, onLive, now })
     this.closed = false
     this.closeTask = null
     this.controllers = new Set()
@@ -168,6 +168,13 @@ export class MarketHistory {
     const interval = CANDLE_INTERVALS[timeframe]
     const seeded = [...(this.seeds.get(keyOf(instrument, timeframe))?.values() ?? [])].filter(row => row.timestamp >= from && row.timestamp <= through)
     if (seeded.length) return { records: seeded, cursor: null }
+    const repairing = () => [...this.repairs.values()].some(repair => repair.instrument === instrument && repair.timeframe === timeframe
+      && repair.remaining.some(bounds => bounds.from <= through && bounds.through >= from))
+    if (!repairing() && await this.awaitRealtimeCandle?.(query) && !repairing()) {
+      // HistorySync rechecks durable coverage after source work. Do not replay
+      // an earlier streamed snapshot over a newer canonical correction.
+      return { records: [], cursor: null }
+    }
     const cursor = Math.min(numeric(query.cursor) ?? through + interval, through + interval)
     const values = await this.get('/market/history-candles', { instId: instrument, bar: timeframe, limit: Math.min(300, (cursor - from) / interval), after: cursor }, signal, priority)
     const rows = this.parsed(instrument, timeframe, values).filter(row => row.timestamp < cursor)
@@ -273,6 +280,8 @@ export class MarketHistory {
     this.controllers.add(controller)
     const task = (async () => {
       await this.ready
+      const bounds = this.bounds(instId, timeframe)
+      if (await this.awaitRealtimeCandle?.({ instrument: instId, timeframe, from: bounds.through, through: bounds.through, signal: controller.signal, priority })) return { live: null, floor: bounds.floor }
       const values = await this.get('/market/candles', { instId, bar: timeframe, limit: 2 }, controller.signal, priority)
       const parsed = values.map(value => this.parseCandle(instId, timeframe, value)).filter(Boolean)
       const live = parsed.filter(row => !row.confirmed).sort((a, b) => b.timestamp - a.timestamp)[0] ?? null

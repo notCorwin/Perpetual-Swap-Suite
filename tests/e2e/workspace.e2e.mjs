@@ -193,6 +193,61 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Live-only subscriptions must reuse the completed frame without a follow-up read.')
 })
 
+test('chart source updates stay outside the plot without resizing its viewport at scaled and design widths', async () => {
+  const previousSize = page.viewportSize()
+  const publish = async status => {
+    const generation = await electron.evaluate(async ({ ipcMain, BrowserWindow }, status) => {
+      const state = globalThis.__workspaceFixture
+      state.chartGeneration += 1
+      const frame = await ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
+      if (status.oiState !== 'ready') {
+        const observed = status.oiState === 'unavailable'
+        frame.endHour += frame.intervalMS
+        frame.latestEnd = frame.endHour
+        frame.bars = [...frame.bars.slice(1), { ...frame.bars.at(-1), hour: frame.endHour,
+          oi: null, buy: null, sell: null, statisticsSources: observed ? 3 : 0,
+          statisticsObserved: observed, oiObserved: observed, takerObserved: observed, indicatorsObserved: observed }]
+      }
+      Object.assign(frame, status)
+      BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
+      return frame.generation
+    }, status)
+    await page.waitForFunction(generation => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.generation === generation, generation)
+  }
+  const geometry = () => page.locator('[data-chart-inst="BETA-USDT-SWAP"]').evaluate(chart => {
+    const status = chart.querySelector('[data-chart-status]'), plot = chart.querySelector('[data-chart-plot]')
+    const row = status.getBoundingClientRect(), area = plot.getBoundingClientRect()
+    return { rowBottom: row.bottom, plotTop: area.top, width: area.width, height: area.height,
+      plotStatuses: plot.querySelectorAll('[role="status"]').length, statusInsidePlot: plot.contains(status) }
+  })
+  try {
+    for (const size of [{ width: 800, height: 572 }, { width: 1600, height: 1000 }]) {
+      await page.setViewportSize(size)
+      await page.waitForFunction(width => Number(document.querySelector('[data-layout="market-workspace"]')?.dataset.uiScale) === width / 1600, size.width)
+      await publish({ oiState: 'ready', takerState: 'ready', indicatorState: 'ready' })
+      const status = page.locator('[data-chart-status]')
+      await page.waitForFunction(() => {
+        const chart = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')
+        return chart?.dataset.chartOiState === 'ready' && chart.dataset.chartTakerState === 'ready'
+      })
+      const baseline = await geometry()
+      for (const value of ['loading', 'unavailable']) {
+        await publish({ oiState: value, takerState: value, indicatorState: value === 'loading' ? 'loading' : 'ready' })
+        await status.getByText(value === 'loading' ? 'Loading OI history…' : 'OKX 15m OI history is incomplete for this range', { exact: true }).waitFor()
+        const current = await geometry()
+        assert.equal(current.statusInsidePlot, false)
+        assert.equal(current.plotStatuses, 0, 'Source messages must never cover candles or indicators.')
+        assert.ok(current.rowBottom <= current.plotTop, 'Status feedback must occupy its own space above the plot.')
+        assert.deepEqual([current.plotTop, current.width, current.height], [baseline.plotTop, baseline.width, baseline.height], 'Source state changes must preserve the plotted viewport.')
+        assert.match(await status.locator('p').getAttribute('title'), /OI.*[Tt]aker/, 'The full source summary must remain available when visually truncated.')
+      }
+    }
+  } finally {
+    await publish({ oiState: 'ready', takerState: 'ready', indicatorState: 'ready' })
+    await page.setViewportSize(previousSize)
+  }
+})
+
 test('pointer inspection selects the drawn first, middle, and latest candle before and after a forming candle shifts the window', async () => {
   await selectTimeframe(page, '15m')
   const publish = forming => electron.evaluate(async ({ ipcMain, BrowserWindow }, forming) => {

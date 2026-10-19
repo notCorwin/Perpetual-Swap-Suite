@@ -1750,6 +1750,7 @@ test('a completed unavailable check has no pending candidate while unrelated met
     assert.equal(duringRenewal.catalogProgress.unknown, 1)
     assert.equal(duringRenewal.catalogProgress.pending, 0, 'Unknown observations must not masquerade as candidate work that is still running.')
     assert.deepEqual(duringRenewal.rows, [])
+    assert.match(duringRenewal.error, /verification is unavailable/i, 'Unrelated renewal work cannot hide an already completed unavailable check.')
   } finally { release(); await renewal; await f.close() }
 })
 

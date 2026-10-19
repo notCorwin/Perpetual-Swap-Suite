@@ -18,6 +18,7 @@ const FIVE_MINUTES = 300_000
 const LIST_TIMEFRAMES = ['5m', '15m', '1H']
 const OBSERVATION_TTL = 90_000
 const TICKER_BOOTSTRAP_MS = 10_000
+const CANDLE_DELIVERY_MS = 10_000
 const CATALOG_RENEW_INTERVAL = 30_000
 const LATEST_CANDLE_REFRESH = 60_000
 const HISTORICAL_STATISTICS_REFRESH = 6 * 3_600_000
@@ -247,6 +248,8 @@ export class MarketService {
     this.liveStatisticsQueue = new Set()
     this.liveStatisticsTimer = null
     this.historyTargets = new Map()
+    this.candleWaits = new Map()
+    this.candleWaitImmediate = null
     this.candleMutations = new Map()
     this.barTasks = new Set()
     this.backgroundTasks = new Set()
@@ -316,6 +319,7 @@ export class MarketService {
     this.history = new MarketHistory({
       store: this.store, metadata: this.metadata,
       get: (path, parameters, signal, priority) => this.get(path, parameters, signal, priority),
+      awaitRealtimeCandle: query => this.awaitRealtimeCandle(query),
       parseCandle: candle,
       persistCandles: (instId, rows, options) => this.persistCandles(instId, rows, typeof options === 'string' ? { priority: options } : options),
       persistStatistics: (instrument, timeframe, end, source, values, range, priority) => this.persistStatisticsSource(instrument, timeframe, end, source, values, this.shutdownController.signal, priority, false, { range }),
@@ -333,6 +337,7 @@ export class MarketService {
     this.realtime = new RealtimeMarket({
       parseCandle: candle,
       onState: state => {
+        this.scheduleCandleWaitCheck()
         if (this.realtimeStatus !== state.status) {
           this.realtimeStatus = state.status; this.touchList()
           if (!this.closing) this.preparedCharts.sourceStateChanged()
@@ -341,7 +346,9 @@ export class MarketService {
       ...(this.webSocketFactory ? { webSocketFactory: this.webSocketFactory } : {}),
       onForming: (row, context) => { this.track(Promise.resolve(this.setLive(row.instrument, row.timeframe, row, context))) },
       onConfirmed: async row => {
-        await this.persistCandles(row.instrument, [row])
+        try { await this.persistCandles(row.instrument, [row]) }
+        finally { this.scheduleCandleWaitCheck() }
+        this.finishCandleWait(this.candleWaits.get(`${row.instrument}:${row.timeframe}:${row.timestamp}`), true)
         // Native statistics remain authoritative for completed periods. Repair
         // this just-closed slot ahead of the multi-day background archive.
         this.track(this.history.ensureStatistics(row.instrument, row.timeframe, row.timestamp, row.timestamp, 'continuity', this.shutdownController.signal))
@@ -698,6 +705,70 @@ export class MarketService {
     const task = Promise.resolve(promise).catch(() => undefined).finally(() => this.backgroundTasks.delete(task))
     this.backgroundTasks.add(task)
     return task
+  }
+
+  pendingCandleCommit(instrument, timeframe, timestamp) {
+    const progress = this.realtime?.getProgress(instrument, timeframe)
+    return progress?.pendingConfirmations > 0 && progress.confirmedThrough >= timestamp && (progress.committedThrough ?? -Infinity) < timestamp
+  }
+
+  finishCandleWait(wait, persisted, error) {
+    if (!wait || this.candleWaits.get(wait.key) !== wait) return
+    this.candleWaits.delete(wait.key)
+    if (error) wait.reject(error)
+    else wait.resolve(persisted)
+    this.scheduleMarketDeadline()
+  }
+
+  checkCandleWaits() {
+    const now = Date.now()
+    for (const wait of this.candleWaits.values()) {
+      if (this.pendingCandleCommit(wait.instrument, wait.timeframe, wait.timestamp)) {
+        // The delivery deadline cannot create a competing REST write while
+        // an accepted confirmation is already committing locally.
+        if (wait.deadline <= now) wait.deadline = Infinity
+      } else if (!this.realtime?.isSubscribed(wait.instrument, wait.timeframe) || wait.deliveryDeadline <= now) this.finishCandleWait(wait, false)
+    }
+    this.scheduleMarketDeadline()
+  }
+
+  scheduleCandleWaitCheck() {
+    if (this.closing || !this.candleWaits.size || this.candleWaitImmediate) return
+    // Realtime releases a failed pending confirmation in its promise finally,
+    // after publishing the error state. Check after that event's microtasks.
+    this.candleWaitImmediate = setImmediate(() => { this.candleWaitImmediate = null; this.checkCandleWaits() })
+    this.candleWaitImmediate.unref?.()
+  }
+
+  async awaitRealtimeCandle({ instrument, timeframe, from, through, signal, priority = 'continuity' }) {
+    signal?.throwIfAborted()
+    if (this.closing || from !== through || through !== closedBoundary(timeframe) - timeframeMilliseconds(timeframe)) return false
+    const deadline = through + timeframeMilliseconds(timeframe) + CANDLE_DELIVERY_MS
+    const progress = this.realtime?.getProgress(instrument, timeframe)
+    const pending = this.pendingCandleCommit(instrument, timeframe, through)
+    if (!pending && !(progress?.committedThrough >= through) && (!this.realtime?.isSubscribed(instrument, timeframe) || Date.now() >= deadline)) return false
+    const key = `${instrument}:${timeframe}:${through}`
+    let wait = this.candleWaits.get(key)
+    if (!wait) {
+      let resolve, reject
+      const promise = new Promise((done, fail) => { resolve = done; reject = fail })
+      wait = { key, instrument, timeframe, timestamp: through, deliveryDeadline: deadline, deadline: pending && Date.now() >= deadline ? Infinity : deadline, promise, resolve, reject, consumers: 0 }
+      this.candleWaits.set(key, wait)
+      // Register first, then inspect durable facts so a confirmation committing
+      // between admission and this read cannot leave its consumer waiting.
+      const registered = wait
+      this.track(this.store.candles({ instrument, timeframe, from, through }, priority).then(rows => {
+        const present = rows.some(row => row.timestamp === through && row.confirmed === true
+          && Number.isFinite(row.baseVolume) && row.baseVolume >= 0 && Number.isFinite(row.quoteVolume) && row.quoteVolume >= 0)
+        if (present) this.finishCandleWait(registered, true)
+        else if (progress?.committedThrough >= through) this.finishCandleWait(registered, false)
+        else this.checkCandleWaits()
+      }).catch(error => this.finishCandleWait(registered, false, error)))
+      this.scheduleMarketDeadline()
+    }
+    wait.consumers += 1
+    try { return await abortable(wait.promise, signal) }
+    finally { if (--wait.consumers === 0) this.finishCandleWait(wait, false) }
   }
 
   requestLane(name) {
@@ -1442,7 +1513,8 @@ export class MarketService {
     const boundary = ids.size ? closedBoundary('5m', now) + FIVE_MINUTES : Infinity
     const tickerRetries = [...this.tickerRecoveries].filter(([id, value]) => this.candidateIDs?.has(id) && !value.signal.aborted && !value.task).map(([, value]) => value.retryAt)
     const sourceRetries = [...this.sourceRecoveries.values()].filter(value => !value.task).map(value => value.retryAt)
-    const next = Math.min(boundary, ...deadlines.values(), ...retries, ...tickerRetries, ...sourceRetries)
+    const candleDeadlines = [...this.candleWaits.values()].map(wait => wait.deadline)
+    const next = Math.min(boundary, ...deadlines.values(), ...retries, ...tickerRetries, ...sourceRetries, ...candleDeadlines)
     if (this.marketDeadlineAt === next) return
     if (this.marketDeadlineTimer) clearTimeout(this.marketDeadlineTimer)
     this.marketDeadlineTimer = null
@@ -1458,6 +1530,7 @@ export class MarketService {
     if (this.closing || this.disposed) return
     this.processingMarketDeadline = true
     try {
+      this.checkCandleWaits()
       const now = Date.now(), asOf = closedBoundary('5m', now)
       const due = new Set([...this.marketDeadlines].filter(([, deadline]) => deadline <= now).map(([instId]) => instId))
       if (asOf !== this.marketBoundary) {
@@ -2211,14 +2284,24 @@ export class MarketService {
     const pendingIDs = new Set([...this.pendingCandidates.values()].filter(value => value.configKey === configKey).map(value => value.instId))
     for (const recovery of this.sourceRecoveries.values()) pendingIDs.add(recovery.instId)
     for (const instId of this.tickerRecoveries.keys()) pendingIDs.add(instId)
+    // A live notification can reach IPC before an already-due deadline gets
+    // its event-loop turn. Count that admitted work without starting it here.
+    if (this.autoRefresh && this.marketDeadlineTimer) {
+      const now = Date.now()
+      for (const [instId, deadline] of this.marketDeadlines) if (deadline <= now) pendingIDs.add(instId)
+    }
     const pending = pendingIDs.size
     const catalogProgress = { total: this.candidateIDs?.size ?? this.catalogChecks.size, completed: this.catalogChecks.size, pending, verified: 0, failed: 0, unknown: 0 }
+    let unavailableContracts = 0
     for (const record of this.catalogChecks.values()) {
       const status = record.status === 'verified' && !this.validCatalogEntry(record) ? 'unknown' : record.status
       catalogProgress[status] += 1
+      if (status === 'unknown' && !pendingIDs.has(record.instrumentID)) unavailableContracts += 1
     }
-    const unavailable = !rows.length && catalogProgress.unknown > 0
-      ? `Market verification is unavailable for ${catalogProgress.unknown} contracts because required observations are missing or expired.${pending > 0 || this.refreshing || this.renewing ? ' Acquiring current observations.' : ''}` : ''
+    // A native close expires the old rolling window before its final candle
+    // arrives. Active revalidation is pending work, not a source failure.
+    const unavailable = !rows.length && unavailableContracts > 0
+      ? `Market verification is unavailable for ${unavailableContracts} contracts because required observations are missing or expired.${pending > 0 || this.refreshing || this.renewing ? ' Acquiring current observations.' : ''}` : ''
     const projectionError = [...this.listProjectionFailures.values()].find(value => value.timeframe === frame && this.catalog.has(value.instId))?.error
     const status = { error: this.error || projectionError || unavailable, loading: this.refreshing !== null || this.renewing !== null || pending > 0,
       catalogProgress,
@@ -2239,6 +2322,9 @@ export class MarketService {
   dispose() {
     if (this.disposeTask) return this.disposeTask
     this.closing = true
+    if (this.candleWaitImmediate) clearImmediate(this.candleWaitImmediate)
+    this.candleWaitImmediate = null
+    for (const wait of this.candleWaits.values()) this.finishCandleWait(wait, false, new DOMException('Market service is closed.', 'AbortError'))
     for (const recovery of this.sourceRecoveries.values()) this.cancelRequiredRecovery(recovery.key)
     this.unsubscribeStore?.()
     for (const instId of this.tickerRecoveries.keys()) this.cancelTickerRecovery(instId)

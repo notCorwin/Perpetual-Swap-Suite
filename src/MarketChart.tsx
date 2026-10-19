@@ -343,6 +343,18 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
   const takerState = surface?.takerState ?? 'ready'
   const atBoundary = view.historyExhausted && surface && view.oldestHour !== null && surface.endHour === Math.min(view.latestEnd ?? Infinity, view.oldestHour + 95 * intervalMS)
   const priceScale = plotGeometry?.priceAxis.kind ?? 'logarithmic'
+  const statusMessages: string[] = []
+  if (unavailable) statusMessages.push(unavailableText)
+  else if (pending) statusMessages.push(surface ? `Preparing ${instId.replace(/-SWAP$/, '')} ${timeframeLabel(timeframe)}${requestedEnd !== null ? ` · ${time(requestedEnd)}` : ''}…` : 'Loading local prices…')
+  if (surface?.indicatorState === 'loading') statusMessages.push('Calculating indicators…')
+  if (oiState === 'loading') statusMessages.push('Loading OI history…')
+  if (takerState === 'loading') statusMessages.push('Loading taker history…')
+  if (oiState === 'unavailable') statusMessages.push(`OKX ${timeframeLabel(displayedFrame)} OI history is incomplete for this range`)
+  if (takerState === 'unavailable') statusMessages.push(`OKX ${timeframeLabel(displayedFrame)} Taker history is incomplete for this range`)
+  if (atBoundary && !pending) statusMessages.push('Start of available history')
+  if (!statusMessages.length) statusMessages.push(error ? 'Chart update failed' : 'Chart ready')
+  const statusLoading = (pending && !unavailable) || surface?.indicatorState === 'loading' || oiState === 'loading' || takerState === 'loading'
+  const statusSummary = statusMessages.join(' · ')
   return <section data-chart-workspace aria-label="Market chart workspace" className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden overscroll-none text-sm font-normal tabular-nums">
     <header className="flex shrink-0 flex-wrap items-center gap-3 border-b px-4 py-2">
       <div className="min-w-0 flex-1"><h2 className="truncate text-base font-semibold tracking-tight" title={displayedId}>{displayedId.replace(/-SWAP$/, '')}</h2></div>
@@ -362,6 +374,10 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
         {([['Open', active.open], ['High', active.high], ['Low', active.low], ['Close', active.close]] as const).map(([label, value]) => <div key={label} className="min-w-0 px-3"><span className="text-muted-foreground">{label} </span><span title={price(value)}>{price(value)}</span></div>)}
       </div>}
       <p data-chart-price-scale={priceScale} className="shrink-0 border-b px-4 py-1 text-xs text-muted-foreground">{priceScale === 'linear' ? 'Linear scale · BOLL includes zero or negative values' : 'Logarithmic price scale'} · ↑ Hollow candles rise · ↓ Solid candles fall</p>
+      <div data-chart-status role="status" aria-live="polite" aria-atomic="true" className="flex h-8 shrink-0 items-center gap-2 border-b px-4 text-xs text-muted-foreground">
+        <Badge variant="secondary">{statusLoading && <Spinner data-icon="inline-start" aria-hidden="true" role="presentation" />}Chart status</Badge>
+        <p className="min-w-0 truncate" title={statusSummary}>{statusMessages.map((message, index) => <span key={message}>{index > 0 && ' · '}<span>{message}</span></span>)}</p>
+      </div>
       <div ref={plotRef} data-chart-plot className="relative min-h-0 flex-1 overflow-hidden" onWheel={event => {
         if (analysis?.phase === 'capturing') return
         const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : -event.deltaY
@@ -376,15 +392,7 @@ export function MarketChart({ instId, timeframe = '15m', onTimeframeChange, list
           if (!matchesSelection || heldPointer.current?.pointerId !== event.pointerId) return
           if (!(event.buttons & 1)) { endInspection(); return }
           inspectAt(event.currentTarget, event.clientX)
-        }}><Plot bars={bars} geometry={plotGeometry} liveBar={surface.liveBar ?? bars.at(-1)!} liveOverlay={!!surface.liveBar} inspected={inspected} oiState={oiState} takerState={takerState} /></svg> : <div role="status" className="flex h-full items-center justify-center gap-2 text-muted-foreground">{unavailable ? unavailableText : <><Spinner />Loading local prices…</>}</div>}
-        {pending && surface && !unavailable && <span role="status" className="pointer-events-none absolute right-4 top-2 rounded-md border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Preparing {instId.replace(/-SWAP$/, '')} {timeframeLabel(timeframe)}{requestedEnd !== null ? ` · ${time(requestedEnd)}` : ''}…</span>}
-        {unavailable && surface && <span role="status" className="pointer-events-none absolute right-4 top-2 max-w-md rounded-md border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{unavailableText}</span>}
-        {surface?.indicatorState === 'loading' && <Badge variant="secondary" role="status" className="pointer-events-none absolute right-4 bottom-2">Calculating indicators…</Badge>}
-        {oiState === 'loading' && <Badge variant="secondary" role="status" className="pointer-events-none absolute right-4 top-10">Loading OI history…</Badge>}
-        {takerState === 'loading' && <Badge variant="secondary" role="status" className="pointer-events-none absolute right-4 top-20">Loading taker history…</Badge>}
-        {oiState === 'unavailable' && <span role="status" className="pointer-events-none absolute right-4 top-10 rounded-md border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{`OKX ${timeframeLabel(displayedFrame)} OI history is incomplete for this range`}</span>}
-        {takerState === 'unavailable' && <span role="status" className="pointer-events-none absolute right-4 top-20 rounded-md border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">{`OKX ${timeframeLabel(displayedFrame)} Taker history is incomplete for this range`}</span>}
-        {atBoundary && !pending && <span role="status" className="pointer-events-none absolute right-4 top-2 rounded-md border bg-chart-annotation px-2 py-1 text-xs text-muted-foreground">Start of available history</span>}
+        }}><Plot bars={bars} geometry={plotGeometry} liveBar={surface.liveBar ?? bars.at(-1)!} liveOverlay={!!surface.liveBar} inspected={inspected} oiState={oiState} takerState={takerState} /></svg> : null}
       </div>
       {captureStatus === 'flashing' && <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
     </section>

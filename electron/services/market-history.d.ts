@@ -9,6 +9,8 @@ export type MarketHistoryOptions = {
   store: Pick<MarketStore, 'candles' | 'coverage' | 'inspectCandles' | 'statistics'> & Partial<Pick<MarketStore, 'candleRevision' | 'candleChangesSince'>>
   metadata: HistorySyncOptions['metadata'] & AuditMetadata
   get(path: string, parameters: Record<string, string | number>, signal: AbortSignal, priority: StorePriority): Promise<unknown[][]>
+  /** Reuse a just-closed candle from the acknowledged stream before REST acquisition. */
+  awaitRealtimeCandle?(query: { instrument: string; timeframe: string; from: number; through: number; signal: AbortSignal; priority: StorePriority }): Promise<boolean>
   // Raw API JSON is checked by the adapter before reaching durable storage.
   parseCandle(instrument: string, timeframe: string, value: unknown[]): CandleRecord | null
   persistCandles(instrument: string, rows: CandleRecord[], options: { priority: StorePriority }): MaybePromise<unknown>

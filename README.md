@@ -54,7 +54,7 @@ The 24h trading-volume check sums actual quote volume from **288 completed 5m ca
 
 All eligible USDT perpetual contracts receive live streams independently of liquidity filters, historical preparation, search, and chart selection. Prices publish immediately; fresh depth, spread, and open-interest observations recheck qualification in short batches. Quiet tickers remain usable through their acknowledged, uninterrupted native subscription without changing raw timestamps; missing snapshots and source faults use bounded per-contract REST recovery. Exact depth/slippage calculations run in a worker, coalescing new observations while preserving each result's original freshness lease. Instrument metadata uses a bootstrap/reconnect REST snapshot plus the global SWAP instruments subscription. Incremental listing, parameter, suspension, and delisting events update the universe directly; healthy collection does not periodically rescan it. Missing or expired data stays unqualified while acquisition continues.
 
-The contract list loads once and then follows desktop change notifications. Healthy snapshots do not poll or start background requests; a hidden workspace resynchronizes when shown, and failed IPC reads keep bounded retries. Required observation leases and native candle boundaries invalidate qualification at their actual deadlines. A ranking whose current completed interval is missing stays unavailable until that close is persisted.
+The contract list loads once and then follows desktop change notifications. Healthy snapshots do not poll or start background requests; a hidden workspace resynchronizes when shown, and failed IPC reads keep bounded retries. Required observation leases and native candle boundaries invalidate qualification at their actual deadlines. Waiting for a closing candle is shown as updating; unavailable observations and actual source failures remain distinct. A ranking whose current completed interval is missing stays unavailable until that close is persisted.
 
 ## Charts and indicators
 
@@ -71,6 +71,8 @@ Select a contract and choose **5m**, **15m**, or **1h**. The default chart timef
 | Analyze Long / Analyze Short | Analyze a captured chart snapshot |
 
 A normal viewport shows 96 candles, but any available prices can render immediately, including a new listing with fewer observations. OHLC, forming prices, OI, Taker, and recursive indicators have independent readiness. Missing or expired statistics leave gaps in their own panels; they do not hide prices, block history, or force the chart back to an older complete window. Stored data is labeled stale until current source observations and stream continuity establish freshness.
+
+Loading, incomplete history, and history boundary messages share a reserved status row above the plot. Source updates do not cover candles or change the plot's dimensions; truncated summaries retain their full text on hover and for assistive technology.
 
 Without candle inspection, the OI and Taker legends each show their latest valid observation in the visible range. An older observation includes its candle time as `as of`; Taker Buy and Sell always come from the same candle. Holding a candle shows only that candle's values, including `Unavailable` for missing statistics. Forming-candle gaps remain gaps in the plots.
 
@@ -91,6 +93,8 @@ Applicable relative changes use `(current − previous) / abs(previous) × 100%`
 **Settings → History to retain (days)** controls the requested history coverage, defaulting to **30 days**, with a supported range of **1–3,650 whole days**. Synchronization also requests 200 earlier **price** candles for initial indicator coverage; statistics do not need indicator warmup. Exact recursive calculations reuse durable checkpoints or replay the available canonical prefix, rather than treating those 200 candles as a substitute for earlier input. Available history depends on listing dates and source availability.
 
 Every eligible contract subscribes to native 5m, 15m, and 1h candles and public ticker, 400-level order-book, open-interest, and trade channels. Public connections carry at most 25 contracts each, with paced connection starts. Books are reconstructed from snapshots and sequence-checked incremental updates; a gap rebuilds the affected connection without stopping the others.
+
+At a native close, acquisition gives the acknowledged candle stream up to 10 seconds to deliver the final candle. Accepted confirmations finish committing before competing acquisition proceeds. Qualification, chart recovery, and archive downloads share this wait and reuse the durable candle; older gaps and disconnected or silent streams use REST recovery.
 
 Completed native candles, independent OI/Taker observations, source coverage evidence, and recursive indicator checkpoints are stored in SQLite WAL. One dedicated writer worker commits facts and their versions atomically; two reader workers serve indexed range queries. A dedicated market coordinator worker owns MarketService, network scheduling, and metadata. The Electron main process handles windows, security, and IPC; separate database and indicator workers execute market SQL and calculations. Forming candles and their live OI/Taker observations remain in memory.
 
