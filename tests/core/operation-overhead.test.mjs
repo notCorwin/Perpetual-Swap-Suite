@@ -3,17 +3,19 @@ import test from 'node:test'
 import { median, assessBudgets, summarizePairs } from '../../scripts/operation-overhead.mjs'
 
 test('paired comparison uses robust medians and retains operation and message cost', () => {
-  const runs=[10,1000,12].flatMap((baseline,index)=>[false,true].map(enabled=>({enabled,metrics:{nativeMarket:{wallMS:enabled?[14,15,16][index]:baseline,cpuMS:enabled?[14,15,16][index]:baseline}},
+  const runs=[10,1000,12].flatMap((baseline,index)=>[false,true].map(enabled=>({trial:index,enabled,metrics:{nativeMarket:{wallMS:enabled?[14,15,16][index]:baseline,cpuMS:enabled?[14,15,16][index]:baseline}},
     business:{marketMessages:100},journal:{phases:{nativeMarket:{operations:200,logicalBytes:20000}}}})))
   const result=summarizePairs(runs).phases.nativeMarket
   assert.equal(result.baseline.wallMS,12);assert.equal(result.enabled.wallMS,15)
-  assert.equal(result.enabled.extraCPUPerOperationMS,.015)
+  assert.equal(result.enabled.extraCPUMS,4)
+  assert.equal(result.enabled.extraWallMS,4)
+  assert.equal(result.enabled.extraCPUPerOperationMS,.02)
   assert.equal(result.enabled.operationsPerMessage,2)
   assert.equal(median([3,1,2,4]),2.5)
 })
 
 test('CPU, disk and durable ACK regressions fail independent configurable budgets', () => {
-  const summary={phases:{nativeMarket:{baseline:{wallMS:100,cpuMS:100},enabled:{wallMS:140,cpuMS:170,eventLoopP99MS:40,extraCPUPerMessageMS:.1,logicalBytesPerMessage:5000}}},rendererAcknowledgment:{p95MS:60,maxMS:220}}
+  const summary={phases:{nativeMarket:{baseline:{wallMS:100,cpuMS:100},enabled:{wallMS:140,cpuMS:170,extraCPUMS:70,eventLoopP99MS:40,extraCPUPerMessageMS:.1,logicalBytesPerMessage:5000}}},rendererAcknowledgment:{p95MS:60,maxMS:220}}
   const budgets={nativeMarket:{wallRatio:.2,wallExtraMS:10,cpuRatio:.2,cpuExtraMS:10,eventLoopP99MS:25,extraCPUPerMessageMS:.05,logicalBytesPerMessage:4000},rendererAcknowledgment:{p95MS:40,maxMS:200}}
   const failures=assessBudgets(summary,budgets)
   assert.deepEqual(failures.map(value=>value.metric),['wallMS','cpuMS','eventLoopP99MS','extraCPUPerMessageMS','logicalBytesPerMessage','p95MS','maxMS'])
@@ -21,7 +23,7 @@ test('CPU, disk and durable ACK regressions fail independent configurable budget
 })
 
 test('absolute CPU allowance prevents timer noise in tiny message probes from failing per-message budgets', () => {
-  const summary={phases:{nativeMarket:{baseline:{wallMS:1,cpuMS:2},enabled:{wallMS:1,cpuMS:3,extraCPUPerMessageMS:.1}}}}
+  const summary={phases:{nativeMarket:{baseline:{wallMS:1,cpuMS:2},enabled:{wallMS:1,cpuMS:3,extraCPUMS:1,extraCPUPerMessageMS:.1}}}}
   assert.deepEqual(assessBudgets(summary,{nativeMarket:{cpuExtraMS:10,extraCPUPerMessageMS:.01}}),[])
 })
 
@@ -46,7 +48,7 @@ test('configuration typos and invalid storage or ACK budgets cannot silently dis
 
 test('cached DB work is bounded by added per-operation CPU while the end-to-end CPU guard remains independent', () => {
   const summary = { phases: {
-    databaseWorker: { baseline: { wallMS: 10, cpuMS: 10 }, enabled: { wallMS: 12, cpuMS: 40, journalOperations: 1000, extraCPUPerOperationMS: .03 } },
+    databaseWorker: { baseline: { wallMS: 10, cpuMS: 10 }, enabled: { wallMS: 12, cpuMS: 40, extraCPUMS:30, journalOperations: 1000, extraCPUPerOperationMS: .03 } },
     backendEndToEnd: { baseline: { wallMS: 100, cpuMS: 100 }, enabled: { wallMS: 105, cpuMS: 130 } },
   } }
   const budget = { databaseWorker: { extraCPUPerOperationMS: .025, cpuExtraMS: 5 }, backendEndToEnd: { cpuRatio: .25 } }
@@ -57,4 +59,35 @@ test('cached DB work is bounded by added per-operation CPU while the end-to-end 
   assert.deepEqual(assessBudgets(summary, budget), [])
   delete summary.phases.databaseWorker.enabled.journalOperations
   assert.equal(assessBudgets(summary, budget)[0].metric, 'journalOperations')
+})
+
+test('paired cost divides each CPU delta by its own measured denominator before taking the median', () => {
+  const operations = [1000, 1, 10], messages = [1000, 10, 100]
+  const runs = operations.flatMap((count, trial) => [false, true].map(enabled => ({
+    trial, enabled, metrics: { nativeMarket: { wallMS: 100, cpuMS: enabled ? 110 + trial * 10 : 100 } },
+    business: { marketMessages: messages[trial] }, journal: { phases: { nativeMarket: { operations: count, logicalBytes: count * 100 } } },
+  })))
+  const result = summarizePairs(runs).phases.nativeMarket.enabled
+  assert.equal(result.extraCPUMS, 20)
+  assert.equal(result.extraCPUPerOperationMS, 3)
+  assert.equal(result.extraCPUPerMessageMS, .3)
+  assert.equal(result.operationsPerMessage, .1)
+  runs[0].business.marketMessages++
+  assert.throws(() => summarizePairs(runs), /Unmatched nativeMarket message denominator/)
+})
+
+test('equal mode counts cannot hide mismatched or duplicate trial identities', () => {
+  const run = (trial, enabled) => ({ trial, enabled, metrics: { cpu: { wallMS: 1, cpuMS: 1 } }, journal: { phases: {} } })
+  assert.throws(() => summarizePairs([run(0, false), run(1, true)]), /Unpaired workload/)
+  assert.throws(() => summarizePairs([run(0, false), run(0, false), run(0, true), run(1, true)]), /Duplicate paired workload/)
+  const result = summarizePairs([run(0, false), run(0, true)]).phases.cpu.enabled
+  assert.equal(result.extraCPUPerOperationMS, undefined, 'No recorded operations means per-operation cost is undefined.')
+})
+
+test('small-sample CPU allowance uses paired added CPU rather than independent mode medians', () => {
+  const summary = { phases: { nativeMarket: { baseline: { wallMS: 1, cpuMS: 100 }, enabled: { wallMS: 1, cpuMS: 105, extraCPUMS: 50, extraCPUPerMessageMS: .1 } } } }
+  const budget = { nativeMarket: { cpuExtraMS: 10, extraCPUPerMessageMS: .025 } }
+  assert.equal(assessBudgets(summary, budget)[0].metric, 'extraCPUPerMessageMS')
+  delete summary.phases.nativeMarket.enabled.extraCPUMS
+  assert.equal(assessBudgets(summary, budget)[0].reason, 'missing-or-invalid-paired-measurement')
 })

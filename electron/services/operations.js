@@ -9,13 +9,14 @@ const statuses = new Set(['ok', 'error', 'cancelled'])
 const allowedAttributes = new Set(['count', 'rows', 'bytes', 'sentBytes', 'receivedBytes', 'statusCode', 'errorName', 'lane', 'priority', 'method', 'measurement', 'queryCount', 'changes', 'inputRows', 'outputRows', 'cache', 'threadId', 'blockingDurationMS', 'renderDurationMS', 'width', 'height', 'reason', 'incomplete', 'durationSource', 'role', 'candles', 'intervalMS', 'checkpoint', 'execution', 'projection', 'bidLevels', 'askLevels', 'bookResident', 'inspected', 'transport', 'stream', 'connection', 'path', 'httpStatus', 'declaredResponseBytes', 'timedOut', 'code', 'clean', 'cpuPercent', 'residentKB', 'processId', 'source', 'queueMS', 'transferMS', 'executionMS', 'calls', 'hook', 'expected', 'workerRole', 'sequence', 'batchSize', 'attempt', 'misses', 'hits', 'invalidations', 'generation', 'revision', 'parameterHash', 'inputHash', 'heapUsedBytes', 'heapTotalBytes', 'rssBytes', 'gcKind', 'gcFlags', 'eventLoopDelayMS', 'bufferedBytes', 'omitted', 'command', 'nativeTimestampUS', 'nativeDurationUS', 'nativeEventName', 'nativeCategory', 'nativeEventId', 'clockDomain', 'nativeStatus'])
 const safeText = (value, maximum = 160) => typeof value === 'string' && value.length > 0 && value.length <= maximum && !value.includes('\0')
 const safeID = value => safeText(value, 256) && /^[\w.:/-]+$/.test(value)
-function attributes(value) {
-  const result = {}
+function attributes(value, base) {
+  const result = base ? { ...base } : {}
   for (const key of Object.keys(value ?? {})) {
     if (!allowedAttributes.has(key)) continue
     const item = value[key]
     if (item === null || typeof item === 'boolean' || typeof item === 'number' && Number.isFinite(item)
       || typeof item === 'string' && item.length <= 160) result[key] = item
+    else if (base) delete result[key]
   }
   return result
 }
@@ -66,11 +67,13 @@ function start(specification, startedAt = performance.timeOrigin + performance.n
     ...(context.parentId ? { parentId: context.parentId } : {}), ...(context.scenarioId ? { scenarioId: context.scenarioId } : {}),
     category: specification.category, name: String(specification.name).slice(0, 160),
     ...(specification.resource ? { resource: String(specification.resource).slice(0, 256) } : {}), startedAt, attributes: attributes(specification.attributes) }
-  localEvent(base, 'start', { durationMS: 0, status: 'running' }); return base
+  // Journal sinks receive mutable events; keep the validated private baseline
+  // independent so a sink cannot inject attributes into the terminal record.
+  localEvent(base, 'start', { durationMS: 0, status: 'running', attributes: { ...base.attributes } }); return base
 }
 function complete(base, detail) {
   localEvent(base, 'end', { durationMS: Math.max(0, detail.durationMS), status: detail.status ?? 'ok',
-    attributes: attributes({ ...base.attributes, ...detail.attributes }),
+    attributes: attributes(detail.attributes, base.attributes),
     ...(Number.isFinite(detail.cpuTimeMS) ? { cpuTimeMS: Math.max(0, detail.cpuTimeMS) } : {}) })
 }
 export function recordOperation(value) {
@@ -82,9 +85,13 @@ const noop = { context: {}, end() {}, run: operation => operation() }
 export function beginOperation(specification) {
   if (!hasOperationRecording() || isOperationSuppressed() || !categories.has(specification.category)) return noop
   const started = performance.now(), base = start(specification, performance.timeOrigin + started)
-  const context = { traceId: base.traceId, parentId: base.id, ...(base.scenarioId ? { scenarioId: base.scenarioId } : {}) }
+  const traceId = base.traceId, parentId = base.id, scenarioId = base.scenarioId
+  const context = { traceId, parentId, ...(scenarioId ? { scenarioId } : {}) }
   let ended = false
-  const span = { context, run: operation => runWithOperationContext(context, operation), end(result = {}) {
+  // These IDs were produced locally. Boundary propagation validates arbitrary
+  // input separately; internal execution preserves caller suppression without
+  // repeatedly copying and validating the same IDs on every nested operation.
+  const span = { context, run: operation => runContext({ traceId, parentId, scenarioId, suppressed: current().suppressed }, operation), end(result = {}) {
     if (ended) return
     ended = true; active.delete(span); complete(base, { ...result, durationMS: performance.now() - started })
   } }

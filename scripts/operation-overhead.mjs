@@ -70,11 +70,15 @@ export function assessBudgets(summary, budgets=defaultBudgets) {
     if (budget.extraCPUPerOperationMS !== undefined && (!Number.isFinite(phase.enabled.journalOperations) || phase.enabled.journalOperations <= 0)) {
       failures.push({ phase: name, metric: 'journalOperations', reason: 'missing-or-invalid-measurement' })
     }
+    const pairedCPURequired = budget.extraCPUPerMessageMS !== undefined || budget.extraCPUPerOperationMS !== undefined
+    if (pairedCPURequired && !Number.isFinite(phase.enabled.extraCPUMS)) {
+      failures.push({ phase: name, metric: 'extraCPUMS', reason: 'missing-or-invalid-paired-measurement' })
+    }
     for(const metric of ['wallMS','eventLoopP99MS','extraCPUPerMessageMS','extraCPUPerOperationMS','logicalBytesPerMessage']){
       if (budget[metric] !== undefined && !Number.isFinite(phase.enabled[metric])) {
         failures.push({ phase: name, metric, reason: 'missing-or-invalid-measurement' }); continue
       }
-      if(budget[metric]!==undefined&&!(['extraCPUPerMessageMS','extraCPUPerOperationMS'].includes(metric)&&phase.enabled.cpuMS-phase.baseline.cpuMS<=(budget.cpuExtraMS??0))&&phase.enabled[metric]>budget[metric])failures.push({phase:name,metric,actual:phase.enabled[metric],limit:budget[metric]})
+      if(budget[metric]!==undefined&&!(['extraCPUPerMessageMS','extraCPUPerOperationMS'].includes(metric)&&phase.enabled.extraCPUMS<=(budget.cpuExtraMS??0))&&phase.enabled[metric]>budget[metric])failures.push({phase:name,metric,actual:phase.enabled[metric],limit:budget[metric]})
     }
   }
   const ack=summary.rendererAcknowledgment,budget=budgets.rendererAcknowledgment
@@ -131,17 +135,46 @@ export function summarizePairs(runs){
       for (const metric of ['wallMS', 'cpuMS']) assert.ok(Number.isFinite(run.metrics[phase][metric]) && run.metrics[phase][metric] >= 0, `Invalid ${phase}.${metric}`)
       for (const [metric, value] of Object.entries(run.metrics[phase])) assert.ok(Number.isFinite(value), `Invalid ${phase}.${metric}`)
     }
+    const byPair = new Map()
+    for (const run of [...groups.baseline, ...groups.enabled]) {
+      assert.ok(Number.isInteger(run.trial) && run.trial >= 0, `Invalid paired trial: ${phase}`)
+      const key = `${run.trial}:${Boolean(run.desktop)}`, pair = byPair.get(key) ?? {}
+      const mode = run.enabled ? 'enabled' : 'baseline'
+      assert.equal(pair[mode], undefined, `Duplicate paired workload: ${phase}/${key}/${mode}`)
+      pair[mode] = run; byPair.set(key, pair)
+    }
+    const pairs = [...byPair.values()]
+    for (const pair of pairs) assert.ok(pair.baseline && pair.enabled, `Unpaired workload: ${phase}`)
     const metrics=new Set(Object.values(groups).flatMap(values=>values.flatMap(run=>Object.keys(run.metrics[phase]))))
     metrics.delete('startedAt');metrics.delete('endedAt')
     phases[phase]=Object.fromEntries(Object.entries(groups).map(([name,values])=>[name,Object.fromEntries([...metrics].map(metric=>[metric,median(values.map(run=>run.metrics[phase][metric]??0))]))]))
-    const recorded=groups.enabled
-    if(recorded.length){phases[phase].enabled.logicalBytesPerMessage=median(recorded.map(run=>run.business.marketMessages?run.journal.phases[phase]?.logicalBytes/run.business.marketMessages:0))
-      phases[phase].enabled.extraCPUPerMessageMS=phase==='nativeMarket'?(phases[phase].enabled.cpuMS-phases[phase].baseline.cpuMS)/recorded[0].business.marketMessages:0
-      phases[phase].enabled.journalOperations=median(recorded.map(run=>run.journal.phases[phase]?.operations??0))
-      phases[phase].enabled.logicalBytes=median(recorded.map(run=>run.journal.phases[phase]?.logicalBytes??0))
-      phases[phase].enabled.extraCPUPerOperationMS=(phases[phase].enabled.cpuMS-phases[phase].baseline.cpuMS)/Math.max(1,phases[phase].enabled.journalOperations)
-      phases[phase].enabled.logicalBytesPerOperation=phases[phase].enabled.logicalBytes/Math.max(1,phases[phase].enabled.journalOperations)
-      if(phase==='nativeMarket'){phases[phase].enabled.operationsPerMessage=phases[phase].enabled.journalOperations/recorded[0].business.marketMessages;phases[phase].enabled.projectedLogicalMiBPerHour=phases[phase].enabled.logicalBytes/phases[phase].enabled.wallMS*3600000/1048576}}
+    const samples = pairs.map(({ baseline, enabled }) => ({
+      cpuDeltaMS: enabled.metrics[phase].cpuMS - baseline.metrics[phase].cpuMS,
+      wallDeltaMS: enabled.metrics[phase].wallMS - baseline.metrics[phase].wallMS,
+      operations: enabled.journal.phases[phase]?.operations ?? 0,
+      logicalBytes: enabled.journal.phases[phase]?.logicalBytes ?? 0,
+      wallMS: enabled.metrics[phase].wallMS,
+      ...(phase === 'nativeMarket' ? { messages: enabled.business.marketMessages } : {}),
+    }))
+    const measured = phases[phase].enabled
+    measured.extraCPUMS = median(samples.map(value => value.cpuDeltaMS))
+    measured.extraWallMS = median(samples.map(value => value.wallDeltaMS))
+    measured.journalOperations = median(samples.map(value => value.operations))
+    measured.logicalBytes = median(samples.map(value => value.logicalBytes))
+    if (samples.every(value => value.operations > 0)) {
+      measured.extraCPUPerOperationMS = median(samples.map(value => value.cpuDeltaMS / value.operations))
+      measured.logicalBytesPerOperation = median(samples.map(value => value.logicalBytes / value.operations))
+    }
+    if (phase === 'nativeMarket') {
+      for (const { baseline, enabled } of pairs) {
+        assert.ok(Number.isInteger(enabled.business.marketMessages) && enabled.business.marketMessages > 0, 'Invalid nativeMarket message denominator')
+        assert.equal(enabled.business.marketMessages, baseline.business.marketMessages, 'Unmatched nativeMarket message denominator')
+      }
+      measured.logicalBytesPerMessage = median(samples.map(value => value.logicalBytes / value.messages))
+      measured.extraCPUPerMessageMS = median(samples.map(value => value.cpuDeltaMS / value.messages))
+      measured.operationsPerMessage = median(samples.map(value => value.operations / value.messages))
+      measured.projectedLogicalMiBPerHour = median(samples.map(value => value.logicalBytes / value.wallMS * 3600000 / 1048576))
+    }
   }
   const latencies=runs.filter(run=>run.enabled).flatMap(run=>run.receiver?.latencies.map(value=>value.durationMS)??[]).toSorted((a,b)=>a-b)
   return {phases,...(latencies.length?{rendererAcknowledgment:{batches:latencies.length,medianMS:median(latencies),p95MS:latencies[Math.min(latencies.length-1,Math.ceil(latencies.length*.95)-1)],maxMS:latencies.at(-1)}}:{})}
@@ -153,7 +186,7 @@ export async function runOverhead({output, repeats=5, cycles=20, contracts=130, 
   const directory=resolve(output??join(root,'.build/operation-overhead',new Date().toISOString().replaceAll(':','').replaceAll('.','')))
   await mkdir(directory,{recursive:true})
   const hostBefore={loadAverage:loadavg(),freeMemoryBytes:freemem()},runs=[],epoch=Math.floor(Date.now()/300000)*300000
-  const sourceFiles = ['electron/services/operations.js', 'electron/services/operation-runtime.js', 'electron/services/operation-journal.js', 'electron/services/renderer-operations.js', 'electron/services/market-service.js', 'electron/services/operation-hooks.js', 'electron/services/operation-network-hooks.js',
+  const sourceFiles = ['electron/services/operations.js', 'electron/services/operation-runtime.js', 'electron/services/operation-journal.js', 'electron/services/renderer-operations.js', 'electron/services/market-service.js', 'electron/services/operation-hooks.js', 'electron/services/operation-network-hooks.js', 'electron/services/realtime-public-market.js',
     'electron/services/worker-operations.js', 'electron/services/operation-worker.js', 'electron/services/recorded-database.js', 'electron/services/indicators.js', 'electron/services/market-store.js', 'electron/services/market-store-worker.js',
     'electron/services/prepared-chart-service.js', 'electron/services/prepared-chart-worker.js', 'src/operation-telemetry.ts', 'src/chart-geometry.ts', 'src/chart-axis.ts', 'src/chart-layout.ts']
   const sourceHashes = async () => Object.fromEntries(await Promise.all(sourceFiles.map(async file => {
@@ -196,7 +229,7 @@ export async function runOverhead({output, repeats=5, cycles=20, contracts=130, 
   await writeFile(join(directory,'report.json'),JSON.stringify(summary,null,2)+'\n')
   const rows=Object.entries(summary.phases).map(([phase,value])=>`| ${phase} | ${value.baseline.wallMS.toFixed(2)} | ${value.enabled.wallMS.toFixed(2)} | ${value.baseline.cpuMS.toFixed(2)} | ${value.enabled.cpuMS.toFixed(2)} | ${value.enabled.eventLoopP99MS?.toFixed(2)??'—'} | ${value.enabled.journalOperations} | ${(value.enabled.logicalBytes/1048576).toFixed(2)} |`)
   const stored = Object.entries(storage).map(([name, value]) => `${name}: ${(value.journalBytes / 1048576).toFixed(2)} MiB on disk / ${(value.logicalBytes / 1048576).toFixed(2)} MiB decoded; ${value.bytesPerOperation.toFixed(1)} stored bytes per operation.`).join('\n\n')
-  await writeFile(join(directory,'report.md'),`# Operation recording overhead\n\nRevision: ${summary.revision}. ${repeats} alternating baseline/enabled pairs after ${warmup} warmup rounds. Exact business results match in every pair. Values are medians; complete raw trials, source hashes and configured budgets are in report.json.\n\n| Workload | Baseline wall ms | Recorded wall ms | Baseline CPU ms | Recorded CPU ms | Recorded event-loop p99 ms | Operations | Logical MiB |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n${rows.join('\n')}\n\n${stored}\n\nStored bytes include startup and warmup. Per-phase bytes describe decoded JSONL and are not attributed physical disk bytes. Business time starts in the same simulated native period for every child and advances monotonically; performance and operation clocks remain real.\n\n${summary.rendererAcknowledgment?`Renderer durable ACKs: median ${summary.rendererAcknowledgment.medianMS.toFixed(2)} ms; p95 ${summary.rendererAcknowledgment.p95MS.toFixed(2)} ms; maximum ${summary.rendererAcknowledgment.maxMS.toFixed(2)} ms.\n\n`:''}Budget failures: ${summary.failures.length}.\n`)
+  await writeFile(join(directory,'report.md'),`# Operation recording overhead\n\nRevision: ${summary.revision}. ${repeats} alternating baseline/enabled pairs after ${warmup} warmup rounds. Exact business results match in every pair. Baseline and recorded columns show each group's median; relative CPU, wall and memory gates compare those group medians. Added CPU and wall costs are medians of matched-pair differences. Per-message and per-operation added CPU divide each pair's difference by its own measured count before taking the median. Phase CPU is whole-process usage inside its window, including worker threads, V8/libuv and possibly earlier journal drain; normalization does not claim exclusive operation CPU. Complete raw trials, source hashes and configured budgets are in report.json.\n\n| Workload | Baseline wall ms | Recorded wall ms | Baseline CPU ms | Recorded CPU ms | Recorded event-loop p99 ms | Operations | Logical MiB |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n${rows.join('\n')}\n\n${stored}\n\nStored bytes include startup and warmup. Per-phase bytes describe decoded JSONL and are not attributed physical disk bytes. Business time starts in the same simulated native period for every child and advances monotonically; performance and operation clocks remain real.\n\n${summary.rendererAcknowledgment?`Renderer durable ACKs: median ${summary.rendererAcknowledgment.medianMS.toFixed(2)} ms; p95 ${summary.rendererAcknowledgment.p95MS.toFixed(2)} ms; maximum ${summary.rendererAcknowledgment.maxMS.toFixed(2)} ms.\n\n`:''}Budget failures: ${summary.failures.length}.\n`)
   return {directory,...summary}
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){

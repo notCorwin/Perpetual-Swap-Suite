@@ -1,7 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
-import { attachOperationSink, beginOperation, measureOperation, type OperationEvent } from '../electron/services/operations.js'
+import { attachOperationSink, attachOperationJournalSink, beginOperation, measureOperation, getOperationContext,
+  runWithOperationContext, withOperationSuppressed, type OperationEvent, type OperationJournalEvent } from '../electron/services/operations.js'
 // @ts-expect-error Node-only JS intentionally stays outside the renderer API.
 import { databaseOperation, openRecordedDatabase } from '../electron/services/recorded-database.js'
 
@@ -33,6 +34,48 @@ test('recording accepts diagnostic scalars and excludes arbitrary payloads', t =
   const badSink = attachOperationSink(() => { throw Error('diagnostics must not throw into app') })
   t.after(badSink)
   assert.equal(measureOperation({ category: 'cpu', name: 'test.safe' }, () => 42), 42)
+})
+
+test('span execution retains its own ancestry and scenario while inheriting execution-time suppression', t => {
+  const events: OperationEvent[] = [], unsubscribe = attachOperationSink(event => events.push(event))
+  t.after(unsubscribe)
+  const span = beginOperation({ category: 'cpu', name: 'test.trusted-span' })
+  const expected = { ...span.context }
+  span.context.traceId = 'public-context-was-mutated'
+  runWithOperationContext({ traceId: 'other-trace', parentId: 'other-parent', scenarioId: 'other-scenario' }, () => span.run(() => {
+    assert.deepEqual(getOperationContext(), expected)
+  }))
+  withOperationSuppressed(() => span.run(() => measureOperation({ category: 'cpu', name: 'test.suppressed-child' }, () => 1)))
+  assert.equal(events.length, 0, 'A span created outside suppression cannot re-enable recording inside a suppressed I/O callback.')
+  span.end()
+  assert.deepEqual(events.map(event => event.name), ['test.trusted-span'])
+})
+
+test('journal sink mutations cannot contaminate the private terminal attribute baseline', t => {
+  const journal: OperationJournalEvent[] = [], unsubscribe = attachOperationJournalSink(event => {
+    if (event.name !== 'test.sink-mutation') return
+    if (event.phase === 'start') {
+      assert.ok(event.attributes)
+      Object.assign(event.attributes, { secret: 'private-body', rows: { payload: 'private-body' }, count: 99 })
+    }
+    journal.push(event)
+  })
+  t.after(unsubscribe)
+  const span = beginOperation({ category: 'cpu', name: 'test.sink-mutation', attributes: { rows: 3, count: 4 } })
+  span.end({ attributes: { count: 7 } })
+  assert.deepEqual(journal[1].attributes, { rows: 3, count: 7 })
+  assert.equal(JSON.stringify(journal[1]).includes('private-body'), false)
+})
+
+test('terminal attributes validate only new values and preserve deletion of invalid overrides', t => {
+  const journal: OperationJournalEvent[] = [], unsubscribe = attachOperationJournalSink(event => { if (event.name === 'test.attribute-overrides') journal.push(event) })
+  t.after(unsubscribe)
+  const span = beginOperation({ category: 'cpu', name: 'test.attribute-overrides', attributes: { rows: 3, count: 4, reason: 'initial', bytes: 9 } })
+  const original = structuredClone(journal[0].attributes)
+  span.end({ attributes: { rows: NaN, count: 7, reason: 'x'.repeat(161), bytes: undefined, secret: 'not-recorded' } as unknown as Record<string, string | number> })
+  assert.deepEqual(journal[0].attributes, original, 'Completing a span does not mutate its already emitted start attributes.')
+  assert.deepEqual(journal[1].attributes, { count: 7 })
+  assert.equal(JSON.stringify(journal).includes('not-recorded'), false)
 })
 
 test('a bulk database operation separates API calls from execution batches without recording bound values', t => {

@@ -42,17 +42,16 @@ const render = index => { const value=geometry(bars,{width:960+(index%3),height:
  path.setAttribute('d',value.upBodies+value.downBodies); return value.upBodies.length+value.downBodies.length; };
 for(let index=0;index<config.warmup*32;index++)render(index);
 await flushWarmup();acknowledgmentLatencies.length=0;await yieldToBrowser();
-const heartbeat=[]; let previous=performance.now();
-const timer=setInterval(()=>{const now=performance.now();heartbeat.push(Math.max(0,now-previous-4));previous=now;},4);
 await window.overhead.start();
 const before=window.overhead.resources(), started=performance.now(); let checksum=0;
+const heartbeat=[]; let previous=started;
+const timer=setInterval(()=>{const now=performance.now();heartbeat.push(Math.max(0,now-previous-4));previous=now;},4);
 for(let index=0;index<config.cycles*32;index++){checksum+=render(index+10000);if(index%8===7)await yieldToBrowser();}
 const produced=performance.now(), after=window.overhead.resources();clearInterval(timer);
 await close();const drained=performance.now();
 const end=window.overhead.resources();
 window.overheadResult={business:{checksum,frames:config.cycles*32},metrics:{renderer:{startedAt:performance.timeOrigin+started,endedAt:performance.timeOrigin+produced,wallMS:produced-started,
  cpuMS:(after.cpu.user-before.cpu.user+after.cpu.system-before.cpu.system)/1000,
- mainThreadCpuMS:(after.cpu.user-before.cpu.user+after.cpu.system-before.cpu.system)/1000,
  rssDeltaBytes:after.memory.rss-before.memory.rss,peakRSSBytes:Math.max(before.memory.rss,after.memory.rss),peakHeapBytes:Math.max(before.memory.heapUsed,after.memory.heapUsed),
  eventLoopP99MS:heartbeat.sort((a,b)=>a-b)[Math.min(heartbeat.length-1,Math.floor(heartbeat.length*.99))]??0,eventLoopMaxMS:Math.max(0,...heartbeat)},
  rendererDrain:{wallMS:drained-produced,cpuMS:(end.cpu.user-after.cpu.user+end.cpu.system-after.cpu.system)/1000}},

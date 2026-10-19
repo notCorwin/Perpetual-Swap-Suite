@@ -149,13 +149,35 @@ test('book depth stays at 400 levels and equivalent numeric price spellings repl
   const f = fixture()
   t.after(() => f.market.close())
   const socket = await f.open()
-  push(socket, 'books', [book(1, -1, Array.from({ length: 410 }, (_, i) => level(1000 - i)), Array.from({ length: 410 }, (_, i) => level(1001 + i)))], btc, 'snapshot')
-  push(socket, 'books', [book(2, 1, [['1000.0', '9', '0', '1']], [])], btc, 'update')
+  const bids = Array.from({ length: 410 }, (_, i) => level(1000 - i)), asks = Array.from({ length: 410 }, (_, i) => level(1001 + i))
+  push(socket, 'books', [book(1, -1, [...bids].reverse(), [...asks].reverse())], btc, 'snapshot')
+  push(socket, 'books', [book(2, 1,
+    [['1000.0', '9', '0', '1'], ['8.1e2', '3', '0', '1'], ['0601.0', '0'], ['1', '0']],
+    [['1.201e3', '4', '0', '1'], ['1001.00', '0'], ['9999', '0']])], btc, 'update')
   await f.market.whenIdle()
-  assert.equal(f.books[0].bids.length, 400)
-  assert.equal(f.books[0].asks.length, 400)
-  assert.equal(f.books[1].bids.length, 400)
-  assert.deepEqual(f.books[1].bids[0], ['1000.0', '9', '0', '1'])
+  assert.deepEqual(f.books[0].bids, bids.slice(0, 400), 'updates preserve every level of the prior callback snapshot')
+  assert.deepEqual(f.books[0].asks, asks.slice(0, 400))
+  assert.deepEqual(f.books[1].bids, bids.slice(0, 399).map(value => value[0] === '1000' ? ['1000.0', '9', '0', '1'] : value[0] === '810' ? ['8.1e2', '3', '0', '1'] : value))
+  assert.deepEqual(f.books[1].asks, asks.slice(1, 400).map(value => value[0] === '1201' ? ['1.201e3', '4', '0', '1'] : value))
+})
+
+test('new and reinserted prices restore priority and trim only the worst levels on both sides', async t => {
+  const f = fixture()
+  t.after(() => f.market.close())
+  const socket = await f.open()
+  const bids = Array.from({ length: 400 }, (_, i) => level(1000 - i)), asks = Array.from({ length: 400 }, (_, i) => level(1001 + i))
+  push(socket, 'books', [book(1, -1, bids, asks)], btc, 'snapshot')
+  push(socket, 'books', [book(2, 1,
+    [level(600, 2), level(1000, 0), ['1000.0', '8', '0', '1'], level(601, 0), level(1000.5, 3)],
+    [level(1401, 2), level(1001, 0), ['1001.0', '8', '0', '1'], level(1400, 0), level(1000.5, 3)])], btc, 'update')
+  push(socket, 'books', [book(3, 2, [['1000.50', '0']], [['1.0005e3', '0']])], btc, 'update')
+  await f.market.whenIdle()
+  assert.deepEqual(f.books[0].bids, bids)
+  assert.deepEqual(f.books[0].asks, asks)
+  assert.deepEqual(f.books[1].bids, [level(1000.5, 3), ['1000.0', '8', '0', '1'], ...bids.slice(1, 399)])
+  assert.deepEqual(f.books[1].asks, [level(1000.5, 3), ['1001.0', '8', '0', '1'], ...asks.slice(1, 399)])
+  assert.deepEqual(f.books[2].bids, f.books[1].bids.slice(1), 'previously trimmed bids cannot reappear after deletion')
+  assert.deepEqual(f.books[2].asks, f.books[1].asks.slice(1), 'previously trimmed asks cannot reappear after deletion')
 })
 
 test('a missing initial snapshot, sequence gap, reset or invalid level forces a fresh connection', async t => {
