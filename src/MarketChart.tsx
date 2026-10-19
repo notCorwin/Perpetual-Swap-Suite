@@ -157,8 +157,10 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {lineStroke("rsi6", lines.rsi6, "var(--chart-1)")}
     {lineStroke("rsi12", lines.rsi12, "var(--chart-2)", "7 4")}
     {lineStroke("rsi24", lines.rsi24, "var(--chart-3)", "1 4")}
-    {lineStroke("atrPercent", lines.atrPercent, "var(--chart-3)")}
-    {lineStroke("bbw", lines.bbw, "var(--chart-1)", "7 4")}
+    <g data-chart-volatility-panel data-chart-panel-top={panels.atr[0]} data-chart-panel-bottom={panels.atr[1]}>
+      {lineStroke("atrPercent", lines.atrPercent, "var(--chart-3)")}
+      {lineStroke("bbw", lines.bbw, "var(--chart-1)", "7 4")}
+    </g>
     {lineStroke("roc", lines.roc, "var(--chart-1)")}
     {lineStroke("maroc", lines.maroc, "var(--chart-2)", "7 4")}
     <g data-chart-oi={oiAxis ? oiComplete ? "complete" : "partial" : "empty"} data-chart-oi-state={oiState} data-chart-oi-samples={oiSamples.length}>
@@ -187,21 +189,6 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {legend("taker", [["↑ Taker Buy (Contracts)", statistics.taker ? compact(statistics.taker.buy) : "Unavailable", "var(--positive)", undefined, statistics.taker?.hour], ["↓ Taker Sell (Contracts)", statistics.taker ? compact(statistics.taker.sell) : "Unavailable", "var(--negative)", "2 3", statistics.taker?.hour]])}
     {panels.rsi[1] - panels.rsi[0] >= 35 && <>{lineLabel(axisStarts.rsi, panels.rsi[0], "100")}{lineLabel(axisStarts.rsi, panels.rsi[1], "0")}</>}
     {panels.roc[1] - panels.roc[0] >= 35 && <>{lineLabel(axisStarts.roc, panels.roc[0], formatPercent(rocAxis.max, rocAxis.decimals))}{lineLabel(axisStarts.roc, panels.roc[1], formatPercent(rocAxis.min, rocAxis.decimals))}</>}
-    <g data-chart-volatility-axis="atrPercent" data-chart-axis-side="left">
-        <text data-chart-axis-label="ATR%" x={columns.atr[0] - 8} y={headerY.atr} textAnchor="end" dominantBaseline="middle" fill="var(--chart-3)">ATR%</text>
-        <line x1={columns.atr[0]} x2={columns.atr[0]} y1={panels.atr[0]} y2={panels.atr[1]} stroke="var(--border)" />
-        {panels.atr[1] - panels.atr[0] >= 35 && geometry.atrTicks.map(({ y, label }, index) => <g key={index}>
-          <line x1={columns.atr[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.25" />
-          <text data-chart-axis-tick x={columns.atr[0] - 8} y={y} textAnchor="end" dominantBaseline="middle" fill="var(--chart-3)">{label}</text>
-        </g>)}
-    </g>
-    <g data-chart-volatility-axis="bbw" data-chart-axis-side="right">
-        <text data-chart-axis-label="BBW" x={axisStarts.atr} y={headerY.atr} dominantBaseline="middle" fill="var(--chart-1)">BBW</text>
-        {panels.atr[1] - panels.atr[0] >= 35 && geometry.bbwTicks.map(({ y, label }, index) => <g key={index}>
-          <line x1={right} x2={right + 4} y1={y} y2={y} stroke="var(--chart-1)" />
-          <text data-chart-axis-tick x={axisStarts.atr} y={y} dominantBaseline="middle" fill="var(--chart-1)">{label}</text>
-        </g>)}
-    </g>
     {oiAxis && panels.oi[1] - panels.oi[0] >= 35 && geometry.oiTicks.map(({ y, label }, index) => <g key={index}><line x1={columns.oi[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.25" />{lineLabel(axisStarts.oi, y, label)}</g>)}
     {panels.taker[1] - panels.taker[0] >= 35 && geometry.takerTicks.map(({ y, label }, index) => <g key={index}>{lineLabel(axisStarts.taker, y, label)}</g>)}
   </>

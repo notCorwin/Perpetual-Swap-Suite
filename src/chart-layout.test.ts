@@ -5,8 +5,8 @@ import { chartCandleWidth, chartHourX, chartLayout, chartPriceLabelLayout, type 
 test("stacked chart layout stays aligned and bounded", () => {
   const order: ChartPanel[] = ["price", "roc", "rsi", "atr", "oi", "taker"]
   for (const [width, height] of [[900, 700], [1440, 900], [2560, 900]]) {
-    const layout = chartLayout(width, height, 48, 40)
-    assert.equal(layout.left, 40)
+    const layout = chartLayout(width, height, 48)
+    assert.equal(layout.left, 0)
     assert.equal(layout.right + 48, width - 4)
     assert.ok(Math.abs((layout.panels.price[1] - layout.panels.price[0]) / (layout.panels.roc[1] - layout.panels.roc[0]) - 40 / 12) < 0.001)
     for (const [index, key] of order.entries()) {

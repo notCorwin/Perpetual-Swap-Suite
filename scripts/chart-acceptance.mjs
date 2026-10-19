@@ -102,32 +102,19 @@ export async function assertWorkspaceLayout(page) {
   return layout
 }
 
-export async function assertIndicatorLegends(page, { requireVolatilityTicks = false } = {}) {
+export async function assertIndicatorLegends(page, { requireFittedVolatility = false } = {}) {
   const reading = await page.locator('svg[data-rendered-inst]').evaluate(svg => {
     const fields = {
       'VWAP(14)': 'vwap', 'EMA(200)': 'ema', 'BOLL(20,2)': 'bollMiddle',
       'ROC(9)': 'roc', 'MAROC(9)': 'maroc', 'RSI(6)': 'rsi6', 'RSI(12)': 'rsi12', 'RSI(24)': 'rsi24',
       'ATR%(14)': 'atrPercent', 'BBW(20,2)': 'bbw', 'OI (Contracts)': 'oi',
     }
+    const volatilityPanel = svg.querySelector('[data-chart-volatility-panel]')
     return {
       foreground: getComputedStyle(document.body).color,
+      volatilityPanel: volatilityPanel ? { top: Number(volatilityPanel.getAttribute('data-chart-panel-top')), bottom: Number(volatilityPanel.getAttribute('data-chart-panel-bottom')) } : null,
+      volatilityCoordinates: svg.querySelectorAll('[data-chart-volatility-axis], [data-chart-axis-label], [data-chart-axis-tick]').length,
       panels: [...svg.querySelectorAll('[data-chart-panel-header]')].map(header => ({ key: header.dataset.chartPanelHeader, y: header.getBBox().y })),
-      volatilityAxes: [...svg.querySelectorAll('[data-chart-volatility-axis]')].map(group => {
-        const field = group.getAttribute('data-chart-volatility-axis')
-        const title = group.querySelector('[data-chart-axis-label]')
-        const curve = svg.querySelector(`[data-chart-indicator="${field}"]`)
-        const curveBounds = curve?.getBoundingClientRect(), svgBounds = svg.getBoundingClientRect()
-        const readText = text => {
-          const bounds = text.getBoundingClientRect(), point = svg.createSVGPoint()
-          point.x = Number(text.getAttribute('x')); point.y = Number(text.getAttribute('y'))
-          const local = point.matrixTransform(text.getScreenCTM()).matrixTransform(svg.getScreenCTM().inverse())
-          return { text: text.textContent, fill: getComputedStyle(text).fill, x: local.x, y: local.y,
-            left: bounds.left, right: bounds.right, svgLeft: svgBounds.left, svgRight: svgBounds.right }
-        }
-        return { field, side: group.getAttribute('data-chart-axis-side'), label: title?.getAttribute('data-chart-axis-label'), title: title ? readText(title) : null,
-          curveLeft: curveBounds?.left, curveRight: curveBounds?.right,
-          ticks: [...group.querySelectorAll('[data-chart-axis-tick]')].map(readText) }
-      }),
       legends: Object.entries(fields).map(([label, field]) => {
         const swatch = [...svg.querySelectorAll('[data-chart-legend]')].find(node => node.dataset.chartLegend === label)
         const group = swatch?.parentElement, texts = group?.querySelectorAll('text')
@@ -159,22 +146,20 @@ export async function assertIndicatorLegends(page, { requireVolatilityTicks = fa
   }
   assert.equal(reading.legends.find(legend => legend.field === 'atrPercent').curveDash, 'none')
   assert.notEqual(reading.legends.find(legend => legend.field === 'bbw').curveDash, 'none', 'BBW must remain distinguishable by its dash pattern.')
-  assert.deepEqual(reading.volatilityAxes.map(axis => axis.field).sort(), ['atrPercent', 'bbw'], 'ATR% and BBW must render two distinct value axes.')
-  for (const axis of reading.volatilityAxes) {
-    const label = axis.field === 'atrPercent' ? 'ATR%' : 'BBW'
-    assert.equal(axis.label, label)
-    assert.equal(axis.side, axis.field === 'atrPercent' ? 'left' : 'right')
-    assert.equal(axis.title?.text, label, 'Each axis must name the indicator it measures.')
-    if (requireVolatilityTicks) assert.ok(axis.ticks.length >= 2, `${label} must display its own numeric scale.`)
-    const curveColor = reading.legends.find(legend => legend.field === axis.field).curveStroke
-    for (const text of [axis.title, ...axis.ticks]) {
-      assert.ok(text, `${label} needs an axis title.`)
-      assert.equal(text.fill, curveColor, `${label} axis text must match its curve color.`)
-      assert.ok(text.left >= text.svgLeft - 1 && text.right <= text.svgRight + 1, `${label} axis text must fit inside the chart.`)
-      if (axis.field === 'atrPercent') assert.ok(text.right < axis.curveLeft, 'ATR% axis text must occupy the left gutter.')
-      else assert.ok(text.left > axis.curveRight, 'BBW axis text must occupy the right gutter.')
-    }
-    for (const tick of axis.ticks) assert.match(tick.text, /^\d+(?:\.\d+)?%$/, `${label} axis must show unsigned percentage tick values.`)
+  assert.equal(reading.volatilityCoordinates, 0, 'ATR% and BBW must hide their vertical coordinates and axis titles.')
+  if (requireFittedVolatility) {
+    const panel = reading.volatilityPanel
+    assert.ok(panel && panel.bottom > panel.top, 'The volatility panel must expose its painted boundaries.')
+    reading.volatilityFits = ['atrPercent', 'bbw'].map(field => {
+      const curve = reading.legends.find(legend => legend.field === field).curve
+      const points = curve.match(/[ML][^ML]+/g).map(command => command.slice(1).trim().split(/\s+/).map(Number))
+      assert.ok(points.every(point => point.length === 2 && point.every(Number.isFinite)), `${field} must contain finite coordinates.`)
+      const ys = points.map(([, y]) => y), top = Math.min(...ys), bottom = Math.max(...ys), height = panel.bottom - panel.top
+      const fit = { field, top, bottom, fillRatio: (bottom - top) / height, topInset: (top - panel.top) / height, bottomInset: (panel.bottom - bottom) / height }
+      assert.ok(fit.fillRatio >= .8, `${field} must use most of its independent panel height: ${JSON.stringify(fit)}`)
+      assert.ok(fit.topInset >= .01 && fit.bottomInset >= .01, `${field} visible extrema need padding inside the panel: ${JSON.stringify(fit)}`)
+      return fit
+    })
   }
   return reading
 }

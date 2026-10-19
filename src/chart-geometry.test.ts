@@ -59,21 +59,19 @@ test('ATR% and BBW use independent nonnegative percentage axes in one panel', ()
   const get = createChartGeometryCache(text => text.length * 6)
   const geometry = get(bars, viewport)
   const panel = geometry.layout.panels.atr
-  assert.equal(geometry.atrAxis.min, 0)
-  assert.ok(geometry.atrAxis.max >= 0.5 && geometry.atrAxis.max < 8)
-  assert.equal(geometry.bbwAxis.min, 0)
-  assert.ok(geometry.bbwAxis.max >= 8)
+  assert.equal(geometry.atrRange.min, 0)
+  assert.ok(geometry.atrRange.max >= 0.5 && geometry.atrRange.max < 8)
+  assert.equal(geometry.bbwRange.min, 0)
+  assert.ok(geometry.bbwRange.max >= 8)
   close(geometry.atrY(0), panel[1])
-  close(geometry.atrY(geometry.atrAxis.max), panel[0])
+  close(geometry.atrY(geometry.atrRange.max), panel[0])
   close(geometry.bbwY(0), panel[1])
-  close(geometry.bbwY(geometry.bbwAxis.max), panel[0])
+  close(geometry.bbwY(geometry.bbwRange.max), panel[0])
   for (const field of ['atrPercent', 'bbw'] as const) {
     const coordinates = [...geometry.lines[field].matchAll(/[ML]([\d.-]+) ([\d.-]+)/g)].map(([, x, y]) => [Number(x), Number(y)])
     assert.equal(coordinates.length, 97)
     assert.ok(coordinates.every(([, y]) => y >= panel[0] - 0.05 && y <= panel[1] + 0.05))
   }
-  assert.ok([...geometry.atrTicks, ...geometry.bbwTicks].every(tick => /^\d+(?:\.\d+)?%$/.test(tick.label)))
-  assert.ok(geometry.layout.left >= Math.max(...geometry.atrTicks.map(tick => tick.label.length * 6)) + 16)
   const missing = get(bars.map(bar => ({ ...bar, atrPercent: null, bbw: null })), viewport)
   assert.equal(missing.lines.atrPercent, '')
   assert.equal(missing.lines.bbw, '')
@@ -81,20 +79,54 @@ test('ATR% and BBW use independent nonnegative percentage axes in one panel', ()
   assert.ok(Number.isFinite(missing.bbwY(0)))
 
   const higherBBW = get(bars.map(bar => ({ ...bar, bbw: bar.bbw * 100 })), viewport)
-  assert.deepEqual(higherBBW.atrAxis, geometry.atrAxis, 'BBW cannot alter the ATR% domain.')
+  assert.deepEqual(higherBBW.atrRange, geometry.atrRange, 'BBW cannot alter the ATR% domain.')
   close(higherBBW.atrY(0.5), geometry.atrY(0.5))
-  assert.ok(higherBBW.bbwAxis.max >= 800)
+  assert.ok(higherBBW.bbwRange.max >= 800)
   const higherATR = get(bars.map(bar => ({ ...bar, atrPercent: bar.atrPercent * 100 })), viewport)
-  assert.deepEqual(higherATR.bbwAxis, geometry.bbwAxis, 'ATR% cannot alter the BBW domain.')
+  assert.deepEqual(higherATR.bbwRange, geometry.bbwRange, 'ATR% cannot alter the BBW domain.')
   close(higherATR.bbwY(8), geometry.bbwY(8))
-  assert.ok(higherATR.atrAxis.max >= 50)
+  assert.ok(higherATR.atrRange.max >= 50)
 
   const missingBBW = get(bars.map(bar => ({ ...bar, bbw: null })), viewport)
-  assert.deepEqual(missingBBW.atrAxis, geometry.atrAxis)
+  assert.deepEqual(missingBBW.atrRange, geometry.atrRange)
   assert.equal(missingBBW.lines.bbw, '')
   const missingATR = get(bars.map(bar => ({ ...bar, atrPercent: null })), viewport)
-  assert.deepEqual(missingATR.bbwAxis, geometry.bbwAxis)
+  assert.deepEqual(missingATR.bbwRange, geometry.bbwRange)
   assert.equal(missingATR.lines.atrPercent, '')
+})
+
+test('positive ATR% and BBW ranges use the panel height without a forced zero baseline', () => {
+  const bars = rows().map((bar, index) => ({ ...bar,
+    atrPercent: index === 40 ? null : 0.12 + index / 95 * 0.14,
+    bbw: index === 40 ? null : 2 + index / 95 * 6,
+  }))
+  for (const height of [400, 700, 1000]) {
+    const geometry = createChartGeometryCache(text => text.length * 6)(bars, { ...viewport, height })
+    const panel = geometry.layout.panels.atr, panelHeight = panel[1] - panel[0]
+    close(geometry.atrRange.min, 0.113)
+    close(geometry.atrRange.max, 0.267)
+    close(geometry.bbwRange.min, 1.7)
+    close(geometry.bbwRange.max, 8.3)
+    for (const [scale, min, max] of [[geometry.atrY, 0.12, 0.26], [geometry.bbwY, 2, 8]] as const) {
+      const top = scale(max), bottom = scale(min)
+      assert.ok(top > panel[0] && bottom < panel[1], 'The curves retain padding at both ends.')
+      assert.ok((bottom - top) / panelHeight > 0.9, 'The actual visible values must occupy most of the panel, even when the panel is short.')
+    }
+    assert.equal(geometry.layout.left, 0, 'Hidden volatility coordinates do not reserve a left gutter.')
+  }
+})
+
+test('constant positive and zero volatility remain finite without artificial variation', () => {
+  const get = createChartGeometryCache(text => text.length * 6)
+  for (const value of [0, 0.000001, 0.2, 20]) {
+    const geometry = get(rows().map(bar => ({ ...bar, atrPercent: value, bbw: value })), viewport)
+    const panel = geometry.layout.panels.atr
+    const expected = value === 0 ? panel[1] : (panel[0] + panel[1]) / 2
+    close(geometry.atrY(value), expected)
+    close(geometry.bbwY(value), expected)
+    assert.ok(geometry.atrRange.min >= 0 && geometry.atrRange.max > geometry.atrRange.min)
+    assert.doesNotMatch(geometry.lines.atrPercent + geometry.lines.bbw, /NaN|Infinity|undefined/)
+  }
 })
 
 test('Bollinger values crossing zero retain a linear domain and genuine warmup gaps', () => {

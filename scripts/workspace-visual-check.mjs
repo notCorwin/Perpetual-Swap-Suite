@@ -34,10 +34,13 @@ try {
       const endHour = Math.floor(Date.UTC(2026, 9, 18) / intervalMS) * intervalMS
       const bars = Array.from({ length: 96 }, (_, index) => {
         const close = 100 + index * .01
+        const averageTrueRange = .4 + .06 * Math.sin(index / 8) + .025 * Math.cos(index / 17)
+        const bandHalfWidth = .5 + .18 * Math.cos(index / 13) + .04 * Math.sin(index / 5)
         return { hour: endHour - (95 - index) * intervalMS, open: close + (index % 2 ? -.05 : .05), high: close + .2, low: close - .2, close,
           confirmed: true, statisticsSources: 3, statisticsObserved: true, indicatorsObserved: true,
-          ema: close, vwap: close - .02, bollUpper: close + .5, bollMiddle: close, bollLower: close - .5,
-          roc: .5, maroc: .25, rsi6: 50, rsi12: 55, rsi24: 60, atrPercent: .4 / close * 100, bbw: 1 / close * 100, oi: 1_000_000 + index, buy: 12_000, sell: 10_000 }
+          ema: close, vwap: close - .02, bollUpper: close + bandHalfWidth, bollMiddle: close, bollLower: close - bandHalfWidth,
+          roc: .5, maroc: .25, rsi6: 50, rsi12: 55, rsi24: 60,
+          atrPercent: averageTrueRange / close * 100, bbw: bandHalfWidth * 2 / close * 100, oi: 1_000_000 + index, buy: 12_000, sell: 10_000 }
       })
       return { instId, timeframe, intervalMS, endHour, latestEnd: endHour, oldestHour: bars[0].hour, historyExhausted: true,
         generation: 1, revision: 1, bars, oiState: 'ready', takerState: 'ready', indicatorState: 'ready', error: '' }
@@ -193,8 +196,9 @@ try {
       await screenshot(`workspace-${theme}-gray-${width}-dpr${dpr}`, width, 1000, dpr)
       await client.send('Emulation.setEmulatedVisionDeficiency', { type: 'none' })
       if (width === 1600 && dpr === 1) {
-        await assertIndicatorLegends(page)
+        const indicators = await assertIndicatorLegends(page, { requireFittedVolatility: true })
         const measured = await measure()
+        measured.semantics.volatilityFits = indicators.volatilityFits
         assert.deepEqual(measured.semantics.positive, theme === 'light' ? [142, 188, 57] : [202, 253, 92])
         assert.deepEqual(measured.semantics.negative, [232, 85, 168])
         assert.equal(measured.semantics.upFill, 'hollow')

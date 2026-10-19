@@ -286,7 +286,7 @@ test('prepared native chart pages preserve canonical indicator values across eve
   } finally { await removeRequestProbe(electron) }
 })
 
-test('ATR% and BBW share the panel between RSI and OI with independent axes, colored titles and exact candle inspection', async () => {
+test('ATR% and BBW share the panel between RSI and OI with independent fitted scales without axis coordinates, colored titles and exact candle inspection', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   const originalViewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }))
   await page.setViewportSize({ width: 1_600, height: 1_000 })
@@ -297,24 +297,26 @@ test('ATR% and BBW share the panel between RSI and OI with independent axes, col
       await selectTimeframe(page, timeframe)
       await waitForRendered(page, fixture, timeframe)
       await page.waitForFunction(() => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.bars.every(bar => Number.isFinite(bar.atrPercent) && Number.isFinite(bar.bbw)))
-      const reading = await assertIndicatorLegends(page, { requireVolatilityTicks: true })
+      const reading = await assertIndicatorLegends(page, { requireFittedVolatility: true })
       const visible = fixture.series[timeframe].bars.slice(-96)
       const curvePoints = field => reading.legends.find(legend => legend.field === field).curve.match(/[ML][^ML]+/g).map(command => command.slice(1).trim().split(/\s+/).map(Number))
-      const tickValues = []
-      for (const axis of reading.volatilityAxes) {
-        const ticks = axis.ticks.map(tick => ({ value: Number.parseFloat(tick.text), y: tick.y })).sort((left, right) => left.value - right.value)
-        const first = ticks[0], last = ticks.at(-1), points = curvePoints(axis.field)
-        assert.ok(last.value > first.value, `${axis.field} needs a nonzero numeric domain.`)
-        tickValues.push(ticks.map(tick => tick.value))
+      const visibleRanges = []
+      for (const field of ['atrPercent', 'bbw']) {
+        const values = visible.map(bar => bar[field]), minimum = Math.min(...values), maximum = Math.max(...values)
+        const points = curvePoints(field), ys = points.map(([, y]) => y), curveTop = Math.min(...ys), curveBottom = Math.max(...ys)
+        assert.ok(minimum > 0 && maximum > minimum, `${field} fixture must expose a varied positive range to catch a forced zero baseline.`)
+        const fittedMinimum = minimum - (reading.volatilityPanel.bottom - curveBottom) / (curveBottom - curveTop) * (maximum - minimum)
+        assert.ok(fittedMinimum > 0, `${field} must fit its positive visible range instead of anchoring the hidden scale to zero.`)
+        visibleRanges.push([minimum, maximum])
         assert.equal(points.length, visible.length + 1)
         for (const [index, bar] of visible.entries()) {
-          const expectedY = first.y + (bar[axis.field] - first.value) / (last.value - first.value) * (last.y - first.y)
-          assert.ok(Math.abs(points[index + 1][1] - expectedY) <= .051,
-            `${timeframe} ${axis.field} candle ${bar.hour} must be positioned by its own rendered tick values.`)
+          const expectedY = curveBottom - (bar[field] - minimum) / (maximum - minimum) * (curveBottom - curveTop)
+          assert.ok(Math.abs(points[index + 1][1] - expectedY) <= .101,
+            `${timeframe} ${field} candle ${bar.hour} must follow its own visible native value range.`)
         }
       }
-      assert.notDeepEqual(tickValues[0], tickValues[1], 'The fixture must expose different ATR% and BBW tick domains, so a shared value scale cannot pass.')
-      assert.deepEqual(curvePoints('atrPercent').map(([x]) => x), curvePoints('bbw').map(([x]) => x), 'Independent value axes must preserve candle time alignment.')
+      assert.notDeepEqual(visibleRanges[0], visibleRanges[1], 'The fixture must expose different ATR% and BBW domains, so a shared scale cannot pass both fitted-height checks.')
+      assert.deepEqual(curvePoints('atrPercent').map(([x]) => x), curvePoints('bbw').map(([x]) => x), 'Independent fitted scales must preserve candle time alignment.')
       const expected = fixture.series[timeframe].bars.at(-1)
       assert.equal(await legendValue('ATR%(14)'), `${expected.atrPercent.toFixed(2)}%`)
       assert.equal(await legendValue('BBW(20,2)'), `${expected.bbw.toFixed(2)}%`)
