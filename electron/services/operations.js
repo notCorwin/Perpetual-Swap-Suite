@@ -6,6 +6,9 @@ const sinks = new Set(), journalSinks = new Set(), active = new Set(), imports =
 let operationSequence = 0, journalSequence = 0
 let identity = { sessionId: 'unattached', executionId: `renderer-${globalThis.crypto?.randomUUID?.() ?? performance.timeOrigin}` }
 let cpuClock, synchronousContext = {}, propagation
+// Domain sets are module-owned, copy-on-write values. Public identity snapshots
+// and worker messages never expose this process-local execution state.
+const hookDomains = Symbol('operation-hook-domains')
 const categories = new Set(['cpu', 'gpu', 'network', 'database', 'io', 'ipc'])
 const statuses = new Set(['ok', 'error', 'cancelled'])
 const normalizedSpecifications = new WeakSet()
@@ -36,6 +39,7 @@ export function configureOperationContext(value, clock) {
   if (clock !== undefined) cpuClock = clock
 }
 export function configureOperationPropagation(value) { propagation = value }
+export function hasOperationPropagation() { return typeof propagation?.get === 'function' && typeof propagation?.run === 'function' }
 export function getOperationContext() {
   const context = current(), scenarioId = context.scenarioId ?? identity.scenarioId
   return { ...(context.traceId ? { traceId: context.traceId } : {}), ...(context.parentId ? { parentId: context.parentId } : {}), ...(scenarioId ? { scenarioId } : {}) }
@@ -52,19 +56,35 @@ export function runWithOperationContext(value, operation) {
   const context = { ...current() }
   return runContext(applyContextIDs(context, validatedContextID(value?.traceId), validatedContextID(value?.parentId), validatedContextID(value?.scenarioId)), operation)
 }
-export function captureOperationContext() {
+export function captureOperationContext({ restoreHookDomains = false } = {}) {
   const captured = current(), traceId = validatedContextID(captured.traceId), parentId = validatedContextID(captured.parentId),
-    scenarioId = validatedContextID(captured.scenarioId ?? identity.scenarioId)
-  // Only immutable validated IDs belong to registration. Suppression and other
-  // execution fields belong to each invocation, including mutable providers.
+    scenarioId = validatedContextID(captured.scenarioId ?? identity.scenarioId), domains = restoreHookDomains ? captured[hookDomains] : undefined
+  // Application callbacks restore registered domains as well as IDs. Internal
+  // observers restore only IDs. Global suppression always belongs to invocation.
   return operation => {
     const context = current()
-    if (context.traceId === traceId && context.parentId === parentId && context.scenarioId === scenarioId) return operation()
-    return runContext(applyContextIDs({ ...context }, traceId, parentId, scenarioId), operation)
+    if (context.traceId === traceId && context.parentId === parentId && context.scenarioId === scenarioId
+      && (!restoreHookDomains || context[hookDomains] === domains)) return operation()
+    const restored = applyContextIDs({ ...context }, traceId, parentId, scenarioId)
+    if (restoreHookDomains) {
+      if (domains === undefined) delete restored[hookDomains]
+      else restored[hookDomains] = domains
+    }
+    return runContext(restored, operation)
   }
 }
 export function withOperationSuppressed(operation) { return runContext({ ...current(), suppressed: true }, operation) }
 export function isOperationSuppressed() { return current().suppressed === true }
+// Node hooks install only after an async propagation provider is configured.
+export function withOperationHookSuppressed(domain, operation) {
+  const context = current(), domains = context[hookDomains]
+  if (domains?.has(domain)) return operation()
+  return runContext({ ...context, [hookDomains]: new Set([...(domains ?? []), domain]) }, operation)
+}
+export function isOperationHookSuppressed(domain) {
+  const context = current()
+  return context.suppressed === true || context[hookDomains]?.has(domain) === true
+}
 export function hasOperationRecording() { return sinks.size > 0 || journalSinks.size > 0 }
 export function readOperationCPUTime() { return cpuClock?.() }
 export function attachOperationSink(sink) { sinks.add(sink); return () => sinks.delete(sink) }
@@ -130,9 +150,11 @@ class LocalOperationSpan {
     return this.#publicContext ??= { traceId: base.traceId, parentId: base.id, ...(base.scenarioId ? { scenarioId: base.scenarioId } : {}) }
   }
   run(operation) {
-    // IDs belong to this span; suppression belongs to the execution that calls it.
+    // IDs belong to this span; global/domain suppression belongs to each run.
     const base = this.#base, context = this.#context ??= { traceId: base.traceId, parentId: base.id, scenarioId: base.scenarioId }
-    return runContext(current().suppressed === true ? { ...context, suppressed: true } : context, operation)
+    const invocation = current(), domains = invocation[hookDomains]
+    if (invocation.suppressed !== true && domains === undefined) return runContext(context, operation)
+    return runContext({ ...context, suppressed: invocation.suppressed === true, [hookDomains]: domains }, operation)
   }
   end(result = {}) {
     if (this.#ended) return

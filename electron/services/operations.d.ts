@@ -8,11 +8,14 @@ export type OperationJournalEvent = Omit<OperationEvent, 'phase' | 'status'> & {
 export type OperationSpan = { readonly context: OperationContext; run<T>(operation: () => T): T; end(result?: { status?: ObservedOperation['status']; attributes?: OperationAttributes; cpuTimeMS?: number }): void }
 export function configureOperationContext(value: { sessionId?: string; executionId?: string; scenarioId?: string }, clock?: () => number): void
 export function configureOperationPropagation(value: { get(): OperationContext | undefined; run<T>(context: OperationContext, operation: () => T): T }): void
+export function hasOperationPropagation(): boolean
 export function getOperationContext(): OperationContext
 export function runWithOperationContext<T>(context: OperationContext | undefined, operation: () => T): T
-export function captureOperationContext(): <T>(operation: () => T) => T
+export function captureOperationContext(options?: { restoreHookDomains?: boolean }): <T>(operation: () => T) => T
 export function withOperationSuppressed<T>(operation: () => T): T
 export function isOperationSuppressed(): boolean
+export function withOperationHookSuppressed<T>(domain: 'network' | 'io' | 'cpu' | 'database', operation: () => T): T
+export function isOperationHookSuppressed(domain: 'network' | 'io' | 'cpu' | 'database'): boolean
 export function hasOperationRecording(): boolean
 export function readOperationCPUTime(): number | undefined
 export function attachOperationSink(sink: (event: OperationEvent) => void): () => void

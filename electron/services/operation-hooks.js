@@ -6,18 +6,17 @@ import http from 'node:http'
 import https from 'node:https'
 import net from 'node:net'
 import tls from 'node:tls'
-import { AsyncLocalStorage } from 'node:async_hooks'
 import { errorMonitor } from 'node:events'
 import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { extname } from 'node:path'
-import { beginOperation, captureOperationContext, isOperationSuppressed, readOperationCPUTime } from './operations.js'
+import { beginOperation, captureOperationContext, hasOperationPropagation, isOperationSuppressed, readOperationCPUTime,
+  withOperationHookSuppressed, isOperationHookSuppressed } from './operations.js'
 import { constructRecordedWebSocket, networkByteLength, networkResource } from './network-operations.js'
 import { installRecordedSQLite } from './recorded-database.js'
 import { assertSandboxURL } from './sandbox-network.js'
 import { installNativeNetworkHooks, installElectronNetworkHooks, getNativeNetworkHookCapabilities } from './operation-network-hooks.js'
 
 const require = createRequire(import.meta.url)
-const hookScopes = new AsyncLocalStorage()
 const installed = new Set()
 const capabilities = new Map()
 function capability(api, enabled, scope, reason, owner, key, wrapped) {
@@ -50,10 +49,7 @@ const tcpSockets = new WeakMap()
 const hookMarker = Symbol('operation-hook')
 const knownExtensions = new Set(['.sqlite', '.db', '.parquet', '.json', '.jsonl', '.js', '.cjs', '.mjs', '.ts', '.html', '.css', '.png', '.pdf', '.txt', '.log'])
 
-export function withOperationHookSuppressed(domain, operation) {
-  return hookScopes.run(new Set([...(hookScopes.getStore() ?? []), domain]), operation)
-}
-export function isOperationHookSuppressed(domain) { return isOperationSuppressed() || hookScopes.getStore()?.has(domain) === true }
+export { withOperationHookSuppressed, isOperationHookSuppressed }
 
 const failed = error => ({ status: error?.name === 'AbortError' ? 'cancelled' : 'error', attributes: { errorName: error?.name ?? 'Error' } })
 const fileResource = value => {
@@ -71,8 +67,7 @@ const resultAttributes = (value, name = '') => ({
   ...(typeof value === 'number' && /\.(?:read|readv|write|writev)(?:Sync)?$/.test(name) ? { bytes: value } : {}),
 })
 const run = (span, operation) => typeof span.run === 'function' ? span.run(operation) : operation()
-const captureScope = () => ({ hooks: hookScopes.getStore(), run: captureOperationContext() })
-const resumeScope = (scope, operation) => scope.run(() => hookScopes.run(scope.hooks, operation))
+const captureScope = () => captureOperationContext({ restoreHookDomains: true })
 
 /** Preserve application callback context while native transport internals are suppressed. */
 function restoreEmitterContexts(target) {
@@ -84,7 +79,7 @@ function restoreEmitterContexts(target) {
     target[key] = function (type, listener) {
       if (typeof listener !== 'function') return Reflect.apply(original, this, arguments)
       const scope = captureScope()
-      const wrapped = function (...args) { return resumeScope(scope, () => Reflect.apply(listener, this, args)) }
+      const wrapped = function (...args) { return scope(() => Reflect.apply(listener, this, args)) }
       wrapped.listener = listener.listener ?? listener
       const handlers = mappings.get(type) ?? []
       handlers.push({ listener, wrapped }); mappings.set(type, handlers)
@@ -119,7 +114,7 @@ function restoreEventTargetContexts(target) {
       const scope = captureScope()
       wrapped = function (...args) {
         if (options?.once === true) registered.delete(key)
-        return resumeScope(scope, () => typeof listener === 'function'
+        return scope(() => typeof listener === 'function'
           ? Reflect.apply(listener, this, args) : Reflect.apply(listener.handleEvent, listener, args))
       }
       registered.set(key, wrapped)
@@ -142,7 +137,7 @@ function restoreEventTargetContexts(target) {
         let wrapped = listener
         if (typeof listener === 'function') {
           const scope = captureScope()
-          wrapped = function (...args) { return resumeScope(scope, () => Reflect.apply(listener, this, args)) }
+          wrapped = function (...args) { return scope(() => Reflect.apply(listener, this, args)) }
           propertyListeners.set(wrapped, listener)
         }
         return Reflect.apply(descriptor.set, this, [wrapped])
@@ -177,7 +172,7 @@ function hookFunction(owner, key, { domain, category, name, api: apiName, resour
         const error = values[0]
         if (!error) returned?.(values[1])
         span.end(error ? failed(error) : { attributes: resultAttributes(values[1], name) })
-        return resumeScope(callerScope, () => Reflect.apply(callback, this, values))
+        return callerScope(() => Reflect.apply(callback, this, values))
       }
     }
     try {
@@ -328,7 +323,7 @@ function installHTTP() {
         const callbackIndex = typeof args.at(-1) === 'function' ? args.length - 1 : -1
         if (callbackIndex >= 0) {
           const callback = args[callbackIndex]
-          args[callbackIndex] = function (response) { observeIncomingMessage(response, state); return resumeScope(caller, () => Reflect.apply(callback, this, [response])) }
+          args[callbackIndex] = function (response) { observeIncomingMessage(response, state); return caller(() => Reflect.apply(callback, this, [response])) }
         }
         try {
           assertSandboxURL(url)
@@ -344,7 +339,7 @@ function installHTTP() {
               if (!state.submissionDepth && bytes !== null) state.attributes.sentBytes += bytes
               if (typeof values.at(-1) === 'function') {
                 const callback = values.at(-1), scope = captureScope()
-                values[values.length - 1] = function (...result) { return resumeScope(scope, () => Reflect.apply(callback, this, result)) }
+                values[values.length - 1] = function (...result) { return scope(() => Reflect.apply(callback, this, result)) }
               }
               state.submissionDepth = (state.submissionDepth ?? 0) + 1
               try { return withOperationHookSuppressed('network', () => Reflect.apply(submit, this, values)) }
@@ -405,7 +400,7 @@ function installSockets() {
     const forwarded = [...normalized]
     if (typeof forwarded.at(-1) === 'function') {
       const callback = forwarded.at(-1), scope = captureScope()
-      forwarded[forwarded.length - 1] = function (...values) { return resumeScope(scope, () => Reflect.apply(callback, this, values)) }
+      forwarded[forwarded.length - 1] = function (...values) { return scope(() => Reflect.apply(callback, this, values)) }
     }
     const url = connectionURL(normalized, false)
     const span = beginOperation({ category: 'network', name: 'socket.connect', resource: networkResource(url), attributes: { source: 'native', transport: 'tcp' } })
@@ -424,7 +419,7 @@ function installSockets() {
       assertSandboxURL(url)
       if (typeof args.at(-1) === 'function') {
         const callback = args.at(-1), scope = captureScope()
-        args[args.length - 1] = function (...values) { return resumeScope(scope, () => Reflect.apply(callback, this, values)) }
+        args[args.length - 1] = function (...values) { return scope(() => Reflect.apply(callback, this, values)) }
       }
       const socket = run(span, () => withOperationHookSuppressed('network', () => Reflect.apply(secureConnect, this, args)))
       return trackConnection(socket, span, url, true)
@@ -599,6 +594,7 @@ function installWebSocket() {
 
 /** Install once per process/worker; existing named builtin imports are live-updated. */
 export function installOperationHooks() {
+  if (!hasOperationPropagation()) throw new Error('Operation hooks require async context propagation; initialize the operation runtime before installing hooks.')
   if (installed.size) return getInstalledOperationHooks()
   installFilesystem()
   installCrypto()
@@ -618,7 +614,7 @@ export function installOperationHooks() {
 }
 
 function nativeNetworkIntegration() {
-  return {captureScope,resumeScope,restoreEmitterContexts,restoreEventTargetContexts,decorateResponse,
+  return {captureScope,resumeScope:(scope,operation)=>scope(operation),restoreEmitterContexts,restoreEventTargetContexts,decorateResponse,
     suppressed:()=>isOperationHookSuppressed('network'),withNetwork:operation=>withOperationHookSuppressed('network',operation)}
 }
 /** Call after Electron ready, before net or Session transports are used. */

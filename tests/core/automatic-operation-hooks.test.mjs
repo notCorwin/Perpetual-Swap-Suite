@@ -7,7 +7,7 @@ const operationsURL = new URL('../../electron/services/operations.js', import.me
 const databaseURL = new URL('../../electron/services/recorded-database.js', import.meta.url).href
 const networkURL = new URL('../../electron/services/network-operations.js', import.meta.url).href
 
-async function execute(source) {
+async function execute(source, { beforeInstall = '' } = {}) {
   const prefix = `
     import assert from 'node:assert/strict';
     import { AsyncLocalStorage } from 'node:async_hooks';
@@ -20,6 +20,7 @@ async function execute(source) {
     const journal = [];
     const unsubscribe = attachOperationSink(event => events.push(event));
     attachOperationJournalSink(event => journal.push(event));
+    ${beforeInstall}
     const enabled = installOperationHooks();
     assert.deepEqual(installOperationHooks(), enabled, 'Installation is idempotent.');
   `
@@ -38,6 +39,25 @@ async function execute(source) {
     })
   })
 }
+
+test('automatic hooks require async context propagation before mutating native APIs', async () => {
+  const result = await execute(`
+    console.log(JSON.stringify({ installed: enabled.length }));
+  `, { beforeInstall: `
+    import fs from 'node:fs';
+    import { getOperationHookCapabilities } from ${JSON.stringify(hooksURL)};
+    const originals = { read: fs.readFileSync, fetch: globalThis.fetch, socket: globalThis.WebSocket };
+    const originalCapabilities = getOperationHookCapabilities();
+    configureOperationPropagation(undefined);
+    assert.throws(() => installOperationHooks(), /require async context propagation/);
+    assert.equal(fs.readFileSync, originals.read);
+    assert.equal(globalThis.fetch, originals.fetch);
+    assert.equal(globalThis.WebSocket, originals.socket);
+    assert.deepEqual(getOperationHookCapabilities(), originalCapabilities, 'A rejected installation leaves hooks and capabilities untouched.');
+    configureOperationPropagation({ get: () => context.getStore(), run: (value, operation) => context.run(value, operation) });
+  ` })
+  assert.ok(result.installed > 0)
+})
 
 test('automatic hooks observe builtin I/O, native computation and raw SQLite without application adapters', async () => {
   const result = await execute(`
@@ -224,10 +244,12 @@ test('raw TCP and native WebSocket hooks retain receivers and injected adapter d
     import { createHash } from 'node:crypto';
     import { recordedWebSocketFactory } from ${JSON.stringify(networkURL)};
     import { getOperationContext, runWithOperationContext } from ${JSON.stringify(operationsURL)};
+    import { isOperationSuppressed } from ${JSON.stringify(operationsURL)};
     import { isOperationHookSuppressed, withOperationHookSuppressed } from ${JSON.stringify(hooksURL)};
     const connectionContext = { traceId: 'socket-trace', parentId: 'socket-parent', scenarioId: 'socket-scenario' };
     const applicationContext = { traceId: 'callback-trace', parentId: 'callback-parent', scenarioId: 'callback-scenario' };
     const observerScopes = [];
+    const restorationTasks = [];
     const stopObserving = attachOperationSink(event => {
       if (event.name === 'websocket.receive') observerScopes.push({ context: getOperationContext(), network: isOperationHookSuppressed('network') });
     });
@@ -260,6 +282,34 @@ test('raw TCP and native WebSocket hooks retain receivers and injected adapter d
         let fixtures = 0; const fixture = () => fixtures++;
         for (let index = 0; index < 2; index++) { socket.addEventListener('fixture', fixture, { once: true }); socket.dispatchEvent(new Event('fixture')); }
         socket.addEventListener('fixture', fixture); socket.removeEventListener('fixture', fixture); socket.dispatchEvent(new Event('fixture')); assert.equal(fixtures, 2);
+        const restored = function (event) {
+          restorationTasks.push((async () => {
+            assert.equal(this, socket);
+            assert.deepEqual(getOperationContext(), applicationContext);
+            assert.equal(isOperationSuppressed(), event.expectedSuppressed);
+            assert.equal(isOperationHookSuppressed('io'), true);
+            assert.equal(isOperationHookSuppressed('network'), event.expectedSuppressed);
+            if (event.expectedStore) assert.equal(context.getStore(), event.expectedStore, 'Matching IDs and domains retain the invocation context.');
+            if (event.expectedLane) assert.equal(context.getStore().lane, event.expectedLane);
+            await Promise.resolve();
+            assert.deepEqual(getOperationContext(), applicationContext);
+            assert.equal(isOperationSuppressed(), event.expectedSuppressed);
+            assert.equal(isOperationHookSuppressed('network'), event.expectedSuppressed);
+            assert.equal(isOperationHookSuppressed('io'), true);
+          })());
+        };
+        runWithOperationContext(applicationContext, () => withOperationHookSuppressed('io', () => {
+          const expectedStore = context.getStore();
+          withOperationSuppressed(() => socket.addEventListener('scope-fixture', restored));
+          socket.dispatchEvent(Object.assign(new Event('scope-fixture'), { expectedSuppressed: false, expectedStore }));
+        }));
+        const dispatch = expectedSuppressed => socket.dispatchEvent(Object.assign(new Event('scope-fixture'), { expectedSuppressed, expectedLane: 'dispatch-lane' }));
+        context.run({ traceId: 'foreign-trace', parentId: 'foreign-parent', scenarioId: 'foreign-scenario', lane: 'dispatch-lane' }, () => {
+          withOperationHookSuppressed('network', () => dispatch(false));
+          withOperationSuppressed(() => withOperationHookSuppressed('network', () => dispatch(true)));
+        });
+        assert.equal(isOperationHookSuppressed('network'), false);
+        assert.equal(isOperationHookSuppressed('io'), false);
         socket.addEventListener('open', () => socket.send('sensitive-payload'));
         const message = function (event) {
           assert.equal(this, socket, 'Application property callbacks retain the native receiver.');
@@ -274,6 +324,8 @@ test('raw TCP and native WebSocket hooks retain receivers and injected adapter d
         socket.addEventListener('close', resolve, { once: true });
         socket.addEventListener('error', reject, { once: true });
       });
+      await Promise.all(restorationTasks);
+      assert.equal(restorationTasks.length, 3);
       assert.equal(events.filter(event => event.name === 'websocket.connect').length, 1);
       assert.equal(events.filter(event => event.name === 'websocket.send').length, 1);
       assert.equal(events.filter(event => event.name === 'websocket.receive').length, 1);
@@ -314,6 +366,50 @@ test('raw TCP and native WebSocket hooks retain receivers and injected adapter d
   `)
   assert.ok(result.names.includes('websocket.closed'))
   assert.ok(result.names.includes('socket.closed'))
+})
+
+test('span contexts inherit invocation hook domains and global suppression across asynchronous siblings', async () => {
+  const result = await execute(`
+    import { beginOperation, getOperationContext, isOperationSuppressed } from ${JSON.stringify(operationsURL)};
+    import { isOperationHookSuppressed, withOperationHookSuppressed } from ${JSON.stringify(hooksURL)};
+    const span = beginOperation({ category: 'cpu', name: 'test.domain-inheritance' });
+    const ids = { ...span.context }, seen = [];
+    const check = (domain, suppressed) => {
+      assert.deepEqual(getOperationContext(), ids);
+      assert.equal(isOperationSuppressed(), suppressed);
+      for (const candidate of ['io', 'network', 'cpu', 'database']) assert.equal(isOperationHookSuppressed(candidate), suppressed || candidate === domain);
+      assert.deepEqual(Object.keys(getOperationContext()).sort(), Object.keys(ids).sort());
+      assert.deepEqual(Object.getOwnPropertySymbols(getOperationContext()), [], 'Internal domains never cross the public identity boundary.');
+    };
+    await Promise.all(['io', 'network', undefined].map(domain => {
+      const invoke = () => span.run(async () => {
+        check(domain, false);
+        await Promise.resolve();
+        check(domain, false);
+        withOperationHookSuppressed('cpu', () => {
+          const previous = context.getStore();
+          withOperationHookSuppressed('cpu', () => assert.equal(context.getStore(), previous, 'An already suppressed domain reuses its context.'));
+          assert.equal(isOperationHookSuppressed('cpu'), true);
+          assert.equal(isOperationHookSuppressed('network'), domain === 'network');
+        });
+        check(domain, false);
+        seen.push(domain ?? 'none');
+      });
+      return domain ? withOperationHookSuppressed(domain, invoke) : invoke();
+    }));
+    await withOperationSuppressed(() => withOperationHookSuppressed('io', () => span.run(async () => {
+      check('io', true); await Promise.resolve(); check('io', true);
+    })));
+    await span.run(async () => { check(undefined, false); await Promise.resolve(); check(undefined, false); });
+    assert.equal(isOperationSuppressed(), false);
+    assert.equal(isOperationHookSuppressed('io'), false);
+    assert.equal(isOperationHookSuppressed('network'), false);
+    assert.deepEqual(span.context, ids);
+    span.end();
+    assert.equal(events.filter(event => event.name === 'test.domain-inheritance').length, 1);
+    unsubscribe(); console.log(JSON.stringify({ siblings: seen.sort() }));
+  `)
+  assert.deepEqual(result.siblings, ['io', 'network', 'none'])
 })
 
 test('injected WebSocket observers retain private connection IDs and live dispatch suppression', async () => {
