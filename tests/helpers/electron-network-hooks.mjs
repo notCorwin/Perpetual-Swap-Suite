@@ -3,9 +3,7 @@ import { app, net, session } from 'electron'
 import { createServer } from 'node:http'
 import { createConnection } from 'node:net'
 import { once } from 'node:events'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { stat } from 'node:fs/promises'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { installOperationHooks, installElectronOperationHooks, getOperationHookCapabilities, getInstalledOperationHooks } from '../../electron/services/operation-hooks.js'
 import { attachOperationSink, configureOperationContext, configureOperationPropagation, withOperationSuppressed } from '../../electron/services/operations.js'
@@ -14,7 +12,8 @@ import { createNativeExchange } from './native-exchange.mjs'
 import { ownFixtureServer } from './fixture-server.mjs'
 
 if (process.platform === 'darwin') app.setActivationPolicy('accessory')
-const userData = await mkdtemp(join(tmpdir(), 'perp-electron-net-proof-'))
+const userData = process.env.PERPETUAL_SWAP_NATIVE_NETWORK_USER_DATA
+assert.ok(userData, 'The parent must own the fixture profile through child shutdown.')
 app.setPath('userData', userData)
 process.env.PERPETUAL_SWAP_SANDBOX = '1'; process.env.PERPETUAL_SWAP_ALLOW_NETWORK = '0'
 const scopes = new AsyncLocalStorage(), events = []
@@ -135,13 +134,17 @@ try {
   await cleanup('cleanup-exchange', () => exchange?.close())
   const connectionsBeforeClose = ownedServer?.connections ?? 0
   await cleanup('cleanup-http', () => ownedServer?.close())
-  await cleanup('cleanup-user-data', () => rm(userData, { recursive: true, force: true }))
   phase('cleanup-recorder')
   await closeOperationRecording().catch(error => { console.error(error.stack); failed = true })
+  let profilePresentBeforeQuit = false
+  await cleanup('profile-retained-before-quit', async () => {
+    profilePresentBeforeQuit = (await stat(userData)).isDirectory()
+    assert.equal(profilePresentBeforeQuit, true)
+  })
   if (failed) app.exit(1)
   else {
     phase('complete')
-    console.log(JSON.stringify({...result,cleanupComplete:true,connectionsBeforeClose,phases}))
+    console.log(JSON.stringify({...result,cleanupComplete:true,profilePresentBeforeQuit,connectionsBeforeClose,phases}))
     app.quit()
   }
 }
