@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
-import { attachOperationSink, attachOperationJournalSink, beginOperation, measureOperation, getOperationContext,
+import { attachOperationSink, attachOperationJournalSink, beginOperation, measureOperation, hookOperationMethods, getOperationContext,
   runWithOperationContext, withOperationSuppressed, type OperationEvent, type OperationJournalEvent } from '../electron/services/operations.js'
 // @ts-expect-error Node-only JS intentionally stays outside the renderer API.
 import { databaseOperation, openRecordedDatabase } from '../electron/services/recorded-database.js'
@@ -128,6 +128,43 @@ test('terminal attribute ownership cannot mutate emitted starts or cause an ende
     assert.deepEqual(overrides, originalOverrides)
     assert.equal(journal[1].attributes?.rows, overrides ? undefined : 3)
   }
+})
+
+test('static method metadata owns its registration snapshot while each invocation owns mutable attributes and context', t => {
+  const observed: OperationJournalEvent[] = []
+  t.after(attachOperationJournalSink(event => {
+    if (event.name !== 'test.static-hook') return
+    observed.push(structuredClone(event))
+    Object.assign(event.attributes!, { rows: 999, secret: 'observer-only' })
+  }))
+  const original = { category: 'cpu' as const, name: 'test.static-hook', resource: 'original', attributes: { rows: 3, count: 4 } }
+  const target = { factor: 2, calculate(value: number) { return { value: this.factor * value, context: getOperationContext() } } }
+  hookOperationMethods(target, { calculate: original })
+  original.name = 'changed-after-registration'; original.resource = 'changed-after-registration'
+  Object.assign(original.attributes, { rows: 100, count: Number.NaN })
+  for (let index = 0; index < 2; index++) {
+    const result = runWithOperationContext({ traceId: `static-trace-${index}`, scenarioId: `static-scenario-${index}` }, () => target.calculate(index + 1))
+    assert.equal(result.value, (index + 1) * 2)
+    assert.equal(result.context.traceId, `static-trace-${index}`)
+  }
+  assert.equal(observed.length, 4)
+  for (const [index, event] of observed.entries()) {
+    assert.equal(event.resource, 'original')
+    assert.deepEqual(event.attributes, { rows: 3, count: 4 })
+    assert.equal(event.traceId, `static-trace-${Math.floor(index / 2)}`)
+    assert.equal(event.scenarioId, `static-scenario-${Math.floor(index / 2)}`)
+  }
+})
+
+test('dynamic method metadata is validated for every invocation even when its factory reuses one object', t => {
+  const events: OperationEvent[] = []
+  t.after(attachOperationSink(event => { if (event.name === 'test.dynamic-hook') events.push(event) }))
+  const specification = { category: 'cpu' as const, name: 'test.dynamic-hook', attributes: { rows: 1 } }
+  const target = { calculate(value: number) { return value } }
+  hookOperationMethods(target, { calculate: value => { specification.attributes.rows = value; return specification } })
+  assert.equal(target.calculate(7), 7)
+  assert.ok(Number.isNaN(target.calculate(Number.NaN)))
+  assert.deepEqual(events.map(event => event.attributes), [{ rows: 7 }, {}])
 })
 
 test('a bulk database operation separates API calls from execution batches without recording bound values', t => {

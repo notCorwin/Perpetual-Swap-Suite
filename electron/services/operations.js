@@ -6,6 +6,7 @@ let identity = { sessionId: 'unattached', executionId: `renderer-${globalThis.cr
 let cpuClock, synchronousContext = {}, propagation
 const categories = new Set(['cpu', 'gpu', 'network', 'database', 'io', 'ipc'])
 const statuses = new Set(['ok', 'error', 'cancelled'])
+const normalizedSpecifications = new WeakSet()
 const allowedAttributes = new Set(['count', 'rows', 'bytes', 'sentBytes', 'receivedBytes', 'statusCode', 'errorName', 'lane', 'priority', 'method', 'measurement', 'queryCount', 'changes', 'inputRows', 'outputRows', 'cache', 'threadId', 'blockingDurationMS', 'renderDurationMS', 'width', 'height', 'reason', 'incomplete', 'durationSource', 'role', 'candles', 'intervalMS', 'checkpoint', 'execution', 'projection', 'bidLevels', 'askLevels', 'bookResident', 'inspected', 'transport', 'stream', 'connection', 'path', 'httpStatus', 'declaredResponseBytes', 'timedOut', 'code', 'clean', 'cpuPercent', 'residentKB', 'processId', 'source', 'queueMS', 'transferMS', 'executionMS', 'calls', 'hook', 'expected', 'workerRole', 'sequence', 'batchSize', 'attempt', 'misses', 'hits', 'invalidations', 'generation', 'revision', 'parameterHash', 'inputHash', 'heapUsedBytes', 'heapTotalBytes', 'rssBytes', 'gcKind', 'gcFlags', 'eventLoopDelayMS', 'bufferedBytes', 'omitted', 'command', 'nativeTimestampUS', 'nativeDurationUS', 'nativeEventName', 'nativeCategory', 'nativeEventId', 'clockDomain', 'nativeStatus'])
 const safeText = (value, maximum = 160) => typeof value === 'string' && value.length > 0 && value.length <= maximum && !value.includes('\0')
 const safeID = value => safeText(value, 256) && /^[\w.:/-]+$/.test(value)
@@ -80,11 +81,12 @@ function localEvent(base, phase, durationMS, status, eventAttributes, cpuTimeMS)
   publish(event); return event
 }
 function start(specification, startedAt = performance.timeOrigin + performance.now()) {
-  const context = current(), id = `${identity.executionId}:${++operationSequence}`
+  const context = current(), id = `${identity.executionId}:${++operationSequence}`, normalized = normalizedSpecifications.has(specification)
   const base = { schemaVersion: 2, sessionId: identity.sessionId, executionId: identity.executionId,
     id, traceId: context.traceId || id, parentId: context.parentId || undefined, scenarioId: context.scenarioId || identity.scenarioId,
-    category: specification.category, name: String(specification.name).slice(0, 160),
-    resource: specification.resource ? String(specification.resource).slice(0, 256) : undefined, startedAt, attributes: attributes(specification.attributes) }
+    category: specification.category, name: normalized ? specification.name : String(specification.name).slice(0, 160),
+    resource: normalized ? specification.resource : specification.resource ? String(specification.resource).slice(0, 256) : undefined,
+    startedAt, attributes: normalized ? { ...specification.attributes } : attributes(specification.attributes) }
   // Mutable start observers cannot alter the private validated terminal baseline.
   localEvent(base, 'start', 0, 'running', { ...base.attributes }, undefined); return base
 }
@@ -153,8 +155,17 @@ export function hookOperationMethods(target, specifications) {
     const descriptor = Object.getOwnPropertyDescriptor(target, name)
     if (!descriptor || typeof descriptor.value !== 'function') throw new TypeError(`Missing operation method: ${name}`)
     const method = descriptor.value
+    let template
+    if (typeof specification !== 'function') {
+      // Static metadata is a registration snapshot. Each span still owns its
+      // mutable attribute baseline and the separate copy seen by start observers.
+      template = Object.freeze({ category: specification.category, name: String(specification.name).slice(0, 160),
+        resource: specification.resource ? String(specification.resource).slice(0, 256) : undefined,
+        attributes: Object.freeze(attributes(specification.attributes)) })
+      normalizedSpecifications.add(template)
+    }
     const wrapped = function (...args) {
-      const spec = typeof specification === 'function' ? Reflect.apply(specification, this, args) : specification
+      const spec = template ?? Reflect.apply(specification, this, args)
       return measureOperation(spec, () => Reflect.apply(method, this, args))
     }
     Object.defineProperty(wrapped, 'name', { value: method.name })

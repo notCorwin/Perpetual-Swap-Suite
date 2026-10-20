@@ -21,6 +21,7 @@ export function recordOperation(event: ObservedOperation): void
 export function beginOperation(specification: OperationSpec): OperationSpan
 export function finishActiveOperations(reason?: string): void
 export function measureOperation<T>(specification: OperationSpec, operation: () => T): T
+/** Static specs are snapshotted at registration; factories supply each invocation's metadata. */
 export function hookOperationMethods(target: object, specifications: Record<string, OperationSpec | ((...args: any[]) => OperationSpec)>): void
 export function registerOperationImportSource(executionId: string, sessionId: string): void
 export function importOperationEvents(events: OperationJournalEvent[]): { accepted: number; duplicates: number; rejected: number; lastSequence: number }
