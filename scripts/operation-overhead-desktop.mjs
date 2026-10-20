@@ -86,7 +86,8 @@ try {
   const mainCPU = process.cpuUsage(measuredCPU), mainCpuMS = (mainCPU.user + mainCPU.system) / 1000
   result.metrics.rendererEndToEnd = { startedAt: performance.timeOrigin + measuredStart, endedAt: performance.timeOrigin + performance.now(), wallMS: performance.now() - measuredStart, cpuMS: result.metrics.renderer.cpuMS + result.metrics.rendererDrain.cpuMS + mainCpuMS, mainCpuMS,
     peakRSSBytes: result.metrics.renderer.peakRSSBytes, peakHeapBytes: result.metrics.renderer.peakHeapBytes }
-  console.log(JSON.stringify({...result, receiver:{batches:result.acknowledgmentLatencies.length,latencies:result.acknowledgmentLatencies,durableLatencies:latency}}))
+  console.log(JSON.stringify({...result, runtime:{mode:'electron-main-and-renderer',node:process.version,v8:process.versions.v8,electron:process.versions.electron,executable:process.execPath},
+    receiver:{batches:result.acknowledgmentLatencies.length,latencies:result.acknowledgmentLatencies,durableLatencies:latency}}))
 } finally {
   window?.destroy(); await new Promise(resolve => server.close(resolve)); app.quit()
 }

@@ -101,6 +101,36 @@ test('lifecycle validation detects sequence gaps, duplicated ends, unmatched sta
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
+test('closed and durable journals reject start/end session or scenario identity changes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'operation-lifecycle-identity-'))
+  try {
+    for (const scenarioId of [undefined, 'scenario']) {
+      await recording(directory, [event({ scenarioId })], { health: { durableRecords: 2 } })
+      assert.equal(operationReportHasFailures(await summarizeOperations(directory)), false, 'Matching optional scenario identity is valid.')
+    }
+    const cases = [
+      { name: 'session changed', start: { scenarioId: 'scenario' }, end: { sessionId: 'other-session' } },
+      { name: 'scenario changed', start: { scenarioId: 'scenario' }, end: { scenarioId: 'other-scenario' } },
+      { name: 'scenario removed', start: { scenarioId: 'scenario' }, end: { scenarioId: undefined } },
+      { name: 'scenario added', start: {}, end: { scenarioId: 'scenario' } },
+    ]
+    for (const value of cases) {
+      const records = lifecycle([event(value.start)])
+      records[1] = { ...records[1], ...value.end }
+      await recording(directory, records, { raw: true, health: { durableRecords: 2 } })
+      const report = await summarizeOperations(directory)
+      assert.equal(report.diagnostics.malformed, 0, value.name)
+      assert.equal(report.diagnostics.recorderCountMismatches, 0, value.name)
+      assert.equal(report.diagnostics.undurableRecords, 0, value.name)
+      assert.equal(report.diagnostics.unclosedOperations, 0, value.name)
+      assert.equal(report.diagnostics.mismatchedLifecycles, 1, value.name)
+      assert.equal(operationReportHasFailures(report), true, value.name)
+      assert.equal(report.totals.count, 1, 'Identity corruption must not erase the observed cost.')
+      assert.equal(report.totals.totalMS, 4)
+    }
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
 test('coverage contracts reject empty recordings and missing roles/categories and expose missing registered children', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'operation-coverage-'))
   try {

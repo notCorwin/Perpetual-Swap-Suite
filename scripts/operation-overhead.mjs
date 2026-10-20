@@ -98,8 +98,12 @@ export function assessBudgets(summary, budgets=defaultBudgets) {
   return failures
 }
 async function journal(directory, phases){
-  const result={records:0,operations:0,logicalBytes:0,journalBytes:0,byName:{},phases:Object.fromEntries(Object.keys(phases).map(name=>[name,{records:0,operations:0,logicalBytes:0,byName:{}}]))}
+  const result={records:0,operations:0,logicalBytes:0,journalBytes:0,byName:{},executions:[],phases:Object.fromEntries(Object.keys(phases).map(name=>[name,{records:0,operations:0,logicalBytes:0,byName:{}}]))}
   let files=[];try{files=await readdir(directory)}catch(error){if(error.code!=='ENOENT')throw error}
+  for (const file of files.filter(file => file.endsWith('.health.json'))) {
+    const health = JSON.parse(await readFile(join(directory, file), 'utf8'))
+    result.executions.push({ executionId: health.executionId, role: health.role, runtime: health.runtime })
+  }
   for(const file of files.filter(isOperationJournal)){
     result.journalBytes += (await stat(join(directory, file))).size
     const lines=createInterface({input:readOperationJournal(join(directory,file)),crlfDelay:Infinity})
@@ -112,14 +116,29 @@ async function journal(directory, phases){
   }
   return result
 }
+export function overheadLaunch({ directory = root, desktop = false, environment = process.env } = {}) {
+  const executable = join(directory, 'node_modules/electron/dist', readFileSync(join(directory, 'node_modules/electron/path.txt'), 'utf8').trim())
+  const env = { ...environment }
+  if (desktop) delete env.ELECTRON_RUN_AS_NODE
+  else env.ELECTRON_RUN_AS_NODE = '1'
+  return { executable, environment: env }
+}
+export function assertMeasuredRuntime(actual, expected) {
+  for (const field of ['node', 'v8', 'electron', 'executable', 'mode']) {
+    assert.ok(typeof actual?.[field] === 'string' && actual[field], `Missing measured runtime identity: ${field}`)
+    assert.equal(actual[field], expected?.[field], `Paired workloads must use the same actual ${field} runtime.`)
+  }
+}
 async function child(script, parameters, enabled, desktop){
   const environment={...process.env,PERPETUAL_SWAP_OVERHEAD_ROOT:root,PERPETUAL_SWAP_OVERHEAD_ENABLED:enabled?'1':'0',
     PERPETUAL_SWAP_OPERATION_DIR:enabled?join(parameters.directory,'operations'):'',PERPETUAL_SWAP_OPERATION_SESSION:`overhead-${parameters.trial}`,
     PERPETUAL_SWAP_SANDBOX:'1',PERPETUAL_SWAP_ALLOW_NETWORK:'0',NODE_OPTIONS:''}
-  delete environment.PERPETUAL_SWAP_OPERATION_PARTICIPANT;delete environment.PERPETUAL_SWAP_OPERATION_ROLE;delete environment.ELECTRON_RUN_AS_NODE
-  const executable=desktop?join(root,'node_modules/electron/dist',readFileSync(join(root,'node_modules/electron/path.txt'),'utf8').trim()):process.execPath
+  delete environment.PERPETUAL_SWAP_OPERATION_PARTICIPANT;delete environment.PERPETUAL_SWAP_OPERATION_ROLE
+  // Backend workers run inside Electron's embedded Node/V8 in the real app.
+  // Matching only process.version can otherwise measure a different V8 build.
+  const launch = overheadLaunch({ desktop, environment })
   return new Promise((done,reject)=>{
-    const process=spawn(executable,[script,JSON.stringify(parameters)],{cwd:root,env:environment,stdio:['ignore','pipe','pipe']})
+    const process=spawn(launch.executable,[script,JSON.stringify(parameters)],{cwd:root,env:launch.environment,stdio:['ignore','pipe','pipe']})
     let stdout='',stderr='';const timer=setTimeout(()=>process.kill('SIGTERM'),120000)
     process.stdout.on('data',value=>stdout+=value);process.stderr.on('data',value=>stderr=(stderr+value).slice(-12000))
     process.once('error',reject);process.once('close',code=>{clearTimeout(timer);if(code!==0){reject(new Error(`Overhead child failed (${code}): ${stderr}\n${stdout.slice(-2000)}`));return}
@@ -194,7 +213,7 @@ export async function runOverhead({output, repeats=5, cycles=20, contracts=130, 
     catch (error) { if (error.code === 'ENOENT') return [file, null]; throw error }
   })))
   const hashes = await sourceHashes()
-  const harnessFiles = ['operation-overhead.mjs', 'operation-overhead-workload.mjs', 'operation-overhead-desktop.mjs', 'operation-overhead-preload.mjs']
+  const harnessFiles = ['operation-overhead.mjs', 'operation-overhead-workload.mjs', 'operation-overhead-memory.mjs', 'operation-overhead-desktop.mjs', 'operation-overhead-preload.mjs']
   const harnessHashes = async () => Object.fromEntries(await Promise.all(harnessFiles.map(async file => [file, createHash('sha256').update(await readFile(join(here, file))).digest('hex')])))
   const harness = await harnessHashes()
   const git=spawnSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'})
@@ -204,12 +223,18 @@ export async function runOverhead({output, repeats=5, cycles=20, contracts=130, 
       await mkdir(parameters.directory,{recursive:true})
       process.stderr.write(`Operation overhead: ${label}\n`)
       const result=await child(join(here,desktop?'operation-overhead-desktop.mjs':'operation-overhead-workload.mjs'),parameters,enabled,desktop)
+      assert.ok(result.runtime?.electron && result.runtime.v8 && result.runtime.executable, 'The measured child must identify its real Electron/Node/V8 runtime.')
+      assert.equal(result.runtime.mode, desktop ? 'electron-main-and-renderer' : 'electron-as-node', 'The measured workload must use its production execution mode.')
       const recording=await journal(join(parameters.directory,'operations'),result.metrics)
+      if (enabled) {
+        for (const execution of recording.executions) for (const field of ['node', 'v8', 'electron']) assert.equal(execution.runtime?.[field], result.runtime[field], `The ${execution.role} execution must use the measured production ${field} runtime.`)
+        if (!desktop) for (const role of ['market-reader', 'market-writer', 'prepared-chart']) assert.ok(recording.executions.some(execution => execution.role === role), `Missing actual backend worker runtime evidence: ${role}`)
+      }
       if(enabled){const {summarizeOperations,operationReportHasFailures}=await import(pathToFileURL(join(root,'scripts/operation-report.mjs')).href);const report=await summarizeOperations(join(parameters.directory,'operations'));assert.equal(operationReportHasFailures(report),false,`Overhead measurement lost journal coverage: ${JSON.stringify(report.diagnostics)}`)}
       const run={trial,desktop,enabled,...result,journal:recording};runs.push(run)
       await writeFile(join(parameters.directory,'result.json'),JSON.stringify(run,null,2)+'\n')
       const paired=runs.find(value=>value.trial===trial&&value.desktop===desktop&&value.enabled!==enabled)
-      if(paired)assert.deepEqual(run.business,paired.business,'Recording must preserve the exact deterministic business result.')
+      if(paired){assertMeasuredRuntime(run.runtime,paired.runtime);assert.deepEqual(run.business,paired.business,'Recording must preserve the exact deterministic business result.')}
     }
   }
   assert.deepEqual(await sourceHashes(), hashes, 'Benchmark source files changed while the paired measurements were running.')
@@ -224,12 +249,16 @@ export async function runOverhead({output, repeats=5, cycles=20, contracts=130, 
       storedToLogicalRatio: median(values.map(run => run.journal.journalBytes / run.journal.logicalBytes)),
     }]
   }))
-  const summary={schemaVersion:2,revision:git.stdout.trim(),sourceHashes:hashes,harnessHashes:harness,storage,runtime:{node:process.version,platform:process.platform,arch:process.arch},host:{cpu:cpus()[0]?.model,cpuCount:cpus().length,before:hostBefore,after:{loadAverage:loadavg(),freeMemoryBytes:freemem()}},parameters:{repeats,cycles,contracts,warmup,renderer,profile,inputCadenceMS:100,businessClock:'fixed midperiod epoch plus monotonic elapsed time',journalAttribution:'Phase bytes are decoded logical JSONL; stored disk bytes are measured for each complete execution including warmup.'},...summarizePairs(runs),budgets,runs}
+  const runtime = { driver: { node: process.version, v8: process.versions.v8, executable: process.execPath, platform: process.platform, arch: process.arch },
+    backend: runs.find(run => !run.desktop).runtime, ...(renderer ? { renderer: runs.find(run => run.desktop).runtime } : {}) }
+  for (const run of runs) assertMeasuredRuntime(run.runtime, run.desktop ? runtime.renderer : runtime.backend)
+  const summary={schemaVersion:2,revision:git.stdout.trim(),sourceHashes:hashes,harnessHashes:harness,storage,runtime,host:{cpu:cpus()[0]?.model,cpuCount:cpus().length,before:hostBefore,after:{loadAverage:loadavg(),freeMemoryBytes:freemem()}},parameters:{repeats,cycles,contracts,warmup,renderer,profile,inputCadenceMS:100,businessClock:'fixed midperiod epoch plus monotonic elapsed time',journalAttribution:'Phase bytes are decoded logical JSONL; stored disk bytes are measured for each complete execution including warmup.'},...summarizePairs(runs),budgets,runs}
   summary.failures=assessBudgets(summary,budgets)
   await writeFile(join(directory,'report.json'),JSON.stringify(summary,null,2)+'\n')
   const rows=Object.entries(summary.phases).map(([phase,value])=>`| ${phase} | ${value.baseline.wallMS.toFixed(2)} | ${value.enabled.wallMS.toFixed(2)} | ${value.baseline.cpuMS.toFixed(2)} | ${value.enabled.cpuMS.toFixed(2)} | ${value.enabled.eventLoopP99MS?.toFixed(2)??'—'} | ${value.enabled.journalOperations} | ${(value.enabled.logicalBytes/1048576).toFixed(2)} |`)
   const stored = Object.entries(storage).map(([name, value]) => `${name}: ${(value.journalBytes / 1048576).toFixed(2)} MiB on disk / ${(value.logicalBytes / 1048576).toFixed(2)} MiB decoded; ${value.bytesPerOperation.toFixed(1)} stored bytes per operation.`).join('\n\n')
-  await writeFile(join(directory,'report.md'),`# Operation recording overhead\n\nRevision: ${summary.revision}. ${repeats} alternating baseline/enabled pairs after ${warmup} warmup rounds. Exact business results match in every pair. Baseline and recorded columns show each group's median; relative CPU, wall and memory gates compare those group medians. Added CPU and wall costs are medians of matched-pair differences. Per-message and per-operation added CPU divide each pair's difference by its own measured count before taking the median. Phase CPU is whole-process usage inside its window, including worker threads, V8/libuv and possibly earlier journal drain; normalization does not claim exclusive operation CPU. Complete raw trials, source hashes and configured budgets are in report.json.\n\n| Workload | Baseline wall ms | Recorded wall ms | Baseline CPU ms | Recorded CPU ms | Recorded event-loop p99 ms | Operations | Logical MiB |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n${rows.join('\n')}\n\n${stored}\n\nStored bytes include startup and warmup. Per-phase bytes describe decoded JSONL and are not attributed physical disk bytes. Business time starts in the same simulated native period for every child and advances monotonically; performance and operation clocks remain real.\n\n${summary.rendererAcknowledgment?`Renderer durable ACKs: median ${summary.rendererAcknowledgment.medianMS.toFixed(2)} ms; p95 ${summary.rendererAcknowledgment.p95MS.toFixed(2)} ms; maximum ${summary.rendererAcknowledgment.maxMS.toFixed(2)} ms.\n\n`:''}Budget failures: ${summary.failures.length}.\n`)
+  const runtimeDescription = `Driver: Node ${runtime.driver.node}, V8 ${runtime.driver.v8}. The driver runtime is not the measured backend. Backend: Electron ${runtime.backend.electron}, Node ${runtime.backend.node}, V8 ${runtime.backend.v8}, ${runtime.backend.mode}; executable: ${runtime.backend.executable}. Each recorded backend worker's own health verifies the same Node/V8/Electron build.\n\n` + (runtime.renderer ? `Renderer: Electron ${runtime.renderer.electron}, Node ${runtime.renderer.node}, V8 ${runtime.renderer.v8}; executable: ${runtime.renderer.executable}.\n\n` : '')
+  await writeFile(join(directory,'report.md'),`# Operation recording overhead\n\n${runtimeDescription}Revision: ${summary.revision}. ${repeats} alternating baseline/enabled pairs after ${warmup} warmup rounds. Exact business results match in every pair. Baseline and recorded columns show each group's median; relative CPU, wall and memory gates compare those group medians. Added CPU and wall costs are medians of matched-pair differences. Per-message and per-operation added CPU divide each pair's difference by its own measured count before taking the median. Phase CPU is whole-process usage inside its window, including worker threads, V8/libuv and possibly earlier journal drain; normalization does not claim exclusive operation CPU. Complete raw trials, source hashes and configured budgets are in report.json.\n\n| Workload | Baseline wall ms | Recorded wall ms | Baseline CPU ms | Recorded CPU ms | Recorded event-loop p99 ms | Operations | Logical MiB |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n${rows.join('\n')}\n\n${stored}\n\nStored bytes include startup and warmup. Per-phase bytes describe decoded JSONL and are not attributed physical disk bytes. Business time starts in the same simulated native period for every child and advances monotonically; performance and operation clocks remain real.\n\n${summary.rendererAcknowledgment?`Renderer durable ACKs: median ${summary.rendererAcknowledgment.medianMS.toFixed(2)} ms; p95 ${summary.rendererAcknowledgment.p95MS.toFixed(2)} ms; maximum ${summary.rendererAcknowledgment.maxMS.toFixed(2)} ms.\n\n`:''}Budget failures: ${summary.failures.length}.\n`)
   return {directory,...summary}
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){

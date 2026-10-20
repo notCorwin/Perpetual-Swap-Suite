@@ -8,6 +8,7 @@ import { pathToFileURL } from 'node:url'
 import { monitorEventLoopDelay, performance } from 'node:perf_hooks'
 import { Session } from 'node:inspector'
 import { setTimeout as delay, setImmediate as turn } from 'node:timers/promises'
+import { createMemorySampler } from './operation-overhead-memory.mjs'
 const root = resolve(process.env.PERPETUAL_SWAP_OVERHEAD_ROOT ?? new URL('../', import.meta.url).pathname)
 const moduleAt = path => import(pathToFileURL(join(root, path)).href)
 const { closeOperationRecording, flushOperationRecording } = await moduleAt('electron/services/operation-runtime.js')
@@ -23,22 +24,23 @@ const businessStart = performance.now()
 Date.now = () => config.epoch + 60_000 + Math.floor(performance.now() - businessStart)
 await mkdir(directory, { recursive: true })
 const metrics = {}
+const memorySampler = createMemorySampler()
 async function measure(name, operation) {
   const histogram = monitorEventLoopDelay({ resolution: 1 }); histogram.enable()
-  let peakRSS = process.memoryUsage().rss, peakHeap = process.memoryUsage().heapUsed
-  const sample = setInterval(() => { const memory = process.memoryUsage(); peakRSS = Math.max(peakRSS, memory.rss); peakHeap = Math.max(peakHeap, memory.heapUsed) }, 5)
   await turn()
-  const cpu = process.cpuUsage(), thread = process.threadCpuUsage(), memory = process.memoryUsage(), utilization = performance.eventLoopUtilization(), started = performance.now()
-  const value = await operation()
-  await turn()
-  const wallMS = performance.now() - started, used = process.cpuUsage(cpu), threadUsed = process.threadCpuUsage(thread)
-  const active = performance.eventLoopUtilization(utilization), after = process.memoryUsage()
-  clearInterval(sample); histogram.disable()
-  metrics[name] = { startedAt: performance.timeOrigin + started, endedAt: performance.timeOrigin + started + wallMS, wallMS, cpuMS: (used.user + used.system) / 1000, mainThreadCpuMS: (threadUsed.user + threadUsed.system) / 1000,
-    eventLoopP99MS: Number.isFinite(histogram.mean) ? histogram.percentile(99) / 1e6 : 0, eventLoopMaxMS: histogram.max / 1e6,
-    eventLoopActiveMS: active.active, eventLoopUtilization: active.utilization, rssDeltaBytes: after.rss - memory.rss,
-    peakRSSBytes: Math.max(peakRSS, after.rss), peakHeapBytes: Math.max(peakHeap, after.heapUsed) }
-  return value
+  const cpu = process.cpuUsage(), thread = process.threadCpuUsage(), memoryWindow = memorySampler.begin(), memory = memoryWindow.initial, utilization = performance.eventLoopUtilization(), started = performance.now()
+  try {
+    const value = await operation()
+    await turn()
+    const wallMS = performance.now() - started, used = process.cpuUsage(cpu), threadUsed = process.threadCpuUsage(thread)
+    const active = performance.eventLoopUtilization(utilization), after = memoryWindow.end()
+    histogram.disable()
+    metrics[name] = { startedAt: performance.timeOrigin + started, endedAt: performance.timeOrigin + started + wallMS, wallMS, cpuMS: (used.user + used.system) / 1000, mainThreadCpuMS: (threadUsed.user + threadUsed.system) / 1000,
+      eventLoopP99MS: Number.isFinite(histogram.mean) ? histogram.percentile(99) / 1e6 : 0, eventLoopMaxMS: histogram.max / 1e6,
+      eventLoopActiveMS: active.active, eventLoopUtilization: active.utilization, rssDeltaBytes: after.final.rss - memory.rss,
+      peakRSSBytes: after.peakRSSBytes, peakHeapBytes: after.peakHeapBytes }
+    return value
+  } finally { memoryWindow.end(); histogram.disable() }
 }
 const frame = (text, opcode = 1) => {
   const body = Buffer.isBuffer(text) ? text : Buffer.from(text), header = Buffer.alloc(body.length < 126 ? 2 : 4)
@@ -164,7 +166,9 @@ try {
   })
   let journalBytes = 0
   if (process.env.PERPETUAL_SWAP_OPERATION_DIR) for (const file of await readdir(process.env.PERPETUAL_SWAP_OPERATION_DIR)) if (/\.jsonl(?:\.gz)?$/.test(file)) journalBytes += (await stat(join(process.env.PERPETUAL_SWAP_OPERATION_DIR, file))).size
-  console.log(JSON.stringify({ business, metrics, journalBytes, parameters: { contracts: config.contracts, cycles: config.cycles, warmup: config.warmup, bookLevels: 400, nativeTransport: 'WebSocket', database: 'SQLite WAL workers',businessClock: 'fixed midperiod epoch plus monotonic elapsed time',warmupDrainMS:300 } }))
+  const runtime = { mode: process.versions.electron && process.env.ELECTRON_RUN_AS_NODE === '1' ? 'electron-as-node' : 'node',
+    node: process.version, v8: process.versions.v8, electron: process.versions.electron ?? null, executable: process.execPath }
+  console.log(JSON.stringify({ business, metrics, journalBytes, runtime, parameters: { contracts: config.contracts, cycles: config.cycles, warmup: config.warmup, bookLevels: 400, nativeTransport: 'WebSocket', database: 'SQLite WAL workers',businessClock: 'fixed midperiod epoch plus monotonic elapsed time',warmupDrainMS:300,memorySampling:memorySampler.snapshot() } }))
 } catch (error) {
   await Promise.allSettled([service.dispose(), store.close(), transport.close()]); await closeOperationRecording().catch(() => {}); throw error
 }

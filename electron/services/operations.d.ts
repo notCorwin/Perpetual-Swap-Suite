@@ -5,7 +5,7 @@ export type OperationSpec = { category: OperationCategory; name: string; resourc
 export type ObservedOperation = OperationSpec & { startedAt: number; durationMS: number; status: 'ok' | 'error' | 'cancelled'; cpuTimeMS?: number }
 export type OperationEvent = ObservedOperation & { schemaVersion: 2; phase: 'end'; sessionId: string; executionId: string; id: string; sequence: number; traceId: string; parentId?: string; scenarioId?: string }
 export type OperationJournalEvent = Omit<OperationEvent, 'phase' | 'status'> & { phase: 'start' | 'end'; status: 'running' | ObservedOperation['status'] }
-export type OperationSpan = { context: OperationContext; run<T>(operation: () => T): T; end(result?: { status?: ObservedOperation['status']; attributes?: OperationAttributes; cpuTimeMS?: number }): void }
+export type OperationSpan = { readonly context: OperationContext; run<T>(operation: () => T): T; end(result?: { status?: ObservedOperation['status']; attributes?: OperationAttributes; cpuTimeMS?: number }): void }
 export function configureOperationContext(value: { sessionId?: string; executionId?: string; scenarioId?: string }, clock?: () => number): void
 export function configureOperationPropagation(value: { get(): OperationContext | undefined; run<T>(context: OperationContext, operation: () => T): T }): void
 export function getOperationContext(): OperationContext

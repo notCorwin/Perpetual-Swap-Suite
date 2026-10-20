@@ -73,7 +73,7 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
   const take = () => {
     clearTimeout(timer); timer = undefined
     if (!queue.length) return { count: 0, buffer: Buffer.alloc(0), offset: position }
-    const raw = Buffer.from(queue.join('')), buffer = encodeOperationJournal(raw)
+    const raw = Buffer.from(`${queue.join('\n')}\n`), buffer = encodeOperationJournal(raw)
     const batch = { count: queue.length, buffer, offset: position }
     counts.uncompressedBytes += raw.length; counts.journalBytes += buffer.length
     queue = []; bytes = 0; position += batch.buffer.length; return batch
@@ -132,9 +132,10 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
       counts.sourceFailures++; counts.omittedRecords++; writeHealth()
       throw new Error('A closing or closed operation journal cannot accept records.')
     }
-    const line = `${JSON.stringify(entry)}\n`
+    // Freeze mutable events synchronously; add separators once when draining.
+    const line = JSON.stringify(entry)
     counts.recorded++; counts.recordedOperations += Number(entry.phase === 'end'); counts.startedOperations += Number(entry.phase === 'start')
-    queue.push(line); bytes += Buffer.byteLength(line)
+    queue.push(line); bytes += Buffer.byteLength(line) + 1
     if (bytes >= 256 * 1024) pressureWrite()
     else if (!timer && !writing) { timer = setTimeout(startWrite, 250); timer.unref() }
   }

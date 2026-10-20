@@ -1,6 +1,27 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { median, assessBudgets, summarizePairs } from '../../scripts/operation-overhead.mjs'
+import { spawn } from 'node:child_process'
+import { median, assessBudgets, summarizePairs, overheadLaunch, assertMeasuredRuntime } from '../../scripts/operation-overhead.mjs'
+
+test('backend measurements and their worker use the real Electron embedded Node/V8 without creating an app window', { timeout: 10_000 }, async () => {
+  const launch = overheadLaunch({ environment: { ...process.env, NODE_OPTIONS: '' } })
+  assert.equal(launch.environment.ELECTRON_RUN_AS_NODE, '1')
+  const source = `const { Worker } = require('node:worker_threads');
+    const runtime = {node:process.version,v8:process.versions.v8,electron:process.versions.electron,executable:process.execPath};
+    const worker = new Worker("const {parentPort}=require('node:worker_threads');parentPort.postMessage({node:process.version,v8:process.versions.v8,electron:process.versions.electron,executable:process.execPath})",{eval:true});
+    worker.once('message',child=>console.log(JSON.stringify({runtime,child})));`
+  const result = await new Promise((resolve, reject) => {
+    const child = spawn(launch.executable, ['-e', source], { env: launch.environment, stdio: ['ignore', 'pipe', 'pipe'] })
+    let output = '', diagnostics = ''
+    child.stdout.on('data', chunk => { output += chunk })
+    child.stderr.on('data', chunk => { diagnostics += chunk })
+    child.once('error', reject)
+    child.once('close', code => code === 0 ? resolve(JSON.parse(output.trim())) : reject(new Error(diagnostics)))
+  })
+  assert.ok(result.runtime.electron, 'The workload cannot silently fall back to the driver Node executable.')
+  assert.deepEqual(result.child, result.runtime)
+  assert.equal(overheadLaunch({ desktop: true, environment: { ELECTRON_RUN_AS_NODE: '1' } }).environment.ELECTRON_RUN_AS_NODE, undefined)
+})
 
 test('paired comparison uses robust medians and retains operation and message cost', () => {
   const runs=[10,1000,12].flatMap((baseline,index)=>[false,true].map(enabled=>({trial:index,enabled,metrics:{nativeMarket:{wallMS:enabled?[14,15,16][index]:baseline,cpuMS:enabled?[14,15,16][index]:baseline}},
@@ -12,6 +33,15 @@ test('paired comparison uses robust medians and retains operation and message co
   assert.equal(result.enabled.extraCPUPerOperationMS,.02)
   assert.equal(result.enabled.operationsPerMessage,2)
   assert.equal(median([3,1,2,4]),2.5)
+})
+
+test('paired overhead measurements reject different engines and execution modes instead of comparing unlike runtimes', () => {
+  const runtime = { node: 'v24.22.0', v8: '15.2-electron', electron: '44.9.0', executable: '/app/Electron', mode: 'electron-as-node' }
+  assert.doesNotThrow(() => assertMeasuredRuntime({ ...runtime, pid: 11 }, { ...runtime, pid: 12 }))
+  for (const field of ['node', 'v8', 'electron', 'executable', 'mode']) {
+    assert.throws(() => assertMeasuredRuntime({ ...runtime, [field]: 'different-runtime' }, runtime), new RegExp(field))
+    assert.throws(() => assertMeasuredRuntime({ ...runtime, [field]: undefined }, runtime), /Missing measured runtime identity/)
+  }
 })
 
 test('CPU, disk and durable ACK regressions fail independent configurable budgets', () => {

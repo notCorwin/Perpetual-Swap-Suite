@@ -23,10 +23,14 @@ async function execute(directory, source, environment = {}) {
     child.once('close', (code, signal) => code === 0 ? resolve() : reject(new Error(`Recorder child failed (${code ?? signal}): ${diagnostics}`)))
   })
   const files = (await readdir(directory)).filter(file => file.endsWith('.jsonl.gz'))
-  return Promise.all(files.map(async file => ({
-    events: gunzipSync(await readFile(join(directory, file))).toString('utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)),
-    health: JSON.parse(await readFile(join(directory, file.replace(/\.jsonl\.gz$/, '.health.json')), 'utf8')),
-  })))
+  return Promise.all(files.map(async file => {
+    const decoded = gunzipSync(await readFile(join(directory, file)))
+    return {
+      decoded,
+      events: decoded.toString('utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)),
+      health: JSON.parse(await readFile(join(directory, file.replace(/\.jsonl\.gz$/, '.health.json')), 'utf8')),
+    }
+  }))
 }
 
 test('pressure writes preserve event order, retry short writes, and close drains records admitted while flushing', async () => {
@@ -45,8 +49,15 @@ test('pressure writes preserve event order, retry short writes, and close drains
       };
       syncBuiltinESMExports();
       const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
-      const { measureOperation } = await import(${JSON.stringify(operations)});
+      const { measureOperation, attachOperationJournalSink } = await import(${JSON.stringify(operations)});
       const recording = initializeOperationRecording();
+      // Later observers may mutate events; an admitted record keeps its snapshot.
+      attachOperationJournalSink(event => {
+        if (event.name === 'runtime.ordered') {
+          event.attributes.count = -1;
+          event.resource = 'mutated-after-admission';
+        }
+      });
       const emit = count => measureOperation({ category: 'cpu', name: 'runtime.ordered', resource: '界'.repeat(256), attributes: { count } }, () => {});
       emit(0);
       const initialFlush = recording.flush();
@@ -58,7 +69,9 @@ test('pressure writes preserve event order, retry short writes, and close drains
       await closing;
     `)
     assert.equal(recordings.length, 1)
-    const { events, health } = recordings[0]
+    const { events, health, decoded } = recordings[0]
+    assert.equal(decoded.toString('utf8'), `${events.map(event => JSON.stringify(event)).join('\n')}\n`, 'Every snapshot has exactly one JSONL delimiter, including across pressure batches.')
+    assert.equal(health.uncompressedBytes, decoded.length, 'The byte total includes UTF-8 Unicode and every newline.')
     assert.deepEqual(events.filter(event => event.phase === 'end' && event.name === 'runtime.ordered').map(event => event.attributes.count), Array.from({ length: 1602 }, (_, index) => index))
     assert.ok(events.every(event => event.sessionId === sessionId))
     assert.ok(events.filter(event => event.name === 'runtime.ordered').every(event => event.resource === '界'.repeat(256)))

@@ -15,6 +15,7 @@ export function operationRequirementKey(value) {
   return JSON.stringify([name, source ?? null])
 }
 const statuses = new Set(['ok', 'error', 'cancelled'])
+const lifecycleFields = ['traceId', 'parentId', 'sessionId', 'scenarioId', 'category', 'name', 'resource', 'startedAt']
 const counters = ['calls', 'queryCount', 'rows', 'changes', 'bytes', 'sentBytes', 'receivedBytes']
 const peaks = ['residentKB', 'cpuPercent']
 const bucketLimits = Array.from({ length: 25 }, (_, index) => 2 ** (index - 4))
@@ -287,14 +288,14 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
       if (event.phase === 'start') {
         if (active.has(event.id) || recentlyEnded.has(event.id)) problem('duplicateOperationIds', file, line, event.name)
         else if (active.size >= maxOpenOperations) { problem('lifecycleLimitReached', file, line, event.name); abandon(event) }
-        else active.set(event.id, Object.fromEntries(['id', 'traceId', 'parentId', 'category', 'name', 'resource', 'startedAt'].map(key => [key, event[key]])))
+        else active.set(event.id, Object.fromEntries(['id', ...lifecycleFields].map(key => [key, event[key]])))
         return
       }
       endCount++
       const start = active.get(event.id)
       if (!start) problem(recentlyEnded.has(event.id) ? 'duplicateOperationIds' : 'unmatchedEnds', file, line, event.name)
       else {
-        if (['traceId', 'parentId', 'category', 'name', 'resource', 'startedAt'].some(key => start[key] !== event[key])) problem('mismatchedLifecycles', file, line, event.name)
+        if (lifecycleFields.some(key => start[key] !== event[key])) problem('mismatchedLifecycles', file, line, event.name)
         active.delete(event.id)
       }
       recentlyEnded.add(event.id)

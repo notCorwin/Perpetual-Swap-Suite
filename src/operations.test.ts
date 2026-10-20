@@ -25,6 +25,20 @@ test('recording preserves synchronous values, thrown identity and async completi
   assert.equal(JSON.stringify(events).includes(failure.message), false)
 })
 
+test('shared span methods preserve asynchronous rejection and cancellation without measuring CPU across await', async t => {
+  const events: OperationEvent[] = [], unsubscribe = attachOperationSink(event => { if (event.name.startsWith('test.promise')) events.push(event) })
+  t.after(unsubscribe)
+  const failure = new TypeError('private asynchronous failure')
+  await assert.rejects(measureOperation({ category: 'cpu', name: 'test.promise.rejected' }, async () => {
+    await Promise.resolve()
+    throw failure
+  }), error => error === failure)
+  const cancelled = Object.assign(new Error('private cancellation'), { name: 'AbortError' })
+  await assert.rejects(measureOperation({ category: 'cpu', name: 'test.promise.cancelled' }, () => Promise.reject(cancelled)), error => error === cancelled)
+  assert.deepEqual(events.map(event => [event.status, event.cpuTimeMS]), [['error', undefined], ['cancelled', undefined]])
+  assert.equal(JSON.stringify(events).includes('private'), false)
+})
+
 test('recording accepts diagnostic scalars and excludes arbitrary payloads', t => {
   const events: OperationEvent[] = [], unsubscribe = attachOperationSink(event => events.push(event))
   t.after(unsubscribe)
@@ -41,6 +55,7 @@ test('span execution retains its own ancestry and scenario while inheriting exec
   t.after(unsubscribe)
   const span = beginOperation({ category: 'cpu', name: 'test.trusted-span' })
   const expected = { ...span.context }
+  const publicContext = span.context
   span.context.traceId = 'public-context-was-mutated'
   runWithOperationContext({ traceId: 'other-trace', parentId: 'other-parent', scenarioId: 'other-scenario' }, () => span.run(() => {
     assert.deepEqual(getOperationContext(), expected)
@@ -48,7 +63,21 @@ test('span execution retains its own ancestry and scenario while inheriting exec
   withOperationSuppressed(() => span.run(() => measureOperation({ category: 'cpu', name: 'test.suppressed-child' }, () => 1)))
   assert.equal(events.length, 0, 'A span created outside suppression cannot re-enable recording inside a suppressed I/O callback.')
   span.end()
+  assert.equal(span.context, publicContext)
   assert.deepEqual(events.map(event => event.name), ['test.trusted-span'])
+})
+
+test('late public context access uses captured ancestry after private execution and completion', t => {
+  const unsubscribe = attachOperationSink(() => {})
+  t.after(unsubscribe)
+  const span = runWithOperationContext({ traceId: 'captured-trace', scenarioId: 'captured-scenario' }, () => beginOperation({ category: 'cpu', name: 'test.late-context' }))
+  const expected = span.run(() => getOperationContext())
+  span.end()
+  runWithOperationContext({ traceId: 'other-trace', scenarioId: 'other-scenario' }, () => {
+    assert.deepEqual(span.context, expected)
+    span.context.scenarioId = 'public-mutation'
+    assert.deepEqual(span.run(() => getOperationContext()), expected)
+  })
 })
 
 test('journal sink mutations cannot contaminate the private terminal attribute baseline', t => {
@@ -76,6 +105,29 @@ test('terminal attributes validate only new values and preserve deletion of inva
   assert.deepEqual(journal[0].attributes, original, 'Completing a span does not mutate its already emitted start attributes.')
   assert.deepEqual(journal[1].attributes, { count: 7 })
   assert.equal(JSON.stringify(journal).includes('not-recorded'), false)
+})
+
+test('terminal attribute ownership cannot mutate emitted starts or cause an ended span to publish again', t => {
+  const journal: OperationJournalEvent[] = [], unsubscribe = attachOperationJournalSink(event => {
+    if (event.name !== 'test.terminal-ownership') return
+    journal.push(event)
+    if (event.phase === 'end') Object.assign(event.attributes!, { count: 99, secret: 'terminal-observer-only' })
+  })
+  t.after(unsubscribe)
+  for (const overrides of [undefined, { count: 6, rows: Number.NaN }]) {
+    journal.length = 0
+    const input = { rows: 3, count: 4 }, originalOverrides = overrides && { ...overrides }
+    const span = beginOperation({ category: 'cpu', name: 'test.terminal-ownership', attributes: input })
+    const start = structuredClone(journal[0])
+    span.end({ attributes: overrides })
+    span.end({ status: 'error', attributes: { count: 10 } })
+    assert.equal(span.run(() => 42), 42)
+    assert.equal(journal.length, 2)
+    assert.deepEqual(journal[0], start)
+    assert.deepEqual(input, { rows: 3, count: 4 })
+    assert.deepEqual(overrides, originalOverrides)
+    assert.equal(journal[1].attributes?.rows, overrides ? undefined : 3)
+  }
 })
 
 test('a bulk database operation separates API calls from execution batches without recording bound values', t => {
