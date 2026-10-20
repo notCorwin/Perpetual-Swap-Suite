@@ -1,4 +1,4 @@
-import { beginOperation, captureOperationContext } from './operations.js'
+import { beginOperation, captureOperationContext, recordOperation } from './operations.js'
 
 let nextConnection = 0
 const recordedSockets = new WeakMap()
@@ -62,7 +62,10 @@ function recordWebSocket(socket, url, suppliedAttributes, pendingConnect) {
       connectFinished = true
       connect.end({ status })
     }
-    const record = (name, detail = {}, status = 'ok') => beginOperation({ category: 'network', name, resource, attributes: { ...attributes, ...detail } }).end({ status })
+    // These callbacks observe an event already delivered by the transport. They
+    // have an observation time, rather than an application operation to time.
+    const record = (name, detail = {}, status = 'ok') => recordOperation({ category: 'network', name, resource,
+      startedAt: performance.timeOrigin + performance.now(), durationMS: 0, status, attributes: { ...attributes, ...detail } })
     // Native observers retain connection IDs without restoring application hook
     // scopes. Suppression belongs to the execution delivering each event.
     const resumeObserver = captureOperationContext()

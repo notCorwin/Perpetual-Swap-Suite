@@ -277,6 +277,20 @@ test('raw TCP and native WebSocket hooks retain receivers and injected adapter d
       assert.equal(events.filter(event => event.name === 'websocket.connect').length, 1);
       assert.equal(events.filter(event => event.name === 'websocket.send').length, 1);
       assert.equal(events.filter(event => event.name === 'websocket.receive').length, 1);
+      assert.equal(events.filter(event => event.name === 'websocket.closed').length, 1);
+      for (const event of events.filter(event => ['websocket.receive', 'websocket.closed'].includes(event.name))) {
+        assert.equal(event.durationMS, 0, 'Already-delivered native events record their observation time without timing the recorder.');
+        assert.equal(event.status, 'ok');
+        const phases = journal.filter(entry => entry.id === event.id);
+        assert.deepEqual(phases.map(entry => entry.phase), ['start', 'end']);
+        assert.equal(phases[0].startedAt, phases[1].startedAt);
+        assert.equal(phases[0].startedAt, event.startedAt);
+      }
+      for (const name of ['websocket.connect', 'websocket.send', 'websocket.close']) {
+        const timed = events.filter(event => event.name === name);
+        assert.equal(timed.length, 1);
+        assert.ok(timed[0].durationMS > 0, name + ' still measures the real native operation.');
+      }
       assert.equal(events.filter(event => event.name === 'fetch.request').length, 1, 'WebSocket callbacks restore application hook context.');
       assert.deepEqual(observerScopes, [{ context: connectionContext, network: true }], 'Internal observers retain connection IDs and native transport scopes.');
       for (const key of ['traceId', 'parentId', 'scenarioId']) {
@@ -332,12 +346,31 @@ test('injected WebSocket observers retain private connection IDs and live dispat
     context.run(foreign, incoming);
     assert.deepEqual(observations[1], { ids: expected, lane: 'dispatch', network: false, io: false });
     assert.equal(events.filter(event => event.name === 'websocket.receive').length, 2);
+    const beforeError = performance.timeOrigin + performance.now();
+    context.run(foreign, () => withOperationSuppressed(() => socket.dispatchEvent(new Event('error'))));
+    assert.equal(events.filter(event => event.name === 'websocket.error').length, 0);
+    context.run(foreign, () => socket.dispatchEvent(new Event('error')));
+    const afterError = performance.timeOrigin + performance.now();
+    const error = events.find(event => event.name === 'websocket.error');
+    assert.equal(error.status, 'error');
+    assert.ok(error.startedAt >= beforeError && error.startedAt <= afterError, 'Instant records use the absolute dispatch observation time.');
     socket.close();
     const beforeRemoved = events.length;
     incoming();
     assert.equal(events.length, beforeRemoved, 'Close removes the exact owned observer identities.');
     const closed = events.find(event => event.name === 'websocket.closed');
     for (const key of ['traceId', 'parentId', 'scenarioId']) assert.equal(closed[key], expected[key]);
+    assert.equal(events.length, 6, 'One connection, two receives, one error, one close call and one closed event.');
+    assert.equal(journal.length, 12, 'Every operation retains both lifecycle records.');
+    assert.equal(closed.status, 'ok');
+    for (const event of events.filter(event => ['websocket.receive', 'websocket.error', 'websocket.closed'].includes(event.name))) {
+      assert.equal(event.durationMS, 0);
+      assert.equal(event.cpuTimeMS, undefined);
+      for (const key of ['traceId', 'parentId', 'scenarioId']) assert.equal(event[key], expected[key]);
+      const phases = journal.filter(entry => entry.id === event.id);
+      assert.deepEqual(phases.map(entry => [entry.phase, entry.durationMS]), [['start', 0], ['end', 0]]);
+      assert.equal(phases[0].startedAt, phases[1].startedAt);
+    }
     stop(); unsubscribe(); console.log(JSON.stringify({ observed: observations.length }));
   `)
   assert.equal(result.observed, 2)
