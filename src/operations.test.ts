@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
 import { attachOperationSink, attachOperationJournalSink, beginOperation, measureOperation, recordOperation, hookOperationMethods, getOperationContext,
-  runWithOperationContext, withOperationSuppressed, type OperationEvent, type OperationJournalEvent } from '../electron/services/operations.js'
+  runWithOperationContext, withOperationSuppressed, finishActiveOperations, type OperationEvent, type OperationJournalEvent } from '../electron/services/operations.js'
 // @ts-expect-error Node-only JS intentionally stays outside the renderer API.
 import { databaseOperation, openRecordedDatabase } from '../electron/services/recorded-database.js'
 
@@ -78,6 +78,108 @@ test('late public context access uses captured ancestry after private execution 
     span.context.scenarioId = 'public-mutation'
     assert.deepEqual(span.run(() => getOperationContext()), expected)
   })
+})
+
+test('mutable terminal observers cannot change lazy span ancestry or reenter completion', t => {
+  const name = 'test.span-terminal-identity', input = { rows: 3, count: 4 }
+  const journal: OperationJournalEvent[] = [], snapshots: OperationJournalEvent[] = []
+  const contexts: ReturnType<typeof getOperationContext>[] = [], executions: ReturnType<typeof getOperationContext>[] = []
+  let span!: ReturnType<typeof beginOperation>, duplicateReads = 0
+  t.after(attachOperationJournalSink(event => {
+    if (event.name !== name) return
+    journal.push(event); snapshots.push(structuredClone(event))
+    Object.assign(event, { id: 'observer-id', traceId: 'observer-trace', parentId: 'observer-parent', scenarioId: 'observer-scenario' })
+    Object.assign(event.attributes!, { rows: 999, secret: 'observer-only' })
+    if (event.phase === 'end') {
+      span.end({ get status() { duplicateReads++; return 'error' as const } })
+      finishActiveOperations('reentrant-terminal-observer')
+      contexts.push(span.context)
+      executions.push(span.run(() => getOperationContext()))
+    }
+  }))
+  for (let index = 0; index < 2; index++) {
+    span = runWithOperationContext({ traceId: `original-trace-${index}`, scenarioId: `original-scenario-${index}` },
+      () => beginOperation({ category: 'cpu', name, attributes: input }))
+    // Neither lazy context has been initialized before the mutable end observer.
+    span.end({ status: 'cancelled', attributes: { rows: NaN, count: 6 } })
+    const start = snapshots[index * 2], terminal = snapshots[index * 2 + 1]
+    const expected = { traceId: start.traceId, parentId: start.id, scenarioId: start.scenarioId }
+    assert.deepEqual(contexts[index], expected)
+    assert.deepEqual(executions[index], expected)
+    assert.equal(span.context, contexts[index])
+    span.context.traceId = 'public-context-mutation'
+    assert.deepEqual(span.run(() => getOperationContext()), expected)
+    for (const key of ['id', 'traceId', 'parentId', 'scenarioId', 'name', 'startedAt'] as const) assert.equal(terminal[key], start[key])
+    assert.equal(terminal.status, 'cancelled')
+    assert.deepEqual(start.attributes, input)
+    assert.deepEqual(terminal.attributes, { count: 6 })
+    assert.deepEqual(journal[index * 2].attributes, { rows: 999, count: 4, secret: 'observer-only' })
+  }
+  assert.equal(duplicateReads, 0)
+  assert.equal(journal.length, 4)
+  assert.equal(new Set(journal).size, 4)
+  assert.equal(new Set(journal.map(event => event.attributes)).size, 4)
+  assert.notEqual(snapshots[0].id, snapshots[2].id)
+  assert.deepEqual(input, { rows: 3, count: 4 })
+})
+
+test('span phases retain canonical event keys and JSON bytes across independent calls', t => {
+  const name = 'test.span-canonical', resource = '界"\\\n😀', values = { rows: 3, reason: 'value"\\\n\0界😀\ud800' }
+  const journal: OperationJournalEvent[] = []
+  t.after(attachOperationJournalSink(event => { if (event.name === name) journal.push(event) }))
+  for (let index = 0; index < 2; index++) {
+    runWithOperationContext({ traceId: `canonical-trace-${index}`, parentId: 'canonical-parent', scenarioId: 'canonical-scenario' }, () => {
+      const span = beginOperation({ category: 'cpu', name, resource: index ? resource : undefined, attributes: values })
+      span.end(index ? { status: 'cancelled', cpuTimeMS: -0, attributes: { count: 7 } } : undefined)
+    })
+  }
+  assert.equal(journal.length, 4)
+  const keys = ['schemaVersion', 'sessionId', 'executionId', 'id', 'traceId', 'parentId', 'scenarioId', 'category', 'name', 'resource', 'startedAt', 'phase', 'sequence', 'durationMS', 'status', 'attributes', 'cpuTimeMS']
+  for (const [index, event] of journal.entries()) {
+    const second = index >= 2, terminal = event.phase === 'end'
+    const expected = { schemaVersion: 2, sessionId: event.sessionId, executionId: event.executionId, id: event.id,
+      traceId: `canonical-trace-${second ? 1 : 0}`, parentId: 'canonical-parent', scenarioId: 'canonical-scenario', category: 'cpu', name,
+      resource: second ? resource : undefined, startedAt: event.startedAt, phase: event.phase, sequence: event.sequence,
+      durationMS: terminal ? event.durationMS : 0, status: terminal ? second ? 'cancelled' : 'ok' : 'running',
+      attributes: terminal && second ? { ...values, count: 7 } : values, cpuTimeMS: terminal && second ? 0 : undefined }
+    assert.deepEqual(Object.keys(event), keys)
+    assert.equal(JSON.stringify(event), JSON.stringify(expected))
+  }
+  assert.equal(new Set(journal).size, 4)
+  assert.equal(new Set(journal.map(event => event.attributes)).size, 4)
+  const retained = structuredClone(journal)
+  Object.assign(journal[1], { id: 'mutated-terminal', name: 'mutated-terminal' })
+  Object.assign(journal[1].attributes!, { rows: 999 })
+  for (const index of [0, 2, 3]) assert.deepEqual(journal[index], retained[index])
+  assert.deepEqual(values, { rows: 3, reason: 'value"\\\n\0界😀\ud800' })
+})
+
+test('result and attribute getter reentry publishes before the completing span receives its sequence', t => {
+  const name = 'test.span-getter-reentry', journal: OperationJournalEvent[] = [], reads: string[] = []
+  t.after(attachOperationJournalSink(event => { if (event.name.startsWith(name)) journal.push(event) }))
+  const observe = (field: string) => {
+    reads.push(field)
+    recordOperation({ category: 'cpu', name: `${name}.${field}`, startedAt: 1234, durationMS: 0, status: 'ok' })
+  }
+  const span = beginOperation({ category: 'cpu', name, attributes: { rows: 3 } })
+  span.end({
+    get attributes() { observe('attributes'); return { get count() { observe('count'); return 7 } } },
+    get status() { observe('status'); return 'cancelled' as const },
+    get cpuTimeMS() { observe('cpuTimeMS'); return 2.5 },
+  })
+  assert.deepEqual(new Set(reads), new Set(['attributes', 'count', 'status', 'cpuTimeMS']))
+  assert.equal(journal.length, reads.length * 2 + 2)
+  assert.equal(journal[0].name, name)
+  assert.equal(journal[0].phase, 'start')
+  assert.deepEqual(journal.map(event => event.sequence), Array.from({ length: journal.length }, (_, index) => journal[0].sequence + index))
+  const terminal = journal.at(-1)!
+  assert.equal(terminal.name, name)
+  assert.equal(terminal.phase, 'end')
+  assert.equal(terminal.status, 'cancelled')
+  assert.equal(terminal.cpuTimeMS, 2.5)
+  assert.deepEqual(terminal.attributes, { rows: 3, count: 7 })
+  span.end()
+  assert.equal(journal.length, reads.length * 2 + 2)
 })
 
 test('journal sink mutations cannot contaminate the private terminal attribute baseline', t => {

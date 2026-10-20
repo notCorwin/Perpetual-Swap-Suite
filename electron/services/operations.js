@@ -108,16 +108,24 @@ function start(specification, startedAt = timeOrigin + performance.now()) {
     id, traceId: context.traceId || id, parentId: context.parentId || undefined, scenarioId: context.scenarioId || identity.scenarioId,
     category: specification.category, name: normalized ? specification.name : String(specification.name).slice(0, 160),
     resource: normalized ? specification.resource : specification.resource ? String(specification.resource).slice(0, 256) : undefined,
-    startedAt, attributes: normalized ? { ...specification.attributes } : attributes(specification.attributes) }
+    startedAt, phase: 'end', sequence: 0, durationMS: 0, status: 'ok',
+    attributes: normalized ? { ...specification.attributes } : attributes(specification.attributes), cpuTimeMS: undefined }
   // Mutable start observers cannot alter the private validated terminal baseline.
   localEvent(base, 'start', 0, 'running', { ...base.attributes }, undefined); return base
 }
-function complete(base, detail, durationMS = detail.durationMS) {
-  // Completion consumes the private baseline. Starts already own an isolated
-  // copy, and an ended span cannot publish this baseline a second time.
-  const terminalAttributes = detail.attributes === undefined ? base.attributes : attributes(detail.attributes, base.attributes)
-  localEvent(base, 'end', Math.max(0, durationMS), detail.status ?? 'ok', terminalAttributes,
-    Number.isFinite(detail.cpuTimeMS) ? Math.max(0, detail.cpuTimeMS) : undefined)
+function complete(base, detail, durationMS) {
+  // Transfer the private terminal snapshot once. Starts already own independent
+  // metadata and attributes; ended spans retain their ancestry as private IDs.
+  const overrides = detail.attributes
+  if (overrides !== undefined) attributes(overrides, base.attributes)
+  base.durationMS = Math.max(0, durationMS)
+  base.status = detail.status ?? 'ok'
+  const cpuTimeMS = detail.cpuTimeMS
+  base.cpuTimeMS = Number.isFinite(cpuTimeMS) ? Math.max(0, cpuTimeMS) : undefined
+  // Result getters may publish nested operations. Assign the terminal sequence
+  // only after every input has been consumed, immediately before publication.
+  base.sequence = ++journalSequence
+  publish(base)
 }
 
 export function recordOperation(value) {
@@ -141,17 +149,17 @@ export function recordOperation(value) {
 }
 const noop = { context: {}, end() {}, run: operation => operation() }
 class LocalOperationSpan {
-  #base; #started; #ended = false; #context; #publicContext
+  #base; #started; #ended = false; #id; #traceId; #scenarioId; #context; #publicContext
   constructor(base, started) {
     this.#base = base; this.#started = started
+    this.#id = base.id; this.#traceId = base.traceId; this.#scenarioId = base.scenarioId
   }
   get context() {
-    const base = this.#base
-    return this.#publicContext ??= { traceId: base.traceId, parentId: base.id, ...(base.scenarioId ? { scenarioId: base.scenarioId } : {}) }
+    return this.#publicContext ??= { traceId: this.#traceId, parentId: this.#id, ...(this.#scenarioId ? { scenarioId: this.#scenarioId } : {}) }
   }
   run(operation) {
     // IDs belong to this span; global/domain suppression belongs to each run.
-    const base = this.#base, context = this.#context ??= { traceId: base.traceId, parentId: base.id, scenarioId: base.scenarioId }
+    const context = this.#context ??= { traceId: this.#traceId, parentId: this.#id, scenarioId: this.#scenarioId }
     const invocation = current(), domains = invocation[hookDomains]
     if (invocation.suppressed !== true && domains === undefined) return runContext(context, operation)
     return runContext({ ...context, suppressed: invocation.suppressed === true, [hookDomains]: domains }, operation)
