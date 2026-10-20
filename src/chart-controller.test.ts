@@ -112,6 +112,48 @@ test('historical navigation keeps the calculated viewport until the requested lo
   } finally { close() }
 })
 
+test('first historical prices finish their recursive calculation before speculative history can move the reserve cursor', async () => {
+  const queue = transportQueue(), store = new PreparedChartStore()
+  const raw = (first: number, count: number) => bars(first, count).map(value => ({ ...value,
+    indicatorsObserved: false, statisticsObserved: false, oiObserved: false, takerObserved: false, statisticsSources: 0,
+    vwap: null, ema: null, bollUpper: null, bollMiddle: null, bollLower: null,
+    roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, atrPercent: null, bbw: null, oi: null, buy: null, sell: null,
+  }))
+  const latest = prepared(btc, 3071, { bars: raw(2944, 128), indicatorState: 'loading' })
+  let history = prepared(btc, 1100, { bars: raw(512, 768), latestEnd: 3071 * hour,
+    revision: 2, indicatorState: 'loading', oiState: 'loading', takerState: 'loading',
+  })
+  const controller = new ChartController({ ...queue.transport, local: async () => latest, history: async () => history }, store)
+  controller.setUniverse([btc], '1H')
+  const close = controller.open(btc, '1H')
+  try {
+    await settled()
+    controller.scroll(-1971)
+    await settled()
+    const initial = controller.getSnapshot().presented!
+    assert.equal(initial.endHour, 1100 * hour)
+    assert.equal(initial.bars.length, 96)
+    assert.equal(initial.indicatorState, 'loading')
+    assert.equal(controller.getSnapshot().pending, false, 'Initial prices remain visible while the independent worker calculates.')
+    assert.equal(queue.calls.length, 0, 'The first visible calculation owns its reserve until its result is installed.')
+
+    const calculated = bars(1005, 96).map(value => ({ ...value, ema: value.hour / hour,
+      statisticsObserved: false, oiObserved: false, takerObserved: false, statisticsSources: 0, oi: null, buy: null, sell: null,
+    }))
+    const byHour = new Map(calculated.map(value => [value.hour, value]))
+    history = { ...history, bars: history.bars.map(value => byHour.get(value.hour) ?? value), revision: 3 }
+    controller.ingestPrepared(history)
+    await settled()
+    const mature = controller.getSnapshot().presented!
+    assert.equal(mature.indicatorState, 'ready')
+    assert.deepEqual(mature.bars.map(value => value.ema), calculated.map(value => value.ema))
+    assert.equal(mature.oiState, 'loading'); assert.equal(mature.takerState, 'loading')
+    assert.equal(queue.calls.length, 1, 'Optional source panels do not block the now safe speculative acquisition.')
+    assert.equal(queue.calls[0].target.end, 606 * hour)
+    assert.equal(controller.getSnapshot().presented, mature, 'Starting the reserve must retain the completed selected viewport.')
+  } finally { close() }
+})
+
 test('a partial resident viewport repairs missing prices instead of waiting forever for calculation', async () => {
   const queue = transportQueue(), store = cached()
   const controller = new ChartController({ ...queue.transport, history: async () => null }, store)

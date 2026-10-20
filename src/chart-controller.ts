@@ -216,7 +216,10 @@ export class ChartController {
   private prefetchTarget(target: ChartTarget): ChartPreparation | null {
     if (Date.now() < this.prefetchAfter) return null
     const window = this.store.window(target.instId, target.timeframe, target.end)
-    if (!window) return null
+    // A cold viewport can display prices before its recursive calculation
+    // finishes. Moving the backend reserve cursor now could evict those rows
+    // before the pending calculation installs their indicators.
+    if (!window || window.indicatorState === 'loading') return null
     const interval = timeframeMilliseconds(target.timeframe)
     const range = this.store.readyBoundaries(target.instId, target.timeframe).find(range => range.firstEnd <= window.endHour && range.lastEnd >= window.endHour)
     if (!range) return null
