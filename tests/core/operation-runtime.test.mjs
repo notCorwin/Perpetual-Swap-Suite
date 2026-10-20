@@ -87,6 +87,78 @@ test('pressure writes preserve event order, retry short writes, and close drains
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
+test('reentrant observations preserve sequence order when serialization crosses a pressure drain and flush', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-operation-runtime-reentrant-'))
+  try {
+    const recordings = await execute(directory, `
+      import assert from 'node:assert/strict';
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      const { measureOperation } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording(), stringify = JSON.stringify;
+      const flushes = [];
+      let interrupted = false;
+      JSON.stringify = (value, ...args) => {
+        if (!interrupted && value?.name === 'runtime.interrupted' && value.phase === 'end') {
+          interrupted = true;
+          for (let count = 0; count < 200; count++) measureOperation({ category: 'cpu', name: 'runtime.reentrant', resource: '界'.repeat(256), attributes: { count } }, () => {});
+          flushes.push(recording.flush());
+        }
+        return stringify(value, ...args);
+      };
+      measureOperation({ category: 'cpu', name: 'runtime.interrupted' }, () => {});
+      JSON.stringify = stringify;
+      assert.equal(interrupted, true);
+      await Promise.all(flushes);
+      await recording.close();
+    `)
+    const { events, health } = recordings[0]
+    assert.ok(health.uncompressedBytes > 256 * 1024, 'The nested observations exceed a real pressure batch.')
+    assert.deepEqual(events.map(event => event.sequence), Array.from({ length: events.length }, (_, index) => index + 1))
+    assert.deepEqual(events.filter(event => event.name === 'runtime.reentrant' && event.phase === 'end').map(event => event.attributes.count), Array.from({ length: 200 }, (_, index) => index))
+    assert.equal(health.failed, 0)
+    assert.equal(health.recorded, events.length)
+    assert.equal(health.durableRecords, events.length)
+    const { summarizeOperations, operationReportHasFailures } = await import('../../scripts/operation-report.mjs')
+    assert.equal(operationReportHasFailures(await summarizeOperations(directory)), false)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('failed reentrant serialization preserves other records and permanently fails recorder health', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-operation-runtime-serialization-failure-'))
+  try {
+    const recordings = await execute(directory, `
+      import assert from 'node:assert/strict';
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      const { measureOperation } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording(), stringify = JSON.stringify;
+      JSON.stringify = (value, ...args) => {
+        if (value?.name === 'runtime.serialization-failure' && value.phase === 'end') {
+          measureOperation({ category: 'cpu', name: 'runtime.admitted-during-failure' }, () => {});
+          throw new Error('Injected serialization failure');
+        }
+        return stringify(value, ...args);
+      };
+      measureOperation({ category: 'cpu', name: 'runtime.serialization-failure' }, () => {});
+      JSON.stringify = stringify;
+      measureOperation({ category: 'cpu', name: 'runtime.after-serialization-failure' }, () => {});
+      await assert.rejects(recording.flush(), /did not complete/);
+      await assert.rejects(recording.close(), /did not close cleanly/);
+    `)
+    const { events, health } = recordings[0]
+    assert.equal(events.filter(event => event.name === 'runtime.serialization-failure' && event.phase === 'end').length, 0)
+    for (const name of ['runtime.admitted-during-failure', 'runtime.after-serialization-failure']) assert.deepEqual(events.filter(event => event.name === name).map(event => event.phase), ['start', 'end'])
+    assert.equal(health.failed, 1)
+    assert.equal(health.sourceFailures, 1)
+    assert.equal(health.omittedRecords, 1)
+    assert.equal(health.recorded, events.length)
+    assert.equal(health.persisted, events.length)
+    assert.equal(health.pending, 0)
+    assert.equal(health.closed, true)
+    const { summarizeOperations, operationReportHasFailures } = await import('../../scripts/operation-report.mjs')
+    assert.equal(operationReportHasFailures(await summarizeOperations(directory)), true)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
 test('repeated durable flushes of unchanged journals do no additional disk synchronization or metadata writes', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'perp-operation-runtime-clean-'))
   try {

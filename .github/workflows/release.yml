@@ -28,6 +28,7 @@ jobs:
       - name: Use the supported npm version
         run: npm install --global npm@12.2.0
       - name: Install locked dependencies
+        id: dependencies
         run: npm ci
       - name: Lint
         run: npm run lint
@@ -54,6 +55,9 @@ jobs:
           PERPETUAL_SWAP_RESOURCE_REPORT: artifacts/market-resources.json
         run: npm run sandbox -- command --foreground --output artifacts/sandbox -- node scripts/market-resource-benchmark.mjs
       - name: Enforce paired operation recording overhead budgets
+        # This independent gate must still collect its own evidence when a
+        # preceding acceptance fails. Both failures remain fatal to validation.
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         # The harness owns isolated recording-disabled and enabled children.
         # An outer recorder would invalidate its disabled baseline.
         run: npm run benchmark:operations -- --output artifacts/operation-overhead
