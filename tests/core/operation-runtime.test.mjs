@@ -268,6 +268,52 @@ test('repeated durable flushes of unchanged journals do no additional disk synch
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
+test('persisted health reflects hook replacement and recovery without new records and retains complete durable state', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-operation-runtime-health-readback-'))
+  try {
+    const recordings = await execute(directory, `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import { join } from 'node:path';
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      const { measureOperation, withOperationSuppressed } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording(), readFile = fs.readFileSync;
+      const path = join(${JSON.stringify(directory)}, recording.executionId + '.health.json');
+      const readHealth = () => withOperationSuppressed(() => JSON.parse(readFile(path, 'utf8')));
+      measureOperation({ category: 'cpu', name: 'fixture.health-state' }, () => 42);
+      const before = Date.now();
+      await recording.flush();
+      const initial = readHealth();
+      assert.ok(initial.updatedAt >= before && initial.updatedAt <= Date.now());
+      assert.equal(initial.durableRecords, initial.recorded);
+      assert.equal(initial.pending, 0);
+      assert.equal(initial.failed, 0);
+      assert.equal(initial.hookCapabilities.find(value => value.api === 'fs.readFileSync').enabled, true);
+      assert.ok(initial.enabledHooks.includes('filesystem'));
+      fs.readFileSync = (...args) => Reflect.apply(readFile, fs, args);
+      await recording.flush();
+      const replaced = readHealth();
+      assert.equal(replaced.recorded, initial.recorded);
+      assert.equal(replaced.hookCapabilities.find(value => value.api === 'fs.readFileSync').enabled, false);
+      assert.equal(replaced.enabledHooks.includes('filesystem'), false);
+      fs.readFileSync = readFile;
+      await recording.flush();
+      const restored = readHealth();
+      assert.equal(restored.recorded, initial.recorded);
+      assert.equal(restored.hookCapabilities.find(value => value.api === 'fs.readFileSync').enabled, true);
+      assert.ok(restored.enabledHooks.includes('filesystem'));
+      await recording.close();
+      const persisted = readHealth(), live = recording.health();
+      const withoutTimestamp = ({ updatedAt, ...state }) => state;
+      assert.deepEqual(withoutTimestamp(persisted), withoutTimestamp(live));
+      assert.equal(persisted.closed, true);
+    `)
+    assert.equal(recordings.length, 1)
+    assert.equal(recordings[0].health.recorded, recordings[0].events.length)
+    assert.equal(recordings[0].health.durableRecords, recordings[0].events.length)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
 test('close joins overlapping durability flushes before releasing the journal descriptor', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'perp-operation-runtime-flush-close-'))
   try {

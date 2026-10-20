@@ -10,6 +10,7 @@ export function configureOperationContext(value: { sessionId?: string; execution
 export function configureOperationPropagation(value: { get(): OperationContext | undefined; run<T>(context: OperationContext, operation: () => T): T }): void
 export function getOperationContext(): OperationContext
 export function runWithOperationContext<T>(context: OperationContext | undefined, operation: () => T): T
+export function captureOperationContext(): <T>(operation: () => T) => T
 export function withOperationSuppressed<T>(operation: () => T): T
 export function isOperationSuppressed(): boolean
 export function hasOperationRecording(): boolean

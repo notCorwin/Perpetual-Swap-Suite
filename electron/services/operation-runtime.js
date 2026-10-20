@@ -19,11 +19,11 @@ installSandboxNetworkBoundary()
 let current
 const suppress = withOperationSuppressed
 const validID = value => typeof value === 'string' && /^[\w.:-]{1,256}$/.test(value)
-const jsonWrite = (path, value) => suppress(() => {
+const jsonWrite = (path, value, encoded) => suppress(() => {
   const temporary = join(dirname(path), `.tmp-${randomUUID()}-${basename(path)}`)
   let descriptor
   try {
-    writeFileSync(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' })
+    writeFileSync(temporary, `${encoded ?? JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' })
     descriptor = openSync(temporary, 'r')
     fdatasyncSync(descriptor)
     closeSync(descriptor); descriptor = undefined
@@ -52,17 +52,22 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
   const queue = new Map()
   let nextSequence = 1, bytes = 0, position = prefix.length, timer, writing, accepting = true, closed = false, closing, flushBarrier = Promise.resolve(), lastHealthState
   let serializing = 0, building = false, draining = 0, serializationBarrier, finishSerialization
-  const health = () => ({ schemaVersion: 2, ...counts, pending: counts.recorded - counts.persisted,
-    activeOperations: counts.startedOperations - counts.recordedOperations, executionId, sessionId, participantId: participant.id,
-    role: participant.role, closed, enabledHooks: typeof hooks === 'function' ? hooks() : hooks,
-    hookCapabilities: capabilities(), encoding: 'brotli-frames-q0-crc32-v1',
-    durability: 'fdatasync-on-flush-and-5s-checkpoint', updatedAt: Date.now(), lastDurableAt,
-    runtime: { node: process.version, electron: process.versions.electron ?? null, v8: process.versions.v8 } })
+  const health = () => {
+    const snapshot = capabilities()
+    return { schemaVersion: 2, ...counts, pending: counts.recorded - counts.persisted,
+      activeOperations: counts.startedOperations - counts.recordedOperations, executionId, sessionId, participantId: participant.id,
+      role: participant.role, closed, enabledHooks: typeof hooks === 'function' ? hooks(snapshot) : hooks,
+      hookCapabilities: snapshot, encoding: 'brotli-frames-q0-crc32-v1',
+      durability: 'fdatasync-on-flush-and-5s-checkpoint', updatedAt: Date.now(), lastDurableAt,
+      runtime: { node: process.version, electron: process.versions.electron ?? null, v8: process.versions.v8 } }
+  }
   const failed = error => { counts.failed++; suppress(() => console.error(`Operation journal failed (${error.code ?? error.name}).`)) }
   const writeHealth = () => {
     const value = health(), state = JSON.stringify({ ...value, updatedAt: undefined })
     if (state === lastHealthState) return
-    try { jsonWrite(healthFile, value); lastHealthState = state }
+    // Reuse the complete state encoding; only the update timestamp is volatile.
+    const encoded = `${state.slice(0, -1)},"updatedAt":${JSON.stringify(value.updatedAt)}}`
+    try { jsonWrite(healthFile, value, encoded); lastHealthState = state }
     catch (error) { failed(error); throw error }
   }
   const serializeFlush = operation => {
@@ -85,8 +90,10 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
     try {
       const lines = []
       let through = nextSequence
-      while (queue.has(through) && queue.get(through) !== undefined) {
-        const line = queue.get(through++)
+      for (;;) {
+        const line = queue.get(through)
+        if (line === undefined) break
+        through++
         // A failed serialization owns its sequence but contributes no fake line.
         if (line !== null) lines.push(line)
       }
@@ -175,7 +182,6 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
     // even starts. The producer's absolute sequence owns its immutable line.
     serializing++
     const sequence = entry.sequence, terminal = Number(entry.phase === 'end'), started = Number(entry.phase === 'start')
-    queue.set(sequence, undefined)
     counts.recorded++; counts.recordedOperations += terminal; counts.startedOperations += started
     try {
       const line = JSON.stringify(entry), length = Buffer.byteLength(line) + 1

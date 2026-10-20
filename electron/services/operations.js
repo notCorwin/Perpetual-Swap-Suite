@@ -37,14 +37,28 @@ export function getOperationContext() {
   const context = current(), scenarioId = context.scenarioId ?? identity.scenarioId
   return { ...(context.traceId ? { traceId: context.traceId } : {}), ...(context.parentId ? { parentId: context.parentId } : {}), ...(scenarioId ? { scenarioId } : {}) }
 }
+const validatedContextID = value => safeID(value) ? value : undefined
+function applyContextIDs(context, traceId, parentId, scenarioId) {
+  if (traceId === undefined) delete context.traceId; else context.traceId = traceId
+  if (parentId === undefined) delete context.parentId; else context.parentId = parentId
+  if (scenarioId === undefined) delete context.scenarioId; else context.scenarioId = scenarioId
+  return context
+}
 export function runWithOperationContext(value, operation) {
   if (value === undefined) return operation()
   const context = { ...current() }
-  for (const key of ['traceId', 'parentId', 'scenarioId']) {
-    if (safeID(value?.[key])) context[key] = value[key]
-    else delete context[key]
+  return runContext(applyContextIDs(context, validatedContextID(value?.traceId), validatedContextID(value?.parentId), validatedContextID(value?.scenarioId)), operation)
+}
+export function captureOperationContext() {
+  const captured = current(), traceId = validatedContextID(captured.traceId), parentId = validatedContextID(captured.parentId),
+    scenarioId = validatedContextID(captured.scenarioId ?? identity.scenarioId)
+  // Only immutable validated IDs belong to registration. Suppression and other
+  // execution fields belong to each invocation, including mutable providers.
+  return operation => {
+    const context = current()
+    if (context.traceId === traceId && context.parentId === parentId && context.scenarioId === scenarioId) return operation()
+    return runContext(applyContextIDs({ ...context }, traceId, parentId, scenarioId), operation)
   }
-  return runContext(context, operation)
 }
 export function withOperationSuppressed(operation) { return runContext({ ...current(), suppressed: true }, operation) }
 export function isOperationSuppressed() { return current().suppressed === true }

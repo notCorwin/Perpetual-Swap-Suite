@@ -10,7 +10,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { errorMonitor } from 'node:events'
 import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { extname } from 'node:path'
-import { beginOperation, getOperationContext, runWithOperationContext, isOperationSuppressed, readOperationCPUTime } from './operations.js'
+import { beginOperation, captureOperationContext, isOperationSuppressed, readOperationCPUTime } from './operations.js'
 import { constructRecordedWebSocket, networkByteLength, networkResource } from './network-operations.js'
 import { installRecordedSQLite } from './recorded-database.js'
 import { assertSandboxURL } from './sandbox-network.js'
@@ -31,8 +31,8 @@ export function getOperationHookCapabilities() {
     return entry
   }).concat(getNativeNetworkHookCapabilities()).sort((a,b)=>a.api.localeCompare(b.api))
 }
-export function getInstalledOperationHooks() {
-  const active=new Set(getOperationHookCapabilities().filter(entry=>entry.enabled).map(entry=>entry.api))
+export function getInstalledOperationHooks(snapshot = getOperationHookCapabilities()) {
+  const active=new Set(snapshot.filter(entry=>entry.enabled).map(entry=>entry.api))
   const checks={filesystem:['fs.readFileSync'],crypto:['crypto.pbkdf2Sync'],zlib:['zlib.gzipSync'],sockets:['net.Socket.connect','tls.connect'],http:['http.request','https.request'],fetch:['globalThis.fetch'],websocket:['globalThis.WebSocket'],sqlite:['node:sqlite.DatabaseSync']}
   const result=[...installed].filter(family=>checks[family]?.every(api=>active.has(api))??true)
   for(const [family,api] of [['dns','dns.lookup'],['udp','dgram.createSocket'],['http2','http2.connect'],['electron.net','electron.net.fetch']])if(active.has(api))result.push(family)
@@ -71,8 +71,8 @@ const resultAttributes = (value, name = '') => ({
   ...(typeof value === 'number' && /\.(?:read|readv|write|writev)(?:Sync)?$/.test(name) ? { bytes: value } : {}),
 })
 const run = (span, operation) => typeof span.run === 'function' ? span.run(operation) : operation()
-const captureScope = () => ({ hooks: hookScopes.getStore(), operation: getOperationContext() })
-const resumeScope = (scope, operation) => runWithOperationContext(scope.operation, () => hookScopes.run(scope.hooks, operation))
+const captureScope = () => ({ hooks: hookScopes.getStore(), run: captureOperationContext() })
+const resumeScope = (scope, operation) => scope.run(() => hookScopes.run(scope.hooks, operation))
 
 /** Preserve application callback context while native transport internals are suppressed. */
 function restoreEmitterContexts(target) {
