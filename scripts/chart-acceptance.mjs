@@ -479,20 +479,22 @@ export async function waitForLocalHistory(electron, page, fixture, timeframe = f
 
 export function separateSourceMaintenance(sourceRequests, fixture) {
   const historical = [], historicalExtensions = [], currentMaintenance = []
-  const maxIntervalMS = Math.max(...Object.values(fixture.series).map(series => series.intervalMS))
   for (const request of sourceRequests) {
     const parameters = request.parameters ?? {}
     const after = Number(parameters.after), limit = Number(parameters.limit)
     const intervalMS = fixture.series[parameters.bar]?.intervalMS
     const latestCandles = request.path === '/market/candles' && limit === 2 && Number.isFinite(intervalMS)
       && parameters.after == null && parameters.before == null
-    // Ranking refreshes read four recent 5m closes. Exclude them only when
-    // their entire requested window is provably later than the chart fixture.
-    const currentCandles = request.path === '/market/history-candles' && limit === 4
-      && Number.isFinite(intervalMS) && Number.isFinite(after)
-      && after > fixture.end + maxIntervalMS && after - limit * intervalMS > fixture.end
+    // Ranking and selected-chart repairs request at most one current viewport.
+    // Exclude them only when every possible returned slot is later than the
+    // fixture. An overlapping, unbounded or ambiguous cursor still fails.
+    const currentCandles = request.path === '/market/history-candles' && Number.isSafeInteger(limit) && limit > 0 && limit <= 96
+      && Number.isFinite(intervalMS) && intervalMS > 0 && Number.isSafeInteger(after) && after % intervalMS === 0
+      && parameters.before == null && after - limit * intervalMS > fixture.end
     const begin = Number(parameters.begin), end = Number(parameters.end)
-    const currentRange = Number.isFinite(begin) && Number.isFinite(end) && end >= begin && begin > fixture.end
+    const statisticsRequest = ['/rubik/stat/contracts/open-interest-history', '/rubik/stat/taker-volume-contract'].includes(request.path)
+    const currentRange = statisticsRequest && Number.isFinite(fixture.series[parameters.period]?.intervalMS)
+      && Number.isSafeInteger(begin) && Number.isSafeInteger(end) && end >= begin && begin > fixture.end
     const candleStart = fixture.series[parameters.bar]?.bars?.[0]?.hour
     const statisticsStart = fixture.series[parameters.period]?.bars?.[0]?.hour
     // Candle `after` and both statistics boundaries are exclusive (see
@@ -500,7 +502,7 @@ export function separateSourceMaintenance(sourceRequests, fixture) {
     // persisted source period still proves a wholly older request.
     const olderCandles = request.path === '/market/history-candles' && Number.isFinite(after)
       && Number.isFinite(candleStart) && after <= candleStart && Number.isFinite(limit) && limit > 0
-    const olderStatistics = ['/rubik/stat/contracts/open-interest-history', '/rubik/stat/taker-volume-contract'].includes(request.path)
+    const olderStatistics = statisticsRequest
       && Number.isFinite(begin) && Number.isFinite(end) && end >= begin
       && Number.isFinite(statisticsStart) && end <= statisticsStart
     if (latestCandles || currentCandles || currentRange) currentMaintenance.push(request)

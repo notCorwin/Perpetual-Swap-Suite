@@ -36,6 +36,85 @@ test('partial price windows render independently of unknown indicators and stati
   assert.equal(store.window(instId, '1H', 13 * hour), null, 'An absent requested end remains a real price gap.')
 })
 
+test('a present latest candle cannot certify a window with an interior price gap', () => {
+  for (const compact of [false, true]) {
+    const store = new PreparedChartStore()
+    store.setUniverse([instId], '1H', instId)
+    const complete = bars(104, 96), sparse = complete.filter((_, index) => index !== 40)
+    const ingest = (values: PreparedChartBar[], revision: number) => {
+      const frame = response(values, { revision, endHour: 199 * hour, latestEnd: 199 * hour, priceState: 'ready' })
+      assert.equal(compact ? store.ingestLatest(frame) : store.ingest(frame), true)
+    }
+    ingest(sparse, 1)
+    const partial = store.window(instId, '1H')!
+    assert.equal(partial.bars.length, 95)
+    assert.equal(partial.priceState, 'partial', 'All timestamp slots must exist, even when the producer claims readiness.')
+    assert.equal(partial.indicatorState, 'ready'); assert.equal(partial.oiState, 'ready'); assert.equal(partial.takerState, 'ready')
+    assert.deepEqual(store.readyBoundaries(instId, '1H'), [], 'Sparse prices provide no complete navigation runway.')
+    ingest(compact ? complete : [complete[40]], 2)
+    const repaired = store.window(instId, '1H')!
+    assert.equal(repaired.priceState, 'ready')
+    assert.deepEqual(repaired.bars.map(bar => bar.hour), complete.map(bar => bar.hour))
+    assert.equal(repaired.bars[0], partial.bars[0], 'Repairing one slot reuses unchanged prepared observations.')
+  }
+})
+
+test('detached live prices never certify an old completed chart as current', () => {
+  for (const compact of [false, true]) {
+    const store = new PreparedChartStore()
+    store.setUniverse([instId], '1H', instId)
+    const frame = response(bars(104, 96), { priceState: 'ready', liveBar: { ...bar(272), confirmed: false } })
+    assert.equal(compact ? store.ingestLatest(frame) : store.ingest(frame), true)
+    const latest = store.window(instId, '1H')!
+    assert.equal(latest.priceState, 'stale')
+    assert.equal(latest.bars.length, 96); assert.equal(latest.liveBar?.hour, 272 * hour)
+    assert.equal(latest.indicatorState, 'ready', 'Actual confirmed indicators remain independently reusable.')
+    if (!compact) assert.equal(store.window(instId, '1H', 198 * hour)?.priceState, 'partial', 'A historical window validates its own grid.')
+  }
+})
+
+test('a known listing boundary certifies every available slot without requiring prelisting candles', () => {
+  const store = new PreparedChartStore()
+  store.setUniverse([instId], '1H', instId)
+  store.ingestLatest(response(bars(188, 12), { historyExhausted: true, priceState: 'ready', liveBar: { ...bar(200), confirmed: false } }))
+  const listed = store.window(instId, '1H')!
+  assert.equal(listed.bars.length, 12)
+  assert.equal(listed.priceState, 'ready')
+  assert.deepEqual(store.readyBoundaries(instId, '1H'), [{ firstEnd: 199 * hour, lastEnd: 199 * hour }])
+})
+
+test('historical price completeness retains missing source inputs independently of timestamp coverage', () => {
+  const store = new PreparedChartStore()
+  store.setUniverse([instId], '1H', instId)
+  const partial = bars(0, 300).map(bar => ({ ...bar, priceComplete: bar.hour !== 150 * hour }))
+  store.ingest(response(partial, { latestEnd: 299 * hour, endHour: 180 * hour, priceState: 'partial', revision: 1 }))
+  assert.equal(store.window(instId, '1H', 180 * hour)?.bars.length, 96)
+  assert.equal(store.window(instId, '1H', 180 * hour)?.priceState, 'partial')
+  assert.equal(store.window(instId, '1H', 299 * hour)?.priceState, 'ready', 'A historical defect cannot poison a different complete viewport.')
+  assert.ok(store.readyBoundaries(instId, '1H').every(range => !(range.firstEnd <= 180 * hour && range.lastEnd >= 180 * hour)))
+  store.ingest(response([{ ...bar(150), priceComplete: true }], { latestEnd: 299 * hour, endHour: 180 * hour, priceState: 'ready', revision: 2 }))
+  assert.equal(store.window(instId, '1H', 180 * hour)?.priceState, 'ready')
+})
+
+test('price freshness changes refresh memoized windows without invalidating historical data', () => {
+  const store = new PreparedChartStore()
+  store.setUniverse([instId], '1H', instId)
+  const frame = response(bars(0, 200), { revision: 1, priceState: 'ready', priceAsOf: 199 * hour, realtimeState: 'stale' })
+  store.ingest(frame)
+  const current = store.window(instId, '1H')!, historical = store.window(instId, '1H', 100 * hour)!
+  store.ingest({ ...frame, revision: 2, priceState: 'stale' })
+  const stale = store.window(instId, '1H')!
+  assert.equal(stale.priceState, 'stale')
+  assert.equal(stale.bars, current.bars, 'Freshness updates do not rebuild prepared price data.')
+  assert.equal(store.window(instId, '1H', 100 * hour), historical)
+  assert.equal(store.ingestLive({ type: 'live', instId, timeframe: '1H', generation: 1, revision: 3, endHour: 199 * hour,
+    liveBar: { ...bar(200), confirmed: false }, priceState: 'ready', priceAsOf: 200 * hour, realtimeState: 'live' }), true)
+  const fresh = store.window(instId, '1H')!
+  assert.equal(fresh.priceState, 'ready'); assert.equal(fresh.priceAsOf, 200 * hour)
+  assert.equal(fresh.bars, current.bars)
+  assert.equal(store.window(instId, '1H', 100 * hour)?.priceState, 'ready')
+})
+
 test('availability belongs to each window and explicitly observed nulls are complete data', () => {
   const store = new PreparedChartStore()
   const values = bars(0, 200)

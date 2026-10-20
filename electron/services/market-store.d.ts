@@ -29,7 +29,7 @@ export type CandleAuditIssue = CandleRange & {
   instrument: string
   timeframe: string
   source: 'candles'
-  reason: 'gap' | 'invalid-grid' | 'invalid-partition' | 'invalid-schema' | 'unconfirmed' | 'invalid-ohlc' | 'negative-volume' | 'missing-base-volume' | 'invalid-metadata' | 'duplicate' | 'corrupt-file'
+  reason: 'gap' | 'invalid-grid' | 'invalid-partition' | 'invalid-schema' | 'unconfirmed' | 'invalid-ohlc' | 'negative-volume' | 'missing-base-volume' | 'missing-quote-volume' | 'invalid-metadata' | 'duplicate' | 'corrupt-file'
   repairable: boolean
   file?: string
   detail?: string

@@ -98,6 +98,39 @@ test('a rejected batch changes neither facts nor coverage, and missing units sta
   } finally { await f.close() }
 })
 
+test('integrity inspection finds missing volume units and verifies their persisted replacements', async () => {
+  const f = await fixture(), target = { ...query, through: base + 4 * step }
+  try {
+    await f.store.appendCandles([
+      { ...candle(0), baseVolume: null },
+      { ...candle(1), quoteVolume: null },
+      { ...candle(2), baseVolume: null, quoteVolume: null },
+      { ...candle(3), volume: 0, baseVolume: 0, quoteVolume: 0 },
+    ])
+    const inspection = await f.store.inspectCandles(target)
+    assert.equal(inspection.checkedRows, 4)
+    assert.deepEqual(inspection.issues.map(({ from, through, reason, repairable }) => ({ from, through, reason, repairable })), [
+      { from: base, through: base, reason: 'missing-base-volume', repairable: true },
+      { from: base + step, through: base + step, reason: 'missing-quote-volume', repairable: true },
+      { from: base + 2 * step, through: base + 2 * step, reason: 'missing-base-volume', repairable: true },
+      { from: base + 2 * step, through: base + 2 * step, reason: 'missing-quote-volume', repairable: true },
+      { from: base + 4 * step, through: base + 4 * step, reason: 'gap', repairable: true },
+    ])
+    assert.deepEqual(inspection.missingRanges, [{ from: base + 4 * step, through: base + 4 * step }])
+
+    await f.store.replaceCandles({ ...target, through: base + 2 * step }, [candle(0), candle(1), { ...candle(2), quoteVolume: null }])
+    assert.deepEqual((await f.store.inspectCandles({ ...target, through: base + 3 * step })).issues.map(issue => issue.reason), ['missing-quote-volume'],
+      'Persisting only part of the required units cannot certify a repaired range.')
+    await f.store.replaceCandles({ ...target, from: base + 2 * step, through: base + 2 * step }, [candle(2)])
+    await f.store.appendCandles([candle(4)])
+    const verified = await f.store.inspectCandles(target)
+    assert.equal(verified.checkedRows, 5)
+    assert.deepEqual(verified.issues, [])
+    assert.deepEqual(verified.missingRanges, [])
+    assert.deepEqual((await f.store.candles(target)).map(({ baseVolume, quoteVolume }) => [baseVolume, quoteVolume]), [[1, 100], [1, 100], [1, 100], [0, 0], [1, 100]])
+  } finally { await f.close() }
+})
+
 test('durable versions survive restart and same-batch revisions are deterministic', async () => {
   const f = await fixture()
   let restarted: MarketStore | undefined

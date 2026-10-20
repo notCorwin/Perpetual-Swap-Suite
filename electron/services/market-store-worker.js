@@ -283,6 +283,7 @@ const commands = {
       const first = Math.floor(row.timestamp / CANDLE_INTERVALS[query.timeframe]) * CANDLE_INTERVALS[query.timeframe]
       const issue = reason => issues.push({ instrument: query.instrument, timeframe: query.timeframe, source: 'candles', from: first, through: first, reason, repairable: true })
       if (row.baseVolume == null) issue('missing-base-volume')
+      if (row.quoteVolume == null) issue('missing-quote-volume')
       if (row.timestamp !== first) issue('invalid-grid')
       if (['open','high','low','close'].some(field => !Number.isFinite(row[field]) || row[field] <= 0)
         || row.high < Math.max(row.open,row.close,row.low) || row.low > Math.min(row.open,row.close,row.high)) issue('invalid-ohlc')

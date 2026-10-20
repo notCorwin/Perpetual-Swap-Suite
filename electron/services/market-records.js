@@ -1,4 +1,7 @@
 export const CANDLE_INTERVALS = Object.freeze({ '5m': 300_000, '15m': 900_000, '1H': 3_600_000 })
+// A timestamp alone cannot prove usable source coverage after legacy imports.
+export const completePriceCandle = row => row?.confirmed === true
+  && [row.baseVolume, row.quoteVolume].every(value => typeof value === 'number' && Number.isFinite(value) && value >= 0)
 export const validInstrument = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._=-]*$/.test(value)
 export function validateQuery({ instrument, timeframe, from = 0, through = Number.MAX_SAFE_INTEGER, limit, order = 'asc' }) {
   if (!validInstrument(instrument)) throw new TypeError('Invalid market instrument.')

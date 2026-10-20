@@ -72,6 +72,8 @@ Select a contract and choose **5m**, **15m**, or **1h**. The default chart timef
 
 A normal viewport shows 96 candles, but any available prices can render immediately, including a new listing with fewer observations. OHLC, forming prices, OI, Taker, and recursive indicators have independent readiness. Missing or expired statistics leave gaps in their own panels; they do not hide prices, block history, or force the chart back to an older complete window. Stored data is labeled stale until current source observations and stream continuity establish freshness.
 
+Every requested price window checks its native timestamp grid and persisted base/quote volumes before becoming ready. A fresh forming quote cannot certify an older completed tail. Missing slots are repaired through the shared history planner, which reuses existing SQLite rows and retries the selected window; the status row identifies incomplete or stale price history while prices remain visible. Known listing boundaries permit shorter complete windows. Gap repairs invalidate downstream indicators, and the manual integrity audit also checks both volume units.
+
 Loading, incomplete history, and history boundary messages share a reserved status row above the plot. Source updates do not cover candles or change the plot's dimensions; truncated summaries retain their full text on hover and for assistive technology.
 
 Without candle inspection, the OI and Taker legends each show their latest valid observation in the visible range. An older observation includes its candle time as `as of`; Taker Buy and Sell always come from the same candle. Holding a candle shows only that candle's values, including `Unavailable` for missing statistics. Forming-candle gaps remain gaps in the plots.

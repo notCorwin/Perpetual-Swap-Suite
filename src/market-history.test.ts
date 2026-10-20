@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MarketHistory } from '../electron/services/market-history.js'
 import { MarketStore } from '../electron/services/market-store.js'
+import { PreparedChartPipeline } from '../electron/services/prepared-chart-service.js'
 import type { CandleRecord } from '../electron/services/market-store.js'
 import type { HistoryTask } from '../electron/services/history-sync.js'
 import type { AuditJob } from '../electron/services/data-audit.js'
@@ -65,6 +66,36 @@ test('native price coverage reuses durable rows and repairs only the missing slo
   assert.equal(calls.length, 1); assert.equal(calls[0].parameters.limit, 1)
   await history.ensurePrices(instId, '5m', base, base + 2 * step)
   assert.equal(calls.length, 1)
+})
+
+test('opening a chart repairs an outage through verified SQLite coverage and reuses it on reopening', async t => {
+  const now = Date.now(), through = Math.floor(now / step) * step - step
+  const canonical = Array.from({ length: 400 }, (_, index) => row(through - (399 - index) * step))
+  const gate = deferred()
+  const { history, store, calls } = await fixture(t, { now: () => now, listing: canonical[0].timestamp,
+    get: async (path, parameters, signal, priority) => {
+      if (path === '/market/history-candles') await gate.promise
+      return source(path, parameters, signal, priority)
+    } })
+  await store.appendCandles(canonical.slice(0, -12))
+  const pipeline: any = new PreparedChartPipeline({ store, history, normalize: value => value, revision: () => 0,
+    instrument: () => ({ listTime: canonical[0].timestamp }), streaming: () => true })
+  try {
+    await pipeline.setLive(instId, '5m', { ...row(through + step), confirmed: false }, { receivedAt: now })
+    const initial = await pipeline.local(instId, '5m')
+    assert.equal(initial.priceState, 'stale'); assert.equal(initial.realtimeState, 'live')
+    const repair = pipeline.refreshObservations(pipeline.state(instId, '5m'))
+    gate.resolve(); await repair
+    const inspection = await store.inspectCandles({ instrument: instId, timeframe: '5m', from: through - 95 * step, through })
+    assert.deepEqual(inspection.issues, []); assert.equal(inspection.checkedRows, 96)
+    const repaired = pipeline.cached(`${instId}:5m`)
+    assert.equal(repaired.priceState, 'ready'); assert.equal(repaired.endHour, through)
+    const priceCalls = () => calls.filter(call => call.path.includes('/market/'))
+    assert.equal(priceCalls().length, 1)
+    assert.equal(priceCalls()[0].parameters.limit, 12, 'The planner must reuse the persisted part of the 96-candle viewport.')
+    await pipeline.local(instId, '5m')
+    assert.equal(priceCalls().length, 1)
+  } finally { gate.resolve(); await pipeline.dispose() }
 })
 
 test('statistics persist without price rows or a price-source request', async t => {
