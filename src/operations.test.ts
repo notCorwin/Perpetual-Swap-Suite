@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
-import { attachOperationSink, attachOperationJournalSink, beginOperation, measureOperation, hookOperationMethods, getOperationContext,
+import { attachOperationSink, attachOperationJournalSink, beginOperation, measureOperation, recordOperation, hookOperationMethods, getOperationContext,
   runWithOperationContext, withOperationSuppressed, type OperationEvent, type OperationJournalEvent } from '../electron/services/operations.js'
 // @ts-expect-error Node-only JS intentionally stays outside the renderer API.
 import { databaseOperation, openRecordedDatabase } from '../electron/services/recorded-database.js'
@@ -128,6 +128,27 @@ test('terminal attribute ownership cannot mutate emitted starts or cause an ende
     assert.deepEqual(overrides, originalOverrides)
     assert.equal(journal[1].attributes?.rows, overrides ? undefined : 3)
   }
+})
+
+test('completed observations retain their original facts when a start observer mutates the caller input', t => {
+  const original = { category: 'cpu' as const, name: 'test.observation-snapshot', startedAt: 1000, durationMS: 12,
+    status: 'ok' as 'ok' | 'error', cpuTimeMS: 7, attributes: { rows: 3 } }
+  const events: OperationJournalEvent[] = []
+  t.after(attachOperationJournalSink(event => {
+    if (event.name !== original.name) return
+    events.push(event)
+    if (event.phase === 'start') {
+      original.status = 'error'; original.durationMS = 99; original.cpuTimeMS = 88
+      original.attributes.rows = 999
+      Object.assign(event.attributes!, { rows: 777, secret: 'observer-only' })
+    }
+  }))
+  recordOperation(original)
+  assert.equal(events.length, 2)
+  assert.equal(events[1].status, 'ok')
+  assert.equal(events[1].durationMS, 12)
+  assert.equal(events[1].cpuTimeMS, 7)
+  assert.deepEqual(events[1].attributes, { rows: 3 })
 })
 
 test('static method metadata owns its registration snapshot while each invocation owns mutable attributes and context', t => {

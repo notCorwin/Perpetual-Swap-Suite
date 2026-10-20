@@ -99,9 +99,12 @@ function complete(base, detail, durationMS = detail.durationMS) {
 }
 
 export function recordOperation(value) {
-  if (!hasOperationRecording() || isOperationSuppressed() || !categories.has(value.category) || !statuses.has(value.status)
-    || !Number.isFinite(value.startedAt) || !Number.isFinite(value.durationMS) || value.durationMS < 0) return
-  complete(start(value, value.startedAt), value)
+  if (!hasOperationRecording() || isOperationSuppressed() || !categories.has(value.category)) return
+  const { status, startedAt, durationMS, cpuTimeMS } = value
+  if (!statuses.has(status) || !Number.isFinite(startedAt) || !Number.isFinite(durationMS) || durationMS < 0) return
+  // A completed observation owns one validated snapshot. Start observers cannot
+  // revise its terminal facts by mutating the caller's input during publication.
+  complete(start(value, startedAt), { status, cpuTimeMS }, durationMS)
 }
 const noop = { context: {}, end() {}, run: operation => operation() }
 class LocalOperationSpan {
