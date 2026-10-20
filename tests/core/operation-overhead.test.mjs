@@ -113,6 +113,16 @@ test('matched margins accept a majority within budget even when the separate mod
     'Changing a ratio as well as its allowance must evaluate the full expression inside each pair.')
 })
 
+test('matched margins preserve inclusive decimal allowance boundaries without tolerating a larger value', () => {
+  const allowance = .1 + .2
+  const budget = { wallRatio: 0, wallExtraMS: .2, cpuRatio: 0, cpuExtraMS: .2,
+    peakRSSRatio: 0, peakRSSExtraBytes: .2 * 1024 }
+  assert.deepEqual(assessBudgets(pairedSummary([.1], [allowance]), { cpu: budget }), [])
+  const failures = assessBudgets(pairedSummary([.1], [allowance + Number.EPSILON]), { cpu: budget })
+  assert.deepEqual(failures.map(value => value.metric), ['wallMS', 'cpuMS', 'peakRSSBytes'])
+  assert.ok(failures.every(value => value.medianBudgetMargin > 0))
+})
+
 test('relative gates fail closed on absent, mismatched, duplicate or invalid raw paired operands', () => {
   const valid = () => pairedSummary([80, 90, 100, 110, 120], [100, 110, 120, 130, 140])
   const mutations = [

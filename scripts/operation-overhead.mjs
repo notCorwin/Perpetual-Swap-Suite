@@ -98,7 +98,7 @@ export function assessBudgets(summary, budgets=defaultBudgets) {
       }
       const margins = pairs.map(({ baseline, enabled }) => {
         const before = baseline.metrics[name][metric], after = enabled.metrics[name][metric]
-        return Number.isFinite(before) && before >= 0 && Number.isFinite(after) && after >= 0 ? after - before * (1 + ratio) - extra : NaN
+        return Number.isFinite(before) && before >= 0 && Number.isFinite(after) && after >= 0 ? after - (before * (1 + ratio) + extra) : NaN
       })
       if (!Number.isFinite(phase.baseline[metric]) || phase.baseline[metric] < 0 || !Number.isFinite(phase.enabled[metric]) || phase.enabled[metric] < 0 || !margins.every(Number.isFinite)) {
         failures.push({ phase: name, metric, method: relativeBudgetMethod, reason: 'missing-or-invalid-paired-measurement' }); continue
