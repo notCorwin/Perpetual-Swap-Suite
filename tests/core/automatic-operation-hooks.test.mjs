@@ -223,6 +223,14 @@ test('raw TCP and native WebSocket hooks retain receivers and injected adapter d
     import net from 'node:net';
     import { createHash } from 'node:crypto';
     import { recordedWebSocketFactory } from ${JSON.stringify(networkURL)};
+    import { getOperationContext, runWithOperationContext } from ${JSON.stringify(operationsURL)};
+    import { isOperationHookSuppressed, withOperationHookSuppressed } from ${JSON.stringify(hooksURL)};
+    const connectionContext = { traceId: 'socket-trace', parentId: 'socket-parent', scenarioId: 'socket-scenario' };
+    const applicationContext = { traceId: 'callback-trace', parentId: 'callback-parent', scenarioId: 'callback-scenario' };
+    const observerScopes = [];
+    const stopObserving = attachOperationSink(event => {
+      if (event.name === 'websocket.receive') observerScopes.push({ context: getOperationContext(), network: isOperationHookSuppressed('network') });
+    });
     const server = http.createServer((_request, response) => response.end('ok'));
     server.on('upgrade', (request, socket) => {
       const accept = createHash('sha1').update(request.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
@@ -244,17 +252,25 @@ test('raw TCP and native WebSocket hooks retain receivers and injected adapter d
     const origin = 'http://127.0.0.1:' + server.address().port;
     try {
       await new Promise((resolve, reject) => {
-        const socket = recordedWebSocketFactory(url => new WebSocket(url), 'fixture')(origin.replace('http:', 'ws:') + '/socket?credential=private');
+        const socket = runWithOperationContext(connectionContext, () => recordedWebSocketFactory(url => new WebSocket(url), 'fixture')(origin.replace('http:', 'ws:') + '/socket?credential=private'));
         assert.ok(socket instanceof WebSocket);
+        const beforeSuppressed = events.length;
+        withOperationSuppressed(() => socket.dispatchEvent(new MessageEvent('message', { data: 'suppressed' })));
+        assert.equal(events.length, beforeSuppressed, 'Observer context restoration preserves invocation-time recording suppression.');
         let fixtures = 0; const fixture = () => fixtures++;
         for (let index = 0; index < 2; index++) { socket.addEventListener('fixture', fixture, { once: true }); socket.dispatchEvent(new Event('fixture')); }
         socket.addEventListener('fixture', fixture); socket.removeEventListener('fixture', fixture); socket.dispatchEvent(new Event('fixture')); assert.equal(fixtures, 2);
         socket.addEventListener('open', () => socket.send('sensitive-payload'));
-        const message = event => {
+        const message = function (event) {
+          assert.equal(this, socket, 'Application property callbacks retain the native receiver.');
           assert.equal(event.data, 'ok');
+          assert.deepEqual(getOperationContext(), applicationContext);
+          assert.equal(isOperationHookSuppressed('network'), false, 'Application callbacks escape native network suppression.');
+          assert.equal(isOperationHookSuppressed('io'), true, 'Application callbacks restore unrelated registered hook scopes.');
           fetch(origin + '/after-message').then(response => response.text()).then(() => socket.close(), reject);
         };
-        socket.onmessage = message; assert.equal(socket.onmessage, message);
+        runWithOperationContext(applicationContext, () => withOperationHookSuppressed('io', () => { socket.onmessage = message; }));
+        assert.equal(socket.onmessage, message);
         socket.addEventListener('close', resolve, { once: true });
         socket.addEventListener('error', reject, { once: true });
       });
@@ -262,6 +278,11 @@ test('raw TCP and native WebSocket hooks retain receivers and injected adapter d
       assert.equal(events.filter(event => event.name === 'websocket.send').length, 1);
       assert.equal(events.filter(event => event.name === 'websocket.receive').length, 1);
       assert.equal(events.filter(event => event.name === 'fetch.request').length, 1, 'WebSocket callbacks restore application hook context.');
+      assert.deepEqual(observerScopes, [{ context: connectionContext, network: true }], 'Internal observers retain connection IDs and native transport scopes.');
+      for (const key of ['traceId', 'parentId', 'scenarioId']) {
+        assert.equal(events.find(event => event.name === 'websocket.receive')[key], connectionContext[key]);
+        assert.equal(events.find(event => event.name === 'fetch.request')[key], applicationContext[key]);
+      }
       const tcp = net.createServer(socket => { socket.on('data', () => {}); socket.end('fixture'); });
       await new Promise(resolve => tcp.listen(0, '127.0.0.1', resolve));
       await new Promise((resolve, reject) => {
@@ -275,10 +296,51 @@ test('raw TCP and native WebSocket hooks retain receivers and injected adapter d
       assert.ok(events.some(event => event.name === 'socket.receive' && event.attributes.bytes === 7));
       assert.doesNotMatch(JSON.stringify(events), /credential|sensitive-payload/);
     } finally { await new Promise(resolve => server.close(resolve)); }
-    unsubscribe(); console.log(JSON.stringify({ names: events.filter(event => event.category === 'network').map(event => event.name) }));
+    stopObserving(); unsubscribe(); console.log(JSON.stringify({ names: events.filter(event => event.category === 'network').map(event => event.name) }));
   `)
   assert.ok(result.names.includes('websocket.closed'))
   assert.ok(result.names.includes('socket.closed'))
+})
+
+test('injected WebSocket observers retain private connection IDs and live dispatch suppression', async () => {
+  const result = await execute(`
+    import { recordedWebSocketFactory } from ${JSON.stringify(networkURL)};
+    import { getOperationContext } from ${JSON.stringify(operationsURL)};
+    import { isOperationHookSuppressed, withOperationHookSuppressed } from ${JSON.stringify(hooksURL)};
+    class Socket extends EventTarget {
+      readyState = 1;
+      send() {}
+      close() { this.dispatchEvent(Object.assign(new Event('close'), { code: 1000, wasClean: true })); }
+    }
+    const registered = { traceId: 'connection-trace', parentId: 'connection-parent', scenarioId: 'connection-scenario', lane: 'registered' };
+    const expected = { traceId: registered.traceId, parentId: registered.parentId, scenarioId: registered.scenarioId };
+    const socket = context.run(registered, () => recordedWebSocketFactory(() => new Socket(), 'injected')('ws://127.0.0.1/feed'));
+    registered.traceId = 'mutated-trace'; registered.parentId = 'mutated-parent'; registered.scenarioId = 'mutated-scenario';
+    const observations = [];
+    const stop = attachOperationSink(event => {
+      if (event.name === 'websocket.receive') observations.push({ ids: getOperationContext(), lane: context.getStore().lane,
+        network: isOperationHookSuppressed('network'), io: isOperationHookSuppressed('io') });
+    });
+    const incoming = () => socket.dispatchEvent(new MessageEvent('message', { data: 'ok' }));
+    const foreign = { traceId: 'foreign-trace', parentId: 'foreign-parent', scenarioId: 'foreign-scenario', lane: 'dispatch' };
+    context.run(foreign, () => withOperationHookSuppressed('network', () => withOperationHookSuppressed('io', incoming)));
+    assert.deepEqual(observations, [{ ids: expected, lane: 'dispatch', network: true, io: true }]);
+    assert.deepEqual(foreign, { traceId: 'foreign-trace', parentId: 'foreign-parent', scenarioId: 'foreign-scenario', lane: 'dispatch' });
+    const beforeSuppressed = events.length;
+    context.run(foreign, () => withOperationSuppressed(incoming));
+    assert.equal(events.length, beforeSuppressed);
+    context.run(foreign, incoming);
+    assert.deepEqual(observations[1], { ids: expected, lane: 'dispatch', network: false, io: false });
+    assert.equal(events.filter(event => event.name === 'websocket.receive').length, 2);
+    socket.close();
+    const beforeRemoved = events.length;
+    incoming();
+    assert.equal(events.length, beforeRemoved, 'Close removes the exact owned observer identities.');
+    const closed = events.find(event => event.name === 'websocket.closed');
+    for (const key of ['traceId', 'parentId', 'scenarioId']) assert.equal(closed[key], expected[key]);
+    stop(); unsubscribe(); console.log(JSON.stringify({ observed: observations.length }));
+  `)
+  assert.equal(result.observed, 2)
 })
 
 

@@ -5,8 +5,8 @@ import { createConnection } from 'node:net'
 import { once } from 'node:events'
 import { stat } from 'node:fs/promises'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { installOperationHooks, installElectronOperationHooks, getOperationHookCapabilities, getInstalledOperationHooks } from '../../electron/services/operation-hooks.js'
-import { attachOperationSink, configureOperationContext, configureOperationPropagation, withOperationSuppressed } from '../../electron/services/operations.js'
+import { installOperationHooks, installElectronOperationHooks, getOperationHookCapabilities, getInstalledOperationHooks, isOperationHookSuppressed, withOperationHookSuppressed } from '../../electron/services/operation-hooks.js'
+import { attachOperationSink, configureOperationContext, configureOperationPropagation, getOperationContext, runWithOperationContext, withOperationSuppressed } from '../../electron/services/operations.js'
 import { initializeOperationRecording, closeOperationRecording } from '../../electron/services/operation-runtime.js'
 import { createNativeExchange } from './native-exchange.mjs'
 import { ownFixtureServer } from './fixture-server.mjs'
@@ -112,14 +112,35 @@ try {
   if (capabilities.find(value => value.api === 'electron.net.WebSocket')?.enabled) {
     phase('websocket')
     exchange = await withOperationSuppressed(() => createNativeExchange())
-    const socket = new net.WebSocket(exchange.environment.PERPETUAL_SWAP_E2E_WEBSOCKET_ORIGIN + '/ws/v5/public')
+    const connectionContext = { traceId: 'electron-socket-trace', parentId: 'electron-socket-parent', scenarioId: 'electron-socket-scenario' }
+    const applicationContext = { traceId: 'electron-callback-trace', parentId: 'electron-callback-parent', scenarioId: 'electron-callback-scenario' }
+    const socket = runWithOperationContext(connectionContext, () => new net.WebSocket(exchange.environment.PERPETUAL_SWAP_E2E_WEBSOCKET_ORIGIN + '/ws/v5/public'))
     assert.ok(socket instanceof originalSocket)
     await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, { once: true }); socket.addEventListener('error', reject, { once: true }) })
-    const messages = new Promise(resolve => socket.addEventListener('message', event => { if (JSON.parse(event.data).data) resolve() }))
+    const beforeCallbackDNS = events.filter(value => value.name === 'electron.net.resolveHost').length
+    const messages = runWithOperationContext(applicationContext, () => withOperationHookSuppressed('io', () => new Promise((resolve, reject) => {
+      const message = function (event) {
+        try {
+          if (!JSON.parse(event.data).data) return
+          socket.removeEventListener('message', message)
+          assert.equal(this, socket)
+          assert.deepEqual(getOperationContext(), applicationContext)
+          assert.equal(isOperationHookSuppressed('network'), false)
+          assert.equal(isOperationHookSuppressed('io'), true)
+          net.resolveHost('localhost').then(resolve, reject)
+        } catch (error) { reject(error) }
+      }
+      socket.addEventListener('message', message)
+    })))
     socket.send(JSON.stringify({ op: 'subscribe', args: [{ channel: 'tickers', instId: 'BTC-USDT-SWAP' }] }))
     await messages
     const closed = new Promise(resolve => socket.addEventListener('close', resolve, { once: true })); socket.close(); await closed
-    assert.ok(events.some(value => value.name === 'websocket.receive' && value.attributes.stream === 'electron-native' && value.attributes.source === 'native'))
+    const received = events.filter(value => value.name === 'websocket.receive' && value.attributes.stream === 'electron-native' && value.attributes.source === 'native')
+    assert.ok(received.length > 0)
+    for (const value of received) for (const key of ['traceId', 'parentId', 'scenarioId']) assert.equal(value[key], connectionContext[key])
+    assert.equal(events.filter(value => value.name === 'electron.net.resolveHost').length, beforeCallbackDNS + 1, 'WebSocket application callbacks retain nested native network operations.')
+    const resolved = events.filter(value => value.name === 'electron.net.resolveHost').at(-1)
+    for (const key of ['traceId', 'parentId', 'scenarioId']) assert.equal(resolved[key], applicationContext[key])
   }
   assert.doesNotMatch(JSON.stringify(events), /private-path|credential|private-no-outbound|secret/)
   phase('assertions-passed')

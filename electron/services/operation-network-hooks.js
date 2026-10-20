@@ -336,11 +336,11 @@ export function installElectronNetworkHooks({ app, net, session }, helpers = int
       const Wrapped = new Proxy(Socket, { construct(target, args, newTarget) {
         const construct = () => {
           assertSandboxURL(args[0])
-          const socket = suppress(() => Reflect.construct(target, args, newTarget === Wrapped ? target : newTarget))
-          integration.restoreEventTargetContexts(socket)
-          return socket
+          return suppress(() => Reflect.construct(target, args, newTarget === Wrapped ? target : newTarget))
         }
-        return suppressed() ? construct() : constructRecordedWebSocket(construct, args[0], { source: 'native', stream: 'electron-native' })
+        const socket = suppressed() ? construct() : constructRecordedWebSocket(construct, args[0], { source: 'native', stream: 'electron-native' })
+        integration.restoreEventTargetContexts(socket)
+        return socket
       } })
       Object.defineProperty(net, 'WebSocket', { configurable: true, writable: true, value: Wrapped })
       electronSocketConstructors.add(Wrapped)

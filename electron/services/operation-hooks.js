@@ -578,15 +578,18 @@ function installWebSocket() {
     const construct = () => {
       assertSandboxURL(args[0])
       const socket = withOperationHookSuppressed('network', () => Reflect.construct(target, args, newTarget === HookedSocket ? target : newTarget))
-      restoreEventTargetContexts(socket)
       for (const method of ['send', 'close']) {
         const original = socket[method]
         socket[method] = function (...values) { return withOperationHookSuppressed('network', () => Reflect.apply(original, this, values)) }
       }
       return socket
     }
-    if (isOperationHookSuppressed('network')) return construct()
-    return constructRecordedWebSocket(construct, args[0], { source: 'native', stream: 'native' })
+    const socket = isOperationHookSuppressed('network') ? construct()
+      : constructRecordedWebSocket(construct, args[0], { source: 'native', stream: 'native' })
+    // Recorder listeners keep transport scopes; later application listeners
+    // restore the complete context in which the application registered them.
+    restoreEventTargetContexts(socket)
+    return socket
   } })
   socketConstructors.add(HookedSocket)
   globalThis.WebSocket = HookedSocket

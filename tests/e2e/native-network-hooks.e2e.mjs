@@ -5,10 +5,11 @@ import { fileURLToPath } from 'node:url'
 import { mkdtemp, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createRequire } from 'node:module'
 import { registerOperationParticipant } from '../../electron/services/operation-runtime.js'
 
 test('real Electron after-ready hooks cover Chromium fetch/session/request/resolver and native WebSocket without windows', { timeout:20000 }, async () => {
-  const executable=fileURLToPath(new URL('../../node_modules/electron/dist/Electron.app/Contents/MacOS/Electron',import.meta.url))
+  const executable=createRequire(import.meta.url)('electron')
   const fixture=fileURLToPath(new URL('../helpers/electron-network-hooks.mjs',import.meta.url))
   // Chromium owns its profile until the actual child and its stdio close.
   // Deleting it inside the running fixture races network-service writes.
