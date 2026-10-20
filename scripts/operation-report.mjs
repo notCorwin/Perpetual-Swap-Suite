@@ -270,7 +270,7 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
     diagnostics.files++
     const storedBytes = (await stat(file)).size
     storage.storedBytes += storedBytes
-    storage[file.endsWith('.gz') ? 'compressedFiles' : 'plainFiles']++
+    storage[file.endsWith('.jsonl') ? 'plainFiles' : 'compressedFiles']++
     const active = new Map(), recentlyEnded = new Set()
     let fileExecutionId = operationJournalExecutionId(basename(file)), rawCount = 0, endCount = 0, previousSequence = 0, decodedBytes = 0
     const consume = (buffer, line) => {
