@@ -255,9 +255,42 @@ export async function runOverhead({output, repeats=5, cycles=20, contracts=130, 
   const summary={schemaVersion:2,revision:git.stdout.trim(),sourceHashes:hashes,harnessHashes:harness,storage,runtime,host:{cpu:cpus()[0]?.model,cpuCount:cpus().length,before:hostBefore,after:{loadAverage:loadavg(),freeMemoryBytes:freemem()}},parameters:{repeats,cycles,contracts,warmup,renderer,profile,inputCadenceMS:100,businessClock:'fixed midperiod epoch plus monotonic elapsed time',journalAttribution:'Phase bytes are decoded logical JSONL; stored disk bytes are measured for each complete execution including warmup.'},...summarizePairs(runs),budgets,runs}
   summary.failures=assessBudgets(summary,budgets)
   await writeFile(join(directory,'report.json'),JSON.stringify(summary,null,2)+'\n')
+  // Preserve the gated trials first. Profiles are a separate diagnostic pair:
+  // their extra inspector cost cannot replace a failed sample or change its gate.
+  if (!profile && summary.failures.some(failure => failure.phase === 'nativeMarket')) {
+    summary.failureProfiles = { purpose: 'diagnostic-only; original trials and failures remain authoritative', status: 'collecting', runs: [] }
+    try {
+      for (const enabled of [false, true]) {
+        const label = `diagnostic-native-${enabled ? 'enabled' : 'baseline'}`
+        const parameters = { directory: join(directory, label), trial: label, cycles, contracts, warmup, epoch, profile: true }
+        await mkdir(parameters.directory, { recursive: true })
+        process.stderr.write(`Operation overhead diagnostic: ${label}\n`)
+        const result = await child(join(here, 'operation-overhead-workload.mjs'), parameters, enabled, false)
+        assertMeasuredRuntime(result.runtime, runtime.backend)
+        assert.deepEqual(result.business, runs.find(run => !run.desktop).business, 'Diagnostic workloads must preserve the gated business result.')
+        const recording = await journal(join(parameters.directory, 'operations'), result.metrics)
+        if (enabled) {
+          const { summarizeOperations, operationReportHasFailures } = await import(pathToFileURL(join(root, 'scripts/operation-report.mjs')).href)
+          const report = await summarizeOperations(join(parameters.directory, 'operations'))
+          assert.equal(operationReportHasFailures(report), false, 'Failure profiling must not lose journal coverage.')
+        }
+        const diagnostic = { enabled, ...result, journal: recording, profile: join(parameters.directory, 'native-market.cpuprofile') }
+        await writeFile(join(parameters.directory, 'result.json'), JSON.stringify(diagnostic, null, 2) + '\n')
+        summary.failureProfiles.runs.push(diagnostic)
+      }
+      assert.deepEqual(await sourceHashes(), hashes, 'Sources changed during failure profiling.')
+      assert.deepEqual(await harnessHashes(), harness, 'Harness changed during failure profiling.')
+      summary.failureProfiles.status = 'complete'
+    } catch (error) {
+      summary.failureProfiles.status = 'failed'
+      summary.failureProfiles.error = error.stack ?? String(error)
+      process.stderr.write(`Operation overhead diagnostic failed: ${error.message}\n`)
+    }
+    await writeFile(join(directory, 'report.json'), JSON.stringify(summary, null, 2) + '\n')
+  }
   const rows=Object.entries(summary.phases).map(([phase,value])=>`| ${phase} | ${value.baseline.wallMS.toFixed(2)} | ${value.enabled.wallMS.toFixed(2)} | ${value.baseline.cpuMS.toFixed(2)} | ${value.enabled.cpuMS.toFixed(2)} | ${value.enabled.eventLoopP99MS?.toFixed(2)??'—'} | ${value.enabled.journalOperations} | ${(value.enabled.logicalBytes/1048576).toFixed(2)} |`)
   const stored = Object.entries(storage).map(([name, value]) => `${name}: ${(value.journalBytes / 1048576).toFixed(2)} MiB on disk / ${(value.logicalBytes / 1048576).toFixed(2)} MiB decoded; ${value.bytesPerOperation.toFixed(1)} stored bytes per operation.`).join('\n\n')
-  const runtimeDescription = `Driver: Node ${runtime.driver.node}, V8 ${runtime.driver.v8}. The driver runtime is not the measured backend. Backend: Electron ${runtime.backend.electron}, Node ${runtime.backend.node}, V8 ${runtime.backend.v8}, ${runtime.backend.mode}; executable: ${runtime.backend.executable}. Each recorded backend worker's own health verifies the same Node/V8/Electron build.\n\n` + (runtime.renderer ? `Renderer: Electron ${runtime.renderer.electron}, Node ${runtime.renderer.node}, V8 ${runtime.renderer.v8}; executable: ${runtime.renderer.executable}.\n\n` : '')
+  const runtimeDescription = `Driver: Node ${runtime.driver.node}, V8 ${runtime.driver.v8}. The driver runtime is not the measured backend. Backend: Electron ${runtime.backend.electron}, Node ${runtime.backend.node}, V8 ${runtime.backend.v8}, ${runtime.backend.mode}; executable: ${runtime.backend.executable}. Each recorded backend worker's own health verifies the same Node/V8/Electron build.\n\n` + (runtime.renderer ? `Renderer: Electron ${runtime.renderer.electron}, Node ${runtime.renderer.node}, V8 ${runtime.renderer.v8}; executable: ${runtime.renderer.executable}.\n\n` : '') + (summary.failureProfiles ? `Native-market failure profiles: ${summary.failureProfiles.status}. The separate diagnostic-only baseline/recorded pair cannot replace the original trials or change their failures. See report.json and diagnostic-native-*/native-market.cpuprofile.\n\n` : '')
   await writeFile(join(directory,'report.md'),`# Operation recording overhead\n\n${runtimeDescription}Revision: ${summary.revision}. ${repeats} alternating baseline/enabled pairs after ${warmup} warmup rounds. Exact business results match in every pair. Baseline and recorded columns show each group's median; relative CPU, wall and memory gates compare those group medians. Added CPU and wall costs are medians of matched-pair differences. Per-message and per-operation added CPU divide each pair's difference by its own measured count before taking the median. Phase CPU is whole-process usage inside its window, including worker threads, V8/libuv and possibly earlier journal drain; normalization does not claim exclusive operation CPU. Complete raw trials, source hashes and configured budgets are in report.json.\n\n| Workload | Baseline wall ms | Recorded wall ms | Baseline CPU ms | Recorded CPU ms | Recorded event-loop p99 ms | Operations | Logical MiB |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n${rows.join('\n')}\n\n${stored}\n\nStored bytes include startup and warmup. Per-phase bytes describe decoded JSONL and are not attributed physical disk bytes. Business time starts in the same simulated native period for every child and advances monotonically; performance and operation clocks remain real.\n\n${summary.rendererAcknowledgment?`Renderer durable ACKs: median ${summary.rendererAcknowledgment.medianMS.toFixed(2)} ms; p95 ${summary.rendererAcknowledgment.p95MS.toFixed(2)} ms; maximum ${summary.rendererAcknowledgment.maxMS.toFixed(2)} ms.\n\n`:''}Budget failures: ${summary.failures.length}.\n`)
   return {directory,...summary}
 }

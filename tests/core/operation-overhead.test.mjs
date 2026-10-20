@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { spawn } from 'node:child_process'
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { median, assessBudgets, summarizePairs, overheadLaunch, assertMeasuredRuntime } from '../../scripts/operation-overhead.mjs'
+import { median, assessBudgets, summarizePairs, overheadLaunch, assertMeasuredRuntime, runOverhead, defaultBudgets } from '../../scripts/operation-overhead.mjs'
 
 test('runtime resolution uses the official Electron package export without assuming path.txt already exists', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'electron-package-export-'))
@@ -133,4 +133,28 @@ test('small-sample CPU allowance uses paired added CPU rather than independent m
   assert.equal(assessBudgets(summary, budget)[0].metric, 'extraCPUPerMessageMS')
   delete summary.phases.nativeMarket.enabled.extraCPUMS
   assert.equal(assessBudgets(summary, budget)[0].reason, 'missing-or-invalid-paired-measurement')
+})
+
+test('a failed native budget retains its original trials and collects separate actual-runtime CPU profiles', { timeout: 60_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'failed-native-overhead-'))
+  try {
+    const budgets = { ...defaultBudgets, nativeMarket: { ...defaultBudgets.nativeMarket, wallMS: 0 } }
+    const report = await runOverhead({ output: directory, repeats: 2, cycles: 1, contracts: 1, warmup: 1, renderer: false, budgets })
+    assert.ok(report.failures.some(failure => failure.phase === 'nativeMarket' && failure.metric === 'wallMS'))
+    assert.deepEqual(report.failures, assessBudgets(report, budgets))
+    assert.equal(report.runs.length, 4, 'Diagnostic runs cannot enter gated medians.')
+    assert.equal(report.parameters.profile, false, 'Original trials must keep their unprofiled configuration.')
+    assert.equal(report.failureProfiles.status, 'complete', report.failureProfiles.error)
+    assert.deepEqual(report.failureProfiles.runs.map(run => run.enabled), [false, true])
+    for (const run of report.failureProfiles.runs) {
+      assertMeasuredRuntime(run.runtime, report.runtime.backend)
+      assert.deepEqual(run.business, report.runs[0].business)
+      const profile = JSON.parse(await readFile(run.profile, 'utf8'))
+      assert.ok(profile.nodes.length > 0 && profile.samples.length > 0, 'The actual backend must produce CPU samples.')
+    }
+    const saved = JSON.parse(await readFile(join(directory, 'report.json'), 'utf8'))
+    assert.deepEqual(saved.failures, report.failures)
+    assert.equal(saved.runs.length, 4)
+    assert.equal(saved.failureProfiles.runs.length, 2)
+  } finally { await rm(directory, { recursive: true, force: true }) }
 })
