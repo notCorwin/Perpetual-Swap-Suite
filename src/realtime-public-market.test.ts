@@ -143,6 +143,45 @@ test('order book snapshots replace all levels; updates insert, replace, delete a
   assert.equal(f.market.getTelemetry().bookEvents, 4)
   assert.equal(f.market.getState().updatedAt, f.clock.time)
   assert.equal(f.books[0].bids[0][1], '1', 'later updates cannot mutate prior callback snapshots')
+  assert.equal(f.books[1].asks[1], f.books[0].asks[0], 'Unchanged levels retain their immutable resident value.')
+  assert.notEqual(f.books[1].bids[0], f.books[0].bids[1], 'A changed level has a new value and preserves the prior snapshot.')
+  assert.notEqual(f.books[2].bids, f.books[1].bids, 'Each callback owns its side arrays.')
+  assert.ok(f.books[2].bids.every((value, index) => value === f.books[1].bids[index]), 'Keepalive snapshots reuse every unchanged level.')
+})
+
+test('shared book levels reject mutations and isolate raw inputs and prior snapshots', async t => {
+  const f = fixture()
+  t.after(() => f.market.close())
+  await f.open()
+  // Supply raw decoded levels directly to verify ownership at reconstruction,
+  // independently of the transport's earlier JSON parsing copy.
+  type Reconstructor = { connection: unknown; updateBook(connection: unknown, instId: string, action: string, raw: ReturnType<typeof book>): PublicMarketBook }
+  const shard = (f.market as unknown as { shards: Reconstructor[] }).shards[0]
+  const raw = book(1)
+  const first = shard.updateBook(shard.connection, btc, 'snapshot', raw)
+  assert.notEqual(first.bids[0], raw.bids[0])
+  assert.equal(Object.isFrozen(raw.bids[0]), false, 'Installing a level must not freeze caller-owned input.')
+  raw.bids[0][1] = '77'
+  raw.asks[0][0] = '777'
+  const changed = level(100, 8)
+  const second = shard.updateBook(shard.connection, btc, 'update', book(2, 1, [changed], []))
+  changed[1] = '88'
+  assert.deepEqual(first.bids, [level(100), level(99)])
+  assert.deepEqual(second.bids, [level(100, 8), level(99)])
+  assert.deepEqual(second.asks, [level(101), level(102)])
+  assert.notEqual(second.bids[0], first.bids[0])
+  assert.equal(second.bids[1], first.bids[1])
+  assert.equal(second.asks[0], first.asks[0])
+  for (const snapshot of [first, second]) for (const side of [snapshot.bids, snapshot.asks]) for (const value of side) {
+    assert.equal(Object.isFrozen(value), true)
+    assert.throws(() => Object.assign(value, { 1: '999' }), TypeError)
+  }
+  first.bids.splice(0)
+  second.asks[0] = level(999)
+  const third = shard.updateBook(shard.connection, btc, 'update', book(2, 2, [], []))
+  assert.deepEqual(third.bids, [level(100, 8), level(99)])
+  assert.deepEqual(third.asks, [level(101), level(102)])
+  assert.equal(third.bids[0], second.bids[0], 'A rejected consumer mutation cannot corrupt resident state.')
 })
 
 test('book depth stays at 400 levels and equivalent numeric price spellings replace the same level', async t => {

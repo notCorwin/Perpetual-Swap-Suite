@@ -401,7 +401,9 @@ class PublicMarketConnection {
           // Map replacement/deletion preserves the established price order.
           // Only a new numeric price can change priority or exceed the depth.
           if (!book[side].has(price)) reorder = true
-          book[side].set(price, [...level])
+          // Published snapshots share resident levels. Install an immutable
+          // copy so neither raw inputs nor a consumer can alter their values.
+          book[side].set(price, Object.freeze([...level]))
         }
       }
       if (reorder) {
@@ -411,7 +413,7 @@ class PublicMarketConnection {
     }
     book.seqId = seqId
     this.books.set(instId, book)
-    return { bids: [...book.bids.values()].map(level => [...level]), asks: [...book.asks.values()].map(level => [...level]), ts: raw.ts, seqId }
+    return { bids: [...book.bids.values()], asks: [...book.asks.values()], ts: raw.ts, seqId }
   }
 
   lost(connection, message, error) {
