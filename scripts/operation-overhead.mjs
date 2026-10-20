@@ -30,6 +30,33 @@ export const defaultBudgets = {
   storage: { bytesPerOperation: 128 },
 }
 const phaseBudgetMetrics = new Set(['wallRatio', 'wallExtraMS', 'cpuRatio', 'cpuExtraMS', 'peakRSSRatio', 'peakRSSExtraBytes', 'wallMS', 'eventLoopP99MS', 'extraCPUPerMessageMS', 'extraCPUPerOperationMS', 'logicalBytesPerMessage'])
+const rendererPhases = new Set(['renderer', 'rendererDrain', 'rendererEndToEnd'])
+const relativeBudgetMethod = 'median-matched-budget-margin'
+function pairedWorkload(runs, phase, repeats) {
+  assert.ok(Array.isArray(runs) && runs.length > 0, `Missing paired workload trials: ${phase}`)
+  for (const run of runs) {
+    assert.ok(typeof run.desktop === 'boolean' && typeof run.enabled === 'boolean', `Invalid paired execution mode: ${phase}`)
+    if (run.metrics?.[phase]) assert.equal(run.desktop, rendererPhases.has(phase), `Unmatched paired execution mode: ${phase}`)
+  }
+  const selected = runs.filter(run => run.desktop === rendererPhases.has(phase)), byPair = new Map()
+  assert.ok(selected.length > 0, `Missing paired workload trials: ${phase}`)
+  for (const run of selected) {
+    assert.ok(run.metrics?.[phase], `Missing paired workload measurement: ${phase}`)
+    for (const metric of ['wallMS', 'cpuMS']) assert.ok(Number.isFinite(run.metrics[phase][metric]) && run.metrics[phase][metric] >= 0, `Invalid ${phase}.${metric}`)
+    for (const [metric, value] of Object.entries(run.metrics[phase])) assert.ok(Number.isFinite(value), `Invalid ${phase}.${metric}`)
+    assert.ok(Number.isInteger(run.trial) && run.trial >= 0, `Invalid paired trial: ${phase}`)
+    const pair = byPair.get(run.trial) ?? {}, mode = run.enabled ? 'enabled' : 'baseline'
+    assert.equal(pair[mode], undefined, `Duplicate paired workload: ${phase}/${run.trial}/${mode}`)
+    pair[mode] = run; byPair.set(run.trial, pair)
+  }
+  const pairs = [...byPair.values()]
+  for (const pair of pairs) assert.ok(pair.baseline && pair.enabled, `Unpaired workload: ${phase}`)
+  if (repeats !== undefined) {
+    assert.ok(Number.isInteger(repeats) && repeats > 0 && pairs.length === repeats, `Missing paired workload trials: ${phase}`)
+    for (let trial = 0; trial < repeats; trial++) assert.ok(byPair.has(trial), `Missing paired trial: ${phase}/${trial}`)
+  }
+  return pairs
+}
 function validateBudgets(budgets) {
   if (!budgets || typeof budgets !== 'object' || Array.isArray(budgets)) throw new TypeError('Performance budgets must be an object.')
   for (const [name, budget] of Object.entries(budgets)) {
@@ -59,13 +86,26 @@ export function assessBudgets(summary, budgets=defaultBudgets) {
       }
     }
     if (invalid) continue
-    for(const [metric,ratio,extra] of [['wallMS',budget.wallRatio,budget.wallExtraMS],['cpuMS',budget.cpuRatio,budget.cpuExtraMS],['peakRSSBytes',budget.peakRSSRatio,budget.peakRSSExtraBytes]]){
+    let pairs, pairError
+    if (['wallRatio', 'cpuRatio', 'peakRSSRatio'].some(metric => budget[metric] !== undefined)) {
+      try { pairs = pairedWorkload(summary.runs, name, summary.parameters?.repeats) }
+      catch (error) { pairError = error.message }
+    }
+    for(const [metric,ratio,extra=0] of [['wallMS',budget.wallRatio,budget.wallExtraMS],['cpuMS',budget.cpuRatio,budget.cpuExtraMS],['peakRSSBytes',budget.peakRSSRatio,budget.peakRSSExtraBytes]]){
       if(ratio===undefined)continue
-      if (!Number.isFinite(phase.baseline[metric]) || !Number.isFinite(phase.enabled[metric])) {
-        failures.push({ phase: name, metric, reason: 'missing-or-invalid-measurement' }); continue
+      if (pairError) {
+        failures.push({ phase: name, metric, method: relativeBudgetMethod, reason: 'missing-or-invalid-paired-measurement', detail: pairError }); continue
       }
-      const allowed=phase.baseline[metric]*(1+ratio)+(extra??0)
-      if(phase.enabled[metric]>allowed)failures.push({phase:name,metric,actual:phase.enabled[metric],limit:allowed})
+      const margins = pairs.map(({ baseline, enabled }) => {
+        const before = baseline.metrics[name][metric], after = enabled.metrics[name][metric]
+        return Number.isFinite(before) && before >= 0 && Number.isFinite(after) && after >= 0 ? after - before * (1 + ratio) - extra : NaN
+      })
+      if (!Number.isFinite(phase.baseline[metric]) || phase.baseline[metric] < 0 || !Number.isFinite(phase.enabled[metric]) || phase.enabled[metric] < 0 || !margins.every(Number.isFinite)) {
+        failures.push({ phase: name, metric, method: relativeBudgetMethod, reason: 'missing-or-invalid-paired-measurement' }); continue
+      }
+      const medianBudgetMargin = median(margins)
+      if (medianBudgetMargin > 0) failures.push({ phase: name, metric, method: relativeBudgetMethod, medianBudgetMargin, allowedMargin: 0, ratio, extraAllowance: extra,
+        descriptiveMedians: { baseline: phase.baseline[metric], enabled: phase.enabled[metric] } })
     }
     if (budget.extraCPUPerOperationMS !== undefined && (!Number.isFinite(phase.enabled.journalOperations) || phase.enabled.journalOperations <= 0)) {
       failures.push({ phase: name, metric: 'journalOperations', reason: 'missing-or-invalid-measurement' })
@@ -148,22 +188,8 @@ async function child(script, parameters, enabled, desktop){
 export function summarizePairs(runs){
   const phases={}
   for(const phase of new Set(runs.flatMap(run=>Object.keys(run.metrics)))){
-    const groups={baseline:runs.filter(run=>!run.enabled&&run.metrics[phase]),enabled:runs.filter(run=>run.enabled&&run.metrics[phase])}
-    assert.ok(groups.baseline.length>0&&groups.baseline.length===groups.enabled.length,`Unpaired workload: ${phase}`)
-    for (const run of [...groups.baseline, ...groups.enabled]) {
-      for (const metric of ['wallMS', 'cpuMS']) assert.ok(Number.isFinite(run.metrics[phase][metric]) && run.metrics[phase][metric] >= 0, `Invalid ${phase}.${metric}`)
-      for (const [metric, value] of Object.entries(run.metrics[phase])) assert.ok(Number.isFinite(value), `Invalid ${phase}.${metric}`)
-    }
-    const byPair = new Map()
-    for (const run of [...groups.baseline, ...groups.enabled]) {
-      assert.ok(Number.isInteger(run.trial) && run.trial >= 0, `Invalid paired trial: ${phase}`)
-      const key = `${run.trial}:${Boolean(run.desktop)}`, pair = byPair.get(key) ?? {}
-      const mode = run.enabled ? 'enabled' : 'baseline'
-      assert.equal(pair[mode], undefined, `Duplicate paired workload: ${phase}/${key}/${mode}`)
-      pair[mode] = run; byPair.set(key, pair)
-    }
-    const pairs = [...byPair.values()]
-    for (const pair of pairs) assert.ok(pair.baseline && pair.enabled, `Unpaired workload: ${phase}`)
+    const pairs = pairedWorkload(runs, phase)
+    const groups={baseline:pairs.map(pair=>pair.baseline),enabled:pairs.map(pair=>pair.enabled)}
     const metrics=new Set(Object.values(groups).flatMap(values=>values.flatMap(run=>Object.keys(run.metrics[phase]))))
     metrics.delete('startedAt');metrics.delete('endedAt')
     phases[phase]=Object.fromEntries(Object.entries(groups).map(([name,values])=>[name,Object.fromEntries([...metrics].map(metric=>[metric,median(values.map(run=>run.metrics[phase][metric]??0))]))]))
@@ -252,7 +278,7 @@ export async function runOverhead({output, repeats=5, cycles=20, contracts=130, 
   const runtime = { driver: { node: process.version, v8: process.versions.v8, executable: process.execPath, platform: process.platform, arch: process.arch },
     backend: runs.find(run => !run.desktop).runtime, ...(renderer ? { renderer: runs.find(run => run.desktop).runtime } : {}) }
   for (const run of runs) assertMeasuredRuntime(run.runtime, run.desktop ? runtime.renderer : runtime.backend)
-  const summary={schemaVersion:2,revision:git.stdout.trim(),sourceHashes:hashes,harnessHashes:harness,storage,runtime,host:{cpu:cpus()[0]?.model,cpuCount:cpus().length,before:hostBefore,after:{loadAverage:loadavg(),freeMemoryBytes:freemem()}},parameters:{repeats,cycles,contracts,warmup,renderer,profile,inputCadenceMS:100,businessClock:'fixed midperiod epoch plus monotonic elapsed time',journalAttribution:'Phase bytes are decoded logical JSONL; stored disk bytes are measured for each complete execution including warmup.'},...summarizePairs(runs),budgets,runs}
+  const summary={schemaVersion:3,estimators:{relativeBudgets:relativeBudgetMethod},revision:git.stdout.trim(),sourceHashes:hashes,harnessHashes:harness,storage,runtime,host:{cpu:cpus()[0]?.model,cpuCount:cpus().length,before:hostBefore,after:{loadAverage:loadavg(),freeMemoryBytes:freemem()}},parameters:{repeats,cycles,contracts,warmup,renderer,profile,inputCadenceMS:100,businessClock:'fixed midperiod epoch plus monotonic elapsed time',journalAttribution:'Phase bytes are decoded logical JSONL; stored disk bytes are measured for each complete execution including warmup.'},...summarizePairs(runs),budgets,runs}
   summary.failures=assessBudgets(summary,budgets)
   await writeFile(join(directory,'report.json'),JSON.stringify(summary,null,2)+'\n')
   // Preserve the gated trials first. Profiles are a separate diagnostic pair:
@@ -291,7 +317,7 @@ export async function runOverhead({output, repeats=5, cycles=20, contracts=130, 
   const rows=Object.entries(summary.phases).map(([phase,value])=>`| ${phase} | ${value.baseline.wallMS.toFixed(2)} | ${value.enabled.wallMS.toFixed(2)} | ${value.baseline.cpuMS.toFixed(2)} | ${value.enabled.cpuMS.toFixed(2)} | ${value.enabled.eventLoopP99MS?.toFixed(2)??'—'} | ${value.enabled.journalOperations} | ${(value.enabled.logicalBytes/1048576).toFixed(2)} |`)
   const stored = Object.entries(storage).map(([name, value]) => `${name}: ${(value.journalBytes / 1048576).toFixed(2)} MiB on disk / ${(value.logicalBytes / 1048576).toFixed(2)} MiB decoded; ${value.bytesPerOperation.toFixed(1)} stored bytes per operation.`).join('\n\n')
   const runtimeDescription = `Driver: Node ${runtime.driver.node}, V8 ${runtime.driver.v8}. The driver runtime is not the measured backend. Backend: Electron ${runtime.backend.electron}, Node ${runtime.backend.node}, V8 ${runtime.backend.v8}, ${runtime.backend.mode}; executable: ${runtime.backend.executable}. Each recorded backend worker's own health verifies the same Node/V8/Electron build.\n\n` + (runtime.renderer ? `Renderer: Electron ${runtime.renderer.electron}, Node ${runtime.renderer.node}, V8 ${runtime.renderer.v8}; executable: ${runtime.renderer.executable}.\n\n` : '') + (summary.failureProfiles ? `Native-market failure profiles: ${summary.failureProfiles.status}. The separate diagnostic-only baseline/recorded pair cannot replace the original trials or change their failures. See report.json and diagnostic-native-*/native-market.cpuprofile.\n\n` : '')
-  await writeFile(join(directory,'report.md'),`# Operation recording overhead\n\n${runtimeDescription}Revision: ${summary.revision}. ${repeats} alternating baseline/enabled pairs after ${warmup} warmup rounds. Exact business results match in every pair. Baseline and recorded columns show each group's median; relative CPU, wall and memory gates compare those group medians. Added CPU and wall costs are medians of matched-pair differences. Per-message and per-operation added CPU divide each pair's difference by its own measured count before taking the median. Phase CPU is whole-process usage inside its window, including worker threads, V8/libuv and possibly earlier journal drain; normalization does not claim exclusive operation CPU. Complete raw trials, source hashes and configured budgets are in report.json.\n\n| Workload | Baseline wall ms | Recorded wall ms | Baseline CPU ms | Recorded CPU ms | Recorded event-loop p99 ms | Operations | Logical MiB |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n${rows.join('\n')}\n\n${stored}\n\nStored bytes include startup and warmup. Per-phase bytes describe decoded JSONL and are not attributed physical disk bytes. Business time starts in the same simulated native period for every child and advances monotonically; performance and operation clocks remain real.\n\n${summary.rendererAcknowledgment?`Renderer durable ACKs: median ${summary.rendererAcknowledgment.medianMS.toFixed(2)} ms; p95 ${summary.rendererAcknowledgment.p95MS.toFixed(2)} ms; maximum ${summary.rendererAcknowledgment.maxMS.toFixed(2)} ms.\n\n`:''}Budget failures: ${summary.failures.length}.\n`)
+  await writeFile(join(directory,'report.md'),`# Operation recording overhead\n\n${runtimeDescription}Revision: ${summary.revision}. ${repeats} alternating baseline/enabled pairs after ${warmup} warmup rounds. Exact business results match in every pair. Baseline and recorded columns show each group's descriptive median. Relative CPU, wall and memory gates instead evaluate the full matched margin for every trial: recorded - baseline * (1 + ratio) - absolute allowance. A positive median margin fails; zero passes. The retained raw trials are required to recompute margins for caller-supplied budgets. This estimator corrects the paired comparison and does not establish a performance improvement. Added CPU and wall costs are medians of matched-pair differences. Per-message and per-operation added CPU divide each pair's difference by its own measured count before taking the median. Phase CPU is whole-process usage inside its window, including worker threads, V8/libuv and possibly earlier journal drain; normalization does not claim exclusive operation CPU. Complete raw trials, source hashes and configured budgets are in report.json.\n\n| Workload | Baseline wall ms | Recorded wall ms | Baseline CPU ms | Recorded CPU ms | Recorded event-loop p99 ms | Operations | Logical MiB |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n${rows.join('\n')}\n\n${stored}\n\nStored bytes include startup and warmup. Per-phase bytes describe decoded JSONL and are not attributed physical disk bytes. Business time starts in the same simulated native period for every child and advances monotonically; performance and operation clocks remain real.\n\n${summary.rendererAcknowledgment?`Renderer durable ACKs: median ${summary.rendererAcknowledgment.medianMS.toFixed(2)} ms; p95 ${summary.rendererAcknowledgment.p95MS.toFixed(2)} ms; maximum ${summary.rendererAcknowledgment.maxMS.toFixed(2)} ms.\n\n`:''}Budget failures: ${summary.failures.length}.\n`)
   return {directory,...summary}
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){
