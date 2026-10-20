@@ -69,7 +69,7 @@ function recordWebSocket(socket, url, suppliedAttributes, pendingConnect) {
     // Native observers retain connection IDs without restoring application hook
     // scopes. Suppression belongs to the execution delivering each event.
     const resumeObserver = captureOperationContext()
-    const observe = listener => function (...args) { return resumeObserver(() => Reflect.apply(listener, this, args)) }
+    const observe = listener => event => resumeObserver(() => listener(event))
     const listeners = {
       open: observe(() => { connected = true; finishConnect('ok') }),
       message: observe(event => record('websocket.receive', { bytes: networkByteLength(event.data) })),
