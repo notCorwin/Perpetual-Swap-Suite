@@ -1,4 +1,5 @@
 import { createReadStream } from 'node:fs'
+import { Buffer } from 'node:buffer'
 import { brotliCompressSync, brotliDecompressSync, crc32, createGunzip, constants } from 'node:zlib'
 import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'

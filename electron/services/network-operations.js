@@ -1,4 +1,5 @@
 import { beginOperation, captureOperationContext, recordOperation } from './operations.js'
+import { Buffer } from 'node:buffer'
 
 let nextConnection = 0
 const recordedSockets = new WeakMap()
