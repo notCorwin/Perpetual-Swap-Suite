@@ -1,5 +1,7 @@
 // Browser-safe operation identity and lifecycle. Node installs async context
 // propagation; browser callbacks use the same API for synchronous scopes.
+const { performance } = globalThis
+const timeOrigin = performance.timeOrigin
 const sinks = new Set(), journalSinks = new Set(), active = new Set(), imports = new Map()
 let operationSequence = 0, journalSequence = 0
 let identity = { sessionId: 'unattached', executionId: `renderer-${globalThis.crypto?.randomUUID?.() ?? performance.timeOrigin}` }
@@ -80,7 +82,7 @@ function localEvent(base, phase, durationMS, status, eventAttributes, cpuTimeMS)
     phase, sequence: ++journalSequence, durationMS, status, attributes: eventAttributes, cpuTimeMS }
   publish(event); return event
 }
-function start(specification, startedAt = performance.timeOrigin + performance.now()) {
+function start(specification, startedAt = timeOrigin + performance.now()) {
   const context = current(), id = `${identity.executionId}:${++operationSequence}`, normalized = normalizedSpecifications.has(specification)
   const base = { schemaVersion: 2, sessionId: identity.sessionId, executionId: identity.executionId,
     id, traceId: context.traceId || id, parentId: context.parentId || undefined, scenarioId: context.scenarioId || identity.scenarioId,
@@ -140,7 +142,7 @@ class LocalOperationSpan {
 }
 export function beginOperation(specification) {
   if (!hasOperationRecording() || isOperationSuppressed() || !categories.has(specification.category)) return noop
-  const started = performance.now(), span = new LocalOperationSpan(start(specification, performance.timeOrigin + started), started)
+  const started = performance.now(), span = new LocalOperationSpan(start(specification, timeOrigin + started), started)
   active.add(span); return span
 }
 

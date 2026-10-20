@@ -2,6 +2,7 @@ import { mkdirSync, openSync, readFileSync, writeFileSync, writeSync, write, clo
 import { join, basename, dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { Buffer } from 'node:buffer'
+import process from 'node:process'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { threadId, workerData } from 'node:worker_threads'
 import { installSandboxNetworkBoundary } from './sandbox-network.js'
