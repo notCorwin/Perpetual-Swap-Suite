@@ -1,7 +1,20 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { spawn } from 'node:child_process'
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { median, assessBudgets, summarizePairs, overheadLaunch, assertMeasuredRuntime } from '../../scripts/operation-overhead.mjs'
+
+test('runtime resolution uses the official Electron package export without assuming path.txt already exists', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'electron-package-export-'))
+  try {
+    const dependency = join(directory, 'node_modules', 'electron')
+    await mkdir(dependency, { recursive: true })
+    await writeFile(join(dependency, 'index.js'), 'module.exports = "/prepared-by-electron/embedded-runtime"')
+    assert.equal(overheadLaunch({ directory }).executable, '/prepared-by-electron/embedded-runtime')
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
 
 test('backend measurements and their worker use the real Electron embedded Node/V8 without creating an app window', { timeout: 10_000 }, async () => {
   const launch = overheadLaunch({ environment: { ...process.env, NODE_OPTIONS: '' } })

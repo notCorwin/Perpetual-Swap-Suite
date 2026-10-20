@@ -102,6 +102,10 @@ export async function runSandbox({ mode = 'core', args = [], output, allowNetwor
   const coverage = sandboxCoverage(mode, { allowEmpty, requireCategories, requireRoles, graphicsPolicy, graphicsProvider })
   if (typeof scenario !== 'string' || !scenario || scenario.length > 160) throw new Error('Scenario must be a nonempty label of at most 160 characters.')
   const commands = await sandboxCommands(mode, args)
+  // Electron's official package export prepares its binary on a clean install.
+  // Resolve this test dependency before entering the offline recording sandbox;
+  // resolving a binary does not launch an application or create a window.
+  if (mode !== 'command') await import('electron')
   const id = `${new Date().toISOString().replaceAll(':', '').replaceAll('.', '')}-${randomUUID().slice(0, 8)}`
   const directory = output ? resolve(output, id) : join(projectRoot, '.build/sandbox', id)
   const operations = join(directory, 'operations'), temporary = join(directory, 'tmp'), userData = join(directory, 'user-data')

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
+import { createRequire } from 'node:module'
 import { mkdir, readFile, readdir, writeFile, stat } from 'node:fs/promises'
 import { createInterface } from 'node:readline'
 import { join, resolve } from 'node:path'
@@ -117,7 +117,7 @@ async function journal(directory, phases){
   return result
 }
 export function overheadLaunch({ directory = root, desktop = false, environment = process.env } = {}) {
-  const executable = join(directory, 'node_modules/electron/dist', readFileSync(join(directory, 'node_modules/electron/path.txt'), 'utf8').trim())
+  const executable = createRequire(join(directory, 'package.json'))('electron')
   const env = { ...environment }
   if (desktop) delete env.ELECTRON_RUN_AS_NODE
   else env.ELECTRON_RUN_AS_NODE = '1'
