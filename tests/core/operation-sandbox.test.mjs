@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 import { gzipSync } from 'node:zlib'
+import { encodeOperationJournal, operationJournalSuffix } from '../../electron/services/operation-journal.js'
 import { operationReportHasFailures, operationReportMarkdown, summarizeOperations } from '../../scripts/operation-report.mjs'
 import { sandboxCommands, sandboxCoverage } from '../../scripts/test-sandbox.mjs'
 
@@ -333,7 +334,7 @@ test('a closed journal cannot claim complete recording before its admitted entri
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
-test('reports stream lossless gzip members and reject a torn or corrupt compressed journal', async () => {
+test('reports retain legacy gzip members and reject a torn or corrupt compressed journal', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'operation-report-gzip-'))
   try {
     await recording(directory, [event()])
@@ -353,5 +354,31 @@ test('reports stream lossless gzip members and reject a torn or corrupt compress
     const corrupt = Buffer.from(compressed); corrupt[corrupt.length - 8] ^= 1
     await writeFile(join(directory, 'execution.jsonl.gz'), corrupt)
     assert.equal((await summarizeOperations(directory)).diagnostics.journalReadFailures, 1)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('reports stream framed journals and surface corruption or torn final batches', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'operation-report-framed-'))
+  try {
+    await recording(directory, [event()])
+    const raw = await readFile(join(directory, 'execution.jsonl'))
+    const split = raw.indexOf(10) + 1
+    const compressed = Buffer.concat([encodeOperationJournal(raw.subarray(0, split)), encodeOperationJournal(raw.subarray(split))])
+    await rm(join(directory, 'execution.jsonl'))
+    const file = join(directory, `execution${operationJournalSuffix}`)
+    await writeFile(file, compressed)
+    const complete = await summarizeOperations(directory)
+    assert.equal(complete.totals.count, 1)
+    assert.equal(complete.journalRecords, 2)
+    assert.equal(operationReportHasFailures(complete), false)
+    await writeFile(file, compressed.subarray(0, compressed.length - 1))
+    const torn = await summarizeOperations(directory)
+    assert.equal(torn.diagnostics.journalReadFailures, 1)
+    assert.equal(operationReportHasFailures(torn), true)
+    const corrupt = Buffer.from(compressed); corrupt[Math.floor(corrupt.length / 2)] ^= 1
+    await writeFile(file, corrupt)
+    const damaged = await summarizeOperations(directory)
+    assert.equal(damaged.diagnostics.journalReadFailures, 1)
+    assert.equal(operationReportHasFailures(damaged), true)
   } finally { await rm(directory, { recursive: true, force: true }) }
 })

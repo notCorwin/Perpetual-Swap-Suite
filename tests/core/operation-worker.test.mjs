@@ -5,10 +5,11 @@ import { spawnSync } from 'node:child_process'
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createInterface } from 'node:readline'
 import { stopOperationWorker } from '../../electron/services/operation-worker.js'
 import { attachOperationSink } from '../../electron/services/operations.js'
 import { PreparedChartPipeline } from '../../electron/services/prepared-chart-service.js'
-import { gunzipSync } from 'node:zlib'
+import { isOperationJournal, readOperationJournal } from '../../electron/services/operation-journal.js'
 
 test('worker shutdown persists its final calculation before acknowledging and terminating', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'perp-operation-worker-'))
@@ -32,7 +33,10 @@ test('worker shutdown persists its final calculation before acknowledging and te
     assert.equal(health.pending, 0)
     assert.ok(health.recorded >= 6)
     assert.equal(health.persisted, health.recorded)
-    const events = gunzipSync(await readFile(join(directory, files.find(file => file.endsWith('.jsonl.gz'))))).toString('utf8').trim().split('\n').map(line => JSON.parse(line))
+    const events = []
+    const lines = createInterface({ input: readOperationJournal(join(directory, files.find(isOperationJournal))), crlfDelay: Infinity })
+    for await (const line of lines) if (line) events.push(JSON.parse(line))
+    assert.equal(events.length, health.recorded, 'The shared decoder must retain every admitted worker record.')
     const replay = events.find(event => event.name === 'indicators.replay' && event.phase === 'end')
     assert.equal(replay.attributes.candles, 220)
     assert.equal(replay.schemaVersion, 2)

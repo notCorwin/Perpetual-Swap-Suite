@@ -4,7 +4,7 @@ import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { gunzipSync } from 'node:zlib'
+import { isOperationJournal, operationJournalExecutionId, readOperationJournal } from '../../electron/services/operation-journal.js'
 
 const runtime = new URL('../../electron/services/operation-runtime.js', import.meta.url).href
 const operations = new URL('../../electron/services/operations.js', import.meta.url).href
@@ -22,13 +22,15 @@ async function execute(directory, source, environment = {}) {
     child.once('error', reject)
     child.once('close', (code, signal) => code === 0 ? resolve() : reject(new Error(`Recorder child failed (${code ?? signal}): ${diagnostics}`)))
   })
-  const files = (await readdir(directory)).filter(file => file.endsWith('.jsonl.gz'))
+  const files = (await readdir(directory)).filter(isOperationJournal)
   return Promise.all(files.map(async file => {
-    const decoded = gunzipSync(await readFile(join(directory, file)))
+    const chunks = []
+    for await (const chunk of readOperationJournal(join(directory, file))) chunks.push(chunk)
+    const decoded = Buffer.concat(chunks)
     return {
       decoded,
       events: decoded.toString('utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)),
-      health: JSON.parse(await readFile(join(directory, file.replace(/\.jsonl\.gz$/, '.health.json')), 'utf8')),
+      health: JSON.parse(await readFile(join(directory, `${operationJournalExecutionId(file)}.health.json`), 'utf8')),
     }
   }))
 }
@@ -118,6 +120,84 @@ test('reentrant observations preserve sequence order when serialization crosses 
     assert.equal(health.failed, 0)
     assert.equal(health.recorded, events.length)
     assert.equal(health.durableRecords, events.length)
+    const { summarizeOperations, operationReportHasFailures } = await import('../../scripts/operation-report.mjs')
+    assert.equal(operationReportHasFailures(await summarizeOperations(directory)), false)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('later sequences admitted before an interrupted observation wait for its contiguous prefix', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-operation-runtime-before-admission-'))
+  try {
+    const recordings = await execute(directory, `
+      import assert from 'node:assert/strict';
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      const { measureOperation } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording(), writer = recording.writers.get(recording.executionId), enqueue = writer.enqueue;
+      const flushes = [];
+      let interrupted = false;
+      writer.enqueue = entry => {
+        if (!interrupted && entry.name === 'runtime.before-admission' && entry.phase === 'end') {
+          interrupted = true;
+          for (let count = 0; count < 200; count++) measureOperation({ category: 'cpu', name: 'runtime.admitted-first', resource: '界'.repeat(256), attributes: { count } }, () => {});
+          flushes.push(recording.flush());
+        }
+        return enqueue(entry);
+      };
+      measureOperation({ category: 'cpu', name: 'runtime.before-admission' }, () => {});
+      assert.equal(interrupted, true);
+      await Promise.all(flushes);
+      await recording.close();
+    `)
+    const { events, decoded, health } = recordings[0]
+    assert.deepEqual(events.map(event => event.sequence), Array.from({ length: events.length }, (_, index) => index + 1))
+    assert.deepEqual(events.filter(event => event.name === 'runtime.admitted-first' && event.phase === 'end').map(event => event.attributes.count), Array.from({ length: 200 }, (_, index) => index))
+    assert.equal(decoded.toString('utf8'), `${events.map(event => JSON.stringify(event)).join('\n')}\n`, 'No reserved slot can become a blank JSONL line.')
+    assert.equal(health.recorded, events.length)
+    assert.equal(health.durableRecords, events.length)
+    const { summarizeOperations, operationReportHasFailures } = await import('../../scripts/operation-report.mjs')
+    assert.equal(operationReportHasFailures(await summarizeOperations(directory)), false)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('independent observations arriving during batch encoding are retained in the next complete batch', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-operation-runtime-encoding-reentry-'))
+  try {
+    const recordings = await execute(directory, `
+      import assert from 'node:assert/strict';
+      import zlib from 'node:zlib';
+      import { AsyncResource } from 'node:async_hooks';
+      import { syncBuiltinESMExports } from 'node:module';
+      let armed = false, interrupted = false, measureOperation;
+      const independent = new AsyncResource('independent-operation-observer');
+      for (const key of ['gzipSync', 'brotliCompressSync']) {
+        const original = zlib[key];
+        zlib[key] = (...args) => {
+          if (armed) {
+            armed = false; interrupted = true;
+            independent.runInAsyncScope(() => {
+              for (let count = 0; count < 200; count++) measureOperation({ category: 'cpu', name: 'runtime.during-encoding', resource: '界'.repeat(256), attributes: { count } }, () => {});
+            });
+          }
+          return original(...args);
+        };
+      }
+      syncBuiltinESMExports();
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      ({ measureOperation } = await import(${JSON.stringify(operations)}));
+      const recording = initializeOperationRecording();
+      armed = true;
+      for (let count = 0; count < 200; count++) measureOperation({ category: 'cpu', name: 'runtime.before-encoding', resource: '界'.repeat(256), attributes: { count } }, () => {});
+      await recording.close();
+      independent.emitDestroy();
+      assert.equal(interrupted, true);
+    `)
+    const { events, decoded, health } = recordings[0]
+    for (const name of ['runtime.before-encoding', 'runtime.during-encoding']) assert.deepEqual(events.filter(event => event.name === name && event.phase === 'end').map(event => event.attributes.count), Array.from({ length: 200 }, (_, index) => index))
+    assert.deepEqual(events.map(event => event.sequence), Array.from({ length: events.length }, (_, index) => index + 1))
+    assert.equal(health.recorded, events.length)
+    assert.equal(health.persisted, events.length)
+    assert.equal(health.uncompressedBytes, decoded.length)
+    assert.equal(health.failed, 0)
     const { summarizeOperations, operationReportHasFailures } = await import('../../scripts/operation-report.mjs')
     assert.equal(operationReportHasFailures(await summarizeOperations(directory)), false)
   } finally { await rm(directory, { recursive: true, force: true }) }

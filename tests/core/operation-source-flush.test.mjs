@@ -7,6 +7,7 @@ import { join } from 'node:path'
 
 const runtime = new URL('../../electron/services/operation-runtime.js', import.meta.url).href
 const operations = new URL('../../electron/services/operations.js', import.meta.url).href
+const journal = new URL('../../electron/services/operation-journal.js', import.meta.url).href
 
 test('renderer source flush durably stores its exact journal without synchronizing another dirty writer', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'perp-targeted-operation-flush-'))
@@ -15,13 +16,14 @@ test('renderer source flush durably stores its exact journal without synchronizi
       import assert from 'node:assert/strict';
       import fs from 'node:fs';
       import { syncBuiltinESMExports } from 'node:module';
+      import { isOperationJournal } from ${JSON.stringify(journal)};
       const opened = new Map(), open = fs.openSync, sync = fs.fdatasync;
       let forbiddenExecution, syncing = [];
       fs.openSync = function(path, ...args) { const fd = open.call(this, path, ...args); opened.set(fd, String(path)); return fd; };
       fs.fdatasync = (fd, callback) => {
         const path = opened.get(fd) ?? '';
         syncing.push(path);
-        if (forbiddenExecution && path.includes(forbiddenExecution) && /\\.jsonl(?:\\.gz)?$/.test(path)) {
+        if (forbiddenExecution && path.includes(forbiddenExecution) && isOperationJournal(path)) {
           callback(new Error('An unrelated dirty journal was synchronized.')); return;
         }
         sync(fd, callback);

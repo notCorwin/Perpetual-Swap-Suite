@@ -49,12 +49,13 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
   const counts = { recorded: 0, persisted: 0, durableRecords: 0, uncompressedBytes: 0, journalBytes: prefix.length,
     failed: 0, recordedOperations: 0, startedOperations: 0, sourceFailures: 0, omittedRecords: 0 }
   let lastDurableAt = null
-  let queue = [], bytes = 0, position = prefix.length, timer, writing, accepting = true, closed = false, closing, flushBarrier = Promise.resolve(), lastHealthState
-  let serializing = 0, serializationBarrier, finishSerialization
+  const queue = new Map()
+  let nextSequence = 1, bytes = 0, position = prefix.length, timer, writing, accepting = true, closed = false, closing, flushBarrier = Promise.resolve(), lastHealthState
+  let serializing = 0, building = false, draining = 0, serializationBarrier, finishSerialization
   const health = () => ({ schemaVersion: 2, ...counts, pending: counts.recorded - counts.persisted,
     activeOperations: counts.startedOperations - counts.recordedOperations, executionId, sessionId, participantId: participant.id,
     role: participant.role, closed, enabledHooks: typeof hooks === 'function' ? hooks() : hooks,
-    hookCapabilities: capabilities(), encoding: 'gzip-members-level1',
+    hookCapabilities: capabilities(), encoding: 'brotli-frames-q0-crc32-v1',
     durability: 'fdatasync-on-flush-and-5s-checkpoint', updatedAt: Date.now(), lastDurableAt,
     runtime: { node: process.version, electron: process.versions.electron ?? null, v8: process.versions.v8 } })
   const failed = error => { counts.failed++; suppress(() => console.error(`Operation journal failed (${error.code ?? error.name}).`)) }
@@ -71,18 +72,45 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
     flushBarrier = task.catch(() => {})
     return task
   }
+  const releaseAdmission = () => {
+    if (serializing || building || draining) return
+    const completed = finishSerialization
+    finishSerialization = undefined; serializationBarrier = undefined
+    completed?.()
+  }
   const take = () => {
     clearTimeout(timer); timer = undefined
-    if (serializing || !queue.length) return { count: 0, buffer: Buffer.alloc(0), offset: position }
-    const raw = Buffer.from(`${queue.join('\n')}\n`), buffer = encodeOperationJournal(raw)
-    const batch = { count: queue.length, buffer, offset: position }
-    counts.uncompressedBytes += raw.length; counts.journalBytes += buffer.length
-    queue = []; bytes = 0; position += batch.buffer.length; return batch
+    if (serializing || building || queue.get(nextSequence) === undefined) return { count: 0, buffer: Buffer.alloc(0), offset: position }
+    building = true
+    try {
+      const lines = []
+      let through = nextSequence
+      while (queue.has(through) && queue.get(through) !== undefined) {
+        const line = queue.get(through++)
+        // A failed serialization owns its sequence but contributes no fake line.
+        if (line !== null) lines.push(line)
+      }
+      const raw = lines.length ? Buffer.from(`${lines.join('\n')}\n`) : Buffer.alloc(0)
+      const buffer = lines.length ? encodeOperationJournal(raw) : Buffer.alloc(0)
+      const batch = { count: lines.length, buffer, offset: position }
+      // New observations may arrive during encoding. Remove only this complete
+      // prefix; absolute sequence keys keep their later admissions independent.
+      for (let sequence = nextSequence; sequence < through; sequence++) queue.delete(sequence)
+      nextSequence = through; bytes -= raw.length
+      counts.uncompressedBytes += raw.length; counts.journalBytes += buffer.length
+      position += buffer.length; return batch
+    } finally { building = false; releaseAdmission() }
+  }
+  const scheduleWrite = () => {
+    if (serializing || building || draining || !queue.size || closed) return
+    if (bytes >= 256 * 1024 && queue.get(nextSequence) !== undefined) pressureWrite()
+    else if (!timer && !writing) { timer = setTimeout(startWrite, 250); timer.unref() }
   }
   const pressureWrite = () => suppress(() => {
-    const { count, buffer, offset } = take()
-    if (!count) return
+    draining++
     try {
+      const { count, buffer, offset } = take()
+      if (!count) return
       let written = 0
       while (written < buffer.length) {
         const size = writeSync(descriptor, buffer, written, buffer.length - written, offset + written)
@@ -91,32 +119,38 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
       }
       counts.persisted += count
     } catch (error) { failed(error) }
+    finally { draining--; try { scheduleWrite() } finally { releaseAdmission() } }
   })
   const startWrite = () => suppress(() => {
     if (writing) return writing
-    const { count, buffer, offset } = take()
-    if (!count) return Promise.resolve()
-    // Reserved offsets keep old async and newer pressure batches disjoint.
-    writing = (async () => {
-      let written = 0
-      while (written < buffer.length) {
-        const size = await new Promise((resolve, reject) => write(descriptor, buffer, written, buffer.length - written, offset + written,
-          (error, size) => error ? reject(error) : resolve(size)))
-        if (!size) throw new Error('Operation journal write made no progress.')
-        written += size
-      }
-      counts.persisted += count
-    })().catch(failed).finally(() => {
-      writing = undefined
-      if (queue.length && !closed && !timer) { timer = setTimeout(startWrite, 250); timer.unref() }
-    })
-    return writing
+    draining++
+    try {
+      const { count, buffer, offset } = take()
+      if (!count) return Promise.resolve()
+      // Reserved offsets keep old async and newer pressure batches disjoint.
+      writing = (async () => {
+        let written = 0
+        while (written < buffer.length) {
+          const size = await new Promise((resolve, reject) => write(descriptor, buffer, written, buffer.length - written, offset + written,
+            (error, size) => error ? reject(error) : resolve(size)))
+          if (!size) throw new Error('Operation journal write made no progress.')
+          written += size
+        }
+        counts.persisted += count
+      })().catch(failed).finally(() => {
+        writing = undefined
+        scheduleWrite()
+      })
+      return writing
+    } finally { draining--; try { scheduleWrite() } finally { releaseAdmission() } }
   })
   const flush = ({ durable = true } = {}) => {
     const target = counts.recorded
     return serializeFlush(() => suppress(async () => {
-      if (serializing) await (serializationBarrier ??= new Promise(resolve => { finishSerialization = resolve }))
-      do { await startWrite() } while (counts.persisted < target && (writing || queue.length))
+      do {
+        if (serializing || building || draining || queue.size && queue.get(nextSequence) === undefined) await (serializationBarrier ??= new Promise(resolve => { finishSerialization = resolve }))
+        await startWrite()
+      } while (counts.persisted < target && (writing || queue.size))
       if (writing) await writing
       if (durable && !closed && counts.durableRecords < target) {
         try {
@@ -131,30 +165,29 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
   }
   const enqueue = entry => {
     if (!accepting) {
-      counts.sourceFailures++; counts.omittedRecords++; writeHealth()
+      counts.sourceFailures++; counts.omittedRecords++
+      if (!closed && entry.sequence >= nextSequence && !queue.has(entry.sequence)) queue.set(entry.sequence, null)
+      finishSerialization?.(); serializationBarrier = undefined; finishSerialization = undefined
+      writeHealth()
       throw new Error('A closing or closed operation journal cannot accept records.')
     }
-    // Serialization may be interrupted by reentrant native/CDP callbacks. Own
-    // the admission position first; only complete immutable lines may drain.
-    const index = queue.length, terminal = Number(entry.phase === 'end'), started = Number(entry.phase === 'start')
-    queue.push(undefined); serializing++
+    // A native/CDP interrupt can publish a later sequence before this function
+    // even starts. The producer's absolute sequence owns its immutable line.
+    serializing++
+    const sequence = entry.sequence, terminal = Number(entry.phase === 'end'), started = Number(entry.phase === 'start')
+    queue.set(sequence, undefined)
     counts.recorded++; counts.recordedOperations += terminal; counts.startedOperations += started
     try {
       const line = JSON.stringify(entry), length = Buffer.byteLength(line) + 1
-      queue[index] = line; bytes += length
+      queue.set(sequence, line); bytes += length
     } catch (error) {
-      queue.splice(index, 1)
+      queue.set(sequence, null)
       counts.recorded--; counts.recordedOperations -= terminal; counts.startedOperations -= started
       counts.sourceFailures++; counts.omittedRecords++; failed(error)
       throw error
     } finally {
       if (--serializing === 0) {
-        const completed = finishSerialization
-        finishSerialization = undefined; serializationBarrier = undefined
-        try {
-          if (bytes >= 256 * 1024) pressureWrite()
-          else if (queue.length && !timer && !writing) { timer = setTimeout(startWrite, 250); timer.unref() }
-        } finally { completed?.() }
+        try { scheduleWrite() } finally { releaseAdmission() }
       }
     }
   }
@@ -170,7 +203,7 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
       closing = (async () => {
         try {
           await flush()
-          while (queue.length || writing) await flush()
+          while (queue.size || writing) await flush()
         } finally {
           // Explicit renderer ACKs may be flushing concurrently with shutdown.
           // Queue descriptor closure behind every previously admitted fdatasync;

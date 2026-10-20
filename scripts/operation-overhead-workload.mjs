@@ -12,6 +12,7 @@ import { createMemorySampler } from './operation-overhead-memory.mjs'
 const root = resolve(process.env.PERPETUAL_SWAP_OVERHEAD_ROOT ?? new URL('../', import.meta.url).pathname)
 const moduleAt = path => import(pathToFileURL(join(root, path)).href)
 const { closeOperationRecording, flushOperationRecording } = await moduleAt('electron/services/operation-runtime.js')
+const { isOperationJournal } = await moduleAt('electron/services/operation-journal.js')
 const { buildIndicatorSeries } = await moduleAt('electron/services/indicators.js')
 const { MarketStore } = await moduleAt('electron/services/market-store.js')
 const { MarketService } = await moduleAt('electron/services/market-service.js')
@@ -165,7 +166,7 @@ try {
   return business
   })
   let journalBytes = 0
-  if (process.env.PERPETUAL_SWAP_OPERATION_DIR) for (const file of await readdir(process.env.PERPETUAL_SWAP_OPERATION_DIR)) if (/\.jsonl(?:\.gz)?$/.test(file)) journalBytes += (await stat(join(process.env.PERPETUAL_SWAP_OPERATION_DIR, file))).size
+  if (process.env.PERPETUAL_SWAP_OPERATION_DIR) for (const file of await readdir(process.env.PERPETUAL_SWAP_OPERATION_DIR)) if (isOperationJournal(file)) journalBytes += (await stat(join(process.env.PERPETUAL_SWAP_OPERATION_DIR, file))).size
   const runtime = { mode: process.versions.electron && process.env.ELECTRON_RUN_AS_NODE === '1' ? 'electron-as-node' : 'node',
     node: process.version, v8: process.versions.v8, electron: process.versions.electron ?? null, executable: process.execPath }
   console.log(JSON.stringify({ business, metrics, journalBytes, runtime, parameters: { contracts: config.contracts, cycles: config.cycles, warmup: config.warmup, bookLevels: 400, nativeTransport: 'WebSocket', database: 'SQLite WAL workers',businessClock: 'fixed midperiod epoch plus monotonic elapsed time',warmupDrainMS:300,memorySampling:memorySampler.snapshot() } }))

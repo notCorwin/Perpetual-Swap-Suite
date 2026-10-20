@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto'
 import { mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join, relative } from 'node:path'
-import { gzipSync } from 'node:zlib'
+import { encodeOperationJournal, operationJournalSuffix } from '../../electron/services/operation-journal.js'
 import { inspectGraphicsTrace } from '../../electron/services/graphics-trace.js'
 import { operationReportHasFailures, summarizeOperations } from '../../scripts/operation-report.mjs'
 
@@ -28,8 +28,8 @@ async function journalFixture(t) {
       return [{ ...event, phase: 'start', sequence: index * 2 + 1, durationMS: 0, status: 'running' },
         { ...event, phase: 'end', sequence: index * 2 + 2 }]
     })
-    const raw = Buffer.from(lifecycle.map(event => JSON.stringify(event)).join('\n') + '\n'), stored = gzipSync(raw)
-    await writeFile(join(directory, `${executionId}.jsonl.gz`), stored)
+    const raw = Buffer.from(lifecycle.map(event => JSON.stringify(event)).join('\n') + '\n'), stored = encodeOperationJournal(raw)
+    await writeFile(join(directory, `${executionId}${operationJournalSuffix}`), stored)
     await json(healthFile(executionId), { schemaVersion: 2, executionId, sessionId, participantId: `participant-${executionId}`, role,
       recorded: lifecycle.length, recordedOperations: records.length, persisted: lifecycle.length, durableRecords: lifecycle.length,
       failed: 0, pending: 0, sourceFailures: 0, omittedRecords: 0, activeOperations: 0, closed: true,

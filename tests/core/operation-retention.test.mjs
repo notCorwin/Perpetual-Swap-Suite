@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, mkdir, readFile, readdir, writeFile, rm, symlink, stat, utimes } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, writeFile, rm, symlink, stat, utimes, rename } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createOperationSession, enforceOperationRetention, DEFAULT_OPERATION_RETENTION } from '../../electron/services/operation-retention.js'
+import { gzipSync } from 'node:zlib'
+import { encodeOperationJournal, operationJournalSuffix } from '../../electron/services/operation-journal.js'
 
 const now = 1_800_000_000_000, day = 86_400_000
 const dead = () => false
@@ -45,6 +47,24 @@ test('retention expires closed legacy sessions whole by age then capacity, retai
   const persisted = JSON.parse(await readFile(join(root, 'retention.json'), 'utf8'))
   assert.equal(persisted.state, 'over-budget')
   assert.equal(persisted.pruned[0].id, recent)
+})
+
+test('whole-session retention recognizes closed current journals and both legacy encodings', async t => {
+  const root = await temporary(t), ids = []
+  const formats = [['.jsonl', value => value], ['.jsonl.gz', gzipSync], [operationJournalSuffix, encodeOperationJournal]]
+  for (const [index, [suffix, encode]] of formats.entries()) {
+    const id = `${now - day}-${765432 + index}`, directory = join(root, id)
+    const { executionId } = await fixture(directory, { pid: 765432 + index, health: { durableRecords: 2 }, at: now - day })
+    const plain = join(directory, `${executionId}.jsonl`), file = join(directory, `${executionId}${suffix}`)
+    const stored = encode(await readFile(plain))
+    if (file !== plain) await rename(plain, file)
+    await writeFile(file, stored)
+    ids.push(id)
+  }
+  const result = await enforceOperationRetention(root, { now: () => now, maxBytes: 0, isProcessAlive: dead })
+  assert.deepEqual(result.pruned.map(value => value.id).sort(), ids.sort())
+  assert.deepEqual(result.failures, [])
+  for (const id of ids) assert.equal(await exists(join(root, id)), false)
 })
 
 test('leases preserve active and crashed sessions and surface protected over-budget data', async t => {
