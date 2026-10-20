@@ -131,15 +131,20 @@ test('terminal attribute ownership cannot mutate emitted starts or cause an ende
 })
 
 test('completed observations retain their original facts when a start observer mutates the caller input', t => {
-  const original = { category: 'cpu' as const, name: 'test.observation-snapshot', startedAt: 1000, durationMS: 12,
+  const name = 'test.observation-snapshot'
+  const original = { category: 'cpu' as const, name, resource: 'original-resource', startedAt: 1000, durationMS: 12,
     status: 'ok' as 'ok' | 'error', cpuTimeMS: 7, attributes: { rows: 3 } }
   const events: OperationJournalEvent[] = []
+  let initial!: OperationJournalEvent
   t.after(attachOperationJournalSink(event => {
-    if (event.name !== original.name) return
+    if (event.name !== name) return
     events.push(event)
     if (event.phase === 'start') {
+      initial = structuredClone(event)
       original.status = 'error'; original.durationMS = 99; original.cpuTimeMS = 88
+      Object.assign(original, { category: 'network', name: 'changed-input', resource: 'changed-input', startedAt: 9999 })
       original.attributes.rows = 999
+      Object.assign(event, { id: 'changed-start', traceId: 'changed-trace', parentId: 'changed-parent', scenarioId: 'changed-scenario', name: 'changed-start', resource: 'changed-start' })
       Object.assign(event.attributes!, { rows: 777, secret: 'observer-only' })
     }
   }))
@@ -149,6 +154,57 @@ test('completed observations retain their original facts when a start observer m
   assert.equal(events[1].durationMS, 12)
   assert.equal(events[1].cpuTimeMS, 7)
   assert.deepEqual(events[1].attributes, { rows: 3 })
+  for (const key of ['id', 'traceId', 'parentId', 'scenarioId', 'category', 'name', 'resource', 'startedAt'] as const) assert.equal(events[1][key], initial[key])
+})
+
+test('completed observations preserve canonical event keys and JSON bytes during reentrant publication', t => {
+  const journal: OperationJournalEvent[] = []
+  const outer = { category: 'network' as const, name: 'test.observation-order.outer', resource: '界"\\\n😀',
+    startedAt: 1234.5, durationMS: 12.25, status: 'cancelled' as const, cpuTimeMS: 7.5, attributes: { rows: 1, reason: 'value"\\\n\0界😀\ud800' } }
+  const inner = { category: 'cpu' as const, name: 'test.observation-order.inner', startedAt: 1235,
+    durationMS: 0, status: 'ok' as const, attributes: { count: 2 } }
+  t.after(attachOperationJournalSink(event => {
+    if (!event.name.startsWith('test.observation-order.')) return
+    journal.push(event)
+    if (event.name === outer.name && event.phase === 'start') recordOperation(inner)
+  }))
+  runWithOperationContext({ traceId: 'point-trace', parentId: 'point-parent', scenarioId: 'point-scenario' }, () => recordOperation(outer))
+  assert.deepEqual(journal.map(event => [event.name, event.phase]), [[outer.name, 'start'], [inner.name, 'start'], [inner.name, 'end'], [outer.name, 'end']])
+  assert.deepEqual(journal.map(event => event.sequence), Array.from({ length: 4 }, (_, index) => journal[0].sequence + index))
+  const keys = ['schemaVersion', 'sessionId', 'executionId', 'id', 'traceId', 'parentId', 'scenarioId', 'category', 'name', 'resource', 'startedAt', 'phase', 'sequence', 'durationMS', 'status', 'attributes', 'cpuTimeMS']
+  for (const event of journal) {
+    const input = event.name === outer.name ? outer : inner
+    const expected = { schemaVersion: 2, sessionId: event.sessionId, executionId: event.executionId, id: event.id,
+      traceId: 'point-trace', parentId: 'point-parent', scenarioId: 'point-scenario', category: input.category, name: input.name,
+      resource: input === outer ? outer.resource : undefined, startedAt: input.startedAt, phase: event.phase, sequence: event.sequence,
+      durationMS: event.phase === 'start' ? 0 : input.durationMS, status: event.phase === 'start' ? 'running' : input.status,
+      attributes: input.attributes, cpuTimeMS: event.phase === 'end' && input === outer ? outer.cpuTimeMS : undefined }
+    assert.deepEqual(Object.keys(event), keys)
+    assert.equal(JSON.stringify(event), JSON.stringify(expected))
+  }
+})
+
+test('completed observations never share publicly mutable events or attributes between calls', t => {
+  const name = 'test.observation-ownership', original = { category: 'network' as const, name,
+    startedAt: 1000, durationMS: 0, status: 'ok' as const, attributes: { rows: 3 } }
+  const events: OperationJournalEvent[] = [], snapshots: OperationJournalEvent[] = []
+  t.after(attachOperationJournalSink(event => {
+    if (event.name !== name) return
+    events.push(event); snapshots.push(structuredClone(event))
+    if (event.phase === 'end') {
+      Object.assign(event, { id: 'changed-end', traceId: 'changed-end', name: 'changed-end' })
+      Object.assign(event.attributes!, { rows: 999, secret: 'observer-only' })
+    }
+  }))
+  recordOperation(original); recordOperation(original)
+  assert.equal(events.length, 4)
+  assert.equal(new Set(events).size, 4)
+  assert.equal(new Set(events.map(event => event.attributes)).size, 4)
+  assert.notEqual(snapshots[0].id, snapshots[2].id)
+  for (const event of snapshots) assert.deepEqual(event.attributes, { rows: 3 })
+  assert.deepEqual(events[0], snapshots[0])
+  assert.deepEqual(events[2], snapshots[2])
+  assert.deepEqual(original.attributes, { rows: 3 })
 })
 
 test('static method metadata owns its registration snapshot while each invocation owns mutable attributes and context', t => {

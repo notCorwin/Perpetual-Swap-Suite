@@ -102,9 +102,20 @@ export function recordOperation(value) {
   if (!hasOperationRecording() || isOperationSuppressed() || !categories.has(value.category)) return
   const { status, startedAt, durationMS, cpuTimeMS } = value
   if (!statuses.has(status) || !Number.isFinite(startedAt) || !Number.isFinite(durationMS) || durationMS < 0) return
-  // A completed observation owns one validated snapshot. Start observers cannot
-  // revise its terminal facts by mutating the caller's input during publication.
-  complete(start(value, startedAt), { status, cpuTimeMS }, durationMS)
+  // Completed observations own their terminal snapshot from admission. Keep the
+  // same key order as localEvent; the independently copied start may be mutated.
+  const context = current(), id = `${identity.executionId}:${++operationSequence}`
+  const terminal = { schemaVersion: 2, sessionId: identity.sessionId, executionId: identity.executionId,
+    id, traceId: context.traceId || id, parentId: context.parentId || undefined, scenarioId: context.scenarioId || identity.scenarioId,
+    category: value.category, name: String(value.name).slice(0, 160),
+    resource: value.resource ? String(value.resource).slice(0, 256) : undefined, startedAt,
+    phase: 'end', sequence: 0, durationMS: Math.max(0, durationMS), status, attributes: attributes(value.attributes),
+    cpuTimeMS: Number.isFinite(cpuTimeMS) ? Math.max(0, cpuTimeMS) : undefined }
+  localEvent(terminal, 'start', 0, 'running', { ...terminal.attributes }, undefined)
+  // Reentrant start observers publish first; this sequence belongs to the
+  // terminal publication, not to the earlier private snapshot construction.
+  terminal.sequence = ++journalSequence
+  publish(terminal)
 }
 const noop = { context: {}, end() {}, run: operation => operation() }
 class LocalOperationSpan {
