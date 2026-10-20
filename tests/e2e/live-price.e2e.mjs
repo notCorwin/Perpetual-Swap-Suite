@@ -13,7 +13,7 @@ const btc = 'BTC-USDT-SWAP', eth = 'ETH-USDT-SWAP'
 
 // This is deliberately a market-value regression, not a foreground paint budget.
 // Hidden windows still exercise native sockets, workers, IPC, React and SVG.
-test('native WebSocket prices reach the selected SVG and survive a same-volume older REST reply', { timeout: 90_000 }, async t => {
+test('native WebSocket prices reach the selected SVG and survive delayed durable history repair', { timeout: 90_000 }, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'perp-native-live-price-'))
   const exchange = await createNativeExchange()
   let electron, page
@@ -90,18 +90,18 @@ test('native WebSocket prices reach the selected SVG and survive a same-volume o
     if (process.env.PERPETUAL_SWAP_TEST_UI !== 'foreground') assert.deepEqual(presentation, { visible: false, focused: false })
     await Promise.all([btc, eth].flatMap(instId => Object.keys(nativeIntervals).map(timeframe => exchange.waitForSubscription(instId, `candle${timeframe}`))))
     await select(btc, '15m')
-    await exchange.waitForHeldLatest()
+    await exchange.waitForHeldHistory()
 
-    // Three real native revisions share the REST response's cumulative volume.
-    // Older source completion must not overwrite a newer socket observation.
+    // Current native prices must remain usable while a missing completed slot
+    // is still being acquired through the bounded history endpoint.
     for (const close of [133.25, 134.5, 135.75]) {
       exchange.sendTicker(btc, close)
       await assertPrice(exchange.sendCandle(btc, '15m', { close, volume: 10 }))
     }
-    const heldPrice = await readPrice(), released = await exchange.releaseLatest()
+    const heldPrice = await readPrice(), released = await exchange.releaseHistory()
     assert.ok(released > 0, 'The test must complete a genuinely deferred native REST response.')
-    // Await the missing closed fact through the public read bridge. Its commit
-    // occurs in the same latest-source task that previously replayed stale live.
+    // Await the missing closed fact through the public read bridge. Its durable
+    // commit must preserve the separately observed native forming price.
     await page.waitForFunction(async expected => {
       const rows = await window.radarDesktop.request({ e2e: { action: 'readCandles', instrument: expected.instId,
         timeframe: '15m', from: expected.timestamp, through: expected.timestamp } })
@@ -111,7 +111,7 @@ test('native WebSocket prices reach the selected SVG and survive a same-volume o
     // chart refresh that could conceal a push-delivery or cache invalidation bug.
     for (let index = 0; index < 10; index++) {
       const current = await readPrice()
-      assert.equal(current.snapshot.livePrice, 135.75, `A late same-volume REST reply rewound the visible native price: ${JSON.stringify(current)}`)
+      assert.equal(current.snapshot.livePrice, 135.75, `A delayed history repair rewound the visible native price: ${JSON.stringify(current)}`)
       assert.equal(current.labelPrice, 135.75)
       assert.equal(current.snapshot.liveHour, heldPrice.snapshot.liveHour)
       assert.ok(current.snapshot.priceObservedAt >= heldPrice.snapshot.priceObservedAt)
@@ -157,7 +157,7 @@ test('native WebSocket prices reach the selected SVG and survive a same-volume o
       chart: page ? await readPrice().catch(() => null) : null, observations }))
     throw error
   } finally {
-    await exchange.releaseLatest().catch(() => {})
+    await exchange.releaseHistory().catch(() => {})
     await electron?.close()
     await exchange.close()
     await rm(directory, { recursive: true, force: true })

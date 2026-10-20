@@ -49,6 +49,7 @@ before(async () => {
       return report
     }
     const prepared = ({ instId, timeframe }) => {
+      if (state.chartOverride?.instId === instId && state.chartOverride.timeframe === timeframe) return structuredClone(state.chartOverride)
       const intervalMS = timeframe === '1H' ? 3_600_000 : timeframe === '15m' ? 900_000 : 300_000
       const endHour = Math.floor(Date.UTC(2026, 9, 18) / intervalMS) * intervalMS
       const bars = Array.from({ length: 96 }, (_, index) => {
@@ -1109,5 +1110,68 @@ test('temporary qualification gaps preserve the current chart and interaction un
     await page.evaluate(() => { delete globalThis.__continuityChart; delete globalThis.__continuitySVG })
     await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), loading: false, error: '', catalogSource: 'live', catalogProgress: undefined })
     await page.locator('[data-market-index]').first().waitFor({ state: 'visible' })
+  }
+})
+
+test('missing recent candles remain visible with repair status until the complete chart is restored', async () => {
+  await selectTimeframe(page, '15m')
+  const chart = page.locator('[data-chart-inst="BETA-USDT-SWAP"]'), status = chart.locator('[data-chart-status]')
+  const publish = phase => electron.evaluate(async ({ ipcMain, BrowserWindow }, phase) => {
+    const state = globalThis.__workspaceFixture
+    if (!state.integrityBaseline) {
+      state.chartGeneration += 1
+      state.integrityBaseline = await ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
+    }
+    const frame = structuredClone(state.integrityBaseline), step = frame.intervalMS
+    frame.revision += { sparse: 1, stale: 2, repaired: 3 }[phase]
+    frame.priceState = 'ready'
+    frame.liveBar = { ...frame.bars.at(-1), hour: frame.endHour + 73 * step,
+      open: 133, high: 134, low: 132, close: 133, confirmed: false, statisticsObserved: false, oi: null, buy: null, sell: null }
+    if (phase === 'sparse') frame.bars.splice(40, 1)
+    if (phase === 'repaired') {
+      frame.bars = frame.bars.map(bar => ({ ...bar, hour: bar.hour + 72 * step }))
+      frame.endHour += 72 * step
+      frame.latestEnd = frame.endHour
+    }
+    state.chartOverride = frame
+    BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
+    return { generation: frame.generation, endHour: frame.endHour, liveHour: frame.liveBar.hour }
+  }, phase)
+  const waitForFrame = frame => page.waitForFunction(({ generation, endHour, liveHour }) => {
+    const chart = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]'), snapshot = chart?.__chartSnapshot
+    return snapshot?.generation === generation && snapshot.liveBar?.hour === liveHour
+      && snapshot.endHour === endHour && snapshot.priceState === 'ready' && Number(chart.dataset.chartEnd) === liveHour
+  }, frame)
+  try {
+    for (const [phase, expected, message] of [
+      ['sparse', 'partial', 'Repairing missing price history…'],
+      ['stale', 'stale', 'Recent price history is stale; repairing…'],
+    ]) {
+      const frame = await publish(phase)
+      await page.waitForFunction(({ generation, state }) => {
+        const chart = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')
+        return chart?.__chartSnapshot.generation === generation && chart.dataset.chartCandleState === state
+      }, { generation: frame.generation, state: expected })
+      await status.getByText(message, { exact: true }).waitFor({ state: 'visible' })
+      assert.doesNotMatch(await status.textContent(), /Chart ready/)
+      assert.equal(await chart.getAttribute('data-chart-incomplete'), 'true')
+      assert.equal(await chart.locator('svg[data-rendered-inst]').isVisible(), true, 'Actual prices remain visible while missing slots repair.')
+      assert.ok(Number(await chart.getAttribute('data-chart-rendered-bars')) >= 95)
+      assert.match(await chart.locator('[data-chart-price-label-value]').textContent(), /^133 /, 'The current forming price remains visible across the historical gap.')
+    }
+    await waitForFrame(await publish('repaired'))
+    await status.getByText('Chart ready', { exact: true }).waitFor({ state: 'visible' })
+    assert.equal(await chart.getAttribute('data-chart-candle-state'), 'ready')
+    assert.equal(await chart.getAttribute('data-chart-incomplete'), 'false')
+    assert.equal(await chart.getAttribute('data-chart-rendered-bars'), '96')
+    assert.doesNotMatch(await status.textContent(), /missing price history|stale; repairing/)
+  } finally {
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      delete state.chartOverride
+      delete state.integrityBaseline
+    })
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]').waitFor({ state: 'visible' })
   }
 })

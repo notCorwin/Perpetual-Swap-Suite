@@ -33,3 +33,30 @@ test('speculative history extensions cannot hide source downloads overlapping sa
   assert.deepEqual(result.historical, overlapping)
   assert.deepEqual(result.currentMaintenance, [])
 })
+
+test('bounded current-window repairs are independent only when their entire source range follows the fixture', () => {
+  const intervalMS = 300_000, fixture = { end: 360 * intervalMS, series: { '5m': { intervalMS } } }
+  const after = fixture.end + 97 * intervalMS
+  const current = [
+    { path: '/market/history-candles', parameters: { bar: '5m', limit: 4, after } },
+    { path: '/market/history-candles', parameters: { bar: '5m', limit: 96, after } },
+    { path: '/rubik/stat/contracts/open-interest-history', parameters: { period: '5m', begin: fixture.end + intervalMS, end: after } },
+  ]
+  const ambiguous = [
+    { path: '/market/history-candles', parameters: { bar: '5m', limit: 96, after: fixture.end + 96 * intervalMS } },
+    { path: '/market/history-candles', parameters: { bar: '5m', limit: 96, after: after + 1 } },
+    { path: '/market/history-candles', parameters: { bar: '5m', limit: 97, after: after + intervalMS } },
+    { path: '/market/history-candles', parameters: { bar: '5m', limit: 0, after } },
+    { path: '/market/history-candles', parameters: { bar: '5m', limit: 4.5, after } },
+    { path: '/market/history-candles', parameters: { bar: '5m', after } },
+    { path: '/market/history-candles', parameters: { bar: '5m', limit: 96, after, before: fixture.end } },
+    { path: '/market/history-candles', parameters: { bar: 'unknown', limit: 96, after } },
+    { path: '/rubik/stat/contracts/open-interest-history', parameters: { period: '5m', begin: fixture.end, end: after } },
+    { path: '/rubik/stat/contracts/open-interest-history', parameters: { period: 'unknown', begin: fixture.end + intervalMS, end: after } },
+    { path: '/unknown', parameters: { begin: fixture.end + intervalMS, end: after } },
+  ]
+  const result = separateSourceMaintenance([...current, ...ambiguous], fixture)
+  assert.deepEqual(result.currentMaintenance, current)
+  assert.deepEqual(result.historical, ambiguous, 'Potential overlap and unknown source semantics remain subject to no-download assertions.')
+  assert.deepEqual(result.historicalExtensions, [])
+})

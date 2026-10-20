@@ -357,17 +357,24 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
   const takerState = surface?.takerState ?? 'ready'
   const atBoundary = view.historyExhausted && surface && view.oldestHour !== null && surface.endHour === Math.min(view.latestEnd ?? Infinity, view.oldestHour + 95 * intervalMS)
   const priceScale = plotGeometry?.priceAxis.kind ?? 'logarithmic'
+  const priceState = surface?.priceState ?? 'loading'
   const statusMessages: string[] = []
   if (unavailable) statusMessages.push(unavailableText)
   else if (pending) statusMessages.push(surface ? `Preparing ${instId.replace(/-SWAP$/, '')} ${timeframeLabel(timeframe)}${requestedEnd !== null ? ` · ${time(requestedEnd)}` : ''}…` : 'Loading local prices…')
+  if (surface && priceState === 'partial') statusMessages.push('Repairing missing price history…')
+  if (surface && priceState === 'stale') statusMessages.push('Recent price history is stale; repairing…')
+  if (surface && priceState === 'loading') statusMessages.push('Loading price history…')
+  if (priceState === 'unavailable') statusMessages.push('Price history is unavailable for this range')
   if (surface?.indicatorState === 'loading') statusMessages.push('Calculating indicators…')
+  if (surface?.indicatorState === 'unavailable') statusMessages.push('Indicators are unavailable for part of this range')
   if (oiState === 'loading') statusMessages.push('Loading OI history…')
   if (takerState === 'loading') statusMessages.push('Loading taker history…')
   if (oiState === 'unavailable') statusMessages.push(`OKX ${timeframeLabel(displayedFrame)} OI history is incomplete for this range`)
   if (takerState === 'unavailable') statusMessages.push(`OKX ${timeframeLabel(displayedFrame)} Taker history is incomplete for this range`)
   if (atBoundary && !pending) statusMessages.push('Start of available history')
   if (!statusMessages.length) statusMessages.push(error ? 'Chart update failed' : 'Chart ready')
-  const statusLoading = (pending && !unavailable) || surface?.indicatorState === 'loading' || oiState === 'loading' || takerState === 'loading'
+  const statusLoading = (pending && !unavailable) || priceState === 'loading' || priceState === 'partial' || priceState === 'stale'
+    || surface?.indicatorState === 'loading' || oiState === 'loading' || takerState === 'loading'
   const statusSummary = statusMessages.join(' · ')
   return <section data-chart-workspace aria-label="Market chart workspace" className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden overscroll-none text-sm font-normal tabular-nums">
     <header className="flex shrink-0 flex-wrap items-center gap-3 border-b px-4 py-2">
@@ -382,7 +389,7 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}</div>}
     {capture.error && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{capture.error}</p>}
     <div className="flex min-h-0 flex-1">
-    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={surface?.priceState ?? (bars.length ? 'ready' : 'loading')} data-chart-statistics-state={surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={bars.length < 96 || bars.some((bar, index) => index > 0 && bar.hour - bars[index - 1].hour !== intervalMS) ? 'true' : 'false'} data-chart-loading={pending && !unavailable ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
+    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending && !unavailable ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
       {active && <div className="grid shrink-0 grid-cols-[minmax(9rem,1.2fr)_repeat(4,minmax(0,1fr))] items-center border-b px-4 py-1.5 text-[length:var(--chart-text-size)]" aria-live="off">
         <p className="min-w-0 truncate border-r pr-3"><span className="font-medium">{displayedId.replace(/-SWAP$/, '')}</span> · <span className="text-muted-foreground">{inspected === null ? historical ? 'Window end' : 'Latest' : 'Selected'}</span> {time(active.hour)}</p>
         {([['Open', active.open], ['High', active.high], ['Low', active.low], ['Close', active.close]] as const).map(([label, value]) => <div key={label} className="min-w-0 px-3"><span className="text-muted-foreground">{label} </span><span title={price(value)}>{price(value)}</span></div>)}

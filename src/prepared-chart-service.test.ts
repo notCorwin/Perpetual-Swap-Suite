@@ -88,6 +88,120 @@ test('a listing with fewer than 96 candles publishes all available prices', asyn
   } finally { await pipeline.dispose() }
 })
 
+test('a current forming quote cannot certify a stale confirmed tail and its full window repairs immediately', async () => {
+  const canonical = source(400), missing = canonical.slice(-12), gate = deferred()
+  let latestCalls = 0, priceCalls = 0
+  const { pipeline, store } = fixture(canonical.slice(0, -12), {
+    async latest() { latestCalls += 1 },
+    async ensurePrices(instrument: string, timeframe: string, from: number, through: number) {
+      priceCalls += 1
+      assert.equal(instrument, instId); assert.equal(timeframe, '15m')
+      assert.equal(from, end() - 95 * interval); assert.equal(through, end())
+      await gate.promise
+      for (const row of missing) store.change(row)
+    },
+  })
+  try {
+    await pipeline.setLive(instId, '15m', { ...candle(end() + interval, 400), confirmed: false }, { receivedAt: Date.now() })
+    const frame = await pipeline.local(instId, '15m')
+    assert.equal(frame.bars.length, 96); assert.equal(frame.priceState, 'stale')
+    assert.equal(frame.realtimeState, 'live', 'Fresh quotes do not prove completed history coverage.')
+    const state = pipeline.state(instId, '15m'), repair = pipeline.refreshObservations(state)
+    assert.equal(priceCalls, 1, 'Concurrent demand reuses the admitted durable repair.')
+    assert.equal(latestCalls, 0, 'A latest-only response cannot replace ensuring the requested window.')
+    gate.resolve(); await repair; await finishSeed(pipeline)
+    const repaired = pipeline.cached(`${instId}:15m`)
+    assert.equal(repaired.priceState, 'ready'); assert.equal(repaired.endHour, end())
+    assert.equal(repaired.bars.length, 96)
+    assert.ok(repaired.bars.every((bar: any, index: number) => bar.hour === end() - (95 - index) * interval))
+    await pipeline.local(instId, '15m')
+    assert.equal(priceCalls, 1, 'Opening a complete persisted window must reuse its coverage.')
+  } finally { gate.resolve(); await pipeline.dispose() }
+})
+
+test('interior holes and missing quote volume stay partial until persisted source inputs are complete', async () => {
+  const canonical = source(400), absent = canonical[360], incomplete = { ...canonical[370], quoteVolume: null }
+  const gate = deferred()
+  let attempts = 0
+  const { pipeline, store } = fixture(canonical.filter(row => row !== absent).map(row => row.timestamp === incomplete.timestamp ? incomplete : row) as any, {
+    async ensurePrices() {
+      attempts += 1; await gate.promise
+      if (attempts === 1) store.change(absent)
+      else store.change(canonical[370])
+    },
+  })
+  try {
+    const frame = await pipeline.local(instId, '15m')
+    assert.equal(frame.priceState, 'partial'); assert.equal(frame.bars.length, 95)
+    const state = pipeline.state(instId, '15m'), key = `prices:${state.key}:${end() - 95 * interval}:${end()}`
+    const first = pipeline.refreshObservations(state)
+    gate.resolve(); await first
+    assert.equal(pipeline.cached(state.key).bars.length, 96)
+    assert.equal(pipeline.cached(state.key).priceState, 'partial', 'Row count alone cannot certify complete candle inputs.')
+    assert.equal(pipeline.cached(state.key).bars.find((bar: any) => bar.hour === incomplete.timestamp).priceComplete, false)
+    assert.ok(pipeline.sourceAttempts.get(key).retryAt > Date.now())
+    pipeline.sourceAttempts.delete(key)
+    await pipeline.refreshObservations(state)
+    assert.equal(pipeline.cached(state.key).priceState, 'ready'); assert.equal(attempts, 2)
+    assert.ok(pipeline.cached(state.key).bars.every((bar: any) => bar.priceComplete === true))
+  } finally { gate.resolve(); await pipeline.dispose() }
+})
+
+test('a verified recent listing uses the first completed native slot without requesting prelisting candles', async () => {
+  const rows = source(12)
+  let requests = 0
+  const { pipeline } = fixture(rows, { async ensurePrices() { requests += 1 } })
+  pipeline.instrument = () => ({ listTime: rows[0].timestamp - interval / 2 })
+  try {
+    const frame = await pipeline.local(instId, '15m')
+    assert.equal(frame.oldestHour, rows[0].timestamp); assert.equal(frame.historyExhausted, true)
+    assert.equal(frame.bars.length, 12); assert.equal(frame.priceState, 'ready')
+    await new Promise<void>(resolve => setImmediate(resolve))
+    assert.equal(requests, 0)
+  } finally { await pipeline.dispose() }
+})
+
+test('a persisted resident gap repair rebuilds descendant indicators before its observer arrives', async () => {
+  const canonical = source(500), absent = canonical[450]
+  const { pipeline, store } = fixture(canonical.filter(row => row !== absent))
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const state = pipeline.state(instId, '15m'), generation = state.generation
+    assert.equal(pipeline.cached(state.key).bars.at(-1).ema, null)
+    store.change(absent)
+    await pipeline.read(state); await pipeline.seed(state); await finishSeed(pipeline)
+    const repaired = pipeline.cached(state.key), oracle = buildIndicatorSeries(canonical, interval).bars as any[]
+    assert.ok(repaired.generation > generation)
+    for (const value of repaired.bars) for (const field of indicatorFields) assert.equal(value[field], oracle.find(row => row.hour === value.hour)![field])
+    assert.equal(repaired.priceState, 'ready'); assert.equal(repaired.indicatorState, 'ready')
+  } finally { await pipeline.dispose() }
+})
+
+test('source retries repair the selected historical viewport instead of the unrelated latest tail', async context => {
+  const now = Math.floor(Date.now() / interval) * interval + 1000
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
+  const canonical = source(500), absent = canonical[330], target = canonical[350].timestamp
+  const requests: Array<{ from: number; through: number }> = []
+  const { pipeline, store } = fixture(canonical.filter(row => row !== absent), {
+    async ensurePrices(_instrument: string, _timeframe: string, from: number, through: number) {
+      requests.push({ from, through })
+      if (requests.length === 1) throw new Error('Transient history failure')
+      store.change(absent)
+    },
+  })
+  const flush = async () => { for (let count = 0; count < 8; count++) await new Promise<void>(resolve => setImmediate(resolve)) }
+  try {
+    const frame = await pipeline.localHistory(instId, '15m', target)
+    assert.equal(frame.priceState, 'partial')
+    await flush(); assert.equal(requests.length, 1)
+    context.mock.timers.tick(1000); await flush()
+    assert.equal(requests.length, 2); assert.equal(requests[1].through, target)
+    assert.equal(requests[1].from, target - 95 * interval)
+    const repaired = pipeline.historyFrame(pipeline.state(instId, '15m'), target)
+    assert.equal(repaired.priceState, 'ready')
+  } finally { await pipeline.dispose() }
+})
+
 test('cold forming prices are visible without any historical candle or recursive seed', async () => {
   const { pipeline } = fixture([])
   try {

@@ -3,6 +3,8 @@ import type { RadarTimeframe } from './timeframe.ts'
 
 export type Bar = {
   hour: number; open: number; high: number; low: number; close: number; confirmed: boolean
+  /** Source completeness includes native base and quote volumes. */
+  priceComplete?: boolean
   statisticsSources?: number
   statisticsObserved?: boolean
   oiObserved?: boolean
@@ -64,6 +66,7 @@ export type PreparedChartMeta = Readonly<{
   key: string; instId: string; timeframe: RadarTimeframe; intervalMS: number
   generation: PreparedChartGeneration; revision: number
   latestEnd: number | null; oldestHour: number | null; historyExhausted: boolean; error: string
+  priceState?: PreparedChartState
   priceAsOf?: number | null; priceObservedAt?: number | null; realtimeState?: 'live' | 'stale'; sourceVersions?: { price: number; oi: number; taker: number }
 }>
 

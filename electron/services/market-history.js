@@ -1,6 +1,7 @@
 import { HistorySync } from './history-sync.js'
 import { DataAudit } from './data-audit.js'
 import { CANDLE_INTERVALS, validateCandle } from './market-store.js'
+import { completePriceCandle as pricePresent } from './market-records.js'
 import { statisticsMask, STATISTICS_OI as OI, STATISTICS_TAKER as TAKER, validTakerVolumes } from './statistics-state.js'
 
 const keyOf = (instrument, timeframe) => `${instrument}:${timeframe}`
@@ -8,7 +9,6 @@ const rangeKey = value => `${keyOf(value.instrument, value.timeframe)}:${value.f
 const numeric = value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value)) ? Number(value) : null
 const nonnegative = value => typeof value === 'number' && Number.isFinite(value) && value >= 0
 const expiryField = source => source === OI ? 'statisticsOIExpiresAt' : 'statisticsTakerExpiresAt'
-const pricePresent = row => row.confirmed === true && nonnegative(row.baseVolume) && nonnegative(row.quoteVolume)
 const sourcePresent = (row, source, now) => {
   if (!(statisticsMask(row) & source)) return false
   const valid = source === OI ? nonnegative(row.oi) : validTakerVolumes(row)

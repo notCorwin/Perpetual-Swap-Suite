@@ -43,11 +43,11 @@ for (const volume of [5, 8]) test(`late forming REST cannot replace a newer nati
     await service.ready
     await service.setChartUniverse([instId], timeframe, instId)
     service.subscribePreparedCharts(frame => published.push(frame))
-    // Let the actual cold chart acquisition own latest(). A second caller
-    // below joins that request while its HTTP response is still held.
-    await service.localChartWindow(instId, timeframe)
-    await requested.promise
+    // Quote acquisition has its own lifetime; chart history demand now owns
+    // completed-window coverage instead of substituting a latest-only read.
     pending = service.history.latest(instId, timeframe)
+    await requested.promise
+    assert.equal(service.history.latest(instId, timeframe), pending, 'Concurrent quote readers share their admitted source request.')
     service.realtime.start(); socket.open()
     await service.realtime.whenIdle()
     socket.message({ arg: { channel: 'candle15m', instId }, data: [raw(now - 60_000, 200, volume)] })
@@ -85,9 +85,8 @@ test('a latest read admitted before the first native tick cannot revive its sour
     await service.ready
     service.installInstruments(new Map([[instId, instrument]]))
     await service.setChartUniverse([instId], timeframe, instId)
-    await service.localChartWindow(instId, timeframe)
-    await requested.promise
     pending = service.history.latest(instId, timeframe)
+    await requested.promise
     assert.equal(service.liveCandles.size, 0, 'No native price has established this source yet.')
     service.installInstruments(new Map())
     service.installInstruments(new Map([[instId, instrument]]))

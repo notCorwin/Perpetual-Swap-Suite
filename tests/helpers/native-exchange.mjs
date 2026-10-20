@@ -36,12 +36,12 @@ export async function createNativeExchange() {
     return Array.from({ length: 400 }, (_, index) => ({ instrument, timeframe, timestamp: end - (399 - index) * step,
       open: close, high: close + 1, low: close - 1, close, volume: 100, baseVolume: 100, quoteVolume: close * 100, confirmed: true }))
   }))
-  // Missing one closed price forces a real latest-price request. Hold that
+  // Missing one closed price forces a real bounded history repair. Hold that
   // response until newer native forming events have already reached the SVG.
   const deferredKey = 'BTC-USDT-SWAP:15m', deferredEnd = Math.floor(asOf / nativeIntervals['15m']) * nativeIntervals['15m'] - nativeIntervals['15m']
   const closedCandles = rows.filter(row => `${row.instrument}:${row.timeframe}` !== deferredKey || row.timestamp !== deferredEnd)
   const clients = new Set(), requests = [], errors = [], held = [], latestQuotes = new Map(identities.map(id => [id, basePrice(id)])), lastCandles = new Map()
-  let holdLatest = true, holdBusinessAcknowledgments = false
+  let holdHistory = true, holdBusinessAcknowledgments = false
   const heldAcknowledgments = []
   const ticker = instId => {
     const price = latestQuotes.get(instId) ?? basePrice(instId)
@@ -69,10 +69,10 @@ export async function createNativeExchange() {
       const values = rows.filter(row => row.instrument === instId && row.timeframe === timeframe
         && (!parameters.after || row.timestamp < Number(parameters.after)) && (!parameters.before || row.timestamp > Number(parameters.before)))
         .toSorted((left, right) => right.timestamp - left.timestamp).slice(0, Math.min(300, Number(parameters.limit) || 100)).map(rawCandle)
-      if (path === '/market/candles' && `${instId}:${timeframe}` === deferredKey && holdLatest) {
+      if (path === '/market/history-candles' && `${instId}:${timeframe}` === deferredKey && holdHistory
+        && values.some(value => Number(value[0]) === deferredEnd)) {
         record.held = true
-        const close = 111.25, timestamp = Math.floor(asOf / step) * step
-        held.push({ response, record, data: [rawCandle({ timestamp, open: 100, high: 112, low: 99, close, volume: 10, baseVolume: 10, quoteVolume: 1112.5, confirmed: false }), ...values] })
+        held.push({ response, record, data: values })
         return
       }
       const current = lastCandles.get(`${instId}:${timeframe}:${Math.floor(Date.now() / step) * step}`)
@@ -144,7 +144,7 @@ export async function createNativeExchange() {
   return { asOf, instruments, closedCandles, requests, errors, deferredEnd,
     environment: { PERPETUAL_SWAP_E2E_HTTP_ORIGIN: origin, PERPETUAL_SWAP_E2E_WEBSOCKET_ORIGIN: origin.replace('http:', 'ws:') },
     waitForSubscription: (instId, channel) => waitFor(() => subscribed(instId, channel).length > 0, `${channel}/${instId} native subscription`),
-    waitForHeldLatest: () => waitFor(() => held.some(value => !value.response.destroyed), 'deferred native BTC 15m latest-price request'),
+    waitForHeldHistory: () => waitFor(() => held.some(value => !value.response.destroyed), 'deferred native BTC 15m missing-candle repair'),
     async disconnectBusiness({ holdAcknowledgments = false } = {}) {
       holdBusinessAcknowledgments = holdAcknowledgments
       const previous = [...clients].filter(client => client.path === '/ws/v5/business')
@@ -164,10 +164,10 @@ export async function createNativeExchange() {
         send(client, { id, event: 'subscribe', arg })
       }
     },
-    async releaseLatest() {
-      holdLatest = false
+    async releaseHistory() {
+      holdHistory = false
       for (const value of held) sendJSON(value.response, value.data)
-      await waitFor(() => held.every(value => value.response.destroyed || value.record.respondedAt !== null), 'deferred latest-price HTTP response completion')
+      await waitFor(() => held.every(value => value.response.destroyed || value.record.respondedAt !== null), 'deferred missing-candle HTTP response completion')
       return held.filter(value => value.record.respondedAt !== null).length
     },
     sendCandle(instId, timeframe, { close, volume, timestamp = Math.floor(Date.now() / nativeIntervals[timeframe]) * nativeIntervals[timeframe], confirmed = false }) {
@@ -189,7 +189,7 @@ export async function createNativeExchange() {
       return { instId, close, sentAt }
     },
     async close() {
-      holdLatest = false
+      holdHistory = false
       for (const value of held) value.response.destroy()
       await ownedServer.close()
     },

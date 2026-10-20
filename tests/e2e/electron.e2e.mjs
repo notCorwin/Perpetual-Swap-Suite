@@ -287,10 +287,9 @@ test('prepared native chart pages preserve canonical indicator values across eve
       }
     }
     const requests = await readRequestProbe(electron)
-    const redundant = requests.sourceRequests.filter(call => call.path !== '/market/candles'
-      && !(call.path === '/market/history-candles' && call.parameters.bar === '5m'
-        && Number(call.parameters.after) - Number(call.parameters.limit) * 300_000 > fixture.end))
-    assert.deepEqual(redundant, [], 'Complete durable chart periods must not be downloaded again. Independent ranking admission may repair its missing current 5m window, beyond this historical fixture.')
+    const sources = separateSourceMaintenance(requests.sourceRequests, fixture)
+    assert.deepEqual([...sources.historical, ...sources.historicalExtensions], [],
+      'Complete durable chart periods must not be downloaded again. Bounded current-window repairs wholly beyond this fixture are independent.')
   } finally { await removeRequestProbe(electron) }
 })
 
@@ -560,7 +559,7 @@ test('a held history read keeps the last complete paint and coalesces every late
     assert.equal(report.commits.at(-1).end, expectedEnd)
     const requests = await readRequestProbe(electron)
     assert.equal(requests.maxActive, 1)
-    assert.deepEqual(separateSourceMaintenance(requests.sourceRequests, fixture).historical, [], 'Scrolling must reuse durable history, independently of latest-candle refresh timing.')
+    assert.deepEqual(separateSourceMaintenance(requests.sourceRequests, fixture).historical, [], 'Scrolling must reuse durable history, independently of bounded current-window repairs beyond the fixture.')
     assert.ok(requests.calls.length <= 12, `Coalesced history work unexpectedly issued ${requests.calls.length} requests.`)
     assert.ok(!report.commits.some(commit => commit.end === fixture.end - 1_200 * fixture.intervalMS), 'The obsolete held target was presented after a newer input.')
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
@@ -592,7 +591,7 @@ test('a late history response cannot overwrite a more recently selected timefram
     assert.ok(final15m >= 0)
     assert.ok(report.commits.slice(final15m).every(commit => commit.timeframe === '15m'), 'An older timeframe repainted after the selected chart was ready.')
     const requests = await readRequestProbe(electron)
-    assert.deepEqual(separateSourceMaintenance(requests.sourceRequests, fixture).historical, [], 'A fully local timeframe switch must reuse historical candles and statistics. Periodic latest two-candle refreshes are independent.')
+    assert.deepEqual(separateSourceMaintenance(requests.sourceRequests, fixture).historical, [], 'A fully local timeframe switch must reuse historical candles and statistics. Bounded current-window repairs beyond the fixture are independent.')
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
 

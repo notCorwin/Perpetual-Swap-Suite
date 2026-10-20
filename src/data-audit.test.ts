@@ -378,7 +378,7 @@ test('a SQLite audit repairs a defective observation without replacing unrelated
   const store = await MarketStore.open(root)
   const base = Date.UTC(2024, 0, 1)
   const through = base + day - interval
-  const candle = (timestamp: number) => ({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp, open: 100, high: 101, low: 99, close: 100, volume: 1, baseVolume: 1, confirmed: true })
+  const candle = (timestamp: number) => ({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp, open: 100, high: 101, low: 99, close: 100, volume: 1, baseVolume: 1, quoteVolume: 100, confirmed: true })
   const repairs: Array<[number, number]> = []
   const audit = new DataAudit({ metadata: new MemoryMetadata(), store, repair: async issue => {
     repairs.push([issue.from, issue.through])
