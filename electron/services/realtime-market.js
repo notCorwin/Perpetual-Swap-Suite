@@ -334,6 +334,10 @@ export class RealtimeMarket {
       connection.pending.delete(keyFor(subscription))
       this.armAcknowledgement(connection)
       this.maybeLive(connection)
+      try {
+        const result = this.options.onSubscribed?.(copy(subscription), { signal: connection.controller.signal, receivedAt })
+        if (result?.then) this.track(Promise.resolve(result).catch(error => this.report('Candle subscription callback failed.', error)))
+      } catch (error) { this.report('Candle subscription callback failed.', error) }
       return
     }
     if (!Array.isArray(message.data)) return

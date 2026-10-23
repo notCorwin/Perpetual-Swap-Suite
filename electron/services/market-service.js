@@ -24,6 +24,8 @@ const LIQUIDITY_SOURCE_CRITERIA = {
   ticker: ['spread'], book: ['depth', 'slippage'], openInterest: ['openInterest'],
   turnover: ['volume24h'], hourly: ['volumeStability'],
 }
+const requiredLiquiditySources = config => Object.entries(LIQUIDITY_SOURCE_CRITERIA)
+  .filter(([, criteria]) => criteria.some(key => config[key].enabled)).map(([source]) => source)
 const OBSERVATION_TTL = 90_000
 const TICKER_BOOTSTRAP_MS = 10_000
 const CANDLE_DELIVERY_MS = 10_000
@@ -192,6 +194,9 @@ export class MarketService {
     this.catalogControllers = new Set()
     this.qualificationReads = new Set()
     this.historicalSourceReads = new Map()
+    this.historicalInputs = new WeakMap()
+    this.historicalAssessments = new WeakMap()
+    this.historicalValidations = new WeakSet()
     this.candidateIDs = null
     this.tickerCache = null
     this.tickerTask = null
@@ -214,6 +219,7 @@ export class MarketService {
     this.processingMarketDeadline = false
     this.renewing = null
     this.instruments = new Map()
+    this.instrumentGenerations = new Map()
     this.instrumentDefinitions = new Map()
     this.instrumentSnapshotReady = false
     this.instrumentSnapshotObservedAt = 0
@@ -363,8 +369,13 @@ export class MarketService {
           this.realtimeStatus = state.status; this.touchList()
           if (!this.closing) this.preparedCharts.sourceStateChanged()
         }
+        this.scheduleMarketDeadline()
       },
       ...(this.webSocketFactory ? { webSocketFactory: this.webSocketFactory } : {}),
+      onSubscribed: ({ instId }) => {
+        const record = this.catalog.get(instId)
+        if (record) this.rememberHistoricalAssessment(record)
+      },
       onForming: (row, context) => { this.track(Promise.resolve(this.setLive(row.instrument, row.timeframe, row, context))) },
       onConfirmed: async row => {
         try { await this.persistCandles(row.instrument, [row]) }
@@ -429,7 +440,20 @@ export class MarketService {
 
   validCatalogEntry(entry, now = Date.now()) {
     return Boolean(entry?.instrument?.instId && entry.ticker && entry.result?.eligible && entry.status === 'verified'
-      && entry.configKey === this.catalogCriteriaKey() && Number.isSafeInteger(entry.expiresAt) && entry.expiresAt > now)
+      && entry.configKey === this.catalogCriteriaKey() && Number.isSafeInteger(entry.expiresAt) && this.catalogEntryExpiry(entry, now) > now)
+  }
+
+  catalogEntryExpiry(entry, now = Date.now()) {
+    if (!entry || entry.expiresAt > now) return entry?.expiresAt ?? 0
+    const instId = entry.instrument.instId, observations = entry.observations ?? {}
+    const continuousMetadata = this.instrumentStream?.synchronized && !this.instrumentStream.signal.aborted && this.candidateIDs?.has(instId)
+    const metadataExpiry = continuousMetadata ? Number.MAX_SAFE_INTEGER : entry.instrumentObservation?.expiresAt ?? 0
+    const required = requiredLiquiditySources(this.prefs().liquidity)
+    const originalExpiry = Math.min(metadataExpiry, ...required.map(key => this.observationExpiry(observations[key], key, instId)))
+    // Only a source's ordinary close can enter rollover. Explicit revocation
+    // of an assessment must never be replaced by a longer source lease.
+    if (entry.expiresAt !== originalExpiry) return entry.expiresAt
+    return Math.min(metadataExpiry, ...required.map(key => this.qualificationExpiry(observations[key], key, instId, entry.configKey, now)))
   }
 
   readCatalog() {
@@ -1377,7 +1401,7 @@ export class MarketService {
           if (config.volume24h.enabled && current.turnover !== observations.turnover
             || config.volumeStability.enabled && current.hourly !== observations.hourly) return
           const currentInput = this.liquidityInput(instrument, config, current, now)
-          const expiredSource = capturedSources.some(key => observations[key] && !this.observation(observations, key, now))
+          const expiredSource = capturedSources.some(key => observations[key] && !this.qualificationObservation(observations, key, instId, configKey, now))
           const record = expiredSource || this.cheapLiquidity(currentInput).status === 'failed'
             ? this.observedCandidate(instrument, config, configKey, current, {}, now, this.evaluateLiquidity({ ...currentInput, book: null }))
             : this.observedCandidate(instrument, config, configKey, observations, {}, now, result)
@@ -1527,6 +1551,47 @@ export class MarketService {
     return value && Number.isSafeInteger(value.observedAt) && this.observationExpiry(value, key) > now ? value : null
   }
 
+  rememberHistoricalAssessment(record, now = Date.now(), validated = false) {
+    if (record.status !== 'verified' || !record.result.eligible || record.expiresAt <= now
+      || !this.currentCandidate(record.instrument, record.configKey, this.shutdownController.signal)) return
+    for (const [key, timeframe] of [['turnover', '5m'], ['hourly', '1H']]) {
+      const observation = record.observations?.[key]
+      if (!observation || observation.value.asOf !== closedBoundary(timeframe, now) || observation.expiresAt <= now) continue
+      if (validated) this.historicalValidations.add(observation)
+      if (!this.historicalValidations.has(observation) || this.historicalAssessments.has(observation)
+        || !this.realtime?.isSubscribed(record.instrumentID, timeframe)) continue
+      this.historicalAssessments.set(observation, { instId: record.instrumentID, key, configKey: record.configKey,
+        instrumentGeneration: this.instrumentGenerations.get(record.instrumentID) ?? 0, connection: this.realtime.connection,
+        subscription: this.realtime.subscriptions.get(`${timeframe}:${record.instrumentID}`) })
+    }
+  }
+
+  qualificationExpiry(observation, key, instId, configKey, now = Date.now()) {
+    const expiry = this.observationExpiry(observation, key, instId)
+    if (expiry > now || !observation || key !== 'turnover' && key !== 'hourly') return expiry
+    const proof = this.historicalAssessments.get(observation), timeframe = key === 'turnover' ? '5m' : '1H'
+    const boundary = closedBoundary(timeframe, now), deadline = boundary + CANDLE_DELIVERY_MS
+    // Runtime authority belongs to the exact validated window and continuous
+    // subscription. Neither a checkpoint, reconnect, tick nor refresh renews it.
+    return proof?.instId === instId && proof.key === key && proof.configKey === configKey
+      && proof.instrumentGeneration === (this.instrumentGenerations.get(instId) ?? 0) && proof.connection === this.realtime?.connection
+      && proof.subscription && proof.subscription === this.realtime.subscriptions.get(`${timeframe}:${instId}`)
+      && this.realtime.isSubscribed(instId, timeframe) && observation.expiresAt === boundary
+      && observation.value.asOf === boundary - timeframeMilliseconds(timeframe) && now < deadline ? deadline : expiry
+  }
+
+  qualificationObservation(observations, key, instId, configKey, now = Date.now()) {
+    const observation = observations[key]
+    if (!observation || !Number.isSafeInteger(observation.observedAt)
+      || this.qualificationExpiry(observation, key, instId, configKey, now) <= now) return null
+    if (key === 'turnover' || key === 'hourly') {
+      const timeframe = key === 'turnover' ? '5m' : '1H', boundary = closedBoundary(timeframe, now)
+      if (observation.value.asOf !== boundary
+        && !(observation.value.asOf === boundary - timeframeMilliseconds(timeframe) && observation.expiresAt === boundary)) return null
+    }
+    return observation
+  }
+
   invalidateLiquidityHistory(instId, rows, timeframe) {
     for (const frame of ['5m', '1H']) if (rows ? rows.some(row => row.timeframe === frame) : timeframe === frame) {
       const key = `${instId}:${frame}`
@@ -1534,27 +1599,38 @@ export class MarketService {
     }
     const observations = this.observations.get(instId)
     if (!observations) return
-    let changed = false, invalidated = false
+    const record = this.catalogChecks.get(instId), published = this.catalog.get(instId)
+    const recordObservations = { ...record?.observations }
+    let recordChanged = false, recordInvalidated = false, publishedInvalidated = false
     for (const [key, frame, count] of [['turnover', '5m', 288], ['hourly', '1H', 24]]) {
-      const value = observations[key]?.value
       const step = timeframeMilliseconds(frame)
-      if (value && (rows ? rows.some(row => row.timeframe === frame && row.timestamp >= value.asOf - count * step && row.timestamp < value.asOf) : timeframe === frame)) {
-        delete observations[key]
-        changed = true
-        invalidated ||= this.prefs().liquidity[key === 'turnover' ? 'volume24h' : 'volumeStability'].enabled
+      for (const observation of new Set([observations[key], record?.observations?.[key], published?.observations?.[key]])) {
+        const value = observation?.value
+        const inputs = this.historicalInputs.get(observation)
+        // A concurrent reader may already have calculated and published the
+        // committed quote amounts. Invalidate changed inputs, not that result.
+        if (!value || !(rows ? rows.some(row => row.timeframe === frame && row.timestamp >= value.asOf - count * step && row.timestamp < value.asOf
+          && (!inputs?.has(row.timestamp) || !Object.is(inputs.get(row.timestamp), row.quoteVolume))) : timeframe === frame)) continue
+        this.historicalAssessments.delete(observation)
+        this.historicalValidations.delete(observation)
+        if (observations[key] === observation) delete observations[key]
+        const enabled = this.prefs().liquidity[key === 'turnover' ? 'volume24h' : 'volumeStability'].enabled
+        if (record?.observations?.[key] === observation) {
+          delete recordObservations[key]; recordChanged = true; recordInvalidated ||= enabled
+        }
+        if (published?.observations?.[key] === observation) publishedInvalidated ||= enabled
       }
     }
-    const record = this.catalogChecks.get(instId)
-    if (changed && record) {
-      if (invalidated) {
+    if (recordChanged && record) {
+      if (recordInvalidated) {
         record.status = 'unknown'; record.result = { ...record.result, eligible: false }; record.expiresAt = Date.now()
       }
-      record.observations = { ...observations }
+      record.observations = recordObservations
       this.metadata.putCatalogEntry(record)
     }
-    if (invalidated) {
-      const entry = this.catalog.get(instId)
-      if (entry) entry.expiresAt = Date.now()
+    if (publishedInvalidated) {
+      const entry = published
+      if (entry) { entry.status = 'unknown'; entry.result = { ...entry.result, eligible: false }; entry.expiresAt = Date.now() }
       this.touchList()
     }
   }
@@ -1588,20 +1664,16 @@ export class MarketService {
     // A due callback owns the captured deadlines even if another observation
     // arrives before the timer gets its event-loop turn.
     if (this.marketDeadlineTimer && this.marketDeadlineAt <= now) return
-    const config = this.prefs().liquidity, required = []
-    if (config.spread.enabled) required.push('ticker')
-    if (config.depth.enabled || config.slippage.enabled) required.push('book')
-    if (config.openInterest.enabled) required.push('openInterest')
-    if (config.volume24h.enabled) required.push('turnover')
-    if (config.volumeStability.enabled) required.push('hourly')
+    const config = this.prefs().liquidity, configKey = JSON.stringify(config), required = requiredLiquiditySources(config)
     const ids = new Set([...this.catalogChecks.keys(), ...this.catalog.keys()]), deadlines = new Map()
     const continuousMetadata = this.instrumentStream?.synchronized && !this.instrumentStream.signal.aborted
     for (const instId of ids) {
-      const values = [this.catalog.get(instId)?.expiresAt]
+      const entry = this.catalog.get(instId), values = [entry?.expiresAt, this.catalogEntryExpiry(entry, now)]
       if (!continuousMetadata || !this.candidateIDs?.has(instId)) values.push(this.instrumentObservations.get(instId)?.expiresAt)
       const observations = this.observations.get(instId) ?? {}
       const assessed = this.catalogChecks.get(instId)?.observations ?? {}
-      for (const key of required) values.push(this.observationExpiry(observations[key], key, instId), this.observationExpiry(assessed[key], key, instId))
+      for (const key of required) values.push(this.observationExpiry(observations[key], key, instId), this.observationExpiry(assessed[key], key, instId),
+        this.qualificationExpiry(observations[key], key, instId, configKey, now), this.qualificationExpiry(assessed[key], key, instId, configKey, now))
       const future = values.filter(value => Number.isSafeInteger(value) && value > now && value < Number.MAX_SAFE_INTEGER)
       if (future.length) deadlines.set(instId, Math.min(...future))
     }
@@ -1641,7 +1713,7 @@ export class MarketService {
       this.pruneCatalog()
       for (const instId of due) {
         const record = this.catalogChecks.get(instId)
-        if (record) this.catalogChecks.set(instId, { ...record, status: 'unknown', result: { ...record.result, eligible: false }, expiresAt: now })
+        if (record && !this.validCatalogEntry(record, now)) this.catalogChecks.set(instId, { ...record, status: 'unknown', result: { ...record.result, eligible: false }, expiresAt: now })
         this.streamQualifications.add(instId)
         this.scheduleQualification(instId)
         this.recoverRequiredSources(instId)
@@ -1767,7 +1839,7 @@ export class MarketService {
       record.observations = { ...observations }
     }
     const published = this.catalog.get(instId)
-    if (published) published.expiresAt = now
+    if (published) { published.status = 'unknown'; published.result = { ...published.result, eligible: false }; published.expiresAt = now }
     // Unsubscribe callbacks run inside the transport's membership update.
     // Requalification must not re-enter subscription reconciliation.
     this.queueStreamQualification(instId, 'book')
@@ -1786,12 +1858,15 @@ export class MarketService {
   }
 
   liquidityInput(instrument, config, observations, now = Date.now()) {
-    const fresh = key => this.observation(observations, key, now)
-    const asOf = closedBoundary('5m', now)
+    const configKey = JSON.stringify(config)
+    const fresh = key => this.qualificationObservation(observations, key, instrument.instId, configKey, now)
     const turnover = fresh('turnover')?.value, hourly = fresh('hourly')?.value
+    // The hourly validator must use the actual retained window's boundary.
+    // Live sources and each historical observation retain their own timestamps.
+    const asOf = hourly?.asOf ?? closedBoundary('5m', now)
     return { instrument, ticker: fresh('ticker')?.value ?? null, book: fresh('book')?.value ?? null,
-      openInterest: fresh('openInterest')?.value ?? null, hourlyCandles: hourly?.asOf === closedBoundary('1H', now) ? hourly.rows : [],
-      turnover24hUSDT: turnover?.asOf === asOf ? turnover.turnover : null, asOf, config }
+      openInterest: fresh('openInterest')?.value ?? null, hourlyCandles: hourly?.rows ?? [],
+      turnover24hUSDT: turnover?.turnover ?? null, asOf, config }
   }
 
   cheapLiquidity(input) {
@@ -1800,31 +1875,41 @@ export class MarketService {
   }
 
   observedCandidate(instrument, config, configKey, observations, errors = {}, now = Date.now(), evaluatedResult) {
-    const fresh = key => this.observation(observations, key, now)
-    const input = this.liquidityInput(instrument, config, observations, now)
+    let assessed = observations, input = this.liquidityInput(instrument, config, observations, now)
     if (!evaluatedResult && input.book && (config.depth.enabled || config.slippage.enabled) && this.cheapLiquidity(input).status === 'failed') input.book = null
-    const result = evaluatedResult ?? this.evaluateLiquidity(input)
-    const required = []
-    if (config.spread.enabled) required.push('ticker')
-    if (config.depth.enabled || config.slippage.enabled) required.push('book')
-    if (config.openInterest.enabled) required.push('openInterest')
-    if (config.volume24h.enabled) required.push('turnover')
-    if (config.volumeStability.enabled) required.push('hourly')
+    let result = evaluatedResult ?? this.evaluateLiquidity(input)
+    const required = requiredLiquiditySources(config)
+    const historical = required.filter(key => key === 'turnover' || key === 'hourly')
+    const historicalPending = historical.some(key => observations[key]?.value.asOf !== closedBoundary(key === 'turnover' ? '5m' : '1H', now))
+    const previous = this.catalog.get(instrument.instId)
+    const retained = historicalPending && this.validCatalogEntry(previous, now)
+      && historical.every(key => this.qualificationObservation(previous.observations, key, instrument.instId, configKey, now))
+    if (result.status === 'verified' && retained && historical.some(key => observations[key] !== previous.observations[key])) {
+      // At an hourly close either native timeframe can commit first. Publish
+      // the complete historical tuple together, while still checking fresh
+      // live evidence and immediately applying any newly proven failure.
+      assessed = { ...observations, ...Object.fromEntries(historical.map(key => [key, previous.observations[key]])) }
+      input = this.liquidityInput(instrument, config, assessed, now)
+      result = this.evaluateLiquidity(input)
+    }
+    const fresh = key => this.qualificationObservation(assessed, key, instrument.instId, configKey, now)
     const instrumentObservation = this.instrumentObservations.get(instrument.instId)
     const continuousMetadata = this.instrumentStream?.synchronized && !this.instrumentStream.signal.aborted && this.candidateIDs?.has(instrument.instId)
     const metadataFresh = continuousMetadata || instrumentObservation?.expiresAt > now
     const validObservations = required.map(fresh)
-    const complete = metadataFresh && validObservations.every(Boolean)
+    const complete = metadataFresh && validObservations.every(Boolean) && (!historicalPending || retained)
     const status = !metadataFresh ? 'unknown' : result.status === 'verified' && complete ? 'verified' : result.status === 'failed' ? 'failed' : 'unknown'
     const leases = complete ? [continuousMetadata ? { ...instrumentObservation, expiresAt: Number.MAX_SAFE_INTEGER } : instrumentObservation,
       ...required.map((key, index) => ({ observedAt: validObservations[index].observedAt, expiresAt: this.observationExpiry(validObservations[index], key, instrument.instId) }))] : []
-    return this.catalogRecord({ instrument, ...(instrumentObservation ? { instrumentObservation } : {}),
+    const record = this.catalogRecord({ instrument, ...(instrumentObservation ? { instrumentObservation } : {}),
       ticker: fresh('ticker')?.value ?? {}, result: { ...result, eligible: status === 'verified' },
-      status, configKey, observations: { ...observations }, observationErrors: errors,
+      status, configKey, observations: { ...assessed }, observationErrors: errors,
       preferencesRevision: this.catalogChecks.get(instrument.instId)?.preferencesRevision ?? 0,
       renewalTarget: status === 'verified' || status === 'unknown' && this.renewalTargets.has(instrument.instId),
       observedAt: leases.length ? Math.min(...leases.map(value => value.observedAt)) : now,
       expiresAt: status === 'verified' ? Math.min(...leases.map(value => value.expiresAt)) : now }, now)
+    this.rememberHistoricalAssessment(record, now, true)
+    return record
   }
 
   // Qualification is a local calculation. Source acquisition can be pending
@@ -1956,6 +2041,7 @@ export class MarketService {
       value ??= calculate(rows, end, from)
       if (key === 'turnover') this.cacheRankingCandles(instId, rows)
       const observation = { value: { asOf: end, ...value }, observedAt: Date.now(), expiresAt: end + step }
+      this.historicalInputs.set(observation, new Map(rows.map(row => [row.timestamp, row.quoteVolume])))
       observations[key] = observation
       return observation
     }
@@ -1987,10 +2073,9 @@ export class MarketService {
     if (config.volumeStability.enabled && !(this.observation(observations, 'hourly')?.value.asOf === closedBoundary('1H', asOf))) tasks.push(observeHistory('hourly'))
     await Promise.all(tasks)
     if (!this.currentCandidate(instrument, configKey, signal)) return
-    const historicalAsOf = closedBoundary('5m')
-    const historicalResult = evaluateLiquidity({ instrument, config, asOf: historicalAsOf,
-      turnover24hUSDT: observations.turnover?.value.asOf === historicalAsOf ? this.observation(observations, 'turnover')?.value.turnover ?? null : null,
-      hourlyCandles: observations.hourly?.value.asOf === closedBoundary('1H', historicalAsOf) ? this.observation(observations, 'hourly')?.value.rows ?? [] : [] })
+    const historicalInput = this.liquidityInput(instrument, config, observations)
+    const historicalResult = evaluateLiquidity({ instrument, config, asOf: historicalInput.asOf,
+      turnover24hUSDT: historicalInput.turnover24hUSDT, hourlyCandles: historicalInput.hourlyCandles })
     // Historical repairs can take minutes. Obtain live liquidity only after
     // those repairs; acquire only a missing contract's bounded ticker fallback.
     // A known failing historical condition already excludes a contract; it
@@ -2142,6 +2227,7 @@ export class MarketService {
     if (removedIDs.length) this.track(this.history.removeTargets(removedIDs))
     this.liveStatistics.remove(removedIDs)
     for (const instId of removedIDs) {
+      this.instrumentGenerations.set(instId, (this.instrumentGenerations.get(instId) ?? 0) + 1)
       // Invalidate in-flight latest reads even before this series has ever
       // received a forming candle. Re-listing retains the newer source epoch.
       for (const timeframe of LIST_TIMEFRAMES) {
@@ -2164,6 +2250,7 @@ export class MarketService {
     for (const instrument of candidates) {
       const previous = this.instruments.get(instrument.instId)
       if (previous && JSON.stringify(previous) !== JSON.stringify(instrument)) {
+        this.instrumentGenerations.set(instrument.instId, (this.instrumentGenerations.get(instrument.instId) ?? 0) + 1)
         const observations = this.observations.get(instrument.instId)
         if (observations) delete observations.book
         this.books.invalidate(instrument.instId)
@@ -2332,6 +2419,8 @@ export class MarketService {
     await this.ready
     const current = this.prefs(), previous = validatePreferences(previousPreferences)
     if (JSON.stringify(previous.liquidity) !== JSON.stringify(current.liquidity)) {
+      this.historicalAssessments = new WeakMap()
+      this.historicalValidations = new WeakSet()
       this.refreshController?.abort()
       this.renewalController?.abort()
       for (const controller of this.catalogControllers) controller.abort()
@@ -2358,6 +2447,8 @@ export class MarketService {
   }
 
   invalidate() {
+    this.historicalAssessments = new WeakMap()
+    this.historicalValidations = new WeakSet()
     this.refreshController?.abort()
     this.renewalController?.abort()
     for (const controller of this.catalogControllers) controller.abort()

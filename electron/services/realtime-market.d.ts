@@ -44,6 +44,8 @@ export type RealtimeMarketOptions<Candle extends CandleRecord = CandleRecord> = 
    * Must coordinate durable mutations with onConfirmed. Close aborts and drains repairs.
    */
   onReconnect: (subscriptions: RealtimeSubscription[], context: { signal: AbortSignal }) => void | Promise<void>
+  /** Per-series acknowledgement; independent of other pending subscriptions. */
+  onSubscribed?: (subscription: RealtimeSubscription, context: RealtimeEventContext) => void | Promise<void>
   onState?: (state: RealtimeMarketState) => void | Promise<void>
   webSocketFactory?: WebSocketFactory
   url?: string
