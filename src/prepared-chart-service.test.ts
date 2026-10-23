@@ -689,6 +689,114 @@ test('a quiet quote pushes its stale transition without periodic chart reads or 
   } finally { await pipeline.dispose() }
 })
 
+test('continuous live quotes cannot postpone repairing a resident historical viewport', async context => {
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Math.floor(Date.now() / interval) * interval + 1000 })
+  const canonical = source(700), target = canonical[500].timestamp, first = target - 95 * interval
+  const calls: string[] = []
+  const rows = canonical.map(row => row.timestamp >= first && row.timestamp < target - 12 * interval
+    ? { ...row, oi: null, buy: null, sell: null, statisticsVersion: null } : row)
+  const { pipeline, store } = fixture(rows as any, {
+    async ensureStatistics(_instrument: string, _timeframe: string, from: number, through: number, _priority: string, _signal: AbortSignal, source: string) {
+      calls.push(source)
+      return { rows: canonical.filter(row => row.timestamp >= from && row.timestamp <= through) }
+    },
+  })
+  const flush = async () => { for (let count = 0; count < 8; count++) await new Promise<void>(resolve => setImmediate(resolve)) }
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const state = pipeline.state(instId, '15m')
+    await pipeline.read(state, target, 1536); await pipeline.seed(state); await finishSeed(pipeline)
+    const reads = store.queries.length
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target }, 'resident-history')
+    for (let tick = 0; tick < 12; tick++) {
+      context.mock.timers.tick(250)
+      await pipeline.setLive(instId, '15m', { ...canonical.at(-1), timestamp: end() + interval, confirmed: false, volume: 100 + tick }, { receivedAt: Date.now() })
+      await flush()
+    }
+    assert.deepEqual(calls.toSorted(), ['oi', 'taker'], 'A quiet period in the live market cannot be required before starting historical repairs.')
+    const repaired = pipeline.historyFrame(state, target)
+    assert.equal(repaired.oiState, 'ready'); assert.equal(repaired.takerState, 'ready')
+    assert.equal(store.queries.length, reads, 'Statistics returned by acquisition must update the resident viewport without rereading its prices.')
+  } finally { await pipeline.dispose() }
+})
+
+test('an old source job on the known viewport edge cannot suppress demand for its uncovered missing samples', async context => {
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Math.floor(Date.now() / interval) * interval + 1000 })
+  const canonical = source(700), target = canonical[500].timestamp, oldEnd = target + 80 * interval, first = target - 95 * interval
+  const calls: Array<{ source: string; from: number; through: number }> = []
+  const rows = canonical.map(row => row.timestamp >= first && row.timestamp <= oldEnd
+    && !(row.timestamp >= target - 15 * interval && row.timestamp <= target)
+    ? { ...row, oi: null, buy: null, sell: null, statisticsVersion: null } : row)
+  const { pipeline } = fixture(rows as any, {
+    async ensureStatistics(_instrument: string, _timeframe: string, from: number, through: number, _priority: string, signal: AbortSignal, source: string) {
+      calls.push({ source, from, through })
+      if (through === oldEnd) await new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+      return { rows: canonical.filter(row => row.timestamp >= from && row.timestamp <= through) }
+    },
+  })
+  const flush = async () => { for (let count = 0; count < 8; count++) await new Promise<void>(resolve => setImmediate(resolve)) }
+  try {
+    await pipeline.local(instId, '15m', { priority: 'background' }); await finishSeed(pipeline)
+    const state = pipeline.state(instId, '15m')
+    await pipeline.read(state, target, 1536); await pipeline.seed(state); await finishSeed(pipeline)
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: oldEnd }, 'old-window')
+    pipeline.refreshObservations(state, oldEnd); await flush(); assert.equal(calls.length, 2)
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target }, 'selected-window')
+    assert.equal(pipeline.frame(state, target, true).bars.filter((bar: any) => bar.oiObserved).length, 16)
+    for (let tick = 0; tick < 12; tick++) {
+      context.mock.timers.tick(250)
+      await pipeline.setLive(instId, '15m', { ...canonical.at(-1), timestamp: end() + interval, confirmed: false, volume: 100 + tick })
+      await flush()
+    }
+    assert.deepEqual(calls.filter(call => call.through === target).map(call => call.source).toSorted(), ['oi', 'taker'])
+    assert.equal(calls.length, 4, 'Useful old consumers are shared, while each uncovered source receives one current consumer.')
+    const repaired = pipeline.historyFrame(state, target)
+    assert.equal(repaired.oiState, 'ready'); assert.equal(repaired.takerState, 'ready')
+  } finally { await pipeline.dispose() }
+})
+
+test('an active source on the known edge cannot hide an uncovered failure or its retry deadline', async () => {
+  const canonical = source(700), target = canonical[500].timestamp, first = target - 95 * interval, gate = deferred()
+  const rows = canonical.map(row => row.timestamp >= first && row.timestamp < target - 15 * interval
+    ? { ...row, oi: null, buy: null, sell: null, statisticsVersion: null } : row)
+  const { pipeline } = fixture(rows as any, { async ensureStatistics() { await gate.promise } })
+  try {
+    await pipeline.local(instId, '15m', { priority: 'background' }); await finishSeed(pipeline)
+    const state = pipeline.state(instId, '15m')
+    await pipeline.read(state, target, 1536); await pipeline.seed(state); await finishSeed(pipeline)
+    const retryAt = Date.now() + 60_000
+    pipeline.sourceAttempts.set('failed-missing-oi', { seriesKey: state.key, source: 'oi', from: first, through: target - 16 * interval,
+      failures: 1, failedAt: Date.now(), retryAt, error: 'Historical OI failed' })
+    const edge = pipeline.sourceJob('known-edge', async () => gate.promise, { state, source: 'oi', from: target - 15 * interval, through: target + 80 * interval })
+    const frame = pipeline.historyFrame(state, target)
+    assert.equal(frame.oiState, 'error'); assert.equal(frame.oiStatus.error, 'Historical OI failed'); assert.equal(frame.oiStatus.retryAt, retryAt)
+    assert.equal(frame.takerState, 'loading', 'A failure is scoped to its own source.')
+    gate.resolve(); await edge
+  } finally { gate.resolve(); await pipeline.dispose() }
+})
+
+test('a newer statistic fences only its own slot while an admitted history page fills the other 95 samples', async () => {
+  const canonical = source(400), rows = canonical.map(row => ({ ...row, oi: null, buy: null, sell: null, statisticsVersion: null }))
+  const { pipeline, store } = fixture(rows as any), gate = deferred(), started = deferred()
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const read = store.candles.bind(store), first = end() - 95 * interval
+    store.candles = async (query: any) => {
+      if (query.from === first && query.order === 'asc') { started.resolve(); await gate.promise; return canonical.slice(-96) }
+      return read(query)
+    }
+    const observed = pipeline.observeStatistics(instId, '15m', first, end(), 'interactive', undefined, 'oi')
+    await started.promise
+    await pipeline.observeStatistics(instId, '15m', end(), end(), 'interactive', [{ ...canonical.at(-1), oi: 9000 }], 'oi')
+    gate.resolve(); await observed
+    const frame = pipeline.cached(`${instId}:15m`)
+    assert.equal(frame.oiState, 'ready'); assert.equal(frame.bars.filter((bar: any) => bar.oiObserved).length, 96)
+    assert.equal(frame.bars.at(-1).oi, 9000, 'The newer final slot remains authoritative.')
+    assert.ok(frame.bars.slice(0, -1).every((bar: any) => bar.oi === 5000))
+    assert.ok(frame.bars.every((bar: any) => !bar.takerObserved), 'Unrequested source observations stay independent.')
+  } finally { gate.resolve(); await pipeline.dispose() }
+})
+
 test('returning from deep history restores an evicted latest price locally before source work', async () => {
   const rows = source(5000), { pipeline, store } = fixture(rows)
   try {

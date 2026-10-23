@@ -705,6 +705,82 @@ test('a reserve status cannot erase a disjoint visible source error or poison un
   assert.equal(store.window(instId, '1H', 299 * hour)?.oiStatus?.error, 'Visible OI failed')
 })
 
+test('statuses touching only observed edges cannot hide failures and retries supersede only the missing slots they cover', () => {
+  for (const compact of [false, true]) for (const edgeState of ['loading', 'ready'] as const) for (const empty of [false, true]) {
+    const store = new PreparedChartStore()
+    store.setUniverse([instId], '1H', instId)
+    const values = bars(104, 96).map((value, index) => index < 16
+      ? empty ? { ...value, oi: null, buy: null, sell: null } : value
+      : { ...value, oi: null, buy: null, sell: null, oiObserved: false, takerObserved: false, statisticsObserved: false, statisticsSources: 0 })
+    const oiStatus = { state: 'error' as const, from: 104 * hour, through: 199 * hour, error: 'OI failed', retryAt: 123_456 }
+    const takerStatus = { ...oiStatus, error: 'Taker failed', retryAt: 234_567 }
+    const ingest = (frame: PreparedChartResponse) => compact ? store.ingestLatest(frame) : store.ingest(frame)
+    ingest(response(values, { oiState: 'error', takerState: 'error', oiStatus, takerStatus }))
+    const failed = store.window(instId, '1H')!
+    const edge = { state: edgeState, from: 24 * hour, through: 119 * hour }
+    ingest(response(values, { revision: 2, oiState: edgeState, takerState: edgeState, oiStatus: edge, takerStatus: edge }))
+    assert.equal(store.window(instId, '1H'), failed, 'An unrelated edge status cannot change the visible failure, including observed-empty edges.')
+    assert.equal(failed.oiStatus?.error, 'OI failed'); assert.equal(failed.oiStatus?.retryAt, 123_456)
+    assert.equal(failed.takerStatus?.error, 'Taker failed'); assert.equal(failed.takerStatus?.retryAt, 234_567)
+
+    ingest(response(values, { revision: 3, oiStatus: { state: 'loading', from: 120 * hour, through: 159 * hour } }))
+    const partialRetry = store.window(instId, '1H')!
+    assert.equal(partialRetry.oiState, 'error'); assert.equal(partialRetry.oiStatus?.retryAt, 123_456)
+    assert.equal(partialRetry.takerState, 'error'); assert.equal(partialRetry.takerStatus?.retryAt, 234_567)
+    ingest(response(values, { revision: 4, oiStatus: { state: 'ready', from: 160 * hour, through: 199 * hour } }))
+    const retrying = store.window(instId, '1H')!
+    assert.equal(retrying.oiState, 'loading', 'Newer statuses supersede every failed slot, but readiness still requires observations.')
+    assert.equal(retrying.oiStatus?.error, undefined); assert.equal(retrying.oiStatus?.retryAt, undefined)
+    assert.equal(retrying.takerState, 'error'); assert.equal(retrying.takerStatus?.retryAt, 234_567)
+    assert.equal(retrying.bars, failed.bars, 'Status changes reuse the prepared bars.')
+    assert.equal(failed.oiState, 'error', 'Previously presented snapshots remain immutable.')
+  }
+})
+
+test('a partially overlapping reserve retry leaves uncovered historical failures visible without affecting complete windows', () => {
+  const store = new PreparedChartStore()
+  const values = bars(104, 196).map(value => value.hour <= 183 * hour
+    ? { ...value, oi: null, buy: null, sell: null, oiObserved: false, takerObserved: false, statisticsObserved: false, statisticsSources: 0 } : value)
+  const oiStatus = { state: 'error' as const, from: 104 * hour, through: 199 * hour, error: 'Historical OI failed', retryAt: 123_456 }
+  const takerStatus = { ...oiStatus, error: 'Historical Taker failed', retryAt: 234_567 }
+  store.ingest(response(values, { endHour: 199 * hour, oiStatus, takerStatus }))
+  const latest = store.window(instId, '1H', 299 * hour)!
+  const reserve = bars(24, 96).map(value => ({ ...value, oi: null, buy: null, sell: null,
+    oiObserved: false, takerObserved: false, statisticsObserved: false, statisticsSources: 0 }))
+  const loading = { state: 'loading' as const, from: 24 * hour, through: 119 * hour }
+  store.ingest(response(reserve, { revision: 2, latestEnd: 299 * hour, oiStatus: loading, takerStatus: loading }))
+  const historical = store.window(instId, '1H', 199 * hour)!
+  assert.equal(historical.bars.length, 96); assert.equal(historical.bars.filter(value => value.oi !== null).length, 16)
+  assert.equal(historical.indicatorState, 'ready')
+  assert.equal(historical.oiState, 'error'); assert.equal(historical.oiStatus?.error, 'Historical OI failed'); assert.equal(historical.oiStatus?.retryAt, 123_456)
+  assert.equal(historical.takerState, 'error'); assert.equal(historical.takerStatus?.error, 'Historical Taker failed'); assert.equal(historical.takerStatus?.retryAt, 234_567)
+  assert.equal(store.window(instId, '1H', 119 * hour)?.oiState, 'loading')
+  assert.equal(store.window(instId, '1H', 119 * hour)?.takerState, 'loading')
+  assert.equal(store.window(instId, '1H', 299 * hour), latest)
+  store.ingest(response([], { revision: 3, endHour: 199 * hour, latestEnd: 299 * hour,
+    oiStatus: { state: 'loading', from: 120 * hour, through: 183 * hour } }))
+  const retrying = store.window(instId, '1H', 199 * hour)!
+  assert.equal(retrying.oiState, 'loading'); assert.equal(retrying.oiStatus?.retryAt, undefined)
+  assert.equal(retrying.takerState, 'error'); assert.equal(retrying.takerStatus?.retryAt, 234_567)
+})
+
+test('unsupported statistics must cover every unobserved slot within a proven listing floor', () => {
+  const store = new PreparedChartStore()
+  const values = bars(188, 12).map(value => ({ ...value, oi: null, oiObserved: false, takerObserved: true, statisticsObserved: false, statisticsSources: 2 }))
+  const unsupported = { state: 'unavailable' as const, reason: 'unsupported' as const, from: 188 * hour, through: 193 * hour }
+  store.ingest(response(values, { historyExhausted: true, oiStatus: unsupported }))
+  const pending = store.window(instId, '1H')!
+  assert.equal(pending.oiState, 'loading'); assert.equal(pending.oiStatus?.reason, undefined)
+  store.ingest(response([], { revision: 2, endHour: 199 * hour, latestEnd: 199 * hour,
+    oiStatus: { ...unsupported, from: 194 * hour, through: 199 * hour } }))
+  const unavailable = store.window(instId, '1H')!
+  assert.equal(unavailable.oiState, 'unavailable'); assert.equal(unavailable.oiStatus?.reason, 'unsupported')
+  assert.equal(unavailable.takerState, 'ready'); assert.equal(unavailable.bars, pending.bars)
+  store.ingest(response([], { revision: 3, endHour: 199 * hour, latestEnd: 199 * hour,
+    oiStatus: { state: 'ready', from: 199 * hour, through: 199 * hour } }))
+  assert.equal(store.window(instId, '1H')?.oiState, 'loading', 'A newer ready status still needs an actual observation.')
+})
+
 
 test('missing timestamps cannot override incoming statistic errors with numeric or observed-empty bars', () => {
   for (const compact of [false, true]) for (const empty of [false, true]) {
@@ -720,7 +796,11 @@ test('missing timestamps cannot override incoming statistic errors with numeric 
     assert.equal(failed.bars.length, 95); assert.equal(failed.priceState, 'partial')
     assert.equal(failed.oiState, 'error'); assert.equal(failed.oiStatus?.error, 'OI request failed'); assert.equal(failed.oiStatus?.retryAt, 123_456)
     assert.equal(failed.takerState, 'error'); assert.equal(failed.takerStatus?.error, 'Taker request failed'); assert.equal(failed.takerStatus?.retryAt, 234_567)
-    ingest(response(compact ? complete : [complete[40]], { revision: 2, endHour: 199 * hour, latestEnd: 199 * hour }))
+    const edge = { state: 'ready' as const, from: 198 * hour, through: 199 * hour }
+    ingest(response(sparse, { revision: 2, oiStatus: edge, takerStatus: edge }))
+    assert.equal(store.window(instId, '1H')?.oiStatus?.retryAt, 123_456, 'A known edge cannot certify the absent interior timestamp.')
+    assert.equal(store.window(instId, '1H')?.takerStatus?.retryAt, 234_567)
+    ingest(response(compact ? complete : [complete[40]], { revision: 3, endHour: 199 * hour, latestEnd: 199 * hour }))
     const recovered = store.window(instId, '1H')!
     assert.equal(recovered.oiState, empty ? 'unavailable' : 'ready'); assert.equal(recovered.oiStatus?.error, undefined)
     assert.equal(recovered.takerState, empty ? 'unavailable' : 'ready'); assert.equal(recovered.takerStatus?.error, undefined)

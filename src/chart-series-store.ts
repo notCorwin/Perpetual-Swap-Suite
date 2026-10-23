@@ -1,5 +1,5 @@
 import { hookOperationMethods } from '../electron/services/operations.js'
-import type { Bar, ChartSourceStatus, PreparedChartBar, PreparedChartLiveUpdate, PreparedChartMeta, PreparedChartResponse, ReadyChartWindow } from './chart-data.ts'
+import type { Bar, ChartSourceStatus, PreparedChartBar, PreparedChartLiveUpdate, PreparedChartMeta, PreparedChartResponse, PreparedChartState, ReadyChartWindow } from './chart-data.ts'
 import { RADAR_TIMEFRAMES, timeframeMilliseconds, type RadarTimeframe } from './timeframe.ts'
 
 const WINDOW_BARS = 96
@@ -77,15 +77,37 @@ function matchingStatus(meta: PreparedChartMeta, from: number, through: number, 
   return [...meta.sourceStatuses ?? []].reverse().find(value => value.source === source && value.status.through !== null && value.status.from <= through && value.status.through >= from)?.status
 }
 
-function windowStatistics(meta: PreparedChartMeta, bars: PreparedChartBar[], from: number, through: number, source: 'oi' | 'taker') {
+function windowStatistics(meta: PreparedChartMeta, bars: PreparedChartBar[], from: number, through: number, source: 'oi' | 'taker'): { state: PreparedChartState; status: ChartSourceStatus | undefined } {
   const bit = source === 'oi' ? 1 : 2
-  const complete = bars.length === (through - from) / meta.intervalMS + 1 && bars.every((bar, index) => bar.hour === from + index * meta.intervalMS)
-  const state = complete && bars.every(bar => observed(bar, bit)) ? bars.every(bar => source === 'oi' ? finite(bar.oi) : finite(bar.buy) && finite(bar.sell)) ? 'ready' : 'unavailable' : 'loading'
-  const matching = matchingStatus(meta, from, through, source)
-  const status: ChartSourceStatus | undefined = state === 'loading' && matching
-    ? { ...matching, state: matching.state === 'error' || matching.reason === 'unsupported' ? matching.state : 'loading', from, through }
-    : matching ? { state, from, through, ...(state === 'unavailable' ? { reason: 'not-published' as const } : {}) } : undefined
-  return { state: status?.state ?? state, status }
+  const missing = new Set<number>()
+  for (let hour = from; hour <= through; hour += meta.intervalMS) missing.add(hour)
+  for (const bar of bars) if (observed(bar, bit)) missing.delete(bar.hour)
+  if (!missing.size) {
+    const state = bars.every(bar => source === 'oi' ? finite(bar.oi) : finite(bar.buy) && finite(bar.sell)) ? 'ready' : 'unavailable'
+    const status: ChartSourceStatus | undefined = matchingStatus(meta, from, through, source)
+      ? { state, from, through, ...(state === 'unavailable' ? { reason: 'not-published' as const } : {}) } : undefined
+    return { state, status }
+  }
+  let matching: ChartSourceStatus | undefined
+  let loading = false
+  // Each missing slot belongs to its newest covering status. Work on other
+  // slots cannot clear a failure that still owns an unresolved observation.
+  for (const value of [...meta.sourceStatuses ?? []].reverse()) {
+    const status = value.status
+    if (value.source !== source || status.through === null) continue
+    let relevant = false
+    for (const hour of missing) if (status.from <= hour && hour <= status.through) {
+      missing.delete(hour)
+      relevant = true
+    }
+    if (!relevant) continue
+    if (!matching || status.state === 'error' && matching.state !== 'error') matching = status
+    if (status.state !== 'error' && !(status.state === 'unavailable' && status.reason === 'unsupported')) loading = true
+  }
+  const state = matching?.state === 'error' ? 'error' : missing.size || loading ? 'loading' : 'unavailable'
+  const status: ChartSourceStatus | undefined = !matching ? undefined : state === 'error' ? { ...matching, from, through }
+    : { state, from, through, ...(state === 'unavailable' ? { reason: 'unsupported' as const } : {}) }
+  return { state, status }
 }
 
 function readyWindow(meta: PreparedChartMeta, bars: PreparedChartBar[], endHour: number, liveBar?: Bar, previous?: ReadyChartWindow): ReadyChartWindow {

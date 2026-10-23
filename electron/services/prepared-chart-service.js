@@ -95,6 +95,7 @@ export class PreparedChartPipeline {
       this.priceJournal.set(key, journal)
     })
     this.closed = false; this.disposeTask = null; this.focusKey = null; this.requestedIDs = new Set(); this.refreshTimer = null
+    this.repairDeadlines = new Map()
   }
 
   state(instId, timeframe) {
@@ -280,10 +281,11 @@ export class PreparedChartPipeline {
   sourceStatus(state, source, from, through, availability) {
     let status = { state: availability, from, through }
     if (!['ready', 'unavailable'].includes(availability)) {
-      const active = [...this.sourceTasks.values()].some(job => job.seriesKey === state.key && job.source === source && job.from <= through && job.through >= from)
-      const failure = [...this.sourceAttempts.values()].filter(attempt => attempt.seriesKey === state.key && attempt.source === source && attempt.from <= through && attempt.through >= from)
+      const pending = this.pendingSourceRanges(state, source, from, through)
+      const failure = [...this.sourceAttempts.values()].filter(attempt => attempt.seriesKey === state.key && attempt.source === source
+        && pending.some(range => attempt.from <= range.through && attempt.through >= range.from))
         .sort((left, right) => right.failedAt - left.failedAt)[0]
-      if (failure && !active) status = { ...status, state: 'error', error: failure.error, retryAt: failure.retryAt }
+      if (failure) status = { ...status, state: 'error', error: failure.error, retryAt: failure.retryAt }
       else if (source !== 'candles' && typeof this.history.ensureStatistics !== 'function') status = { ...status, state: 'unavailable', reason: 'unsupported' }
     } else if (availability === 'unavailable' && source !== 'candles') status.reason = 'not-published'
     state.statusCache ??= new Map()
@@ -544,7 +546,7 @@ export class PreparedChartPipeline {
     for (const [source, bit] of [['oi', 1], ['taker', 2]]) {
       let missing = false
       for (let hour = from; hour <= end; hour += step) if (!sourceFresh(state.rows.get(hour), bit)) { missing = true; break }
-      if (!missing || typeof this.history.ensureStatistics !== 'function') continue
+      if (!missing || typeof this.history.ensureStatistics !== 'function' || !this.pendingSourceRanges(state, source, from, end).length) continue
       this.sourceJob(`${source}:${state.key}:${from}:${end}`, async (signal, job) => {
         const result = await this.history.ensureStatistics(instId, timeframe, from, end, job.priority, signal, source)
         signal.throwIfAborted()
@@ -638,10 +640,26 @@ export class PreparedChartPipeline {
   }
 
   sourceRetryAt(state, source, from, through) {
+    if (!this.sourceAttempts.size) return 0
+    const pending = this.pendingSourceRanges(state, source, from, through)
     let retryAt = 0
     for (const attempt of this.sourceAttempts.values()) if (attempt.seriesKey === state.key && attempt.source === source
-      && attempt.from <= through && attempt.through >= from) retryAt = Math.max(retryAt, attempt.retryAt)
+      && pending.some(range => attempt.from <= range.through && attempt.through >= range.from)) retryAt = Math.max(retryAt, attempt.retryAt)
     return retryAt > Date.now() ? retryAt : 0
+  }
+
+  pendingSourceRanges(state, source, from, through) {
+    const jobs = [...this.sourceTasks.values()].filter(job => job.seriesKey === state.key && job.source === source)
+    const ranges = []
+    for (let hour = from; hour <= through; hour += state.intervalMS) {
+      const row = state.rows.get(hour)
+      if ((source === 'candles' ? completePriceCandle(row) : sourceFresh(row, source === 'oi' ? 1 : 2))
+        || jobs.some(job => job.from <= hour && job.through >= hour)) continue
+      const previous = ranges.at(-1)
+      if (previous?.through + state.intervalMS === hour) previous.through = hour
+      else ranges.push({ from: hour, through: hour })
+    }
+    return ranges
   }
 
   sourceJob(key, operation, { state, source, from, through, reserve, priority = 'interactive' }) {
@@ -685,13 +703,21 @@ export class PreparedChartPipeline {
   scheduleRefresh() {
     if (this.refreshTimer !== null) clearTimeout(this.refreshTimer)
     this.refreshTimer = null
-    if (this.closed || !this.focus) return
+    if (this.closed || !this.focus) { this.repairDeadlines.clear(); return }
     const focus = this.focus
     const state = this.series.get(this.focusKey)
-    if (!state) return
+    if (!state) { this.repairDeadlines.clear(); return }
     const now = Date.now(), step = state.intervalMS, boundary = Math.floor(now / step) * step
     const end = focus.end ?? boundary - step, from = Math.max(0, end - (VISIBLE - 1) * step, state.floor ?? 0)
     let deadline = boundary + step + 1000, missingPrices = false
+    const repairDeadlines = new Map()
+    const repair = (source, from, through) => {
+      const key = `${state.key}:${source}:${from}:${through}`
+      // Missing-source demand has an absolute due time. Fresh live quotes may
+      // renew their own lease, but cannot debounce historical repair forever.
+      const at = this.sourceRetryAt(state, source, from, through) || this.repairDeadlines.get(key) || now + 1000
+      repairDeadlines.set(key, at); deadline = Math.min(deadline, at)
+    }
     const missingStatistics = { oi: false, taker: false }
     for (let hour = from; hour <= end; hour += step) {
       const row = state.rows.get(hour)
@@ -707,15 +733,15 @@ export class PreparedChartPipeline {
     for (const [family, missing, supported] of [['prices', missingPrices, this.history.latest || this.history.ensurePrices], ['oi', missingStatistics.oi, this.history.ensureStatistics], ['taker', missingStatistics.taker, this.history.ensureStatistics]]) {
       if (!missing || !supported) continue
       const source = family === 'prices' ? 'candles' : family
-      const active = [...this.sourceTasks.values()].some(job => job.seriesKey === state.key && job.source === source && job.from <= end && job.through >= from)
-      if (!active) deadline = Math.min(deadline, this.sourceRetryAt(state, source, from, end) || now + 1000)
+      if (this.pendingSourceRanges(state, source, from, end).length) repair(source, from, end)
     }
     const indicators = this.indicatorDemand(state, focus)
     if (indicators) {
       const active = [...this.sourceTasks.values()].some(job => job.seriesKey === state.key && job.source === 'candles'
         && job.from <= indicators.from && job.through >= indicators.through)
-      if (!active) deadline = Math.min(deadline, this.sourceRetryAt(state, 'candles', indicators.from, indicators.through) || now + 1000)
+      if (!active) repair('candles', indicators.from, indicators.through)
     }
+    this.repairDeadlines = repairDeadlines
     if (this.cached(state.key)?.realtimeState === 'live' && state.observedAt !== null) deadline = Math.min(deadline, state.observedAt + 30_000)
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = null
@@ -908,18 +934,21 @@ export class PreparedChartPipeline {
 
   async observeStatistics(instId, timeframe, from, through, priority, inputRows, source) {
     const key = seriesKey(instId, timeframe), state = this.series.get(key), live = this.liveStates.get(key)
-    const admitted = [state, live].filter(Boolean).map(current => ({ current, oi: current.oiVersion, taker: current.takerVersion,
-      hours: [...current.rows.keys()].filter(hour => hour >= from && hour <= through) })).filter(value => value.hours.length)
+    const admitted = [state, live].filter(Boolean).map(current => ({ current,
+      rows: new Map([...current.rows].filter(([hour]) => hour >= from && hour <= through)) })).filter(value => value.rows.size)
     if (!admitted.length) return
     priority ??= this.demandPriority(state ?? live, from, through) === 'interactive' ? 'interactive' : 'background'
-    const hours = admitted.flatMap(value => value.hours)
+    const hours = admitted.flatMap(value => [...value.rows.keys()])
     // Acquisition already returns its committed projection. Both chart and live
     // residency reuse those same rows, or share one bounded SQLite read.
     const rows = inputRows ?? await this.store.candles({ instrument: instId, timeframe, from: Math.min(...hours), through: Math.max(...hours), limit: HISTORY, order: 'asc' }, priority)
-    for (const { current, oi, taker } of admitted) {
-      const allowed = ((oi === current.oiVersion ? 1 : 0) | (taker === current.takerVersion ? 2 : 0)) & (source === 'oi' ? 1 : source === 'taker' ? 2 : 3)
-      for (const row of rows) if (current.rows.has(row.timestamp)) {
+    for (const { current, rows: prior } of admitted) {
+      for (const row of rows) if (current.rows.has(row.timestamp) && prior.has(row.timestamp)) {
         const previous = current.rows.get(row.timestamp), normalized = this.normalize(row)
+        // A newer observation fences only that slot and source. It cannot
+        // discard the unrelated observations in an admitted history page.
+        const allowed = ((changedSource(prior.get(row.timestamp), previous, 1) ? 0 : 1)
+          | (changedSource(prior.get(row.timestamp), previous, 2) ? 0 : 2)) & (source === 'oi' ? 1 : source === 'taker' ? 2 : 3)
         const value = mergeStatistics(previous, { ...previous, ...Object.fromEntries(statisticsFields.map(field => [field, normalized[field]])) }, allowed)
         if (changedSource(previous, value, 1)) current.oiVersion = (current.oiVersion ?? 0) + 1
         if (changedSource(previous, value, 2)) current.takerVersion = (current.takerVersion ?? 0) + 1
