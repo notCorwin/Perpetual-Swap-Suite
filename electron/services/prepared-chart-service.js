@@ -7,6 +7,7 @@ import { stopOperationWorker } from './operation-worker.js'
 import { completePriceCandle } from './market-records.js'
 
 const VISIBLE = 96, TAIL = 128, CHUNK = 1024, HISTORY = 1536, HISTORY_AHEAD = 256, HISTORY_PAGE = 300
+const INDICATOR_WARMUP = 199 // EMA200 is the longest initial seed.
 // Formula versions identify the complete recursive state and verified producer.
 // Older checkpoints do not contain ATR14's Wilder accumulator and SMA seed.
 const FORMULA_VERSION = 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-wilder-atr14-percent-bbw20-2-v5'
@@ -532,6 +533,7 @@ export class PreparedChartPipeline {
 
   refreshObservations(state, targetEnd, historyBars = VISIBLE, priceBars = historyBars, focus = this.focus, reserve) {
     if (!this.currentFocus(focus) || focus.key !== state.key) return null
+    this.refreshIndicators(state, focus)
     const { instId, timeframe, intervalMS: step } = state
     const end = targetEnd ?? Math.floor(Date.now() / step) * step - step
     const from = Math.max(0, end - (historyBars - 1) * step, state.floor ?? 0)
@@ -574,6 +576,60 @@ export class PreparedChartPipeline {
     return task
   }
 
+  indicatorDemand(state, focus = this.focus) {
+    if (!this.currentFocus(focus) || focus.key !== state.key || typeof this.history.ensurePrices !== 'function') return null
+    const end = focus.end ?? Math.floor(Date.now() / state.intervalMS) * state.intervalMS - state.intervalMS
+    const floor = state.floor ?? 0, first = Math.max(0, end - (VISIBLE - 1) * state.intervalMS, floor)
+    let from = Infinity, through = -Infinity
+    for (let hour = first; hour <= end; hour += state.intervalMS) {
+      const calculated = state.indicators.get(hour)
+      if (!calculated) continue
+      if (!numeric(calculated.ema) && hour >= floor + INDICATOR_WARMUP * state.intervalMS) {
+        from = Math.min(from, hour - INDICATOR_WARMUP * state.intervalMS); through = hour
+      }
+      // VWAP can lack offscreen native volumes even when EMA is mature.
+      // An observed zero-volume window is mathematically undefined, not a gap.
+      if (!numeric(calculated.vwap) && hour >= floor + 13 * state.intervalMS) {
+        const start = hour - 13 * state.intervalMS
+        for (let stamp = start; stamp <= hour; stamp += state.intervalMS) if (!completePriceCandle(state.rows.get(stamp))) {
+          from = Math.min(from, start); through = hour; break
+        }
+      }
+    }
+    return from < Infinity ? { from, through } : null
+  }
+
+  refreshIndicators(state, focus = this.focus) {
+    const demand = this.indicatorDemand(state, focus)
+    if (!demand) return null
+    const { from, through } = demand
+    const task = this.sourceJob(`prices:${state.key}:${from}:${through}`, async (signal, job) => {
+      const watermark = () => this.store.priceWatermark?.(state.instId, state.timeframe, job.priority)
+        ?? this.store.candleWatermark(state.instId, state.timeframe, job.priority)
+      const revision = await watermark(), generation = state.generation
+      const result = await this.history.ensurePrices(state.instId, state.timeframe, from, through, job.priority, signal)
+      signal.throwIfAborted()
+      // A prepend or an offscreen hole repair changes recursive descendants,
+      // even when a local tail read cannot see the changed source candle.
+      if (revision !== await watermark() && generation === state.generation) this.invalidateDerived(state, from)
+      const cursor = state.historyEnd ?? undefined
+      await this.read(state, cursor, cursor === undefined ? TAIL : HISTORY, job.priority)
+      signal.throwIfAborted()
+      const rows = result?.rows ?? await this.store.candles({ instrument: state.instId, timeframe: state.timeframe, from, through }, job.priority)
+      signal.throwIfAborted()
+      const byHour = new Map(rows.map(row => [row.timestamp, row]))
+      let complete = true
+      for (let hour = from; hour <= through; hour += state.intervalMS) if (!completePriceCandle(byHour.get(hour))) { complete = false; break }
+      // A previous consumer may have committed these inputs before cancellation
+      // or another generation change. Its cached warmup nulls still need replay.
+      if (complete && this.indicatorDemand(state, focus)) this.invalidateDerived(state, from)
+      this.seed(state, 'foreground'); this.publish(state)
+      return complete
+    }, { state, source: 'candles', from, through, priority: 'interactive' })
+    task?.catch(() => {})
+    return task
+  }
+
   promoteSourceJob(job, priority) {
     if (priorityRank(priority) <= priorityRank(job.priority)) return
     job.priority = priority
@@ -581,10 +637,17 @@ export class PreparedChartPipeline {
     this.history.promoteSource?.(instId, timeframe, job.source, job.from, job.through, priority)?.catch?.(() => {})
   }
 
+  sourceRetryAt(state, source, from, through) {
+    let retryAt = 0
+    for (const attempt of this.sourceAttempts.values()) if (attempt.seriesKey === state.key && attempt.source === source
+      && attempt.from <= through && attempt.through >= from) retryAt = Math.max(retryAt, attempt.retryAt)
+    return retryAt > Date.now() ? retryAt : 0
+  }
+
   sourceJob(key, operation, { state, source, from, through, reserve, priority = 'interactive' }) {
     const existing = this.sourceTasks.get(key) ?? [...this.sourceTasks.values()].find(job => job.seriesKey === state.key && job.source === source && job.from <= from && job.through >= through)
     if (existing) { existing.reserve ??= reserve; this.promoteSourceJob(existing, priority); return existing.task }
-    if ((this.sourceAttempts.get(key)?.retryAt ?? 0) > Date.now()) return null
+    if (this.sourceRetryAt(state, source, from, through)) return null
     const controller = new AbortController(), signal = controller.signal
     const job = { controller, state, source, seriesKey: state.key, from, through, reserve, priority, task: null }
     const failed = error => {
@@ -643,10 +706,15 @@ export class PreparedChartPipeline {
     }
     for (const [family, missing, supported] of [['prices', missingPrices, this.history.latest || this.history.ensurePrices], ['oi', missingStatistics.oi, this.history.ensureStatistics], ['taker', missingStatistics.taker, this.history.ensureStatistics]]) {
       if (!missing || !supported) continue
-      const key = `${family}:${state.key}:${from}:${end}`
       const source = family === 'prices' ? 'candles' : family
       const active = [...this.sourceTasks.values()].some(job => job.seriesKey === state.key && job.source === source && job.from <= end && job.through >= from)
-      if (!active) deadline = Math.min(deadline, this.sourceAttempts.get(key)?.retryAt ?? now + 1000)
+      if (!active) deadline = Math.min(deadline, this.sourceRetryAt(state, source, from, end) || now + 1000)
+    }
+    const indicators = this.indicatorDemand(state, focus)
+    if (indicators) {
+      const active = [...this.sourceTasks.values()].some(job => job.seriesKey === state.key && job.source === 'candles'
+        && job.from <= indicators.from && job.through >= indicators.through)
+      if (!active) deadline = Math.min(deadline, this.sourceRetryAt(state, 'candles', indicators.from, indicators.through) || now + 1000)
     }
     if (this.cached(state.key)?.realtimeState === 'live' && state.observedAt !== null) deadline = Math.min(deadline, state.observedAt + 30_000)
     this.refreshTimer = setTimeout(() => {
@@ -779,6 +847,7 @@ export class PreparedChartPipeline {
       if (state.calculation === task) state.calculation = null
       this.liveSeeds.delete(state.key); this.trim()
       if (!this.closed && restart) this.seed(state, priority)
+      if (!this.closed) { this.refreshIndicators(state); this.scheduleRefresh() }
     })
     state.calculation = task; this.liveSeeds.set(state.key, task)
     return task

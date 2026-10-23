@@ -180,6 +180,190 @@ test('a persisted resident gap repair rebuilds descendant indicators before its 
   } finally { await pipeline.dispose() }
 })
 
+test('a complete price viewport automatically acquires its missing EMA warmup and republishes exact curves', async () => {
+  const canonical = source(400), gate = deferred(), requests: Array<{ from: number; through: number }> = []
+  const { pipeline, store } = fixture(canonical.slice(-96), {
+    async ensurePrices(_instrument: string, _timeframe: string, from: number, through: number) {
+      requests.push({ from, through }); await gate.promise
+      const rows = canonical.filter(row => row.timestamp >= from && row.timestamp <= through)
+      for (const row of rows) if (!store.rows.some(value => value.timestamp === row.timestamp)) store.change(row)
+      return { rows }
+    },
+  })
+  const controller = new ChartController({
+    focus: (target, id) => pipeline.setFocus(target ? { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } : null, id),
+    local: (id, timeframe, focusId) => pipeline.local(id, timeframe, { focusId }),
+    prepare: (target, focusId) => pipeline.prepare(target.instId, target.timeframe, target.end ?? undefined, 96, { focusId }),
+    universe: (ids, timeframe, focusId) => Promise.resolve(pipeline.setUniverse(ids, timeframe, focusId)),
+  })
+  const encoder = new ChartNotificationEncoder()
+  const unsubscribe = pipeline.subscribe((frame: any) => controller.ingestPrepared(encoder.encode(frame)))
+  await controller.setUniverse([instId], '15m', instId)
+  const close = controller.open(instId, '15m')
+  try {
+    const frame = await pipeline.local(instId, '15m', { focusId: pipeline.focus.id })
+    assert.equal(frame.priceState, 'ready'); await finishSeed(pipeline)
+    assert.equal(pipeline.cached(`${instId}:15m`).indicatorState, 'unavailable')
+    assert.equal(controller.getSnapshot().presented?.indicatorState, 'unavailable')
+    assert.equal(requests.length, 1, 'Calculated warmup nulls must trigger source demand without another user action.')
+    assert.deepEqual(requests[0], { from: end() - 294 * interval, through: end() })
+    pipeline.refreshObservations(pipeline.state(instId, '15m'))
+    assert.equal(requests.length, 1, 'Repeated maintenance shares the pending warmup repair.')
+    gate.resolve(); await Promise.all([...pipeline.sourceTasks.values()].map((job: any) => job.task)); await finishSeed(pipeline)
+    const repaired = pipeline.cached(`${instId}:15m`)
+    assert.equal(repaired.priceState, 'ready'); assert.equal(repaired.indicatorState, 'ready')
+    assert.equal(controller.getSnapshot().presented?.indicatorState, 'ready', 'The pushed repair must replace the renderer cache without reopening the chart.')
+    const oracle = new Map((buildIndicatorSeries(canonical.slice(-295), interval).bars as any[]).map(row => [row.hour, row]))
+    for (const value of repaired.bars) for (const field of indicatorFields) assert.equal(value[field], oracle.get(value.hour)[field], `${field} at ${value.hour}`)
+    const calculations = pipeline.nextCalculation, reads = store.queries.length
+    await pipeline.local(instId, '15m', { focusId: pipeline.focus.id }); await finishSeed(pipeline)
+    assert.equal(requests.length, 1); assert.equal(pipeline.nextCalculation, calculations); assert.equal(store.queries.length, reads)
+  } finally { gate.resolve(); close(); unsubscribe(); await pipeline.dispose() }
+})
+
+test('an offscreen source hole repairs the selected historical indicators without reseeding from a truncated tail', async () => {
+  const canonical = source(700), target = canonical[500].timestamp, absent = canonical[350]
+  const requests: Array<{ from: number; through: number }> = []
+  const { pipeline, store } = fixture(canonical.filter(row => row !== absent), {
+    async ensurePrices(_instrument: string, _timeframe: string, from: number, through: number) {
+      requests.push({ from, through }); store.change(absent)
+      return { rows: store.rows.filter(row => row.timestamp >= from && row.timestamp <= through) }
+    },
+  })
+  try {
+    const frame = await pipeline.localHistory(instId, '15m', target)
+    assert.equal(frame.priceState, 'ready')
+    await finishSeed(pipeline)
+    await Promise.all([...pipeline.sourceTasks.values()].map((job: any) => job.task)); await finishSeed(pipeline)
+    assert.equal(requests.length, 1); assert.ok(requests[0].from <= absent.timestamp); assert.equal(requests[0].through, target)
+    const repaired = pipeline.historyFrame(pipeline.state(instId, '15m'), target)
+    const oracle = new Map((buildIndicatorSeries(canonical, interval).bars as any[]).map(row => [row.hour, row]))
+    for (const value of repaired.bars) for (const field of indicatorFields) assert.equal(value[field], oracle.get(value.hour)[field], `${field} at ${value.hour}`)
+    assert.equal(repaired.indicatorState, 'ready')
+  } finally { await pipeline.dispose() }
+})
+
+test('warmup inputs committed before acquisition still replace cached null indicators without an observer', async () => {
+  const canonical = source(295), { pipeline, store } = fixture(canonical.slice(-96))
+  let requests = 0
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    assert.equal(pipeline.cached(`${instId}:15m`).indicatorState, 'unavailable')
+    for (const row of canonical.slice(0, -96)) store.change(row)
+    pipeline.history.ensurePrices = async () => { requests += 1; return { rows: store.rows } }
+    await pipeline.refreshIndicators(pipeline.state(instId, '15m')); await finishSeed(pipeline)
+    const repaired = pipeline.cached(`${instId}:15m`)
+    assert.equal(repaired.indicatorState, 'ready')
+    const oracle = new Map((buildIndicatorSeries(canonical, interval).bars as any[]).map(row => [row.hour, row]))
+    for (const value of repaired.bars) for (const field of indicatorFields) assert.equal(value[field], oracle.get(value.hour)[field])
+    pipeline.refreshObservations(pipeline.state(instId, '15m'))
+    assert.equal(requests, 1, 'Complete durable inputs must not leave a repeating successful acquisition loop.')
+  } finally { await pipeline.dispose() }
+})
+
+test('a concurrent visible correction cannot suppress invalidation of a later offscreen warmup repair', async () => {
+  const canonical = source(400), absent = canonical[240], gate = deferred()
+  let requests = 0
+  const { pipeline, store } = fixture(canonical.filter(row => row !== absent), {
+    async ensurePrices() { requests += 1; await gate.promise; store.change(absent); return { rows: store.rows } },
+  })
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    assert.equal(requests, 1)
+    const state = pipeline.state(instId, '15m'), generation = state.generation
+    const corrected = { ...canonical[390], close: canonical[390].close + 1 }
+    const previous = store.change(corrected)
+    pipeline.observe([corrected], previous); await finishSeed(pipeline)
+    assert.ok(state.generation > generation)
+    gate.resolve(); await Promise.all([...pipeline.sourceTasks.values()].map((job: any) => job.task)); await finishSeed(pipeline)
+    const repaired = pipeline.cached(`${instId}:15m`)
+    const oracle = new Map((buildIndicatorSeries(canonical.map(row => row.timestamp === corrected.timestamp ? corrected : row), interval).bars as any[]).map(row => [row.hour, row]))
+    assert.equal(requests, 1); assert.equal(repaired.indicatorState, 'ready')
+    for (const value of repaired.bars) for (const field of indicatorFields) assert.equal(value[field], oracle.get(value.hour)[field])
+  } finally { gate.resolve(); await pipeline.dispose() }
+})
+
+test('indicator warmup acquisition retries automatically after a source failure while complete prices remain visible', async context => {
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Math.floor(Date.now() / interval) * interval + 1000 })
+  const canonical = source(400), absent = canonical[240]
+  let attempts = 0
+  const { pipeline, store } = fixture(canonical.filter(row => row !== absent), {
+    async ensurePrices() {
+      if (++attempts === 1) { store.change(absent); throw new Error('Warmup committed before transport failure') }
+      return { rows: store.rows }
+    },
+  })
+  const flush = async () => { for (let count = 0; count < 8; count++) await new Promise<void>(resolve => setImmediate(resolve)) }
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline); await flush()
+    assert.equal(attempts, 1); assert.equal(pipeline.cached(`${instId}:15m`).priceState, 'ready')
+    context.mock.timers.tick(4999); await flush(); assert.equal(attempts, 1)
+    context.mock.timers.tick(1); await flush()
+    await Promise.all([...pipeline.sourceTasks.values()].map((job: any) => job.task)); await finishSeed(pipeline)
+    assert.equal(attempts, 2); assert.equal(pipeline.cached(`${instId}:15m`).indicatorState, 'ready')
+  } finally { await pipeline.dispose() }
+})
+
+test('missing offscreen VWAP volumes repair even when every visible EMA is already numeric', async () => {
+  const canonical = source(400), incomplete = { ...canonical[300], baseVolume: null, quoteVolume: null }
+  let requests = 0
+  const { pipeline, store } = fixture(canonical.map(row => row.timestamp === incomplete.timestamp ? incomplete : row) as any, {
+    async ensurePrices(_instrument: string, _timeframe: string, from: number, through: number) {
+      requests += 1; assert.ok(from <= incomplete.timestamp); assert.ok(through >= incomplete.timestamp)
+      store.change(canonical[300])
+      return { rows: store.rows.filter(row => row.timestamp >= from && row.timestamp <= through) }
+    },
+  })
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await Promise.all([...pipeline.sourceTasks.values()].map((job: any) => job.task)); await finishSeed(pipeline)
+    const repaired = pipeline.cached(`${instId}:15m`)
+    assert.equal(requests, 1); assert.equal(repaired.indicatorState, 'ready')
+    const oracle = new Map((buildIndicatorSeries(canonical, interval).bars as any[]).map(row => [row.hour, row]))
+    for (const value of repaired.bars) assert.equal(value.vwap, oracle.get(value.hour).vwap)
+  } finally { await pipeline.dispose() }
+})
+
+test('a wider indicator warmup demand respects the failed viewport source retry deadline', async context => {
+  const now = Math.floor(Date.now() / interval) * interval + 1000, retryAt = now + 60_000
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
+  const canonical = source(400), absent = canonical[350], gate = deferred()
+  let attempts = 0
+  const { pipeline, store } = fixture(canonical.filter(row => row !== absent), {
+    async ensurePrices() {
+      if (++attempts === 1) throw Object.assign(new Error('Rate limited'), { retryAt })
+      store.change(absent); return { rows: store.rows }
+    },
+  })
+  const calculate = pipeline.calculate.bind(pipeline)
+  pipeline.calculate = async (...args: any[]) => { await gate.promise; return calculate(...args) }
+  const flush = async () => { for (let count = 0; count < 8; count++) await new Promise<void>(resolve => setImmediate(resolve)) }
+  try {
+    await pipeline.local(instId, '15m'); await flush(); assert.equal(attempts, 1)
+    gate.resolve(); await finishSeed(pipeline); await flush()
+    assert.ok(pipeline.indicatorDemand(pipeline.state(instId, '15m')))
+    assert.equal(attempts, 1, 'Completing calculation cannot bypass backoff by requesting a different overlapping range.')
+    context.mock.timers.tick(59_999); await flush(); assert.equal(attempts, 1)
+    context.mock.timers.tick(1); await flush()
+    await Promise.all([...pipeline.sourceTasks.values()].map((job: any) => job.task)); await finishSeed(pipeline)
+    assert.equal(attempts, 2); assert.equal(pipeline.cached(`${instId}:15m`).indicatorState, 'ready')
+  } finally { gate.resolve(); await pipeline.dispose() }
+})
+
+test('genuine listing warmup and zero-volume VWAP do not cause repeated history acquisition', async () => {
+  for (const count of [12, 220, 400]) {
+    const rows = source(count).map(row => ({ ...row, baseVolume: 0, quoteVolume: 0 }))
+    let requests = 0
+    const { pipeline } = fixture(rows, { async ensurePrices() { requests += 1 } })
+    pipeline.instrument = () => ({ listTime: rows[0].timestamp })
+    try {
+      await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+      await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+      assert.equal(requests, 0); assert.equal(pipeline.cached(`${instId}:15m`).indicatorState, 'unavailable')
+    } finally { await pipeline.dispose() }
+  }
+})
+
 test('source retries repair the selected historical viewport instead of the unrelated latest tail', async context => {
   const now = Math.floor(Date.now() / interval) * interval + 1000
   context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
@@ -197,9 +381,10 @@ test('source retries repair the selected historical viewport instead of the unre
     const frame = await pipeline.localHistory(instId, '15m', target)
     assert.equal(frame.priceState, 'partial')
     await flush(); assert.equal(requests.length, 1)
-    context.mock.timers.tick(1000); await flush()
+    context.mock.timers.tick(4999); await flush(); assert.equal(requests.length, 1, 'A smaller viewport retry must respect the failed history page backoff.')
+    context.mock.timers.tick(1); await flush()
     assert.equal(requests.length, 2); assert.equal(requests[1].through, target)
-    assert.equal(requests[1].from, target - 95 * interval)
+    assert.ok(requests[1].from <= target - 95 * interval)
     const repaired = pipeline.historyFrame(pipeline.state(instId, '15m'), target)
     assert.equal(repaired.priceState, 'ready')
   } finally { await pipeline.dispose() }
