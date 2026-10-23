@@ -227,11 +227,11 @@ test('small-sample CPU allowance uses paired added CPU rather than independent m
   assert.equal(assessBudgets(summary, budget)[0].reason, 'missing-or-invalid-paired-measurement')
 })
 
-test('a failed native budget retains its original trials and collects separate actual-runtime CPU profiles', { timeout: 60_000 }, async () => {
+test('unfiltered native traffic follows subscription demand and failed budgets retain trials plus separate runtime profiles', { timeout: 60_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'failed-native-overhead-'))
   try {
     const budgets = { ...defaultBudgets, nativeMarket: { ...defaultBudgets.nativeMarket, wallMS: 0 } }
-    const report = await runOverhead({ output: directory, repeats: 2, cycles: 1, contracts: 1, warmup: 1, renderer: false, budgets })
+    const report = await runOverhead({ output: directory, repeats: 2, cycles: 1, contracts: 2, warmup: 1, renderer: false, budgets })
     assert.equal(report.schemaVersion, 3)
     assert.equal(report.estimators.relativeBudgets, 'median-matched-budget-margin')
     assert.ok(report.failures.some(failure => failure.phase === 'nativeMarket' && failure.metric === 'wallMS'))
@@ -240,6 +240,22 @@ test('a failed native budget retains its original trials and collects separate a
     assert.equal(report.parameters.profile, false, 'Original trials must keep their unprofiled configuration.')
     assert.equal(report.failureProfiles.status, 'complete', report.failureProfiles.error)
     assert.deepEqual(report.failureProfiles.runs.map(run => run.enabled), [false, true])
+    for (const run of [...report.runs, ...report.failureProfiles.runs]) {
+      const perChannel = report.parameters.contracts * report.parameters.cycles
+      assert.ok(Object.values(run.parameters.liquidityFilters).every(enabled => enabled === false), 'Recorder traffic must not enable a liquidity consumer to preserve unwanted input.')
+      assert.deepEqual(run.parameters.subscribedChannels, ['open-interest', 'tickers', 'trades'])
+      assert.deepEqual(run.parameters.inputChannels, ['open-interest', 'tickers'])
+      assert.equal(Object.hasOwn(run.parameters, 'bookLevels'), false, 'Parameters must describe the actual workload rather than an obsolete book fixture.')
+      assert.deepEqual(run.business.marketMessagesByChannel, { tickers: perChannel, 'open-interest': perChannel })
+      assert.equal(run.business.marketMessages, perChannel * 2, 'Warmup and idle subscribed channels cannot inflate the message denominator.')
+      if (run.enabled) {
+        const operations = run.journal.phases.nativeMarket.byName
+        assert.equal(operations['websocket.receive'], run.business.marketMessages, 'Each counted input must have native receive evidence.')
+        assert.equal(operations['market.websocket.decode'], run.business.marketMessages, 'Every actual input must retain its decode operation.')
+        assert.equal(operations['market.book.reconstruct'], undefined)
+        assert.equal(operations['liquidity.book.identity'], undefined)
+      }
+    }
     for (const run of report.failureProfiles.runs) {
       assertMeasuredRuntime(run.runtime, report.runtime.backend)
       assert.deepEqual(run.business, report.runs[0].business)

@@ -427,12 +427,18 @@ class PublicMarketConnection {
       this.maybeLive(connection)
       return
     }
-    if (Array.isArray(message.data) && ingress > session.ingress) {
-      // Book frames admitted before the ACK may belong to the retired wire
-      // subscription. They can neither seed reconstruction nor queue callbacks.
-      if (subscription.channel === 'books' && connection.pending.has(key)) return
-      this.enqueue(connection, subscription, session, message, receivedAt)
+    if (message.event != null || ingress <= session.ingress) return
+    // Book frames admitted before the ACK may belong to the retired wire
+    // subscription. They can neither seed reconstruction nor fault a new book.
+    if (subscription.channel === 'books') {
+      if (connection.pending.has(key)) return
+      if (!Array.isArray(message.data)) {
+        this.telemetry.rejectedEvents++
+        this.recoverBook(connection, subscription.instId, `Invalid OKX order book data for ${subscription.instId}.`)
+        return
+      }
     }
+    if (Array.isArray(message.data)) this.enqueue(connection, subscription, session, message, receivedAt)
   }
 
   enqueue(connection, subscription, session, message, receivedAt) {

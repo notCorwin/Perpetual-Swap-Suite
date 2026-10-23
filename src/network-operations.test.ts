@@ -120,3 +120,12 @@ test('HTTP timeouts are failed requests even when the underlying response arrive
   await Promise.resolve(); await Promise.resolve()
   assert.equal(entries.length, 1, 'A late response cannot finish the same attempt twice.')
 })
+
+test('HTTP service failures preserve Retry-After delays and dates for shared source backoff', async t => {
+  const now = Date.UTC(2026, 9, 23, 12)
+  t.mock.method(Date, 'now', () => now)
+  for (const header of ['120', new Date(now + 120_000).toUTCString()]) {
+    await assert.rejects(request(async () => new Response('Unavailable', { status: 503, headers: { 'Retry-After': header } })),
+      (error: Error & { retryAfter?: number }) => /503/.test(error.message) && error.retryAfter === 120_000)
+  }
+})

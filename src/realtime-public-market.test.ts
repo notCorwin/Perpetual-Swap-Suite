@@ -75,6 +75,7 @@ const btc = 'BTC-USDT-SWAP', eth = 'ETH-USDT-SWAP'
 const push = (socket: Socket, channel: string, data: unknown[], instId = btc, action?: string) => socket.message({ arg: { channel, instId }, data, ...(action ? { action } : {}) })
 const level = (price: number, size = 1) => [String(price), String(size), '0', '1']
 const book = (seqId: number, prevSeqId = -1, bids = [level(100), level(99)], asks = [level(101), level(102)]) => ({ seqId, prevSeqId, ts: '1800000000000', bids, asks })
+const malformedBookPayloads = [{ data: {} }, { data: null }, {}]
 
 function fixture(overrides: Partial<RealtimePublicMarketOptions> = {}) {
   const clock = new Clock(), sockets: Socket[] = [], urls: string[] = [], tickers: string[] = [], oi: string[] = [], books: PublicMarketBook[] = [], trades: unknown[] = [], errors: string[] = []
@@ -280,6 +281,97 @@ test('book faults resubscribe exactly that book while healthy channels on the sa
   }
 })
 
+test('malformed book data envelopes invalidate only that book and require a fresh snapshot', async t => {
+  for (const payload of malformedBookPayloads) {
+    const delivered: string[] = [], removed: string[] = [], signals = new Map<string, AbortSignal>()
+    const f = fixture({
+      onBook: (instId, value, context) => { delivered.push(`${instId}:${value.seqId}`); signals.set(instId, context.signal) },
+      onUnsubscribed: (instId, channel) => { removed.push(`${channel}:${instId}`) },
+    })
+    t.after(() => f.market.close())
+    const socket = await f.open([btc, eth])
+    push(socket, 'books', [book(10)], btc, 'snapshot')
+    push(socket, 'books', [book(20)], eth, 'snapshot')
+    await f.market.whenIdle()
+    const retiredSignal = signals.get(btc)!
+    const malformed = { arg: { channel: 'books', instId: btc }, action: 'update', ...payload }
+    socket.message(malformed)
+    socket.message(malformed)
+    push(socket, 'books', [book(99)], btc, 'snapshot')
+    push(socket, 'books', [book(21, 20)], eth, 'update')
+    push(socket, 'tickers', [{ last: '101' }])
+    push(socket, 'open-interest', [{ oi: '202' }], eth)
+    push(socket, 'trades', [{ tradeId: '1', side: 'buy', sz: '3' }], eth)
+    await f.market.whenIdle()
+    assert.deepEqual(delivered, [`${btc}:10`, `${eth}:20`, `${eth}:21`])
+    assert.deepEqual(removed, [`books:${btc}`])
+    assert.equal(retiredSignal.aborted, true, 'Existing book evidence loses its subscription authority immediately.')
+    assert.equal(signals.get(eth)?.aborted, false)
+    assert.equal(f.market.getTelemetry().rejectedEvents, 1, 'Repeated frames cannot fault an already retired book.')
+    assert.deepEqual(f.tickers, [`${btc}:101`])
+    assert.deepEqual(f.oi, [`${eth}:202`])
+    assert.equal(f.trades.length, 1)
+    assert.deepEqual(socket.commands().slice(1).map(({ op, args }) => ({ op, args })), [
+      { op: 'unsubscribe', args: [{ instId: btc, channel: 'books' }] },
+    ])
+    await f.clock.advance(999)
+    assert.equal(socket.commands().length, 2)
+    await f.clock.advance(1)
+    await f.market.whenIdle()
+    assert.deepEqual(socket.commands().at(-1)?.args, [{ instId: btc, channel: 'books' }])
+    assert.equal(socket.commands().at(-1)?.op, 'subscribe')
+    push(socket, 'books', [book(11, 10)], btc, 'update')
+    await f.market.whenIdle()
+    assert.equal(delivered.length, 3, 'An incremental update cannot reuse the invalidated snapshot.')
+    assert.equal(f.market.getTelemetry().rejectedEvents, 2)
+    assert.deepEqual(removed, [`books:${btc}`, `books:${btc}`])
+    await f.clock.advance(1999)
+    assert.equal(socket.commands().length, 4, 'Malformed envelopes share the existing book recovery backoff.')
+    await f.clock.advance(1)
+    await f.market.whenIdle()
+    push(socket, 'books', [book(100)], btc, 'snapshot')
+    await f.market.whenIdle()
+    assert.equal(delivered.at(-1), `${btc}:100`)
+    assert.equal(signals.get(btc)?.aborted, false)
+    assert.equal(f.sockets.length, 1)
+    assert.equal(socket.readyState, 1)
+    assert.equal(f.market.getTelemetry().reconnects, 0)
+    assert.equal(f.market.getState().status, 'live')
+  }
+})
+
+test('book envelope validation preserves controls, empty arrays and the subscription ACK fence', async t => {
+  const removed: string[] = []
+  const f = fixture({ onUnsubscribed: (instId, channel) => { removed.push(`${channel}:${instId}`) } })
+  t.after(() => f.market.close())
+  f.market.setSubscriptions([btc])
+  f.market.start()
+  const socket = f.sockets[0]
+  socket.autoAck = false
+  socket.open()
+  const initial = socket.commands()[0]
+  for (const payload of malformedBookPayloads) socket.message({ arg: { channel: 'books', instId: btc }, action: 'update', ...payload })
+  push(socket, 'books', [book(900)], btc, 'snapshot')
+  await f.market.whenIdle()
+  assert.equal(f.books.length, 0)
+  assert.equal(f.market.getTelemetry().rejectedEvents, 0)
+  for (const arg of initial.args) socket.message({ id: initial.id, event: 'subscribe', arg })
+  await f.market.whenIdle()
+  push(socket, 'books', [book(10)], btc, 'snapshot')
+  await f.market.whenIdle()
+  socket.message({ id: initial.id, event: 'subscribe', arg: { channel: 'books', instId: btc } })
+  socket.message({ event: 'channel-conn-count', arg: { channel: 'books', instId: btc }, connCount: '1' })
+  socket.message('pong')
+  push(socket, 'books', [], btc, 'update')
+  push(socket, 'books', [book(11, 10)], btc, 'update')
+  await f.market.whenIdle()
+  assert.deepEqual(f.books.map(value => value.seqId), [10, 11])
+  assert.deepEqual(removed, [])
+  assert.equal(f.market.getTelemetry().rejectedEvents, 0)
+  assert.equal(socket.commands().length, 1)
+  assert.equal(f.market.getState().status, 'live')
+})
+
 test('books demand changes only books and reenable waits for unsubscribe and fresh subscription ACKs', async t => {
   const subscribed: string[] = [], removed: string[] = []
   const f = fixture({
@@ -433,6 +525,67 @@ test('asynchronous decoding cannot carry an old book frame across disable and re
   await f.market.whenIdle()
   assert.equal(f.books.at(-1)?.seqId, 100)
   assert.equal(f.sockets.length, 1)
+})
+
+test('stale decoded malformed envelopes cannot invalidate an acknowledged replacement book session', async t => {
+  const removed: string[] = []
+  const f = fixture({ onUnsubscribed: (instId, channel) => { removed.push(`${channel}:${instId}`) } })
+  t.after(() => f.market.close())
+  const socket = await f.open()
+  push(socket, 'books', [book(10)], btc, 'snapshot')
+  await f.market.whenIdle()
+  type Decoder = { connection: { ingress: number }; consume(connection: unknown, text: string, receivedAt: number, ingress: number): void }
+  const shard = (f.market as unknown as { shards: Decoder[] }).shards[0]
+  const retiredIngress = shard.connection.ingress
+  f.market.setSubscriptions([btc], { books: false })
+  f.market.setSubscriptions([btc], { books: true })
+  await f.market.whenIdle()
+  push(socket, 'books', [book(100)], btc, 'snapshot')
+  await f.market.whenIdle()
+  // Replay decoding completion after the replacement ACK to isolate its ingress
+  // fence; normal messageTail ordering also serializes incoming control ACKs.
+  for (const payload of malformedBookPayloads) shard.consume(shard.connection, JSON.stringify({ arg: { channel: 'books', instId: btc }, action: 'update', ...payload }), f.clock.now(), retiredIngress)
+  push(socket, 'books', [book(101, 100)], btc, 'update')
+  await f.market.whenIdle()
+  assert.deepEqual(f.books.map(value => value.seqId), [10, 100, 101])
+  assert.deepEqual(removed, [`books:${btc}`])
+  assert.equal(f.market.getTelemetry().rejectedEvents, 0)
+  assert.equal(socket.commands().length, 3)
+  assert.equal(f.sockets.length, 1)
+  assert.equal(f.market.getState().status, 'live')
+})
+
+test('an old socket finishing malformed book decoding cannot cancel its live replacement', async t => {
+  const decoding = deferred<string>(), began = deferred(), removed: string[] = []
+  const f = fixture({ onUnsubscribed: (instId, channel) => { removed.push(`${channel}:${instId}`) } })
+  t.after(async () => { decoding.resolve('pong'); await f.market.close() })
+  const oldSocket = await f.open()
+  push(oldSocket, 'books', [book(10)], btc, 'snapshot')
+  await f.market.whenIdle()
+  oldSocket.data({ text: () => { began.resolve(); return decoding.promise } })
+  await began.promise
+  f.market.setSubscriptions([])
+  f.market.setSubscriptions([btc])
+  await f.clock.advance(500)
+  const replacement = f.sockets.at(-1)!
+  assert.notEqual(replacement, oldSocket)
+  replacement.open()
+  await turn()
+  push(replacement, 'books', [book(100)], btc, 'snapshot')
+  await turn()
+  assert.equal(f.market.getState().status, 'live')
+  assert.deepEqual(f.books.map(value => value.seqId), [10, 100])
+  const removalCount = removed.length
+  decoding.resolve(JSON.stringify({ arg: { channel: 'books', instId: btc }, action: 'update', data: {} }))
+  await f.market.whenIdle()
+  push(replacement, 'books', [book(101, 100)], btc, 'update')
+  await f.market.whenIdle()
+  assert.deepEqual(f.books.map(value => value.seqId), [10, 100, 101])
+  assert.equal(removed.length, removalCount)
+  assert.equal(f.market.getTelemetry().rejectedEvents, 0)
+  assert.equal(replacement.commands().length, 1)
+  assert.equal(replacement.readyState, 1)
+  assert.equal(f.sockets.length, 2)
 })
 
 test('book acknowledgement timeouts retry only that channel with ACK fencing and backoff', async t => {

@@ -881,15 +881,22 @@ export class MarketService {
             const contentLength = response.headers?.get('content-length')
             if (contentLength !== null && contentLength !== undefined && /^\d+$/.test(contentLength) && Number.isSafeInteger(Number(contentLength))) attributes.declaredResponseBytes = Number(contentLength)
             if (signal.aborted) throw signal.reason ?? new Error('The request was aborted.')
+            const serverDelay = retryAfterDelay(response.headers?.get('retry-after'))
             if (response.status === 429) {
-              const serverDelay = retryAfterDelay(response.headers.get('retry-after'))
               // A 429 cools only the endpoint family that returned it. OI
               // must never freeze an unrelated candle repair or Taker read.
               lane.rateLimitedUntil = Math.max(lane.rateLimitedUntil, Date.now() + (serverDelay ?? RETRY_DELAYS[0]))
               lane.concurrency = Math.max(2, Math.floor((lane.concurrency ?? 4) / 2))
               throw new RetryAfterError(request.path, serverDelay, lane.name)
             }
-            if (!response.ok) throw new Error(`OKX ${request.path} failed (${response.status}).`)
+            if (!response.ok) {
+              const error = new Error(`OKX ${request.path} failed (${response.status}).`)
+              if (serverDelay !== undefined) {
+                error.retryAfter = serverDelay
+                lane.rateLimitedUntil = Math.max(lane.rateLimitedUntil, Date.now() + serverDelay)
+              }
+              throw error
+            }
             const payload = await response.json()
             if (signal.aborted) throw signal.reason ?? new Error('The request was aborted.')
             if (payload.code && payload.code !== '0') throw new Error(`OKX ${request.path}: ${payload.msg || payload.code}`)

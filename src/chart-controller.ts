@@ -143,7 +143,7 @@ export class ChartController {
   scroll(steps: number) {
     const target = this.view.requested
     if (!this.active || !target || !Number.isFinite(steps) || !Math.trunc(steps)) return
-    const latest = this.store.latestEnd(target.instId, target.timeframe)
+    const latest = this.view.latestEnd
     if (latest === null) return
     const interval = timeframeMilliseconds(target.timeframe)
     const meta = this.store.snapshotMeta(target.instId, target.timeframe)
@@ -202,6 +202,10 @@ export class ChartController {
     }
     const ready = this.store.window(target.instId, target.timeframe, target.end)
     const previous = this.view.presented
+    // The confirmed navigation boundary outlives a prepared generation. A
+    // rebuilt historical window can arrive before its latest counterpart;
+    // that calculation gap must not discard already consumed wheel input.
+    const latestEnd = meta?.latestEnd ?? (this.view.requested && sameSeries(this.view.requested, target) ? this.view.latestEnd : null)
     const completeHistoricalPrices = ready && this.completePrices(ready)
     const calculatingHistory = target.end !== null && ready
       && (ready.indicatorState === 'loading' || !completeHistoricalPrices)
@@ -217,7 +221,7 @@ export class ChartController {
       pending: ready === null || Boolean(calculatingHistory),
       error: ready || requested !== this.view.requested ? '' : this.view.error,
       oldestHour: meta?.oldestHour ?? null,
-      latestEnd: meta?.latestEnd ?? null,
+      latestEnd,
       historyExhausted: meta?.historyExhausted ?? false,
       unavailable: ready || requested !== this.view.requested ? null : this.view.unavailable,
     })

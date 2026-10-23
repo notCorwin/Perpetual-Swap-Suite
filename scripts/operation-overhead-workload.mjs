@@ -51,7 +51,7 @@ const frame = (text, opcode = 1) => {
   return Buffer.concat([header, body])
 }
 async function exchange() {
-  const clients = new Set(), errors = []
+  const clients = new Set(), errors = [], messageCounts = {}
   const server = createServer((_request, response) => response.writeHead(404).end())
   server.on('upgrade', (request, socket) => {
     const accept = createHash('sha1').update(request.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
@@ -83,14 +83,17 @@ async function exchange() {
     })
   })
   server.listen(0, '127.0.0.1'); await once(server, 'listening')
-  const send = (arg, data, action) => {
+  const send = (arg, data) => {
     let sent = 0
     for (const client of clients) if (client.subscriptions.has(`${arg.channel}:${arg.instId}`)) {
-      client.socket.write(frame(JSON.stringify({ arg, data: [data], ...(action ? { action } : {}) }))); sent++
+      client.socket.write(frame(JSON.stringify({ arg, data: [data] }))); sent++
     }
     assert.equal(sent, 1, 'Every deterministic market message must have exactly one native subscriber.')
+    messageCounts[arg.channel] = (messageCounts[arg.channel] ?? 0) + sent
   }
   return { url: `ws://127.0.0.1:${server.address().port}/feed`, send, errors,
+    get messages() { return Object.values(messageCounts).reduce((sum, count) => sum + count, 0) },
+    get messageCounts() { return { ...messageCounts } },
     async close() { for (const { socket } of clients) socket.destroy(); await new Promise(resolve => server.close(resolve)) } }
 }
 const ids = Array.from({ length: config.contracts }, (_, index) => `ASSET${index}-USDT-SWAP`)
@@ -103,27 +106,29 @@ const store = await MarketStore.open(join(directory, 'MarketData'))
 const transport = await exchange()
 const preferences = structuredClone(DEFAULT_PREFERENCES)
 for (const rule of Object.values(preferences.liquidity)) rule.enabled = false
-// This workload measures native book intake, so keep its actual consumer enabled.
-preferences.liquidity.depth.enabled = true
+// Measure the unfiltered catalog's price/OI updates. Disabled depth and
+// slippage have no book demand; enabling one here changes the business work.
 let unexpectedRequests = 0
 const service = new MarketService(store, () => preferences, async () => { unexpectedRequests++; return new Response(JSON.stringify({ code: '0', data: [] })) }, false,
   { webSocketFactory: () => new WebSocket(transport.url) })
 const waitFor = async (condition, description) => { const until = performance.now() + 30000; while (!condition()) { assert.ok(performance.now() < until, `Timed out: ${description}`); await delay(2) } }
-let sequence = 0, messages = 0
+let sequence = 0
 const sendRound = async () => {
   const started = performance.now()
   sequence++
   const before = service.publicRealtime.getTelemetry().receivedEvents
+  const sentBefore = transport.messages
   for (const [index, instId] of ids.entries()) {
     const price = 100 + index / 10 + sequence / 1000, ts = String(Date.now())
-    transport.send({ instId, channel: 'tickers' }, { instId, last: String(price), bidPx: String(price - .01), askPx: String(price + .01), ts })
-    transport.send({ instId, channel: 'open-interest' }, { instId, oi: String(10000 + sequence), oiUsd: '10000000', ts })
-    const levels = side => Array.from({ length: sequence === 1 ? 400 : 1 }, (_, level) => [(side === 'bid' ? 99 - level / 100 : 101 + level / 100).toFixed(2), String(1000 + sequence), '0', '1'])
-    transport.send({ instId, channel: 'books' }, { bids: levels('bid'), asks: levels('ask'), seqId: sequence, prevSeqId: sequence === 1 ? -1 : sequence - 1, ts }, sequence === 1 ? 'snapshot' : 'update')
-    messages += 3
+    const ticker = service.publicRealtime.subscriptions.get(`tickers:${instId}`)
+    const openInterest = service.publicRealtime.subscriptions.get(`open-interest:${instId}`)
+    if (ticker) transport.send(ticker, { instId, last: String(price), bidPx: String(price - .01), askPx: String(price + .01), ts })
+    if (openInterest) transport.send(openInterest, { instId, oi: String(10000 + sequence), oiUsd: '10000000', ts })
   }
-  await waitFor(() => service.publicRealtime.getTelemetry().receivedEvents >= before + ids.length * 3, 'native market receive barrier')
+  const sent = transport.messages - sentBefore
+  await waitFor(() => service.publicRealtime.getTelemetry().receivedEvents >= before + sent, 'native market receive barrier')
   await service.publicRealtime.whenIdle()
+  assert.equal(service.publicRealtime.getTelemetry().receivedEvents, before + sent, 'Every sent market update must be received exactly once.')
   // Await the actual 100ms coalescing deadline rather than invoking internals.
   await waitFor(() => service.streamQualifications.size === 0 && !service.streamQualificationTimer && service.streamEvaluations.size === 0, 'qualification batch')
   // Input rate is a fixture property; removing redundant qualification must
@@ -135,7 +140,9 @@ try {
   await service.ready; await store.appendCandles(seedRows)
   service.installInstruments(new Map(ids.map(instId => [instId, { instId, instType: 'SWAP', instCategory: '1', settleCcy: 'USDT', ctType: 'linear', state: 'live', ctVal: '1', ctMult: '1', ctValCcy: instId.split('-')[0], ruleType: 'normal' }])))
   service.publicRealtime.start()
-  await waitFor(() => service.publicRealtime.getState().status === 'live', 'all130 subscriptions')
+  await waitFor(() => service.publicRealtime.getState().status === 'live', 'all native subscriptions')
+  const subscribedChannels = [...new Set([...service.publicRealtime.subscriptions.values()].map(value => value.channel))].sort()
+  assert.ok(!subscribedChannels.includes('books'), 'Disabled depth/slippage must not create book demand.')
   for (let index = 0; index < config.warmup; index++) await sendRound()
   await waitFor(() => service.backgroundTasks.size === 0 && service.preparedCharts.liveSeeds.size === 0, 'warm catalog/history projections')
   for (let index = 0; index < config.warmup; index++) buildIndicatorSeries(source)
@@ -153,7 +160,7 @@ try {
     }
     return { checksum, written }
   })
-  const before = messages
+  const before = transport.messages, countsBefore = transport.messageCounts
   const profiler = config.profile ? new Session() : undefined
   const profileCall = method => new Promise((resolve, reject) => profiler.post(method, (error, result) => error ? reject(error) : resolve(result)))
   if(profiler){profiler.connect();await profileCall('Profiler.enable');await profileCall('Profiler.start')}
@@ -163,7 +170,8 @@ try {
   assert.equal(rows.length, config.contracts); assert.equal(service.publicRealtime.getTelemetry().rejectedEvents, 0)
   assert.deepEqual(transport.errors, []); assert.equal(unexpectedRequests, 0, 'The warmed workload must not reacquire available history.')
   await measure('durableFlush', () => flushOperationRecording())
-  const business = { CPU, WORKER, DATABASE, contracts: rows.length, finalPrices: rows.map(row => [row.instId, row.lastPrice]).sort(), marketMessages: messages - before }
+  const marketMessagesByChannel = Object.fromEntries(Object.entries(transport.messageCounts).map(([channel, count]) => [channel, count - (countsBefore[channel] ?? 0)]))
+  const business = { CPU, WORKER, DATABASE, contracts: rows.length, finalPrices: rows.map(row => [row.instId, row.lastPrice]).sort(), marketMessages: transport.messages - before, marketMessagesByChannel }
   await service.dispose(); await store.close(); await transport.close(); await closeOperationRecording()
   return business
   })
@@ -171,7 +179,10 @@ try {
   if (process.env.PERPETUAL_SWAP_OPERATION_DIR) for (const file of await readdir(process.env.PERPETUAL_SWAP_OPERATION_DIR)) if (isOperationJournal(file)) journalBytes += (await stat(join(process.env.PERPETUAL_SWAP_OPERATION_DIR, file))).size
   const runtime = { mode: process.versions.electron && process.env.ELECTRON_RUN_AS_NODE === '1' ? 'electron-as-node' : 'node',
     node: process.version, v8: process.versions.v8, electron: process.versions.electron ?? null, executable: process.execPath }
-  console.log(JSON.stringify({ business, metrics, journalBytes, runtime, parameters: { contracts: config.contracts, cycles: config.cycles, warmup: config.warmup, bookLevels: 400, nativeTransport: 'WebSocket', database: 'SQLite WAL workers',businessClock: 'fixed midperiod epoch plus monotonic elapsed time',warmupDrainMS:300,memorySampling:memorySampler.snapshot() } }))
+  console.log(JSON.stringify({ business, metrics, journalBytes, runtime, parameters: { contracts: config.contracts, cycles: config.cycles, warmup: config.warmup,
+    liquidityFilters: Object.fromEntries(Object.entries(preferences.liquidity).map(([name, rule]) => [name, rule.enabled])),
+    subscribedChannels, inputChannels: Object.keys(transport.messageCounts).sort(),
+    nativeTransport: 'WebSocket', database: 'SQLite WAL workers',businessClock: 'fixed midperiod epoch plus monotonic elapsed time',warmupDrainMS:300,memorySampling:memorySampler.snapshot() } }))
 } catch (error) {
   await Promise.allSettled([service.dispose(), store.close(), transport.close()]); await closeOperationRecording().catch(() => {}); throw error
 }

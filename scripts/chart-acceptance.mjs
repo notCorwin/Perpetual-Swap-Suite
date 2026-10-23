@@ -69,15 +69,24 @@ export async function selectTimeframe(page, timeframe) {
 }
 
 export async function waitForRendered(page, fixture, timeframe = fixture.timeframe, end = fixture.end) {
-  await page.waitForFunction(({ instId, timeframe, end }) => {
-    const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
-    const svg = chart?.querySelector('svg[data-rendered-inst]')
-    return svg?.getAttribute('data-rendered-inst') === instId
-      && svg.getAttribute('data-rendered-timeframe') === timeframe
-      && Number(chart.getAttribute('data-chart-completed-end') ?? svg.getAttribute('data-rendered-end')) === end
-      && chart.getAttribute('data-chart-rendered-bars') === '96'
-      && chart.getAttribute('data-chart-loading') === 'false'
-  }, { instId: fixture.instId, timeframe, end }, { timeout: 20_000 })
+  try {
+    await page.waitForFunction(({ instId, timeframe, end }) => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+      const svg = chart?.querySelector('svg[data-rendered-inst]')
+      return svg?.getAttribute('data-rendered-inst') === instId
+        && svg.getAttribute('data-rendered-timeframe') === timeframe
+        && Number(chart.getAttribute('data-chart-completed-end') ?? svg.getAttribute('data-rendered-end')) === end
+        && chart.getAttribute('data-chart-rendered-bars') === '96'
+        && chart.getAttribute('data-chart-loading') === 'false'
+    }, { instId: fixture.instId, timeframe, end }, { timeout: 20_000 })
+  } catch (error) {
+    const state = await page.locator('[data-chart-inst]').evaluate(chart => ({
+      attributes: Object.fromEntries([...chart.attributes].filter(attribute => attribute.name.startsWith('data-chart-')).map(attribute => [attribute.name, attribute.value])),
+      inputs: window.__chartPaintProbe?.inputBursts,
+      commits: window.__chartPaintProbe?.commits?.slice(-12),
+    }))
+    throw new Error(`${error.message}\nExpected ${fixture.instId} ${timeframe} at ${end}. Chart state: ${JSON.stringify(state)}`, { cause: error })
+  }
 }
 
 export async function assertWorkspaceLayout(page) {

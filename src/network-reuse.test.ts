@@ -30,7 +30,7 @@ const settle = async (service: MarketService) => {
     await Promise.allSettled([...service.backgroundTasks, ...service.candidateTasks.values()])
   } while (service.backgroundTasks.size || service.candidateTasks.size || service.refreshing)
 }
-const fixture = async (automatic = false, bookSource?: () => Promise<Response>) => {
+const fixture = async (automatic = false, sources: { book?: () => Response | Promise<Response>; openInterest?: () => Response | Promise<Response> } = {}) => {
   const preferences = structuredClone(DEFAULT_PREFERENCES)
   for (const condition of Object.values(preferences.liquidity)) condition.enabled = false
   preferences.liquidity.spread.enabled = true
@@ -41,8 +41,8 @@ const fixture = async (automatic = false, bookSource?: () => Promise<Response>) 
     requests.push(path)
     if (path.endsWith('/public/instruments')) return response([instrument])
     if (path.endsWith('/market/tickers')) return response([{ instId, last: '100', bidPx: '99.99', askPx: '100' }])
-    if (path.endsWith('/market/books')) return bookSource ? bookSource() : response([{ ts: String(Date.now()), bids: [['99.99', '200001']], asks: [['100', '200001']] }])
-    if (path.endsWith('/public/open-interest')) return response([{ instId, oiUsd: '6000000', ts: String(Date.now()) }])
+    if (path.endsWith('/market/books')) return sources.book ? sources.book() : response([{ ts: String(Date.now()), bids: [['99.99', '200001']], asks: [['100', '200001']] }])
+    if (path.endsWith('/public/open-interest')) return sources.openInterest ? sources.openInterest() : response([{ instId, oiUsd: '6000000', ts: String(Date.now()) }])
     throw new Error(`Unexpected source request: ${path}`)
   }, automatic, { webSocketFactory: () => { const socket = new Socket(); sockets.push(socket); return socket } })
   service.projectListEntry = async () => null
@@ -119,7 +119,7 @@ test('candidate cancellation leaves its shared order-book acquisition available 
   let started!: () => void, release!: (value: Response) => void
   const entered = new Promise<void>(resolve => { started = resolve })
   const held = new Promise<Response>(resolve => { release = resolve })
-  const f = await fixture(false, () => { started(); return held })
+  const f = await fixture(false, { book: () => { started(); return held } })
   let refreshing: Promise<void> | undefined
   try {
     f.preferences.liquidity.depth.enabled = true
@@ -140,7 +140,7 @@ test('candidate cancellation leaves its shared order-book acquisition available 
   } finally { release(response([])); await refreshing; await f.close() }
 })
 
-test('book channel recovery immediately retires its cached qualification without reconnecting healthy channels', async () => {
+for (const malformedEnvelope of [false, true]) test(`book channel recovery immediately retires cached qualification after ${malformedEnvelope ? 'a malformed envelope' : 'a sequence gap'}`, async () => {
   const f = await fixture(true)
   try {
     f.preferences.liquidity.depth.enabled = true
@@ -156,7 +156,8 @@ test('book channel recovery immediately retires its cached qualification without
     f.service.streamLiquidity = { evaluate: (input: LiquidityInput) => new Promise(resolve => { held = { input, resolve } }), close: async () => undefined }
     f.service.flushStreamQualifications()
     assert.ok(held)
-    emit('update', { ts: String(Date.now()), seqId: 3, prevSeqId: 2, bids: [], asks: [] })
+    if (malformedEnvelope) socket.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ arg: { channel: 'books', instId }, action: 'update', data: {} }) }))
+    else emit('update', { ts: String(Date.now()), seqId: 3, prevSeqId: 2, bids: [], asks: [] })
     await f.service.publicRealtime.whenIdle()
     held.resolve(evaluateLiquidity(held.input))
     await Promise.all([...f.service.streamEvaluations.values()])
@@ -164,5 +165,30 @@ test('book channel recovery immediately retires its cached qualification without
     assert.deepEqual(f.service.listRowsFor('15m'), [])
     assert.equal(socket.readyState, 1)
     assert.equal(f.service.catalogChecks.get(instId).status, 'unknown')
+  } finally { await f.close() }
+})
+
+test('HTTP503 Retry-After controls every bulk OI consumer until the server deadline', async context => {
+  let now = Math.floor(Date.now() / 300_000) * 300_000 + 60_000, available = false
+  context.mock.method(Date, 'now', () => now)
+  const f = await fixture(false, { openInterest: () => available ? response([{ instId, oiUsd: '6000000', ts: String(now) }])
+    : new Response('Temporarily unavailable', { status: 503, headers: { 'Retry-After': '120' } }) })
+  try {
+    f.preferences.liquidity.openInterest.enabled = true
+    await f.service.refresh()
+    assert.equal(f.service.openInterest.retryAt, now + 120_000)
+    assert.equal(f.service.requestLanes.get('openInterest').rateLimitedUntil, now + 120_000)
+    assert.equal(f.service.requestLanes.get('candles').rateLimitedUntil, 0)
+    assert.equal(f.service.catalogChecks.get(instId).status, 'unknown')
+    for (const force of [false, true]) await assert.rejects(f.service.openInterest.observe(undefined, 'foreground', force), /503/)
+    now += 119_999
+    await assert.rejects(f.service.openInterest.observe(), /503/)
+    assert.equal(f.requests.filter(path => path.endsWith('/public/open-interest')).length, 1)
+    now += 1; available = true
+    const snapshot = await f.service.openInterest.observe()
+    assert.equal(snapshot.get(instId)?.observedAt, now)
+    assert.equal(snapshot.get(instId)?.expiresAt, now + 90_000)
+    assert.equal(f.service.openInterest.retryAt, 0)
+    assert.equal(f.requests.filter(path => path.endsWith('/public/open-interest')).length, 2)
   } finally { await f.close() }
 })

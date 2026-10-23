@@ -642,6 +642,31 @@ test('a new calculation generation from prefetch retains the painted frame until
   } finally { close() }
 })
 
+test('historical wheel intent survives a new calculation generation before its latest window is rebuilt', async () => {
+  const queue = transportQueue(), store = cached(0, 2500)
+  const controller = new ChartController(queue.transport, store)
+  await controller.setUniverse([btc], '1H')
+  const close = controller.open(btc, '1H')
+  try {
+    await settled()
+    controller.scroll(-600)
+    const start = controller.getSnapshot().requested!.end!
+    controller.ingestPrepared(prepared(btc, start / hour, { generation: 2, revision: 2, latestEnd: 2499 * hour,
+      bars: bars(start / hour - 671, 672),
+    }))
+    assert.equal(store.latestEnd(btc, '1H'), null, 'The rebuilt historical generation deliberately precedes its latest prepared window.')
+    for (let frame = 0; frame < 6; frame++) controller.scroll(-96)
+    const expected = start - 576 * hour
+    assert.equal(controller.getSnapshot().requested!.end, expected, 'Every consumed wheel batch must advance the selected cursor while the latest calculation is unavailable.')
+    controller.ingestPrepared(prepared(btc, 2499, { generation: 2, revision: 3 }))
+    const view = controller.getSnapshot()
+    assert.equal(view.requested!.end, expected, 'A late latest completion cannot move the historical cursor.')
+    assert.equal(view.presented!.endHour, expected)
+    assert.equal(view.pending, false)
+    assert.deepEqual(view.presented!.bars, bars(expected / hour - 95, 96))
+  } finally { close() }
+})
+
 test('latest mode follows pushed frames atomically and never polls a successfully prepared idle chart', async context => {
   context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
   const queue = transportQueue()
