@@ -19,7 +19,7 @@ import { formatPercent } from "@/market-percent"
 import { RADAR_TIMEFRAMES, timeframeLabel, timeframeMilliseconds, type RadarTimeframe } from '@/timeframe'
 
 import { chartController } from '@/chart-controller'
-import type { Bar, PreparedChartState } from '@/chart-data'
+import type { Bar, ChartSourceStatus, PreparedChartState } from '@/chart-data'
 import { measureOperation } from '../electron/services/operations.js'
 
 const EMPTY_BARS: readonly Bar[] = []
@@ -67,9 +67,15 @@ const PriceCountdown = memo(function PriceCountdown({ hour, intervalMS, x, y }: 
   const value = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`
   return <text data-chart-countdown x={x} y={y} dominantBaseline="middle" fill="var(--muted-foreground)">{value}</text>
 })
+const sourceStatusText = (label: string, state: PreparedChartState, status?: ChartSourceStatus) => {
+  if (state === 'error') return `${label} failed: ${status?.error || 'Source request failed'}${status?.retryAt ? ` · retry at ${new Date(status.retryAt).toLocaleTimeString('en-US', { hour12: false })}` : ''}`
+  if (state === 'loading') return `Loading ${label} history…`
+  if (state === 'unavailable') return status?.reason === 'unsupported' ? `${label} history is unsupported` : `${label} is not published for part of this range`
+  return ''
+}
 const chartGeometry = createChartGeometryCache(legendWidth)
 
-export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = false, inspected, oiState = 'ready', takerState = 'ready' }: { bars: readonly Bar[]; geometry: ChartGeometry; liveBar: Bar; liveOverlay?: boolean; inspected: number | null; oiState?: PreparedChartState; takerState?: PreparedChartState }) {
+export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = false, inspected, oiState = 'ready', takerState = 'ready', oiStatus, takerStatus }: { bars: readonly Bar[]; geometry: ChartGeometry; liveBar: Bar; liveOverlay?: boolean; inspected: number | null; oiState?: PreparedChartState; takerState?: PreparedChartState; oiStatus?: ChartSourceStatus; takerStatus?: ChartSourceStatus }) {
   const areaClipId = useId().replaceAll(":", "")
   return measureOperation({ category: 'cpu', name: 'chart.svg.construct', attributes: { candles: bars.length, inspected: inspected !== null } }, () => {
   const n = bars.length
@@ -101,6 +107,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     const shrink = Math.min(1, available / required)
     let cursor = 0
     return <g key={key} data-chart-panel-header={key}>
+      {(key === "oi" || key === "taker") && <title>{sourceStatusText(key === "oi" ? "OI" : "Taker", key === "oi" ? oiState : takerState, key === "oi" ? oiStatus : takerStatus)}</title>}
       <g transform={`translate(${start},${headerY[key]}) scale(${shrink})`}>
       {items.map(([label, value, color, dash, sourceHour], index) => {
         const itemStart = cursor
@@ -187,8 +194,8 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {legend("roc", [["ROC(9)", formatPercent(active.roc), "var(--chart-1)"], ["MAROC(9)", formatPercent(active.maroc), "var(--chart-2)", "7 4"]])}
     {legend("rsi", [["RSI(6)", active.rsi6?.toFixed(1) ?? "—", "var(--chart-1)"], ["RSI(12)", active.rsi12?.toFixed(1) ?? "—", "var(--chart-2)", "7 4"], ["RSI(24)", active.rsi24?.toFixed(1) ?? "—", "var(--chart-3)", "1 4"]])}
     {legend("atr", [["ATR%(14)", chartPercent(active.atrPercent), "var(--chart-3)"], ["BBW(20,2)", chartPercent(active.bbw), "var(--chart-1)", "7 4"]])}
-    {legend("oi", [["OI (Contracts)", statistics.oi ? compact(statistics.oi.oi) : "Unavailable", "var(--chart-2)", undefined, statistics.oi?.hour]])}
-    {legend("taker", [["↑ Taker Buy (Contracts)", statistics.taker ? compact(statistics.taker.buy) : "Unavailable", "var(--positive)", undefined, statistics.taker?.hour], ["↓ Taker Sell (Contracts)", statistics.taker ? compact(statistics.taker.sell) : "Unavailable", "var(--negative)", "2 3", statistics.taker?.hour]])}
+    {legend("oi", [["OI (Contracts)", statistics.oi ? compact(statistics.oi.oi) : oiState === "loading" ? "Loading…" : oiState === "error" ? "Failed" : "Unavailable", "var(--chart-2)", undefined, statistics.oi?.hour]])}
+    {legend("taker", [["↑ Taker Buy (Contracts)", statistics.taker ? compact(statistics.taker.buy) : takerState === "loading" ? "Loading…" : takerState === "error" ? "Failed" : "Unavailable", "var(--positive)", undefined, statistics.taker?.hour], ["↓ Taker Sell (Contracts)", statistics.taker ? compact(statistics.taker.sell) : takerState === "loading" ? "Loading…" : takerState === "error" ? "Failed" : "Unavailable", "var(--negative)", "2 3", statistics.taker?.hour]])}
     {panels.rsi[1] - panels.rsi[0] >= 35 && <>{lineLabel(axisStarts.rsi, panels.rsi[0], "100")}{lineLabel(axisStarts.rsi, panels.rsi[1], "0")}</>}
     {panels.roc[1] - panels.roc[0] >= 35 && <>{lineLabel(axisStarts.roc, panels.roc[0], formatPercent(rocAxis.max, rocAxis.decimals))}{lineLabel(axisStarts.roc, panels.roc[1], formatPercent(rocAxis.min, rocAxis.decimals))}</>}
     {oiAxis && panels.oi[1] - panels.oi[0] >= 35 && geometry.oiTicks.map(({ y, label }, index) => <g key={index}><line x1={columns.oi[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.25" />{lineLabel(axisStarts.oi, y, label)}</g>)}
@@ -364,20 +371,21 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
   const priceState = surface?.priceState ?? 'loading'
   const statusMessages: string[] = []
   if (unavailable) statusMessages.push(unavailableText)
-  else if (pending) statusMessages.push(surface ? `Preparing ${instId.replace(/-SWAP$/, '')} ${timeframeLabel(timeframe)}${requestedEnd !== null ? ` · ${time(requestedEnd)}` : ''}…` : 'Loading local prices…')
-  if (surface && priceState === 'partial') statusMessages.push('Repairing missing price history…')
-  if (surface && priceState === 'stale') statusMessages.push('Recent price history is stale; repairing…')
-  if (surface && priceState === 'loading') statusMessages.push('Loading price history…')
+  else if (pending && !error) statusMessages.push(surface ? `Preparing ${instId.replace(/-SWAP$/, '')} ${timeframeLabel(timeframe)}${requestedEnd !== null ? ` · ${time(requestedEnd)}` : ''}…` : 'Loading local prices…')
+  if (surface && !error && priceState === 'partial') statusMessages.push('Repairing missing price history…')
+  if (surface && !error && priceState === 'stale') statusMessages.push('Recent price history is stale; repairing…')
+  if (surface && !error && priceState === 'loading') statusMessages.push('Loading price history…')
+  if (priceState === 'error') statusMessages.push(sourceStatusText('Price history', priceState, surface?.priceStatus))
   if (priceState === 'unavailable') statusMessages.push('Price history is unavailable for this range')
   if (surface?.indicatorState === 'loading') statusMessages.push('Calculating indicators…')
   if (surface?.indicatorState === 'unavailable') statusMessages.push('Indicators are unavailable for part of this range')
-  if (oiState === 'loading') statusMessages.push('Loading OI history…')
-  if (takerState === 'loading') statusMessages.push('Loading taker history…')
-  if (oiState === 'unavailable') statusMessages.push(`OKX ${timeframeLabel(displayedFrame)} OI history is incomplete for this range`)
-  if (takerState === 'unavailable') statusMessages.push(`OKX ${timeframeLabel(displayedFrame)} Taker history is incomplete for this range`)
+  for (const [label, state, status] of [['OI', oiState, surface?.oiStatus], ['Taker', takerState, surface?.takerStatus]] as const) {
+    const message = sourceStatusText(label, state, status)
+    if (message) statusMessages.push(message)
+  }
   if (atBoundary && !pending) statusMessages.push('Start of available history')
   if (!statusMessages.length) statusMessages.push(error ? 'Chart update failed' : 'Chart ready')
-  const statusLoading = (pending && !unavailable) || priceState === 'loading' || priceState === 'partial' || priceState === 'stale'
+  const statusLoading = !error && ((pending && !unavailable) || priceState === 'loading' || priceState === 'partial' || priceState === 'stale')
     || surface?.indicatorState === 'loading' || oiState === 'loading' || takerState === 'loading'
   const statusSummary = statusMessages.join(' · ')
   return <section data-chart-workspace aria-label="Market chart workspace" className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden overscroll-none text-sm font-normal tabular-nums">
@@ -393,7 +401,7 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}</div>}
     {capture.error && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{capture.error}</p>}
     <div className="flex min-h-0 flex-1">
-    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending && !unavailable ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
+    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending && !unavailable ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
       {active && <div className="grid shrink-0 grid-cols-[minmax(9rem,1.2fr)_repeat(4,minmax(0,1fr))] items-center border-b px-4 py-1.5 text-[length:var(--chart-text-size)]" aria-live="off">
         <p className="min-w-0 truncate border-r pr-3"><span className="font-medium">{displayedId.replace(/-SWAP$/, '')}</span> · <span className="text-muted-foreground">{inspected === null ? historical ? 'Window end' : 'Latest' : 'Selected'}</span> {time(active.hour)}</p>
         {([['Open', active.open], ['High', active.high], ['Low', active.low], ['Close', active.close]] as const).map(([label, value]) => <div key={label} className="min-w-0 px-3"><span className="text-muted-foreground">{label} </span><span title={price(value)}>{price(value)}</span></div>)}
@@ -417,7 +425,7 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
           if (!matchesSelection || heldPointer.current?.pointerId !== event.pointerId) return
           if (!(event.buttons & 1)) { endInspection(); return }
           inspectAt(event.currentTarget, event.clientX)
-        }}><Plot bars={bars} geometry={plotGeometry} liveBar={surface.liveBar ?? bars.at(-1)!} liveOverlay={!!surface.liveBar} inspected={inspected} oiState={oiState} takerState={takerState} /></svg> : null}
+        }}><Plot bars={bars} geometry={plotGeometry} liveBar={surface.liveBar ?? bars.at(-1)!} liveOverlay={!!surface.liveBar} inspected={inspected} oiState={oiState} takerState={takerState} oiStatus={surface.oiStatus} takerStatus={surface.takerStatus} /></svg> : null}
       </div>
       {captureStatus === 'flashing' && <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
     </section>

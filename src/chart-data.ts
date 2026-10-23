@@ -18,7 +18,11 @@ export type Bar = {
   takerUnavailableReason?: 'not-published'
 }
 
-export type PreparedChartState = 'ready' | 'partial' | 'loading' | 'stale' | 'unavailable'
+export type PreparedChartState = 'ready' | 'partial' | 'loading' | 'stale' | 'unavailable' | 'error'
+export type ChartSourceStatus = Readonly<{
+  state: PreparedChartState; from: number; through: number | null
+  error?: string; retryAt?: number; reason?: 'not-published' | 'unsupported'
+}>
 export type PreparedChartBar = Bar & { confirmed: true }
 export type PreparedChartGeneration = number
 export type ChartUnavailable = Readonly<{ reason: 'insufficient-history'; availableCandles: number; requiredCandles: 96; retryAt: number }>
@@ -33,6 +37,9 @@ export type PreparedChartResponse = {
   generation: PreparedChartGeneration
   revision: number
   bars: PreparedChartBar[]
+  priceStatus?: ChartSourceStatus
+  oiStatus?: ChartSourceStatus
+  takerStatus?: ChartSourceStatus
   oiState: PreparedChartState
   takerState: PreparedChartState
   indicatorState: PreparedChartState
@@ -66,6 +73,10 @@ export type PreparedChartMeta = Readonly<{
   key: string; instId: string; timeframe: RadarTimeframe; intervalMS: number
   generation: PreparedChartGeneration; revision: number
   latestEnd: number | null; oldestHour: number | null; historyExhausted: boolean; error: string
+  sourceStatuses?: readonly Readonly<{ source: 'price' | 'oi' | 'taker'; status: ChartSourceStatus }>[]
+  priceStatus?: ChartSourceStatus
+  oiStatus?: ChartSourceStatus
+  takerStatus?: ChartSourceStatus
   priceState?: PreparedChartState
   priceAsOf?: number | null; priceObservedAt?: number | null; realtimeState?: 'live' | 'stale'; sourceVersions?: { price: number; oi: number; taker: number }
 }>
@@ -74,6 +85,9 @@ export type ReadyChartWindow = Readonly<{
   key: string; instId: string; timeframe: RadarTimeframe; intervalMS: number
   generation: PreparedChartGeneration
   bars: readonly PreparedChartBar[]; endHour: number
+  priceStatus?: ChartSourceStatus
+  oiStatus?: ChartSourceStatus
+  takerStatus?: ChartSourceStatus
   oiState: PreparedChartState; takerState: PreparedChartState; indicatorState: PreparedChartState
   liveBar?: Bar
   priceState?: PreparedChartState

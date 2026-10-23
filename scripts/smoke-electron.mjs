@@ -8,6 +8,7 @@ import { _electron } from 'playwright'
 import { once } from 'node:events'
 import { DuckDBInstance } from '@duckdb/node-api'
 import { inspectApp } from './electron-delivery.mjs'
+import { backgroundTestEnvironment, prepareBackgroundApp } from './electron-test-runtime.mjs'
 import { assertIndicatorLegends, openChart } from './chart-acceptance.mjs'
 
 async function deadline(work, label, milliseconds = 60_000) {
@@ -23,8 +24,13 @@ async function deadline(work, label, milliseconds = 60_000) {
 export async function smokeElectron({ app, revision, report: reportPath }) {
   assert.match(revision ?? '', /^[0-9a-f]{40}$/i, 'Smoke requires the full expected Git revision.')
   const artifact = await inspectApp(app, revision)
+  const prepared = await prepareBackgroundApp({ sourceApp: artifact.app, executableName: 'Perpetual Swap Suite' })
   const userData = await mkdtemp(join(tmpdir(), 'perpetual-swap-package-smoke-'))
-  const report = { app: artifact.app, revision, dirty: artifact.metadata.dirty, checks: [], startedAt: new Date().toISOString() }
+  const report = { app: artifact.app, revision, dirty: artifact.metadata.dirty, checks: [], startedAt: new Date().toISOString(),
+    verification: { kind: 'background-replica', sourceApp: artifact.app, sourceExecutable: artifact.executable,
+      sourceFingerprint: prepared.sourceFingerprint, testedApp: prepared.app, testedExecutable: prepared.executable,
+      containerChanges: ['LSBackgroundOnly=true', 'LSUIElement=false', 'test bundle identifiers', 'ad-hoc signature'],
+      renderer: 'offscreen', productionAppLaunched: false, nativeVisiblePaint: false } }
   let electron
   let page
   const errors = []
@@ -50,17 +56,17 @@ export async function smokeElectron({ app, revision, report: reportPath }) {
   }
   const launch = async () => {
     electron = await _electron.launch({
-      executablePath: artifact.executable,
+      executablePath: prepared.executable,
       args: ['--disable-gpu', `--user-data-dir=${userData}`],
       timeout: 45_000,
-      env: {
+      env: backgroundTestEnvironment(prepared, {
         ...process.env,
         ELECTRON_RUN_AS_NODE: undefined,
         ELECTRON_RENDERER_URL: undefined,
         PERPETUAL_SWAP_E2E: '1',
         PERPETUAL_SWAP_E2E_LIVE_REFRESH: '0',
         PERPETUAL_SWAP_USER_DATA: userData,
-      },
+      }),
     })
     page = await electron.firstWindow({ timeout: 30_000 })
     page.on('pageerror', error => errors.push(error.message))
@@ -82,6 +88,8 @@ export async function smokeElectron({ app, revision, report: reportPath }) {
       const preferences = windows[0]?.webContents.getLastWebPreferences()
       return {
         count: windows.length, executable: process.execPath, packaged: desktopApp.isPackaged,
+        offscreen: windows[0]?.webContents.isOffscreen(), visible: windows[0]?.isVisible(),
+        focused: windows[0]?.isFocused(), focusable: windows[0]?.isFocusable(),
         contextIsolation: preferences?.contextIsolation,
         nodeIntegration: preferences?.nodeIntegration,
         sandbox: preferences?.sandbox,
@@ -89,7 +97,11 @@ export async function smokeElectron({ app, revision, report: reportPath }) {
     })
     assert.equal(window.count, 1)
     assert.equal(window.packaged, true)
-    assert.equal(window.executable, artifact.executable, 'Smoke must launch the candidate executable.')
+    assert.equal(window.executable, prepared.executable, 'Smoke must launch only the guarded packaged replica.')
+    assert.equal(window.offscreen, true, 'Packaged smoke must keep its real renderer offscreen.')
+    assert.equal(window.visible, false)
+    assert.equal(window.focused, false)
+    assert.equal(window.focusable, false)
     assert.equal(window.contextIsolation, true)
     assert.equal(window.nodeIntegration, false)
     assert.equal(window.sandbox, true)
@@ -118,7 +130,7 @@ export async function smokeElectron({ app, revision, report: reportPath }) {
         ${legacy.timestamp + 600_000}::BIGINT) TO ${destination} (FORMAT PARQUET)`)
     } finally { legacyDB.closeSync(); legacyEngine.closeSync() }
     await launch()
-    report.checks.push('packaged executable, revision, window, preload isolation')
+    report.checks.push('guarded packaged replica: executable, revision, offscreen window, preload isolation')
     const readLegacy = async () => {
       const rows = await request({ e2e: { action: 'readCandles', instrument: legacy.instrument,
         timeframe: legacy.timeframe, from: legacy.timestamp, through: legacy.timestamp + 300_000 } })

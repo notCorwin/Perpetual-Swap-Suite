@@ -1236,3 +1236,46 @@ test('reopening a hidden historical chart restores its cached cursor with fresh 
     assert.equal(queue.calls.length, 0)
   } finally { reopen() }
 })
+
+
+test('a displayed chart preserves per-source failure metadata through the controller while successful Taker stays visible', async () => {
+  const first = prepared(btc, 199)
+  first.bars = first.bars.map(bar => ({ ...bar, oi: null, oiObserved: false, takerObserved: true, statisticsObserved: false, statisticsSources: 2 }))
+  first.oiState = 'loading'
+  const controller = new ChartController({ prepare: async () => first, local: async () => first, universe: async () => ({ frames: [first] }) })
+  await controller.setUniverse([btc], '1H', btc)
+  const close = controller.open(btc, '1H')
+  try {
+    await settled()
+    const failed = { ...first, revision: 2, oiState: 'error' as const,
+      oiStatus: { state: 'error' as const, from: 104 * hour, through: 199 * hour, error: 'OI temporarily unavailable', retryAt: Date.now() + 5000 } }
+    controller.ingestPrepared(failed)
+    const view = controller.getSnapshot()
+    assert.equal(view.pending, false); assert.equal(view.error, '')
+    assert.equal(view.presented?.oiState, 'error'); assert.equal(view.presented?.oiStatus?.error, 'OI temporarily unavailable')
+    assert.equal(view.presented?.oiStatus?.retryAt, failed.oiStatus.retryAt)
+    assert.equal(view.presented?.takerState, 'ready'); assert.equal(view.presented?.priceState, 'ready')
+    assert.ok(view.presented?.bars.every(bar => bar.buy === 20 && bar.sell === 30))
+  } finally { close() }
+})
+
+
+test('a preparation response with cached prices publishes its price-source error and retry time without rejecting its data', async () => {
+  const complete = prepared(btc, 199), retryAt = Date.now() + 60_000
+  const failed = { ...complete, bars: complete.bars.filter((_, index) => index !== 40), priceState: 'error' as const,
+    priceStatus: { state: 'error' as const, from: 104 * hour, through: 199 * hour, error: 'Price endpoint offline', retryAt }, error: 'Price endpoint offline' }
+  let calls = 0
+  const controller = new ChartController({ local: async () => null, universe: async () => ({ frames: [] }), prepare: async () => { calls += 1; return failed } })
+  const close = controller.open(btc, '1H')
+  try {
+    await settled()
+    const view = controller.getSnapshot()
+    assert.equal(calls, 1); assert.equal(view.pending, false)
+    assert.equal(view.presented?.bars.length, 95); assert.equal(view.presented?.priceState, 'error')
+    assert.equal(view.presented?.priceStatus?.retryAt, retryAt)
+    assert.match(view.error, /Price endpoint offline/); assert.ok(view.error.includes(new Date(retryAt).toISOString()))
+    controller.ingestPrepared({ ...complete, revision: 2, priceState: 'ready', priceStatus: { state: 'ready', from: 104 * hour, through: 199 * hour } })
+    assert.equal(controller.getSnapshot().presented?.bars.length, 96)
+    assert.equal(controller.getSnapshot().presented?.priceState, 'ready'); assert.equal(controller.getSnapshot().error, '')
+  } finally { close() }
+})

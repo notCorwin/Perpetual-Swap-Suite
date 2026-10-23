@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { performance } from 'node:perf_hooks'
 import { CANDLE_INTERVALS, validateCandle, validateQuery } from './market-records.js'
 import { statisticsMask, validTakerVolumes } from './statistics-state.js'
+import { statisticsAbsenceExpiryAt } from './statistics-coverage.js'
 
 const database = openRecordedDatabase(DatabaseSync, workerData.path, { readOnly: workerData.reader === true }, workerData.reader ? 'market-reader' : 'market-writer')
 database.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA cache_size=-8192;')
@@ -36,8 +37,19 @@ else {
       path TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, status TEXT NOT NULL, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS import_issues (
       path TEXT PRIMARY KEY, instrument TEXT NOT NULL, timeframe TEXT NOT NULL, from_ts INTEGER NOT NULL,
-      through_ts INTEGER NOT NULL, reason TEXT NOT NULL, detail TEXT NOT NULL);
-    PRAGMA user_version=1;`)
+      through_ts INTEGER NOT NULL, reason TEXT NOT NULL, detail TEXT NOT NULL);`)
+  const version = database.prepare('PRAGMA user_version').get().user_version
+  if (version < 2) {
+    database.exec('BEGIN IMMEDIATE')
+    try {
+      database.exec('ALTER TABLE statistics ADD COLUMN absence_attempts INTEGER NOT NULL DEFAULT 0;')
+      // Keep observation times and downloaded values. Old imported nulls lack
+      // versioned absence proof and must be checked again, never leased anew.
+      database.exec(`UPDATE statistics SET absence_attempts=1 WHERE origin=1 AND (value1 IS NULL OR (source=2 AND value2 IS NULL));
+        UPDATE statistics SET expires_at=NULL WHERE origin=0 AND (value1 IS NULL OR (source=2 AND value2 IS NULL));
+        PRAGMA user_version=2; COMMIT;`)
+    } catch (error) { database.exec('ROLLBACK'); throw error }
+  }
 }
 
 const statements = new Map()
@@ -78,31 +90,38 @@ const refreshBounds = id => {
   run('UPDATE series SET candle_count=?, first_ts=?, last_ts=? WHERE id=?', result.count, result.first, result.last, id)
 }
 
-function writeStatistic(series, source, timestamp, first, second, expiresAt, changes, importing = false, importVersion = 0, preserveExistingSource = false) {
+function writeStatistic(series, source, timestamp, first, second, expiresAt, changes,
+  { importing = false, importVersion = 0, preserveExistingSource = false, observedAt = importing ? importVersion : Date.now(), observeAbsence = false } = {}) {
   const previous = get('SELECT * FROM statistics WHERE series_id=? AND source=? AND timestamp=?', series.id, source, timestamp)
   if (importing && previous && (previous.origin === 1 || previous.import_version > importVersion)) return false
   if (preserveExistingSource && previous) return false
-  if (source === 2 && first === 0 && second === 0 && previous?.value1 != null && previous.value2 != null && (previous.value1 !== 0 || previous.value2 !== 0)) {
-    const price = get('SELECT volume,quote_volume FROM candles WHERE series_id=? AND timestamp=?', series.id, timestamp)
-    if (price && (price.volume > 0 || price.quote_volume > 0)) return false
-  }
+  const price = source === 2 && (first === 0 && second === 0 || previous?.value1 === 0 && previous.value2 === 0)
+    ? get('SELECT volume,quote_volume FROM candles WHERE series_id=? AND timestamp=?', series.id, timestamp) : null
+  const traded = price?.volume > 0 || price?.quote_volume > 0
+  const absent = first === null || source === 2 && (second === null || first === 0 && second === 0 && traded)
+  const previousNumeric = previous?.value1 != null && (source === 1 || previous.value2 != null
+    && !(previous.value1 === 0 && previous.value2 === 0 && traded))
   // Absence is a bounded source observation, never a correction to a numeric fact.
-  if (previous?.value1 !== null && previous?.value1 !== undefined && first === null) {
-    const price = source === 2 && previous.value1 === 0 && previous.value2 === 0
-      ? get('SELECT volume,quote_volume FROM candles WHERE series_id=? AND timestamp=?', series.id, timestamp) : null
-    if (!price || !(price.volume > 0 || price.quote_volume > 0)) return false
+  if (absent && previousNumeric) return false
+  if (absent && previous && observedAt < previous.written_at) return false
+  if (first === null && previous?.value1 === 0 && previous.value2 === 0 && traded) {
     // A fresh empty response can renew a contradicted zero placeholder's
     // unavailable proof. Merely receiving its price never renews that proof.
     first = previous.value1; second = previous.value2
   }
-  if (previous && Object.is(previous.value1, first) && Object.is(previous.value2, second) && Object.is(previous.expires_at, expiresAt)) {
+  const absenceAttempts = !absent ? 0 : observeAbsence ? Math.min(Number.MAX_SAFE_INTEGER, (previous?.absence_attempts ?? 0) + 1)
+    : previous?.absence_attempts || 1
+  expiresAt = expiresAt === undefined && absent && observeAbsence
+    ? statisticsAbsenceExpiryAt(series.timeframe, timestamp, observedAt, absenceAttempts) : expiresAt ?? null
+  if (previous && Object.is(previous.value1, first) && Object.is(previous.value2, second) && Object.is(previous.expires_at, expiresAt)
+    && previous.absence_attempts === absenceAttempts && (!observeAbsence || !absent || previous.written_at === observedAt)) {
     if (!importing && previous.origin === 0) run('UPDATE statistics SET origin=1,import_version=0 WHERE series_id=? AND source=? AND timestamp=?', series.id, source, timestamp)
     return false
   }
-  run(`INSERT INTO statistics(series_id,source,timestamp,value1,value2,expires_at,written_at,origin,import_version)
-    VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(series_id,source,timestamp) DO UPDATE SET value1=excluded.value1,value2=excluded.value2,
-    expires_at=excluded.expires_at,written_at=excluded.written_at,origin=excluded.origin,import_version=excluded.import_version`,
-  series.id, source, timestamp, first, second, expiresAt, importing ? importVersion : Date.now(), importing ? 0 : 1, importVersion)
+  run(`INSERT INTO statistics(series_id,source,timestamp,value1,value2,expires_at,written_at,origin,import_version,absence_attempts)
+    VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(series_id,source,timestamp) DO UPDATE SET value1=excluded.value1,value2=excluded.value2,
+    expires_at=excluded.expires_at,written_at=excluded.written_at,origin=excluded.origin,import_version=excluded.import_version,absence_attempts=excluded.absence_attempts`,
+  series.id, source, timestamp, first, second, expiresAt, observedAt, importing ? 0 : 1, importVersion, absenceAttempts)
   mutate(changes, series, timestamp)
   return true
 }
@@ -141,10 +160,12 @@ function append(rows, { importing = false, replacement, partition } = {}) {
         }
       } else if (!importing && previous?.origin === 0) run('UPDATE candles SET origin=1,import_version=0 WHERE series_id=? AND timestamp=?', series.id, row.timestamp)
       const mask = statisticsMask(row)
-      if (mask & 1 || !importing && Number.isFinite(row.oi)) writeStatistic(series, 1, row.timestamp, row.oi ?? null, null, row.statisticsOIExpiresAt ?? null, changes, importing, importVersion)
+      if (mask & 1 || !importing && Number.isFinite(row.oi)) writeStatistic(series, 1, row.timestamp, row.oi ?? null, null, row.statisticsOIExpiresAt ?? null, changes,
+        { importing, importVersion, observedAt: row.statisticsOIObservedAt ?? (importing ? importVersion : row.writtenAt ?? (row.oi == null ? 0 : Date.now())) })
       if (mask & 2 || !importing && validTakerVolumes(row)) {
         const volumes = validTakerVolumes(row)
-        writeStatistic(series, 2, row.timestamp, volumes?.sell ?? null, volumes?.buy ?? null, row.statisticsTakerExpiresAt ?? null, changes, importing, importVersion)
+        writeStatistic(series, 2, row.timestamp, volumes?.sell ?? null, volumes?.buy ?? null, row.statisticsTakerExpiresAt ?? null, changes,
+          { importing, importVersion, observedAt: row.statisticsTakerObservedAt ?? (importing ? importVersion : row.writtenAt ?? (volumes ? Date.now() : 0)) })
       }
     }
     for (const id of bounds) refreshBounds(id)
@@ -161,6 +182,8 @@ function appendStatistics(input) {
   if (!['oi', 'taker'].includes(input.source) || query.from % step || query.through % step || !Array.isArray(input.values)
     || query.through - query.from > 65_535 * step) throw new TypeError('Invalid statistics page.')
   if (input.expiresAt != null && (!Number.isSafeInteger(input.expiresAt) || input.expiresAt < 0)) throw new TypeError('Invalid statistics expiry.')
+  const observedAt = input.observedAt ?? Date.now()
+  if (!Number.isSafeInteger(observedAt) || observedAt < 0) throw new TypeError('Invalid statistics observation time.')
   const source = input.source === 'oi' ? 1 : 2, observations = new Map()
   for (const value of input.values) {
     if (!Array.isArray(value) || !Number.isSafeInteger(value[0]) || value[0] % step) throw new TypeError('Statistics must follow the native period grid.')
@@ -171,22 +194,25 @@ function appendStatistics(input) {
   }
   return transaction(() => {
     const series = ensureSeries(query), changes = new Map()
+    const observation = { preserveExistingSource: input.preserveExistingSource, observedAt, observeAbsence: true }
     let count = 0
     for (let timestamp = query.from; timestamp <= query.through; timestamp += step) {
       const values = observations.get(timestamp), first = values?.[0] ?? null, second = source === 1 ? null : values?.[1] ?? null
       if (source === 2 && (first === null || second === null)) {
-        if (writeStatistic(series, source, timestamp, null, null, input.expiresAt ?? null, changes, false, 0, input.preserveExistingSource)) count += 1
-      } else if (writeStatistic(series, source, timestamp, first, second, input.expiresAt ?? null, changes, false, 0, input.preserveExistingSource)) count += 1
+        if (writeStatistic(series, source, timestamp, null, null, input.expiresAt, changes, observation)) count += 1
+      } else if (writeStatistic(series, source, timestamp, first, second, input.expiresAt, changes, observation)) count += 1
     }
     return { result: count, mutations: finishMutations(changes) }
   })
 }
 
-const takerContradiction = '(t.value1=0 AND t.value2=0 AND (c.volume>0 OR c.quote_volume>0))'
+const takerContradiction = '(t.value1=0 AND t.value2=0 AND (c.volume>0 OR COALESCE(c.quote_volume,0)>0))'
 const mergedProjection = `c.timestamp,c.open,c.high,c.low,c.close,c.volume,c.base_volume AS baseVolume,c.quote_volume AS quoteVolume,
   c.written_at AS writtenAt,o.value1 AS oi,CASE WHEN ${takerContradiction} THEN NULL ELSE t.value1 END AS sell,CASE WHEN ${takerContradiction} THEN NULL ELSE t.value2 END AS buy,
   CASE WHEN o.value1 IS NOT NULL THEN NULL ELSE o.expires_at END AS statisticsOIExpiresAt,
   CASE WHEN t.value1 IS NOT NULL AND t.value2 IS NOT NULL AND NOT ${takerContradiction} THEN NULL ELSE t.expires_at END AS statisticsTakerExpiresAt,
+  o.written_at AS statisticsOIObservedAt,COALESCE(o.absence_attempts,0) AS statisticsOIAbsenceAttempts,
+  t.written_at AS statisticsTakerObservedAt,COALESCE(t.absence_attempts,0) AS statisticsTakerAbsenceAttempts,
   CASE WHEN o.timestamp IS NOT NULL AND o.value1 IS NOT NULL AND t.timestamp IS NOT NULL AND t.value1 IS NOT NULL AND t.value2 IS NOT NULL AND NOT ${takerContradiction} THEN 1
     ELSE 8+CASE WHEN o.timestamp IS NULL THEN 0 ELSE 1 END+CASE WHEN t.timestamp IS NULL THEN 0 ELSE 2 END END AS statisticsVersion`
 const mergedJoins = 'LEFT JOIN statistics o ON o.series_id=c.series_id AND o.source=1 AND o.timestamp=c.timestamp LEFT JOIN statistics t ON t.series_id=c.series_id AND t.source=2 AND t.timestamp=c.timestamp'
@@ -205,13 +231,18 @@ const statisticRows = query => {
     WHERE s.series_id=? AND s.source ${source ? '=?' : 'IN (1,2)'} AND s.timestamp>=? AND s.timestamp<=? ORDER BY s.timestamp`, series.id, ...(source ? [source] : []), valid.from, valid.through)
   const result = new Map()
   for (const row of rows) {
-    const value = result.get(row.timestamp) ?? { instrument: query.instrument, timeframe: query.timeframe, timestamp: row.timestamp, oi: null, sell: null, buy: null, statisticsVersion: 8, statisticsOIExpiresAt: null, statisticsTakerExpiresAt: null }
+    const value = result.get(row.timestamp) ?? { instrument: query.instrument, timeframe: query.timeframe, timestamp: row.timestamp, oi: null, sell: null, buy: null, statisticsVersion: 8,
+      statisticsOIExpiresAt: null, statisticsTakerExpiresAt: null, statisticsOIObservedAt: null, statisticsTakerObservedAt: null, statisticsOIAbsenceAttempts: 0, statisticsTakerAbsenceAttempts: 0 }
     value.statisticsVersion |= row.source
-    if (row.source === 1) { value.oi = row.value1; value.statisticsOIExpiresAt = row.value1 !== null ? null : row.expires_at }
+    if (row.source === 1) {
+      value.oi = row.value1; value.statisticsOIExpiresAt = row.value1 !== null ? null : row.expires_at
+      value.statisticsOIObservedAt = row.written_at; value.statisticsOIAbsenceAttempts = row.absence_attempts
+    }
     else {
       const invalidZero = row.value1 === 0 && row.value2 === 0 && (row.price_volume > 0 || row.price_quote_volume > 0)
       value.sell = invalidZero ? null : row.value1; value.buy = invalidZero ? null : row.value2
       value.statisticsTakerExpiresAt = value.sell !== null && value.buy !== null ? null : row.expires_at
+      value.statisticsTakerObservedAt = row.written_at; value.statisticsTakerAbsenceAttempts = row.absence_attempts
     }
     result.set(row.timestamp, value)
   }
@@ -226,12 +257,13 @@ function missingRanges(query, source = 'candles') {
   if (!series) return [{ from, through }]
   const sourceBit = source === 'oi' ? 1 : 2
   const contradicted = source === 'taker' ? ' AND NOT(value1=0 AND value2=0 AND EXISTS(SELECT 1 FROM candles c WHERE c.series_id=statistics.series_id AND c.timestamp=statistics.timestamp AND (c.volume>0 OR c.quote_volume>0)))' : ''
-  const condition = source === 'candles' ? '' : ` AND source=? AND ((value1 IS NOT NULL${contradicted}) OR expires_at>?)`
+  const condition = source === 'candles' ? '' : ` AND source=? AND ((value1 IS NOT NULL${source === 'taker' ? ' AND value2 IS NOT NULL' : ''}${contradicted}) OR expires_at>?)`
   const table = source === 'candles' ? 'candles' : 'statistics'
+  const now = Date.now()
   const values = all(`WITH present AS (SELECT timestamp,LAG(timestamp,1,?) OVER(ORDER BY timestamp) AS previous FROM ${table}
     WHERE series_id=? AND timestamp>=? AND timestamp<=?${condition}) SELECT previous+? AS "from",timestamp-? AS through FROM present WHERE timestamp-previous>?`,
-    from - step, series.id, from, through, ...(source === 'candles' ? [] : [sourceBit, Date.now()]), step, step, step)
-  const last = get(`SELECT MAX(timestamp) AS timestamp FROM ${table} WHERE series_id=? AND timestamp>=? AND timestamp<=?${condition}`, series.id, from, through, ...(source === 'candles' ? [] : [sourceBit, Date.now()]))?.timestamp
+    from - step, series.id, from, through, ...(source === 'candles' ? [] : [sourceBit, now]), step, step, step)
+  const last = get(`SELECT MAX(timestamp) AS timestamp FROM ${table} WHERE series_id=? AND timestamp>=? AND timestamp<=?${condition}`, series.id, from, through, ...(source === 'candles' ? [] : [sourceBit, now]))?.timestamp
   if (last == null) return [{ from, through }]
   if (last < through) values.push({ from: last + step, through })
   return values

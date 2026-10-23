@@ -61,7 +61,7 @@ function request(fetcher: typeof fetch, controller = new AbortController(), time
   const service = Object.assign(Object.create(MarketService.prototype), { fetcher, requestTimeout: timeout, disposed: false })
   const lane = { name: 'candles', interval: 0, concurrency: 4, rateLimitedUntil: 0 }
   const result = new Promise((resolve, reject) => {
-    void service.performRequest(lane, { path: '/market/history-candles', parameters: { instId: 'BTC-USDT-SWAP', privateValue: 'secret' }, priority: 'foreground', controller, cleaned: true, resolve, reject })
+    void service.performRequest(lane, { path: '/market/history-candles', parameters: { instId: 'BTC-USDT-SWAP', privateValue: 'secret' }, priority: 'foreground', bucket: lane, enqueuedAt: Date.now(), controller, cleaned: true, resolve, reject })
   })
   return result
 }

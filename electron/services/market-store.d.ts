@@ -13,6 +13,10 @@ export type CandleRecord = {
   oi?: number | null
   buy?: number | null
   sell?: number | null
+  statisticsOIObservedAt?: number | null
+  statisticsTakerObservedAt?: number | null
+  statisticsOIAbsenceAttempts?: number
+  statisticsTakerAbsenceAttempts?: number
   confirmed: boolean
   [key: string]: unknown
 }
@@ -21,8 +25,17 @@ export type CandleQuery = { instrument: string; timeframe: string; from?: number
 export type StatisticsRecord = {
   instrument: string; timeframe: string; timestamp: number; oi: number | null; buy: number | null; sell: number | null
   statisticsVersion: number; statisticsOIExpiresAt: number | null; statisticsTakerExpiresAt: number | null
+  statisticsOIObservedAt: number | null; statisticsTakerObservedAt: number | null
+  statisticsOIAbsenceAttempts: number; statisticsTakerAbsenceAttempts: number
 }
-export type StatisticsPage = CandleQuery & CandleRange & { source: 'oi' | 'taker'; values: Array<Array<number | null>>; expiresAt?: number | null; preserveExistingSource?: boolean }
+export type StatisticsPage = CandleQuery & CandleRange & {
+  source: 'oi' | 'taker'; values: Array<Array<number | null>>
+  /** Successful source observation time; defaults to Date.now(). */
+  observedAt?: number
+  /** Explicit absence lease override; omitted leases follow the per-slot policy. Numeric facts remain reusable. */
+  expiresAt?: number | null
+  preserveExistingSource?: boolean
+}
 export type IndicatorCheckpoint = { timestamp: number; state: any; formulaVersion: string; sourceRevision: string | number; bollExpansion?: unknown }
 export type CandleRange = { from: number; through: number }
 export type CandleAuditIssue = CandleRange & {

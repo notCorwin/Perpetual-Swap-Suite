@@ -49,7 +49,7 @@ jobs:
       - name: Verify workspace scaling and contrast
         env:
           PERPETUAL_SWAP_UI_VISUAL_OUTPUT: artifacts/workspace-visual
-        run: npm run sandbox -- command --output artifacts/sandbox -- node scripts/workspace-visual-check.mjs
+        run: npm run sandbox -- command --desktop --output artifacts/sandbox -- node scripts/workspace-visual-check.mjs
       - name: Verify full-market intake under held statistics and archive writes
         env:
           PERPETUAL_SWAP_RESOURCE_REPORT: artifacts/market-resources.json

@@ -219,7 +219,8 @@ export class ChartController {
       requested: target,
       presented,
       pending: ready === null || Boolean(calculatingHistory),
-      error: ready || requested !== this.view.requested ? '' : this.view.error,
+      error: ready?.priceStatus?.state === 'error' ? `Price history failed: ${ready.priceStatus.error || 'Source request failed'}${ready.priceStatus.retryAt ? ` · retry at ${new Date(ready.priceStatus.retryAt).toISOString()}` : ''}`
+        : ready || requested !== this.view.requested ? '' : this.view.error,
       oldestHour: meta?.oldestHour ?? null,
       latestEnd,
       historyExhausted: meta?.historyExhausted ?? false,
@@ -385,7 +386,7 @@ export class ChartController {
       const response = await this.transport.prepare(job, focusId)
       const elapsed = performance.now() - startedAt
       this.preparationMS = Math.max(elapsed, this.preparationMS * .75 + elapsed * .25)
-      if (response.error) throw new Error(response.error)
+      if (response.error && response.priceStatus?.state !== 'error') throw new Error(response.error)
       if (response.unavailable) {
         if (this.active && focusId === this.focusId && this.view.requested && targetKey(this.view.requested) === targetKey(job)) {
           this.publish({ ...this.view, pending: false, error: '', unavailable: response.unavailable })

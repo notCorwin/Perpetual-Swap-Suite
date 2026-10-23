@@ -8,7 +8,7 @@ type Instrument = { instId: string; listTime?: number | string; [key: string]: u
 export type MarketHistoryOptions = {
   store: Pick<MarketStore, 'candles' | 'coverage' | 'inspectCandles' | 'statistics'> & Partial<Pick<MarketStore, 'candleRevision' | 'candleChangesSince'>>
   metadata: HistorySyncOptions['metadata'] & AuditMetadata
-  get(path: string, parameters: Record<string, string | number>, signal: AbortSignal, priority: StorePriority): Promise<unknown[][]>
+  get(path: string, parameters: Record<string, string | number>, signal: AbortSignal, priority: StorePriority, options?: { getPriority?: () => StorePriority }): Promise<unknown[][]>
   /** Reuse a just-closed candle from the acknowledged stream before REST acquisition. */
   awaitRealtimeCandle?(query: { instrument: string; timeframe: string; from: number; through: number; signal: AbortSignal; priority: StorePriority }): Promise<boolean>
   // Raw API JSON is checked by the adapter before reaching durable storage.
@@ -34,7 +34,8 @@ export class MarketHistory {
   readonly audit: DataAudit
   ensurePrices(instId: string, timeframe: Timeframe, from: number, through: number, priority?: StorePriority, signal?: AbortSignal): Promise<{ rows: CandleRecord[]; floor?: number }>
   /** OI and Taker are acquired and persisted independently of price rows. Numeric observations remain reusable; direct empty observations revalidate only their expired native-period ranges. */
-  ensureStatistics(instId: string, timeframe: Timeframe, from: number, through: number, priority?: StorePriority, signal?: AbortSignal): Promise<{ rows: CandleRecord[] }>
+  ensureStatistics(instId: string, timeframe: Timeframe, from: number, through: number, priority?: StorePriority, signal?: AbortSignal, source?: 'oi' | 'taker'): Promise<{ rows: CandleRecord[] }>
+  promoteSource(instId: string, timeframe: Timeframe, source: 'candles' | 'oi' | 'taker', from: number, through: number, priority: StorePriority): Promise<unknown>
   /** Publishes its forming observation through onLive only if the admitted live revision remains current. */
   latest(instId: string, timeframe: Timeframe, priority?: StorePriority): Promise<{ floor?: number }>
   removeTargets(instIds: Iterable<string>): Promise<void>

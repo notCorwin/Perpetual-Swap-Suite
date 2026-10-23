@@ -189,6 +189,51 @@ test('a disjoint interactive range preempts a blocked background page for the sa
   await sync.waitFor(background.id)
 })
 
+test('shared background pages follow live chart priority without promoting the larger archive or duplicating work', async t => {
+  const gate = deferred(), started: HistorySourceQuery[] = []
+  const { sync } = fixture({ sources: { candles: { fetchGap: async request => {
+    started.push(request)
+    if (started.length === 1) await gate.promise
+    return rows(request)
+  } } } })
+  t.after(() => { gate.resolve(); return sync.close() })
+  const archive = await sync.enqueue({ ...query, through: base + 599 * step, priority: 'background' })
+  await waitFor(() => started.length === 1)
+  const page = started[0], transportPriority = page.getPriority
+  assert.equal(transportPriority(), 'background')
+  const bounds = { ...query, from: base + 400 * step, through: base + 499 * step }
+  const chart = await sync.enqueue({ ...bounds, priority: 'prefetch' })
+  assert.equal(sync.promote(bounds, 'interactive'), 1)
+  assert.equal(sync.getTask(archive.id)?.priority, 'background', 'A chart promotion cannot raise unrelated archive pages.')
+  assert.equal(sync.getTask(chart.id)?.priority, 'interactive')
+  assert.equal(transportPriority(), 'interactive')
+  assert.equal(page.priority, 'background', 'The dispatch snapshot remains stable; transport queues use getPriority for live demand.')
+  assert.equal(page.signal.aborted, false, 'A useful shared page keeps its transport request.')
+  assert.equal(started.length, 1)
+  gate.resolve()
+  const complete = await sync.waitFor(chart.id)
+  assert.deepEqual([complete.coveredRecords, complete.localRecords], [100, 0], 'Joining a fetch cannot count its later result as reused data.')
+  await sync.waitFor(archive.id)
+  assert.equal(started.length, 2)
+  assert.ok(started.every(request => request.getPriority() === 'background'), 'Once chart demand finishes, later archive work remains background.')
+})
+
+test('an interactive arrival promotes an already queued shared fetch and its cancellation restores background priority', async t => {
+  const gate = deferred(), started: HistorySourceQuery[] = []
+  const { sync } = fixture({ sources: { candles: { fetchGap: async request => { started.push(request); await gate.promise; return rows(request) } } } })
+  t.after(() => { gate.resolve(); return sync.close() })
+  const background = await sync.enqueue(query)
+  await waitFor(() => started.length === 1)
+  const interactive = await sync.enqueue({ ...query, priority: 'interactive' })
+  assert.equal(started[0].getPriority(), 'interactive')
+  await sync.cancel(interactive.id)
+  assert.equal(started[0].getPriority(), 'background')
+  assert.equal(started[0].signal.aborted, false)
+  gate.resolve()
+  assert.equal((await sync.waitFor(background.id)).status, 'completed')
+  assert.equal(started.length, 1)
+})
+
 test('maintenance receives a page during a continuous interactive backlog', async t => {
   const started: string[] = []
   const { sync } = fixture({ maxConcurrentTasks: 1, maxConcurrentPerSource: 1,
@@ -219,9 +264,49 @@ test('unavailable requires explicit source evidence and an empty page pauses ins
   const task = await empty.sync.enqueue(query), result = await empty.sync.waitFor(task.id)
   assert.equal(result.status, 'paused'); assert.match(result.lastError!, /no persisted coverage progress/)
   assert.deepEqual(result.unavailableRanges, [])
+  assert.deepEqual([result.coveredRecords, result.emptyRecords, result.unavailableRecords], [0, 0, 0])
+  assert.deepEqual(empty.sync.progressFor([query.instrument], query.timeframe), { retrying: 0, unavailable: 0 })
   const bounded = fixture({ sources: { candles: { inspect: () => ({ availableFrom: query.through + step, reason: 'Explicit source boundary.' }), fetchGap: () => { throw Error('Unavailable range must not fetch') } } } }); t.after(() => bounded.sync.close())
   const unavailable = await bounded.sync.enqueue(query)
   assert.equal((await bounded.sync.waitFor(unavailable.id)).status, 'unavailable')
+})
+
+test('fail-fast callers receive the first source failure and server cooldown while shared background waiters survive', async t => {
+  let calls = 0, clock = base
+  const { sync, store } = fixture({ now: () => clock, sources: { candles: { fetchGap: request => {
+    if (++calls === 1) throw Object.assign(new Error('Source rate limit.'), { retryAfter: 60_000, retryAt: base + 90_000 })
+    return rows(request)
+  } } } })
+  t.after(() => sync.close())
+  const background = await sync.enqueue(query), interactive = await sync.enqueue({ ...query, priority: 'interactive' })
+  let settled = false
+  const normal = sync.waitFor(background.id).then(result => { settled = true; return result })
+  await assert.rejects(sync.waitFor(interactive.id, { failFast: true }), error => {
+    assert.equal((error as Error).message, 'Source rate limit.')
+    assert.equal((error as Error & { retryAt: number }).retryAt, base + 90_000)
+    return true
+  })
+  await assert.rejects(sync.waitFor(interactive.id, { failFast: true }), { message: 'Source rate limit.', retryAt: base + 90_000 })
+  assert.equal(sync.getTask(background.id)?.status, 'retry')
+  assert.equal(sync.getTask(background.id)?.nextAttemptAt, base + 90_000)
+  assert.equal(settled, false)
+  assert.equal(store.values.size, 0, 'A source error cannot write empty observations.')
+  assert.equal(sync.getTask(background.id)?.unavailableRecords, 0)
+  await sync.cancel(interactive.id)
+  assert.equal(settled, false, 'Cancelling the failed chart consumer preserves the background waiter.')
+  clock += 90_000
+  await sync.resume(background.id)
+  assert.equal((await normal).status, 'completed')
+  assert.equal(calls, 2)
+})
+
+test('Retry-After alone extends first-error retry reporting beyond exponential backoff', async t => {
+  const { sync } = fixture({ now: () => base, sources: { candles: { fetchGap: () => { throw Object.assign(new Error('Cooldown.'), { retryAfter: 60_000 }) } } } })
+  t.after(() => sync.close())
+  const task = await sync.enqueue(query)
+  await assert.rejects(sync.waitFor(task.id, { failFast: true }), { message: 'Cooldown.', retryAt: base + 60_000 })
+  assert.equal(sync.getTask(task.id)?.nextAttemptAt, base + 60_000)
+  await sync.cancel(task.id)
 })
 
 test('all finite consumers pause at their failure budget and recover only after an explicit resume', async t => {
@@ -285,8 +370,8 @@ test('durable progress separates numeric history, leased emptiness, and overlapp
   const task = await sync.enqueue({ ...query, through: last })
   const completed = await sync.waitFor(task.id)
   const initial = snapshots.find(value => value.inspected)!
-  assert.deepEqual([initial.coveredRecords, initial.unavailableRecords, initial.localRecords], [1, 5, 1])
-  assert.deepEqual([completed.coveredRecords, completed.unavailableRecords, completed.localRecords], [5, 5, 1])
+  assert.deepEqual([initial.coveredRecords, initial.emptyRecords, initial.unavailableRecords, initial.localRecords], [1, 0, 5, 1])
+  assert.deepEqual([completed.coveredRecords, completed.emptyRecords, completed.unavailableRecords, completed.localRecords], [5, 0, 5, 1])
   assert.equal(completed.status, 'unavailable')
   assert.equal(completed.writtenRecords, 4)
 })
@@ -307,7 +392,7 @@ test('completed finite consumers never restart at lease expiry and explicit requ
   t.after(() => sync.close())
   const task = await sync.enqueue({ ...query, through: last, source: 'oi' })
   const first = await sync.waitFor(task.id); await sync.whenIdle()
-  assert.deepEqual([first.coveredRecords, first.unavailableRecords, first.localRecords], [299, 1, 299])
+  assert.deepEqual([first.coveredRecords, first.emptyRecords, first.unavailableRecords, first.localRecords], [299, 1, 0, 299])
   clock += 20
   await new Promise(resolve => setTimeout(resolve, 25))
   assert.equal(calls.length, 1, 'Expiry cannot restart a completed consumer.')

@@ -84,8 +84,8 @@ export class MarketHistory {
       now,
       // MarketService.get already meters each independent OKX endpoint family.
       minRequestIntervalMS: 0,
-      maxConcurrentTasks: 8,
-      maxConcurrentPerSource: { candles: 4, oi: 2, taker: 2 },
+      maxConcurrentTasks: 20,
+      maxConcurrentPerSource: { candles: 4, oi: 8, taker: 8 },
     })
     this.audit = new DataAudit({ metadata, now, onCheckpoint: onAuditCheckpoint,
       inspect: async (target, { signal }) => {
@@ -176,7 +176,7 @@ export class MarketHistory {
       return { records: [], cursor: null }
     }
     const cursor = Math.min(numeric(query.cursor) ?? through + interval, through + interval)
-    const values = await this.get('/market/history-candles', { instId: instrument, bar: timeframe, limit: Math.min(300, (cursor - from) / interval), after: cursor }, signal, priority)
+    const values = await this.get('/market/history-candles', { instId: instrument, bar: timeframe, limit: Math.min(300, (cursor - from) / interval), after: cursor }, signal, priority, { getPriority: query.getPriority })
     const rows = this.parsed(instrument, timeframe, values).filter(row => row.timestamp < cursor)
     return { records: rows, cursor: rows.length ? Math.min(...rows.map(row => row.timestamp)) : null }
   }
@@ -189,7 +189,7 @@ export class MarketHistory {
     // OKX excludes both boundaries. Ask each source about the actual page;
     // a shared local retention cutoff cannot establish its availability.
     const values = await this.get(path, { instId: instrument, period: timeframe, limit: 100,
-      begin: pageFrom - interval, end: through + interval, ...(source === 'taker' ? { unit: 1 } : {}) }, signal, priority)
+      begin: pageFrom - interval, end: through + interval, ...(source === 'taker' ? { unit: 1 } : {}) }, signal, priority, { getPriority: query.getPriority })
     if (!Array.isArray(values)) throw new TypeError('OKX statistics must contain an array.')
     const byTimestamp = new Map()
     for (const value of values) {
@@ -250,13 +250,17 @@ export class MarketHistory {
     this.assertOpen()
     signal?.throwIfAborted()
     const task = await this.sync.enqueue({ instrument: instId, timeframe, source, from, through, priority })
+    const failFast = priority === 'interactive' || priority === 'prefetch'
     const abort = () => { void this.sync.cancel(task.id).catch(() => undefined) }
     signal?.addEventListener('abort', abort, { once: true })
     try {
       if (signal?.aborted) { abort(); signal.throwIfAborted() }
-      const result = await abortable(this.sync.waitFor(task.id), signal)
+      const result = await abortable(this.sync.waitFor(task.id, { failFast }), signal)
       if (!['completed', 'unavailable'].includes(result.status)) throw new Error(result.lastError || `History ${source} task was ${result.status}.`)
       return result
+    } catch (error) {
+      if (failFast) await this.sync.cancel(task.id).catch(() => undefined)
+      throw error
     } finally { signal?.removeEventListener('abort', abort) }
   }
 
@@ -266,10 +270,16 @@ export class MarketHistory {
     return { rows: await abortable(this.store.candles({ instrument: instId, timeframe, from, through }, priority), signal), floor: this.bounds(instId, timeframe).floor }
   }
 
-  async ensureStatistics(instId, timeframe, from, through, priority = 'foreground', signal) {
+  async ensureStatistics(instId, timeframe, from, through, priority = 'foreground', signal, source) {
     await abortable(this.ready, signal)
-    await Promise.all(['oi', 'taker'].map(source => this.request(instId, timeframe, source, from, through, priority, signal)))
+    if (source !== undefined && !['oi', 'taker'].includes(source)) throw new TypeError('Unknown statistics source.')
+    await Promise.all((source ? [source] : ['oi', 'taker']).map(selected => this.request(instId, timeframe, selected, from, through, priority, signal)))
     return { rows: await abortable(this.store.candles({ instrument: instId, timeframe, from, through }, priority), signal) }
+  }
+
+  async promoteSource(instId, timeframe, source, from, through, priority) {
+    await this.ready
+    return this.sync.promote({ instrument: instId, timeframe, source, from, through }, priority)
   }
 
   latest(instId, timeframe, priority = 'foreground') {

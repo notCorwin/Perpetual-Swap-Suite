@@ -28,12 +28,12 @@ const OBSERVATION_TTL = 90_000
 const TICKER_BOOTSTRAP_MS = 10_000
 const CANDLE_DELIVERY_MS = 10_000
 const CATALOG_RENEW_INTERVAL = 30_000
-const LATEST_CANDLE_REFRESH = 60_000
-const HISTORICAL_STATISTICS_REFRESH = 6 * 3_600_000
 const REQUEST_TIMEOUT = 12_000
 const RETRY_DELAYS = [1_000]
 const REQUEST_PRIORITY = { background: 0, chartWarm: 0, prefetch: 1, statistics: 2, continuity: 2, foreground: 3, repair: 3, prepared: 3, interactive: 4 }
 const REQUEST_LANE_INTERVALS = Object.freeze({ candles: 100, oi: 200, taker: 400, books: 50, instruments: 100, tickers: 100, openInterest: 100, market: 80 })
+const instrumentRateLimit = name => name === 'oi' || name === 'taker'
+const MAX_HTTP_REQUESTS = 24
 const requestLaneFor = path => {
   if (path.includes('/rubik/stat/taker-volume-contract')) return 'taker'
   if (path.includes('/rubik/stat/contracts/open-interest-history')) return 'oi'
@@ -79,9 +79,6 @@ const number = value => {
   return Number.isFinite(parsed) ? parsed : null
 }
 const timeframeMilliseconds = timeframe => timeframe === '5m' ? FIVE_MINUTES : timeframe === '15m' ? 900_000 : 3_600_000
-const statisticsExpiryAt = (timeframe, end, observedAt = Date.now()) => observedAt
-  + (end >= observedAt - timeframeMilliseconds(timeframe) * 2 ? LATEST_CANDLE_REFRESH : HISTORICAL_STATISTICS_REFRESH)
-
 function normalizedStatistics(candle) {
   const sources = statisticsMask(candle)
   const volumes = sources & STATISTICS_TAKER ? validTakerVolumes(candle) : null
@@ -97,11 +94,10 @@ function normalizedStatistics(candle) {
   for (const source of [STATISTICS_OI, STATISTICS_TAKER]) {
     const field = statisticsExpiryField(source)
     const missing = source === STATISTICS_OI ? next.oi === null : next.buy === null || next.sell === null
-    // A price correction can invalidate a previously genuine zero Taker pair.
-    // That is new missing coverage, not a new successful empty HTTP response.
-    const invalidatedTaker = source === STATISTICS_TAKER && !volumes && (candle.buy != null || candle.sell != null)
+    // Only persisted source proof can lease an empty observation. A price
+    // correction or import must never manufacture a new successful response.
     next[field] = sources & source && missing
-      ? number(candle[field]) ?? (invalidatedTaker ? 0 : statisticsExpiryAt(candle.timeframe, candle.timestamp, number(candle.writtenAt) ?? 0))
+      ? number(candle[field]) ?? 0
       : null
   }
   return next
@@ -265,7 +261,9 @@ export class MarketService {
     this.candleMutations = new Map()
     this.barTasks = new Set()
     this.backgroundTasks = new Set()
-    this.requestLanes = new Map(Object.entries(REQUEST_LANE_INTERVALS).map(([name, interval]) => [name, { name, interval, queue: [], task: null, running: false, active: new Map(), wake: null, nextAt: 0, rateLimitedUntil: 0 }]))
+    this.requestLanes = new Map(Object.entries(REQUEST_LANE_INTERVALS).map(([name, interval]) => [name, { name, interval, queue: [], task: null, running: false, active: new Map(), buckets: new Map(), wake: null, nextAt: 0, rateLimitedUntil: 0,
+      ...(instrumentRateLimit(name) ? { concurrency: 8 } : {}) }]))
+    this.activeRequests = new Set()
     this.abortControllers = new Set()
     this.shutdownController = new AbortController()
     this.revision = 0
@@ -290,7 +288,12 @@ export class MarketService {
     this.chartSubscriptions = []
     this.latestAuditID = null
     // The proxy admits no historical work until durable metadata has opened.
-    const history = Object.fromEntries(['ensurePrices', 'ensureStatistics', 'latest'].map(method => [method, async (...args) => { await this.ready; return this.history[method](...args) }]))
+    const history = Object.fromEntries(['ensurePrices', 'ensureStatistics', 'latest', 'promoteSource'].map(method => [method, async (...args) => {
+      await this.ready
+      const result = await this.history[method](...args)
+      if (method === 'promoteSource') this.wakeRequestQueues()
+      return result
+    }]))
     this.preparedCharts = new PreparedChartPipeline({ store, history, normalize: normalizedStatistics, revision: instId => this.dataRevision(instId), instrument: instId => this.instruments.get(instId),
       streaming: (instId, timeframe) => this.realtime?.isSubscribed(instId, timeframe) ?? false })
     this.ready = this.initialize()
@@ -332,7 +335,7 @@ export class MarketService {
     this.metadata ??= await MetadataStore.open(join(this.store.root, 'Metadata'))
     this.history = new MarketHistory({
       store: this.store, metadata: this.metadata,
-      get: (path, parameters, signal, priority) => this.get(path, parameters, signal, priority),
+      get: (path, parameters, signal, priority, options) => this.get(path, parameters, signal, priority, options),
       awaitRealtimeCandle: query => this.awaitRealtimeCandle(query),
       parseCandle: candle,
       persistCandles: (instId, rows, options) => this.persistCandles(instId, rows, typeof options === 'string' ? { priority: options } : options),
@@ -802,6 +805,22 @@ export class MarketService {
     return lane
   }
 
+  requestBucket(lane, parameters) {
+    if (!instrumentRateLimit(lane.name)) return lane
+    // Both statistics endpoints meter IP + instrument, across all periods.
+    const key = String(parameters?.instId ?? '')
+    let bucket = lane.buckets.get(key)
+    if (!bucket) {
+      const now = Date.now()
+      for (const [id, value] of lane.buckets) if (!value.pending && Math.max(value.nextAt, value.rateLimitedUntil) <= now) lane.buckets.delete(id)
+      bucket = { nextAt: 0, rateLimitedUntil: 0, pending: 0 }
+      lane.buckets.set(key, bucket)
+    }
+    return bucket
+  }
+
+  wakeRequestQueues() { for (const lane of this.requestLanes.values()) lane.wake?.() }
+
   nextQueuedRequest(lane, eligible = () => true) {
     // Reserve service for interactive work while ageing maintenance instead
     // of starving an archive behind an endless stream of closes.
@@ -826,6 +845,7 @@ export class MarketService {
     request.requestSignal?.removeEventListener('abort', request.abort)
     request.controller.signal.removeEventListener('abort', request.onAbort)
     this.abortControllers.delete(request.controller)
+    if (request.bucket !== this.requestLane(request.lane)) request.bucket.pending -= 1
   }
 
   rejectQueuedRequest(request) {
@@ -865,7 +885,7 @@ export class MarketService {
           if (request.controller.signal.aborted) throw request.controller.signal.reason ?? new Error('The request was aborted.')
           const url = requestURL(request.path, request.parameters), signal = request.controller.signal
           const operation = beginOperation({ category: 'ipc', name: 'http.request', resource: networkResource(url),
-            attributes: { transport: 'http', method: 'GET', path: request.path, lane: lane.name, priority: request.priority } })
+            attributes: { transport: 'http', method: 'GET', path: request.path, lane: lane.name, priority: request.priority, queueMS: Math.max(0, Date.now() - request.enqueuedAt) } })
           const attributes = {}
           let finished = false
           const finish = status => {
@@ -883,25 +903,30 @@ export class MarketService {
             if (signal.aborted) throw signal.reason ?? new Error('The request was aborted.')
             const serverDelay = retryAfterDelay(response.headers?.get('retry-after'))
             if (response.status === 429) {
-              // A 429 cools only the endpoint family that returned it. OI
-              // must never freeze an unrelated candle repair or Taker read.
-              lane.rateLimitedUntil = Math.max(lane.rateLimitedUntil, Date.now() + (serverDelay ?? RETRY_DELAYS[0]))
-              lane.concurrency = Math.max(2, Math.floor((lane.concurrency ?? 4) / 2))
+              // Statistics cooling belongs to this instrument's bucket;
+              // unrelated instruments retain their own published allowance.
+              request.bucket.rateLimitedUntil = Math.max(request.bucket.rateLimitedUntil, Date.now() + (serverDelay ?? RETRY_DELAYS[0]))
+              if (!instrumentRateLimit(lane.name)) lane.concurrency = Math.max(2, Math.floor((lane.concurrency ?? 4) / 2))
               throw new RetryAfterError(request.path, serverDelay, lane.name)
             }
             if (!response.ok) {
               const error = new Error(`OKX ${request.path} failed (${response.status}).`)
               if (serverDelay !== undefined) {
                 error.retryAfter = serverDelay
-                lane.rateLimitedUntil = Math.max(lane.rateLimitedUntil, Date.now() + serverDelay)
+                request.bucket.rateLimitedUntil = Math.max(request.bucket.rateLimitedUntil, Date.now() + serverDelay)
               }
               throw error
             }
             const payload = await response.json()
             if (signal.aborted) throw signal.reason ?? new Error('The request was aborted.')
+            if (String(payload.code) === '50011') {
+              request.bucket.rateLimitedUntil = Math.max(request.bucket.rateLimitedUntil, Date.now() + (serverDelay ?? RETRY_DELAYS[0]))
+              throw new RetryAfterError(request.path, serverDelay, lane.name)
+            }
             if (payload.code && payload.code !== '0') throw new Error(`OKX ${request.path}: ${payload.msg || payload.code}`)
-            const data = payload.data ?? []
-            if (Array.isArray(data)) attributes.rows = data.length
+            const data = payload.data
+            if (!Array.isArray(data)) throw new TypeError(`OKX ${request.path} response needs a data array.`)
+            attributes.rows = data.length
             finish('ok')
             return data
           } catch (error) { finish(signal.aborted && !(signal.reason instanceof RequestTimeoutError) ? 'cancelled' : 'error'); throw error }
@@ -910,7 +935,7 @@ export class MarketService {
         lane.latencyMS = lane.latencyMS === undefined ? performance.now() - startedAt : lane.latencyMS * 0.8 + (performance.now() - startedAt) * 0.2
         lane.completed = (lane.completed ?? 0) + 1
         if (lane.interval > 0) {
-          lane.concurrency = Math.max(2, Math.min(lane.name === 'books' ? 16 : 8, Math.ceil(lane.latencyMS / lane.interval) + 1))
+          if (!instrumentRateLimit(lane.name)) lane.concurrency = Math.max(2, Math.min(lane.name === 'books' ? 16 : 8, Math.ceil(lane.latencyMS / lane.interval) + 1))
           if (this.history?.sync.maxConcurrentPerSource.has(lane.name)) {
             this.history.sync.maxConcurrentPerSource.set(lane.name, lane.concurrency)
             this.history.sync.maxConcurrentTasks = Math.min(24, [...this.history.sync.maxConcurrentPerSource.values()].reduce((sum, count) => sum + count, 0))
@@ -932,18 +957,26 @@ export class MarketService {
       while (lane.queue.length || lane.active.size) {
         const limit = lane.concurrency ?? (name === 'books' ? 16 : 4)
         const maintenanceActive = [...lane.active.values()].filter(request => requestPriority(request.priority) < 3).length
-        const eligible = request => requestPriority(request.priority) >= 3 || maintenanceActive < Math.max(1, limit - 1)
-        const canStart = lane.active.size < limit && lane.queue.some(eligible)
+        const globalMaintenance = [...this.activeRequests].filter(request => requestPriority(request.priority) < 3).length
+        const capacity = request => requestPriority(request.priority) >= 3
+          || maintenanceActive < Math.max(1, limit - 1) && globalMaintenance < MAX_HTTP_REQUESTS - 2
+        const now = Date.now()
+        const eligible = request => capacity(request) && Math.max(request.bucket.nextAt, request.bucket.rateLimitedUntil) <= now
+        const canStart = lane.active.size < limit && this.activeRequests.size < MAX_HTTP_REQUESTS && lane.queue.some(capacity)
         if (!canStart) { await this.waitRequestLane(lane); continue }
-        const delay = Math.max(lane.nextAt, lane.rateLimitedUntil) - Date.now()
-        if (delay > 0) { await this.waitRequestLane(lane, delay); continue }
+        if (!lane.queue.some(eligible)) {
+          const delay = Math.min(...lane.queue.filter(capacity).map(request => Math.max(request.bucket.nextAt, request.bucket.rateLimitedUntil) - now))
+          await this.waitRequestLane(lane, Math.min(2_147_483_647, Math.max(1, delay))); continue
+        }
         // Choose at admission time so newly queued chart/qualification work
         // passes downloads that were waiting for the endpoint's rate budget.
         const request = this.nextQueuedRequest(lane, eligible)
-        lane.nextAt = Date.now() + lane.interval
+        request.bucket.nextAt = Date.now() + lane.interval
+        this.activeRequests.add(request)
         const active = this.performRequest(lane, request).finally(() => {
           lane.active.delete(active)
-          lane.wake?.()
+          this.activeRequests.delete(request)
+          this.wakeRequestQueues()
         })
         lane.active.set(active, request)
       }
@@ -960,7 +993,7 @@ export class MarketService {
     return Promise.all([...this.requestLanes.keys()].map(name => this.drainRequestLane(name)))
   }
 
-  get(path, parameters, requestSignal, priority = 'foreground') {
+  get(path, parameters, requestSignal, priority = 'foreground', { getPriority } = {}) {
     if (this.disposed || requestSignal?.aborted) throw new Error('Market service is closed.')
     const lane = requestLaneFor(path)
     // Independent endpoint budgets reserve capacity for chart and Verify
@@ -973,7 +1006,9 @@ export class MarketService {
     let resolveRequest, rejectRequest
     const result = new Promise((resolve, reject) => { resolveRequest = resolve; rejectRequest = reject })
     const queue = this.requestLane(lane)
-    const request = { path, parameters, requestSignal, priority, lane, controller, abort, enqueuedAt: Date.now(), resolve: resolveRequest, reject: rejectRequest, cleaned: false, onAbort: null }
+    const bucket = this.requestBucket(queue, parameters)
+    if (bucket !== queue) bucket.pending += 1
+    const request = { path, parameters, requestSignal, get priority() { return getPriority?.() ?? priority }, lane, bucket, controller, abort, enqueuedAt: Date.now(), resolve: resolveRequest, reject: rejectRequest, cleaned: false, onAbort: null }
     request.onAbort = () => this.rejectQueuedRequest(request)
     controller.signal.addEventListener('abort', request.onAbort, { once: true })
     if (controller.signal.aborted) request.onAbort()
@@ -1054,20 +1089,15 @@ export class MarketService {
     return { from: end - 99 * intervalMS, through: end, intervalMS }
   }
 
-  statisticsExpiry(timeframe, end) {
-    return statisticsExpiryAt(timeframe, end)
-  }
-
   async persistStatisticsSource(instrument, timeframe, end, source, values, signal, priority = 'statistics', preserveExistingSource = false, { range, projectList = true } = {}) {
     await this.ready
     if (this.disposed || signal?.aborted) return false
     const page = range ?? this.statisticsPageRange(timeframe, end)
     const changed = await this.store.appendStatistics({ instrument: instrument.instId, timeframe,
       source: source === STATISTICS_OI ? 'oi' : 'taker', from: page.from, through: page.through,
-      values: values.map(value => value.map(number)), expiresAt: this.statisticsExpiry(timeframe, end), preserveExistingSource }, priority)
+      values: values.map(value => value.map(number)), observedAt: Date.now(), preserveExistingSource }, priority)
     if (changed) {
       this.markChartDataChanged(instrument.instId)
-      this.track(this.preparedCharts.observeStatistics(instrument.instId, timeframe, page.from, page.through))
       if (projectList) this.scheduleListProjection(instrument.instId)
     }
     return changed > 0

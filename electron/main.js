@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { parseDesktopRequest } from './desktop-contract.js'
 import { createDesktopSecurity } from './desktop-security.js'
-import { testPresentation } from './test-presentation.js'
+import { assertBackgroundTestLaunch, testPresentation, testWindowOptions } from './test-presentation.js'
 import { startTestOwnerWatchdog } from './test-owner.js'
 import { initializeOperationRecording, closeOperationRecording, closeExternalOperationSource } from './services/operation-runtime.js'
 import { startGraphicsRecording } from './services/operation-graphics.js'
@@ -21,7 +21,8 @@ const rendererURL = process.env.ELECTRON_RENDERER_URL || undefined
 const testMode = process.env.PERPETUAL_SWAP_E2E === '1'
 const testLaunchParentPID = process.ppid
 const backgroundTests = testPresentation() === 'background'
-if (backgroundTests && process.platform === 'darwin') app.setActivationPolicy('accessory')
+if (backgroundTests) assertBackgroundTestLaunch()
+if (backgroundTests && process.platform === 'darwin') app.setActivationPolicy('prohibited')
 // Chromium initializes its profile during ready. Isolate both locations first.
 if (process.env.PERPETUAL_SWAP_USER_DATA) {
   const userData = process.env.PERPETUAL_SWAP_USER_DATA
@@ -172,10 +173,11 @@ async function handleRequest(event, payload, context) {
 async function createWindow() {
   if (shuttingDown || window && !window.isDestroyed()) return
   window = new BrowserWindow({
+    ...testWindowOptions(backgroundTests),
     width: 1600, height: 1000, minWidth: 400, minHeight: 300,
     title: 'Perpetual Swap Suite', backgroundColor: '#101114', show: !testMode && !backgroundTests,
-    focusable: !backgroundTests,
-    webPreferences: { preload: join(root, 'electron', 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
+    webPreferences: { ...testWindowOptions(backgroundTests).webPreferences,
+      preload: join(root, 'electron', 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   })
   window.webContents.on('will-navigate', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
   window.webContents.on('will-redirect', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
@@ -245,13 +247,12 @@ app.whenReady().then(() => {
       testOwnerExitTimer.unref()
     } })
   }
-  if (backgroundTests && process.platform === 'darwin') app.dock.hide()
   if (!shuttingDown) startupTask = startDesktop()
   return startupTask
 }).catch(error => { console.error('Desktop startup failed:', error); app.quit() })
 app.once('will-quit', () => { stopTestOwner(); clearTimeout(testOwnerExitTimer) })
 app.on('activate', () => {
-  if (app.isReady() && !shuttingDown && BrowserWindow.getAllWindows().length === 0) void startupTask.then(createWindow).catch(error => console.error('Could not open application window:', error))
+  if (!backgroundTests && app.isReady() && !shuttingDown && BrowserWindow.getAllWindows().length === 0) void startupTask.then(createWindow).catch(error => console.error('Could not open application window:', error))
 })
 app.on('before-quit', event => {
   if (shutdownComplete) return

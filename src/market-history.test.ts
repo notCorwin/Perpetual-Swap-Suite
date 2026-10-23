@@ -134,6 +134,27 @@ test('a long statistics request batches native pages and reuses numeric observat
   assert.equal(calls.length, 30)
 })
 
+test('a visible OI failure reports its first retry deadline without delaying or certifying Taker', async t => {
+  const { history, store, calls } = await fixture(t, { get: async (path, parameters, signal, priority) => {
+    if (path.includes('open-interest')) throw new Error('OI temporarily offline')
+    return source(path, parameters, signal, priority)
+  } })
+  Object.assign(history.sync, { maxAttempts: 5, retryBaseMS: 60_000, maxRetryDelayMS: 60_000 })
+  const taker = history.ensureStatistics(instId, '5m', base, base + 2 * step, 'interactive', undefined, 'taker')
+  await assert.rejects(history.ensureStatistics(instId, '5m', base, base + 2 * step, 'interactive', undefined, 'oi'), error => {
+    assert.equal((error as Error).message, 'OI temporarily offline')
+    assert.equal((error as Error & { retryAt: number }).retryAt, base + 2 * day + 60_000)
+    return true
+  })
+  await taker
+  assert.equal(calls.filter(call => call.path.includes('open-interest')).length, 1)
+  assert.equal((await store.statistics({ instrument: instId, timeframe: '5m', source: 'oi' })).length, 0, 'Request failures cannot persist absence proofs.')
+  const rows = await store.statistics({ instrument: instId, timeframe: '5m', source: 'taker' })
+  assert.equal(rows.length, 3)
+  assert.ok(rows.every(row => row.buy === 30 && row.sell === 20))
+  assert.ok(history.sync.listTasks().filter(task => task.source === 'oi').every(task => task.status === 'cancelled'))
+})
+
 test('direct empty source observations own bounded retry leases without inventing availability', async t => {
   let now = base + day
   const { history, store, calls } = await fixture(t, { now: () => now, get: async () => [] })

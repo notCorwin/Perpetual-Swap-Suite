@@ -67,3 +67,36 @@ test('compression retains a bounded LRU and an evicted frame starts with a compl
   assert.equal(isLive(encoder.encode({ ...b, revision: b.revision + 2 })), false, 'The oldest unused frame is evicted.')
   assert.equal(encoder.size, 2)
 })
+
+
+test('source error and retry metadata changes require full frames even when bars and state are unchanged', async t => {
+  const pipeline = fixture(t), encoder = new ChartNotificationEncoder(), frames: PreparedChartResponse[] = []
+  pipeline.subscribe(frame => frames.push(frame))
+  await pipeline.setLive(instId, timeframe, source())
+  const end = source().timestamp - intervalMS
+  const frame = { ...frames[0], endHour: end, latestEnd: end, oiState: 'error' as const,
+    oiStatus: { state: 'error' as const, from: end - 95 * intervalMS, through: end, error: 'OI unavailable', retryAt: 1000 } }
+  assert.equal(isLive(encoder.encode(frame)), false)
+  assert.equal(isLive(encoder.encode({ ...frame, revision: frame.revision + 1 })), true)
+  const delayed = { ...frame, revision: frame.revision + 2, oiStatus: { ...frame.oiStatus, error: 'OI rate limit', retryAt: 2000 } }
+  const message = encoder.encode(delayed)
+  assert.equal(isLive(message), false)
+  assert.equal((message as PreparedChartResponse).oiStatus?.retryAt, 2000)
+  assert.equal((message as PreparedChartResponse).oiStatus?.error, 'OI rate limit')
+  assert.equal(isLive(encoder.encode({ ...delayed, revision: frame.revision + 3 })), true)
+})
+
+
+test('price repair retry changes remain full notifications and cannot be compressed away with unchanged cached bars', async t => {
+  const pipeline = fixture(t), encoder = new ChartNotificationEncoder(), frames: PreparedChartResponse[] = []
+  pipeline.subscribe(frame => frames.push(frame))
+  await pipeline.setLive(instId, timeframe, source())
+  const end = source().timestamp - intervalMS
+  const frame = { ...frames[0], endHour: end, latestEnd: end, priceState: 'error' as const, error: 'Price source offline',
+    priceStatus: { state: 'error' as const, from: end - 95 * intervalMS, through: end, error: 'Price source offline', retryAt: 1000 } }
+  assert.equal(isLive(encoder.encode(frame)), false)
+  assert.equal(isLive(encoder.encode({ ...frame, revision: frame.revision + 1 })), true)
+  const changed = encoder.encode({ ...frame, revision: frame.revision + 2, priceStatus: { ...frame.priceStatus, retryAt: 2000 } })
+  assert.equal(isLive(changed), false)
+  assert.equal((changed as PreparedChartResponse).priceStatus?.retryAt, 2000)
+})

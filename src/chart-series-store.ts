@@ -1,5 +1,5 @@
 import { hookOperationMethods } from '../electron/services/operations.js'
-import type { Bar, PreparedChartBar, PreparedChartLiveUpdate, PreparedChartMeta, PreparedChartResponse, ReadyChartWindow } from './chart-data.ts'
+import type { Bar, ChartSourceStatus, PreparedChartBar, PreparedChartLiveUpdate, PreparedChartMeta, PreparedChartResponse, ReadyChartWindow } from './chart-data.ts'
 import { RADAR_TIMEFRAMES, timeframeMilliseconds, type RadarTimeframe } from './timeframe.ts'
 
 const WINDOW_BARS = 96
@@ -59,22 +59,56 @@ function preparedBar(bar: PreparedChartBar, intervalMS: number, previous?: Prepa
   return Object.freeze(next)
 }
 
+function sourceMeta(previous: PreparedChartMeta | undefined, response: PreparedChartResponse) {
+  const statuses = [...previous?.sourceStatuses ?? []]
+  let changed = false
+  for (const source of ['price', 'oi', 'taker'] as const) {
+    const status = response[`${source}Status`]
+    if (!status) continue
+    changed = true
+    const prior = statuses.findIndex(value => value.source === source && value.status.from === status.from && value.status.through === status.through)
+    if (prior >= 0) statuses.splice(prior, 1)
+    statuses.push({ source, status: Object.freeze({ ...status }) })
+  }
+  return { priceStatus: response.priceStatus, oiStatus: response.oiStatus, takerStatus: response.takerStatus, sourceStatuses: changed ? Object.freeze(statuses.slice(-16)) : previous?.sourceStatuses }
+}
+
+function matchingStatus(meta: PreparedChartMeta, from: number, through: number, source: 'price' | 'oi' | 'taker') {
+  return [...meta.sourceStatuses ?? []].reverse().find(value => value.source === source && value.status.through !== null && value.status.from <= through && value.status.through >= from)?.status
+}
+
+function windowStatistics(meta: PreparedChartMeta, bars: PreparedChartBar[], from: number, through: number, source: 'oi' | 'taker') {
+  const bit = source === 'oi' ? 1 : 2
+  const complete = bars.length === (through - from) / meta.intervalMS + 1 && bars.every((bar, index) => bar.hour === from + index * meta.intervalMS)
+  const state = complete && bars.every(bar => observed(bar, bit)) ? bars.every(bar => source === 'oi' ? finite(bar.oi) : finite(bar.buy) && finite(bar.sell)) ? 'ready' : 'unavailable' : 'loading'
+  const matching = matchingStatus(meta, from, through, source)
+  const status: ChartSourceStatus | undefined = state === 'loading' && matching
+    ? { ...matching, state: matching.state === 'error' || matching.reason === 'unsupported' ? matching.state : 'loading', from, through }
+    : matching ? { state, from, through, ...(state === 'unavailable' ? { reason: 'not-published' as const } : {}) } : undefined
+  return { state: status?.state ?? state, status }
+}
+
 function readyWindow(meta: PreparedChartMeta, bars: PreparedChartBar[], endHour: number, liveBar?: Bar, previous?: ReadyChartWindow): ReadyChartWindow {
   const first = Math.max(endHour - (WINDOW_BARS - 1) * meta.intervalMS, meta.historyExhausted ? meta.oldestHour ?? -Infinity : -Infinity)
   const complete = bars.length === (endHour - first) / meta.intervalMS + 1
     && bars.every((bar, index) => bar.hour === first + index * meta.intervalMS && bar.priceComplete !== false)
   const latest = endHour === meta.latestEnd
   const detached = latest && liveBar && liveBar.hour !== endHour + meta.intervalMS
-  const priceState = !bars.length && !liveBar ? 'loading' : !complete ? 'partial'
+  const availability = !bars.length && !liveBar ? 'loading' : !complete ? 'partial'
     : latest && (detached || meta.priceState === 'stale') ? 'stale'
       : latest ? meta.priceState ?? 'ready' : 'ready'
+  const price = matchingStatus(meta, first, endHour, 'price')
+  const priceStatus = price ? availability !== 'ready' && price.state === 'error' ? { ...price, from: first, through: endHour } : { state: availability, from: first, through: endHour } : undefined
+  const priceState = priceStatus?.state === 'error' ? 'error' : availability
+  const oi = windowStatistics(meta, bars, first, endHour, 'oi'), taker = windowStatistics(meta, bars, first, endHour, 'taker')
   const sameBars = previous && previous.generation === meta.generation && bars.length === previous.bars.length && bars.every((bar, index) => previous.bars[index] === bar)
   if (sameBars && previous.liveBar === liveBar && previous.priceState === priceState && previous.priceAsOf === meta.priceAsOf
+    && JSON.stringify(previous.priceStatus) === JSON.stringify(priceStatus)
+    && previous.oiState === oi.state && previous.takerState === taker.state && JSON.stringify(previous.oiStatus) === JSON.stringify(oi.status) && JSON.stringify(previous.takerStatus) === JSON.stringify(taker.status)
     && previous.realtimeState === (meta.realtimeState ?? 'stale') && previous.priceObservedAt === meta.priceObservedAt && JSON.stringify(previous.sourceVersions) === JSON.stringify(meta.sourceVersions)) return previous
   return Object.freeze({
     key: meta.key, instId: meta.instId, timeframe: meta.timeframe, intervalMS: meta.intervalMS, generation: meta.generation, bars: sameBars ? previous.bars : Object.freeze(bars), endHour,
-    oiState: bars.length && bars.every(bar => bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)) ? bars.every(bar => finite(bar.oi)) ? 'ready' : 'unavailable' : 'loading',
-    takerState: bars.length && bars.every(bar => bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2)) ? bars.every(bar => finite(bar.buy) && finite(bar.sell)) ? 'ready' : 'unavailable' : 'loading',
+    priceStatus, oiState: oi.state, takerState: taker.state, oiStatus: oi.status, takerStatus: taker.status,
     indicatorState: bars.length && bars.every(bar => bar.indicatorsObserved) ? bars.every(bar => indicatorFields.every(field => finite(bar[field]))) ? 'ready' : 'unavailable' : 'loading',
     ...(liveBar ? { liveBar } : {}), priceState, priceAsOf: meta.priceAsOf, priceObservedAt: meta.priceObservedAt, realtimeState: meta.realtimeState ?? 'stale', sourceVersions: meta.sourceVersions,
   })
@@ -236,6 +270,7 @@ export class PreparedChartStore {
     const meta: PreparedChartMeta = Object.freeze({
       key, instId, timeframe, intervalMS, generation, revision, latestEnd: endHour,
       priceState: response.priceState, priceAsOf: response.priceAsOf, priceObservedAt: response.priceObservedAt, realtimeState: response.realtimeState, sourceVersions: response.sourceVersions,
+      ...sourceMeta(previous?.meta, response),
       oldestHour: response.oldestHour === null ? previous?.meta.oldestHour ?? null : Math.min(previous?.meta.oldestHour ?? Infinity, response.oldestHour),
       historyExhausted: response.historyExhausted || (previous?.meta.historyExhausted ?? false), error: response.error,
     })
@@ -301,6 +336,7 @@ export class PreparedChartStore {
     const latestEnd = finite(response.latestEnd) ? Math.max(current.meta.latestEnd ?? -Infinity, response.latestEnd) : current.meta.latestEnd
     const oldestHour = finite(response.oldestHour) ? Math.min(current.meta.oldestHour ?? Infinity, response.oldestHour) : current.meta.oldestHour
     const nextMeta: PreparedChartMeta = {
+      ...(newestMeta ? sourceMeta(current.meta, response) : { priceStatus: current.meta.priceStatus, oiStatus: current.meta.oiStatus, takerStatus: current.meta.takerStatus, sourceStatuses: current.meta.sourceStatuses }),
       priceState: newestMeta && response.endHour === response.latestEnd ? response.priceState : current.meta.priceState,
       priceAsOf: newestMeta ? response.priceAsOf ?? current.meta.priceAsOf : current.meta.priceAsOf,
       priceObservedAt: newestMeta ? response.priceObservedAt ?? current.meta.priceObservedAt : current.meta.priceObservedAt,

@@ -18,9 +18,9 @@ import { SnapshotOrder } from '@/snapshot-order'
 const emptyAudit: DataAudit = { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '', revision: 0, serviceSession: '' }
 const errorMessage = (cause: unknown) => cause instanceof Error ? cause.message : 'The desktop service could not complete this request.'
 const emptyDownload: HistoryDownload = {
-  revision: 0, serviceSession: '', phase: 'idle', startedAt: null, updatedAt: null, finishedAt: null,
+  schemaVersion: 2, revision: 0, serviceSession: '', phase: 'idle', startedAt: null, updatedAt: null, finishedAt: null,
   contracts: { completed: 0, total: 0 }, streams: { completed: 0, total: 0 },
-  progress: { completed: 0, total: 0, available: 0, unavailable: 0, reused: 0, pending: 0 },
+  progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 },
   active: [], failures: [], error: '',
 }
 const count = (value: number) => value.toLocaleString('en-US')
@@ -68,27 +68,32 @@ function HistoryDownloadSettings({ open }: { open: boolean }) {
     return () => { window.removeEventListener('radar-history-download-changed', published); lifecycle.current++ }
   }, [open, accept, request])
   const { progress, contracts, streams } = download
-  const percent = progress.total ? Math.min(100, progress.completed / progress.total * 100) : 0
+  const percent = progress.total ? Math.min(100, progress.checked / progress.total * 100) : 0
   const percentLabel = (Math.floor(percent * 10) / 10).toFixed(1)
+  const numericPercent = progress.total ? Math.min(100, progress.available / progress.total * 100) : 0
+  const numericLabel = (Math.floor(numericPercent * 10) / 10).toFixed(1)
   const phase = download.phase === 'completed'
-    ? progress.unavailable > 0 ? 'Completed with unavailable data' : 'Download complete'
+    ? progress.empty > 0 ? 'Completed with temporarily missing data' : progress.unavailable > 0 ? 'Completed with verified unavailable data' : 'Download complete'
     : { idle: 'Ready to download', running: 'Downloading history', cancelled: 'Download cancelled', failed: 'Download failed' }[download.phase]
   return <FieldSet>
     <FieldLegend>Qualified contract history</FieldLegend>
     <FieldDescription>Download all available history for contracts meeting the saved filters when the download starts. Save settings first to apply filter changes. The contract list and end time stay fixed for this download.</FieldDescription>
     <FieldDescription>Includes 5m, 15m and 1H candles, open interest and taker buy/sell data, from listing through the latest completed interval. The audit lookback does not limit this download. Sources may not provide the full listing history. Existing valid data is reused.</FieldDescription>
     <p role="status" className="text-sm">{!ready ? busy === 'status' ? 'Reading download status…' : 'Download status unavailable' : `${phase} · ${percentLabel}%`}</p>
-    <Progress aria-label="History download progress" aria-valuetext={`${count(progress.completed)} of ${count(progress.total)} source timestamps checked; ${count(progress.unavailable)} unavailable`} value={download.phase === 'running' && progress.total === 0 ? null : percent} />
+    <Progress aria-label="History download progress" aria-valuetext={`${count(progress.checked)} of ${count(progress.total)} source timestamps checked; ${count(progress.available)} available; ${count(progress.empty)} temporarily missing; ${count(progress.unavailable)} verified unavailable; ${count(progress.failed)} failed; ${count(progress.pending)} pending`} value={download.phase === 'running' && progress.total === 0 ? null : percent} />
     <dl className="grid grid-cols-[1fr_auto] gap-x-4 gap-y-1 text-sm tabular-nums" aria-label="History download details">
-      <dt>Checked source timestamps</dt><dd>{count(progress.completed)} / {count(progress.total)}</dd>
+      <dt>Checked source timestamps</dt><dd>{count(progress.checked)} / {count(progress.total)}</dd>
+      <dt>Numeric data completeness</dt><dd>{numericLabel}%</dd>
       <dt>Available</dt><dd>{count(progress.available)}</dd>
-      <dt>Unavailable from source</dt><dd>{count(progress.unavailable)}</dd>
+      <dt>Temporarily missing</dt><dd>{count(progress.empty)}</dd>
+      <dt>Verified unavailable</dt><dd>{count(progress.unavailable)}</dd>
+      <dt>Failed source timestamps</dt><dd>{count(progress.failed)}</dd>
       <dt>Reused from local data</dt><dd>{count(progress.reused)}</dd>
       <dt>Pending source timestamps</dt><dd>{count(progress.pending)}</dd>
       <dt>Contracts finished</dt><dd>{count(contracts.completed)} / {count(contracts.total)}</dd>
       <dt>Data streams finished</dt><dd>{count(streams.completed)} / {count(streams.total)}</dd>
     </dl>
-    <FieldDescription>Progress counts verified source timestamps, including confirmed unavailable intervals. Unavailable data is not stored as successful market data. The download continues when you close settings.</FieldDescription>
+    <FieldDescription>Checked coverage includes temporary gaps and verified unavailability. Numeric completeness counts available records only; failed requests do not establish source absence. The download continues when you close settings.</FieldDescription>
     <div className="flex flex-wrap gap-2">
       <Button type="button" variant="outline" onClick={() => void request('start')} disabled={!ready || Boolean(busy) || download.phase === 'running'}>{busy === 'start' && <Spinner data-icon="inline-start" />}Download all qualified history</Button>
       <Button type="button" variant="outline" onClick={() => void request('cancel')} disabled={!ready || Boolean(busy) || download.phase !== 'running'}>{busy === 'cancel' && <Spinner data-icon="inline-start" />}Cancel download</Button>

@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PreparedChartPipeline } from '../electron/services/prepared-chart-service.js'
+import { ChartController } from './chart-controller.ts'
 import { ChartNotificationEncoder } from '../electron/services/chart-notifications.js'
 import { MarketStore } from '../electron/services/market-store.js'
 import { buildIndicatorSeries } from '../electron/services/indicators.js'
@@ -70,7 +71,7 @@ test('fresh OHLC and forming price publish while both statistic requests are hel
     const frame = await pipeline.prepare(instId, '15m')
     assert.equal(frame.endHour, end()); assert.equal(frame.liveBar.close, 142)
     assert.equal(frame.realtimeState, 'live'); assert.equal(frame.oiState, 'loading'); assert.equal(frame.takerState, 'loading')
-    assert.equal(statistics, 1)
+    assert.equal(statistics, 2)
     await finishSeed(pipeline)
     assert.equal(pipeline.cached(`${instId}:15m`).liveBar.close, 142)
     assert.equal(pipeline.cached(`${instId}:15m`).indicatorState, 'ready')
@@ -137,7 +138,9 @@ test('interior holes and missing quote volume stay partial until persisted sourc
     const first = pipeline.refreshObservations(state)
     gate.resolve(); await first
     assert.equal(pipeline.cached(state.key).bars.length, 96)
-    assert.equal(pipeline.cached(state.key).priceState, 'partial', 'Row count alone cannot certify complete candle inputs.')
+    assert.equal(pipeline.cached(state.key).priceState, 'error', 'A completed repair that still lacks candle inputs publishes its failure.')
+    assert.match(pipeline.cached(state.key).error, /Price history is incomplete/)
+    assert.ok(pipeline.cached(state.key).priceStatus.retryAt > Date.now())
     assert.equal(pipeline.cached(state.key).bars.find((bar: any) => bar.hour === incomplete.timestamp).priceComplete, false)
     assert.ok(pipeline.sourceAttempts.get(key).retryAt > Date.now())
     pipeline.sourceAttempts.delete(key)
@@ -382,7 +385,7 @@ test('statistics changes refresh only their observations without recalculating p
     store.rows[store.rows.length - 1] = { ...last, oi: null, statisticsVersion: 11, statisticsOIExpiresAt: Date.now() - 1 }
     await pipeline.observeStatistics(instId, '15m', last.timestamp, last.timestamp)
     const next = pipeline.cached(`${instId}:15m`)
-    assert.equal(next.endHour, end()); assert.equal(next.oiState, 'loading'); assert.equal(next.indicatorState, 'ready')
+    assert.equal(next.endHour, end()); assert.equal(next.oiState, 'unavailable'); assert.equal(next.oiStatus.reason, 'unsupported'); assert.equal(next.indicatorState, 'ready')
     assert.equal(next.bars.at(-1).ema, frame.bars.at(-1).ema); assert.equal(pipeline.nextCalculation, count)
     assert.equal(next.sourceVersions.price, frame.sourceVersions.price)
     assert.ok(next.sourceVersions.oi > frame.sourceVersions.oi)
@@ -422,7 +425,7 @@ test('bounded local historical prices remain navigable across unknown and expire
     const requested = rows[2000].timestamp, frame = await pipeline.localHistory(instId, '15m', requested)
     assert.ok(frame.bars.length <= 1536); assert.equal(frame.endHour, requested)
     assert.ok(frame.bars.some((value: any) => value.hour === requested))
-    assert.equal(frame.oiState, 'loading'); assert.ok(store.queries.every(query => query.limit))
+    assert.equal(frame.oiState, 'unavailable'); assert.equal(frame.oiStatus.reason, 'unsupported'); assert.ok(store.queries.every(query => query.limit))
   } finally { await pipeline.dispose() }
 })
 
@@ -452,11 +455,11 @@ test('failed statistic sources use independent exponential deadlines while price
   try {
     const frame = await pipeline.local(instId, '15m')
     await flush()
-    assert.equal(frame.priceState, 'ready'); assert.equal(attempts, 1)
-    context.mock.timers.tick(4_999); await flush(); assert.equal(attempts, 1)
-    context.mock.timers.tick(1); await flush(); assert.equal(attempts, 2)
-    context.mock.timers.tick(9_999); await flush(); assert.equal(attempts, 2)
-    context.mock.timers.tick(1); await flush(); assert.equal(attempts, 3)
+    assert.equal(frame.priceState, 'ready'); assert.equal(attempts, 2)
+    context.mock.timers.tick(4_999); await flush(); assert.equal(attempts, 2)
+    context.mock.timers.tick(1); await flush(); assert.equal(attempts, 4)
+    context.mock.timers.tick(9_999); await flush(); assert.equal(attempts, 4)
+    context.mock.timers.tick(1); await flush(); assert.equal(attempts, 6)
     assert.equal(pipeline.cached(`${instId}:15m`).endHour, end())
   } finally { await pipeline.dispose() }
 })
@@ -476,10 +479,11 @@ test('successful unavailable observations renew only at their actual lease deadl
   try {
     await pipeline.local(instId, '15m'); await finishSeed(pipeline)
     context.mock.timers.tick(9_999); await flush(); assert.equal(attempts, 0)
-    context.mock.timers.tick(1); await flush(); assert.equal(attempts, 1)
+    context.mock.timers.tick(1); await flush(); assert.equal(attempts, 2)
     assert.equal(pipeline.cached(`${instId}:15m`).endHour, end())
     assert.equal(pipeline.cached(`${instId}:15m`).oiState, 'unavailable')
-    context.mock.timers.tick(30_000); await flush(); assert.equal(attempts, 1)
+    assert.equal(pipeline.cached(`${instId}:15m`).oiStatus.reason, 'not-published')
+    context.mock.timers.tick(30_000); await flush(); assert.equal(attempts, 2)
   } finally { await pipeline.dispose() }
 })
 
@@ -1277,5 +1281,163 @@ test('a disjoint prefetch reserve retains the selected viewport and cannot trigg
     assert.equal(sourceCalls, 0, 'Resident reserve eviction must not manufacture a source outage for the selected viewport.')
     assert.equal(store.queries.length, reads)
     assert.ok(state.rows.size <= 1536 + 96, 'One bounded selected viewport accompanies the bounded acquisition reserve.')
+  } finally { await pipeline.dispose() }
+})
+
+
+test('an OI failure publishes its error and retry while Taker completes independently', async context => {
+  const now = Math.floor(Date.now() / interval) * interval + 1000
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
+  const rows = source(400).map(row => ({ ...row, oi: null, buy: null, sell: null, statisticsVersion: null }))
+  const calls: string[] = [], priorities: string[] = [], retryAt = now + 8_000
+  let oiCalls = 0
+  const { pipeline, store } = fixture(rows as any, {
+    async ensureStatistics(_id: string, _frame: string, from: number, through: number, priority: string, _signal: AbortSignal, source: string) {
+      calls.push(source); priorities.push(priority)
+      if (source === 'oi' && ++oiCalls === 1) throw Object.assign(new Error('OI endpoint temporarily unavailable'), { retryAt })
+      store.rows = store.rows.map(row => row.timestamp < from || row.timestamp > through ? row
+        : source === 'oi' ? { ...row, oi: 5000, statisticsVersion: row.buy === null ? 9 : 1 }
+          : { ...row, buy: 70, sell: 30, statisticsVersion: row.oi === null ? 10 : 1 })
+    },
+  })
+  const reads: string[] = [], read = store.candles.bind(store)
+  store.candles = async (query: any, priority?: string) => { if (query.order === 'asc' && query.limit === 1536) reads.push(priority!); return read(query) }
+  const flush = async () => { for (let count = 0; count < 8; count++) await new Promise<void>(resolve => setImmediate(resolve)) }
+  try {
+    await pipeline.local(instId, '15m'); await flush()
+    const failed = pipeline.cached(`${instId}:15m`)
+    assert.equal(failed.priceState, 'ready'); assert.equal(failed.takerState, 'ready')
+    assert.equal(failed.oiState, 'error'); assert.equal(failed.oiStatus.error, 'OI endpoint temporarily unavailable')
+    assert.equal(failed.oiStatus.retryAt, retryAt)
+    assert.ok(failed.bars.every((bar: any) => bar.buy === 70 && bar.sell === 30 && bar.oi === null))
+    assert.deepEqual(calls.toSorted(), ['oi', 'taker']); assert.deepEqual(priorities, ['interactive', 'interactive'])
+    assert.deepEqual(reads, ['interactive'], 'Statistics SQLite projections share the visible acquisition priority.')
+    context.mock.timers.tick(7_999); await flush(); assert.equal(oiCalls, 1)
+    context.mock.timers.tick(1); await flush()
+    assert.equal(oiCalls, 2); assert.equal(calls.filter(source => source === 'taker').length, 1)
+    const repaired = pipeline.cached(`${instId}:15m`)
+    assert.equal(repaired.oiState, 'ready'); assert.equal(repaired.oiStatus.error, undefined)
+    assert.equal(repaired.takerState, 'ready')
+    assert.equal(pipeline.sourceAttempts.size, 0)
+  } finally { await pipeline.dispose() }
+})
+
+test('visible prices and statistic jobs outrank reserve acquisition and shared reserve jobs promote in place', async () => {
+  const rows = source(2200).map(row => ({ ...row, oi: null, buy: null, sell: null, statisticsVersion: null }))
+  const calls: Array<{ source: string; priority: string; from: number; through: number; signal: AbortSignal }> = [], promotions: any[] = []
+  const acquire = async (_id: string, _frame: string, from: number, through: number, priority: string, signal: AbortSignal, source = 'candles') => {
+    calls.push({ source, priority, from, through, signal })
+    await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+  }
+  const { pipeline } = fixture(rows as any, { ensureStatistics: acquire, ensurePrices: acquire,
+    promoteSource(...args: unknown[]) { promotions.push(args) },
+  })
+  const flush = () => new Promise<void>(resolve => setImmediate(resolve))
+  try {
+    await pipeline.local(instId, '15m'); await flush()
+    assert.deepEqual(calls.map(call => [call.source, call.priority]), [['oi', 'interactive'], ['taker', 'interactive']])
+    const state = pipeline.state(instId, '15m'), reserveEnd = rows[1000].timestamp
+    const reserve = { from: reserveEnd - 299 * interval, through: reserveEnd }
+    pipeline.refreshObservations(state, reserveEnd, 300, 300, pipeline.focus, reserve)?.catch(() => {})
+    await flush()
+    const reserved = calls.filter(call => call.through === reserveEnd)
+    assert.deepEqual(reserved.map(call => [call.source, call.priority]), [['oi', 'prefetch'], ['taker', 'prefetch'], ['candles', 'prefetch']])
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: reserveEnd })
+    pipeline.refreshObservations(state, reserveEnd, 96, 96, pipeline.focus, reserve)?.catch(() => {})
+    await flush()
+    assert.equal(calls.filter(call => call.through === reserveEnd).length, 3, 'Promotion keeps each existing acquisition.')
+    assert.ok(reserved.every(call => !call.signal.aborted))
+    assert.deepEqual(promotions.map(args => [args[2], args[5]]).toSorted(), [['candles', 'interactive'], ['oi', 'interactive'], ['taker', 'interactive']])
+  } finally { pipeline.setFocus(null); await pipeline.dispose() }
+})
+
+test('cached successful-empty and numeric statistics acquire no new source data across viewport revisits', async () => {
+  const rows: any[] = source(1800), expiresAt = Date.now() + 60_000
+  rows[1000] = { ...rows[1000], oi: null, statisticsVersion: 11, statisticsOIExpiresAt: expiresAt }
+  let requests = 0
+  const { pipeline } = fixture(rows, {
+    async ensurePrices() { requests += 1; throw new Error('Cached prices must not acquire HTTP') },
+    async ensureStatistics() { requests += 1; throw new Error('Cached statistics must not acquire HTTP') },
+  })
+  try {
+    await pipeline.local(instId, '15m')
+    await pipeline.localHistory(instId, '15m', rows[1000].timestamp)
+    await pipeline.local(instId, '15m')
+    const old = await pipeline.localHistory(instId, '15m', rows[1000].timestamp)
+    assert.equal(old.oiState, 'unavailable'); assert.equal(old.oiStatus.reason, 'not-published')
+    assert.equal(old.takerState, 'ready'); assert.equal(requests, 0)
+  } finally { await pipeline.dispose() }
+})
+
+
+test('a historical source failure republishes status while reusing its prepared price and indicator projection', async () => {
+  const rows = source(500).map(row => ({ ...row, oi: null, statisticsVersion: 10 })), gate = deferred()
+  const { pipeline } = fixture(rows as any, { async ensureStatistics() { await gate.promise; throw new Error('OI offline') } })
+  try {
+    const target = rows[350].timestamp
+    await pipeline.localHistory(instId, '15m', target); await finishSeed(pipeline)
+    const state = pipeline.state(instId, '15m'), before = pipeline.historyFrame(state, target), calculations = pipeline.nextCalculation
+    gate.resolve()
+    for (let count = 0; count < 8; count++) await new Promise<void>(resolve => setImmediate(resolve))
+    const failed = pipeline.historyFrame(state, target)
+    assert.equal(failed.oiState, 'error'); assert.equal(failed.takerState, 'ready')
+    assert.equal(failed.bars, before.bars, 'A changed error or retry deadline does not rebuild the prepared reserve.')
+    assert.equal(pipeline.nextCalculation, calculations)
+  } finally { gate.resolve(); await pipeline.dispose() }
+})
+
+
+test('a failed cached price repair publishes its retry deadline through the encoder, store and controller, then recovers', async context => {
+  const now = Math.floor(Date.now() / interval) * interval + 1000
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
+  const canonical = source(400), absent = canonical[380], retryAt = now + 7000
+  let calls = 0
+  const { pipeline, store } = fixture(canonical.filter(row => row !== absent), {
+    async ensurePrices() {
+      calls += 1
+      if (calls === 1) throw Object.assign(new Error('Price endpoint offline'), { retryAt })
+      store.change(absent)
+    },
+  })
+  const controller = new ChartController({
+    focus: (target, id) => pipeline.setFocus(target ? { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } : null, id),
+    local: (id, timeframe, focusId) => pipeline.local(id, timeframe, { focusId }),
+    prepare: (target, focusId) => pipeline.prepare(target.instId, target.timeframe, target.end ?? undefined, 96, { focusId }),
+    universe: (ids, timeframe, focusId) => Promise.resolve(pipeline.setUniverse(ids, timeframe, focusId)),
+  })
+  const encoder = new ChartNotificationEncoder()
+  const unsubscribe = pipeline.subscribe((frame: any) => controller.ingestPrepared(encoder.encode(frame)))
+  const flush = async () => { for (let count = 0; count < 10; count++) await new Promise<void>(resolve => setImmediate(resolve)) }
+  await controller.setUniverse([instId], '15m', instId)
+  const close = controller.open(instId, '15m')
+  try {
+    await flush()
+    const failed = controller.getSnapshot(), frame = pipeline.cached(`${instId}:15m`)
+    assert.equal(calls, 1); assert.equal(failed.pending, false)
+    assert.equal(frame.error, 'Price endpoint offline'); assert.equal(frame.priceStatus.state, 'error'); assert.equal(frame.priceStatus.retryAt, retryAt)
+    assert.equal(failed.presented?.bars.length, 95); assert.equal(failed.presented?.priceState, 'error')
+    assert.equal(failed.presented?.priceStatus?.retryAt, retryAt)
+    assert.match(failed.error, /Price endpoint offline/); assert.match(failed.error, /retry at/)
+    const cached = await pipeline.prepare(instId, '15m', undefined, 96, { focusId: pipeline.focus.id })
+    assert.equal(cached.bars, frame.bars); assert.equal(cached.error, 'Price endpoint offline'); assert.equal(cached.priceStatus.retryAt, retryAt)
+    context.mock.timers.tick(6999); await flush(); assert.equal(calls, 1)
+    context.mock.timers.tick(1); await flush()
+    const recovered = controller.getSnapshot()
+    assert.equal(calls, 2); assert.equal(recovered.presented?.bars.length, 96); assert.equal(recovered.presented?.priceState, 'ready')
+    assert.equal(recovered.error, ''); assert.equal(recovered.presented?.priceStatus?.error, undefined)
+    assert.equal(recovered.presented?.priceStatus?.retryAt, undefined)
+  } finally { close(); unsubscribe(); await pipeline.dispose() }
+})
+
+test('forming-only cached charts expose failed price acquisition without discarding their live quote', async () => {
+  const { pipeline } = fixture([], { async ensurePrices() { throw new Error('Price history offline') } })
+  try {
+    await pipeline.setLive(instId, '15m', { ...candle(end() + interval), confirmed: false })
+    await pipeline.prepare(instId, '15m')
+    for (let count = 0; count < 8; count++) await new Promise<void>(resolve => setImmediate(resolve))
+    const frame = pipeline.cached(`${instId}:15m`)
+    assert.equal(frame.bars.length, 0); assert.equal(frame.liveBar.close, 101)
+    assert.equal(frame.priceState, 'error'); assert.equal(frame.error, 'Price history offline')
+    assert.ok(frame.priceStatus.retryAt > Date.now())
   } finally { await pipeline.dispose() }
 })

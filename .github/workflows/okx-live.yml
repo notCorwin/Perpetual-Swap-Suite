@@ -90,7 +90,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          npm run sandbox -- command --allow-network --scenario okx-live-chart --output artifacts/sandbox --require-category network --require-category database --require-category cpu --require-category io --require-category ipc --require-role electron-main --require-role renderer --require-role market-backend --require-role market-reader --require-role market-writer --require-role prepared-chart -- node scripts/okx-live-chart.mjs 2>&1 | tee artifacts/okx-chart.log
+          npm run sandbox -- command --desktop --allow-network --scenario okx-live-chart --output artifacts/sandbox --require-category network --require-category database --require-category cpu --require-category io --require-category ipc --require-role electron-main --require-role renderer --require-role market-backend --require-role market-reader --require-role market-writer --require-role prepared-chart -- node scripts/okx-live-chart.mjs 2>&1 | tee artifacts/okx-chart.log
           chart_status="${PIPESTATUS[0]}"
           set -e
           echo "exit-code=$chart_status" >> "$GITHUB_OUTPUT"

@@ -8,7 +8,8 @@ export type PreparedLatestSourceResult = PreparedPriceSourceResult
 /** All source methods resolve after their confirmed records have been durably committed. */
 export type PreparedChartHistory = {
   ensurePrices(instId: string, timeframe: HistoryTimeframe, from: number, through: number, priority: HistoryPriority, signal?: AbortSignal): Promise<PreparedPriceSourceResult | void>
-  ensureStatistics(instId: string, timeframe: HistoryTimeframe, from: number, through: number, priority: HistoryPriority, signal?: AbortSignal): Promise<{ rows?: CandleRecord[] } | void>
+  ensureStatistics(instId: string, timeframe: HistoryTimeframe, from: number, through: number, priority: HistoryPriority, signal?: AbortSignal, source?: 'oi' | 'taker'): Promise<{ rows?: CandleRecord[] } | void>
+  promoteSource?(instId: string, timeframe: HistoryTimeframe, source: 'candles' | 'oi' | 'taker', from: number, through: number, priority: HistoryPriority): Promise<unknown> | void
   /** Owns guarded publication of its forming source observation. */
   latest(instId: string, timeframe: HistoryTimeframe, priority: HistoryPriority, signal?: AbortSignal): Promise<PreparedLatestSourceResult | void>
 }
@@ -43,7 +44,7 @@ export class PreparedChartPipeline {
   setLive(instId: string, timeframe: HistoryTimeframe, candle: CandleRecord | null, context?: { receivedAt?: number }): Promise<PreparedChartResponse | null>
   /** Call after a durable range replacement to reject all prior calculations and snapshots. */
   invalidate(instId: string, timeframe: HistoryTimeframe): void
-  observeStatistics(instId: string, timeframe: HistoryTimeframe, from: number, through: number): Promise<void>
+  observeStatistics(instId: string, timeframe: HistoryTimeframe, from: number, through: number, priority?: HistoryPriority, inputRows?: CandleRecord[], source?: 'oi' | 'taker'): Promise<void>
   /** First pool worker, exposed for worker isolation diagnostics. */
   readonly worker: Worker | null
   dispose(): Promise<void>

@@ -119,7 +119,7 @@ test('saved numeric coverage is reused across an entire manual download without 
   const complete = await finished(f.download)
   assert.equal(complete.phase, 'completed')
   assert.equal(f.calls.length, 0)
-  assert.deepEqual(complete.progress, { completed: started.progress.total, total: started.progress.total, available: started.progress.total, unavailable: 0, reused: started.progress.total, pending: 0 })
+  assert.deepEqual(complete.progress, { checked: started.progress.total, total: started.progress.total, available: started.progress.total, empty: 0, unavailable: 0, failed: 0, reused: started.progress.total, pending: 0 })
   assert.deepEqual(f.metadata.report, complete)
 })
 
@@ -149,12 +149,12 @@ test('progress advances only after durable partial pages and accounts for source
   await waitFor(() => candleCalls === 2)
   const partial = f.download.snapshot()
   assert.equal(partial.progress.available, 4)
-  assert.equal(partial.progress.completed, 4)
+  assert.equal(partial.progress.checked, 4)
   assert.equal(partial.progress.total, started.progress.total)
   secondPage.resolve()
   const complete = await finished(f.download)
   assert.equal(complete.phase, 'completed')
-  assert.deepEqual(complete.progress, { completed: 51, total: 51, available: 37, unavailable: 14, reused: 2, pending: 0 })
+  assert.deepEqual(complete.progress, { checked: 51, total: 51, available: 37, empty: 12, unavailable: 2, failed: 0, reused: 2, pending: 0 })
   assert.equal(complete.failures.length, 0)
 })
 
@@ -167,7 +167,7 @@ test('cancellation aborts finite source demand and keeps unverified slots pendin
   const stopped = await f.download.cancel()
   await f.sync.whenIdle()
   assert.equal(stopped.phase, 'cancelled')
-  assert.deepEqual(stopped.progress, { completed: 0, total: started.progress.total, available: 0, unavailable: 0, reused: 0, pending: started.progress.total })
+  assert.deepEqual(stopped.progress, { checked: 0, total: started.progress.total, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: started.progress.total })
   assert.deepEqual(stopped.active, [])
   assert.ok(f.calls.every(call => call.signal.aborted))
   const calls = f.calls.length
@@ -175,21 +175,60 @@ test('cancellation aborts finite source demand and keeps unverified slots pendin
   assert.equal(f.calls.length, calls)
 })
 
-test('a failed stream leaves its missing slots pending while independent streams finish', async t => {
+test('a failed stream reports failed source slots separately while independent streams finish', async t => {
   const f = fixture(t, { fetchGap: request => request.source === 'candles' && request.timeframe === '5m' ? [] : records(request) })
   f.download.start([instrument])
   const complete = await finished(f.download)
   assert.equal(complete.phase, 'failed')
   assert.equal(complete.failures.length, 1)
   assert.match(complete.failures[0].error, /no persisted coverage progress/)
-  assert.deepEqual(complete.progress, { completed: 39, total: 51, available: 39, unavailable: 0, reused: 0, pending: 12 })
+  assert.deepEqual(complete.progress, { checked: 39, total: 51, available: 39, empty: 0, unavailable: 0, failed: 12, reused: 0, pending: 0 })
   assert.deepEqual(complete.streams, { completed: 8, total: 9 })
   assert.deepEqual(complete.contracts, { completed: 0, total: 1 })
 })
 
+test('failed partial chunks preserve numeric checkpoints and leave never attempted older chunks pending', async t => {
+  let calls = 0
+  const f = fixture(t, { chunkSlots: 4, pageSize: 2, concurrency: 1, fetchGap: request => {
+    if (request.source === 'candles' && request.timeframe === '5m' && ++calls > 1) throw new Error('Source outage.')
+    return records(request)
+  } })
+  f.download.start([instrument])
+  const complete = await finished(f.download)
+  assert.equal(complete.phase, 'failed')
+  assert.deepEqual(complete.progress, { checked: 41, total: 51, available: 41, empty: 0, unavailable: 0, failed: 2, reused: 0, pending: 8 })
+  assert.deepEqual(complete.failures, [{ instrument: instrument.instId, timeframe: '5m', source: 'candles', from: base + 100 * 60_000,
+    through: base + 115 * 60_000, error: 'Source outage.' }])
+  assert.deepEqual(f.metadata.report, complete)
+})
+
+test('unexpired empty leases complete finite coverage checks without claiming numeric completeness or verified unavailability', async t => {
+  const f = fixture(t, { fetchGap: request => request.source === 'oi'
+    ? records(request).map(record => ({ ...record, oi: null })) : records(request) })
+  f.download.start([instrument])
+  const complete = await finished(f.download)
+  assert.equal(complete.phase, 'completed')
+  assert.deepEqual(complete.progress, { checked: 51, total: 51, available: 34, empty: 17, unavailable: 0, failed: 0, reused: 0, pending: 0 })
+  const calls = f.calls.length
+  f.download.start([instrument])
+  const repeated = await finished(f.download)
+  assert.equal(f.calls.length, calls, 'Unexpired empty checks and numeric values are both reused without network requests.')
+  assert.deepEqual(repeated.progress, { ...complete.progress, reused: 34 })
+})
+
+test('obsolete combined absence reports are discarded without inventing a split or restarting source work', async t => {
+  const metadata = new MemoryMetadata()
+  metadata.report = { phase: 'running', progress: { completed: 20, total: 20, available: 5, unavailable: 15, reused: 5, pending: 0 } } as unknown as HistoryDownloadReport
+  const f = fixture(t, { metadata })
+  await f.sync.start(); await f.sync.whenIdle()
+  assert.deepEqual(f.download.snapshot(), emptyHistoryDownload())
+  assert.deepEqual(metadata.report, emptyHistoryDownload())
+  assert.equal(f.calls.length, 0)
+})
+
 test('restoring an interrupted report or old rolling goals never starts a download', async t => {
   const metadata = new MemoryMetadata()
-  metadata.report = { ...emptyHistoryDownload(), id: 'interrupted', phase: 'running', startedAt: base, progress: { completed: 2, total: 20, available: 2, unavailable: 0, reused: 2, pending: 18 } }
+  metadata.report = { ...emptyHistoryDownload(), id: 'interrupted', phase: 'running', startedAt: base, progress: { checked: 2, total: 20, available: 2, empty: 0, unavailable: 0, failed: 0, reused: 2, pending: 18 } }
   metadata.tasks.set('legacy', { id: 'legacy', ...instrument, purpose: 'history', priority: 'background' })
   const f = fixture(t, { metadata })
   await f.sync.start(); await f.sync.whenIdle()
@@ -228,14 +267,14 @@ test('cancellation waits for an admitted durable page and checkpoints its final 
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(stopped, false, 'Cancellation must include an admitted mutation in its final checkpoint.')
   assert.equal(f.store.values.size, 0)
-  assert.equal(f.download.snapshot().progress.completed, 0)
+  assert.equal(f.download.snapshot().progress.checked, 0)
   commit.resolve()
   const report = await cancellation
   await f.sync.whenIdle()
   assert.equal(report.phase, 'cancelled')
   assert.equal(f.calls.length, 1, 'Draining the admitted write cannot start another source request.')
   assert.equal(f.store.values.size, 12)
-  assert.deepEqual(report.progress, { completed: 12, total: started.progress.total, available: 12, unavailable: 0, reused: 0, pending: started.progress.total - 12 })
+  assert.deepEqual(report.progress, { checked: 12, total: started.progress.total, available: 12, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: started.progress.total - 12 })
   assert.deepEqual(report.active, [])
   assert.deepEqual(f.metadata.report, report)
 })
@@ -254,16 +293,16 @@ test('a fatal scheduler shutdown preserves earlier durable pages and clears cons
   const failed = await finished(f.download)
   assert.equal(failed.phase, 'failed')
   assert.match(failed.failures[0].error, /closed/)
-  assert.deepEqual(failed.progress, { completed: 3, total: started.progress.total, available: 3, unavailable: 0, reused: 0, pending: started.progress.total - 3 })
+  assert.deepEqual(failed.progress, { checked: 3, total: started.progress.total, available: 3, empty: 0, unavailable: 0, failed: started.progress.total - 3, reused: 0, pending: 0 })
   assert.deepEqual(failed.active, [])
   assert.deepEqual(f.metadata.report, failed)
   const restarted = f.download.start([instrument])
   assert.notEqual(restarted.id, started.id)
-  assert.equal(restarted.progress.completed, 0)
+  assert.equal(restarted.progress.checked, 0)
   assert.deepEqual(restarted.active, [])
   const stopped = await finished(f.download)
   assert.equal(stopped.phase, 'failed', 'A closed source owner cannot acquire new history.')
-  assert.deepEqual(stopped.progress, { completed: 0, total: started.progress.total, available: 0, unavailable: 0, reused: 0, pending: started.progress.total })
+  assert.deepEqual(stopped.progress, { checked: 0, total: started.progress.total, available: 0, empty: 0, unavailable: 0, failed: started.progress.total, reused: 0, pending: 0 })
   assert.deepEqual(stopped.active, [])
   assert.equal(pages, 2)
   assert.equal(failed.progress.available, 3, 'A new request cannot mutate the saved prior result.')
@@ -288,7 +327,7 @@ test('an asynchronous checkpoint save failure stops acquisition and produces a f
   assert.match(failed.error, /Could not save download progress: Metadata disk is full/)
   assert.deepEqual(failed.active, [])
   assert.equal(failed.progress.pending, started.progress.total)
-  assert.equal(failed.progress.completed, 0)
+  assert.equal(failed.progress.checked, 0)
   assert.equal(f.calls.length, 1, 'A failed checkpoint must stop later source admission.')
   assert.equal(f.calls[0].signal.aborted, true)
   assert.ok(saves >= 2)

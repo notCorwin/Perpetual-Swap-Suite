@@ -49,7 +49,7 @@ test('a present latest candle cannot certify a window with an interior price gap
     const partial = store.window(instId, '1H')!
     assert.equal(partial.bars.length, 95)
     assert.equal(partial.priceState, 'partial', 'All timestamp slots must exist, even when the producer claims readiness.')
-    assert.equal(partial.indicatorState, 'ready'); assert.equal(partial.oiState, 'ready'); assert.equal(partial.takerState, 'ready')
+    assert.equal(partial.indicatorState, 'ready'); assert.equal(partial.oiState, 'loading'); assert.equal(partial.takerState, 'loading')
     assert.deepEqual(store.readyBoundaries(instId, '1H'), [], 'Sparse prices provide no complete navigation runway.')
     ingest(compact ? complete : [complete[40]], 2)
     const repaired = store.window(instId, '1H')!
@@ -661,4 +661,85 @@ test('repeated full and compact forming frames preserve the byte budget and evic
   assert.ok(store.window(instId, '1H'), 'The active compact frame stays pinned.')
   assert.equal(store.window(eth, '1H'), null)
   assert.ok(store.window(sol, '1H'))
+})
+
+
+test('source errors and retry deadlines survive window derivation and live deltas while the other source renders', () => {
+  for (const compact of [false, true]) {
+    const store = new PreparedChartStore()
+    store.setUniverse([instId], '1H', instId)
+    const values = bars(104, 96).map(value => ({ ...value, oi: null, oiObserved: false, takerObserved: true, statisticsObserved: false, statisticsSources: 2 }))
+    const oiStatus = { state: 'error' as const, from: 104 * hour, through: 199 * hour, error: 'OI source offline', retryAt: 123_456 }
+    const ingest = (frame: PreparedChartResponse) => compact ? store.ingestLatest(frame) : store.ingest(frame)
+    assert.equal(ingest(response(values, { oiState: 'error', oiStatus })), true)
+    const failed = store.window(instId, '1H')!
+    assert.equal(failed.oiState, 'error'); assert.equal(failed.oiStatus?.error, 'OI source offline'); assert.equal(failed.oiStatus?.retryAt, 123_456)
+    assert.equal(failed.takerState, 'ready'); assert.ok(failed.bars.every(bar => bar.buy === 20 && bar.sell === 30))
+    const waiting = { ...oiStatus, error: 'OI rate limit', retryAt: 234_567 }
+    assert.equal(ingest(response(values, { revision: 2, oiState: 'error', oiStatus: waiting })), true)
+    const retry = store.window(instId, '1H')!
+    assert.notEqual(retry, failed); assert.equal(retry.bars, failed.bars)
+    assert.equal(retry.oiStatus?.error, 'OI rate limit'); assert.equal(retry.oiStatus?.retryAt, 234_567)
+    assert.equal(store.ingestLive({ type: 'live', instId, timeframe: '1H', generation: 1, revision: 3, endHour: 199 * hour,
+      liveBar: { ...bar(200), confirmed: false } }), true)
+    assert.equal(store.window(instId, '1H')?.oiState, 'error'); assert.equal(store.window(instId, '1H')?.oiStatus?.retryAt, 234_567)
+    assert.equal(ingest(response(values.map(value => ({ ...value, oi: 1_000, oiObserved: true, statisticsSources: 3, statisticsObserved: true })), {
+      revision: 4, oiStatus: { state: 'ready', from: 104 * hour, through: 199 * hour },
+    })), true)
+    assert.equal(store.window(instId, '1H')?.oiState, 'ready'); assert.equal(store.window(instId, '1H')?.oiStatus?.error, undefined)
+    assert.equal(store.window(instId, '1H')?.takerState, 'ready')
+  }
+})
+
+test('a reserve status cannot erase a disjoint visible source error or poison unrelated windows', () => {
+  const store = new PreparedChartStore()
+  const values = bars(0, 300).map(value => ({ ...value, oi: null, oiObserved: false, takerObserved: true, statisticsObserved: false, statisticsSources: 2 }))
+  store.ingest(response(values, { oiState: 'error', oiStatus: { state: 'error', from: 204 * hour, through: 299 * hour, error: 'Visible OI failed', retryAt: 123_456 } }))
+  assert.equal(store.window(instId, '1H', 299 * hour)?.oiState, 'error')
+  assert.equal(store.window(instId, '1H', 99 * hour)?.oiState, 'loading')
+  store.ingest(response(values.slice(0, 100), { revision: 2, endHour: 99 * hour, latestEnd: 299 * hour,
+    oiStatus: { state: 'unavailable', reason: 'unsupported', from: 4 * hour, through: 99 * hour },
+  }))
+  assert.equal(store.window(instId, '1H', 99 * hour)?.oiStatus?.reason, 'unsupported')
+  assert.equal(store.window(instId, '1H', 299 * hour)?.oiState, 'error')
+  assert.equal(store.window(instId, '1H', 299 * hour)?.oiStatus?.error, 'Visible OI failed')
+})
+
+
+test('missing timestamps cannot override incoming statistic errors with numeric or observed-empty bars', () => {
+  for (const compact of [false, true]) for (const empty of [false, true]) {
+    const store = new PreparedChartStore()
+    store.setUniverse([instId], '1H', instId)
+    const complete = bars(104, 96).map(value => empty ? { ...value, oi: null, buy: null, sell: null } : value)
+    const sparse = complete.filter((_, index) => index !== 40)
+    const oiStatus = { state: 'error' as const, from: 104 * hour, through: 199 * hour, error: 'OI request failed', retryAt: 123_456 }
+    const takerStatus = { ...oiStatus, error: 'Taker request failed', retryAt: 234_567 }
+    const ingest = (frame: PreparedChartResponse) => compact ? store.ingestLatest(frame) : store.ingest(frame)
+    ingest(response(sparse, { oiState: 'error', takerState: 'error', oiStatus, takerStatus }))
+    const failed = store.window(instId, '1H')!
+    assert.equal(failed.bars.length, 95); assert.equal(failed.priceState, 'partial')
+    assert.equal(failed.oiState, 'error'); assert.equal(failed.oiStatus?.error, 'OI request failed'); assert.equal(failed.oiStatus?.retryAt, 123_456)
+    assert.equal(failed.takerState, 'error'); assert.equal(failed.takerStatus?.error, 'Taker request failed'); assert.equal(failed.takerStatus?.retryAt, 234_567)
+    ingest(response(compact ? complete : [complete[40]], { revision: 2, endHour: 199 * hour, latestEnd: 199 * hour }))
+    const recovered = store.window(instId, '1H')!
+    assert.equal(recovered.oiState, empty ? 'unavailable' : 'ready'); assert.equal(recovered.oiStatus?.error, undefined)
+    assert.equal(recovered.takerState, empty ? 'unavailable' : 'ready'); assert.equal(recovered.takerStatus?.error, undefined)
+  }
+})
+
+test('price failure metadata is scoped to the affected incomplete window and survives unrelated reserve statuses', () => {
+  const store = new PreparedChartStore()
+  const complete = bars(0, 300), values = complete.filter(value => value.hour !== 240 * hour)
+  const priceStatus = { state: 'error' as const, from: 204 * hour, through: 299 * hour, error: 'Prices offline', retryAt: 123_456 }
+  store.ingest(response(values, { priceState: 'error', priceStatus, error: 'Prices offline' }))
+  const failed = store.window(instId, '1H', 299 * hour)!
+  assert.equal(failed.priceState, 'error'); assert.equal(failed.priceStatus?.error, 'Prices offline'); assert.equal(failed.priceStatus?.retryAt, 123_456)
+  assert.equal(store.window(instId, '1H', 99 * hour)?.priceState, 'ready')
+  assert.equal(store.window(instId, '1H', 99 * hour)?.priceStatus, undefined)
+  store.ingest(response(values.slice(0, 100), { revision: 2, endHour: 99 * hour, latestEnd: 299 * hour, priceStatus: { state: 'ready', from: 4 * hour, through: 99 * hour } }))
+  assert.equal(store.window(instId, '1H', 299 * hour)?.priceState, 'error')
+  assert.equal(store.window(instId, '1H', 299 * hour)?.priceStatus?.retryAt, 123_456)
+  store.ingest(response([complete[240]], { revision: 3, endHour: 299 * hour, latestEnd: 299 * hour, priceState: 'ready' }))
+  assert.equal(store.window(instId, '1H', 299 * hour)?.priceState, 'ready')
+  assert.equal(store.window(instId, '1H', 299 * hour)?.priceStatus?.error, undefined)
 })

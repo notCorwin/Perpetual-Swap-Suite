@@ -18,7 +18,7 @@
     "benchmark": "node scripts/test-sandbox.mjs command -- node --experimental-strip-types scripts/benchmark.ts",
     "benchmark:operations": "node scripts/operation-overhead.mjs",
     "benchmark:chart:foreground": "node scripts/test-sandbox.mjs command --foreground -- node scripts/chart-scroll-benchmark.mjs",
-    "benchmark:instruments": "npm run build && node scripts/test-sandbox.mjs command -- node scripts/instrument-navigation-benchmark.mjs",
+    "benchmark:instruments": "npm run build && node scripts/test-sandbox.mjs command --desktop -- node scripts/instrument-navigation-benchmark.mjs",
     "benchmark:market:foreground": "node scripts/test-sandbox.mjs command --foreground -- node scripts/market-resource-benchmark.mjs",
     "test:okx:1h": "node scripts/test-sandbox.mjs command --allow-network -- node scripts/okx-live-1h.mjs",
     "test:okx:streams": "node scripts/test-sandbox.mjs command --allow-network -- node scripts/okx-live-streams.mjs",
@@ -30,7 +30,7 @@
     "sandbox": "node scripts/test-sandbox.mjs",
     "operations:report": "node scripts/operation-report.mjs",
     "benchmark:startup": "node scripts/test-sandbox.mjs command -- node scripts/benchmark-startup.mjs",
-    "test:okx:chart": "npm run build && node scripts/test-sandbox.mjs command --allow-network --scenario okx-live-chart --require-category network --require-category database --require-category cpu --require-category io --require-category ipc --require-role electron-main --require-role renderer --require-role market-backend --require-role market-reader --require-role market-writer --require-role prepared-chart -- node scripts/okx-live-chart.mjs"
+    "test:okx:chart": "npm run build && node scripts/test-sandbox.mjs command --desktop --allow-network --scenario okx-live-chart --require-category network --require-category database --require-category cpu --require-category io --require-category ipc --require-role electron-main --require-role renderer --require-role market-backend --require-role market-reader --require-role market-writer --require-role prepared-chart -- node scripts/okx-live-chart.mjs"
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "3.0.71",

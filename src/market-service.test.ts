@@ -2192,18 +2192,18 @@ test('history download checkpoints and replies carry detached snapshots with mon
   const f = await fixture()
   try {
     const observed: import('./desktop-contract.ts').HistoryDownload[] = []
-    const unsubscribeMutation = f.service.subscribeHistoryDownload(report => { report.progress.completed = 999 })
+    const unsubscribeMutation = f.service.subscribeHistoryDownload(report => { report.progress.checked = 999 })
     const unsubscribe = f.service.subscribeHistoryDownload(report => { observed.push(report) })
     f.service.subscribeHistoryDownload(() => { throw new Error('Disconnected renderer.') })
     f.service.subscribeHistoryDownload(async () => { throw new Error('Disconnected async renderer.') })
     const initial = await f.service.historyDownloadRequest({ action: 'status' })
     f.service.historyDownload.report = { ...f.service.historyDownload.snapshot(), phase: 'running',
-      progress: { completed: 2, total: 5, available: 1, unavailable: 1, reused: 1, pending: 3 } }
+      progress: { checked: 2, total: 5, available: 1, empty: 0, unavailable: 1, failed: 0, reused: 1, pending: 3 } }
     f.service.publishHistoryDownload(f.service.historyDownload.snapshot())
     const current = await f.service.historyDownloadRequest({ action: 'status' })
     assert.equal(initial.phase, 'idle')
-    assert.equal(initial.progress.completed, 0, 'A previously returned reply must remain detached from later checkpoints and listeners.')
-    assert.equal(current.progress.completed, 2)
+    assert.equal(initial.progress.checked, 0, 'A previously returned reply must remain detached from later checkpoints and listeners.')
+    assert.equal(current.progress.checked, 2)
     assert.equal(current.serviceSession, initial.serviceSession)
     assert.ok(observed.length >= 3)
     assert.ok(observed.every((report, index) => report.serviceSession === initial.serviceSession && (index === 0 || report.revision > observed[index - 1].revision)))

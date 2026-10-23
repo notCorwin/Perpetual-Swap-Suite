@@ -27,6 +27,7 @@ const freshQuote = (timestamp, observedAt, intervalMS, now = Date.now()) => time
   && observedAt != null && now - observedAt < 30_000
 const samePrice = (left, right) => left && priceFields.every(field => Object.is(left[field], right[field]))
 const sourceFresh = (row, bit) => Boolean(statisticsMask(row) & bit) && (bit === 1 ? numeric(row.oi) || Number(row.statisticsOIExpiresAt) > Date.now() : numeric(row.buy) && numeric(row.sell) || Number(row.statisticsTakerExpiresAt) > Date.now())
+const priorityRank = priority => ({ interactive: 5, foreground: 4, prepared: 4, repair: 4, continuity: 3, statistics: 2, prefetch: 1, chartWarm: 1, background: 0 })[priority] ?? 0
 const sourceState = (rows, bit) => rows.length && rows.every(row => sourceFresh(row, bit))
   ? rows.every(row => bit === 1 ? numeric(row.oi) : numeric(row.buy) && numeric(row.sell)) ? 'ready' : 'unavailable' : 'loading'
 const changedSource = (left, right, bit) => !left || (statisticsMask(left) & bit) !== (statisticsMask(right) & bit)
@@ -207,7 +208,10 @@ export class PreparedChartPipeline {
       // A nearby cursor can still use an admitted viewport/reserve page. Keep
       // that consumer attached so HistorySync need not abort and refetch it.
       if (job.seriesKey === key && (job.from <= end && job.through >= from
-        || job.reserve && end >= job.reserve.from && end <= job.reserve.through)) continue
+        || job.reserve && end >= job.reserve.from && end <= job.reserve.through)) {
+        if (job.from <= end && job.through >= from) this.promoteSourceJob(job, 'interactive')
+        continue
+      }
       this.sourceTasks.delete(sourceKey)
       if (this.tasks.get(sourceKey) === job.task) this.tasks.delete(sourceKey)
       job.controller.abort()
@@ -254,21 +258,55 @@ export class PreparedChartPipeline {
     const core = latest?.indicatorState?.lastTimestamp === state.latestHour ? latest.indicatorState : state.indicatorState
     const liveBar = live ? bar(live, core?.lastTimestamp + state.intervalMS === live.timestamp ? projectIndicatorCandle(core, live) : undefined) : undefined
     const realtime = freshQuote(live?.timestamp, state.observedAt, state.intervalMS) && this.streaming(state.instId, state.timeframe)
-    const first = Math.max(0, end - (VISIBLE - 1) * state.intervalMS, state.floor ?? 0)
+    const expectedEnd = Math.floor(Date.now() / state.intervalMS) * state.intervalMS - state.intervalMS
+    const first = Math.max(0, (end ?? expectedEnd) - (VISIBLE - 1) * state.intervalMS, state.floor ?? 0)
     const complete = end !== null && rows.length === (end - first) / state.intervalMS + 1
       && rows.every((row, index) => row.timestamp === first + index * state.intervalMS && completePriceCandle(row))
-    const expectedEnd = Math.floor(Date.now() / state.intervalMS) * state.intervalMS - state.intervalMS
-    const priceState = !bars.length && !liveBar ? 'loading' : !complete ? 'partial'
+    const availability = !bars.length && !liveBar ? 'loading' : !complete ? 'partial'
       : !historical && end < expectedEnd ? 'stale' : 'ready'
+    const priceStatus = this.sourceStatus(state, 'candles', first, end ?? expectedEnd, availability)
     return { instId: state.instId, timeframe: state.timeframe, intervalMS: state.intervalMS, endHour: end,
       latestEnd: state.latestHour, oldestHour: state.floor, historyExhausted: state.floor !== null && (rows[0]?.timestamp ?? Infinity) <= state.floor,
       generation: state.generation, revision: this.nextRevision = Math.max(this.nextRevision + 1, this.revision(state.instId)), bars,
-      priceState, priceAsOf: live?.timestamp ?? rows.at(-1)?.timestamp ?? null,
+      priceState: priceStatus.state, priceStatus, priceAsOf: live?.timestamp ?? rows.at(-1)?.timestamp ?? null,
       priceObservedAt: state.observedAt, realtimeState: realtime ? 'live' : 'stale',
       sourceVersions: { price: state.priceVersion, oi: state.oiVersion ?? 0, taker: state.takerVersion ?? 0 },
-      oiState: sourceState(rows, 1), takerState: sourceState(rows, 2),
+      ...this.statisticsStatus(state, rows, first, end ?? expectedEnd),
       indicatorState: bars.length && bars.every(value => value.indicatorsObserved) ? bars.every(value => indicatorFields.every(field => numeric(value[field]))) ? 'ready' : 'unavailable' : 'loading',
-      liveBar, error: '' }
+      liveBar, error: priceStatus.error ?? '' }
+  }
+
+  sourceStatus(state, source, from, through, availability) {
+    let status = { state: availability, from, through }
+    if (!['ready', 'unavailable'].includes(availability)) {
+      const active = [...this.sourceTasks.values()].some(job => job.seriesKey === state.key && job.source === source && job.from <= through && job.through >= from)
+      const failure = [...this.sourceAttempts.values()].filter(attempt => attempt.seriesKey === state.key && attempt.source === source && attempt.from <= through && attempt.through >= from)
+        .sort((left, right) => right.failedAt - left.failedAt)[0]
+      if (failure && !active) status = { ...status, state: 'error', error: failure.error, retryAt: failure.retryAt }
+      else if (source !== 'candles' && typeof this.history.ensureStatistics !== 'function') status = { ...status, state: 'unavailable', reason: 'unsupported' }
+    } else if (availability === 'unavailable' && source !== 'candles') status.reason = 'not-published'
+    state.statusCache ??= new Map()
+    const key = `${source}:${through}`, previous = state.statusCache.get(key)
+    if (previous && JSON.stringify(previous) === JSON.stringify(status)) status = previous
+    state.statusCache.delete(key); state.statusCache.set(key, status)
+    while (state.statusCache.size > 12) state.statusCache.delete(state.statusCache.keys().next().value)
+    return status
+  }
+
+  statisticsStatus(state, rows, from, through) {
+    const result = {}
+    for (const [source, bit] of [['oi', 1], ['taker', 2]]) {
+      const complete = through !== null && rows.length === (through - from) / state.intervalMS + 1
+      const status = this.sourceStatus(state, source, from, through, complete ? sourceState(rows, bit) : 'loading')
+      result[`${source}State`] = status.state
+      result[`${source}Status`] = status
+    }
+    return result
+  }
+
+  demandPriority(state, from, through, focus = this.focus) {
+    const end = focus?.end ?? Math.floor(Date.now() / state.intervalMS) * state.intervalMS - state.intervalMS
+    return focus?.key === state.key && from <= end && through >= end - (VISIBLE - 1) * state.intervalMS ? 'interactive' : 'prefetch'
   }
 
   publish(state) {
@@ -281,7 +319,9 @@ export class PreparedChartPipeline {
     this.emit(frame)
     if (state.historyEnd !== null && state.historyEnd !== undefined && state.historyEnd !== frame.endHour) {
       const key = this.historyKey(state, state.historyEnd)
-      if (key !== state.publishedHistoryKey) { this.emit(this.historyFrame(state, state.historyEnd)); state.publishedHistoryKey = key }
+      if (key !== state.publishedHistoryKey || state.publishedHistoryStatus !== state.statusVersion) {
+        this.emit(this.historyFrame(state, state.historyEnd)); state.publishedHistoryKey = key; state.publishedHistoryStatus = state.statusVersion
+      }
     }
     return frame
   }
@@ -412,7 +452,7 @@ export class PreparedChartPipeline {
       state.historyRequest = (state.historyRequest ?? 0) + 1
       state.historyEnd = null
     }
-    if (!state.loaded || !state.rows.has(state.latestHour)) await this.job(`local:${key}`, () => this.read(state, undefined, TAIL, priority))
+    if (!state.loaded || !state.rows.has(state.latestHour)) await this.job(`local:${key}`, () => this.read(state, undefined, TAIL, this.currentFocus(focus) ? 'interactive' : priority))
     this.seed(state, priority)
     const frame = this.publish(state)
     this.refreshObservations(state, undefined, VISIBLE, VISIBLE, focus)
@@ -436,13 +476,13 @@ export class PreparedChartPipeline {
     let resident = Boolean(state.loaded && admitted && end !== null && from >= admitted.from && end <= admitted.through
       && admitted.revision === this.store.candleRevision?.(instId, timeframe))
     for (let hour = from; resident && hour <= end; hour += state.intervalMS) resident = completePriceCandle(state.rows.get(hour))
-    if (!resident) await this.job(`history:${state.key}:${targetEnd ?? 'latest'}`, () => this.read(state, targetEnd, HISTORY))
+    if (!resident) await this.job(`history:${state.key}:${targetEnd ?? 'latest'}`, () => this.read(state, targetEnd, HISTORY, this.demandPriority(state, from, end, focus)))
     if (this.currentFocus(focus) && request === state.historyRequest) state.historyEnd = targetEnd ?? state.latestHour
     this.seed(state, 'foreground')
     this.refreshObservations(state, targetEnd, VISIBLE, targetEnd === undefined ? VISIBLE : HISTORY_PAGE, focus, reserve)
     const currentEnd = targetEnd ?? state.latestHour
     const frame = this.historyFrame(state, currentEnd)
-    if (request === state.historyRequest) state.publishedHistoryKey = this.historyKey(state, currentEnd)
+    if (request === state.historyRequest) { state.publishedHistoryKey = this.historyKey(state, currentEnd); state.publishedHistoryStatus = state.statusVersion }
     return frame.bars.length || frame.liveBar ? frame : null
   }
 
@@ -496,73 +536,86 @@ export class PreparedChartPipeline {
     const end = targetEnd ?? Math.floor(Date.now() / step) * step - step
     const from = Math.max(0, end - (historyBars - 1) * step, state.floor ?? 0)
     const priceFrom = Math.max(0, end - (priceBars - 1) * step, state.floor ?? 0)
-    let pricesMissing = false, statisticsMissing = false
+    const priority = this.demandPriority(state, from, end, focus)
+    let pricesMissing = false
     for (let hour = priceFrom; hour <= end; hour += step) if (!completePriceCandle(state.rows.get(hour))) { pricesMissing = true; break }
-    for (let hour = from; hour <= end; hour += step) {
-      const row = state.rows.get(hour)
-      if (!row || !sourceFresh(row, 1) || !sourceFresh(row, 2)) statisticsMissing = true
-    }
-    if (statisticsMissing && typeof this.history.ensureStatistics === 'function') {
-      this.sourceJob(`statistics:${state.key}:${from}:${end}`, async signal => {
-        const result = await this.history.ensureStatistics(instId, timeframe, from, end, 'background', signal)
+    for (const [source, bit] of [['oi', 1], ['taker', 2]]) {
+      let missing = false
+      for (let hour = from; hour <= end; hour += step) if (!sourceFresh(state.rows.get(hour), bit)) { missing = true; break }
+      if (!missing || typeof this.history.ensureStatistics !== 'function') continue
+      this.sourceJob(`${source}:${state.key}:${from}:${end}`, async (signal, job) => {
+        const result = await this.history.ensureStatistics(instId, timeframe, from, end, job.priority, signal, source)
         signal.throwIfAborted()
-        await this.observeStatistics(instId, timeframe, from, end)
-        const rows = result?.rows ? new Map(result.rows.map(row => [row.timestamp, row])) : state.rows
-        for (let hour = from; hour <= end; hour += step) { const row = rows.get(hour); if (!row || !sourceFresh(row, 1) || !sourceFresh(row, 2)) return false }
+        await this.observeStatistics(instId, timeframe, from, end, job.priority, result?.rows, source)
+        signal.throwIfAborted()
+        for (let hour = from; hour <= end; hour += step) { const row = state.rows.get(hour); if (row && !sourceFresh(row, bit)) return false }
         return true
-      }, { state, from, through: end, reserve })?.catch(() => {})
+      }, { state, source, from, through: end, reserve, priority })?.catch(() => {})
     }
     if (!pricesMissing || !this.history.ensurePrices && !this.history.latest) return null
-    const task = this.sourceJob(`prices:${state.key}:${priceFrom}:${end}`, async signal => {
+    const task = this.sourceJob(`prices:${state.key}:${priceFrom}:${end}`, async (signal, job) => {
       // A latest observation proves only that candle. The durable planner owns
       // every missing slot in this window, including outages between two ticks.
       const result = typeof this.history.ensurePrices === 'function'
-        ? await this.history.ensurePrices(instId, timeframe, priceFrom, end, 'foreground', signal)
-        : await this.history.latest(instId, timeframe, 'foreground', signal)
+        ? await this.history.ensurePrices(instId, timeframe, priceFrom, end, job.priority, signal)
+        : await this.history.latest(instId, timeframe, job.priority, signal)
       signal.throwIfAborted()
       // Acquisition pages are source work. Their completion refreshes the
       // active navigation reserve, never admits an obsolete subpage instead.
       const cursor = state.historyEnd ?? undefined
-      await this.read(state, cursor, cursor === undefined ? TAIL : HISTORY)
+      await this.read(state, cursor, cursor === undefined ? TAIL : HISTORY, job.priority)
       signal.throwIfAborted()
       this.seed(state, 'foreground'); this.publish(state)
       const rows = result?.rows ? new Map(result.rows.map(row => [row.timestamp, row])) : state.rows
       for (let hour = priceFrom; hour <= end; hour += step) if (!completePriceCandle(rows.get(hour))) return false
       return true
-    }, { state, from: priceFrom, through: end, reserve })
+    }, { state, source: 'candles', from: priceFrom, through: end, reserve, priority })
     task?.catch(() => {})
     return task
   }
 
-  sourceJob(key, operation, { state, from, through, reserve }) {
-    const existing = this.sourceTasks.get(key)
-    if (existing) { existing.reserve ??= reserve; return existing.task }
+  promoteSourceJob(job, priority) {
+    if (priorityRank(priority) <= priorityRank(job.priority)) return
+    job.priority = priority
+    const [instId, timeframe] = [job.state.instId, job.state.timeframe]
+    this.history.promoteSource?.(instId, timeframe, job.source, job.from, job.through, priority)?.catch?.(() => {})
+  }
+
+  sourceJob(key, operation, { state, source, from, through, reserve, priority = 'interactive' }) {
+    const existing = this.sourceTasks.get(key) ?? [...this.sourceTasks.values()].find(job => job.seriesKey === state.key && job.source === source && job.from <= from && job.through >= through)
+    if (existing) { existing.reserve ??= reserve; this.promoteSourceJob(existing, priority); return existing.task }
     if ((this.sourceAttempts.get(key)?.retryAt ?? 0) > Date.now()) return null
     const controller = new AbortController(), signal = controller.signal
-    const job = { controller, seriesKey: state.key, from, through, reserve, task: null }
+    const job = { controller, state, source, seriesKey: state.key, from, through, reserve, priority, task: null }
+    const failed = error => {
+      const failures = (this.sourceAttempts.get(key)?.failures ?? 0) + 1, now = Date.now()
+      this.sourceAttempts.set(key, { seriesKey: state.key, source, from, through, failures, failedAt: now,
+        error: error?.message || `${source === 'oi' ? 'Open interest' : source === 'taker' ? 'Taker' : 'Price'} history is incomplete for this range.`,
+        retryAt: Number(error?.retryAt) > now ? Number(error.retryAt) : now + Math.min(30_000, 5_000 * 2 ** (failures - 1)) })
+    }
     const task = Promise.resolve().then(async () => {
       try {
-        const result = await abortable(() => operation(signal), signal)
+        const result = await abortable(() => operation(signal, job), signal)
         signal.throwIfAborted()
-        if (result === false) {
-          const failures = (this.sourceAttempts.get(key)?.failures ?? 0) + 1
-          this.sourceAttempts.set(key, { failures, retryAt: Date.now() + Math.min(30_000, 5_000 * 2 ** (failures - 1)) })
-        } else this.sourceAttempts.delete(key)
+        if (result === false) failed()
+        else this.sourceAttempts.delete(key)
         return result
-      }
-      catch (error) {
-        if (!signal.aborted) {
-          const failures = (this.sourceAttempts.get(key)?.failures ?? 0) + 1
-          this.sourceAttempts.set(key, { failures, retryAt: Date.now() + Math.min(30_000, 5_000 * 2 ** (failures - 1)) })
-        }
+      } catch (error) {
+        if (!signal.aborted) failed(error)
         throw error
       } finally {
         if (this.sourceTasks.get(key) === job) this.sourceTasks.delete(key)
         if (this.tasks.get(key) === task) this.tasks.delete(key)
-        if (!this.closed) setImmediate(() => this.scheduleRefresh()).unref?.()
+        if (!this.closed) {
+          state.statusVersion = (state.statusVersion ?? 0) + 1
+          if (!signal.aborted) this.publish(state)
+          setImmediate(() => this.scheduleRefresh()).unref?.()
+        }
       }
     })
     job.task = task; this.sourceTasks.set(key, job); this.tasks.set(key, task)
+    state.statusVersion = (state.statusVersion ?? 0) + 1
+    this.publish(state)
     return task
   }
 
@@ -575,22 +628,25 @@ export class PreparedChartPipeline {
     if (!state) return
     const now = Date.now(), step = state.intervalMS, boundary = Math.floor(now / step) * step
     const end = focus.end ?? boundary - step, from = Math.max(0, end - (VISIBLE - 1) * step, state.floor ?? 0)
-    let deadline = boundary + step + 1000, missingPrices = false, missingStatistics = false
+    let deadline = boundary + step + 1000, missingPrices = false
+    const missingStatistics = { oi: false, taker: false }
     for (let hour = from; hour <= end; hour += step) {
       const row = state.rows.get(hour)
       if (!completePriceCandle(row)) missingPrices = true
       for (const bit of [1, 2]) {
-        if (!row || !sourceFresh(row, bit)) missingStatistics = true
+        if (!row || !sourceFresh(row, bit)) missingStatistics[bit === 1 ? 'oi' : 'taker'] = true
         else if (bit === 1 ? !numeric(row.oi) : !numeric(row.buy) || !numeric(row.sell)) {
           const expiry = Number(row[bit === 1 ? 'statisticsOIExpiresAt' : 'statisticsTakerExpiresAt'])
           if (expiry > now) deadline = Math.min(deadline, expiry)
         }
       }
     }
-    for (const [family, missing, supported] of [['prices', missingPrices, this.history.latest || this.history.ensurePrices], ['statistics', missingStatistics, this.history.ensureStatistics]]) {
+    for (const [family, missing, supported] of [['prices', missingPrices, this.history.latest || this.history.ensurePrices], ['oi', missingStatistics.oi, this.history.ensureStatistics], ['taker', missingStatistics.taker, this.history.ensureStatistics]]) {
       if (!missing || !supported) continue
       const key = `${family}:${state.key}:${from}:${end}`
-      if (!this.tasks.has(key)) deadline = Math.min(deadline, this.sourceAttempts.get(key)?.retryAt ?? now + 1000)
+      const source = family === 'prices' ? 'candles' : family
+      const active = [...this.sourceTasks.values()].some(job => job.seriesKey === state.key && job.source === source && job.from <= end && job.through >= from)
+      if (!active) deadline = Math.min(deadline, this.sourceAttempts.get(key)?.retryAt ?? now + 1000)
     }
     if (this.cached(state.key)?.realtimeState === 'live' && state.observedAt !== null) deadline = Math.min(deadline, state.observedAt + 30_000)
     this.refreshTimer = setTimeout(() => {
@@ -781,14 +837,18 @@ export class PreparedChartPipeline {
   }
 
 
-  async observeStatistics(instId, timeframe, from, through) {
+  async observeStatistics(instId, timeframe, from, through, priority, inputRows, source) {
     const key = seriesKey(instId, timeframe), state = this.series.get(key), live = this.liveStates.get(key)
-    for (const current of [state, live].filter(Boolean)) {
-      const hours = [...current.rows.keys()].filter(hour => hour >= from && hour <= through)
-      if (!hours.length) continue
-      const admittedOI = current.oiVersion, admittedTaker = current.takerVersion
-      const rows = await this.store.candles({ instrument: instId, timeframe, from: Math.min(...hours), through: Math.max(...hours), limit: HISTORY, order: 'asc' }, 'background')
-      const allowed = (admittedOI === current.oiVersion ? 1 : 0) | (admittedTaker === current.takerVersion ? 2 : 0)
+    const admitted = [state, live].filter(Boolean).map(current => ({ current, oi: current.oiVersion, taker: current.takerVersion,
+      hours: [...current.rows.keys()].filter(hour => hour >= from && hour <= through) })).filter(value => value.hours.length)
+    if (!admitted.length) return
+    priority ??= this.demandPriority(state ?? live, from, through) === 'interactive' ? 'interactive' : 'background'
+    const hours = admitted.flatMap(value => value.hours)
+    // Acquisition already returns its committed projection. Both chart and live
+    // residency reuse those same rows, or share one bounded SQLite read.
+    const rows = inputRows ?? await this.store.candles({ instrument: instId, timeframe, from: Math.min(...hours), through: Math.max(...hours), limit: HISTORY, order: 'asc' }, priority)
+    for (const { current, oi, taker } of admitted) {
+      const allowed = ((oi === current.oiVersion ? 1 : 0) | (taker === current.takerVersion ? 2 : 0)) & (source === 'oi' ? 1 : source === 'taker' ? 2 : 3)
       for (const row of rows) if (current.rows.has(row.timestamp)) {
         const previous = current.rows.get(row.timestamp), normalized = this.normalize(row)
         const value = mergeStatistics(previous, { ...previous, ...Object.fromEntries(statisticsFields.map(field => [field, normalized[field]])) }, allowed)

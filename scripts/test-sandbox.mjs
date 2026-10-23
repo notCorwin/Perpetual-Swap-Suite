@@ -8,12 +8,15 @@ import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { operationCategories, operationRequirementKey, operationReportHasFailures, writeOperationReport } from './operation-report.mjs'
 import { requireForegroundTests } from '../electron/test-presentation.js'
+import { backgroundTestEnvironment, prepareTestElectron } from './electron-test-runtime.mjs'
+import { assertTestSpawn } from './electron-test-launch-register.mjs'
 
 const projectRoot = fileURLToPath(new URL('../', import.meta.url))
 const registration = fileURLToPath(new URL('./sandbox-register.mjs', import.meta.url))
+const launchRegistration = fileURLToPath(new URL('./electron-test-launch-register.mjs', import.meta.url))
 const signalExit = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143, SIGKILL: 137 }
 const git = args => { const result = spawnSync('git', args, { cwd: projectRoot, encoding: 'utf8' }); return result.status === 0 ? result.stdout.trim() : null }
-const node = args => [process.execPath, '--import', registration, ...args]
+const node = args => [process.execPath, '--import', launchRegistration, '--import', registration, ...args]
 const npm = args => [process.platform === 'win32' ? 'npm.cmd' : 'npm', ...args]
 const coreCoverage = {
   requireCategories: ['cpu', 'network', 'database', 'io', 'ipc'],
@@ -66,7 +69,7 @@ export async function sandboxCommands(mode, args = []) {
     // Node, and install recording before any application module is imported.
     return [basename(args[0]).replace(/\.exe$/, '') === 'node' || resolve(args[0]) === process.execPath ? node(args.slice(1)) : args]
   }
-  if (!['core', 'e2e', 'gpu', 'foreground', 'all'].includes(mode) || args.length) throw new Error('Usage: node scripts/test-sandbox.mjs core|e2e|gpu|foreground|all|command [--foreground] [--allow-network] [--gpu-trace] [--require-gpu] [--metal] [--require-gpu-hardware-timing] [--allow-empty] [--require-category CATEGORY] [--require-role ROLE] [--scenario LABEL] [--output PATH] [-- COMMAND ARGS...]')
+  if (!['core', 'e2e', 'gpu', 'foreground', 'all'].includes(mode) || args.length) throw new Error('Usage: node scripts/test-sandbox.mjs core|e2e|gpu|foreground|all|command [--desktop] [--foreground] [--allow-network] [--gpu-trace] [--require-gpu] [--metal] [--require-gpu-hardware-timing] [--allow-empty] [--require-category CATEGORY] [--require-role ROLE] [--scenario LABEL] [--output PATH] [-- COMMAND ARGS...]')
   const commands = []
   if (mode === 'core' || mode === 'all') commands.push(node(['--experimental-strip-types', '--test', ...await testFiles('src', '.test.ts'), ...await testFiles('tests/core', '.test.mjs')]))
   if (mode !== 'core') {
@@ -78,6 +81,7 @@ export async function sandboxCommands(mode, args = []) {
 }
 
 function execute(command, { environment, logPath, onChild }) {
+  assertTestSpawn(command[0], { env: environment })
   return new Promise(resolveResult => {
     const log = createWriteStream(logPath)
     const child = spawn(command[0], command.slice(1), { cwd: projectRoot, env: environment, detached: process.platform !== 'win32', stdio: ['inherit', 'pipe', 'pipe'] })
@@ -95,35 +99,36 @@ function execute(command, { environment, logPath, onChild }) {
   })
 }
 
-export async function runSandbox({ mode = 'core', args = [], output, allowNetwork = false, gpuTrace = false, foreground = false,
+export async function runSandbox({ mode = 'core', args = [], output, allowNetwork = false, gpuTrace = false, foreground = false, desktop = false,
   allowEmpty = false, requireCategories = [], requireRoles = [], scenario = mode, graphicsPolicy, graphicsProvider } = {}) {
   const presentation = foreground || mode === 'foreground' ? 'foreground' : 'background'
   if (presentation === 'foreground') requireForegroundTests({ ...process.env, PERPETUAL_SWAP_TEST_UI: presentation })
   const coverage = sandboxCoverage(mode, { allowEmpty, requireCategories, requireRoles, graphicsPolicy, graphicsProvider })
   if (typeof scenario !== 'string' || !scenario || scenario.length > 160) throw new Error('Scenario must be a nonempty label of at most 160 characters.')
   const commands = await sandboxCommands(mode, args)
-  // Electron's official package export prepares its binary on a clean install.
-  // Resolve this test dependency before entering the offline recording sandbox;
-  // resolving a binary does not launch an application or create a window.
-  if (mode !== 'command') await import('electron')
+  // Prepare once before any command can import Playwright/Electron. Never ask
+  // electron/index.js to download or resolve an unprotected runtime here.
+  const guardedRuntime = presentation === 'background' && process.platform === 'darwin' && (['e2e', 'gpu', 'all'].includes(mode) || mode === 'command' && desktop)
+    ? await prepareTestElectron() : undefined
   const id = `${new Date().toISOString().replaceAll(':', '').replaceAll('.', '')}-${randomUUID().slice(0, 8)}`
   const directory = output ? resolve(output, id) : join(projectRoot, '.build/sandbox', id)
   const operations = join(directory, 'operations'), temporary = join(directory, 'tmp'), userData = join(directory, 'user-data')
   await Promise.all([operations, temporary, userData].map(path => mkdir(path, { recursive: true })))
-  const environment = { ...process.env, PERPETUAL_SWAP_SANDBOX: '1', PERPETUAL_SWAP_TEST_UI: presentation, PERPETUAL_SWAP_ALLOW_NETWORK: allowNetwork ? '1' : '0',
+  let environment = { ...process.env, PERPETUAL_SWAP_SANDBOX: '1', PERPETUAL_SWAP_TEST_UI: presentation, PERPETUAL_SWAP_ALLOW_NETWORK: allowNetwork ? '1' : '0',
     PERPETUAL_SWAP_TEST_OWNER_PID: String(process.pid),
     PERPETUAL_SWAP_GPU_TRACE: gpuTrace ? '1' : '0', PERPETUAL_SWAP_OPERATION_DIR: operations, PERPETUAL_SWAP_OPERATION_SESSION: id, PERPETUAL_SWAP_OPERATION_SCENARIO: scenario,
     PERPETUAL_SWAP_GPU_POLICY: coverage.graphics?.policy ?? '', PERPETUAL_SWAP_GPU_PROVIDER: coverage.graphics?.provider ?? '',
     PERPETUAL_SWAP_USER_DATA: userData, TMPDIR: temporary, TMP: temporary, TEMP: temporary }
+  if (guardedRuntime) environment = backgroundTestEnvironment(guardedRuntime, environment)
   const manifest = { schemaVersion: 2, id, mode, scenario, coverage, startedAt: new Date().toISOString(), directory,
     revision: git(['rev-parse', 'HEAD']), dirty: Boolean(git(['status', '--porcelain'])),
     runtime: { node: process.version, electron: process.versions.electron ?? null, platform: platform(), arch: arch() },
-    environment: { sandbox: true, presentation, network: allowNetwork ? 'live explicitly enabled' : 'loopback and injected fixtures only', nativeGpuTrace: gpuTrace || Boolean(coverage.graphics), operationDirectory: operations, temporaryDirectory: temporary, userDataDirectory: userData },
+    environment: { sandbox: true, presentation, ...(guardedRuntime ? { testRuntime: guardedRuntime } : {}), network: allowNetwork ? 'live explicitly enabled' : 'loopback and injected fixtures only', nativeGpuTrace: gpuTrace || Boolean(coverage.graphics), operationDirectory: operations, temporaryDirectory: temporary, userDataDirectory: userData },
     commands: commands.map(command => ({ command, status: 'pending' })), outcome: { status: 'running' } }
   const save = () => writeFile(join(directory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
   await save()
   console.log(`Sandbox: ${directory}`)
-  console.log(`Test windows: ${presentation}${presentation === 'background' ? '; native foreground paint acceptance runs only in GitHub-hosted macOS CI' : ' (dedicated GitHub-hosted macOS CI)'}.`)
+  console.log(`Test windows: ${presentation}${guardedRuntime ? ' (background-only bundle; offscreen renderer)' : ''}${presentation === 'background' ? '; native foreground paint acceptance runs only in GitHub-hosted macOS CI' : ' (dedicated GitHub-hosted macOS CI)'}.`)
   let exitCode = 0, activeChild = null, interrupted = null, killTimer
   const stopChild = signal => {
     if (!activeChild?.pid) return
@@ -181,11 +186,12 @@ export async function runSandbox({ mode = 'core', args = [], output, allowNetwor
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const input = process.argv.slice(2), mode = input.shift() ?? 'core'
-    let allowNetwork = false, gpuTrace = false, allowEmpty = false, foreground = false, output, scenario, graphicsPolicy, graphicsProvider
+    let allowNetwork = false, gpuTrace = false, allowEmpty = false, foreground = false, desktop = false, output, scenario, graphicsPolicy, graphicsProvider
     const requireCategories = [], requireRoles = []
     while (input.length && input[0] !== '--') {
       const flag = input.shift()
       if (flag === '--allow-network') allowNetwork = true
+      else if (flag === '--desktop') desktop = true
       else if (flag === '--foreground') foreground = true
       else if (flag === '--gpu-trace') gpuTrace = true
       else if (flag === '--require-gpu') graphicsPolicy = graphicsPolicy === 'require-hardware-timing' ? graphicsPolicy : 'require-accelerated'
@@ -199,7 +205,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       else throw new Error(`Unknown sandbox option: ${flag}`)
     }
     if (input[0] === '--') input.shift()
-    const result = await runSandbox({ mode, args: input, output, allowNetwork, gpuTrace, allowEmpty, foreground, requireCategories, requireRoles, graphicsPolicy, graphicsProvider, ...(scenario ? { scenario } : {}) })
+    const result = await runSandbox({ mode, args: input, output, allowNetwork, gpuTrace, allowEmpty, foreground, desktop, requireCategories, requireRoles, graphicsPolicy, graphicsProvider, ...(scenario ? { scenario } : {}) })
     process.exitCode = result.exitCode
   } catch (error) { console.error(error.stack ?? error.message); process.exitCode = 1 }
 }

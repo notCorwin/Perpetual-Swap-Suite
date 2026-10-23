@@ -30,9 +30,9 @@ before(async () => {
     const state = globalThis.__workspaceFixture = { preferences, analysisSettings: { model: 'fixture/vision', hasAPIKey: false }, rows, initialRows: rows, requests: [], revision: 1, loading: false, error: '', catalogSource: 'live', catalogProgress: undefined, failNextSave: false, failSnapshots: 0, staleNextSnapshot: false, staleReplies: 0, chartGeneration: 1, bollMode: 'standard', holdNextSnapshot: false, releaseSnapshot: null, snapshotActive: 0, snapshotMaximum: 0,
       holdAuditAction: null, releaseAudit: null, heldAuditReply: null,
       holdDownloadAction: null, releaseDownload: null, heldDownloadReply: null,
-      historyDownload: { phase: 'idle', startedAt: null, updatedAt: null, finishedAt: null,
+      historyDownload: { schemaVersion: 2, phase: 'idle', startedAt: null, updatedAt: null, finishedAt: null,
         contracts: { completed: 0, total: 0 }, streams: { completed: 0, total: 0 },
-        progress: { completed: 0, total: 0, available: 0, unavailable: 0, reused: 0, pending: 0 },
+        progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 },
         active: [], failures: [], error: '', revision: 0, serviceSession: 'download-fixture' },
       audit: { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '', revision: 0, serviceSession: 'audit-fixture' } }
     state.notify = () => BrowserWindow.getAllWindows()[0].webContents.send('radar:market-changed')
@@ -108,7 +108,7 @@ before(async () => {
         const action = value.historyDownload.action
         if (action === 'start') state.publishDownload({ id: 'download-1', phase: 'running', startedAt: 1_800_000_000_000, updatedAt: 1_800_000_001_000, finishedAt: null,
           contracts: { completed: 0, total: 2 }, streams: { completed: 1, total: 18 },
-          progress: { completed: 100, total: 1_000, available: 90, unavailable: 10, reused: 80, pending: 900 }, failures: [], error: '',
+          progress: { checked: 100, total: 1_000, available: 90, empty: 0, unavailable: 10, failed: 0, reused: 80, pending: 900 }, failures: [], error: '',
           active: [{ instrument: 'BETA-USDT-SWAP', timeframe: '15m', source: 'oi', from: 1_799_990_100_000, through: 1_799_991_000_000,
             status: 'retrying', attempts: 2, nextAttemptAt: 1_800_000_005_000, error: 'Temporary source limit.' }] })
         if (action === 'cancel') state.publishDownload({ phase: 'cancelled', active: [], finishedAt: 1_800_000_010_000 })
@@ -306,7 +306,7 @@ test('chart source updates stay outside the plot without resizing its viewport a
       const baseline = await geometry()
       for (const value of ['loading', 'unavailable']) {
         await publish({ oiState: value, takerState: value, indicatorState: value === 'loading' ? 'loading' : 'ready' })
-        await status.getByText(value === 'loading' ? 'Loading OI history…' : 'OKX 15m OI history is incomplete for this range', { exact: true }).waitFor()
+        await status.getByText(value === 'loading' ? 'Loading OI history…' : 'OI is not published for part of this range', { exact: true }).waitFor()
         const current = await geometry()
         assert.equal(current.statusInsidePlot, false)
         assert.equal(current.plotStatuses, 0, 'Source messages must never cover candles or indicators.')
@@ -840,7 +840,7 @@ test('manual history downloads show exact pushed progress and retry details, con
   await active.getByText(/retrying · Consecutive failures: 2 · Next retry:/).waitFor()
   await active.getByText('Temporary source limit.', { exact: true }).waitFor()
   await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({
-    progress: { completed: 999_999, total: 1_000_000, available: 900_000, unavailable: 99_999, reused: 300_000, pending: 1 },
+    progress: { checked: 999_999, total: 1_000_000, available: 900_000, empty: 0, unavailable: 99_999, failed: 0, reused: 300_000, pending: 1 },
   }) })
   await settings.getByRole('status').filter({ hasText: 'Downloading history · 99.9%' }).waitFor()
   await details.getByText('999,999 / 1,000,000', { exact: true }).waitFor()
@@ -849,7 +849,7 @@ test('manual history downloads show exact pushed progress and retry details, con
   await backToMarkets()
   await settings.waitFor({ state: 'hidden' })
   await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({
-    progress: { completed: 1_000_000, total: 1_000_000, available: 900_001, unavailable: 99_999, reused: 300_000, pending: 0 },
+    progress: { checked: 1_000_000, total: 1_000_000, available: 900_001, empty: 0, unavailable: 99_999, failed: 0, reused: 300_000, pending: 0 },
   }) })
   await openSettings('Market data')
   await settings.getByRole('status').filter({ hasText: 'Downloading history · 100.0%' }).waitFor()
@@ -867,24 +867,24 @@ test('new download pushes win over held replies and completion distinguishes una
   try {
     await electron.evaluate(() => {
       const state = globalThis.__workspaceFixture
-      state.publishDownload({ phase: 'idle', progress: { completed: 0, total: 0, available: 0, unavailable: 0, reused: 0, pending: 0 }, error: '' })
+      state.publishDownload({ phase: 'idle', progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 }, error: '' })
       state.holdDownloadAction = 'status'
     })
     await openSettings('Market data')
     await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseDownload))
     await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({ phase: 'completed',
-      progress: { completed: 1_000_000, total: 1_000_000, available: 900_001, unavailable: 99_999, reused: 300_000, pending: 0 },
+      progress: { checked: 1_000_000, total: 1_000_000, available: 900_001, empty: 0, unavailable: 99_999, failed: 0, reused: 300_000, pending: 0 },
       contracts: { completed: 2, total: 2 }, streams: { completed: 18, total: 18 }, active: [],
     }) })
-    await settings.getByRole('status').filter({ hasText: 'Completed with unavailable data · 100.0%' }).waitFor()
+    await settings.getByRole('status').filter({ hasText: 'Completed with verified unavailable data · 100.0%' }).waitFor()
     await electron.evaluate(() => { globalThis.__workspaceFixture.releaseDownload() })
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
-    await settings.getByRole('status').filter({ hasText: 'Completed with unavailable data · 100.0%' }).waitFor()
+    await settings.getByRole('status').filter({ hasText: 'Completed with verified unavailable data · 100.0%' }).waitFor()
     await electron.evaluate(() => { globalThis.__workspaceFixture.holdDownloadAction = 'start' })
     await settings.getByRole('button', { name: 'Download all qualified history', exact: true }).click()
     await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseDownload))
     await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({ phase: 'completed',
-      progress: { completed: 1_000, total: 1_000, available: 1_000, unavailable: 0, reused: 80, pending: 0 },
+      progress: { checked: 1_000, total: 1_000, available: 1_000, empty: 0, unavailable: 0, failed: 0, reused: 80, pending: 0 },
       contracts: { completed: 2, total: 2 }, streams: { completed: 18, total: 18 }, active: [],
     }) })
     await settings.getByRole('status').filter({ hasText: 'Download complete · 100.0%' }).waitFor()

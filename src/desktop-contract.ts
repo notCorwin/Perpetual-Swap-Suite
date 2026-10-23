@@ -36,12 +36,14 @@ export type DataAudit = {
   error: string
 }
 export type HistoryDownload = {
+  schemaVersion: 2
   revision: number; serviceSession: string
   id?: string; phase: 'idle' | 'running' | 'completed' | 'cancelled' | 'failed'
   startedAt: number | null; updatedAt: number | null; finishedAt: number | null
   contracts: { completed: number; total: number }
   streams: { completed: number; total: number }
-  progress: { completed: number; total: number; available: number; unavailable: number; reused: number; pending: number }
+  /** Successful coverage checks are independent from numeric data completeness. */
+  progress: { checked: number; total: number; available: number; empty: number; unavailable: number; failed: number; reused: number; pending: number }
   active: { instrument: string; timeframe: string; source: string; from: number; through: number; status: string; attempts: number; nextAttemptAt: number | null; error: string }[]
   failures: { instrument: string; timeframe: string; source: string; from: number; through: number; error: string }[]
   error: string
