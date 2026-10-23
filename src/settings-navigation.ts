@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState, type RefObject } from 'react'
 
 export const SETTINGS_SECTIONS = [
-  { id: 'workspace', label: 'Workspace', description: 'Chart defaults and contract ranking.' },
-  { id: 'liquidity', label: 'Liquidity filters', description: 'Choose which contracts qualify for the market list.' },
-  { id: 'data', label: 'Market data', description: 'Download history and verify your local data.' },
-  { id: 'analysis', label: 'AI analysis', description: 'Configure chart analysis and your Gateway connection.' },
+  { id: 'workspace', label: 'Workspace' },
+  { id: 'liquidity', label: 'Liquidity filters' },
+  { id: 'data', label: 'Market data' },
+  { id: 'analysis', label: 'AI analysis' },
 ] as const
 export type SettingsSection = typeof SETTINGS_SECTIONS[number]['id']
 export type SettingsNavigationState = { dirty: boolean; busy: boolean }

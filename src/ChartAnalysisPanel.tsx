@@ -3,7 +3,7 @@ import { Copy, Send, Square, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
-import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
+import { Empty, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupTextarea } from '@/components/ui/input-group'
 import { Message, MessageContent, MessageFooter } from '@/components/ui/message'
 import { MessageScroller, MessageScrollerButton, MessageScrollerContent, MessageScrollerItem, MessageScrollerProvider, MessageScrollerViewport } from '@/components/ui/message-scroller'
@@ -49,14 +49,14 @@ export function ChartAnalysisPanel({ instId, timeframe = '15m', session, ready, 
   }
   return <aside className="flex min-h-0 w-(--analysis-panel-width) shrink-0 flex-col border-l bg-card" aria-label="Chart analysis">
     <div className="flex shrink-0 items-center gap-2 border-b px-4 py-2">
-      <h2 className="flex-1 font-semibold">Analysis</h2>
+      <h2 className="min-w-0 flex-1 truncate font-semibold">{instId.replace(/-SWAP$/, '')} · {timeframe}</h2>
+      {session && <Badge variant="outline">{ANALYSIS_PROMPTS[session.direction].label}</Badge>}
+      <AnalysisSettingsButton />
       <Button variant="ghost" size="icon-sm" onClick={onClose} aria-label="Close analysis"><X /></Button>
     </div>
     <div className="flex shrink-0 flex-col gap-2 border-b p-3">
-      <div className="flex items-center gap-2"><p className="flex-1 font-medium">{instId.replace(/-SWAP$/, '')} · {timeframe}</p>{session && <Badge variant="outline">{ANALYSIS_PROMPTS[session.direction].label}</Badge>}</div>
-      <p className="break-all text-xs text-muted-foreground">{session?.model ?? 'Vercel AI Gateway'}</p>
-      {session?.capturedAt ? <div className="flex flex-col gap-1 text-xs text-muted-foreground"><p>Captured {captureTime(session.capturedAt)}</p><p>{session.rangeLabel}</p><p>Follow-ups use this snapshot.</p></div> : null}
-      <div className="flex items-center gap-2"><Button variant="outline" size="sm" disabled={busy || !ready} onClick={onNew}>{session?.image ? 'New analysis' : 'Analyze chart'}</Button><AnalysisSettingsButton />{busy && <Button variant="ghost" size="sm" onClick={() => chartAnalysis.stop(instId)}><Square data-icon="inline-start" />Stop</Button>}</div>
+      {session?.capturedAt ? <p className="truncate text-xs text-muted-foreground" title={`${session.model} · Captured ${captureTime(session.capturedAt)} · ${session.rangeLabel}`}>Snapshot · {session.rangeLabel}</p> : null}
+      <div className="flex items-center gap-2"><Button variant="outline" size="sm" disabled={busy || !ready} onClick={onNew}>{session?.image ? 'New analysis' : 'Analyze chart'}</Button>{busy && <Button variant="ghost" size="sm" onClick={() => chartAnalysis.stop(instId)}><Square data-icon="inline-start" />Stop</Button>}</div>
     </div>
     {session?.error && <Alert variant="destructive"><AlertDescription>{session.error} Automatically retrying.</AlertDescription></Alert>}
     {copyState?.error && <Alert variant="destructive"><AlertDescription>{copyState.error}</AlertDescription></Alert>}
@@ -64,7 +64,7 @@ export function ChartAnalysisPanel({ instId, timeframe = '15m', session, ready, 
       <MessageScrollerProvider key={instId} autoScroll>
         <MessageScroller role="log" aria-label="Analysis conversation">
           <MessageScrollerViewport><MessageScrollerContent className="p-3">
-            {!session?.turns.length && <Empty><EmptyHeader><EmptyTitle>{session?.phase === 'capturing' ? 'Preparing chart…' : session?.phase === 'stopped' ? 'Analysis stopped' : 'Analyze this chart'}</EmptyTitle><EmptyDescription>{session?.phase === 'capturing' ? 'Capturing the visible chart for the model.' : 'Start an analysis, then ask follow-up questions about the same snapshot.'}</EmptyDescription></EmptyHeader></Empty>}
+            {!session?.turns.length && (session?.phase === 'capturing' || session?.phase === 'stopped') && <Empty><EmptyHeader><EmptyTitle>{session.phase === 'capturing' ? 'Preparing chart…' : 'Analysis stopped'}</EmptyTitle></EmptyHeader></Empty>}
             {session?.turns.map(turn => <Fragment key={turn.id}>
               <MessageScrollerItem messageId={`${turn.id}-user`} scrollAnchor><Message align="end"><MessageContent><Bubble variant="secondary" align="end"><BubbleContent><p lang="en" className="whitespace-pre-wrap select-text">{turn.question}</p></BubbleContent></Bubble></MessageContent></Message></MessageScrollerItem>
               <MessageScrollerItem messageId={`${turn.id}-assistant`}><Message><MessageContent>
@@ -83,7 +83,7 @@ export function ChartAnalysisPanel({ instId, timeframe = '15m', session, ready, 
         <InputGroupTextarea name="analysis-question" aria-label="Ask a follow-up" placeholder={canRetry ? 'Retry the stopped response or ask something new…' : 'Ask about this snapshot…'} value={session?.draft ?? ''} disabled={!session?.image || busy} onChange={event => chartAnalysis.draft(instId, event.target.value)} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} onKeyDown={event => {
           if (event.key === 'Enter' && !event.shiftKey && !composing && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) { event.preventDefault(); send() }
         }} />
-        <InputGroupAddon align="block-end"><span className="flex-1 text-xs text-muted-foreground">Shift+Enter for a new line</span><InputGroupButton type="submit" variant="outline" aria-label="Send follow-up" disabled={busy || !session?.image || (!session.draft.trim() && !canRetry)}><Send /></InputGroupButton></InputGroupAddon>
+        <InputGroupAddon align="block-end" className="justify-end"><InputGroupButton type="submit" variant="outline" aria-label="Send follow-up" disabled={busy || !session?.image || (!session.draft.trim() && !canRetry)}><Send /></InputGroupButton></InputGroupAddon>
       </InputGroup>
     </form>
   </aside>

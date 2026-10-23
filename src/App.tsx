@@ -226,7 +226,7 @@ function App() {
       <header className="flex flex-col gap-4 border-b p-4">
         <div className="flex items-center justify-between gap-2"><h1 className="text-base font-semibold">Perpetual Swap Suite</h1><a ref={settingsLauncher} href={settingsHref('workspace')} className={buttonVariants({ variant: 'outline', size: 'sm' })}><Settings2 aria-hidden="true" data-icon="inline-start" />Settings</a></div>
         <Input aria-label="Search contracts" placeholder="Search contracts…" value={query} onChange={event => setQuery(event.target.value)} />
-        <div className="flex items-center justify-between gap-2"><span className="text-xs text-muted-foreground">{visible.length} / {rows.length} contracts</span><Badge variant="outline"><Radio aria-hidden="true" />{status}</Badge></div>
+        <div className="flex items-center justify-between gap-2"><span className="text-xs text-muted-foreground">{query.trim() ? `${visible.length} / ${rows.length}` : rows.length} contracts</span><Badge variant="outline"><Radio aria-hidden="true" />{status}</Badge></div>
       </header>
       {preferencesError && <p role="alert" className="border-b p-3 text-sm text-destructive">{preferencesError}</p>}
       {error && <p role="alert" className="border-b p-3 text-sm text-destructive">{error}</p>}
@@ -239,7 +239,7 @@ function App() {
           </TableCell></TableRow></TableBody>}
         </Table>
       </section>
-      <footer className="flex flex-col gap-1 border-t p-4 text-xs text-muted-foreground" aria-live="polite">{retainedChart && <span role="status">{verifying ? 'Rechecking qualification · Current chart remains available' : 'Qualification data unavailable · Current chart remains available'}</span>}<span>Realtime: {realtime}</span><span>{updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data'}</span><span>Ranking: completed 5m closes · {preferences.rankingLookback}m lookback</span></footer>
+      <footer className="flex flex-col gap-1 border-t p-4 text-xs text-muted-foreground" aria-live="polite">{retainedChart && <span role="status">{verifying ? 'Rechecking qualification · Current chart remains available' : 'Qualification data unavailable · Current chart remains available'}</span>}<div className="flex items-center justify-between gap-3"><span aria-label={`Realtime connection: ${realtime}`}>{realtime}</span><span>{updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data'}</span></div></footer>
     </aside>
     <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
       {selectedID ? <MarketChart active={settingsSection === null} instId={selectedID} timeframe={timeframe} onTimeframeChange={changeTimeframe} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
