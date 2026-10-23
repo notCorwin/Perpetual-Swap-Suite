@@ -1141,3 +1141,141 @@ test('returning to latest while one reserve page is held retires the obsolete ol
     assert.equal(state.active, 0)
   } finally { hold.resolve(); await preparation; await pipeline.dispose() }
 })
+
+test('a superseded local probe retains its admitted facts without reviving source demand or focus', async () => {
+  const other = 'ETH-USDT-SWAP', rows = source(400)
+  const { pipeline, store } = fixture([...rows.slice(0, -12), ...rows.map(row => ({ ...row, instrument: other }))])
+  const hold = deferred(), reached = deferred(), requests: string[] = []
+  const candles = store.candles.bind(store)
+  let held = false
+  store.candles = async (query: any) => {
+    const result = await candles(query)
+    if (!held && query.instrument === instId && query.order === 'desc') { held = true; reached.resolve(); await hold.promise }
+    return result
+  }
+  pipeline.history.ensurePrices = async (id: string) => { requests.push(id) }
+  let stale: Promise<unknown> | undefined
+  try {
+    stale = pipeline.prepare(instId, '15m')
+    await reached.promise
+    await pipeline.local(other, '15m')
+    hold.resolve(); await stale
+    assert.equal(pipeline.focusKey, `${other}:15m`)
+    assert.deepEqual(requests, [], 'Finishing an obsolete local read cannot start a new source consumer.')
+    assert.ok(pipeline.series.get(`${instId}:15m`).rows.size > 0, 'Already admitted local observations remain reusable.')
+    assert.equal(pipeline.sourceAttempts.size, 0)
+  } finally { hold.resolve(); await stale; await pipeline.dispose() }
+})
+
+test('returning to the same target cannot resurrect an earlier local probe ownership', async () => {
+  const { pipeline, store } = fixture(source(400).slice(0, -12)), hold = deferred(), reached = deferred()
+  const candles = store.candles.bind(store)
+  let held = false, calls = 0, stale: Promise<unknown> | undefined
+  store.candles = async (query: any) => {
+    const result = await candles(query)
+    if (!held && query.order === 'desc') { held = true; reached.resolve(); await hold.promise }
+    return result
+  }
+  pipeline.history.ensurePrices = async () => { calls += 1 }
+  try {
+    pipeline.setFocus({ instId, timeframe: '15m' }, 'first')
+    stale = pipeline.prepare(instId, '15m', undefined, 96, { focusId: 'first' })
+    await reached.promise
+    pipeline.setFocus(null, 'hidden')
+    pipeline.setFocus({ instId, timeframe: '15m' }, 'second')
+    hold.resolve(); await stale
+    assert.equal(calls, 0)
+    assert.equal(pipeline.focus.id, 'second')
+  } finally { hold.resolve(); await stale; await pipeline.dispose() }
+})
+
+test('a nearby cursor adopts overlapping viewport sources and a disjoint jump releases them without backoff', async () => {
+  const rows = source(2000), { pipeline } = fixture(rows.slice(-128)), signals: AbortSignal[] = [], reached = deferred()
+  pipeline.history.ensurePrices = async (_id: string, _timeframe: string, _from: number, _through: number, _priority: string, signal: AbortSignal) => {
+    signals.push(signal); reached.resolve()
+    await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+  }
+  const target = rows[500].timestamp
+  let preparation: Promise<unknown> | undefined
+  try {
+    preparation = pipeline.prepare(instId, '15m', target)
+    await reached.promise
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target - interval })
+    assert.equal(signals[0].aborted, false, 'A shared page is still useful to the neighboring viewport.')
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: rows[1500].timestamp })
+    assert.equal(signals[0].aborted, true)
+    await preparation
+    assert.equal(pipeline.sourceAttempts.size, 0, 'Navigation cancellation is not a source failure.')
+    assert.equal(pipeline.sourceTasks.size, 0)
+  } finally { pipeline.setFocus(null); await preparation; await pipeline.dispose() }
+})
+
+test('an aborted source finalizer cannot remove a replacement consumer for the same target', async () => {
+  const { pipeline } = fixture([]), signals: AbortSignal[] = []
+  pipeline.history.ensurePrices = async (_id: string, _timeframe: string, _from: number, _through: number, _priority: string, signal: AbortSignal) => {
+    signals.push(signal)
+    await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+  }
+  const flush = async () => { for (let index = 0; index < 8; index++) await new Promise<void>(resolve => setImmediate(resolve)) }
+  try {
+    await pipeline.local(instId, '15m'); await flush()
+    pipeline.setFocus(null)
+    await pipeline.local(instId, '15m'); await flush()
+    assert.equal(signals.length, 2)
+    assert.equal(signals[0].aborted, true); assert.equal(signals[1].aborted, false)
+    const state = pipeline.series.get(`${instId}:15m`), active = pipeline.refreshObservations(state)
+    assert.equal(pipeline.sourceTasks.size, 1)
+    await flush()
+    assert.equal(pipeline.tasks.size, 1)
+    assert.equal(pipeline.refreshObservations(state), active, 'The replacement remains the deduplication owner after the old finalizer runs.')
+    assert.equal(pipeline.sourceAttempts.size, 0)
+  } finally { pipeline.setFocus(null); await pipeline.dispose() }
+})
+
+test('an admitted prefetch reserve preserves selected focus and can transfer its useful source to a new cursor', async () => {
+  const rows = source(2000), { pipeline } = fixture(rows.slice(-128)), started = deferred(), signals: AbortSignal[] = []
+  const selected = rows[1800].timestamp, prefetch = rows[1000].timestamp
+  pipeline.history.ensurePrices = async (_id: string, _timeframe: string, _from: number, _through: number, _priority: string, signal: AbortSignal) => {
+    signals.push(signal); started.resolve()
+    await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+  }
+  let preparation: Promise<unknown> | undefined
+  try {
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: selected }, 'selected')
+    preparation = pipeline.prepare(instId, '15m', prefetch, 768, { focusId: 'selected' })
+    await started.promise
+    assert.equal(pipeline.focus.end, selected, 'The reserve cursor is independent of the selected viewport.')
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: prefetch - 600 * interval }, 'inside-reserve')
+    assert.equal(signals[0].aborted, false, 'An already admitted reserve source remains useful inside its requested runway.')
+    pipeline.setFocus({ instId, timeframe: '15m' }, 'latest')
+    assert.equal(signals[0].aborted, true)
+    await preparation
+    assert.equal(signals.length, 1, 'Retiring a reserve stops the rest of its page loop.')
+    assert.equal(pipeline.sourceAttempts.size, 0)
+  } finally { pipeline.setFocus(null); await preparation; await pipeline.dispose() }
+})
+
+test('a disjoint prefetch reserve retains the selected viewport and cannot trigger repeated source maintenance', async context => {
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Math.floor(Date.now() / interval) * interval + 1000 })
+  const rows = source(2500), { pipeline, store } = fixture(rows), selected = rows.at(-1)!.timestamp, target = rows[900].timestamp
+  let sourceCalls = 0
+  pipeline.history.ensurePrices = async () => { sourceCalls += 1 }
+  pipeline.history.ensureStatistics = async () => { sourceCalls += 1 }
+  const flush = async () => { for (let index = 0; index < 8; index++) await new Promise<void>(resolve => setImmediate(resolve)) }
+  try {
+    pipeline.setFocus({ instId, timeframe: '15m' }, 'visible')
+    await pipeline.local(instId, '15m', { focusId: 'visible' }); await finishSeed(pipeline)
+    await pipeline.prepare(instId, '15m', target, 768, { focusId: 'visible' }); await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`)
+    assert.equal(pipeline.focus.end, undefined)
+    assert.equal(state.historyEnd, target)
+    for (let hour = selected - 95 * interval; hour <= selected; hour += interval) assert.ok(state.rows.has(hour))
+    assert.equal(pipeline.frame(state, selected).bars.length, 96)
+    const reads = store.queries.length
+    pipeline.scheduleRefresh()
+    context.mock.timers.tick(5000); await flush()
+    assert.equal(sourceCalls, 0, 'Resident reserve eviction must not manufacture a source outage for the selected viewport.')
+    assert.equal(store.queries.length, reads)
+    assert.ok(state.rows.size <= 1536 + 96, 'One bounded selected viewport accompanies the bounded acquisition reserve.')
+  } finally { await pipeline.dispose() }
+})

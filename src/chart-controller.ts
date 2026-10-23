@@ -15,9 +15,10 @@ export type ChartView = {
   unavailable: PreparedChartResponse['unavailable'] | null
 }
 export type ChartTransport = {
-  prepare: (target: ChartPreparation) => Promise<PreparedChartResponse>
-  local: (instId: string, timeframe: RadarTimeframe) => Promise<PreparedChartResponse | null>
-  history?: (target: ChartTarget) => Promise<PreparedChartResponse | null>
+  focus?: (target: ChartTarget | null, id: string) => Promise<unknown> | void
+  prepare: (target: ChartPreparation, focusId?: string) => Promise<PreparedChartResponse>
+  local: (instId: string, timeframe: RadarTimeframe, focusId?: string) => Promise<PreparedChartResponse | null>
+  history?: (target: ChartTarget, focusId?: string) => Promise<PreparedChartResponse | null>
   universe: (instIds: string[], timeframe: RadarTimeframe, focusInstId?: string) => Promise<{ frames: PreparedChartResponse[] }>
 }
 const targetKey = (target: ChartTarget) => `${target.timeframe}:${target.instId}:${target.end ?? 'latest'}`
@@ -33,6 +34,9 @@ export class ChartController {
   private listeners = new Set<() => void>()
   private view: ChartView = { requested: null, presented: null, pending: false, error: '', oldestHour: null, latestEnd: null, historyExhausted: false, unavailable: null }
   private owner = 0
+  private focusVersion = 0
+  private readonly identity = crypto.randomUUID()
+  private focusId = ''
   private active = false
   private demandTargets = new Set<string>()
   private maintenanceTarget: ChartPreparation | null = null
@@ -114,7 +118,7 @@ export class ChartController {
     }
   }
 
-  open(instId: string, timeframe: RadarTimeframe) {
+  open(instId: string, timeframe: RadarTimeframe, end: number | null = null) {
     const owner = ++this.owner
     this.active = true
     this.refresh = false
@@ -127,11 +131,12 @@ export class ChartController {
     this.clearTimer()
     this.store.setUniverse(this.universeIds, timeframe, instId)
     this.publish({ ...this.view, unavailable: null })
-    this.setTarget({ instId, timeframe, end: null })
+    this.setTarget({ instId, timeframe, end }, true)
     return () => {
       if (owner !== this.owner) return
       this.active = false
       this.clearTimer()
+      this.updateFocus(null)
     }
   }
 
@@ -154,8 +159,13 @@ export class ChartController {
     this.setTarget({ ...target, end: end >= latest ? null : end })
   }
 
-  private setTarget(target: ChartTarget) {
-    if (this.view.requested && targetKey(this.view.requested) === targetKey(target)) {
+  private updateFocus(target: ChartTarget | null) {
+    this.focusId = `${this.identity}:${++this.focusVersion}`
+    void Promise.resolve(this.transport.focus?.(target, this.focusId)).catch(() => {})
+  }
+
+  private setTarget(target: ChartTarget, forceFocus = false) {
+    if (!forceFocus && this.view.requested && targetKey(this.view.requested) === targetKey(target)) {
       this.commit()
       void this.pump()
       return
@@ -164,6 +174,7 @@ export class ChartController {
     this.failureCount = 0
     this.retryAt = 0
     this.localCheckedKey = null
+    this.updateFocus(target)
     this.commit(target)
     void this.pump()
   }
@@ -315,16 +326,17 @@ export class ChartController {
   }
 
   private async hydrateLocal(target: ChartTarget) {
+    const focusId = this.focusId
     const key = seriesKey(target)
     this.localTargets.add(key)
     const admittedAt = this.notificationVersion
     try {
-      const response = await this.transport.local(target.instId, target.timeframe)
+      const response = await this.transport.local(target.instId, target.timeframe, focusId)
       if (response && this.store.ingestLatest(this.preservePushedLive(response, admittedAt))) this.preparedChanged(response)
     } catch { /* A local miss still has the independent foreground preparation lane. */ }
     finally {
       this.localTargets.delete(key)
-      if (this.view.requested && targetKey(this.view.requested) === targetKey(target)) this.localCheckedKey = targetKey(target)
+      if (focusId === this.focusId) this.localCheckedKey = targetKey(target)
       void this.pump()
     }
   }
@@ -335,11 +347,12 @@ export class ChartController {
   }
 
   private async hydrateHistory(target: ChartTarget, checkedKey: string, watermark: string) {
+    const focusId = this.focusId
     const key = seriesKey(target)
     this.historyTargets.add(key)
     const admittedAt = this.notificationVersion
     try {
-      const response = await this.transport.history!(target)
+      const response = await this.transport.history!(target, focusId)
       if (response) {
         const accepted = this.store.ingest(this.preservePushedLive(response, admittedAt))
         const meta = this.store.snapshotMeta(target.instId, target.timeframe)
@@ -359,20 +372,21 @@ export class ChartController {
   }
 
   private async run(job: ChartPreparation, kind: 'target' | 'refresh' | 'prefetch') {
+    const focusId = this.focusId
     let failed = false
     let unavailableRetryAt: number | null = null
     const startedAt = performance.now()
     const admittedAt = this.notificationVersion
     try {
-      const response = await this.transport.prepare(job)
+      const response = await this.transport.prepare(job, focusId)
       const elapsed = performance.now() - startedAt
       this.preparationMS = Math.max(elapsed, this.preparationMS * .75 + elapsed * .25)
       if (response.error) throw new Error(response.error)
       if (response.unavailable) {
-        if (this.active && this.view.requested && targetKey(this.view.requested) === targetKey(job)) {
+        if (this.active && focusId === this.focusId && this.view.requested && targetKey(this.view.requested) === targetKey(job)) {
           this.publish({ ...this.view, pending: false, error: '', unavailable: response.unavailable })
           unavailableRetryAt = response.unavailable.retryAt
-        } else if (kind === 'prefetch') this.prefetchAfter = Math.max(Date.now() + 5_000, response.unavailable.retryAt)
+        } else if (kind === 'prefetch' && focusId === this.focusId) this.prefetchAfter = Math.max(Date.now() + 5_000, response.unavailable.retryAt)
       } else {
         const accepted = this.store.ingest(this.preservePushedLive(response, admittedAt))
         if (accepted && job.end !== null) {
@@ -384,11 +398,11 @@ export class ChartController {
         if (accepted && !prepared) throw new Error('No local prices are available for this range yet.')
         if (this.active) this.commit()
       }
-      if (this.view.requested && targetKey(this.view.requested) === targetKey(job)) { this.failureCount = 0; this.retryAt = 0 }
+      if (focusId === this.focusId && this.view.requested && targetKey(this.view.requested) === targetKey(job)) { this.failureCount = 0; this.retryAt = 0 }
     } catch (cause) {
       failed = true
-      if (kind === 'prefetch') this.prefetchAfter = Date.now() + 5_000
-      else if (this.active && this.view.requested && targetKey(this.view.requested) === targetKey(job)) {
+      if (kind === 'prefetch' && focusId === this.focusId) this.prefetchAfter = Date.now() + 5_000
+      else if (this.active && focusId === this.focusId && this.view.requested && targetKey(this.view.requested) === targetKey(job)) {
         this.failureCount += 1
         this.retryAt = Date.now() + Math.min(10_000, 500 * 2 ** Math.min(this.failureCount, 4))
         const complete = this.commit()
@@ -399,7 +413,7 @@ export class ChartController {
       else this.demandTargets.delete(seriesKey(job))
     }
     if (!this.active) return
-    const changed = this.view.requested && targetKey(this.view.requested) !== targetKey(job)
+    const changed = focusId !== this.focusId || this.view.requested && targetKey(this.view.requested) !== targetKey(job)
     if (unavailableRetryAt !== null && !changed) this.wake(Math.max(0, unavailableRetryAt - Date.now()), true)
     else if (failed && !changed && kind !== 'prefetch') this.wake(Math.max(0, this.retryAt - Date.now()), true)
     else queueMicrotask(() => { void this.pump() })
@@ -407,8 +421,9 @@ export class ChartController {
 }
 
 export const chartController = new ChartController({
-  prepare: target => window.radarDesktop.request({ chartWindow: { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined, historyBars: target.historyBars } }),
-  local: (instId, timeframe) => window.radarDesktop.request({ chartLocal: { instId, timeframe } }),
-  history: target => window.radarDesktop.request({ chartHistory: { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } }),
+  focus: (target, id) => window.radarDesktop.request({ chartFocus: { id, target: target ? { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } : null } }),
+  prepare: (target, focusId) => window.radarDesktop.request({ chartWindow: { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined, historyBars: target.historyBars, focusId } }),
+  local: (instId, timeframe, focusId) => window.radarDesktop.request({ chartLocal: { instId, timeframe, focusId } }),
+  history: (target, focusId) => window.radarDesktop.request({ chartHistory: { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined, focusId } }),
   universe: (instIds, timeframe, focusInstId) => window.radarDesktop.request({ chartUniverse: { instIds, timeframe, focusInstId } }),
 })

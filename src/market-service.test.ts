@@ -429,35 +429,42 @@ test('qualified contracts renew independently while discovery waits for another 
     assert.equal(f.service.catalog.has(instId), true)
     discoverOther = true
     refresh = f.service.refresh()
-    await waitFor(() => blocked && oiCalls === 2 && f.service.candidateTasks.size === 1)
+    await waitFor(() => blocked && oiCalls === 1 && f.service.candidateTasks.size === 1)
     const previous = f.service.catalog.get(instId)
     previous.expiresAt = Date.now() - 1
+    f.service.observations.get(instId).openInterest.expiresAt = 0
+    f.service.openInterest.snapshot = null
     assert.equal((await f.service.snapshot()).rows.length, 0, 'An expired contract is never displayed as currently qualified.')
     f.service.tickerCache.observedAt = Date.now() - 90_001
     await f.service.renewCatalog()
-    await waitFor(() => oiCalls === 3 && f.service.candidateTasks.size === 1)
+    await waitFor(() => oiCalls === 2 && f.service.candidateTasks.size === 1)
     assert.equal(f.service.refreshing !== null, true, 'Renewal must finish without waiting for full discovery.')
-    assert.equal(oiCalls, 3)
+    assert.equal(oiCalls, 2)
     assert.deepEqual((await f.service.snapshot()).rows.map(row => row.instId), [instId])
     assert.ok(f.service.catalog.get(instId).expiresAt > Date.now())
   } finally { release(); await refresh; await f.close() }
 })
 
-test('expired qualification stays hidden after unavailable observations and recovers through independent renewal', async () => {
+test('expired qualification stays hidden after unavailable observations and recovers after shared cooldown', async context => {
+  let now = Date.now()
+  context.mock.method(Date, 'now', () => now)
   const configuration = disabled(); configuration.liquidity.openInterest.enabled = true
   let unavailable = false
   const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response(unavailable ? [] : [{ instId, oiUsd: '6000000' }]) : null))
   try {
     f.service.updateRanking = async () => undefined
+    for (const lane of f.service.requestLanes.values()) lane.interval = 0
     await f.service.refresh()
     const observed = f.service.observations.get(instId).openInterest
     observed.expiresAt = Date.now() - 1
+    f.service.openInterest.snapshot = null
     f.service.catalog.get(instId).expiresAt = Date.now() - 1
     assert.equal((await f.service.snapshot()).rows.length, 0)
     assert.equal(f.service.renewalTargets.has(instId), true)
     unavailable = true
     await f.service.renewCatalog()
-    await waitFor(() => f.service.metadata.getCatalogEntry(instId).status === 'unknown' && f.service.candidateTasks.size === 0)
+    await Promise.all([...f.service.candidateTasks.values()])
+    assert.equal(f.service.metadata.getCatalogEntry(instId).status, 'unknown')
     const missing = await f.service.snapshot()
     assert.equal(missing.rows.length, 0)
     assert.equal(missing.catalogProgress.unknown, 1)
@@ -466,8 +473,10 @@ test('expired qualification stays hidden after unavailable observations and reco
     assert.equal(f.service.metadata.getCatalogEntry(instId).observations.openInterest.expiresAt, observed.expiresAt, 'A failed request cannot renew an old observation.')
     assert.equal(f.service.renewalTargets.has(instId), true, 'Missing data must not remove a previously qualified contract from renewal.')
     unavailable = false
+    now = f.service.openInterest.retryAt
     await f.service.renewCatalog()
-    await waitFor(() => f.service.catalog.has(instId) && f.service.candidateTasks.size === 0)
+    await Promise.all([...f.service.candidateTasks.values()])
+    assert.equal(f.service.catalog.has(instId), true)
     const recovered = await f.service.snapshot()
     assert.deepEqual(recovered.rows.map(row => row.instId), [instId])
     assert.equal(recovered.catalogProgress.verified, 1)
@@ -1401,6 +1410,9 @@ test('a liquidity edit does not wait for a previous candidate source that ignore
   try {
     isolateQualification(f.service)
     await f.service.refresh()
+    const retainedOI = structuredClone(f.service.observations.get(instId).openInterest)
+    f.service.observations.get(instId).openInterest.expiresAt = 0
+    f.service.openInterest.snapshot = null
     const get = f.service.get.bind(f.service)
     f.service.get = async (path: string, ...args: unknown[]) => {
       if (path === '/public/open-interest') {
@@ -1412,6 +1424,7 @@ test('a liquidity edit does not wait for a previous candidate source that ignore
     }
     refresh = f.service.refresh()
     await waitFor(() => blocked)
+    f.service.observations.get(instId).openInterest = retainedOI
     const previous = structuredClone(configuration)
     configuration.liquidity.openInterest.minUSDT = 4_000_000
     reconfigured = f.service.reconfigure(previous)
@@ -1553,6 +1566,8 @@ test('a historical correction during a live observation cannot restore the previ
     }
     await f.service.refresh()
     assert.equal(f.service.catalog.get(instId).result.turnover, 57_600_000)
+    f.service.observations.get(instId).openInterest.expiresAt = 0
+    f.service.openInterest.snapshot = null
     blockOI = true
     refresh = f.service.refresh()
     await waitFor(() => blocked)

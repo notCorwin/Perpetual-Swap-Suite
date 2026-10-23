@@ -56,9 +56,10 @@ export type DesktopCommands = {
   cancelGatewayFetch: { input: string; output: { ok: boolean } }
   copyText: { input: string; output: { ok: boolean } }
   captureChart: { input: ChartCaptureBounds & { output?: 'png' }; output: { ok: boolean } }
-  chartWindow: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number; historyBars?: number }; output: PreparedChartResponse }
-  chartLocal: { input: { instId: string; timeframe: RadarTimeframe }; output: PreparedChartResponse | null }
-  chartHistory: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number }; output: PreparedChartResponse | null }
+  chartFocus: { input: { id: string; target: { instId: string; timeframe: RadarTimeframe; endHour?: number } | null }; output: { ok: boolean } }
+  chartWindow: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number; historyBars?: number; focusId?: string }; output: PreparedChartResponse }
+  chartLocal: { input: { instId: string; timeframe: RadarTimeframe; focusId?: string }; output: PreparedChartResponse | null }
+  chartHistory: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number; focusId?: string }; output: PreparedChartResponse | null }
   chartUniverse: { input: { instIds: string[]; timeframe: RadarTimeframe; focusInstId?: string }; output: { frames: PreparedChartResponse[] } }
 }
 export type DesktopRequest = { [K in keyof DesktopCommands]: { [P in K]: DesktopCommands[K]['input'] } }[keyof DesktopCommands]
@@ -79,6 +80,7 @@ export interface RadarDesktop {
   request(value: { captureChart: ChartCaptureBounds & { output: 'png' } }): Promise<ChartImage>
   request(value: { captureChart: DesktopCommands['captureChart']['input'] }): Promise<DesktopCommands['captureChart']['output']>
   request(value: { chartWindow: DesktopCommands['chartWindow']['input'] }): Promise<DesktopCommands['chartWindow']['output']>
+  request(value: { chartFocus: DesktopCommands['chartFocus']['input'] }): Promise<DesktopCommands['chartFocus']['output']>
   request(value: { chartLocal: DesktopCommands['chartLocal']['input'] }): Promise<DesktopCommands['chartLocal']['output']>
   request(value: { chartHistory: DesktopCommands['chartHistory']['input'] }): Promise<DesktopCommands['chartHistory']['output']>
   request(value: { chartUniverse: DesktopCommands['chartUniverse']['input'] }): Promise<DesktopCommands['chartUniverse']['output']>

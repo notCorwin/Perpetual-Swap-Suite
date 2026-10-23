@@ -199,7 +199,11 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
 
 export function MarketChart({ instId, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect }: { instId: string; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
   const view = useSyncExternalStore(chartController.subscribe, chartController.getSnapshot)
-  useLayoutEffect(() => chartController.open(instId, timeframe), [instId, timeframe])
+  useLayoutEffect(() => {
+    if (!isActive) return
+    const target = chartController.getSnapshot().requested
+    return chartController.open(instId, timeframe, target?.instId === instId && target.timeframe === timeframe ? target.end : null)
+  }, [instId, timeframe, isActive])
   const surface = view.presented
   const matchesSelection = surface?.instId === instId && surface.timeframe === timeframe
   const pending = view.pending || !matchesSelection

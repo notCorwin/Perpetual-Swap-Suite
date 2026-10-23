@@ -124,7 +124,7 @@ test('discovery subscribes candidates including failed and unknown filters witho
     await f.open()
     const ids = instruments.map(value => value.instId)
     assert.deepEqual(f.subscriptions(OKX_BUSINESS_WEBSOCKET_URL), ids.flatMap(instId => ['5m', '15m', '1H'].map(frame => `candle${frame}:${instId}`)).sort())
-    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), ids.flatMap(instId => ['tickers', 'open-interest', 'books', 'trades'].map(channel => `${channel}:${instId}`)).sort())
+    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), ids.flatMap(instId => ['tickers', 'open-interest', 'trades'].map(channel => `${channel}:${instId}`)).sort())
     assert.deepEqual(f.service.history.sync.listTasks(), [], 'Discovery must not start bulk history downloads.')
     assert.equal(f.service.catalog.size, 0)
     assert.deepEqual(paths, ['/api/v5/public/instruments'])
@@ -233,9 +233,53 @@ test('delisting removes every public and candle subscription, including a previo
     instruments = instruments.slice(0, 1)
     await f.discover(); await f.idle()
     assert.deepEqual(f.subscriptions(OKX_BUSINESS_WEBSOCKET_URL), ['candle1H:BTC-USDT-SWAP', 'candle15m:BTC-USDT-SWAP', 'candle5m:BTC-USDT-SWAP'].sort())
-    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), ['books:BTC-USDT-SWAP', 'open-interest:BTC-USDT-SWAP', 'tickers:BTC-USDT-SWAP', 'trades:BTC-USDT-SWAP'].sort())
+    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), ['open-interest:BTC-USDT-SWAP', 'tickers:BTC-USDT-SWAP', 'trades:BTC-USDT-SWAP'].sort())
     assert.equal(f.service.catalog.has(removed), false)
     assert.equal(f.service.renewalTargets.has(removed), false)
+  } finally { await f.close() }
+})
+
+test('liquidity settings retain books while either dependent rule is enabled and toggle only that channel', async () => {
+  const instruments = [instrument(), instrument('ETH')], config = preferences('depth', 'slippage'), paths: string[] = []
+  const f = await fixture(config, async input => {
+    const path = new URL(String(input)).pathname
+    paths.push(path)
+    assert.ok(path.endsWith('/public/instruments'))
+    return response(instruments)
+  })
+  try {
+    await f.discover(); await f.open()
+    const ids = instruments.map(value => value.instId), socket = f.sockets.get(OKX_PUBLIC_WEBSOCKET_URL)![0]
+    const initialCommands = socket.sent.length
+    const stable = [...f.service.publicRealtime.subscriptions].filter(([, value]) => value.channel !== 'books')
+    const candles = f.subscriptions(OKX_BUSINESS_WEBSOCKET_URL)
+    let previous = structuredClone(config)
+    config.liquidity.depth.enabled = false
+    await f.service.reconfigure(previous); await f.idle()
+    assert.equal(socket.sent.length, initialCommands, 'Slippage still needs the resident books subscription.')
+    previous = structuredClone(config)
+    config.liquidity.slippage.enabled = false
+    await f.service.reconfigure(previous); await f.idle()
+    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), ids.flatMap(instId => ['tickers', 'open-interest', 'trades'].map(channel => `${channel}:${instId}`)).sort())
+    assert.deepEqual(f.subscriptions(OKX_BUSINESS_WEBSOCKET_URL), candles)
+    for (const [key, value] of stable) assert.equal(f.service.publicRealtime.subscriptions.get(key), value)
+    f.push(OKX_PUBLIC_WEBSOCKET_URL, ids[0], 'tickers', [ticker(ids[0], 200)])
+    await f.idle()
+    assert.equal(f.service.observations.get(ids[0]).ticker.value.last, '200')
+    previous = structuredClone(config)
+    config.liquidity.depth.enabled = true
+    await f.service.reconfigure(previous); await f.idle()
+    for (const instId of ids) assert.ok(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL).includes(`books:${instId}`))
+    for (const [key, value] of stable) assert.equal(f.service.publicRealtime.subscriptions.get(key), value)
+    const controls = socket.sent.slice(initialCommands).map(value => JSON.parse(value))
+    assert.equal(controls.filter(command => command.op === 'unsubscribe').length, 1)
+    assert.equal(controls.filter(command => command.op === 'subscribe').length, 1)
+    assert.ok(controls.every(command => command.args.every((arg: Subscription) => arg.channel === 'books')))
+    f.push(OKX_PUBLIC_WEBSOCKET_URL, ids[0], 'books', [deepBook(200, '1000', 100)], 'snapshot')
+    await f.idle()
+    assert.equal(f.service.observations.get(ids[0]).book.value.seqId, 100)
+    assert.deepEqual(paths, ['/api/v5/public/instruments'])
+    assert.equal(f.sockets.get(OKX_PUBLIC_WEBSOCKET_URL)?.length, 1)
   } finally { await f.close() }
 })
 

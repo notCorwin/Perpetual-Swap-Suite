@@ -6,8 +6,18 @@ export type PublicMarketChannel = 'tickers' | 'open-interest' | 'books' | 'trade
 export type PublicMarketRawRecord = Record<string, string | number>
 export type PublicInstrumentRecord = Record<string, unknown>
 export type PublicMarketSubscription = { instId: string; channel: PublicMarketChannel } | { channel: 'instruments'; instType: 'SWAP' }
+export type PublicMarketChannelDemand = {
+  /** Defaults to true. Disable when neither depth nor slippage needs books. */
+  books?: boolean
+}
 export type PublicMarketBook = { bids: (readonly string[])[]; asks: (readonly string[])[]; ts: string; seqId: number }
-export type PublicMarketEventContext = { signal: AbortSignal; receivedAt: number; /** Subscription proof captured before callback queuing. */ acknowledged?: boolean }
+export type PublicMarketEventContext = {
+  /** Socket lifetime, or the individual subscription lifetime for books. */
+  signal: AbortSignal
+  receivedAt: number
+  /** Subscription proof captured before callback queuing. */
+  acknowledged?: boolean
+}
 export type RealtimePublicMarketTelemetry = {
   receivedEvents: number
   tickerEvents: number
@@ -33,7 +43,7 @@ export type RealtimePublicMarketOptions = {
   onBook: (instId: string, book: PublicMarketBook, context: PublicMarketEventContext) => void | Promise<void>
   onTrades: (instId: string, raw: PublicMarketRawRecord[], context: PublicMarketEventContext) => void | Promise<void>
   onSubscribed?: (instId: string, channel: PublicMarketChannel, context: PublicMarketEventContext) => void | Promise<void>
-  /** Synchronous notification when the desired subscription generation is removed. */
+  /** Synchronous invalidation on removal or book recovery; that book's signal is then aborted. */
   onUnsubscribed?: (instId: string, channel: PublicMarketChannel, context: PublicMarketEventContext) => void | Promise<void>
   /** Called only for the contracts on the retired socket; its signal is aborted. */
   onDisconnect?: (instIds: string[], context: { signal: AbortSignal }) => void | Promise<void>
@@ -47,7 +57,9 @@ export type RealtimePublicMarketOptions = {
   setTimeout?: (callback: () => void, delay: number) => unknown
   clearTimeout?: (handle: unknown) => void
   random?: () => number
+  /** Initial transport reconnect and single-book recovery delay (default 1s). */
   reconnectBaseMs?: number
+  /** Maximum retry delay and healthy-book backoff reset interval (default 30s). */
   reconnectMaxMs?: number
   reconnectJitter?: number
   heartbeatIntervalMs?: number
@@ -60,8 +72,8 @@ export class RealtimePublicMarket {
   constructor(options: RealtimePublicMarketOptions)
   readonly instruments: Set<string>
   readonly subscriptions: Map<string, PublicMarketSubscription>
-  /** Subscribes every instrument to tickers, open-interest, books, and trades. */
-  setSubscriptions(instIds: string[]): void
+  /** Always retains tickers, open-interest, and trades; books follow demand. */
+  setSubscriptions(instIds: string[], demand?: PublicMarketChannelDemand): void
   start(): void
   getState(): RealtimeMarketState
   getTelemetry(): RealtimePublicMarketTelemetry

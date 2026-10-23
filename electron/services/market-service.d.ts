@@ -20,7 +20,7 @@ export class MarketService {
   subscribeHistoryDownload(listener: (report: HistoryDownload) => void | Promise<void>): () => void
   invalidate(): void
   restoreCatalog(): Promise<boolean>
-  refresh(): Promise<void>
+  refresh(options?: { reuse?: boolean }): Promise<void>
   /** Pure projection of current facts; an inactive timeframe does not admit work. */
   listRowsFor(timeframe: '5m' | '15m' | '1H', now?: number): RankedMarketRow[]
   prepareChartWindow(instId: string, timeframe: '5m' | '15m' | '1H', end?: number, historyBars?: number): Promise<PreparedChartWindow>

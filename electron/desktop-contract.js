@@ -65,9 +65,14 @@ function optional(target, source, key, parse) {
 }
 
 function chart(value, path, window = false) {
-  record(value, path, window ? ['instId', 'timeframe', 'endHour', ...(path === 'chartWindow' ? ['historyBars'] : [])] : ['instId', 'timeframe'], ['instId', 'timeframe'])
+  const fields = ['instId', 'timeframe']
+  if (window) fields.push('endHour')
+  if (path === 'chartWindow') fields.push('historyBars')
+  if (path !== 'chartFocus.target') fields.push('focusId')
+  record(value, path, fields, ['instId', 'timeframe'])
   const result = { instId: text(value.instId, `${path}.instId`, { maximum: 256 }), timeframe: choice(value.timeframe, `${path}.timeframe`, TIMEFRAMES) }
   optional(result, value, 'historyBars', input => number(input, `${path}.historyBars`, 96, 4_096, true))
+  optional(result, value, 'focusId', input => text(input, `${path}.focusId`, { maximum: 256 }))
   return optional(result, value, 'endHour', input => number(input, `${path}.endHour`, 0, Number.MAX_SAFE_INTEGER, true))
 }
 
@@ -187,7 +192,7 @@ function candle(value, index) {
 
 /** Validate the complete request before dispatching any operation or side effect. */
 export function parseDesktopRequest(value, { allowE2E = false } = {}) {
-  const operations = ['snapshot', 'preferences', 'dataAudit', 'historyDownload', 'chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse', 'captureChart', 'copyText', 'analysisSettings', 'gatewayFetch', 'cancelGatewayFetch', 'e2e']
+  const operations = ['snapshot', 'preferences', 'dataAudit', 'historyDownload', 'chartFocus', 'chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse', 'captureChart', 'copyText', 'analysisSettings', 'gatewayFetch', 'cancelGatewayFetch', 'e2e']
   record(value, 'request', operations)
   const keys = Object.keys(value)
   if (keys.length !== 1) invalid('request', 'must contain exactly one operation')
@@ -205,6 +210,10 @@ export function parseDesktopRequest(value, { allowE2E = false } = {}) {
       return { historyDownload: { action: choice(input.action, 'historyDownload.action', ['start', 'cancel', 'status']) } }
     }
     case 'chartWindow': return { chartWindow: chart(input, operation, true) }
+    case 'chartFocus': {
+      record(input, operation, ['id', 'target'], ['id', 'target'])
+      return { chartFocus: { id: text(input.id, 'chartFocus.id', { maximum: 256 }), target: input.target === null ? null : chart(input.target, 'chartFocus.target', true) } }
+    }
     case 'chartLocal': return { chartLocal: chart(input, operation) }
     case 'chartHistory': return { chartHistory: chart(input, operation, true) }
     case 'chartUniverse': {

@@ -7,10 +7,10 @@ export type PreparedPriceSourceResult = { rows?: CandleRecord[]; floor?: number 
 export type PreparedLatestSourceResult = PreparedPriceSourceResult
 /** All source methods resolve after their confirmed records have been durably committed. */
 export type PreparedChartHistory = {
-  ensurePrices(instId: string, timeframe: HistoryTimeframe, from: number, through: number, priority: HistoryPriority): Promise<PreparedPriceSourceResult | void>
-  ensureStatistics(instId: string, timeframe: HistoryTimeframe, from: number, through: number, priority: HistoryPriority): Promise<{ rows?: CandleRecord[] } | void>
+  ensurePrices(instId: string, timeframe: HistoryTimeframe, from: number, through: number, priority: HistoryPriority, signal?: AbortSignal): Promise<PreparedPriceSourceResult | void>
+  ensureStatistics(instId: string, timeframe: HistoryTimeframe, from: number, through: number, priority: HistoryPriority, signal?: AbortSignal): Promise<{ rows?: CandleRecord[] } | void>
   /** Owns guarded publication of its forming source observation. */
-  latest(instId: string, timeframe: HistoryTimeframe, priority: HistoryPriority): Promise<PreparedLatestSourceResult | void>
+  latest(instId: string, timeframe: HistoryTimeframe, priority: HistoryPriority, signal?: AbortSignal): Promise<PreparedLatestSourceResult | void>
 }
 export class PreparedChartPipeline {
   constructor(options: {
@@ -22,10 +22,12 @@ export class PreparedChartPipeline {
     /** Acknowledged current candle subscription; persisted coverage is checked separately. */
     streaming?(instId: string, timeframe: HistoryTimeframe): boolean
   })
-  prepare(instId: string, timeframe: HistoryTimeframe, targetEnd?: number, historyBars?: number): Promise<PreparedChartResponse>
-  local(instId: string, timeframe: HistoryTimeframe, options?: { priority?: HistoryPriority }): Promise<PreparedChartResponse | null>
+  /** Replace source ownership, including when navigation is entirely resident; null releases chart demand. */
+  setFocus(target: { instId: string; timeframe: HistoryTimeframe; endHour?: number } | null, id?: string): void
+  prepare(instId: string, timeframe: HistoryTimeframe, targetEnd?: number, historyBars?: number, options?: { focusId?: string }): Promise<PreparedChartResponse>
+  local(instId: string, timeframe: HistoryTimeframe, options?: { priority?: HistoryPriority; focusId?: string }): Promise<PreparedChartResponse | null>
   /** Bounded local price projection. Missing sources and exact indicators repair independently. */
-  localHistory(instId: string, timeframe: HistoryTimeframe, targetEnd?: number): Promise<PreparedChartResponse | null>
+  localHistory(instId: string, timeframe: HistoryTimeframe, targetEnd?: number, options?: { focusId?: string }): Promise<PreparedChartResponse | null>
   projectSeries(instId: string, timeframe: HistoryTimeframe): Promise<{ end: number | null; bars: Bar[] }>
   /** Bounded canonical tail plus the untruncated BOLL expansion run for list metrics. */
   projectListSeries(instId: string, timeframe: HistoryTimeframe): Promise<{ end: number | null; bars: Bar[]; bollExpansion: { hours: number; complete: boolean } | null }>

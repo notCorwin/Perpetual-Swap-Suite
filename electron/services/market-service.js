@@ -14,6 +14,7 @@ import { RealtimePublicMarket } from './realtime-public-market.js'
 import { LiveStatistics } from './live-statistics.js'
 import { StreamLiquidityEvaluator } from './stream-liquidity.js'
 import { MarketOpenInterest } from './market-open-interest.js'
+import { MarketBook } from './market-book.js'
 import { statisticsMask, statisticsVersionFor, validTakerVolumes, STATISTICS_OI, STATISTICS_TAKER } from './statistics-state.js'
 
 const OKX_ORIGIN = 'https://www.okx.com/api/v5'
@@ -206,6 +207,8 @@ export class MarketService {
     this.handledSourceErrors = new WeakSet()
     this.errorOwner = null
     this.openInterest = new MarketOpenInterest((...args) => this.get(...args))
+    this.books = new MarketBook((...args) => this.get(...args))
+    this.bookGenerations = new Map()
     this.qualificationQueue = new Set()
     this.qualificationImmediate = null
     this.marketDeadlineTimer = null
@@ -217,6 +220,8 @@ export class MarketService {
     this.instruments = new Map()
     this.instrumentDefinitions = new Map()
     this.instrumentSnapshotReady = false
+    this.instrumentSnapshotObservedAt = 0
+    this.instrumentSubscriptionWaiters = new Set()
     this.instrumentDeltas = new Map()
     this.instrumentEventVersion = 0
     this.instrumentStream = null
@@ -385,12 +390,14 @@ export class MarketService {
       },
       onUnsubscribed: (instId, channel, context) => {
         if (channel === 'tickers') this.tickerDisconnected([instId], context)
+        if (channel === 'books') this.bookUnsubscribed(instId)
       },
       onState: state => {
         if (this.publicRealtimeStatus !== state.status) { this.publicRealtimeStatus = state.status; this.touchList() }
       },
       onDisconnect: (ids, context) => {
         this.tickerDisconnected(ids, context)
+        for (const instId of ids) this.bookUnsubscribed(instId)
         this.liveStatistics.disconnect(ids, Date.now())
         for (const instId of ids) this.scheduleLiveStatistics(instId)
       },
@@ -1113,6 +1120,7 @@ export class MarketService {
     if (key === 'openInterest' && (number(value.oiUsd) === null || number(value.oiUsd) < 0)) return
     observations[key] = { value, source: 'websocket', sourceTimestamp, observedAt: receivedAt, expiresAt: receivedAt + OBSERVATION_TTL }
     this.observations.set(instId, observations)
+    if (key === 'book') this.books.invalidate(instId)
     this.cancelRequiredRecovery(`${instId}:${key}`)
     if (key === 'ticker') {
       const session = this.tickerSubscriptions.get(instId)
@@ -1323,9 +1331,11 @@ export class MarketService {
         if (this.streamEvaluations.has(instId)) continue
         this.streamLiquidity ??= new StreamLiquidityEvaluator()
         const capturedSources = Object.entries(LIQUIDITY_SOURCE_CRITERIA).filter(([, criteria]) => criteria.some(key => config[key].enabled)).map(([source]) => source)
+        const bookGeneration = this.bookGenerations.get(instId) ?? 0
         const task = this.streamLiquidity.evaluate(input).then(result => {
           if (this.closing || !this.currentCandidate(instrument, configKey, this.shutdownController.signal)
             || this.instrumentObservations.get(instId) !== instrumentObservation) return
+          if (capturedSources.includes('book') && (this.bookGenerations.get(instId) ?? 0) !== bookGeneration) return
           const current = this.observations.get(instId) ?? {}, now = Date.now()
           if (config.volume24h.enabled && current.turnover !== observations.turnover
             || config.volumeStability.enabled && current.hourly !== observations.hourly) return
@@ -1418,7 +1428,8 @@ export class MarketService {
     for (const instId of ids) for (const timeframe of LIST_TIMEFRAMES) subscriptions.set(`${instId}:${timeframe}`, { instId, timeframe })
     this.preparedCharts.setRealtimeSubscriptions([...subscriptions.values()])
     this.realtime.setSubscriptions([...subscriptions.values()])
-    this.publicRealtime?.setSubscriptions([...ids])
+    const { depth, slippage } = this.prefs().liquidity
+    this.publicRealtime?.setSubscriptions([...ids], { books: depth.enabled || slippage.enabled })
     if (!this.closing) this.preparedCharts.sourceStateChanged()
   }
 
@@ -1622,7 +1633,8 @@ export class MarketService {
         : source === 'openInterest' ? config.openInterest.enabled : source === 'turnover' ? config.volume24h.enabled : config.volumeStability.enabled
       const key = `${instId}:${source}`
       if (!enabled || this.observation(observations, source)) { this.cancelRequiredRecovery(key); continue }
-      if (!this.sourceRecoveries.has(key)) this.sourceRecoveries.set(key, { key, instId, source, attempts: 0, retryAt: Date.now(), task: null, controller: new AbortController() })
+      if (!this.sourceRecoveries.has(key)) this.sourceRecoveries.set(key, { key, instId, source, attempts: 0,
+        retryAt: Math.max(Date.now(), source === 'openInterest' ? this.openInterest.retryAt : 0), task: null, controller: new AbortController() })
     }
     this.scheduleMarketDeadline()
   }
@@ -1664,12 +1676,7 @@ export class MarketService {
           return
         }
         const observation = recovery.source === 'book'
-          ? await this.get('/market/books', { instId: recovery.instId, sz: 400 }, signal, 'continuity').then(values => {
-            const value = values[0]
-            if (!value?.bids?.length || !value?.asks?.length) throw new Error('Missing order-book observation.')
-            const observedAt = Date.now()
-            return { value, source: 'rest', sourceTimestamp: number(value.ts), observedAt, expiresAt: observedAt + OBSERVATION_TTL }
-          })
+          ? await this.bookObservation(recovery.instId, signal, 'continuity')
           : (await this.openInterest.observe(signal, 'continuity')).get(recovery.instId)
         if (!observation) throw new Error(`Missing ${recovery.source} observation for ${recovery.instId}.`)
         if (this.closing || signal.aborted || this.sourceRecoveries.get(recovery.key) !== recovery) return
@@ -1685,13 +1692,60 @@ export class MarketService {
         this.queueStreamQualification(recovery.instId)
       } catch (error) {
         if (!signal.aborted && this.sourceRecoveries.get(recovery.key) === recovery) {
-          recovery.retryAt = Date.now() + Math.min(30_000, 1_000 * 2 ** Math.min(5, recovery.attempts++))
+          recovery.retryAt = Math.max(Date.now() + Math.min(30_000, 1_000 * 2 ** Math.min(5, recovery.attempts++)),
+            recovery.source === 'openInterest' ? this.openInterest.retryAt : 0)
           this.sourceError(recovery.key, error)
         }
       }
     })().finally(() => { recovery.task = null; this.scheduleMarketDeadline() })
     recovery.task = task
     return task
+  }
+
+  async bookObservation(instId, signal, priority) {
+    try {
+      const observation = await this.books.observe(instId, signal, priority, this.observation(this.observations.get(instId) ?? {}, 'book'))
+      return { ...observation, source: observation.source ?? 'rest', sourceTimestamp: number(observation.value.ts) }
+    } catch (error) {
+      signal.throwIfAborted()
+      // A native snapshot can retire an obsolete REST acquisition while its
+      // consumers still need the now-current book.
+      const current = this.observation(this.observations.get(instId) ?? {}, 'book')
+      if (current) return current
+      throw error
+    }
+  }
+
+  bookUnsubscribed(instId) {
+    this.bookGenerations.set(instId, (this.bookGenerations.get(instId) ?? 0) + 1)
+    this.books.invalidate(instId)
+    const observations = this.observations.get(instId)
+    if (observations) delete observations.book
+    const { depth, slippage } = this.prefs().liquidity
+    if (this.closing || !depth.enabled && !slippage.enabled) return
+    const now = Date.now(), record = this.catalogChecks.get(instId)
+    if (record) {
+      record.status = 'unknown'; record.expiresAt = now
+      record.result = { ...record.result, eligible: false }
+      record.observations = { ...observations }
+    }
+    const published = this.catalog.get(instId)
+    if (published) published.expiresAt = now
+    // Unsubscribe callbacks run inside the transport's membership update.
+    // Requalification must not re-enter subscription reconciliation.
+    this.queueStreamQualification(instId, 'book')
+    this.touchList()
+    this.scheduleMarketDeadline()
+  }
+
+  acceptObservation(instId, key, observation) {
+    const observations = this.observations.get(instId) ?? {}, previous = observations[key]
+    const timestamp = number(observation.sourceTimestamp ?? observation.value?.ts)
+    const previousTimestamp = number(previous?.sourceTimestamp ?? previous?.value?.ts)
+    if (timestamp !== null && previousTimestamp !== null && timestamp < previousTimestamp) throw new Error(`${key} returned an older observation for ${instId}.`)
+    if (!previous || previous.observedAt < observation.observedAt || timestamp !== null && previousTimestamp !== null && timestamp > previousTimestamp) observations[key] = { ...observation, sourceTimestamp: timestamp }
+    this.observations.set(instId, observations)
+    return observations[key]
   }
 
   liquidityInput(instrument, config, observations, now = Date.now()) {
@@ -1887,18 +1941,6 @@ export class MarketService {
     if (early.status === 'failed') {
       return this.publishCandidate(instrument, config, configKey, signal, observations, errors)
     }
-    const observe = async (key, operation) => {
-      const requestedAt = Date.now()
-      try {
-        const value = await operation()
-        if (!this.currentCandidate(instrument, configKey, signal)) return
-        const now = Date.now()
-        if (!(observations[key]?.source === 'websocket' && observations[key].observedAt >= requestedAt)) observations[key] = { value, observedAt: now, expiresAt: now + OBSERVATION_TTL }
-      } catch (error) {
-        // Preserve a still-valid observation, never extend it on failure.
-        errors[key] = error instanceof Error ? error.message : String(error)
-      }
-    }
     const observeHistory = async key => {
       try { await this.observeHistoricalSource(instId, key, observations, signal, !localOnly, () => this.currentCandidate(instrument, configKey, signal)) }
       catch (error) { errors[key] = error instanceof Error ? error.message : String(error) }
@@ -1921,17 +1963,18 @@ export class MarketService {
       if (!value) throw new Error(`Missing ticker observation for ${instId}.`)
       if (this.currentCandidate(instrument, configKey, signal)) observations.ticker = value
     }).catch(error => { errors.ticker = error instanceof Error ? error.message : String(error) }))
-    if (!localOnly && historicalResult.status !== 'failed' && (config.depth.enabled || config.slippage.enabled) && this.observation(observations, 'book')?.source !== 'websocket') live.push(observe('book', async () => {
-      const value = (await this.get('/market/books', { instId, sz: 400 }, signal, priority))[0]
-      if (!value || !Array.isArray(value.bids) || !value.bids.length || !Array.isArray(value.asks) || !value.asks.length) throw new Error('Missing order-book observation.')
-      return value
-    }))
-    if (!localOnly && historicalResult.status !== 'failed' && config.openInterest.enabled && this.observation(observations, 'openInterest')?.source !== 'websocket') live.push((async () => {
+    if (!localOnly && historicalResult.status !== 'failed' && (config.depth.enabled || config.slippage.enabled) && !this.observation(observations, 'book')) live.push((async () => {
+      try {
+        const observation = await this.bookObservation(instId, signal, priority)
+        if (this.currentCandidate(instrument, configKey, signal)) this.acceptObservation(instId, 'book', observation)
+      } catch (error) { errors.book = error instanceof Error ? error.message : String(error) }
+    })())
+    if (!localOnly && historicalResult.status !== 'failed' && config.openInterest.enabled && !this.observation(observations, 'openInterest')) live.push((async () => {
       try {
         // One explicit source snapshot is shared by the whole refresh round.
         // A candidate delayed by history renews it if its lease has elapsed.
         if (!sources.openInterest) {
-          const task = this.openInterest.observe(signal, priority, true).catch(error => {
+          const task = this.openInterest.observe(signal, priority).catch(error => {
             if (sources.openInterest === task) sources.openInterest = null
             throw error
           })
@@ -1941,7 +1984,7 @@ export class MarketService {
         if (values.values().next().value?.expiresAt <= Date.now()) values = await this.openInterest.observe(signal, priority)
         const observation = values.get(instId)
         if (!observation) throw new Error(`Missing open-interest observation for ${instId}.`)
-        if (this.currentCandidate(instrument, configKey, signal) && this.observation(observations, 'openInterest')?.source !== 'websocket') observations.openInterest = observation
+        if (this.currentCandidate(instrument, configKey, signal)) this.acceptObservation(instId, 'openInterest', observation)
       } catch (error) { errors.openInterest = error instanceof Error ? error.message : String(error) }
     })())
     await Promise.all(live)
@@ -1994,6 +2037,37 @@ export class MarketService {
       && (!current || JSON.stringify(current) === JSON.stringify(instrument))
   }
 
+  waitForInstrumentSubscription(signal) {
+    if (this.instrumentStream || !this.publicRealtime.started || !this.publicRealtime.subscriptions.has('instruments:SWAP')) return Promise.resolve()
+    signal.throwIfAborted()
+    return new Promise((resolve, reject) => {
+      const finish = () => { cleanup(); resolve() }
+      const abort = () => { cleanup(); reject(signal.reason) }
+      const cleanup = () => {
+        clearTimeout(timer)
+        this.instrumentSubscriptionWaiters.delete(finish)
+        signal.removeEventListener('abort', abort)
+      }
+      const timer = setTimeout(finish, TICKER_BOOTSTRAP_MS)
+      this.instrumentSubscriptionWaiters.add(finish)
+      signal.addEventListener('abort', abort, { once: true })
+    })
+  }
+
+  async catalogInstruments(configKey, signal, reuse) {
+    // Normal startup obtains its baseline after the subscription ack. REST
+    // remains available when the control stream cannot establish itself.
+    if (!this.instrumentSnapshotReady) await this.waitForInstrumentSubscription(signal)
+    const stream = this.instrumentStream
+    if (stream && !stream.signal.aborted) {
+      await abortable(stream.task, signal)
+      if (this.instrumentStream === stream && stream.synchronized && !stream.signal.aborted) return [...this.candidateIDs].map(id => this.instruments.get(id))
+      throw new Error('The instruments stream has not synchronized its authoritative snapshot.')
+    }
+    if (reuse && this.instrumentSnapshotReady && Date.now() - this.instrumentSnapshotObservedAt < OBSERVATION_TTL) return [...this.candidateIDs].map(id => this.instruments.get(id))
+    return this.discoverInstruments(configKey, signal, 'foreground')
+  }
+
   async discoverInstruments(configKey, signal, priority) {
     try {
       if (!this.instrumentTask || this.instrumentTask.signal.aborted) {
@@ -2013,6 +2087,7 @@ export class MarketService {
       }
       if (![...definitions.values()].some(eligibleInstrument)) throw new Error('No supported swap instrument metadata could be verified. Retrying automatically.')
       this.instrumentSnapshotReady = true
+      this.instrumentSnapshotObservedAt = Date.now()
       const candidates = this.installInstruments(definitions)
       this.sourceError('instruments', null)
       return candidates
@@ -2041,6 +2116,7 @@ export class MarketService {
       this.cancelTickerRecovery(instId)
       this.clearTickerFault(instId)
       this.observations.delete(instId)
+      this.books.invalidate(instId)
       this.instrumentObservations.delete(instId)
       this.tickerCache?.values.delete(instId)
     }
@@ -2053,6 +2129,7 @@ export class MarketService {
       if (previous && JSON.stringify(previous) !== JSON.stringify(instrument)) {
         const observations = this.observations.get(instrument.instId)
         if (observations) delete observations.book
+        this.books.invalidate(instrument.instId)
       }
       this.instruments.set(instrument.instId, instrument)
       if (!observedIDs || observedIDs.has(instrument.instId)) this.instrumentObservations.set(instrument.instId, { observedAt: Date.now(), expiresAt: Date.now() + OBSERVATION_TTL })
@@ -2091,7 +2168,7 @@ export class MarketService {
     if (this.closing || context.signal.aborted) return
     if (this.instrumentRetryTimer) clearTimeout(this.instrumentRetryTimer)
     this.instrumentRetryTimer = null
-    const stream = { signal: context.signal, synchronized: false, delay: 1_000 }
+    const stream = { signal: context.signal, synchronized: false, delay: 1_000, task: null }
     this.instrumentStream = stream
     this.instrumentDeltas.clear()
     const synchronize = async () => {
@@ -2111,15 +2188,18 @@ export class MarketService {
       } catch (error) {
         if (this.closing || stream.signal.aborted || this.instrumentStream !== stream) return
         this.sourceError('instruments', error)
-        this.instrumentRetryTimer = setTimeout(() => { this.instrumentRetryTimer = null; this.track(synchronize()) }, stream.delay)
+        this.instrumentRetryTimer = setTimeout(() => { this.instrumentRetryTimer = null; stream.task = synchronize(); this.track(stream.task) }, stream.delay)
         stream.delay = Math.min(30_000, stream.delay * 2)
         this.instrumentRetryTimer.unref?.()
       }
     }
-    return synchronize()
+    stream.task = synchronize()
+    for (const finish of this.instrumentSubscriptionWaiters) finish()
+    return stream.task
   }
 
   instrumentStreamDisconnected(context) {
+    for (const finish of this.instrumentSubscriptionWaiters) finish()
     if (this.instrumentStream?.signal !== context.signal) return
     this.instrumentStream = null
     this.instrumentDeltas.clear()
@@ -2168,7 +2248,7 @@ export class MarketService {
     return this.renewing
   }
 
-  async refresh() {
+  async refresh({ reuse = false } = {}) {
     await this.ready
     if (this.closing || this.disposed) return
     if (this.refreshing) return this.refreshing
@@ -2181,8 +2261,8 @@ export class MarketService {
       try {
         this.verifyCatalog()
         const [candidates] = await Promise.all([
-          this.discoverInstruments(configKey, controller.signal, 'foreground'),
-          this.tickerObservations(controller.signal, 'foreground', true),
+          this.catalogInstruments(configKey, controller.signal, reuse),
+          ...(!reuse ? [this.tickerObservations(controller.signal, 'foreground', true)] : []),
         ])
         if (controller.signal.aborted || this.catalogCriteriaKey() !== configKey) return
         this.verifyCatalog()
@@ -2191,7 +2271,8 @@ export class MarketService {
         candidates.sort((a, b) => Number(this.renewalTargets.has(b.instId)) - Number(this.renewalTargets.has(a.instId)))
         // A successful check publishes independently; the first row does not wait for the full exchange scan.
         const sources = {}
-        await Promise.all(candidates.map(instrument => this.checkCandidate(instrument, config, configKey, controller.signal, 'foreground', { sources })))
+        await Promise.all(candidates.filter(instrument => !reuse || this.catalogChecks.get(instrument.instId)?.status === 'unknown')
+          .map(instrument => this.checkCandidate(instrument, config, configKey, controller.signal, 'foreground', { sources })))
         if (!controller.signal.aborted && this.catalogCriteriaKey() === configKey) {
           this.lastRefreshAt = startedAt
           this.sourceError('refresh', null)
@@ -2219,11 +2300,12 @@ export class MarketService {
       for (const controller of this.catalogControllers) controller.abort()
       this.catalogChecks.clear(); this.renewalTargets.clear()
       this.verifyCatalog()
+      this.updateSubscriptions()
       this.scheduleMarketDeadline()
       this.lastRefreshAt = 0
       const configKey = JSON.stringify(current.liquidity)
       if (this.autoRefresh) this.track(Promise.allSettled([this.refreshing, this.renewing].filter(Boolean)).then(() => {
-        if (!this.closing && !this.disposed && this.catalogCriteriaKey() === configKey) return this.refresh()
+        if (!this.closing && !this.disposed && this.catalogCriteriaKey() === configKey) return this.refresh({ reuse: true })
       }))
     }
     if (previous.rankingLookback !== current.rankingLookback) {
@@ -2390,6 +2472,7 @@ export class MarketService {
   dispose() {
     if (this.disposeTask) return this.disposeTask
     this.closing = true
+    this.books.dispose()
     if (this.candleWaitImmediate) clearImmediate(this.candleWaitImmediate)
     this.candleWaitImmediate = null
     for (const wait of this.candleWaits.values()) this.finishCandleWait(wait, false, new DOMException('Market service is closed.', 'AbortError'))

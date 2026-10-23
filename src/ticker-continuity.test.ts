@@ -102,7 +102,7 @@ const fixture = async (context: TestContext, instruments = [instrument()], optio
     for (const lane of value.requestLanes.values()) { lane.interval = 0; lane.nextAt = 0 }
   }
   await service.ready; prepare(service); bootstrap.resolve()
-  await service.refresh()
+  const initialRefresh = service.refreshing
   const idle = async () => {
     await Promise.all([...services].flatMap(value => [value.publicRealtime.whenIdle(), value.realtime.whenIdle()]))
     await setImmediate(); await setImmediate()
@@ -156,6 +156,7 @@ const fixture = async (context: TestContext, instruments = [instrument()], optio
     await store.close(); context.mock.timers.reset(); await rm(root, { recursive: true, force: true })
   }
   await open()
+  await initialRefresh
   await waitFor(() => service.pendingCandidates.size === 0 && service.refreshing === null)
   return { service, store, config, sockets, requests, repairs, bulkReplies, holdBulk: () => { holdBulk = true }, socketFor, push, qualify, advance, idle, waitFor, open, reopen, close }
 }

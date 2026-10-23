@@ -28,7 +28,7 @@ const nativePrepared = (instId: string, end: number, timeframe: RadarTimeframe, 
 }
 const settled = () => new Promise<void>(resolve => setImmediate(resolve))
 // Inspecting older candles explicitly admits durable history and its reserve.
-// Returning to latest keeps that already requested work independent of focus.
+// Returning to latest keeps the admitted durable navigation cache reusable.
 const inspectHistory = async (controller: ChartController) => {
   controller.scroll(-1)
   await settled()
@@ -1149,4 +1149,65 @@ test('first acquisition still presents short listing prices and observed warmup 
     assert.equal(next.indicatorState, 'unavailable'); assert.equal(next.oiState, 'loading'); assert.equal(next.takerState, 'loading')
     assert.equal(controller.getSnapshot().pending, false, 'A proven listing floor and observed warmup nulls are a complete historical presentation.')
   } finally { close() }
+})
+
+test('cached navigation publishes focus ownership and only the current component release clears it', async () => {
+  const store = cached(1000, 5000), queue = transportQueue()
+  const focus: Array<{ target: { instId: string; timeframe: string; end: number | null } | null; id: string }> = []
+  const controller = new ChartController({ ...queue.transport, focus: (target, id) => { focus.push({ target, id }) } }, store)
+  const closeFirst = controller.open(btc, '1H')
+  await settled()
+  controller.scroll(-1500)
+  const cursor = controller.getSnapshot().requested!.end
+  const navigation = focus.at(-1)!
+  assert.equal(navigation.target?.end, cursor)
+  assert.equal(queue.calls.length, 0, 'A resident navigation still releases obsolete backend source demand.')
+  const closeSecond = controller.open(btc, '1H')
+  closeFirst()
+  assert.notEqual(focus.at(-1)!.target, null)
+  closeSecond()
+  assert.equal(focus.at(-1)!.target, null)
+  assert.equal(new Set(focus.map(value => value.id)).size, focus.length, 'Reopening the same chart has a fresh ownership token.')
+})
+
+test('local, history and preparation lanes carry their admitted focus token across later navigation', async () => {
+  const tokens: string[] = [], local: string[] = [], preparedTokens: string[] = [], historical: string[] = []
+  const queue = transportQueue(), store = cached()
+  const controller = new ChartController({ ...queue.transport,
+    focus: (_target, id) => { tokens.push(id) },
+    local: async (_id, _timeframe, focusId) => { local.push(focusId!); return null },
+    history: async (_target, focusId) => { historical.push(focusId!); return null },
+    prepare: (target, focusId) => { preparedTokens.push(focusId!); return queue.transport.prepare(target) },
+  }, store)
+  const close = controller.open(btc, '1H')
+  try {
+    await settled()
+    controller.scroll(-1000)
+    await waitFor(() => queue.calls.length > 0)
+    const navigationToken = tokens.at(-1)!
+    assert.equal(local[0], tokens[0])
+    assert.equal(historical.at(-1), navigationToken)
+    assert.equal(preparedTokens.at(-1), navigationToken)
+    controller.scroll(1000)
+    assert.notEqual(tokens.at(-1), navigationToken)
+    assert.equal(preparedTokens.at(-1), navigationToken, 'An already admitted remote request keeps its original token.')
+  } finally { close() }
+})
+
+test('reopening a hidden historical chart restores its cached cursor with fresh source ownership', async () => {
+  const store = cached(1000, 5000), queue = transportQueue(), focus: Array<number | null | undefined> = []
+  const controller = new ChartController({ ...queue.transport, focus: target => { focus.push(target?.end) } }, store)
+  const close = controller.open(btc, '1H')
+  controller.scroll(-1500)
+  const retained = controller.getSnapshot().requested!
+  close()
+  assert.equal(focus.at(-1), undefined)
+  const reopen = controller.open(retained.instId, retained.timeframe, retained.end)
+  try {
+    assert.equal(controller.getSnapshot().requested?.end, retained.end)
+    assert.equal(controller.getSnapshot().presented?.endHour, retained.end)
+    assert.equal(focus.at(-1), retained.end)
+    await settled()
+    assert.equal(queue.calls.length, 0)
+  } finally { reopen() }
 })

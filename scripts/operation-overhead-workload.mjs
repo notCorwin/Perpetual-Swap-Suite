@@ -103,6 +103,8 @@ const store = await MarketStore.open(join(directory, 'MarketData'))
 const transport = await exchange()
 const preferences = structuredClone(DEFAULT_PREFERENCES)
 for (const rule of Object.values(preferences.liquidity)) rule.enabled = false
+// This workload measures native book intake, so keep its actual consumer enabled.
+preferences.liquidity.depth.enabled = true
 let unexpectedRequests = 0
 const service = new MarketService(store, () => preferences, async () => { unexpectedRequests++; return new Response(JSON.stringify({ code: '0', data: [] })) }, false,
   { webSocketFactory: () => new WebSocket(transport.url) })
