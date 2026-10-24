@@ -7,6 +7,8 @@ export class StreamLiquidityEvaluator {
     this.worker = null
     this.pending = new Map()
     this.nextID = 0
+    this.books = new Map()
+    this.nextBookVersion = 0
     this.closed = false
     this.closeTask = null
   }
@@ -32,6 +34,7 @@ export class StreamLiquidityEvaluator {
   workerFailed(worker, error) {
     if (this.worker !== worker) return
     this.worker = null
+    this.books.clear()
     for (const request of this.pending.values()) request.reject(error)
     this.pending.clear()
     // The next observation starts a fresh worker; an old exit event cannot
@@ -48,9 +51,20 @@ export class StreamLiquidityEvaluator {
         worker = this.worker ?? this.startWorker()
         this.pending.set(id, request)
         worker.ref()
-        // postMessage captures this input synchronously. Later observations
-        // cannot change which snapshot the returned result describes.
-        request.dispatch(worker, { id, input })
+        const instId = input?.instrument?.instId
+        const book = typeof instId === 'string' && input.book && typeof input.book === 'object' ? input.book : null
+        const previous = book && this.books.get(instId)
+        const snapshot = book ? previous?.book === book ? previous : { version: ++this.nextBookVersion, book } : null
+        const evict = snapshot && !this.books.has(instId) && this.books.size >= 512 ? this.books.keys().next().value : undefined
+        // Each immutable book crosses the boundary once per worker lifetime.
+        // Later ticker/OI observations reference that exact captured version.
+        request.dispatch(worker, { id, input: book ? { ...input, book: null } : input,
+          ...(snapshot ? { bookVersion: snapshot.version, ...(snapshot !== previous ? { bookSnapshot: book } : {}) } : {}),
+          ...(evict !== undefined ? { evictBook: evict } : {}) })
+        if (snapshot) {
+          if (evict !== undefined) this.books.delete(evict)
+          this.books.delete(instId); this.books.set(instId, snapshot)
+        }
       } catch (error) {
         this.pending.delete(id)
         if (worker && !this.pending.size) worker.unref()
@@ -64,6 +78,7 @@ export class StreamLiquidityEvaluator {
     this.closed = true
     const worker = this.worker
     this.worker = null
+    this.books.clear()
     for (const request of this.pending.values()) request.reject(new Error('Streaming liquidity evaluator is closed.'))
     this.pending.clear()
     this.closeTask = worker ? stopOperationWorker(worker, 'stream-liquidity') : Promise.resolve()

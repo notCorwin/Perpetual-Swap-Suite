@@ -2,6 +2,7 @@ import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
 import { evaluateLiquidity, type LiquidityInput } from '../electron/services/liquidity.js'
 import { StreamLiquidityEvaluator } from '../electron/services/stream-liquidity.js'
+import { stopOperationWorker } from '../electron/services/operation-worker.js'
 import { DEFAULT_PREFERENCES } from '../electron/services/preferences.js'
 
 const fixture = (index = 0): LiquidityInput => {
@@ -53,6 +54,41 @@ test('a malformed uncloneable request rejects independently and later evaluation
   const input = fixture()
   await assert.rejects(worker.evaluate({ ...input, ticker: { invalid: () => {} } }))
   assert.deepEqual(await worker.evaluate(input), evaluateLiquidity(input))
+})
+
+test('ticker and OI changes reuse the resident book without cloning its content again', async t => {
+  const evaluator = new StreamLiquidityEvaluator()
+  t.after(() => evaluator.close())
+  const input = fixture()
+  await evaluator.evaluate(input)
+  const native = (evaluator as any).worker
+  const postMessage = native.postMessage
+  const sent: any[] = []
+  native.postMessage = function (message: unknown, ...args: unknown[]) {
+    sent.push(message)
+    return postMessage.call(this, message, ...args)
+  }
+  const changed = { ...input, ticker: { ...input.ticker, last: '101' }, openInterest: { oiUsd: '7000000' } }
+  assert.deepEqual(await evaluator.evaluate(changed), evaluateLiquidity(changed))
+  assert.deepEqual(await evaluator.evaluate(input), evaluateLiquidity(input))
+  assert.equal(sent.length, 2)
+  assert.ok(sent.every(message => message.input.book === null && message.bookVersion && !message.bookSnapshot))
+  assert.equal(sent[0].bookVersion, sent[1].bookVersion)
+  const newBook = { ...input, book: { ...input.book, asks: [['100', '1000000']] } }
+  assert.deepEqual(await evaluator.evaluate(newBook), evaluateLiquidity(newBook))
+  assert.equal(sent[2].bookSnapshot, newBook.book)
+  assert.notEqual(sent[2].bookVersion, sent[1].bookVersion)
+})
+
+test('a replacement worker receives the required book again after its old lifetime ends', async t => {
+  const evaluator = new StreamLiquidityEvaluator()
+  t.after(() => evaluator.close())
+  const input = fixture()
+  await evaluator.evaluate(input)
+  const previous = (evaluator as any).worker
+  await stopOperationWorker(previous, 'stream-liquidity')
+  assert.deepEqual(await evaluator.evaluate(input), evaluateLiquidity(input))
+  assert.notEqual((evaluator as any).worker, previous)
 })
 
 test('100 fresh deep-book calculations leave the main event loop responsive', async t => {

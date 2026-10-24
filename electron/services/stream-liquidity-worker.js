@@ -1,28 +1,21 @@
 import { parentPort } from 'node:worker_threads'
 import { createLiquidityEvaluator } from './liquidity.js'
 import { onOperationMessage } from './worker-operations.js'
-import { measureOperation } from './operations.js'
 
 const evaluate = createLiquidityEvaluator()
 const books = new Map()
-const MAX_BOOK_SNAPSHOTS = 512
 
-onOperationMessage(parentPort, 'stream-liquidity', ({ type, id, input }) => {
+onOperationMessage(parentPort, 'stream-liquidity', ({ type, id, input, bookVersion, bookSnapshot, evictBook }) => {
   if (type === 'closeOperations') {
     return { type: 'operationsClosed' }
   }
   try {
     const instId = input?.instrument?.instId
-    if (typeof instId === 'string' && input.book && typeof input.book === 'object') {
-      // Structured cloning changes object identity. Restore an immutable
-      // snapshot's identity so ticker/OI updates reuse its exact book fractions.
-      const signature = measureOperation({ category: 'cpu', name: 'liquidity.book.identity', resource: instId,
-        attributes: { bidLevels: input.book.bids?.length ?? 0, askLevels: input.book.asks?.length ?? 0 } }, () => JSON.stringify(input.book))
-      const previous = books.get(instId)
-      const snapshot = previous?.signature === signature ? previous : { signature, book: input.book }
-      books.delete(instId)
-      books.set(instId, snapshot)
-      if (books.size > MAX_BOOK_SNAPSHOTS) books.delete(books.keys().next().value)
+    if (evictBook !== undefined) books.delete(evictBook)
+    if (bookVersion !== undefined) {
+      if (bookSnapshot) books.set(instId, { version: bookVersion, book: bookSnapshot })
+      const snapshot = books.get(instId)
+      if (!snapshot || snapshot.version !== bookVersion) throw new Error('The requested order book version is not resident in this worker.')
       input = { ...input, book: snapshot.book }
     }
     return { id, result: evaluate(input) }
