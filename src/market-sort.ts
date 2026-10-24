@@ -1,5 +1,3 @@
-export type EMA200Signal = "Long" | "Short" | "Unsure"
-
 export function wrappedMarket(order: string[], index: number): string | undefined {
   return order.length ? order[((index % order.length) + order.length) % order.length] : undefined
 }

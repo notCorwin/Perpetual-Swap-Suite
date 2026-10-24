@@ -272,10 +272,6 @@ const commands = {
   validateCandles: rows => { if (!Array.isArray(rows)) throw new TypeError('Candles must be an array.'); rows.forEach(validateCandle); return { result: undefined } },
   append: (rows, options) => append(rows, options), appendStatistics,
   candles: query => ({ result: candleRows(query) }), statistics: query => ({ result: statisticRows(query) }),
-  candleTimestamps: query => {
-    const valid = validateQuery(query), series = identity(valid)
-    return { result: series ? all('SELECT timestamp FROM candles WHERE series_id=? AND timestamp>=? AND timestamp<=? ORDER BY timestamp', series.id, valid.from, valid.through).map(row => row.timestamp) : [] }
-  },
   missingRanges: (query, source) => ({ result: missingRanges(query, source) }),
   coverage: query => { validateQuery(query); const value = identity(query); return { result: { count: value?.candle_count ?? 0, first: value?.first_ts ?? null, last: value?.last_ts ?? null } } },
   watermark: (query, priceOnly) => { validateQuery(query); const value = identity(query); return { result: `sqlite:${value?.id ?? 0}:${priceOnly ? value?.price_revision ?? 0 : value?.revision ?? 0}` } },
@@ -295,7 +291,6 @@ const commands = {
     run('INSERT OR REPLACE INTO indicator_checkpoints(series_id,formula,timestamp,value) VALUES(?,?,?,?)', series.id, query.formulaVersion, query.timestamp, encoded)
     return { result: true }
   },
-  checkpointInvalidate: query => { validateQuery(query); const series = identity(query); if (series) run('DELETE FROM indicator_checkpoints WHERE series_id=? AND timestamp>=?', series.id, query.from); return { result: undefined } },
   migrationState: path => ({ result: get('SELECT * FROM migration_partitions WHERE path=?', path) ?? null }),
   migrationReport: () => ({ result: { complete: Boolean(get("SELECT 1 FROM migration_partitions WHERE path='__complete__'")),
     completedPartitions: get("SELECT COUNT(*) AS count FROM migration_partitions WHERE path!='__complete__' AND status='completed'").count,

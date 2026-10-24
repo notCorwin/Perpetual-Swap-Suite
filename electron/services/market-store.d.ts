@@ -59,7 +59,6 @@ export class MarketStore {
   appendCandles(candles: CandleRecord[], priority?: StorePriority): Promise<number>
   appendStatistics(page: StatisticsPage, priority?: StorePriority): Promise<number>
   statistics(query: CandleQuery & { source?: 'oi' | 'taker' }, priority?: StorePriority): Promise<StatisticsRecord[]>
-  readStatistics(query: CandleQuery & { source?: 'oi' | 'taker' }, priority?: StorePriority): Promise<StatisticsRecord[]>
   statisticsMissingRanges(query: CandleQuery & CandleRange & { source: 'oi' | 'taker' }, priority?: StorePriority): Promise<CandleRange[]>
   /** Replace the inclusive grid range, including malformed records within each covered bar. */
   replaceCandles(query: CandleQuery & CandleRange, candles: CandleRecord[], priority?: StorePriority): Promise<number>
@@ -74,10 +73,8 @@ export class MarketStore {
   priceWatermark(instrument: string, timeframe: string, priority?: StorePriority): Promise<string>
   readIndicatorCheckpoint(query: CandleQuery & { before: number; formulaVersion: string }, priority?: StorePriority): Promise<IndicatorCheckpoint | null>
   writeIndicatorCheckpoint(query: CandleQuery & IndicatorCheckpoint, priority?: StorePriority): Promise<boolean>
-  invalidateIndicatorCheckpoints(query: CandleQuery & { from: number }, priority?: StorePriority): Promise<void>
   integrityCheck(): Promise<string[]>
   migrationStatus(): Promise<{ complete: boolean; completedPartitions: number; failedPartitions: number; importedRows: number; issues: Array<{ path: string; instrument: string; timeframe: string; from: number; through: number; reason: string; detail: string }>; error: string }>
-  candleTimestamps(query: { instrument: string; timeframe: string; from?: number; through?: number }, priority?: StorePriority): Promise<number[]>
   coverage(instrument: string, timeframe: string, priority?: StorePriority): Promise<{ count: number; first: number | null; last: number | null }>
   missingCandleRanges(query: { instrument: string; timeframe?: string; from: number; through: number; intervalMS?: number }, priority?: StorePriority): Promise<Array<{ from: number; through: number }>>
   close(): Promise<void>

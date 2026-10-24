@@ -33,7 +33,7 @@ export const MarketRowsViewport = memo(function MarketRowsViewport({ ids, childr
       const target = event.target as HTMLElement
       const row = target.closest<HTMLTableRowElement>("tr[data-market-index]")
       if (row && element.contains(row)) setPinned(ids[Number(row.dataset.marketIndex)])
-      else if (!target.closest("[data-slot=popover-content], [data-slot=select-content], [role=dialog]")) setPinned(null)
+      else if (!target.closest("[data-slot=select-content], [role=dialog]")) setPinned(null)
     }
     const observer = new ResizeObserver(schedule)
     observer.observe(element)

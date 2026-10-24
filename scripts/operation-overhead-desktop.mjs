@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url'
 const root = resolve(process.env.PERPETUAL_SWAP_OVERHEAD_ROOT ?? new URL('../', import.meta.url).pathname)
 const { createRendererOperationReceiver } = await import(pathToFileURL(join(root, 'electron/services/renderer-operations.js')).href)
 const { closeOperationRecording, flushOperationRecording } = await import(pathToFileURL(join(root, 'electron/services/operation-runtime.js')).href)
-const config = JSON.parse(process.argv.at(-1)), enabled = process.env.PERPETUAL_SWAP_OVERHEAD_ENABLED === '1'
+const config = JSON.parse(process.argv.at(-1))
 await mkdir(join(config.directory, 'profile'), { recursive: true }); app.setPath('userData', join(config.directory, 'profile'))
 if (process.platform === 'darwin') app.setActivationPolicy('accessory')
 const receiver = createRendererOperationReceiver(), latency = []

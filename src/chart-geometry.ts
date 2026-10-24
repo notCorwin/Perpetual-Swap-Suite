@@ -1,4 +1,4 @@
-import { chartAxis, chartAxisForLabels, logarithmicChartAxis, type LogChartAxis } from './chart-axis.ts'
+import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicScale } from './chart-axis.ts'
 import { chartCandleWidth, chartHourX, chartLayout } from './chart-layout.ts'
 import type { Bar } from './chart-data.ts'
 import { finitePercentage, formatPercent } from './market-percent.ts'
@@ -35,11 +35,6 @@ const paddedIndicatorRange = (min: number, max: number) => {
   if (!Number.isFinite(min)) return { min: 0, max: 1 }
   const padding = (max - min || max || 1) * 0.05
   return { min: Math.max(0, min - padding), max: max + padding }
-}
-const logScale = (axis: LogChartAxis, panel: Range) => {
-  const coordinate = axis.zeroInclusive ? (value: number) => Math.log1p(value) / Math.LN10 : Math.log10
-  const min = coordinate(axis.min), span = coordinate(axis.max) - min, height = panel[1] - panel[0]
-  return (value: number) => panel[1] - (coordinate(value) - min) / span * height
 }
 
 /** One immutable viewport owns its axes, coordinates and paths. */
@@ -88,7 +83,7 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
   const layout = chartLayout(width, height, gutter), { left, right } = layout
   const x = bars.map(bar => chartHourX(bar.hour, endHour, left, right, intervalMS))
   const barWidth = chartCandleWidth(right - left)
-  const priceY = priceAxis.kind === 'linear' ? linearScale(priceAxis.min, priceAxis.max, panels.price) : logScale(priceAxis, panels.price)
+  const priceY = priceAxis.kind === 'linear' ? linearScale(priceAxis.min, priceAxis.max, panels.price) : logarithmicScale(priceAxis, panels.price)
   const rsiY = linearScale(0, 100, panels.rsi), rocY = linearScale(rocAxis.min, rocAxis.max, panels.roc)
   const rsiCrossings = chartRsiCrossings(bars, intervalMS)
   const rsiMarkers: (typeof rsiCrossings[number] & { levels: (30 | 70)[]; x: number; y: number; d: string })[] = []
@@ -101,7 +96,7 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
   }
   const atrY = linearScale(atrRange.min, atrRange.max, panels.atr)
   const bbwY = linearScale(bbwRange.min, bbwRange.max, panels.atr)
-  const oiY = oiAxis ? logScale(oiAxis, panels.oi) : () => NaN
+  const oiY = oiAxis ? logarithmicScale(oiAxis, panels.oi) : () => NaN
   const takerY = linearScale(takerAxis.min, takerAxis.max, panels.taker), rocZeroY = rocY(0)
   const line = (key: typeof lineFields[number], y: (value: number) => number) => {
     const segments: string[] = []

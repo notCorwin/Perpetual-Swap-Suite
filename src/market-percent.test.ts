@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { finitePercentage, formatPercent, percentageNumber, type PercentageValue } from "./market-percent.ts"
+import { finitePercentage, formatPercent, type PercentageValue } from "./market-percent.ts"
 
 test("percentage readings keep their native percentage units and two decimal places", () => {
   for (const [value, expected] of [
@@ -18,5 +18,4 @@ test("non-finite percentages are unavailable for display and chart coordinates",
   const readings: PercentageValue[] = [Infinity, 20, 0, -50, -Infinity, null, NaN]
   assert.deepEqual(readings.map(finitePercentage), [null, 20, 0, -50, null, null, null])
   assert.deepEqual(readings.map(value => formatPercent(value)), ["—", "+20.00%", "0.00%", "-50.00%", "—", "—", "—"])
-  assert.equal(percentageNumber(null), null)
 })

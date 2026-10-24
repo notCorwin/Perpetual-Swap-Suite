@@ -301,7 +301,7 @@ export function installElectronNetworkHooks({ app, net, session }, helpers = int
     if (suppressed()) return Reflect.apply(original, this, args)
     const operation = beginOperation(spec('electron.net.request', 'electron-http', { measurement: 'http-body-wall' }))
     const attributes = { sentBytes: 0, receivedBytes: 0 }
-    let ended = false, response, depth = 0
+    let ended = false, depth = 0
     const finish = result => { if (!ended) { ended = true; operation.end({ ...result, attributes: { ...attributes, ...result?.attributes } }) } }
     try {
       const url = requestURL(args[0]); assertSandboxURL(url)
@@ -309,7 +309,6 @@ export function installElectronNetworkHooks({ app, net, session }, helpers = int
       const request = operation.run(() => suppress(() => Reflect.apply(original, this, args)))
       integration.restoreEmitterContexts(request)
       request.once('response', incoming => {
-        response = incoming
         try { observeElectronResponse(incoming, operation, attributes, finish) } catch (error) { finish(failure(error)); request.abort(); throw error }
       })
       request.once(errorMonitor, error => finish(failure(error)))

@@ -64,7 +64,8 @@ export function logarithmicChartAxis(min: number, max: number, maxLabels: number
   return { min: axisMin, max: axisMax, ticks, decimals, zeroInclusive }
 }
 
-export function logarithmicY(value: number, axis: LogChartAxis, panel: readonly [number, number]) {
-  const min = logCoordinate(axis.min, axis.zeroInclusive), max = logCoordinate(axis.max, axis.zeroInclusive)
-  return panel[1] - (logCoordinate(value, axis.zeroInclusive) - min) / (max - min) * (panel[1] - panel[0])
+export function logarithmicScale(axis: LogChartAxis, panel: readonly [number, number]) {
+  const coordinate = axis.zeroInclusive ? (value: number) => Math.log1p(value) / Math.LN10 : Math.log10
+  const min = coordinate(axis.min), span = coordinate(axis.max) - min, height = panel[1] - panel[0]
+  return (value: number) => panel[1] - (coordinate(value) - min) / span * height
 }

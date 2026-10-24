@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicY } from "./chart-axis.ts"
+import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicScale } from "./chart-axis.ts"
 
 test("axes fit the plotted range and keep labels sparse", () => {
   const price = chartAxis(90, 94.34, 8)
@@ -27,23 +27,26 @@ test("indicator labels use an even, rounded interval within the available height
 test("price log axis gives equal space to equal price ratios and handles narrow ranges", () => {
   const axis = logarithmicChartAxis(10, 1_000, 7)
   const panel: readonly [number, number] = [0, 300]
-  assert.ok(Math.abs((logarithmicY(10, axis, panel) - logarithmicY(100, axis, panel)) - (logarithmicY(100, axis, panel) - logarithmicY(1_000, axis, panel))) < 1e-9)
+  const y = logarithmicScale(axis, panel)
+  assert.ok(Math.abs((y(10) - y(100)) - (y(100) - y(1_000))) < 1e-9)
   assert.ok(axis.ticks.length <= 7 && axis.ticks.every(tick => tick > 0))
   for (const [min, max] of [[90, 94.34], [0.0000482, 0.0000491], [42, 42]]) {
     const narrow = logarithmicChartAxis(min, max, 8)
+    const narrowY = logarithmicScale(narrow, panel)
     assert.ok(narrow.min > 0 && narrow.min < min && narrow.max > max)
     assert.ok(narrow.ticks.length >= 2 && narrow.ticks.length <= 8)
     assert.ok(narrow.ticks.every((tick, index) => index === 0 || tick > narrow.ticks[index - 1]))
-    assert.ok(narrow.ticks.every(tick => Number.isFinite(logarithmicY(tick, narrow, panel))))
+    assert.ok(narrow.ticks.every(tick => Number.isFinite(narrowY(tick))))
   }
 })
 
 test("zero-inclusive log axes retain zero for open interest", () => {
   const axis = logarithmicChartAxis(0, 1_000, 6, true)
   const panel: readonly [number, number] = [0, 150]
-  assert.equal(logarithmicY(0, axis, panel), panel[1])
-  assert.ok(Math.abs((logarithmicY(0, axis, panel) - logarithmicY(1, axis, panel)) - (logarithmicY(1, axis, panel) - logarithmicY(3, axis, panel))) < 1e-9)
-  assert.ok(logarithmicY(500, axis, panel) < logarithmicY(200, axis, panel))
+  const y = logarithmicScale(axis, panel)
+  assert.equal(y(0), panel[1])
+  assert.ok(Math.abs((y(0) - y(1)) - (y(1) - y(3))) < 1e-9)
+  assert.ok(y(500) < y(200))
   const empty = logarithmicChartAxis(0, 0, 4, true)
   assert.ok(empty.max > 0 && empty.ticks.includes(0))
   assert.ok(logarithmicChartAxis(0, 100, 5, true).ticks.length <= 5)

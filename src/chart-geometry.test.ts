@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { logarithmicY } from './chart-axis.ts'
 import type { Bar } from './chart-data.ts'
 import { createChartGeometryCache } from './chart-geometry.ts'
 
@@ -18,9 +17,13 @@ test('shared viewport coordinates preserve time gaps and logarithmic price and z
   assert.equal(priceAxis.kind, 'logarithmic')
   assert.ok(oiAxis)
   for (const value of [98, 100, 102, 104]) {
-    close(geometry.priceY(value), logarithmicY(value, priceAxis, layout.panels.price))
+    const fraction = Math.log(value / priceAxis.min) / Math.log(priceAxis.max / priceAxis.min)
+    close(geometry.priceY(value), layout.panels.price[1] - fraction * (layout.panels.price[1] - layout.panels.price[0]))
   }
-  for (const value of [0, 1, 10, 950]) close(geometry.oiY(value), logarithmicY(value, oiAxis, layout.panels.oi))
+  for (const value of [0, 1, 10, 950]) {
+    const fraction = Math.log((value + 1) / (oiAxis.min + 1)) / Math.log((oiAxis.max + 1) / (oiAxis.min + 1))
+    close(geometry.oiY(value), layout.panels.oi[1] - fraction * (layout.panels.oi[1] - layout.panels.oi[0]))
+  }
   close(geometry.oiY(0), layout.panels.oi[1])
   const first = geometry.x[0], last = geometry.x.at(-1)!
   for (let index = 0; index < bars.length; index++) close(geometry.x[index], first + (last - first) * index / 95)

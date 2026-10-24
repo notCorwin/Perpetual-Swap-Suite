@@ -2,7 +2,7 @@ import { createOperationWorker, createOperationProcess, createWorkerRequest } fr
 import { mkdir, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { CANDLE_INTERVALS, validateCandle, validateQuery } from './market-records.js'
+import { CANDLE_INTERVALS, validateQuery } from './market-records.js'
 export { CANDLE_INTERVALS, validateCandle } from './market-records.js'
 
 const keyOf = (instrument, timeframe) => `${instrument}:${timeframe}`
@@ -278,8 +278,6 @@ export class MarketStore {
   appendStatistics(input, priority = 'background') { return this.operation(() => this.writer.request('appendStatistics', [input], priority)) }
   candles(query, priority = 'background') { return this.read('candles', query, priority) }
   statistics(query, priority = 'background') { return this.read('statistics', query, priority) }
-  readStatistics(query, priority = 'background') { return this.statistics(query, priority) }
-  candleTimestamps(query, priority = 'background') { return this.read('candleTimestamps', query, priority) }
   coverage(instrument, timeframe, priority = 'background') { return this.read('coverage', { instrument, timeframe }, priority) }
   candleWatermark(instrument, timeframe, priority = 'background') { return this.read('watermark', { instrument, timeframe }, priority, false) }
   priceWatermark(instrument, timeframe, priority = 'background') { return this.read('watermark', { instrument, timeframe }, priority, true) }
@@ -294,7 +292,6 @@ export class MarketStore {
   migrationStatus() { return this.operation(async () => { await this.migrationReady; const report = await this.readers.request('migrationReport'); return { ...report, complete: this.migrationComplete || report.complete, error: this.migrationError?.message ?? this.migrationWarning ?? '' } }) }
   readIndicatorCheckpoint(query, priority = 'background') { return this.read('checkpointRead', { ...query, through: query.before }, priority) }
   writeIndicatorCheckpoint(query, priority = 'background') { return this.operation(() => this.writer.request('checkpointWrite', [query], priority)) }
-  invalidateIndicatorCheckpoints(query, priority = 'background') { return this.operation(() => this.writer.request('checkpointInvalidate', [query], priority)) }
 
   close() {
     if (this.closeTask) return this.closeTask
