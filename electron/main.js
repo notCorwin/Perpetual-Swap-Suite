@@ -266,7 +266,8 @@ app.on('before-quit', event => {
       for (const { controller } of gatewayRequests.values()) controller.abort()
       await Promise.allSettled([...gatewayRequests.values()].map(value => value.finished))
       await startupTask.catch(error => console.error('Desktop startup did not complete:', error))
-      await backend?.dispose()
+      try { await backend?.dispose() }
+      catch (error) { console.error('Market backend shutdown failed:', error) }
       await Promise.allSettled([...desktopRequests])
       if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) {
         await drainRendererOperations(window).catch(error => console.error('Renderer operation shutdown failed:', error))

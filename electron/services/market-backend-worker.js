@@ -195,9 +195,11 @@ onOperationMessage(parentPort, 'market-backend', async ({ id, method, value }) =
     else if (method === 'probe') result = await probe(value)
     else if (method === 'dispose') {
       sourceProbe?.release()
-      await service.dispose()
-      await store.close()
-      metadata.close()
+      const failures = []
+      for (const close of [() => service.dispose(), () => store.close(), () => metadata.close()]) {
+        try { await close() } catch (error) { failures.push(error) }
+      }
+      if (failures.length) throw new AggregateError(failures, `Market backend shutdown failed: ${failures.map(error => error?.message ?? String(error)).join('; ')}`)
       result = { ok: true }
     } else throw new Error('Unsupported backend operation.')
     return { id, value: result }

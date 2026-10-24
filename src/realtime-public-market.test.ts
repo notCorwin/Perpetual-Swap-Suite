@@ -104,6 +104,54 @@ function fixture(overrides: Partial<RealtimePublicMarketOptions> = {}) {
   return { market, clock, sockets, urls, tickers, oi, books, trades, errors, open }
 }
 
+test('targeted ticker recovery replaces its lifetime without disturbing healthy subscriptions', async t => {
+  const subscribed: { instId: string; channel: string; signal: AbortSignal }[] = []
+  const f = fixture({ onSubscribed: (instId, channel, context) => { subscribed.push({ instId, channel, signal: context.signal }) } })
+  t.after(() => f.market.close())
+  const socket = await f.open([btc, eth])
+  const affected = subscribed.find(value => value.instId === btc && value.channel === 'tickers')!
+  const healthy = subscribed.find(value => value.instId === eth && value.channel === 'tickers')!
+  const before = socket.commands().length
+  assert.equal(f.market.recoverSubscription(btc, 'tickers'), true)
+  assert.equal(affected.signal.aborted, true)
+  assert.equal(healthy.signal.aborted, false)
+  await f.market.whenIdle()
+  assert.deepEqual(socket.commands().slice(before).map(value => ({ op: value.op, args: value.args })), [
+    { op: 'unsubscribe', args: [{ instId: btc, channel: 'tickers' }] },
+    { op: 'subscribe', args: [{ instId: btc, channel: 'tickers' }] },
+  ])
+  assert.notEqual(subscribed.findLast(value => value.instId === btc && value.channel === 'tickers')!.signal, affected.signal)
+  push(socket, 'tickers', [{ last: '101' }], btc)
+  push(socket, 'tickers', [{ last: '202' }], eth)
+  await f.market.whenIdle()
+  assert.deepEqual(f.tickers, [`${btc}:101`, `${eth}:202`])
+  assert.equal(f.sockets.length, 1)
+})
+
+for (const failure of ['timeout', 'error'] as const) test(`a recovered ticker ${failure} keeps healthy neighbors on their existing connection`, async t => {
+  const f = fixture()
+  t.after(() => f.market.close())
+  const socket = await f.open([btc, eth])
+  socket.autoAck = false
+  f.market.recoverSubscription(btc, 'tickers')
+  const unsubscribe = socket.commands().at(-1)!
+  socket.message({ id: unsubscribe.id, event: 'unsubscribe', arg: unsubscribe.args[0] })
+  await f.market.whenIdle()
+  const subscribe = socket.commands().at(-1)!
+  assert.equal(subscribe.op, 'subscribe')
+  if (failure === 'timeout') await f.clock.advance(15_000)
+  else {
+    socket.message({ id: subscribe.id, event: 'error', arg: subscribe.args[0], code: '60012', msg: 'Subscription unavailable.' })
+    await f.market.whenIdle()
+  }
+  assert.equal(socket.readyState, 1)
+  assert.equal(f.sockets.length, 1)
+  push(socket, 'tickers', [{ last: '202' }], eth)
+  await f.market.whenIdle()
+  assert.deepEqual(f.tickers, [`${eth}:202`])
+  assert.ok(socket.commands().slice(1).every(command => command.args.every(arg => arg.instId === btc && arg.channel === 'tickers')))
+})
+
 test('all contracts subscribe to all four native channels concurrently in bounded requests', async t => {
   const f = fixture()
   t.after(() => f.market.close())

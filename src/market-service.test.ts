@@ -152,6 +152,39 @@ const localCatalog = (service: MarketService, ids = [instId]) => service.replace
   instrument: { ...instrument, instId: id }, ticker: { ...ticker, instId: id }, result: { eligible: true, status: 'verified', turnover: 40_000_000 },
 })))
 
+test('no-op and audit-only configuration changes preserve the market revision and cached rows', async () => {
+  const f = await fixture()
+  try {
+    const revision = f.service.revision
+    await f.service.reconfigure(structuredClone(f.preferences))
+    const previous = structuredClone(f.preferences)
+    f.preferences.historyDays = previous.historyDays + 1
+    await f.service.reconfigure(previous)
+    assert.equal(f.service.revision, revision)
+  } finally { await f.close() }
+})
+
+test('a realtime shutdown failure still closes history, calculations and owned metadata', async () => {
+  const f = await fixture()
+  const close = f.service.realtime.close.bind(f.service.realtime)
+  f.service.realtime.close = async () => { await close(); throw new Error('Retained uncommitted revision.') }
+  let metadataClosed = false
+  const closeMetadata = f.service.metadata.close.bind(f.service.metadata)
+  f.service.metadata.close = () => { metadataClosed = true; closeMetadata() }
+  try {
+    await assert.rejects(f.service.dispose(), /Retained uncommitted revision/)
+    assert.equal(f.service.disposed, true)
+    assert.equal(f.service.shutdownController.signal.aborted, true)
+    assert.equal(f.service.history.sync.closed, true)
+    assert.equal(f.service.preparedCharts.closed, true)
+    assert.equal(metadataClosed, true)
+  } finally {
+    await f.service.dispose().catch(() => {})
+    await f.store.close()
+    await rm(f.root, { recursive: true, force: true })
+  }
+})
+
 test('all candidate contracts retain native collection while unselected contracts avoid chart preparation', async () => {
   const f = await fixture(), other = 'ETH-USDT-SWAP', frames = ['5m', '15m', '1H']
   try {
@@ -279,7 +312,7 @@ const discovery = (extra?: (url: URL) => Response | Promise<Response | null> | n
   throw new Error(`Unexpected ${url}`)
 }
 
-test('legacy inferred unavailable observations are revalidated through bounded HTTP while genuine history is retained', async () => {
+test('missing Taker observations are fetched through bounded HTTP while genuine OI history is retained', async () => {
   const timestamp = Math.floor((Date.now() - 30 * 86_400_000) / fiveMinutes) * fiveMinutes
   const calls: URL[] = []
   const f = await fixture(disabled(), async input => {

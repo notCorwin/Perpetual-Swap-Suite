@@ -12,7 +12,7 @@ export type PublicMarketChannelDemand = {
 }
 export type PublicMarketBook = { bids: (readonly string[])[]; asks: (readonly string[])[]; ts: string; seqId: number }
 export type PublicMarketEventContext = {
-  /** Socket lifetime, or the individual subscription lifetime for books. */
+  /** Socket lifetime, or the individual subscription lifetime for books/tickers. */
   signal: AbortSignal
   receivedAt: number
   /** Subscription proof captured before callback queuing. */
@@ -76,6 +76,8 @@ export class RealtimePublicMarket {
   setSubscriptions(instIds: string[], demand?: PublicMarketChannelDemand): void
   start(): void
   getState(): RealtimeMarketState
+  /** Replace only this native subscription; respects shared control limits. */
+  recoverSubscription(instId: string, channel: PublicMarketChannel): boolean
   getTelemetry(): RealtimePublicMarketTelemetry
   whenIdle(): Promise<void>
   /** Irreversible idempotent shutdown; drains accepted callbacks and decoding. */

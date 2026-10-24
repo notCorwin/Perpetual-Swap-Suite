@@ -199,8 +199,9 @@ test('an ACK cannot grant continuity to REST, pre-ACK native, or cloned ticker o
     assert.equal(f.service.observation({ ticker: preACK }, 'ticker'), null)
     assert.equal(f.service.observation({ ticker: clone }, 'ticker'), null)
     assert.equal(f.service.observation({ ticker: rest }, 'ticker'), null)
-    assert.deepEqual((await f.service.snapshot()).rows, [])
-    assert.ok(values.every(value => f.service.catalogChecks.get(value.instId).status === 'unknown'))
+    const snapshot = await f.service.snapshot()
+    assert.deepEqual(snapshot.rows, [])
+    assert.equal(snapshot.catalogProgress.unknown, values.length)
   } finally { await f.close() }
 })
 
@@ -285,30 +286,35 @@ test('replacing a quiet ticker immediately invalidates its old assessed continui
   } finally { if (held) held.resolve(evaluateLiquidity(held.input)); await f.close() }
 })
 
-test('a malformed native ticker revokes only its own continuity and admits only its targeted REST repair', async context => {
+test('a malformed native ticker replaces only its native subscription without REST polling', async context => {
   const values = [instrument(), instrument('ETH')], f = await fixture(context, values)
   try {
     for (const value of values) await f.push('tickers', value.instId, [ticker(value.instId)])
     await f.qualify(); await f.advance(91_000)
     const affected = values[0].instId, healthy = values[1].instId
     const healthyObservation = f.service.observations.get(healthy).ticker, before = f.requests.length
+    const previousSignal = f.service.tickerSubscriptions.get(affected).signal
+    const socket = f.socketFor('tickers', affected)
     await f.push('tickers', affected, [{ last: 'invalid', bidPx: '99.99', askPx: '100', ts: String(Date.now()) }])
     assert.equal(f.service.catalog.has(affected), false)
     assert.equal(f.service.catalog.has(healthy), true)
     await f.advance(1)
-    await f.waitFor(() => f.repairs.length > 0)
-    assert.deepEqual(f.requests.slice(before).map(url => [url.pathname, url.searchParams.get('instId')]), [['/api/v5/market/ticker', affected]])
+    await f.waitFor(() => f.service.tickerSubscriptions.get(affected)?.signal !== previousSignal)
+    assert.equal(previousSignal.aborted, true)
+    assert.equal(f.socketFor('tickers', affected), socket, 'The healthy shared connection remains open.')
+    assert.deepEqual(f.requests.slice(before), [])
     assert.equal(f.service.observations.get(healthy).ticker, healthyObservation)
     assert.equal(f.service.catalogChecks.get(healthy).status, 'verified')
-    f.repairs[0].resolve([ticker(affected, 102)])
-    await f.waitFor(() => f.service.observations.get(affected).ticker.value.last === '102')
+    await f.advance(100_000)
+    assert.equal(f.repairs.length, 0, 'Continued native silence must not turn into REST polling.')
+    await f.push('tickers', affected, [ticker(affected, 102)]); await f.qualify()
     const repaired = f.service.observations.get(affected).ticker
-    assert.ok(repaired.expiresAt > Date.now() && repaired.expiresAt < Number.MAX_SAFE_INTEGER)
-    assert.equal(f.service.observationExpiry(repaired, 'ticker', affected), repaired.expiresAt, 'A successful HTTP repair is still ordinary bounded evidence.')
+    assert.equal(repaired.source, 'websocket')
+    assert.equal(f.service.observationExpiry(repaired, 'ticker', affected), Number.MAX_SAFE_INTEGER)
   } finally { await f.close() }
 })
 
-test('same-socket unsubscribe and re-add revoke the old quiet proof and cancel a held targeted repair', async context => {
+test('same-socket unsubscribe and native recovery revoke only the affected quiet proof', async context => {
   const values = [instrument(), instrument('ETH')], f = await fixture(context, values)
   try {
     for (const value of values) await f.push('tickers', value.instId, [ticker(value.instId)])
@@ -324,20 +330,21 @@ test('same-socket unsubscribe and re-add revoke the old quiet proof and cancel a
     f.service.publicRealtime.setSubscriptions(values.map(value => value.instId)); await f.idle()
     assert.equal(f.socketFor('tickers', affected), socket)
     assert.equal(f.service.catalog.has(affected), false)
+    const beforeRecovery = f.service.tickerSubscriptions.get(affected).signal
     await f.advance(10_001)
-    await f.waitFor(() => f.repairs.length === 1)
-    const repair = f.repairs[0]
-    assert.equal(repair.instId, affected)
-    assert.equal(repair.signal?.aborted, false)
+    await f.waitFor(() => f.service.tickerSubscriptions.get(affected)?.signal !== beforeRecovery)
+    assert.equal(beforeRecovery.aborted, true)
+    const replacement = f.service.tickerSubscriptions.get(affected).signal
+    assert.equal(f.repairs.length, 0)
     f.service.publicRealtime.setSubscriptions([healthy])
-    assert.equal(repair.signal?.aborted, true, 'Unsubscribing must abort a held repair owned by that subscription.')
+    assert.equal(replacement.aborted, true)
     await f.idle()
     f.service.publicRealtime.setSubscriptions(values.map(value => value.instId)); await f.idle()
-    repair.resolve([ticker(affected, 999)]); await f.idle()
     assert.equal(f.service.observations.get(affected).ticker, previous)
     assert.equal(f.service.catalog.has(affected), false)
     assert.equal(f.service.catalog.has(healthy), true)
     await f.push('tickers', affected, [ticker(affected, 102)]); await f.qualify()
+    await f.waitFor(() => f.service.catalog.has(affected))
     assert.equal(f.service.catalog.has(affected), true)
     assert.equal(f.service.observations.get(affected).ticker.value.last, '102')
   } finally { await f.close() }

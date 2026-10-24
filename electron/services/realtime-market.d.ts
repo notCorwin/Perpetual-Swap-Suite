@@ -71,12 +71,14 @@ export class RealtimeMarket<Candle extends CandleRecord = CandleRecord> {
   start(): void
   getState(): RealtimeMarketState
   getTelemetry(): RealtimeMarketTelemetry
-  getProgress(instId: string, timeframe: RadarTimeframe): { receivedThrough: number | null; confirmedThrough: number | null; committedThrough: number | null; pendingConfirmations: number }
+  getProgress(instId: string, timeframe: RadarTimeframe): { receivedThrough: number | null; confirmedThrough: number | null; committedThrough: number | null; pendingConfirmations: number; committing: boolean }
   /** Exact current connection acknowledgement; unrelated pending subscriptions do not affect it. */
   isSubscribed(instId: string, timeframe: RadarTimeframe): boolean
   getForming(instId: string, timeframe: RadarTimeframe): Candle | null
   /** Drains accepted decoding, recovery and consumer callbacks; does not close. */
   whenIdle(): Promise<void>
+  /** Resume retained failed revisions after writer recovery; no timer or backoff. */
+  retryPendingConfirmations(): void
   /** Irreversible, idempotent shutdown barrier; aborts recovery and drains writes. */
   close(): Promise<void>
 }

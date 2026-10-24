@@ -45,6 +45,7 @@ export class RealtimeMarket {
     this.telemetry = { receivedEvents: 0, formingEvents: 0, confirmedEvents: 0, ignoredEvents: 0, rejectedEvents: 0, reconnects: 0, pendingEvents: 0, lastReceivedAt: null, lastDispatchLatencyMs: null, maxDispatchLatencyMs: 0, lastCallbackLatencyMs: null, maxCallbackLatencyMs: 0 }
     this.subscriptions = new Map()
     this.series = new Map()
+    this.commitFailures = new Map()
     this.tasks = new Set()
     this.retirements = new Set()
     this.durableController = new AbortController()
@@ -70,7 +71,7 @@ export class RealtimeMarket {
     const series = this.series.get(keyFor({ instId, timeframe }))
     const timestamp = value => Number.isFinite(value) ? value : null
     return { receivedThrough: timestamp(series?.latestTimestamp), confirmedThrough: timestamp(series?.confirmedThrough),
-      committedThrough: timestamp(series?.committedThrough), pendingConfirmations: series?.pendingConfirmations.size ?? 0 }
+      committedThrough: timestamp(series?.committedThrough), pendingConfirmations: series?.pendingConfirmations.size ?? 0, committing: Boolean(series?.commitTask) }
   }
   isSubscribed(instId, timeframe) {
     const connection = this.connection, key = keyFor({ instId, timeframe })
@@ -126,6 +127,51 @@ export class RealtimeMarket {
     // microtasks. Include decoding admitted by those operations in this drain.
     await Promise.resolve()
     while (this.tasks.size) await Promise.allSettled([...this.tasks])
+  }
+
+  commitError() {
+    return this.commitFailures.values().next().value ?? ''
+  }
+
+  /** A new source observation or a recovered writer resumes retained revisions. */
+  retryPendingConfirmations() {
+    for (const series of this.series.values()) if (series.pendingConfirmations.size) {
+      series.commitDemand++
+      this.drainConfirmations(series)
+    }
+  }
+
+  drainConfirmations(series) {
+    if (series.commitTask || !series.pendingConfirmations.size) return
+    const task = Promise.resolve().then(async () => {
+      while (series.pendingConfirmations.size) {
+        const [fingerprint, entry] = series.pendingConfirmations.entries().next().value
+        const demand = series.commitDemand
+        try {
+          await this.options.onConfirmed(copy(entry.candle), entry.context)
+        } catch (error) {
+          series.failedDemand = demand
+          const detail = error instanceof Error ? error.message : String(error)
+          this.commitFailures.set(series, `Confirmed candle persistence failed. ${detail}`)
+          this.report('Confirmed candle persistence failed.', error, !this.closed)
+          // Retry only when a new recovery trigger arrived during this attempt.
+          // A persistent local failure must neither lose its revision nor spin.
+          if (series.commitDemand > demand) continue
+          break
+        }
+        series.pendingConfirmations.delete(fingerprint)
+        series.confirmations.set(fingerprint, true)
+        while (series.confirmations.size > this.confirmationCacheSize) series.confirmations.delete(series.confirmations.keys().next().value)
+        series.committedThrough = Math.max(series.committedThrough, entry.candle.timestamp)
+        this.commitFailures.delete(series)
+        this.telemetry.confirmedEvents++
+        this.setState({ updatedAt: Math.max(this.state.updatedAt ?? -Infinity, entry.context.receivedAt), error: this.commitError() || this.connection?.recoveryError || '' })
+      }
+    }).finally(() => {
+      series.commitTask = null
+      if (series.pendingConfirmations.size && (!this.commitFailures.has(series) || series.commitDemand > series.failedDemand)) this.drainConfirmations(series)
+    })
+    series.commitTask = this.track(task)
   }
 
   setState(patch) {
@@ -201,6 +247,7 @@ export class RealtimeMarket {
     connection.repaired = new Set()
     connection.recoveryAttempt = 0
     connection.recoveryError = ''
+    this.retryPendingConfirmations()
     if (connection.wasReconnect) this.recover(connection)
     this.flushSubscriptions(connection)
     this.armHeartbeat(connection)
@@ -278,7 +325,7 @@ export class RealtimeMarket {
     const live = connection.ready && !connection.pending.size && this.subscriptions.size > 0
       && [...this.subscriptions].every(([key, value]) => connection.sent.get(key) === value)
     if (live) this.attempt = 0
-    this.setState({ status: live ? 'live' : connection.wasReconnect ? 'reconnecting' : 'connecting', ...(live ? { error: connection.recoveryError } : {}) })
+    this.setState({ status: live ? 'live' : connection.wasReconnect ? 'reconnecting' : 'connecting', ...(live ? { error: this.commitError() || connection.recoveryError } : {}) })
   }
 
   armHeartbeat(connection) {
@@ -350,7 +397,7 @@ export class RealtimeMarket {
     const key = keyFor(subscription)
     let series = this.series.get(key)
     if (!series) {
-      series = { tail: Promise.resolve(), durableTail: Promise.resolve(), pending: 0, forming: null, latestTimestamp: -Infinity,
+      series = { tail: Promise.resolve(), commitTask: null, commitDemand: 0, pending: 0, forming: null, latestTimestamp: -Infinity,
         confirmedThrough: -Infinity, committedThrough: -Infinity, confirmations: new Map(), pendingConfirmations: new Map() }
       this.series.set(key, series)
     }
@@ -383,6 +430,8 @@ export class RealtimeMarket {
       return
     }
     const fingerprint = signature(raw), cumulative = volumes(raw), timestamp = candle.timestamp
+    series.commitDemand++
+    this.drainConfirmations(series)
     if (candle.confirmed) {
       if (series.confirmations.has(fingerprint) || series.pendingConfirmations.has(fingerprint)) { this.telemetry.ignoredEvents++; return }
     } else {
@@ -401,19 +450,8 @@ export class RealtimeMarket {
       // Preserve correction order without putting live delivery behind fsync.
       series.confirmedThrough = Math.max(series.confirmedThrough, timestamp)
       if (series.forming && series.forming.candle.timestamp <= timestamp) series.forming = null
-      const durable = series.durableTail.then(() => this.options.onConfirmed(copy(candle), context)).then(() => {
-        series.confirmations.set(fingerprint, true)
-        while (series.confirmations.size > this.confirmationCacheSize) series.confirmations.delete(series.confirmations.keys().next().value)
-        series.committedThrough = Math.max(series.committedThrough, timestamp)
-        this.telemetry.confirmedEvents++
-        this.setState({ updatedAt: Math.max(this.state.updatedAt ?? -Infinity, receivedAt), error: this.connection?.recoveryError ?? '' })
-      }).catch(error => {
-        // Failure never creates durable coverage; the same source revision can retry.
-        this.report('Confirmed candle persistence failed.', error, this.active(connection) ? true : 'log')
-      }).finally(() => { series.pendingConfirmations.delete(fingerprint) })
-      series.pendingConfirmations.set(fingerprint, durable)
-      series.durableTail = durable
-      this.track(durable)
+      series.pendingConfirmations.set(fingerprint, { candle: copy(candle), context })
+      this.drainConfirmations(series)
     } else {
       const forming = { candle: copy(candle), fingerprint, volumes: cumulative, published: false }
       series.forming = forming
@@ -423,7 +461,7 @@ export class RealtimeMarket {
     }
     this.telemetry.lastCallbackLatencyMs = Math.max(0, this.now() - receivedAt)
     this.telemetry.maxCallbackLatencyMs = Math.max(this.telemetry.maxCallbackLatencyMs, this.telemetry.lastCallbackLatencyMs)
-    this.setState({ updatedAt: Math.max(this.state.updatedAt ?? -Infinity, receivedAt), ...(this.state.status === 'live' ? { error: this.connection?.recoveryError ?? '' } : {}) })
+    this.setState({ updatedAt: Math.max(this.state.updatedAt ?? -Infinity, receivedAt), ...(this.state.status === 'live' ? { error: this.commitError() || this.connection?.recoveryError || '' } : {}) })
   }
 
   cleanupSeries(key, series) {
@@ -489,7 +527,11 @@ export class RealtimeMarket {
     this.closePromise = Promise.resolve().then(async () => {
       await Promise.allSettled([...this.retirements])
       await this.whenIdle()
+      this.retryPendingConfirmations()
+      await this.whenIdle()
       this.durableController.abort()
+      const pending = [...this.series.values()].reduce((total, series) => total + series.pendingConfirmations.size, 0)
+      if (pending) throw new Error(`Realtime market closed with ${pending} uncommitted candle revisions. ${this.commitError()}`)
       this.series.clear()
     })
     this.closed = true

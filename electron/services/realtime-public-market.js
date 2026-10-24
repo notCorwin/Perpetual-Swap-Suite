@@ -239,7 +239,7 @@ class PublicMarketConnection {
         for (const [key, value] of chunk) {
           const pending = { id, subscription: value, deadline: now + this.ackTimeoutMs }
           if (op === 'subscribe') {
-            const controller = value.channel === 'books' ? new AbortController() : connection.controller
+            const controller = value.channel === 'books' || value.channel === 'tickers' ? new AbortController() : connection.controller
             connection.sessions.set(key, { controller, ingress: connection.ingress })
             connection.sent.set(key, value)
             connection.pending.set(key, pending)
@@ -273,7 +273,7 @@ class PublicMarketConnection {
     const deadline = Math.min(...pending.map(value => value.deadline))
     this.timer(connection, 'ack', Math.max(1, deadline - this.now()), () => {
       const expired = pending.filter(value => value.deadline <= this.now())
-      if (expired.some(value => value.subscription.channel !== 'books' && connection.pending.get(keyFor(value.subscription)) === value)) {
+      if (expired.some(value => !['books', 'tickers'].includes(value.subscription.channel) && connection.pending.get(keyFor(value.subscription)) === value)) {
         this.lost(connection, 'Public market subscription acknowledgement timed out.')
         return
       }
@@ -281,7 +281,13 @@ class PublicMarketConnection {
         const { instId } = value.subscription, key = keyFor(value.subscription)
         if (connection.unsubscribing.get(key) === value) {
           this.deferUnsubscription(value, `Public market unsubscribe acknowledgement timed out for ${key}.`)
-        } else if (connection.pending.get(key) === value) this.recoverBook(connection, instId, `Order book subscribe acknowledgement timed out for ${instId}.`)
+        } else if (connection.pending.get(key) === value) {
+          if (value.subscription.channel === 'books') this.recoverBook(connection, instId, `Order book subscribe acknowledgement timed out for ${instId}.`)
+          else {
+            this.report(`Ticker subscribe acknowledgement timed out for ${instId}.`)
+            this.recoverSubscription(instId, 'tickers')
+          }
+        }
       }
       this.flushSubscriptions(connection)
     })
@@ -303,7 +309,15 @@ class PublicMarketConnection {
       const result = this.options.onUnsubscribed?.(subscription.instId, subscription.channel, { signal: session?.controller.signal ?? connection.controller.signal, receivedAt: this.now(), acknowledged: false })
       if (result?.then) this.track(Promise.resolve(result).catch(error => this.report('Unsubscription callback failed.', error)))
     } catch (error) { this.report('Unsubscription callback failed.', error) }
-    if (subscription.channel === 'books') session?.controller.abort()
+    if (session?.controller !== connection.controller) session?.controller.abort()
+  }
+
+  recoverSubscription(instId, channel) {
+    const connection = this.connection, subscription = this.subscriptions.get(`${channel}:${instId}`)
+    if (!connection || !this.active(connection) || !subscription || !connection.sessions.has(keyFor(subscription))) return false
+    this.invalidateSubscription(connection, subscription)
+    this.flushSubscriptions(connection)
+    return true
   }
 
   deferBookRecovery(connection, instId, message) {
@@ -379,13 +393,14 @@ class PublicMarketConnection {
         const pending = [...connection.pending.values(), ...connection.unsubscribing.values()].filter(value => value.id === message.id && value.deadline !== null
           && (errorKey === null || keyFor(value.subscription) === errorKey))
         if (!pending.length) return
-        if (pending.every(value => value.subscription.channel === 'books' || connection.unsubscribing.get(keyFor(value.subscription)) === value)) {
+        if (pending.every(value => ['books', 'tickers'].includes(value.subscription.channel) || connection.unsubscribing.get(keyFor(value.subscription)) === value)) {
           for (const value of pending) {
             const { instId } = value.subscription, key = keyFor(value.subscription)
             const detail = `OKX public market control failed for ${key} (${message.code ?? 'unknown'}): ${message.msg ?? 'No details.'}`
             if (connection.unsubscribing.get(key) === value) {
               this.deferUnsubscription(value, detail)
-            } else this.recoverBook(connection, instId, detail)
+            } else if (value.subscription.channel === 'books') this.recoverBook(connection, instId, detail)
+            else { this.report(detail); this.recoverSubscription(instId, 'tickers') }
           }
           this.flushSubscriptions(connection)
           return
@@ -716,6 +731,12 @@ export class RealtimePublicMarket {
   }
 
   getState() { return copy(this.state) }
+
+  /** Replace only the faulty native subscription, within the control budget. */
+  recoverSubscription(instId, channel) {
+    if (this.closed) return false
+    return this.shards.find(market => market.instruments.has(instId))?.recoverSubscription(instId, channel) ?? false
+  }
 
   addTelemetry(total, value) {
     for (const key of Object.keys(total)) {

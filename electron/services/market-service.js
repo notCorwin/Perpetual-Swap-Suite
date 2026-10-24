@@ -92,7 +92,7 @@ function normalizedStatistics(candle) {
   }
   // Preserve genuine observations independently. Old inferred nulls and
   // traded-period zero placeholders require a real bounded source request.
-  next.statisticsVersion = sources ? statisticsVersionFor(sources, next) : null
+  next.statisticsVersion = sources ? statisticsVersionFor(sources) : null
   for (const source of [STATISTICS_OI, STATISTICS_TAKER]) {
     const field = statisticsExpiryField(source)
     const missing = source === STATISTICS_OI ? next.oi === null : next.buy === null || next.sell === null
@@ -376,7 +376,7 @@ export class MarketService {
         const record = this.catalog.get(instId)
         if (record) this.rememberHistoricalAssessment(record)
       },
-      onForming: (row, context) => { this.track(Promise.resolve(this.setLive(row.instrument, row.timeframe, row, context))) },
+      onForming: (row, context) => this.setLive(row.instrument, row.timeframe, row, context),
       onConfirmed: async row => {
         try { await this.persistCandles(row.instrument, [row]) }
         finally { this.scheduleCandleWaitCheck() }
@@ -761,7 +761,7 @@ export class MarketService {
 
   pendingCandleCommit(instrument, timeframe, timestamp) {
     const progress = this.realtime?.getProgress(instrument, timeframe)
-    return progress?.pendingConfirmations > 0 && progress.confirmedThrough >= timestamp && (progress.committedThrough ?? -Infinity) < timestamp
+    return progress?.committing && progress.confirmedThrough >= timestamp && (progress.committedThrough ?? -Infinity) < timestamp
   }
 
   finishCandleWait(wait, persisted, error) {
@@ -1075,7 +1075,7 @@ export class MarketService {
     const confirmed = candles.filter(value => value.confirmed)
     await this.ready
     if (this.disposed || !confirmed.length) return false
-    return this.enqueueCandleMutation(instrument, async () => {
+    const result = await this.enqueueCandleMutation(instrument, async () => {
       if (this.disposed) return false
       const changed = await this.appendChangedCandlesLocked(confirmed, priority)
       if (!changed.length) return false
@@ -1087,6 +1087,10 @@ export class MarketService {
       if (projectList) this.scheduleListProjection(instrument)
       return true
     })
+    // Writer recovery also belongs to an in-flight attempt that has rejected
+    // but has not observed that rejection yet. Signal outside the mutation lock.
+    if (result) this.realtime.retryPendingConfirmations()
+    return result
   }
 
   async replaceCandles(range, candles, priority = 'foreground') {
@@ -1246,7 +1250,8 @@ export class MarketService {
 
   tickerDisconnected(ids, { signal }) {
     for (const instId of ids) {
-      if (this.tickerSubscriptions.get(instId)?.signal !== signal) continue
+      const session = this.tickerSubscriptions.get(instId)
+      if (!session || session.signal !== signal && !session.signal.aborted) continue
       this.tickerSubscriptions.delete(instId)
       this.cancelTickerRecovery(instId)
       this.capTickerAssessment(instId)
@@ -1301,6 +1306,16 @@ export class MarketService {
   async repairTicker(instId, recovery, priority = 'foreground') {
     if (recovery.task) return recovery.task
     if (this.closing || recovery.signal.aborted || !this.candidateIDs?.has(instId) || this.tickerRecoveries.get(instId) !== recovery) return
+    if (this.publicRealtime.started && this.publicRealtime.subscriptions.has(`tickers:${instId}`)) {
+      // A missing or invalid native source is repaired at its subscription.
+      // ACK deadlines and the transport control budget own recovery cadence.
+      // REST cannot certify that source or turn its failure into polling.
+      recovery.retryAt = Infinity
+      this.tickerFaults.set(instId, new Error(`Waiting for native ticker recovery for ${instId}.`))
+      this.sourceError('tickers', this.tickerFaults.get(instId))
+      this.publicRealtime.recoverSubscription(instId, 'tickers')
+      return
+    }
     const controller = new AbortController()
     recovery.controller = controller
     const signal = AbortSignal.any([recovery.signal, controller.signal, this.shutdownController.signal])
@@ -2418,7 +2433,9 @@ export class MarketService {
   async reconfigure(previousPreferences) {
     await this.ready
     const current = this.prefs(), previous = validatePreferences(previousPreferences)
-    if (JSON.stringify(previous.liquidity) !== JSON.stringify(current.liquidity)) {
+    const liquidityChanged = JSON.stringify(previous.liquidity) !== JSON.stringify(current.liquidity)
+    if (!liquidityChanged && previous.rankingLookback === current.rankingLookback && previous.chartTimeframe === current.chartTimeframe) return
+    if (liquidityChanged) {
       this.historicalAssessments = new WeakMap()
       this.historicalValidations = new WeakSet()
       this.refreshController?.abort()
@@ -2620,21 +2637,27 @@ export class MarketService {
     this.qualificationQueue.clear()
     this.disposeTask = (async () => {
       try { await this.ready } catch { if (this.ownsMetadata) this.metadata?.close(); return }
+      const failures = []
+      const settle = async operations => {
+        const results = await Promise.allSettled(operations.map(operation => Promise.resolve().then(operation)))
+        for (const result of results) if (result.status === 'rejected') failures.push(result.reason)
+      }
       // A confirmed stream event resolves only after its durable write. Drain it before aborting source work.
-      await Promise.all([this.realtime?.close(), this.publicRealtime?.close()])
-      await this.streamLiquidity?.close()
+      await settle([() => this.realtime?.close(), () => this.publicRealtime?.close()])
+      await settle([() => this.streamLiquidity?.close()])
       this.disposed = true
       this.refreshController?.abort()
       this.renewalController?.abort()
       for (const controller of this.catalogControllers) controller.abort()
       this.shutdownController.abort()
       for (const controller of this.abortControllers) controller.abort()
-      await this.historyDownload.close()
-      await this.history.close()
-      await this.preparedCharts.dispose()
+      await settle([() => this.historyDownload.close()])
+      await settle([() => this.history.close()])
+      await settle([() => this.preparedCharts.dispose()])
       await Promise.allSettled([this.refreshing, this.renewing, this.drainRequestQueues(), ...this.candidateTasks.values(), ...this.barTasks, ...this.backgroundTasks, ...this.rankingTasks.values(), ...this.candleMutations.values(), ...[...this.listProjectionTasks.values()].map(value => value.task)].filter(Boolean))
-      try { this.flushRankingPersistence() }
-      finally { if (this.ownsMetadata) this.metadata.close() }
+      await settle([() => this.flushRankingPersistence()])
+      if (this.ownsMetadata) await settle([() => this.metadata.close()])
+      if (failures.length) throw new AggregateError(failures, `Market service shutdown failed: ${failures.map(error => error?.message ?? String(error)).join('; ')}`)
     })()
     return this.disposeTask
   }
