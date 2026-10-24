@@ -20,7 +20,7 @@ export class MarketService {
   invalidate(): void
   restoreCatalog(): Promise<boolean>
   refresh(options?: { reuse?: boolean }): Promise<void>
-  /** Pure projection of the qualified canonical market list. */
+  /** Pure projection of the canonical list, including its bounded exit buffer. */
   listRowsFor(now?: number): RankedMarketRow[]
   prepareChartWindow(instId: string, timeframe: '5m' | '15m' | '1H', end?: number, historyBars?: number): Promise<PreparedChartWindow>
   getPreparedCharts(): Promise<{ frames: PreparedChartWindow[] }>

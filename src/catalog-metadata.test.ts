@@ -44,12 +44,14 @@ test('renewal uses changed contract units even when the new metadata cannot prov
     await Promise.all([...f.service.candidateTasks.values()])
     assert.equal(f.service.renewalTargets.get(instId).ctVal, '0.01')
     assert.equal(f.service.metadata.getCatalogEntry(instId).status, 'unknown')
-    assert.equal((await f.service.snapshot()).rows.length, 0)
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false)
+    assert.equal((await f.service.snapshot()).rows.length, 1, 'The prior row remains inside the exit buffer without qualifying under obsolete units.')
     await f.service.renewCatalog()
     await Promise.all([...f.service.candidateTasks.values()])
     assert.equal(f.service.metadata.getCatalogEntry(instId).instrument.ctVal, '0.01')
     assert.equal(f.service.metadata.getCatalogEntry(instId).status, 'unknown', 'An old, larger contract value must not restore qualification.')
-    assert.equal((await f.service.snapshot()).rows.length, 0)
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false)
+    assert.equal((await f.service.snapshot()).rows.length, 1)
   } finally { await f.close() }
 })
 
@@ -116,10 +118,12 @@ test('instrument discovery failure cannot renew an old qualification lease', asy
       observations: { ...previous.observations, book: { ...previous.observations.book, observedAt: now - 90_001, expiresAt: now - 1 } } }
     f.service.metadata.putCatalogEntry(expired)
     f.service.catalog.set(instId, expired)
-    assert.equal((await f.service.snapshot()).rows.length, 0)
+    assert.equal(f.service.validCatalogEntry(expired), false)
+    assert.equal((await f.service.snapshot()).rows.length, 1)
     await f.service.renewCatalog()
     const snapshot = await f.service.snapshot()
-    assert.equal(snapshot.rows.length, 0)
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false)
+    assert.equal(snapshot.rows.length, 1, 'A metadata outage leaves only the bounded exit buffer, never a renewed lease.')
     assert.match(snapshot.error, /instruments.*503/i)
     assert.deepEqual(f.service.metadata.getCatalogEntry(instId), expired, 'An expired lease must remain expired after a metadata outage.')
   } finally { await f.close() }

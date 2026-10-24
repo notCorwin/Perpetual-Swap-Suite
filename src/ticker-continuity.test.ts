@@ -175,6 +175,7 @@ test('an acknowledged quiet native ticker remains eligible beyond 90 seconds wit
     assert.deepEqual(observation, original)
     assert.equal(f.service.tickerCache.values.get(value.instId), observation)
     assert.equal(f.service.catalogChecks.get(value.instId).status, 'verified')
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(value.instId)), true, 'Acknowledged native continuity keeps the quiet ticker qualified.')
     assert.deepEqual((await f.service.snapshot()).rows.map(row => row.instId), [value.instId])
     assert.equal(f.requests.length, before, 'Native session continuity must not admit a healthy-source REST renewal.')
   } finally { await f.close() }
@@ -199,7 +200,8 @@ test('an ACK cannot grant continuity to REST, pre-ACK native, or cloned ticker o
     assert.equal(f.service.observation({ ticker: clone }, 'ticker'), null)
     assert.equal(f.service.observation({ ticker: rest }, 'ticker'), null)
     const snapshot = await f.service.snapshot()
-    assert.deepEqual(snapshot.rows, [])
+    assert.ok(values.every(value => !f.service.validCatalogEntry(f.service.catalog.get(value.instId))), 'Expired ticker leases invalidate all strict catalog entries.')
+    assert.deepEqual(snapshot.rows.map(row => row.instId).sort(), values.map(value => value.instId).sort(), 'Previously qualified rows remain published during the list-removal buffer.')
     assert.equal(snapshot.catalogProgress.unknown, values.length)
   } finally { await f.close() }
 })
@@ -219,7 +221,7 @@ test('a persisted quiet ticker loses session continuity across restart and a fre
     const restarted = await f.reopen()
     assert.deepEqual(restarted.observations.get(value.instId).ticker, raw)
     assert.equal(restarted.observation(restarted.observations.get(value.instId), 'ticker'), null)
-    assert.deepEqual((await restarted.snapshot()).rows, [])
+    assert.deepEqual((await restarted.snapshot()).rows, [], 'Runtime list-removal buffers are process-local and are not restored after restart.')
     assert.equal((await restarted.snapshot()).catalogProgress.unknown, 1)
   } finally { await f.close() }
 })
@@ -277,7 +279,7 @@ test('replacing a quiet ticker immediately invalidates its old assessed continui
     assert.equal(f.service.observation({ ticker: old }, 'ticker'), null)
     await f.advance(100)
     assert.ok(held)
-    assert.deepEqual((await f.service.snapshot()).rows, [])
+    assert.deepEqual((await f.service.snapshot()).rows.map(row => row.instId), [value.instId], 'The UI list retains the last qualified row while strict requalification is pending.')
     hold = false; held.resolve(evaluateLiquidity(held.input))
     await f.waitFor(() => f.service.streamEvaluations.size === 0)
     assert.equal(f.service.catalog.has(value.instId), true)

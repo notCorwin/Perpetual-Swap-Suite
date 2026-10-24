@@ -228,8 +228,13 @@ test('canonical list reads reuse both sort orders and expire before stale eligib
       currentTime = expiry
       const expired = await f.service.snapshot({ sinceRevision: first.revision, serviceSession: first.serviceSession })
       assert.equal('unchanged' in expired, false)
-      assert.equal('rows' in expired && expired.rows.length, 0)
+      assert.equal('rows' in expired && expired.rows.some(row => row.instId === instId), true, 'The expired listing remains in the backend buffer.')
+      assert.equal(expired.catalogProgress.verified, 0, 'The buffered row is no longer eligible.')
+      assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false)
       assert.equal(f.service.revision, first.revision, 'An observational read cannot run the due maintenance callback.')
+      currentTime = expiry + 30_000
+      assert.equal(f.service.listRowsFor().some(row => row.instId === instId), false, 'The row is removed at buffer expiry even before its callback runs.')
+      currentTime = expiry
       localCatalog(f.service)
       f.service.catalog.get(instId).expiresAt = now + 2 * fiveMinutes
       const current = await f.service.snapshot()
@@ -345,7 +350,9 @@ test('history progress does not publish market rows or create list indicator wor
   } finally { await f.close() }
 })
 
-test('qualified catalog membership alone owns chart preparation and prepared reads never admit work', async () => {
+test('backend listed membership owns chart preparation and prepared reads never admit work', async context => {
+  let now = Date.now()
+  context.mock.method(Date, 'now', () => now)
   const f = await fixture(), universes: string[][] = []
   try {
     f.service.updateRanking = async () => undefined
@@ -371,6 +378,10 @@ test('qualified catalog membership alone owns chart preparation and prepared rea
     assert.deepEqual(universes, [[instId]], 'Renderer reads and timeframe preferences cannot modify preparation.')
     localCatalog(f.service, [instId, 'ETH-USDT-SWAP'])
     localCatalog(f.service, [])
+    assert.equal(f.service.catalog.size, 0)
+    assert.deepEqual(universes, [[instId], [instId, 'ETH-USDT-SWAP']], 'Chart preparation preserves buffered membership.')
+    now += 30_000
+    f.service.processMarketDeadline()
     assert.deepEqual(universes, [[instId], [instId, 'ETH-USDT-SWAP'], []])
   } finally { await f.close() }
 })
@@ -480,7 +491,9 @@ test('missing 24-hour source data remains unknown instead of manufacturing zero 
     f.service.history.ensurePrices = async () => ({ rows: [] })
     await f.service.persistCandles(instId, [rawCandle(asOf - fiveMinutes)])
     await f.service.refresh()
-    assert.equal((await f.service.snapshot()).rows.length, 0)
+    assert.equal((await f.service.snapshot()).catalogProgress.verified, 0)
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false)
+    assert.equal((await f.service.snapshot()).rows.length, 0, 'An instrument that never qualified cannot enter the exit buffer.')
     assert.equal(f.service.metadata.getCatalogEntry(instId).status, 'unknown')
   } finally { await f.close() }
 })
@@ -500,7 +513,8 @@ test('failed and empty observations retain an existing valid lease without exten
     assert.ok(retained.expiresAt <= initial.observations.openInterest.expiresAt, 'Renewed instrument metadata cannot extend the retained open-interest source lease.')
     f.service.catalog.get(instId).expiresAt = Date.now() - 1
     f.service.touchList()
-    assert.equal((await f.service.snapshot()).rows.length, 0)
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false)
+    assert.equal((await f.service.snapshot()).rows.length, 1, 'The last verified row receives the exit buffer after its lease expires.')
   } finally { await f.close() }
 })
 
@@ -540,7 +554,8 @@ test('qualified contracts renew independently while discovery waits for another 
     previous.expiresAt = Date.now() - 1
     f.service.observations.get(instId).openInterest.expiresAt = 0
     f.service.openInterest.snapshot = null
-    assert.equal((await f.service.snapshot()).rows.length, 0, 'An expired contract is never displayed as currently qualified.')
+    assert.equal(f.service.validCatalogEntry(previous), false, 'An expired contract is never currently qualified.')
+    assert.equal((await f.service.snapshot()).rows.length, 1, 'The expired contract remains listed during its removal buffer.')
     f.service.tickerCache.observedAt = Date.now() - 90_001
     await f.service.renewCatalog()
     await waitFor(() => oiCalls === 2 && f.service.candidateTasks.size === 1)
@@ -566,14 +581,15 @@ test('expired qualification stays hidden after unavailable observations and reco
     f.service.openInterest.snapshot = null
     f.service.catalog.get(instId).expiresAt = Date.now() - 1
     f.service.touchList()
-    assert.equal((await f.service.snapshot()).rows.length, 0)
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false)
+    assert.equal((await f.service.snapshot()).rows.length, 1, 'The expired listing remains buffered while renewal is unavailable.')
     assert.equal(f.service.renewalTargets.has(instId), true)
     unavailable = true
     await f.service.renewCatalog()
     await Promise.all([...f.service.candidateTasks.values()])
     assert.equal(f.service.metadata.getCatalogEntry(instId).status, 'unknown')
     const missing = await f.service.snapshot()
-    assert.equal(missing.rows.length, 0)
+    assert.equal(missing.rows.length, 1, 'The failed observation does not erase the still-buffered listing.')
     assert.equal(missing.catalogProgress.unknown, 1)
     assert.match(missing.error, /verification is unavailable/i)
     assert.equal(f.service.metadata.getCatalogEntry(instId).status, 'unknown')
@@ -691,7 +707,7 @@ test('restored renewal targets include prior qualification without turning every
     restored = new MarketService(f.store, () => f.preferences, async () => { throw new Error('Offline') }, false)
     isolateChartPreparation(restored)
     await restored.ready
-    assert.deepEqual((await restored.snapshot()).rows, [], 'Cached expired or unknown contracts remain hidden.')
+    assert.deepEqual((await restored.snapshot()).rows, [], 'Expired startup checkpoints are not restored into the listing buffer.')
     assert.deepEqual([...restored.renewalTargets.keys()].sort(), [instId, priorID].sort())
     assert.equal(restored.renewalTargets.has(otherID), false)
   } finally { await restored?.dispose(); await f.close() }
@@ -747,7 +763,8 @@ test('SQLite catalogue restore enforces config key and expiry while historical c
     assert.equal((await restored.snapshot()).rows.length, 1)
     restored.catalog.get(instId).expiresAt = Date.now() - 1
     restored.touchList()
-    assert.equal((await restored.snapshot()).rows.length, 0)
+    assert.equal(restored.validCatalogEntry(restored.catalog.get(instId)), false)
+    assert.equal((await restored.snapshot()).rows.length, 1, 'A runtime expiry is buffered after configuration is reconfigured.')
     const chart = await restored.localChartHistory(instId, '5m', first + 299 * fiveMinutes)
     assert.equal(chart!.bars.filter(bar => bar.hour >= chart!.endHour! - 95 * fiveMinutes).length, 96)
     f.preferences.liquidity.spread.maxPercent *= 2
@@ -1519,7 +1536,8 @@ test('liquidity threshold edits immediately reuse valid observations without net
     let previous = structuredClone(configuration)
     configuration.liquidity.openInterest.minUSDT = 7_000_000
     await f.service.reconfigure(previous)
-    assert.deepEqual(f.service.listRowsFor(), [])
+    assert.deepEqual(f.service.listRowsFor().map(row => row.instId), [instId], 'The rejected threshold keeps its prior row buffered.')
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false)
     previous = structuredClone(configuration)
     configuration.liquidity.openInterest.minUSDT = 5_000_000
     await f.service.reconfigure(previous)
@@ -1527,7 +1545,8 @@ test('liquidity threshold edits immediately reuse valid observations without net
     previous = structuredClone(configuration)
     configuration.liquidity.spread.maxPercent = 0.001
     await f.service.reconfigure(previous)
-    assert.deepEqual(f.service.listRowsFor(), [])
+    assert.deepEqual(f.service.listRowsFor().map(row => row.instId), [instId], 'The spread rejection remains listed during the buffer.')
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false)
     previous = structuredClone(configuration)
     configuration.liquidity.spread.enabled = false
     await f.service.reconfigure(previous)
@@ -1590,12 +1609,14 @@ test('in-memory verification rejects expired observations without extending eith
     observations.openInterest.expiresAt = Date.now() - 1
     const expired = structuredClone(observations.openInterest)
     f.service.verifyCatalog()
-    assert.deepEqual(f.service.listRowsFor(), [])
+    assert.deepEqual(f.service.listRowsFor().map(row => row.instId), [instId], 'An expired observation invalidates eligibility while retaining the buffered row.')
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false)
     assert.equal(f.service.catalogChecks.get(instId).status, 'unknown')
     assert.deepEqual(observations.openInterest, expired, 'Verification cannot turn an expired source into a fresh observation.')
     delete observations.openInterest
     f.service.verifyCatalog()
-    assert.deepEqual(f.service.listRowsFor(), [])
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false)
+    assert.deepEqual(f.service.listRowsFor().map(row => row.instId), [instId], 'Missing source evidence leaves the former row buffered.')
     assert.equal(f.service.catalogChecks.get(instId).status, 'unknown')
   } finally { await f.close() }
 })
@@ -1663,14 +1684,16 @@ test('durable volume corrections and replacements invalidate cached qualificatio
     await f.service.refresh()
     assert.equal(f.service.catalog.get(instId).result.turnover, 57_600_000)
     await f.service.persistCandles(instId, [{ ...rawCandle(timestamp), quoteVolume: 400_000 }])
-    assert.deepEqual((await f.service.snapshot()).rows, [], 'A corrected historical fact must immediately hide the previous qualification before recomputation.')
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false, 'A correction immediately invalidates the prior qualification.')
+    assert.deepEqual((await f.service.snapshot()).rows.map(row => row.instId), [instId], 'The invalidated listing remains buffered before recomputation.')
     assert.equal(f.service.metadata.getCatalogEntry(instId).observations.turnover, undefined, 'Restart must not restore the invalidated persisted qualification fact.')
     assert.equal(f.service.catalogChecks.get(instId).status, 'unknown')
     await f.service.refresh()
     assert.equal(preparations, 0, 'A durable correction must recompute from complete local candles without history acquisition.')
     assert.equal(f.service.catalog.get(instId).result.turnover, 57_800_000)
     await f.service.replaceCandles({ instrument: instId, timeframe: '5m', from: timestamp, through: timestamp }, [{ ...rawCandle(timestamp), quoteVolume: 600_000 }])
-    assert.deepEqual((await f.service.snapshot()).rows, [], 'A replacement must immediately hide the previous qualification before recomputation.')
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false, 'A replacement immediately invalidates the prior qualification.')
+    assert.deepEqual((await f.service.snapshot()).rows.map(row => row.instId), [instId], 'The invalidated listing remains buffered before recomputation.')
     assert.equal(f.service.metadata.getCatalogEntry(instId).observations.turnover, undefined)
     await f.service.refresh()
     assert.equal(preparations, 0, 'A replacement must recompute from complete local candles without history acquisition.')
@@ -1709,19 +1732,21 @@ test('a historical correction during a live observation cannot restore the previ
     await waitFor(() => blocked)
     assert.equal(preparations, 0, 'The pending check starts with the cached completed historical window.')
     await f.service.persistCandles(instId, [{ ...rawCandle(timestamp), quoteVolume: 0 }])
-    assert.deepEqual((await f.service.snapshot()).rows, [])
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false)
+    assert.deepEqual((await f.service.snapshot()).rows.map(row => row.instId), [instId])
     release(); await refresh
     const invalidated = f.service.metadata.getCatalogEntry(instId)
     assert.equal(invalidated.status, 'failed')
     assert.equal(invalidated.result.turnover, 57_400_000, 'Qualification must use the correction committed while the bulk source was pending.')
-    assert.deepEqual((await f.service.snapshot()).rows, [])
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false)
+    assert.deepEqual((await f.service.snapshot()).rows.map(row => row.instId), [instId])
     blockOI = false
     await f.service.refresh()
     const recomputed = f.service.metadata.getCatalogEntry(instId)
     assert.equal(preparations, 0, 'The corrected complete local range must not enqueue historical acquisition.')
     assert.equal(recomputed.status, 'failed')
     assert.equal(recomputed.result.turnover, 57_400_000)
-    assert.deepEqual((await f.service.snapshot()).rows, [])
+    assert.deepEqual((await f.service.snapshot()).rows.map(row => row.instId), [instId])
   } finally { release(); await refresh; await f.close() }
 })
 

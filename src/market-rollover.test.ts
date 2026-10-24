@@ -141,11 +141,12 @@ const fixture = async (context: TestContext, { hourly = false, connected = true,
     }
     const advance = async (milliseconds: number) => { context.mock.timers.tick(milliseconds); await turn() }
     const roll = async () => { await advance(boundary - Date.now()) }
-    const rowIDs = async () => (await service.snapshot()).rows.map(row => row.instId).sort()
+    const qualifiedIDs = () => [...service.catalog.values()].filter(entry => service.validCatalogEntry(entry)).map(entry => entry.instrumentID).sort()
+    const publishedIDs = async () => (await service.snapshot()).rows.map(row => row.instId).sort()
     const historical = (id: string, key = 'turnover') => structuredClone(service.observations.get(id)?.[key])
     const live = () => ids.map(id => Object.fromEntries(['ticker', 'book', 'openInterest'].map(key => [key, structuredClone(service.observations.get(id)?.[key])])))
     return { service, store, socket, preferences, asOf, boundary, root, fetcher, isolateQualification,
-      waitFor, advance, roll, rowIDs, historical, live, priceRequests, close,
+      waitFor, advance, roll, qualifiedIDs, publishedIDs, historical, live, priceRequests, close,
       assertNoRefresh: () => assert.equal(fetches, initialFetches),
     }
   } catch (error) { await close(); throw error }
@@ -161,7 +162,7 @@ test('a live 5m rollover keeps all rows and original source provenance, then rep
     unsubscribe = f.service.subscribeMarket(() => { notifications.push(sample()) })
     await f.roll()
     await sample()
-    assert.deepEqual(await f.rowIDs(), [...ids].sort(), 'Calendar rollover alone must not empty the eligible list.')
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort(), 'Calendar rollover alone must not empty the eligible list.')
     await f.waitFor(() => f.service.candleWaits.size === ids.length, sample)
     assert.deepEqual(f.priceRequests, [], 'All instruments must concurrently await their subscribed closing candles.')
     for (const [index, id] of ids.entries()) assert.deepEqual(f.historical(id), original[index], 'Retention must not rewrite asOf, observedAt, or the original expiry.')
@@ -209,7 +210,7 @@ test('continuity binds when the native ACK arrives between historical validation
     await f.service.realtime.whenIdle()
     assert.equal(f.service.realtime.isSubscribed(ids[0], '5m'), true)
     await f.roll()
-    assert.deepEqual(await f.rowIDs(), [...ids].sort(), 'The ACK/publication ordering cannot revoke a validated continuous subscription at its first close.')
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort(), 'The ACK/publication ordering cannot revoke a validated continuous subscription at its first close.')
   } finally { await f.close() }
 })
 
@@ -230,7 +231,7 @@ test('completed native candles roll qualification windows forward without anothe
     await f.waitFor(() => ids.every(id => f.service.catalog.get(id)?.observations.turnover.value.asOf === f.boundary
       && f.service.catalog.get(id)?.observations.hourly.value.asOf === f.boundary))
     assert.equal(historicalReads, 0, 'Previously validated windows consume only newly committed native observations.')
-    assert.deepEqual(await f.rowIDs(), [...ids].sort())
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     assert.ok(ids.every(id => f.service.catalog.get(id).result.turnover === 57_800_000))
     f.assertNoRefresh()
   } finally { await f.close() }
@@ -255,10 +256,11 @@ test('a newly committed final that fails the volume threshold removes only its i
   const f = await fixture(context, { threshold: 57_500_000 })
   try {
     await f.roll()
-    assert.deepEqual(await f.rowIDs(), [...ids].sort())
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     f.socket.candle(candle(ids[0], f.asOf, 0))
     await f.waitFor(() => f.service.catalogChecks.get(ids[0])?.status === 'failed')
-    assert.deepEqual(await f.rowIDs(), ids.slice(1).sort(), 'A known failed final must not use the old passing assessment for the rest of the delivery window.')
+    assert.deepEqual(await f.qualifiedIDs(), ids.slice(1).sort(), 'A known failed final must not use the old passing assessment for the rest of the delivery window.')
+    assert.deepEqual(await f.publishedIDs(), [...ids].sort(), 'The failed contract remains in published rows during the 30-second list-removal buffer.')
     assert.equal(f.service.catalogChecks.get(ids[0]).result.turnover, 57_400_000)
     assert.equal(f.historical(ids[0]).value.asOf, f.boundary)
     assert.deepEqual(f.priceRequests, [])
@@ -280,7 +282,7 @@ test('an accepted final does not expose the next historical window before its lo
     f.socket.candle(candle(ids[1], f.asOf, 600_000))
     await f.waitFor(() => f.service.catalog.get(ids[1])?.result.turnover === 58_000_000)
     await f.advance(9_999)
-    assert.deepEqual(await f.rowIDs(), [...ids].sort())
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     assert.deepEqual(f.historical(ids[0]), original)
     assert.equal((await f.service.snapshot()).rows.find(row => row.instId === ids[0])?.turnover24hUSDT, 57_600_000)
     assert.deepEqual(await f.store.candles({ instrument: ids[0], timeframe: '5m', from: f.asOf, through: f.asOf }), [])
@@ -288,11 +290,11 @@ test('an accepted final does not expose the next historical window before its lo
     // The local commit may keep its acquisition waiter; it cannot extend the
     // renderer's permission to display the old assessment beyond ten seconds.
     await f.advance(1)
-    assert.deepEqual(await f.rowIDs(), [ids[1]], 'A pending write cannot retain stale rows; another instrument already committed its replacement independently.')
+    assert.deepEqual(await f.qualifiedIDs(), [ids[1]], 'A pending write cannot retain stale rows; another instrument already committed its replacement independently.')
     held.resolve()
     await f.service.realtime.whenIdle()
     await f.waitFor(() => f.service.catalog.get(ids[0])?.result.turnover === 57_800_000)
-    assert.deepEqual(await f.rowIDs(), ids.slice(0, 2).sort())
+    assert.deepEqual(await f.qualifiedIDs(), ids.slice(0, 2).sort())
     assert.equal(f.historical(ids[0]).value.asOf, f.boundary)
     f.assertNoRefresh()
   } finally { held.resolve(); await f.close() }
@@ -304,13 +306,16 @@ test('missing finals retain their old assessment for less than ten seconds and c
     const original = ids.map(id => f.historical(id))
     await f.roll()
     await f.advance(9_999)
-    assert.deepEqual(await f.rowIDs(), [...ids].sort())
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     assert.deepEqual(f.priceRequests, [])
     await f.advance(1)
-    assert.deepEqual(await f.rowIDs(), [], 'The calendar grace period has a fixed delivery deadline.')
+    assert.deepEqual(await f.qualifiedIDs(), [], 'The calendar grace period has a fixed delivery deadline.')
     await f.waitFor(() => f.priceRequests.length >= ids.length)
-    await f.advance(20_000)
-    assert.deepEqual(await f.rowIDs(), [])
+    await f.advance(29_999)
+    assert.deepEqual(await f.qualifiedIDs(), [])
+    assert.deepEqual(await f.publishedIDs(), [...ids].sort(), 'Published rows remain buffered after rollover retention ends and before 30 seconds elapse.')
+    await f.advance(1)
+    assert.deepEqual(await f.publishedIDs(), [], 'The exit buffer lasts exactly 30 seconds after the delivery allowance ends.')
     for (const [index, id] of ids.entries()) {
       const retained = f.historical(id)
       if (retained) assert.equal(retained.value.asOf, original[index].value.asOf, 'Retries must not relabel stale input as a newer window.')
@@ -323,13 +328,13 @@ test('disconnecting the confirmed-candle socket immediately ends rollover retent
   const f = await fixture(context)
   try {
     await f.roll()
-    assert.deepEqual(await f.rowIDs(), [...ids].sort())
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     f.socket.close()
     await turn()
-    assert.deepEqual(await f.rowIDs(), [], 'Desired subscriptions without an active acknowledged transport cannot retain old facts.')
+    assert.deepEqual(await f.qualifiedIDs(), [], 'Desired subscriptions without an active acknowledged transport cannot retain old facts.')
     assert.equal(f.service.realtime.isSubscribed(ids[0], '5m'), false)
     await f.advance(16)
-    assert.deepEqual(await f.rowIDs(), [])
+    assert.deepEqual(await f.qualifiedIDs(), [])
     f.assertNoRefresh()
   } finally { await f.close() }
 })
@@ -340,7 +345,7 @@ test('a desired but never acknowledged candle subscription does not admit rollov
     assert.ok(f.service.realtime.subscriptions.size > 0)
     assert.equal(f.service.realtime.isSubscribed(ids[0], '5m'), false)
     await f.roll()
-    assert.deepEqual(await f.rowIDs(), [])
+    assert.deepEqual(await f.qualifiedIDs(), [])
     f.assertNoRefresh()
   } finally { await f.close() }
 })
@@ -359,9 +364,10 @@ for (const source of ['ticker', 'book', 'openInterest'] as const) test(`an expir
     }
     f.service.scheduleMarketDeadline()
     await f.roll()
-    assert.deepEqual(await f.rowIDs(), [...ids].sort())
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     await f.advance(1_000)
-    assert.deepEqual(await f.rowIDs(), ids.slice(1).sort())
+    assert.deepEqual(await f.qualifiedIDs(), ids.slice(1).sort())
+    assert.deepEqual(await f.publishedIDs(), [...ids].sort(), 'An expired required source removes strict eligibility immediately while its row is buffered.')
   } finally { await f.close() }
 })
 
@@ -369,9 +375,10 @@ test('an explicit source invalidation ends the retained assessment immediately',
   const f = await fixture(context)
   try {
     await f.roll()
-    assert.deepEqual(await f.rowIDs(), [...ids].sort())
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     f.service.bookUnsubscribed(ids[0])
-    assert.deepEqual(await f.rowIDs(), ids.slice(1).sort())
+    assert.deepEqual(await f.qualifiedIDs(), ids.slice(1).sort())
+    assert.deepEqual(await f.publishedIDs(), [...ids].sort(), 'Explicit source revocation invalidates qualification immediately but published rows use the removal buffer.')
     f.assertNoRefresh()
   } finally { await f.close() }
 })
@@ -380,11 +387,11 @@ test('a correction inside the retained history invalidates it before replacement
   const f = await fixture(context)
   try {
     await f.roll()
-    assert.deepEqual(await f.rowIDs(), [...ids].sort())
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     await f.service.persistCandles(ids[0], [candle(ids[0], f.asOf - fiveMinutes, 0)])
-    assert.deepEqual(await f.rowIDs(), ids.slice(1).sort(), 'A changed input invalidates the retained proof immediately after its durable commit.')
+    assert.deepEqual(await f.qualifiedIDs(), ids.slice(1).sort(), 'A changed input invalidates the retained proof immediately after its durable commit.')
     await f.advance(16)
-    assert.deepEqual(await f.rowIDs(), ids.slice(1).sort())
+    assert.deepEqual(await f.qualifiedIDs(), ids.slice(1).sort())
     assert.equal(f.historical(ids[0]), undefined)
     f.assertNoRefresh()
   } finally { await f.close() }
@@ -394,11 +401,11 @@ test('changing liquidity criteria cannot reuse an assessment retained under the 
   const f = await fixture(context)
   try {
     await f.roll()
-    assert.deepEqual(await f.rowIDs(), [...ids].sort())
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     f.preferences.liquidity.volume24h.minUSDT = 31_000_000
-    assert.deepEqual(await f.rowIDs(), [], 'Another passing threshold still needs a matching criteria identity.')
+    assert.deepEqual(await f.qualifiedIDs(), [], 'Another passing threshold still needs a matching criteria identity.')
     f.service.verifyCatalog()
-    assert.deepEqual(await f.rowIDs(), [], 'Local re-evaluation must not manufacture a current historical window from the retained one.')
+    assert.deepEqual(await f.qualifiedIDs(), [], 'Local re-evaluation must not manufacture a current historical window from the retained one.')
     f.assertNoRefresh()
   } finally { await f.close() }
 })
@@ -407,7 +414,7 @@ test('restoring previous criteria during rollover cannot restore their revoked r
   const f = await fixture(context)
   try {
     await f.roll()
-    assert.deepEqual(await f.rowIDs(), [...ids].sort())
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     f.service.autoRefresh = false
     let previous = structuredClone(f.preferences)
     f.preferences.liquidity.volume24h.minUSDT = 31_000_000
@@ -417,7 +424,7 @@ test('restoring previous criteria during rollover cannot restore their revoked r
     await f.service.reconfigure(previous)
     f.service.autoRefresh = true
     f.service.verifyCatalog()
-    assert.deepEqual(await f.rowIDs(), [], 'A → B → A settings must require fresh current-window evidence.')
+    assert.deepEqual(await f.qualifiedIDs(), [], 'A → B → A settings must require fresh current-window evidence.')
     f.assertNoRefresh()
   } finally { await f.close() }
 })
@@ -426,7 +433,7 @@ test('a reconnect acknowledgement cannot restore the old connection’s rollover
   const f = await fixture(context)
   try {
     await f.roll()
-    assert.deepEqual(await f.rowIDs(), [...ids].sort())
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     const originalConnection = f.service.realtime.connection
     f.socket.close()
     await turn()
@@ -438,7 +445,7 @@ test('a reconnect acknowledgement cannot restore the old connection’s rollover
     assert.notEqual(f.service.realtime.connection, originalConnection)
     assert.equal(f.service.realtime.isSubscribed(ids[0], '5m'), true)
     f.service.verifyCatalog()
-    assert.deepEqual(await f.rowIDs(), [], 'Only the original continuously acknowledged connection may bridge its closing boundary.')
+    assert.deepEqual(await f.qualifiedIDs(), [], 'Only the original continuously acknowledged connection may bridge its closing boundary.')
     f.assertNoRefresh()
   } finally { await f.close() }
 })
@@ -455,9 +462,9 @@ test('reconnecting before a close cannot rebind a fresh observation to the repla
     await f.service.realtime.whenIdle()
     assert.equal(f.service.realtime.isSubscribed(ids[0], '5m'), true)
     f.service.verifyCatalog()
-    assert.deepEqual(await f.rowIDs(), [...ids].sort(), 'The original window remains fresh until the close.')
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort(), 'The original window remains fresh until the close.')
     await f.roll()
-    assert.deepEqual(await f.rowIDs(), [], 'Rechecking a still-fresh value cannot transfer its original connection ownership.')
+    assert.deepEqual(await f.qualifiedIDs(), [], 'Rechecking a still-fresh value cannot transfer its original connection ownership.')
     f.assertNoRefresh()
   } finally { await f.close() }
 })
@@ -474,7 +481,7 @@ test('removing and readding a subscription on one connection cannot reuse its pr
     assert.equal(f.service.realtime.connection, connection)
     assert.equal(f.service.realtime.isSubscribed(ids[0], '5m'), true)
     await f.roll()
-    assert.deepEqual(await f.rowIDs(), ids.slice(1).sort(), 'A replacement subscription must not compare equal to an absent ownership token.')
+    assert.deepEqual(await f.qualifiedIDs(), ids.slice(1).sort(), 'A replacement subscription must not compare equal to an absent ownership token.')
     f.assertNoRefresh()
   } finally { await f.close() }
 })
@@ -485,12 +492,12 @@ test('an unrelated pending acknowledgement cannot prevent a continuously subscri
     assert.equal(f.service.realtime.getState().status, 'connecting')
     assert.equal(f.service.realtime.isSubscribed(ids[0], '5m'), true)
     await f.roll()
-    assert.deepEqual(await f.rowIDs(), [...ids].sort(), 'Authority must be captured when this series is acknowledged, before the aggregate socket becomes live.')
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort(), 'Authority must be captured when this series is acknowledged, before the aggregate socket becomes live.')
     await f.advance(1_000)
     f.socket.releaseAcknowledgements()
     await f.service.realtime.whenIdle()
     assert.equal(f.service.realtime.getState().status, 'live')
-    assert.deepEqual(await f.rowIDs(), [...ids].sort())
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     f.assertNoRefresh()
   } finally { await f.close() }
 })
@@ -506,13 +513,13 @@ test('equal metadata refreshes preserve rollover while changed and restored cont
     await f.roll()
     const definitions = () => new Map(structuredClone(instruments).map(instrument => [instrument.instId, instrument]))
     f.service.installInstruments(definitions())
-    assert.deepEqual(await f.rowIDs(), [...ids].sort(), 'A semantically identical metadata response must reuse the same contract epoch.')
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort(), 'A semantically identical metadata response must reuse the same contract epoch.')
     const changed = definitions()
     changed.get(ids[0])!.ctVal = '0.02'
     f.service.installInstruments(changed)
     f.service.installInstruments(definitions())
     f.service.verifyCatalog()
-    assert.deepEqual(await f.rowIDs(), ids.slice(1).sort(), 'Changing and restoring units must not revive the original assessment.')
+    assert.deepEqual(await f.qualifiedIDs(), ids.slice(1).sort(), 'Changing and restoring units must not revive the original assessment.')
     f.assertNoRefresh()
   } finally { await f.close() }
 })
@@ -522,7 +529,7 @@ test('reopening durable catalog checkpoints cannot resurrect runtime rollover re
   let reopened: MarketService | undefined
   try {
     await f.roll()
-    assert.deepEqual(await f.rowIDs(), [...ids].sort())
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     await f.service.dispose()
     reopened = new MarketService(f.store, () => f.preferences, f.fetcher, false, { webSocketFactory: () => new CandleSocket() })
     f.isolateQualification(reopened)
@@ -546,7 +553,8 @@ test('acknowledging a new socket alone cannot give a fresh checkpoint runtime ro
     await reopened.realtime.whenIdle()
     assert.equal(reopened.realtime.isSubscribed(ids[0], '5m'), true)
     await f.roll()
-    assert.deepEqual((await reopened.snapshot()).rows, [], 'A checkpoint needs runtime validation; acknowledgement does not validate historical input.')
+    assert.ok([...reopened.catalog.values()].every(entry => !reopened!.validCatalogEntry(entry)), 'Acknowledgement cannot renew a checkpoint’s historical qualification.')
+    assert.deepEqual((await reopened.snapshot()).rows.map(row => row.instId).sort(), [...ids].sort(), 'A checkpoint admitted while fresh gets the ordinary exit buffer when its lease later expires.')
     f.assertNoRefresh()
   } finally { await reopened?.dispose(); await f.close() }
 })
@@ -588,15 +596,15 @@ test('live-source recovery during an hourly rollover waits for a complete new hi
     observation.expiresAt = Date.now()
     f.service.streamQualifications.add(ids[0]); f.service.flushStreamQualifications()
     await f.waitFor(() => !f.service.streamEvaluations.has(ids[0]))
-    assert.deepEqual(await f.rowIDs(), ids.slice(1).sort())
+    assert.deepEqual(await f.qualifiedIDs(), ids.slice(1).sort())
     f.service.acceptObservation(ids[0], 'openInterest', { ...observation, observedAt: Date.now(), expiresAt: Date.now() + 90_000 })
     f.service.streamQualifications.add(ids[0]); f.service.flushStreamQualifications()
     await f.waitFor(() => !f.service.streamEvaluations.has(ids[0]))
-    assert.deepEqual(await f.rowIDs(), ids.slice(1).sort(), 'Recovered live input must not admit new turnover with the previous hour’s window.')
+    assert.deepEqual(await f.qualifiedIDs(), ids.slice(1).sort(), 'Recovered live input must not admit new turnover with the previous hour’s window.')
     f.socket.candle(candle(ids[0], epoch, 2_500_000, '1H'))
     await f.service.realtime.whenIdle()
     await f.waitFor(() => f.service.catalog.get(ids[0])?.result.volumeRatio === 1.25)
-    assert.deepEqual(await f.rowIDs(), [...ids].sort())
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     f.assertNoRefresh()
   } finally { await f.close() }
 })
@@ -606,7 +614,7 @@ for (const first of ['5m', '1H']) test(`an hourly rollover keeps the last comple
   try {
     const originalTurnover = f.historical(ids[0]), originalHourly = f.historical(ids[0], 'hourly')
     await f.roll()
-    assert.deepEqual(await f.rowIDs(), [...ids].sort())
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     assert.deepEqual(f.historical(ids[0]), originalTurnover)
     assert.deepEqual(f.historical(ids[0], 'hourly'), originalHourly)
     const final = (timeframe: string) => timeframe === '5m'
@@ -616,13 +624,13 @@ for (const first of ['5m', '1H']) test(`an hourly rollover keeps the last comple
     await f.service.realtime.whenIdle()
     assert.equal(f.service.realtime.getProgress(ids[0], first).committedThrough, final(first).timestamp)
     await f.advance(16)
-    assert.deepEqual(await f.rowIDs(), [...ids].sort(), 'One missing native timeframe must not cause a gap between complete hourly assessments.')
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort(), 'One missing native timeframe must not cause a gap between complete hourly assessments.')
     assert.equal((await f.service.snapshot()).rows.find(row => row.instId === ids[0])?.turnover24hUSDT, 57_600_000)
     await f.advance(1_000)
     f.socket.candle(final(first === '5m' ? '1H' : '5m'))
     await f.service.realtime.whenIdle()
     await f.waitFor(() => f.service.catalog.get(ids[0])?.result.turnover === 57_800_000 && f.service.catalog.get(ids[0])?.result.volumeRatio === 1.25)
-    assert.deepEqual(await f.rowIDs(), [...ids].sort())
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     assert.equal(f.historical(ids[0]).value.asOf, f.boundary)
     assert.equal(f.historical(ids[0], 'hourly').value.asOf, f.boundary)
     assert.deepEqual(f.priceRequests, [])

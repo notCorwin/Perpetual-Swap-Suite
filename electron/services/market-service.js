@@ -29,6 +29,7 @@ const OBSERVATION_TTL = 90_000
 const TICKER_BOOTSTRAP_MS = 10_000
 const CANDLE_DELIVERY_MS = 10_000
 const CATALOG_RENEW_INTERVAL = 30_000
+const LIST_REMOVAL_DELAY_MS = 30_000
 const REQUEST_TIMEOUT = 12_000
 const RETRY_DELAYS = [1_000]
 const REQUEST_PRIORITY = { background: 0, chartWarm: 0, prefetch: 1, statistics: 2, continuity: 2, foreground: 3, repair: 3, prepared: 3, interactive: 4 }
@@ -133,6 +134,10 @@ export class MarketService {
     this.webSocketFactory = webSocketFactory
     this.requestTimeout = Number.isFinite(requestTimeout) && requestTimeout > 0 ? requestTimeout : REQUEST_TIMEOUT
     this.catalog = new Map()
+    // Eligibility expires immediately. Only the published list has an exit delay;
+    // these process-local entries never renew or persist qualification evidence.
+    this.listRemovals = new Map()
+    this.listedUniverse = new Set()
     this.catalogPublications = new Map()
     this.catalogPublicationTask = null
     this.catalogChecks = new Map()
@@ -453,12 +458,17 @@ export class MarketService {
     if (this.disposed) return false
     const previous = this.catalog
     const next = new Map(entries.map(entry => { const record = this.catalogRecord(entry); return [record.instrument.instId, record] }))
+    const now = Date.now()
+    for (const instId of next.keys()) this.listRemovals.delete(instId)
+    for (const [instId, entry] of previous) if (!next.has(instId) && !this.listRemovals.has(instId)) {
+      // A late deadline callback must not restart the delay at its arrival time.
+      this.bufferListRemoval(entry, now)
+    }
     const changed = JSON.stringify([...next]) !== JSON.stringify([...this.catalog])
     this.catalog = next
     for (const entry of next.values()) this.instruments.set(entry.instrument.instId, entry.instrument)
     if (changed) { this.catalogRevision += 1; this.touchList() }
-    const membershipChanged = previous.size !== next.size || [...next.keys()].some(instId => !previous.has(instId))
-    if (membershipChanged) this.preparedCharts.setUniverse([...next.keys()])
+    this.updateListedUniverse(now)
     for (const instId of next.keys()) if (!previous.has(instId)) this.track(this.updateRanking(instId, { ensure: true }))
     this.updateSubscriptions()
     this.scheduleMarketDeadline()
@@ -470,24 +480,57 @@ export class MarketService {
     if (valid.length !== this.catalog.size) this.replaceCatalog(valid)
   }
 
+  bufferListRemoval(entry, now = Date.now(), expiry = entry ? this.catalogEntryExpiry(entry, now) : 0) {
+    const removedAt = Math.min(now, expiry)
+    if (!entry || removedAt + LIST_REMOVAL_DELAY_MS <= now) return
+    const instId = entry.instrument.instId
+    if (!this.listRemovals.has(instId)) this.listRemovals.set(instId, { entry, removeAt: removedAt + LIST_REMOVAL_DELAY_MS })
+  }
+
+  listedCatalogEntries(now = Date.now()) {
+    const entries = new Map()
+    for (const [instId, entry] of this.catalog) {
+      const expiry = this.catalogEntryExpiry(entry, now)
+      // Projection reads can run before the due maintenance callback. Apply the
+      // same known expiry without mutating state or admitting background work.
+      if (this.validCatalogEntry(entry, now) || expiry <= now && now < expiry + LIST_REMOVAL_DELAY_MS) entries.set(instId, entry)
+    }
+    for (const [instId, removal] of this.listRemovals) if (!entries.has(instId) && now < removal.removeAt) entries.set(instId, removal.entry)
+    return entries
+  }
+
+  updateListedUniverse(now = Date.now()) {
+    const ids = new Set(this.listedCatalogEntries(now).keys())
+    if (ids.size === this.listedUniverse.size && [...ids].every(id => this.listedUniverse.has(id))) return
+    this.listedUniverse = ids
+    this.preparedCharts.setUniverse([...ids])
+  }
+
   /** Reuse one canonical projection until its market facts or freshness proof change. */
   canonicalMarketList(now = Date.now()) {
     const lookback = this.prefs().rankingLookback, configKey = this.catalogCriteriaKey(), asOf = closedBoundary('5m', now)
     const cached = this.canonicalList
     if (cached?.revision === this.revision && cached.lookback === lookback && cached.configKey === configKey
       && now >= cached.observedAt && now < cached.expiresAt) return cached
-    const entries = [...this.catalog.values()].filter(entry => this.validCatalogEntry(entry, now))
+    const entries = [...this.listedCatalogEntries(now).values()]
+    const qualifiedCount = [...this.catalog.values()].filter(entry => this.validCatalogEntry(entry, now)).length
     const rows = measureOperation({ category: 'cpu', name: 'market.list.sort', attributes: { inputRows: entries.length } }, () => entries.map(entry => {
       const instId = entry.instrument.instId, ranking = this.rankings.get(instId)
       const current = ranking?.lookback === lookback && ranking.rankingAsOf === asOf
-      return { instId, lastPrice: number(entry.ticker.last), turnover24hUSDT: number(entry.result.turnover),
+      const ticker = this.observations.get(instId)?.ticker?.value ?? entry.ticker
+      return { instId, lastPrice: number(ticker.last), turnover24hUSDT: number(this.catalogChecks.get(instId)?.result.turnover ?? entry.result.turnover),
         rankingChange: current ? ranking.rankingChange : null, rankingAsOf: current ? ranking.rankingAsOf : null }
     }).sort(compareRanking))
     const turnoverOrder = measureOperation({ category: 'cpu', name: 'market.list.turnover-sort', attributes: { inputRows: rows.length } }, () => [...rows]
       .sort((left, right) => (right.turnover24hUSDT ?? -Infinity) - (left.turnover24hUSDT ?? -Infinity) || (left.instId < right.instId ? -1 : left.instId > right.instId ? 1 : 0))
       .map(row => row.instId))
-    this.canonicalList = { revision: this.revision, lookback, configKey, observedAt: now,
-      expiresAt: Math.min(asOf + FIVE_MINUTES, ...entries.map(entry => this.catalogEntryExpiry(entry, now))), rows, turnoverOrder }
+    const expiries = entries.map(entry => {
+      const expiry = this.catalogEntryExpiry(entry, now)
+      return this.listRemovals.get(entry.instrument.instId)?.removeAt ?? (expiry > now ? expiry : expiry + LIST_REMOVAL_DELAY_MS)
+    })
+    this.canonicalList = { revision: this.revision, lookback, configKey, observedAt: now, qualifiedCount,
+      current: qualifiedCount === this.catalog.size && [...this.listRemovals.values()].every(removal => removal.removeAt > now),
+      expiresAt: Math.min(asOf + FIVE_MINUTES, ...expiries), rows, turnoverOrder }
     return this.canonicalList
   }
 
@@ -511,7 +554,7 @@ export class MarketService {
       this.rankingVersions.set(instId, (this.rankingVersions.get(instId) ?? 0) + 1)
       this.rankingReads.delete(instId)
       this.rankingWindows.set(instId, { rows })
-      if (this.catalog.has(instId)) this.publishRanking(instId, this.prefs().rankingLookback, closedBoundary('5m'))
+      if (this.catalog.has(instId) || this.listRemovals.has(instId)) this.publishRanking(instId, this.prefs().rankingLookback, closedBoundary('5m'))
     }
   }
 
@@ -534,7 +577,7 @@ export class MarketService {
   publishRanking(instId, lookback, asOf) {
     const previous = this.rankings.get(instId)
     const { rankingChange, rankingAsOf } = this.cachedRanking(instId, lookback, asOf)
-    if (this.catalog.has(instId) && (previous?.lookback !== lookback || !Object.is(previous?.rankingChange, rankingChange) || previous?.rankingAsOf !== rankingAsOf)) {
+    if ((this.catalog.has(instId) || this.listRemovals.has(instId)) && (previous?.lookback !== lookback || !Object.is(previous?.rankingChange, rankingChange) || previous?.rankingAsOf !== rankingAsOf)) {
       this.listUpdatedAt = Date.now()
       this.touchList()
     }
@@ -1063,7 +1106,7 @@ export class MarketService {
       const entry = this.catalog.get(instId)
       if (entry) entry.ticker = value
       // Publish the current trade price without waiting for qualification or history.
-      if (entry) { this.listUpdatedAt = receivedAt; this.touchList() }
+      if (entry || this.listRemovals.has(instId)) { this.listUpdatedAt = receivedAt; this.touchList() }
     }
     this.queueStreamQualification(instId, key)
   }
@@ -1134,8 +1177,9 @@ export class MarketService {
       // Source proof changes eligibility, never the desired collection universe.
       // In particular an unsubscribe callback must not re-enter subscriptions.
       if (this.catalog.has(instId) && !this.validCatalogEntry(this.catalog.get(instId), now)) {
+        this.bufferListRemoval(published, now)
         this.catalog.delete(instId); this.catalogRevision++
-        this.preparedCharts.setUniverse([...this.catalog.keys()])
+        this.updateListedUniverse(now)
       }
       this.touchList()
     }
@@ -1303,6 +1347,7 @@ export class MarketService {
       this.catalogChecks.set(instId, record)
       const existing = this.catalog.has(instId)
       if (record.status === 'verified') {
+        this.listRemovals.delete(instId)
         next.set(instId, record); this.renewalTargets.set(instId, instrument)
         membershipChanged ||= !existing
       } else {
@@ -1339,7 +1384,7 @@ export class MarketService {
     // a same-boundary result computed from the superseded source candles.
     const saved = this.metadata?.getCatalogEntry(instId)
     if (saved?.lastRanking) { delete saved.lastRanking; this.metadata.putCatalogEntry(saved) }
-    if (this.catalog.has(instId)) this.touchList()
+    if (this.catalog.has(instId) || this.listRemovals.has(instId)) this.touchList()
   }
 
   onHistoryReplaced(instId, timeframe) {
@@ -1455,7 +1500,7 @@ export class MarketService {
       && proof.instrumentGeneration === (this.instrumentGenerations.get(instId) ?? 0) && proof.connection === this.realtime?.connection
       && proof.subscription && proof.subscription === this.realtime.subscriptions.get(`${timeframe}:${instId}`)
       && this.realtime.isSubscribed(instId, timeframe) && observation.expiresAt === boundary
-      && observation.value.asOf === boundary - timeframeMilliseconds(timeframe) && now < deadline ? deadline : expiry
+      && observation.value.asOf === boundary - timeframeMilliseconds(timeframe) ? deadline : expiry
   }
 
   qualificationObservation(observations, key, instId, configKey, now = Date.now()) {
@@ -1488,6 +1533,7 @@ export class MarketService {
     const observations = this.observations.get(instId)
     if (!observations) return
     const record = this.catalogChecks.get(instId), published = this.catalog.get(instId)
+    const now = Date.now(), publishedExpiry = this.catalogEntryExpiry(published, now)
     const recordObservations = { ...record?.observations }
     let recordChanged = false, recordInvalidated = false, publishedInvalidated = false
     for (const [key, frame, count] of [['turnover', '5m', 288], ['hourly', '1H', 24]]) {
@@ -1511,15 +1557,17 @@ export class MarketService {
     }
     if (recordChanged && record) {
       if (recordInvalidated) {
-        record.status = 'unknown'; record.result = { ...record.result, eligible: false }; record.expiresAt = Date.now()
+        record.status = 'unknown'; record.result = { ...record.result, eligible: false }; record.expiresAt = Math.min(record.expiresAt, now)
       }
       record.observations = recordObservations
       this.metadata.putCatalogEntry(record)
     }
     if (publishedInvalidated) {
       const entry = published
-      if (entry) { entry.status = 'unknown'; entry.result = { ...entry.result, eligible: false }; entry.expiresAt = Date.now() }
+      this.bufferListRemoval(entry, now, publishedExpiry)
+      if (entry) { entry.status = 'unknown'; entry.result = { ...entry.result, eligible: false }; entry.expiresAt = Math.min(publishedExpiry, now) }
       this.touchList()
+      this.scheduleMarketDeadline()
     }
   }
 
@@ -1570,7 +1618,12 @@ export class MarketService {
     const tickerRetries = [...this.tickerRecoveries].filter(([id, value]) => this.candidateIDs?.has(id) && !value.signal.aborted && !value.task).map(([, value]) => value.retryAt)
     const sourceRetries = [...this.sourceRecoveries.values()].filter(value => !value.task).map(value => value.retryAt)
     const candleDeadlines = [...this.candleWaits.values()].map(wait => wait.deadline)
-    const next = Math.min(boundary, ...deadlines.values(), ...tickerRetries, ...sourceRetries, ...candleDeadlines)
+    const removalDeadlines = [...this.listRemovals.values()].map(removal => removal.removeAt)
+    for (const entry of this.catalog.values()) {
+      const expiry = this.catalogEntryExpiry(entry, now)
+      if (expiry <= now && expiry + LIST_REMOVAL_DELAY_MS > now) removalDeadlines.push(expiry + LIST_REMOVAL_DELAY_MS)
+    }
+    const next = Math.min(boundary, ...deadlines.values(), ...tickerRetries, ...sourceRetries, ...candleDeadlines, ...removalDeadlines)
     if (this.marketDeadlineAt === next) return
     if (this.marketDeadlineTimer) clearTimeout(this.marketDeadlineTimer)
     this.marketDeadlineTimer = null
@@ -1592,12 +1645,15 @@ export class MarketService {
       if (asOf !== this.marketBoundary) {
         this.marketBoundary = asOf
         this.touchList()
-        for (const instId of this.catalog.keys()) this.track(this.updateRanking(instId, { asOf }))
+        for (const instId of new Set([...this.catalog.keys(), ...this.listRemovals.keys()])) this.track(this.updateRanking(instId, { asOf }))
         for (const instId of this.catalogChecks.keys()) this.scheduleQualification(instId)
       }
       // A worker can still own an earlier immutable observation. Its published
       // lease expires independently of newer raw source observations.
       this.pruneCatalog()
+      let removed = false
+      for (const [instId, removal] of this.listRemovals) if (removal.removeAt <= now) { this.listRemovals.delete(instId); removed = true }
+      if (removed) { this.touchList(); this.updateListedUniverse(now) }
       for (const instId of due) {
         const record = this.catalogChecks.get(instId)
         if (record && !this.validCatalogEntry(record, now)) this.catalogChecks.set(instId, { ...record, status: 'unknown', result: { ...record.result, eligible: false }, expiresAt: now })
@@ -1720,20 +1776,21 @@ export class MarketService {
   }
 
   bookUnsubscribed(instId) {
+    const now = Date.now(), published = this.catalog.get(instId), publishedExpiry = this.catalogEntryExpiry(published, now)
     this.bookGenerations.set(instId, (this.bookGenerations.get(instId) ?? 0) + 1)
     this.books.invalidate(instId)
     const observations = this.observations.get(instId)
     if (observations) delete observations.book
     const { depth, slippage } = this.prefs().liquidity
     if (this.closing || !depth.enabled && !slippage.enabled) return
-    const now = Date.now(), record = this.catalogChecks.get(instId)
+    const record = this.catalogChecks.get(instId)
     if (record) {
-      record.status = 'unknown'; record.expiresAt = now
+      record.status = 'unknown'; record.expiresAt = Math.min(record.expiresAt, now)
       record.result = { ...record.result, eligible: false }
       record.observations = { ...observations }
     }
-    const published = this.catalog.get(instId)
-    if (published) { published.status = 'unknown'; published.result = { ...published.result, eligible: false }; published.expiresAt = now }
+    this.bufferListRemoval(published, now, publishedExpiry)
+    if (published) { published.status = 'unknown'; published.result = { ...published.result, eligible: false }; published.expiresAt = Math.min(publishedExpiry, now) }
     // Unsubscribe callbacks run inside the transport's membership update.
     // Requalification must not re-enter subscription reconciliation.
     this.queueStreamQualification(instId, 'book')
@@ -2389,7 +2446,7 @@ export class MarketService {
       }))
     }
     if (previous.rankingLookback !== current.rankingLookback) {
-      for (const instId of this.catalog.keys()) this.track(this.updateRanking(instId, { ensure: true }))
+      for (const instId of new Set([...this.catalog.keys(), ...this.listRemovals.keys()])) this.track(this.updateRanking(instId, { ensure: true }))
     }
     this.touchList()
     this.scheduleMarketDeadline()
@@ -2498,7 +2555,7 @@ export class MarketService {
 
   async snapshot({ sinceRevision, serviceSession } = {}) {
     await this.ready
-    const { rows, turnoverOrder } = this.canonicalMarketList()
+    const { rows, turnoverOrder, qualifiedCount, current: listCurrent } = this.canonicalMarketList()
     const configKey = this.catalogCriteriaKey()
     const pendingIDs = new Set([...this.pendingCandidates.values()].filter(value => value.configKey === configKey).map(value => value.instId))
     for (const recovery of this.sourceRecoveries.values()) pendingIDs.add(recovery.instId)
@@ -2519,16 +2576,16 @@ export class MarketService {
     }
     // A native close expires the old rolling window before its final candle
     // arrives. Active revalidation is pending work, not a source failure.
-    const unavailable = !rows.length && unavailableContracts > 0
+    const unavailable = !qualifiedCount && unavailableContracts > 0
       ? `Market verification is unavailable for ${unavailableContracts} contracts because required observations are missing or expired.${pending > 0 || this.refreshing || this.renewing ? ' Acquiring current observations.' : ''}` : ''
     const status = { error: this.error || unavailable, loading: this.refreshing !== null || this.renewing !== null || pending > 0,
       catalogProgress,
       updatedAt: this.listUpdatedAt ?? this.catalogUpdatedAt,
       catalogSource: this.catalogSource, realtimeState: this.realtimeState() }
     const metadata = { ...status, revision: this.revision, serviceSession: this.serviceSession }
-    // A source event may reach IPC before a due maintenance callback. Never
-    // retain expired membership or a previous ranking boundary behind a version hit.
-    const current = this.marketBoundary === closedBoundary('5m') && rows.length === this.catalog.size
+    // A source or retirement deadline can reach IPC before its callback. Never
+    // hide a changed projection or ranking boundary behind a version hit.
+    const current = this.marketBoundary === closedBoundary('5m') && listCurrent
     if (current && serviceSession === this.serviceSession && sinceRevision === this.revision) return { ...metadata, unchanged: true }
     return { ...metadata, rows, turnoverOrder }
   }

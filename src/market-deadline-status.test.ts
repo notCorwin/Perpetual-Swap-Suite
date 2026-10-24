@@ -40,7 +40,8 @@ test('a market push arriving before the closing deadline callback reports queued
     now = asOf + step
     assert.equal(service.marketDeadlineAt, now)
     const queued = await service.snapshot()
-    assert.deepEqual(queued.rows, [])
+    assert.deepEqual(queued.rows.map(row => row.instId), [instId], 'The exit buffer preserves the list without renewing qualification.')
+    assert.equal(service.validCatalogEntry(service.catalog.get(instId)), false)
     assert.equal(queued.catalogProgress.unknown, 1)
     assert.equal(queued.catalogProgress.pending, 1)
     assert.equal(queued.loading, true)
