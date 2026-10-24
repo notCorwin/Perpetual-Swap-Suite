@@ -13,7 +13,7 @@ export function databaseOperation(name, operation, attributes = {}, resource) {
   const span = beginOperation({ category: 'database', name, resource, attributes })
   const cpu = readOperationCPUTime()
   const details = group = { calls: 0, queryCount: 0, rows: 0, changes: 0 }
-  try { const result = typeof span.run === 'function' ? span.run(operation) : operation(); span.end({ attributes: details, ...(cpu === undefined ? {} : { cpuTimeMS: readOperationCPUTime() - cpu }) }); return result }
+  try { const result = span.run(operation); span.end({ attributes: details, ...(cpu === undefined ? {} : { cpuTimeMS: readOperationCPUTime() - cpu }) }); return result }
   catch (error) { span.end({ status: 'error', attributes: { ...details, errorName: error?.name ?? 'Error' }, ...(cpu === undefined ? {} : { cpuTimeMS: readOperationCPUTime() - cpu }) }); throw error }
   finally { group = undefined }
 }
@@ -84,7 +84,7 @@ export function recordedDatabase(database, resource) {
     if (key === 'prepare') return sql => {
       // Only identifiers from a fixed schema are recorded. SQL text and literals
       // may contain paths or secrets and must never enter the journal.
-      const tables = ['settings', 'analysis_settings', 'migrations', 'sync_tasks', 'audits', 'catalog', 'series', 'candles', 'statistics', 'replacements', 'indicator_checkpoints', 'migration_partitions', 'import_issues']
+      const tables = ['settings', 'analysis_settings', 'migrations', 'audits', 'catalog', 'series', 'candles', 'statistics', 'replacements', 'indicator_checkpoints', 'migration_partitions', 'import_issues']
       const table = sql.match(/\b(?:FROM|INTO|UPDATE|TABLE)\s+([a-z_]+)/i)?.[1]?.toLowerCase()
       const statement = invoke('prepare', target.prepare.bind(target), [sql])
       return statementProxy(statement, tables.includes(table) ? table : undefined)

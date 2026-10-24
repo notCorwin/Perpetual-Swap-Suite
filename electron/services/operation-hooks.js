@@ -66,7 +66,7 @@ const resultAttributes = (value, name = '') => ({
   ...(typeof value?.bytesWritten === 'number' ? { bytes: value.bytesWritten } : {}),
   ...(typeof value === 'number' && /\.(?:read|readv|write|writev)(?:Sync)?$/.test(name) ? { bytes: value } : {}),
 })
-const run = (span, operation) => typeof span.run === 'function' ? span.run(operation) : operation()
+const run = (span, operation) => span.run(operation)
 const captureScope = () => captureOperationContext({ restoreHookDomains: true })
 
 /** Preserve application callback context while native transport internals are suppressed. */
