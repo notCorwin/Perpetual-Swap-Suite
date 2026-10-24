@@ -131,6 +131,60 @@ test('optional statistics settle independently in bounded lanes while focus chan
   } finally { oi.resolve(); taker.resolve(); await pipeline.dispose() }
 })
 
+test('a latest candidate keeps selected one-slot statistics repairs at its lagging left edge after focus changes', async context => {
+  context.mock.timers.enable({ apis: ['Date'], now: Math.floor(Date.now() / step) * step + 1000 })
+  const id = 'LAGGING-EDGE-USDT-SWAP', other = 'NEXT-FOCUS-USDT-SWAP', oi = deferred(), taker = deferred()
+  const canonical = rowsFor(id).slice(0, -1), latest = canonical.at(-1)!.timestamp, edge = canonical.at(-96)!
+  const calls: Array<{ instrument: string; source: string; from: number; through: number; signal: AbortSignal }> = []
+  const rows = canonical.map(row => row.timestamp === edge.timestamp
+    ? { ...row, oi: null, buy: null, sell: null, statisticsVersion: null } : row)
+  const { pipeline, store } = fixture([...rows, ...rowsFor(other)], {
+    async ensureStatistics(instrument: string, _timeframe: string, from: number, through: number, _priority: string, signal: AbortSignal, source: string) {
+      calls.push({ instrument, source, from, through, signal })
+      await (source === 'oi' ? oi : taker).promise
+      signal.throwIfAborted()
+      return { rows: canonical.filter(row => row.timestamp >= from && row.timestamp <= through)
+        .map(row => source === 'oi' ? { ...row, buy: null, sell: null, statisticsVersion: 9 } : { ...row, oi: null, statisticsVersion: 10 }) }
+    },
+  })
+  const edgeCalls = () => calls.filter(call => call.instrument === id && call.from === edge.timestamp && call.through === edge.timestamp)
+  try {
+    // The displayed latest window trails the clock by one native candle. Its
+    // left edge falls outside the clock-aligned viewport; no history is opened.
+    assert.equal(latest, end() - step); assert.equal(edge.timestamp, end() - 96 * step)
+    pipeline.setFocus({ instId: id, timeframe: '15m' }, 'original-selection')
+    await pipeline.local(id, '15m', { focusId: 'original-selection' })
+    await waitFor(() => ready(pipeline, id) && settled(pipeline) && edgeCalls().length === 2)
+    assert.equal(pipeline.universe.size, 0, 'The selected focus starts both one-slot repairs before candidate admission.')
+    assert.deepEqual(edgeCalls().map(call => call.source).toSorted(), ['oi', 'taker'])
+    const originalRepairs = edgeCalls(), initial = pipeline.cached(`${id}:15m`)
+    assert.equal(initial.endHour, latest); assert.equal(initial.bars[0].hour, edge.timestamp)
+    assert.equal(initial.bars[0].oiObserved, false); assert.equal(initial.bars[0].takerObserved, false)
+
+    pipeline.setUniverse([id, other], '15m')
+    await waitFor(() => ready(pipeline, id) && ready(pipeline, other) && settled(pipeline))
+    assert.equal(edgeCalls().length, 2, 'Candidate warming reuses the active one-slot repairs.')
+    const reads = store.queries.filter(query => query.instrument === id).length
+    pipeline.setFocus({ instId: other, timeframe: '15m' }, 'next-selection')
+    await pipeline.local(other, '15m', { focusId: 'next-selection' })
+    for (const repair of originalRepairs) assert.equal(repair.signal.aborted, false, `${repair.source} repair still belongs to the original latest candidate.`)
+
+    oi.resolve()
+    await waitFor(() => pipeline.cached(`${id}:15m`)?.oiState === 'ready')
+    assert.equal(pipeline.cached(`${id}:15m`).takerState, 'loading')
+    taker.resolve()
+    await waitFor(() => pipeline.cached(`${id}:15m`)?.takerState === 'ready' && pipeline.sourceTasks.size === 0)
+    const repaired = pipeline.cached(`${id}:15m`)
+    assert.equal(repaired.endHour, latest); assert.equal(repaired.bars.length, 96)
+    assert.equal(repaired.indicatorState, 'ready'); assert.equal(repaired.oiState, 'ready')
+    assert.deepEqual(repaired.bars.map((bar: any) => [bar.hour, bar.oi, bar.buy, bar.sell]),
+      canonical.slice(-96).map(row => [row.timestamp, row.oi, row.buy, row.sell]))
+    assert.equal(edgeCalls().length, 2, 'Focus changes never abort and restart a repair still demanded by a candidate.')
+    assert.equal(store.queries.filter(query => query.instrument === id).length, reads, 'Returned statistics fill both residencies without rereading prices.')
+    assert.equal(pipeline.series.get(`${id}:15m`).historyEnd, null)
+  } finally { oi.resolve(); taker.resolve(); await pipeline.dispose(); context.mock.timers.reset() }
+})
+
 test('timeframe changes and removal retire queued and active candidate sources without touching market subscriptions', async () => {
   const calls: any[] = [], ids = Array.from({ length: 7 }, (_, index) => `CANCEL${index}-USDT-SWAP`)
   const acquire = async (instrument: string, timeframe: string, _from: number, _through: number, _priority: string, signal: AbortSignal, source = 'candles') => {

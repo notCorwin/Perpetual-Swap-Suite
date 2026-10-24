@@ -338,7 +338,9 @@ export class PreparedChartPipeline {
       job.demands = new Set([...(job.demands ?? [])].filter(demand => this.currentDemand(demand)))
       const candidate = this.universe.get(job.seriesKey), candidateStep = job.state.intervalMS
       const candidateEnd = Math.floor(Date.now() / candidateStep) * candidateStep - candidateStep
-      if (candidate && job.from <= candidateEnd && job.through >= candidateEnd - (VISIBLE - 1 + (job.source === 'candles' ? INDICATOR_WARMUP : 0)) * candidateStep) job.demands.add(candidate)
+      const displayedEnd = this.liveStates.get(job.seriesKey)?.latestHour ?? candidateEnd
+      if (candidate && [candidateEnd, displayedEnd].some(end => job.from <= end
+        && job.through >= end - (VISIBLE - 1 + (job.source === 'candles' ? INDICATOR_WARMUP : 0)) * candidateStep)) job.demands.add(candidate)
       // A nearby cursor can still use an admitted viewport/reserve page. Keep
       // that consumer attached so HistorySync need not abort and refetch it.
       if (job.seriesKey === key && (job.from <= end && job.through >= from
@@ -518,7 +520,7 @@ export class PreparedChartPipeline {
     const ceiling = Math.floor(Date.now() / state.intervalMS) * state.intervalMS - state.intervalMS
     const through = end === undefined || end === null ? ceiling : Math.min(end + HISTORY_AHEAD * state.intervalMS, ceiling)
     const from = end === undefined || end === null ? undefined : Math.max(0, end - (limit - HISTORY_AHEAD - 1) * state.intervalMS)
-    const admittedPrice = state.priceVersion, admittedOI = state.oiVersion, admittedTaker = state.takerVersion
+    const admittedPrice = state.priceVersion, admittedRows = new Map(state.rows)
     const residentRevision = this.store.candleRevision?.(state.instId, state.timeframe)
     const rows = await this.store.candles({ instrument: state.instId, timeframe: state.timeframe, from, through, limit, order: 'desc' }, priority)
     if (this.closed) return
@@ -526,7 +528,11 @@ export class PreparedChartPipeline {
     const residentFirst = Math.min(...state.rows.keys()), residentLast = Math.max(...state.rows.keys())
     let pricesChanged = false, observationsChanged = false, changedFrom = Infinity, oiChanged = false, takerChanged = false
     for (const row of rows) if (row.confirmed) {
-      const previous = state.rows.get(row.timestamp), value = mergeStatistics(previous, this.normalize(row), (admittedOI === state.oiVersion ? 1 : 0) | (admittedTaker === state.takerVersion ? 2 : 0))
+      const previous = state.rows.get(row.timestamp), prior = admittedRows.get(row.timestamp)
+      // Concurrent statistics fence their own slot and source. A newer value
+      // elsewhere cannot discard fresh observations at the viewport edge.
+      const allowed = (!previous || !changedSource(prior, previous, 1) ? 1 : 0) | (!previous || !changedSource(prior, previous, 2) ? 2 : 0)
+      const value = mergeStatistics(previous, this.normalize(row), allowed)
       // A committed hole repair may precede its observer. It changes the
       // recursive input prefix just like a correction of an existing candle.
       // Ordinary reserve expansion lies outside the retained interval.
@@ -741,6 +747,13 @@ export class PreparedChartPipeline {
     let pricesMissing = false
     for (let hour = priceFrom; hour <= end; hour += step) if (!completePriceCandle(state.rows.get(hour))) { pricesMissing = true; break }
     this.refreshStatistics(state, from, end, priority, reserve, focus)
+    // Latest prices can trail the clock while their independent repair runs.
+    // Keep every actually displayed slot in demand, including the older edge
+    // that has already left the clock-aligned acquisition window.
+    if (targetEnd === undefined && state.latestHour !== null && state.latestHour !== end) {
+      const displayedFrom = Math.max(0, state.latestHour - (VISIBLE - 1) * step, state.floor ?? 0)
+      this.refreshStatistics(state, displayedFrom, state.latestHour, priority, reserve, focus)
+    }
     if (!pricesMissing || !this.history.ensurePrices && !this.history.latest) return null
     const task = this.sourceJob(`prices:${state.key}:${priceFrom}:${end}`, async (signal, job) => {
       // A latest observation proves only that candle. The durable planner owns
@@ -790,6 +803,13 @@ export class PreparedChartPipeline {
     if (typeof this.history.ensureStatistics !== 'function') return
     const { instId, timeframe, intervalMS: step } = state
     for (const [source, bit] of [['oi', 1], ['taker', 2]]) {
+      // Skipping an active range also means sharing its lifetime. Otherwise a
+      // focus change can cancel the edge repair a candidate just reused.
+      for (const job of this.sourceTasks.values()) if (job.seriesKey === state.key && job.source === source && job.from <= through && job.through >= from) {
+        if (demand) job.demands.add(demand)
+        job.reserve ??= reserve
+        this.promoteSourceJob(job, priority)
+      }
       for (const bounds of this.pendingSourceRanges(state, source, from, through)) {
         this.sourceJob(`${source}:${state.key}:${bounds.from}:${bounds.through}`, async (signal, job) => {
           const result = await this.history.ensureStatistics(instId, timeframe, bounds.from, bounds.through, job.priority, signal, source)
@@ -986,6 +1006,8 @@ export class PreparedChartPipeline {
     if (missingPrices && (this.history.latest || this.history.ensurePrices)
       && this.pendingSourceRanges(state, 'candles', from, end).length) repair('candles', from, end)
     const statisticsRanges = [{ from, through: end }, ...this.statisticsRanges(state)]
+    if (focus.end === undefined && state.latestHour !== null && state.latestHour !== end)
+      statisticsRanges.push({ from: Math.max(0, state.latestHour - (VISIBLE - 1) * step, state.floor ?? 0), through: state.latestHour })
     for (const bounds of statisticsRanges) for (let hour = bounds.from; hour <= bounds.through; hour += step) {
       const row = state.rows.get(hour)
       for (const bit of [1, 2]) {

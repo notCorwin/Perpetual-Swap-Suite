@@ -121,6 +121,36 @@ test('a current forming quote cannot certify a stale confirmed tail and its full
   } finally { gate.resolve(); await pipeline.dispose() }
 })
 
+for (const lag of [1, 12, 160]) test(`latest statistics cover the displayed left edge while confirmed prices lag ${lag} periods`, async () => {
+  const canonical = source(600).slice(0, -lag), first = canonical.at(-1)!.timestamp - 95 * interval, gate = deferred()
+  const rows = canonical.map(row => row.timestamp === first ? { ...row, oi: null, buy: null, sell: null, statisticsVersion: null } : row)
+  const calls: Array<{ source: string; from: number; through: number }> = []
+  const { pipeline, store } = fixture(rows as any, {
+    async ensurePrices() { await gate.promise },
+    async ensureStatistics(_id: string, _frame: string, from: number, through: number, _priority: string, _signal: AbortSignal, source: string) {
+      calls.push({ source, from, through })
+      store.rows = store.rows.map(row => row.timestamp !== first || first < from || first > through ? row
+        : source === 'oi' ? { ...row, oi: 5000, statisticsVersion: row.buy === null ? 9 : 11 }
+          : { ...row, buy: 70, sell: 30, statisticsVersion: row.oi === null ? 10 : 11 })
+      return { rows: store.rows.filter(row => row.timestamp >= from && row.timestamp <= through) }
+    },
+  })
+  try {
+    await pipeline.setLive(instId, '15m', { ...candle(end() + interval), confirmed: false }, { receivedAt: Date.now() })
+    await pipeline.local(instId, '15m')
+    for (let turn = 0; turn < 8; turn++) await new Promise<void>(resolve => setImmediate(resolve))
+    const frame = pipeline.cached(`${instId}:15m`)
+    assert.equal(frame.bars[0].hour, first)
+    assert.equal(frame.oiState, 'ready', 'Price catch-up cannot exclude an already displayed statistic slot.')
+    assert.equal(frame.takerState, 'ready')
+    assert.deepEqual(calls.filter(call => call.from <= first && call.through >= first).map(call => call.source).toSorted(), ['oi', 'taker'])
+    const requested = calls.filter(call => call.from <= first && call.through >= first).length
+    pipeline.refreshObservations(pipeline.series.get(`${instId}:15m`))
+    await new Promise<void>(resolve => setImmediate(resolve))
+    assert.equal(calls.filter(call => call.from <= first && call.through >= first).length, requested, 'Successful left-edge observations remain reusable while prices are delayed.')
+  } finally { gate.resolve(); await pipeline.dispose() }
+})
+
 test('interior holes and missing quote volume stay partial until persisted source inputs are complete', async () => {
   const canonical = source(400), absent = canonical[360], incomplete = { ...canonical[370], quoteVolume: null }
   const gate = deferred()
@@ -797,6 +827,31 @@ test('a newer statistic fences only its own slot while an admitted history page 
     assert.ok(frame.bars.slice(0, -1).every((bar: any) => bar.oi === 5000))
     assert.ok(frame.bars.every((bar: any) => !bar.takerObserved), 'Unrequested source observations stay independent.')
   } finally { gate.resolve(); await pipeline.dispose() }
+})
+
+test('a concurrent statistic update cannot discard unrelated left-edge observations from a local read', async () => {
+  const canonical = source(400), rows = canonical.map(row => ({ ...row, oi: null, buy: null, sell: null, statisticsVersion: null }))
+  const { pipeline, store } = fixture(rows as any), gate = deferred(), entered = deferred()
+  let reading: Promise<unknown> | undefined
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`), read = store.candles.bind(store)
+    store.rows = canonical
+    store.candles = async (query: any) => {
+      const result = await read(query)
+      if (query.order === 'desc') { entered.resolve(); await gate.promise }
+      return result
+    }
+    reading = pipeline.read(state)
+    await entered.promise
+    const last = canonical.at(-1)!
+    await pipeline.observeStatistics(instId, '15m', last.timestamp, last.timestamp, 'interactive', [{ ...last, oi: 9000 }], 'oi')
+    gate.resolve(); await reading
+    const frame = pipeline.frame(state)
+    assert.ok(frame.bars.slice(0, -1).every((bar: any) => bar.oi === 5000), 'A newer final slot cannot veto the other 95 native observations.')
+    assert.ok(frame.bars.every((bar: any) => bar.buy === 70 && bar.sell === 30), 'The OI update cannot fence Taker observations.')
+    assert.equal(frame.bars.at(-1).oi, 9000, 'The actual concurrent OI correction stays authoritative.')
+  } finally { gate.resolve(); await reading; await pipeline.dispose() }
 })
 
 test('returning from deep history restores an evicted latest price locally before source work', async () => {
