@@ -79,9 +79,8 @@ const fixture = async (config: ReturnType<typeof preferences>, fetcher: typeof f
   // Raw collection assertions exclude independent chart-history preparation.
   service.preparedCharts.setRealtimeSubscriptions = () => undefined
   await service.ready
-  service.projectListEntry = async () => null
+  service.preparedCharts.setUniverse = () => ({ frames: [] })
   service.updateRanking = async () => undefined
-  service.scheduleListProjection = () => undefined
   for (const lane of service.requestLanes.values()) lane.interval = 0
   service.publicRealtime.start()
   service.realtime.start()
@@ -143,16 +142,21 @@ test('a streamed ticker changes every published list price without waiting for h
   })
   try {
     await f.service.refresh(); await f.open()
-    for (const frame of ['5m', '15m', '1H']) f.service.ensureListRows(frame)
-    assert.equal(f.service.listRowsFor('15m')[0]?.lastPrice, 100)
+    assert.equal(f.service.listRowsFor()[0]?.lastPrice, 100)
     let reads = 0
     f.store.candles = async () => { reads += 1; throw new Error('A ticker must not read history.') }
     f.service.history.ensurePrices = async () => { reads += 1; throw new Error('A ticker must not repair history.') }
-    const before = requests
+    const before = requests, snapshot = await f.service.snapshot()
+    let events = 0
+    const unsubscribe = f.service.subscribeMarket(() => { events++ })
     f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'tickers', [ticker(value.instId, 200)])
     await f.idle()
     assert.ok(f.service.streamQualifications.has(value.instId), 'The price must publish before the deferred screening batch runs.')
-    for (const frame of ['5m', '15m', '1H'] as const) assert.equal(f.service.listRowsFor(frame)[0]?.lastPrice, 200)
+    assert.equal(f.service.listRowsFor()[0]?.lastPrice, 200)
+    await waitFor(() => events > 0)
+    unsubscribe()
+    const changed = await f.service.snapshot({ sinceRevision: snapshot.revision, serviceSession: snapshot.serviceSession })
+    assert.equal('rows' in changed && changed.rows[0]?.lastPrice, 200)
     assert.equal(reads, 0)
     assert.equal(requests, before)
   } finally { await f.close() }
@@ -178,7 +182,7 @@ test('a previously failing contract is requalified by the 100ms stream batch wit
     assert.equal(f.service.catalog.has(value.instId), false, 'Raw callbacks defer expensive qualification into one shared batch.')
     await waitFor(() => f.service.catalog.has(value.instId))
     assert.equal(f.service.catalogChecks.get(value.instId)?.status, 'verified')
-    assert.equal(f.service.listRowsFor('15m')[0]?.lastPrice, 200)
+    assert.equal(f.service.listRowsFor()[0]?.lastPrice, 200)
     assert.equal(requests, before)
   } finally { await f.close() }
 })
@@ -214,11 +218,11 @@ test('delayed REST ticker and book responses cannot regress newer WebSocket obse
     assert.equal(f.service.observations.get(value.instId).ticker, streamTicker)
     assert.equal(f.service.observations.get(value.instId).book, streamBook)
     assert.equal(f.service.catalogChecks.get(value.instId)?.status, 'verified')
-    assert.equal(f.service.listRowsFor('15m')[0]?.lastPrice, 200)
+    assert.equal(f.service.listRowsFor()[0]?.lastPrice, 200)
   } finally { tickerGate.resolve(); bookGate.resolve(); await checking; await f.close() }
 })
 
-test('delisting removes every public and candle subscription, including a previously selected chart', async () => {
+test('delisting removes every public and candle subscription across all native periods', async () => {
   let instruments = [instrument(), instrument('ETH')]
   const f = await fixture(preferences('spread'), async input => {
     const path = new URL(String(input)).pathname
@@ -229,7 +233,6 @@ test('delisting removes every public and candle subscription, including a previo
   try {
     await f.service.refresh(); await f.open()
     const removed = instruments[1].instId
-    f.service.chartSubscriptions = [{ instId: removed, timeframe: '1H' }]
     instruments = instruments.slice(0, 1)
     await f.discover(); await f.idle()
     assert.deepEqual(f.subscriptions(OKX_BUSINESS_WEBSOCKET_URL), ['candle1H:BTC-USDT-SWAP', 'candle15m:BTC-USDT-SWAP', 'candle5m:BTC-USDT-SWAP'].sort())
@@ -359,10 +362,10 @@ test('an older asynchronous depth result cannot replace a newer streamed list pr
     const evaluation = f.service.streamEvaluations.get(value.instId)
     f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'tickers', [ticker(value.instId, 300)])
     await f.idle()
-    assert.equal(f.service.listRowsFor('15m')[0]?.lastPrice, 300)
+    assert.equal(f.service.listRowsFor()[0]?.lastPrice, 300)
     gate.resolve(); await evaluation
     assert.equal(f.service.catalog.get(value.instId).ticker.last, '300')
-    assert.equal(f.service.listRowsFor('15m')[0]?.lastPrice, 300)
+    assert.equal(f.service.listRowsFor()[0]?.lastPrice, 300)
   } finally { gate.resolve(); await f.close() }
 })
 

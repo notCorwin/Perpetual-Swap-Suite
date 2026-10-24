@@ -13,6 +13,7 @@ const INDICATOR_WARMUP = 199 // EMA200 is the longest initial seed.
 const FORMULA_VERSION = 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-wilder-atr14-percent-bbw20-2-v5'
 const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
 const priceFields = ['open', 'high', 'low', 'close', 'volume', 'baseVolume', 'quoteVolume', 'confirmed']
+const TIMEFRAMES = ['5m', '15m', '1H']
 const intervalFor = timeframe => ({ '5m': 300_000, '15m': 900_000, '1H': 3_600_000 })[timeframe]
 const seriesKey = (instId, timeframe) => `${instId}:${timeframe}`
 const numeric = value => typeof value === 'number' && Number.isFinite(value)
@@ -195,24 +196,24 @@ export class PreparedChartPipeline {
   cached(key) { return this.snapshots.get(key)?.frame ?? null }
   latest(state) { return state.latestHour ?? null }
 
-  setUniverse(instIds, timeframe, focusInstId) {
+  setUniverse(instIds) {
     if (this.closed) throw new Error('Prepared chart data service is closed.')
-    if (!intervalFor(timeframe)) throw new Error('Unsupported chart timeframe.')
-    this.requestedIDs = new Set(instIds)
+    this.requestedIDs = new Set(instIds.filter(Boolean))
     const previous = this.universe
-    this.universe = new Map([...this.requestedIDs].map(instId => {
+    this.universe = new Map([...this.requestedIDs].flatMap(instId => TIMEFRAMES.map(timeframe => {
       const key = seriesKey(instId, timeframe)
       return [key, previous.get(key) ?? { key, instId, timeframe, controller: new AbortController() }]
-    }))
+    })))
     for (const [key, demand] of previous) if (!this.universe.has(key)) demand.controller.abort()
-    if (focusInstId && !this.explicitFocus && this.focusKey !== seriesKey(focusInstId, timeframe)) this.setFocus({ instId: focusInstId, timeframe })
     this.reconcileSourceJobs()
     this.candidateQueue = this.candidateQueue.filter(demand => this.currentDemand(demand))
     for (const demand of this.universe.values()) this.queueCandidate(demand)
     this.trim()
     this.scheduleCandidates()
-    // Admission returns resident frames immediately; each missing candidate
-    // publishes its own price/indicator/statistic lifecycle as it becomes ready.
+  }
+
+  // Renderer hydration observes backend-owned membership without admitting work.
+  residentFrames() {
     return { frames: [...this.universe.keys()].flatMap(key => this.cached(key) ?? []) }
   }
 
@@ -320,13 +321,27 @@ export class PreparedChartPipeline {
     if (target && (!intervalFor(target.timeframe) || target.endHour !== undefined && !Number.isFinite(target.endHour))) throw new Error('Invalid chart target.')
     if (id !== undefined) this.explicitFocus = true
     if (key === this.focus?.key && target?.endHour === this.focus?.end && id === this.focus?.id) return
-    this.focus = target ? { key, timeframe: target.timeframe, end: target.endHour, id } : null
+    this.replaceFocus(target, id)
+  }
+
+  // An invalidated input generation needs a new preparation identity while
+  // preserving the renderer's ownership token and selected cursor.
+  replaceFocus(target, id) {
+    const key = target ? seriesKey(target.instId, target.timeframe) : null
+    this.focus = target ? { key, instId: target.instId, timeframe: target.timeframe, end: target.endHour, id } : null
     this.focusKey = key
-    const state = this.series.get(key)
+    const state = target ? this.state(target.instId, target.timeframe) : null
     if (state) state.historyEnd = target.endHour ?? null
     const candidate = this.universe.get(key), queued = this.candidateQueue.indexOf(candidate)
     if (queued > 0) { this.candidateQueue.splice(queued, 1); this.candidateQueue.unshift(candidate) }
     this.reconcileSourceJobs()
+    if (this.focus) {
+      const focus = this.focus
+      focus.task = Promise.resolve().then(() => this.prepareFocus(focus))
+      // The command acknowledges intent immediately; lifecycle notifications
+      // and backend retry deadlines report independently owned source work.
+      void focus.task.catch(() => {}).finally(() => this.scheduleRefresh())
+    }
     this.scheduleRefresh()
   }
 
@@ -549,7 +564,7 @@ export class PreparedChartPipeline {
     if (oiChanged) state.oiVersion = (state.oiVersion ?? 0) + 1
     if (takerChanged) state.takerVersion = (state.takerVersion ?? 0) + 1
     if (pricesChanged) this.invalidateDerived(state, changedFrom)
-    this.retainRows(state, this.liveStates.get(state.key) === state ? TAIL : HISTORY)
+    this.retainRows(state, this.liveStates.get(state.key) === state ? TAIL : HISTORY, end)
     const coverage = await this.store.coverage(state.instId, state.timeframe, priority)
     state.latestHour = coverage.last === null ? state.latestHour : Math.max(state.latestHour ?? -Infinity, coverage.last)
     const listing = Number(this.instrument(state.instId)?.listTime)
@@ -559,7 +574,7 @@ export class PreparedChartPipeline {
       const hours = rows.filter(row => row.confirmed && state.rows.has(row.timestamp)).map(row => row.timestamp)
       // Admission follows the returned facts, including an implicit latest
       // query. An obsolete subpage cannot certify another active viewport.
-      if (hours.includes(state.historyEnd)) state.historyRange = { from: Math.min(...hours), through: Math.max(...hours),
+      if (hours.length) state.historyRange = { from: Math.min(...hours), through: Math.max(...hours),
         revision: residentRevision === this.store.candleRevision?.(state.instId, state.timeframe) ? residentRevision : null }
     }
     this.updateMemory(state)
@@ -568,10 +583,10 @@ export class PreparedChartPipeline {
     this.syncLive(state)
   }
 
-  retainRows(state, limit) {
+  retainRows(state, limit, cursor = state.historyEnd) {
     if (!state.rows.size) { this.pruneSourceAttempts(state); return }
-    const historical = state.historyEnd !== null && state.historyEnd !== undefined
-    const anchor = historical ? state.historyEnd : Math.max(...state.rows.keys()), ahead = historical ? HISTORY_AHEAD : 0
+    const historical = cursor !== null && cursor !== undefined
+    const anchor = historical ? cursor : Math.max(...state.rows.keys()), ahead = historical ? HISTORY_AHEAD : 0
     const first = anchor - (limit - ahead - 1) * state.intervalMS, last = anchor + ahead * state.intervalMS
     // Acquisition can advance its reserve beyond the selected viewport. Keep
     // those at most 96 selected facts too, so focus maintenance does not keep
@@ -635,18 +650,14 @@ export class PreparedChartPipeline {
     return live
   }
 
-  async local(instId, timeframe, { priority = 'foreground', focusId, focus = priority === 'foreground' ? this.requestFocus(instId, timeframe, undefined, focusId) : null } = {}) {
+  async local(instId, timeframe, { priority = 'foreground' } = {}) {
     if (this.closed) throw new Error('Prepared chart data service is closed.')
     if (!intervalFor(timeframe)) throw new Error('Unsupported chart timeframe.')
     const key = seriesKey(instId, timeframe)
     const state = this.state(instId, timeframe)
     state.chartRequested = true
-    if (this.currentFocus(focus)) {
-      state.historyRequest = (state.historyRequest ?? 0) + 1
-      state.historyEnd = null
-    }
     if (!state.loaded || !state.rows.has(state.latestHour)) {
-      await this.job(`local:${key}`, () => this.read(state, undefined, TAIL, this.currentFocus(focus) ? 'interactive' : priority))
+      await this.job(`local:${key}`, () => this.read(state, undefined, TAIL, priority))
       // A concurrent candidate may own this coalesced SQLite read. Its compact
       // facts also admit the selected chart without another disk query.
       const live = this.liveStates.get(key)
@@ -658,59 +669,55 @@ export class PreparedChartPipeline {
         this.updateMemory(state)
       }
     }
-    this.seed(state, priority)
     const frame = this.publish(state)
-    this.refreshObservations(state, undefined, VISIBLE, VISIBLE, focus)
-    this.scheduleRefresh()
     return frame.bars.length || frame.liveBar ? frame : null
   }
 
-  async localHistory(instId, timeframe, targetEnd, { focusId, focus = this.requestFocus(instId, timeframe, targetEnd, focusId), reserve } = {}) {
+  async localHistory(instId, timeframe, targetEnd) {
     if (this.closed) throw new Error('Prepared chart data service is closed.')
+    if (!intervalFor(timeframe) || targetEnd !== undefined && !Number.isFinite(targetEnd)) throw new Error('Invalid chart target.')
     const state = this.state(instId, timeframe)
     state.chartRequested = true
-    const request = this.currentFocus(focus) ? state.historyRequest = (state.historyRequest ?? 0) + 1 : null
-    if (request !== null) state.historyEnd = targetEnd ?? state.latestHour
     const end = targetEnd ?? state.latestHour
     const from = Math.max(0, end - (VISIBLE - 1) * state.intervalMS, state.floor ?? 0)
-    // The local mutation counter also fences a commit whose normal observer
-    // has not arrived yet. Reuse never certifies an older durable observation.
-    // A latest tail is only 128 rows. A bulk admission belongs to the actual
-    // returned interval; a previous deep-history read cannot certify that tail.
     const admitted = state.historyRange
     let resident = Boolean(state.loaded && admitted && end !== null && from >= admitted.from && end <= admitted.through
       && admitted.revision === this.store.candleRevision?.(instId, timeframe))
     for (let hour = from; resident && hour <= end; hour += state.intervalMS) resident = completePriceCandle(state.rows.get(hour))
-    if (!resident) await this.job(`history:${state.key}:${targetEnd ?? 'latest'}`, () => this.read(state, targetEnd, HISTORY, this.demandPriority(state, from, end, focus)))
-    if (this.currentFocus(focus) && request === state.historyRequest) state.historyEnd = targetEnd ?? state.latestHour
-    this.seed(state, 'foreground')
-    this.refreshObservations(state, targetEnd, VISIBLE, targetEnd === undefined ? VISIBLE : HISTORY_PAGE, focus, reserve)
-    this.prefetchStatistics(state, focus)
-    const currentEnd = targetEnd ?? state.latestHour
-    const frame = this.historyFrame(state, currentEnd)
-    if (request === state.historyRequest) { state.publishedHistoryKey = this.historyKey(state, currentEnd); state.publishedHistoryStatus = state.statusVersion }
+    if (!resident) await this.job(`history:${state.key}:${targetEnd ?? 'latest'}`, () => this.read(state, targetEnd, HISTORY, 'foreground'))
+    const frame = this.historyFrame(state, targetEnd ?? state.latestHour)
     return frame.bars.length || frame.liveBar ? frame : null
   }
 
-  async prepare(instId, timeframe, targetEnd, historyBars = VISIBLE, { focusId } = {}) {
+  async prepare(instId, timeframe, targetEnd, _historyBars = VISIBLE, { focusId } = {}) {
     if (!intervalFor(timeframe) || targetEnd !== undefined && !Number.isFinite(targetEnd)) throw new Error('Invalid chart target.')
     const focus = this.requestFocus(instId, timeframe, targetEnd, focusId)
-    const reserveBars = Math.max(HISTORY_PAGE, Math.min(HISTORY - HISTORY_AHEAD, historyBars))
+    if (focus) await focus.task
+    const frame = targetEnd === undefined ? await this.local(instId, timeframe) : await this.localHistory(instId, timeframe, targetEnd)
+    const state = this.state(instId, timeframe)
+    return frame ?? (targetEnd === undefined ? this.frame(state) : this.historyFrame(state, targetEnd))
+  }
+
+  async prepareFocus(focus) {
+    if (!this.currentFocus(focus)) return null
+    const { instId, timeframe, end: targetEnd } = focus
+    // The backend owns a fixed navigation reserve. Wheel cadence and renderer
+    // prepare retries cannot change acquisition, cancellation, or retry policy.
+    const reserveBars = HISTORY - HISTORY_AHEAD
     const reserve = targetEnd === undefined ? undefined : { from: targetEnd - (reserveBars - 1) * intervalFor(timeframe), through: targetEnd }
-    let frame = targetEnd === undefined ? await this.local(instId, timeframe, { focus }) : await this.localHistory(instId, timeframe, targetEnd, { focus, reserve })
+    let frame = targetEnd === undefined ? await this.local(instId, timeframe) : await this.localHistory(instId, timeframe, targetEnd)
     const state = this.state(instId, timeframe)
     state.active += 1
     const current = () => this.currentFocus(focus)
     try {
       if (!current()) return targetEnd === undefined ? frame ?? this.frame(state) : this.historyFrame(state, targetEnd)
       const prices = this.refreshObservations(state, targetEnd, VISIBLE, targetEnd === undefined ? VISIBLE : HISTORY_PAGE, focus, reserve)
+      this.seed(state, 'foreground', focus)
+      this.prefetchStatistics(state, focus)
       if (targetEnd !== undefined) {
-        // One native page makes the nearest viewport usable, including the
-        // recursive indicators' warmup. Publish it before downloading farther
-        // reserve pages; the renderer can advance while this request continues.
         await prices?.catch(error => { if (current()) throw error })
         if (!current()) return this.historyFrame(state, targetEnd)
-        await this.seed(state, 'foreground')
+        await this.seed(state, 'foreground', focus)
         while (current() && state.calculation) await state.calculation
         if (!current()) return this.historyFrame(state, targetEnd)
         this.publish(state)
@@ -719,7 +726,7 @@ export class PreparedChartPipeline {
           if (through < Math.max(0, state.floor ?? 0)) break
           await this.refreshObservations(state, through, Math.min(HISTORY_PAGE, reserveBars - loaded), undefined, focus, reserve)?.catch(error => { if (current()) throw error })
           if (!current()) break
-          await this.seed(state, 'foreground')
+          await this.seed(state, 'foreground', focus)
           while (current() && state.calculation) await state.calculation
           if (!current()) break
           this.publish(state)
@@ -1082,7 +1089,7 @@ export class PreparedChartPipeline {
 
   seed(state, priority = 'background', demand) {
     if (this.closed || !state.rows.size && !this.liveStates.get(state.key)?.rows.size) return Promise.resolve()
-    if (state.calculation) return state.calculation
+    if (state.calculation) return state.calculation.then(() => !demand || this.currentDemand(demand) ? this.seed(state, priority, demand) : undefined)
     const shared = this.liveSeeds.get(state.key)
     if (shared) return shared.then(() => !demand || this.currentDemand(demand) ? this.seed(state, priority, demand) : undefined)
     const stillNeeded = () => !this.closed && (!demand || this.currentDemand(demand))
@@ -1207,22 +1214,6 @@ export class PreparedChartPipeline {
     return task
   }
 
-  async projectSeries(instId, timeframe) {
-    const state = this.state(instId, timeframe)
-    if (!state.loaded) await this.read(state, undefined, TAIL, 'background')
-    const live = this.liveState(instId, timeframe)
-    if (state.latestHour !== null && !state.rows.has(state.latestHour) && !live.rows.has(state.latestHour)) await this.read(live, undefined, TAIL, 'background')
-    await this.seed(state)
-    const current = live.rows.has(state.latestHour) ? live : state
-    return { end: state.latestHour, bars: [...current.rows.values()].sort((a, b) => a.timestamp - b.timestamp).slice(-TAIL).map(row => bar(row, current.indicators.get(row.timestamp))) }
-  }
-  async projectListSeries(instId, timeframe) {
-    const live = this.liveStates.get(seriesKey(instId, timeframe))
-    if (live?.indicatorState && live.indicatorState.lastTimestamp === live.latestHour && live.rows.size && [...live.rows.keys()].every(hour => live.indicators.has(hour))) return { end: live.latestHour, bars: [...live.rows.values()].sort((a, b) => a.timestamp - b.timestamp).map(row => bar(row, live.indicators.get(row.timestamp))), bollExpansion: live.bollExpansion ?? null }
-    const projected = await this.projectSeries(instId, timeframe)
-    return { ...projected, bollExpansion: this.liveStates.get(seriesKey(instId, timeframe))?.bollExpansion ?? null }
-  }
-
   observe(rows, previous) {
     return measureOperation({ category: 'cpu', name: 'indicators.observe', attributes: { candles: rows.length, execution: 'inline' } }, () => {
     for (const [key, batch] of Map.groupBy(rows, row => seriesKey(row.instrument, row.timeframe))) {
@@ -1294,15 +1285,16 @@ export class PreparedChartPipeline {
   }
 
   invalidate(instId, timeframe) {
-    const state = this.series.get(seriesKey(instId, timeframe)), live = this.liveStates.get(seriesKey(instId, timeframe))
-    for (const current of [state, live].filter(Boolean)) {
-      current.priceVersion += 1; current.generation = ++this.nextGeneration; current.indicatorState = null; current.indicators.clear(); current.loaded = false; current.historyRange = null; current.rows.clear(); current.latestHour = null
+    const key = seriesKey(instId, timeframe), state = this.series.get(key), live = this.liveStates.get(key)
+    const generation = ++this.nextGeneration
+    for (const current of new Set([state, live].filter(Boolean))) {
+      current.priceVersion += 1; current.generation = generation; current.indicatorState = null; current.indicators.clear(); current.loaded = false; current.historyRange = null; current.rows.clear(); current.latestHour = null
       current.indicatorFailures?.clear()
     }
-    this.snapshots.delete(seriesKey(instId, timeframe))
-    const focus = this.focus?.key === state?.key ? this.focus : null
-    if (state) (state.historyEnd != null ? this.localHistory(instId, timeframe, state.historyEnd, { focus }) : this.local(instId, timeframe, { focus })).catch(() => {})
-    const demand = this.universe.get(seriesKey(instId, timeframe))
+    this.snapshots.delete(key)
+    const focus = this.focus?.key === key ? this.focus : null
+    if (focus) this.replaceFocus({ instId, timeframe, endHour: focus.end }, focus.id)
+    const demand = this.universe.get(key)
     if (demand) this.queueCandidate(demand, true)
   }
 

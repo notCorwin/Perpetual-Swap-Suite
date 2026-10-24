@@ -1,6 +1,5 @@
 import type { AnalysisSettings, AnalysisSettingsRequest } from './chart-analysis.ts'
 import type { PreparedChartResponse } from './chart-data.ts'
-import type { NativeMarketRow } from './market-row.ts'
 import type { Preferences, PreferencesPatch } from '../electron/services/preferences.js'
 import type { RadarTimeframe } from './timeframe.ts'
 import type { OperationContext, OperationJournalEvent } from '../electron/services/operations.js'
@@ -18,14 +17,16 @@ export type OperationBridgeHooks = {
 export type ChartCaptureBounds = { x: number; y: number; width: number; height: number; backgroundRGB: number[] }
 export type ChartImage = { imageDataURL: string; width: number; height: number }
 
-export type RankedMarketRow = NativeMarketRow & { rankingChange: number | null; rankingAsOf: number | null }
-export type ListProgress = { total: number; completed: number; pending: number; retrying: number; unavailable: number }
+export type RankedMarketRow = {
+  instId: string; lastPrice: number | null; turnover24hUSDT: number | null
+  rankingChange: number | null; rankingAsOf: number | null
+}
 export type CatalogProgress = { total: number; completed: number; verified: number; failed: number; unknown: number; pending: number }
 export type MarketSnapshot = {
-  rows: RankedMarketRow[]; updatedAt: number | null; error: string; revision: number
-  loading?: boolean; listProgress?: ListProgress; catalogSource?: 'none' | 'cache' | 'live'
+  rows: RankedMarketRow[]; turnoverOrder: string[]; updatedAt: number | null; error: string; revision: number
+  loading?: boolean; catalogSource?: 'none' | 'cache' | 'live'
   catalogProgress?: CatalogProgress
-  serviceSession?: string; timeframe?: RadarTimeframe; realtimeState?: string
+  serviceSession?: string; realtimeState?: string
 }
 export type UnchangedSnapshot = Partial<Omit<MarketSnapshot, 'rows'>> & { unchanged: true; revision: number; error: string }
 export type DataAudit = {
@@ -50,7 +51,7 @@ export type HistoryDownload = {
 }
 export type DesktopCommands = {
   preferences: { input: { action: 'read' } | { action: 'update'; values: PreferencesPatch }; output: Preferences }
-  snapshot: { input: { timeframe: RadarTimeframe; sinceRevision?: number; serviceSession?: string }; output: MarketSnapshot | UnchangedSnapshot }
+  snapshot: { input: { sinceRevision?: number; serviceSession?: string }; output: MarketSnapshot | UnchangedSnapshot }
   dataAudit: { input: { action: 'start' | 'cancel' | 'status' | 'repair' }; output: DataAudit }
   historyDownload: { input: { action: 'start' | 'cancel' | 'status' }; output: HistoryDownload }
   analysisSettings: { input: AnalysisSettingsRequest; output: AnalysisSettings }
@@ -60,9 +61,9 @@ export type DesktopCommands = {
   captureChart: { input: ChartCaptureBounds & { output?: 'png' }; output: { ok: boolean } }
   chartFocus: { input: { id: string; target: { instId: string; timeframe: RadarTimeframe; endHour?: number } | null }; output: { ok: boolean } }
   chartWindow: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number; historyBars?: number; focusId?: string }; output: PreparedChartResponse }
-  chartLocal: { input: { instId: string; timeframe: RadarTimeframe; focusId?: string }; output: PreparedChartResponse | null }
-  chartHistory: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number; focusId?: string }; output: PreparedChartResponse | null }
-  chartUniverse: { input: { instIds: string[]; timeframe: RadarTimeframe; focusInstId?: string }; output: { frames: PreparedChartResponse[] } }
+  chartLocal: { input: { instId: string; timeframe: RadarTimeframe }; output: PreparedChartResponse | null }
+  chartHistory: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number }; output: PreparedChartResponse | null }
+  chartUniverse: { input: Record<string, never>; output: { frames: PreparedChartResponse[] } }
 }
 export type DesktopRequest = { [K in keyof DesktopCommands]: { [P in K]: DesktopCommands[K]['input'] } }[keyof DesktopCommands]
 export type DesktopResponse<Request extends DesktopRequest> = Request extends { captureChart: { output: 'png' } }

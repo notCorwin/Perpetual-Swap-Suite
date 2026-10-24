@@ -8,8 +8,9 @@ const reject = (request, options) => assert.throws(() => parseDesktopRequest(req
 
 test('desktop requests accept each supported operation and preserve the public payload shape', () => {
   for (const request of [
-    { snapshot: { timeframe: '15m' } },
-    { snapshot: { timeframe: '1H', sinceRevision: -1, serviceSession: 'collector-1' } },
+    { snapshot: {} },
+    { snapshot: { sinceRevision: -1, serviceSession: 'collector-1' } },
+    { snapshot: { sinceRevision: 0, serviceSession: 'collector-1' } },
     { preferences: { action: 'read' } },
     { preferences: { action: 'update', values: { chartTimeframe: '5m', rankingLookback: 15, historyDays: 30, liquidity: { spread: { enabled: true, maxPercent: .05 }, depth: { enabled: false, minUSDT: 100_000 }, slippage: { enabled: true, maxPercent: .1, notionalUSDT: 100_000 }, volume24h: { minUSDT: 30_000_000 }, openInterest: { minUSDT: 5_000_000 }, volumeStability: { maxRatio: 2, enabled: false } } } } },
     { preferences: { action: 'update', values: { liquidity: { slippage: { notionalUSDT: 200_000 } } } } },
@@ -21,13 +22,10 @@ test('desktop requests accept each supported operation and preserve the public p
     { chartFocus: { id: 'focus-1', target: { instId, timeframe: '15m', endHour: 1_729_080_000_000 } } },
     { chartFocus: { id: 'hidden-2', target: null } },
     { chartWindow: { instId, timeframe: '15m', focusId: 'focus-1', historyBars: 1280 } },
-    { chartLocal: { instId, timeframe: '15m', focusId: 'focus-1' } },
-    { chartHistory: { instId, timeframe: '15m', focusId: 'focus-1', endHour: 1_729_080_000_000 } },
     { chartLocal: { instId, timeframe: '15m' } },
     { chartHistory: { instId, timeframe: '5m' } },
     { chartHistory: { instId, timeframe: '1H', endHour: 1_729_080_000_000 } },
-    { chartUniverse: { instIds: [instId], timeframe: '1H', focusInstId: instId } },
-    { chartUniverse: { instIds: [], timeframe: '5m' } },
+    { chartUniverse: {} },
     { captureChart: { x: 0, y: 0, width: 80, height: 60 } },
     { captureChart: { x: 1.5, y: 2.5, width: 80.5, height: 60.5, backgroundRGB: [.1, .2, .3], output: 'png' } },
     { copyText: '' },
@@ -47,7 +45,7 @@ test('mixed commands and unknown top-level or nested fields are rejected before 
   for (const request of [
     { copyText: 'text', preferences: { action: 'update', values: { historyDays: 10 } } },
     { copyText: 'text', unsupported: true },
-    { snapshot: { timeframe: '5m', rocPeriod: 9 } },
+    { snapshot: { rocPeriod: 9 } },
     { preferences: { action: 'read', values: { historyDays: 10 } } },
     { preferences: { action: 'update', values: { historyDays: 10, arbitrary: true } } },
     { preferences: { action: 'update', values: { liquidity: { spread: { maxPercent: .1, ignored: true } } } } },
@@ -56,14 +54,33 @@ test('mixed commands and unknown top-level or nested fields are rejected before 
     { chartWindow: { instId, timeframe: '5m', extra: true } },
     { chartLocal: { instId, timeframe: '5m', endHour: 1 } },
     { chartHistory: { instId, timeframe: '5m', extra: true } },
-    { chartHistory: { instId, timeframe: '5m', historyBars: 96 } },
     { chartFocus: { id: 'focus-1', target: { instId, timeframe: '5m', focusId: 'other' } } },
     { chartFocus: { id: 'focus-1', target: { instId, timeframe: '5m', historyBars: 96 } } },
-    { chartUniverse: { instIds: [instId], timeframe: '5m', extra: true } },
+    { chartUniverse: { extra: true } },
     { captureChart: { x: 0, y: 0, width: 80, height: 60, ignored: true } },
     { analysisSettings: { action: 'read', apiKey: 'test-key' } },
     { analysisSettings: { action: 'save', model: 'test-model', apiKey: 'test-key', endpoint: 'https://example.com' } },
     { gatewayFetch: { id: 'request-1', body: '{}', url: 'https://example.com' } },
+  ]) assert.throws(() => dispatch(request), DesktopRequestError)
+  assert.equal(effects, 0)
+})
+
+test('read requests reject retired timeframe, universe, and focus demand fields before dispatch', () => {
+  let effects = 0
+  const dispatch = input => { const request = parseDesktopRequest(input); effects++; return request }
+  for (const request of [
+    { snapshot: { timeframe: '5m' } },
+    { snapshot: { sinceRevision: 1, serviceSession: 'collector-1', timeframe: '15m' } },
+    { snapshot: { listProgress: {} } },
+    { chartUniverse: { instIds: [] } },
+    { chartUniverse: { timeframe: '5m' } },
+    { chartUniverse: { focusInstId: instId } },
+    { chartUniverse: { instIds: [instId], timeframe: '5m', focusInstId: instId } },
+    { chartLocal: { instId, timeframe: '5m', focusId: 'focus-1' } },
+    { chartLocal: { instId, timeframe: '5m', historyBars: 96 } },
+    { chartHistory: { instId, timeframe: '5m', historyBars: 96 } },
+    { chartHistory: { instId, timeframe: '5m', focusId: 'focus-1' } },
+    { chartHistory: { instId, timeframe: '5m', endHour: 1_729_080_000_000, focusId: undefined } },
   ]) assert.throws(() => dispatch(request), DesktopRequestError)
   assert.equal(effects, 0)
 })
@@ -81,9 +98,9 @@ test('retired protocol operations and appearance preferences have no accepted co
 test('required fields, action-specific fields, types, and numeric boundaries are validated', () => {
   for (const request of [
     null, [], '', 1, {}, new Date(),
-    { snapshot: {} }, { snapshot: { timeframe: '1m' } },
-    { snapshot: { timeframe: '5m', sinceRevision: -2 } }, { snapshot: { timeframe: '5m', sinceRevision: .5 } },
-    { snapshot: { timeframe: '5m', serviceSession: '' } },
+    { snapshot: null }, { snapshot: [] },
+    ...[-2, .5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '1', null].map(sinceRevision => ({ snapshot: { sinceRevision } })),
+    ...['', 1, null].map(serviceSession => ({ snapshot: { serviceSession } })),
     { preferences: { action: 'save', values: {} } }, { preferences: { action: 'update' } },
     { preferences: { action: 'update', values: {} } },
     ...[0, -5, 7, 5.5, Infinity, '15'].map(rankingLookback => ({ preferences: { action: 'update', values: { rankingLookback } } })),
@@ -102,8 +119,7 @@ test('required fields, action-specific fields, types, and numeric boundaries are
     ...[95, 4_097, 100.5, NaN, Infinity, '512', null].map(historyBars => ({ chartWindow: { instId, timeframe: '5m', historyBars } })),
     { chartHistory: { instId, timeframe: '5m', endHour: -1 } },
     { chartHistory: { instId, timeframe: '5m', endHour: 1.5 } },
-    { chartUniverse: { instIds: [instId, null], timeframe: '5m' } },
-    { chartUniverse: { instIds: Array(1001).fill(instId), timeframe: '5m' } },
+    { chartUniverse: null }, { chartUniverse: [] },
     { captureChart: { x: 0, y: 0, width: 0, height: 60 } },
     { captureChart: { x: NaN, y: 0, width: 80, height: 60 } },
     { captureChart: { x: 0, y: 0, width: Infinity, height: 60 } },
@@ -125,22 +141,28 @@ test('validated requests are detached data and cannot invoke accessors or inheri
   reject(Object.create({ copyText: 'text' }))
   reject({ copyText: 'text', [Symbol('hidden')]: true })
   reject(Object.defineProperty({ copyText: 'text' }, 'hidden', { value: true }))
-  const nestedAccessor = { snapshot: Object.defineProperty({}, 'timeframe', { enumerable: true, get() { reads++; return '5m' } }) }
+  const nestedAccessor = { snapshot: Object.defineProperty({}, 'sinceRevision', { enumerable: true, get() { reads++; return 1 } }) }
   reject(nestedAccessor)
+  reject({ chartUniverse: Object.defineProperty({}, 'instIds', { enumerable: true, get() { reads++; return [] } }) })
   assert.equal(reads, 0)
-  const sparse = Array(1)
-  reject({ chartUniverse: { instIds: sparse, timeframe: '5m' } })
-  const customArray = Object.assign([instId], { ignored: true })
-  reject({ chartUniverse: { instIds: customArray, timeframe: '5m' } })
-  const request = { chartUniverse: { instIds: [instId], timeframe: '5m' } }
+  const sparse = Array(3)
+  reject({ captureChart: { x: 0, y: 0, width: 80, height: 60, backgroundRGB: sparse } })
+  const customArray = Object.assign([0, 0, 0], { ignored: true })
+  reject({ captureChart: { x: 0, y: 0, width: 80, height: 60, backgroundRGB: customArray } })
+  const request = { chartFocus: { id: 'focus-1', target: { instId, timeframe: '5m' } } }
   const parsed = parseDesktopRequest(request)
-  request.chartUniverse.instIds.push('ETH-USDT-SWAP')
-  assert.deepEqual(parsed.chartUniverse.instIds, [instId])
+  request.chartFocus.target.instId = 'ETH-USDT-SWAP'
+  assert.equal(parsed.chartFocus.target.instId, instId)
+  const universe = { chartUniverse: {} }
+  const parsedUniverse = parseDesktopRequest(universe)
+  universe.chartUniverse.instIds = [instId]
+  assert.deepEqual(parsedUniverse, { chartUniverse: {} })
   const partial = { preferences: { action: 'update', values: { liquidity: { depth: { enabled: false } } } } }
   const parsedPartial = parseDesktopRequest(partial)
   partial.preferences.values.liquidity.depth.enabled = true
   assert.equal(parsedPartial.preferences.values.liquidity.depth.enabled, false)
   assert.deepEqual(parseDesktopRequest({ chartWindow: { instId, timeframe: '5m', endHour: undefined } }), { chartWindow: { instId, timeframe: '5m' } })
+  assert.deepEqual(parseDesktopRequest({ snapshot: { sinceRevision: undefined, serviceSession: undefined } }), { snapshot: {} })
 })
 
 test('test-only actions require explicit boolean opt-in and retain their own strict schemas', () => {

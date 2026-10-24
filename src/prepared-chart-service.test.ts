@@ -54,6 +54,19 @@ const fixture = (rows = source(400), history: any = {}) => {
   pipeline.workerLimit = 2
   return { store, pipeline }
 }
+// Commands declare backend demand; the subsequent reads never create it.
+const focusLatest = async (pipeline: any, id: string, timeframe: string) => {
+  pipeline.setFocus({ instId: id, timeframe })
+  const frame = await pipeline.local(id, timeframe)
+  await Promise.resolve()
+  return frame
+}
+const focusHistory = async (pipeline: any, id: string, timeframe: string, endHour?: number) => {
+  pipeline.setFocus({ instId: id, timeframe, endHour })
+  const frame = await pipeline.localHistory(id, timeframe, endHour)
+  await Promise.resolve()
+  return frame
+}
 const finishSeed = async (pipeline: any) => { while (pipeline.liveSeeds.size) await Promise.all([...pipeline.liveSeeds.values()]) }
 const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
 const sqliteFixture = async (rows: any[]) => {
@@ -62,6 +75,85 @@ const sqliteFixture = async (rows: any[]) => {
   const pipeline: any = new PreparedChartPipeline({ store, history: {} as any, normalize: (row: any) => row, revision: () => 0, instrument: () => undefined })
   return { store, pipeline, async close() { await pipeline.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) } }
 }
+
+test('local and historical reads expose durable facts without creating backend demand', async () => {
+  const rows = source(2000), calls: string[] = []
+  const { pipeline, store } = fixture(rows, {
+    async ensurePrices() { calls.push('prices') },
+    async ensureStatistics() { calls.push('statistics') },
+  })
+  try {
+    const latest = await pipeline.local(instId, '15m')
+    const historical = await pipeline.localHistory(instId, '15m', rows[1000].timestamp)
+    const missing = await pipeline.local('MISSING-USDT-SWAP', '15m')
+    await new Promise<void>(resolve => setImmediate(resolve))
+    assert.equal(latest.bars.length, 96); assert.equal(latest.bars.at(-1).close, rows.at(-1)!.close)
+    assert.ok(historical.bars.some((bar: any) => bar.hour === rows[1000].timestamp)); assert.equal(missing, null)
+    assert.ok(store.queries.length > 0, 'Pure reads may hydrate existing SQLite facts.')
+    assert.equal(pipeline.focus, null); assert.equal(pipeline.focusKey, null); assert.equal(pipeline.universe.size, 0)
+    assert.equal(pipeline.state(instId, '15m').historyEnd, null, 'A historical read cannot select its cursor.')
+    assert.equal(pipeline.nextCalculation, 0); assert.equal(pipeline.liveSeeds.size, 0); assert.equal(store.checkpoints.length, 0)
+    assert.equal(pipeline.sourceTasks.size, 0); assert.equal(pipeline.sourceAttempts.size, 0); assert.deepEqual(calls, [])
+  } finally { await pipeline.dispose() }
+})
+
+test('resident hydration is read-only and focus alone starts exact backend preparation', async () => {
+  const rows = source(400), { pipeline, store } = fixture(rows)
+  try {
+    for (let read = 0; read < 3; read++) assert.deepEqual(pipeline.residentFrames(), { frames: [] })
+    assert.equal(store.queries.length, 0); assert.equal(pipeline.series.size, 0); assert.equal(pipeline.nextCalculation, 0)
+    assert.equal(pipeline.focus, null); assert.equal(pipeline.universe.size, 0)
+    pipeline.setFocus({ instId, timeframe: '15m' }, 'explicit')
+    const focus = pipeline.focus
+    assert.ok(focus.task instanceof Promise)
+    await focus.task; await finishSeed(pipeline)
+    const frame = pipeline.cached(`${instId}:15m`), oracle = buildIndicatorSeries(rows, interval).bars.at(-1) as any
+    assert.equal(frame.indicatorState, 'ready')
+    for (const field of indicatorFields) assert.equal(frame.bars.at(-1)[field], oracle[field])
+    const reads = store.queries.length, calculations = pipeline.nextCalculation, checkpoints = store.checkpoints.length
+    for (let read = 0; read < 3; read++) {
+      pipeline.residentFrames()
+      await pipeline.local(instId, '15m')
+    }
+    assert.equal(pipeline.focus, focus); assert.equal(pipeline.focus.task, focus.task)
+    assert.equal(store.queries.length, reads); assert.equal(pipeline.nextCalculation, calculations); assert.equal(store.checkpoints.length, checkpoints)
+  } finally { await pipeline.dispose() }
+})
+
+test('historical focus alone repairs durable prices, statistics and exact indicators without renderer reads', async () => {
+  const canonical = source(2500), target = canonical[1800].timestamp, absent = canonical[1780], statistic = canonical[1770]
+  const calls: string[] = []
+  const rows = canonical.filter(row => row.timestamp !== absent.timestamp)
+    .map(row => row.timestamp === statistic.timestamp ? { ...row, oi: null, buy: null, sell: null, statisticsVersion: null } : row)
+  const { pipeline, store } = fixture(rows as any, {
+    async ensurePrices(_id: string, _frame: string, from: number, through: number) {
+      calls.push('price')
+      if (from <= absent.timestamp && through >= absent.timestamp) store.change(absent)
+      return { rows: canonical.filter(row => row.timestamp >= from && row.timestamp <= through) }
+    },
+    async ensureStatistics(_id: string, _frame: string, from: number, through: number, _priority: string, _signal: AbortSignal, source: string) {
+      calls.push(source)
+      store.rows = store.rows.map(row => row.timestamp < from || row.timestamp > through ? row
+        : source === 'oi' ? { ...row, oi: 5000, statisticsVersion: row.buy === null ? 9 : 11 }
+          : { ...row, buy: 70, sell: 30, statisticsVersion: row.oi === null ? 10 : 11 })
+      return { rows: store.rows.filter(row => row.timestamp >= from && row.timestamp <= through) }
+    },
+  })
+  try {
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target }, 'history-demand')
+    await pipeline.focus.task
+    while (pipeline.sourceTasks.size) await Promise.all([...pipeline.sourceTasks.values()].map((job: any) => job.task))
+    await finishSeed(pipeline)
+    const frame = pipeline.historyFrame(pipeline.series.get(`${instId}:15m`), target)
+    const viewport = frame.bars.filter((bar: any) => bar.hour >= target - 95 * interval && bar.hour <= target)
+    assert.equal(viewport.length, 96)
+    assert.ok(viewport.every((bar: any) => bar.priceComplete && bar.oiObserved && bar.takerObserved && bar.indicatorsObserved))
+    assert.ok(store.rows.some(row => row.timestamp === absent.timestamp), 'Focus repair commits the absent price into durable source data.')
+    assert.deepEqual([...new Set(calls)].toSorted(), ['oi', 'price', 'taker'])
+    const oracle = new Map(buildIndicatorSeries(canonical, interval).bars.map((bar: any) => [bar.hour, bar]))
+    for (const bar of viewport) for (const field of indicatorFields) assert.equal(bar[field], (oracle.get(bar.hour) as any)[field])
+  } finally { await pipeline.dispose() }
+})
 
 test('fresh OHLC and forming price publish while both statistic requests are held', async () => {
   const hold = deferred(), rows = source(400).map(row => ({ ...row, oi: null, buy: null, sell: null, statisticsVersion: null }))
@@ -82,8 +174,8 @@ test('fresh OHLC and forming price publish while both statistic requests are hel
 test('a listing with fewer than 96 candles publishes all available prices', async () => {
   const { pipeline } = fixture(source(12))
   try {
-    const frame = await pipeline.local(instId, '15m')
-    assert.equal(frame.bars.length, 12); assert.equal(frame.endHour, end()); assert.equal(frame.unavailable, undefined)
+    const frame = await focusLatest(pipeline, instId, '15m')
+    assert.equal(frame.bars.length, 12); assert.equal(frame.endHour, end())
     await finishSeed(pipeline)
     assert.equal(pipeline.cached(`${instId}:15m`).indicatorState, 'unavailable', 'Observed warmup nulls are truthful calculated results.')
     assert.equal(pipeline.cached(`${instId}:15m`).bars.at(-1).ema, null)
@@ -105,7 +197,7 @@ test('a current forming quote cannot certify a stale confirmed tail and its full
   })
   try {
     await pipeline.setLive(instId, '15m', { ...candle(end() + interval, 400), confirmed: false }, { receivedAt: Date.now() })
-    const frame = await pipeline.local(instId, '15m')
+    const frame = await focusLatest(pipeline, instId, '15m')
     assert.equal(frame.bars.length, 96); assert.equal(frame.priceState, 'stale')
     assert.equal(frame.realtimeState, 'live', 'Fresh quotes do not prove completed history coverage.')
     const state = pipeline.state(instId, '15m'), repair = pipeline.refreshObservations(state)
@@ -116,7 +208,7 @@ test('a current forming quote cannot certify a stale confirmed tail and its full
     assert.equal(repaired.priceState, 'ready'); assert.equal(repaired.endHour, end())
     assert.equal(repaired.bars.length, 96)
     assert.ok(repaired.bars.every((bar: any, index: number) => bar.hour === end() - (95 - index) * interval))
-    await pipeline.local(instId, '15m')
+    await focusLatest(pipeline, instId, '15m')
     assert.equal(priceCalls, 1, 'Opening a complete persisted window must reuse its coverage.')
   } finally { gate.resolve(); await pipeline.dispose() }
 })
@@ -137,7 +229,7 @@ for (const lag of [1, 12, 160]) test(`latest statistics cover the displayed left
   })
   try {
     await pipeline.setLive(instId, '15m', { ...candle(end() + interval), confirmed: false }, { receivedAt: Date.now() })
-    await pipeline.local(instId, '15m')
+    await focusLatest(pipeline, instId, '15m')
     for (let turn = 0; turn < 8; turn++) await new Promise<void>(resolve => setImmediate(resolve))
     const frame = pipeline.cached(`${instId}:15m`)
     assert.equal(frame.bars[0].hour, first)
@@ -163,7 +255,7 @@ test('interior holes and missing quote volume stay partial until persisted sourc
     },
   })
   try {
-    const frame = await pipeline.local(instId, '15m')
+    const frame = await focusLatest(pipeline, instId, '15m')
     assert.equal(frame.priceState, 'partial'); assert.equal(frame.bars.length, 95)
     const state = pipeline.state(instId, '15m'), key = `prices:${state.key}:${end() - 95 * interval}:${end()}`
     const first = pipeline.refreshObservations(state)
@@ -187,7 +279,7 @@ test('a verified recent listing uses the first completed native slot without req
   const { pipeline } = fixture(rows, { async ensurePrices() { requests += 1 } })
   pipeline.instrument = () => ({ listTime: rows[0].timestamp - interval / 2 })
   try {
-    const frame = await pipeline.local(instId, '15m')
+    const frame = await focusLatest(pipeline, instId, '15m')
     assert.equal(frame.oldestHour, rows[0].timestamp); assert.equal(frame.historyExhausted, true)
     assert.equal(frame.bars.length, 12); assert.equal(frame.priceState, 'ready')
     await new Promise<void>(resolve => setImmediate(resolve))
@@ -199,7 +291,7 @@ test('a persisted resident gap repair rebuilds descendant indicators before its 
   const canonical = source(500), absent = canonical[450]
   const { pipeline, store } = fixture(canonical.filter(row => row !== absent))
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const state = pipeline.state(instId, '15m'), generation = state.generation
     assert.equal(pipeline.cached(state.key).bars.at(-1).ema, null)
     store.change(absent)
@@ -223,17 +315,17 @@ test('a complete price viewport automatically acquires its missing EMA warmup an
   })
   const controller = new ChartController({
     focus: (target, id) => pipeline.setFocus(target ? { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } : null, id),
-    local: (id, timeframe, focusId) => pipeline.local(id, timeframe, { focusId }),
-    prepare: (target, focusId) => pipeline.prepare(target.instId, target.timeframe, target.end ?? undefined, 96, { focusId }),
-    universe: (ids, timeframe, focusId) => Promise.resolve(pipeline.setUniverse(ids, timeframe, focusId)),
+    local: (id, timeframe) => pipeline.local(id, timeframe),
+    history: target => pipeline.localHistory(target.instId, target.timeframe, target.end ?? undefined),
+    universe: () => Promise.resolve(pipeline.residentFrames()),
   })
   const encoder = new ChartNotificationEncoder()
   const unsubscribe = pipeline.subscribe((frame: any) => controller.ingestPrepared(encoder.encode(frame)))
   await controller.setUniverse([instId], '15m', instId)
   const close = controller.open(instId, '15m')
   try {
-    const frame = await pipeline.local(instId, '15m', { focusId: pipeline.focus.id })
-    assert.equal(frame.priceState, 'ready'); await finishSeed(pipeline)
+    const frame = await pipeline.local(instId, '15m')
+    assert.equal(frame.priceState, 'ready'); await pipeline.focus.task; await finishSeed(pipeline)
     assert.equal(pipeline.cached(`${instId}:15m`).indicatorState, 'unavailable')
     assert.equal(controller.getSnapshot().presented?.indicatorState, 'unavailable')
     assert.equal(requests.length, 1, 'Calculated warmup nulls must trigger source demand without another user action.')
@@ -247,7 +339,7 @@ test('a complete price viewport automatically acquires its missing EMA warmup an
     const oracle = new Map((buildIndicatorSeries(canonical.slice(-295), interval).bars as any[]).map(row => [row.hour, row]))
     for (const value of repaired.bars) for (const field of indicatorFields) assert.equal(value[field], oracle.get(value.hour)[field], `${field} at ${value.hour}`)
     const calculations = pipeline.nextCalculation, reads = store.queries.length
-    await pipeline.local(instId, '15m', { focusId: pipeline.focus.id }); await finishSeed(pipeline)
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
     assert.equal(requests.length, 1); assert.equal(pipeline.nextCalculation, calculations); assert.equal(store.queries.length, reads)
   } finally { gate.resolve(); close(); unsubscribe(); await pipeline.dispose() }
 })
@@ -261,8 +353,9 @@ test('an offscreen source hole repairs the selected historical indicators withou
       return { rows: store.rows.filter(row => row.timestamp >= from && row.timestamp <= through) }
     },
   })
+  pipeline.instrument = () => ({ listTime: canonical[0].timestamp })
   try {
-    const frame = await pipeline.localHistory(instId, '15m', target)
+    const frame = await focusHistory(pipeline, instId, '15m', target)
     assert.equal(frame.priceState, 'ready')
     await finishSeed(pipeline)
     await Promise.all([...pipeline.sourceTasks.values()].map((job: any) => job.task)); await finishSeed(pipeline)
@@ -278,7 +371,7 @@ test('warmup inputs committed before acquisition still replace cached null indic
   const canonical = source(295), { pipeline, store } = fixture(canonical.slice(-96))
   let requests = 0
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     assert.equal(pipeline.cached(`${instId}:15m`).indicatorState, 'unavailable')
     for (const row of canonical.slice(0, -96)) store.change(row)
     pipeline.history.ensurePrices = async () => { requests += 1; return { rows: store.rows } }
@@ -299,7 +392,7 @@ test('a concurrent visible correction cannot suppress invalidation of a later of
     async ensurePrices() { requests += 1; await gate.promise; store.change(absent); return { rows: store.rows } },
   })
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     assert.equal(requests, 1)
     const state = pipeline.state(instId, '15m'), generation = state.generation
     const corrected = { ...canonical[390], close: canonical[390].close + 1 }
@@ -326,7 +419,7 @@ test('indicator warmup acquisition retries after source recovery while complete 
   })
   const flush = async () => { for (let count = 0; count < 8; count++) await new Promise<void>(resolve => setImmediate(resolve)) }
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline); await flush()
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline); await flush()
     assert.equal(attempts, 1); assert.equal(pipeline.cached(`${instId}:15m`).priceState, 'ready')
     context.mock.timers.tick(60_000); await flush(); assert.equal(attempts, 1)
     pipeline.sourceStateChanged(); pipeline.refreshObservations(pipeline.state(instId, '15m')); await flush()
@@ -346,7 +439,7 @@ test('missing offscreen VWAP volumes repair even when every visible EMA is alrea
     },
   })
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     await Promise.all([...pipeline.sourceTasks.values()].map((job: any) => job.task)); await finishSeed(pipeline)
     const repaired = pipeline.cached(`${instId}:15m`)
     assert.equal(requests, 1); assert.equal(repaired.indicatorState, 'ready')
@@ -370,7 +463,7 @@ test('a wider indicator warmup demand respects the failed viewport source retry 
   pipeline.calculate = async (...args: any[]) => { await gate.promise; return calculate(...args) }
   const flush = async () => { for (let count = 0; count < 8; count++) await new Promise<void>(resolve => setImmediate(resolve)) }
   try {
-    await pipeline.local(instId, '15m'); await flush(); assert.equal(attempts, 1)
+    await focusLatest(pipeline, instId, '15m'); await flush(); assert.equal(attempts, 1)
     gate.resolve(); await finishSeed(pipeline); await flush()
     assert.ok(pipeline.indicatorDemand(pipeline.state(instId, '15m')))
     assert.equal(attempts, 1, 'Completing calculation cannot bypass backoff by requesting a different overlapping range.')
@@ -388,8 +481,8 @@ test('genuine listing warmup and zero-volume VWAP do not cause repeated history 
     const { pipeline } = fixture(rows, { async ensurePrices() { requests += 1 } })
     pipeline.instrument = () => ({ listTime: rows[0].timestamp })
     try {
-      await pipeline.local(instId, '15m'); await finishSeed(pipeline)
-      await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+      await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
+      await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
       assert.equal(requests, 0); assert.equal(pipeline.cached(`${instId}:15m`).indicatorState, 'unavailable')
     } finally { await pipeline.dispose() }
   }
@@ -409,7 +502,7 @@ test('source recovery repairs the selected historical viewport instead of the un
   })
   const flush = async () => { for (let count = 0; count < 8; count++) await new Promise<void>(resolve => setImmediate(resolve)) }
   try {
-    const frame = await pipeline.localHistory(instId, '15m', target)
+    const frame = await focusHistory(pipeline, instId, '15m', target)
     assert.equal(frame.priceState, 'partial')
     await flush(); assert.equal(requests.length, 1)
     context.mock.timers.tick(60_000); await flush(); assert.equal(requests.length, 1, 'Unchanged failed demand waits for a meaningful recovery event.')
@@ -424,9 +517,9 @@ test('source recovery repairs the selected historical viewport instead of the un
 test('cold forming prices are visible without any historical candle or recursive seed', async () => {
   const { pipeline } = fixture([])
   try {
-    pipeline.setUniverse([instId], '15m', instId)
+    pipeline.setUniverse([instId])
     await pipeline.setLive(instId, '15m', { ...candle(end() + interval), confirmed: false, close: 101.5 })
-    const frame = await pipeline.local(instId, '15m')
+    const frame = await focusLatest(pipeline, instId, '15m')
     assert.equal(frame.bars.length, 0); assert.equal(frame.liveBar.close, 101.5); assert.equal(frame.indicatorState, 'loading')
   } finally { await pipeline.dispose() }
 })
@@ -438,12 +531,12 @@ test('subscription changes immediately republish quote status from cached projec
   const encoder = new ChartNotificationEncoder(), notifications: any[] = []
   pipeline.subscribe((frame: any) => notifications.push(encoder.encode(frame)))
   try {
-    pipeline.setUniverse([instId, other], '15m', instId)
-    await pipeline.local(instId, '15m')
+    pipeline.setUniverse([instId, other])
+    await focusLatest(pipeline, instId, '15m')
     await finishSeed(pipeline)
     const live = { ...candle(end() + interval), confirmed: false }
     await pipeline.setLive(instId, '15m', live)
-    await pipeline.local(other, '15m')
+    await focusLatest(pipeline, other, '15m')
     await pipeline.setLive(other, '15m', { ...live, instrument: other })
     pipeline.series.delete(`${other}:15m`) // Previously opened compact cache outlives its history LRU.
     const focused = pipeline.cached(`${instId}:15m`), cached = pipeline.cached(`${other}:15m`)
@@ -510,7 +603,7 @@ test('full-universe forming intake retains raw prices without publishing charts 
     assert.equal(store.queries.length, 0)
     assert.equal(frames.length, 0, 'Collector membership alone cannot produce 51,660 unused chart notifications.')
     assert.equal(operations.filter(operation => operation.name === 'chart.frame').length, 0)
-    const selected = ids[178], opened = await pipeline.local(selected, '1H')
+    const selected = ids[178], opened = await focusLatest(pipeline, selected, '1H')
     assert.equal(opened.liveBar.close, 160.178, 'Opening a cold chart reads the latest retained native price immediately.')
     assert.equal(opened.realtimeState, 'live')
     frames.length = 0; operations.length = 0
@@ -520,47 +613,29 @@ test('full-universe forming intake retains raw prices without publishing charts 
     assert.equal(frames[0].timeframe, '1H')
     assert.equal(frames[0].liveBar.close, 161.178)
     assert.equal(operations.filter(operation => operation.name === 'chart.frame').length, 1)
-    pipeline.setUniverse([selected], '1H')
+    pipeline.setUniverse([selected])
     await new Promise<void>(resolve => setImmediate(resolve))
     await Promise.all([...pipeline.candidateTasks.values()])
     pipeline.maxSeries = 1
-    await pipeline.local(ids[179], '5m')
+    await focusLatest(pipeline, ids[179], '5m')
     assert.equal(pipeline.series.has(`${selected}:1H`), false)
     const reads = store.queries.length
     frames.length = 0
     await tick(62)
-    assert.equal(frames.length, 2, 'A previously materialized compact cache stays current after history LRU eviction.')
+    assert.deepEqual(frames.map(frame => `${frame.instId}:${frame.timeframe}`).toSorted(),
+      [`${selected}:5m`, `${selected}:15m`, `${selected}:1H`, `${ids[179]}:5m`].toSorted(),
+      'Every backend universe timeframe and the previously materialized compact cache stay current after history LRU eviction.')
     assert.equal(frames.find(frame => frame.instId === selected).liveBar.close, 162.178)
     assert.equal(store.queries.length, reads, 'Maintaining compact cached prices cannot restore their evicted history.')
     assert.equal(pipeline.realtimeKeys.size, 861, 'Publication demand cannot remove background market collection.')
   } finally { unsubscribe(); await pipeline.dispose() }
 })
 
-test('list-indicator reuse cannot materialize chart snapshots or notifications before a chart is opened', async () => {
-  const { pipeline } = fixture(), frames: any[] = []
-  pipeline.subscribe((frame: any) => frames.push(frame))
-  try {
-    const projected = await pipeline.projectListSeries(instId, '15m')
-    assert.ok(projected.bars.length > 0)
-    assert.ok(pipeline.series.has(`${instId}:15m`))
-    assert.equal(pipeline.snapshots.size, 0, 'Indicator residency is reusable source data, not an implicit chart subscription.')
-    assert.equal(frames.length, 0)
-    const calculations = pipeline.nextCalculation
-    await pipeline.setLive(instId, '15m', { ...candle(end() + interval), confirmed: false, close: 250 })
-    assert.equal(frames.length, 0)
-    const opened = await pipeline.local(instId, '15m')
-    assert.equal(opened.liveBar.close, 250)
-    assert.equal(opened.indicatorState, 'ready')
-    assert.equal(pipeline.nextCalculation, calculations, 'Opening reuses the existing exact recursive calculation.')
-    assert.equal(frames.length, 1)
-  } finally { await pipeline.dispose() }
-})
-
 test('exact recursive work reads bounded chunks and durable checkpoints reproduce full-history math', async () => {
   const rows = source(3500), { pipeline, store } = fixture(rows)
   let restarted: any
   try {
-    const raw = await pipeline.local(instId, '15m')
+    const raw = await focusLatest(pipeline, instId, '15m')
     assert.equal(raw.indicatorState, 'loading'); assert.equal(store.queries[0].limit, 128)
     await finishSeed(pipeline)
     const frame = pipeline.cached(`${instId}:15m`), oracle = buildIndicatorSeries(rows, interval).bars as any[]
@@ -571,7 +646,7 @@ test('exact recursive work reads bounded chunks and durable checkpoints reproduc
     restarted = new PreparedChartPipeline({ store: store as any, history: {} as any, normalize: (row: any) => row, revision: () => 0, instrument: () => undefined })
     restarted.workerLimit = 2
     store.queries = []
-    await restarted.local(instId, '15m'); await finishSeed(restarted)
+    await focusLatest(restarted, instId, '15m'); await finishSeed(restarted)
     const chunks = store.queries.filter(query => query.order === 'asc')
     assert.ok(chunks[0].from > rows[0].timestamp, 'A verified prefix checkpoint avoids replaying the canonical origin.')
     for (const key of indicatorFields) assert.equal(restarted.cached(`${instId}:15m`).bars.at(-1)[key], oracle.at(-1)![key])
@@ -581,7 +656,7 @@ test('exact recursive work reads bounded chunks and durable checkpoints reproduc
 test('old price corrections invalidate descendant seeds and keep prices visible during exact recomputation', async () => {
   const rows = source(2500), { pipeline, store } = fixture(rows)
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const changed = { ...rows[100], close: rows[100].close + .5 }
     const previous = store.change(changed)
     pipeline.observe([changed], previous)
@@ -596,7 +671,7 @@ test('old price corrections invalidate descendant seeds and keep prices visible 
 test('statistics changes refresh only their observations without recalculating price indicators', async () => {
   const { pipeline, store } = fixture()
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const count = pipeline.nextCalculation, frame = pipeline.cached(`${instId}:15m`), last = store.rows.at(-1)!
     store.rows[store.rows.length - 1] = { ...last, oi: null, statisticsVersion: 11, statisticsOIExpiresAt: Date.now() - 1 }
     await pipeline.observeStatistics(instId, '15m', last.timestamp, last.timestamp)
@@ -614,7 +689,7 @@ test('warm forming ticks preserve exact confirmed state and never read or replay
   const operations: OperationEvent[] = []
   const detach = attachOperationSink(operation => operations.push(operation))
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     assert.ok(operations.some(operation => operation.name === 'chart.project'), 'Cold chart work is observable through the shared operation recorder.')
     operations.length = 0
     const reads = store.queries.length, calculations = pipeline.nextCalculation, writes = store.checkpoints.length
@@ -638,7 +713,7 @@ test('warm forming ticks preserve exact confirmed state and never read or replay
 test('bounded local historical prices remain navigable across unknown and expired statistic holes', async () => {
   const rows = source(5000).map(row => ({ ...row, oi: null, buy: null, sell: null, statisticsVersion: null })), { pipeline, store } = fixture(rows as any)
   try {
-    const requested = rows[2000].timestamp, frame = await pipeline.localHistory(instId, '15m', requested)
+    const requested = rows[2000].timestamp, frame = await focusHistory(pipeline, instId, '15m', requested)
     assert.ok(frame.bars.length <= 1536); assert.equal(frame.endHour, requested)
     assert.ok(frame.bars.some((value: any) => value.hour === requested))
     assert.equal(frame.oiState, 'unavailable'); assert.equal(frame.oiStatus.reason, 'unsupported'); assert.ok(store.queries.every(query => query.limit))
@@ -648,7 +723,7 @@ test('bounded local historical prices remain navigable across unknown and expire
 test('cache existence never certifies realtime when stream continuity or observation age is missing', async () => {
   const { pipeline } = fixture()
   try {
-    await pipeline.local(instId, '15m')
+    await focusLatest(pipeline, instId, '15m')
     assert.equal(pipeline.cached(`${instId}:15m`).realtimeState, 'stale')
     await pipeline.setLive(instId, '15m', { ...candle(end() + interval), confirmed: false }, { receivedAt: Date.now() - 60_000 })
     assert.equal(pipeline.cached(`${instId}:15m`).realtimeState, 'stale')
@@ -669,7 +744,7 @@ test('failed statistic sources wait independently for source recovery while pric
   const { pipeline } = fixture(rows as any, { async ensureStatistics() { attempts += 1; throw new Error('Statistics offline') } })
   const flush = () => new Promise<void>(resolve => setImmediate(resolve))
   try {
-    const frame = await pipeline.local(instId, '15m')
+    const frame = await focusLatest(pipeline, instId, '15m')
     await flush()
     assert.equal(frame.priceState, 'ready'); assert.equal(attempts, 2)
     context.mock.timers.tick(60_000); await flush(); assert.equal(attempts, 2)
@@ -693,7 +768,7 @@ test('successful unavailable observations renew only at their actual lease deadl
   } })
   const flush = () => new Promise<void>(resolve => setImmediate(resolve))
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     context.mock.timers.tick(9_999); await flush(); assert.equal(attempts, 0)
     context.mock.timers.tick(1); await flush(); assert.equal(attempts, 2)
     assert.equal(pipeline.cached(`${instId}:15m`).endHour, end())
@@ -710,7 +785,7 @@ test('a quiet quote pushes its stale transition without periodic chart reads or 
   const { pipeline } = fixture(source(400), { async latest() { requests += 1 }, async ensureStatistics() { requests += 1 } })
   const published: any[] = []
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     pipeline.subscribe((frame: any) => published.push(frame))
     await pipeline.setLive(instId, '15m', { ...candle(end() + interval), confirmed: false }, { receivedAt: Date.now() })
     assert.equal(published.at(-1).realtimeState, 'live')
@@ -733,8 +808,9 @@ test('continuous live quotes cannot postpone repairing a resident historical vie
     },
   })
   const flush = async () => { for (let count = 0; count < 8; count++) await new Promise<void>(resolve => setImmediate(resolve)) }
+  pipeline.instrument = () => ({ listTime: canonical[0].timestamp })
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const state = pipeline.state(instId, '15m')
     await pipeline.read(state, target, 1536); await pipeline.seed(state); await finishSeed(pipeline)
     const reads = store.queries.length
@@ -766,14 +842,18 @@ test('uncovered statistic samples are repaired without refetching known viewport
     },
   })
   const flush = async () => { for (let count = 0; count < 8; count++) await new Promise<void>(resolve => setImmediate(resolve)) }
+  pipeline.instrument = () => ({ listTime: canonical[0].timestamp })
   try {
-    await pipeline.local(instId, '15m', { priority: 'background' }); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const state = pipeline.state(instId, '15m')
     await pipeline.read(state, target, 1536); await pipeline.seed(state); await finishSeed(pipeline)
     pipeline.setFocus({ instId, timeframe: '15m', endHour: oldEnd }, 'old-window')
-    pipeline.refreshObservations(state, oldEnd); await flush(); assert.equal(calls.length, 2)
+    pipeline.refreshObservations(state, oldEnd); await flush()
+    assert.deepEqual(calls.filter(call => call.through === oldEnd).map(call => call.source).toSorted(), ['oi', 'taker'])
+    const acquired = calls.length
     pipeline.setFocus({ instId, timeframe: '15m', endHour: target }, 'selected-window')
-    assert.equal(pipeline.frame(state, target, true).bars.filter((bar: any) => bar.oiObserved).length, 16)
+    assert.equal(pipeline.frame(state, target, true).bars.filter((bar: any) => bar.oiObserved).length, 96,
+      'The backend reserve repairs uncovered samples before the user selects them.')
     for (let tick = 0; tick < 12; tick++) {
       context.mock.timers.tick(250)
       await pipeline.setLive(instId, '15m', { ...canonical.at(-1), timestamp: end() + interval, confirmed: false, volume: 100 + tick })
@@ -781,6 +861,7 @@ test('uncovered statistic samples are repaired without refetching known viewport
     }
     const repairs = calls.filter(call => call.from === first && call.through === target - 16 * interval)
     assert.deepEqual(repairs.map(call => call.source).toSorted(), ['oi', 'taker'])
+    assert.equal(calls.length, acquired, 'Selecting the repaired reserve cannot request the same samples again.')
     assert.ok(calls.every(call => call.through < target - 15 * interval || call.from > target), 'Statistic acquisition excludes already observed samples.')
     const repaired = pipeline.historyFrame(state, target)
     assert.equal(repaired.oiState, 'ready'); assert.equal(repaired.takerState, 'ready')
@@ -793,7 +874,7 @@ test('an active source on the known edge cannot hide an uncovered failure or its
     ? { ...row, oi: null, buy: null, sell: null, statisticsVersion: null } : row)
   const { pipeline } = fixture(rows as any, { async ensureStatistics() { await gate.promise } })
   try {
-    await pipeline.local(instId, '15m', { priority: 'background' }); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const state = pipeline.state(instId, '15m')
     await pipeline.read(state, target, 1536); await pipeline.seed(state); await finishSeed(pipeline)
     const retryAt = Date.now() + 60_000
@@ -811,7 +892,7 @@ test('a newer statistic fences only its own slot while an admitted history page 
   const canonical = source(400), rows = canonical.map(row => ({ ...row, oi: null, buy: null, sell: null, statisticsVersion: null }))
   const { pipeline, store } = fixture(rows as any), gate = deferred(), started = deferred()
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const read = store.candles.bind(store), first = end() - 95 * interval
     store.candles = async (query: any) => {
       if (query.from === first && query.order === 'asc') { started.resolve(); await gate.promise; return canonical.slice(-96) }
@@ -834,7 +915,7 @@ test('a concurrent statistic update cannot discard unrelated left-edge observati
   const { pipeline, store } = fixture(rows as any), gate = deferred(), entered = deferred()
   let reading: Promise<unknown> | undefined
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const state = pipeline.series.get(`${instId}:15m`), read = store.candles.bind(store)
     store.rows = canonical
     store.candles = async (query: any) => {
@@ -857,12 +938,12 @@ test('a concurrent statistic update cannot discard unrelated left-edge observati
 test('returning from deep history restores an evicted latest price locally before source work', async () => {
   const rows = source(5000), { pipeline, store } = fixture(rows)
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
-    await pipeline.localHistory(instId, '15m', rows[2000].timestamp); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
+    await focusHistory(pipeline, instId, '15m', rows[2000].timestamp); await finishSeed(pipeline)
     const state = pipeline.series.get(`${instId}:15m`)
     assert.equal(state.rows.has(rows.at(-1)!.timestamp), false, 'The test must actually evict the current tail.')
     const before = store.queries.length
-    const latest = await pipeline.local(instId, '15m')
+    const latest = await focusLatest(pipeline, instId, '15m')
     assert.equal(latest.endHour, rows.at(-1)!.timestamp)
     assert.equal(latest.bars.at(-1).close, rows.at(-1)!.close)
     assert.equal(state.historyEnd, null)
@@ -873,7 +954,7 @@ test('returning from deep history restores an evicted latest price locally befor
 test('forming ticks never rebuild or republish an open historical navigation reserve', async () => {
   const rows = source(2000), { pipeline, store } = fixture(rows), target = rows[1900].timestamp
   try {
-    await pipeline.localHistory(instId, '15m', target); await finishSeed(pipeline)
+    await focusHistory(pipeline, instId, '15m', target); await finishSeed(pipeline)
     const state = pipeline.series.get(`${instId}:15m`), history = pipeline.historyFrame(state, target)
     const reads = store.queries.length, calculations = pipeline.nextCalculation, published: any[] = []
     pipeline.subscribe((frame: any) => published.push(frame))
@@ -894,7 +975,7 @@ test('in-flight local SQLite reads remain admitted while other series exceed the
   }
   pipeline.maxSeries = 1
   try {
-    const selected = pipeline.local(instId, '15m')
+    const selected = focusLatest(pipeline, instId, '15m')
     await started.promise
     const admitted = pipeline.series.get(`${instId}:15m`)
     for (let index = 0; index < 20; index += 1) {
@@ -913,16 +994,16 @@ test('in-flight local SQLite reads remain admitted while other series exceed the
 test('rows admitted behind an in-flight historical replay are eventually calculated exactly', async () => {
   const rows = source(3500), { pipeline, store } = fixture(rows), hold = deferred(), reached = deferred()
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const write = store.writeIndicatorCheckpoint.bind(store)
     let blocked = false
     store.writeIndicatorCheckpoint = async (value: any) => {
       if (!blocked && value.timestamp === rows[1023].timestamp) { blocked = true; reached.resolve(); await hold.promise }
       return write(value)
     }
-    await pipeline.localHistory(instId, '15m', rows[2000].timestamp)
+    await focusHistory(pipeline, instId, '15m', rows[2000].timestamp)
     await reached.promise
-    await pipeline.localHistory(instId, '15m', rows[600].timestamp)
+    await focusHistory(pipeline, instId, '15m', rows[600].timestamp)
     hold.resolve(); await finishSeed(pipeline)
     const state = pipeline.series.get(`${instId}:15m`), frame = pipeline.historyFrame(state, rows[600].timestamp)
     const oracle = new Map(buildIndicatorSeries(rows, interval).bars.map((value: any) => [value.hour, value]))
@@ -936,11 +1017,11 @@ test('rows admitted behind an in-flight historical replay are eventually calcula
 test('historical replay cannot replace the exact latest recursive core or its known statistics', async () => {
   const rows = source(4000), { pipeline } = fixture(rows)
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const current = { ...candle(end() + interval, 4000), high: 510, close: 501.5, confirmed: false }
     await pipeline.setLive(instId, '15m', current)
     const before = pipeline.cached(`${instId}:15m`)
-    await pipeline.localHistory(instId, '15m', rows[2000].timestamp); await finishSeed(pipeline)
+    await focusHistory(pipeline, instId, '15m', rows[2000].timestamp); await finishSeed(pipeline)
     const next = await pipeline.setLive(instId, '15m', { ...current, close: 501.6, volume: current.volume + 1 })
     assert.equal(next.bars.length, 96, 'A historical navigation reserve must not publish an empty latest tail.')
     assert.equal(next.bars.at(-1).oi, rows.at(-1)!.oi)
@@ -955,7 +1036,7 @@ test('historical replay cannot replace the exact latest recursive core or its kn
 test('price-only observations preserve independently known OI and Taker facts', async () => {
   const { pipeline, store } = fixture()
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const previous = store.rows.at(-1)!, priceOnly = { ...previous, close: previous.close + 1, statisticsVersion: 0, oi: null, buy: null, sell: null }
     pipeline.observe([priceOnly], new Map([[previous.timestamp, previous]]))
     const frame = pipeline.cached(`${instId}:15m`), last = frame.bars.at(-1)
@@ -967,7 +1048,7 @@ test('price-only observations preserve independently known OI and Taker facts', 
 test('a delayed statistics query cannot roll back canonical price fields or a newer statistic observation', async () => {
   const { pipeline, store } = fixture(), hold = deferred(), started = deferred()
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const query = store.candles.bind(store), previous = store.rows.at(-1)!
     let blocked = false
     store.candles = async (value: any) => {
@@ -991,9 +1072,9 @@ test('a delayed statistics query cannot roll back canonical price fields or a ne
 test('restored latest cores do not share mutable recursive state and volume corrections invalidate derived values', async () => {
   const rows = source(500), { pipeline, store } = fixture(rows)
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     pipeline.series.delete(`${instId}:15m`)
-    await pipeline.local(instId, '15m')
+    await focusLatest(pipeline, instId, '15m')
     const state = pipeline.series.get(`${instId}:15m`), live = pipeline.liveStates.get(`${instId}:15m`)
     assert.notEqual(state.indicatorState, live.indicatorState)
     const next = candle(end() + interval, 500)
@@ -1014,14 +1095,14 @@ test('restored latest cores do not share mutable recursive state and volume corr
 test('the requested historical viewport publishes exact indicators before its remaining reserve finishes', async () => {
   const rows = source(3500), { pipeline } = fixture(rows), hold = deferred(), reached = deferred()
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const calculate = pipeline.calculate.bind(pipeline), target = rows[2000].timestamp
     let blocked = false
     pipeline.calculate = async (candles: any[], ...args: any[]) => {
       if (!blocked && candles[0].timestamp === rows[0].timestamp) { blocked = true; reached.resolve(); await hold.promise }
       return calculate(candles, ...args)
     }
-    await pipeline.localHistory(instId, '15m', target)
+    await focusHistory(pipeline, instId, '15m', target)
     await reached.promise
     const frame = pipeline.historyFrame(pipeline.series.get(`${instId}:15m`), target)
     const viewport = frame.bars.filter((value: any) => value.hour >= target - 95 * interval && value.hour <= target)
@@ -1035,7 +1116,7 @@ test('a checkpoint lookup cannot attach an old recursive seed to a later durable
   const rows = source(3500), { pipeline, store } = fixture(rows)
   let restarted: any
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline); await pipeline.dispose()
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline); await pipeline.dispose()
     const read = store.readIndicatorCheckpoint.bind(store)
     let corrected = false
     store.readIndicatorCheckpoint = async (query: any) => {
@@ -1044,7 +1125,7 @@ test('a checkpoint lookup cannot attach an old recursive seed to a later durable
       return result
     }
     restarted = new PreparedChartPipeline({ store: store as any, history: {} as any, normalize: (row: any) => row, revision: () => 0, instrument: () => undefined })
-    await restarted.local(instId, '15m'); await finishSeed(restarted)
+    await focusLatest(restarted, instId, '15m'); await finishSeed(restarted)
     const oracle = new Map(buildIndicatorSeries(store.rows, interval).bars.map((value: any) => [value.hour, value]))
     const frame = restarted.cached(`${instId}:15m`)
     for (const value of frame.bars) for (const key of indicatorFields) assert.equal(value[key], (oracle.get(value.hour) as any)[key])
@@ -1062,7 +1143,7 @@ test('a rejected checkpoint write reloads changed canonical inputs before publis
     return write(value)
   }
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const frame = pipeline.cached(`${instId}:15m`), oracle = new Map(buildIndicatorSeries(store.rows, interval).bars.map((value: any) => [value.hour, value]))
     for (const value of frame.bars) for (const key of indicatorFields) assert.equal(value[key], (oracle.get(value.hour) as any)[key])
     assert.equal(frame.bars.find((value: any) => value.hour === rows[1750].timestamp).close, store.rows[1750].close)
@@ -1073,9 +1154,9 @@ test('a rejected checkpoint write reloads changed canonical inputs before publis
 test('a durable correction reloaded through the live tail keeps its historical series generation coherent', async () => {
   const rows = source(3000), { pipeline, store } = fixture(rows)
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const historicalEnd = rows[1500].timestamp
-    await pipeline.localHistory(instId, '15m', historicalEnd); await finishSeed(pipeline)
+    await focusHistory(pipeline, instId, '15m', historicalEnd); await pipeline.focus.task; await finishSeed(pipeline)
     const state = pipeline.series.get(`${instId}:15m`), live = pipeline.liveStates.get(`${instId}:15m`)
     assert.equal(state.rows.has(state.latestHour), false, 'The historical reserve must be independent of the retained latest tail.')
     assert.equal(state.generation, live.generation)
@@ -1101,7 +1182,7 @@ test('a durable correction reloaded through the live tail keeps its historical s
 test('a late historical SQL response cannot retarget or evict the newer requested viewport', async () => {
   const rows = source(5000), { pipeline, store } = fixture(rows), hold = deferred(), started = deferred()
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const read = store.candles.bind(store), oldEnd = rows[1800].timestamp, newEnd = rows[3500].timestamp
     let blocked = false
     store.candles = async (query: any) => {
@@ -1109,9 +1190,9 @@ test('a late historical SQL response cannot retarget or evict the newer requeste
       if (!blocked && query.order === 'desc' && query.through === oldEnd + 256 * interval) { blocked = true; started.resolve(); await hold.promise }
       return result
     }
-    const older = pipeline.localHistory(instId, '15m', oldEnd)
+    const older = focusHistory(pipeline, instId, '15m', oldEnd)
     await started.promise
-    await pipeline.localHistory(instId, '15m', newEnd)
+    await focusHistory(pipeline, instId, '15m', newEnd)
     hold.resolve(); await older; await finishSeed(pipeline)
     const state = pipeline.series.get(`${instId}:15m`), frame = pipeline.historyFrame(state, newEnd)
     assert.equal(state.historyEnd, newEnd)
@@ -1123,9 +1204,9 @@ test('a late historical SQL response cannot retarget or evict the newer requeste
 test('resident historical viewports reuse their canonical rows without another SQLite read', async () => {
   const rows = source(3500), { pipeline, store } = fixture(rows)
   try {
-    await pipeline.localHistory(instId, '15m', rows[2000].timestamp); await finishSeed(pipeline)
+    await focusHistory(pipeline, instId, '15m', rows[2000].timestamp); await finishSeed(pipeline)
     const reads = store.queries.length
-    const next = await pipeline.localHistory(instId, '15m', rows[1999].timestamp)
+    const next = await focusHistory(pipeline, instId, '15m', rows[1999].timestamp)
     const viewport = next.bars.filter((value: any) => value.hour >= rows[1904].timestamp && value.hour <= rows[1999].timestamp)
     assert.equal(viewport.length, 96)
     assert.equal(viewport.every((value: any) => value.indicatorsObserved), true)
@@ -1136,52 +1217,103 @@ test('resident historical viewports reuse their canonical rows without another S
 test('the first history gesture expands a resident latest tail into its durable navigation reserve', async () => {
   const rows = source(3500), { pipeline, store } = fixture(rows)
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const state = pipeline.series.get(`${instId}:15m`)
     assert.equal(state.rows.size, 128)
     const before = store.queries.length
-    const historical = await pipeline.localHistory(instId, '15m', rows.at(-2)!.timestamp)
+    const historical = await focusHistory(pipeline, instId, '15m', rows.at(-2)!.timestamp)
     assert.ok(historical.bars.length >= 1280, 'A complete 96-candle viewport cannot substitute for the first bulk history admission.')
     assert.ok(store.queries.slice(before).some(query => query.order === 'desc' && query.limit === 1536))
     await finishSeed(pipeline)
     const reads = store.queries.length
-    await pipeline.localHistory(instId, '15m', rows.at(-3)!.timestamp)
+    await focusHistory(pipeline, instId, '15m', rows.at(-3)!.timestamp)
     assert.equal(store.queries.length, reads, 'Later resident gestures reuse the admitted historical reserve.')
 
-    await pipeline.localHistory(instId, '15m', rows[1200].timestamp); await finishSeed(pipeline)
+    await focusHistory(pipeline, instId, '15m', rows[1200].timestamp); await finishSeed(pipeline)
     assert.ok(state.historyRange.through < rows.at(-96)!.timestamp)
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const tail = [...state.rows.values()].filter((row: any) => row.timestamp >= rows.at(-128)!.timestamp)
     assert.equal(tail.length, 128, 'Returning from deep history restores only the latest tail.')
     const afterDeepHistory = store.queries.length
-    const returned = await pipeline.localHistory(instId, '15m', rows.at(-2)!.timestamp)
+    const returned = await focusHistory(pipeline, instId, '15m', rows.at(-2)!.timestamp)
     assert.ok(returned.bars.filter((bar: any) => bar.hour >= rows.at(-1280)!.timestamp).length >= 1280,
       'A deep-history interval cannot certify the latest navigation reserve.')
     assert.ok(store.queries.slice(afterDeepHistory).some(query => query.order === 'desc' && query.limit === 1536))
     await finishSeed(pipeline)
     const admittedAgain = store.queries.length
-    await pipeline.localHistory(instId, '15m', rows.at(-3)!.timestamp)
+    await focusHistory(pipeline, instId, '15m', rows.at(-3)!.timestamp)
     assert.equal(store.queries.length, admittedAgain)
 
-    await pipeline.local(instId, '15m')
+    await focusLatest(pipeline, instId, '15m')
     pipeline.invalidate(instId, '15m')
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     assert.equal(state.rows.size, 128)
     const afterInvalidation = store.queries.length
-    const restored = await pipeline.localHistory(instId, '15m', rows.at(-2)!.timestamp)
+    const restored = await focusHistory(pipeline, instId, '15m', rows.at(-2)!.timestamp)
     assert.ok(restored.bars.length >= 1280, 'Invalidation also retires the previous bulk-history admission.')
     assert.ok(store.queries.slice(afterInvalidation).some(query => query.order === 'desc' && query.limit === 1536))
   } finally { await pipeline.dispose() }
+})
+
+for (const heldReplay of [false, true]) test(`historical invalidation restarts backend focus without renderer reads${heldReplay ? ' while an obsolete replay is in flight' : ''}`, async () => {
+  const rows = source(5000), target = rows[2000].timestamp, { pipeline, store } = fixture(rows)
+  const gate = deferred(), entered = deferred(), frames: any[] = []
+  let held = false
+  const settleCandidates = async () => {
+    while (pipeline.candidateTasks.size || pipeline.candidateQueue.length) {
+      await Promise.all([...pipeline.candidateTasks.values()])
+      await new Promise<void>(resolve => setImmediate(resolve))
+    }
+    await finishSeed(pipeline)
+  }
+  try {
+    pipeline.setFocus({ instId, timeframe: '15m' }, 'latest')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    assert.ok(store.checkpoints.some(value => value.timestamp > target), 'A mature latest checkpoint cannot calculate an older viewport by itself.')
+    pipeline.setUniverse([instId]); await settleCandidates()
+    if (heldReplay) {
+      const calculate = pipeline.calculate.bind(pipeline)
+      pipeline.calculate = async (...args: any[]) => {
+        if (!held) {
+          held = true; entered.resolve(); await gate.promise
+          const result = await calculate(...args)
+          return { ...result, bars: result.bars.map((bar: any) => ({ ...bar, ema: -12345 })) }
+        }
+        return calculate(...args)
+      }
+    }
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target }, 'historical-owner')
+    const previousFocus = pipeline.focus
+    if (heldReplay) await entered.promise
+    else { await previousFocus.task; await finishSeed(pipeline) }
+    const generation = pipeline.series.get(`${instId}:15m`).generation
+    pipeline.subscribe((frame: any) => frames.push(frame))
+    pipeline.invalidate(instId, '15m')
+    const renewed = pipeline.focus
+    assert.notEqual(renewed, previousFocus, 'Invalidation retires the old preparation identity, even though renderer ownership is unchanged.')
+    assert.equal(renewed.id, 'historical-owner'); assert.equal(renewed.end, target)
+    assert.equal(pipeline.series.get(`${instId}:15m`).generation, pipeline.liveStates.get(`${instId}:15m`).generation)
+    gate.resolve()
+    await Promise.all([previousFocus.task, renewed.task]); await settleCandidates()
+    const state = pipeline.series.get(`${instId}:15m`), frame = pipeline.historyFrame(state, target)
+    const viewport = frame.bars.filter((bar: any) => bar.hour >= target - 95 * interval && bar.hour <= target)
+    assert.ok(frame.generation > generation); assert.equal(viewport.length, 96)
+    assert.ok(viewport.every((bar: any) => bar.indicatorsObserved), 'Focused historical math must rebuild without a renderer read or prepare retry.')
+    assert.ok(frames.some(frame => frame.endHour === target && frame.indicatorState === 'ready'))
+    assert.ok(frames.every(frame => frame.bars.every((bar: any) => bar.ema !== -12345)), 'An obsolete worker result cannot enter the renewed generation.')
+    const oracle = new Map(buildIndicatorSeries(rows, interval).bars.map((bar: any) => [bar.hour, bar]))
+    for (const bar of viewport) for (const field of indicatorFields) assert.equal(bar[field], (oracle.get(bar.hour) as any)[field])
+  } finally { gate.resolve(); await pipeline.dispose() }
 })
 
 test('a committed mutation invalidates resident history before its normal observer arrives', async () => {
   const rows = source(2500), fixtureValue = await sqliteFixture(rows), { pipeline, store } = fixtureValue
   try {
     const target = rows[1800].timestamp
-    await pipeline.localHistory(instId, '15m', target); await finishSeed(pipeline)
+    await focusHistory(pipeline, instId, '15m', target); await finishSeed(pipeline)
     const corrected = { ...rows[1750], close: rows[1750].close + .5 }
     await store.appendCandles([corrected]) // Deliberately withhold pipeline.observe.
-    const next = await pipeline.localHistory(instId, '15m', target)
+    const next = await focusHistory(pipeline, instId, '15m', target)
     assert.equal(next.bars.find((value: any) => value.hour === corrected.timestamp).close, corrected.close)
     await finishSeed(pipeline)
     const oracle = new Map(buildIndicatorSeries(rows.map(row => row.timestamp === corrected.timestamp ? corrected : row), interval).bars.map((value: any) => [value.hour, value]))
@@ -1197,7 +1329,7 @@ test('a delayed historical SQL result reloads a durable correction before mergin
   let reading: Promise<void> | undefined
   try {
     const target = rows[1800].timestamp
-    await pipeline.localHistory(instId, '15m', target); await finishSeed(pipeline)
+    await focusHistory(pipeline, instId, '15m', target); await finishSeed(pipeline)
     const state = pipeline.series.get(`${instId}:15m`), read = store.candles.bind(store)
     let reads = 0
     store.candles = async (query: any, priority: any) => {
@@ -1240,9 +1372,9 @@ test('cold history publishes a mature nearest viewport before farther reserve pa
   const { pipeline, store } = fixtureValue
   let preparation: Promise<unknown> | undefined
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     pipeline.subscribe((frame: any) => frames.push(frame))
-    preparation = pipeline.prepare(instId, '15m', target, 4096).then(() => { finished = true })
+    preparation = pipeline.prepare(instId, '15m', target).then(() => { finished = true })
     await reached.promise
     const ready = frames.find(frame => frame.endHour === target && frame.indicatorState === 'ready')
     assert.ok(ready, 'The nearest requested viewport must publish exact mature curves before another source page starts.')
@@ -1273,7 +1405,7 @@ test('an ATR upgrade ignores v4 checkpoints without ATR state even when they car
   await store.writeIndicatorCheckpoint({ instrument: instId, timeframe: '15m', timestamp: poisoned.lastTimestamp,
     formulaVersion: legacyVersion, state: poisoned, sourceRevision: await store.priceWatermark() })
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const oracle = new Map(buildIndicatorSeries(rows, interval).bars.map((value: any) => [value.hour, value]))
     for (const value of pipeline.cached(`${instId}:15m`).bars) for (const field of indicatorFields) {
       assert.equal(value[field], (oracle.get(value.hour) as any)[field], `The upgraded producer must reconstruct ${field} from canonical candles.`)
@@ -1287,9 +1419,9 @@ test('an ATR upgrade ignores v4 checkpoints without ATR state even when they car
 test('new archive pages after an open historical viewport cannot evict its prices, statistics or unaffected exact indicators', async () => {
   const all = source(5000), { pipeline, store } = fixture(all.filter((_, index) => index < 2100 || index >= 4000))
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const target = all[1800].timestamp
-    await pipeline.localHistory(instId, '15m', target); await finishSeed(pipeline)
+    await focusHistory(pipeline, instId, '15m', target); await finishSeed(pipeline)
     const state = pipeline.series.get(`${instId}:15m`), first = target - 95 * interval
     const original = new Map([...state.indicators].filter(([hour]: any) => hour >= first && hour <= target))
     assert.equal(original.size, 96)
@@ -1311,7 +1443,7 @@ test('new archive pages after an open historical viewport cannot evict its price
 test('newly downloaded older prefixes invalidate recursive descendants without discarding independent statistic facts', async () => {
   const all = source(1100), { pipeline, store } = fixture(all.slice(600)), target = all[1000].timestamp
   try {
-    await pipeline.localHistory(instId, '15m', target); await finishSeed(pipeline)
+    await focusHistory(pipeline, instId, '15m', target); await finishSeed(pipeline)
     const state = pipeline.series.get(`${instId}:15m`)
     for (const page of [all.slice(300, 600), all.slice(0, 300)]) {
       const generation = state.generation, prior = new Map()
@@ -1332,7 +1464,7 @@ test('newly downloaded older prefixes invalidate recursive descendants without d
 test('durable later-price changes do not restart an unaffected historical replay or clear its already prepared prefix', async () => {
   const rows = source(3500), f = await sqliteFixture(rows), { pipeline, store } = f, hold = deferred(), started = deferred()
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const target = rows[1800].timestamp, calculate = pipeline.calculate.bind(pipeline), inputs: string[] = []
     let blocked = false, reloads = 0
     const reload = pipeline.refreshChangedCanonical.bind(pipeline)
@@ -1342,7 +1474,7 @@ test('durable later-price changes do not restart an unaffected historical replay
       if (!blocked) { blocked = true; started.resolve(); await hold.promise }
       return calculate(input, ...args)
     }
-    await pipeline.localHistory(instId, '15m', target)
+    await focusHistory(pipeline, instId, '15m', target)
     await started.promise
     const corrected = { ...rows[3400], close: rows[3400].close + .5 }
     await store.appendCandles([corrected])
@@ -1369,7 +1501,7 @@ test('durable later-price changes do not restart an unaffected historical replay
     assert.equal(pipeline.priceJournal.get(state.key).length, 256)
     pipeline.maxSeries = 1
     await store.appendCandles([{ ...rows.at(-1)!, instrument: 'ETH-USDT-SWAP' }])
-    await pipeline.local('ETH-USDT-SWAP', '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, 'ETH-USDT-SWAP', '15m'); await finishSeed(pipeline)
     assert.equal(pipeline.priceJournal.has(state.key), false, 'Evicting the resident reserve also releases its bounded mutation journal.')
   } finally { hold.resolve(); await f.close() }
 })
@@ -1377,7 +1509,7 @@ test('durable later-price changes do not restart an unaffected historical replay
 test('a durable prefix correction with a late observer retains the strict fence and cannot certify stale recursive state', async () => {
   const rows = source(3500), f = await sqliteFixture(rows), { pipeline, store } = f, hold = deferred(), started = deferred()
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const target = rows[1800].timestamp, calculate = pipeline.calculate.bind(pipeline)
     let blocked = false, reloads = 0
     const reload = pipeline.refreshChangedCanonical.bind(pipeline)
@@ -1386,7 +1518,7 @@ test('a durable prefix correction with a late observer retains the strict fence 
       if (!blocked) { blocked = true; started.resolve(); await hold.promise }
       return calculate(input, ...args)
     }
-    await pipeline.localHistory(instId, '15m', target)
+    await focusHistory(pipeline, instId, '15m', target)
     await started.promise
     const corrected = { ...rows[1000], close: rows[1000].close + .5, baseVolume: 500 }
     await store.appendCandles([corrected]) // Deliberately withhold pipeline.observe.
@@ -1406,7 +1538,7 @@ test('a durable prefix correction with a late observer retains the strict fence 
 test('a missing durable mutation event cannot authorize rebasing even a later-price change', async () => {
   const rows = source(3500), f = await sqliteFixture(rows), { pipeline, store } = f, hold = deferred(), started = deferred()
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const target = rows[1800].timestamp, calculate = pipeline.calculate.bind(pipeline)
     let blocked = false, reloads = 0
     const reload = pipeline.refreshChangedCanonical.bind(pipeline)
@@ -1415,7 +1547,7 @@ test('a missing durable mutation event cannot authorize rebasing even a later-pr
       if (!blocked) { blocked = true; started.resolve(); await hold.promise }
       return calculate(input, ...args)
     }
-    await pipeline.localHistory(instId, '15m', target)
+    await focusHistory(pipeline, instId, '15m', target)
     await started.promise
     pipeline.unsubscribeStore()
     const corrected = { ...rows[3400], close: rows[3400].close + .5 }
@@ -1441,12 +1573,12 @@ test('cold adjacent acquisition retains its full 1280-before and 256-ahead reser
   })
   const { pipeline, store } = f
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
-    await pipeline.prepare(instId, '15m', target, 1280); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
+    await pipeline.prepare(instId, '15m', target); await finishSeed(pipeline)
     const state = pipeline.series.get(`${instId}:15m`), keys = [...state.rows.keys()].sort((a: number, b: number) => a - b)
     const first = target - 1279 * interval, last = target + 256 * interval, admitted = state.historyRange
     const reads = store.queries.length
-    await pipeline.localHistory(instId, '15m', target - interval); await finishSeed(pipeline)
+    await focusHistory(pipeline, instId, '15m', target - interval); await finishSeed(pipeline)
     context.diagnostic(JSON.stringify({ retainedFirst: keys[0], expectedFirst: first, retainedLast: keys.at(-1), expectedLast: last,
       retained: keys.length, admitted, revisitReads: store.queries.length - reads }))
     assert.equal(keys[0], first, 'Older acquired reserve pages must remain resident instead of competing with excess newer rows.')
@@ -1461,7 +1593,7 @@ test('cold adjacent acquisition retains its full 1280-before and 256-ahead reser
 test('a latest-boundary history admission is reusable when its end is implicit', async () => {
   const rows = source(8192), { pipeline, store } = fixture(rows)
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     await pipeline.localHistory(instId, '15m', undefined); await finishSeed(pipeline)
     const reads = store.queries.length
     await pipeline.localHistory(instId, '15m', rows.at(-2)!.timestamp); await finishSeed(pipeline)
@@ -1483,10 +1615,10 @@ test('returning to latest while one reserve page is held retires the obsolete ol
   })
   const { pipeline } = f
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
-    preparation = pipeline.prepare(instId, '15m', target, 1280)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
+    preparation = pipeline.prepare(instId, '15m', target)
     await reached.promise
-    await pipeline.local(instId, '15m')
+    await focusLatest(pipeline, instId, '15m')
     hold.resolve(); await preparation; await finishSeed(pipeline)
     const state = pipeline.series.get(`${instId}:15m`)
     assert.equal(state.historyEnd, null)
@@ -1512,7 +1644,7 @@ test('a superseded local probe retains its admitted facts without reviving sourc
   try {
     stale = pipeline.prepare(instId, '15m')
     await reached.promise
-    await pipeline.local(other, '15m')
+    await focusLatest(pipeline, other, '15m')
     hold.resolve(); await stale
     assert.equal(pipeline.focusKey, `${other}:15m`)
     assert.deepEqual(requests, [], 'Finishing an obsolete local read cannot start a new source consumer.')
@@ -1530,15 +1662,17 @@ test('returning to the same target cannot resurrect an earlier local probe owner
     if (!held && query.order === 'desc') { held = true; reached.resolve(); await hold.promise }
     return result
   }
-  pipeline.history.ensurePrices = async () => { calls += 1 }
+  const owners: string[] = []
+  pipeline.history.ensurePrices = async () => { calls += 1; owners.push(pipeline.focus.id) }
   try {
     pipeline.setFocus({ instId, timeframe: '15m' }, 'first')
-    stale = pipeline.prepare(instId, '15m', undefined, 96, { focusId: 'first' })
+    stale = pipeline.focus.task
     await reached.promise
     pipeline.setFocus(null, 'hidden')
     pipeline.setFocus({ instId, timeframe: '15m' }, 'second')
-    hold.resolve(); await stale
-    assert.equal(calls, 0)
+    hold.resolve(); await stale; await pipeline.focus.task
+    assert.equal(calls, 1)
+    assert.deepEqual(owners, ['second'], 'Only the new explicit focus may create source demand.')
     assert.equal(pipeline.focus.id, 'second')
   } finally { hold.resolve(); await stale; await pipeline.dispose() }
 })
@@ -1560,7 +1694,7 @@ test('a nearby cursor adopts overlapping viewport sources and a disjoint jump re
     assert.equal(signals[0].aborted, true)
     await preparation
     assert.equal(pipeline.sourceAttempts.size, 0, 'Navigation cancellation is not a source failure.')
-    assert.equal(pipeline.sourceTasks.size, 0)
+    assert.ok([...pipeline.sourceTasks.values()].every((job: any) => job.demands.has(pipeline.focus)), 'Only current viewport consumers may keep source work alive.')
   } finally { pipeline.setFocus(null); await preparation; await pipeline.dispose() }
 })
 
@@ -1572,9 +1706,9 @@ test('an aborted source finalizer cannot remove a replacement consumer for the s
   }
   const flush = async () => { for (let index = 0; index < 8; index++) await new Promise<void>(resolve => setImmediate(resolve)) }
   try {
-    await pipeline.local(instId, '15m'); await flush()
+    await focusLatest(pipeline, instId, '15m'); await flush()
     pipeline.setFocus(null)
-    await pipeline.local(instId, '15m'); await flush()
+    await focusLatest(pipeline, instId, '15m'); await flush()
     assert.equal(signals.length, 2)
     assert.equal(signals[0].aborted, true); assert.equal(signals[1].aborted, false)
     const state = pipeline.series.get(`${instId}:15m`), active = pipeline.refreshObservations(state)
@@ -1585,55 +1719,6 @@ test('an aborted source finalizer cannot remove a replacement consumer for the s
     assert.equal(pipeline.sourceAttempts.size, 0)
   } finally { pipeline.setFocus(null); await pipeline.dispose() }
 })
-
-test('an admitted prefetch reserve preserves selected focus and can transfer its useful source to a new cursor', async () => {
-  const rows = source(2000), { pipeline } = fixture(rows.slice(-128)), started = deferred(), signals: AbortSignal[] = []
-  const selected = rows[1800].timestamp, prefetch = rows[1000].timestamp
-  pipeline.history.ensurePrices = async (_id: string, _timeframe: string, _from: number, _through: number, _priority: string, signal: AbortSignal) => {
-    signals.push(signal); started.resolve()
-    await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
-  }
-  let preparation: Promise<unknown> | undefined
-  try {
-    pipeline.setFocus({ instId, timeframe: '15m', endHour: selected }, 'selected')
-    preparation = pipeline.prepare(instId, '15m', prefetch, 768, { focusId: 'selected' })
-    await started.promise
-    assert.equal(pipeline.focus.end, selected, 'The reserve cursor is independent of the selected viewport.')
-    pipeline.setFocus({ instId, timeframe: '15m', endHour: prefetch - 600 * interval }, 'inside-reserve')
-    assert.equal(signals[0].aborted, false, 'An already admitted reserve source remains useful inside its requested runway.')
-    pipeline.setFocus({ instId, timeframe: '15m' }, 'latest')
-    assert.equal(signals[0].aborted, true)
-    await preparation
-    assert.equal(signals.length, 1, 'Retiring a reserve stops the rest of its page loop.')
-    assert.equal(pipeline.sourceAttempts.size, 0)
-  } finally { pipeline.setFocus(null); await preparation; await pipeline.dispose() }
-})
-
-test('a disjoint prefetch reserve retains the selected viewport and cannot trigger repeated source maintenance', async context => {
-  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Math.floor(Date.now() / interval) * interval + 1000 })
-  const rows = source(2500), { pipeline, store } = fixture(rows), selected = rows.at(-1)!.timestamp, target = rows[900].timestamp
-  let sourceCalls = 0
-  pipeline.history.ensurePrices = async () => { sourceCalls += 1 }
-  pipeline.history.ensureStatistics = async () => { sourceCalls += 1 }
-  const flush = async () => { for (let index = 0; index < 8; index++) await new Promise<void>(resolve => setImmediate(resolve)) }
-  try {
-    pipeline.setFocus({ instId, timeframe: '15m' }, 'visible')
-    await pipeline.local(instId, '15m', { focusId: 'visible' }); await finishSeed(pipeline)
-    await pipeline.prepare(instId, '15m', target, 768, { focusId: 'visible' }); await finishSeed(pipeline)
-    const state = pipeline.series.get(`${instId}:15m`)
-    assert.equal(pipeline.focus.end, undefined)
-    assert.equal(state.historyEnd, target)
-    for (let hour = selected - 95 * interval; hour <= selected; hour += interval) assert.ok(state.rows.has(hour))
-    assert.equal(pipeline.frame(state, selected).bars.length, 96)
-    const reads = store.queries.length
-    pipeline.scheduleRefresh()
-    context.mock.timers.tick(5000); await flush()
-    assert.equal(sourceCalls, 0, 'Resident reserve eviction must not manufacture a source outage for the selected viewport.')
-    assert.equal(store.queries.length, reads)
-    assert.ok(state.rows.size <= 1536 + 96, 'One bounded selected viewport accompanies the bounded acquisition reserve.')
-  } finally { await pipeline.dispose() }
-})
-
 
 test('an OI failure publishes its error and retry while Taker completes independently', async context => {
   const now = Math.floor(Date.now() / interval) * interval + 1000
@@ -1654,7 +1739,7 @@ test('an OI failure publishes its error and retry while Taker completes independ
   store.candles = async (query: any, priority?: string) => { if (query.order === 'asc' && query.limit === 1536) reads.push(priority!); return read(query) }
   const flush = async () => { for (let count = 0; count < 8; count++) await new Promise<void>(resolve => setImmediate(resolve)) }
   try {
-    await pipeline.local(instId, '15m'); await flush()
+    await focusLatest(pipeline, instId, '15m'); await flush()
     const failed = pipeline.cached(`${instId}:15m`)
     assert.equal(failed.priceState, 'ready'); assert.equal(failed.takerState, 'ready')
     assert.equal(failed.oiState, 'error'); assert.equal(failed.oiStatus.error, 'OI endpoint temporarily unavailable')
@@ -1684,7 +1769,7 @@ test('visible prices and statistic jobs outrank reserve acquisition and shared r
   })
   const flush = () => new Promise<void>(resolve => setImmediate(resolve))
   try {
-    await pipeline.local(instId, '15m'); await flush()
+    await focusLatest(pipeline, instId, '15m'); await flush()
     assert.deepEqual(calls.map(call => [call.source, call.priority]), [['oi', 'interactive'], ['taker', 'interactive']])
     const state = pipeline.state(instId, '15m'), reserveEnd = rows[1000].timestamp
     const reserve = { from: reserveEnd - 299 * interval, through: reserveEnd }
@@ -1710,10 +1795,10 @@ test('cached successful-empty and numeric statistics acquire no new source data 
     async ensureStatistics() { requests += 1; throw new Error('Cached statistics must not acquire HTTP') },
   })
   try {
-    await pipeline.local(instId, '15m')
-    await pipeline.localHistory(instId, '15m', rows[1000].timestamp)
-    await pipeline.local(instId, '15m')
-    const old = await pipeline.localHistory(instId, '15m', rows[1000].timestamp)
+    await focusLatest(pipeline, instId, '15m')
+    await focusHistory(pipeline, instId, '15m', rows[1000].timestamp)
+    await focusLatest(pipeline, instId, '15m')
+    const old = await focusHistory(pipeline, instId, '15m', rows[1000].timestamp)
     assert.equal(old.oiState, 'unavailable'); assert.equal(old.oiStatus.reason, 'not-published')
     assert.equal(old.takerState, 'ready'); assert.equal(requests, 0)
   } finally { await pipeline.dispose() }
@@ -1734,7 +1819,7 @@ test('offscreen statistic absence expires and revalidates only its native slots 
   })
   const flush = async () => { for (let index = 0; index < 8; index++) await new Promise<void>(resolve => setImmediate(resolve)) }
   try {
-    await pipeline.localHistory(instId, '15m', target); await finishSeed(pipeline)
+    await focusHistory(pipeline, instId, '15m', target); await finishSeed(pipeline)
     pipeline.scheduleRefresh()
     assert.equal(calls.length, 0, 'An unexpired direct empty observation is reusable outside the viewport.')
     context.mock.timers.tick(4999); await flush(); assert.equal(calls.length, 0)
@@ -1752,7 +1837,7 @@ test('a historical source failure republishes status while reusing its prepared 
   const { pipeline } = fixture(rows as any, { async ensureStatistics() { await gate.promise; throw new Error('OI offline') } })
   try {
     const target = rows[350].timestamp
-    await pipeline.localHistory(instId, '15m', target); await finishSeed(pipeline)
+    await focusHistory(pipeline, instId, '15m', target); await finishSeed(pipeline)
     const state = pipeline.state(instId, '15m'), before = pipeline.historyFrame(state, target), calculations = pipeline.nextCalculation
     gate.resolve()
     for (let count = 0; count < 8; count++) await new Promise<void>(resolve => setImmediate(resolve))
@@ -1778,9 +1863,9 @@ test('a failed cached price repair publishes its retry deadline through the enco
   })
   const controller = new ChartController({
     focus: (target, id) => pipeline.setFocus(target ? { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } : null, id),
-    local: (id, timeframe, focusId) => pipeline.local(id, timeframe, { focusId }),
-    prepare: (target, focusId) => pipeline.prepare(target.instId, target.timeframe, target.end ?? undefined, 96, { focusId }),
-    universe: (ids, timeframe, focusId) => Promise.resolve(pipeline.setUniverse(ids, timeframe, focusId)),
+    local: (id, timeframe) => pipeline.local(id, timeframe),
+    history: target => pipeline.localHistory(target.instId, target.timeframe, target.end ?? undefined),
+    universe: () => Promise.resolve(pipeline.residentFrames()),
   })
   const encoder = new ChartNotificationEncoder()
   const unsubscribe = pipeline.subscribe((frame: any) => controller.ingestPrepared(encoder.encode(frame)))
@@ -1795,7 +1880,7 @@ test('a failed cached price repair publishes its retry deadline through the enco
     assert.equal(failed.presented?.bars.length, 95); assert.equal(failed.presented?.priceState, 'error')
     assert.equal(failed.presented?.priceStatus?.retryAt, retryAt)
     assert.match(failed.error, /Price endpoint offline/); assert.match(failed.error, /retry at/)
-    const cached = await pipeline.prepare(instId, '15m', undefined, 96, { focusId: pipeline.focus.id })
+    const cached = await pipeline.local(instId, '15m')
     assert.equal(cached.bars, frame.bars); assert.equal(cached.error, 'Price endpoint offline'); assert.equal(cached.priceStatus.retryAt, retryAt)
     context.mock.timers.tick(6999); await flush(); assert.equal(calls, 1)
     context.mock.timers.tick(1); await flush()
@@ -1831,7 +1916,7 @@ test('a deterministic indicator failure publishes its input and range once, then
     return calculate(...args)
   }
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const state = pipeline.state(instId, '15m'), failed = pipeline.cached(state.key), reads = store.queries.length
     assert.equal(failed.priceState, 'ready'); assert.equal(failed.oiState, 'ready')
     assert.equal(failed.indicatorState, 'error'); assert.equal(failed.indicatorStatus.error, 'Indicator input rejected')
@@ -1839,7 +1924,7 @@ test('a deterministic indicator failure publishes its input and range once, then
     assert.equal(failed.indicatorStatus.retryOn, 'input-change'); assert.ok(failed.indicatorStatus.inputVersion)
     const version = failed.indicatorStatus.inputVersion
     for (let count = 0; count < 4; count++) {
-      await pipeline.local(instId, '15m'); await pipeline.seed(state)
+      await focusLatest(pipeline, instId, '15m'); await pipeline.seed(state)
       pipeline.sourceStateChanged()
     }
     context.mock.timers.tick(60_000)
@@ -1885,7 +1970,7 @@ test('an interrupted indicator worker publishes a recoverable failure and its re
     return task
   }
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const recovered = pipeline.cached(`${instId}:15m`)
     assert.equal(failures.length, 1); assert.equal(failures[0].retryOn, 'worker-recovery')
     assert.match(failures[0].error, /Worker exited/)
@@ -1905,10 +1990,10 @@ test('repeated worker failures stop automatic recovery and a healthy worker resu
     return calculate(...args)
   }
   try {
-    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     assert.equal(attempts, 2)
     const state = pipeline.state(instId, '15m')
-    await pipeline.seed(state); await pipeline.local(instId, '15m')
+    await pipeline.seed(state); await focusLatest(pipeline, instId, '15m')
     assert.equal(attempts, 2); assert.equal(pipeline.cached(state.key).indicatorState, 'error')
     const other = 'ETH-USDT-SWAP'
     await pipeline.calculate(source(12).map(row => ({ ...row, instrument: other })), interval)
@@ -1923,12 +2008,12 @@ test('observed indicator warmup and mathematically undefined values are distingu
     const rows = source(count).map(row => zeroVolume ? { ...row, baseVolume: 0, quoteVolume: 0 } : row)
     const { pipeline } = fixture(rows)
     try {
-      await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+      await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
       const frame = pipeline.cached(`${instId}:15m`)
       assert.equal(frame.indicatorState, 'unavailable'); assert.equal(frame.indicatorStatus.reason, reason)
       assert.equal(frame.indicatorStatus.error, undefined); assert.equal(frame.indicatorStatus.retryOn, undefined)
       const calls = pipeline.nextCalculation
-      await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+      await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
       assert.equal(pipeline.nextCalculation, calls)
     } finally { await pipeline.dispose() }
   }

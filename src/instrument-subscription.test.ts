@@ -28,10 +28,8 @@ const configuration = () => {
 const projectionIsolation = (service: MarketService) => {
   // These tests exercise collection, membership and durable writes. Rendering
   // and indicator projection have their own source-window integration tests.
-  service.projectListEntry = async () => null
+  service.preparedCharts.setUniverse = () => ({ frames: [] })
   service.updateRanking = async () => undefined
-  service.readListBars = async () => ({ bars: [] })
-  service.scheduleListProjection = () => undefined
   for (const lane of service.requestLanes.values()) lane.interval = 0
 }
 const settle = async (service: MarketService) => {
@@ -69,7 +67,7 @@ const synchronized = async (service: MarketService) => {
   return { controller, context }
 }
 const ids = (service: MarketService) => [...service.candidateIDs].sort()
-const listed = (service: MarketService) => service.listRowsFor('15m').map(row => row.instId).sort()
+const listed = (service: MarketService) => service.listRowsFor().map(row => row.instId).sort()
 
 test('subscribe-before-snapshot reconciliation merges buffered listing, delisting and partial definition updates', async () => {
   const held = deferred<unknown[]>(), began = deferred()

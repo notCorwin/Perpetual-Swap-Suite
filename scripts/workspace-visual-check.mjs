@@ -48,10 +48,12 @@ try {
     ipcMain.removeHandler('radar:request')
     ipcMain.handle('radar:request', async (_event, value) => {
       if (value.preferences) return preferences
-      if (value.snapshot) return { rows, revision: 1, serviceSession: 'visual-fixture', timeframe: value.snapshot.timeframe,
+      if (value.snapshot) return { rows, turnoverOrder: [...rows].sort((a, b) => a.instId.localeCompare(b.instId, 'en')).map(row => row.instId), revision: 1, serviceSession: 'visual-fixture',
         realtimeState: 'Connected', updatedAt: 1_800_000_000_000, catalogSource: 'live', error: '', loading: false }
-      if (value.chartUniverse) return { frames: value.chartUniverse.instIds.map(instId => prepared({ instId, timeframe: value.chartUniverse.timeframe })) }
+      if (value.chartUniverse) return { frames: rows.flatMap(({ instId }) => ['5m', '15m', '1H'].map(timeframe => prepared({ instId, timeframe }))) }
+      if (value.chartFocus) return { ok: true }
       if (value.chartLocal) return prepared(value.chartLocal)
+      if (value.chartHistory) return prepared(value.chartHistory)
       if (value.chartWindow) return prepared(value.chartWindow)
       if (value.analysisSettings) return { model: '', hasAPIKey: false }
       if (value.dataAudit) return { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '' }

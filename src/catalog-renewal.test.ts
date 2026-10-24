@@ -57,9 +57,8 @@ const fixture = async (now: number, options: { webSocketFactory?: WebSocketFacto
   // Measure qualification renewal independently of automatic chart-history preparation.
   service.preparedCharts.setRealtimeSubscriptions = () => undefined
   await service.ready
-  service.projectListEntry = async () => null
+  service.preparedCharts.setUniverse = () => ({ frames: [] })
   service.updateRanking = async () => undefined
-  service.scheduleListProjection = () => undefined
   const ensurePrices = service.history.ensurePrices.bind(service.history)
   service.history.ensurePrices = async () => { throw new Error('Complete durable qualification data must not need acquisition.') }
   service.scheduleRefresh = () => undefined
@@ -332,7 +331,7 @@ test('the next durable final candle immediately restores the exact rolling turno
     assert.deepEqual((await f.service.snapshot()).rows, [])
     await f.service.persistCandles(instId, [candle(f.asOf, 400_000)])
     await waitFor(() => f.service.catalog.get(instId)?.result.turnover === 57_800_000)
-    assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
+    assert.deepEqual(f.service.listRowsFor().map(row => row.instId), [instId])
     const turnover = f.service.metadata.getCatalogEntry(instId).observations.turnover
     assert.equal(turnover.value.asOf, f.asOf + fiveMinutes)
     assert.equal(turnover.value.turnover, 57_800_000, 'Drop the oldest 200,000 and add the newly completed 400,000 quote volume.')
@@ -354,7 +353,7 @@ test('a durable historical volume correction immediately applies the resulting q
     f.enableLocalUpdates()
     await f.service.persistCandles(instId, [candle(f.asOf - fiveMinutes, 0)])
     await waitFor(() => f.service.catalogChecks.get(instId)?.status === 'failed')
-    assert.deepEqual(f.service.listRowsFor('15m'), [])
+    assert.deepEqual(f.service.listRowsFor(), [])
     assert.equal(f.service.metadata.getCatalogEntry(instId).result.turnover, 57_400_000)
     assert.equal(f.service.renewalTargets.has(instId), false, 'A verified condition failure must stop priority renewal.')
     assert.deepEqual(f.sourcesBefore(), sources)

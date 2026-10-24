@@ -77,8 +77,10 @@ test('opening a chart repairs an outage through verified SQLite coverage and reu
     await pipeline.setLive(instId, '5m', { ...row(through + step), confirmed: false }, { receivedAt: now })
     const initial = await pipeline.local(instId, '5m')
     assert.equal(initial.priceState, 'stale'); assert.equal(initial.realtimeState, 'live')
-    const repair = pipeline.refreshObservations(pipeline.state(instId, '5m'))
+    pipeline.setFocus({ instId, timeframe: '5m' })
+    const repair = pipeline.focus.task
     gate.resolve(); await repair
+    await waitFor(() => pipeline.cached(`${instId}:5m`)?.priceState === 'ready')
     const inspection = await store.inspectCandles({ instrument: instId, timeframe: '5m', from: through - 95 * step, through })
     assert.deepEqual(inspection.issues, []); assert.equal(inspection.checkedRows, 96)
     const repaired = pipeline.cached(`${instId}:5m`)

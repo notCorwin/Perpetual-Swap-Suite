@@ -21,6 +21,7 @@ const fixture = async (t: TestContext, enabled: Array<keyof typeof DEFAULT_PREFE
   for (const [key, rule] of Object.entries(config.liquidity)) rule.enabled = enabled.includes(key as keyof typeof config.liquidity)
   let requests = 0
   const service = new MarketService(store, () => config, async () => { requests++; return new Response(JSON.stringify({ code: '0', data: [] })) }, false)
+  service.preparedCharts.setUniverse = () => undefined
   await service.ready
   const rows = [['5m', 300000], ['15m', 900000]] as const
   await store.appendCandles(rows.flatMap(([timeframe, step]) => Array.from({ length: 300 }, (_, index) => ({ instrument: instId, timeframe,
@@ -43,7 +44,7 @@ test('disabled liquidity sources reuse the assessment while latest trade prices 
     }
     await delay(150)
     assert.equal(service.catalogChecks.get(instId), original)
-    assert.equal(service.listRowsFor('15m')[0]?.lastPrice, 109)
+    assert.equal(service.listRowsFor()[0]?.lastPrice, 109)
     assert.equal(service.observations.get(instId).ticker.value.last, '109')
     assert.equal(service.observations.get(instId).openInterest.value.oi, '109')
     assert.equal(service.streamQualifications.size, 0)

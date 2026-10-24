@@ -12,9 +12,9 @@ import { parseDesktopRequest } from '../electron/desktop-contract.js'
 const step = 900_000, btc = 'BTC-USDT-SWAP', eth = 'ETH-USDT-SWAP'
 const end = () => Math.floor(Date.now() / step) * step - step
 const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done }); return { promise, resolve } }
-const waitFor = async (condition: () => boolean) => {
+const waitFor = async (condition: () => boolean | Promise<boolean>) => {
   const deadline = performance.now() + 4000
-  while (!condition()) { assert.ok(performance.now() < deadline, 'Chart source demand did not settle.'); await new Promise(resolve => setTimeout(resolve, 2)) }
+  while (!await condition()) { assert.ok(performance.now() < deadline, 'Chart source demand did not settle.'); await new Promise(resolve => setTimeout(resolve, 2)) }
 }
 type SourceCall = { path: string; parameters: Record<string, string | number>; signal: AbortSignal }
 const values = ({ path, parameters }: SourceCall): unknown[][] => {
@@ -48,15 +48,48 @@ const fixture = async ({ acquire = async (_call: SourceCall) => {}, beforeWrite 
   return { store, history, pipeline, calls, async close() { await pipeline.dispose(); await history.close(); await store.close(); await rm(root, { recursive: true, force: true }) } }
 }
 
+test('local chart reads never create source demand, seed indicators, or acquire and replace focus', async () => {
+  const f = await fixture({ acquire: call => untilAborted(call.signal) }), through = end()
+  const seeds: string[] = [], seed = f.pipeline.seed.bind(f.pipeline)
+  f.pipeline.seed = (state: any, ...args: any[]) => { seeds.push(state.instId); return seed(state, ...args) }
+  try {
+    await f.store.appendCandles(Array.from({ length: 400 }, (_, index) => ({
+      instrument: btc, timeframe: '15m', timestamp: through - (399 - index) * step,
+      open: 100, high: 102, low: 99, close: 101, volume: 10, baseVolume: 1, quoteVolume: 1000,
+      confirmed: true, oi: 500, buy: 6, sell: 4, statisticsVersion: 11,
+    })))
+    assert.ok((await f.pipeline.local(btc, '15m'))?.bars.length)
+    assert.ok((await f.pipeline.localHistory(btc, '15m', through - 100 * step))?.bars.length)
+    assert.equal(f.pipeline.focus, null)
+    assert.equal(f.pipeline.focusKey, null)
+    assert.equal(f.pipeline.sourceTasks.size, 0)
+    assert.equal(f.history.sync.listTasks().length, 0)
+    assert.equal(f.calls.length, 0, 'Local data reads must never start a source transport.')
+    assert.deepEqual(seeds, [], 'Local data reads must never request indicator seeding.')
+    assert.equal(f.pipeline.nextCalculation, 0)
+
+    f.pipeline.setFocus({ instId: eth, timeframe: '15m' }, 'selected')
+    await waitFor(() => f.calls.filter(call => call.parameters.instId === eth).length === 3)
+    const selected = f.pipeline.focus
+    assert.ok((await f.pipeline.local(btc, '15m'))?.bars.length)
+    assert.ok((await f.pipeline.localHistory(btc, '15m', through - 101 * step))?.bars.length)
+    assert.equal(f.pipeline.focus, selected, 'A local read cannot replace another explicit owner.')
+    assert.equal(f.pipeline.focusKey, `${eth}:15m`)
+    assert.ok(f.calls.every(call => call.parameters.instId === eth))
+    assert.ok(f.calls.every(call => !call.signal.aborted), 'Reading another series cannot cancel selected transports.')
+    assert.ok(seeds.every(instId => instId === eth), 'Only the explicitly focused series may seed indicators.')
+  } finally { await f.close() }
+})
+
 test('superseding a chart aborts its actual price, OI and Taker transports while the current chart completes', async () => {
   const f = await fixture({ acquire: call => call.parameters.instId === btc ? untilAborted(call.signal) : Promise.resolve() })
   try {
-    await f.pipeline.local(btc, '15m')
+    f.pipeline.setFocus({ instId: btc, timeframe: '15m' }, 'btc')
     await waitFor(() => f.calls.filter(call => call.parameters.instId === btc).length === 3)
     f.pipeline.setFocus({ instId: eth, timeframe: '15m' }, 'eth')
-    await f.pipeline.local(eth, '15m', { focusId: 'eth' })
     const obsolete = f.calls.filter(call => call.parameters.instId === btc)
     await waitFor(() => obsolete.every(call => call.signal.aborted))
+    await waitFor(() => f.calls.filter(call => call.parameters.instId === eth).length === 3)
     await f.history.sync.whenIdle()
     await waitFor(() => f.pipeline.sourceTasks.size === 0)
     assert.equal(f.pipeline.focusKey, `${eth}:15m`)
@@ -75,7 +108,7 @@ test('hiding a chart cancels only its consumers while overlapping history observ
     price = f.history.ensurePrices(btc, '15m', from, through, 'continuity')
     statistics = f.history.ensureStatistics(btc, '15m', from, through, 'continuity')
     await waitFor(() => f.calls.length === 3)
-    await f.pipeline.local(btc, '15m')
+    f.pipeline.setFocus({ instId: btc, timeframe: '15m' }, 'visible')
     await waitFor(() => f.history.sync.listTasks().length === 6)
     f.pipeline.setFocus(null, 'hidden')
     await waitFor(() => f.history.sync.listTasks().filter(task => task.status === 'cancelled').length === 3)
@@ -88,8 +121,13 @@ test('hiding a chart cancels only its consumers while overlapping history observ
     assert.equal(f.pipeline.focusKey, null)
     assert.equal(f.pipeline.refreshTimer, null)
     assert.equal(f.pipeline.sourceAttempts.size, 0)
-    await f.pipeline.local(btc, '15m', { priority: 'background' })
+    const generation = (await f.pipeline.local(btc, '15m')).generation
+    const calculations = f.pipeline.nextCalculation
+    const historical = await f.pipeline.localHistory(btc, '15m', through)
     assert.equal(f.calls.length, 3, 'Durable facts remain reusable after chart ownership ends.')
+    assert.equal(f.pipeline.focusKey, null, 'Reading retained facts must not reacquire source ownership.')
+    assert.equal(historical.generation, generation, 'A read-only projection keeps the admitted input generation.')
+    assert.equal(f.pipeline.nextCalculation, calculations, 'Reading retained facts must not seed another calculation.')
   } finally { hold.resolve(); await Promise.allSettled([price, statistics]); await f.close() }
 })
 
@@ -115,11 +153,11 @@ test('superseded queued chart consumers never enter their source transports', as
   const f = await fixture({ acquire: call => call.parameters.instId === btc ? untilAborted(call.signal) : Promise.resolve() })
   ;(f.history.sync as any).maxConcurrentTasks = 1
   try {
-    await f.pipeline.local(btc, '15m')
+    f.pipeline.setFocus({ instId: btc, timeframe: '15m' }, 'btc')
     await waitFor(() => f.calls.length === 1 && f.history.sync.listTasks().length === 3)
     assert.equal(f.history.sync.listTasks().filter(task => task.status === 'queued').length, 2)
     f.pipeline.setFocus({ instId: eth, timeframe: '15m' }, 'eth')
-    await f.pipeline.local(eth, '15m', { focusId: 'eth' })
+    await waitFor(() => f.history.sync.listTasks().filter(task => task.instrument === eth).length === 3)
     await f.history.sync.whenIdle()
     await waitFor(() => f.pipeline.sourceTasks.size === 0)
     assert.equal(f.calls.filter(call => call.parameters.instId === btc).length, 1)
@@ -139,7 +177,12 @@ test('cached price history proactively fills both statistic reserves without scr
         ...(visible ? { oi: 500, buy: 6, sell: 4, statisticsVersion: 11 } : {}) }
     })
     await f.store.appendCandles(candles)
-    const frame = await f.pipeline.localHistory(btc, '15m', target)
+    f.pipeline.setFocus({ instId: btc, timeframe: '15m', endHour: target }, 'history')
+    let frame: any
+    await waitFor(async () => {
+      frame = await f.pipeline.localHistory(btc, '15m', target)
+      return frame?.priceState === 'ready' && frame?.oiState === 'ready' && frame?.takerState === 'ready'
+    })
     assert.equal(frame.priceState, 'ready'); assert.equal(frame.oiState, 'ready'); assert.equal(frame.takerState, 'ready')
     await waitFor(() => f.calls.some(call => call.path.includes('open-interest')) && f.calls.some(call => call.path.includes('taker')))
     assert.ok(f.calls.every(call => !call.path.includes('candles')), 'Complete cached prices must not gate or duplicate statistic acquisition.')
@@ -148,12 +191,14 @@ test('cached price history proactively fills both statistic reserves without scr
     await waitFor(() => [...state.rows.values()].every((row: any) => row.buy === 6 && row.sell === 4))
     assert.ok([...state.rows.values()].some((row: any) => row.oi == null), 'Taker completes while offscreen OI remains held.')
     const pending = [...f.pipeline.sourceTasks.values()]
+    f.pipeline.setFocus({ instId: btc, timeframe: '15m', endHour: target - step }, 'adjacent')
     await f.pipeline.localHistory(btc, '15m', target - step)
     assert.ok(pending.every((job: any) => !job.controller.signal.aborted), 'Adjacent scrolling reuses already admitted statistic reserves.')
     hold.resolve(); await f.history.sync.whenIdle()
     await waitFor(() => f.pipeline.sourceTasks.size === 0)
     assert.ok([...state.rows.values()].every((row: any) => row.oi === 500 && row.buy === 6 && row.sell === 4))
     const requests = f.calls.length
+    f.pipeline.setFocus({ instId: btc, timeframe: '15m', endHour: target - 2 * step }, 'adjacent-next')
     await f.pipeline.localHistory(btc, '15m', target - 2 * step)
     await f.history.sync.whenIdle()
     assert.equal(f.calls.length, requests, 'Prepared statistic coverage remains reusable on subsequent navigation.')
@@ -174,7 +219,7 @@ test('cold historical price pages proactively populate their entire statistic re
   } finally { await f.close() }
 })
 
-test('the chart focus IPC contract reaches the backend worker and local requests keep their ownership token', async () => {
+test('the chart focus IPC contract starts backend hydration and retired ownership permits pure local reads', async () => {
   const userData = await mkdtemp(join(tmpdir(), 'perp-chart-focus-worker-')), backend = new MarketBackend({ userData, testMode: true })
   const request = (value: unknown) => backend.request(parseDesktopRequest(value))
   try {
@@ -183,10 +228,14 @@ test('the chart focus IPC contract reaches the backend worker and local requests
       open: 100, high: 102, low: 99, close: 101, volume: 10, baseVolume: 1, quoteVolume: 1000, confirmed: true }))
     await backend.request({ e2e: { action: 'seedCandles', candles } })
     assert.deepEqual(await request({ chartFocus: { id: 'visible', target: { instId: btc, timeframe: '15m' } } }), { ok: true })
-    const local = await request({ chartLocal: { instId: btc, timeframe: '15m', focusId: 'visible' } })
+    let local: any
+    await waitFor(async () => {
+      local = await request({ chartLocal: { instId: btc, timeframe: '15m' } })
+      return local?.bars.length === 96
+    })
     assert.equal(local.bars.length, 96)
     assert.deepEqual(await request({ chartFocus: { id: 'hidden', target: null } }), { ok: true })
-    const stale = await request({ chartHistory: { instId: btc, timeframe: '15m', endHour: through, focusId: 'visible' } })
+    const stale = await request({ chartHistory: { instId: btc, timeframe: '15m', endHour: through } })
     assert.ok(stale.bars.length >= 96, 'Retired source ownership still permits reading durable facts.')
   } finally { await backend.dispose(); await rm(userData, { recursive: true, force: true }) }
 })

@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { MarketStore } from '../electron/services/market-store.js'
 import { MarketService } from '../electron/services/market-service.js'
 
-test('list and chart share the full-history EMA seed through corrections, eviction and restart', async () => {
+test('prepared windows retain the full-history EMA seed through corrections, eviction and restart', async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-canonical-'))
   let store = await MarketStore.open(root)
   const instrument = { instId: 'BTC-USDT-SWAP' }, step = 300_000, first = Date.UTC(2024, 0, 1)
@@ -17,21 +17,26 @@ test('list and chart share the full-history EMA seed through corrections, evicti
       confirmed: true, statisticsVersion: 11, oi: 100, buy: 10, sell: 10 }
   })
   let service = new MarketService(store, undefined, async () => { throw new Error('A complete canonical series must stay local.') }, false)
+  let focusID = 0
   const verify = async () => {
-    const list = await service.readListBars({ instrument }, '5m')
-    const chart = await service.prepareChartWindow(instrument.instId, '5m', rows.at(-1)!.timestamp)
-    const byHour = new Map(list.bars.map((bar: { hour: number }) => [bar.hour, bar]))
+    service.instruments.set(instrument.instId, { ...instrument, listTime: String(first) })
+    service.preparedCharts.setFocus({ instId: instrument.instId, timeframe: '5m', endHour: rows.at(-1)!.timestamp }, String(++focusID))
+    await service.preparedCharts.focus!.task
+    const prepared = (await service.localChartWindow(instrument.instId, '5m'))!
+    const chart = (await service.localChartHistory(instrument.instId, '5m', rows.at(-1)!.timestamp))!
+    const byHour = new Map(prepared.bars.map((bar: { hour: number }) => [bar.hour, bar]))
     assert.equal(chart.bars.filter(bar => bar.hour >= rows.at(-1)!.timestamp - 95 * step && bar.hour <= rows.at(-1)!.timestamp).length, 96)
     const shared = chart.bars.filter(bar => byHour.has(bar.hour))
-    assert.equal(shared.length, list.bars.length, 'The chart navigation history must contain the full bounded list projection.')
+    assert.equal(shared.length, prepared.bars.length, 'The chart navigation history must contain the bounded prepared tail.')
     for (const bar of shared) for (const field of ['ema', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'vwap', 'bollMiddle'] as const) {
       assert.equal(bar[field], (byHour.get(bar.hour) as any)[field], `${field} at ${bar.hour}`)
     }
-    return list.bars.at(-1)
+    return prepared.bars.at(-1)
   }
   try {
     await store.appendCandles(rows)
     const latest = await verify()
+    assert.ok(latest && typeof latest.ema === 'number' && typeof latest.atrPercent === 'number')
     // Closed form of 201 identical updates after the SMA seed of 1000.
     const expected = 100 + 900 * (199 / 201) ** 201
     assert.ok(Math.abs(latest.ema - expected) < 1e-9)
@@ -43,7 +48,7 @@ test('list and chart share the full-history EMA seed through corrections, evicti
     await verify()
     service.preparedCharts.maxSeries = 1
     await store.appendCandles([{ ...rows[0], instrument: 'ETH-USDT-SWAP' }])
-    await service.readListBars({ instrument: { instId: 'ETH-USDT-SWAP' } }, '5m')
+    await service.localChartWindow('ETH-USDT-SWAP', '5m')
     await verify()
     await service.dispose()
     await store.close()

@@ -97,9 +97,10 @@ async function exchange() {
     async close() { for (const { socket } of clients) socket.destroy(); await new Promise(resolve => server.close(resolve)) } }
 }
 const ids = Array.from({ length: config.contracts }, (_, index) => `ASSET${index}-USDT-SWAP`)
+const nativePeriods = [['5m', 300000], ['15m', 900000], ['1H', 3600000]]
 const epoch = config.epoch, candle = (instrument, timeframe, timestamp, index) => ({ instrument, timeframe, timestamp,
   open: 100, high: 105, low: 95, close: 100 + (index % 17) / 100, volume: 100, baseVolume: 1, quoteVolume: 10000, confirmed: true })
-const seedRows = ids.flatMap(id => [['5m', 300000], ['15m', 900000]].flatMap(([timeframe, step]) =>
+const seedRows = ids.flatMap(id => nativePeriods.flatMap(([timeframe, step]) =>
   Array.from({ length: 300 }, (_, index) => candle(id, timeframe, Math.floor(epoch / step) * step - (300 - index) * step, index))))
 const source = Array.from({ length: 4096 }, (_, index) => candle(ids[0], '5m', epoch + index * 300000, index))
 const store = await MarketStore.open(join(directory, 'MarketData'))
@@ -138,13 +139,33 @@ const sendRound = async () => {
 }
 try {
   await service.ready; await store.appendCandles(seedRows)
+  // This workload measures warmed native traffic, not first acquisition. Seed
+  // successful-empty independent statistics for every native period before
+  // backend qualification admits automatic preparation in either paired mode.
+  for (const instrument of ids) for (const [timeframe, step] of nativePeriods) {
+    const through = Math.floor(epoch / step) * step - step, from = through - 299 * step
+    for (const source of ['oi', 'taker']) await store.appendStatistics({ instrument, timeframe, source, from, through, values: [], expiresAt: Date.now() + 600000 })
+  }
   service.installInstruments(new Map(ids.map(instId => [instId, { instId, instType: 'SWAP', instCategory: '1', settleCcy: 'USDT', ctType: 'linear', state: 'live', ctVal: '1', ctMult: '1', ctValCcy: instId.split('-')[0], ruleType: 'normal' }])))
   service.publicRealtime.start()
   await waitFor(() => service.publicRealtime.getState().status === 'live', 'all native subscriptions')
   const subscribedChannels = [...new Set([...service.publicRealtime.subscriptions.values()].map(value => value.channel))].sort()
   assert.ok(!subscribedChannels.includes('books'), 'Disabled depth/slippage must not create book demand.')
   for (let index = 0; index < config.warmup; index++) await sendRound()
-  await waitFor(() => service.backgroundTasks.size === 0 && service.preparedCharts.liveSeeds.size === 0, 'warm catalog/history projections')
+  // Qualified membership owns the all-period universe. A selected viewport is
+  // a separate backend intent; local/resident reads never start that lifecycle.
+  assert.deepEqual([...service.catalog.keys()].sort(), [...ids].sort())
+  const pipeline = service.preparedCharts
+  pipeline.setFocus({ instId: ids[0], timeframe: '15m' }, 'overhead-workload')
+  await pipeline.focus.task
+  await waitFor(() => {
+    const ready = new Set(pipeline.residentFrames().frames.filter(frame => frame.bars.length === 96 && frame.indicatorState === 'ready'
+      && frame.priceState === 'ready' && frame.oiState === 'unavailable' && frame.takerState === 'unavailable').map(frame => `${frame.instId}:${frame.timeframe}`))
+    return ids.every(instId => nativePeriods.every(([timeframe]) => ready.has(`${instId}:${timeframe}`)))
+      && service.backgroundTasks.size === 0 && pipeline.candidateTasks.size === 0 && pipeline.candidateQueue.length === 0
+      && pipeline.liveSeeds.size === 0 && pipeline.sourceTasks.size === 0 && pipeline.calculations.size === 0
+  }, 'backend-owned preparation of every qualified native frame')
+  const preparedFrames = pipeline.residentFrames().frames.length
   for (let index = 0; index < config.warmup; index++) buildIndicatorSeries(source)
   for (let index = 0; index < config.warmup; index++) await service.preparedCharts.calculate(source, 300000, 'foreground')
   await delay(300); await flushOperationRecording()
@@ -166,12 +187,12 @@ try {
   if(profiler){profiler.connect();await profileCall('Profiler.enable');await profileCall('Profiler.start')}
   await measure('nativeMarket', async () => { for (let index = 0; index < config.cycles; index++) await sendRound() })
   if(profiler){const {profile}=await profileCall('Profiler.stop');profiler.disconnect();await writeFile(join(directory,'native-market.cpuprofile'),JSON.stringify(profile))}
-  const rows = service.listRowsFor('15m')
+  const rows = service.listRowsFor()
   assert.equal(rows.length, config.contracts); assert.equal(service.publicRealtime.getTelemetry().rejectedEvents, 0)
   assert.deepEqual(transport.errors, []); assert.equal(unexpectedRequests, 0, 'The warmed workload must not reacquire available history.')
   await measure('durableFlush', () => flushOperationRecording())
   const marketMessagesByChannel = Object.fromEntries(Object.entries(transport.messageCounts).map(([channel, count]) => [channel, count - (countsBefore[channel] ?? 0)]))
-  const business = { CPU, WORKER, DATABASE, contracts: rows.length, finalPrices: rows.map(row => [row.instId, row.lastPrice]).sort(), marketMessages: transport.messages - before, marketMessagesByChannel }
+  const business = { CPU, WORKER, DATABASE, contracts: rows.length, preparedFrames, finalPrices: rows.map(row => [row.instId, row.lastPrice]).sort(), marketMessages: transport.messages - before, marketMessagesByChannel }
   await service.dispose(); await store.close(); await transport.close(); await closeOperationRecording()
   return business
   })
@@ -181,7 +202,7 @@ try {
     node: process.version, v8: process.versions.v8, electron: process.versions.electron ?? null, executable: process.execPath }
   console.log(JSON.stringify({ business, metrics, journalBytes, runtime, parameters: { contracts: config.contracts, cycles: config.cycles, warmup: config.warmup,
     liquidityFilters: Object.fromEntries(Object.entries(preferences.liquidity).map(([name, rule]) => [name, rule.enabled])),
-    subscribedChannels, inputChannels: Object.keys(transport.messageCounts).sort(),
+    subscribedChannels, inputChannels: Object.keys(transport.messageCounts).sort(), nativePeriods: nativePeriods.map(([timeframe]) => timeframe),
     nativeTransport: 'WebSocket', database: 'SQLite WAL workers',businessClock: 'fixed midperiod epoch plus monotonic elapsed time',warmupDrainMS:300,memorySampling:memorySampler.snapshot() } }))
 } catch (error) {
   await Promise.allSettled([service.dispose(), store.close(), transport.close()]); await closeOperationRecording().catch(() => {}); throw error

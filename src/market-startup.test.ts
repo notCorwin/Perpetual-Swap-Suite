@@ -8,7 +8,6 @@ import { MarketStore, type CandleQuery } from '../electron/services/market-store
 import { MarketService } from '../electron/services/market-service.js'
 import { DEFAULT_PREFERENCES } from '../electron/services/preferences.js'
 import type { RealtimeWebSocket } from '../electron/services/realtime-market.js'
-import type { Bar } from './chart-data.ts'
 
 const fiveMinutes = 300_000
 const timeframes = [['5m', fiveMinutes], ['15m', 900_000], ['1H', 3_600_000]] as const
@@ -138,31 +137,24 @@ test('automatic startup gates 289 candidates on shared tickers and OI before acq
     assert.equal(history.mock.callCount(), 0)
     assert.equal(requestsFor('/market/books').length, 0)
     assert.equal(requestsFor('/public/open-interest').length, 1)
-    assert.deepEqual(market.listRowsFor('15m'), [])
+    assert.deepEqual(market.listRowsFor(), [])
 
     interestGate.resolve()
     await waitFor(() => market.refreshing === null && market.candidateTasks.size === 0 && market.sourceRecoveries.size === 0
-      && market.streamQualifications.size === 0 && market.streamEvaluations.size === 0 && market.backgroundTasks.size === 0
-      && market.listProjectionTasks.size === 0 && market.listProjectionResults.size === 14, 'qualification and real list projections')
+      && market.streamQualifications.size === 0 && market.streamEvaluations.size === 0 && market.backgroundTasks.size === 0, 'qualification and backend chart preparation')
     const completedMS = Math.round(performance.now() - started)
     const snapshot = await market.snapshot()
     assert.deepEqual(snapshot.catalogProgress, { total: 289, completed: 289, pending: 0, verified: 14, failed: 275, unknown: 0 })
-    assert.deepEqual(snapshot.listProgress, { total: 14, completed: 14, pending: 0, retrying: 0, unavailable: 0 })
+    assert.equal('listProgress' in snapshot, false)
     assert.equal(snapshot.loading, false)
     assert.equal(snapshot.error, '')
     assert.deepEqual(snapshot.rows.map(row => row.instId).sort(), healthy)
     for (const row of snapshot.rows) {
       assert.equal(row.turnover24hUSDT, 57_600_000)
       assert.equal(row.lastPrice, 100)
-      assert.equal(row.price, 202.99, 'The real default 15m projection uses its native latest completed candle.')
       assert.ok(Number.isFinite(row.rankingChange))
-      assert.ok(Number.isFinite(row.rsi6))
       assert.equal(market.validCatalogEntry(market.catalog.get(row.instId)), true)
-      const projection = market.listProjectionResults.get(`15m:${row.instId}`)
-      assert.equal(projection.end, Math.floor(Date.now() / 900_000) * 900_000 - 900_000)
-      assert.ok(projection.bars.length >= 96)
-      assert.ok(projection.bars.every((bar: Bar) => bar.indicatorsObserved))
-      assert.ok(Number.isFinite(projection.bars.at(-1).ema))
+      assert.deepEqual(Object.keys(row).sort(), ['instId', 'lastPrice', 'turnover24hUSDT', 'rankingChange', 'rankingAsOf'].sort())
     }
     const windows: CandleQuery[] = qualificationReads.mock.calls.map((call: { arguments: [CandleQuery, AbortSignal] }) => call.arguments[0])
     assert.equal(windows.length, 14, 'Only the final 14 cheap-gate survivors read qualification windows, rather than all 289 candidates.')

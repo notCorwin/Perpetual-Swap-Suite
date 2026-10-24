@@ -1,7 +1,7 @@
 import type { Worker } from 'node:worker_threads'
 import type { CandleRecord, MarketStore } from './market-store.js'
 import type { HistoryPriority, HistoryTimeframe } from './history-sync.js'
-import type { Bar, PreparedChartResponse } from '../../src/chart-data.ts'
+import type { PreparedChartResponse } from '../../src/chart-data.ts'
 
 export type PreparedPriceSourceResult = { rows?: CandleRecord[]; floor?: number | null }
 export type PreparedLatestSourceResult = PreparedPriceSourceResult
@@ -23,17 +23,17 @@ export class PreparedChartPipeline {
     /** Acknowledged current candle subscription; persisted coverage is checked separately. */
     streaming?(instId: string, timeframe: HistoryTimeframe): boolean
   })
-  /** Replace selected source ownership; candidate preparation remains independently owned by setUniverse. */
+  /** Declare viewport demand and immediately own its hydration, repair, priority and bounded reserve. */
   setFocus(target: { instId: string; timeframe: HistoryTimeframe; endHour?: number } | null, id?: string): void
   prepare(instId: string, timeframe: HistoryTimeframe, targetEnd?: number, historyBars?: number, options?: { focusId?: string }): Promise<PreparedChartResponse>
-  local(instId: string, timeframe: HistoryTimeframe, options?: { priority?: HistoryPriority; focusId?: string }): Promise<PreparedChartResponse | null>
-  /** Bounded local price projection. Missing sources and exact indicators repair independently. */
-  localHistory(instId: string, timeframe: HistoryTimeframe, targetEnd?: number, options?: { focusId?: string }): Promise<PreparedChartResponse | null>
-  projectSeries(instId: string, timeframe: HistoryTimeframe): Promise<{ end: number | null; bars: Bar[] }>
-  /** Bounded canonical tail plus the untruncated BOLL expansion run for list metrics. */
-  projectListSeries(instId: string, timeframe: HistoryTimeframe): Promise<{ end: number | null; bars: Bar[]; bollExpansion: { hours: number; complete: boolean } | null }>
-  /** Return cached current-timeframe frames immediately and prepare every candidate asynchronously with bounded concurrency; readiness publishes through subscribe. */
-  setUniverse(instIds: string[], timeframe: HistoryTimeframe, focusInstId?: string): { frames: PreparedChartResponse[] }
+  /** Pure latest durable read; never starts calculation, changes focus, or schedules source work. */
+  local(instId: string, timeframe: HistoryTimeframe, options?: { priority?: HistoryPriority }): Promise<PreparedChartResponse | null>
+  /** Pure bounded durable read. Never changes focus or schedules source work. */
+  localHistory(instId: string, timeframe: HistoryTimeframe, targetEnd?: number): Promise<PreparedChartResponse | null>
+  /** Backend catalog membership owns every supported timeframe, with bounded independent preparation. */
+  setUniverse(instIds: string[]): void
+  /** Pure renderer hydration of cached frames; never admits work or changes membership. */
+  residentFrames(): { frames: PreparedChartResponse[] }
   /** Lightweight collector membership; this never restores or prepares candidate charts. */
   setRealtimeSubscriptions(subscriptions: { instId: string; timeframe: HistoryTimeframe }[]): void
   /** Reassess actual source deadlines after connection or subscription changes. */

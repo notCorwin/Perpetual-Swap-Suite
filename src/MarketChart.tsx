@@ -20,7 +20,7 @@ import { formatPercent } from "@/market-percent"
 import { RADAR_TIMEFRAMES, timeframeLabel, timeframeMilliseconds, type RadarTimeframe } from '@/timeframe'
 
 import { chartController } from '@/chart-controller'
-import { chartReadyForListing, createChartPlotCache } from '@/chart-render'
+import { createChartPlotCache } from '@/chart-render'
 import type { Bar, ChartSourceStatus, PreparedChartState, ReadyChartWindow } from '@/chart-data'
 import { measureOperation } from '../electron/services/operations.js'
 
@@ -228,20 +228,20 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
 })
 
 type PlotSize = { width: number; height: number }
-type RenderReady = (instId: string, timeframe: RadarTimeframe) => (() => void)
 
 /** Every candidate owns a mounted SVG. Selection changes visibility, not paths. */
-const PreparedPlot = memo(function PreparedPlot({ instId, timeframe, size, selected, inspected, onReady, navigationSurface }: {
+const PreparedPlot = memo(function PreparedPlot({ instId, timeframe, size, selected, inspected, navigationSurface, presentedSurface }: {
   instId: string; timeframe: RadarTimeframe; size: PlotSize; selected: boolean; inspected: number | null
-  onReady?: RenderReady; navigationSurface?: ReadyChartWindow
+  navigationSurface?: ReadyChartWindow; presentedSurface?: ReadyChartWindow
 }) {
   const latest = useSyncExternalStore(chartController.store.subscribe, () => chartController.store.window(instId, timeframe))
-  const surface = navigationSurface ?? latest
+  // The selected SVG and its parent legends publish one immutable frame.
+  // Hidden candidates may consume new cache entries independently.
+  const surface = navigationSurface ?? presentedSurface ?? latest
   const plot = chartPlot(surface, size)
-  const ready = !navigationSurface && chartReadyForListing(surface) && Boolean(plot)
-  useLayoutEffect(() => {
-    if (ready) return onReady?.(instId, timeframe)
-  }, [ready, instId, timeframe, size.width, size.height, onReady])
+  const ready = Boolean(surface?.bars.length && (surface.priceState === 'ready' || surface.priceState === 'stale')
+    && (surface.indicatorState === 'ready' || surface.indicatorState === 'unavailable')
+    && surface.oiState !== 'loading' && surface.takerState !== 'loading' && plot)
   if (!surface || !plot) return null
   const { bars, geometry } = plot
   return <PlotVisible value={selected}>
@@ -260,7 +260,7 @@ const PreparedPlot = memo(function PreparedPlot({ instId, timeframe, size, selec
   </PlotVisible>
 })
 
-export function MarketChart({ instId, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, candidateIds = listOrder, onRenderReady, turnoverOrder, onSelect }: { instId: string; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; onRenderReady?: RenderReady; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
+export function MarketChart({ instId, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, candidateIds = listOrder, turnoverOrder, onSelect }: { instId: string; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
   const view = useSyncExternalStore(chartController.subscribe, chartController.getSnapshot)
   useLayoutEffect(() => {
     if (!isActive) return
@@ -270,8 +270,6 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
   const surface = view.presented
   const matchesSelection = surface?.instId === instId && surface.timeframe === timeframe
   const pending = view.pending || !matchesSelection
-  const unavailable = view.requested?.instId === instId && view.requested.timeframe === timeframe ? view.unavailable : null
-  const unavailableText = unavailable ? `${instId.replace(/-SWAP$/, '')} has ${unavailable.availableCandles} completed ${timeframeLabel(timeframe)} candles. A complete chart requires ${unavailable.requiredCandles}.` : ''
   const intervalMS = surface?.intervalMS ?? timeframeMilliseconds(timeframe)
   const displayedId = surface?.instId ?? instId
   const displayedFrame = surface?.timeframe ?? timeframe
@@ -441,8 +439,7 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
   const priceScale = plotGeometry?.priceAxis.kind ?? 'logarithmic'
   const priceState = surface?.priceState ?? 'loading'
   const statusMessages: string[] = []
-  if (unavailable) statusMessages.push(unavailableText)
-  else if (pending && !error) statusMessages.push(surface ? `Preparing ${instId.replace(/-SWAP$/, '')} ${timeframeLabel(timeframe)}${requestedEnd !== null ? ` · ${time(requestedEnd)}` : ''}…` : 'Loading local prices…')
+  if (pending && !error) statusMessages.push(surface ? `Preparing ${instId.replace(/-SWAP$/, '')} ${timeframeLabel(timeframe)}${requestedEnd !== null ? ` · ${time(requestedEnd)}` : ''}…` : 'Loading local prices…')
   if (surface && !error && priceState === 'partial') statusMessages.push('Repairing missing price history…')
   if (surface && !error && priceState === 'stale') statusMessages.push('Recent price history is stale; repairing…')
   if (surface && !error && priceState === 'loading') statusMessages.push('Loading price history…')
@@ -457,7 +454,7 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
   }
   if (atBoundary && !pending) statusMessages.push('Start of available history')
   if (!statusMessages.length && error) statusMessages.push('Chart update failed')
-  const statusLoading = !error && ((pending && !unavailable) || priceState === 'loading' || priceState === 'partial' || priceState === 'stale')
+  const statusLoading = !error && ((pending) || priceState === 'loading' || priceState === 'partial' || priceState === 'stale')
     || surface?.indicatorState === 'loading' || oiState === 'loading' || takerState === 'loading'
   const statusSummary = statusMessages.join(' · ')
   return <section data-chart-workspace aria-label="Market chart workspace" className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden overscroll-none text-sm font-normal tabular-nums">
@@ -472,7 +469,7 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}</div>}
     {capture.error && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{capture.error}</p>}
     <div className="flex min-h-0 flex-1">
-    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending && !unavailable ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
+    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
       <div className="flex h-9 shrink-0 items-center gap-6 border-b px-4">
         <h2 className="min-w-0 max-w-1/2 truncate text-base font-semibold tracking-tight" title={displayedId}>{displayedId.replace(/-SWAP$/, '')} · {timeframeLabel(displayedFrame)}</h2>
         <div data-chart-status data-chart-indicator-state={surface?.indicatorState} data-chart-indicator-input={surface?.indicatorStatus?.inputVersion} role="status" aria-live="polite" aria-atomic="true" className="flex min-w-0 flex-1 items-center gap-2 text-xs text-muted-foreground">
@@ -514,7 +511,8 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
         queueWheel(delta * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 240 : 1))
       }}>
         {plotCandidates.map(id => <PreparedPlot key={`${timeframe}:${id}`} instId={id} timeframe={timeframe} size={plotSize}
-          selected={matchesSelection && !navigationSurface && id === displayedId} inspected={id === displayedId ? inspected : null} onReady={onRenderReady} />)}
+          selected={matchesSelection && !navigationSurface && id === displayedId} inspected={id === displayedId ? inspected : null}
+          presentedSurface={matchesSelection && !navigationSurface && id === displayedId ? surface ?? undefined : undefined} />)}
         {navigationSurface && <PreparedPlot key="navigation" instId={navigationSurface.instId} timeframe={navigationSurface.timeframe}
           size={plotSize} selected={true} inspected={inspected} navigationSurface={navigationSurface} />}
       </div>

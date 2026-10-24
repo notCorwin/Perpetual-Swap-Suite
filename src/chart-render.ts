@@ -1,15 +1,5 @@
 import type { Bar, ReadyChartWindow } from './chart-data.ts'
 import { createChartGeometryCache } from './chart-geometry.ts'
-import type { RadarTimeframe } from './timeframe.ts'
-
-export const chartRenderKey = (instId: string, timeframe: RadarTimeframe) => `${timeframe}:${instId}`
-
-/** Missing/undefined observations have a finished, truthful panel of their own. */
-export function chartReadyForListing(window: ReadyChartWindow | null) {
-  return Boolean(window?.bars.length && (window.priceState === 'ready' || window.priceState === 'stale')
-    && (window.indicatorState === 'ready' || window.indicatorState === 'unavailable')
-    && window.oiState !== 'loading' && window.takerState !== 'loading')
-}
 
 /** Selection and background rendering share the exact same immutable paths. */
 export function createChartPlotCache(measureText: (text: string) => number) {
@@ -39,29 +29,5 @@ export function createChartPlotCache(measureText: (text: string) => number) {
     variants.push(plot)
     if (variants.length > 2) variants.shift()
     return plot
-  }
-}
-
-/** A row is selectable only while its completed SVG is mounted in the pool. */
-export class RenderedChartRegistry {
-  private readonly receipts = new Map<string, Set<symbol>>()
-  private snapshot: ReadonlySet<string> = new Set()
-  private readonly listeners = new Set<() => void>()
-  readonly getSnapshot = () => this.snapshot
-  readonly subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
-  readonly register = (instId: string, timeframe: RadarTimeframe) => {
-    const key = chartRenderKey(instId, timeframe), token = Symbol(key)
-    const owners = this.receipts.get(key) ?? new Set<symbol>()
-    owners.add(token); this.receipts.set(key, owners)
-    if (!this.snapshot.has(key)) this.publish()
-    return () => {
-      if (!owners.delete(token) || owners.size) return
-      this.receipts.delete(key)
-      this.publish()
-    }
-  }
-  private publish() {
-    this.snapshot = new Set(this.receipts.keys())
-    for (const listener of this.listeners) listener()
   }
 }

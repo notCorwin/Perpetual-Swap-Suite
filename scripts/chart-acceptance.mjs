@@ -555,18 +555,18 @@ export function separateSourceMaintenance(sourceRequests, fixture) {
   return { historical, historicalExtensions, currentMaintenance }
 }
 
-export async function installRequestProbe(electron, instId, { holdHistorical = false, disableLocalHistory = false, initialHistoryBars = null, capHistoricalWindows = false, historicalDelayMS = 0 } = {}) {
-  await electron.evaluate(async ({ ipcMain, BrowserWindow }, { instId, holdHistorical, disableLocalHistory, initialHistoryBars, capHistoricalWindows, historicalDelayMS }) => {
+export async function installRequestProbe(electron, instId, { holdHistorical = false, initialHistoryBars = null, historicalDelayMS = 0 } = {}) {
+  await electron.evaluate(async ({ ipcMain, BrowserWindow }, { instId, holdHistorical, initialHistoryBars, historicalDelayMS }) => {
     const original = ipcMain._invokeHandlers.get('radar:request')
     const contents = BrowserWindow.getAllWindows()[0].webContents
     const originalSend = contents.send
     await globalThis.__marketBackend.probe({ action: 'sourceInstall', instId })
     const probe = {
-      original, contents, originalSend, calls: [], active: 0, maxActive: 0,
-      historicalActive: 0, maxHistoricalActive: 0,
-      historyCalls: [], historyResponses: [], historyFrames: new Map(), transferredHistoryBars: 0, transferredWindowBars: 0,
-      sourceCalls: 0, sourceRequests: [], holdLatest: false, latestHeld: false,
-      held: false, callsAtHold: null, release: null,
+      original, contents, originalSend, calls: [], active: 0, maxActive: 0, focusCalls: [], legacyWindowCalls: 0,
+      historicalActive: 0, maxHistoricalActive: 0, localActive: 0, maxLocalActive: 0,
+      historyCalls: [], historyResponses: [], historyFrames: new Map(), transferredHistoryBars: 0,
+      holdHistorical, holdLocal: false, held: false, heldCall: null, heldSettled: false, callsAtHold: null, release: null,
+      extendHistory: initialHistoryBars === null, deliveredFloors: new Map(), extensions: [], pendingPushes: new Map(), timers: new Set(), closed: false,
     }
     const rememberHistory = response => {
       if (response?.instId !== instId || !['5m', '15m', '1H'].includes(response.timeframe) || !Array.isArray(response.bars) || response.bars.length <= 96) return
@@ -578,67 +578,100 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
         generation: response.generation, revision: response.revision,
       })
     }
-    // Model a durable range that has not reached the renderer yet. Every
-    // compact/local ingress observes the same cutoff, including pushed data,
-    // while an actual historical prepare may extend it using the real store.
-    const initialRange = response => {
-      if (!Number.isSafeInteger(initialHistoryBars) || response?.instId !== instId || !Array.isArray(response.bars)) return response
-      const first = response.latestEnd - (initialHistoryBars - 1) * response.intervalMS
-      return { ...response, bars: response.bars.filter(bar => bar.hour >= first) }
+    const floor = response => {
+      if (!Number.isSafeInteger(initialHistoryBars) || response?.instId !== instId || !Array.isArray(response.bars)) return null
+      if (!probe.deliveredFloors.has(response.timeframe)) probe.deliveredFloors.set(response.timeframe, response.latestEnd - (initialHistoryBars - 1) * response.intervalMS)
+      return probe.deliveredFloors.get(response.timeframe)
+    }
+    const clip = response => {
+      const first = floor(response)
+      return first === null ? response : { ...response, bars: response.bars.filter(bar => bar.hour >= first) }
+    }
+    const extension = (response, kind, startedAt, readCompletedAt = Date.now()) => {
+      const previousFloor = floor(response)
+      if (!probe.extendHistory || previousFloor === null || !response.bars.length || response.bars[0].hour >= previousFloor) return null
+      const record = { kind, instId: response.instId, timeframe: response.timeframe, endHour: response.endHour,
+        startedAt, readCompletedAt, completedAt: null, previousFloor, first: response.bars[0].hour, end: response.bars.at(-1).hour, bars: response.bars.length }
+      probe.extensions.push(record)
+      return record
+    }
+    const delivered = (response, record) => {
+      if (record) {
+        probe.deliveredFloors.set(response.timeframe, Math.min(probe.deliveredFloors.get(response.timeframe), response.bars[0].hour))
+        Object.assign(record, { completedAt: Date.now(), first: response.bars[0].hour, end: response.bars.at(-1).hour, bars: response.bars.length })
+      }
+      const result = clip(response)
+      rememberHistory(result)
+      return result
     }
     contents.send = function (channel, ...args) {
-      if (channel === 'radar:chart-prepared') { args[0] = initialRange(args[0]); rememberHistory(args[0]) }
+      if (channel !== 'radar:chart-prepared') return originalSend.call(this, channel, ...args)
+      const response = args[0], record = extension(response, 'push', Date.now())
+      if (record && historicalDelayMS > 0) {
+        const pending = probe.pendingPushes.get(response.timeframe)
+        if (pending) { pending.args = args; probe.extensions.pop(); return }
+        const entry = { args, record }; probe.pendingPushes.set(response.timeframe, entry)
+        const timer = setTimeout(() => {
+          probe.timers.delete(timer); probe.pendingPushes.delete(response.timeframe)
+          if (probe.closed) return
+          entry.args[0] = delivered(entry.args[0], record)
+          originalSend.call(contents, channel, ...entry.args)
+        }, historicalDelayMS)
+        probe.timers.add(timer)
+        return
+      }
+      args[0] = delivered(response, record)
       return originalSend.call(this, channel, ...args)
     }
     const released = new Promise(resolve => { probe.release = resolve })
     ipcMain.removeHandler('radar:request')
     ipcMain.handle('radar:request', async (event, value) => {
-      if (value.chartHistory?.instId === instId) {
-        probe.historyCalls.push({ ...value.chartHistory })
-        const response = disableLocalHistory ? null : initialRange(await original(event, value))
-        const bars = response?.bars.length ?? 0
-        probe.transferredHistoryBars += bars
-        probe.historyResponses.push({ ...value.chartHistory, bars })
-        rememberHistory(response)
-        return response
+      if (value.chartFocus) {
+        probe.focusCalls.push({ ...value.chartFocus, at: Date.now() })
+        return original(event, value)
       }
-      if (value.chartWindow?.instId !== instId) {
+      if (value.chartWindow) probe.legacyWindowCalls += 1
+      const kind = value.chartHistory?.instId === instId ? 'history' : value.chartLocal?.instId === instId ? 'local' : null
+      if (!kind) {
         const response = await original(event, value)
-        return value.chartUniverse ? { ...response, frames: response.frames.map(initialRange) }
-          : value.chartLocal ? initialRange(response) : response
+        return value.chartUniverse ? { ...response, frames: response.frames.map(clip) } : response
       }
-      const historical = Number.isFinite(value.chartWindow.endHour)
-      const call = { ...value.chartWindow, startedAt: Date.now(), completedAt: null }
+      const query = value.chartHistory ?? value.chartLocal
+      const call = { kind, ...query, startedAt: Date.now(), readCompletedAt: null, completedAt: null, bars: 0 }
       probe.calls.push(call)
-      probe.active += 1
-      probe.maxActive = Math.max(probe.maxActive, probe.active)
-      if (historical) {
-        probe.historicalActive += 1
-        probe.maxHistoricalActive = Math.max(probe.maxHistoricalActive, probe.historicalActive)
-      }
+      probe.active += 1; probe.maxActive = Math.max(probe.maxActive, probe.active)
+      const lane = kind === 'history' ? 'historicalActive' : 'localActive'
+      const maximum = kind === 'history' ? 'maxHistoricalActive' : 'maxLocalActive'
+      probe[lane] += 1; probe[maximum] = Math.max(probe[maximum], probe[lane])
+      if (kind === 'history') probe.historyCalls.push({ ...query })
+      let held = false
       try {
-        if (probe.holdLatest && !Number.isFinite(value.chartWindow.endHour)) {
-          probe.latestHeld = true
-          await released
-        } else if (holdHistorical && !probe.held && Number.isFinite(value.chartWindow.endHour)) {
-          probe.held = true
-          probe.callsAtHold = probe.calls.length
-          await released
-        }
-        if (historical && historicalDelayMS > 0) await new Promise(resolve => setTimeout(resolve, historicalDelayMS))
+        // Read first, then hold delivery of the detached old reply. Explicit
+        // backend focus/demand continues while either renderer disk lane waits.
         const response = await original(event, value)
-        probe.transferredWindowBars += response?.bars.length ?? 0
-        const result = historical && !capHistoricalWindows ? response : initialRange(response)
-        if (historical) rememberHistory(result)
+        call.readCompletedAt = Date.now()
+        if (kind === 'history' && probe.holdHistorical && !probe.held && Number.isFinite(query.endHour)) {
+          held = probe.held = true; probe.heldCall = call; probe.callsAtHold = probe.calls.length
+          await released
+        } else if (kind === 'local' && probe.holdLocal) await released
+        const record = extension(response, kind, call.startedAt, call.readCompletedAt)
+        if (record && historicalDelayMS > 0) await new Promise(resolve => setTimeout(resolve, historicalDelayMS))
+        const result = delivered(response, record)
+        call.bars = result?.bars.length ?? 0
+        call.first = result?.bars[0]?.hour ?? null; call.end = result?.bars.at(-1)?.hour ?? null
+        call.delayedExtension = Boolean(record)
+        if (kind === 'history') {
+          probe.transferredHistoryBars += call.bars
+          probe.historyResponses.push({ ...query, bars: call.bars, first: call.first, end: call.end })
+        }
         return result
       } finally {
-        call.completedAt = Date.now()
-        probe.active -= 1
-        if (historical) probe.historicalActive -= 1
+        call.completedAt = Date.now(); probe.active -= 1; probe[lane] -= 1
+        if (held) probe.heldSettled = true
       }
     })
     globalThis.__chartRequestProbe = probe
-  }, { instId, holdHistorical, disableLocalHistory, initialHistoryBars, capHistoricalWindows, historicalDelayMS })
+  }, { instId, holdHistorical, initialHistoryBars, historicalDelayMS })
 }
 
 export async function releaseRequestProbe(electron) {
@@ -651,11 +684,11 @@ export async function readRequestProbe(electron) {
     const sourceRequests = await globalThis.__marketBackend.probe({ action: 'sourceRead' })
     return {
       calls: probe.calls, active: probe.active, maxActive: probe.maxActive,
-      historicalActive: probe.historicalActive, maxHistoricalActive: probe.maxHistoricalActive,
+      historicalActive: probe.historicalActive, maxHistoricalActive: probe.maxHistoricalActive, localActive: probe.localActive, maxLocalActive: probe.maxLocalActive,
+      focusCalls: probe.focusCalls, legacyWindowCalls: probe.legacyWindowCalls, heldCall: probe.heldCall, heldSettled: probe.heldSettled, extensions: probe.extensions,
       historyCalls: probe.historyCalls, historyResponses: probe.historyResponses, historyFrames: Object.fromEntries(probe.historyFrames),
-      transferredHistoryBars: probe.transferredHistoryBars, transferredWindowBars: probe.transferredWindowBars,
-      transferredBars: probe.transferredHistoryBars + probe.transferredWindowBars,
-      sourceCalls: sourceRequests.length, sourceRequests, held: probe.held, latestHeld: probe.latestHeld, callsAtHold: probe.callsAtHold,
+      transferredHistoryBars: probe.transferredHistoryBars, transferredBars: probe.transferredHistoryBars,
+      sourceCalls: sourceRequests.length, sourceRequests, held: probe.held, callsAtHold: probe.callsAtHold,
     }
   })
 }
@@ -665,6 +698,8 @@ export async function removeRequestProbe(electron) {
     const probe = globalThis.__chartRequestProbe
     if (!probe) return
     probe.release()
+    probe.closed = true
+    for (const timer of probe.timers) clearTimeout(timer)
     await globalThis.__marketBackend.probe({ action: 'sourceRemove' })
     probe.contents.send = probe.originalSend
     ipcMain.removeHandler('radar:request')
@@ -673,9 +708,9 @@ export async function removeRequestProbe(electron) {
   })
 }
 
-// Exercise a cold boundary while real wheel events keep arriving. Restricting
-// every initial ingress prevents the normal bulk durable read from turning
-// this into an already-warmed navigation test.
+// Exercise backend reserve preparation while real wheel events keep arriving.
+// Restrict all initial ingresses, then delay both durable reads and backend
+// pushes so neither path can bypass the observed history-delivery latency.
 export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
   const initialHistoryBars = 1_000
   const historicalDelayMS = 1_500
@@ -700,9 +735,9 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
     await page.evaluate(async () => { for (let index = 0; index < 2; index += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
     await wheelBurst(page, { deltaY: -12 })
     await waitForRendered(page, fixture)
-    assert.deepEqual(initial.calls.filter(call => Number.isFinite(call.endHour)), [],
-      'The cold boundary must still be beyond the idle prefetch runway before wheel input.')
+    assert.deepEqual(initial.extensions, [], 'Initial hydration must keep every ingress inside the artificial delivered range.')
     await startPaintProbe(page, fixture)
+    await electron.evaluate(() => { globalThis.__chartRequestProbe.extendHistory = true })
     const inputs = await wheelBurst(page, { frames, deltaY: 24 })
     const expectedEnd = fixture.end - frames * candlesPerFrame * fixture.intervalMS
     await waitForRendered(page, fixture, fixture.timeframe, expectedEnd)
@@ -714,31 +749,37 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
     const requests = await readRequestProbe(electron)
     assert.equal(paint.pendingFrames, 0, `Latency-covered scrolling must never expose an unprepared requested viewport: ${JSON.stringify({ calls: requests.calls, sourceRequests: requests.sourceRequests, historyResponses: requests.historyResponses.length, inputDurationMS: inputs.at(-1) - inputs[0], pendingFrames: paint.pendingFrames })}`)
     assert.ok(latency.latestInputToPaintMS < 100, `The latest wheel input took ${latency.latestInputToPaintMS} ms to paint. ${JSON.stringify(latency)}`)
-    const historical = requests.calls.filter(call => Number.isFinite(call.endHour))
-    const first = historical[0]
-    assert.ok(first, 'Approaching the cold boundary must issue a historical prefetch.')
+    const extensions = requests.extensions.filter(record => record.completedAt !== null && record.startedAt >= timeOrigin + inputs[0])
+    const first = extensions[0]
+    assert.ok(first, 'Backend reserve preparation must extend the delivered history during the gesture.')
     const requestTime = first.startedAt - timeOrigin
     const responseTime = first.completedAt - timeOrigin
-    assert.ok(requestTime > inputs[0] && responseTime < inputs.at(-1),
-      'Historical work must start and finish during the ongoing wheel gesture, without waiting for scroll end.')
-    assert.ok(first.completedAt - first.startedAt >= historicalDelayMS,
-      'The measured historical request must include the full artificial network latency.')
-    const firstMissingViewportEnd = fixture.end - (initialHistoryBars - 95) * fixture.intervalMS
-    assert.equal(first.endHour, firstMissingViewportEnd, 'Prefetch must extend the adjacent complete viewport rather than skip a 96-candle page.')
-    assert.ok(first.historyBars > 96, 'A latency-covered prefetch must prepare a bulk range.')
+    assert.ok(requestTime >= inputs[0] && responseTime < inputs.at(-1),
+      'A delayed history delivery must start and finish while wheel input is still arriving.')
+    const observedDeliveryMS = first.completedAt - first.readCompletedAt
+    assert.ok(observedDeliveryMS >= historicalDelayMS, 'The actual prepared data must spend the full configured interval behind the delivery gate.')
+    const initialFirst = fixture.end - (initialHistoryBars - 1) * fixture.intervalMS
+    assert.ok(first.first < initialFirst && first.end >= initialFirst && first.bars > 96,
+      'A real bulk response must extend continuously across the original delivered boundary.')
+    const crossingIndex = Math.ceil((initialHistoryBars - 95) / candlesPerFrame) - 1
+    assert.ok(responseTime < inputs[crossingIndex], 'Backend reserve data must reach the renderer before the first viewport crosses the original boundary.')
     const inputsAtRequest = inputs.filter(input => input <= requestTime).length
     const runwayAtRequest = initialHistoryBars - 96 - inputsAtRequest * candlesPerFrame
-    assert.ok(runwayAtRequest >= 192, `Only ${runwayAtRequest} resident candles remained when prefetch started.`)
-    assert.equal(requests.maxHistoricalActive, 1, 'Continuous wheel input may not start concurrent historical requests.')
-    assert.ok(historical.length <= 3, `A single cold-boundary traversal issued ${historical.length} historical requests.`)
+    assert.ok(runwayAtRequest >= 192, `Only ${runwayAtRequest} resident candles remained when backend history delivery started.`)
+    assert.ok(requests.maxHistoricalActive <= 2, 'Continuous input must keep durable reads within two independent lanes.')
+    assert.equal(requests.legacyWindowCalls, 0)
+    const delayedReads = requests.calls.filter(call => call.delayedExtension)
+    const readBudget = 2 * (Math.ceil((inputs.at(-1) - inputs[0]) / historicalDelayMS) + 1)
+    assert.ok(delayedReads.length <= readBudget, `A cold-boundary traversal admitted ${delayedReads.length} delayed disk reads (budget ${readBudget}).`)
     const sources = separateSourceMaintenance(requests.sourceRequests, fixture)
     assert.deepEqual(sources.historical, [], 'Prefetch must reuse persisted source candles and statistics within the latency test range.')
     return {
       foregroundWindow: foreground.native, environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence, initialHistoryBars, historicalDelayMS, continuousWheelFrames: frames,
       scrolledCandles: frames * candlesPerFrame, crossedInitialBoundary: true,
-      runwayAtRequest, prefetchHistoryBars: first.historyBars,
+      runwayAtRequest, deliveredHistoryBars: first.bars, observedHistoryDeliveryMS: observedDeliveryMS,
       prefetchStartedDuringGesture: true, prefetchCompletedDuringGesture: true,
-      historicalRequests: historical.length, maxConcurrentHistoricalRequests: requests.maxHistoricalActive,
+      historicalRequests: delayedReads.length, delayedBackendPushes: extensions.filter(record => record.kind === 'push').length,
+      maxConcurrentHistoricalRequests: requests.maxHistoricalActive,
       olderSourceExtensions: sources.historicalExtensions.length,
       repeatedSourceDownloads: sources.historical.length,
       ...latency, ...paint, commits: paint.commits.length,

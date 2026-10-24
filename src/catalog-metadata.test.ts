@@ -22,7 +22,6 @@ const fixture = async (fetcher: typeof fetch) => {
   await service.ready
   // These tests exercise qualification, without scheduling unrelated chart or history work.
   service.updateRanking = async () => undefined
-  service.readListBars = async () => ({ bars: [] })
   for (const lane of service.requestLanes.values()) lane.interval = 0
   const close = async () => { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
   return { service, store, preferences, close }

@@ -57,7 +57,7 @@ for (const source of ['book', 'openInterest'] as const) test(`an expired ${sourc
   const observations = { [source]: { value: source === 'book' ? book() : { oiUsd: '6000000' }, source: 'websocket', observedAt: now, expiresAt: now + 90000 } }
   service.observations.set(instId, observations)
   const record = service.observedCandidate(instrument(), service.prefs().liquidity, service.catalogCriteriaKey(), observations)
-  service.catalog.set(instId, record); service.catalogChecks.set(instId, record); service.ensureListRows('15m')
+  service.catalog.set(instId, record); service.catalogChecks.set(instId, record)
   assert.equal((await service.snapshot()).rows.length, 1)
   service.autoRefresh = true; service.scheduleMarketDeadline()
   now += 90001; service.processMarketDeadline()
@@ -102,19 +102,20 @@ test('current quote and forming candle publish while independent OI and Taker re
   seedInstrument(service)
   const frame = '15m', interval = 900000, formingAt = Math.floor(Date.now() / interval) * interval, end = formingAt - interval
   await store.appendCandles(Array.from({ length: 300 }, (_, index) => candle(end - (299 - index) * interval, frame)))
-  await service.setChartUniverse([instId], frame, instId)
+  // Preparing the selected viewport is explicit; raw collection already covers every period.
+  service.preparedCharts.setFocus({ instId, timeframe: frame })
   const initial = await service.localChartWindow(instId, frame)
   assert.ok(initial?.bars.length)
   const observations = { ticker: { value: ticker(), observedAt: Date.now(), expiresAt: Date.now() + 90000 } }
   service.observations.set(instId, observations)
   const record = service.observedCandidate(instrument(), service.prefs().liquidity, service.catalogCriteriaKey(), observations)
-  service.catalog.set(instId, record); service.catalogChecks.set(instId, record); service.ensureListRows(frame)
+  service.catalog.set(instId, record); service.catalogChecks.set(instId, record)
   const statistics = service.history.ensureStatistics(instId, frame, end, end, 'continuity')
   try {
     await waitFor(() => started.size === 2)
     service.receivePublicObservation(instId, 'ticker', ticker(220), { receivedAt: Date.now(), acknowledged: false })
     await service.setLive(instId, frame, { ...candle(formingAt, frame, 220), confirmed: false })
-    const snapshot = await service.snapshot(frame), chart = await service.localChartWindow(instId, frame)
+    const snapshot = await service.snapshot(), chart = await service.localChartWindow(instId, frame)
     assert.equal(snapshot.rows[0].lastPrice, 220)
     assert.equal(chart?.liveBar?.close, 220)
     assert.equal(chart?.priceState, 'ready')

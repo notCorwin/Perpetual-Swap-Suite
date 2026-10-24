@@ -76,7 +76,7 @@ async function request(value) {
     }
     return preferences
   }
-  if (value.snapshot) return service.snapshot(value.snapshot.timeframe, value.snapshot)
+  if (value.snapshot) return service.snapshot(value.snapshot)
   if (value.dataAudit) return service.dataAuditRequest(value.dataAudit)
   if (value.historyDownload) return service.historyDownloadRequest(value.historyDownload)
   if (value.chartFocus || value.chartWindow || value.chartLocal || value.chartHistory) {
@@ -85,13 +85,13 @@ async function request(value) {
       if (value.chartFocus) { service.preparedCharts.setFocus(value.chartFocus.target, value.chartFocus.id); return { ok: true } }
       const { instId, timeframe, endHour, historyBars, focusId } = value.chartWindow ?? value.chartLocal ?? value.chartHistory
       if (value.chartWindow) return service.preparedCharts.prepare(instId, timeframe, endHour, historyBars, { focusId })
-      if (value.chartLocal) return service.preparedCharts.local(instId, timeframe, { focusId })
-      return service.preparedCharts.localHistory(instId, timeframe, endHour, { focusId })
+      if (value.chartLocal) return service.preparedCharts.local(instId, timeframe)
+      return service.preparedCharts.localHistory(instId, timeframe, endHour)
     })
     service.barTasks.add(task)
     return task.finally(() => service.barTasks.delete(task))
   }
-  if (value.chartUniverse) return service.setChartUniverse(value.chartUniverse.instIds, value.chartUniverse.timeframe, value.chartUniverse.focusInstId)
+  if (value.chartUniverse) return service.preparedCharts.residentFrames()
   if (value.analysisSettings) {
     const input = value.analysisSettings
     if (input.action === 'save') metadata.updateAnalysisSettings({ model: input.model, apiKey: input.apiKey })

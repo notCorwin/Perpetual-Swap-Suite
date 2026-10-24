@@ -45,9 +45,8 @@ const fixture = async (automatic = false, sources: { book?: () => Response | Pro
     if (path.endsWith('/public/open-interest')) return sources.openInterest ? sources.openInterest() : response([{ instId, oiUsd: '6000000', ts: String(Date.now()) }])
     throw new Error(`Unexpected source request: ${path}`)
   }, automatic, { webSocketFactory: () => { const socket = new Socket(); sockets.push(socket); return socket } })
-  service.projectListEntry = async () => null
+  service.preparedCharts.setUniverse = () => ({ frames: [] })
   service.updateRanking = async () => undefined
-  service.scheduleListProjection = () => undefined
   await service.ready
   for (const lane of service.requestLanes.values()) lane.interval = 0
   return { service, preferences, requests, sockets, async close() { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) } }
@@ -162,7 +161,7 @@ for (const malformedEnvelope of [false, true]) test(`book channel recovery immed
     held.resolve(evaluateLiquidity(held.input))
     await Promise.all([...f.service.streamEvaluations.values()])
     assert.equal(f.service.observations.get(instId).book, undefined)
-    assert.deepEqual(f.service.listRowsFor('15m'), [])
+    assert.deepEqual(f.service.listRowsFor(), [])
     assert.equal(socket.readyState, 1)
     assert.equal(f.service.catalogChecks.get(instId).status, 'unknown')
   } finally { await f.close() }

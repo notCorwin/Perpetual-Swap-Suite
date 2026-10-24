@@ -35,9 +35,8 @@ const fixture = async (config: ReturnType<typeof preferences>, fetcher: typeof f
   const store = await MarketStore.open(root)
   const service = new MarketService(store, () => config, fetcher, false)
   await service.ready
-  service.projectListEntry = async () => null
+  service.preparedCharts.setUniverse = () => ({ frames: [] })
   service.updateRanking = async () => undefined
-  service.scheduleListProjection = () => undefined
   for (const lane of service.requestLanes.values()) lane.interval = 0
   const close = async () => { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
   return { service, store, close }
@@ -62,7 +61,7 @@ test('150 contract checks share bulk sources and reuse valid OI across price ref
     assert.deepEqual([...calls.values()], [1, 1, 1])
     price = 200
     await f.service.refresh()
-    const rows = f.service.listRowsFor('15m')
+    const rows = f.service.listRowsFor()
     assert.equal(rows.length, 150)
     assert.ok(rows.every(row => row.lastPrice === 200))
     assert.deepEqual([...calls.values()], [2, 2, 1])
@@ -160,7 +159,7 @@ test('a shared bulk OI rejection skips history and books for the entire excluded
     context.diagnostic(`289 contracts: ${histories.length} historical acquisitions, ${paths.filter(path => path.endsWith('/public/open-interest')).length} bulk OI request, ${(performance.now() - started).toFixed(1)} ms.`)
     assert.deepEqual(new Set(histories), eligibleIDs)
     assert.equal(paths.filter(path => path.endsWith('/public/open-interest')).length, 1)
-    assert.deepEqual(new Set(f.service.listRowsFor('15m').map(row => row.instId)), eligibleIDs)
+    assert.deepEqual(new Set(f.service.listRowsFor().map(row => row.instId)), eligibleIDs)
     assert.equal((await f.service.snapshot()).catalogProgress.failed, 275)
   } finally { await f.close() }
 })
@@ -362,7 +361,7 @@ test('market subscribers receive the final bulk change together and stop receivi
     let reading: ReturnType<typeof f.service.snapshot> | undefined
     const unsubscribe = f.service.subscribeMarket(() => {
       notifications += 1
-      reading = f.service.snapshot('15m', { sinceRevision: before.revision, serviceSession: before.serviceSession })
+      reading = f.service.snapshot({ sinceRevision: before.revision, serviceSession: before.serviceSession })
     })
     price = 200
     await f.service.refresh()

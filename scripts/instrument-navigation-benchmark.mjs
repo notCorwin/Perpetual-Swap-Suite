@@ -13,7 +13,7 @@ try {
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData } })
   let page = await electron.firstWindow()
   await page.waitForLoadState('domcontentloaded')
-  await installNavigationProbe(electron, page)
+  await installNavigationProbe(electron)
   const fixture = await page.evaluate(() => window.radarDesktop.request({ e2e: { action: 'seedInstrumentNavigationBenchmark' } }))
   const backgroundLoad = process.env.PERPETUAL_SWAP_BENCHMARK_BACKGROUND === '1'
   if (backgroundLoad) await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'backgroundStart' }))
@@ -32,9 +32,10 @@ try {
     const requests = await electron.evaluate(() => globalThis.__navigationStartupRequests.requests)
     startup.selectionIPC = selectionRequests({ requests }).filter(request => request.instId === startup.instId
       && request.at >= startup.inputEpoch - 1 && request.at <= startup.commitEpoch + 1).length
-    if (startup.framesToCommit > 10 || startup.inputToSVGCommitMS > 150 || startup.selectionIPC > 2 || startup.violations.length) throw new Error(`Cold-start selection exceeded the local-read budget: ${JSON.stringify(startup)}`)
-    await installNavigationProbe(electron, page)
-    report.restart = { startup, ...await exerciseInstrumentNavigation(electron, page, fixture, { awaitInitialPreparation: false, holdHistory: false }) }
+    if (startup.framesToCommit > 1 || startup.inputToSVGCommitMS > 50 || startup.selectionIPC > 2 || startup.violations.length
+      || !startup.preparedBeforeInput.includes(`${startup.timeframe}:${startup.instId}`)) throw new Error(`Warm startup selection exceeded the local-read budget: ${JSON.stringify(startup)}`)
+    await installNavigationProbe(electron)
+    report.restart = { startup, ...await exerciseInstrumentNavigation(electron, page, fixture, { holdHistory: false }) }
   }
   const percentile = (values, ratio) => {
     const sorted = [...values].sort((left, right) => left - right)

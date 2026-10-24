@@ -6,9 +6,9 @@ import { PreparedChartStore } from './chart-series-store.ts'
 import type { PreparedChartNotification, PreparedChartResponse } from './chart-data.ts'
 
 const instId = 'BTC-USDT-SWAP', timeframe = '15m', intervalMS = 900000
-const fixture = (t: TestContext) => {
-  const pipeline = new PreparedChartPipeline({ store: {} as never, history: {} as never, normalize: value => value, revision: () => 0, instrument: () => undefined, streaming: () => true })
-  pipeline.setUniverse([instId], timeframe, instId)
+const fixture = async (t: TestContext) => {
+  const pipeline = new PreparedChartPipeline({ store: { candles: async () => [], coverage: async () => ({ first: null, last: null, count: 0 }) } as never, history: {} as never, normalize: value => value, revision: () => 0, instrument: () => undefined, streaming: () => true })
+  await pipeline.local(instId, timeframe)
   t.after(() => pipeline.dispose())
   return pipeline
 }
@@ -17,7 +17,7 @@ const source = (close = 100) => ({ instrument: instId, timeframe, timestamp: Mat
 const isLive = (notification: PreparedChartNotification) => 'type' in notification && notification.type === 'live'
 
 test('a forming-only cold chart keeps advancing through the actual pipeline, encoder and renderer store', async t => {
-  const pipeline = fixture(t), encoder = new ChartNotificationEncoder(), store = new PreparedChartStore(), messages: PreparedChartNotification[] = []
+  const pipeline = await fixture(t), encoder = new ChartNotificationEncoder(), store = new PreparedChartStore(), messages: PreparedChartNotification[] = []
   store.setUniverse([instId], timeframe, instId)
   pipeline.subscribe(frame => {
     const message = encoder.encode(frame)
@@ -36,7 +36,7 @@ test('a forming-only cold chart keeps advancing through the actual pipeline, enc
 })
 
 test('known latest and historical boundaries retain separate compression state and preserve source metadata', async t => {
-  const pipeline = fixture(t), encoder = new ChartNotificationEncoder(), frames: PreparedChartResponse[] = []
+  const pipeline = await fixture(t), encoder = new ChartNotificationEncoder(), frames: PreparedChartResponse[] = []
   pipeline.subscribe(frame => frames.push(frame))
   await pipeline.setLive(instId, timeframe, source())
   const end = source().timestamp - intervalMS
@@ -54,7 +54,7 @@ test('known latest and historical boundaries retain separate compression state a
 })
 
 test('compression retains a bounded LRU and an evicted frame starts with a complete notification', async t => {
-  const pipeline = fixture(t), encoder = new ChartNotificationEncoder(2), frames: PreparedChartResponse[] = []
+  const pipeline = await fixture(t), encoder = new ChartNotificationEncoder(2), frames: PreparedChartResponse[] = []
   pipeline.subscribe(frame => frames.push(frame))
   await pipeline.setLive(instId, timeframe, source())
   const end = source().timestamp - intervalMS
@@ -70,7 +70,7 @@ test('compression retains a bounded LRU and an evicted frame starts with a compl
 
 
 test('source error and retry metadata changes require full frames even when bars and state are unchanged', async t => {
-  const pipeline = fixture(t), encoder = new ChartNotificationEncoder(), frames: PreparedChartResponse[] = []
+  const pipeline = await fixture(t), encoder = new ChartNotificationEncoder(), frames: PreparedChartResponse[] = []
   pipeline.subscribe(frame => frames.push(frame))
   await pipeline.setLive(instId, timeframe, source())
   const end = source().timestamp - intervalMS
@@ -88,7 +88,7 @@ test('source error and retry metadata changes require full frames even when bars
 
 
 test('indicator error details and recovery input versions cross the notification boundary', async t => {
-  const pipeline = fixture(t), encoder = new ChartNotificationEncoder(), frames: PreparedChartResponse[] = []
+  const pipeline = await fixture(t), encoder = new ChartNotificationEncoder(), frames: PreparedChartResponse[] = []
   pipeline.subscribe(frame => frames.push(frame))
   await pipeline.setLive(instId, timeframe, source())
   const end = source().timestamp - intervalMS
@@ -104,7 +104,7 @@ test('indicator error details and recovery input versions cross the notification
 })
 
 test('price repair retry changes remain full notifications and cannot be compressed away with unchanged cached bars', async t => {
-  const pipeline = fixture(t), encoder = new ChartNotificationEncoder(), frames: PreparedChartResponse[] = []
+  const pipeline = await fixture(t), encoder = new ChartNotificationEncoder(), frames: PreparedChartResponse[] = []
   pipeline.subscribe(frame => frames.push(frame))
   await pipeline.setLive(instId, timeframe, source())
   const end = source().timestamp - intervalMS

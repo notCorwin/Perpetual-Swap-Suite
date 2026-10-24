@@ -41,7 +41,8 @@ for (const volume of [5, 8]) test(`late forming REST cannot replace a newer nati
   let pending: Promise<unknown> | undefined
   try {
     await service.ready
-    await service.setChartUniverse([instId], timeframe, instId)
+    service.installInstruments(new Map([[instId, { instId, instType: 'SWAP', instCategory: '1', settleCcy: 'USDT', ctType: 'linear', state: 'live', ctVal: '0.01', ctMult: '1', ctValCcy: 'BTC', ruleType: 'normal' }]]))
+    await service.localChartWindow(instId, timeframe)
     service.subscribePreparedCharts(frame => published.push(frame))
     // Quote acquisition has its own lifetime; chart history demand now owns
     // completed-window coverage instead of substituting a latest-only read.
@@ -84,7 +85,7 @@ test('a latest read admitted before the first native tick cannot revive its sour
   try {
     await service.ready
     service.installInstruments(new Map([[instId, instrument]]))
-    await service.setChartUniverse([instId], timeframe, instId)
+    await service.localChartWindow(instId, timeframe)
     pending = service.history.latest(instId, timeframe)
     await requested.promise
     assert.equal(service.liveCandles.size, 0, 'No native price has established this source yet.')

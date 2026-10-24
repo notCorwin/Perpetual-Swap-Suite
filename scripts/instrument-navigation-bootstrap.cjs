@@ -16,8 +16,8 @@ writeFileSync(preload, `require('electron').contextBridge.executeInMainWorld({ f
 const handle = ipcMain.handle.bind(ipcMain)
 const probe = globalThis.__navigationStartupRequests = { requests: [], ready: new Set() }
 ipcMain.handle = (channel, handler) => handle(channel, channel !== 'radar:request' ? handler : async (event, value) => {
-  const kind = ['chartUniverse', 'chartLocal', 'chartWindow', 'chartHistory'].find(kind => value[kind])
-  if (kind) probe.requests.push({ kind, ...value[kind], at: Date.now() })
+  const kind = ['chartUniverse', 'chartFocus', 'chartLocal', 'chartWindow', 'chartHistory'].find(kind => value[kind])
+  if (kind) probe.requests.push({ kind, ...(kind === 'chartFocus' ? value[kind].target : value[kind]), at: Date.now() })
   const result = await handler(event, value)
   if (kind === 'chartUniverse') for (const frame of result.frames ?? []) if (frame.bars?.length >= 96) probe.ready.add(`${frame.timeframe}:${frame.instId}`)
   return result

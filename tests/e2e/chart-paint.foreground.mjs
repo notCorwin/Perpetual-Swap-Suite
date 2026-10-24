@@ -32,7 +32,7 @@ after(async () => {
   finally { await rm(userData, { recursive: true, force: true }) }
 })
 
-test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while speculative preparation is stalled in every native timeframe', { timeout: 90_000 }, async context => {
+test('bulk-warmed history scrolls, reverses, and jumps within 100 ms with bounded disk reads in every native timeframe', { timeout: 90_000 }, async context => {
   const foreground = await foregroundPaintWindow(electron, page)
   context.after(async () => {
     await foreground.restore()
@@ -41,10 +41,10 @@ test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while specu
   })
   context.diagnostic(`Native paint window: ${JSON.stringify({ before: foreground.previous, during: foreground.native, environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence })}`)
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  // Adaptive speculative preparation is held indefinitely. Source reads are
-  // also stalled after warming, so navigation must stay independent of both
-  // lanes and use the already transferred durable series.
-  await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
+  // Complete the initial durable hydration before holding subsequent disk
+  // deliveries and source maintenance. Resident navigation uses transferred
+  // data independently of either backend preparation or the two read lanes.
+  await installRequestProbe(electron, fixture.instId)
   try {
     await openChart(page, fixture)
     const warmedHistory = new Map()
@@ -55,7 +55,8 @@ test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while specu
     }
     context.diagnostic(`Resident history before stalls: ${JSON.stringify(Object.fromEntries(warmedHistory))}`)
     await electron.evaluate(async () => {
-      globalThis.__chartRequestProbe.holdLatest = true
+      globalThis.__chartRequestProbe.holdHistorical = true
+      globalThis.__chartRequestProbe.holdLocal = true
       await globalThis.__marketBackend.probe({ action: 'sourceHold', hold: true })
     })
     for (const timeframe of fixture.timeframes) {
@@ -82,19 +83,20 @@ test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while specu
       }
       const paint = await finishPaintProbe(page)
       assertCompletePaints(paint)
-      assert.equal(paint.pendingFrames, 0, 'Resident navigation must never wait for the stalled speculative preparation.')
+      assert.equal(paint.pendingFrames, 0, 'Resident navigation must never wait for the held disk deliveries.')
       const after = await readRequestProbe(electron)
       const historicalRequests = after.calls.slice(before.calls.length).filter(call => Number.isFinite(call.endHour))
-      assert.ok(historicalRequests.every(call => call.historyBars > 96), `Resident ${timeframe} targets must only issue bulk speculative preparation: ${JSON.stringify(historicalRequests)}`)
+      assert.ok(historicalRequests.every(call => call.kind === 'history'), 'Resident navigation may issue only observational history reads.')
+      assert.equal(after.legacyWindowCalls, 0)
       const sources = separateSourceMaintenance(after.sourceRequests.slice(before.sourceCalls), fixture)
       assert.deepEqual(sources.historical, [], `A warmed ${timeframe} scroll attempted a historical download: ${JSON.stringify(sources.historical)}`)
-      assert.ok(after.maxHistoricalActive <= 1, 'Resident targets must never queue foreground work behind the stalled speculative preparation.')
+      assert.ok(after.maxHistoricalActive <= 2, 'Resident targets must never queue foreground work behind the held disk deliveries.')
       assert.ok(after.transferredHistoryBars >= residentHistoryBars, 'The fixture must exercise a bulk durable-history transfer.')
     }
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
 
-test('historical prefetch covers 1500 ms of network latency before the cold boundary during continuous wheel input', { timeout: 90_000 }, async () => {
+test('backend history reserve covers 1500 ms of delivery latency before the cold boundary during continuous wheel input', { timeout: 90_000 }, async () => {
   const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark', instId: 'PREFETCH-USDT-SWAP' }))
   await measureLatencyCoveredPrefetch(electron, page, fixture)
 })

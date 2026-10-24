@@ -7,7 +7,7 @@ const HOUR = 3_600_000
 // Fixtures use the same independent price/statistic ledgers as production.
 async function persistNativeFixture(store, marketService, rows) {
   const { instrument, timeframe } = rows[0]
-  await marketService.persistCandles(instrument, rows, { projectList: false })
+  await marketService.persistCandles(instrument, rows)
   const range = { instrument, timeframe, from: rows[0].timestamp, through: rows.at(-1).timestamp, expiresAt: Date.now() + 60_000 }
   await store.appendStatistics({ ...range, source: 'oi', values: rows.filter(row => row.oi != null).map(row => [row.timestamp, row.oi]) })
   await store.appendStatistics({ ...range, source: 'taker', values: rows.filter(row => row.buy != null && row.sell != null).map(row => [row.timestamp, row.sell, row.buy]) })
@@ -16,7 +16,7 @@ async function persistNativeFixture(store, marketService, rows) {
 
 // Keep this fixture at the data boundary.  It intentionally registers only a
 // market catalog entry plus durable source/statistics observations: the
-// production list projection is responsible for building the visible row.
+// backend publishes its canonical row and owns preparation of all native periods.
 export async function seedCachedListProjection(store, marketService) {
   const instId = 'ETH-USDT-SWAP'
   const timeframe = '1H'
@@ -86,8 +86,6 @@ export async function seedCachedListProjection(store, marketService) {
   marketService.renewalTargets.set(instId, instrument)
   marketService.replaceCatalog([entry])
   await marketService.persistCatalog([entry], savedAt)
-  await marketService.ensureListTimeframe(timeframe)
-  await marketService.projectListEntry(instId, timeframe)
 
   return { instId, timeframe, end, periods, savedAt }
 }
@@ -144,8 +142,6 @@ export async function seedChartScrollBenchmark(store, marketService, { instId = 
   marketService.catalogSource = 'live'
   marketService.instruments.set(instId, instrument)
   marketService.replaceCatalog([entry])
-  await marketService.ensureListTimeframe(timeframe)
-  await marketService.projectListEntry(instId, timeframe)
   marketService.error = ''
   marketService.lastRefreshAt = savedAt
   marketService.markChartDataChanged(instId)
@@ -219,8 +215,6 @@ export async function seedInstrumentNavigationBenchmark(store, marketService) {
   marketService.catalogUpdatedAt = savedAt
   marketService.catalogSource = 'live'
   marketService.replaceCatalog(catalog)
-  await marketService.ensureListTimeframe('1H')
-  for (const instId of instIds) await marketService.projectListEntry(instId, '1H')
   marketService.error = ''
   marketService.lastRefreshAt = savedAt
   return { instIds, timeframes, timeframe: '1H', intervalMS: HOUR, end, periods, instruments,
@@ -266,8 +260,6 @@ export async function createChartAcquisitionFixture(store, marketService, { time
   marketService.instruments.set(instId, instrument)
   marketService.catalogUpdatedAt = Date.now(); marketService.catalogSource = 'live'
   marketService.replaceCatalog([{ instrument, ticker, result: { eligible: true, turnover: 90_000_000, oiUSD: 8_000_000, spread: .01, depth: 300_000, slippage: .02 }, change24h: 5.2 }])
-  await marketService.ensureListTimeframe(timeframe)
-  await marketService.projectListEntry(instId, timeframe)
   marketService.error = ''; marketService.lastRefreshAt = Date.now()
   const targetEnd = rows[mode === 'gap' ? 600 : 1100].timestamp
   const fixture = { instId, timeframe, timeframes: [timeframe], intervalMS, end, start, periods, targetEnd, mode,
@@ -349,8 +341,6 @@ export async function createChartColdBoundaryFixture(store, marketService, { tim
   marketService.catalogUpdatedAt = Date.now(); marketService.catalogSource = 'live'
   marketService.replaceCatalog([{ instrument, ticker, result: { eligible: true, turnover: 90_000_000, oiUSD: 8_000_000,
     spread: .01, depth: 300_000, slippage: .02 }, change24h: 5.2 }])
-  await marketService.ensureListTimeframe(timeframe)
-  await marketService.projectListEntry(instId, timeframe)
   marketService.error = ''; marketService.lastRefreshAt = Date.now()
   const fixture = { instId, timeframe, timeframes: [timeframe], intervalMS, end, start, periods,
     initialHistoryBars, targetDistance, targetEnd, firstMissingEnd, sourceDelayMS,

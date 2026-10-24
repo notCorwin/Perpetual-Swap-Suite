@@ -32,7 +32,6 @@ export const completeChartPriceRange = (bars: readonly Pick<Bar, 'hour' | 'price
   && bars.every((bar, index) => bar.hour === from + index * intervalMS && bar.priceComplete !== false)
 export type PreparedChartBar = Bar & { confirmed: true }
 export type PreparedChartGeneration = number
-export type ChartUnavailable = Readonly<{ reason: 'insufficient-history'; availableCandles: number; requiredCandles: 96; retryAt: number }>
 export type PreparedChartResponse = {
   instId: string
   timeframe: RadarTimeframe
@@ -57,7 +56,6 @@ export type PreparedChartResponse = {
   priceObservedAt?: number | null
   realtimeState?: 'live' | 'stale'
   sourceVersions?: { price: number; oi: number; taker: number }
-  unavailable?: ChartUnavailable
   error: string
 }
 

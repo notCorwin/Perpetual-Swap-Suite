@@ -79,9 +79,8 @@ const fixture = async (context: TestContext, { hourly = false, connected = true,
   const service = new MarketService(store, () => preferences, fetcher, false, { webSocketFactory: () => socket })
   const isolateQualification = (value: MarketService) => {
     value.preparedCharts.setRealtimeSubscriptions = () => undefined
-    value.projectListEntry = async () => null
+    value.preparedCharts.setUniverse = () => ({ frames: [] })
     value.updateRanking = async () => undefined
-    value.scheduleListProjection = () => undefined
     value.scheduleRefresh = () => undefined
     value.scheduleRenewal = () => undefined
   }

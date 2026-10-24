@@ -173,12 +173,12 @@ test('preferences persist through the single desktop entry point and survive a p
 })
 
 test('snapshot IPC returns compact unchanged responses and refreshes rows for another collector session', async () => {
-  const first = await request({ snapshot: { timeframe: '5m', sinceRevision: -1 } })
+  const first = await request({ snapshot: { sinceRevision: -1 } })
   assert.ok(first.serviceSession)
-  const same = await request({ snapshot: { timeframe: '5m', sinceRevision: first.revision, serviceSession: first.serviceSession } })
+  const same = await request({ snapshot: { sinceRevision: first.revision, serviceSession: first.serviceSession } })
   assert.equal(same.unchanged, true)
   assert.equal('rows' in same, false)
-  const fresh = await request({ snapshot: { timeframe: '5m', sinceRevision: same.revision, serviceSession: 'previous-collector' } })
+  const fresh = await request({ snapshot: { sinceRevision: same.revision, serviceSession: 'previous-collector' } })
   assert.ok(Array.isArray(fresh.rows))
 })
 
@@ -186,7 +186,7 @@ test('Radar has no Research or Strategy workspace or desktop operations', async 
   await page.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).waitFor()
   assert.equal(await page.getByRole('button', { name: /Research|Strategy|Signals|Rules|Universe/ }).count(), 0)
   assert.equal(await page.locator('[data-mode-switch]').count(), 0)
-  const previous = await request({ snapshot: { timeframe: '5m', sinceRevision: -1 } })
+  const previous = await request({ snapshot: { sinceRevision: -1 } })
   for (const value of [
     { suite: { mode: 'radar', action: 'evaluate', timeframe: '5m' } },
     { research: { action: 'list' } },
@@ -203,8 +203,9 @@ test('Radar has no Research or Strategy workspace or desktop operations', async 
     { windowTint: '#ffffff' },
     { rocPeriod: 9, marocPeriod: 9, timeframe: '5m', sinceRevision: -1 },
   ]) await assert.rejects(() => request(value), /Invalid desktop bridge request/)
-  const current = await request({ snapshot: { timeframe: '5m', sinceRevision: -1 } })
-  assert.equal(current.timeframe, previous.timeframe)
+  const current = await request({ snapshot: { sinceRevision: -1 } })
+  assert.deepEqual(current.rows, previous.rows)
+  assert.equal('timeframe' in current, false)
   for (const key of ['filterMetricsCatalog', 'filterFunctions', 'filterFunctionCatalog', 'filterLibraryPreferences',
     'notificationsEnabled', 'notificationAuthorization', 'notificationError', 'backgroundMonitoringEnabled',
     'backgroundMonitoringError', 'monitoringPaused', 'launchAtLogin', 'launchAtLoginError']) {
@@ -227,31 +228,28 @@ test('clipboard, screenshot capture, analysis settings, and safe gateway cancell
   assert.ok(image.width > 0 && image.height > 0)
   assert.deepEqual(await request({ analysisSettings: { action: 'save', model: 'test-model', apiKey: 'test-key' } }), { model: 'test-model', hasAPIKey: true })
   assert.deepEqual(await request({ analysisSettings: { action: 'read' } }), { model: 'test-model', hasAPIKey: true })
-  assert.equal('analysis' in await request({ snapshot: { timeframe: '5m', sinceRevision: -1 } }), false)
+  assert.equal('analysis' in await request({ snapshot: { sinceRevision: -1 } }), false)
   assert.deepEqual(await request({ analysisSettings: { action: 'removeKey' } }), { model: 'test-model', hasAPIKey: false })
   await assert.rejects(() => request({ gatewayFetch: { id: 'missing-key', body: '{}' } }), /Save an AI Gateway API key/)
   assert.deepEqual(await request({ cancelGatewayFetch: 'no-such-request' }), { ok: true })
-  const initial = await request({ snapshot: { timeframe: '5m', sinceRevision: -1 } })
+  const initial = await request({ snapshot: { sinceRevision: -1 } })
   assert.equal(initial.error, '')
   assert.deepEqual(initial.rows, [])
 })
 
-test('cached catalog projection retains statistics while the list shows contract, price, and independent ranking change', async () => {
+test('canonical catalog rows show contract, live price, and ranking independently of chart preparation', async () => {
   const fixture = await request({ e2e: { action: 'seedCachedListProjection' } })
   assert.equal(fixture.timeframe, '1H')
 
   // This is the renderer's ordinary radar request.  The fixture only writes
   // source/statistics cache rows and catalog context; it never injects a
   // ready-made market row.
-  const projected = await waitFor(async () => {
-    const snapshot = await request({ snapshot: { timeframe: fixture.timeframe, sinceRevision: -1 } })
-    const row = snapshot.rows?.find(value => value.instId === fixture.instId)
-    return row && row.oiChange !== null && row.takerRatio !== null && row.rsi6 !== null && row.ema200Signal !== null ? row : null
-  })
-  assert.notEqual(projected.oiChange, null)
-  assert.notEqual(projected.takerRatio, null)
-  assert.notEqual(projected.rsi6, null)
-  assert.notEqual(projected.ema200Signal, null)
+  const snapshot = await request({ snapshot: { sinceRevision: -1 } })
+  const row = snapshot.rows.find(value => value.instId === fixture.instId)
+  assert.ok(row)
+  assert.ok(Number.isFinite(row.lastPrice))
+  assert.equal('timeframe' in snapshot, false)
+  assert.equal('listProgress' in snapshot, false)
 
   // Reload so React obtains the row through the same initial snapshot read as
   // an app user, then inspect the rendered table instead of the IPC object.
@@ -285,7 +283,7 @@ test('a restarted desktop restores cached catalog readings before a live scan co
   const cells = market.locator('td')
   assert.equal(await cells.count(), 3)
   assert.doesNotMatch((await cells.nth(1).textContent()) ?? '', /—/)
-  const snapshot = await request({ snapshot: { timeframe: '1H', sinceRevision: -1 } })
+  const snapshot = await request({ snapshot: { sinceRevision: -1 } })
   assert.equal(snapshot.catalogSource, 'cache')
   assert.equal(snapshot.loading, true, 'The delayed production-style discovery must still be running.')
   await page.locator('[data-market-list]').getByText('Refreshing', { exact: true }).waitFor()
@@ -558,72 +556,77 @@ for (const mode of ['gap', 'prepend']) test(`first historical acquisition keeps 
   }
 })
 
-test('a held history read keeps the last complete paint and coalesces every later wheel event into the latest target', async () => {
+test('a held old history read leaves backend demand and the latest wheel target independent with two bounded read lanes', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  await installRequestProbe(electron, fixture.instId, { disableLocalHistory: true, initialHistoryBars: 1_000, capHistoricalWindows: true })
+  await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
   try {
     await openChart(page, fixture)
-    await removeRequestProbe(electron)
-    await installRequestProbe(electron, fixture.instId, { holdHistorical: true, disableLocalHistory: true })
     await startPaintProbe(page, fixture)
     await wheelBurst(page, { deltaY: 14_400 })
     await waitFor(async () => (await readRequestProbe(electron)).held)
-    await wheelBurst(page, { frames: 4, eventsPerFrame: 32, deltaY: 12 })
+    const initial = await readRequestProbe(electron)
+    assert.equal(initial.heldCall.kind, 'history')
+    assert.equal(initial.heldCall.endHour, fixture.end - 1_200 * fixture.intervalMS)
+    assert.ok(initial.heldCall.readCompletedAt !== null, 'A real detached durable reply must exist before delivery is held.')
+    const forward = await wheelBurst(page, { frames: 4, eventsPerFrame: 32, deltaY: 12 })
     await wheelBurst(page, { frames: 2, eventsPerFrame: 32, deltaY: -12 })
     const expectedEnd = fixture.end - 1_264 * fixture.intervalMS
-    await page.waitForFunction(({ instId, expectedEnd }) => {
-      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
-      return Number(chart?.getAttribute('data-chart-requested-end')) === expectedEnd
-        && chart.getAttribute('data-chart-loading') === 'true'
-    }, { instId: fixture.instId, expectedEnd })
-    const held = await readRequestProbe(electron)
-    assert.equal(held.active, 1)
-    assert.equal(held.maxActive, 1, 'Wheel events may not create a parallel request storm.')
-    assert.equal(held.calls.length, held.callsAtHold, `No additional read may cross IPC while history is held: ${JSON.stringify(held.calls)}`)
-    const svg = page.locator(`svg[data-rendered-inst="${fixture.instId}"]`)
-    assert.equal(Number(await svg.getAttribute('data-rendered-end')), fixture.end)
-    assert.match(await page.locator(`[data-chart-inst="${fixture.instId}"]`).textContent(), /Preparing/)
-    await releaseRequestProbe(electron)
     await waitForRendered(page, fixture, fixture.timeframe, expectedEnd)
+    const held = await readRequestProbe(electron)
+    assert.equal(held.heldSettled, false, 'The new target must finish while the old disk response remains held.')
+    assert.ok(held.maxHistoricalActive <= 2, 'Wheel input must keep history reads inside the two available lanes.')
+    assert.ok(held.maxLocalActive <= 2)
+    assert.equal(held.legacyWindowCalls, 0, 'The renderer must express demand separately from pure chart reads.')
+    assert.equal(held.focusCalls.findLast(call => call.target)?.target.endHour, expectedEnd, 'Held disk delivery cannot block or replace backend viewport demand.')
+    assert.ok(held.calls.filter(call => call.kind === 'history').length <= 2 * (forward.length + 3), 'Wheel bursts must coalesce rather than create one read per raw event.')
+    const beforeRelease = await page.evaluate(() => window.__chartPaintProbe.commits.length)
+    await releaseRequestProbe(electron)
+    await waitFor(async () => (await readRequestProbe(electron)).heldSettled)
     await page.evaluate(async () => { for (let index = 0; index < 8; index += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
     const report = await finishPaintProbe(page)
     assertCompletePaints(report)
     assert.equal(report.commits.at(-1).end, expectedEnd)
+    assert.ok(report.commits.slice(beforeRelease).every(commit => commit.end === expectedEnd && commit.timeframe === fixture.timeframe), 'Late disk data must not repaint an obsolete cursor.')
     const requests = await readRequestProbe(electron)
-    assert.equal(requests.maxActive, 1)
-    assert.deepEqual(separateSourceMaintenance(requests.sourceRequests, fixture).historical, [], 'Scrolling must reuse durable history, independently of bounded current-window repairs beyond the fixture.')
-    assert.ok(requests.calls.length <= 12, `Coalesced history work unexpectedly issued ${requests.calls.length} requests.`)
-    assert.ok(!report.commits.some(commit => commit.end === fixture.end - 1_200 * fixture.intervalMS), 'The obsolete held target was presented after a newer input.')
+    assert.ok(requests.maxHistoricalActive <= 2)
+    assert.deepEqual(separateSourceMaintenance(requests.sourceRequests, fixture).historical, [], 'Scrolling must reuse durable history independently of bounded current-window maintenance.')
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
 
-test('a late history response cannot overwrite a more recently selected timeframe', async () => {
+test('a late durable history response cannot overwrite a more recently selected timeframe', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  await installRequestProbe(electron, fixture.instId, { disableLocalHistory: true, initialHistoryBars: 1_000, capHistoricalWindows: true })
+  await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
   try {
     await openChart(page, fixture)
     for (const timeframe of fixture.timeframes) {
       await selectTimeframe(page, timeframe)
       await waitForRendered(page, fixture, timeframe)
     }
-    await removeRequestProbe(electron)
-    await installRequestProbe(electron, fixture.instId, { holdHistorical: true, disableLocalHistory: true })
     await startPaintProbe(page, fixture)
     await wheelBurst(page, { deltaY: 14_400 })
     await waitFor(async () => (await readRequestProbe(electron)).held)
+    const original = await readRequestProbe(electron)
+    assert.equal(original.heldCall.timeframe, fixture.timeframe)
+    assert.ok(original.heldCall.readCompletedAt !== null)
     await selectTimeframe(page, '5m')
+    await waitForRendered(page, fixture, '5m')
     await selectTimeframe(page, '15m')
-    await releaseRequestProbe(electron)
     await waitForRendered(page, fixture, '15m')
+    const current = await readRequestProbe(electron)
+    assert.equal(current.heldSettled, false, 'Both period selections must finish independently of the held old read.')
+    assert.equal(current.focusCalls.findLast(call => call.target)?.target.timeframe, '15m')
+    const beforeRelease = await page.evaluate(() => window.__chartPaintProbe.commits.length)
+    await releaseRequestProbe(electron)
+    await waitFor(async () => (await readRequestProbe(electron)).heldSettled)
     await page.evaluate(async () => { for (let index = 0; index < 8; index += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
     const report = await finishPaintProbe(page)
     assertCompletePaints(report)
     assert.equal(report.commits.at(-1).timeframe, '15m')
-    const final15m = report.commits.findIndex(commit => commit.timeframe === '15m')
-    assert.ok(final15m >= 0)
-    assert.ok(report.commits.slice(final15m).every(commit => commit.timeframe === '15m'), 'An older timeframe repainted after the selected chart was ready.')
+    assert.ok(report.commits.slice(beforeRelease).every(commit => commit.timeframe === '15m' && commit.end === fixture.end), 'An older period must not repaint after the selected chart is ready.')
     const requests = await readRequestProbe(electron)
-    assert.deepEqual(separateSourceMaintenance(requests.sourceRequests, fixture).historical, [], 'A fully local timeframe switch must reuse historical candles and statistics. Bounded current-window repairs beyond the fixture are independent.')
+    assert.ok(requests.maxHistoricalActive <= 2 && requests.maxLocalActive <= 2)
+    assert.equal(requests.legacyWindowCalls, 0)
+    assert.deepEqual(separateSourceMaintenance(requests.sourceRequests, fixture).historical, [], 'A fully local period switch must reuse historical prices and statistics.')
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
 
@@ -865,14 +868,14 @@ test('known RSI, ATR% and BBW segments remain visible through indicator warm-up 
   }
 })
 
-test('a short listing remains usable while waiting for its chart to qualify for list admission', async () => {
+test('a qualified short listing remains selectable while chart statistics are still loading', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   await installPreparedTransform({ mode: 'partial', instId: fixture.instId, end: fixture.end, intervalMS: fixture.intervalMS })
   try {
     await page.reload({ waitUntil: 'domcontentloaded' })
     await page.locator(`[data-chart-inst="${fixture.instId}"]`).waitFor({ state: 'visible' })
-    assert.equal(await page.locator(`[aria-label="View ${fixture.instId} chart"]`).count(), 0,
-      'Unknown statistic panels keep the candidate out of the ready chart list.')
+    assert.equal(await page.locator(`[aria-label="View ${fixture.instId} chart"]`).count(), 1,
+      'Chart statistics cannot revoke backend list membership.')
     await selectTimeframe(page, fixture.timeframe)
     const chart = page.locator(`[data-chart-inst="${fixture.instId}"]`)
     await page.waitForFunction(() => document.querySelector('[data-chart-inst]')?.dataset.chartRenderedBars === '12')

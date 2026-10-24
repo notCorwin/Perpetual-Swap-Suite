@@ -89,8 +89,9 @@ test('native WebSocket prices reach the selected SVG and survive delayed durable
     })
     if (process.env.PERPETUAL_SWAP_TEST_UI !== 'foreground') assert.deepEqual(presentation, { visible: false, focused: false })
     await Promise.all([btc, eth].flatMap(instId => Object.keys(nativeIntervals).map(timeframe => exchange.waitForSubscription(instId, `candle${timeframe}`))))
-    // The initial candidate stays usable while its missing source repairs;
-    // list admission now waits for a completed pre-rendered chart.
+    // Backend qualification exposes both rows while the missing chart source repairs.
+    await page.locator(`[aria-label="View ${btc} chart"]`).waitFor({ state: 'visible' })
+    await page.locator(`[aria-label="View ${eth} chart"]`).waitFor({ state: 'visible' })
     await page.locator(`[data-chart-inst="${btc}"]`).waitFor({ state: 'visible' })
     await exchange.waitForHeldHistory()
 
