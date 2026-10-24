@@ -530,6 +530,7 @@ export class PreparedChartPipeline {
     if (this.currentFocus(focus) && request === state.historyRequest) state.historyEnd = targetEnd ?? state.latestHour
     this.seed(state, 'foreground')
     this.refreshObservations(state, targetEnd, VISIBLE, targetEnd === undefined ? VISIBLE : HISTORY_PAGE, focus, reserve)
+    this.prefetchStatistics(state, focus)
     const currentEnd = targetEnd ?? state.latestHour
     const frame = this.historyFrame(state, currentEnd)
     if (request === state.historyRequest) { state.publishedHistoryKey = this.historyKey(state, currentEnd); state.publishedHistoryStatus = state.statusVersion }
@@ -590,19 +591,7 @@ export class PreparedChartPipeline {
     const priority = this.demandPriority(state, from, end, focus)
     let pricesMissing = false
     for (let hour = priceFrom; hour <= end; hour += step) if (!completePriceCandle(state.rows.get(hour))) { pricesMissing = true; break }
-    for (const [source, bit] of [['oi', 1], ['taker', 2]]) {
-      let missing = false
-      for (let hour = from; hour <= end; hour += step) if (!sourceFresh(state.rows.get(hour), bit)) { missing = true; break }
-      if (!missing || typeof this.history.ensureStatistics !== 'function' || !this.pendingSourceRanges(state, source, from, end).length) continue
-      this.sourceJob(`${source}:${state.key}:${from}:${end}`, async (signal, job) => {
-        const result = await this.history.ensureStatistics(instId, timeframe, from, end, job.priority, signal, source)
-        signal.throwIfAborted()
-        await this.observeStatistics(instId, timeframe, from, end, job.priority, result?.rows, source)
-        signal.throwIfAborted()
-        for (let hour = from; hour <= end; hour += step) { const row = state.rows.get(hour); if (row && !sourceFresh(row, bit)) return false }
-        return true
-      }, { state, source, from, through: end, reserve, priority })?.catch(() => {})
-    }
+    this.refreshStatistics(state, from, end, priority, reserve)
     if (!pricesMissing || !this.history.ensurePrices && !this.history.latest) return null
     const task = this.sourceJob(`prices:${state.key}:${priceFrom}:${end}`, async (signal, job) => {
       // A latest observation proves only that candle. The durable planner owns
@@ -616,6 +605,7 @@ export class PreparedChartPipeline {
       const cursor = state.historyEnd ?? undefined
       await this.read(state, cursor, cursor === undefined ? TAIL : HISTORY, job.priority)
       signal.throwIfAborted()
+      this.prefetchStatistics(state)
       this.seed(state, 'foreground'); this.publish(state)
       const rows = result?.rows ? new Map(result.rows.map(row => [row.timestamp, row])) : state.rows
       for (let hour = priceFrom; hour <= end; hour += step) if (!completePriceCandle(rows.get(hour))) return false
@@ -623,6 +613,40 @@ export class PreparedChartPipeline {
     }, { state, source: 'candles', from: priceFrom, through: end, reserve, priority })
     task?.catch(() => {})
     return task
+  }
+
+  statisticsRange(state) {
+    if (state.historyEnd == null) return null
+    const first = Math.max(0, state.floor ?? 0, state.historyEnd - (HISTORY - HISTORY_AHEAD - 1) * state.intervalMS)
+    const last = Math.min(state.historyEnd + HISTORY_AHEAD * state.intervalMS,
+      Math.floor(Date.now() / state.intervalMS) * state.intervalMS - state.intervalMS)
+    const hours = [...state.rows.keys()].filter(hour => hour >= first && hour <= last)
+    return hours.length ? { from: Math.min(...hours), through: Math.max(...hours) } : null
+  }
+
+  prefetchStatistics(state, focus = this.focus) {
+    if (!this.currentFocus(focus) || focus.key !== state.key) return
+    const reserve = this.statisticsRange(state)
+    // Durable prices already admit this bounded navigation reserve. Its OI
+    // and Taker coverage must advance without waiting for a price cache miss.
+    if (reserve) this.refreshStatistics(state, reserve.from, reserve.through, 'prefetch', reserve)
+  }
+
+  refreshStatistics(state, from, through, priority, reserve) {
+    if (typeof this.history.ensureStatistics !== 'function') return
+    const { instId, timeframe, intervalMS: step } = state
+    for (const [source, bit] of [['oi', 1], ['taker', 2]]) {
+      for (const bounds of this.pendingSourceRanges(state, source, from, through)) {
+        this.sourceJob(`${source}:${state.key}:${bounds.from}:${bounds.through}`, async (signal, job) => {
+          const result = await this.history.ensureStatistics(instId, timeframe, bounds.from, bounds.through, job.priority, signal, source)
+          signal.throwIfAborted()
+          await this.observeStatistics(instId, timeframe, bounds.from, bounds.through, job.priority, result?.rows, source)
+          signal.throwIfAborted()
+          for (let hour = bounds.from; hour <= bounds.through; hour += step) { const row = state.rows.get(hour); if (row && !sourceFresh(row, bit)) return false }
+          return true
+        }, { state, source, ...bounds, reserve, priority })?.catch(() => {})
+      }
+    }
   }
 
   indicatorDemand(state, focus = this.focus) {
@@ -780,22 +804,26 @@ export class PreparedChartPipeline {
       const at = retryAt || this.repairDeadlines.get(key) || now + 1000
       repairDeadlines.set(key, at); deadline = Math.min(deadline, at)
     }
-    const missingStatistics = { oi: false, taker: false }
     for (let hour = from; hour <= end; hour += step) {
       const row = state.rows.get(hour)
       if (!completePriceCandle(row)) missingPrices = true
+    }
+    if (missingPrices && (this.history.latest || this.history.ensurePrices)
+      && this.pendingSourceRanges(state, 'candles', from, end).length) repair('candles', from, end)
+    const statistics = this.statisticsRange(state)
+    const statisticsRanges = [{ from, through: end }, ...(statistics ? [statistics] : [])]
+    for (const bounds of statisticsRanges) for (let hour = bounds.from; hour <= bounds.through; hour += step) {
+      const row = state.rows.get(hour)
       for (const bit of [1, 2]) {
-        if (!row || !sourceFresh(row, bit)) missingStatistics[bit === 1 ? 'oi' : 'taker'] = true
-        else if (bit === 1 ? !numeric(row.oi) : !numeric(row.buy) || !numeric(row.sell)) {
+        if (sourceFresh(row, bit) && (bit === 1 ? !numeric(row.oi) : !numeric(row.buy) || !numeric(row.sell))) {
           const expiry = Number(row[bit === 1 ? 'statisticsOIExpiresAt' : 'statisticsTakerExpiresAt'])
           if (expiry > now) deadline = Math.min(deadline, expiry)
         }
       }
     }
-    for (const [family, missing, supported] of [['prices', missingPrices, this.history.latest || this.history.ensurePrices], ['oi', missingStatistics.oi, this.history.ensureStatistics], ['taker', missingStatistics.taker, this.history.ensureStatistics]]) {
-      if (!missing || !supported) continue
-      const source = family === 'prices' ? 'candles' : family
-      if (this.pendingSourceRanges(state, source, from, end).length) repair(source, from, end)
+    if (this.history.ensureStatistics) for (const source of ['oi', 'taker']) {
+      for (const bounds of statisticsRanges)
+        for (const pending of this.pendingSourceRanges(state, source, bounds.from, bounds.through)) repair(source, pending.from, pending.through)
     }
     const indicators = this.indicatorDemand(state, focus)
     if (indicators) {
@@ -811,6 +839,7 @@ export class PreparedChartPipeline {
       if (state.statisticsDeadline <= Date.now()) { state.freshnessVersion = (state.freshnessVersion ?? 0) + 1; state.statisticsDeadline = Infinity }
       this.publish(state) // Expired quote/empty-observation leases change status only.
       this.refreshObservations(state, focus.end, VISIBLE, VISIBLE, focus)
+      this.prefetchStatistics(state, focus)
       this.scheduleRefresh()
     }, Math.max(1, deadline - now))
     this.refreshTimer.unref?.()

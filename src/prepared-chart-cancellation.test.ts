@@ -128,6 +128,52 @@ test('superseded queued chart consumers never enter their source transports', as
   } finally { await f.close() }
 })
 
+test('cached price history proactively fills both statistic reserves without scrolling or blocking the viewport', async () => {
+  const hold = deferred(), target = end() - 300 * step
+  const f = await fixture({ acquire: call => call.path.includes('open-interest') ? hold.promise : Promise.resolve() })
+  try {
+    const candles = Array.from({ length: 1000 }, (_, index) => {
+      const timestamp = end() - (999 - index) * step, visible = timestamp >= target - 95 * step && timestamp <= target
+      return { instrument: btc, timeframe: '15m', timestamp, open: 100, high: 102, low: 99, close: 101,
+        volume: 10, baseVolume: 1, quoteVolume: 1000, confirmed: true,
+        ...(visible ? { oi: 500, buy: 6, sell: 4, statisticsVersion: 11 } : {}) }
+    })
+    await f.store.appendCandles(candles)
+    const frame = await f.pipeline.localHistory(btc, '15m', target)
+    assert.equal(frame.priceState, 'ready'); assert.equal(frame.oiState, 'ready'); assert.equal(frame.takerState, 'ready')
+    await waitFor(() => f.calls.some(call => call.path.includes('open-interest')) && f.calls.some(call => call.path.includes('taker')))
+    assert.ok(f.calls.every(call => !call.path.includes('candles')), 'Complete cached prices must not gate or duplicate statistic acquisition.')
+    const state = f.pipeline.series.get(`${btc}:15m`), first = Math.min(...state.rows.keys()), last = Math.max(...state.rows.keys())
+    assert.ok(first < target - 95 * step && last > target, 'The admitted reserve must extend in both navigation directions.')
+    await waitFor(() => [...state.rows.values()].every((row: any) => row.buy === 6 && row.sell === 4))
+    assert.ok([...state.rows.values()].some((row: any) => row.oi == null), 'Taker completes while offscreen OI remains held.')
+    const pending = [...f.pipeline.sourceTasks.values()]
+    await f.pipeline.localHistory(btc, '15m', target - step)
+    assert.ok(pending.every((job: any) => !job.controller.signal.aborted), 'Adjacent scrolling reuses already admitted statistic reserves.')
+    hold.resolve(); await f.history.sync.whenIdle()
+    await waitFor(() => f.pipeline.sourceTasks.size === 0)
+    assert.ok([...state.rows.values()].every((row: any) => row.oi === 500 && row.buy === 6 && row.sell === 4))
+    const requests = f.calls.length
+    await f.pipeline.localHistory(btc, '15m', target - 2 * step)
+    await f.history.sync.whenIdle()
+    assert.equal(f.calls.length, requests, 'Prepared statistic coverage remains reusable on subsequent navigation.')
+  } finally { hold.resolve(); await f.close() }
+})
+
+test('cold historical price pages proactively populate their entire statistic reserve', async () => {
+  const f = await fixture(), target = end() - 100 * step
+  try {
+    await f.pipeline.prepare(btc, '15m', target, 768)
+    await f.history.sync.whenIdle()
+    await waitFor(() => f.pipeline.sourceTasks.size === 0)
+    const rows = await f.store.candles({ instrument: btc, timeframe: '15m', from: target - 767 * step, through: target })
+    assert.equal(rows.length, 768)
+    assert.ok(rows.every(row => row.oi === 500 && row.buy === 6 && row.sell === 4), 'Every acquired price page must prime both statistic sources before another scroll.')
+    const frame = f.pipeline.historyFrame(f.pipeline.series.get(`${btc}:15m`), target)
+    assert.equal(frame.oiState, 'ready'); assert.equal(frame.takerState, 'ready')
+  } finally { await f.close() }
+})
+
 test('the chart focus IPC contract reaches the backend worker and local requests keep their ownership token', async () => {
   const userData = await mkdtemp(join(tmpdir(), 'perp-chart-focus-worker-')), backend = new MarketBackend({ userData, testMode: true })
   const request = (value: unknown) => backend.request(parseDesktopRequest(value))

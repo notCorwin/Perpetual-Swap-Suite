@@ -721,7 +721,7 @@ test('continuous live quotes cannot postpone repairing a resident historical vie
   } finally { await pipeline.dispose() }
 })
 
-test('an old source job on the known viewport edge cannot suppress demand for its uncovered missing samples', async context => {
+test('uncovered statistic samples are repaired without refetching known viewport edges', async context => {
   context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Math.floor(Date.now() / interval) * interval + 1000 })
   const canonical = source(700), target = canonical[500].timestamp, oldEnd = target + 80 * interval, first = target - 95 * interval
   const calls: Array<{ source: string; from: number; through: number }> = []
@@ -749,8 +749,9 @@ test('an old source job on the known viewport edge cannot suppress demand for it
       await pipeline.setLive(instId, '15m', { ...canonical.at(-1), timestamp: end() + interval, confirmed: false, volume: 100 + tick })
       await flush()
     }
-    assert.deepEqual(calls.filter(call => call.through === target).map(call => call.source).toSorted(), ['oi', 'taker'])
-    assert.equal(calls.length, 4, 'Useful old consumers are shared, while each uncovered source receives one current consumer.')
+    const repairs = calls.filter(call => call.from === first && call.through === target - 16 * interval)
+    assert.deepEqual(repairs.map(call => call.source).toSorted(), ['oi', 'taker'])
+    assert.ok(calls.every(call => call.through < target - 15 * interval || call.from > target), 'Statistic acquisition excludes already observed samples.')
     const repaired = pipeline.historyFrame(state, target)
     assert.equal(repaired.oiState, 'ready'); assert.equal(repaired.takerState, 'ready')
   } finally { await pipeline.dispose() }
@@ -1660,6 +1661,34 @@ test('cached successful-empty and numeric statistics acquire no new source data 
     const old = await pipeline.localHistory(instId, '15m', rows[1000].timestamp)
     assert.equal(old.oiState, 'unavailable'); assert.equal(old.oiStatus.reason, 'not-published')
     assert.equal(old.takerState, 'ready'); assert.equal(requests, 0)
+  } finally { await pipeline.dispose() }
+})
+
+
+test('offscreen statistic absence expires and revalidates only its native slots without another gesture', async context => {
+  const now = Math.floor(Date.now() / interval) * interval + 1000
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
+  const rows: any[] = source(1800), target = rows[1400].timestamp, absent = rows[500].timestamp
+  rows[500] = { ...rows[500], oi: null, statisticsOIExpiresAt: now + 5000 }
+  const calls: Array<{ source: string; from: number; through: number; priority: string }> = []
+  const { pipeline, store } = fixture(rows, {
+    async ensureStatistics(_id: string, _frame: string, from: number, through: number, priority: string, _signal: AbortSignal, source: string) {
+      calls.push({ source, from, through, priority })
+      store.rows = store.rows.map(row => row.timestamp === absent ? { ...row, oi: 5000 } : row)
+      return { rows: store.rows.filter(row => row.timestamp >= from && row.timestamp <= through) }
+    },
+  })
+  const flush = async () => { for (let index = 0; index < 8; index++) await new Promise<void>(resolve => setImmediate(resolve)) }
+  try {
+    await pipeline.localHistory(instId, '15m', target); await finishSeed(pipeline)
+    pipeline.scheduleRefresh()
+    assert.equal(calls.length, 0, 'An unexpired direct empty observation is reusable outside the viewport.')
+    context.mock.timers.tick(4999); await flush(); assert.equal(calls.length, 0)
+    context.mock.timers.tick(1); await flush()
+    assert.deepEqual(calls, [{ source: 'oi', from: absent, through: absent, priority: 'prefetch' }])
+    assert.equal(pipeline.series.get(`${instId}:15m`).rows.get(absent).oi, 5000)
+    pipeline.prefetchStatistics(pipeline.series.get(`${instId}:15m`)); await flush()
+    assert.equal(calls.length, 1, 'Numeric coverage needs no repeated acquisition.')
   } finally { await pipeline.dispose() }
 })
 
