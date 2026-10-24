@@ -265,7 +265,7 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   await electron.evaluate(({ BrowserWindow }, update) => BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', update), liveUpdate)
   await page.waitForFunction(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 135)
   assert.match(await chart.locator('[aria-live="off"]').textContent(), /Close\s+135/)
-  assert.match(await chart.locator('[data-chart-price-label-value]').textContent(), /^135 /)
+  assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^135 /)
   assert.equal(await page.evaluate(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot.bars === globalThis.__completedSubscriptionBars), true)
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Live-only subscriptions must reuse the completed frame without a follow-up read.')
 })
@@ -946,7 +946,7 @@ test('constant Bollinger bands stay finite and negative lower bands explicitly s
     assert.equal(await page.locator('[data-chart-price-scale="linear"]').getAttribute('title'), 'Linear scale · BOLL includes zero or negative values')
     const paths = await page.locator('svg[data-rendered-inst] path[d]').evaluateAll(paths => paths.map(path => path.getAttribute('d')))
     assert.doesNotMatch(paths.join(' '), /NaN|Infinity|undefined/)
-    assert.equal(await page.locator('[data-chart-indicator="bollLower"]').evaluate(path => path.getAttribute('d').length > 0), true)
+    assert.equal(await page.locator('svg[data-rendered-inst] [data-chart-indicator="bollLower"]').evaluate(path => path.getAttribute('d').length > 0), true)
   } finally { await publishMode('standard') }
 })
 
@@ -1212,7 +1212,7 @@ test('missing recent candles remain visible with repair status until the complet
       assert.equal(await chart.getAttribute('data-chart-incomplete'), 'true')
       assert.equal(await chart.locator('svg[data-rendered-inst]').isVisible(), true, 'Actual prices remain visible while missing slots repair.')
       assert.ok(Number(await chart.getAttribute('data-chart-rendered-bars')) >= 95)
-      assert.match(await chart.locator('[data-chart-price-label-value]').textContent(), /^133 /, 'The current forming price remains visible across the historical gap.')
+      assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^133 /, 'The current forming price remains visible across the historical gap.')
     }
     await waitForFrame(await publish('repaired'))
     await page.waitForFunction(() => !document.querySelector('[data-chart-status]')?.textContent.trim())

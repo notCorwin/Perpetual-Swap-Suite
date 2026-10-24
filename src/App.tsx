@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { Radio, Settings2 } from 'lucide-react'
 import { buttonVariants } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -11,6 +11,7 @@ import { WorkspaceViewport } from '@/WorkspaceViewport'
 import { WorkspaceSettings } from '@/WorkspaceSettings'
 import { settingsHref, useSettingsSection, type SettingsNavigationState } from '@/settings-navigation'
 import { chartController } from '@/chart-controller'
+import { chartRenderKey, RenderedChartRegistry } from '@/chart-render'
 import { compareRankingChange } from '@/market-ranking'
 import { MarketRowsBuffer } from '@/market-snapshot'
 import { SnapshotOrder } from '@/snapshot-order'
@@ -63,6 +64,8 @@ function App() {
   const [preferences, setPreferences] = useState<Preferences>(DEFAULT_PREFERENCES)
   const [preferencesLoaded, setPreferencesLoaded] = useState(false)
   const [preferencesError, setPreferencesError] = useState('')
+  const [renderedCharts] = useState(() => new RenderedChartRegistry())
+  const rendered = useSyncExternalStore(renderedCharts.subscribe, renderedCharts.getSnapshot)
   const [rows, setRows] = useState<RankedMarketRow[]>([])
   const marketRows = useRef(new MarketRowsBuffer<RankedMarketRow>())
   const [removalAt, setRemovalAt] = useState<number | null>(null)
@@ -143,9 +146,8 @@ function App() {
           if (!('unchanged' in snapshot)) {
             const buffered = marketRows.current.update(snapshot.rows, performance.now(), order.current.serviceSession ?? '')
             const unverified = snapshot.loading && qualificationPending(snapshot.catalogProgress) || snapshot.error || snapshot.catalogSource === 'none' || (snapshot.catalogProgress?.unknown ?? 0) > 0
-            // Admit every native timeframe and recover missed startup pushes
-            // before exposing selectable rows. This reads existing compact
-            // frames; background history preparation remains independent.
+            // Start candidate preparation independently of list admission.
+            // The SVG pool acknowledges each chart after its DOM is committed.
             const first = buffered.reduce<RankedMarketRow | null>((best, row) => !best || compareRankingChange(row, best) < 0 ? row : best, null)
             const retained = !buffered.length && unverified ? chartController.getSnapshot().requested?.instId : undefined
             void chartController.setUniverse(retained ? [retained] : buffered.map(row => row.instId), timeframe, retained ?? first?.instId)
@@ -187,24 +189,27 @@ function App() {
   }, [preferencesLoaded, timeframe])
 
   const ranked = useMemo(() => [...rows].sort(compareRankingChange), [rows])
-  const visible = useMemo(() => ranked.filter(row => row.instId.toLowerCase().includes(query.trim().toLowerCase())), [ranked, query])
+  const listed = useMemo(() => ranked.filter(row => rendered.has(chartRenderKey(row.instId, timeframe))), [ranked, rendered, timeframe])
+  const visible = useMemo(() => listed.filter(row => row.instId.toLowerCase().includes(query.trim().toLowerCase())), [listed, query])
+  const preparingCharts = rows.length - listed.length
   const verifying = Boolean(catalog.loading) && qualificationPending(catalog.catalogProgress) || (!ready && !error)
   const awaitingObservations = Boolean(catalog.loading && catalog.catalogProgress && catalog.catalogProgress.completed === catalog.catalogProgress.total && catalog.catalogProgress.pending > 0)
   const verificationUnavailable = !verifying && (Boolean(error) || catalog.catalogSource === 'none' || (catalog.catalogProgress?.unknown ?? 0) > 0)
-  const emptyTitle = verifying ? catalog.catalogSource === 'none' ? 'Loading contracts' : awaitingObservations ? 'Updating market data' : 'Verifying contracts' : verificationUnavailable ? 'Market verification unavailable' : 'No qualified contracts'
-  const emptyDescription = verifying
+  const emptyTitle = preparingCharts ? 'Preparing charts' : verifying ? catalog.catalogSource === 'none' ? 'Loading contracts' : awaitingObservations ? 'Updating market data' : 'Verifying contracts' : verificationUnavailable ? 'Market verification unavailable' : 'No qualified contracts'
+  const emptyDescription = preparingCharts ? `${listed.length} / ${rows.length} charts ready. Contracts appear when their charts are rendered.` : verifying
     ? awaitingObservations ? 'Waiting for fresh observations. Market data collection continues in the background.' : catalog.catalogProgress?.total ? `Checking enabled conditions: ${catalog.catalogProgress.completed} / ${catalog.catalogProgress.total} contracts completed.` : 'The data service is preparing and verifying the market list.'
     : verificationUnavailable ? 'Market data could not verify the enabled conditions. Waiting for updated observations from the data service.' : 'Adjust the enabled liquidity conditions in Settings.'
-  const noSearchMatch = Boolean(query.trim()) && rows.length > 0
+  const noSearchMatch = Boolean(query.trim()) && listed.length > 0
   // After the list buffer expires, a verification gap still preserves the
   // current chart until the service can confirm its exclusion.
-  const selectedRow = rows.find(row => row.instId === selected) ?? ranked[0]
+  const selectedRow = rows.find(row => row.instId === selected) ?? listed[0] ?? ranked[0]
   const retainedChart = !rows.length && Boolean(selected) && (verifying || verificationUnavailable)
   const selectedID = selectedRow?.instId ?? (retainedChart ? selected : null)
   useEffect(() => { if (ready && !retainedChart) setSelected(selectedRow?.instId ?? null) }, [ready, retainedChart, selectedRow?.instId])
-  const listOrder = useMemo(() => ranked.map(row => row.instId), [ranked])
-  const turnoverOrder = useMemo(() => [...rows].sort((a, b) => (b.turnover24hUSDT ?? -1) - (a.turnover24hUSDT ?? -1) || a.instId.localeCompare(b.instId, 'en')).map(row => row.instId), [rows])
-  useEffect(() => { chartController.setUniverse(retainedChart && selectedID ? [selectedID] : ready ? listOrder : [], timeframe) }, [ready, listOrder, timeframe, retainedChart, selectedID])
+  const candidateIds = useMemo(() => ranked.map(row => row.instId), [ranked])
+  const listOrder = useMemo(() => listed.map(row => row.instId), [listed])
+  const turnoverOrder = useMemo(() => [...listed].sort((a, b) => (b.turnover24hUSDT ?? -1) - (a.turnover24hUSDT ?? -1) || a.instId.localeCompare(b.instId, 'en')).map(row => row.instId), [listed])
+  useEffect(() => { chartController.setUniverse(retainedChart && selectedID ? [selectedID] : ready ? candidateIds : [], timeframe) }, [ready, candidateIds, timeframe, retainedChart, selectedID])
   const savePreferences = useCallback(async (values: Partial<Preferences>) => {
     const write = ++preferenceWrite.current
     let saved: Preferences
@@ -231,12 +236,12 @@ function App() {
       <header className="flex flex-col gap-4 border-b p-4">
         <div className="flex items-center justify-between gap-2"><h1 className="text-base font-semibold">Perpetual Swap Suite</h1><a ref={settingsLauncher} href={settingsHref('workspace')} className={buttonVariants({ variant: 'outline', size: 'sm' })}><Settings2 aria-hidden="true" data-icon="inline-start" />Settings</a></div>
         <Input aria-label="Search contracts" placeholder="Search contracts…" value={query} onChange={event => setQuery(event.target.value)} />
-        <div className="flex items-center justify-between gap-2"><span className="text-xs text-muted-foreground">{query.trim() ? `${visible.length} / ${rows.length}` : rows.length} contracts</span><Badge variant="outline"><Radio aria-hidden="true" />{status}</Badge></div>
+        <div className="flex items-center justify-between gap-2"><span className="text-xs text-muted-foreground">{query.trim() ? `${visible.length} / ${listed.length}` : listed.length} contracts</span><Badge variant="outline"><Radio aria-hidden="true" />{status}</Badge></div>
       </header>
       {preferencesError && <p role="alert" className="border-b p-3 text-sm text-destructive">{preferencesError}</p>}
       {error && <p role="alert" className="border-b p-3 text-sm text-destructive">{error}</p>}
       <section data-market-scroll className="min-h-0 flex-1 overflow-y-auto [&>[data-slot=table-container]]:overflow-visible" aria-label="Perpetual swap markets">
-        <Table className="table-fixed" data-market-count={visible.length} data-total-market-count={rows.length} aria-rowcount={visible.length + 1}>
+        <Table className="table-fixed" data-market-count={visible.length} data-total-market-count={listed.length} data-preparing-chart-count={preparingCharts} aria-rowcount={visible.length + 1}>
           <colgroup><col className="w-[35%]" /><col className="w-[33%]" /><col className="w-[32%]" /></colgroup>
           <TableHeader className="sticky top-0 bg-background"><TableRow><TableHead>Contract</TableHead><TableHead className="text-right">Price</TableHead><TableHead className="text-right" aria-sort="descending" title="Sorted by absolute signed relative change, largest first">{preferences.rankingLookback}m change</TableHead></TableRow></TableHeader>
           {visible.length ? <MarketRowsViewport ids={visible.map(row => row.instId)}>{index => <MarketRowView row={visible[index]} index={index} selected={visible[index].instId === selectedID} lookback={preferences.rankingLookback} onSelect={setSelected} />}</MarketRowsViewport> : <TableBody><TableRow><TableCell colSpan={3}>
@@ -244,10 +249,10 @@ function App() {
           </TableCell></TableRow></TableBody>}
         </Table>
       </section>
-      <footer className="flex flex-col gap-1 border-t p-4 text-xs text-muted-foreground" aria-live="polite">{retainedChart && <span role="status">{verifying ? 'Rechecking qualification · Current chart remains available' : 'Qualification data unavailable · Current chart remains available'}</span>}<div className="flex items-center justify-between gap-3"><span aria-label={`Realtime connection: ${realtime}`}>{realtime}</span><span>{updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data'}</span></div></footer>
+      <footer className="flex flex-col gap-1 border-t p-4 text-xs text-muted-foreground" aria-live="polite">{preparingCharts > 0 && <span role="status">Preparing charts · {listed.length} / {rows.length} ready</span>}{retainedChart && <span role="status">{verifying ? 'Rechecking qualification · Current chart remains available' : 'Qualification data unavailable · Current chart remains available'}</span>}<div className="flex items-center justify-between gap-3"><span aria-label={`Realtime connection: ${realtime}`}>{realtime}</span><span>{updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data'}</span></div></footer>
     </aside>
     <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
-      {selectedID ? <MarketChart active={settingsSection === null} instId={selectedID} timeframe={timeframe} onTimeframeChange={changeTimeframe} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
+      {selectedID ? <MarketChart active={settingsSection === null} instId={selectedID} timeframe={timeframe} candidateIds={candidateIds} onRenderReady={renderedCharts.register} onTimeframeChange={changeTimeframe} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
     </section>
     </div>
     {settingsSection && <WorkspaceSettings section={settingsSection} preferences={preferences} loaded={preferencesLoaded} loadError={preferencesError} onSave={savePreferences} onNavigationStateChange={updateSettingsGuard} />}

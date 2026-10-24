@@ -15,6 +15,8 @@ const keyFor = (instId: string, timeframe: RadarTimeframe) => `${timeframe}:${in
 const samePrices = (left: Bar, right: Bar) => (['hour', 'open', 'high', 'low', 'close', 'confirmed'] as const).every(field => left[field] === right[field])
 const observed = (bar: Bar, source: 1 | 2) => (source === 1 ? bar.oiObserved : bar.takerObserved)
   ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & source)
+const retainedStatus = (value: ChartSourceStatus | undefined, previous: ChartSourceStatus | undefined) =>
+  JSON.stringify(value) === JSON.stringify(previous) ? previous : value
 
 export type ReadyChartBoundary = Readonly<{ firstEnd: number; lastEnd: number }>
 export type PreparedChartStoreLimits = { maxSeries?: number; maxBarsPerSeries?: number; maxWindowsPerSeries?: number; maxBytes?: number }
@@ -154,10 +156,13 @@ function readyWindow(meta: PreparedChartMeta, bars: PreparedChartBar[], endHour:
     : latest && (detached || meta.priceState === 'stale') ? 'stale'
       : 'ready'
   const price = windowSource(meta, bars, first, endHour, 'price').status
-  const priceStatus = price ? availability !== 'ready' && price.state === 'error' ? { ...price, from: first, through: endHour } : { state: availability, from: first, through: endHour } : undefined
+  const priceStatus = retainedStatus(price ? availability !== 'ready' && price.state === 'error' ? { ...price, from: first, through: endHour } : { state: availability, from: first, through: endHour } : undefined, previous?.priceStatus)
   const priceState = priceStatus?.state === 'error' ? 'error' : availability
   const oi = windowSource(meta, bars, first, endHour, 'oi'), taker = windowSource(meta, bars, first, endHour, 'taker')
   const indicator = windowSource(meta, bars, first, endHour, 'indicator')
+  oi.status = retainedStatus(oi.status, previous?.oiStatus)
+  taker.status = retainedStatus(taker.status, previous?.takerStatus)
+  indicator.status = retainedStatus(indicator.status, previous?.indicatorStatus)
   const sameBars = previous && previous.generation === meta.generation && bars.length === previous.bars.length && bars.every((bar, index) => previous.bars[index] === bar)
   if (sameBars && previous.liveBar === liveBar && previous.priceState === priceState && previous.priceAsOf === meta.priceAsOf
     && JSON.stringify(previous.priceStatus) === JSON.stringify(priceStatus)
@@ -180,6 +185,7 @@ export class PreparedChartStore {
   // Keep only the numeric watermark after eviction so in-flight old generations cannot reenter this session.
   private readonly generations = new Map<string, number>()
   private universe = new Set<string>()
+  private renderedUniverse = new Set<string>()
   private focusKey: string | null = null
   private readonly byteSizes = new WeakMap<object, number>()
   private seriesBytes = 0
@@ -257,6 +263,7 @@ export class PreparedChartStore {
   /** Compact latest frames belong to navigation candidates, independently of the history LRU. */
   setUniverse(instIds: readonly string[], _timeframe: RadarTimeframe, focusInstId?: string) {
     if (focusInstId) this.focusKey = keyFor(focusInstId, _timeframe)
+    this.renderedUniverse = new Set(instIds.map(instId => keyFor(instId, _timeframe)))
     this.universe = new Set([...instIds, ...(focusInstId ? [focusInstId] : [])].flatMap(instId => RADAR_TIMEFRAMES.map(({ value }) => keyFor(instId, value))))
     for (const key of this.latestFrames.keys()) if (!this.universe.has(key)) this.setLatestFrame(key, null)
     for (const [key, entry] of this.series) {
@@ -479,7 +486,9 @@ export class PreparedChartStore {
     }
     for (const key of this.latestFrames.keys()) {
       if (this.seriesBytes + this.latestBytes <= this.maxBytes) break
-      if (key !== this.focusKey) this.setLatestFrame(key, null)
+      // Listed SVGs own their latest inputs. The byte target applies after
+      // this bounded candidate working set; deep history is evicted first.
+      if (key !== this.focusKey && !this.renderedUniverse.has(key)) this.setLatestFrame(key, null)
     }
   }
 

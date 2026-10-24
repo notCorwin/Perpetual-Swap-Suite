@@ -71,7 +71,7 @@ export class ChartController {
 
   setUniverse(instIds: readonly string[], timeframe: RadarTimeframe, focusInstId?: string) {
     const ids = [...new Set(instIds.filter(Boolean))]
-    const key = JSON.stringify(ids.toSorted())
+    const key = JSON.stringify([timeframe, ids.toSorted()])
     this.universeIds = ids
     const focus = focusInstId ?? (this.view.requested?.timeframe === timeframe ? this.view.requested.instId : undefined)
     this.store.setUniverse(ids, timeframe, focus)

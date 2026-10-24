@@ -118,6 +118,19 @@ async function request(value) {
 
 async function probe(input) {
   if (!workerData.testMode) throw new Error('Backend probes are unavailable outside tests.')
+  if (input.action === 'persistCandles') {
+    for (const rows of Map.groupBy(input.candles, row => row.instrument).values()) await service.persistCandles(rows[0].instrument, rows, { projectList: false })
+    return { ok: true }
+  }
+  if (input.action === 'preparedDiagnostics') {
+    const pipeline = service.preparedCharts
+    const state = value => value ? { rows: value.rows.size, indicators: value.indicators.size, generation: value.generation,
+      calculating: Boolean(value.calculation), indicatorVersion: value.indicatorVersion, latestHour: value.latestHour } : null
+    return { tasks: [...pipeline.candidateTasks.keys()].map(value => value.key), queue: pipeline.candidateQueue.map(value => value.key),
+      seeds: [...pipeline.liveSeeds.keys()], sources: [...pipeline.sourceTasks.values()].map(value => ({ key: value.seriesKey, source: value.source, from: value.from, through: value.through })),
+      series: [...pipeline.universe.keys()].map(key => ({ key, compact: state(pipeline.liveStates.get(key)), history: state(pipeline.series.get(key)),
+        cached: pipeline.cached(key)?.indicatorState, cachedGeneration: pipeline.cached(key)?.generation })) }
+  }
   if (input.action === 'seedChartScrollBenchmark') return seedChartScrollBenchmark(store, service, { instId: input.instId })
   if (input.action === 'coldBoundaryInstall') {
     coldBoundaryFixture?.remove()

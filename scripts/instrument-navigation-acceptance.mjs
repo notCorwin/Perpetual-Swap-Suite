@@ -15,12 +15,16 @@ export function startupNavigationProbe() {
   })
   const sample = () => {
     const rows = [...document.querySelectorAll('[aria-label^="View "][aria-label$=" chart"]')]
-    if (rows.length && probe.listAt === null) {
+    // Progressive admission may expose the selected chart first. A switch is
+    // possible as soon as a second already rendered contract enters the list.
+    if (rows.length > 1 && probe.listAt === null) {
       probe.listAt = performance.now()
       requestAnimationFrame(() => {
         const selected = document.querySelector('[data-market-index][aria-selected="true"]')
-        const row = rows.findLast(row => row !== selected)
-        if (!row) throw new Error('The cold-start fixture needs another selectable contract.')
+        // Reconcile admission can replace an earlier mutation's row before
+        // paint. Resolve the actual attached target at the input boundary.
+        const row = [...document.querySelectorAll('[aria-label^="View "][aria-label$=" chart"]')].findLast(row => row !== selected)
+        if (!row) { probe.listAt = null; return }
         probe.instId = row.getAttribute('aria-label').slice(5, -6)
         probe.timeframe = document.querySelector('[aria-label="Chart timeframe"] [aria-pressed="true"]')?.textContent
         probe.inputAt = performance.now()
@@ -60,7 +64,15 @@ export function startupNavigationProbe() {
 }
 
 export async function startupNavigationReport(page, launchedAt, fixture) {
-  await page.waitForFunction(() => window.__navigationStartup && window.__navigationStartup.paintAt !== null, null, { timeout: 10_000 })
+  await page.waitForFunction(() => window.__navigationStartup && window.__navigationStartup.paintAt !== null, null, { timeout: 10_000 }).catch(async error => {
+    const state = await page.evaluate(() => {
+      const { samples, previous, stop, ready, ...probe } = window.__navigationStartup ?? {}
+      return { probe, rows: [...document.querySelectorAll('[data-market-index]')].map(row => ({ id: row.getAttribute('aria-label'), selected: row.getAttribute('aria-selected') })),
+        plots: [...document.querySelectorAll('svg[data-prepared-chart-inst]')].map(svg => ({ ...svg.dataset })),
+        chart: document.querySelector('[data-chart-inst]')?.__chartSnapshot?.instId }
+    })
+    throw new Error(`Cold-start navigation did not finish: ${JSON.stringify(state)}`, { cause: error })
+  })
   return page.evaluate(({ launchedAt, instruments }) => {
     const probe = window.__navigationStartup
     const fields = ['open', 'high', 'low', 'close', 'ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
@@ -308,7 +320,8 @@ export async function measureNavigation(page, trigger, { expectedInstId = null, 
 
 export async function firstVisibleMarket(page, excluded = []) {
   const rows = page.locator('[aria-label^="View "][aria-label$=" chart"]')
-  await rows.first().waitFor({ state: 'visible', timeout: 15_000 })
+  await page.waitForFunction(excluded => [...document.querySelectorAll('[aria-label^="View "][aria-label$=" chart"]')]
+    .some(row => !excluded.includes(row.getAttribute('aria-label').slice(5, -6))), excluded, { timeout: 15_000 })
   const ids = await rows.evaluateAll(rows => rows.map(row => row.getAttribute('aria-label').slice(5, -6)))
   const instId = ids.find(id => !excluded.includes(id))
   if (!instId) throw new Error('The market list did not contain another selectable contract.')

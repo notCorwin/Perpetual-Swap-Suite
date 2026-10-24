@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
+import { createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react"
 import { flushSync } from "react-dom"
 import { Camera } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
@@ -11,7 +11,7 @@ import { chartAnalysis } from '@/analysis-service'
 import { type AnalysisDirection } from '@/chart-analysis'
 import { chartCaptureBounds } from '@/chart-capture'
 import { CHART_PANELS, chartPriceLabelLayout, type ChartPanel as Panel } from "@/chart-layout"
-import { chartCompact as compact, chartPrice as price, chartPercent, createChartGeometryCache, type ChartGeometry } from "@/chart-geometry"
+import { chartCompact as compact, chartPrice as price, chartPercent, type ChartGeometry } from "@/chart-geometry"
 import { chartStatisticsSamples } from '@/chart-legend'
 import { cn } from "@/lib/utils"
 import { chartNavigationTarget } from "@/market-sort"
@@ -19,7 +19,8 @@ import { formatPercent } from "@/market-percent"
 import { RADAR_TIMEFRAMES, timeframeLabel, timeframeMilliseconds, type RadarTimeframe } from '@/timeframe'
 
 import { chartController } from '@/chart-controller'
-import type { Bar, ChartSourceStatus, PreparedChartState } from '@/chart-data'
+import { chartReadyForListing, createChartPlotCache } from '@/chart-render'
+import type { Bar, ChartSourceStatus, PreparedChartState, ReadyChartWindow } from '@/chart-data'
 import { measureOperation } from '../electron/services/operations.js'
 
 const EMPTY_BARS: readonly Bar[] = []
@@ -57,12 +58,16 @@ const chartTextWidth = (text: string, fontSize: number = chartTokens.textSize) =
   return width
 }
 const legendWidth = (text: string) => chartTextWidth(text)
+const PlotVisible = createContext(true)
 const PriceCountdown = memo(function PriceCountdown({ hour, intervalMS, x, y }: { hour: number; intervalMS: number; x: number; y: number }) {
   const [now, setNow] = useState(Date.now)
+  const visible = useContext(PlotVisible)
   useEffect(() => {
+    if (!visible) return
+    setNow(Date.now())
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
     return () => window.clearInterval(timer)
-  }, [])
+  }, [visible])
   const seconds = Math.max(0, Math.floor((hour + intervalMS - now) / 1000))
   const value = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`
   return <text data-chart-countdown x={x} y={y} dominantBaseline="middle" fill="var(--muted-foreground)">{value}</text>
@@ -73,7 +78,7 @@ const sourceStatusText = (label: string, state: PreparedChartState, status?: Cha
   if (state === 'unavailable') return status?.reason === 'unsupported' ? `${label} history is unsupported` : `${label} is not published for part of this range`
   return ''
 }
-const chartGeometry = createChartGeometryCache(legendWidth)
+const chartPlot = createChartPlotCache(legendWidth)
 
 export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = false, inspected, oiState = 'ready', takerState = 'ready', oiStatus, takerStatus }: { bars: readonly Bar[]; geometry: ChartGeometry; liveBar: Bar; liveOverlay?: boolean; inspected: number | null; oiState?: PreparedChartState; takerState?: PreparedChartState; oiStatus?: ChartSourceStatus; takerStatus?: ChartSourceStatus }) {
   const areaClipId = useId().replaceAll(":", "")
@@ -126,7 +131,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   }
   return <>
     <defs>
-      <pattern id="sell-hatch" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <pattern id={`${areaClipId}-sell-hatch`} width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
         <line x1="0" x2="0" y1="0" y2="4" stroke="var(--background)" opacity="0.55" />
       </pattern>
       <clipPath id={`${areaClipId}-positive`}><rect x={columns.roc[0]} y={panels.roc[0]} width={columns.roc[1] - columns.roc[0]} height={rocZeroY - panels.roc[0]} /></clipPath>
@@ -157,7 +162,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     <g data-chart-taker={takerComplete ? "complete" : takerAvailable ? "partial" : "empty"} data-chart-taker-state={takerState}>
       <path data-chart-taker-buy-samples={geometry.buySamples} d={buys} fill="var(--positive)" stroke="var(--foreground)" opacity="0.9" />
       <path data-chart-taker-sell-samples={geometry.sellSamples} d={sells} fill="var(--negative)" stroke="var(--foreground)" opacity="0.9" />
-      <path d={sells} fill="url(#sell-hatch)" opacity="0.7" />
+      <path d={sells} fill={`url(#${areaClipId}-sell-hatch)`} opacity="0.7" />
     </g>
     {lineStroke("bollUpper", lines.bollUpper, "var(--chart-1)")}
     {lineStroke("bollMiddle", lines.bollMiddle, "var(--chart-1)")}
@@ -205,7 +210,40 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   })
 })
 
-export function MarketChart({ instId, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect }: { instId: string; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
+type PlotSize = { width: number; height: number }
+type RenderReady = (instId: string, timeframe: RadarTimeframe) => (() => void)
+
+/** Every candidate owns a mounted SVG. Selection changes visibility, not paths. */
+const PreparedPlot = memo(function PreparedPlot({ instId, timeframe, size, selected, inspected, onReady, navigationSurface }: {
+  instId: string; timeframe: RadarTimeframe; size: PlotSize; selected: boolean; inspected: number | null
+  onReady?: RenderReady; navigationSurface?: ReadyChartWindow
+}) {
+  const latest = useSyncExternalStore(chartController.store.subscribe, () => chartController.store.window(instId, timeframe))
+  const surface = navigationSurface ?? latest
+  const plot = chartPlot(surface, size)
+  const ready = !navigationSurface && chartReadyForListing(surface) && Boolean(plot)
+  useLayoutEffect(() => {
+    if (ready) return onReady?.(instId, timeframe)
+  }, [ready, instId, timeframe, size.width, size.height, onReady])
+  if (!surface || !plot) return null
+  const { bars, geometry } = plot
+  return <PlotVisible value={selected}>
+    <svg strokeWidth="var(--chart-line-width)" data-prepared-chart-inst={instId} data-prepared-chart-timeframe={timeframe}
+      data-prepared-chart-ready={ready} data-prepared-indicator-state={surface.indicatorState} data-prepared-oi-state={surface.oiState} data-prepared-taker-state={surface.takerState}
+      data-rendered-inst={selected ? instId : undefined} data-rendered-timeframe={selected ? timeframe : undefined}
+      data-rendered-start={bars[0]!.hour} data-rendered-end={bars.at(-1)!.hour}
+      viewBox={`0 0 ${size.width} ${size.height}`} aria-hidden={!selected}
+      style={{ visibility: selected ? 'visible' : 'hidden' }}
+      className={cn('absolute inset-0 h-full w-full text-[length:var(--chart-text-size)] select-none focus-visible:outline-2 focus-visible:outline-ring', !selected && 'pointer-events-none')}
+      role="img" tabIndex={selected ? 0 : -1}
+      aria-label={`${instId} ${bars.length}-candle ${timeframeLabel(timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end. Scroll to review history. Arrow keys navigate markets.`}>
+      <Plot bars={bars} geometry={geometry} liveBar={surface.liveBar ?? bars.at(-1)!} liveOverlay={!!surface.liveBar}
+        inspected={selected ? inspected : null} oiState={surface.oiState} takerState={surface.takerState} oiStatus={surface.oiStatus} takerStatus={surface.takerStatus} />
+    </svg>
+  </PlotVisible>
+})
+
+export function MarketChart({ instId, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, candidateIds = listOrder, onRenderReady, turnoverOrder, onSelect }: { instId: string; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; onRenderReady?: RenderReady; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
   const view = useSyncExternalStore(chartController.subscribe, chartController.getSnapshot)
   useLayoutEffect(() => {
     if (!isActive) return
@@ -217,8 +255,6 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
   const pending = view.pending || !matchesSelection
   const unavailable = view.requested?.instId === instId && view.requested.timeframe === timeframe ? view.unavailable : null
   const unavailableText = unavailable ? `${instId.replace(/-SWAP$/, '')} has ${unavailable.availableCandles} completed ${timeframeLabel(timeframe)} candles. A complete chart requires ${unavailable.requiredCandles}.` : ''
-  const confirmedBars = surface?.bars ?? EMPTY_BARS, formingBar = surface?.liveBar
-  const bars = useMemo(() => formingBar ? [...confirmedBars.filter(bar => bar.hour < formingBar.hour), formingBar].slice(-96) : confirmedBars, [confirmedBars, formingBar])
   const intervalMS = surface?.intervalMS ?? timeframeMilliseconds(timeframe)
   const displayedId = surface?.instId ?? instId
   const displayedFrame = surface?.timeframe ?? timeframe
@@ -228,10 +264,12 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
   const chartRef = useRef<HTMLElement>(null)
   const plotRef = useRef<HTMLDivElement>(null)
   const [plotSize, setPlotSize] = useState({ width: 0, height: 0 })
-  const plotEnd = bars.at(-1)?.hour ?? 0
-  const plotLive = surface?.liveBar ?? bars.at(-1)
-  const plotGeometry = bars.length && plotSize.width > 0 ? chartGeometry(bars, { ...plotSize, endHour: plotEnd, intervalMS,
-    liveClose: plotLive && plotLive.hour <= plotEnd + (surface?.liveBar ? intervalMS : 0) ? plotLive.close : undefined }) : null
+  const preparedPlot = chartPlot(surface, plotSize)
+  const bars = preparedPlot?.bars ?? surface?.bars ?? EMPTY_BARS
+  const plotGeometry = preparedPlot?.geometry ?? null
+  const latestSurface = surface ? chartController.store.window(surface.instId, surface.timeframe) : null
+  const navigationSurface = surface && surface !== latestSurface ? surface : undefined
+  const plotCandidates = candidateIds.includes(displayedId) ? candidateIds : [...candidateIds, displayedId]
   const [inspection, setInspection] = useState<{ instId: string; timeframe: RadarTimeframe; hour: number } | null>(null)
   const inspectedIndex = inspection?.instId === surface?.instId && inspection?.timeframe === surface?.timeframe ? bars.findIndex(bar => bar.hour === inspection?.hour) : -1
   const inspected = inspectedIndex >= 0 ? inspectedIndex : null
@@ -415,21 +453,26 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
         {([['Open', active.open], ['High', active.high], ['Low', active.low], ['Close', active.close]] as const).map(([label, value]) => <div key={label} data-chart-ohlc={label.toLowerCase()} className="min-w-0"><span className="text-muted-foreground">{label} </span><span title={price(value)}>{price(value)}</span></div>)}
         <span data-chart-price-scale={priceScale} className="ml-auto text-muted-foreground" title={priceScale === 'linear' ? 'Linear scale · BOLL includes zero or negative values' : 'Logarithmic price scale'}>{priceScale === 'linear' ? 'Linear' : 'Log'}</span>
       </div>}
-      <div ref={plotRef} data-chart-plot className="relative min-h-0 flex-1 overflow-hidden" onWheel={event => {
+      <div ref={plotRef} data-chart-plot className="relative min-h-0 flex-1 overflow-hidden" onPointerDown={event => {
+        const target = (event.target as Element).closest<SVGSVGElement>('svg[data-rendered-inst]')
+        if (!matchesSelection || !target || event.button !== 0 || heldPointer.current) return
+        event.preventDefault(); target.setPointerCapture(event.pointerId)
+        heldPointer.current = { pointerId: event.pointerId, target }
+        inspectAt(target, event.clientX)
+      }} onPointerUp={endInspection} onPointerCancel={endInspection} onLostPointerCapture={endInspection} onPointerMove={event => {
+        const held = heldPointer.current
+        if (!matchesSelection || held?.pointerId !== event.pointerId) return
+        if (!(event.buttons & 1)) { endInspection(); return }
+        inspectAt(held.target, event.clientX)
+      }} onWheel={event => {
         if (analysis?.phase === 'capturing') return
         const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : -event.deltaY
         queueWheel(delta * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 240 : 1))
       }}>
-        {surface && plotGeometry && bars.length > 0 && plotSize.width > 0 ? <svg key={surface.key} strokeWidth="var(--chart-line-width)" data-rendered-inst={surface.instId} data-rendered-timeframe={surface.timeframe} data-rendered-start={bars[0]!.hour} data-rendered-end={bars.at(-1)!.hour} viewBox={`0 0 ${plotSize.width} ${plotSize.height}`} className={cn('absolute inset-0 h-full w-full text-[length:var(--chart-text-size)] select-none focus-visible:outline-2 focus-visible:outline-ring', !matchesSelection && 'pointer-events-none')} role="img" tabIndex={matchesSelection ? 0 : -1} aria-label={`${surface.instId} ${bars.length}-candle ${timeframeLabel(surface.timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end. Scroll to review history. Arrow keys navigate markets.`} onPointerDown={event => {
-          if (!matchesSelection || event.button !== 0 || heldPointer.current) return
-          event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId)
-          heldPointer.current = { pointerId: event.pointerId, target: event.currentTarget }
-          inspectAt(event.currentTarget, event.clientX)
-        }} onPointerUp={endInspection} onPointerCancel={endInspection} onLostPointerCapture={endInspection} onPointerMove={event => {
-          if (!matchesSelection || heldPointer.current?.pointerId !== event.pointerId) return
-          if (!(event.buttons & 1)) { endInspection(); return }
-          inspectAt(event.currentTarget, event.clientX)
-        }}><Plot bars={bars} geometry={plotGeometry} liveBar={surface.liveBar ?? bars.at(-1)!} liveOverlay={!!surface.liveBar} inspected={inspected} oiState={oiState} takerState={takerState} oiStatus={surface.oiStatus} takerStatus={surface.takerStatus} /></svg> : null}
+        {plotCandidates.map(id => <PreparedPlot key={`${timeframe}:${id}`} instId={id} timeframe={timeframe} size={plotSize}
+          selected={matchesSelection && !navigationSurface && id === displayedId} inspected={id === displayedId ? inspected : null} onReady={onRenderReady} />)}
+        {navigationSurface && <PreparedPlot key="navigation" instId={navigationSurface.instId} timeframe={navigationSurface.timeframe}
+          size={plotSize} selected={true} inspected={inspected} navigationSurface={navigationSurface} />}
       </div>
       {captureStatus === 'flashing' && <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
     </section>

@@ -225,6 +225,7 @@ test('cached catalog projection retains statistics while the list shows contract
 
   // Reload so React obtains the row through the same initial snapshot read as
   // an app user, then inspect the rendered table instead of the IPC object.
+  await request({ preferences: { action: 'update', values: { chartTimeframe: fixture.timeframe } } })
   await page.reload({ waitUntil: 'domcontentloaded' })
   const market = page.locator(`[aria-label="View ${fixture.instId} chart"]`)
   await market.waitFor({ state: 'visible', timeout: 10_000 })
@@ -245,6 +246,7 @@ test('a restarted desktop restores cached catalog readings before a live scan co
   // recreate the entire Electron process to cover the production startup path,
   // rather than a renderer reload against an already-warm main process.
   const fixture = await request({ e2e: { action: 'seedCachedListProjection' } })
+  await request({ preferences: { action: 'update', values: { chartTimeframe: fixture.timeframe } } })
   await electron.close()
   await launchElectron(true)
 
@@ -298,7 +300,7 @@ test('ATR% and BBW share the panel between RSI and OI with independent fitted sc
   const originalViewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }))
   await page.setViewportSize({ width: 1_600, height: 1_000 })
   await openChart(page, fixture)
-  const legendValue = label => page.locator(`[data-chart-legend="${label}"]`).evaluate(line => line.parentElement.querySelectorAll('text')[1].textContent)
+  const legendValue = label => page.locator(`svg[data-rendered-inst] [data-chart-legend="${label}"]`).evaluate(line => line.parentElement.querySelectorAll('text')[1].textContent)
   try {
     for (const timeframe of fixture.timeframes) {
       await selectTimeframe(page, timeframe)
@@ -385,7 +387,7 @@ test('the paint probe catches changed indicator geometry without a new snapshot 
     const observation = await page.evaluate(async instId => {
       const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
       const snapshot = chart.__chartSnapshot
-      const path = chart.querySelector('[data-chart-indicator="rsi12"]')
+      const path = chart.querySelector('svg[data-rendered-inst] [data-chart-indicator="rsi12"]')
       const original = path.getAttribute('d')
       const initiallyValid = window.__chartPaintProbe.errors.length === 0
       try {
@@ -654,7 +656,7 @@ test('the live price overlay follows its actual price without changing the 96 co
     assert.notEqual(overlay.countdownFill, overlay.labelFill)
     await wheelBurst(page, { deltaY: 12 })
     await waitForRendered(page, fixture, fixture.timeframe, fixture.end - fixture.intervalMS)
-    assert.equal(await page.locator('[data-chart-countdown]').count(), 0, 'Historical charts must not display a live countdown.')
+    assert.equal(await page.locator('svg[data-rendered-inst] [data-chart-countdown]').count(), 0, 'Historical charts must not display a live countdown.')
     assert.equal(await page.evaluate(() => document.querySelector('[data-chart-inst]').__chartSnapshot.liveBar), undefined)
     assertCompletePaints(await finishPaintProbe(page))
   } finally {
@@ -833,12 +835,14 @@ test('known RSI, ATR% and BBW segments remain visible through indicator warm-up 
   }
 })
 
-test('a listing with twelve prices remains usable while statistics are unknown', async () => {
+test('a short listing remains usable while waiting for its chart to qualify for list admission', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   await installPreparedTransform({ mode: 'partial', instId: fixture.instId, end: fixture.end, intervalMS: fixture.intervalMS })
   try {
     await page.reload({ waitUntil: 'domcontentloaded' })
-    await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click()
+    await page.locator(`[data-chart-inst="${fixture.instId}"]`).waitFor({ state: 'visible' })
+    assert.equal(await page.locator(`[aria-label="View ${fixture.instId} chart"]`).count(), 0,
+      'Unknown statistic panels keep the candidate out of the ready chart list.')
     await selectTimeframe(page, fixture.timeframe)
     const chart = page.locator(`[data-chart-inst="${fixture.instId}"]`)
     await page.waitForFunction(() => document.querySelector('[data-chart-inst]')?.dataset.chartRenderedBars === '12')
@@ -861,7 +865,7 @@ test('historically unavailable statistics remain missing instead of becoming fal
   assert.equal(await chart.getAttribute('data-chart-taker-state'), 'unavailable')
   assert.equal(await chart.getAttribute('data-chart-oi-samples'), '0')
   assert.equal(await chart.getAttribute('data-chart-taker-samples'), '0')
-  assert.equal(await chart.locator('[data-chart-taker="empty"]').count(), 1)
+  assert.equal(await chart.locator('svg[data-rendered-inst] [data-chart-taker="empty"]').count(), 1)
   const status = chart.locator('[data-chart-status]')
   assert.equal(await status.getByText('OI is not published for part of this range', { exact: true }).count(), 1)
   assert.equal(await status.getByText('Taker is not published for part of this range', { exact: true }).count(), 1)

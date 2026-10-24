@@ -448,13 +448,12 @@ test('subscription changes immediately republish quote status from cached projec
   } finally { await pipeline.dispose() }
 })
 
-test('candidate subscription and renderer admission perform no eager source restoration', async () => {
+test('collector subscriptions perform no eager source restoration', async () => {
   const { pipeline, store } = fixture()
   try {
     const ids = Array.from({ length: 287 }, (_, i) => `CANDIDATE${i}-USDT-SWAP`)
     pipeline.setRealtimeSubscriptions(ids.flatMap(instId => ['5m', '15m', '1H'].map(timeframe => ({ instId, timeframe }))))
-    const response = await pipeline.setUniverse(ids, '15m', ids[0])
-    assert.deepEqual(response, { frames: [] }); assert.equal(pipeline.realtimeKeys.size, 861)
+    assert.equal(pipeline.realtimeKeys.size, 861)
     assert.equal(store.queries.length, 0); assert.equal(pipeline.nextCalculation, 0); assert.equal(pipeline.series.size, 0)
   } finally { await pipeline.dispose() }
 })
@@ -464,7 +463,6 @@ test('full-universe forming intake retains raw prices without publishing charts 
   const ids = Array.from({ length: 287 }, (_, index) => `CANDIDATE${index}-USDT-SWAP`)
   const timeframes = [['5m', 300000], ['15m', 900000], ['1H', 3600000]] as const
   pipeline.setRealtimeSubscriptions(ids.flatMap(instId => timeframes.map(([timeframe]) => ({ instId, timeframe }))))
-  pipeline.setUniverse(ids, '15m')
   pipeline.subscribe((frame: any) => frames.push(frame))
   const unsubscribe = attachOperationSink(operation => operations.push(operation))
   const tick = async (sequence: number) => {
@@ -492,6 +490,9 @@ test('full-universe forming intake retains raw prices without publishing charts 
     assert.equal(frames[0].timeframe, '1H')
     assert.equal(frames[0].liveBar.close, 161.178)
     assert.equal(operations.filter(operation => operation.name === 'chart.frame').length, 1)
+    pipeline.setUniverse([selected], '1H')
+    await new Promise<void>(resolve => setImmediate(resolve))
+    await Promise.all([...pipeline.candidateTasks.values()])
     pipeline.maxSeries = 1
     await pipeline.local(ids[179], '5m')
     assert.equal(pipeline.series.has(`${selected}:1H`), false)
@@ -507,7 +508,6 @@ test('full-universe forming intake retains raw prices without publishing charts 
 
 test('list-indicator reuse cannot materialize chart snapshots or notifications before a chart is opened', async () => {
   const { pipeline } = fixture(), frames: any[] = []
-  pipeline.setUniverse([instId], '15m')
   pipeline.subscribe((frame: any) => frames.push(frame))
   try {
     const projected = await pipeline.projectListSeries(instId, '15m')
@@ -1663,7 +1663,6 @@ test('cached successful-empty and numeric statistics acquire no new source data 
     assert.equal(old.takerState, 'ready'); assert.equal(requests, 0)
   } finally { await pipeline.dispose() }
 })
-
 
 test('offscreen statistic absence expires and revalidates only its native slots without another gesture', async context => {
   const now = Math.floor(Date.now() / interval) * interval + 1000

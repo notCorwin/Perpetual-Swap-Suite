@@ -23,7 +23,7 @@ export class PreparedChartPipeline {
     /** Acknowledged current candle subscription; persisted coverage is checked separately. */
     streaming?(instId: string, timeframe: HistoryTimeframe): boolean
   })
-  /** Replace source ownership, including when navigation is entirely resident; null releases chart demand. */
+  /** Replace selected source ownership; candidate preparation remains independently owned by setUniverse. */
   setFocus(target: { instId: string; timeframe: HistoryTimeframe; endHour?: number } | null, id?: string): void
   prepare(instId: string, timeframe: HistoryTimeframe, targetEnd?: number, historyBars?: number, options?: { focusId?: string }): Promise<PreparedChartResponse>
   local(instId: string, timeframe: HistoryTimeframe, options?: { priority?: HistoryPriority; focusId?: string }): Promise<PreparedChartResponse | null>
@@ -32,7 +32,7 @@ export class PreparedChartPipeline {
   projectSeries(instId: string, timeframe: HistoryTimeframe): Promise<{ end: number | null; bars: Bar[] }>
   /** Bounded canonical tail plus the untruncated BOLL expansion run for list metrics. */
   projectListSeries(instId: string, timeframe: HistoryTimeframe): Promise<{ end: number | null; bars: Bar[]; bollExpansion: { hours: number; complete: boolean } | null }>
-  /** Set renderer priorities and return all cached native frames for its contracts. */
+  /** Return cached current-timeframe frames immediately and prepare every candidate asynchronously with bounded concurrency; readiness publishes through subscribe. */
   setUniverse(instIds: string[], timeframe: HistoryTimeframe, focusInstId?: string): { frames: PreparedChartResponse[] }
   /** Lightweight collector membership; this never restores or prepares candidate charts. */
   setRealtimeSubscriptions(subscriptions: { instId: string; timeframe: HistoryTimeframe }[]): void

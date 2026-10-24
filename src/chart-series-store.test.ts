@@ -533,14 +533,17 @@ test('complete cache eviction retains the session generation watermark against l
 })
 
 
-test('latest candidate frames obey a byte budget independently of candidate membership', () => {
+test('rendered candidates retain compact inputs under byte pressure and release them with membership', () => {
   const store = new PreparedChartStore({ maxBytes: 300_000 })
   const ids = Array.from({ length: 80 }, (_, index) => `BYTE${index}-USDT-SWAP`)
   store.setUniverse(ids, '1H', ids[0])
   for (const id of ids) store.ingestLatest(response(bars(104, 96), { instId: id }))
-  assert.ok(store.latestSize <= 5, 'Pinned candidate membership cannot make history retention grow without a byte limit.')
+  assert.equal(store.latestSize, ids.length, 'Every listed chart retains its compact inputs independently of the history budget.')
+  assert.equal(store.size, 0, 'Candidate residency must not pin deep histories.')
   assert.ok(store.window(ids[0], '1H'), 'The selected frame survives background candidate pressure.')
-  assert.equal(store.window(ids[1], '1H'), null, 'Evicted price windows are restored through a bounded local query.')
+  assert.ok(store.window(ids[1], '1H'), 'An unselected listed chart cannot be evicted and reconstructed on selection.')
+  store.setUniverse([ids[0]], '1H', ids[0])
+  assert.equal(store.latestSize, 1, 'Removing candidates releases their compact working set.')
 })
 
 test('live freshness metadata reaches retained history and an old bulk read cannot rewind it', () => {
@@ -671,10 +674,13 @@ test('repeated full and compact forming frames preserve the byte budget and evic
   assert.equal(store.size, 0); assert.equal(store.latestSize, 2)
   assert.ok(store.window(eth, '1H'), 'Repeated updates of the same completed payload cannot accumulate byte charges.')
   store.ingestLatest(response(completed, { instId: sol }))
-  assert.equal(store.latestSize, 2)
+  assert.equal(store.latestSize, 3)
   assert.ok(store.window(instId, '1H'), 'The active compact frame stays pinned.')
-  assert.equal(store.window(eth, '1H'), null)
+  assert.ok(store.window(eth, '1H'), 'Every rendered candidate stays resident under pressure.')
   assert.ok(store.window(sol, '1H'))
+  store.setUniverse([instId, sol], '1H', instId)
+  assert.equal(store.latestSize, 2)
+  assert.equal(store.window(eth, '1H'), null)
 })
 
 

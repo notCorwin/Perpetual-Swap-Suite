@@ -7,11 +7,12 @@ import { compareRankingChange } from './market-ranking.ts'
 import { MarketRowsBuffer } from './market-snapshot.ts'
 import { DEFAULT_PREFERENCES, type Preferences } from './renderer-preferences.ts'
 import { SnapshotOrder } from './snapshot-order.ts'
+import { chartRenderKey, RenderedChartRegistry } from './chart-render.ts'
 import type { RankedMarketRow } from './desktop-contract.ts'
 import type { RadarTimeframe } from './timeframe.ts'
 
 type View = {
-  preferences: Preferences; rows: RankedMarketRow[]; ready: boolean; status: string; error: string
+  preferences: Preferences; rows: RankedMarketRow[]; listed: RankedMarketRow[]; renderedCharts: RenderedChartRegistry; ready: boolean; status: string; error: string
   selectedID: string | null
   savePreferences(values: Partial<Preferences>): Promise<void>
   changeTimeframe(timeframe: RadarTimeframe): void
@@ -31,7 +32,7 @@ const declarations = ast.program.body.filter(node => node.type === 'VariableDecl
 const logic = stripTypeScriptTypes([
   ...declarations.map(node => source.slice(node.start!, node.end!)),
   source.slice(component.start!, renderReturn.start!),
-  'return { preferences, rows, ready, status, error, selectedID, savePreferences, changeTimeframe } }',
+  'return { preferences, rows, listed, renderedCharts, ready, status, error, selectedID, savePreferences, changeTimeframe } }',
 ].join('\n'))
 
 function fixture(snapshotFailure = false) {
@@ -71,14 +72,14 @@ function fixture(snapshotFailure = false) {
   function slot() { return slots[cursor++] ?? (slots[cursor - 1] = {}) }
   const changed = (previous: unknown[] | undefined, next: unknown[]) => !previous || previous.length !== next.length || next.some((value, index) => !Object.is(value, previous[index]))
   const environment = {
-    window, document, DEFAULT_PREFERENCES, SnapshotOrder, compareRankingChange, MarketRowsBuffer,
+    window, document, DEFAULT_PREFERENCES, SnapshotOrder, compareRankingChange, MarketRowsBuffer, chartRenderKey, RenderedChartRegistry,
     performance: { now: () => now },
     chartController: { ingestPrepared() {}, getSnapshot: () => ({}), setUniverse: (...args: unknown[]) => { universeRequests.push(args) } },
     useSettingsSection: () => null,
     useRef<T>(initial: T) { const current = slot(); return current.value ??= { current: initial } },
     useState<T>(initial: T) {
       const current = slot()
-      if (!('value' in current)) current.value = initial
+      if (!('value' in current)) current.value = typeof initial === 'function' ? (initial as () => T)() : initial
       return [current.value, (value: T | ((previous: T) => T)) => {
         const next = typeof value === 'function' ? (value as (previous: T) => T)(current.value as T) : value
         if (!Object.is(current.value, next)) { current.value = next; dirty = true }
@@ -90,6 +91,10 @@ function fixture(snapshotFailure = false) {
       return current.value
     },
     useCallback<T>(callback: T, dependencies: unknown[]) { return environment.useMemo(() => callback, dependencies) },
+    useSyncExternalStore(subscribe: (listener: () => void) => () => void, read: () => unknown) {
+      environment.useEffect(() => subscribe(() => { dirty = true }), [subscribe])
+      return read()
+    },
     useEffect(setup: () => void | (() => void), dependencies: unknown[]) {
       const current = slot()
       if (changed(current.dependencies, dependencies)) {
@@ -266,4 +271,40 @@ test('an early timer rearms until the full removal delay has elapsed', async con
   app.advance(1); await app.flush()
   assert.deepEqual(app.view.rows, [])
   assert.equal(app.pendingTimers, 0)
+})
+
+
+test('list candidates stay subscribed but are exposed only after their timeframe SVG commits', async context => {
+  const app = fixture(); context.after(() => app.close())
+  await app.flush()
+  const id = app.state.rows[0].instId
+  assert.deepEqual(app.view.listed, [])
+  assert.deepEqual(app.universeRequests.at(-1)![0], [id], 'Unrendered candidates still drive background preparation.')
+  const release = app.view.renderedCharts.register(id, '15m')
+  await app.flush()
+  assert.deepEqual((app.view.listed as RankedMarketRow[]).map(row => row.instId), [id])
+  app.view.changeTimeframe('1H'); await app.flush()
+  assert.deepEqual(app.view.listed, [], 'The previous timeframe cannot admit an unrendered chart.')
+  const releaseHour = app.view.renderedCharts.register(id, '1H')
+  await app.flush()
+  assert.deepEqual((app.view.listed as RankedMarketRow[]).map(row => row.instId), [id])
+  releaseHour(); await app.flush()
+  assert.deepEqual(app.view.listed, [], 'Evicted SVGs immediately revoke their list admission.')
+  release()
+})
+
+
+test('a selected candidate retains its chart when its render receipt is renewed', async context => {
+  const app = fixture(); context.after(() => app.close())
+  const id = app.state.rows[0].instId, other = 'ETH-USDT-SWAP'
+  app.state.rows.push({ ...app.state.rows[0], instId: other, rankingChange: 1 })
+  await app.flush()
+  const release = app.view.renderedCharts.register(id, '15m')
+  const releaseOther = app.view.renderedCharts.register(other, '15m')
+  await app.flush()
+  assert.equal(app.view.selectedID, id)
+  release(); await app.flush()
+  assert.deepEqual((app.view.listed as RankedMarketRow[]).map(row => row.instId), [other])
+  assert.equal(app.view.selectedID, id, 'A temporary calculation gap cannot move selection or discard its historical cursor.')
+  releaseOther()
 })

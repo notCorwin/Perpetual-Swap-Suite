@@ -1004,9 +1004,11 @@ test('cached native prices switch synchronously while selected-series hydration 
     assert.equal(controller.getSnapshot().pending, false)
     assert.ok(localCalls > 0 && localCalls <= 8, 'Rapid selections coalesce bounded local reads instead of warming every candidate.')
     assert.equal(historyCalls, 0, 'Selection and timeframe changes do not serialize deep history.')
-    await controller.setUniverse(ids.toReversed(), '1H')
+    const admitted = universeCalls
+    await controller.setUniverse(ids, '1H')
     await settled()
-    assert.equal(universeCalls, 1, 'Live list reordering must not serialize the whole prepared universe again.')
+    assert.equal(universeCalls, admitted, 'Live list reordering must not serialize the whole prepared universe again.')
+    assert.equal(universeCalls, 4, 'Each timeframe change admits its own background chart demand.')
     assert.equal(queue.calls.length, 0, 'Warm latest selection does not request history or provider preparation.')
   } finally { releases.forEach(release => release()) }
 })
@@ -1051,7 +1053,9 @@ test('a failed universe handshake can retry unchanged membership without restart
   try {
     assert.equal(controller.getSnapshot().pending, false)
     await controller.setUniverse([btc], '15m')
-    assert.equal(handshakes, 2, 'Healthy membership does not resubscribe when changing native periods.')
+    assert.equal(handshakes, 3, 'Changing timeframe must move background preparation even at unchanged membership.')
+    await controller.setUniverse([btc], '15m')
+    assert.equal(handshakes, 3, 'Unchanged membership and timeframe reuse the successful handshake.')
     assert.equal(queue.calls.length, 0)
   } finally { close() }
 })
