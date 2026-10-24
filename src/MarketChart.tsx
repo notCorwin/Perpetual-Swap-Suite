@@ -137,7 +137,8 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       <path d={area} fill="var(--chart-roc-positive-area)" clipPath={`url(#${areaClipId}-positive)`} />
       <path d={area} fill="var(--chart-roc-negative-area)" clipPath={`url(#${areaClipId}-negative)`} />
     </g>)}
-    <rect x={columns.rsi[0]} y={rsiY(70)} width={columns.rsi[1] - columns.rsi[0]} height={rsiY(30) - rsiY(70)} fill="var(--chart-rsi-area)" />
+    <rect x={columns.rsi[0]} y={rsiY(100)} width={columns.rsi[1] - columns.rsi[0]} height={rsiY(70) - rsiY(100)} fill="var(--chart-rsi-area)" />
+    <rect x={columns.rsi[0]} y={rsiY(30)} width={columns.rsi[1] - columns.rsi[0]} height={rsiY(0) - rsiY(30)} fill="var(--chart-rsi-area)" />
     {grid}
     {rocZeroY > panels.roc[0] && rocZeroY < panels.roc[1] && <line x1={columns.roc[0]} x2={columns.roc[1]} y1={rocZeroY} y2={rocZeroY} stroke="var(--muted-foreground)" strokeOpacity="0.5" />}
     {bars.flatMap((bar, index) => (bar.hour - firstHour) % (12 * intervalMS) === 0 ? panelKeys.map(key => <line key={`${(bar.hour - firstHour) / intervalMS}-${key}`} x1={x[index]} x2={x[index]} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--border)" strokeOpacity="0.22" />) : [])}
