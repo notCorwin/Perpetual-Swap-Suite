@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { reconcileMarketRows } from "./market-snapshot.ts"
+import { MarketRowsBuffer, reconcileMarketRows } from "./market-snapshot.ts"
 import type { NativeMarketRow } from "./market-row.ts"
 
 test("bridge refreshes keep unchanged row identities while updating changed readings and opportunity", () => {
@@ -25,4 +25,33 @@ test("bridge refreshes keep unchanged row identities while updating changed read
   assert.equal(next[1].oiChange, -4)
   assert.equal(next[2].opportunity.score, 21)
   assert.deepEqual(reconcileMarketRows(next, [incoming[2], incoming[0]]), [next[2], next[0]])
+})
+
+test('contracts expire independently and new qualifying contracts appear immediately', () => {
+  const buffer = new MarketRowsBuffer<NativeMarketRow>()
+  const first = { instId: 'BTC-USDT-SWAP' } as NativeMarketRow
+  const second = { instId: 'ETH-USDT-SWAP' } as NativeMarketRow
+  buffer.update([first, second], 0, 'live:15m')
+  assert.deepEqual(buffer.update([second], 1_000, 'live:15m'), [second, first])
+  assert.equal(buffer.nextRemovalAt, 31_000)
+  buffer.update([], 5_000, 'live:15m')
+  assert.deepEqual(buffer.expire(30_999), [second, first])
+  assert.deepEqual(buffer.expire(31_000), [second])
+  assert.equal(buffer.nextRemovalAt, 35_000)
+  const third = { instId: 'SOL-USDT-SWAP' } as NativeMarketRow
+  assert.deepEqual(buffer.update([third], 34_999, 'live:15m'), [third, second])
+  assert.deepEqual(buffer.expire(35_000), [third])
+  assert.equal(buffer.nextRemovalAt, null)
+})
+
+test('a delayed refresh expires missing rows and a new collector session drops stale rows', () => {
+  const buffer = new MarketRowsBuffer<NativeMarketRow>()
+  const row = { instId: 'BTC-USDT-SWAP' } as NativeMarketRow
+  buffer.update([row], 0, 'first:15m')
+  buffer.update([], 100, 'first:15m')
+  assert.deepEqual(buffer.update([], 30_100, 'first:15m'), [])
+  buffer.update([row], 30_101, 'first:15m')
+  buffer.update([], 30_102, 'first:15m')
+  assert.deepEqual(buffer.update([], 30_103, 'second:15m'), [])
+  assert.equal(buffer.nextRemovalAt, null)
 })

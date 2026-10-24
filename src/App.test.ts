@@ -4,7 +4,7 @@ import { stripTypeScriptTypes } from 'node:module'
 import test from 'node:test'
 import { parse } from '@babel/parser'
 import { compareRankingChange } from './market-ranking.ts'
-import { reconcileMarketRows } from './market-snapshot.ts'
+import { MarketRowsBuffer } from './market-snapshot.ts'
 import { DEFAULT_PREFERENCES, type Preferences } from './renderer-preferences.ts'
 import { SnapshotOrder } from './snapshot-order.ts'
 import type { RankedMarketRow } from './desktop-contract.ts'
@@ -12,6 +12,7 @@ import type { RadarTimeframe } from './timeframe.ts'
 
 type View = {
   preferences: Preferences; rows: RankedMarketRow[]; ready: boolean; status: string; error: string
+  selectedID: string | null
   savePreferences(values: Partial<Preferences>): Promise<void>
   changeTimeframe(timeframe: RadarTimeframe): void
 }
@@ -30,12 +31,13 @@ const declarations = ast.program.body.filter(node => node.type === 'VariableDecl
 const logic = stripTypeScriptTypes([
   ...declarations.map(node => source.slice(node.start!, node.end!)),
   source.slice(component.start!, renderReturn.start!),
-  'return { preferences, rows, ready, status, error, savePreferences, changeTimeframe } }',
+  'return { preferences, rows, ready, status, error, selectedID, savePreferences, changeTimeframe } }',
 ].join('\n'))
 
 function fixture(snapshotFailure = false) {
   const slots: Slot[] = [], effects: (() => void)[] = []
-  let cursor = 0, dirty = true, rendered: View, timers = 0
+  let cursor = 0, dirty = true, rendered: View, timers = 0, now = 0
+  const pendingTimers = new Map<number, { callback: () => void; at: number }>()
   const snapshotRequests: { timeframe: RadarTimeframe; sinceRevision: number }[] = []
   const universeRequests: unknown[][] = []
   const state = {
@@ -44,7 +46,8 @@ function fixture(snapshotFailure = false) {
     afterUpdate: undefined as undefined | (() => Promise<void>),
   }
   const window = Object.assign(new EventTarget(), {
-    setTimeout() { timers++; return 1 },
+    setTimeout(callback: () => void, delay: number) { const id = ++timers; pendingTimers.set(id, { callback, at: now + delay }); return id },
+    clearTimeout(id: number) { pendingTimers.delete(id) },
     radarDesktop: { async request(command: {
       preferences?: { action: string; values?: Partial<Preferences> }
       snapshot?: { timeframe: RadarTimeframe; sinceRevision: number }
@@ -68,8 +71,8 @@ function fixture(snapshotFailure = false) {
   function slot() { return slots[cursor++] ?? (slots[cursor - 1] = {}) }
   const changed = (previous: unknown[] | undefined, next: unknown[]) => !previous || previous.length !== next.length || next.some((value, index) => !Object.is(value, previous[index]))
   const environment = {
-    window, document, DEFAULT_PREFERENCES, SnapshotOrder, compareRankingChange, reconcileMarketRows,
-    clearTimeout() {},
+    window, document, DEFAULT_PREFERENCES, SnapshotOrder, compareRankingChange, MarketRowsBuffer,
+    performance: { now: () => now },
     chartController: { ingestPrepared() {}, getSnapshot: () => ({}), setUniverse: (...args: unknown[]) => { universeRequests.push(args) } },
     useSettingsSection: () => null,
     useRef<T>(initial: T) { const current = slot(); return current.value ??= { current: initial } },
@@ -100,6 +103,15 @@ function fixture(snapshotFailure = false) {
     state, snapshotRequests, universeRequests,
     get view() { return rendered },
     get timers() { return timers },
+    get pendingTimers() { return pendingTimers.size },
+    advance(milliseconds: number) {
+      now += milliseconds
+      for (const [id, timer] of pendingTimers) if (timer.at <= now) { pendingTimers.delete(id); timer.callback() }
+    },
+    fireTimerEarly() {
+      const [id, timer] = pendingTimers.entries().next().value!
+      pendingTimers.delete(id); timer.callback()
+    },
     notify() { window.dispatchEvent(new Event('radar-market-changed')) },
     async flush() {
       for (let pass = 0; pass < 8; pass++) {
@@ -174,4 +186,84 @@ test('local snapshot failures wait for a data-service notification without timed
   assert.equal(app.view.status, 'Live')
   assert.equal(app.view.error, '')
   assert.equal(app.view.ready, true)
+})
+
+test('missing contracts retain their chart and expire after 30 seconds without another snapshot', async context => {
+  const app = fixture(); context.after(() => app.close())
+  app.state.rows.push({ ...app.state.rows[0], instId: 'ETH-USDT-SWAP', rankingChange: 1 })
+  await app.flush()
+  assert.equal(app.view.selectedID, 'BTC-USDT-SWAP')
+  app.state.rows = [app.state.rows[1]]
+  app.state.revision++; app.notify(); await app.flush()
+  assert.equal(app.view.rows.length, 2)
+  assert.equal(app.view.selectedID, 'BTC-USDT-SWAP')
+  assert.ok((app.universeRequests.at(-1)![0] as string[]).includes('BTC-USDT-SWAP'))
+  assert.equal(app.pendingTimers, 1)
+
+  app.advance(10_000)
+  app.notify(); await app.flush() // An unchanged response cannot extend the deadline.
+  app.state.revision++; app.notify(); await app.flush() // Nor can another absence.
+  app.advance(19_999); await app.flush()
+  assert.equal(app.view.rows.length, 2)
+  const requests = app.snapshotRequests.length
+  app.advance(1); await app.flush()
+  assert.deepEqual(app.view.rows.map(row => row.instId), ['ETH-USDT-SWAP'])
+  assert.equal(app.view.selectedID, 'ETH-USDT-SWAP')
+  assert.deepEqual(app.universeRequests.at(-1)![0], ['ETH-USDT-SWAP'])
+  assert.equal(app.snapshotRequests.length, requests, 'Expiry only updates the local display; it must not poll the service.')
+  assert.equal(app.pendingTimers, 0)
+})
+
+test('reappearing contracts cancel eviction, update readings, and get a fresh buffer on the next absence', async context => {
+  const app = fixture(); context.after(() => app.close())
+  await app.flush()
+  const original = app.state.rows[0]
+  app.state.rows = []; app.state.revision++; app.notify(); await app.flush()
+  app.advance(29_999)
+  app.state.rows = [{ ...original, lastPrice: 123 }]
+  app.state.revision++; app.notify(); await app.flush()
+  assert.equal(app.view.rows[0].lastPrice, 123)
+  assert.equal(app.pendingTimers, 0)
+  app.advance(1); await app.flush()
+  assert.equal(app.view.rows.length, 1)
+  app.state.rows = []; app.state.revision++; app.notify(); await app.flush()
+  app.advance(29_999); await app.flush()
+  assert.equal(app.view.selectedID, original.instId)
+  app.advance(1); await app.flush()
+  assert.deepEqual(app.view.rows, [])
+  assert.equal(app.view.selectedID, null)
+  assert.deepEqual(app.universeRequests.at(-1)![0], [])
+})
+
+test('timeframe changes preserve the removal deadline and cleanup cancels pending eviction', async context => {
+  const app = fixture(); context.after(() => app.close())
+  await app.flush()
+  app.state.rows = []; app.state.revision++; app.notify(); await app.flush()
+  assert.equal(app.pendingTimers, 1)
+  app.advance(10_000)
+  app.view.changeTimeframe('1H'); await app.flush()
+  assert.equal(app.view.rows.length, 1)
+  assert.equal(app.pendingTimers, 1)
+  app.advance(20_000); await app.flush()
+  assert.deepEqual(app.view.rows, [])
+  assert.equal(app.pendingTimers, 0)
+  app.state.rows = [{ instId: 'ETH-USDT-SWAP', rankingChange: 1 }] as RankedMarketRow[]
+  app.state.revision++; app.notify(); await app.flush()
+  app.state.rows = []; app.state.revision++; app.notify(); await app.flush()
+  assert.equal(app.pendingTimers, 1)
+  app.close()
+  assert.equal(app.pendingTimers, 0)
+})
+
+test('an early timer rearms until the full removal delay has elapsed', async context => {
+  const app = fixture(); context.after(() => app.close())
+  await app.flush()
+  app.state.rows = []; app.state.revision++; app.notify(); await app.flush()
+  app.advance(29_999.5)
+  app.fireTimerEarly(); await app.flush()
+  assert.equal(app.view.rows.length, 1)
+  assert.equal(app.pendingTimers, 1)
+  app.advance(1); await app.flush()
+  assert.deepEqual(app.view.rows, [])
+  assert.equal(app.pendingTimers, 0)
 })

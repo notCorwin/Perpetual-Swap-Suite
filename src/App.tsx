@@ -12,7 +12,7 @@ import { WorkspaceSettings } from '@/WorkspaceSettings'
 import { settingsHref, useSettingsSection, type SettingsNavigationState } from '@/settings-navigation'
 import { chartController } from '@/chart-controller'
 import { compareRankingChange } from '@/market-ranking'
-import { reconcileMarketRows } from '@/market-snapshot'
+import { MarketRowsBuffer } from '@/market-snapshot'
 import { SnapshotOrder } from '@/snapshot-order'
 import { DEFAULT_PREFERENCES, type Preferences } from '@/renderer-preferences'
 import type { MarketSnapshot, RankedMarketRow, UnchangedSnapshot } from '@/desktop-contract'
@@ -64,6 +64,8 @@ function App() {
   const [preferencesLoaded, setPreferencesLoaded] = useState(false)
   const [preferencesError, setPreferencesError] = useState('')
   const [rows, setRows] = useState<RankedMarketRow[]>([])
+  const marketRows = useRef(new MarketRowsBuffer<RankedMarketRow>())
+  const [removalAt, setRemovalAt] = useState<number | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
   const [query, setQuery] = useState('')
   const [ready, setReady] = useState(false)
@@ -77,6 +79,22 @@ function App() {
   const snapshotInFlight = useRef<Promise<MarketSnapshot | UnchangedSnapshot> | null>(null)
   const preferenceWrite = useRef(0)
   const timeframe = preferences.chartTimeframe
+
+  useEffect(() => {
+    if (removalAt === null) return
+    let timer: number
+    const expire = () => {
+      const now = performance.now()
+      if (now < removalAt) {
+        timer = window.setTimeout(expire, Math.ceil(removalAt - now))
+        return
+      }
+      setRows(marketRows.current.expire(now))
+      setRemovalAt(marketRows.current.nextRemovalAt)
+    }
+    timer = window.setTimeout(expire, Math.max(0, Math.ceil(removalAt - performance.now())))
+    return () => window.clearTimeout(timer)
+  }, [removalAt])
 
   useEffect(() => {
     const receive = (event: Event) => chartController.ingestPrepared((event as CustomEvent<PreparedChartNotification>).detail)
@@ -123,16 +141,18 @@ function App() {
         if ((!snapshot.timeframe || snapshot.timeframe === timeframe) && order.current.accept(snapshot)) {
           revision.current = order.current.revision
           if (!('unchanged' in snapshot)) {
+            const buffered = marketRows.current.update(snapshot.rows, performance.now(), order.current.serviceSession ?? '')
             const unverified = snapshot.loading && qualificationPending(snapshot.catalogProgress) || snapshot.error || snapshot.catalogSource === 'none' || (snapshot.catalogProgress?.unknown ?? 0) > 0
             // Admit every native timeframe and recover missed startup pushes
             // before exposing selectable rows. This reads existing compact
             // frames; background history preparation remains independent.
-            const first = snapshot.rows.reduce<RankedMarketRow | null>((best, row) => !best || compareRankingChange(row, best) < 0 ? row : best, null)
-            const retained = !snapshot.rows.length && unverified ? chartController.getSnapshot().requested?.instId : undefined
-            void chartController.setUniverse(retained ? [retained] : snapshot.rows.map(row => row.instId), timeframe, retained ?? first?.instId)
+            const first = buffered.reduce<RankedMarketRow | null>((best, row) => !best || compareRankingChange(row, best) < 0 ? row : best, null)
+            const retained = !buffered.length && unverified ? chartController.getSnapshot().requested?.instId : undefined
+            void chartController.setUniverse(retained ? [retained] : buffered.map(row => row.instId), timeframe, retained ?? first?.instId)
             if (stopped) return
-            setRows(current => reconcileMarketRows(current, snapshot.rows) as RankedMarketRow[])
-            setSelected(current => snapshot.rows.some(row => row.instId === current) || (!snapshot.rows.length && unverified) ? current : snapshot.rows.reduce<RankedMarketRow | null>((first, row) => !first || compareRankingChange(row, first) < 0 ? row : first, null)?.instId ?? null)
+            setRows(buffered)
+            setRemovalAt(marketRows.current.nextRemovalAt)
+            setSelected(current => buffered.some(row => row.instId === current) || (!buffered.length && unverified) ? current : first?.instId ?? null)
             setReady(true)
           }
           setError(snapshot.error)
@@ -176,12 +196,12 @@ function App() {
     ? awaitingObservations ? 'Waiting for fresh observations. Market data collection continues in the background.' : catalog.catalogProgress?.total ? `Checking enabled conditions: ${catalog.catalogProgress.completed} / ${catalog.catalogProgress.total} contracts completed.` : 'The data service is preparing and verifying the market list.'
     : verificationUnavailable ? 'Market data could not verify the enabled conditions. Waiting for updated observations from the data service.' : 'Adjust the enabled liquidity conditions in Settings.'
   const noSearchMatch = Boolean(query.trim()) && rows.length > 0
-  // Only confirmed exclusions clear the chart. A temporary verification gap
-  // clears the qualified list while preserving the current chart and its state.
+  // After the list buffer expires, a verification gap still preserves the
+  // current chart until the service can confirm its exclusion.
   const selectedRow = rows.find(row => row.instId === selected) ?? ranked[0]
   const retainedChart = !rows.length && Boolean(selected) && (verifying || verificationUnavailable)
   const selectedID = selectedRow?.instId ?? (retainedChart ? selected : null)
-  useEffect(() => { if (ready && !rows.length && !verifying && !verificationUnavailable) setSelected(null) }, [ready, rows.length, verifying, verificationUnavailable])
+  useEffect(() => { if (ready && !retainedChart) setSelected(selectedRow?.instId ?? null) }, [ready, retainedChart, selectedRow?.instId])
   const listOrder = useMemo(() => ranked.map(row => row.instId), [ranked])
   const turnoverOrder = useMemo(() => [...rows].sort((a, b) => (b.turnover24hUSDT ?? -1) - (a.turnover24hUSDT ?? -1) || a.instId.localeCompare(b.instId, 'en')).map(row => row.instId), [rows])
   useEffect(() => { chartController.setUniverse(retainedChart && selectedID ? [selectedID] : ready ? listOrder : [], timeframe) }, [ready, listOrder, timeframe, retainedChart, selectedID])
