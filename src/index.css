@@ -191,11 +191,12 @@
 [data-analysis-answer], [data-analysis-answer] * { user-select: text; }
 [data-analysis-answer] [data-slot="table-container"] { overflow-x: auto; }
 
-[data-window-titlebar] {
+[data-window-drag-region] {
   app-region: drag;
+  user-select: none;
 }
 
-[data-window-titlebar] button, [data-window-titlebar] a {
+[data-window-drag-region] :is(button, a, input, select, textarea, [role="button"]) {
   app-region: no-drag;
 }
 

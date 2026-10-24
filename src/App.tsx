@@ -8,7 +8,6 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/u
 import { MarketChart } from '@/MarketChart'
 import { MarketRowsViewport } from '@/MarketRowsViewport'
 import { WorkspaceViewport } from '@/WorkspaceViewport'
-import { WindowTitleBar } from '@/WindowTitleBar'
 import { WorkspaceSettings } from '@/WorkspaceSettings'
 import { settingsHref, useSettingsSection, type SettingsNavigationState } from '@/settings-navigation'
 import { chartController } from '@/chart-controller'
@@ -232,11 +231,10 @@ function App() {
   }, [preferences.chartTimeframe, savePreferences])
 
   return <WorkspaceViewport>
-    <WindowTitleBar><a ref={settingsLauncher} href={settingsHref('workspace')} className={buttonVariants({ variant: 'ghost', size: 'sm' })}><Settings2 aria-hidden="true" data-icon="inline-start" />Settings</a></WindowTitleBar>
-    <div className="flex min-h-0 flex-1">
     <div hidden={settingsSection !== null} inert={settingsSection !== null} className={cn('h-full min-w-0 flex-1', settingsSection === null ? 'flex' : 'hidden')}>
     <aside data-market-list className="flex h-full w-[420px] shrink-0 flex-col border-r" aria-label="Contract list">
       <header className="flex flex-col gap-4 border-b p-4">
+        <div data-window-drag-region className="flex items-center justify-between gap-2"><h1 className="text-base font-semibold">Perpetual Swap Suite</h1><a ref={settingsLauncher} href={settingsHref('workspace')} className={buttonVariants({ variant: 'outline', size: 'sm' })}><Settings2 aria-hidden="true" data-icon="inline-start" />Settings</a></div>
         <Input aria-label="Search contracts" placeholder="Search contracts…" value={query} onChange={event => setQuery(event.target.value)} />
         <div className="flex items-center justify-between gap-2"><span className="text-xs text-muted-foreground">{query.trim() ? `${visible.length} / ${listed.length}` : listed.length} contracts</span><Badge variant="outline"><Radio aria-hidden="true" />{status}</Badge></div>
       </header>
@@ -258,7 +256,6 @@ function App() {
     </section>
     </div>
     {settingsSection && <WorkspaceSettings section={settingsSection} preferences={preferences} loaded={preferencesLoaded} loadError={preferencesError} onSave={savePreferences} onNavigationStateChange={updateSettingsGuard} />}
-    </div>
   </WorkspaceViewport>
 }
 export default App

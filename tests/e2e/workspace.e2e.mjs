@@ -236,6 +236,33 @@ test('default selection uses absolute completed-candle change with nulls last an
   await assertWorkspaceLayout(page)
 })
 
+test('the existing chart toolbar provides window dragging while its controls remain interactive', async () => {
+  const toolbar = page.locator('[data-chart-toolbar]')
+  await assertWorkspaceLayout(page)
+  assert.equal(await toolbar.evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'drag')
+  for (const name of ['5m', '15m', '1h', 'Copy chart', 'Analyze Long', 'Analyze Short']) {
+    assert.equal(await toolbar.getByRole('button', { name, exact: true }).evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
+  }
+  assert.equal(await toolbar.getByRole('heading').count(), 0, 'The toolbar must retain the original chart actions and status without an application title.')
+  const sidebar = page.getByRole('complementary', { name: 'Contract list' })
+  assert.equal(await sidebar.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).isVisible(), true)
+  await selectTimeframe(page, '5m')
+  await page.locator('svg[data-rendered-timeframe="5m"]').waitFor()
+  await toolbar.getByRole('button', { name: '15m', exact: true }).focus()
+  await page.keyboard.press('Enter')
+  await page.locator('svg[data-rendered-timeframe="15m"]').waitFor()
+  await toolbar.getByRole('button', { name: 'Copy chart', exact: true }).click()
+  await page.getByRole('status').filter({ hasText: 'Chart copied to clipboard' }).waitFor()
+  const settingsLink = sidebar.getByRole('link', { name: 'Settings', exact: true })
+  assert.equal(await settingsLink.evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
+  await settingsLink.click()
+  const settings = settingsPage()
+  await settings.waitFor({ state: 'visible' })
+  assert.equal(await settings.locator('header').evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'drag')
+  assert.equal(await settings.getByRole('link', { name: 'Back to markets', exact: true }).evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
+  await backToMarkets()
+})
+
 test('a prepared idle chart makes no periodic window requests and accepts a pushed forming candle', async () => {
   const chart = page.locator('[data-chart-inst="BETA-USDT-SWAP"]')
   await page.waitForFunction(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.dataset.chartLoading === 'false')

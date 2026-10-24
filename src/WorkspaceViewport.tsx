@@ -17,5 +17,5 @@ export function WorkspaceViewport({ children }: { children: ReactNode }) {
     document.body.style.setProperty("--workspace-height", `${viewport.height / scale}px`)
     return () => { document.body.style.removeProperty('zoom'); document.body.style.removeProperty('--workspace-height') }
   }, [scale, viewport.height])
-  return <div data-layout="market-workspace" data-design-width={WORKSPACE_DESIGN_WIDTH} data-ui-scale={scale} className="flex flex-col overflow-hidden" style={{ width: WORKSPACE_DESIGN_WIDTH, height: viewport.height / scale }}>{children}</div>
+  return <div data-layout="market-workspace" data-design-width={WORKSPACE_DESIGN_WIDTH} data-ui-scale={scale} className="flex overflow-hidden" style={{ width: WORKSPACE_DESIGN_WIDTH, height: viewport.height / scale }}>{children}</div>
 }
