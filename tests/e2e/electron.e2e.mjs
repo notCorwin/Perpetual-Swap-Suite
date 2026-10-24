@@ -122,6 +122,51 @@ test('desktop window loads the React workspace with a restricted renderer', asyn
   assert.equal(await page.evaluate(() => typeof window.webkit?.messageHandlers?.radar), 'undefined')
 })
 
+test('custom title bar controls reach the owning native window without showing it', async () => {
+  // Intercept only native window mutations: exercise production UI, preload,
+  // request validation, and sender ownership without exposing a test window.
+  await electron.evaluate(({ BrowserWindow }) => {
+    const window = BrowserWindow.getAllWindows()[0]
+    const names = ['close', 'minimize', 'maximize', 'unmaximize', 'isMaximized']
+    const originals = new Map(names.map(name => [name, window[name]]))
+    const probe = globalThis.__windowControlProbe = { window, originals, calls: [], maximized: false }
+    window.isMaximized = () => probe.maximized
+    window.close = () => { probe.calls.push('close') }
+    window.minimize = () => { probe.calls.push('minimize') }
+    window.maximize = () => { probe.calls.push('maximize'); probe.maximized = true }
+    window.unmaximize = () => { probe.calls.push('unmaximize'); probe.maximized = false }
+  })
+  try {
+    const titlebar = page.getByRole('banner', { name: 'Window title bar' })
+    await titlebar.waitFor()
+    assert.equal(await titlebar.evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'drag')
+    for (const name of ['Close window', 'Minimize window', 'Zoom window']) {
+      assert.equal(await titlebar.getByRole('button', { name, exact: true }).evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
+    }
+    await titlebar.getByRole('button', { name: 'Minimize window', exact: true }).click()
+    const zoom = titlebar.getByRole('button', { name: 'Zoom window', exact: true })
+    await zoom.click()
+    await zoom.focus()
+    await page.keyboard.press('Enter')
+    await titlebar.getByRole('button', { name: 'Close window', exact: true }).click()
+    await waitFor(() => electron.evaluate(() => globalThis.__windowControlProbe.calls.length === 4))
+    assert.deepEqual(await electron.evaluate(() => globalThis.__windowControlProbe.calls), ['minimize', 'maximize', 'unmaximize', 'close'])
+    const settings = titlebar.getByRole('link', { name: 'Settings', exact: true })
+    assert.equal(await settings.evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
+    await settings.click()
+    await page.getByRole('main', { name: 'Settings', exact: true }).waitFor()
+    assert.equal(await titlebar.isVisible(), true, 'Window controls must remain available in settings.')
+    await page.getByRole('link', { name: 'Back to markets', exact: true }).click()
+    assert.equal(await electron.evaluate(() => globalThis.__windowControlProbe.window.isVisible()), false)
+  } finally {
+    await electron.evaluate(() => {
+      const probe = globalThis.__windowControlProbe
+      for (const [name, original] of probe.originals) probe.window[name] = original
+      delete globalThis.__windowControlProbe
+    })
+  }
+})
+
 test('preferences persist through the single desktop entry point and survive a process restart', async () => {
   const initial = await request({ preferences: { action: 'read' } })
   assert.equal(initial.chartTimeframe, '15m')

@@ -144,12 +144,24 @@ async function gatewayFetch(event, { id, body }) {
 }
 
 async function handleRequest(event, payload, context) {
-  security.assertTrustedSender(event, window)
+  const target = window
+  security.assertTrustedSender(event, target)
   const request = parseDesktopRequest(payload, { allowE2E: testMode })
   if (shuttingDown) throw new Error('The application is closing.')
   const task = runWithOperationContext(context, () => measureOperation({ category: 'ipc', name: 'desktop.request.execute', resource: Object.keys(request)[0] }, async () => {
   if (request.gatewayFetch) return gatewayFetch(event, request.gatewayFetch)
   if (request.cancelGatewayFetch) { gatewayRequests.get(request.cancelGatewayFetch)?.controller.abort(); return { ok: true } }
+  if (request.windowControl) {
+    switch (request.windowControl.action) {
+      case 'close': target.close(); break
+      case 'minimize': target.minimize(); break
+      case 'toggleMaximize':
+        if (target.isMaximized()) target.unmaximize()
+        else target.maximize()
+        break
+    }
+    return { ok: true }
+  }
   if ('copyText' in request) { clipboard.writeText(request.copyText); return { ok: true } }
   if (request.captureChart) {
     const { x, y, width, height, output } = request.captureChart
@@ -174,6 +186,7 @@ async function createWindow() {
   if (shuttingDown || window && !window.isDestroyed()) return
   window = new BrowserWindow({
     ...testWindowOptions(backgroundTests),
+    frame: false,
     width: 1600, height: 1000, minWidth: 400, minHeight: 300,
     title: 'Perpetual Swap Suite', backgroundColor: '#101114', show: !testMode && !backgroundTests,
     webPreferences: { ...testWindowOptions(backgroundTests).webPreferences,

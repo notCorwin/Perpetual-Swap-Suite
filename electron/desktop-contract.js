@@ -192,7 +192,7 @@ function candle(value, index) {
 
 /** Validate the complete request before dispatching any operation or side effect. */
 export function parseDesktopRequest(value, { allowE2E = false } = {}) {
-  const operations = ['snapshot', 'preferences', 'dataAudit', 'historyDownload', 'chartFocus', 'chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse', 'captureChart', 'copyText', 'analysisSettings', 'gatewayFetch', 'cancelGatewayFetch', 'e2e']
+  const operations = ['snapshot', 'preferences', 'dataAudit', 'historyDownload', 'chartFocus', 'chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse', 'captureChart', 'copyText', 'windowControl', 'analysisSettings', 'gatewayFetch', 'cancelGatewayFetch', 'e2e']
   record(value, 'request', operations)
   const keys = Object.keys(value)
   if (keys.length !== 1) invalid('request', 'must contain exactly one operation')
@@ -224,6 +224,10 @@ export function parseDesktopRequest(value, { allowE2E = false } = {}) {
     }
     case 'captureChart': return { captureChart: captureChart(input) }
     case 'copyText': return { copyText: text(input, operation, { empty: true, maximum: 16_777_216 }) }
+    case 'windowControl': {
+      record(input, operation, ['action'], ['action'])
+      return { windowControl: { action: choice(input.action, 'windowControl.action', ['close', 'minimize', 'toggleMaximize']) } }
+    }
     case 'analysisSettings': return { analysisSettings: analysisSettings(input) }
     case 'gatewayFetch': {
       record(input, operation, ['id', 'body'], ['id', 'body'])

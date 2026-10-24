@@ -57,6 +57,7 @@ export type DesktopCommands = {
   gatewayFetch: { input: { id: string; body: string }; output: { status: number; headers: Record<string, string> } }
   cancelGatewayFetch: { input: string; output: { ok: boolean } }
   copyText: { input: string; output: { ok: boolean } }
+  windowControl: { input: { action: 'close' | 'minimize' | 'toggleMaximize' }; output: { ok: boolean } }
   captureChart: { input: ChartCaptureBounds & { output?: 'png' }; output: { ok: boolean } }
   chartFocus: { input: { id: string; target: { instId: string; timeframe: RadarTimeframe; endHour?: number } | null }; output: { ok: boolean } }
   chartWindow: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number; historyBars?: number; focusId?: string }; output: PreparedChartResponse }
@@ -79,6 +80,7 @@ export interface RadarDesktop {
   request(value: { gatewayFetch: DesktopCommands['gatewayFetch']['input'] }): Promise<DesktopCommands['gatewayFetch']['output']>
   request(value: { cancelGatewayFetch: DesktopCommands['cancelGatewayFetch']['input'] }): Promise<DesktopCommands['cancelGatewayFetch']['output']>
   request(value: { copyText: DesktopCommands['copyText']['input'] }): Promise<DesktopCommands['copyText']['output']>
+  request(value: { windowControl: DesktopCommands['windowControl']['input'] }): Promise<DesktopCommands['windowControl']['output']>
   request(value: { captureChart: ChartCaptureBounds & { output: 'png' } }): Promise<ChartImage>
   request(value: { captureChart: DesktopCommands['captureChart']['input'] }): Promise<DesktopCommands['captureChart']['output']>
   request(value: { chartWindow: DesktopCommands['chartWindow']['input'] }): Promise<DesktopCommands['chartWindow']['output']>

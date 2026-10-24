@@ -191,6 +191,14 @@
 [data-analysis-answer], [data-analysis-answer] * { user-select: text; }
 [data-analysis-answer] [data-slot="table-container"] { overflow-x: auto; }
 
+[data-window-titlebar] {
+  app-region: drag;
+}
+
+[data-window-titlebar] button, [data-window-titlebar] a {
+  app-region: no-drag;
+}
+
 [data-slot="dialog-content"], [data-slot="select-content"], [data-slot="popover-content"] {
   overscroll-behavior: contain;
 }

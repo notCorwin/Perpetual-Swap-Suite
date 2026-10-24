@@ -169,17 +169,18 @@ try {
         ratio: effectiveContrast, effectiveContrast, paintRatio, boundaryContrast, boundaries, threshold: decorative ? null : 3,
         exemption: decorative ? 'Decorative arrow; signed numeric value conveys direction' : undefined, strokeDasharray: style.strokeDasharray, candleFill: element.dataset.chartCandleFill }
     })
+    const renderedChart = document.querySelector('svg[data-rendered-inst]')
     const chartLineDash = field => {
-      const line = document.querySelector(`[data-chart-indicator="${field}"]`)
+      const line = renderedChart?.querySelector(`[data-chart-indicator="${field}"]`)
       return line ? getComputedStyle(line).strokeDasharray : null
     }
     const rootStyle = getComputedStyle(document.documentElement)
     const semantics = { positive: rgba(rootStyle.getPropertyValue('--positive')).slice(0, 3), negative: rgba(rootStyle.getPropertyValue('--negative')).slice(0, 3),
       positiveLabel: rgba(rootStyle.getPropertyValue('--chart-positive-label')).slice(0, 3), negativeLabel: rgba(rootStyle.getPropertyValue('--chart-negative-label')).slice(0, 3),
-      takerLegends: [...document.querySelectorAll('[data-chart-panel-header="taker"] [data-chart-legend]')].map(swatch => ({ label: swatch.dataset.chartLegend,
+      takerLegends: [...renderedChart?.querySelectorAll('[data-chart-panel-header="taker"] [data-chart-legend]') ?? []].map(swatch => ({ label: swatch.dataset.chartLegend,
         labelColor: rgba(getComputedStyle(swatch.parentElement.querySelector('text')).fill).slice(0, 3), swatchColor: rgba(getComputedStyle(swatch).stroke).slice(0, 3) })),
-      upFill: document.querySelector('[data-chart-candle-direction="up"]')?.dataset.chartCandleFill,
-      downFill: document.querySelector('[data-chart-candle-direction="down"]')?.dataset.chartCandleFill,
+      upFill: renderedChart?.querySelector('[data-chart-candle-direction="up"]')?.dataset.chartCandleFill,
+      downFill: renderedChart?.querySelector('[data-chart-candle-direction="down"]')?.dataset.chartCandleFill,
       emaDash: chartLineDash('ema'), vwapDash: chartLineDash('vwap') }
     return { texts, graphics, semantics }
   })

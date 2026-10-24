@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createDesktopSecurity, isAllowedExternalURL } from '../electron/desktop-security.js'
-import { parseDesktopRequest } from '../electron/desktop-contract.js'
+import { DesktopRequestError, parseDesktopRequest } from '../electron/desktop-contract.js'
 
 test('installed renderer trust follows its entry point without permitting another page or remote origin', () => {
   const rendererFile = fileURLToPath(new URL('../dist/index.html', import.meta.url))
@@ -35,4 +35,30 @@ test('desktop commands reject mixed operations and keep fixture access explicitl
   assert.deepEqual(parseDesktopRequest({ snapshot: { timeframe: '15m', sinceRevision: -1 } }), { snapshot: { timeframe: '15m', sinceRevision: -1 } })
   assert.throws(() => parseDesktopRequest({ preferences: { action: 'update', values: { rankingLookback: 30 } }, copyText: 'side effect' }), /exactly one operation/)
   assert.throws(() => parseDesktopRequest({ e2e: { action: 'settings' } }), /unavailable outside tests/)
+})
+
+test('window controls accept only fixed actions without caller-selected window targets', () => {
+  for (const action of ['close', 'minimize', 'toggleMaximize']) {
+    const request = { windowControl: { action } }
+    const parsed = parseDesktopRequest(request)
+    assert.deepEqual(parsed, request)
+    assert.ok('windowControl' in parsed)
+    assert.notEqual(parsed, request)
+    assert.notEqual(parsed.windowControl, request.windowControl)
+  }
+  for (const windowControl of [
+    null, [], 'close', {},
+    { action: undefined }, { action: null }, { action: true },
+    { action: 'maximize' }, { action: 'unmaximize' }, { action: 'titlebarDoubleClick' },
+    { action: 'close', windowId: 1 }, { action: 'close', target: 'focused' },
+    Object.create({ action: 'close' }),
+  ]) assert.throws(() => parseDesktopRequest({ windowControl }), DesktopRequestError)
+  assert.throws(() => parseDesktopRequest({ windowControl: { action: 'close' }, copyText: 'mixed' }), DesktopRequestError)
+
+  let reads = 0
+  const windowControl = Object.defineProperty({}, 'action', {
+    enumerable: true, get() { reads++; return 'close' },
+  })
+  assert.throws(() => parseDesktopRequest({ windowControl }), DesktopRequestError)
+  assert.equal(reads, 0)
 })
