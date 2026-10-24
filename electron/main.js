@@ -15,6 +15,7 @@ import { createRendererOperationReceiver } from './services/renderer-operations.
 import { createOperationSession, enforceOperationRetention } from './services/operation-retention.js'
 import { installElectronOperationHooks } from './services/operation-hooks.js'
 import { MarketBackend } from './services/market-backend.js'
+import { windowToolbarLayout } from './window-layout.js'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const rendererURL = process.env.ELECTRON_RENDERER_URL || undefined
@@ -175,6 +176,7 @@ async function createWindow() {
   window = new BrowserWindow({
     ...testWindowOptions(backgroundTests),
     frame: false,
+    ...(process.platform === 'darwin' ? { titleBarStyle: 'hidden', trafficLightPosition: windowToolbarLayout(1600, true).buttonsPosition } : {}),
     width: 1600, height: 1000, minWidth: 400, minHeight: 300,
     title: 'Perpetual Swap Suite', backgroundColor: '#101114', show: !testMode && !backgroundTests,
     webPreferences: { ...testWindowOptions(backgroundTests).webPreferences,
@@ -183,12 +185,10 @@ async function createWindow() {
   if (process.platform === 'darwin') {
     const target = window
     const positionButtons = () => {
-      const scale = target.getContentSize()[0] / 1600
-      const position = { x: Math.round(16 * scale), y: Math.round(16 * scale + (Math.max(28 * scale, 28) - 14) / 2) }
+      const position = windowToolbarLayout(target.getContentSize()[0], true).buttonsPosition
       const current = target.getWindowButtonPosition()
       if (current?.x !== position.x || current?.y !== position.y) target.setWindowButtonPosition(position)
     }
-    target.setWindowButtonVisibility(true)
     positionButtons()
     target.on('resize', positionButtons)
     target.on('leave-full-screen', positionButtons)

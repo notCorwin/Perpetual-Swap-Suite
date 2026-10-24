@@ -233,9 +233,9 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
   </Field>
   const currentSection = SETTINGS_SECTIONS.find(value => value.id === section)!
   return <main aria-label="Settings" data-layout="settings-workspace" className="flex h-full min-w-0 flex-1 flex-col bg-background">
-    <header data-window-drag-region data-native-window-controls-header className="flex items-center justify-between gap-6 border-b px-8 py-6">
-      <h1 className="text-2xl font-semibold">Settings</h1>
-      <a href="#/" className={buttonVariants({ variant: 'outline' })}><ArrowLeft aria-hidden="true" data-icon="inline-start" />Back to markets</a>
+    <header data-window-toolbar data-window-drag-region data-native-window-controls-header className="flex items-center justify-between gap-6 border-b px-4">
+      <h1 className="text-base font-semibold">Settings</h1>
+      <a href="#/" className={buttonVariants({ variant: 'outline', size: 'sm' })}><ArrowLeft aria-hidden="true" data-icon="inline-start" />Back to markets</a>
     </header>
     <div className="flex min-h-0 flex-1">
       <nav aria-label="Settings categories" className="flex w-64 shrink-0 flex-col gap-2 overflow-y-auto border-r p-6">

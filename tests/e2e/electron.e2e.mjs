@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
+import { measureNativeWindowControls } from '../helpers/native-window-controls.mjs'
 import { assertCompletePaints, assertIndicatorLegends, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
 
 
@@ -120,15 +121,35 @@ test('desktop window loads the React workspace with a restricted renderer', asyn
   assert.equal(await page.evaluate(() => typeof window.require), 'undefined')
   assert.equal(await page.evaluate(() => typeof window.radarDesktop.request), 'function')
   assert.equal(await page.evaluate(() => window.radarDesktop.nativeWindowControls), process.platform === 'darwin')
-  if (process.platform === 'darwin') {
-    const controls = await electron.evaluate(({ BrowserWindow }) => {
-      const window = BrowserWindow.getAllWindows()[0]
-      return { position: window.getWindowButtonPosition(), visible: window._getWindowButtonVisibility?.() }
-    })
-    assert.ok(controls.position?.x >= 0 && controls.position.y >= 0, 'The frameless window must have positioned native traffic lights.')
-    if (controls.visible !== undefined) assert.equal(controls.visible, true, 'Native traffic lights must be enabled without showing the test window.')
-  }
   assert.equal(await page.evaluate(() => typeof window.webkit?.messageHandlers?.radar), 'undefined')
+})
+
+test('native traffic lights align with the renderer toolbar after window resizing', { skip: process.platform !== 'darwin' }, async () => {
+  const previous = await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].getContentSize())
+  const measurements = []
+  try {
+    for (const width of [1_000, 1_600, 2_000]) {
+      const actualWidth = await electron.evaluate(({ BrowserWindow }, width) => {
+        const target = BrowserWindow.getAllWindows()[0]
+        target.setContentSize(width, 1_000)
+        return target.getContentSize()[0]
+      }, width)
+      await page.waitForFunction(width => innerWidth === width && Number(document.querySelector('[data-layout="market-workspace"]').dataset.uiScale) === width / 1_600, actualWidth)
+      const native = await measureNativeWindowControls(electron)
+      const row = await page.locator('[data-sidebar-toolbar]').boundingBox()
+      const title = await page.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).boundingBox()
+      for (const [name, button] of Object.entries(native.buttons)) {
+        assert.ok(button && !button.hidden && !button.hiddenOrHasHiddenAncestor, `${name} must be an enabled native control.`)
+        assert.ok(Math.abs(button.y + button.height / 2 - (row.y + row.height / 2)) <= .5, `${name} must actually align with the toolbar: ${JSON.stringify({ native, row })}`)
+        assert.ok(button.x + button.width < title.x, `${name} must not cover the application title.`)
+      }
+      measurements.push({ width: actualWidth, row, title, native })
+    }
+    await writeFile(join(root, '.build', 'native-topbar-geometry.json'), `${JSON.stringify(measurements, null, 2)}\n`)
+  } finally {
+    await electron.evaluate(({ BrowserWindow }, [width, height]) => BrowserWindow.getAllWindows()[0].setContentSize(width, height), previous)
+    await page.waitForFunction(width => innerWidth === width && Number(document.querySelector('[data-layout="market-workspace"]').dataset.uiScale) === width / 1_600, previous[0])
+  }
 })
 
 test('preferences persist through the single desktop entry point and survive a process restart', async () => {

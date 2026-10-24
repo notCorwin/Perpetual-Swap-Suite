@@ -100,6 +100,8 @@ export async function assertWorkspaceLayout(page) {
       designWidth: Number(root.dataset.designWidth), scale: Number(root.dataset.uiScale),
       viewport: { width: innerWidth, height: innerHeight }, root: rectangle(root),
       toolbar: toolbar ? rectangle(toolbar) : null,
+      sidebarToolbar: controlsRow ? rectangle(controlsRow) : null,
+      toolbarControls: toolbar ? [...toolbar.querySelectorAll('button')].map(rectangle) : [],
       nativeControls: controlsRow && window.radarDesktop.nativeWindowControls ? {
         row: rectangle(controlsRow), title: rectangle(controlsRow.querySelector('h1')), settings: rectangle(controlsRow.querySelector('a')),
         inset: Number.parseFloat(getComputedStyle(controlsRow).paddingInlineStart) * Number(root.dataset.uiScale),
@@ -115,10 +117,16 @@ export async function assertWorkspaceLayout(page) {
   assert.ok(layout.list.y === 0 && layout.chart.y === 0, 'Both original workspace columns must begin at the top of the window.')
   assert.ok(Math.abs(layout.list.height - layout.viewport.height) < 1 && Math.abs(layout.chart.height - layout.list.height) < 1, 'Both workspace columns must use the full window height.')
   if (layout.toolbar) assert.ok(layout.toolbar.y === 0 && Math.abs(layout.toolbar.x - layout.chart.x) < 1 && Math.abs(layout.toolbar.width - layout.chart.width) < 1, 'The existing chart toolbar must form the top of the chart column without an extra title bar.')
+  if (layout.toolbar && layout.sidebarToolbar) {
+    assert.ok(Math.abs(layout.toolbar.height - layout.sidebarToolbar.height) < 1, 'The sidebar and chart must share one toolbar height.')
+    const center = layout.toolbar.y + layout.toolbar.height / 2
+    assert.ok(layout.toolbarControls.every(control => Math.abs(control.y + control.height / 2 - center) < 1), 'All chart toolbar controls must share the same vertical center.')
+  }
   if (layout.nativeControls) {
     const { row, title, settings, inset } = layout.nativeControls
-    assert.ok(Math.abs(inset - 72) < 1 && row.height >= 27, 'Native traffic lights need fixed-size clearance at every workspace scale.')
+    assert.ok(Math.abs(inset - 16 * layout.scale - 72) < 1 && row.height >= 35, 'Native traffic lights need fixed-size clearance at every workspace scale.')
     assert.ok(title.x >= row.x + inset - 1 && title.x + title.width <= settings.x + 1, 'Native controls, application title, and settings must not overlap.')
+    assert.ok([title, settings].every(control => Math.abs(control.y + control.height / 2 - (row.y + row.height / 2)) < 1), 'Application title and settings must align with the chart toolbar controls.')
   }
   assert.ok(Math.abs(layout.list.width / layout.scale - 420) < 2, 'The contract list must keep its design width.')
   assert.ok(Math.abs(layout.chart.width / layout.scale - 1_180) < 2, 'The chart panel must keep its design width.')
