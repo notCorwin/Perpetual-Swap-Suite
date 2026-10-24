@@ -119,6 +119,15 @@ test('desktop window loads the React workspace with a restricted renderer', asyn
   assert.equal(await page.evaluate(() => document.visibilityState), 'visible')
   assert.equal(await page.evaluate(() => typeof window.require), 'undefined')
   assert.equal(await page.evaluate(() => typeof window.radarDesktop.request), 'function')
+  assert.equal(await page.evaluate(() => window.radarDesktop.nativeWindowControls), process.platform === 'darwin')
+  if (process.platform === 'darwin') {
+    const controls = await electron.evaluate(({ BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows()[0]
+      return { position: window.getWindowButtonPosition(), visible: window._getWindowButtonVisibility?.() }
+    })
+    assert.ok(controls.position?.x >= 0 && controls.position.y >= 0, 'The frameless window must have positioned native traffic lights.')
+    if (controls.visible !== undefined) assert.equal(controls.visible, true, 'Native traffic lights must be enabled without showing the test window.')
+  }
   assert.equal(await page.evaluate(() => typeof window.webkit?.messageHandlers?.radar), 'undefined')
 })
 

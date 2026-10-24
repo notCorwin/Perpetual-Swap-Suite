@@ -180,6 +180,19 @@ async function createWindow() {
     webPreferences: { ...testWindowOptions(backgroundTests).webPreferences,
       preload: join(root, 'electron', 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   })
+  if (process.platform === 'darwin') {
+    const target = window
+    const positionButtons = () => {
+      const scale = target.getContentSize()[0] / 1600
+      const position = { x: Math.round(16 * scale), y: Math.round(16 * scale + (Math.max(28 * scale, 28) - 14) / 2) }
+      const current = target.getWindowButtonPosition()
+      if (current?.x !== position.x || current?.y !== position.y) target.setWindowButtonPosition(position)
+    }
+    target.setWindowButtonVisibility(true)
+    positionButtons()
+    target.on('resize', positionButtons)
+    target.on('leave-full-screen', positionButtons)
+  }
   window.webContents.on('will-navigate', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
   window.webContents.on('will-redirect', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
   window.webContents.on('will-frame-navigate', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })

@@ -68,6 +68,7 @@ export type DesktopRequest = { [K in keyof DesktopCommands]: { [P in K]: Desktop
 export type DesktopResponse<Request extends DesktopRequest> = Request extends { captureChart: { output: 'png' } }
   ? ChartImage : { [K in keyof DesktopCommands]: Request extends Record<K, unknown> ? DesktopCommands[K]['output'] : never }[keyof DesktopCommands]
 export interface RadarDesktop {
+  readonly nativeWindowControls: boolean
   initializeOperations(hooks: OperationBridgeHooks): Promise<OperationSourceIdentity>
   recordOperations(batch: OperationBatch): Promise<OperationAcknowledgment>
   operationSourceFailure(value: { executionId: string; reason: string; omitted: number }): Promise<void>

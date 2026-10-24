@@ -234,7 +234,7 @@ function App() {
     <div hidden={settingsSection !== null} inert={settingsSection !== null} className={cn('h-full min-w-0 flex-1', settingsSection === null ? 'flex' : 'hidden')}>
     <aside data-market-list className="flex h-full w-[420px] shrink-0 flex-col border-r" aria-label="Contract list">
       <header className="flex flex-col gap-4 border-b p-4">
-        <div data-window-drag-region className="flex items-center justify-between gap-2"><h1 className="text-base font-semibold">Perpetual Swap Suite</h1><a ref={settingsLauncher} href={settingsHref('workspace')} className={buttonVariants({ variant: 'outline', size: 'sm' })}><Settings2 aria-hidden="true" data-icon="inline-start" />Settings</a></div>
+        <div data-window-drag-region data-native-window-controls-row className="flex items-center justify-between gap-2"><h1 className="min-w-0 truncate text-base font-semibold">Perpetual Swap Suite</h1><a ref={settingsLauncher} href={settingsHref('workspace')} className={buttonVariants({ variant: 'outline', size: 'sm' })}><Settings2 aria-hidden="true" data-icon="inline-start" />Settings</a></div>
         <Input aria-label="Search contracts" placeholder="Search contracts…" value={query} onChange={event => setQuery(event.target.value)} />
         <div className="flex items-center justify-between gap-2"><span className="text-xs text-muted-foreground">{query.trim() ? `${visible.length} / ${listed.length}` : listed.length} contracts</span><Badge variant="outline"><Radio aria-hidden="true" />{status}</Badge></div>
       </header>

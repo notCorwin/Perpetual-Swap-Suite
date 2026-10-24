@@ -259,6 +259,10 @@ test('the existing chart toolbar provides window dragging while its controls rem
   const settings = settingsPage()
   await settings.waitFor({ state: 'visible' })
   assert.equal(await settings.locator('header').evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'drag')
+  if (process.platform === 'darwin') {
+    const heading = await settings.getByRole('heading', { name: 'Settings', exact: true }).boundingBox()
+    assert.ok(heading.x >= 72, 'Settings must reserve native traffic light space as well.')
+  }
   assert.equal(await settings.getByRole('link', { name: 'Back to markets', exact: true }).evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
   await backToMarkets()
 })

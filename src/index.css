@@ -200,6 +200,16 @@
   app-region: no-drag;
 }
 
+[data-native-window-controls-row] {
+  min-height: max(1.75rem, var(--native-window-controls-row-height, 0px));
+  padding-inline-start: var(--native-window-controls-width, 0px);
+}
+
+[data-native-window-controls-header] {
+  min-height: var(--native-window-controls-header-height, 0px);
+  padding-inline-start: calc(2rem + var(--native-window-controls-width, 0px));
+}
+
 [data-slot="dialog-content"], [data-slot="select-content"], [data-slot="popover-content"] {
   overscroll-behavior: contain;
 }

@@ -27,6 +27,7 @@ ipcRenderer.on('radar:operations-drain', async (_event, { id }) => {
 })
 window.addEventListener('pagehide', () => { if (operationHooks) void operationHooks.flush().catch(() => {}) })
 contextBridge.exposeInMainWorld('radarDesktop', {
+  nativeWindowControls: process.platform === 'darwin',
   request,
   initializeOperations: hooks => { operationHooks = hooks; return ipcRenderer.invoke('radar:operations-initialize', { nonce: operationNonce }) },
   recordOperations: batch => ipcRenderer.invoke('radar:operations', batch),
