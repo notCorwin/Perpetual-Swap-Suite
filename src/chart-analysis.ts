@@ -43,6 +43,7 @@ export function analysisMessages(session: AnalysisSession, index: number): Model
 
 /// A process-local store shared by all market chart entry points. No chart,
 /// draft, or generated answer is written to local storage or the database.
+/// Errors and stops stay settled until an explicit analyze/send/retry action.
 export class ChartAnalysisStore {
   private sessions = new Map<string, AnalysisSession>()
   private operations = new Map<string, AbortController>()
@@ -75,11 +76,11 @@ export class ChartAnalysisStore {
     try {
       const settings = await this.settings()
       if (!this.current(id, operation)) return
-      if (!settings.hasAPIKey) throw new Error('Configure a Gateway API Key to analyze charts.')
+      this.validateSettings(settings)
       const image = await capture()
       if (!this.current(id, operation)) return
       this.update(id, session => ({ ...session, model: settings.model, image, capturedAt: image.capturedAt, rangeLabel: image.rangeLabel }))
-      await this.runTurn(id, ANALYSIS_PROMPTS[direction].question, operation)
+      await this.runTurn(id, ANALYSIS_PROMPTS[direction].question, operation, false, settings)
     } catch (error) { this.fail(id, operation, error) }
     finally { if (this.current(id, operation)) this.operations.delete(id) }
   }
@@ -105,17 +106,27 @@ export class ChartAnalysisStore {
     const message = error instanceof Error ? error.message : error && typeof error === 'object' && 'message' in error && typeof error.message === 'string' ? error.message : 'Could not analyze this chart.'
     this.update(id, session => ({ ...session, phase: 'error', error: message, turns: session.turns.map(turn => turn.status === 'streaming' ? { ...turn, status: 'error', error: message } : turn) }))
   }
-  private async runTurn(id: string, question: string, operation: AbortController, retry = false) {
+  private validateSettings(settings: AnalysisSettings) {
+    if (!settings.hasAPIKey) throw new Error('Configure a Gateway API Key, then start or retry the analysis.')
+    if (!settings.model.trim()) throw new Error('Configure a model ID, then start or retry the analysis.')
+  }
+  private async runTurn(id: string, question: string, operation: AbortController, retry = false, initialSettings?: AnalysisSettings) {
     const session = this.get(id)!
     const turn: AnalysisTurn = { id: retry ? session.turns.at(-1)!.id : `turn-${++this.nextTurn}`, question, text: '', status: 'streaming', error: '' }
     const turns = retry ? [...session.turns.slice(0, -1), turn] : [...session.turns, turn]
     const next = { ...session, turns, phase: 'streaming' as const, error: '' }
     this.publish(id, next)
-    await this.runner({ model: next.model, instructions: ANALYSIS_PROMPTS[next.direction].system, messages: analysisMessages(next, turns.length - 1), signal: operation.signal }, text => {
+    // Explicit recovery reads the current configuration without recapturing the
+    // snapshot or replaying a failed request on a timer.
+    const settings = initialSettings ?? await this.settings()
+    if (!this.current(id, operation)) return
+    this.validateSettings(settings)
+    this.update(id, value => ({ ...value, model: settings.model }))
+    await this.runner({ model: settings.model, instructions: ANALYSIS_PROMPTS[next.direction].system, messages: analysisMessages(next, turns.length - 1), signal: operation.signal }, text => {
       if (this.current(id, operation)) this.update(id, value => ({ ...value, turns: value.turns.map(item => item.id === turn.id ? { ...item, text: item.text + text } : item) }))
     })
     if (!this.current(id, operation)) return
-    if (!this.get(id)!.turns.at(-1)!.text.trim()) throw new Error('The model returned an empty answer. It will retry automatically; you can also choose another model.')
+    if (!this.get(id)!.turns.at(-1)!.text.trim()) throw new Error('The model returned an empty answer. Retry the response or choose another model.')
     this.update(id, value => ({ ...value, phase: 'ready', turns: value.turns.map(item => item.id === turn.id ? { ...item, status: 'complete' } : item) }))
   }
 }

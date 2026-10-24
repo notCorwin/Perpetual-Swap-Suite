@@ -368,53 +368,34 @@ test('a healthy idle market list makes no periodic snapshot requests', async () 
     'Successful market reads must wait for a notification, action, or visibility change.')
 })
 
-test('snapshot failures retry with bounded backoff and stop scheduling after recovery', async () => {
+test('snapshot failures wait for a new notification and resume immediately on recovery', async () => {
   try {
     await page.evaluate(() => {
-      const timeout = window.setTimeout.bind(window), clear = window.clearTimeout.bind(window)
-      const pending = new Map(), delays = []
-      let next = 1_000_000_000
-      // Advance only the snapshot error deadlines. Other UI clocks and native
-      // event delivery keep running normally throughout this Electron test.
+      const timeout = window.setTimeout.bind(window)
+      const delays = []
       window.setTimeout = (handler, delay, ...args) => {
-        if (typeof handler !== 'function' || ![4_000, 8_000, 16_000, 30_000].includes(delay)) return timeout(handler, delay, ...args)
-        const id = ++next
-        delays.push(delay); pending.set(id, () => handler(...args))
-        return id
+        if ([4_000, 8_000, 16_000, 30_000].includes(delay)) delays.push(delay)
+        return timeout(handler, delay, ...args)
       }
-      window.clearTimeout = id => { pending.delete(id); clear(id) }
-      globalThis.__snapshotRetryClock = { delays, pending, runNext() {
-        const [id, run] = pending.entries().next().value ?? []
-        if (!run) throw new Error('No snapshot retry deadline was scheduled.')
-        pending.delete(id); run()
-      }, restore() { window.setTimeout = timeout; window.clearTimeout = clear; pending.clear() } }
+      globalThis.__snapshotRetryClock = { delays, restore() { window.setTimeout = timeout } }
     })
     const before = await electron.evaluate(() => {
       const state = globalThis.__workspaceFixture
       const before = state.requests.filter(value => value.snapshot).length
-      state.failSnapshots = 5
+      state.failSnapshots = 1
       state.rows = state.rows.map(row => row.instId === 'BETA-USDT-SWAP' ? { ...row, lastPrice: 204 } : row)
       state.revision += 1; state.notify()
       return before
     })
-    const delays = [4_000, 8_000, 16_000, 30_000, 30_000]
-    for (let index = 0; index < delays.length; index++) {
-      await page.waitForFunction(index => globalThis.__snapshotRetryClock.delays.length === index + 1 && globalThis.__snapshotRetryClock.pending.size === 1, index)
-      assert.deepEqual(await page.evaluate(() => globalThis.__snapshotRetryClock.delays), delays.slice(0, index + 1))
-      assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before + index + 1,
-        'A failed request must wait for its single retry deadline.')
-      await page.evaluate(() => globalThis.__snapshotRetryClock.runNext())
-    }
+    const error = page.getByRole('alert').filter({ hasText: 'Snapshot temporarily unavailable.' })
+    await error.waitFor({ state: 'visible' })
+    assert.deepEqual(await page.evaluate(() => globalThis.__snapshotRetryClock.delays), [])
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before + 1)
+    await electron.evaluate(() => globalThis.__workspaceFixture.notify())
     await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '204')
-    await page.getByRole('alert').filter({ hasText: 'Snapshot temporarily unavailable.' }).waitFor({ state: 'hidden' })
-    assert.equal(await page.evaluate(() => globalThis.__snapshotRetryClock.pending.size), 0)
-    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before + 6)
-    await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.failSnapshots = 1; state.notify() })
-    await page.waitForFunction(() => globalThis.__snapshotRetryClock.delays.length === 6)
-    assert.equal(await page.evaluate(() => globalThis.__snapshotRetryClock.delays.at(-1)), 4_000, 'Recovery resets the error backoff.')
-    await page.evaluate(() => globalThis.__snapshotRetryClock.runNext())
-    await page.getByRole('alert').filter({ hasText: 'Snapshot temporarily unavailable.' }).waitFor({ state: 'hidden' })
-    assert.equal(await page.evaluate(() => globalThis.__snapshotRetryClock.pending.size), 0)
+    await error.waitFor({ state: 'hidden' })
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before + 2)
+    assert.deepEqual(await page.evaluate(() => globalThis.__snapshotRetryClock.delays), [])
   } finally {
     await page.evaluate(() => { globalThis.__snapshotRetryClock?.restore(); delete globalThis.__snapshotRetryClock })
     await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.failSnapshots = 0; state.rows = state.initialRows; state.revision += 1; state.notify() })

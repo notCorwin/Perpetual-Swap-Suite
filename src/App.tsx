@@ -72,7 +72,6 @@ function App() {
   const [realtime, setRealtime] = useState('Connecting')
   const [error, setError] = useState('')
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
-  const [refresh, setRefresh] = useState(0)
   const order = useRef(new SnapshotOrder())
   const revision = useRef(-1)
   const snapshotInFlight = useRef<Promise<MarketSnapshot | UnchangedSnapshot> | null>(null)
@@ -95,23 +94,18 @@ function App() {
   useEffect(() => {
     if (!preferencesLoaded) return
     let stopped = false
-    let timer: number | undefined
     let working = false
     let queued = false
-    let backoff = 2000
     // The first request for each timeframe needs its rows, even when the
     // collector revision has not changed since the previous timeframe.
     revision.current = -1
-    const clearTimer = () => { clearTimeout(timer); timer = undefined }
     const visible = () => document.visibilityState !== 'hidden'
     const load = async () => {
       if (stopped) return
-      clearTimer()
       if (working) { queued = true; return }
       if (!visible()) { queued = true; return }
       working = true
       queued = false
-      let failed = false
       try {
         // Effect replacements share the outstanding IPC request until it
         // settles, but each response still belongs to its original effect.
@@ -151,19 +145,13 @@ function App() {
           if (snapshot.updatedAt !== undefined) setUpdatedAt(snapshot.updatedAt)
           if (snapshot.realtimeState) setRealtime(snapshot.realtimeState)
         }
-        backoff = 2000
       } catch (cause) {
         if (stopped) return
-        failed = true
-        setError(message(cause)); setStatus('Reconnecting'); setRealtime('Disconnected')
+        setError(message(cause)); setStatus('Unavailable'); setRealtime('Disconnected')
         setCatalog(current => ({ ...current, loading: false }))
-        backoff = Math.min(backoff * 2, 30_000)
       } finally {
         working = false
-        if (!stopped && visible()) {
-          if (queued) void load()
-          else if (failed) timer = window.setTimeout(load, backoff)
-        }
+        if (!stopped && visible() && queued) void load()
       }
     }
     const changed = () => { void load() }
@@ -173,11 +161,10 @@ function App() {
     void load()
     return () => {
       stopped = true
-      clearTimer()
       window.removeEventListener('radar-market-changed', changed)
       document.removeEventListener('visibilitychange', shown)
     }
-  }, [preferencesLoaded, timeframe, refresh])
+  }, [preferencesLoaded, timeframe])
 
   const ranked = useMemo(() => [...rows].sort(compareRankingChange), [rows])
   const visible = useMemo(() => ranked.filter(row => row.instId.toLowerCase().includes(query.trim().toLowerCase())), [ranked, query])
@@ -187,7 +174,7 @@ function App() {
   const emptyTitle = verifying ? catalog.catalogSource === 'none' ? 'Loading contracts' : awaitingObservations ? 'Updating market data' : 'Verifying contracts' : verificationUnavailable ? 'Market verification unavailable' : 'No qualified contracts'
   const emptyDescription = verifying
     ? awaitingObservations ? 'Waiting for fresh observations. Market data collection continues in the background.' : catalog.catalogProgress?.total ? `Checking enabled conditions: ${catalog.catalogProgress.completed} / ${catalog.catalogProgress.total} contracts completed.` : 'The data service is preparing and verifying the market list.'
-    : verificationUnavailable ? 'Market data could not verify the enabled conditions. The data service will retry automatically.' : 'Adjust the enabled liquidity conditions in Settings.'
+    : verificationUnavailable ? 'Market data could not verify the enabled conditions. Waiting for updated observations from the data service.' : 'Adjust the enabled liquidity conditions in Settings.'
   const noSearchMatch = Boolean(query.trim()) && rows.length > 0
   // Only confirmed exclusions clear the chart. A temporary verification gap
   // clears the qualified list while preserving the current chart and its state.
@@ -204,13 +191,11 @@ function App() {
     try { saved = await window.radarDesktop.request({ preferences: { action: 'update', values } }) }
     catch (cause) { if (write !== preferenceWrite.current) return; throw cause }
     if (write !== preferenceWrite.current) return
-    revision.current = -1
-    setPreferences(saved); setPreferencesError(''); setStatus('Refreshing'); setRefresh(current => current + 1)
-    if (JSON.stringify(saved.liquidity) !== JSON.stringify(preferences.liquidity)) {
-      setRows([]); setReady(false); setError('')
-      setCatalog(current => ({ ...current, loading: true, catalogProgress: undefined }))
-    }
-  }, [preferences.liquidity])
+    // The backend publishes changed qualification/ranking data. Clearing rows
+    // here can erase a newer snapshot that arrived before the save response.
+    // Only a timeframe change restarts the loader and requests its own rows.
+    setPreferences(saved); setPreferencesError('')
+  }, [])
   const changeTimeframe = useCallback((chartTimeframe: RadarTimeframe) => {
     const previous = preferences.chartTimeframe
     setPreferences(current => ({ ...current, chartTimeframe }))

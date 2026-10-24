@@ -1,4 +1,4 @@
-import { Fragment, lazy, Suspense, useEffect, useRef, useState } from 'react'
+import { Fragment, lazy, Suspense, useState } from 'react'
 import { Copy, Send, Square, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -21,20 +21,6 @@ export function ChartAnalysisPanel({ instId, timeframe = '15m', session, ready, 
   const canRetry = Boolean(session?.turns.at(-1) && ['error', 'stopped'].includes(session.turns.at(-1)!.status))
   const [copyState, setCopyState] = useState<{ id: string; error: string } | null>(null)
   const [composing, setComposing] = useState(false)
-  const retryAttempt = useRef(0)
-  const onNewRef = useRef(onNew)
-  useEffect(() => { onNewRef.current = onNew }, [onNew])
-  useEffect(() => { retryAttempt.current = 0 }, [instId])
-  useEffect(() => {
-    if (session?.phase !== 'error') { if (session?.phase === 'ready') retryAttempt.current = 0; return }
-    if (!session.turns.length && !ready) return
-    const attempt = ++retryAttempt.current
-    const timer = window.setTimeout(() => {
-      if (session.turns.length) void chartAnalysis.retry(instId)
-      else onNewRef.current()
-    }, Math.min(30_000, 2_000 * 2 ** Math.min(attempt - 1, 4)))
-    return () => window.clearTimeout(timer)
-  }, [instId, ready, session?.phase, session?.error, session?.turns.length])
   const copy = async (id: string, text: string) => {
     try {
       const result = await window.radarDesktop.request({ copyText: text })
@@ -58,7 +44,7 @@ export function ChartAnalysisPanel({ instId, timeframe = '15m', session, ready, 
       {session?.capturedAt ? <p className="truncate text-xs text-muted-foreground" title={`${session.model} · Captured ${captureTime(session.capturedAt)} · ${session.rangeLabel}`}>Snapshot · {session.rangeLabel}</p> : null}
       <div className="flex items-center gap-2"><Button variant="outline" size="sm" disabled={busy || !ready} onClick={onNew}>{session?.image ? 'New analysis' : 'Analyze chart'}</Button>{busy && <Button variant="ghost" size="sm" onClick={() => chartAnalysis.stop(instId)}><Square data-icon="inline-start" />Stop</Button>}</div>
     </div>
-    {session?.error && <Alert variant="destructive"><AlertDescription>{session.error} Automatically retrying.</AlertDescription></Alert>}
+    {session?.error && <Alert variant="destructive"><AlertDescription>{session.error}</AlertDescription></Alert>}
     {copyState?.error && <Alert variant="destructive"><AlertDescription>{copyState.error}</AlertDescription></Alert>}
     <div className="min-h-0 flex-1">
       <MessageScrollerProvider key={instId} autoScroll>
@@ -80,7 +66,7 @@ export function ChartAnalysisPanel({ instId, timeframe = '15m', session, ready, 
     </div>
     <form className="shrink-0 border-t p-3" onSubmit={event => { event.preventDefault(); send() }}>
       <InputGroup>
-        <InputGroupTextarea name="analysis-question" aria-label="Ask a follow-up" placeholder={canRetry ? 'Retry the stopped response or ask something new…' : 'Ask about this snapshot…'} value={session?.draft ?? ''} disabled={!session?.image || busy} onChange={event => chartAnalysis.draft(instId, event.target.value)} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} onKeyDown={event => {
+        <InputGroupTextarea name="analysis-question" aria-label="Ask a follow-up" placeholder={canRetry ? 'Retry the response or ask something new…' : 'Ask about this snapshot…'} value={session?.draft ?? ''} disabled={!session?.image || busy} onChange={event => chartAnalysis.draft(instId, event.target.value)} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} onKeyDown={event => {
           if (event.key === 'Enter' && !event.shiftKey && !composing && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) { event.preventDefault(); send() }
         }} />
         <InputGroupAddon align="block-end" className="justify-end"><InputGroupButton type="submit" variant="outline" aria-label="Send follow-up" disabled={busy || !session?.image || (!session.draft.trim() && !canRetry)}><Send /></InputGroupButton></InputGroupAddon>
