@@ -193,7 +193,9 @@ export class MarketService {
     this.pendingCandidates = new Map()
     this.catalogControllers = new Set()
     this.qualificationReads = new Set()
+    this.qualificationReadQueue = []
     this.historicalSourceReads = new Map()
+    this.historicalWindows = new Map()
     this.historicalInputs = new WeakMap()
     this.historicalAssessments = new WeakMap()
     this.historicalValidations = new WeakSet()
@@ -368,8 +370,8 @@ export class MarketService {
         if (this.realtimeStatus !== state.status) {
           this.realtimeStatus = state.status; this.touchList()
           if (!this.closing) this.preparedCharts.sourceStateChanged()
+          this.scheduleMarketDeadline()
         }
-        this.scheduleMarketDeadline()
       },
       ...(this.webSocketFactory ? { webSocketFactory: this.webSocketFactory } : {}),
       onSubscribed: ({ instId }) => {
@@ -1454,6 +1456,7 @@ export class MarketService {
         if (record.status === 'failed') this.renewalTargets.delete(instId)
         membershipChanged ||= existing
       }
+      if (record.status !== 'verified') this.recoverRequiredSources(instId)
     }
     this.catalogSource = 'live'; this.catalogUpdatedAt = Date.now()
     // Durable catalog checkpoints belong to discovery/renewal. High-frequency
@@ -1611,6 +1614,16 @@ export class MarketService {
     for (const frame of ['5m', '1H']) if (rows ? rows.some(row => row.timeframe === frame) : timeframe === frame) {
       const key = `${instId}:${frame}`
       this.liquidityHistoryRevisions.set(key, this.liquidityHistoryRevision(instId, frame) + 1)
+      const window = this.historicalWindows.get(key)
+      if (!rows) this.historicalWindows.delete(key)
+      else if (window) {
+        for (const row of rows) if (row.timeframe === frame) window.rows.set(row.timestamp, row)
+        const step = timeframeMilliseconds(frame), through = closedBoundary(frame) - step
+        const from = through - (frame === '5m' ? 288 : 24) * step
+        for (const timestamp of window.rows.keys()) if (timestamp < from || timestamp > through) window.rows.delete(timestamp)
+        window.revision = this.liquidityHistoryRevision(instId, frame)
+        window.storeRevision = this.store.candlePriceRevision(instId, frame)
+      }
     }
     const observations = this.observations.get(instId)
     if (!observations) return
@@ -1752,11 +1765,19 @@ export class MarketService {
   recoverRequiredSources(instId) {
     if (!this.autoRefresh || this.closing || !this.candidateIDs?.has(instId)) return
     const config = this.prefs().liquidity, observations = this.observations.get(instId) ?? {}
+    if (this.cheapLiquidity(this.liquidityInput(this.instruments.get(instId), config, observations)).status === 'failed') {
+      for (const source of ['book', 'openInterest', 'turnover', 'hourly']) this.cancelRequiredRecovery(`${instId}:${source}`)
+      return
+    }
+    const awaitingInterest = config.openInterest.enabled && !this.observation(observations, 'openInterest')
+    const awaitingTicker = config.spread.enabled && !this.observation(observations, 'ticker')
     for (const source of ['book', 'openInterest', 'turnover', 'hourly']) {
       const enabled = source === 'book' ? config.depth.enabled || config.slippage.enabled
         : source === 'openInterest' ? config.openInterest.enabled : source === 'turnover' ? config.volume24h.enabled : config.volumeStability.enabled
       const key = `${instId}:${source}`
-      if (!enabled || this.observation(observations, source)) { this.cancelRequiredRecovery(key); continue }
+      // Recovery obeys the same cheap-source gate as discovery. Native ticks
+      // arriving while bulk OI is pending cannot fan out historical work.
+      if (!enabled || source !== 'openInterest' && (awaitingInterest || awaitingTicker) || this.observation(observations, source)) { this.cancelRequiredRecovery(key); continue }
       if (!this.sourceRecoveries.has(key)) this.sourceRecoveries.set(key, { key, instId, source, attempts: 0,
         retryAt: Math.max(Date.now(), source === 'openInterest' ? this.openInterest.retryAt : 0), task: null, controller: new AbortController() })
     }
@@ -1990,16 +2011,37 @@ export class MarketService {
     return task
   }
 
-  async readQualificationCandles(query, signal) {
-    // Bound only local I/O, never an acquisition's network/history wait. Keep
-    // the highest-priority store queue short enough for chart interactions.
-    while (this.qualificationReads.size >= 4) await abortable(Promise.race(this.qualificationReads), signal)
-    signal.throwIfAborted()
-    const read = this.store.candles(query, 'foreground')
-    const pending = read.then(() => undefined, () => undefined)
-    this.qualificationReads.add(pending)
-    try { return await read }
-    finally { this.qualificationReads.delete(pending) }
+  readQualificationCandles(query, signal) {
+    return new Promise((resolve, reject) => {
+      const request = { query, signal, resolve, reject }
+      const abort = () => {
+        const index = this.qualificationReadQueue.indexOf(request)
+        if (index >= 0) this.qualificationReadQueue.splice(index, 1)
+        reject(signal.reason)
+      }
+      if (signal.aborted) { abort(); return }
+      request.abort = abort
+      signal.addEventListener('abort', abort, { once: true })
+      this.qualificationReadQueue.push(request)
+      this.drainQualificationReads()
+    })
+  }
+
+  drainQualificationReads() {
+    // Wake only the next reader, rather than every waiting contract after
+    // every completion. Network acquisition never occupies these four slots.
+    while (this.qualificationReads.size < 4 && this.qualificationReadQueue.length) {
+      const request = this.qualificationReadQueue.shift()
+      request.signal.removeEventListener('abort', request.abort)
+      const pending = Promise.resolve().then(() => {
+        request.signal.throwIfAborted()
+        return this.store.candles(request.query, 'foreground')
+      }).then(request.resolve, request.reject).finally(() => {
+        this.qualificationReads.delete(pending)
+        this.drainQualificationReads()
+      })
+      this.qualificationReads.add(pending)
+    }
   }
 
   async observeHistoricalSource(instId, key, observations, signal, acquire, current) {
@@ -2018,13 +2060,38 @@ export class MarketService {
       const end = closedBoundary(timeframe), from = end - count * step, through = end - step
       const cached = this.observation(observations, key)
       if (cached?.value.asOf === end) return cached
+      const retained = this.historicalWindows.get(`${instId}:${timeframe}`)
+      if (retained?.revision === this.liquidityHistoryRevision(instId, timeframe)
+        && retained.storeRevision === this.store.candlePriceRevision(instId, timeframe)) {
+        const missing = []
+        for (let timestamp = from; timestamp <= through; timestamp += step) if (!retained.rows.has(timestamp)) missing.push(timestamp)
+        // An intact rolling window needs only its subscribed final. Do not
+        // rescan all historical rows or enqueue a repair just to await it.
+        if (missing.length === 1 && missing[0] === through && await this.awaitRealtimeCandle({ instrument: instId, timeframe, from: through, through, signal })) {
+          const mutation = this.candleMutations.get(instId)
+          if (mutation) await abortable(mutation, signal)
+          if (!this.historicalWindows.get(`${instId}:${timeframe}`)?.rows.has(through)) this.historicalWindows.delete(`${instId}:${timeframe}`)
+          continue
+        }
+      }
       let revision = this.liquidityHistoryRevision(instId, timeframe), rows, value
       const read = () => {
+        const windowKey = `${instId}:${timeframe}`, window = this.historicalWindows.get(windowKey)
+        const storeRevision = this.store.candlePriceRevision(instId, timeframe)
+        if (window?.revision === revision && window.storeRevision === storeRevision) {
+          const rows = [...window.rows.values()].filter(row => row.timestamp >= from && row.timestamp <= through).sort((a, b) => a.timestamp - b.timestamp)
+          try { return Promise.resolve({ rows, value: calculate(rows, end, from) }) }
+          catch { /* A missing completed slot still needs durable local/source repair. */ }
+        }
         const identity = `${instId}:${key}:${end}:${revision}`
         let task = this.historicalSourceReads.get(identity)
         if (!task) {
           task = this.readQualificationCandles({ instrument: instId, timeframe, from, through }, this.shutdownController.signal)
-            .then(rows => ({ rows, value: calculate(rows, end, from) }))
+            .then(rows => {
+              const value = calculate(rows, end, from)
+              if (revision === this.liquidityHistoryRevision(instId, timeframe) && storeRevision === this.store.candlePriceRevision(instId, timeframe)) this.historicalWindows.set(windowKey, { rows: new Map(rows.map(row => [row.timestamp, row])), revision, storeRevision })
+              return { rows, value }
+            })
             .finally(() => { if (this.historicalSourceReads.get(identity) === task) this.historicalSourceReads.delete(identity) })
           this.historicalSourceReads.set(identity, task)
           this.track(task)
@@ -2054,6 +2121,7 @@ export class MarketService {
       if (!current() || this.observations.get(instId) !== observations) return null
       if (end !== closedBoundary(timeframe)) continue
       value ??= calculate(rows, end, from)
+      this.historicalWindows.set(`${instId}:${timeframe}`, { rows: new Map(rows.map(row => [row.timestamp, row])), revision, storeRevision: this.store.candlePriceRevision(instId, timeframe) })
       if (key === 'turnover') this.cacheRankingCandles(instId, rows)
       const observation = { value: { asOf: end, ...value }, observedAt: Date.now(), expiresAt: end + step }
       this.historicalInputs.set(observation, new Map(rows.map(row => [row.timestamp, row.quoteVolume])))
@@ -2079,6 +2147,29 @@ export class MarketService {
     if (early.status === 'failed') {
       return this.publishCandidate(instrument, config, configKey, signal, observations, errors)
     }
+    const observeOpenInterest = async () => {
+      try {
+        if (!sources.openInterest) {
+          const task = this.openInterest.observe(signal, priority).catch(error => {
+            if (sources.openInterest === task) sources.openInterest = null
+            throw error
+          })
+          sources.openInterest = task
+        }
+        let values = await sources.openInterest
+        if (values.values().next().value?.expiresAt <= Date.now()) values = await this.openInterest.observe(signal, priority)
+        const observation = values.get(instId)
+        if (!observation) throw new Error(`Missing open-interest observation for ${instId}.`)
+        if (this.currentCandidate(instrument, configKey, signal)) this.acceptObservation(instId, 'openInterest', observation)
+        delete errors.openInterest
+      } catch (error) { errors.openInterest = error instanceof Error ? error.message : String(error) }
+    }
+    if (!localOnly && config.openInterest.enabled && !this.observation(observations, 'openInterest')) await observeOpenInterest()
+    // An authoritative bulk rejection must not queue historical downloads or
+    // local scans ahead of the contracts that can actually enter the list.
+    if (this.cheapLiquidity(this.liquidityInput(instrument, config, observations)).status === 'failed') {
+      return this.publishCandidate(instrument, config, configKey, signal, observations, errors)
+    }
     const observeHistory = async key => {
       try { await this.observeHistoricalSource(instId, key, observations, signal, !localOnly, () => this.currentCandidate(instrument, configKey, signal)) }
       catch (error) { errors[key] = error instanceof Error ? error.message : String(error) }
@@ -2096,6 +2187,7 @@ export class MarketService {
     // A known failing historical condition already excludes a contract; it
     // must not consume the live request budget needed by qualified contracts.
     const live = []
+    if (!localOnly && historicalResult.status !== 'failed' && config.openInterest.enabled && !this.observation(observations, 'openInterest')) live.push(observeOpenInterest())
     if (!localOnly && historicalResult.status !== 'failed') live.push(this.tickerObservation(instId, signal, priority).then(value => {
       if (!value) throw new Error(`Missing ticker observation for ${instId}.`)
       if (this.currentCandidate(instrument, configKey, signal)) observations.ticker = value
@@ -2105,24 +2197,6 @@ export class MarketService {
         const observation = await this.bookObservation(instId, signal, priority)
         if (this.currentCandidate(instrument, configKey, signal)) this.acceptObservation(instId, 'book', observation)
       } catch (error) { errors.book = error instanceof Error ? error.message : String(error) }
-    })())
-    if (!localOnly && historicalResult.status !== 'failed' && config.openInterest.enabled && !this.observation(observations, 'openInterest')) live.push((async () => {
-      try {
-        // One explicit source snapshot is shared by the whole refresh round.
-        // A candidate delayed by history renews it if its lease has elapsed.
-        if (!sources.openInterest) {
-          const task = this.openInterest.observe(signal, priority).catch(error => {
-            if (sources.openInterest === task) sources.openInterest = null
-            throw error
-          })
-          sources.openInterest = task
-        }
-        let values = await sources.openInterest
-        if (values.values().next().value?.expiresAt <= Date.now()) values = await this.openInterest.observe(signal, priority)
-        const observation = values.get(instId)
-        if (!observation) throw new Error(`Missing open-interest observation for ${instId}.`)
-        if (this.currentCandidate(instrument, configKey, signal)) this.acceptObservation(instId, 'openInterest', observation)
-      } catch (error) { errors.openInterest = error instanceof Error ? error.message : String(error) }
     })())
     await Promise.all(live)
     return this.publishCandidate(instrument, config, configKey, signal, observations, errors)
@@ -2152,6 +2226,9 @@ export class MarketService {
       const next = new Map(this.catalog)
       for (const { record, signal } of records) {
         if (this.catalogChecks.get(record.instrumentID) !== record || !this.currentCandidate(record.instrument, record.configKey, signal)) continue
+        // The subscription ACK may have arrived between validation and this
+        // deferred publication. Bind continuity once both facts are present.
+        this.rememberHistoricalAssessment(record)
         if (this.validCatalogEntry(record)) next.set(record.instrumentID, record)
         else next.delete(record.instrumentID)
       }
@@ -2317,12 +2394,14 @@ export class MarketService {
         await this.instrumentTask?.task.catch(() => undefined)
         if (this.closing || stream.signal.aborted || this.instrumentStream !== stream) return
         const signal = AbortSignal.any([stream.signal, this.shutdownController.signal])
-        const candidates = await this.discoverInstruments(this.catalogCriteriaKey(), signal, 'foreground')
+        await this.discoverInstruments(this.catalogCriteriaKey(), signal, 'foreground')
         if (this.closing || stream.signal.aborted || this.instrumentStream !== stream) return
         stream.synchronized = true
         this.verifyCatalog()
-        const config = this.prefs().liquidity, key = JSON.stringify(config), sources = {}
-        this.track(Promise.allSettled(candidates.map(instrument => this.checkCandidate(instrument, config, key, signal, 'foreground', { sources }))))
+        // Startup refresh already owns qualification and its priority order.
+        // Reconnection reuses that coordinator instead of admitting a second
+        // exchange-wide scan before the shared ticker snapshot has arrived.
+        if (!this.refreshing) this.track(this.refresh({ reuse: true }))
         this.sourceError('instruments', null)
       } catch (error) {
         if (this.closing || stream.signal.aborted || this.instrumentStream !== stream) return
@@ -2401,7 +2480,7 @@ export class MarketService {
         this.verifyCatalog()
         const [candidates] = await Promise.all([
           this.catalogInstruments(configKey, controller.signal, reuse),
-          ...(!reuse ? [this.tickerObservations(controller.signal, 'foreground', true)] : []),
+          ...(!reuse || !this.tickerFaults.size ? [this.tickerObservations(controller.signal, 'foreground', !reuse)] : []),
         ])
         if (controller.signal.aborted || this.catalogCriteriaKey() !== configKey) return
         this.verifyCatalog()

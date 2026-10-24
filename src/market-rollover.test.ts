@@ -192,6 +192,66 @@ test('a live 5m rollover keeps all rows and original source provenance, then rep
   } finally { unsubscribe(); await f.close() }
 })
 
+test('continuity binds when the native ACK arrives between historical validation and deferred publication', async context => {
+  const f = await fixture(context, { connected: false })
+  try {
+    f.socket.heldAcknowledgements.add(`candle5m:${ids[0]}`)
+    f.service.realtime.start(); f.socket.open()
+    await f.service.realtime.whenIdle()
+    assert.equal(f.service.realtime.isSubscribed(ids[0], '5m'), false)
+    f.service.catalog.delete(ids[0])
+    const put = f.service.metadata.putCatalogEntry.bind(f.service.metadata)
+    f.service.metadata.putCatalogEntry = (record: unknown) => {
+      const result = put(record)
+      for (const acknowledge of f.socket.acknowledgements.splice(0)) acknowledge()
+      return result
+    }
+    await f.service.checkCandidate(instruments[0], f.preferences.liquidity, f.service.catalogCriteriaKey(), f.service.shutdownController.signal, 'foreground', { localOnly: true })
+    await f.service.realtime.whenIdle()
+    assert.equal(f.service.realtime.isSubscribed(ids[0], '5m'), true)
+    await f.roll()
+    assert.deepEqual(await f.rowIDs(), [...ids].sort(), 'The ACK/publication ordering cannot revoke a validated continuous subscription at its first close.')
+  } finally { await f.close() }
+})
+
+test('completed native candles roll qualification windows forward without another full-window database read', async context => {
+  const f = await fixture(context, { hourly: true })
+  try {
+    let historicalReads = 0
+    const read = f.service.readQualificationCandles.bind(f.service)
+    f.service.readQualificationCandles = (...args: unknown[]) => { historicalReads++; return read(...args) }
+    for (const id of ids) await f.store.appendStatistics({ instrument: id, timeframe: '5m', source: 'oi',
+      from: f.asOf - fiveMinutes, through: f.asOf - fiveMinutes, values: [[f.asOf - fiveMinutes, 100]], observedAt: Date.now() })
+    await f.roll()
+    for (const id of ids) {
+      f.socket.candle(candle(id, f.asOf, 400_000))
+      f.socket.candle(candle(id, epoch, 2_000_000, '1H'))
+    }
+    await f.service.realtime.whenIdle()
+    await f.waitFor(() => ids.every(id => f.service.catalog.get(id)?.observations.turnover.value.asOf === f.boundary
+      && f.service.catalog.get(id)?.observations.hourly.value.asOf === f.boundary))
+    assert.equal(historicalReads, 0, 'Previously validated windows consume only newly committed native observations.')
+    assert.deepEqual(await f.rowIDs(), [...ids].sort())
+    assert.ok(ids.every(id => f.service.catalog.get(id).result.turnover === 57_800_000))
+    f.assertNoRefresh()
+  } finally { await f.close() }
+})
+
+test('ordinary forming ticks do not rescan every instrument deadline', async context => {
+  const f = await fixture(context)
+  try {
+    let scans = 0
+    const schedule = f.service.scheduleMarketDeadline.bind(f.service)
+    f.service.scheduleMarketDeadline = () => { scans++; return schedule() }
+    for (let index = 0; index < 100; index++) {
+      context.mock.timers.tick(1)
+      f.socket.candle({ ...candle(ids[index % ids.length], f.asOf), confirmed: false, volume: 2_000 + index })
+    }
+    await f.service.realtime.whenIdle()
+    assert.equal(scans, 0, 'Updated quote timestamps do not change qualification deadlines.')
+  } finally { await f.close() }
+})
+
 test('a newly committed final that fails the volume threshold removes only its instrument', async context => {
   const f = await fixture(context, { threshold: 57_500_000 })
   try {

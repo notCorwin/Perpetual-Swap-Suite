@@ -117,7 +117,7 @@ export class MarketStore {
 
   constructor(root, path, writer, readers) {
     this.root = root; this.path = path; this.closed = false; this.closeTask = null
-    this.revisions = new Map(); this.mutations = new Map(); this.operations = new Set()
+    this.revisions = new Map(); this.priceRevisions = new Map(); this.mutations = new Map(); this.operations = new Set()
     this.listeners = new Set(); this.migration = null; this.migrationPending = new Map(); this.migrationWrites = new Set(); this.nextMigrationID = 0
     this.writeMetrics = { partitions: 0, rowsSubmitted: 0, bytesRead: 0, bytesWritten: 0, durationMS: 0 }
     this.writer = new DatabaseWorkers([writer], (mutations, duration) => this.committed(mutations, duration))
@@ -138,6 +138,7 @@ export class MarketStore {
     for (const change of changes) {
       const key = keyOf(change.instrument, change.timeframe), revision = (this.revisions.get(key) ?? 0) + 1
       this.revisions.set(key, revision)
+      if (change.priceFrom !== null) this.priceRevisions.set(key, (this.priceRevisions.get(key) ?? 0) + 1)
       const journal = this.mutations.get(key) ?? []
       journal.push({ revision, range: { from: change.from, through: change.through } })
       if (journal.length > 256) journal.shift()
@@ -148,6 +149,7 @@ export class MarketStore {
 
   subscribe(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener) }
   candleRevision(instrument, timeframe) { return this.revisions.get(keyOf(instrument, timeframe)) ?? 0 }
+  candlePriceRevision(instrument, timeframe) { return this.priceRevisions.get(keyOf(instrument, timeframe)) ?? 0 }
   candleChangesSince(instrument, timeframe, previousRevision) {
     const revision = this.candleRevision(instrument, timeframe)
     if (previousRevision === revision) return { revision, ranges: [] }

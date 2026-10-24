@@ -131,6 +131,40 @@ test('a known failing spread excludes a contract without downloading its history
   } finally { await f.close() }
 })
 
+test('a shared bulk OI rejection skips history and books for the entire excluded universe', async context => {
+  const instruments = Array.from({ length: 289 }, (_, index) => instrument(`COIN${index}`))
+  const eligible = instruments.slice(-14), eligibleIDs = new Set(eligible.map(value => value.instId))
+  const paths: string[] = [], histories: string[] = []
+  const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
+  const f = await fixture(preferences('spread', 'depth', 'slippage', 'volume24h', 'openInterest'), async input => {
+    const url = new URL(String(input)), path = url.pathname
+    paths.push(path)
+    if (path.endsWith('/public/instruments')) return response(instruments)
+    if (path.endsWith('/market/tickers')) return response(instruments.map(value => ticker(value.instId)))
+    if (path.endsWith('/public/open-interest')) return response(instruments.map(value => ({ instId: value.instId, oiUsd: eligibleIDs.has(value.instId) ? '6000000' : '1' })))
+    if (path.endsWith('/market/books')) {
+      assert.ok(eligibleIDs.has(url.searchParams.get('instId')!))
+      return response([book])
+    }
+    throw new Error(`Unexpected endpoint: ${path}`)
+  })
+  try {
+    f.service.history.ensurePrices = async (id: string) => {
+      histories.push(id)
+      assert.ok(eligibleIDs.has(id), 'A known OI failure cannot consume a historical request slot.')
+      return { rows: Array.from({ length: 288 }, (_, index) => ({ instrument: id, timeframe: '5m', timestamp: asOf - (288 - index) * fiveMinutes,
+        open: 99, high: 101, low: 98, close: 100, volume: 2_000, baseVolume: 20, quoteVolume: 200_000, confirmed: true })) }
+    }
+    const started = performance.now()
+    await f.service.refresh()
+    context.diagnostic(`289 contracts: ${histories.length} historical acquisitions, ${paths.filter(path => path.endsWith('/public/open-interest')).length} bulk OI request, ${(performance.now() - started).toFixed(1)} ms.`)
+    assert.deepEqual(new Set(histories), eligibleIDs)
+    assert.equal(paths.filter(path => path.endsWith('/public/open-interest')).length, 1)
+    assert.deepEqual(new Set(f.service.listRowsFor('15m').map(row => row.instId)), eligibleIDs)
+    assert.equal((await f.service.snapshot()).catalogProgress.failed, 275)
+  } finally { await f.close() }
+})
+
 test('a book arriving after contract metadata changes cannot repopulate its invalidated observation', async () => {
   const gate = deferred()
   let current = instrument(), started = false
@@ -190,7 +224,8 @@ test('a recovered OI source can serve a later history completion after the share
     gate.resolve(); await refresh
     assert.equal(oiCalls, 2, 'The shared deadline permits one new acquisition after network recovery.')
     assert.equal(f.service.catalog.get(instruments[1].instId)?.status, 'verified')
-    assert.equal(f.service.observations.get(instruments[0].instId).openInterest, undefined, 'The failed first attempt cannot manufacture an observation.')
+    const recovered = f.service.observations.get(instruments[0].instId).openInterest
+    if (recovered) assert.equal(recovered.observedAt, now, 'A sibling can reuse the successful recovery, never manufacture a lease from the failed first attempt.')
   } finally { gate.resolve(); await refresh; await f.close() }
 })
 

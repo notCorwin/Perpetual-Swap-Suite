@@ -67,6 +67,7 @@ export class MarketStore {
   getWriteMetrics(): { partitions: number; rowsSubmitted: number; bytesRead: number; bytesWritten: number; durationMS: number }
   getDiagnostics(): { workerThreadIds: { writer: number; readers: number[] }; reads: Record<string, number>; writes: Record<string, number>; migrationComplete: boolean; migrationProcessId: number | null }
   candleRevision(instrument: string, timeframe: string): number
+  candlePriceRevision(instrument: string, timeframe: string): number
   candleChangesSince(instrument: string, timeframe: string, revision: number): { revision: number; ranges: CandleRange[] | null }
   candles(query: CandleQuery, priority?: StorePriority): Promise<CandleRecord[]>
   candleWatermark(instrument: string, timeframe: string, priority?: StorePriority): Promise<string>

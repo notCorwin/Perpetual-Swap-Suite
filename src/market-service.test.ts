@@ -359,7 +359,7 @@ test('discovery follows enabled conditions and publishes before a slower candida
     if (url.pathname.endsWith('/public/instruments')) return response([instrument, { ...instrument, instId: 'ETH-USDT-SWAP' }])
     if (url.pathname.endsWith('/market/tickers')) return response([ticker, { ...ticker, instId: 'ETH-USDT-SWAP' }])
     if (url.pathname.endsWith('/public/open-interest')) {
-      return response([{ instId, oiUsd: '6000000' }, { instId: 'ETH-USDT-SWAP', oiUsd: '1' }])
+      return response([{ instId, oiUsd: '6000000' }, { instId: 'ETH-USDT-SWAP', oiUsd: '6000000' }])
     }
     if (url.pathname.endsWith('/market/books')) {
       if (url.searchParams.get('instId') === instId) return response([{ asks: [['100', '200001']], bids: [['99.99', '200001']] }])
@@ -375,7 +375,7 @@ test('discovery follows enabled conditions and publishes before a slower candida
     await waitFor(() => slowStarted && f.service.catalog.has(instId))
     assert.equal((await f.service.snapshot()).rows[0].instId, instId)
     assert.equal(f.service.refreshing !== null, true)
-    resolveSlow(response([{ asks: [['100', '200001']], bids: [['99.99', '200001']] }]))
+    resolveSlow(response([{ asks: [['100', '1']], bids: [['99.99', '1']] }]))
     await refresh
     assert.deepEqual((await f.service.snapshot()).rows.map(row => row.instId), [instId])
   } finally { resolveSlow?.(response([])); await f.close() }
@@ -517,7 +517,7 @@ test('expired qualification stays hidden after unavailable observations and reco
   } finally { await f.close() }
 })
 
-test('historical preparation completes before live liquidity and repairs only the ticker aged during the wait', async () => {
+test('bulk OI excludes candidates before history and only the ticker aged during repair is reacquired', async () => {
   const configuration = disabled()
   for (const key of ['spread', 'depth', 'slippage', 'volume24h', 'openInterest'] as const) configuration.liquidity[key].enabled = true
   let preparing = false, tickerCalls = 0, targetedTickerCalls = 0, bookCalls = 0, oiCalls = 0
@@ -544,7 +544,7 @@ test('historical preparation completes before live liquidity and repairs only th
     }
     refresh = f.service.refresh()
     await waitFor(() => preparing)
-    assert.deepEqual([tickerCalls, bookCalls, oiCalls], [1, 0, 0])
+    assert.deepEqual([tickerCalls, bookCalls, oiCalls], [1, 0, 1])
     f.service.tickerCache.observedAt = Date.now() - 90_001
     for (const value of f.service.tickerCache.values.values()) value.expiresAt = Date.now() - 1
     release(); await refresh
@@ -623,12 +623,13 @@ test('restored renewal targets include prior qualification without turning every
   } finally { await restored?.dispose(); await f.close() }
 })
 
-test('known failing historical turnover does not consume live liquidity requests', async () => {
+test('known failing historical turnover does not consume per-contract book requests', async () => {
   const configuration = disabled()
   for (const key of ['spread', 'depth', 'openInterest', 'volume24h'] as const) configuration.liquidity[key].enabled = true
   let liveCalls = 0
   const f = await fixture(configuration, discovery(url => {
-    if (url.pathname.endsWith('/market/books') || url.pathname.endsWith('/public/open-interest')) liveCalls += 1
+    if (url.pathname.endsWith('/public/open-interest')) return response([{ instId, oiUsd: '6000000' }])
+    if (url.pathname.endsWith('/market/books')) liveCalls += 1
     throw new Error(`A known historical rejection must not request ${url}`)
   }))
   try {
@@ -1609,8 +1610,8 @@ test('a historical correction during a live observation cannot restore the previ
     assert.deepEqual((await f.service.snapshot()).rows, [])
     release(); await refresh
     const invalidated = f.service.metadata.getCatalogEntry(instId)
-    assert.equal(invalidated.status, 'unknown')
-    assert.equal(invalidated.result.turnover, null, 'Completing a live request must not republish a historical total invalidated during that request.')
+    assert.equal(invalidated.status, 'failed')
+    assert.equal(invalidated.result.turnover, 57_400_000, 'Qualification must use the correction committed while the bulk source was pending.')
     assert.deepEqual((await f.service.snapshot()).rows, [])
     blockOI = false
     await f.service.refresh()
@@ -2050,6 +2051,9 @@ test('turnover source recovery rereads a durable correction and cannot publish a
     hold.resolve(); await pending
     assert.equal(f.service.observations.get(instId).turnover.value.turnover, 57_800_000)
     delete f.service.observations.get(instId).turnover
+    // Force a new canonical read; an unchanged in-memory window otherwise
+    // satisfies this demand without entering the deliberately held store.
+    f.service.historicalWindows.delete(`${instId}:5m`)
     const retired = turnoverRecovery(f.service), cancelled = deferred(), entered = deferred()
     blocked = false
     f.store.candles = async (query, priority) => {
