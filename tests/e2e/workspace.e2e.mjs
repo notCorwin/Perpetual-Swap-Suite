@@ -279,7 +279,7 @@ test('chart source updates stay outside the plot without resizing its viewport a
         frame.latestEnd = frame.endHour
         frame.bars = [...frame.bars.slice(1), { ...frame.bars.at(-1), hour: frame.endHour,
           oi: null, buy: null, sell: null, statisticsSources: observed ? 3 : 0,
-          statisticsObserved: observed, oiObserved: observed, takerObserved: observed, indicatorsObserved: observed }]
+          statisticsObserved: observed, oiObserved: observed, takerObserved: observed, indicatorsObserved: true }]
       }
       Object.assign(frame, status)
       BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
@@ -305,7 +305,9 @@ test('chart source updates stay outside the plot without resizing its viewport a
       })
       const baseline = await geometry()
       for (const value of ['loading', 'unavailable']) {
-        await publish({ oiState: value, takerState: value, indicatorState: value === 'loading' ? 'loading' : 'ready' })
+        // Statistics arrive independently of already calculated price curves.
+        // An uncalculated navigation frame intentionally retains the old plot.
+        await publish({ oiState: value, takerState: value, indicatorState: 'ready' })
         await status.getByText(value === 'loading' ? 'Loading OI history…' : 'OI is not published for part of this range', { exact: true }).waitFor()
         const current = await geometry()
         assert.equal(current.statusInsidePlot, false)
