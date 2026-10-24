@@ -56,7 +56,8 @@
   --negative: rgb(232 85 168);
   --analysis-panel-width: 400px;
   --chart-annotation: var(--muted);
-  --chart-rsi-area: color-mix(in srgb, var(--foreground) 5%, transparent);
+  --chart-threshold: color-mix(in srgb, var(--foreground) 29%, transparent);
+  --chart-midpoint: color-mix(in srgb, var(--foreground) 6.5%, transparent);
   --chart-roc-positive-area: color-mix(in srgb, var(--positive) 12%, transparent);
   --chart-roc-negative-area: color-mix(in srgb, var(--negative) 12%, transparent);
   --chart-positive-label: color-mix(in srgb, var(--positive) 50%, var(--foreground));

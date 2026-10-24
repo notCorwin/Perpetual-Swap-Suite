@@ -3,6 +3,7 @@ import { chartCandleWidth, chartHourX, chartLayout } from './chart-layout.ts'
 import type { Bar } from './chart-data.ts'
 import { finitePercentage, formatPercent } from './market-percent.ts'
 import { measureOperation } from '../electron/services/operations.js'
+import { chartRsiCrossings } from './rsi-crossings.ts'
 
 const compactFormatter = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 5, notation: 'compact' })
 const priceFormatter = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 8 })
@@ -89,6 +90,15 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
   const barWidth = chartCandleWidth(right - left)
   const priceY = priceAxis.kind === 'linear' ? linearScale(priceAxis.min, priceAxis.max, panels.price) : logScale(priceAxis, panels.price)
   const rsiY = linearScale(0, 100, panels.rsi), rocY = linearScale(rocAxis.min, rocAxis.max, panels.roc)
+  const rsiCrossings = chartRsiCrossings(bars, intervalMS)
+  const rsiMarkers: (typeof rsiCrossings[number] & { levels: (30 | 70)[]; x: number; y: number; d: string })[] = []
+  for (const crossing of rsiCrossings) {
+    const previous = rsiMarkers.at(-1)
+    if (previous?.index === crossing.index && previous.field === crossing.field) { previous.levels.push(crossing.level); continue }
+    const pointX = x[crossing.index], pointY = rsiY(crossing.value), baseY = pointY + (crossing.direction === 'up' ? 5 : -5)
+    rsiMarkers.push({ ...crossing, levels: [crossing.level], x: pointX, y: pointY,
+      d: `M${pointX.toFixed(1)} ${pointY.toFixed(1)} L${(pointX - 3.5).toFixed(1)} ${baseY.toFixed(1)} L${(pointX + 3.5).toFixed(1)} ${baseY.toFixed(1)} Z` })
+  }
   const atrY = linearScale(atrRange.min, atrRange.max, panels.atr)
   const bbwY = linearScale(bbwRange.min, bbwRange.max, panels.atr)
   const oiY = oiAxis ? logScale(oiAxis, panels.oi) : () => NaN
@@ -167,7 +177,7 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
     if (takerAvailable && sell > 0) sells.push(rectangle(center - barWidth / 2, totalY, barWidth, buyY - totalY))
   }
   return Object.freeze({
-    ...options, layout, gutter, x, priceAxis, rocAxis, atrRange, bbwRange, oiAxis, takerAxis, priceY, rsiY, rocY, atrY, bbwY, oiY, takerY, rocZeroY,
+    ...options, layout, gutter, x, priceAxis, rocAxis, atrRange, bbwRange, oiAxis, takerAxis, priceY, rsiY, rocY, atrY, bbwY, oiY, takerY, rocZeroY, rsiMarkers,
     priceTicks: priceAxis.ticks.map((value, index) => ({ y: priceY(value), label: priceLabelsText[index] })),
     oiTicks: oiAxis?.ticks.map((value, index) => ({ y: oiY(value), label: oiLabelsText[index] })) ?? [],
     takerTicks: takerAxis.ticks.map((value, index) => ({ y: takerY(value), label: takerLabelsText[index] })),

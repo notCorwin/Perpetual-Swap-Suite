@@ -13,6 +13,7 @@ import { chartCaptureBounds } from '@/chart-capture'
 import { CHART_PANELS, chartPriceLabelLayout, type ChartPanel as Panel } from "@/chart-layout"
 import { chartCompact as compact, chartPrice as price, chartPercent, type ChartGeometry } from "@/chart-geometry"
 import { chartStatisticsSamples } from '@/chart-legend'
+import { RSI_FIELDS, type RsiField } from '@/rsi-crossings'
 import { cn } from "@/lib/utils"
 import { chartNavigationTarget } from "@/market-sort"
 import { formatPercent } from "@/market-percent"
@@ -52,7 +53,7 @@ const chartTextWidth = (text: string, fontSize: number = chartTokens.textSize) =
   const cached = chartTextWidths.get(key)
   if (cached !== undefined) return cached
   if (!legendContext) return normalized.length * fontSize * .7
-  legendContext.font = `${fontSize}px ${chartStyle.fontFamily || 'ui-sans-serif, system-ui, sans-serif'}`
+  legendContext.font = `${fontSize}px ${chartStyle.getPropertyValue('--font-mono').trim() || 'ui-monospace, monospace'}`
   const width = legendContext.measureText(normalized).width
   chartTextWidths.set(key, width)
   return width
@@ -88,7 +89,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const statistics = chartStatisticsSamples(bars, inspected)
   const { height, endHour, intervalMS, gutter, x, firstHour, candleHigh, candleLow, highIndex, lowIndex,
     oiComplete, takerComplete, oiSamples, takerAvailable, rocAxis, oiAxis,
-    priceY, rsiY, oiY, rocZeroY, lines, rocAreas, bollBands, upWicks, downWicks, upBodies, downBodies, buys, sells } = geometry
+    priceY, rsiY, oiY, rocZeroY, lines, rocAreas, bollBands, upWicks, downWicks, upBodies, downBodies, buys, sells, rsiMarkers } = geometry
   const { panels, columns, axisStarts, headerY, right } = geometry.layout
   const tag = { price: liveBar.close, rising: liveBar.close >= liveBar.open, inViewport: liveBar.hour <= endHour + (liveOverlay ? intervalMS : 0) }
   const latestY = priceY(tag.price)
@@ -96,6 +97,13 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const latestPrice = `${price(tag.price)} ${tag.rising ? '↑' : '↓'}`
   const priceLabel = chartPriceLabelLayout(latestY, panels.price, chartTokens.textSize, chartTokens.priceLabelPaddingY, liveOverlay)
   const tickHalfHeight = chartTokens.textSize / 2
+  const inspectedTime = inspected === null ? null : time(active.hour)
+  const inspectedTimeWidth = inspectedTime ? chartTextWidth(inspectedTime) + 12 : 0
+  const inspectedTimeX = inspected === null ? 0 : Math.max(columns.rsi[0], Math.min(right - inspectedTimeWidth, x[inspected] - inspectedTimeWidth / 2))
+  const rsiValue = (field: RsiField) => {
+    const marker = inspected === null ? undefined : rsiMarkers.find(marker => marker.index === inspected && marker.field === field)
+    return `${active[field]?.toFixed(1) ?? '—'}${marker ? ` ${marker.direction === 'up' ? '↑' : '↓'}${marker.levels.join('/')}` : ''}`
+  }
   const lineStroke = (key: keyof Bar, d: string, color: string, dash?: string) => <path data-chart-indicator={key} d={d} fill="none" stroke={color} strokeLinecap="round" strokeLinejoin="round" strokeDasharray={dash} />
   const lineLabel = (x: number, y: number, label: string, color = "var(--muted-foreground)") =>
     <text x={x} y={y} dominantBaseline="middle" fill={color}>{label}</text>
@@ -117,7 +125,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       {items.map(([label, value, color, dash, sourceHour], index) => {
         const itemStart = cursor
         cursor += widths[index] + gap
-        const labelColor = key === "taker" ? index === 0 ? "var(--chart-positive-label)" : "var(--chart-negative-label)" : color
+        const labelColor = key === "rsi" ? "var(--muted-foreground)" : key === "taker" ? index === 0 ? "var(--chart-positive-label)" : "var(--chart-negative-label)" : color
         return <g key={label} transform={`translate(${itemStart},0)`} data-chart-legend-source-hour={sourceHour}>
         {key === "taker" && !dash && <line data-chart-legend-outline={label} x1="0" x2="18" stroke="var(--foreground)" />}
         <line data-chart-legend={label} x1="0" x2="18" stroke={color} strokeDasharray={key === "taker" && !dash ? "2 3" : dash} />
@@ -142,12 +150,15 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       <path d={area} fill="var(--chart-roc-positive-area)" clipPath={`url(#${areaClipId}-positive)`} />
       <path d={area} fill="var(--chart-roc-negative-area)" clipPath={`url(#${areaClipId}-negative)`} />
     </g>)}
-    <rect x={columns.rsi[0]} y={rsiY(100)} width={columns.rsi[1] - columns.rsi[0]} height={rsiY(70) - rsiY(100)} fill="var(--chart-rsi-area)" />
-    <rect x={columns.rsi[0]} y={rsiY(30)} width={columns.rsi[1] - columns.rsi[0]} height={rsiY(0) - rsiY(30)} fill="var(--chart-rsi-area)" />
+    {[30, 50, 70].map(level => <line key={level} data-chart-rsi-threshold={level} x1={columns.rsi[0]} x2={columns.rsi[1]} y1={rsiY(level)} y2={rsiY(level)} stroke={level === 50 ? 'var(--chart-midpoint)' : 'var(--chart-threshold)'} />)}
     {grid}
     {rocZeroY > panels.roc[0] && rocZeroY < panels.roc[1] && <line x1={columns.roc[0]} x2={columns.roc[1]} y1={rocZeroY} y2={rocZeroY} stroke="var(--muted-foreground)" strokeOpacity="0.5" />}
     {bars.flatMap((bar, index) => (bar.hour - firstHour) % (12 * intervalMS) === 0 ? panelKeys.map(key => <line key={`${(bar.hour - firstHour) / intervalMS}-${key}`} x1={x[index]} x2={x[index]} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--border)" strokeOpacity="0.22" />) : [])}
-    {bars.map((bar, index) => ({ bar, index })).filter(({ bar, index }) => index === n - 1 || (bar.hour - firstHour) % (24 * intervalMS) === 0).map(({ bar, index }) => <text key={(bar.hour - firstHour) / intervalMS} x={x[index]} y={height - 7} textAnchor={index === 0 ? "start" : index === n - 1 ? "end" : "middle"} fill="var(--muted-foreground)">{hourLabel(bar.hour)}</text>)}
+    {bars.map((bar, index) => ({ bar, index })).filter(({ bar, index }) => index === n - 1 || (bar.hour - firstHour) % (24 * intervalMS) === 0).filter(({ bar, index }) => {
+      if (!inspectedTime) return true
+      const width = chartTextWidth(hourLabel(bar.hour)), start = x[index] - (index === 0 ? 0 : index === n - 1 ? width : width / 2)
+      return start + width < inspectedTimeX - 4 || start > inspectedTimeX + inspectedTimeWidth + 4
+    }).map(({ bar, index }) => <text key={(bar.hour - firstHour) / intervalMS} x={x[index]} y={height - 7} textAnchor={index === 0 ? "start" : index === n - 1 ? "end" : "middle"} fill="var(--muted-foreground)">{hourLabel(bar.hour)}</text>)}
     {geometry.priceTicks.map(({ y, label }, index) => <g key={index} data-chart-price-tick><line x1={columns.price[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.35" />{(!tag.inViewport || y + tickHalfHeight < priceLabel.top || y - tickHalfHeight > priceLabel.bottom) && lineLabel(axisStarts.price, y, label)}</g>)}
     <line x1={right} x2={right} y1={panels.price[0]} y2={panels.taker[1]} stroke="var(--border)" opacity="0.8" />
     {tag.inViewport && tag.rising && <line data-chart-live-price-outline x1={columns.price[0]} x2={right} y1={latestY} y2={latestY} stroke="var(--foreground)" />}
@@ -171,7 +182,11 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {lineStroke("ema", lines.ema, "var(--chart-3)", "7 4")}
     {lineStroke("rsi6", lines.rsi6, "var(--chart-1)")}
     {lineStroke("rsi12", lines.rsi12, "var(--chart-2)", "7 4")}
-    {lineStroke("rsi24", lines.rsi24, "var(--chart-3)", "1 4")}
+    {lineStroke("rsi24", lines.rsi24, "var(--chart-3)", "3 4")}
+    {rsiMarkers.map(marker => <path key={`${marker.field}:${marker.hour}`} data-chart-rsi-crossing={marker.field} data-chart-rsi-direction={marker.direction} data-chart-rsi-levels={marker.levels.join('/')} data-chart-rsi-hour={marker.hour}
+      d={marker.d} fill={`var(--chart-${RSI_FIELDS.indexOf(marker.field) + 1})`} stroke="var(--background)" strokeLinejoin="round">
+      <title>{`${time(marker.hour)} · RSI(${marker.field.slice(3)}) crossed ${marker.direction === 'up' ? 'above' : 'below'} ${marker.levels.join(' and ')} · ${marker.value.toFixed(1)}${bars[marker.index].confirmed ? '' : ' · Forming candle'}`}</title>
+    </path>)}
     <g data-chart-volatility-panel data-chart-panel-top={panels.atr[0]} data-chart-panel-bottom={panels.atr[1]}>
       {lineStroke("atrPercent", lines.atrPercent, "var(--chart-3)")}
       {lineStroke("bbw", lines.bbw, "var(--chart-1)", "7 4")}
@@ -198,14 +213,16 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     </g>}
     {legend("price", [["VWAP(14)", price(active.vwap), "var(--chart-2)", "2 3"], ["EMA(200)", price(active.ema), "var(--chart-3)", "7 4"], ["BOLL(20,2)", `U ${price(active.bollUpper)}\u00a0·\u00a0M ${price(active.bollMiddle)}\u00a0·\u00a0L ${price(active.bollLower)}`, "var(--chart-1)"]])}
     {legend("roc", [["ROC(9)", formatPercent(active.roc), "var(--chart-1)"], ["MAROC(9)", formatPercent(active.maroc), "var(--chart-2)", "7 4"]])}
-    {legend("rsi", [["RSI(6)", active.rsi6?.toFixed(1) ?? "—", "var(--chart-1)"], ["RSI(12)", active.rsi12?.toFixed(1) ?? "—", "var(--chart-2)", "7 4"], ["RSI(24)", active.rsi24?.toFixed(1) ?? "—", "var(--chart-3)", "1 4"]])}
+    {legend("rsi", [["RSI(6)", rsiValue('rsi6'), "var(--chart-1)"], ["RSI(12)", rsiValue('rsi12'), "var(--chart-2)", "7 4"], ["RSI(24)", rsiValue('rsi24'), "var(--chart-3)", "3 4"]])}
     {legend("atr", [["ATR%(14)", chartPercent(active.atrPercent), "var(--chart-3)"], ["BBW(20,2)", chartPercent(active.bbw), "var(--chart-1)", "7 4"]])}
     {legend("oi", [["OI (Contracts)", statistics.oi ? compact(statistics.oi.oi) : oiState === "loading" ? "Loading…" : oiState === "error" ? "Failed" : "Unavailable", "var(--chart-2)", undefined, statistics.oi?.hour]])}
     {legend("taker", [["↑ Taker Buy (Contracts)", statistics.taker ? compact(statistics.taker.buy) : takerState === "loading" ? "Loading…" : takerState === "error" ? "Failed" : "Unavailable", "var(--positive)", undefined, statistics.taker?.hour], ["↓ Taker Sell (Contracts)", statistics.taker ? compact(statistics.taker.sell) : takerState === "loading" ? "Loading…" : takerState === "error" ? "Failed" : "Unavailable", "var(--negative)", "2 3", statistics.taker?.hour]])}
-    {panels.rsi[1] - panels.rsi[0] >= 35 && <>{lineLabel(axisStarts.rsi, panels.rsi[0], "100")}{lineLabel(axisStarts.rsi, panels.rsi[1], "0")}</>}
+    {[30, 70].map(level => <g key={level} data-chart-rsi-tick={level}>{lineLabel(axisStarts.rsi, rsiY(level), String(level), 'var(--foreground)')}</g>)}
+    {panels.rsi[1] - panels.rsi[0] >= chartTokens.textSize * 6 && <>{lineLabel(axisStarts.rsi, rsiY(100), '100')}{lineLabel(axisStarts.rsi, rsiY(50), '50')}{lineLabel(axisStarts.rsi, rsiY(0), '0')}</>}
     {panels.roc[1] - panels.roc[0] >= 35 && <>{lineLabel(axisStarts.roc, panels.roc[0], formatPercent(rocAxis.max, rocAxis.decimals))}{lineLabel(axisStarts.roc, panels.roc[1], formatPercent(rocAxis.min, rocAxis.decimals))}</>}
     {oiAxis && panels.oi[1] - panels.oi[0] >= 35 && geometry.oiTicks.map(({ y, label }, index) => <g key={index}><line x1={columns.oi[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.25" />{lineLabel(axisStarts.oi, y, label)}</g>)}
     {panels.taker[1] - panels.taker[0] >= 35 && geometry.takerTicks.map(({ y, label }, index) => <g key={index}>{lineLabel(axisStarts.taker, y, label)}</g>)}
+    {inspectedTime && <g data-chart-inspected-time><rect x={inspectedTimeX} y={height - 19} width={inspectedTimeWidth} height={18} rx={3} fill="var(--chart-annotation)" /><text x={inspectedTimeX + inspectedTimeWidth / 2} y={height - 7} textAnchor="middle" fill="var(--foreground)">{inspectedTime}</text></g>}
   </>
   })
 })
@@ -234,9 +251,9 @@ const PreparedPlot = memo(function PreparedPlot({ instId, timeframe, size, selec
       data-rendered-start={bars[0]!.hour} data-rendered-end={bars.at(-1)!.hour}
       viewBox={`0 0 ${size.width} ${size.height}`} aria-hidden={!selected}
       style={{ visibility: selected ? 'visible' : 'hidden' }}
-      className={cn('absolute inset-0 h-full w-full text-[length:var(--chart-text-size)] select-none focus-visible:outline-2 focus-visible:outline-ring', !selected && 'pointer-events-none')}
+      className={cn('absolute inset-0 h-full w-full font-mono text-[length:var(--chart-text-size)] select-none focus-visible:outline-2 focus-visible:outline-ring', !selected && 'pointer-events-none')}
       role="img" tabIndex={selected ? 0 : -1}
-      aria-label={`${instId} ${bars.length}-candle ${timeframeLabel(timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end. Scroll to review history. Arrow keys navigate markets.`}>
+      aria-label={`${instId} ${bars.length}-candle ${timeframeLabel(timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end. Hover RSI crossing triangles to inspect their candle and time. Alt+Left and Alt+Right inspect RSI crossings; Escape clears inspection. Scroll to review history. Arrow keys navigate markets.`}>
       <Plot bars={bars} geometry={geometry} liveBar={surface.liveBar ?? bars.at(-1)!} liveOverlay={!!surface.liveBar}
         inspected={selected ? inspected : null} oiState={surface.oiState} takerState={surface.takerState} oiStatus={surface.oiStatus} takerStatus={surface.takerStatus} />
     </svg>
@@ -381,6 +398,21 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
     }
     setInspection({ instId: surface.instId, timeframe: surface.timeframe, hour: bars[nearest].hour })
   }
+  const inspectCrossingAt = (target: SVGSVGElement, hovered: Element, clientX: number, clientY: number) => {
+    if (!surface || !plotGeometry) return
+    const rect = target.getBoundingClientRect()
+    if (!(rect.width > 0 && rect.height > 0)) return
+    const exactHour = hovered.closest('[data-chart-rsi-crossing]')?.getAttribute('data-chart-rsi-hour')
+    let nearest: number | null = exactHour ? plotGeometry.rsiMarkers.find(marker => marker.hour === Number(exactHour))?.index ?? null : null
+    let distance = 12
+    if (nearest === null) for (const marker of plotGeometry.rsiMarkers) {
+      const next = Math.hypot(rect.left + marker.x * rect.width / plotSize.width - clientX, rect.top + marker.y * rect.height / plotSize.height - clientY)
+      if (next < distance) { distance = next; nearest = marker.index }
+    }
+    const hour = nearest === null ? null : bars[nearest].hour
+    setInspection(current => hour === null ? null : current?.instId === surface.instId && current.timeframe === surface.timeframe && current.hour === hour
+      ? current : { instId: surface.instId, timeframe: surface.timeframe, hour })
+  }
   const captureChart = async () => {
     if (pending || !surface || !chartRef.current) return
     setCapture({ status: 'copying', error: '' })
@@ -453,7 +485,14 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
         {([['Open', active.open], ['High', active.high], ['Low', active.low], ['Close', active.close]] as const).map(([label, value]) => <div key={label} data-chart-ohlc={label.toLowerCase()} className="min-w-0"><span className="text-muted-foreground">{label} </span><span title={price(value)}>{price(value)}</span></div>)}
         <span data-chart-price-scale={priceScale} className="ml-auto text-muted-foreground" title={priceScale === 'linear' ? 'Linear scale · BOLL includes zero or negative values' : 'Logarithmic price scale'}>{priceScale === 'linear' ? 'Linear' : 'Log'}</span>
       </div>}
-      <div ref={plotRef} data-chart-plot className="relative min-h-0 flex-1 overflow-hidden" onPointerDown={event => {
+      <div ref={plotRef} data-chart-plot className="relative min-h-0 flex-1 overflow-hidden" onKeyDown={event => {
+        if (event.key === 'Escape') { endInspection(); return }
+        if (!matchesSelection || !surface || !plotGeometry || !event.altKey || !(event.key === 'ArrowLeft' || event.key === 'ArrowRight')) return
+        event.preventDefault()
+        const indices = [...new Set(plotGeometry.rsiMarkers.map(marker => marker.index))]
+        const index = event.key === 'ArrowLeft' ? indices.findLast(index => index < (inspected ?? bars.length)) : indices.find(index => index > (inspected ?? -1))
+        if (index !== undefined) setInspection({ instId: surface.instId, timeframe: surface.timeframe, hour: bars[index].hour })
+      }} onPointerLeave={() => { if (!heldPointer.current) setInspection(null) }} onPointerDown={event => {
         const target = (event.target as Element).closest<SVGSVGElement>('svg[data-rendered-inst]')
         if (!matchesSelection || !target || event.button !== 0 || heldPointer.current) return
         event.preventDefault(); target.setPointerCapture(event.pointerId)
@@ -461,6 +500,11 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
         inspectAt(target, event.clientX)
       }} onPointerUp={endInspection} onPointerCancel={endInspection} onLostPointerCapture={endInspection} onPointerMove={event => {
         const held = heldPointer.current
+        if (!held) {
+          const target = (event.target as Element).closest<SVGSVGElement>('svg[data-rendered-inst]')
+          if (matchesSelection && target) inspectCrossingAt(target, event.target as Element, event.clientX, event.clientY)
+          return
+        }
         if (!matchesSelection || held?.pointerId !== event.pointerId) return
         if (!(event.buttons & 1)) { endInspection(); return }
         inspectAt(held.target, event.clientX)

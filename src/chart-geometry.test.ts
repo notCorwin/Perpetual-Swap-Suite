@@ -32,6 +32,27 @@ test('shared viewport coordinates preserve time gaps and logarithmic price and z
   assert.equal(geometry.sellSamples, 96)
 })
 
+test('RSI markers use the sampled candle coordinates and combine thresholds crossed in one jump', () => {
+  const bars = rows().map((bar, index) => ({ ...bar, rsi6: index === 0 ? 20 : 80 }))
+  const get = createChartGeometryCache(text => text.length * 6)
+  const geometry = get(bars, viewport)
+  assert.equal(geometry.rsiMarkers.length, 1)
+  const marker = geometry.rsiMarkers[0]
+  assert.equal(marker.index, 1)
+  assert.equal(marker.hour, bars[1].hour)
+  assert.equal(marker.field, 'rsi6')
+  assert.equal(marker.direction, 'up')
+  assert.deepEqual(marker.levels, [30, 70])
+  close(marker.x, geometry.x[1])
+  close(marker.y, geometry.rsiY(80))
+  assert.equal(get(bars, viewport), geometry, 'Inspection reuses the prepared crossing geometry.')
+  const forming = bars.map((bar, index) => index === 95 ? { ...bar, rsi6: 20, confirmed: false } : bar)
+  const updated = get(forming, viewport).rsiMarkers.at(-1)!
+  assert.equal(updated.index, 95)
+  assert.equal(updated.direction, 'down')
+  assert.deepEqual(updated.levels, [30, 70])
+})
+
 test('missing periods and unavailable observations break paths and filled areas without inventing zero samples', () => {
   const bars = [0, 1, 3, 4, 5].map(index => ({ ...candle(index), ema: index === 3 ? null : 100,
     atrPercent: index === 3 ? null : 2.5, bbw: index === 3 ? null : 6,

@@ -144,8 +144,14 @@ export async function assertIndicatorLegends(page, { requireFittedVolatility = f
       'ATR%(14)': 'atrPercent', 'BBW(20,2)': 'bbw', 'OI (Contracts)': 'oi',
     }
     const volatilityPanel = svg.querySelector('[data-chart-volatility-panel]')
+    const colorProbe = document.createElementNS('http://www.w3.org/2000/svg', 'text')
+    colorProbe.setAttribute('fill', 'var(--muted-foreground)')
+    svg.append(colorProbe)
+    const mutedForeground = getComputedStyle(colorProbe).fill
+    colorProbe.remove()
     return {
       foreground: getComputedStyle(document.body).color,
+      mutedForeground,
       volatilityPanel: volatilityPanel ? { top: Number(volatilityPanel.getAttribute('data-chart-panel-top')), bottom: Number(volatilityPanel.getAttribute('data-chart-panel-bottom')) } : null,
       volatilityCoordinates: svg.querySelectorAll('[data-chart-volatility-axis], [data-chart-axis-label], [data-chart-axis-tick]').length,
       panels: [...svg.querySelectorAll('[data-chart-panel-header]')].map(header => ({ key: header.dataset.chartPanelHeader, y: header.getBBox().y })),
@@ -169,7 +175,8 @@ export async function assertIndicatorLegends(page, { requireFittedVolatility = f
   assert.ok(reading.panels.every((panel, index) => index === 0 || panel.y > reading.panels[index - 1].y), 'Panel titles must follow their visual order, with ATR% and BBW between RSI and OI.')
   for (const legend of reading.legends) {
     assert.ok(legend.curve, `${legend.label} must have a drawn curve.`)
-    assert.equal(legend.labelFill, legend.curveStroke, `${legend.label} title must show its curve color.`)
+    assert.equal(legend.labelFill, legend.panel === 'rsi' ? reading.mutedForeground : legend.curveStroke,
+      `${legend.label} title must use ${legend.panel === 'rsi' ? 'muted text beside its colored swatch' : 'its curve color'}.`)
     assert.equal(legend.swatchStroke, legend.curveStroke, `${legend.label} swatch must match its curve.`)
     assert.equal(legend.valueFill, reading.foreground, `${legend.label} numeric value must retain the foreground text color.`)
     assert.equal(legend.curveWidth, 1, `${legend.label} must use a 1 px stroke.`)

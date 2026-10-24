@@ -397,6 +397,76 @@ test('pointer inspection selects the drawn first, middle, and latest candle befo
   }
 })
 
+test('RSI crossings retain a flat panel and expose the sampled candle and time at scaled widths in both themes', async () => {
+  await selectTimeframe(page, '15m')
+  const originalSize = page.viewportSize()
+  const publish = custom => electron.evaluate(async ({ ipcMain, BrowserWindow }, custom) => {
+    const state = globalThis.__workspaceFixture
+    state.chartGeneration += 1
+    const frame = await ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
+    if (custom) frame.bars = frame.bars.map((bar, index) => ({ ...bar,
+      rsi6: index === 20 ? 29 : index === 21 ? 31 : index === 40 ? 69 : index === 41 ? 71 : 50,
+      rsi12: index === 60 ? 71 : index === 61 ? 69 : 55,
+      rsi24: index === 80 ? 29 : index === 81 ? 31 : 60,
+    }))
+    BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
+    return frame
+  }, custom)
+  const frame = await publish(true)
+  await page.waitForFunction(generation => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.generation === generation, frame.generation)
+  try {
+    for (const colorScheme of ['dark', 'light']) for (const width of [800, 1600]) {
+      await page.emulateMedia({ colorScheme })
+      await page.setViewportSize({ width, height: width === 800 ? 572 : 1000 })
+      const svg = page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]')
+      assert.equal(await svg.locator('[data-chart-rsi-threshold]').count(), 3)
+      assert.equal(await svg.locator('[data-chart-rsi-tick="30"], [data-chart-rsi-tick="70"]').count(), 2)
+      const appearance = await svg.evaluate(svg => ({ font: getComputedStyle(svg).fontFamily,
+        retiredFill: getComputedStyle(document.documentElement).getPropertyValue('--chart-rsi-area').trim(),
+        seriesWidth: getComputedStyle(svg.querySelector('[data-chart-indicator="rsi6"]')).strokeWidth }))
+      assert.match(appearance.font, /monospace/)
+      assert.equal(appearance.retiredFill, '')
+      assert.equal(appearance.seriesWidth, '1px')
+      for (const field of ['rsi6', 'rsi12', 'rsi24']) assert.ok(await svg.locator(`[data-chart-rsi-crossing="${field}"]`).count() > 0)
+      const marker = svg.locator(`[data-chart-rsi-crossing="rsi6"][data-chart-rsi-hour="${frame.bars[21].hour}"]`)
+      assert.equal(await marker.getAttribute('data-chart-rsi-direction'), 'up')
+      assert.equal(await marker.getAttribute('data-chart-rsi-levels'), '30')
+      const point = await marker.evaluate(marker => {
+        const [, x, y] = marker.getAttribute('d').match(/^M([\d.-]+) ([\d.-]+)/)
+        const point = marker.ownerSVGElement.createSVGPoint()
+        point.x = Number(x); point.y = Number(y)
+        const screen = point.matrixTransform(marker.ownerSVGElement.getScreenCTM())
+        point.x -= 3; point.y += 4.5
+        const corner = point.matrixTransform(marker.ownerSVGElement.getScreenCTM())
+        return { x: screen.x, y: screen.y, cornerX: corner.x, cornerY: corner.y }
+      })
+      await page.mouse.move(point.x, point.y)
+      await page.waitForFunction(hour => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes(
+        new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }).format(hour)), frame.bars[21].hour)
+      assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars[21].close)
+      assert.match(await svg.locator('[data-chart-panel-header="rsi"]').textContent(), /31\.0 ↑30/)
+      await page.mouse.move(point.cornerX, point.cornerY)
+      assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars[21].close, 'Hovering a triangle corner must inspect that triangle\'s candle.')
+      assert.equal(await svg.locator('[data-chart-inspected-time]').count(), 1)
+      const labelBounds = await svg.locator('[data-chart-inspected-time] rect').evaluate(rect => ({ x: Number(rect.getAttribute('x')), end: Number(rect.getAttribute('x')) + Number(rect.getAttribute('width')),
+        right: Number(rect.ownerSVGElement.querySelector('[data-chart-rsi-threshold]').getAttribute('x2')) }))
+      assert.ok(labelBounds.x >= 0 && labelBounds.end <= labelBounds.right)
+      if (process.env.PERPETUAL_SWAP_UI_SCREENSHOTS) await page.screenshot({ path: join(process.env.PERPETUAL_SWAP_UI_SCREENSHOTS, `rsi-${colorScheme}-${width}.png`) })
+      await svg.focus()
+      await page.keyboard.press('Alt+ArrowLeft')
+      assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars[20].close)
+      await page.keyboard.press('Alt+ArrowRight')
+      assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars[21].close)
+      await page.keyboard.press('Escape')
+      assert.equal(await svg.locator('[data-chart-inspected-time]').count(), 0)
+    }
+  } finally {
+    await publish(false)
+    await page.emulateMedia({ colorScheme: null })
+    await page.setViewportSize(originalSize)
+  }
+})
+
 test('a healthy idle market list makes no periodic snapshot requests', async () => {
   await page.waitForFunction(() => document.querySelectorAll('[data-market-index]').length === 4)
   const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length)
@@ -608,6 +678,7 @@ test('settings is a separate grouped page with keyboard navigation and a retaine
 })
 
 test('preference drafts survive category changes and validation returns to the first invalid group', async () => {
+  const updatesBefore = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.preferences?.action === 'update').length)
   const settings = await openSettings()
   await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).fill('7')
   await chooseSettingsCategory('Liquidity filters')
@@ -625,7 +696,7 @@ test('preference drafts survive category changes and validation returns to the f
   await settings.getByText('Use a multiple of 5 minutes.', { exact: true }).waitFor()
   assert.equal(await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).inputValue(), '7')
   assert.equal(await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).evaluate(element => element === document.activeElement), true)
-  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.preferences?.action === 'update').length), 0)
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.preferences?.action === 'update').length), updatesBefore)
   await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).fill('30')
   await chooseSettingsCategory('Liquidity filters')
   assert.equal(await spread.getAttribute('aria-checked'), 'false')
