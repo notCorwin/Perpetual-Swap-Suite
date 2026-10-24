@@ -227,20 +227,30 @@ test('small-sample CPU allowance uses paired added CPU rather than independent m
   assert.equal(assessBudgets(summary, budget)[0].reason, 'missing-or-invalid-paired-measurement')
 })
 
-test('unfiltered native traffic follows subscription demand and failed budgets retain trials plus separate runtime profiles', { timeout: 60_000 }, async () => {
+test('native traffic and the real renderer retain matched trials and separate failure profiles', { timeout: 60_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'failed-native-overhead-'))
   try {
     const budgets = { ...defaultBudgets, nativeMarket: { ...defaultBudgets.nativeMarket, wallMS: 0 } }
-    const report = await runOverhead({ output: directory, repeats: 2, cycles: 1, contracts: 2, warmup: 1, renderer: false, budgets })
+    const report = await runOverhead({ output: directory, repeats: 2, cycles: 1, contracts: 2, warmup: 1, renderer: true, budgets })
     assert.equal(report.schemaVersion, 3)
     assert.equal(report.estimators.relativeBudgets, 'median-matched-budget-margin')
     assert.ok(report.failures.some(failure => failure.phase === 'nativeMarket' && failure.metric === 'wallMS'))
     assert.deepEqual(report.failures, assessBudgets(report, budgets))
-    assert.equal(report.runs.length, 4, 'Diagnostic runs cannot enter gated medians.')
+    assert.equal(report.runs.length, 8, 'Diagnostic runs cannot enter gated medians.')
+    assert.ok(report.sourceHashes['src/rsi-crossings.ts'], 'Renderer source identity must include transitive chart calculations.')
+    assert.ok(report.phases.rendererEndToEnd)
+    const rendererRuns = report.runs.filter(run => run.desktop)
+    assert.equal(rendererRuns.length, 4)
+    for (const run of rendererRuns) {
+      assert.equal(run.business.frames, 32)
+      assert.equal(run.runtime.mode, 'electron-main-and-renderer')
+      assert.equal(run.parameters.realRenderer, true)
+      if (run.enabled) assert.ok(run.receiver.batches > 0, 'Actual renderer work must reach the durable operation receiver.')
+    }
     assert.equal(report.parameters.profile, false, 'Original trials must keep their unprofiled configuration.')
     assert.equal(report.failureProfiles.status, 'complete', report.failureProfiles.error)
     assert.deepEqual(report.failureProfiles.runs.map(run => run.enabled), [false, true])
-    for (const run of [...report.runs, ...report.failureProfiles.runs]) {
+    for (const run of [...report.runs.filter(run => !run.desktop), ...report.failureProfiles.runs]) {
       const perChannel = report.parameters.contracts * report.parameters.cycles
       assert.ok(Object.values(run.parameters.liquidityFilters).every(enabled => enabled === false), 'Recorder traffic must not enable a liquidity consumer to preserve unwanted input.')
       assert.deepEqual(run.parameters.subscribedChannels, ['open-interest', 'tickers', 'trades'])
@@ -267,7 +277,7 @@ test('unfiltered native traffic follows subscription demand and failed budgets r
     }
     const saved = JSON.parse(await readFile(join(directory, 'report.json'), 'utf8'))
     assert.deepEqual(saved.failures, report.failures)
-    assert.equal(saved.runs.length, 4)
+    assert.equal(saved.runs.length, 8)
     assert.equal(saved.failureProfiles.runs.length, 2)
   } finally { await rm(directory, { recursive: true, force: true }) }
 })

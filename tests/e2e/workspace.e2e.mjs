@@ -496,13 +496,27 @@ test('RSI crossings retain a flat panel and expose the sampled candle and time a
       await page.emulateMedia({ colorScheme })
       await page.setViewportSize({ width, height: width === 800 ? 572 : 1000 })
       const svg = page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]')
-      await page.waitForFunction(() => {
-        const svg = document.querySelector('svg[data-rendered-inst="BETA-USDT-SWAP"]')
-        const scale = Number(document.querySelector('[data-ui-scale]')?.dataset.uiScale)
-        if (!svg || !scale) return false
-        const rect = svg.getBoundingClientRect(), bounds = svg.viewBox.baseVal
-        return Math.abs(rect.width - bounds.width * scale) < .5 && Math.abs(rect.height - bounds.height * scale) < .5
-      })
+      const markerPoint = async () => {
+        const handle = await page.waitForFunction(({ hour, width }) => {
+          const svg = document.querySelector('svg[data-rendered-inst="BETA-USDT-SWAP"]')
+          const scale = Number(document.querySelector('[data-ui-scale]')?.dataset.uiScale)
+          if (!svg || !scale) return false
+          const rect = svg.getBoundingClientRect(), bounds = svg.viewBox.baseVal
+          if (Math.abs(rect.right - width) >= .5 || Math.abs(rect.width - bounds.width * scale) >= .5 || Math.abs(rect.height - bounds.height * scale) >= .5) return false
+          const marker = svg.querySelector(`[data-chart-rsi-crossing="rsi6"][data-chart-rsi-hour="${hour}"]`)
+          if (!marker) return false
+          const [, x, y] = marker.getAttribute('d').match(/^M([\d.-]+) ([\d.-]+)/)
+          const point = svg.createSVGPoint(), matrix = svg.getScreenCTM()
+          if (!matrix) return false
+          point.x = Number(x); point.y = Number(y)
+          const center = point.matrixTransform(matrix)
+          point.x -= 3; point.y += 4.5
+          const corner = point.matrixTransform(matrix)
+          return { x: center.x, y: center.y, cornerX: corner.x, cornerY: corner.y }
+        }, { hour: frame.bars[21].hour, width })
+        try { return await handle.jsonValue() } finally { await handle.dispose() }
+      }
+      const point = await markerPoint()
       assert.equal(await svg.locator('[data-chart-rsi-threshold]').count(), 3)
       assert.equal(await svg.locator('[data-chart-rsi-tick="30"], [data-chart-rsi-tick="70"]').count(), 2)
       const appearance = await svg.evaluate(svg => ({ font: getComputedStyle(svg).fontFamily,
@@ -515,21 +529,13 @@ test('RSI crossings retain a flat panel and expose the sampled candle and time a
       const marker = svg.locator(`[data-chart-rsi-crossing="rsi6"][data-chart-rsi-hour="${frame.bars[21].hour}"]`)
       assert.equal(await marker.getAttribute('data-chart-rsi-direction'), 'up')
       assert.equal(await marker.getAttribute('data-chart-rsi-levels'), '30')
-      const point = await marker.evaluate(marker => {
-        const [, x, y] = marker.getAttribute('d').match(/^M([\d.-]+) ([\d.-]+)/)
-        const point = marker.ownerSVGElement.createSVGPoint()
-        point.x = Number(x); point.y = Number(y)
-        const screen = point.matrixTransform(marker.ownerSVGElement.getScreenCTM())
-        point.x -= 3; point.y += 4.5
-        const corner = point.matrixTransform(marker.ownerSVGElement.getScreenCTM())
-        return { x: screen.x, y: screen.y, cornerX: corner.x, cornerY: corner.y }
-      })
       await page.mouse.move(point.x, point.y)
       await page.waitForFunction(hour => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes(
         new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }).format(hour)), frame.bars[21].hour)
       assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars[21].close)
       assert.match(await svg.locator('[data-chart-panel-header="rsi"]').textContent(), /31\.0 ↑30/)
-      await page.mouse.move(point.cornerX, point.cornerY)
+      const corner = await markerPoint()
+      await page.mouse.move(corner.cornerX, corner.cornerY)
       assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars[21].close, 'Hovering a triangle corner must inspect that triangle\'s candle.')
       assert.equal(await svg.locator('[data-chart-inspected-time]').count(), 1)
       const labelBounds = await svg.locator('[data-chart-inspected-time] rect').evaluate(rect => ({ x: Number(rect.getAttribute('x')), end: Number(rect.getAttribute('x')) + Number(rect.getAttribute('width')),

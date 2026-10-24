@@ -1,16 +1,17 @@
 import { app, BrowserWindow, ipcMain } from 'electron'
 import { createServer } from 'node:http'
-import { readFile, mkdir } from 'node:fs/promises'
-import { stripTypeScriptTypes } from 'node:module'
+import { mkdir } from 'node:fs/promises'
 import { once } from 'node:events'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { loadRendererModules } from './operation-overhead-modules.mjs'
+import { testWindowOptions } from '../electron/test-presentation.js'
 const root = resolve(process.env.PERPETUAL_SWAP_OVERHEAD_ROOT ?? new URL('../', import.meta.url).pathname)
 const { createRendererOperationReceiver } = await import(pathToFileURL(join(root, 'electron/services/renderer-operations.js')).href)
 const { closeOperationRecording, flushOperationRecording } = await import(pathToFileURL(join(root, 'electron/services/operation-runtime.js')).href)
 const config = JSON.parse(process.argv.at(-1))
 await mkdir(join(config.directory, 'profile'), { recursive: true }); app.setPath('userData', join(config.directory, 'profile'))
-if (process.platform === 'darwin') app.setActivationPolicy('accessory')
+if (process.platform === 'darwin') app.setActivationPolicy('prohibited')
 const receiver = createRendererOperationReceiver(), latency = []
 let measuredCPU, measuredStart
 ipcMain.handle('overhead:start', () => { measuredCPU = process.cpuUsage(); measuredStart = performance.now() })
@@ -20,11 +21,7 @@ ipcMain.handle('overhead:batch', async (_event, batch) => {
   latency.push({ durationMS: performance.now() - started, size: batch.events.length }); return result
 })
 ipcMain.handle('overhead:failure', (_event, value) => receiver.fail(1, value))
-const paths = ['src/operation-telemetry.ts', 'src/chart-geometry.ts', 'src/chart-axis.ts', 'src/chart-layout.ts', 'src/market-percent.ts', 'electron/services/operations.js']
-const modules = new Map(await Promise.all(paths.map(async path => {
-  const source = await readFile(join(root, path), 'utf8')
-  return [`/${path}`, path.endsWith('.ts') ? stripTypeScriptTypes(source, { mode: 'strip' }) : source]
-})))
+const { modules } = await loadRendererModules(root)
 const source = `
 import { initializeOperationTelemetry } from '/src/operation-telemetry.ts';
 import { createChartGeometryCache } from '/src/chart-geometry.ts';
@@ -69,7 +66,8 @@ let window
 async function run() {
 try {
   await app.whenReady()
-  window = new BrowserWindow({ show: false, width: 1000, height: 800, webPreferences: { preload: new URL('./operation-overhead-preload.mjs', import.meta.url).pathname,
+  const presentation = testWindowOptions(true)
+  window = new BrowserWindow({ ...presentation, width: 1000, height: 800, webPreferences: { ...presentation.webPreferences, preload: new URL('./operation-overhead-preload.mjs', import.meta.url).pathname,
     sandbox: false, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } })
   window.webContents.on('preload-error', (_event, path, error) => console.error('preload', path, error));
   window.webContents.on('console-message', event => { if (event.message?.includes('Error')) console.error(event.message) })

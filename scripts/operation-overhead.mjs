@@ -9,6 +9,8 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { cpus, loadavg, freemem } from 'node:os'
 import { isOperationJournal, readOperationJournal } from '../electron/services/operation-journal.js'
+import { loadRendererModules } from './operation-overhead-modules.mjs'
+import { backgroundTestEnvironment, prepareTestElectron } from './electron-test-runtime.mjs'
 const root = resolve(process.env.PERPETUAL_SWAP_OVERHEAD_ROOT ?? fileURLToPath(new URL('../', import.meta.url)))
 const here = fileURLToPath(new URL('./', import.meta.url))
 export const median = values => { const sorted = values.toSorted((a,b)=>a-b), middle=Math.floor(sorted.length/2); return sorted.length%2 ? sorted[middle] : (sorted[middle-1]+sorted[middle])/2 }
@@ -177,6 +179,11 @@ async function child(script, parameters, enabled, desktop){
   // Backend workers run inside Electron's embedded Node/V8 in the real app.
   // Matching only process.version can otherwise measure a different V8 build.
   const launch = overheadLaunch({ desktop, environment })
+  if (desktop && process.platform === 'darwin') {
+    const prepared = await prepareTestElectron()
+    launch.executable = prepared.executable
+    launch.environment = backgroundTestEnvironment(prepared, { ...launch.environment, PERPETUAL_SWAP_USER_DATA: join(parameters.directory, 'profile') })
+  }
   return new Promise((done,reject)=>{
     const process=spawn(launch.executable,[script,JSON.stringify(parameters)],{cwd:root,env:launch.environment,stdio:['ignore','pipe','pipe']})
     let stdout='',stderr='';const timer=setTimeout(()=>process.kill('SIGTERM'),120000)
@@ -233,13 +240,17 @@ export async function runOverhead({output, repeats=5, cycles=20, contracts=130, 
   const hostBefore={loadAverage:loadavg(),freeMemoryBytes:freemem()},runs=[],epoch=Math.floor(Date.now()/300000)*300000
   const sourceFiles = ['electron/services/operations.js', 'electron/services/operation-runtime.js', 'electron/services/operation-journal.js', 'electron/services/renderer-operations.js', 'electron/services/market-service.js', 'electron/services/operation-hooks.js', 'electron/services/operation-network-hooks.js', 'electron/services/network-operations.js', 'electron/services/realtime-public-market.js',
     'electron/services/worker-operations.js', 'electron/services/operation-worker.js', 'electron/services/recorded-database.js', 'electron/services/indicators.js', 'electron/services/market-store.js', 'electron/services/market-store-worker.js',
-    'electron/services/prepared-chart-service.js', 'electron/services/prepared-chart-worker.js', 'src/operation-telemetry.ts', 'src/chart-geometry.ts', 'src/chart-axis.ts', 'src/chart-layout.ts']
-  const sourceHashes = async () => Object.fromEntries(await Promise.all(sourceFiles.map(async file => {
-    try { return [file, createHash('sha256').update(await readFile(join(root, file))).digest('hex')] }
-    catch (error) { if (error.code === 'ENOENT') return [file, null]; throw error }
-  })))
+    'electron/services/prepared-chart-service.js', 'electron/services/prepared-chart-worker.js']
+  const sourceHashes = async () => {
+    const { hashes } = await loadRendererModules(root)
+    const backend = await Promise.all(sourceFiles.filter(file => !Object.hasOwn(hashes, file)).map(async file => {
+      try { return [file, createHash('sha256').update(await readFile(join(root, file))).digest('hex')] }
+      catch (error) { if (error.code === 'ENOENT') return [file, null]; throw error }
+    }))
+    return { ...Object.fromEntries(backend), ...hashes }
+  }
   const hashes = await sourceHashes()
-  const harnessFiles = ['operation-overhead.mjs', 'operation-overhead-workload.mjs', 'operation-overhead-memory.mjs', 'operation-overhead-desktop.mjs', 'operation-overhead-preload.mjs']
+  const harnessFiles = ['operation-overhead.mjs', 'operation-overhead-workload.mjs', 'operation-overhead-memory.mjs', 'operation-overhead-desktop.mjs', 'operation-overhead-preload.mjs', 'operation-overhead-modules.mjs']
   const harnessHashes = async () => Object.fromEntries(await Promise.all(harnessFiles.map(async file => [file, createHash('sha256').update(await readFile(join(here, file))).digest('hex')])))
   const harness = await harnessHashes()
   const git=spawnSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'})
