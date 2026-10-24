@@ -18,16 +18,6 @@ const rows = (request: HistorySourceQuery): CandleRecord[] => {
     open: 100, high: 101, low: 99, close: 100, volume: 1, baseVolume: 1, quoteVolume: 100, confirmed: true,
   }))
 }
-class MemoryMetadata {
-  tasks = new Map<string, unknown>()
-  writes = 0
-  putSyncTask(task: HistoryTask) { this.writes++; this.tasks.set(task.id, structuredClone(task)) }
-  putSyncTasks(tasks: HistoryTask[]) { for (const task of tasks) this.putSyncTask(task) }
-  getSyncTask(id: string) { return structuredClone(this.tasks.get(id) ?? null) }
-  listSyncTasks() { return [...this.tasks.values()].map(value => structuredClone(value)) }
-  deleteSyncTask(id: string) { return this.tasks.delete(id) }
-  deleteSyncTasks(ids: string[]) { for (const id of ids) this.deleteSyncTask(id) }
-}
 class MemoryStore {
   values = new Map<string, HistoryRecord>()
   version = 0
@@ -47,14 +37,14 @@ class MemoryStore {
   }
 }
 const fixture = (options: Partial<HistorySyncOptions> = {}) => {
-  const metadata = new MemoryMetadata(), store = new MemoryStore(), requests: HistorySourceQuery[] = []
-  const sync = new HistorySync({ metadata, store, sources: { candles: { fetchGap: request => { requests.push(request); return rows(request) } } },
+  const store = new MemoryStore(), requests: HistorySourceQuery[] = []
+  const sync = new HistorySync({ store, sources: { candles: { fetchGap: request => { requests.push(request); return rows(request) } } },
     minRequestIntervalMS: 0, retryBaseMS: 1, maxRetryDelayMS: 4, ...options })
-  return { sync, metadata, store, requests }
+  return { sync, store, requests }
 }
 
 test('validates source identities, ranges, priorities and scheduling limits', async t => {
-  assert.throws(() => new HistorySync({} as HistorySyncOptions), /metadata/)
+  assert.throws(() => new HistorySync({} as HistorySyncOptions), /store/)
   for (const options of [{ maxConcurrentTasks: 0 }, { maxConcurrentPerSource: 0 }, { maxAttempts: 0 }, { maxRetainedTerminalTasks: 0 }]) assert.throws(() => fixture(options), /at least/)
   const { sync } = fixture(); t.after(() => sync.close())
   await assert.rejects(sync.enqueue({ ...query, from: base + 1 }), /grid/)
@@ -63,7 +53,7 @@ test('validates source identities, ranges, priorities and scheduling limits', as
 })
 
 test('overlapping and adjacent consumers share one canonical API page without persisted execution rows', async t => {
-  const { sync, requests, metadata } = fixture(); t.after(() => sync.close())
+  const { sync, requests } = fixture(); t.after(() => sync.close())
   const consumers = await Promise.all([
     sync.enqueue({ ...query, from: base, through: base + 99 * step, priority: 'foreground' }),
     sync.enqueue({ ...query, from: base + 50 * step, through: base + 149 * step, priority: 'foreground' }),
@@ -74,8 +64,6 @@ test('overlapping and adjacent consumers share one canonical API page without pe
   assert.ok(results.every(task => task.status === 'completed'))
   assert.equal(requests.length, 1)
   assert.deepEqual({ from: requests[0].from, through: requests[0].through }, { from: base, through: base + 199 * step })
-  assert.equal(metadata.tasks.size, 0)
-  assert.equal(metadata.writes, 0)
 })
 
 test('API pages are bounded, coverage is shared and overlapping arrivals do not duplicate in-flight work', async t => {
@@ -138,23 +126,17 @@ test('cancellation during an accepted durable write cannot undo facts or revive 
 
 test('the final cancelled consumer aborts its fetch and removes execution demand', async t => {
   let signal: AbortSignal | undefined
-  const { sync, metadata } = fixture({ sources: { candles: { fetchGap: request => new Promise((_resolve, reject) => { signal = request.signal; request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true }) }) } } })
+  const { sync } = fixture({ sources: { candles: { fetchGap: request => new Promise((_resolve, reject) => { signal = request.signal; request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true }) }) } } })
   t.after(() => sync.close())
   const task = await sync.enqueue(query); await waitFor(() => Boolean(signal)); await sync.cancel(task.id); await sync.whenIdle()
   assert.equal(signal?.aborted, true)
-  assert.equal(metadata.tasks.size, 0)
 })
 
-test('startup deletes legacy archive goals and checkpoints without fetching or restoring demand', async t => {
-  const metadata = new MemoryMetadata()
-  for (const [id, purpose, status] of [['legacy-history', 'history', 'queued'], ['legacy-warmup', 'warmup', 'completed'], ['legacy-consumer', 'requested', 'running'], ['legacy-paused', 'history', 'paused']]) {
-    metadata.tasks.set(id, { ...query, id, purpose, status, priority: 'background' })
-  }
-  const { sync, requests } = fixture({ metadata })
+test('startup needs no metadata and admits no source demand', async t => {
+  const { sync, requests } = fixture()
   t.after(() => sync.close())
-  await sync.start(); await sync.whenIdle()
-  assert.equal(metadata.tasks.size, 0)
-  assert.equal(metadata.writes, 0)
+  assert.equal(await sync.start(), sync)
+  await sync.whenIdle()
   assert.deepEqual(sync.listTasks(), [])
   assert.deepEqual(requests, [])
 })
@@ -311,15 +293,13 @@ test('Retry-After alone extends first-error retry reporting beyond exponential b
 
 test('all finite consumers pause at their failure budget and recover only after an explicit resume', async t => {
   let attempts = 0, failed = true
-  const { sync, metadata } = fixture({ maxAttempts: 2, sources: { candles: { fetchGap: request => { attempts++; if (failed) throw new Error('Temporary source outage.'); return rows(request) } } } })
+  const { sync } = fixture({ maxAttempts: 2, sources: { candles: { fetchGap: request => { attempts++; if (failed) throw new Error('Temporary source outage.'); return rows(request) } } } })
   t.after(() => sync.close())
   const manual = await sync.enqueue(query), consumer = await sync.enqueue({ ...query, priority: 'foreground' })
   const stopped = await Promise.all([sync.waitFor(manual.id), sync.waitFor(consumer.id)])
   assert.ok(stopped.every(task => task.status === 'paused' && task.attempts === 2))
   await sync.whenIdle()
   assert.equal(attempts, 2)
-  assert.equal(metadata.tasks.size, 0)
-  assert.equal(metadata.writes, 0)
   failed = false
   await sync.resume(manual.id)
   assert.equal((await sync.waitFor(manual.id)).status, 'completed')
@@ -328,18 +308,17 @@ test('all finite consumers pause at their failure budget and recover only after 
 })
 
 test('delisting during admission cannot resurrect a finite consumer', async t => {
-  const { sync, metadata } = fixture()
+  const { sync } = fixture()
   t.after(() => sync.close())
   await sync.start()
   const admission = sync.enqueue(query)
   const retired = assert.rejects(admission, { name: 'AbortError' })
   await sync.removeTargets([query.instrument]); await retired
-  assert.equal(metadata.tasks.size, 0)
   assert.deepEqual(sync.listTasks(), [])
 })
 
 test('completed consumer handles stay bounded while durable coverage is reused', async t => {
-  const { sync, requests, metadata } = fixture({ maxRetainedTerminalTasks: 4 })
+  const { sync, requests } = fixture({ maxRetainedTerminalTasks: 4 })
   t.after(() => sync.close())
   for (let index = 0; index < 20; index++) {
     const task = await sync.enqueue(query)
@@ -347,8 +326,6 @@ test('completed consumer handles stay bounded while durable coverage is reused',
   }
   assert.equal(sync.listTasks().length, 4)
   assert.equal(requests.length, 1)
-  assert.equal(metadata.tasks.size, 0)
-  assert.equal(metadata.writes, 0)
 })
 
 test('durable progress separates numeric history, leased emptiness, and overlapping explicit unavailability', async t => {
@@ -379,7 +356,7 @@ test('durable progress separates numeric history, leased emptiness, and overlapp
 test('completed finite consumers never restart at lease expiry and explicit requests revalidate only the expired slots', async t => {
   const last = base + 299 * step, calls: HistorySourceQuery[] = [], reads: HistoryRange[] = []
   let clock = Date.now(), expiresAt = 0, revision = 0
-  const sync = new HistorySync({ metadata: new MemoryMetadata(), now: () => clock,
+  const sync = new HistorySync({ now: () => clock,
     sources: { oi: { fetchGap: request => { calls.push(request); return [{ instrument: request.instrument, timeframe: request.timeframe, timestamp: last, oi: null }] } } },
     store: {
       async missingCandleRanges(request) { reads.push({ from: request.from, through: request.through }); return request.from <= last && request.through >= last && expiresAt <= clock ? [{ from: last, through: last }] : [] },

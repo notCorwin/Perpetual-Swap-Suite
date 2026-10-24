@@ -56,7 +56,7 @@ test('1H list projections read the native candle sequence instead of a 5m aggreg
   const instrument = { instId: 'BTC-USDT-SWAP' }
   const end = Date.UTC(2024, 0, 20, 12)
   const first = end - 200 * hour
-  const native = Array.from({ length: 201 }, (_, index) => ({ ...rawCandle(first + index * hour, 200 + index), timeframe: '1H', statisticsVersion: 1, oi: 1_000 + index, buy: 100 + index, sell: 50 + index }))
+  const native = Array.from({ length: 201 }, (_, index) => ({ ...rawCandle(first + index * hour, 200 + index), timeframe: '1H', statisticsVersion: 11, oi: 1_000 + index, buy: 100 + index, sell: 50 + index }))
   const raw = Array.from({ length: 12 }, (_, index) => rawCandle(end - index * fiveMinutes, 1))
   const service = new MarketService(store, () => DEFAULT_PREFERENCES, fetch, false)
   try {
@@ -74,7 +74,7 @@ test('5m writes do not mutate native timeframe OI or taker statistics', async ()
   const start = Date.UTC(2024, 7, 1)
   const service = new MarketService(store, () => DEFAULT_PREFERENCES, fetch, false)
   try {
-    await store.appendCandles([{ ...rawCandle(start, 100), timeframe: '1H', oi: 9_999, buy: 8_888, sell: 7_777, statisticsVersion: 1 }])
+    await store.appendCandles([{ ...rawCandle(start, 100), timeframe: '1H', oi: 9_999, buy: 8_888, sell: 7_777, statisticsVersion: 11 }])
     await service.persistCandles(instrument.instId, Array.from({ length: 12 }, (_, index) => ({
       ...rawCandle(start + index * fiveMinutes, 100 + index), oi: 10 + index, buy: 20 + index, sell: 30 + index,
     })))
@@ -99,7 +99,7 @@ test('Taker zero placeholders become unavailable without erasing genuine zero-vo
       oi: 1_000 + index,
       buy: index === 97 ? 12 : null,
       sell: index === 97 ? 13 : null,
-      statisticsVersion: index === 97 ? 1 : 5,
+      statisticsVersion: index === 97 ? 11 : 9,
     })))
     const values = timestamps.map((timestamp, index) => [String(timestamp),
       index === 1 ? '-1' : [0, 97, 98].includes(index) ? '0' : '20',
@@ -118,7 +118,7 @@ test('Taker zero placeholders become unavailable without erasing genuine zero-vo
     assert.deepEqual([rows[3].sell, rows[3].buy], [20, 30], 'The direct endpoint order is sell then buy.')
     assert.deepEqual([rows[97].buy, rows[97].sell], [12, 13], 'A zero placeholder cannot erase healthy direct statistics.')
     assert.deepEqual([rows[98].buy, rows[98].sell], [0, 0], 'A candle with genuinely no trades may have zero on both sides.')
-    assert.equal(rows[98].statisticsVersion, 1)
+    assert.equal(rows[98].statisticsVersion, 11)
     assert.equal(rows[98].statisticsTakerExpiresAt, null)
   } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
@@ -291,7 +291,7 @@ test('legacy inferred unavailable observations are revalidated through bounded H
   })
   try {
     await f.store.appendCandles([{ ...rawCandle(timestamp), oi: 777, buy: null, sell: null,
-      statisticsVersion: 7, statisticsTakerExpiresAt: Date.now() + hour }])
+      statisticsVersion: 9 }])
     const result = await f.service.history.ensureStatistics(instId, '5m', timestamp, timestamp)
     assert.deepEqual([result.rows[0].oi, result.rows[0].buy, result.rows[0].sell], [777, 444, 333])
     assert.equal(calls.length, 1)
@@ -631,7 +631,7 @@ test('SQLite catalogue restore enforces config key and expiry while historical c
     localCatalog(f.service)
     await f.service.persistCatalog([...f.service.catalog.values()])
     const first = Date.UTC(2024, 0, 1)
-    await f.service.persistCandles(instId, Array.from({ length: 300 }, (_, index) => ({ ...rawCandle(first + index * fiveMinutes), oi: 100, buy: 10, sell: 8, statisticsVersion: 1 })))
+    await f.service.persistCandles(instId, Array.from({ length: 300 }, (_, index) => ({ ...rawCandle(first + index * fiveMinutes), oi: 100, buy: 10, sell: 8, statisticsVersion: 11 })))
     await f.service.dispose()
     restored = new MarketService(f.store, () => f.preferences, async () => { throw new Error('Offline') }, false)
     isolateChartPreparation(restored)
@@ -1194,7 +1194,7 @@ test('live integration stays in memory and close drains accepted confirmation wh
   const f = await fixture(disabled(), undefined, { webSocketFactory: () => socket })
   const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
   try {
-    const candles = Array.from({ length: 300 }, (_, index) => ({ ...rawCandle(asOf - (301 - index) * fiveMinutes), statisticsVersion: 1, oi: 100, buy: 20, sell: 10 }))
+    const candles = Array.from({ length: 300 }, (_, index) => ({ ...rawCandle(asOf - (301 - index) * fiveMinutes), statisticsVersion: 11, oi: 100, buy: 20, sell: 10 }))
     await f.service.persistCandles(instId, candles)
     await f.service.localChartWindow(instId, '5m')
     const originalAppend = f.store.appendCandles.bind(f.store)
@@ -1274,14 +1274,14 @@ test('concurrent price repair and independent statistics commit preserve both so
     return response([[String(timestamp), String(repaired.open), String(repaired.high), String(repaired.low), String(repaired.close), '20', '2', '400', '1']])
   })
   try {
-    await f.store.appendCandles([{ ...rawCandle(timestamp), oi: 10, buy: 20, sell: 30, statisticsVersion: 1 }])
+    await f.store.appendCandles([{ ...rawCandle(timestamp), oi: 10, buy: 20, sell: 30, statisticsVersion: 11 }])
     await Promise.all([
       f.service.persistStatisticsSource(instrument, '5m', timestamp, 1, [[timestamp, 777]], undefined, 'foreground', false, { range: { from: timestamp, through: timestamp, intervalMS: fiveMinutes } }),
       f.service.history.repair({ instrument: instId, timeframe: '5m', source: 'candles', from: timestamp, through: timestamp, reason: 'invalid-ohlc', repairable: true }, { signal: new AbortController().signal }),
     ])
     const [final] = await f.store.candles({ instrument: instId, timeframe: '5m', from: timestamp, through: timestamp })
     assert.deepEqual([final.open, final.high, final.low, final.close, final.volume, final.baseVolume, final.quoteVolume], [repaired.open, repaired.high, repaired.low, repaired.close, 20, 2, 400])
-    assert.deepEqual([final.oi, final.buy, final.sell, final.statisticsVersion], [777, 20, 30, 1])
+    assert.deepEqual([final.oi, final.buy, final.sell, final.statisticsVersion], [777, 20, 30, 11])
   } finally { await f.close() }
 })
 
@@ -1290,7 +1290,7 @@ test('statistics queued behind a replacement merge against repaired OHLC', async
   let release!: () => void
   let replacement: Promise<unknown> | undefined, statistics: Promise<unknown> | undefined
   try {
-    await f.store.appendCandles([{ ...rawCandle(timestamp), oi: 10, buy: 20, sell: 30, statisticsVersion: 1 }])
+    await f.store.appendCandles([{ ...rawCandle(timestamp), oi: 10, buy: 20, sell: 30, statisticsVersion: 11 }])
     const original = f.store.replaceCandles.bind(f.store)
     let started!: () => void
     const entered = new Promise<void>(resolve => { started = resolve })
@@ -1309,7 +1309,7 @@ test('replacement retains bounded null leases and revalidates Taker zeros agains
   const f = await fixture(), timestamp = Math.floor(Date.now() / fiveMinutes) * fiveMinutes - 3 * fiveMinutes, expiry = Date.now() + 20_000
   try {
     await f.store.appendCandles([
-      { ...rawCandle(timestamp), volume: 0, baseVolume: 0, quoteVolume: 0, oi: 10, buy: 0, sell: 0, statisticsVersion: 1 },
+      { ...rawCandle(timestamp), volume: 0, baseVolume: 0, quoteVolume: 0, oi: 10, buy: 0, sell: 0, statisticsVersion: 11 },
       { ...rawCandle(timestamp + fiveMinutes), oi: 11, buy: null, sell: null, statisticsVersion: 11, statisticsTakerExpiresAt: expiry },
       { ...rawCandle(timestamp + 2 * fiveMinutes), volume: 0, baseVolume: 0, quoteVolume: 0, oi: null, buy: 0, sell: 0, statisticsVersion: 10 },
     ])
@@ -1329,7 +1329,7 @@ test('a failed SQLite replacement transaction propagates its error and preserves
   const f = await fixture(), timestamp = Math.floor(Date.now() / fiveMinutes) * fiveMinutes - fiveMinutes
   const range = { instrument: instId, timeframe: '5m', from: timestamp, through: timestamp }, originalReplace = f.store.replaceCandles.bind(f.store)
   try {
-    await f.store.appendCandles([{ ...rawCandle(timestamp), oi: 10, buy: 20, sell: 30, statisticsVersion: 1 }])
+    await f.store.appendCandles([{ ...rawCandle(timestamp), oi: 10, buy: 20, sell: 30, statisticsVersion: 11 }])
     f.store.replaceCandles = async () => { throw new Error('SQLite transaction could not commit.') }
     await assert.rejects(f.service.replaceCandles(range, [rawCandle(timestamp, 300)]), /SQLite transaction could not commit/)
     const [row] = await f.store.candles(range)
@@ -1346,7 +1346,7 @@ test('an explicit REST confirmed revision invalidates the prepared generation an
     return response([[String(timestamp), String(revised.open), String(revised.high), String(revised.low), '200', '1', '1', '200', '1']])
   })
   try {
-    await f.store.appendCandles(Array.from({ length: 300 }, (_, index) => ({ ...rawCandle(timestamp - (299 - index) * fiveMinutes), oi: 10, buy: 20, sell: 30, statisticsVersion: 1 })))
+    await f.store.appendCandles(Array.from({ length: 300 }, (_, index) => ({ ...rawCandle(timestamp - (299 - index) * fiveMinutes), oi: 10, buy: 20, sell: 30, statisticsVersion: 11 })))
     const before = await f.service.localChartWindow(instId, '5m')
     await f.service.history.latest(instId, '5m')
     const after = await f.service.localChartWindow(instId, '5m')

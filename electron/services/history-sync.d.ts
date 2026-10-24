@@ -75,11 +75,6 @@ export type HistorySource = {
   inspect?(query: HistorySourceQuery): MaybePromise<HistorySourceInspection>
 }
 export type HistorySyncOptions = {
-  metadata: {
-    listSyncTasks(): MaybePromise<unknown[]>
-    deleteSyncTask(id: string): MaybePromise<unknown>
-    deleteSyncTasks?(ids: string[]): MaybePromise<unknown>
-  }
   store: {
     missingCandleRanges(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string; intervalMS: number }, priority?: HistoryPriority): Promise<HistoryRange[]>
     /** Process-local mutation revision. Without one, completed enqueues revalidate storage. */
@@ -111,7 +106,7 @@ export type HistorySyncOptions = {
 }
 export class HistorySync {
   constructor(options: HistorySyncOptions)
-  /** Delete legacy persisted archive goals without admitting any source work. */
+  /** Start the process-local scheduler without restoring persisted demand. */
   start(): Promise<this>
   /** Create a finite process-local consumer. Overlapping and adjacent consumers share source coverage and API pages; cancellation removes only that consumer. */
   enqueue(request: HistoryRequest): Promise<HistoryTask>

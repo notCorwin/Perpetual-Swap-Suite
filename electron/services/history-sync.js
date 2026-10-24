@@ -48,13 +48,12 @@ const slots = (values, step) => values.reduce((total, value) => total + (value.t
 /** Finite process-local consumers share durable source coverage and one in-flight page per series/source. */
 export class HistorySync {
   constructor(options) {
-    const { metadata, store, sources, write, onProgress, onError, now = Date.now } = options ?? {}
-    for (const name of ['listSyncTasks', 'deleteSyncTask']) if (typeof metadata?.[name] !== 'function') throw new TypeError(`metadata.${name} is required.`)
+    const { store, sources, write, onProgress, onError, now = Date.now } = options ?? {}
     if (typeof store?.missingCandleRanges !== 'function') throw new TypeError('store.missingCandleRanges is required.')
     if (!write && typeof store.appendCandles !== 'function') throw new TypeError('store.appendCandles or write is required.')
     if (!sources || !Object.keys(sources).length) throw new TypeError('At least one history source is required.')
     for (const [name, source] of Object.entries(sources)) if (typeof source?.fetchGap !== 'function') throw new TypeError(`Invalid history source: ${name}.`)
-    this.metadata = metadata; this.store = store; this.sources = new Map(Object.entries(sources))
+    this.store = store; this.sources = new Map(Object.entries(sources))
     this.write = write ?? ((records, task) => store.appendCandles(records, task.priority))
     this.onProgress = onProgress; this.onError = onError; this.now = now
     this.maxConcurrentTasks = integer(options.maxConcurrentTasks ?? 8, 'maxConcurrentTasks', 1)
@@ -81,19 +80,8 @@ export class HistorySync {
 
   start() {
     if (this.closed) return Promise.reject(new Error('HistorySync is closed.'))
-    this.started ??= this.removeLegacyTasks().then(() => { this.kick(); return this })
+    this.started ??= Promise.resolve().then(() => { this.kick(); return this })
     return this.started
-  }
-
-  async removeLegacyTasks() {
-    const saved = await this.metadata.listSyncTasks()
-    if (!Array.isArray(saved)) throw new TypeError('metadata.listSyncTasks must return an array.')
-    // Old rolling archive goals must never restart merely because the app opens.
-    const ids = [...new Set(saved.map(task => task?.id).filter(id => typeof id === 'string' && id))]
-    if (ids.length) {
-      if (this.metadata.deleteSyncTasks) await this.metadata.deleteSyncTasks(ids)
-      else for (const id of ids) await this.metadata.deleteSyncTask(id)
-    }
   }
 
   group(identity) {

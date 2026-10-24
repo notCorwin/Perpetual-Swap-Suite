@@ -23,13 +23,10 @@ const records = (request: HistorySourceQuery): HistoryRecord[] => {
 const numeric = (record: HistoryRecord, source: string) => source === 'candles' ? 'confirmed' in record && record.confirmed
   : source === 'oi' ? typeof record.oi === 'number' : typeof record.buy === 'number' && typeof record.sell === 'number'
 class MemoryMetadata {
-  tasks = new Map<string, unknown>()
   report: HistoryDownloadReport | null = null
   getHistoryDownload() { return structuredClone(this.report) }
   saveHistoryDownload(report: HistoryDownloadReport) { this.report = structuredClone(report) }
-  listSyncTasks() { return [...this.tasks.values()].map(value => structuredClone(value)) }
-  deleteSyncTask(id: string) { this.tasks.delete(id) }
-  deleteSyncTasks(ids: string[]) { for (const id of ids) this.tasks.delete(id) }
+
 }
 class SourceStore {
   values = new Map<string, { record: HistoryRecord; expiresAt: number }>()
@@ -69,7 +66,7 @@ const fixture = (t: TestContext, options: { now?: () => number; metadata?: Memor
   const calls: HistorySourceQuery[] = [], reports: HistoryDownloadReport[] = []
   let download: HistoryDownload
   const source: HistorySource = { pageSize: options.pageSize, inspect: options.inspect, fetchGap: request => { calls.push(request); return options.fetchGap?.(request) ?? records(request) } }
-  const sync = new HistorySync({ metadata, store, sources: { candles: source, oi: source, taker: source },
+  const sync = new HistorySync({ store, sources: { candles: source, oi: source, taker: source },
     write: (rows, task) => store.append(rows, task.source), maxAttempts: 1, onProgress: task => download?.observe(task), now })
   download = new HistoryDownload({ sync, metadata, now, chunkSlots: options.chunkSlots ?? 2400, concurrency: options.concurrency ?? 4, onChange: report => { reports.push(report) } })
   t.after(async () => { await download.close(); await sync.close() })
@@ -226,10 +223,9 @@ test('obsolete combined absence reports are discarded without inventing a split 
   assert.equal(f.calls.length, 0)
 })
 
-test('restoring an interrupted report or old rolling goals never starts a download', async t => {
+test('restoring an interrupted report never starts a download', async t => {
   const metadata = new MemoryMetadata()
   metadata.report = { ...emptyHistoryDownload(), id: 'interrupted', phase: 'running', startedAt: base, progress: { checked: 2, total: 20, available: 2, empty: 0, unavailable: 0, failed: 0, reused: 2, pending: 18 } }
-  metadata.tasks.set('legacy', { id: 'legacy', ...instrument, purpose: 'history', priority: 'background' })
   const f = fixture(t, { metadata })
   await f.sync.start(); await f.sync.whenIdle()
   const restored = f.download.snapshot()
@@ -239,7 +235,6 @@ test('restoring an interrupted report or old rolling goals never starts a downlo
   assert.match(restored.error, /Start a new download/)
   assert.equal(f.calls.length, 0)
   assert.deepEqual(f.sync.listTasks(), [])
-  assert.equal(metadata.tasks.size, 0)
   assert.deepEqual(metadata.report, restored)
 })
 

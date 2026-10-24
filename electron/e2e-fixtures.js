@@ -52,7 +52,7 @@ export async function seedCachedListProjection(store, marketService) {
       oi: 2_000_000 + index * 4_000,
       buy: 12_000 + index * 17,
       sell: 8_000 + index * 11,
-      statisticsVersion: 1,
+      statisticsVersion: 11,
       confirmed: true,
     }
   })
@@ -119,7 +119,7 @@ export async function seedChartScrollBenchmark(store, marketService, { instId = 
         oi: 2_100_000 + index * 230,
         buy: 92_000 + index % 800,
         sell: 76_000 + (index * 3) % 900,
-        statisticsVersion: 1, statisticsSources: 3, statisticsObserved: true, confirmed: true,
+        statisticsVersion: 11, statisticsSources: 3, statisticsObserved: true, confirmed: true,
       }
     })
   }
@@ -192,7 +192,7 @@ export async function seedInstrumentNavigationBenchmark(store, marketService) {
           oi: 2_000_000 + instrumentIndex * 150_000 + index * 219,
           buy: 60_000 + instrumentIndex * 1_300 + index % 700,
           sell: 48_000 + instrumentIndex * 1_100 + index % 900,
-          statisticsVersion: 1, statisticsSources: 3, statisticsObserved: true, confirmed: true,
+          statisticsVersion: 11, statisticsSources: 3, statisticsObserved: true, confirmed: true,
         }
       })
       await persistNativeFixture(store, marketService, candles)
@@ -242,7 +242,7 @@ export async function createChartAcquisitionFixture(store, marketService, { time
       open, high: Math.max(open, close) + .8, low: Math.min(open, close) - .8, close,
       volume, baseVolume: volume, quoteVolume: volume * close, confirmed: true,
       oi: 2_000_000 + index * 213, buy: 81_000 + index % 711, sell: 62_000 + index % 811,
-      statisticsVersion: 1, statisticsSources: 3, statisticsObserved: true }
+      statisticsVersion: 11, statisticsSources: 3, statisticsObserved: true }
   })
   const prefix = mode === 'gap' ? rows.slice(0, 768) : rows.slice(512, 1280)
   const pending = mode === 'gap' ? rows.slice(768, periods - 128) : rows.slice(0, 512)
@@ -309,7 +309,7 @@ export async function createChartColdBoundaryFixture(store, marketService, { tim
       open, high: Math.max(open, close) + .6, low: Math.min(open, close) - .6, close,
       volume, baseVolume: volume, quoteVolume: volume * close, confirmed: true,
       oi: 2_000_000 + index * 113, buy: 70_000 + index % 701, sell: 60_000 + index % 601,
-      statisticsVersion: 1, statisticsSources: 3, statisticsObserved: true }
+      statisticsVersion: 11, statisticsSources: 3, statisticsObserved: true }
   })
   const original = marketService.get.bind(marketService), requests = []
   let release

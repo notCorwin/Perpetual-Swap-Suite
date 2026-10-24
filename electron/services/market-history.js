@@ -65,7 +65,6 @@ export class MarketHistory {
       fetchGap: query => this.fetchStatistics(query, source),
     })
     this.sync = new HistorySync({
-      metadata,
       store: {
         missingCandleRanges: (query, priority) => this.missingSource(query, priority),
         ...(typeof store.candleRevision === 'function' ? {

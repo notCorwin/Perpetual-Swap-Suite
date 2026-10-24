@@ -14,7 +14,7 @@ const interval = 900_000, instId = 'BTC-USDT-SWAP'
 const end = () => Math.floor(Date.now() / interval) * interval - interval
 const candle = (timestamp: number, index = 0) => ({ instrument: instId, timeframe: '15m', timestamp,
   open: 100 + index / 10, high: 102 + index / 10, low: 98 + index / 10, close: 101 + index / 10,
-  volume: 100, baseVolume: 100, quoteVolume: 10_000, oi: 5_000, buy: 70, sell: 30, statisticsVersion: 1, confirmed: true })
+  volume: 100, baseVolume: 100, quoteVolume: 10_000, oi: 5_000, buy: 70, sell: 30, statisticsVersion: 11, confirmed: true })
 const deferred = () => { let resolve = () => {}; const promise = new Promise<void>(done => { resolve = done }); return { promise, resolve } }
 const source = (count: number) => Array.from({ length: count }, (_, i) => candle(end() - (count - 1 - i) * interval, i))
 class MemoryStore {
@@ -1589,8 +1589,8 @@ test('an OI failure publishes its error and retry while Taker completes independ
       calls.push(source); priorities.push(priority)
       if (source === 'oi' && ++oiCalls === 1) throw Object.assign(new Error('OI endpoint temporarily unavailable'), { retryAt })
       store.rows = store.rows.map(row => row.timestamp < from || row.timestamp > through ? row
-        : source === 'oi' ? { ...row, oi: 5000, statisticsVersion: row.buy === null ? 9 : 1 }
-          : { ...row, buy: 70, sell: 30, statisticsVersion: row.oi === null ? 10 : 1 })
+        : source === 'oi' ? { ...row, oi: 5000, statisticsVersion: row.buy === null ? 9 : 11 }
+          : { ...row, buy: 70, sell: 30, statisticsVersion: row.oi === null ? 10 : 11 })
     },
   })
   const reads: string[] = [], read = store.candles.bind(store)

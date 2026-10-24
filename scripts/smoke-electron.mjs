@@ -141,7 +141,7 @@ export async function smokeElectron({ app, revision, report: reportPath }) {
         assert.ok(Math.abs(row.quoteVolume / row.baseVolume - row.close) < 1e-12)
       }
       const [numeric, unavailable] = rows
-      for (const [field, expected] of Object.entries({ oi: 1234, buy: 8, sell: 12, statisticsVersion: 1,
+      for (const [field, expected] of Object.entries({ oi: 1234, buy: 8, sell: 12, statisticsVersion: 11,
         statisticsOIExpiresAt: null, statisticsTakerExpiresAt: null })) assert.equal(numeric[field], expected, `Numeric ${field} must follow the canonical non-expiring facts contract.`)
       assert.equal(numeric.buy + numeric.sell, numeric.volume)
       for (const [field, expected] of Object.entries({ oi: null, buy: null, sell: null, statisticsVersion: 11,

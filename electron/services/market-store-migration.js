@@ -7,6 +7,7 @@ import { basename, join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { CANDLE_INTERVALS, validateCandle } from './market-records.js'
+import { statisticsVersionFor, validTakerVolumes } from './statistics-state.js'
 
 const DAY = 86_400_000, quote = value => `'${String(value).replaceAll("'", "''")}'`
 const [root, databasePath] = process.argv.slice(2)
@@ -20,8 +21,18 @@ const partVersion = file => { const match = /^(base|delta)-(\d+)-[A-Za-z0-9-]+\.
 const activeParts = files => { const base = Math.max(0, ...files.map(file => { const version = partVersion(file); return version?.kind === 'base' ? version.generation : 0 })); return files.filter(file => { const version = partVersion(file); return !version ? base === 0 : version.kind === 'base' ? version.generation === base : version.generation > base }) }
 const directories = async path => { try { return (await readdir(path, { withFileTypes: true })).filter(value => value.isDirectory()).map(value => value.name).sort() } catch (error) { if (error.code === 'ENOENT') return []; throw error } }
 let engine, connection, sequence = 0, draining = false, complete = false, stopping = false, released = false
-const queue = [], acknowledgments = new Map()
-const readyConnection = async () => { if (!connection) { const { DuckDBInstance } = await import('@duckdb/node-api'); engine = await measureOperation({ category: 'database', name: 'duckdb.open' }, () => DuckDBInstance.create(':memory:')); connection = await measureOperation({ category: 'database', name: 'duckdb.connect' }, () => engine.connect()) } return connection }
+const queue = [], acknowledgments = new Map(), pendingImports = new Map()
+const readyConnection = async () => {
+  if (!connection) {
+    const { DuckDBInstance } = await import('@duckdb/node-api')
+    engine = await measureOperation({ category: 'database', name: 'duckdb.open' }, () => DuckDBInstance.create(':memory:'))
+    try {
+      connection = await measureOperation({ category: 'database', name: 'duckdb.connect' }, () => engine.connect())
+      await measureOperation({ category: 'database', name: 'duckdb.configure' }, () => connection.run('SET errors_as_json=true'))
+    } catch (error) { connection?.closeSync(); engine.closeSync(); connection = null; engine = null; throw error }
+  }
+  return connection
+}
 const post = message => { if (process.connected) process.send(message, () => {}) }
 const send = payload => new Promise((resolve, reject) => {
   if (!process.connected) { reject(new Error('Market archive parent disconnected.')); return }
@@ -32,6 +43,49 @@ const send = payload => new Promise((resolve, reject) => {
     if (error) { acknowledgments.delete(id); request.reject(error) }
   })
 })
+
+class SourceIssue extends Error {
+  constructor(reason, message) { super(message); this.reason = reason }
+}
+
+// DuckDB also reports engine/resource/I/O failures through Error. Only explicit
+// content-decoding errors establish that the retained source is corrupt.
+const readSource = async (db, name, sql) => {
+  try { return (await measureOperation({ category: 'database', name }, () => db.runAndReadAll(sql))).getRowObjectsJS() }
+  catch (error) {
+    let detail
+    try { detail = JSON.parse(error.message) } catch { throw error }
+    if (detail.exception_type === 'Conversion') throw new SourceIssue('invalid-schema', detail.exception_message)
+    if (['Invalid Input', 'IO', 'Serialization'].includes(detail.exception_type)
+      && /^(?:no magic bytes found|file ['"].*['"] too small to be a parquet file|(?:expected )?parquet magic bytes|failed to (?:parse|deserialize) (?:the )?(?:parquet|thrift|footer)|(?:invalid|corrupt|malformed) (?:parquet|thrift|file footer))/i.test(detail.exception_message)) {
+      throw new SourceIssue('corrupt-file', detail.exception_message)
+    }
+    throw error
+  }
+}
+
+const importStatistics = row => {
+  const version = row.statisticsVersion ?? 0
+  if ((version & ~3) === 8) return row
+  // Old 1 meant both sources; old 4 could lease ranges without observing them.
+  // Preserve their numeric downloads, but never import speculative null leases.
+  const prior = version === 1 ? 3 : (version & ~3) === 4 ? version & 3 : 0
+  const sources = (prior & 1 && typeof row.oi === 'number' && Number.isFinite(row.oi) && row.oi >= 0 ? 1 : 0)
+    | (prior & 2 && validTakerVolumes(row) ? 2 : 0)
+  return { ...row, statisticsVersion: statisticsVersionFor(sources), statisticsOIExpiresAt: null, statisticsTakerExpiresAt: null }
+}
+
+const commitPartition = async (payload, priority) => {
+  // Reuse validated rows if only the SQLite/IPC commit failed. The caller
+  // checks the source fingerprint before reusing this process-local stage.
+  pendingImports.set(payload.partition.path, payload)
+  await send({ import: payload, priority })
+  pendingImports.delete(payload.partition.path)
+  // A foreground request can recover a failed background commit immediately.
+  // Its successful acknowledgment makes the scheduled retry obsolete.
+  for (let index = retryPartitions.length - 1; index >= 0; index--) if (retryPartitions[index].path === payload.partition.path) retryPartitions.splice(index, 1)
+  if (!retryPartitions.length) { retryAt = 0; clearTimeout(retryTimer); retryTimer = null }
+}
 
 async function importPartition(path, instrument, timeframe, priority, tolerateIssues) {
   const previous = saved.get(path)
@@ -48,28 +102,44 @@ async function importPartition(path, instrument, timeframe, priority, tolerateIs
     return
   }
   const from = Date.parse(`${path.slice(-10)}T00:00:00Z`), through = from + DAY - CANDLE_INTERVALS[timeframe]
+  const pending = pendingImports.get(path)
+  if (pending?.partition.fingerprint === fingerprint) {
+    if (!stopping) await commitPartition(pending, priority)
+    return
+  }
+  pendingImports.delete(path)
+  // Engine startup and the parent transaction are operational boundaries, not
+  // source validation. Neither may persist a corrupt-file marker on failure.
+  const db = files.length ? await readyConnection() : null
+  let rows = []
   try {
-    let rows = []
     if (files.length) {
-      const db = await readyConnection(), relation = `read_parquet([${files.map(quote).join(',')}],union_by_name=true,hive_partitioning=false)`
-      const columns = (await measureOperation({ category: 'database', name: 'duckdb.describe' }, () => db.runAndReadAll(`DESCRIBE SELECT * FROM ${relation}`))).getRowObjectsJS(), types = new Map(columns.map(column => [column.column_name, column.column_type]))
-      for (const field of ['instrument', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'confirmed']) if (!types.has(field)) throw new TypeError(`Legacy market schema is missing ${field}.`)
-      if (!/^(?:U?(?:TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT))$/.test(types.get('timestamp')) || types.get('confirmed') !== 'BOOLEAN') throw new TypeError('Invalid legacy timestamp or confirmation schema.')
-      for (const field of ['open', 'high', 'low', 'close', 'volume']) if (!/^(?:U?(?:TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT)|FLOAT|DOUBLE|DECIMAL\(\d+,\d+\))$/.test(types.get(field))) throw new TypeError(`Invalid legacy ${field} schema.`)
+      const relation = `read_parquet([${files.map(quote).join(',')}],union_by_name=true,hive_partitioning=false)`
+      const columns = await readSource(db, 'duckdb.describe', `DESCRIBE SELECT * FROM ${relation}`), types = new Map(columns.map(column => [column.column_name, column.column_type]))
+      for (const field of ['instrument', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'confirmed']) if (!types.has(field)) throw new SourceIssue('invalid-schema', `Legacy market schema is missing ${field}.`)
+      if (!/^(?:U?(?:TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT))$/.test(types.get('timestamp')) || types.get('confirmed') !== 'BOOLEAN') throw new SourceIssue('invalid-schema', 'Invalid legacy timestamp or confirmation schema.')
+      for (const field of ['open', 'high', 'low', 'close', 'volume']) if (!/^(?:U?(?:TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT)|FLOAT|DOUBLE|DECIMAL\(\d+,\d+\))$/.test(types.get(field))) throw new SourceIssue('invalid-schema', `Invalid legacy ${field} schema.`)
       const projection = Object.entries(fields).map(([field, type]) => `${types.has(field) ? `CAST("${field}" AS ${type})` : `NULL::${type}`} AS "${field}"`).join(',')
       const projected = `(SELECT ${projection} FROM ${relation})`
-      const duplicate = (await measureOperation({ category: 'database', name: 'duckdb.duplicates' }, () => db.runAndReadAll(`SELECT timestamp FROM ${projected} GROUP BY timestamp,COALESCE(writtenAt,0) HAVING COUNT(*)>1 LIMIT 1`))).getRowObjectsJS()[0]
-      if (duplicate) { const error = new Error('Ambiguous equal-revision legacy candle observations.'); error.reason = 'duplicate'; throw error }
-      rows = (await measureOperation({ category: 'database', name: 'duckdb.read' }, () => db.runAndReadAll(`SELECT * FROM ${projected} QUALIFY ROW_NUMBER() OVER(PARTITION BY timestamp ORDER BY COALESCE(writtenAt,0) DESC)=1 ORDER BY timestamp`))).getRowObjectsJS()
+      const duplicate = (await readSource(db, 'duckdb.duplicates', `SELECT timestamp FROM ${projected} GROUP BY timestamp,COALESCE(writtenAt,0) HAVING COUNT(*)>1 LIMIT 1`))[0]
+      if (duplicate) throw new SourceIssue('duplicate', 'Ambiguous equal-revision legacy candle observations.')
+      rows = (await readSource(db, 'duckdb.read', `SELECT * FROM ${projected} QUALIFY ROW_NUMBER() OVER(PARTITION BY timestamp ORDER BY COALESCE(writtenAt,0) DESC)=1 ORDER BY timestamp`))
         .map(row => Object.fromEntries(Object.entries(row).map(([field, value]) => [field, typeof value === 'bigint' ? Number(value) : value])))
-      for (const row of rows) { validateCandle(row); if (row.instrument !== instrument || row.timeframe !== timeframe || row.timestamp < from || row.timestamp > through) throw new TypeError('A legacy market candle does not match its partition.') }
+      for (const row of rows) {
+        try { validateCandle(row) }
+        catch (error) { if (error instanceof TypeError) throw new SourceIssue('invalid-schema', error.message); throw error }
+        if (row.instrument !== instrument || row.timeframe !== timeframe || row.timestamp < from || row.timestamp > through) throw new SourceIssue('invalid-schema', 'A legacy market candle does not match its partition.')
+      }
+      rows = rows.map(importStatistics)
     }
-    if (!stopping) await send({ import: { rows, partition: { path, fingerprint } }, priority })
   } catch (error) {
     if (stopping) return
-    await send({ failure: { path, fingerprint, instrument, timeframe, from, through, reason: error.reason ?? (error instanceof TypeError ? 'invalid-schema' : 'corrupt-file'), detail: error.message } })
+    if (!(error instanceof SourceIssue)) throw error
+    await send({ failure: { path, fingerprint, instrument, timeframe, from, through, reason: error.reason, detail: error.message } })
     if (!tolerateIssues) throw error
+    return
   }
+  if (!stopping) await commitPartition({ rows, partition: { path, fingerprint } }, priority)
 }
 
 async function importQuery(job) {

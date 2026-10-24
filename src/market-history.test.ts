@@ -7,7 +7,6 @@ import { MarketHistory } from '../electron/services/market-history.js'
 import { MarketStore } from '../electron/services/market-store.js'
 import { PreparedChartPipeline } from '../electron/services/prepared-chart-service.js'
 import type { CandleRecord } from '../electron/services/market-store.js'
-import type { HistoryTask } from '../electron/services/history-sync.js'
 import type { AuditJob } from '../electron/services/data-audit.js'
 
 const step = 300_000, day = 86400000, base = Date.UTC(2026, 9, 1), instId = 'BTC-USDT-SWAP'
@@ -18,13 +17,7 @@ const parseCandle = (instrument: string, timeframe: string, value: unknown[]) =>
 const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done }); return { promise, resolve } }
 const waitFor = async (condition: () => boolean) => { const deadline = performance.now() + 4000; while (!condition()) { assert.ok(performance.now() < deadline); await new Promise(resolve => setTimeout(resolve, 2)) } }
 class MemoryMetadata {
-  tasks = new Map<string, HistoryTask>(); audits = new Map<string, AuditJob>()
-  putSyncTask(task: HistoryTask) { this.tasks.set(task.id, structuredClone(task)); return task }
-  putSyncTasks(tasks: HistoryTask[]) { for (const task of tasks) this.putSyncTask(task) }
-  getSyncTask(id: string) { return this.tasks.get(id) ?? null }
-  listSyncTasks() { return [...this.tasks.values()].map(task => structuredClone(task)) }
-  deleteSyncTask(id: string) { return this.tasks.delete(id) }
-  deleteSyncTasks(ids: string[]) { for (const id of ids) this.deleteSyncTask(id) }
+  audits = new Map<string, AuditJob>()
   saveAudit(job: AuditJob) { this.audits.set(job.id, structuredClone(job)); return job }
   listAudits() { return [...this.audits.values()].map(job => structuredClone(job)) }
 }
@@ -177,7 +170,7 @@ test('source evidence before listing is unavailable and never requested', async 
 
 test('cancellation removes only its viewport demand while another consumer completes shared price history', async t => {
   const gate = deferred(); let entered = false, sourceSignal: AbortSignal | undefined
-  const { history, metadata } = await fixture(t, { get: async (path, parameters, signal, priority) => { entered = true; sourceSignal = signal; await gate.promise; return source(path, parameters, signal, priority) } })
+  const { history } = await fixture(t, { get: async (path, parameters, signal, priority) => { entered = true; sourceSignal = signal; await gate.promise; return source(path, parameters, signal, priority) } })
   const controller = new AbortController()
   const first = history.ensurePrices(instId, '5m', base, base + 2 * step, 'foreground', controller.signal)
   const rejected = assert.rejects(first, { name: 'AbortError' })
@@ -185,7 +178,6 @@ test('cancellation removes only its viewport demand while another consumer compl
   await waitFor(() => entered); controller.abort(); await rejected
   assert.equal(sourceSignal?.aborted, false)
   gate.resolve(); assert.equal((await second).rows.length, 3)
-  assert.equal(metadata.tasks.size, 0)
 })
 
 test('malformed or conflicting direct statistics fail without certifying source coverage', async t => {
@@ -207,15 +199,14 @@ test('latest initialization publishes actual observations without inventing miss
 
 test('delisting removes finite consumer demand without deleting source facts', async t => {
   const gate = deferred()
-  const { history, metadata, store } = await fixture(t, { get: async (path, parameters, signal, priority) => { await gate.promise; signal.throwIfAborted(); return source(path, parameters, signal, priority) } })
+  const { history, store } = await fixture(t, { get: async (path, parameters, signal, priority) => { await gate.promise; signal.throwIfAborted(); return source(path, parameters, signal, priority) } })
   await store.appendCandles([row(base)])
   const task = await history.sync.enqueue({ instrument: instId, timeframe: '5m', source: 'candles', from: base + step, through: base + 2 * step })
   assert.equal(history.sync.listTasks().length, 1)
-  assert.equal(metadata.tasks.size, 0)
   const cancelled = history.sync.waitFor(task.id)
   await history.removeTargets([instId]); gate.resolve(); await history.sync.whenIdle()
   assert.equal((await cancelled).status, 'cancelled')
-  assert.equal(metadata.tasks.size, 0); assert.equal(history.sync.listTasks().length, 0)
+  assert.equal(history.sync.listTasks().length, 0)
   assert.equal((await store.coverage(instId, '5m')).count, 1)
 })
 

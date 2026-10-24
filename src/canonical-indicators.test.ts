@@ -14,7 +14,7 @@ test('list and chart share the full-history EMA seed through corrections, evicti
     const close = index < 799 ? 1000 : 100
     return { instrument: instrument.instId, timeframe: '5m', timestamp: first + index * step,
       open: close, high: close, low: close, close, volume: 1, baseVolume: 1, quoteVolume: close,
-      confirmed: true, statisticsVersion: 1, oi: 100, buy: 10, sell: 10 }
+      confirmed: true, statisticsVersion: 11, oi: 100, buy: 10, sell: 10 }
   })
   let service = new MarketService(store, undefined, async () => { throw new Error('A complete canonical series must stay local.') }, false)
   const verify = async () => {

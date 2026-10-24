@@ -213,8 +213,7 @@ const mergedProjection = `c.timestamp,c.open,c.high,c.low,c.close,c.volume,c.bas
   CASE WHEN t.value1 IS NOT NULL AND t.value2 IS NOT NULL AND NOT ${takerContradiction} THEN NULL ELSE t.expires_at END AS statisticsTakerExpiresAt,
   o.written_at AS statisticsOIObservedAt,COALESCE(o.absence_attempts,0) AS statisticsOIAbsenceAttempts,
   t.written_at AS statisticsTakerObservedAt,COALESCE(t.absence_attempts,0) AS statisticsTakerAbsenceAttempts,
-  CASE WHEN o.timestamp IS NOT NULL AND o.value1 IS NOT NULL AND t.timestamp IS NOT NULL AND t.value1 IS NOT NULL AND t.value2 IS NOT NULL AND NOT ${takerContradiction} THEN 1
-    ELSE 8+CASE WHEN o.timestamp IS NULL THEN 0 ELSE 1 END+CASE WHEN t.timestamp IS NULL THEN 0 ELSE 2 END END AS statisticsVersion`
+  8+CASE WHEN o.timestamp IS NULL THEN 0 ELSE 1 END+CASE WHEN t.timestamp IS NULL THEN 0 ELSE 2 END AS statisticsVersion`
 const mergedJoins = 'LEFT JOIN statistics o ON o.series_id=c.series_id AND o.source=1 AND o.timestamp=c.timestamp LEFT JOIN statistics t ON t.series_id=c.series_id AND t.source=2 AND t.timestamp=c.timestamp'
 const candleRows = query => {
   const valid = validateQuery(query), series = identity(valid)

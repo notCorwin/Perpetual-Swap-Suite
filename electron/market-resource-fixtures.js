@@ -8,7 +8,7 @@ export function resourceCandle(instrumentIndex, timeframe, index, periods, asOf)
   const close = 100 + instrumentIndex * 3 + offset + index * 0.01, volume = 100 + index % 7
   return { instrument: `SCALE${String(instrumentIndex).padStart(3, '0')}-USDT-SWAP`, timeframe, timestamp,
     open: close - 0.02, high: close + 0.06, low: close - 0.05, close,
-    volume, baseVolume: volume, quoteVolume: volume * close, confirmed: true }
+    volume, baseVolume: volume, quoteVolume: volume * close, statisticsVersion: 8, confirmed: true }
 }
 
 /** Synthetic intake only; storage, scheduler, service, IPC, React and SVG are real. */
