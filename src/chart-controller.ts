@@ -1,4 +1,5 @@
 import { PreparedChartStore } from './chart-series-store.ts'
+import { completeChartPriceRange } from './chart-data.ts'
 import type { PreparedChartNotification, PreparedChartResponse, ReadyChartWindow } from './chart-data.ts'
 import { timeframeMilliseconds, type RadarTimeframe } from './timeframe.ts'
 
@@ -43,7 +44,7 @@ export class ChartController {
   private localTargets = new Set<string>()
   private localCheckedKey: string | null = null
   private historyTargets = new Set<string>()
-  private historyChecked = new Map<string, string>()
+  private historyAttempts = new Map<string, { key: string; state: 'succeeded' | 'failed' }>()
   private historyHydrated = new Map<string, string>()
   private universeIds: string[] = []
   private universeKey = ''
@@ -54,8 +55,7 @@ export class ChartController {
   private refresh = false
   private timer: ReturnType<typeof setTimeout> | null = null
   private prefetchAfter = 0
-  private failureCount = 0
-  private retryAt = 0
+  private preparationFailures = new Map<string, { target: ChartTarget; basis: string; retryAt?: number }>()
   private direction = -1
   private scrollAt = 0
   private scrollSpeed = 0
@@ -109,8 +109,6 @@ export class ChartController {
     const target = this.view.requested
     if (this.active && target?.instId === response.instId && target.timeframe === response.timeframe) {
       if (this.commit()) {
-        this.failureCount = 0
-        this.retryAt = 0
         this.refresh = false
         this.clearTimer()
       }
@@ -122,8 +120,6 @@ export class ChartController {
     const owner = ++this.owner
     this.active = true
     this.refresh = false
-    this.failureCount = 0
-    this.retryAt = 0
     this.scrollAt = 0
     this.scrollSpeed = 0
     this.direction = -1
@@ -161,6 +157,7 @@ export class ChartController {
 
   private updateFocus(target: ChartTarget | null) {
     this.focusId = `${this.identity}:${++this.focusVersion}`
+    this.preparationFailures.clear()
     void Promise.resolve(this.transport.focus?.(target, this.focusId)).catch(() => {})
   }
 
@@ -171,8 +168,6 @@ export class ChartController {
       return
     }
     this.clearTimer()
-    this.failureCount = 0
-    this.retryAt = 0
     this.localCheckedKey = null
     this.updateFocus(target)
     this.commit(target)
@@ -188,8 +183,7 @@ export class ChartController {
   private completePrices(window: ReadyChartWindow) {
     const meta = this.store.snapshotMeta(window.instId, window.timeframe)
     const first = Math.max(window.endHour - 95 * window.intervalMS, meta?.historyExhausted ? meta.oldestHour ?? -Infinity : -Infinity)
-    return window.bars.length === (window.endHour - first) / window.intervalMS + 1
-      && window.bars.every((bar, index) => bar.hour === first + index * window.intervalMS)
+    return completeChartPriceRange(window.bars, first, window.endHour, window.intervalMS)
   }
 
   private commit(requested = this.view.requested) {
@@ -206,19 +200,19 @@ export class ChartController {
     // rebuilt historical window can arrive before its latest counterpart;
     // that calculation gap must not discard already consumed wheel input.
     const latestEnd = meta?.latestEnd ?? (this.view.requested && sameSeries(this.view.requested, target) ? this.view.latestEnd : null)
-    const completeHistoricalPrices = ready && this.completePrices(ready)
-    const calculatingHistory = target.end !== null && ready
-      && (ready.indicatorState === 'loading' || !completeHistoricalPrices)
+    const completePrices = ready && this.completePrices(ready)
+    const calculating = ready
+      && (ready.indicatorState === 'loading' || target.end !== null && !completePrices)
       && previous?.instId === target.instId && previous.timeframe === target.timeframe
       && previous.bars.some(bar => bar.indicatorsObserved)
     // Initial prices stay independent of optional sources. Moving an already
-    // calculated chart into history switches its curves and prices together.
-    const presented = calculatingHistory ? previous : ready
+    // calculated chart in either direction switches curves and prices together.
+    const presented = calculating ? previous : ready
       ?? (previous?.instId === target.instId && previous.timeframe === target.timeframe ? previous : null)
     this.publish({
       requested: target,
       presented,
-      pending: ready === null || Boolean(calculatingHistory),
+      pending: ready === null || Boolean(calculating),
       error: ready?.priceStatus?.state === 'error' ? `Price history failed: ${ready.priceStatus.error || 'Source request failed'}${ready.priceStatus.retryAt ? ` · retry at ${new Date(ready.priceStatus.retryAt).toISOString()}` : ''}`
         : ready || requested !== this.view.requested ? '' : this.view.error,
       oldestHour: meta?.oldestHour ?? null,
@@ -226,7 +220,7 @@ export class ChartController {
       historyExhausted: meta?.historyExhausted ?? false,
       unavailable: ready || requested !== this.view.requested ? null : this.view.unavailable,
     })
-    return ready !== null && !calculatingHistory
+    return ready !== null && !calculating
   }
 
   private prefetchTarget(target: ChartTarget): ChartPreparation | null {
@@ -235,7 +229,7 @@ export class ChartController {
     // A cold viewport can display prices before its recursive calculation
     // finishes. Moving the backend reserve cursor now could evict those rows
     // before the pending calculation installs their indicators.
-    if (!window || window.indicatorState === 'loading') return null
+    if (!window || window.indicatorState === 'loading' || window.indicatorState === 'error') return null
     const interval = timeframeMilliseconds(target.timeframe)
     const range = this.store.readyBoundaries(target.instId, target.timeframe).find(range => range.firstEnd <= window.endHour && range.lastEnd >= window.endHour)
     if (!range) return null
@@ -253,7 +247,9 @@ export class ChartController {
       if (end < earliest || end > (meta?.latestEnd ?? window.endHour)) continue
       const existing = this.store.window(target.instId, target.timeframe, end)
       if (existing && this.completePrices(existing)) continue
-      return { ...target, end, historyBars: direction < 0 ? batch + 95 : (end - range.lastEnd) / interval + 95 }
+      const job = { ...target, end, historyBars: direction < 0 ? batch + 95 : (end - range.lastEnd) / interval + 95 }
+      if (this.blockedPreparation(job)) continue
+      return job
     }
     return null
   }
@@ -285,7 +281,7 @@ export class ChartController {
     // A resident end candle does not prove the preceding viewport exists.
     // Missing prices still need source repair while calculated prices can wait
     // independently for their indicator worker.
-    const ready = window && (target.end === null || this.completePrices(window)) ? window : null
+    const ready = window && this.completePrices(window) ? window : null
     if (target.end === null && this.localCheckedKey !== targetKey(target)) {
       if (!this.localTargets.has(key) && this.localTargets.size < 2) void this.hydrateLocal(target)
       if (!ready) return
@@ -293,10 +289,10 @@ export class ChartController {
     // Focused durable history has its own lane. A slow provider request must
     // never prevent an already saved range from entering the renderer cache.
     const watermark = this.historyWatermark(target)
-    const historyKey = `${targetKey(target)}:${watermark}`
+    const historyKey = `${targetKey(target)}:${watermark}:${this.focusId}`
     if (this.transport.history && (!ready || target.end !== null)) {
-      const needsHistory = this.historyHydrated.get(key) !== watermark
-        || !ready && this.historyChecked.get(key) !== historyKey
+      const attempted = this.historyAttempts.get(key)?.key === historyKey
+      const needsHistory = !attempted && (this.historyHydrated.get(key) !== watermark || !ready)
       if (needsHistory) {
         // Bound local work while allowing a newly selected series to bypass
         // one older read. Further selections coalesce in view.requested.
@@ -308,7 +304,7 @@ export class ChartController {
       // until input stopped changing the target.
       if ((needsHistory || this.historyTargets.has(key)) && (ready || this.historyHydrated.get(key) !== watermark)) return
     }
-    if (this.retryAt > Date.now()) { this.wake(this.retryAt - Date.now(), true); return }
+    if (this.blockedPreparation(target)) return
     if (!ready || this.refresh) {
       if (this.demandTargets.has(key) || this.demandTargets.size >= 2) return
       const maintenance = this.maintenanceTarget
@@ -348,7 +344,22 @@ export class ChartController {
 
   private historyWatermark(target: ChartTarget) {
     const meta = this.store.snapshotMeta(target.instId, target.timeframe)
-    return `${meta?.generation ?? -1}:${JSON.stringify(meta?.sourceVersions ?? meta?.revision ?? -1)}:${meta?.latestEnd ?? -1}:${this.store.historyEpoch(target.instId, target.timeframe)}`
+    return `${meta?.generation ?? -1}:${JSON.stringify(meta?.sourceVersions ?? meta?.revision ?? -1)}:${meta?.latestEnd ?? -1}:${this.store.historyEpoch(target.instId, target.timeframe)}:${meta?.indicatorStatus?.inputVersion ?? ''}:${meta?.indicatorStatus?.state ?? ''}`
+  }
+
+  private preparationBasis(target: ChartTarget) { return `${this.focusId}:${this.historyWatermark(target)}` }
+
+  private blockedPreparation(target: ChartTarget) {
+    // Each target retains its own failure. An opposite reserve cannot erase it
+    // and make the two directions retry one another without a new input basis.
+    // A fixed focus has only the selected end and bounded reserve endpoints;
+    // focus changes clear the set, while watermark/eviction changes retire it.
+    for (const [key, failure] of this.preparationFailures) if (failure.basis !== this.preparationBasis(failure.target)) this.preparationFailures.delete(key)
+    const failure = this.preparationFailures.get(targetKey(target))
+    if (!failure) return false
+    if (failure.retryAt !== undefined && failure.retryAt <= Date.now()) return false
+    if (failure.retryAt !== undefined && this.timer === null) this.wake(failure.retryAt - Date.now(), this.view.requested !== null && targetKey(target) === targetKey(this.view.requested))
+    return true
   }
 
   private async hydrateHistory(target: ChartTarget, checkedKey: string, watermark: string) {
@@ -363,14 +374,15 @@ export class ChartController {
         const meta = this.store.snapshotMeta(target.instId, target.timeframe)
         // A newer compact notification can arrive while this bulk read is in
         // flight. Its revision must not certify older historical observations.
-        if (accepted) this.historyHydrated.set(key, `${response.generation}:${JSON.stringify(response.sourceVersions ?? response.revision)}:${meta?.latestEnd ?? -1}:${this.store.historyEpoch(target.instId, target.timeframe)}`)
+        if (accepted) this.historyHydrated.set(key, `${response.generation}:${JSON.stringify(response.sourceVersions ?? response.revision)}:${meta?.latestEnd ?? -1}:${this.store.historyEpoch(target.instId, target.timeframe)}:${meta?.indicatorStatus?.inputVersion ?? ''}:${meta?.indicatorStatus?.state ?? ''}`)
         if (this.active) this.commit()
       } else this.historyHydrated.set(key, watermark)
+      this.historyAttempts.set(key, { key: checkedKey, state: 'succeeded' })
     } catch {
       // A failed local read cannot hold the independent source repair lane.
-      this.historyHydrated.set(key, watermark)
+      // It also cannot certify hydration or retry from its own finalizer.
+      this.historyAttempts.set(key, { key: checkedKey, state: 'failed' })
     } finally {
-      this.historyChecked.set(key, checkedKey)
       this.historyTargets.delete(key)
       void this.pump()
     }
@@ -391,7 +403,7 @@ export class ChartController {
         if (this.active && focusId === this.focusId && this.view.requested && targetKey(this.view.requested) === targetKey(job)) {
           this.publish({ ...this.view, pending: false, error: '', unavailable: response.unavailable })
           unavailableRetryAt = response.unavailable.retryAt
-        } else if (kind === 'prefetch' && focusId === this.focusId) this.prefetchAfter = Math.max(Date.now() + 5_000, response.unavailable.retryAt)
+        } else if (kind === 'prefetch' && focusId === this.focusId) this.prefetchAfter = response.unavailable.retryAt
       } else {
         const accepted = this.store.ingest(this.preservePushedLive(response, admittedAt))
         if (accepted && job.end !== null) {
@@ -399,17 +411,19 @@ export class ChartController {
           // range. Do not immediately serialize the same bulk history again.
           this.historyHydrated.set(seriesKey(job), this.historyWatermark(job))
         } else if (accepted && kind !== 'refresh') this.historyHydrated.delete(seriesKey(job))
-        const prepared = this.store.window(job.instId, job.timeframe, response.endHour)
-        if (accepted && !prepared) throw new Error('No local prices are available for this range yet.')
+        const prepared = this.store.window(job.instId, job.timeframe, job.end)
         if (this.active) this.commit()
+        if (accepted && !prepared) throw new Error('No local prices are available for this range yet.')
+        if (focusId === this.focusId) {
+          if (accepted && prepared && !this.completePrices(prepared)) this.preparationFailures.set(targetKey(job), { target: job, basis: this.preparationBasis(job) })
+          else this.preparationFailures.delete(targetKey(job))
+        }
       }
-      if (focusId === this.focusId && this.view.requested && targetKey(this.view.requested) === targetKey(job)) { this.failureCount = 0; this.retryAt = 0 }
     } catch (cause) {
       failed = true
-      if (kind === 'prefetch' && focusId === this.focusId) this.prefetchAfter = Date.now() + 5_000
-      else if (this.active && focusId === this.focusId && this.view.requested && targetKey(this.view.requested) === targetKey(job)) {
-        this.failureCount += 1
-        this.retryAt = Date.now() + Math.min(10_000, 500 * 2 ** Math.min(this.failureCount, 4))
+      const retryAt = cause && typeof cause === 'object' && 'retryAt' in cause && typeof cause.retryAt === 'number' && cause.retryAt > Date.now() ? cause.retryAt : undefined
+      if (focusId === this.focusId) this.preparationFailures.set(targetKey(job), { target: job, basis: this.preparationBasis(job), retryAt })
+      if (kind !== 'prefetch' && this.active && focusId === this.focusId && this.view.requested && targetKey(this.view.requested) === targetKey(job)) {
         const complete = this.commit()
         this.publish({ ...this.view, pending: !complete, error: cause instanceof Error ? cause.message : 'Could not prepare chart history.' })
       }
@@ -420,7 +434,7 @@ export class ChartController {
     if (!this.active) return
     const changed = focusId !== this.focusId || this.view.requested && targetKey(this.view.requested) !== targetKey(job)
     if (unavailableRetryAt !== null && !changed) this.wake(Math.max(0, unavailableRetryAt - Date.now()), true)
-    else if (failed && !changed && kind !== 'prefetch') this.wake(Math.max(0, this.retryAt - Date.now()), true)
+    else if (failed && !changed) { this.blockedPreparation(job) }
     else queueMicrotask(() => { void this.pump() })
   }
 }

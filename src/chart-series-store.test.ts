@@ -379,6 +379,20 @@ test('bar pressure preserves the requested viewport and evicted ends require a f
   assert.ok(Object.isFrozen(held) && Object.isFrozen(held.bars))
 })
 
+test('bar eviction changes the navigation residency watermark while compact observations keep their input version', () => {
+  const store = new PreparedChartStore({ maxBarsPerSeries: 96 })
+  const versions = { price: 1, oi: 1, taker: 1 }
+  store.setUniverse([instId], '1H', instId)
+  store.ingest(response(bars(104, 96), { sourceVersions: versions }))
+  const epoch = store.historyEpoch(instId, '1H')
+  store.ingestLatest(response(bars(104, 96), { revision: 2, sourceVersions: versions }))
+  assert.equal(store.historyEpoch(instId, '1H'), epoch)
+  store.ingest(response(bars(0, 96), { revision: 3, latestEnd: 199 * hour, sourceVersions: versions }))
+  assert.ok(store.historyEpoch(instId, '1H') > epoch, 'Evicted observations cannot retain a failure/hydration certificate for the old residency.')
+  assert.deepEqual(store.snapshotMeta(instId, '1H')?.sourceVersions, versions)
+  assert.ok(store.window(instId, '1H'), 'The independently retained latest projection remains available.')
+})
+
 test('series LRU honors metadata and window reads while evicted snapshots stay immutable', () => {
   const store = new PreparedChartStore({ maxSeries: 2 })
   const eth = 'ETH-USDT-SWAP', sol = 'SOL-USDT-SWAP'
@@ -822,4 +836,79 @@ test('price failure metadata is scoped to the affected incomplete window and sur
   store.ingest(response([complete[240]], { revision: 3, endHour: 299 * hour, latestEnd: 299 * hour, priceState: 'ready' }))
   assert.equal(store.window(instId, '1H', 299 * hour)?.priceState, 'ready')
   assert.equal(store.window(instId, '1H', 299 * hour)?.priceStatus?.error, undefined)
+})
+
+test('source failures survive arbitrarily many unrelated statuses and expire with their resident navigation data', () => {
+  const store = new PreparedChartStore({ maxBarsPerSeries: 512 })
+  const values = bars(0, 400).map(value => value.hour >= 104 * hour && value.hour < 120 * hour
+    ? { ...value, oi: null, oiObserved: false, statisticsObserved: false, statisticsSources: 2 } : value)
+  store.ingest(response(values, { oiStatus: { state: 'error', from: 104 * hour, through: 119 * hour, error: 'Resident OI failure' } }))
+  let revision = 1
+  for (let index = 200; index < 240; index += 1) store.ingest(response([], { revision: ++revision, endHour: 399 * hour, latestEnd: 399 * hour,
+    oiStatus: { state: 'loading', from: index * hour, through: index * hour },
+  }))
+  assert.equal(store.window(instId, '1H', 199 * hour)?.oiStatus?.error, 'Resident OI failure')
+  // Repeated subranges replace and coalesce their own validity intervals.
+  for (let index = 0; index < 80; index += 1) store.ingest(response([], { revision: ++revision, endHour: 399 * hour, latestEnd: 399 * hour,
+    oiStatus: { state: 'loading', from: (200 + index % 40) * hour, through: (200 + index % 40) * hour },
+  }))
+  assert.ok(store.snapshotMeta(instId, '1H')!.sourceStatuses!.length <= 3)
+  store.ingest(response([], { revision: ++revision, endHour: 399 * hour, latestEnd: 399 * hour,
+    oiStatus: { state: 'ready', from: 104 * hour, through: 111 * hour },
+  }))
+  assert.equal(store.window(instId, '1H', 199 * hour)?.oiState, 'error', 'Only the covered half of a failure has been superseded.')
+  store.ingest(response([], { revision: ++revision, endHour: 399 * hour, latestEnd: 399 * hour,
+    oiStatus: { state: 'ready', from: 112 * hour, through: 119 * hour },
+  }))
+  assert.equal(store.window(instId, '1H', 199 * hour)?.oiState, 'loading', 'A successful source status clears the failure; numeric readiness still needs observations.')
+  store.ingest(response(bars(1000, 512), { revision: ++revision }))
+  assert.ok(store.snapshotMeta(instId, '1H')!.sourceStatuses!.every(value => value.status.from >= 905 * hour))
+  assert.equal(store.window(instId, '1H', 199 * hour), null)
+})
+
+test('indicator errors retain their input and range until covered by recovery, independently of statistics', () => {
+  const store = new PreparedChartStore()
+  const values = bars(104, 196).map(value => value.hour < 200 * hour ? { ...value, indicatorsObserved: false, ema: null } : value)
+  const indicatorStatus = { state: 'error' as const, from: 104 * hour, through: 199 * hour,
+    error: 'Invalid indicator input', inputVersion: 'price:1', retryOn: 'input-change' as const }
+  store.ingest(response(values, { indicatorStatus }))
+  const failed = store.window(instId, '1H', 199 * hour)!
+  assert.equal(failed.indicatorState, 'error'); assert.equal(failed.indicatorStatus?.inputVersion, 'price:1')
+  assert.equal(failed.oiState, 'ready'); assert.equal(failed.priceState, 'ready')
+  store.ingest(response([], { revision: 2, endHour: 299 * hour, latestEnd: 299 * hour,
+    indicatorStatus: { state: 'ready', from: 204 * hour, through: 299 * hour, inputVersion: 'price:1' },
+  }))
+  assert.equal(store.window(instId, '1H', 199 * hour), failed)
+  assert.equal(store.window(instId, '1H', 299 * hour)?.indicatorState, 'ready')
+  store.ingest(response([], { revision: 3, endHour: 199 * hour, latestEnd: 299 * hour,
+    indicatorStatus: { state: 'loading', from: 104 * hour, through: 199 * hour, inputVersion: 'price:2' },
+  }))
+  const recovering = store.window(instId, '1H', 199 * hour)!
+  assert.equal(recovering.indicatorState, 'loading'); assert.equal(recovering.indicatorStatus?.error, undefined)
+  assert.equal(recovering.bars, failed.bars)
+  store.ingest(response(bars(104, 96), { revision: 4, endHour: 199 * hour, latestEnd: 299 * hour,
+    indicatorStatus: { state: 'ready', from: 104 * hour, through: 199 * hour, inputVersion: 'price:2' },
+  }))
+  assert.equal(store.window(instId, '1H', 199 * hour)?.indicatorState, 'ready')
+  assert.equal(store.window(instId, '1H', 199 * hour)?.indicatorStatus?.inputVersion, 'price:2')
+  assert.equal(failed.indicatorState, 'error')
+})
+
+test('percentage fields admit only finite numbers or null and completeness corrections invalidate navigation bounds', () => {
+  for (const field of ['roc', 'maroc'] as const) for (const value of ['Infinity', '-Infinity', Infinity, -Infinity, NaN]) {
+    const store = new PreparedChartStore()
+    const values = bars(104, 96)
+    store.ingest(response(values.map((bar, index) => index === 40 ? { ...bar, [field]: value } as unknown as PreparedChartBar : bar)))
+    assert.equal(store.window(instId, '1H')?.priceState, 'partial')
+    assert.equal(store.window(instId, '1H')?.bars.length, 95)
+  }
+  const store = new PreparedChartStore()
+  store.ingest(response(bars(104, 96)))
+  assert.equal(store.readyBoundaries(instId, '1H').length, 1)
+  store.ingest(response([{ ...bar(150), priceComplete: false }], { revision: 2, endHour: 199 * hour, latestEnd: 199 * hour }))
+  assert.equal(store.window(instId, '1H')?.priceState, 'partial')
+  assert.equal(store.readyBoundaries(instId, '1H').length, 0)
+  store.ingest(response([bar(150)], { revision: 3, endHour: 199 * hour, latestEnd: 199 * hour }))
+  assert.equal(store.window(instId, '1H')?.priceState, 'ready')
+  assert.equal(store.readyBoundaries(instId, '1H').length, 1)
 })

@@ -21,8 +21,15 @@ export type Bar = {
 export type PreparedChartState = 'ready' | 'partial' | 'loading' | 'stale' | 'unavailable' | 'error'
 export type ChartSourceStatus = Readonly<{
   state: PreparedChartState; from: number; through: number | null
-  error?: string; retryAt?: number; reason?: 'not-published' | 'unsupported'
+  error?: string; retryAt?: number; reason?: 'not-published' | 'unsupported' | 'insufficient-history' | 'undefined-value'
+  /** Exact recursive input basis; unrelated statistic/quote updates do not change it. */
+  inputVersion?: string
+  retryOn?: 'input-change' | 'worker-recovery'
 }>
+/** Both navigation and presentation require the same complete source slots. */
+export const completeChartPriceRange = (bars: readonly Pick<Bar, 'hour' | 'priceComplete'>[], from: number, through: number, intervalMS: number) =>
+  bars.length === (through - from) / intervalMS + 1
+  && bars.every((bar, index) => bar.hour === from + index * intervalMS && bar.priceComplete !== false)
 export type PreparedChartBar = Bar & { confirmed: true }
 export type PreparedChartGeneration = number
 export type ChartUnavailable = Readonly<{ reason: 'insufficient-history'; availableCandles: number; requiredCandles: 96; retryAt: number }>
@@ -40,6 +47,7 @@ export type PreparedChartResponse = {
   priceStatus?: ChartSourceStatus
   oiStatus?: ChartSourceStatus
   takerStatus?: ChartSourceStatus
+  indicatorStatus?: ChartSourceStatus
   oiState: PreparedChartState
   takerState: PreparedChartState
   indicatorState: PreparedChartState
@@ -73,10 +81,11 @@ export type PreparedChartMeta = Readonly<{
   key: string; instId: string; timeframe: RadarTimeframe; intervalMS: number
   generation: PreparedChartGeneration; revision: number
   latestEnd: number | null; oldestHour: number | null; historyExhausted: boolean; error: string
-  sourceStatuses?: readonly Readonly<{ source: 'price' | 'oi' | 'taker'; status: ChartSourceStatus }>[]
+  sourceStatuses?: readonly Readonly<{ source: 'price' | 'oi' | 'taker' | 'indicator'; status: ChartSourceStatus }>[]
   priceStatus?: ChartSourceStatus
   oiStatus?: ChartSourceStatus
   takerStatus?: ChartSourceStatus
+  indicatorStatus?: ChartSourceStatus
   priceState?: PreparedChartState
   priceAsOf?: number | null; priceObservedAt?: number | null; realtimeState?: 'live' | 'stale'; sourceVersions?: { price: number; oi: number; taker: number }
 }>
@@ -88,6 +97,7 @@ export type ReadyChartWindow = Readonly<{
   priceStatus?: ChartSourceStatus
   oiStatus?: ChartSourceStatus
   takerStatus?: ChartSourceStatus
+  indicatorStatus?: ChartSourceStatus
   oiState: PreparedChartState; takerState: PreparedChartState; indicatorState: PreparedChartState
   liveBar?: Bar
   priceState?: PreparedChartState

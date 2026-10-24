@@ -1,4 +1,4 @@
-const unchangedFields = ['generation', 'endHour', 'latestEnd', 'oldestHour', 'historyExhausted', 'oiState', 'takerState', 'oiStatus', 'takerStatus', 'priceStatus', 'indicatorState', 'error', 'unavailable']
+const unchangedFields = ['generation', 'endHour', 'latestEnd', 'oldestHour', 'historyExhausted', 'oiState', 'takerState', 'oiStatus', 'takerStatus', 'priceStatus', 'indicatorState', 'indicatorStatus', 'error', 'unavailable']
 
 /** Compress only updates whose completed source frame the renderer can identify. */
 export class ChartNotificationEncoder {

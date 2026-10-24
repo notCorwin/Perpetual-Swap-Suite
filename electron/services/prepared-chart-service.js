@@ -45,7 +45,7 @@ const mergeStatistics = (previous, incoming, allowed = 3) => {
     if ((accept ? incomingMask : priorMask) & bit) sources |= bit
     for (const field of bit === 1 ? ['oi', 'statisticsOIExpiresAt'] : ['buy', 'sell', 'statisticsTakerExpiresAt']) value[field] = source?.[field] ?? null
   }
-  value.statisticsVersion = statisticsVersionFor(sources, value)
+  value.statisticsVersion = statisticsVersionFor(sources)
   return value
 }
 const blankIndicators = Object.fromEntries(indicatorFields.map(field => [field, null]))
@@ -84,6 +84,7 @@ export class PreparedChartPipeline {
     this.workers = []; this.calculations = new Map(); this.calculationQueue = []
     this.workerLimit = Math.max(1, Math.min(8, availableParallelism() - 2))
     this.sourceAttempts = new Map(); this.sourceTasks = new Map()
+    this.sourceEpoch = 0
     this.focus = null; this.explicitFocus = false
     this.priceJournal = new Map()
     this.unsubscribeStore = store.subscribe?.(change => {
@@ -105,6 +106,7 @@ export class PreparedChartPipeline {
       const live = this.liveStates.get(key)
       state = { key, instId, timeframe, intervalMS: intervalFor(timeframe), rows: new Map(), indicators: new Map(),
         generation: live?.generation || ++this.nextGeneration, sourceVersion: live?.sourceVersion ?? 0, priceVersion: live?.priceVersion ?? 0, oiVersion: live?.oiVersion ?? 0, takerVersion: live?.takerVersion ?? 0,
+        indicatorFailures: new Map(live?.indicatorFailures ?? []),
         indicatorState: live?.indicatorState ? structuredClone(live.indicatorState) : null, live: live?.live ?? null, observedAt: live?.observedAt ?? null,
         floor: live?.floor ?? null, active: 0, latestHour: live?.latestHour ?? null, historyEnd: null, loaded: false, calculation: null }
     }
@@ -153,6 +155,7 @@ export class PreparedChartPipeline {
       if (this.series.size <= this.maxSeries && bytes <= this.maxBytes) break
       if (state.active || key === this.focusKey) continue
       this.series.delete(key); this.priceJournal.delete(key); bytes -= state.byteSize ?? 0
+      for (const [attemptKey, attempt] of this.sourceAttempts) if (attempt.seriesKey === key) this.sourceAttempts.delete(attemptKey)
     }
     for (const [key] of this.snapshots) if (!this.universe.has(key) && !this.series.has(key)) this.snapshots.delete(key)
     const snapshotBytes = value => {
@@ -173,6 +176,7 @@ export class PreparedChartPipeline {
       if (key === this.focusKey || this.series.get(key)?.active) continue
       projected -= state.byteSize ?? 0
       state.rows.clear(); state.indicators.clear(); state.barCaches?.clear(); state.historyBarsCache = null; state.byteSize = 0
+      state.indicatorFailures?.clear()
       // Quotes and fixed-size recursive checkpoints remain available on ticks.
     }
   }
@@ -230,6 +234,7 @@ export class PreparedChartPipeline {
 
   currentFocus(focus) { return !this.closed && focus !== null && focus === this.focus }
   sourceStateChanged() {
+    this.sourceEpoch += 1
     // Source continuity changes the quote lease, not the cached calculation.
     // Publish status immediately even when a quiet series sends no next tick.
     for (const [key, snapshot] of this.snapshots) {
@@ -267,6 +272,7 @@ export class PreparedChartPipeline {
     const availability = !bars.length && !liveBar ? 'loading' : !complete ? 'partial'
       : !historical && end < expectedEnd ? 'stale' : 'ready'
     const priceStatus = this.sourceStatus(state, 'candles', first, end ?? expectedEnd, availability)
+    const indicatorStatus = this.indicatorStatus(state, bars, first, end ?? expectedEnd)
     return { instId: state.instId, timeframe: state.timeframe, intervalMS: state.intervalMS, endHour: end,
       latestEnd: state.latestHour, oldestHour: state.floor, historyExhausted: state.floor !== null && (rows[0]?.timestamp ?? Infinity) <= state.floor,
       generation: state.generation, revision: this.nextRevision = Math.max(this.nextRevision + 1, this.revision(state.instId)), bars,
@@ -274,7 +280,7 @@ export class PreparedChartPipeline {
       priceObservedAt: state.observedAt, realtimeState: realtime ? 'live' : 'stale',
       sourceVersions: { price: state.priceVersion, oi: state.oiVersion ?? 0, taker: state.takerVersion ?? 0 },
       ...this.statisticsStatus(state, rows, first, end ?? expectedEnd),
-      indicatorState: bars.length && bars.every(value => value.indicatorsObserved) ? bars.every(value => indicatorFields.every(field => numeric(value[field]))) ? 'ready' : 'unavailable' : 'loading',
+      indicatorState: indicatorStatus.state, indicatorStatus,
       liveBar, error: priceStatus.error ?? '' }
   }
 
@@ -288,12 +294,35 @@ export class PreparedChartPipeline {
       if (failure) status = { ...status, state: 'error', error: failure.error, retryAt: failure.retryAt }
       else if (source !== 'candles' && typeof this.history.ensureStatistics !== 'function') status = { ...status, state: 'unavailable', reason: 'unsupported' }
     } else if (availability === 'unavailable' && source !== 'candles') status.reason = 'not-published'
+    return this.cachedStatus(state, source, status)
+  }
+
+  cachedStatus(state, source, status) {
     state.statusCache ??= new Map()
+    const { through } = status
     const key = `${source}:${through}`, previous = state.statusCache.get(key)
     if (previous && JSON.stringify(previous) === JSON.stringify(status)) status = previous
     state.statusCache.delete(key); state.statusCache.set(key, status)
     while (state.statusCache.size > 12) state.statusCache.delete(state.statusCache.keys().next().value)
     return status
+  }
+
+  indicatorInputVersion(state) {
+    return `${FORMULA_VERSION}:${state.generation}:${state.priceVersion}:${this.priceJournal.get(state.key)?.at(-1)?.revision ?? 0}`
+  }
+
+  indicatorStatus(state, bars, from, through) {
+    const inputVersion = this.indicatorInputVersion(state)
+    let status = { state: 'loading', from, through, inputVersion }
+    if (bars.length && bars.every(value => value.indicatorsObserved)) {
+      status.state = bars.every(value => indicatorFields.every(field => numeric(value[field]))) ? 'ready' : 'unavailable'
+      if (status.state === 'unavailable') status.reason = bars.some(value => value.ema === null) ? 'insufficient-history' : 'undefined-value'
+    } else {
+      const failure = bars.filter(value => !value.indicatorsObserved).map(value => state.indicatorFailures?.get(value.hour))
+        .find(value => value?.inputVersion === inputVersion)
+      if (failure) status = { ...failure, from, through, state: 'error' }
+    }
+    return this.cachedStatus(state, 'indicator', status)
   }
 
   statisticsStatus(state, rows, from, through) {
@@ -402,7 +431,7 @@ export class PreparedChartPipeline {
   }
 
   retainRows(state, limit) {
-    if (!state.rows.size) return
+    if (!state.rows.size) { this.pruneSourceAttempts(state); return }
     const historical = state.historyEnd !== null && state.historyEnd !== undefined
     const anchor = historical ? state.historyEnd : Math.max(...state.rows.keys()), ahead = historical ? HISTORY_AHEAD : 0
     const first = anchor - (limit - ahead - 1) * state.intervalMS, last = anchor + ahead * state.intervalMS
@@ -414,6 +443,20 @@ export class PreparedChartPipeline {
     const selectedFrom = selected === null ? null : selected - (VISIBLE - 1) * state.intervalMS
     for (const hour of state.rows.keys()) if ((hour < first || hour > last)
       && (selected === null || hour < selectedFrom || hour > selected)) { state.rows.delete(hour); state.indicators.delete(hour) }
+    for (const hour of state.indicatorFailures?.keys() ?? []) if (!state.rows.has(hour)) state.indicatorFailures.delete(hour)
+    this.pruneSourceAttempts(state)
+  }
+
+  pruneSourceAttempts(state) {
+    // The latest tail cannot retire errors owned by a resident historical
+    // reserve of the same series. Both share one bounded source lifetime.
+    if (this.series.get(state.key) !== state) return
+    const hours = [...state.rows.keys(), ...(this.liveStates.get(state.key)?.rows.keys() ?? [])]
+    const selected = this.focus?.key === state.key ? this.focus.end ?? state.latestHour ?? Math.floor(Date.now() / state.intervalMS) * state.intervalMS - state.intervalMS : null
+    const from = selected === null ? null : selected - (VISIBLE - 1) * state.intervalMS
+    for (const [key, attempt] of this.sourceAttempts) if (attempt.seriesKey === state.key
+      && !hours.some(hour => hour >= attempt.from && hour <= attempt.through)
+      && !(selected !== null && attempt.from <= selected && attempt.through >= from)) this.sourceAttempts.delete(key)
   }
 
   invalidateDerived(state, from) {
@@ -422,6 +465,7 @@ export class PreparedChartPipeline {
       current.generation = generation
       if ((current.indicatorState?.lastTimestamp ?? -Infinity) >= from) current.indicatorState = null
       for (const hour of current.indicators.keys()) if (hour >= from) current.indicators.delete(hour)
+      current.indicatorFailures?.clear()
       current.indicatorVersion = (current.indicatorVersion ?? 0) + 1
     }
   }
@@ -435,8 +479,11 @@ export class PreparedChartPipeline {
       if (previous && !samePrice(previous, row)) live.indicators.delete(hour)
       live.rows.set(hour, row)
       if (state.indicators.has(hour)) live.indicators.set(hour, state.indicators.get(hour))
+      const failure = state.indicatorFailures?.get(hour)
+      if (failure) { live.indicatorFailures ??= new Map(); live.indicatorFailures.set(hour, failure) }
     }
     for (const hour of live.rows.keys()) if (hour < state.latestHour - (TAIL - 1) * state.intervalMS) { live.rows.delete(hour); live.indicators.delete(hour) }
+    for (const hour of live.indicatorFailures?.keys() ?? []) if (!live.rows.has(hour)) live.indicatorFailures.delete(hour)
     if (state.indicatorState && (!live.indicatorState || state.indicatorState.lastTimestamp > live.indicatorState.lastTimestamp)) live.indicatorState = structuredClone(state.indicatorState)
     live.latestHour = state.latestHour; live.floor = state.floor; live.generation = state.generation
     for (const field of ['sourceVersion', 'priceVersion', 'oiVersion', 'takerVersion', 'indicatorVersion']) live[field] = Math.max(live[field] ?? 0, state[field] ?? 0)
@@ -644,8 +691,20 @@ export class PreparedChartPipeline {
     const pending = this.pendingSourceRanges(state, source, from, through)
     let retryAt = 0
     for (const attempt of this.sourceAttempts.values()) if (attempt.seriesKey === state.key && attempt.source === source
-      && pending.some(range => attempt.from <= range.through && attempt.through >= range.from)) retryAt = Math.max(retryAt, attempt.retryAt)
+      && pending.some(range => attempt.from <= range.through && attempt.through >= range.from)
+      && numeric(attempt.retryAt)) retryAt = Math.max(retryAt, attempt.retryAt)
     return retryAt > Date.now() ? retryAt : 0
+  }
+
+  sourceInputVersion(state, source) { return source === 'candles' ? state.priceVersion : source === 'oi' ? state.oiVersion : state.takerVersion }
+
+  sourceBlocked(state, source, from, through) {
+    if (this.sourceRetryAt(state, source, from, through)) return true
+    const pending = this.pendingSourceRanges(state, source, from, through)
+    return [...this.sourceAttempts.values()].some(attempt => attempt.seriesKey === state.key && attempt.source === source
+      && attempt.retryAt === undefined && attempt.focus === this.focus && attempt.sourceEpoch === this.sourceEpoch
+      && attempt.inputVersion === this.sourceInputVersion(state, source)
+      && pending.some(range => attempt.from <= range.through && attempt.through >= range.from))
   }
 
   pendingSourceRanges(state, source, from, through) {
@@ -665,14 +724,15 @@ export class PreparedChartPipeline {
   sourceJob(key, operation, { state, source, from, through, reserve, priority = 'interactive' }) {
     const existing = this.sourceTasks.get(key) ?? [...this.sourceTasks.values()].find(job => job.seriesKey === state.key && job.source === source && job.from <= from && job.through >= through)
     if (existing) { existing.reserve ??= reserve; this.promoteSourceJob(existing, priority); return existing.task }
-    if (this.sourceRetryAt(state, source, from, through)) return null
+    if (this.sourceBlocked(state, source, from, through)) return null
     const controller = new AbortController(), signal = controller.signal
     const job = { controller, state, source, seriesKey: state.key, from, through, reserve, priority, task: null }
     const failed = error => {
-      const failures = (this.sourceAttempts.get(key)?.failures ?? 0) + 1, now = Date.now()
-      this.sourceAttempts.set(key, { seriesKey: state.key, source, from, through, failures, failedAt: now,
+      const now = Date.now()
+      this.sourceAttempts.set(key, { seriesKey: state.key, source, from, through, failedAt: now,
+        focus: this.focus, sourceEpoch: this.sourceEpoch, inputVersion: this.sourceInputVersion(state, source),
         error: error?.message || `${source === 'oi' ? 'Open interest' : source === 'taker' ? 'Taker' : 'Price'} history is incomplete for this range.`,
-        retryAt: Number(error?.retryAt) > now ? Number(error.retryAt) : now + Math.min(30_000, 5_000 * 2 ** (failures - 1)) })
+        ...(Number.isFinite(error?.retryAt) && error.retryAt > now ? { retryAt: error.retryAt } : {}) })
     }
     const task = Promise.resolve().then(async () => {
       try {
@@ -715,7 +775,9 @@ export class PreparedChartPipeline {
       const key = `${state.key}:${source}:${from}:${through}`
       // Missing-source demand has an absolute due time. Fresh live quotes may
       // renew their own lease, but cannot debounce historical repair forever.
-      const at = this.sourceRetryAt(state, source, from, through) || this.repairDeadlines.get(key) || now + 1000
+      const retryAt = this.sourceRetryAt(state, source, from, through)
+      if (!retryAt && this.sourceBlocked(state, source, from, through)) return
+      const at = retryAt || this.repairDeadlines.get(key) || now + 1000
       repairDeadlines.set(key, at); deadline = Math.min(deadline, at)
     }
     const missingStatistics = { oi: false, taker: false }
@@ -797,7 +859,9 @@ export class PreparedChartPipeline {
     if (this.closed || !state.rows.size && !this.liveStates.get(state.key)?.rows.size) return Promise.resolve()
     if (state.calculation) return state.calculation
     const live = this.syncLive(state)
-    const missing = current => [...current.rows.keys()].filter(hour => !current.indicators.has(hour)).sort((a, b) => a - b)
+    const inputVersion = () => this.indicatorInputVersion(state)
+    const missing = current => [...current.rows.keys()].filter(hour => !current.indicators.has(hour)
+      && current.indicatorFailures?.get(hour)?.inputVersion !== inputVersion()).sort((a, b) => a - b)
     const needed = () => {
       const resident = missing(state), end = state.historyEnd ?? state.latestHour
       const viewport = resident.filter(hour => hour >= end - (VISIBLE - 1) * state.intervalMS && hour <= end)
@@ -807,13 +871,20 @@ export class PreparedChartPipeline {
       const tail = missing(live)
       return tail.length ? tail : resident
     }
-    if (!needed().length) return Promise.resolve()
+    const initialDemand = needed()
+    if (!initialDemand.length) return Promise.resolve()
+    // Replacing a failed input basis starts a new observable lifecycle without
+    // discarding separately prepared prices or statistic observations.
+    for (const current of [state, live]) for (const [hour, failure] of current.indicatorFailures ?? []) {
+      if (failure.inputVersion !== inputVersion()) current.indicatorFailures.delete(hour)
+    }
     state.active += 1
-    let restart = false
+    let restart = false, failedDemand = initialDemand, failedFrom = 0, admittedInput = inputVersion(), workerRecovery = false
     const task = (async () => {
       while (!this.closed) {
         const demand = needed()
         if (!demand.length) break
+        failedDemand = demand; failedFrom = 0; admittedInput = inputVersion()
         const first = demand[0], end = demand.at(-1)
         let version = state.priceVersion, generation = state.generation
         const watermark = () => this.store.priceWatermark?.(state.instId, state.timeframe, priority) ?? this.store.candleWatermark(state.instId, state.timeframe, priority)
@@ -838,8 +909,10 @@ export class PreparedChartPipeline {
         if (!await currentBasis()) return
         let calculated = checkpoint?.state ?? null, cursor = checkpoint ? checkpoint.timestamp + state.intervalMS : 0, progressed = false
         while (!this.closed && cursor <= end) {
+          failedFrom = cursor
           const rows = await this.store.candles({ instrument: state.instId, timeframe: state.timeframe, from: cursor, through: end, limit: CHUNK, order: 'asc' }, priority)
           if (!rows.length) break
+          failedFrom = rows[0].timestamp
           const result = await this.calculate(rows, state.intervalMS, state.key === this.focusKey ? 'foreground' : priority, calculated)
           if (!await currentBasis()) return
           if (this.reconcileCanonical(state, rows)) { restart = true; return }
@@ -868,14 +941,35 @@ export class PreparedChartPipeline {
         // update retries them; every calculated warm-up null is still observed.
         if (!progressed) break
       }
-    })().catch(error => { state.indicatorError = error.message }).finally(() => {
+    })().catch(error => {
+      if (this.closed || admittedInput !== inputVersion()) { restart = !this.closed; return }
+      const retryOn = error?.code === 'PREPARED_CHART_WORKER_UNAVAILABLE' || error?.name === 'WorkerExitError' ? 'worker-recovery' : 'input-change'
+      const failure = { state: 'error', from: failedFrom, through: Math.max(failedDemand.at(-1), state.latestHour ?? -Infinity), inputVersion: admittedInput,
+        error: error?.message || 'Could not calculate indicators.', retryOn }
+      for (const current of [state, live]) {
+        current.indicatorFailures ??= new Map()
+        for (const hour of current.rows.keys()) if (hour >= failure.from && hour <= failure.through && !current.indicators.has(hour)) current.indicatorFailures.set(hour, failure)
+      }
+      state.statusVersion = (state.statusVersion ?? 0) + 1
+      this.publish(state)
+      // One replacement worker may recover an interrupted calculation. A
+      // repeatedly crashing input then waits for input or a healthy worker;
+      // refresh callbacks cannot spin on the same failure.
+      if (retryOn === 'worker-recovery' && state.workerRecoveryInput !== admittedInput) {
+        state.workerRecoveryInput = admittedInput; workerRecovery = true
+      }
+    }).finally(() => {
       state.active -= 1
       if (state.calculation === task) state.calculation = null
       this.liveSeeds.delete(state.key); this.trim()
-      if (!this.closed && restart) this.seed(state, priority)
+      if (!this.closed && workerRecovery) for (const current of [state, live]) for (const [hour, failure] of current.indicatorFailures ?? []) {
+        if (failure.retryOn === 'worker-recovery' && failure.inputVersion === admittedInput) current.indicatorFailures.delete(hour)
+      }
+      if (!this.closed && (restart || workerRecovery)) { this.publish(state); this.seed(state, priority) }
       if (!this.closed) { this.refreshIndicators(state); this.scheduleRefresh() }
     })
     state.calculation = task; this.liveSeeds.set(state.key, task)
+    this.publish(state)
     return task
   }
 
@@ -965,6 +1059,7 @@ export class PreparedChartPipeline {
     const state = this.series.get(seriesKey(instId, timeframe)), live = this.liveStates.get(seriesKey(instId, timeframe))
     for (const current of [state, live].filter(Boolean)) {
       current.priceVersion += 1; current.generation = ++this.nextGeneration; current.indicatorState = null; current.indicators.clear(); current.loaded = false; current.historyRange = null; current.rows.clear(); current.latestHour = null
+      current.indicatorFailures?.clear()
     }
     this.snapshots.delete(seriesKey(instId, timeframe))
     const focus = this.focus?.key === state?.key ? this.focus : null
@@ -1008,13 +1103,22 @@ export class PreparedChartPipeline {
         const pending = this.calculations.get(id)
         if (!pending) return
         this.calculations.delete(id); slot.busy = null; slot.worker.unref()
-        if (error) pending.reject(new Error(error)); else pending.resolve({ bars, state })
+        if (error) pending.reject(new Error(error)); else {
+          pending.resolve({ bars, state })
+          const key = pending.candles[0] && seriesKey(pending.candles[0].instrument, pending.candles[0].timeframe)
+          for (const current of this.series.values()) if (current.key !== key && [...current.indicatorFailures?.values() ?? []].some(value => value.retryOn === 'worker-recovery')) {
+            for (const target of [current, this.liveStates.get(current.key)].filter(Boolean)) for (const [hour, failure] of target.indicatorFailures ?? []) {
+              if (failure.retryOn === 'worker-recovery') target.indicatorFailures.delete(hour)
+            }
+            setImmediate(() => { if (!this.closed) this.seed(current) }).unref?.()
+          }
+        }
         this.drainCalculations()
       })
       const failed = error => {
         if (!this.workers.includes(slot)) return
         const pending = this.calculations.get(slot.busy)
-        if (pending) { this.calculations.delete(slot.busy); pending.reject(error) }
+        if (pending) { this.calculations.delete(slot.busy); pending.reject(Object.assign(error, { code: 'PREPARED_CHART_WORKER_UNAVAILABLE' })) }
         this.workers = this.workers.filter(value => value !== slot); this.drainCalculations()
       }
       slot.worker.on('error', failed)

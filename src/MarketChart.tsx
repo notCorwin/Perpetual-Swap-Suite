@@ -68,7 +68,7 @@ const PriceCountdown = memo(function PriceCountdown({ hour, intervalMS, x, y }: 
   return <text data-chart-countdown x={x} y={y} dominantBaseline="middle" fill="var(--muted-foreground)">{value}</text>
 })
 const sourceStatusText = (label: string, state: PreparedChartState, status?: ChartSourceStatus) => {
-  if (state === 'error') return `${label} failed: ${status?.error || 'Source request failed'}${status?.retryAt ? ` · retry at ${new Date(status.retryAt).toLocaleTimeString('en-US', { hour12: false })}` : ''}`
+  if (state === 'error') return `${label} failed: ${status?.error || 'Source request failed'}${status?.retryAt ? ` · retry at ${new Date(status.retryAt).toLocaleTimeString('en-US', { hour12: false })}` : status?.retryOn === 'worker-recovery' ? ' · waiting for calculation service recovery' : status?.retryOn === 'input-change' ? ' · waiting for updated data' : ''}`
   if (state === 'loading') return `Loading ${label} history…`
   if (state === 'unavailable') return status?.reason === 'unsupported' ? `${label} history is unsupported` : `${label} is not published for part of this range`
   return ''
@@ -378,7 +378,8 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
   if (priceState === 'error') statusMessages.push(sourceStatusText('Price history', priceState, surface?.priceStatus))
   if (priceState === 'unavailable') statusMessages.push('Price history is unavailable for this range')
   if (surface?.indicatorState === 'loading') statusMessages.push('Calculating indicators…')
-  if (surface?.indicatorState === 'unavailable') statusMessages.push('Indicators are unavailable for part of this range')
+  if (surface?.indicatorState === 'error') statusMessages.push(sourceStatusText('Indicators', 'error', surface.indicatorStatus))
+  if (surface?.indicatorState === 'unavailable') statusMessages.push(surface.indicatorStatus?.reason === 'insufficient-history' ? 'Insufficient history for some indicators' : 'Some indicators are undefined for this range')
   for (const [label, state, status] of [['OI', oiState, surface?.oiStatus], ['Taker', takerState, surface?.takerStatus]] as const) {
     const message = sourceStatusText(label, state, status)
     if (message) statusMessages.push(message)
@@ -400,10 +401,10 @@ export function MarketChart({ instId, timeframe = '15m', active: isActive = true
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}</div>}
     {capture.error && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{capture.error}</p>}
     <div className="flex min-h-0 flex-1">
-    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending && !unavailable ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
+    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending && !unavailable ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
       <div className="flex h-9 shrink-0 items-center gap-6 border-b px-4">
         <h2 className="min-w-0 max-w-1/2 truncate text-base font-semibold tracking-tight" title={displayedId}>{displayedId.replace(/-SWAP$/, '')} · {timeframeLabel(displayedFrame)}</h2>
-        <div data-chart-status role="status" aria-live="polite" aria-atomic="true" className="flex min-w-0 flex-1 items-center gap-2 text-xs text-muted-foreground">
+        <div data-chart-status data-chart-indicator-state={surface?.indicatorState} data-chart-indicator-input={surface?.indicatorStatus?.inputVersion} role="status" aria-live="polite" aria-atomic="true" className="flex min-w-0 flex-1 items-center gap-2 text-xs text-muted-foreground">
           {statusLoading && <Spinner aria-hidden="true" role="presentation" />}
           <p className="min-w-0 truncate" title={statusSummary}>{statusMessages.map((message, index) => <span key={message}>{index > 0 && ' · '}<span>{message}</span></span>)}</p>
         </div>

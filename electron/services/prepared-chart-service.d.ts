@@ -38,6 +38,7 @@ export class PreparedChartPipeline {
   setRealtimeSubscriptions(subscriptions: { instId: string; timeframe: HistoryTimeframe }[]): void
   /** Reassess actual source deadlines after connection or subscription changes. */
   sourceStateChanged(): void
+  /** Includes range/input-version indicator failures and their recovery lifecycle. */
   subscribe(listener: (frame: PreparedChartResponse) => void): () => void
   observe(rows: CandleRecord[], previous: Map<number, CandleRecord>): void
   /** Forming candles only change in-memory projections; confirmed writes use observe. */

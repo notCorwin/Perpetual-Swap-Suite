@@ -9,6 +9,7 @@ import { ChartNotificationEncoder } from '../electron/services/chart-notificatio
 import { MarketStore } from '../electron/services/market-store.js'
 import { buildIndicatorSeries } from '../electron/services/indicators.js'
 import { attachOperationSink, type OperationEvent } from '../electron/services/operations.js'
+import { stopOperationWorker } from '../electron/services/operation-worker.js'
 
 const interval = 900_000, instId = 'BTC-USDT-SWAP'
 const end = () => Math.floor(Date.now() / interval) * interval - interval
@@ -140,10 +141,10 @@ test('interior holes and missing quote volume stay partial until persisted sourc
     assert.equal(pipeline.cached(state.key).bars.length, 96)
     assert.equal(pipeline.cached(state.key).priceState, 'error', 'A completed repair that still lacks candle inputs publishes its failure.')
     assert.match(pipeline.cached(state.key).error, /Price history is incomplete/)
-    assert.ok(pipeline.cached(state.key).priceStatus.retryAt > Date.now())
+    assert.equal(pipeline.cached(state.key).priceStatus.retryAt, undefined)
     assert.equal(pipeline.cached(state.key).bars.find((bar: any) => bar.hour === incomplete.timestamp).priceComplete, false)
-    assert.ok(pipeline.sourceAttempts.get(key).retryAt > Date.now())
-    pipeline.sourceAttempts.delete(key)
+    assert.equal(pipeline.sourceAttempts.get(key).retryAt, undefined)
+    pipeline.sourceStateChanged()
     await pipeline.refreshObservations(state)
     assert.equal(pipeline.cached(state.key).priceState, 'ready'); assert.equal(attempts, 2)
     assert.ok(pipeline.cached(state.key).bars.every((bar: any) => bar.priceComplete === true))
@@ -283,7 +284,7 @@ test('a concurrent visible correction cannot suppress invalidation of a later of
   } finally { gate.resolve(); await pipeline.dispose() }
 })
 
-test('indicator warmup acquisition retries automatically after a source failure while complete prices remain visible', async context => {
+test('indicator warmup acquisition retries after source recovery while complete prices remain visible', async context => {
   context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Math.floor(Date.now() / interval) * interval + 1000 })
   const canonical = source(400), absent = canonical[240]
   let attempts = 0
@@ -297,8 +298,8 @@ test('indicator warmup acquisition retries automatically after a source failure 
   try {
     await pipeline.local(instId, '15m'); await finishSeed(pipeline); await flush()
     assert.equal(attempts, 1); assert.equal(pipeline.cached(`${instId}:15m`).priceState, 'ready')
-    context.mock.timers.tick(4999); await flush(); assert.equal(attempts, 1)
-    context.mock.timers.tick(1); await flush()
+    context.mock.timers.tick(60_000); await flush(); assert.equal(attempts, 1)
+    pipeline.sourceStateChanged(); pipeline.refreshObservations(pipeline.state(instId, '15m')); await flush()
     await Promise.all([...pipeline.sourceTasks.values()].map((job: any) => job.task)); await finishSeed(pipeline)
     assert.equal(attempts, 2); assert.equal(pipeline.cached(`${instId}:15m`).indicatorState, 'ready')
   } finally { await pipeline.dispose() }
@@ -364,7 +365,7 @@ test('genuine listing warmup and zero-volume VWAP do not cause repeated history 
   }
 })
 
-test('source retries repair the selected historical viewport instead of the unrelated latest tail', async context => {
+test('source recovery repairs the selected historical viewport instead of the unrelated latest tail', async context => {
   const now = Math.floor(Date.now() / interval) * interval + 1000
   context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
   const canonical = source(500), absent = canonical[330], target = canonical[350].timestamp
@@ -381,8 +382,8 @@ test('source retries repair the selected historical viewport instead of the unre
     const frame = await pipeline.localHistory(instId, '15m', target)
     assert.equal(frame.priceState, 'partial')
     await flush(); assert.equal(requests.length, 1)
-    context.mock.timers.tick(4999); await flush(); assert.equal(requests.length, 1, 'A smaller viewport retry must respect the failed history page backoff.')
-    context.mock.timers.tick(1); await flush()
+    context.mock.timers.tick(60_000); await flush(); assert.equal(requests.length, 1, 'Unchanged failed demand waits for a meaningful recovery event.')
+    pipeline.sourceStateChanged(); pipeline.refreshObservations(pipeline.state(instId, '15m'), target); await flush()
     assert.equal(requests.length, 2); assert.equal(requests[1].through, target)
     assert.ok(requests[1].from <= target - 95 * interval)
     const repaired = pipeline.historyFrame(pipeline.state(instId, '15m'), target)
@@ -629,7 +630,7 @@ test('cache existence never certifies realtime when stream continuity or observa
   } finally { await pipeline.dispose() }
 })
 
-test('failed statistic sources use independent exponential deadlines while prices stay available', async context => {
+test('failed statistic sources wait independently for source recovery while prices stay available', async context => {
   // Exercise source deadlines without also crossing a native candle boundary.
   const now = Math.floor(Date.now() / interval) * interval + 1000
   context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
@@ -641,10 +642,10 @@ test('failed statistic sources use independent exponential deadlines while price
     const frame = await pipeline.local(instId, '15m')
     await flush()
     assert.equal(frame.priceState, 'ready'); assert.equal(attempts, 2)
-    context.mock.timers.tick(4_999); await flush(); assert.equal(attempts, 2)
-    context.mock.timers.tick(1); await flush(); assert.equal(attempts, 4)
-    context.mock.timers.tick(9_999); await flush(); assert.equal(attempts, 4)
-    context.mock.timers.tick(1); await flush(); assert.equal(attempts, 6)
+    context.mock.timers.tick(60_000); await flush(); assert.equal(attempts, 2)
+    pipeline.sourceStateChanged(); pipeline.refreshObservations(pipeline.state(instId, '15m')); await flush()
+    assert.equal(attempts, 4)
+    context.mock.timers.tick(60_000); await flush(); assert.equal(attempts, 4)
     assert.equal(pipeline.cached(`${instId}:15m`).endHour, end())
   } finally { await pipeline.dispose() }
 })
@@ -1731,6 +1732,121 @@ test('forming-only cached charts expose failed price acquisition without discard
     const frame = pipeline.cached(`${instId}:15m`)
     assert.equal(frame.bars.length, 0); assert.equal(frame.liveBar.close, 101)
     assert.equal(frame.priceState, 'error'); assert.equal(frame.error, 'Price history offline')
-    assert.ok(frame.priceStatus.retryAt > Date.now())
+    assert.equal(frame.priceStatus.retryAt, undefined)
   } finally { await pipeline.dispose() }
+})
+
+test('a deterministic indicator failure publishes its input and range once, then recovers only after price input changes', async context => {
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Math.floor(Date.now() / interval) * interval + 1000 })
+  const { pipeline, store } = fixture(), calculate = pipeline.calculate.bind(pipeline)
+  const states: string[] = []
+  pipeline.subscribe((frame: any) => states.push(frame.indicatorState))
+  let attempts = 0, fail = true
+  pipeline.calculate = (...args: any[]) => {
+    attempts += 1
+    if (fail) throw new Error('Indicator input rejected')
+    return calculate(...args)
+  }
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const state = pipeline.state(instId, '15m'), failed = pipeline.cached(state.key), reads = store.queries.length
+    assert.equal(failed.priceState, 'ready'); assert.equal(failed.oiState, 'ready')
+    assert.equal(failed.indicatorState, 'error'); assert.equal(failed.indicatorStatus.error, 'Indicator input rejected')
+    assert.equal(failed.indicatorStatus.from, end() - 95 * interval); assert.equal(failed.indicatorStatus.through, end())
+    assert.equal(failed.indicatorStatus.retryOn, 'input-change'); assert.ok(failed.indicatorStatus.inputVersion)
+    const version = failed.indicatorStatus.inputVersion
+    for (let count = 0; count < 4; count++) {
+      await pipeline.local(instId, '15m'); await pipeline.seed(state)
+      pipeline.sourceStateChanged()
+    }
+    context.mock.timers.tick(60_000)
+    await new Promise<void>(resolve => setImmediate(resolve))
+    assert.equal(attempts, 1, 'Refreshes, source reconnections and timers cannot replay a deterministic rejected input.')
+    assert.equal(store.queries.length, reads, 'The cached failure also avoids repeating its source scans.')
+    fail = false
+    const original = store.rows.at(-1)!, corrected = { ...original, close: original.close + .25 }
+    pipeline.observe([corrected], store.change(corrected))
+    await finishSeed(pipeline)
+    const repaired = pipeline.cached(state.key)
+    assert.equal(repaired.indicatorState, 'ready'); assert.equal(repaired.indicatorStatus.error, undefined)
+    assert.notEqual(repaired.indicatorStatus.inputVersion, version)
+    assert.ok(states.includes('error')); assert.ok(states.lastIndexOf('loading') > states.indexOf('error'))
+    const expected = new Map((buildIndicatorSeries(store.rows, interval).bars as any[]).map(value => [value.hour, value]))
+    for (const value of repaired.bars) for (const field of indicatorFields) assert.equal(value[field], expected.get(value.hour)[field])
+  } finally { await pipeline.dispose() }
+})
+
+test('an interrupted indicator worker publishes a recoverable failure and its replacement reproduces exact values', async () => {
+  const { pipeline, store } = fixture(), calculate = pipeline.calculate.bind(pipeline)
+  const failures: any[] = []
+  pipeline.workerLimit = 1
+  await calculate(source(1), interval)
+  pipeline.subscribe((frame: any) => { if (frame.indicatorState === 'error') failures.push(frame.indicatorStatus) })
+  let attempts = 0
+  let stopped: Promise<void> | undefined
+  pipeline.calculate = (...args: any[]) => {
+    attempts += 1
+    if (attempts === 1) {
+      const worker = pipeline.worker, send = worker.postMessage.bind(worker)
+      worker.postMessage = (message: any, ...parameters: any[]) => {
+        if (message.candles) {
+          // Lose an admitted request, then end its real worker after flushing
+          // diagnostics so fault injection retains the complete operation log.
+          stopped = stopOperationWorker(worker, 'prepared-chart')
+          return
+        }
+        return send(message, ...parameters)
+      }
+    }
+    const task = calculate(...args)
+    return task
+  }
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    const recovered = pipeline.cached(`${instId}:15m`)
+    assert.equal(failures.length, 1); assert.equal(failures[0].retryOn, 'worker-recovery')
+    assert.match(failures[0].error, /Worker exited/)
+    assert.equal(attempts, 2); assert.equal(recovered.indicatorState, 'ready')
+    assert.equal(recovered.indicatorStatus.inputVersion, failures[0].inputVersion)
+    const expected = new Map((buildIndicatorSeries(store.rows, interval).bars as any[]).map(value => [value.hour, value]))
+    for (const value of recovered.bars) for (const field of indicatorFields) assert.equal(value[field], expected.get(value.hour)[field])
+  } finally { await stopped; await pipeline.dispose() }
+})
+
+test('repeated worker failures stop automatic recovery and a healthy worker resumes the failed range', async () => {
+  const { pipeline } = fixture(), calculate = pipeline.calculate.bind(pipeline)
+  let attempts = 0
+  pipeline.calculate = (...args: any[]) => {
+    attempts += 1
+    if (attempts <= 2) throw Object.assign(new Error('Worker unavailable'), { name: 'WorkerExitError' })
+    return calculate(...args)
+  }
+  try {
+    await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+    assert.equal(attempts, 2)
+    const state = pipeline.state(instId, '15m')
+    await pipeline.seed(state); await pipeline.local(instId, '15m')
+    assert.equal(attempts, 2); assert.equal(pipeline.cached(state.key).indicatorState, 'error')
+    const other = 'ETH-USDT-SWAP'
+    await pipeline.calculate(source(12).map(row => ({ ...row, instrument: other })), interval)
+    for (let count = 0; count < 4; count++) await new Promise<void>(resolve => setImmediate(resolve))
+    await finishSeed(pipeline)
+    assert.equal(attempts, 4); assert.equal(pipeline.cached(state.key).indicatorState, 'ready')
+  } finally { await pipeline.dispose() }
+})
+
+test('observed indicator warmup and mathematically undefined values are distinguished from failures', async () => {
+  for (const [count, zeroVolume, reason] of [[12, false, 'insufficient-history'], [400, true, 'undefined-value']] as const) {
+    const rows = source(count).map(row => zeroVolume ? { ...row, baseVolume: 0, quoteVolume: 0 } : row)
+    const { pipeline } = fixture(rows)
+    try {
+      await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+      const frame = pipeline.cached(`${instId}:15m`)
+      assert.equal(frame.indicatorState, 'unavailable'); assert.equal(frame.indicatorStatus.reason, reason)
+      assert.equal(frame.indicatorStatus.error, undefined); assert.equal(frame.indicatorStatus.retryOn, undefined)
+      const calls = pipeline.nextCalculation
+      await pipeline.local(instId, '15m'); await finishSeed(pipeline)
+      assert.equal(pipeline.nextCalculation, calls)
+    } finally { await pipeline.dispose() }
+  }
 })

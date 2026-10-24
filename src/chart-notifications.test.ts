@@ -87,6 +87,22 @@ test('source error and retry metadata changes require full frames even when bars
 })
 
 
+test('indicator error details and recovery input versions cross the notification boundary', async t => {
+  const pipeline = fixture(t), encoder = new ChartNotificationEncoder(), frames: PreparedChartResponse[] = []
+  pipeline.subscribe(frame => frames.push(frame))
+  await pipeline.setLive(instId, timeframe, source())
+  const end = source().timestamp - intervalMS
+  const frame = { ...frames[0], endHour: end, latestEnd: end, indicatorState: 'error' as const,
+    indicatorStatus: { state: 'error' as const, from: end - 95 * intervalMS, through: end,
+      error: 'Worker unavailable', inputVersion: 'input-1', retryOn: 'worker-recovery' as const } }
+  encoder.encode(frame)
+  const changed = { ...frame, revision: frame.revision + 1, indicatorStatus: { ...frame.indicatorStatus, inputVersion: 'input-2', error: 'Invalid calculation input', retryOn: 'input-change' as const } }
+  const message = encoder.encode(changed)
+  assert.equal(isLive(message), false)
+  assert.deepEqual((message as PreparedChartResponse).indicatorStatus, changed.indicatorStatus)
+  assert.equal(isLive(encoder.encode({ ...changed, revision: changed.revision + 1 })), true)
+})
+
 test('price repair retry changes remain full notifications and cannot be compressed away with unchanged cached bars', async t => {
   const pipeline = fixture(t), encoder = new ChartNotificationEncoder(), frames: PreparedChartResponse[] = []
   pipeline.subscribe(frame => frames.push(frame))

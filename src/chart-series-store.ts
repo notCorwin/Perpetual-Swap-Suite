@@ -1,4 +1,5 @@
 import { hookOperationMethods } from '../electron/services/operations.js'
+import { completeChartPriceRange } from './chart-data.ts'
 import type { Bar, ChartSourceStatus, PreparedChartBar, PreparedChartLiveUpdate, PreparedChartMeta, PreparedChartResponse, PreparedChartState, ReadyChartWindow } from './chart-data.ts'
 import { RADAR_TIMEFRAMES, timeframeMilliseconds, type RadarTimeframe } from './timeframe.ts'
 
@@ -34,7 +35,7 @@ function preparedBar(bar: PreparedChartBar, intervalMS: number, previous?: Prepa
   if (!Number.isSafeInteger(bar.hour) || bar.hour % intervalMS !== 0 || !bar.confirmed || !validPrice(bar)
     || ![bar.oi, bar.buy, bar.sell].every(value => nullableNumber(value) && (value === null || value >= 0))
     || (bar.buy === null) !== (bar.sell === null)
-    || !indicatorFields.every(field => nullableNumber(bar[field]) || (field === 'roc' || field === 'maroc') && (bar[field] === 'Infinity' || bar[field] === '-Infinity'))) return null
+    || !indicatorFields.every(field => nullableNumber(bar[field]))) return null
   const next = { ...bar }
   // A price projection is not a retraction of independently prepared sources.
   // Price generations invalidate recursive results while independently proven
@@ -60,32 +61,66 @@ function preparedBar(bar: PreparedChartBar, intervalMS: number, previous?: Prepa
 }
 
 function sourceMeta(previous: PreparedChartMeta | undefined, response: PreparedChartResponse) {
-  const statuses = [...previous?.sourceStatuses ?? []]
-  let changed = false
-  for (const source of ['price', 'oi', 'taker'] as const) {
+  let statuses = [...previous?.sourceStatuses ?? []].filter(value => value.source !== 'indicator' || previous?.generation === response.generation)
+  for (const source of ['price', 'oi', 'taker', 'indicator'] as const) {
     const status = response[`${source}Status`]
-    if (!status) continue
-    changed = true
-    const prior = statuses.findIndex(value => value.source === source && value.status.from === status.from && value.status.through === status.through)
-    if (prior >= 0) statuses.splice(prior, 1)
+    if (!status || status.through === null || !Number.isSafeInteger(status.from) || !Number.isSafeInteger(status.through)
+      || status.from < 0 || status.from > status.through || status.from % response.intervalMS || status.through % response.intervalMS) continue
+    // A status supersedes only its own slots. Keep uncovered failures until
+    // their source succeeds or their navigation data leaves the cache.
+    statuses = statuses.flatMap(value => {
+      const prior = value.status
+      if (value.source !== source || prior.through === null || prior.through < status.from || prior.from > status.through!) return [value]
+      return [
+        ...(prior.from < status.from ? [{ source, status: Object.freeze({ ...prior, through: status.from - response.intervalMS }) }] : []),
+        ...(prior.through > status.through! ? [{ source, status: Object.freeze({ ...prior, from: status.through! + response.intervalMS }) }] : []),
+      ]
+    })
     statuses.push({ source, status: Object.freeze({ ...status }) })
   }
-  return { priceStatus: response.priceStatus, oiStatus: response.oiStatus, takerStatus: response.takerStatus, sourceStatuses: changed ? Object.freeze(statuses.slice(-16)) : previous?.sourceStatuses }
+  return { priceStatus: response.priceStatus, oiStatus: response.oiStatus, takerStatus: response.takerStatus, indicatorStatus: response.indicatorStatus, sourceStatuses: Object.freeze(statuses) }
 }
 
-function matchingStatus(meta: PreparedChartMeta, from: number, through: number, source: 'price' | 'oi' | 'taker') {
+/** Status residency follows possible resident viewports, rather than an LRU count. */
+function retainedSourceMeta(meta: PreparedChartMeta, hours: readonly number[], liveEnd?: number): PreparedChartMeta {
+  if (!meta.sourceStatuses?.length) return meta
+  const ranges: Array<{ from: number; through: number }> = []
+  for (const hour of [...hours, ...(liveEnd === undefined ? [] : [liveEnd])].sort((left, right) => left - right)) {
+    const from = hour - (WINDOW_BARS - 1) * meta.intervalMS, previous = ranges.at(-1)
+    if (previous && from <= previous.through + meta.intervalMS) previous.through = hour
+    else ranges.push({ from, through: hour })
+  }
+  const statuses = (meta.sourceStatuses ?? []).flatMap(value => ranges.flatMap(range => value.status.through !== null && value.status.from <= range.through && value.status.through >= range.from
+    ? [{ source: value.source, status: Object.freeze({ ...value.status, from: Math.max(value.status.from, range.from), through: Math.min(value.status.through, range.through) }) }] : []))
+    .sort((left, right) => left.source.localeCompare(right.source) || left.status.from - right.status.from)
+  const merged: typeof statuses = []
+  for (const value of statuses) {
+    const prior = merged.at(-1)
+    const { from: _from, through: _through, ...details } = value.status
+    const { from: _priorFrom, through: _priorThrough, ...priorDetails } = prior?.status ?? {}
+    if (prior?.source === value.source && prior.status.through! + meta.intervalMS === value.status.from && JSON.stringify(details) === JSON.stringify(priorDetails)) {
+      merged[merged.length - 1] = { source: value.source, status: Object.freeze({ ...prior.status, through: value.status.through }) }
+    } else merged.push(value)
+  }
+  return Object.freeze({ ...meta, sourceStatuses: Object.freeze(merged) })
+}
+
+function matchingStatus(meta: PreparedChartMeta, from: number, through: number, source: 'price' | 'oi' | 'taker' | 'indicator') {
   return [...meta.sourceStatuses ?? []].reverse().find(value => value.source === source && value.status.through !== null && value.status.from <= through && value.status.through >= from)?.status
 }
 
-function windowStatistics(meta: PreparedChartMeta, bars: PreparedChartBar[], from: number, through: number, source: 'oi' | 'taker'): { state: PreparedChartState; status: ChartSourceStatus | undefined } {
+function windowSource(meta: PreparedChartMeta, bars: PreparedChartBar[], from: number, through: number, source: 'price' | 'oi' | 'taker' | 'indicator'): { state: PreparedChartState; status: ChartSourceStatus | undefined } {
   const bit = source === 'oi' ? 1 : 2
-  const missing = new Set<number>()
-  for (let hour = from; hour <= through; hour += meta.intervalMS) missing.add(hour)
-  for (const bar of bars) if (observed(bar, bit)) missing.delete(bar.hour)
+  if (source === 'indicator' && !bars.length) return { state: 'loading', status: undefined }
+  const missing = new Set<number>(source === 'indicator' ? bars.map(bar => bar.hour) : [])
+  if (source !== 'indicator') for (let hour = from; hour <= through; hour += meta.intervalMS) missing.add(hour)
+  for (const bar of bars) if (source === 'price' ? bar.priceComplete !== false : source === 'indicator' ? bar.indicatorsObserved : observed(bar, bit)) missing.delete(bar.hour)
   if (!missing.size) {
-    const state = bars.every(bar => source === 'oi' ? finite(bar.oi) : finite(bar.buy) && finite(bar.sell)) ? 'ready' : 'unavailable'
-    const status: ChartSourceStatus | undefined = matchingStatus(meta, from, through, source)
-      ? { state, from, through, ...(state === 'unavailable' ? { reason: 'not-published' as const } : {}) } : undefined
+    const state = source === 'price' || bars.every(bar => source === 'indicator' ? indicatorFields.every(field => finite(bar[field])) : source === 'oi' ? finite(bar.oi) : finite(bar.buy) && finite(bar.sell)) ? 'ready' : 'unavailable'
+    const prior = matchingStatus(meta, from, through, source)
+    const reason = source === 'indicator' ? bars.some(bar => bar.ema === null) ? 'insufficient-history' : 'undefined-value' : 'not-published'
+    const status: ChartSourceStatus | undefined = prior
+      ? { state, from, through, ...(prior.inputVersion ? { inputVersion: prior.inputVersion } : {}), ...(state === 'unavailable' ? { reason } : {}) } : undefined
     return { state, status }
   }
   let matching: ChartSourceStatus | undefined
@@ -106,32 +141,33 @@ function windowStatistics(meta: PreparedChartMeta, bars: PreparedChartBar[], fro
   }
   const state = matching?.state === 'error' ? 'error' : missing.size || loading ? 'loading' : 'unavailable'
   const status: ChartSourceStatus | undefined = !matching ? undefined : state === 'error' ? { ...matching, from, through }
-    : { state, from, through, ...(state === 'unavailable' ? { reason: 'unsupported' as const } : {}) }
+    : { state, from, through, ...(matching.inputVersion ? { inputVersion: matching.inputVersion } : {}), ...(state === 'unavailable' ? { reason: 'unsupported' as const } : {}) }
   return { state, status }
 }
 
 function readyWindow(meta: PreparedChartMeta, bars: PreparedChartBar[], endHour: number, liveBar?: Bar, previous?: ReadyChartWindow): ReadyChartWindow {
   const first = Math.max(endHour - (WINDOW_BARS - 1) * meta.intervalMS, meta.historyExhausted ? meta.oldestHour ?? -Infinity : -Infinity)
-  const complete = bars.length === (endHour - first) / meta.intervalMS + 1
-    && bars.every((bar, index) => bar.hour === first + index * meta.intervalMS && bar.priceComplete !== false)
+  const complete = completeChartPriceRange(bars, first, endHour, meta.intervalMS)
   const latest = endHour === meta.latestEnd
   const detached = latest && liveBar && liveBar.hour !== endHour + meta.intervalMS
-  const availability = !bars.length && !liveBar ? 'loading' : !complete ? 'partial'
+  const availability: PreparedChartState = !bars.length && !liveBar ? 'loading' : !complete ? 'partial'
     : latest && (detached || meta.priceState === 'stale') ? 'stale'
-      : latest ? meta.priceState ?? 'ready' : 'ready'
-  const price = matchingStatus(meta, first, endHour, 'price')
+      : 'ready'
+  const price = windowSource(meta, bars, first, endHour, 'price').status
   const priceStatus = price ? availability !== 'ready' && price.state === 'error' ? { ...price, from: first, through: endHour } : { state: availability, from: first, through: endHour } : undefined
   const priceState = priceStatus?.state === 'error' ? 'error' : availability
-  const oi = windowStatistics(meta, bars, first, endHour, 'oi'), taker = windowStatistics(meta, bars, first, endHour, 'taker')
+  const oi = windowSource(meta, bars, first, endHour, 'oi'), taker = windowSource(meta, bars, first, endHour, 'taker')
+  const indicator = windowSource(meta, bars, first, endHour, 'indicator')
   const sameBars = previous && previous.generation === meta.generation && bars.length === previous.bars.length && bars.every((bar, index) => previous.bars[index] === bar)
   if (sameBars && previous.liveBar === liveBar && previous.priceState === priceState && previous.priceAsOf === meta.priceAsOf
     && JSON.stringify(previous.priceStatus) === JSON.stringify(priceStatus)
     && previous.oiState === oi.state && previous.takerState === taker.state && JSON.stringify(previous.oiStatus) === JSON.stringify(oi.status) && JSON.stringify(previous.takerStatus) === JSON.stringify(taker.status)
+    && previous.indicatorState === indicator.state && JSON.stringify(previous.indicatorStatus) === JSON.stringify(indicator.status)
     && previous.realtimeState === (meta.realtimeState ?? 'stale') && previous.priceObservedAt === meta.priceObservedAt && JSON.stringify(previous.sourceVersions) === JSON.stringify(meta.sourceVersions)) return previous
   return Object.freeze({
     key: meta.key, instId: meta.instId, timeframe: meta.timeframe, intervalMS: meta.intervalMS, generation: meta.generation, bars: sameBars ? previous.bars : Object.freeze(bars), endHour,
     priceStatus, oiState: oi.state, takerState: taker.state, oiStatus: oi.status, takerStatus: taker.status,
-    indicatorState: bars.length && bars.every(bar => bar.indicatorsObserved) ? bars.every(bar => indicatorFields.every(field => finite(bar[field]))) ? 'ready' : 'unavailable' : 'loading',
+    indicatorState: indicator.state, indicatorStatus: indicator.status,
     ...(liveBar ? { liveBar } : {}), priceState, priceAsOf: meta.priceAsOf, priceObservedAt: meta.priceObservedAt, realtimeState: meta.realtimeState ?? 'stale', sourceVersions: meta.sourceVersions,
   })
 }
@@ -172,6 +208,9 @@ export class PreparedChartStore {
 
   private setLatestFrame(key: string, value: { meta: PreparedChartMeta; window: ReadyChartWindow } | null) {
     const previous = this.latestFrames.get(key)
+    if (value && (previous?.window.bars !== value.window.bars || previous.window.endHour !== value.window.endHour || previous.meta.sourceStatuses !== value.meta.sourceStatuses)) {
+      value = { ...value, meta: retainedSourceMeta(value.meta, value.window.bars.map(bar => bar.hour), value.window.liveBar ? value.window.endHour : undefined) }
+    }
     if (previous?.window.bars !== value?.window.bars) {
       this.latestBytes += (value ? this.sizeOfBars(value.window.bars) : 0) - (previous ? this.sizeOfBars(previous.window.bars) : 0)
     }
@@ -201,7 +240,7 @@ export class PreparedChartStore {
 
   get size() { return this.series.size }
   get latestSize() { return this.latestFrames.size }
-  /** Changes when a full history entry is recreated after eviction. Compact frames do not count. */
+  /** Changes when history is recreated or loses resident bars. Compact frames do not count. */
   historyEpoch(instId: string, timeframe: RadarTimeframe) { return this.series.get(keyFor(instId, timeframe))?.epoch ?? 0 }
   private latestFrame(key: string) {
     const latest = this.latestFrames.get(key)
@@ -315,6 +354,7 @@ export class PreparedChartStore {
     if (!this.acceptGeneration(key, generation)) return false
     let entry = this.access(key)
     const latest = this.latestFrames.get(key)
+    const previousGeneration = entry?.meta.generation ?? latest?.meta.generation
     const newGeneration = !entry || entry.meta.generation !== generation
     if (newGeneration) {
       entry = {
@@ -325,6 +365,7 @@ export class PreparedChartStore {
         windows: latest?.meta.generation === generation ? new Map([[latest.window.endHour, latest.window]]) : new Map(), boundaries: null,
         liveBar: latest?.meta.generation === generation ? latest.window.liveBar : undefined, liveRevision: latest?.meta.generation === generation ? latest.meta.revision : -1,
       }
+      if (previousGeneration !== generation) entry.meta = Object.freeze({ ...entry.meta, indicatorStatus: undefined, sourceStatuses: entry.meta.sourceStatuses?.filter(value => value.source !== 'indicator') })
       this.setSeriesEntry(key, entry)
       while (this.series.size > this.maxSeries) {
         const evicted = this.series.keys().next().value!
@@ -341,6 +382,7 @@ export class PreparedChartStore {
       const bar = preparedBar(incoming, intervalMS, previous?.bar, sameGeneration)
       if (!bar) continue
       if (previous && !sameGeneration) current.boundaries = null
+      if (previous?.bar.priceComplete !== bar.priceComplete) current.boundaries = null
       if (sameBar(previous?.bar, bar)) {
         previous!.revision = sameGeneration ? Math.max(previous!.revision, revision) : revision
         if (!sameGeneration) { previous!.generation = generation; changed = true }
@@ -358,7 +400,7 @@ export class PreparedChartStore {
     const latestEnd = finite(response.latestEnd) ? Math.max(current.meta.latestEnd ?? -Infinity, response.latestEnd) : current.meta.latestEnd
     const oldestHour = finite(response.oldestHour) ? Math.min(current.meta.oldestHour ?? Infinity, response.oldestHour) : current.meta.oldestHour
     const nextMeta: PreparedChartMeta = {
-      ...(newestMeta ? sourceMeta(current.meta, response) : { priceStatus: current.meta.priceStatus, oiStatus: current.meta.oiStatus, takerStatus: current.meta.takerStatus, sourceStatuses: current.meta.sourceStatuses }),
+      ...(newestMeta ? sourceMeta(current.meta, response) : { priceStatus: current.meta.priceStatus, oiStatus: current.meta.oiStatus, takerStatus: current.meta.takerStatus, indicatorStatus: current.meta.indicatorStatus, sourceStatuses: current.meta.sourceStatuses }),
       priceState: newestMeta && response.endHour === response.latestEnd ? response.priceState : current.meta.priceState,
       priceAsOf: newestMeta ? response.priceAsOf ?? current.meta.priceAsOf : current.meta.priceAsOf,
       priceObservedAt: newestMeta ? response.priceObservedAt ?? current.meta.priceObservedAt : current.meta.priceObservedAt,
@@ -389,11 +431,13 @@ export class PreparedChartStore {
         .sort((left, right) => Math.abs(right - anchor) - Math.abs(left - anchor) || left - right)
       const excess = current.bars.size - this.maxBarsPerSeries
       for (const hour of removable.slice(0, excess)) this.setSeriesBar(current, hour, null)
+      current.epoch = ++this.nextEpoch
       current.hours = current.hours.filter(hour => current.bars.has(hour))
       current.windows.clear()
       current.boundaries = null
       changed = true
     }
+    current.meta = retainedSourceMeta(current.meta, current.hours.filter(hour => current.bars.get(hour)?.generation === generation), current.liveBar ? current.meta.latestEnd ?? undefined : undefined)
     if (this.universe.has(key)) {
       const previous = this.latestFrame(key)
       // A historical batch can carry a new indicator generation and a fully
