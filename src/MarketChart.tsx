@@ -414,11 +414,16 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
     const navigate = (event: KeyboardEvent) => {
       if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.defaultPrevented || event.isComposing || event.keyCode === 229) return
       const target = event.target instanceof Element ? event.target : document.activeElement
-      if (target?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="radio"], [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"], [data-slot="button-group"]')) return
+      if (target?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="radio"], [role="radiogroup"], [role="combobox"], [role="slider"], [role="spinbutton"], [role="tablist"], [role="tree"], [role="grid"], [role="dialog"], [role="alertdialog"], [role="menu"], [role="menubar"], [role="listbox"], [aria-haspopup][aria-expanded="true"]')) return
       if (!(event.key === 'ArrowUp' || event.key === 'ArrowDown' || event.key === 'ArrowLeft' || event.key === 'ArrowRight')) return
-      event.preventDefault()
       const id = chartNavigationTarget(listOrder, turnoverOrder, navigationId.current, event.key)
-      if (!id || id === navigationId.current) return
+      if (!id) return
+      // Market shortcuts own these keys before row and toolbar roving focus.
+      // Keep focus outside candidate SVGs, which become hidden on selection.
+      event.preventDefault()
+      event.stopPropagation()
+      plotRef.current?.focus({ preventScroll: true })
+      if (id === navigationId.current) return
       navigationId.current = id
       if (navigationTask.current === null) {
         const task = navigationTask.current = {}
@@ -429,8 +434,8 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
         })
       }
     }
-    window.addEventListener('keydown', navigate)
-    return () => window.removeEventListener('keydown', navigate)
+    window.addEventListener('keydown', navigate, true)
+    return () => window.removeEventListener('keydown', navigate, true)
   }, [isActive, listOrder, turnoverOrder, onSelect])
   const queueWheel = (pixels: number) => {
     if (!isActive || !surface || !matchesSelection || !Number.isFinite(pixels) || pixels === 0) return
@@ -556,7 +561,7 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
         {([['Open', active.open], ['High', active.high], ['Low', active.low], ['Close', active.close]] as const).map(([label, value]) => <div key={label} data-chart-ohlc={label.toLowerCase()} className="min-w-0"><span className="text-muted-foreground">{label} </span><span title={price(value)}>{price(value)}</span></div>)}
         <span data-chart-price-scale={priceScale} className="ml-auto text-muted-foreground" title={priceScale === 'linear' ? 'Linear scale · BOLL includes zero or negative values' : 'Logarithmic price scale'}>{priceScale === 'linear' ? 'Linear' : 'Log'}</span>
       </div>}
-      <div ref={plotRef} data-chart-plot className="relative min-h-0 flex-1 overflow-hidden" onKeyDown={event => {
+      <div ref={plotRef} data-chart-plot tabIndex={-1} className="relative min-h-0 flex-1 overflow-hidden focus-visible:outline-2 focus-visible:outline-ring focus-visible:-outline-offset-2" onKeyDown={event => {
         if (event.key === 'Escape') { endInspection(); return }
         if (!matchesSelection || !surface || !plotGeometry || !event.altKey || !(event.key === 'ArrowLeft' || event.key === 'ArrowRight')) return
         event.preventDefault()
@@ -565,9 +570,12 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
         const index = chartRsiNavigationTarget(plotGeometry.rsiMarkers.map(marker => marker.index), current, direction)
         if (index !== undefined) setInspection({ instId: surface.instId, timeframe: surface.timeframe, hour: bars[index].hour })
       }} onPointerLeave={() => { if (!heldPointer.current) setInspection(null) }} onPointerDown={event => {
+        if (event.button !== 0) return
+        event.preventDefault()
+        event.currentTarget.focus({ preventScroll: true })
         const target = (event.target as Element).closest<SVGSVGElement>('svg[data-rendered-inst]')
-        if (!matchesSelection || !target || event.button !== 0 || heldPointer.current) return
-        event.preventDefault(); target.setPointerCapture(event.pointerId)
+        if (!matchesSelection || !target || heldPointer.current) return
+        target.setPointerCapture(event.pointerId)
         heldPointer.current = { pointerId: event.pointerId, target }
         inspectAt(target, event.clientX)
       }} onPointerUp={endInspection} onPointerCancel={endInspection} onLostPointerCapture={endInspection} onPointerMove={event => {

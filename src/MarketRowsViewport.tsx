@@ -62,9 +62,8 @@ export const MarketRowsViewport = memo(function MarketRowsViewport({ ids, childr
   const ordered = [...indices].sort((a, b) => a - b)
   const spacer = (count: number, key: string) => count > 0 && <TableRow key={key} aria-hidden="true" className="border-0" data-virtual-spacer><TableCell colSpan={3} className="p-0" style={{ height: count * range.size }} /></TableRow>
   return <TableBody ref={body} onKeyDownCapture={event => {
-    if (!(event.target instanceof HTMLTableRowElement) || !["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return
-    const current = Number(event.target.dataset.marketIndex)
-    const target = event.key === "Home" ? 0 : event.key === "End" ? ids.length - 1 : Math.max(0, Math.min(ids.length - 1, current + (event.key === "ArrowDown" ? 1 : -1)))
+    if (!(event.target instanceof HTMLTableRowElement) || !["Home", "End"].includes(event.key)) return
+    const target = event.key === "Home" ? 0 : ids.length - 1
     event.preventDefault()
     const existing = body.current?.querySelector<HTMLTableRowElement>(`tr[data-market-index="${target}"]`)
     if (existing) existing.focus()

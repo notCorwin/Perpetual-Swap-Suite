@@ -246,6 +246,75 @@ test('default selection uses absolute completed-candle change with nulls last an
   await assertWorkspaceLayout(page)
 })
 
+test('market arrow shortcuts survive contract clicks, toolbar focus and repeated chart switches', async () => {
+  const expectMarket = async (key, symbol) => {
+    await page.keyboard.press(key)
+    await page.locator(`svg[data-rendered-inst="${symbol}-USDT-SWAP"]`).waitFor({ state: 'visible', timeout: 2_000 })
+    assert.equal(await selected().getAttribute('aria-label'), `View ${symbol}-USDT-SWAP chart`)
+    assert.equal(await page.locator('[data-chart-plot]').evaluate(plot => document.activeElement === plot), true,
+      'Chart navigation must retain focus on a stable surface rather than a hidden candidate SVG.')
+  }
+  try {
+    await page.getByRole('row', { name: 'View ZETA-USDT-SWAP chart', exact: true }).click()
+    await expectMarket('ArrowDown', 'ALPHA')
+    await expectMarket('ArrowUp', 'ZETA')
+    await page.getByRole('button', { name: '15m', exact: true }).click()
+    await expectMarket('ArrowRight', 'ALPHA')
+    assert.equal(await page.locator('[aria-label="Chart timeframe"] [aria-pressed="true"]').textContent(), '15m')
+    await page.getByRole('button', { name: 'Analyze Short', exact: true }).focus()
+    await expectMarket('ArrowLeft', 'BETA')
+    await expectMarket('ArrowUp', 'NULL')
+    await expectMarket('ArrowDown', 'BETA')
+    await page.getByRole('button', { name: 'Copy chart', exact: true }).click()
+    await expectMarket('ArrowDown', 'ZETA')
+    await page.evaluate(() => { window.dispatchEvent(new Event('blur')); window.dispatchEvent(new Event('focus')) })
+    await expectMarket('ArrowDown', 'ALPHA')
+  } finally {
+    await page.getByRole('row', { name: 'View BETA-USDT-SWAP chart', exact: true }).click()
+  }
+  assert.equal(await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()), false,
+    'DOM focus regressions must be exercised without acquiring macOS window focus.')
+})
+
+test('clicking the chart releases search focus while editing and settings keep their arrow keys', async () => {
+  const search = page.getByRole('textbox', { name: 'Search contracts' })
+  try {
+    await page.getByRole('row', { name: 'View BETA-USDT-SWAP chart', exact: true }).click()
+    await search.fill('BETA')
+    await page.keyboard.press('ArrowLeft')
+    assert.equal(await search.evaluate(input => input.selectionStart), 3)
+    assert.equal(await selected().getAttribute('aria-label'), 'View BETA-USDT-SWAP chart')
+    await search.fill('')
+    await page.locator('svg[data-rendered-inst]').click({ position: { x: 50, y: 50 } })
+    assert.equal(await page.locator('[data-chart-plot]').evaluate(plot => document.activeElement === plot), true,
+      'A chart click must explicitly transfer DOM focus after preventing pointer defaults for inspection.')
+    await page.keyboard.press('ArrowDown')
+    await page.locator('svg[data-rendered-inst="ZETA-USDT-SWAP"]').waitFor({ state: 'visible', timeout: 2_000 })
+    for (const key of ['Shift+ArrowDown', 'Control+ArrowDown', 'Meta+ArrowDown', 'Alt+ArrowDown']) await page.keyboard.press(key)
+    assert.equal(await selected().getAttribute('aria-label'), 'View ZETA-USDT-SWAP chart')
+    await page.locator('[data-chart-plot]').dispatchEvent('keydown', { key: 'ArrowDown', isComposing: true })
+    assert.equal(await selected().getAttribute('aria-label'), 'View ZETA-USDT-SWAP chart')
+    const settings = await openSettings()
+    const lookback = settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)', exact: true })
+    await lookback.focus()
+    await page.keyboard.press('ArrowUp')
+    assert.equal(await lookback.inputValue(), '16')
+    assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'ZETA-USDT-SWAP')
+    await settings.getByRole('button', { name: 'Discard changes', exact: true }).click()
+    await backToMarkets()
+    await page.keyboard.press('ArrowDown')
+    await page.locator('svg[data-rendered-inst="ALPHA-USDT-SWAP"]').waitFor({ state: 'visible', timeout: 2_000 })
+  } finally {
+    if (await settingsPage().isVisible()) {
+      const discard = settingsPage().getByRole('button', { name: 'Discard changes', exact: true })
+      if (await discard.isEnabled()) await discard.click()
+      await backToMarkets()
+    }
+    await search.fill('')
+    await page.getByRole('row', { name: 'View BETA-USDT-SWAP chart', exact: true }).click()
+  }
+})
+
 test('cold and warm chart periods preserve list nodes, order, count, and selection without reloading market rows', async () => {
   try {
     await electron.evaluate(() => {

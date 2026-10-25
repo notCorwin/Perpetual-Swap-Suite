@@ -406,7 +406,6 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
     await assertWorkspaceLayout(page)
     const second = await firstVisibleMarket(page, [first.instId])
     const mouseSwitch = await nextFrame(() => second.locator.click(), { expectedInstId: second.instId, sourceInstId: first.instId, timeframe })
-    await page.locator('svg[data-rendered-inst]').focus()
     if (holdThisPhase) {
       const switched = await nextFrame(() => page.keyboard.press('ArrowDown'), { sourceInstId: second.instId, timeframe })
       const paintCount = await page.evaluate(() => window.__navigationPaintProbe.commits.length)
