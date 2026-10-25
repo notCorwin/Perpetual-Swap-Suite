@@ -1,12 +1,19 @@
 import assert from 'node:assert/strict'
 import { assertWorkspaceLayout, selectTimeframe } from './chart-acceptance.mjs'
 
+function navigationTimingScope(presentation) {
+  return presentation === 'foreground'
+    ? { presentation, wallTime: 'native foreground deadlines enforced: 50 ms for normal input and 100 ms for rapid input', frames: 'at most one frame enforced' }
+    : { presentation, wallTime: 'input-to-SVG values are diagnostics; no native display deadline is inferred', frames: 'at most one frame enforced' }
+}
+
 // Executed in the first document by the test-only Electron bootstrap. Record
 // list availability separately, then measure selection of an actually prepared
 // SVG. Listing a qualified contract does not imply its chart is ready.
 export function startupNavigationProbe() {
   const probe = window.__navigationStartup = { documentAt: performance.timeOrigin, domAt: null, listAt: null, preparedAt: null, inputAt: null, commitAt: null, paintAt: null,
-    instId: null, timeframe: null, framesToCommit: 0, framesToPaint: 0, previous: null, commits: [], samples: [], ready: new Set(), violations: [] }
+    instId: null, timeframe: null, framesToCommit: 0, framesToPaint: 0, previous: null, commits: [], samples: [], ready: new Set(), violations: [],
+    allowInput: false, armedAt: null, inputPresentation: null }
   let stopped = false, clicking = false, inputQueued = false, raf = null
   document.addEventListener('DOMContentLoaded', () => { probe.domAt = performance.now() }, { once: true })
   window.addEventListener('radar-chart-prepared', event => {
@@ -24,16 +31,20 @@ export function startupNavigationProbe() {
       && svg.dataset.preparedChartReady === 'true' && svg.querySelector('[data-chart-indicator="ema"]')?.getAttribute('d')
       && svg.viewBox.baseVal.width > 0 && svg.viewBox.baseVal.height > 0)
     const target = rows.findLast(row => row !== selected && preparedSVG(row))
-    if (!clicking && !inputQueued && target) {
+    if (!clicking && !inputQueued && probe.allowInput && target && document.visibilityState === 'visible' && document.hasFocus()) {
       inputQueued = true
       requestAnimationFrame(() => {
         inputQueued = false
-        if (!target.isConnected || target.getAttribute('aria-selected') === 'true' || !preparedSVG(target)) return
+        if (!probe.allowInput || document.visibilityState !== 'visible' || !document.hasFocus()
+          || !target.isConnected || target.getAttribute('aria-selected') === 'true' || !preparedSVG(target)) return
         probe.preparedAt = performance.now()
         probe.instId = target.getAttribute('aria-label').slice(5, -6)
         probe.timeframe = preparedSVG(target).dataset.preparedChartTimeframe
         probe.ready.add(`${probe.timeframe}:${probe.instId}`)
+        probe.allowInput = false
         probe.inputAt = performance.now()
+        probe.inputPresentation = { armedAt: probe.armedAt, inputAt: probe.inputAt,
+          documentVisibility: document.visibilityState, documentFocused: document.hasFocus() }
         probe.preparedAtInput = [...probe.ready]
         clicking = true
         target.click()
@@ -69,7 +80,13 @@ export function startupNavigationProbe() {
   raf = requestAnimationFrame(frame)
 }
 
-export async function startupNavigationReport(page, launchedAt, fixture) {
+export async function startupNavigationReport(page, launchedAt, fixture, { presentation = 'offscreen' } = {}) {
+  await page.evaluate(() => {
+    const probe = window.__navigationStartup
+    if (!probe) throw new Error('The cold-start navigation probe is unavailable.')
+    probe.armedAt = performance.now()
+    probe.allowInput = true
+  })
   await page.waitForFunction(() => window.__navigationStartup && window.__navigationStartup.paintAt !== null, null, { timeout: 40_000 }).catch(async error => {
     const state = await page.evaluate(() => {
       const { samples, previous, stop, ready, ...probe } = window.__navigationStartup ?? {}
@@ -79,7 +96,7 @@ export async function startupNavigationReport(page, launchedAt, fixture) {
     })
     throw new Error(`Cold-start navigation did not finish: ${JSON.stringify(state)}`, { cause: error })
   })
-  return page.evaluate(({ launchedAt, instruments }) => {
+  const report = await page.evaluate(({ launchedAt, instruments }) => {
     const probe = window.__navigationStartup
     const fields = ['open', 'high', 'low', 'close', 'ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
     const oracle = new Map(instruments.map(({ instId, series }) => [instId, new Map(Object.entries(series).map(([frame, value]) => [frame, new Map(value.bars.map(bar => [bar.hour, bar]))]))]))
@@ -91,7 +108,8 @@ export async function startupNavigationReport(page, launchedAt, fixture) {
         if (probe.violations.length < 20) probe.violations.push(`Startup ${snapshot.instId}/${snapshot.timeframe}/${bar.hour}/${field} used another source value.`)
       }
     }
-    return { instId: probe.instId, timeframe: probe.timeframe, processToListMS: probe.documentAt + probe.listAt - launchedAt,
+    return { instId: probe.instId, timeframe: probe.timeframe, armedAt: probe.armedAt, inputPresentation: probe.inputPresentation,
+      processToListMS: probe.documentAt + probe.listAt - launchedAt,
       documentToListMS: probe.listAt, domToListMS: probe.listAt - probe.domAt,
       processToFirstChartMS: probe.documentAt + probe.commits[0].at - launchedAt,
       domToFirstChartMS: probe.commits[0].at - probe.domAt,
@@ -101,6 +119,7 @@ export async function startupNavigationReport(page, launchedAt, fixture) {
       preparedBeforeInput: probe.preparedAtInput, commits: probe.commits, violations: probe.violations }
   }, { launchedAt, instruments: fixture.instruments.map(({ instId, series }) => ({ instId,
     series: Object.fromEntries(Object.entries(series).map(([frame, value]) => [frame, { bars: value.bars.slice(-96) }])) })) })
+  return { timingScope: navigationTimingScope(presentation), ...report }
 }
 
 // Persist the same fixture's market catalog before a real process restart. Its
@@ -343,7 +362,8 @@ export async function firstVisibleMarket(page, excluded = []) {
   return { instId, locator: page.locator(`[aria-label="View ${instId} chart"]`) }
 }
 
-export async function exerciseInstrumentNavigation(electron, page, fixture, { holdHistory = true } = {}) {
+export async function exerciseInstrumentNavigation(electron, page, fixture, { holdHistory = true, presentation = 'offscreen' } = {}) {
+  assert.ok(presentation === 'offscreen' || presentation === 'foreground', `Unknown navigation presentation: ${presentation}`)
   const phases = []
   let heldHistory = null
   // First launch and restart use the same all-contract/all-timeframe barrier.
@@ -356,16 +376,29 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
       svg.dataset.preparedChartInst === id && svg.dataset.preparedChartTimeframe.toLowerCase() === timeframe
       && svg.dataset.preparedChartReady === 'true')) && document.querySelector('[data-chart-inst]')?.dataset.chartLoading === 'false'
   }, fixture.instIds, { timeout: 10_000 })
-  assert.equal(await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()), false,
-    'Navigation acceptance must never take macOS window focus.')
+  if (presentation === 'foreground') {
+    const native = await electron.evaluate(({ BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows()[0]
+      return { visible: window.isVisible(), focused: window.isFocused(), minimized: window.isMinimized(), offscreen: window.webContents.isOffscreen() }
+    })
+    assert.deepEqual(native, { visible: true, focused: true, minimized: false, offscreen: false },
+      'Foreground navigation timing requires a visible, focused native window.')
+    assert.equal(await page.evaluate(() => document.visibilityState === 'visible' && document.hasFocus()), true,
+      'Foreground navigation timing requires a visible, focused document.')
+  } else {
+    assert.equal(await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()), false,
+      'Offscreen navigation acceptance must never take macOS window focus.')
+  }
   await startNavigationPaintProbe(page, fixture)
-  const nextFrame = async (trigger, { maximumMS = 50, ...options } = {}) => {
+  const nextFrame = async (trigger, { rapid = false, ...options } = {}) => {
     const before = selectionRequests(await navigationRequests(electron)).length
     const result = await measureNavigation(page, trigger, options)
     const after = selectionRequests(await navigationRequests(electron)).length
     assert.ok(after - before <= 2, `A selection must use bounded local hydration: ${JSON.stringify({ result, requests: selectionRequests(await navigationRequests(electron)).slice(before) })}`)
     assert.ok(result.framesToCommit <= 1, `${result.instId} needed ${result.framesToCommit} animation frames to switch.`)
-    assert.ok(result.inputToSVGCommitMS <= maximumMS, `${result.instId} blocked input for ${result.inputToSVGCommitMS.toFixed(1)} ms (budget ${maximumMS} ms).`)
+    const maximumMS = rapid ? 100 : 50
+    if (presentation === 'foreground') assert.ok(result.inputToSVGCommitMS <= maximumMS,
+      `${result.instId} blocked input for ${result.inputToSVGCommitMS.toFixed(1)} ms (native foreground budget ${maximumMS} ms).`)
     return { ...result, selectionIPC: after - before }
   }
   for (const timeframe of [fixture.timeframe, ...fixture.timeframes.filter(frame => frame !== fixture.timeframe)]) {
@@ -442,14 +475,25 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
       const offset = window.__navigationPaintProbe.commits.length
       for (let index = 0; index < 37; index += 1) window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }))
       return offset
-    }) }, { expectedInstId, timeframe, maximumMS: 100 })
+    }) }, { expectedInstId, timeframe, rapid: true })
     const rapidPaints = await page.evaluate(offset => window.__navigationPaintProbe.commits.slice(offset), beforeBurst)
     assert.ok(rapidPaints.every(paint => paint.instId === expectedInstId), 'A coalesced key burst must only present its final requested instrument.')
     phases.push({ timeframe, prewarm, timeframeSwitch, firstVisit, mouseSwitch, keyboard, rapid, distinctContracts: new Set(order).size })
   }
   const paints = await finishNavigationPaintProbe(page)
   assertNavigationPaints(paints)
-  assert.equal(await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()), false,
-    'Navigation acceptance must never take macOS window focus.')
-  return { phases, initialPreparation, heldHistory, ...paints, commits: paints.commits.length }
+  if (presentation === 'foreground') {
+    const native = await electron.evaluate(({ BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows()[0]
+      return { visible: window.isVisible(), focused: window.isFocused(), minimized: window.isMinimized(), offscreen: window.webContents.isOffscreen() }
+    })
+    assert.deepEqual(native, { visible: true, focused: true, minimized: false, offscreen: false },
+      'The native window must remain foreground throughout navigation acceptance.')
+    assert.equal(await page.evaluate(() => document.visibilityState === 'visible' && document.hasFocus()), true,
+      'The document must remain foreground throughout navigation acceptance.')
+  } else {
+    assert.equal(await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()), false,
+      'Offscreen navigation acceptance must never take macOS window focus.')
+  }
+  return { timingScope: navigationTimingScope(presentation), phases, initialPreparation, heldHistory, ...paints, commits: paints.commits.length }
 }

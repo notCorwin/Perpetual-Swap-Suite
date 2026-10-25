@@ -44,11 +44,6 @@ jobs:
         # Hosted runners may expose software rendering. The dedicated report
         # distinguishes confirmed unsupported hardware from a passed GPU check.
         run: npm run test:gpu -- --output artifacts/sandbox
-      - name: Test native foreground chart painting
-        # Native timing is independent evidence even when an offscreen
-        # functional/renderer acceptance fails; either failure remains fatal.
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
-        run: npm run test:foreground -- --output artifacts/sandbox
       - name: Verify workspace scaling and contrast
         env:
           PERPETUAL_SWAP_UI_VISUAL_OUTPUT: artifacts/workspace-visual
@@ -73,9 +68,36 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  chart-foreground:
+    name: Native foreground chart and navigation timing
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: '.nvmrc'
+          cache: npm
+      - name: Use the supported npm version
+        run: npm install --global npm@12.2.0
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Test native foreground charts and navigation
+        run: npm run test:foreground -- --output artifacts/sandbox
+      - name: Retain native timing diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: chart-foreground-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
   package-smoke:
     name: Package and smoke the macOS executable
-    needs: validate
+    needs: [validate, chart-foreground]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: macos-15
     timeout-minutes: 25

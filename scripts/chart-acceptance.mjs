@@ -870,7 +870,7 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture, { o
     assertCompletePaints(paint)
     const requests = await readRequestProbe(electron)
     assert.equal(paint.pendingFrames, 0, `Latency-covered scrolling must never expose an unprepared requested viewport: ${JSON.stringify({ calls: requests.calls, sourceRequests: requests.sourceRequests, historyResponses: requests.historyResponses.length, inputDurationMS: inputs.at(-1) - inputs[0], pendingFrames: paint.pendingFrames, pendingWindows: paint.pendingWindows })}`)
-    assert.ok(latency.latestInputToPaintMS < 100, `The latest wheel input took ${latency.latestInputToPaintMS} ms to paint. ${JSON.stringify(latency)}`)
+    if (!offscreen) assert.ok(latency.latestInputToPaintMS < 100, `The latest wheel input took ${latency.latestInputToPaintMS} ms to paint. ${JSON.stringify(latency)}`)
     const extensions = requests.extensions.filter(record => record.completedAt !== null && record.startedAt >= timeOrigin + inputs[0])
     const first = extensions[0]
     assert.ok(first, 'Backend reserve preparation must extend the delivered history during the gesture.')
@@ -897,6 +897,9 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture, { o
     assert.deepEqual(sources.historical, [], 'Prefetch must reuse persisted source candles and statistics within the latency test range.')
     return {
       foregroundWindow: foreground?.native, environment: foreground?.environment, idleFrameCadence: foreground?.idleFrameCadence,
+      timingScope: offscreen
+        ? { presentation: 'offscreen', wallTime: 'input-to-paint values are diagnostics; no native display deadline is inferred', frames: 'all paint and pending-frame assertions remain enforced' }
+        : { presentation: 'native foreground', wallTime: '100 ms latest-input-to-paint deadline enforced', frames: 'all paint and pending-frame assertions remain enforced' },
       nativePaintMeasured: false, foregroundPaintOpportunityMeasured: !offscreen,
       initialHistoryBars, initialHistoryFirst: admitted.first, historicalDelayMS, continuousWheelFrames: frames,
       scrolledCandles: frames * candlesPerFrame, crossedInitialBoundary: true,

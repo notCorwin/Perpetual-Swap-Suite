@@ -31,7 +31,10 @@ test('ordinary test commands exclude native foreground acceptance and the explic
     assert.ok(files.every(file => !file.endsWith('.foreground.mjs')))
   }
   const commands = await sandboxCommands('foreground')
-  assert.deepEqual(commands.at(-1).filter(file => file.endsWith('.mjs') && file.startsWith('tests/')), ['tests/e2e/chart-paint.foreground.mjs'])
+  assert.deepEqual(commands.at(-1).filter(file => file.endsWith('.mjs') && file.startsWith('tests/')), [
+    'tests/e2e/chart-paint.foreground.mjs',
+    'tests/e2e/instrument-navigation.foreground.mjs',
+  ])
 })
 
 test('native foreground measurement is limited to a dedicated hosted macOS CI runner', async () => {
