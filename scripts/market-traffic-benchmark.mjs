@@ -6,6 +6,7 @@ import { dirname, extname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { _electron } from 'playwright'
+import { requireForegroundTests } from '../electron/test-presentation.js'
 import { createMarketTrafficExchange } from '../tests/helpers/market-traffic-exchange.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
@@ -15,7 +16,7 @@ const { values } = parseArgs({
     'app-root': { type: 'string' }, output: { type: 'string' },
     'candidate-count': { type: 'string' }, 'passing-count': { type: 'string' },
     'spread-failure-count': { type: 'string' }, 'duration-seconds': { type: 'string' }, 'cadence-ms': { type: 'string' },
-    'expect-optimized': { type: 'boolean' },
+    'expect-optimized': { type: 'boolean' }, foreground: { type: 'boolean' },
   },
   allowPositionals: false,
 })
@@ -31,10 +32,21 @@ const spreadFailureCount = numberOption('spread-failure-count', Math.floor((cand
 const durationSeconds = numberOption('duration-seconds', 7)
 const cadenceMS = numberOption('cadence-ms', 500)
 const expectOptimized = values['expect-optimized'] === true
+const foreground = values.foreground === true
+const benchmarkMode = foreground
+  ? 'foreground-electron-loopback-market-traffic-and-renderer-responsiveness'
+  : 'hidden-electron-loopback-market-traffic-and-renderer-responsiveness'
 if (candidateCount < 3 || candidateCount > 100) throw new Error('--candidate-count must be between 3 and 100.')
 if (durationSeconds < 5 || durationSeconds > 10) throw new Error('--duration-seconds must be between 5 and 10.')
 if (cadenceMS < 100 || cadenceMS > 2_000) throw new Error('--cadence-ms must be between 100 and 2000.')
-if (process.env.PERPETUAL_SWAP_SANDBOX !== '1' || process.env.PERPETUAL_SWAP_TEST_UI !== 'background'
+if (foreground) {
+  // This check rejects local --foreground use before app resolution or launch.
+  requireForegroundTests()
+  if (process.env.PERPETUAL_SWAP_SANDBOX !== '1' || process.env.PERPETUAL_SWAP_TEST_UI !== 'foreground'
+    || process.env.PERPETUAL_SWAP_ALLOW_NETWORK !== '0') {
+    throw new Error('Run foreground market traffic measurement through scripts/test-sandbox.mjs command --desktop --foreground with network disabled.')
+  }
+} else if (process.env.PERPETUAL_SWAP_SANDBOX !== '1' || process.env.PERPETUAL_SWAP_TEST_UI !== 'background'
   || process.env.PERPETUAL_SWAP_ALLOW_NETWORK !== '0' || !process.env.PERPETUAL_SWAP_TEST_GUARD) {
   throw new Error('Run through scripts/test-sandbox.mjs command --desktop. The hidden protected runtime and network-disabled sandbox are required.')
 }
@@ -72,10 +84,12 @@ async function targetMetadata(app, checkout) {
   catch { return { path, revision: null, dirty: null } }
 }
 
-async function protectedRuntime(electron) {
-  const guard = JSON.parse(await readFile(process.env.PERPETUAL_SWAP_TEST_GUARD, 'utf8'))
+async function runtimeMetadata(electron) {
   const runtime = await electron.evaluate(({ app }) => ({ executable: process.execPath, electronVersion: process.versions.electron,
     packaged: app.isPackaged, appPath: app.getAppPath() }))
+  if (foreground) return { presentation: 'native-foreground-window', sourceFingerprint: null, executable: runtime.executable,
+    electronVersion: runtime.electronVersion, packaged: runtime.packaged, appPath: runtime.appPath }
+  const guard = JSON.parse(await readFile(process.env.PERPETUAL_SWAP_TEST_GUARD, 'utf8'))
   if (runtime.executable !== guard.executable) throw new Error(`App did not use the protected test Electron runtime: ${runtime.executable}`)
   return { presentation: guard.presentation, sourceFingerprint: guard.sourceFingerprint, executable: runtime.executable,
     electronVersion: runtime.electronVersion, packaged: runtime.packaged, appPath: runtime.appPath }
@@ -87,6 +101,27 @@ async function assertHidden(electron) {
     return { visible: window.isVisible(), focused: window.isFocused(), minimized: window.isMinimized(), offscreen: window.webContents.isOffscreen() }
   })
   assert.deepEqual(state, { visible: false, focused: false, minimized: false, offscreen: true }, 'App must remain hidden, unfocused and offscreen.')
+  return state
+}
+
+async function assertForeground(electron, page) {
+  requireForegroundTests()
+  const id = await electron.evaluate(({ BrowserWindow, app }) => {
+    const window = BrowserWindow.getAllWindows()[0]
+    if (!window) throw new Error('Foreground measurement requires the app window.')
+    if (window.isMinimized()) window.restore()
+    window.show()
+    app.focus({ steal: true })
+    window.focus()
+    return window.id
+  })
+  await page.waitForFunction(() => document.visibilityState === 'visible' && document.hasFocus(), null, { timeout: 5_000 })
+  const state = await electron.evaluate(({ BrowserWindow }, windowId) => {
+    const window = BrowserWindow.fromId(windowId)
+    return { visible: window.isVisible(), focused: window.isFocused(), minimized: window.isMinimized(), offscreen: window.webContents.isOffscreen() }
+  }, id)
+  assert.deepEqual(state, { visible: true, focused: true, minimized: false, offscreen: false },
+    'Foreground market traffic measurement requires a visible, focused, non-offscreen native window.')
   return state
 }
 
@@ -104,9 +139,9 @@ if (app.selected === '/Applications/Perpetual Swap Suite.app'
 }
 const output = resolve(values.output ?? join(root, '.build/traffic-optimization/market-traffic.json'))
 const userData = process.env.PERPETUAL_SWAP_USER_DATA
-if (!userData || !process.env.PERPETUAL_SWAP_TEST_GUARD) throw new Error('Protected sandbox user data is required.')
+if (!userData || (!foreground && !process.env.PERPETUAL_SWAP_TEST_GUARD)) throw new Error('Protected sandbox user data is required.')
 const fixture = await createMarketTrafficExchange({ candidateCount, passingCount, spreadFailureCount, seed: 17 })
-let electron, cadence
+let electron, cadence, failureMeasurements
 try {
   electron = await _electron.launch({ args: [app.entry], cwd: app.cwd,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_E2E_LIVE_REFRESH: '1',
@@ -115,7 +150,8 @@ try {
       PERPETUAL_SWAP_USER_DATA: userData } })
   const page = await electron.firstWindow()
   await page.waitForLoadState('domcontentloaded')
-  const presentation = await assertHidden(electron), runtime = await protectedRuntime(electron)
+  const presentation = foreground ? await assertForeground(electron, page) : await assertHidden(electron)
+  const runtime = await runtimeMetadata(electron)
   await page.waitForSelector('input[aria-label="Search contracts"]', { timeout: 30_000 })
 
   let snapshot
@@ -178,23 +214,39 @@ try {
   await sleep(cadenceMS)
   // The sample clock starts after qualification, connection setup and the
   // initial cadence message. Only steady-state fixture traffic is measured.
+  if (foreground) await assertForeground(electron, page)
   const sampleStartedAt = fixture.beginSample()
-  await page.evaluate(() => {
-    const state = { gaps: [], interactions: [], lastFrame: null, startedAt: performance.now(), active: true }
+  await page.evaluate(requireForeground => {
+    const state = { gaps: [], interactions: [], lastFrame: null, startedAt: performance.now(), active: true,
+      presentation: { requiredForeground: requireForeground, samples: 0, totalViolations: 0, violations: [] } }
+    const checkPresentation = () => {
+      if (!state.active) return
+      state.presentation.samples++
+      if (requireForeground && (document.visibilityState !== 'visible' || !document.hasFocus())) {
+        state.presentation.totalViolations++
+        if (state.presentation.violations.length < 10) state.presentation.violations.push({
+          at: performance.now(), visibility: document.visibilityState, focused: document.hasFocus() })
+      }
+    }
+    document.addEventListener('visibilitychange', checkPresentation)
+    window.addEventListener('blur', checkPresentation)
     const frame = now => {
       if (!state.active) return
+      checkPresentation()
       if (state.lastFrame !== null) state.gaps.push(now - state.lastFrame)
       state.lastFrame = now
       requestAnimationFrame(frame)
     }
     document.addEventListener('input', event => {
       if (event.target?.getAttribute?.('aria-label') !== 'Search contracts') return
+      checkPresentation()
       const started = performance.now()
       requestAnimationFrame(() => requestAnimationFrame(() => state.interactions.push(performance.now() - started)))
     }, true)
     globalThis.__marketTrafficResponsiveness = state
+    checkPresentation()
     requestAnimationFrame(frame)
-  })
+  }, foreground)
   const search = page.locator('input[aria-label="Search contracts"]')
   const searches = fixture.instIds.slice(0, passingCount).map(instId => instId.slice(0, 4))
   const interactionTask = (async () => {
@@ -213,12 +265,28 @@ try {
       const sorted = [...values].sort((left, right) => left - right)
       return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))] ?? 0
     }
-    return { elapsedMS: performance.now() - state.startedAt, frameCount: state.gaps.length,
+    return { elapsedMS: performance.now() - state.startedAt, frameCount: state.gaps.length, presentation: state.presentation,
       frameGapMS: { p50: percentile(state.gaps, .5), p95: percentile(state.gaps, .95), max: Math.max(0, ...state.gaps) },
       searchInteractionMS: { count: state.interactions.length, p50: percentile(state.interactions, .5),
         p95: percentile(state.interactions, .95), max: Math.max(0, ...state.interactions) } }
   })
+  failureMeasurements = {
+    schemaVersion: 1,
+    mode: benchmarkMode,
+    partial: true,
+    generatedAt: new Date().toISOString(),
+    app: { path: app.selected, entry: app.entry, build: target, checkout },
+    runtime: { ...runtime, testPresentation: foreground ? 'foreground-native' : runtime.presentation, presentation,
+      network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' },
+    fixture: { candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture.oiFailureCount, seed: fixture.seed,
+      dataFingerprint: `market-traffic-v2-bookseq-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
+      cadenceMS, durationSeconds, sampleStartedAt, expectOptimized },
+    renderer: { ...renderer, measurement: foreground
+      ? 'Native foreground renderer RAF gaps and React search input to next-frame latency; native compositor paint was not measured.'
+      : 'Hidden offscreen renderer RAF gaps and React search input to next-frame latency; no native compositor paint claim.' },
+  }
   const traffic = fixture.endSample()
+  if (foreground) assert.equal(renderer.presentation.totalViolations, 0, 'Foreground visibility and focus must hold throughout sampling.')
   assert.ok(Math.abs(traffic.durationSeconds - durationSeconds) <= 0.75,
     `Steady-state traffic sample duration drifted outside the bounded window: ${traffic.durationSeconds}s.`)
   const delivery = fixture.deliverySummary(), finalValues = fixture.latestValues
@@ -271,7 +339,7 @@ try {
   const httpResponsePayloadBytes = Object.values(traffic.http).reduce((sum, value) => sum + value.payloadBytes, 0)
   const report = {
     schemaVersion: 1,
-    mode: 'hidden-electron-loopback-market-traffic-and-renderer-responsiveness',
+    mode: benchmarkMode,
     generatedAt: new Date().toISOString(),
     app: { path: app.selected, entry: app.entry, build: target, checkout },
     runtime: { ...runtime, testPresentation: runtime.presentation, presentation,
@@ -288,7 +356,9 @@ try {
       subscriptionAcknowledgementBytesByChannel: traffic.acknowledgements,
       subscriptionCounts: fixture.currentAcknowledgements,
       freshness, fixtureRequests: fixture.requests.length, fixtureRequestBytes: fixture.requests.reduce((sum, value) => sum + (value.requestPayloadBytes ?? 0), 0) },
-    renderer: { ...renderer, measurement: 'Hidden offscreen renderer RAF gaps and React search input to next-frame latency; no native compositor paint claim.' },
+    renderer: { ...renderer, measurement: foreground
+      ? 'Native foreground renderer RAF gaps and React search input to next-frame latency; native compositor paint was not measured.'
+      : 'Hidden offscreen renderer RAF gaps and React search input to next-frame latency; no native compositor paint claim.' },
     correctness: { finalRealtimeState: finalSnapshot.realtimeState, connectedWebSocketClients: fixture.readyState.clients,
       allCandidatesHaveFreshTickerOpenInterestAnd5m: true,
       passingIDs: (finalSnapshot.rows ?? []).map(row => row.instId).sort(),
@@ -304,9 +374,17 @@ try {
     fixture.requests.filter(request => request.path === path).length]))
   const channels = Object.fromEntries(Object.entries(fixture.currentAcknowledgements).map(([channel, ids]) => [channel, ids.length]))
   const deliveryCounts = Object.fromEntries(Object.entries(fixture.deliverySummary().byChannel).map(([channel, value]) => [channel, value.instrumentCount]))
-  console.error(JSON.stringify({ benchmarkFailure: error.message, fixtureErrors: fixture.errors,
+  const diagnostics = { benchmarkFailure: error.message, fixtureErrors: fixture.errors,
     fixtureRequests: requestCounts, fixtureReadyClients: fixture.readyState.clients,
-    fixtureSubscriptions: channels, instrumentsWithFixtureDeliveries: deliveryCounts }, null, 2))
+    fixtureSubscriptions: channels, instrumentsWithFixtureDeliveries: deliveryCounts }
+  if (failureMeasurements) {
+    try {
+      await mkdir(dirname(output), { recursive: true })
+      await writeFile(output, `${JSON.stringify({ ...failureMeasurements, outcome: 'failed', failure: error.message, diagnostics }, null, 2)}\n`)
+      diagnostics.partialFailureReport = output
+    } catch (reportError) { diagnostics.partialFailureReportError = reportError.message }
+  }
+  console.error(JSON.stringify(diagnostics, null, 2))
   throw error
 } finally {
   cadence?.stop()

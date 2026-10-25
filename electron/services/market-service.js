@@ -208,6 +208,8 @@ export class MarketService {
     this.statisticsTasks = new Map()
     this.liveCandles = new Map()
     this.liveCandleSources = new Map()
+    this.derivedLivePrices = new WeakSet()
+    this.livePrefixTasks = new Map()
     this.liveReceivedAt = new Map()
     this.liveSourceRevisions = new Map()
     this.sourceRecoveries = new Map()
@@ -251,7 +253,7 @@ export class MarketService {
     // The proxy admits no historical work until durable metadata has opened.
     const history = Object.fromEntries(['ensurePrices', 'ensureStatistics', 'latest', 'promoteSource'].map(method => [method, async (...args) => {
       await this.ready
-      const result = await this.history[method](...args)
+      const result = await (method === 'latest' ? this.latestChartPrice(...args) : this.history[method](...args))
       if (method === 'promoteSource') this.wakeRequestQueues()
       return result
     }]))
@@ -260,7 +262,10 @@ export class MarketService {
       acquire: (_instId, timeframe) => timeframe === this.preferences().chartTimeframe,
       onFocus: () => this.scheduleSubscriptions() })
     this.candleDerivations = new CandleDerivations({ store,
-      onLive: (instId, timeframe, row, context) => this.track(this.setLive(instId, timeframe, row, context)) })
+      onLive: (instId, timeframe, row, context) => {
+        if (row) this.derivedLivePrices.add(row)
+        return this.track(this.setLive(instId, timeframe, row, context))
+      } })
     this.ready = this.initialize()
     this.unsubscribeStore = this.store.subscribe?.(change => {
       if (!change.imported || this.closing) return
@@ -1562,7 +1567,38 @@ export class MarketService {
   }
 
   priceStreaming(instId, timeframe) {
-    return Boolean(this.realtime?.isSubscribed(instId, '5m') && (timeframe === '5m' || this.liveCandleSources.has(`${instId}:${timeframe}`)))
+    return Boolean(this.realtime?.isSubscribed(instId, '5m')
+      && (timeframe === '5m' || this.derivedLivePrices.has(this.liveCandleSources.get(`${instId}:${timeframe}`))))
+  }
+
+  latestChartPrice(instId, timeframe, priority = 'foreground', signal) {
+    if (this.closing || this.disposed) return Promise.reject(new Error('Market service is closed.'))
+    const base = this.liveCandleSources.get(`${instId}:5m`), step = timeframeMilliseconds(timeframe)
+    const from = base && Math.floor(base.timestamp / step) * step
+    const listedAt = number(this.instruments.get(instId)?.listTime)
+    if (timeframe === '5m' || !this.realtime.isSubscribed(instId, '5m')
+      || !base || base.timestamp !== closedBoundary('5m') || listedAt !== null && listedAt > from) {
+      return this.history.latest(instId, timeframe, priority)
+    }
+    const key = `${instId}:${timeframe}`
+    if (this.livePrefixTasks.has(key)) return abortable(this.livePrefixTasks.get(key), signal)
+    const generation = this.instrumentGenerations.get(instId) ?? 0
+    const task = Promise.resolve().then(async () => {
+      // A demanded coarse live candle needs at most eleven closed fine bars.
+      // Reuse durable coverage before acquiring only that missing prefix.
+      const through = base.timestamp - FIVE_MINUTES
+      const rows = from <= through
+        ? (await this.history.ensurePrices(instId, '5m', from, through, priority, this.shutdownController.signal)).rows : []
+      if (this.closing || (this.instrumentGenerations.get(instId) ?? 0) !== generation) return {}
+      const current = this.liveCandleSources.get(`${instId}:5m`)
+      if (current) {
+        this.track(this.candleDerivations.observe(current, { receivedAt: this.liveReceivedAt.get(`${instId}:5m`) }))
+        this.candleDerivations.correct(instId, rows)
+      }
+      return {}
+    }).finally(() => { if (this.livePrefixTasks.get(key) === task) this.livePrefixTasks.delete(key) })
+    this.livePrefixTasks.set(key, task)
+    return abortable(task, signal)
   }
 
   async reconcileRealtime(subscriptions, { signal } = {}) {
@@ -2805,7 +2841,7 @@ export class MarketService {
       await settle([() => this.historyDownload.close()])
       await settle([() => this.history.close()])
       await settle([() => this.preparedCharts.dispose()])
-      await Promise.allSettled([this.refreshing, this.renewing, this.drainRequestQueues(), ...this.candidateTasks.values(), ...this.barTasks, ...this.backgroundTasks, ...this.rankingTasks.values(), ...this.candleMutations.values()].filter(Boolean))
+      await Promise.allSettled([this.refreshing, this.renewing, this.drainRequestQueues(), ...this.candidateTasks.values(), ...this.barTasks, ...this.backgroundTasks, ...this.rankingTasks.values(), ...this.candleMutations.values(), ...this.livePrefixTasks.values()].filter(Boolean))
       await settle([() => this.flushRankingPersistence()])
       if (this.ownsMetadata) await settle([() => this.metadata.close()])
       if (failures.length) throw new AggregateError(failures, `Market service shutdown failed: ${failures.map(error => error?.message ?? String(error)).join('; ')}`)
