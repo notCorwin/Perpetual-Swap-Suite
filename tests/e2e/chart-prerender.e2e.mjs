@@ -133,6 +133,11 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
         && svg.closest('[data-chart-inst]')?.dataset.chartLoading === 'false'
     }, coldTarget)
     await assertSharedSurface('Timeframe switch')
+    const backgroundBeforeCorrection = await page.evaluate(() => {
+      const bar = document.querySelector('[data-chart-inst]').__chartSnapshot.bars.at(-1)
+      return { close: bar.close, ema: bar.ema,
+        path: document.querySelector('svg[data-rendered-inst] [data-chart-indicator="ema"]').getAttribute('d') }
+    })
     assert.equal(await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()), false,
       'The acceptance app must never take macOS window focus.')
     const target = initial.ids.find(id => id !== coldTarget)
@@ -178,10 +183,6 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
     }), { ...beforeCorrection, count: 1, sameSurface: true, sameSnapshot: true, sameEMAPath: true },
     'A durable correction for an unselected contract must leave the current chart untouched.')
 
-    const previousEMAPath = await page.evaluate(() => {
-      const svg = document.querySelector('svg[data-rendered-inst]')
-      return svg.querySelector('[data-chart-indicator="ema"]').getAttribute('d')
-    })
     await page.locator(`[aria-label="View ${background} chart"]`).evaluate(row => {
       window.__prerenderProbe.selected = row.getAttribute('aria-label').slice(5, -6)
       row.click()
@@ -192,12 +193,14 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
         && snapshot.bars.some(bar => bar.hour === hour && bar.close === close)
         && chart.dataset.chartLoading === 'false'
     }, { instId: background, hour: fixture.end, close: correction.close })
-    assert.equal(await page.evaluate(({ previousPath, hour, close }) => {
+    const expectedEMA = backgroundBeforeCorrection.ema + 2 / 201 * (correction.close - backgroundBeforeCorrection.close)
+    assert.equal(await page.evaluate(({ previousPath, hour, close, expectedEMA }) => {
       const svg = document.querySelector('svg[data-rendered-inst]'), chart = document.querySelector('[data-chart-inst]')
       const ema = svg?.querySelector('[data-chart-indicator="ema"]')
       return svg === window.__sharedSurface && ema === window.__sharedEMA
-        && ema?.getAttribute('d') !== previousPath && chart.__chartSnapshot.bars.some(bar => bar.hour === hour && bar.close === close)
-    }, { previousPath: previousEMAPath, hour: fixture.end, close: correction.close }), true,
+        && ema?.getAttribute('d') !== previousPath && chart.__chartSnapshot.bars.some(bar => bar.hour === hour && bar.close === close
+          && Math.abs(bar.ema - expectedEMA) < 1e-10)
+    }, { previousPath: backgroundBeforeCorrection.path, hour: fixture.end, close: correction.close, expectedEMA }), true,
     'Selecting the corrected contract must immediately redraw its indicator on the existing SVG and EMA path nodes.')
     await assertSharedSurface('Corrected contract switch')
 
@@ -220,21 +223,13 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
         const svg = chart?.querySelector('svg[data-rendered-inst]')
         const labelPrice = Number(svg?.querySelector('[data-chart-price-label-value]')?.textContent.split(/\s/)[0].replaceAll(',', ''))
         resolve({ price, currentAtNextFrame: snapshot?.instId === instId && snapshot.liveBar?.close === price
+          && snapshot.bars.length === 96 && snapshot.bars.every(bar => bar.confirmed)
           && svg === window.__sharedSurface && Math.abs(labelPrice - price) < 1e-5 })
       }))
     }, liveTarget)
     assert.equal(liveSelection.currentAtNextFrame, true, 'The current SVG must show the selected contract live price by the next frame.')
-    await page.waitForFunction(({ instId, price }) => {
-      const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
-      return snapshot?.instId === instId && snapshot.liveBar?.close === price
-        && chart.querySelector('svg[data-rendered-inst]') === window.__sharedSurface
-    }, { instId: liveTarget, price: liveSelection.price })
-    assert.equal(await page.evaluate(() => {
-      const chart = document.querySelector('[data-chart-inst]'), snapshot = chart.__chartSnapshot
-      const label = chart.querySelector('[data-chart-price-label-value]').textContent
-      return snapshot.bars.length === 96 && snapshot.bars.every(bar => bar.confirmed)
-        && Math.abs(Number(label.split(/\s/)[0].replaceAll(',', '')) - snapshot.liveBar.close) < 1e-5
-    }), true, 'Selection must immediately pair the latest price with its existing complete candle window.')
+    // Later authoritative backend frames may supersede this injected price;
+    // the assertion above inspects the complete SVG in the measured frame.
 
     // Resizing may change list virtualization, but the chart keeps one surface.
     const stability = await page.evaluate(() => window.__prerenderProbe.stop())
