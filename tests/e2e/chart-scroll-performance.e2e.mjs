@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { _electron } from 'playwright'
 import {
-  installRequestProbe, measureLatencyCoveredPrefetch, openChart, readRequestProbe, removeRequestProbe, resetRequestProbe,
+  installRequestProbe, measureLatencyCoveredPrefetch, offscreenChartWindow, openChart, readRequestProbe, removeRequestProbe, resetRequestProbe,
   separateSourceMaintenance, waitForLocalHistory, waitForRendered, wheelBurst,
 } from '../../scripts/chart-acceptance.mjs'
 
@@ -31,7 +31,7 @@ async function waitForRequestQuiescence(timeoutMS = 5_000) {
 before(async () => {
   userData = await mkdtemp(join(tmpdir(), 'perp-radar-chart-scroll-e2e-'))
   await writeFile(join(userData, 'settings.json'), JSON.stringify({ monitoringPaused: true, backgroundMonitoringEnabled: false }))
-  electron = await _electron.launch({ args: [root, '--headless', '--disable-gpu'], cwd: root, env: {
+  electron = await _electron.launch({ args: [root], cwd: root, env: {
     ...process.env,
     ELECTRON_RUN_AS_NODE: undefined,
     PERPETUAL_SWAP_E2E: '1',
@@ -40,6 +40,7 @@ before(async () => {
   } })
   page = await electron.firstWindow()
   await page.waitForLoadState('domcontentloaded')
+  await offscreenChartWindow(electron)
 })
 
 after(async () => {

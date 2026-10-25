@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { _electron } from 'playwright'
 import {
-  installRequestProbe, measureOffscreenColdBoundary, openChart, readRequestProbe,
+  installRequestProbe, measureOffscreenColdBoundary, offscreenChartWindow, openChart, readRequestProbe,
   removeRequestProbe, resetRequestProbe, separateSourceMaintenance, selectTimeframe,
   waitForLocalHistory, waitForRendered,
 } from './chart-acceptance.mjs'
@@ -206,13 +206,7 @@ try {
   } })
   const page = await electron.firstWindow()
   await page.waitForLoadState('domcontentloaded')
-  const native = await electron.evaluate(({ BrowserWindow }) => {
-    const window = BrowserWindow.getAllWindows()[0]
-    const state = { visible: window.isVisible(), focused: window.isFocused(), offscreen: window.webContents.isOffscreen() }
-    if (state.visible || state.focused || !state.offscreen) throw new Error(`Unsafe chart benchmark presentation: ${JSON.stringify(state)}`)
-    window.webContents.setFrameRate(60)
-    return state
-  })
+  const native = await offscreenChartWindow(electron)
   const cdp = await page.context().newCDPSession(page)
   await cdp.send('Performance.enable')
   const request = value => page.evaluate(value => window.radarDesktop.request(value), value)

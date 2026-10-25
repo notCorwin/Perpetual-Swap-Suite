@@ -4,16 +4,18 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
+import { offscreenChartWindow } from '../../scripts/chart-acceptance.mjs'
 import { assertNavigationPaints, exerciseInstrumentNavigation, finishNavigationPaintProbe, installNavigationProbe, measureNavigation, persistNavigationCatalog, removeNavigationProbe, selectionRequests, startNavigationPaintProbe, startupNavigationReport } from '../../scripts/instrument-navigation-acceptance.mjs'
 
 const root = new URL('../..', import.meta.url).pathname
 const userData = await mkdtemp(join(tmpdir(), 'perp-instrument-navigation-e2e-'))
 let electron, page, fixture
 before(async () => {
-  electron = await _electron.launch({ args: ['.', '--headless', '--disable-gpu'], cwd: root,
+  electron = await _electron.launch({ args: ['.'], cwd: root,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData } })
   page = await electron.firstWindow()
   await page.waitForLoadState('domcontentloaded')
+  await offscreenChartWindow(electron)
   await installNavigationProbe(electron)
   fixture = await page.evaluate(() => window.radarDesktop.request({ e2e: { action: 'seedInstrumentNavigationBenchmark' } }))
 })
@@ -42,10 +44,11 @@ test('a real process restart reports preparation separately and compares warm na
   await removeNavigationProbe(electron)
   await electron.close()
   const launchedAt = Date.now()
-  electron = await _electron.launch({ args: ['-r', './scripts/instrument-navigation-bootstrap.cjs', '.', '--headless', '--disable-gpu'], cwd: root,
+  electron = await _electron.launch({ args: ['-r', './scripts/instrument-navigation-bootstrap.cjs', '.'], cwd: root,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData } })
   page = await electron.firstWindow()
   await page.waitForLoadState('domcontentloaded')
+  await offscreenChartWindow(electron)
   const startup = await startupNavigationReport(page, launchedAt, fixture)
   const requests = await electron.evaluate(() => globalThis.__navigationStartupRequests.requests)
   const selectedRequests = selectionRequests({ requests }).filter(request => request.instId === startup.instId

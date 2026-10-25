@@ -2,6 +2,20 @@ import assert from 'node:assert/strict'
 import { requireForegroundTests } from '../electron/test-presentation.js'
 import { barsWithIndicators } from '../electron/services/indicators.js'
 
+// The guarded runtime owns focus isolation. Performance acceptance keeps the
+// production rendering configuration instead of forcing software/headless work.
+export async function offscreenChartWindow(electron) {
+  const state = await electron.evaluate(({ BrowserWindow, app }) => {
+    const window = BrowserWindow.getAllWindows()[0]
+    return { visible: window.isVisible(), focused: window.isFocused(), offscreen: window.webContents.isOffscreen(),
+      headless: app.commandLine.hasSwitch('headless'), disableGPU: app.commandLine.hasSwitch('disable-gpu') }
+  })
+  assert.deepEqual(state, { visible: false, focused: false, offscreen: true, headless: false, disableGPU: false },
+    'Offscreen chart performance acceptance must stay hidden and unfocused with the default Electron rendering configuration.')
+  await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.setFrameRate(60))
+  return state
+}
+
 // A foreground paint budget requires a native foreground window. A hidden
 // BrowserWindow can still report document.visibilityState === 'visible' while
 // macOS schedules its animation frames at an occluded-window cadence.
