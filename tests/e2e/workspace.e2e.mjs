@@ -252,7 +252,7 @@ test('market arrow shortcuts survive contract clicks, toolbar focus and repeated
     await page.locator(`svg[data-rendered-inst="${symbol}-USDT-SWAP"]`).waitFor({ state: 'visible', timeout: 2_000 })
     assert.equal(await selected().getAttribute('aria-label'), `View ${symbol}-USDT-SWAP chart`)
     assert.equal(await page.locator('[data-chart-plot]').evaluate(plot => document.activeElement === plot), true,
-      'Chart navigation must retain focus on a stable surface rather than a hidden candidate SVG.')
+      'Chart navigation must retain focus on the current chart surface.')
   }
   try {
     await page.getByRole('row', { name: 'View ZETA-USDT-SWAP chart', exact: true }).click()
@@ -347,7 +347,7 @@ test('cold and warm chart periods preserve list nodes, order, count, and selecti
     await selectTimeframe(page, '1H')
     await waitForAuditFixture(() => globalThis.__workspaceFixture.preferences.chartTimeframe === '1H')
     await waitForAuditFixture(() => globalThis.__workspaceFixture.requests.some(value => value.chartFocus?.target?.timeframe === '1H'))
-    assert.equal(await page.locator('svg[data-prepared-chart-timeframe="1H"]').count(), 0, 'The cold period must have no resident rendered chart yet.')
+    assert.equal(await page.locator('svg[data-prepared-chart-timeframe="1H"]').count(), 0, 'The current surface must remain on 15m until the 1H frame is selected.')
     assert.equal(await selected().getAttribute('aria-label'), 'View ZETA-USDT-SWAP chart')
 
     // Backend preparation completes through pushes, independently of any new

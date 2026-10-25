@@ -56,7 +56,7 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
     const report = await exerciseInstrumentNavigation(electron, page, fixture, { presentation })
     assert.equal(report.phases.length, 3)
     assert.equal(report.initialPreparation.readyFrameCount, fixture.instIds.length * 3)
-    assert.equal(report.phases.every(phase => phase.distinctContracts === 16 && phase.prewarm.readyCount === 16), true)
+    assert.equal(report.phases.every(phase => phase.distinctContracts === 16 && phase.rendererFrames.readyCount === 16), true)
     assert.equal(report.heldHistory.lateWrongInstrumentPaints, 0)
     assert.deepEqual(report.violations, [])
     const inputs = report.phases.flatMap(phase => [phase.firstVisit, phase.mouseSwitch, phase.rapid, ...phase.keyboard,
@@ -68,7 +68,7 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
       selectionIPC: inputs.reduce((sum, input) => sum + input.selectionIPC, 0) })}`)
   })
 
-  test('a real process restart reports preparation separately and compares warm navigation across every contract and period', { timeout: 120_000 }, async context => {
+  test('a real process restart reports renderer frame arrival separately and measures navigation across every contract and period', { timeout: 120_000 }, async context => {
     assert.equal(await persistNavigationCatalog(electron, page), fixture.instIds.length)
     await removeNavigationProbe(electron)
     presentationState = null
@@ -88,8 +88,8 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
     context.diagnostic(`Cold process restart: ${JSON.stringify({ ...startup, selectionIPC: selectedRequests.length,
       native: presentationState?.native, environment: presentationState?.environment, idleFrameCadence: presentationState?.idleFrameCadence })}`)
     assert.ok(selectedRequests.length <= 2, 'A prepared startup selection uses only bounded local reads.')
-    assert.ok(startup.preparationWaitMS >= 0, 'List availability and target chart preparation must be timed separately.')
-    assert.ok(startup.preparedBeforeInput.includes(`${startup.timeframe}:${startup.instId}`), 'Startup selection must await its actual prepared SVG.')
+    assert.ok(startup.rendererFrameWaitMS >= 0, 'List availability and canonical renderer frame arrival must be timed separately.')
+    assert.ok(startup.rendererFramesBeforeInput.includes(`${startup.timeframe}:${startup.instId}`), 'Startup selection must wait until the renderer receives its canonical full frame.')
     assert.deepEqual(startup.violations, [], 'Every startup SVG must retain the exact persisted prices and canonical indicators.')
     assert.ok(startup.inputPresentation && startup.armedAt <= startup.inputPresentation.inputAt,
       'The startup input must occur after the report arms the prepared-chart probe.')
@@ -105,7 +105,7 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
     const report = await exerciseInstrumentNavigation(electron, page, fixture, { holdHistory: false, presentation })
     assert.equal(report.phases.length, 3)
     assert.equal(report.initialPreparation.readyFrameCount, fixture.instIds.length * 3)
-    assert.equal(report.phases.every(phase => phase.prewarm.readyCount === fixture.instIds.length), true)
+    assert.equal(report.phases.every(phase => phase.rendererFrames.readyCount === fixture.instIds.length), true)
     assert.deepEqual(report.violations, [])
     context.diagnostic(`Restart navigation timing (${JSON.stringify(report.timingScope)}): ${JSON.stringify(report.phases.map(phase => ({ timeframe: phase.timeframe,
       firstVisit: phase.firstVisit, timeframeSwitch: phase.timeframeSwitch, rapid: phase.rapid,
@@ -117,6 +117,7 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
     const current = await page.locator('svg[data-rendered-inst]').evaluate(svg => ({ instId: svg.dataset.renderedInst, timeframe: svg.dataset.renderedTimeframe }))
     const timeframe = fixture.timeframes.find(value => value !== current.timeframe)
     const instId = fixture.instIds.find(value => value !== current.instId)
+    const activeSVG = await page.locator('svg[data-rendered-inst]').elementHandle()
     await startNavigationPaintProbe(page, fixture)
     try {
       const result = await measureNavigation(page, () => page.evaluate(({ instId, timeframe }) => {
@@ -130,12 +131,14 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
       if (presentation === 'foreground') assert.ok(result.inputToSVGCommitMS <= 50,
         `The interleaved native foreground selection blocked input for ${result.inputToSVGCommitMS} ms: ${JSON.stringify(result)}`)
       context.diagnostic(`Interleaved selection timing (${presentation}): ${JSON.stringify(result)}`)
-      await page.waitForFunction(({ ids, timeframe }) => ids.every(id => [...document.querySelectorAll('svg[data-prepared-chart-inst]')].some(svg =>
-        svg.dataset.preparedChartInst === id && svg.dataset.preparedChartTimeframe === timeframe && svg.dataset.preparedChartReady === 'true')),
-      { ids: fixture.instIds, timeframe })
       const visible = await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => ({ instId: svg.dataset.renderedInst, timeframe: svg.dataset.renderedTimeframe })))
       assert.deepEqual(visible, [{ instId, timeframe }])
+      assert.equal(await activeSVG.evaluate(svg => svg.isConnected && svg === document.querySelector('svg[data-rendered-inst]')), true,
+        'An interleaved market and timeframe switch must reuse the current SVG surface.')
+      assert.equal(await page.locator('svg[data-prepared-chart-inst]').count(), 1,
+        'Only the current SVG surface may remain mounted after an interleaved switch.')
     } finally {
+      await activeSVG.dispose()
       assertNavigationPaints(await finishNavigationPaintProbe(page))
     }
   })

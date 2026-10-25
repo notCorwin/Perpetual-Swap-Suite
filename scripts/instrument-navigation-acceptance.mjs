@@ -8,39 +8,41 @@ function navigationTimingScope(presentation) {
 }
 
 // Executed in the first document by the test-only Electron bootstrap. Record
-// list availability separately, then measure selection of an actually prepared
-// SVG. Listing a qualified contract does not imply its chart is ready.
+// list availability separately, then measure a selection after the renderer
+// has received its canonical frame. Geometry is built as part of that selection.
 export function startupNavigationProbe() {
   const probe = window.__navigationStartup = { documentAt: performance.timeOrigin, domAt: null, listAt: null, preparedAt: null, inputAt: null, commitAt: null, paintAt: null,
     instId: null, timeframe: null, framesToCommit: 0, framesToPaint: 0, previous: null, commits: [], samples: [], ready: new Set(), violations: [],
-    allowInput: false, armedAt: null, inputPresentation: null }
+    readyAt: new Map(), allowInput: false, armedAt: null, inputPresentation: null }
   let stopped = false, clicking = false, inputQueued = false, raf = null
   document.addEventListener('DOMContentLoaded', () => { probe.domAt = performance.now() }, { once: true })
   window.addEventListener('radar-chart-prepared', event => {
     const frame = event.detail
-    if (frame?.bars?.length >= 96) probe.ready.add(`${frame.timeframe}:${frame.instId}`)
+    if (frame?.bars?.length === 96 && frame.indicatorState === 'ready'
+      && ['ready', 'stale'].includes(frame.priceState) && ['ready', 'unavailable'].includes(frame.oiState)
+      && ['ready', 'unavailable'].includes(frame.takerState)) {
+      const key = `${frame.timeframe}:${frame.instId}`
+      probe.ready.add(key)
+      if (!probe.readyAt.has(key)) probe.readyAt.set(key, performance.now())
+    }
   })
   const sample = () => {
     const rows = [...document.querySelectorAll('[aria-label^="View "][aria-label$=" chart"]')]
     if (rows.length && probe.listAt === null) probe.listAt = performance.now()
     const selected = rows.find(row => row.getAttribute('aria-selected') === 'true')
     const timeframe = document.querySelector('[aria-label="Chart timeframe"] [aria-pressed="true"]')?.textContent?.trim()
-    const preparedSVG = row => [...document.querySelectorAll('svg[data-prepared-chart-inst]')].find(svg =>
-      svg.dataset.preparedChartInst === row.getAttribute('aria-label').slice(5, -6)
-      && svg.dataset.preparedChartTimeframe.toLowerCase() === timeframe?.toLowerCase()
-      && svg.dataset.preparedChartReady === 'true' && svg.querySelector('[data-chart-indicator="ema"]')?.getAttribute('d')
-      && svg.viewBox.baseVal.width > 0 && svg.viewBox.baseVal.height > 0)
-    const target = rows.findLast(row => row !== selected && preparedSVG(row))
+    const canonicalTimeframe = timeframe?.toLowerCase() === '1h' ? '1H' : timeframe?.toLowerCase()
+    const readyRow = row => probe.ready.has(`${canonicalTimeframe}:${row.getAttribute('aria-label').slice(5, -6)}`)
+    const target = rows.findLast(row => row !== selected && readyRow(row))
     if (!clicking && !inputQueued && probe.allowInput && target && document.visibilityState === 'visible' && document.hasFocus()) {
       inputQueued = true
       requestAnimationFrame(() => {
         inputQueued = false
         if (!probe.allowInput || document.visibilityState !== 'visible' || !document.hasFocus()
-          || !target.isConnected || target.getAttribute('aria-selected') === 'true' || !preparedSVG(target)) return
-        probe.preparedAt = performance.now()
+          || !target.isConnected || target.getAttribute('aria-selected') === 'true' || !readyRow(target)) return
         probe.instId = target.getAttribute('aria-label').slice(5, -6)
-        probe.timeframe = preparedSVG(target).dataset.preparedChartTimeframe
-        probe.ready.add(`${probe.timeframe}:${probe.instId}`)
+        probe.timeframe = canonicalTimeframe
+        probe.preparedAt = Math.max(probe.listAt, probe.readyAt.get(`${probe.timeframe}:${probe.instId}`) ?? performance.now())
         probe.allowInput = false
         probe.inputAt = performance.now()
         probe.inputPresentation = { armedAt: probe.armedAt, inputAt: probe.inputAt,
@@ -89,9 +91,9 @@ export async function startupNavigationReport(page, launchedAt, fixture, { prese
   })
   await page.waitForFunction(() => window.__navigationStartup && window.__navigationStartup.paintAt !== null, null, { timeout: 40_000 }).catch(async error => {
     const state = await page.evaluate(() => {
-      const { samples, previous, stop, ready, ...probe } = window.__navigationStartup ?? {}
+      const { samples, previous, stop, ready, readyAt, ...probe } = window.__navigationStartup ?? {}
       return { probe, rows: [...document.querySelectorAll('[data-market-index]')].map(row => ({ id: row.getAttribute('aria-label'), selected: row.getAttribute('aria-selected') })),
-        plots: [...document.querySelectorAll('svg[data-prepared-chart-inst]')].map(svg => ({ ...svg.dataset })),
+        rendererReady: [...(ready ?? [])],
         chart: document.querySelector('[data-chart-inst]')?.__chartSnapshot?.instId }
     })
     throw new Error(`Cold-start navigation did not finish: ${JSON.stringify(state)}`, { cause: error })
@@ -113,10 +115,10 @@ export async function startupNavigationReport(page, launchedAt, fixture, { prese
       documentToListMS: probe.listAt, domToListMS: probe.listAt - probe.domAt,
       processToFirstChartMS: probe.documentAt + probe.commits[0].at - launchedAt,
       domToFirstChartMS: probe.commits[0].at - probe.domAt,
-      preparationWaitMS: probe.preparedAt - probe.listAt, listToInputMS: probe.inputAt - probe.listAt, inputToSVGCommitMS: probe.commitAt - probe.inputAt,
+      rendererFrameWaitMS: Math.max(0, probe.preparedAt - probe.listAt), listToInputMS: probe.inputAt - probe.listAt, inputToSVGCommitMS: probe.commitAt - probe.inputAt,
       inputToNextPaintMS: probe.paintAt - probe.inputAt, framesToCommit: probe.framesToCommit, framesToPaint: probe.framesToPaint,
       inputEpoch: probe.documentAt + probe.inputAt, commitEpoch: probe.documentAt + probe.commitAt,
-      preparedBeforeInput: probe.preparedAtInput, commits: probe.commits, violations: probe.violations }
+      rendererFramesBeforeInput: probe.preparedAtInput, commits: probe.commits, violations: probe.violations }
   }, { launchedAt, instruments: fixture.instruments.map(({ instId, series }) => ({ instId,
     series: Object.fromEntries(Object.entries(series).map(([frame, value]) => [frame, { bars: value.bars.slice(-96) }])) })) })
   return { timingScope: navigationTimingScope(presentation), ...report }
@@ -134,7 +136,7 @@ export async function installNavigationProbe(electron) {
     const original = ipcMain._invokeHandlers.get('radar:request')
     const contents = BrowserWindow.getAllWindows()[0].webContents
     const originalSend = contents.send
-    const probe = { original, contents, originalSend, requests: [], ready: new Set(globalThis.__navigationStartupRequests?.ready ?? []), held: false, heldSettled: false, holdInstId: null, release: null }
+    const probe = { original, contents, originalSend, requests: [], held: false, heldSettled: false, holdInstId: null, release: null }
     const released = new Promise(resolve => { probe.release = resolve })
     contents.send = function (channel, ...args) {
       const frame = args[0]
@@ -160,8 +162,6 @@ export async function installNavigationProbe(electron) {
       }
       try {
         const response = await original(event, value)
-        if (kind === 'chartUniverse') probe.ready = new Set((response.frames ?? []).filter(frame => frame.bars?.length >= 96
-          && frame.indicatorState === 'ready').map(frame => `${frame.timeframe}:${frame.instId}`))
         return response
       } finally { if (held) probe.heldSettled = true }
     })
@@ -177,31 +177,41 @@ export async function waitForUniverseReady(electron, page, fixture) {
   const qualified = snapshot.rows.map(row => row.instId)
   assert.deepEqual([...qualified].sort(), [...fixture.instIds].sort(), 'The navigation fixture must cover the entire backend-qualified universe.')
   const expected = timeframes.flatMap(timeframe => qualified.map(instId => `${timeframe}:${instId}`))
-  let ready = new Set()
+  const ready = new Set()
   while (Date.now() - startedAt < 40_000) {
     const keys = await page.evaluate(async () => {
       const { frames } = await window.radarDesktop.request({ chartUniverse: {} })
-      return frames.filter(frame => frame.bars?.length >= 96 && frame.indicatorState === 'ready'
+      const canonical = frames.filter(frame => frame.bars?.length === 96 && frame.indicatorState === 'ready'
         && ['ready', 'stale'].includes(frame.priceState) && ['ready', 'unavailable'].includes(frame.oiState)
-        && ['ready', 'unavailable'].includes(frame.takerState)).map(frame => `${frame.timeframe}:${frame.instId}`)
+        && ['ready', 'unavailable'].includes(frame.takerState))
+      const keys = canonical.map(frame => `${frame.timeframe}:${frame.instId}`)
+      const delivered = window.__navigationCanonicalFrames ??= new Set()
+      // Feed the canonical frames through the same renderer event App uses for
+      // backend publications. The controller/store receives data, but no
+      // hidden chart surfaces are mounted or prepared by this barrier.
+      for (const frame of canonical) {
+        const key = `${frame.timeframe}:${frame.instId}`
+        if (delivered.has(key)) continue
+        window.dispatchEvent(new CustomEvent('radar-chart-prepared', { detail: frame }))
+        delivered.add(key)
+      }
+      return keys
     })
-    ready = new Set(keys)
+    for (const key of keys) ready.add(key)
     if (expected.every(key => ready.has(key))) break
     await new Promise(resolve => setTimeout(resolve, 100))
   }
-  assert.deepEqual(expected.filter(key => !ready.has(key)), [], 'Automatic backend prewarm must prepare every qualified contract in all three timeframes.')
-  const tracked = new Set((await navigationRequests(electron)).ready)
-  assert.deepEqual(expected.filter(key => !tracked.has(key)), [], 'The navigation probe must account for every resident universe frame.')
-  await page.evaluate(async () => { await new Promise(resolve => requestAnimationFrame(resolve)); await new Promise(resolve => requestAnimationFrame(resolve)) })
+  assert.deepEqual(expected.filter(key => !ready.has(key)), [], 'The renderer must receive every canonical qualified contract frame in all three timeframes.')
+  await page.evaluate(async () => { await new Promise(resolve => requestAnimationFrame(resolve)) })
   return { candidateCount: fixture.instIds.length, frameCount: expected.length, readyFrameCount: expected.filter(key => ready.has(key)).length,
-    prewarmTotalMS: Date.now() - startedAt, frames: timeframes.map(timeframe => ({ timeframe, candidateCount: fixture.instIds.length,
+    rendererFrameWaitMS: Date.now() - startedAt, frames: timeframes.map(timeframe => ({ timeframe, instrumentCount: fixture.instIds.length,
       readyCount: fixture.instIds.filter(id => ready.has(`${timeframe}:${id}`)).length })) }
 }
 
 export async function navigationRequests(electron) {
   return electron.evaluate(() => {
     const probe = globalThis.__instrumentNavigationProbe
-    return { requests: probe.requests, ready: [...probe.ready], held: probe.held, heldSettled: probe.heldSettled }
+    return { requests: probe.requests, held: probe.held, heldSettled: probe.heldSettled }
   })
 }
 
@@ -366,16 +376,19 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
   assert.ok(presentation === 'offscreen' || presentation === 'foreground', `Unknown navigation presentation: ${presentation}`)
   const phases = []
   let heldHistory = null
-  // First launch and restart use the same all-contract/all-timeframe barrier.
-  // Preparation is reported separately from every warm latency comparison.
+  // First launch and restart use the same renderer-received frame barrier.
+  // Chart geometry is still created during each measured selection.
   const initialPreparation = { sourceFixtureSeedMS: fixture.seedCompletedAt - fixture.seedStartedAt,
     ...await waitForUniverseReady(electron, page, fixture) }
-  await page.waitForFunction(ids => {
-    const timeframe = document.querySelector('[aria-label="Chart timeframe"] [aria-pressed="true"]')?.textContent?.toLowerCase()
-    return ids.every(id => [...document.querySelectorAll('svg[data-prepared-chart-inst]')].some(svg =>
-      svg.dataset.preparedChartInst === id && svg.dataset.preparedChartTimeframe.toLowerCase() === timeframe
-      && svg.dataset.preparedChartReady === 'true')) && document.querySelector('[data-chart-inst]')?.dataset.chartLoading === 'false'
-  }, fixture.instIds, { timeout: 10_000 })
+  await page.waitForFunction(() => document.querySelector('svg[data-rendered-inst]')
+    && document.querySelector('[data-chart-inst]')?.dataset.chartLoading === 'false', null, { timeout: 10_000 })
+  const sharedSurface = await page.locator('svg[data-rendered-inst]').elementHandle()
+  const assertSharedSurface = async phase => {
+    assert.equal(await page.locator('svg[data-rendered-inst]').count(), 1, `${phase} must leave exactly one active chart SVG.`)
+    assert.equal(await page.locator('svg[data-prepared-chart-inst]').count(), 1, `${phase} must not retain hidden candidate SVGs.`)
+    assert.equal(await sharedSurface.evaluate(svg => svg.isConnected && svg === document.querySelector('svg[data-rendered-inst]')), true,
+      `${phase} must reuse the current chart SVG node.`)
+  }
   if (presentation === 'foreground') {
     const native = await electron.evaluate(({ BrowserWindow }) => {
       const window = BrowserWindow.getAllWindows()[0]
@@ -396,6 +409,7 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
     const after = selectionRequests(await navigationRequests(electron)).length
     assert.ok(after - before <= 2, `A selection must use bounded local hydration: ${JSON.stringify({ result, requests: selectionRequests(await navigationRequests(electron)).slice(before) })}`)
     assert.ok(result.framesToCommit <= 1, `${result.instId} needed ${result.framesToCommit} animation frames to switch.`)
+    await assertSharedSurface(`${result.instId}/${result.timeframe ?? options.timeframe ?? 'current timeframe'} selection`)
     const maximumMS = rapid ? 100 : 50
     if (presentation === 'foreground') assert.ok(result.inputToSVGCommitMS <= maximumMS,
       `${result.instId} blocked input for ${result.inputToSVGCommitMS.toFixed(1)} ms (native foreground budget ${maximumMS} ms).`)
@@ -409,12 +423,11 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
       assert.ok(previousSVG)
       const instId = await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-inst')
       timeframeSwitch = await nextFrame(() => selectTimeframe(page, timeframe), { expectedInstId: instId, timeframe })
-      assert.equal(await previousSVG.evaluate(svg => svg.isConnected && svg === document.querySelector('svg[data-rendered-inst]')), true,
-        'A prepared timeframe switch must preserve the selected SVG instead of remounting the candidate pool.')
+      await assertSharedSurface(`${timeframe} timeframe switch`)
       await previousSVG.dispose()
     }
     await assertWorkspaceLayout(page)
-    const prewarm = initialPreparation.frames.find(frame => frame.timeframe === timeframe)
+    const rendererFrames = initialPreparation.frames.find(frame => frame.timeframe === timeframe)
     const currentlySelected = await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-inst')
     const first = await firstVisibleMarket(page, [currentlySelected])
     const holdThisPhase = holdHistory && heldHistory === null
@@ -478,8 +491,9 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
     }) }, { expectedInstId, timeframe, rapid: true })
     const rapidPaints = await page.evaluate(offset => window.__navigationPaintProbe.commits.slice(offset), beforeBurst)
     assert.ok(rapidPaints.every(paint => paint.instId === expectedInstId), 'A coalesced key burst must only present its final requested instrument.')
-    phases.push({ timeframe, prewarm, timeframeSwitch, firstVisit, mouseSwitch, keyboard, rapid, distinctContracts: new Set(order).size })
+    phases.push({ timeframe, rendererFrames, timeframeSwitch, firstVisit, mouseSwitch, keyboard, rapid, distinctContracts: new Set(order).size })
   }
+  await sharedSurface.dispose()
   const paints = await finishNavigationPaintProbe(page)
   assertNavigationPaints(paints)
   if (presentation === 'foreground') {

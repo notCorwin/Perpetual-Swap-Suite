@@ -71,7 +71,9 @@ export async function sandboxCommands(mode, args = []) {
   }
   if (!['core', 'e2e', 'gpu', 'foreground', 'all'].includes(mode) || args.length) throw new Error('Usage: node scripts/test-sandbox.mjs core|e2e|gpu|foreground|all|command [--desktop] [--foreground] [--allow-network] [--gpu-trace] [--require-gpu] [--metal] [--require-gpu-hardware-timing] [--allow-empty] [--require-category CATEGORY] [--require-role ROLE] [--scenario LABEL] [--output PATH] [-- COMMAND ARGS...]')
   const commands = []
-  if (mode === 'core' || mode === 'all') commands.push(node(['--experimental-strip-types', '--test', ...await testFiles('src', '.test.ts'), ...await testFiles('tests/core', '.test.mjs')]))
+  // Each core file may own SQLite and indicator worker trees. Unbounded file
+  // parallelism oversubscribes those workers and the real-Electron workload.
+  if (mode === 'core' || mode === 'all') commands.push(node(['--experimental-strip-types', '--test-concurrency=2', '--test', ...await testFiles('src', '.test.ts'), ...await testFiles('tests/core', '.test.mjs')]))
   if (mode !== 'core') {
     commands.push(npm(['run', 'build']))
     if (mode !== 'gpu') commands.push(node(['--test-concurrency=1', '--test', ...await testFiles('tests/e2e', mode === 'foreground' ? '.foreground.mjs' : '.e2e.mjs')]))

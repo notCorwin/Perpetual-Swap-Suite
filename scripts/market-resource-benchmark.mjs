@@ -115,15 +115,21 @@ try {
     requestAnimationFrame(frame)
   }, fixture)
   await page.waitForFunction(() => Number(document.querySelector('[data-total-market-count]')?.getAttribute('data-total-market-count')) === 287, null, { timeout: 60_000 })
-  const prewarmStartedAt = Date.now()
+  const rendererFramesStartedAt = Date.now()
   await page.waitForFunction(async ({ instIds, timeframes }) => {
     const { frames } = await window.radarDesktop.request({ chartUniverse: {} })
-    const ready = new Set(frames.filter(frame => frame.bars.length >= 96 && frame.indicatorState === 'ready')
-      .map(frame => `${frame.instId}:${frame.timeframe}`))
-    return instIds.every(instId => timeframes.every(timeframe => ready.has(`${instId}:${timeframe}`)))
+    const canonical = frames.filter(frame => frame.bars?.length === 96 && frame.indicatorState === 'ready'
+      && ['ready', 'stale'].includes(frame.priceState) && ['ready', 'unavailable'].includes(frame.oiState)
+      && ['ready', 'unavailable'].includes(frame.takerState))
+    const ready = new Set(canonical.map(frame => `${frame.instId}:${frame.timeframe}`))
+    if (!instIds.every(instId => timeframes.every(timeframe => ready.has(`${instId}:${timeframe}`)))) return false
+    // Route the full renderer universe through App's ordinary notification
+    // handler; only the selected contract creates SVG geometry.
+    for (const frame of canonical) window.dispatchEvent(new CustomEvent('radar-chart-prepared', { detail: frame }))
+    return true
   }, fixture, { timeout: 120_000, polling: 500 })
-  report.backendPrewarm = { readyPairs: fixture.instIds.length * fixture.timeframes.length,
-    waitAfterListMS: Date.now() - prewarmStartedAt, demand: 'Backend qualification; observed through resident frame reads.' }
+  report.rendererFrameBarrier = { readyPairs: fixture.instIds.length * fixture.timeframes.length,
+    waitAfterListMS: Date.now() - rendererFramesStartedAt, demand: 'Canonical frames delivered through the renderer prepared-frame event.' }
   const focus = fixture.instIds[0], timeframe = '15m'
   let sequence = 0
   const choose = async (instId, phase) => {
@@ -140,7 +146,7 @@ try {
     report.switches.push({ phase, instId, inputMode: 'search entry and row click', selectedBeforeClick, inputToPaintMS: value.paintedAt - inputAt, bars: value.bars, indicatorState: value.indicatorState, expected, actualPrice: value.livePrice })
     delete report.pendingSelection
   }
-  await choose(fixture.instIds[1], 'first selection after backend prewarm')
+  await choose(fixture.instIds[1], 'first selection after renderer frame delivery')
   await choose(focus, 'first local selection')
   await selectTimeframe(page, timeframe)
   await page.waitForFunction(({ focus, timeframe }) => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.instId === focus && document.querySelector('[data-chart-inst]')?.__chartSnapshot?.timeframe === timeframe, { focus, timeframe })

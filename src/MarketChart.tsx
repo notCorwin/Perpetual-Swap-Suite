@@ -1,4 +1,4 @@
-import { createContext, memo, useCallback, useContext, useDeferredValue, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
+import { createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
 import { flushSync } from "react-dom"
 import { Camera } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
@@ -83,6 +83,7 @@ const sourceStatusText = (label: string, state: PreparedChartState, status?: Cha
 const chartPlot = createChartPlotCache(legendWidth)
 const chartOverscan = (surface: ReadyChartWindow | null): { before?: Bar; after?: Bar } => {
   if (!surface?.bars.length) return {}
+  if (chartController.store.snapshotMeta(surface.instId, surface.timeframe)?.generation !== surface.generation) return {}
   const bars = surface.liveBar
     ? [...surface.bars.filter(bar => bar.hour < surface.liveBar!.hour), surface.liveBar].slice(-96)
     : surface.bars
@@ -264,44 +265,35 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
 
 type PlotSize = { width: number; height: number }
 
-/** Every candidate owns a mounted SVG. Selection changes visibility, not paths. */
-const PreparedPlot = memo(function PreparedPlot({ instId, timeframe, size, selected, inspected, inspectedBar, wheelFraction = 0, navigationSurface, presentedSurface }: {
-  instId: string; timeframe: RadarTimeframe; size: PlotSize; selected: boolean; inspected: number | null
-  inspectedBar?: Bar
-  wheelFraction?: number
-  navigationSurface?: ReadyChartWindow; presentedSurface?: ReadyChartWindow
+const ChartSurface = memo(function ChartSurface({ surface, size, selected, inspected, inspectedBar, wheelFraction }: {
+  surface: ReadyChartWindow; size: PlotSize; selected: boolean; inspected: number | null
+  inspectedBar?: Bar; wheelFraction: number
 }) {
-  const subscribe = useCallback((listener: () => void) => chartController.store.subscribe(instId, timeframe, listener), [instId, timeframe])
-  const getSnapshot = useCallback(() => chartController.store.window(instId, timeframe), [instId, timeframe])
-  const latest = useSyncExternalStore(subscribe, getSnapshot)
-  // The selected SVG and its parent legends publish one immutable frame.
-  // Hidden candidates may consume new cache entries independently.
-  const surface = navigationSurface ?? presentedSurface ?? latest
   const overscan = chartOverscan(surface)
   const plot = chartPlot(surface, size, overscan)
-  const ready = Boolean(surface?.bars.length && (surface.priceState === 'ready' || surface.priceState === 'stale')
+  const ready = Boolean(surface.bars.length && (surface.priceState === 'ready' || surface.priceState === 'stale')
     && (surface.indicatorState === 'ready' || surface.indicatorState === 'unavailable')
     && surface.oiState !== 'loading' && surface.takerState !== 'loading' && plot)
-  if (!surface || !plot) return null
+  if (!plot) return null
   const { bars, geometry } = plot
   const contentOffset = chartWheelContentOffset(wheelFraction, geometry.barPitch, Boolean(plot.before), Boolean(plot.after))
   return <PlotVisible value={selected}>
-    <svg strokeWidth="var(--chart-line-width)" data-prepared-chart-inst={instId} data-prepared-chart-timeframe={timeframe}
+    <svg strokeWidth="var(--chart-line-width)" data-prepared-chart-inst={surface.instId} data-prepared-chart-timeframe={surface.timeframe}
       data-prepared-chart-ready={ready} data-prepared-indicator-state={surface.indicatorState} data-prepared-oi-state={surface.oiState} data-prepared-taker-state={surface.takerState}
-      data-rendered-inst={selected ? instId : undefined} data-rendered-timeframe={selected ? timeframe : undefined}
+      data-rendered-inst={selected ? surface.instId : undefined} data-rendered-timeframe={selected ? surface.timeframe : undefined}
       data-rendered-start={bars[0]!.hour} data-rendered-end={bars.at(-1)!.hour}
       viewBox={`0 0 ${size.width} ${size.height}`} aria-hidden={!selected}
       style={{ visibility: selected ? 'visible' : 'hidden' }}
       className={cn('absolute inset-0 h-full w-full font-mono text-[length:var(--chart-text-size)] select-none focus-visible:outline-2 focus-visible:outline-ring', !selected && 'pointer-events-none')}
       role="img" tabIndex={selected ? 0 : -1}
-      aria-label={`${instId} ${bars.length}-candle ${timeframeLabel(timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end. Hover RSI crossing triangles to inspect their candle and time. Alt+Left and Alt+Right inspect RSI crossings; Escape clears inspection. Scroll to review history. Arrow keys navigate markets.`}>
+      aria-label={`${surface.instId} ${bars.length}-candle ${timeframeLabel(surface.timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end. Hover RSI crossing triangles to inspect their candle and time. Alt+Left and Alt+Right inspect RSI crossings; Escape clears inspection. Scroll to review history. Arrow keys navigate markets.`}>
       <Plot bars={bars} geometry={geometry} liveBar={surface.liveBar ?? bars.at(-1)!} liveOverlay={!!surface.liveBar} contentOffset={contentOffset}
         inspected={selected ? inspected : null} inspectedBar={selected ? inspectedBar : undefined} oiState={surface.oiState} takerState={surface.takerState} oiStatus={surface.oiStatus} takerStatus={surface.takerStatus} />
     </svg>
   </PlotVisible>
 })
 
-export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, candidateIds = listOrder, turnoverOrder, onSelect }: { instId: string; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
+export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect }: { instId: string; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
   const view = useSyncExternalStore(chartController.subscribe, chartController.getSnapshot)
   useLayoutEffect(() => {
     if (!isActive) return
@@ -325,11 +317,6 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
   const preparedPlot = chartPlot(surface, plotSize, overscan)
   const bars = preparedPlot?.bars ?? surface?.bars ?? EMPTY_BARS
   const plotGeometry = preparedPlot?.geometry ?? null
-  const latestSurface = surface ? chartController.store.window(surface.instId, surface.timeframe) : null
-  const navigationSurface = surface && surface !== latestSurface ? surface : undefined
-  const plotCandidates = candidateIds.includes(displayedId) ? candidateIds : [...candidateIds, displayedId]
-  // Visible input must not wait for the rest of the candidate pool to redraw.
-  const backgroundTimeframe = useDeferredValue(timeframe)
   const [inspection, setInspection] = useState<{ instId: string; timeframe: RadarTimeframe; hour: number } | null>(null)
   const inspectedIndex = inspection?.instId === surface?.instId && inspection?.timeframe === surface?.timeframe ? bars.findIndex(bar => bar.hour === inspection?.hour) : -1
   const inspected = inspectedIndex >= 0 ? inspectedIndex : null
@@ -595,11 +582,7 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
         const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : -event.deltaY
         queueWheel(delta * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 240 : 1))
       }}>
-        {plotCandidates.map(id => <PreparedPlot key={id} instId={id} timeframe={id === displayedId ? timeframe : backgroundTimeframe} size={plotSize}
-          selected={matchesSelection && !navigationSurface && id === displayedId} wheelFraction={matchesSelection && !navigationSurface && id === displayedId ? activeWheelFraction : 0} inspected={id === displayedId ? inspected : null} inspectedBar={id === displayedId ? inspectedBar : undefined}
-          presentedSurface={matchesSelection && !navigationSurface && id === displayedId ? surface ?? undefined : undefined} />)}
-        {navigationSurface && <PreparedPlot key="navigation" instId={navigationSurface.instId} timeframe={navigationSurface.timeframe}
-          size={plotSize} selected={true} inspected={inspected} inspectedBar={inspectedBar} wheelFraction={activeWheelFraction} navigationSurface={navigationSurface} />}
+        {surface && <ChartSurface surface={surface} size={plotSize} selected={matchesSelection} inspected={inspected} inspectedBar={inspectedBar} wheelFraction={activeWheelFraction} />}
       </div>
       {captureStatus === 'flashing' && <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
     </section>
