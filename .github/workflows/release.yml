@@ -45,6 +45,9 @@ jobs:
         # distinguishes confirmed unsupported hardware from a passed GPU check.
         run: npm run test:gpu -- --output artifacts/sandbox
       - name: Test native foreground chart painting
+        # Native timing is independent evidence even when an offscreen
+        # functional/renderer acceptance fails; either failure remains fatal.
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         run: npm run test:foreground -- --output artifacts/sandbox
       - name: Verify workspace scaling and contrast
         env:
