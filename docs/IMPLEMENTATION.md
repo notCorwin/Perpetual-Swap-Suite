@@ -15,6 +15,8 @@ The [original assessment](IMPROVEMENT_PLAN.md) records the earlier baseline. The
 
 A dedicated market coordinator worker owns MarketService, metadata, and network scheduling. The Electron main process owns windows, security, and IPC dispatch. Separate database and indicator workers execute SQL and recursive replay. Subscription membership does not eagerly load every contract's history or calculate a chart for every timeframe.
 
+Database admission uses six fixed priority queues with FIFO order within each rank. Dispatch checks only their heads, so a burst of N reads requires O(N) scheduling work. After eight foreground selections, the globally oldest lower-priority request gets a turn. Failure and shutdown still settle every admitted request before the connection closes.
+
 ## Durable observations
 
 `MarketData/market.sqlite` is the sole authority for completed native candles and historical OI/Taker observations. Keyed native-period queries replace filesystem scans and Parquet delta/base publication. Statistics have independent storage keys and may commit before their price candle arrives. Facts and their per-series revisions change in the same transaction; observers are notified only after commit.

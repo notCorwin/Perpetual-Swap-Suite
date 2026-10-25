@@ -7,13 +7,35 @@ export { CANDLE_INTERVALS, validateCandle } from './market-records.js'
 
 const keyOf = (instrument, timeframe) => `${instrument}:${timeframe}`
 const priorityRank = value => ({ interactive: 5, foreground: 4, prepared: 4, repair: 4, continuity: 3, statistics: 2, prefetch: 1, chartWarm: 1, background: 0 })[value] ?? 0
+const PRIORITY_BUCKET_COUNT = 6
+
+function emptyPriorityBuckets() {
+  return Array.from({ length: PRIORITY_BUCKET_COUNT }, () => ({ head: null, tail: null }))
+}
+
+function enqueue(buckets, job) {
+  const bucket = buckets[job.rank]
+  const node = { job, next: null }
+  if (bucket.tail) bucket.tail.next = node
+  else bucket.head = node
+  bucket.tail = node
+}
+
+function dequeue(bucket) {
+  const node = bucket.head
+  if (!node) return null
+  bucket.head = node.next
+  if (!bucket.head) bucket.tail = null
+  return node.job
+}
 
 /** A bounded set of database connections; SQLite work never runs on Electron's event loop. */
 class DatabaseWorkers {
   constructor(workers, onMutation) {
     this.workers = workers
     this.onMutation = onMutation
-    this.queue = []
+    this.buckets = emptyPriorityBuckets()
+    this.queuedCount = 0
     this.tasks = new Set()
     this.nextID = 0
     this.foregroundBurst = 0
@@ -48,14 +70,23 @@ class DatabaseWorkers {
   fail(error) {
     this.failed = error
     for (const worker of this.workers) { worker.current?.reject(error); worker.current = null; worker.busy = false }
-    for (const job of this.queue.splice(0)) job.reject(error)
+    while (this.queuedCount) {
+      let rank = -1, oldestID = Infinity
+      for (let candidate = 0; candidate < PRIORITY_BUCKET_COUNT; candidate += 1) {
+        const job = this.buckets[candidate].head?.job
+        if (job && job.id < oldestID) { rank = candidate; oldestID = job.id }
+      }
+      dequeue(this.buckets[rank]).reject(error)
+      this.queuedCount -= 1
+    }
   }
   request(command, args = [], priority = 'background') {
     if (this.failed) return Promise.reject(this.failed)
     const task = new Promise((resolve, reject) => {
       const request = createWorkerRequest('market-store', command, resolve, reject, { priority })
-      this.queue.push({ id: ++this.nextID, command, args, priority, ...request })
-      this.metrics.requests += 1; this.metrics.maximumQueued = Math.max(this.metrics.maximumQueued, this.queue.length)
+      enqueue(this.buckets, { id: ++this.nextID, command, args, priority, rank: priorityRank(priority), ...request })
+      this.queuedCount += 1
+      this.metrics.requests += 1; this.metrics.maximumQueued = Math.max(this.metrics.maximumQueued, this.queuedCount)
       this.drain()
     })
     this.tasks.add(task)
@@ -64,14 +95,23 @@ class DatabaseWorkers {
   }
   drain() {
     for (const worker of this.workers) {
-      if (worker.busy || !this.queue.length) continue
-      let index = this.foregroundBurst >= 8 ? this.queue.findIndex(job => priorityRank(job.priority) < 3) : -1
-      if (index < 0) {
-        index = 0
-        for (let candidate = 1; candidate < this.queue.length; candidate += 1) if (priorityRank(this.queue[candidate].priority) > priorityRank(this.queue[index].priority)) index = candidate
+      if (worker.busy || !this.queuedCount) continue
+      let rank = -1
+      if (this.foregroundBurst >= 8) {
+        let oldestLowPriorityID = Infinity
+        for (let candidate = 0; candidate < 3; candidate += 1) {
+          const job = this.buckets[candidate].head?.job
+          if (job && job.id < oldestLowPriorityID) { rank = candidate; oldestLowPriorityID = job.id }
+        }
       }
-      const [job] = this.queue.splice(Math.max(0, index), 1)
-      this.foregroundBurst = priorityRank(job.priority) >= 3 ? this.foregroundBurst + 1 : 0
+      if (rank < 0) {
+        for (let candidate = PRIORITY_BUCKET_COUNT - 1; candidate >= 0; candidate -= 1) {
+          if (this.buckets[candidate].head) { rank = candidate; break }
+        }
+      }
+      const job = dequeue(this.buckets[rank])
+      this.queuedCount -= 1
+      this.foregroundBurst = job.rank >= 3 ? this.foregroundBurst + 1 : 0
       worker.busy = true; worker.current = job; worker.ref()
       try { job.dispatch(worker, { id: job.id, command: job.command, args: job.args }) }
       catch (error) { worker.current = null; worker.busy = false; worker.unref(); job.reject(error); queueMicrotask(() => this.drain()) }
@@ -164,7 +204,7 @@ export class MarketStore {
     return { revision, ranges }
   }
   getWriteMetrics() { return { ...this.writeMetrics } }
-  getDiagnostics() { return { workerThreadIds: this.workerThreadIds, reads: { ...this.readers.metrics, queued: this.readers.queue.length }, writes: { ...this.writer.metrics, queued: this.writer.queue.length }, migrationComplete: this.migrationComplete ?? false, migrationProcessId: this.migration?.pid ?? null } }
+  getDiagnostics() { return { workerThreadIds: this.workerThreadIds, reads: { ...this.readers.metrics, queued: this.readers.queuedCount }, writes: { ...this.writer.metrics, queued: this.writer.queuedCount }, migrationComplete: this.migrationComplete ?? false, migrationProcessId: this.migration?.pid ?? null } }
 
   async startMigration() {
     if (await this.writer.request('migrationState', ['__complete__'])) { this.migrationComplete = true; return }
