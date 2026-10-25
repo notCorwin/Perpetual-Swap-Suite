@@ -42,6 +42,28 @@ async function recording(directory, records, { health = {}, raw = false, ending 
   await writeFile(join(directory, 'participant-execution.participant.json'), JSON.stringify({ schemaVersion: 2, id: 'participant-execution', executionId: 'execution', role: 'fixture', status: 'ready', registeredAt: 1_700_000_000_000 }))
 }
 
+test('CPU coverage distinguishes unmeasured operations from measured zero and partial sums', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'operation-cpu-coverage-'))
+  try {
+    await recording(directory, [event({ name: 'cpu.unmeasured' }),
+      event({ id: 'execution:2', name: 'cpu.zero', cpuTimeMS: 0 }),
+      event({ id: 'execution:3', name: 'cpu.partial', cpuTimeMS: 2 }),
+      event({ id: 'execution:4', name: 'cpu.partial' })])
+    const report = await summarizeOperations(directory)
+    const find = name => report.operations.find(value => value.name === name)
+    assert.equal(find('cpu.unmeasured').cpuTimeMS, null)
+    assert.equal(find('cpu.unmeasured').cpuMeasuredCount, 0)
+    assert.equal(find('cpu.zero').cpuTimeMS, 0)
+    assert.equal(find('cpu.zero').cpuMeasuredCount, 1)
+    assert.equal(find('cpu.partial').count, 2)
+    assert.equal(find('cpu.partial').cpuTimeMS, 2)
+    assert.equal(find('cpu.partial').cpuMeasuredCount, 1)
+    assert.equal(report.totals.cpuTimeMS, 2)
+    assert.equal(report.totals.cpuMeasuredCount, 2)
+    assert.match(operationReportMarkdown(report), /Thread CPU measurements: 2\/4 operations; 2 ms measured \(partial sum/)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
 test('offline reports retain completed costs and work counters with bounded cardinality and damaged traces', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'operation-report-'))
   try {
@@ -52,7 +74,7 @@ test('offline reports retain completed costs and work counters with bounded card
     await recording(directory, records, { ending: '', health: { persisted: 47, failed: 2, pending: 1 } })
     await writeFile(join(directory, 'damaged.jsonl'), 'invalid\n' + 'x'.repeat(4000) + '\n')
     const report = await summarizeOperations(directory, { maxGroups: 2, maxLineBytes: 1000, slowestLimit: 3 })
-    assert.equal(report.schemaVersion, 2)
+    assert.equal(report.schemaVersion, 3)
     assert.equal(report.journalRecords, 48)
     assert.equal(report.totals.count, 24)
     assert.equal(report.totals.totalMS, 80)

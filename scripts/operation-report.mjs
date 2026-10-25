@@ -19,7 +19,7 @@ const lifecycleFields = ['traceId', 'parentId', 'sessionId', 'scenarioId', 'cate
 const counters = ['calls', 'queryCount', 'rows', 'changes', 'bytes', 'sentBytes', 'receivedBytes']
 const peaks = ['residentKB', 'cpuPercent']
 const bucketLimits = Array.from({ length: 25 }, (_, index) => 2 ** (index - 4))
-const aggregate = () => ({ count: 0, errors: 0, cancelled: 0, totalMS: 0, maxMS: 0, cpuTimeMS: 0,
+const aggregate = () => ({ count: 0, errors: 0, cancelled: 0, totalMS: 0, maxMS: 0, cpuTimeMS: 0, cpuMeasuredCount: 0,
   work: Object.fromEntries(counters.map(key => [key, 0])), peaks: Object.fromEntries(peaks.map(key => [key, null])),
   buckets: Array(bucketLimits.length + 1).fill(0) })
 const label = value => typeof value === 'string' ? value.slice(0, 240) : ''
@@ -27,7 +27,7 @@ const substantive = event => !/^(diagnostics|runtime|operation-recording)\./.tes
 function add(target, event) {
   target.count++; target.errors += Number(event.status === 'error'); target.cancelled += Number(event.status === 'cancelled')
   target.totalMS += event.durationMS; target.maxMS = Math.max(target.maxMS, event.durationMS)
-  target.cpuTimeMS += Number.isFinite(event.cpuTimeMS) && event.cpuTimeMS >= 0 ? event.cpuTimeMS : 0
+  if (Number.isFinite(event.cpuTimeMS) && event.cpuTimeMS >= 0) { target.cpuTimeMS += event.cpuTimeMS; target.cpuMeasuredCount++ }
   for (const key of counters) if (Number.isFinite(event.attributes?.[key]) && event.attributes[key] >= 0) target.work[key] += event.attributes[key]
   for (const key of peaks) if (Number.isFinite(event.attributes?.[key]) && event.attributes[key] >= 0) target.peaks[key] = Math.max(target.peaks[key] ?? 0, event.attributes[key])
   const bucket = bucketLimits.findIndex(limit => event.durationMS <= limit)
@@ -40,7 +40,8 @@ function finish(value) {
     if (cumulative >= value.count * .95) { p95UpperBoundMS = bucketLimits[index] ?? null; break }
   }
   const { buckets: _buckets, ...result } = value
-  return { ...result, averageMS: value.count ? value.totalMS / value.count : 0, p95UpperBoundMS }
+  return { ...result, cpuTimeMS: value.cpuMeasuredCount ? value.cpuTimeMS : null,
+    averageMS: value.count ? value.totalMS / value.count : 0, p95UpperBoundMS }
 }
 const recordingFile = path => isOperationJournal(path) || /\.(health\.json|participant\.json)$/.test(path) || /(?:chromium|graphics-check|metal)-[^/]+\.status\.json$/.test(path)
 async function* traceFiles(path, depth = 0) {
@@ -434,7 +435,7 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
   }
   diagnostics.emptyRecording = Number(!allowEmpty && substantiveOperations === 0)
   diagnostics.missingRequiredCategories = missingCategories.length; diagnostics.missingRequiredRoles = missingRoles.length; diagnostics.missingRequiredOperations = missingOperations.size
-  return { schemaVersion: 2, generatedAt: new Date().toISOString(), source: resolve(path), journalRecords,
+  return { schemaVersion: 3, generatedAt: new Date().toISOString(), source: resolve(path), journalRecords,
     totals: finish(total), categories: operationCategories.map(category => ({ category, ...finish(byCategory[category]) })),
     operations: [...operations.values()].map(finish).concat(operationCategories.filter(category => operationOverflow[category].count)
       .map(category => ({ category, name: '[other operation names]', ...finish(operationOverflow[category]) }))).sort((left, right) => right.totalMS - left.totalMS),
@@ -444,13 +445,14 @@ export async function summarizeOperations(path, { maxGroups = 256, maxLineBytes 
     graphics: { requirement: graphics ?? null, checks: graphicsChecks, metalProviders }, diagnostics, storage,
     coverage: { allowEmpty, requireCategories, requireRoles, requireOperations, substantiveOperations, actualCategories: [...actualCategories].sort(), actualRoles: [...roles].sort(),
       missingCategories, missingRoles, missingOperations: [...missingOperations.values()], participants: participantCoverage, ...(graphics ? { graphics } : {}) },
-    measurement: 'Elapsed times overlap across nested/concurrent boundaries and are not process wall time. Work counters are totals at each recorded boundary, not unique business facts. Database calls count hooked native API calls; queryCount counts exec/all/get/run/iterate execution batches, not parsed SQL statements. CPU time uses the current thread clock when supported. GPU submission/capture times and process peaks are not hardware kernel timings. p95UpperBoundMS uses exponential duration buckets. Raw traceId/parentId/scenarioId fields preserve correlation.' }
+    measurement: 'Elapsed times overlap across nested/concurrent boundaries and are not process wall time. Work counters are totals at each recorded boundary, not unique business facts. Database calls count hooked native API calls; queryCount counts exec/all/get/run/iterate execution batches, not parsed SQL statements. CPU time is a partial sum across cpuMeasuredCount measured operations, not process CPU; groups with no CPU measurement report null. GPU submission/capture times and process peaks are not hardware kernel timings. p95UpperBoundMS uses exponential duration buckets. Raw traceId/parentId/scenarioId fields preserve correlation.' }
 }
 
 const ms = value => Number(value.toFixed(3)).toLocaleString('en-US')
 const escape = value => String(value).replaceAll('|', '\\|').replaceAll('\n', ' ').replaceAll('\r', ' ')
 export function operationReportMarkdown(report) {
   return ['# Expensive operations', '', `${report.totals.count.toLocaleString('en-US')} completed operations; ${report.journalRecords.toLocaleString('en-US')} lifecycle records; ${report.totals.errors} errors; ${report.totals.cancelled} cancelled.`, '',
+    `Thread CPU measurements: ${report.totals.cpuMeasuredCount}/${report.totals.count} operations; ${report.totals.cpuTimeMS === null ? 'unavailable' : `${ms(report.totals.cpuTimeMS)} ms measured (partial sum; nested spans may overlap)`}.`, '',
     `Journal storage: ${report.storage.storedBytes.toLocaleString('en-US')} bytes stored; ${report.storage.decodedBytes.toLocaleString('en-US')} bytes decoded; ${report.storage.compressedFiles} compressed / ${report.storage.plainFiles} plain journals.`, '',
     '| Category | Operations | Errors | Cancelled | Total ms | Max ms |', '| --- | ---: | ---: | ---: | ---: | ---: |',
     ...report.categories.map(value => `| ${value.category} | ${value.count} | ${value.errors} | ${value.cancelled} | ${ms(value.totalMS)} | ${ms(value.maxMS)} |`), '',
