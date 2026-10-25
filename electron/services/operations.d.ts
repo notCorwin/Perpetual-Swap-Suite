@@ -1,8 +1,8 @@
 export type OperationCategory = 'cpu' | 'gpu' | 'network' | 'database' | 'io' | 'ipc'
 export type OperationAttributes = Record<string, string | number | boolean | null>
 export type OperationContext = { traceId?: string; parentId?: string; scenarioId?: string }
-export type OperationSpec = { category: OperationCategory; name: string; resource?: string; attributes?: OperationAttributes }
-export type ObservedOperation = OperationSpec & { startedAt: number; durationMS: number; status: 'ok' | 'error' | 'cancelled'; cpuTimeMS?: number }
+export type OperationSpec = { category: OperationCategory; name: string; resource?: string; attributes?: OperationAttributes; cpuTime?: boolean }
+export type ObservedOperation = Omit<OperationSpec, 'cpuTime'> & { startedAt: number; durationMS: number; status: 'ok' | 'error' | 'cancelled'; cpuTimeMS?: number }
 export type OperationEvent = ObservedOperation & { schemaVersion: 2; phase: 'end'; sessionId: string; executionId: string; id: string; sequence: number; traceId: string; parentId?: string; scenarioId?: string }
 export type OperationJournalEvent = Omit<OperationEvent, 'phase' | 'status'> & { phase: 'start' | 'end'; status: 'running' | ObservedOperation['status'] }
 export type OperationSpan = { readonly context: OperationContext; run<T>(operation: () => T): T; end(result?: { status?: ObservedOperation['status']; attributes?: OperationAttributes; cpuTimeMS?: number }): void }

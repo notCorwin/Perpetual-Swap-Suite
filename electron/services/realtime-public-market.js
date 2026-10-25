@@ -801,7 +801,7 @@ export class RealtimePublicMarket {
 }
 
 hookOperationMethods(PublicMarketConnection.prototype, {
-  consume: { category: 'cpu', name: 'market.websocket.decode', attributes: { stream: 'okx.public' } },
+  consume: { category: 'cpu', name: 'market.websocket.decode', cpuTime: false, attributes: { stream: 'okx.public', durationSource: 'performance.now' } },
   updateBook: (_connection, instId, _action, raw) => ({ category: 'cpu', name: 'market.book.reconstruct', resource: instId,
     attributes: { bidLevels: raw?.bids?.length ?? 0, askLevels: raw?.asks?.length ?? 0 } }),
 })

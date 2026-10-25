@@ -183,7 +183,7 @@ function failOperation(span, error) {
   span.end({ status: error?.name === 'AbortError' ? 'cancelled' : 'error', attributes: { errorName: error?.name ?? 'Error' } }); throw error
 }
 export function measureOperation(specification, operation) {
-  const span = beginOperation(specification), cpu = cpuClock && span !== noop ? cpuClock() : undefined
+  const span = beginOperation(specification), cpu = specification.cpuTime !== false && cpuClock && span !== noop ? cpuClock() : undefined
   try {
     const value = span.run(operation)
     // A clock measured across await would include unrelated thread work.
@@ -207,6 +207,7 @@ export function hookOperationMethods(target, specifications) {
       // mutable attribute baseline and the separate copy seen by start observers.
       template = Object.freeze({ category: specification.category, name: String(specification.name).slice(0, 160),
         resource: specification.resource ? String(specification.resource).slice(0, 256) : undefined,
+        cpuTime: specification.cpuTime,
         attributes: Object.freeze(attributes(specification.attributes)) })
       normalizedSpecifications.add(template)
     }

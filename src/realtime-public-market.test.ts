@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
 import { setImmediate } from 'node:timers/promises'
+import { attachOperationSink, configureOperationContext, type OperationEvent } from '../electron/services/operations.js'
 import { OKX_PUBLIC_WEBSOCKET_URL, RealtimePublicMarket } from '../electron/services/realtime-public-market.js'
 import type { PublicMarketBook, RealtimePublicMarketOptions } from '../electron/services/realtime-public-market.js'
 import type { RealtimeWebSocket } from '../electron/services/realtime-market.js'
@@ -126,6 +127,36 @@ test('targeted ticker recovery replaces its lifetime without disturbing healthy 
   await f.market.whenIdle()
   assert.deepEqual(f.tickers, [`${btc}:101`, `${eth}:202`])
   assert.equal(f.sockets.length, 1)
+})
+
+test('market websocket decode records wall duration without reading the thread CPU clock', async t => {
+  const f = fixture()
+  t.after(() => f.market.close())
+  await f.open()
+  const entries: OperationEvent[] = []
+  t.after(attachOperationSink(event => { if (event.name === 'market.websocket.decode') entries.push(event) }))
+  let counterReads = 0
+  const restoreCPUClock = () => {
+    const { user, system } = process.threadCpuUsage()
+    return (user + system) / 1000
+  }
+  configureOperationContext({}, () => { counterReads++; return counterReads * 0.25 })
+  t.after(() => configureOperationContext({}, restoreCPUClock))
+
+  type Connection = { ingress: number }
+  type Shard = { connection: Connection; consume(connection: Connection, text: string, receivedAt: number, ingress: number): void }
+  const shard = (f.market as unknown as { shards: Shard[] }).shards[0]
+  shard.consume(shard.connection, JSON.stringify({ arg: { channel: 'tickers', instId: btc }, data: [{ last: '101' }] }),
+    f.clock.time, shard.connection.ingress + 1)
+  await f.market.whenIdle()
+
+  assert.deepEqual(f.tickers, [`${btc}:101`])
+  assert.equal(entries.length, 1)
+  assert.equal(entries[0].status, 'ok')
+  assert.equal(entries[0].cpuTimeMS, undefined)
+  assert.equal(entries[0].attributes?.durationSource, 'performance.now')
+  assert.ok(Number.isFinite(entries[0].durationMS) && entries[0].durationMS >= 0)
+  assert.equal(counterReads, 0)
 })
 
 for (const failure of ['timeout', 'error'] as const) test(`a recovered ticker ${failure} keeps healthy neighbors on their existing connection`, async t => {

@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
-import { attachOperationSink, attachOperationJournalSink, beginOperation, measureOperation, recordOperation, hookOperationMethods, getOperationContext,
+import { attachOperationSink, attachOperationJournalSink, beginOperation, measureOperation, recordOperation, hookOperationMethods, getOperationContext, configureOperationContext,
   runWithOperationContext, withOperationSuppressed, finishActiveOperations, type OperationEvent, type OperationJournalEvent } from '../electron/services/operations.js'
 // @ts-expect-error Node-only JS intentionally stays outside the renderer API.
 import { databaseOperation, openRecordedDatabase } from '../electron/services/recorded-database.js'
@@ -37,6 +37,68 @@ test('shared span methods preserve asynchronous rejection and cancellation witho
   await assert.rejects(measureOperation({ category: 'cpu', name: 'test.promise.cancelled' }, () => Promise.reject(cancelled)), error => error === cancelled)
   assert.deepEqual(events.map(event => [event.status, event.cpuTimeMS]), [['error', undefined], ['cancelled', undefined]])
   assert.equal(JSON.stringify(events).includes('private'), false)
+})
+
+test('CPU timing is opt-out per span while wall lifecycle, ancestry, errors and static metadata remain recorded', t => {
+  const journal: OperationJournalEvent[] = [], namePrefix = 'test.cpu-time-switch'
+  let counterReads = 0
+  const cpuClock = () => { counterReads++; return counterReads * 0.25 }
+  const restoreCPUClock = () => {
+    const { user, system } = process.threadCpuUsage()
+    return (user + system) / 1000
+  }
+  configureOperationContext({}, cpuClock)
+  t.after(() => configureOperationContext({}, restoreCPUClock))
+  t.after(attachOperationJournalSink(event => { if (event.name.startsWith(namePrefix)) journal.push(structuredClone(event)) }))
+
+  const parent = beginOperation({ category: 'network', name: `${namePrefix}.parent` })
+  const value = parent.run(() => measureOperation({ category: 'cpu', name: `${namePrefix}.disabled`, cpuTime: false,
+    attributes: { durationSource: 'performance.now' } }, () => 42))
+  parent.end()
+  assert.equal(value, 42)
+  assert.equal(counterReads, 0)
+  const disabled = journal.filter(event => event.name === `${namePrefix}.disabled`)
+  assert.deepEqual(disabled.map(event => event.phase), ['start', 'end'])
+  assert.equal(disabled[0].status, 'running')
+  assert.equal(disabled[1].status, 'ok')
+  assert.equal(disabled[1].cpuTimeMS, undefined)
+  assert.ok(disabled[1].startedAt > 0 && Number.isFinite(disabled[1].durationMS) && disabled[1].durationMS >= 0)
+  assert.equal(disabled[0].traceId, disabled[1].traceId)
+  assert.equal(disabled[1].parentId, journal[0].id)
+  assert.equal(disabled[1].attributes?.durationSource, 'performance.now')
+
+  for (const [name, spec] of [
+    [`${namePrefix}.default`, { category: 'cpu' as const, name: `${namePrefix}.default` }],
+    [`${namePrefix}.enabled`, { category: 'cpu' as const, name: `${namePrefix}.enabled`, cpuTime: true }],
+  ] as const) {
+    const readsBefore: number = counterReads
+    measureOperation(spec, () => 1)
+    assert.equal(counterReads - readsBefore, 2, `${name} keeps the default thread CPU measurements`)
+    const terminal = journal.findLast(event => event.name === name && event.phase === 'end')!
+    assert.equal(terminal.cpuTimeMS, 0.25)
+    assert.ok(Number.isFinite(terminal.durationMS) && terminal.durationMS >= 0)
+  }
+
+  const failure = new TypeError('private decode failure'), readsBeforeError = counterReads
+  assert.throws(() => measureOperation({ category: 'cpu', name: `${namePrefix}.error`, cpuTime: false }, () => { throw failure }), error => error === failure)
+  assert.equal(counterReads, readsBeforeError)
+  const failed = journal.findLast(event => event.name === `${namePrefix}.error` && event.phase === 'end')!
+  assert.equal(failed.status, 'error')
+  assert.equal(failed.cpuTimeMS, undefined)
+  assert.ok(Number.isFinite(failed.durationMS) && failed.durationMS >= 0)
+
+  const staticName = `${namePrefix}.static`, staticSpec = { category: 'cpu' as const, name: staticName, cpuTime: false,
+    attributes: { durationSource: 'performance.now' } }
+  const target = { run() { return 7 } }
+  hookOperationMethods(target, { run: staticSpec })
+  staticSpec.cpuTime = true
+  const readsBeforeStatic = counterReads
+  assert.equal(target.run(), 7)
+  assert.equal(counterReads, readsBeforeStatic, 'The static registration snapshot retains cpuTime:false.')
+  const terminal = journal.findLast(event => event.name === staticName && event.phase === 'end')!
+  assert.equal(terminal.cpuTimeMS, undefined)
+  assert.ok(Number.isFinite(terminal.durationMS) && terminal.durationMS >= 0)
+  assert.equal(terminal.attributes?.durationSource, 'performance.now')
 })
 
 test('recording accepts diagnostic scalars and excludes arbitrary payloads', t => {
