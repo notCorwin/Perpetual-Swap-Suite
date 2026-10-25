@@ -246,7 +246,7 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
     const oracles = Object.fromEntries(Object.entries(series).map(([frame, entry]) => [frame, new Map(entry.bars.map(bar => [bar.hour, bar]))]))
     const probe = {
       active: true, frames: 0, pendingFrames: 0, paints: 0, minimumBars: Infinity, errors: [],
-      frameGaps: [], frameSamples: [], validationSamples: [], inputBursts: [], commits: [], previousFrame: null, previousSnapshot: null, previousBars: null,
+      frameGaps: [], frameSamples: [], validationSamples: [], inputBursts: [], commits: [], pendingWindows: [], previousFrame: null, previousSnapshot: null, previousBars: null,
       phase: 'initial', quality: [], known: new Map(), geometry: new Map(),
       raf: null, observer: null, schedulerObservers: [],
       scheduler: { counts: {}, entries: [], supportedEntryTypes: PerformanceObserver.supportedEntryTypes },
@@ -283,6 +283,11 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       if (!snapshot || !svg) { fail('A presented chart disappeared.'); return }
       const { timeframe } = snapshot
       const bars = chart.__chartRenderedBars ?? snapshot.bars
+      if (frame && chart.dataset.chartLoading === 'true' && probe.pendingWindows.length < 10) probe.pendingWindows.push({
+        at: sampledAt, end: snapshot.endHour, requestedEnd: chart.dataset.chartRequestedEnd, generation: snapshot.generation,
+        bars: bars?.length, indicatorState: snapshot.indicatorState, priceState: snapshot.priceState,
+        observedIndicators: bars?.filter(bar => bar.indicatorsObserved).length,
+      })
       if (Array.isArray(bars)) {
         if (Number(svg.dataset.renderedStart) !== bars[0]?.hour || Number(svg.dataset.renderedEnd) !== bars.at(-1)?.hour) fail('SVG labels and the drawn range disagree.')
         if (Number(chart.dataset.chartStart) !== bars[0]?.hour || Number(chart.dataset.chartEnd) !== bars.at(-1)?.hour) fail('Header and actual plot refer to different ranges.')
@@ -427,7 +432,7 @@ export async function finishPaintProbe(page) {
       return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * ratio))] ?? 0
     }
     return {
-      frames: probe.frames, pendingFrames: probe.pendingFrames, paints: probe.paints, minimumBars: probe.minimumBars,
+      frames: probe.frames, pendingFrames: probe.pendingFrames, pendingWindows: probe.pendingWindows, paints: probe.paints, minimumBars: probe.minimumBars,
       violations: probe.errors, commits: probe.commits, quality: probe.quality, scheduler: probe.scheduler,
       p95FrameGapMS: Number(percentile(probe.frameGaps, .95).toFixed(3)),
       maxFrameGapMS: Number(Math.max(0, ...probe.frameGaps).toFixed(3)),
@@ -468,13 +473,13 @@ export async function wheelBurst(page, { frames = 1, eventsPerFrame = 1, deltaY 
   }, { frames, eventsPerFrame, deltaY, deltaX, deltaMode })
 }
 
-export async function measurePaintLatency(page, { inputs, targets }) {
+export async function measurePaintLatency(page, { inputs, targets, requireForeground = true }) {
   const latestInput = inputs.at(-1)
   const expectedEnd = targets.at(-1)
   await page.waitForFunction(({ latestInput, expectedEnd }) => window.__chartPaintProbe?.commits.some(commit =>
     commit.end === expectedEnd && commit.at >= latestInput && commit.presentedAt !== null), { latestInput, expectedEnd })
-  return page.evaluate(({ inputs, targets }) => {
-    if (document.visibilityState !== 'visible' || !document.hasFocus()) throw new Error('Foreground paint latency lost its visible, focused window.')
+  return page.evaluate(({ inputs, targets, requireForeground }) => {
+    if (requireForeground && (document.visibilityState !== 'visible' || !document.hasFocus())) throw new Error('Foreground paint latency lost its visible, focused window.')
     const probe = window.__chartPaintProbe, commits = probe.commits
     for (const { observer, record } of probe.schedulerObservers) record(observer.takeRecords())
     const matching = inputs.map((input, index) => commits.find(commit => commit.end === targets[index] && commit.at >= input && commit.presentedAt !== null))
@@ -508,7 +513,7 @@ export async function measurePaintLatency(page, { inputs, targets }) {
       totalProbeValidationMS: Number(validation.reduce((sum, duration) => sum + duration, 0).toFixed(3)),
       p95ProbeValidationMS: percentileOf(validation, .95), maxProbeValidationMS: Number(Math.max(0, ...validation).toFixed(3)),
     }
-  }, { inputs, targets })
+  }, { inputs, targets, requireForeground })
 }
 
 export async function waitForLocalHistory(electron, page, fixture, timeframe = fixture.timeframe, { requireIndicators = false } = {}) {
@@ -595,7 +600,7 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
       preparedPushes: 0, preparedPushBars: 0, fullHistoryPushes: 0, fullHistoryPushBars: 0,
       historyPushSamples: new Map(), fullHistoryPushShapes: new Map(), sourceBaseline: 0,
       holdHistorical, holdLocal: false, held: false, heldCall: null, heldSettled: false, callsAtHold: null, release: null,
-      extendHistory: initialHistoryBars === null, deliveredFloors: new Map(), extensions: [], pendingPushes: new Map(), timers: new Set(), closed: false,
+      extendHistory: initialHistoryBars === null, deliveredFloors: new Map(), delayFloors: new Map(), extensions: [], pendingPushes: new Map(), timers: new Set(), closed: false,
     }
     const rememberHistory = response => {
       if (response?.instId !== instId || !['5m', '15m', '1H'].includes(response.timeframe) || !Array.isArray(response.bars) || response.bars.length <= 96) return
@@ -608,7 +613,9 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
       })
     }
     const floor = response => {
-      if (!Number.isSafeInteger(initialHistoryBars) || response?.instId !== instId || !Array.isArray(response.bars)) return null
+      if (response?.instId !== instId || !Array.isArray(response.bars)) return null
+      if (probe.deliveredFloors.has(response.timeframe)) return probe.deliveredFloors.get(response.timeframe)
+      if (!Number.isSafeInteger(initialHistoryBars)) return null
       if (!probe.deliveredFloors.has(response.timeframe)) probe.deliveredFloors.set(response.timeframe, response.latestEnd - (initialHistoryBars - 1) * response.intervalMS)
       return probe.deliveredFloors.get(response.timeframe)
     }
@@ -618,7 +625,10 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
     }
     const extension = (response, kind, startedAt, readCompletedAt = Date.now()) => {
       const previousFloor = floor(response)
-      if (!probe.extendHistory || previousFloor === null || !response.bars.length || response.bars[0].hour >= previousFloor) return null
+      if (!probe.extendHistory || previousFloor === null || !response.bars.length) return null
+      if (!probe.delayFloors.has(response.timeframe)) probe.delayFloors.set(response.timeframe, previousFloor)
+      const delayFloor = probe.delayFloors.get(response.timeframe)
+      if (response.bars[0].hour >= delayFloor) return null
       const record = { kind, instId: response.instId, timeframe: response.timeframe, endHour: response.endHour,
         startedAt, readCompletedAt, completedAt: null, previousFloor, first: response.bars[0].hour, end: response.bars.at(-1).hour, bars: response.bars.length }
       probe.extensions.push(record)
@@ -654,14 +664,21 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
       const record = extension(response, 'push', Date.now())
       if (record && historicalDelayMS > 0) {
         const pending = probe.pendingPushes.get(response.timeframe)
-        if (pending) { pending.args = args; probe.extensions.pop(); return }
-        const entry = { args, record }; probe.pendingPushes.set(response.timeframe, entry)
+        const entry = pending ?? { args, record, timer: null }
+        if (pending) {
+          clearTimeout(entry.timer); probe.timers.delete(entry.timer)
+          entry.args = args
+          entry.record.readCompletedAt = record.readCompletedAt
+          probe.extensions.pop()
+        }
+        probe.pendingPushes.set(response.timeframe, entry)
         const timer = setTimeout(() => {
           probe.timers.delete(timer); probe.pendingPushes.delete(response.timeframe)
           if (probe.closed) return
-          entry.args[0] = delivered(entry.args[0], record)
+          entry.args[0] = delivered(entry.args[0], entry.record)
           originalSend.call(contents, channel, ...entry.args)
         }, historicalDelayMS)
+        entry.timer = timer
         probe.timers.add(timer)
         return
       }
@@ -795,43 +812,50 @@ export async function removeRequestProbe(electron) {
 // Exercise backend reserve preparation while real wheel events keep arriving.
 // Restrict all initial ingresses, then delay both durable reads and backend
 // pushes so neither path can bypass the observed history-delivery latency.
-export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
-  const initialHistoryBars = 1_000
+export async function measureLatencyCoveredPrefetch(electron, page, fixture, { offscreen = false } = {}) {
   const historicalDelayMS = 1_500
-  const frames = 576
+  const frames = 768
   const candlesPerFrame = 2
-  const foreground = await foregroundPaintWindow(electron, page)
+  const foreground = offscreen ? null : await foregroundPaintWindow(electron, page)
+  if (offscreen) {
+    const native = await electron.evaluate(({ BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows()[0]
+      return { visible: window.isVisible(), focused: window.isFocused(), offscreen: window.webContents.isOffscreen() }
+    })
+    assert.deepEqual(native, { visible: false, focused: false, offscreen: true })
+  }
   try {
-    await installRequestProbe(electron, fixture.instId, { initialHistoryBars, historicalDelayMS })
+    await installRequestProbe(electron, fixture.instId, { historicalDelayMS })
     await openChart(page, fixture)
-    // Admit the bounded durable range through an actual history gesture;
-    // opening latest deliberately performs no deep-history IPC.
-    await wheelBurst(page, { deltaY: 12 })
-    const timeOrigin = await page.evaluate(() => performance.timeOrigin)
-    const deadline = Date.now() + 20_000
-    let initial
-    do {
-      initial = await readRequestProbe(electron)
-      if (initial.historyResponses.some(response => response.timeframe === fixture.timeframe && response.bars === initialHistoryBars)) break
-      assert.ok(Date.now() < deadline, 'The initial renderer history must stop at the artificial cold boundary.')
-      await new Promise(resolve => setTimeout(resolve, 20))
-    } while (true)
-    await page.evaluate(async () => { for (let index = 0; index < 2; index += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
-    await wheelBurst(page, { deltaY: -12 })
+    // Delay only facts beyond the genuinely admitted range. Silently clipping
+    // already delivered facts gives the backend a false view of client runway.
+    await waitForLocalHistory(electron, page, fixture, fixture.timeframe, { requireIndicators: true })
     await waitForRendered(page, fixture)
-    assert.deepEqual(initial.extensions, [], 'Initial hydration must keep every ingress inside the artificial delivered range.')
+    const initial = await readRequestProbe(electron)
+    const admitted = initial.historyFrames[fixture.timeframe]
+    assert.ok(admitted && admitted.calculated === admitted.bars)
+    assert.equal(admitted.end, fixture.end, 'The initial delivered range must end at the fixture latest candle.')
+    const initialHistoryBars = (fixture.end - admitted.first) / fixture.intervalMS + 1
+    assert.equal(initialHistoryBars, admitted.bars, 'The initial delivered reserve must contain every native candle slot.')
+    assert.ok(initialHistoryBars > 96 && initialHistoryBars <= 1536)
+    assert.ok(frames * candlesPerFrame > initialHistoryBars - 95, 'The gesture must cross the actual delivered boundary.')
+    const timeOrigin = await page.evaluate(() => performance.timeOrigin)
+    assert.deepEqual(initial.extensions, [], 'Initial preparation must finish before delayed delivery begins.')
+    await electron.evaluate((_, { timeframe, first }) => {
+      globalThis.__chartRequestProbe.deliveredFloors.set(timeframe, first)
+    }, { timeframe: fixture.timeframe, first: admitted.first })
     await startPaintProbe(page, fixture)
     await electron.evaluate(() => { globalThis.__chartRequestProbe.extendHistory = true })
     const inputs = await wheelBurst(page, { frames, deltaY: 24 })
     const expectedEnd = fixture.end - frames * candlesPerFrame * fixture.intervalMS
     await waitForRendered(page, fixture, fixture.timeframe, expectedEnd)
     const latency = await measurePaintLatency(page, {
-      inputs, targets: inputs.map((_, index) => fixture.end - (index + 1) * candlesPerFrame * fixture.intervalMS),
+      inputs, targets: inputs.map((_, index) => fixture.end - (index + 1) * candlesPerFrame * fixture.intervalMS), requireForeground: !offscreen,
     })
     const paint = await finishPaintProbe(page)
     assertCompletePaints(paint)
     const requests = await readRequestProbe(electron)
-    assert.equal(paint.pendingFrames, 0, `Latency-covered scrolling must never expose an unprepared requested viewport: ${JSON.stringify({ calls: requests.calls, sourceRequests: requests.sourceRequests, historyResponses: requests.historyResponses.length, inputDurationMS: inputs.at(-1) - inputs[0], pendingFrames: paint.pendingFrames })}`)
+    assert.equal(paint.pendingFrames, 0, `Latency-covered scrolling must never expose an unprepared requested viewport: ${JSON.stringify({ calls: requests.calls, sourceRequests: requests.sourceRequests, historyResponses: requests.historyResponses.length, inputDurationMS: inputs.at(-1) - inputs[0], pendingFrames: paint.pendingFrames, pendingWindows: paint.pendingWindows })}`)
     assert.ok(latency.latestInputToPaintMS < 100, `The latest wheel input took ${latency.latestInputToPaintMS} ms to paint. ${JSON.stringify(latency)}`)
     const extensions = requests.extensions.filter(record => record.completedAt !== null && record.startedAt >= timeOrigin + inputs[0])
     const first = extensions[0]
@@ -858,7 +882,9 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
     const sources = separateSourceMaintenance(requests.sourceRequests, fixture)
     assert.deepEqual(sources.historical, [], 'Prefetch must reuse persisted source candles and statistics within the latency test range.')
     return {
-      foregroundWindow: foreground.native, environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence, initialHistoryBars, historicalDelayMS, continuousWheelFrames: frames,
+      foregroundWindow: foreground?.native, environment: foreground?.environment, idleFrameCadence: foreground?.idleFrameCadence,
+      nativePaintMeasured: false, foregroundPaintOpportunityMeasured: !offscreen,
+      initialHistoryBars, initialHistoryFirst: admitted.first, historicalDelayMS, continuousWheelFrames: frames,
       scrolledCandles: frames * candlesPerFrame, crossedInitialBoundary: true,
       runwayAtRequest, deliveredHistoryBars: first.bars, observedHistoryDeliveryMS: observedDeliveryMS,
       prefetchStartedDuringGesture: true, prefetchCompletedDuringGesture: true,
@@ -870,7 +896,7 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture) {
     }
   } finally {
     try { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
-    finally { await foreground.restore() }
+    finally { await foreground?.restore() }
   }
 }
 
@@ -1026,7 +1052,7 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
     } : undefined
     return { timeframe, initialHistoryBars: fixture.initialHistoryBars, sourceDelayMS: fixture.sourceDelayMS,
       initiallyMissingCandles: 96 - before.length, nearestSourceCandles: Number(nearest.parameters.limit),
-      nativePaintMeasured: !offscreen, rendererTargetObserved: true,
+      nativePaintMeasured: false, foregroundPaintOpportunityMeasured: !offscreen, rendererTargetObserved: true,
       ...(nativePageToPaintMS === null ? {} : { nativePageToPaintMS }),
       nativeSourceRequests: sources.requests.length, heldReservePages: heldReserve.length, heldStatisticsPages: heldStatistics.length,
       targetPresentedWhilePending: initialTarget.loading,

@@ -191,6 +191,72 @@ test('prepared historical focus reuses its rolling reserve without rereading, re
   } finally { detach(); await pipeline.dispose() }
 })
 
+test('same-series cursor changes share canonical replay through the indicator reserve and series changes retire it', async () => {
+  const rows = source(1800), eth = rows.map(row => ({ ...row, instrument: 'ETH-USDT-SWAP' })), target = rows[1600].timestamp
+  const { pipeline } = fixture([...rows, ...eth]), gate = deferred(), entered = deferred()
+  const calculate = pipeline.calculate.bind(pipeline), calculated: { instrument: string; first: number; last: number }[] = []
+  pipeline.calculate = async (candles: any[], ...args: any[]) => {
+    calculated.push({ instrument: candles[0]?.instrument, first: candles[0]?.timestamp, last: candles.at(-1)?.timestamp })
+    if (calculated.length === 1) { entered.resolve(); await gate.promise }
+    return calculate(candles, ...args)
+  }
+  let firstFocus: Promise<unknown> | undefined, nextFocus: Promise<unknown> | undefined, replay: Promise<unknown> | undefined
+  try {
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target }, 'scroll-before')
+    firstFocus = pipeline.focus.task
+    await entered.promise
+    replay = pipeline.liveSeeds.get(`${instId}:15m`)
+    assert.ok(replay, 'The first viewport has one canonical replay in flight.')
+
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target - interval }, 'scroll-during')
+    nextFocus = pipeline.focus.task
+    assert.strictEqual(pipeline.liveSeeds.get(`${instId}:15m`), replay, 'A cursor update retains the running replay task.')
+    assert.strictEqual(pipeline.series.get(`${instId}:15m`).calculation, replay)
+    gate.resolve()
+    await Promise.all([firstFocus, nextFocus, replay])
+    await finishSeed(pipeline)
+
+    const state = pipeline.series.get(`${instId}:15m`), reserveFirst = target - interval - (96 + 256 - 1) * interval
+    const btcChunks = calculated.filter(value => value.instrument === instId)
+    assert.equal(btcChunks.filter(value => value.first === rows[0].timestamp).length, 1,
+      'The initial recursive prefix is not replayed again after the cursor changes.')
+    for (let hour = reserveFirst; hour <= target - interval; hour += interval) {
+      assert.ok(state.indicators.has(hour), `The prepared navigation margin has an observed indicator at ${hour}.`)
+    }
+    assert.equal(pipeline.preparedHistoryReserve(state, target - interval, 96 + 256), true)
+  } finally {
+    gate.resolve()
+    await Promise.allSettled([firstFocus, nextFocus, replay].filter(Boolean) as Promise<unknown>[])
+    await pipeline.dispose()
+  }
+
+  const cancelled = fixture([...rows, ...eth]), cancelGate = deferred(), cancelEntered = deferred()
+  const cancelCalculate = cancelled.pipeline.calculate.bind(cancelled.pipeline), cancelInputs: string[] = []
+  cancelled.pipeline.calculate = async (candles: any[], ...args: any[]) => {
+    cancelInputs.push(candles[0]?.instrument)
+    if (cancelInputs.length === 1) { cancelEntered.resolve(); await cancelGate.promise }
+    return cancelCalculate(candles, ...args)
+  }
+  let obsoleteFocus: Promise<unknown> | undefined, selectedFocus: Promise<unknown> | undefined, obsoleteReplay: Promise<unknown> | undefined
+  try {
+    cancelled.pipeline.setFocus({ instId, timeframe: '15m', endHour: target }, 'old-series')
+    obsoleteFocus = cancelled.pipeline.focus.task
+    await cancelEntered.promise
+    obsoleteReplay = cancelled.pipeline.liveSeeds.get(`${instId}:15m`)
+    cancelled.pipeline.setFocus({ instId: 'ETH-USDT-SWAP', timeframe: '15m', endHour: target }, 'new-series')
+    selectedFocus = cancelled.pipeline.focus.task
+    cancelGate.resolve()
+    await Promise.all([obsoleteFocus, selectedFocus, obsoleteReplay])
+    await finishSeed(cancelled.pipeline)
+    assert.equal(cancelInputs.filter(id => id === instId).length, 1, 'Changing series prevents the obsolete replay from admitting another chunk.')
+    assert.equal(cancelled.pipeline.cached('ETH-USDT-SWAP:15m').indicatorState, 'ready')
+  } finally {
+    cancelGate.resolve()
+    await Promise.allSettled([obsoleteFocus, selectedFocus, obsoleteReplay].filter(Boolean) as Promise<unknown>[])
+    await cancelled.pipeline.dispose()
+  }
+})
+
 test('fresh OHLC and forming price publish while both statistic requests are held', async () => {
   const hold = deferred(), rows = source(400).map(row => ({ ...row, oi: null, buy: null, sell: null, statisticsVersion: null }))
   let statistics = 0

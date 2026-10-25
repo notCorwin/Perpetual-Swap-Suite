@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { _electron } from 'playwright'
 import {
-  installRequestProbe, openChart, readRequestProbe, removeRequestProbe, resetRequestProbe,
+  installRequestProbe, measureLatencyCoveredPrefetch, openChart, readRequestProbe, removeRequestProbe, resetRequestProbe,
   separateSourceMaintenance, waitForLocalHistory, waitForRendered, wheelBurst,
 } from '../../scripts/chart-acceptance.mjs'
 
@@ -197,4 +197,19 @@ test('cached reserve scrolling keeps one final intent and the canonical 96-bar i
   } finally {
     await removeRequestProbe(electron)
   }
+})
+
+test('real resident reserve covers delayed history delivery before continuous input crosses its boundary', { timeout: 90_000 }, async context => {
+  const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark', instId: 'PREFETCH-USDT-SWAP' }))
+  const report = await measureLatencyCoveredPrefetch(electron, page, fixture, { offscreen: true })
+  assert.equal(report.crossedInitialBoundary, true)
+  assert.ok(report.observedHistoryDeliveryMS >= 1500)
+  assert.ok(report.runwayAtRequest >= 192)
+  assert.equal(report.pendingFrames, 0)
+  assert.equal(report.repeatedSourceDownloads, 0)
+  context.diagnostic(JSON.stringify({ initialHistoryBars: report.initialHistoryBars, scrolledCandles: report.scrolledCandles,
+    runwayAtRequest: report.runwayAtRequest, observedHistoryDeliveryMS: report.observedHistoryDeliveryMS,
+    minimumBars: report.minimumBars, pendingFrames: report.pendingFrames, latestInputToPaintOpportunityMS: report.latestInputToPaintMS,
+    nativePaintMeasured: report.nativePaintMeasured }))
+  await writeFile(join(root, '.build/chart-prefetch-latency.json'), `${JSON.stringify(report, null, 2)}\n`)
 })

@@ -775,11 +775,12 @@ export class PreparedChartPipeline {
       const entries = attempts.get(attempt.source) ?? []
       entries.push(attempt); attempts.set(attempt.source, entries)
     }
-    const visibleFirst = Math.max(first, end - (VISIBLE - 1) * step)
     for (let hour = first; hour <= end; hour += step) {
       const row = state.rows.get(hour)
       if (!completePriceCandle(row)) return false
-      if (hour >= visibleFirst && !state.indicators.has(hour) && state.indicatorFailures?.get(hour)?.inputVersion !== inputVersion) return false
+      const failure = state.indicatorFailures?.get(hour)
+      const terminalIndicatorFailure = failure?.inputVersion === inputVersion && failure.from <= hour && failure.through >= hour
+      if (!state.indicators.has(hour) && !terminalIndicatorFailure) return false
       if (typeof this.history.ensureStatistics === 'function') for (const [source, bit] of [['oi', 1], ['taker', 2]]) {
         if (sourceFresh(row, bit)) continue
         const blocked = (attempts.get(source) ?? []).some(attempt => attempt.from <= hour && attempt.through >= hour
@@ -1195,10 +1196,25 @@ export class PreparedChartPipeline {
 
   seed(state, priority = 'background', demand) {
     if (this.closed || !state.rows.size && !this.liveStates.get(state.key)?.rows.size) return Promise.resolve()
-    if (state.calculation) return state.calculation.then(() => !demand || this.currentDemand(demand) ? this.seed(state, priority, demand) : undefined)
+    const focusOwned = demand != null && demand === this.focus
+    const owner = () => {
+      if (this.closed) return null
+      if (!demand) return { demand: undefined, priority }
+      if (focusOwned) {
+        return this.focus?.key === state.key ? { demand: this.focus, priority: 'foreground' } : null
+      }
+      return this.currentDemand(demand) ? { demand, priority } : null
+    }
+    if (state.calculation) return state.calculation.then(() => {
+      const current = owner()
+      return current ? this.seed(state, current.priority, current.demand) : undefined
+    })
     const shared = this.liveSeeds.get(state.key)
-    if (shared) return shared.then(() => !demand || this.currentDemand(demand) ? this.seed(state, priority, demand) : undefined)
-    const stillNeeded = () => !this.closed && (!demand || this.currentDemand(demand))
+    if (shared) return shared.then(() => {
+      const current = owner()
+      return current ? this.seed(state, current.priority, current.demand) : undefined
+    })
+    const stillNeeded = () => owner() !== null
     if (!stillNeeded()) return Promise.resolve()
     const live = this.syncLive(state)
     // Selection can create a resident history state while this replay is in
@@ -1318,7 +1334,8 @@ export class PreparedChartPipeline {
         }
         if (recovered) state.statusVersion = (state.statusVersion ?? 0) + 1
       }
-      if (stillNeeded() && (restart || workerRecovery)) { this.publish(state); this.seed(state, priority, demand) }
+      const current = owner()
+      if (current && (restart || workerRecovery)) { this.publish(state); this.seed(state, current.priority, current.demand) }
       if (!this.closed) { this.refreshIndicators(state); this.scheduleRefresh() }
     })
     state.calculation = task; this.liveSeeds.set(state.key, task)
