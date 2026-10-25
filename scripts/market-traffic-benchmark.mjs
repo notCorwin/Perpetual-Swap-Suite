@@ -8,6 +8,7 @@ import { parseArgs } from 'node:util'
 import { _electron } from 'playwright'
 import { requireForegroundTests } from '../electron/test-presentation.js'
 import { createMarketTrafficExchange } from '../tests/helpers/market-traffic-exchange.mjs'
+import { inspectMarketTrafficReadiness } from '../tests/helpers/market-traffic-readiness.mjs'
 import { compareMarketTrafficReports, validateMarketTrafficReport } from './market-traffic-comparison.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
@@ -139,12 +140,28 @@ function percentile(samples, fraction) {
 }
 
 async function waitForSelectedFrames(page, instIds) {
-  const startedAt = performance.now(), timeframe = '15m'
+  const startedAt = performance.now(), timeframe = '15m', timeoutMS = 120_000
+  const firstObservedReadyAtMS = new Map()
   await page.locator('[aria-label="Chart timeframe"] button').filter({ hasText: /^15m$/i }).click()
-  let ready = []
-  while (performance.now() - startedAt < 40_000) {
-    ready = await page.evaluate(async ({ instIds, timeframe }) => {
+  let observed = { readyIDs: [], missingIDs: [...instIds].sort(), terminalStates: [] }
+  while (performance.now() - startedAt < timeoutMS) {
+    const summaries = await page.evaluate(async ({ instIds, timeframe }) => {
       const { frames } = await window.radarDesktop.request({ chartUniverse: {} })
+      const selected = new Map(frames.filter(frame => instIds.includes(frame.instId) && frame.timeframe === timeframe)
+        .map(frame => [frame.instId, frame]))
+      const candidates = instIds.map(instId => {
+        const frame = selected.get(instId)
+        if (!frame) return { instId, timeframe, present: false }
+        return { instId, timeframe, present: true, barCount: frame.bars?.length ?? 0,
+          firstBarHour: frame.bars?.[0]?.hour ?? null, lastBarHour: frame.bars?.at(-1)?.hour ?? null,
+          endHour: frame.endHour ?? null, latestEnd: frame.latestEnd ?? null, oldestHour: frame.oldestHour ?? null,
+          historyExhausted: frame.historyExhausted ?? null, generation: frame.generation ?? null, revision: frame.revision ?? null,
+          indicatorState: frame.indicatorState ?? null, indicatorStatus: frame.indicatorStatus ?? null,
+          priceState: frame.priceState ?? null, priceStatus: frame.priceStatus ?? null,
+          oiState: frame.oiState ?? null, oiStatus: frame.oiStatus ?? null,
+          takerState: frame.takerState ?? null, takerStatus: frame.takerStatus ?? null,
+          sourceVersions: frame.sourceVersions ?? null, error: frame.error ?? null }
+      })
       const canonical = frames.filter(frame => instIds.includes(frame.instId) && frame.timeframe === timeframe
         && frame.bars?.length === 96 && frame.indicatorState === 'ready'
         && ['ready', 'stale'].includes(frame.priceState) && ['ready', 'unavailable'].includes(frame.oiState)
@@ -154,14 +171,34 @@ async function waitForSelectedFrames(page, instIds) {
         window.dispatchEvent(new CustomEvent('radar-chart-prepared', { detail: frame }))
         delivered.add(frame.instId)
       }
-      return canonical.map(frame => frame.instId).sort()
+      return candidates
     }, { instIds, timeframe })
-    if (ready.length === instIds.length) break
+    observed = inspectMarketTrafficReadiness(instIds, timeframe, summaries)
+    const elapsedMS = performance.now() - startedAt
+    for (const instId of observed.readyIDs) if (!firstObservedReadyAtMS.has(instId)) firstObservedReadyAtMS.set(instId, elapsedMS)
+    if (observed.missingIDs.length === 0) break
     await sleep(100)
   }
-  assert.deepEqual(ready, [...instIds].sort(), 'Every qualified selected-period frame must be ready before steady-state measurement.')
+  const evidence = { timeframe, expectedFrames: instIds.length, readyFrames: observed.readyIDs.length,
+    readyIDs: observed.readyIDs, missingIDs: observed.missingIDs,
+    terminalStates: observed.terminalStates.map(frame => ({ ...frame, firstObservedReadyAtMS: firstObservedReadyAtMS.get(frame.instId) ?? null })),
+    elapsedMS: performance.now() - startedAt, timeoutMS,
+    measurement: 'Bounded chart startup readiness warmup; elapsedMS is excluded from steady-state performance results.' }
+  readinessFailureEvidence = evidence
+  if (evidence.missingIDs.length) {
+    const error = new Error(`Every qualified selected-period frame must be ready within the bounded ${timeoutMS / 1_000}s startup warmup. Missing: ${evidence.missingIDs.join(', ')}.`)
+    error.readinessEvidence = evidence
+    throw error
+  }
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
-  return { timeframe, expectedFrames: instIds.length, readyFrames: ready.length, elapsedMS: performance.now() - startedAt }
+  return evidence
+}
+
+function fixtureRequestEvidence(requests) {
+  return requests.map(({ path, parameters, receivedAt, respondedAt, responseChannel, responsePayloadBytes }) => ({
+    path, parameters, receivedAt, respondedAt: respondedAt ?? null, responseChannel: responseChannel ?? null,
+    responsePayloadBytes: responsePayloadBytes ?? 0,
+  }))
 }
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -189,7 +226,7 @@ const output = resolve(values.output ?? join(root, '.build/traffic-optimization/
 const userData = process.env.PERPETUAL_SWAP_USER_DATA
 if (!userData || (!foreground && !process.env.PERPETUAL_SWAP_TEST_GUARD)) throw new Error('Protected sandbox user data is required.')
 const fixture = await createMarketTrafficExchange({ candidateCount, passingCount, spreadFailureCount, seed: 17 })
-let electron, cadence, failureMeasurements, completedReport
+let electron, cadence, failureMeasurements, completedReport, runtimeEvidence, presentationEvidence, readinessFailureEvidence
 try {
   electron = await _electron.launch({ args: [app.entry], cwd: app.cwd,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_E2E_LIVE_REFRESH: '1',
@@ -200,6 +237,8 @@ try {
   await page.waitForLoadState('domcontentloaded')
   const presentation = foreground ? await assertForeground(electron, page) : await assertHidden(electron)
   const runtime = await runtimeMetadata(electron)
+  presentationEvidence = presentation
+  runtimeEvidence = runtime
   await page.waitForSelector('input[aria-label="Search contracts"]', { timeout: 30_000 })
 
   let snapshot
@@ -221,6 +260,8 @@ try {
   assert.ok(['live', 'connecting'].includes(snapshot.realtimeState), 'Realtime must not be disconnected or recovering before sampling.')
   assert.deepEqual((snapshot.rows ?? []).map(row => row.instId).sort(), fixture.instIds.slice(0, passingCount).sort(),
     'The rendered market list must contain exactly the passing fixture contracts.')
+  await page.waitForFunction(count => document.querySelector('[data-market-count]')?.getAttribute('data-market-count') === String(count),
+    passingCount, { timeout: 5_000 })
   assert.equal(await page.locator('[data-market-count]').getAttribute('data-market-count'), String(passingCount),
     'The renderer must present all passing candidates before measurement.')
 
@@ -258,8 +299,11 @@ try {
   }
   assert.deepEqual(fixture.errors, [], 'The fixture observed an invalid or unexpected production request.')
 
-  const readiness = waitReady ? await waitForSelectedFrames(page, [...qualifyingIDs]) : null
   cadence = fixture.startCadence(cadenceMS)
+  // Keep live fixture observations flowing while chart startup work settles.
+  // The fixed steady-state sample still starts only after readiness plus one
+  // complete cadence interval.
+  const readiness = waitReady ? await waitForSelectedFrames(page, [...qualifyingIDs]) : null
   await sleep(cadenceMS)
   // The sample clock starts after qualification, connection setup and the
   // initial cadence message. Only steady-state fixture traffic is measured.
@@ -331,7 +375,7 @@ try {
     app: { path: app.selected, entry: app.entry, build: target, checkout },
     runtime: { ...runtime, testPresentation: runtime.testPresentation, presentation,
       network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' },
-    fixture: { candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture.oiFailureCount, seed: fixture.seed,
+    fixture: { asOf: fixture.asOf, candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture.oiFailureCount, seed: fixture.seed,
       dataFingerprint: `market-traffic-v2-bookseq-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
       cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness,
       readinessPhase: readiness ? 'all-passing-15m-frames-ready-before-steady-state-sample' : null },
@@ -399,7 +443,7 @@ try {
     app: { path: app.selected, entry: app.entry, build: target, checkout },
     runtime: { ...runtime, testPresentation: runtime.testPresentation, presentation,
       network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' },
-    fixture: { candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture.oiFailureCount, seed: fixture.seed,
+    fixture: { asOf: fixture.asOf, candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture.oiFailureCount, seed: fixture.seed,
       dataFingerprint: `market-traffic-v2-bookseq-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
       qualification: { total: finalSnapshot.catalogProgress.total, completed: finalSnapshot.catalogProgress.completed,
         pending: finalSnapshot.catalogProgress.pending, verified: finalSnapshot.catalogProgress.verified,
@@ -411,7 +455,8 @@ try {
       websocketPayloadBytesByChannel: traffic.websocket, httpResponsePayloadBytesByChannel: traffic.http,
       subscriptionAcknowledgementBytesByChannel: traffic.acknowledgements,
       subscriptionCounts: fixture.currentAcknowledgements,
-      freshness, fixtureRequests: fixture.requests.length, fixtureRequestBytes: fixture.requests.reduce((sum, value) => sum + (value.requestPayloadBytes ?? 0), 0) },
+      freshness, fixtureRequests: fixture.requests.length, fixtureRequestBytes: fixture.requests.reduce((sum, value) => sum + (value.requestPayloadBytes ?? 0), 0),
+      fixtureRequestDetails: fixtureRequestEvidence(fixture.requests) },
     renderer: { ...renderer, measurement: foreground
       ? 'Native foreground renderer RAF gaps and React search input to next-frame latency; native compositor paint was not measured.'
       : 'Hidden offscreen renderer RAF gaps and React search input to next-frame latency; no native compositor paint claim.' },
@@ -443,9 +488,11 @@ try {
     fixture.requests.filter(request => request.path === path).length]))
   const channels = Object.fromEntries(Object.entries(fixture.currentAcknowledgements).map(([channel, ids]) => [channel, ids.length]))
   const deliveryCounts = Object.fromEntries(Object.entries(fixture.deliverySummary().byChannel).map(([channel, value]) => [channel, value.instrumentCount]))
-  const diagnostics = { benchmarkFailure: error.message, fixtureErrors: fixture.errors,
+  const diagnostics = { benchmarkFailure: error.message, fixtureErrors: fixture.errors, fixtureAsOf: fixture.asOf,
     fixtureRequests: requestCounts, fixtureReadyClients: fixture.readyState.clients,
-    fixtureSubscriptions: channels, instrumentsWithFixtureDeliveries: deliveryCounts }
+    fixtureSubscriptions: channels, instrumentsWithFixtureDeliveries: deliveryCounts,
+    fixtureRequestDetails: fixtureRequestEvidence(fixture.requests),
+    ...(error.readinessEvidence ?? readinessFailureEvidence ? { chartReadiness: error.readinessEvidence ?? readinessFailureEvidence } : {}) }
   if (completedReport) {
     try {
       completedReport.outcome = 'failed'
@@ -459,6 +506,20 @@ try {
     try {
       await mkdir(dirname(output), { recursive: true })
       await writeFile(output, `${JSON.stringify({ ...failureMeasurements, outcome: 'failed', failure: error.message, diagnostics }, null, 2)}\n`)
+      diagnostics.partialFailureReport = output
+    } catch (reportError) { diagnostics.partialFailureReportError = reportError.message }
+  } else {
+    try {
+      const partial = { schemaVersion: 1, mode: benchmarkMode, partial: true, outcome: 'failed', generatedAt: new Date().toISOString(),
+        failure: error.message, diagnostics,
+        app: { path: app.selected, entry: app.entry, build: target, checkout },
+        runtime: runtimeEvidence ? { ...runtimeEvidence, presentation: presentationEvidence,
+          network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' } : null,
+        fixture: { asOf: fixture.asOf, candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture.oiFailureCount, seed: fixture.seed,
+          dataFingerprint: `market-traffic-v2-bookseq-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
+          cadenceMS, durationSeconds, expectOptimized, readiness: readinessFailureEvidence ?? null } }
+      await mkdir(dirname(output), { recursive: true })
+      await writeFile(output, `${JSON.stringify(partial, null, 2)}\n`)
       diagnostics.partialFailureReport = output
     } catch (reportError) { diagnostics.partialFailureReportError = reportError.message }
   }

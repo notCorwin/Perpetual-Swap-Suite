@@ -115,6 +115,9 @@ export function validateMarketTrafficReport(report, label, { baseline = false } 
     assert.equal(report.fixture?.readiness?.expectedFrames, report.fixture.passingCount, `${label} readiness must cover each passing contract.`)
     assert.equal(report.fixture?.readiness?.readyFrames, report.fixture.passingCount, `${label} must have every passing chart ready.`)
     assert.ok(Number.isFinite(report.fixture.readiness.elapsedMS), `${label} is missing the readiness barrier measurement.`)
+    assert.equal(report.fixture.readiness.measurement,
+      'Bounded chart startup readiness warmup; elapsedMS is excluded from steady-state performance results.',
+      `${label} must identify readiness elapsed time as startup warmup rather than a performance result.`)
   }
 }
 
