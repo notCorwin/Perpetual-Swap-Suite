@@ -643,6 +643,19 @@ test('the live price overlay follows its actual price without changing the 96 co
   await installPreparedTransform({ mode: 'live', instId: fixture.instId, livePrice })
   try {
     await openChart(page, fixture)
+    // This case measures the live overlay over a prepared adjacent window.
+    // First acquisition may legitimately present its known prices while the
+    // missing leading candle loads; cold acquisition is tested separately.
+    const historicalEnd = fixture.end - fixture.intervalMS
+    await wheelBurst(page, { deltaY: 12 })
+    await waitForRendered(page, fixture, fixture.timeframe, historicalEnd)
+    await page.waitForFunction(({ end, intervalMS }) => {
+      const bars = document.querySelector('[data-chart-inst]')?.__chartSnapshot?.bars
+      return bars?.length === 96 && bars.every((bar, index) =>
+        bar.confirmed && bar.hour === end - 95 * intervalMS + index * intervalMS)
+    }, { end: historicalEnd, intervalMS: fixture.intervalMS })
+    await wheelBurst(page, { deltaY: -12 })
+    await waitForRendered(page, fixture)
     await page.waitForFunction(() => Boolean(document.querySelector('[data-chart-inst]')?.__chartSnapshot?.liveBar))
     await startPaintProbe(page, fixture)
     const overlay = await page.evaluate(() => {

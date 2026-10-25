@@ -41,14 +41,17 @@ jobs:
       - name: Test Electron with isolated fixtures
         run: npm run test:e2e -- --output artifacts/sandbox
       - name: Probe native GPU capabilities and verify accelerated chart work when available
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         # Hosted runners may expose software rendering. The dedicated report
         # distinguishes confirmed unsupported hardware from a passed GPU check.
         run: npm run test:gpu -- --output artifacts/sandbox
       - name: Verify workspace scaling and contrast
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         env:
           PERPETUAL_SWAP_UI_VISUAL_OUTPUT: artifacts/workspace-visual
         run: npm run sandbox -- command --desktop --output artifacts/sandbox -- node scripts/workspace-visual-check.mjs
       - name: Verify full-market intake under held statistics and archive writes
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         env:
           PERPETUAL_SWAP_RESOURCE_REPORT: artifacts/market-resources.json
         run: npm run sandbox -- command --foreground --output artifacts/sandbox -- node scripts/market-resource-benchmark.mjs
