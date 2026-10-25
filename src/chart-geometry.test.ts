@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { Bar } from './chart-data.ts'
 import { createChartGeometryCache } from './chart-geometry.ts'
+import { chartPanelClip } from './chart-layout.ts'
 
 const intervalMS = 900_000
 const candle = (index: number): Bar => ({ hour: index * intervalMS, open: 100, high: 103, low: 99, close: 102, confirmed: true,
@@ -54,6 +55,35 @@ test('RSI markers use the sampled candle coordinates and combine thresholds cros
   assert.equal(updated.index, 95)
   assert.equal(updated.direction, 'down')
   assert.deepEqual(updated.levels, [30, 70])
+})
+
+test('fractional overscan extends paths and crossings without changing the 96-bar axes', () => {
+  const bars = rows().map(bar => ({ ...bar, rsi6: 25 }))
+  const before = { ...candle(-1), rsi6: 80, high: 1000, low: 50 }
+  const after = { ...candle(96), rsi6: 80, high: 2000, low: 40 }
+  const get = createChartGeometryCache(text => text.length * 6)
+  const baseline = get(bars, viewport)
+  const geometry = get(bars, viewport, { before, after })
+  assert.deepEqual(geometry.priceAxis, baseline.priceAxis)
+  assert.deepEqual(geometry.oiAxis, baseline.oiAxis)
+  assert.equal(geometry.x.length, 96)
+  close(geometry.barPitch, geometry.x[1] - geometry.x[0])
+  const emaX = [...geometry.lines.ema.matchAll(/[ML]([\d.-]+) ([\d.-]+)/g)].map(([, x]) => Number(x))
+  assert.equal(emaX.length, 98)
+  assert.ok(emaX[0] < geometry.layout.left)
+  assert.ok(emaX.at(-1)! > geometry.layout.right)
+  const priceClip = chartPanelClip(geometry.layout, 'price', geometry.barPitch)
+  assert.ok(emaX[0] >= priceClip.x && emaX.at(-1)! <= priceClip.x + priceClip.width,
+    'The translated price panel clip must admit adjacent bar centers on both sides.')
+  const leftCrossing = geometry.rsiMarkers.find(marker => marker.hour === bars[0].hour && marker.field === 'rsi6')
+  const rightCrossing = geometry.rsiMarkers.find(marker => marker.hour === after.hour && marker.field === 'rsi6')
+  assert.equal(leftCrossing?.index, 0)
+  assert.equal(leftCrossing?.confirmed, true)
+  assert.equal(rightCrossing?.index, -1, 'An overscan crossing does not masquerade as a visible selection index.')
+  assert.equal(rightCrossing?.confirmed, true)
+  assert.equal((geometry.upWicks + geometry.downWicks).match(/M/g)?.length, 98, 'Candle paths include both exact adjacent overscan bars.')
+  assert.equal(geometry.buySamples, baseline.buySamples, 'Overscan does not change the visible statistics sample count.')
+  assert.equal(geometry.sellSamples, baseline.sellSamples)
 })
 
 test('missing periods and unavailable observations break paths and filled areas without inventing zero samples', () => {

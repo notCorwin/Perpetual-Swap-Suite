@@ -501,6 +501,20 @@ export class PreparedChartStore {
     return this.seriesWindow(entry, endHour)
   }
 
+  /** Read exact cached slots for plot overscan without scheduling history work. */
+  knownBars(instId: string, timeframe: RadarTimeframe, hours: readonly number[]): readonly (PreparedChartBar | undefined)[] {
+    const key = keyFor(instId, timeframe), generation = this.generations.get(key)
+    if (generation === undefined) return hours.map(() => undefined)
+    const entry = this.series.get(key), latest = this.latestFrame(key)
+    return hours.map(hour => {
+      if (!Number.isSafeInteger(hour) || hour % timeframeMilliseconds(timeframe)) return undefined
+      const cached = entry?.meta.generation === generation ? entry.bars.get(hour) : undefined
+      if (cached?.generation === generation) return cached.bar
+      if (latest?.meta.generation === generation) return latest.window.bars.find(bar => bar.hour === hour)
+      return undefined
+    })
+  }
+
   private seriesWindow(entry: Series, endHour: number): ReadyChartWindow | null {
     if (entry.meta.generation !== this.generations.get(entry.meta.key)) return null
     const bars: PreparedChartBar[] = []

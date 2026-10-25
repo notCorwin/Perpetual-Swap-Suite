@@ -170,6 +170,24 @@ export class ChartController {
     this.setTarget({ ...target, end: end >= latest ? null : end })
   }
 
+  /** Admit cached neighbours for sub-candle movement without changing demand. */
+  prefetchAdjacent(direction: number) {
+    const { requested, presented, latestEnd, oldestHour, historyExhausted } = this.view
+    if (!this.active || !requested || !presented || !direction || !Number.isFinite(direction)
+      || !sameSeries(requested, presented) || !this.transport.history) return
+    const edge = direction < 0 ? presented.bars[0] : presented.bars.at(-1)
+    if (!edge) return
+    const hour = edge.hour + Math.sign(direction) * presented.intervalMS
+    if (!Number.isSafeInteger(hour) || latestEnd === null || hour > latestEnd
+      || historyExhausted && oldestHour !== null && hour < oldestHour
+      || this.store.knownBars(requested.instId, requested.timeframe, [hour])[0]) return
+    const target = { ...requested, end: requested.end ?? latestEnd }
+    const key = seriesKey(target), watermark = this.historyWatermark(target)
+    const checkedKey = `${targetKey(target)}:${watermark}:${this.focusId}`
+    if (this.historyAttempts.get(key) === checkedKey || this.historyTargets.has(targetKey(target)) || this.historyTargets.size >= 2) return
+    void this.hydrateHistory(target, checkedKey, watermark)
+  }
+
   private updateFocus(target: ChartTarget | null) {
     this.focusId = `${this.identity}:${++this.focusVersion}`
     const focusId = this.focusId
@@ -222,9 +240,10 @@ export class ChartController {
       && (ready.indicatorState === 'loading' || target.end !== null && !completePrices)
       && previous?.instId === target.instId && previous.timeframe === target.timeframe
       && previous.bars.some(bar => bar.indicatorsObserved)
-    // Initial prices stay independent of optional sources. Moving an already
-    // calculated chart in either direction switches curves and prices together.
-    const presented = calculating ? previous : ready
+    // A prepared price window owns the requested cursor even while its missing
+    // indicators or price slots recover. Never freeze navigation on an unrelated
+    // older window; unavailable samples remain explicit gaps in the new frame.
+    const presented = ready
       ?? (previous?.instId === target.instId && previous.timeframe === target.timeframe ? previous : null)
     const priceSource = this.priceSource?.target === targetKey(target) ? this.priceSource : null
     const priceStatus = priceSource ? priceSource.status : ready?.priceStatus

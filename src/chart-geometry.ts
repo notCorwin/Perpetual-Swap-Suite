@@ -27,6 +27,7 @@ const axisFormatter = (decimals: number) => {
 
 type Range = readonly [number, number]
 export type ChartGeometryOptions = Readonly<{ width: number; height: number; endHour: number; intervalMS: number; liveClose?: number }>
+export type ChartGeometryOverscan = Readonly<{ before?: Bar; after?: Bar }>
 const linearScale = (min: number, max: number, panel: Range) => {
   const span = max - min || 1, height = panel[1] - panel[0]
   return (value: number) => panel[1] - (value - min) / span * height
@@ -38,9 +39,14 @@ const paddedIndicatorRange = (min: number, max: number) => {
 }
 
 /** One immutable viewport owns its axes, coordinates and paths. */
-function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, measureText: (text: string) => number) {
+function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, measureText: (text: string) => number, overscan: ChartGeometryOverscan = {}) {
   const { width, height, endHour, intervalMS, liveClose } = options
   const firstHour = endHour - 95 * intervalMS, firstAtLeft = bars[0].hour === firstHour
+  const pathBars = [
+    ...(overscan.before?.hour === firstHour - intervalMS ? [overscan.before] : []),
+    ...bars,
+    ...(overscan.after?.hour === endHour + intervalMS ? [overscan.after] : []),
+  ]
   let priceMin = Infinity, priceMax = -Infinity, rocExtent = 0, minATR = Infinity, maxATR = 0, minBBW = Infinity, maxBBW = 0, maxTaker = 1
   let candleHigh = -Infinity, candleLow = Infinity, highIndex = 0, lowIndex = 0
   const oiSamples: { index: number; value: number }[] = []
@@ -83,15 +89,19 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
   const layout = chartLayout(width, height, gutter), { left, right } = layout
   const x = bars.map(bar => chartHourX(bar.hour, endHour, left, right, intervalMS))
   const barWidth = chartCandleWidth(right - left)
+  const barPitch = (right - left - barWidth) / 95
+  const pathX = pathBars.map(bar => chartHourX(bar.hour, endHour, left, right, intervalMS))
   const priceY = priceAxis.kind === 'linear' ? linearScale(priceAxis.min, priceAxis.max, panels.price) : logarithmicScale(priceAxis, panels.price)
   const rsiY = linearScale(0, 100, panels.rsi), rocY = linearScale(rocAxis.min, rocAxis.max, panels.roc)
-  const rsiCrossings = chartRsiCrossings(bars, intervalMS)
-  const rsiMarkers: (typeof rsiCrossings[number] & { levels: (30 | 70)[]; x: number; y: number; d: string })[] = []
+  const visibleIndex = new Map(bars.map((bar, index) => [bar.hour, index]))
+  const rsiCrossings = chartRsiCrossings(pathBars, intervalMS)
+  const rsiMarkers: (typeof rsiCrossings[number] & { index: number; confirmed: boolean; levels: (30 | 70)[]; x: number; y: number; d: string })[] = []
   for (const crossing of rsiCrossings) {
     const previous = rsiMarkers.at(-1)
-    if (previous?.index === crossing.index && previous.field === crossing.field) { previous.levels.push(crossing.level); continue }
-    const pointX = x[crossing.index], pointY = rsiY(crossing.value), baseY = pointY + (crossing.direction === 'up' ? 5 : -5)
-    rsiMarkers.push({ ...crossing, levels: [crossing.level], x: pointX, y: pointY,
+    const pointX = pathX[crossing.index], pointY = rsiY(crossing.value), baseY = pointY + (crossing.direction === 'up' ? 5 : -5)
+    const index = visibleIndex.get(crossing.hour) ?? -1
+    if (previous?.hour === crossing.hour && previous.field === crossing.field) { previous.levels.push(crossing.level); continue }
+    rsiMarkers.push({ ...crossing, index, confirmed: pathBars[crossing.index].confirmed, levels: [crossing.level], x: pointX, y: pointY,
       d: `M${pointX.toFixed(1)} ${pointY.toFixed(1)} L${(pointX - 3.5).toFixed(1)} ${baseY.toFixed(1)} L${(pointX + 3.5).toFixed(1)} ${baseY.toFixed(1)} Z` })
   }
   const atrY = linearScale(atrRange.min, atrRange.max, panels.atr)
@@ -101,15 +111,15 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
   const line = (key: typeof lineFields[number], y: (value: number) => number) => {
     const segments: string[] = []
     let segment = ''
-    bars.forEach((bar, index) => {
+    pathBars.forEach((bar, index) => {
       const value = bar[key], pointY = finite(value) ? y(value) : NaN
-      if (!Number.isFinite(pointY) || index > 0 && bar.hour - bars[index - 1].hour !== intervalMS) {
+      if (!Number.isFinite(pointY) || index > 0 && bar.hour - pathBars[index - 1].hour !== intervalMS) {
         if (segment) segments.push(segment)
         segment = ''
         if (!Number.isFinite(pointY)) return
       }
-      if (index === 0 && firstAtLeft) segment = `M${left} ${pointY.toFixed(1)}`
-      segment += `${segment ? ' L' : 'M'}${x[index].toFixed(1)} ${pointY.toFixed(1)}`
+      if (index === 0 && firstAtLeft && bar.hour === firstHour) segment = `M${left} ${pointY.toFixed(1)}`
+      segment += `${segment ? ' L' : 'M'}${pathX[index].toFixed(1)} ${pointY.toFixed(1)}`
     })
     if (segment) segments.push(segment)
     return segments.join(' ')
@@ -126,13 +136,13 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
       }
       points = []
     }
-    bars.forEach((bar, index) => {
+    pathBars.forEach((bar, index) => {
       const value = finitePercentage(bar[key])
-      if (value === null || index > 0 && bar.hour - bars[index - 1].hour !== intervalMS) finish()
+      if (value === null || index > 0 && bar.hour - pathBars[index - 1].hour !== intervalMS) finish()
       if (value === null) return
       const pointY = Number(rocY(value).toFixed(1))
-      if (index === 0 && firstAtLeft) points.push([left, pointY])
-      points.push([Number(x[index].toFixed(1)), pointY])
+      if (index === 0 && firstAtLeft && bar.hour === firstHour) points.push([left, pointY])
+      points.push([Number(pathX[index].toFixed(1)), pointY])
     })
     finish()
     return segments.join(' ')
@@ -144,11 +154,11 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
     if (upper.length > 1) bollBands.push(`M${upper.join(' L')} L${lower.reverse().join(' L')} Z`)
     upper = []; lower = []
   }
-  bars.forEach((bar, index) => {
+  pathBars.forEach((bar, index) => {
     if (!finite(bar.bollUpper) || !finite(bar.bollLower)) { finishBand(); return }
-    if (index > 0 && bar.hour - bars[index - 1].hour !== intervalMS) finishBand()
-    const pointX = x[index].toFixed(1)
-    if (index === 0 && firstAtLeft) {
+    if (index > 0 && bar.hour - pathBars[index - 1].hour !== intervalMS) finishBand()
+    const pointX = pathX[index].toFixed(1)
+    if (index === 0 && firstAtLeft && bar.hour === firstHour) {
       upper.push(`${left} ${priceY(bar.bollUpper).toFixed(1)}`)
       lower.push(`${left} ${priceY(bar.bollLower).toFixed(1)}`)
     }
@@ -160,8 +170,8 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
   const upWicks: string[] = [], downWicks: string[] = [], upBodies: string[] = [], downBodies: string[] = [], buys: string[] = [], sells: string[] = []
   const takerAvailable = bars.some(bar => finite(bar.buy) && bar.buy > 0 || finite(bar.sell) && bar.sell > 0)
   const zeroY = takerY(0)
-  for (const [index, bar] of bars.entries()) {
-    const rising = bar.close >= bar.open, center = x[index]
+  for (const [index, bar] of pathBars.entries()) {
+    const rising = bar.close >= bar.open, center = pathX[index]
     const wicks = rising ? upWicks : downWicks, bodies = rising ? upBodies : downBodies
     wicks.push(`M${center} ${priceY(bar.high)}V${priceY(bar.low)}`)
     const top = priceY(Math.max(bar.open, bar.close))
@@ -172,7 +182,7 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
     if (takerAvailable && sell > 0) sells.push(rectangle(center - barWidth / 2, totalY, barWidth, buyY - totalY))
   }
   return Object.freeze({
-    ...options, layout, gutter, x, priceAxis, rocAxis, atrRange, bbwRange, oiAxis, takerAxis, priceY, rsiY, rocY, atrY, bbwY, oiY, takerY, rocZeroY, rsiMarkers,
+    ...options, layout, gutter, x, barPitch, priceAxis, rocAxis, atrRange, bbwRange, oiAxis, takerAxis, priceY, rsiY, rocY, atrY, bbwY, oiY, takerY, rocZeroY, rsiMarkers,
     priceTicks: priceAxis.ticks.map((value, index) => ({ y: priceY(value), label: priceLabelsText[index] })),
     oiTicks: oiAxis?.ticks.map((value, index) => ({ y: oiY(value), label: oiLabelsText[index] })) ?? [],
     takerTicks: takerAxis.ticks.map((value, index) => ({ y: takerY(value), label: takerLabelsText[index] })),
@@ -180,7 +190,9 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
     oiComplete: bars.every(bar => finite(bar.oi)), takerComplete: bars.every(bar => finite(bar.buy) && finite(bar.sell)),
     lines, rocAreas, bollBands,
     upWicks: upWicks.join(' '), downWicks: downWicks.join(' '), upBodies: upBodies.join(' '), downBodies: downBodies.join(' '),
-    buys: buys.join(' '), sells: sells.join(' '), buySamples: buys.length, sellSamples: sells.length,
+    buys: buys.join(' '), sells: sells.join(' '),
+    buySamples: bars.filter(bar => finite(bar.buy) && bar.buy > 0).length,
+    sellSamples: bars.filter(bar => finite(bar.sell) && bar.sell > 0).length,
   })
 }
 
@@ -189,30 +201,35 @@ export type ChartGeometry = ReturnType<typeof buildGeometry>
 /** Weak ownership follows immutable chart windows. A separate LRU also caps
  * derived paths globally, including windows still resident in the source cache. */
 export function createChartGeometryCache(measureText: (text: string) => number) {
-  const cache = new WeakMap<readonly Bar[], ChartGeometry[]>()
-  const resident = new Map<ChartGeometry, ChartGeometry[]>()
-  return (bars: readonly Bar[], options: ChartGeometryOptions): ChartGeometry => {
+  type Variant = { value: ChartGeometry; before?: Bar; after?: Bar }
+  const cache = new WeakMap<readonly Bar[], Variant[]>()
+  const resident = new Map<ChartGeometry, Variant[]>()
+  return (bars: readonly Bar[], options: ChartGeometryOptions, overscan: ChartGeometryOverscan = {}): ChartGeometry => {
     const variants = cache.get(bars) ?? []
     const liveClose = finite(options.liveClose) ? options.liveClose : undefined
-    const index = variants.findIndex(value => value.width === options.width && value.height === options.height
-      && value.endHour === options.endHour && value.intervalMS === options.intervalMS && value.liveClose === liveClose)
+    const index = variants.findIndex(({ value, before, after }) => value.width === options.width && value.height === options.height
+      && value.endHour === options.endHour && value.intervalMS === options.intervalMS && value.liveClose === liveClose
+      && before === overscan.before && after === overscan.after)
     if (index >= 0) {
-      const [value] = variants.splice(index, 1)
-      variants.push(value)
+      const [variant] = variants.splice(index, 1)
+      variants.push(variant)
+      const { value } = variant
       resident.delete(value); resident.set(value, variants)
       return value
     }
     const value = measureOperation({ category: 'cpu', name: 'chart.geometry', attributes: {
-      candles: bars.length, width: options.width, height: options.height, intervalMS: options.intervalMS,
-    } }, () => buildGeometry(bars, { ...options, liveClose }, measureText))
-    variants.push(value)
-    if (variants.length > 4) resident.delete(variants.shift()!)
+      candles: bars.length + Number(Boolean(overscan.before)) + Number(Boolean(overscan.after)), width: options.width, height: options.height, intervalMS: options.intervalMS,
+    } }, () => buildGeometry(bars, { ...options, liveClose }, measureText, overscan))
+    const variant = { value, before: overscan.before, after: overscan.after }
+    variants.push(variant)
+    if (variants.length > 4) resident.delete(variants.shift()!.value)
     cache.set(bars, variants)
     resident.set(value, variants)
     if (resident.size > 64) {
       const [oldest, entries] = resident.entries().next().value!
       resident.delete(oldest)
-      entries.splice(entries.indexOf(oldest), 1)
+      const index = entries.findIndex(entry => entry.value === oldest)
+      if (index >= 0) entries.splice(index, 1)
     }
     return value
   }

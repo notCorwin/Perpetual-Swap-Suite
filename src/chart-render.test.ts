@@ -37,3 +37,22 @@ test('selection reuses preconstructed live paths even beyond the geometry LRU ca
   assert.notEqual(cache(changed, size), plots[0], 'New prices invalidate the prior immutable plot.')
   assert.notEqual(cache(windows[0], { ...size, width: 800 }), plots[0], 'Layout changes prepare correctly sized paths.')
 })
+
+test('fractional overscan paths retain the exact 96-bar presentation window', () => {
+  const cache = createChartPlotCache(text => text.length * 6), size = { width: 960, height: 700 }
+  const frame = window(), baseline = cache(frame, size)!
+  const before = { ...frame.bars[0]!, hour: -step }
+  const after = { ...frame.bars.at(-1)!, hour: 96 * step }
+  const extended = cache(frame, size, { before, after })!
+  assert.notEqual(extended, baseline)
+  assert.equal(extended.bars, baseline.bars)
+  assert.equal(extended.bars.length, 96)
+  assert.equal(extended.geometry.x.length, 96)
+  assert.equal(extended.geometry.priceAxis.min, baseline.geometry.priceAxis.min)
+  assert.equal(extended.geometry.priceAxis.max, baseline.geometry.priceAxis.max)
+  const emaPoints = [...extended.geometry.lines.ema.matchAll(/[ML]([\d.-]+) ([\d.-]+)/g)].map(([, x]) => Number(x))
+  assert.equal(emaPoints.length, 98)
+  assert.ok(emaPoints[0] < extended.geometry.layout.left)
+  assert.ok(emaPoints.at(-1)! > extended.geometry.layout.right)
+  assert.equal(cache(frame, size, { before, after }), extended, 'Repeating an unchanged overscan frame reuses its geometry.')
+})

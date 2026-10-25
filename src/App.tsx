@@ -11,7 +11,7 @@ import { WorkspaceViewport } from '@/WorkspaceViewport'
 import { WorkspaceSettings } from '@/WorkspaceSettings'
 import { settingsHref, useSettingsSection, type SettingsNavigationState } from '@/settings-navigation'
 import { chartController } from '@/chart-controller'
-import { reconcileMarketRows } from '@/market-snapshot'
+import { reconcileMarketOrder, reconcileMarketRows } from '@/market-snapshot'
 import { SnapshotOrder } from '@/snapshot-order'
 import { DEFAULT_PREFERENCES, type Preferences } from '@/renderer-preferences'
 import type { MarketSnapshot, RankedMarketRow, UnchangedSnapshot } from '@/desktop-contract'
@@ -61,6 +61,7 @@ function App() {
   const [preferencesLoaded, setPreferencesLoaded] = useState(false)
   const [preferencesError, setPreferencesError] = useState('')
   const [rows, setRows] = useState<RankedMarketRow[]>([])
+  const [candidateIds, setCandidateIds] = useState<string[]>([])
   const [turnoverOrder, setTurnoverOrder] = useState<string[]>([])
   const [selected, setSelected] = useState<string | null>(null)
   const [query, setQuery] = useState('')
@@ -107,7 +108,8 @@ function App() {
             const unverified = snapshot.loading && qualificationPending(snapshot.catalogProgress) || snapshot.error || snapshot.catalogSource === 'none' || (snapshot.catalogProgress?.unknown ?? 0) > 0
             // Membership and order come from the backend, independently of charts.
             setRows(current => reconcileMarketRows(current, snapshot.rows))
-            setTurnoverOrder(snapshot.turnoverOrder)
+            setCandidateIds(current => reconcileMarketOrder(current, snapshot.rows.map(row => row.instId)))
+            setTurnoverOrder(current => reconcileMarketOrder(current, snapshot.turnoverOrder))
             setSelected(current => snapshot.rows.some(row => row.instId === current) || (!snapshot.rows.length && unverified) ? current : snapshot.rows[0]?.instId ?? null)
             setReady(true)
           }
@@ -143,6 +145,7 @@ function App() {
   }, [preferencesLoaded])
 
   const visible = useMemo(() => rows.filter(row => row.instId.toLowerCase().includes(query.trim().toLowerCase())), [rows, query])
+  const visibleIds = useMemo(() => candidateIds.filter(id => id.toLowerCase().includes(query.trim().toLowerCase())), [candidateIds, query])
   const verifying = Boolean(catalog.loading) && qualificationPending(catalog.catalogProgress) || (!ready && !error)
   const awaitingObservations = Boolean(catalog.loading && catalog.catalogProgress && catalog.catalogProgress.completed === catalog.catalogProgress.total && catalog.catalogProgress.pending > 0)
   const verificationUnavailable = !verifying && (Boolean(error) || catalog.catalogSource === 'none' || (catalog.catalogProgress?.unknown ?? 0) > 0)
@@ -155,7 +158,6 @@ function App() {
   const selectedRow = rows.find(row => row.instId === selected) ?? rows[0]
   const retainedChart = !rows.length && Boolean(selected) && (verifying || verificationUnavailable)
   const selectedID = selectedRow?.instId ?? (retainedChart ? selected : null)
-  const candidateIds = useMemo(() => rows.map(row => row.instId), [rows])
   const listOrder = candidateIds
   useEffect(() => { if (ready) chartController.setUniverse(retainedChart && selectedID ? [selectedID] : candidateIds, timeframe) }, [ready, candidateIds, timeframe, retainedChart, selectedID])
   const savePreferences = useCallback(async (values: Partial<Preferences>) => {
@@ -192,7 +194,7 @@ function App() {
         <Table className="table-fixed" data-market-count={visible.length} data-total-market-count={rows.length} aria-rowcount={visible.length + 1}>
           <colgroup><col className="w-[35%]" /><col className="w-[33%]" /><col className="w-[32%]" /></colgroup>
           <TableHeader className="sticky top-0 bg-background"><TableRow><TableHead>Contract</TableHead><TableHead className="text-right">Price</TableHead><TableHead className="text-right" aria-sort="descending" title="Sorted by absolute signed relative change, largest first">{preferences.rankingLookback}m change</TableHead></TableRow></TableHeader>
-          {visible.length ? <MarketRowsViewport ids={visible.map(row => row.instId)}>{index => <MarketRowView row={visible[index]} index={index} selected={visible[index].instId === selectedID} lookback={preferences.rankingLookback} onSelect={setSelected} />}</MarketRowsViewport> : <TableBody><TableRow><TableCell colSpan={3}>
+          {visible.length ? <MarketRowsViewport ids={visibleIds}>{index => <MarketRowView row={visible[index]} index={index} selected={visible[index].instId === selectedID} lookback={preferences.rankingLookback} onSelect={setSelected} />}</MarketRowsViewport> : <TableBody><TableRow><TableCell colSpan={3}>
             <Empty><EmptyHeader><EmptyTitle>{noSearchMatch ? 'No matching contracts' : emptyTitle}</EmptyTitle><EmptyDescription>{noSearchMatch ? 'Try another contract name.' : emptyDescription}</EmptyDescription></EmptyHeader></Empty>
           </TableCell></TableRow></TableBody>}
         </Table>

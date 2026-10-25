@@ -502,7 +502,7 @@ test('mature local indicators and statistics stay drawn from the first scroll th
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
 
-for (const mode of ['gap', 'prepend']) test(`first historical acquisition keeps every calculated curve and source panel while ${mode === 'gap' ? 'later gaps fill' : 'an earlier prefix changes the exact recursive seed'}`, async context => {
+for (const mode of ['gap', 'prepend']) test(`first historical acquisition preserves requested prices and source panels while ${mode === 'gap' ? 'later gaps fill' : 'an earlier prefix rebuilds exact indicators'}`, async context => {
   const probe = value => electron.evaluate((_, value) => globalThis.__marketBackend.probe(value), value)
   const fixture = await probe({ action: 'acquisitionInstall', timeframe: '15m', mode })
   const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
@@ -524,7 +524,7 @@ for (const mode of ['gap', 'prepend']) test(`first historical acquisition keeps 
     const firstEMA = await page.evaluate(() => document.querySelector('[data-chart-inst]').__chartSnapshot.bars.at(-1).ema)
     if (mode === 'prepend') assert.ok(Math.abs(firstEMA - desired.at(-1).ema) > 1e-6,
       'The absent earlier prefix must actually change the recursive result, so retaining a stale curve cannot pass this test.')
-    await startPaintProbe(page, fixture, { requireMatureData: true, verifyIndicatorValues: mode === 'gap' })
+    await startPaintProbe(page, fixture, { requireMatureData: mode === 'gap', verifyIndicatorValues: mode === 'gap' })
     const sourceCounts = { candles: 0, oi: 0, taker: 0 }
     const pageCounts = { candles: 0, oi: 0, taker: 0 }
     const complete = new Set()
@@ -538,8 +538,8 @@ for (const mode of ['gap', 'prepend']) test(`first historical acquisition keeps 
         await settle()
       }
     }
-    // The prefix variant must adopt the new correct numbers without ever
-    // clearing its already visible curves or independent statistic panels.
+    // A changed prefix invalidates recursive curves until exact replacements
+    // arrive. Prices keep the selected cursor and independent statistics stay.
     await page.waitForFunction(({ desired, fields }) => {
       const bars = document.querySelector('[data-chart-inst]')?.__chartSnapshot?.bars
       return bars?.length === desired.length && bars.every((bar, index) => bar.hour === desired[index].hour
@@ -549,8 +549,9 @@ for (const mode of ['gap', 'prepend']) test(`first historical acquisition keeps 
     const paint = await finishPaintProbe(page)
     context.diagnostic(`First acquisition ${mode}: ${JSON.stringify({ sourceCounts, paints: paint.paints, quality: paint.quality })}`)
     assertCompletePaints(paint)
-    assert.ok(paint.quality.every(frame => frame.indicators === 96 && frame.oi === 96 && frame.taker === 96),
-      'Every mature curve and statistic panel must remain visible through native page ingestion, even when the canonical generation changes.')
+    assert.ok(paint.quality.every(frame => frame.oi === 96 && frame.taker === 96 && (mode === 'prepend' || frame.indicators === 96)),
+      'Independent statistics and unchanged indicator inputs must remain available while a changed recursive prefix rebuilds.')
+    assert.ok(paint.commits.every(commit => commit.end === fixture.targetEnd), 'Canonical page writes must not cancel or replace the requested wheel cursor.')
   } finally {
     await page.evaluate(() => { const probe = window.__chartPaintProbe; if (probe) { probe.active = false; cancelAnimationFrame(probe.raf); probe.observer.disconnect(); delete window.__chartPaintProbe } })
   }

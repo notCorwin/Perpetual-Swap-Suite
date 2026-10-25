@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { stripTypeScriptTypes } from 'node:module'
 import test from 'node:test'
 import { parse } from '@babel/parser'
-import { reconcileMarketRows } from './market-snapshot.ts'
+import { reconcileMarketOrder, reconcileMarketRows } from './market-snapshot.ts'
 import { DEFAULT_PREFERENCES, type Preferences } from './renderer-preferences.ts'
 import { SnapshotOrder } from './snapshot-order.ts'
 import type { MarketSnapshot, RankedMarketRow } from './desktop-contract.ts'
@@ -71,7 +71,7 @@ function fixture(snapshotFailure = false) {
   function slot() { return slots[cursor++] ?? (slots[cursor - 1] = {}) }
   const changed = (previous: unknown[] | undefined, next: unknown[]) => !previous || previous.length !== next.length || next.some((value, index) => !Object.is(value, previous[index]))
   const environment = {
-    window, document, DEFAULT_PREFERENCES, SnapshotOrder, reconcileMarketRows,
+    window, document, DEFAULT_PREFERENCES, SnapshotOrder, reconcileMarketRows, reconcileMarketOrder,
     performance: { now: () => now },
     chartController: { ingestPrepared() {}, getSnapshot: () => ({}), setUniverse: (...args: unknown[]) => { universeRequests.push(args) } },
     useSettingsSection: () => null,
@@ -176,6 +176,21 @@ test('all qualified rows are immediately visible without any chart render receip
   assert.deepEqual(app.view.turnoverOrder, ['ETH-USDT-SWAP', 'BTC-USDT-SWAP'], 'Volume navigation consumes the backend order.')
   assert.equal(app.view.selectedID, 'BTC-USDT-SWAP')
   assert.equal(app.timers, 0)
+})
+
+test('price updates refresh rows without rebuilding chart membership or equal navigation order', async context => {
+  const app = fixture(); context.after(() => app.close())
+  await app.flush()
+  const universes = app.universeRequests.length, turnoverOrder = app.view.turnoverOrder
+  app.state.rows = [{ ...app.state.rows[0], lastPrice: 101 }]
+  app.state.revision++; app.notify(); await app.flush()
+  assert.equal(app.view.rows[0].lastPrice, 101)
+  assert.equal(app.view.turnoverOrder, turnoverOrder)
+  assert.equal(app.universeRequests.length, universes)
+  app.state.rows = [{ ...app.state.rows[0], instId: 'ETH-USDT-SWAP' }]
+  app.state.revision++; app.notify(); await app.flush()
+  assert.equal(app.view.selectedID, 'ETH-USDT-SWAP')
+  assert.ok(app.universeRequests.length > universes)
 })
 
 test('switching every chart timeframe preserves the list and never reloads its snapshot', async context => {

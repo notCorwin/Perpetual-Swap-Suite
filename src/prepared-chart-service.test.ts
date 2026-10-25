@@ -155,6 +155,42 @@ test('historical focus alone repairs durable prices, statistics and exact indica
   } finally { await pipeline.dispose() }
 })
 
+test('prepared historical focus reuses its rolling reserve without rereading, recalculating, or republishing', async () => {
+  const rows = source(2200), target = rows[1700].timestamp
+  let priceRepairs = 0
+  const { pipeline, store } = fixture(rows, { async ensurePrices(_id: string, _timeframe: string, from: number, through: number) {
+    priceRepairs += 1
+    return { rows: store.rows.filter(row => row.timestamp >= from && row.timestamp <= through) }
+  } })
+  const operations: OperationEvent[] = [], frames: any[] = [], detach = attachOperationSink(operation => operations.push(operation))
+  pipeline.subscribe((frame: any) => frames.push(frame))
+  try {
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target }, 'scroll-0')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`), original = pipeline.historyFrame(state, target)
+    const reads = store.queries.length, calculations = pipeline.nextCalculation
+    assert.ok(Object.isFrozen(state.rows.get(target)), 'Projected candle inputs are immutable snapshots.')
+    assert.ok(Object.isFrozen(state.indicators.get(target)), 'Projected indicator inputs are immutable snapshots.')
+    assert.equal(pipeline.preparedHistoryReserve(state, target, 96 + 256), true)
+    operations.length = 0; frames.length = 0
+
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target - interval }, 'scroll-1')
+    const moved = await pipeline.focus.task
+
+    assert.equal(moved, null, 'The focus command has no frame consumer on this path.')
+    assert.equal(state.historyEnd, target - interval)
+    assert.strictEqual(state.historyBarsCache.bars, original.bars, 'The whole resident projection remains shared across cursor changes.')
+    assert.equal(store.queries.length, reads, 'A covered viewport plus safety margin needs no SQLite read.')
+    assert.equal(pipeline.nextCalculation, calculations, 'A complete resident indicator basis needs no replay.')
+    assert.deepEqual(operations.filter(operation => operation.name === 'chart.project'), [], 'Cached rows require no projection work.')
+    assert.deepEqual(frames, [], 'A cursor-only move does not republish chart data.')
+
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target - 1057 * interval }, 'scroll-edge')
+    await pipeline.focus.task
+    assert.ok(priceRepairs > 0, 'Moving past the safe resident edge starts the normal larger-reserve acquisition.')
+  } finally { detach(); await pipeline.dispose() }
+})
+
 test('fresh OHLC and forming price publish while both statistic requests are held', async () => {
   const hold = deferred(), rows = source(400).map(row => ({ ...row, oi: null, buy: null, sell: null, statisticsVersion: null }))
   let statistics = 0
@@ -169,6 +205,30 @@ test('fresh OHLC and forming price publish while both statistic requests are hel
     assert.equal(pipeline.cached(`${instId}:15m`).liveBar.close, 142)
     assert.equal(pipeline.cached(`${instId}:15m`).indicatorState, 'ready')
   } finally { hold.resolve(); await pipeline.dispose() }
+})
+
+test('resident history advertises its listing floor before the viewport reaches it and publishes boundary-only changes', async () => {
+  const rows = source(600), floor = rows[0].timestamp, target = rows[400].timestamp
+  const { pipeline } = fixture(rows)
+  pipeline.instrument = () => ({ listTime: String(floor) })
+  const frames: any[] = []
+  pipeline.subscribe((frame: any) => frames.push(frame))
+  try {
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target }, 'listing-floor')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`), history = pipeline.historyFrame(state, target)
+    assert.equal(pipeline.frame(state, target, true).historyExhausted, false, 'The visible window is still above the listing floor.')
+    assert.equal(history.bars[0].hour, floor)
+    assert.equal(history.historyExhausted, true, 'The delivered reserve already proves the listing boundary.')
+    state.publishedHistoryFrame = { ...history, historyExhausted: false }
+    frames.length = 0
+    pipeline.publish(state)
+    const update = frames.find(frame => frame.endHour === target)
+    assert.ok(update, 'A changed boundary cannot be swallowed by identical bar content.')
+    assert.equal(update.historyExhausted, true)
+    assert.equal(update.bars.length, 96, 'Boundary metadata does not require another full reserve transfer.')
+    assert.equal(pipeline.preparedHistoryReserve(state, floor - interval, 352), false)
+  } finally { await pipeline.dispose() }
 })
 
 test('a listing with fewer than 96 candles publishes all available prices', async () => {
@@ -1846,6 +1906,64 @@ test('a historical source failure republishes status while reusing its prepared 
     assert.equal(failed.bars, before.bars, 'A changed error or retry deadline does not rebuild the prepared reserve.')
     assert.equal(pipeline.nextCalculation, calculations)
   } finally { gate.resolve(); await pipeline.dispose() }
+})
+
+test('an unchanged price and indicator failure publishes the new cursor range in a viewport frame', async () => {
+  const rows = source(500), target = rows[350].timestamp, { pipeline } = fixture(rows)
+  const originalSourceStatus = pipeline.sourceStatus.bind(pipeline), frames: any[] = []
+  pipeline.sourceStatus = (state: any, source: string, from: number, through: number, availability: string) => source === 'candles'
+    ? { state: 'error', from, through, error: 'Price offline', retryAt: 123_456 }
+    : originalSourceStatus(state, source, from, through, availability)
+  pipeline.indicatorStatus = (_state: any, _bars: any[], from: number, through: number) => ({
+    state: 'error', from, through, inputVersion: 'same-input', error: 'Indicator worker offline', retryOn: 'worker-recovery',
+  })
+  try {
+    await pipeline.localHistory(instId, '15m', target)
+    const state = pipeline.state(instId, '15m')
+    state.historyEnd = target
+    state.publishedHistoryFrame = pipeline.historyFrame(state, target)
+    const residentBars = state.publishedHistoryFrame.bars
+    pipeline.subscribe((frame: any) => frames.push(frame))
+
+    state.historyEnd = target - interval
+    pipeline.publish(state)
+
+    const update = frames.at(-1)
+    assert.equal(update.endHour, target - interval)
+    assert.equal(update.bars.length, 96, 'Status-only cursor changes use the selected viewport.')
+    assert.equal(update.priceStatus.error, 'Price offline')
+    assert.equal(update.priceStatus.from, target - 96 * interval)
+    assert.equal(update.priceStatus.through, target - interval)
+    assert.equal(update.indicatorStatus.error, 'Indicator worker offline')
+    assert.equal(update.indicatorStatus.from, target - 96 * interval)
+    assert.equal(update.indicatorStatus.through, target - interval)
+    assert.strictEqual(state.historyBarsCache.bars, residentBars, 'No 1536-bar projection is rebuilt for range metadata.')
+  } finally { await pipeline.dispose() }
+})
+
+test('covered focus navigation still publishes a known indicator failure for the new viewport', async () => {
+  const rows = source(2200), target = rows[1700].timestamp, { pipeline } = fixture(rows)
+  const frames: any[] = []
+  pipeline.subscribe((frame: any) => frames.push(frame))
+  try {
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target }, 'before-failure')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`), failedHour = target - interval
+    state.indicators.delete(failedHour)
+    state.indicatorFailures.set(failedHour, { inputVersion: pipeline.indicatorInputVersion(state),
+      error: 'Worker unavailable', retryOn: 'worker-recovery' })
+    pipeline.publish(state)
+    frames.length = 0
+    const reads = pipeline.nextCalculation
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: failedHour }, 'cached-failure')
+    await pipeline.focus.task
+    const update = frames.findLast(frame => frame.endHour === failedHour)
+    assert.ok(update, 'The reserve fast path cannot hide a selected failure lifecycle.')
+    assert.equal(update.bars.length, 96)
+    assert.equal(update.indicatorStatus.state, 'error')
+    assert.equal(update.indicatorStatus.through, failedHour)
+    assert.equal(pipeline.nextCalculation, reads, 'An unchanged worker failure does not start another replay.')
+  } finally { await pipeline.dispose() }
 })
 
 

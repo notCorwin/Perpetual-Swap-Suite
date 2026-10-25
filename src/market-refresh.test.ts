@@ -134,7 +134,9 @@ test('a shared bulk OI rejection skips history and books for the entire excluded
   const instruments = Array.from({ length: 289 }, (_, index) => instrument(`COIN${index}`))
   const eligible = instruments.slice(-14), eligibleIDs = new Set(eligible.map(value => value.instId))
   const paths: string[] = [], histories: string[] = []
-  const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
+  const now = Math.floor(Date.now() / fiveMinutes) * fiveMinutes + 60_000
+  context.mock.method(Date, 'now', () => now)
+  const asOf = Math.floor(now / fiveMinutes) * fiveMinutes
   const f = await fixture(preferences('spread', 'depth', 'slippage', 'volume24h', 'openInterest'), async input => {
     const url = new URL(String(input)), path = url.pathname
     paths.push(path)

@@ -1,9 +1,17 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { reconcileMarketRows } from './market-snapshot.ts'
+import { reconcileMarketOrder, reconcileMarketRows } from './market-snapshot.ts'
 import type { RankedMarketRow } from './desktop-contract.ts'
 
 const row = (instId: string, lastPrice = 100): RankedMarketRow => ({ instId, lastPrice, turnover24hUSDT: 40_000_000, rankingChange: 1, rankingAsOf: 900_000 })
+
+test('navigation order identity follows membership and order rather than row prices', () => {
+  const previous = ['BTC-USDT-SWAP', 'ETH-USDT-SWAP']
+  assert.equal(reconcileMarketOrder(previous, [...previous]), previous)
+  assert.deepEqual(reconcileMarketOrder(previous, [...previous].reverse()), ['ETH-USDT-SWAP', 'BTC-USDT-SWAP'])
+  assert.deepEqual(reconcileMarketOrder(previous, ['ETH-USDT-SWAP']), ['ETH-USDT-SWAP'])
+  assert.deepEqual(reconcileMarketOrder(previous, []), [])
+})
 
 test('snapshot reconciliation preserves unchanged row identities and backend order', () => {
   const previous = [row('BTC-USDT-SWAP'), row('ETH-USDT-SWAP')]

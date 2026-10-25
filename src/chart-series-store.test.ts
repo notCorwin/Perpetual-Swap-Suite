@@ -36,6 +36,19 @@ test('partial price windows render independently of unknown indicators and stati
   assert.equal(store.window(instId, '1H', 13 * hour), null, 'An absent requested end remains a real price gap.')
 })
 
+test('known overscan lookups return only exact current-generation cached bars without filling gaps', () => {
+  const store = new PreparedChartStore()
+  store.ingest(response(bars(0, 96)))
+  assert.deepEqual(store.knownBars(instId, '1H', [-hour, 0, 40 * hour, 95 * hour, 96 * hour]),
+    [undefined, store.window(instId, '1H')!.bars[0], store.window(instId, '1H')!.bars[40], store.window(instId, '1H')!.bars[95], undefined])
+
+  store.ingest(response([bar(96)], { generation: 2, revision: 1, latestEnd: 96 * hour }))
+  assert.deepEqual(store.knownBars(instId, '1H', [0, 96 * hour]), [undefined, store.window(instId, '1H')!.bars[0]],
+    'A generation change invalidates old adjacent slots even if their prior objects remain referenced elsewhere.')
+  assert.deepEqual(store.knownBars(instId, '1H', [Number.NaN, 96 * hour + 1]), [undefined, undefined],
+    'Invalid timestamps do not trigger a nearest-bar fallback.')
+})
+
 test('a present latest candle cannot certify a window with an interior price gap', () => {
   for (const compact of [false, true]) {
     const store = new PreparedChartStore()

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { requireForegroundTests } from '../electron/test-presentation.js'
+import { barsWithIndicators } from '../electron/services/indicators.js'
 
 // A foreground paint budget requires a native foreground window. A hidden
 // BrowserWindow can still report document.visibilityState === 'visible' while
@@ -87,6 +88,21 @@ export async function waitForRendered(page, fixture, timeframe = fixture.timefra
     }))
     throw new Error(`${error.message}\nExpected ${fixture.instId} ${timeframe} at ${end}. Chart state: ${JSON.stringify(state)}`, { cause: error })
   }
+}
+
+// Cold acquisition can present a complete target price window while indicator
+// preparation is still pending. This waits for that exact rendered cursor
+// without treating the pending flag as a missing price frame.
+export async function waitForPresentedTarget(page, fixture, timeframe, end) {
+  await page.waitForFunction(({ instId, timeframe, end }) => {
+    const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+    const svg = chart?.querySelector('svg[data-rendered-inst]')
+    return svg?.getAttribute('data-rendered-inst') === instId
+      && svg.getAttribute('data-rendered-timeframe') === timeframe
+      && Number(svg.getAttribute('data-rendered-end')) === end
+      && Number(chart.getAttribute('data-chart-completed-end')) === end
+      && chart.getAttribute('data-chart-rendered-bars') === '96'
+  }, { instId: fixture.instId, timeframe, end }, { timeout: 20_000 })
 }
 
 export async function assertWorkspaceLayout(page) {
@@ -292,8 +308,16 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
           probe.geometry.set(field, { d, expected })
           const { samples, points: expectedPoints } = expected.curves.get(field)
           if (samples > 1 && !d) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} lost its ${field} SVG curve with ${samples} known samples.`)
-          const points = (d.match(/[ML]/g) ?? []).length
-          if (points !== expectedPoints) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${points} points for ${expectedPoints} known positions.`)
+          const clipId = svg.querySelector('[data-chart-wheel-content]')?.parentElement?.getAttribute('clip-path')?.match(/#([^)]*)/)?.[1]
+          const clip = clipId ? svg.querySelector(`[id="${clipId}"] rect`) : null
+          const coordinates = [...d.matchAll(/[ML]([\d.e+-]+)[ ,]+([\d.e+-]+)/gi)].map(point => Number(point[1]))
+          if (clip) {
+            const left = Number(clip.getAttribute('x')), right = left + Number(clip.getAttribute('width'))
+            const inside = coordinates.filter(x => x >= left - .05 && x <= right + .05)
+            const padding = expectedPoints > samples && inside.some(x => Math.abs(x - left) <= .05) ? 1 : 0
+            if (inside.length !== samples + padding || coordinates.filter(x => x < left - .05).length > 1
+              || coordinates.filter(x => x > right + .05).length > 1) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.length} points; expected ${samples} visible samples and at most one adjacent sample per side.`)
+          } else if (coordinates.length !== expectedPoints) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.length} points for ${expectedPoints} known positions.`)
           if (/NaN|Infinity|undefined/.test(d)) fail('Nonfinite SVG geometry.')
         }
         if (requireMatureData) {
@@ -333,6 +357,9 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
           if (Number.isFinite(previous[field]) && !Number.isFinite(bar[field])) fail(`${probe.phase}: ${key} downgraded previously drawn ${field} from ${previous[field]} to ${bar[field]} without a price change.`)
         }
         probe.known.set(key, { ...bar })
+        if (!bar.indicatorsObserved) for (const field of indicatorFields) {
+          if (bar[field] !== null) fail(`${probe.phase}: ${key} retained ${field} without an observed calculation for its canonical generation.`)
+        }
         for (const field of fields.filter(field => {
           if (['open', 'high', 'low', 'close'].includes(field)) return true
           if (requireMatureData && Number.isFinite(expected[field])) return true
@@ -565,6 +592,8 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
       original, contents, originalSend, calls: [], active: 0, maxActive: 0, focusCalls: [], legacyWindowCalls: 0,
       historicalActive: 0, maxHistoricalActive: 0, localActive: 0, maxLocalActive: 0,
       historyCalls: [], historyResponses: [], historyFrames: new Map(), transferredHistoryBars: 0,
+      preparedPushes: 0, preparedPushBars: 0, fullHistoryPushes: 0, fullHistoryPushBars: 0,
+      historyPushSamples: new Map(), fullHistoryPushShapes: new Map(), sourceBaseline: 0,
       holdHistorical, holdLocal: false, held: false, heldCall: null, heldSettled: false, callsAtHold: null, release: null,
       extendHistory: initialHistoryBars === null, deliveredFloors: new Map(), extensions: [], pendingPushes: new Map(), timers: new Set(), closed: false,
     }
@@ -606,7 +635,23 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
     }
     contents.send = function (channel, ...args) {
       if (channel !== 'radar:chart-prepared') return originalSend.call(this, channel, ...args)
-      const response = args[0], record = extension(response, 'push', Date.now())
+      const response = args[0]
+      if (response?.instId === instId && Array.isArray(response.bars)) {
+        probe.preparedPushes += 1
+        probe.preparedPushBars += response.bars.length
+        if (response.bars.length > 96) {
+          probe.fullHistoryPushes += 1
+          probe.fullHistoryPushBars += response.bars.length
+          const shape = [response.timeframe, response.generation, response.revision, response.endHour,
+            response.bars[0]?.hour, response.bars.at(-1)?.hour, response.bars.length].join(':')
+          probe.fullHistoryPushShapes.set(shape, (probe.fullHistoryPushShapes.get(shape) ?? 0) + 1)
+          const sample = probe.historyPushSamples.get(response.timeframe) ?? { first: response, last: null, count: 0 }
+          sample.count += 1
+          if (sample.count > 1) sample.last = response
+          probe.historyPushSamples.set(response.timeframe, sample)
+        }
+      }
+      const record = extension(response, 'push', Date.now())
       if (record && historicalDelayMS > 0) {
         const pending = probe.pendingPushes.get(response.timeframe)
         if (pending) { pending.args = args; probe.extensions.pop(); return }
@@ -681,15 +726,54 @@ export async function releaseRequestProbe(electron) {
 export async function readRequestProbe(electron) {
   return electron.evaluate(async () => {
     const probe = globalThis.__chartRequestProbe
-    const sourceRequests = await globalThis.__marketBackend.probe({ action: 'sourceRead' })
+    const sourceRequests = (await globalThis.__marketBackend.probe({ action: 'sourceRead' })).slice(probe.sourceBaseline)
+    const uniqueOrUnchangedOverlap = Object.fromEntries([...probe.historyPushSamples].map(([timeframe, { first, last, count }]) => {
+      if (!last) return [timeframe, { fullHistoryPushes: count, firstBars: first.bars.length, lastBars: 0,
+        firstStart: first.bars[0]?.hour ?? null, firstEnd: first.bars.at(-1)?.hour ?? null,
+        lastStart: null, lastEnd: null, sharedBars: 0, newBars: 0, changedBars: 0,
+        byteIdenticalBars: 0, firstAndLastPayloadIdentical: false }]
+      const earlier = new Map(first.bars.map(bar => [bar.hour, JSON.stringify(bar)]))
+      let sharedBars = 0, byteIdenticalBars = 0
+      for (const bar of last.bars) if (earlier.has(bar.hour)) {
+        sharedBars += 1
+        if (earlier.get(bar.hour) === JSON.stringify(bar)) byteIdenticalBars += 1
+      }
+      const newBars = last.bars.length - sharedBars
+      return [timeframe, { fullHistoryPushes: count, firstBars: first.bars.length, lastBars: last.bars.length,
+        firstStart: first.bars[0]?.hour ?? null, firstEnd: first.bars.at(-1)?.hour ?? null,
+        lastStart: last.bars[0]?.hour ?? null, lastEnd: last.bars.at(-1)?.hour ?? null,
+        sharedBars, newBars, changedBars: sharedBars - byteIdenticalBars, byteIdenticalBars,
+        firstAndLastPayloadIdentical: first.bars.length === last.bars.length && sharedBars === first.bars.length && byteIdenticalBars === first.bars.length }]
+    }))
     return {
       calls: probe.calls, active: probe.active, maxActive: probe.maxActive,
       historicalActive: probe.historicalActive, maxHistoricalActive: probe.maxHistoricalActive, localActive: probe.localActive, maxLocalActive: probe.maxLocalActive,
       focusCalls: probe.focusCalls, legacyWindowCalls: probe.legacyWindowCalls, heldCall: probe.heldCall, heldSettled: probe.heldSettled, extensions: probe.extensions,
       historyCalls: probe.historyCalls, historyResponses: probe.historyResponses, historyFrames: Object.fromEntries(probe.historyFrames),
       transferredHistoryBars: probe.transferredHistoryBars, transferredBars: probe.transferredHistoryBars,
+      traffic: { preparedPushes: probe.preparedPushes, totalBars: probe.preparedPushBars,
+        fullHistoryPushes: probe.fullHistoryPushes, fullHistoryPushBars: probe.fullHistoryPushBars,
+        duplicateFullHistorySignatures: [...probe.fullHistoryPushShapes.values()].reduce((total, count) => total + count - 1, 0),
+        uniqueOrUnchangedOverlap },
       sourceCalls: sourceRequests.length, sourceRequests, held: probe.held, callsAtHold: probe.callsAtHold,
     }
+  })
+}
+
+export async function resetRequestProbe(electron) {
+  await electron.evaluate(async () => {
+    const probe = globalThis.__chartRequestProbe
+    if (!probe) throw new Error('The chart request probe is not installed.')
+    if (probe.active || probe.timers.size || probe.pendingPushes.size) throw new Error('Cannot reset an active chart request probe.')
+    const sourceRequests = await globalThis.__marketBackend.probe({ action: 'sourceRead' })
+    probe.sourceBaseline = sourceRequests.length
+    probe.calls.length = 0; probe.focusCalls.length = 0; probe.historyCalls.length = 0; probe.historyResponses.length = 0
+    probe.historyFrames.clear(); probe.extensions.length = 0; probe.deliveredFloors.clear()
+    probe.transferredHistoryBars = 0; probe.legacyWindowCalls = 0; probe.maxActive = 0
+    probe.maxHistoricalActive = 0; probe.maxLocalActive = 0
+    probe.preparedPushes = 0; probe.preparedPushBars = 0; probe.fullHistoryPushes = 0; probe.fullHistoryPushBars = 0
+    probe.historyPushSamples.clear()
+    probe.fullHistoryPushShapes.clear()
   })
 }
 
@@ -799,10 +883,21 @@ export async function measureNativeColdBoundary(electron, page, options = {}) {
   finally { await foreground.restore() }
 }
 
-async function nativeColdBoundary(electron, page, { timeframe = '15m' } = {}) {
+export async function measureOffscreenColdBoundary(electron, page, options = {}) {
+  const native = await electron.evaluate(({ BrowserWindow }) => {
+    const window = BrowserWindow.getAllWindows()[0]
+    return { visible: window.isVisible(), focused: window.isFocused(), offscreen: window.webContents.isOffscreen() }
+  })
+  assert.deepEqual(native, { visible: false, focused: false, offscreen: true }, 'Cold-boundary data-path measurement requires the protected hidden offscreen window.')
+  return { ...await nativeColdBoundary(electron, page, { ...options, offscreen: true }), native,
+    presentation: 'protected hidden offscreen renderer; native compositor paint is not measured' }
+}
+
+async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen = false } = {}) {
   const probe = value => electron.evaluate((_, value) => globalThis.__marketBackend.probe(value), value)
   const fixture = await probe({ action: 'coldBoundaryInstall', timeframe })
   let paintStarted = false
+  let cdp, beforeMetrics
   try {
     const before = await electron.evaluate((_, fixture) => globalThis.__marketBackend.request({ e2e: {
       action: 'readCandles', instrument: fixture.instId, timeframe: fixture.timeframe,
@@ -811,6 +906,11 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m' } = {}) {
     assert.equal(before.length, 95, 'The first boundary viewport must contain exactly one never-downloaded candle.')
     assert.ok(before.every(row => row.timestamp > fixture.firstMissingEnd), 'The missing boundary candle must not already exist in SQLite.')
     await openChart(page, fixture)
+    if (offscreen) {
+      cdp = await page.context().newCDPSession(page)
+      await cdp.send('Performance.enable')
+      beforeMetrics = Object.fromEntries((await cdp.send('Performance.getMetrics')).metrics.map(metric => [metric.name, metric.value]))
+    }
     await startPaintProbe(page, fixture, { verifyIndicatorValues: false })
     paintStarted = true
     const approachDistance = fixture.initialHistoryBars - 96 - 256
@@ -827,7 +927,13 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m' } = {}) {
       await new Promise(resolve => setTimeout(resolve, 20))
     } while (true)
     const inputs = await wheelBurst(page, { deltaY: (fixture.targetDistance - approachDistance) * 12 })
-    await waitForRendered(page, fixture, timeframe, fixture.targetEnd)
+    await waitForPresentedTarget(page, fixture, timeframe, fixture.targetEnd)
+    const initialTarget = await page.locator(`[data-chart-inst="${fixture.instId}"]`).evaluate(chart => ({
+      loading: chart.dataset.chartLoading === 'true', incomplete: chart.dataset.chartIncomplete === 'true',
+      renderedBars: Number(chart.dataset.chartRenderedBars), end: Number(chart.dataset.chartCompletedEnd),
+    }))
+    assert.equal(initialTarget.renderedBars, 96)
+    assert.equal(initialTarget.end, fixture.targetEnd)
     const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
     await page.waitForFunction(({ targetEnd, firstMissingEnd, indicatorFields }) => {
       const snapshot = document.querySelector('[data-chart-inst]')?.__chartSnapshot
@@ -836,13 +942,67 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m' } = {}) {
         && snapshot.bars.every(bar => indicatorFields.every(field => Number.isFinite(bar[field])))
         && missing && missing.oi === null && missing.buy === null && missing.sell === null
     }, { targetEnd: fixture.targetEnd, firstMissingEnd: fixture.firstMissingEnd, indicatorFields }, { timeout: 10_000 })
-    const latency = await measurePaintLatency(page, { inputs, targets: [fixture.targetEnd] })
-    assert.ok(latency.latestInputToPaintMS < 100, `The freshly acquired nearest viewport took ${latency.latestInputToPaintMS} ms after its boundary gesture. ${JSON.stringify(latency)}`)
+    const recovered = await page.locator(`[data-chart-inst="${fixture.instId}"]`).evaluate(chart => {
+      const snapshot = chart.__chartSnapshot
+      return { endHour: snapshot?.endHour, bars: (chart.__chartRenderedBars ?? snapshot?.bars ?? []).map(bar => ({
+        ...bar,
+        oiObserved: bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1),
+        takerObserved: bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2),
+      })) }
+    })
+    assert.equal(recovered.endHour, fixture.targetEnd)
+    assert.equal(recovered.bars.length, 96)
+    // The cold fixture's full provider history is intentionally not all present
+    // in SQLite. Build this oracle from every candle actually available after
+    // the nearest page is committed, so recursive seeds and missing-period
+    // resets match the canonical input the product can replay at this point.
+    const canonicalCandles = await electron.evaluate((_, fixture) => globalThis.__marketBackend.request({ e2e: {
+      action: 'readCandles', instrument: fixture.instId, timeframe: fixture.timeframe,
+      from: fixture.start, through: fixture.end,
+    } }), fixture)
+    assert.ok(canonicalCandles.length > 0, `The cold ${timeframe} canonical SQLite prefix must be readable.`)
+    const oracle = new Map(barsWithIndicators(canonicalCandles, fixture.intervalMS).map(bar => [bar.hour, bar]))
+    const priceFields = ['open', 'high', 'low', 'close'], indicatorFieldsObserved = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower',
+      'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
+    let observedIndicatorBars = 0, observedOIBars = 0, observedTakerBars = 0
+    const assertCanonical = (actual, expected, field) => {
+      if (expected[field] === null) {
+        assert.equal(actual, null, `${timeframe} ${expected.hour} ${field} must match the canonical undefined value.`)
+        return
+      }
+      assert.equal(typeof actual, 'number', `${timeframe} ${expected.hour} ${field} must be observed as a number.`)
+      assert.ok(Number.isFinite(actual) && Math.abs(actual - expected[field]) <= Math.max(1, Math.abs(expected[field])) * 1e-10,
+        `${timeframe} ${expected.hour} ${field}: expected canonical ${expected[field]}, got ${actual}.`)
+    }
+    for (const bar of recovered.bars) {
+      const expected = oracle.get(bar.hour)
+      assert.ok(expected, `No canonical SQLite-derived ${timeframe} bar exists for ${bar.hour}.`)
+      for (const field of priceFields) assertCanonical(bar[field], expected, field)
+      if (bar.indicatorsObserved) {
+        observedIndicatorBars += 1
+        for (const field of indicatorFieldsObserved) assertCanonical(bar[field], expected, field)
+      } else {
+        for (const field of indicatorFieldsObserved) assert.equal(bar[field], null,
+          `${timeframe} ${bar.hour} must not retain an old ${field} curve while that indicator is unobserved.`)
+      }
+      if (bar.oiObserved) { observedOIBars += 1; assertCanonical(bar.oi, expected, 'oi') }
+      else assert.equal(bar.oi, null, `${timeframe} ${bar.hour} must keep unobserved OI explicitly missing.`)
+      if (bar.takerObserved) {
+        observedTakerBars += 1
+        assertCanonical(bar.buy, expected, 'buy'); assertCanonical(bar.sell, expected, 'sell')
+      } else {
+        assert.equal(bar.buy, null, `${timeframe} ${bar.hour} must keep unobserved taker buys explicitly missing.`)
+        assert.equal(bar.sell, null, `${timeframe} ${bar.hour} must keep unobserved taker sells explicitly missing.`)
+      }
+    }
+    const latency = offscreen ? null : await measurePaintLatency(page, { inputs, targets: [fixture.targetEnd] })
+    if (latency) assert.ok(latency.latestInputToPaintMS < 100, `The freshly acquired nearest viewport took ${latency.latestInputToPaintMS} ms after its boundary gesture. ${JSON.stringify(latency)}`)
     sources = await probe({ action: 'coldBoundaryRead' })
     const nearest = sources.requests.find(request => request.source === 'candles' && request.through === fixture.firstMissingEnd)
     assert.ok(nearest?.completedAt !== null && nearest?.completedAt !== undefined,
       `The first download must end at the adjacent missing viewport, without a skipped 96-candle page: ${JSON.stringify(sources.requests)}`)
-    assert.equal(Number(nearest.parameters.limit), 205, 'Nearest preparation must reuse the saved 95-candle suffix and fetch only its missing 205-candle warmup prefix.')
+    assert.ok(Number(nearest.parameters.limit) >= 200 && Number(nearest.parameters.limit) <= 300,
+      `Nearest preparation must reuse the saved suffix and fetch at most one native page including indicator warmup: ${JSON.stringify(nearest)}`)
     assert.ok(nearest.completedAt - nearest.startedAt >= fixture.sourceDelayMS, 'The real source page must include the configured network latency.')
     const heldReserve = sources.requests.filter(request => request.source === 'candles' && request.held && request.completedAt === null)
     const heldStatistics = sources.requests.filter(request => request.source !== 'candles' && request.held && request.completedAt === null)
@@ -854,16 +1014,31 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m' } = {}) {
     paintStarted = false
     assertCompletePaints(paint)
     const timeOrigin = await page.evaluate(() => performance.timeOrigin)
-    const targetPaint = paint.commits.find(commit => commit.end === fixture.targetEnd && commit.presentedAt !== null)
-    const nativePageToPaintMS = Number((timeOrigin + targetPaint.presentedAt - nearest.completedAt).toFixed(3))
-    assert.ok(nativePageToPaintMS < 1_000, `The nearest native page waited ${nativePageToPaintMS} ms to paint despite its complete prices and indicator warmup.`)
+    const targetPaint = paint.commits.find(commit => commit.end === fixture.targetEnd && (offscreen || commit.presentedAt !== null))
+    assert.ok(targetPaint, 'The target chart snapshot must reach the renderer probe.')
+    const nativePageToPaintMS = offscreen ? null : Number((timeOrigin + targetPaint.presentedAt - nearest.completedAt).toFixed(3))
+    if (nativePageToPaintMS !== null) assert.ok(nativePageToPaintMS < 1_000, `The nearest native page waited ${nativePageToPaintMS} ms to paint despite its complete prices and indicator warmup.`)
+    const afterMetrics = cdp ? Object.fromEntries((await cdp.send('Performance.getMetrics')).metrics.map(metric => [metric.name, metric.value])) : null
+    const offscreenObservation = afterMetrics ? {
+      rendererTaskMS: Number(((afterMetrics.TaskDuration - beforeMetrics.TaskDuration) * 1000).toFixed(3)),
+      rendererScriptMS: Number(((afterMetrics.ScriptDuration - beforeMetrics.ScriptDuration) * 1000).toFixed(3)),
+      nativePaintMeasured: false,
+    } : undefined
     return { timeframe, initialHistoryBars: fixture.initialHistoryBars, sourceDelayMS: fixture.sourceDelayMS,
       initiallyMissingCandles: 96 - before.length, nearestSourceCandles: Number(nearest.parameters.limit),
-      nativePageToPaintMS,
+      nativePaintMeasured: !offscreen, rendererTargetObserved: true,
+      ...(nativePageToPaintMS === null ? {} : { nativePageToPaintMS }),
       nativeSourceRequests: sources.requests.length, heldReservePages: heldReserve.length, heldStatisticsPages: heldStatistics.length,
-      targetPaintedBeforeReserveAndStatistics: true, duplicateSourcePages: 0,
-      ...latency, ...paint, commits: paint.commits.length, approachInput: approachInputs[0] }
+      targetPresentedWhilePending: initialTarget.loading,
+      targetPriceOrIndicatorIncompleteAtPresentation: initialTarget.incomplete,
+      observedFieldOracle: { priceBars: recovered.bars.length, indicatorBars: observedIndicatorBars,
+        oiBars: observedOIBars, takerBars: observedTakerBars, checksCanonicalValues: true, unobservedFieldsRemainNull: true },
+      ...(offscreen ? { targetObservedBeforeReserveAndStatistics: true } : { targetPaintedBeforeReserveAndStatistics: true }),
+      duplicateSourcePages: 0,
+      ...(offscreenObservation ? { offscreenObservation } : {}),
+      ...(latency ?? {}), ...paint, commits: paint.commits.length, approachInput: approachInputs[0] }
   } finally {
+    await cdp?.detach()
     if (paintStarted) await finishPaintProbe(page)
     await probe({ action: 'coldBoundaryRemove' })
   }

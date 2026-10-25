@@ -89,6 +89,33 @@ test('durable history hydrates once and cached scrolling commits synchronously w
   } finally { close(); context.mock.timers.reset() }
 })
 
+test('fractional navigation admits local neighbours once without moving the requested cursor or backend demand', async () => {
+  const tail = prepared(btc, 1199), bulk = prepared(btc, 1199, { bars: bars(1000, 200), revision: 2 })
+  const gate = deferred<PreparedChartResponse | null>(), demands: Array<ChartTarget | null> = []
+  let reads = 0
+  const store = new PreparedChartStore()
+  store.setUniverse([btc], '1H', btc)
+  store.ingestLatest(tail)
+  const controller = new ChartController(transport({ focus: target => { demands.push(target) },
+    history: async () => { reads += 1; return gate.promise } }), store)
+  const close = controller.open(btc, '1H')
+  try {
+    await settled()
+    const target = controller.getSnapshot().requested, focusCalls = demands.length
+    for (let input = 0; input < 32; input += 1) controller.prefetchAdjacent(-.25)
+    assert.equal(reads, 1)
+    assert.equal(controller.getSnapshot().requested, target)
+    assert.equal(controller.getSnapshot().presented?.endHour, 1199 * hour)
+    gate.resolve(bulk); await settled()
+    assert.equal(store.knownBars(btc, '1H', [1103 * hour])[0]?.hour, 1103 * hour)
+    controller.prefetchAdjacent(-.75)
+    controller.prefetchAdjacent(.25)
+    assert.equal(reads, 1, 'Known neighbours and the latest boundary cannot start another read.')
+    assert.equal(demands.length, focusCalls)
+    assert.equal(controller.getSnapshot().requested, target)
+  } finally { close() }
+})
+
 test('cached native period and instrument switches display synchronously while demand declares each selection', async () => {
   const demands: Array<ChartTarget | null> = []
   const frames = [nativePrepared(btc, 1199, '5m'), nativePrepared(btc, 1199, '15m'), nativePrepared(eth, 1199, '1H')]
@@ -123,18 +150,35 @@ test('uncached scroll declares current demand immediately and preserves calculat
   close()
 })
 
-test('raw historical prices cannot erase existing technical curves while backend calculation is pending', async () => {
+test('historical navigation presents its prices immediately while missing indicators remain explicit', async () => {
   const raw = prepared(btc, 599, { latestEnd: 1199 * hour, revision: 2, indicatorState: 'loading',
     bars: bars(504, 96).map(bar => ({ ...bar, indicatorsObserved: false, ema: null, vwap: null, bollUpper: null, bollMiddle: null, bollLower: null, roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, atrPercent: null, bbw: null })) })
   const controller = new ChartController(transport({ history: async () => raw }), cached())
-  const close = controller.open(btc, '1H'), original = controller.getSnapshot().presented
+  const close = controller.open(btc, '1H')
   controller.scroll(-600); await settled()
   assert.equal(controller.store.window(btc, '1H', 599 * hour)?.bars.length, 96)
-  assert.equal(controller.getSnapshot().presented, original)
+  assert.equal(controller.getSnapshot().presented?.endHour, 599 * hour)
+  assert.equal(controller.getSnapshot().presented?.indicatorState, 'loading')
+  assert.ok(controller.getSnapshot().presented?.bars.every(bar => bar.ema === null && !bar.indicatorsObserved))
   assert.equal(controller.getSnapshot().pending, true)
   controller.ingestPrepared(prepared(btc, 599, { latestEnd: 1199 * hour, revision: 3 }))
   assert.equal(controller.getSnapshot().presented?.endHour, 599 * hour)
   assert.equal(controller.getSnapshot().pending, false)
+  close()
+})
+
+test('a historical price gap does not hold navigation on the previous cursor or invent a candle', () => {
+  const controller = new ChartController(transport(), cached())
+  const close = controller.open(btc, '1H')
+  const missingHour = 550 * hour
+  controller.ingestPrepared(prepared(btc, 599, { latestEnd: 1199 * hour, revision: 2,
+    bars: bars(504, 96).filter(bar => bar.hour !== missingHour), priceState: 'partial' }))
+  controller.scroll(-600)
+  const view = controller.getSnapshot()
+  assert.equal(view.presented?.endHour, 599 * hour)
+  assert.equal(view.presented?.bars.length, 95)
+  assert.ok(view.presented?.bars.every(bar => bar.hour !== missingHour))
+  assert.equal(view.pending, true)
   close()
 })
 
