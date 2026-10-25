@@ -1,5 +1,6 @@
 import { randomUUID, createHash } from 'node:crypto'
 import { importOperationEvents } from './operations.js'
+import { MAX_OPERATION_BATCH_SIZE } from './operation-limits.js'
 import { registerOperationParticipant, claimExternalOperationParticipant, markExternalOperationSourceIncomplete, flushExternalOperationSource } from './operation-runtime.js'
 
 /** Trusted IPC source ownership and replay-safe durable batch acknowledgments. */
@@ -25,7 +26,7 @@ export function createRendererOperationReceiver({ register = registerOperationPa
     receive(owner, batch) {
       const source = sourceFor(owner, batch?.executionId)
       if (!batch || typeof batch.batchId !== 'string' || batch.batchId.length > 256 || !Array.isArray(batch.events)
-        || !batch.events.length || batch.events.length > 128 || !Number.isSafeInteger(batch.firstSequence)
+        || !batch.events.length || batch.events.length > MAX_OPERATION_BATCH_SIZE || !Number.isSafeInteger(batch.firstSequence)
         || batch.firstSequence !== batch.events[0]?.sequence
         || batch.events.some((event, index) => event?.executionId !== source.executionId || event.sessionId !== source.sessionId || event.sequence !== batch.firstSequence + index)) {
         throw new TypeError('Invalid renderer operation batch.')

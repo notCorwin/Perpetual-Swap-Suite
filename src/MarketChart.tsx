@@ -271,7 +271,9 @@ const PreparedPlot = memo(function PreparedPlot({ instId, timeframe, size, selec
   wheelFraction?: number
   navigationSurface?: ReadyChartWindow; presentedSurface?: ReadyChartWindow
 }) {
-  const latest = useSyncExternalStore(chartController.store.subscribe, () => chartController.store.window(instId, timeframe))
+  const subscribe = useCallback((listener: () => void) => chartController.store.subscribe(instId, timeframe, listener), [instId, timeframe])
+  const getSnapshot = useCallback(() => chartController.store.window(instId, timeframe), [instId, timeframe])
+  const latest = useSyncExternalStore(subscribe, getSnapshot)
   // The selected SVG and its parent legends publish one immutable frame.
   // Hidden candidates may consume new cache entries independently.
   const surface = navigationSurface ?? presentedSurface ?? latest

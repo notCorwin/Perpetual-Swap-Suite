@@ -1,5 +1,6 @@
 import { attachOperationJournalSink, beginOperation, configureOperationContext, recordOperation, runWithOperationContext,
   type OperationJournalEvent, type OperationSpan } from '../electron/services/operations.js'
+import { MAX_OPERATION_BATCH_SIZE } from '../electron/services/operation-limits.js'
 import type { OperationAcknowledgment, OperationBatch, OperationBridgeHooks, OperationSourceIdentity } from './desktop-contract.ts'
 
 type TelemetryHost = {
@@ -14,7 +15,7 @@ type TelemetryHost = {
   onStop?: (callback: () => Promise<void>) => () => void
 }
 
-const BATCH_SIZE = 128, FLUSH_MS = 250, MAX_PENDING = 8_192
+const FLUSH_THRESHOLD = 128, FLUSH_MS = 250, MAX_PENDING = 8_192
 
 /** Retain each lifecycle record until the main process acknowledges durable storage. */
 export async function initializeOperationTelemetry(host: TelemetryHost = {
@@ -81,7 +82,9 @@ export async function initializeOperationTelemetry(host: TelemetryHost = {
     if (!finalBatches) {
       finalBatches = batch ? [batch] : []
       const offset = batch?.events.length ?? 0
-      for (let index = offset; index < pending.length; index += BATCH_SIZE) finalBatches.push(createBatch(pending.slice(index, index + BATCH_SIZE)))
+      for (let index = offset; index < pending.length; index += MAX_OPERATION_BATCH_SIZE) {
+        finalBatches.push(createBatch(pending.slice(index, index + MAX_OPERATION_BATCH_SIZE)))
+      }
     }
     finalBatches = finalBatches.filter(value => pending.some(event => event.sequence === value.firstSequence))
     // Submit every retained batch synchronously, including an immutable replay of
@@ -106,7 +109,7 @@ export async function initializeOperationTelemetry(host: TelemetryHost = {
     if (flushing) return flushing
     flushing = (async () => {
       while (pending.length && !stopped) {
-        const sent = batch ??= createBatch(pending.slice(0, BATCH_SIZE))
+        const sent = batch ??= createBatch(pending.slice(0, MAX_OPERATION_BATCH_SIZE))
         acknowledge(sent, await host.recordOperations(sent))
       }
       await assertComplete()
@@ -159,7 +162,7 @@ export async function initializeOperationTelemetry(host: TelemetryHost = {
   unsubscribe = attachOperationJournalSink(event => {
     if (failedSource || pending.length >= MAX_PENDING) { failedSource = true; omitted++; return }
     pending.push(event)
-    if (!stopped && pending.length >= BATCH_SIZE) void flush().catch(schedule)
+    if (!stopped && pending.length >= FLUSH_THRESHOLD) void flush().catch(schedule)
     else schedule()
   })
   for (const type of ['longtask', 'long-animation-frame']) {

@@ -210,7 +210,7 @@ test('reordered blocks can fill old ranges without overwriting newer observation
 test('unchanged and distant blocks preserve memoized window identity and frozen data', () => {
   const store = new PreparedChartStore()
   let notifications = 0
-  const unsubscribe = store.subscribe(() => { notifications += 1 })
+  const unsubscribe = store.subscribe(instId, '1H', () => { notifications += 1 })
   const incoming = bars(0, 96)
   store.ingest(response(incoming))
   const first = store.window(instId, '1H')!
@@ -228,6 +228,143 @@ test('unchanged and distant blocks preserve memoized window identity and frozen 
   unsubscribe()
   store.ingest(response(bars(500, 96), { revision: 5 }))
   assert.equal(notifications, 4)
+})
+
+test('series subscriptions notify the changed instrument and timeframe after each mutation', () => {
+  const store = new PreparedChartStore()
+  const eth = 'ETH-USDT-SWAP'
+  const fiveMinutes = 5 * 60_000
+  store.setUniverse([instId, eth], '1H')
+  store.ingest(response(bars(0, 200), { latestEnd: 199 * hour }))
+  store.ingestLatest(response(bars(104, 96), { instId: eth }))
+  store.ingestLatest(response(bars(104, 96, fiveMinutes), { timeframe: '5m', intervalMS: fiveMinutes }))
+
+  const notifications: string[] = []
+  let latest = store.window(instId, '1H')
+  let historical = store.window(instId, '1H', 95 * hour)
+  let otherInstrument = store.window(eth, '1H')
+  let otherTimeframe = store.window(instId, '5m')
+  const unsubscribe = [
+    store.subscribe(instId, '1H', () => {
+      notifications.push(`${instId}:1H`)
+      latest = store.window(instId, '1H')
+      historical = store.window(instId, '1H', 95 * hour)
+    }),
+    store.subscribe(eth, '1H', () => {
+      notifications.push(`${eth}:1H`)
+      otherInstrument = store.window(eth, '1H')
+    }),
+    store.subscribe(instId, '5m', () => {
+      notifications.push(`${instId}:5m`)
+      otherTimeframe = store.window(instId, '5m')
+    }),
+  ]
+  const expectOnly = (key: string) => {
+    assert.deepEqual(notifications, [key])
+    notifications.length = 0
+  }
+
+  const revised = bars(104, 96).map((value, index) => index === 95 ? { ...value, close: 110, high: 111 } : value)
+  assert.equal(store.ingestLatest(response(revised, { revision: 2 })), true)
+  expectOnly(`${instId}:1H`)
+  assert.equal(latest, store.window(instId, '1H'))
+  assert.equal(latest?.bars.at(-1)?.close, 110)
+  assert.equal(otherInstrument, store.window(eth, '1H'))
+  assert.equal(otherTimeframe, store.window(instId, '5m'))
+
+  assert.equal(store.ingestLive({ type: 'live', instId, timeframe: '1H', generation: 1, revision: 3, endHour: 199 * hour,
+    liveBar: { ...bar(200), confirmed: false }, realtimeState: 'live' }), true)
+  expectOnly(`${instId}:1H`)
+  assert.equal(latest?.liveBar?.hour, 200 * hour)
+  assert.equal(latest, store.window(instId, '1H'))
+
+  assert.equal(store.ingest(response([bar(50, hour, { close: 105, high: 106 })], { revision: 4, endHour: 50 * hour, latestEnd: 199 * hour })), true)
+  expectOnly(`${instId}:1H`)
+  assert.equal(historical, store.window(instId, '1H', 95 * hour))
+  assert.equal(historical?.bars[50]?.close, 105)
+
+  assert.equal(store.ingestLatest(response(bars(104, 96), { revision: 5, sourceVersions: { price: 5, oi: 2, taker: 3 }, priceAsOf: 199 * hour })), true)
+  expectOnly(`${instId}:1H`)
+  assert.deepEqual(latest?.sourceVersions, { price: 5, oi: 2, taker: 3 })
+  assert.equal(latest, store.window(instId, '1H'))
+
+  assert.equal(store.ingestLatest(response(bars(104, 96).map(value => ({ ...value, close: 120, high: 121 })), { generation: 2, revision: 1 })), true)
+  expectOnly(`${instId}:1H`)
+  assert.equal(latest?.generation, 2)
+  assert.equal(latest, store.window(instId, '1H'))
+
+  assert.equal(store.ingestLatest(response(bars(104, 96, fiveMinutes), { timeframe: '5m', intervalMS: fiveMinutes, revision: 2 })), true)
+  expectOnly(`${instId}:5m`)
+  assert.equal(otherTimeframe, store.window(instId, '5m'))
+  assert.equal(otherInstrument, store.window(eth, '1H'))
+
+  unsubscribe[2]()
+  assert.equal(store.ingestLatest(response(bars(104, 96, fiveMinutes), { timeframe: '5m', intervalMS: fiveMinutes, revision: 3 })), true)
+  assert.deepEqual(notifications, [])
+  unsubscribe[0]()
+  unsubscribe[1]()
+})
+
+test('byte eviction and universe cleanup notify subscribers whose readable window disappears', () => {
+  const eth = 'ETH-USDT-SWAP'
+  const completed = bars(0, 96)
+  const oneSeriesBytes = completed.reduce((total, value) => total + JSON.stringify(value).length * 2, 0)
+  const pressured = new PreparedChartStore({ maxBytes: oneSeriesBytes })
+  pressured.ingest(response(completed, { instId: eth }))
+  let evictedWindow = pressured.window(eth, '1H')
+  const evictions: string[] = []
+  const unsubscribeEviction = pressured.subscribe(eth, '1H', () => {
+    evictions.push(eth)
+    evictedWindow = pressured.window(eth, '1H')
+  })
+  assert.equal(pressured.ingest(response(completed, { instId })), true)
+  assert.deepEqual(evictions, [eth])
+  assert.equal(evictedWindow, null, 'The eviction callback observes that the other series no longer has a readable history window.')
+  assert.ok(pressured.window(instId, '1H'), 'The incoming series remains readable within the same byte budget.')
+  unsubscribeEviction()
+
+  const store = new PreparedChartStore()
+  store.setUniverse([instId, eth], '1H')
+  store.ingestLatest(response(bars(104, 96)))
+  store.ingestLatest(response(bars(104, 96), { instId: eth }))
+  let removedWindow = store.window(instId, '1H')
+  let retainedWindow = store.window(eth, '1H')
+  const changes: string[] = []
+  const unsubscribeRemoved = store.subscribe(instId, '1H', () => {
+    changes.push(instId)
+    removedWindow = store.window(instId, '1H')
+  })
+  const unsubscribeRetained = store.subscribe(eth, '1H', () => {
+    changes.push(eth)
+    retainedWindow = store.window(eth, '1H')
+  })
+  store.setUniverse([eth], '1H')
+  assert.deepEqual(changes, [instId])
+  assert.equal(removedWindow, null, 'Dropping a candidate releases its latest frame and notifies its mounted plot.')
+  assert.equal(retainedWindow, store.window(eth, '1H'))
+  unsubscribeRemoved()
+  unsubscribeRetained()
+})
+
+test('source status changes notify the series after its window reflects the new status', () => {
+  const store = new PreparedChartStore()
+  store.setUniverse([instId], '1H')
+  const withoutOi = bars(104, 96).map(value => ({ ...value, oi: null, oiObserved: false, statisticsObserved: false, statisticsSources: 0 }))
+  assert.equal(store.ingestLatest(response(withoutOi, { oiState: 'loading' })), true)
+  let snapshot = store.window(instId, '1H')
+  const notifications: string[] = []
+  const unsubscribe = store.subscribe(instId, '1H', () => {
+    notifications.push(instId)
+    snapshot = store.window(instId, '1H')
+  })
+
+  const oiStatus = { state: 'error' as const, from: 104 * hour, through: 199 * hour, error: 'Open interest source offline', retryAt: 123_456 }
+  assert.equal(store.ingestLatest(response(withoutOi, { revision: 2, oiState: 'error', oiStatus })), true)
+  assert.deepEqual(notifications, [instId])
+  assert.equal(snapshot?.oiState, 'error')
+  assert.equal(snapshot?.oiStatus?.error, oiStatus.error)
+  assert.equal(snapshot, store.window(instId, '1H'))
+  unsubscribe()
 })
 
 test('live data stays separate from confirmed windows and never leaks into historical presentation', () => {

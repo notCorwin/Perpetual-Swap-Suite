@@ -3,6 +3,7 @@ import test from 'node:test'
 import { barsWithIndicators, buildIndicatorSeries, projectIndicatorCandle } from '../electron/services/indicators.js'
 import { createLiquidityEvaluator, type LiquidityInput } from '../electron/services/liquidity.js'
 import { attachOperationSink, measureOperation, type OperationEvent, type OperationJournalEvent } from '../electron/services/operations.js'
+import { MAX_OPERATION_BATCH_SIZE } from '../electron/services/operation-limits.js'
 import { createChartGeometryCache } from './chart-geometry.ts'
 import { initializeOperationTelemetry } from './operation-telemetry.ts'
 import type { OperationBatch, OperationBridgeHooks, OperationSourceIdentity } from './desktop-contract.ts'
@@ -137,6 +138,29 @@ test('renderer retains lifecycle records until acknowledgment and retries the sa
   assert.equal(harness.timers.size, 0)
 })
 
+test('renderer drains sustained backlog in large durable batches after a delayed acknowledgment', async () => {
+  const harness = telemetryHost(), stop = await initializeOperationTelemetry(harness.host)
+  try {
+    harness.holdNext()
+    for (let index = 0; index < 3_200; index++) measureOperation({ category: 'cpu', name: 'fixture.sustained' }, () => index)
+    assert.equal(harness.attempts.length, 1, 'The 128-record trigger submits one batch while its ACK is held.')
+    assert.equal(harness.attempts[0].events.length, 128)
+
+    harness.release()
+    await harness.flush()
+    const sizes = harness.batches.map(value => value.events.length)
+    assert.deepEqual(sizes, [128, ...Array(6).fill(MAX_OPERATION_BATCH_SIZE), 128])
+    assert.ok(sizes.every(size => size > 0 && size <= MAX_OPERATION_BATCH_SIZE))
+    assert.equal(new Set(harness.batches.map(value => value.batchId)).size, harness.batches.length)
+    const records = harness.batches.flatMap(value => value.events)
+    assert.equal(records.length, 6_400)
+    const firstSequence = records[0].sequence
+    assert.deepEqual(records.map(value => value.sequence), Array.from({ length: 6_400 }, (_, index) => firstSequence + index))
+    assert.equal(new Set(records.map(value => `${value.id}:${value.phase}`)).size, records.length)
+    assert.equal(harness.failures.length, 0, 'A drain below the unchanged 8192-record cap does not poison the source.')
+  } finally { await stop() }
+})
+
 test('leaving a renderer submits cancelled requests before an earlier durable ACK can resume the document', async () => {
   const harness = telemetryHost(), persisted = new Map<number, OperationJournalEvent>()
   let tail = Promise.resolve(), release: (() => void) | undefined, first = true
@@ -183,6 +207,45 @@ test('leaving a renderer submits cancelled requests before an earlier durable AC
       assert.equal(requests.filter(event => event.id === start.id && event.phase === 'end' && event.status === 'cancelled').length, 1)
     }
     assert.equal(harness.timers.size, 0)
+  } finally { release?.(); await stop() }
+})
+
+test('renderer final handoff replays the active batch and submits ordered batches up to the shared maximum', async () => {
+  const harness = telemetryHost(), persisted = new Map<number, OperationJournalEvent>()
+  let tail = Promise.resolve(), release: (() => void) | undefined, first = true
+  const recordOperations = (batch: OperationBatch) => {
+    harness.attempts.push(structuredClone(batch))
+    const task = tail.then(async () => {
+      if (first) { first = false; await new Promise<void>(resolve => { release = resolve }) }
+      for (const event of batch.events) {
+        const previous = persisted.get(event.sequence)
+        if (previous) assert.deepEqual(event, previous, 'The close-fence replay keeps the original immutable records.')
+        else persisted.set(event.sequence, event)
+      }
+      return { batchId: batch.batchId, lastSequence: batch.events.at(-1)!.sequence }
+    })
+    tail = task.then(() => {}, () => {})
+    return task
+  }
+  const stop = await initializeOperationTelemetry({ ...harness.host, recordOperations })
+  try {
+    for (let index = 0; index < 3_200; index++) measureOperation({ category: 'cpu', name: 'fixture.final-backlog' }, () => index)
+    assert.equal(harness.attempts.length, 1)
+    assert.equal(harness.attempts[0].events.length, 128)
+    let completed = false
+    const detached = harness.detach().finally(() => { completed = true })
+    await Promise.resolve()
+    assert.deepEqual(harness.attempts.map(value => value.events.length), [128, 128, ...Array(6).fill(MAX_OPERATION_BATCH_SIZE), 128])
+    assert.deepEqual(harness.attempts[1], harness.attempts[0], 'Final handoff resubmits the in-flight batch ID and sequence range.')
+    assert.equal(persisted.size, 0, 'No batch is durable before the held ACK releases.')
+    assert.equal(completed, false)
+    release!()
+    await detached
+    const records = [...persisted.values()]
+    assert.equal(records.length, 6_400)
+    const firstSequence = records[0].sequence
+    assert.deepEqual(records.map(value => value.sequence), Array.from({ length: 6_400 }, (_, index) => firstSequence + index))
+    assert.equal(harness.failures.length, 0)
   } finally { release?.(); await stop() }
 })
 

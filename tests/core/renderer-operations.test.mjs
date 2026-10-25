@@ -3,6 +3,7 @@ import test from 'node:test'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { createRendererOperationReceiver } from '../../electron/services/renderer-operations.js'
+import { MAX_OPERATION_BATCH_SIZE } from '../../electron/services/operation-limits.js'
 import { attachOperationJournalSink, registerOperationImportSource } from '../../electron/services/operations.js'
 
 test('renderer batches preserve source IDs and only acknowledge durable, replay-safe contiguous records', async () => {
@@ -72,4 +73,26 @@ test('renderer omission high-water marks survive lost acknowledgments without du
   receiver.fail(20, zero)
   receiver.fail(20, zero)
   assert.deepEqual(losses.map(value => value.omitted), [208, 2, 0], 'A zero-omission source failure is recorded once.')
+})
+
+test('renderer receiver accepts the shared maximum batch size and rejects larger batches', async () => {
+  const imported = []
+  const receiver = createRendererOperationReceiver({
+    register: () => ({ id: 'batch-limit-participant' }),
+    claim: (_, executionId) => ({ executionId, sessionId: 'batch-limit-session' }),
+    importEvents: events => { imported.push(events.length); return { accepted: events.length, duplicates: 0, rejected: 0 } },
+    flush: async () => {},
+  })
+  const owner = 23, source = receiver.initialize(owner, 'batch-limit-source')
+  const events = (first, count) => Array.from({ length: count }, (_, index) => ({ executionId: source.executionId,
+    sessionId: source.sessionId, sequence: first + index }))
+  const maximum = { executionId: source.executionId, batchId: 'max-batch', firstSequence: 1,
+    events: events(1, MAX_OPERATION_BATCH_SIZE) }
+  assert.deepEqual(await receiver.receive(owner, maximum), { batchId: 'max-batch', lastSequence: MAX_OPERATION_BATCH_SIZE })
+  assert.deepEqual(imported, [MAX_OPERATION_BATCH_SIZE])
+
+  const oversized = { executionId: source.executionId, batchId: 'oversized-batch', firstSequence: MAX_OPERATION_BATCH_SIZE + 1,
+    events: events(MAX_OPERATION_BATCH_SIZE + 1, MAX_OPERATION_BATCH_SIZE + 1) }
+  assert.throws(() => receiver.receive(owner, oversized), /Invalid renderer operation batch/)
+  assert.deepEqual(imported, [MAX_OPERATION_BATCH_SIZE], 'Rejected batches never reach event import or durable flush.')
 })

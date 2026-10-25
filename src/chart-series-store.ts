@@ -190,7 +190,10 @@ export class PreparedChartStore {
   private readonly byteSizes = new WeakMap<object, number>()
   private seriesBytes = 0
   private latestBytes = 0
-  private readonly listeners = new Set<() => void>()
+  private readonly listeners = new Map<string, Set<() => void>>()
+  private readonly changedKeys = new Set<string>()
+  private mutationDepth = 0
+  private notifying = false
   private readonly maxSeries: number
   private readonly maxBarsPerSeries: number
   private readonly maxWindowsPerSeries: number
@@ -210,6 +213,7 @@ export class PreparedChartStore {
     this.seriesBytes += (entry?.byteSize ?? 0) - (this.series.get(key)?.byteSize ?? 0)
     if (entry) this.series.set(key, entry)
     else this.series.delete(key)
+    this.markChanged(key)
   }
 
   private setLatestFrame(key: string, value: { meta: PreparedChartMeta; window: ReadyChartWindow } | null) {
@@ -222,6 +226,7 @@ export class PreparedChartStore {
     }
     if (value) this.latestFrames.set(key, value)
     else this.latestFrames.delete(key)
+    if (previous?.window !== value?.window || previous?.meta !== value?.meta) this.markChanged(key)
   }
 
   private setSeriesBar(entry: Series, hour: number, value: CachedBar | null) {
@@ -231,6 +236,7 @@ export class PreparedChartStore {
     this.seriesBytes += delta
     if (value) entry.bars.set(hour, value)
     else entry.bars.delete(hour)
+    this.markChanged(entry.meta.key)
   }
 
   private access(key: string): Series | undefined {
@@ -239,9 +245,51 @@ export class PreparedChartStore {
     return entry
   }
 
-  readonly subscribe = (listener: () => void) => {
-    this.listeners.add(listener)
-    return () => { this.listeners.delete(listener) }
+  private markChanged(key: string) {
+    this.changedKeys.add(key)
+  }
+
+  private mutate<T>(operation: () => T): T {
+    this.mutationDepth += 1
+    try {
+      return operation()
+    } finally {
+      this.mutationDepth -= 1
+      if (this.mutationDepth === 0) this.flushChanges()
+    }
+  }
+
+  private flushChanges() {
+    if (this.notifying || this.mutationDepth > 0) return
+    this.notifying = true
+    let failure: unknown
+    let failed = false
+    try {
+      while (this.changedKeys.size) {
+        const keys = [...this.changedKeys]
+        this.changedKeys.clear()
+        for (const key of keys) for (const listener of [...this.listeners.get(key) ?? []]) {
+          try { listener() } catch (error) { if (!failed) { failed = true; failure = error } }
+        }
+      }
+    } finally {
+      this.notifying = false
+    }
+    if (failed) throw failure
+  }
+
+  readonly subscribe = (instId: string, timeframe: RadarTimeframe, listener: () => void) => {
+    const key = keyFor(instId, timeframe)
+    let listeners = this.listeners.get(key)
+    if (!listeners) this.listeners.set(key, listeners = new Set())
+    listeners.add(listener)
+    let subscribed = true
+    return () => {
+      if (!subscribed) return
+      subscribed = false
+      listeners!.delete(listener)
+      if (listeners!.size === 0 && this.listeners.get(key) === listeners) this.listeners.delete(key)
+    }
   }
 
   get size() { return this.series.size }
@@ -262,16 +310,18 @@ export class PreparedChartStore {
 
   /** Compact latest frames belong to navigation candidates, independently of the history LRU. */
   setUniverse(instIds: readonly string[], _timeframe: RadarTimeframe, focusInstId?: string) {
-    if (focusInstId) this.focusKey = keyFor(focusInstId, _timeframe)
-    this.renderedUniverse = new Set(instIds.map(instId => keyFor(instId, _timeframe)))
-    this.universe = new Set([...instIds, ...(focusInstId ? [focusInstId] : [])].flatMap(instId => RADAR_TIMEFRAMES.map(({ value }) => keyFor(instId, value))))
-    for (const key of this.latestFrames.keys()) if (!this.universe.has(key)) this.setLatestFrame(key, null)
-    for (const [key, entry] of this.series) {
-      if (!this.universe.has(key) || this.latestFrame(key) || entry.meta.latestEnd === null) continue
-      const window = this.seriesWindow(entry, entry.meta.latestEnd)
-      if (window) this.setLatestFrame(key, { meta: entry.meta, window })
-    }
-    this.trimBytes()
+    this.mutate(() => {
+      if (focusInstId) this.focusKey = keyFor(focusInstId, _timeframe)
+      this.renderedUniverse = new Set(instIds.map(instId => keyFor(instId, _timeframe)))
+      this.universe = new Set([...instIds, ...(focusInstId ? [focusInstId] : [])].flatMap(instId => RADAR_TIMEFRAMES.map(({ value }) => keyFor(instId, value))))
+      for (const key of this.latestFrames.keys()) if (!this.universe.has(key)) this.setLatestFrame(key, null)
+      for (const [key, entry] of this.series) {
+        if (!this.universe.has(key) || this.latestFrame(key) || entry.meta.latestEnd === null) continue
+        const window = this.seriesWindow(entry, entry.meta.latestEnd)
+        if (window) this.setLatestFrame(key, { meta: entry.meta, window })
+      }
+      this.trimBytes()
+    })
   }
 
   private acceptGeneration(key: string, generation: number) {
@@ -283,183 +333,190 @@ export class PreparedChartStore {
       // Keep bounded old bar slots solely to merge independent statistics when
       // this generation's prices arrive. Read paths reject their old provenance.
     }
+    if (generation !== known) this.markChanged(key)
     this.generations.set(key, generation)
     return true
   }
 
   /** Latest-ready notifications never allocate a deep-history cache entry. */
   ingestLive(update: PreparedChartLiveUpdate): boolean {
-    const key = keyFor(update.instId, update.timeframe), previous = this.latestFrames.get(key)
-    if (!this.universe.has(key) || !previous || update.generation !== this.generations.get(key) || update.generation !== previous.meta.generation
-      || !Number.isSafeInteger(update.revision) || update.revision < previous.meta.revision || update.endHour !== previous.window.endHour) return false
-    const incoming = update.liveBar
-    if (incoming !== null && (incoming.confirmed || !validPrice(incoming) || !Number.isSafeInteger(incoming.hour)
-      || incoming.hour % previous.meta.intervalMS !== 0 || incoming.hour <= update.endHour)) return false
-    const liveBar = incoming === null ? undefined : sameBar(previous.window.liveBar, incoming) ? previous.window.liveBar : Object.freeze({ ...incoming })
-    const meta = Object.freeze({ ...previous.meta, revision: update.revision, priceState: update.priceState ?? previous.meta.priceState, priceObservedAt: update.priceObservedAt ?? previous.meta.priceObservedAt, priceAsOf: update.priceAsOf ?? previous.meta.priceAsOf, realtimeState: update.realtimeState ?? previous.meta.realtimeState, sourceVersions: update.sourceVersions ?? previous.meta.sourceVersions })
-    const window = readyWindow(meta, [...previous.window.bars], update.endHour, liveBar, previous.window)
-    const entry = this.series.get(key)
-    if (entry) {
-      entry.meta = Object.freeze({ ...entry.meta, revision: Math.max(entry.meta.revision, update.revision),
-        priceState: meta.priceState, priceAsOf: meta.priceAsOf, priceObservedAt: meta.priceObservedAt, realtimeState: meta.realtimeState, sourceVersions: meta.sourceVersions })
-      entry.liveBar = liveBar
-      entry.liveRevision = update.revision
-    }
-    this.setLatestFrame(key, { meta, window })
-    if (window !== previous.window || meta !== previous.meta) for (const listener of this.listeners) listener()
-    return true
+    return this.mutate(() => {
+      const key = keyFor(update.instId, update.timeframe), previous = this.latestFrames.get(key)
+      if (!this.universe.has(key) || !previous || update.generation !== this.generations.get(key) || update.generation !== previous.meta.generation
+        || !Number.isSafeInteger(update.revision) || update.revision < previous.meta.revision || update.endHour !== previous.window.endHour) return false
+      const incoming = update.liveBar
+      if (incoming !== null && (incoming.confirmed || !validPrice(incoming) || !Number.isSafeInteger(incoming.hour)
+        || incoming.hour % previous.meta.intervalMS !== 0 || incoming.hour <= update.endHour)) return false
+      const liveBar = incoming === null ? undefined : sameBar(previous.window.liveBar, incoming) ? previous.window.liveBar : Object.freeze({ ...incoming })
+      const meta = Object.freeze({ ...previous.meta, revision: update.revision, priceState: update.priceState ?? previous.meta.priceState, priceObservedAt: update.priceObservedAt ?? previous.meta.priceObservedAt, priceAsOf: update.priceAsOf ?? previous.meta.priceAsOf, realtimeState: update.realtimeState ?? previous.meta.realtimeState, sourceVersions: update.sourceVersions ?? previous.meta.sourceVersions })
+      const window = readyWindow(meta, [...previous.window.bars], update.endHour, liveBar, previous.window)
+      const entry = this.series.get(key)
+      if (entry) {
+        entry.meta = Object.freeze({ ...entry.meta, revision: Math.max(entry.meta.revision, update.revision),
+          priceState: meta.priceState, priceAsOf: meta.priceAsOf, priceObservedAt: meta.priceObservedAt, realtimeState: meta.realtimeState, sourceVersions: meta.sourceVersions })
+        entry.liveBar = liveBar
+        entry.liveRevision = update.revision
+      }
+      this.setLatestFrame(key, { meta, window })
+      if (window !== previous.window || meta !== previous.meta) this.markChanged(key)
+      return true
+    })
   }
 
   /** Latest-ready notifications never allocate a deep-history cache entry. */
   ingestLatest(response: PreparedChartResponse): boolean {
-    if (response.endHour === null && response.liveBar) response = { ...response, endHour: response.liveBar.hour - response.intervalMS, latestEnd: response.liveBar.hour - response.intervalMS }
-    const { instId, timeframe, intervalMS, generation, revision, endHour } = response
-    const key = keyFor(instId, timeframe)
-    if (!this.universe.has(key) || !finite(endHour) || endHour !== response.latestEnd || !instId
-      || !['5m', '15m', '1H'].includes(timeframe) || intervalMS !== timeframeMilliseconds(timeframe)
-      || !Number.isSafeInteger(revision) || revision < 0 || !Number.isSafeInteger(generation) || generation < 0
-      || !this.acceptGeneration(key, generation)) return false
-    if (this.series.has(key)) return this.ingest(response)
-    const previous = this.latestFrames.get(key)
-    if (previous?.meta.generation === generation && (revision < previous.meta.revision || endHour < previous.window.endHour)) return false
-    const incoming = new Map(response.bars.map(bar => [bar.hour, bar]))
-    const previousBars = new Map(previous?.window.bars.map(bar => [bar.hour, bar]))
-    const bars: PreparedChartBar[] = []
-    for (let index = WINDOW_BARS - 1; index >= 0; index -= 1) {
-      const hour = endHour - index * intervalMS, value = incoming.get(hour)
-      if (!value) continue
-      const previousBar = previousBars.get(hour)
-      const bar = preparedBar(value, intervalMS, previousBar, previous?.meta.generation === generation)
-      if (!bar) continue
-      const oldBar = previousBar
-      bars.push(sameBar(oldBar, bar) ? oldBar! : bar)
-    }
-    if ((!bars.length || !incoming.has(endHour)) && !response.liveBar) return false
-    const meta: PreparedChartMeta = Object.freeze({
-      key, instId, timeframe, intervalMS, generation, revision, latestEnd: endHour,
-      priceState: response.priceState, priceAsOf: response.priceAsOf, priceObservedAt: response.priceObservedAt, realtimeState: response.realtimeState, sourceVersions: response.sourceVersions,
-      ...sourceMeta(previous?.meta, response),
-      oldestHour: response.oldestHour === null ? previous?.meta.oldestHour ?? null : Math.min(previous?.meta.oldestHour ?? Infinity, response.oldestHour),
-      historyExhausted: response.historyExhausted || (previous?.meta.historyExhausted ?? false), error: response.error,
+    return this.mutate(() => {
+      if (response.endHour === null && response.liveBar) response = { ...response, endHour: response.liveBar.hour - response.intervalMS, latestEnd: response.liveBar.hour - response.intervalMS }
+      const { instId, timeframe, intervalMS, generation, revision, endHour } = response
+      const key = keyFor(instId, timeframe)
+      if (!this.universe.has(key) || !finite(endHour) || endHour !== response.latestEnd || !instId
+        || !['5m', '15m', '1H'].includes(timeframe) || intervalMS !== timeframeMilliseconds(timeframe)
+        || !Number.isSafeInteger(revision) || revision < 0 || !Number.isSafeInteger(generation) || generation < 0
+        || !this.acceptGeneration(key, generation)) return false
+      if (this.series.has(key)) return this.ingest(response)
+      const previous = this.latestFrames.get(key)
+      if (previous?.meta.generation === generation && (revision < previous.meta.revision || endHour < previous.window.endHour)) return false
+      const incoming = new Map(response.bars.map(bar => [bar.hour, bar]))
+      const previousBars = new Map(previous?.window.bars.map(bar => [bar.hour, bar]))
+      const bars: PreparedChartBar[] = []
+      for (let index = WINDOW_BARS - 1; index >= 0; index -= 1) {
+        const hour = endHour - index * intervalMS, value = incoming.get(hour)
+        if (!value) continue
+        const previousBar = previousBars.get(hour)
+        const bar = preparedBar(value, intervalMS, previousBar, previous?.meta.generation === generation)
+        if (!bar) continue
+        const oldBar = previousBar
+        bars.push(sameBar(oldBar, bar) ? oldBar! : bar)
+      }
+      if ((!bars.length || !incoming.has(endHour)) && !response.liveBar) return false
+      const meta: PreparedChartMeta = Object.freeze({
+        key, instId, timeframe, intervalMS, generation, revision, latestEnd: endHour,
+        priceState: response.priceState, priceAsOf: response.priceAsOf, priceObservedAt: response.priceObservedAt, realtimeState: response.realtimeState, sourceVersions: response.sourceVersions,
+        ...sourceMeta(previous?.meta, response),
+        oldestHour: response.oldestHour === null ? previous?.meta.oldestHour ?? null : Math.min(previous?.meta.oldestHour ?? Infinity, response.oldestHour),
+        historyExhausted: response.historyExhausted || (previous?.meta.historyExhausted ?? false), error: response.error,
+      })
+      const live = response.liveBar
+      const liveBar = live && !live.confirmed && validPrice(live) && live.hour > endHour
+        && Number.isSafeInteger(live.hour) && live.hour % intervalMS === 0
+        ? sameBar(previous?.window.liveBar, live) ? previous!.window.liveBar : Object.freeze({ ...live }) : undefined
+      const window = readyWindow(meta, bars, endHour, liveBar, previous?.window)
+      this.setLatestFrame(key, { meta, window })
+      this.trimBytes()
+      if (window !== previous?.window || revision !== previous?.meta.revision) this.markChanged(key)
+      return true
     })
-    const live = response.liveBar
-    const liveBar = live && !live.confirmed && validPrice(live) && live.hour > endHour
-      && Number.isSafeInteger(live.hour) && live.hour % intervalMS === 0
-      ? sameBar(previous?.window.liveBar, live) ? previous!.window.liveBar : Object.freeze({ ...live }) : undefined
-    const window = readyWindow(meta, bars, endHour, liveBar, previous?.window)
-    this.setLatestFrame(key, { meta, window })
-    this.trimBytes()
-    if (window !== previous?.window || revision !== previous?.meta.revision) for (const listener of this.listeners) listener()
-    return true
   }
 
   ingest(response: PreparedChartResponse): boolean {
-    const { instId, timeframe, intervalMS, generation, revision } = response
-    if (!instId || !['5m', '15m', '1H'].includes(timeframe) || intervalMS !== timeframeMilliseconds(timeframe)
-      || !Number.isSafeInteger(revision) || revision < 0 || !Number.isSafeInteger(generation) || generation < 0) return false
-    const key = keyFor(instId, timeframe)
-    if (!this.acceptGeneration(key, generation)) return false
-    let entry = this.access(key)
-    const latest = this.latestFrames.get(key)
-    const previousGeneration = entry?.meta.generation ?? latest?.meta.generation
-    const newGeneration = !entry || entry.meta.generation !== generation
-    if (newGeneration) {
-      entry = {
-        epoch: ++this.nextEpoch, byteSize: entry?.byteSize ?? (latest ? this.sizeOfBars(latest.window.bars) : 0),
-        meta: Object.freeze({ ...(entry?.meta ?? latest?.meta), key, instId, timeframe, intervalMS, generation, revision, latestEnd: entry?.meta.latestEnd ?? latest?.meta.latestEnd ?? null, oldestHour: entry?.meta.oldestHour ?? latest?.meta.oldestHour ?? null, historyExhausted: entry?.meta.historyExhausted ?? latest?.meta.historyExhausted ?? false, error: '' }),
-        bars: entry?.bars ?? new Map(latest?.window.bars.map(bar => [bar.hour, { bar, revision: latest.meta.revision, generation: latest.meta.generation }]) ?? []),
-        hours: entry?.hours ?? latest?.window.bars.map(bar => bar.hour) ?? [],
-        windows: latest?.meta.generation === generation ? new Map([[latest.window.endHour, latest.window]]) : new Map(), boundaries: null,
-        liveBar: latest?.meta.generation === generation ? latest.window.liveBar : undefined, liveRevision: latest?.meta.generation === generation ? latest.meta.revision : -1,
+    return this.mutate(() => {
+      const { instId, timeframe, intervalMS, generation, revision } = response
+      if (!instId || !['5m', '15m', '1H'].includes(timeframe) || intervalMS !== timeframeMilliseconds(timeframe)
+        || !Number.isSafeInteger(revision) || revision < 0 || !Number.isSafeInteger(generation) || generation < 0) return false
+      const key = keyFor(instId, timeframe)
+      if (!this.acceptGeneration(key, generation)) return false
+      let entry = this.access(key)
+      const latest = this.latestFrames.get(key)
+      const previousGeneration = entry?.meta.generation ?? latest?.meta.generation
+      const newGeneration = !entry || entry.meta.generation !== generation
+      if (newGeneration) {
+        entry = {
+          epoch: ++this.nextEpoch, byteSize: entry?.byteSize ?? (latest ? this.sizeOfBars(latest.window.bars) : 0),
+          meta: Object.freeze({ ...(entry?.meta ?? latest?.meta), key, instId, timeframe, intervalMS, generation, revision, latestEnd: entry?.meta.latestEnd ?? latest?.meta.latestEnd ?? null, oldestHour: entry?.meta.oldestHour ?? latest?.meta.oldestHour ?? null, historyExhausted: entry?.meta.historyExhausted ?? latest?.meta.historyExhausted ?? false, error: '' }),
+          bars: entry?.bars ?? new Map(latest?.window.bars.map(bar => [bar.hour, { bar, revision: latest.meta.revision, generation: latest.meta.generation }]) ?? []),
+          hours: entry?.hours ?? latest?.window.bars.map(bar => bar.hour) ?? [],
+          windows: latest?.meta.generation === generation ? new Map([[latest.window.endHour, latest.window]]) : new Map(), boundaries: null,
+          liveBar: latest?.meta.generation === generation ? latest.window.liveBar : undefined, liveRevision: latest?.meta.generation === generation ? latest.meta.revision : -1,
+        }
+        if (previousGeneration !== generation) entry.meta = Object.freeze({ ...entry.meta, indicatorStatus: undefined, sourceStatuses: entry.meta.sourceStatuses?.filter(value => value.source !== 'indicator') })
+        this.setSeriesEntry(key, entry)
+        while (this.series.size > this.maxSeries) {
+          const evicted = this.series.keys().next().value!
+          this.setSeriesEntry(evicted, null)
+        }
       }
-      if (previousGeneration !== generation) entry.meta = Object.freeze({ ...entry.meta, indicatorStatus: undefined, sourceStatuses: entry.meta.sourceStatuses?.filter(value => value.source !== 'indicator') })
-      this.setSeriesEntry(key, entry)
-      while (this.series.size > this.maxSeries) {
-        const evicted = this.series.keys().next().value!
-        this.setSeriesEntry(evicted, null)
+      const current = entry!
+      let changed = newGeneration
+      const addedHours: number[] = []
+      for (const incoming of response.bars) {
+        const previous = current.bars.get(incoming.hour)
+        const sameGeneration = previous?.generation === generation
+        if (sameGeneration && previous.revision > revision) continue
+        const bar = preparedBar(incoming, intervalMS, previous?.bar, sameGeneration)
+        if (!bar) continue
+        if (previous && !sameGeneration) current.boundaries = null
+        if (previous?.bar.priceComplete !== bar.priceComplete) current.boundaries = null
+        if (sameBar(previous?.bar, bar)) {
+          previous!.revision = sameGeneration ? Math.max(previous!.revision, revision) : revision
+          if (!sameGeneration) { previous!.generation = generation; changed = true }
+          continue
+        }
+        if (!previous) addedHours.push(bar.hour)
+        this.setSeriesBar(current, bar.hour, { bar, revision, generation })
+        changed = true
       }
-    }
-    const current = entry!
-    let changed = newGeneration
-    const addedHours: number[] = []
-    for (const incoming of response.bars) {
-      const previous = current.bars.get(incoming.hour)
-      const sameGeneration = previous?.generation === generation
-      if (sameGeneration && previous.revision > revision) continue
-      const bar = preparedBar(incoming, intervalMS, previous?.bar, sameGeneration)
-      if (!bar) continue
-      if (previous && !sameGeneration) current.boundaries = null
-      if (previous?.bar.priceComplete !== bar.priceComplete) current.boundaries = null
-      if (sameBar(previous?.bar, bar)) {
-        previous!.revision = sameGeneration ? Math.max(previous!.revision, revision) : revision
-        if (!sameGeneration) { previous!.generation = generation; changed = true }
-        continue
+      if (addedHours.length) {
+        current.hours = [...current.hours, ...addedHours].sort((left, right) => left - right)
+        current.boundaries = null
       }
-      if (!previous) addedHours.push(bar.hour)
-      this.setSeriesBar(current, bar.hour, { bar, revision, generation })
-      changed = true
-    }
-    if (addedHours.length) {
-      current.hours = [...current.hours, ...addedHours].sort((left, right) => left - right)
-      current.boundaries = null
-    }
-    const newestMeta = revision >= current.meta.revision
-    const latestEnd = finite(response.latestEnd) ? Math.max(current.meta.latestEnd ?? -Infinity, response.latestEnd) : current.meta.latestEnd
-    const oldestHour = finite(response.oldestHour) ? Math.min(current.meta.oldestHour ?? Infinity, response.oldestHour) : current.meta.oldestHour
-    const nextMeta: PreparedChartMeta = {
-      ...(newestMeta ? sourceMeta(current.meta, response) : { priceStatus: current.meta.priceStatus, oiStatus: current.meta.oiStatus, takerStatus: current.meta.takerStatus, indicatorStatus: current.meta.indicatorStatus, sourceStatuses: current.meta.sourceStatuses }),
-      priceState: newestMeta && response.endHour === response.latestEnd ? response.priceState : current.meta.priceState,
-      priceAsOf: newestMeta ? response.priceAsOf ?? current.meta.priceAsOf : current.meta.priceAsOf,
-      priceObservedAt: newestMeta ? response.priceObservedAt ?? current.meta.priceObservedAt : current.meta.priceObservedAt,
-      realtimeState: newestMeta ? response.realtimeState ?? current.meta.realtimeState : current.meta.realtimeState,
-      sourceVersions: newestMeta ? response.sourceVersions ?? current.meta.sourceVersions : current.meta.sourceVersions,
-      key, instId, timeframe, intervalMS, generation, revision: Math.max(current.meta.revision, revision), latestEnd, oldestHour,
-      historyExhausted: current.meta.historyExhausted || response.historyExhausted,
-      error: newestMeta ? response.error : current.meta.error,
-    }
-    if (Object.keys(nextMeta).some(field => nextMeta[field as keyof PreparedChartMeta] !== current.meta[field as keyof PreparedChartMeta])) {
-      if (nextMeta.oldestHour !== current.meta.oldestHour || nextMeta.historyExhausted !== current.meta.historyExhausted) current.boundaries = null
-      current.meta = Object.freeze(nextMeta)
-      changed = true
-    }
-    if (response.liveBar && revision >= current.liveRevision && !response.liveBar.confirmed && validPrice(response.liveBar)
-      && Number.isSafeInteger(response.liveBar.hour) && response.liveBar.hour % intervalMS === 0) {
-      if (!sameBar(current.liveBar, response.liveBar)) { current.liveBar = Object.freeze({ ...response.liveBar }); changed = true }
-      current.liveRevision = revision
-    }
-    if (current.liveBar && current.meta.latestEnd !== null && current.liveBar.hour <= current.meta.latestEnd) {
-      current.liveBar = undefined
-      changed = true
-    }
-    if (current.bars.size > this.maxBarsPerSeries) {
-      const anchor = finite(response.endHour) ? response.endHour : current.meta.latestEnd ?? current.hours.at(-1)!
-      const first = anchor - (WINDOW_BARS - 1) * intervalMS
-      const removable = current.hours.filter(hour => hour < first || hour > anchor)
-        .sort((left, right) => Math.abs(right - anchor) - Math.abs(left - anchor) || left - right)
-      const excess = current.bars.size - this.maxBarsPerSeries
-      for (const hour of removable.slice(0, excess)) this.setSeriesBar(current, hour, null)
-      current.epoch = ++this.nextEpoch
-      current.hours = current.hours.filter(hour => current.bars.has(hour))
-      current.windows.clear()
-      current.boundaries = null
-      changed = true
-    }
-    current.meta = retainedSourceMeta(current.meta, current.hours.filter(hour => current.bars.get(hour)?.generation === generation), current.liveBar ? current.meta.latestEnd ?? undefined : undefined)
-    if (this.universe.has(key)) {
-      const previous = this.latestFrame(key)
-      // A historical batch can carry a new indicator generation and a fully
-      // rebuilt latest window together. Repin that window in the same ingest.
-      const end = finite(response.latestEnd) && current.bars.get(response.latestEnd)?.generation === generation
-        ? Math.max(previous?.window.endHour ?? -Infinity, response.latestEnd) : previous?.window.endHour
-      const window = end === undefined ? null : this.seriesWindow(current, end)
-      if (window) {
-        this.setLatestFrame(key, { meta: Object.freeze({ ...current.meta, latestEnd: window.endHour }), window })
-        if (window !== previous?.window) changed = true
+      const newestMeta = revision >= current.meta.revision
+      const latestEnd = finite(response.latestEnd) ? Math.max(current.meta.latestEnd ?? -Infinity, response.latestEnd) : current.meta.latestEnd
+      const oldestHour = finite(response.oldestHour) ? Math.min(current.meta.oldestHour ?? Infinity, response.oldestHour) : current.meta.oldestHour
+      const nextMeta: PreparedChartMeta = {
+        ...(newestMeta ? sourceMeta(current.meta, response) : { priceStatus: current.meta.priceStatus, oiStatus: current.meta.oiStatus, takerStatus: current.meta.takerStatus, indicatorStatus: current.meta.indicatorStatus, sourceStatuses: current.meta.sourceStatuses }),
+        priceState: newestMeta && response.endHour === response.latestEnd ? response.priceState : current.meta.priceState,
+        priceAsOf: newestMeta ? response.priceAsOf ?? current.meta.priceAsOf : current.meta.priceAsOf,
+        priceObservedAt: newestMeta ? response.priceObservedAt ?? current.meta.priceObservedAt : current.meta.priceObservedAt,
+        realtimeState: newestMeta ? response.realtimeState ?? current.meta.realtimeState : current.meta.realtimeState,
+        sourceVersions: newestMeta ? response.sourceVersions ?? current.meta.sourceVersions : current.meta.sourceVersions,
+        key, instId, timeframe, intervalMS, generation, revision: Math.max(current.meta.revision, revision), latestEnd, oldestHour,
+        historyExhausted: current.meta.historyExhausted || response.historyExhausted,
+        error: newestMeta ? response.error : current.meta.error,
       }
-    }
-    this.trimBytes()
-    if (changed) for (const listener of this.listeners) listener()
-    return true
+      if (Object.keys(nextMeta).some(field => nextMeta[field as keyof PreparedChartMeta] !== current.meta[field as keyof PreparedChartMeta])) {
+        if (nextMeta.oldestHour !== current.meta.oldestHour || nextMeta.historyExhausted !== current.meta.historyExhausted) current.boundaries = null
+        current.meta = Object.freeze(nextMeta)
+        changed = true
+      }
+      if (response.liveBar && revision >= current.liveRevision && !response.liveBar.confirmed && validPrice(response.liveBar)
+        && Number.isSafeInteger(response.liveBar.hour) && response.liveBar.hour % intervalMS === 0) {
+        if (!sameBar(current.liveBar, response.liveBar)) { current.liveBar = Object.freeze({ ...response.liveBar }); changed = true }
+        current.liveRevision = revision
+      }
+      if (current.liveBar && current.meta.latestEnd !== null && current.liveBar.hour <= current.meta.latestEnd) {
+        current.liveBar = undefined
+        changed = true
+      }
+      if (current.bars.size > this.maxBarsPerSeries) {
+        const anchor = finite(response.endHour) ? response.endHour : current.meta.latestEnd ?? current.hours.at(-1)!
+        const first = anchor - (WINDOW_BARS - 1) * intervalMS
+        const removable = current.hours.filter(hour => hour < first || hour > anchor)
+          .sort((left, right) => Math.abs(right - anchor) - Math.abs(left - anchor) || left - right)
+        const excess = current.bars.size - this.maxBarsPerSeries
+        for (const hour of removable.slice(0, excess)) this.setSeriesBar(current, hour, null)
+        current.epoch = ++this.nextEpoch
+        current.hours = current.hours.filter(hour => current.bars.has(hour))
+        current.windows.clear()
+        current.boundaries = null
+        changed = true
+      }
+      current.meta = retainedSourceMeta(current.meta, current.hours.filter(hour => current.bars.get(hour)?.generation === generation), current.liveBar ? current.meta.latestEnd ?? undefined : undefined)
+      if (this.universe.has(key)) {
+        const previous = this.latestFrame(key)
+        // A historical batch can carry a new indicator generation and a fully
+        // rebuilt latest window together. Repin that window in the same ingest.
+        const end = finite(response.latestEnd) && current.bars.get(response.latestEnd)?.generation === generation
+          ? Math.max(previous?.window.endHour ?? -Infinity, response.latestEnd) : previous?.window.endHour
+        const window = end === undefined ? null : this.seriesWindow(current, end)
+        if (window) {
+          this.setLatestFrame(key, { meta: Object.freeze({ ...current.meta, latestEnd: window.endHour }), window })
+          if (window !== previous?.window) changed = true
+        }
+      }
+      this.trimBytes()
+      if (changed) this.markChanged(key)
+      return true
+    })
   }
 
   private sizeOfBar(bar: PreparedChartBar): number {

@@ -164,9 +164,9 @@ function hookFunction(owner, key, { domain, category, name, api: apiName, resour
     if (isOperationHookSuppressed(domain)) return Reflect.apply(original, this, args)
     const span = beginOperation({ category, name: name ?? key, resource: resource?.(args), attributes: attributes?.(args) })
     const cpu = category === 'cpu' || typeof key === 'string' && key.endsWith('Sync') ? readOperationCPUTime() : undefined
-    const callerScope = captureScope()
     const callbackIndex = (typeof callback === 'function' ? callback(args) : callback) && typeof args.at(-1) === 'function' ? args.length - 1 : -1
     if (callbackIndex >= 0) {
+      const callerScope = captureScope()
       const callback = args[callbackIndex]
       args[callbackIndex] = function (...values) {
         const error = values[0]
