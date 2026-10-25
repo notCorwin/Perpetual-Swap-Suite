@@ -207,9 +207,17 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
     // A selected contract consumes a canonical live update and selection in one
     // turn. The current SVG node must show that frame at the next animation frame.
     const liveTarget = target
-    const liveSelection = await page.evaluate(async instId => {
-      const { frames } = await window.radarDesktop.request({ chartUniverse: {} })
+    const liveFrame = await electron.evaluate(async (_electron, instId) => {
+      const gate = globalThis.__prerenderGate
+      const { frames } = await gate.original(gate.event, { chartUniverse: {} })
       const frame = frames.find(value => value.instId === instId && value.timeframe === '15m')
+      // Isolate the synthetic input from real backend publications. A newer
+      // authoritative frame is allowed to supersede it after this measurement.
+      gate.held = true
+      return frame
+    }, liveTarget)
+    let liveSelection
+    try { liveSelection = await page.evaluate(({ instId, frame }) => {
       const last = frame.bars.at(-1), price = last.close + 7
       window.dispatchEvent(new CustomEvent('radar-chart-prepared', { detail: {
         type: 'live', instId, timeframe: frame.timeframe, generation: frame.generation, revision: frame.revision + 1,
@@ -222,12 +230,15 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
         const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
         const svg = chart?.querySelector('svg[data-rendered-inst]')
         const labelPrice = Number(svg?.querySelector('[data-chart-price-label-value]')?.textContent.split(/\s/)[0].replaceAll(',', ''))
-        resolve({ price, currentAtNextFrame: snapshot?.instId === instId && snapshot.liveBar?.close === price
+        resolve({ price, currentInst: snapshot?.instId, livePrice: snapshot?.liveBar?.close, labelPrice,
+          currentAtNextFrame: snapshot?.instId === instId && snapshot.liveBar?.close === price
           && snapshot.bars.length === 96 && snapshot.bars.every(bar => bar.confirmed)
           && svg === window.__sharedSurface && Math.abs(labelPrice - price) < 1e-5 })
       }))
-    }, liveTarget)
-    assert.equal(liveSelection.currentAtNextFrame, true, 'The current SVG must show the selected contract live price by the next frame.')
+    }, { instId: liveTarget, frame: liveFrame }) }
+    finally { await electron.evaluate(() => globalThis.__prerenderGate.release()) }
+    assert.equal(liveSelection.currentAtNextFrame, true,
+      `The current SVG must show the selected contract live price by the next frame: ${JSON.stringify(liveSelection)}`)
     // Later authoritative backend frames may supersede this injected price;
     // the assertion above inspects the complete SVG in the measured frame.
 
