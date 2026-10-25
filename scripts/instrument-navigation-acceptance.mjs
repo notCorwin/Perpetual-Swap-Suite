@@ -372,8 +372,13 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
     await page.locator('[data-market-list] [aria-label^="View "]').first().waitFor({ state: 'visible' })
     let timeframeSwitch = null
     if (await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-timeframe') !== timeframe) {
+      const previousSVG = await page.locator('svg[data-rendered-inst]').elementHandle()
+      assert.ok(previousSVG)
       const instId = await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-inst')
       timeframeSwitch = await nextFrame(() => selectTimeframe(page, timeframe), { expectedInstId: instId, timeframe })
+      assert.equal(await previousSVG.evaluate(svg => svg.isConnected && svg === document.querySelector('svg[data-rendered-inst]')), true,
+        'A prepared timeframe switch must preserve the selected SVG instead of remounting the candidate pool.')
+      await previousSVG.dispose()
     }
     await assertWorkspaceLayout(page)
     const prewarm = initialPreparation.frames.find(frame => frame.timeframe === timeframe)

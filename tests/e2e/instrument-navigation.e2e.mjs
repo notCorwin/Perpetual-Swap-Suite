@@ -4,7 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { exerciseInstrumentNavigation, installNavigationProbe, persistNavigationCatalog, removeNavigationProbe, selectionRequests, startupNavigationReport } from '../../scripts/instrument-navigation-acceptance.mjs'
+import { assertNavigationPaints, exerciseInstrumentNavigation, finishNavigationPaintProbe, installNavigationProbe, measureNavigation, persistNavigationCatalog, removeNavigationProbe, selectionRequests, startNavigationPaintProbe, startupNavigationReport } from '../../scripts/instrument-navigation-acceptance.mjs'
 
 const root = new URL('../..', import.meta.url).pathname
 const userData = await mkdtemp(join(tmpdir(), 'perp-instrument-navigation-e2e-'))
@@ -67,4 +67,29 @@ test('a real process restart reports preparation separately and compares warm na
   context.diagnostic(`Restart navigation: ${JSON.stringify(report.phases.map(phase => ({ timeframe: phase.timeframe,
     firstVisit: phase.firstVisit, timeframeSwitch: phase.timeframeSwitch, rapid: phase.rapid,
     maximumKeyboardMS: Math.max(...phase.keyboard.map(input => input.inputToSVGCommitMS)) })))}`)
+})
+
+test('a market selected in the same task as a timeframe switch immediately uses the requested period', async () => {
+  const current = await page.locator('svg[data-rendered-inst]').evaluate(svg => ({ instId: svg.dataset.renderedInst, timeframe: svg.dataset.renderedTimeframe }))
+  const timeframe = fixture.timeframes.find(value => value !== current.timeframe)
+  const instId = fixture.instIds.find(value => value !== current.instId)
+  await startNavigationPaintProbe(page, fixture)
+  try {
+    const result = await measureNavigation(page, () => page.evaluate(({ instId, timeframe }) => {
+      const button = [...document.querySelectorAll('[aria-label="Chart timeframe"] button')].find(button => button.textContent.trim() === timeframe)
+      const row = document.querySelector(`[aria-label="View ${instId} chart"]`)
+      if (!button || !row) throw new Error('The prepared interleaving targets must be mounted.')
+      button.click()
+      row.click()
+    }, { instId, timeframe }), { expectedInstId: instId, timeframe })
+    assert.ok(result.framesToCommit <= 1)
+    assert.ok(result.inputToSVGCommitMS <= 50)
+    await page.waitForFunction(({ ids, timeframe }) => ids.every(id => [...document.querySelectorAll('svg[data-prepared-chart-inst]')].some(svg =>
+      svg.dataset.preparedChartInst === id && svg.dataset.preparedChartTimeframe === timeframe && svg.dataset.preparedChartReady === 'true')),
+    { ids: fixture.instIds, timeframe })
+    const visible = await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => ({ instId: svg.dataset.renderedInst, timeframe: svg.dataset.renderedTimeframe })))
+    assert.deepEqual(visible, [{ instId, timeframe }])
+  } finally {
+    assertNavigationPaints(await finishNavigationPaintProbe(page))
+  }
 })

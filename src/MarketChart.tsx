@@ -1,4 +1,4 @@
-import { createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
+import { createContext, memo, useCallback, useContext, useDeferredValue, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
 import { flushSync } from "react-dom"
 import { Camera } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
@@ -326,6 +326,8 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
   const latestSurface = surface ? chartController.store.window(surface.instId, surface.timeframe) : null
   const navigationSurface = surface && surface !== latestSurface ? surface : undefined
   const plotCandidates = candidateIds.includes(displayedId) ? candidateIds : [...candidateIds, displayedId]
+  // Visible input must not wait for the rest of the candidate pool to redraw.
+  const backgroundTimeframe = useDeferredValue(timeframe)
   const [inspection, setInspection] = useState<{ instId: string; timeframe: RadarTimeframe; hour: number } | null>(null)
   const inspectedIndex = inspection?.instId === surface?.instId && inspection?.timeframe === surface?.timeframe ? bars.findIndex(bar => bar.hour === inspection?.hour) : -1
   const inspected = inspectedIndex >= 0 ? inspectedIndex : null
@@ -583,7 +585,7 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
         const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : -event.deltaY
         queueWheel(delta * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 240 : 1))
       }}>
-        {plotCandidates.map(id => <PreparedPlot key={`${timeframe}:${id}`} instId={id} timeframe={timeframe} size={plotSize}
+        {plotCandidates.map(id => <PreparedPlot key={id} instId={id} timeframe={id === displayedId ? timeframe : backgroundTimeframe} size={plotSize}
           selected={matchesSelection && !navigationSurface && id === displayedId} wheelFraction={matchesSelection && !navigationSurface && id === displayedId ? activeWheelFraction : 0} inspected={id === displayedId ? inspected : null} inspectedBar={id === displayedId ? inspectedBar : undefined}
           presentedSurface={matchesSelection && !navigationSurface && id === displayedId ? surface ?? undefined : undefined} />)}
         {navigationSurface && <PreparedPlot key="navigation" instId={navigationSurface.instId} timeframe={navigationSurface.timeframe}
