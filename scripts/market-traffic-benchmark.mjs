@@ -17,6 +17,7 @@ const { values } = parseArgs({
     'candidate-count': { type: 'string' }, 'passing-count': { type: 'string' },
     'spread-failure-count': { type: 'string' }, 'duration-seconds': { type: 'string' }, 'cadence-ms': { type: 'string' },
     'expect-optimized': { type: 'boolean' }, foreground: { type: 'boolean' },
+    'wait-ready': { type: 'boolean' },
   },
   allowPositionals: false,
 })
@@ -33,6 +34,7 @@ const durationSeconds = numberOption('duration-seconds', 7)
 const cadenceMS = numberOption('cadence-ms', 500)
 const expectOptimized = values['expect-optimized'] === true
 const foreground = values.foreground === true
+const waitReady = foreground || values['wait-ready'] === true
 const benchmarkMode = foreground
   ? 'foreground-electron-loopback-market-traffic-and-renderer-responsiveness'
   : 'hidden-electron-loopback-market-traffic-and-renderer-responsiveness'
@@ -130,6 +132,32 @@ function percentile(samples, fraction) {
   return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))] ?? 0
 }
 
+async function waitForSelectedFrames(page, instIds) {
+  const startedAt = performance.now(), timeframe = '15m'
+  await page.locator('[aria-label="Chart timeframe"] button').filter({ hasText: /^15m$/i }).click()
+  let ready = []
+  while (performance.now() - startedAt < 40_000) {
+    ready = await page.evaluate(async ({ instIds, timeframe }) => {
+      const { frames } = await window.radarDesktop.request({ chartUniverse: {} })
+      const canonical = frames.filter(frame => instIds.includes(frame.instId) && frame.timeframe === timeframe
+        && frame.bars?.length === 96 && frame.indicatorState === 'ready'
+        && ['ready', 'stale'].includes(frame.priceState) && ['ready', 'unavailable'].includes(frame.oiState)
+        && ['ready', 'unavailable'].includes(frame.takerState))
+      const delivered = window.__marketTrafficReadyFrames ??= new Set()
+      for (const frame of canonical) if (!delivered.has(frame.instId)) {
+        window.dispatchEvent(new CustomEvent('radar-chart-prepared', { detail: frame }))
+        delivered.add(frame.instId)
+      }
+      return canonical.map(frame => frame.instId).sort()
+    }, { instIds, timeframe })
+    if (ready.length === instIds.length) break
+    await sleep(100)
+  }
+  assert.deepEqual(ready, [...instIds].sort(), 'Every qualified selected-period frame must be ready before steady-state measurement.')
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+  return { timeframe, expectedFrames: instIds.length, readyFrames: ready.length, elapsedMS: performance.now() - startedAt }
+}
+
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const app = await appEntryFor(values['app-root'] ?? root)
 const checkout = checkoutMetadata(), target = await targetMetadata(app, checkout)
@@ -210,6 +238,7 @@ try {
   }
   assert.deepEqual(fixture.errors, [], 'The fixture observed an invalid or unexpected production request.')
 
+  const readiness = waitReady ? await waitForSelectedFrames(page, [...qualifyingIDs]) : null
   cadence = fixture.startCadence(cadenceMS)
   await sleep(cadenceMS)
   // The sample clock starts after qualification, connection setup and the
@@ -217,7 +246,7 @@ try {
   if (foreground) await assertForeground(electron, page)
   const sampleStartedAt = fixture.beginSample()
   await page.evaluate(requireForeground => {
-    const state = { gaps: [], interactions: [], lastFrame: null, startedAt: performance.now(), active: true,
+    const state = { gaps: [], interactions: [], interactionSamples: [], lastFrame: null, startedAt: performance.now(), active: true,
       presentation: { requiredForeground: requireForeground, samples: 0, totalViolations: 0, violations: [] } }
     const checkPresentation = () => {
       if (!state.active) return
@@ -240,8 +269,12 @@ try {
     document.addEventListener('input', event => {
       if (event.target?.getAttribute?.('aria-label') !== 'Search contracts') return
       checkPresentation()
-      const started = performance.now()
-      requestAnimationFrame(() => requestAnimationFrame(() => state.interactions.push(performance.now() - started)))
+      const started = performance.now(), term = event.target.value
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        const completed = performance.now(), durationMS = completed - started
+        state.interactions.push(durationMS)
+        state.interactionSamples.push({ term, startedMS: started - state.startedAt, completedMS: completed - state.startedAt, durationMS })
+      }))
     }, true)
     globalThis.__marketTrafficResponsiveness = state
     checkPresentation()
@@ -266,9 +299,9 @@ try {
       return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))] ?? 0
     }
     return { elapsedMS: performance.now() - state.startedAt, frameCount: state.gaps.length, presentation: state.presentation,
-      frameGapMS: { p50: percentile(state.gaps, .5), p95: percentile(state.gaps, .95), max: Math.max(0, ...state.gaps) },
+      frameGapMS: { p50: percentile(state.gaps, .5), p95: percentile(state.gaps, .95), max: Math.max(0, ...state.gaps), samples: state.gaps },
       searchInteractionMS: { count: state.interactions.length, p50: percentile(state.interactions, .5),
-        p95: percentile(state.interactions, .95), max: Math.max(0, ...state.interactions) } }
+        p95: percentile(state.interactions, .95), max: Math.max(0, ...state.interactions), samples: state.interactionSamples } }
   })
   failureMeasurements = {
     schemaVersion: 1,
@@ -280,7 +313,7 @@ try {
       network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' },
     fixture: { candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture.oiFailureCount, seed: fixture.seed,
       dataFingerprint: `market-traffic-v2-bookseq-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
-      cadenceMS, durationSeconds, sampleStartedAt, expectOptimized },
+      cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness },
     renderer: { ...renderer, measurement: foreground
       ? 'Native foreground renderer RAF gaps and React search input to next-frame latency; native compositor paint was not measured.'
       : 'Hidden offscreen renderer RAF gaps and React search input to next-frame latency; no native compositor paint claim.' },
@@ -349,7 +382,7 @@ try {
       qualification: { total: finalSnapshot.catalogProgress.total, completed: finalSnapshot.catalogProgress.completed,
         pending: finalSnapshot.catalogProgress.pending, verified: finalSnapshot.catalogProgress.verified,
         failed: finalSnapshot.catalogProgress.failed, unknown: finalSnapshot.catalogProgress.unknown },
-      requiredChannels, cadenceMS, durationSeconds, sampleStartedAt, expectOptimized },
+      requiredChannels, cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness },
     traffic: { durationSeconds: traffic.durationSeconds, websocketPayloadBytes, httpResponsePayloadBytes,
       totalPayloadBytes: websocketPayloadBytes + httpResponsePayloadBytes,
       websocketPayloadBytesByChannel: traffic.websocket, httpResponsePayloadBytesByChannel: traffic.http,
