@@ -266,11 +266,12 @@ test('a delayed previous-boundary history read cannot replace the current durabl
   } finally { gate.resolve(); await refresh; await f.close() }
 })
 
-test('reconnect recovery admits later series while the first series waits, with prices preceding its statistics', async () => {
+test('reconnect admits every price series while charts retain ownership of statistics acquisition', async () => {
   const f = await fixture(preferences())
   const gate = deferred(), events: string[] = []
   let recovery: Promise<void> | undefined
   try {
+    f.service.listedUniverse = new Set(['BTC-USDT-SWAP', 'ETH-USDT-SWAP'])
     f.store.coverage = async () => ({ first: null, last: null, count: 0 })
     f.service.history.ensurePrices = async (id: string) => {
       events.push(`prices:${id}`)
@@ -278,11 +279,10 @@ test('reconnect recovery admits later series while the first series waits, with 
       return { rows: [] }
     }
     f.service.history.ensureStatistics = async (id: string) => { events.push(`statistics:${id}`); return { rows: [] } }
-    recovery = f.service.reconcileRealtime([{ instId: 'BTC-USDT-SWAP', timeframe: '5m' }, { instId: 'ETH-USDT-SWAP', timeframe: '1H' }])
-    await waitFor(() => events.includes('statistics:ETH-USDT-SWAP'))
-    assert.equal(events.includes('statistics:BTC-USDT-SWAP'), false)
+    recovery = f.service.reconcileRealtime([{ instId: 'BTC-USDT-SWAP', timeframe: '5m' }, { instId: 'ETH-USDT-SWAP', timeframe: '5m' }])
+    await waitFor(() => events.includes('prices:ETH-USDT-SWAP'))
     gate.resolve(); await recovery
-    for (const id of ['BTC-USDT-SWAP', 'ETH-USDT-SWAP']) assert.ok(events.indexOf(`prices:${id}`) < events.indexOf(`statistics:${id}`))
+    assert.deepEqual(events.sort(), ['prices:BTC-USDT-SWAP', 'prices:ETH-USDT-SWAP'])
   } finally { gate.resolve(); await recovery; await f.close() }
 })
 
@@ -292,14 +292,16 @@ test('failed reconnect recovery drains an already accepted sibling before report
   let siblingStarted = false, siblingWritten = false, finished = false
   let recovery: Promise<void> | undefined
   try {
+    f.service.listedUniverse = new Set(['BTC-USDT-SWAP', 'ETH-USDT-SWAP'])
     f.store.coverage = async () => ({ first: null, last: null, count: 0 })
     f.service.history.ensurePrices = async (id: string) => {
       if (id === 'BTC-USDT-SWAP') throw new Error('The first recovery source failed.')
       siblingStarted = true; await gate.promise
+      siblingWritten = true
       return { rows: [] }
     }
-    f.service.history.ensureStatistics = async () => { siblingWritten = true; return { rows: [] } }
-    const running: Promise<void> = f.service.reconcileRealtime([{ instId: 'BTC-USDT-SWAP', timeframe: '5m' }, { instId: 'ETH-USDT-SWAP', timeframe: '1H' }])
+    f.service.history.ensureStatistics = async () => { throw new Error('Collector recovery cannot own statistics acquisition.') }
+    const running: Promise<void> = f.service.reconcileRealtime([{ instId: 'BTC-USDT-SWAP', timeframe: '5m' }, { instId: 'ETH-USDT-SWAP', timeframe: '5m' }])
     recovery = running
     void running.then(() => { finished = true }, () => { finished = true })
     await waitFor(() => siblingStarted)

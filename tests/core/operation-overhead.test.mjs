@@ -253,7 +253,7 @@ test('native traffic and the real renderer retain matched trials and separate fa
     for (const run of [...report.runs.filter(run => !run.desktop), ...report.failureProfiles.runs]) {
       const perChannel = report.parameters.contracts * report.parameters.cycles
       assert.ok(Object.values(run.parameters.liquidityFilters).every(enabled => enabled === false), 'Recorder traffic must not enable a liquidity consumer to preserve unwanted input.')
-      assert.deepEqual(run.parameters.subscribedChannels, ['open-interest', 'tickers', 'trades'])
+      assert.deepEqual(run.parameters.subscribedChannels, ['open-interest', 'tickers'], 'The traffic fixture has no active listed or focused Taker consumer.')
       assert.deepEqual(run.parameters.inputChannels, ['open-interest', 'tickers'])
       assert.deepEqual(run.parameters.nativePeriods, ['5m', '15m', '1H'])
       assert.equal(run.business.contracts, report.parameters.contracts)

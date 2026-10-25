@@ -15,8 +15,15 @@ const waitFor = async (condition, description) => {
     await new Promise(resolve => setTimeout(resolve, 10))
   }
 }
+const expectedAggregate = (rows, timeframe, timestamp) => ({
+  instrument: rows[0].instrument, timeframe, timestamp,
+  open: rows[0].open, high: Math.max(...rows.map(row => row.high)), low: Math.min(...rows.map(row => row.low)), close: rows.at(-1).close,
+  volume: rows.reduce((total, row) => total + row.volume, 0),
+  baseVolume: rows.reduce((total, row) => total + row.baseVolume, 0),
+  quoteVolume: rows.reduce((total, row) => total + row.quoteVolume, 0), confirmed: true,
+})
 
-test('backend collection, gap repair, and all-period preparation run before any renderer or chart read', { timeout: 90_000 }, async () => {
+test('backend collection, gap repair, and all-period preparation run independently of a renderer', { timeout: 90_000 }, async () => {
   const userData = await mkdtemp(join(tmpdir(), 'perp-backend-lifecycle-'))
   const exchange = await createNativeExchange()
   let backend
@@ -46,24 +53,65 @@ test('backend collection, gap repair, and all-period preparation run before any 
     backend.on('chart', frame => { if (Array.isArray(frame.bars)) published.set(`${frame.instId}:${frame.timeframe}`, frame) })
     await backend.ready
     const ids = exchange.instruments.map(value => value.instId)
-    await Promise.all(ids.flatMap(instId => Object.keys(nativeIntervals).map(timeframe => exchange.waitForSubscription(instId, `candle${timeframe}`))))
+    await Promise.all(ids.map(instId => exchange.waitForSubscription(instId, 'candle5m')))
+    assert.deepEqual(exchange.businessSubscriptions(), ids.map(instId => `candle5m:${instId}`).sort(),
+      'The backend must collect every candidate on 5m and derive both coarse periods locally.')
+    await backend.request({ chartFocus: { id: 'e2e-btc-15m', target: { instId: ids[0], timeframe: '15m' } } })
     await exchange.waitForHeldHistory()
-    assert.ok(await exchange.releaseHistory() > 0, 'Automatic collection must acquire the genuinely missing closed candle.')
-    await waitFor(() => ids.every(instId => Object.keys(nativeIntervals).every(timeframe => {
-      const frame = published.get(`${instId}:${timeframe}`)
-      return frame?.bars.length === 96 && frame.indicatorState === 'ready'
-        && frame.oiState === 'unavailable' && frame.takerState === 'unavailable'
-    })), 'publish every qualified native frame and its successful-empty source status')
+    assert.equal(await exchange.releaseHistory(), 1, 'Only the missing coarse parent should need a native REST fallback.')
+    assert.deepEqual(exchange.requests.filter(value => value.path === '/market/history-candles' && value.parameters.instId === ids[0]
+      && value.parameters.bar === '5m' && Number(value.parameters.after) === exchange.missingBaseEnd + nativeIntervals['5m']), [],
+    'A selected 15m chart must not download its unselected interior 5m child.')
+    const basePrefix = await backend.request({ e2e: { action: 'readCandles', instrument: ids[0], timeframe: '5m',
+      from: exchange.seededBaseFrom, through: exchange.seededBaseThrough } })
+    const gapIndex = (exchange.missingBaseEnd - exchange.seededBaseFrom) / nativeIntervals['5m']
+    assert.equal(basePrefix.length, exchange.baseCandleCount - 1)
+    assert.ok(basePrefix.every((row, index) => row.confirmed && row.timestamp === exchange.seededBaseFrom
+      + (index < gapIndex ? index : index + 1) * nativeIntervals['5m']),
+    'The canonical 5m gap must remain explicit while 15m is selected.')
+    for (const instId of ids) for (const timeframe of Object.keys(nativeIntervals)) {
+      await backend.request({ chartFocus: { id: `e2e-${instId}-${timeframe}`, target: { instId, timeframe } } })
+      await waitFor(() => {
+        const frame = published.get(`${instId}:${timeframe}`)
+        return frame?.bars.length === 96 && frame.indicatorState === 'ready'
+          && frame.oiState === 'unavailable' && frame.takerState === 'unavailable'
+      }, `publish the locally prepared ${timeframe} frame and its successful-empty source status for ${instId}`)
+      if (instId === ids[0] && timeframe === '5m') {
+        await waitFor(async () => {
+          const rows = await backend.request({ e2e: { action: 'readCandles', instrument: ids[0], timeframe: '5m',
+            from: exchange.missingBaseEnd, through: exchange.missingBaseEnd } })
+          return rows[0]?.confirmed === true
+        }, 'repair the 5m gap only after the 5m chart owns that history range')
+      }
+    }
+    assert.deepEqual(exchange.businessSubscriptions(), ids.map(instId => `candle5m:${instId}`).sort(),
+      'Focusing local coarse frames must not install coarse native WebSocket subscriptions.')
 
     const repaired = await backend.request({ e2e: { action: 'readCandles', instrument: ids[0], timeframe: '15m', from: exchange.deferredEnd, through: exchange.deferredEnd } })
     assert.equal(repaired.length, 1)
     assert.equal(repaired[0].confirmed, true)
-    const changed = exchange.sendCandle(ids[1], '5m', { timestamp: Math.floor(exchange.asOf / nativeIntervals['5m']) * nativeIntervals['5m'] - nativeIntervals['5m'], close: 551.25, confirmed: true })
+    const changedAt = Math.floor(exchange.asOf / nativeIntervals['1H']) * nativeIntervals['1H'] - nativeIntervals['5m']
+    const changed = exchange.sendCandle(ids[1], '5m', { timestamp: changedAt, close: 551.25, volume: 100, confirmed: true })
+    assert.ok(changed.volume > 0 && changed.baseVolume > 0 && changed.quoteVolume > 0)
     await waitFor(async () => {
-      const rows = await backend.request({ e2e: { action: 'readCandles', instrument: ids[1], timeframe: '5m', from: changed.hour, through: changed.hour } })
+      const rows = await backend.request({ e2e: { action: 'readCandles', instrument: ids[1], timeframe: '5m', from: changed.timestamp, through: changed.timestamp } })
       return rows[0]?.close === changed.close
     }, 'persist an unselected contract update')
-    await waitFor(() => published.get(`${ids[1]}:5m`)?.bars.at(-1)?.close === changed.close, 'recalculate the unselected native frame')
+    await waitFor(() => published.get(`${ids[1]}:5m`)?.bars.some(bar => bar.hour === changed.timestamp && bar.close === changed.close), 'recalculate the unselected native frame')
+    for (const timeframe of ['15m', '1H']) {
+      const step = nativeIntervals[timeframe], timestamp = Math.floor(changed.timestamp / step) * step
+      const children = exchange.closedCandles.filter(row => row.instrument === ids[1] && row.timeframe === '5m'
+        && row.timestamp >= timestamp && row.timestamp < timestamp + step).map(row => row.timestamp === changed.timestamp
+        ? { ...row, close: changed.close, high: Math.max(row.open, changed.close) + 1, low: Math.min(row.open, changed.close) - 1,
+          volume: changed.volume, baseVolume: changed.baseVolume, quoteVolume: changed.quoteVolume } : row)
+      assert.equal(children.length, step / nativeIntervals['5m'], `${timeframe} must have a complete canonical 5m source bucket.`)
+      const expected = expectedAggregate(children, timeframe, timestamp)
+      const rows = await backend.request({ e2e: { action: 'readCandles', instrument: ids[1], timeframe, from: timestamp, through: timestamp } })
+      assert.equal(rows.length, 1)
+      for (const field of ['open', 'high', 'low', 'close', 'volume', 'baseVolume', 'quoteVolume', 'confirmed']) {
+        assert.equal(rows[0][field], expected[field], `${timeframe} ${field} must match the canonical 5m aggregate.`)
+      }
+    }
 
     // With sources settled, observational reads cannot manufacture new repair
     // work, focus ownership, or source demand for any period.

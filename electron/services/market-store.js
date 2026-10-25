@@ -315,6 +315,19 @@ export class MarketStore {
       return this.writer.request('append', [candles, { replacement: range }], priority)
     })
   }
+  aggregateCandles(query, priority = 'background') {
+    return this.operation(() => {
+      if (!query || typeof query !== 'object' || !Object.hasOwn(query, 'from') || !Object.hasOwn(query, 'through')) {
+        throw new TypeError('Candle aggregation requires an explicit parent range.')
+      }
+      const range = validateQuery(query), step = CANDLE_INTERVALS[range.timeframe]
+      if (!['15m', '1H'].includes(range.timeframe) || range.from % step || range.through % step
+        || query.invalidateIncomplete !== undefined && typeof query.invalidateIncomplete !== 'boolean') {
+        throw new TypeError('Invalid candle aggregation range.')
+      }
+      return this.writer.request('aggregateCandles', [{ ...range, invalidateIncomplete: query.invalidateIncomplete === true }], priority)
+    })
+  }
   appendStatistics(input, priority = 'background') { return this.operation(() => this.writer.request('appendStatistics', [input], priority)) }
   candles(query, priority = 'background') { return this.read('candles', query, priority) }
   statistics(query, priority = 'background') { return this.read('statistics', query, priority) }

@@ -9,7 +9,7 @@ import { DEFAULT_PREFERENCES } from '../electron/services/preferences.js'
 import type { RealtimeWebSocket } from '../electron/services/realtime-market.js'
 import type { PreparedChartResponse } from './chart-data.ts'
 
-const instId = 'BTC-USDT-SWAP', timeframe = '15m', step = 900_000
+const instId = 'BTC-USDT-SWAP', timeframe = '5m', step = 300_000
 const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done }); return { promise, resolve } }
 const raw = (timestamp: number, close: number, volume: number) => [String(timestamp), '100', '250', '90', String(close), String(volume), '1', '500', '0']
 class Socket extends EventTarget implements RealtimeWebSocket {
@@ -51,7 +51,7 @@ for (const volume of [5, 8]) test(`late forming REST cannot replace a newer nati
     assert.equal(service.history.latest(instId, timeframe), pending, 'Concurrent quote readers share their admitted source request.')
     service.realtime.start(); socket.open()
     await service.realtime.whenIdle()
-    socket.message({ arg: { channel: 'candle15m', instId }, data: [raw(now - 60_000, 200, volume)] })
+    socket.message({ arg: { channel: 'candle5m', instId }, data: [raw(now - 60_000, 200, volume)] })
     await service.realtime.whenIdle()
     assert.equal(service.liveCandles.get(`${instId}:${timeframe}`).close, 200)
     assert.equal(service.preparedCharts.cached(`${instId}:${timeframe}`).liveBar.close, 200)

@@ -10,6 +10,21 @@ const channels = ['tickers', 'open-interest', 'books', 'trades']
 const keyFor = ({ instId, instType, channel }) => `${channel}:${channel === 'instruments' ? instType : instId}`
 const hour = 3_600_000
 const copy = value => ({ ...value })
+const validInstrumentId = value => typeof value === 'string' && /^[A-Za-z0-9-]{1,128}$/.test(value)
+
+function normalizeDemand(value, instruments, channel) {
+  if (value === undefined || value === true) return new Set(instruments)
+  if (value === false) return new Set()
+  if (value === null || typeof value === 'string' || typeof value[Symbol.iterator] !== 'function') {
+    throw new TypeError(`${channel} subscription demand must be a boolean or iterable of instrument IDs.`)
+  }
+  const demand = new Set()
+  for (const instId of value) {
+    if (!validInstrumentId(instId)) throw new TypeError(`Invalid ${channel} subscription demand.`)
+    if (instruments.has(instId)) demand.add(instId)
+  }
+  return demand
+}
 
 /** Transport and incremental order-book reconstruction; consumers own projections. */
 class PublicMarketConnection {
@@ -61,9 +76,8 @@ class PublicMarketConnection {
   getState() { return copy(this.state) }
   getTelemetry() { return copy(this.telemetry) }
 
-  setSubscriptions(instIds, { books = true } = {}) {
+  setSubscriptions(instIds, { books, trades }) {
     if (this.closed) throw new Error('Realtime public market is closed.')
-    if (typeof books !== 'boolean') throw new TypeError('Book subscription demand must be a boolean.')
     const instruments = new Set()
     const next = new Map()
     if (this.options.instrumentsControl) {
@@ -71,10 +85,11 @@ class PublicMarketConnection {
       next.set(key, this.subscriptions.get(key) ?? value)
     }
     for (const instId of instIds) {
-      if (typeof instId !== 'string' || !/^[A-Za-z0-9-]{1,128}$/.test(instId)) throw new TypeError('Invalid public market subscription.')
+      if (!validInstrumentId(instId)) throw new TypeError('Invalid public market subscription.')
       instruments.add(instId)
       for (const channel of channels) {
-        if (channel === 'books' && !books) continue
+        if (channel === 'books' && !books.has(instId)) continue
+        if (channel === 'trades' && !trades.has(instId)) continue
         const value = { instId, channel }, key = keyFor(value)
         next.set(key, this.subscriptions.get(key) ?? value)
       }
@@ -84,7 +99,7 @@ class PublicMarketConnection {
     this.subscriptions = next
     if (this.connection) for (const [, value] of removed) {
       this.invalidateSubscription(this.connection, value)
-      this.connection.bookRecoveries.delete(value.instId)
+      if (value.channel === 'books') this.connection.bookRecoveries.delete(value.instId)
     }
     for (const instId of this.books.keys()) if (!next.has(`books:${instId}`)) this.books.delete(instId)
     if (!next.size) {
@@ -652,7 +667,7 @@ export class RealtimePublicMarket {
     this.controlShard = null
     if (typeof options.onInstruments === 'function') {
       this.controlShard = this.makeShard(true)
-      this.controlShard.setSubscriptions([])
+      this.controlShard.setSubscriptions([], { books: new Set(), trades: new Set() })
       this.subscriptions = new Map(this.controlShard.subscriptions)
     }
   }
@@ -685,11 +700,13 @@ export class RealtimePublicMarket {
     return market
   }
 
-  setSubscriptions(instIds, { books = true } = {}) {
+  setSubscriptions(instIds, demand = {}) {
     if (this.closed) throw new Error('Realtime public market is closed.')
-    if (typeof books !== 'boolean') throw new TypeError('Book subscription demand must be a boolean.')
+    if (demand === null || typeof demand !== 'object') throw new TypeError('Public market channel demand must be an object.')
     const next = new Set(instIds)
-    for (const instId of next) if (typeof instId !== 'string' || !/^[A-Za-z0-9-]{1,128}$/.test(instId)) throw new TypeError('Invalid public market subscription.')
+    for (const instId of next) if (!validInstrumentId(instId)) throw new TypeError('Invalid public market subscription.')
+    const books = normalizeDemand(demand.books, next, 'Book')
+    const trades = normalizeDemand(demand.trades, next, 'Trade')
     this.changing = true
     this.instruments = next
     const assigned = new Set()
@@ -705,7 +722,10 @@ export class RealtimePublicMarket {
       allocation.ids.push(instId)
     }
     for (const { market, ids } of allocations) {
-      market.setSubscriptions(ids, { books })
+      market.setSubscriptions(ids, {
+        books: new Set(ids.filter(instId => books.has(instId))),
+        trades: new Set(ids.filter(instId => trades.has(instId))),
+      })
       if (!ids.length && market !== this.controlShard) {
         this.shards = this.shards.filter(value => value !== market)
         const closing = market.close().then(() => {

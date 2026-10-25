@@ -50,9 +50,9 @@ const abortable = (promise, signal) => {
 
 /** OKX source adaptation; HistorySync alone schedules durable observations. */
 export class MarketHistory {
-  constructor({ store, metadata, get, awaitRealtimeCandle, parseCandle, persistCandles, persistStatistics, replaceCandles, instrument, onProgress, onLive, liveRevision, onAuditCheckpoint, now = Date.now }) {
+  constructor({ store, metadata, get, awaitRealtimeCandle, parseCandle, persistCandles, persistStatistics, replaceCandles, derivePrices, instrument, onProgress, onLive, liveRevision, onAuditCheckpoint, now = Date.now }) {
     if (typeof replaceCandles !== 'function') throw new TypeError('MarketHistory needs a replacement mutation callback.')
-    Object.assign(this, { store, metadata, get, awaitRealtimeCandle, parseCandle, persistCandles, persistStatistics, replaceCandles, instrument, onLive, liveRevision, now })
+    Object.assign(this, { store, metadata, get, awaitRealtimeCandle, parseCandle, persistCandles, persistStatistics, replaceCandles, derivePrices, instrument, onLive, liveRevision, now })
     this.closed = false
     this.closeTask = null
     this.controllers = new Set()
@@ -126,7 +126,14 @@ export class MarketHistory {
   }
 
   async missingSource(query, priority) {
-    const rows = query.source === 'candles' ? await this.store.candles(query, priority) : await this.store.statistics(query, priority)
+    let rows = query.source === 'candles' ? await this.store.candles(query, priority) : await this.store.statistics(query, priority)
+    if (query.source === 'candles' && query.timeframe !== '5m' && this.derivePrices) {
+      const gaps = missing(rows, query.from, query.through, query.intervalMS, pricePresent)
+      if (gaps.length) {
+        for (const gap of gaps) await this.derivePrices({ instrument: query.instrument, timeframe: query.timeframe, ...gap }, priority)
+        rows = await this.store.candles(query, priority)
+      }
+    }
     const bit = query.source === 'oi' ? OI : TAKER
     const observations = this.seeds.get(keyOf(query.instrument, query.timeframe)), observedAt = this.now()
     const leases = []

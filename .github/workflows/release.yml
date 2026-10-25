@@ -40,6 +40,8 @@ jobs:
         run: npm run test:core -- --output artifacts/sandbox
       - name: Test Electron with isolated fixtures
         run: npm run test:e2e -- --output artifacts/sandbox
+      - name: Verify reduced traffic with complete live coverage and responsive input
+        run: npm run sandbox -- command --desktop --output artifacts/sandbox -- node scripts/market-traffic-benchmark.mjs --expect-optimized --output artifacts/market-traffic.json
       - name: Probe native GPU capabilities and verify accelerated chart work when available
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         # Hosted runners may expose software rendering. The dedicated report

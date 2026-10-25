@@ -90,8 +90,8 @@ function fixture(overrides: Partial<RealtimePublicMarketOptions> = {}) {
     logger: { error: message => { errors.push(String(message)) } },
     ...overrides,
   })
-  const open = async (instIds = [btc]) => {
-    market.setSubscriptions(instIds)
+  const open = async (instIds = [btc], demand?: { books?: boolean | Iterable<string>; trades?: boolean | Iterable<string> }) => {
+    market.setSubscriptions(instIds, demand)
     market.start()
     const expected = Math.ceil(new Set(instIds).size / 25)
     for (let index = 0; index < expected; index++) {
@@ -509,6 +509,127 @@ test('books demand changes only books and reenable waits for unsubscribe and fre
   const count = socket.commands().length
   f.market.setSubscriptions([btc, eth], { books: true })
   assert.equal(socket.commands().length, count)
+})
+
+test('book and trade iterable demands partition per shard while tickers and open interest cover every instrument', async t => {
+  const f = fixture()
+  t.after(() => f.market.close())
+  const instIds = Array.from({ length: 26 }, (_, index) => `TOKEN${index}-USDT-SWAP`)
+  const first = instIds[0], nearBoundary = instIds[24], last = instIds[25], other = 'SOL-USDT-SWAP'
+  await f.open(instIds, { books: new Set([first, last]), trades: [nearBoundary, last, other] })
+  const channels = (instId: string) => f.sockets.flatMap(socket => socket.commands()).flatMap(command => command.args)
+    .filter(arg => arg.instId === instId).map(arg => arg.channel).sort()
+  assert.deepEqual(channels(first), ['books', 'open-interest', 'tickers'])
+  assert.deepEqual(channels(nearBoundary), ['open-interest', 'tickers', 'trades'])
+  assert.deepEqual(channels(last), ['books', 'open-interest', 'tickers', 'trades'])
+  assert.equal(f.sockets.length, 2)
+  assert.equal(f.market.subscriptions.size, 56)
+
+  const count = f.sockets.flatMap(socket => socket.commands()).length
+  f.market.setSubscriptions(instIds, { books: [first, last, first], trades: new Set([other, last, nearBoundary]) })
+  assert.equal(f.sockets.flatMap(socket => socket.commands()).length, count, 'Equivalent iterable demands retain the existing channel sessions.')
+  push(f.sockets[0], 'books', [book(10)], nearBoundary, 'snapshot')
+  push(f.sockets[0], 'trades', [{ tradeId: 'excluded' }], first)
+  push(f.sockets[0], 'books', [book(11)], first, 'snapshot')
+  push(f.sockets[1], 'books', [book(12)], last, 'snapshot')
+  push(f.sockets[0], 'trades', [{ tradeId: 'included-first-shard' }], nearBoundary)
+  push(f.sockets[1], 'trades', [{ tradeId: 'included-second-shard' }], last)
+  push(f.sockets[0], 'tickers', [{ last: '100' }], first)
+  push(f.sockets[1], 'tickers', [{ last: '200' }], last)
+  push(f.sockets[0], 'open-interest', [{ oi: '300' }], first)
+  push(f.sockets[1], 'open-interest', [{ oi: '400' }], last)
+  await f.market.whenIdle()
+  assert.deepEqual(f.books.map(value => value.seqId).sort((a, b) => a - b), [11, 12])
+  assert.equal(f.trades.length, 2)
+  assert.deepEqual(f.tickers.sort(), [`${first}:100`, `${last}:200`].sort())
+  assert.deepEqual(f.oi.sort(), [`${first}:300`, `${last}:400`].sort())
+})
+
+test('trade demand removal invalidates only that session and requalification waits for its unsubscribe ACK', async t => {
+  const removed: string[] = [], disconnected: string[][] = [], accepted: (boolean | undefined)[] = [], fTrades: unknown[] = []
+  const f = fixture({
+    onTrades: (_instId, value, context) => { fTrades.push(value); accepted.push(context.acknowledged) },
+    onUnsubscribed: (instId, channel, context) => {
+      if (channel === 'trades') {
+        assert.equal(context.signal.aborted, false)
+        removed.push(`${channel}:${instId}`)
+      }
+    },
+    onDisconnect: instIds => { disconnected.push(instIds) },
+  })
+  t.after(() => f.market.close())
+  const socket = await f.open([btc, eth], { books: true, trades: true })
+  socket.autoAck = false
+  const stable = [...f.market.subscriptions].filter(([, value]) => ['tickers', 'open-interest', 'books'].includes(value.channel))
+
+  f.market.setSubscriptions([btc, eth], { books: true, trades: new Set([btc]) })
+  const unsubscribe = socket.commands().at(-1)!
+  assert.equal(unsubscribe.op, 'unsubscribe')
+  assert.deepEqual(unsubscribe.args, [{ instId: eth, channel: 'trades' }])
+  assert.deepEqual(removed, [`trades:${eth}`], 'Trade coverage is invalidated synchronously on channel removal.')
+  for (const [key, value] of stable) assert.equal(f.market.subscriptions.get(key), value)
+
+  const count = socket.commands().length
+  f.market.setSubscriptions([btc, eth], { books: true, trades: [btc] })
+  assert.equal(socket.commands().length, count, 'Repeating unchanged demand cannot duplicate controls.')
+  assert.deepEqual(removed, [`trades:${eth}`], 'A repeated demand change cannot notify the parent twice.')
+  push(socket, 'trades', [{ tradeId: 'retired' }], eth)
+  push(socket, 'tickers', [{ last: '100' }], eth)
+  push(socket, 'open-interest', [{ oi: '200' }], eth)
+  push(socket, 'trades', [{ tradeId: 'retained' }], btc)
+  await f.market.whenIdle()
+  assert.deepEqual(fTrades, [[{ tradeId: 'retained' }]])
+  assert.deepEqual(accepted, [true])
+  assert.deepEqual(f.tickers, [`${eth}:100`])
+  assert.deepEqual(f.oi, [`${eth}:200`])
+
+  f.market.setSubscriptions([btc, eth], { books: true, trades: [btc, eth] })
+  assert.equal(socket.commands().length, count, 'Requalification remains blocked by its outstanding unsubscribe ACK.')
+  socket.message({ id: 'stale', event: 'unsubscribe', arg: unsubscribe.args[0] })
+  await f.market.whenIdle()
+  assert.equal(socket.commands().length, count)
+  socket.message({ id: unsubscribe.id, event: 'unsubscribe', arg: unsubscribe.args[0] })
+  await f.market.whenIdle()
+  const subscribe = socket.commands().at(-1)!
+  assert.equal(subscribe.op, 'subscribe')
+  assert.deepEqual(subscribe.args, [{ instId: eth, channel: 'trades' }])
+  assert.equal(f.sockets.length, 1)
+  assert.deepEqual(disconnected, [])
+  assert.deepEqual(removed, [`trades:${eth}`])
+
+  push(socket, 'trades', [{ tradeId: 'new-session-before-ACK' }], eth)
+  await f.market.whenIdle()
+  assert.deepEqual(fTrades.at(-1), [{ tradeId: 'new-session-before-ACK' }])
+  assert.deepEqual(accepted, [true, false], 'Unacknowledged events are distinguished from the retired session.')
+  socket.message({ id: subscribe.id, event: 'subscribe', arg: subscribe.args[0] })
+  await f.market.whenIdle()
+  push(socket, 'trades', [{ tradeId: 'acknowledged' }], eth)
+  await f.market.whenIdle()
+  assert.deepEqual(accepted, [true, false, true])
+})
+
+test('changing trade demand preserves an in-flight book recovery and its retry deadline', async t => {
+  const removed: string[] = []
+  const f = fixture({ onUnsubscribed: (instId, channel) => { removed.push(`${channel}:${instId}`) } })
+  t.after(() => f.market.close())
+  const socket = await f.open([btc])
+  push(socket, 'books', [book(10)], btc, 'snapshot')
+  push(socket, 'books', [book(11, 9)], btc, 'update')
+  await f.market.whenIdle()
+  assert.equal(socket.commands().at(-1)?.op, 'unsubscribe')
+  assert.deepEqual(socket.commands().at(-1)?.args, [{ instId: btc, channel: 'books' }])
+
+  f.market.setSubscriptions([btc], { books: true, trades: false })
+  await f.market.whenIdle()
+  assert.deepEqual(socket.commands().at(-1)?.args, [{ instId: btc, channel: 'trades' }])
+  assert.deepEqual(removed, [`books:${btc}`, `trades:${btc}`])
+  await f.clock.advance(999)
+  assert.equal(socket.commands().length, 3)
+  await f.clock.advance(1)
+  await f.market.whenIdle()
+  assert.equal(socket.commands().at(-1)?.op, 'subscribe')
+  assert.deepEqual(socket.commands().at(-1)?.args, [{ instId: btc, channel: 'books' }])
+  assert.equal(f.sockets.length, 1)
 })
 
 test('a disabled initial book demand retains the other streams and defaults still enable books', async t => {

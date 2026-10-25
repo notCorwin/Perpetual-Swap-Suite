@@ -27,4 +27,5 @@ export class LiveStatistics {
   openInterest(instId: string, observation: LiveOpenInterest, receivedAt?: number): void
   /** Copy a candle and add only trustworthy native-period observations. */
   enrich<T extends CandleRecord>(candle: T, receivedAt?: number): T
+  canFinalize(candle: CandleRecord, receivedAt?: number): boolean
 }

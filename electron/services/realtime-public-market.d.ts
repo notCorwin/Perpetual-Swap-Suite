@@ -7,8 +7,10 @@ export type PublicMarketRawRecord = Record<string, string | number>
 export type PublicInstrumentRecord = Record<string, unknown>
 export type PublicMarketSubscription = { instId: string; channel: PublicMarketChannel } | { channel: 'instruments'; instType: 'SWAP' }
 export type PublicMarketChannelDemand = {
-  /** Defaults to true. Disable when neither depth nor slippage needs books. */
-  books?: boolean
+  /** Defaults to true. Disable or list instruments when depth/slippage is not needed. */
+  books?: boolean | Iterable<string>
+  /** Defaults to true. Disable or list instruments when trade flow is not needed. */
+  trades?: boolean | Iterable<string>
 }
 export type PublicMarketBook = { bids: (readonly string[])[]; asks: (readonly string[])[]; ts: string; seqId: number }
 export type PublicMarketEventContext = {
@@ -43,7 +45,7 @@ export type RealtimePublicMarketOptions = {
   onBook: (instId: string, book: PublicMarketBook, context: PublicMarketEventContext) => void | Promise<void>
   onTrades: (instId: string, raw: PublicMarketRawRecord[], context: PublicMarketEventContext) => void | Promise<void>
   onSubscribed?: (instId: string, channel: PublicMarketChannel, context: PublicMarketEventContext) => void | Promise<void>
-  /** Synchronous invalidation on removal or book recovery; that book's signal is then aborted. */
+  /** Synchronous invalidation on channel removal or book recovery, including same-socket demand changes. */
   onUnsubscribed?: (instId: string, channel: PublicMarketChannel, context: PublicMarketEventContext) => void | Promise<void>
   /** Called only for the contracts on the retired socket; its signal is aborted. */
   onDisconnect?: (instIds: string[], context: { signal: AbortSignal }) => void | Promise<void>
@@ -72,7 +74,7 @@ export class RealtimePublicMarket {
   constructor(options: RealtimePublicMarketOptions)
   readonly instruments: Set<string>
   readonly subscriptions: Map<string, PublicMarketSubscription>
-  /** Always retains tickers, open-interest, and trades; books follow demand. */
+  /** Tickers and open interest cover every instrument; books and trades follow independent demand. */
   setSubscriptions(instIds: string[], demand?: PublicMarketChannelDemand): void
   start(): void
   getState(): RealtimeMarketState

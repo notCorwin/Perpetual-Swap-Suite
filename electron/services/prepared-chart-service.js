@@ -79,8 +79,8 @@ const appendConfirmed = (state, candle) => {
 
 /** Price publication, statistic observations and exact indicator work have independent lifetimes. */
 export class PreparedChartPipeline {
-  constructor({ store, history, normalize, revision, instrument, streaming = () => false }) {
-    Object.assign(this, { store, history, normalize, revision, instrument, streaming })
+  constructor({ store, history, normalize, revision, instrument, streaming = () => false, acquire = () => true, onFocus = () => {} }) {
+    Object.assign(this, { store, history, normalize, revision, instrument, streaming, acquire, onFocus })
     this.series = new Map(); this.liveStates = new Map(); this.snapshots = new Map(); this.universe = new Map()
     this.realtimeKeys = new Set(); this.listeners = new Set(); this.tasks = new Map(); this.localTasks = new Map()
     this.liveSeeds = new Map(); this.maxSeries = 12; this.maxBytes = 32 * 1024 * 1024
@@ -88,7 +88,9 @@ export class PreparedChartPipeline {
     this.nextGeneration = 0; this.nextRevision = 0; this.nextCalculation = 0
     this.nextProjection = 0
     this.workers = []; this.calculations = new Map(); this.calculationQueue = []
-    this.workerLimit = Math.max(1, Math.min(8, availableParallelism() - 2))
+    // Market ingress, liquidity, renderer and the OS share the same CPU. Do
+    // not let the indicator pool consume every remaining execution slot.
+    this.workerLimit = Math.max(1, Math.min(4, availableParallelism() - 3))
     this.candidateLimit = Math.min(4, this.workerLimit)
     this.candidateQueue = []; this.candidateTasks = new Map(); this.candidateTimer = null; this.candidateTimerAt = Infinity
     this.warmSourceQueue = []; this.warmSourceActive = new Map()
@@ -226,6 +228,7 @@ export class PreparedChartPipeline {
   }
 
   currentDemand(demand) { return this.currentFocus(demand) || !this.closed && demand != null && this.universe.get(demand.key) === demand }
+  sourceDemand(demand) { return this.currentDemand(demand) && (this.currentFocus(demand) || this.acquire(demand.instId, demand.timeframe)) }
   stateDemand(state) { return this.liveStates.get(state.key) === state && this.universe.get(state.key) || (this.focus?.key === state.key ? this.focus : this.universe.get(state.key)) }
   candidateVersion(demand) {
     const state = this.liveStates.get(demand.key)
@@ -351,6 +354,7 @@ export class PreparedChartPipeline {
       void focus.task.catch(() => {}).finally(() => this.scheduleRefresh())
     }
     this.scheduleRefresh()
+    this.onFocus(this.focus)
   }
 
   reconcileSourceJobs() {
@@ -358,11 +362,11 @@ export class PreparedChartPipeline {
     const end = this.focus && (this.focus.end ?? Math.floor(Date.now() / step) * step - step)
     const from = end - (VISIBLE - 1) * step
     for (const [sourceKey, job] of this.sourceTasks) {
-      job.demands = new Set([...(job.demands ?? [])].filter(demand => this.currentDemand(demand)))
+      job.demands = new Set([...(job.demands ?? [])].filter(demand => this.sourceDemand(demand)))
       const candidate = this.universe.get(job.seriesKey), candidateStep = job.state.intervalMS
       const candidateEnd = Math.floor(Date.now() / candidateStep) * candidateStep - candidateStep
       const displayedEnd = this.liveStates.get(job.seriesKey)?.latestHour ?? candidateEnd
-      if (candidate && [candidateEnd, displayedEnd].some(end => job.from <= end
+      if (candidate && this.sourceDemand(candidate) && [candidateEnd, displayedEnd].some(end => job.from <= end
         && job.through >= end - (VISIBLE - 1 + (job.source === 'candles' ? INDICATOR_WARMUP : 0)) * candidateStep)) job.demands.add(candidate)
       // A nearby cursor can still use an admitted viewport/reserve page. Keep
       // that consumer attached so HistorySync need not abort and refetch it.
@@ -390,6 +394,7 @@ export class PreparedChartPipeline {
   currentFocus(focus) { return !this.closed && focus !== null && focus === this.focus }
   sourceStateChanged() {
     this.sourceEpoch += 1
+    this.reconcileSourceJobs()
     // Source continuity changes the quote lease, not the cached calculation.
     // Publish status immediately even when a quiet series sends no next tick.
     for (const [key, snapshot] of this.snapshots) {
@@ -851,7 +856,7 @@ export class PreparedChartPipeline {
   }
 
   refreshObservations(state, targetEnd, historyBars = VISIBLE, priceBars = historyBars, focus = this.stateDemand(state), reserve) {
-    if (!this.currentDemand(focus) || focus.key !== state.key) return null
+    if (!this.sourceDemand(focus) || focus.key !== state.key) return null
     this.refreshIndicators(state, focus)
     const { instId, timeframe, intervalMS: step } = state
     const end = targetEnd ?? Math.floor(Date.now() / step) * step - step
@@ -914,7 +919,7 @@ export class PreparedChartPipeline {
   }
 
   refreshStatistics(state, from, through, priority, reserve, demand = this.stateDemand(state)) {
-    if (typeof this.history.ensureStatistics !== 'function') return
+    if (!this.sourceDemand(demand) || typeof this.history.ensureStatistics !== 'function') return
     const { instId, timeframe, intervalMS: step } = state
     for (const [source, bit] of [['oi', 1], ['taker', 2]]) {
       // Skipping an active range also means sharing its lifetime. Otherwise a
@@ -938,7 +943,7 @@ export class PreparedChartPipeline {
   }
 
   indicatorDemand(state, focus = this.stateDemand(state)) {
-    if (!this.currentDemand(focus) || focus.key !== state.key || typeof this.history.ensurePrices !== 'function') return null
+    if (!this.sourceDemand(focus) || focus.key !== state.key || typeof this.history.ensurePrices !== 'function') return null
     const expectedEnd = Math.floor(Date.now() / state.intervalMS) * state.intervalMS - state.intervalMS
     const end = focus.end ?? (this.universe.get(state.key) === focus ? state.latestHour ?? expectedEnd : expectedEnd)
     const floor = state.floor ?? 0, first = Math.max(0, end - (VISIBLE - 1) * state.intervalMS, floor)

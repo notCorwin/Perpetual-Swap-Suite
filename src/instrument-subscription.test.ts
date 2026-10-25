@@ -51,8 +51,7 @@ async function fixture(definitions = [instrument()], acquire?: () => Promise<unk
     throw new Error(`Unexpected network acquisition: ${url.pathname}`)
   }
   const service = new MarketService(store, () => preferences, fetcher, false)
-  // Collection assertions exclude independent chart-history preparation.
-  service.preparedCharts.setRealtimeSubscriptions = () => undefined
+  // Realtime chart keys are lightweight membership and do not prepare history.
   await service.ready
   projectionIsolation(service)
   const close = async () => { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
@@ -86,7 +85,8 @@ test('subscribe-before-snapshot reconciliation merges buffered listing, delistin
     assert.equal(f.service.instruments.get(btc).ctVal, '0.02', 'An older REST snapshot cannot overwrite a buffered definition revision.')
     assert.deepEqual(listed(f.service), [btc, sol])
     assert.deepEqual([...f.service.publicRealtime.instruments].sort(), [btc, sol])
-    assert.equal(f.service.realtime.subscriptions.size, 6, 'Both eligible contracts receive every native candle timeframe.')
+    assert.deepEqual([...f.service.realtime.subscriptions.keys()].sort(), ['5m:BTC-USDT-SWAP', '5m:SOL-USDT-SWAP'])
+    assert.equal(f.service.preparedCharts.realtimeKeys.size, 6, 'Chart projections retain all periods from each candidate’s 5m source.')
     assert.equal(f.requests.filter(path => path.endsWith('/public/instruments')).length, 1)
   } finally { held.resolve([]); await synchronizing; await f.close() }
 })

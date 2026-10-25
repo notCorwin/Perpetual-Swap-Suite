@@ -21,6 +21,8 @@ test('mid-period subscription never presents partial taker totals as a full cand
   statistics.trades(instId, [trade('full-buy', fiveMinutes + 100), trade('full-sell', fiveMinutes + 200, 'sell', '3')], fiveMinutes + 200)
   assert.deepEqual(values(statistics.enrich(candle(fiveMinutes), fiveMinutes + 200)), [null, 2, 3])
   assert.deepEqual(values(statistics.enrich(candle(0, '15m'), fiveMinutes + 200)), [null, null, null])
+  assert.equal(statistics.canFinalize(candle(0, '5m', true), fiveMinutes), false)
+  assert.equal(statistics.canFinalize(candle(fiveMinutes, '5m', true), 2 * fiveMinutes), true)
 })
 
 test('aggregate trade size is counted once, independent of count and duplicate frames', () => {
@@ -60,6 +62,8 @@ test('disconnect invalidates its affected period and preserves previously comple
   statistics.trades(instId, [trade('resumed', fiveMinutes + 500)], fiveMinutes + 500)
   assert.deepEqual(values(statistics.enrich(candle(fiveMinutes), fiveMinutes + 500)), [null, null, null])
   assert.deepEqual(values(statistics.enrich(candle(0, '5m', true, 2), fiveMinutes + 500)), [null, 2, 0])
+  assert.equal(statistics.canFinalize(candle(0, '5m', true, 2), fiveMinutes + 500), true)
+  assert.equal(statistics.canFinalize(candle(fiveMinutes, '5m', true), 2 * fiveMinutes), false)
   statistics.trades(instId, [trade('next', 2 * fiveMinutes + 100, 'sell', '4')], 2 * fiveMinutes + 100)
   assert.deepEqual(values(statistics.enrich(candle(2 * fiveMinutes), 2 * fiveMinutes + 100)), [null, 0, 4])
   assert.deepEqual(values(statistics.enrich(candle(0, '15m'), 2 * fiveMinutes + 100)), [null, null, null])

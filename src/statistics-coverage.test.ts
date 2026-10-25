@@ -180,7 +180,7 @@ test('SQLite v1 migration retains numeric history and expires unversioned import
     assert.deepEqual(await store.statistics({ ...range, from: base + step, through: base + step }), [renewed])
     await store.close()
     const migrated = new DatabaseSync(join(root, 'market.sqlite'))
-    try { assert.equal(migrated.prepare('PRAGMA user_version').get()!.user_version, 2) }
+    try { assert.equal(migrated.prepare('PRAGMA user_version').get()!.user_version, 3) }
     finally { migrated.close() }
   } finally { await store?.close(); await rm(root, { recursive: true, force: true }) }
 })

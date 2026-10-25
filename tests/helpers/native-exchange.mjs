@@ -5,6 +5,7 @@ import { once } from 'node:events'
 import { ownFixtureServer } from './fixture-server.mjs'
 
 export const nativeIntervals = { '5m': 300_000, '15m': 900_000, '1H': 3_600_000 }
+const baseCandleCount = 3_600
 const frame = (value, opcode = 1) => {
   const body = Buffer.isBuffer(value) ? value : Buffer.from(value)
   const header = Buffer.alloc(body.length < 126 ? 2 : body.length < 65536 ? 4 : 10)
@@ -31,15 +32,35 @@ export async function createNativeExchange() {
   const basePrice = instId => instId.startsWith('BTC') ? 100 : 500
   const instruments = identities.map(instId => ({ instId, instType: 'SWAP', instCategory: '1', ctType: 'linear', settleCcy: 'USDT', state: 'live',
     ctVal: '1', ctMult: '1', ctValCcy: instId.split('-')[0], ruleType: 'normal', listTime: String(asOf - 500 * nativeIntervals['1H']) }))
-  const rows = identities.flatMap(instrument => Object.entries(nativeIntervals).flatMap(([timeframe, step]) => {
-    const end = Math.floor(asOf / step) * step - step, close = basePrice(instrument)
-    return Array.from({ length: 400 }, (_, index) => ({ instrument, timeframe, timestamp: end - (399 - index) * step,
+  const rows = identities.flatMap(instrument => {
+    const step = nativeIntervals['5m'], end = Math.floor(asOf / step) * step - step, close = basePrice(instrument)
+    const baseRows = Array.from({ length: baseCandleCount }, (_, index) => ({ instrument, timeframe: '5m', timestamp: end - (baseCandleCount - 1 - index) * step,
       open: close, high: close + 1, low: close - 1, close, volume: 100, baseVolume: 100, quoteVolume: close * 100, confirmed: true }))
-  }))
-  // Missing one closed price forces a real bounded history repair. Hold that
-  // response until newer native forming events have already reached the SVG.
-  const deferredKey = 'BTC-USDT-SWAP:15m', deferredEnd = Math.floor(asOf / nativeIntervals['15m']) * nativeIntervals['15m'] - nativeIntervals['15m']
-  const closedCandles = rows.filter(row => `${row.instrument}:${row.timeframe}` !== deferredKey || row.timestamp !== deferredEnd)
+    const coarseRows = Object.entries(nativeIntervals).filter(([timeframe]) => timeframe !== '5m').flatMap(([timeframe, interval]) => {
+      const grouped = new Map()
+      for (const row of baseRows) {
+        const timestamp = Math.floor(row.timestamp / interval) * interval, children = grouped.get(timestamp) ?? []
+        children.push(row); grouped.set(timestamp, children)
+      }
+      return [...grouped].filter(([, children]) => children.length === interval / step).map(([timestamp, children]) => ({
+        instrument, timeframe, timestamp, open: children[0].open, high: Math.max(...children.map(row => row.high)),
+        low: Math.min(...children.map(row => row.low)), close: children.at(-1).close,
+        volume: children.reduce((total, row) => total + row.volume, 0),
+        baseVolume: children.reduce((total, row) => total + row.baseVolume, 0),
+        quoteVolume: children.reduce((total, row) => total + row.quoteVolume, 0), confirmed: true,
+      }))
+    })
+    return [...baseRows, ...coarseRows]
+  })
+  // This parent is absent from SQLite because one required canonical 5m child
+  // is absent too. The renderer must retain its native 5m live price while the
+  // coarse source falls back to a held REST repair. Keep the gap outside the
+  // list's current 15m ranking window, which legitimately needs 5m history.
+  const deferredKey = 'BTC-USDT-SWAP:15m', deferredEnd = Math.floor(asOf / nativeIntervals['15m']) * nativeIntervals['15m'] - nativeIntervals['1H']
+  const missingBaseEnd = deferredEnd + nativeIntervals['5m']
+  const seededBase = rows.filter(row => row.timeframe === '5m')
+  const closedCandles = seededBase.filter(row => row.instrument !== 'BTC-USDT-SWAP' || row.timestamp !== missingBaseEnd)
+  const seededBaseFrom = seededBase[0].timestamp, seededBaseThrough = seededBase.at(-1).timestamp
   const clients = new Set(), requests = [], errors = [], held = [], latestQuotes = new Map(identities.map(id => [id, basePrice(id)])), lastCandles = new Map()
   let holdHistory = true, holdBusinessAcknowledgments = false
   const heldAcknowledgments = []
@@ -69,8 +90,8 @@ export async function createNativeExchange() {
       const values = rows.filter(row => row.instrument === instId && row.timeframe === timeframe
         && (!parameters.after || row.timestamp < Number(parameters.after)) && (!parameters.before || row.timestamp > Number(parameters.before)))
         .toSorted((left, right) => right.timestamp - left.timestamp).slice(0, Math.min(300, Number(parameters.limit) || 100)).map(rawCandle)
-      if (path === '/market/history-candles' && `${instId}:${timeframe}` === deferredKey && holdHistory
-        && values.some(value => Number(value[0]) === deferredEnd)) {
+      const missingCoarseParent = `${instId}:${timeframe}` === deferredKey && values.some(value => Number(value[0]) === deferredEnd)
+      if (path === '/market/history-candles' && holdHistory && missingCoarseParent) {
         record.held = true
         held.push({ response, record, data: values })
         return
@@ -141,10 +162,20 @@ export async function createNativeExchange() {
   server.listen(0, '127.0.0.1'); await once(server, 'listening')
   const origin = `http://127.0.0.1:${server.address().port}`
   const subscribed = (instId, channel) => [...clients].filter(client => client.subscriptions.has(`${channel}:${instId}`))
-  return { asOf, instruments, closedCandles, requests, errors, deferredEnd,
+  return { asOf, instruments, closedCandles, requests, errors, deferredEnd, missingBaseEnd, seededBaseFrom, seededBaseThrough, baseCandleCount,
     environment: { PERPETUAL_SWAP_E2E_HTTP_ORIGIN: origin, PERPETUAL_SWAP_E2E_WEBSOCKET_ORIGIN: origin.replace('http:', 'ws:') },
     waitForSubscription: (instId, channel) => waitFor(() => subscribed(instId, channel).length > 0, `${channel}/${instId} native subscription`),
-    waitForHeldHistory: () => waitFor(() => held.some(value => !value.response.destroyed), 'deferred native BTC 15m missing-candle repair'),
+    waitForHeldHistory: async () => {
+      try {
+        await waitFor(() => held.some(value => !value.response.destroyed && value.record.parameters.instId === 'BTC-USDT-SWAP'
+          && value.record.parameters.bar === '15m'), 'deferred native BTC 15m fallback for a parent that cannot be derived locally')
+      } catch (error) {
+        const candleRequests = requests.filter(value => value.path === '/market/history-candles')
+        throw new Error(`${error.message}; native candle requests=${JSON.stringify(candleRequests)}`, { cause: error })
+      }
+    },
+    businessSubscriptions: () => [...new Set([...clients].filter(client => client.path === '/ws/v5/business')
+      .flatMap(client => [...client.subscriptions.keys()]))].sort(),
     async disconnectBusiness({ holdAcknowledgments = false } = {}) {
       holdBusinessAcknowledgments = holdAcknowledgments
       const previous = [...clients].filter(client => client.path === '/ws/v5/business')
@@ -155,7 +186,7 @@ export async function createNativeExchange() {
       return previous.length
     },
     waitForBusinessReconnect: () => waitFor(() => new Set(heldAcknowledgments.filter(value => clients.has(value.client)).map(value => subscriptionKey(value.arg))).size
-      === identities.length * Object.keys(nativeIntervals).length, 'real native business resubscription commands'),
+      === identities.length, 'real native business resubscription commands for every candidate'),
     resumeBusinessAcknowledgments() {
       holdBusinessAcknowledgments = false
       for (const { client, id, arg } of heldAcknowledgments.splice(0)) {
@@ -171,6 +202,7 @@ export async function createNativeExchange() {
       return held.filter(value => value.record.respondedAt !== null).length
     },
     sendCandle(instId, timeframe, { close, volume, timestamp = Math.floor(Date.now() / nativeIntervals[timeframe]) * nativeIntervals[timeframe], confirmed = false }) {
+      assert.equal(timeframe, '5m', 'The native fixture sends canonical 5m candles only.')
       const channel = `candle${timeframe}`, recipients = subscribed(instId, channel)
       assert.ok(recipients.length, `No native ${channel}/${instId} subscriber`)
       const key = `${instId}:${timeframe}:${timestamp}`, previous = lastCandles.get(key), cumulative = volume ?? (previous?.volume ?? 0) + 1
@@ -180,7 +212,7 @@ export async function createNativeExchange() {
       lastCandles.set(key, row)
       const sentAt = Date.now()
       for (const client of recipients) send(client, { arg: { channel, instId }, data: [rawCandle(row)] })
-      return { instId, timeframe, hour: timestamp, close, sentAt }
+      return { instId, timeframe, timestamp, close, volume: cumulative, baseVolume: cumulative, quoteVolume, confirmed, sentAt }
     },
     sendTicker(instId, close) {
       latestQuotes.set(instId, close)

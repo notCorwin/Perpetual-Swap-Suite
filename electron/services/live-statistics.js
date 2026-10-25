@@ -144,6 +144,14 @@ export class LiveStatistics {
     }
   }
 
+  canFinalize(candle, receivedAt = this.now()) {
+    const interval = INTERVALS.get(candle.timeframe), start = candle.timestamp
+    if (!interval || !timestamp(start) || start % interval || receivedAt < start + interval) return false
+    const state = this.state(candle.instrument, receivedAt), close = start + interval
+    return Boolean(state && (state.active !== null && state.active <= start
+      || state.coverage.some(value => value.from <= start && value.through >= close)))
+  }
+
   enrich(candle, receivedAt = this.now()) {
     const result = { ...candle }
     const interval = INTERVALS.get(candle.timeframe)

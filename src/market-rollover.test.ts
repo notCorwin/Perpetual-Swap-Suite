@@ -113,13 +113,13 @@ const fixture = async (context: TestContext, { hourly = false, connected = true,
     if (connected) {
       if (partialAck) {
         service.realtime.ackTimeoutMs = 30_000
-        socket.heldAcknowledgements.add(`candle15m:${ids[1]}`)
+        socket.heldAcknowledgements.add(`candle5m:${ids[1]}`)
       }
       service.realtime.start(); socket.open()
       await service.realtime.whenIdle()
       for (const id of ids) {
-        assert.equal(service.realtime.isSubscribed(id, '5m'), true)
-        if (hourly) assert.equal(service.realtime.isSubscribed(id, '1H'), true)
+        assert.equal(service.realtime.isSubscribed(id, '5m'), !partialAck || id !== ids[1])
+        if (hourly) assert.equal(service.realtime.isSubscribed(id, '1H'), false)
       }
     }
     offline = true
@@ -214,7 +214,7 @@ test('continuity binds when the native ACK arrives between historical validation
   } finally { await f.close() }
 })
 
-test('completed native candles roll qualification windows forward without another full-window database read', async context => {
+test('one completed 5m source rolls both qualification windows forward without another full-window database read', async context => {
   const f = await fixture(context, { hourly: true })
   try {
     let historicalReads = 0
@@ -225,12 +225,11 @@ test('completed native candles roll qualification windows forward without anothe
     await f.roll()
     for (const id of ids) {
       f.socket.candle(candle(id, f.asOf, 400_000))
-      f.socket.candle(candle(id, epoch, 2_000_000, '1H'))
     }
     await f.service.realtime.whenIdle()
     await f.waitFor(() => ids.every(id => f.service.catalog.get(id)?.observations.turnover.value.asOf === f.boundary
       && f.service.catalog.get(id)?.observations.hourly.value.asOf === f.boundary))
-    assert.equal(historicalReads, 0, 'Previously validated windows consume only newly committed native observations.')
+    assert.equal(historicalReads, 0, 'Previously validated windows consume only the new source and derived commits.')
     assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     assert.ok(ids.every(id => f.service.catalog.get(id).result.turnover === 57_800_000))
     f.assertNoRefresh()
@@ -492,12 +491,13 @@ test('an unrelated pending acknowledgement cannot prevent a continuously subscri
     assert.equal(f.service.realtime.getState().status, 'connecting')
     assert.equal(f.service.realtime.isSubscribed(ids[0], '5m'), true)
     await f.roll()
-    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort(), 'Authority must be captured when this series is acknowledged, before the aggregate socket becomes live.')
+    const continuous = [ids[0], ids[2]].sort()
+    assert.deepEqual(await f.qualifiedIDs(), continuous, 'Only the unacknowledged source loses continuity; the other series retain their own authority.')
     await f.advance(1_000)
     f.socket.releaseAcknowledgements()
     await f.service.realtime.whenIdle()
     assert.equal(f.service.realtime.getState().status, 'live')
-    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
+    assert.deepEqual(await f.qualifiedIDs(), continuous, 'A late ACK cannot renew the previous historical assessment.')
     f.assertNoRefresh()
   } finally { await f.close() }
 })
@@ -586,12 +586,16 @@ test('a current-window read racing a new durable close cannot invalidate the una
 
 test('live-source recovery during an hourly rollover waits for a complete new historical tuple before readmission', async context => {
   const f = await fixture(context, { hourly: true })
+  const writing = deferred(), held = deferred()
+  const aggregate = f.store.aggregateCandles.bind(f.store)
+  f.store.aggregateCandles = async (range, priority) => {
+    if (range.instrument === ids[0] && range.timeframe === '1H') { writing.resolve(); await held.promise }
+    return aggregate(range, priority)
+  }
   try {
     await f.roll()
     f.socket.candle(candle(ids[0], f.asOf, 400_000))
-    await f.service.realtime.whenIdle()
-    await f.waitFor(() => f.historical(ids[0]).value.asOf === f.boundary)
-    await f.advance(1_000)
+    await writing.promise
     const observation = f.service.observations.get(ids[0]).openInterest
     observation.expiresAt = Date.now()
     f.service.streamQualifications.add(ids[0]); f.service.flushStreamQualifications()
@@ -599,41 +603,44 @@ test('live-source recovery during an hourly rollover waits for a complete new hi
     assert.deepEqual(await f.qualifiedIDs(), ids.slice(1).sort())
     f.service.acceptObservation(ids[0], 'openInterest', { ...observation, observedAt: Date.now(), expiresAt: Date.now() + 90_000 })
     f.service.streamQualifications.add(ids[0]); f.service.flushStreamQualifications()
-    await f.waitFor(() => !f.service.streamEvaluations.has(ids[0]))
+    await turn()
     assert.deepEqual(await f.qualifiedIDs(), ids.slice(1).sort(), 'Recovered live input must not admit new turnover with the previous hour’s window.')
-    f.socket.candle(candle(ids[0], epoch, 2_500_000, '1H'))
+    held.resolve()
     await f.service.realtime.whenIdle()
-    await f.waitFor(() => f.service.catalog.get(ids[0])?.result.volumeRatio === 1.25)
+    await f.waitFor(() => f.service.catalog.get(ids[0])?.result.volumeRatio === 1.3)
     assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     f.assertNoRefresh()
-  } finally { await f.close() }
+  } finally { held.resolve(); await f.close() }
 })
 
-for (const first of ['5m', '1H']) test(`an hourly rollover keeps the last complete assessment when the ${first} final arrives first`, async context => {
+for (const blocked of ['15m', '1H']) test(`an hourly rollover keeps the complete assessment while its ${blocked} derivation is committing`, async context => {
   const f = await fixture(context, { hourly: true })
+  const writing = deferred(), held = deferred()
+  const aggregate = f.store.aggregateCandles.bind(f.store)
+  f.store.aggregateCandles = async (range, priority) => {
+    if (range.instrument === ids[0] && range.timeframe === blocked) { writing.resolve(); await held.promise }
+    return aggregate(range, priority)
+  }
   try {
     const originalTurnover = f.historical(ids[0]), originalHourly = f.historical(ids[0], 'hourly')
     await f.roll()
     assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     assert.deepEqual(f.historical(ids[0]), originalTurnover)
     assert.deepEqual(f.historical(ids[0], 'hourly'), originalHourly)
-    const final = (timeframe: string) => timeframe === '5m'
-      ? candle(ids[0], f.asOf, 400_000)
-      : candle(ids[0], epoch, 2_500_000, '1H')
-    f.socket.candle(final(first))
-    await f.service.realtime.whenIdle()
-    assert.equal(f.service.realtime.getProgress(ids[0], first).committedThrough, final(first).timestamp)
+    f.socket.candle(candle(ids[0], f.asOf, 400_000))
+    await writing.promise
+    assert.equal(f.service.realtime.getProgress(ids[0], '5m').pendingConfirmations, 1)
     await f.advance(16)
-    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort(), 'One missing native timeframe must not cause a gap between complete hourly assessments.')
+    assert.deepEqual(await f.qualifiedIDs(), [...ids].sort(), 'The source transaction must not publish an intermediate historical tuple.')
     assert.equal((await f.service.snapshot()).rows.find(row => row.instId === ids[0])?.turnover24hUSDT, 57_600_000)
     await f.advance(1_000)
-    f.socket.candle(final(first === '5m' ? '1H' : '5m'))
+    held.resolve()
     await f.service.realtime.whenIdle()
-    await f.waitFor(() => f.service.catalog.get(ids[0])?.result.turnover === 57_800_000 && f.service.catalog.get(ids[0])?.result.volumeRatio === 1.25)
+    await f.waitFor(() => f.service.catalog.get(ids[0])?.result.turnover === 57_800_000 && f.service.catalog.get(ids[0])?.result.volumeRatio === 1.3)
     assert.deepEqual(await f.qualifiedIDs(), [...ids].sort())
     assert.equal(f.historical(ids[0]).value.asOf, f.boundary)
     assert.equal(f.historical(ids[0], 'hourly').value.asOf, f.boundary)
     assert.deepEqual(f.priceRequests, [])
     f.assertNoRefresh()
-  } finally { await f.close() }
+  } finally { held.resolve(); await f.close() }
 })

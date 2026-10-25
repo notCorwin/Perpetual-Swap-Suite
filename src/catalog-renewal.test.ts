@@ -261,7 +261,7 @@ test('temporarily expired qualification retains the confirmed-candle feeds neede
   try {
     const subscriptions = () => [...f.service.realtime.subscriptions.values()].map(value => `${value.instId}:${value.timeframe}`).sort()
     const before = subscriptions()
-    assert.deepEqual(before, ['15m', '1H', '5m'].map(timeframe => `${instId}:${timeframe}`))
+    assert.deepEqual(before, [`${instId}:5m`])
     now = f.asOf + fiveMinutes
     const expired = await f.service.snapshot()
     assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false, 'Expired source leases invalidate strict qualification immediately.')

@@ -1,6 +1,14 @@
 # Historical OI and Taker sources
 
-The application requests native candles, contract open interest, and contract Taker volumes as independent background sources. Each statistics page commits directly into the authoritative SQLite store, independently of whether a price candle has arrived. Prices, OI, and Taker have separate readiness and source versions; an unavailable statistic cannot block OHLC display or local history navigation. Requests remain paced separately for each OKX endpoint family, and overlapping consumers share bounded page acquisition.
+The application shares one realtime 5m price source and derives aligned larger periods locally. Contract open interest and Taker quantities have independent readiness and source versions; an unavailable statistic cannot block OHLC display or local history navigation. Native statistics pages commit directly into SQLite independently of price arrival. Requests remain paced separately for each OKX endpoint family, and overlapping consumers share bounded page acquisition.
+
+## Realtime reuse and acquisition demand
+
+Ticker, open-interest and 5m price streams cover the entire supported candidate universe. Deep books are needed only after enabled non-book prerequisites have verified; an instrument failing its book checks remains subscribed so it can recover. A short retirement grace prevents threshold oscillation from exhausting subscription-control allowances. Trade streams cover listed contracts and the current chart. Removing a trade subscription breaks its coverage lifetime even if the shared socket remains open.
+
+Every completed demanded period first reuses complete, uninterrupted, deduplicated trades from the public stream. The buy/sell total must reconcile with its confirmed contract volume. A bounded 250ms grace can receive the last trade frame from the independent socket without blocking price publication. A successful local result stores the volume proof atomically with its Taker quantities. A stale calculation cannot commit against a newer volume; a later volume correction makes the old calculated source missing. Valid native historical statistics are preserved. Only remaining source gaps require native REST acquisition; OI is never inferred from prices, turnover, or trades.
+
+Local chart prices and indicator checkpoints remain prepared across periods. Automatic network warmup is limited to the chosen period and current chart; explicit historical navigation, archival download and repair still own their requested ranges. Collector reconnects repair price gaps while chart demand owns statistics ranges, so an offline interval does not trigger an unrelated statistics archive download. Closing the window does not change the application's existing continuous-collection lifecycle.
 
 ## Bounded historical requests
 

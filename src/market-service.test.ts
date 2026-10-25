@@ -267,28 +267,28 @@ test('a realtime shutdown failure still closes history, calculations and owned m
   }
 })
 
-test('all candidate contracts retain native collection while unselected contracts avoid chart preparation', async () => {
+test('all candidates collect 5m while unselected contracts avoid chart preparation', async () => {
   const f = await fixture(), other = 'ETH-USDT-SWAP', frames = ['5m', '15m', '1H']
   try {
     f.service.instruments.set(other, { ...instrument, instId: other })
     f.service.candidateIDs = new Set([instId, other])
     localCatalog(f.service)
     f.resumeChartPreparation()
-    const expected = [instId, other].flatMap(id => frames.map(timeframe => `${id}:${timeframe}`)).sort()
-    assert.deepEqual([...f.service.preparedCharts.realtimeKeys].sort(), expected)
-    assert.deepEqual([...f.service.realtime.subscriptions.values()].map(({ instId, timeframe }: any) => `${instId}:${timeframe}`).sort(), expected)
+    const prepared = [instId, other].flatMap(id => frames.map(timeframe => `${id}:${timeframe}`)).sort()
+    assert.deepEqual([...f.service.preparedCharts.realtimeKeys].sort(), prepared)
+    assert.deepEqual([...f.service.realtime.subscriptions.values()].map(({ instId, timeframe }: any) => `${instId}:${timeframe}`).sort(), [`${instId}:5m`, `${other}:5m`].sort())
     assert.equal(f.service.catalog.has(other), false, 'The second contract has no qualified list row or chart selection.')
     assert.equal('chartSubscriptions' in f.service, false)
 
-    const timestamp = Math.floor(Date.now() / hour) * hour
-    const row = { ...nativeCandle(timestamp, '1H', 123), instrument: other, confirmed: false }
+    const timestamp = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
+    const row = { ...nativeCandle(timestamp, '5m', 123), instrument: other, confirmed: false }
     await f.service.realtime.options.onForming(row, { signal: new AbortController().signal, receivedAt: Date.now() })
-    assert.equal(f.service.liveCandles.get(`${other}:1H`).close, 123)
-    assert.equal(f.service.preparedCharts.liveStates.get(`${other}:1H`).live.close, 123, 'An unselected contract retains only its lightweight current candle.')
-    assert.equal(f.service.preparedCharts.series.has(`${other}:1H`), false, 'Collector membership cannot initialize a full historical chart.')
-    assert.equal(f.service.preparedCharts.liveSeeds.has(`${other}:1H`), false)
+    assert.equal(f.service.liveCandles.get(`${other}:5m`).close, 123)
+    assert.equal(f.service.preparedCharts.liveStates.get(`${other}:5m`).live.close, 123, 'An unselected contract retains only its lightweight current candle.')
+    assert.equal(f.service.preparedCharts.series.has(`${other}:5m`), false, 'Collector membership cannot initialize a full historical chart.')
+    assert.equal(f.service.preparedCharts.liveSeeds.has(`${other}:5m`), false)
     await f.service.getPreparedCharts()
-    assert.deepEqual([...f.service.preparedCharts.realtimeKeys].sort(), expected, 'Focusing a qualified chart cannot remove any candidate subscription.')
+    assert.deepEqual([...f.service.preparedCharts.realtimeKeys].sort(), prepared, 'Focusing a qualified chart cannot remove any candidate period key.')
   } finally { await f.close() }
 })
 
@@ -1815,24 +1815,56 @@ test('a rejected contract restored with fresh instrument and liquidity observati
   } finally { await restored?.dispose(); await f.close() }
 })
 
-test('missing qualification history requests continuity acquisition after inspecting the local durable window', async () => {
+test('missing qualification history requests continuity acquisition after inspecting the local durable window', async t => {
+  const now = Math.floor(Date.now() / hour) * hour + 17 * 60_000
+  t.mock.method(Date, 'now', () => now)
   const configuration = disabled()
   configuration.liquidity.volume24h.enabled = true
   configuration.liquidity.volumeStability.enabled = true
   const f = await fixture(configuration, discovery())
   const requests: Array<[string, string]> = []
+  const sourceTrace: string[] = []
+  const hourlyObserved = deferred()
+  const service = f.service as any
+  const invalidateLiquidityHistory = service.invalidateLiquidityHistory.bind(service)
+  service.invalidateLiquidityHistory = (id: string, rows: unknown, timeframe: string) => {
+    const hadHourly = id === instId && Boolean(service.observations.get(id)?.hourly)
+    invalidateLiquidityHistory(id, rows, timeframe)
+    if (hadHourly && !service.observations.get(id)?.hourly) sourceTrace.push(`hourly-revoked:${timeframe ?? 'all'}`)
+  }
+  const observeHistoricalSource = service.observeHistoricalSource.bind(service)
+  service.observeHistoricalSource = async (id: string, key: string, ...args: any[]) => {
+    const result = await observeHistoricalSource(id, key, ...args)
+    if (key === 'hourly') { sourceTrace.push('hourly:observed'); hourlyObserved.resolve() }
+    return result
+  }
   try {
     isolateQualification(f.service)
     f.service.history.ensurePrices = async (id: string, timeframe: '5m' | '1H', from: number, through: number, priority: string) => {
       requests.push([timeframe, priority])
+      sourceTrace.push(`${timeframe}:start`)
+      if (timeframe === '5m') await hourlyObserved.promise
       const step = timeframe === '5m' ? fiveMinutes : hour
       const records = Array.from({ length: (through - from) / step + 1 }, (_, index) => ({ ...nativeCandle(from + index * step, timeframe), quoteVolume: timeframe === '5m' ? 200_000 : 2_000_000 }))
       await f.service.persistCandles(id, records)
-      return { rows: await f.store.candles({ instrument: id, timeframe, from, through }) }
+      const rows = await f.store.candles({ instrument: id, timeframe, from, through })
+      sourceTrace.push(`${timeframe}:return:${rows.length}`)
+      return { rows }
     }
     await f.service.refresh()
     assert.deepEqual(requests.sort(), [['1H', 'continuity'], ['5m', 'continuity']], 'Qualification cannot queue missing windows behind broad historical backfills.')
-    assert.deepEqual(f.service.listRowsFor().map(row => row.instId), [instId])
+    const hourlyObservedAt = sourceTrace.indexOf('hourly:observed'), hourlyRevokedAt = sourceTrace.indexOf('hourly-revoked:1H')
+    assert.ok(hourlyObservedAt >= 0 && hourlyRevokedAt > hourlyObservedAt, 'The 5m acquisition must invalidate a completed hourly observation before qualification publication.')
+    const listedRows = f.service.listRowsFor()
+    if (!listedRows.some(row => row.instId === instId)) {
+      const record = f.service.catalogChecks.get(instId), observations = f.service.observations.get(instId) ?? {}
+      const end = Math.floor(now / hour) * hour, from = end - 24 * hour
+      const durableHourly = await f.store.candles({ instrument: instId, timeframe: '1H', from, through: end - hour })
+      t.diagnostic(JSON.stringify({ requests, sourceTrace, status: record?.status, result: record?.result, errors: record?.observationErrors, observations: Object.fromEntries(Object.entries(observations).map(([key, value]: [string, any]) => [key, {
+        source: value.source, asOf: value.value?.asOf, turnover: value.value?.turnover, observedAt: value.observedAt, expiresAt: value.expiresAt,
+      }])), listIDs: listedRows.map(row => row.instId), durableHourly: durableHourly.map(row => ({ timestamp: row.timestamp, quoteVolume: row.quoteVolume, confirmed: row.confirmed })) }))
+    }
+    assert.deepEqual(listedRows.map(row => row.instId), [instId])
     assert.equal(f.service.catalog.get(instId).result.turnover, 57_600_000)
   } finally { await f.close() }
 })

@@ -19,6 +19,8 @@ export type MarketHistoryOptions = {
   instrument?(instId: string): Instrument | undefined
   /** Owner serializes replacement, statistics preservation and invalidation with every candle mutation. */
   replaceCandles(range: CandleRange & { instrument: string; timeframe: string }, rows: CandleRecord[], priority: StorePriority): MaybePromise<unknown>
+  /** Materialize only complete already-local 5m buckets before requesting missing coarse history. */
+  derivePrices?(range: CandleRange & { instrument: string; timeframe: string }, priority: StorePriority): MaybePromise<unknown>
   onProgress?(task: HistoryTask): MaybePromise<void>
   /** Exact saved audit checkpoints; observer failures cannot interrupt auditing. */
   onAuditCheckpoint?(job: AuditJob): MaybePromise<void>

@@ -22,6 +22,9 @@ export class PreparedChartPipeline {
     instrument(instId: string): { listTime?: string | number } | undefined
     /** Acknowledged current candle subscription; persisted coverage is checked separately. */
     streaming?(instId: string, timeframe: HistoryTimeframe): boolean
+    /** Allow network acquisition for background candidates; local preparation remains reusable for every period. */
+    acquire?(instId: string, timeframe: HistoryTimeframe): boolean
+    onFocus?(focus: { instId: string; timeframe: HistoryTimeframe } | null): void
   })
   /** Declare viewport demand and immediately own its hydration, repair, priority and bounded reserve. */
   setFocus(target: { instId: string; timeframe: HistoryTimeframe; endHour?: number } | null, id?: string): void

@@ -1,6 +1,10 @@
 # Indicator contract
 
-All calculations consume one canonical, timestamp-ordered native candle series. Completed candles come from the authoritative SQLite native-period store. A forming candle may be appended in memory for the live overlay; it never replaces a completed candle or enters historical storage. A missing period starts a new contiguous run and restarts initialization.
+All calculations consume one canonical, timestamp-ordered candle series for their target period. The realtime price source is native 5m candles. Complete, aligned groups of three or twelve 5m candles produce 15m or 1H OHLCV: first open, maximum high, minimum low, final close, and separately summed contract volume, base volume and quote turnover. Summation compensates floating-point rounding. A missing child never becomes a zero-volume candle. Completed derived candles enter SQLite through the writer and use the same revision/checkpoint invalidation rules as other prices.
+
+Existing native coarser history remains reusable. A missing coarser historical window first uses complete finer data already on disk; if that is insufficient, its bounded native request avoids downloading twelve fine periods just to display one hour. Corrections to a complete canonical fine bucket replace its derived parent, including a previously native parent; an incomplete previously derived parent becomes missing. Independent statistics survive price replacement. A forming parent uses only its contiguous 5m prefix, including the current forming child, and remains in memory until all required children have durably closed. Its prefix is bounded to one hour and bootstrapped asynchronously, outside live delivery and the renderer.
+
+A forming candle never replaces a completed candle or enters historical storage. A missing target period starts a new contiguous run and restarts indicator initialization. Indicators are calculated from the target-period candles, never by averaging finer-period indicators.
 
 The list and chart project the same calculation. Their visible windows cannot choose the seed. Older price additions and historical price corrections invalidate the affected generation and later checkpoints; formula or input-schema changes invalidate incompatible derived state. OI/Taker revisions do not invalidate price indicators. Unknown volume remains unknown instead of being inferred from price.
 
@@ -19,7 +23,7 @@ Batch initialization and incremental updates use the same formulas. Confirmed st
 | Signed relative change | `(current − previous) / abs(previous) × 100%`. Missing, nonfinite or zero baseline gives no value, displayed as `—`. |
 | Taker imbalance | `(buyContracts − sellContracts) / (buyContracts + sellContracts) × 100%`. A zero total gives no value. This is a participation ratio, not a relative change. |
 
-OI and Taker Buy/Sell retain contract units and native candle periods. Unavailable statistics remain explicit gaps, never fabricated zeroes. Floating-point assertions use independent expected values with a stated tolerance; agreement with a second invocation of production code is not proof of mathematical correctness.
+OI and Taker Buy/Sell retain contract units and aligned target periods. OI remains an independently observed quantity. Complete, uninterrupted, deduplicated trades may supply Taker totals only when their sum reconciles with the confirmed candle's contract volume. The writer verifies and stores that volume with the calculated result; a later price-volume correction makes a mismatched calculated Taker unavailable. Native historical statistics remain independent of this proof. Unavailable statistics remain explicit gaps, never fabricated zeroes. Floating-point assertions use independent expected values with a stated tolerance; agreement with a second invocation of production code is not proof of mathematical correctness.
 
 ## Checkpoint correctness
 

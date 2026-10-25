@@ -10,7 +10,7 @@ import { DEFAULT_PREFERENCES } from '../electron/services/preferences.js'
 import type { RealtimeWebSocket } from '../electron/services/realtime-market.js'
 
 const fiveMinutes = 300_000
-const timeframes = [['5m', fiveMinutes], ['15m', 900_000], ['1H', 3_600_000]] as const
+const fifteenMinutes = 900_000
 const response = (data: unknown) => new Response(JSON.stringify({ code: '0', data }), { headers: { 'Content-Type': 'application/json' } })
 const deferred = () => {
   let resolve!: () => void
@@ -39,6 +39,9 @@ class Socket extends EventTarget implements RealtimeWebSocket {
       if (command.op === 'subscribe') this.acknowledged.set(subscriptionKey(arg), arg)
       else this.acknowledged.delete(subscriptionKey(arg))
       this.message({ id: command.id, event: command.op, arg })
+      if (command.op === 'subscribe' && arg.channel === 'books') queueMicrotask(() => this.message({ arg, action: 'snapshot', data: [{
+        seqId: 1, prevSeqId: -1, ts: String(Date.now()), bids: [['99.99', '2000', '0', '1']], asks: [['100', '2000', '0', '1']],
+      }] }))
     })
   }
   close() {
@@ -74,12 +77,16 @@ test('automatic startup gates 289 candidates on shared tickers and OI before acq
   let store: MarketStore | undefined, service: MarketService | undefined
   try {
     store = await MarketStore.open(root)
-    const seeded = healthy.flatMap(instrument => timeframes.flatMap(([timeframe, step], frameIndex) => Array.from({ length: 300 }, (_, index) => {
-      const close = 100 * (frameIndex + 1) + index / 100
-      return { instrument, timeframe, timestamp: Math.floor(Date.now() / step) * step - (300 - index) * step,
+    const latest15m = Math.floor(Date.now() / fifteenMinutes) * fifteenMinutes - fifteenMinutes
+    const first5m = latest15m - 299 * fifteenMinutes
+    const baseCount = (asOf - fiveMinutes - first5m) / fiveMinutes + 1
+    const seeded = healthy.flatMap(instrument => Array.from({ length: baseCount }, (_, index) => {
+      const timestamp = first5m + index * fiveMinutes
+      const close = 100 + index / 100
+      return { instrument, timeframe: '5m', timestamp,
         open: close - .05, high: close + 1, low: close - 1, close, volume: 2000, baseVolume: 2000, quoteVolume: 200_000, confirmed: true }
-    })))
-    assert.equal(await store.appendCandles(seeded), 14 * 3 * 300)
+    }))
+    assert.equal(await store.appendCandles(seeded), 14 * baseCount)
     const reads = t.mock.method(store, 'candles')
     const fetcher: typeof fetch = async input => {
       const url = new URL(String(input)); requests.push(url)
@@ -161,16 +168,18 @@ test('automatic startup gates 289 candidates on shared tickers and OI before acq
     assert.deepEqual(windows.map(query => query.instrument).sort(), healthy)
     assert.ok(windows.every(query => query.timeframe === '5m' && query.from === asOf - 288 * fiveMinutes && query.through === asOf - fiveMinutes))
     assert.ok(reads.mock.calls.every(call => healthyIDs.has(call.arguments[0].instrument)), 'None of the 275 bulk-OI failures reads per-contract candle data.')
-    assert.equal(history.mock.callCount(), 0, 'Seeded native SQLite history needs no source acquisition.')
-    assert.equal(requestsFor('/market/books').length, 14)
-    assert.deepEqual(requestsFor('/market/books').map(url => url.searchParams.get('instId')).sort(), healthy)
+    assert.equal(history.mock.callCount(), 0, 'Seeded 5m SQLite history and local aggregation need no source acquisition.')
+    assert.equal(requestsFor('/market/books').length, 0, 'Live books come from their subscribed WebSocket snapshot without REST duplicates.')
+    assert.equal(market.publicRealtime.getTelemetry().bookEvents, 14, 'Each eligible contract qualifies from an acknowledged WebSocket snapshot.')
+    assert.ok(healthy.every(id => market.observations.get(id)?.book?.source === 'websocket'))
     assert.equal(requestsFor('/public/open-interest').length, 1)
     assert.equal(requestsFor('/market/tickers').length, 1)
     assert.equal(requestsFor('/public/instruments').length, 1)
     assert.deepEqual(unexpected, [])
     assert.ok(requests.filter(url => url.searchParams.has('instId')).every(url => healthyIDs.has(url.searchParams.get('instId')!)))
     t.diagnostic(JSON.stringify({ metadataMS, pendingOIMS, completedMS, qualificationWindows: windows.length, bulkOIRequests: 1,
-      bookRequests: 14, historyAcquisitions: history.mock.callCount(), candleReads: reads.mock.callCount(), database: store.getDiagnostics().reads }))
+      bookRequests: requestsFor('/market/books').length, websocketBookSnapshots: market.publicRealtime.getTelemetry().bookEvents,
+      historyAcquisitions: history.mock.callCount(), candleReads: reads.mock.callCount(), database: store.getDiagnostics().reads }))
   } finally {
     tickerGate.resolve(); interestGate.resolve()
     await service?.dispose()
