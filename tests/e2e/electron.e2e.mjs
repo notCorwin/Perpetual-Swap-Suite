@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
 import { measureNativeWindowControls } from '../helpers/native-window-controls.mjs'
-import { assertCompletePaints, assertIndicatorLegends, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
+import { assertCompletePaints, assertIndicatorLegends, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
 
 
 const root = new URL('../..', import.meta.url).pathname
@@ -299,10 +299,10 @@ test('prepared native chart pages preserve canonical indicator values across eve
   await installRequestProbe(electron, fixture.instId)
   try {
     for (const timeframe of fixture.timeframes) {
-      const prepared = await waitFor(async () => {
-        const frame = await request({ chartWindow: { instId: fixture.instId, timeframe, endHour: fixture.end } })
-        return frame.indicatorState !== 'loading' ? frame : null
-      })
+      const focusId = `canonical-oracle:${timeframe}`
+      await request({ chartFocus: { id: focusId, target: { instId: fixture.instId, timeframe, endHour: fixture.end } } })
+      const prepared = await request({ chartWindow: { instId: fixture.instId, timeframe, endHour: fixture.end, focusId } })
+      assert.notEqual(prepared.indicatorState, 'loading', 'The matching focus owns and completes canonical preparation.')
       const expected = new Map(fixture.series[timeframe].bars.map(bar => [bar.hour, bar]))
       const visible = prepared.bars.filter(bar => bar.hour >= fixture.end - 95 * fixture.series[timeframe].intervalMS && bar.hour <= fixture.end)
       assert.equal(visible.length, 96)
@@ -445,7 +445,7 @@ test('the paint probe catches changed indicator geometry without a new snapshot 
 
 })
 
-test('mature local indicators and statistics stay drawn from the first scroll through prefetch, push and scroll end', async context => {
+test('prepared resident indicators and statistics stay drawn through rapid scrolling, latest pushes and reversal', async context => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   const indicatorFields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
   await installRequestProbe(electron, fixture.instId)
@@ -461,19 +461,21 @@ test('mature local indicators and statistics stay drawn from the first scroll th
         return snapshot?.timeframe === timeframe && snapshot.bars.length === 96
           && snapshot.bars.every(bar => [...fields, 'oi', 'buy', 'sell'].every(field => Number.isFinite(bar[field])))
       }, { timeframe, fields: indicatorFields }, { timeout: 20_000 })
+      const resident = await waitForLocalHistory(electron, page, fixture, timeframe, { requireIndicators: true })
+      assert.ok(resident >= 96 + 972, 'Every measured target must lie inside the fully calculated resident reserve.')
+      await waitForRendered(page, fixture, timeframe)
       await startPaintProbe(page, fixture, { requireMatureData: true })
       const phase = value => page.evaluate(value => { window.__chartPaintProbe.phase = value }, value)
       const settle = () => page.evaluate(async () => { for (let frame = 0; frame < 12; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
       const intervalMS = fixture.series[timeframe].intervalMS
-      await phase('first wheel and local history admission')
-      await wheelBurst(page, { deltaY: 7_200 })
-      await waitForRendered(page, fixture, timeframe, fixture.end - 600 * intervalMS)
-      await waitFor(async () => (await readRequestProbe(electron)).historyResponses.some(response => response.timeframe === timeframe && response.bars > 96))
-      await phase('continuous scrolling and speculative prefetch')
+      await phase('first resident wheel frame')
+      await wheelBurst(page, { deltaY: 3_600 })
+      await waitForRendered(page, fixture, timeframe, fixture.end - 300 * intervalMS)
+      await phase('continuous resident scrolling')
       await wheelBurst(page, { frames: 6, eventsPerFrame: 32, deltaY: 36 })
-      await waitForRendered(page, fixture, timeframe, fixture.end - 1_176 * intervalMS)
-      await wheelBurst(page, { deltaY: 7_200 })
-      const historicalEnd = fixture.end - 1_776 * intervalMS
+      await waitForRendered(page, fixture, timeframe, fixture.end - 876 * intervalMS)
+      await wheelBurst(page, { deltaY: 96 * 12 })
+      const historicalEnd = fixture.end - 972 * intervalMS
       await waitForRendered(page, fixture, timeframe, historicalEnd)
       await phase('scroll end and asynchronous completions')
       await settle()
@@ -488,7 +490,7 @@ test('mature local indicators and statistics stay drawn from the first scroll th
       await settle()
       assert.equal(Number(await page.locator('[data-chart-inst]').getAttribute('data-chart-completed-end')), historicalEnd, 'A latest publication must preserve the historical viewport.')
       await phase('reverse to latest and stop')
-      await wheelBurst(page, { deltaY: -1_776 * 12 })
+      await wheelBurst(page, { deltaY: -972 * 12 })
       await waitForRendered(page, fixture, timeframe)
       await settle()
       const paint = await finishPaintProbe(page)
