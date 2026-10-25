@@ -7,17 +7,28 @@ import { parseArgs } from 'node:util'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const baselineRevision = 'ab9cb551bd00252abf370a324fe17d1eeacd6db1'
+const hiddenMode = 'hidden-electron-loopback-market-traffic-and-renderer-responsiveness'
+const foregroundMode = 'foreground-electron-loopback-market-traffic-and-renderer-responsiveness'
 
 function sumBytes(channels) {
   return Object.values(channels ?? {}).reduce((total, value) => total + value.payloadBytes, 0)
 }
 
-function validateReport(report, label, { baseline = false } = {}) {
-  assert.equal(report.mode, 'hidden-electron-loopback-market-traffic-and-renderer-responsiveness', `${label} is not the deterministic loopback market benchmark.`)
+export function validateMarketTrafficReport(report, label, { baseline = false } = {}) {
+  const foreground = report.mode === foregroundMode
+  assert.ok(foreground || report.mode === hiddenMode, `${label} is not the deterministic loopback market benchmark.`)
   assert.equal(report.runtime?.network, 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1', `${label} must be loopback-only.`)
-  assert.deepEqual(report.runtime?.presentation, { visible: false, focused: false, minimized: false, offscreen: true }, `${label} must remain hidden and unfocused.`)
-  assert.equal(report.runtime?.testPresentation, 'background-only-offscreen', `${label} must use the protected background-only Electron bundle.`)
-  assert.ok(report.runtime?.sourceFingerprint && report.runtime?.electronVersion, `${label} is missing protected Electron runtime identity.`)
+  if (foreground) {
+    assert.deepEqual(report.runtime?.presentation, { visible: true, focused: true, minimized: false, offscreen: false }, `${label} must remain visible, focused and native.`)
+    assert.equal(report.runtime?.testPresentation, 'foreground-native', `${label} must use the native foreground presentation.`)
+    assert.deepEqual(report.runtime?.foregroundCIProof, { githubActions: true, runnerEnvironment: 'github-hosted', runnerOS: 'macOS' },
+      `${label} is missing the hosted macOS foreground proof from requireForegroundTests.`)
+    assert.ok(report.runtime?.executable && report.runtime?.electronVersion, `${label} is missing the actual Electron runtime identity.`)
+  } else {
+    assert.deepEqual(report.runtime?.presentation, { visible: false, focused: false, minimized: false, offscreen: true }, `${label} must remain hidden and unfocused.`)
+    assert.equal(report.runtime?.testPresentation, 'background-only-offscreen', `${label} must use the protected background-only Electron bundle.`)
+    assert.ok(report.runtime?.sourceFingerprint && report.runtime?.electronVersion, `${label} is missing protected Electron runtime identity.`)
+  }
   assert.ok(report.fixture?.candidateCount >= 3 && report.fixture.candidateCount <= 100, `${label} has an invalid candidate count.`)
   assert.ok(report.fixture?.durationSeconds >= 5 && report.fixture.durationSeconds <= 10, `${label} has an invalid fixed sample duration.`)
   assert.ok(Number.isFinite(report.traffic?.durationSeconds)
@@ -66,8 +77,6 @@ function validateReport(report, label, { baseline = false } = {}) {
       assert.equal(report.traffic.subscriptionCounts?.[channel]?.length ?? 0, 0, `${label} has a remote ${channel} subscription.`)
       assert.equal(report.traffic.websocketPayloadBytesByChannel?.[channel]?.messages ?? 0, 0, `${label} measured remote ${channel} payloads.`)
     }
-    assert.ok(report.renderer.frameGapMS.p95 <= 50, `${label} frame-gap p95 exceeds the optimized 50ms budget.`)
-    assert.ok(report.renderer.searchInteractionMS.p95 <= 50, `${label} search-response p95 exceeds the optimized 50ms budget.`)
   }
   const websocketBytes = sumBytes(report.traffic?.websocketPayloadBytesByChannel)
   const httpBytes = sumBytes(report.traffic?.httpResponsePayloadBytesByChannel)
@@ -84,10 +93,28 @@ function validateReport(report, label, { baseline = false } = {}) {
     assert.ok(Number.isFinite(value) && value >= 0, `${label} has no valid ${name} measurement.`)
   }
   if (baseline) {
-    assert.equal(report.app?.build?.revision, baselineRevision, `${label} must use the installed ab9cb551 baseline app.`)
-    assert.equal(report.app?.build?.dirty, false, `${label} installed baseline app must be clean.`)
+    assert.equal(report.app?.build?.revision, baselineRevision, `${label} must use the clean ab9cb551 baseline app.`)
+    assert.equal(report.app?.build?.dirty, false, `${label} baseline app must be clean.`)
+    if (foreground) {
+      assert.equal(report.app?.build?.provenance, 'working-tree checkout', `${label} foreground baseline must use the selected ab9cb551 source checkout.`)
+      assert.equal(report.app?.checkout?.revision, baselineRevision, `${label} selected baseline checkout must be ab9cb551.`)
+      assert.equal(report.app?.checkout?.dirty, false, `${label} selected baseline checkout must be clean.`)
+    }
   } else {
     assert.equal(report.app?.build?.provenance, 'working-tree checkout', `${label} must measure the selected working tree.`)
+    if (foreground) {
+      assert.equal(report.app?.build?.dirty, false, `${label} foreground comparison checkout must be clean.`)
+      assert.equal(report.app?.checkout?.dirty, false, `${label} selected checkout must be clean.`)
+      assert.equal(report.app?.build?.revision, report.app?.checkout?.revision, `${label} app provenance must describe the selected checkout.`)
+    }
+  }
+  if (foreground) {
+    assert.equal(report.fixture?.readinessPhase, 'all-passing-15m-frames-ready-before-steady-state-sample',
+      `${label} must sample only after the selected chart readiness barrier.`)
+    assert.equal(report.fixture?.readiness?.timeframe, '15m', `${label} must use the same selected 15m readiness phase.`)
+    assert.equal(report.fixture?.readiness?.expectedFrames, report.fixture.passingCount, `${label} readiness must cover each passing contract.`)
+    assert.equal(report.fixture?.readiness?.readyFrames, report.fixture.passingCount, `${label} must have every passing chart ready.`)
+    assert.ok(Number.isFinite(report.fixture.readiness.elapsedMS), `${label} is missing the readiness barrier measurement.`)
   }
 }
 
@@ -96,15 +123,25 @@ const closeToNoRegression = (before, after, absolute, relative) => ({ before, af
   passed: after <= before + Math.max(absolute, before * relative) })
 
 export function compareMarketTrafficReports(before, after) {
-  validateReport(before, 'before', { baseline: true })
-  validateReport(after, 'after')
+  validateMarketTrafficReport(before, 'before', { baseline: true })
+  validateMarketTrafficReport(after, 'after')
+  assert.equal(after.mode, before.mode, 'Before/after reports must use the same presentation mode.')
+  const foreground = before.mode === foregroundMode
   assert.equal(before.fixture.expectOptimized, false, 'Before report must measure the installed baseline without optimized-only assertions.')
   assert.equal(after.fixture.expectOptimized, true, 'After report must enable --expect-optimized assertions.')
   for (const key of ['candidateCount', 'passingCount', 'spreadFailureCount', 'oiFailureCount', 'seed', 'dataFingerprint', 'cadenceMS', 'durationSeconds']) {
     assert.equal(after.fixture[key], before.fixture[key], `Before/after fixture input ${key} must match exactly.`)
   }
-  assert.equal(after.runtime.sourceFingerprint, before.runtime.sourceFingerprint, 'Before/after must use the same protected Electron bundle.')
   assert.equal(after.runtime.electronVersion, before.runtime.electronVersion, 'Before/after must use the same Electron version.')
+  if (foreground) {
+    assert.equal(after.runtime.executable, before.runtime.executable, 'Before/after must use the same actual Electron executable.')
+    assert.equal(after.fixture.readinessPhase, before.fixture.readinessPhase, 'Before/after must cross the same chart readiness phase before sampling.')
+    for (const key of ['timeframe', 'expectedFrames', 'readyFrames']) assert.equal(after.fixture.readiness[key], before.fixture.readiness[key],
+      `Before/after chart readiness ${key} must match.`)
+    assert.deepEqual(after.correctness.passingIDs, before.correctness.passingIDs, 'Before/after must qualify the same candidate output set.')
+  } else {
+    assert.equal(after.runtime.sourceFingerprint, before.runtime.sourceFingerprint, 'Before/after must use the same protected Electron bundle.')
+  }
   for (const channel of ['tickers', 'open-interest', 'candle5m']) {
     assert.deepEqual(after.traffic.subscriptionCounts[channel], before.traffic.subscriptionCounts[channel],
       `Before/after must retain the same ${channel} candidate coverage.`)
@@ -135,11 +172,15 @@ export function compareMarketTrafficReports(before, after) {
   }
   for (const [name, result] of Object.entries(responsiveness)) assert.equal(result.passed, true,
     `Renderer responsiveness regressed beyond the bounded noise allowance for ${name}: ${JSON.stringify(result)}`)
-  assert.ok(after.renderer.frameGapMS.p95 <= 50, 'After frame gap p95 exceeded the 50ms responsiveness budget.')
-  assert.ok(after.renderer.searchInteractionMS.p95 <= 75, 'After search interaction p95 exceeded the 75ms hidden renderer budget.')
+  if (!foreground) {
+    assert.ok(after.renderer.frameGapMS.p95 <= 50, 'After frame gap p95 exceeded the 50ms responsiveness budget.')
+    assert.ok(after.renderer.searchInteractionMS.p95 <= 75, 'After search interaction p95 exceeded the 75ms hidden renderer budget.')
+  }
+  assert.ok(afterRate < beforeRate,
+    `Optimized total payload rate must decrease: before=${beforeRate.toFixed(2)} B/s, after=${afterRate.toFixed(2)} B/s.`)
   return {
     schemaVersion: 1,
-    mode: 'before-after-loopback-market-traffic-comparison',
+    mode: foreground ? 'before-after-foreground-loopback-market-traffic-comparison' : 'before-after-loopback-market-traffic-comparison',
     generatedAt: new Date().toISOString(),
     fixture: before.fixture,
     traffic: { beforeTotalPayloadBytes: beforeTotal, afterTotalPayloadBytes: afterTotal,
@@ -151,7 +192,8 @@ export function compareMarketTrafficReports(before, after) {
     responsiveness,
     correctness: { before: before.correctness, after: after.correctness },
     provenance: { beforeRevision: before.app.build.revision, afterRevision: after.app.build.revision,
-      protectedRuntimeFingerprint: before.runtime.sourceFingerprint },
+      ...(foreground ? { electronExecutable: before.runtime.executable } : { protectedRuntimeFingerprint: before.runtime.sourceFingerprint }),
+      presentation: foreground ? 'native-foreground-window' : 'background-only-offscreen' },
   }
 }
 

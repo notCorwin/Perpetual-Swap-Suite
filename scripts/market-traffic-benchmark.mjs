@@ -8,6 +8,7 @@ import { parseArgs } from 'node:util'
 import { _electron } from 'playwright'
 import { requireForegroundTests } from '../electron/test-presentation.js'
 import { createMarketTrafficExchange } from '../tests/helpers/market-traffic-exchange.mjs'
+import { compareMarketTrafficReports, validateMarketTrafficReport } from './market-traffic-comparison.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const baselineRevision = 'ab9cb551bd00252abf370a324fe17d1eeacd6db1'
@@ -17,7 +18,7 @@ const { values } = parseArgs({
     'candidate-count': { type: 'string' }, 'passing-count': { type: 'string' },
     'spread-failure-count': { type: 'string' }, 'duration-seconds': { type: 'string' }, 'cadence-ms': { type: 'string' },
     'expect-optimized': { type: 'boolean' }, foreground: { type: 'boolean' },
-    'wait-ready': { type: 'boolean' },
+    'wait-ready': { type: 'boolean' }, 'baseline-report': { type: 'string' },
   },
   allowPositionals: false,
 })
@@ -34,6 +35,7 @@ const durationSeconds = numberOption('duration-seconds', 7)
 const cadenceMS = numberOption('cadence-ms', 500)
 const expectOptimized = values['expect-optimized'] === true
 const foreground = values.foreground === true
+const baselineReportPath = values['baseline-report'] ? resolve(values['baseline-report']) : null
 const waitReady = foreground || values['wait-ready'] === true
 const benchmarkMode = foreground
   ? 'foreground-electron-loopback-market-traffic-and-renderer-responsiveness'
@@ -41,6 +43,8 @@ const benchmarkMode = foreground
 if (candidateCount < 3 || candidateCount > 100) throw new Error('--candidate-count must be between 3 and 100.')
 if (durationSeconds < 5 || durationSeconds > 10) throw new Error('--duration-seconds must be between 5 and 10.')
 if (cadenceMS < 100 || cadenceMS > 2_000) throw new Error('--cadence-ms must be between 100 and 2000.')
+if (baselineReportPath && !foreground) throw new Error('--baseline-report is supported only with --foreground.')
+if (baselineReportPath && !expectOptimized) throw new Error('--baseline-report requires --expect-optimized for the after run.')
 if (foreground) {
   // This check rejects local --foreground use before app resolution or launch.
   requireForegroundTests()
@@ -70,9 +74,9 @@ async function appEntryFor(appRoot) {
   return { selected, entry: selected, cwd: selected }
 }
 
-function checkoutMetadata() {
-  const revision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim()
-  const dirty = Boolean(execFileSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8' }).trim())
+function checkoutMetadata(directory = root) {
+  const revision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: directory, encoding: 'utf8' }).trim()
+  const dirty = Boolean(execFileSync('git', ['status', '--porcelain'], { cwd: directory, encoding: 'utf8' }).trim())
   return { revision, dirty }
 }
 
@@ -89,8 +93,10 @@ async function targetMetadata(app, checkout) {
 async function runtimeMetadata(electron) {
   const runtime = await electron.evaluate(({ app }) => ({ executable: process.execPath, electronVersion: process.versions.electron,
     packaged: app.isPackaged, appPath: app.getAppPath() }))
-  if (foreground) return { presentation: 'native-foreground-window', sourceFingerprint: null, executable: runtime.executable,
-    electronVersion: runtime.electronVersion, packaged: runtime.packaged, appPath: runtime.appPath }
+  if (foreground) return { presentation: 'native-foreground-window', testPresentation: 'foreground-native', sourceFingerprint: null,
+    executable: runtime.executable, electronVersion: runtime.electronVersion, packaged: runtime.packaged, appPath: runtime.appPath,
+    foregroundCIProof: { githubActions: process.env.GITHUB_ACTIONS === 'true', runnerEnvironment: process.env.RUNNER_ENVIRONMENT ?? null,
+      runnerOS: process.env.RUNNER_OS ?? null } }
   const guard = JSON.parse(await readFile(process.env.PERPETUAL_SWAP_TEST_GUARD, 'utf8'))
   if (runtime.executable !== guard.executable) throw new Error(`App did not use the protected test Electron runtime: ${runtime.executable}`)
   return { presentation: guard.presentation, sourceFingerprint: guard.sourceFingerprint, executable: runtime.executable,
@@ -159,8 +165,22 @@ async function waitForSelectedFrames(page, instIds) {
 }
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+let baselineReport = null
+if (baselineReportPath) {
+  try {
+    baselineReport = JSON.parse(await readFile(baselineReportPath, 'utf8'))
+    validateMarketTrafficReport(baselineReport, 'baseline', { baseline: true })
+    if (baselineReport.mode !== 'foreground-electron-loopback-market-traffic-and-renderer-responsiveness') {
+      throw new Error('Baseline report must use the native foreground presentation.')
+    }
+    assert.equal(baselineReport.fixture.expectOptimized, false, 'Foreground baseline report must omit optimized-only assertions.')
+  } catch (error) {
+    throw new Error(`Invalid --baseline-report ${baselineReportPath}: ${error.message}`)
+  }
+}
 const app = await appEntryFor(values['app-root'] ?? root)
-const checkout = checkoutMetadata(), target = await targetMetadata(app, checkout)
+const checkout = checkoutMetadata(app.selected.endsWith('.app') || app.selected.endsWith('.asar') ? root : app.selected)
+const target = await targetMetadata(app, checkout)
 if (app.selected === '/Applications/Perpetual Swap Suite.app'
   && (target.revision !== baselineRevision || target.dirty !== false)) {
   throw new Error(`Installed traffic baseline must be the clean ${baselineRevision} app; found ${target.revision} (dirty=${target.dirty}).`)
@@ -169,7 +189,7 @@ const output = resolve(values.output ?? join(root, '.build/traffic-optimization/
 const userData = process.env.PERPETUAL_SWAP_USER_DATA
 if (!userData || (!foreground && !process.env.PERPETUAL_SWAP_TEST_GUARD)) throw new Error('Protected sandbox user data is required.')
 const fixture = await createMarketTrafficExchange({ candidateCount, passingCount, spreadFailureCount, seed: 17 })
-let electron, cadence, failureMeasurements
+let electron, cadence, failureMeasurements, completedReport
 try {
   electron = await _electron.launch({ args: [app.entry], cwd: app.cwd,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_E2E_LIVE_REFRESH: '1',
@@ -309,16 +329,18 @@ try {
     partial: true,
     generatedAt: new Date().toISOString(),
     app: { path: app.selected, entry: app.entry, build: target, checkout },
-    runtime: { ...runtime, testPresentation: foreground ? 'foreground-native' : runtime.presentation, presentation,
+    runtime: { ...runtime, testPresentation: runtime.testPresentation, presentation,
       network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' },
     fixture: { candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture.oiFailureCount, seed: fixture.seed,
       dataFingerprint: `market-traffic-v2-bookseq-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
-      cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness },
+      cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness,
+      readinessPhase: readiness ? 'all-passing-15m-frames-ready-before-steady-state-sample' : null },
     renderer: { ...renderer, measurement: foreground
       ? 'Native foreground renderer RAF gaps and React search input to next-frame latency; native compositor paint was not measured.'
       : 'Hidden offscreen renderer RAF gaps and React search input to next-frame latency; no native compositor paint claim.' },
   }
   const traffic = fixture.endSample()
+  failureMeasurements.rawFixtureSample = traffic
   if (foreground) assert.equal(renderer.presentation.totalViolations, 0, 'Foreground visibility and focus must hold throughout sampling.')
   assert.ok(Math.abs(traffic.durationSeconds - durationSeconds) <= 0.75,
     `Steady-state traffic sample duration drifted outside the bounded window: ${traffic.durationSeconds}s.`)
@@ -361,7 +383,7 @@ try {
   assert.equal(outputMatchesLatest, true, 'Rendered passing tickers must match the latest fixture values.')
   assert.ok(renderer.frameCount >= durationSeconds * 15, 'Renderer RAF sampling is incomplete; reject disconnected/no-op runs.')
   assert.ok(renderer.searchInteractionMS.count >= passingCount, 'Renderer did not process all search interactions.')
-  if (expectOptimized) {
+  if (expectOptimized && !baselineReport) {
     assert.ok(renderer.frameGapMS.p95 <= 50, `Optimized renderer frame-gap p95 exceeded 50ms: ${renderer.frameGapMS.p95}`)
     assert.ok(renderer.searchInteractionMS.p95 <= 50, `Optimized renderer search-response p95 exceeded 50ms: ${renderer.searchInteractionMS.p95}`)
   }
@@ -375,14 +397,15 @@ try {
     mode: benchmarkMode,
     generatedAt: new Date().toISOString(),
     app: { path: app.selected, entry: app.entry, build: target, checkout },
-    runtime: { ...runtime, testPresentation: runtime.presentation, presentation,
+    runtime: { ...runtime, testPresentation: runtime.testPresentation, presentation,
       network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' },
     fixture: { candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture.oiFailureCount, seed: fixture.seed,
       dataFingerprint: `market-traffic-v2-bookseq-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
       qualification: { total: finalSnapshot.catalogProgress.total, completed: finalSnapshot.catalogProgress.completed,
         pending: finalSnapshot.catalogProgress.pending, verified: finalSnapshot.catalogProgress.verified,
         failed: finalSnapshot.catalogProgress.failed, unknown: finalSnapshot.catalogProgress.unknown },
-      requiredChannels, cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness },
+      requiredChannels, cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness,
+      readinessPhase: readiness ? 'all-passing-15m-frames-ready-before-steady-state-sample' : null },
     traffic: { durationSeconds: traffic.durationSeconds, websocketPayloadBytes, httpResponsePayloadBytes,
       totalPayloadBytes: websocketPayloadBytes + httpResponsePayloadBytes,
       websocketPayloadBytesByChannel: traffic.websocket, httpResponsePayloadBytesByChannel: traffic.http,
@@ -400,6 +423,19 @@ try {
     fixtureErrors: fixture.errors,
   }
   await mkdir(dirname(output), { recursive: true })
+  completedReport = report
+  if (baselineReport) {
+    try {
+      const comparison = compareMarketTrafficReports(baselineReport, report)
+      report.comparison = { baselineReport: baselineReportPath, outcome: 'passed', result: comparison }
+    } catch (error) {
+      report.outcome = 'failed'
+      report.failure = error.message
+      report.comparison = { baselineReport: baselineReportPath, outcome: 'failed', failure: error.message }
+      await writeFile(output, `${JSON.stringify(report, null, 2)}\n`)
+      throw error
+    }
+  }
   await writeFile(output, `${JSON.stringify(report, null, 2)}\n`)
   console.log(JSON.stringify({ report: output, ...report }, null, 2))
 } catch (error) {
@@ -410,7 +446,16 @@ try {
   const diagnostics = { benchmarkFailure: error.message, fixtureErrors: fixture.errors,
     fixtureRequests: requestCounts, fixtureReadyClients: fixture.readyState.clients,
     fixtureSubscriptions: channels, instrumentsWithFixtureDeliveries: deliveryCounts }
-  if (failureMeasurements) {
+  if (completedReport) {
+    try {
+      completedReport.outcome = 'failed'
+      completedReport.failure ??= error.message
+      completedReport.diagnostics = diagnostics
+      await mkdir(dirname(output), { recursive: true })
+      await writeFile(output, `${JSON.stringify(completedReport, null, 2)}\n`)
+      diagnostics.partialFailureReport = output
+    } catch (reportError) { diagnostics.partialFailureReportError = reportError.message }
+  } else if (failureMeasurements) {
     try {
       await mkdir(dirname(output), { recursive: true })
       await writeFile(output, `${JSON.stringify({ ...failureMeasurements, outcome: 'failed', failure: error.message, diagnostics }, null, 2)}\n`)

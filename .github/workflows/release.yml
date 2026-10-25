@@ -40,9 +40,6 @@ jobs:
         run: npm run test:core -- --output artifacts/sandbox
       - name: Test Electron with isolated fixtures
         run: npm run test:e2e -- --output artifacts/sandbox
-      - name: Verify reduced traffic with complete live coverage and responsive input
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
-        run: npm run sandbox -- command --foreground --output artifacts/sandbox -- node scripts/market-traffic-benchmark.mjs --expect-optimized --foreground --output artifacts/market-traffic.json
       - name: Probe native GPU capabilities and verify accelerated chart work when available
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         # Hosted runners may expose software rendering. The dedicated report
@@ -101,9 +98,50 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  market-traffic:
+    name: Paired native foreground market traffic and input timing
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: '.nvmrc'
+          cache: npm
+      - name: Use the supported npm version
+        run: npm install --global npm@12.2.0
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Prepare the clean pre-optimization source with identical dependencies
+        shell: bash
+        run: |
+          baseline_revision=ab9cb551bd00252abf370a324fe17d1eeacd6db1
+          git fetch --no-tags --depth=1 origin "$baseline_revision"
+          git worktree add --detach .build/traffic-baseline-source "$baseline_revision"
+          ln -s "$GITHUB_WORKSPACE/node_modules" .build/traffic-baseline-source/node_modules
+          git diff --exit-code "$baseline_revision" HEAD -- package.json package-lock.json
+          npm --prefix .build/traffic-baseline-source run build
+      - name: Build the optimized renderer
+        run: npm run build
+      - name: Measure the original app on the same runner
+        run: npm run sandbox -- command --foreground --output .build/traffic-optimization/ci/sandbox-before -- node scripts/market-traffic-benchmark.mjs --app-root .build/traffic-baseline-source --foreground --output .build/traffic-optimization/ci/market-before.json
+      - name: Verify reduced traffic and paired renderer responsiveness
+        run: npm run sandbox -- command --foreground --output .build/traffic-optimization/ci/sandbox-after -- node scripts/market-traffic-benchmark.mjs --expect-optimized --foreground --baseline-report .build/traffic-optimization/ci/market-before.json --output .build/traffic-optimization/ci/market-after.json
+      - name: Retain paired traffic and timing diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: market-traffic-${{ github.sha }}
+          path: .build/traffic-optimization/ci/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
   package-smoke:
     name: Package and smoke the macOS executable
-    needs: [validate, chart-foreground]
+    needs: [validate, chart-foreground, market-traffic]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: macos-15
     timeout-minutes: 25
