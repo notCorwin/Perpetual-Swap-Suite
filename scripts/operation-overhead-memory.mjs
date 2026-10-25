@@ -1,6 +1,11 @@
-// Overlapping phase windows share the same physical 5 ms process-memory scan.
+import { getHeapStatistics } from 'node:v8'
+
+// Read the two measured counters without the full memoryUsage page scan.
+const processMemory = () => ({ rss: process.memoryUsage.rss(), heapUsed: getHeapStatistics().used_heap_size })
+
+// Overlapping phase windows share the same physical 5 ms memory sample.
 // Boundary scans also update every active window so nested windows cannot hide peaks.
-export function createMemorySampler({ read = () => process.memoryUsage(), schedule = setInterval, cancel = clearInterval } = {}) {
+export function createMemorySampler({ read = processMemory, schedule = setInterval, cancel = clearInterval } = {}) {
   const windows = new Set()
   let timer = null
   let reads = 0

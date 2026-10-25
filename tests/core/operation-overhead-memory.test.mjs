@@ -18,6 +18,30 @@ function fixture() {
   return { sampler, timers, cancelled, reads: () => reads, memory: (rss, heapUsed) => { memory = { rss, heapUsed } } }
 }
 
+test('the default sampler preserves RSS and heap peaks without a full process-memory scan', () => {
+  const original = process.memoryUsage
+  let rss = 100, reads = 0, tick
+  const fullScan = () => { throw new Error('The sampler must not request unmeasured process counters.') }
+  fullScan.rss = () => { reads++; return rss }
+  process.memoryUsage = fullScan
+  try {
+    const sampler = createMemorySampler({ schedule: callback => { tick = callback; return 0 }, cancel() {} })
+    const window = sampler.begin()
+    rss = 300
+    tick()
+    rss = 200
+    const result = window.end()
+    assert.equal(reads, 3)
+    assert.deepEqual(Object.keys(window.initial).sort(), ['heapUsed', 'rss'])
+    assert.ok(window.initial.heapUsed > 0 && result.final.heapUsed > 0)
+    assert.equal(result.peakRSSBytes, 300)
+    assert.ok(result.peakHeapBytes >= Math.max(window.initial.heapUsed, result.final.heapUsed))
+    assert.equal(sampler.snapshot().intervalMS, 5)
+  } finally {
+    process.memoryUsage = original
+  }
+})
+
 test('overlapping windows share one 5 ms scan and observe all boundary scans', () => {
   const f = fixture()
   const outer = f.sampler.begin()
