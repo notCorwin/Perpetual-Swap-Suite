@@ -109,6 +109,16 @@ export function validateMarketTrafficReport(report, label, { baseline = false } 
     }
   }
   if (foreground) {
+    assert.equal(report.fixture?.searchScenario?.version, 'distributed-input-v1', `${label} must use distributed search sampling.`)
+    const schedule = report.fixture.searchScenario, interactions = report.renderer.searchInteractionMS
+    assert.ok(schedule.eventCount >= 21 && schedule.windowMS === report.fixture.durationSeconds * 1_000
+      && schedule.lastInputAtMS === schedule.windowMS - 100, `${label} has an invalid fixed search schedule.`)
+    assert.equal(interactions.count, schedule.eventCount, `${label} did not complete every declared search event.`)
+    assert.equal(interactions.samples?.length, schedule.eventCount, `${label} lacks per-input search evidence.`)
+    assert.ok(interactions.samples.every(sample => sample.correct && sample.actualResultCount === sample.expectedResultCount),
+      `${label} did not verify the filtered results for every timed search.`)
+    assert.ok(interactions.samples.at(-1).startedMS - interactions.samples[0].startedMS >= schedule.windowMS * .8,
+      `${label} search inputs must span the steady-state sample, rather than an initial burst.`)
     assert.equal(report.fixture?.readinessPhase, 'all-passing-15m-frames-ready-before-steady-state-sample',
       `${label} must sample only after the selected chart readiness barrier.`)
     assert.equal(report.fixture?.readiness?.timeframe, '15m', `${label} must use the same selected 15m readiness phase.`)
@@ -137,6 +147,7 @@ export function compareMarketTrafficReports(before, after) {
   }
   assert.equal(after.runtime.electronVersion, before.runtime.electronVersion, 'Before/after must use the same Electron version.')
   if (foreground) {
+    assert.deepEqual(after.fixture.searchScenario, before.fixture.searchScenario, 'Before/after must use the same search schedule.')
     assert.equal(after.runtime.executable, before.runtime.executable, 'Before/after must use the same actual Electron executable.')
     assert.equal(after.fixture.readinessPhase, before.fixture.readinessPhase, 'Before/after must cross the same chart readiness phase before sampling.')
     for (const key of ['timeframe', 'expectedFrames', 'readyFrames']) assert.equal(after.fixture.readiness[key], before.fixture.readiness[key],

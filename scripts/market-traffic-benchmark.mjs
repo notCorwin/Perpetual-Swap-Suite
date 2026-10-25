@@ -38,9 +38,13 @@ const expectOptimized = values['expect-optimized'] === true
 const foreground = values.foreground === true
 const baselineReportPath = values['baseline-report'] ? resolve(values['baseline-report']) : null
 const waitReady = foreground || values['wait-ready'] === true
+const searchEventCount = (passingCount + 1) * (foreground ? Math.ceil(21 / (passingCount + 1)) : 1)
+const searchScenario = foreground ? { version: 'distributed-input-v1', eventCount: searchEventCount,
+  windowMS: durationSeconds * 1_000, lastInputAtMS: durationSeconds * 1_000 - 100 } : null
 const benchmarkMode = foreground
   ? 'foreground-electron-loopback-market-traffic-and-renderer-responsiveness'
   : 'hidden-electron-loopback-market-traffic-and-renderer-responsiveness'
+const searchMeasurement = `${foreground ? 'Native foreground' : 'Hidden offscreen'} renderer RAF gaps and input-to-second-RAF scheduling latency; filtered result counts are recorded and native compositor paint is not measured.`
 if (candidateCount < 3 || candidateCount > 100) throw new Error('--candidate-count must be between 3 and 100.')
 if (durationSeconds < 5 || durationSeconds > 10) throw new Error('--duration-seconds must be between 5 and 10.')
 if (cadenceMS < 100 || cadenceMS > 2_000) throw new Error('--cadence-ms must be between 100 and 2000.')
@@ -309,7 +313,7 @@ try {
   // initial cadence message. Only steady-state fixture traffic is measured.
   if (foreground) await assertForeground(electron, page)
   const sampleStartedAt = fixture.beginSample()
-  await page.evaluate(requireForeground => {
+  await page.evaluate(({ requireForeground, passingIDs }) => {
     const state = { gaps: [], interactions: [], interactionSamples: [], lastFrame: null, startedAt: performance.now(), active: true,
       presentation: { requiredForeground: requireForeground, samples: 0, totalViolations: 0, violations: [] } }
     const checkPresentation = () => {
@@ -336,20 +340,25 @@ try {
       const started = performance.now(), term = event.target.value
       requestAnimationFrame(() => requestAnimationFrame(() => {
         const completed = performance.now(), durationMS = completed - started
+        const expectedResultCount = passingIDs.filter(id => id.toLowerCase().includes(term.trim().toLowerCase())).length
+        const actualResultCount = Number(document.querySelector('[data-market-count]')?.getAttribute('data-market-count'))
         state.interactions.push(durationMS)
-        state.interactionSamples.push({ term, startedMS: started - state.startedAt, completedMS: completed - state.startedAt, durationMS })
+        state.interactionSamples.push({ term, startedMS: started - state.startedAt, completedMS: completed - state.startedAt, durationMS,
+          expectedResultCount, actualResultCount, correct: actualResultCount === expectedResultCount })
       }))
     }, true)
     globalThis.__marketTrafficResponsiveness = state
     checkPresentation()
     requestAnimationFrame(frame)
-  }, foreground)
+  }, { requireForeground: foreground, passingIDs: [...qualifyingIDs] })
   const search = page.locator('input[aria-label="Search contracts"]')
   const searches = fixture.instIds.slice(0, passingCount).map(instId => instId.slice(0, 4))
   const interactionTask = (async () => {
-    for (const term of [...searches, '']) {
-      await search.fill(term)
-      await sleep(30)
+    const terms = [...searches, ''], startedAt = performance.now()
+    for (let index = 0; index < searchEventCount; index++) {
+      if (foreground) await sleep(Math.max(0, startedAt + index * searchScenario.lastInputAtMS / (searchEventCount - 1) - performance.now()))
+      await search.fill(terms[index % terms.length])
+      if (!foreground) await sleep(30)
     }
   })()
   await Promise.all([interactionTask, sleep(durationSeconds * 1_000)])
@@ -377,11 +386,9 @@ try {
       network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' },
     fixture: { asOf: fixture.asOf, candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture.oiFailureCount, seed: fixture.seed,
       dataFingerprint: `market-traffic-v2-bookseq-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
-      cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness,
+      cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness, searchScenario,
       readinessPhase: readiness ? 'all-passing-15m-frames-ready-before-steady-state-sample' : null },
-    renderer: { ...renderer, measurement: foreground
-      ? 'Native foreground renderer RAF gaps and React search input to next-frame latency; native compositor paint was not measured.'
-      : 'Hidden offscreen renderer RAF gaps and React search input to next-frame latency; no native compositor paint claim.' },
+    renderer: { ...renderer, measurement: searchMeasurement },
   }
   const traffic = fixture.endSample()
   failureMeasurements.rawFixtureSample = traffic
@@ -427,6 +434,8 @@ try {
   assert.equal(outputMatchesLatest, true, 'Rendered passing tickers must match the latest fixture values.')
   assert.ok(renderer.frameCount >= durationSeconds * 15, 'Renderer RAF sampling is incomplete; reject disconnected/no-op runs.')
   assert.ok(renderer.searchInteractionMS.count >= passingCount, 'Renderer did not process all search interactions.')
+  assert.equal(renderer.searchInteractionMS.count, searchEventCount, 'Renderer must complete the entire declared search schedule.')
+  if (foreground) assert.ok(renderer.searchInteractionMS.samples.every(sample => sample.correct), 'Every timed input must render the expected filtered contract count.')
   if (expectOptimized && !baselineReport) {
     assert.ok(renderer.frameGapMS.p95 <= 50, `Optimized renderer frame-gap p95 exceeded 50ms: ${renderer.frameGapMS.p95}`)
     assert.ok(renderer.searchInteractionMS.p95 <= 50, `Optimized renderer search-response p95 exceeded 50ms: ${renderer.searchInteractionMS.p95}`)
@@ -448,7 +457,7 @@ try {
       qualification: { total: finalSnapshot.catalogProgress.total, completed: finalSnapshot.catalogProgress.completed,
         pending: finalSnapshot.catalogProgress.pending, verified: finalSnapshot.catalogProgress.verified,
         failed: finalSnapshot.catalogProgress.failed, unknown: finalSnapshot.catalogProgress.unknown },
-      requiredChannels, cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness,
+      requiredChannels, cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness, searchScenario,
       readinessPhase: readiness ? 'all-passing-15m-frames-ready-before-steady-state-sample' : null },
     traffic: { durationSeconds: traffic.durationSeconds, websocketPayloadBytes, httpResponsePayloadBytes,
       totalPayloadBytes: websocketPayloadBytes + httpResponsePayloadBytes,
@@ -457,9 +466,7 @@ try {
       subscriptionCounts: fixture.currentAcknowledgements,
       freshness, fixtureRequests: fixture.requests.length, fixtureRequestBytes: fixture.requests.reduce((sum, value) => sum + (value.requestPayloadBytes ?? 0), 0),
       fixtureRequestDetails: fixtureRequestEvidence(fixture.requests) },
-    renderer: { ...renderer, measurement: foreground
-      ? 'Native foreground renderer RAF gaps and React search input to next-frame latency; native compositor paint was not measured.'
-      : 'Hidden offscreen renderer RAF gaps and React search input to next-frame latency; no native compositor paint claim.' },
+    renderer: { ...renderer, measurement: searchMeasurement },
     correctness: { finalRealtimeState: finalSnapshot.realtimeState, connectedWebSocketClients: fixture.readyState.clients,
       allCandidatesHaveFreshTickerOpenInterestAnd5m: true,
       passingIDs: (finalSnapshot.rows ?? []).map(row => row.instId).sort(),

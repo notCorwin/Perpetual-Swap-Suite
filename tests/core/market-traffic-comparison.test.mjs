@@ -34,6 +34,7 @@ function report({ baseline, foreground = false, multiplier = 1, seed = 17, ageMS
       dataFingerprint: `market-traffic-v2-bookseq-10-2-4-seed-${seed}`, cadenceMS: 500, durationSeconds: 7,
       expectOptimized: !baseline, requiredChannels, qualification: { total: 10, completed: 10, pending: 0, verified: 2, failed: 8, unknown: 0 },
       ...(foreground ? { readinessPhase: 'all-passing-15m-frames-ready-before-steady-state-sample',
+        searchScenario: { version: 'distributed-input-v1', eventCount: 21, windowMS: 7_000, lastInputAtMS: 6_900 },
         readiness: { timeframe: '15m', expectedFrames: 2, readyFrames: 2, elapsedMS: 100,
           measurement: 'Bounded chart startup readiness warmup; elapsedMS is excluded from steady-state performance results.' } } : {}) },
     traffic: { durationSeconds: 7, websocketPayloadBytes, httpResponsePayloadBytes: 0, totalPayloadBytes: websocketPayloadBytes,
@@ -42,7 +43,9 @@ function report({ baseline, foreground = false, multiplier = 1, seed = 17, ageMS
         ...(baseline ? { books: candidateIDs, trades: candidateIDs, candle15m: candidateIDs, candle1H: candidateIDs }
           : { books: candidateIDs.slice(0, 2), trades: candidateIDs.slice(0, 2) }) }, freshness: values },
     renderer: { frameCount: 400, frameGapMS: { p50: 16.7, p95: frameGapP95MS, max: 25 },
-      searchInteractionMS: { count: 3, p50: 33.4, p95: interactionP95MS, max: 42 } },
+      searchInteractionMS: { count: foreground ? 21 : 3, p50: 33.4, p95: interactionP95MS, max: 42,
+        ...(foreground ? { samples: Array.from({ length: 21 }, (_, index) => ({ startedMS: index * 345,
+          expectedResultCount: 1, actualResultCount: 1, correct: true })) } : {}) } },
     correctness: { finalRealtimeState: 'live', connectedWebSocketClients: 3, allCandidatesHaveFreshTickerOpenInterestAnd5m: true,
       passingIDs, outputMatchesLatestFixtureTickers: true }, fixtureErrors: [],
   }
@@ -118,4 +121,19 @@ test('foreground market traffic comparison rejects presentation, readiness, runt
 
   const regressed = report({ foreground: true, interactionP95MS: 49 })
   assert.throws(() => compareMarketTrafficReports(before, regressed), /searchInteractionP95MS/)
+})
+
+test('foreground market comparison requires complete, distributed, correct search results', () => {
+  const before = report({ baseline: true, foreground: true, multiplier: 3 })
+  const after = report({ foreground: true, multiplier: 2 })
+  const incomplete = structuredClone(after)
+  incomplete.renderer.searchInteractionMS.count = 7
+  assert.throws(() => compareMarketTrafficReports(before, incomplete), /every declared search event/)
+  const burst = structuredClone(after)
+  burst.renderer.searchInteractionMS.samples.forEach((sample, index) => { sample.startedMS = index * 30 })
+  assert.throws(() => compareMarketTrafficReports(before, burst), /initial burst/)
+  const wrongResults = structuredClone(after)
+  wrongResults.renderer.searchInteractionMS.samples[3].correct = false
+  wrongResults.renderer.searchInteractionMS.samples[3].actualResultCount = 2
+  assert.throws(() => compareMarketTrafficReports(before, wrongResults), /filtered results/)
 })
