@@ -165,7 +165,27 @@ try {
   }, fixture, { timeout: 120_000, polling: 500 })
   report.rendererFrameBarrier = { readyPairs: fixture.instIds.length * fixture.timeframes.length,
     waitAfterListMS: Date.now() - rendererFramesStartedAt, demand: 'Canonical frames delivered through the renderer prepared-frame event.' }
+  // Backend frame delivery does not mean the initial SVG has reached a RAF.
+  // Start prepared-selection timing only after that visible baseline exists;
+  // retain its preparation wait separately from subsequent input latency.
   const focus = fixture.instIds[0], timeframe = '15m'
+  const selectedFrameWaitStartedAt = performance.now()
+  const selectedRaf = await page.waitForFunction(({ focus, timeframe }) => {
+    const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
+    const svg = chart?.querySelector('svg[data-rendered-inst]')
+    const record = window.__resourcePaint.records.at(-1)
+    if (!snapshot || !record || snapshot.instId !== focus || snapshot.timeframe !== timeframe
+      || svg?.dataset.renderedInst !== focus || svg.dataset.renderedTimeframe !== timeframe
+      || Number(svg.dataset.renderedEnd) !== snapshot.endHour
+      || snapshot !== window.__resourcePaint.previous || record.instId !== snapshot.instId
+      || record.timeframe !== snapshot.timeframe || record.bars !== 96 || record.indicatorState !== 'ready'
+      || !Number.isFinite(record.nextFrameAt) || record.nextFrameAt < record.committedAt) return false
+    const { instId, committedAt, nextFrameAt } = record
+    return { instId, timeframe, committedAt, nextFrameAt }
+  }, { focus, timeframe }, { timeout: 20_000 })
+  report.rendererFrameBarrier.selectedRaf = await selectedRaf.jsonValue()
+  await selectedRaf.dispose()
+  report.rendererFrameBarrier.selectedRaf.waitAfterUniverseMS = performance.now() - selectedFrameWaitStartedAt
   let sequence = 0
   const choose = async (instId, phase) => {
     const expected = sequence ? 100 + Number(instId.slice(5, 8)) * 3 + 10 + fixture.periods * .01 + sequence * .001 : null

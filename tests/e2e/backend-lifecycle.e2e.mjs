@@ -91,6 +91,13 @@ test('backend collection, gap repair, and all-period preparation run independent
     assert.equal(repaired.length, 1)
     assert.equal(repaired[0].confirmed, true)
     const changedAt = Math.floor(exchange.asOf / nativeIntervals['1H']) * nativeIntervals['1H'] - nativeIntervals['5m']
+    const coarseBefore = new Map()
+    for (const timeframe of ['15m', '1H']) {
+      const step = nativeIntervals[timeframe], timestamp = Math.floor(changedAt / step) * step
+      const rows = await backend.request({ e2e: { action: 'readCandles', instrument: ids[1], timeframe, from: timestamp, through: timestamp } })
+      assert.equal(rows.length, 1, `The seeded ${timeframe} aggregate must exist before the 5m correction.`)
+      coarseBefore.set(timeframe, rows[0])
+    }
     const changed = exchange.sendCandle(ids[1], '5m', { timestamp: changedAt, close: 551.25, volume: 100, confirmed: true })
     assert.ok(changed.volume > 0 && changed.baseVolume > 0 && changed.quoteVolume > 0)
     await waitFor(async () => {
@@ -106,6 +113,15 @@ test('backend collection, gap repair, and all-period preparation run independent
           volume: changed.volume, baseVolume: changed.baseVolume, quoteVolume: changed.quoteVolume } : row)
       assert.equal(children.length, step / nativeIntervals['5m'], `${timeframe} must have a complete canonical 5m source bucket.`)
       const expected = expectedAggregate(children, timeframe, timestamp)
+      // The confirmed 5m write is observable before the serialized coarse
+      // materialization finishes. Wait for that derived write before checking
+      // the exact canonical aggregate; the 5m publication alone is not its
+      // completion signal.
+      await waitFor(async () => {
+        const rows = await backend.request({ e2e: { action: 'readCandles', instrument: ids[1], timeframe, from: timestamp, through: timestamp } })
+        return rows.length === 1 && ['open', 'high', 'low', 'close', 'volume', 'baseVolume', 'quoteVolume', 'confirmed']
+          .some(field => !Object.is(rows[0][field], coarseBefore.get(timeframe)[field]))
+      }, `materialize the canonical ${timeframe} aggregate after its 5m correction`)
       const rows = await backend.request({ e2e: { action: 'readCandles', instrument: ids[1], timeframe, from: timestamp, through: timestamp } })
       assert.equal(rows.length, 1)
       for (const field of ['open', 'high', 'low', 'close', 'volume', 'baseVolume', 'quoteVolume', 'confirmed']) {
