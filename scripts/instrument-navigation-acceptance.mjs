@@ -3,24 +3,23 @@ import { assertWorkspaceLayout, selectTimeframe } from './chart-acceptance.mjs'
 
 function navigationTimingScope(presentation) {
   return presentation === 'foreground'
-    ? { presentation, wallTime: 'native foreground deadlines enforced: 50 ms for normal input and 100 ms for rapid input', frames: 'at most one frame enforced' }
-    : { presentation, wallTime: 'input-to-SVG values are diagnostics; no native display deadline is inferred', frames: 'at most one frame enforced' }
+    ? { presentation, wallTime: 'native foreground input-to-SVG deadlines enforced: 50 ms for normal input and 100 ms for rapid input', frames: 'at most one renderer RAF sample enforced' }
+    : { presentation, wallTime: 'input-to-SVG and input-to-RAF values are diagnostics; no native display deadline is inferred', frames: 'at most one renderer RAF sample enforced' }
 }
 
 // Executed in the first document by the test-only Electron bootstrap. Record
 // list availability separately, then measure a selection after the renderer
 // has received its canonical frame. Geometry is built as part of that selection.
 export function startupNavigationProbe() {
-  const probe = window.__navigationStartup = { documentAt: performance.timeOrigin, domAt: null, listAt: null, preparedAt: null, inputAt: null, commitAt: null, paintAt: null,
-    instId: null, timeframe: null, framesToCommit: 0, framesToPaint: 0, previous: null, commits: [], samples: [], ready: new Set(), violations: [],
+  const probe = window.__navigationStartup = { documentAt: performance.timeOrigin, domAt: null, listAt: null, preparedAt: null, inputAt: null, commitAt: null, rafSampleAt: null,
+    instId: null, timeframe: null, framesToCommit: 0, framesToRafSample: 0, previous: null, commits: [], samples: [], ready: new Set(), violations: [],
     readyAt: new Map(), allowInput: false, armedAt: null, inputPresentation: null }
   let stopped = false, clicking = false, inputQueued = false, raf = null
   document.addEventListener('DOMContentLoaded', () => { probe.domAt = performance.now() }, { once: true })
   window.addEventListener('radar-chart-prepared', event => {
     const frame = event.detail
     if (frame?.bars?.length === 96 && frame.indicatorState === 'ready'
-      && ['ready', 'stale'].includes(frame.priceState) && ['ready', 'unavailable'].includes(frame.oiState)
-      && ['ready', 'unavailable'].includes(frame.takerState)) {
+      && ['ready', 'stale'].includes(frame.priceState) && frame.oiState === 'ready' && frame.takerState === 'ready') {
       const key = `${frame.timeframe}:${frame.instId}`
       probe.ready.add(key)
       if (!probe.readyAt.has(key)) probe.readyAt.set(key, performance.now())
@@ -63,7 +62,7 @@ export function startupNavigationProbe() {
     }
     if (clicking && probe.commitAt === null && snapshot.instId === probe.instId && snapshot.timeframe === probe.timeframe && chart.dataset.chartLoading === 'false') {
       probe.commitAt = performance.now()
-      requestAnimationFrame(() => { probe.paintAt = performance.now(); stop() })
+      requestAnimationFrame(() => { probe.rafSampleAt = performance.now(); stop() })
     }
   }
   const observer = new MutationObserver(sample)
@@ -72,7 +71,7 @@ export function startupNavigationProbe() {
     if (stopped) return
     if (probe.inputAt !== null) {
       if (probe.commitAt === null) probe.framesToCommit += 1
-      probe.framesToPaint += 1
+      probe.framesToRafSample += 1
     }
     sample()
     if (!stopped) raf = requestAnimationFrame(frame)
@@ -89,7 +88,7 @@ export async function startupNavigationReport(page, launchedAt, fixture, { prese
     probe.armedAt = performance.now()
     probe.allowInput = true
   })
-  await page.waitForFunction(() => window.__navigationStartup && window.__navigationStartup.paintAt !== null, null, { timeout: 40_000 }).catch(async error => {
+  await page.waitForFunction(() => window.__navigationStartup && window.__navigationStartup.rafSampleAt !== null, null, { timeout: 40_000 }).catch(async error => {
     const state = await page.evaluate(() => {
       const { samples, previous, stop, ready, readyAt, ...probe } = window.__navigationStartup ?? {}
       return { probe, rows: [...document.querySelectorAll('[data-market-index]')].map(row => ({ id: row.getAttribute('aria-label'), selected: row.getAttribute('aria-selected') })),
@@ -116,7 +115,7 @@ export async function startupNavigationReport(page, launchedAt, fixture, { prese
       processToFirstChartMS: probe.documentAt + probe.commits[0].at - launchedAt,
       domToFirstChartMS: probe.commits[0].at - probe.domAt,
       rendererFrameWaitMS: Math.max(0, probe.preparedAt - probe.listAt), listToInputMS: probe.inputAt - probe.listAt, inputToSVGCommitMS: probe.commitAt - probe.inputAt,
-      inputToNextPaintMS: probe.paintAt - probe.inputAt, framesToCommit: probe.framesToCommit, framesToPaint: probe.framesToPaint,
+      inputToNextRafSampleMS: probe.rafSampleAt - probe.inputAt, framesToCommit: probe.framesToCommit, framesToRafSample: probe.framesToRafSample,
       inputEpoch: probe.documentAt + probe.inputAt, commitEpoch: probe.documentAt + probe.commitAt,
       rendererFramesBeforeInput: probe.preparedAtInput, commits: probe.commits, violations: probe.violations }
   }, { launchedAt, instruments: fixture.instruments.map(({ instId, series }) => ({ instId,
@@ -131,15 +130,17 @@ export async function persistNavigationCatalog(electron, _page) {
   return electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'persistNavigationCatalog' }))
 }
 
-export async function installNavigationProbe(electron) {
-  await electron.evaluate(({ ipcMain, BrowserWindow }) => {
+export async function installNavigationProbe(electron, { omitUniverseInstId = null } = {}) {
+  await electron.evaluate(({ ipcMain, BrowserWindow }, omitUniverseInstId) => {
     const original = ipcMain._invokeHandlers.get('radar:request')
     const contents = BrowserWindow.getAllWindows()[0].webContents
     const originalSend = contents.send
-    const probe = { original, contents, originalSend, requests: [], held: false, heldSettled: false, holdInstId: null, release: null }
+    const probe = { original, contents, originalSend, requests: [], held: false, heldSettled: false,
+      holdInstId: null, omitUniverseInstId, release: null }
     const released = new Promise(resolve => { probe.release = resolve })
     contents.send = function (channel, ...args) {
       const frame = args[0]
+      if (channel === 'radar:chart-prepared' && frame?.instId === probe.omitUniverseInstId) return
       // Keep the blocked history boundary deterministic: its independent push
       // cannot complete the viewport ahead of the deliberately held disk read.
       if (channel === 'radar:chart-prepared' && frame?.instId === probe.holdInstId && !probe.heldSettled
@@ -162,28 +163,30 @@ export async function installNavigationProbe(electron) {
       }
       try {
         const response = await original(event, value)
+        if (value.chartUniverse && probe.omitUniverseInstId) {
+          return { ...response, frames: response.frames.filter(frame => frame.instId !== probe.omitUniverseInstId) }
+        }
         return response
       } finally { if (held) probe.heldSettled = true }
     })
     globalThis.__instrumentNavigationProbe = probe
-  })
+  }, omitUniverseInstId)
 }
 
 // Observe automatic backend preparation through the pure resident-frame read.
 // Neither local reads nor the measurement driver admit chart work.
-export async function waitForUniverseReady(electron, page, fixture) {
+export async function waitForUniverseReady(electron, page, fixture, { omitInstId = null } = {}) {
   const startedAt = Date.now(), timeframes = ['5m', '15m', '1H']
   const snapshot = await page.evaluate(() => window.radarDesktop.request({ snapshot: { sinceRevision: -1 } }))
   const qualified = snapshot.rows.map(row => row.instId)
   assert.deepEqual([...qualified].sort(), [...fixture.instIds].sort(), 'The navigation fixture must cover the entire backend-qualified universe.')
-  const expected = timeframes.flatMap(timeframe => qualified.map(instId => `${timeframe}:${instId}`))
+  const expected = timeframes.flatMap(timeframe => qualified.filter(instId => instId !== omitInstId).map(instId => `${timeframe}:${instId}`))
   const ready = new Set()
   while (Date.now() - startedAt < 40_000) {
-    const keys = await page.evaluate(async () => {
+    const keys = await page.evaluate(async omittedInstId => {
       const { frames } = await window.radarDesktop.request({ chartUniverse: {} })
-      const canonical = frames.filter(frame => frame.bars?.length === 96 && frame.indicatorState === 'ready'
-        && ['ready', 'stale'].includes(frame.priceState) && ['ready', 'unavailable'].includes(frame.oiState)
-        && ['ready', 'unavailable'].includes(frame.takerState))
+      const canonical = frames.filter(frame => frame.instId !== omittedInstId && frame.bars?.length === 96 && frame.indicatorState === 'ready'
+        && ['ready', 'stale'].includes(frame.priceState) && frame.oiState === 'ready' && frame.takerState === 'ready')
       const keys = canonical.map(frame => `${frame.timeframe}:${frame.instId}`)
       const delivered = window.__navigationCanonicalFrames ??= new Set()
       // Feed the canonical frames through the same renderer event App uses for
@@ -196,14 +199,15 @@ export async function waitForUniverseReady(electron, page, fixture) {
         delivered.add(key)
       }
       return keys
-    })
+    }, omitInstId)
     for (const key of keys) ready.add(key)
     if (expected.every(key => ready.has(key))) break
     await new Promise(resolve => setTimeout(resolve, 100))
   }
-  assert.deepEqual(expected.filter(key => !ready.has(key)), [], 'The renderer must receive every canonical qualified contract frame in all three timeframes.')
+  assert.deepEqual(expected.filter(key => !ready.has(key)), [], 'The renderer must receive every canonical qualified contract frame except the deliberately unprepared candidate.')
   await page.evaluate(async () => { await new Promise(resolve => requestAnimationFrame(resolve)) })
-  return { candidateCount: fixture.instIds.length, frameCount: expected.length, readyFrameCount: expected.filter(key => ready.has(key)).length,
+  return { candidateCount: fixture.instIds.length, frameCount: expected.length, omittedInstId: omitInstId,
+    readyFrameCount: expected.filter(key => ready.has(key)).length,
     rendererFrameWaitMS: Date.now() - startedAt, frames: timeframes.map(timeframe => ({ timeframe, instrumentCount: fixture.instIds.length,
       readyCount: fixture.instIds.filter(id => ready.has(`${timeframe}:${id}`)).length })) }
 }
@@ -249,14 +253,14 @@ export async function waitForInstrument(page, instId, timeframe) {
   }, { instId, timeframe }, { timeout: 10_000 })
 }
 
-export async function startNavigationPaintProbe(page, fixture) {
-  await page.evaluate(instruments => {
+export async function startNavigationFrameProbe(page, fixture, { requirePreparedStatistics = true } = {}) {
+  await page.evaluate(({ instruments, requirePreparedStatistics }) => {
     const oracles = new Map(instruments.map(instrument => [instrument.instId,
       new Map(Object.entries(instrument.series).map(([timeframe, series]) => [timeframe, { intervalMS: series.intervalMS, bars: new Map(series.bars.map(bar => [bar.hour, bar])) }]))]))
     const fields = ['open', 'high', 'low', 'close', 'ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
-    const probe = { active: true, frames: 0, paints: 0, minimumBars: Infinity, violations: [], commits: [], previous: null, presentedSurface: null, raf: null, observer: null }
+    const probe = { active: true, rafSamples: 0, snapshotChanges: 0, minimumBars: Infinity, violations: [], commits: [], previous: null, observedSurface: null, raf: null, observer: null }
     const fail = message => { if (probe.violations.length < 20) probe.violations.push(message) }
-    const sample = (presentedFrame = false) => {
+    const sample = () => {
       const chart = document.querySelector('[data-chart-inst]')
       if (!chart) return
       const svg = chart.querySelector('svg[data-rendered-inst]')
@@ -264,23 +268,32 @@ export async function startNavigationPaintProbe(page, fixture) {
       // Preserve a complete prior frame while the next contract is preparing.
       // Initial mounting may precede the first complete SVG in the same frame.
       if (!svg || !snapshot) return
-      probe.presentedSurface = chart
+      if (requirePreparedStatistics && (snapshot.oiState !== 'ready' || snapshot.takerState !== 'ready')) {
+        fail('Fixture-known OI/Taker states became unavailable during prepared navigation.')
+      }
+      probe.observedSurface = chart
       if (svg.dataset.renderedInst !== snapshot.instId || svg.dataset.renderedTimeframe !== snapshot.timeframe) fail('The actual SVG combines different identities.')
       if (Number(svg.dataset.renderedStart) !== snapshot.bars[0]?.hour || Number(svg.dataset.renderedEnd) !== snapshot.endHour) fail('The rendered range and its labels disagree.')
       if (chart.dataset.chartInst !== snapshot.instId || Number(chart.dataset.chartEnd) !== snapshot.endHour) fail('Chart metadata and the drawn instrument disagree.')
       if (probe.previous === snapshot) return
       probe.previous = snapshot
-      probe.paints += 1
+      probe.snapshotChanges += 1
       probe.minimumBars = Math.min(probe.minimumBars, snapshot.bars.length)
       probe.commits.push({ instId: snapshot.instId, timeframe: snapshot.timeframe, end: snapshot.endHour, at: performance.now() })
-      if (snapshot.bars.length !== 96) fail(`A switch presented ${snapshot.bars.length} candles.`)
+      if (snapshot.bars.length !== 96) fail(`A switch snapshot contains ${snapshot.bars.length} candles.`)
       const oracle = oracles.get(snapshot.instId)?.get(snapshot.timeframe)
       for (const [index, bar] of snapshot.bars.entries()) {
         const expected = oracle?.bars.get(bar.hour)
         if (!expected) { fail(`Unexpected source ${snapshot.instId}/${snapshot.timeframe}/${bar.hour}.`); continue }
         if (index && bar.hour - snapshot.bars[index - 1].hour !== oracle.intervalMS) fail('A switched chart contains noncontiguous periods.')
         if (!bar.confirmed) fail('A forming candle entered the persisted completed window.')
-        for (const field of fields.filter(field => ['open', 'high', 'low', 'close'].includes(field) || ['oi', 'buy', 'sell'].includes(field) ? !['oi', 'buy', 'sell'].includes(field) || bar.statisticsObserved : bar.indicatorsObserved)) {
+        const oiObserved = bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)
+        const takerObserved = bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2)
+        if (requirePreparedStatistics && Number.isFinite(expected.oi) && !oiObserved) fail('Fixture-known OI observation disappeared during prepared navigation.')
+        if (requirePreparedStatistics && Number.isFinite(expected.buy) && Number.isFinite(expected.sell) && !takerObserved) fail('Fixture-known Taker observation disappeared during prepared navigation.')
+        for (const field of fields.filter(field => ['open', 'high', 'low', 'close'].includes(field)
+          || (field === 'oi' ? requirePreparedStatistics || oiObserved
+            : ['buy', 'sell'].includes(field) ? requirePreparedStatistics || takerObserved : bar.indicatorsObserved))) {
           if (expected[field] === null ? bar[field] !== null : typeof bar[field] !== 'number' || !Number.isFinite(bar[field]) || Math.abs(bar[field] - expected[field]) > Math.max(1, Math.abs(expected[field])) * 1e-10) fail(`${snapshot.instId} ${bar.hour} ${field} has the wrong source value.`)
         }
       }
@@ -290,28 +303,28 @@ export async function startNavigationPaintProbe(page, fixture) {
     }
     probe.observer = new MutationObserver(() => sample())
     probe.observer.observe(document.getElementById('root'), { subtree: true, childList: true, attributes: true })
-    const frame = () => { if (!probe.active) return; probe.frames += 1; sample(true); probe.raf = requestAnimationFrame(frame) }
+    const frame = () => { if (!probe.active) return; probe.rafSamples += 1; sample(); probe.raf = requestAnimationFrame(frame) }
     sample()
     probe.raf = requestAnimationFrame(frame)
     window.__navigationPaintProbe = probe
-  }, fixture.instruments)
+  }, { instruments: fixture.instruments, requirePreparedStatistics })
 }
 
-export async function finishNavigationPaintProbe(page) {
+export async function finishNavigationFrameProbe(page) {
   return page.evaluate(() => {
     const probe = window.__navigationPaintProbe
     probe.active = false
     cancelAnimationFrame(probe.raf)
     probe.observer.disconnect()
     delete window.__navigationPaintProbe
-    return { frames: probe.frames, paints: probe.paints, minimumBars: probe.minimumBars, violations: probe.violations, commits: probe.commits }
+    return { rafSamples: probe.rafSamples, snapshotChanges: probe.snapshotChanges, minimumBars: probe.minimumBars, violations: probe.violations, commits: probe.commits }
   })
 }
 
-export function assertNavigationPaints(report) {
-  assert.ok(report.frames > 0)
+export function assertNavigationFrames(report) {
+  assert.ok(report.rafSamples > 0)
   assert.equal(report.minimumBars, 96)
-  assert.deepEqual(report.violations, [], 'A navigation frame was incomplete or used another contract’s values.')
+  assert.deepEqual(report.violations, [], 'A renderer snapshot was incomplete or used another contract’s values.')
 }
 
 // Capture the actual input event and the subsequent actual SVG commit. Node
@@ -320,7 +333,7 @@ export async function measureNavigation(page, trigger, { expectedInstId = null, 
   await page.evaluate(({ expectedInstId, sourceInstId, timeframe, timeoutMS }) => {
     const source = sourceInstId ?? document.querySelector('svg[data-rendered-inst]')?.getAttribute('data-rendered-inst')
     const expectedFrame = timeframe ?? document.querySelector('svg[data-rendered-inst]')?.getAttribute('data-rendered-timeframe')
-    const pending = { done: false, started: null, frames: 0, raf: null, observer: null, result: null, timer: null }
+    const pending = { done: false, started: null, selectionAcknowledgedAt: null, frames: 0, raf: null, observer: null, result: null, timer: null }
     window.__navigationMeasurement = new Promise((resolve, reject) => {
       const cleanup = () => {
         pending.done = true
@@ -332,13 +345,18 @@ export async function measureNavigation(page, trigger, { expectedInstId = null, 
       }
       const sample = () => {
         if (pending.done || pending.started === null) return
+        if (expectedInstId && pending.selectionAcknowledgedAt === null
+          && document.querySelector(`[aria-label="View ${expectedInstId} chart"]`)?.getAttribute('aria-selected') === 'true') {
+          pending.selectionAcknowledgedAt = performance.now()
+        }
         const svg = document.querySelector('svg[data-rendered-inst]')
         const id = svg?.getAttribute('data-rendered-inst')
         const chart = svg?.closest('[data-chart-inst]')
         if (!id || expectedFrame && svg.getAttribute('data-rendered-timeframe') !== expectedFrame || (expectedInstId ? id !== expectedInstId : id === source) || chart.dataset.chartRenderedBars !== '96' || chart.dataset.chartLoading !== 'false') return
-        const result = { instId: id, inputToSVGCommitMS: performance.now() - pending.started, framesToCommit: pending.frames }
+        const result = { instId: id, timeframe: expectedFrame, inputToSVGCommitMS: performance.now() - pending.started, framesToCommit: pending.frames,
+          inputToSelectionAcknowledgedMS: pending.selectionAcknowledgedAt === null ? null : pending.selectionAcknowledgedAt - pending.started }
         cleanup()
-        requestAnimationFrame(() => resolve({ ...result, inputToNextPaintMS: performance.now() - pending.started }))
+        requestAnimationFrame(() => resolve({ ...result, inputToNextRafSampleMS: performance.now() - pending.started }))
       }
       const frame = () => { if (pending.done) return; if (pending.started !== null) pending.frames += 1; sample(); if (!pending.done) pending.raf = requestAnimationFrame(frame) }
       const timeout = () => { cleanup(); reject(new Error('The requested contract did not commit a complete chart before the navigation deadline.')) }
@@ -372,17 +390,18 @@ export async function firstVisibleMarket(page, excluded = []) {
   return { instId, locator: page.locator(`[aria-label="View ${instId} chart"]`) }
 }
 
-export async function exerciseInstrumentNavigation(electron, page, fixture, { holdHistory = true, presentation = 'offscreen' } = {}) {
+export async function exerciseInstrumentNavigation(electron, page, fixture, { holdHistory = true, presentation = 'offscreen', unpreparedInstId = null } = {}) {
   assert.ok(presentation === 'offscreen' || presentation === 'foreground', `Unknown navigation presentation: ${presentation}`)
+  assert.ok(unpreparedInstId === null || fixture.instIds.includes(unpreparedInstId), 'The unprepared selection must be in the navigation fixture.')
   const phases = []
   let heldHistory = null
   // First launch and restart use the same renderer-received frame barrier.
   // Chart geometry is still created during each measured selection.
   const initialPreparation = { sourceFixtureSeedMS: fixture.seedCompletedAt - fixture.seedStartedAt,
-    ...await waitForUniverseReady(electron, page, fixture) }
+    ...await waitForUniverseReady(electron, page, fixture, { omitInstId: unpreparedInstId }) }
   await page.waitForFunction(() => document.querySelector('svg[data-rendered-inst]')
     && document.querySelector('[data-chart-inst]')?.dataset.chartLoading === 'false', null, { timeout: 10_000 })
-  const sharedSurface = await page.locator('svg[data-rendered-inst]').elementHandle()
+  let sharedSurface = await page.locator('svg[data-rendered-inst]').elementHandle()
   const assertSharedSurface = async phase => {
     assert.equal(await page.locator('svg[data-rendered-inst]').count(), 1, `${phase} must leave exactly one active chart SVG.`)
     assert.equal(await page.locator('svg[data-prepared-chart-inst]').count(), 1, `${phase} must not retain hidden candidate SVGs.`)
@@ -402,18 +421,56 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
     assert.equal(await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()), false,
       'Offscreen navigation acceptance must never take macOS window focus.')
   }
-  await startNavigationPaintProbe(page, fixture)
-  const nextFrame = async (trigger, { rapid = false, ...options } = {}) => {
+  const initialInstId = await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-inst')
+  const initialTimeframe = await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-timeframe')
+  if (initialTimeframe !== fixture.timeframe) {
+    await selectTimeframe(page, fixture.timeframe)
+    await waitForInstrument(page, initialInstId, fixture.timeframe)
+  }
+  await startNavigationFrameProbe(page, fixture, { requirePreparedStatistics: unpreparedInstId === null })
+  const nextFrame = async (trigger, { rapid = false, requireLocal = false, ...options } = {}) => {
     const before = selectionRequests(await navigationRequests(electron)).length
     const result = await measureNavigation(page, trigger, options)
-    const after = selectionRequests(await navigationRequests(electron)).length
-    assert.ok(after - before <= 2, `A selection must use bounded local hydration: ${JSON.stringify({ result, requests: selectionRequests(await navigationRequests(electron)).slice(before) })}`)
-    assert.ok(result.framesToCommit <= 1, `${result.instId} needed ${result.framesToCommit} animation frames to switch.`)
-    await assertSharedSurface(`${result.instId}/${result.timeframe ?? options.timeframe ?? 'current timeframe'} selection`)
+    const newRequests = selectionRequests(await navigationRequests(electron)).slice(before)
+    const after = before + newRequests.length
+    assert.ok(after - before <= 2, `A selection must use bounded local hydration: ${JSON.stringify({ result, requests: newRequests })}`)
+    if (requireLocal) assert.ok(newRequests.some(request => request.kind === 'chartLocal' && request.instId === result.instId),
+      `${result.instId} had no prepared renderer frame and must hydrate from durable local history.`)
+    if (!requireLocal) {
+      assert.ok(result.framesToCommit <= 1, `${result.instId} needed ${result.framesToCommit} animation frames to switch.`)
+      await assertSharedSurface(`${result.instId}/${result.timeframe ?? options.timeframe ?? 'current timeframe'} selection`)
+    }
     const maximumMS = rapid ? 100 : 50
-    if (presentation === 'foreground') assert.ok(result.inputToSVGCommitMS <= maximumMS,
+    if (presentation === 'foreground' && !requireLocal) assert.ok(result.inputToSVGCommitMS <= maximumMS,
       `${result.instId} blocked input for ${result.inputToSVGCommitMS.toFixed(1)} ms (native foreground budget ${maximumMS} ms).`)
+    if (requireLocal) {
+      assert.ok(Number.isFinite(result.inputToSelectionAcknowledgedMS), 'A cold selection must acknowledge the requested contract before its data arrives.')
+      if (presentation === 'foreground') assert.ok(result.inputToSelectionAcknowledgedMS <= 100, 'Cold selection acknowledgment exceeded 100 ms.')
+    }
     return { ...result, selectionIPC: after - before }
+  }
+  let unpreparedSelection = null
+  if (unpreparedInstId) {
+    const current = await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-inst')
+    assert.notEqual(current, unpreparedInstId, 'The unprepared candidate must not already be selected.')
+    const target = page.locator(`[aria-label="View ${unpreparedInstId} chart"]`)
+    await target.waitFor({ state: 'visible', timeout: 15_000 })
+    unpreparedSelection = await nextFrame(() => target.click(), {
+      expectedInstId: unpreparedInstId, sourceInstId: current, timeframe: fixture.timeframe, requireLocal: true,
+    })
+    unpreparedSelection.rendererFrameAvailableBeforeInput = false
+    unpreparedSelection.hydratedFromLocalHistory = true
+    unpreparedSelection.preparedSwitchBudgetApplied = false
+    const coldFrames = await finishNavigationFrameProbe(page)
+    assertNavigationFrames(coldFrames)
+    unpreparedSelection.coldFramesChecked = coldFrames.snapshotChanges
+    initialPreparation.beforeColdSelection = { ...initialPreparation }
+    await electron.evaluate(() => { globalThis.__instrumentNavigationProbe.omitUniverseInstId = null })
+    Object.assign(initialPreparation, await waitForUniverseReady(electron, page, fixture))
+    await sharedSurface.dispose()
+    sharedSurface = await page.locator('svg[data-rendered-inst]').elementHandle()
+    await assertSharedSurface(`${unpreparedInstId} ready for subsequent prepared selection timing`)
+    await startNavigationFrameProbe(page, fixture)
   }
   for (const timeframe of [fixture.timeframe, ...fixture.timeframes.filter(frame => frame !== fixture.timeframe)]) {
     await page.locator('[data-market-list] [aria-label^="View "]').first().waitFor({ state: 'visible' })
@@ -454,7 +511,7 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
     const mouseSwitch = await nextFrame(() => second.locator.click(), { expectedInstId: second.instId, sourceInstId: first.instId, timeframe })
     if (holdThisPhase) {
       const switched = await nextFrame(() => page.keyboard.press('ArrowDown'), { sourceInstId: second.instId, timeframe })
-      const paintCount = await page.evaluate(() => window.__navigationPaintProbe.commits.length)
+      const commitCount = await page.evaluate(() => window.__navigationPaintProbe.commits.length)
       await new Promise(resolve => setTimeout(resolve, Math.max(0, 1_500 - (Date.now() - heldStartedAt))))
       assert.equal((await navigationRequests(electron)).heldSettled, false, 'The old history job must remain unresolved during the switch.')
       await releaseInstrumentHistory(electron)
@@ -464,9 +521,9 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
         await new Promise(resolve => setTimeout(resolve, 20))
       }
       await waitForInstrument(page, switched.instId, timeframe)
-      const latePaints = await page.evaluate(offset => window.__navigationPaintProbe.commits.slice(offset), paintCount)
-      assert.ok(latePaints.every(paint => paint.instId === switched.instId), 'The obsolete instrument repainted after the new selection.')
-      heldHistory = { heldForMS: 1_500, sourceInstId: first.instId, mouseSwitch, ...switched, lateWrongInstrumentPaints: 0 }
+      const lateCommits = await page.evaluate(offset => window.__navigationPaintProbe.commits.slice(offset), commitCount)
+      assert.ok(lateCommits.every(commit => commit.instId === switched.instId), 'The obsolete instrument committed after the new selection.')
+      heldHistory = { heldForMS: 1_500, sourceInstId: first.instId, mouseSwitch, ...switched, lateWrongInstrumentCommits: 0 }
     }
     const initial = await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-inst')
     const order = [initial]
@@ -489,13 +546,13 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
       for (let index = 0; index < 37; index += 1) window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }))
       return offset
     }) }, { expectedInstId, timeframe, rapid: true })
-    const rapidPaints = await page.evaluate(offset => window.__navigationPaintProbe.commits.slice(offset), beforeBurst)
-    assert.ok(rapidPaints.every(paint => paint.instId === expectedInstId), 'A coalesced key burst must only present its final requested instrument.')
+    const rapidCommits = await page.evaluate(offset => window.__navigationPaintProbe.commits.slice(offset), beforeBurst)
+    assert.ok(rapidCommits.every(commit => commit.instId === expectedInstId), 'A coalesced key burst must only commit its final requested instrument.')
     phases.push({ timeframe, rendererFrames, timeframeSwitch, firstVisit, mouseSwitch, keyboard, rapid, distinctContracts: new Set(order).size })
   }
   await sharedSurface.dispose()
-  const paints = await finishNavigationPaintProbe(page)
-  assertNavigationPaints(paints)
+  const frameReport = await finishNavigationFrameProbe(page)
+  assertNavigationFrames(frameReport)
   if (presentation === 'foreground') {
     const native = await electron.evaluate(({ BrowserWindow }) => {
       const window = BrowserWindow.getAllWindows()[0]
@@ -509,5 +566,6 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
     assert.equal(await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()), false,
       'Offscreen navigation acceptance must never take macOS window focus.')
   }
-  return { timingScope: navigationTimingScope(presentation), phases, initialPreparation, heldHistory, ...paints, commits: paints.commits.length }
+  return { timingScope: navigationTimingScope(presentation), phases, initialPreparation, unpreparedSelection, heldHistory,
+    ...frameReport, commits: frameReport.commits.length }
 }

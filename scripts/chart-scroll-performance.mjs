@@ -6,6 +6,7 @@ import { dirname, extname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { _electron } from 'playwright'
+import { summarizeLatencySamples } from './chart-acceptance-metrics.mjs'
 import {
   installRequestProbe, measureOffscreenColdBoundary, offscreenChartWindow, openChart, readRequestProbe,
   removeRequestProbe, resetRequestProbe, separateSourceMaintenance, selectTimeframe,
@@ -43,9 +44,11 @@ async function appEntryFor(appRoot) {
 }
 
 function percentiles(values) {
-  const sorted = [...values].sort((left, right) => left - right)
-  const at = ratio => Number((sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * ratio))] ?? 0).toFixed(3))
-  return { p50: at(.5), p95: at(.95), max: Number((sorted.at(-1) ?? 0).toFixed(3)) }
+  const summary = summarizeLatencySamples(values)
+  const rounded = value => value === null ? null : Number(value.toFixed(3))
+  return { sampleCount: summary.sampleCount, p50: rounded(summary.p50MS), p95: rounded(summary.p95MS),
+    p95SampleMinimum: summary.p95SampleMinimum, p99: rounded(summary.p99MS), p99SampleMinimum: summary.p99SampleMinimum,
+    max: rounded(summary.maxMS) }
 }
 
 function assertOracle(fixture, timeframe, rendered, expectedEnd) {

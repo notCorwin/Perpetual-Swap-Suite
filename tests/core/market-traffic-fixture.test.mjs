@@ -73,6 +73,8 @@ test('market traffic fixture counts acknowledged subscriptions and exact sent pa
   assert.ok(sample.acknowledgements.tickers.payloadBytes > 0)
   assert.deepEqual(fixture.currentAcknowledgements.tickers, ['T000-USDT-SWAP'])
   assert.ok((sample.deliveries.tickers?.['T000-USDT-SWAP'] ?? 0) >= 2)
+  assert.equal(sample.deliveryTimestamps.tickers['T000-USDT-SWAP'].length, sample.deliveries.tickers['T000-USDT-SWAP'])
+  assert.ok(sample.deliveryTimestamps.tickers['T000-USDT-SWAP'].every(time => time >= sample.startedAt && time <= sample.endedAt))
 })
 
 test('market traffic book snapshots use the native reset sequence and updates advance it', async t => {
@@ -134,4 +136,50 @@ test('market traffic book snapshots use the native reset sequence and updates ad
   assert.deepEqual(fixture.errors, [])
   assert.deepEqual(fixture.bookFrames.map(({ action, seqId, prevSeqId }) => ({ action, seqId, prevSeqId })),
     frames.map(({ action, data }) => ({ action, seqId: data[0].seqId, prevSeqId: data[0].prevSeqId })))
+})
+
+test('market traffic confirms every elapsed native candle and keeps HTTP history continuous across an hourly boundary', async t => {
+  const hour = 3_600_000, boundary = Math.ceil(Date.now() / hour) * hour
+  let timestamp = boundary - 50
+  const fixture = await createMarketTrafficExchange({ candidateCount: 3, passingCount: 1, spreadFailureCount: 1, now: () => timestamp })
+  const socket = new WebSocket(`${fixture.environment.PERPETUAL_SWAP_E2E_WEBSOCKET_ORIGIN}/ws/v5/business`)
+  t.after(async () => {
+    if (socket.readyState < WebSocket.CLOSING) await new Promise(resolve => {
+      socket.addEventListener('close', resolve, { once: true })
+      socket.close()
+    })
+    await fixture.close()
+  })
+  const messages = []
+  socket.addEventListener('message', event => messages.push(JSON.parse(event.data)))
+  await new Promise((resolve, reject) => {
+    socket.addEventListener('open', resolve, { once: true })
+    socket.addEventListener('error', reject, { once: true })
+  })
+  const intervals = { '5m': 300_000, '15m': 900_000, '1H': hour }
+  const args = Object.keys(intervals).map(timeframe => ({ channel: `candle${timeframe}`, instId: 'T000-USDT-SWAP' }))
+  socket.send(JSON.stringify({ id: 'boundary', op: 'subscribe', args }))
+  const waitForRows = async count => {
+    const deadline = performance.now() + 2_000
+    while (messages.filter(value => value.data).length < count && performance.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.equal(messages.filter(value => value.data).length, count)
+  }
+  await waitForRows(3)
+  fixture.beginSample()
+  timestamp = boundary + 50
+  const cadence = fixture.startCadence(100)
+  cadence.stop()
+  await waitForRows(9)
+  const sample = fixture.endSample()
+  for (const [timeframe, interval] of Object.entries(intervals)) {
+    const channel = `candle${timeframe}`
+    const rows = messages.filter(value => value.arg?.channel === channel && value.data).flatMap(value => value.data)
+    assert.deepEqual(rows.map(row => [Number(row[0]), row[8]]), [[boundary - interval, '0'], [boundary - interval, '1'], [boundary, '0']])
+    const response = await fetch(urlOf(fixture, `/market/history-candles?instId=T000-USDT-SWAP&bar=${timeframe}&limit=300`))
+    const history = (await response.json()).data
+    assert.deepEqual(history[0], rows[1], 'HTTP and WebSocket must agree on the completed candle.')
+    assert.ok(history.every((row, index) => row[8] === '1' && (index === 0 || Number(history[index - 1][0]) - Number(row[0]) === interval)))
+    assert.equal(sample.deliveries[channel]['T000-USDT-SWAP'], 2, 'Both completion and forming callbacks need their own send evidence.')
+  }
+  assert.deepEqual(fixture.errors, [])
 })

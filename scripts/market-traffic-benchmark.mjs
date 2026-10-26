@@ -8,11 +8,11 @@ import { parseArgs } from 'node:util'
 import { _electron } from 'playwright'
 import { requireForegroundTests } from '../electron/test-presentation.js'
 import { createMarketTrafficExchange } from '../tests/helpers/market-traffic-exchange.mjs'
+import { createMarketTrafficEvidence } from '../tests/helpers/market-traffic-evidence.mjs'
 import { inspectMarketTrafficReadiness } from '../tests/helpers/market-traffic-readiness.mjs'
 import { compareMarketTrafficReports, validateMarketTrafficReport } from './market-traffic-comparison.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
-const baselineRevision = 'ab9cb551bd00252abf370a324fe17d1eeacd6db1'
 const { values } = parseArgs({
   options: {
     'app-root': { type: 'string' }, output: { type: 'string' },
@@ -44,7 +44,7 @@ const searchScenario = foreground ? { version: 'distributed-input-v1', eventCoun
 const benchmarkMode = foreground
   ? 'foreground-electron-loopback-market-traffic-and-renderer-responsiveness'
   : 'hidden-electron-loopback-market-traffic-and-renderer-responsiveness'
-const searchMeasurement = `${foreground ? 'Native foreground' : 'Hidden offscreen'} renderer RAF gaps and input-to-second-RAF scheduling latency; filtered result counts are recorded and native compositor paint is not measured.`
+const searchMeasurement = `${foreground ? 'Native foreground' : 'Hidden offscreen'} renderer RAF callback opportunity gaps and input-to-second-RAF scheduling latency. These timings do not measure SVG commit or native compositor paint; filtered result counts are sampled after the second RAF.`
 if (candidateCount < 3 || candidateCount > 100) throw new Error('--candidate-count must be between 3 and 100.')
 if (durationSeconds < 5 || durationSeconds > 10) throw new Error('--duration-seconds must be between 5 and 10.')
 if (cadenceMS < 100 || cadenceMS > 2_000) throw new Error('--cadence-ms must be between 100 and 2000.')
@@ -104,7 +104,7 @@ async function runtimeMetadata(electron) {
       runnerOS: process.env.RUNNER_OS ?? null } }
   const guard = JSON.parse(await readFile(process.env.PERPETUAL_SWAP_TEST_GUARD, 'utf8'))
   if (runtime.executable !== guard.executable) throw new Error(`App did not use the protected test Electron runtime: ${runtime.executable}`)
-  return { presentation: guard.presentation, sourceFingerprint: guard.sourceFingerprint, executable: runtime.executable,
+  return { presentation: guard.presentation, testPresentation: guard.presentation, sourceFingerprint: guard.sourceFingerprint, executable: runtime.executable,
     electronVersion: runtime.electronVersion, packaged: runtime.packaged, appPath: runtime.appPath }
 }
 
@@ -136,11 +136,6 @@ async function assertForeground(electron, page) {
   assert.deepEqual(state, { visible: true, focused: true, minimized: false, offscreen: false },
     'Foreground market traffic measurement requires a visible, focused, non-offscreen native window.')
   return state
-}
-
-function percentile(samples, fraction) {
-  const sorted = [...samples].sort((left, right) => left - right)
-  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))] ?? 0
 }
 
 async function waitForSelectedFrames(page, instIds) {
@@ -222,10 +217,6 @@ if (baselineReportPath) {
 const app = await appEntryFor(values['app-root'] ?? root)
 const checkout = checkoutMetadata(app.selected.endsWith('.app') || app.selected.endsWith('.asar') ? root : app.selected)
 const target = await targetMetadata(app, checkout)
-if (app.selected === '/Applications/Perpetual Swap Suite.app'
-  && (target.revision !== baselineRevision || target.dirty !== false)) {
-  throw new Error(`Installed traffic baseline must be the clean ${baselineRevision} app; found ${target.revision} (dirty=${target.dirty}).`)
-}
 const output = resolve(values.output ?? join(root, '.build/traffic-optimization/market-traffic.json'))
 const userData = process.env.PERPETUAL_SWAP_USER_DATA
 if (!userData || (!foreground && !process.env.PERPETUAL_SWAP_TEST_GUARD)) throw new Error('Protected sandbox user data is required.')
@@ -284,23 +275,6 @@ try {
   assert.ok(fixture.readyState.clients >= 3, 'The app must open public and business loopback WebSockets.')
   const qualifyingIDs = new Set((snapshot.rows ?? []).map(row => row.instId))
   const optimizedDemand = { checked: false, bookIDs: [], tradeIDs: [], candle15mCount: null, candle1HCount: null }
-  if (expectOptimized) {
-    const demandDeadline = Date.now() + 30_000
-    const validDemand = () => {
-      acknowledgements = fixture.currentAcknowledgements
-      const bookIDs = acknowledgements.books ?? [], tradeIDs = acknowledgements.trades ?? []
-      return bookIDs.length <= passingCount && tradeIDs.length <= passingCount
-        && bookIDs.every(instId => qualifyingIDs.has(instId)) && tradeIDs.every(instId => qualifyingIDs.has(instId))
-        && (acknowledgements.candle15m ?? []).length === 0 && (acknowledgements.candle1H ?? []).length === 0
-    }
-    while (!validDemand() && Date.now() < demandDeadline) await sleep(50)
-    assert.equal(validDemand(), true, 'Optimized subscription demand must limit books/trades to verified contracts and remove remote 15m/1H channels.')
-    optimizedDemand.checked = true
-    optimizedDemand.bookIDs = [...(acknowledgements.books ?? [])].sort()
-    optimizedDemand.tradeIDs = [...(acknowledgements.trades ?? [])].sort()
-    optimizedDemand.candle15mCount = (acknowledgements.candle15m ?? []).length
-    optimizedDemand.candle1HCount = (acknowledgements.candle1H ?? []).length
-  }
   assert.deepEqual(fixture.errors, [], 'The fixture observed an invalid or unexpected production request.')
 
   cadence = fixture.startCadence(cadenceMS)
@@ -312,6 +286,41 @@ try {
   // The sample clock starts after qualification, connection setup and the
   // initial cadence message. Only steady-state fixture traffic is measured.
   if (foreground) await assertForeground(electron, page)
+  const appDemand = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'marketTrafficEvidence', phase: 'arm' }))
+  assert.equal(appDemand.source, 'market-service accepted callbacks after native parsing', 'Application receipt capture must use the production service callbacks.')
+  const expectedSubscriptions = appDemand.expectedSubscriptions
+  assert.deepEqual(expectedSubscriptions.tickers, fixture.instIds, 'Configured ticker demand must cover every fixture candidate.')
+  assert.deepEqual(expectedSubscriptions['open-interest'], fixture.instIds, 'Configured open-interest demand must cover every fixture candidate.')
+  assert.deepEqual(expectedSubscriptions.candle5m, fixture.instIds, 'The production canonical candle source must cover every fixture candidate.')
+  assert.deepEqual(appDemand.marketDemand.eligibleIDs, [...qualifyingIDs].sort(), 'Receipt demand must use the actual eligible market universe.')
+  assert.deepEqual(expectedSubscriptions.trades,
+    [...new Set([...appDemand.marketDemand.eligibleIDs, appDemand.marketDemand.focusedInstrumentID].filter(Boolean))].sort(),
+    'Trade demand must cover the eligible market list and the focused chart contract.')
+  if (appDemand.marketDemand.booksEnabled) for (const instId of qualifyingIDs) {
+    assert.ok(expectedSubscriptions.books.includes(instId), `Configured depth/slippage checks require a book for eligible ${instId}.`)
+  }
+  if (expectOptimized) {
+    assert.deepEqual(expectedSubscriptions.candle15m, [], 'The production chart must derive 15m from its canonical 5m source.')
+    assert.deepEqual(expectedSubscriptions.candle1H, [], 'The production chart must derive 1H from its canonical 5m source.')
+  }
+  const demandDeadline = Date.now() + 30_000
+  const demandAcknowledged = () => {
+    acknowledgements = fixture.currentAcknowledgements
+    const expectedChannels = new Set(Object.keys(expectedSubscriptions))
+    const activeChannels = Object.keys(acknowledgements).filter(channel => channel !== 'instruments')
+    return activeChannels.every(channel => expectedChannels.has(channel))
+      && Object.entries(expectedSubscriptions).every(([channel, ids]) =>
+        JSON.stringify([...(acknowledgements[channel] ?? [])].sort()) === JSON.stringify(ids))
+  }
+  while (!demandAcknowledged() && Date.now() < demandDeadline) await sleep(50)
+  assert.equal(demandAcknowledged(), true, 'Acknowledged fixture subscriptions must match the app-derived configured eligible/focus demand exactly.')
+  if (expectOptimized) {
+    optimizedDemand.checked = true
+    optimizedDemand.bookIDs = [...expectedSubscriptions.books]
+    optimizedDemand.tradeIDs = [...expectedSubscriptions.trades]
+    optimizedDemand.candle15mCount = expectedSubscriptions.candle15m.length
+    optimizedDemand.candle1HCount = expectedSubscriptions.candle1H.length
+  }
   const sampleStartedAt = fixture.beginSample()
   await page.evaluate(({ requireForeground, passingIDs }) => {
     const state = { gaps: [], interactions: [], interactionSamples: [], lastFrame: null, startedAt: performance.now(), active: true,
@@ -369,12 +378,14 @@ try {
     state.active = false
     const percentile = (values, fraction) => {
       const sorted = [...values].sort((left, right) => left - right)
-      return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))] ?? 0
+      return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)] ?? 0
     }
     return { elapsedMS: performance.now() - state.startedAt, frameCount: state.gaps.length, presentation: state.presentation,
-      frameGapMS: { p50: percentile(state.gaps, .5), p95: percentile(state.gaps, .95), max: Math.max(0, ...state.gaps), samples: state.gaps },
-      searchInteractionMS: { count: state.interactions.length, p50: percentile(state.interactions, .5),
-        p95: percentile(state.interactions, .95), max: Math.max(0, ...state.interactions), samples: state.interactionSamples } }
+      rafOpportunityGapMS: { sampleCount: state.gaps.length, p50: percentile(state.gaps, .5), p95: percentile(state.gaps, .95),
+        max: Math.max(0, ...state.gaps), samples: state.gaps },
+      searchInputToSecondRAFMS: { sampleCount: state.interactions.length, p50: percentile(state.interactions, .5),
+        p95: percentile(state.interactions, .95), p95Interpretation: 'Empirical nearest-rank summary; descriptive at this sample count, not a tail guarantee.',
+        max: Math.max(0, ...state.interactions), samples: state.interactionSamples } }
   })
   failureMeasurements = {
     schemaVersion: 1,
@@ -385,17 +396,25 @@ try {
     runtime: { ...runtime, testPresentation: runtime.testPresentation, presentation,
       network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' },
     fixture: { asOf: fixture.asOf, candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture.oiFailureCount, seed: fixture.seed,
-      dataFingerprint: `market-traffic-v2-bookseq-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
+      candidateIDs: fixture.instIds,
+      dataFingerprint: `market-traffic-v3-app-receipts-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
       cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness, searchScenario,
       readinessPhase: readiness ? 'all-passing-15m-frames-ready-before-steady-state-sample' : null },
     renderer: { ...renderer, measurement: searchMeasurement },
   }
   const traffic = fixture.endSample()
+  const appReceipts = await electron.evaluate((_, sample) => globalThis.__marketBackend.probe({ action: 'marketTrafficEvidence', phase: 'end',
+    sampleStartedAt: sample.startedAt, sampleEndedAt: sample.endedAt }), { startedAt: sampleStartedAt, endedAt: traffic.endedAt })
+  assert.deepEqual(appReceipts.expectedSubscriptions, expectedSubscriptions,
+    'The configured eligible/focus demand must stay unchanged through the sample.')
+  const receiptEvidence = createMarketTrafficEvidence({ expectedSubscriptions,
+    applicationReceipts: { ...appReceipts.applicationReceipts, tradeStats: appReceipts.tradeStats },
+    fixtureDeliveries: traffic.deliveryTimestamps, sampleStartedAt: traffic.startedAt, sampleEndedAt: traffic.endedAt, cadenceMS })
   failureMeasurements.rawFixtureSample = traffic
   if (foreground) assert.equal(renderer.presentation.totalViolations, 0, 'Foreground visibility and focus must hold throughout sampling.')
   assert.ok(Math.abs(traffic.durationSeconds - durationSeconds) <= 0.75,
     `Steady-state traffic sample duration drifted outside the bounded window: ${traffic.durationSeconds}s.`)
-  const delivery = fixture.deliverySummary(), finalValues = fixture.latestValues
+  const finalValues = fixture.latestValues
   let finalSnapshot, outputMatchesLatest = false
   const outputDeadline = Date.now() + 1_000
   while (Date.now() < outputDeadline) {
@@ -404,24 +423,8 @@ try {
       const expected = Number(finalValues[`tickers:${row.instId}`]?.last)
       return Number.isFinite(expected) && Math.abs(row.lastPrice - expected) < 1e-8
     })
-    if (outputMatchesLatest) break
+    if (outputMatchesLatest && JSON.stringify(finalSnapshot.catalogProgress) === JSON.stringify(snapshot.catalogProgress)) break
     await sleep(25)
-  }
-  const freshLimitMS = Math.max(1_500, cadenceMS * 3)
-  const freshness = Object.fromEntries(requiredChannels.map(channel => [channel, fixture.instIds.map(instId => {
-    const key = `${channel}:${instId}`, record = delivery.byChannel[channel]?.entries.find(value => value.instId === instId)
-    const sampleMessages = traffic.deliveries[channel]?.[instId] ?? 0
-    return { instId, sampleMessages, lastSentAt: record?.lastSentAt ?? null,
-      ageMS: record?.lastSentAt == null ? null : Date.now() - record.lastSentAt,
-      latestFixtureValue: finalValues[key] ?? null }
-  })]))
-  for (const channel of requiredChannels) {
-    const channelMessages = traffic.websocket[channel]?.messages ?? 0
-    assert.ok(channelMessages >= Math.floor(durationSeconds * 1_000 / cadenceMS * candidateCount * 0.75),
-      `The ${channel} channel did not deliver a bounded steady-state stream.`)
-    const unseen = freshness[channel].filter(value => value.sampleMessages < Math.floor(durationSeconds * 1_000 / cadenceMS * 0.75)
-      || value.ageMS === null || value.ageMS > freshLimitMS)
-    assert.deepEqual(unseen, [], `Every candidate's ${channel} observation must stay fresh for the complete steady-state sample.`)
   }
   assert.ok(['live', 'connecting'].includes(finalSnapshot.realtimeState), 'Realtime cannot disconnect or recover during the sample.')
   assert.ok(fixture.readyState.clients >= 3, 'The public and business loopback transports must stay connected for the sample.')
@@ -433,12 +436,12 @@ try {
     'Candidate output must remain correct throughout the sample.')
   assert.equal(outputMatchesLatest, true, 'Rendered passing tickers must match the latest fixture values.')
   assert.ok(renderer.frameCount >= durationSeconds * 15, 'Renderer RAF sampling is incomplete; reject disconnected/no-op runs.')
-  assert.ok(renderer.searchInteractionMS.count >= passingCount, 'Renderer did not process all search interactions.')
-  assert.equal(renderer.searchInteractionMS.count, searchEventCount, 'Renderer must complete the entire declared search schedule.')
-  if (foreground) assert.ok(renderer.searchInteractionMS.samples.every(sample => sample.correct), 'Every timed input must render the expected filtered contract count.')
-  if (expectOptimized && !baselineReport) {
-    assert.ok(renderer.frameGapMS.p95 <= 50, `Optimized renderer frame-gap p95 exceeded 50ms: ${renderer.frameGapMS.p95}`)
-    assert.ok(renderer.searchInteractionMS.p95 <= 50, `Optimized renderer search-response p95 exceeded 50ms: ${renderer.searchInteractionMS.p95}`)
+  assert.ok(renderer.searchInputToSecondRAFMS.sampleCount >= passingCount, 'Renderer did not process all search interactions.')
+  assert.equal(renderer.searchInputToSecondRAFMS.sampleCount, searchEventCount, 'Renderer must complete the entire declared search schedule.')
+  if (foreground) assert.ok(renderer.searchInputToSecondRAFMS.samples.every(sample => sample.correct), 'Every timed input must render the expected filtered contract count.')
+  if (expectOptimized) {
+    assert.ok(renderer.rafOpportunityGapMS.p95 <= 50, `Optimized renderer RAF opportunity gap p95 exceeded 50ms: ${renderer.rafOpportunityGapMS.p95}`)
+    assert.ok(renderer.searchInputToSecondRAFMS.p95 <= 50, `Optimized input-to-second-RAF p95 exceeded 50ms: ${renderer.searchInputToSecondRAFMS.p95}`)
   }
   assert.deepEqual(fixture.errors, [], 'The fixture observed a production protocol or endpoint error during measurement.')
   const unsolicitedHTTP = fixture.requests.filter(request => !request.respondedAt || request.responsePayloadBytes <= 0)
@@ -453,7 +456,8 @@ try {
     runtime: { ...runtime, testPresentation: runtime.testPresentation, presentation,
       network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' },
     fixture: { asOf: fixture.asOf, candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture.oiFailureCount, seed: fixture.seed,
-      dataFingerprint: `market-traffic-v2-bookseq-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
+      candidateIDs: fixture.instIds,
+      dataFingerprint: `market-traffic-v3-app-receipts-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
       qualification: { total: finalSnapshot.catalogProgress.total, completed: finalSnapshot.catalogProgress.completed,
         pending: finalSnapshot.catalogProgress.pending, verified: finalSnapshot.catalogProgress.verified,
         failed: finalSnapshot.catalogProgress.failed, unknown: finalSnapshot.catalogProgress.unknown },
@@ -463,12 +467,13 @@ try {
       totalPayloadBytes: websocketPayloadBytes + httpResponsePayloadBytes,
       websocketPayloadBytesByChannel: traffic.websocket, httpResponsePayloadBytesByChannel: traffic.http,
       subscriptionAcknowledgementBytesByChannel: traffic.acknowledgements,
-      subscriptionCounts: fixture.currentAcknowledgements,
-      freshness, fixtureRequests: fixture.requests.length, fixtureRequestBytes: fixture.requests.reduce((sum, value) => sum + (value.requestPayloadBytes ?? 0), 0),
+      subscriptionCounts: fixture.currentAcknowledgements, receiptEvidence,
+      configuredDemand: appReceipts.marketDemand,
+      fixtureRequests: fixture.requests.length, fixtureRequestBytes: fixture.requests.reduce((sum, value) => sum + (value.requestPayloadBytes ?? 0), 0),
       fixtureRequestDetails: fixtureRequestEvidence(fixture.requests) },
     renderer: { ...renderer, measurement: searchMeasurement },
     correctness: { finalRealtimeState: finalSnapshot.realtimeState, connectedWebSocketClients: fixture.readyState.clients,
-      allCandidatesHaveFreshTickerOpenInterestAnd5m: true,
+      allCandidatesHaveContinuousTickerOpenInterestAnd5mReceipts: true,
       passingIDs: (finalSnapshot.rows ?? []).map(row => row.instId).sort(),
       failures: finalSnapshot.catalogProgress.failed, unknown: finalSnapshot.catalogProgress.unknown,
       outputMatchesLatestFixtureTickers: outputMatchesLatest, optimizedDemand },
@@ -476,6 +481,7 @@ try {
   }
   await mkdir(dirname(output), { recursive: true })
   completedReport = report
+  if (expectOptimized) validateMarketTrafficReport(report, 'current')
   if (baselineReport) {
     try {
       const comparison = compareMarketTrafficReports(baselineReport, report)
@@ -523,7 +529,7 @@ try {
         runtime: runtimeEvidence ? { ...runtimeEvidence, presentation: presentationEvidence,
           network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' } : null,
         fixture: { asOf: fixture.asOf, candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture.oiFailureCount, seed: fixture.seed,
-          dataFingerprint: `market-traffic-v2-bookseq-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
+          dataFingerprint: `market-traffic-v3-app-receipts-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
           cadenceMS, durationSeconds, expectOptimized, readiness: readinessFailureEvidence ?? null } }
       await mkdir(dirname(output), { recursive: true })
       await writeFile(output, `${JSON.stringify(partial, null, 2)}\n`)

@@ -51,7 +51,7 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
       await waitForRendered(page, fixture, timeframe)
       const residentHistoryBars = warmedHistory.get(timeframe)
       const beforeScrolling = await readRequestProbe(electron)
-      await startPaintProbe(page, fixture)
+      await startPaintProbe(page, fixture, { requireMatureData: true, requireWarmStatistics: true })
       const intervalMS = fixture.series[timeframe].intervalMS
       const phases = []
       let distance = 0
@@ -63,7 +63,7 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
         const end = fixture.end - distance * intervalMS
         await waitForRendered(page, fixture, timeframe, end)
         const observation = await measurePaintLatency(page, { inputs, targets: inputs.map((_, index) => fixture.end - (startingDistance + candles / inputs.length * (index + 1)) * intervalMS) })
-        assert.ok(observation.latestInputToPaintMS < 100, `Warm ${timeframe} ${name} took ${observation.latestInputToPaintMS} ms from latest input to its first paint opportunity.`)
+        assert.ok(observation.maxInputToRafSampleMS < 100, `Warm ${timeframe} ${name} had an intent take ${observation.maxInputToRafSampleMS} ms to reach its exact or coalesced chart target.`)
         phases.push({
           name, frames: options.frames ?? 1, eventsPerFrame: options.eventsPerFrame ?? 1,
           candles, end, ...observation,
@@ -118,7 +118,7 @@ const delayedHistory = await withBenchmarkApp(async (electron, page, fixture) =>
       await selectTimeframe(page, timeframe)
       await waitForRendered(page, fixture, timeframe)
     }
-    await startPaintProbe(page, fixture)
+    await startPaintProbe(page, fixture, { requireMatureData: true, requireWarmStatistics: true })
     const started = Date.now()
     await wheelBurst(page, { deltaY: 14_400 })
     while (!(await readRequestProbe(electron)).held) {
@@ -162,7 +162,7 @@ const nativeColdBoundary = await withBenchmarkApp((electron, page) => measureNat
 
 console.log(JSON.stringify({
   generatedAt: new Date().toISOString(),
-  mode: 'real-electron-bulk-history-svg-frame-correctness-and-input-to-paint-opportunity',
+  mode: 'real-electron-bulk-history-svg-frame-correctness-and-input-to-renderer-raf-sample',
   performance: performanceReport,
   delayedHistory,
   latencyCoveredPrefetch,

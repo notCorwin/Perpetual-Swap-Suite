@@ -32,14 +32,14 @@ after(async () => {
   finally { await rm(userData, { recursive: true, force: true }) }
 })
 
-test('bulk-warmed history scrolls, reverses, and jumps within 100 ms with bounded disk reads in every native timeframe', { timeout: 90_000 }, async context => {
+test('bulk-warmed history updates every renderer target within 100 ms during scroll, reversal, and jumps', { timeout: 90_000 }, async context => {
   const foreground = await foregroundPaintWindow(electron, page)
   context.after(async () => {
     await foreground.restore()
     const restored = await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isVisible())
     assert.equal(restored, foreground.previous.visible, 'The latency test must restore the native window visibility.')
   })
-  context.diagnostic(`Native paint window: ${JSON.stringify({ before: foreground.previous, during: foreground.native, environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence })}`)
+  context.diagnostic(`Native foreground timing window: ${JSON.stringify({ before: foreground.previous, during: foreground.native, environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence })}`)
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   // Complete the initial durable hydration before holding subsequent disk
   // deliveries and source maintenance. Resident navigation uses transferred
@@ -64,7 +64,7 @@ test('bulk-warmed history scrolls, reverses, and jumps within 100 ms with bounde
       await waitForRendered(page, fixture, timeframe)
       const residentHistoryBars = warmedHistory.get(timeframe)
       const before = await readRequestProbe(electron)
-      await startPaintProbe(page, fixture)
+      await startPaintProbe(page, fixture, { requireMatureData: true, requireWarmStatistics: true })
       const intervalMS = fixture.series[timeframe].intervalMS
       let distance = 0
       for (const phase of [
@@ -78,8 +78,8 @@ test('bulk-warmed history scrolls, reverses, and jumps within 100 ms with bounde
         await waitForRendered(page, fixture, timeframe, targets.at(-1))
         const latency = await measurePaintLatency(page, { inputs, targets })
         context.diagnostic(JSON.stringify({ timeframe, phase: phase.name, ...latency }))
-        assert.ok(latency.latestInputToPaintMS < 100, `${timeframe} ${phase.name} took ${latency.latestInputToPaintMS} ms from the latest wheel input to its first paint opportunity. ${JSON.stringify(latency)}`)
-        assert.ok(latency.latestBurstStartToPaintMS < 100, `${timeframe} ${phase.name} took ${latency.latestBurstStartToPaintMS} ms from the first wheel input in the latest burst to its first paint opportunity. ${JSON.stringify(latency)}`)
+        assert.ok(latency.maxInputToRafSampleMS < 100, `${timeframe} ${phase.name} had an intent take ${latency.maxInputToRafSampleMS} ms to reach its exact or coalesced chart target. ${JSON.stringify(latency)}`)
+        assert.ok(latency.latestBurstStartToRafSampleMS < 100, `${timeframe} ${phase.name} took ${latency.latestBurstStartToRafSampleMS} ms from the first wheel input in the latest burst to its renderer RAF sample. ${JSON.stringify(latency)}`)
       }
       const paint = await finishPaintProbe(page)
       assertCompletePaints(paint)
@@ -101,7 +101,7 @@ test('backend history reserve covers 1500 ms of delivery latency before the cold
   await measureLatencyCoveredPrefetch(electron, page, fixture)
 })
 
-test('a never-downloaded native price page paints before the farther reserve and optional statistics finish', async context => {
+test('a never-downloaded native price page reaches an SVG snapshot before reserve and optional statistics finish', async context => {
   const report = await measureNativeColdBoundary(electron, page)
   context.diagnostic(`Native cold boundary: ${JSON.stringify(report)}`)
 })

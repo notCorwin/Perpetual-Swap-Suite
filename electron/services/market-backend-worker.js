@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { MetadataStore } from './metadata-store.js'
 import { MarketStore } from './market-store.js'
 import { MarketService } from './market-service.js'
+import { wrapAcceptedCallback } from './market-traffic-callback-probe.js'
 import { ChartNotificationEncoder } from './chart-notifications.js'
 import { createChartAcquisitionFixture, createChartColdBoundaryFixture, seedCachedListProjection, seedChartScrollBenchmark, seedHistoricalStatisticsBoundary, seedInstrumentNavigationBenchmark } from '../e2e-fixtures.js'
 import { backgroundArchiveRows, seedMarketResources, startBackgroundArchive } from '../market-resource-fixtures.js'
@@ -155,7 +156,8 @@ async function probe(input) {
     resourceFixture = await seedMarketResources(store, service, input)
     return { ...resourceFixture.fixture, backendThreadId: threadId, diagnostics: store.getDiagnostics() }
   }
-  if (input.action === 'scaleTick') { if (!resourceFixture) throw new Error('Resource benchmark is not seeded.'); return resourceFixture.tick(input) }
+  if (input.action === 'scaleLoadStart') { if (!resourceFixture) throw new Error('Resource benchmark is not seeded.'); return resourceFixture.startLoad(input) }
+  if (input.action === 'scaleLoadRead') { if (!resourceFixture) throw new Error('Resource benchmark is not seeded.'); return resourceFixture.readLoad(input) }
   if (input.action === 'scaleStop') { if (!resourceFixture) throw new Error('Resource benchmark is not seeded.'); return resourceFixture.stop() }
   if (input.action === 'persistNavigationCatalog') {
     const lease = { observedAt: Date.now(), expiresAt: Date.now() + 90_000 }
@@ -185,6 +187,138 @@ async function probe(input) {
     if (sourceProbe) service.get = sourceProbe.original
     sourceProbe = null
     return { ok: true }
+  }
+  if (input.action === 'marketTrafficEvidence') {
+    if (input.phase === 'arm') {
+      if (service.__marketTrafficEvidence) throw new Error('Market traffic receipt capture is already armed.')
+      const candidateIDs = [...(service.candidateIDs ?? [])].sort()
+      const eligibleIDs = [...service.listedUniverse].sort()
+      const focusedInstrumentID = service.preparedCharts.focus?.instId ?? null
+      const liquidity = service.prefs().liquidity
+      const booksEnabled = liquidity.depth.enabled || liquidity.slippage.enabled
+      const publicSubscriptions = service.publicRealtime.subscriptions
+      const expectedSubscriptions = {
+        tickers: candidateIDs,
+        'open-interest': candidateIDs,
+        books: booksEnabled ? [...(service.publicSubscriptionDemand?.books ?? [])].sort() : [],
+        trades: candidateIDs.filter(instId => service.statisticsDemand(instId)).sort(),
+        candle5m: [], candle15m: [], candle1H: [],
+      }
+      for (const { instId, timeframe } of service.realtime.subscriptions.values()) {
+        const channel = `candle${timeframe}`
+        expectedSubscriptions[channel] ??= []
+        expectedSubscriptions[channel].push(instId)
+      }
+      for (const channel of ['candle5m', 'candle15m', 'candle1H']) expectedSubscriptions[channel].sort()
+      const actualSubscriptions = {
+        tickers: [], 'open-interest': [], books: [], trades: [], candle5m: [], candle15m: [], candle1H: [],
+      }
+      for (const { instId, channel } of publicSubscriptions.values()) if (channel !== 'instruments') actualSubscriptions[channel].push(instId)
+      for (const { instId, timeframe } of service.realtime.subscriptions.values()) actualSubscriptions[`candle${timeframe}`].push(instId)
+      for (const values of Object.values(actualSubscriptions)) values.sort()
+      for (const channel of Object.keys(expectedSubscriptions)) {
+        if (!actualSubscriptions[channel]) actualSubscriptions[channel] = []
+        if (JSON.stringify(actualSubscriptions[channel]) !== JSON.stringify(expectedSubscriptions[channel])) {
+          throw new Error(`Application ${channel} demand does not match its configured eligible/focus demand.`)
+        }
+      }
+      if (booksEnabled && eligibleIDs.some(instId => !expectedSubscriptions.books.includes(instId))) {
+        throw new Error('Configured depth/slippage checks require books for every eligible listed contract.')
+      }
+      const expectedTrades = [...new Set([...eligibleIDs, focusedInstrumentID].filter(Boolean))].sort()
+      if (JSON.stringify(expectedSubscriptions.trades) !== JSON.stringify(expectedTrades)) {
+        throw new Error('Configured trade statistics demand does not match listed contracts and chart focus.')
+      }
+      const capture = { startedAt: Date.now(), endedAt: null, expectedSubscriptions, actualSubscriptions,
+        candidateIDs, eligibleIDs, focusedInstrumentID, booksEnabled, records: {}, restore: [] }
+      const restoreCapture = () => {
+        for (const restore of capture.restore.splice(0).reverse()) restore()
+        if (service.__marketTrafficEvidence === capture) delete service.__marketTrafficEvidence
+      }
+      capture.restoreCapture = restoreCapture
+      const record = (channel, instId, receivedAt, fillCount) => {
+        if (typeof instId !== 'string' || !Number.isSafeInteger(receivedAt) || receivedAt < capture.startedAt
+          || capture.endedAt !== null && receivedAt > capture.endedAt) return
+        const byInstrument = capture.records[channel] ??= {}
+        const values = byInstrument[instId] ??= []
+        values.push({ receivedAt, ...(fillCount === undefined ? {} : { fillCount }) })
+      }
+      const wrap = (options, name, channelFor) => {
+        wrapAcceptedCallback(options, name, args => {
+          const evidence = channelFor(args)
+          if (evidence) record(evidence.channel, evidence.instId, evidence.receivedAt, evidence.fillCount)
+        }, capture.restore)
+      }
+      try {
+        const publicMarket = service.publicRealtime
+        const instruments = new Set()
+        const instrumentChannels = { onTicker: 'tickers', onOpenInterest: 'open-interest', onBook: 'books' }
+        const instrumentOptionForShard = options => {
+          if (instruments.has(options)) return
+          instruments.add(options)
+          for (const [name, channel] of Object.entries(instrumentChannels)) instrumentCallbackForOptions(options, name, channel)
+          instrumentCallbackForOptions(options, 'onTrades', 'trades')
+        }
+        function instrumentCallbackForOptions(options, name, channel) {
+          wrap(options, name, ([instId, values, context]) => ({ channel, instId, receivedAt: context?.receivedAt,
+            ...(channel === 'trades' ? { fillCount: Array.isArray(values) ? values.length : 0 } : {}) }))
+        }
+        for (const market of [...publicMarket.shards, publicMarket.controlShard].filter(Boolean)) instrumentOptionForShard(market.options)
+        const makeShard = publicMarket.makeShard
+        const wrappedMakeShard = function (...args) {
+          const market = makeShard.apply(this, args)
+          instrumentOptionForShard(market.options)
+          return market
+        }
+        publicMarket.makeShard = wrappedMakeShard
+        capture.restore.push(() => { if (publicMarket.makeShard === wrappedMakeShard) publicMarket.makeShard = makeShard })
+        wrap(service.realtime.options, 'onForming', ([row, context]) => ({
+          channel: `candle${row?.timeframe}`, instId: row?.instrument, receivedAt: context?.receivedAt,
+        }))
+        wrap(service.realtime.options, 'onConfirmed', ([row, context]) => ({
+          channel: `candle${row?.timeframe}`, instId: row?.instrument, receivedAt: context?.receivedAt,
+        }))
+        service.__marketTrafficEvidence = capture
+        return { source: 'market-service accepted callbacks after native parsing', expectedSubscriptions, actualSubscriptions,
+          marketDemand: { candidateIDs, eligibleIDs, focusedInstrumentID, booksEnabled } }
+      } catch (error) {
+        restoreCapture()
+        throw error
+      }
+    }
+    if (input.phase === 'end') {
+      const capture = service.__marketTrafficEvidence
+      if (!capture) throw new Error('Market traffic receipt capture was not armed.')
+      const { sampleStartedAt, sampleEndedAt } = input
+      try {
+        if (!Number.isSafeInteger(sampleStartedAt) || !Number.isSafeInteger(sampleEndedAt) || sampleEndedAt <= sampleStartedAt) {
+          throw new Error('Market traffic receipt capture requires the complete fixture sample window.')
+        }
+        capture.endedAt = sampleEndedAt
+        await Promise.all([service.publicRealtime.whenIdle(), service.realtime.whenIdle()])
+        const applicationReceipts = {}, tradeStats = {}
+        for (const [channel, byInstrument] of Object.entries(capture.records)) {
+          applicationReceipts[channel] = {}
+          for (const [instId, records] of Object.entries(byInstrument)) {
+            const selected = records.filter(value => value.receivedAt >= sampleStartedAt && value.receivedAt <= sampleEndedAt)
+            applicationReceipts[channel][instId] = selected.map(value => value.receivedAt)
+            if (channel === 'trades') tradeStats[instId] = {
+              messageCount: selected.length,
+              fillCount: selected.reduce((sum, value) => sum + (value.fillCount ?? 0), 0),
+              noFillMessageCount: selected.filter(value => value.fillCount === 0).length,
+            }
+          }
+        }
+        return { source: 'market-service accepted callbacks after native parsing', sampleStartedAt, sampleEndedAt,
+          expectedSubscriptions: capture.expectedSubscriptions, actualSubscriptions: capture.actualSubscriptions,
+          marketDemand: { candidateIDs: capture.candidateIDs, eligibleIDs: capture.eligibleIDs,
+            focusedInstrumentID: capture.focusedInstrumentID, booksEnabled: capture.booksEnabled },
+          applicationReceipts, tradeStats }
+      } finally {
+        capture.restoreCapture()
+      }
+    }
+    throw new Error('Market traffic receipt capture phase must be arm or end.')
   }
   if (input.action === 'diagnostics') return { backendThreadId: threadId, tasks: service.history.sync.listTasks(), writeMetrics: store.getWriteMetrics() }
   if (input.action === 'backgroundStart') return startBackgroundArchive(store, service)

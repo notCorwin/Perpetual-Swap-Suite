@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process'
 import { parseArgs } from 'node:util'
 import { _electron } from 'playwright'
 import { exerciseInstrumentNavigation, installNavigationProbe, persistNavigationCatalog, removeNavigationProbe, selectionRequests, startupNavigationReport } from './instrument-navigation-acceptance.mjs'
+import { summarizeLatencySamples } from './chart-acceptance-metrics.mjs'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const { values } = parseArgs({
@@ -90,11 +91,12 @@ try {
   await page.waitForLoadState('domcontentloaded')
   const presentation = await assertHiddenOffscreen(electron)
   const runtime = await protectedRuntime(electron)
-  await installNavigationProbe(electron)
+  const unpreparedInstId = 'BTC-USDT-SWAP'
+  await installNavigationProbe(electron, { omitUniverseInstId: unpreparedInstId })
   const fixture = await page.evaluate(() => window.radarDesktop.request({ e2e: { action: 'seedInstrumentNavigationBenchmark' } }))
   const backgroundLoad = process.env.PERPETUAL_SWAP_BENCHMARK_BACKGROUND === '1'
   if (backgroundLoad) await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'backgroundStart' }))
-  report = await exerciseInstrumentNavigation(electron, page, fixture)
+  report = await exerciseInstrumentNavigation(electron, page, fixture, { unpreparedInstId })
   if (backgroundLoad) report.background = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'backgroundStatus' }))
   await persistNavigationCatalog(electron, page)
   await removeNavigationProbe(electron)
@@ -114,23 +116,29 @@ try {
   const requests = await electron.evaluate(() => globalThis.__navigationStartupRequests.requests)
   startup.selectionIPC = selectionRequests({ requests }).filter(request => request.instId === startup.instId
     && request.at >= startup.inputEpoch - 1 && request.at <= startup.commitEpoch + 1).length
-  if (startup.framesToCommit > 1 || startup.inputToSVGCommitMS > 50 || startup.selectionIPC > 2 || startup.violations.length
+  if (startup.framesToCommit > 1 || !presentation.offscreen && startup.inputToSVGCommitMS > 50 || startup.selectionIPC > 2 || startup.violations.length
     || !startup.rendererFramesBeforeInput.includes(`${startup.timeframe}:${startup.instId}`)) throw new Error(`Warm startup selection exceeded the local-read budget: ${JSON.stringify(startup)}`)
   await installNavigationProbe(electron)
   report.restart = { startup, ...await exerciseInstrumentNavigation(electron, page, fixture, { holdHistory: false }) }
-  const percentile = (values, ratio) => {
-    const sorted = [...values].sort((left, right) => left - right)
-    return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * ratio))] ?? 0
-  }
   for (const phase of [...report.phases, ...(report.restart?.phases ?? [])]) {
-    phase.keyboardP50MS = Number(percentile(phase.keyboard.map(input => input.inputToSVGCommitMS), .5).toFixed(3))
-    phase.keyboardP95MS = Number(percentile(phase.keyboard.map(input => input.inputToSVGCommitMS), .95).toFixed(3))
-    phase.keyboardNextPaintP95MS = Number(percentile(phase.keyboard.map(input => input.inputToNextPaintMS), .95).toFixed(3))
-    if (backgroundLoad && phase.keyboardP95MS > 50) throw new Error(`Background keyboard p95 exceeds the 50ms budget: ${phase.keyboardP95MS}`)
+    const keyboard = summarizeLatencySamples(phase.keyboard.map(input => input.inputToSVGCommitMS))
+    const nextRafSample = summarizeLatencySamples(phase.keyboard.map(input => input.inputToNextRafSampleMS))
+    phase.keyboardSampleCount = keyboard.sampleCount
+    phase.keyboardP50MS = keyboard.p50MS === null ? null : Number(keyboard.p50MS.toFixed(3))
+    phase.keyboardP95MS = keyboard.p95MS === null ? null : Number(keyboard.p95MS.toFixed(3))
+    phase.keyboardP95SampleMinimum = keyboard.p95SampleMinimum
+    phase.keyboardMaxMS = keyboard.maxMS === null ? null : Number(keyboard.maxMS.toFixed(3))
+    phase.keyboardNextRafSampleP95MS = nextRafSample.p95MS === null ? null : Number(nextRafSample.p95MS.toFixed(3))
+    phase.keyboardNextRafSampleP95SampleMinimum = nextRafSample.p95SampleMinimum
+    const foregroundGateMS = keyboard.p95MS ?? keyboard.maxMS
+    if (!presentation.offscreen && foregroundGateMS !== null && foregroundGateMS > 50) {
+      const statistic = keyboard.p95MS === null ? 'maximum' : 'p95'
+      throw new Error(`Foreground keyboard ${statistic} exceeds the 50ms budget: ${foregroundGateMS}`)
+    }
     phase.maximumFramesToCommit = Math.max(phase.firstVisit.framesToCommit, phase.mouseSwitch.framesToCommit, phase.rapid.framesToCommit,
       phase.timeframeSwitch?.framesToCommit ?? 0, ...phase.keyboard.map(input => input.framesToCommit))
   }
-  report = { generatedAt: new Date().toISOString(), mode: 'electron-native-instrument-navigation-input-to-svg-and-next-paint',
+  report = { generatedAt: new Date().toISOString(), mode: 'electron-instrument-navigation-input-to-svg-and-next-renderer-raf-sample',
     appRoot: app.selected, appEntry: app.entry, fixture: { candidates: fixture.instIds.length, timeframes: fixture.timeframes,
       periodsPerNativeSeries: fixture.periods }, metadata: { checkout, targetBuild: target,
       runtime: { ...runtime, native: presentation, network: 'sandbox network disabled; seeded offline fixture' } }, ...report }

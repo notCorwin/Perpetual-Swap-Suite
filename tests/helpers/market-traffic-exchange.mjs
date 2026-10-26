@@ -41,9 +41,9 @@ function addTally(target, channel, bytes) {
  * Deterministic, loopback-only OKX protocol fixture. The app still uses its
  * production HTTP parser, WebSocket transports, subscription code and market
  * qualification path. Values are stable across runs; source timestamps are
- * current so freshness checks exercise the same code as a live feed.
+ * current so the app's accepted observation path sees current live-feed values.
  */
-export async function createMarketTrafficExchange({ candidateCount = 50, passingCount = 6, spreadFailureCount = 22, seed = 1 } = {}) {
+export async function createMarketTrafficExchange({ candidateCount = 50, passingCount = 6, spreadFailureCount = 22, seed = 1, now = Date.now } = {}) {
   for (const [name, value] of Object.entries({ candidateCount, passingCount, spreadFailureCount, seed })) {
     assert.ok(Number.isSafeInteger(value) && value >= 0, `${name} must be a nonnegative safe integer.`)
   }
@@ -52,7 +52,7 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
   assert.ok(spreadFailureCount <= candidateCount - passingCount, 'Too many spread failures.')
   const oiFailureCount = candidateCount - passingCount - spreadFailureCount
   assert.ok(oiFailureCount > 0, 'The fixture needs at least one open-interest failure.')
-  const asOf = Date.now()
+  const asOf = now()
   const instIds = Array.from({ length: candidateCount }, (_, index) => `T${String(index).padStart(3, '0')}-USDT-SWAP`)
   const kinds = new Map(instIds.map((instId, index) => [instId, index < passingCount ? 'pass'
     : index < passingCount + spreadFailureCount ? 'spread' : 'openInterest']))
@@ -62,7 +62,7 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
       ctVal: '1', ctMult: '1', ctValCcy: base, ruleType: 'normal', listTime: String(asOf - 500 * marketTrafficIntervals['1H']),
       tickSz: '0.01', lotSz: '1', minSz: '1', instFamily: 'T-USDT', index }]
   }))
-  const tickerFor = (instId, messageTick = 0, timestamp = Date.now()) => {
+  const tickerFor = (instId, messageTick = 0, timestamp = now()) => {
     const index = instrumentById.get(instId)?.index ?? 0
     const kind = kinds.get(instId) ?? 'pass'
     const last = 100 + index + messageTick * 0.001
@@ -70,38 +70,35 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
     return { instId, last: String(last), bidPx: String(bid), askPx: String(ask), open24h: String(100 + index),
       high24h: String(last + 2), low24h: String(last - 2), volCcy24h: '500000', vol24h: '500000', ts: String(timestamp) }
   }
-  const openInterestFor = (instId, timestamp = Date.now()) => {
+  const openInterestFor = (instId, timestamp = now()) => {
     const index = instrumentById.get(instId)?.index ?? 0
     const low = kinds.get(instId) === 'openInterest'
     return { instId, oi: low ? '10000' : '100000', oiUsd: low ? '1000000' : '10000000', ts: String(timestamp) }
   }
-  const bookFor = (instId, timestamp = Date.now()) => {
+  const bookFor = (instId, timestamp = now()) => {
     const ticker = tickerFor(instId)
     return { instId, bids: [[ticker.bidPx, '100000']], asks: [[ticker.askPx, '100000']], ts: String(timestamp) }
   }
-  const candleRows = new Map()
-  for (const instId of instIds) for (const [timeframe, interval] of Object.entries(marketTrafficIntervals)) {
-    const end = Math.floor(asOf / interval) * interval, index = instrumentById.get(instId).index, close = 100 + index
+  const confirmedCandle = (instId, timeframe, timestamp) => {
+    const close = 100 + instrumentById.get(instId).index
     const quoteVolume = timeframe === '5m' ? 125_000 : timeframe === '15m' ? 375_000 : 1_500_000
-    const count = timeframe === '5m' ? 288 : 300
-    const rows = Array.from({ length: count }, (_, rowIndex) => {
-      const timestamp = end - count * interval + rowIndex * interval
-      return { instrument: instId, timeframe, timestamp, open: close, high: close + 1, low: close - 1, close,
-        volume: quoteVolume / close, baseVolume: quoteVolume / close, quoteVolume, confirmed: true }
-    })
-    candleRows.set(`${instId}:${timeframe}`, rows)
+    return { instrument: instId, timeframe, timestamp, open: close, high: close + 1, low: close - 1, close,
+      volume: quoteVolume / close, baseVolume: quoteVolume / close, quoteVolume, confirmed: true }
   }
   const instruments = instIds.map(instId => { const { index, ...instrument } = instrumentById.get(instId); return instrument })
   const clients = new Set(), requests = [], errors = [], sentByChannel = {}, acknowledgements = {}, deliveries = {}, lastDelivery = {}, latestValues = {}, bookSequences = new Map(), bookFrames = []
-  const window = { active: false, startedAt: null, endedAt: null, ws: {}, http: {}, ack: {}, deliveries: {} }
+  const window = { active: false, startedAt: null, endedAt: null, ws: {}, http: {}, ack: {}, deliveries: {}, deliveryTimestamps: {} }
   let tick = 0, cadenceTimer = null
   const latestCounter = (channel, instId) => {
     const key = `${channel}:${instId}`
     deliveries[key] = (deliveries[key] ?? 0) + 1
-    lastDelivery[key] = Date.now()
+    lastDelivery[key] = now()
     if (window.active) {
       const channelCounts = window.deliveries[channel] ??= {}
       channelCounts[instId] = (channelCounts[instId] ?? 0) + 1
+      const channelTimes = window.deliveryTimestamps[channel] ??= {}
+      const timestamps = channelTimes[instId] ??= []
+      timestamps.push(now())
     }
   }
   const sendText = (client, value, channel, kind = 'data') => {
@@ -125,14 +122,17 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
   const responseCandleRows = (instId, timeframe, url, path) => {
     const interval = marketTrafficIntervals[timeframe]
     if (!interval || !instrumentById.has(instId)) return []
-    const source = candleRows.get(`${instId}:${timeframe}`) ?? []
+    const initialCount = timeframe === '5m' ? 288 : 300
+    const from = Math.floor(asOf / interval) * interval - initialCount * interval
+    const end = Math.floor(now() / interval) * interval
+    const source = Array.from({ length: (end - from) / interval }, (_, index) => confirmedCandle(instId, timeframe, from + index * interval))
     const after = Number(url.searchParams.get('after')) || Infinity
     const before = Number(url.searchParams.get('before')) || -Infinity
     const limit = Math.min(300, Math.max(1, Number(url.searchParams.get('limit')) || 100))
     const values = source.filter(row => row.timestamp < after && row.timestamp > before)
       .toSorted((left, right) => right.timestamp - left.timestamp).slice(0, limit).map(rawCandle)
     if (path !== '/market/candles') return values
-    const now = Date.now(), timestamp = Math.floor(now / interval) * interval, index = instrumentById.get(instId).index
+    const timestamp = Math.floor(now() / interval) * interval, index = instrumentById.get(instId).index
     const close = 100 + index
     const forming = [timestamp, close, close + 1, close - 1, close, 100, 100, 10_000, '0'].map(String)
     return [forming, ...values].slice(0, limit)
@@ -145,9 +145,9 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
       return
     }
     const path = url.pathname.replace(/^\/api\/v5/, ''), params = Object.fromEntries(url.searchParams)
-    const record = { path, parameters: params, receivedAt: Date.now(), responsePayloadBytes: 0 }
+    const record = { path, parameters: params, receivedAt: now(), responsePayloadBytes: 0 }
     requests.push(record)
-    response.once('finish', () => { record.respondedAt = Date.now() })
+    response.once('finish', () => { record.respondedAt = now() })
     if (path === '/public/instruments') return sendJSON(response, path, instruments, record)
     if (path === '/market/tickers') return sendJSON(response, path, instIds.map(instId => tickerFor(instId)), record)
     if (path === '/market/ticker') {
@@ -191,10 +191,10 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
       return [{ bids: value.bids.map(([price, size]) => [price, size, '0', '1']), asks: value.asks.map(([price, size]) => [price, size, '0', '1']),
         seqId: 1, prevSeqId: -1, ts: value.ts }]
     }
-    if (channel === 'trades') return [{ instId, tradeId: String(instrumentById.get(instId).index + 1), ts: String(Date.now()), side: 'buy', sz: '10', px: '100', count: '1' }]
+    if (channel === 'trades') return [{ instId, tradeId: String(instrumentById.get(instId).index + 1), ts: String(now()), side: 'buy', sz: '10', px: '100', count: '1' }]
     if (businessChannels.has(channel)) {
       const timeframe = [...Object.keys(marketTrafficIntervals)].find(value => `candle${value}` === channel)
-      const interval = marketTrafficIntervals[timeframe], timestamp = Math.floor(Date.now() / interval) * interval
+      const interval = marketTrafficIntervals[timeframe], timestamp = Math.floor(now() / interval) * interval
       const close = 100 + instrumentById.get(instId).index
       return [[timestamp, close, close + 1, close - 1, close, 100, 100, 10_000, '0'].map(String)]
     }
@@ -208,15 +208,16 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
     }
     const instId = arg.instId
     if (!instrumentById.has(instId)) { errors.push(`WebSocket subscribed to unknown instrument: ${instId}`); return }
-    const timestamp = Date.now()
+    const timestamp = now()
+    let sent = false
     if (arg.channel === 'tickers') {
       const value = tickerFor(instId, currentTick, timestamp)
       latestValues[`${arg.channel}:${instId}`] = value
-      sendText(client, { arg, data: [value] }, arg.channel)
+      sent = sendText(client, { arg, data: [value] }, arg.channel)
     } else if (arg.channel === 'open-interest') {
       const value = openInterestFor(instId, timestamp)
       latestValues[`${arg.channel}:${instId}`] = value
-      sendText(client, { arg, data: [value] }, arg.channel)
+      sent = sendText(client, { arg, data: [value] }, arg.channel)
     }
     else if (arg.channel === 'books') {
       const book = bookFor(instId, timestamp)
@@ -230,20 +231,28 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
       bookSequences.set(instId, seqId)
       bookFrames.push({ instId, action, seqId, prevSeqId, bids: value.bids.length, asks: value.asks.length })
       latestValues[`${arg.channel}:${instId}`] = value
-      sendText(client, { arg, action, data: [value] }, arg.channel)
+      sent = sendText(client, { arg, action, data: [value] }, arg.channel)
     } else if (arg.channel === 'trades') {
       const value = { instId, tradeId: String(currentTick + 1), ts: String(timestamp), side: currentTick % 2 ? 'sell' : 'buy', sz: '10', px: '100', count: '1' }
       latestValues[`${arg.channel}:${instId}`] = value
-      sendText(client, { arg, data: [value] }, arg.channel)
+      sent = sendText(client, { arg, data: [value] }, arg.channel)
     } else if (businessChannels.has(arg.channel)) {
       const timeframe = [...Object.keys(marketTrafficIntervals)].find(value => `candle${value}` === arg.channel)
       const interval = marketTrafficIntervals[timeframe], period = Math.floor(timestamp / interval) * interval, index = instrumentById.get(instId).index
+      const key = keyFor(arg), previous = client.candlePeriods.get(key)
+      // A real stream confirms the elapsed candle before publishing the next
+      // forming candle. HTTP recovery must expose the same completed values.
+      if (previous !== undefined) for (let closed = previous; closed < period; closed += interval) {
+        const row = rawCandle(confirmedCandle(instId, timeframe, closed))
+        if (sendText(client, { arg, data: [row] }, arg.channel)) latestCounter(arg.channel, instId)
+      }
+      client.candlePeriods.set(key, period)
       const close = 100 + index + currentTick * 0.001, volume = 100 + currentTick, quoteVolume = volume * close
       const row = [period, close, close + 1, close - 1, close, volume, volume, quoteVolume, '0'].map(String)
       latestValues[`${arg.channel}:${instId}`] = row
-      sendText(client, { arg, data: [row] }, arg.channel)
+      sent = sendText(client, { arg, data: [row] }, arg.channel)
     }
-    latestCounter(arg.channel, instId)
+    if (sent) latestCounter(arg.channel, instId)
   }
   const receiveText = (client, text) => {
     if (text === 'ping') { sendText(client, 'pong', 'control'); return }
@@ -303,7 +312,7 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
     const accept = createHash('sha1').update(`${request.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64')
     socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
     socket.setNoDelay(true)
-    const client = { socket, path: request.url, pending: Buffer.alloc(0), subscriptions: new Map() }
+    const client = { socket, path: request.url, pending: Buffer.alloc(0), subscriptions: new Map(), candlePeriods: new Map() }
     clients.add(client)
     socket.on('data', chunk => consume(client, chunk))
     socket.on('error', error => { if (error.code !== 'ECONNRESET') errors.push(`WebSocket socket: ${error.code ?? error.name}`) })
@@ -349,18 +358,18 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
     beginSample() {
       if (window.active) throw new Error('A traffic sample is already active.')
       window.active = true
-      window.startedAt = Date.now()
+      window.startedAt = now()
       window.endedAt = null
-      window.ws = {}; window.http = {}; window.ack = {}; window.deliveries = {}
+      window.ws = {}; window.http = {}; window.ack = {}; window.deliveries = {}; window.deliveryTimestamps = {}
       return window.startedAt
     },
     endSample() {
-      window.endedAt = Date.now()
+      window.endedAt = now()
       window.active = false
       return { startedAt: window.startedAt, endedAt: window.endedAt,
         durationSeconds: (window.endedAt - window.startedAt) / 1_000,
         websocket: structuredClone(window.ws), http: structuredClone(window.http), acknowledgements: structuredClone(window.ack),
-        deliveries: structuredClone(window.deliveries) }
+        deliveries: structuredClone(window.deliveries), deliveryTimestamps: structuredClone(window.deliveryTimestamps) }
     },
     deliverySummary() {
       const byChannel = Object.fromEntries([...new Set(Object.keys(deliveries).map(key => key.slice(0, key.indexOf(':'))))].sort().map(channel => {

@@ -4,14 +4,41 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
+import { validateMarketTrafficEvidence } from '../tests/helpers/market-traffic-evidence.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
-const baselineRevision = 'ab9cb551bd00252abf370a324fe17d1eeacd6db1'
 const hiddenMode = 'hidden-electron-loopback-market-traffic-and-renderer-responsiveness'
 const foregroundMode = 'foreground-electron-loopback-market-traffic-and-renderer-responsiveness'
 
 function sumBytes(channels) {
   return Object.values(channels ?? {}).reduce((total, value) => total + value.payloadBytes, 0)
+}
+
+const summaryTolerance = 1e-6
+const nearestRank = (values, fraction) => [...values].sort((left, right) => left - right)[Math.max(0, Math.ceil(values.length * fraction) - 1)]
+
+function assertSummaryMatchesSamples(summary, samples, label) {
+  assert.ok(Array.isArray(samples) && samples.length > 0, `${label} has no raw samples.`)
+  assert.ok(Number.isSafeInteger(summary.sampleCount) && summary.sampleCount === samples.length,
+    `${label} sample count does not match its raw samples.`)
+  assert.ok(samples.every(value => Number.isFinite(value) && value >= 0), `${label} raw samples must be finite nonnegative values.`)
+  const expected = { p50: nearestRank(samples, .5), p95: nearestRank(samples, .95), max: Math.max(...samples) }
+  for (const [metric, value] of Object.entries(expected)) {
+    assert.ok(Number.isFinite(summary[metric]) && summary[metric] >= 0, `${label} ${metric} must be a finite measurement.`)
+    assert.ok(Math.abs(summary[metric] - value) <= summaryTolerance,
+      `${label} ${metric} does not match its raw samples: summary=${summary[metric]}, measured=${value}.`)
+  }
+}
+
+function validateComparisonBuildProvenance(report, label) {
+  const build = report.app?.build
+  assert.match(build?.revision ?? '', /^(?:[a-f\d]{40}|[a-f\d]{64})$/i, `${label} app build must identify a full Git revision.`)
+  assert.equal(build.dirty, false, `${label} app build must have clean provenance.`)
+  if (build.provenance === 'working-tree checkout') {
+    assert.equal(report.app?.checkout?.dirty, false, `${label} selected checkout must have clean provenance.`)
+    assert.equal(report.app?.checkout?.revision, build.revision, `${label} app build must match its selected checkout revision.`)
+  } else assert.ok(typeof build.path === 'string' && build.path.length > 0,
+    `${label} app build provenance must identify a checkout or packaged build metadata file.`)
 }
 
 export function validateMarketTrafficReport(report, label, { baseline = false } = {}) {
@@ -39,12 +66,12 @@ export function validateMarketTrafficReport(report, label, { baseline = false } 
   assert.equal(report.fixture.qualification.pending, 0, `${label} still has qualification work pending.`)
   assert.ok(report.fixture.passingCount > 0 && report.fixture.passingCount < report.fixture.candidateCount, `${label} lacks both passing and failing candidates.`)
   assert.equal(report.fixture.dataFingerprint,
-    `market-traffic-v2-bookseq-${report.fixture.candidateCount}-${report.fixture.passingCount}-${report.fixture.spreadFailureCount}-seed-${report.fixture.seed}`,
-    `${label} must use the sequence-correct book fixture protocol version.`)
+    `market-traffic-v3-app-receipts-${report.fixture.candidateCount}-${report.fixture.passingCount}-${report.fixture.spreadFailureCount}-seed-${report.fixture.seed}`,
+    `${label} must use the accepted-receipt market fixture protocol version.`)
   assert.equal(report.fixture.qualification.verified, report.fixture.passingCount, `${label} qualified the wrong number of candidates.`)
   assert.equal(report.fixture.qualification.failed, report.fixture.candidateCount - report.fixture.passingCount, `${label} failed the wrong number of candidates.`)
   assert.equal(report.fixture.qualification.unknown, 0, `${label} contains unresolved candidates.`)
-  assert.equal(report.correctness?.allCandidatesHaveFreshTickerOpenInterestAnd5m, true, `${label} did not retain all required live channels.`)
+  assert.equal(report.correctness?.allCandidatesHaveContinuousTickerOpenInterestAnd5mReceipts, true, `${label} did not retain all required live channels.`)
   assert.equal(report.correctness?.outputMatchesLatestFixtureTickers, true, `${label} renderer output did not match the fixture.`)
   assert.ok(['live', 'connecting'].includes(report.correctness?.finalRealtimeState), `${label} disconnected or was recovering during measurement.`)
   assert.ok(report.correctness?.connectedWebSocketClients >= 3, `${label} has no connected native WebSocket transports.`)
@@ -54,27 +81,42 @@ export function validateMarketTrafficReport(report, label, { baseline = false } 
   assert.deepEqual([...expectedIDs].sort(), expectedIDs, `${label} candidate output IDs must be sorted.`)
   const required = ['tickers', 'open-interest', 'candle5m']
   assert.deepEqual(report.fixture.requiredChannels, required, `${label} must exercise all required live channels.`)
-  for (const channel of required) {
-    const subscribed = report.traffic.subscriptionCounts?.[channel] ?? []
-    assert.equal(subscribed.length, report.fixture.candidateCount, `${label} is missing ${channel} subscriptions.`)
-    assert.equal(new Set(subscribed).size, report.fixture.candidateCount, `${label} has duplicate ${channel} subscriptions.`)
-    const fresh = report.traffic.freshness?.[channel] ?? []
-    assert.equal(fresh.length, report.fixture.candidateCount, `${label} has incomplete ${channel} freshness evidence.`)
-    const minimumMessages = Math.floor(report.fixture.durationSeconds * 1_000 / report.fixture.cadenceMS * .75)
-    assert.ok(fresh.every(value => value.sampleMessages >= minimumMessages && subscribed.includes(value.instId) && value.ageMS !== null
-      && value.ageMS <= Math.max(1_500, report.fixture.cadenceMS * 3)), `${label} has stale or missing ${channel} observations.`)
-    assert.equal(new Set(fresh.map(value => value.instId)).size, report.fixture.candidateCount, `${label} freshness IDs are duplicated.`)
-    assert.deepEqual(fresh.map(value => value.instId).sort(), [...subscribed].sort(), `${label} ${channel} freshness does not cover every subscribed candidate.`)
+  assert.deepEqual(report.fixture.candidateIDs?.length, report.fixture.candidateCount, `${label} must identify the complete fixture candidate set.`)
+  assert.equal(new Set(report.fixture.candidateIDs).size, report.fixture.candidateCount, `${label} fixture candidate IDs are duplicated.`)
+  assert.deepEqual([...report.fixture.candidateIDs].sort(), report.fixture.candidateIDs, `${label} fixture candidate IDs must be sorted.`)
+  const receiptEvidence = report.traffic.receiptEvidence
+  validateMarketTrafficEvidence(receiptEvidence)
+  assert.equal(receiptEvidence.sampleStartedAt, report.fixture.sampleStartedAt, `${label} receipt timestamps must use the fixture sample start.`)
+  assert.ok(Math.abs(receiptEvidence.durationMS / 1_000 - report.fixture.durationSeconds) <= .75, `${label} receipt window drifted from the measured traffic duration.`)
+  assert.deepEqual(report.traffic.configuredDemand?.candidateIDs, report.fixture.candidateIDs,
+    `${label} subscription demand must be derived from the complete candidate universe.`)
+  assert.deepEqual(report.traffic.configuredDemand?.eligibleIDs, report.correctness.passingIDs,
+    `${label} subscription demand must use the app's eligible market list.`)
+  const expectedSubscriptions = receiptEvidence.expectedSubscriptions
+  for (const channel of ['tickers', 'open-interest', 'candle5m']) {
+    assert.deepEqual(expectedSubscriptions[channel], report.fixture.candidateIDs, `${label} is missing ${channel} candidate demand.`)
   }
+  const focused = report.traffic.configuredDemand.focusedInstrumentID
+  assert.deepEqual(expectedSubscriptions.trades,
+    [...new Set([...report.traffic.configuredDemand.eligibleIDs, focused].filter(Boolean))].sort(),
+    `${label} trades must cover configured eligible and focused demand.`)
+  if (report.traffic.configuredDemand.booksEnabled) {
+    assert.ok(expectedSubscriptions.books.length > 0, `${label} configured books demand cannot be empty.`)
+    for (const instId of report.traffic.configuredDemand.eligibleIDs) assert.ok(expectedSubscriptions.books.includes(instId),
+      `${label} configured books demand is missing eligible ${instId}.`)
+  } else assert.deepEqual(expectedSubscriptions.books, [], `${label} requested books while depth and slippage filters are disabled.`)
+  const expectedChannelSet = new Set(Object.keys(expectedSubscriptions))
+  const acknowledgedChannels = Object.keys(report.traffic.subscriptionCounts ?? {}).filter(channel => channel !== 'instruments')
+  assert.ok(acknowledgedChannels.every(channel => expectedChannelSet.has(channel)), `${label} acknowledged an unconfigured channel.`)
+  for (const channel of Object.keys(expectedSubscriptions)) {
+    const expected = expectedSubscriptions[channel], acknowledged = report.traffic.subscriptionCounts?.[channel] ?? []
+    assert.deepEqual(acknowledged, expected, `${label} ${channel} acknowledgements do not match configured demand.`)
+  }
+  for (const channel of required) assert.ok((report.traffic.websocketPayloadBytesByChannel?.[channel]?.messages ?? 0) > 0,
+    `${label} has no measured ${channel} payload.`)
   if (report.fixture.expectOptimized) {
-    const eligible = new Set(report.correctness.passingIDs)
-    for (const channel of ['books', 'trades']) {
-      const demand = report.traffic.subscriptionCounts?.[channel] ?? []
-      assert.ok(demand.length <= report.fixture.passingCount && demand.every(instId => eligible.has(instId)),
-        `${label} optimized ${channel} demand exceeds verified/selected contracts.`)
-    }
     for (const channel of ['candle15m', 'candle1H']) {
-      assert.equal(report.traffic.subscriptionCounts?.[channel]?.length ?? 0, 0, `${label} has a remote ${channel} subscription.`)
+      assert.deepEqual(expectedSubscriptions[channel] ?? [], [], `${label} has a remote ${channel} subscription.`)
       assert.equal(report.traffic.websocketPayloadBytesByChannel?.[channel]?.messages ?? 0, 0, `${label} measured remote ${channel} payloads.`)
     }
   }
@@ -84,22 +126,45 @@ export function validateMarketTrafficReport(report, label, { baseline = false } 
   assert.equal(report.traffic?.httpResponsePayloadBytes, httpBytes, `${label} HTTP payload total is inconsistent.`)
   assert.equal(report.traffic?.totalPayloadBytes, websocketBytes + httpBytes, `${label} total fixture payload bytes are inconsistent.`)
   assert.ok(report.traffic.totalPayloadBytes > 0, `${label} is a no-op traffic run.`)
-  for (const channel of required) assert.ok((report.traffic.websocketPayloadBytesByChannel?.[channel]?.messages ?? 0) > 0,
-    `${label} has no measured ${channel} payload.`)
   assert.ok(report.renderer?.frameCount >= report.fixture.durationSeconds * 15, `${label} has insufficient renderer frame samples.`)
-  assert.ok(report.renderer?.searchInteractionMS?.count >= report.fixture.passingCount, `${label} has insufficient renderer interaction samples.`)
-  for (const [name, value] of Object.entries({ frameGapP95: report.renderer.frameGapMS?.p95,
-    interactionP95: report.renderer.searchInteractionMS?.p95 })) {
+  assert.equal(report.renderer?.rafOpportunityGapMS?.sampleCount, report.renderer?.frameCount, `${label} RAF opportunity sample count is inconsistent.`)
+  assert.equal(report.renderer?.rafOpportunityGapMS?.samples?.length, report.renderer?.rafOpportunityGapMS?.sampleCount, `${label} RAF opportunity timestamps are incomplete.`)
+  assert.ok(report.renderer?.searchInputToSecondRAFMS?.sampleCount >= report.fixture.passingCount, `${label} has insufficient renderer interaction samples.`)
+  assert.equal(report.renderer?.searchInputToSecondRAFMS?.samples?.length, report.renderer?.searchInputToSecondRAFMS?.sampleCount, `${label} input-to-RAF samples are incomplete.`)
+  assertSummaryMatchesSamples(report.renderer.rafOpportunityGapMS,
+    report.renderer.rafOpportunityGapMS.samples, `${label} RAF opportunity gap`)
+  const interactionSamples = report.renderer.searchInputToSecondRAFMS.samples
+  const interactionDurations = interactionSamples.map((sample, index) => {
+    assert.ok(Number.isFinite(sample?.startedMS) && sample.startedMS >= 0, `${label} search sample ${index} has an invalid start time.`)
+    assert.ok(Number.isFinite(sample?.completedMS) && Number.isFinite(sample?.durationMS) && sample.durationMS >= 0,
+      `${label} search sample ${index} has an invalid or missing duration.`)
+    assert.ok(Math.abs(sample.completedMS - sample.startedMS - sample.durationMS) <= summaryTolerance,
+      `${label} search sample ${index} duration does not match its raw timestamps.`)
+    return sample.durationMS
+  })
+  assertSummaryMatchesSamples(report.renderer.searchInputToSecondRAFMS, interactionDurations,
+    `${label} input-to-second-RAF`)
+  for (const [name, value] of Object.entries({ rafOpportunityGapP95: report.renderer.rafOpportunityGapMS?.p95,
+    rafOpportunityGapMax: report.renderer.rafOpportunityGapMS?.max,
+    inputToSecondRAFP95: report.renderer.searchInputToSecondRAFMS?.p95,
+    inputToSecondRAFMax: report.renderer.searchInputToSecondRAFMS?.max })) {
     assert.ok(Number.isFinite(value) && value >= 0, `${label} has no valid ${name} measurement.`)
   }
+  assert.match(report.renderer?.measurement ?? '', /RAF callback opportunity gaps/,
+    `${label} must label renderer timing as RAF opportunity measurements.`)
+  assert.match(report.renderer.measurement, /do not measure SVG commit or native compositor paint/,
+    `${label} must state that renderer timing is not SVG commit or native paint.`)
+  assert.match(report.renderer.searchInputToSecondRAFMS.p95Interpretation ?? '', /descriptive at this sample count/,
+    `${label} must identify the small-sample empirical search p95 as descriptive.`)
+  if (report.fixture.expectOptimized) {
+    assert.ok(report.renderer.rafOpportunityGapMS.p95 <= 50, `${label} optimized renderer RAF opportunity gap p95 exceeded 50ms.`)
+    assert.ok(report.renderer.searchInputToSecondRAFMS.p95 <= 50, `${label} optimized input-to-second-RAF p95 exceeded 50ms.`)
+    assert.ok(report.renderer.rafOpportunityGapMS.max < 100, `${label} optimized renderer had a RAF stall of at least 100ms.`)
+    assert.ok(report.renderer.searchInputToSecondRAFMS.max < 100, `${label} optimized renderer had a search stall of at least 100ms.`)
+  }
   if (baseline) {
-    assert.equal(report.app?.build?.revision, baselineRevision, `${label} must use the clean ab9cb551 baseline app.`)
+    assert.ok(report.app?.build?.revision, `${label} baseline app identity is missing.`)
     assert.equal(report.app?.build?.dirty, false, `${label} baseline app must be clean.`)
-    if (foreground) {
-      assert.equal(report.app?.build?.provenance, 'working-tree checkout', `${label} foreground baseline must use the selected ab9cb551 source checkout.`)
-      assert.equal(report.app?.checkout?.revision, baselineRevision, `${label} selected baseline checkout must be ab9cb551.`)
-      assert.equal(report.app?.checkout?.dirty, false, `${label} selected baseline checkout must be clean.`)
-    }
   } else {
     assert.equal(report.app?.build?.provenance, 'working-tree checkout', `${label} must measure the selected working tree.`)
     if (foreground) {
@@ -110,10 +175,10 @@ export function validateMarketTrafficReport(report, label, { baseline = false } 
   }
   if (foreground) {
     assert.equal(report.fixture?.searchScenario?.version, 'distributed-input-v1', `${label} must use distributed search sampling.`)
-    const schedule = report.fixture.searchScenario, interactions = report.renderer.searchInteractionMS
+    const schedule = report.fixture.searchScenario, interactions = report.renderer.searchInputToSecondRAFMS
     assert.ok(schedule.eventCount >= 21 && schedule.windowMS === report.fixture.durationSeconds * 1_000
       && schedule.lastInputAtMS === schedule.windowMS - 100, `${label} has an invalid fixed search schedule.`)
-    assert.equal(interactions.count, schedule.eventCount, `${label} did not complete every declared search event.`)
+    assert.equal(interactions.sampleCount, schedule.eventCount, `${label} did not complete every declared search event.`)
     assert.equal(interactions.samples?.length, schedule.eventCount, `${label} lacks per-input search evidence.`)
     assert.ok(interactions.samples.every(sample => sample.correct && sample.actualResultCount === sample.expectedResultCount),
       `${label} did not verify the filtered results for every timed search.`)
@@ -138,6 +203,10 @@ const closeToNoRegression = (before, after, absolute, relative) => ({ before, af
 export function compareMarketTrafficReports(before, after) {
   validateMarketTrafficReport(before, 'before', { baseline: true })
   validateMarketTrafficReport(after, 'after')
+  validateComparisonBuildProvenance(before, 'Before')
+  validateComparisonBuildProvenance(after, 'After')
+  assert.notEqual(after.app.build.revision, before.app.build.revision,
+    'Before/after comparison requires distinct clean app build revisions.')
   assert.equal(after.mode, before.mode, 'Before/after reports must use the same presentation mode.')
   const foreground = before.mode === foregroundMode
   assert.equal(before.fixture.expectOptimized, false, 'Before report must measure the installed baseline without optimized-only assertions.')
@@ -145,6 +214,7 @@ export function compareMarketTrafficReports(before, after) {
   for (const key of ['candidateCount', 'passingCount', 'spreadFailureCount', 'oiFailureCount', 'seed', 'dataFingerprint', 'cadenceMS', 'durationSeconds']) {
     assert.equal(after.fixture[key], before.fixture[key], `Before/after fixture input ${key} must match exactly.`)
   }
+  assert.deepEqual(after.fixture.candidateIDs, before.fixture.candidateIDs, 'Before/after fixture candidate IDs must match exactly.')
   assert.equal(after.runtime.electronVersion, before.runtime.electronVersion, 'Before/after must use the same Electron version.')
   if (foreground) {
     assert.deepEqual(after.fixture.searchScenario, before.fixture.searchScenario, 'Before/after must use the same search schedule.')
@@ -156,9 +226,20 @@ export function compareMarketTrafficReports(before, after) {
   } else {
     assert.equal(after.runtime.sourceFingerprint, before.runtime.sourceFingerprint, 'Before/after must use the same protected Electron bundle.')
   }
-  for (const channel of ['tickers', 'open-interest', 'candle5m']) {
-    assert.deepEqual(after.traffic.subscriptionCounts[channel], before.traffic.subscriptionCounts[channel],
-      `Before/after must retain the same ${channel} candidate coverage.`)
+  const optimizationRemovableChannels = new Set(['candle15m', 'candle1H'])
+  const measuredChannels = Object.keys(before.traffic.receiptEvidence.expectedSubscriptions)
+    .filter(channel => !optimizationRemovableChannels.has(channel))
+  assert.deepEqual(Object.keys(after.traffic.receiptEvidence.expectedSubscriptions).filter(channel => !optimizationRemovableChannels.has(channel)).sort(),
+    measuredChannels.slice().sort(), 'Before/after must measure the same retained channel set.')
+  for (const channel of measuredChannels) {
+    const beforeIDs = before.traffic.receiptEvidence.expectedSubscriptions[channel]
+    const afterIDs = after.traffic.receiptEvidence.expectedSubscriptions[channel]
+    assert.deepEqual(afterIDs, beforeIDs, `Before/after must retain the same ${channel} instrument coverage.`)
+    const beforeEntries = new Map(before.traffic.receiptEvidence.channels[channel].entries.map(value => [value.instId, value]))
+    for (const entry of after.traffic.receiptEvidence.channels[channel].entries) {
+      assert.equal(entry.fixtureSendCount, beforeEntries.get(entry.instId).fixtureSendCount,
+        `Before/after ${channel}/${entry.instId} fixture send counts must match exactly.`)
+    }
   }
   const beforeChannels = before.traffic.websocketPayloadBytesByChannel ?? {}, afterChannels = after.traffic.websocketPayloadBytesByChannel ?? {}
   const channelNames = [...new Set([...Object.keys(beforeChannels), ...Object.keys(afterChannels)])].sort()
@@ -181,14 +262,14 @@ export function compareMarketTrafficReports(before, after) {
       afterPayloadBytesPerSecond: Number((right / after.traffic.durationSeconds).toFixed(2)) }]
   }))
   const responsiveness = {
-    frameGapP95MS: closeToNoRegression(before.renderer.frameGapMS.p95, after.renderer.frameGapMS.p95, 2, .15),
-    searchInteractionP95MS: closeToNoRegression(before.renderer.searchInteractionMS.p95, after.renderer.searchInteractionMS.p95, 3, .2),
+    rafOpportunityGapP95MS: closeToNoRegression(before.renderer.rafOpportunityGapMS.p95, after.renderer.rafOpportunityGapMS.p95, 2, .15),
+    inputToSecondRAFP95MS: closeToNoRegression(before.renderer.searchInputToSecondRAFMS.p95, after.renderer.searchInputToSecondRAFMS.p95, 3, .2),
   }
   for (const [name, result] of Object.entries(responsiveness)) assert.equal(result.passed, true,
     `Renderer responsiveness regressed beyond the bounded noise allowance for ${name}: ${JSON.stringify(result)}`)
   if (!foreground) {
-    assert.ok(after.renderer.frameGapMS.p95 <= 50, 'After frame gap p95 exceeded the 50ms responsiveness budget.')
-    assert.ok(after.renderer.searchInteractionMS.p95 <= 75, 'After search interaction p95 exceeded the 75ms hidden renderer budget.')
+    assert.ok(after.renderer.rafOpportunityGapMS.p95 <= 50, 'After RAF opportunity gap p95 exceeded the 50ms responsiveness budget.')
+    assert.ok(after.renderer.searchInputToSecondRAFMS.p95 <= 75, 'After input-to-second-RAF p95 exceeded the 75ms hidden renderer budget.')
   }
   assert.ok(afterRate < beforeRate,
     `Optimized total payload rate must decrease: before=${beforeRate.toFixed(2)} B/s, after=${afterRate.toFixed(2)} B/s.`)

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { requireForegroundTests } from '../electron/test-presentation.js'
 import { barsWithIndicators } from '../electron/services/indicators.js'
+import { accountChartIntents, assertScrollResponsiveness, assertWarmStatistics, summarizeLatencySamples } from './chart-acceptance-metrics.mjs'
 
 // The guarded runtime owns focus isolation. Performance acceptance keeps the
 // production rendering configuration instead of forcing software/headless work.
@@ -54,7 +55,7 @@ export async function foregroundPaintWindow(electron, page) {
     }, previous.id)
     assert.equal(environment.headless, false, 'Foreground paint must use the normal Electron compositor.')
     assert.equal(environment.disableGPU, false, 'Foreground paint must use the production GPU configuration.')
-    const idleFrameCadence = await page.evaluate(() => new Promise((resolve, reject) => {
+    const idleFrameCadenceSamples = await page.evaluate(() => new Promise((resolve, reject) => {
       const startedAt = performance.now(), gaps = []
       let previous = null, raf
       const deadline = setTimeout(() => { cancelAnimationFrame(raf); reject(new Error('Foreground animation frames did not advance within 5 seconds.')) }, 5000)
@@ -63,13 +64,14 @@ export async function foregroundPaintWindow(electron, page) {
         previous = timestamp
         if (timestamp - startedAt < 1000) { raf = requestAnimationFrame(frame); return }
         clearTimeout(deadline)
-        gaps.sort((left, right) => left - right)
-        resolve({ phase: 'before scenario setup', frames: gaps.length, durationMS: timestamp - startedAt,
-          medianMS: gaps[Math.floor((gaps.length - 1) * .5)] ?? null,
-          p95MS: gaps[Math.floor((gaps.length - 1) * .95)] ?? null, maxMS: gaps.at(-1) ?? null })
+        resolve({ frames: gaps.length, durationMS: timestamp - startedAt, frameGaps: gaps })
       }
       raf = requestAnimationFrame(frame)
     }))
+    const cadence = summarizeLatencySamples(idleFrameCadenceSamples.frameGaps)
+    const idleFrameCadence = { phase: 'before scenario setup', frames: idleFrameCadenceSamples.frames,
+      durationMS: idleFrameCadenceSamples.durationMS, medianMS: cadence.p50MS, p95MS: cadence.p95MS,
+      p95SampleCount: cadence.sampleCount, p95SampleMinimum: cadence.p95SampleMinimum, maxMS: cadence.maxMS }
     return { previous, native, environment, idleFrameCadence, restore }
   } catch (error) {
     await restore()
@@ -107,7 +109,7 @@ export async function waitForRendered(page, fixture, timeframe = fixture.timefra
 // Cold acquisition can present a complete target price window while indicator
 // preparation is still pending. This waits for that exact rendered cursor
 // without treating the pending flag as a missing price frame.
-export async function waitForPresentedTarget(page, fixture, timeframe, end) {
+export async function waitForTargetSnapshot(page, fixture, timeframe, end) {
   await page.waitForFunction(({ instId, timeframe, end }) => {
     const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
     const svg = chart?.querySelector('svg[data-rendered-inst]')
@@ -247,18 +249,33 @@ export async function openChart(page, fixture, timeframe = fixture.timeframe) {
 }
 
 // Inspect the actual immutable data passed to Plot and its SVG, rather than
-// treating the requested viewport or an aggregate loading flag as a paint.
+// treating the requested viewport or an aggregate loading flag as a render.
 // __chartSnapshot is a reference to the rendered object; it avoids serializing
 // 96 full bars into an attribute on every production animation frame.
-export async function startPaintProbe(page, fixture, { requireMatureData = false, verifyIndicatorValues = true } = {}) {
-  await page.evaluate(({ instId, series, requireMatureData, verifyIndicatorValues }) => {
+export async function startPaintProbe(page, fixture, { requireMatureData = false, requireWarmStatistics = false, indicatorValidation = 'fixture' } = {}) {
+  assert.ok(['fixture', 'finite', 'deferred-canonical'].includes(indicatorValidation), 'Unknown chart indicator validation contract.')
+  if (requireWarmStatistics) {
+    const { timeframe, bars } = await page.locator(`[data-chart-inst="${fixture.instId}"]`).evaluate(chart => ({
+      timeframe: chart.__chartSnapshot?.timeframe,
+      bars: (chart.__chartSnapshot?.bars ?? []).map(bar => ({
+        hour: bar.hour, oi: bar.oi, buy: bar.buy, sell: bar.sell, oiObserved: bar.oiObserved,
+        takerObserved: bar.takerObserved, statisticsObserved: bar.statisticsObserved, statisticsSources: bar.statisticsSources,
+      })),
+    }))
+    assert.ok(fixture.series[timeframe], `The warm chart timeframe ${timeframe} must have a fixture oracle.`)
+    assertWarmStatistics(bars, fixture.series[timeframe].bars)
+  }
+  await page.evaluate(({ instId, series, requireMatureData, requireWarmStatistics, indicatorValidation }) => {
     const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
     if (!(chart instanceof HTMLElement)) throw new Error('No chart surface to inspect.')
+    const expectedTimeframe = chart.__chartSnapshot?.timeframe
+    if (!series[expectedTimeframe]) throw new Error('The initial chart needs a known fixture timeframe.')
     const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
     const indicatorFields = fields.slice(4, -3), statisticFields = ['oi', 'buy', 'sell']
     const curveFields = [...indicatorFields, 'oi'], expectedGeometry = new WeakMap()
     const oracles = Object.fromEntries(Object.entries(series).map(([frame, entry]) => [frame, new Map(entry.bars.map(bar => [bar.hour, bar]))]))
     const probe = {
+      instId, expectedTimeframe,
       active: true, frames: 0, pendingFrames: 0, paints: 0, minimumBars: Infinity, errors: [],
       frameGaps: [], frameSamples: [], validationSamples: [], inputBursts: [], commits: [], pendingWindows: [], previousFrame: null, previousSnapshot: null, previousBars: null,
       phase: 'initial', quality: [], known: new Map(), geometry: new Map(),
@@ -294,7 +311,7 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       }
       const snapshot = chart.__chartSnapshot
       const svg = chart.querySelector('svg[data-rendered-inst]')
-      if (!snapshot || !svg) { fail('A presented chart disappeared.'); return }
+      if (!snapshot || !svg) { fail('The current chart SVG disappeared.'); return }
       const { timeframe } = snapshot
       const bars = chart.__chartRenderedBars ?? snapshot.bars
       if (frame && chart.dataset.chartLoading === 'true' && probe.pendingWindows.length < 10) probe.pendingWindows.push({
@@ -341,12 +358,16 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
         }
         if (requireMatureData) {
           for (const field of indicatorFields) if (!svg.querySelector(`[data-chart-indicator="${field}"]`)?.getAttribute('d')) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} has no ${field} SVG curve for mature local history.`)
-          if (svg.querySelector('[data-chart-oi]')?.getAttribute('data-chart-oi') !== 'complete') fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} lost complete OI geometry.`)
-          if (svg.querySelector('[data-chart-taker]')?.getAttribute('data-chart-taker') !== 'complete') fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} lost complete Taker geometry.`)
+          const expectsOI = bars.some(bar => Number.isFinite(oracles[timeframe]?.get(bar.hour)?.oi))
+          const expectsTaker = bars.some(bar => Number.isFinite(oracles[timeframe]?.get(bar.hour)?.buy) && Number.isFinite(oracles[timeframe]?.get(bar.hour)?.sell))
+          if ((requireWarmStatistics ? expectsOI : bars.some(bar => bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)))
+            && svg.querySelector('[data-chart-oi]')?.getAttribute('data-chart-oi') !== 'complete') fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} lost complete observed OI geometry.`)
+          if ((requireWarmStatistics ? expectsTaker : bars.some(bar => bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2)))
+            && svg.querySelector('[data-chart-taker]')?.getAttribute('data-chart-taker') !== 'complete') fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} lost complete observed Taker geometry.`)
         }
       }
       if (snapshot === probe.previousSnapshot && bars === probe.previousBars) {
-        if (frame && probe.commits.at(-1)?.presentedAt === null) probe.commits.at(-1).presentedAt = sampledAt
+        if (frame && probe.commits.at(-1)?.rafSampledAt === null) probe.commits.at(-1).rafSampledAt = sampledAt
         return
       }
       probe.previousSnapshot = snapshot
@@ -355,10 +376,9 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       const intervalMS = series[timeframe]?.intervalMS
       if (!Array.isArray(bars)) { fail('The rendered snapshot has no bars.'); return }
       probe.minimumBars = Math.min(probe.minimumBars, bars.length)
-      // A mutation is a React commit; the following animation frame is the
-      // first paint opportunity that includes that committed SVG. Keep both
-      // times so input latency does not mistake a DOM mutation for a frame.
-      probe.commits.push({ at: sampledAt, presentedAt: frame ? sampledAt : null, end: snapshot.endHour, timeframe, phase: probe.phase })
+      // A mutation is a React commit; the following RAF callback samples that
+      // DOM state. This does not prove that Electron's compositor presented it.
+      probe.commits.push({ at: sampledAt, rafSampledAt: frame ? sampledAt : null, end: snapshot.endHour, instId: snapshot.instId, timeframe, phase: probe.phase })
       probe.quality.push({ phase: probe.phase, end: snapshot.endHour, timeframe, indicators: bars.filter(bar => indicatorFields.every(field => Number.isFinite(bar[field]))).length,
         oi: bars.filter(bar => Number.isFinite(bar.oi)).length, taker: bars.filter(bar => Number.isFinite(bar.buy) && Number.isFinite(bar.sell)).length })
       if (bars.length !== 96) fail(`Rendered ${bars.length} bars for ${timeframe}.`)
@@ -376,22 +396,30 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
           if (Number.isFinite(previous[field]) && !Number.isFinite(bar[field])) fail(`${probe.phase}: ${key} downgraded previously drawn ${field} from ${previous[field]} to ${bar[field]} without a price change.`)
         }
         probe.known.set(key, { ...bar })
+        const expectedOI = Number.isFinite(expected.oi)
+        const expectedTaker = Number.isFinite(expected.buy) && Number.isFinite(expected.sell)
+        if (requireWarmStatistics && expectedOI && !(bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1))) fail(`${probe.phase}: ${key} has fixture-known OI but it is not observed in the warm-statistics contract.`)
+        if (requireWarmStatistics && expectedTaker && !(bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2))) fail(`${probe.phase}: ${key} has fixture-known Taker values but they are not observed in the warm-statistics contract.`)
         if (!bar.indicatorsObserved) for (const field of indicatorFields) {
           if (bar[field] !== null) fail(`${probe.phase}: ${key} retained ${field} without an observed calculation for its canonical generation.`)
         }
         for (const field of fields.filter(field => {
           if (['open', 'high', 'low', 'close'].includes(field)) return true
+          if (field === 'oi') return (requireWarmStatistics && Number.isFinite(expected.oi))
+            || (bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1))
+          if (field === 'buy' || field === 'sell') return (requireWarmStatistics && Number.isFinite(expected[field]))
+            || (bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2))
           if (requireMatureData && Number.isFinite(expected[field])) return true
-          if (field === 'oi') return bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)
-          if (field === 'buy' || field === 'sell') return bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2)
           return bar.indicatorsObserved
         })) {
           const actual = bar[field], wanted = expected[field]
-          // When an earlier prefix is still arriving, exact recursive results
-          // legitimately change. Require continuous finite geometry here; the
-          // acquisition test checks the final complete-prefix oracle separately.
-          if (!verifyIndicatorValues && indicatorFields.includes(field)) {
-            if (!Number.isFinite(actual)) fail(`${probe.phase}: ${timeframe} ${bar.hour} ${field} retracted to ${actual} during prefix acquisition.`)
+          // A new canonical prefix can legitimately change recursive values and
+          // its warmup boundary. Deferred mode checks exact local inputs after
+          // replay settles; it never substitutes the unseen provider archive.
+          if (indicatorValidation !== 'fixture' && indicatorFields.includes(field)) {
+            if (!Number.isFinite(actual) && !(indicatorValidation === 'deferred-canonical' && actual === null)) {
+              fail(`${probe.phase}: ${timeframe} ${bar.hour} ${field} retracted to ${actual} during prefix acquisition.`)
+            }
             continue
           }
           if (wanted === null) {
@@ -429,11 +457,11 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
     sample()
     probe.raf = requestAnimationFrame(frame)
     window.__chartPaintProbe = probe
-  }, { instId: fixture.instId, series: fixture.series, requireMatureData, verifyIndicatorValues })
+  }, { instId: fixture.instId, series: fixture.series, requireMatureData, requireWarmStatistics, indicatorValidation })
 }
 
 export async function finishPaintProbe(page) {
-  return page.evaluate(() => {
+  const report = await page.evaluate(() => {
     const probe = window.__chartPaintProbe
     if (!probe) throw new Error('No chart paint probe was installed.')
     probe.active = false
@@ -441,28 +469,32 @@ export async function finishPaintProbe(page) {
     probe.observer.disconnect()
     for (const { observer, record } of probe.schedulerObservers) { record(observer.takeRecords()); observer.disconnect() }
     delete window.__chartPaintProbe
-    const percentile = (values, ratio) => {
-      const sorted = [...values].sort((left, right) => left - right)
-      return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * ratio))] ?? 0
-    }
     return {
       frames: probe.frames, pendingFrames: probe.pendingFrames, pendingWindows: probe.pendingWindows, paints: probe.paints, minimumBars: probe.minimumBars,
       violations: probe.errors, commits: probe.commits, quality: probe.quality, scheduler: probe.scheduler,
-      p95FrameGapMS: Number(percentile(probe.frameGaps, .95).toFixed(3)),
-      maxFrameGapMS: Number(Math.max(0, ...probe.frameGaps).toFixed(3)),
+      frameGaps: probe.frameGaps,
       droppedFrames: probe.frameGaps.filter(gap => gap > 25).length,
       probeValidationSamples: probe.validationSamples.length,
       totalProbeValidationMS: Number(probe.validationSamples.reduce((sum, sample) => sum + sample.durationMS, 0).toFixed(3)),
-      p95ProbeValidationMS: Number(percentile(probe.validationSamples.map(sample => sample.durationMS), .95).toFixed(3)),
-      maxProbeValidationMS: Number(Math.max(0, ...probe.validationSamples.map(sample => sample.durationMS)).toFixed(3)),
+      validationDurations: probe.validationSamples.map(sample => sample.durationMS),
     }
   })
+  const frameGaps = summarizeLatencySamples(report.frameGaps)
+  const validation = summarizeLatencySamples(report.validationDurations)
+  delete report.frameGaps
+  delete report.validationDurations
+  return { ...report, rafSampleCount: report.frames,
+    p95FrameGapMS: frameGaps.p95MS, maxFrameGapMS: frameGaps.maxMS,
+    p95FrameGapSampleCount: frameGaps.sampleCount, p95FrameGapSampleMinimum: frameGaps.p95SampleMinimum,
+    p99FrameGapMS: frameGaps.p99MS, p99FrameGapSampleMinimum: frameGaps.p99SampleMinimum,
+    p95ProbeValidationMS: validation.p95MS, maxProbeValidationMS: validation.maxMS,
+    p95ProbeValidationSampleMinimum: validation.p95SampleMinimum }
 }
 
 export function assertCompletePaints(report) {
-  assert.ok(report.frames > 0, 'The acceptance probe must observe presented frames.')
+  assert.ok(report.frames > 0, 'The acceptance probe must observe renderer animation frames.')
   assert.ok(report.paints > 0, 'The acceptance probe must inspect the real rendered snapshot.')
-  assert.equal(report.minimumBars, 96, 'Every presented window must contain 96 candles.')
+  assert.equal(report.minimumBars, 96, 'Every observed window must contain 96 candles.')
   assert.deepEqual(report.violations, [], 'A rendered window was incomplete, mixed, or mathematically incorrect.')
 }
 
@@ -491,43 +523,76 @@ export async function measurePaintLatency(page, { inputs, targets, requireForegr
   const latestInput = inputs.at(-1)
   const expectedEnd = targets.at(-1)
   await page.waitForFunction(({ latestInput, expectedEnd }) => window.__chartPaintProbe?.commits.some(commit =>
-    commit.end === expectedEnd && commit.at >= latestInput && commit.presentedAt !== null), { latestInput, expectedEnd })
-  return page.evaluate(({ inputs, targets, requireForeground }) => {
-    if (requireForeground && (document.visibilityState !== 'visible' || !document.hasFocus())) throw new Error('Foreground paint latency lost its visible, focused window.')
+    commit.end === expectedEnd && commit.instId === window.__chartPaintProbe.instId
+    && commit.timeframe === window.__chartPaintProbe.expectedTimeframe
+    && commit.at >= latestInput && commit.rafSampledAt !== null), { latestInput, expectedEnd })
+  const observation = await page.evaluate(({ inputs, targets, requireForeground }) => {
+    if (requireForeground && (document.visibilityState !== 'visible' || !document.hasFocus())) throw new Error('Foreground renderer timing lost its visible, focused window.')
     const probe = window.__chartPaintProbe, commits = probe.commits
     for (const { observer, record } of probe.schedulerObservers) record(observer.takeRecords())
-    const matching = inputs.map((input, index) => commits.find(commit => commit.end === targets[index] && commit.at >= input && commit.presentedAt !== null))
-    const latencies = matching.flatMap((commit, index) => commit ? [commit.presentedAt - inputs[index]] : []).sort((left, right) => left - right)
-    const percentile = ratio => Number((latencies[Math.min(latencies.length - 1, Math.floor(latencies.length * ratio))] ?? 0).toFixed(3))
-    const latest = matching.at(-1)
     const bursts = inputs.map(input => probe.inputBursts.find(burst => burst.lastAt === input))
     if (bursts.some(burst => !burst)) throw new Error('Every measured wheel burst must include its first and final input timestamps.')
     const latestBurst = bursts.at(-1), startedAt = bursts[0].firstAt
-    const frameGaps = probe.frameSamples.filter(sample => sample.at >= startedAt && sample.at <= latest.presentedAt).map(sample => sample.gapMS)
-    const validation = probe.validationSamples.filter(sample => sample.at >= startedAt && sample.at <= latest.presentedAt).map(sample => sample.durationMS)
-    const percentileOf = (values, ratio) => {
-      const sorted = [...values].sort((left, right) => left - right)
-      return Number((sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * ratio))] ?? 0).toFixed(3))
-    }
     return {
-      documentVisibility: document.visibilityState, documentFocused: document.hasFocus(),
-      scheduler: probe.scheduler.entries.filter(entry => entry.startTime + entry.duration >= startedAt && entry.startTime <= latest.presentedAt),
-      committedInputs: latencies.length, supersededInputs: inputs.length - latencies.length,
-      p50InputToPaintMS: percentile(.5), p95InputToPaintMS: percentile(.95),
-      latestInputToPaintMS: Number((latest.presentedAt - inputs.at(-1)).toFixed(3)),
-      latestInputToCommitMS: Number((latest.at - inputs.at(-1)).toFixed(3)),
-      latestCommitToPaintMS: Number((latest.presentedAt - latest.at).toFixed(3)),
-      latestBurstStartToPaintMS: Number((latest.presentedAt - latestBurst.firstAt).toFixed(3)),
-      latestBurstStartToCommitMS: Number((latest.at - latestBurst.firstAt).toFixed(3)),
-      latestBurstDispatchMS: Number((latestBurst.lastAt - latestBurst.firstAt).toFixed(3)),
-      latestBurstEvents: latestBurst.events,
-      maxBurstDispatchMS: Number(Math.max(0, ...bursts.map(burst => burst.lastAt - burst.firstAt)).toFixed(3)),
-      p95FrameGapMS: percentileOf(frameGaps, .95), maxFrameGapMS: Number(Math.max(0, ...frameGaps).toFixed(3)),
-      probeValidationSamples: validation.length,
-      totalProbeValidationMS: Number(validation.reduce((sum, duration) => sum + duration, 0).toFixed(3)),
-      p95ProbeValidationMS: percentileOf(validation, .95), maxProbeValidationMS: Number(Math.max(0, ...validation).toFixed(3)),
+      visibility: document.visibilityState, focused: document.hasFocus(), commits, instId: probe.instId, timeframe: probe.expectedTimeframe,
+      scheduler: probe.scheduler.entries.filter(entry => entry.startTime + entry.duration >= startedAt),
+      bursts, inputs, targets, startedAt,
+      frameSamples: probe.frameSamples.filter(sample => sample.at >= startedAt),
+      validationSamples: probe.validationSamples.filter(sample => sample.at >= startedAt),
     }
   }, { inputs, targets, requireForeground })
+  const accounted = accountChartIntents(inputs.map((at, index) => ({ at, target: targets[index], instId: observation.instId, timeframe: observation.timeframe })), observation.commits)
+  const latest = accounted.at(-1)
+  if (!latest?.commit) throw new Error(`The latest chart intent ${targets.at(-1)} has no renderer RAF sample.`)
+  const endAt = latest.commit.rafSampledAt
+  assert.ok(observation.commits.filter(commit => commit.at >= observation.startedAt && commit.at <= endAt)
+    .every(commit => commit.instId === observation.instId && commit.timeframe === observation.timeframe),
+  'A scroll gesture committed an unintended instrument or timeframe.')
+  const frameGaps = observation.frameSamples.filter(sample => sample.at <= endAt).map(sample => sample.gapMS)
+  const validation = observation.validationSamples.filter(sample => sample.at <= endAt).map(sample => sample.durationMS)
+  const latencies = accounted.filter(intent => intent.commit).map(intent => intent.latencyMS)
+  const latencySummary = summarizeLatencySamples(latencies)
+  const frameSummary = summarizeLatencySamples(frameGaps)
+  const validationSummary = summarizeLatencySamples(validation)
+  const latestBurst = observation.bursts.at(-1)
+  const startedAt = observation.startedAt
+  if (accounted.some(intent => intent.commit?.rafSampledAt > endAt)) throw new Error('The gesture report contains a chart sample after the latest target.')
+  const report = {
+      documentVisibility: observation.visibility, documentFocused: observation.focused,
+      scheduler: observation.scheduler.filter(entry => entry.startTime <= endAt),
+      committedInputs: accounted.filter(intent => intent.status === 'committed').length,
+      supersededInputs: accounted.filter(intent => intent.status === 'coalesced').length,
+      unaccountedInputs: accounted.filter(intent => intent.status === 'unaccounted').map(({ index, target }) => ({ index, target })),
+      intents: accounted.map(({ index, target, status, supersededBy, latencyMS }) => ({ index, target, status, supersededBy, latencyMS })),
+      intentLatenciesMS: latencies.map(value => Number(value.toFixed(3))),
+      p50InputToRafSampleMS: latencySummary.p50MS,
+      p95InputToRafSampleMS: latencySummary.p95MS,
+      p95InputToRafSampleCount: latencySummary.sampleCount,
+      p95InputToRafSampleMinimum: latencySummary.p95SampleMinimum,
+      p99InputToRafSampleMS: latencySummary.p99MS,
+      p99InputToRafSampleMinimum: latencySummary.p99SampleMinimum,
+      maxInputToRafSampleMS: latencySummary.maxMS,
+      latestInputToRafSampleMS: Number(latest.latencyMS.toFixed(3)),
+      latestInputToCommitMS: Number((latest.commit.at - inputs.at(-1)).toFixed(3)),
+      latestCommitToRafSampleMS: Number((endAt - latest.commit.at).toFixed(3)),
+      latestBurstStartToRafSampleMS: Number((endAt - latestBurst.firstAt).toFixed(3)),
+      latestBurstStartToCommitMS: Number((latest.commit.at - latestBurst.firstAt).toFixed(3)),
+      latestBurstDispatchMS: Number((latestBurst.lastAt - latestBurst.firstAt).toFixed(3)),
+      latestBurstEvents: latestBurst.events,
+      maxBurstDispatchMS: Number(Math.max(0, ...observation.bursts.map(burst => burst.lastAt - burst.firstAt)).toFixed(3)),
+      p95FrameGapMS: frameSummary.p95MS, p95FrameGapSampleCount: frameSummary.sampleCount,
+      p95FrameGapSampleMinimum: frameSummary.p95SampleMinimum, p99FrameGapMS: frameSummary.p99MS,
+      p99FrameGapSampleMinimum: frameSummary.p99SampleMinimum, maxFrameGapMS: frameSummary.maxMS,
+      probeValidationSamples: validation.length,
+      totalProbeValidationMS: Number(validation.reduce((sum, duration) => sum + duration, 0).toFixed(3)),
+      p95ProbeValidationMS: validationSummary.p95MS, p95ProbeValidationSampleMinimum: validationSummary.p95SampleMinimum,
+      maxProbeValidationMS: validationSummary.maxMS,
+  }
+  if (report.unaccountedInputs.length) {
+    throw new Error(`Chart intents disappeared without a committed target or coalescing successor: ${JSON.stringify(report.unaccountedInputs)}`)
+  }
+  if (requireForeground) assertScrollResponsiveness(report)
+  return report
 }
 
 export async function waitForLocalHistory(electron, page, fixture, timeframe = fixture.timeframe, { requireIndicators = false } = {}) {
@@ -870,7 +935,7 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture, { o
     assertCompletePaints(paint)
     const requests = await readRequestProbe(electron)
     assert.equal(paint.pendingFrames, 0, `Latency-covered scrolling must never expose an unprepared requested viewport: ${JSON.stringify({ calls: requests.calls, sourceRequests: requests.sourceRequests, historyResponses: requests.historyResponses.length, inputDurationMS: inputs.at(-1) - inputs[0], pendingFrames: paint.pendingFrames, pendingWindows: paint.pendingWindows })}`)
-    if (!offscreen) assert.ok(latency.latestInputToPaintMS < 100, `The latest wheel input took ${latency.latestInputToPaintMS} ms to paint. ${JSON.stringify(latency)}`)
+    if (!offscreen) assert.ok(latency.maxInputToRafSampleMS < 100, `A wheel intent took ${latency.maxInputToRafSampleMS} ms to reach its exact or coalesced chart target. ${JSON.stringify(latency)}`)
     const extensions = requests.extensions.filter(record => record.completedAt !== null && record.startedAt >= timeOrigin + inputs[0])
     const first = extensions[0]
     assert.ok(first, 'Backend reserve preparation must extend the delivered history during the gesture.')
@@ -898,9 +963,9 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture, { o
     return {
       foregroundWindow: foreground?.native, environment: foreground?.environment, idleFrameCadence: foreground?.idleFrameCadence,
       timingScope: offscreen
-        ? { presentation: 'offscreen', wallTime: 'input-to-paint values are diagnostics; no native display deadline is inferred', frames: 'all paint and pending-frame assertions remain enforced' }
-        : { presentation: 'native foreground', wallTime: '100 ms latest-input-to-paint deadline enforced', frames: 'all paint and pending-frame assertions remain enforced' },
-      nativePaintMeasured: false, foregroundPaintOpportunityMeasured: !offscreen,
+        ? { presentation: 'offscreen', wallTime: 'input-to-renderer-RAF values are diagnostics; no native display deadline is inferred', frames: 'all renderer RAF and pending-frame assertions remain enforced' }
+        : { presentation: 'native foreground', wallTime: '100 ms maximum intent-to-renderer-RAF deadline enforced', frames: 'all renderer RAF and pending-frame assertions remain enforced' },
+      nativePaintMeasured: false, foregroundRafObservationMeasured: !offscreen,
       initialHistoryBars, initialHistoryFirst: admitted.first, historicalDelayMS, continuousWheelFrames: frames,
       scrolledCandles: frames * candlesPerFrame, crossedInitialBoundary: true,
       runwayAtRequest, deliveredHistoryBars: first.bars, observedHistoryDeliveryMS: observedDeliveryMS,
@@ -936,6 +1001,230 @@ export async function measureOffscreenColdBoundary(electron, page, options = {})
     presentation: 'protected hidden offscreen renderer; native compositor paint is not measured' }
 }
 
+// Exercise one complete 96-slot viewport that has no durable candles. Input
+// continues while its source request is delayed; the later reverse gesture
+// must remain the cursor that eventually resolves. A second run fails that
+// source page and checks that the UI does not claim the absent range completed.
+export async function measureOffscreenMissingWindow(electron, page, { timeframe = '15m', failSource = false } = {}) {
+  const native = await electron.evaluate(({ BrowserWindow }) => {
+    const window = BrowserWindow.getAllWindows()[0]
+    return { visible: window.isVisible(), focused: window.isFocused(), offscreen: window.webContents.isOffscreen() }
+  })
+  assert.deepEqual(native, { visible: false, focused: false, offscreen: true }, 'Cold missing-window measurement requires the protected hidden offscreen window.')
+  const probe = value => electron.evaluate((_, value) => globalThis.__marketBackend.probe(value), value)
+  const fixture = await probe({ action: 'coldBoundaryInstall', timeframe, scenario: 'full-missing-window', sourceDelayMS: 1_800, failNearestCandles: failSource })
+  let probeInstalled = false, paintStarted = false
+  try {
+    const initialRows = await electron.evaluate((_, fixture) => globalThis.__marketBackend.request({ e2e: {
+      action: 'readCandles', instrument: fixture.instId, timeframe: fixture.timeframe,
+      from: fixture.targetWindowStart, through: fixture.targetEnd,
+    } }), fixture)
+    assert.equal(initialRows.length, 0, 'All 96 target candle slots must be absent from SQLite before the gesture.')
+    await installRequestProbe(electron, fixture.instId)
+    probeInstalled = true
+    await openChart(page, fixture)
+    await startPaintProbe(page, fixture, { indicatorValidation: 'deferred-canonical' })
+    paintStarted = true
+
+    const firstInputs = await wheelBurst(page, { deltaY: fixture.targetDistance * 12 })
+    const deadline = Date.now() + 10_000
+    let sourceSnapshot, nearest
+    do {
+      sourceSnapshot = await probe({ action: 'coldBoundaryRead' })
+      nearest = sourceSnapshot.requests.find(request => request.source === 'candles'
+        && request.from <= fixture.targetEnd && request.through >= fixture.targetWindowStart)
+      if (nearest) break
+      assert.ok(Date.now() < deadline, `The completely absent viewport did not start native source acquisition: ${JSON.stringify(sourceSnapshot)}`)
+      await new Promise(resolve => setTimeout(resolve, 20))
+    } while (true)
+    assert.equal(nearest.held, false, 'The nearest source page must be the active delayed or failed request, not farther speculative work.')
+    assert.equal(nearest.completedAt, null)
+    assert.equal(nearest.failedAt, null)
+
+    const firstState = await readColdWindowState(page, fixture.instId)
+    assert.equal(firstState.loading, true, 'The renderer must expose a pending request while the absent window is unresolved.')
+    assert.equal(firstState.requestedEnd, fixture.targetEnd)
+    assert.notEqual(firstState.renderedEnd, fixture.targetEnd, 'The old SVG must not be labeled as the missing requested window.')
+
+    const continuation = await wheelBurst(page, { frames: 6, deltaY: 72 })
+    const reversal = await wheelBurst(page, { frames: 4, deltaY: -72 })
+    const latestDistance = fixture.targetDistance + 12
+    const latestEnd = fixture.end - latestDistance * fixture.intervalMS
+    const latestInputs = [...firstInputs, ...continuation, ...reversal]
+    const latestTargets = [fixture.targetEnd,
+      ...continuation.map((_, index) => fixture.end - (fixture.targetDistance + (index + 1) * 6) * fixture.intervalMS),
+      ...reversal.map((_, index) => fixture.end - (fixture.targetDistance + 36 - (index + 1) * 6) * fixture.intervalMS)]
+    assert.equal(latestTargets.at(-1), latestEnd)
+    await page.waitForFunction(({ instId, end }) => Number(document.querySelector(`[data-chart-inst="${instId}"]`)?.dataset.chartRequestedEnd) === end,
+      { instId: fixture.instId, end: latestEnd }, { timeout: 5000 })
+    const latestState = await readColdWindowState(page, fixture.instId)
+    assert.equal(latestState.requestedEnd, latestEnd, 'The reverse gesture must update the pending target to the latest intent.')
+    assert.notEqual(latestState.renderedEnd, latestEnd, 'The missing window must remain visibly pending before source resolution.')
+    sourceSnapshot = await probe({ action: 'coldBoundaryRead' })
+    nearest = sourceSnapshot.requests.find(request => request.source === 'candles'
+      && request.from <= fixture.targetEnd && request.through >= fixture.targetWindowStart)
+    assert.equal(nearest.completedAt, null, 'The delayed request must remain active through continuing and reversed input.')
+    assert.equal(nearest.failedAt, null, 'A configured delayed source failure must occur after continuing and reversed input.')
+
+    let latency = null
+    if (failSource) {
+      const failedDeadline = Date.now() + 10_000
+      while (!nearest.failedAt) {
+        assert.ok(Date.now() < failedDeadline, `The configured source failure did not surface: ${JSON.stringify(sourceSnapshot)}`)
+        await new Promise(resolve => setTimeout(resolve, 20))
+        sourceSnapshot = await probe({ action: 'coldBoundaryRead' })
+        nearest = sourceSnapshot.requests.find(request => request.source === 'candles'
+          && request.from <= fixture.targetEnd && request.through >= fixture.targetWindowStart)
+      }
+      await page.waitForFunction(({ instId, latestEnd }) => {
+        const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+        const alert = document.querySelector('[role="alert"]')?.textContent ?? ''
+        return Number(chart?.dataset.chartRequestedEnd) === latestEnd && /price history failed/i.test(alert)
+      }, { instId: fixture.instId, latestEnd }, { timeout: 5_000 }).catch(async error => {
+        throw new Error(`A failed cold source must remain a truthful chart error. State: ${JSON.stringify(await readColdWindowState(page, fixture.instId))}`, { cause: error })
+      })
+      const failedState = await readColdWindowState(page, fixture.instId)
+      assert.equal(failedState.requestedEnd, latestEnd)
+      assert.notEqual(failedState.completedEnd, latestEnd, 'A failed page must not publish the missing target as complete.')
+      assert.match(failedState.alert, /price history failed/i)
+      assert.ok(nearest.failedAt - nearest.startedAt >= fixture.sourceDelayMS,
+        'The configured failed price source must remain delayed for the full interval.')
+    } else {
+      await waitForRendered(page, fixture, timeframe, latestEnd)
+      await page.waitForFunction(instId => {
+        const snapshot = document.querySelector(`[data-chart-inst="${instId}"]`)?.__chartSnapshot
+        return ['ready', 'unavailable'].includes(snapshot?.indicatorState) && snapshot.bars.every(bar => bar.indicatorsObserved)
+      }, fixture.instId, { timeout: 10_000 })
+      latency = await measurePaintLatency(page, { inputs: latestInputs, targets: latestTargets, requireForeground: false })
+      const recoveredState = await readColdWindowState(page, fixture.instId)
+      assert.equal(recoveredState.renderedEnd, latestEnd)
+      assert.equal(recoveredState.completedEnd, latestEnd)
+      assert.equal(recoveredState.loading, false)
+      assert.equal(recoveredState.candleState, 'ready')
+      assert.equal(recoveredState.incomplete, true, 'The target remains explicitly incomplete while optional OI/Taker source pages are held.')
+      assert.equal(recoveredState.statisticsState, 'loading')
+      assert.ok(['loading', 'unavailable'].includes(recoveredState.oiState) && ['loading', 'unavailable'].includes(recoveredState.takerState),
+        `Statistics readiness must reflect the held sources: ${JSON.stringify(recoveredState)}`)
+    }
+
+    sourceSnapshot = await probe({ action: 'coldBoundaryRead' })
+    nearest = sourceSnapshot.requests.find(request => request.source === 'candles'
+      && request.from <= fixture.targetEnd && request.through >= fixture.targetWindowStart)
+    const finishedAt = failSource ? nearest.failedAt : nearest.completedAt
+    assert.ok(Number.isFinite(finishedAt) && finishedAt - nearest.startedAt >= fixture.sourceDelayMS,
+      'The configured price source must remain delayed for the full interval before success or failure.')
+    const heldStatistics = sourceSnapshot.requests.filter(request => request.source !== 'candles'
+      && request.held && request.completedAt === null)
+    if (!failSource) assert.ok(heldStatistics.length, 'The ready price window must remain explicitly incomplete while OI/Taker source pages are held.')
+
+    const finalWindow = await readColdWindowState(page, fixture.instId)
+    const observedFieldOracle = await assertColdCanonicalViewport(electron, page, fixture, finalWindow.renderedEnd)
+    assert.equal(finalWindow.indicatorState, observedFieldOracle.expectedIndicatorState,
+      'Indicator readiness must describe the available SQLite prefix, including its real warmup boundary.')
+    const paint = await finishPaintProbe(page)
+    paintStarted = false
+    assertCompletePaints(paint)
+    const requests = await readRequestProbe(electron)
+    assert.ok(requests.maxHistoricalActive <= 2, `Cold acquisition exceeded the two historical read lanes: ${JSON.stringify(requests)}`)
+    assert.equal(requests.legacyWindowCalls, 0)
+    const sourceKeys = sourceSnapshot.requests.map(request => `${request.source}:${request.from}:${request.through}`)
+    const duplicatePages = sourceKeys.length - new Set(sourceKeys).size
+    assert.ok(sourceSnapshot.requests.length <= 8, `A single cold viewport admitted too many source requests: ${JSON.stringify(sourceSnapshot.requests)}`)
+    assert.ok(duplicatePages <= (failSource ? 1 : 0), `The same cold source page was requested repeatedly: ${JSON.stringify(sourceSnapshot.requests)}`)
+    return { scenario: 'full-missing-window', observedFieldOracle, initiallyMissingCandles: fixture.initiallyMissingViewportBars,
+      initiallyPresentCandles: initialRows.length,
+      latestIntentPreserved: failSource ? latestState.requestedEnd === latestEnd : true,
+      sourceFailure: failSource ? nearest.error : null, sourceDelayMS: fixture.sourceDelayMS,
+      sourceRequests: sourceSnapshot.requests.length, duplicateSourcePages: duplicatePages,
+      heldSourceRequests: sourceSnapshot.requests.filter(request => request.held && request.completedAt === null).length,
+      heldStatisticsRequests: heldStatistics.length,
+      maximumActiveSourceRequests: sourceSnapshot.maxActive,
+      boundedHistoricalReads: requests.maxHistoricalActive <= 2, failedSourceDidNotClaimCompletion: failSource,
+      exactInputAccounting: latency ? { intents: latestInputs.length, committed: latency.committedInputs,
+        superseded: latency.supersededInputs, maximumIntentToRafSampleMS: latency.maxInputToRafSampleMS,
+        allIntentsAccounted: latency.unaccountedInputs.length === 0 } : null,
+      nativePaintMeasured: false, rendererRafSamples: paint.frames, ...paint }
+  } finally {
+    if (paintStarted) await finishPaintProbe(page)
+    if (probeInstalled) { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
+    await probe({ action: 'coldBoundaryRemove' })
+  }
+}
+
+async function readColdWindowState(page, instId) {
+  return page.locator(`[data-chart-inst="${instId}"]`).evaluate(chart => {
+    const svg = chart.querySelector('svg[data-rendered-inst]')
+    return { loading: chart.dataset.chartLoading === 'true', incomplete: chart.dataset.chartIncomplete === 'true',
+      requestedEnd: Number(chart.dataset.chartRequestedEnd), completedEnd: Number(chart.dataset.chartCompletedEnd),
+      renderedEnd: Number(svg?.dataset.renderedEnd), candleState: chart.dataset.chartCandleState,
+      statisticsState: chart.dataset.chartStatisticsState, oiState: chart.dataset.chartOiState,
+      takerState: chart.dataset.chartTakerState,
+      indicatorState: chart.querySelector('[data-chart-status]')?.dataset.chartIndicatorState ?? null,
+      alert: document.querySelector('[role="alert"]')?.textContent ?? '' }
+  })
+}
+
+async function assertColdCanonicalViewport(electron, page, fixture, endHour) {
+  const timeframe = fixture.timeframe
+  const recovered = await page.locator(`[data-chart-inst="${fixture.instId}"]`).evaluate(chart => {
+    const snapshot = chart.__chartSnapshot
+    return { endHour: snapshot?.endHour, bars: (chart.__chartRenderedBars ?? snapshot?.bars ?? []).map(bar => ({
+      ...bar,
+      oiObserved: bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1),
+      takerObserved: bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2),
+    })) }
+  })
+  assert.equal(recovered.endHour, endHour)
+  assert.equal(recovered.bars.length, 96)
+  // The cold fixture's full provider history is intentionally not all present
+  // in SQLite. Build this oracle from every candle actually available after
+  // the nearest page is committed, so recursive seeds and missing-period
+  // resets match the canonical input the product can replay at this point.
+  const canonicalCandles = await electron.evaluate((_, fixture) => globalThis.__marketBackend.request({ e2e: {
+    action: 'readCandles', instrument: fixture.instId, timeframe: fixture.timeframe,
+    from: fixture.start, through: fixture.end,
+  } }), fixture)
+  assert.ok(canonicalCandles.length > 0, `The cold ${timeframe} canonical SQLite prefix must be readable.`)
+  const oracle = new Map(barsWithIndicators(canonicalCandles, fixture.intervalMS).map(bar => [bar.hour, bar]))
+  const priceFields = ['open', 'high', 'low', 'close'], indicatorFieldsObserved = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower',
+    'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
+  let observedIndicatorBars = 0, observedOIBars = 0, observedTakerBars = 0
+  const assertCanonical = (actual, expected, field) => {
+    if (expected[field] === null) {
+      assert.equal(actual, null, `${timeframe} ${expected.hour} ${field} must match the canonical undefined value.`)
+      return
+    }
+    assert.equal(typeof actual, 'number', `${timeframe} ${expected.hour} ${field} must be observed as a number.`)
+    assert.ok(Number.isFinite(actual) && Math.abs(actual - expected[field]) <= Math.max(1, Math.abs(expected[field])) * 1e-10,
+      `${timeframe} ${expected.hour} ${field}: expected canonical ${expected[field]}, got ${actual}.`)
+  }
+  for (const bar of recovered.bars) {
+    const expected = oracle.get(bar.hour)
+    assert.ok(expected, `No canonical SQLite-derived ${timeframe} bar exists for ${bar.hour}.`)
+    for (const field of priceFields) assertCanonical(bar[field], expected, field)
+    if (bar.indicatorsObserved) {
+      observedIndicatorBars += 1
+      for (const field of indicatorFieldsObserved) assertCanonical(bar[field], expected, field)
+    } else {
+      assert.fail(`${timeframe} ${bar.hour} did not finish its local canonical indicator calculation.`)
+      for (const field of indicatorFieldsObserved) assert.equal(bar[field], null,
+        `${timeframe} ${bar.hour} must not retain an old ${field} curve while that indicator is unobserved.`)
+    }
+    if (bar.oiObserved) { observedOIBars += 1; assertCanonical(bar.oi, expected, 'oi') }
+    else assert.equal(bar.oi, null, `${timeframe} ${bar.hour} must keep unobserved OI explicitly missing.`)
+    if (bar.takerObserved) {
+      observedTakerBars += 1
+      assertCanonical(bar.buy, expected, 'buy'); assertCanonical(bar.sell, expected, 'sell')
+    } else {
+      assert.equal(bar.buy, null, `${timeframe} ${bar.hour} must keep unobserved taker buys explicitly missing.`)
+      assert.equal(bar.sell, null, `${timeframe} ${bar.hour} must keep unobserved taker sells explicitly missing.`)
+    }
+  }
+  const expectedIndicatorState = recovered.bars.every(bar => indicatorFieldsObserved.every(field => Number.isFinite(oracle.get(bar.hour)?.[field]))) ? 'ready' : 'unavailable'
+  return { priceBars: recovered.bars.length, indicatorBars: observedIndicatorBars, oiBars: observedOIBars, takerBars: observedTakerBars, expectedIndicatorState,
+    checksCanonicalValues: true, unobservedFieldsRemainNull: true }
+}
+
 async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen = false } = {}) {
   const probe = value => electron.evaluate((_, value) => globalThis.__marketBackend.probe(value), value)
   const fixture = await probe({ action: 'coldBoundaryInstall', timeframe })
@@ -954,7 +1243,7 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
       await cdp.send('Performance.enable')
       beforeMetrics = Object.fromEntries((await cdp.send('Performance.getMetrics')).metrics.map(metric => [metric.name, metric.value]))
     }
-    await startPaintProbe(page, fixture, { verifyIndicatorValues: false })
+    await startPaintProbe(page, fixture, { indicatorValidation: 'finite' })
     paintStarted = true
     const approachDistance = fixture.initialHistoryBars - 96 - 256
     const approachInputs = await wheelBurst(page, { deltaY: approachDistance * 12 })
@@ -970,7 +1259,7 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
       await new Promise(resolve => setTimeout(resolve, 20))
     } while (true)
     const inputs = await wheelBurst(page, { deltaY: (fixture.targetDistance - approachDistance) * 12 })
-    await waitForPresentedTarget(page, fixture, timeframe, fixture.targetEnd)
+    await waitForTargetSnapshot(page, fixture, timeframe, fixture.targetEnd)
     const initialTarget = await page.locator(`[data-chart-inst="${fixture.instId}"]`).evaluate(chart => ({
       loading: chart.dataset.chartLoading === 'true', incomplete: chart.dataset.chartIncomplete === 'true',
       renderedBars: Number(chart.dataset.chartRenderedBars), end: Number(chart.dataset.chartCompletedEnd),
@@ -985,61 +1274,9 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
         && snapshot.bars.every(bar => indicatorFields.every(field => Number.isFinite(bar[field])))
         && missing && missing.oi === null && missing.buy === null && missing.sell === null
     }, { targetEnd: fixture.targetEnd, firstMissingEnd: fixture.firstMissingEnd, indicatorFields }, { timeout: 10_000 })
-    const recovered = await page.locator(`[data-chart-inst="${fixture.instId}"]`).evaluate(chart => {
-      const snapshot = chart.__chartSnapshot
-      return { endHour: snapshot?.endHour, bars: (chart.__chartRenderedBars ?? snapshot?.bars ?? []).map(bar => ({
-        ...bar,
-        oiObserved: bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1),
-        takerObserved: bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2),
-      })) }
-    })
-    assert.equal(recovered.endHour, fixture.targetEnd)
-    assert.equal(recovered.bars.length, 96)
-    // The cold fixture's full provider history is intentionally not all present
-    // in SQLite. Build this oracle from every candle actually available after
-    // the nearest page is committed, so recursive seeds and missing-period
-    // resets match the canonical input the product can replay at this point.
-    const canonicalCandles = await electron.evaluate((_, fixture) => globalThis.__marketBackend.request({ e2e: {
-      action: 'readCandles', instrument: fixture.instId, timeframe: fixture.timeframe,
-      from: fixture.start, through: fixture.end,
-    } }), fixture)
-    assert.ok(canonicalCandles.length > 0, `The cold ${timeframe} canonical SQLite prefix must be readable.`)
-    const oracle = new Map(barsWithIndicators(canonicalCandles, fixture.intervalMS).map(bar => [bar.hour, bar]))
-    const priceFields = ['open', 'high', 'low', 'close'], indicatorFieldsObserved = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower',
-      'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
-    let observedIndicatorBars = 0, observedOIBars = 0, observedTakerBars = 0
-    const assertCanonical = (actual, expected, field) => {
-      if (expected[field] === null) {
-        assert.equal(actual, null, `${timeframe} ${expected.hour} ${field} must match the canonical undefined value.`)
-        return
-      }
-      assert.equal(typeof actual, 'number', `${timeframe} ${expected.hour} ${field} must be observed as a number.`)
-      assert.ok(Number.isFinite(actual) && Math.abs(actual - expected[field]) <= Math.max(1, Math.abs(expected[field])) * 1e-10,
-        `${timeframe} ${expected.hour} ${field}: expected canonical ${expected[field]}, got ${actual}.`)
-    }
-    for (const bar of recovered.bars) {
-      const expected = oracle.get(bar.hour)
-      assert.ok(expected, `No canonical SQLite-derived ${timeframe} bar exists for ${bar.hour}.`)
-      for (const field of priceFields) assertCanonical(bar[field], expected, field)
-      if (bar.indicatorsObserved) {
-        observedIndicatorBars += 1
-        for (const field of indicatorFieldsObserved) assertCanonical(bar[field], expected, field)
-      } else {
-        for (const field of indicatorFieldsObserved) assert.equal(bar[field], null,
-          `${timeframe} ${bar.hour} must not retain an old ${field} curve while that indicator is unobserved.`)
-      }
-      if (bar.oiObserved) { observedOIBars += 1; assertCanonical(bar.oi, expected, 'oi') }
-      else assert.equal(bar.oi, null, `${timeframe} ${bar.hour} must keep unobserved OI explicitly missing.`)
-      if (bar.takerObserved) {
-        observedTakerBars += 1
-        assertCanonical(bar.buy, expected, 'buy'); assertCanonical(bar.sell, expected, 'sell')
-      } else {
-        assert.equal(bar.buy, null, `${timeframe} ${bar.hour} must keep unobserved taker buys explicitly missing.`)
-        assert.equal(bar.sell, null, `${timeframe} ${bar.hour} must keep unobserved taker sells explicitly missing.`)
-      }
-    }
+    const observedFieldOracle = await assertColdCanonicalViewport(electron, page, fixture, fixture.targetEnd)
     const latency = offscreen ? null : await measurePaintLatency(page, { inputs, targets: [fixture.targetEnd] })
-    if (latency) assert.ok(latency.latestInputToPaintMS < 100, `The freshly acquired nearest viewport took ${latency.latestInputToPaintMS} ms after its boundary gesture. ${JSON.stringify(latency)}`)
+    if (latency) assert.ok(latency.maxInputToRafSampleMS < 100, `A boundary intent took ${latency.maxInputToRafSampleMS} ms to reach its exact or coalesced chart target. ${JSON.stringify(latency)}`)
     sources = await probe({ action: 'coldBoundaryRead' })
     const nearest = sources.requests.find(request => request.source === 'candles' && request.through === fixture.firstMissingEnd)
     assert.ok(nearest?.completedAt !== null && nearest?.completedAt !== undefined,
@@ -1050,17 +1287,21 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
     const heldReserve = sources.requests.filter(request => request.source === 'candles' && request.held && request.completedAt === null)
     const heldStatistics = sources.requests.filter(request => request.source !== 'candles' && request.held && request.completedAt === null)
     assert.ok(sources.holding && heldReserve.length && heldStatistics.length,
-      'The target must paint while both the farther price reserve and optional statistics remain unresolved.')
+      'The target SVG snapshot must be available while both the farther price reserve and optional statistics remain unresolved.')
     const keys = sources.requests.map(request => `${request.source}:${request.from}:${request.through}`)
     assert.equal(new Set(keys).size, keys.length, `Concurrent consumers must reuse the same native source page: ${JSON.stringify(sources.requests)}`)
+    await page.waitForFunction(({ instId, timeframe, end }) => window.__chartPaintProbe?.commits.some(commit =>
+      commit.instId === instId && commit.timeframe === timeframe && commit.end === end && Number.isFinite(commit.rafSampledAt)),
+    { instId: fixture.instId, timeframe, end: fixture.targetEnd }, { timeout: 5000 })
     const paint = await finishPaintProbe(page)
     paintStarted = false
     assertCompletePaints(paint)
     const timeOrigin = await page.evaluate(() => performance.timeOrigin)
-    const targetPaint = paint.commits.find(commit => commit.end === fixture.targetEnd && (offscreen || commit.presentedAt !== null))
-    assert.ok(targetPaint, 'The target chart snapshot must reach the renderer probe.')
-    const nativePageToPaintMS = offscreen ? null : Number((timeOrigin + targetPaint.presentedAt - nearest.completedAt).toFixed(3))
-    if (nativePageToPaintMS !== null) assert.ok(nativePageToPaintMS < 1_000, `The nearest native page waited ${nativePageToPaintMS} ms to paint despite its complete prices and indicator warmup.`)
+    const targetCommit = paint.commits.find(commit => commit.end === fixture.targetEnd && commit.instId === fixture.instId
+      && commit.timeframe === timeframe && Number.isFinite(commit.rafSampledAt))
+    assert.ok(targetCommit, 'The target chart snapshot must reach a renderer RAF sample.')
+    const nativePageToRafSampleMS = offscreen ? null : Number((timeOrigin + targetCommit.rafSampledAt - nearest.completedAt).toFixed(3))
+    if (nativePageToRafSampleMS !== null) assert.ok(nativePageToRafSampleMS < 1_000, `The nearest native page waited ${nativePageToRafSampleMS} ms to reach a renderer RAF sample despite its complete prices and indicator warmup.`)
     const afterMetrics = cdp ? Object.fromEntries((await cdp.send('Performance.getMetrics')).metrics.map(metric => [metric.name, metric.value])) : null
     const offscreenObservation = afterMetrics ? {
       rendererTaskMS: Number(((afterMetrics.TaskDuration - beforeMetrics.TaskDuration) * 1000).toFixed(3)),
@@ -1069,14 +1310,13 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
     } : undefined
     return { timeframe, initialHistoryBars: fixture.initialHistoryBars, sourceDelayMS: fixture.sourceDelayMS,
       initiallyMissingCandles: 96 - before.length, nearestSourceCandles: Number(nearest.parameters.limit),
-      nativePaintMeasured: false, foregroundPaintOpportunityMeasured: !offscreen, rendererTargetObserved: true,
-      ...(nativePageToPaintMS === null ? {} : { nativePageToPaintMS }),
+      nativePaintMeasured: false, foregroundRafObservationMeasured: !offscreen, rendererTargetObserved: true,
+      ...(nativePageToRafSampleMS === null ? {} : { nativePageToRafSampleMS }),
       nativeSourceRequests: sources.requests.length, heldReservePages: heldReserve.length, heldStatisticsPages: heldStatistics.length,
-      targetPresentedWhilePending: initialTarget.loading,
-      targetPriceOrIndicatorIncompleteAtPresentation: initialTarget.incomplete,
-      observedFieldOracle: { priceBars: recovered.bars.length, indicatorBars: observedIndicatorBars,
-        oiBars: observedOIBars, takerBars: observedTakerBars, checksCanonicalValues: true, unobservedFieldsRemainNull: true },
-      ...(offscreen ? { targetObservedBeforeReserveAndStatistics: true } : { targetPaintedBeforeReserveAndStatistics: true }),
+      targetSnapshotShownWhilePending: initialTarget.loading,
+      targetPriceOrIndicatorIncompleteAtSnapshot: initialTarget.incomplete,
+      observedFieldOracle,
+      targetSnapshotObservedBeforeReserveAndStatistics: true,
       duplicateSourcePages: 0,
       ...(offscreenObservation ? { offscreenObservation } : {}),
       ...(latency ?? {}), ...paint, commits: paint.commits.length, approachInput: approachInputs[0] }

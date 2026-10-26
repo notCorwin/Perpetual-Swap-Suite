@@ -29,8 +29,11 @@ jobs:
         run: npm install --global npm@12.2.0
       - name: Install locked dependencies
         run: npm ci
-      - name: Build the renderer for the native source-to-SVG check
-        run: npm run build
+      - name: Build renderer and record artifact validity
+        shell: bash
+        run: |
+          mkdir -p artifacts/build
+          node scripts/build-artifact-reuse.mjs build --manifest artifacts/build/renderer.json -- npm run build 2>&1 | tee artifacts/build/renderer-build.log
       - name: Record public endpoint availability
         run: |
           mkdir -p artifacts
@@ -66,6 +69,7 @@ jobs:
           OKX_LIVE_TIMEOUT_MS: '120000'
         shell: bash
         run: |
+          node scripts/build-artifact-reuse.mjs verify --manifest artifacts/build/renderer.json
           set +e
           npm run sandbox -- command --allow-network --output artifacts/sandbox -- node scripts/okx-live-1h.mjs 2>&1 | tee artifacts/okx-integration.log
           history_status="${PIPESTATUS[0]}"
@@ -78,6 +82,7 @@ jobs:
         id: streams
         shell: bash
         run: |
+          node scripts/build-artifact-reuse.mjs verify --manifest artifacts/build/renderer.json
           set +e
           npm run sandbox -- command --allow-network --scenario okx-all-contract-streams --output artifacts/sandbox -- node scripts/okx-live-streams.mjs 2>&1 | tee artifacts/okx-streams.log
           streams_status="${PIPESTATUS[0]}"
@@ -89,6 +94,7 @@ jobs:
           OKX_LIVE_CHART_OUTPUT: artifacts/okx-live-chart
         shell: bash
         run: |
+          node scripts/build-artifact-reuse.mjs verify --manifest artifacts/build/renderer.json
           set +e
           npm run sandbox -- command --desktop --allow-network --scenario okx-live-chart --output artifacts/sandbox --require-category network --require-category database --require-category cpu --require-category io --require-category ipc --require-role electron-main --require-role renderer --require-role market-backend --require-role market-reader --require-role market-writer --require-role prepared-chart -- node scripts/okx-live-chart.mjs 2>&1 | tee artifacts/okx-chart.log
           chart_status="${PIPESTATUS[0]}"

@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { _electron } from 'playwright'
 import {
-  installRequestProbe, measureLatencyCoveredPrefetch, offscreenChartWindow, openChart, readRequestProbe, removeRequestProbe, resetRequestProbe,
+  installRequestProbe, measureLatencyCoveredPrefetch, measureOffscreenMissingWindow, offscreenChartWindow, openChart, readRequestProbe, removeRequestProbe, resetRequestProbe,
   separateSourceMaintenance, waitForLocalHistory, waitForRendered, wheelBurst,
 } from '../../scripts/chart-acceptance.mjs'
 
@@ -210,7 +210,29 @@ test('real resident reserve covers delayed history delivery before continuous in
   assert.equal(report.repeatedSourceDownloads, 0)
   context.diagnostic(JSON.stringify({ initialHistoryBars: report.initialHistoryBars, scrolledCandles: report.scrolledCandles,
     runwayAtRequest: report.runwayAtRequest, observedHistoryDeliveryMS: report.observedHistoryDeliveryMS,
-    minimumBars: report.minimumBars, pendingFrames: report.pendingFrames, latestInputToPaintOpportunityMS: report.latestInputToPaintMS,
+    minimumBars: report.minimumBars, pendingFrames: report.pendingFrames, latestInputToRafSampleMS: report.latestInputToRafSampleMS,
     nativePaintMeasured: report.nativePaintMeasured }))
   await writeFile(join(root, '.build/chart-prefetch-latency.json'), `${JSON.stringify(report, null, 2)}\n`)
+})
+
+test('a completely absent 96-candle viewport stays truthful through delayed acquisition, continuing input, and reversal', { timeout: 45_000 }, async context => {
+  const report = await measureOffscreenMissingWindow(electron, page)
+  assert.equal(report.initiallyMissingCandles, 96)
+  assert.equal(report.initiallyPresentCandles, 0)
+  assert.equal(report.latestIntentPreserved, true)
+  assert.equal(report.exactInputAccounting.allIntentsAccounted, true)
+  assert.ok(report.exactInputAccounting.intents > 1)
+  assert.equal(report.nativePaintMeasured, false)
+  context.diagnostic(JSON.stringify(report))
+})
+
+test('a delayed failure on a completely absent viewport remains an explicit pending chart error', { timeout: 45_000 }, async context => {
+  const report = await measureOffscreenMissingWindow(electron, page, { failSource: true })
+  assert.equal(report.initiallyMissingCandles, 96)
+  assert.equal(report.initiallyPresentCandles, 0)
+  assert.equal(report.failedSourceDidNotClaimCompletion, true)
+  assert.equal(report.latestIntentPreserved, true)
+  assert.match(report.sourceFailure, /configured cold-window source failure/i)
+  assert.equal(report.nativePaintMeasured, false)
+  context.diagnostic(JSON.stringify(report))
 })

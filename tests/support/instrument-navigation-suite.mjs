@@ -5,10 +5,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { _electron } from 'playwright'
+import { summarizeLatencySamples } from '../../scripts/chart-acceptance-metrics.mjs'
 import {
-  assertNavigationPaints, exerciseInstrumentNavigation, finishNavigationPaintProbe, installNavigationProbe,
+  assertNavigationFrames, exerciseInstrumentNavigation, finishNavigationFrameProbe, installNavigationProbe,
   measureNavigation, persistNavigationCatalog, removeNavigationProbe, selectionRequests,
-  startNavigationPaintProbe, startupNavigationReport,
+  startNavigationFrameProbe, startupNavigationReport,
 } from '../../scripts/instrument-navigation-acceptance.mjs'
 
 export function registerInstrumentNavigationTests({ presentation, prepareWindow }) {
@@ -33,7 +34,7 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
 
   before(async () => {
     await launch()
-    await installNavigationProbe(electron)
+    await installNavigationProbe(electron, { omitUniverseInstId: 'BTC-USDT-SWAP' })
     fixture = await page.evaluate(() => window.radarDesktop.request({ e2e: { action: 'seedInstrumentNavigationBenchmark' } }))
     assert.equal(fixture.instIds.length, 16, 'The navigation scenario must cover all sixteen native contracts.')
     assert.equal(fixture.timeframes.length, 3, 'The navigation scenario must cover all three native timeframes.')
@@ -51,20 +52,24 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
     }
   })
 
-  test('all sixteen native contracts switch by the next frame while old history remains blocked', { timeout: 120_000 }, async context => {
+  test('an unprepared selection acknowledges input before all sixteen prepared contracts switch by the next frame', { timeout: 120_000 }, async context => {
     context.diagnostic(`Presentation: ${JSON.stringify({ native: presentationState?.native, environment: presentationState?.environment, idleFrameCadence: presentationState?.idleFrameCadence })}`)
-    const report = await exerciseInstrumentNavigation(electron, page, fixture, { presentation })
+    const report = await exerciseInstrumentNavigation(electron, page, fixture, { presentation, unpreparedInstId: 'BTC-USDT-SWAP' })
+    assert.equal(report.unpreparedSelection.rendererFrameAvailableBeforeInput, false)
+    assert.equal(report.unpreparedSelection.hydratedFromLocalHistory, true)
     assert.equal(report.phases.length, 3)
     assert.equal(report.initialPreparation.readyFrameCount, fixture.instIds.length * 3)
     assert.equal(report.phases.every(phase => phase.distinctContracts === 16 && phase.rendererFrames.readyCount === 16), true)
-    assert.equal(report.heldHistory.lateWrongInstrumentPaints, 0)
+    assert.equal(report.heldHistory.lateWrongInstrumentCommits, 0)
     assert.deepEqual(report.violations, [])
     const inputs = report.phases.flatMap(phase => [phase.firstVisit, phase.mouseSwitch, phase.rapid, ...phase.keyboard,
       ...(phase.timeframeSwitch ? [phase.timeframeSwitch] : [])])
-    const percentile = (field, ratio) => inputs.map(input => input[field]).toSorted((left, right) => left - right)[Math.floor((inputs.length - 1) * ratio)]
+    const svg = summarizeLatencySamples(inputs.map(input => input.inputToSVGCommitMS))
+    const raf = summarizeLatencySamples(inputs.map(input => input.inputToNextRafSampleMS))
     context.diagnostic(`Navigation timing (${JSON.stringify(report.timingScope)}): ${JSON.stringify({ initialPreparation: report.initialPreparation, inputs: inputs.length,
-      svgP50MS: percentile('inputToSVGCommitMS', .5), svgP95MS: percentile('inputToSVGCommitMS', .95),
-      nextPaintP95MS: percentile('inputToNextPaintMS', .95), maximumFramesToCommit: Math.max(...inputs.map(input => input.framesToCommit)),
+      svgP50MS: svg.p50MS, svgP95MS: svg.p95MS, svgMaxMS: svg.maxMS,
+      nextRafSampleP95MS: raf.p95MS, nextRafSampleMaxMS: raf.maxMS, percentileMinimum: svg.p95SampleMinimum,
+      maximumFramesToCommit: Math.max(...inputs.map(input => input.framesToCommit)),
       selectionIPC: inputs.reduce((sum, input) => sum + input.selectionIPC, 0) })}`)
   })
 
@@ -112,13 +117,31 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
       maximumKeyboardMS: Math.max(...phase.keyboard.map(input => input.inputToSVGCommitMS)) })))}`)
   })
 
+  test('the prepared navigation verifier rejects fixture-known statistics marked unobserved', async () => {
+    await startNavigationFrameProbe(page, fixture)
+    await page.evaluate(async () => {
+      const chart = document.querySelector('[data-chart-inst]'), original = chart.__chartSnapshot
+      const descriptor = Object.getOwnPropertyDescriptor(chart, '__chartSnapshot')
+      try {
+        const missing = { ...original, oiState: 'unavailable', takerState: 'unavailable',
+          bars: original.bars.map(bar => ({ ...bar, oi: null, buy: null, sell: null,
+            oiObserved: false, takerObserved: false, statisticsObserved: false, statisticsSources: 0 })) }
+        Object.defineProperty(chart, '__chartSnapshot', { configurable: true, value: missing })
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+      } finally { Object.defineProperty(chart, '__chartSnapshot', descriptor) }
+    })
+    const report = await finishNavigationFrameProbe(page)
+    assert.ok(report.violations.some(value => /Fixture-known OI observation disappeared/.test(value)))
+    assert.ok(report.violations.some(value => /Fixture-known Taker observation disappeared/.test(value)))
+  })
+
   test('a market selected in the same task as a timeframe switch immediately uses the requested period', async context => {
     context.diagnostic(`Presentation: ${JSON.stringify({ native: presentationState?.native, environment: presentationState?.environment, idleFrameCadence: presentationState?.idleFrameCadence })}`)
     const current = await page.locator('svg[data-rendered-inst]').evaluate(svg => ({ instId: svg.dataset.renderedInst, timeframe: svg.dataset.renderedTimeframe }))
     const timeframe = fixture.timeframes.find(value => value !== current.timeframe)
     const instId = fixture.instIds.find(value => value !== current.instId)
     const activeSVG = await page.locator('svg[data-rendered-inst]').elementHandle()
-    await startNavigationPaintProbe(page, fixture)
+    await startNavigationFrameProbe(page, fixture)
     try {
       const result = await measureNavigation(page, () => page.evaluate(({ instId, timeframe }) => {
         const button = [...document.querySelectorAll('[aria-label="Chart timeframe"] button')].find(button => button.textContent.trim() === timeframe)
@@ -139,7 +162,7 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
         'Only the current SVG surface may remain mounted after an interleaved switch.')
     } finally {
       await activeSVG.dispose()
-      assertNavigationPaints(await finishNavigationPaintProbe(page))
+      assertNavigationFrames(await finishNavigationFrameProbe(page))
     }
   })
 }

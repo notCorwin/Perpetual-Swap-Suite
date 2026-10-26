@@ -4,6 +4,8 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: '23 3 * * *'
 
 permissions:
   contents: read
@@ -15,6 +17,7 @@ concurrency:
 jobs:
   validate:
     name: Lint, types, core, and Electron E2E
+    if: github.event_name != 'schedule'
     runs-on: macos-15
     timeout-minutes: 25
     steps:
@@ -38,30 +41,39 @@ jobs:
         run: node_modules/.bin/tsc -b
       - name: Test core behavior
         run: npm run test:core -- --output artifacts/sandbox
+      - name: Build renderer once and record reusable artifact validity
+        shell: bash
+        run: |
+          mkdir -p artifacts/build
+          node scripts/build-artifact-reuse.mjs build --manifest artifacts/build/renderer.json -- npm run build 2>&1 | tee artifacts/build/renderer-build.log
       - name: Test Electron with isolated fixtures
-        run: npm run test:e2e -- --output artifacts/sandbox
+        run: npm run test:e2e -- --reuse-build-manifest artifacts/build/renderer.json --output artifacts/sandbox
       - name: Probe native GPU capabilities and verify accelerated chart work when available
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         # Hosted runners may expose software rendering. The dedicated report
         # distinguishes confirmed unsupported hardware from a passed GPU check.
-        run: npm run test:gpu -- --output artifacts/sandbox
+        run: npm run test:gpu -- --reuse-build-manifest artifacts/build/renderer.json --output artifacts/sandbox
       - name: Verify workspace scaling and contrast
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         env:
           PERPETUAL_SWAP_UI_VISUAL_OUTPUT: artifacts/workspace-visual
-        run: npm run sandbox -- command --desktop --output artifacts/sandbox -- node scripts/workspace-visual-check.mjs
-      - name: Verify full-market intake under held statistics and archive writes
+        run: |
+          node scripts/build-artifact-reuse.mjs verify --manifest artifacts/build/renderer.json
+          npm run sandbox -- command --desktop --output artifacts/sandbox -- node scripts/workspace-visual-check.mjs
+      - name: Verify short full-market intake under held statistics and archive writes
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         env:
           PERPETUAL_SWAP_RESOURCE_REPORT: artifacts/market-resources.json
-        run: npm run sandbox -- command --foreground --output artifacts/sandbox -- node scripts/market-resource-benchmark.mjs
+        run: |
+          node scripts/build-artifact-reuse.mjs verify --manifest artifacts/build/renderer.json
+          npm run sandbox -- command --desktop --foreground --output artifacts/sandbox -- node scripts/market-resource-benchmark.mjs
       - name: Enforce paired operation recording overhead budgets
-        # This independent gate must still collect its own evidence when a
-        # preceding acceptance fails. Both failures remain fatal to validation.
+        # Keep this independent gate collecting its own evidence after an
+        # earlier acceptance failure. Its isolated pairs preserve the baseline.
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
-        # The harness owns isolated recording-disabled and enabled children.
-        # An outer recorder would invalidate its disabled baseline.
-        run: npm run benchmark:operations -- --output artifacts/operation-overhead
+        run: |
+          node scripts/build-artifact-reuse.mjs verify --manifest artifacts/build/renderer.json
+          npm run benchmark:operations -- --output artifacts/operation-overhead
       - name: Retain sandbox recordings and diagnostics
         if: always()
         uses: actions/upload-artifact@v7
@@ -73,6 +85,7 @@ jobs:
 
   chart-foreground:
     name: Native foreground chart and navigation timing
+    if: github.event_name != 'schedule'
     runs-on: macos-15
     timeout-minutes: 15
     steps:
@@ -98,8 +111,71 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  nightly-soak:
+    name: Scheduled extended market soak and Metal observer
+    if: github.event_name == 'schedule'
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: '.nvmrc'
+          cache: npm
+      - name: Use the supported npm version
+        run: npm install --global npm@12.2.0
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Build renderer and record reusable artifact validity
+        id: renderer-build
+        shell: bash
+        run: |
+          mkdir -p artifacts/build
+          node scripts/build-artifact-reuse.mjs build --manifest artifacts/build/renderer.json -- npm run build 2>&1 | tee artifacts/build/renderer-build.log
+      - name: Run the fixed-rate full-market soak
+        if: ${{ !cancelled() && steps.renderer-build.outcome == 'success' }}
+        env:
+          PERPETUAL_SWAP_RESOURCE_REPORT: artifacts/market-resources.json
+        run: |
+          node scripts/build-artifact-reuse.mjs verify --manifest artifacts/build/renderer.json
+          npm run sandbox -- command --desktop --foreground --output artifacts/sandbox -- node scripts/market-resource-benchmark.mjs --ticks 240 --cadence-ms 500
+      - name: Probe native Metal capability and collect observer measurements
+        id: metal-observer
+        if: ${{ !cancelled() && steps.renderer-build.outcome == 'success' }}
+        run: |
+          npm run benchmark:metal -- --output artifacts/metal-observer
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          const report = JSON.parse(readFileSync('artifacts/metal-observer/report.json', 'utf8'))
+          appendFileSync(process.env.GITHUB_OUTPUT, `outcome=${report.outcome}\n`)
+          if (report.outcome === 'unsupported') appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+            'Metal observer overhead: **skipped**, native Metal device unavailable; no overhead gate was executed.\n')
+          NODE
+      - name: Enforce native Metal observer overhead budgets
+        if: ${{ !cancelled() && steps.metal-observer.outcome == 'success' && steps.metal-observer.outputs.outcome != 'unsupported' }}
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict'
+          import { readFileSync } from 'node:fs'
+          const report = JSON.parse(readFileSync('artifacts/metal-observer/report.json', 'utf8'))
+          assert.equal(report.outcome, 'passed')
+          assert.equal(report.pairs.length, report.repeats)
+          assert.equal(report.assessment.passed, true)
+          NODE
+      - name: Retain nightly soak recordings and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-soak-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
   market-traffic:
-    name: Paired native foreground market traffic and input timing
+    name: Native foreground market traffic gates
+    if: github.event_name != 'schedule'
     runs-on: macos-15
     timeout-minutes: 15
     steps:
@@ -114,30 +190,23 @@ jobs:
         run: npm install --global npm@12.2.0
       - name: Install locked dependencies
         run: npm ci
-      - name: Prepare the clean pre-optimization source with identical dependencies
+      - name: Build current renderer and record artifact validity
         shell: bash
         run: |
-          baseline_revision=ab9cb551bd00252abf370a324fe17d1eeacd6db1
-          git fetch --no-tags --depth=1 origin "$baseline_revision"
-          git worktree add --detach .build/traffic-baseline-source "$baseline_revision"
-          ln -s "$GITHUB_WORKSPACE/node_modules" .build/traffic-baseline-source/node_modules
-          git diff --exit-code "$baseline_revision" HEAD -- package.json package-lock.json
-          npm --prefix .build/traffic-baseline-source run build
-      - name: Build the optimized renderer
-        run: npm run build
-      - name: Measure the original app on the same runner
-        run: npm run sandbox -- command --foreground --output .build/traffic-optimization/ci/sandbox-before -- node scripts/market-traffic-benchmark.mjs --app-root .build/traffic-baseline-source --foreground --output .build/traffic-optimization/ci/market-before.json
-      - name: Verify reduced traffic and paired renderer responsiveness
-        run: npm run sandbox -- command --foreground --output .build/traffic-optimization/ci/sandbox-after -- node scripts/market-traffic-benchmark.mjs --expect-optimized --foreground --baseline-report .build/traffic-optimization/ci/market-before.json --output .build/traffic-optimization/ci/market-after.json
-      - name: Retain paired traffic and timing diagnostics
+          mkdir -p artifacts/build
+          node scripts/build-artifact-reuse.mjs build --manifest artifacts/build/renderer.json -- npm run build 2>&1 | tee artifacts/build/renderer-build.log
+      - name: Enforce current-version absolute traffic and responsiveness gates
+        run: |
+          node scripts/build-artifact-reuse.mjs verify --manifest artifacts/build/renderer.json
+          npm run sandbox -- command --desktop --foreground --output artifacts/sandbox -- node scripts/market-traffic-benchmark.mjs --expect-optimized --foreground --output artifacts/market-traffic.json
+      - name: Retain current-version traffic and timing diagnostics
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: market-traffic-${{ github.sha }}
-          path: .build/traffic-optimization/ci/
-          include-hidden-files: true
+          name: market-traffic-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 14
 
   package-smoke:
     name: Package and smoke the macOS executable

@@ -526,7 +526,7 @@ for (const mode of ['gap', 'prepend']) test(`first historical acquisition preser
     const firstEMA = await page.evaluate(() => document.querySelector('[data-chart-inst]').__chartSnapshot.bars.at(-1).ema)
     if (mode === 'prepend') assert.ok(Math.abs(firstEMA - desired.at(-1).ema) > 1e-6,
       'The absent earlier prefix must actually change the recursive result, so retaining a stale curve cannot pass this test.')
-    await startPaintProbe(page, fixture, { requireMatureData: mode === 'gap', verifyIndicatorValues: mode === 'gap' })
+    await startPaintProbe(page, fixture, { requireMatureData: mode === 'gap', indicatorValidation: mode === 'gap' ? 'fixture' : 'finite' })
     const sourceCounts = { candles: 0, oi: 0, taker: 0 }
     const pageCounts = { candles: 0, oi: 0, taker: 0 }
     const complete = new Set()

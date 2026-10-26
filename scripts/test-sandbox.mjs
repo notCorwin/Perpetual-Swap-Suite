@@ -7,6 +7,7 @@ import { arch, platform } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { operationCategories, operationRequirementKey, operationReportHasFailures, writeOperationReport } from './operation-report.mjs'
+import { verifyBuildReuseManifest } from './build-artifact-reuse.mjs'
 import { requireForegroundTests } from '../electron/test-presentation.js'
 import { backgroundTestEnvironment, prepareTestElectron } from './electron-test-runtime.mjs'
 import { assertTestSpawn } from './electron-test-launch-register.mjs'
@@ -57,27 +58,32 @@ export function sandboxCoverage(mode, { allowEmpty = false, requireCategories = 
   return coverage
 }
 
-async function testFiles(directory, suffix) {
-  const files = (await readdir(join(projectRoot, directory))).filter(file => file.endsWith(suffix)).sort().map(file => join(directory, file))
+async function testFiles(directory, suffix, root = projectRoot) {
+  const files = (await readdir(join(root, directory))).filter(file => file.endsWith(suffix)).sort().map(file => join(directory, file))
   if (!files.length) throw new Error(`No ${suffix} tests found in ${directory}.`)
   return files
 }
-export async function sandboxCommands(mode, args = []) {
+export async function sandboxCommands(mode, args = [], { reuseBuildManifest, root = projectRoot } = {}) {
   if (mode === 'command') {
+    if (reuseBuildManifest) throw new Error('--reuse-build-manifest is supported only by build-backed test suites.')
     if (!args.length) throw new Error('command requires an executable after --.')
     // Use the project's supported runtime even when the shell resolves another
     // Node, and install recording before any application module is imported.
     return [basename(args[0]).replace(/\.exe$/, '') === 'node' || resolve(args[0]) === process.execPath ? node(args.slice(1)) : args]
   }
-  if (!['core', 'e2e', 'gpu', 'foreground', 'all'].includes(mode) || args.length) throw new Error('Usage: node scripts/test-sandbox.mjs core|e2e|gpu|foreground|all|command [--desktop] [--foreground] [--allow-network] [--gpu-trace] [--require-gpu] [--metal] [--require-gpu-hardware-timing] [--allow-empty] [--require-category CATEGORY] [--require-role ROLE] [--scenario LABEL] [--output PATH] [-- COMMAND ARGS...]')
+  if (!['core', 'e2e', 'gpu', 'foreground', 'all'].includes(mode) || args.length) throw new Error('Usage: node scripts/test-sandbox.mjs core|e2e|gpu|foreground|all|command [--desktop] [--foreground] [--allow-network] [--gpu-trace] [--require-gpu] [--metal] [--require-gpu-hardware-timing] [--allow-empty] [--require-category CATEGORY] [--require-role ROLE] [--scenario LABEL] [--output PATH] [--reuse-build-manifest PATH] [-- COMMAND ARGS...]')
+  if (reuseBuildManifest && !['e2e', 'gpu', 'foreground'].includes(mode)) {
+    throw new Error('--reuse-build-manifest is supported only by a single renderer-consuming suite: e2e, gpu, or foreground.')
+  }
   const commands = []
   // Each core file may own SQLite and indicator worker trees. Unbounded file
   // parallelism oversubscribes those workers and the real-Electron workload.
-  if (mode === 'core' || mode === 'all') commands.push(node(['--experimental-strip-types', '--test-concurrency=2', '--test', ...await testFiles('src', '.test.ts'), ...await testFiles('tests/core', '.test.mjs')]))
+  if (mode === 'core' || mode === 'all') commands.push(node(['--experimental-strip-types', '--test-concurrency=2', '--test', ...await testFiles('src', '.test.ts', root), ...await testFiles('tests/core', '.test.mjs', root)]))
   if (mode !== 'core') {
-    commands.push(npm(['run', 'build']))
-    if (mode !== 'gpu') commands.push(node(['--test-concurrency=1', '--test', ...await testFiles('tests/e2e', mode === 'foreground' ? '.foreground.mjs' : '.e2e.mjs')]))
-    if (mode === 'gpu' || mode === 'all') commands.push(node(['--test-concurrency=1', '--test', ...await testFiles('tests/e2e', '.gpu.mjs')]))
+    if (reuseBuildManifest) await verifyBuildReuseManifest({ root, manifestPath: reuseBuildManifest })
+    else commands.push(npm(['run', 'build']))
+    if (mode !== 'gpu') commands.push(node(['--test-concurrency=1', '--test', ...await testFiles('tests/e2e', mode === 'foreground' ? '.foreground.mjs' : '.e2e.mjs', root)]))
+    if (mode === 'gpu' || mode === 'all') commands.push(node(['--test-concurrency=1', '--test', ...await testFiles('tests/e2e', '.gpu.mjs', root)]))
   }
   return commands
 }
@@ -102,12 +108,12 @@ function execute(command, { environment, logPath, onChild }) {
 }
 
 export async function runSandbox({ mode = 'core', args = [], output, allowNetwork = false, gpuTrace = false, foreground = false, desktop = false,
-  allowEmpty = false, requireCategories = [], requireRoles = [], scenario = mode, graphicsPolicy, graphicsProvider } = {}) {
+  allowEmpty = false, requireCategories = [], requireRoles = [], scenario = mode, graphicsPolicy, graphicsProvider, reuseBuildManifest } = {}) {
   const presentation = foreground || mode === 'foreground' ? 'foreground' : 'background'
   if (presentation === 'foreground') requireForegroundTests({ ...process.env, PERPETUAL_SWAP_TEST_UI: presentation })
   const coverage = sandboxCoverage(mode, { allowEmpty, requireCategories, requireRoles, graphicsPolicy, graphicsProvider })
   if (typeof scenario !== 'string' || !scenario || scenario.length > 160) throw new Error('Scenario must be a nonempty label of at most 160 characters.')
-  const commands = await sandboxCommands(mode, args)
+  const commands = await sandboxCommands(mode, args, { reuseBuildManifest })
   // Prepare once before any command can import Playwright/Electron. Never ask
   // electron/index.js to download or resolve an unprotected runtime here.
   const guardedRuntime = presentation === 'background' && process.platform === 'darwin' && (['e2e', 'gpu', 'all'].includes(mode) || mode === 'command' && desktop)
@@ -188,7 +194,7 @@ export async function runSandbox({ mode = 'core', args = [], output, allowNetwor
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const input = process.argv.slice(2), mode = input.shift() ?? 'core'
-    let allowNetwork = false, gpuTrace = false, allowEmpty = false, foreground = false, desktop = false, output, scenario, graphicsPolicy, graphicsProvider
+    let allowNetwork = false, gpuTrace = false, allowEmpty = false, foreground = false, desktop = false, output, scenario, graphicsPolicy, graphicsProvider, reuseBuildManifest
     const requireCategories = [], requireRoles = []
     while (input.length && input[0] !== '--') {
       const flag = input.shift()
@@ -204,10 +210,11 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       else if (flag === '--require-role' && input.length) requireRoles.push(input.shift())
       else if (flag === '--scenario' && input.length) scenario = input.shift()
       else if (flag === '--output' && input.length) output = input.shift()
+      else if (flag === '--reuse-build-manifest' && input.length) reuseBuildManifest = input.shift()
       else throw new Error(`Unknown sandbox option: ${flag}`)
     }
     if (input[0] === '--') input.shift()
-    const result = await runSandbox({ mode, args: input, output, allowNetwork, gpuTrace, allowEmpty, foreground, desktop, requireCategories, requireRoles, graphicsPolicy, graphicsProvider, ...(scenario ? { scenario } : {}) })
+    const result = await runSandbox({ mode, args: input, output, allowNetwork, gpuTrace, allowEmpty, foreground, desktop, requireCategories, requireRoles, graphicsPolicy, graphicsProvider, reuseBuildManifest, ...(scenario ? { scenario } : {}) })
     process.exitCode = result.exitCode
   } catch (error) { console.error(error.stack ?? error.message); process.exitCode = 1 }
 }

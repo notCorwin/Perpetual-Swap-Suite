@@ -286,13 +286,19 @@ export async function createChartAcquisitionFixture(store, marketService, { time
 // source adapter, history scheduler and SQLite page writer. Only the latest
 // tail exists initially; older reserve pages and both optional sources can be
 // held independently after the nearest price page has arrived.
-export async function createChartColdBoundaryFixture(store, marketService, { timeframe = '15m' } = {}) {
-  if (!['5m', '15m', '1H'].includes(timeframe)) throw new TypeError('Invalid cold-boundary timeframe.')
-  const instId = `COLD-${timeframe.toUpperCase()}-USDT-SWAP`
+export async function createChartColdBoundaryFixture(store, marketService, {
+  timeframe = '15m', scenario = 'single-missing-boundary', sourceDelayMS = 100, failNearestCandles = false,
+} = {}) {
+  if (!['5m', '15m', '1H'].includes(timeframe) || !['single-missing-boundary', 'full-missing-window'].includes(scenario)
+    || !Number.isFinite(sourceDelayMS) || sourceDelayMS < 0 || typeof failNearestCandles !== 'boolean') throw new TypeError('Invalid cold-boundary fixture.')
+  const variant = scenario === 'full-missing-window' ? failNearestCandles ? 'EMPTY-FAIL' : 'EMPTY' : 'BOUNDARY'
+  const instId = `COLD-${variant}-${timeframe.toUpperCase()}-USDT-SWAP`
   const intervalMS = { '5m': FIVE_MINUTES, '15m': 3 * FIVE_MINUTES, '1H': HOUR }[timeframe]
-  const periods = 8192, initialHistoryBars = 1000, targetDistance = initialHistoryBars - 95, sourceDelayMS = 100
+  const periods = 8192, initialHistoryBars = scenario === 'full-missing-window' ? 512 : 1000
   const end = Math.floor(Date.now() / intervalMS) * intervalMS - intervalMS
+  const targetDistance = scenario === 'full-missing-window' ? initialHistoryBars + 1 : initialHistoryBars - 95
   const start = end - (periods - 1) * intervalMS, targetEnd = end - targetDistance * intervalMS
+  const targetWindowStart = targetEnd - 95 * intervalMS
   const firstMissingEnd = end - initialHistoryBars * intervalMS
   const rows = Array.from({ length: periods }, (_, index) => {
     const open = 130 + index * .009 + Math.sin(index / 19) * 1.1
@@ -306,7 +312,7 @@ export async function createChartColdBoundaryFixture(store, marketService, { tim
   const original = marketService.get.bind(marketService), requests = []
   let release
   const released = new Promise(resolve => { release = resolve })
-  let holding = true
+  let holding = true, active = 0, maxActive = 0
   marketService.get = async (path, parameters, signal, priority) => {
     if (parameters?.instId !== instId) return original(path, parameters, signal, priority)
     const source = path === '/market/history-candles' ? 'candles'
@@ -315,23 +321,33 @@ export async function createChartColdBoundaryFixture(store, marketService, { tim
     if (!source || (source === 'candles' ? parameters.bar : parameters.period) !== timeframe) return original(path, parameters, signal, priority)
     const through = source === 'candles' ? Number(parameters.after) - intervalMS : Number(parameters.end) - intervalMS
     const from = source === 'candles' ? through - (Number(parameters.limit) - 1) * intervalMS : Number(parameters.begin) + intervalMS
-    const held = source !== 'candles' || through < firstMissingEnd
+    const nearestSourceEnd = scenario === 'full-missing-window' ? targetEnd : firstMissingEnd
+    const held = source !== 'candles' || through < nearestSourceEnd
     const request = { source, path, parameters: { ...parameters }, from, through, priority, held: held && holding,
-      startedAt: Date.now(), completedAt: null }
+      startedAt: Date.now(), completedAt: null, failedAt: null, error: null }
     requests.push(request)
-    if (held && holding) await new Promise((resolve, reject) => {
-      const abort = () => { signal?.removeEventListener('abort', abort); reject(signal.reason ?? new Error('Cold-boundary request aborted.')) }
-      if (signal?.aborted) return abort()
-      signal?.addEventListener('abort', abort, { once: true })
-      released.then(() => { signal?.removeEventListener('abort', abort); resolve() })
-    })
-    await new Promise(resolve => setTimeout(resolve, sourceDelayMS))
-    signal?.throwIfAborted()
-    const page = rows.filter(row => row.timestamp >= from && row.timestamp <= through).reverse()
-    request.completedAt = Date.now()
-    return page.map(row => source === 'candles'
-      ? [row.timestamp, row.open, row.high, row.low, row.close, row.volume, row.baseVolume, row.quoteVolume, '1'].map(String)
-      : (source === 'oi' ? [row.timestamp, row.oi] : [row.timestamp, row.sell, row.buy]).map(String))
+    active += 1; maxActive = Math.max(maxActive, active)
+    try {
+      if (held && holding) await new Promise((resolve, reject) => {
+        const abort = () => { signal?.removeEventListener('abort', abort); reject(signal.reason ?? new Error('Cold-boundary request aborted.')) }
+        if (signal?.aborted) return abort()
+        signal?.addEventListener('abort', abort, { once: true })
+        released.then(() => { signal?.removeEventListener('abort', abort); resolve() })
+      })
+      await new Promise(resolve => setTimeout(resolve, sourceDelayMS))
+      signal?.throwIfAborted()
+      if (failNearestCandles && source === 'candles' && from <= targetEnd && through >= targetWindowStart) {
+        throw new Error('Configured cold-window source failure.')
+      }
+      const page = rows.filter(row => row.timestamp >= from && row.timestamp <= through).reverse()
+      request.completedAt = Date.now()
+      return page.map(row => source === 'candles'
+        ? [row.timestamp, row.open, row.high, row.low, row.close, row.volume, row.baseVolume, row.quoteVolume, '1'].map(String)
+        : (source === 'oi' ? [row.timestamp, row.oi] : [row.timestamp, row.sell, row.buy]).map(String))
+    } catch (error) {
+      request.failedAt = Date.now(); request.error = error instanceof Error ? error.message : String(error)
+      throw error
+    } finally { active -= 1 }
   }
   await persistNativeFixture(store, marketService, rows.slice(-initialHistoryBars))
   const instrument = { instId, instCategory: '1', settleCcy: 'USDT', state: 'live', ctVal: '0.1', ctValCcy: 'COLD', listTime: String(start) }
@@ -342,10 +358,11 @@ export async function createChartColdBoundaryFixture(store, marketService, { tim
   marketService.replaceCatalog([{ instrument, ticker, result: { eligible: true, turnover: 90_000_000, oiUSD: 8_000_000,
     spread: .01, depth: 300_000, slippage: .02 }, change24h: 5.2 }])
   marketService.error = ''; marketService.lastRefreshAt = Date.now()
-  const fixture = { instId, timeframe, timeframes: [timeframe], intervalMS, end, start, periods,
-    initialHistoryBars, targetDistance, targetEnd, firstMissingEnd, sourceDelayMS,
+  const fixture = { instId, timeframe, timeframes: [timeframe], intervalMS, end, start, periods, scenario,
+    initialHistoryBars, targetDistance, targetEnd, targetWindowStart, firstMissingEnd, sourceDelayMS, failNearestCandles,
+    initiallyMissingViewportBars: scenario === 'full-missing-window' ? 96 : 1,
     series: { [timeframe]: { intervalMS, start, end, bars: barsWithIndicators(rows, intervalMS) } } }
-  return { fixture, read: () => ({ holding, requests: requests.map(request => ({ ...request })) }),
+  return { fixture, read: () => ({ holding, active, maxActive, requests: requests.map(request => ({ ...request })) }),
     release: () => { holding = false; release() },
     remove: () => { holding = false; release(); marketService.get = original } }
 }

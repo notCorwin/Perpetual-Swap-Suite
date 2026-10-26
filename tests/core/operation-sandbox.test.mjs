@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 import { gzipSync } from 'node:zlib'
 import { encodeOperationJournal, operationJournalSuffix } from '../../electron/services/operation-journal.js'
+import { writeBuildReuseManifest } from '../../scripts/build-artifact-reuse.mjs'
 import { operationReportHasFailures, operationReportMarkdown, summarizeOperations } from '../../scripts/operation-report.mjs'
 import { sandboxCommands, sandboxCoverage } from '../../scripts/test-sandbox.mjs'
 
@@ -33,6 +34,35 @@ test('dedicated GPU discovery and policies cannot silently weaken or enter funct
   assert.ok(!functional.flat().some(value => value.endsWith('.gpu.mjs')))
   assert.ok(all.at(-1).some(value => value.endsWith('graphics.gpu.mjs')))
   assert.equal(all.filter(command => command.join(' ').includes('npm run build')).length, 1)
+})
+
+test('renderer suites reuse only a currently valid build manifest and reject stale renderer files', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'sandbox-build-reuse-'))
+  const manifestPath = '.build/renderer.json'
+  try {
+    await mkdir(join(root, 'src'), { recursive: true })
+    await mkdir(join(root, 'dist'), { recursive: true })
+    await mkdir(join(root, 'tests/e2e'), { recursive: true })
+    await writeFile(join(root, 'package.json'), '{"scripts":{"build":"vite build"}}\n')
+    await writeFile(join(root, 'package-lock.json'), '{"lockfileVersion":3}\n')
+    await writeFile(join(root, '.nvmrc'), '24.22.0\n')
+    await writeFile(join(root, 'src/entry.tsx'), 'export {}\n')
+    await writeFile(join(root, 'dist/index.html'), '<main></main>\n')
+    await writeFile(join(root, 'tests/e2e/fixture.e2e.mjs'), 'export {}\n')
+    await writeFile(join(root, 'tests/e2e/fixture.gpu.mjs'), 'export {}\n')
+    await writeBuildReuseManifest({ root, manifestPath })
+
+    const e2e = await sandboxCommands('e2e', [], { root, reuseBuildManifest: manifestPath })
+    const gpu = await sandboxCommands('gpu', [], { root, reuseBuildManifest: manifestPath })
+    assert.equal(e2e.length, 1, 'A valid manifest lets E2E consume the renderer build without a second build command.')
+    assert.equal(gpu.length, 1, 'A valid manifest lets GPU consume the same renderer build without a second build command.')
+    assert.ok(e2e[0].includes('tests/e2e/fixture.e2e.mjs'))
+    assert.ok(gpu[0].includes('tests/e2e/fixture.gpu.mjs'))
+    assert.ok(!e2e.flat().includes('build') && !gpu.flat().includes('build'))
+
+    await writeFile(join(root, 'dist/index.html'), '<main>changed</main>\n')
+    await assert.rejects(sandboxCommands('gpu', [], { root, reuseBuildManifest: manifestPath }), /output changed or is incomplete/)
+  } finally { await rm(root, { recursive: true, force: true }) }
 })
 async function recording(directory, records, { health = {}, raw = false, ending = '\n', suffix = '' } = {}) {
   const journal = raw ? records : lifecycle(records)
