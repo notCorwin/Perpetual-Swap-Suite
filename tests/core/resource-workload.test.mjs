@@ -47,3 +47,38 @@ test('failed ticks remain explicit and cancellation stops subsequent admission',
   assert.equal(load.snapshot().failed, 2)
   assert.ok(load.snapshot({ includeTicks: true }).ticks.every(row => row.error === 'injected intake failure'))
 })
+
+test('scheduled source timestamps stay on the monotonic epoch clock when wall time is adjusted', async context => {
+  const timers = clock()
+  let wallTime = 42
+  context.mock.method(Date, 'now', () => wallTime)
+  const load = startResourceWorkload({ ticks: 2, cadenceMS: 100, ...timers,
+    tick: () => ({ receivedAt: performance.timeOrigin + timers.now() }) })
+  await timers.advance(0)
+  wallTime += 30_000
+  await timers.advance(100)
+  const records = load.snapshot({ includeTicks: true }).ticks
+  assert.equal(load.snapshot().startedAt, performance.timeOrigin)
+  assert.deepEqual(records.map(row => row.receivedAt - row.plannedAt), [0, 0])
+  assert.equal(records[1].plannedAt - records[0].plannedAt, 100)
+})
+
+test('an early timer callback cannot emit an input before its declared schedule', async () => {
+  let time = 0
+  const callbacks = []
+  const load = startResourceWorkload({ ticks: 2, cadenceMS: 100, epoch: 1000, now: () => time,
+    schedule: (fn, delay) => { callbacks.push({ fn, delay }); return callbacks.length }, unschedule() {},
+    tick: () => ({ receivedAt: 1000 + time }) })
+  callbacks[0].fn()
+  for (let index = 0; index < 4; index++) await Promise.resolve()
+  time = 99.5
+  callbacks[1].fn()
+  assert.equal(load.snapshot().emitted, 1)
+  assert.equal(callbacks[2].delay, 1)
+  time = 100
+  callbacks[2].fn()
+  for (let index = 0; index < 4; index++) await Promise.resolve()
+  const rows = load.snapshot({ includeTicks: true }).ticks
+  assert.deepEqual(rows.map(row => row.emittedAt), [1000, 1100])
+  assert.ok(rows.every(row => row.plannedAt <= row.emittedAt && row.emittedAt <= row.receivedAt && row.receivedAt <= row.completedAt))
+})

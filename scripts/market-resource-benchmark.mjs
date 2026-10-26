@@ -21,6 +21,7 @@ const reportPath = resolve(root, process.env.PERPETUAL_SWAP_RESOURCE_REPORT ?? '
 const userData = await mkdtemp(join(tmpdir(), 'perp-market-resources-'))
 const report = { generatedAt: new Date().toISOString(), mode: 'real Electron renderer, worker backend and SQLite; synthetic native intake',
   nativePresentationMeasured: false, timing: 'Scheduled synthetic input to SVG commit and next RAF opportunity; no native compositor presentation.',
+  clock: 'Epoch-origin monotonic performance clocks for source schedule/receipt and renderer input/commit/RAF; 2 ms origin precision tolerance with raw clock deltas retained.',
   externalWebSocketTransportMeasured: false, externalNetworkMeasured: false, receiveToFrameBudgetMS: offscreen ? null : 100,
   samples: [], switches: [], history: [], memorySamples: [], viewIntents: [], outcome: 'running' }
 let electron, page, stopped = false
@@ -193,11 +194,12 @@ try {
   await page.waitForFunction(({ focus, timeframe }) => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.instId === focus && document.querySelector('[data-chart-inst]')?.__chartSnapshot?.timeframe === timeframe, { focus, timeframe })
   report.backgroundReady = await probe({ action: 'backgroundStart' })
   report.backgroundStarted = true
-  await page.evaluate(() => {
+  const loadInputAt = await page.evaluate(() => {
     window.__resourcePaint.frameGaps = []; window.__resourcePaint.previousFrame = null
     window.__armResourceScheduler()
+    return performance.timeOrigin + performance.now()
   })
-  report.viewIntents.push({ at: Date.now(), instId: focus, timeframe })
+  report.viewIntents.push({ at: loadInputAt, instId: focus, timeframe })
   report.loadStart = await probe({ action: 'scaleLoadStart', ticks, cadenceMS, focusInstId: focus, timeframe })
   const loadDeadline = performance.now() + ticks * cadenceMS + 20_000
   let load, nextMemorySample = 0
@@ -241,6 +243,8 @@ try {
     return { frames: gaps.length, medianMS: gaps[Math.floor((gaps.length - 1) * .5)], p95MS: gaps[Math.floor((gaps.length - 1) * .95)], maxMS: gaps.at(-1), visibilityState: document.visibilityState, focused: document.hasFocus() }
   })
   report.schedulerAfterTicks = await page.evaluate(() => window.__finishResourceScheduler())
+  assert.ok(load.ticks.every(tick => tick.nativeUpdates === fixture.instIds.length * fixture.timeframes.length),
+    'Every fixed-rate input must update the complete contract/timeframe universe before visible-series timing can acknowledge it.')
   report.delivery = summarizeResourceDelivery(load, commits, { intents: report.viewIntents })
   report.samples = report.delivery.samples
   assertResourceDeliveryBudget(report.delivery, report.receiveToFrameBudgetMS)
@@ -277,7 +281,8 @@ try {
         snapshot: snapshot ? { instId: snapshot.instId, timeframe: snapshot.timeframe, endHour: snapshot.endHour, generation: snapshot.generation, revision: snapshot.revision, bars: snapshot.bars.length, liveBar: snapshot.liveBar } : null,
         lastRecords: window.__resourcePaint?.records.slice(-12), violations: window.__resourcePaint?.violations }
     }) } catch {} }
-  throw error
+  console.error(error.stack ?? error.message)
+  process.exitCode = 1
 } finally {
   if (electron && !stopped) { try { report.final = await probe({ action: 'scaleStop' }) } catch {} }
   await mkdir(dirname(reportPath), { recursive: true })

@@ -56,7 +56,7 @@ export async function seedMarketResources(store, service, { count = 287, periods
   const tick = async ({ sequence = tickCount + 1, focusInstId = instIds[0], timeframe = '15m' } = {}) => {
     if (!Number.isSafeInteger(sequence) || sequence <= tickCount) throw new Error('Synthetic updates must advance monotonically.')
     tickCount = sequence
-    const receivedAt = Date.now(), updates = []
+    const receivedAt = performance.timeOrigin + performance.now(), updates = []
     let expected = null
     for (let index = 0; index < count; index += 1) {
       const instId = instIds[index], price = resourceCandle(index, '15m', periods, periods, asOf).close + sequence * 0.001

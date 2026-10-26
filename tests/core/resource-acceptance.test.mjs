@@ -33,12 +33,55 @@ test('a delayed input measures the viewport active when received while retaining
   assert.doesNotThrow(() => assertResourceDeliveryBudget(report))
 })
 
-test('source timestamps allow clock granularity but reject a reordered source chain', () => {
+test('source timestamps on one monotonic clock reject every reordered edge', () => {
   const input = load()
   input.ticks[0].emittedAt = input.ticks[0].receivedAt + 1
-  assert.doesNotThrow(() => summarizeResourceDelivery(input, [commit(1), commit(2), commit(3)]))
+  assert.throws(() => summarizeResourceDelivery(input, [commit(1), commit(2), commit(3)]), /ordered.*source timestamps/)
+  input.ticks[0].emittedAt = input.ticks[0].plannedAt - .1
+  assert.throws(() => summarizeResourceDelivery(input, [commit(1), commit(2), commit(3)]), /ordered.*source timestamps/)
+  input.ticks[0].emittedAt = input.ticks[0].plannedAt
   input.ticks[0].completedAt = input.ticks[0].receivedAt - 10
   assert.throws(() => summarizeResourceDelivery(input, [commit(1), commit(2), commit(3)]), /ordered.*source timestamps/)
+})
+
+test('cross-process origin precision retains raw deltas without turning a submillisecond offset into a negative latency', () => {
+  const records = [{ ...commit(1), committedAt: 101.5, nextFrameAt: 101.75 }, commit(2), commit(3)]
+  const report = summarizeResourceDelivery(load(), records)
+  assert.equal(report.samples[0].receiveToCommitClockDeltaMS, -.5)
+  assert.equal(report.samples[0].receiveToFrameClockDeltaMS, -.25)
+  assert.equal(report.samples[0].receiveToCommitMS, 0)
+  assert.equal(report.samples[0].receiveToFrameMS, 0)
+  assert.equal(report.crossProcessOriginToleranceMS, 2)
+  assert.throws(() => summarizeResourceDelivery(load(), [{ ...records[0], committedAt: 90, nextFrameAt: 120 }, commit(2), commit(3)]), /ordered receive\/commit\/RAF/)
+})
+
+test('a selection that supersedes the old viewport acknowledges the global market update in the new visible series', () => {
+  const report = summarizeResourceDelivery(load(), [commit(1), { ...commit(2), instId: 'ETH' }, { ...commit(3), instId: 'ETH' }], {
+    intents: [{ at: 0, instId: 'BTC', timeframe: '5m' }, { at: 206, instId: 'ETH', timeframe: '5m' }],
+  })
+  assert.equal(report.samples[1].instId, 'ETH')
+  assert.equal(report.samples[1].receiveToFrameMS, 18)
+  assert.doesNotThrow(() => assertResourceDeliveryBudget(report))
+})
+
+test('clock-ambiguous transitions to history stay measured instead of silently excluding a possibly live input', () => {
+  const report = summarizeResourceDelivery(load(), [commit(1), { ...commit(2), committedAt: 220, nextFrameAt: 230 }, commit(3)], {
+    intents: [{ at: 0, instId: 'BTC', timeframe: '5m' }, { at: 201, instId: 'BTC', timeframe: '5m', historical: true },
+      { at: 215, instId: 'BTC', timeframe: '5m', historical: false }],
+  })
+  assert.deepEqual(report.historicalViewportInputs, [])
+  assert.equal(report.viewportOriginAmbiguities[0].sequence, 2)
+  assert.equal(report.samples[1].receiveToFrameMS, 28)
+})
+
+test('a definitely historical viewport is an explicit exclusion bounded by the live-input minimum', () => {
+  const report = summarizeResourceDelivery(load(), [commit(1), commit(3)], {
+    intents: [{ at: 0, instId: 'BTC', timeframe: '5m' }, { at: 150, instId: 'BTC', timeframe: '5m', historical: true },
+      { at: 250, instId: 'BTC', timeframe: '5m', historical: false }],
+  })
+  assert.deepEqual(report.historicalViewportInputs, [2])
+  assert.deepEqual(report.viewportOriginAmbiguities, [])
+  assert.equal(report.count, 2)
 })
 test('missing output, omitted scheduled input and unfinished intake cannot pass', () => {
   assert.throws(() => summarizeResourceDelivery(load(), [commit(1)]), /never reached/)

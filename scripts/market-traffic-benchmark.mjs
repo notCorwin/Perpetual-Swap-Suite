@@ -539,7 +539,8 @@ try {
     } catch (reportError) { diagnostics.partialFailureReportError = reportError.message }
   }
   console.error(JSON.stringify(diagnostics, null, 2))
-  throw error
+  console.error(error.stack ?? error.message)
+  process.exitCode = 1
 } finally {
   cadence?.stop()
   if (electron) await electron.close()

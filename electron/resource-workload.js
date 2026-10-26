@@ -1,12 +1,12 @@
 /** Fixed-rate synthetic intake. Scheduling never waits for a renderer or tick. */
 export function startResourceWorkload({ ticks = 60, cadenceMS = 500, firstSequence = 1, tick,
-  now = () => performance.now(), epoch = Date.now(), schedule = setTimeout, unschedule = clearTimeout } = {}) {
+  now = () => performance.now(), epoch: configuredEpoch, schedule = setTimeout, unschedule = clearTimeout } = {}) {
   if (!Number.isSafeInteger(ticks) || ticks < 2 || ticks > 1200
     || !Number.isSafeInteger(cadenceMS) || cadenceMS < 20 || cadenceMS > 2000
     || !Number.isSafeInteger(firstSequence) || firstSequence < 1 || typeof tick !== 'function') {
     throw new Error('Invalid fixed-rate resource workload.')
   }
-  const origin = now(), records = [], pending = new Set()
+  const origin = now(), epoch = configuredEpoch ?? performance.timeOrigin + origin, records = [], pending = new Set()
   let timer, cancelled = false, emitted = 0, completed = 0, maxPending = 0, failed = 0, maxScheduleLatenessMS = 0
   const snapshot = ({ includeTicks = false } = {}) => ({
     state: cancelled ? 'cancelled' : emitted < ticks ? 'emitting' : pending.size ? 'draining' : failed ? 'failed' : 'complete',
@@ -18,7 +18,12 @@ export function startResourceWorkload({ ticks = 60, cadenceMS = 500, firstSequen
   })
   const emit = () => {
     if (cancelled) return
-    const index = emitted++, plannedMS = index * cadenceMS, emittedMS = now() - origin
+    const plannedMS = emitted * cadenceMS, emittedMS = now() - origin
+    if (emittedMS < plannedMS) {
+      timer = schedule(emit, Math.ceil(plannedMS - emittedMS))
+      return
+    }
+    const index = emitted++
     const record = { sequence: firstSequence + index, plannedAt: epoch + plannedMS,
       emittedAt: epoch + emittedMS, scheduleLatenessMS: Math.max(0, emittedMS - plannedMS), completedAt: null }
     maxScheduleLatenessMS = Math.max(maxScheduleLatenessMS, record.scheduleLatenessMS)
