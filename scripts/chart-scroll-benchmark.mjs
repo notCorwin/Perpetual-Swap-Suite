@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
 import { requireForegroundTests } from '../electron/test-presentation.js'
-import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureNativeColdBoundary, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from './chart-acceptance.mjs'
+import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureNativeColdBoundary, measureChartIntentLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from './chart-acceptance.mjs'
 
 requireForegroundTests()
 
@@ -62,7 +62,7 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
         distance += candles
         const end = fixture.end - distance * intervalMS
         await waitForRendered(page, fixture, timeframe, end)
-        const observation = await measurePaintLatency(page, { inputs, targets: inputs.map((_, index) => fixture.end - (startingDistance + candles / inputs.length * (index + 1)) * intervalMS) })
+        const observation = await measureChartIntentLatency(page, { inputs, targets: inputs.map((_, index) => fixture.end - (startingDistance + candles / inputs.length * (index + 1)) * intervalMS) })
         assert.ok(observation.maxInputToRafSampleMS < 100, `Warm ${timeframe} ${name} had an intent take ${observation.maxInputToRafSampleMS} ms to reach its exact or coalesced chart target.`)
         phases.push({
           name, frames: options.frames ?? 1, eventsPerFrame: options.eventsPerFrame ?? 1,

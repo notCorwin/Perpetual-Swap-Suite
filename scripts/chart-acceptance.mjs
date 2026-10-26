@@ -277,7 +277,7 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
     const probe = {
       instId, expectedTimeframe,
       active: true, frames: 0, pendingFrames: 0, paints: 0, minimumBars: Infinity, errors: [],
-      frameGaps: [], frameSamples: [], validationSamples: [], inputBursts: [], commits: [], pendingWindows: [], previousFrame: null, previousSnapshot: null, previousBars: null,
+      frameGaps: [], frameSamples: [], validationSamples: [], inputBursts: [], commits: [], requestCommits: [], pendingWindows: [], previousFrame: null, previousSnapshot: null, previousBars: null,
       phase: 'initial', quality: [], known: new Map(), geometry: new Map(),
       raf: null, observer: null, schedulerObservers: [],
       scheduler: { counts: {}, entries: [], supportedEntryTypes: PerformanceObserver.supportedEntryTypes },
@@ -314,6 +314,14 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       if (!snapshot || !svg) { fail('The current chart SVG disappeared.'); return }
       const { timeframe } = snapshot
       const bars = chart.__chartRenderedBars ?? snapshot.bars
+      const requestedEnd = Number(chart.dataset.chartRequestedEnd)
+      if (Number.isFinite(requestedEnd) && requestedEnd > 0) {
+        const previous = probe.requestCommits.at(-1)
+        if (!previous || previous.end !== requestedEnd || previous.instId !== snapshot.instId || previous.timeframe !== timeframe) {
+          probe.requestCommits.push({ at: sampledAt, rafSampledAt: frame ? sampledAt : null,
+            end: requestedEnd, instId: snapshot.instId, timeframe })
+        } else if (frame && previous.rafSampledAt === null) previous.rafSampledAt = sampledAt
+      }
       if (frame && chart.dataset.chartLoading === 'true' && probe.pendingWindows.length < 10) probe.pendingWindows.push({
         at: sampledAt, end: snapshot.endHour, requestedEnd: chart.dataset.chartRequestedEnd, generation: snapshot.generation,
         bars: bars?.length, indicatorState: snapshot.indicatorState, priceState: snapshot.priceState,
@@ -519,16 +527,18 @@ export async function wheelBurst(page, { frames = 1, eventsPerFrame = 1, deltaY 
   }, { frames, eventsPerFrame, deltaY, deltaX, deltaMode })
 }
 
-export async function measurePaintLatency(page, { inputs, targets, requireForeground = true }) {
+export async function measureChartIntentLatency(page, { inputs, targets, requireForeground = true, milestone = 'rendered-window' }) {
+  assert.ok(['rendered-window', 'requested-cursor'].includes(milestone), 'Unknown chart intent acknowledgment milestone.')
+  const commitKey = milestone === 'requested-cursor' ? 'requestCommits' : 'commits'
   const latestInput = inputs.at(-1)
   const expectedEnd = targets.at(-1)
-  await page.waitForFunction(({ latestInput, expectedEnd }) => window.__chartPaintProbe?.commits.some(commit =>
+  await page.waitForFunction(({ latestInput, expectedEnd, commitKey }) => window.__chartPaintProbe?.[commitKey].some(commit =>
     commit.end === expectedEnd && commit.instId === window.__chartPaintProbe.instId
     && commit.timeframe === window.__chartPaintProbe.expectedTimeframe
-    && commit.at >= latestInput && commit.rafSampledAt !== null), { latestInput, expectedEnd })
-  const observation = await page.evaluate(({ inputs, targets, requireForeground }) => {
+    && commit.at >= latestInput && commit.rafSampledAt !== null), { latestInput, expectedEnd, commitKey })
+  const observation = await page.evaluate(({ inputs, targets, requireForeground, commitKey }) => {
     if (requireForeground && (document.visibilityState !== 'visible' || !document.hasFocus())) throw new Error('Foreground renderer timing lost its visible, focused window.')
-    const probe = window.__chartPaintProbe, commits = probe.commits
+    const probe = window.__chartPaintProbe, commits = probe[commitKey]
     for (const { observer, record } of probe.schedulerObservers) record(observer.takeRecords())
     const bursts = inputs.map(input => probe.inputBursts.find(burst => burst.lastAt === input))
     if (bursts.some(burst => !burst)) throw new Error('Every measured wheel burst must include its first and final input timestamps.')
@@ -540,7 +550,7 @@ export async function measurePaintLatency(page, { inputs, targets, requireForegr
       frameSamples: probe.frameSamples.filter(sample => sample.at >= startedAt),
       validationSamples: probe.validationSamples.filter(sample => sample.at >= startedAt),
     }
-  }, { inputs, targets, requireForeground })
+  }, { inputs, targets, requireForeground, commitKey })
   const accounted = accountChartIntents(inputs.map((at, index) => ({ at, target: targets[index], instId: observation.instId, timeframe: observation.timeframe })), observation.commits)
   const latest = accounted.at(-1)
   if (!latest?.commit) throw new Error(`The latest chart intent ${targets.at(-1)} has no renderer RAF sample.`)
@@ -558,6 +568,7 @@ export async function measurePaintLatency(page, { inputs, targets, requireForegr
   const startedAt = observation.startedAt
   if (accounted.some(intent => intent.commit?.rafSampledAt > endAt)) throw new Error('The gesture report contains a chart sample after the latest target.')
   const report = {
+      milestone,
       documentVisibility: observation.visibility, documentFocused: observation.focused,
       scheduler: observation.scheduler.filter(entry => entry.startTime <= endAt),
       committedInputs: accounted.filter(intent => intent.status === 'committed').length,
@@ -931,7 +942,7 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture, { o
     const inputs = await wheelBurst(page, { frames, deltaY: 24 })
     const expectedEnd = fixture.end - frames * candlesPerFrame * fixture.intervalMS
     await waitForRendered(page, fixture, fixture.timeframe, expectedEnd)
-    const latency = await measurePaintLatency(page, {
+    const latency = await measureChartIntentLatency(page, {
       inputs, targets: inputs.map((_, index) => fixture.end - (index + 1) * candlesPerFrame * fixture.intervalMS), requireForeground: !offscreen,
     })
     const paint = await finishPaintProbe(page)
@@ -1008,12 +1019,13 @@ export async function measureOffscreenColdBoundary(electron, page, options = {})
 // continues while its source request is delayed; the later reverse gesture
 // must remain the cursor that eventually resolves. A second run fails that
 // source page and checks that the UI does not claim the absent range completed.
-export async function measureOffscreenMissingWindow(electron, page, { timeframe = '15m', failSource = false } = {}) {
+export async function measureMissingWindow(electron, page, { timeframe = '15m', failSource = false, offscreen = true } = {}) {
+  const foreground = offscreen ? null : await foregroundPaintWindow(electron, page)
   const native = await electron.evaluate(({ BrowserWindow }) => {
     const window = BrowserWindow.getAllWindows()[0]
     return { visible: window.isVisible(), focused: window.isFocused(), offscreen: window.webContents.isOffscreen() }
   })
-  assert.deepEqual(native, { visible: false, focused: false, offscreen: true }, 'Cold missing-window measurement requires the protected hidden offscreen window.')
+  assert.deepEqual(native, { visible: !offscreen, focused: !offscreen, offscreen }, 'Cold missing-window measurement must use its declared window presentation.')
   const probe = value => electron.evaluate((_, value) => globalThis.__marketBackend.probe(value), value)
   const fixture = await probe({ action: 'coldBoundaryInstall', timeframe, scenario: 'full-missing-window', sourceDelayMS: 1_800, failNearestCandles: failSource })
   let probeInstalled = false, paintStarted = false
@@ -1068,6 +1080,9 @@ export async function measureOffscreenMissingWindow(electron, page, { timeframe 
       && request.from <= fixture.targetEnd && request.through >= fixture.targetWindowStart)
     assert.equal(nearest.completedAt, null, 'The delayed request must remain active through continuing and reversed input.')
     assert.equal(nearest.failedAt, null, 'A configured delayed source failure must occur after continuing and reversed input.')
+    const pendingInputAcknowledgment = await measureChartIntentLatency(page, {
+      inputs: latestInputs, targets: latestTargets, requireForeground: !offscreen, milestone: 'requested-cursor',
+    })
 
     let latency = null
     if (failSource) {
@@ -1098,7 +1113,7 @@ export async function measureOffscreenMissingWindow(electron, page, { timeframe 
         const snapshot = document.querySelector(`[data-chart-inst="${instId}"]`)?.__chartSnapshot
         return ['ready', 'unavailable'].includes(snapshot?.indicatorState) && snapshot.bars.every(bar => bar.indicatorsObserved)
       }, fixture.instId, { timeout: 10_000 })
-      latency = await measurePaintLatency(page, { inputs: latestInputs, targets: latestTargets, requireForeground: false })
+      latency = await measureChartIntentLatency(page, { inputs: latestInputs, targets: latestTargets, requireForeground: false })
       const recoveredState = await readColdWindowState(page, fixture.instId)
       assert.equal(recoveredState.renderedEnd, latestEnd)
       assert.equal(recoveredState.completedEnd, latestEnd)
@@ -1121,12 +1136,16 @@ export async function measureOffscreenMissingWindow(electron, page, { timeframe 
     if (!failSource) assert.ok(heldStatistics.length, 'The ready price window must remain explicitly incomplete while OI/Taker source pages are held.')
 
     const finalWindow = await readColdWindowState(page, fixture.instId)
-    const observedFieldOracle = await assertColdCanonicalViewport(electron, page, fixture, finalWindow.renderedEnd)
-    assert.equal(finalWindow.indicatorState, observedFieldOracle.expectedIndicatorState,
-      'Indicator readiness must describe the available SQLite prefix, including its real warmup boundary.')
     const paint = await finishPaintProbe(page)
     paintStarted = false
     assertCompletePaints(paint)
+    if (!offscreen) assert.ok(paint.maxFrameGapMS < 100,
+      `A completely absent viewport caused a renderer RAF stall of at least 100 ms: ${JSON.stringify({ maxFrameGapMS: paint.maxFrameGapMS, scheduler: paint.scheduler })}`)
+    // End the timing phase at the terminal UI state. Reading and independently
+    // checking its SQLite prefix is correctness verification outside that phase.
+    const observedFieldOracle = await assertColdCanonicalViewport(electron, page, fixture, finalWindow.renderedEnd)
+    assert.equal(finalWindow.indicatorState, observedFieldOracle.expectedIndicatorState,
+      'Indicator readiness must describe the available SQLite prefix, including its real warmup boundary.')
     const requests = await readRequestProbe(electron)
     assert.ok(requests.maxHistoricalActive <= 2, `Cold acquisition exceeded the two historical read lanes: ${JSON.stringify(requests)}`)
     assert.equal(requests.legacyWindowCalls, 0)
@@ -1143,6 +1162,14 @@ export async function measureOffscreenMissingWindow(electron, page, { timeframe 
       heldStatisticsRequests: heldStatistics.length,
       maximumActiveSourceRequests: sourceSnapshot.maxActive,
       boundedHistoricalReads: requests.maxHistoricalActive <= 2, failedSourceDidNotClaimCompletion: failSource,
+      presentation: offscreen ? 'protected hidden offscreen renderer' : 'native foreground renderer',
+      timingScope: 'Input-to-requested-cursor RAF acknowledgment and continuous RAF gaps through the terminal source success/error UI; source availability latency is reported separately. SQLite oracle checks follow the timing phase.',
+      foregroundRafObservationMeasured: !offscreen,
+      inputBudgetMS: offscreen ? null : 100,
+      pendingInputAcknowledgment,
+      dataAvailability: latency ? { latestInputToRenderedWindowRafMS: latency.latestInputToRafSampleMS,
+        maximumIntentToRenderedWindowRafMS: latency.maxInputToRafSampleMS, sourceDelayMS: fixture.sourceDelayMS } : null,
+      ...(foreground ? { environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence } : {}),
       exactInputAccounting: latency ? { intents: latestInputs.length, committed: latency.committedInputs,
         superseded: latency.supersededInputs, maximumIntentToRafSampleMS: latency.maxInputToRafSampleMS,
         allIntentsAccounted: latency.unaccountedInputs.length === 0 } : null,
@@ -1151,6 +1178,7 @@ export async function measureOffscreenMissingWindow(electron, page, { timeframe 
     if (paintStarted) await finishPaintProbe(page)
     if (probeInstalled) { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
     await probe({ action: 'coldBoundaryRemove' })
+    await foreground?.restore()
   }
 }
 
@@ -1278,7 +1306,7 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
         && missing && missing.oi === null && missing.buy === null && missing.sell === null
     }, { targetEnd: fixture.targetEnd, firstMissingEnd: fixture.firstMissingEnd, indicatorFields }, { timeout: 10_000 })
     const observedFieldOracle = await assertColdCanonicalViewport(electron, page, fixture, fixture.targetEnd)
-    const latency = offscreen ? null : await measurePaintLatency(page, { inputs, targets: [fixture.targetEnd] })
+    const latency = offscreen ? null : await measureChartIntentLatency(page, { inputs, targets: [fixture.targetEnd] })
     if (latency) assert.ok(latency.maxInputToRafSampleMS < 100, `A boundary intent took ${latency.maxInputToRafSampleMS} ms to reach its exact or coalesced chart target. ${JSON.stringify(latency)}`)
     sources = await probe({ action: 'coldBoundaryRead' })
     const nearest = sources.requests.find(request => request.source === 'candles' && request.through === fixture.firstMissingEnd)

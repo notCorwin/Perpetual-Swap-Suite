@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
 import { requireForegroundTests } from '../../electron/test-presentation.js'
-import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureNativeColdBoundary, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
+import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureMissingWindow, measureNativeColdBoundary, measureChartIntentLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
 
 requireForegroundTests()
 
@@ -76,7 +76,7 @@ test('bulk-warmed history updates every renderer target within 100 ms during scr
         const targets = inputs.map((_, index) => fixture.end - (distance + phase.candles / inputs.length * (index + 1)) * intervalMS)
         distance += phase.candles
         await waitForRendered(page, fixture, timeframe, targets.at(-1))
-        const latency = await measurePaintLatency(page, { inputs, targets })
+        const latency = await measureChartIntentLatency(page, { inputs, targets })
         context.diagnostic(JSON.stringify({ timeframe, phase: phase.name, ...latency }))
         assert.ok(latency.maxInputToRafSampleMS < 100, `${timeframe} ${phase.name} had an intent take ${latency.maxInputToRafSampleMS} ms to reach its exact or coalesced chart target. ${JSON.stringify(latency)}`)
         assert.ok(latency.latestBurstStartToRafSampleMS < 100, `${timeframe} ${phase.name} took ${latency.latestBurstStartToRafSampleMS} ms from the first wheel input in the latest burst to its renderer RAF sample. ${JSON.stringify(latency)}`)
@@ -104,4 +104,18 @@ test('backend history reserve covers 1500 ms of delivery latency before the cold
 test('a never-downloaded native price page reaches an SVG snapshot before reserve and optional statistics finish', async context => {
   const report = await measureNativeColdBoundary(electron, page)
   context.diagnostic(`Native cold boundary: ${JSON.stringify(report)}`)
+})
+
+for (const failSource of [false, true]) test(`a completely absent viewport keeps foreground input responsive through delayed source ${failSource ? 'failure' : 'success'}`, { timeout: 60_000 }, async context => {
+  const report = await measureMissingWindow(electron, page, { offscreen: false, failSource })
+  assert.equal(report.initiallyPresentCandles, 0)
+  assert.equal(report.initiallyMissingCandles, 96)
+  assert.equal(report.foregroundRafObservationMeasured, true)
+  assert.equal(report.pendingInputAcknowledgment.milestone, 'requested-cursor')
+  assert.equal(report.pendingInputAcknowledgment.unaccountedInputs.length, 0)
+  assert.equal(report.failedSourceDidNotClaimCompletion, failSource)
+  context.diagnostic(JSON.stringify({ scenario: report.scenario, sourceFailure: report.sourceFailure,
+    inputBudgetMS: report.inputBudgetMS, maxInputAcknowledgmentMS: report.pendingInputAcknowledgment.maxInputToRafSampleMS,
+    maxFrameGapMS: report.maxFrameGapMS, dataAvailability: report.dataAvailability,
+    timingScope: report.timingScope, sourceRequests: report.sourceRequests, observedFieldOracle: report.observedFieldOracle }))
 })

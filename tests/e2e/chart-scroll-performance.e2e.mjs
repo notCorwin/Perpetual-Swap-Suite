@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { _electron } from 'playwright'
 import {
-  installRequestProbe, measureLatencyCoveredPrefetch, measureOffscreenMissingWindow, offscreenChartWindow, openChart, readRequestProbe, removeRequestProbe, resetRequestProbe,
+  installRequestProbe, measureLatencyCoveredPrefetch, measureMissingWindow, offscreenChartWindow, openChart, readRequestProbe, removeRequestProbe, resetRequestProbe,
   separateSourceMaintenance, waitForLocalHistory, waitForRendered, wheelBurst,
 } from '../../scripts/chart-acceptance.mjs'
 
@@ -216,7 +216,9 @@ test('real resident reserve covers delayed history delivery before continuous in
 })
 
 test('a completely absent 96-candle viewport stays truthful through delayed acquisition, continuing input, and reversal', { timeout: 45_000 }, async context => {
-  const report = await measureOffscreenMissingWindow(electron, page)
+  const report = await measureMissingWindow(electron, page)
+  assert.equal(report.pendingInputAcknowledgment.milestone, 'requested-cursor')
+  assert.equal(report.pendingInputAcknowledgment.unaccountedInputs.length, 0)
   assert.equal(report.initiallyMissingCandles, 96)
   assert.equal(report.initiallyPresentCandles, 0)
   assert.equal(report.latestIntentPreserved, true)
@@ -227,7 +229,9 @@ test('a completely absent 96-candle viewport stays truthful through delayed acqu
 })
 
 test('a delayed failure on a completely absent viewport remains an explicit pending chart error', { timeout: 45_000 }, async context => {
-  const report = await measureOffscreenMissingWindow(electron, page, { failSource: true })
+  const report = await measureMissingWindow(electron, page, { failSource: true })
+  assert.equal(report.pendingInputAcknowledgment.milestone, 'requested-cursor')
+  assert.equal(report.pendingInputAcknowledgment.unaccountedInputs.length, 0)
   assert.equal(report.initiallyMissingCandles, 96)
   assert.equal(report.initiallyPresentCandles, 0)
   assert.equal(report.failedSourceDidNotClaimCompletion, true)
