@@ -8,7 +8,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { _electron } from 'playwright'
 import { offscreenChartWindow, selectTimeframe } from './chart-acceptance.mjs'
 import { requireForegroundTests } from '../electron/test-presentation.js'
-import { summarizeResourceDelivery } from './resource-acceptance.mjs'
+import { assertResourceDeliveryBudget, summarizeResourceDelivery } from './resource-acceptance.mjs'
 
 const { values } = parseArgs({ options: { offscreen: { type: 'boolean' }, ticks: { type: 'string' }, 'cadence-ms': { type: 'string' } } })
 const offscreen = values.offscreen === true
@@ -49,9 +49,13 @@ try {
   report.appMetricsAtStart = await electron.evaluate(({ app }) => app.getAppMetrics())
   await page.evaluate(() => {
     const state = window.__resourceScheduler = { timeOrigin: performance.timeOrigin, supportedEntryTypes: PerformanceObserver.supportedEntryTypes,
+      phase: 'fixed-rate-intake', active: false, startedAt: null, endedAt: null,
       counts: {}, entries: { longtask: [], 'long-animation-frame': [] } }
-    for (const type of Object.keys(state.entries)) if (state.supportedEntryTypes.includes(type)) {
-      new PerformanceObserver(list => { for (const entry of list.getEntries()) {
+    const observers = []
+    const record = (type, entries) => {
+      if (!state.active) return
+      for (const entry of entries) {
+        if (entry.startTime + entry.duration < state.startedAt) continue
         state.counts[type] = (state.counts[type] ?? 0) + 1
         if (state.entries[type].length >= 50) continue
         state.entries[type].push({ name: entry.name, startTime: entry.startTime, duration: entry.duration,
@@ -59,7 +63,23 @@ try {
           scripts: [...(entry.scripts ?? [])].slice(0, 5).map(script => ({ sourceURL: script.sourceURL, invoker: script.invoker,
             invokerType: script.invokerType, duration: script.duration, executionStart: script.executionStart,
             forcedStyleAndLayoutDuration: script.forcedStyleAndLayoutDuration })) })
-      } }).observe({ type, buffered: true })
+      }
+    }
+    for (const type of Object.keys(state.entries)) if (state.supportedEntryTypes.includes(type)) {
+      const observer = new PerformanceObserver(list => record(type, list.getEntries()))
+      observer.observe({ type, buffered: true })
+      observers.push({ type, observer })
+    }
+    window.__armResourceScheduler = () => {
+      for (const { observer } of observers) observer.takeRecords()
+      state.startedAt = performance.now()
+      state.active = true
+    }
+    window.__finishResourceScheduler = () => {
+      for (const { type, observer } of observers) { record(type, observer.takeRecords()); observer.disconnect() }
+      state.endedAt = performance.now()
+      state.active = false
+      return state
     }
   })
   report.idleFrameCadence = await page.evaluate(() => new Promise(resolve => {
@@ -147,18 +167,24 @@ try {
   const focus = fixture.instIds[0], timeframe = '15m'
   let sequence = 0
   const choose = async (instId, phase) => {
-    // Searching can change the requested chart before the subsequent row
-    // click. Measure from the first real input, including that possible paint.
-    const inputAt = await page.evaluate(() => performance.timeOrigin + performance.now())
-    report.viewIntents.push({ at: inputAt, instId, timeframe: '15m' })
     const expected = sequence ? 100 + Number(instId.slice(5, 8)) * 3 + 10 + fixture.periods * .01 + sequence * .001 : null
-    report.pendingSelection = { instId, phase, inputAt, expected }
+    report.pendingSelection = { instId, phase, expected }
+    const selectedBeforeSearch = await page.evaluate(() => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.instId ?? null)
     await page.getByRole('textbox', { name: 'Search contracts' }).fill(instId)
     const selectedBeforeClick = await page.evaluate(() => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.instId ?? null)
-    await page.locator(`[aria-label="View ${instId} chart"]`).evaluate(node => node.click())
+    assert.equal(selectedBeforeClick, selectedBeforeSearch, 'Filtering contracts must preserve chart selection until a row is selected.')
+    // The search filters the list; the row click selects the chart. Capture
+    // that semantic input in its renderer task, excluding driver round trips.
+    const inputAt = await page.locator(`[aria-label="View ${instId} chart"]`).evaluate(node => {
+      const at = performance.timeOrigin + performance.now()
+      node.click()
+      return at
+    })
+    report.pendingSelection.inputAt = inputAt
+    report.viewIntents.push({ at: inputAt, instId, timeframe: '15m' })
     await page.waitForFunction(({ instId, inputAt, expected }) => window.__resourcePaint.records.some(record => record.instId === instId && record.nextFrameAt >= inputAt && record.bars === 96 && record.indicatorState === 'ready' && (expected === null || record.livePrice >= expected)), { instId, inputAt, expected }, { timeout: 20_000 })
     const value = await page.evaluate(({ instId, inputAt, expected }) => window.__resourcePaint.records.find(record => record.instId === instId && record.nextFrameAt >= inputAt && record.bars === 96 && record.indicatorState === 'ready' && (expected === null || record.livePrice >= expected)), { instId, inputAt, expected })
-    report.switches.push({ phase, instId, inputMode: 'search entry and row click', selectedBeforeClick, inputToFrameMS: value.nextFrameAt - inputAt, bars: value.bars, indicatorState: value.indicatorState, expected, actualPrice: value.livePrice })
+    report.switches.push({ phase, instId, inputMode: 'row click after search filtering', selectedBeforeClick, rowClickToFrameMS: value.nextFrameAt - inputAt, bars: value.bars, indicatorState: value.indicatorState, expected, actualPrice: value.livePrice })
     delete report.pendingSelection
   }
   await choose(fixture.instIds[1], 'first selection after renderer frame delivery')
@@ -167,7 +193,10 @@ try {
   await page.waitForFunction(({ focus, timeframe }) => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.instId === focus && document.querySelector('[data-chart-inst]')?.__chartSnapshot?.timeframe === timeframe, { focus, timeframe })
   report.backgroundReady = await probe({ action: 'backgroundStart' })
   report.backgroundStarted = true
-  await page.evaluate(() => { window.__resourcePaint.frameGaps = []; window.__resourcePaint.previousFrame = null })
+  await page.evaluate(() => {
+    window.__resourcePaint.frameGaps = []; window.__resourcePaint.previousFrame = null
+    window.__armResourceScheduler()
+  })
   report.viewIntents.push({ at: Date.now(), instId: focus, timeframe })
   report.loadStart = await probe({ action: 'scaleLoadStart', ticks, cadenceMS, focusInstId: focus, timeframe })
   const loadDeadline = performance.now() + ticks * cadenceMS + 20_000
@@ -205,18 +234,21 @@ try {
   await Promise.all([monitor(), interact()])
   await page.waitForFunction(({ focus, sequence }) => window.__resourcePaint.records.some(record => record.instId === focus && record.sequence === sequence && record.nextFrameAt !== null), { focus, sequence }, { timeout: 10_000 })
   const commits = await page.evaluate(() => window.__resourcePaint.records)
-  report.delivery = summarizeResourceDelivery(load, commits, { budgetMS: report.receiveToFrameBudgetMS, intents: report.viewIntents })
-  report.samples = report.delivery.samples
+  report.rendererCommits = commits
   report.load = load
   report.foregroundFrameCadence = await page.evaluate(() => {
     const gaps = [...window.__resourcePaint.frameGaps].sort((left, right) => left - right)
     return { frames: gaps.length, medianMS: gaps[Math.floor((gaps.length - 1) * .5)], p95MS: gaps[Math.floor((gaps.length - 1) * .95)], maxMS: gaps.at(-1), visibilityState: document.visibilityState, focused: document.hasFocus() }
   })
+  report.schedulerAfterTicks = await page.evaluate(() => window.__finishResourceScheduler())
+  report.delivery = summarizeResourceDelivery(load, commits, { intents: report.viewIntents })
+  report.samples = report.delivery.samples
+  assertResourceDeliveryBudget(report.delivery, report.receiveToFrameBudgetMS)
   if (!offscreen) {
+    assert.ok(report.switches.every(value => value.rowClickToFrameMS <= 100), 'A prepared contract selection exceeded the 100 ms row-click-to-RAF budget during the resource workload.')
     assert.ok(report.foregroundFrameCadence.maxMS < 100, 'Continuous market intake caused a renderer RAF stall of at least 100 ms.')
     assert.ok(report.foregroundFrameCadence.p95MS <= 50, 'Continuous market intake exceeded the 50 ms renderer RAF p95 budget.')
   }
-  report.schedulerAfterTicks = await page.evaluate(() => window.__resourceScheduler)
   await page.waitForFunction(() => window.__resourcePaint.indicatorValuesChecked > 0, null, { timeout: 30_000 })
   report.correctness = await page.evaluate(() => ({ violations: window.__resourcePaint.violations, indicatorValuesChecked: window.__resourcePaint.indicatorValuesChecked, rendererCommits: window.__resourcePaint.records.length }))
   report.background = await probe({ action: 'backgroundStatus' })
