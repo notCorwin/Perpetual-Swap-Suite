@@ -7,6 +7,7 @@ import { _electron } from 'playwright'
 import { MarketStore } from '../../electron/services/market-store.js'
 import { MetadataStore, DEFAULT_PREFERENCES } from '../../electron/services/metadata-store.js'
 import { createNativeExchange, nativeIntervals } from '../helpers/native-exchange.mjs'
+import { waitForAsyncCondition } from '../../scripts/async-readiness.mjs'
 
 const root = new URL('../..', import.meta.url).pathname
 const btc = 'BTC-USDT-SWAP', eth = 'ETH-USDT-SWAP'
@@ -68,7 +69,16 @@ test('native WebSocket prices reach the selected SVG and survive delayed durable
     }, { instId, timeframe })
   }
   const sendBasePrice = async (instId, chartTimeframe, close, volume) => {
-    const interval = nativeIntervals['5m'], timestamp = Math.floor(Date.now() / interval) * interval
+    const { currentTimestamp: timestamp, closed } = exchange.closeElapsedCandles()
+    if (closed.length) {
+      await waitForAsyncCondition(async () => {
+        const durable = await Promise.all(closed.map(event => readCandles({ instId: event.instId, timeframe: '5m',
+          from: event.timestamp, through: event.timestamp })))
+        return durable.every((rows, index) => rows.length === 1 && rows[0].confirmed
+          && rows[0].timestamp === closed[index].timestamp)
+      }, { description: `${closed.length} elapsed native 5m candles to commit`, timeoutMS: 15_000 })
+    }
+    const interval = nativeIntervals['5m']
     const start = Math.floor(timestamp / nativeIntervals[chartTimeframe]) * nativeIntervals[chartTimeframe]
     const prefixCount = (timestamp - start) / interval
     const prefix = prefixCount ? await readCandles({ instId, timeframe: '5m', from: start, through: timestamp - interval }) : []
@@ -132,11 +142,10 @@ test('native WebSocket prices reach the selected SVG and survive delayed durable
     assert.deepEqual(missingBase, [], 'A coarse fallback must not fabricate the missing canonical 5m child.')
     // Await the missing closed fact through the public read bridge. Its durable
     // commit must preserve the separately observed native forming price.
-    await page.waitForFunction(async expected => {
-      const rows = await window.radarDesktop.request({ e2e: { action: 'readCandles', instrument: expected.instId,
-        timeframe: '15m', from: expected.timestamp, through: expected.timestamp } })
+    await waitForAsyncCondition(async () => {
+      const rows = await readCandles({ instId: btc, timeframe: '15m', from: exchange.deferredEnd, through: exchange.deferredEnd })
       return rows.length === 1 && rows[0].confirmed
-    }, { instId: btc, timestamp: exchange.deferredEnd })
+    }, { description: 'the durable repaired 15m parent' })
     // Observe actual UI commits during the source completion, without issuing a
     // chart refresh that could conceal a push-delivery or cache invalidation bug.
     for (let index = 0; index < 10; index++) {
@@ -153,11 +162,10 @@ test('native WebSocket prices reach the selected SVG and survive delayed durable
     await select(eth, '15m')
     await sendBasePrice(eth, '15m', 512.5, 10)
     await select(btc, '5m')
-    await page.waitForFunction(async expected => {
-      const rows = await window.radarDesktop.request({ e2e: { action: 'readCandles', instrument: expected.instId,
-        timeframe: '5m', from: expected.timestamp, through: expected.timestamp } })
+    await waitForAsyncCondition(async () => {
+      const rows = await readCandles({ instId: btc, timeframe: '5m', from: exchange.missingBaseEnd, through: exchange.missingBaseEnd })
       return rows.length === 1 && rows[0].confirmed
-    }, { instId: btc, timestamp: exchange.missingBaseEnd }, { timeout: 15_000 })
+    }, { description: 'the selected 5m chart to durably repair its interior gap', timeoutMS: 15_000 })
     assert.ok(exchange.requests.some(value => value.path === '/market/history-candles' && value.parameters.instId === btc
       && value.parameters.bar === '5m' && Number(value.parameters.after) === exchange.missingBaseEnd + nativeIntervals['5m']),
     'Selecting the 5m chart must own the repair of its historical interior gap.')

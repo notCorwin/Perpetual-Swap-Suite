@@ -9,6 +9,7 @@ import { _electron } from 'playwright'
 import { offscreenChartWindow, selectTimeframe } from './chart-acceptance.mjs'
 import { requireForegroundTests } from '../electron/test-presentation.js'
 import { assessResourceBudgets, summarizeResourceDelivery } from './resource-acceptance.mjs'
+import { waitForAsyncCondition } from './async-readiness.mjs'
 
 const { values } = parseArgs({ options: { offscreen: { type: 'boolean' }, ticks: { type: 'string' }, 'cadence-ms': { type: 'string' } } })
 const offscreen = values.offscreen === true
@@ -151,19 +152,26 @@ try {
   }, fixture)
   await page.waitForFunction(() => Number(document.querySelector('[data-total-market-count]')?.getAttribute('data-total-market-count')) === 287, null, { timeout: 60_000 })
   const rendererFramesStartedAt = Date.now()
-  await page.waitForFunction(async ({ instIds, timeframes }) => {
+  const readiness = await waitForAsyncCondition(() => page.evaluate(async ({ instIds, timeframes }) => {
     const { frames } = await window.radarDesktop.request({ chartUniverse: {} })
+    // The fixture deliberately holds optional statistics requests. Price and
+    // exact indicators must become ready independently of those pending lanes.
     const canonical = frames.filter(frame => frame.bars?.length === 96 && frame.indicatorState === 'ready'
-      && ['ready', 'stale'].includes(frame.priceState) && ['ready', 'unavailable'].includes(frame.oiState)
-      && ['ready', 'unavailable'].includes(frame.takerState))
+      && ['ready', 'stale'].includes(frame.priceState))
     const ready = new Set(canonical.map(frame => `${frame.instId}:${frame.timeframe}`))
+    const states = source => Object.fromEntries([...new Set(frames.map(frame => frame[source]))]
+      .map(state => [state, frames.filter(frame => frame[source] === state).length]))
+    const readiness = window.__resourceUniverseReadiness = { readyPairs: ready.size, receivedPairs: frames.length,
+      expectedPairs: instIds.length * timeframes.length, oiStates: states('oiState'), takerStates: states('takerState') }
     if (!instIds.every(instId => timeframes.every(timeframe => ready.has(`${instId}:${timeframe}`)))) return false
     // Route the full renderer universe through App's ordinary notification
     // handler; only the selected contract creates SVG geometry.
     for (const frame of canonical) window.dispatchEvent(new CustomEvent('radar-chart-prepared', { detail: frame }))
-    return true
-  }, fixture, { timeout: 120_000, polling: 500 })
-  report.rendererFrameBarrier = { readyPairs: fixture.instIds.length * fixture.timeframes.length,
+    return readiness
+  }, fixture), { description: 'all canonical frames to reach the renderer', timeoutMS: 120_000, pollingMS: 500 })
+  assert.equal(readiness.readyPairs, fixture.instIds.length * fixture.timeframes.length)
+  report.rendererFrameBarrier = { ...readiness,
+    required: '96-bar prices and exact indicators; optional OI/Taker requests remain intentionally held.',
     waitAfterListMS: Date.now() - rendererFramesStartedAt, demand: 'Canonical frames delivered through the renderer prepared-frame event.' }
   // Backend frame delivery does not mean the initial SVG has reached a RAF.
   // Start prepared-selection timing only after that visible baseline exists;
@@ -296,7 +304,8 @@ try {
         selectedRow: document.querySelector('[data-market-index][aria-selected="true"]')?.getAttribute('aria-label'),
         chart: chart ? Object.fromEntries([...chart.attributes].filter(value => value.name.startsWith('data-chart')).map(value => [value.name, value.value])) : null,
         snapshot: snapshot ? { instId: snapshot.instId, timeframe: snapshot.timeframe, endHour: snapshot.endHour, generation: snapshot.generation, revision: snapshot.revision, bars: snapshot.bars.length, liveBar: snapshot.liveBar } : null,
-        lastRecords: window.__resourcePaint?.records.slice(-12), violations: window.__resourcePaint?.violations }
+        lastRecords: window.__resourcePaint?.records.slice(-12), violations: window.__resourcePaint?.violations,
+        universeReadiness: window.__resourceUniverseReadiness }
     }) } catch {} }
   console.error(error.stack ?? error.message)
   process.exitCode = 1
