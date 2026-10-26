@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { assertResourceDeliveryBudget, summarizeResourceDelivery } from '../../scripts/resource-acceptance.mjs'
+import { assessResourceBudgets, assertResourceDeliveryBudget, summarizeResourceDelivery } from '../../scripts/resource-acceptance.mjs'
 
 const load = () => ({ state: 'complete', emitted: 3, completed: 3, plannedTicks: 3, failed: 0, maxScheduleLatenessMS: 0, cadenceMS: 100,
   ticks: [1, 2, 3].map(sequence => ({ sequence, plannedAt: sequence * 100, emittedAt: sequence * 100,
@@ -87,5 +87,28 @@ test('missing output, omitted scheduled input and unfinished intake cannot pass'
   assert.throws(() => summarizeResourceDelivery(load(), [commit(1)]), /never reached/)
   assert.throws(() => summarizeResourceDelivery({ ...load(), emitted: 2 }, []), /scheduled input/)
   assert.throws(() => summarizeResourceDelivery({ ...load(), state: 'draining' }, []), /finish/)
-  assert.throws(() => summarizeResourceDelivery({ ...load(), maxScheduleLatenessMS: 101 }, []), /scheduler/)
+})
+
+test('source overload retains valid delivery samples and still fails its unchanged cadence budget', () => {
+  const input = { ...load(), maxScheduleLatenessMS: 101 }
+  const delivery = summarizeResourceDelivery(input, [commit(1), commit(2), commit(3)])
+  assert.equal(delivery.samples.length, 3)
+  const failures = assessResourceBudgets({ load: input, delivery }, { offscreen: true })
+  assert.deepEqual(failures.map(value => value.gate), ['source-cadence'])
+  assert.match(failures[0].message, /101 ms.*100 ms/)
+})
+
+test('independent resource budget failures remain visible instead of masking one another', () => {
+  const input = { ...load(), maxScheduleLatenessMS: 101 }
+  const failures = assessResourceBudgets({ load: input, delivery: { receiveToFrameMaxMS: 110 },
+    switches: [{ rowClickToFrameMS: 155 }], frameCadence: { maxMS: 101, p95MS: 51 } })
+  assert.deepEqual(failures.map(value => value.gate), ['source-cadence', 'receive-to-raf', 'prepared-selection', 'raf-gap', 'raf-p95'])
+  assert.deepEqual(assessResourceBudgets({ load: load(), delivery: { receiveToFrameMaxMS: 100 },
+    switches: [{ rowClickToFrameMS: 100 }], frameCadence: { maxMS: 99.9, p95MS: 50 } }), [])
+})
+
+test('foreground resource budgets reject missing or non-finite measurements', () => {
+  const failures = assessResourceBudgets({ load: { ...load(), maxScheduleLatenessMS: NaN },
+    delivery: { receiveToFrameMaxMS: NaN }, switches: [], frameCadence: { maxMS: null, p95MS: null } })
+  assert.equal(failures.length, 5)
 })

@@ -257,8 +257,8 @@ export async function startNavigationFrameProbe(page, fixture, { requirePrepared
   await page.evaluate(({ instruments, requirePreparedStatistics }) => {
     const oracles = new Map(instruments.map(instrument => [instrument.instId,
       new Map(Object.entries(instrument.series).map(([timeframe, series]) => [timeframe, { intervalMS: series.intervalMS, bars: new Map(series.bars.map(bar => [bar.hour, bar])) }]))]))
-    const fields = ['open', 'high', 'low', 'close', 'ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
-    const probe = { active: true, rafSamples: 0, snapshotChanges: 0, minimumBars: Infinity, violations: [], commits: [], previous: null, observedSurface: null, raf: null, observer: null }
+    const probe = { active: true, requirePreparedStatistics, oracles, rafSamples: 0, snapshotChanges: 0, minimumBars: Infinity, violations: [], commits: [], observations: [],
+      snapshotCaptureMS: 0, snapshotCaptureMaxMS: 0, snapshotValidationMS: 0, previous: null, observedSurface: null, raf: null, observer: null }
     const fail = message => { if (probe.violations.length < 20) probe.violations.push(message) }
     const sample = () => {
       const chart = document.querySelector('[data-chart-inst]')
@@ -279,27 +279,25 @@ export async function startNavigationFrameProbe(page, fixture, { requirePrepared
       probe.previous = snapshot
       probe.snapshotChanges += 1
       probe.minimumBars = Math.min(probe.minimumBars, snapshot.bars.length)
-      probe.commits.push({ instId: snapshot.instId, timeframe: snapshot.timeframe, end: snapshot.endHour, at: performance.now() })
-      if (snapshot.bars.length !== 96) fail(`A switch snapshot contains ${snapshot.bars.length} candles.`)
-      const oracle = oracles.get(snapshot.instId)?.get(snapshot.timeframe)
-      for (const [index, bar] of snapshot.bars.entries()) {
-        const expected = oracle?.bars.get(bar.hour)
-        if (!expected) { fail(`Unexpected source ${snapshot.instId}/${snapshot.timeframe}/${bar.hour}.`); continue }
-        if (index && bar.hour - snapshot.bars[index - 1].hour !== oracle.intervalMS) fail('A switched chart contains noncontiguous periods.')
-        if (!bar.confirmed) fail('A forming candle entered the persisted completed window.')
-        const oiObserved = bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)
-        const takerObserved = bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2)
-        if (requirePreparedStatistics && Number.isFinite(expected.oi) && !oiObserved) fail('Fixture-known OI observation disappeared during prepared navigation.')
-        if (requirePreparedStatistics && Number.isFinite(expected.buy) && Number.isFinite(expected.sell) && !takerObserved) fail('Fixture-known Taker observation disappeared during prepared navigation.')
-        for (const field of fields.filter(field => ['open', 'high', 'low', 'close'].includes(field)
-          || (field === 'oi' ? requirePreparedStatistics || oiObserved
-            : ['buy', 'sell'].includes(field) ? requirePreparedStatistics || takerObserved : bar.indicatorsObserved))) {
-          if (expected[field] === null ? bar[field] !== null : typeof bar[field] !== 'number' || !Number.isFinite(bar[field]) || Math.abs(bar[field] - expected[field]) > Math.max(1, Math.abs(expected[field])) * 1e-10) fail(`${snapshot.instId} ${bar.hour} ${field} has the wrong source value.`)
-        }
-      }
-      if (snapshot.oiState === 'ready' && Number(svg.querySelector('[data-chart-oi-samples]')?.getAttribute('data-chart-oi-samples')) !== snapshot.bars.length) fail('OI geometry was incomplete after switching.')
-      for (const side of ['buy', 'sell']) if (snapshot.takerState === 'ready' && Number(svg.querySelector(`[data-chart-taker-${side}-samples]`)?.getAttribute(`data-chart-taker-${side}-samples`)) !== 96) fail(`Taker ${side} geometry was incomplete after switching.`)
-      for (const path of svg.querySelectorAll('path[d]')) if (/NaN|Infinity|undefined/.test(path.getAttribute('d'))) fail('A switched chart contains invalid SVG geometry.')
+      const at = performance.now()
+      const captureStartedAt = performance.now()
+      // PreparedChartStore freezes its windows, arrays, and bars. The mutable
+      // synthetic snapshot in the negative fixture is copied once here so the
+      // deferred oracle still checks exactly what was observed at commit time.
+      const retainedSnapshot = Object.isFrozen(snapshot) ? snapshot : Object.freeze({
+        ...snapshot, bars: Object.freeze(snapshot.bars.map(bar => Object.freeze({ ...bar }))),
+      })
+      const geometry = Object.freeze({
+        oiSamples: svg.querySelector('[data-chart-oi-samples]')?.getAttribute('data-chart-oi-samples'),
+        takerBuySamples: svg.querySelector('[data-chart-taker-buy-samples]')?.getAttribute('data-chart-taker-buy-samples'),
+        takerSellSamples: svg.querySelector('[data-chart-taker-sell-samples]')?.getAttribute('data-chart-taker-sell-samples'),
+        pathData: Object.freeze(Array.from(svg.querySelectorAll('path[d]'), path => path.getAttribute('d'))),
+      })
+      probe.commits.push({ instId: snapshot.instId, timeframe: snapshot.timeframe, end: snapshot.endHour, at })
+      probe.observations.push(Object.freeze({ snapshot: retainedSnapshot, geometry }))
+      const captureMS = performance.now() - captureStartedAt
+      probe.snapshotCaptureMS += captureMS
+      probe.snapshotCaptureMaxMS = Math.max(probe.snapshotCaptureMaxMS, captureMS)
     }
     probe.observer = new MutationObserver(() => sample())
     probe.observer.observe(document.getElementById('root'), { subtree: true, childList: true, attributes: true })
@@ -316,15 +314,51 @@ export async function finishNavigationFrameProbe(page) {
     probe.active = false
     cancelAnimationFrame(probe.raf)
     probe.observer.disconnect()
+    const validationStartedAt = performance.now()
+    const fields = ['open', 'high', 'low', 'close', 'ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
+    const fail = message => { if (probe.violations.length < 20) probe.violations.push(message) }
+    for (const { snapshot, geometry } of probe.observations) {
+      if (snapshot.bars.length !== 96) fail(`A switch snapshot contains ${snapshot.bars.length} candles.`)
+      const oracle = probe.oracles.get(snapshot.instId)?.get(snapshot.timeframe)
+      for (const [index, bar] of snapshot.bars.entries()) {
+        const expected = oracle?.bars.get(bar.hour)
+        if (!expected) { fail(`Unexpected source ${snapshot.instId}/${snapshot.timeframe}/${bar.hour}.`); continue }
+        if (index && bar.hour - snapshot.bars[index - 1].hour !== oracle.intervalMS) fail('A switched chart contains noncontiguous periods.')
+        if (!bar.confirmed) fail('A forming candle entered the persisted completed window.')
+        const oiObserved = bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)
+        const takerObserved = bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2)
+        if (probe.requirePreparedStatistics && Number.isFinite(expected.oi) && !oiObserved) fail('Fixture-known OI observation disappeared during prepared navigation.')
+        if (probe.requirePreparedStatistics && Number.isFinite(expected.buy) && Number.isFinite(expected.sell) && !takerObserved) fail('Fixture-known Taker observation disappeared during prepared navigation.')
+        for (const field of fields) {
+          if (!(['open', 'high', 'low', 'close'].includes(field)
+            || (field === 'oi' ? probe.requirePreparedStatistics || oiObserved
+              : ['buy', 'sell'].includes(field) ? probe.requirePreparedStatistics || takerObserved : bar.indicatorsObserved))) continue
+          if (expected[field] === null ? bar[field] !== null : typeof bar[field] !== 'number' || !Number.isFinite(bar[field]) || Math.abs(bar[field] - expected[field]) > Math.max(1, Math.abs(expected[field])) * 1e-10) {
+            fail(`${snapshot.instId} ${bar.hour} ${field} has the wrong source value.`)
+          }
+        }
+      }
+      if (snapshot.oiState === 'ready' && Number(geometry.oiSamples) !== snapshot.bars.length) fail('OI geometry was incomplete after switching.')
+      if (snapshot.takerState === 'ready' && Number(geometry.takerBuySamples) !== 96) fail('Taker buy geometry was incomplete after switching.')
+      if (snapshot.takerState === 'ready' && Number(geometry.takerSellSamples) !== 96) fail('Taker sell geometry was incomplete after switching.')
+      for (const path of geometry.pathData) if (/NaN|Infinity|undefined/.test(path)) fail('A switched chart contains invalid SVG geometry.')
+    }
+    probe.snapshotValidationMS = performance.now() - validationStartedAt
     delete window.__navigationPaintProbe
-    return { rafSamples: probe.rafSamples, snapshotChanges: probe.snapshotChanges, minimumBars: probe.minimumBars, violations: probe.violations, commits: probe.commits }
+    return { rafSamples: probe.rafSamples, snapshotChanges: probe.snapshotChanges, minimumBars: probe.minimumBars, violations: probe.violations, commits: probe.commits,
+      capture: { snapshots: probe.observations.length, totalMS: probe.snapshotCaptureMS, maxMS: probe.snapshotCaptureMaxMS },
+      validation: { snapshots: probe.observations.length, totalMS: probe.snapshotValidationMS } }
   })
 }
 
 export function assertNavigationFrames(report) {
-  assert.ok(report.rafSamples > 0)
-  assert.equal(report.minimumBars, 96)
-  assert.deepEqual(report.violations, [], 'A renderer snapshot was incomplete or used another contract’s values.')
+  const diagnostics = JSON.stringify({ snapshots: report.snapshotChanges, capture: report.capture, validation: report.validation })
+  assert.ok(report.rafSamples > 0, `The probe needs renderer RAF samples. ${diagnostics}`)
+  assert.equal(report.minimumBars, 96, `Every observed window must contain 96 bars. ${diagnostics}`)
+  assert.deepEqual(report.violations, [], `A renderer snapshot was incomplete or used another contract’s values. ${diagnostics}`)
+  assert.equal(report.capture.snapshots, report.snapshotChanges)
+  assert.equal(report.validation.snapshots, report.snapshotChanges, 'Every captured snapshot must receive the deferred oracle checks.')
+  for (const value of [report.capture.totalMS, report.capture.maxMS, report.validation.totalMS]) assert.ok(Number.isFinite(value) && value >= 0)
 }
 
 // Capture the actual input event and the subsequent actual SVG commit. Node
@@ -354,6 +388,7 @@ export async function measureNavigation(page, trigger, { expectedInstId = null, 
         const chart = svg?.closest('[data-chart-inst]')
         if (!id || expectedFrame && svg.getAttribute('data-rendered-timeframe') !== expectedFrame || (expectedInstId ? id !== expectedInstId : id === source) || chart.dataset.chartRenderedBars !== '96' || chart.dataset.chartLoading !== 'false') return
         const result = { instId: id, timeframe: expectedFrame, inputToSVGCommitMS: performance.now() - pending.started, framesToCommit: pending.frames,
+          probeCaptureMS: (window.__navigationPaintProbe?.snapshotCaptureMS ?? 0) - pending.captureStartedMS,
           inputToSelectionAcknowledgedMS: pending.selectionAcknowledgedAt === null ? null : pending.selectionAcknowledgedAt - pending.started }
         cleanup()
         requestAnimationFrame(() => resolve({ ...result, inputToNextRafSampleMS: performance.now() - pending.started }))
@@ -363,6 +398,7 @@ export async function measureNavigation(page, trigger, { expectedInstId = null, 
       const input = event => {
         if (pending.started !== null || event.type === 'keydown' && !event.key.startsWith('Arrow')) return
         pending.started = performance.now()
+        pending.captureStartedMS = window.__navigationPaintProbe?.snapshotCaptureMS ?? 0
         clearTimeout(pending.timer)
         pending.timer = setTimeout(timeout, timeoutMS)
       }
@@ -437,12 +473,12 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
     if (requireLocal) assert.ok(newRequests.some(request => request.kind === 'chartLocal' && request.instId === result.instId),
       `${result.instId} had no prepared renderer frame and must hydrate from durable local history.`)
     if (!requireLocal) {
-      assert.ok(result.framesToCommit <= 1, `${result.instId} needed ${result.framesToCommit} animation frames to switch.`)
+      assert.ok(result.framesToCommit <= 1, `${result.instId} needed ${result.framesToCommit} animation frames to switch. ${JSON.stringify(result)}`)
       await assertSharedSurface(`${result.instId}/${result.timeframe ?? options.timeframe ?? 'current timeframe'} selection`)
     }
     const maximumMS = rapid ? 100 : 50
     if (presentation === 'foreground' && !requireLocal) assert.ok(result.inputToSVGCommitMS <= maximumMS,
-      `${result.instId} blocked input for ${result.inputToSVGCommitMS.toFixed(1)} ms (native foreground budget ${maximumMS} ms).`)
+      `${result.instId} blocked input for ${result.inputToSVGCommitMS.toFixed(1)} ms (native foreground budget ${maximumMS} ms). ${JSON.stringify(result)}`)
     if (requireLocal) {
       assert.ok(Number.isFinite(result.inputToSelectionAcknowledgedMS), 'A cold selection must acknowledge the requested contract before its data arrives.')
       if (presentation === 'foreground') assert.ok(result.inputToSelectionAcknowledgedMS <= 100, 'Cold selection acknowledgment exceeded 100 ms.')
@@ -464,6 +500,8 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
     const coldFrames = await finishNavigationFrameProbe(page)
     assertNavigationFrames(coldFrames)
     unpreparedSelection.coldFramesChecked = coldFrames.snapshotChanges
+    unpreparedSelection.probeCosts = { capture: coldFrames.capture, validation: coldFrames.validation,
+      inputToSVGCommitAdjusted: false }
     initialPreparation.beforeColdSelection = { ...initialPreparation }
     await electron.evaluate(() => { globalThis.__instrumentNavigationProbe.omitUniverseInstId = null })
     Object.assign(initialPreparation, await waitForUniverseReady(electron, page, fixture))
@@ -566,6 +604,9 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
     assert.equal(await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()), false,
       'Offscreen navigation acceptance must never take macOS window focus.')
   }
-  return { timingScope: navigationTimingScope(presentation), phases, initialPreparation, unpreparedSelection, heldHistory,
+  const timingScope = { ...navigationTimingScope(presentation), probeCosts: {
+    capture: frameReport.capture, validation: frameReport.validation, inputToSVGCommitAdjusted: false,
+  } }
+  return { timingScope, phases, initialPreparation, unpreparedSelection, heldHistory,
     ...frameReport, commits: frameReport.commits.length }
 }

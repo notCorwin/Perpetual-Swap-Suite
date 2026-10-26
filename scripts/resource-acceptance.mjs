@@ -6,8 +6,6 @@ export function summarizeResourceDelivery(load, commits, { intents = [] } = {}) 
   assert.equal(load.emitted, load.plannedTicks, 'Every scheduled input must be emitted.')
   assert.equal(load.completed, load.plannedTicks, 'Every emitted input must settle.')
   assert.equal(load.failed, 0)
-  assert.ok(Number.isFinite(load.maxScheduleLatenessMS) && load.maxScheduleLatenessMS <= load.cadenceMS,
-    'The source scheduler must not fall behind by a complete input interval.')
   assert.ok(load.ticks?.length === load.plannedTicks && load.ticks.every(row =>
     ['plannedAt', 'emittedAt', 'receivedAt', 'completedAt'].every(field => Number.isFinite(row[field]))
     && row.plannedAt <= row.emittedAt && row.emittedAt <= row.receivedAt && row.receivedAt <= row.completedAt),
@@ -65,4 +63,29 @@ export function assertResourceDeliveryBudget(summary, budgetMS = 100) {
   assert.ok(Number.isFinite(budgetMS) && budgetMS > 0, 'The renderer delivery budget must be a positive measurement.')
   assert.ok(Number.isFinite(summary.receiveToFrameMaxMS) && summary.receiveToFrameMaxMS <= budgetMS,
     `An accepted market input waited ${summary.receiveToFrameMaxMS.toFixed(2)} ms for a renderer frame opportunity (budget ${budgetMS} ms).`)
+}
+
+// Evaluate independent performance budgets together. A source scheduling miss
+// must not discard valid renderer samples or hide a simultaneous frame stall.
+export function assessResourceBudgets({ load, delivery, switches, frameCadence }, { offscreen = false } = {}) {
+  const checks = [
+    ['source-cadence', () => assert.ok(Number.isFinite(load.cadenceMS) && load.cadenceMS > 0
+      && Number.isFinite(load.maxScheduleLatenessMS) && load.maxScheduleLatenessMS >= 0
+      && load.maxScheduleLatenessMS <= load.cadenceMS,
+    `The source scheduler fell behind by ${load.maxScheduleLatenessMS} ms (budget ${load.cadenceMS} ms).`)],
+    ['receive-to-raf', () => assertResourceDeliveryBudget(delivery, offscreen ? null : 100)],
+  ]
+  if (!offscreen) checks.push(
+    ['prepared-selection', () => assert.ok(Array.isArray(switches) && switches.length > 0
+      && switches.every(value => Number.isFinite(value.rowClickToFrameMS) && value.rowClickToFrameMS >= 0 && value.rowClickToFrameMS <= 100),
+    'A prepared contract selection exceeded the 100 ms row-click-to-RAF budget or has no valid measurement.')],
+    ['raf-gap', () => assert.ok(Number.isFinite(frameCadence?.maxMS) && frameCadence.maxMS >= 0 && frameCadence.maxMS < 100,
+      `The renderer RAF gap was ${frameCadence?.maxMS} ms (budget <100 ms).`)],
+    ['raf-p95', () => assert.ok(Number.isFinite(frameCadence?.p95MS) && frameCadence.p95MS >= 0 && frameCadence.p95MS <= 50,
+      `The renderer RAF p95 was ${frameCadence?.p95MS} ms (budget 50 ms).`)],
+  )
+  return checks.flatMap(([gate, check]) => {
+    try { check(); return [] }
+    catch (error) { return [{ gate, message: error.message }] }
+  })
 }

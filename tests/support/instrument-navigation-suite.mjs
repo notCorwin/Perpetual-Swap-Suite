@@ -133,6 +133,9 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
     const report = await finishNavigationFrameProbe(page)
     assert.ok(report.violations.some(value => /Fixture-known OI observation disappeared/.test(value)))
     assert.ok(report.violations.some(value => /Fixture-known Taker observation disappeared/.test(value)))
+    assert.throws(() => assertNavigationFrames(report), error => error.code === 'ERR_ASSERTION'
+      && error.message.includes('"capture":') && error.message.includes('"validation":'),
+    'A correctness failure must retain capture and deferred validation cost diagnostics.')
   })
 
   test('a market selected in the same task as a timeframe switch immediately uses the requested period', async context => {

@@ -8,7 +8,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { _electron } from 'playwright'
 import { offscreenChartWindow, selectTimeframe } from './chart-acceptance.mjs'
 import { requireForegroundTests } from '../electron/test-presentation.js'
-import { assertResourceDeliveryBudget, summarizeResourceDelivery } from './resource-acceptance.mjs'
+import { assessResourceBudgets, summarizeResourceDelivery } from './resource-acceptance.mjs'
 
 const { values } = parseArgs({ options: { offscreen: { type: 'boolean' }, ticks: { type: 'string' }, 'cadence-ms': { type: 'string' } } })
 const offscreen = values.offscreen === true
@@ -267,12 +267,6 @@ try {
     'Every fixed-rate input must update the complete contract/timeframe universe before visible-series timing can acknowledge it.')
   report.delivery = summarizeResourceDelivery(load, commits, { intents: report.viewIntents })
   report.samples = report.delivery.samples
-  assertResourceDeliveryBudget(report.delivery, report.receiveToFrameBudgetMS)
-  if (!offscreen) {
-    assert.ok(report.switches.every(value => value.rowClickToFrameMS <= 100), 'A prepared contract selection exceeded the 100 ms row-click-to-RAF budget during the resource workload.')
-    assert.ok(report.foregroundFrameCadence.maxMS < 100, 'Continuous market intake caused a renderer RAF stall of at least 100 ms.')
-    assert.ok(report.foregroundFrameCadence.p95MS <= 50, 'Continuous market intake exceeded the 50 ms renderer RAF p95 budget.')
-  }
   await page.waitForFunction(() => window.__resourcePaint.indicatorValuesChecked > 0, null, { timeout: 30_000 })
   report.correctness = await page.evaluate(() => ({ violations: window.__resourcePaint.violations, indicatorValuesChecked: window.__resourcePaint.indicatorValuesChecked, rendererCommits: window.__resourcePaint.records.length }))
   report.background = await probe({ action: 'backgroundStatus' })
@@ -280,6 +274,8 @@ try {
   report.schedulerAfterLoad = await page.evaluate(() => window.__resourceScheduler)
   report.rendererMemoryAfterLoad = await page.evaluate(() => performance.memory ? { usedJSHeapSize: performance.memory.usedJSHeapSize, totalJSHeapSize: performance.memory.totalJSHeapSize, jsHeapSizeLimit: performance.memory.jsHeapSizeLimit } : null)
   report.final = await probe({ action: 'scaleStop' }); stopped = true
+  report.acceptanceFailures = assessResourceBudgets({ load, delivery: report.delivery, switches: report.switches,
+    frameCadence: report.foregroundFrameCadence }, { offscreen })
   assert.deepEqual(report.correctness.violations, [])
   assert.equal(report.final.actualRows, fixture.rowsSeeded)
   assert.equal(report.final.minimumRowsPerSeries, fixture.periods)
@@ -289,6 +285,7 @@ try {
   assert.deepEqual(report.final.liveMismatches, [], 'Every synthetic native series must retain the latest accepted revision.')
   assert.ok(report.switches.some(value => value.phase.includes('during fixed-rate')) && report.history.length === 2,
     'The workload must exercise selection and reversal while background writes and intake continue.')
+  assert.deepEqual(report.acceptanceFailures, [], 'Resource performance budgets failed; all independent failures and samples are retained.')
   report.outcome = 'passed'
 } catch (error) {
   report.outcome = 'failed'; report.error = error.stack ?? error.message
