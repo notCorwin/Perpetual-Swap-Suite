@@ -1,4 +1,4 @@
-import type { RealtimeMarketState, WebSocketFactory } from './realtime-market.js'
+import type { MarketTrafficProbeEvent, RealtimeMarketState, WebSocketFactory } from './realtime-market.js'
 
 export const OKX_PUBLIC_WEBSOCKET_URL: 'wss://ws.okx.com/ws/v5/public'
 export const PUBLIC_MARKET_CONTRACTS_PER_CONNECTION: 25
@@ -19,6 +19,8 @@ export type PublicMarketEventContext = {
   receivedAt: number
   /** Subscription proof captured before callback queuing. */
   acknowledged?: boolean
+  /** Present only while the bounded loopback traffic probe is armed. */
+  marketTrafficEvents?: readonly MarketTrafficProbeEvent[]
 }
 export type RealtimePublicMarketTelemetry = {
   receivedEvents: number
@@ -52,6 +54,8 @@ export type RealtimePublicMarketOptions = {
   /** New-connection events wait until this recovery callback completes. */
   onReconnect?: (instIds: string[], context: { signal: AbortSignal }) => void | Promise<void>
   onState?: (state: RealtimeMarketState) => void | Promise<void>
+  /** Test-only observer; absent during normal operation and called for each native market data event. */
+  onMarketTrafficIngress?: (events: readonly MarketTrafficProbeEvent[], probeCostMonotonicUS: number) => void
   webSocketFactory?: WebSocketFactory
   url?: string
   logger?: Pick<Console, 'error'>

@@ -321,7 +321,8 @@ try {
     optimizedDemand.candle15mCount = expectedSubscriptions.candle15m.length
     optimizedDemand.candle1HCount = expectedSubscriptions.candle1H.length
   }
-  const sampleStartedAt = fixture.beginSample()
+  const sampleWindow = await fixture.beginSample()
+  const sampleStartedAt = sampleWindow.startedAt
   await page.evaluate(({ requireForeground, passingIDs }) => {
     const state = { gaps: [], interactions: [], interactionSamples: [], lastFrame: null, startedAt: performance.now(), active: true,
       presentation: { requiredForeground: requireForeground, samples: 0, totalViolations: 0, violations: [] } }
@@ -371,8 +372,21 @@ try {
     }
   })()
   await Promise.all([interactionTask, sleep(durationSeconds * 1_000)])
-  cadence.stop()
-  await sleep(50)
+  const traffic = fixture.endSample()
+  failureMeasurements = {
+    schemaVersion: 1, mode: benchmarkMode, partial: true, generatedAt: new Date().toISOString(),
+    app: { path: app.selected, entry: app.entry, build: target, checkout },
+    runtime: { ...runtime, testPresentation: runtime.testPresentation, presentation,
+      network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' },
+    fixture: { asOf: fixture.asOf, candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture.oiFailureCount, seed: fixture.seed,
+      candidateIDs: fixture.instIds,
+      dataFingerprint: `market-traffic-v3-app-receipts-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
+      cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness, searchScenario,
+      readinessPhase: readiness ? 'all-passing-15m-frames-ready-before-steady-state-sample' : null },
+    rawFixtureSample: traffic,
+    renderer: null,
+  }
+  let rendererCaptureError
   const renderer = await page.evaluate(() => {
     const state = globalThis.__marketTrafficResponsiveness
     state.active = false
@@ -386,31 +400,29 @@ try {
       searchInputToSecondRAFMS: { sampleCount: state.interactions.length, p50: percentile(state.interactions, .5),
         p95: percentile(state.interactions, .95), p95Interpretation: 'Empirical nearest-rank summary; descriptive at this sample count, not a tail guarantee.',
         max: Math.max(0, ...state.interactions), samples: state.interactionSamples } }
-  })
-  failureMeasurements = {
-    schemaVersion: 1,
-    mode: benchmarkMode,
-    partial: true,
-    generatedAt: new Date().toISOString(),
-    app: { path: app.selected, entry: app.entry, build: target, checkout },
-    runtime: { ...runtime, testPresentation: runtime.testPresentation, presentation,
-      network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' },
-    fixture: { asOf: fixture.asOf, candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture.oiFailureCount, seed: fixture.seed,
-      candidateIDs: fixture.instIds,
-      dataFingerprint: `market-traffic-v3-app-receipts-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
-      cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness, searchScenario,
-      readinessPhase: readiness ? 'all-passing-15m-frames-ready-before-steady-state-sample' : null },
-    renderer: { ...renderer, measurement: searchMeasurement },
-  }
-  const traffic = fixture.endSample()
+  }).catch(error => { rendererCaptureError = error; return null })
+  failureMeasurements.renderer = renderer ? { ...renderer, measurement: searchMeasurement } : null
+  if (rendererCaptureError) failureMeasurements.rendererCaptureError = rendererCaptureError.message
   const appReceipts = await electron.evaluate((_, sample) => globalThis.__marketBackend.probe({ action: 'marketTrafficEvidence', phase: 'end',
-    sampleStartedAt: sample.startedAt, sampleEndedAt: sample.endedAt }), { startedAt: sampleStartedAt, endedAt: traffic.endedAt })
+    sampleStartedAt: sample.startedAt, sampleEndedAt: sample.endedAt,
+    sampleStartedMonotonicUS: sample.startedAtMonotonicUS, sampleEndedMonotonicUS: sample.endedAtMonotonicUS,
+    drainDeadlineMonotonicUS: sample.drainDeadlineMonotonicUS }), traffic).catch(error => {
+    failureMeasurements.applicationCaptureError = error.message
+    throw error
+  })
+  failureMeasurements.rawApplicationReceipts = appReceipts
+  if (rendererCaptureError) throw rendererCaptureError
+  assert.equal(appReceipts.captureError, undefined, `Application capture failed: ${JSON.stringify(appReceipts.captureError)}`)
   assert.deepEqual(appReceipts.expectedSubscriptions, expectedSubscriptions,
     'The configured eligible/focus demand must stay unchanged through the sample.')
   const receiptEvidence = createMarketTrafficEvidence({ expectedSubscriptions,
-    applicationReceipts: { ...appReceipts.applicationReceipts, tradeStats: appReceipts.tradeStats },
-    fixtureDeliveries: traffic.deliveryTimestamps, sampleStartedAt: traffic.startedAt, sampleEndedAt: traffic.endedAt, cadenceMS })
-  failureMeasurements.rawFixtureSample = traffic
+    applicationReceipts: appReceipts.applicationReceipts, nativeIngressEvents: appReceipts.nativeIngressEvents,
+    fixtureDeliveries: traffic, fixtureRounds: traffic.rounds,
+    sampleStartedAt: traffic.startedAt, sampleEndedAt: traffic.endedAt,
+    sampleStartedMonotonicUS: traffic.startedAtMonotonicUS, sampleEndedMonotonicUS: traffic.endedAtMonotonicUS,
+    drainDeadlineMonotonicUS: traffic.drainDeadlineMonotonicUS, cadenceMS,
+    allowNoFillTrades: true,
+    probeObserverCostMonotonicUS: appReceipts.probeObserverCostMonotonicUS })
   if (foreground) assert.equal(renderer.presentation.totalViolations, 0, 'Foreground visibility and focus must hold throughout sampling.')
   assert.ok(Math.abs(traffic.durationSeconds - durationSeconds) <= 0.75,
     `Steady-state traffic sample duration drifted outside the bounded window: ${traffic.durationSeconds}s.`)
@@ -497,8 +509,12 @@ try {
     }
   }
   await writeFile(output, `${JSON.stringify(report, null, 2)}\n`)
-  console.log(JSON.stringify({ report: output, ...report }, null, 2))
+  console.log(JSON.stringify({ report: output, candidates: candidateCount, qualified: passingCount,
+    completeRounds: receiptEvidence.fixtureRounds.length, matchedPayloads: receiptEvidence.fixtureEvents.length,
+    maximumSendToCallbackAcceptanceMS: receiptEvidence.aggregateLatenciesUS.fixtureSendToCallbackAcceptance.maximumUS / 1_000,
+    totalPayloadBytes: report.traffic.totalPayloadBytes }, null, 2))
 } catch (error) {
+  if (failureMeasurements && error?.marketTrafficEvidence) failureMeasurements.rawCausalEvidence = error.marketTrafficEvidence
   const requestCounts = Object.fromEntries([...new Set(fixture.requests.map(request => request.path))].map(path => [path,
     fixture.requests.filter(request => request.path === path).length]))
   const channels = Object.fromEntries(Object.entries(fixture.currentAcknowledgements).map(([channel, ids]) => [channel, ids.length]))

@@ -2,6 +2,7 @@ import { hookOperationMethods } from './operations.js'
 // Native OKX public streams cover the entire eligible universe independently of
 // chart selection. https://www.okx.com/docs-v5/en/#order-book-trading-market-data
 import { recordedWebSocketFactory } from './network-operations.js'
+import { marketTrafficPayloadIdentity, monotonicMicroseconds } from './market-traffic-callback-probe.js'
 
 export const OKX_PUBLIC_WEBSOCKET_URL = 'wss://ws.okx.com/ws/v5/public'
 export const PUBLIC_MARKET_CONTRACTS_PER_CONNECTION = 25
@@ -375,6 +376,8 @@ class PublicMarketConnection {
 
   message(connection, data) {
     if (!this.active(connection)) return
+    const trafficProbeEnabled = typeof this.options.onMarketTrafficIngress === 'function'
+    const nativeHandlerEnteredAtMonotonicUS = trafficProbeEnabled ? monotonicMicroseconds() : null
     const receivedAt = this.now()
     const ingress = ++connection.ingress
     this.armHeartbeat(connection)
@@ -385,13 +388,13 @@ class PublicMarketConnection {
         else if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) text = new TextDecoder().decode(data)
         else throw new TypeError('Unsupported WebSocket message data.')
       }
-      if (this.active(connection)) this.consume(connection, text, receivedAt, ingress)
+      if (this.active(connection)) this.consume(connection, text, receivedAt, ingress, nativeHandlerEnteredAtMonotonicUS)
     }).catch(error => this.report('WebSocket message decoding failed.', error, this.active(connection) ? true : 'log'))
     connection.messageTail = task
     this.track(task)
   }
 
-  consume(connection, text, receivedAt, ingress) {
+  consume(connection, text, receivedAt, ingress, nativeHandlerEnteredAtMonotonicUS = null) {
     if (text === 'pong') {
       connection.waitingForPong = false
       this.clearConnectionTimer(connection, 'pong')
@@ -468,27 +471,42 @@ class PublicMarketConnection {
         return
       }
     }
-    if (Array.isArray(message.data)) this.enqueue(connection, subscription, session, message, receivedAt)
+    if (Array.isArray(message.data)) this.enqueue(connection, subscription, session, message, receivedAt, ingress, nativeHandlerEnteredAtMonotonicUS)
   }
 
-  enqueue(connection, subscription, session, message, receivedAt) {
+  enqueue(connection, subscription, session, message, receivedAt, nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS) {
     this.telemetry.receivedEvents += message.data.length
     this.telemetry.lastReceivedAt = receivedAt
     this.telemetry.pendingEvents++
     const key = keyFor(subscription)
     const acknowledged = !connection.pending.has(key)
     const current = () => this.active(connection) && this.subscriptions.get(key) === subscription && connection.sessions.get(key) === session
+    let trafficEvents = null
+    const trafficObserver = this.options.onMarketTrafficIngress
+    if (Number.isSafeInteger(nativeHandlerEnteredAtMonotonicUS) && typeof trafficObserver === 'function') {
+      const probeStartedAtMonotonicUS = monotonicMicroseconds()
+      trafficEvents = message.data.map(payload => ({
+        ...(marketTrafficPayloadIdentity(subscription.channel, subscription.instId, payload)
+          ?? { channel: subscription.channel, instId: subscription.instId, identity: null, payloadFingerprint: null }),
+        nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS,
+      }))
+      const probeCostMonotonicUS = monotonicMicroseconds() - probeStartedAtMonotonicUS
+      trafficObserver(trafficEvents, probeCostMonotonicUS)
+    }
+    const contextFor = trafficEvent => ({ signal: session.controller.signal, receivedAt, acknowledged,
+      ...(trafficEvent ? { marketTrafficEvents: [trafficEvent] } : {}) })
     const task = (this.tails.get(key) ?? Promise.resolve()).then(async () => {
       if (!await connection.readyTask || !current()) return
-      const context = { signal: session.controller.signal, receivedAt, acknowledged }
       const { instId, channel } = subscription
       if (channel === 'instruments') {
-        await this.options.onInstruments(message.data, context)
+        await this.options.onInstruments(message.data, contextFor(undefined))
       } else if (channel === 'trades') {
-        await this.options.onTrades(instId, message.data, context)
+        await this.options.onTrades(instId, message.data, { signal: session.controller.signal, receivedAt, acknowledged,
+          ...(trafficEvents ? { marketTrafficEvents: trafficEvents } : {}) })
         this.telemetry.tradeEvents += message.data.length
-      } else for (const raw of message.data) {
+      } else for (let index = 0; index < message.data.length; index++) {
         if (!current()) return
+        const raw = message.data[index], context = contextFor(trafficEvents?.[index])
         if (channel === 'books') {
           const book = this.updateBook(connection, instId, message.action, raw)
           if (!book) continue

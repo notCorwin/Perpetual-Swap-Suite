@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { MetadataStore } from './metadata-store.js'
 import { MarketStore } from './market-store.js'
 import { MarketService } from './market-service.js'
-import { wrapAcceptedCallback } from './market-traffic-callback-probe.js'
+import { drainCallbackProbeObserverCostMonotonicUS, monotonicMicroseconds, validateMarketTrafficDrainWindow, wrapAcceptedCallback } from './market-traffic-callback-probe.js'
 import { ChartNotificationEncoder } from './chart-notifications.js'
 import { createChartAcquisitionFixture, createChartColdBoundaryFixture, seedCachedListProjection, seedChartScrollBenchmark, seedHistoricalStatisticsBoundary, seedInstrumentNavigationBenchmark } from '../e2e-fixtures.js'
 import { backgroundArchiveRows, seedMarketResources, startBackgroundArchive } from '../market-resource-fixtures.js'
@@ -229,24 +229,53 @@ async function probe(input) {
       if (JSON.stringify(expectedSubscriptions.trades) !== JSON.stringify(expectedTrades)) {
         throw new Error('Configured trade statistics demand does not match listed contracts and chart focus.')
       }
-      const capture = { startedAt: Date.now(), endedAt: null, expectedSubscriptions, actualSubscriptions,
-        candidateIDs, eligibleIDs, focusedInstrumentID, booksEnabled, records: {}, restore: [] }
+      const capture = { expectedSubscriptions, actualSubscriptions,
+        candidateIDs, eligibleIDs, focusedInstrumentID, booksEnabled, nativeIngressEvents: [], callbackEvents: [],
+        callbackEventsByID: new Map(), probeObserverCostMonotonicUS: 0, ingressOptions: new Set(), restore: [] }
       const restoreCapture = () => {
         for (const restore of capture.restore.splice(0).reverse()) restore()
         if (service.__marketTrafficEvidence === capture) delete service.__marketTrafficEvidence
       }
       capture.restoreCapture = restoreCapture
-      const record = (channel, instId, receivedAt, fillCount) => {
-        if (typeof instId !== 'string' || !Number.isSafeInteger(receivedAt) || receivedAt < capture.startedAt
-          || capture.endedAt !== null && receivedAt > capture.endedAt) return
-        const byInstrument = capture.records[channel] ??= {}
-        const values = byInstrument[instId] ??= []
-        values.push({ receivedAt, ...(fillCount === undefined ? {} : { fillCount }) })
+      drainCallbackProbeObserverCostMonotonicUS()
+      const installIngressObserver = options => {
+        if (capture.ingressOptions.has(options)) return
+        capture.ingressOptions.add(options)
+        const previous = options.onMarketTrafficIngress
+        const observer = (events, observerCostUS = 0) => {
+          capture.probeObserverCostMonotonicUS += Number.isSafeInteger(observerCostUS) && observerCostUS >= 0 ? observerCostUS : 0
+          if (Array.isArray(events)) capture.nativeIngressEvents.push(...events)
+        }
+        options.onMarketTrafficIngress = observer
+        capture.restore.push(() => {
+          if (options.onMarketTrafficIngress !== observer) return
+          if (previous === undefined) delete options.onMarketTrafficIngress
+          else options.onMarketTrafficIngress = previous
+        })
       }
       const wrap = (options, name, channelFor) => {
-        wrapAcceptedCallback(options, name, args => {
+        wrapAcceptedCallback(options, name, (args, timing) => {
           const evidence = channelFor(args)
-          if (evidence) record(evidence.channel, evidence.instId, evidence.receivedAt, evidence.fillCount)
+          if (!evidence) return
+          const events = evidence.context?.marketTrafficEvents
+          if (timing.phase === 'entry') {
+            if (!Array.isArray(events)) return
+            const records = events.map(event => {
+              if (event.channel !== evidence.channel || event.instId !== evidence.instId) return null
+              const record = { ...event, callbackID: timing.callbackID,
+                callbackEnteredAtMonotonicUS: timing.callbackEnteredAtMonotonicUS,
+                callbackAcceptedAtMonotonicUS: null, receivedAt: evidence.context.receivedAt,
+                fillCount: evidence.fillCount ?? 0 }
+              capture.callbackEvents.push(record)
+              return record
+            })
+            capture.callbackEventsByID.set(timing.callbackID, records.filter(Boolean))
+          } else {
+            for (const record of capture.callbackEventsByID.get(timing.callbackID) ?? []) {
+              record.callbackAcceptedAtMonotonicUS = timing.callbackAcceptedAtMonotonicUS
+            }
+            capture.callbackEventsByID.delete(timing.callbackID)
+          }
         }, capture.restore)
       }
       try {
@@ -260,7 +289,8 @@ async function probe(input) {
           instrumentCallbackForOptions(options, 'onTrades', 'trades')
         }
         function instrumentCallbackForOptions(options, name, channel) {
-          wrap(options, name, ([instId, values, context]) => ({ channel, instId, receivedAt: context?.receivedAt,
+          installIngressObserver(options)
+          wrap(options, name, ([instId, values, context]) => ({ channel, instId, context,
             ...(channel === 'trades' ? { fillCount: Array.isArray(values) ? values.length : 0 } : {}) }))
         }
         for (const market of [...publicMarket.shards, publicMarket.controlShard].filter(Boolean)) instrumentOptionForShard(market.options)
@@ -272,11 +302,12 @@ async function probe(input) {
         }
         publicMarket.makeShard = wrappedMakeShard
         capture.restore.push(() => { if (publicMarket.makeShard === wrappedMakeShard) publicMarket.makeShard = makeShard })
+        installIngressObserver(service.realtime.options)
         wrap(service.realtime.options, 'onForming', ([row, context]) => ({
-          channel: `candle${row?.timeframe}`, instId: row?.instrument, receivedAt: context?.receivedAt,
+          channel: `candle${row?.timeframe}`, instId: row?.instrument, context,
         }))
         wrap(service.realtime.options, 'onConfirmed', ([row, context]) => ({
-          channel: `candle${row?.timeframe}`, instId: row?.instrument, receivedAt: context?.receivedAt,
+          channel: `candle${row?.timeframe}`, instId: row?.instrument, context,
         }))
         service.__marketTrafficEvidence = capture
         return { source: 'market-service accepted callbacks after native parsing', expectedSubscriptions, actualSubscriptions,
@@ -289,31 +320,33 @@ async function probe(input) {
     if (input.phase === 'end') {
       const capture = service.__marketTrafficEvidence
       if (!capture) throw new Error('Market traffic receipt capture was not armed.')
-      const { sampleStartedAt, sampleEndedAt } = input
+      const { sampleStartedAt, sampleEndedAt, sampleStartedMonotonicUS, sampleEndedMonotonicUS,
+        drainDeadlineMonotonicUS } = input
+      const snapshotCapture = () => {
+        capture.probeObserverCostMonotonicUS += drainCallbackProbeObserverCostMonotonicUS()
+        return { source: 'fixture socket write matched to native WebSocket handler entry and fulfilled production callback', sampleStartedAt, sampleEndedAt,
+          sampleStartedMonotonicUS, sampleEndedMonotonicUS, drainDeadlineMonotonicUS,
+          expectedSubscriptions: capture.expectedSubscriptions, actualSubscriptions: capture.actualSubscriptions,
+          marketDemand: { candidateIDs: capture.candidateIDs, eligibleIDs: capture.eligibleIDs,
+            focusedInstrumentID: capture.focusedInstrumentID, booksEnabled: capture.booksEnabled },
+          applicationReceipts: { callbackEvents: capture.callbackEvents.map(event => ({ ...event })) },
+          nativeIngressEvents: capture.nativeIngressEvents.map(event => ({ ...event })),
+          probeObserverCostMonotonicUS: capture.probeObserverCostMonotonicUS }
+      }
       try {
         if (!Number.isSafeInteger(sampleStartedAt) || !Number.isSafeInteger(sampleEndedAt) || sampleEndedAt <= sampleStartedAt) {
           throw new Error('Market traffic receipt capture requires the complete fixture sample window.')
         }
-        capture.endedAt = sampleEndedAt
-        await Promise.all([service.publicRealtime.whenIdle(), service.realtime.whenIdle()])
-        const applicationReceipts = {}, tradeStats = {}
-        for (const [channel, byInstrument] of Object.entries(capture.records)) {
-          applicationReceipts[channel] = {}
-          for (const [instId, records] of Object.entries(byInstrument)) {
-            const selected = records.filter(value => value.receivedAt >= sampleStartedAt && value.receivedAt <= sampleEndedAt)
-            applicationReceipts[channel][instId] = selected.map(value => value.receivedAt)
-            if (channel === 'trades') tradeStats[instId] = {
-              messageCount: selected.length,
-              fillCount: selected.reduce((sum, value) => sum + (value.fillCount ?? 0), 0),
-              noFillMessageCount: selected.filter(value => value.fillCount === 0).length,
-            }
-          }
+        validateMarketTrafficDrainWindow(input)
+        while (monotonicMicroseconds() < drainDeadlineMonotonicUS) {
+          const remainingMS = (drainDeadlineMonotonicUS - monotonicMicroseconds()) / 1_000
+          await new Promise(resolve => setTimeout(resolve, Math.max(1, Math.ceil(remainingMS))))
         }
-        return { source: 'market-service accepted callbacks after native parsing', sampleStartedAt, sampleEndedAt,
-          expectedSubscriptions: capture.expectedSubscriptions, actualSubscriptions: capture.actualSubscriptions,
-          marketDemand: { candidateIDs: capture.candidateIDs, eligibleIDs: capture.eligibleIDs,
-            focusedInstrumentID: capture.focusedInstrumentID, booksEnabled: capture.booksEnabled },
-          applicationReceipts, tradeStats }
+        return snapshotCapture()
+      } catch (error) {
+        // Return a serializable failure together with the raw capture; worker
+        // RPC errors preserve only message/stack and would discard this data.
+        return { ...snapshotCapture(), captureError: { name: error.name, message: error.message } }
       } finally {
         capture.restoreCapture()
       }

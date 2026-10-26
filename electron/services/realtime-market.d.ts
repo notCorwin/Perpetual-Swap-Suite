@@ -33,7 +33,15 @@ export interface RealtimeWebSocket {
   removeEventListener(type: string, callback: EventListener): void
 }
 export type WebSocketFactory = (url: string) => RealtimeWebSocket
-export type RealtimeEventContext = { signal: AbortSignal; receivedAt: number }
+export type MarketTrafficProbeEvent = {
+  channel: string
+  instId: string
+  identity: string | null
+  payloadFingerprint: string | null
+  nativeMessageSequence: number
+  nativeHandlerEnteredAtMonotonicUS: number
+}
+export type RealtimeEventContext = { signal: AbortSignal; receivedAt: number; marketTrafficEvents?: readonly MarketTrafficProbeEvent[] }
 export type RealtimeMarketOptions<Candle extends CandleRecord = CandleRecord> = {
   parseCandle: (instId: string, timeframe: RadarTimeframe, raw: string[]) => Candle | null
   /** Memory projection only. Same-volume OHLC corrections follow receive order. */
@@ -46,6 +54,8 @@ export type RealtimeMarketOptions<Candle extends CandleRecord = CandleRecord> = 
   onReconnect: (subscriptions: RealtimeSubscription[], context: { signal: AbortSignal }) => void | Promise<void>
   /** Per-series acknowledgement; independent of other pending subscriptions. */
   onSubscribed?: (subscription: RealtimeSubscription, context: RealtimeEventContext) => void | Promise<void>
+  /** Test-only observer; absent during normal operation and called for each native candle message. */
+  onMarketTrafficIngress?: (events: readonly MarketTrafficProbeEvent[], probeCostMonotonicUS: number) => void
   onState?: (state: RealtimeMarketState) => void | Promise<void>
   webSocketFactory?: WebSocketFactory
   url?: string

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
 import { once } from 'node:events'
+import { marketTrafficPayloadIdentity, monotonicMicroseconds } from '../../electron/services/market-traffic-callback-probe.js'
 import { ownFixtureServer } from './fixture-server.mjs'
 
 export const marketTrafficIntervals = Object.freeze({ '5m': 300_000, '15m': 900_000, '1H': 3_600_000 })
@@ -87,8 +88,10 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
   }
   const instruments = instIds.map(instId => { const { index, ...instrument } = instrumentById.get(instId); return instrument })
   const clients = new Set(), requests = [], errors = [], sentByChannel = {}, acknowledgements = {}, deliveries = {}, lastDelivery = {}, latestValues = {}, bookSequences = new Map(), bookFrames = []
-  const window = { active: false, startedAt: null, endedAt: null, ws: {}, http: {}, ack: {}, deliveries: {}, deliveryTimestamps: {} }
-  let tick = 0, cadenceTimer = null
+  const window = { active: false, startedAt: null, endedAt: null, startedAtMonotonicUS: null, endedAtMonotonicUS: null,
+    ws: {}, http: {}, ack: {}, deliveries: {}, deliveryTimestamps: {}, events: [], rounds: [] }
+  let tick = 0, cadenceRound = 0, cadenceTimer = null, cadenceIntervalMS = null, sampleStartWaiter = null, currentRoundEvidence = null
+  const streamSequences = new Map()
   const latestCounter = (channel, instId) => {
     const key = `${channel}:${instId}`
     deliveries[key] = (deliveries[key] ?? 0) + 1
@@ -101,11 +104,26 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
       timestamps.push(now())
     }
   }
-  const sendText = (client, value, channel, kind = 'data') => {
+  const sendText = (client, value, channel, kind = 'data', roundId = cadenceRound) => {
     if (client.socket.destroyed) return false
     const text = typeof value === 'string' ? value : JSON.stringify(value)
     const bytes = Buffer.byteLength(text)
+    const sidecar = kind === 'data' && window.active && currentRoundEvidence && Array.isArray(value?.data)
+      ? value.data.map(payload => ({
+        ...(marketTrafficPayloadIdentity(channel, value.arg?.instId, payload)
+          ?? { channel, instId: value.arg?.instId ?? null, identity: null, payloadFingerprint: null }),
+        roundId, sequence: 0, sentAt: now(),
+      })) : []
+    const sentAtMonotonicUS = sidecar.length ? monotonicMicroseconds() : null
     client.socket.write(frame(text))
+    for (const event of sidecar) {
+      const stream = `${event.channel}:${event.instId}`
+      event.sequence = (streamSequences.get(stream) ?? 0) + 1
+      event.sentAtMonotonicUS = sentAtMonotonicUS
+      streamSequences.set(stream, event.sequence)
+      window.events.push(event)
+      currentRoundEvidence.events.push(event)
+    }
     addTally(sentByChannel, channel, bytes)
     if (window.active) addTally(window.ws, channel, bytes)
     if (kind === 'ack' && window.active) addTally(window.ack, channel, bytes)
@@ -334,6 +352,36 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
     }
     return result
   }
+  const allTrafficChannels = ['tickers', 'open-interest', 'books', 'trades', 'candle5m', 'candle15m', 'candle1H']
+  const trafficDemand = () => Object.fromEntries(allTrafficChannels.map(channel => [channel,
+    [...(activeSubscriptions().get(channel) ?? [])].sort()]))
+  const dispatchCadenceRound = () => {
+    tick++
+    cadenceRound++
+    if (sampleStartWaiter) {
+      window.active = true
+      window.startedAt = now()
+      window.startedAtMonotonicUS = monotonicMicroseconds()
+      window.endedAt = null
+      window.endedAtMonotonicUS = null
+      window.ws = {}; window.http = {}; window.ack = {}; window.deliveries = {}; window.deliveryTimestamps = {}
+      window.events = []; window.rounds = []
+      streamSequences.clear()
+    }
+    currentRoundEvidence = window.active ? { roundId: cadenceRound, startedAtMonotonicUS: monotonicMicroseconds(),
+      expectedSubscriptions: trafficDemand(), events: [] } : null
+    if (currentRoundEvidence) window.rounds.push(currentRoundEvidence)
+    for (const client of clients) for (const arg of client.subscriptions.values()) {
+      if (arg.channel !== 'instruments') sendSubscribed(client, arg, tick + seed)
+    }
+    if (currentRoundEvidence) currentRoundEvidence.endedAtMonotonicUS = monotonicMicroseconds()
+    currentRoundEvidence = null
+    if (sampleStartWaiter) {
+      const resolveStart = sampleStartWaiter
+      sampleStartWaiter = null
+      resolveStart({ startedAt: window.startedAt, startedAtMonotonicUS: window.startedAtMonotonicUS })
+    }
+  }
   return {
     asOf, instIds, instruments, kinds, passingCount, spreadFailureCount, oiFailureCount, seed,
     environment: { PERPETUAL_SWAP_E2E_HTTP_ORIGIN: origin,
@@ -344,30 +392,32 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
     startCadence(intervalMS = 500) {
       assert.ok(Number.isSafeInteger(intervalMS) && intervalMS >= 100 && intervalMS <= 2_000, 'Cadence must be 100–2000ms.')
       if (cadenceTimer) throw new Error('The fixture cadence is already running.')
-      const dispatch = () => {
-        tick++
-        for (const client of clients) for (const arg of client.subscriptions.values()) {
-          if (arg.channel !== 'instruments') sendSubscribed(client, arg, tick + seed)
-        }
-      }
-      dispatch()
-      cadenceTimer = setInterval(dispatch, intervalMS)
+      dispatchCadenceRound()
+      cadenceIntervalMS = intervalMS
+      cadenceTimer = setInterval(dispatchCadenceRound, intervalMS)
       cadenceTimer.unref?.()
-      return { stop: () => { clearInterval(cadenceTimer); cadenceTimer = null }, intervalMS }
+      return { stop: () => { if (cadenceTimer) clearInterval(cadenceTimer); cadenceTimer = null }, intervalMS }
     },
     beginSample() {
-      if (window.active) throw new Error('A traffic sample is already active.')
-      window.active = true
-      window.startedAt = now()
-      window.endedAt = null
-      window.ws = {}; window.http = {}; window.ack = {}; window.deliveries = {}; window.deliveryTimestamps = {}
-      return window.startedAt
+      if (window.active || sampleStartWaiter) throw new Error('A traffic sample is already active or starting.')
+      return new Promise(resolve => { sampleStartWaiter = resolve })
     },
     endSample() {
+      if (!window.active || !Number.isSafeInteger(window.startedAtMonotonicUS)) throw new Error('A traffic sample is not active.')
+      if (cadenceTimer) clearInterval(cadenceTimer)
+      cadenceTimer = null
+      window.endedAtMonotonicUS = monotonicMicroseconds()
+      const lastSendUS = window.events.at(-1)?.sentAtMonotonicUS
+      while (lastSendUS != null && window.endedAtMonotonicUS <= lastSendUS) window.endedAtMonotonicUS = monotonicMicroseconds()
       window.endedAt = now()
       window.active = false
+      const events = structuredClone(window.events), rounds = structuredClone(window.rounds)
+      const drainDeadlineMonotonicUS = events.length
+        ? Math.max(...events.map(event => event.sentAtMonotonicUS + 1_000 * cadenceIntervalMS)) : window.endedAtMonotonicUS
       return { startedAt: window.startedAt, endedAt: window.endedAt,
         durationSeconds: (window.endedAt - window.startedAt) / 1_000,
+        startedAtMonotonicUS: window.startedAtMonotonicUS, endedAtMonotonicUS: window.endedAtMonotonicUS,
+        drainDeadlineMonotonicUS, events, rounds,
         websocket: structuredClone(window.ws), http: structuredClone(window.http), acknowledgements: structuredClone(window.ack),
         deliveries: structuredClone(window.deliveries), deliveryTimestamps: structuredClone(window.deliveryTimestamps) }
     },
@@ -385,6 +435,7 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
     async close() {
       if (cadenceTimer) clearInterval(cadenceTimer)
       cadenceTimer = null
+      cadenceIntervalMS = null
       for (const client of clients) client.socket.destroy()
       await ownedServer.close()
     },

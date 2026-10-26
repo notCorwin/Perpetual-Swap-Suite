@@ -58,13 +58,12 @@ test('market traffic fixture counts acknowledged subscriptions and exact sent pa
     socket.addEventListener('open', resolve, { once: true })
     socket.addEventListener('error', reject, { once: true })
   })
-  fixture.beginSample()
+  fixture.startCadence(100)
+  await fixture.beginSample()
   socket.send(JSON.stringify({ id: 'bench-1', op: 'subscribe', args: [{ channel: 'tickers', instId: 'T000-USDT-SWAP' }] }))
   const deadline = Date.now() + 2_000
   while (messages.length < 2 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
-  const cadence = fixture.startCadence(100)
   await new Promise(resolve => setTimeout(resolve, 150))
-  cadence.stop()
   const sample = fixture.endSample()
   assert.equal(messages[0]?.event, 'subscribe')
   assert.equal(messages[1]?.arg?.channel, 'tickers')
@@ -93,18 +92,17 @@ test('market traffic book snapshots use the native reset sequence and updates ad
     socket.addEventListener('open', resolve, { once: true })
     socket.addEventListener('error', reject, { once: true })
   })
-  fixture.beginSample()
+  fixture.startCadence(100)
+  await fixture.beginSample()
   socket.send(JSON.stringify({ id: 'book-bench-1', op: 'subscribe', args: [{ channel: 'books', instId: 'T000-USDT-SWAP' }] }))
   const initialDeadline = Date.now() + 2_000
   while (messages.filter(value => value.arg?.channel === 'books').length < 2 && Date.now() < initialDeadline) {
     await new Promise(resolve => setTimeout(resolve, 10))
   }
-  const cadence = fixture.startCadence(100)
   const updateDeadline = Date.now() + 2_000
   while (messages.filter(value => value.arg?.channel === 'books' && value.action).length < 3 && Date.now() < updateDeadline) {
     await new Promise(resolve => setTimeout(resolve, 10))
   }
-  cadence.stop()
   const sample = fixture.endSample()
   const frames = messages.filter(value => value.arg?.channel === 'books' && value.action)
   assert.ok(frames.length >= 3, 'The fixture must send one book snapshot and recurring book updates.')
@@ -138,6 +136,47 @@ test('market traffic book snapshots use the native reset sequence and updates ad
     frames.map(({ action, data }) => ({ action, seqId: data[0].seqId, prevSeqId: data[0].prevSeqId })))
 })
 
+test('market traffic fixture keeps round identity in its sidecar without changing OKX wire messages', async t => {
+  const fixture = await createMarketTrafficExchange({ candidateCount: 3, passingCount: 1, spreadFailureCount: 1 })
+  const socket = new WebSocket(`${fixture.environment.PERPETUAL_SWAP_E2E_WEBSOCKET_ORIGIN}/ws/v5/public`)
+  t.after(async () => {
+    if (socket.readyState < WebSocket.CLOSING) await new Promise(resolve => {
+      socket.addEventListener('close', resolve, { once: true })
+      socket.close()
+    })
+    await fixture.close()
+  })
+  const messages = []
+  socket.addEventListener('message', event => messages.push(JSON.parse(event.data)))
+  await new Promise((resolve, reject) => {
+    socket.addEventListener('open', resolve, { once: true })
+    socket.addEventListener('error', reject, { once: true })
+  })
+  socket.send(JSON.stringify({ id: 'round-sidecar', op: 'subscribe', args: [{ channel: 'tickers', instId: 'T000-USDT-SWAP' }] }))
+  const ackDeadline = Date.now() + 2_000
+  while (messages.length < 2 && Date.now() < ackDeadline) await new Promise(resolve => setTimeout(resolve, 5))
+  const sampleStart = fixture.beginSample()
+  const cadence = fixture.startCadence(100)
+  await sampleStart
+  cadence.stop()
+  const sample = fixture.endSample()
+  assert.equal(sample.events.length, 1)
+  assert.equal(sample.rounds.length, 1)
+  assert.equal(sample.events[0].roundId, sample.rounds[0].roundId)
+  assert.equal(sample.events[0].sequence, 1)
+  assert.match(sample.events[0].identity, /T000-USDT-SWAP/)
+  assert.match(sample.events[0].payloadFingerprint, /^[a-f0-9]{64}$/)
+  assert.ok(sample.events[0].sentAtMonotonicUS >= sample.startedAtMonotonicUS
+    && sample.events[0].sentAtMonotonicUS < sample.endedAtMonotonicUS)
+  assert.equal(sample.drainDeadlineMonotonicUS, sample.events[0].sentAtMonotonicUS + 100_000)
+  assert.deepEqual(sample.rounds[0].expectedSubscriptions, {
+    tickers: ['T000-USDT-SWAP'], 'open-interest': [], books: [], trades: [], candle5m: [], candle15m: [], candle1H: [],
+  })
+  const wireData = messages.find(value => value.arg?.channel === 'tickers' && value.data)
+  assert.equal(wireData.roundId, undefined)
+  assert.equal(wireData.sequence, undefined)
+})
+
 test('market traffic confirms every elapsed native candle and keeps HTTP history continuous across an hourly boundary', async t => {
   const hour = 3_600_000, boundary = Math.ceil(Date.now() / hour) * hour
   let timestamp = boundary - 50
@@ -165,9 +204,10 @@ test('market traffic confirms every elapsed native candle and keeps HTTP history
     assert.equal(messages.filter(value => value.data).length, count)
   }
   await waitForRows(3)
-  fixture.beginSample()
   timestamp = boundary + 50
+  const sampleStart = fixture.beginSample()
   const cadence = fixture.startCadence(100)
+  await sampleStart
   cadence.stop()
   await waitForRows(9)
   const sample = fixture.endSample()

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import test from 'node:test'
 import { createMarketTrafficEvidence } from '../helpers/market-traffic-evidence.mjs'
 import { compareMarketTrafficReports, validateMarketTrafficReport } from '../../scripts/market-traffic-comparison.mjs'
@@ -14,18 +15,39 @@ const candidateIDs = Array.from({ length: 10 }, (_, index) => `T${String(index).
 const requiredChannels = ['tickers', 'open-interest', 'candle5m']
 const sampleStartedAt = 1_798_000_000_000
 const sampleEndedAt = sampleStartedAt + 7_000
-const receipts = Array.from({ length: 13 }, (_, index) => sampleStartedAt + 500 + index * 500)
-
 function trafficEvidence() {
   const expectedSubscriptions = { tickers: candidateIDs, 'open-interest': candidateIDs, books: candidateIDs.slice(0, 2),
     trades: candidateIDs.slice(0, 2), candle5m: candidateIDs, candle15m: [], candle1H: [] }
-  const events = Object.fromEntries(Object.entries(expectedSubscriptions).map(([channel, ids]) => [channel,
-    Object.fromEntries(ids.map(instId => [instId, receipts]))]))
-  const tradeStats = Object.fromEntries(candidateIDs.slice(0, 2).map(instId => [instId,
-    { messageCount: receipts.length, fillCount: receipts.length, noFillMessageCount: 0 }]))
+  const sampleStartedMonotonicUS = 100_000_000, sampleEndedMonotonicUS = sampleStartedMonotonicUS + 7_000_000
+  const fixtureEvents = [], fixtureRounds = [], nativeIngressEvents = [], callbackEvents = []
+  let nativeMessageSequence = 0, callbackID = 0
+  for (let index = 0; index < 13; index++) {
+    const roundId = index + 1, roundEvents = []
+    const sentAtMonotonicUS = sampleStartedMonotonicUS + 500_000 + index * 500_000
+    for (const [channel, ids] of Object.entries(expectedSubscriptions)) for (const instId of ids) {
+      const identity = JSON.stringify([channel, instId, roundId])
+      const payloadFingerprint = createHash('sha256').update(identity).digest('hex')
+      const event = { channel, instId, identity, payloadFingerprint, roundId, sequence: index + 1,
+        sentAt: sampleStartedAt + 500 + index * 500, sentAtMonotonicUS }
+      fixtureEvents.push(event)
+      roundEvents.push(event)
+      nativeMessageSequence++
+      const nativeHandlerEnteredAtMonotonicUS = sentAtMonotonicUS + 1_000
+      nativeIngressEvents.push({ channel, instId, identity, payloadFingerprint, nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS })
+      callbackID++
+      callbackEvents.push({ channel, instId, identity, payloadFingerprint, nativeMessageSequence, callbackID,
+        nativeHandlerEnteredAtMonotonicUS, callbackEnteredAtMonotonicUS: sentAtMonotonicUS + 2_000,
+        callbackAcceptedAtMonotonicUS: sentAtMonotonicUS + 20_000,
+        receivedAt: sampleStartedAt + 505 + index * 500, fillCount: channel === 'trades' ? 1 : 0 })
+    }
+    fixtureRounds.push({ roundId, startedAtMonotonicUS: sentAtMonotonicUS, endedAtMonotonicUS: sentAtMonotonicUS,
+      expectedSubscriptions, events: roundEvents })
+  }
   return createMarketTrafficEvidence({ expectedSubscriptions,
-    applicationReceipts: { ...events, tradeStats }, fixtureDeliveries: events,
-    sampleStartedAt, sampleEndedAt, cadenceMS: 500 })
+    applicationReceipts: { callbackEvents }, nativeIngressEvents,
+    fixtureDeliveries: { events: fixtureEvents, rounds: fixtureRounds }, fixtureRounds,
+    sampleStartedAt, sampleEndedAt, sampleStartedMonotonicUS, sampleEndedMonotonicUS,
+    drainDeadlineMonotonicUS: sampleEndedMonotonicUS, cadenceMS: 500 })
 }
 
 const channelEvidence = (multiplier, names = ['tickers', 'open-interest', 'books', 'trades', 'candle5m']) =>
@@ -98,16 +120,12 @@ test('market traffic comparison requires equal live coverage and reports measure
   assert.equal(result.responsiveness.rafOpportunityGapP95MS.passed, true)
 })
 
-test('paired comparison rejects a retained stream with an extra fixture tick', () => {
+test('comparison rejects a mutated causal stream summary before pairing', () => {
   const before = report({ baseline: true, multiplier: 3 })
   const after = report({ multiplier: 2 })
   const entry = after.traffic.receiptEvidence.channels.tickers.entries[0]
-  entry.applicationReceivedAtTimestamps.push(sampleEndedAt)
-  entry.fixtureSentAtTimestamps.push(sampleEndedAt)
-  entry.applicationReceiptCount++
   entry.fixtureSendCount++
-  entry.lastReceivedAt = sampleEndedAt
-  assert.throws(() => compareMarketTrafficReports(before, after), /tickers\/T000-USDT-SWAP fixture send counts must match exactly/)
+  assert.throws(() => compareMarketTrafficReports(before, after), /Causal market traffic channel summaries are inconsistent/)
 })
 
 test('paired comparison requires distinct clean app revisions', () => {
@@ -147,7 +165,7 @@ test('market traffic comparison rejects changed fixtures, missing receipt interv
   assert.throws(() => compareMarketTrafficReports(before, report({ multiplier: 2, seed: 18 })), /seed must match/)
   const missingMiddle = report({ multiplier: 2 })
   missingMiddle.traffic.receiptEvidence.channels.tickers.entries[0].applicationReceivedAtTimestamps.splice(5, 1)
-  assert.throws(() => compareMarketTrafficReports(before, missingMiddle), /receipt count is inconsistent/)
+  assert.throws(() => compareMarketTrafficReports(before, missingMiddle), /Causal market traffic channel summaries are inconsistent/)
   assert.throws(() => compareMarketTrafficReports(before, report({ multiplier: 2, frameGapP95MS: 60 })), /RAF opportunity gap|regressed/)
 })
 
