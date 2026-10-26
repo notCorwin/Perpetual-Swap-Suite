@@ -591,7 +591,10 @@ export async function measurePaintLatency(page, { inputs, targets, requireForegr
   if (report.unaccountedInputs.length) {
     throw new Error(`Chart intents disappeared without a committed target or coalescing successor: ${JSON.stringify(report.unaccountedInputs)}`)
   }
-  if (requireForeground) assertScrollResponsiveness(report)
+  if (requireForeground) {
+    try { assertScrollResponsiveness(report) }
+    catch (error) { throw new Error(`${error.message}\nScroll timing: ${JSON.stringify(report)}`, { cause: error }) }
+  }
   return report
 }
 
