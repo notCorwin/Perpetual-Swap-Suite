@@ -11,6 +11,12 @@ test('a single middle RAF stall cannot hide behind a healthy p95', () => {
   assert.throws(() => validateMarketTrafficReport(value, 'stalled'), /RAF stall/)
 })
 
+test('a diagnostic profile cannot replace acceptance or its comparison baseline', () => {
+  const value = { ...report({ foreground: true }), diagnosticOnly: true }
+  assert.throws(() => validateMarketTrafficReport(value, 'profiled'), /diagnostic profiling/)
+  assert.throws(() => validateMarketTrafficReport(value, 'baseline', { baseline: true }), /diagnostic profiling/)
+})
+
 const candidateIDs = Array.from({ length: 10 }, (_, index) => `T${String(index).padStart(3, '0')}-USDT-SWAP`)
 const requiredChannels = ['tickers', 'open-interest', 'candle5m']
 const sampleStartedAt = 1_798_000_000_000

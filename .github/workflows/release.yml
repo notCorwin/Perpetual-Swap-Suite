@@ -196,9 +196,17 @@ jobs:
           mkdir -p artifacts/build
           node scripts/build-artifact-reuse.mjs build --manifest artifacts/build/renderer.json -- npm run build 2>&1 | tee artifacts/build/renderer-build.log
       - name: Enforce current-version absolute traffic and responsiveness gates
+        id: traffic-gate
         run: |
           node scripts/build-artifact-reuse.mjs verify --manifest artifacts/build/renderer.json
           npm run sandbox -- command --desktop --foreground --output artifacts/sandbox -- node scripts/market-traffic-benchmark.mjs --expect-optimized --foreground --output artifacts/market-traffic.json
+      - name: Collect separate renderer diagnostics after traffic acceptance failure
+        if: ${{ failure() && steps.traffic-gate.outcome == 'failure' }}
+        env:
+          PERPETUAL_SWAP_RENDERER_DIAGNOSTICS: artifacts/market-traffic-diagnostic-profile
+        run: |
+          node scripts/build-artifact-reuse.mjs verify --manifest artifacts/build/renderer.json
+          npm run sandbox -- command --desktop --foreground --output artifacts/sandbox -- node scripts/market-traffic-benchmark.mjs --expect-optimized --foreground --output artifacts/market-traffic-diagnostic.json
       - name: Retain current-version traffic and timing diagnostics
         if: always()
         uses: actions/upload-artifact@v7

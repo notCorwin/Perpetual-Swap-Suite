@@ -11,6 +11,7 @@ import { createMarketTrafficExchange } from '../tests/helpers/market-traffic-exc
 import { createMarketTrafficEvidence } from '../tests/helpers/market-traffic-evidence.mjs'
 import { inspectMarketTrafficReadiness } from '../tests/helpers/market-traffic-readiness.mjs'
 import { compareMarketTrafficReports, validateMarketTrafficReport } from './market-traffic-comparison.mjs'
+import { startRendererDiagnostics } from './renderer-diagnostics.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const { values } = parseArgs({
@@ -221,7 +222,7 @@ const output = resolve(values.output ?? join(root, '.build/traffic-optimization/
 const userData = process.env.PERPETUAL_SWAP_USER_DATA
 if (!userData || (!foreground && !process.env.PERPETUAL_SWAP_TEST_GUARD)) throw new Error('Protected sandbox user data is required.')
 const fixture = await createMarketTrafficExchange({ candidateCount, passingCount, spreadFailureCount, seed: 17 })
-let electron, cadence, failureMeasurements, completedReport, runtimeEvidence, presentationEvidence, readinessFailureEvidence
+let electron, cadence, failureMeasurements, completedReport, runtimeEvidence, presentationEvidence, readinessFailureEvidence, stopDiagnostics
 try {
   electron = await _electron.launch({ args: [app.entry], cwd: app.cwd,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_E2E_LIVE_REFRESH: '1',
@@ -321,6 +322,7 @@ try {
     optimizedDemand.candle15mCount = expectedSubscriptions.candle15m.length
     optimizedDemand.candle1HCount = expectedSubscriptions.candle1H.length
   }
+  if (process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS) stopDiagnostics = await startRendererDiagnostics(electron, page, process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS)
   const sampleWindow = await fixture.beginSample()
   const sampleStartedAt = sampleWindow.startedAt
   await page.evaluate(({ requireForeground, passingIDs }) => {
@@ -375,6 +377,7 @@ try {
   const traffic = fixture.endSample()
   failureMeasurements = {
     schemaVersion: 1, mode: benchmarkMode, partial: true, generatedAt: new Date().toISOString(),
+    diagnosticOnly: Boolean(stopDiagnostics),
     app: { path: app.selected, entry: app.entry, build: target, checkout },
     runtime: { ...runtime, testPresentation: runtime.testPresentation, presentation,
       network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' },
@@ -464,6 +467,7 @@ try {
     schemaVersion: 1,
     mode: benchmarkMode,
     generatedAt: new Date().toISOString(),
+    diagnosticOnly: Boolean(stopDiagnostics),
     app: { path: app.selected, entry: app.entry, build: target, checkout },
     runtime: { ...runtime, testPresentation: runtime.testPresentation, presentation,
       network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' },
@@ -495,7 +499,7 @@ try {
   }
   await mkdir(dirname(output), { recursive: true })
   completedReport = report
-  if (expectOptimized) validateMarketTrafficReport(report, 'current')
+  if (expectOptimized && !stopDiagnostics) validateMarketTrafficReport(report, 'current')
   if (baselineReport) {
     try {
       const comparison = compareMarketTrafficReports(baselineReport, report)
@@ -509,7 +513,7 @@ try {
     }
   }
   await writeFile(output, `${JSON.stringify(report, null, 2)}\n`)
-  console.log(JSON.stringify({ report: output, candidates: candidateCount, qualified: passingCount,
+  console.log(JSON.stringify({ report: output, diagnosticOnly: Boolean(stopDiagnostics), candidates: candidateCount, qualified: passingCount,
     completeRounds: receiptEvidence.fixtureRounds.length, matchedPayloads: receiptEvidence.fixtureEvents.length,
     maximumSendToCallbackAcceptanceMS: receiptEvidence.aggregateLatenciesUS.fixtureSendToCallbackAcceptance.maximumUS / 1_000,
     totalPayloadBytes: report.traffic.totalPayloadBytes }, null, 2))
@@ -559,6 +563,7 @@ try {
   process.exitCode = 1
 } finally {
   cadence?.stop()
+  try { await stopDiagnostics?.() } catch (error) { console.error(error); process.exitCode = 1 }
   if (electron) await electron.close()
   if (fixture) await fixture.close()
 }
