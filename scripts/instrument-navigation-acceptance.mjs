@@ -132,7 +132,8 @@ export async function persistNavigationCatalog(electron, _page) {
 }
 
 export async function installNavigationProbe(electron, { omitUniverseInstId = null } = {}) {
-  await electron.evaluate(({ ipcMain, BrowserWindow }, omitUniverseInstId) => {
+  await electron.evaluate(async ({ ipcMain, BrowserWindow }, omitUniverseInstId) => {
+    const { encodeChartWire, decodeChartWire } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/chart-wire.js')
     const original = ipcMain._invokeHandlers.get('radar:request')
     const contents = BrowserWindow.getAllWindows()[0].webContents
     const originalSend = contents.send
@@ -140,7 +141,7 @@ export async function installNavigationProbe(electron, { omitUniverseInstId = nu
       holdInstId: null, omitUniverseInstId, release: null }
     const released = new Promise(resolve => { probe.release = resolve })
     contents.send = function (channel, ...args) {
-      const frame = args[0]
+      const frame = channel === 'radar:chart-prepared' ? decodeChartWire(args[0]) : null
       if (channel === 'radar:chart-prepared' && frame?.instId === probe.omitUniverseInstId) return
       // Keep the blocked history boundary deterministic: its independent push
       // cannot complete the viewport ahead of the deliberately held disk read.
@@ -149,7 +150,7 @@ export async function installNavigationProbe(electron, { omitUniverseInstId = nu
       return originalSend.call(this, channel, ...args)
     }
     ipcMain.removeHandler('radar:request')
-    ipcMain.handle('radar:request', async (event, value) => {
+    ipcMain.handle('radar:request', async (event, value, context) => {
       const kind = ['chartUniverse', 'chartFocus', 'chartLocal', 'chartHistory', 'chartWindow'].find(key => key in value)
       let held = false
       if (kind) {
@@ -163,9 +164,10 @@ export async function installNavigationProbe(electron, { omitUniverseInstId = nu
         }
       }
       try {
-        const response = await original(event, value)
+        const response = await original(event, value, context)
         if (value.chartUniverse && probe.omitUniverseInstId) {
-          return { ...response, frames: response.frames.filter(frame => frame.instId !== probe.omitUniverseInstId) }
+          const universe = decodeChartWire(response)
+          return encodeChartWire({ ...universe, frames: universe.frames.filter(frame => frame.instId !== probe.omitUniverseInstId) })
         }
         return response
       } finally { if (held) probe.heldSettled = true }

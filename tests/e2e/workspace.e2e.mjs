@@ -17,7 +17,8 @@ before(async () => {
   await page.waitForLoadState('domcontentloaded')
   // Stub only the desktop boundary. These renderer checks remain independent
   // of source downloads, persistence workers, and any configured AI service.
-  await electron.evaluate(({ ipcMain, BrowserWindow }) => {
+  await electron.evaluate(async ({ ipcMain, BrowserWindow }) => {
+    const { encodeChartWire } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/chart-wire.js')
     const preferences = { chartTimeframe: '15m', rankingLookback: 15, historyDays: 30, liquidity: {
       spread: { enabled: true, maxPercent: .05 }, depth: { enabled: true, minUSDT: 100_000 },
       slippage: { enabled: true, maxPercent: .1, notionalUSDT: 100_000 }, volume24h: { enabled: true, minUSDT: 30_000_000 },
@@ -35,6 +36,7 @@ before(async () => {
         progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 },
         active: [], failures: [], error: '', revision: 0, serviceSession: 'download-fixture' },
       audit: { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '', revision: 0, serviceSession: 'audit-fixture' } }
+    state.sendChart = frame => BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', encodeChartWire(frame))
     state.notify = () => {
       state.rows = [...state.rows].sort((left, right) => (right.rankingChange == null ? -1 : Math.abs(right.rankingChange))
         - (left.rankingChange == null ? -1 : Math.abs(left.rankingChange)) || left.instId.localeCompare(right.instId, 'en'))
@@ -68,7 +70,7 @@ before(async () => {
         generation: state.chartGeneration, revision: state.chartGeneration, bars, oiState: 'ready', takerState: 'ready', indicatorState: 'ready', error: '' }
     }
     ipcMain.removeHandler('radar:request')
-    ipcMain.handle('radar:request', async (_event, value) => {
+    state.request = async (_event, value) => {
       state.requests.push(value)
       if (value.preferences) {
         if (value.preferences.action === 'update') {
@@ -145,6 +147,10 @@ before(async () => {
         return report
       }
       throw new Error(`Unsupported renderer fixture operation: ${Object.keys(value).join(', ')}`)
+    }
+    ipcMain.handle('radar:request', async (event, value) => {
+      const result = await state.request(event, value)
+      return value.chartUniverse || value.chartLocal || value.chartHistory || value.chartWindow ? encodeChartWire(result) : result
     })
   })
   await page.setViewportSize({ width: Number(process.env.PERPETUAL_SWAP_UI_INITIAL_WIDTH ?? 800), height: Number(process.env.PERPETUAL_SWAP_UI_INITIAL_HEIGHT ?? 572) })
@@ -356,8 +362,8 @@ test('cold and warm chart periods preserve list nodes, order, count, and selecti
       const state = globalThis.__workspaceFixture
       state.coldTimeframes = []; state.chartGeneration += 1
       for (const { instId } of state.rows) {
-        const frame = await ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId, timeframe: '1H' } })
-        BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
+        const frame = await globalThis.__workspaceFixture.request(null, { chartLocal: { instId, timeframe: '1H' } })
+        globalThis.__workspaceFixture.sendChart(frame)
       }
     })
     await page.locator('svg[data-rendered-inst="ZETA-USDT-SWAP"][data-rendered-timeframe="1H"]').waitFor({ state: 'visible' })
@@ -422,11 +428,11 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   await electron.evaluate(async ({ ipcMain, BrowserWindow }) => {
     const state = globalThis.__workspaceFixture
     state.chartGeneration += 1
-    const frame = await ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
+    const frame = await globalThis.__workspaceFixture.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
     const last = frame.bars.at(-1)
     frame.liveBar = { ...last, hour: frame.endHour + frame.intervalMS, open: 133, high: 134, low: 132, close: 133,
       confirmed: false, statisticsObserved: false, oi: null, buy: null, sell: null }
-    BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
+    globalThis.__workspaceFixture.sendChart(frame)
   })
   await page.waitForFunction(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 133)
   assert.equal(Number(await chart.getAttribute('data-chart-rendered-bars')), 96)
@@ -439,7 +445,7 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   })
   const reads = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length)
   assert.equal('bars' in liveUpdate, false, 'A forming update must not transfer completed candles.')
-  await electron.evaluate(({ BrowserWindow }, update) => BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', update), liveUpdate)
+  await electron.evaluate(({ BrowserWindow }, update) => globalThis.__workspaceFixture.sendChart(update), liveUpdate)
   await page.waitForFunction(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 135)
   assert.match(await chart.locator('[aria-live="off"]').textContent(), /Close\s+135/)
   assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^135 /)
@@ -453,7 +459,7 @@ test('chart source updates stay outside the plot without resizing its viewport a
     const generation = await electron.evaluate(async ({ ipcMain, BrowserWindow }, status) => {
       const state = globalThis.__workspaceFixture
       state.chartGeneration += 1
-      const frame = await ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
+      const frame = await globalThis.__workspaceFixture.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
       if (status.oiState !== 'ready') {
         const observed = status.oiState === 'unavailable'
         frame.endHour += frame.intervalMS
@@ -463,7 +469,7 @@ test('chart source updates stay outside the plot without resizing its viewport a
           statisticsObserved: observed, oiObserved: observed, takerObserved: observed, indicatorsObserved: true }]
       }
       Object.assign(frame, status)
-      BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
+      globalThis.__workspaceFixture.sendChart(frame)
       return frame.generation
     }, status)
     await page.waitForFunction(generation => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.generation === generation, generation)
@@ -509,10 +515,10 @@ test('pointer inspection selects the drawn first, middle, and latest candle befo
   const publish = forming => electron.evaluate(async ({ ipcMain, BrowserWindow }, forming) => {
     const state = globalThis.__workspaceFixture
     state.chartGeneration += 1
-    const frame = await ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
+    const frame = await globalThis.__workspaceFixture.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
     if (forming) frame.liveBar = { ...frame.bars.at(-1), hour: frame.endHour + frame.intervalMS,
       open: 133, high: 138, low: 132, close: 137, confirmed: false, statisticsObserved: false, oi: null, buy: null, sell: null }
-    BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
+    globalThis.__workspaceFixture.sendChart(frame)
     return frame
   }, forming)
   const waitForFrame = frame => page.waitForFunction(({ generation, end }) => {
@@ -549,13 +555,13 @@ test('RSI crossings retain a flat panel and expose the sampled candle and time a
   const publish = custom => electron.evaluate(async ({ ipcMain, BrowserWindow }, custom) => {
     const state = globalThis.__workspaceFixture
     state.chartGeneration += 1
-    const frame = await ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
+    const frame = await globalThis.__workspaceFixture.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
     if (custom) frame.bars = frame.bars.map((bar, index) => ({ ...bar,
       rsi6: index === 20 ? 29 : index === 21 ? 31 : index === 40 ? 69 : index === 41 ? 71 : 50,
       rsi12: index === 60 ? 71 : index === 61 ? 69 : 55,
       rsi24: index === 80 ? 29 : index === 81 ? 31 : 60,
     }))
-    BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
+    globalThis.__workspaceFixture.sendChart(frame)
     return frame
   }, custom)
   const frame = await publish(true)
@@ -745,7 +751,7 @@ test('market notifications wait while hidden and refresh immediately when the wo
 test('search preserves selection while six width/DPR combinations share page, pointer, and capture coordinates', async () => {
   const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }))
   const client = await page.context().newCDPSession(page)
-  const fixture = await electron.evaluate(({ ipcMain }) => ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } }))
+  const fixture = await electron.evaluate(({ ipcMain }) => globalThis.__workspaceFixture.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } }))
   try {
     for (const deviceScaleFactor of [1, 2]) for (const width of [1_200, 1_600, 2_000]) {
       await client.send('Emulation.setDeviceMetricsOverride', { width, height: 1_000, deviceScaleFactor, mobile: false })
@@ -1401,7 +1407,7 @@ test('missing recent candles remain visible with repair status until the complet
     const state = globalThis.__workspaceFixture
     if (!state.integrityBaseline) {
       state.chartGeneration += 1
-      state.integrityBaseline = await ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
+      state.integrityBaseline = await globalThis.__workspaceFixture.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
     }
     const frame = structuredClone(state.integrityBaseline), step = frame.intervalMS
     frame.revision += { sparse: 1, stale: 2, repaired: 3 }[phase]
@@ -1415,7 +1421,7 @@ test('missing recent candles remain visible with repair status until the complet
       frame.latestEnd = frame.endHour
     }
     state.chartOverride = frame
-    BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
+    globalThis.__workspaceFixture.sendChart(frame)
     return { generation: frame.generation, endHour: frame.endHour, liveHour: frame.liveBar.hour }
   }, phase)
   const waitForFrame = frame => page.waitForFunction(({ generation, endHour, liveHour }) => {
@@ -1464,7 +1470,7 @@ test('failed and unavailable chart sources preserve qualified rows and report di
     await electron.evaluate(async ({ ipcMain }) => {
       const state = globalThis.__workspaceFixture
       state.chartGeneration += 1
-      const frame = await ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
+      const frame = await globalThis.__workspaceFixture.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
       const range = { from: frame.bars[0].hour, through: frame.endHour }
       state.sourceBaseline = structuredClone(frame)
       state.chartOverride = { ...frame, revision: frame.revision + 1, oiState: 'error', takerState: 'unavailable',
@@ -1491,7 +1497,7 @@ test('failed and unavailable chart sources preserve qualified rows and report di
     await electron.evaluate(({ BrowserWindow }) => {
       const state = globalThis.__workspaceFixture
       state.chartOverride = { ...state.sourceBaseline, revision: state.sourceBaseline.revision + 2 }
-      BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', state.chartOverride)
+      globalThis.__workspaceFixture.sendChart(state.chartOverride)
     })
     await page.waitForFunction(() => document.querySelector('[data-chart-inst]')?.dataset.chartOiState === 'ready'
       && document.querySelector('[data-chart-inst]')?.dataset.chartTakerState === 'ready')

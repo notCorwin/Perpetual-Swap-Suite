@@ -20,7 +20,8 @@ try {
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData } })
   const page = await electron.firstWindow()
   await page.waitForLoadState('domcontentloaded')
-  await electron.evaluate(({ ipcMain }) => {
+  await electron.evaluate(async ({ ipcMain }) => {
+    const { encodeChartWire } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/chart-wire.js')
     const preferences = { chartTimeframe: '15m', rankingLookback: 15, historyDays: 30, liquidity: {
       spread: { enabled: true, maxPercent: .05 }, depth: { enabled: true, minUSDT: 100_000 },
       slippage: { enabled: true, maxPercent: .1, notionalUSDT: 100_000 }, volume24h: { enabled: true, minUSDT: 30_000_000 },
@@ -50,11 +51,11 @@ try {
       if (value.preferences) return preferences
       if (value.snapshot) return { rows, turnoverOrder: [...rows].sort((a, b) => a.instId.localeCompare(b.instId, 'en')).map(row => row.instId), revision: 1, serviceSession: 'visual-fixture',
         realtimeState: 'Connected', updatedAt: 1_800_000_000_000, catalogSource: 'live', error: '', loading: false }
-      if (value.chartUniverse) return { frames: rows.flatMap(({ instId }) => ['5m', '15m', '1H'].map(timeframe => prepared({ instId, timeframe }))) }
+      if (value.chartUniverse) return encodeChartWire({ frames: rows.flatMap(({ instId }) => ['5m', '15m', '1H'].map(timeframe => prepared({ instId, timeframe }))) })
       if (value.chartFocus) return { ok: true }
-      if (value.chartLocal) return prepared(value.chartLocal)
-      if (value.chartHistory) return prepared(value.chartHistory)
-      if (value.chartWindow) return prepared(value.chartWindow)
+      if (value.chartLocal) return encodeChartWire(prepared(value.chartLocal))
+      if (value.chartHistory) return encodeChartWire(prepared(value.chartHistory))
+      if (value.chartWindow) return encodeChartWire(prepared(value.chartWindow))
       if (value.analysisSettings) return { model: '', hasAPIKey: false }
       if (value.dataAudit) return { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '' }
       throw new Error(`Unsupported visual fixture operation: ${Object.keys(value).join(', ')}`)

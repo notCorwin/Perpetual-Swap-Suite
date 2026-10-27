@@ -923,6 +923,7 @@ export function separateSourceMaintenance(sourceRequests, fixture) {
 
 export async function installRequestProbe(electron, instId, { holdHistorical = false, initialHistoryBars = null, historicalDelayMS = 0 } = {}) {
   await electron.evaluate(async ({ ipcMain, BrowserWindow }, { instId, holdHistorical, initialHistoryBars, historicalDelayMS }) => {
+    const { encodeChartWire, decodeChartWire } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/chart-wire.js')
     const original = ipcMain._invokeHandlers.get('radar:request')
     const contents = BrowserWindow.getAllWindows()[0].webContents
     const originalSend = contents.send
@@ -980,9 +981,21 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
       rememberHistory(result)
       return result
     }
+    // Timers can fire just before their requested deadline. Check both the
+    // monotonic interval and the wall-clock timestamps used by the evidence.
+    const remainingDelay = (record, deadline) => Math.max(deadline - performance.now(), record.readCompletedAt + historicalDelayMS - Date.now())
+    const waitForDelay = record => new Promise(resolve => {
+      const deadline = performance.now() + historicalDelayMS
+      const check = () => {
+        const remaining = remainingDelay(record, deadline)
+        if (remaining > 0) setTimeout(check, Math.ceil(remaining))
+        else resolve()
+      }
+      check()
+    })
     contents.send = function (channel, ...args) {
       if (channel !== 'radar:chart-prepared') return originalSend.call(this, channel, ...args)
-      const response = args[0]
+      const response = decodeChartWire(args[0])
       if (response?.instId === instId && Array.isArray(response.bars)) {
         probe.preparedPushes += 1
         probe.preparedPushBars += response.bars.length
@@ -1001,39 +1014,52 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
       const record = extension(response, 'push', Date.now())
       if (record && historicalDelayMS > 0) {
         const pending = probe.pendingPushes.get(response.timeframe)
-        const entry = pending ?? { args, record, timer: null }
+        const entry = pending ?? { args, response, record, timer: null }
         if (pending) {
           clearTimeout(entry.timer); probe.timers.delete(entry.timer)
           entry.args = args
+          entry.response = response
           entry.record.readCompletedAt = record.readCompletedAt
           probe.extensions.pop()
         }
         probe.pendingPushes.set(response.timeframe, entry)
-        const timer = setTimeout(() => {
-          probe.timers.delete(timer); probe.pendingPushes.delete(response.timeframe)
+        const deadline = performance.now() + historicalDelayMS
+        const deliver = () => {
+          probe.timers.delete(entry.timer)
           if (probe.closed) return
-          entry.args[0] = delivered(entry.args[0], entry.record)
+          const remaining = remainingDelay(entry.record, deadline)
+          if (remaining > 0) {
+            entry.timer = setTimeout(deliver, Math.ceil(remaining))
+            probe.timers.add(entry.timer)
+            return
+          }
+          probe.pendingPushes.delete(response.timeframe)
+          const result = delivered(entry.response, entry.record)
+          if (result !== entry.response) entry.args[0] = encodeChartWire(result)
           originalSend.call(contents, channel, ...entry.args)
-        }, historicalDelayMS)
-        entry.timer = timer
-        probe.timers.add(timer)
+        }
+        entry.timer = setTimeout(deliver, historicalDelayMS)
+        probe.timers.add(entry.timer)
         return
       }
-      args[0] = delivered(response, record)
+      const result = delivered(response, record)
+      if (result !== response) args[0] = encodeChartWire(result)
       return originalSend.call(this, channel, ...args)
     }
     const released = new Promise(resolve => { probe.release = resolve })
     ipcMain.removeHandler('radar:request')
-    ipcMain.handle('radar:request', async (event, value) => {
+    ipcMain.handle('radar:request', async (event, value, context) => {
       if (value.chartFocus) {
         probe.focusCalls.push({ ...value.chartFocus, at: Date.now() })
-        return original(event, value)
+        return original(event, value, context)
       }
       if (value.chartWindow) probe.legacyWindowCalls += 1
       const kind = value.chartHistory?.instId === instId ? 'history' : value.chartLocal?.instId === instId ? 'local' : null
       if (!kind) {
-        const response = await original(event, value)
-        return value.chartUniverse ? { ...response, frames: response.frames.map(clip) } : response
+        const wire = await original(event, value, context)
+        if (!value.chartUniverse) return wire
+        const response = decodeChartWire(wire), frames = response.frames.map(clip)
+        return frames.every((frame, index) => frame === response.frames[index]) ? wire : encodeChartWire({ ...response, frames })
       }
       const query = value.chartHistory ?? value.chartLocal
       const call = { kind, ...query, startedAt: Date.now(), readCompletedAt: null, completedAt: null, bars: 0 }
@@ -1047,14 +1073,15 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
       try {
         // Read first, then hold delivery of the detached old reply. Explicit
         // backend focus/demand continues while either renderer disk lane waits.
-        const response = await original(event, value)
+        const wire = await original(event, value, context)
+        const response = decodeChartWire(wire)
         call.readCompletedAt = Date.now()
         if (kind === 'history' && probe.holdHistorical && !probe.held && Number.isFinite(query.endHour)) {
           held = probe.held = true; probe.heldCall = call; probe.callsAtHold = probe.calls.length
           await released
         } else if (kind === 'local' && probe.holdLocal) await released
         const record = extension(response, kind, call.startedAt, call.readCompletedAt)
-        if (record && historicalDelayMS > 0) await new Promise(resolve => setTimeout(resolve, historicalDelayMS))
+        if (record && historicalDelayMS > 0) await waitForDelay(record)
         const result = delivered(response, record)
         call.bars = result?.bars.length ?? 0
         call.first = result?.bars[0]?.hour ?? null; call.end = result?.bars.at(-1)?.hour ?? null
@@ -1063,7 +1090,7 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
           probe.transferredHistoryBars += call.bars
           probe.historyResponses.push({ ...query, bars: call.bars, first: call.first, end: call.end })
         }
-        return result
+        return result === response ? wire : encodeChartWire(result)
       } finally {
         call.completedAt = Date.now(); probe.active -= 1; probe[lane] -= 1
         if (held) probe.heldSettled = true

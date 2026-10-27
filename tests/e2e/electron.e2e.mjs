@@ -39,7 +39,8 @@ const waitFor = async (read, timeout = 10_000) => {
 // Prepared snapshots reach the controller through local hits, universe hits,
 // pushed publications, and demand reads. Exercise the same payload at every
 // ingress so these geometry tests do not depend on a particular cache miss.
-const installPreparedTransform = async options => electron.evaluate(({ ipcMain, BrowserWindow }, options) => {
+const installPreparedTransform = async options => electron.evaluate(async ({ ipcMain, BrowserWindow }, options) => {
+  const { encodeChartWire, decodeChartWire } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/chart-wire.js')
   const original = ipcMain._invokeHandlers.get('radar:request')
   const contents = BrowserWindow.getAllWindows()[0].webContents
   const originalSend = contents.send
@@ -76,14 +77,19 @@ const installPreparedTransform = async options => electron.evaluate(({ ipcMain, 
     return response
   }
   ipcMain.removeHandler('radar:request')
-  ipcMain.handle('radar:request', async (event, value) => {
+  ipcMain.handle('radar:request', async (event, value, context) => {
     if (value.chartWindow?.instId === options.instId) probe.calls += 1
-    const response = await original(event, value)
-    return value.chartUniverse ? { ...response, frames: response.frames.map(transform) }
-      : value.chartLocal || value.chartHistory || value.chartWindow ? transform(response) : response
+    const wire = await original(event, value, context)
+    if (!(value.chartUniverse || value.chartLocal || value.chartHistory || value.chartWindow)) return wire
+    const response = decodeChartWire(wire)
+    const result = value.chartUniverse ? { ...response, frames: response.frames.map(transform) } : transform(response)
+    return result === response ? wire : encodeChartWire(result)
   })
   contents.send = function (channel, ...args) {
-    if (channel === 'radar:chart-prepared') args[0] = transform(args[0])
+    if (channel === 'radar:chart-prepared') {
+      const frame = decodeChartWire(args[0]), result = transform(frame)
+      if (result !== frame) args[0] = encodeChartWire(result)
+    }
     return originalSend.call(this, channel, ...args)
   }
   globalThis.__preparedTransform = probe
@@ -704,9 +710,10 @@ test('prepared resident indicators and statistics stay drawn through rapid scrol
       // Forward an actual backend local frame through the ordinary event
       // ingress. Its contents are unchanged; only delivery timing is controlled.
       await electron.evaluate(async ({ BrowserWindow }, { instId, timeframe }) => {
+        const { encodeChartWire } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/chart-wire.js')
         const frame = await globalThis.__marketBackend.request({ chartLocal: { instId, timeframe } })
         if (!frame) throw new Error('The active backend must retain its latest local frame.')
-        BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
+        BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', encodeChartWire(frame))
       }, { instId: fixture.instId, timeframe })
       await settle()
       assert.equal(Number(await page.locator('[data-chart-inst]').getAttribute('data-chart-completed-end')), historicalEnd, 'A latest publication must preserve the historical viewport.')

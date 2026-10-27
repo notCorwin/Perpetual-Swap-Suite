@@ -67,6 +67,16 @@ test('Electron persists actual renderer, graphics and database work across worke
     const parent = completed.get(record.parentId)
     return parent && parent.executionId !== record.executionId && parent.traceId === record.traceId
   }), 'Renderer/main/worker operations must preserve a real causal trace across execution boundaries.')
+  for (const [childName, parentName, resource] of [
+    ['desktop.request.execute', 'desktop.request', 'chartWindow'],
+    ['desktop.notification.receive', 'desktop.notification.send', 'radar:chart-prepared'],
+  ]) {
+    assert.ok([...completed.values()].some(record => {
+      const parent = completed.get(record.parentId)
+      return record.name === childName && record.resource === resource && parent?.name === parentName
+        && parent.resource === resource && parent.executionId !== record.executionId && parent.traceId === record.traceId
+    }), `${resource} must retain its renderer/main operation lineage in the durable journal.`)
+  }
   const graphics = await Promise.all(files.filter(file => file.endsWith('.status.json')).map(async file => JSON.parse(await readFile(join(operations, file), 'utf8'))))
   assert.equal(graphics.length, 1)
   assert.equal(graphics[0].enabled, true)
