@@ -48,6 +48,32 @@ test('resident window projection is reused until canonical bars or source metada
   } finally { stop() }
 })
 
+test('unchanged prepared bars advance revision and freshness without hiding later corrections', () => {
+  for (const compact of [false, true]) {
+    const store = new PreparedChartStore()
+    if (compact) store.setUniverse([instId], '1H')
+    const ingest = (frame: PreparedChartResponse) => compact ? store.ingestLatest(frame) : store.ingest(frame)
+    const values = bars(0, 96)
+    ingest(response(values))
+    const original = store.window(instId, '1H')!
+    const repeated = values.map(value => ({ ...value }))
+    ingest(response(repeated, { revision: 10, sourceVersions: { price: 1, oi: 2, taker: 3 }, realtimeState: 'live', priceObservedAt: 1234 }))
+    const refreshed = store.window(instId, '1H')!
+    assert.ok(refreshed.bars.every((value, index) => value === original.bars[index]))
+    assert.equal(repeated.every(value => Object.isFrozen(value)), false, 'Incoming transport data must remain caller-owned.')
+    assert.equal(store.snapshotMeta(instId, '1H')!.revision, 10)
+    assert.deepEqual(refreshed.sourceVersions, { price: 1, oi: 2, taker: 3 })
+    assert.equal(refreshed.realtimeState, 'live')
+    assert.equal(refreshed.priceObservedAt, 1234)
+    const correction = values.map((value, index) => index === 95 ? { ...value, close: 101.5 } : value)
+    ingest(response(correction, { revision: 9 }))
+    assert.equal(store.window(instId, '1H')!.bars.at(-1)!.close, 101, 'An unchanged newer response must still fence stale corrections.')
+    ingest(response(correction, { revision: 11 }))
+    assert.equal(store.window(instId, '1H')!.bars.at(-1)!.close, 101.5)
+    assert.equal(original.bars.at(-1)!.close, 101)
+  }
+})
+
 test('partial price windows render independently of unknown indicators and statistics', () => {
   const store = new PreparedChartStore()
   store.ingest(response(bars(0, 12).map(value => ({ ...value, statisticsSources: 0, statisticsObserved: false, indicatorsObserved: false,

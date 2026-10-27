@@ -8,12 +8,47 @@ test('a different native timeframe or instrument cannot acknowledge a scroll tar
     assert.equal(result[0].status, 'unaccounted')
   }
 })
-import { accountChartIntents, assertColdBoundaryResponsiveness, assertColdBoundaryTiming, assertScrollResponsiveness, assertWarmStatistics, coldBoundaryTiming, collectAcceptanceChecks, summarizeLatencySamples } from '../../scripts/chart-acceptance-metrics.mjs'
+import { accountChartIntents, assertColdBoundaryResponsiveness, assertColdBoundaryTiming, assertNavigationResponsiveness, assertScrollResponsiveness, assertWarmStatistics, coldBoundaryTiming, collectAcceptanceChecks, summarizeLatencySamples } from '../../scripts/chart-acceptance-metrics.mjs'
 import { measureChartIntentLatency } from '../../scripts/chart-acceptance.mjs'
 
 const coldTimes = () => ({ rendererTimeOrigin: 1_000_000, approachInputAt: 1_000, finalInputAt: 2_000,
   firstTargetRAFAt: 2_020, readyTargetRAFAt: 2_080, nearestStartedAt: 1_000_500,
   nearestCompletedAt: 1_000_700, preparedTargetAt: 1_000_750 })
+
+test('navigation keeps the 50/100 ms deadlines and one-frame limit independently enforced', () => {
+  const report = { instId: 'XRP', framesToCommit: 1, inputToSVGCommitMS: 50 }
+  assert.throws(() => assertNavigationResponsiveness(report, {}), /declared presentation/)
+  assert.doesNotThrow(() => assertNavigationResponsiveness(report, { presentation: 'foreground' }))
+  for (const inputToSVGCommitMS of [50.1, 88.2, NaN, -1]) {
+    assert.throws(() => assertNavigationResponsiveness({ ...report, inputToSVGCommitMS }, { presentation: 'foreground' }), /budget 50 ms/)
+  }
+  assert.doesNotThrow(() => assertNavigationResponsiveness({ ...report, inputToSVGCommitMS: 100 }, { presentation: 'foreground', rapid: true }))
+  assert.throws(() => assertNavigationResponsiveness({ ...report, inputToSVGCommitMS: 100.1 }, { presentation: 'foreground', rapid: true }), /budget 100 ms/)
+  for (const framesToCommit of [2, NaN, -1]) {
+    assert.throws(() => assertNavigationResponsiveness({ ...report, framesToCommit }, { presentation: 'offscreen' }), /animation frames/)
+  }
+  assert.doesNotThrow(() => assertNavigationResponsiveness({ ...report, inputToSVGCommitMS: 1800 }, { presentation: 'offscreen' }))
+})
+
+test('cold navigation keeps source availability separate from input acknowledgment', () => {
+  const report = { instId: 'BTC', framesToCommit: 120, inputToSVGCommitMS: 1800, inputToSelectionAcknowledgedMS: 100 }
+  assert.doesNotThrow(() => assertNavigationResponsiveness(report, { presentation: 'foreground', requireLocal: true }))
+  assert.throws(() => assertNavigationResponsiveness({ ...report, inputToSelectionAcknowledgedMS: 100.1 }, { presentation: 'foreground', requireLocal: true }), /acknowledgment exceeded/)
+  assert.throws(() => assertNavigationResponsiveness({ ...report, inputToSelectionAcknowledgedMS: null }, { presentation: 'offscreen', requireLocal: true }), /acknowledge the requested contract/)
+})
+
+test('a slow navigation input does not suppress later timing and canonical checks', () => {
+  const checked = [], reports = [{ instId: 'XRP', inputToSVGCommitMS: 88.2, framesToCommit: 1 },
+    { instId: 'BTC', inputToSVGCommitMS: 20, framesToCommit: 2 }, { instId: 'ETH', inputToSVGCommitMS: 10, framesToCommit: 1 }]
+  const { results, failures } = collectAcceptanceChecks([
+    ...reports.map(report => [report.instId, () => { checked.push(report.instId); assertNavigationResponsiveness(report, { presentation: 'foreground' }) }]),
+    ['canonical frames', () => { checked.push('canonical frames'); assert.fail('Wrong contract source') }],
+  ])
+  assert.deepEqual(checked, ['XRP', 'BTC', 'ETH', 'canonical frames'])
+  assert.deepEqual(results.map(result => result.passed), [false, false, true, false])
+  assert.equal(failures.length, 3)
+  assert.match(failures[0].message, /88.2 ms/)
+})
 
 test('pre-intent lead is reported but is not charged to target response', () => {
   const report = coldBoundaryTiming(coldTimes())

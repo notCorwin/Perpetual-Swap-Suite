@@ -964,14 +964,17 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
       const delayFloor = probe.delayFloors.get(response.timeframe)
       if (response.bars[0].hour >= delayFloor) return null
       const record = { kind, instId: response.instId, timeframe: response.timeframe, endHour: response.endHour,
-        startedAt, readCompletedAt, completedAt: null, previousFloor, first: response.bars[0].hour, end: response.bars.at(-1).hour, bars: response.bars.length }
+        startedAt, readCompletedAt, completedAt: null, previousFloor, first: response.bars[0].hour, end: response.bars.at(-1).hour, bars: response.bars.length,
+        generation: response.generation, revision: response.revision, sourceVersions: response.sourceVersions && { ...response.sourceVersions } }
       probe.extensions.push(record)
       return record
     }
     const delivered = (response, record) => {
       if (record) {
         probe.deliveredFloors.set(response.timeframe, Math.min(probe.deliveredFloors.get(response.timeframe), response.bars[0].hour))
-        Object.assign(record, { completedAt: Date.now(), first: response.bars[0].hour, end: response.bars.at(-1).hour, bars: response.bars.length })
+        Object.assign(record, { completedAt: Date.now(), first: response.bars[0].hour, end: response.bars.at(-1).hour, bars: response.bars.length,
+          endHour: response.endHour, generation: response.generation, revision: response.revision,
+          sourceVersions: response.sourceVersions && { ...response.sourceVersions } })
       }
       const result = clip(response)
       rememberHistory(result)

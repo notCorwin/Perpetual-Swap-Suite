@@ -68,6 +68,32 @@ export function assertScrollResponsiveness(report, { inputBudgetMS = 100, frameB
   throwFailures(failures)
 }
 
+export function assertNavigationResponsiveness(report, { presentation, rapid = false, requireLocal = false }) {
+  if (!['foreground', 'offscreen'].includes(presentation)) throw new TypeError('Navigation timing requires a declared presentation.')
+  const maximumMS = rapid ? 100 : 50
+  const { failures } = collectAcceptanceChecks([
+    ...(!requireLocal ? [['renderer frames', () => {
+      if (!Number.isSafeInteger(report.framesToCommit) || report.framesToCommit < 0 || report.framesToCommit > 1) {
+        throw new Error(`${report.instId} needed ${report.framesToCommit} animation frames to switch.`)
+      }
+    }]] : []),
+    ...(presentation === 'foreground' && !requireLocal ? [['prepared input latency', () => {
+      if (!Number.isFinite(report.inputToSVGCommitMS) || report.inputToSVGCommitMS < 0 || report.inputToSVGCommitMS > maximumMS) {
+        throw new Error(`${report.instId} blocked input for ${report.inputToSVGCommitMS} ms (native foreground budget ${maximumMS} ms).`)
+      }
+    }]] : []),
+    ...(requireLocal ? [['cold selection acknowledgment', () => {
+      if (!Number.isFinite(report.inputToSelectionAcknowledgedMS) || report.inputToSelectionAcknowledgedMS < 0) {
+        throw new Error('A cold selection must acknowledge the requested contract before its data arrives.')
+      }
+      if (presentation === 'foreground' && report.inputToSelectionAcknowledgedMS > 100) {
+        throw new Error('Cold selection acknowledgment exceeded 100 ms.')
+      }
+    }]] : []),
+  ])
+  throwFailures(failures)
+}
+
 // Renderer timestamps are performance.now() offsets; fixture timestamps use
 // the source worker's performance.timeOrigin + performance.now(). Convert
 // the renderer offsets to the same epoch before comparing the two domains.

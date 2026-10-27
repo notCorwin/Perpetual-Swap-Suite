@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { assertWorkspaceLayout, selectTimeframe } from './chart-acceptance.mjs'
+import { assertNavigationResponsiveness, collectAcceptanceChecks } from './chart-acceptance-metrics.mjs'
 
 function navigationTimingScope(presentation) {
   return presentation === 'foreground'
@@ -367,7 +368,7 @@ export async function measureNavigation(page, trigger, { expectedInstId = null, 
   await page.evaluate(({ expectedInstId, sourceInstId, timeframe, timeoutMS }) => {
     const source = sourceInstId ?? document.querySelector('svg[data-rendered-inst]')?.getAttribute('data-rendered-inst')
     const expectedFrame = timeframe ?? document.querySelector('svg[data-rendered-inst]')?.getAttribute('data-rendered-timeframe')
-    const pending = { done: false, started: null, selectionAcknowledgedAt: null, frames: 0, raf: null, observer: null, result: null, timer: null }
+    const pending = { done: false, started: null, inputType: null, inputKey: null, selectionAcknowledgedAt: null, frames: 0, raf: null, observer: null, result: null, timer: null }
     window.__navigationMeasurement = new Promise((resolve, reject) => {
       const cleanup = () => {
         pending.done = true
@@ -387,17 +388,24 @@ export async function measureNavigation(page, trigger, { expectedInstId = null, 
         const id = svg?.getAttribute('data-rendered-inst')
         const chart = svg?.closest('[data-chart-inst]')
         if (!id || expectedFrame && svg.getAttribute('data-rendered-timeframe') !== expectedFrame || (expectedInstId ? id !== expectedInstId : id === source) || chart.dataset.chartRenderedBars !== '96' || chart.dataset.chartLoading !== 'false') return
-        const result = { instId: id, timeframe: expectedFrame, inputToSVGCommitMS: performance.now() - pending.started, framesToCommit: pending.frames,
+        const commitAt = performance.now()
+        const result = { instId: id, timeframe: expectedFrame, sourceInstId: source,
+          rendererTimeOrigin: performance.timeOrigin, inputAt: pending.started, commitAt, inputType: pending.inputType, inputKey: pending.inputKey,
+          inputToSVGCommitMS: commitAt - pending.started, framesToCommit: pending.frames,
           probeCaptureMS: (window.__navigationPaintProbe?.snapshotCaptureMS ?? 0) - pending.captureStartedMS,
           inputToSelectionAcknowledgedMS: pending.selectionAcknowledgedAt === null ? null : pending.selectionAcknowledgedAt - pending.started }
         cleanup()
-        requestAnimationFrame(() => resolve({ ...result, inputToNextRafSampleMS: performance.now() - pending.started }))
+        requestAnimationFrame(() => {
+          const rafSampleAt = performance.now()
+          resolve({ ...result, rafSampleAt, inputToNextRafSampleMS: rafSampleAt - pending.started })
+        })
       }
       const frame = () => { if (pending.done) return; if (pending.started !== null) pending.frames += 1; sample(); if (!pending.done) pending.raf = requestAnimationFrame(frame) }
       const timeout = () => { cleanup(); reject(new Error('The requested contract did not commit a complete chart before the navigation deadline.')) }
       const input = event => {
         if (pending.started !== null || event.type === 'keydown' && !event.key.startsWith('Arrow')) return
         pending.started = performance.now()
+        pending.inputType = event.type; pending.inputKey = event.type === 'keydown' ? event.key : null
         pending.captureStartedMS = window.__navigationPaintProbe?.snapshotCaptureMS ?? 0
         clearTimeout(pending.timer)
         pending.timer = setTimeout(timeout, timeoutMS)
@@ -429,7 +437,7 @@ export async function firstVisibleMarket(page, excluded = []) {
 export async function exerciseInstrumentNavigation(electron, page, fixture, { holdHistory = true, presentation = 'offscreen', unpreparedInstId = null } = {}) {
   assert.ok(presentation === 'offscreen' || presentation === 'foreground', `Unknown navigation presentation: ${presentation}`)
   assert.ok(unpreparedInstId === null || fixture.instIds.includes(unpreparedInstId), 'The unprepared selection must be in the navigation fixture.')
-  const phases = []
+  const phases = [], measurements = [], timingChecks = []
   let heldHistory = null
   // First launch and restart use the same renderer-received frame barrier.
   // Chart geometry is still created during each measured selection.
@@ -473,16 +481,11 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
     if (requireLocal) assert.ok(newRequests.some(request => request.kind === 'chartLocal' && request.instId === result.instId),
       `${result.instId} had no prepared renderer frame and must hydrate from durable local history.`)
     if (!requireLocal) {
-      assert.ok(result.framesToCommit <= 1, `${result.instId} needed ${result.framesToCommit} animation frames to switch. ${JSON.stringify(result)}`)
       await assertSharedSurface(`${result.instId}/${result.timeframe ?? options.timeframe ?? 'current timeframe'} selection`)
     }
-    const maximumMS = rapid ? 100 : 50
-    if (presentation === 'foreground' && !requireLocal) assert.ok(result.inputToSVGCommitMS <= maximumMS,
-      `${result.instId} blocked input for ${result.inputToSVGCommitMS.toFixed(1)} ms (native foreground budget ${maximumMS} ms). ${JSON.stringify(result)}`)
-    if (requireLocal) {
-      assert.ok(Number.isFinite(result.inputToSelectionAcknowledgedMS), 'A cold selection must acknowledge the requested contract before its data arrives.')
-      if (presentation === 'foreground') assert.ok(result.inputToSelectionAcknowledgedMS <= 100, 'Cold selection acknowledgment exceeded 100 ms.')
-    }
+    measurements.push({ ...result, rapid, requireLocal, selectionIPC: after - before })
+    timingChecks.push([`${measurements.length - 1}: ${result.instId}/${result.timeframe}`, () =>
+      assertNavigationResponsiveness(result, { presentation, rapid, requireLocal })])
     return { ...result, selectionIPC: after - before }
   }
   let unpreparedSelection = null
@@ -590,7 +593,14 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
   }
   await sharedSurface.dispose()
   const frameReport = await finishNavigationFrameProbe(page)
-  assertNavigationFrames(frameReport)
+  const { results: checks, failures } = collectAcceptanceChecks([
+    ['canonical navigation frames', () => assertNavigationFrames(frameReport)], ...timingChecks,
+  ])
+  if (failures.length) {
+    const evidence = { presentation, measurements, checks, initialPreparation, heldHistory, frameReport }
+    throw new Error(`${failures.map(error => error?.message ?? String(error)).join('\n')}\nNavigation phase data: ${JSON.stringify(evidence)}`,
+      { cause: new AggregateError(failures) })
+  }
   if (presentation === 'foreground') {
     const native = await electron.evaluate(({ BrowserWindow }) => {
       const window = BrowserWindow.getAllWindows()[0]

@@ -8,7 +8,7 @@ const indicatorFields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 
 const barFields = ['hour', 'open', 'high', 'low', 'close', 'confirmed', 'priceComplete', 'statisticsSources', 'statisticsObserved', 'oiObserved', 'takerObserved', 'indicatorsObserved', ...indicatorFields, 'oi', 'buy', 'sell', 'oiUnavailableReason', 'takerUnavailableReason'] as const
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
 const nullableNumber = (value: unknown) => value === null || finite(value)
-const sameBar = (left: Bar | undefined, right: Bar) => left !== undefined && barFields.every(field => left[field] === right[field])
+const sameBar = (left: Bar | undefined, right: Bar) => left !== undefined && (left === right || barFields.every(field => left[field] === right[field]))
 const validPrice = (bar: Bar) => [bar.open, bar.high, bar.low, bar.close].every(value => finite(value) && value > 0)
   && bar.high >= Math.max(bar.open, bar.close, bar.low) && bar.low <= Math.min(bar.open, bar.close, bar.high)
 const validLiveBar = (bar: Bar, intervalMS: number) => bar?.confirmed === false && validPrice(bar)
@@ -40,6 +40,9 @@ type Series = {
 }
 
 function preparedBar(bar: PreparedChartBar, intervalMS: number, previous?: PreparedChartBar, sameGeneration = true): PreparedChartBar | null {
+  // Cached bars are immutable and validated for this native interval. Exact
+  // equality in the same generation needs neither validation nor another copy.
+  if (sameGeneration && sameBar(previous, bar)) return previous!
   if (!Number.isSafeInteger(bar.hour) || bar.hour % intervalMS !== 0 || !bar.confirmed || !validPrice(bar)
     || ![bar.oi, bar.buy, bar.sell].every(value => nullableNumber(value) && (value === null || value >= 0))
     || (bar.buy === null) !== (bar.sell === null)

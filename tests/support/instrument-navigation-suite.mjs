@@ -54,6 +54,9 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
   })
 
   test('an unprepared selection acknowledges input before all sixteen prepared contracts switch by the next frame', { timeout: 120_000 }, async context => {
+    if (process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS) context.after(await startRendererDiagnostics(electron, page,
+      join(process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS, 'initial-navigation'),
+      { cpuProfile: process.env.PERPETUAL_SWAP_RENDERER_TRACE_ONLY !== '1' }))
     context.diagnostic(`Presentation: ${JSON.stringify({ native: presentationState?.native, environment: presentationState?.environment, idleFrameCadence: presentationState?.idleFrameCadence })}`)
     const report = await exerciseInstrumentNavigation(electron, page, fixture, { presentation, unpreparedInstId: 'BTC-USDT-SWAP' })
     assert.equal(report.unpreparedSelection.rendererFrameAvailableBeforeInput, false)
@@ -65,6 +68,9 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
     assert.deepEqual(report.violations, [])
     const inputs = report.phases.flatMap(phase => [phase.firstVisit, phase.mouseSwitch, phase.rapid, ...phase.keyboard,
       ...(phase.timeframeSwitch ? [phase.timeframeSwitch] : [])])
+    assert.ok(inputs.every(input => Number.isFinite(input.rendererTimeOrigin) && input.inputAt <= input.commitAt
+      && input.commitAt <= input.rafSampleAt && ['click', 'keydown'].includes(input.inputType)),
+    'Every measured selection must retain ordered input, SVG commit and RAF timestamps from its renderer document.')
     const svg = summarizeLatencySamples(inputs.map(input => input.inputToSVGCommitMS))
     const raf = summarizeLatencySamples(inputs.map(input => input.inputToNextRafSampleMS))
     context.diagnostic(`Navigation timing (${JSON.stringify(report.timingScope)}): ${JSON.stringify({ initialPreparation: report.initialPreparation, inputs: inputs.length,
