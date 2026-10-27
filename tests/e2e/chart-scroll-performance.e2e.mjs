@@ -31,7 +31,8 @@ async function waitForRequestQuiescence(timeoutMS = 5_000) {
 test('cold boundary witnesses prepared target history and validates its selected ready RAF', { timeout: 60_000 }, async context => {
   const report = await measureOffscreenColdBoundary(electron, page)
   context.diagnostic(`Cold boundary witness: ${JSON.stringify({ timing: report.coldTiming, preparedTarget: report.preparedTarget,
-    approach: report.approachLatency, sourcePhaseRAF: report.sourcePhaseRAF, targetPhaseRAF: report.targetPhaseRAF })}`)
+    approach: report.approachLatency, approachAcknowledgment: report.approachAcknowledgment,
+    sourcePhaseRAF: report.sourcePhaseRAF, targetPhaseRAF: report.targetPhaseRAF })}`)
   assert.equal(report.preparedTarget.targetEnd, report.targetEnd)
   assert.ok(report.preparedTarget.historyBars > 96)
   assert.equal(report.coldTiming.preparedBeforeFinalInput, true, 'The witness must precede target demand.')
@@ -39,6 +40,12 @@ test('cold boundary witnesses prepared target history and validates its selected
   assert.equal(report.observedFieldOracle.priceBars, 96)
   assert.equal(report.observedFieldOracle.indicatorBars, 96)
   assert.equal(report.inputBursts.length, 2)
+  assert.equal(report.approachLatency.milestone, 'rendered-window')
+  assert.match(report.approachLatency.meaning, /no 100 ms content deadline/)
+  assert.equal(report.approachAcknowledgment.milestone, 'requested-cursor')
+  assert.equal(report.approachAcknowledgment.unaccountedInputs.length, 0)
+  assert.equal(report.approachAcknowledgment.lastCommit.end, report.approachAcknowledgment.intents.at(-1).target)
+  assert.ok(Number.isFinite(report.approachAcknowledgment.lastCommit.rafSampledAt))
   assert.ok(report.observationSamples.length > 0)
   assert.ok(report.observationSamples.every(sample => Number.isFinite(sample.at) && typeof sample.frame === 'boolean'))
   for (const phase of [report.sourcePhaseRAF, report.targetPhaseRAF]) {
@@ -232,6 +239,43 @@ test('real resident reserve covers delayed history delivery before continuous in
     minimumBars: report.minimumBars, pendingFrames: report.pendingFrames, latestInputToRafSampleMS: report.latestInputToRafSampleMS,
     nativePaintMeasured: report.nativePaintMeasured }))
   await writeFile(join(root, '.build/chart-prefetch-latency.json'), `${JSON.stringify(report, null, 2)}\n`)
+})
+
+test('a prefetch validation failure retains complete timing and delivery evidence', { timeout: 90_000 }, async () => {
+  const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark', instId: 'PREFETCH-EVIDENCE-USDT-SWAP' }))
+  // Inject a validation failure only after the real 768-input phase and
+  // deferred probe have completed; the measured workload is unchanged.
+  const failingPage = new Proxy(page, { get(target, key) {
+    const value = target[key]
+    if (key === 'evaluate') return async (...args) => {
+      const result = await value.apply(target, args)
+      if (args[1]?.includeTimingEvidence && Array.isArray(result?.violations)) result.violations.push('Injected deferred paint validation failure.')
+      return result
+    }
+    return typeof value === 'function' ? value.bind(target) : value
+  } })
+  await assert.rejects(measureLatencyCoveredPrefetch(electron, failingPage, fixture, { offscreen: true }), error => {
+    const marker = '\nPrefetch phase data: '
+    const position = error.message.lastIndexOf(marker)
+    assert.ok(position >= 0, 'The failure must include the phase evidence.')
+    const evidence = JSON.parse(error.message.slice(position + marker.length))
+    assert.ok(Number.isFinite(evidence.rendererTimeOrigin))
+    assert.equal(evidence.inputs.length, 768)
+    assert.equal(evidence.latency.intents.length, 768)
+    assert.ok(evidence.latency.intents.every(intent => Number.isFinite(intent.inputAt)
+      && Number.isFinite(intent.commitAt) && Number.isFinite(intent.rafSampledAt)))
+    assert.ok(evidence.paint.violations.includes('Injected deferred paint validation failure.'))
+    assert.ok(evidence.paint.frames > 0 && evidence.paint.paints > 0)
+    assert.ok(evidence.paint.frameSamples.length > 0 && evidence.paint.captureTimings.length > 0)
+    assert.ok(evidence.paint.captureTimings.every(sample => Number.isFinite(sample.at) && Number.isFinite(sample.durationMS)))
+    assert.ok(evidence.requests.extensions.length > 0)
+    assert.ok(Number.isFinite(evidence.runway.runwayAtRequest))
+    assert.deepEqual(evidence.sources.historical, [])
+    assert.equal(evidence.checks.find(check => check.name === 'complete paints').passed, false)
+    assert.equal(evidence.checks.find(check => check.name === 'delivery before crossing').passed, true)
+    assert.equal(evidence.checks.find(check => check.name === 'persisted sources').passed, true)
+    return true
+  })
 })
 
 test('a completely absent 96-candle viewport stays truthful through delayed acquisition, continuing input, and reversal', { timeout: 45_000 }, async context => {

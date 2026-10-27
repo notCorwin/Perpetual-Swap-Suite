@@ -109,7 +109,8 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
       `The warm startup selection blocked native foreground input for ${startup.inputToSVGCommitMS} ms: ${JSON.stringify(startup)}`)
     await installNavigationProbe(electron)
     if (process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS) context.after(await startRendererDiagnostics(electron, page,
-      join(process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS, 'restart-navigation')))
+      join(process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS, 'restart-navigation'),
+      { cpuProfile: process.env.PERPETUAL_SWAP_RENDERER_TRACE_ONLY !== '1' }))
     const report = await exerciseInstrumentNavigation(electron, page, fixture, { holdHistory: false, presentation })
     assert.equal(report.phases.length, 3)
     assert.equal(report.initialPreparation.readyFrameCount, fixture.instIds.length * 3)

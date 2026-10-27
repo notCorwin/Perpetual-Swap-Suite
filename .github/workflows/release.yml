@@ -112,10 +112,11 @@ jobs:
       - name: Test native foreground charts and navigation
         id: native-charts
         run: npm run test:foreground -- --output artifacts/sandbox
-      - name: Collect separate profiles after native chart acceptance failure
+      - name: Collect separate traces after native chart acceptance failure
         if: ${{ failure() && steps.native-charts.outcome == 'failure' }}
         env:
-          PERPETUAL_SWAP_RENDERER_DIAGNOSTICS: artifacts/native-chart-diagnostic-profile
+          PERPETUAL_SWAP_RENDERER_DIAGNOSTICS: artifacts/native-chart-diagnostic-trace
+          PERPETUAL_SWAP_RENDERER_TRACE_ONLY: '1'
         run: |
           test -f dist/index.html
           npm run sandbox -- command --desktop --foreground --output artifacts/diagnostic-sandbox -- node --test-concurrency=1 --test tests/e2e/chart-paint.foreground.mjs tests/e2e/instrument-navigation.foreground.mjs

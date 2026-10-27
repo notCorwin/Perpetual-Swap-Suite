@@ -30,7 +30,8 @@ before(async () => {
 })
 beforeEach(async context => {
   if (process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS) stopDiagnostics = await startRendererDiagnostics(electron, page,
-    join(process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS, 'chart-paint', context.name.replace(/[^a-z0-9]+/gi, '-')))
+    join(process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS, 'chart-paint', context.name.replace(/[^a-z0-9]+/gi, '-')),
+    { cpuProfile: process.env.PERPETUAL_SWAP_RENDERER_TRACE_ONLY !== '1' })
 })
 afterEach(async () => {
   const stop = stopDiagnostics

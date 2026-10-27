@@ -30,13 +30,42 @@ export function summarizeLatencySamples(values, { minimumPercentileSamples = DEF
   }
 }
 
-export function assertScrollResponsiveness(report, { inputBudgetMS = 100, frameBudgetMS = 100 } = {}) {
-  const latency = summarizeLatencySamples(report.intentLatenciesMS)
-  if (!latency.sampleCount || report.unaccountedInputs?.length) throw new Error('Scroll responsiveness needs every input intent accounted for.')
-  if (latency.maxMS >= inputBudgetMS) throw new Error(`Scroll intent exceeded ${inputBudgetMS} ms: ${latency.maxMS} ms.`)
-  if (!Number.isFinite(report.maxFrameGapMS) || report.maxFrameGapMS >= frameBudgetMS) {
-    throw new Error(`A renderer RAF gap exceeded ${frameBudgetMS} ms: ${report.maxFrameGapMS} ms.`)
+// Run independent checks even when one fails, so functional and performance
+// failures remain visible together in the acceptance evidence.
+export function collectAcceptanceChecks(checks) {
+  const results = [], failures = []
+  for (const [name, check] of checks) {
+    try { check(); results.push({ name, passed: true }) }
+    catch (error) {
+      results.push({ name, passed: false, message: error?.message ?? String(error) })
+      failures.push(error)
+    }
   }
+  return { results, failures }
+}
+
+function throwFailures(failures) {
+  if (failures.length === 1) throw failures[0]
+  if (failures.length > 1) throw new AggregateError(failures, failures.map(error => error?.message ?? String(error)).join('\n'))
+}
+
+export function assertScrollResponsiveness(report, { inputBudgetMS = 100, frameBudgetMS = 100 } = {}) {
+  let latency
+  const { failures } = collectAcceptanceChecks([
+    ['input accounting', () => {
+      latency = summarizeLatencySamples(report.intentLatenciesMS)
+      if (!latency.sampleCount || report.unaccountedInputs?.length) throw new Error('Scroll responsiveness needs every input intent accounted for.')
+    }],
+    ['input latency', () => {
+      if (latency?.maxMS >= inputBudgetMS) throw new Error(`Scroll intent exceeded ${inputBudgetMS} ms: ${latency.maxMS} ms.`)
+    }],
+    ['renderer RAF gap', () => {
+      if (!Number.isFinite(report.maxFrameGapMS) || report.maxFrameGapMS >= frameBudgetMS) {
+        throw new Error(`A renderer RAF gap exceeded ${frameBudgetMS} ms: ${report.maxFrameGapMS} ms.`)
+      }
+    }],
+  ])
+  throwFailures(failures)
 }
 
 // Renderer timestamps are performance.now() offsets; fixture timestamps use
@@ -73,24 +102,49 @@ export function coldBoundaryTiming({ rendererTimeOrigin, approachInputAt, finalI
 }
 
 export function assertColdBoundaryTiming(timing) {
-  if (!Number.isFinite(timing?.readyAfterPrerequisitesMS) || timing.readyAfterPrerequisitesMS < 0
-    || timing.readyAfterPrerequisitesMS >= 1_000) throw new Error(`Cold ready RAF exceeded the 1000 ms post-prerequisite budget: ${timing?.readyAfterPrerequisitesMS} ms.`)
-  if (!Number.isFinite(timing.preparedAfterSourceMS) || timing.preparedAfterSourceMS < 0
-    || timing.preparedAfterSourceMS >= 1_000) throw new Error(`Cold prefetch preparation exceeded the 1000 ms source-to-prepared budget: ${timing.preparedAfterSourceMS} ms.`)
-  if (!timing.preparedBeforeFinalInput) throw new Error('No passive prepared-target history publication was observed before the final input; prefetch readiness cannot be established independently of demand.')
+  const { failures } = collectAcceptanceChecks([
+    ['ready RAF budget', () => {
+      if (!Number.isFinite(timing?.readyAfterPrerequisitesMS) || timing.readyAfterPrerequisitesMS < 0
+        || timing.readyAfterPrerequisitesMS >= 1_000) throw new Error(`Cold ready RAF exceeded the 1000 ms post-prerequisite budget: ${timing?.readyAfterPrerequisitesMS} ms.`)
+    }],
+    ['source-to-prepared budget', () => {
+      if (!Number.isFinite(timing?.preparedAfterSourceMS) || timing.preparedAfterSourceMS < 0
+        || timing.preparedAfterSourceMS >= 1_000) throw new Error(`Cold prefetch preparation exceeded the 1000 ms source-to-prepared budget: ${timing?.preparedAfterSourceMS} ms.`)
+    }],
+    ['passive preparation', () => {
+      if (!timing?.preparedBeforeFinalInput) throw new Error('No passive prepared-target history publication was observed before the final input; prefetch readiness cannot be established independently of demand.')
+    }],
+  ])
+  throwFailures(failures)
 }
 
-export function assertColdBoundaryResponsiveness({ approachLatency, finalLatency, sourcePhaseRAF, targetPhaseRAF }) {
-  assertScrollResponsiveness(approachLatency)
-  assertScrollResponsiveness(finalLatency)
-  if (!Number.isFinite(finalLatency.maxInputToRafSampleMS) || finalLatency.maxInputToRafSampleMS >= 100) {
-    throw new Error(`A boundary intent took ${finalLatency.maxInputToRafSampleMS} ms to reach its exact or coalesced chart target.`)
-  }
-  for (const [phase, report] of [['approach/source', sourcePhaseRAF], ['target-to-ready', targetPhaseRAF]]) {
-    if (!Number.isFinite(report?.maxGapMS) || report.maxGapMS < 0 || report.maxGapMS >= 100) {
-      throw new Error(`A ${phase} renderer RAF gap exceeded 100 ms: ${report?.maxGapMS} ms.`)
-    }
-  }
+export function assertColdBoundaryResponsiveness({ approachAcknowledgment, finalLatency, readyTargetInputToRAFMS, sourcePhaseRAF, targetPhaseRAF }) {
+  const { failures } = collectAcceptanceChecks([
+    ['approach milestone', () => {
+      if (approachAcknowledgment?.milestone !== 'requested-cursor') throw new Error('The cold approach must measure the requested-cursor RAF acknowledgment.')
+    }],
+    ['approach acknowledgment', () => assertScrollResponsiveness(approachAcknowledgment)],
+    ['final milestone', () => {
+      if (finalLatency?.milestone !== 'rendered-window') throw new Error('The prepared boundary target must measure the rendered-window RAF.')
+    }],
+    ['final rendered target', () => assertScrollResponsiveness(finalLatency)],
+    ['final maximum', () => {
+      if (!Number.isFinite(finalLatency?.maxInputToRafSampleMS) || finalLatency.maxInputToRafSampleMS >= 100) {
+        throw new Error(`A boundary intent took ${finalLatency?.maxInputToRafSampleMS} ms to reach its exact or coalesced chart target.`)
+      }
+    }],
+    ['prepared target ready RAF', () => {
+      if (!Number.isFinite(readyTargetInputToRAFMS) || readyTargetInputToRAFMS < 0 || readyTargetInputToRAFMS >= 100) {
+        throw new Error(`The prepared target took ${readyTargetInputToRAFMS} ms to reach its complete ready RAF.`)
+      }
+    }],
+    ...[['approach/source', sourcePhaseRAF], ['target-to-ready', targetPhaseRAF]].map(([phase, report]) => [phase, () => {
+      if (!Number.isFinite(report?.maxGapMS) || report.maxGapMS < 0 || report.maxGapMS >= 100) {
+        throw new Error(`A ${phase} renderer RAF gap exceeded 100 ms: ${report?.maxGapMS} ms.`)
+      }
+    }]),
+  ])
+  throwFailures(failures)
 }
 
 // The seeded warm fixture promises numeric source values for every populated

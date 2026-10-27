@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { requireForegroundTests } from '../electron/test-presentation.js'
 import { barsWithIndicators } from '../electron/services/indicators.js'
-import { accountChartIntents, assertColdBoundaryResponsiveness, assertColdBoundaryTiming, assertScrollResponsiveness, assertWarmStatistics, coldBoundaryTiming, summarizeLatencySamples } from './chart-acceptance-metrics.mjs'
+import { accountChartIntents, assertColdBoundaryResponsiveness, assertColdBoundaryTiming, assertScrollResponsiveness, assertWarmStatistics, coldBoundaryTiming, collectAcceptanceChecks, summarizeLatencySamples } from './chart-acceptance-metrics.mjs'
 
 // The guarded runtime owns focus isolation. Performance acceptance keeps the
 // production rendering configuration instead of forcing software/headless work.
@@ -483,8 +483,8 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
   }, { instId: fixture.instId, series: fixture.series, requireMatureData, requireWarmStatistics, indicatorValidation })
 }
 
-export async function finishPaintProbe(page, { readyTarget = null } = {}) {
-  const report = await page.evaluate(readyTarget => {
+export async function finishPaintProbe(page, { readyTarget = null, includeRequestCommits = false, includeTimingEvidence = false } = {}) {
+  const report = await page.evaluate(({ readyTarget, includeRequestCommits, includeTimingEvidence }) => {
     const probe = window.__chartPaintProbe
     if (!probe) throw new Error('No chart paint probe was installed.')
     probe.capturePending()
@@ -648,10 +648,13 @@ export async function finishPaintProbe(page, { readyTarget = null } = {}) {
       totalProbeValidationMS: Number(probe.validationSamples.reduce((sum, sample) => sum + sample.durationMS, 0).toFixed(3)),
       validationDurations: probe.validationSamples.map(sample => sample.durationMS),
       deferredValidationSamples, failedCaptureSamples, totalDeferredValidationMS: Number(deferredValidationMS.toFixed(3)),
-      ...(readyTarget ? { readyFrame, firstFrameAt: probe.firstFrameAt ?? null, frameSamples: probe.frameSamples, inputBursts: probe.inputBursts,
+      ...(readyTarget || includeTimingEvidence ? { firstFrameAt: probe.firstFrameAt ?? null, frameSamples: probe.frameSamples, inputBursts: probe.inputBursts,
         observationSamples: probe.observations.map(({ at, frame, phase, captureFailure }) => ({ at, frame, phase, captureFailure: Boolean(captureFailure) })) } : {}),
+      ...(readyTarget ? { readyFrame } : {}),
+      ...(includeRequestCommits ? { requestCommits: probe.requestCommits } : {}),
+      ...(includeTimingEvidence ? { captureTimings: probe.validationSamples } : {}),
     }
-  }, readyTarget)
+  }, { readyTarget, includeRequestCommits, includeTimingEvidence })
   const frameGaps = summarizeLatencySamples(report.frameGaps)
   const capture = summarizeLatencySamples(report.validationDurations)
   delete report.frameGaps
@@ -671,6 +674,28 @@ export function assertCompletePaints(report) {
   assert.ok(report.paints > 0, 'The acceptance probe must inspect the real rendered snapshot.')
   assert.equal(report.minimumBars, 96, 'Every observed window must contain 96 candles.')
   assert.deepEqual(report.violations, [], 'A rendered window was incomplete, mixed, or mathematically incorrect.')
+}
+
+// Keep only timing and validation metadata in failure evidence. The retained
+// bars and SVG paths are checked inside finishPaintProbe and are not serialized
+// once per observation.
+function paintPhaseEvidence(paint) {
+  return { frames: paint.frames, pendingFrames: paint.pendingFrames, pendingWindows: paint.pendingWindows,
+    paints: paint.paints, minimumBars: paint.minimumBars, violations: paint.violations,
+    deferredValidationSamples: paint.deferredValidationSamples, failedCaptureSamples: paint.failedCaptureSamples,
+    totalDeferredValidationMS: paint.totalDeferredValidationMS, probeCaptureSamples: paint.probeCaptureSamples,
+    totalProbeCaptureMS: paint.totalProbeCaptureMS, maxProbeCaptureMS: paint.maxProbeCaptureMS, scheduler: paint.scheduler,
+    firstFrameAt: paint.firstFrameAt, inputBursts: paint.inputBursts, commits: paint.commits,
+    requestCommits: paint.requestCommits, frameSamples: paint.frameSamples, captureTimings: paint.captureTimings,
+    observationSamples: paint.observationSamples }
+}
+
+function prefetchPerformanceChecks(latency) {
+  return [
+    ['100 ms input and RAF budgets', () => assertScrollResponsiveness(latency)],
+    ['100 ms maximum raw input latency', () => assert.ok(latency.maxInputToRafSampleMS < 100,
+      `A wheel intent took ${latency.maxInputToRafSampleMS} ms to reach its exact or coalesced chart target.`)],
+  ]
 }
 
 export async function wheelBurst(page, { frames = 1, eventsPerFrame = 1, deltaY = 12, deltaX = 0, deltaMode = 0 }) {
@@ -694,7 +719,7 @@ export async function wheelBurst(page, { frames = 1, eventsPerFrame = 1, deltaY 
   }, { frames, eventsPerFrame, deltaY, deltaX, deltaMode })
 }
 
-export async function measureChartIntentLatency(page, { inputs, targets, requireForeground = true, milestone = 'rendered-window' }) {
+export async function measureChartIntentLatency(page, { inputs, targets, requireForeground = true, milestone = 'rendered-window', enforceBudgets = true }) {
   assert.ok(['rendered-window', 'requested-cursor'].includes(milestone), 'Unknown chart intent acknowledgment milestone.')
   const commitKey = milestone === 'requested-cursor' ? 'requestCommits' : 'commits'
   const latestInput = inputs.at(-1)
@@ -704,14 +729,18 @@ export async function measureChartIntentLatency(page, { inputs, targets, require
     && commit.timeframe === window.__chartPaintProbe.expectedTimeframe
     && commit.at >= latestInput && commit.rafSampledAt !== null), { latestInput, expectedEnd, commitKey })
   const observation = await page.evaluate(({ inputs, targets, requireForeground, commitKey }) => {
-    if (requireForeground && (document.visibilityState !== 'visible' || !document.hasFocus())) throw new Error('Foreground renderer timing lost its visible, focused window.')
+    const visibility = document.visibilityState, focused = document.hasFocus()
+    if (requireForeground && (visibility !== 'visible' || !focused)) {
+      throw new Error(`Foreground renderer timing lost its visible, focused window: ${JSON.stringify({ visibility, focused })}.`)
+    }
     const probe = window.__chartPaintProbe, commits = probe[commitKey]
     for (const { observer, record } of probe.schedulerObservers) record(observer.takeRecords())
     const bursts = inputs.map(input => probe.inputBursts.find(burst => burst.lastAt === input))
     if (bursts.some(burst => !burst)) throw new Error('Every measured wheel burst must include its first and final input timestamps.')
     const latestBurst = bursts.at(-1), startedAt = bursts[0].firstAt
     return {
-      visibility: document.visibilityState, focused: document.hasFocus(), commits, instId: probe.instId, timeframe: probe.expectedTimeframe,
+      visibility, focused, rendererTimeOrigin: performance.timeOrigin,
+      commits, instId: probe.instId, timeframe: probe.expectedTimeframe,
       scheduler: probe.scheduler.entries.filter(entry => entry.startTime + entry.duration >= startedAt),
       bursts, inputs, targets, startedAt,
       frameSamples: probe.frameSamples.filter(sample => sample.at >= startedAt),
@@ -736,12 +765,13 @@ export async function measureChartIntentLatency(page, { inputs, targets, require
   if (accounted.some(intent => intent.commit?.rafSampledAt > endAt)) throw new Error('The gesture report contains a chart sample after the latest target.')
   const report = {
       milestone,
-      documentVisibility: observation.visibility, documentFocused: observation.focused,
+      documentVisibility: observation.visibility, documentFocused: observation.focused, rendererTimeOrigin: observation.rendererTimeOrigin,
       scheduler: observation.scheduler.filter(entry => entry.startTime <= endAt),
       committedInputs: accounted.filter(intent => intent.status === 'committed').length,
       supersededInputs: accounted.filter(intent => intent.status === 'coalesced').length,
       unaccountedInputs: accounted.filter(intent => intent.status === 'unaccounted').map(({ index, target }) => ({ index, target })),
-      intents: accounted.map(({ index, target, status, supersededBy, latencyMS }) => ({ index, target, status, supersededBy, latencyMS })),
+      intents: accounted.map(({ index, target, status, supersededBy, commit, latencyMS }) => ({ index, inputAt: inputs[index], target, status, supersededBy,
+        commitAt: commit?.at ?? null, rafSampledAt: commit?.rafSampledAt ?? null, committedTarget: commit?.end ?? null, latencyMS })),
       intentLatenciesMS: latencies.map(value => Number(value.toFixed(3))),
       p50InputToRafSampleMS: latencySummary.p50MS,
       p95InputToRafSampleMS: latencySummary.p95MS,
@@ -773,7 +803,7 @@ export async function measureChartIntentLatency(page, { inputs, targets, require
   if (report.unaccountedInputs.length) {
     throw new Error(`Chart intents disappeared without a committed target or coalescing successor: ${JSON.stringify(report.unaccountedInputs)}`)
   }
-  if (requireForeground) {
+  if (requireForeground && enforceBudgets) {
     try { assertScrollResponsiveness(report) }
     catch (error) { throw new Error(`${error.message}\nScroll timing: ${JSON.stringify(report)}`, { cause: error }) }
   }
@@ -1080,16 +1110,21 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture, { o
   const historicalDelayMS = 1_500
   const frames = 768
   const candlesPerFrame = 2
-  const foreground = offscreen ? null : await foregroundPaintWindow(electron, page)
-  if (offscreen) {
-    const native = await electron.evaluate(({ BrowserWindow }) => {
-      const window = BrowserWindow.getAllWindows()[0]
-      return { visible: window.isVisible(), focused: window.isFocused(), offscreen: window.webContents.isOffscreen() }
-    })
-    assert.deepEqual(native, { visible: false, focused: false, offscreen: true })
-  }
+  const phaseData = { presentation: offscreen ? 'hidden offscreen' : 'native foreground', historicalDelayMS,
+    continuousWheelFrames: frames, candlesPerFrame }
+  let foreground, probeInstalled = false, paintStarted = false, failure
   try {
+    foreground = offscreen ? null : await foregroundPaintWindow(electron, page)
+    if (offscreen) {
+      const native = await electron.evaluate(({ BrowserWindow }) => {
+        const window = BrowserWindow.getAllWindows()[0]
+        return { visible: window.isVisible(), focused: window.isFocused(), offscreen: window.webContents.isOffscreen() }
+      })
+      phaseData.native = native
+      assert.deepEqual(native, { visible: false, focused: false, offscreen: true })
+    } else phaseData.foreground = { native: foreground.native, environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence }
     await installRequestProbe(electron, fixture.instId, { historicalDelayMS })
+    probeInstalled = true
     await openChart(page, fixture)
     // Delay only facts beyond the genuinely admitted range. Silently clipping
     // already delivered facts gives the backend a false view of client runway.
@@ -1097,6 +1132,7 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture, { o
     await waitForRendered(page, fixture)
     const initial = await readRequestProbe(electron)
     const admitted = initial.historyFrames[fixture.timeframe]
+    phaseData.initial = initial
     assert.ok(admitted && admitted.calculated === admitted.bars)
     assert.equal(admitted.end, fixture.end, 'The initial delivered range must end at the fixture latest candle.')
     const initialHistoryBars = (fixture.end - admitted.first) / fixture.intervalMS + 1
@@ -1104,47 +1140,67 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture, { o
     assert.ok(initialHistoryBars > 96 && initialHistoryBars <= 1536)
     assert.ok(frames * candlesPerFrame > initialHistoryBars - 95, 'The gesture must cross the actual delivered boundary.')
     const timeOrigin = await page.evaluate(() => performance.timeOrigin)
+    phaseData.rendererTimeOrigin = timeOrigin
+    phaseData.initialHistoryBars = initialHistoryBars
     assert.deepEqual(initial.extensions, [], 'Initial preparation must finish before delayed delivery begins.')
     await electron.evaluate((_, { timeframe, first }) => {
       globalThis.__chartRequestProbe.deliveredFloors.set(timeframe, first)
     }, { timeframe: fixture.timeframe, first: admitted.first })
     await startPaintProbe(page, fixture)
+    paintStarted = true
     await electron.evaluate(() => { globalThis.__chartRequestProbe.extendHistory = true })
     const inputs = await wheelBurst(page, { frames, deltaY: 24 })
+    phaseData.inputs = inputs
     const expectedEnd = fixture.end - frames * candlesPerFrame * fixture.intervalMS
     await waitForRendered(page, fixture, fixture.timeframe, expectedEnd)
     const latency = await measureChartIntentLatency(page, {
-      inputs, targets: inputs.map((_, index) => fixture.end - (index + 1) * candlesPerFrame * fixture.intervalMS), requireForeground: !offscreen,
+      inputs, targets: inputs.map((_, index) => fixture.end - (index + 1) * candlesPerFrame * fixture.intervalMS),
+      requireForeground: !offscreen, enforceBudgets: false,
     })
-    const paint = await finishPaintProbe(page)
-    assertCompletePaints(paint)
+    phaseData.latency = latency
+    const paint = await finishPaintProbe(page, { includeRequestCommits: true, includeTimingEvidence: true })
+    paintStarted = false
+    phaseData.paint = paintPhaseEvidence(paint)
     const requests = await readRequestProbe(electron)
-    assert.equal(paint.pendingFrames, 0, `Latency-covered scrolling must never expose an unprepared requested viewport: ${JSON.stringify({ calls: requests.calls, sourceRequests: requests.sourceRequests, historyResponses: requests.historyResponses.length, inputDurationMS: inputs.at(-1) - inputs[0], pendingFrames: paint.pendingFrames, pendingWindows: paint.pendingWindows })}`)
-    if (!offscreen) assert.ok(latency.maxInputToRafSampleMS < 100, `A wheel intent took ${latency.maxInputToRafSampleMS} ms to reach its exact or coalesced chart target. ${JSON.stringify(latency)}`)
+    phaseData.requests = requests
     const extensions = requests.extensions.filter(record => record.completedAt !== null && record.startedAt >= timeOrigin + inputs[0])
     const first = extensions[0]
-    assert.ok(first, 'Backend reserve preparation must extend the delivered history during the gesture.')
-    const requestTime = first.startedAt - timeOrigin
-    const responseTime = first.completedAt - timeOrigin
-    assert.ok(requestTime >= inputs[0] && responseTime < inputs.at(-1),
-      'A delayed history delivery must start and finish while wheel input is still arriving.')
-    const observedDeliveryMS = first.completedAt - first.readCompletedAt
-    assert.ok(observedDeliveryMS >= historicalDelayMS, 'The actual prepared data must spend the full configured interval behind the delivery gate.')
+    const requestTime = first ? first.startedAt - timeOrigin : null
+    const responseTime = first ? first.completedAt - timeOrigin : null
+    const observedDeliveryMS = first ? first.completedAt - first.readCompletedAt : null
     const initialFirst = fixture.end - (initialHistoryBars - 1) * fixture.intervalMS
-    assert.ok(first.first < initialFirst && first.end >= initialFirst && first.bars > 96,
-      'A real bulk response must extend continuously across the original delivered boundary.')
     const crossingIndex = Math.ceil((initialHistoryBars - 95) / candlesPerFrame) - 1
-    assert.ok(responseTime < inputs[crossingIndex], 'Backend reserve data must reach the renderer before the first viewport crosses the original boundary.')
-    const inputsAtRequest = inputs.filter(input => input <= requestTime).length
-    const runwayAtRequest = initialHistoryBars - 96 - inputsAtRequest * candlesPerFrame
-    assert.ok(runwayAtRequest >= 192, `Only ${runwayAtRequest} resident candles remained when backend history delivery started.`)
-    assert.ok(requests.maxHistoricalActive <= 2, 'Continuous input must keep durable reads within two independent lanes.')
-    assert.equal(requests.legacyWindowCalls, 0)
+    const inputsAtRequest = first ? inputs.filter(input => input <= requestTime).length : null
+    const runwayAtRequest = first ? initialHistoryBars - 96 - inputsAtRequest * candlesPerFrame : null
     const delayedReads = requests.calls.filter(call => call.delayedExtension)
     const readBudget = 2 * (Math.ceil((inputs.at(-1) - inputs[0]) / historicalDelayMS) + 1)
-    assert.ok(delayedReads.length <= readBudget, `A cold-boundary traversal admitted ${delayedReads.length} delayed disk reads (budget ${readBudget}).`)
     const sources = separateSourceMaintenance(requests.sourceRequests, fixture)
-    assert.deepEqual(sources.historical, [], 'Prefetch must reuse persisted source candles and statistics within the latency test range.')
+    phaseData.runway = { requestTime, responseTime, observedDeliveryMS, inputsAtRequest, runwayAtRequest, crossingIndex,
+      crossingInputAt: inputs[crossingIndex], delayedReadCount: delayedReads.length, readBudget, initialFirst }
+    phaseData.sources = sources
+    // All paint, source, delivery, and timing checks run after deferred paint
+    // validation. A slow gesture must not hide the functional result, and a
+    // functional failure must not hide either timing budget.
+    const checks = [
+      ['complete paints', () => assertCompletePaints(paint)],
+      ['no pending frames', () => assert.equal(paint.pendingFrames, 0, 'Latency-covered scrolling must never expose an unprepared requested viewport.')],
+      ['history delivery', () => assert.ok(first, 'Backend reserve preparation must extend the delivered history during the gesture.')],
+      ...(first ? [
+        ['delivery during gesture', () => assert.ok(requestTime >= inputs[0] && responseTime < inputs.at(-1), 'A delayed history delivery must start and finish while wheel input is still arriving.')],
+        ['delivery delay', () => assert.ok(observedDeliveryMS >= historicalDelayMS, 'The actual prepared data must spend the full configured interval behind the delivery gate.')],
+        ['continuous extension', () => assert.ok(first.first < initialFirst && first.end >= initialFirst && first.bars > 96, 'A real bulk response must extend continuously across the original delivered boundary.')],
+        ['delivery before crossing', () => assert.ok(responseTime < inputs[crossingIndex], 'Backend reserve data must reach the renderer before the first viewport crosses the original boundary.')],
+        ['request runway', () => assert.ok(runwayAtRequest >= 192, `Only ${runwayAtRequest} resident candles remained when backend history delivery started.`)],
+      ] : []),
+      ['historical read lanes', () => assert.ok(requests.maxHistoricalActive <= 2, 'Continuous input must keep durable reads within two independent lanes.')],
+      ['legacy window calls', () => assert.equal(requests.legacyWindowCalls, 0)],
+      ['delayed read budget', () => assert.ok(delayedReads.length <= readBudget, `A cold-boundary traversal admitted ${delayedReads.length} delayed disk reads (budget ${readBudget}).`)],
+      ['persisted sources', () => assert.deepEqual(sources.historical, [], 'Prefetch must reuse persisted source candles and statistics within the latency test range.')],
+      ...(!offscreen ? prefetchPerformanceChecks(latency) : []),
+    ]
+    const { results, failures } = collectAcceptanceChecks(checks)
+    phaseData.checks = results
+    if (failures.length) throw new AggregateError(failures, failures.map(error => error?.message ?? String(error)).join('\n'))
     return {
       foregroundWindow: foreground?.native, environment: foreground?.environment, idleFrameCadence: foreground?.idleFrameCadence,
       timingScope: offscreen
@@ -1159,11 +1215,73 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture, { o
       maxConcurrentHistoricalRequests: requests.maxHistoricalActive,
       olderSourceExtensions: sources.historicalExtensions.length,
       repeatedSourceDownloads: sources.historical.length,
-      ...latency, ...paint, commits: paint.commits.length,
+      ...latency, ...paint, frameSamples: undefined, captureTimings: undefined, observationSamples: undefined,
+      inputBursts: undefined, requestCommits: undefined, commits: paint.commits.length,
     }
+  } catch (error) {
+    const evidenceErrors = []
+    if (paintStarted) {
+      try {
+        const paint = await finishPaintProbe(page, { includeRequestCommits: true, includeTimingEvidence: true })
+        paintStarted = false
+        phaseData.paint = paintPhaseEvidence(paint)
+      } catch (evidenceError) { evidenceErrors.push(`Paint evidence: ${evidenceError?.message ?? String(evidenceError)}`) }
+    }
+    if (phaseData.rendererTimeOrigin === undefined) {
+      try { phaseData.rendererTimeOrigin = await page.evaluate(() => performance.timeOrigin) }
+      catch (evidenceError) { evidenceErrors.push(`Renderer clock: ${evidenceError?.message ?? String(evidenceError)}`) }
+    }
+    if (probeInstalled && !phaseData.requests) {
+      try { phaseData.requests = await readRequestProbe(electron) }
+      catch (evidenceError) { evidenceErrors.push(`Request evidence: ${evidenceError?.message ?? String(evidenceError)}`) }
+    }
+    const observedInputs = phaseData.inputs ?? phaseData.paint?.inputBursts?.map(burst => burst.lastAt)
+    if (!phaseData.latency && observedInputs?.length && phaseData.paint?.commits) {
+      try {
+        const intents = observedInputs.map((at, index) => ({ at, target: fixture.end - (index + 1) * candlesPerFrame * fixture.intervalMS,
+          instId: fixture.instId, timeframe: fixture.timeframe }))
+        phaseData.intentAccounting = accountChartIntents(intents, phaseData.paint.commits).map(intent => ({
+          index: intent.index, inputAt: observedInputs[intent.index], target: intent.target, status: intent.status,
+          supersededBy: intent.supersededBy, commitAt: intent.commit?.at ?? null, rafSampledAt: intent.commit?.rafSampledAt ?? null,
+          committedTarget: intent.commit?.end ?? null, latencyMS: intent.latencyMS }))
+      } catch (evidenceError) { evidenceErrors.push(`Intent evidence: ${evidenceError?.message ?? String(evidenceError)}`) }
+    }
+    if (!phaseData.runway && observedInputs?.length && Number.isFinite(phaseData.initialHistoryBars)
+      && Number.isFinite(phaseData.rendererTimeOrigin) && phaseData.requests) {
+      const first = phaseData.requests.extensions.find(record => record.startedAt >= phaseData.rendererTimeOrigin + observedInputs[0])
+      if (first) {
+        const requestTime = first.startedAt - phaseData.rendererTimeOrigin
+        const inputsAtRequest = observedInputs.filter(input => input <= requestTime).length
+        phaseData.runway = { requestTime, responseTime: Number.isFinite(first.completedAt) ? first.completedAt - phaseData.rendererTimeOrigin : null,
+          inputsAtRequest, runwayAtRequest: phaseData.initialHistoryBars - 96 - inputsAtRequest * candlesPerFrame,
+          deliveryPending: first.completedAt === null }
+      }
+    }
+    const performanceFailures = []
+    if (!offscreen && phaseData.latency && !phaseData.checks) {
+      const performance = collectAcceptanceChecks(prefetchPerformanceChecks(phaseData.latency))
+      phaseData.checks = performance.results
+      performanceFailures.push(...performance.failures)
+    }
+    if (evidenceErrors.length) phaseData.evidenceErrors = evidenceErrors
+    const failures = [error, ...performanceFailures]
+    const message = failures.map(item => item?.message ?? String(item)).join('\n')
+    failure = new Error(`${message}\nPrefetch phase data: ${JSON.stringify(phaseData)}`,
+      { cause: failures.length === 1 ? error : new AggregateError(failures, message) })
+    throw failure
   } finally {
-    try { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
-    finally { await foreground?.restore() }
+    const cleanupErrors = []
+    if (paintStarted) try { await finishPaintProbe(page) } catch (error) { cleanupErrors.push(error) }
+    if (probeInstalled) {
+      try { await releaseRequestProbe(electron) } catch (error) { cleanupErrors.push(error) }
+      try { await removeRequestProbe(electron) } catch (error) { cleanupErrors.push(error) }
+    }
+    try { await foreground?.restore() } catch (error) { cleanupErrors.push(error) }
+    if (cleanupErrors.length) {
+      const message = cleanupErrors.map(error => error?.message ?? String(error)).join('\n')
+      if (failure) failure.message += `\nPrefetch cleanup failures: ${message}`
+      else throw new AggregateError(cleanupErrors, `Prefetch cleanup failures: ${message}\nPrefetch phase data: ${JSON.stringify(phaseData)}`)
+    }
   }
 }
 
@@ -1431,11 +1549,28 @@ async function assertColdCanonicalViewport(electron, page, fixture, endHour, cap
     checksCanonicalValues: true, unobservedFieldsRemainNull: true }
 }
 
+function summarizeColdApproach(inputs, target, fixture, timeframe, commits, frameSamples, endAt, milestone) {
+  const intents = accountChartIntents(inputs.map(at => ({ at, target, instId: fixture.instId, timeframe })), commits)
+  const last = intents.at(-1)
+  const gaps = frameSamples.filter(sample => sample.at >= inputs[0]
+    && sample.at <= (last.commit?.rafSampledAt ?? endAt)).map(sample => sample.gapMS)
+  const latencies = intents.filter(intent => intent.commit).map(intent => intent.latencyMS)
+  return { milestone,
+    committedInputs: intents.filter(intent => intent.status === 'committed').length,
+    supersededInputs: intents.filter(intent => intent.status === 'coalesced').length,
+    unaccountedInputs: intents.filter(intent => intent.status === 'unaccounted').map(({ index, target }) => ({ index, target })),
+    intents: intents.map(({ index, target, status, supersededBy, commit, latencyMS }) => ({ index, inputAt: inputs[index], target, status, supersededBy,
+      commitAt: commit?.at ?? null, rafSampledAt: commit?.rafSampledAt ?? null, committedTarget: commit?.end ?? null, latencyMS })),
+    lastCommit: last.commit, intentLatenciesMS: latencies.map(value => Number(value.toFixed(3))),
+    maxInputToRafSampleMS: summarizeLatencySamples(latencies).maxMS,
+    maxFrameGapMS: summarizeLatencySamples(gaps).maxMS }
+}
+
 async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen = false } = {}) {
   const probe = value => electron.evaluate((_, value) => globalThis.__marketBackend.probe(value), value)
   const fixture = await probe({ action: 'coldBoundaryInstall', timeframe })
   let paintStarted = false
-  let cdp, beforeMetrics
+  let cdp, beforeMetrics, approachInputs, inputs, failure
   const phaseData = { timeframe, presentation: offscreen ? 'hidden offscreen' : 'native foreground',
     clocks: { renderer: 'performance.now() offsets plus renderer performance.timeOrigin', source: 'worker performance.timeOrigin plus performance.now()' } }
   try {
@@ -1454,7 +1589,7 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
     await startPaintProbe(page, fixture, { indicatorValidation: 'finite' })
     paintStarted = true
     const approachDistance = fixture.initialHistoryBars - 96 - 256
-    const approachInputs = await wheelBurst(page, { deltaY: approachDistance * 12 })
+    approachInputs = await wheelBurst(page, { deltaY: approachDistance * 12 })
     phaseData.approachInputs = approachInputs
     const approachEnd = fixture.end - approachDistance * fixture.intervalMS
     await waitForRendered(page, fixture, timeframe, approachEnd)
@@ -1469,7 +1604,7 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
       assert.ok(Date.now() < deadline, `Native prefetch did not publish its nearest page before the held reserve: ${JSON.stringify(sources)}`)
       await new Promise(resolve => setTimeout(resolve, 20))
     } while (true)
-    const inputs = await wheelBurst(page, { deltaY: (fixture.targetDistance - approachDistance) * 12 })
+    inputs = await wheelBurst(page, { deltaY: (fixture.targetDistance - approachDistance) * 12 })
     phaseData.finalInputs = inputs
     await waitForTargetSnapshot(page, fixture, timeframe, fixture.targetEnd)
     const initialTarget = await page.locator(`[data-chart-inst="${fixture.instId}"]`).evaluate(chart => ({
@@ -1504,8 +1639,9 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
     const keys = sources.requests.map(request => `${request.source}:${request.from}:${request.through}`)
     assert.equal(new Set(keys).size, keys.length, `Concurrent consumers must reuse the same native source page: ${JSON.stringify(sources.requests)}`)
     const paint = await finishPaintProbe(page, { readyTarget: { instId: fixture.instId, timeframe, endHour: fixture.targetEnd,
-      intervalMS: fixture.intervalMS, afterAt: inputs.at(-1) } })
+      intervalMS: fixture.intervalMS, afterAt: inputs.at(-1) }, includeRequestCommits: true, includeTimingEvidence: true })
     paintStarted = false
+    phaseData.paint = paintPhaseEvidence(paint)
     const timeOrigin = await page.evaluate(() => performance.timeOrigin)
     phaseData.rendererTimeOrigin = timeOrigin
     const targetCommit = paint.commits.find(commit => commit.end === fixture.targetEnd && commit.instId === fixture.instId
@@ -1529,20 +1665,12 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
     const targetFrameSummary = summarizeLatencySamples(targetFrames.map(sample => sample.gapMS))
     phaseData.targetPhaseRAF = { startAt: inputs.at(-1), endAt: paint.readyFrame?.at ?? null, samples: targetFrames,
       sampleCount: targetFrameSummary.sampleCount, maxGapMS: targetFrameSummary.maxMS }
-    const approachIntents = accountChartIntents(approachInputs.map(at => ({ at, target: approachEnd, instId: fixture.instId, timeframe })), paint.commits)
-    const approachLast = approachIntents.at(-1)
-    const approachGaps = paint.frameSamples.filter(sample => sample.at >= approachInputs[0]
-      && sample.at <= (approachLast.commit?.rafSampledAt ?? inputs.at(-1))).map(sample => sample.gapMS)
-    const approachLatency = { milestone: 'rendered-window',
-      committedInputs: approachIntents.filter(intent => intent.status === 'committed').length,
-      supersededInputs: approachIntents.filter(intent => intent.status === 'coalesced').length,
-      unaccountedInputs: approachIntents.filter(intent => intent.status === 'unaccounted').map(({ index, target }) => ({ index, target })),
-      intents: approachIntents.map(({ index, target, status, supersededBy, latencyMS }) => ({ index, target, status, supersededBy, latencyMS })),
-      lastCommit: approachLast.commit,
-      intentLatenciesMS: approachIntents.filter(intent => intent.commit).map(intent => Number(intent.latencyMS.toFixed(3))),
-      maxInputToRafSampleMS: summarizeLatencySamples(approachIntents.filter(intent => intent.commit).map(intent => intent.latencyMS)).maxMS,
-      maxFrameGapMS: summarizeLatencySamples(approachGaps).maxMS }
+    const approachLatency = { ...summarizeColdApproach(approachInputs, approachEnd, fixture, timeframe, paint.commits, paint.frameSamples, inputs.at(-1), 'rendered-window'),
+      meaning: 'Raw rendered-content availability diagnostic; initial history hydration is not guaranteed and no 100 ms content deadline is asserted.' }
+    const approachAcknowledgment = summarizeColdApproach(approachInputs, approachEnd, fixture, timeframe, paint.requestCommits,
+      paint.frameSamples, inputs.at(-1), 'requested-cursor')
     phaseData.approachLatency = approachLatency
+    phaseData.approachAcknowledgment = approachAcknowledgment
     assert.ok(targetCommit, 'The target chart snapshot must reach a renderer RAF sample.')
     assert.ok(paint.readyFrame, 'No captured target RAF contained all 96 prices and observed finite indicators.')
     assert.ok(sources.preparedTarget, 'No passive history publication witnessed the prepared target after the nearest source completed; the prefetch preparation gap cannot be measured without demand.')
@@ -1551,19 +1679,29 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
       firstTargetRAFAt: targetCommit.rafSampledAt, readyTargetRAFAt: paint.readyFrame.at,
       nearestStartedAt: nearest.startedAt, nearestCompletedAt: nearest.completedAt, preparedTargetAt: sources.preparedTarget.at })
     phaseData.timing = timing
-    assert.equal(paint.inputBursts.length, approachInputs.length + inputs.length, 'Every approach and boundary wheel burst must be counted.')
-    assertCompletePaints(paint)
-    assert.ok(Number.isFinite(sourcePhaseStart) && Number.isFinite(paint.firstFrameAt) && paint.firstFrameAt <= sourcePhaseStart,
-      'The renderer RAF probe started too late to cover the complete approach/source phase.')
-    if (!offscreen) {
-      assert.ok(latency.documentVisibility === 'visible' && latency.documentFocused, 'Native timing requires a visible, focused renderer.')
-      assertColdBoundaryResponsiveness({ approachLatency, finalLatency: latency, sourcePhaseRAF: phaseData.sourcePhaseRAF, targetPhaseRAF: phaseData.targetPhaseRAF })
-    }
-    assertColdBoundaryTiming(timing)
     const missing = paint.readyFrame.bars.find(bar => bar.hour === fixture.firstMissingEnd)
-    assert.ok(missing && missing.oi === null && missing.buy === null && missing.sell === null,
-      'The selected ready RAF must keep held optional statistics missing at the boundary.')
-    const observedFieldOracle = await assertColdCanonicalViewport(electron, page, fixture, fixture.targetEnd, paint.readyFrame)
+    let observedFieldOracle, oracleError
+    try { observedFieldOracle = await assertColdCanonicalViewport(electron, page, fixture, fixture.targetEnd, paint.readyFrame) }
+    catch (error) { oracleError = error }
+    phaseData.observedFieldOracle = observedFieldOracle
+    const checks = [
+      ['input bursts', () => assert.equal(paint.inputBursts.length, approachInputs.length + inputs.length, 'Every approach and boundary wheel burst must be counted.')],
+      ['complete paints', () => assertCompletePaints(paint)],
+      ['source RAF coverage', () => assert.ok(Number.isFinite(sourcePhaseStart) && Number.isFinite(paint.firstFrameAt) && paint.firstFrameAt <= sourcePhaseStart,
+        'The renderer RAF probe started too late to cover the complete approach/source phase.')],
+      ['cold source timing', () => assertColdBoundaryTiming(timing)],
+      ['held statistics', () => assert.ok(missing && missing.oi === null && missing.buy === null && missing.sell === null,
+        'The selected ready RAF must keep held optional statistics missing at the boundary.')],
+      ['canonical viewport', () => { if (oracleError) throw oracleError }],
+      ...(!offscreen ? [
+        ['foreground presentation', () => assert.ok(latency.documentVisibility === 'visible' && latency.documentFocused, 'Native timing requires a visible, focused renderer.')],
+        ['cold responsiveness', () => assertColdBoundaryResponsiveness({ approachAcknowledgment, finalLatency: latency,
+          readyTargetInputToRAFMS: timing.inputToReadyRAFMS, sourcePhaseRAF: phaseData.sourcePhaseRAF, targetPhaseRAF: phaseData.targetPhaseRAF })],
+      ] : []),
+    ]
+    const { results, failures } = collectAcceptanceChecks(checks)
+    phaseData.checks = results
+    if (failures.length) throw new AggregateError(failures, failures.map(error => error?.message ?? String(error)).join('\n'))
     const afterMetrics = cdp ? Object.fromEntries((await cdp.send('Performance.getMetrics')).metrics.map(metric => [metric.name, metric.value])) : null
     const offscreenObservation = afterMetrics ? {
       rendererTaskMS: Number(((afterMetrics.TaskDuration - beforeMetrics.TaskDuration) * 1000).toFixed(3)),
@@ -1574,7 +1712,7 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
       initiallyMissingCandles: 96 - before.length, nearestSourceCandles: Number(nearest.parameters.limit),
       nativePaintMeasured: false, foregroundRafObservationMeasured: !offscreen, rendererTargetObserved: true,
       nativePageToRafSampleMS: timing.rawPageToFirstRAFMS, coldTiming: timing, preparedTarget: sources.preparedTarget,
-      approachLatency, sourcePhaseRAF: phaseData.sourcePhaseRAF, targetPhaseRAF: phaseData.targetPhaseRAF, inputBursts: paint.inputBursts,
+      approachLatency, approachAcknowledgment, sourcePhaseRAF: phaseData.sourcePhaseRAF, targetPhaseRAF: phaseData.targetPhaseRAF, inputBursts: paint.inputBursts,
       sourceTimeOrigin: sources.sourceTimeOrigin, sourceRequests: sources.requests, commitSamples: paint.commits, readyTargetFrame: phaseData.readyFrame,
       nativeSourceRequests: sources.requests.length, heldReservePages: heldReserve.length, heldStatisticsPages: heldStatistics.length,
       targetSnapshotShownWhilePending: initialTarget.loading,
@@ -1583,12 +1721,57 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
       targetSnapshotObservedBeforeReserveAndStatistics: true,
       duplicateSourcePages: 0,
       ...(offscreenObservation ? { offscreenObservation } : {}),
-      ...latency, ...paint, readyFrame: undefined, frameSamples: undefined, commits: paint.commits.length, approachInput: approachInputs[0] }
+      ...latency, ...paint, readyFrame: undefined, frameSamples: undefined, captureTimings: undefined, requestCommits: undefined,
+      commits: paint.commits.length, approachInput: approachInputs[0] }
   } catch (error) {
-    throw new Error(`${error?.message ?? String(error)}\nCold-boundary phase data: ${JSON.stringify(phaseData)}`, { cause: error })
+    const evidenceErrors = []
+    if (paintStarted) {
+      try {
+        const paint = await finishPaintProbe(page, { readyTarget: inputs?.length ? { instId: fixture.instId, timeframe, endHour: fixture.targetEnd,
+          intervalMS: fixture.intervalMS, afterAt: inputs.at(-1) } : null, includeRequestCommits: true, includeTimingEvidence: true })
+        paintStarted = false
+        phaseData.paint = paintPhaseEvidence(paint)
+        if (paint.readyFrame) phaseData.readyFrame = { at: paint.readyFrame.at, endHour: paint.readyFrame.snapshot.endHour,
+          bars: paint.readyFrame.bars.length, generation: paint.readyFrame.snapshot.generation }
+      } catch (evidenceError) { evidenceErrors.push(`Paint evidence: ${evidenceError?.message ?? String(evidenceError)}`) }
+    }
+    if (phaseData.rendererTimeOrigin === undefined) {
+      try { phaseData.rendererTimeOrigin = await page.evaluate(() => performance.timeOrigin) }
+      catch (evidenceError) { evidenceErrors.push(`Renderer clock: ${evidenceError?.message ?? String(evidenceError)}`) }
+    }
+    try { phaseData.sources = await probe({ action: 'coldBoundaryRead' }) }
+    catch (evidenceError) { evidenceErrors.push(`Source evidence: ${evidenceError?.message ?? String(evidenceError)}`) }
+    if (approachInputs?.length && phaseData.paint?.commits && phaseData.paint?.requestCommits) {
+      try {
+        const approachEnd = fixture.end - (fixture.initialHistoryBars - 96 - 256) * fixture.intervalMS
+        const endAt = inputs?.at(-1) ?? Infinity
+        phaseData.approachLatency ??= summarizeColdApproach(approachInputs, approachEnd, fixture, timeframe,
+          phaseData.paint.commits, phaseData.paint.frameSamples, endAt, 'rendered-window')
+        phaseData.approachAcknowledgment ??= summarizeColdApproach(approachInputs, approachEnd, fixture, timeframe,
+          phaseData.paint.requestCommits, phaseData.paint.frameSamples, endAt, 'requested-cursor')
+      } catch (evidenceError) { evidenceErrors.push(`Approach intent evidence: ${evidenceError?.message ?? String(evidenceError)}`) }
+    }
+    if (!phaseData.finalLatency && inputs?.length && phaseData.paint?.commits) {
+      try {
+        const intents = inputs.map(at => ({ at, target: fixture.targetEnd, instId: fixture.instId, timeframe }))
+        phaseData.finalIntentAccounting = accountChartIntents(intents, phaseData.paint.commits).map(intent => ({
+          index: intent.index, inputAt: inputs[intent.index], target: intent.target, status: intent.status,
+          supersededBy: intent.supersededBy, commitAt: intent.commit?.at ?? null, rafSampledAt: intent.commit?.rafSampledAt ?? null,
+          committedTarget: intent.commit?.end ?? null, latencyMS: intent.latencyMS }))
+      } catch (evidenceError) { evidenceErrors.push(`Final intent evidence: ${evidenceError?.message ?? String(evidenceError)}`) }
+    }
+    if (evidenceErrors.length) phaseData.evidenceErrors = evidenceErrors
+    failure = new Error(`${error?.message ?? String(error)}\nCold-boundary phase data: ${JSON.stringify(phaseData)}`, { cause: error })
+    throw failure
   } finally {
-    await cdp?.detach()
-    if (paintStarted) await finishPaintProbe(page)
-    await probe({ action: 'coldBoundaryRemove' })
+    const cleanupErrors = []
+    try { await cdp?.detach() } catch (error) { cleanupErrors.push(error) }
+    if (paintStarted) try { await finishPaintProbe(page) } catch (error) { cleanupErrors.push(error) }
+    try { await probe({ action: 'coldBoundaryRemove' }) } catch (error) { cleanupErrors.push(error) }
+    if (cleanupErrors.length) {
+      const message = cleanupErrors.map(error => error?.message ?? String(error)).join('\n')
+      if (failure) failure.message += `\nCold-boundary cleanup failures: ${message}`
+      else throw new AggregateError(cleanupErrors, `Cold-boundary cleanup failures: ${message}\nCold-boundary phase data: ${JSON.stringify(phaseData)}`)
+    }
   }
 }

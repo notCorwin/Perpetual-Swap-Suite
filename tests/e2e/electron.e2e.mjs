@@ -468,7 +468,7 @@ test('the paint probe selects the first ready target RAF and retains its mutable
       }
     }, fixture.instId)
     report = await finishPaintProbe(page, { readyTarget: { instId: fixture.instId, timeframe: fixture.timeframe,
-      endHour: fixture.end, intervalMS: fixture.intervalMS, afterAt: sample.afterAt } })
+      endHour: fixture.end, intervalMS: fixture.intervalMS, afterAt: sample.afterAt }, includeRequestCommits: true, includeTimingEvidence: true })
     assert.equal(sample.observationsHaveEntryAndFrame, true)
     assert.ok(Number.isFinite(sample.incompleteAt) && sample.readyAt > sample.incompleteAt)
     assert.ok(Number.isFinite(sample.incompletePriceAt) && sample.readyAt > sample.incompletePriceAt)
@@ -478,6 +478,10 @@ test('the paint probe selects the first ready target RAF and retains its mutable
     assert.equal(report.readyFrame.bars[0].ema, sample.expectedEMA)
     assert.equal(report.readyFrame.snapshot.indicatorState, 'loading', 'Complete observed values determine readiness even before aggregate status catches up.')
     assert.equal(report.readyFrame.snapshot.priceStatus.state, sample.expectedStatus, 'Later mutation must not alter the selected snapshot.')
+    assert.ok(report.requestCommits.some(commit => commit.instId === fixture.instId && commit.timeframe === fixture.timeframe
+      && commit.end === fixture.end && Number.isFinite(commit.rafSampledAt)))
+    assert.equal(report.captureTimings.length, report.probeCaptureSamples)
+    assert.ok(report.captureTimings.every(sample => Number.isFinite(sample.at) && Number.isFinite(sample.durationMS)))
   } finally { if (!report) await finishPaintProbe(page) }
 })
 
