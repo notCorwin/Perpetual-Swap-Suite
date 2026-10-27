@@ -193,6 +193,73 @@ test('sub-candle wheel frames move continuously while axes stay fixed and native
     const probe = await readRequestProbe(electron)
     assert.equal(probe.focusCalls.length, 1, '32 events in one animation frame must produce one backend navigation intent.')
     assert.equal(probe.traffic.fullHistoryPushes, 0)
+
+    await wheelBurst(page, { deltaY: 3 })
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    const fractionalStart = await read()
+    assert.ok(fractionalStart.offset > 0, 'The resident window must have a visible fractional offset before the burst.')
+    await waitForRequestQuiescence()
+    await resetRequestProbe(electron)
+    const leading = await page.evaluate(async instId => {
+      const plot = document.querySelector('[data-chart-plot]')
+      let framePassed = false
+      const frame = requestAnimationFrame(() => { framePassed = true })
+      try {
+        for (let event = 0; event < 32; event += 1) {
+          plot.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: 3 }))
+        }
+        await Promise.resolve()
+        const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+        const svg = chart.querySelector('svg[data-rendered-inst]')
+        return {
+          framePassed,
+          requestedEnd: Number(chart.dataset.chartRequestedEnd),
+          completedEnd: Number(chart.dataset.chartCompletedEnd),
+          renderedEnd: Number(svg.dataset.renderedEnd),
+          bars: chart.__chartRenderedBars.length,
+          lastBar: chart.__chartRenderedBars.at(-1)?.hour,
+          loading: chart.dataset.chartLoading,
+          offsets: [...svg.querySelectorAll('[data-chart-wheel-content]')].map(element => Number(element.dataset.chartWheelOffset)),
+        }
+      } finally { cancelAnimationFrame(frame) }
+    }, fixture.instId)
+    const expectedEnd = startEnd - 17 * interval
+    assert.equal(leading.framePassed, false, 'The leading update must be observed before the next animation frame.')
+    assert.equal(leading.requestedEnd, expectedEnd)
+    assert.equal(leading.completedEnd, expectedEnd)
+    assert.equal(leading.renderedEnd, expectedEnd, 'The cached target must already be presented at the microtask boundary.')
+    assert.equal(leading.lastBar, expectedEnd)
+    assert.equal(leading.bars, 96)
+    assert.equal(leading.loading, 'false')
+    assert.ok(leading.offsets.length > 0 && leading.offsets.every(offset => Math.abs(offset - fractionalStart.offset) < 1e-9),
+      `The new window must retain the existing fractional displacement: ${JSON.stringify({ leading, fractionalStart })}`)
+    await waitForRendered(page, fixture, timeframe, expectedEnd)
+    await waitForRequestQuiescence()
+    const leadingProbe = await readRequestProbe(electron)
+    assert.equal(leadingProbe.focusCalls.length, 1, 'The leading 32-event burst must produce one backend navigation intent.')
+    assert.equal(leadingProbe.focusCalls[0].target.endHour, expectedEnd)
+    assert.equal(leadingProbe.traffic.fullHistoryPushes, 0)
+
+    await resetRequestProbe(electron)
+    await page.evaluate(async () => {
+      const plot = document.querySelector('[data-chart-plot]')
+      const wheel = deltaY => plot.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY }))
+      wheel(3)
+      await Promise.resolve()
+      wheel(120)
+      const button = [...document.querySelectorAll('[aria-label="Chart timeframe"] button')]
+        .find(element => element.textContent.trim() === '5m')
+      button.click()
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+    })
+    await waitForRendered(page, fixture, '5m')
+    await waitForRequestQuiescence()
+    const switchedProbe = await readRequestProbe(electron)
+    assert.ok(switchedProbe.focusCalls.some(call => call.target?.timeframe === '5m'), 'The new timeframe must declare its selection.')
+    assert.equal(switchedProbe.focusCalls.some(call => call.target?.timeframe === timeframe), false,
+      'A trailing wheel batch from the previous timeframe must be cancelled before it can declare demand.')
+    assert.equal(switchedProbe.focusCalls.findLast(call => call.target?.timeframe === '5m')?.target.endHour, undefined,
+      'The cancelled batch must not move the new timeframe away from its latest window.')
   } finally {
     await removeRequestProbe(electron)
   }
