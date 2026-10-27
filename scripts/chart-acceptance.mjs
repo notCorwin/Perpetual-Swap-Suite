@@ -956,7 +956,9 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
     }
     const clip = response => {
       const first = floor(response)
-      return first === null ? response : { ...response, bars: response.bars.filter(bar => bar.hour >= first) }
+      if (first === null) return response
+      const bars = response.bars.filter(bar => bar.hour >= first)
+      return bars.length === response.bars.length ? response : { ...response, bars }
     }
     const extension = (response, kind, startedAt, readCompletedAt = Date.now()) => {
       const previousFloor = floor(response)

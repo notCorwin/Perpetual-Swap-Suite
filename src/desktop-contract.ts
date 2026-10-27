@@ -10,7 +10,7 @@ export type OperationAcknowledgment = { batchId: string; lastSequence: number }
 export type OperationBridgeHooks = {
   beginRequest(command: string): { id: string; context: OperationContext }
   endRequest(id: string, status: 'ok' | 'error'): void
-  receive(channel: string, detail: unknown, context?: OperationContext): void
+  receive(channel: string, detail: unknown, context?: OperationContext, decode?: (detail: unknown) => unknown): void
   flush(): Promise<void>
 }
 

@@ -13,6 +13,7 @@ test('chart requests and publications cross Electron as wire strings and retain 
   const page = await electron.firstWindow()
   await page.waitForLoadState('domcontentloaded')
   await page.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).waitFor()
+  await assert.rejects(() => page.evaluate(() => window.radarDesktopBootstrap.connect(() => {})), /already connected/)
   const request = value => page.evaluate(value => window.radarDesktop.request(value), value)
   await electron.evaluate(({ ipcMain, BrowserWindow }) => {
     const original = ipcMain._invokeHandlers.get('radar:request'), contents = BrowserWindow.getAllWindows()[0].webContents
@@ -102,7 +103,7 @@ test('chart requests and publications cross Electron as wire strings and retain 
         await attacker.loadURL(url)
         results.push(await attacker.webContents.executeJavaScript(`(async () => {
           let transport
-          window.dispatchEvent(new CustomEvent('radar-desktop-connect', { detail: value => { transport = value } }))
+          if (!window.radarDesktop) window.radarDesktopBootstrap.connect(value => { transport = value })
           const desktop = window.radarDesktop ?? transport
           try { await desktop.request({ preferences: { action: 'read' } }); return 'accepted' }
           catch (error) { return error.message }

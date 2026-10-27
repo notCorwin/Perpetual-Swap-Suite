@@ -102,7 +102,7 @@ test('an untrusted renderer cannot use the real IPC channel even when supplied w
         await attacker.loadURL(url)
         results.push(await attacker.webContents.executeJavaScript(`(async () => {
           let transport
-          window.dispatchEvent(new CustomEvent('radar-desktop-connect', { detail: value => { transport = value } }))
+          if (!window.radarDesktop) window.radarDesktopBootstrap.connect(value => { transport = value })
           const desktop = window.radarDesktop ?? transport
           const exposed = typeof desktop?.request === 'function'
           if (!exposed) return { exposed }

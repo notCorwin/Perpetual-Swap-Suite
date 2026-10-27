@@ -106,6 +106,33 @@ function telemetryHost() {
 
 const ended = (batches: OperationBatch[]): OperationJournalEvent[] => batches.flatMap(batch => batch.events).filter(event => event.phase === 'end')
 
+test('notification decoding belongs to receive lineage and failed decoding remains an error record', async () => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'window')
+  const delivered: CustomEvent[] = [], events: OperationEvent[] = []
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: { dispatchEvent: (event: CustomEvent) => { delivered.push(event); return true } } })
+  const harness = telemetryHost(), stop = await initializeOperationTelemetry(harness.host)
+  const detach = attachOperationSink(event => events.push(event))
+  try {
+    const context = { traceId: 'wire:trace', parentId: 'wire:send' }
+    harness.hooks().receive('radar:chart-prepared', 'encoded', context, () => measureOperation({ category: 'cpu', name: 'fixture.decode' }, () => ({ revision: 7 })))
+    assert.deepEqual(delivered.map(event => event.detail), [{ revision: 7 }])
+    const received = events.find(event => event.name === 'desktop.notification.receive')!
+    const decoded = events.find(event => event.name === 'fixture.decode')!
+    assert.equal(received.parentId, context.parentId)
+    assert.equal(received.traceId, context.traceId)
+    assert.equal(decoded.parentId, received.id)
+    assert.equal(decoded.traceId, received.traceId)
+    assert.throws(() => harness.hooks().receive('radar:chart-prepared', 'malformed', context, () => { throw new SyntaxError('Invalid wire') }), SyntaxError)
+    assert.equal(delivered.length, 1, 'Malformed data cannot dispatch a business notification.')
+    assert.deepEqual(events.filter(event => event.name === 'desktop.notification.receive').map(event => event.status), ['ok', 'error'])
+    assert.equal(events.at(-1)!.attributes!.errorName, 'SyntaxError')
+  } finally {
+    await stop(); detach()
+    if (previous) Object.defineProperty(globalThis, 'window', previous)
+    else Reflect.deleteProperty(globalThis, 'window')
+  }
+})
+
 test('renderer retains lifecycle records until acknowledgment and retries the same immutable batch', async () => {
   const harness = telemetryHost(), stop = await initializeOperationTelemetry(harness.host)
   try {

@@ -10,8 +10,10 @@ type DesktopTransport = {
   operationSourceFailure(value: { executionId: string; reason: string; omitted: number }): Promise<void>
 }
 
+declare global { interface Window { radarDesktopBootstrap: { connect(accept: (bridge: DesktopTransport) => void): void } } }
+
 let transport: DesktopTransport | undefined
-window.dispatchEvent(new CustomEvent('radar-desktop-connect', { detail: (bridge: DesktopTransport) => { transport = bridge } }))
+window.radarDesktopBootstrap.connect(bridge => { transport = bridge })
 if (!transport) throw new Error('The desktop transport is unavailable.')
 const bridge = transport
 let operations: OperationBridgeHooks | undefined
@@ -37,7 +39,7 @@ const desktop: RadarDesktop = {
   initializeOperations(hooks) {
     operations = hooks
     return bridge.initializeOperations({ ...hooks, receive: (channel, detail, context) => {
-      hooks.receive(channel, channel === 'radar:chart-prepared' ? decodeChartWire(detail) : detail, context)
+      hooks.receive(channel, detail, context, channel === 'radar:chart-prepared' ? decodeChartWire : undefined)
     } })
   },
   recordOperations: batch => bridge.recordOperations(batch),

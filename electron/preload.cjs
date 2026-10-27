@@ -28,16 +28,13 @@ const transport = {
   recordOperations: batch => ipcRenderer.invoke('radar:operations', batch),
   operationSourceFailure: value => ipcRenderer.invoke('radar:operations-failure', value),
 }
-// Hand the private transport to the application world once. The application
-// installs the sole public desktop API there, so bulk strings are parsed there.
-contextBridge.executeInMainWorld({
-  func: bridge => {
-    const connect = event => {
-      if (typeof event.detail !== 'function') return
-      window.removeEventListener('radar-desktop-connect', connect)
-      event.detail(bridge)
-    }
-    window.addEventListener('radar-desktop-connect', connect)
+// Hand the transport to the application once through the stable bridge API.
+// Bulk values remain strings when the resulting function proxies are called.
+let connected = false
+contextBridge.exposeInMainWorld('radarDesktopBootstrap', {
+  connect: accept => {
+    if (connected || typeof accept !== 'function') throw new Error('The desktop transport is already connected or the receiver is invalid.')
+    connected = true
+    accept(transport)
   },
-  args: [transport],
 })
