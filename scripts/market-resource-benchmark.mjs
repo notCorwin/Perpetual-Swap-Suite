@@ -8,7 +8,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { _electron } from 'playwright'
 import { offscreenChartWindow, selectTimeframe } from './chart-acceptance.mjs'
 import { requireForegroundTests } from '../electron/test-presentation.js'
-import { assessResourceBudgets, summarizeResourceDelivery } from './resource-acceptance.mjs'
+import { assessResourceBudgets, installResourcePaintProbe, summarizeResourceDelivery } from './resource-acceptance.mjs'
 import { waitForAsyncCondition } from './async-readiness.mjs'
 import { startRendererDiagnostics } from './renderer-diagnostics.mjs'
 
@@ -26,7 +26,7 @@ const reportPath = resolve(root, process.env.PERPETUAL_SWAP_RESOURCE_REPORT ?? '
 const userData = await mkdtemp(join(tmpdir(), 'perp-market-resources-'))
 const report = { generatedAt: new Date().toISOString(), mode: 'real Electron renderer, worker backend and SQLite; synthetic native intake',
   diagnosticOnly: values.diagnostic === true,
-  nativePresentationMeasured: false, timing: 'Scheduled synthetic input to SVG commit and next RAF opportunity; no native compositor presentation.',
+  nativePresentationMeasured: false, timing: 'Scheduled synthetic input to SVG commit and a RAF opportunity that rechecks the displayed chart; no native compositor presentation.',
   clock: 'Epoch-origin monotonic performance clocks for source schedule/receipt and renderer input/commit/RAF; 2 ms origin precision tolerance with raw clock deltas retained.',
   externalWebSocketTransportMeasured: false, externalNetworkMeasured: false, receiveToFrameBudgetMS: offscreen ? null : 100,
   samples: [], switches: [], history: [], memorySamples: [], viewIntents: [], outcome: 'running' }
@@ -108,54 +108,7 @@ try {
   report.fixture = fixture
   report.appMetricsAfterSeed = await electron.evaluate(({ app }) => app.getAppMetrics())
   assert.equal(fixture.rowsSeeded, 287 * 3 * 320)
-  await page.evaluate(fixture => {
-    const state = window.__resourcePaint = { records: [], violations: [], indicatorValuesChecked: 0, previous: null, frameGaps: [], previousFrame: null }
-    const near = (actual, expected, description) => {
-      if (expected === null ? actual !== null : typeof actual !== 'number' || Math.abs(actual - expected) > Math.max(1, Math.abs(expected)) * 1e-10) {
-        if (state.violations.length < 40) state.violations.push(`${description}: ${actual} != ${expected}`)
-      }
-    }
-    const sample = () => {
-      const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot, svg = chart?.querySelector('svg[data-rendered-inst]')
-      if (!snapshot?.instId?.startsWith('SCALE') || !svg || snapshot === state.previous) return
-      state.previous = snapshot
-      if (svg.dataset.renderedInst !== snapshot.instId || svg.dataset.renderedTimeframe !== snapshot.timeframe) state.violations.push('SVG mixed native series identities.')
-      const instrument = Number(snapshot.instId.slice(5, 8)), step = fixture.intervals[snapshot.timeframe]
-      const first = Math.floor(fixture.asOf / step) * step - fixture.periods * step
-      const baseline = 100 + instrument * 3 + ({ '5m': 0, '15m': 10, '1H': 20 })[snapshot.timeframe]
-      for (const value of snapshot.bars) {
-        const index = (value.hour - first) / step, close = baseline + index * .01
-        if (!Number.isInteger(index) || index < 0 || index >= fixture.periods) { state.violations.push('A persisted candle fell outside its seeded native range.'); continue }
-        for (const [field, expected] of Object.entries({ open: close - .02, high: close + .06, low: close - .05, close })) near(value[field], expected, `${snapshot.instId}/${snapshot.timeframe}/${index}/${field}`)
-        if (value.indicatorsObserved) {
-          const middle = close - .095, deviation = .01 * Math.sqrt(399 / 12)
-          const roc = i => (baseline + i * .01 - (baseline + (i - 9) * .01)) / Math.abs(baseline + (i - 9) * .01) * 100
-          let numerator = 0, denominator = 0
-          for (let i = Math.max(0, index - 13); i <= index; i += 1) { const volume = 100 + i % 7; numerator += (baseline + i * .01 + .01 / 3) * volume; denominator += volume }
-          const expected = { ema: index >= 199 ? close - .995 : null,
-            bollMiddle: index >= 19 ? middle : null, bollUpper: index >= 19 ? middle + 2 * deviation : null, bollLower: index >= 19 ? middle - 2 * deviation : null,
-            vwap: index >= 13 ? numerator / denominator : null, roc: index >= 9 ? roc(index) : null,
-            maroc: index >= 17 ? Array.from({ length: 9 }, (_, offset) => roc(index - offset)).reduce((a, b) => a + b, 0) / 9 : null,
-            rsi6: index >= 6 ? 100 : null, rsi12: index >= 12 ? 100 : null, rsi24: index >= 24 ? 100 : null,
-            atrPercent: index >= 13 ? .11 / close * 100 : null, bbw: index >= 19 ? 4 * deviation / middle * 100 : null }
-          for (const [field, expectedValue] of Object.entries(expected)) { near(value[field], expectedValue, `${snapshot.instId}/${snapshot.timeframe}/${index}/${field}`); state.indicatorValuesChecked += 1 }
-        }
-      }
-      const label = chart.querySelector('[data-chart-price-label-value]')?.textContent ?? ''
-      const liveVisible = snapshot.liveBar && Number(svg.dataset.renderedEnd) === snapshot.liveBar.hour
-      if (liveVisible) near(Number(label.split(/\s/)[0].replaceAll(',', '')), snapshot.liveBar.close, 'Visible SVG live-price label')
-      const record = { instId: snapshot.instId, timeframe: snapshot.timeframe, endHour: snapshot.endHour,
-        livePrice: snapshot.liveBar?.close ?? null, priceObservedAt: snapshot.priceObservedAt,
-        sequence: liveVisible ? Math.round((snapshot.liveBar.close - baseline - fixture.periods * .01) * 1000) : 0,
-        committedAt: performance.timeOrigin + performance.now(), nextFrameAt: null, label, bars: snapshot.bars.length,
-        indicatorState: snapshot.indicatorState, oiState: snapshot.oiState, takerState: snapshot.takerState }
-      state.records.push(record)
-      requestAnimationFrame(() => { record.nextFrameAt = performance.timeOrigin + performance.now() })
-    }
-    new MutationObserver(sample).observe(document, { subtree: true, attributes: true, childList: true })
-    const frame = timestamp => { if (state.previousFrame !== null) state.frameGaps.push(timestamp - state.previousFrame); state.previousFrame = timestamp; sample(); requestAnimationFrame(frame) }
-    requestAnimationFrame(frame)
-  }, fixture)
+  await page.evaluate(installResourcePaintProbe, fixture)
   await page.waitForFunction(() => Number(document.querySelector('[data-total-market-count]')?.getAttribute('data-total-market-count')) === 287, null, { timeout: 60_000 })
   const rendererFramesStartedAt = Date.now()
   const readiness = await waitForAsyncCondition(() => page.evaluate(async ({ instIds, timeframes }) => {
@@ -183,6 +136,7 @@ try {
   // Start prepared-selection timing only after that visible baseline exists;
   // retain its preparation wait separately from subsequent input latency.
   const focus = fixture.instIds[0], timeframe = '15m'
+  const currentEnd = Math.floor(fixture.asOf / fixture.intervals[timeframe]) * fixture.intervals[timeframe] - fixture.intervals[timeframe]
   const selectedFrameWaitStartedAt = performance.now()
   const selectedRaf = await page.waitForFunction(({ focus, timeframe }) => {
     const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
@@ -193,7 +147,7 @@ try {
       || Number(svg.dataset.renderedEnd) !== snapshot.endHour
       || snapshot !== window.__resourcePaint.previous || record.instId !== snapshot.instId
       || record.timeframe !== snapshot.timeframe || record.bars !== 96 || record.indicatorState !== 'ready'
-      || !Number.isFinite(record.nextFrameAt) || record.nextFrameAt < record.committedAt) return false
+      || !window.__resourcePaint.isFrame(record)) return false
     const { instId, committedAt, nextFrameAt } = record
     return { instId, timeframe, committedAt, nextFrameAt }
   }, { focus, timeframe }, { timeout: 20_000 })
@@ -216,9 +170,9 @@ try {
       return at
     })
     report.pendingSelection.inputAt = inputAt
-    report.viewIntents.push({ at: inputAt, instId, timeframe: '15m' })
-    await page.waitForFunction(({ instId, inputAt, expected }) => window.__resourcePaint.records.some(record => record.instId === instId && record.nextFrameAt >= inputAt && record.bars === 96 && record.indicatorState === 'ready' && (expected === null || record.livePrice >= expected)), { instId, inputAt, expected }, { timeout: 20_000 })
-    const value = await page.evaluate(({ instId, inputAt, expected }) => window.__resourcePaint.records.find(record => record.instId === instId && record.nextFrameAt >= inputAt && record.bars === 96 && record.indicatorState === 'ready' && (expected === null || record.livePrice >= expected)), { instId, inputAt, expected })
+    report.viewIntents.push({ at: inputAt, instId, timeframe: '15m', liveEndHour: currentEnd })
+    await page.waitForFunction(({ instId, inputAt, expected }) => window.__resourcePaint.records.some(record => window.__resourcePaint.isFrame(record) && record.instId === instId && record.timeframe === '15m' && record.nextFrameAt >= inputAt && record.bars === 96 && record.indicatorState === 'ready' && (expected === null || record.frame.livePrice >= expected)), { instId, inputAt, expected }, { timeout: 20_000 })
+    const value = await page.evaluate(({ instId, inputAt, expected }) => window.__resourcePaint.records.find(record => window.__resourcePaint.isFrame(record) && record.instId === instId && record.timeframe === '15m' && record.nextFrameAt >= inputAt && record.bars === 96 && record.indicatorState === 'ready' && (expected === null || record.frame.livePrice >= expected)), { instId, inputAt, expected })
     report.switches.push({ phase, instId, inputMode: 'row click after search filtering', selectedBeforeClick, rowClickToFrameMS: value.nextFrameAt - inputAt, bars: value.bars, indicatorState: value.indicatorState, expected, actualPrice: value.livePrice })
     delete report.pendingSelection
   }
@@ -233,7 +187,7 @@ try {
     window.__armResourceScheduler()
     return performance.timeOrigin + performance.now()
   })
-  report.viewIntents.push({ at: loadInputAt, instId: focus, timeframe })
+  report.viewIntents.push({ at: loadInputAt, instId: focus, timeframe, liveEndHour: currentEnd })
   report.loadStart = await probe({ action: 'scaleLoadStart', ticks, cadenceMS, focusInstId: focus, timeframe })
   const loadDeadline = performance.now() + ticks * cadenceMS + 20_000
   let load, nextMemorySample = 0
@@ -253,22 +207,26 @@ try {
   const interact = async () => {
     await sleep(Math.min(500, cadenceMS * 5))
     for (const index of [286, 175, 96, 14]) { await choose(fixture.instIds[index], 'selection during fixed-rate intake'); await choose(focus, 'warm revisit during fixed-rate intake') }
-    const currentEnd = Math.floor(fixture.asOf / fixture.intervals[timeframe]) * fixture.intervals[timeframe] - fixture.intervals[timeframe]
     for (const distance of [64, -64]) {
       const expectedEnd = distance > 0 ? currentEnd - 64 * fixture.intervals[timeframe] : currentEnd
       const inputAt = await page.evaluate(distance => {
         const inputAt = performance.timeOrigin + performance.now()
         document.querySelector('[data-chart-plot]').dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: distance * 12 }))
+        window.__resourcePaint.recheck()
         return inputAt
       }, distance)
-      report.viewIntents.push({ at: inputAt, instId: focus, timeframe, historical: distance > 0 })
-      await page.waitForFunction(({ focus, expectedEnd, inputAt }) => window.__resourcePaint.records.some(record => record.instId === focus && record.endHour === expectedEnd && record.bars === 96 && record.nextFrameAt >= inputAt), { focus, expectedEnd, inputAt }, { timeout: 20_000 })
-      const frame = await page.evaluate(({ focus, expectedEnd, inputAt }) => window.__resourcePaint.records.find(record => record.instId === focus && record.endHour === expectedEnd && record.bars === 96 && record.nextFrameAt >= inputAt), { focus, expectedEnd, inputAt })
+      report.viewIntents.push({ at: inputAt, instId: focus, timeframe, endHour: expectedEnd, liveEndHour: currentEnd, historical: distance > 0 })
+      await page.waitForFunction(({ focus, timeframe, expectedEnd, inputAt }) => window.__resourcePaint.records.some(record => window.__resourcePaint.isFrame(record) && record.instId === focus && record.timeframe === timeframe && record.frame.endHour === expectedEnd && record.bars === 96 && record.nextFrameAt >= inputAt), { focus, timeframe, expectedEnd, inputAt }, { timeout: 20_000 })
+      const frame = await page.evaluate(({ focus, timeframe, expectedEnd, inputAt }) => window.__resourcePaint.records.find(record => window.__resourcePaint.isFrame(record) && record.instId === focus && record.timeframe === timeframe && record.frame.endHour === expectedEnd && record.bars === 96 && record.nextFrameAt >= inputAt), { focus, timeframe, expectedEnd, inputAt })
       report.history.push({ distance, expectedEnd, inputToFrameMS: frame.nextFrameAt - inputAt, bars: frame.bars, oiState: frame.oiState, takerState: frame.takerState })
     }
   }
   await Promise.all([monitor(), interact()])
-  await page.waitForFunction(({ focus, sequence }) => window.__resourcePaint.records.some(record => record.instId === focus && record.sequence === sequence && record.nextFrameAt !== null), { focus, sequence }, { timeout: 10_000 })
+  const finalIntent = report.viewIntents.at(-1)
+  assert.ok(finalIntent && !finalIntent.historical && finalIntent.instId === focus && finalIntent.timeframe === timeframe,
+    'The fixed-rate workload must finish on the selected live viewport.')
+  await page.waitForFunction(input => window.__resourcePaint.readyForLatest(input),
+    { instId: focus, timeframe, sequence, afterAt: finalIntent.at }, { timeout: 10_000 })
   const commits = await page.evaluate(() => window.__resourcePaint.records)
   report.rendererCommits = commits
   report.load = load

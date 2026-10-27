@@ -308,10 +308,10 @@ test('real resident reserve covers delayed history delivery before continuous in
   await writeFile(join(root, '.build/chart-prefetch-latency.json'), `${JSON.stringify(report, null, 2)}\n`)
 })
 
-test('a prefetch validation failure retains complete timing and delivery evidence', { timeout: 90_000 }, async () => {
+test('a prefetch validation failure retains complete timing and delivery evidence', { timeout: 90_000 }, async context => {
   const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark', instId: 'PREFETCH-EVIDENCE-USDT-SWAP' }))
-  // Inject a validation failure only after the real 768-input phase and
-  // deferred probe have completed; the measured workload is unchanged.
+  // Inject paint and delivery-report failures only after the real 768-input
+  // phase and deferred probe have completed; the workload is unchanged.
   const failingPage = new Proxy(page, { get(target, key) {
     const value = target[key]
     if (key === 'evaluate') return async (...args) => {
@@ -321,7 +321,17 @@ test('a prefetch validation failure retains complete timing and delivery evidenc
     }
     return typeof value === 'function' ? value.bind(target) : value
   } })
-  await assert.rejects(measureLatencyCoveredPrefetch(electron, failingPage, fixture, { offscreen: true }), error => {
+  const failingElectron = new Proxy(electron, { get(target, key) {
+    const value = target[key]
+    if (key === 'evaluate') return async (...args) => {
+      const result = await value.apply(target, args)
+      const completed = result?.extensions?.find(record => Number.isFinite(record.completedAt))
+      if (completed) completed.completedAt += 60_000
+      return result
+    }
+    return typeof value === 'function' ? value.bind(target) : value
+  } })
+  await assert.rejects(measureLatencyCoveredPrefetch(failingElectron, failingPage, fixture, { offscreen: true }), error => {
     const marker = '\nPrefetch phase data: '
     const position = error.message.lastIndexOf(marker)
     assert.ok(position >= 0, 'The failure must include the phase evidence.')
@@ -339,8 +349,11 @@ test('a prefetch validation failure retains complete timing and delivery evidenc
     assert.ok(Number.isFinite(evidence.runway.runwayAtRequest))
     assert.deepEqual(evidence.sources.historical, [])
     assert.equal(evidence.checks.find(check => check.name === 'complete paints').passed, false)
-    assert.equal(evidence.checks.find(check => check.name === 'delivery before crossing').passed, true)
+    const delivery = evidence.checks.find(check => check.name === 'delivery before crossing')
+    assert.equal(delivery?.passed, false, 'An independent delivery failure must survive the injected paint failure.')
+    assert.match(delivery.message, /reach the renderer before the first viewport crosses/)
     assert.equal(evidence.checks.find(check => check.name === 'persisted sources').passed, true)
+    context.diagnostic(`Injected prefetch failure checks: ${JSON.stringify(evidence.checks)}`)
     return true
   })
 })
