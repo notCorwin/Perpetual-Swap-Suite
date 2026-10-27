@@ -85,6 +85,7 @@ export class PreparedChartPipeline {
     this.realtimeKeys = new Set(); this.listeners = new Set(); this.tasks = new Map(); this.localTasks = new Map()
     this.liveSeeds = new Map(); this.maxSeries = 12; this.maxBytes = 32 * 1024 * 1024
     this.maxProjectionBytes = 64 * 1024 * 1024; this.objectSizes = new WeakMap()
+    this.resolvedIndicatorStatuses = new WeakMap()
     this.nextGeneration = 0; this.nextRevision = 0; this.nextCalculation = 0
     this.nextProjection = 0
     this.workers = []; this.calculations = new Map(); this.calculationQueue = []
@@ -416,7 +417,7 @@ export class PreparedChartPipeline {
     state.projectedBars ??= new Map()
     const cached = state.projectedBars.get(row.timestamp)
     if (cached?.row === row && cached.indicator === indicator && cached.oiFresh === oiFresh && cached.takerFresh === takerFresh) return cached
-    const entry = { row, indicator, oiFresh, takerFresh, token: ++this.nextProjection, bar: bar(row, indicator) }
+    const entry = { row, indicator, oiFresh, takerFresh, token: ++this.nextProjection, bar: Object.freeze(bar(row, indicator)) }
     state.projectedBars.set(row.timestamp, entry)
     return entry
   }
@@ -434,7 +435,10 @@ export class PreparedChartPipeline {
     const key = values.map(value => value.token).join(',')
     const previous = projection === 'history' ? state.historyBarsCache : state.barCaches.get(end)
     if (previous?.key === key) return previous.bars
-    const bars = values.map(value => value.bar)
+    const bars = Object.freeze(values.map(value => value.bar))
+    // Only arrays created here are eligible for reuse; callers may also pass
+    // arbitrary arrays to indicatorStatus, even if those arrays are frozen.
+    this.resolvedIndicatorStatuses.set(bars, null)
     if (projection === 'history') state.historyBarsCache = { key, bars }
     else {
       state.barCaches.set(end, { key, bars })
@@ -489,7 +493,7 @@ export class PreparedChartPipeline {
     state.statusCache ??= new Map()
     const { through } = status
     const key = `${source}:${through}`, previous = state.statusCache.get(key)
-    if (previous && JSON.stringify(previous) === JSON.stringify(status)) status = previous
+    if (previous && (previous === status || JSON.stringify(previous) === JSON.stringify(status))) status = previous
     state.statusCache.delete(key); state.statusCache.set(key, status)
     while (state.statusCache.size > 12) state.statusCache.delete(state.statusCache.keys().next().value)
     return status
@@ -501,6 +505,10 @@ export class PreparedChartPipeline {
 
   indicatorStatus(state, bars, from, through) {
     const inputVersion = this.indicatorInputVersion(state)
+    const cached = this.resolvedIndicatorStatuses.get(bars)
+    if (cached && cached.from === from && cached.through === through && cached.inputVersion === inputVersion) {
+      return this.cachedStatus(state, 'indicator', cached.status)
+    }
     let status = { state: 'loading', from, through, inputVersion }
     if (bars.length && bars.every(value => value.indicatorsObserved)) {
       status.state = bars.every(value => indicatorFields.every(field => numeric(value[field]))) ? 'ready' : 'unavailable'
@@ -510,7 +518,13 @@ export class PreparedChartPipeline {
         .find(value => value?.inputVersion === inputVersion)
       if (failure) status = { ...failure, from, through, state: 'error' }
     }
-    return this.cachedStatus(state, 'indicator', status)
+    status = this.cachedStatus(state, 'indicator', status)
+    // Loading and error states depend on mutable failure/retry lifecycles.
+    // Resolved states depend only on these immutable bars, bounds and basis.
+    if ((status.state === 'ready' || status.state === 'unavailable') && cached !== undefined) {
+      this.resolvedIndicatorStatuses.set(bars, { from, through, inputVersion, status: Object.freeze(status) })
+    }
+    return status
   }
 
   statisticsStatus(state, rows, from, through) {
