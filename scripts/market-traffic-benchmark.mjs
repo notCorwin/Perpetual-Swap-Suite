@@ -12,6 +12,8 @@ import { createMarketTrafficEvidence } from '../tests/helpers/market-traffic-evi
 import { inspectMarketTrafficReadiness } from '../tests/helpers/market-traffic-readiness.mjs'
 import { compareMarketTrafficReports, validateMarketTrafficReport } from './market-traffic-comparison.mjs'
 import { startRendererDiagnostics } from './renderer-diagnostics.mjs'
+import { installMarketTrafficMainProbe } from './market-traffic-main-probe.mjs'
+import { installMarketTrafficRendererProbe } from './market-traffic-renderer-probe.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const { values } = parseArgs({
@@ -226,7 +228,7 @@ const output = resolve(values.output ?? join(root, '.build/traffic-optimization/
 const userData = process.env.PERPETUAL_SWAP_USER_DATA
 if (!userData || (!foreground && !process.env.PERPETUAL_SWAP_TEST_GUARD)) throw new Error('Protected sandbox user data is required.')
 const fixture = await createMarketTrafficExchange({ candidateCount, passingCount, spreadFailureCount, seed: 17 })
-let electron, cadence, failureMeasurements, completedReport, runtimeEvidence, presentationEvidence, readinessFailureEvidence, stopDiagnostics
+let electron, cadence, failureMeasurements, completedReport, runtimeEvidence, presentationEvidence, readinessFailureEvidence, stopDiagnostics, mainLoopStarted = false
 try {
   electron = await _electron.launch({ args: [app.entry], cwd: app.cwd,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_E2E_LIVE_REFRESH: '1',
@@ -327,46 +329,11 @@ try {
     optimizedDemand.candle1HCount = expectedSubscriptions.candle1H.length
   }
   if (values.diagnostic) stopDiagnostics = await startRendererDiagnostics(electron, page, diagnosticDirectory)
+  await electron.evaluate(installMarketTrafficMainProbe)
+  mainLoopStarted = true
   const sampleWindow = await fixture.beginSample()
   const sampleStartedAt = sampleWindow.startedAt
-  await page.evaluate(({ requireForeground, passingIDs }) => {
-    const state = { gaps: [], interactions: [], interactionSamples: [], lastFrame: null, startedAt: performance.now(), active: true,
-      presentation: { requiredForeground: requireForeground, samples: 0, totalViolations: 0, violations: [] } }
-    const checkPresentation = () => {
-      if (!state.active) return
-      state.presentation.samples++
-      if (requireForeground && (document.visibilityState !== 'visible' || !document.hasFocus())) {
-        state.presentation.totalViolations++
-        if (state.presentation.violations.length < 10) state.presentation.violations.push({
-          at: performance.now(), visibility: document.visibilityState, focused: document.hasFocus() })
-      }
-    }
-    document.addEventListener('visibilitychange', checkPresentation)
-    window.addEventListener('blur', checkPresentation)
-    const frame = now => {
-      if (!state.active) return
-      checkPresentation()
-      if (state.lastFrame !== null) state.gaps.push(now - state.lastFrame)
-      state.lastFrame = now
-      requestAnimationFrame(frame)
-    }
-    document.addEventListener('input', event => {
-      if (event.target?.getAttribute?.('aria-label') !== 'Search contracts') return
-      checkPresentation()
-      const started = performance.now(), term = event.target.value
-      requestAnimationFrame(() => requestAnimationFrame(() => {
-        const completed = performance.now(), durationMS = completed - started
-        const expectedResultCount = passingIDs.filter(id => id.toLowerCase().includes(term.trim().toLowerCase())).length
-        const actualResultCount = Number(document.querySelector('[data-market-count]')?.getAttribute('data-market-count'))
-        state.interactions.push(durationMS)
-        state.interactionSamples.push({ term, startedMS: started - state.startedAt, completedMS: completed - state.startedAt, durationMS,
-          expectedResultCount, actualResultCount, correct: actualResultCount === expectedResultCount })
-      }))
-    }, true)
-    globalThis.__marketTrafficResponsiveness = state
-    checkPresentation()
-    requestAnimationFrame(frame)
-  }, { requireForeground: foreground, passingIDs: [...qualifyingIDs] })
+  await page.evaluate(installMarketTrafficRendererProbe, { requireForeground: foreground, passingIDs: [...qualifyingIDs] })
   const search = page.locator('input[aria-label="Search contracts"]')
   const searches = fixture.instIds.slice(0, passingCount).map(instId => instId.slice(0, 4))
   const interactionTask = (async () => {
@@ -394,22 +361,13 @@ try {
     renderer: null,
   }
   let rendererCaptureError
-  const renderer = await page.evaluate(() => {
-    const state = globalThis.__marketTrafficResponsiveness
-    state.active = false
-    const percentile = (values, fraction) => {
-      const sorted = [...values].sort((left, right) => left - right)
-      return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)] ?? 0
-    }
-    return { elapsedMS: performance.now() - state.startedAt, frameCount: state.gaps.length, presentation: state.presentation,
-      rafOpportunityGapMS: { sampleCount: state.gaps.length, p50: percentile(state.gaps, .5), p95: percentile(state.gaps, .95),
-        max: Math.max(0, ...state.gaps), samples: state.gaps },
-      searchInputToSecondRAFMS: { sampleCount: state.interactions.length, p50: percentile(state.interactions, .5),
-        p95: percentile(state.interactions, .95), p95Interpretation: 'Empirical nearest-rank summary; descriptive at this sample count, not a tail guarantee.',
-        max: Math.max(0, ...state.interactions), samples: state.interactionSamples } }
-  }).catch(error => { rendererCaptureError = error; return null })
+  const renderer = await page.evaluate(() => globalThis.__marketTrafficResponsiveness.stop())
+    .catch(error => { rendererCaptureError = error; return null })
   failureMeasurements.renderer = renderer ? { ...renderer, measurement: searchMeasurement } : null
   if (rendererCaptureError) failureMeasurements.rendererCaptureError = rendererCaptureError.message
+  const mainProcess = await electron.evaluate(() => globalThis.__marketTrafficMainLoop.stop())
+  mainLoopStarted = false
+  failureMeasurements.mainProcess = mainProcess
   const appReceipts = await electron.evaluate((_, sample) => globalThis.__marketBackend.probe({ action: 'marketTrafficEvidence', phase: 'end',
     sampleStartedAt: sample.startedAt, sampleEndedAt: sample.endedAt,
     sampleStartedMonotonicUS: sample.startedAtMonotonicUS, sampleEndedMonotonicUS: sample.endedAtMonotonicUS,
@@ -494,6 +452,7 @@ try {
       fixtureRequests: fixture.requests.length,
       fixtureRequestDetails: fixtureRequestEvidence(fixture.requests) },
     renderer: { ...renderer, measurement: searchMeasurement },
+    mainProcess,
     correctness: { finalRealtimeState: finalSnapshot.realtimeState, connectedWebSocketClients: fixture.readyState.clients,
       allCandidatesHaveContinuousTickerOpenInterestAnd5mReceipts: true,
       passingIDs: (finalSnapshot.rows ?? []).map(row => row.instId).sort(),
@@ -567,6 +526,10 @@ try {
   process.exitCode = 1
 } finally {
   cadence?.stop()
+  if (mainLoopStarted) {
+    try { await electron.evaluate(() => globalThis.__marketTrafficMainLoop?.stop()) }
+    catch (error) { console.error(error); process.exitCode = 1 }
+  }
   try { await stopDiagnostics?.() } catch (error) { console.error(error); process.exitCode = 1 }
   if (electron) await electron.close()
   if (fixture) await fixture.close()
