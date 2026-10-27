@@ -8,6 +8,7 @@ import { threadId, workerData } from 'node:worker_threads'
 import { installSandboxNetworkBoundary } from './sandbox-network.js'
 import { installOperationHooks, getOperationHookCapabilities, getInstalledOperationHooks } from './operation-hooks.js'
 import { encodeOperationJournal, operationJournalSuffix } from './operation-journal.js'
+import { createRecorderSelfTiming } from './recorder-self-timing.js'
 import { attachOperationJournalSink, configureOperationContext, configureOperationPropagation, finishActiveOperations,
   registerOperationImportSource, withOperationSuppressed } from './operations.js'
 
@@ -38,6 +39,7 @@ const jsonWrite = (path, value, encoded) => suppress(() => {
 
 function journalWriter(directory, sessionId, executionId, participant, hooks, capabilities = () => []) {
   const file = join(directory, `${executionId}${operationJournalSuffix}`), healthFile = join(directory, `${executionId}.health.json`)
+  const selfTiming = createRecorderSelfTiming()
   const descriptor = suppress(() => openSync(file, 'wx', 0o600))
   const prefix = suppress(() => encodeOperationJournal(Buffer.alloc(0)))
   suppress(() => {
@@ -54,22 +56,24 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
   const queue = new Map()
   let nextSequence = 1, bytes = 0, position = prefix.length, timer, writing, accepting = true, closed = false, closing, flushBarrier = Promise.resolve(), lastHealthState
   let serializing = 0, building = false, draining = 0, serializationBarrier, finishSerialization
-  const health = () => {
+  const health = (includeSelfTiming = true) => {
     const snapshot = capabilities()
     return { schemaVersion: 2, ...counts, pending: counts.recorded - counts.persisted,
       activeOperations: counts.startedOperations - counts.recordedOperations, executionId, sessionId, participantId: participant.id,
       role: participant.role, closed, enabledHooks: typeof hooks === 'function' ? hooks(snapshot) : hooks,
       hookCapabilities: snapshot, encoding: 'brotli-frames-q0-crc32-v1',
       durability: 'fdatasync-on-flush-and-5s-checkpoint', updatedAt: Date.now(), lastDurableAt,
-      runtime: { node: process.version, electron: process.versions.electron ?? null, v8: process.versions.v8 } }
+      runtime: { node: process.version, electron: process.versions.electron ?? null, v8: process.versions.v8 },
+      ...(includeSelfTiming ? { selfTiming: selfTiming.snapshot() } : {}) }
   }
   const failed = error => { counts.failed++; suppress(() => console.error(`Operation journal failed (${error.code ?? error.name}).`)) }
   const writeHealth = () => {
-    const value = health(), state = JSON.stringify({ ...value, updatedAt: undefined })
+    // Diagnostic progress alone must not invalidate an unchanged durable proof.
+    const value = health(false), state = JSON.stringify({ ...value, updatedAt: undefined })
     if (state === lastHealthState) return
-    // Reuse the complete state encoding; only the update timestamp is volatile.
-    const encoded = `${state.slice(0, -1)},"updatedAt":${JSON.stringify(value.updatedAt)}}`
-    try { jsonWrite(healthFile, value, encoded); lastHealthState = state }
+    // Reuse durable-state encoding; append diagnostics without making them a write trigger.
+    const encoded = `${state.slice(0, -1)},"updatedAt":${JSON.stringify(value.updatedAt)},"selfTiming":${JSON.stringify(selfTiming.snapshot())}}`
+    try { selfTiming.measure('health-publish', () => jsonWrite(healthFile, value, encoded)); lastHealthState = state }
     catch (error) { failed(error); throw error }
   }
   const serializeFlush = operation => {
@@ -90,24 +94,26 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
     if (serializing || building || queue.get(nextSequence) === undefined) return { count: 0, buffer: Buffer.alloc(0), offset: position }
     building = true
     try {
-      const lines = []
-      let through = nextSequence
-      for (;;) {
-        const line = queue.get(through)
-        if (line === undefined) break
-        through++
-        // A failed serialization owns its sequence but contributes no fake line.
-        if (line !== null) lines.push(line)
-      }
-      const raw = lines.length ? Buffer.from(`${lines.join('\n')}\n`) : Buffer.alloc(0)
-      const buffer = lines.length ? encodeOperationJournal(raw) : Buffer.alloc(0)
-      const batch = { count: lines.length, buffer, offset: position }
-      // New observations may arrive during encoding. Remove only this complete
-      // prefix; absolute sequence keys keep their later admissions independent.
-      for (let sequence = nextSequence; sequence < through; sequence++) queue.delete(sequence)
-      nextSequence = through; bytes -= raw.length
-      counts.uncompressedBytes += raw.length; counts.journalBytes += buffer.length
-      position += buffer.length; return batch
+      return selfTiming.measure('batch-build', () => {
+        const lines = []
+        let through = nextSequence
+        for (;;) {
+          const line = queue.get(through)
+          if (line === undefined) break
+          through++
+          // A failed serialization owns its sequence but contributes no fake line.
+          if (line !== null) lines.push(line)
+        }
+        const raw = lines.length ? Buffer.from(`${lines.join('\n')}\n`) : Buffer.alloc(0)
+        const buffer = lines.length ? encodeOperationJournal(raw) : Buffer.alloc(0)
+        const batch = { count: lines.length, buffer, offset: position }
+        // New observations may arrive during encoding. Remove only this complete
+        // prefix; absolute sequence keys keep their later admissions independent.
+        for (let sequence = nextSequence; sequence < through; sequence++) queue.delete(sequence)
+        nextSequence = through; bytes -= raw.length
+        counts.uncompressedBytes += raw.length; counts.journalBytes += buffer.length
+        position += buffer.length; return batch
+      })
     } finally { building = false; releaseAdmission() }
   }
   const scheduleWrite = () => {
@@ -120,13 +126,15 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
     try {
       const { count, buffer, offset } = take()
       if (!count) return
-      let written = 0
-      while (written < buffer.length) {
-        const size = writeSync(descriptor, buffer, written, buffer.length - written, offset + written)
-        if (!size) throw new Error('Operation journal write made no progress.')
-        written += size
-      }
-      counts.persisted += count
+      selfTiming.measure('pressure-write', () => {
+        let written = 0
+        while (written < buffer.length) {
+          const size = writeSync(descriptor, buffer, written, buffer.length - written, offset + written)
+          if (!size) throw new Error('Operation journal write made no progress.')
+          written += size
+        }
+        counts.persisted += count
+      })
     } catch (error) { failed(error) }
     finally { draining--; try { scheduleWrite() } finally { releaseAdmission() } }
   })

@@ -268,6 +268,53 @@ test('repeated durable flushes of unchanged journals do no additional disk synch
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
+test('recorder self-timing attributes delayed bulk stages without recursive records or redundant health writes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-operation-runtime-self-timing-'))
+  try {
+    const recordings = await execute(directory, `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import zlib from 'node:zlib';
+      import { syncBuiltinESMExports } from 'node:module';
+      const waiting = new Int32Array(new SharedArrayBuffer(4));
+      const delay = () => Atomics.wait(waiting, 0, 0, 12);
+      let encodeDelay = false, writeDelay = false, healthDelay = false, healthWrites = 0;
+      const compress = zlib.brotliCompressSync, write = fs.writeSync, sync = fs.fdatasyncSync, writeFile = fs.writeFileSync;
+      zlib.brotliCompressSync = (...args) => { if (encodeDelay) { encodeDelay = false; delay() } return compress(...args) };
+      fs.writeSync = (...args) => { if (writeDelay) { writeDelay = false; delay() } return write(...args) };
+      fs.fdatasyncSync = (...args) => { if (healthDelay) { healthDelay = false; delay() } return sync(...args) };
+      fs.writeFileSync = (path, ...args) => { if (String(path).endsWith('.health.json')) healthWrites++; return writeFile(path, ...args) };
+      syncBuiltinESMExports();
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      const { measureOperation, withOperationSuppressed } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording();
+      encodeDelay = writeDelay = healthDelay = true;
+      for (let count = 0; count < 200; count++) measureOperation({ category: 'cpu', name: 'runtime.self-timing', resource: '界'.repeat(256), attributes: { count } }, () => {});
+      await recording.flush();
+      assert.equal(encodeDelay || writeDelay || healthDelay, false, 'Every controlled bulk path must actually execute.');
+      const live = recording.health().selfTiming;
+      for (const stage of ['batch-build', 'pressure-write', 'health-publish']) {
+        assert.ok(live.slowSamples.some(sample => sample.stage === stage && sample.durationMS >= 12), stage);
+      }
+      const published = withOperationSuppressed(() => JSON.parse(fs.readFileSync(${JSON.stringify(directory)} + '/' + recording.executionId + '.health.json', 'utf8'))).selfTiming;
+      assert.equal(live.stages['health-publish'].count, published.stages['health-publish'].count + 1,
+        'A persisted publication cannot include its own unfinished measurement.');
+      const writes = healthWrites;
+      await Promise.all([recording.flush(), recording.flush(), recording.flush()]);
+      assert.equal(healthWrites, writes, 'Unpublished diagnostic progress must not invalidate the durable proof.');
+      await recording.close();
+    `)
+    const { events, health } = recordings[0]
+    assert.deepEqual(events.filter(event => event.name === 'runtime.self-timing' && event.phase === 'end').map(event => event.attributes.count), Array.from({ length: 200 }, (_, index) => index))
+    assert.equal(events.some(event => ['batch-build', 'pressure-write', 'health-publish'].includes(event.name)), false)
+    assert.equal(health.failed, 0)
+    assert.equal(health.pending, 0)
+    assert.equal(health.recorded, events.length)
+    assert.equal(health.durableRecords, events.length)
+    for (const stage of ['batch-build', 'pressure-write', 'health-publish']) assert.ok(health.selfTiming.slowSamples.some(sample => sample.stage === stage && sample.durationMS >= 12), stage)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
 test('persisted health reflects hook replacement and recovery without new records and retains complete durable state', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'perp-operation-runtime-health-readback-'))
   try {
@@ -304,8 +351,10 @@ test('persisted health reflects hook replacement and recovery without new record
       assert.ok(restored.enabledHooks.includes('filesystem'));
       await recording.close();
       const persisted = readHealth(), live = recording.health();
-      const withoutTimestamp = ({ updatedAt, ...state }) => state;
-      assert.deepEqual(withoutTimestamp(persisted), withoutTimestamp(live));
+      const durableState = ({ updatedAt, selfTiming, ...state }) => state;
+      assert.deepEqual(durableState(persisted), durableState(live));
+      assert.equal(live.selfTiming.stages['health-publish'].count, persisted.selfTiming.stages['health-publish'].count + 1,
+        'The final health publication remains observable in live timing without recursively publishing itself.');
       assert.equal(persisted.closed, true);
     `)
     assert.equal(recordings.length, 1)

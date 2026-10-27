@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { _electron } from 'playwright'
 import { summarizeLatencySamples } from '../../scripts/chart-acceptance-metrics.mjs'
 import { startRendererDiagnostics } from '../../scripts/renderer-diagnostics.mjs'
+import { startProcessWitness } from './process-witness.mjs'
 import {
   assertNavigationFrames, exerciseInstrumentNavigation, finishNavigationFrameProbe, installNavigationProbe,
   measureNavigation, persistNavigationCatalog, removeNavigationProbe, selectionRequests,
@@ -19,7 +20,7 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
 
   const root = fileURLToPath(new URL('../..', import.meta.url))
   const userData = mkdtemp(join(tmpdir(), `perp-instrument-navigation-${presentation}-`))
-  let electron, page, fixture, presentationState
+  let electron, page, fixture, presentationState, stopWitness
 
   const launch = async (restart = false) => {
     electron = await _electron.launch({
@@ -31,6 +32,7 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
     if (presentation === 'foreground') presentationState = await prepareWindow(electron, page)
     await page.waitForLoadState('domcontentloaded')
     if (presentation === 'offscreen') presentationState = await prepareWindow(electron, page)
+    stopWitness = await startProcessWitness(electron, `${presentation}-navigation-${restart ? 'restarted' : 'initial'}`)
   }
 
   before(async () => {
@@ -45,8 +47,11 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
     try {
       await presentationState?.restore?.()
       if (electron) {
-        await removeNavigationProbe(electron)
-        await electron.close()
+        try { await stopWitness?.() }
+        finally {
+          try { await removeNavigationProbe(electron) }
+          finally { await electron.close() }
+        }
       }
     } finally {
       await rm(await userData, { recursive: true, force: true })
@@ -84,6 +89,7 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
     assert.equal(await persistNavigationCatalog(electron, page), fixture.instIds.length)
     await removeNavigationProbe(electron)
     presentationState = null
+    await stopWitness?.(); stopWitness = undefined
     await electron.close()
     electron = null
     const launchedAt = Date.now()

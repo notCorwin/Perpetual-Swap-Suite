@@ -238,7 +238,7 @@ export async function runOverhead({output, repeats=5, cycles=20, contracts=130, 
   const directory=resolve(output??join(root,'.build/operation-overhead',new Date().toISOString().replaceAll(':','').replaceAll('.','')))
   await mkdir(directory,{recursive:true})
   const hostBefore={loadAverage:loadavg(),freeMemoryBytes:freemem()},runs=[],epoch=Math.floor(Date.now()/300000)*300000
-  const sourceFiles = ['electron/services/operations.js', 'electron/services/operation-runtime.js', 'electron/services/operation-journal.js', 'electron/services/renderer-operations.js', 'electron/services/market-service.js', 'electron/services/operation-hooks.js', 'electron/services/operation-network-hooks.js', 'electron/services/network-operations.js', 'electron/services/realtime-public-market.js',
+  const sourceFiles = ['electron/services/operations.js', 'electron/services/operation-runtime.js', 'electron/services/recorder-self-timing.js', 'electron/services/operation-journal.js', 'electron/services/renderer-operations.js', 'electron/services/market-service.js', 'electron/services/operation-hooks.js', 'electron/services/operation-network-hooks.js', 'electron/services/network-operations.js', 'electron/services/realtime-public-market.js',
     'electron/services/worker-operations.js', 'electron/services/operation-worker.js', 'electron/services/recorded-database.js', 'electron/services/indicators.js', 'electron/services/market-store.js', 'electron/services/market-store-worker.js',
     'electron/services/prepared-chart-service.js', 'electron/services/prepared-chart-worker.js']
   const sourceHashes = async () => {

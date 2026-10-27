@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { installMarketTrafficMainProbe } from '../../scripts/market-traffic-main-probe.mjs'
+import { installMainLoopWitness } from '../../scripts/main-loop-witness.mjs'
 
 function harness(options = {}) {
   let wall = 10, cpu = { user: 100, system: 20 }, callback, cancelled = false, reads = 0
@@ -9,8 +9,8 @@ function harness(options = {}) {
     readCPU: () => { reads++; wall += .25; return { ...cpu } },
     schedule: (handler, interval) => { callback = handler; assert.equal(interval, 20); return 42 },
     cancel: id => { assert.equal(id, 42); cancelled = true } }
-  installMarketTrafficMainProbe(null, { ...options, runtime })
-  const stop = target.__marketTrafficMainLoop.stop
+  installMainLoopWitness(null, { ...options, runtime })
+  const stop = target.__mainLoopWitness.stop
   return { target, runtime, stop, fire: () => callback(), advance: (nextWall, nextCPU = cpu) => { wall = nextWall; cpu = nextCPU },
     get cancelled() { return cancelled }, get reads() { return reads } }
 }
@@ -30,7 +30,7 @@ test('main-loop witness retains an aligned scheduling gap separately from actual
   assert.equal(report.maxCaptureCostMS, .25)
   assert.equal(report.omittedSamples, 0)
   assert.equal(host.cancelled, true)
-  assert.equal(host.target.__marketTrafficMainLoop, undefined)
+  assert.equal(host.target.__mainLoopWitness, undefined)
   const reads = host.reads
   host.fire()
   assert.equal(host.reads, reads, 'A queued callback after cleanup must not mutate the retained report.')
@@ -51,8 +51,8 @@ test('main-loop witness reports capacity loss and always retains its stop timest
 
 test('main-loop witness refuses replacement of an active sample', () => {
   const host = harness()
-  assert.throws(() => installMarketTrafficMainProbe(null, { runtime: host.runtime }), /already installed/)
+  assert.throws(() => installMainLoopWitness(null, { runtime: host.runtime }), /already installed/)
   host.stop()
-  assert.doesNotThrow(() => installMarketTrafficMainProbe(null, { runtime: host.runtime }))
-  host.target.__marketTrafficMainLoop.stop()
+  assert.doesNotThrow(() => installMainLoopWitness(null, { runtime: host.runtime }))
+  host.target.__mainLoopWitness.stop()
 })

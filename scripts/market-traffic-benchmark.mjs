@@ -12,7 +12,7 @@ import { createMarketTrafficEvidence } from '../tests/helpers/market-traffic-evi
 import { inspectMarketTrafficReadiness } from '../tests/helpers/market-traffic-readiness.mjs'
 import { compareMarketTrafficReports, validateMarketTrafficReport } from './market-traffic-comparison.mjs'
 import { startRendererDiagnostics } from './renderer-diagnostics.mjs'
-import { installMarketTrafficMainProbe } from './market-traffic-main-probe.mjs'
+import { installMainLoopWitness } from './main-loop-witness.mjs'
 import { installMarketTrafficRendererProbe } from './market-traffic-renderer-probe.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
@@ -329,7 +329,7 @@ try {
     optimizedDemand.candle1HCount = expectedSubscriptions.candle1H.length
   }
   if (values.diagnostic) stopDiagnostics = await startRendererDiagnostics(electron, page, diagnosticDirectory)
-  await electron.evaluate(installMarketTrafficMainProbe)
+  await electron.evaluate(installMainLoopWitness)
   mainLoopStarted = true
   const sampleWindow = await fixture.beginSample()
   const sampleStartedAt = sampleWindow.startedAt
@@ -365,7 +365,7 @@ try {
     .catch(error => { rendererCaptureError = error; return null })
   failureMeasurements.renderer = renderer ? { ...renderer, measurement: searchMeasurement } : null
   if (rendererCaptureError) failureMeasurements.rendererCaptureError = rendererCaptureError.message
-  const mainProcess = await electron.evaluate(() => globalThis.__marketTrafficMainLoop.stop())
+  const mainProcess = await electron.evaluate(() => globalThis.__mainLoopWitness.stop())
   mainLoopStarted = false
   failureMeasurements.mainProcess = mainProcess
   const appReceipts = await electron.evaluate((_, sample) => globalThis.__marketBackend.probe({ action: 'marketTrafficEvidence', phase: 'end',
@@ -527,7 +527,7 @@ try {
 } finally {
   cadence?.stop()
   if (mainLoopStarted) {
-    try { await electron.evaluate(() => globalThis.__marketTrafficMainLoop?.stop()) }
+    try { await electron.evaluate(() => globalThis.__mainLoopWitness?.stop()) }
     catch (error) { console.error(error); process.exitCode = 1 }
   }
   try { await stopDiagnostics?.() } catch (error) { console.error(error); process.exitCode = 1 }

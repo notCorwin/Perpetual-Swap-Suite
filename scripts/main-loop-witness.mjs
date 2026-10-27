@@ -1,10 +1,10 @@
 // Self-contained: Playwright serializes this function into Electron's main world.
-export function installMarketTrafficMainProbe(_, { intervalMS = 20, capacity = 1_024, runtime } = {}) {
+export function installMainLoopWitness(_, { intervalMS = 20, capacity = 1_024, runtime } = {}) {
   if (!Number.isSafeInteger(intervalMS) || intervalMS < 1 || !Number.isSafeInteger(capacity) || capacity < 2) {
     throw new TypeError('Main-loop witness requires a positive interval and room for its start and stop samples.')
   }
   const target = runtime?.target ?? globalThis
-  if (target.__marketTrafficMainLoop) throw new Error('A market traffic main-loop witness is already installed.')
+  if (target.__mainLoopWitness) throw new Error('A main-loop witness is already installed.')
   const now = runtime?.now ?? (() => performance.now())
   const timeOriginMS = runtime?.timeOriginMS ?? performance.timeOrigin
   const readCPU = runtime?.readCPU ?? (() => process.threadCpuUsage())
@@ -29,9 +29,9 @@ export function installMarketTrafficMainProbe(_, { intervalMS = 20, capacity = 1
     result = { timeOriginMS, intervalMS, capacity, omittedSamples, captureCostMS, maxCaptureCostMS,
       measurement: 'Main-thread timer callback timestamps and cumulative thread CPU. Timer gaps witness main-loop unavailability; they do not identify its cause or measure compositor paint.',
       samples }
-    delete target.__marketTrafficMainLoop
+    delete target.__mainLoopWitness
     return result
   }
-  target.__marketTrafficMainLoop = { stop }
+  target.__mainLoopWitness = { stop }
   return { timeOriginMS, intervalMS, capacity }
 }

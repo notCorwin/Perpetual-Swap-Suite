@@ -111,6 +111,8 @@ jobs:
         run: npm ci
       - name: Test native foreground charts and navigation
         id: native-charts
+        env:
+          PERPETUAL_SWAP_PROCESS_WITNESS_DIRECTORY: artifacts/process-witness
         run: npm run test:foreground -- --output artifacts/sandbox
       - name: Collect separate traces after native chart acceptance failure
         if: ${{ failure() && steps.native-charts.outcome == 'failure' }}

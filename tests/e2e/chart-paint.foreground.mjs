@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { _electron } from 'playwright'
 import { requireForegroundTests } from '../../electron/test-presentation.js'
 import { startRendererDiagnostics } from '../../scripts/renderer-diagnostics.mjs'
+import { startProcessWitness } from '../support/process-witness.mjs'
 import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureMissingWindow, measureNativeColdBoundary, measureChartIntentLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
 
 requireForegroundTests()
@@ -14,7 +15,7 @@ requireForegroundTests()
 // window can suspend its animation frames, so functional tests use another app.
 const root = new URL('../..', import.meta.url).pathname
 const userData = await mkdtemp(join(tmpdir(), 'perp-chart-paint-e2e-'))
-let electron, page, stopDiagnostics
+let electron, page, stopDiagnostics, stopWitness
 
 before(async () => {
   await writeFile(join(userData, 'settings.json'), JSON.stringify({
@@ -31,11 +32,13 @@ beforeEach(async context => {
   if (process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS) stopDiagnostics = await startRendererDiagnostics(electron, page,
     join(process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS, 'chart-paint', context.name.replace(/[^a-z0-9]+/gi, '-')),
     { cpuProfile: process.env.PERPETUAL_SWAP_RENDERER_TRACE_ONLY !== '1' })
+  stopWitness = await startProcessWitness(electron, `chart-${context.name}`)
 })
 afterEach(async () => {
-  const stop = stopDiagnostics
-  stopDiagnostics = undefined
-  await stop?.()
+  const stop = stopDiagnostics, witness = stopWitness
+  stopDiagnostics = undefined; stopWitness = undefined
+  try { await witness?.() }
+  finally { await stop?.() }
 })
 after(async () => {
   try { await electron?.close() }
