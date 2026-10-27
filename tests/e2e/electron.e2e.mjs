@@ -4,7 +4,8 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { assertCompletePaints, assertIndicatorLegends, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
+import { measureNativeWindowControls } from '../helpers/native-window-controls.mjs'
+import { assertCompletePaints, assertIndicatorLegends, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
 
 
 const root = new URL('../..', import.meta.url).pathname
@@ -119,7 +120,36 @@ test('desktop window loads the React workspace with a restricted renderer', asyn
   assert.equal(await page.evaluate(() => document.visibilityState), 'visible')
   assert.equal(await page.evaluate(() => typeof window.require), 'undefined')
   assert.equal(await page.evaluate(() => typeof window.radarDesktop.request), 'function')
+  assert.equal(await page.evaluate(() => window.radarDesktop.nativeWindowControls), process.platform === 'darwin')
   assert.equal(await page.evaluate(() => typeof window.webkit?.messageHandlers?.radar), 'undefined')
+})
+
+test('native traffic lights align with the renderer toolbar after window resizing', { skip: process.platform !== 'darwin' }, async () => {
+  const previous = await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].getContentSize())
+  const measurements = []
+  try {
+    for (const width of [1_000, 1_600, 2_000]) {
+      const actualWidth = await electron.evaluate(({ BrowserWindow }, width) => {
+        const target = BrowserWindow.getAllWindows()[0]
+        target.setContentSize(width, 1_000)
+        return target.getContentSize()[0]
+      }, width)
+      await page.waitForFunction(width => innerWidth === width && Number(document.querySelector('[data-layout="market-workspace"]').dataset.uiScale) === width / 1_600, actualWidth)
+      const native = await measureNativeWindowControls(electron)
+      const row = await page.locator('[data-sidebar-toolbar]').boundingBox()
+      const title = await page.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).boundingBox()
+      for (const [name, button] of Object.entries(native.buttons)) {
+        assert.ok(button && !button.hidden && !button.hiddenOrHasHiddenAncestor, `${name} must be an enabled native control.`)
+        assert.ok(Math.abs(button.y + button.height / 2 - (row.y + row.height / 2)) <= .5, `${name} must actually align with the toolbar: ${JSON.stringify({ native, row })}`)
+        assert.ok(button.x + button.width < title.x, `${name} must not cover the application title.`)
+      }
+      measurements.push({ width: actualWidth, row, title, native })
+    }
+    await writeFile(join(root, '.build', 'native-topbar-geometry.json'), `${JSON.stringify(measurements, null, 2)}\n`)
+  } finally {
+    await electron.evaluate(({ BrowserWindow }, [width, height]) => BrowserWindow.getAllWindows()[0].setContentSize(width, height), previous)
+    await page.waitForFunction(width => innerWidth === width && Number(document.querySelector('[data-layout="market-workspace"]').dataset.uiScale) === width / 1_600, previous[0])
+  }
 })
 
 test('preferences persist through the single desktop entry point and survive a process restart', async () => {
@@ -143,12 +173,12 @@ test('preferences persist through the single desktop entry point and survive a p
 })
 
 test('snapshot IPC returns compact unchanged responses and refreshes rows for another collector session', async () => {
-  const first = await request({ snapshot: { timeframe: '5m', sinceRevision: -1 } })
+  const first = await request({ snapshot: { sinceRevision: -1 } })
   assert.ok(first.serviceSession)
-  const same = await request({ snapshot: { timeframe: '5m', sinceRevision: first.revision, serviceSession: first.serviceSession } })
+  const same = await request({ snapshot: { sinceRevision: first.revision, serviceSession: first.serviceSession } })
   assert.equal(same.unchanged, true)
   assert.equal('rows' in same, false)
-  const fresh = await request({ snapshot: { timeframe: '5m', sinceRevision: same.revision, serviceSession: 'previous-collector' } })
+  const fresh = await request({ snapshot: { sinceRevision: same.revision, serviceSession: 'previous-collector' } })
   assert.ok(Array.isArray(fresh.rows))
 })
 
@@ -156,7 +186,7 @@ test('Radar has no Research or Strategy workspace or desktop operations', async 
   await page.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).waitFor()
   assert.equal(await page.getByRole('button', { name: /Research|Strategy|Signals|Rules|Universe/ }).count(), 0)
   assert.equal(await page.locator('[data-mode-switch]').count(), 0)
-  const previous = await request({ snapshot: { timeframe: '5m', sinceRevision: -1 } })
+  const previous = await request({ snapshot: { sinceRevision: -1 } })
   for (const value of [
     { suite: { mode: 'radar', action: 'evaluate', timeframe: '5m' } },
     { research: { action: 'list' } },
@@ -173,8 +203,9 @@ test('Radar has no Research or Strategy workspace or desktop operations', async 
     { windowTint: '#ffffff' },
     { rocPeriod: 9, marocPeriod: 9, timeframe: '5m', sinceRevision: -1 },
   ]) await assert.rejects(() => request(value), /Invalid desktop bridge request/)
-  const current = await request({ snapshot: { timeframe: '5m', sinceRevision: -1 } })
-  assert.equal(current.timeframe, previous.timeframe)
+  const current = await request({ snapshot: { sinceRevision: -1 } })
+  assert.deepEqual(current.rows, previous.rows)
+  assert.equal('timeframe' in current, false)
   for (const key of ['filterMetricsCatalog', 'filterFunctions', 'filterFunctionCatalog', 'filterLibraryPreferences',
     'notificationsEnabled', 'notificationAuthorization', 'notificationError', 'backgroundMonitoringEnabled',
     'backgroundMonitoringError', 'monitoringPaused', 'launchAtLogin', 'launchAtLoginError']) {
@@ -197,34 +228,32 @@ test('clipboard, screenshot capture, analysis settings, and safe gateway cancell
   assert.ok(image.width > 0 && image.height > 0)
   assert.deepEqual(await request({ analysisSettings: { action: 'save', model: 'test-model', apiKey: 'test-key' } }), { model: 'test-model', hasAPIKey: true })
   assert.deepEqual(await request({ analysisSettings: { action: 'read' } }), { model: 'test-model', hasAPIKey: true })
-  assert.equal('analysis' in await request({ snapshot: { timeframe: '5m', sinceRevision: -1 } }), false)
+  assert.equal('analysis' in await request({ snapshot: { sinceRevision: -1 } }), false)
   assert.deepEqual(await request({ analysisSettings: { action: 'removeKey' } }), { model: 'test-model', hasAPIKey: false })
   await assert.rejects(() => request({ gatewayFetch: { id: 'missing-key', body: '{}' } }), /Save an AI Gateway API key/)
   assert.deepEqual(await request({ cancelGatewayFetch: 'no-such-request' }), { ok: true })
-  const initial = await request({ snapshot: { timeframe: '5m', sinceRevision: -1 } })
+  const initial = await request({ snapshot: { sinceRevision: -1 } })
   assert.equal(initial.error, '')
   assert.deepEqual(initial.rows, [])
 })
 
-test('cached catalog projection retains statistics while the list shows contract, price, and independent ranking change', async () => {
+test('canonical catalog rows show contract, live price, and ranking independently of chart preparation', async () => {
   const fixture = await request({ e2e: { action: 'seedCachedListProjection' } })
   assert.equal(fixture.timeframe, '1H')
 
   // This is the renderer's ordinary radar request.  The fixture only writes
   // source/statistics cache rows and catalog context; it never injects a
   // ready-made market row.
-  const projected = await waitFor(async () => {
-    const snapshot = await request({ snapshot: { timeframe: fixture.timeframe, sinceRevision: -1 } })
-    const row = snapshot.rows?.find(value => value.instId === fixture.instId)
-    return row && row.oiChange !== null && row.takerRatio !== null && row.rsi6 !== null && row.ema200Signal !== null ? row : null
-  })
-  assert.notEqual(projected.oiChange, null)
-  assert.notEqual(projected.takerRatio, null)
-  assert.notEqual(projected.rsi6, null)
-  assert.notEqual(projected.ema200Signal, null)
+  const snapshot = await request({ snapshot: { sinceRevision: -1 } })
+  const row = snapshot.rows.find(value => value.instId === fixture.instId)
+  assert.ok(row)
+  assert.ok(Number.isFinite(row.lastPrice))
+  assert.equal('timeframe' in snapshot, false)
+  assert.equal('listProgress' in snapshot, false)
 
   // Reload so React obtains the row through the same initial snapshot read as
   // an app user, then inspect the rendered table instead of the IPC object.
+  await request({ preferences: { action: 'update', values: { chartTimeframe: fixture.timeframe } } })
   await page.reload({ waitUntil: 'domcontentloaded' })
   const market = page.locator(`[aria-label="View ${fixture.instId} chart"]`)
   await market.waitFor({ state: 'visible', timeout: 10_000 })
@@ -245,6 +274,7 @@ test('a restarted desktop restores cached catalog readings before a live scan co
   // recreate the entire Electron process to cover the production startup path,
   // rather than a renderer reload against an already-warm main process.
   const fixture = await request({ e2e: { action: 'seedCachedListProjection' } })
+  await request({ preferences: { action: 'update', values: { chartTimeframe: fixture.timeframe } } })
   await electron.close()
   await launchElectron(true)
 
@@ -253,7 +283,7 @@ test('a restarted desktop restores cached catalog readings before a live scan co
   const cells = market.locator('td')
   assert.equal(await cells.count(), 3)
   assert.doesNotMatch((await cells.nth(1).textContent()) ?? '', /—/)
-  const snapshot = await request({ snapshot: { timeframe: '1H', sinceRevision: -1 } })
+  const snapshot = await request({ snapshot: { sinceRevision: -1 } })
   assert.equal(snapshot.catalogSource, 'cache')
   assert.equal(snapshot.loading, true, 'The delayed production-style discovery must still be running.')
   await page.locator('[data-market-list]').getByText('Refreshing', { exact: true }).waitFor()
@@ -269,10 +299,10 @@ test('prepared native chart pages preserve canonical indicator values across eve
   await installRequestProbe(electron, fixture.instId)
   try {
     for (const timeframe of fixture.timeframes) {
-      const prepared = await waitFor(async () => {
-        const frame = await request({ chartWindow: { instId: fixture.instId, timeframe, endHour: fixture.end } })
-        return frame.indicatorState !== 'loading' ? frame : null
-      })
+      const focusId = `canonical-oracle:${timeframe}`
+      await request({ chartFocus: { id: focusId, target: { instId: fixture.instId, timeframe, endHour: fixture.end } } })
+      const prepared = await request({ chartWindow: { instId: fixture.instId, timeframe, endHour: fixture.end, focusId } })
+      assert.notEqual(prepared.indicatorState, 'loading', 'The matching focus owns and completes canonical preparation.')
       const expected = new Map(fixture.series[timeframe].bars.map(bar => [bar.hour, bar]))
       const visible = prepared.bars.filter(bar => bar.hour >= fixture.end - 95 * fixture.series[timeframe].intervalMS && bar.hour <= fixture.end)
       assert.equal(visible.length, 96)
@@ -287,10 +317,9 @@ test('prepared native chart pages preserve canonical indicator values across eve
       }
     }
     const requests = await readRequestProbe(electron)
-    const redundant = requests.sourceRequests.filter(call => call.path !== '/market/candles'
-      && !(call.path === '/market/history-candles' && call.parameters.bar === '5m'
-        && Number(call.parameters.after) - Number(call.parameters.limit) * 300_000 > fixture.end))
-    assert.deepEqual(redundant, [], 'Complete durable chart periods must not be downloaded again. Independent ranking admission may repair its missing current 5m window, beyond this historical fixture.')
+    const sources = separateSourceMaintenance(requests.sourceRequests, fixture)
+    assert.deepEqual([...sources.historical, ...sources.historicalExtensions], [],
+      'Complete durable chart periods must not be downloaded again. Bounded current-window repairs wholly beyond this fixture are independent.')
   } finally { await removeRequestProbe(electron) }
 })
 
@@ -299,7 +328,7 @@ test('ATR% and BBW share the panel between RSI and OI with independent fitted sc
   const originalViewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }))
   await page.setViewportSize({ width: 1_600, height: 1_000 })
   await openChart(page, fixture)
-  const legendValue = label => page.locator(`[data-chart-legend="${label}"]`).evaluate(line => line.parentElement.querySelectorAll('text')[1].textContent)
+  const legendValue = label => page.locator(`svg[data-rendered-inst] [data-chart-legend="${label}"]`).evaluate(line => line.parentElement.querySelectorAll('text')[1].textContent)
   try {
     for (const timeframe of fixture.timeframes) {
       await selectTimeframe(page, timeframe)
@@ -386,7 +415,7 @@ test('the paint probe catches changed indicator geometry without a new snapshot 
     const observation = await page.evaluate(async instId => {
       const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
       const snapshot = chart.__chartSnapshot
-      const path = chart.querySelector('[data-chart-indicator="rsi12"]')
+      const path = chart.querySelector('svg[data-rendered-inst] [data-chart-indicator="rsi12"]')
       const original = path.getAttribute('d')
       const initiallyValid = window.__chartPaintProbe.errors.length === 0
       try {
@@ -416,7 +445,7 @@ test('the paint probe catches changed indicator geometry without a new snapshot 
 
 })
 
-test('mature local indicators and statistics stay drawn from the first scroll through prefetch, push and scroll end', async context => {
+test('prepared resident indicators and statistics stay drawn through rapid scrolling, latest pushes and reversal', async context => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   const indicatorFields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
   await installRequestProbe(electron, fixture.instId)
@@ -432,19 +461,21 @@ test('mature local indicators and statistics stay drawn from the first scroll th
         return snapshot?.timeframe === timeframe && snapshot.bars.length === 96
           && snapshot.bars.every(bar => [...fields, 'oi', 'buy', 'sell'].every(field => Number.isFinite(bar[field])))
       }, { timeframe, fields: indicatorFields }, { timeout: 20_000 })
+      const resident = await waitForLocalHistory(electron, page, fixture, timeframe, { requireIndicators: true })
+      assert.ok(resident >= 96 + 972, 'Every measured target must lie inside the fully calculated resident reserve.')
+      await waitForRendered(page, fixture, timeframe)
       await startPaintProbe(page, fixture, { requireMatureData: true })
       const phase = value => page.evaluate(value => { window.__chartPaintProbe.phase = value }, value)
       const settle = () => page.evaluate(async () => { for (let frame = 0; frame < 12; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
       const intervalMS = fixture.series[timeframe].intervalMS
-      await phase('first wheel and local history admission')
-      await wheelBurst(page, { deltaY: 7_200 })
-      await waitForRendered(page, fixture, timeframe, fixture.end - 600 * intervalMS)
-      await waitFor(async () => (await readRequestProbe(electron)).historyResponses.some(response => response.timeframe === timeframe && response.bars > 96))
-      await phase('continuous scrolling and speculative prefetch')
+      await phase('first resident wheel frame')
+      await wheelBurst(page, { deltaY: 3_600 })
+      await waitForRendered(page, fixture, timeframe, fixture.end - 300 * intervalMS)
+      await phase('continuous resident scrolling')
       await wheelBurst(page, { frames: 6, eventsPerFrame: 32, deltaY: 36 })
-      await waitForRendered(page, fixture, timeframe, fixture.end - 1_176 * intervalMS)
-      await wheelBurst(page, { deltaY: 7_200 })
-      const historicalEnd = fixture.end - 1_776 * intervalMS
+      await waitForRendered(page, fixture, timeframe, fixture.end - 876 * intervalMS)
+      await wheelBurst(page, { deltaY: 96 * 12 })
+      const historicalEnd = fixture.end - 972 * intervalMS
       await waitForRendered(page, fixture, timeframe, historicalEnd)
       await phase('scroll end and asynchronous completions')
       await settle()
@@ -459,7 +490,7 @@ test('mature local indicators and statistics stay drawn from the first scroll th
       await settle()
       assert.equal(Number(await page.locator('[data-chart-inst]').getAttribute('data-chart-completed-end')), historicalEnd, 'A latest publication must preserve the historical viewport.')
       await phase('reverse to latest and stop')
-      await wheelBurst(page, { deltaY: -1_776 * 12 })
+      await wheelBurst(page, { deltaY: -972 * 12 })
       await waitForRendered(page, fixture, timeframe)
       await settle()
       const paint = await finishPaintProbe(page)
@@ -473,7 +504,7 @@ test('mature local indicators and statistics stay drawn from the first scroll th
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
 
-for (const mode of ['gap', 'prepend']) test(`first historical acquisition keeps every calculated curve and source panel while ${mode === 'gap' ? 'later gaps fill' : 'an earlier prefix changes the exact recursive seed'}`, async context => {
+for (const mode of ['gap', 'prepend']) test(`first historical acquisition preserves requested prices and source panels while ${mode === 'gap' ? 'later gaps fill' : 'an earlier prefix rebuilds exact indicators'}`, async context => {
   const probe = value => electron.evaluate((_, value) => globalThis.__marketBackend.probe(value), value)
   const fixture = await probe({ action: 'acquisitionInstall', timeframe: '15m', mode })
   const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
@@ -495,7 +526,7 @@ for (const mode of ['gap', 'prepend']) test(`first historical acquisition keeps 
     const firstEMA = await page.evaluate(() => document.querySelector('[data-chart-inst]').__chartSnapshot.bars.at(-1).ema)
     if (mode === 'prepend') assert.ok(Math.abs(firstEMA - desired.at(-1).ema) > 1e-6,
       'The absent earlier prefix must actually change the recursive result, so retaining a stale curve cannot pass this test.')
-    await startPaintProbe(page, fixture, { requireMatureData: true, verifyIndicatorValues: mode === 'gap' })
+    await startPaintProbe(page, fixture, { requireMatureData: mode === 'gap', indicatorValidation: mode === 'gap' ? 'fixture' : 'finite' })
     const sourceCounts = { candles: 0, oi: 0, taker: 0 }
     const pageCounts = { candles: 0, oi: 0, taker: 0 }
     const complete = new Set()
@@ -509,8 +540,8 @@ for (const mode of ['gap', 'prepend']) test(`first historical acquisition keeps 
         await settle()
       }
     }
-    // The prefix variant must adopt the new correct numbers without ever
-    // clearing its already visible curves or independent statistic panels.
+    // A changed prefix invalidates recursive curves until exact replacements
+    // arrive. Prices keep the selected cursor and independent statistics stay.
     await page.waitForFunction(({ desired, fields }) => {
       const bars = document.querySelector('[data-chart-inst]')?.__chartSnapshot?.bars
       return bars?.length === desired.length && bars.every((bar, index) => bar.hour === desired[index].hour
@@ -520,79 +551,85 @@ for (const mode of ['gap', 'prepend']) test(`first historical acquisition keeps 
     const paint = await finishPaintProbe(page)
     context.diagnostic(`First acquisition ${mode}: ${JSON.stringify({ sourceCounts, paints: paint.paints, quality: paint.quality })}`)
     assertCompletePaints(paint)
-    assert.ok(paint.quality.every(frame => frame.indicators === 96 && frame.oi === 96 && frame.taker === 96),
-      'Every mature curve and statistic panel must remain visible through native page ingestion, even when the canonical generation changes.')
+    assert.ok(paint.quality.every(frame => frame.oi === 96 && frame.taker === 96 && (mode === 'prepend' || frame.indicators === 96)),
+      'Independent statistics and unchanged indicator inputs must remain available while a changed recursive prefix rebuilds.')
+    assert.ok(paint.commits.every(commit => commit.end === fixture.targetEnd), 'Canonical page writes must not cancel or replace the requested wheel cursor.')
   } finally {
     await page.evaluate(() => { const probe = window.__chartPaintProbe; if (probe) { probe.active = false; cancelAnimationFrame(probe.raf); probe.observer.disconnect(); delete window.__chartPaintProbe } })
   }
 })
 
-test('a held history read keeps the last complete paint and coalesces every later wheel event into the latest target', async () => {
+test('a held old history read leaves backend demand and the latest wheel target independent with two bounded read lanes', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  await installRequestProbe(electron, fixture.instId, { disableLocalHistory: true, initialHistoryBars: 1_000, capHistoricalWindows: true })
+  await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
   try {
     await openChart(page, fixture)
-    await removeRequestProbe(electron)
-    await installRequestProbe(electron, fixture.instId, { holdHistorical: true, disableLocalHistory: true })
     await startPaintProbe(page, fixture)
     await wheelBurst(page, { deltaY: 14_400 })
     await waitFor(async () => (await readRequestProbe(electron)).held)
-    await wheelBurst(page, { frames: 4, eventsPerFrame: 32, deltaY: 12 })
+    const initial = await readRequestProbe(electron)
+    assert.equal(initial.heldCall.kind, 'history')
+    assert.equal(initial.heldCall.endHour, fixture.end - 1_200 * fixture.intervalMS)
+    assert.ok(initial.heldCall.readCompletedAt !== null, 'A real detached durable reply must exist before delivery is held.')
+    const forward = await wheelBurst(page, { frames: 4, eventsPerFrame: 32, deltaY: 12 })
     await wheelBurst(page, { frames: 2, eventsPerFrame: 32, deltaY: -12 })
     const expectedEnd = fixture.end - 1_264 * fixture.intervalMS
-    await page.waitForFunction(({ instId, expectedEnd }) => {
-      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
-      return Number(chart?.getAttribute('data-chart-requested-end')) === expectedEnd
-        && chart.getAttribute('data-chart-loading') === 'true'
-    }, { instId: fixture.instId, expectedEnd })
-    const held = await readRequestProbe(electron)
-    assert.equal(held.active, 1)
-    assert.equal(held.maxActive, 1, 'Wheel events may not create a parallel request storm.')
-    assert.equal(held.calls.length, held.callsAtHold, `No additional read may cross IPC while history is held: ${JSON.stringify(held.calls)}`)
-    const svg = page.locator(`svg[data-rendered-inst="${fixture.instId}"]`)
-    assert.equal(Number(await svg.getAttribute('data-rendered-end')), fixture.end)
-    assert.match(await page.locator(`[data-chart-inst="${fixture.instId}"]`).textContent(), /Preparing/)
-    await releaseRequestProbe(electron)
     await waitForRendered(page, fixture, fixture.timeframe, expectedEnd)
+    const held = await readRequestProbe(electron)
+    assert.equal(held.heldSettled, false, 'The new target must finish while the old disk response remains held.')
+    assert.ok(held.maxHistoricalActive <= 2, 'Wheel input must keep history reads inside the two available lanes.')
+    assert.ok(held.maxLocalActive <= 2)
+    assert.equal(held.legacyWindowCalls, 0, 'The renderer must express demand separately from pure chart reads.')
+    assert.equal(held.focusCalls.findLast(call => call.target)?.target.endHour, expectedEnd, 'Held disk delivery cannot block or replace backend viewport demand.')
+    assert.ok(held.calls.filter(call => call.kind === 'history').length <= 2 * (forward.length + 3), 'Wheel bursts must coalesce rather than create one read per raw event.')
+    const beforeRelease = await page.evaluate(() => window.__chartPaintProbe.commits.length)
+    await releaseRequestProbe(electron)
+    await waitFor(async () => (await readRequestProbe(electron)).heldSettled)
     await page.evaluate(async () => { for (let index = 0; index < 8; index += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
     const report = await finishPaintProbe(page)
     assertCompletePaints(report)
     assert.equal(report.commits.at(-1).end, expectedEnd)
+    assert.ok(report.commits.slice(beforeRelease).every(commit => commit.end === expectedEnd && commit.timeframe === fixture.timeframe), 'Late disk data must not repaint an obsolete cursor.')
     const requests = await readRequestProbe(electron)
-    assert.equal(requests.maxActive, 1)
-    assert.deepEqual(separateSourceMaintenance(requests.sourceRequests, fixture).historical, [], 'Scrolling must reuse durable history, independently of latest-candle refresh timing.')
-    assert.ok(requests.calls.length <= 12, `Coalesced history work unexpectedly issued ${requests.calls.length} requests.`)
-    assert.ok(!report.commits.some(commit => commit.end === fixture.end - 1_200 * fixture.intervalMS), 'The obsolete held target was presented after a newer input.')
+    assert.ok(requests.maxHistoricalActive <= 2)
+    assert.deepEqual(separateSourceMaintenance(requests.sourceRequests, fixture).historical, [], 'Scrolling must reuse durable history independently of bounded current-window maintenance.')
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
 
-test('a late history response cannot overwrite a more recently selected timeframe', async () => {
+test('a late durable history response cannot overwrite a more recently selected timeframe', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  await installRequestProbe(electron, fixture.instId, { disableLocalHistory: true, initialHistoryBars: 1_000, capHistoricalWindows: true })
+  await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
   try {
     await openChart(page, fixture)
     for (const timeframe of fixture.timeframes) {
       await selectTimeframe(page, timeframe)
       await waitForRendered(page, fixture, timeframe)
     }
-    await removeRequestProbe(electron)
-    await installRequestProbe(electron, fixture.instId, { holdHistorical: true, disableLocalHistory: true })
     await startPaintProbe(page, fixture)
     await wheelBurst(page, { deltaY: 14_400 })
     await waitFor(async () => (await readRequestProbe(electron)).held)
+    const original = await readRequestProbe(electron)
+    assert.equal(original.heldCall.timeframe, fixture.timeframe)
+    assert.ok(original.heldCall.readCompletedAt !== null)
     await selectTimeframe(page, '5m')
+    await waitForRendered(page, fixture, '5m')
     await selectTimeframe(page, '15m')
-    await releaseRequestProbe(electron)
     await waitForRendered(page, fixture, '15m')
+    const current = await readRequestProbe(electron)
+    assert.equal(current.heldSettled, false, 'Both period selections must finish independently of the held old read.')
+    assert.equal(current.focusCalls.findLast(call => call.target)?.target.timeframe, '15m')
+    const beforeRelease = await page.evaluate(() => window.__chartPaintProbe.commits.length)
+    await releaseRequestProbe(electron)
+    await waitFor(async () => (await readRequestProbe(electron)).heldSettled)
     await page.evaluate(async () => { for (let index = 0; index < 8; index += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
     const report = await finishPaintProbe(page)
     assertCompletePaints(report)
     assert.equal(report.commits.at(-1).timeframe, '15m')
-    const final15m = report.commits.findIndex(commit => commit.timeframe === '15m')
-    assert.ok(final15m >= 0)
-    assert.ok(report.commits.slice(final15m).every(commit => commit.timeframe === '15m'), 'An older timeframe repainted after the selected chart was ready.')
+    assert.ok(report.commits.slice(beforeRelease).every(commit => commit.timeframe === '15m' && commit.end === fixture.end), 'An older period must not repaint after the selected chart is ready.')
     const requests = await readRequestProbe(electron)
-    assert.deepEqual(separateSourceMaintenance(requests.sourceRequests, fixture).historical, [], 'A fully local timeframe switch must reuse historical candles and statistics. Periodic latest two-candle refreshes are independent.')
+    assert.ok(requests.maxHistoricalActive <= 2 && requests.maxLocalActive <= 2)
+    assert.equal(requests.legacyWindowCalls, 0)
+    assert.deepEqual(separateSourceMaintenance(requests.sourceRequests, fixture).historical, [], 'A fully local period switch must reuse historical prices and statistics.')
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
 
@@ -606,6 +643,19 @@ test('the live price overlay follows its actual price without changing the 96 co
   await installPreparedTransform({ mode: 'live', instId: fixture.instId, livePrice })
   try {
     await openChart(page, fixture)
+    // This case measures the live overlay over a prepared adjacent window.
+    // First acquisition may legitimately present its known prices while the
+    // missing leading candle loads; cold acquisition is tested separately.
+    const historicalEnd = fixture.end - fixture.intervalMS
+    await wheelBurst(page, { deltaY: 12 })
+    await waitForRendered(page, fixture, fixture.timeframe, historicalEnd)
+    await page.waitForFunction(({ end, intervalMS }) => {
+      const bars = document.querySelector('[data-chart-inst]')?.__chartSnapshot?.bars
+      return bars?.length === 96 && bars.every((bar, index) =>
+        bar.confirmed && bar.hour === end - 95 * intervalMS + index * intervalMS)
+    }, { end: historicalEnd, intervalMS: fixture.intervalMS })
+    await wheelBurst(page, { deltaY: -12 })
+    await waitForRendered(page, fixture)
     await page.waitForFunction(() => Boolean(document.querySelector('[data-chart-inst]')?.__chartSnapshot?.liveBar))
     await startPaintProbe(page, fixture)
     const overlay = await page.evaluate(() => {
@@ -655,7 +705,7 @@ test('the live price overlay follows its actual price without changing the 96 co
     assert.notEqual(overlay.countdownFill, overlay.labelFill)
     await wheelBurst(page, { deltaY: 12 })
     await waitForRendered(page, fixture, fixture.timeframe, fixture.end - fixture.intervalMS)
-    assert.equal(await page.locator('[data-chart-countdown]').count(), 0, 'Historical charts must not display a live countdown.')
+    assert.equal(await page.locator('svg[data-rendered-inst] [data-chart-countdown]').count(), 0, 'Historical charts must not display a live countdown.')
     assert.equal(await page.evaluate(() => document.querySelector('[data-chart-inst]').__chartSnapshot.liveBar), undefined)
     assertCompletePaints(await finishPaintProbe(page))
   } finally {
@@ -834,12 +884,14 @@ test('known RSI, ATR% and BBW segments remain visible through indicator warm-up 
   }
 })
 
-test('a listing with twelve prices remains usable while statistics are unknown', async () => {
+test('a qualified short listing remains selectable while chart statistics are still loading', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   await installPreparedTransform({ mode: 'partial', instId: fixture.instId, end: fixture.end, intervalMS: fixture.intervalMS })
   try {
     await page.reload({ waitUntil: 'domcontentloaded' })
-    await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click()
+    await page.locator(`[data-chart-inst="${fixture.instId}"]`).waitFor({ state: 'visible' })
+    assert.equal(await page.locator(`[aria-label="View ${fixture.instId} chart"]`).count(), 1,
+      'Chart statistics cannot revoke backend list membership.')
     await selectTimeframe(page, fixture.timeframe)
     const chart = page.locator(`[data-chart-inst="${fixture.instId}"]`)
     await page.waitForFunction(() => document.querySelector('[data-chart-inst]')?.dataset.chartRenderedBars === '12')
@@ -862,8 +914,9 @@ test('historically unavailable statistics remain missing instead of becoming fal
   assert.equal(await chart.getAttribute('data-chart-taker-state'), 'unavailable')
   assert.equal(await chart.getAttribute('data-chart-oi-samples'), '0')
   assert.equal(await chart.getAttribute('data-chart-taker-samples'), '0')
-  assert.equal(await chart.locator('[data-chart-taker="empty"]').count(), 1)
-  assert.equal(await chart.getByText('OKX 1h OI history is incomplete for this range', { exact: true }).count(), 1)
-  assert.equal(await chart.getByText('OKX 1h Taker history is incomplete for this range', { exact: true }).count(), 1)
+  assert.equal(await chart.locator('svg[data-rendered-inst] [data-chart-taker="empty"]').count(), 1)
+  const status = chart.locator('[data-chart-status]')
+  assert.equal(await status.getByText('OI is not published for part of this range', { exact: true }).count(), 1)
+  assert.equal(await status.getByText('Taker is not published for part of this range', { exact: true }).count(), 1)
   assertCompletePaints(await finishPaintProbe(page))
 })

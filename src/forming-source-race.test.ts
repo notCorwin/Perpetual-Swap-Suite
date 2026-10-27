@@ -9,7 +9,7 @@ import { DEFAULT_PREFERENCES } from '../electron/services/preferences.js'
 import type { RealtimeWebSocket } from '../electron/services/realtime-market.js'
 import type { PreparedChartResponse } from './chart-data.ts'
 
-const instId = 'BTC-USDT-SWAP', timeframe = '15m', step = 900_000
+const instId = 'BTC-USDT-SWAP', timeframe = '5m', step = 300_000
 const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done }); return { promise, resolve } }
 const raw = (timestamp: number, close: number, volume: number) => [String(timestamp), '100', '250', '90', String(close), String(volume), '1', '500', '0']
 class Socket extends EventTarget implements RealtimeWebSocket {
@@ -41,16 +41,17 @@ for (const volume of [5, 8]) test(`late forming REST cannot replace a newer nati
   let pending: Promise<unknown> | undefined
   try {
     await service.ready
-    await service.setChartUniverse([instId], timeframe, instId)
-    service.subscribePreparedCharts(frame => published.push(frame))
-    // Let the actual cold chart acquisition own latest(). A second caller
-    // below joins that request while its HTTP response is still held.
+    service.installInstruments(new Map([[instId, { instId, instType: 'SWAP', instCategory: '1', settleCcy: 'USDT', ctType: 'linear', state: 'live', ctVal: '0.01', ctMult: '1', ctValCcy: 'BTC', ruleType: 'normal' }]]))
     await service.localChartWindow(instId, timeframe)
-    await requested.promise
+    service.subscribePreparedCharts(frame => published.push(frame))
+    // Quote acquisition has its own lifetime; chart history demand now owns
+    // completed-window coverage instead of substituting a latest-only read.
     pending = service.history.latest(instId, timeframe)
+    await requested.promise
+    assert.equal(service.history.latest(instId, timeframe), pending, 'Concurrent quote readers share their admitted source request.')
     service.realtime.start(); socket.open()
     await service.realtime.whenIdle()
-    socket.message({ arg: { channel: 'candle15m', instId }, data: [raw(now - 60_000, 200, volume)] })
+    socket.message({ arg: { channel: 'candle5m', instId }, data: [raw(now - 60_000, 200, volume)] })
     await service.realtime.whenIdle()
     assert.equal(service.liveCandles.get(`${instId}:${timeframe}`).close, 200)
     assert.equal(service.preparedCharts.cached(`${instId}:${timeframe}`).liveBar.close, 200)
@@ -84,10 +85,9 @@ test('a latest read admitted before the first native tick cannot revive its sour
   try {
     await service.ready
     service.installInstruments(new Map([[instId, instrument]]))
-    await service.setChartUniverse([instId], timeframe, instId)
     await service.localChartWindow(instId, timeframe)
-    await requested.promise
     pending = service.history.latest(instId, timeframe)
+    await requested.promise
     assert.equal(service.liveCandles.size, 0, 'No native price has established this source yet.')
     service.installInstruments(new Map())
     service.installInstruments(new Map([[instId, instrument]]))

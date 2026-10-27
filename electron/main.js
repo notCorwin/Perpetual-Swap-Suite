@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, contentTracing, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, clipboard, contentTracing, ipcMain, net, session, shell } from 'electron'
 import { mkdirSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -6,21 +6,24 @@ import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { parseDesktopRequest } from './desktop-contract.js'
 import { createDesktopSecurity } from './desktop-security.js'
-import { testPresentation } from './test-presentation.js'
+import { assertBackgroundTestLaunch, testPresentation, testWindowOptions } from './test-presentation.js'
 import { startTestOwnerWatchdog } from './test-owner.js'
 import { initializeOperationRecording, closeOperationRecording, closeExternalOperationSource } from './services/operation-runtime.js'
 import { startGraphicsRecording } from './services/operation-graphics.js'
 import { beginOperation, measureOperation, recordOperation, runWithOperationContext, withOperationSuppressed } from './services/operations.js'
 import { createRendererOperationReceiver } from './services/renderer-operations.js'
 import { createOperationSession, enforceOperationRetention } from './services/operation-retention.js'
+import { installElectronOperationHooks } from './services/operation-hooks.js'
 import { MarketBackend } from './services/market-backend.js'
+import { windowToolbarLayout } from './window-layout.js'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const rendererURL = process.env.ELECTRON_RENDERER_URL || undefined
 const testMode = process.env.PERPETUAL_SWAP_E2E === '1'
 const testLaunchParentPID = process.ppid
 const backgroundTests = testPresentation() === 'background'
-if (backgroundTests && process.platform === 'darwin') app.setActivationPolicy('accessory')
+if (backgroundTests) assertBackgroundTestLaunch()
+if (backgroundTests && process.platform === 'darwin') app.setActivationPolicy('prohibited')
 // Chromium initializes its profile during ready. Isolate both locations first.
 if (process.env.PERPETUAL_SWAP_USER_DATA) {
   const userData = process.env.PERPETUAL_SWAP_USER_DATA
@@ -171,11 +174,25 @@ async function handleRequest(event, payload, context) {
 async function createWindow() {
   if (shuttingDown || window && !window.isDestroyed()) return
   window = new BrowserWindow({
+    ...testWindowOptions(backgroundTests),
+    frame: false,
+    ...(process.platform === 'darwin' ? { titleBarStyle: 'hidden', trafficLightPosition: windowToolbarLayout(1600, true).buttonsPosition } : {}),
     width: 1600, height: 1000, minWidth: 400, minHeight: 300,
     title: 'Perpetual Swap Suite', backgroundColor: '#101114', show: !testMode && !backgroundTests,
-    focusable: !backgroundTests,
-    webPreferences: { preload: join(root, 'electron', 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
+    webPreferences: { ...testWindowOptions(backgroundTests).webPreferences,
+      preload: join(root, 'electron', 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   })
+  if (process.platform === 'darwin') {
+    const target = window
+    const positionButtons = () => {
+      const position = windowToolbarLayout(target.getContentSize()[0], true).buttonsPosition
+      const current = target.getWindowButtonPosition()
+      if (current?.x !== position.x || current?.y !== position.y) target.setWindowButtonPosition(position)
+    }
+    positionButtons()
+    target.on('resize', positionButtons)
+    target.on('leave-full-screen', positionButtons)
+  }
   window.webContents.on('will-navigate', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
   window.webContents.on('will-redirect', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
   window.webContents.on('will-frame-navigate', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
@@ -233,6 +250,10 @@ async function startDesktop() {
 }
 
 app.whenReady().then(() => {
+  if (operationRecording) {
+    installElectronOperationHooks({ app, net, session })
+    void operationRecording.flush().catch(error => console.error('Operation hook checkpoint failed:', error.message))
+  }
   if (testMode || process.env.PERPETUAL_SWAP_SANDBOX === '1' || process.env.PERPETUAL_SWAP_TEST_UI !== undefined) {
     stopTestOwner = startTestOwnerWatchdog({ parentPID: testLaunchParentPID, onOwnerLost: () => {
       app.quit()
@@ -240,13 +261,12 @@ app.whenReady().then(() => {
       testOwnerExitTimer.unref()
     } })
   }
-  if (backgroundTests && process.platform === 'darwin') app.dock.hide()
   if (!shuttingDown) startupTask = startDesktop()
   return startupTask
 }).catch(error => { console.error('Desktop startup failed:', error); app.quit() })
 app.once('will-quit', () => { stopTestOwner(); clearTimeout(testOwnerExitTimer) })
 app.on('activate', () => {
-  if (app.isReady() && !shuttingDown && BrowserWindow.getAllWindows().length === 0) void startupTask.then(createWindow).catch(error => console.error('Could not open application window:', error))
+  if (!backgroundTests && app.isReady() && !shuttingDown && BrowserWindow.getAllWindows().length === 0) void startupTask.then(createWindow).catch(error => console.error('Could not open application window:', error))
 })
 app.on('before-quit', event => {
   if (shutdownComplete) return
@@ -260,7 +280,8 @@ app.on('before-quit', event => {
       for (const { controller } of gatewayRequests.values()) controller.abort()
       await Promise.allSettled([...gatewayRequests.values()].map(value => value.finished))
       await startupTask.catch(error => console.error('Desktop startup did not complete:', error))
-      await backend?.dispose()
+      try { await backend?.dispose() }
+      catch (error) { console.error('Market backend shutdown failed:', error) }
       await Promise.allSettled([...desktopRequests])
       if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) {
         await drainRendererOperations(window).catch(error => console.error('Renderer operation shutdown failed:', error))

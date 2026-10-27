@@ -27,7 +27,9 @@ export type HistoryTask = HistoryRange & {
   writtenRecords: number
   /** Durable numeric source slots, excluding missing slots and leased empty observations. */
   coveredRecords: number
-  /** Union of covered empty-observation leases and explicitly unavailable missing slots. */
+  /** Unexpired successful empty observations, excluding explicit unavailable evidence. */
+  emptyRecords: number
+  /** Nonnumeric slots covered by explicit source evidence; numeric data takes precedence. */
   unavailableRecords: number
   /** Numeric coverage observed at the consumer's first durable inspection. */
   localRecords: number
@@ -46,7 +48,10 @@ export type HistorySourceQuery = HistoryRange & {
   instrument: string
   timeframe: HistoryTimeframe
   source: string
+  /** Priority when this source operation was dispatched. */
   priority: HistoryPriority
+  /** Dynamic priority of live consumers overlapping this shared page. Pass to MarketService.get's fifth options argument. */
+  getPriority(): HistoryPriority
   cursor: string | number | null
   signal: AbortSignal
 }
@@ -70,11 +75,6 @@ export type HistorySource = {
   inspect?(query: HistorySourceQuery): MaybePromise<HistorySourceInspection>
 }
 export type HistorySyncOptions = {
-  metadata: {
-    listSyncTasks(): MaybePromise<unknown[]>
-    deleteSyncTask(id: string): MaybePromise<unknown>
-    deleteSyncTasks?(ids: string[]): MaybePromise<unknown>
-  }
   store: {
     missingCandleRanges(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string; intervalMS: number }, priority?: HistoryPriority): Promise<HistoryRange[]>
     /** Process-local mutation revision. Without one, completed enqueues revalidate storage. */
@@ -106,7 +106,7 @@ export type HistorySyncOptions = {
 }
 export class HistorySync {
   constructor(options: HistorySyncOptions)
-  /** Delete legacy persisted archive goals without admitting any source work. */
+  /** Start the process-local scheduler without restoring persisted demand. */
   start(): Promise<this>
   /** Create a finite process-local consumer. Overlapping and adjacent consumers share source coverage and API pages; cancellation removes only that consumer. */
   enqueue(request: HistoryRequest): Promise<HistoryTask>
@@ -115,7 +115,9 @@ export class HistorySync {
   /** Read detached snapshots. Terminal handles can expire from bounded result history. */
   getTask(id: string): HistoryTask | null
   listTasks(): HistoryTask[]
-  /** Count unique instruments with retrying or unavailable/paused source demand. */
+  /** Promote live consumers contained by these bounds and their shared page. Larger archive consumers retain background priority. Returns the number promoted. */
+  promote(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string }, priority: HistoryPriority): number
+  /** Count unique instruments with retrying or explicitly unavailable source demand. */
   progressFor(instIds: Iterable<string>, timeframe: HistoryTimeframe): { retrying: number; unavailable: number }
   /** Recheck an explicit observation or repair even before it changes storage. */
   invalidate(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string }): void
@@ -124,8 +126,8 @@ export class HistorySync {
   cancel(id: string): Promise<HistoryTask>
   /** Resume retries/cancelled work; unavailable tasks recheck source metadata. */
   resume(id: string): Promise<HistoryTask>
-  /** Resolves when completed, unavailable, paused, or cancelled. Registered waiters survive result pruning; an already expired ID is unknown. */
-  waitFor(id: string): Promise<HistoryTask>
+  /** Resolves when completed, unavailable, paused, or cancelled. failFast rejects on the first source error with Error.retryAt (number | null), leaving other consumers and background waiters intact. */
+  waitFor(id: string, options?: { failFast?: boolean }): Promise<HistoryTask>
   /** Includes scheduled retries; paused/cancelled/unavailable work is idle. */
   whenIdle(): Promise<void>
   /** Reject waiters and abort active fetches; drain accepted writes. Consumers never restart. */

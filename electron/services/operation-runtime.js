@@ -1,10 +1,13 @@
 import { mkdirSync, openSync, readFileSync, writeFileSync, writeSync, write, closeSync, fdatasync, fdatasyncSync, renameSync, unlinkSync } from 'node:fs'
 import { join, basename, dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { Buffer } from 'node:buffer'
+import process from 'node:process'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { threadId, workerData } from 'node:worker_threads'
 import { installSandboxNetworkBoundary } from './sandbox-network.js'
-import { installOperationHooks } from './operation-hooks.js'
+import { installOperationHooks, getOperationHookCapabilities, getInstalledOperationHooks } from './operation-hooks.js'
+import { encodeOperationJournal, operationJournalSuffix } from './operation-journal.js'
 import { attachOperationJournalSink, configureOperationContext, configureOperationPropagation, finishActiveOperations,
   registerOperationImportSource, withOperationSuppressed } from './operations.js'
 
@@ -18,11 +21,11 @@ installSandboxNetworkBoundary()
 let current
 const suppress = withOperationSuppressed
 const validID = value => typeof value === 'string' && /^[\w.:-]{1,256}$/.test(value)
-const jsonWrite = (path, value) => suppress(() => {
+const jsonWrite = (path, value, encoded) => suppress(() => {
   const temporary = join(dirname(path), `.tmp-${randomUUID()}-${basename(path)}`)
   let descriptor
   try {
-    writeFileSync(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' })
+    writeFileSync(temporary, `${encoded ?? JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' })
     descriptor = openSync(temporary, 'r')
     fdatasyncSync(descriptor)
     closeSync(descriptor); descriptor = undefined
@@ -33,19 +36,40 @@ const jsonWrite = (path, value) => suppress(() => {
   }
 })
 
-function journalWriter(directory, sessionId, executionId, participant, hooks) {
-  const file = join(directory, `${executionId}.jsonl`), healthFile = join(directory, `${executionId}.health.json`)
+function journalWriter(directory, sessionId, executionId, participant, hooks, capabilities = () => []) {
+  const file = join(directory, `${executionId}${operationJournalSuffix}`), healthFile = join(directory, `${executionId}.health.json`)
   const descriptor = suppress(() => openSync(file, 'wx', 0o600))
-  const counts = { recorded: 0, persisted: 0, durableRecords: 0, failed: 0, recordedOperations: 0, startedOperations: 0, sourceFailures: 0, omittedRecords: 0 }
+  const prefix = suppress(() => encodeOperationJournal(Buffer.alloc(0)))
+  suppress(() => {
+    let offset = 0
+    while (offset < prefix.length) {
+      const written = writeSync(descriptor, prefix, offset, prefix.length - offset, offset)
+      if (!written) throw new Error('Operation journal write made no progress.')
+      offset += written
+    }
+  })
+  const counts = { recorded: 0, persisted: 0, durableRecords: 0, uncompressedBytes: 0, journalBytes: prefix.length,
+    failed: 0, recordedOperations: 0, startedOperations: 0, sourceFailures: 0, omittedRecords: 0 }
   let lastDurableAt = null
-  let queue = [], bytes = 0, position = 0, timer, writing, accepting = true, closed = false, closing, flushBarrier = Promise.resolve()
-  const health = () => ({ schemaVersion: 2, ...counts, pending: counts.recorded - counts.persisted,
-    activeOperations: counts.startedOperations - counts.recordedOperations, executionId, sessionId, participantId: participant.id,
-    role: participant.role, closed, enabledHooks: hooks, durability: 'fdatasync-on-flush-and-5s-checkpoint', updatedAt: Date.now(), lastDurableAt,
-    runtime: { node: process.version, electron: process.versions.electron ?? null, v8: process.versions.v8 } })
+  const queue = new Map()
+  let nextSequence = 1, bytes = 0, position = prefix.length, timer, writing, accepting = true, closed = false, closing, flushBarrier = Promise.resolve(), lastHealthState
+  let serializing = 0, building = false, draining = 0, serializationBarrier, finishSerialization
+  const health = () => {
+    const snapshot = capabilities()
+    return { schemaVersion: 2, ...counts, pending: counts.recorded - counts.persisted,
+      activeOperations: counts.startedOperations - counts.recordedOperations, executionId, sessionId, participantId: participant.id,
+      role: participant.role, closed, enabledHooks: typeof hooks === 'function' ? hooks(snapshot) : hooks,
+      hookCapabilities: snapshot, encoding: 'brotli-frames-q0-crc32-v1',
+      durability: 'fdatasync-on-flush-and-5s-checkpoint', updatedAt: Date.now(), lastDurableAt,
+      runtime: { node: process.version, electron: process.versions.electron ?? null, v8: process.versions.v8 } }
+  }
   const failed = error => { counts.failed++; suppress(() => console.error(`Operation journal failed (${error.code ?? error.name}).`)) }
   const writeHealth = () => {
-    try { jsonWrite(healthFile, health()) }
+    const value = health(), state = JSON.stringify({ ...value, updatedAt: undefined })
+    if (state === lastHealthState) return
+    // Reuse the complete state encoding; only the update timestamp is volatile.
+    const encoded = `${state.slice(0, -1)},"updatedAt":${JSON.stringify(value.updatedAt)}}`
+    try { jsonWrite(healthFile, value, encoded); lastHealthState = state }
     catch (error) { failed(error); throw error }
   }
   const serializeFlush = operation => {
@@ -55,15 +79,47 @@ function journalWriter(directory, sessionId, executionId, participant, hooks) {
     flushBarrier = task.catch(() => {})
     return task
   }
+  const releaseAdmission = () => {
+    if (serializing || building || draining) return
+    const completed = finishSerialization
+    finishSerialization = undefined; serializationBarrier = undefined
+    completed?.()
+  }
   const take = () => {
     clearTimeout(timer); timer = undefined
-    const batch = { count: queue.length, buffer: Buffer.from(queue.join('')), offset: position }
-    queue = []; bytes = 0; position += batch.buffer.length; return batch
+    if (serializing || building || queue.get(nextSequence) === undefined) return { count: 0, buffer: Buffer.alloc(0), offset: position }
+    building = true
+    try {
+      const lines = []
+      let through = nextSequence
+      for (;;) {
+        const line = queue.get(through)
+        if (line === undefined) break
+        through++
+        // A failed serialization owns its sequence but contributes no fake line.
+        if (line !== null) lines.push(line)
+      }
+      const raw = lines.length ? Buffer.from(`${lines.join('\n')}\n`) : Buffer.alloc(0)
+      const buffer = lines.length ? encodeOperationJournal(raw) : Buffer.alloc(0)
+      const batch = { count: lines.length, buffer, offset: position }
+      // New observations may arrive during encoding. Remove only this complete
+      // prefix; absolute sequence keys keep their later admissions independent.
+      for (let sequence = nextSequence; sequence < through; sequence++) queue.delete(sequence)
+      nextSequence = through; bytes -= raw.length
+      counts.uncompressedBytes += raw.length; counts.journalBytes += buffer.length
+      position += buffer.length; return batch
+    } finally { building = false; releaseAdmission() }
+  }
+  const scheduleWrite = () => {
+    if (serializing || building || draining || !queue.size || closed) return
+    if (bytes >= 256 * 1024 && queue.get(nextSequence) !== undefined) pressureWrite()
+    else if (!timer && !writing) { timer = setTimeout(startWrite, 250); timer.unref() }
   }
   const pressureWrite = () => suppress(() => {
-    const { count, buffer, offset } = take()
-    if (!count) return
+    draining++
     try {
+      const { count, buffer, offset } = take()
+      if (!count) return
       let written = 0
       while (written < buffer.length) {
         const size = writeSync(descriptor, buffer, written, buffer.length - written, offset + written)
@@ -72,33 +128,40 @@ function journalWriter(directory, sessionId, executionId, participant, hooks) {
       }
       counts.persisted += count
     } catch (error) { failed(error) }
+    finally { draining--; try { scheduleWrite() } finally { releaseAdmission() } }
   })
   const startWrite = () => suppress(() => {
     if (writing) return writing
-    const { count, buffer, offset } = take()
-    if (!count) return Promise.resolve()
-    // Reserved offsets keep old async and newer pressure batches disjoint.
-    writing = (async () => {
-      let written = 0
-      while (written < buffer.length) {
-        const size = await new Promise((resolve, reject) => write(descriptor, buffer, written, buffer.length - written, offset + written,
-          (error, size) => error ? reject(error) : resolve(size)))
-        if (!size) throw new Error('Operation journal write made no progress.')
-        written += size
-      }
-      counts.persisted += count
-    })().catch(failed).finally(() => {
-      writing = undefined
-      if (queue.length && !closed && !timer) { timer = setTimeout(startWrite, 250); timer.unref() }
-    })
-    return writing
+    draining++
+    try {
+      const { count, buffer, offset } = take()
+      if (!count) return Promise.resolve()
+      // Reserved offsets keep old async and newer pressure batches disjoint.
+      writing = (async () => {
+        let written = 0
+        while (written < buffer.length) {
+          const size = await new Promise((resolve, reject) => write(descriptor, buffer, written, buffer.length - written, offset + written,
+            (error, size) => error ? reject(error) : resolve(size)))
+          if (!size) throw new Error('Operation journal write made no progress.')
+          written += size
+        }
+        counts.persisted += count
+      })().catch(failed).finally(() => {
+        writing = undefined
+        scheduleWrite()
+      })
+      return writing
+    } finally { draining--; try { scheduleWrite() } finally { releaseAdmission() } }
   })
   const flush = ({ durable = true } = {}) => {
     const target = counts.recorded
     return serializeFlush(() => suppress(async () => {
-      do { await startWrite() } while (counts.persisted < target && (writing || queue.length))
+      do {
+        if (serializing || building || draining || queue.size && queue.get(nextSequence) === undefined) await (serializationBarrier ??= new Promise(resolve => { finishSerialization = resolve }))
+        await startWrite()
+      } while (counts.persisted < target && (writing || queue.size))
       if (writing) await writing
-      if (durable && !closed) {
+      if (durable && !closed && counts.durableRecords < target) {
         try {
           await new Promise((resolve, reject) => fdatasync(descriptor, error => error ? reject(error) : resolve()))
           counts.durableRecords = Math.max(counts.durableRecords, Math.min(target, counts.persisted)); lastDurableAt = Date.now()
@@ -109,17 +172,33 @@ function journalWriter(directory, sessionId, executionId, participant, hooks) {
       if (counts.failed || counts.persisted < target || counts.sourceFailures || counts.omittedRecords) throw new Error('Operation journal persistence did not complete.')
     }))
   }
-  const enqueue = entry => suppress(() => {
+  const enqueue = entry => {
     if (!accepting) {
-      counts.sourceFailures++; counts.omittedRecords++; writeHealth()
+      counts.sourceFailures++; counts.omittedRecords++
+      if (!closed && entry.sequence >= nextSequence && !queue.has(entry.sequence)) queue.set(entry.sequence, null)
+      finishSerialization?.(); serializationBarrier = undefined; finishSerialization = undefined
+      writeHealth()
       throw new Error('A closing or closed operation journal cannot accept records.')
     }
-    const line = `${JSON.stringify(entry)}\n`
-    counts.recorded++; counts.recordedOperations += Number(entry.phase === 'end'); counts.startedOperations += Number(entry.phase === 'start')
-    queue.push(line); bytes += Buffer.byteLength(line)
-    if (bytes >= 256 * 1024) pressureWrite()
-    else if (!timer && !writing) { timer = setTimeout(startWrite, 250); timer.unref() }
-  })
+    // A native/CDP interrupt can publish a later sequence before this function
+    // even starts. The producer's absolute sequence owns its immutable line.
+    serializing++
+    const sequence = entry.sequence, terminal = Number(entry.phase === 'end'), started = Number(entry.phase === 'start')
+    counts.recorded++; counts.recordedOperations += terminal; counts.startedOperations += started
+    try {
+      const line = JSON.stringify(entry), length = Buffer.byteLength(line) + 1
+      queue.set(sequence, line); bytes += length
+    } catch (error) {
+      queue.set(sequence, null)
+      counts.recorded--; counts.recordedOperations -= terminal; counts.startedOperations -= started
+      counts.sourceFailures++; counts.omittedRecords++; failed(error)
+      throw error
+    } finally {
+      if (--serializing === 0) {
+        try { scheduleWrite() } finally { releaseAdmission() }
+      }
+    }
+  }
   const exit = () => { pressureWrite(); writeHealth() }
   const markIncomplete = (reason, count = 1) => {
     counts.sourceFailures++; counts.omittedRecords += Number.isSafeInteger(count) && count > 0 ? count : 0
@@ -132,7 +211,7 @@ function journalWriter(directory, sessionId, executionId, participant, hooks) {
       closing = (async () => {
         try {
           await flush()
-          while (queue.length || writing) await flush()
+          while (queue.size || writing) await flush()
         } finally {
           // Explicit renderer ACKs may be flushing concurrently with shutdown.
           // Queue descriptor closure behind every previously admitted fdatasync;
@@ -167,9 +246,8 @@ export function initializeOperationRecording({ directory = process.env.PERPETUAL
   jsonWrite(join(directory, `${participant.id}.participant.json`), participant)
   configureOperationContext({ sessionId, executionId, ...(process.env.PERPETUAL_SWAP_OPERATION_SCENARIO ? { scenarioId: process.env.PERPETUAL_SWAP_OPERATION_SCENARIO } : {}) }, process.threadCpuUsage
     ? () => { const value = process.threadCpuUsage(); return (value.user + value.system) / 1000 } : undefined)
-  const hooks = suppress(() => installOperationHooks())
-  const enabledHooks = Array.isArray(hooks) ? hooks : hooks?.enabledHooks ?? []
-  const writers = new Map([[executionId, journalWriter(directory, sessionId, executionId, participant, enabledHooks)]])
+  suppress(() => installOperationHooks())
+  const writers = new Map([[executionId, journalWriter(directory, sessionId, executionId, participant, getInstalledOperationHooks, getOperationHookCapabilities)]])
   let closed = false, closeTask
   const unsubscribe = attachOperationJournalSink(entry => {
     const writer = writers.get(entry.executionId)
@@ -178,7 +256,7 @@ export function initializeOperationRecording({ directory = process.env.PERPETUAL
   })
   const flush = async options => { await Promise.all([...writers.values()].map(writer => writer.flush(options))) }
   const exit = () => { if (!closed) { finishActiveOperations(); for (const writer of writers.values()) writer.exit() } }
-  current = { directory, sessionId, executionId, writers, enabledHooks, flush, health: () => writers.get(executionId).health(), close() {
+  current = { directory, sessionId, executionId, writers, get enabledHooks() { return getInstalledOperationHooks() }, flush, health: () => writers.get(executionId).health(), close() {
     if (!closeTask) closeTask = (async () => {
       finishActiveOperations()
       const flushed = await Promise.allSettled([...writers.values()].map(writer => writer.flush()))
@@ -211,7 +289,11 @@ export function claimExternalOperationParticipant(participantId, executionId) {
     || participant.executionId && participant.executionId !== executionId) throw new Error('Invalid external operation participant claim.')
   if (!current.writers.has(executionId)) {
     Object.assign(participant, { executionId, status: 'ready' }); jsonWrite(path, participant)
-    current.writers.set(executionId, journalWriter(current.directory, current.sessionId, executionId, participant, ['renderer-ipc', 'performance-observer']))
+    current.writers.set(executionId, journalWriter(current.directory, current.sessionId, executionId, participant, ['renderer-ipc', 'performance-observer'], () => [
+      { api: 'preload.request', enabled: true, scope: 'renderer bridge request lifecycle' },
+      { api: 'preload.notification', enabled: true, scope: 'renderer bridge event delivery' },
+      { api: 'PerformanceObserver', enabled: false, scope: 'optional browser entry types', reason: 'entry availability is browser dependent' },
+    ]))
     registerOperationImportSource(executionId, current.sessionId)
   }
   return { sessionId: current.sessionId, executionId,
@@ -221,6 +303,12 @@ export function markExternalOperationSourceIncomplete(executionId, reason, count
   current?.writers.get(executionId)?.markIncomplete(reason, count)
 }
 export function closeExternalOperationSource(executionId) { return current?.writers.get(executionId)?.close() ?? Promise.resolve() }
+/** A renderer ACK promises durability for that registered source only. */
+export async function flushExternalOperationSource(executionId) {
+  const writer = current?.writers.get(executionId)
+  if (!writer || executionId === current.executionId) throw new TypeError('Unknown external operation source.')
+  await writer.flush()
+}
 export function flushOperationRecording(options) { return current?.flush(options) ?? Promise.resolve() }
 export function closeOperationRecording() { return current?.close() ?? Promise.resolve() }
 initializeOperationRecording()

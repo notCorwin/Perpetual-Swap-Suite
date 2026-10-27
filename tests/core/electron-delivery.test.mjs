@@ -32,13 +32,13 @@ async function setup(t) {
     root, candidate, destination, revision: 'new',
     copy: (from, to) => cp(from, to, { recursive: true }),
     validate: async (path, revision) => assert.equal(await readFile(join(path, 'revision'), 'utf8'), revision),
-    smoke: async path => ({ executable: path }),
+    verify: async path => ({ executable: path }),
   }
 }
 
 test('a rejected candidate never changes the installed app', async t => {
   const options = await setup(t)
-  options.smoke = async () => { throw new Error('Candidate preload failed') }
+  options.verify = async () => { throw new Error('Candidate preload failed') }
   await assert.rejects(installApp(options), /Candidate preload failed/)
   assert.equal(await readFile(join(options.destination, 'revision'), 'utf8'), 'old')
   assert.deepEqual((await readdir(options.root)).sort(), ['candidate.app', 'installed.app'])
@@ -55,9 +55,9 @@ test('a corrupted staged copy leaves the old app intact', async t => {
   assert.deepEqual((await readdir(options.root)).sort(), ['candidate.app', 'installed.app'])
 })
 
-test('installed smoke failure restores the previous app', async t => {
+test('installed verification failure restores the previous app', async t => {
   const options = await setup(t)
-  options.smoke = async path => {
+  options.verify = async path => {
     if (path === options.destination) throw new Error('Installed worker failed')
   }
   await assert.rejects(installApp(options), /Installed worker failed/)
@@ -65,7 +65,7 @@ test('installed smoke failure restores the previous app', async t => {
   assert.deepEqual((await readdir(options.root)).sort(), ['candidate.app', 'installed.app'])
 })
 
-test('delivery validates before replacement and smokes the real destination', async t => {
+test('delivery passes candidate evidence to explicit installed verification without requiring a production launch', async t => {
   const options = await setup(t)
   const calls = []
   const validate = options.validate
@@ -74,10 +74,26 @@ test('delivery validates before replacement and smokes the real destination', as
     if (path !== options.destination) assert.equal(await readFile(join(options.destination, 'revision'), 'utf8'), 'old')
     await validate(path, revision)
   }
-  options.smoke = async path => { calls.push(['smoke', path]); return { executable: path } }
+  options.verify = async (path, revision, context) => {
+    calls.push(['verify', path])
+    assert.equal(revision, options.revision)
+    if (context.stage === 'candidate') return { sourceApp: path, testedExecutable: 'guarded-replica', productionAppLaunched: false }
+    assert.equal(context.stage, 'installed')
+    assert.equal(context.candidateVerification.testedExecutable, 'guarded-replica')
+    return { installedApp: path, candidateVerification: context.candidateVerification, productionAppLaunched: false }
+  }
   const report = await installApp(options)
-  assert.deepEqual(calls.map(([kind]) => kind), ['validate', 'smoke', 'validate', 'validate', 'smoke'])
-  assert.equal(report.executable, options.destination)
+  assert.deepEqual(calls.map(([kind]) => kind), ['validate', 'verify', 'validate', 'validate', 'verify'])
+  assert.equal(report.installedApp, options.destination)
+  assert.equal(report.productionAppLaunched, false)
   assert.equal(await readFile(join(options.destination, 'revision'), 'utf8'), 'new')
   assert.deepEqual((await readdir(options.root)).sort(), ['candidate.app', 'installed.app'])
+})
+
+test('delivery rejects a missing verification contract before copying or replacing anything', async t => {
+  const options = await setup(t)
+  delete options.verify
+  options.copy = () => assert.fail('No copy before verification is configured.')
+  await assert.rejects(installApp(options), /verification contract is required/)
+  assert.equal(await readFile(join(options.destination, 'revision'), 'utf8'), 'old')
 })

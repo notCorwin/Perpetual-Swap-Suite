@@ -1,28 +1,30 @@
-import assert from "node:assert/strict"
-import test from "node:test"
-import { reconcileMarketRows } from "./market-snapshot.ts"
-import type { NativeMarketRow } from "./market-row.ts"
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import { reconcileMarketOrder, reconcileMarketRows } from './market-snapshot.ts'
+import type { RankedMarketRow } from './desktop-contract.ts'
 
-test("bridge refreshes keep unchanged row identities while updating changed readings and opportunity", () => {
-  const previous: NativeMarketRow[] = Array.from({ length: 3 }, (_, index) => ({
-    instId: `MKT${index}`, turnover24hUSDT: 40_000_000, ema200Signal: "Long",
-    price: 100, lastPrice: 101, priceChange: 1, currentLow: 99, currentHigh: 102,
-    buy: 100, sell: 90, takerRatio: 5, oiChange: 2,
-    highBreakout: { status: "none" }, lowBreakdown: { status: "none" },
-    highBreakout96: { status: "none" }, lowBreakdown96: { status: "none" },
-    roc: 2, maroc: 1, rocChange: 1, marocChange: 0.5,
-    rsi6: 60, rsi12: 55, rsi24: 50, bollAboveBand: "middle", bollExpansion: null,
-    opportunity: { direction: "Long", setup: "Startup", status: "Candidate", score: 87, components: null, reasons: [] },
-  }))
+const row = (instId: string, lastPrice = 100): RankedMarketRow => ({ instId, lastPrice, turnover24hUSDT: 40_000_000, rankingChange: 1, rankingAsOf: 900_000 })
+
+test('navigation order identity follows membership and order rather than row prices', () => {
+  const previous = ['BTC-USDT-SWAP', 'ETH-USDT-SWAP']
+  assert.equal(reconcileMarketOrder(previous, [...previous]), previous)
+  assert.deepEqual(reconcileMarketOrder(previous, [...previous].reverse()), ['ETH-USDT-SWAP', 'BTC-USDT-SWAP'])
+  assert.deepEqual(reconcileMarketOrder(previous, ['ETH-USDT-SWAP']), ['ETH-USDT-SWAP'])
+  assert.deepEqual(reconcileMarketOrder(previous, []), [])
+})
+
+test('snapshot reconciliation preserves unchanged row identities and backend order', () => {
+  const previous = [row('BTC-USDT-SWAP'), row('ETH-USDT-SWAP')]
   assert.equal(reconcileMarketRows(previous, structuredClone(previous)), previous)
-  const incoming = structuredClone(previous)
-  incoming[1].oiChange = -4
-  incoming[2].opportunity.status = "Watch"
-  incoming[2].opportunity.score = 21
-  const next = reconcileMarketRows(previous, incoming)
-  assert.equal(next[0], previous[0])
-  assert.notEqual(next[1], previous[1])
-  assert.equal(next[1].oiChange, -4)
-  assert.equal(next[2].opportunity.score, 21)
-  assert.deepEqual(reconcileMarketRows(next, [incoming[2], incoming[0]]), [next[2], next[0]])
+  const next = reconcileMarketRows(previous, [row('ETH-USDT-SWAP', 101), row('BTC-USDT-SWAP')])
+  assert.deepEqual(next.map(value => value.instId), ['ETH-USDT-SWAP', 'BTC-USDT-SWAP'])
+  assert.equal(next[1], previous[0])
+  assert.equal(next[0].lastPrice, 101)
+  assert.notEqual(next[0], previous[1])
+})
+
+test('snapshot reconciliation applies backend membership immediately', () => {
+  const previous = [row('BTC-USDT-SWAP'), row('ETH-USDT-SWAP')]
+  assert.deepEqual(reconcileMarketRows(previous, [row('ETH-USDT-SWAP')]), [previous[1]])
+  assert.deepEqual(reconcileMarketRows(previous, []), [])
 })

@@ -38,11 +38,13 @@ test('source observations commit before candles and preserve numeric truth acros
     assert.deepEqual(await f.store.candles(query), [])
     const observations = await f.store.statistics(query)
     assert.equal(observations.length, 2)
+    assert.ok(observations.every(row => row.statisticsVersion === 11))
     assert.equal(observations[0].oi, 1_000)
     assert.equal(observations[1].statisticsOIExpiresAt, source.expiresAt)
     await f.store.appendCandles([candle(0), candle(1)])
     let [row] = await f.store.candles(query)
     assert.equal(row.oi, 1_000); assert.equal(row.sell, 10); assert.equal(row.buy, 20)
+    assert.equal(row.statisticsVersion, 11, 'Complete numeric observations use the same source format as empty observations.')
     const price = await f.store.priceWatermark(query.instrument, query.timeframe)
     await f.store.appendStatistics({ ...source, values: [] })
     await f.store.appendStatistics({ ...source, source: 'taker', values: [] })
@@ -95,6 +97,39 @@ test('a rejected batch changes neither facts nor coverage, and missing units sta
     await f.store.appendCandles([{ ...candle(0), baseVolume: null }])
     assert.equal((await f.store.candles(query))[0].baseVolume, null)
     assert.equal((await f.store.inspectCandles({ ...query, through: base })).issues[0].reason, 'missing-base-volume')
+  } finally { await f.close() }
+})
+
+test('integrity inspection finds missing volume units and verifies their persisted replacements', async () => {
+  const f = await fixture(), target = { ...query, through: base + 4 * step }
+  try {
+    await f.store.appendCandles([
+      { ...candle(0), baseVolume: null },
+      { ...candle(1), quoteVolume: null },
+      { ...candle(2), baseVolume: null, quoteVolume: null },
+      { ...candle(3), volume: 0, baseVolume: 0, quoteVolume: 0 },
+    ])
+    const inspection = await f.store.inspectCandles(target)
+    assert.equal(inspection.checkedRows, 4)
+    assert.deepEqual(inspection.issues.map(({ from, through, reason, repairable }) => ({ from, through, reason, repairable })), [
+      { from: base, through: base, reason: 'missing-base-volume', repairable: true },
+      { from: base + step, through: base + step, reason: 'missing-quote-volume', repairable: true },
+      { from: base + 2 * step, through: base + 2 * step, reason: 'missing-base-volume', repairable: true },
+      { from: base + 2 * step, through: base + 2 * step, reason: 'missing-quote-volume', repairable: true },
+      { from: base + 4 * step, through: base + 4 * step, reason: 'gap', repairable: true },
+    ])
+    assert.deepEqual(inspection.missingRanges, [{ from: base + 4 * step, through: base + 4 * step }])
+
+    await f.store.replaceCandles({ ...target, through: base + 2 * step }, [candle(0), candle(1), { ...candle(2), quoteVolume: null }])
+    assert.deepEqual((await f.store.inspectCandles({ ...target, through: base + 3 * step })).issues.map(issue => issue.reason), ['missing-quote-volume'],
+      'Persisting only part of the required units cannot certify a repaired range.')
+    await f.store.replaceCandles({ ...target, from: base + 2 * step, through: base + 2 * step }, [candle(2)])
+    await f.store.appendCandles([candle(4)])
+    const verified = await f.store.inspectCandles(target)
+    assert.equal(verified.checkedRows, 5)
+    assert.deepEqual(verified.issues, [])
+    assert.deepEqual(verified.missingRanges, [])
+    assert.deepEqual((await f.store.candles(target)).map(({ baseVolume, quoteVolume }) => [baseVolume, quoteVolume]), [[1, 100], [1, 100], [1, 100], [0, 0], [1, 100]])
   } finally { await f.close() }
 })
 

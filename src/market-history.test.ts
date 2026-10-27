@@ -5,8 +5,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MarketHistory } from '../electron/services/market-history.js'
 import { MarketStore } from '../electron/services/market-store.js'
+import { PreparedChartPipeline } from '../electron/services/prepared-chart-service.js'
 import type { CandleRecord } from '../electron/services/market-store.js'
-import type { HistoryTask } from '../electron/services/history-sync.js'
 import type { AuditJob } from '../electron/services/data-audit.js'
 
 const step = 300_000, day = 86400000, base = Date.UTC(2026, 9, 1), instId = 'BTC-USDT-SWAP'
@@ -17,13 +17,7 @@ const parseCandle = (instrument: string, timeframe: string, value: unknown[]) =>
 const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done }); return { promise, resolve } }
 const waitFor = async (condition: () => boolean) => { const deadline = performance.now() + 4000; while (!condition()) { assert.ok(performance.now() < deadline); await new Promise(resolve => setTimeout(resolve, 2)) } }
 class MemoryMetadata {
-  tasks = new Map<string, HistoryTask>(); audits = new Map<string, AuditJob>()
-  putSyncTask(task: HistoryTask) { this.tasks.set(task.id, structuredClone(task)); return task }
-  putSyncTasks(tasks: HistoryTask[]) { for (const task of tasks) this.putSyncTask(task) }
-  getSyncTask(id: string) { return this.tasks.get(id) ?? null }
-  listSyncTasks() { return [...this.tasks.values()].map(task => structuredClone(task)) }
-  deleteSyncTask(id: string) { return this.tasks.delete(id) }
-  deleteSyncTasks(ids: string[]) { for (const id of ids) this.deleteSyncTask(id) }
+  audits = new Map<string, AuditJob>()
   saveAudit(job: AuditJob) { this.audits.set(job.id, structuredClone(job)); return job }
   listAudits() { return [...this.audits.values()].map(job => structuredClone(job)) }
 }
@@ -67,6 +61,38 @@ test('native price coverage reuses durable rows and repairs only the missing slo
   assert.equal(calls.length, 1)
 })
 
+test('opening a chart repairs an outage through verified SQLite coverage and reuses it on reopening', async t => {
+  const now = Date.now(), through = Math.floor(now / step) * step - step
+  const canonical = Array.from({ length: 400 }, (_, index) => row(through - (399 - index) * step))
+  const gate = deferred()
+  const { history, store, calls } = await fixture(t, { now: () => now, listing: canonical[0].timestamp,
+    get: async (path, parameters, signal, priority) => {
+      if (path === '/market/history-candles') await gate.promise
+      return source(path, parameters, signal, priority)
+    } })
+  await store.appendCandles(canonical.slice(0, -12))
+  const pipeline: any = new PreparedChartPipeline({ store, history, normalize: value => value, revision: () => 0,
+    instrument: () => ({ listTime: canonical[0].timestamp }), streaming: () => true })
+  try {
+    await pipeline.setLive(instId, '5m', { ...row(through + step), confirmed: false }, { receivedAt: now })
+    const initial = await pipeline.local(instId, '5m')
+    assert.equal(initial.priceState, 'stale'); assert.equal(initial.realtimeState, 'live')
+    pipeline.setFocus({ instId, timeframe: '5m' })
+    const repair = pipeline.focus.task
+    gate.resolve(); await repair
+    await waitFor(() => pipeline.cached(`${instId}:5m`)?.priceState === 'ready')
+    const inspection = await store.inspectCandles({ instrument: instId, timeframe: '5m', from: through - 95 * step, through })
+    assert.deepEqual(inspection.issues, []); assert.equal(inspection.checkedRows, 96)
+    const repaired = pipeline.cached(`${instId}:5m`)
+    assert.equal(repaired.priceState, 'ready'); assert.equal(repaired.endHour, through)
+    const priceCalls = () => calls.filter(call => call.path.includes('/market/'))
+    assert.equal(priceCalls().length, 1)
+    assert.equal(priceCalls()[0].parameters.limit, 12, 'The planner must reuse the persisted part of the 96-candle viewport.')
+    await pipeline.local(instId, '5m')
+    assert.equal(priceCalls().length, 1)
+  } finally { gate.resolve(); await pipeline.dispose() }
+})
+
 test('statistics persist without price rows or a price-source request', async t => {
   const { history, store, calls } = await fixture(t)
   const result = await history.ensureStatistics(instId, '5m', base, base + 2 * step)
@@ -103,6 +129,27 @@ test('a long statistics request batches native pages and reuses numeric observat
   assert.equal(calls.length, 30)
 })
 
+test('a visible OI failure reports its first retry deadline without delaying or certifying Taker', async t => {
+  const { history, store, calls } = await fixture(t, { get: async (path, parameters, signal, priority) => {
+    if (path.includes('open-interest')) throw new Error('OI temporarily offline')
+    return source(path, parameters, signal, priority)
+  } })
+  Object.assign(history.sync, { maxAttempts: 5, retryBaseMS: 60_000, maxRetryDelayMS: 60_000 })
+  const taker = history.ensureStatistics(instId, '5m', base, base + 2 * step, 'interactive', undefined, 'taker')
+  await assert.rejects(history.ensureStatistics(instId, '5m', base, base + 2 * step, 'interactive', undefined, 'oi'), error => {
+    assert.equal((error as Error).message, 'OI temporarily offline')
+    assert.equal((error as Error & { retryAt: number }).retryAt, base + 2 * day + 60_000)
+    return true
+  })
+  await taker
+  assert.equal(calls.filter(call => call.path.includes('open-interest')).length, 1)
+  assert.equal((await store.statistics({ instrument: instId, timeframe: '5m', source: 'oi' })).length, 0, 'Request failures cannot persist absence proofs.')
+  const rows = await store.statistics({ instrument: instId, timeframe: '5m', source: 'taker' })
+  assert.equal(rows.length, 3)
+  assert.ok(rows.every(row => row.buy === 30 && row.sell === 20))
+  assert.ok(history.sync.listTasks().filter(task => task.source === 'oi').every(task => task.status === 'cancelled'))
+})
+
 test('direct empty source observations own bounded retry leases without inventing availability', async t => {
   let now = base + day
   const { history, store, calls } = await fixture(t, { now: () => now, get: async () => [] })
@@ -125,7 +172,7 @@ test('source evidence before listing is unavailable and never requested', async 
 
 test('cancellation removes only its viewport demand while another consumer completes shared price history', async t => {
   const gate = deferred(); let entered = false, sourceSignal: AbortSignal | undefined
-  const { history, metadata } = await fixture(t, { get: async (path, parameters, signal, priority) => { entered = true; sourceSignal = signal; await gate.promise; return source(path, parameters, signal, priority) } })
+  const { history } = await fixture(t, { get: async (path, parameters, signal, priority) => { entered = true; sourceSignal = signal; await gate.promise; return source(path, parameters, signal, priority) } })
   const controller = new AbortController()
   const first = history.ensurePrices(instId, '5m', base, base + 2 * step, 'foreground', controller.signal)
   const rejected = assert.rejects(first, { name: 'AbortError' })
@@ -133,7 +180,6 @@ test('cancellation removes only its viewport demand while another consumer compl
   await waitFor(() => entered); controller.abort(); await rejected
   assert.equal(sourceSignal?.aborted, false)
   gate.resolve(); assert.equal((await second).rows.length, 3)
-  assert.equal(metadata.tasks.size, 0)
 })
 
 test('malformed or conflicting direct statistics fail without certifying source coverage', async t => {
@@ -155,15 +201,14 @@ test('latest initialization publishes actual observations without inventing miss
 
 test('delisting removes finite consumer demand without deleting source facts', async t => {
   const gate = deferred()
-  const { history, metadata, store } = await fixture(t, { get: async (path, parameters, signal, priority) => { await gate.promise; signal.throwIfAborted(); return source(path, parameters, signal, priority) } })
+  const { history, store } = await fixture(t, { get: async (path, parameters, signal, priority) => { await gate.promise; signal.throwIfAborted(); return source(path, parameters, signal, priority) } })
   await store.appendCandles([row(base)])
   const task = await history.sync.enqueue({ instrument: instId, timeframe: '5m', source: 'candles', from: base + step, through: base + 2 * step })
   assert.equal(history.sync.listTasks().length, 1)
-  assert.equal(metadata.tasks.size, 0)
   const cancelled = history.sync.waitFor(task.id)
   await history.removeTargets([instId]); gate.resolve(); await history.sync.whenIdle()
   assert.equal((await cancelled).status, 'cancelled')
-  assert.equal(metadata.tasks.size, 0); assert.equal(history.sync.listTasks().length, 0)
+  assert.equal(history.sync.listTasks().length, 0)
   assert.equal((await store.coverage(instId, '5m')).count, 1)
 })
 

@@ -3,11 +3,12 @@ import { Button, buttonVariants } from '@/components/ui/button'
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Spinner } from '@/components/ui/spinner'
+import { Settings2 } from 'lucide-react'
 import { DEFAULT_ANALYSIS_MODEL } from '@/chart-analysis'
 import { requestAnalysisSettings } from '@/analysis-service'
 
 export function AnalysisSettingsButton() {
-  return <a href="#/settings/analysis" className={buttonVariants({ variant: 'outline', size: 'sm' })}>Configure analysis</a>
+  return <a href="#/settings/analysis" aria-label="Configure analysis" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}><Settings2 aria-hidden="true" /></a>
 }
 
 type AnalysisSettingsProps = {
@@ -85,14 +86,13 @@ export function AnalysisSettings({ onDirtyChange, onBusyChange }: AnalysisSettin
   return <form id="analysis-settings-form" noValidate onSubmit={event => { event.preventDefault(); void save() }} aria-busy={busy}>
     <FieldGroup>
       <Field data-disabled={busy || !loaded}>
-        <FieldLabel htmlFor="gateway-api-key">Gateway API Key</FieldLabel>
+        <FieldLabel htmlFor="gateway-api-key">Vercel AI Gateway API Key</FieldLabel>
         <Input id="gateway-api-key" name="gateway-api-key" type="password" autoComplete="off" spellCheck={false} disabled={busy || !loaded} value={key} placeholder={configured ? 'Leave blank to keep the saved key…' : 'Enter your Gateway API Key…'} onChange={event => { setKey(event.target.value); setSuccess('') }} />
-        <FieldDescription>{loaded ? configured ? 'Configured. Enter a new key to replace it.' : 'Not configured.' : 'Loading saved configuration.'} Saved locally for your macOS user. App updates keep the saved key.</FieldDescription>
       </Field>
       <Field data-invalid={modelInvalid} data-disabled={busy || !loaded}>
         <FieldLabel htmlFor="analysis-model">Model</FieldLabel>
         <Input ref={modelInput} id="analysis-model" name="analysis-model" autoComplete="off" spellCheck={false} disabled={busy || !loaded} value={model} aria-invalid={modelInvalid} onChange={event => { setModel(event.target.value); setSuccess(''); if (event.target.value.trim()) setModelInvalid(false) }} />
-        <FieldDescription>Use a Vercel AI Gateway model ID with image input support.</FieldDescription>
+        <FieldDescription>Requires image input support.</FieldDescription>
       </Field>
       {error && <FieldError>{error}</FieldError>}
       {success && <FieldDescription role="status">{success}</FieldDescription>}

@@ -57,9 +57,8 @@ const fixture = async (now: number, options: { webSocketFactory?: WebSocketFacto
   // Measure qualification renewal independently of automatic chart-history preparation.
   service.preparedCharts.setRealtimeSubscriptions = () => undefined
   await service.ready
-  service.projectListEntry = async () => null
+  service.preparedCharts.setUniverse = () => ({ frames: [] })
   service.updateRanking = async () => undefined
-  service.scheduleListProjection = () => undefined
   const ensurePrices = service.history.ensurePrices.bind(service.history)
   service.history.ensurePrices = async () => { throw new Error('Complete durable qualification data must not need acquisition.') }
   service.scheduleRefresh = () => undefined
@@ -262,10 +261,11 @@ test('temporarily expired qualification retains the confirmed-candle feeds neede
   try {
     const subscriptions = () => [...f.service.realtime.subscriptions.values()].map(value => `${value.instId}:${value.timeframe}`).sort()
     const before = subscriptions()
-    assert.deepEqual(before, ['15m', '1H', '5m'].map(timeframe => `${instId}:${timeframe}`))
+    assert.deepEqual(before, [`${instId}:5m`])
     now = f.asOf + fiveMinutes
     const expired = await f.service.snapshot()
-    assert.deepEqual(expired.rows, [], 'Expired qualification cannot remain in the eligible list.')
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false, 'Expired source leases invalidate strict qualification immediately.')
+    assert.deepEqual(expired.rows.map(row => row.instId), [instId], 'The published list keeps its last qualified contract during the 30-second removal buffer.')
     assert.equal(expired.catalogProgress.unknown, 1)
     assert.deepEqual(subscriptions(), before, 'A previously qualified contract must keep receiving final candles while its observations renew.')
     f.assertLocalOnly()
@@ -293,7 +293,8 @@ for (const outcome of ['confirmed', 'failed'] as const) test(`a 5m deadline repo
     context.mock.timers.tick(deadline - Date.now())
     await requested
     const pending = await f.service.snapshot()
-    assert.deepEqual(pending.rows, [], 'The expired rolling window cannot keep a contract qualified.')
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false, 'A pending rolling-window check is not strict qualification.')
+    assert.deepEqual(pending.rows.map(row => row.instId), [instId], 'The UI list remains buffered while the strict recheck is pending.')
     assert.equal(pending.catalogProgress.unknown, 1)
     assert.equal(pending.catalogProgress.pending, 1)
     assert.equal(pending.loading, true)
@@ -313,7 +314,8 @@ for (const outcome of ['confirmed', 'failed'] as const) test(`a 5m deadline repo
       await waitFor(() => f.service.error === 'OKX candle history unavailable.')
       const failed = await f.service.snapshot()
       assert.equal(failed.error, 'OKX candle history unavailable.', 'A real source error must remain visible even while retries are scheduled.')
-      assert.deepEqual(failed.rows, [])
+      assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false, 'Failed acquisition cannot preserve strict eligibility.')
+      assert.deepEqual(failed.rows.map(row => row.instId), [instId], 'Published rows remain buffered during the removal window after acquisition failure.')
       assert.notEqual(f.service.observations.get(instId)?.turnover?.value.asOf, deadline)
     }
     f.assertLocalOnly()
@@ -329,10 +331,11 @@ test('the next durable final candle immediately restores the exact rolling turno
     const metadataLease = structuredClone(f.service.instrumentObservations.get(instId))
     f.enableLocalUpdates()
     now = f.asOf + fiveMinutes + 1
-    assert.deepEqual((await f.service.snapshot()).rows, [])
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false)
+    assert.deepEqual((await f.service.snapshot()).rows.map(row => row.instId), [instId], 'The expired contract remains visible in the temporary list buffer.')
     await f.service.persistCandles(instId, [candle(f.asOf, 400_000)])
     await waitFor(() => f.service.catalog.get(instId)?.result.turnover === 57_800_000)
-    assert.deepEqual(f.service.listRowsFor('15m').map(row => row.instId), [instId])
+    assert.deepEqual(f.service.listRowsFor().map(row => row.instId), [instId])
     const turnover = f.service.metadata.getCatalogEntry(instId).observations.turnover
     assert.equal(turnover.value.asOf, f.asOf + fiveMinutes)
     assert.equal(turnover.value.turnover, 57_800_000, 'Drop the oldest 200,000 and add the newly completed 400,000 quote volume.')
@@ -354,7 +357,8 @@ test('a durable historical volume correction immediately applies the resulting q
     f.enableLocalUpdates()
     await f.service.persistCandles(instId, [candle(f.asOf - fiveMinutes, 0)])
     await waitFor(() => f.service.catalogChecks.get(instId)?.status === 'failed')
-    assert.deepEqual(f.service.listRowsFor('15m'), [])
+    assert.equal(f.service.validCatalogEntry(f.service.catalog.get(instId)), false, 'A failed volume check removes strict eligibility immediately.')
+    assert.deepEqual(f.service.listRowsFor().map(row => row.instId), [instId], 'Published rows retain the formerly qualified contract for 30 seconds.')
     assert.equal(f.service.metadata.getCatalogEntry(instId).result.turnover, 57_400_000)
     assert.equal(f.service.renewalTargets.has(instId), false, 'A verified condition failure must stop priority renewal.')
     assert.deepEqual(f.sourcesBefore(), sources)

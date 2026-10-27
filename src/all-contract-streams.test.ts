@@ -65,7 +65,7 @@ class Socket extends EventTarget implements RealtimeWebSocket {
   }
 }
 
-const fixture = async (config: ReturnType<typeof preferences>, fetcher: typeof fetch) => {
+const fixture = async (config: ReturnType<typeof preferences>, fetcher: typeof fetch, autoStart = true) => {
   const root = await mkdtemp(join(tmpdir(), 'perp-all-contract-streams-'))
   const store = await MarketStore.open(root)
   const sockets = new Map<string, Socket[]>()
@@ -76,15 +76,13 @@ const fixture = async (config: ReturnType<typeof preferences>, fetcher: typeof f
       return socket
     },
   })
-  // Raw collection assertions exclude independent chart-history preparation.
-  service.preparedCharts.setRealtimeSubscriptions = () => undefined
+  // Keep chart source membership visible without admitting historical work.
   await service.ready
-  service.projectListEntry = async () => null
+  service.preparedCharts.setUniverse = () => ({ frames: [] })
   service.updateRanking = async () => undefined
-  service.scheduleListProjection = () => undefined
   for (const lane of service.requestLanes.values()) lane.interval = 0
-  service.publicRealtime.start()
-  service.realtime.start()
+  const start = () => { service.publicRealtime.start(); service.realtime.start() }
+  if (autoStart) start()
   const idle = async () => {
     await Promise.all([service.publicRealtime.whenIdle(), service.realtime.whenIdle()])
     await setImmediate()
@@ -101,7 +99,7 @@ const fixture = async (config: ReturnType<typeof preferences>, fetcher: typeof f
   }
   const discover = () => service.discoverInstruments(service.catalogCriteriaKey(), new AbortController().signal, 'foreground')
   const close = async () => { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
-  return { service, store, sockets, idle, open, subscriptions, push, discover, close }
+  return { service, store, sockets, idle, open, subscriptions, push, discover, close, start }
 }
 
 test('discovery subscribes candidates including failed and unknown filters without starting a bulk archive', async () => {
@@ -123,8 +121,11 @@ test('discovery subscribes candidates including failed and unknown filters witho
     await discovery
     await f.open()
     const ids = instruments.map(value => value.instId)
-    assert.deepEqual(f.subscriptions(OKX_BUSINESS_WEBSOCKET_URL), ids.flatMap(instId => ['5m', '15m', '1H'].map(frame => `candle${frame}:${instId}`)).sort())
-    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), ids.flatMap(instId => ['tickers', 'open-interest', 'books', 'trades'].map(channel => `${channel}:${instId}`)).sort())
+    assert.deepEqual(f.subscriptions(OKX_BUSINESS_WEBSOCKET_URL), ids.map(instId => `candle5m:${instId}`).sort())
+    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), ids.flatMap(instId => ['tickers', 'open-interest'].map(channel => `${channel}:${instId}`)).sort())
+    assert.deepEqual([...f.service.realtime.subscriptions.keys()].sort(), ids.map(instId => `5m:${instId}`).sort())
+    assert.equal(f.service.preparedCharts.realtimeKeys.size, ids.length * 3)
+    for (const instId of ids) for (const timeframe of ['5m', '15m', '1H']) assert.ok(f.service.preparedCharts.realtimeKeys.has(`${instId}:${timeframe}`))
     assert.deepEqual(f.service.history.sync.listTasks(), [], 'Discovery must not start bulk history downloads.')
     assert.equal(f.service.catalog.size, 0)
     assert.deepEqual(paths, ['/api/v5/public/instruments'])
@@ -143,16 +144,21 @@ test('a streamed ticker changes every published list price without waiting for h
   })
   try {
     await f.service.refresh(); await f.open()
-    for (const frame of ['5m', '15m', '1H']) f.service.ensureListRows(frame)
-    assert.equal(f.service.listRowsFor('15m')[0]?.lastPrice, 100)
+    assert.equal(f.service.listRowsFor()[0]?.lastPrice, 100)
     let reads = 0
     f.store.candles = async () => { reads += 1; throw new Error('A ticker must not read history.') }
     f.service.history.ensurePrices = async () => { reads += 1; throw new Error('A ticker must not repair history.') }
-    const before = requests
+    const before = requests, snapshot = await f.service.snapshot()
+    let events = 0
+    const unsubscribe = f.service.subscribeMarket(() => { events++ })
     f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'tickers', [ticker(value.instId, 200)])
     await f.idle()
     assert.ok(f.service.streamQualifications.has(value.instId), 'The price must publish before the deferred screening batch runs.')
-    for (const frame of ['5m', '15m', '1H'] as const) assert.equal(f.service.listRowsFor(frame)[0]?.lastPrice, 200)
+    assert.equal(f.service.listRowsFor()[0]?.lastPrice, 200)
+    await waitFor(() => events > 0)
+    unsubscribe()
+    const changed = await f.service.snapshot({ sinceRevision: snapshot.revision, serviceSession: snapshot.serviceSession })
+    assert.equal('rows' in changed && changed.rows[0]?.lastPrice, 200)
     assert.equal(reads, 0)
     assert.equal(requests, before)
   } finally { await f.close() }
@@ -178,7 +184,7 @@ test('a previously failing contract is requalified by the 100ms stream batch wit
     assert.equal(f.service.catalog.has(value.instId), false, 'Raw callbacks defer expensive qualification into one shared batch.')
     await waitFor(() => f.service.catalog.has(value.instId))
     assert.equal(f.service.catalogChecks.get(value.instId)?.status, 'verified')
-    assert.equal(f.service.listRowsFor('15m')[0]?.lastPrice, 200)
+    assert.equal(f.service.listRowsFor()[0]?.lastPrice, 200)
     assert.equal(requests, before)
   } finally { await f.close() }
 })
@@ -192,17 +198,20 @@ test('delayed REST ticker and book responses cannot regress newer WebSocket obse
     if (path.endsWith('/market/tickers')) { tickerStarted = true; await tickerGate.promise; return response([ticker(value.instId)]) }
     if (path.endsWith('/market/books')) { bookStarted = true; await bookGate.promise; return response([{ asks: [['100', '1']], bids: [['99.99', '1']] }]) }
     throw new Error(`Unexpected endpoint: ${path}`)
-  })
+  }, false)
   let checking: Promise<unknown> | undefined
   try {
-    await f.discover(); await f.open()
+    await f.discover()
     const signal = new AbortController().signal
     checking = Promise.all([
       f.service.tickerObservations(signal, 'foreground', true),
       f.service.checkCandidate(value, f.service.prefs().liquidity, f.service.catalogCriteriaKey(), signal),
     ])
     await waitFor(() => tickerStarted && bookStarted)
+    f.start(); await f.open()
     f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'tickers', [ticker(value.instId, 200)])
+    await f.idle(); f.service.flushStreamQualifications()
+    await waitFor(() => f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL).includes(`books:${value.instId}`))
     f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'books', [{ asks: [['200', '200001']], bids: [['199.99', '200001']], ts: String(Date.now()), seqId: 99, prevSeqId: -1 }], 'snapshot')
     await f.idle()
     const observations = f.service.observations.get(value.instId)
@@ -214,11 +223,11 @@ test('delayed REST ticker and book responses cannot regress newer WebSocket obse
     assert.equal(f.service.observations.get(value.instId).ticker, streamTicker)
     assert.equal(f.service.observations.get(value.instId).book, streamBook)
     assert.equal(f.service.catalogChecks.get(value.instId)?.status, 'verified')
-    assert.equal(f.service.listRowsFor('15m')[0]?.lastPrice, 200)
+    assert.equal(f.service.listRowsFor()[0]?.lastPrice, 200)
   } finally { tickerGate.resolve(); bookGate.resolve(); await checking; await f.close() }
 })
 
-test('delisting removes every public and candle subscription, including a previously selected chart', async () => {
+test('delisting removes candidate streams while derived chart periods keep only the 5m source', async () => {
   let instruments = [instrument(), instrument('ETH')]
   const f = await fixture(preferences('spread'), async input => {
     const path = new URL(String(input)).pathname
@@ -229,13 +238,62 @@ test('delisting removes every public and candle subscription, including a previo
   try {
     await f.service.refresh(); await f.open()
     const removed = instruments[1].instId
-    f.service.chartSubscriptions = [{ instId: removed, timeframe: '1H' }]
     instruments = instruments.slice(0, 1)
     await f.discover(); await f.idle()
-    assert.deepEqual(f.subscriptions(OKX_BUSINESS_WEBSOCKET_URL), ['candle1H:BTC-USDT-SWAP', 'candle15m:BTC-USDT-SWAP', 'candle5m:BTC-USDT-SWAP'].sort())
-    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), ['books:BTC-USDT-SWAP', 'open-interest:BTC-USDT-SWAP', 'tickers:BTC-USDT-SWAP', 'trades:BTC-USDT-SWAP'].sort())
+    assert.deepEqual(f.subscriptions(OKX_BUSINESS_WEBSOCKET_URL), ['candle5m:BTC-USDT-SWAP'])
+    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), ['open-interest:BTC-USDT-SWAP', 'tickers:BTC-USDT-SWAP', 'trades:BTC-USDT-SWAP'].sort())
     assert.equal(f.service.catalog.has(removed), false)
     assert.equal(f.service.renewalTargets.has(removed), false)
+  } finally { await f.close() }
+})
+
+test('liquidity settings retain books while either dependent rule is enabled and toggle only that channel', async () => {
+  const instruments = [instrument(), instrument('ETH')], config = preferences('spread', 'depth', 'slippage'), paths: string[] = []
+  const f = await fixture(config, async input => {
+    const path = new URL(String(input)).pathname
+    paths.push(path)
+    assert.ok(path.endsWith('/public/instruments'))
+    return response(instruments)
+  })
+  try {
+    await f.discover(); await f.open()
+    const ids = instruments.map(value => value.instId), socket = f.sockets.get(OKX_PUBLIC_WEBSOCKET_URL)![0]
+    for (const id of ids) f.push(OKX_PUBLIC_WEBSOCKET_URL, id, 'tickers', [ticker(id)])
+    await f.idle(); f.service.flushStreamQualifications(); await f.idle()
+    await waitFor(() => ids.every(id => f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL).includes(`books:${id}`)))
+    const initialCommands = socket.sent.length
+    const stable = [...f.service.publicRealtime.subscriptions].filter(([, value]) => value.channel !== 'books')
+    const candles = f.subscriptions(OKX_BUSINESS_WEBSOCKET_URL)
+    let previous = structuredClone(config)
+    config.liquidity.depth.enabled = false
+    await f.service.reconfigure(previous); await f.idle()
+    assert.equal(socket.sent.length, initialCommands, 'Slippage still needs the resident books subscription.')
+    for (const id of ids) f.push(OKX_PUBLIC_WEBSOCKET_URL, id, 'tickers', [{ ...ticker(id), bidPx: '99' }])
+    await f.idle(); f.service.flushStreamQualifications(); await f.idle()
+    assert.ok(ids.every(id => f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL).includes(`books:${id}`)), 'A failed cheap check uses book retirement grace.')
+    previous = structuredClone(config)
+    config.liquidity.slippage.enabled = false
+    await f.service.reconfigure(previous); await f.idle()
+    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), ids.flatMap(instId => ['tickers', 'open-interest'].map(channel => `${channel}:${instId}`)).sort())
+    assert.deepEqual(f.subscriptions(OKX_BUSINESS_WEBSOCKET_URL), candles)
+    for (const [key, value] of stable) assert.equal(f.service.publicRealtime.subscriptions.get(key), value)
+    previous = structuredClone(config)
+    config.liquidity.depth.enabled = true
+    await f.service.reconfigure(previous); await f.idle()
+    for (const id of ids) f.push(OKX_PUBLIC_WEBSOCKET_URL, id, 'tickers', [ticker(id)])
+    await f.idle(); f.service.flushStreamQualifications(); await f.idle()
+    await waitFor(() => ids.every(id => f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL).includes(`books:${id}`)))
+    for (const instId of ids) assert.ok(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL).includes(`books:${instId}`))
+    for (const [key, value] of stable) assert.equal(f.service.publicRealtime.subscriptions.get(key), value)
+    const controls = socket.sent.slice(initialCommands).map(value => JSON.parse(value))
+    assert.equal(controls.filter(command => command.op === 'unsubscribe').length, 1)
+    assert.equal(controls.filter(command => command.op === 'subscribe').length, 1)
+    assert.ok(controls.every(command => command.args.every((arg: Subscription) => arg.channel === 'books')))
+    f.push(OKX_PUBLIC_WEBSOCKET_URL, ids[0], 'books', [deepBook(200, '1000', 100)], 'snapshot')
+    await f.idle()
+    assert.equal(f.service.observations.get(ids[0]).book.value.seqId, 100)
+    assert.deepEqual(paths, ['/api/v5/public/instruments'])
+    assert.equal(f.sockets.get(OKX_PUBLIC_WEBSOCKET_URL)?.length, 1)
   } finally { await f.close() }
 })
 
@@ -250,6 +308,10 @@ test('forming OI updates remain in memory and a mid-period trade subscription ne
   })
   try {
     await f.discover(); await f.open()
+    f.service.preparedCharts.prepareFocus = async () => null
+    f.service.preparedCharts.setFocus({ instId: value.instId, timeframe: '15m' }, 'forming-statistics-focus')
+    await waitFor(() => f.service.publicRealtime.subscriptions.has(`trades:${value.instId}`))
+    await f.idle()
     const raw = [String(start), '100', '101', '99', '100', '7', '0.07', '7', '0']
     f.push(OKX_BUSINESS_WEBSOCKET_URL, value.instId, 'candle5m', [raw])
     await f.idle()
@@ -282,6 +344,8 @@ test('fresh 400-level books are qualified asynchronously without exact book arit
       return synchronous(input)
     }
     f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'tickers', [ticker(value.instId)])
+    await f.idle(); f.service.flushStreamQualifications()
+    await waitFor(() => f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL).includes(`books:${value.instId}`))
     f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'books', [deepBook()], 'snapshot')
     await f.idle()
     f.service.flushStreamQualifications()
@@ -300,25 +364,30 @@ test('an older asynchronous depth result cannot replace a newer streamed list pr
   const f = await fixture(preferences('spread', 'depth'), async input => {
     const path = new URL(String(input)).pathname
     if (path.endsWith('/public/instruments')) return response([value])
-    if (path.endsWith('/market/tickers')) return response([ticker(value.instId)])
-    if (path.endsWith('/market/books')) return response([deepBook()])
     throw new Error(`Unexpected endpoint: ${path}`)
   })
   try {
-    await f.service.refresh(); await f.open()
+    await f.discover(); await f.open()
+    f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'tickers', [ticker(value.instId)])
+    await f.idle(); f.service.flushStreamQualifications(); await f.idle()
+    await waitFor(() => f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL).includes(`books:${value.instId}`))
+    f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'books', [deepBook()], 'snapshot')
+    await f.idle(); f.service.flushStreamQualifications()
+    await waitFor(() => f.service.catalog.has(value.instId))
+    await f.service.streamLiquidity?.close()
     let captured: LiquidityInput | undefined
     f.service.streamLiquidity = { evaluate: async (input: LiquidityInput) => { captured = input; await gate.promise; return evaluateLiquidity(input) }, close: async () => { gate.resolve() } }
     f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'tickers', [ticker(value.instId, 200)])
-    f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'books', [deepBook(200)], 'snapshot')
+    f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'books', [deepBook(200, '1000', 2)], 'snapshot')
     await f.idle(); f.service.flushStreamQualifications()
     assert.equal(captured?.ticker?.last, '200')
     const evaluation = f.service.streamEvaluations.get(value.instId)
     f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'tickers', [ticker(value.instId, 300)])
     await f.idle()
-    assert.equal(f.service.listRowsFor('15m')[0]?.lastPrice, 300)
+    assert.equal(f.service.listRowsFor()[0]?.lastPrice, 300)
     gate.resolve(); await evaluation
     assert.equal(f.service.catalog.get(value.instId).ticker.last, '300')
-    assert.equal(f.service.listRowsFor('15m')[0]?.lastPrice, 300)
+    assert.equal(f.service.listRowsFor()[0]?.lastPrice, 300)
   } finally { gate.resolve(); await f.close() }
 })
 
@@ -336,6 +405,8 @@ for (const change of ['contract units', 'preferences', 'completed history'] as c
     let captured: LiquidityInput | undefined
     f.service.streamLiquidity = { evaluate: async (input: LiquidityInput) => { captured = input; await gate.promise; return evaluateLiquidity(input) }, close: async () => { gate.resolve() } }
     f.push(OKX_PUBLIC_WEBSOCKET_URL, current.instId, 'tickers', [ticker(current.instId)])
+    await f.idle(); f.service.flushStreamQualifications()
+    await waitFor(() => f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL).includes(`books:${current.instId}`))
     f.push(OKX_PUBLIC_WEBSOCKET_URL, current.instId, 'books', [deepBook()], 'snapshot')
     await f.idle(); f.service.flushStreamQualifications()
     assert.ok(captured)
@@ -367,6 +438,8 @@ test('worker results preserve original book leases, evaluate the newest queued b
       close: async () => { for (const gate of gates) gate.resolve() },
     }
     f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'tickers', [ticker(value.instId)])
+    await f.idle(); f.service.flushStreamQualifications()
+    await waitFor(() => f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL).includes(`books:${value.instId}`))
     f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'books', [deepBook()], 'snapshot')
     await f.idle(); f.service.flushStreamQualifications()
     const evaluation = f.service.streamEvaluations.get(value.instId)
@@ -438,6 +511,10 @@ test('delisting and relisting reset trade coverage and OI even when the candle p
   try {
     await f.discover(); await f.open()
     const id = instruments[0].instId
+    f.service.preparedCharts.prepareFocus = async () => null
+    f.service.preparedCharts.setFocus({ instId: id, timeframe: '5m' }, 'delisting-trade-coverage')
+    await waitFor(() => f.service.publicRealtime.subscriptions.has(`trades:${id}`))
+    await f.idle()
     const raw = (volume: number) => [String(start), '100', '101', '99', '100', String(volume), String(volume / 100), String(volume), '0']
     now += 10
     f.push(OKX_PUBLIC_WEBSOCKET_URL, id, 'trades', [{ instId: id, tradeId: '1', side: 'buy', sz: '2', ts: String(now) }])
@@ -461,29 +538,38 @@ test('delisting and relisting reset trade coverage and OI even when the candle p
 })
 
 test('a confirmed candle requests its exact statistics slot while subsequent forming candles continue', async () => {
-  const value = instrument(), gate = deferred(), calls: unknown[][] = []
+  const values = [instrument(), instrument('ETH')], focused = values[0], gate = deferred(), calls: unknown[][] = []
   const f = await fixture(preferences(), async input => {
     assert.ok(new URL(String(input)).pathname.endsWith('/public/instruments'))
-    return response([value])
+    return response(values)
   })
   try {
     await f.discover(); await f.open()
+    f.service.preparedCharts.prepareFocus = async () => null
+    f.service.preparedCharts.setFocus({ instId: focused.instId, timeframe: '5m' }, 'confirmed-statistics-focus')
+    await waitFor(() => f.service.publicRealtime.subscriptions.has(`trades:${focused.instId}`))
+    await f.idle()
+    assert.deepEqual([...f.service.publicRealtime.subscriptions].filter(([, value]) => value.channel === 'trades').map(([, value]) => value.instId), [focused.instId])
     let finished = false
     f.service.history.ensureStatistics = async (...args: unknown[]) => { calls.push(args); await gate.promise; finished = true; return { rows: [] } }
     const now = Math.floor(Date.now() / fiveMinutes) * fiveMinutes, closed = now - fiveMinutes
     const raw = (time: number, price: number, volume: number, confirmed = false) => [String(time), '100', '105', '95', String(price), String(volume), String(volume / 100), String(volume), confirmed ? '1' : '0']
-    f.push(OKX_BUSINESS_WEBSOCKET_URL, value.instId, 'candle5m', [raw(closed, 101, 1, true), raw(now, 102, 1)])
+    for (const [index, value] of values.entries()) {
+      f.push(OKX_BUSINESS_WEBSOCKET_URL, value.instId, 'candle5m', [raw(closed, 101 + index, 1, true), raw(now, 102 + index, 1)])
+    }
     await f.idle()
-    assert.equal(calls.length, 1)
-    assert.deepEqual(calls[0].slice(0, 5), [value.instId, '5m', closed, closed, 'continuity'])
+    await waitFor(() => calls.length === 1)
+    await new Promise(resolve => setTimeout(resolve, 275))
+    assert.equal(calls.length, 1, 'An unqualified and unfocused candidate must not start statistics archive work.')
+    assert.deepEqual(calls[0].slice(0, 5), [focused.instId, '5m', closed, closed, 'continuity'])
     assert.ok(calls[0][5] instanceof AbortSignal)
     assert.equal(finished, false)
-    assert.equal(f.service.liveCandles.get(`${value.instId}:5m`).close, 102)
-    f.push(OKX_BUSINESS_WEBSOCKET_URL, value.instId, 'candle5m', [raw(now, 103, 2)])
+    assert.equal(f.service.liveCandles.get(`${focused.instId}:5m`).close, 102)
+    f.push(OKX_BUSINESS_WEBSOCKET_URL, focused.instId, 'candle5m', [raw(now, 103, 2)])
     await f.idle()
-    assert.equal(f.service.liveCandles.get(`${value.instId}:5m`).close, 103)
+    assert.equal(f.service.liveCandles.get(`${focused.instId}:5m`).close, 103)
     assert.equal(finished, false)
-    const durable = await f.store.candles({ instrument: value.instId, timeframe: '5m' })
+    const durable = await f.store.candles({ instrument: focused.instId, timeframe: '5m' })
     assert.deepEqual(durable.map(row => [row.timestamp, row.confirmed]), [[closed, true]])
   } finally { gate.resolve(); await f.close() }
 })

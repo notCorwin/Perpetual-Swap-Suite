@@ -1,20 +1,9 @@
-import type { ChartTimeframe, Preferences, PreferencesPatch } from './preferences.js'
+import type { Preferences, PreferencesPatch } from './preferences.js'
 export type { ChartTimeframe, Preferences, PreferencesPatch } from './preferences.js'
 export { DEFAULT_PREFERENCES, validatePreferences } from './preferences.js'
 export type SettingsSnapshot = { schemaVersion: 1; revision: number; preferences: Preferences }
 export type JSONValue = string | number | boolean | null | JSONValue[] | { [key: string]: JSONValue }
 export type AnalysisSettings = { model?: string; apiKey?: string; [key: string]: JSONValue | undefined }
-export type SyncTaskRecord = {
-  id: string
-  schemaVersion?: 1
-  instrument: string
-  timeframe: ChartTimeframe
-  source: string
-  from: number
-  through: number
-  status: 'queued' | 'running' | 'retry' | 'paused' | 'cancelled' | 'completed' | 'unavailable' | 'failed'
-  [key: string]: unknown
-}
 export type AuditRecord = {
   id: string
   schemaVersion?: 1
@@ -37,7 +26,7 @@ export class SettingsRevisionConflictError extends Error {
   readonly expectedRevision: number
   readonly actualRevision: number
 }
-/** SQLite stores mutable metadata only. Completed candles remain in Parquet. */
+/** SQLite stores settings, audits, catalog entries, and manual download reports. */
 export class MetadataStore {
   private constructor(database: unknown)
   static open(root: string, options?: { legacySettingsPath?: string }): Promise<MetadataStore>
@@ -48,12 +37,6 @@ export class MetadataStore {
   getAnalysisSettings(): AnalysisSettings
   /** Main process only. */
   updateAnalysisSettings(patch: AnalysisSettings): AnalysisSettings
-  putSyncTask<T extends SyncTaskRecord>(task: T): T
-  putSyncTasks<T extends SyncTaskRecord>(tasks: T[]): T[]
-  getSyncTask(id: string): SyncTaskRecord | null
-  listSyncTasks(): SyncTaskRecord[]
-  deleteSyncTask(id: string): boolean
-  deleteSyncTasks(ids: string[]): number
   saveAudit<T extends AuditRecord>(audit: T): T
   getAudit(id: string): AuditRecord | null
   listAudits(): AuditRecord[]

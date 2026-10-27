@@ -27,6 +27,21 @@ export function chartPriceLabelLayout(priceY: number, panel: Range, fontSize: nu
   }
 }
 
+export function chartContentClip(layout: ReturnType<typeof chartLayout>, height: number) {
+  const top = layout.panels.price[0]
+  return { x: layout.columns.price[0], y: top, width: Math.max(0, layout.right - layout.columns.price[0]), height: Math.max(0, height - top) }
+}
+
+export function chartPanelClip(layout: ReturnType<typeof chartLayout>, panel: ChartPanel, horizontalOverscan = 0) {
+  const overscan = Number.isFinite(horizontalOverscan) ? Math.max(0, horizontalOverscan) : 0
+  return {
+    x: layout.columns[panel][0] - overscan,
+    y: layout.panels[panel][0],
+    width: Math.max(0, layout.columns[panel][1] - layout.columns[panel][0] + 2 * overscan),
+    height: Math.max(0, layout.panels[panel][1] - layout.panels[panel][0]),
+  }
+}
+
 export function chartLayout(width: number, height: number, labelGutter = 64) {
   const rightMargin = 4, top = 4, headerHeight = 24, rowGap = 3, bottomAxis = 22
   const right = width - rightMargin - labelGutter, column: Range = [0, right]

@@ -9,7 +9,6 @@ test('maintenance is bounded while continuity and interactive work retain indepe
   let release!: () => void
   const gate = new Promise<void>(resolve => { release = resolve })
   const sync = new HistorySync({
-    metadata: { listSyncTasks() { return [] }, deleteSyncTask() {} },
     store: { async missingCandleRanges(query) { return covered.has(`${query.source}:${query.instrument}`) ? [] : [{ from: query.from, through: query.through }] } },
     write(records, task) { for (const row of records) covered.add(`${task.source}:${row.instrument}`) },
     maxConcurrentTasks: 3, maxConcurrentPerSource: { candles: 2, oi: 1 },

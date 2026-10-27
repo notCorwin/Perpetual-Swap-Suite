@@ -5,8 +5,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
+import { gzipSync } from 'node:zlib'
+import { encodeOperationJournal, operationJournalSuffix } from '../../electron/services/operation-journal.js'
+import { writeBuildReuseManifest } from '../../scripts/build-artifact-reuse.mjs'
 import { operationReportHasFailures, operationReportMarkdown, summarizeOperations } from '../../scripts/operation-report.mjs'
-import { sandboxCoverage } from '../../scripts/test-sandbox.mjs'
+import { sandboxCommands, sandboxCoverage } from '../../scripts/test-sandbox.mjs'
 
 const event = (overrides = {}) => ({ schemaVersion: 2, phase: 'end', id: 'execution:1', traceId: 'trace:1', sessionId: 'session', executionId: 'execution',
   category: 'cpu', name: 'indicators.replay', resource: 'BTC-USDT-SWAP', startedAt: 1_700_000_000_000, durationMS: 4, status: 'ok', attributes: {}, ...overrides })
@@ -14,13 +17,82 @@ const lifecycle = events => events.flatMap((value, index) => [
   { ...value, phase: 'start', sequence: index * 2 + 1, durationMS: 0, status: 'running', cpuTimeMS: undefined },
   { ...value, sequence: index * 2 + 2 },
 ])
+
+test('dedicated GPU discovery and policies cannot silently weaken or enter functional suites', async () => {
+  const gpu = sandboxCoverage('gpu')
+  assert.deepEqual(gpu.graphics, { policy: 'auto', provider: 'chromium' })
+  assert.ok(gpu.requireRoles.includes('node') && gpu.requireRoles.includes('electron-main'))
+  assert.ok(!gpu.requireRoles.includes('prepared-chart'), 'Confirmed unsupported hosts do not require workers they never exercised.')
+  assert.deepEqual(sandboxCoverage('all').graphics, gpu.graphics)
+  assert.equal(sandboxCoverage('e2e').graphics, undefined)
+  assert.deepEqual(sandboxCoverage('gpu', { graphicsPolicy: 'require-hardware-timing', graphicsProvider: 'metal' }).graphics,
+    { policy: 'require-hardware-timing', provider: 'metal' })
+  assert.throws(() => sandboxCoverage('gpu', { graphicsPolicy: 'require-hardware-timing' }), /requires --metal/)
+  assert.throws(() => sandboxCoverage('e2e', { graphicsProvider: 'metal' }), /gpu or all/)
+  const dedicated = await sandboxCommands('gpu'), functional = await sandboxCommands('e2e'), all = await sandboxCommands('all')
+  assert.ok(dedicated.at(-1).some(value => value.endsWith('graphics.gpu.mjs')))
+  assert.ok(!functional.flat().some(value => value.endsWith('.gpu.mjs')))
+  assert.ok(all.at(-1).some(value => value.endsWith('graphics.gpu.mjs')))
+  assert.equal(all.filter(command => command.join(' ').includes('npm run build')).length, 1)
+})
+
+test('renderer suites reuse only a currently valid build manifest and reject stale renderer files', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'sandbox-build-reuse-'))
+  const manifestPath = '.build/renderer.json'
+  try {
+    await mkdir(join(root, 'src'), { recursive: true })
+    await mkdir(join(root, 'dist'), { recursive: true })
+    await mkdir(join(root, 'tests/e2e'), { recursive: true })
+    await writeFile(join(root, 'package.json'), '{"scripts":{"build":"vite build"}}\n')
+    await writeFile(join(root, 'package-lock.json'), '{"lockfileVersion":3}\n')
+    await writeFile(join(root, '.nvmrc'), '24.22.0\n')
+    await writeFile(join(root, 'src/entry.tsx'), 'export {}\n')
+    await writeFile(join(root, 'dist/index.html'), '<main></main>\n')
+    await writeFile(join(root, 'tests/e2e/fixture.e2e.mjs'), 'export {}\n')
+    await writeFile(join(root, 'tests/e2e/fixture.gpu.mjs'), 'export {}\n')
+    await writeBuildReuseManifest({ root, manifestPath })
+
+    const e2e = await sandboxCommands('e2e', [], { root, reuseBuildManifest: manifestPath })
+    const gpu = await sandboxCommands('gpu', [], { root, reuseBuildManifest: manifestPath })
+    assert.equal(e2e.length, 1, 'A valid manifest lets E2E consume the renderer build without a second build command.')
+    assert.equal(gpu.length, 1, 'A valid manifest lets GPU consume the same renderer build without a second build command.')
+    assert.ok(e2e[0].includes('tests/e2e/fixture.e2e.mjs'))
+    assert.ok(gpu[0].includes('tests/e2e/fixture.gpu.mjs'))
+    assert.ok(!e2e.flat().includes('build') && !gpu.flat().includes('build'))
+
+    await writeFile(join(root, 'dist/index.html'), '<main>changed</main>\n')
+    await assert.rejects(sandboxCommands('gpu', [], { root, reuseBuildManifest: manifestPath }), /output changed or is incomplete/)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
 async function recording(directory, records, { health = {}, raw = false, ending = '\n', suffix = '' } = {}) {
   const journal = raw ? records : lifecycle(records)
   await writeFile(join(directory, 'execution.jsonl'), journal.map(value => JSON.stringify(value)).join('\n') + ending + suffix)
   await writeFile(join(directory, 'execution.health.json'), JSON.stringify({ schemaVersion: 2, executionId: 'execution', participantId: 'participant-execution', role: 'fixture', enabledHooks: ['fixture.cpu'],
-    recorded: journal.length, recordedOperations: journal.filter(value => value.phase === 'end').length, persisted: journal.length, failed: 0, pending: 0, closed: true, ...health }))
+    recorded: journal.length, recordedOperations: journal.filter(value => value.phase === 'end').length, persisted: journal.length, failed: 0, pending: 0, sourceFailures: 0, omittedRecords: 0, activeOperations: 0, closed: true, ...health }))
   await writeFile(join(directory, 'participant-execution.participant.json'), JSON.stringify({ schemaVersion: 2, id: 'participant-execution', executionId: 'execution', role: 'fixture', status: 'ready', registeredAt: 1_700_000_000_000 }))
 }
+
+test('CPU coverage distinguishes unmeasured operations from measured zero and partial sums', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'operation-cpu-coverage-'))
+  try {
+    await recording(directory, [event({ name: 'cpu.unmeasured' }),
+      event({ id: 'execution:2', name: 'cpu.zero', cpuTimeMS: 0 }),
+      event({ id: 'execution:3', name: 'cpu.partial', cpuTimeMS: 2 }),
+      event({ id: 'execution:4', name: 'cpu.partial' })])
+    const report = await summarizeOperations(directory)
+    const find = name => report.operations.find(value => value.name === name)
+    assert.equal(find('cpu.unmeasured').cpuTimeMS, null)
+    assert.equal(find('cpu.unmeasured').cpuMeasuredCount, 0)
+    assert.equal(find('cpu.zero').cpuTimeMS, 0)
+    assert.equal(find('cpu.zero').cpuMeasuredCount, 1)
+    assert.equal(find('cpu.partial').count, 2)
+    assert.equal(find('cpu.partial').cpuTimeMS, 2)
+    assert.equal(find('cpu.partial').cpuMeasuredCount, 1)
+    assert.equal(report.totals.cpuTimeMS, 2)
+    assert.equal(report.totals.cpuMeasuredCount, 2)
+    assert.match(operationReportMarkdown(report), /Thread CPU measurements: 2\/4 operations; 2 ms measured \(partial sum/)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
 
 test('offline reports retain completed costs and work counters with bounded cardinality and damaged traces', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'operation-report-'))
@@ -32,7 +104,7 @@ test('offline reports retain completed costs and work counters with bounded card
     await recording(directory, records, { ending: '', health: { persisted: 47, failed: 2, pending: 1 } })
     await writeFile(join(directory, 'damaged.jsonl'), 'invalid\n' + 'x'.repeat(4000) + '\n')
     const report = await summarizeOperations(directory, { maxGroups: 2, maxLineBytes: 1000, slowestLimit: 3 })
-    assert.equal(report.schemaVersion, 2)
+    assert.equal(report.schemaVersion, 3)
     assert.equal(report.journalRecords, 48)
     assert.equal(report.totals.count, 24)
     assert.equal(report.totals.totalMS, 80)
@@ -79,6 +151,36 @@ test('lifecycle validation detects sequence gaps, duplicated ends, unmatched sta
     const bounded = await summarizeOperations(directory, { maxOpenOperations: 1 })
     assert.ok(bounded.diagnostics.lifecycleLimitReached > 0)
     assert.equal(operationReportHasFailures(bounded), true)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('closed and durable journals reject start/end session or scenario identity changes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'operation-lifecycle-identity-'))
+  try {
+    for (const scenarioId of [undefined, 'scenario']) {
+      await recording(directory, [event({ scenarioId })], { health: { durableRecords: 2 } })
+      assert.equal(operationReportHasFailures(await summarizeOperations(directory)), false, 'Matching optional scenario identity is valid.')
+    }
+    const cases = [
+      { name: 'session changed', start: { scenarioId: 'scenario' }, end: { sessionId: 'other-session' } },
+      { name: 'scenario changed', start: { scenarioId: 'scenario' }, end: { scenarioId: 'other-scenario' } },
+      { name: 'scenario removed', start: { scenarioId: 'scenario' }, end: { scenarioId: undefined } },
+      { name: 'scenario added', start: {}, end: { scenarioId: 'scenario' } },
+    ]
+    for (const value of cases) {
+      const records = lifecycle([event(value.start)])
+      records[1] = { ...records[1], ...value.end }
+      await recording(directory, records, { raw: true, health: { durableRecords: 2 } })
+      const report = await summarizeOperations(directory)
+      assert.equal(report.diagnostics.malformed, 0, value.name)
+      assert.equal(report.diagnostics.recorderCountMismatches, 0, value.name)
+      assert.equal(report.diagnostics.undurableRecords, 0, value.name)
+      assert.equal(report.diagnostics.unclosedOperations, 0, value.name)
+      assert.equal(report.diagnostics.mismatchedLifecycles, 1, value.name)
+      assert.equal(operationReportHasFailures(report), true, value.name)
+      assert.equal(report.totals.count, 1, 'Identity corruption must not erase the observed cost.')
+      assert.equal(report.totals.totalMS, 4)
+    }
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
@@ -243,8 +345,8 @@ test('reports expose killed executions, missing raw records and incomplete opt-i
   const directory = await mkdtemp(join(tmpdir(), 'operation-interrupted-'))
   try {
     await recording(directory, [event()], { health: { recorded: 3, persisted: 3, closed: false, sourceFailures: 2, omittedRecords: 4, activeOperations: 1 } })
-    await writeFile(join(directory, 'chromium-disabled.status.json'), JSON.stringify({ enabled: false, complete: false }))
-    await writeFile(join(directory, 'chromium-truncated.status.json'), JSON.stringify({ enabled: true, complete: false, file: 'chromium-truncated.trace.json', bufferUsage: { percentage: 1 } }))
+    await writeFile(join(directory, 'chromium-disabled.status.json'), JSON.stringify({ schemaVersion: 2, requested: false, enabled: false, complete: false, system: {} }))
+    await writeFile(join(directory, 'chromium-truncated.status.json'), JSON.stringify({ schemaVersion: 2, requested: true, enabled: true, complete: false, system: {}, file: 'chromium-truncated.trace.json', bufferUsage: { percentage: 1 } }))
     const report = await summarizeOperations(directory)
     assert.equal(report.diagnostics.unclosedExecutions, 1)
     assert.equal(report.diagnostics.recorderCountMismatches, 1)
@@ -281,5 +383,64 @@ test('a closed journal cannot claim complete recording before its admitted entri
     assert.equal(operationReportHasFailures(pending), true)
     await recording(directory, [event()], { health: { durableRecords: 2 } })
     assert.equal(operationReportHasFailures(await summarizeOperations(directory)), false)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('reports retain legacy gzip members and reject a torn or corrupt compressed journal', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'operation-report-gzip-'))
+  try {
+    await recording(directory, [event()])
+    const raw = await readFile(join(directory, 'execution.jsonl'))
+    const plain = await summarizeOperations(directory)
+    assert.deepEqual(plain.storage, { storedBytes: raw.length, decodedBytes: raw.length, compressedFiles: 0, plainFiles: 1 })
+    assert.match(operationReportMarkdown(plain), /0 compressed \/ 1 plain journals/)
+    const split = raw.indexOf(10) + 1
+    const compressed = Buffer.concat([gzipSync(raw.subarray(0, split)), gzipSync(raw.subarray(split))])
+    await rm(join(directory, 'execution.jsonl'))
+    await writeFile(join(directory, 'execution.jsonl.gz'), compressed)
+    const complete = await summarizeOperations(directory)
+    assert.equal(complete.totals.count, 1)
+    assert.equal(complete.journalRecords, 2)
+    assert.deepEqual(complete.storage, { storedBytes: compressed.length, decodedBytes: raw.length, compressedFiles: 1, plainFiles: 0 })
+    assert.deepEqual(complete.operations, plain.operations, 'Compression preserves the complete operation content.')
+    assert.match(operationReportMarkdown(complete), /1 compressed \/ 0 plain journals/)
+    assert.equal(operationReportHasFailures(complete), false)
+    await writeFile(join(directory, 'execution.jsonl.gz'), compressed.subarray(0, compressed.length - 4))
+    const torn = await summarizeOperations(directory)
+    assert.equal(torn.diagnostics.journalReadFailures, 1)
+    assert.equal(operationReportHasFailures(torn), true)
+    const corrupt = Buffer.from(compressed); corrupt[corrupt.length - 8] ^= 1
+    await writeFile(join(directory, 'execution.jsonl.gz'), corrupt)
+    assert.equal((await summarizeOperations(directory)).diagnostics.journalReadFailures, 1)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('reports stream framed journals and surface corruption or torn final batches', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'operation-report-framed-'))
+  try {
+    await recording(directory, [event()])
+    const raw = await readFile(join(directory, 'execution.jsonl'))
+    const split = raw.indexOf(10) + 1
+    const compressed = Buffer.concat([encodeOperationJournal(raw.subarray(0, split)), encodeOperationJournal(raw.subarray(split))])
+    await rm(join(directory, 'execution.jsonl'))
+    const file = join(directory, `execution${operationJournalSuffix}`)
+    await writeFile(file, compressed)
+    const complete = await summarizeOperations(directory)
+    assert.equal(complete.totals.count, 1)
+    assert.equal(complete.journalRecords, 2)
+    assert.deepEqual(complete.storage, { storedBytes: compressed.length, decodedBytes: raw.length, compressedFiles: 1, plainFiles: 0 })
+    assert.equal(complete.operations[0].name, 'indicators.replay')
+    assert.equal(complete.totals.totalMS, 4)
+    assert.match(operationReportMarkdown(complete), /1 compressed \/ 0 plain journals/)
+    assert.equal(operationReportHasFailures(complete), false)
+    await writeFile(file, compressed.subarray(0, compressed.length - 1))
+    const torn = await summarizeOperations(directory)
+    assert.equal(torn.diagnostics.journalReadFailures, 1)
+    assert.equal(operationReportHasFailures(torn), true)
+    const corrupt = Buffer.from(compressed); corrupt[Math.floor(corrupt.length / 2)] ^= 1
+    await writeFile(file, corrupt)
+    const damaged = await summarizeOperations(directory)
+    assert.equal(damaged.diagnostics.journalReadFailures, 1)
+    assert.equal(operationReportHasFailures(damaged), true)
   } finally { await rm(directory, { recursive: true, force: true }) }
 })

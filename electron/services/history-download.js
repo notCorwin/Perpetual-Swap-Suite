@@ -5,9 +5,9 @@ const clone = value => structuredClone(value)
 const count = (from, through, step) => Math.max(0, Math.floor((through - from) / step) + 1)
 const message = error => error instanceof Error ? error.message : String(error)
 export const emptyHistoryDownload = () => ({
-  phase: 'idle', startedAt: null, updatedAt: null, finishedAt: null,
+  schemaVersion: 2, phase: 'idle', startedAt: null, updatedAt: null, finishedAt: null,
   contracts: { completed: 0, total: 0 }, streams: { completed: 0, total: 0 },
-  progress: { completed: 0, total: 0, available: 0, unavailable: 0, reused: 0, pending: 0 },
+  progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 },
   active: [], failures: [], error: '',
 })
 
@@ -17,7 +17,11 @@ export class HistoryDownload {
   constructor({ sync, metadata, onChange, now = Date.now, chunkSlots = 2400, concurrency = 4 }) {
     if (!Number.isSafeInteger(chunkSlots) || chunkSlots < 1 || !Number.isSafeInteger(concurrency) || concurrency < 1) throw new TypeError('Invalid history download limits.')
     Object.assign(this, { sync, metadata, onChange, now, chunkSlots, concurrency })
-    this.report = metadata.getHistoryDownload() ?? emptyHistoryDownload()
+    const saved = metadata.getHistoryDownload()
+    // Old combined absence counters cannot be split without source evidence.
+    // Retire that report; a fresh explicit run still reuses all durable values.
+    this.report = saved?.schemaVersion === 2 ? saved : emptyHistoryDownload()
+    if (saved && saved.schemaVersion !== 2) metadata.saveHistoryDownload(this.report)
     this.active = new Map()
     this.job = null
     this.timer = null
@@ -64,12 +68,12 @@ export class HistoryDownload {
       }
       for (const [timeframe, step] of Object.entries(CANDLE_INTERVALS)) {
         const from = Math.ceil(listing / step) * step, through = Math.floor(startedAt / step) * step - step
-        for (const source of ['candles', 'oi', 'taker']) streams.push({ instrument: instrument.instId, timeframe, source, from, through, step, available: 0, unavailable: 0, reused: 0, done: false, failed: false })
+        for (const source of ['candles', 'oi', 'taker']) streams.push({ instrument: instrument.instId, timeframe, source, from, through, step, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, done: false })
       }
     }
     this.report = { ...emptyHistoryDownload(), id: randomUUID(), phase: 'running', startedAt,
       contracts: { completed: 0, total: unique.length }, streams: { completed: 0, total: streams.length },
-      progress: { completed: 0, total: streams.reduce((sum, stream) => sum + count(stream.from, stream.through, stream.step), 0), available: 0, unavailable: 0, reused: 0, pending: 0 },
+      progress: { ...emptyHistoryDownload().progress, total: streams.reduce((sum, stream) => sum + count(stream.from, stream.through, stream.step), 0) },
       failures, error: unique.length ? '' : 'No currently qualified contracts are available. Wait for qualification or update the saved conditions.' }
     this.report.progress.pending = this.report.progress.total
     const job = { streams, cancelled: false, failure: '', promise: null }
@@ -97,15 +101,18 @@ export class HistoryDownload {
     const streams = this.job?.streams ?? []
     const progress = this.report.progress
     progress.available = streams.reduce((sum, value) => sum + value.available, 0)
+    progress.empty = streams.reduce((sum, value) => sum + value.empty, 0)
     progress.unavailable = streams.reduce((sum, value) => sum + value.unavailable, 0)
+    progress.failed = streams.reduce((sum, value) => sum + value.failed, 0)
     progress.reused = streams.reduce((sum, value) => sum + value.reused, 0)
     for (const { task } of this.active.values()) {
       progress.available += task.coveredRecords ?? 0
+      progress.empty += task.emptyRecords ?? 0
       progress.unavailable += task.unavailableRecords ?? 0
       progress.reused += Math.min(task.localRecords ?? 0, task.coveredRecords ?? 0)
     }
-    progress.completed = progress.available + progress.unavailable
-    progress.pending = Math.max(0, progress.total - progress.completed)
+    progress.checked = progress.available + progress.empty + progress.unavailable
+    progress.pending = Math.max(0, progress.total - progress.checked - progress.failed)
     this.report.streams.completed = streams.filter(stream => stream.done).length
     const byInstrument = new Map()
     for (const stream of streams) {
@@ -122,9 +129,11 @@ export class HistoryDownload {
     await Promise.all(Array.from({ length: Math.min(this.concurrency, job.streams.length) }, async () => {
       while (!job.cancelled && cursor < job.streams.length) {
         const stream = job.streams[cursor++]
+        let attempt = null
         try {
           for (let through = stream.through; through >= stream.from && !job.cancelled;) {
             const from = Math.max(stream.from, through - (this.chunkSlots - 1) * stream.step)
+            attempt = { from, through, checked: 0 }
             const task = await this.sync.enqueue({ instrument: stream.instrument, timeframe: stream.timeframe, source: stream.source, from, through, priority: 'background' })
             let result
             try {
@@ -135,22 +144,28 @@ export class HistoryDownload {
             } finally {
               // A fatal scheduler error can reject the waiter after earlier
               // pages committed. Keep the last verified durable checkpoint.
-              const checkpoint = result ?? this.active.get(task.id)?.task
+              const checkpoint = result ?? this.sync.getTask(task.id) ?? this.active.get(task.id)?.task
               stream.available += checkpoint?.coveredRecords ?? 0
+              stream.empty += checkpoint?.emptyRecords ?? 0
               stream.unavailable += checkpoint?.unavailableRecords ?? 0
               stream.reused += Math.min(checkpoint?.localRecords ?? 0, checkpoint?.coveredRecords ?? 0)
+              attempt.checked = (checkpoint?.coveredRecords ?? 0) + (checkpoint?.emptyRecords ?? 0) + (checkpoint?.unavailableRecords ?? 0)
               this.active.delete(task.id)
               this.update(); this.publish()
             }
             if (job.cancelled) break
             if (!['completed', 'unavailable'].includes(result.status)) throw new Error(result.lastError || `Source task ${result.status}.`)
             through = from - stream.step
+            attempt = null
           }
           if (!job.cancelled) stream.done = true
         } catch (error) {
           if (!job.cancelled) {
-            stream.failed = true
-            this.report.failures.push({ instrument: stream.instrument, timeframe: stream.timeframe, source: stream.source, from: stream.from, through: stream.through, error: message(error) })
+            // Only this attempted chunk failed. Older chunks which were never
+            // admitted remain pending; failure establishes no source absence.
+            if (attempt) stream.failed += Math.max(0, count(attempt.from, attempt.through, stream.step) - attempt.checked)
+            this.report.failures.push({ instrument: stream.instrument, timeframe: stream.timeframe, source: stream.source,
+              from: attempt?.from ?? stream.from, through: attempt?.through ?? stream.through, error: message(error) })
           }
         }
         this.update(); this.publish()

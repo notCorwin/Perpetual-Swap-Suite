@@ -64,17 +64,22 @@ function optional(target, source, key, parse) {
   return target
 }
 
-function chart(value, path, window = false) {
-  record(value, path, window ? ['instId', 'timeframe', 'endHour', ...(path === 'chartWindow' ? ['historyBars'] : [])] : ['instId', 'timeframe'], ['instId', 'timeframe'])
+function chart(value, path) {
+  const fields = ['instId', 'timeframe']
+  if (path !== 'chartLocal') fields.push('endHour')
+  if (path === 'chartWindow') fields.push('historyBars')
+  if (path === 'chartWindow') fields.push('focusId')
+  record(value, path, fields, ['instId', 'timeframe'])
   const result = { instId: text(value.instId, `${path}.instId`, { maximum: 256 }), timeframe: choice(value.timeframe, `${path}.timeframe`, TIMEFRAMES) }
   optional(result, value, 'historyBars', input => number(input, `${path}.historyBars`, 96, 4_096, true))
+  optional(result, value, 'focusId', input => text(input, `${path}.focusId`, { maximum: 256 }))
   return optional(result, value, 'endHour', input => number(input, `${path}.endHour`, 0, Number.MAX_SAFE_INTEGER, true))
 }
 
 function snapshot(value) {
   const path = 'snapshot'
-  record(value, path, ['timeframe', 'sinceRevision', 'serviceSession'], ['timeframe'])
-  const result = { timeframe: choice(value.timeframe, `${path}.timeframe`, TIMEFRAMES) }
+  record(value, path, ['sinceRevision', 'serviceSession'])
+  const result = {}
   optional(result, value, 'sinceRevision', input => number(input, `${path}.sinceRevision`, -1, Number.MAX_SAFE_INTEGER, true))
   return optional(result, value, 'serviceSession', input => text(input, `${path}.serviceSession`, { maximum: 256 }))
 }
@@ -187,7 +192,7 @@ function candle(value, index) {
 
 /** Validate the complete request before dispatching any operation or side effect. */
 export function parseDesktopRequest(value, { allowE2E = false } = {}) {
-  const operations = ['snapshot', 'preferences', 'dataAudit', 'historyDownload', 'chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse', 'captureChart', 'copyText', 'analysisSettings', 'gatewayFetch', 'cancelGatewayFetch', 'e2e']
+  const operations = ['snapshot', 'preferences', 'dataAudit', 'historyDownload', 'chartFocus', 'chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse', 'captureChart', 'copyText', 'analysisSettings', 'gatewayFetch', 'cancelGatewayFetch', 'e2e']
   record(value, 'request', operations)
   const keys = Object.keys(value)
   if (keys.length !== 1) invalid('request', 'must contain exactly one operation')
@@ -204,14 +209,16 @@ export function parseDesktopRequest(value, { allowE2E = false } = {}) {
       record(input, operation, ['action'], ['action'])
       return { historyDownload: { action: choice(input.action, 'historyDownload.action', ['start', 'cancel', 'status']) } }
     }
-    case 'chartWindow': return { chartWindow: chart(input, operation, true) }
+    case 'chartWindow': return { chartWindow: chart(input, operation) }
+    case 'chartFocus': {
+      record(input, operation, ['id', 'target'], ['id', 'target'])
+      return { chartFocus: { id: text(input.id, 'chartFocus.id', { maximum: 256 }), target: input.target === null ? null : chart(input.target, 'chartFocus.target') } }
+    }
     case 'chartLocal': return { chartLocal: chart(input, operation) }
-    case 'chartHistory': return { chartHistory: chart(input, operation, true) }
+    case 'chartHistory': return { chartHistory: chart(input, operation) }
     case 'chartUniverse': {
-      record(input, operation, ['instIds', 'timeframe', 'focusInstId'], ['instIds', 'timeframe'])
-      array(input.instIds, 'chartUniverse.instIds', 1_000)
-      const result = { instIds: input.instIds.map((id, index) => text(id, `chartUniverse.instIds[${index}]`, { maximum: 256 })), timeframe: choice(input.timeframe, 'chartUniverse.timeframe', TIMEFRAMES) }
-      return { chartUniverse: optional(result, input, 'focusInstId', id => text(id, 'chartUniverse.focusInstId', { maximum: 256 })) }
+      record(input, operation, [])
+      return { chartUniverse: {} }
     }
     case 'captureChart': return { captureChart: captureChart(input) }
     case 'copyText': return { copyText: text(input, operation, { empty: true, maximum: 16_777_216 }) }

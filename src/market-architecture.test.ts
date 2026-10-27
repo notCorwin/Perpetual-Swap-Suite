@@ -57,7 +57,7 @@ for (const source of ['book', 'openInterest'] as const) test(`an expired ${sourc
   const observations = { [source]: { value: source === 'book' ? book() : { oiUsd: '6000000' }, source: 'websocket', observedAt: now, expiresAt: now + 90000 } }
   service.observations.set(instId, observations)
   const record = service.observedCandidate(instrument(), service.prefs().liquidity, service.catalogCriteriaKey(), observations)
-  service.catalog.set(instId, record); service.catalogChecks.set(instId, record); service.ensureListRows('15m')
+  service.catalog.set(instId, record); service.catalogChecks.set(instId, record)
   assert.equal((await service.snapshot()).rows.length, 1)
   service.autoRefresh = true; service.scheduleMarketDeadline()
   now += 90001; service.processMarketDeadline()
@@ -70,20 +70,18 @@ for (const source of ['book', 'openInterest'] as const) test(`an expired ${sourc
   assert.equal(service.sourceRecoveries.has(`${instId}:${source}`), false)
 })
 
-test('287 contracts and three native collector periods do not restore or calculate full chart histories', async t => {
+test('287 contracts use one 5m collector period while prepared chart keys cover all periods', async t => {
   let requests = 0
   const { service } = await fixture(t, preferences(), async input => { requests++; throw Error(`Collector membership must not acquire charts: ${input}`) })
   const ids = Array.from({ length: 287 }, (_, index) => `T${index}-USDT-SWAP`)
   service.candidateIDs = new Set(ids)
   for (const id of ids) service.instruments.set(id, instrument(id))
   service.updateSubscriptions()
-  assert.equal(service.realtime.subscriptions.size, 287 * 3)
+  assert.equal(service.realtime.subscriptions.size, 287)
+  assert.ok([...service.realtime.subscriptions.values()].every(value => value.timeframe === '5m'))
   assert.equal(service.preparedCharts.realtimeKeys.size, 287 * 3)
-  for (const id of ids) for (const frame of ['5m', '15m', '1H']) {
-    const interval = frame === '5m' ? step : frame === '15m' ? 900000 : 3600000
-    await service.setLive(id, frame, { ...candle(Math.floor(Date.now() / interval) * interval, frame), instrument: id, confirmed: false })
-  }
-  assert.equal(service.liveCandles.size, 861)
+  for (const id of ids) await service.setLive(id, '5m', { ...candle(Math.floor(Date.now() / step) * step, '5m'), instrument: id, confirmed: false })
+  assert.equal(service.liveCandles.size, 287)
   assert.equal(service.preparedCharts.series.size, 0)
   assert.equal(service.preparedCharts.snapshots.size, 0)
   assert.equal(service.preparedCharts.liveSeeds.size, 0)
@@ -100,21 +98,22 @@ test('current quote and forming candle publish while independent OI and Taker re
     return nativeResponse(input)
   })
   seedInstrument(service)
-  const frame = '15m', interval = 900000, formingAt = Math.floor(Date.now() / interval) * interval, end = formingAt - interval
+  const frame = '5m', interval = step, formingAt = Math.floor(Date.now() / interval) * interval, end = formingAt - interval
   await store.appendCandles(Array.from({ length: 300 }, (_, index) => candle(end - (299 - index) * interval, frame)))
-  await service.setChartUniverse([instId], frame, instId)
+  // Preparing the selected 5m viewport is explicit; no native 15m source is needed.
+  service.preparedCharts.setFocus({ instId, timeframe: frame })
   const initial = await service.localChartWindow(instId, frame)
   assert.ok(initial?.bars.length)
   const observations = { ticker: { value: ticker(), observedAt: Date.now(), expiresAt: Date.now() + 90000 } }
   service.observations.set(instId, observations)
   const record = service.observedCandidate(instrument(), service.prefs().liquidity, service.catalogCriteriaKey(), observations)
-  service.catalog.set(instId, record); service.catalogChecks.set(instId, record); service.ensureListRows(frame)
+  service.catalog.set(instId, record); service.catalogChecks.set(instId, record)
   const statistics = service.history.ensureStatistics(instId, frame, end, end, 'continuity')
   try {
     await waitFor(() => started.size === 2)
     service.receivePublicObservation(instId, 'ticker', ticker(220), { receivedAt: Date.now(), acknowledged: false })
     await service.setLive(instId, frame, { ...candle(formingAt, frame, 220), confirmed: false })
-    const snapshot = await service.snapshot(frame), chart = await service.localChartWindow(instId, frame)
+    const snapshot = await service.snapshot(), chart = await service.localChartWindow(instId, frame)
     assert.equal(snapshot.rows[0].lastPrice, 220)
     assert.equal(chart?.liveBar?.close, 220)
     assert.equal(chart?.priceState, 'ready')

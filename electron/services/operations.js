@@ -1,18 +1,30 @@
 // Browser-safe operation identity and lifecycle. Node installs async context
 // propagation; browser callbacks use the same API for synchronous scopes.
+const { performance } = globalThis
+const timeOrigin = performance.timeOrigin
 const sinks = new Set(), journalSinks = new Set(), active = new Set(), imports = new Map()
 let operationSequence = 0, journalSequence = 0
 let identity = { sessionId: 'unattached', executionId: `renderer-${globalThis.crypto?.randomUUID?.() ?? performance.timeOrigin}` }
 let cpuClock, synchronousContext = {}, propagation
+// Domain sets are module-owned, copy-on-write values. Public identity snapshots
+// and worker messages never expose this process-local execution state.
+const hookDomains = Symbol('operation-hook-domains')
 const categories = new Set(['cpu', 'gpu', 'network', 'database', 'io', 'ipc'])
 const statuses = new Set(['ok', 'error', 'cancelled'])
-const allowedAttributes = new Set(['count', 'rows', 'bytes', 'sentBytes', 'receivedBytes', 'statusCode', 'errorName', 'lane', 'priority', 'method', 'measurement', 'queryCount', 'changes', 'inputRows', 'outputRows', 'cache', 'threadId', 'blockingDurationMS', 'renderDurationMS', 'width', 'height', 'reason', 'incomplete', 'durationSource', 'role', 'candles', 'intervalMS', 'checkpoint', 'execution', 'projection', 'bidLevels', 'askLevels', 'bookResident', 'inspected', 'transport', 'stream', 'connection', 'path', 'httpStatus', 'declaredResponseBytes', 'timedOut', 'code', 'clean', 'cpuPercent', 'residentKB', 'processId', 'source', 'queueMS', 'transferMS', 'executionMS', 'calls', 'hook', 'expected', 'workerRole', 'sequence', 'batchSize', 'attempt', 'misses', 'hits', 'invalidations', 'generation', 'revision', 'parameterHash', 'inputHash', 'heapUsedBytes', 'heapTotalBytes', 'rssBytes', 'gcKind', 'gcFlags', 'eventLoopDelayMS', 'bufferedBytes', 'omitted', 'command'])
+const normalizedSpecifications = new WeakSet()
+const allowedAttributes = new Set(['count', 'rows', 'bytes', 'sentBytes', 'receivedBytes', 'statusCode', 'errorName', 'lane', 'priority', 'method', 'measurement', 'queryCount', 'changes', 'inputRows', 'outputRows', 'cache', 'threadId', 'blockingDurationMS', 'renderDurationMS', 'width', 'height', 'reason', 'incomplete', 'durationSource', 'role', 'candles', 'intervalMS', 'checkpoint', 'execution', 'projection', 'bidLevels', 'askLevels', 'bookResident', 'inspected', 'transport', 'stream', 'connection', 'path', 'httpStatus', 'declaredResponseBytes', 'timedOut', 'code', 'clean', 'cpuPercent', 'residentKB', 'processId', 'source', 'queueMS', 'transferMS', 'executionMS', 'calls', 'hook', 'expected', 'workerRole', 'sequence', 'batchSize', 'attempt', 'misses', 'hits', 'invalidations', 'generation', 'revision', 'parameterHash', 'inputHash', 'heapUsedBytes', 'heapTotalBytes', 'rssBytes', 'gcKind', 'gcFlags', 'eventLoopDelayMS', 'bufferedBytes', 'omitted', 'command', 'nativeTimestampUS', 'nativeDurationUS', 'nativeEventName', 'nativeCategory', 'nativeEventId', 'clockDomain', 'nativeStatus'])
 const safeText = (value, maximum = 160) => typeof value === 'string' && value.length > 0 && value.length <= maximum && !value.includes('\0')
 const safeID = value => safeText(value, 256) && /^[\w.:/-]+$/.test(value)
-function attributes(value) {
-  return Object.fromEntries(Object.entries(value ?? {}).filter(([key, item]) => allowedAttributes.has(key)
-    && (item === null || typeof item === 'boolean' || typeof item === 'number' && Number.isFinite(item)
-      || typeof item === 'string' && item.length <= 160)))
+function attributes(value, base) {
+  const result = base ?? {}
+  for (const key of Object.keys(value ?? {})) {
+    if (!allowedAttributes.has(key)) continue
+    const item = value[key]
+    if (item === null || typeof item === 'boolean' || typeof item === 'number' && Number.isFinite(item)
+      || typeof item === 'string' && item.length <= 160) result[key] = item
+    else if (base) delete result[key]
+  }
+  return result
 }
 const current = () => propagation?.get() ?? synchronousContext
 const runContext = (context, operation) => {
@@ -27,21 +39,52 @@ export function configureOperationContext(value, clock) {
   if (clock !== undefined) cpuClock = clock
 }
 export function configureOperationPropagation(value) { propagation = value }
+export function hasOperationPropagation() { return typeof propagation?.get === 'function' && typeof propagation?.run === 'function' }
 export function getOperationContext() {
   const context = current(), scenarioId = context.scenarioId ?? identity.scenarioId
   return { ...(context.traceId ? { traceId: context.traceId } : {}), ...(context.parentId ? { parentId: context.parentId } : {}), ...(scenarioId ? { scenarioId } : {}) }
 }
+const validatedContextID = value => safeID(value) ? value : undefined
+function applyContextIDs(context, traceId, parentId, scenarioId) {
+  if (traceId === undefined) delete context.traceId; else context.traceId = traceId
+  if (parentId === undefined) delete context.parentId; else context.parentId = parentId
+  if (scenarioId === undefined) delete context.scenarioId; else context.scenarioId = scenarioId
+  return context
+}
 export function runWithOperationContext(value, operation) {
   if (value === undefined) return operation()
   const context = { ...current() }
-  for (const key of ['traceId', 'parentId', 'scenarioId']) {
-    if (safeID(value?.[key])) context[key] = value[key]
-    else delete context[key]
+  return runContext(applyContextIDs(context, validatedContextID(value?.traceId), validatedContextID(value?.parentId), validatedContextID(value?.scenarioId)), operation)
+}
+export function captureOperationContext({ restoreHookDomains = false } = {}) {
+  const captured = current(), traceId = validatedContextID(captured.traceId), parentId = validatedContextID(captured.parentId),
+    scenarioId = validatedContextID(captured.scenarioId ?? identity.scenarioId), domains = restoreHookDomains ? captured[hookDomains] : undefined
+  // Application callbacks restore registered domains as well as IDs. Internal
+  // observers restore only IDs. Global suppression always belongs to invocation.
+  return operation => {
+    const context = current()
+    if (context.traceId === traceId && context.parentId === parentId && context.scenarioId === scenarioId
+      && (!restoreHookDomains || context[hookDomains] === domains)) return operation()
+    const restored = applyContextIDs({ ...context }, traceId, parentId, scenarioId)
+    if (restoreHookDomains) {
+      if (domains === undefined) delete restored[hookDomains]
+      else restored[hookDomains] = domains
+    }
+    return runContext(restored, operation)
   }
-  return runContext(context, operation)
 }
 export function withOperationSuppressed(operation) { return runContext({ ...current(), suppressed: true }, operation) }
 export function isOperationSuppressed() { return current().suppressed === true }
+// Node hooks install only after an async propagation provider is configured.
+export function withOperationHookSuppressed(domain, operation) {
+  const context = current(), domains = context[hookDomains]
+  if (domains?.has(domain)) return operation()
+  return runContext({ ...context, [hookDomains]: new Set([...(domains ?? []), domain]) }, operation)
+}
+export function isOperationHookSuppressed(domain) {
+  const context = current()
+  return context.suppressed === true || context[hookDomains]?.has(domain) === true
+}
 export function hasOperationRecording() { return sinks.size > 0 || journalSinks.size > 0 }
 export function readOperationCPUTime() { return cpuClock?.() }
 export function attachOperationSink(sink) { sinks.add(sink); return () => sinks.delete(sink) }
@@ -52,52 +95,103 @@ function publish(event) {
   if (event.phase === 'end') for (const sink of sinks) { try { sink(event) } catch { /* See above. */ } }
   return accepted
 }
-function localEvent(base, phase, detail) {
-  const event = { ...base, phase, sequence: ++journalSequence, ...detail }; publish(event); return event
+function localEvent(base, phase, durationMS, status, eventAttributes, cpuTimeMS) {
+  const event = { schemaVersion: base.schemaVersion, sessionId: base.sessionId, executionId: base.executionId,
+    id: base.id, traceId: base.traceId, parentId: base.parentId, scenarioId: base.scenarioId,
+    category: base.category, name: base.name, resource: base.resource, startedAt: base.startedAt,
+    phase, sequence: ++journalSequence, durationMS, status, attributes: eventAttributes, cpuTimeMS }
+  publish(event); return event
 }
-function start(specification, startedAt = performance.timeOrigin + performance.now()) {
-  const context = getOperationContext(), id = `${identity.executionId}:${++operationSequence}`
-  const base = { schemaVersion: 2, ...identity, id, traceId: context.traceId ?? id,
-    ...(context.parentId ? { parentId: context.parentId } : {}), ...(context.scenarioId ? { scenarioId: context.scenarioId } : {}),
-    category: specification.category, name: String(specification.name).slice(0, 160),
-    ...(specification.resource ? { resource: String(specification.resource).slice(0, 256) } : {}), startedAt, attributes: attributes(specification.attributes) }
-  localEvent(base, 'start', { durationMS: 0, status: 'running' }); return base
+function start(specification, startedAt = timeOrigin + performance.now()) {
+  const context = current(), id = `${identity.executionId}:${++operationSequence}`, normalized = normalizedSpecifications.has(specification)
+  const base = { schemaVersion: 2, sessionId: identity.sessionId, executionId: identity.executionId,
+    id, traceId: context.traceId || id, parentId: context.parentId || undefined, scenarioId: context.scenarioId || identity.scenarioId,
+    category: specification.category, name: normalized ? specification.name : String(specification.name).slice(0, 160),
+    resource: normalized ? specification.resource : specification.resource ? String(specification.resource).slice(0, 256) : undefined,
+    startedAt, phase: 'end', sequence: 0, durationMS: 0, status: 'ok',
+    attributes: normalized ? { ...specification.attributes } : attributes(specification.attributes), cpuTimeMS: undefined }
+  // Mutable start observers cannot alter the private validated terminal baseline.
+  localEvent(base, 'start', 0, 'running', { ...base.attributes }, undefined); return base
 }
-function complete(base, detail) {
-  localEvent(base, 'end', { durationMS: Math.max(0, detail.durationMS), status: detail.status ?? 'ok',
-    attributes: attributes({ ...base.attributes, ...detail.attributes }),
-    ...(Number.isFinite(detail.cpuTimeMS) ? { cpuTimeMS: Math.max(0, detail.cpuTimeMS) } : {}) })
+function complete(base, detail, durationMS) {
+  // Transfer the private terminal snapshot once. Starts already own independent
+  // metadata and attributes; ended spans retain their ancestry as private IDs.
+  const overrides = detail.attributes
+  if (overrides !== undefined) attributes(overrides, base.attributes)
+  base.durationMS = Math.max(0, durationMS)
+  base.status = detail.status ?? 'ok'
+  const cpuTimeMS = detail.cpuTimeMS
+  base.cpuTimeMS = Number.isFinite(cpuTimeMS) ? Math.max(0, cpuTimeMS) : undefined
+  // Result getters may publish nested operations. Assign the terminal sequence
+  // only after every input has been consumed, immediately before publication.
+  base.sequence = ++journalSequence
+  publish(base)
 }
+
 export function recordOperation(value) {
-  if (!hasOperationRecording() || isOperationSuppressed() || !categories.has(value.category) || !statuses.has(value.status)
-    || !Number.isFinite(value.startedAt) || !Number.isFinite(value.durationMS) || value.durationMS < 0) return
-  complete(start(value, value.startedAt), value)
+  if (!hasOperationRecording() || isOperationSuppressed() || !categories.has(value.category)) return
+  const { status, startedAt, durationMS, cpuTimeMS } = value
+  if (!statuses.has(status) || !Number.isFinite(startedAt) || !Number.isFinite(durationMS) || durationMS < 0) return
+  // Completed observations own their terminal snapshot from admission. Keep the
+  // same key order as localEvent; the independently copied start may be mutated.
+  const context = current(), id = `${identity.executionId}:${++operationSequence}`
+  const terminal = { schemaVersion: 2, sessionId: identity.sessionId, executionId: identity.executionId,
+    id, traceId: context.traceId || id, parentId: context.parentId || undefined, scenarioId: context.scenarioId || identity.scenarioId,
+    category: value.category, name: String(value.name).slice(0, 160),
+    resource: value.resource ? String(value.resource).slice(0, 256) : undefined, startedAt,
+    phase: 'end', sequence: 0, durationMS: Math.max(0, durationMS), status, attributes: attributes(value.attributes),
+    cpuTimeMS: Number.isFinite(cpuTimeMS) ? Math.max(0, cpuTimeMS) : undefined }
+  localEvent(terminal, 'start', 0, 'running', { ...terminal.attributes }, undefined)
+  // Reentrant start observers publish first; this sequence belongs to the
+  // terminal publication, not to the earlier private snapshot construction.
+  terminal.sequence = ++journalSequence
+  publish(terminal)
 }
 const noop = { context: {}, end() {}, run: operation => operation() }
+class LocalOperationSpan {
+  #base; #started; #ended = false; #id; #traceId; #scenarioId; #context; #publicContext
+  constructor(base, started) {
+    this.#base = base; this.#started = started
+    this.#id = base.id; this.#traceId = base.traceId; this.#scenarioId = base.scenarioId
+  }
+  get context() {
+    return this.#publicContext ??= { traceId: this.#traceId, parentId: this.#id, ...(this.#scenarioId ? { scenarioId: this.#scenarioId } : {}) }
+  }
+  run(operation) {
+    // IDs belong to this span; global/domain suppression belongs to each run.
+    const context = this.#context ??= { traceId: this.#traceId, parentId: this.#id, scenarioId: this.#scenarioId }
+    const invocation = current(), domains = invocation[hookDomains]
+    if (invocation.suppressed !== true && domains === undefined) return runContext(context, operation)
+    return runContext({ ...context, suppressed: invocation.suppressed === true, [hookDomains]: domains }, operation)
+  }
+  end(result = {}) {
+    if (this.#ended) return
+    this.#ended = true; active.delete(this)
+    complete(this.#base, result, performance.now() - this.#started)
+  }
+}
 export function beginOperation(specification) {
   if (!hasOperationRecording() || isOperationSuppressed() || !categories.has(specification.category)) return noop
-  const started = performance.now(), base = start(specification, performance.timeOrigin + started)
-  const context = { traceId: base.traceId, parentId: base.id, ...(base.scenarioId ? { scenarioId: base.scenarioId } : {}) }
-  let ended = false
-  const span = { context, run: operation => runWithOperationContext(context, operation), end(result = {}) {
-    if (ended) return
-    ended = true; active.delete(span); complete(base, { ...result, durationMS: performance.now() - started })
-  } }
+  const started = performance.now(), span = new LocalOperationSpan(start(specification, timeOrigin + started), started)
   active.add(span); return span
 }
+
 export function finishActiveOperations(reason = 'execution-stopped') {
   for (const span of active) span.end({ status: 'cancelled', attributes: { incomplete: true, reason } })
 }
+function failOperation(span, error) {
+  span.end({ status: error?.name === 'AbortError' ? 'cancelled' : 'error', attributes: { errorName: error?.name ?? 'Error' } }); throw error
+}
 export function measureOperation(specification, operation) {
-  const span = beginOperation(specification), cpu = cpuClock && span !== noop ? cpuClock() : undefined
-  const failed = error => { span.end({ status: error?.name === 'AbortError' ? 'cancelled' : 'error', attributes: { errorName: error?.name ?? 'Error' } }); throw error }
+  const span = beginOperation(specification), cpu = specification.cpuTime !== false && cpuClock && span !== noop ? cpuClock() : undefined
   try {
     const value = span.run(operation)
-    // A thread clock measured across await would include unrelated tasks.
-    if (value && typeof value.then === 'function') return Promise.resolve(value).then(result => { span.end(); return result }, failed)
+    // A clock measured across await would include unrelated thread work.
+    if (value && typeof value.then === 'function') return Promise.resolve(value).then(result => { span.end(); return result }, error => failOperation(span, error))
     span.end(cpu === undefined ? {} : { cpuTimeMS: cpuClock() - cpu }); return value
-  } catch (error) { return failed(error) }
+  } catch (error) { return failOperation(span, error) }
 }
+
 const hookedMethods = new WeakMap()
 export function hookOperationMethods(target, specifications) {
   const installed = hookedMethods.get(target) ?? new Set()
@@ -107,8 +201,18 @@ export function hookOperationMethods(target, specifications) {
     const descriptor = Object.getOwnPropertyDescriptor(target, name)
     if (!descriptor || typeof descriptor.value !== 'function') throw new TypeError(`Missing operation method: ${name}`)
     const method = descriptor.value
+    let template
+    if (typeof specification !== 'function') {
+      // Static metadata is a registration snapshot. Each span still owns its
+      // mutable attribute baseline and the separate copy seen by start observers.
+      template = Object.freeze({ category: specification.category, name: String(specification.name).slice(0, 160),
+        resource: specification.resource ? String(specification.resource).slice(0, 256) : undefined,
+        cpuTime: specification.cpuTime,
+        attributes: Object.freeze(attributes(specification.attributes)) })
+      normalizedSpecifications.add(template)
+    }
     const wrapped = function (...args) {
-      const spec = typeof specification === 'function' ? Reflect.apply(specification, this, args) : specification
+      const spec = template ?? Reflect.apply(specification, this, args)
       return measureOperation(spec, () => Reflect.apply(method, this, args))
     }
     Object.defineProperty(wrapped, 'name', { value: method.name })

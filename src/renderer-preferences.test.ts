@@ -1,16 +1,7 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { compareRankingChange } from './market-ranking.ts'
 import { DEFAULT_PREFERENCES, preferencesDraft, validatePreferencesDraft } from './renderer-preferences.ts'
 
-test('ranking uses absolute completed change, null last and stable instrument ties', () => {
-  const rows = [
-    { instId: 'C', rankingChange: 1 }, { instId: 'B', rankingChange: 2 },
-    { instId: 'D', rankingChange: null }, { instId: 'A', rankingChange: -5 },
-    { instId: 'F', rankingChange: NaN }, { instId: 'AA', rankingChange: -2 },
-  ]
-  assert.deepEqual(rows.sort(compareRankingChange).map(row => row.instId), ['A', 'AA', 'B', 'C', 'D', 'F'])
-})
 test('default screening settings round trip independently from chart timeframe', () => {
   const draft = preferencesDraft(DEFAULT_PREFERENCES)
   assert.deepEqual(validatePreferencesDraft(draft), { values: DEFAULT_PREFERENCES, errors: {} })

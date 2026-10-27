@@ -1,4 +1,5 @@
 import { setMaxListeners } from 'node:events'
+import { startResourceWorkload } from './resource-workload.js'
 
 const intervals = { '5m': 300_000, '15m': 900_000, '1H': 3_600_000 }
 
@@ -8,7 +9,7 @@ export function resourceCandle(instrumentIndex, timeframe, index, periods, asOf)
   const close = 100 + instrumentIndex * 3 + offset + index * 0.01, volume = 100 + index % 7
   return { instrument: `SCALE${String(instrumentIndex).padStart(3, '0')}-USDT-SWAP`, timeframe, timestamp,
     open: close - 0.02, high: close + 0.06, low: close - 0.05, close,
-    volume, baseVolume: volume, quoteVolume: volume * close, confirmed: true }
+    volume, baseVolume: volume, quoteVolume: volume * close, statisticsVersion: 8, confirmed: true }
 }
 
 /** Synthetic intake only; storage, scheduler, service, IPC, React and SVG are real. */
@@ -17,7 +18,7 @@ export async function seedMarketResources(store, service, { count = 287, periods
   const startedAt = Date.now(), asOf = startedAt, timeframes = Object.keys(intervals), instIds = [], catalog = []
   const controller = new AbortController(), originalFetcher = service.fetcher
   setMaxListeners(0, controller.signal)
-  let heldStatistics = 0, tickCount = 0, nativeUpdates = 0
+  let heldStatistics = 0, tickCount = 0, nativeUpdates = 0, workload
   service.fetcher = async (input, options = {}) => {
     const url = new URL(input), signal = options.signal
     if (url.pathname.includes('/rubik/stat/') && url.searchParams.get('instId')?.startsWith('SCALE')) {
@@ -55,7 +56,7 @@ export async function seedMarketResources(store, service, { count = 287, periods
   const tick = async ({ sequence = tickCount + 1, focusInstId = instIds[0], timeframe = '15m' } = {}) => {
     if (!Number.isSafeInteger(sequence) || sequence <= tickCount) throw new Error('Synthetic updates must advance monotonically.')
     tickCount = sequence
-    const receivedAt = Date.now(), updates = []
+    const receivedAt = performance.timeOrigin + performance.now(), updates = []
     let expected = null
     for (let index = 0; index < count; index += 1) {
       const instId = instIds[index], price = resourceCandle(index, '15m', periods, periods, asOf).close + sequence * 0.001
@@ -73,13 +74,27 @@ export async function seedMarketResources(store, service, { count = 287, periods
   }
   return {
     fixture: { instIds, count, periods, timeframes, intervals, asOf, rowsSeeded: count * periods * timeframes.length, seedStartedAt: startedAt, seedCompletedAt: Date.now(), source: 'Synthetic native intake; external WebSocket transport and OKX network are not measured.' },
-    tick,
+    startLoad(options = {}) {
+      if (workload) throw new Error('A resource workload has already started.')
+      const { ticks, cadenceMS, focusInstId, timeframe } = options
+      workload = startResourceWorkload({ ticks, cadenceMS, firstSequence: tickCount + 1,
+        tick: ({ sequence }) => tick({ sequence, focusInstId, timeframe }) })
+      return workload.snapshot()
+    },
+    readLoad(options) { if (!workload) throw new Error('Resource workload has not started.'); return workload.snapshot(options) },
     async stop() {
+      const load = workload?.snapshot({ includeTicks: true })
+      workload?.cancel()
       controller.abort(new Error('Resource benchmark finished.'))
       service.fetcher = originalFetcher
-      const counts = []
+      const counts = [], liveMismatches = []
+      if (tickCount) for (let index = 0; index < count; index++) for (const frame of timeframes) {
+        const expected = resourceCandle(index, frame, periods, periods, asOf).close + tickCount * .001
+        const actual = service.liveCandles.get(`${instIds[index]}:${frame}`)?.close
+        if (actual !== expected) liveMismatches.push({ instId: instIds[index], timeframe: frame, expected, actual: actual ?? null })
+      }
       for (const instId of instIds) for (const timeframe of timeframes) counts.push((await store.coverage(instId, timeframe)).count)
-      return { heldStatistics, ticks: tickCount, nativeUpdates, actualRows: counts.reduce((sum, value) => sum + value, 0), minimumRowsPerSeries: Math.min(...counts),
+      return { heldStatistics, ticks: tickCount, nativeUpdates, liveMismatches, ...(load ? { load } : {}), actualRows: counts.reduce((sum, value) => sum + value, 0), minimumRowsPerSeries: Math.min(...counts),
         indicatorWorkerThreadIds: service.preparedCharts.workers.map(slot => slot.worker?.threadId ?? slot.threadId),
         residentChartSeries: service.preparedCharts.series.size, liveProjectionSeeds: service.preparedCharts.liveStates.size,
         cache: { estimatedResidentBytes: [...service.preparedCharts.series.values()].reduce((sum, state) => sum + (state.byteSize ?? 0), 0),

@@ -56,7 +56,8 @@
   --negative: rgb(232 85 168);
   --analysis-panel-width: 400px;
   --chart-annotation: var(--muted);
-  --chart-rsi-area: color-mix(in srgb, var(--foreground) 5%, transparent);
+  --chart-threshold: color-mix(in srgb, var(--foreground) 29%, transparent);
+  --chart-midpoint: color-mix(in srgb, var(--foreground) 6.5%, transparent);
   --chart-roc-positive-area: color-mix(in srgb, var(--positive) 12%, transparent);
   --chart-roc-negative-area: color-mix(in srgb, var(--negative) 12%, transparent);
   --chart-positive-label: color-mix(in srgb, var(--positive) 50%, var(--foreground));
@@ -191,7 +192,26 @@
 [data-analysis-answer], [data-analysis-answer] * { user-select: text; }
 [data-analysis-answer] [data-slot="table-container"] { overflow-x: auto; }
 
-[data-slot="dialog-content"], [data-slot="select-content"], [data-slot="popover-content"] {
+[data-window-drag-region] {
+  app-region: drag;
+  user-select: none;
+}
+
+[data-window-drag-region] :is(button, a, input, select, textarea, [role="button"]) {
+  app-region: no-drag;
+}
+
+[data-window-toolbar] {
+  height: var(--window-toolbar-height, 3rem);
+  flex-shrink: 0;
+}
+
+[data-native-window-controls-row],
+[data-native-window-controls-header] {
+  padding-inline-start: calc(1rem + var(--native-window-controls-width, 0px));
+}
+
+[data-slot="select-content"] {
   overscroll-behavior: contain;
 }
 

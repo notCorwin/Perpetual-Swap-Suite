@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { MetadataStore } from './metadata-store.js'
 import { MarketStore } from './market-store.js'
 import { MarketService } from './market-service.js'
+import { drainCallbackProbeObserverCostMonotonicUS, monotonicMicroseconds, validateMarketTrafficDrainWindow, wrapAcceptedCallback } from './market-traffic-callback-probe.js'
 import { ChartNotificationEncoder } from './chart-notifications.js'
 import { createChartAcquisitionFixture, createChartColdBoundaryFixture, seedCachedListProjection, seedChartScrollBenchmark, seedHistoricalStatisticsBoundary, seedInstrumentNavigationBenchmark } from '../e2e-fixtures.js'
 import { backgroundArchiveRows, seedMarketResources, startBackgroundArchive } from '../market-resource-fixtures.js'
@@ -76,16 +77,22 @@ async function request(value) {
     }
     return preferences
   }
-  if (value.snapshot) return service.snapshot(value.snapshot.timeframe, value.snapshot)
+  if (value.snapshot) return service.snapshot(value.snapshot)
   if (value.dataAudit) return service.dataAuditRequest(value.dataAudit)
   if (value.historyDownload) return service.historyDownloadRequest(value.historyDownload)
-  if (value.chartWindow) {
-    const { instId, timeframe, endHour, historyBars } = value.chartWindow
-    return service.prepareChartWindow(instId, timeframe, endHour, historyBars)
+  if (value.chartFocus || value.chartWindow || value.chartLocal || value.chartHistory) {
+    if (service.closing || service.disposed) throw new Error('Market service is closed.')
+    const task = service.ready.then(() => {
+      if (value.chartFocus) { service.preparedCharts.setFocus(value.chartFocus.target, value.chartFocus.id); return { ok: true } }
+      const { instId, timeframe, endHour, historyBars, focusId } = value.chartWindow ?? value.chartLocal ?? value.chartHistory
+      if (value.chartWindow) return service.preparedCharts.prepare(instId, timeframe, endHour, historyBars, { focusId })
+      if (value.chartLocal) return service.preparedCharts.local(instId, timeframe)
+      return service.preparedCharts.localHistory(instId, timeframe, endHour)
+    })
+    service.barTasks.add(task)
+    return task.finally(() => service.barTasks.delete(task))
   }
-  if (value.chartLocal) return service.localChartWindow(value.chartLocal.instId, value.chartLocal.timeframe)
-  if (value.chartHistory) return service.localChartHistory(value.chartHistory.instId, value.chartHistory.timeframe, value.chartHistory.endHour)
-  if (value.chartUniverse) return service.setChartUniverse(value.chartUniverse.instIds, value.chartUniverse.timeframe, value.chartUniverse.focusInstId)
+  if (value.chartUniverse) return service.preparedCharts.residentFrames()
   if (value.analysisSettings) {
     const input = value.analysisSettings
     if (input.action === 'save') metadata.updateAnalysisSettings({ model: input.model, apiKey: input.apiKey })
@@ -112,6 +119,19 @@ async function request(value) {
 
 async function probe(input) {
   if (!workerData.testMode) throw new Error('Backend probes are unavailable outside tests.')
+  if (input.action === 'persistCandles') {
+    for (const rows of Map.groupBy(input.candles, row => row.instrument).values()) await service.persistCandles(rows[0].instrument, rows, { projectList: false })
+    return { ok: true }
+  }
+  if (input.action === 'preparedDiagnostics') {
+    const pipeline = service.preparedCharts
+    const state = value => value ? { rows: value.rows.size, indicators: value.indicators.size, generation: value.generation,
+      calculating: Boolean(value.calculation), indicatorVersion: value.indicatorVersion, latestHour: value.latestHour } : null
+    return { tasks: [...pipeline.candidateTasks.keys()].map(value => value.key), queue: pipeline.candidateQueue.map(value => value.key),
+      seeds: [...pipeline.liveSeeds.keys()], sources: [...pipeline.sourceTasks.values()].map(value => ({ key: value.seriesKey, source: value.source, from: value.from, through: value.through })),
+      series: [...pipeline.universe.keys()].map(key => ({ key, compact: state(pipeline.liveStates.get(key)), history: state(pipeline.series.get(key)),
+        cached: pipeline.cached(key)?.indicatorState, cachedGeneration: pipeline.cached(key)?.generation })) }
+  }
   if (input.action === 'seedChartScrollBenchmark') return seedChartScrollBenchmark(store, service, { instId: input.instId })
   if (input.action === 'coldBoundaryInstall') {
     coldBoundaryFixture?.remove()
@@ -136,7 +156,8 @@ async function probe(input) {
     resourceFixture = await seedMarketResources(store, service, input)
     return { ...resourceFixture.fixture, backendThreadId: threadId, diagnostics: store.getDiagnostics() }
   }
-  if (input.action === 'scaleTick') { if (!resourceFixture) throw new Error('Resource benchmark is not seeded.'); return resourceFixture.tick(input) }
+  if (input.action === 'scaleLoadStart') { if (!resourceFixture) throw new Error('Resource benchmark is not seeded.'); return resourceFixture.startLoad(input) }
+  if (input.action === 'scaleLoadRead') { if (!resourceFixture) throw new Error('Resource benchmark is not seeded.'); return resourceFixture.readLoad(input) }
   if (input.action === 'scaleStop') { if (!resourceFixture) throw new Error('Resource benchmark is not seeded.'); return resourceFixture.stop() }
   if (input.action === 'persistNavigationCatalog') {
     const lease = { observedAt: Date.now(), expiresAt: Date.now() + 90_000 }
@@ -167,6 +188,171 @@ async function probe(input) {
     sourceProbe = null
     return { ok: true }
   }
+  if (input.action === 'marketTrafficEvidence') {
+    if (input.phase === 'arm') {
+      if (service.__marketTrafficEvidence) throw new Error('Market traffic receipt capture is already armed.')
+      const candidateIDs = [...(service.candidateIDs ?? [])].sort()
+      const eligibleIDs = [...service.listedUniverse].sort()
+      const focusedInstrumentID = service.preparedCharts.focus?.instId ?? null
+      const liquidity = service.prefs().liquidity
+      const booksEnabled = liquidity.depth.enabled || liquidity.slippage.enabled
+      const publicSubscriptions = service.publicRealtime.subscriptions
+      const expectedSubscriptions = {
+        tickers: candidateIDs,
+        'open-interest': candidateIDs,
+        books: booksEnabled ? [...(service.publicSubscriptionDemand?.books ?? [])].sort() : [],
+        trades: candidateIDs.filter(instId => service.statisticsDemand(instId)).sort(),
+        candle5m: [], candle15m: [], candle1H: [],
+      }
+      for (const { instId, timeframe } of service.realtime.subscriptions.values()) {
+        const channel = `candle${timeframe}`
+        expectedSubscriptions[channel] ??= []
+        expectedSubscriptions[channel].push(instId)
+      }
+      for (const channel of ['candle5m', 'candle15m', 'candle1H']) expectedSubscriptions[channel].sort()
+      const actualSubscriptions = {
+        tickers: [], 'open-interest': [], books: [], trades: [], candle5m: [], candle15m: [], candle1H: [],
+      }
+      for (const { instId, channel } of publicSubscriptions.values()) if (channel !== 'instruments') actualSubscriptions[channel].push(instId)
+      for (const { instId, timeframe } of service.realtime.subscriptions.values()) actualSubscriptions[`candle${timeframe}`].push(instId)
+      for (const values of Object.values(actualSubscriptions)) values.sort()
+      for (const channel of Object.keys(expectedSubscriptions)) {
+        if (!actualSubscriptions[channel]) actualSubscriptions[channel] = []
+        if (JSON.stringify(actualSubscriptions[channel]) !== JSON.stringify(expectedSubscriptions[channel])) {
+          throw new Error(`Application ${channel} demand does not match its configured eligible/focus demand.`)
+        }
+      }
+      if (booksEnabled && eligibleIDs.some(instId => !expectedSubscriptions.books.includes(instId))) {
+        throw new Error('Configured depth/slippage checks require books for every eligible listed contract.')
+      }
+      const expectedTrades = [...new Set([...eligibleIDs, focusedInstrumentID].filter(Boolean))].sort()
+      if (JSON.stringify(expectedSubscriptions.trades) !== JSON.stringify(expectedTrades)) {
+        throw new Error('Configured trade statistics demand does not match listed contracts and chart focus.')
+      }
+      const capture = { expectedSubscriptions, actualSubscriptions,
+        candidateIDs, eligibleIDs, focusedInstrumentID, booksEnabled, nativeIngressEvents: [], callbackEvents: [],
+        callbackEventsByID: new Map(), probeObserverCostMonotonicUS: 0, ingressOptions: new Set(), restore: [] }
+      const restoreCapture = () => {
+        for (const restore of capture.restore.splice(0).reverse()) restore()
+        if (service.__marketTrafficEvidence === capture) delete service.__marketTrafficEvidence
+      }
+      capture.restoreCapture = restoreCapture
+      drainCallbackProbeObserverCostMonotonicUS()
+      const installIngressObserver = options => {
+        if (capture.ingressOptions.has(options)) return
+        capture.ingressOptions.add(options)
+        const previous = options.onMarketTrafficIngress
+        const observer = (events, observerCostUS = 0) => {
+          capture.probeObserverCostMonotonicUS += Number.isSafeInteger(observerCostUS) && observerCostUS >= 0 ? observerCostUS : 0
+          if (Array.isArray(events)) capture.nativeIngressEvents.push(...events)
+        }
+        options.onMarketTrafficIngress = observer
+        capture.restore.push(() => {
+          if (options.onMarketTrafficIngress !== observer) return
+          if (previous === undefined) delete options.onMarketTrafficIngress
+          else options.onMarketTrafficIngress = previous
+        })
+      }
+      const wrap = (options, name, channelFor) => {
+        wrapAcceptedCallback(options, name, (args, timing) => {
+          const evidence = channelFor(args)
+          if (!evidence) return
+          const events = evidence.context?.marketTrafficEvents
+          if (timing.phase === 'entry') {
+            if (!Array.isArray(events)) return
+            const records = events.map(event => {
+              if (event.channel !== evidence.channel || event.instId !== evidence.instId) return null
+              const record = { ...event, callbackID: timing.callbackID,
+                callbackEnteredAtMonotonicUS: timing.callbackEnteredAtMonotonicUS,
+                callbackAcceptedAtMonotonicUS: null, receivedAt: evidence.context.receivedAt,
+                fillCount: evidence.fillCount ?? 0 }
+              capture.callbackEvents.push(record)
+              return record
+            })
+            capture.callbackEventsByID.set(timing.callbackID, records.filter(Boolean))
+          } else {
+            for (const record of capture.callbackEventsByID.get(timing.callbackID) ?? []) {
+              record.callbackAcceptedAtMonotonicUS = timing.callbackAcceptedAtMonotonicUS
+            }
+            capture.callbackEventsByID.delete(timing.callbackID)
+          }
+        }, capture.restore)
+      }
+      try {
+        const publicMarket = service.publicRealtime
+        const instruments = new Set()
+        const instrumentChannels = { onTicker: 'tickers', onOpenInterest: 'open-interest', onBook: 'books' }
+        const instrumentOptionForShard = options => {
+          if (instruments.has(options)) return
+          instruments.add(options)
+          for (const [name, channel] of Object.entries(instrumentChannels)) instrumentCallbackForOptions(options, name, channel)
+          instrumentCallbackForOptions(options, 'onTrades', 'trades')
+        }
+        function instrumentCallbackForOptions(options, name, channel) {
+          installIngressObserver(options)
+          wrap(options, name, ([instId, values, context]) => ({ channel, instId, context,
+            ...(channel === 'trades' ? { fillCount: Array.isArray(values) ? values.length : 0 } : {}) }))
+        }
+        for (const market of [...publicMarket.shards, publicMarket.controlShard].filter(Boolean)) instrumentOptionForShard(market.options)
+        const makeShard = publicMarket.makeShard
+        const wrappedMakeShard = function (...args) {
+          const market = makeShard.apply(this, args)
+          instrumentOptionForShard(market.options)
+          return market
+        }
+        publicMarket.makeShard = wrappedMakeShard
+        capture.restore.push(() => { if (publicMarket.makeShard === wrappedMakeShard) publicMarket.makeShard = makeShard })
+        installIngressObserver(service.realtime.options)
+        wrap(service.realtime.options, 'onForming', ([row, context]) => ({
+          channel: `candle${row?.timeframe}`, instId: row?.instrument, context,
+        }))
+        wrap(service.realtime.options, 'onConfirmed', ([row, context]) => ({
+          channel: `candle${row?.timeframe}`, instId: row?.instrument, context,
+        }))
+        service.__marketTrafficEvidence = capture
+        return { source: 'market-service accepted callbacks after native parsing', expectedSubscriptions, actualSubscriptions,
+          marketDemand: { candidateIDs, eligibleIDs, focusedInstrumentID, booksEnabled } }
+      } catch (error) {
+        restoreCapture()
+        throw error
+      }
+    }
+    if (input.phase === 'end') {
+      const capture = service.__marketTrafficEvidence
+      if (!capture) throw new Error('Market traffic receipt capture was not armed.')
+      const { sampleStartedAt, sampleEndedAt, sampleStartedMonotonicUS, sampleEndedMonotonicUS,
+        drainDeadlineMonotonicUS } = input
+      const snapshotCapture = () => {
+        capture.probeObserverCostMonotonicUS += drainCallbackProbeObserverCostMonotonicUS()
+        return { source: 'fixture socket write matched to native WebSocket handler entry and fulfilled production callback', sampleStartedAt, sampleEndedAt,
+          sampleStartedMonotonicUS, sampleEndedMonotonicUS, drainDeadlineMonotonicUS,
+          expectedSubscriptions: capture.expectedSubscriptions, actualSubscriptions: capture.actualSubscriptions,
+          marketDemand: { candidateIDs: capture.candidateIDs, eligibleIDs: capture.eligibleIDs,
+            focusedInstrumentID: capture.focusedInstrumentID, booksEnabled: capture.booksEnabled },
+          applicationReceipts: { callbackEvents: capture.callbackEvents.map(event => ({ ...event })) },
+          nativeIngressEvents: capture.nativeIngressEvents.map(event => ({ ...event })),
+          probeObserverCostMonotonicUS: capture.probeObserverCostMonotonicUS }
+      }
+      try {
+        if (!Number.isSafeInteger(sampleStartedAt) || !Number.isSafeInteger(sampleEndedAt) || sampleEndedAt <= sampleStartedAt) {
+          throw new Error('Market traffic receipt capture requires the complete fixture sample window.')
+        }
+        validateMarketTrafficDrainWindow(input)
+        while (monotonicMicroseconds() < drainDeadlineMonotonicUS) {
+          const remainingMS = (drainDeadlineMonotonicUS - monotonicMicroseconds()) / 1_000
+          await new Promise(resolve => setTimeout(resolve, Math.max(1, Math.ceil(remainingMS))))
+        }
+        return snapshotCapture()
+      } catch (error) {
+        // Return a serializable failure together with the raw capture; worker
+        // RPC errors preserve only message/stack and would discard this data.
+        return { ...snapshotCapture(), captureError: { name: error.name, message: error.message } }
+      } finally {
+        capture.restoreCapture()
+      }
+    }
+    throw new Error('Market traffic receipt capture phase must be arm or end.')
+  }
   if (input.action === 'diagnostics') return { backendThreadId: threadId, tasks: service.history.sync.listTasks(), writeMetrics: store.getWriteMetrics() }
   if (input.action === 'backgroundStart') return startBackgroundArchive(store, service)
   if (input.action === 'backgroundStatus') {
@@ -189,9 +375,11 @@ onOperationMessage(parentPort, 'market-backend', async ({ id, method, value }) =
     else if (method === 'probe') result = await probe(value)
     else if (method === 'dispose') {
       sourceProbe?.release()
-      await service.dispose()
-      await store.close()
-      metadata.close()
+      const failures = []
+      for (const close of [() => service.dispose(), () => store.close(), () => metadata.close()]) {
+        try { await close() } catch (error) { failures.push(error) }
+      }
+      if (failures.length) throw new AggregateError(failures, `Market backend shutdown failed: ${failures.map(error => error?.message ?? String(error)).join('; ')}`)
       result = { ok: true }
     } else throw new Error('Unsupported backend operation.')
     return { id, value: result }

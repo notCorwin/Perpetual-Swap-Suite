@@ -131,7 +131,7 @@ test('public settings and market responses never contain the saved analysis cred
       await request({ analysisSettings: { action: 'read' } }),
       await request({ preferences: { action: 'read' } }),
       await request({ preferences: { action: 'update', values: { chartTimeframe: previous.chartTimeframe } } }),
-      await request({ snapshot: { timeframe: '15m', sinceRevision: -1 } }),
+      await request({ snapshot: { sinceRevision: -1 } }),
       await request({ dataAudit: { action: 'status' } }),
     ]
     for (const response of responses) {

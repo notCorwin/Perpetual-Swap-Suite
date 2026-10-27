@@ -3,8 +3,10 @@ import { test } from 'node:test'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createInterface } from 'node:readline'
 import { _electron } from 'playwright'
 import { summarizeOperations } from '../../scripts/operation-report.mjs'
+import { isOperationJournal, readOperationJournal } from '../../electron/services/operation-journal.js'
 
 test('Electron persists actual renderer, graphics and database work across worker shutdown', { timeout: 60_000 }, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'operation-desktop-'))
@@ -27,8 +29,8 @@ test('Electron persists actual renderer, graphics and database work across worke
   await request({ e2e: { action: 'seedCandles', candles } })
   await request({ chartWindow: { instId: 'BTC-USDT-SWAP', timeframe: '5m', historyBars: 96 } })
   const fixture = await request({ e2e: { action: 'seedCachedListProjection' } })
-  await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click()
   await page.locator('[aria-label="Chart timeframe"] button').filter({ hasText: /^1H$/i }).click()
+  await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click()
   await page.locator(`svg[data-rendered-inst="${fixture.instId}"][data-rendered-timeframe="1H"]`).waitFor()
   const capture = await request({ captureChart: { x: 0, y: 0, width: 160, height: 100, output: 'png' } })
   assert.ok(capture.imageDataURL.startsWith('data:image/png;base64,'))
@@ -50,7 +52,14 @@ test('Electron persists actual renderer, graphics and database work across worke
   const health = await Promise.all(files.filter(file => file.endsWith('.health.json')).map(async file => JSON.parse(await readFile(join(operations, file), 'utf8'))))
   assert.ok(health.length >= 4, 'Main/backend/database/compute workers need distinct execution journals.')
   assert.ok(health.every(value => value.closed && value.pending === 0 && value.failed === 0))
-  const records = (await Promise.all(files.filter(file => file.endsWith('.jsonl')).map(async file => (await readFile(join(operations, file), 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line))))).flat()
+  const records = (await Promise.all(files.filter(isOperationJournal).map(async file => {
+    const events = []
+    const lines = createInterface({ input: readOperationJournal(join(operations, file)), crlfDelay: Infinity })
+    for await (const line of lines) if (line) events.push(JSON.parse(line))
+    return events
+  }))).flat()
+  assert.ok(records.length > 0)
+  assert.equal(records.length, health.reduce((count, value) => count + value.recorded, 0), 'Every admitted record must survive decoding across all executions.')
   assert.ok(records.every(record => record.schemaVersion === 2 && ['start', 'end'].includes(record.phase)))
   if (process.env.PERPETUAL_SWAP_OPERATION_SCENARIO) assert.ok(records.every(record => record.scenarioId === process.env.PERPETUAL_SWAP_OPERATION_SCENARIO), 'Every execution must retain the sandbox scenario identity.')
   const completed = new Map(records.filter(record => record.phase === 'end').map(record => [record.id, record]))

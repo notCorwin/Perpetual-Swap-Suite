@@ -166,7 +166,7 @@ test('a confirmation without a preceding forming update advances receipt before 
   push(socket, raw(epoch, 102, 2, true))
   await began.promise
   assert.deepEqual(f.market.getProgress(btc.instId, btc.timeframe), {
-    receivedThrough: epoch, confirmedThrough: epoch, committedThrough: null, pendingConfirmations: 1,
+    receivedThrough: epoch, confirmedThrough: epoch, committedThrough: null, pendingConfirmations: 1, committing: true,
   })
   write.resolve()
   await f.market.whenIdle()
@@ -194,6 +194,102 @@ test('a failed durable write never advances committed coverage and allows the sa
   assert.equal(f.market.getForming(btc.instId, btc.timeframe), null)
   assert.equal(f.market.getState().error, '')
   assert.equal(f.market.getState().updatedAt, f.clock.now())
+})
+
+test('a new forming observation resumes a failed confirmation without replay or a retry timer', async t => {
+  let available = false
+  const committed: number[] = []
+  const f = fixture({ onConfirmed: candle => {
+    if (!available) throw new Error('Writer unavailable.')
+    committed.push(candle.close)
+  } })
+  t.after(() => f.market.close())
+  const socket = await f.open()
+  const timers = f.clock.timers.size
+  push(socket, raw(epoch, 102, 2, true))
+  await f.market.whenIdle()
+  assert.equal(f.market.getProgress(btc.instId, btc.timeframe).pendingConfirmations, 1)
+  assert.equal(f.market.getProgress(btc.instId, btc.timeframe).committedThrough, null)
+  assert.equal(f.clock.timers.size, timers, 'Local persistence failure must not add a retry timer.')
+  available = true
+  push(socket, raw(epoch + 300_000, 104))
+  await f.market.whenIdle()
+  assert.deepEqual(committed, [102])
+  assert.equal(f.market.getProgress(btc.instId, btc.timeframe).pendingConfirmations, 0)
+  assert.equal(f.market.getForming(btc.instId, btc.timeframe)?.timestamp, epoch + 300_000)
+})
+
+test('a failed revision keeps later corrections ordered until writer recovery', async t => {
+  let available = false, attempts = 0
+  const committed: number[] = []
+  const f = fixture({ onConfirmed: candle => {
+    attempts++
+    if (!available) throw new Error('Writer unavailable.')
+    committed.push(candle.close)
+  } })
+  t.after(() => f.market.close())
+  const socket = await f.open()
+  push(socket, raw(epoch, 101, 1, true))
+  await f.market.whenIdle()
+  push(socket, raw(epoch, 102, 2, true))
+  await f.market.whenIdle()
+  assert.equal(f.market.getProgress(btc.instId, btc.timeframe).pendingConfirmations, 2)
+  assert.deepEqual(committed, [])
+  const pausedAttempts = attempts
+  await turn()
+  assert.equal(attempts, pausedAttempts, 'A persistent local failure must not spin.')
+  available = true
+  f.market.retryPendingConfirmations()
+  await f.market.whenIdle()
+  assert.deepEqual(committed, [101, 102])
+  assert.equal(f.market.getProgress(btc.instId, btc.timeframe).pendingConfirmations, 0)
+})
+
+test('writer recovery before the first rejection is observed still resumes its retained revision', async t => {
+  let attempts = 0, reject!: (error: Error) => void
+  const first = new Promise<void>((_resolve, fail) => { reject = fail })
+  const f = fixture({ onConfirmed: () => { attempts++; return attempts === 1 ? first : undefined } })
+  t.after(() => f.market.close())
+  const socket = await f.open()
+  push(socket, raw(epoch, 102, 2, true))
+  await turn()
+  assert.equal(attempts, 1)
+  reject(new Error('Writer temporarily unavailable.'))
+  f.market.retryPendingConfirmations()
+  await f.market.whenIdle()
+  assert.equal(attempts, 2)
+  assert.equal(f.market.getProgress(btc.instId, btc.timeframe).pendingConfirmations, 0)
+})
+
+test('a writer recovery trigger between failure and task release is not lost', async t => {
+  let available = false, attempts = 0
+  let market: RealtimeMarket<Candle>
+  const f = fixture({
+    onConfirmed: () => { attempts++; if (!available) throw new Error('Writer unavailable.') },
+    onState: state => {
+      if (state.error.includes('Writer unavailable')) queueMicrotask(() => { available = true; market.retryPendingConfirmations() })
+    },
+  })
+  market = f.market
+  t.after(() => market.close())
+  const socket = await f.open()
+  push(socket, raw(epoch, 102, 2, true))
+  await market.whenIdle()
+  assert.equal(attempts, 2)
+  assert.equal(market.getProgress(btc.instId, btc.timeframe).pendingConfirmations, 0)
+})
+
+test('shutdown reports retained uncommitted revisions without retrying forever', async () => {
+  let attempts = 0
+  const f = fixture({ onConfirmed: () => { attempts++; throw new Error('Disk is full.') } })
+  const socket = await f.open()
+  push(socket, raw(epoch, 102, 2, true))
+  await f.market.whenIdle()
+  const closing = f.market.close()
+  assert.equal(closing, f.market.close())
+  await assert.rejects(closing, /1 uncommitted candle revisions.*Disk is full/)
+  assert.equal(attempts, 2, 'Shutdown makes one final attempt and then reports failure.')
+  assert.equal(f.market.getProgress(btc.instId, btc.timeframe).pendingConfirmations, 1)
 })
 
 test('a failed forming projection can retry the same event and malformed input is reported', async t => {

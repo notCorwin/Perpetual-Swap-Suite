@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
 import { requireForegroundTests } from '../electron/test-presentation.js'
-import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureNativeColdBoundary, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from './chart-acceptance.mjs'
+import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureNativeColdBoundary, measureChartIntentLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from './chart-acceptance.mjs'
 
 requireForegroundTests()
 
@@ -33,7 +33,7 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
   let sourceRequests = []
   const foreground = await foregroundPaintWindow(electron, page)
   try {
-    await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
+    await installRequestProbe(electron, fixture.instId)
     await openChart(page, fixture)
     const warmedHistory = new Map()
     for (const timeframe of fixture.timeframes) {
@@ -42,7 +42,8 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
       warmedHistory.set(timeframe, await waitForLocalHistory(electron, page, fixture, timeframe, { requireIndicators: true }))
     }
     await electron.evaluate(async () => {
-      globalThis.__chartRequestProbe.holdLatest = true
+      globalThis.__chartRequestProbe.holdHistorical = true
+      globalThis.__chartRequestProbe.holdLocal = true
       await globalThis.__marketBackend.probe({ action: 'sourceHold', hold: true })
     })
     for (const timeframe of fixture.timeframes) {
@@ -50,7 +51,7 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
       await waitForRendered(page, fixture, timeframe)
       const residentHistoryBars = warmedHistory.get(timeframe)
       const beforeScrolling = await readRequestProbe(electron)
-      await startPaintProbe(page, fixture)
+      await startPaintProbe(page, fixture, { requireMatureData: true, requireWarmStatistics: true })
       const intervalMS = fixture.series[timeframe].intervalMS
       const phases = []
       let distance = 0
@@ -61,8 +62,8 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
         distance += candles
         const end = fixture.end - distance * intervalMS
         await waitForRendered(page, fixture, timeframe, end)
-        const observation = await measurePaintLatency(page, { inputs, targets: inputs.map((_, index) => fixture.end - (startingDistance + candles / inputs.length * (index + 1)) * intervalMS) })
-        assert.ok(observation.latestInputToPaintMS < 100, `Warm ${timeframe} ${name} took ${observation.latestInputToPaintMS} ms from latest input to its first paint opportunity.`)
+        const observation = await measureChartIntentLatency(page, { inputs, targets: inputs.map((_, index) => fixture.end - (startingDistance + candles / inputs.length * (index + 1)) * intervalMS) })
+        assert.ok(observation.maxInputToRafSampleMS < 100, `Warm ${timeframe} ${name} had an intent take ${observation.maxInputToRafSampleMS} ms to reach its exact or coalesced chart target.`)
         phases.push({
           name, frames: options.frames ?? 1, eventsPerFrame: options.eventsPerFrame ?? 1,
           candles, end, ...observation,
@@ -76,15 +77,16 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
       await sweep('line-mode', { deltaY: -9, deltaMode: 1 }, -12)
       const paint = await finishPaintProbe(page)
       assertCompletePaints(paint)
-      assert.equal(paint.pendingFrames, 0, 'Resident navigation must never wait for stalled speculative preparation.')
+      assert.equal(paint.pendingFrames, 0, 'Resident navigation must never wait for held disk deliveries.')
       const requests = await readRequestProbe(electron)
       const scrollingRequests = requests.calls.slice(beforeScrolling.calls.length)
       const historicalRequests = scrollingRequests.filter(call => Number.isFinite(call.endHour))
       const scrollingSourceRequests = requests.sourceRequests.slice(beforeScrolling.sourceCalls)
       const sources = separateSourceMaintenance(scrollingSourceRequests, fixture)
-      assert.ok(historicalRequests.every(call => call.historyBars > 96), `Resident targets must only issue bulk speculative preparation: ${JSON.stringify(historicalRequests)}`)
+      assert.ok(historicalRequests.every(call => call.kind === 'history'), 'Resident navigation may issue only observational history reads.')
+      assert.equal(requests.legacyWindowCalls, 0)
       assert.deepEqual(sources.historical, [], `Warm scrolling must not download fixture history: ${JSON.stringify(sources.historical)}`)
-      assert.ok(requests.maxHistoricalActive <= 1, 'Resident targets must stay independent of the stalled speculative preparation lane.')
+      assert.ok(requests.maxHistoricalActive <= 2, 'Resident targets must stay independent of the held disk deliveries lane.')
       timeframes.push({
         timeframe, phases, ...paint, commits: paint.commits.length,
         preparedRequests: historicalRequests.length,
@@ -109,50 +111,46 @@ const performanceReport = await withBenchmarkApp(async (electron, page, fixture)
 })
 
 const delayedHistory = await withBenchmarkApp(async (electron, page, fixture) => {
-  // This case intentionally disables the durable bulk lane before mounting
-  // React. Otherwise a 1200-candle jump is correctly an immediate local hit.
-  await installRequestProbe(electron, fixture.instId, { disableLocalHistory: true, initialHistoryBars: 1_000, capHistoricalWindows: true })
+  await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
   try {
     await openChart(page, fixture)
-    // Prime native latest snapshots before measuring the fallback path.
     for (const timeframe of fixture.timeframes) {
       await selectTimeframe(page, timeframe)
       await waitForRendered(page, fixture, timeframe)
     }
-    await removeRequestProbe(electron)
-    await installRequestProbe(electron, fixture.instId, { holdHistorical: true, disableLocalHistory: true })
-    await startPaintProbe(page, fixture)
+    await startPaintProbe(page, fixture, { requireMatureData: true, requireWarmStatistics: true })
     const started = Date.now()
     await wheelBurst(page, { deltaY: 14_400 })
     while (!(await readRequestProbe(electron)).held) {
-      assert.ok(Date.now() - started < 10_000, 'The chart did not request its uncached target.')
+      assert.ok(Date.now() - started < 10_000, 'The chart did not start the old durable history read.')
       await new Promise(resolve => setTimeout(resolve, 20))
     }
     await wheelBurst(page, { frames: 4, eventsPerFrame: 32, deltaY: 12 })
     await wheelBurst(page, { frames: 2, eventsPerFrame: 32, deltaY: -12 })
-    await new Promise(resolve => setTimeout(resolve, Math.max(0, 1_500 - (Date.now() - started))))
     const expectedEnd = fixture.end - 1_264 * fixture.intervalMS
-    const heldEnd = Number(await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-end'))
-    assert.equal(heldEnd, fixture.end, 'An incomplete target must never replace the last correct paint.')
+    await waitForRendered(page, fixture, fixture.timeframe, expectedEnd)
+    await new Promise(resolve => setTimeout(resolve, Math.max(0, 1_500 - (Date.now() - started))))
     const heldRequests = await readRequestProbe(electron)
-    assert.equal(heldRequests.calls.length, heldRequests.callsAtHold, `A held request must not accumulate an IPC backlog: ${JSON.stringify(heldRequests.calls)}`)
+    assert.equal(heldRequests.heldSettled, false, 'The latest cursor must finish before the older disk reply is released.')
+    assert.ok(heldRequests.maxHistoricalActive <= 2 && heldRequests.maxLocalActive <= 2, 'Navigation must bound each pure read lane independently of backend focus demand.')
+    assert.equal(heldRequests.legacyWindowCalls, 0)
+    const heldEnd = Number(await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-end'))
+    assert.equal(heldEnd, expectedEnd)
+    const beforeRelease = await page.evaluate(() => window.__chartPaintProbe.commits.length)
     await releaseRequestProbe(electron)
     await waitForRendered(page, fixture, fixture.timeframe, expectedEnd)
-    await selectTimeframe(page, '5m')
-    await selectTimeframe(page, '15m')
-    await selectTimeframe(page, '1H')
-    await waitForRendered(page, fixture)
+    await page.evaluate(async () => { for (let index = 0; index < 8; index += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
     const paint = await finishPaintProbe(page)
     assertCompletePaints(paint)
+    assert.ok(paint.commits.slice(beforeRelease).every(commit => commit.end === expectedEnd && commit.timeframe === fixture.timeframe), 'Releasing the old disk reply must never repaint its obsolete cursor.')
     const requests = await readRequestProbe(electron)
     const sources = separateSourceMaintenance(requests.sourceRequests, fixture)
-    assert.deepEqual(sources.historical, [], `Prepared timeframe switches unexpectedly downloaded fixture history: ${JSON.stringify(sources.historical)}`)
-    assert.ok(!paint.commits.some(commit => commit.end === fixture.end - 1_200 * fixture.intervalMS), 'An obsolete held target was drawn after newer input.')
+    assert.deepEqual(sources.historical, [], `Pure history reads unexpectedly downloaded fixture data: ${JSON.stringify(sources.historical)}`)
     return {
-      heldForMS: 1_500, heldEnd, expectedEnd, latestIntentPreserved: true,
+      heldForMS: Date.now() - started, heldEnd, expectedEnd, latestIntentPreserved: true,
       ...paint, commits: paint.commits.length,
-      preparedRequests: requests.calls.length, maxConcurrentRequests: requests.maxActive,
-      localHistoryReads: requests.historyCalls.length, transferredHistoryBars: requests.transferredHistoryBars,
+      historyReads: requests.historyCalls.length, maxConcurrentHistoryReads: requests.maxHistoricalActive,
+      transferredHistoryBars: requests.transferredHistoryBars,
       sourceRequests: requests.sourceRequests, currentMaintenanceRequests: sources.currentMaintenance,
       repeatedSourceDownloads: sources.historical.length,
     }
@@ -164,7 +162,7 @@ const nativeColdBoundary = await withBenchmarkApp((electron, page) => measureNat
 
 console.log(JSON.stringify({
   generatedAt: new Date().toISOString(),
-  mode: 'real-electron-bulk-history-svg-frame-correctness-and-input-to-paint-opportunity',
+  mode: 'real-electron-bulk-history-svg-frame-correctness-and-input-to-renderer-raf-sample',
   performance: performanceReport,
   delayedHistory,
   latencyCoveredPrefetch,

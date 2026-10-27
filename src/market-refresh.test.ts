@@ -35,15 +35,14 @@ const fixture = async (config: ReturnType<typeof preferences>, fetcher: typeof f
   const store = await MarketStore.open(root)
   const service = new MarketService(store, () => config, fetcher, false)
   await service.ready
-  service.projectListEntry = async () => null
+  service.preparedCharts.setUniverse = () => ({ frames: [] })
   service.updateRanking = async () => undefined
-  service.scheduleListProjection = () => undefined
   for (const lane of service.requestLanes.values()) lane.interval = 0
   const close = async () => { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
   return { service, store, close }
 }
 
-test('150 contract checks use one bulk OI and ticker request per refresh and publish their prices together', async () => {
+test('150 contract checks share bulk sources and reuse valid OI across price refreshes', async () => {
   const instruments = Array.from({ length: 150 }, (_, index) => instrument(`COIN${index}`))
   const calls = new Map<string, number>()
   let price = 100
@@ -62,10 +61,10 @@ test('150 contract checks use one bulk OI and ticker request per refresh and pub
     assert.deepEqual([...calls.values()], [1, 1, 1])
     price = 200
     await f.service.refresh()
-    const rows = f.service.listRowsFor('15m')
+    const rows = f.service.listRowsFor()
     assert.equal(rows.length, 150)
     assert.ok(rows.every(row => row.lastPrice === 200))
-    assert.deepEqual([...calls.values()], [2, 2, 2])
+    assert.deepEqual([...calls.values()], [2, 2, 1])
     const sources = instruments.map(value => f.service.observations.get(value.instId).openInterest)
     assert.equal(new Set(sources.map(value => value.observedAt)).size, 1)
     assert.ok(sources.every(value => value.expiresAt === value.observedAt + 90_000))
@@ -91,6 +90,10 @@ test('saturated slow book requests cannot block metadata and ticker renewal', as
   try {
     await f.service.refresh()
     assert.equal(f.service.catalog.size, 17)
+    for (const value of instruments) {
+      f.service.observations.get(value.instId).book.expiresAt = 0
+      f.service.books.invalidate(value.instId)
+    }
     blocked = true
     refresh = f.service.refresh()
     await waitFor(() => activeBooks === 16)
@@ -127,6 +130,42 @@ test('a known failing spread excludes a contract without downloading its history
   } finally { await f.close() }
 })
 
+test('a shared bulk OI rejection skips history and books for the entire excluded universe', async context => {
+  const instruments = Array.from({ length: 289 }, (_, index) => instrument(`COIN${index}`))
+  const eligible = instruments.slice(-14), eligibleIDs = new Set(eligible.map(value => value.instId))
+  const paths: string[] = [], histories: string[] = []
+  const now = Math.floor(Date.now() / fiveMinutes) * fiveMinutes + 60_000
+  context.mock.method(Date, 'now', () => now)
+  const asOf = Math.floor(now / fiveMinutes) * fiveMinutes
+  const f = await fixture(preferences('spread', 'depth', 'slippage', 'volume24h', 'openInterest'), async input => {
+    const url = new URL(String(input)), path = url.pathname
+    paths.push(path)
+    if (path.endsWith('/public/instruments')) return response(instruments)
+    if (path.endsWith('/market/tickers')) return response(instruments.map(value => ticker(value.instId)))
+    if (path.endsWith('/public/open-interest')) return response(instruments.map(value => ({ instId: value.instId, oiUsd: eligibleIDs.has(value.instId) ? '6000000' : '1' })))
+    if (path.endsWith('/market/books')) {
+      assert.ok(eligibleIDs.has(url.searchParams.get('instId')!))
+      return response([book])
+    }
+    throw new Error(`Unexpected endpoint: ${path}`)
+  })
+  try {
+    f.service.history.ensurePrices = async (id: string) => {
+      histories.push(id)
+      assert.ok(eligibleIDs.has(id), 'A known OI failure cannot consume a historical request slot.')
+      return { rows: Array.from({ length: 288 }, (_, index) => ({ instrument: id, timeframe: '5m', timestamp: asOf - (288 - index) * fiveMinutes,
+        open: 99, high: 101, low: 98, close: 100, volume: 2_000, baseVolume: 20, quoteVolume: 200_000, confirmed: true })) }
+    }
+    const started = performance.now()
+    await f.service.refresh()
+    context.diagnostic(`289 contracts: ${histories.length} historical acquisitions, ${paths.filter(path => path.endsWith('/public/open-interest')).length} bulk OI request, ${(performance.now() - started).toFixed(1)} ms.`)
+    assert.deepEqual(new Set(histories), eligibleIDs)
+    assert.equal(paths.filter(path => path.endsWith('/public/open-interest')).length, 1)
+    assert.deepEqual(new Set(f.service.listRowsFor().map(row => row.instId)), eligibleIDs)
+    assert.equal((await f.service.snapshot()).catalogProgress.failed, 275)
+  } finally { await f.close() }
+})
+
 test('a book arriving after contract metadata changes cannot repopulate its invalidated observation', async () => {
   const gate = deferred()
   let current = instrument(), started = false
@@ -152,7 +191,9 @@ test('a book arriving after contract metadata changes cannot repopulate its inva
   } finally { gate.resolve(); await refresh; await f.close() }
 })
 
-test('a recovered OI source can serve a later history completion after the same scan initially failed', async () => {
+test('a recovered OI source can serve a later history completion after the shared retry deadline', async context => {
+  let now = Math.floor(Date.now() / fiveMinutes) * fiveMinutes + 60_000
+  context.mock.method(Date, 'now', () => now)
   const instruments = [instrument(), instrument('ETH')]
   const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
   const rows = (instId: string) => Array.from({ length: 288 }, (_, index) => ({ instrument: instId, timeframe: '5m', timestamp: asOf - (288 - index) * fiveMinutes, open: 99, high: 101, low: 98, close: 100, volume: 2_000, baseVolume: 20, quoteVolume: 200_000, confirmed: true }))
@@ -179,11 +220,13 @@ test('a recovered OI source can serve a later history completion after the same 
     }
     refresh = f.service.refresh()
     await waitFor(() => historyStarted && oiCalls === 1 && f.service.catalogChecks.get(instruments[0].instId)?.status === 'unknown')
+    now = f.service.openInterest.retryAt
     await f.store.appendCandles(rows(instruments[1].instId))
     gate.resolve(); await refresh
-    assert.equal(oiCalls, 2, 'A rejected round-level source promise must not poison later candidates after network recovery.')
+    assert.equal(oiCalls, 2, 'The shared deadline permits one new acquisition after network recovery.')
     assert.equal(f.service.catalog.get(instruments[1].instId)?.status, 'verified')
-    assert.equal(f.service.observations.get(instruments[0].instId).openInterest, undefined, 'The failed first attempt cannot manufacture an observation.')
+    const recovered = f.service.observations.get(instruments[0].instId).openInterest
+    if (recovered) assert.equal(recovered.observedAt, now, 'A sibling can reuse the successful recovery, never manufacture a lease from the failed first attempt.')
   } finally { gate.resolve(); await refresh; await f.close() }
 })
 
@@ -223,11 +266,12 @@ test('a delayed previous-boundary history read cannot replace the current durabl
   } finally { gate.resolve(); await refresh; await f.close() }
 })
 
-test('reconnect recovery admits later series while the first series waits, with prices preceding its statistics', async () => {
+test('reconnect admits every price series while charts retain ownership of statistics acquisition', async () => {
   const f = await fixture(preferences())
   const gate = deferred(), events: string[] = []
   let recovery: Promise<void> | undefined
   try {
+    f.service.listedUniverse = new Set(['BTC-USDT-SWAP', 'ETH-USDT-SWAP'])
     f.store.coverage = async () => ({ first: null, last: null, count: 0 })
     f.service.history.ensurePrices = async (id: string) => {
       events.push(`prices:${id}`)
@@ -235,11 +279,10 @@ test('reconnect recovery admits later series while the first series waits, with 
       return { rows: [] }
     }
     f.service.history.ensureStatistics = async (id: string) => { events.push(`statistics:${id}`); return { rows: [] } }
-    recovery = f.service.reconcileRealtime([{ instId: 'BTC-USDT-SWAP', timeframe: '5m' }, { instId: 'ETH-USDT-SWAP', timeframe: '1H' }])
-    await waitFor(() => events.includes('statistics:ETH-USDT-SWAP'))
-    assert.equal(events.includes('statistics:BTC-USDT-SWAP'), false)
+    recovery = f.service.reconcileRealtime([{ instId: 'BTC-USDT-SWAP', timeframe: '5m' }, { instId: 'ETH-USDT-SWAP', timeframe: '5m' }])
+    await waitFor(() => events.includes('prices:ETH-USDT-SWAP'))
     gate.resolve(); await recovery
-    for (const id of ['BTC-USDT-SWAP', 'ETH-USDT-SWAP']) assert.ok(events.indexOf(`prices:${id}`) < events.indexOf(`statistics:${id}`))
+    assert.deepEqual(events.sort(), ['prices:BTC-USDT-SWAP', 'prices:ETH-USDT-SWAP'])
   } finally { gate.resolve(); await recovery; await f.close() }
 })
 
@@ -249,14 +292,16 @@ test('failed reconnect recovery drains an already accepted sibling before report
   let siblingStarted = false, siblingWritten = false, finished = false
   let recovery: Promise<void> | undefined
   try {
+    f.service.listedUniverse = new Set(['BTC-USDT-SWAP', 'ETH-USDT-SWAP'])
     f.store.coverage = async () => ({ first: null, last: null, count: 0 })
     f.service.history.ensurePrices = async (id: string) => {
       if (id === 'BTC-USDT-SWAP') throw new Error('The first recovery source failed.')
       siblingStarted = true; await gate.promise
+      siblingWritten = true
       return { rows: [] }
     }
-    f.service.history.ensureStatistics = async () => { siblingWritten = true; return { rows: [] } }
-    const running: Promise<void> = f.service.reconcileRealtime([{ instId: 'BTC-USDT-SWAP', timeframe: '5m' }, { instId: 'ETH-USDT-SWAP', timeframe: '1H' }])
+    f.service.history.ensureStatistics = async () => { throw new Error('Collector recovery cannot own statistics acquisition.') }
+    const running: Promise<void> = f.service.reconcileRealtime([{ instId: 'BTC-USDT-SWAP', timeframe: '5m' }, { instId: 'ETH-USDT-SWAP', timeframe: '5m' }])
     recovery = running
     void running.then(() => { finished = true }, () => { finished = true })
     await waitFor(() => siblingStarted)
@@ -320,7 +365,7 @@ test('market subscribers receive the final bulk change together and stop receivi
     let reading: ReturnType<typeof f.service.snapshot> | undefined
     const unsubscribe = f.service.subscribeMarket(() => {
       notifications += 1
-      reading = f.service.snapshot('15m', { sinceRevision: before.revision, serviceSession: before.serviceSession })
+      reading = f.service.snapshot({ sinceRevision: before.revision, serviceSession: before.serviceSession })
     })
     price = 200
     await f.service.refresh()

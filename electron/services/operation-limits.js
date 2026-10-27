@@ -1,0 +1,1 @@
+export const MAX_OPERATION_BATCH_SIZE = 2_048

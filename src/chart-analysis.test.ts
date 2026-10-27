@@ -102,15 +102,82 @@ test('follow-ups can refer to visible partial answers after interruption', async
   assert.equal(requests[1].messages[2].content, 'Explain this range')
 })
 
-test('missing credentials and empty output produce actionable errors', async () => {
-  let captures = 0
-  const missing = new ChartAnalysisStore(async () => {}, async () => ({ model: DEFAULT_ANALYSIS_MODEL, hasAPIKey: false }))
-  await missing.analyze('BTC', async () => { captures++; return snapshot() })
+test('configuration errors stay stopped until a new explicit analysis after configuration changes', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] })
+  let captures = 0, requests = 0
+  let configuration = { model: DEFAULT_ANALYSIS_MODEL, hasAPIKey: false }
+  const store = new ChartAnalysisStore(async (_, text) => { requests++; text('Answer') }, async () => configuration)
+  const capture = async () => { captures++; return snapshot() }
+  await store.analyze('BTC', capture)
+  assert.match(store.get('BTC')!.error, /Configure a Gateway API Key/)
+  context.mock.timers.tick(300_000)
+  assert.equal(store.get('BTC')?.phase, 'error')
   assert.equal(captures, 0)
-  assert.match(missing.get('BTC')!.error, /Configure a Gateway API Key/)
-  const empty = new ChartAnalysisStore(async () => {}, settings)
+  assert.equal(requests, 0)
+  configuration = { model: '', hasAPIKey: true }
+  await store.analyze('BTC', capture)
+  assert.match(store.get('BTC')!.error, /Configure a model ID/)
+  assert.equal(captures, 0)
+  configuration = { model: 'fixture/vision', hasAPIKey: true }
+  await store.analyze('BTC', capture)
+  assert.equal(store.get('BTC')?.phase, 'ready')
+  assert.equal(store.get('BTC')?.model, 'fixture/vision')
+  assert.equal(captures, 1)
+  assert.equal(requests, 1)
+})
+
+test('explicit retries revalidate credentials and use the current model without recapturing', async () => {
+  const requests: Parameters<AnalysisRunner>[0][] = []
+  let captures = 0, configuration = { model: 'fixture/old', hasAPIKey: true }
+  const store = new ChartAnalysisStore(async (request, text) => {
+    requests.push(request)
+    if (requests.length === 1) throw new TypeError('Network disconnected.')
+    text('Recovered')
+  }, async () => configuration)
+  await store.analyze('BTC', async () => { captures++; return snapshot() })
+  const image = store.get('BTC')!.image, turnId = store.get('BTC')!.turns[0].id
+  configuration = { ...configuration, hasAPIKey: false }
+  await store.retry('BTC')
+  assert.match(store.get('BTC')!.error, /Configure a Gateway API Key/)
+  assert.equal(requests.length, 1)
+  configuration = { model: 'fixture/new', hasAPIKey: true }
+  await store.retry('BTC')
+  assert.equal(requests.length, 2)
+  assert.equal(requests[1].model, 'fixture/new')
+  assert.equal(store.get('BTC')?.phase, 'ready')
+  assert.equal(store.get('BTC')?.image, image)
+  assert.equal(store.get('BTC')?.turns.length, 1)
+  assert.equal(store.get('BTC')?.turns[0].id, turnId)
+  assert.equal(captures, 1)
+})
+
+test('stopping a retry during configuration loading prevents late recovery', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] })
+  let requests = 0, reads = 0, release = () => {}
+  const store = new ChartAnalysisStore(async () => { requests++; throw new Error('Offline') }, () => {
+    if (++reads === 1) return settings()
+    return new Promise(resolve => { release = () => { void settings().then(resolve) } })
+  })
+  await store.analyze('BTC', snapshot)
+  const retry = store.retry('BTC')
+  store.stop('BTC')
+  release(); await retry
+  context.mock.timers.tick(300_000)
+  assert.equal(requests, 1)
+  assert.equal(store.get('BTC')?.phase, 'stopped')
+  assert.equal(store.get('BTC')?.turns[0].status, 'stopped')
+})
+
+test('empty output produces an actionable terminal error', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] })
+  let requests = 0
+  const empty = new ChartAnalysisStore(async () => { requests++ }, settings)
   await empty.analyze('BTC', snapshot)
+  context.mock.timers.tick(300_000)
   assert.match(empty.get('BTC')!.error, /empty answer/)
+  assert.doesNotMatch(empty.get('BTC')!.error, /automatically/i)
+  assert.equal(empty.get('BTC')?.phase, 'error')
+  assert.equal(requests, 1)
 })
 
 function nativeFixture(status: number, data: string, interrupted = false, beforeTerminal?: Promise<void>) {
@@ -119,13 +186,13 @@ function nativeFixture(status: number, data: string, interrupted = false, before
     if (request.cancelGatewayFetch) { cancelled.push(request.cancelGatewayFetch); return { ok: true } }
     const { id, body } = request.gatewayFetch!
     bodies.push(body)
-    setTimeout(async () => {
+    setImmediate(async () => {
       const bytes = new TextEncoder().encode(data)
       // Deliberately split every multibyte UTF-8 character and SSE frame.
       for (const byte of bytes) events.dispatchEvent(new CustomEvent('radar-gateway-stream', { detail: { id, type: 'data', base64: btoa(String.fromCharCode(byte)) } satisfies GatewayEvent }))
       if (beforeTerminal) await beforeTerminal
       events.dispatchEvent(new CustomEvent('radar-gateway-stream', { detail: { id, type: interrupted ? 'error' : 'end', message: 'Gateway stream interrupted.' } satisfies GatewayEvent }))
-    }, 0)
+    })
     return { status, headers: { 'Content-Type': status === 200 ? 'text/event-stream' : 'application/json' } }
   } } as GatewayBridge
   return { fetch: createGatewayFetch(bridge, events), bodies, cancelled, events }
@@ -164,12 +231,36 @@ test('SDK preserves partial text on network and incomplete SSE failures without 
   }
 })
 
-test('HTTP errors remain visible and cancellation settles even before native headers arrive', async () => {
-  const native = nativeFixture(401, JSON.stringify({ error: { message: 'Invalid Gateway API Key', type: 'authentication_error' } }))
-  const store = new ChartAnalysisStore(createAnalysisRunner(native.fetch), settings)
+test('401 and 429 errors stay visible without scheduled retries', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] })
+  for (const [status, message] of [[401, 'Invalid Gateway API Key'], [429, 'Rate limited']] as const) {
+    const native = nativeFixture(status, JSON.stringify({ error: { message } }))
+    const store = new ChartAnalysisStore(createAnalysisRunner(native.fetch), settings)
+    await store.analyze('BTC', snapshot)
+    context.mock.timers.tick(300_000)
+    assert.equal(store.get('BTC')?.phase, 'error')
+    assert.match(store.get('BTC')!.error, new RegExp(message))
+    assert.equal(native.bodies.length, 1)
+  }
+})
+
+test('network disconnection waits for a single explicit retry', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] })
+  let requests = 0
+  const store = new ChartAnalysisStore(createAnalysisRunner(async () => {
+    requests++; throw new TypeError('Network disconnected.')
+  }), settings)
   await store.analyze('BTC', snapshot)
-  assert.match(store.get('BTC')!.error, /Invalid Gateway API Key/)
-  assert.equal(native.bodies.length, 1)
+  context.mock.timers.tick(300_000)
+  assert.equal(store.get('BTC')?.phase, 'error')
+  assert.equal(requests, 1)
+  await store.retry('BTC')
+  context.mock.timers.tick(300_000)
+  assert.equal(requests, 2)
+  assert.equal(store.get('BTC')?.turns.length, 1)
+})
+
+test('cancellation settles even before native headers arrive', async () => {
   let cancelled = false
   const fetch = createGatewayFetch({ request(request: object) {
     if ('cancelGatewayFetch' in request) { cancelled = true; return Promise.resolve({ ok: true }) }

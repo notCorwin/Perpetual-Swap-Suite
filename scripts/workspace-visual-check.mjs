@@ -48,10 +48,12 @@ try {
     ipcMain.removeHandler('radar:request')
     ipcMain.handle('radar:request', async (_event, value) => {
       if (value.preferences) return preferences
-      if (value.snapshot) return { rows, revision: 1, serviceSession: 'visual-fixture', timeframe: value.snapshot.timeframe,
+      if (value.snapshot) return { rows, turnoverOrder: [...rows].sort((a, b) => a.instId.localeCompare(b.instId, 'en')).map(row => row.instId), revision: 1, serviceSession: 'visual-fixture',
         realtimeState: 'Connected', updatedAt: 1_800_000_000_000, catalogSource: 'live', error: '', loading: false }
-      if (value.chartUniverse) return { frames: value.chartUniverse.instIds.map(instId => prepared({ instId, timeframe: value.chartUniverse.timeframe })) }
+      if (value.chartUniverse) return { frames: rows.flatMap(({ instId }) => ['5m', '15m', '1H'].map(timeframe => prepared({ instId, timeframe }))) }
+      if (value.chartFocus) return { ok: true }
       if (value.chartLocal) return prepared(value.chartLocal)
+      if (value.chartHistory) return prepared(value.chartHistory)
       if (value.chartWindow) return prepared(value.chartWindow)
       if (value.analysisSettings) return { model: '', hasAPIKey: false }
       if (value.dataAudit) return { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '' }
@@ -169,17 +171,18 @@ try {
         ratio: effectiveContrast, effectiveContrast, paintRatio, boundaryContrast, boundaries, threshold: decorative ? null : 3,
         exemption: decorative ? 'Decorative arrow; signed numeric value conveys direction' : undefined, strokeDasharray: style.strokeDasharray, candleFill: element.dataset.chartCandleFill }
     })
+    const renderedChart = document.querySelector('svg[data-rendered-inst]')
     const chartLineDash = field => {
-      const line = document.querySelector(`[data-chart-indicator="${field}"]`)
+      const line = renderedChart?.querySelector(`[data-chart-indicator="${field}"]`)
       return line ? getComputedStyle(line).strokeDasharray : null
     }
     const rootStyle = getComputedStyle(document.documentElement)
     const semantics = { positive: rgba(rootStyle.getPropertyValue('--positive')).slice(0, 3), negative: rgba(rootStyle.getPropertyValue('--negative')).slice(0, 3),
       positiveLabel: rgba(rootStyle.getPropertyValue('--chart-positive-label')).slice(0, 3), negativeLabel: rgba(rootStyle.getPropertyValue('--chart-negative-label')).slice(0, 3),
-      takerLegends: [...document.querySelectorAll('[data-chart-panel-header="taker"] [data-chart-legend]')].map(swatch => ({ label: swatch.dataset.chartLegend,
+      takerLegends: [...renderedChart?.querySelectorAll('[data-chart-panel-header="taker"] [data-chart-legend]') ?? []].map(swatch => ({ label: swatch.dataset.chartLegend,
         labelColor: rgba(getComputedStyle(swatch.parentElement.querySelector('text')).fill).slice(0, 3), swatchColor: rgba(getComputedStyle(swatch).stroke).slice(0, 3) })),
-      upFill: document.querySelector('[data-chart-candle-direction="up"]')?.dataset.chartCandleFill,
-      downFill: document.querySelector('[data-chart-candle-direction="down"]')?.dataset.chartCandleFill,
+      upFill: renderedChart?.querySelector('[data-chart-candle-direction="up"]')?.dataset.chartCandleFill,
+      downFill: renderedChart?.querySelector('[data-chart-candle-direction="down"]')?.dataset.chartCandleFill,
       emaDash: chartLineDash('ema'), vwapDash: chartLineDash('vwap') }
     return { texts, graphics, semantics }
   })

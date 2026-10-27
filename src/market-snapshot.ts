@@ -1,21 +1,18 @@
-import type { NativeMarketRow } from "./market-row.ts"
+import type { RankedMarketRow } from './desktop-contract.ts'
 
-function equalValue(a: unknown, b: unknown): boolean {
-  if (Object.is(a, b)) return true
-  if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false
-  if (Array.isArray(a) || Array.isArray(b)) return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((value, index) => equalValue(value, b[index]))
-  const left = a as Record<string, unknown>, right = b as Record<string, unknown>
-  const keys = Object.keys(left)
-  return keys.length === Object.keys(right).length && keys.every(key => Object.hasOwn(right, key) && equalValue(left[key], right[key]))
+/** Price-only snapshots do not change navigation or virtual-list geometry. */
+export function reconcileMarketOrder(previous: string[], incoming: string[]): string[] {
+  return previous.length === incoming.length && incoming.every((id, index) => id === previous[index]) ? previous : incoming
 }
 
 // Bridge replies contain fresh objects, even when the native cache is unchanged.
 // Preserve row identities so typing and menu state do not redraw every contract.
-export function reconcileMarketRows(previous: NativeMarketRow[], incoming: NativeMarketRow[]): NativeMarketRow[] {
+export function reconcileMarketRows(previous: RankedMarketRow[], incoming: RankedMarketRow[]): RankedMarketRow[] {
   const byID = new Map(previous.map(row => [row.instId, row]))
   const next = incoming.map(row => {
     const old = byID.get(row.instId)
-    return old && equalValue(old, row) ? old : row
+    return old && old.lastPrice === row.lastPrice && old.turnover24hUSDT === row.turnover24hUSDT
+      && old.rankingChange === row.rankingChange && old.rankingAsOf === row.rankingAsOf ? old : row
   })
   return previous.length === next.length && next.every((row, index) => row === previous[index]) ? previous : next
 }

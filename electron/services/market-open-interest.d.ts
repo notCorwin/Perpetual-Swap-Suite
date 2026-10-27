@@ -7,5 +7,8 @@ export type OpenInterestGet = (path: string, parameters: Record<string, string>,
 
 export class MarketOpenInterest {
   constructor(get: OpenInterestGet, now?: () => number)
+  /** Shared retry deadline in epoch milliseconds; zero after success. */
+  readonly retryAt: number
+  /** Fresh snapshots retain their original 90-second lease. Force never bypasses a retry deadline. */
   observe(signal?: AbortSignal, priority?: string, force?: boolean): Promise<Map<string, OpenInterestObservation>>
 }

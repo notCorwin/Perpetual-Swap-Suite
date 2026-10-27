@@ -6,18 +6,37 @@ import http from 'node:http'
 import https from 'node:https'
 import net from 'node:net'
 import tls from 'node:tls'
-import { AsyncLocalStorage } from 'node:async_hooks'
 import { errorMonitor } from 'node:events'
 import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { extname } from 'node:path'
-import { beginOperation, getOperationContext, runWithOperationContext, isOperationSuppressed, readOperationCPUTime } from './operations.js'
+import { beginOperation, captureOperationContext, hasOperationPropagation, isOperationSuppressed, readOperationCPUTime,
+  withOperationHookSuppressed, isOperationHookSuppressed } from './operations.js'
 import { constructRecordedWebSocket, networkByteLength, networkResource } from './network-operations.js'
 import { installRecordedSQLite } from './recorded-database.js'
 import { assertSandboxURL } from './sandbox-network.js'
+import { installNativeNetworkHooks, installElectronNetworkHooks, getNativeNetworkHookCapabilities } from './operation-network-hooks.js'
 
 const require = createRequire(import.meta.url)
-const hookScopes = new AsyncLocalStorage()
 const installed = new Set()
+const capabilities = new Map()
+function capability(api, enabled, scope, reason, owner, key, wrapped) {
+  const reference = owner && new WeakRef(owner)
+  capabilities.set(api, { api, enabled, scope, ...(reason ? { reason } : {}),
+    ...(reference ? { probe: () => { const value=reference.deref(); return !value || value[key]===wrapped } } : {}) })
+}
+export function getOperationHookCapabilities() {
+  return [...capabilities.values()].map(({probe,...entry})=>{
+    try {if(entry.enabled&&probe&&!probe())return {...entry,enabled:false,reason:'hook-replaced-after-installation'}}catch{return {...entry,enabled:false,reason:'hook-readback-failed'}}
+    return entry
+  }).concat(getNativeNetworkHookCapabilities()).sort((a,b)=>a.api.localeCompare(b.api))
+}
+export function getInstalledOperationHooks(snapshot = getOperationHookCapabilities()) {
+  const active=new Set(snapshot.filter(entry=>entry.enabled).map(entry=>entry.api))
+  const checks={filesystem:['fs.readFileSync'],crypto:['crypto.pbkdf2Sync'],zlib:['zlib.gzipSync'],sockets:['net.Socket.connect','tls.connect'],http:['http.request','https.request'],fetch:['globalThis.fetch'],websocket:['globalThis.WebSocket'],sqlite:['node:sqlite.DatabaseSync']}
+  const result=[...installed].filter(family=>checks[family]?.every(api=>active.has(api))??true)
+  for(const [family,api] of [['dns','dns.lookup'],['udp','dgram.createSocket'],['http2','http2.connect'],['electron.net','electron.net.fetch']])if(active.has(api))result.push(family)
+  return result
+}
 const handleHooks = new WeakSet()
 const directoryHooks = new WeakSet()
 const streamHooks = new WeakSet()
@@ -30,10 +49,7 @@ const tcpSockets = new WeakMap()
 const hookMarker = Symbol('operation-hook')
 const knownExtensions = new Set(['.sqlite', '.db', '.parquet', '.json', '.jsonl', '.js', '.cjs', '.mjs', '.ts', '.html', '.css', '.png', '.pdf', '.txt', '.log'])
 
-export function withOperationHookSuppressed(domain, operation) {
-  return hookScopes.run(new Set([...(hookScopes.getStore() ?? []), domain]), operation)
-}
-export function isOperationHookSuppressed(domain) { return isOperationSuppressed() || hookScopes.getStore()?.has(domain) === true }
+export { withOperationHookSuppressed, isOperationHookSuppressed }
 
 const failed = error => ({ status: error?.name === 'AbortError' ? 'cancelled' : 'error', attributes: { errorName: error?.name ?? 'Error' } })
 const fileResource = value => {
@@ -50,9 +66,8 @@ const resultAttributes = (value, name = '') => ({
   ...(typeof value?.bytesWritten === 'number' ? { bytes: value.bytesWritten } : {}),
   ...(typeof value === 'number' && /\.(?:read|readv|write|writev)(?:Sync)?$/.test(name) ? { bytes: value } : {}),
 })
-const run = (span, operation) => typeof span.run === 'function' ? span.run(operation) : operation()
-const captureScope = () => ({ hooks: hookScopes.getStore(), operation: getOperationContext() })
-const resumeScope = (scope, operation) => runWithOperationContext(scope.operation, () => hookScopes.run(scope.hooks, operation))
+const run = (span, operation) => span.run(operation)
+const captureScope = () => captureOperationContext({ restoreHookDomains: true })
 
 /** Preserve application callback context while native transport internals are suppressed. */
 function restoreEmitterContexts(target) {
@@ -64,7 +79,7 @@ function restoreEmitterContexts(target) {
     target[key] = function (type, listener) {
       if (typeof listener !== 'function') return Reflect.apply(original, this, arguments)
       const scope = captureScope()
-      const wrapped = function (...args) { return resumeScope(scope, () => Reflect.apply(listener, this, args)) }
+      const wrapped = function (...args) { return scope(() => Reflect.apply(listener, this, args)) }
       wrapped.listener = listener.listener ?? listener
       const handlers = mappings.get(type) ?? []
       handlers.push({ listener, wrapped }); mappings.set(type, handlers)
@@ -99,7 +114,7 @@ function restoreEventTargetContexts(target) {
       const scope = captureScope()
       wrapped = function (...args) {
         if (options?.once === true) registered.delete(key)
-        return resumeScope(scope, () => typeof listener === 'function'
+        return scope(() => typeof listener === 'function'
           ? Reflect.apply(listener, this, args) : Reflect.apply(listener.handleEvent, listener, args))
       }
       registered.set(key, wrapped)
@@ -122,7 +137,7 @@ function restoreEventTargetContexts(target) {
         let wrapped = listener
         if (typeof listener === 'function') {
           const scope = captureScope()
-          wrapped = function (...args) { return resumeScope(scope, () => Reflect.apply(listener, this, args)) }
+          wrapped = function (...args) { return scope(() => Reflect.apply(listener, this, args)) }
           propertyListeners.set(wrapped, listener)
         }
         return Reflect.apply(descriptor.set, this, [wrapped])
@@ -140,22 +155,24 @@ function preserveFunction(original, replacement) {
 }
 
 /** Callback overloads, promises and synchronous returns retain their native API. */
-function hookFunction(owner, key, { domain, category, name, resource, attributes, returned, callback = false } = {}) {
+function hookFunction(owner, key, { domain, category, name, api: apiName, resource, attributes, returned, callback = false } = {}) {
   const original = owner[key]
-  if (typeof original !== 'function' || original[hookMarker]) return
+  const api=apiName??name??String(key),scope=domain==='io'?'node-filesystem-api-call':'node-native-computation-api-call'
+  if (typeof original !== 'function') { capability(api,false,scope,'runtime-api-unavailable'); return }
+  if(original[hookMarker]) {capability(api,true,scope,undefined,owner,key,original);return}
   const replacement = preserveFunction(original, function (...args) {
     if (isOperationHookSuppressed(domain)) return Reflect.apply(original, this, args)
     const span = beginOperation({ category, name: name ?? key, resource: resource?.(args), attributes: attributes?.(args) })
     const cpu = category === 'cpu' || typeof key === 'string' && key.endsWith('Sync') ? readOperationCPUTime() : undefined
-    const callerScope = captureScope()
     const callbackIndex = (typeof callback === 'function' ? callback(args) : callback) && typeof args.at(-1) === 'function' ? args.length - 1 : -1
     if (callbackIndex >= 0) {
+      const callerScope = captureScope()
       const callback = args[callbackIndex]
       args[callbackIndex] = function (...values) {
         const error = values[0]
         if (!error) returned?.(values[1])
         span.end(error ? failed(error) : { attributes: resultAttributes(values[1], name) })
-        return resumeScope(callerScope, () => Reflect.apply(callback, this, values))
+        return callerScope(() => Reflect.apply(callback, this, values))
       }
     }
     try {
@@ -171,12 +188,15 @@ function hookFunction(owner, key, { domain, category, name, resource, attributes
       return value
     } catch (error) { span.end({ ...failed(error), ...(cpu === undefined ? {} : { cpuTimeMS: readOperationCPUTime() - cpu }) }); throw error }
   })
-  try { owner[key] = replacement } catch { /* Feature support differs between Node and Electron. */ }
+  try { owner[key] = replacement; capability(api,owner[key]===replacement,scope,owner[key]===replacement?undefined:'native-property-not-writable',owner,key,replacement) }
+  catch { capability(api,false,scope,'native-property-not-writable') }
 }
 
 function hookNodeStreamFactory(owner, key, category, name, domain) {
   const original = owner[key]
-  if (typeof original !== 'function' || original[hookMarker]) return
+  const scope='factory-created-node-stream-lifecycle'
+  if (typeof original !== 'function') {capability(name,false,scope,'runtime-api-unavailable');return}
+  if(original[hookMarker]) {capability(name,true,scope,undefined,owner,key,original);return}
   const replacement = preserveFunction(original, function (...args) {
     if (isOperationHookSuppressed(domain)) return Reflect.apply(original, this, args)
     const span = beginOperation({ category, name, ...(category === 'io' ? { resource: fileResource(args[0]) } : {}),
@@ -193,7 +213,8 @@ function hookNodeStreamFactory(owner, key, category, name, domain) {
       return stream
     } catch (error) { span.end(failed(error)); throw error }
   })
-  try { Object.defineProperty(owner, key, { configurable: true, writable: true, enumerable: Object.getOwnPropertyDescriptor(owner, key)?.enumerable ?? false, value: replacement }) } catch { /* Optional native stream factories can be read-only. */ }
+  try { Object.defineProperty(owner,key,{configurable:true,writable:true,enumerable:Object.getOwnPropertyDescriptor(owner,key)?.enumerable??false,value:replacement});capability(name,owner[key]===replacement,scope,owner[key]===replacement?undefined:'native-property-not-writable',owner,key,replacement) }
+  catch {capability(name,false,scope,'native-property-not-writable')}
 }
 
 function hookFileHandle(handle) {
@@ -219,7 +240,7 @@ function installFilesystem() {
     const options = { domain: 'io', category: 'io', name: `fs.${method}`, resource: args => fileResource(args[0]) }
     hookFunction(fs, method, { ...options, returned: method === 'opendir' ? hookDirectory : undefined, callback: true })
     hookFunction(fs, `${method}Sync`, { ...options, name: `fs.${method}Sync`, returned: method === 'opendir' ? hookDirectory : undefined })
-    hookFunction(filePromises, method, { ...options, name: `fs.promises.${method}`, returned: method === 'open' ? hookFileHandle : method === 'opendir' ? hookDirectory : undefined })
+    if(!['close','fdatasync','fchmod','fchown','fstat','fsync','ftruncate','futimes','read','readv','write','writev'].includes(method))hookFunction(filePromises, method, { ...options, name: `fs.promises.${method}`, returned: method === 'open' ? hookFileHandle : method === 'opendir' ? hookDirectory : undefined })
   }
   for (const method of ['createReadStream', 'createWriteStream']) hookNodeStreamFactory(fs, method, 'io', `fs.${method}`, 'io')
   for (const method of ['realpath', 'realpathSync']) if (fs[method]?.native) hookFunction(fs[method], 'native', {
@@ -230,13 +251,14 @@ function installFilesystem() {
 
 function installCrypto() {
   const names = ['pbkdf2', 'scrypt', 'hkdf', 'argon2', 'randomBytes', 'randomFill', 'generateKey', 'generateKeyPair', 'generatePrime', 'checkPrime', 'createPrivateKey', 'createPublicKey', 'createSecretKey', 'diffieHellman', 'sign', 'verify', 'publicEncrypt', 'privateDecrypt', 'privateEncrypt', 'publicDecrypt', 'hash']
-  for (const method of names) for (const key of [method, `${method}Sync`]) hookFunction(crypto, key, {
+  const syncVariants=new Set(['pbkdf2','scrypt','hkdf','argon2','randomFill','generateKey','generateKeyPair','generatePrime','checkPrime'])
+  for (const method of names) for (const key of syncVariants.has(method)?[method,`${method}Sync`]:[method]) hookFunction(crypto, key, {
     domain: 'cpu', category: 'cpu', name: `crypto.${key}`, attributes: () => ({ measurement: key.endsWith('Sync') ? 'native-thread-wall' : 'native-call-wall' }),
     callback: args => !key.endsWith('Sync') && (method === 'sign' ? args.length >= 4 : method === 'verify' ? args.length >= 5 : !['createPrivateKey', 'createPublicKey', 'createSecretKey', 'hash', 'publicEncrypt', 'privateDecrypt', 'privateEncrypt', 'publicDecrypt'].includes(method)),
   })
   for (const [type, methods] of [['Hash', ['update', 'digest', 'copy']], ['Hmac', ['update', 'digest']], ['Sign', ['update', 'sign']], ['Verify', ['update', 'verify']], ['Cipheriv', ['update', 'final']], ['Decipheriv', ['update', 'final']], ['ECDH', ['computeSecret', 'generateKeys']]]) {
     if (!crypto[type]) continue
-    for (const method of methods) hookFunction(crypto[type].prototype, method, { domain: 'cpu', category: 'cpu', name: `crypto.${type.toLowerCase()}.${method}`,
+    for (const method of methods) hookFunction(crypto[type].prototype, method, { domain: 'cpu', category: 'cpu', name: `crypto.${type.toLowerCase()}.${method}`,api:`crypto.${type}.prototype.${method}`,
       attributes: args => ({ measurement: 'native-thread-wall', ...(method === 'update' ? { bytes: networkByteLength(args[0]) } : {}) }) })
   }
   const subtle = crypto.webcrypto?.subtle
@@ -301,7 +323,7 @@ function installHTTP() {
         const callbackIndex = typeof args.at(-1) === 'function' ? args.length - 1 : -1
         if (callbackIndex >= 0) {
           const callback = args[callbackIndex]
-          args[callbackIndex] = function (response) { observeIncomingMessage(response, state); return resumeScope(caller, () => Reflect.apply(callback, this, [response])) }
+          args[callbackIndex] = function (response) { observeIncomingMessage(response, state); return caller(() => Reflect.apply(callback, this, [response])) }
         }
         try {
           assertSandboxURL(url)
@@ -317,7 +339,7 @@ function installHTTP() {
               if (!state.submissionDepth && bytes !== null) state.attributes.sentBytes += bytes
               if (typeof values.at(-1) === 'function') {
                 const callback = values.at(-1), scope = captureScope()
-                values[values.length - 1] = function (...result) { return resumeScope(scope, () => Reflect.apply(callback, this, result)) }
+                values[values.length - 1] = function (...result) { return scope(() => Reflect.apply(callback, this, result)) }
               }
               state.submissionDepth = (state.submissionDepth ?? 0) + 1
               try { return withOperationHookSuppressed('network', () => Reflect.apply(submit, this, values)) }
@@ -338,6 +360,7 @@ function installHTTP() {
       })
     }
   }
+  for(const [owner,prefix] of [[http,'http'],[https,'https']])for(const key of ['request','get'])capability(`${prefix}.${key}`,true,'node-client-request-through-consumed-response',undefined,owner,key,owner[key])
   installed.add('http')
 }
 
@@ -377,7 +400,7 @@ function installSockets() {
     const forwarded = [...normalized]
     if (typeof forwarded.at(-1) === 'function') {
       const callback = forwarded.at(-1), scope = captureScope()
-      forwarded[forwarded.length - 1] = function (...values) { return resumeScope(scope, () => Reflect.apply(callback, this, values)) }
+      forwarded[forwarded.length - 1] = function (...values) { return scope(() => Reflect.apply(callback, this, values)) }
     }
     const url = connectionURL(normalized, false)
     const span = beginOperation({ category: 'network', name: 'socket.connect', resource: networkResource(url), attributes: { source: 'native', transport: 'tcp' } })
@@ -396,7 +419,7 @@ function installSockets() {
       assertSandboxURL(url)
       if (typeof args.at(-1) === 'function') {
         const callback = args.at(-1), scope = captureScope()
-        args[args.length - 1] = function (...values) { return resumeScope(scope, () => Reflect.apply(callback, this, values)) }
+        args[args.length - 1] = function (...values) { return scope(() => Reflect.apply(callback, this, values)) }
       }
       const socket = run(span, () => withOperationHookSuppressed('network', () => Reflect.apply(secureConnect, this, args)))
       return trackConnection(socket, span, url, true)
@@ -416,12 +439,14 @@ function installSockets() {
       } catch (error) { span.end(failed(error)); throw error }
     })
   }
+  for(const [owner,key,api] of [[net.Socket.prototype,'connect','net.Socket.connect'],[net.Socket.prototype,'write','net.Socket.write'],[net.Socket.prototype,'end','net.Socket.end'],[net.Socket.prototype,'push','net.Socket.push'],[tls,'connect','tls.connect']])capability(api,true,'tracked-outbound-socket-connect-and-submission',undefined,owner,key,owner[key])
   installed.add('sockets')
 }
 
 function installFetch() {
   const fetcher = globalThis.fetch
-  if (typeof fetcher !== 'function' || fetcher[hookMarker]) return
+  if(typeof fetcher!=='function'){capability('globalThis.fetch',false,'native-fetch-through-lazy-consumed-body','runtime-api-unavailable');return}
+  if(fetcher[hookMarker])return
   globalThis.fetch = preserveFunction(fetcher, async function (input, init) {
     if (isOperationHookSuppressed('network')) return Reflect.apply(fetcher, this, arguments)
     const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined)
@@ -449,6 +474,7 @@ function installFetch() {
       return response
     } catch (error) { state.finish(failed(error)); throw error }
   })
+  capability('globalThis.fetch',true,'native-fetch-through-lazy-consumed-body',undefined,globalThis,'fetch',globalThis.fetch)
   installed.add('fetch')
 }
 
@@ -541,29 +567,35 @@ function decorateResponse(response, state) {
 
 function installWebSocket() {
   const Socket = globalThis.WebSocket
-  if (typeof Socket !== 'function' || socketConstructors.has(Socket)) return
+  if(typeof Socket!=='function'){capability('globalThis.WebSocket',false,'native-socket-connect-send-receive','runtime-api-unavailable');return}
+  if(socketConstructors.has(Socket))return
   const HookedSocket = new Proxy(Socket, { construct(target, args, newTarget) {
     const construct = () => {
       assertSandboxURL(args[0])
       const socket = withOperationHookSuppressed('network', () => Reflect.construct(target, args, newTarget === HookedSocket ? target : newTarget))
-      restoreEventTargetContexts(socket)
       for (const method of ['send', 'close']) {
         const original = socket[method]
         socket[method] = function (...values) { return withOperationHookSuppressed('network', () => Reflect.apply(original, this, values)) }
       }
       return socket
     }
-    if (isOperationHookSuppressed('network')) return construct()
-    return constructRecordedWebSocket(construct, args[0], { source: 'native', stream: 'native' })
+    const socket = isOperationHookSuppressed('network') ? construct()
+      : constructRecordedWebSocket(construct, args[0], { source: 'native', stream: 'native' })
+    // Recorder listeners keep transport scopes; later application listeners
+    // restore the complete context in which the application registered them.
+    restoreEventTargetContexts(socket)
+    return socket
   } })
   socketConstructors.add(HookedSocket)
   globalThis.WebSocket = HookedSocket
+  capability('globalThis.WebSocket',globalThis.WebSocket===HookedSocket,'native-socket-connect-send-receive',undefined,globalThis,'WebSocket',HookedSocket)
   installed.add('websocket')
 }
 
 /** Install once per process/worker; existing named builtin imports are live-updated. */
 export function installOperationHooks() {
-  if (installed.size) return [...installed]
+  if (!hasOperationPropagation()) throw new Error('Operation hooks require async context propagation; initialize the operation runtime before installing hooks.')
+  if (installed.size) return getInstalledOperationHooks()
   installFilesystem()
   installCrypto()
   installZlib()
@@ -571,7 +603,23 @@ export function installOperationHooks() {
   installHTTP()
   installFetch()
   installWebSocket()
-  try { if (installRecordedSQLite(require('node:sqlite'))) installed.add('sqlite') } catch { /* Some Electron runtimes omit optional node:sqlite. */ }
+  try {
+    const sqlite=require('node:sqlite'),enabled=installRecordedSQLite(sqlite)
+    if(enabled)installed.add('sqlite')
+    capability('node:sqlite.DatabaseSync',enabled,'default-module-constructor-and-recorded-opens-only',enabled?undefined:'native-constructor-not-writable',sqlite,'DatabaseSync',sqlite.DatabaseSync)
+  } catch {capability('node:sqlite.DatabaseSync',false,'default-module-constructor-and-recorded-opens-only','runtime-api-unavailable')}
+  installNativeNetworkHooks(nativeNetworkIntegration())
   syncBuiltinESMExports()
-  return [...installed]
+  return getInstalledOperationHooks()
+}
+
+function nativeNetworkIntegration() {
+  return {captureScope,resumeScope:(scope,operation)=>scope(operation),restoreEmitterContexts,restoreEventTargetContexts,decorateResponse,
+    suppressed:()=>isOperationHookSuppressed('network'),withNetwork:operation=>withOperationHookSuppressed('network',operation)}
+}
+/** Call after Electron ready, before net or Session transports are used. */
+export function installElectronOperationHooks(electron) {
+  installOperationHooks()
+  installElectronNetworkHooks(electron,nativeNetworkIntegration())
+  return getOperationHookCapabilities()
 }

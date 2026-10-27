@@ -28,10 +28,8 @@ const configuration = () => {
 const projectionIsolation = (service: MarketService) => {
   // These tests exercise collection, membership and durable writes. Rendering
   // and indicator projection have their own source-window integration tests.
-  service.projectListEntry = async () => null
+  service.preparedCharts.setUniverse = () => ({ frames: [] })
   service.updateRanking = async () => undefined
-  service.readListBars = async () => ({ bars: [] })
-  service.scheduleListProjection = () => undefined
   for (const lane of service.requestLanes.values()) lane.interval = 0
 }
 const settle = async (service: MarketService) => {
@@ -53,8 +51,7 @@ async function fixture(definitions = [instrument()], acquire?: () => Promise<unk
     throw new Error(`Unexpected network acquisition: ${url.pathname}`)
   }
   const service = new MarketService(store, () => preferences, fetcher, false)
-  // Collection assertions exclude independent chart-history preparation.
-  service.preparedCharts.setRealtimeSubscriptions = () => undefined
+  // Realtime chart keys are lightweight membership and do not prepare history.
   await service.ready
   projectionIsolation(service)
   const close = async () => { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
@@ -69,7 +66,7 @@ const synchronized = async (service: MarketService) => {
   return { controller, context }
 }
 const ids = (service: MarketService) => [...service.candidateIDs].sort()
-const listed = (service: MarketService) => service.listRowsFor('15m').map(row => row.instId).sort()
+const listed = (service: MarketService) => service.listRowsFor().map(row => row.instId).sort()
 
 test('subscribe-before-snapshot reconciliation merges buffered listing, delisting and partial definition updates', async () => {
   const held = deferred<unknown[]>(), began = deferred()
@@ -88,7 +85,8 @@ test('subscribe-before-snapshot reconciliation merges buffered listing, delistin
     assert.equal(f.service.instruments.get(btc).ctVal, '0.02', 'An older REST snapshot cannot overwrite a buffered definition revision.')
     assert.deepEqual(listed(f.service), [btc, sol])
     assert.deepEqual([...f.service.publicRealtime.instruments].sort(), [btc, sol])
-    assert.equal(f.service.realtime.subscriptions.size, 6, 'Both eligible contracts receive every native candle timeframe.')
+    assert.deepEqual([...f.service.realtime.subscriptions.keys()].sort(), ['5m:BTC-USDT-SWAP', '5m:SOL-USDT-SWAP'])
+    assert.equal(f.service.preparedCharts.realtimeKeys.size, 6, 'Chart projections retain all periods from each candidate’s 5m source.')
     assert.equal(f.requests.filter(path => path.endsWith('/public/instruments')).length, 1)
   } finally { held.resolve([]); await synchronizing; await f.close() }
 })
@@ -130,13 +128,15 @@ test('live metadata additions and delistings update list membership and subscrip
     f.service.receiveInstruments([{ instId: btc, state: 'suspend' }], context)
     await settle(f.service)
     assert.deepEqual(ids(f.service), [eth])
-    assert.deepEqual(listed(f.service), [eth])
+    assert.deepEqual([...f.service.catalog.keys()], [eth], 'Delisting revokes eligibility immediately.')
+    assert.deepEqual(listed(f.service), [btc, eth], 'Published membership has a bounded exit buffer.')
     assert.deepEqual([...f.service.publicRealtime.instruments], [eth])
     assert.ok([...f.service.realtime.subscriptions.values()].every(value => value.instId === eth))
     f.service.receiveInstruments([{ instId: eth, expTime: String(Date.now()) }], context)
     await settle(f.service)
     assert.deepEqual(ids(f.service), [])
-    assert.deepEqual(listed(f.service), [])
+    assert.equal(f.service.catalog.size, 0)
+    assert.deepEqual(listed(f.service), [btc, eth])
     assert.equal(f.service.publicRealtime.instruments.size, 0)
     assert.equal(f.service.realtime.subscriptions.size, 0)
     assert.equal(f.requests.length, requests, 'An instruments delta needs no REST scan or timer-driven renewal.')
@@ -172,7 +172,8 @@ test('disconnect removes continuous metadata eligibility and a restart cannot re
     assert.ok(f.service.metadata.getCatalogEntry(btc).expiresAt > future, 'The checkpoint captures the currently verified streaming session.')
     controller.abort()
     f.service.instrumentStreamDisconnected({ ...context, receivedAt: future })
-    assert.deepEqual(listed(f.service), [])
+    assert.equal(f.service.catalog.size, 0)
+    assert.deepEqual(listed(f.service), [btc], 'Disconnect cannot renew eligibility but preserves the exit buffer.')
     assert.equal(f.service.catalogChecks.get(btc).status, 'unknown')
     await f.service.dispose()
     restarted = new MarketService(f.store, () => f.preferences, f.fetcher, false)

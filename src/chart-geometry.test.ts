@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { logarithmicY } from './chart-axis.ts'
 import type { Bar } from './chart-data.ts'
 import { createChartGeometryCache } from './chart-geometry.ts'
+import { chartPanelClip } from './chart-layout.ts'
 
 const intervalMS = 900_000
 const candle = (index: number): Bar => ({ hour: index * intervalMS, open: 100, high: 103, low: 99, close: 102, confirmed: true,
@@ -18,9 +18,13 @@ test('shared viewport coordinates preserve time gaps and logarithmic price and z
   assert.equal(priceAxis.kind, 'logarithmic')
   assert.ok(oiAxis)
   for (const value of [98, 100, 102, 104]) {
-    close(geometry.priceY(value), logarithmicY(value, priceAxis, layout.panels.price))
+    const fraction = Math.log(value / priceAxis.min) / Math.log(priceAxis.max / priceAxis.min)
+    close(geometry.priceY(value), layout.panels.price[1] - fraction * (layout.panels.price[1] - layout.panels.price[0]))
   }
-  for (const value of [0, 1, 10, 950]) close(geometry.oiY(value), logarithmicY(value, oiAxis, layout.panels.oi))
+  for (const value of [0, 1, 10, 950]) {
+    const fraction = Math.log((value + 1) / (oiAxis.min + 1)) / Math.log((oiAxis.max + 1) / (oiAxis.min + 1))
+    close(geometry.oiY(value), layout.panels.oi[1] - fraction * (layout.panels.oi[1] - layout.panels.oi[0]))
+  }
   close(geometry.oiY(0), layout.panels.oi[1])
   const first = geometry.x[0], last = geometry.x.at(-1)!
   for (let index = 0; index < bars.length; index++) close(geometry.x[index], first + (last - first) * index / 95)
@@ -30,6 +34,56 @@ test('shared viewport coordinates preserve time gaps and logarithmic price and z
   assert.ok(priceAxis.min < 98 && priceAxis.max > 104)
   assert.equal(geometry.buySamples, 96)
   assert.equal(geometry.sellSamples, 96)
+})
+
+test('RSI markers use the sampled candle coordinates and combine thresholds crossed in one jump', () => {
+  const bars = rows().map((bar, index) => ({ ...bar, rsi6: index === 0 ? 20 : 80 }))
+  const get = createChartGeometryCache(text => text.length * 6)
+  const geometry = get(bars, viewport)
+  assert.equal(geometry.rsiMarkers.length, 1)
+  const marker = geometry.rsiMarkers[0]
+  assert.equal(marker.index, 1)
+  assert.equal(marker.hour, bars[1].hour)
+  assert.equal(marker.field, 'rsi6')
+  assert.equal(marker.direction, 'up')
+  assert.deepEqual(marker.levels, [30, 70])
+  close(marker.x, geometry.x[1])
+  close(marker.y, geometry.rsiY(80))
+  assert.equal(get(bars, viewport), geometry, 'Inspection reuses the prepared crossing geometry.')
+  const forming = bars.map((bar, index) => index === 95 ? { ...bar, rsi6: 20, confirmed: false } : bar)
+  const updated = get(forming, viewport).rsiMarkers.at(-1)!
+  assert.equal(updated.index, 95)
+  assert.equal(updated.direction, 'down')
+  assert.deepEqual(updated.levels, [30, 70])
+})
+
+test('fractional overscan extends paths and crossings without changing the 96-bar axes', () => {
+  const bars = rows().map(bar => ({ ...bar, rsi6: 25 }))
+  const before = { ...candle(-1), rsi6: 80, high: 1000, low: 50 }
+  const after = { ...candle(96), rsi6: 80, high: 2000, low: 40 }
+  const get = createChartGeometryCache(text => text.length * 6)
+  const baseline = get(bars, viewport)
+  const geometry = get(bars, viewport, { before, after })
+  assert.deepEqual(geometry.priceAxis, baseline.priceAxis)
+  assert.deepEqual(geometry.oiAxis, baseline.oiAxis)
+  assert.equal(geometry.x.length, 96)
+  close(geometry.barPitch, geometry.x[1] - geometry.x[0])
+  const emaX = [...geometry.lines.ema.matchAll(/[ML]([\d.-]+) ([\d.-]+)/g)].map(([, x]) => Number(x))
+  assert.equal(emaX.length, 98)
+  assert.ok(emaX[0] < geometry.layout.left)
+  assert.ok(emaX.at(-1)! > geometry.layout.right)
+  const priceClip = chartPanelClip(geometry.layout, 'price', geometry.barPitch)
+  assert.ok(emaX[0] >= priceClip.x && emaX.at(-1)! <= priceClip.x + priceClip.width,
+    'The translated price panel clip must admit adjacent bar centers on both sides.')
+  const leftCrossing = geometry.rsiMarkers.find(marker => marker.hour === bars[0].hour && marker.field === 'rsi6')
+  const rightCrossing = geometry.rsiMarkers.find(marker => marker.hour === after.hour && marker.field === 'rsi6')
+  assert.equal(leftCrossing?.index, 0)
+  assert.equal(leftCrossing?.confirmed, true)
+  assert.equal(rightCrossing?.index, -1, 'An overscan crossing does not masquerade as a visible selection index.')
+  assert.equal(rightCrossing?.confirmed, true)
+  assert.equal((geometry.upWicks + geometry.downWicks).match(/M/g)?.length, 98, 'Candle paths include both exact adjacent overscan bars.')
+  assert.equal(geometry.buySamples, baseline.buySamples, 'Overscan does not change the visible statistics sample count.')
+  assert.equal(geometry.sellSamples, baseline.sellSamples)
 })
 
 test('missing periods and unavailable observations break paths and filled areas without inventing zero samples', () => {

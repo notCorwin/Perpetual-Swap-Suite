@@ -3,6 +3,7 @@ import test from 'node:test'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { createRendererOperationReceiver } from '../../electron/services/renderer-operations.js'
+import { MAX_OPERATION_BATCH_SIZE } from '../../electron/services/operation-limits.js'
 import { attachOperationJournalSink, registerOperationImportSource } from '../../electron/services/operations.js'
 
 test('renderer batches preserve source IDs and only acknowledge durable, replay-safe contiguous records', async () => {
@@ -19,7 +20,8 @@ test('renderer batches preserve source IDs and only acknowledge durable, replay-
   const persisted = [], receiver = createRendererOperationReceiver({
     register: role => { assert.equal(role, 'renderer'); registrations++; return { id: 'fixture-participant' } },
     claim: (_participant, executionId) => { registerOperationImportSource(executionId, 'fixture-session'); return { executionId, sessionId: 'fixture-session' } },
-    flush: async () => {
+    flush: async executionId => {
+      assert.equal(executionId, identity.executionId, 'A renderer batch flushes exactly its registered source.')
       if (persistenceFailure) throw new Error('Fixture disk failure')
       await new Promise(resolve => { release = resolve })
     },
@@ -47,20 +49,50 @@ test('renderer batches preserve source IDs and only acknowledge durable, replay-
     assert.throws(() => receiver.receive(8, batch), /Unknown renderer/)
     await assert.rejects(receiver.receive(7, { ...batch, batchId: 'gap', firstSequence: 4, events: [event(4, 'start')] }), /out of sequence/)
     await assert.rejects(receiver.receive(7, { ...batch, events: batch.events.map(value => ({ ...value, name: 'changed' })) }), /different records/)
-    const backlog = Array.from({ length: 2_048 }, (_, index) => ({
-      ...event(index + 3, index % 2 ? 'end' : 'start'), id: `${identity.executionId}:${Math.floor(index / 2) + 2}`,
-    }))
-    const largeBatch = { ...batch, batchId: 'fixture-backlog', firstSequence: 3, events: backlog }
-    assert.throws(() => receiver.receive(7, { ...largeBatch, events: [...backlog, event(2_051, 'start')] }), /Invalid renderer operation batch/)
-    const draining = receiver.receive(7, largeBatch)
-    await new Promise(resolve => setImmediate(resolve))
-    assert.equal(persisted.length, 2_050)
-    release()
-    assert.deepEqual(await draining, { batchId: 'fixture-backlog', lastSequence: 2_050 })
-    const replay = receiver.receive(7, largeBatch)
-    await new Promise(resolve => setImmediate(resolve))
-    assert.equal(persisted.length, 2_050, 'A full-size lost-ACK retry must not duplicate retained records.')
-    release()
-    assert.deepEqual(await replay, { batchId: 'fixture-backlog', lastSequence: 2_050 })
   } finally { unsubscribe() }
+})
+
+
+test('renderer omission high-water marks survive lost acknowledgments without duplicating loss counts', () => {
+  const losses = [], receiver = createRendererOperationReceiver({
+    register: () => ({ id: 'failure-participant' }),
+    claim: (_, executionId) => ({ executionId, sessionId: 'failure-session' }),
+    incomplete: (executionId, reason, omitted) => losses.push({ executionId, reason, omitted }),
+  })
+  const source = receiver.initialize(19, 'failure-source')
+  const report = omitted => receiver.fail(19, { executionId: source.executionId, reason: 'renderer-buffer-exhausted', omitted })
+  report(208)
+  report(208) // Main accepted the first request, but its IPC acknowledgment was lost.
+  report(210)
+  report(208) // A delayed older report cannot roll back the durable high-water mark.
+  report(210)
+  assert.deepEqual(losses.map(value => value.omitted), [208, 2])
+  assert.equal(losses.reduce((sum, value) => sum + value.omitted, 0), 210)
+  const empty = receiver.initialize(20, 'zero-omission-source')
+  const zero = { executionId: empty.executionId, reason: 'source-detached', omitted: 0 }
+  receiver.fail(20, zero)
+  receiver.fail(20, zero)
+  assert.deepEqual(losses.map(value => value.omitted), [208, 2, 0], 'A zero-omission source failure is recorded once.')
+})
+
+test('renderer receiver accepts the shared maximum batch size and rejects larger batches', async () => {
+  const imported = []
+  const receiver = createRendererOperationReceiver({
+    register: () => ({ id: 'batch-limit-participant' }),
+    claim: (_, executionId) => ({ executionId, sessionId: 'batch-limit-session' }),
+    importEvents: events => { imported.push(events.length); return { accepted: events.length, duplicates: 0, rejected: 0 } },
+    flush: async () => {},
+  })
+  const owner = 23, source = receiver.initialize(owner, 'batch-limit-source')
+  const events = (first, count) => Array.from({ length: count }, (_, index) => ({ executionId: source.executionId,
+    sessionId: source.sessionId, sequence: first + index }))
+  const maximum = { executionId: source.executionId, batchId: 'max-batch', firstSequence: 1,
+    events: events(1, MAX_OPERATION_BATCH_SIZE) }
+  assert.deepEqual(await receiver.receive(owner, maximum), { batchId: 'max-batch', lastSequence: MAX_OPERATION_BATCH_SIZE })
+  assert.deepEqual(imported, [MAX_OPERATION_BATCH_SIZE])
+
+  const oversized = { executionId: source.executionId, batchId: 'oversized-batch', firstSequence: MAX_OPERATION_BATCH_SIZE + 1,
+    events: events(MAX_OPERATION_BATCH_SIZE + 1, MAX_OPERATION_BATCH_SIZE + 1) }
+  assert.throws(() => receiver.receive(owner, oversized), /Invalid renderer operation batch/)
+  assert.deepEqual(imported, [MAX_OPERATION_BATCH_SIZE], 'Rejected batches never reach event import or durable flush.')
 })

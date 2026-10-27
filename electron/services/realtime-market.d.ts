@@ -33,7 +33,15 @@ export interface RealtimeWebSocket {
   removeEventListener(type: string, callback: EventListener): void
 }
 export type WebSocketFactory = (url: string) => RealtimeWebSocket
-export type RealtimeEventContext = { signal: AbortSignal; receivedAt: number }
+export type MarketTrafficProbeEvent = {
+  channel: string
+  instId: string
+  identity: string | null
+  payloadFingerprint: string | null
+  nativeMessageSequence: number
+  nativeHandlerEnteredAtMonotonicUS: number
+}
+export type RealtimeEventContext = { signal: AbortSignal; receivedAt: number; marketTrafficEvents?: readonly MarketTrafficProbeEvent[] }
 export type RealtimeMarketOptions<Candle extends CandleRecord = CandleRecord> = {
   parseCandle: (instId: string, timeframe: RadarTimeframe, raw: string[]) => Candle | null
   /** Memory projection only. Same-volume OHLC corrections follow receive order. */
@@ -44,6 +52,10 @@ export type RealtimeMarketOptions<Candle extends CandleRecord = CandleRecord> = 
    * Must coordinate durable mutations with onConfirmed. Close aborts and drains repairs.
    */
   onReconnect: (subscriptions: RealtimeSubscription[], context: { signal: AbortSignal }) => void | Promise<void>
+  /** Per-series acknowledgement; independent of other pending subscriptions. */
+  onSubscribed?: (subscription: RealtimeSubscription, context: RealtimeEventContext) => void | Promise<void>
+  /** Test-only observer; absent during normal operation and called for each native candle message. */
+  onMarketTrafficIngress?: (events: readonly MarketTrafficProbeEvent[], probeCostMonotonicUS: number) => void
   onState?: (state: RealtimeMarketState) => void | Promise<void>
   webSocketFactory?: WebSocketFactory
   url?: string
@@ -69,12 +81,14 @@ export class RealtimeMarket<Candle extends CandleRecord = CandleRecord> {
   start(): void
   getState(): RealtimeMarketState
   getTelemetry(): RealtimeMarketTelemetry
-  getProgress(instId: string, timeframe: RadarTimeframe): { receivedThrough: number | null; confirmedThrough: number | null; committedThrough: number | null; pendingConfirmations: number }
+  getProgress(instId: string, timeframe: RadarTimeframe): { receivedThrough: number | null; confirmedThrough: number | null; committedThrough: number | null; pendingConfirmations: number; committing: boolean }
   /** Exact current connection acknowledgement; unrelated pending subscriptions do not affect it. */
   isSubscribed(instId: string, timeframe: RadarTimeframe): boolean
   getForming(instId: string, timeframe: RadarTimeframe): Candle | null
   /** Drains accepted decoding, recovery and consumer callbacks; does not close. */
   whenIdle(): Promise<void>
+  /** Resume retained failed revisions after writer recovery; no timer or backoff. */
+  retryPendingConfirmations(): void
   /** Irreversible, idempotent shutdown barrier; aborts recovery and drains writes. */
   close(): Promise<void>
 }

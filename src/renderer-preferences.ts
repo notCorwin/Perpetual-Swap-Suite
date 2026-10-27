@@ -5,13 +5,13 @@ import type { Preferences } from '../electron/services/preferences.js'
 export { DEFAULT_PREFERENCES }
 export type { Preferences }
 export type LiquidityKey = keyof Preferences['liquidity']
-export const LIQUIDITY_FIELDS: { key: LiquidityKey; label: string; description: string; parameter: 'maxPercent' | 'minUSDT' | 'maxRatio'; parameterLabel: string }[] = [
-  { key: 'spread', label: 'Bid-ask spread', description: 'Spread must be below the limit.', parameter: 'maxPercent', parameterLabel: 'Maximum spread (%)' },
-  { key: 'depth', label: 'Order book depth', description: 'Both sides must exceed the minimum.', parameter: 'minUSDT', parameterLabel: 'Minimum depth per side (USDT)' },
-  { key: 'slippage', label: 'Slippage', description: 'Estimated slippage must be below the limit for the specified trade size.', parameter: 'maxPercent', parameterLabel: 'Maximum slippage (%)' },
-  { key: 'volume24h', label: '24h trading volume', description: 'Quote trading volume must exceed the minimum.', parameter: 'minUSDT', parameterLabel: 'Minimum 24h volume (USDT)' },
-  { key: 'openInterest', label: 'Open interest', description: 'USDT notional open interest must exceed the minimum.', parameter: 'minUSDT', parameterLabel: 'Minimum open interest (USDT)' },
-  { key: 'volumeStability', label: 'Volume stability', description: 'Maximum / minimum volume across 24 completed hourly intervals must be below the limit.', parameter: 'maxRatio', parameterLabel: 'Maximum hourly volume ratio' },
+export const LIQUIDITY_FIELDS: { key: LiquidityKey; label: string; description?: string; parameter: 'maxPercent' | 'minUSDT' | 'maxRatio'; parameterLabel: string }[] = [
+  { key: 'spread', label: 'Bid-ask spread', parameter: 'maxPercent', parameterLabel: 'Maximum spread (%)' },
+  { key: 'depth', label: 'Order book depth, per side', parameter: 'minUSDT', parameterLabel: 'Minimum depth per side (USDT)' },
+  { key: 'slippage', label: 'Slippage', parameter: 'maxPercent', parameterLabel: 'Maximum slippage (%)' },
+  { key: 'volume24h', label: '24h trading volume', parameter: 'minUSDT', parameterLabel: 'Minimum 24h volume (USDT)' },
+  { key: 'openInterest', label: 'Open interest', parameter: 'minUSDT', parameterLabel: 'Minimum open interest (USDT)' },
+  { key: 'volumeStability', label: 'Volume stability', description: '24 completed hours · max / min volume', parameter: 'maxRatio', parameterLabel: 'Maximum hourly volume ratio' },
 ]
 export type PreferencesDraft = {
   chartTimeframe: RadarTimeframe

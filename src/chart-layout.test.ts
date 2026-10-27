@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chartCandleWidth, chartHourX, chartLayout, chartPriceLabelLayout, type ChartPanel } from "./chart-layout.ts"
+import { chartCandleWidth, chartContentClip, chartHourX, chartLayout, chartPanelClip, chartPriceLabelLayout, type ChartPanel } from "./chart-layout.ts"
 
 test("stacked chart layout stays aligned and bounded", () => {
   const order: ChartPanel[] = ["price", "roc", "rsi", "atr", "oi", "taker"]
@@ -29,6 +29,26 @@ test("chart hours retain their position when candles are missing", () => {
   assert.equal(first - candleWidth / 2, 0)
   assert.equal(last + candleWidth / 2, 960)
   assert.equal(chartHourX(10 * hour, 95 * hour, 0, 960), first + (last - first) * 10 / 95)
+})
+
+test("fractional content clipping stops before axis labels and legends", () => {
+  const height = 700, layout = chartLayout(960, height, 64), clip = chartContentClip(layout, height)
+  assert.equal(clip.x, layout.columns.price[0])
+  assert.equal(clip.y, layout.panels.price[0])
+  assert.equal(clip.width, layout.right - layout.columns.price[0])
+  assert.equal(clip.y + clip.height, height)
+  assert.ok(clip.x + clip.width < layout.axisStarts.price)
+  assert.ok(clip.y > layout.headerY.price)
+
+  const pitch = 8.5
+  for (const panel of ["price", "roc", "rsi", "atr", "oi", "taker"] as const) {
+    const inner = chartPanelClip(layout, panel, pitch)
+    assert.equal(inner.x, layout.columns[panel][0] - pitch)
+    assert.equal(inner.x + inner.width, layout.columns[panel][1] + pitch)
+    assert.equal(inner.y, layout.panels[panel][0])
+    assert.equal(inner.height, layout.panels[panel][1] - layout.panels[panel][0])
+  }
+  assert.equal(clip.x + clip.width, layout.right, 'The stationary outer clip still ends before the axis gutter.')
 })
 
 test("axis price and countdown share one-line spacing and outer padding", () => {

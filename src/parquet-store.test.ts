@@ -7,13 +7,14 @@ import { chmod, mkdtemp, mkdir, readFile, readdir, rename, rm, writeFile } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DuckDBInstance } from '@duckdb/node-api'
+import { DatabaseSync } from 'node:sqlite'
 import { MarketStore } from '../electron/services/market-store.js'
 
 const base = Date.UTC(2024, 0, 1), step = 300_000
 const query = { instrument: 'BTC-USDT-SWAP', timeframe: '5m', from: base, through: base + step }
 const row = (index: number, close = 100) => ({ instrument: query.instrument, timeframe: query.timeframe, timestamp: base + index * step,
   open: 100, high: Math.max(close, 101), low: 99, close, volume: 1, baseVolume: 2, quoteVolume: 200,
-  oi: 1_000, sell: 20, buy: 30, statisticsVersion: 1, confirmed: true, writtenAt: 100 + index })
+  oi: 1_000, sell: 20, buy: 30, statisticsVersion: 11, confirmed: true, writtenAt: 100 + index })
 const quote = (value: string) => `'${value.replaceAll("'", "''")}'`
 const legacy = async (root: string, name: string, values: any[]) => {
   const directory = join(root, 'candles', 'timeframe=5m', 'instrument=BTC-USDT-SWAP', 'date=2024-01-01')
@@ -21,7 +22,7 @@ const legacy = async (root: string, name: string, values: any[]) => {
   const source = join(root, 'input.json'), path = join(directory, name), engine = await DuckDBInstance.create(':memory:'), db = await engine.connect()
   try {
     await writeFile(source, JSON.stringify(values))
-    const columns = `instrument:'VARCHAR',timeframe:'VARCHAR',timestamp:'BIGINT',open:'DOUBLE',high:'DOUBLE',low:'DOUBLE',close:'DOUBLE',volume:'DOUBLE',baseVolume:'DOUBLE',quoteVolume:'DOUBLE',oi:'DOUBLE',sell:'DOUBLE',buy:'DOUBLE',statisticsVersion:'INTEGER',confirmed:'BOOLEAN',writtenAt:'BIGINT'`
+    const columns = `instrument:'VARCHAR',timeframe:'VARCHAR',timestamp:'BIGINT',open:'DOUBLE',high:'DOUBLE',low:'DOUBLE',close:'DOUBLE',volume:'DOUBLE',baseVolume:'DOUBLE',quoteVolume:'DOUBLE',oi:'DOUBLE',sell:'DOUBLE',buy:'DOUBLE',statisticsVersion:'INTEGER',statisticsOIExpiresAt:'BIGINT',statisticsTakerExpiresAt:'BIGINT',confirmed:'BOOLEAN',writtenAt:'BIGINT'`
     await db.run(`COPY(SELECT * FROM read_json(${quote(source)},columns={${columns}},format='array')) TO ${quote(path)} (FORMAT PARQUET)`)
     return path
   } finally { db.closeSync(); engine.closeSync(); await rm(source, { force: true }) }
@@ -45,6 +46,123 @@ test('legacy Parquet is imported read-only with newest base visibility and durab
     assert.equal(await store.candleWatermark(query.instrument, query.timeframe), watermark)
     assert.equal((await readdir(join(root, 'candles', 'timeframe=5m', 'instrument=BTC-USDT-SWAP', 'date=2024-01-01'))).length, 2)
   } finally { await store?.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('legacy statistics encodings convert once at import while preserving numeric downloads and rechecking speculative absence', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-import-statistics-'))
+  let store: MarketStore | undefined
+  try {
+    const lease = { statisticsOIExpiresAt: Date.now() + 60_000, statisticsTakerExpiresAt: Date.now() + 60_000 }
+    await legacy(root, 'base-200-statistics.parquet', [
+      { ...row(0), statisticsVersion: 1 },
+      { ...row(1), ...lease, statisticsVersion: 7, buy: null, sell: null },
+      { ...row(2), statisticsVersion: 7 },
+      { ...row(3), statisticsVersion: 5 },
+      { ...row(4), ...lease, statisticsVersion: 7, buy: 0, sell: 0 },
+      { ...row(5), ...lease, statisticsVersion: 1, oi: null, buy: null, sell: null },
+      { ...row(6), ...lease, statisticsVersion: 4, oi: null, buy: null, sell: null },
+    ])
+    const bounds = { ...query, through: base + 6 * step }
+    const expected = [[1_000, 30, 20, 11], [1_000, null, null, 9], [1_000, 30, 20, 11],
+      [1_000, null, null, 9], [1_000, null, null, 9], [null, null, null, 8], [null, null, null, 8]]
+    for (let attempt = 0; attempt < 2; attempt++) {
+      store = await MarketStore.open(root)
+      const rows = await store.candles(bounds)
+      assert.deepEqual(rows.map(value => [value.oi, value.buy, value.sell, value.statisticsVersion]), expected)
+      assert.ok(rows.every(value => value.statisticsOIExpiresAt === null && value.statisticsTakerExpiresAt === null))
+      assert.deepEqual(await store.statisticsMissingRanges({ ...bounds, source: 'oi' }), [{ from: base + 5 * step, through: base + 6 * step }])
+      assert.deepEqual(await store.statisticsMissingRanges({ ...bounds, source: 'taker' }), [{ from: base + step, through: base + step }, { from: base + 3 * step, through: base + 6 * step }])
+      await store.close()
+    }
+  } finally { await store?.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a valid source remains retryable after a SQLite import commit failure and recovers without a corruption marker', { timeout: 15_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-import-commit-failure-'))
+  let store: MarketStore | undefined, database: DatabaseSync | undefined
+  try {
+    const path = await legacy(root, 'base-200-data.parquet', [row(0)])
+    const original = await readFile(path)
+    store = await MarketStore.open(root)
+    database = new DatabaseSync(join(root, 'market.sqlite'))
+    database.exec("CREATE TRIGGER fail_import BEFORE INSERT ON candles BEGIN SELECT RAISE(ABORT, 'Injected SQLite import commit failure'); END")
+    await assert.rejects(store.candles(query), /Injected SQLite import commit failure/)
+    const failed = await store.migrationStatus()
+    assert.equal(failed.complete, false)
+    assert.equal(failed.failedPartitions, 0)
+    assert.deepEqual(failed.issues, [])
+    assert.equal(database.prepare('SELECT COUNT(*) AS count FROM candles').get()!.count, 0)
+    assert.equal(database.prepare('SELECT COUNT(*) AS count FROM migration_partitions').get()!.count, 0)
+    database.exec('DROP TRIGGER fail_import')
+    const importer = (store as any).migration
+    const closed = once(importer, 'close')
+    importer.ref(); importer.channel?.ref()
+    const [value] = await store.candles(query)
+    assert.deepEqual([value.close, value.oi, value.buy, value.sell, value.statisticsVersion], [100, 1_000, 30, 20, 11])
+    importer.ref(); importer.channel?.ref()
+    assert.deepEqual(await closed, [0, null])
+    const recovered = await store.migrationStatus()
+    assert.equal(recovered.complete, true)
+    assert.equal(recovered.completedPartitions, 1)
+    assert.equal(recovered.failedPartitions, 0)
+    assert.deepEqual(recovered.issues, [])
+    assert.deepEqual(await readFile(path), original)
+  } finally { database?.close(); await store?.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('engine startup, scan, and I/O failures stay operational and resume the same valid archive', { timeout: 15_000 }, async () => {
+  const operationsURL = new URL('../electron/services/worker-operations.js', import.meta.url).href
+  const { createOperationProcess, createWorkerRequest } = await import(operationsURL)
+  for (const mode of ['startup', 'scan', 'io']) {
+    const root = await mkdtemp(join(tmpdir(), 'perp-import-engine-failure-')), store = await MarketStore.open(root)
+    let importer: any, finished: Promise<any> | undefined
+    try {
+      // Open SQLite before adding the archive so this test owns the importer.
+      const internal = store as any
+      await internal.migrationReady
+      internal.migrationComplete = false
+      await legacy(root, 'base-200-data.parquet', [row(0)])
+      const gate = join(root, 'engine-unavailable')
+      await writeFile(gate, '')
+      importer = createOperationProcess(fileURLToPath(new URL('../tests/helpers/market-migration-fault.mjs', import.meta.url)),
+        [root, join(root, 'market.sqlite'), mode, gate], { execPath: process.execPath, execArgv: [], stdio: ['ignore', 'ignore', 'pipe', 'ipc'] }, 'market-migration')
+      finished = once(importer, 'close')
+      let ready!: () => void, sequence = 0
+      const initialized = new Promise<void>(resolve => { ready = resolve }), pending = new Map<number, any>()
+      importer.on('message', (message: any) => {
+        if (message.fixtureReady) ready()
+        else if (message.sequence) {
+          const writer = (store as any).writer
+          const task = message.import ? writer.request('append', [message.import.rows, { importing: true, partition: message.import.partition }])
+            : message.failure ? writer.request('migrationFailure', [message.failure]) : writer.request('migrationComplete')
+          task.then(() => importer.send({ ack: message.sequence }), (error: Error) => importer.send({ ack: message.sequence, error: error.message }))
+        } else if (message.id) { pending.get(message.id)?.resolve(message); pending.delete(message.id) }
+      })
+      const request = () => new Promise<any>((resolve, reject) => {
+        const id = ++sequence, job = createWorkerRequest('market-migration', 'import', resolve, reject)
+        pending.set(id, job)
+        job.dispatch(importer, { id, query, priority: 'foreground', tolerateIssues: false })
+      })
+      await initialized
+      assert.match((await request()).error, mode === 'startup' ? /engine startup failure/ : mode === 'io' ? /Permission denied/ : /scan engine failure/)
+      const failed = await store.migrationStatus()
+      assert.equal(failed.complete, false)
+      assert.equal(failed.failedPartitions, 0)
+      assert.deepEqual(failed.issues, [])
+      await rm(gate)
+      assert.equal((await request()).error, undefined)
+      assert.deepEqual(await finished, [0, null])
+      const recovered = await store.migrationStatus()
+      assert.equal(recovered.complete, true)
+      assert.equal(recovered.completedPartitions, 1)
+      assert.deepEqual(recovered.issues, [])
+      assert.equal((await store.candles(query))[0].oi, 1_000)
+    } finally {
+      if (importer?.connected) importer.send({ stop: true })
+      await finished
+      await store.close(); await rm(root, { recursive: true, force: true })
+    }
+  }
 })
 
 test('one-time native import runs in a separate process, exits normally and is skipped after cutover', { timeout: 15_000 }, async () => {

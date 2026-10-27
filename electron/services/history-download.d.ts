@@ -1,6 +1,9 @@
 import type { HistoryDownload as PublishedHistoryDownload } from '../../src/desktop-contract.ts'
 import type { HistorySync, HistoryTask } from './history-sync.js'
 
+/** checked = available + empty + unavailable; all slots belong to exactly one
+ * of those categories, failed, or pending. Only available contains numeric data.
+ * Reports checkpoint a finite run; empty observations never start renewal work. */
 export type HistoryDownloadReport = Omit<PublishedHistoryDownload, 'revision' | 'serviceSession'>
 export type HistoryDownloadInstrument = { instId: string; listTime?: string | number }
 export type HistoryDownloadOptions = {

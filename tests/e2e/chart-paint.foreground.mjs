@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
 import { requireForegroundTests } from '../../electron/test-presentation.js'
-import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureNativeColdBoundary, measurePaintLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
+import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureMissingWindow, measureNativeColdBoundary, measureChartIntentLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
 
 requireForegroundTests()
 
@@ -32,19 +32,19 @@ after(async () => {
   finally { await rm(userData, { recursive: true, force: true }) }
 })
 
-test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while speculative preparation is stalled in every native timeframe', { timeout: 90_000 }, async context => {
+test('bulk-warmed history updates every renderer target within 100 ms during scroll, reversal, and jumps', { timeout: 90_000 }, async context => {
   const foreground = await foregroundPaintWindow(electron, page)
   context.after(async () => {
     await foreground.restore()
     const restored = await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isVisible())
     assert.equal(restored, foreground.previous.visible, 'The latency test must restore the native window visibility.')
   })
-  context.diagnostic(`Native paint window: ${JSON.stringify({ before: foreground.previous, during: foreground.native, environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence })}`)
+  context.diagnostic(`Native foreground timing window: ${JSON.stringify({ before: foreground.previous, during: foreground.native, environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence })}`)
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  // Adaptive speculative preparation is held indefinitely. Source reads are
-  // also stalled after warming, so navigation must stay independent of both
-  // lanes and use the already transferred durable series.
-  await installRequestProbe(electron, fixture.instId, { holdHistorical: true })
+  // Complete the initial durable hydration before holding subsequent disk
+  // deliveries and source maintenance. Resident navigation uses transferred
+  // data independently of either backend preparation or the two read lanes.
+  await installRequestProbe(electron, fixture.instId)
   try {
     await openChart(page, fixture)
     const warmedHistory = new Map()
@@ -55,7 +55,8 @@ test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while specu
     }
     context.diagnostic(`Resident history before stalls: ${JSON.stringify(Object.fromEntries(warmedHistory))}`)
     await electron.evaluate(async () => {
-      globalThis.__chartRequestProbe.holdLatest = true
+      globalThis.__chartRequestProbe.holdHistorical = true
+      globalThis.__chartRequestProbe.holdLocal = true
       await globalThis.__marketBackend.probe({ action: 'sourceHold', hold: true })
     })
     for (const timeframe of fixture.timeframes) {
@@ -63,7 +64,7 @@ test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while specu
       await waitForRendered(page, fixture, timeframe)
       const residentHistoryBars = warmedHistory.get(timeframe)
       const before = await readRequestProbe(electron)
-      await startPaintProbe(page, fixture)
+      await startPaintProbe(page, fixture, { requireMatureData: true, requireWarmStatistics: true })
       const intervalMS = fixture.series[timeframe].intervalMS
       let distance = 0
       for (const phase of [
@@ -75,31 +76,46 @@ test('bulk-warmed history scrolls, reverses, and jumps within 100 ms while specu
         const targets = inputs.map((_, index) => fixture.end - (distance + phase.candles / inputs.length * (index + 1)) * intervalMS)
         distance += phase.candles
         await waitForRendered(page, fixture, timeframe, targets.at(-1))
-        const latency = await measurePaintLatency(page, { inputs, targets })
+        const latency = await measureChartIntentLatency(page, { inputs, targets })
         context.diagnostic(JSON.stringify({ timeframe, phase: phase.name, ...latency }))
-        assert.ok(latency.latestInputToPaintMS < 100, `${timeframe} ${phase.name} took ${latency.latestInputToPaintMS} ms from the latest wheel input to its first paint opportunity. ${JSON.stringify(latency)}`)
-        assert.ok(latency.latestBurstStartToPaintMS < 100, `${timeframe} ${phase.name} took ${latency.latestBurstStartToPaintMS} ms from the first wheel input in the latest burst to its first paint opportunity. ${JSON.stringify(latency)}`)
+        assert.ok(latency.maxInputToRafSampleMS < 100, `${timeframe} ${phase.name} had an intent take ${latency.maxInputToRafSampleMS} ms to reach its exact or coalesced chart target. ${JSON.stringify(latency)}`)
+        assert.ok(latency.latestBurstStartToRafSampleMS < 100, `${timeframe} ${phase.name} took ${latency.latestBurstStartToRafSampleMS} ms from the first wheel input in the latest burst to its renderer RAF sample. ${JSON.stringify(latency)}`)
       }
       const paint = await finishPaintProbe(page)
       assertCompletePaints(paint)
-      assert.equal(paint.pendingFrames, 0, 'Resident navigation must never wait for the stalled speculative preparation.')
+      assert.equal(paint.pendingFrames, 0, 'Resident navigation must never wait for the held disk deliveries.')
       const after = await readRequestProbe(electron)
       const historicalRequests = after.calls.slice(before.calls.length).filter(call => Number.isFinite(call.endHour))
-      assert.ok(historicalRequests.every(call => call.historyBars > 96), `Resident ${timeframe} targets must only issue bulk speculative preparation: ${JSON.stringify(historicalRequests)}`)
+      assert.ok(historicalRequests.every(call => call.kind === 'history'), 'Resident navigation may issue only observational history reads.')
+      assert.equal(after.legacyWindowCalls, 0)
       const sources = separateSourceMaintenance(after.sourceRequests.slice(before.sourceCalls), fixture)
       assert.deepEqual(sources.historical, [], `A warmed ${timeframe} scroll attempted a historical download: ${JSON.stringify(sources.historical)}`)
-      assert.ok(after.maxHistoricalActive <= 1, 'Resident targets must never queue foreground work behind the stalled speculative preparation.')
+      assert.ok(after.maxHistoricalActive <= 2, 'Resident targets must never queue foreground work behind the held disk deliveries.')
       assert.ok(after.transferredHistoryBars >= residentHistoryBars, 'The fixture must exercise a bulk durable-history transfer.')
     }
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
 
-test('historical prefetch covers 1500 ms of network latency before the cold boundary during continuous wheel input', { timeout: 90_000 }, async () => {
+test('backend history reserve covers 1500 ms of delivery latency before the cold boundary during continuous wheel input', { timeout: 90_000 }, async () => {
   const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark', instId: 'PREFETCH-USDT-SWAP' }))
   await measureLatencyCoveredPrefetch(electron, page, fixture)
 })
 
-test('a never-downloaded native price page paints before the farther reserve and optional statistics finish', async context => {
+test('a never-downloaded native price page reaches an SVG snapshot before reserve and optional statistics finish', async context => {
   const report = await measureNativeColdBoundary(electron, page)
   context.diagnostic(`Native cold boundary: ${JSON.stringify(report)}`)
+})
+
+for (const failSource of [false, true]) test(`a completely absent viewport keeps foreground input responsive through delayed source ${failSource ? 'failure' : 'success'}`, { timeout: 60_000 }, async context => {
+  const report = await measureMissingWindow(electron, page, { offscreen: false, failSource })
+  assert.equal(report.initiallyPresentCandles, 0)
+  assert.equal(report.initiallyMissingCandles, 96)
+  assert.equal(report.foregroundRafObservationMeasured, true)
+  assert.equal(report.pendingInputAcknowledgment.milestone, 'requested-cursor')
+  assert.equal(report.pendingInputAcknowledgment.unaccountedInputs.length, 0)
+  assert.equal(report.failedSourceDidNotClaimCompletion, failSource)
+  context.diagnostic(JSON.stringify({ scenario: report.scenario, sourceFailure: report.sourceFailure,
+    inputBudgetMS: report.inputBudgetMS, maxInputAcknowledgmentMS: report.pendingInputAcknowledgment.maxInputToRafSampleMS,
+    maxFrameGapMS: report.maxFrameGapMS, dataAvailability: report.dataAvailability,
+    timingScope: report.timingScope, sourceRequests: report.sourceRequests, observedFieldOracle: report.observedFieldOracle }))
 })

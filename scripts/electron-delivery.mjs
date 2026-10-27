@@ -65,19 +65,26 @@ export async function inspectApp(appPath, expectedRevision) {
   const { stdout } = await execute('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleExecutable', join(app, 'Contents', 'Info.plist')])
   assert.equal(stdout.trim(), productName)
   await execute('codesign', ['--verify', '--deep', '--strict', app])
-  return { app, executable, metadata }
+  // CodeResources seals resources and nested code. Deep strict verification
+  // plus identical main code/plist identifies the installed signed artifact.
+  const identity = createHash('sha256')
+  for (const path of [executable, join(app, 'Contents', 'Info.plist'), join(app, 'Contents', '_CodeSignature', 'CodeResources')]) {
+    identity.update(await readFile(path)).update('\0')
+  }
+  return { app, executable, metadata, identity: identity.digest('hex') }
 }
 
 // Stage beside the destination, so the final renames stay on one filesystem.
-// Roll back both a failed replacement and a failed installed executable smoke.
-export async function installApp({ candidate, destination, revision, validate = inspectApp, smoke, beforeReplace = async () => {}, copy = (from, to) => run('ditto', [from, to]) }) {
-  assert.equal(typeof smoke, 'function', 'An executable smoke check is required.')
+// Verification can execute a guarded candidate replica, then check the exact
+// signed installed artifact without launching the production app.
+export async function installApp({ candidate, destination, revision, validate = inspectApp, verify, beforeReplace = async () => {}, copy = (from, to) => run('ditto', [from, to]) }) {
+  assert.equal(typeof verify, 'function', 'An explicit candidate/installed verification contract is required.')
   candidate = resolve(candidate)
   destination = resolve(destination)
   assert.notEqual(candidate, destination, 'The candidate must differ from the installed app.')
   assert.ok(destination.endsWith('.app'), 'The installation destination must be an .app directory.')
-  await validate(candidate, revision)
-  await smoke(candidate, revision)
+  const candidateArtifact = await validate(candidate, revision)
+  const candidateVerification = await verify(candidate, revision, { stage: 'candidate', artifact: candidateArtifact })
   await mkdir(dirname(destination), { recursive: true })
   const id = randomUUID()
   const staged = join(dirname(destination), `.${productName}.install-${id}.app`)
@@ -97,8 +104,8 @@ export async function installApp({ candidate, destination, revision, validate = 
     } catch (error) { if (error.code !== 'ENOENT') throw error }
     await rename(staged, destination)
     replaced = true
-    await validate(destination, revision)
-    const report = await smoke(destination, revision)
+    const installedArtifact = await validate(destination, revision)
+    const report = await verify(destination, revision, { stage: 'installed', artifact: installedArtifact, candidateArtifact, candidateVerification })
     verified = true
     if (backedUp) await rm(backup, { recursive: true })
     return report

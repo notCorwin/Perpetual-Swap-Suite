@@ -2,6 +2,7 @@ import { hookOperationMethods } from './operations.js'
 // Native OKX public streams cover the entire eligible universe independently of
 // chart selection. https://www.okx.com/docs-v5/en/#order-book-trading-market-data
 import { recordedWebSocketFactory } from './network-operations.js'
+import { marketTrafficPayloadIdentity, monotonicMicroseconds } from './market-traffic-callback-probe.js'
 
 export const OKX_PUBLIC_WEBSOCKET_URL = 'wss://ws.okx.com/ws/v5/public'
 export const PUBLIC_MARKET_CONTRACTS_PER_CONNECTION = 25
@@ -10,6 +11,21 @@ const channels = ['tickers', 'open-interest', 'books', 'trades']
 const keyFor = ({ instId, instType, channel }) => `${channel}:${channel === 'instruments' ? instType : instId}`
 const hour = 3_600_000
 const copy = value => ({ ...value })
+const validInstrumentId = value => typeof value === 'string' && /^[A-Za-z0-9-]{1,128}$/.test(value)
+
+function normalizeDemand(value, instruments, channel) {
+  if (value === undefined || value === true) return new Set(instruments)
+  if (value === false) return new Set()
+  if (value === null || typeof value === 'string' || typeof value[Symbol.iterator] !== 'function') {
+    throw new TypeError(`${channel} subscription demand must be a boolean or iterable of instrument IDs.`)
+  }
+  const demand = new Set()
+  for (const instId of value) {
+    if (!validInstrumentId(instId)) throw new TypeError(`Invalid ${channel} subscription demand.`)
+    if (instruments.has(instId)) demand.add(instId)
+  }
+  return demand
+}
 
 /** Transport and incremental order-book reconstruction; consumers own projections. */
 class PublicMarketConnection {
@@ -61,7 +77,7 @@ class PublicMarketConnection {
   getState() { return copy(this.state) }
   getTelemetry() { return copy(this.telemetry) }
 
-  setSubscriptions(instIds) {
+  setSubscriptions(instIds, { books, trades }) {
     if (this.closed) throw new Error('Realtime public market is closed.')
     const instruments = new Set()
     const next = new Map()
@@ -70,9 +86,11 @@ class PublicMarketConnection {
       next.set(key, this.subscriptions.get(key) ?? value)
     }
     for (const instId of instIds) {
-      if (typeof instId !== 'string' || !/^[A-Za-z0-9-]{1,128}$/.test(instId)) throw new TypeError('Invalid public market subscription.')
+      if (!validInstrumentId(instId)) throw new TypeError('Invalid public market subscription.')
       instruments.add(instId)
       for (const channel of channels) {
+        if (channel === 'books' && !books.has(instId)) continue
+        if (channel === 'trades' && !trades.has(instId)) continue
         const value = { instId, channel }, key = keyFor(value)
         next.set(key, this.subscriptions.get(key) ?? value)
       }
@@ -80,13 +98,11 @@ class PublicMarketConnection {
     const removed = [...this.subscriptions].filter(([key, value]) => next.get(key) !== value && value.channel !== 'instruments')
     this.instruments = instruments
     this.subscriptions = next
-    if (this.connection && this.options.onUnsubscribed) for (const [, value] of removed) {
-      try {
-        const result = this.options.onUnsubscribed(value.instId, value.channel, { signal: this.connection.controller.signal, receivedAt: this.now(), acknowledged: false })
-        if (result?.then) this.track(Promise.resolve(result).catch(error => this.report('Unsubscription callback failed.', error)))
-      } catch (error) { this.report('Unsubscription callback failed.', error) }
+    if (this.connection) for (const [, value] of removed) {
+      this.invalidateSubscription(this.connection, value)
+      if (value.channel === 'books') this.connection.bookRecoveries.delete(value.instId)
     }
-    for (const instId of this.books.keys()) if (!instruments.has(instId)) this.books.delete(instId)
+    for (const instId of this.books.keys()) if (!next.has(`books:${instId}`)) this.books.delete(instId)
     if (!next.size) {
       this.cancelRetry()
       if (this.connection) this.retire(this.connection)
@@ -149,7 +165,7 @@ class PublicMarketConnection {
     let socket
     try { socket = this.factory(this.url) }
     catch (error) { this.scheduleReconnect(this.report('WebSocket connection failed.', error)); return }
-    const connection = { socket, sent: new Map(), pending: new Map(), timers: new Map(), commands: [], commandId: 0, controller: new AbortController(), ready: false, waitingForPong: false, retired: false, wasReconnect: this.hasOpened }
+    const connection = { socket, sent: new Map(), sessions: new Map(), pending: new Map(), unsubscribing: new Map(), bookRecoveries: new Map(), timers: new Map(), commands: [], commandId: 0, ingress: 0, controller: new AbortController(), ready: false, waitingForPong: false, retired: false, wasReconnect: this.hasOpened }
     this.connection = connection
     connection.done = new Promise(resolve => { connection.resolveDone = resolve })
     connection.listeners = {
@@ -216,11 +232,16 @@ class PublicMarketConnection {
   flushSubscriptions(connection) {
     if (!this.active(connection) || !connection.opened || connection.socket.readyState !== 1) return
     this.clearConnectionTimer(connection, 'control')
-    const removals = [...connection.sent].filter(([key, value]) => this.subscriptions.get(key) !== value)
-    const additions = [...this.subscriptions].filter(([key, value]) => connection.sent.get(key) !== value)
+    const due = value => value.channel !== 'books' || (connection.bookRecoveries.get(value.instId)?.retryAt ?? -Infinity) <= this.now()
+    const removals = [...connection.sent].filter(([key, value]) => this.subscriptions.get(key) !== value || !connection.sessions.has(key))
+    for (const [key, pending] of connection.unsubscribing) {
+      if (pending.deadline === null && pending.retryAt <= this.now()) removals.push([key, pending.subscription])
+    }
     // OKX: at most 480 control requests/hour and 64 KB/request. Four channels
     // per contract are batched across the entire universe, never polled in turn.
-    for (const [op, entries] of [['unsubscribe', removals], ['subscribe', additions]]) {
+    for (const op of ['unsubscribe', 'subscribe']) {
+      const entries = op === 'unsubscribe' ? removals
+        : [...this.subscriptions].filter(([key, value]) => connection.sent.get(key) !== value && !connection.unsubscribing.has(key) && due(value))
       for (let index = 0; index < entries.length; index += 100) {
         const now = this.now()
         connection.commands = connection.commands.filter(time => time > now - hour)
@@ -232,8 +253,18 @@ class PublicMarketConnection {
         }
         const chunk = entries.slice(index, index + 100), id = String(++connection.commandId)
         for (const [key, value] of chunk) {
-          if (op === 'subscribe') { connection.sent.set(key, value); connection.pending.set(key, { id, deadline: now + this.ackTimeoutMs }) }
-          else { connection.sent.delete(key); connection.pending.delete(key) }
+          const pending = { id, subscription: value, deadline: now + this.ackTimeoutMs }
+          if (op === 'subscribe') {
+            const controller = value.channel === 'books' || value.channel === 'tickers' ? new AbortController() : connection.controller
+            connection.sessions.set(key, { controller, ingress: connection.ingress })
+            connection.sent.set(key, value)
+            connection.pending.set(key, pending)
+          } else {
+            pending.attempt = connection.unsubscribing.get(key)?.attempt ?? 0
+            connection.sent.delete(key)
+            connection.pending.delete(key)
+            connection.unsubscribing.set(key, pending)
+          }
         }
         try {
           connection.socket.send(JSON.stringify({ id, op, args: chunk.map(([, value]) => ({ ...value })) }))
@@ -241,21 +272,93 @@ class PublicMarketConnection {
         } catch (error) { this.lost(connection, 'WebSocket subscription failed.', error); return }
       }
     }
+    const retries = [...connection.bookRecoveries].filter(([instId, recovery]) => {
+      const key = `books:${instId}`
+      return this.subscriptions.has(key) && !connection.sessions.has(key) && !connection.unsubscribing.has(key) && recovery.retryAt > this.now()
+    }).map(([, recovery]) => recovery.retryAt)
+    for (const pending of connection.unsubscribing.values()) if (pending.deadline === null && pending.retryAt > this.now()) retries.push(pending.retryAt)
+    if (retries.length) this.timer(connection, 'control', Math.max(1, Math.min(...retries) - this.now()), () => this.flushSubscriptions(connection))
     this.armAcknowledgement(connection)
     this.maybeLive(connection)
   }
 
   armAcknowledgement(connection) {
     this.clearConnectionTimer(connection, 'ack')
-    if (!connection.pending.size) return
-    const deadline = Math.min(...[...connection.pending.values()].map(value => value.deadline))
-    this.timer(connection, 'ack', Math.max(1, deadline - this.now()), () => this.lost(connection, 'Public market subscription acknowledgement timed out.'))
+    const pending = [...connection.pending.values(), ...connection.unsubscribing.values()].filter(value => value.deadline !== null)
+    if (!pending.length) return
+    const deadline = Math.min(...pending.map(value => value.deadline))
+    this.timer(connection, 'ack', Math.max(1, deadline - this.now()), () => {
+      const expired = pending.filter(value => value.deadline <= this.now())
+      if (expired.some(value => !['books', 'tickers'].includes(value.subscription.channel) && connection.pending.get(keyFor(value.subscription)) === value)) {
+        this.lost(connection, 'Public market subscription acknowledgement timed out.')
+        return
+      }
+      for (const value of expired) {
+        const { instId } = value.subscription, key = keyFor(value.subscription)
+        if (connection.unsubscribing.get(key) === value) {
+          this.deferUnsubscription(value, `Public market unsubscribe acknowledgement timed out for ${key}.`)
+        } else if (connection.pending.get(key) === value) {
+          if (value.subscription.channel === 'books') this.recoverBook(connection, instId, `Order book subscribe acknowledgement timed out for ${instId}.`)
+          else {
+            this.report(`Ticker subscribe acknowledgement timed out for ${instId}.`)
+            this.recoverSubscription(instId, 'tickers')
+          }
+        }
+      }
+      this.flushSubscriptions(connection)
+    })
+  }
+
+  deferUnsubscription(pending, message) {
+    pending.deadline = null
+    const delay = Math.min(this.maxDelay, this.baseDelay * 2 ** Math.min(pending.attempt++, 30))
+    pending.retryAt = this.now() + delay
+    this.report(message)
+  }
+
+  invalidateSubscription(connection, subscription) {
+    const key = keyFor(subscription), session = connection.sessions.get(key)
+    connection.sessions.delete(key)
+    connection.pending.delete(key)
+    if (subscription.channel === 'books') this.books.delete(subscription.instId)
+    try {
+      const result = this.options.onUnsubscribed?.(subscription.instId, subscription.channel, { signal: session?.controller.signal ?? connection.controller.signal, receivedAt: this.now(), acknowledged: false })
+      if (result?.then) this.track(Promise.resolve(result).catch(error => this.report('Unsubscription callback failed.', error)))
+    } catch (error) { this.report('Unsubscription callback failed.', error) }
+    if (session?.controller !== connection.controller) session?.controller.abort()
+  }
+
+  recoverSubscription(instId, channel) {
+    const connection = this.connection, subscription = this.subscriptions.get(`${channel}:${instId}`)
+    if (!connection || !this.active(connection) || !subscription || !connection.sessions.has(keyFor(subscription))) return false
+    this.invalidateSubscription(connection, subscription)
+    this.flushSubscriptions(connection)
+    return true
+  }
+
+  deferBookRecovery(connection, instId, message) {
+    const previous = connection.bookRecoveries.get(instId)
+    // Only a sustained healthy book resets backoff. ACKs and a snapshot followed
+    // immediately by another corrupt update cannot create a tight retry loop.
+    const stable = previous?.healthySince != null && this.now() - previous.healthySince >= this.maxDelay
+    const attempt = !previous || stable ? 1 : previous.attempt + 1
+    const delay = Math.min(this.maxDelay, this.baseDelay * 2 ** Math.min(attempt - 1, 30))
+    connection.bookRecoveries.set(instId, { attempt, retryAt: this.now() + delay, healthySince: null })
+    this.report(message)
+  }
+
+  recoverBook(connection, instId, message) {
+    const key = `books:${instId}`, subscription = this.subscriptions.get(key)
+    if (!this.active(connection) || !subscription || !connection.sessions.has(key)) return
+    this.deferBookRecovery(connection, instId, message)
+    this.invalidateSubscription(connection, subscription)
+    this.flushSubscriptions(connection)
   }
 
   maybeLive(connection) {
     if (!this.active(connection)) return
     const live = connection.ready && !connection.pending.size && this.subscriptions.size > 0
-      && [...this.subscriptions].every(([key, value]) => connection.sent.get(key) === value)
+      && [...this.subscriptions].every(([key, value]) => connection.sent.get(key) === value && connection.sessions.has(key))
     if (live) this.attempt = 0
     this.setState({ status: live ? 'live' : connection.wasReconnect ? 'reconnecting' : 'connecting', ...(live ? { error: '' } : {}) })
   }
@@ -273,7 +376,10 @@ class PublicMarketConnection {
 
   message(connection, data) {
     if (!this.active(connection)) return
+    const trafficProbeEnabled = typeof this.options.onMarketTrafficIngress === 'function'
+    const nativeHandlerEnteredAtMonotonicUS = trafficProbeEnabled ? monotonicMicroseconds() : null
     const receivedAt = this.now()
+    const ingress = ++connection.ingress
     this.armHeartbeat(connection)
     const task = (connection.messageTail ?? Promise.resolve()).then(async () => {
       let text = data
@@ -282,13 +388,13 @@ class PublicMarketConnection {
         else if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) text = new TextDecoder().decode(data)
         else throw new TypeError('Unsupported WebSocket message data.')
       }
-      if (this.active(connection)) this.consume(connection, text, receivedAt)
+      if (this.active(connection)) this.consume(connection, text, receivedAt, ingress, nativeHandlerEnteredAtMonotonicUS)
     }).catch(error => this.report('WebSocket message decoding failed.', error, this.active(connection) ? true : 'log'))
     connection.messageTail = task
     this.track(task)
   }
 
-  consume(connection, text, receivedAt) {
+  consume(connection, text, receivedAt, ingress, nativeHandlerEnteredAtMonotonicUS = null) {
     if (text === 'pong') {
       connection.waitingForPong = false
       this.clearConnectionTimer(connection, 'pong')
@@ -300,12 +406,37 @@ class PublicMarketConnection {
     catch (error) { this.report('Invalid WebSocket JSON.', error); return }
     if (!message || typeof message !== 'object') { this.report('Invalid WebSocket message.'); return }
     if (message.event === 'error' || message.event === 'notice') {
+      if (message.event === 'error' && message.id != null) {
+        const errorKey = message.arg ? keyFor(message.arg) : null
+        const pending = [...connection.pending.values(), ...connection.unsubscribing.values()].filter(value => value.id === message.id && value.deadline !== null
+          && (errorKey === null || keyFor(value.subscription) === errorKey))
+        if (!pending.length) return
+        if (pending.every(value => ['books', 'tickers'].includes(value.subscription.channel) || connection.unsubscribing.get(keyFor(value.subscription)) === value)) {
+          for (const value of pending) {
+            const { instId } = value.subscription, key = keyFor(value.subscription)
+            const detail = `OKX public market control failed for ${key} (${message.code ?? 'unknown'}): ${message.msg ?? 'No details.'}`
+            if (connection.unsubscribing.get(key) === value) {
+              this.deferUnsubscription(value, detail)
+            } else if (value.subscription.channel === 'books') this.recoverBook(connection, instId, detail)
+            else { this.report(detail); this.recoverSubscription(instId, 'tickers') }
+          }
+          this.flushSubscriptions(connection)
+          return
+        }
+      }
       this.lost(connection, `OKX WebSocket ${message.event} (${message.code ?? 'unknown'}): ${message.msg ?? 'No details.'}`)
       return
     }
     const key = keyFor(message.arg ?? {})
+    if (message.event === 'unsubscribe') {
+      if (connection.unsubscribing.get(key)?.id !== message.id) return
+      connection.unsubscribing.delete(key)
+      this.flushSubscriptions(connection)
+      return
+    }
     const subscription = this.subscriptions.get(key)
-    if (!subscription || connection.sent.get(key) !== subscription) return
+    const session = connection.sessions.get(key)
+    if (!subscription || connection.sent.get(key) !== subscription || !session) return
     if (message.event === 'subscribe') {
       if (connection.pending.get(key)?.id !== message.id) return
       connection.pending.delete(key)
@@ -321,7 +452,7 @@ class PublicMarketConnection {
         } catch (error) { this.report('Instruments readiness callback failed.', error) }
       } else if (this.options.onSubscribed) {
         try {
-          const result = this.options.onSubscribed(subscription.instId, subscription.channel, { signal: connection.controller.signal, receivedAt, acknowledged: true })
+          const result = this.options.onSubscribed(subscription.instId, subscription.channel, { signal: session.controller.signal, receivedAt, acknowledged: true })
           if (result?.then) this.track(Promise.resolve(result).catch(error => this.report('Subscription callback failed.', error)))
         } catch (error) { this.report('Subscription callback failed.', error) }
       }
@@ -329,26 +460,53 @@ class PublicMarketConnection {
       this.maybeLive(connection)
       return
     }
-    if (Array.isArray(message.data)) this.enqueue(connection, subscription, message, receivedAt)
+    if (message.event != null || ingress <= session.ingress) return
+    // Book frames admitted before the ACK may belong to the retired wire
+    // subscription. They can neither seed reconstruction nor fault a new book.
+    if (subscription.channel === 'books') {
+      if (connection.pending.has(key)) return
+      if (!Array.isArray(message.data)) {
+        this.telemetry.rejectedEvents++
+        this.recoverBook(connection, subscription.instId, `Invalid OKX order book data for ${subscription.instId}.`)
+        return
+      }
+    }
+    if (Array.isArray(message.data)) this.enqueue(connection, subscription, session, message, receivedAt, ingress, nativeHandlerEnteredAtMonotonicUS)
   }
 
-  enqueue(connection, subscription, message, receivedAt) {
+  enqueue(connection, subscription, session, message, receivedAt, nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS) {
     this.telemetry.receivedEvents += message.data.length
     this.telemetry.lastReceivedAt = receivedAt
     this.telemetry.pendingEvents++
     const key = keyFor(subscription)
     const acknowledged = !connection.pending.has(key)
+    const current = () => this.active(connection) && this.subscriptions.get(key) === subscription && connection.sessions.get(key) === session
+    let trafficEvents = null
+    const trafficObserver = this.options.onMarketTrafficIngress
+    if (Number.isSafeInteger(nativeHandlerEnteredAtMonotonicUS) && typeof trafficObserver === 'function') {
+      const probeStartedAtMonotonicUS = monotonicMicroseconds()
+      trafficEvents = message.data.map(payload => ({
+        ...(marketTrafficPayloadIdentity(subscription.channel, subscription.instId, payload)
+          ?? { channel: subscription.channel, instId: subscription.instId, identity: null, payloadFingerprint: null }),
+        nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS,
+      }))
+      const probeCostMonotonicUS = monotonicMicroseconds() - probeStartedAtMonotonicUS
+      trafficObserver(trafficEvents, probeCostMonotonicUS)
+    }
+    const contextFor = trafficEvent => ({ signal: session.controller.signal, receivedAt, acknowledged,
+      ...(trafficEvent ? { marketTrafficEvents: [trafficEvent] } : {}) })
     const task = (this.tails.get(key) ?? Promise.resolve()).then(async () => {
-      if (!await connection.readyTask || !this.active(connection) || this.subscriptions.get(key) !== subscription) return
-      const context = { signal: connection.controller.signal, receivedAt, acknowledged }
+      if (!await connection.readyTask || !current()) return
       const { instId, channel } = subscription
       if (channel === 'instruments') {
-        await this.options.onInstruments(message.data, context)
+        await this.options.onInstruments(message.data, contextFor(undefined))
       } else if (channel === 'trades') {
-        await this.options.onTrades(instId, message.data, context)
+        await this.options.onTrades(instId, message.data, { signal: session.controller.signal, receivedAt, acknowledged,
+          ...(trafficEvents ? { marketTrafficEvents: trafficEvents } : {}) })
         this.telemetry.tradeEvents += message.data.length
-      } else for (const raw of message.data) {
-        if (!this.active(connection) || this.subscriptions.get(key) !== subscription) return
+      } else for (let index = 0; index < message.data.length; index++) {
+        if (!current()) return
+        const raw = message.data[index], context = contextFor(trafficEvents?.[index])
         if (channel === 'books') {
           const book = this.updateBook(connection, instId, message.action, raw)
           if (!book) continue
@@ -376,34 +534,46 @@ class PublicMarketConnection {
     const seqId = raw?.seqId, prevSeqId = raw?.prevSeqId
     if (!['snapshot', 'update'].includes(action) || !Number.isSafeInteger(seqId) || seqId < 0 || typeof raw?.ts !== 'string' || !raw.ts.trim() || !Number.isFinite(Number(raw.ts)) || !Array.isArray(raw?.bids) || !Array.isArray(raw?.asks) || action === 'snapshot' && prevSeqId !== -1) {
       this.telemetry.rejectedEvents++
-      this.lost(connection, `Invalid OKX order book for ${instId}.`)
+      this.recoverBook(connection, instId, `Invalid OKX order book for ${instId}.`)
       return null
     }
     if (action === 'update' && (!previous || !Number.isSafeInteger(prevSeqId) || prevSeqId !== previous.seqId || seqId < prevSeqId || seqId === prevSeqId && (raw.bids.length || raw.asks.length))) {
       this.telemetry.rejectedEvents++
-      this.lost(connection, `Order book sequence gap or reset for ${instId}; requesting a fresh snapshot.`)
+      this.recoverBook(connection, instId, `Order book sequence gap or reset for ${instId}; requesting a fresh snapshot.`)
       return null
     }
     // A snapshot replaces every level. Incremental messages replace equal
     // prices, insert new ones, and remove a level when its size is zero.
     const book = action === 'snapshot' ? { bids: new Map(), asks: new Map(), seqId } : previous
     for (const side of ['bids', 'asks']) {
+      let reorder = action === 'snapshot'
       for (const level of raw[side]) {
         const price = Number(level?.[0]), size = Number(level?.[1])
         if (!Array.isArray(level) || level.length < 2 || typeof level[0] !== 'string' || !level[0].trim() || typeof level[1] !== 'string' || !level[1].trim() || !Number.isFinite(price) || price <= 0 || !Number.isFinite(size) || size < 0) {
           this.telemetry.rejectedEvents++
-          this.lost(connection, `Invalid OKX order book level for ${instId}.`)
+          this.recoverBook(connection, instId, `Invalid OKX order book level for ${instId}.`)
           return null
         }
         if (size === 0) book[side].delete(price)
-        else book[side].set(price, [...level])
+        else {
+          // Map replacement/deletion preserves the established price order.
+          // Only a new numeric price can change priority or exceed the depth.
+          if (!book[side].has(price)) reorder = true
+          // Published snapshots share resident levels. Install an immutable
+          // copy so neither raw inputs nor a consumer can alter their values.
+          book[side].set(price, Object.freeze([...level]))
+        }
       }
-      const sorted = [...book[side]].sort((a, b) => side === 'bids' ? b[0] - a[0] : a[0] - b[0])
-      book[side] = new Map(sorted.slice(0, 400))
+      if (reorder) {
+        const sorted = [...book[side]].sort((a, b) => side === 'bids' ? b[0] - a[0] : a[0] - b[0])
+        book[side] = new Map(sorted.slice(0, 400))
+      }
     }
     book.seqId = seqId
     this.books.set(instId, book)
-    return { bids: [...book.bids.values()].map(level => [...level]), asks: [...book.asks.values()].map(level => [...level]), ts: raw.ts, seqId }
+    const recovery = connection.bookRecoveries.get(instId)
+    if (recovery && recovery.healthySince === null) recovery.healthySince = this.now()
+    return { bids: [...book.bids.values()], asks: [...book.asks.values()], ts: raw.ts, seqId }
   }
 
   lost(connection, message, error) {
@@ -432,6 +602,8 @@ class PublicMarketConnection {
     if (connection.retired) return
     connection.retired = true
     connection.controller.abort()
+    for (const session of connection.sessions.values()) session.controller.abort()
+    connection.sessions.clear()
     if (this.options.instrumentsControl && this.options.onInstrumentsDisconnect) {
       try {
         const result = this.options.onInstrumentsDisconnect({ signal: connection.controller.signal, receivedAt: this.now() })
@@ -513,7 +685,7 @@ export class RealtimePublicMarket {
     this.controlShard = null
     if (typeof options.onInstruments === 'function') {
       this.controlShard = this.makeShard(true)
-      this.controlShard.setSubscriptions([])
+      this.controlShard.setSubscriptions([], { books: new Set(), trades: new Set() })
       this.subscriptions = new Map(this.controlShard.subscriptions)
     }
   }
@@ -546,10 +718,13 @@ export class RealtimePublicMarket {
     return market
   }
 
-  setSubscriptions(instIds) {
+  setSubscriptions(instIds, demand = {}) {
     if (this.closed) throw new Error('Realtime public market is closed.')
+    if (demand === null || typeof demand !== 'object') throw new TypeError('Public market channel demand must be an object.')
     const next = new Set(instIds)
-    for (const instId of next) if (typeof instId !== 'string' || !/^[A-Za-z0-9-]{1,128}$/.test(instId)) throw new TypeError('Invalid public market subscription.')
+    for (const instId of next) if (!validInstrumentId(instId)) throw new TypeError('Invalid public market subscription.')
+    const books = normalizeDemand(demand.books, next, 'Book')
+    const trades = normalizeDemand(demand.trades, next, 'Trade')
     this.changing = true
     this.instruments = next
     const assigned = new Set()
@@ -565,7 +740,10 @@ export class RealtimePublicMarket {
       allocation.ids.push(instId)
     }
     for (const { market, ids } of allocations) {
-      market.setSubscriptions(ids)
+      market.setSubscriptions(ids, {
+        books: new Set(ids.filter(instId => books.has(instId))),
+        trades: new Set(ids.filter(instId => trades.has(instId))),
+      })
       if (!ids.length && market !== this.controlShard) {
         this.shards = this.shards.filter(value => value !== market)
         const closing = market.close().then(() => {
@@ -591,6 +769,12 @@ export class RealtimePublicMarket {
   }
 
   getState() { return copy(this.state) }
+
+  /** Replace only the faulty native subscription, within the control budget. */
+  recoverSubscription(instId, channel) {
+    if (this.closed) return false
+    return this.shards.find(market => market.instruments.has(instId))?.recoverSubscription(instId, channel) ?? false
+  }
 
   addTelemetry(total, value) {
     for (const key of Object.keys(total)) {
@@ -655,7 +839,7 @@ export class RealtimePublicMarket {
 }
 
 hookOperationMethods(PublicMarketConnection.prototype, {
-  consume: { category: 'cpu', name: 'market.websocket.decode', attributes: { stream: 'okx.public' } },
+  consume: { category: 'cpu', name: 'market.websocket.decode', cpuTime: false, attributes: { stream: 'okx.public', durationSource: 'performance.now' } },
   updateBook: (_connection, instId, _action, raw) => ({ category: 'cpu', name: 'market.book.reconstruct', resource: instId,
     attributes: { bidLevels: raw?.bids?.length ?? 0, askLevels: raw?.asks?.length ?? 0 } }),
 })

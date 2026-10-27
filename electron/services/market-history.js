@@ -1,6 +1,7 @@
 import { HistorySync } from './history-sync.js'
 import { DataAudit } from './data-audit.js'
 import { CANDLE_INTERVALS, validateCandle } from './market-store.js'
+import { completePriceCandle as pricePresent } from './market-records.js'
 import { statisticsMask, STATISTICS_OI as OI, STATISTICS_TAKER as TAKER, validTakerVolumes } from './statistics-state.js'
 
 const keyOf = (instrument, timeframe) => `${instrument}:${timeframe}`
@@ -8,7 +9,6 @@ const rangeKey = value => `${keyOf(value.instrument, value.timeframe)}:${value.f
 const numeric = value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value)) ? Number(value) : null
 const nonnegative = value => typeof value === 'number' && Number.isFinite(value) && value >= 0
 const expiryField = source => source === OI ? 'statisticsOIExpiresAt' : 'statisticsTakerExpiresAt'
-const pricePresent = row => row.confirmed === true && nonnegative(row.baseVolume) && nonnegative(row.quoteVolume)
 const sourcePresent = (row, source, now) => {
   if (!(statisticsMask(row) & source)) return false
   const valid = source === OI ? nonnegative(row.oi) : validTakerVolumes(row)
@@ -50,9 +50,9 @@ const abortable = (promise, signal) => {
 
 /** OKX source adaptation; HistorySync alone schedules durable observations. */
 export class MarketHistory {
-  constructor({ store, metadata, get, awaitRealtimeCandle, parseCandle, persistCandles, persistStatistics, replaceCandles, instrument, onProgress, onLive, liveRevision, onAuditCheckpoint, now = Date.now }) {
+  constructor({ store, metadata, get, awaitRealtimeCandle, parseCandle, persistCandles, persistStatistics, replaceCandles, derivePrices, instrument, onProgress, onLive, liveRevision, onAuditCheckpoint, now = Date.now }) {
     if (typeof replaceCandles !== 'function') throw new TypeError('MarketHistory needs a replacement mutation callback.')
-    Object.assign(this, { store, metadata, get, awaitRealtimeCandle, parseCandle, persistCandles, persistStatistics, replaceCandles, instrument, onLive, liveRevision, now })
+    Object.assign(this, { store, metadata, get, awaitRealtimeCandle, parseCandle, persistCandles, persistStatistics, replaceCandles, derivePrices, instrument, onLive, liveRevision, now })
     this.closed = false
     this.closeTask = null
     this.controllers = new Set()
@@ -65,7 +65,6 @@ export class MarketHistory {
       fetchGap: query => this.fetchStatistics(query, source),
     })
     this.sync = new HistorySync({
-      metadata,
       store: {
         missingCandleRanges: (query, priority) => this.missingSource(query, priority),
         ...(typeof store.candleRevision === 'function' ? {
@@ -84,8 +83,8 @@ export class MarketHistory {
       now,
       // MarketService.get already meters each independent OKX endpoint family.
       minRequestIntervalMS: 0,
-      maxConcurrentTasks: 8,
-      maxConcurrentPerSource: { candles: 4, oi: 2, taker: 2 },
+      maxConcurrentTasks: 20,
+      maxConcurrentPerSource: { candles: 4, oi: 8, taker: 8 },
     })
     this.audit = new DataAudit({ metadata, now, onCheckpoint: onAuditCheckpoint,
       inspect: async (target, { signal }) => {
@@ -127,7 +126,14 @@ export class MarketHistory {
   }
 
   async missingSource(query, priority) {
-    const rows = query.source === 'candles' ? await this.store.candles(query, priority) : await this.store.statistics(query, priority)
+    let rows = query.source === 'candles' ? await this.store.candles(query, priority) : await this.store.statistics(query, priority)
+    if (query.source === 'candles' && query.timeframe !== '5m' && this.derivePrices) {
+      const gaps = missing(rows, query.from, query.through, query.intervalMS, pricePresent)
+      if (gaps.length) {
+        for (const gap of gaps) await this.derivePrices({ instrument: query.instrument, timeframe: query.timeframe, ...gap }, priority)
+        rows = await this.store.candles(query, priority)
+      }
+    }
     const bit = query.source === 'oi' ? OI : TAKER
     const observations = this.seeds.get(keyOf(query.instrument, query.timeframe)), observedAt = this.now()
     const leases = []
@@ -176,7 +182,7 @@ export class MarketHistory {
       return { records: [], cursor: null }
     }
     const cursor = Math.min(numeric(query.cursor) ?? through + interval, through + interval)
-    const values = await this.get('/market/history-candles', { instId: instrument, bar: timeframe, limit: Math.min(300, (cursor - from) / interval), after: cursor }, signal, priority)
+    const values = await this.get('/market/history-candles', { instId: instrument, bar: timeframe, limit: Math.min(300, (cursor - from) / interval), after: cursor }, signal, priority, { getPriority: query.getPriority })
     const rows = this.parsed(instrument, timeframe, values).filter(row => row.timestamp < cursor)
     return { records: rows, cursor: rows.length ? Math.min(...rows.map(row => row.timestamp)) : null }
   }
@@ -189,7 +195,7 @@ export class MarketHistory {
     // OKX excludes both boundaries. Ask each source about the actual page;
     // a shared local retention cutoff cannot establish its availability.
     const values = await this.get(path, { instId: instrument, period: timeframe, limit: 100,
-      begin: pageFrom - interval, end: through + interval, ...(source === 'taker' ? { unit: 1 } : {}) }, signal, priority)
+      begin: pageFrom - interval, end: through + interval, ...(source === 'taker' ? { unit: 1 } : {}) }, signal, priority, { getPriority: query.getPriority })
     if (!Array.isArray(values)) throw new TypeError('OKX statistics must contain an array.')
     const byTimestamp = new Map()
     for (const value of values) {
@@ -250,13 +256,17 @@ export class MarketHistory {
     this.assertOpen()
     signal?.throwIfAborted()
     const task = await this.sync.enqueue({ instrument: instId, timeframe, source, from, through, priority })
+    const failFast = priority === 'interactive' || priority === 'prefetch'
     const abort = () => { void this.sync.cancel(task.id).catch(() => undefined) }
     signal?.addEventListener('abort', abort, { once: true })
     try {
       if (signal?.aborted) { abort(); signal.throwIfAborted() }
-      const result = await abortable(this.sync.waitFor(task.id), signal)
+      const result = await abortable(this.sync.waitFor(task.id, { failFast }), signal)
       if (!['completed', 'unavailable'].includes(result.status)) throw new Error(result.lastError || `History ${source} task was ${result.status}.`)
       return result
+    } catch (error) {
+      if (failFast) await this.sync.cancel(task.id).catch(() => undefined)
+      throw error
     } finally { signal?.removeEventListener('abort', abort) }
   }
 
@@ -266,10 +276,16 @@ export class MarketHistory {
     return { rows: await abortable(this.store.candles({ instrument: instId, timeframe, from, through }, priority), signal), floor: this.bounds(instId, timeframe).floor }
   }
 
-  async ensureStatistics(instId, timeframe, from, through, priority = 'foreground', signal) {
+  async ensureStatistics(instId, timeframe, from, through, priority = 'foreground', signal, source) {
     await abortable(this.ready, signal)
-    await Promise.all(['oi', 'taker'].map(source => this.request(instId, timeframe, source, from, through, priority, signal)))
+    if (source !== undefined && !['oi', 'taker'].includes(source)) throw new TypeError('Unknown statistics source.')
+    await Promise.all((source ? [source] : ['oi', 'taker']).map(selected => this.request(instId, timeframe, selected, from, through, priority, signal)))
     return { rows: await abortable(this.store.candles({ instrument: instId, timeframe, from, through }, priority), signal) }
+  }
+
+  async promoteSource(instId, timeframe, source, from, through, priority) {
+    await this.ready
+    return this.sync.promote({ instrument: instId, timeframe, source, from, through }, priority)
   }
 
   latest(instId, timeframe, priority = 'foreground') {

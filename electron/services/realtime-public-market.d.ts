@@ -1,4 +1,4 @@
-import type { RealtimeMarketState, WebSocketFactory } from './realtime-market.js'
+import type { MarketTrafficProbeEvent, RealtimeMarketState, WebSocketFactory } from './realtime-market.js'
 
 export const OKX_PUBLIC_WEBSOCKET_URL: 'wss://ws.okx.com/ws/v5/public'
 export const PUBLIC_MARKET_CONTRACTS_PER_CONNECTION: 25
@@ -6,8 +6,22 @@ export type PublicMarketChannel = 'tickers' | 'open-interest' | 'books' | 'trade
 export type PublicMarketRawRecord = Record<string, string | number>
 export type PublicInstrumentRecord = Record<string, unknown>
 export type PublicMarketSubscription = { instId: string; channel: PublicMarketChannel } | { channel: 'instruments'; instType: 'SWAP' }
-export type PublicMarketBook = { bids: string[][]; asks: string[][]; ts: string; seqId: number }
-export type PublicMarketEventContext = { signal: AbortSignal; receivedAt: number; /** Subscription proof captured before callback queuing. */ acknowledged?: boolean }
+export type PublicMarketChannelDemand = {
+  /** Defaults to true. Disable or list instruments when depth/slippage is not needed. */
+  books?: boolean | Iterable<string>
+  /** Defaults to true. Disable or list instruments when trade flow is not needed. */
+  trades?: boolean | Iterable<string>
+}
+export type PublicMarketBook = { bids: (readonly string[])[]; asks: (readonly string[])[]; ts: string; seqId: number }
+export type PublicMarketEventContext = {
+  /** Socket lifetime, or the individual subscription lifetime for books/tickers. */
+  signal: AbortSignal
+  receivedAt: number
+  /** Subscription proof captured before callback queuing. */
+  acknowledged?: boolean
+  /** Present only while the bounded loopback traffic probe is armed. */
+  marketTrafficEvents?: readonly MarketTrafficProbeEvent[]
+}
 export type RealtimePublicMarketTelemetry = {
   receivedEvents: number
   tickerEvents: number
@@ -29,17 +43,19 @@ export type RealtimePublicMarketOptions = {
   onInstrumentsDisconnect?: (context: PublicMarketEventContext) => void | Promise<void>
   onTicker: (instId: string, raw: PublicMarketRawRecord, context: PublicMarketEventContext) => void | Promise<void>
   onOpenInterest: (instId: string, raw: PublicMarketRawRecord, context: PublicMarketEventContext) => void | Promise<void>
-  /** Full 400-level book, reconstructed from native snapshots and updates. */
+  /** Full 400-level snapshot with immutable levels shared across unchanged prices. */
   onBook: (instId: string, book: PublicMarketBook, context: PublicMarketEventContext) => void | Promise<void>
   onTrades: (instId: string, raw: PublicMarketRawRecord[], context: PublicMarketEventContext) => void | Promise<void>
   onSubscribed?: (instId: string, channel: PublicMarketChannel, context: PublicMarketEventContext) => void | Promise<void>
-  /** Synchronous notification when the desired subscription generation is removed. */
+  /** Synchronous invalidation on channel removal or book recovery, including same-socket demand changes. */
   onUnsubscribed?: (instId: string, channel: PublicMarketChannel, context: PublicMarketEventContext) => void | Promise<void>
   /** Called only for the contracts on the retired socket; its signal is aborted. */
   onDisconnect?: (instIds: string[], context: { signal: AbortSignal }) => void | Promise<void>
   /** New-connection events wait until this recovery callback completes. */
   onReconnect?: (instIds: string[], context: { signal: AbortSignal }) => void | Promise<void>
   onState?: (state: RealtimeMarketState) => void | Promise<void>
+  /** Test-only observer; absent during normal operation and called for each native market data event. */
+  onMarketTrafficIngress?: (events: readonly MarketTrafficProbeEvent[], probeCostMonotonicUS: number) => void
   webSocketFactory?: WebSocketFactory
   url?: string
   logger?: Pick<Console, 'error'>
@@ -47,7 +63,9 @@ export type RealtimePublicMarketOptions = {
   setTimeout?: (callback: () => void, delay: number) => unknown
   clearTimeout?: (handle: unknown) => void
   random?: () => number
+  /** Initial transport reconnect and single-book recovery delay (default 1s). */
   reconnectBaseMs?: number
+  /** Maximum retry delay and healthy-book backoff reset interval (default 30s). */
   reconnectMaxMs?: number
   reconnectJitter?: number
   heartbeatIntervalMs?: number
@@ -60,10 +78,12 @@ export class RealtimePublicMarket {
   constructor(options: RealtimePublicMarketOptions)
   readonly instruments: Set<string>
   readonly subscriptions: Map<string, PublicMarketSubscription>
-  /** Subscribes every instrument to tickers, open-interest, books, and trades. */
-  setSubscriptions(instIds: string[]): void
+  /** Tickers and open interest cover every instrument; books and trades follow independent demand. */
+  setSubscriptions(instIds: string[], demand?: PublicMarketChannelDemand): void
   start(): void
   getState(): RealtimeMarketState
+  /** Replace only this native subscription; respects shared control limits. */
+  recoverSubscription(instId: string, channel: PublicMarketChannel): boolean
   getTelemetry(): RealtimePublicMarketTelemetry
   whenIdle(): Promise<void>
   /** Irreversible idempotent shutdown; drains accepted callbacks and decoding. */

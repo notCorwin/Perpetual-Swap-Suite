@@ -2,9 +2,6 @@ import { openRecordedDatabase } from './recorded-database.js'
 import { DEFAULT_PREFERENCES, validatePreferenceFields, validatePreferences } from './preferences.js'
 export { DEFAULT_PREFERENCES, validatePreferences } from './preferences.js'
 
-const TIMEFRAMES = new Set(['5m', '15m', '1H'])
-const INTERVALS = { '5m': 300_000, '15m': 900_000, '1H': 3_600_000 }
-const SYNC_STATUSES = new Set(['queued', 'running', 'retry', 'paused', 'cancelled', 'completed', 'unavailable', 'failed'])
 const AUDIT_STATUSES = new Set(['queued', 'running', 'paused', 'completed', 'cancelled', 'failed'])
 
 function object(value, label) {
@@ -14,10 +11,6 @@ function object(value, label) {
 function keys(value, allowed, label) {
   object(value, label)
   if (Object.keys(value).some(key => !allowed.includes(key))) throw new TypeError(`${label} contains an unknown field.`)
-}
-
-function positive(value, label) {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) throw new TypeError(`${label} must be a positive finite number.`)
 }
 
 function integer(value, label) {
@@ -61,40 +54,31 @@ function validateAnalysis(value) {
   return jsonCopy(value)
 }
 
-function validateRanges(value, timeframe, enforceGrid) {
+function validateRanges(value) {
   if (!value || typeof value !== 'object') return
-  const frame = value.timeframe ?? timeframe
-  if (enforceGrid && Object.hasOwn(value, 'timeframe') && !TIMEFRAMES.has(frame)) throw new TypeError('Metadata timeframe must be 5m, 15m, or 1H.')
   if (Object.hasOwn(value, 'from') || Object.hasOwn(value, 'through')) {
     // A corrupt file can have an unknown range. Keep that explicit, never zero.
     if (value.from !== null || value.through !== null) {
       integer(value.from, 'Range from'); integer(value.through, 'Range through')
       if (value.through < value.from) throw new TypeError('Range through must not precede from.')
-      if (enforceGrid && frame && (value.from % INTERVALS[frame] || value.through % INTERVALS[frame])) throw new TypeError('Metadata ranges must align with the timeframe grid.')
     }
   }
-  for (const child of Object.values(value)) if (child && typeof child === 'object') validateRanges(child, frame, enforceGrid)
+  for (const child of Object.values(value)) if (child && typeof child === 'object') validateRanges(child)
 }
 
-function validateJob(value, type) {
+function validateAudit(value) {
   const copy = jsonCopy(value)
-  object(copy, type === 'sync' ? 'Sync task' : 'Audit')
+  object(copy, 'Audit')
   identifier(copy.id, 'Job id')
   if (Object.hasOwn(copy, 'schemaVersion') && copy.schemaVersion !== 1) throw new TypeError('Unsupported metadata schema version.')
-  if (!(type === 'sync' ? SYNC_STATUSES : AUDIT_STATUSES).has(copy.status)) throw new TypeError('Invalid job status.')
-  if (type === 'sync') {
-    identifier(copy.instrument, 'Sync instrument'); identifier(copy.source, 'Sync source')
-    if (!TIMEFRAMES.has(copy.timeframe)) throw new TypeError('Sync timeframe must be 5m, 15m, or 1H.')
-    integer(copy.from, 'Sync from'); integer(copy.through, 'Sync through')
-    if (Object.hasOwn(copy, 'priority') && !['foreground', 'background'].includes(copy.priority)) throw new TypeError('Invalid sync priority.')
-    if (Object.hasOwn(copy, 'purpose') && !['history', 'warmup', 'requested'].includes(copy.purpose)) throw new TypeError('Invalid sync purpose.')
-  } else if (Object.hasOwn(copy, 'phase') && !['inspect', 'repair', 'verify'].includes(copy.phase)) throw new TypeError('Invalid audit phase.')
+  if (!AUDIT_STATUSES.has(copy.status)) throw new TypeError('Invalid audit status.')
+  if (Object.hasOwn(copy, 'phase') && !['inspect', 'repair', 'verify'].includes(copy.phase)) throw new TypeError('Invalid audit phase.')
   for (const field of ['createdAt', 'updatedAt', 'completedAt', 'nextAttemptAt', 'attempts', 'writtenRecords', 'checkedRows', 'checkedFiles', 'files', 'verificationCheckedRows', 'verificationFiles', 'repairIndex', 'verifyIndex']) {
     if (Object.hasOwn(copy, field) && copy[field] !== null) integer(copy[field], field)
   }
   // Audit issues may describe an invalid grid or timeframe; do not reject the
   // evidence that an audit is required to report.
-  validateRanges(copy, undefined, type === 'sync')
+  validateRanges(copy)
   return copy
 }
 
@@ -133,17 +117,17 @@ export class MetadataStore {
       await chmod(path, 0o600)
       database.exec('PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;')
       const version = database.prepare('PRAGMA user_version').get().user_version
-      if (version !== 0 && version !== 1) throw new Error('Unsupported metadata database schema version.')
-      store.#transaction(() => {
+      if (![0, 1, 2].includes(version)) throw new Error('Unsupported metadata database schema version.')
+      if (version < 2) store.#transaction(() => {
         database.exec(`
           CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL CHECK (revision >= 0), preferences TEXT NOT NULL CHECK (json_valid(preferences)));
           CREATE TABLE IF NOT EXISTS analysis_settings (id INTEGER PRIMARY KEY CHECK (id = 1), value TEXT NOT NULL CHECK (json_valid(value)));
           CREATE TABLE IF NOT EXISTS migrations (id TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (json_valid(value)));
-          CREATE TABLE IF NOT EXISTS sync_tasks (id TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (json_valid(value)));
           CREATE TABLE IF NOT EXISTS audits (id TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (json_valid(value)));
           CREATE TABLE IF NOT EXISTS history_download (id TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (json_valid(value)));
           CREATE TABLE IF NOT EXISTS catalog (id TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (json_valid(value)));
-          PRAGMA user_version = 1;
+          DROP TABLE IF EXISTS sync_tasks;
+          PRAGMA user_version = 2;
         `)
         database.prepare('INSERT OR IGNORE INTO settings (id, revision, preferences) VALUES (1, 0, ?)').run(JSON.stringify(DEFAULT_PREFERENCES))
         database.prepare('INSERT OR IGNORE INTO analysis_settings (id, value) VALUES (1, ?)').run('{}')
@@ -212,6 +196,7 @@ export class MetadataStore {
       const current = this.getSettings()
       if (Object.hasOwn(options, 'expectedRevision') && options.expectedRevision !== current.revision) throw new SettingsRevisionConflictError(options.expectedRevision, current.revision)
       const preferences = validatePreferences(merge(current.preferences, patch))
+      if (JSON.stringify(preferences) === JSON.stringify(current.preferences)) return current
       const revision = current.revision + 1
       integer(revision, 'Settings revision')
       this.#database.prepare('UPDATE settings SET revision = ?, preferences = ? WHERE id = 1').run(revision, JSON.stringify(preferences))
@@ -256,23 +241,9 @@ export class MetadataStore {
     return this.#database.prepare(`DELETE FROM ${table} WHERE id = ?`).run(id).changes > 0
   }
 
-  putSyncTask(task) { const value = validateJob(task, 'sync'); return this.#put('sync_tasks', value.id, value) }
-  putSyncTasks(tasks) {
-    if (!Array.isArray(tasks)) throw new TypeError('Sync tasks must be an array.')
-    const values = tasks.map(task => validateJob(task, 'sync'))
-    return this.#transaction(() => values.map(value => this.#put('sync_tasks', value.id, value)))
-  }
-  getSyncTask(id) { const value = this.#get('sync_tasks', id); return value && validateJob(value, 'sync') }
-  listSyncTasks() { return this.#list('sync_tasks').map(value => validateJob(value, 'sync')) }
-  deleteSyncTask(id) { return this.#delete('sync_tasks', id) }
-  deleteSyncTasks(ids) {
-    if (!Array.isArray(ids)) throw new TypeError('Sync task IDs must be an array.')
-    ids.forEach(id => identifier(id, 'Sync task ID'))
-    return this.#transaction(() => ids.reduce((deleted, id) => deleted + Number(this.#delete('sync_tasks', id)), 0))
-  }
-  saveAudit(audit) { const value = validateJob(audit, 'audit'); return this.#put('audits', value.id, value) }
-  getAudit(id) { const value = this.#get('audits', id); return value && validateJob(value, 'audit') }
-  listAudits() { return this.#list('audits').map(value => validateJob(value, 'audit')) }
+  saveAudit(audit) { const value = validateAudit(audit); return this.#put('audits', value.id, value) }
+  getAudit(id) { const value = this.#get('audits', id); return value && validateAudit(value) }
+  listAudits() { return this.#list('audits').map(validateAudit) }
   getHistoryDownload() { return this.#get('history_download', 'latest') }
   saveHistoryDownload(report) { return this.#put('history_download', 'latest', structuredClone(report)) }
   putCatalogEntry(entry) { const value = validateCatalog(entry); return this.#put('catalog', value.instrumentID, value) }

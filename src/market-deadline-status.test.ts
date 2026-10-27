@@ -27,9 +27,8 @@ test('a market push arriving before the closing deadline callback reports queued
   }, false)
   try {
     await service.ready
-    service.projectListEntry = async () => null
+    service.preparedCharts.setUniverse = () => ({ frames: [] })
     service.updateRanking = async () => undefined
-    service.scheduleListProjection = () => undefined
     const asOf = Math.floor(now / step) * step
     await store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ instrument: instId, timeframe: '5m',
       timestamp: asOf - (288 - index) * step, open: 99, high: 101, low: 98, close: 100,
@@ -41,7 +40,8 @@ test('a market push arriving before the closing deadline callback reports queued
     now = asOf + step
     assert.equal(service.marketDeadlineAt, now)
     const queued = await service.snapshot()
-    assert.deepEqual(queued.rows, [])
+    assert.deepEqual(queued.rows.map(row => row.instId), [instId], 'The exit buffer preserves the list without renewing qualification.')
+    assert.equal(service.validCatalogEntry(service.catalog.get(instId)), false)
     assert.equal(queued.catalogProgress.unknown, 1)
     assert.equal(queued.catalogProgress.pending, 1)
     assert.equal(queued.loading, true)

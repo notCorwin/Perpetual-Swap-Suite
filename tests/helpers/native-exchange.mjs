@@ -2,8 +2,10 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
 import { once } from 'node:events'
+import { ownFixtureServer } from './fixture-server.mjs'
 
 export const nativeIntervals = { '5m': 300_000, '15m': 900_000, '1H': 3_600_000 }
+const baseCandleCount = 3_600
 const frame = (value, opcode = 1) => {
   const body = Buffer.isBuffer(value) ? value : Buffer.from(value)
   const header = Buffer.alloc(body.length < 126 ? 2 : body.length < 65536 ? 4 : 10)
@@ -25,42 +27,63 @@ const rawCandle = row => [row.timestamp, row.open, row.high, row.low, row.close,
 
 /** Only the exchange is synthetic: clients use native HTTP/WebSocket transport,
  * protocol acknowledgments, production parsing and the ordinary market pipeline. */
-export async function createNativeExchange() {
-  const asOf = Date.now(), identities = ['BTC-USDT-SWAP', 'ETH-USDT-SWAP']
+export async function createNativeExchange({ asOf = Date.now(), now = () => Date.now() } = {}) {
+  assert.equal(typeof now, 'function', 'The native fixture clock must be a function.')
+  const identities = ['BTC-USDT-SWAP', 'ETH-USDT-SWAP']
   const basePrice = instId => instId.startsWith('BTC') ? 100 : 500
   const instruments = identities.map(instId => ({ instId, instType: 'SWAP', instCategory: '1', ctType: 'linear', settleCcy: 'USDT', state: 'live',
     ctVal: '1', ctMult: '1', ctValCcy: instId.split('-')[0], ruleType: 'normal', listTime: String(asOf - 500 * nativeIntervals['1H']) }))
-  const rows = identities.flatMap(instrument => Object.entries(nativeIntervals).flatMap(([timeframe, step]) => {
-    const end = Math.floor(asOf / step) * step - step, close = basePrice(instrument)
-    return Array.from({ length: 400 }, (_, index) => ({ instrument, timeframe, timestamp: end - (399 - index) * step,
+  const rows = identities.flatMap(instrument => {
+    const step = nativeIntervals['5m'], end = Math.floor(asOf / step) * step - step, close = basePrice(instrument)
+    const baseRows = Array.from({ length: baseCandleCount }, (_, index) => ({ instrument, timeframe: '5m', timestamp: end - (baseCandleCount - 1 - index) * step,
       open: close, high: close + 1, low: close - 1, close, volume: 100, baseVolume: 100, quoteVolume: close * 100, confirmed: true }))
-  }))
-  // Missing one closed price forces a real latest-price request. Hold that
-  // response until newer native forming events have already reached the SVG.
-  const deferredKey = 'BTC-USDT-SWAP:15m', deferredEnd = Math.floor(asOf / nativeIntervals['15m']) * nativeIntervals['15m'] - nativeIntervals['15m']
-  const closedCandles = rows.filter(row => `${row.instrument}:${row.timeframe}` !== deferredKey || row.timestamp !== deferredEnd)
+    const coarseRows = Object.entries(nativeIntervals).filter(([timeframe]) => timeframe !== '5m').flatMap(([timeframe, interval]) => {
+      const grouped = new Map()
+      for (const row of baseRows) {
+        const timestamp = Math.floor(row.timestamp / interval) * interval, children = grouped.get(timestamp) ?? []
+        children.push(row); grouped.set(timestamp, children)
+      }
+      return [...grouped].filter(([, children]) => children.length === interval / step).map(([timestamp, children]) => ({
+        instrument, timeframe, timestamp, open: children[0].open, high: Math.max(...children.map(row => row.high)),
+        low: Math.min(...children.map(row => row.low)), close: children.at(-1).close,
+        volume: children.reduce((total, row) => total + row.volume, 0),
+        baseVolume: children.reduce((total, row) => total + row.baseVolume, 0),
+        quoteVolume: children.reduce((total, row) => total + row.quoteVolume, 0), confirmed: true,
+      }))
+    })
+    return [...baseRows, ...coarseRows]
+  })
+  // This parent is absent from SQLite because one required canonical 5m child
+  // is absent too. The renderer must retain its native 5m live price while the
+  // coarse source falls back to a held REST repair. Keep the gap outside the
+  // list's current 15m ranking window, which legitimately needs 5m history.
+  const deferredKey = 'BTC-USDT-SWAP:15m', deferredEnd = Math.floor(asOf / nativeIntervals['15m']) * nativeIntervals['15m'] - nativeIntervals['1H']
+  const missingBaseEnd = deferredEnd + nativeIntervals['5m']
+  const seededBase = rows.filter(row => row.timeframe === '5m')
+  const closedCandles = seededBase.filter(row => row.instrument !== 'BTC-USDT-SWAP' || row.timestamp !== missingBaseEnd)
+  const seededBaseFrom = seededBase[0].timestamp, seededBaseThrough = Math.max(...seededBase.map(row => row.timestamp))
   const clients = new Set(), requests = [], errors = [], held = [], latestQuotes = new Map(identities.map(id => [id, basePrice(id)])), lastCandles = new Map()
-  let holdLatest = true, holdBusinessAcknowledgments = false
+  let holdHistory = true, holdBusinessAcknowledgments = false
   const heldAcknowledgments = []
   const ticker = instId => {
     const price = latestQuotes.get(instId) ?? basePrice(instId)
     return { instId, last: String(price), bidPx: String(price - .01), askPx: String(price + .01), open24h: String(basePrice(instId)),
-      high24h: String(price + 10), low24h: String(Math.max(.01, price - 10)), volCcy24h: '500000', ts: String(Date.now()) }
+      high24h: String(price + 10), low24h: String(Math.max(.01, price - 10)), volCcy24h: '500000', ts: String(now()) }
   }
   const sendJSON = (response, data) => {
     if (!response.destroyed) response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ code: '0', data }))
   }
   const server = createServer((request, response) => {
     const url = new URL(request.url, 'http://127.0.0.1'), path = url.pathname.replace(/^\/api\/v5/, '')
-    const parameters = Object.fromEntries(url.searchParams), record = { path, parameters, receivedAt: Date.now(), respondedAt: null, held: false }
+    const parameters = Object.fromEntries(url.searchParams), record = { path, parameters, receivedAt: now(), respondedAt: null, held: false }
     requests.push(record)
-    response.once('finish', () => { record.respondedAt = Date.now() })
+    response.once('finish', () => { record.respondedAt = now() })
     const instId = parameters.instId ?? identities[0]
     if (path === '/public/instruments') return sendJSON(response, instruments)
     if (path === '/market/tickers') return sendJSON(response, identities.map(ticker))
     if (path === '/market/ticker') return sendJSON(response, [ticker(instId)])
-    if (path === '/public/open-interest') return sendJSON(response, [{ instId, oi: '100000', oiUsd: '10000000', ts: String(Date.now()) }])
-    if (path === '/market/books') return sendJSON(response, [{ bids: [[String(basePrice(instId) - .01), '100000']], asks: [[String(basePrice(instId) + .01), '100000']], ts: String(Date.now()) }])
+    if (path === '/public/open-interest') return sendJSON(response, [{ instId, oi: '100000', oiUsd: '10000000', ts: String(now()) }])
+    if (path === '/market/books') return sendJSON(response, [{ bids: [[String(basePrice(instId) - .01), '100000']], asks: [[String(basePrice(instId) + .01), '100000']], ts: String(now()) }])
     if (path.startsWith('/rubik/stat/')) return sendJSON(response, [])
     if (path === '/market/history-candles' || path === '/market/candles') {
       const timeframe = parameters.bar, step = nativeIntervals[timeframe]
@@ -68,26 +91,27 @@ export async function createNativeExchange() {
       const values = rows.filter(row => row.instrument === instId && row.timeframe === timeframe
         && (!parameters.after || row.timestamp < Number(parameters.after)) && (!parameters.before || row.timestamp > Number(parameters.before)))
         .toSorted((left, right) => right.timestamp - left.timestamp).slice(0, Math.min(300, Number(parameters.limit) || 100)).map(rawCandle)
-      if (path === '/market/candles' && `${instId}:${timeframe}` === deferredKey && holdLatest) {
+      const missingCoarseParent = `${instId}:${timeframe}` === deferredKey && values.some(value => Number(value[0]) === deferredEnd)
+      if (path === '/market/history-candles' && holdHistory && missingCoarseParent) {
         record.held = true
-        const close = 111.25, timestamp = Math.floor(asOf / step) * step
-        held.push({ response, record, data: [rawCandle({ timestamp, open: 100, high: 112, low: 99, close, volume: 10, baseVolume: 10, quoteVolume: 1112.5, confirmed: false }), ...values] })
+        held.push({ response, record, data: values })
         return
       }
-      const current = lastCandles.get(`${instId}:${timeframe}:${Math.floor(Date.now() / step) * step}`)
+      const current = lastCandles.get(`${instId}:${timeframe}:${Math.floor(now() / step) * step}`)
       return sendJSON(response, path === '/market/candles' && current && !current.confirmed
         ? [rawCandle(current), ...values].slice(0, Math.min(300, Number(parameters.limit) || 100)) : values)
     }
     errors.push(`Unexpected native exchange HTTP endpoint: ${request.url}`)
     response.writeHead(500, { 'Content-Type': 'application/json' }).end(JSON.stringify({ code: 'fixture-error', msg: 'Unsupported loopback exchange endpoint', data: [] }))
   })
+  const ownedServer = ownFixtureServer(server)
   const send = (client, value) => { if (!client.socket.destroyed) client.socket.write(frame(typeof value === 'string' ? value : JSON.stringify(value))) }
   const snapshot = (client, arg) => {
     const { instId, channel } = arg
     if (channel === 'tickers') send(client, { arg, data: [ticker(instId)] })
-    else if (channel === 'open-interest') send(client, { arg, data: [{ instId, oi: '100000', oiUsd: '10000000', ts: String(Date.now()) }] })
+    else if (channel === 'open-interest') send(client, { arg, data: [{ instId, oi: '100000', oiUsd: '10000000', ts: String(now()) }] })
     else if (channel === 'books') send(client, { arg, action: 'snapshot', data: [{ bids: [[String(basePrice(instId) - .01), '100000', '0', '1']],
-      asks: [[String(basePrice(instId) + .01), '100000', '0', '1']], seqId: 1, prevSeqId: -1, ts: String(Date.now()) }] })
+      asks: [[String(basePrice(instId) + .01), '100000', '0', '1']], seqId: 1, prevSeqId: -1, ts: String(now()) }] })
   }
   const receiveText = (client, text) => {
     if (text === 'ping') { send(client, 'pong'); return }
@@ -124,6 +148,7 @@ export async function createNativeExchange() {
     }
   }
   server.on('upgrade', (request, socket, head) => {
+    if (ownedServer.closing) { socket.destroy(); return }
     if (!['/ws/v5/public', '/ws/v5/business'].includes(request.url) || typeof request.headers['sec-websocket-key'] !== 'string') { socket.destroy(); return }
     const accept = createHash('sha1').update(request.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
     socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
@@ -138,10 +163,73 @@ export async function createNativeExchange() {
   server.listen(0, '127.0.0.1'); await once(server, 'listening')
   const origin = `http://127.0.0.1:${server.address().port}`
   const subscribed = (instId, channel) => [...clients].filter(client => client.subscriptions.has(`${channel}:${instId}`))
-  return { asOf, instruments, closedCandles, requests, errors, deferredEnd,
+  const publishCandle = row => {
+    const instId = row.instrument, timeframe = row.timeframe, channel = `candle${timeframe}`, recipients = subscribed(instId, channel)
+    assert.ok(recipients.length, `No native ${channel}/${instId} subscriber`)
+    const sentAt = now()
+    for (const client of recipients) send(client, { arg: { channel, instId }, data: [rawCandle(row)] })
+    return { instId, timeframe, timestamp: row.timestamp, open: row.open, high: row.high, low: row.low, close: row.close,
+      volume: row.volume, baseVolume: row.baseVolume, quoteVolume: row.quoteVolume, confirmed: row.confirmed, sentAt }
+  }
+  const sourceKey = row => `${row.instrument}:${row.timeframe}:${row.timestamp}`
+  const upsertSource = row => {
+    const index = rows.findIndex(value => sourceKey(value) === sourceKey(row))
+    if (index < 0) rows.push(row)
+    else rows[index] = row
+  }
+  const updateCoarseSource = row => {
+    for (const [timeframe, interval] of Object.entries(nativeIntervals).filter(([period]) => period !== '5m')) {
+      const timestamp = Math.floor(row.timestamp / interval) * interval
+      const children = rows.filter(value => value.instrument === row.instrument && value.timeframe === '5m'
+        && value.timestamp >= timestamp && value.timestamp < timestamp + interval).toSorted((left, right) => left.timestamp - right.timestamp)
+      if (children.length !== interval / nativeIntervals['5m'] || !children.every((value, index) => value.confirmed
+        && value.timestamp === timestamp + index * nativeIntervals['5m'])) continue
+      upsertSource({ instrument: row.instrument, timeframe, timestamp, open: children[0].open,
+        high: Math.max(...children.map(value => value.high)), low: Math.min(...children.map(value => value.low)), close: children.at(-1).close,
+        volume: children.reduce((total, value) => total + value.volume, 0),
+        baseVolume: children.reduce((total, value) => total + value.baseVolume, 0),
+        quoteVolume: children.reduce((total, value) => total + value.quoteVolume, 0), confirmed: true })
+    }
+  }
+  const step = nativeIntervals['5m']
+  let sourceClosedThrough = seededBaseThrough
+  const closeElapsedCandles = () => {
+    const currentTime = now(), currentTimestamp = Math.floor(currentTime / step) * step, lastElapsed = currentTimestamp - step, closed = []
+    for (let timestamp = sourceClosedThrough + step; timestamp <= lastElapsed; timestamp += step) {
+      for (const instrument of identities) {
+        const key = `${instrument}:5m:${timestamp}`, forming = lastCandles.get(key)
+        let row
+        if (forming) row = { ...forming, confirmed: true }
+        else {
+          const previous = rows.find(value => value.instrument === instrument && value.timeframe === '5m' && value.timestamp === timestamp - step)
+          assert.ok(previous?.confirmed, `No confirmed native 5m baseline precedes ${instrument} at ${timestamp}`)
+          const close = previous.close
+          row = { instrument, timeframe: '5m', timestamp, open: close, high: close + 1, low: close - 1, close,
+            volume: 100, baseVolume: 100, quoteVolume: close * 100, confirmed: true }
+        }
+        lastCandles.set(key, row)
+        upsertSource(row)
+        updateCoarseSource(row)
+        closed.push(publishCandle(row))
+      }
+      sourceClosedThrough = timestamp
+    }
+    return { currentTime, currentTimestamp, closed }
+  }
+  return { asOf, instruments, closedCandles, requests, errors, deferredEnd, missingBaseEnd, seededBaseFrom, seededBaseThrough, baseCandleCount,
     environment: { PERPETUAL_SWAP_E2E_HTTP_ORIGIN: origin, PERPETUAL_SWAP_E2E_WEBSOCKET_ORIGIN: origin.replace('http:', 'ws:') },
     waitForSubscription: (instId, channel) => waitFor(() => subscribed(instId, channel).length > 0, `${channel}/${instId} native subscription`),
-    waitForHeldLatest: () => waitFor(() => held.some(value => !value.response.destroyed), 'deferred native BTC 15m latest-price request'),
+    waitForHeldHistory: async () => {
+      try {
+        await waitFor(() => held.some(value => !value.response.destroyed && value.record.parameters.instId === 'BTC-USDT-SWAP'
+          && value.record.parameters.bar === '15m'), 'deferred native BTC 15m fallback for a parent that cannot be derived locally')
+      } catch (error) {
+        const candleRequests = requests.filter(value => value.path === '/market/history-candles')
+        throw new Error(`${error.message}; native candle requests=${JSON.stringify(candleRequests)}`, { cause: error })
+      }
+    },
+    businessSubscriptions: () => [...new Set([...clients].filter(client => client.path === '/ws/v5/business')
+      .flatMap(client => [...client.subscriptions.keys()]))].sort(),
     async disconnectBusiness({ holdAcknowledgments = false } = {}) {
       holdBusinessAcknowledgments = holdAcknowledgments
       const previous = [...clients].filter(client => client.path === '/ws/v5/business')
@@ -152,7 +240,7 @@ export async function createNativeExchange() {
       return previous.length
     },
     waitForBusinessReconnect: () => waitFor(() => new Set(heldAcknowledgments.filter(value => clients.has(value.client)).map(value => subscriptionKey(value.arg))).size
-      === identities.length * Object.keys(nativeIntervals).length, 'real native business resubscription commands'),
+      === identities.length, 'real native business resubscription commands for every candidate'),
     resumeBusinessAcknowledgments() {
       holdBusinessAcknowledgments = false
       for (const { client, id, arg } of heldAcknowledgments.splice(0)) {
@@ -161,35 +249,35 @@ export async function createNativeExchange() {
         send(client, { id, event: 'subscribe', arg })
       }
     },
-    async releaseLatest() {
-      holdLatest = false
+    async releaseHistory() {
+      holdHistory = false
       for (const value of held) sendJSON(value.response, value.data)
-      await waitFor(() => held.every(value => value.response.destroyed || value.record.respondedAt !== null), 'deferred latest-price HTTP response completion')
+      await waitFor(() => held.every(value => value.response.destroyed || value.record.respondedAt !== null), 'deferred missing-candle HTTP response completion')
       return held.filter(value => value.record.respondedAt !== null).length
     },
-    sendCandle(instId, timeframe, { close, volume, timestamp = Math.floor(Date.now() / nativeIntervals[timeframe]) * nativeIntervals[timeframe], confirmed = false }) {
-      const channel = `candle${timeframe}`, recipients = subscribed(instId, channel)
-      assert.ok(recipients.length, `No native ${channel}/${instId} subscriber`)
+    closeElapsedCandles,
+    sendCandle(instId, timeframe, { close, volume, timestamp = Math.floor(now() / nativeIntervals[timeframe]) * nativeIntervals[timeframe], confirmed = false }) {
+      assert.equal(timeframe, '5m', 'The native fixture sends canonical 5m candles only.')
       const key = `${instId}:${timeframe}:${timestamp}`, previous = lastCandles.get(key), cumulative = volume ?? (previous?.volume ?? 0) + 1
-      const quoteVolume = Math.max(previous?.quoteVolume ?? 0, cumulative * close), open = basePrice(instId)
-      const row = { timestamp, open, high: Math.max(open, close) + 1, low: Math.min(open, close) - 1, close,
+      const quoteVolume = Math.max(previous?.quoteVolume ?? 0, cumulative * close), open = previous?.open ?? basePrice(instId)
+      const row = { instrument: instId, timeframe, timestamp, open,
+        high: Math.max(previous?.high ?? -Infinity, Math.max(open, close) + 1),
+        low: Math.min(previous?.low ?? Infinity, Math.min(open, close) - 1), close,
         volume: cumulative, baseVolume: cumulative, quoteVolume, confirmed }
       lastCandles.set(key, row)
-      const sentAt = Date.now()
-      for (const client of recipients) send(client, { arg: { channel, instId }, data: [rawCandle(row)] })
-      return { instId, timeframe, hour: timestamp, close, sentAt }
+      if (confirmed) { upsertSource(row); updateCoarseSource(row) }
+      return publishCandle(row)
     },
     sendTicker(instId, close) {
       latestQuotes.set(instId, close)
-      const sentAt = Date.now()
+      const sentAt = now()
       for (const client of subscribed(instId, 'tickers')) send(client, { arg: { channel: 'tickers', instId }, data: [ticker(instId)] })
       return { instId, close, sentAt }
     },
     async close() {
-      holdLatest = false
+      holdHistory = false
       for (const value of held) value.response.destroy()
-      for (const client of clients) client.socket.destroy()
-      await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+      await ownedServer.close()
     },
   }
 }

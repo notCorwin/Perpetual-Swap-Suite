@@ -11,13 +11,6 @@ const step = 300_000
 const instrument = { instId: 'BTC-USDT-SWAP', instType: 'SWAP', ctType: 'linear', instCategory: '1', settleCcy: 'USDT',
   state: 'live', ruleType: 'normal', ctVal: '0.01', ctMult: '1', ctValCcy: 'BTC' }
 const tick = () => new Promise(resolve => setImmediate(resolve))
-const waitFor = async (condition: () => boolean) => {
-  const deadline = performance.now() + 2_000
-  while (!condition()) {
-    assert.ok(performance.now() < deadline, 'A source change must publish without a snapshot poll.')
-    await tick()
-  }
-}
 const fixture = async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-observation-events-'))
   const store = await MarketStore.open(root), preferences = structuredClone(DEFAULT_PREFERENCES)
@@ -27,7 +20,7 @@ const fixture = async () => {
   // These tests observe qualification events, not independent chart-history preparation.
   service.preparedCharts.setRealtimeSubscriptions = () => undefined
   await service.ready
-  service.projectListEntry = async () => null
+  service.preparedCharts.setUniverse = () => ({ frames: [] })
   service.updateRanking = async () => undefined
   const admit = (expiresAt = Date.now() + 90_000) => {
     service.instruments.set(instrument.instId, instrument)
@@ -40,57 +33,53 @@ const fixture = async () => {
     close: async () => { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) } }
 }
 
-test('snapshot and list reads for an uncached timeframe are observational and never admit maintenance', async () => {
+test('canonical snapshot and prepared frame reads never admit source or calculation work', async () => {
   const f = await fixture(), service = f.service
   try {
     f.admit()
     const asOf = Math.floor(Date.now() / step) * step
     service.rankings.set(instrument.instId, { lookback: f.preferences.rankingLookback, rankingChange: 2, rankingAsOf: asOf })
     service.rankingWindows.set(instrument.instId, { marker: 'unchanged' })
-    const revision = service.revision, frames = [...service.listRows.keys()], ranking = structuredClone([...service.rankings]), windows = structuredClone([...service.rankingWindows])
-    for (const method of ['refresh', 'ensureListRows', 'projectListEntry', 'updateRanking', 'cachedRanking', 'pruneCatalog']) {
+    const revision = service.revision, ranking = structuredClone([...service.rankings]), windows = structuredClone([...service.rankingWindows])
+    for (const method of ['refresh', 'updateSubscriptions', 'updateRanking', 'cachedRanking', 'pruneCatalog']) {
       service[method] = () => { throw new Error(`An observational read called ${method}.`) }
     }
+    service.preparedCharts.setUniverse = () => { throw new Error('A read changed the preparation universe.') }
+    service.preparedCharts.residentFrames = () => ({ frames: [] })
+    service.history.ensurePrices = service.history.ensureStatistics = () => { throw new Error('A read admitted historical work.') }
+    service.store.candles = () => { throw new Error('A read scanned SQLite history.') }
     service.lastRefreshAt = 0
-    const first = await service.snapshot('5m')
+    const first = await service.snapshot()
     assert.equal(first.rows.length, 1)
     assert.equal(first.rows[0].rankingChange, 2)
     assert.equal(first.rows[0].rankingAsOf, asOf)
-    assert.deepEqual(service.listRowsFor('5m'), first.rows)
-    const next = await service.snapshot('5m', { sinceRevision: first.revision, serviceSession: first.serviceSession })
+    assert.deepEqual(service.listRowsFor(), first.rows)
+    const next = await service.snapshot({ sinceRevision: first.revision, serviceSession: first.serviceSession })
     assert.equal('unchanged' in next, true)
     assert.equal(service.revision, revision)
-    assert.deepEqual([...service.listRows.keys()], frames)
     assert.deepEqual([...service.rankings], ranking)
     assert.deepEqual([...service.rankingWindows], windows)
+    assert.deepEqual(await service.getPreparedCharts(), { frames: [] })
     assert.equal(f.requests(), 0)
   } finally { await f.close() }
 })
 
-test('progress-only retry, recovery and pause changes publish while list values stay equal', async () => {
+test('chart history retry and recovery do not publish or alter the canonical list', async () => {
   const f = await fixture(), service = f.service
-  let events = 0, progress = { retrying: 0, unavailable: 0 }
+  let events = 0
   try {
     f.admit()
     await new Promise(resolve => setTimeout(resolve, 25))
-    service.history.sync.progressFor = () => progress
-    const rows = service.listRowsFor('15m'), unsubscribe = service.subscribeMarket(() => { events++ })
+    service.history.sync.progressFor = () => { throw new Error('Canonical list reads cannot inspect timeframe progress.') }
+    const before = await service.snapshot(), unsubscribe = service.subscribeMarket(() => { events++ })
     for (const status of ['retry', 'running', 'paused', 'completed']) {
-      progress = { retrying: Number(status === 'retry'), unavailable: Number(status === 'paused') }
-      const before = events
       service.onHistoryProgress({ instrument: instrument.instId, timeframe: '15m', status })
-      await waitFor(() => events > before)
-      const snapshot = await service.snapshot('15m')
-      assert.deepEqual(snapshot.rows, rows)
-      assert.equal(snapshot.listProgress.retrying, progress.retrying)
-      assert.equal(snapshot.listProgress.unavailable, progress.unavailable)
+      assert.deepEqual(await service.snapshot(), before)
     }
-    unsubscribe()
-    const before = events
-    service.onHistoryProgress({ instrument: instrument.instId, timeframe: '15m', status: 'retry' })
     await new Promise(resolve => setTimeout(resolve, 25))
-    assert.equal(events, before)
+    assert.equal(events, 0)
     assert.equal(f.requests(), 0)
+    unsubscribe()
   } finally { await f.close() }
 })
 

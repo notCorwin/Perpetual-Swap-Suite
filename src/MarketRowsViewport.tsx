@@ -33,7 +33,7 @@ export const MarketRowsViewport = memo(function MarketRowsViewport({ ids, childr
       const target = event.target as HTMLElement
       const row = target.closest<HTMLTableRowElement>("tr[data-market-index]")
       if (row && element.contains(row)) setPinned(ids[Number(row.dataset.marketIndex)])
-      else if (!target.closest("[data-slot=popover-content], [data-slot=select-content], [role=dialog]")) setPinned(null)
+      else if (!target.closest("[data-slot=select-content], [role=dialog]")) setPinned(null)
     }
     const observer = new ResizeObserver(schedule)
     observer.observe(element)
@@ -62,9 +62,8 @@ export const MarketRowsViewport = memo(function MarketRowsViewport({ ids, childr
   const ordered = [...indices].sort((a, b) => a - b)
   const spacer = (count: number, key: string) => count > 0 && <TableRow key={key} aria-hidden="true" className="border-0" data-virtual-spacer><TableCell colSpan={3} className="p-0" style={{ height: count * range.size }} /></TableRow>
   return <TableBody ref={body} onKeyDownCapture={event => {
-    if (!(event.target instanceof HTMLTableRowElement) || !["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return
-    const current = Number(event.target.dataset.marketIndex)
-    const target = event.key === "Home" ? 0 : event.key === "End" ? ids.length - 1 : Math.max(0, Math.min(ids.length - 1, current + (event.key === "ArrowDown" ? 1 : -1)))
+    if (!(event.target instanceof HTMLTableRowElement) || !["Home", "End"].includes(event.key)) return
+    const target = event.key === "Home" ? 0 : ids.length - 1
     event.preventDefault()
     const existing = body.current?.querySelector<HTMLTableRowElement>(`tr[data-market-index="${target}"]`)
     if (existing) existing.focus()

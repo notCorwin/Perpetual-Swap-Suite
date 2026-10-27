@@ -13,23 +13,56 @@ export type CandleRecord = {
   oi?: number | null
   buy?: number | null
   sell?: number | null
+  statisticsOIObservedAt?: number | null
+  statisticsTakerObservedAt?: number | null
+  statisticsOIAbsenceAttempts?: number
+  statisticsTakerAbsenceAttempts?: number
   confirmed: boolean
   [key: string]: unknown
 }
 export type StorePriority = 'interactive' | 'foreground' | 'prepared' | 'repair' | 'continuity' | 'statistics' | 'prefetch' | 'chartWarm' | 'background'
 export type CandleQuery = { instrument: string; timeframe: string; from?: number; through?: number; limit?: number; order?: 'asc' | 'desc' }
+export type AggregateCandleQuery = {
+  instrument: string
+  timeframe: '15m' | '1H'
+  /** Inclusive, floor-aligned parent candle timestamps. */
+  from: number
+  through: number
+  /** Changed-child repair mode: replace complete parents and remove incomplete derived prices. */
+  invalidateIncomplete?: boolean
+}
+/** `changed` counts price rows written or removed; `complete` counts valid 5m buckets found. */
+export type AggregateCandleResult = { changed: number; complete: number; invalidated: number }
 export type StatisticsRecord = {
   instrument: string; timeframe: string; timestamp: number; oi: number | null; buy: number | null; sell: number | null
   statisticsVersion: number; statisticsOIExpiresAt: number | null; statisticsTakerExpiresAt: number | null
+  statisticsOIObservedAt: number | null; statisticsTakerObservedAt: number | null
+  statisticsOIAbsenceAttempts: number; statisticsTakerAbsenceAttempts: number
 }
-export type StatisticsPage = CandleQuery & CandleRange & { source: 'oi' | 'taker'; values: Array<Array<number | null>>; expiresAt?: number | null; preserveExistingSource?: boolean }
+type StatisticsPageFields = CandleQuery & CandleRange & {
+  values: Array<Array<number | null>>
+  /** Successful source observation time; defaults to Date.now(). */
+  observedAt?: number
+  /** Explicit absence lease override; omitted leases follow the per-slot policy. Numeric facts remain reusable. */
+  expiresAt?: number | null
+  /** Keep valid numeric facts; unavailable or stale derived observations may be replaced. */
+  preserveExistingSource?: boolean
+}
+export type StatisticsPage = StatisticsPageFields & (
+  { source: 'oi'; priceVolume?: never }
+  | {
+    source: 'taker'
+    /** Single point only; binds local Taker data to the exact persisted candle volume. */
+    priceVolume?: number
+  }
+)
 export type IndicatorCheckpoint = { timestamp: number; state: any; formulaVersion: string; sourceRevision: string | number; bollExpansion?: unknown }
 export type CandleRange = { from: number; through: number }
 export type CandleAuditIssue = CandleRange & {
   instrument: string
   timeframe: string
   source: 'candles'
-  reason: 'gap' | 'invalid-grid' | 'invalid-partition' | 'invalid-schema' | 'unconfirmed' | 'invalid-ohlc' | 'negative-volume' | 'missing-base-volume' | 'invalid-metadata' | 'duplicate' | 'corrupt-file'
+  reason: 'gap' | 'invalid-grid' | 'invalid-partition' | 'invalid-schema' | 'unconfirmed' | 'invalid-ohlc' | 'negative-volume' | 'missing-base-volume' | 'missing-quote-volume' | 'invalid-metadata' | 'duplicate' | 'corrupt-file'
   repairable: boolean
   file?: string
   detail?: string
@@ -46,24 +79,24 @@ export class MarketStore {
   appendCandles(candles: CandleRecord[], priority?: StorePriority): Promise<number>
   appendStatistics(page: StatisticsPage, priority?: StorePriority): Promise<number>
   statistics(query: CandleQuery & { source?: 'oi' | 'taker' }, priority?: StorePriority): Promise<StatisticsRecord[]>
-  readStatistics(query: CandleQuery & { source?: 'oi' | 'taker' }, priority?: StorePriority): Promise<StatisticsRecord[]>
   statisticsMissingRanges(query: CandleQuery & CandleRange & { source: 'oi' | 'taker' }, priority?: StorePriority): Promise<CandleRange[]>
   /** Replace the inclusive grid range, including malformed records within each covered bar. */
   replaceCandles(query: CandleQuery & CandleRange, candles: CandleRecord[], priority?: StorePriority): Promise<number>
+  /** Fill missing prices from complete 5m buckets; preserve native parent prices and independent statistics. */
+  aggregateCandles(query: AggregateCandleQuery, priority?: StorePriority): Promise<AggregateCandleResult>
   inspectCandles(query: CandleQuery & CandleRange, priority?: StorePriority): Promise<CandleInspection>
   getWriteMetrics(): { partitions: number; rowsSubmitted: number; bytesRead: number; bytesWritten: number; durationMS: number }
   getDiagnostics(): { workerThreadIds: { writer: number; readers: number[] }; reads: Record<string, number>; writes: Record<string, number>; migrationComplete: boolean; migrationProcessId: number | null }
   candleRevision(instrument: string, timeframe: string): number
+  candlePriceRevision(instrument: string, timeframe: string): number
   candleChangesSince(instrument: string, timeframe: string, revision: number): { revision: number; ranges: CandleRange[] | null }
   candles(query: CandleQuery, priority?: StorePriority): Promise<CandleRecord[]>
   candleWatermark(instrument: string, timeframe: string, priority?: StorePriority): Promise<string>
   priceWatermark(instrument: string, timeframe: string, priority?: StorePriority): Promise<string>
   readIndicatorCheckpoint(query: CandleQuery & { before: number; formulaVersion: string }, priority?: StorePriority): Promise<IndicatorCheckpoint | null>
   writeIndicatorCheckpoint(query: CandleQuery & IndicatorCheckpoint, priority?: StorePriority): Promise<boolean>
-  invalidateIndicatorCheckpoints(query: CandleQuery & { from: number }, priority?: StorePriority): Promise<void>
   integrityCheck(): Promise<string[]>
   migrationStatus(): Promise<{ complete: boolean; completedPartitions: number; failedPartitions: number; importedRows: number; issues: Array<{ path: string; instrument: string; timeframe: string; from: number; through: number; reason: string; detail: string }>; error: string }>
-  candleTimestamps(query: { instrument: string; timeframe: string; from?: number; through?: number }, priority?: StorePriority): Promise<number[]>
   coverage(instrument: string, timeframe: string, priority?: StorePriority): Promise<{ count: number; first: number | null; last: number | null }>
   missingCandleRanges(query: { instrument: string; timeframe?: string; from: number; through: number; intervalMS?: number }, priority?: StorePriority): Promise<Array<{ from: number; through: number }>>
   close(): Promise<void>

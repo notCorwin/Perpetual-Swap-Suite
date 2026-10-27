@@ -23,19 +23,23 @@ before(async () => {
       slippage: { enabled: true, maxPercent: .1, notionalUSDT: 100_000 }, volume24h: { enabled: true, minUSDT: 30_000_000 },
       openInterest: { enabled: true, minUSDT: 5_000_000 }, volumeStability: { enabled: false, maxRatio: 2 },
     } }
-    const rows = [['NULL', null], ['ZETA', 3], ['BETA', -3], ['ALPHA', 1]].map(([symbol, rankingChange]) => ({
+    const rows = [['BETA', -3], ['ZETA', 3], ['ALPHA', 1], ['NULL', null]].map(([symbol, rankingChange]) => ({
       instId: `${symbol}-USDT-SWAP`, price: 100, lastPrice: 100, rankingChange, rankingAsOf: 1_800_000_000_000,
       turnover24hUSDT: 50_000_000,
     }))
-    const state = globalThis.__workspaceFixture = { preferences, analysisSettings: { model: 'fixture/vision', hasAPIKey: false }, rows, initialRows: rows, requests: [], revision: 1, loading: false, error: '', catalogSource: 'live', catalogProgress: undefined, failNextSave: false, failSnapshots: 0, staleNextSnapshot: false, staleReplies: 0, chartGeneration: 1, bollMode: 'standard', holdNextSnapshot: false, releaseSnapshot: null, snapshotActive: 0, snapshotMaximum: 0,
+    const state = globalThis.__workspaceFixture = { preferences, analysisSettings: { model: 'fixture/vision', hasAPIKey: false }, rows, initialRows: rows, requests: [], coldTimeframes: [], revision: 1, loading: false, error: '', catalogSource: 'live', catalogProgress: undefined, failNextSave: false, failSnapshots: 0, staleNextSnapshot: false, staleReplies: 0, chartGeneration: 1, bollMode: 'standard', holdNextSnapshot: false, releaseSnapshot: null, snapshotActive: 0, snapshotMaximum: 0,
       holdAuditAction: null, releaseAudit: null, heldAuditReply: null,
       holdDownloadAction: null, releaseDownload: null, heldDownloadReply: null,
-      historyDownload: { phase: 'idle', startedAt: null, updatedAt: null, finishedAt: null,
+      historyDownload: { schemaVersion: 2, phase: 'idle', startedAt: null, updatedAt: null, finishedAt: null,
         contracts: { completed: 0, total: 0 }, streams: { completed: 0, total: 0 },
-        progress: { completed: 0, total: 0, available: 0, unavailable: 0, reused: 0, pending: 0 },
+        progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 },
         active: [], failures: [], error: '', revision: 0, serviceSession: 'download-fixture' },
       audit: { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '', revision: 0, serviceSession: 'audit-fixture' } }
-    state.notify = () => BrowserWindow.getAllWindows()[0].webContents.send('radar:market-changed')
+    state.notify = () => {
+      state.rows = [...state.rows].sort((left, right) => (right.rankingChange == null ? -1 : Math.abs(right.rankingChange))
+        - (left.rankingChange == null ? -1 : Math.abs(left.rankingChange)) || left.instId.localeCompare(right.instId, 'en'))
+      BrowserWindow.getAllWindows()[0].webContents.send('radar:market-changed')
+    }
     state.publishAudit = values => {
       state.audit = { ...state.audit, ...structuredClone(values), revision: state.audit.revision + 1 }
       const report = structuredClone(state.audit)
@@ -49,6 +53,7 @@ before(async () => {
       return report
     }
     const prepared = ({ instId, timeframe }) => {
+      if (state.chartOverride?.instId === instId && state.chartOverride.timeframe === timeframe) return structuredClone(state.chartOverride)
       const intervalMS = timeframe === '1H' ? 3_600_000 : timeframe === '15m' ? 900_000 : 300_000
       const endHour = Math.floor(Date.UTC(2026, 9, 18) / intervalMS) * intervalMS
       const bars = Array.from({ length: 96 }, (_, index) => {
@@ -78,8 +83,8 @@ before(async () => {
         const stale = state.staleNextSnapshot
         state.staleNextSnapshot = false
         if (stale) state.staleReplies += 1
-        const snapshot = { rows: stale ? [] : state.rows, revision: state.revision - (stale ? 1 : 0), serviceSession: 'renderer-fixture',
-          timeframe: value.snapshot.timeframe, realtimeState: 'Connected', updatedAt: 1_800_000_000_000,
+        const snapshot = { rows: stale ? [] : state.rows, turnoverOrder: [...state.rows].sort((a, b) => (b.turnover24hUSDT ?? -1) - (a.turnover24hUSDT ?? -1) || a.instId.localeCompare(b.instId, 'en')).map(row => row.instId), revision: state.revision - (stale ? 1 : 0), serviceSession: 'renderer-fixture',
+          realtimeState: 'Connected', updatedAt: 1_800_000_000_000,
           catalogSource: state.catalogSource, catalogProgress: state.catalogProgress, error: state.error, loading: state.loading }
         state.snapshotActive += 1
         state.snapshotMaximum = Math.max(state.snapshotMaximum, state.snapshotActive)
@@ -92,9 +97,16 @@ before(async () => {
           return snapshot
         } finally { state.snapshotActive -= 1 }
       }
-      if (value.chartUniverse) return { frames: value.chartUniverse.instIds.map(instId => prepared({ instId, timeframe: value.chartUniverse.timeframe })) }
-      if (value.chartLocal) return prepared(value.chartLocal)
-      if (value.chartWindow) return prepared(value.chartWindow)
+      if (value.chartUniverse) return { frames: state.rows.flatMap(({ instId }) => ['5m', '15m', '1H']
+        .filter(timeframe => !state.coldTimeframes.includes(timeframe)).map(timeframe => prepared({ instId, timeframe }))) }
+      if (value.chartFocus) return { ok: true }
+      if (value.chartLocal || value.chartHistory) {
+        const query = value.chartLocal ?? value.chartHistory
+        return state.coldTimeframes.includes(query.timeframe) ? null : prepared(query)
+      }
+      if (value.chartWindow) return state.coldTimeframes.includes(value.chartWindow.timeframe)
+        ? { ...prepared(value.chartWindow), bars: [], priceState: 'loading', indicatorState: 'loading', oiState: 'loading', takerState: 'loading' }
+        : prepared(value.chartWindow)
       if (value.captureChart) return { ok: true }
       if (value.analysisSettings) {
         if (value.analysisSettings.action === 'save') state.analysisSettings = {
@@ -107,7 +119,7 @@ before(async () => {
         const action = value.historyDownload.action
         if (action === 'start') state.publishDownload({ id: 'download-1', phase: 'running', startedAt: 1_800_000_000_000, updatedAt: 1_800_000_001_000, finishedAt: null,
           contracts: { completed: 0, total: 2 }, streams: { completed: 1, total: 18 },
-          progress: { completed: 100, total: 1_000, available: 90, unavailable: 10, reused: 80, pending: 900 }, failures: [], error: '',
+          progress: { checked: 100, total: 1_000, available: 90, empty: 0, unavailable: 10, failed: 0, reused: 80, pending: 900 }, failures: [], error: '',
           active: [{ instrument: 'BETA-USDT-SWAP', timeframe: '15m', source: 'oi', from: 1_799_990_100_000, through: 1_799_991_000_000,
             status: 'retrying', attempts: 2, nextAttemptAt: 1_800_000_005_000, error: 'Temporary source limit.' }] })
         if (action === 'cancel') state.publishDownload({ phase: 'cancelled', active: [], finishedAt: 1_800_000_010_000 })
@@ -136,6 +148,8 @@ before(async () => {
     })
   })
   await page.setViewportSize({ width: Number(process.env.PERPETUAL_SWAP_UI_INITIAL_WIDTH ?? 800), height: Number(process.env.PERPETUAL_SWAP_UI_INITIAL_HEIGHT ?? 572) })
+  // Install before mounting so renderer timers and performance.now() share one clock.
+  await page.clock.install()
   await page.reload({ waitUntil: 'domcontentloaded' })
   await page.locator('[data-market-index]').first().waitFor({ state: 'visible' })
   await page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]').waitFor({ state: 'visible' })
@@ -172,6 +186,7 @@ after(async () => {
 })
 
 const selected = () => page.locator('[data-market-index][aria-selected="true"]')
+const waitForMarketStatus = status => page.waitForFunction(status => document.querySelector('[data-market-list] [data-slot="badge"]')?.textContent.trim() === status, status)
 const settingsPage = () => page.getByRole('main', { name: 'Settings', exact: true })
 const chooseSettingsCategory = async category => {
   const settings = settingsPage()
@@ -231,12 +246,179 @@ test('default selection uses absolute completed-candle change with nulls last an
   await assertWorkspaceLayout(page)
 })
 
+test('market arrow shortcuts survive contract clicks, toolbar focus and repeated chart switches', async () => {
+  const expectMarket = async (key, symbol) => {
+    await page.keyboard.press(key)
+    await page.locator(`svg[data-rendered-inst="${symbol}-USDT-SWAP"]`).waitFor({ state: 'visible', timeout: 2_000 })
+    assert.equal(await selected().getAttribute('aria-label'), `View ${symbol}-USDT-SWAP chart`)
+    assert.equal(await page.locator('[data-chart-plot]').evaluate(plot => document.activeElement === plot), true,
+      'Chart navigation must retain focus on the current chart surface.')
+  }
+  try {
+    await page.getByRole('row', { name: 'View ZETA-USDT-SWAP chart', exact: true }).click()
+    await expectMarket('ArrowDown', 'ALPHA')
+    await expectMarket('ArrowUp', 'ZETA')
+    await page.getByRole('button', { name: '15m', exact: true }).click()
+    await expectMarket('ArrowRight', 'ALPHA')
+    assert.equal(await page.locator('[aria-label="Chart timeframe"] [aria-pressed="true"]').textContent(), '15m')
+    await page.getByRole('button', { name: 'Analyze Short', exact: true }).focus()
+    await expectMarket('ArrowLeft', 'BETA')
+    await expectMarket('ArrowUp', 'NULL')
+    await expectMarket('ArrowDown', 'BETA')
+    await page.getByRole('button', { name: 'Copy chart', exact: true }).click()
+    await expectMarket('ArrowDown', 'ZETA')
+    await page.evaluate(() => { window.dispatchEvent(new Event('blur')); window.dispatchEvent(new Event('focus')) })
+    await expectMarket('ArrowDown', 'ALPHA')
+  } finally {
+    await page.getByRole('row', { name: 'View BETA-USDT-SWAP chart', exact: true }).click()
+  }
+  assert.equal(await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()), false,
+    'DOM focus regressions must be exercised without acquiring macOS window focus.')
+})
+
+test('clicking the chart releases search focus while editing and settings keep their arrow keys', async () => {
+  const search = page.getByRole('textbox', { name: 'Search contracts' })
+  try {
+    await page.getByRole('row', { name: 'View BETA-USDT-SWAP chart', exact: true }).click()
+    await search.fill('BETA')
+    await page.keyboard.press('ArrowLeft')
+    assert.equal(await search.evaluate(input => input.selectionStart), 3)
+    assert.equal(await selected().getAttribute('aria-label'), 'View BETA-USDT-SWAP chart')
+    await search.fill('')
+    await page.locator('svg[data-rendered-inst]').click({ position: { x: 50, y: 50 } })
+    assert.equal(await page.locator('[data-chart-plot]').evaluate(plot => document.activeElement === plot), true,
+      'A chart click must explicitly transfer DOM focus after preventing pointer defaults for inspection.')
+    await page.keyboard.press('ArrowDown')
+    await page.locator('svg[data-rendered-inst="ZETA-USDT-SWAP"]').waitFor({ state: 'visible', timeout: 2_000 })
+    for (const key of ['Shift+ArrowDown', 'Control+ArrowDown', 'Meta+ArrowDown', 'Alt+ArrowDown']) await page.keyboard.press(key)
+    assert.equal(await selected().getAttribute('aria-label'), 'View ZETA-USDT-SWAP chart')
+    await page.locator('[data-chart-plot]').dispatchEvent('keydown', { key: 'ArrowDown', isComposing: true })
+    assert.equal(await selected().getAttribute('aria-label'), 'View ZETA-USDT-SWAP chart')
+    const settings = await openSettings()
+    const lookback = settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)', exact: true })
+    await lookback.focus()
+    await page.keyboard.press('ArrowUp')
+    assert.equal(await lookback.inputValue(), '16')
+    assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'ZETA-USDT-SWAP')
+    await settings.getByRole('button', { name: 'Discard changes', exact: true }).click()
+    await backToMarkets()
+    await page.keyboard.press('ArrowDown')
+    await page.locator('svg[data-rendered-inst="ALPHA-USDT-SWAP"]').waitFor({ state: 'visible', timeout: 2_000 })
+  } finally {
+    if (await settingsPage().isVisible()) {
+      const discard = settingsPage().getByRole('button', { name: 'Discard changes', exact: true })
+      if (await discard.isEnabled()) await discard.click()
+      await backToMarkets()
+    }
+    await search.fill('')
+    await page.getByRole('row', { name: 'View BETA-USDT-SWAP chart', exact: true }).click()
+  }
+})
+
+test('cold and warm chart periods preserve list nodes, order, count, and selection without reloading market rows', async () => {
+  try {
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.coldTimeframes = ['1H']
+      state.preferences.chartTimeframe = '15m'
+    })
+    // A new document discards previously received 1H frames, so this switch is
+    // genuinely cold even when earlier tests have visited every native period.
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await page.locator('[aria-label="View ZETA-USDT-SWAP chart"]').click()
+    await page.locator('svg[data-rendered-inst="ZETA-USDT-SWAP"][data-rendered-timeframe="15m"]').waitFor({ state: 'visible' })
+    const snapshotCount = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length)
+    await page.evaluate(() => {
+      const rows = [...document.querySelectorAll('[data-market-index]')]
+      const probe = window.__timeframeListProbe = { rows, order: rows.map(row => row.getAttribute('aria-label')), violations: [] }
+      const inspect = () => {
+        const current = [...document.querySelectorAll('[data-market-index]')]
+        if (current.length !== rows.length || current.some((row, index) => row !== rows[index]
+          || row.getAttribute('aria-label') !== probe.order[index])
+          || document.querySelector('[data-total-market-count]')?.dataset.totalMarketCount !== '4'
+          || document.querySelector('[data-market-index][aria-selected="true"]')?.getAttribute('aria-label') !== 'View ZETA-USDT-SWAP chart') {
+          if (probe.violations.length < 10) probe.violations.push(current.map(row => row.getAttribute('aria-label')))
+        }
+      }
+      const observer = new MutationObserver(inspect)
+      observer.observe(document.getElementById('root'), { subtree: true, childList: true, attributes: true })
+      probe.stop = () => { inspect(); observer.disconnect(); return probe.violations }
+    })
+    await selectTimeframe(page, '1H')
+    await waitForAuditFixture(() => globalThis.__workspaceFixture.preferences.chartTimeframe === '1H')
+    await waitForAuditFixture(() => globalThis.__workspaceFixture.requests.some(value => value.chartFocus?.target?.timeframe === '1H'))
+    assert.equal(await page.locator('svg[data-prepared-chart-timeframe="1H"]').count(), 0, 'The current surface must remain on 15m until the 1H frame is selected.')
+    assert.equal(await selected().getAttribute('aria-label'), 'View ZETA-USDT-SWAP chart')
+
+    // Backend preparation completes through pushes, independently of any new
+    // list snapshot or renderer-supplied universe membership.
+    await electron.evaluate(async ({ ipcMain, BrowserWindow }) => {
+      const state = globalThis.__workspaceFixture
+      state.coldTimeframes = []; state.chartGeneration += 1
+      for (const { instId } of state.rows) {
+        const frame = await ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId, timeframe: '1H' } })
+        BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
+      }
+    })
+    await page.locator('svg[data-rendered-inst="ZETA-USDT-SWAP"][data-rendered-timeframe="1H"]').waitFor({ state: 'visible' })
+    for (const timeframe of ['5m', '15m', '1H']) {
+      await selectTimeframe(page, timeframe)
+      await waitForAuditFixture((_electron, timeframe) => globalThis.__workspaceFixture.preferences.chartTimeframe === timeframe, timeframe)
+      await page.locator(`svg[data-rendered-inst="ZETA-USDT-SWAP"][data-rendered-timeframe="${timeframe}"]`).waitFor({ state: 'visible' })
+    }
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    assert.deepEqual(await page.evaluate(() => window.__timeframeListProbe.stop()), [], 'Chart readiness and timeframe saves must never replace, remove, or reorder market rows.')
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), snapshotCount, 'Saving only chartTimeframe must not request another market snapshot.')
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartUniverse).every(value => Object.keys(value.chartUniverse).length === 0)), true, 'Universe reads must never carry membership, timeframe, or focus writes.')
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).every(value => !('timeframe' in value.snapshot))), true)
+  } finally {
+    await page.evaluate(() => { window.__timeframeListProbe?.stop(); delete window.__timeframeListProbe })
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.coldTimeframes = []; state.preferences.chartTimeframe = '15m'
+    })
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"][data-rendered-timeframe="15m"]').waitFor({ state: 'visible' })
+  }
+})
+
+test('the existing chart toolbar provides window dragging while its controls remain interactive', async () => {
+  const toolbar = page.locator('[data-chart-toolbar]')
+  await assertWorkspaceLayout(page)
+  assert.equal(await toolbar.evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'drag')
+  for (const name of ['5m', '15m', '1h', 'Copy chart', 'Analyze Long', 'Analyze Short']) {
+    assert.equal(await toolbar.getByRole('button', { name, exact: true }).evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
+  }
+  assert.equal(await toolbar.getByRole('heading').count(), 0, 'The toolbar must retain the original chart actions and status without an application title.')
+  const sidebar = page.getByRole('complementary', { name: 'Contract list' })
+  assert.equal(await sidebar.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).isVisible(), true)
+  await selectTimeframe(page, '5m')
+  await page.locator('svg[data-rendered-timeframe="5m"]').waitFor()
+  await toolbar.getByRole('button', { name: '15m', exact: true }).focus()
+  await page.keyboard.press('Enter')
+  await page.locator('svg[data-rendered-timeframe="15m"]').waitFor()
+  await toolbar.getByRole('button', { name: 'Copy chart', exact: true }).click()
+  await page.getByRole('status').filter({ hasText: 'Chart copied to clipboard' }).waitFor()
+  const settingsLink = sidebar.getByRole('link', { name: 'Settings', exact: true })
+  assert.equal(await settingsLink.evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
+  await settingsLink.click()
+  const settings = settingsPage()
+  await settings.waitFor({ state: 'visible' })
+  assert.equal(await settings.locator('header').evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'drag')
+  if (process.platform === 'darwin') {
+    const heading = await settings.getByRole('heading', { name: 'Settings', exact: true }).boundingBox()
+    assert.ok(heading.x >= 72, 'Settings must reserve native traffic light space as well.')
+  }
+  assert.equal(await settings.getByRole('link', { name: 'Back to markets', exact: true }).evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
+  await backToMarkets()
+})
+
 test('a prepared idle chart makes no periodic window requests and accepts a pushed forming candle', async () => {
   const chart = page.locator('[data-chart-inst="BETA-USDT-SWAP"]')
   await page.waitForFunction(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.dataset.chartLoading === 'false')
-  const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow).length)
+  const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length)
   await new Promise(resolve => setTimeout(resolve, 2_250))
-  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow).length), before, 'A successfully prepared chart must stay idle until an event or actual retry deadline.')
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), before, 'A successfully prepared chart must not poll local or provider windows.')
   await electron.evaluate(async ({ ipcMain, BrowserWindow }) => {
     const state = globalThis.__workspaceFixture
     state.chartGeneration += 1
@@ -248,11 +430,11 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   })
   await page.waitForFunction(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 133)
   assert.equal(Number(await chart.getAttribute('data-chart-rendered-bars')), 96)
-  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow).length), before, 'A pushed forming candle must update the prepared chart without a window request.')
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), before + 1, 'Only the fixture read may be added; the pushed candle must not trigger another renderer read.')
   const liveUpdate = await page.evaluate(() => {
     const snapshot = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot
     globalThis.__completedSubscriptionBars = snapshot.bars
-    return { type: 'live', instId: snapshot.instId, timeframe: snapshot.timeframe, generation: 2, revision: 2,
+    return { type: 'live', instId: snapshot.instId, timeframe: snapshot.timeframe, generation: snapshot.generation, revision: snapshot.generation + 1,
       endHour: snapshot.endHour, liveBar: { ...snapshot.liveBar, high: 136, close: 135 } }
   })
   const reads = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length)
@@ -260,7 +442,7 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   await electron.evaluate(({ BrowserWindow }, update) => BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', update), liveUpdate)
   await page.waitForFunction(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 135)
   assert.match(await chart.locator('[aria-live="off"]').textContent(), /Close\s+135/)
-  assert.match(await chart.locator('[data-chart-price-label-value]').textContent(), /^135 /)
+  assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^135 /)
   assert.equal(await page.evaluate(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot.bars === globalThis.__completedSubscriptionBars), true)
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Live-only subscriptions must reuse the completed frame without a follow-up read.')
 })
@@ -278,7 +460,7 @@ test('chart source updates stay outside the plot without resizing its viewport a
         frame.latestEnd = frame.endHour
         frame.bars = [...frame.bars.slice(1), { ...frame.bars.at(-1), hour: frame.endHour,
           oi: null, buy: null, sell: null, statisticsSources: observed ? 3 : 0,
-          statisticsObserved: observed, oiObserved: observed, takerObserved: observed, indicatorsObserved: observed }]
+          statisticsObserved: observed, oiObserved: observed, takerObserved: observed, indicatorsObserved: true }]
       }
       Object.assign(frame, status)
       BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
@@ -304,8 +486,10 @@ test('chart source updates stay outside the plot without resizing its viewport a
       })
       const baseline = await geometry()
       for (const value of ['loading', 'unavailable']) {
-        await publish({ oiState: value, takerState: value, indicatorState: value === 'loading' ? 'loading' : 'ready' })
-        await status.getByText(value === 'loading' ? 'Loading OI history…' : 'OKX 15m OI history is incomplete for this range', { exact: true }).waitFor()
+        // Statistics arrive independently of already calculated price curves.
+        // An uncalculated navigation frame intentionally retains the old plot.
+        await publish({ oiState: value, takerState: value, indicatorState: 'ready' })
+        await status.getByText(value === 'loading' ? 'Loading OI history…' : 'OI is not published for part of this range', { exact: true }).waitFor()
         const current = await geometry()
         assert.equal(current.statusInsidePlot, false)
         assert.equal(current.plotStatuses, 0, 'Source messages must never cover candles or indicators.')
@@ -347,7 +531,7 @@ test('pointer inspection selects the drawn first, middle, and latest candle befo
         await page.mouse.move(target.x, target.y)
         await page.mouse.down()
         await page.waitForFunction(() => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
-        const close = await page.locator('[data-chart-inst] [aria-live="off"] > div:last-child span[title]').getAttribute('title')
+        const close = await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')
         assert.equal(Number(close), target.close, `${forming ? 'The forming' : 'The completed-only'} window must inspect its drawn candle at slot ${slot}.`)
         await page.mouse.up()
         await page.waitForFunction(() => !document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
@@ -359,6 +543,89 @@ test('pointer inspection selects the drawn first, middle, and latest candle befo
   }
 })
 
+test('RSI crossings retain a flat panel and expose the sampled candle and time at scaled widths in both themes', async () => {
+  await selectTimeframe(page, '15m')
+  const originalSize = page.viewportSize()
+  const publish = custom => electron.evaluate(async ({ ipcMain, BrowserWindow }, custom) => {
+    const state = globalThis.__workspaceFixture
+    state.chartGeneration += 1
+    const frame = await ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
+    if (custom) frame.bars = frame.bars.map((bar, index) => ({ ...bar,
+      rsi6: index === 20 ? 29 : index === 21 ? 31 : index === 40 ? 69 : index === 41 ? 71 : 50,
+      rsi12: index === 60 ? 71 : index === 61 ? 69 : 55,
+      rsi24: index === 80 ? 29 : index === 81 ? 31 : 60,
+    }))
+    BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
+    return frame
+  }, custom)
+  const frame = await publish(true)
+  await page.waitForFunction(generation => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.generation === generation, frame.generation)
+  try {
+    for (const colorScheme of ['dark', 'light']) for (const width of [800, 1600]) {
+      await page.emulateMedia({ colorScheme })
+      await page.setViewportSize({ width, height: width === 800 ? 572 : 1000 })
+      const svg = page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]')
+      const markerPoint = async () => {
+        const handle = await page.waitForFunction(({ hour, width }) => {
+          const svg = document.querySelector('svg[data-rendered-inst="BETA-USDT-SWAP"]')
+          const scale = Number(document.querySelector('[data-ui-scale]')?.dataset.uiScale)
+          if (!svg || !scale) return false
+          const rect = svg.getBoundingClientRect(), bounds = svg.viewBox.baseVal
+          if (Math.abs(rect.right - width) >= .5 || Math.abs(rect.width - bounds.width * scale) >= .5 || Math.abs(rect.height - bounds.height * scale) >= .5) return false
+          const marker = svg.querySelector(`[data-chart-rsi-crossing="rsi6"][data-chart-rsi-hour="${hour}"]`)
+          if (!marker) return false
+          const [, x, y] = marker.getAttribute('d').match(/^M([\d.-]+) ([\d.-]+)/)
+          const point = svg.createSVGPoint(), matrix = svg.getScreenCTM()
+          if (!matrix) return false
+          point.x = Number(x); point.y = Number(y)
+          const center = point.matrixTransform(matrix)
+          point.x -= 3; point.y += 4.5
+          const corner = point.matrixTransform(matrix)
+          return { x: center.x, y: center.y, cornerX: corner.x, cornerY: corner.y }
+        }, { hour: frame.bars[21].hour, width })
+        try { return await handle.jsonValue() } finally { await handle.dispose() }
+      }
+      const point = await markerPoint()
+      assert.equal(await svg.locator('[data-chart-rsi-threshold]').count(), 3)
+      assert.equal(await svg.locator('[data-chart-rsi-tick="30"], [data-chart-rsi-tick="70"]').count(), 2)
+      const appearance = await svg.evaluate(svg => ({ font: getComputedStyle(svg).fontFamily,
+        retiredFill: getComputedStyle(document.documentElement).getPropertyValue('--chart-rsi-area').trim(),
+        seriesWidth: getComputedStyle(svg.querySelector('[data-chart-indicator="rsi6"]')).strokeWidth }))
+      assert.match(appearance.font, /monospace/)
+      assert.equal(appearance.retiredFill, '')
+      assert.equal(appearance.seriesWidth, '1px')
+      for (const field of ['rsi6', 'rsi12', 'rsi24']) assert.ok(await svg.locator(`[data-chart-rsi-crossing="${field}"]`).count() > 0)
+      const marker = svg.locator(`[data-chart-rsi-crossing="rsi6"][data-chart-rsi-hour="${frame.bars[21].hour}"]`)
+      assert.equal(await marker.getAttribute('data-chart-rsi-direction'), 'up')
+      assert.equal(await marker.getAttribute('data-chart-rsi-levels'), '30')
+      await page.mouse.move(point.x, point.y)
+      await page.waitForFunction(hour => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes(
+        new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }).format(hour)), frame.bars[21].hour)
+      assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars[21].close)
+      assert.match(await svg.locator('[data-chart-panel-header="rsi"]').textContent(), /31\.0 ↑30/)
+      const corner = await markerPoint()
+      await page.mouse.move(corner.cornerX, corner.cornerY)
+      assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars[21].close, 'Hovering a triangle corner must inspect that triangle\'s candle.')
+      assert.equal(await svg.locator('[data-chart-inspected-time]').count(), 1)
+      const labelBounds = await svg.locator('[data-chart-inspected-time] rect').evaluate(rect => ({ x: Number(rect.getAttribute('x')), end: Number(rect.getAttribute('x')) + Number(rect.getAttribute('width')),
+        right: Number(rect.ownerSVGElement.querySelector('[data-chart-rsi-threshold]').getAttribute('x2')) }))
+      assert.ok(labelBounds.x >= 0 && labelBounds.end <= labelBounds.right)
+      if (process.env.PERPETUAL_SWAP_UI_SCREENSHOTS) await page.screenshot({ path: join(process.env.PERPETUAL_SWAP_UI_SCREENSHOTS, `rsi-${colorScheme}-${width}.png`) })
+      await svg.focus()
+      await page.keyboard.press('Alt+ArrowLeft')
+      assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars[20].close)
+      await page.keyboard.press('Alt+ArrowRight')
+      assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars[21].close)
+      await page.keyboard.press('Escape')
+      assert.equal(await svg.locator('[data-chart-inspected-time]').count(), 0)
+    }
+  } finally {
+    await publish(false)
+    await page.emulateMedia({ colorScheme: null })
+    await page.setViewportSize(originalSize)
+  }
+})
+
 test('a healthy idle market list makes no periodic snapshot requests', async () => {
   await page.waitForFunction(() => document.querySelectorAll('[data-market-index]').length === 4)
   const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length)
@@ -367,53 +634,34 @@ test('a healthy idle market list makes no periodic snapshot requests', async () 
     'Successful market reads must wait for a notification, action, or visibility change.')
 })
 
-test('snapshot failures retry with bounded backoff and stop scheduling after recovery', async () => {
+test('snapshot failures wait for a new notification and resume immediately on recovery', async () => {
   try {
     await page.evaluate(() => {
-      const timeout = window.setTimeout.bind(window), clear = window.clearTimeout.bind(window)
-      const pending = new Map(), delays = []
-      let next = 1_000_000_000
-      // Advance only the snapshot error deadlines. Other UI clocks and native
-      // event delivery keep running normally throughout this Electron test.
+      const timeout = window.setTimeout.bind(window)
+      const delays = []
       window.setTimeout = (handler, delay, ...args) => {
-        if (typeof handler !== 'function' || ![4_000, 8_000, 16_000, 30_000].includes(delay)) return timeout(handler, delay, ...args)
-        const id = ++next
-        delays.push(delay); pending.set(id, () => handler(...args))
-        return id
+        if ([4_000, 8_000, 16_000, 30_000].includes(delay)) delays.push(delay)
+        return timeout(handler, delay, ...args)
       }
-      window.clearTimeout = id => { pending.delete(id); clear(id) }
-      globalThis.__snapshotRetryClock = { delays, pending, runNext() {
-        const [id, run] = pending.entries().next().value ?? []
-        if (!run) throw new Error('No snapshot retry deadline was scheduled.')
-        pending.delete(id); run()
-      }, restore() { window.setTimeout = timeout; window.clearTimeout = clear; pending.clear() } }
+      globalThis.__snapshotRetryClock = { delays, restore() { window.setTimeout = timeout } }
     })
     const before = await electron.evaluate(() => {
       const state = globalThis.__workspaceFixture
       const before = state.requests.filter(value => value.snapshot).length
-      state.failSnapshots = 5
+      state.failSnapshots = 1
       state.rows = state.rows.map(row => row.instId === 'BETA-USDT-SWAP' ? { ...row, lastPrice: 204 } : row)
       state.revision += 1; state.notify()
       return before
     })
-    const delays = [4_000, 8_000, 16_000, 30_000, 30_000]
-    for (let index = 0; index < delays.length; index++) {
-      await page.waitForFunction(index => globalThis.__snapshotRetryClock.delays.length === index + 1 && globalThis.__snapshotRetryClock.pending.size === 1, index)
-      assert.deepEqual(await page.evaluate(() => globalThis.__snapshotRetryClock.delays), delays.slice(0, index + 1))
-      assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before + index + 1,
-        'A failed request must wait for its single retry deadline.')
-      await page.evaluate(() => globalThis.__snapshotRetryClock.runNext())
-    }
+    const error = page.getByRole('alert').filter({ hasText: 'Snapshot temporarily unavailable.' })
+    await error.waitFor({ state: 'visible' })
+    assert.deepEqual(await page.evaluate(() => globalThis.__snapshotRetryClock.delays), [])
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before + 1)
+    await electron.evaluate(() => globalThis.__workspaceFixture.notify())
     await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '204')
-    await page.getByRole('alert').filter({ hasText: 'Snapshot temporarily unavailable.' }).waitFor({ state: 'hidden' })
-    assert.equal(await page.evaluate(() => globalThis.__snapshotRetryClock.pending.size), 0)
-    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before + 6)
-    await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.failSnapshots = 1; state.notify() })
-    await page.waitForFunction(() => globalThis.__snapshotRetryClock.delays.length === 6)
-    assert.equal(await page.evaluate(() => globalThis.__snapshotRetryClock.delays.at(-1)), 4_000, 'Recovery resets the error backoff.')
-    await page.evaluate(() => globalThis.__snapshotRetryClock.runNext())
-    await page.getByRole('alert').filter({ hasText: 'Snapshot temporarily unavailable.' }).waitFor({ state: 'hidden' })
-    assert.equal(await page.evaluate(() => globalThis.__snapshotRetryClock.pending.size), 0)
+    await error.waitFor({ state: 'hidden' })
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before + 2)
+    assert.deepEqual(await page.evaluate(() => globalThis.__snapshotRetryClock.delays), [])
   } finally {
     await page.evaluate(() => { globalThis.__snapshotRetryClock?.restore(); delete globalThis.__snapshotRetryClock })
     await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.failSnapshots = 0; state.rows = state.initialRows; state.revision += 1; state.notify() })
@@ -507,11 +755,12 @@ test('search preserves selection while six width/DPR combinations share page, po
       await page.mouse.move(target.x, target.y)
       await page.mouse.down()
       await page.waitForFunction(() => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
-      const hoveredClose = await page.locator('[data-chart-inst] [aria-live="off"] > div:last-child span[title]').getAttribute('title')
+      const hoveredClose = await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')
       assert.equal(Number(hoveredClose), target.close, 'Screen-space pointer input must inspect the candle drawn beneath it at every UI scale and DPR.')
       await page.mouse.up()
       await page.waitForFunction(() => !document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
       const captureBounds = await page.locator('[data-chart-inst]').boundingBox()
+      assert.equal(await page.locator('[data-chart-inst] h2').textContent(), `${fixture.instId.replace(/-SWAP$/, '')} · ${fixture.timeframe}`, 'Copied and analyzed chart bounds must include the contract and displayed timeframe.')
       await page.getByRole('button', { name: 'Copy chart', exact: true }).click()
       await page.getByRole('status').filter({ hasText: 'Chart copied to clipboard' }).waitFor()
       const request = await electron.evaluate(() => globalThis.__workspaceFixture.requests.findLast(value => value.captureChart).captureChart)
@@ -588,6 +837,7 @@ test('settings is a separate grouped page with keyboard navigation and a retaine
 })
 
 test('preference drafts survive category changes and validation returns to the first invalid group', async () => {
+  const updatesBefore = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.preferences?.action === 'update').length)
   const settings = await openSettings()
   await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).fill('7')
   await chooseSettingsCategory('Liquidity filters')
@@ -605,7 +855,7 @@ test('preference drafts survive category changes and validation returns to the f
   await settings.getByText('Use a multiple of 5 minutes.', { exact: true }).waitFor()
   assert.equal(await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).inputValue(), '7')
   assert.equal(await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).evaluate(element => element === document.activeElement), true)
-  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.preferences?.action === 'update').length), 0)
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.preferences?.action === 'update').length), updatesBefore)
   await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).fill('30')
   await chooseSettingsCategory('Liquidity filters')
   assert.equal(await spread.getAttribute('aria-checked'), 'false')
@@ -692,7 +942,7 @@ test('AI configuration is inline and retains its draft and loaded settings acros
   const model = settings.getByRole('textbox', { name: 'Model', exact: true })
   await page.waitForFunction(() => document.getElementById('analysis-model')?.value === 'fixture/vision')
   assert.equal(await page.getByRole('dialog').count(), 0)
-  const key = settings.getByLabel('Gateway API Key', { exact: true })
+  const key = settings.getByLabel('Vercel AI Gateway API Key', { exact: true })
   assert.equal(await key.getAttribute('type'), 'password')
   await model.fill('')
   await settings.getByRole('button', { name: 'Save analysis settings', exact: true }).click()
@@ -839,7 +1089,7 @@ test('manual history downloads show exact pushed progress and retry details, con
   await active.getByText(/retrying · Consecutive failures: 2 · Next retry:/).waitFor()
   await active.getByText('Temporary source limit.', { exact: true }).waitFor()
   await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({
-    progress: { completed: 999_999, total: 1_000_000, available: 900_000, unavailable: 99_999, reused: 300_000, pending: 1 },
+    progress: { checked: 999_999, total: 1_000_000, available: 900_000, empty: 0, unavailable: 99_999, failed: 0, reused: 300_000, pending: 1 },
   }) })
   await settings.getByRole('status').filter({ hasText: 'Downloading history · 99.9%' }).waitFor()
   await details.getByText('999,999 / 1,000,000', { exact: true }).waitFor()
@@ -848,7 +1098,7 @@ test('manual history downloads show exact pushed progress and retry details, con
   await backToMarkets()
   await settings.waitFor({ state: 'hidden' })
   await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({
-    progress: { completed: 1_000_000, total: 1_000_000, available: 900_001, unavailable: 99_999, reused: 300_000, pending: 0 },
+    progress: { checked: 1_000_000, total: 1_000_000, available: 900_001, empty: 0, unavailable: 99_999, failed: 0, reused: 300_000, pending: 0 },
   }) })
   await openSettings('Market data')
   await settings.getByRole('status').filter({ hasText: 'Downloading history · 100.0%' }).waitFor()
@@ -866,24 +1116,24 @@ test('new download pushes win over held replies and completion distinguishes una
   try {
     await electron.evaluate(() => {
       const state = globalThis.__workspaceFixture
-      state.publishDownload({ phase: 'idle', progress: { completed: 0, total: 0, available: 0, unavailable: 0, reused: 0, pending: 0 }, error: '' })
+      state.publishDownload({ phase: 'idle', progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 }, error: '' })
       state.holdDownloadAction = 'status'
     })
     await openSettings('Market data')
     await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseDownload))
     await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({ phase: 'completed',
-      progress: { completed: 1_000_000, total: 1_000_000, available: 900_001, unavailable: 99_999, reused: 300_000, pending: 0 },
+      progress: { checked: 1_000_000, total: 1_000_000, available: 900_001, empty: 0, unavailable: 99_999, failed: 0, reused: 300_000, pending: 0 },
       contracts: { completed: 2, total: 2 }, streams: { completed: 18, total: 18 }, active: [],
     }) })
-    await settings.getByRole('status').filter({ hasText: 'Completed with unavailable data · 100.0%' }).waitFor()
+    await settings.getByRole('status').filter({ hasText: 'Completed with verified unavailable data · 100.0%' }).waitFor()
     await electron.evaluate(() => { globalThis.__workspaceFixture.releaseDownload() })
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
-    await settings.getByRole('status').filter({ hasText: 'Completed with unavailable data · 100.0%' }).waitFor()
+    await settings.getByRole('status').filter({ hasText: 'Completed with verified unavailable data · 100.0%' }).waitFor()
     await electron.evaluate(() => { globalThis.__workspaceFixture.holdDownloadAction = 'start' })
     await settings.getByRole('button', { name: 'Download all qualified history', exact: true }).click()
     await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseDownload))
     await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({ phase: 'completed',
-      progress: { completed: 1_000, total: 1_000, available: 1_000, unavailable: 0, reused: 80, pending: 0 },
+      progress: { checked: 1_000, total: 1_000, available: 1_000, empty: 0, unavailable: 0, failed: 0, reused: 80, pending: 0 },
       contracts: { completed: 2, total: 2 }, streams: { completed: 18, total: 18 }, active: [],
     }) })
     await settings.getByRole('status').filter({ hasText: 'Download complete · 100.0%' }).waitFor()
@@ -934,6 +1184,7 @@ test('ranking changes keep the chosen chart while long lists retain keyboard and
   assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
   await page.getByRole('textbox', { name: 'Search contracts' }).fill('')
   await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.rows = state.initialRows; state.revision += 1; state.notify() })
+  await page.waitForFunction(() => document.querySelector('[aria-label="View ZETA-USDT-SWAP chart"] td:last-child')?.textContent.includes('+3.00%'))
   await page.waitForFunction(() => document.querySelector('[data-total-market-count]')?.getAttribute('data-total-market-count') === '4')
 })
 
@@ -951,38 +1202,42 @@ test('constant Bollinger bands stay finite and negative lower bands explicitly s
     await page.waitForFunction(() => document.querySelector('[data-chart-inst]').__chartSnapshot?.bars.every(bar => bar.bollUpper === 100 && bar.bollLower === 100))
     assert.equal(await page.locator('[data-chart-price-scale]').getAttribute('data-chart-price-scale'), 'logarithmic')
     await publishMode('negative')
-    await page.locator('[data-chart-price-scale="linear"]').getByText('Linear scale · BOLL includes zero or negative values', { exact: false }).waitFor()
+    await page.locator('[data-chart-price-scale="linear"]').getByText('Linear', { exact: true }).waitFor()
+    assert.equal(await page.locator('[data-chart-price-scale="linear"]').getAttribute('title'), 'Linear scale · BOLL includes zero or negative values')
     const paths = await page.locator('svg[data-rendered-inst] path[d]').evaluateAll(paths => paths.map(path => path.getAttribute('d')))
     assert.doesNotMatch(paths.join(' '), /NaN|Infinity|undefined/)
-    assert.equal(await page.locator('[data-chart-indicator="bollLower"]').evaluate(path => path.getAttribute('d').length > 0), true)
+    assert.equal(await page.locator('svg[data-rendered-inst] [data-chart-indicator="bollLower"]').evaluate(path => path.getAttribute('d').length > 0), true)
   } finally { await publishMode('standard') }
 })
 
-test('a rejected old snapshot preserves notification delivery and qualification changes select the next contract or the empty state', async () => {
-  await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.staleNextSnapshot = true; state.notify() })
-  const deadline = Date.now() + 10_000
-  while (!(await electron.evaluate(() => globalThis.__workspaceFixture.staleReplies))) {
-    assert.ok(Date.now() < deadline, 'The renderer did not read the notified stale snapshot.')
-    await new Promise(resolve => setTimeout(resolve, 25))
+test('a rejected old snapshot preserves notifications and backend exclusions remove rows immediately', async () => {
+  try {
+    await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.staleNextSnapshot = true; state.notify() })
+    await waitForAuditFixture(() => globalThis.__workspaceFixture.staleReplies > 0)
+    assert.equal(await selected().getAttribute('aria-label'), 'View BETA-USDT-SWAP chart', 'An old empty snapshot cannot clear selection.')
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.rows = state.rows.filter(row => row.instId !== 'BETA-USDT-SWAP')
+      state.loading = true; state.revision += 1; state.notify()
+    })
+    await waitForMarketStatus('Refreshing')
+    await page.locator('[data-market-index][aria-selected="true"][aria-label="View ZETA-USDT-SWAP chart"]').waitFor()
+    assert.equal(await page.locator('[data-total-market-count]').getAttribute('data-total-market-count'), '3')
+    assert.equal(await page.locator('[aria-label="View BETA-USDT-SWAP chart"]').count(), 0)
+    await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.rows = []; state.loading = false; state.revision += 1; state.notify() })
+    await page.locator('[data-market-list]').getByText('No qualified contracts', { exact: true }).waitFor()
+    await page.locator('[data-chart-panel]').getByText('No qualified contracts', { exact: true }).waitFor()
+    assert.equal(await page.locator('[data-total-market-count]').getAttribute('data-total-market-count'), '0')
+    assert.equal(await page.locator('[data-chart-inst]').count(), 0)
+    const snapshots = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length)
+    await page.clock.fastForward(31_000)
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), snapshots, 'The renderer must not poll or defer backend membership changes.')
+    await assertWorkspaceLayout(page)
+  } finally {
+    await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.rows = state.initialRows; state.loading = false; state.revision += 1; state.notify() })
+    await page.locator('[data-market-index][aria-label="View BETA-USDT-SWAP chart"]').click()
   }
-  assert.equal(await selected().getAttribute('aria-label'), 'View BETA-USDT-SWAP chart', 'An old empty snapshot cannot clear the current selection.')
-  const requestsAtStaleReply = await electron.evaluate(() => {
-    const state = globalThis.__workspaceFixture
-    state.rows = state.rows.filter(row => row.instId !== 'BETA-USDT-SWAP')
-    state.revision += 1
-    state.notify()
-    return state.requests.filter(value => value.snapshot).length
-  })
-  await page.locator('[data-market-index][aria-selected="true"][aria-label="View ZETA-USDT-SWAP chart"]').waitFor()
-  assert.ok(await electron.evaluate((_electron, count) => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length > count, requestsAtStaleReply), 'Rejecting one stale snapshot must not stop subsequent notifications.')
-  await page.locator('[data-chart-inst="ZETA-USDT-SWAP"]').waitFor()
-  await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.rows = []; state.revision += 1; state.notify() })
-  await page.locator('[data-market-list]').getByText('No qualified contracts', { exact: true }).waitFor()
-  await page.locator('[data-chart-panel]').getByText('No qualified contracts', { exact: true }).waitFor()
-  assert.equal(await page.locator('[data-chart-inst]').count(), 0)
-  await assertWorkspaceLayout(page)
 })
-
 
 test('empty snapshots distinguish startup, verification failures, confirmed exclusions, and recovery', async () => {
   const publish = async values => electron.evaluate((_electron, values) => {
@@ -1045,6 +1300,8 @@ test('completed unknown qualification does not report pending acquisition during
       state.revision += 1
       state.notify()
     })
+    await waitForMarketStatus('Incomplete')
+    assert.equal(await page.locator('[data-total-market-count]').getAttribute('data-total-market-count'), '0', 'The renderer displays the backend membership immediately.')
     await page.locator('[data-market-list]').getByText('Market verification unavailable', { exact: true }).waitFor()
     await page.locator('[data-market-list]').getByText('Incomplete', { exact: true }).waitFor()
     assert.equal(await page.locator('[data-market-list]').getByText(/^Updating \d+ contracts$/).count(), 0, 'Completed but unproven observations are not pending acquisition.')
@@ -1071,9 +1328,8 @@ test('temporary qualification gaps preserve the current chart and interaction un
   const assertRetained = async (title, status) => {
     await page.locator('[data-market-list]').getByText(title, { exact: true }).waitFor()
     await page.getByRole('status').filter({ hasText: status }).waitFor()
-    assert.equal(await page.locator('[data-total-market-count]').getAttribute('data-total-market-count'), '0', 'The qualified list must remain empty while qualification is unknown.')
+    assert.equal(await page.locator('[data-total-market-count]').getAttribute('data-total-market-count'), '0', 'The renderer must use the backend membership immediately.')
     assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
-    assert.deepEqual(await electron.evaluate(() => globalThis.__workspaceFixture.requests.findLast(value => value.chartUniverse)?.chartUniverse.instIds), ['BETA-USDT-SWAP'], 'The retained chart must keep its realtime and prepared-data subscription.')
     assert.equal(await page.evaluate(() => globalThis.__continuityChart === document.querySelector('[data-chart-inst]') && globalThis.__continuitySVG === document.querySelector('svg[data-rendered-inst]')), true, 'A temporary verification gap must preserve the existing chart surface.')
     assert.match(await page.locator('[data-chart-inst] [aria-live="off"] p').textContent(), /Selected/, 'The ongoing candle inspection must survive verification gaps.')
     assert.equal(await page.getByText('No qualified contracts', { exact: true }).count(), 0)
@@ -1089,6 +1345,9 @@ test('temporary qualification gaps preserve the current chart and interaction un
     await page.mouse.down()
     await page.waitForFunction(() => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
     await publish({ rows: [], loading: true, error: '', catalogSource: 'live', catalogProgress: { total: 4, completed: 0, verified: 0, failed: 0, unknown: 0, pending: 4 } })
+    await waitForMarketStatus('Verifying 0/4')
+    assert.equal(await page.locator('[data-total-market-count]').getAttribute('data-total-market-count'), '0', 'A verification gap may empty backend membership without discarding the current chart.')
+    assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
     await assertRetained('Verifying contracts', 'Rechecking qualification · Current chart remains available')
     await publish({ loading: false, error: 'Order book observations are temporarily unavailable.', catalogProgress: { total: 4, completed: 4, verified: 0, failed: 0, unknown: 4, pending: 0 } })
     await assertRetained('Market verification unavailable', 'Qualification data unavailable · Current chart remains available')
@@ -1101,13 +1360,145 @@ test('temporary qualification gaps preserve the current chart and interaction un
     assert.match(await page.locator('[data-chart-inst] [aria-live="off"] p').textContent(), /Selected/)
     await page.mouse.up()
     await publish({ rows: [], loading: true, catalogProgress: { total: 4, completed: 4, verified: 0, failed: 4, unknown: 0, pending: 0 } })
+    await waitForMarketStatus('Refreshing')
+    await page.locator('[data-market-list]').getByText('No qualified contracts', { exact: true }).waitFor()
     await page.locator('[data-chart-panel]').getByText('No qualified contracts', { exact: true }).waitFor()
     assert.equal(await page.locator('[data-chart-inst]').count(), 0, 'A confirmed complete exclusion must clear the chart.')
-    assert.deepEqual(await electron.evaluate(() => globalThis.__workspaceFixture.requests.findLast(value => value.chartUniverse)?.chartUniverse.instIds), [], 'Confirmed exclusions must remove the retained chart subscription.')
   } finally {
     await page.mouse.up()
     await page.evaluate(() => { delete globalThis.__continuityChart; delete globalThis.__continuitySVG })
     await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), loading: false, error: '', catalogSource: 'live', catalogProgress: undefined })
     await page.locator('[data-market-index]').first().waitFor({ state: 'visible' })
+  }
+})
+
+test('backend readmission updates membership without restoring a previously excluded selection', async () => {
+  const publish = async values => electron.evaluate((_electron, values) => {
+    const state = globalThis.__workspaceFixture
+    Object.assign(state, values); state.revision += 1; state.notify()
+  }, values)
+  try {
+    await page.locator('[aria-label="View BETA-USDT-SWAP chart"]').click()
+    await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows.filter(row => row.instId !== 'BETA-USDT-SWAP')), loading: false })
+    await page.locator('[data-market-index][aria-selected="true"][aria-label="View ZETA-USDT-SWAP chart"]').waitFor()
+    assert.equal(await page.locator('[aria-label="View BETA-USDT-SWAP chart"]').count(), 0)
+    await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows.map(row => row.instId === 'BETA-USDT-SWAP' ? { ...row, lastPrice: 147, rankingChange: -7 } : row)) })
+    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '147')
+    assert.equal(await selected().getAttribute('aria-label'), 'View ZETA-USDT-SWAP chart', 'Readmission must preserve the current user selection.')
+    assert.equal(await page.locator('[data-market-index="0"]').getAttribute('aria-label'), 'View BETA-USDT-SWAP chart')
+    assert.equal(await page.locator('[data-total-market-count]').getAttribute('data-total-market-count'), '4')
+  } finally {
+    await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), loading: false, error: '', catalogSource: 'live', catalogProgress: undefined })
+    await page.locator('[aria-label="View BETA-USDT-SWAP chart"]').click()
+    await page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]').waitFor({ state: 'visible' })
+  }
+})
+
+test('missing recent candles remain visible with repair status until the complete chart is restored', async () => {
+  await selectTimeframe(page, '15m')
+  const chart = page.locator('[data-chart-inst="BETA-USDT-SWAP"]'), status = chart.locator('[data-chart-status]')
+  const publish = phase => electron.evaluate(async ({ ipcMain, BrowserWindow }, phase) => {
+    const state = globalThis.__workspaceFixture
+    if (!state.integrityBaseline) {
+      state.chartGeneration += 1
+      state.integrityBaseline = await ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
+    }
+    const frame = structuredClone(state.integrityBaseline), step = frame.intervalMS
+    frame.revision += { sparse: 1, stale: 2, repaired: 3 }[phase]
+    frame.priceState = 'ready'
+    frame.liveBar = { ...frame.bars.at(-1), hour: frame.endHour + 73 * step,
+      open: 133, high: 134, low: 132, close: 133, confirmed: false, statisticsObserved: false, oi: null, buy: null, sell: null }
+    if (phase === 'sparse') frame.bars.splice(40, 1)
+    if (phase === 'repaired') {
+      frame.bars = frame.bars.map(bar => ({ ...bar, hour: bar.hour + 72 * step }))
+      frame.endHour += 72 * step
+      frame.latestEnd = frame.endHour
+    }
+    state.chartOverride = frame
+    BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
+    return { generation: frame.generation, endHour: frame.endHour, liveHour: frame.liveBar.hour }
+  }, phase)
+  const waitForFrame = frame => page.waitForFunction(({ generation, endHour, liveHour }) => {
+    const chart = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]'), snapshot = chart?.__chartSnapshot
+    return snapshot?.generation === generation && snapshot.liveBar?.hour === liveHour
+      && snapshot.endHour === endHour && snapshot.priceState === 'ready' && Number(chart.dataset.chartEnd) === liveHour
+  }, frame)
+  try {
+    for (const [phase, expected, message] of [
+      ['sparse', 'partial', 'Repairing missing price history…'],
+      ['stale', 'stale', 'Recent price history is stale; repairing…'],
+    ]) {
+      const frame = await publish(phase)
+      await page.waitForFunction(({ generation, state }) => {
+        const chart = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')
+        return chart?.__chartSnapshot.generation === generation && chart.dataset.chartCandleState === state
+      }, { generation: frame.generation, state: expected })
+      await status.getByText(message, { exact: true }).waitFor({ state: 'visible' })
+      assert.doesNotMatch(await status.textContent(), /Chart ready/)
+      assert.equal(await chart.getAttribute('data-chart-incomplete'), 'true')
+      assert.equal(await chart.locator('svg[data-rendered-inst]').isVisible(), true, 'Actual prices remain visible while missing slots repair.')
+      assert.ok(Number(await chart.getAttribute('data-chart-rendered-bars')) >= 95)
+      assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^133 /, 'The current forming price remains visible across the historical gap.')
+    }
+    await waitForFrame(await publish('repaired'))
+    await page.waitForFunction(() => !document.querySelector('[data-chart-status]')?.textContent.trim())
+    assert.equal(await chart.getAttribute('data-chart-candle-state'), 'ready')
+    assert.equal(await chart.getAttribute('data-chart-incomplete'), 'false')
+    assert.equal(await chart.getAttribute('data-chart-rendered-bars'), '96')
+    assert.doesNotMatch(await status.textContent(), /missing price history|stale; repairing/)
+  } finally {
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      delete state.chartOverride
+      delete state.integrityBaseline
+    })
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]').waitFor({ state: 'visible' })
+  }
+})
+
+test('failed and unavailable chart sources preserve qualified rows and report distinct status until a pushed recovery', async () => {
+  await selectTimeframe(page, '15m')
+  const chart = page.locator('[data-chart-inst="BETA-USDT-SWAP"]')
+  try {
+    await electron.evaluate(async ({ ipcMain }) => {
+      const state = globalThis.__workspaceFixture
+      state.chartGeneration += 1
+      const frame = await ipcMain._invokeHandlers.get('radar:request')(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
+      const range = { from: frame.bars[0].hour, through: frame.endHour }
+      state.sourceBaseline = structuredClone(frame)
+      state.chartOverride = { ...frame, revision: frame.revision + 1, oiState: 'error', takerState: 'unavailable',
+        oiStatus: { ...range, state: 'error', error: 'OI endpoint temporarily unavailable', retryAt: Date.now() + 60_000 },
+        takerStatus: { ...range, state: 'unavailable', reason: 'not-published' },
+        bars: frame.bars.map(bar => ({ ...bar, oi: null, buy: null, sell: null, oiObserved: false, takerObserved: true, statisticsObserved: false, statisticsSources: 2 })) }
+    })
+    // Begin with no numeric observation for this source range. An already
+    // observed value is correctly retained through a later temporary failure.
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await chart.locator('[data-chart-status]').getByText(/OI failed: OI endpoint temporarily unavailable.*retry at/).waitFor({ timeout: 5_000 }).catch(async error => {
+      const actual = await chart.evaluate(node => ({ status: node.querySelector('[data-chart-status]')?.textContent, dataset: { ...node.dataset },
+        snapshot: node.__chartSnapshot && { generation: node.__chartSnapshot.generation, revision: node.__chartSnapshot.revision,
+          oiState: node.__chartSnapshot.oiState, oiStatus: node.__chartSnapshot.oiStatus, takerState: node.__chartSnapshot.takerState, takerStatus: node.__chartSnapshot.takerStatus } }))
+      throw new Error(`The pushed source failure was not presented: ${JSON.stringify(actual)}`, { cause: error })
+    })
+    await chart.locator('[data-chart-status]').getByText('Taker is not published for part of this range', { exact: true }).waitFor()
+    assert.equal(await chart.getAttribute('data-chart-oi-state'), 'error')
+    assert.equal(await chart.getAttribute('data-chart-taker-state'), 'unavailable')
+    assert.equal(await chart.getAttribute('data-chart-taker-samples'), '0')
+    assert.equal(await chart.locator('svg[data-rendered-inst]').isVisible(), true)
+    assert.equal(await page.locator('[data-total-market-count]').getAttribute('data-total-market-count'), '4')
+    assert.equal(await selected().getAttribute('aria-label'), 'View BETA-USDT-SWAP chart')
+    await electron.evaluate(({ BrowserWindow }) => {
+      const state = globalThis.__workspaceFixture
+      state.chartOverride = { ...state.sourceBaseline, revision: state.sourceBaseline.revision + 2 }
+      BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', state.chartOverride)
+    })
+    await page.waitForFunction(() => document.querySelector('[data-chart-inst]')?.dataset.chartOiState === 'ready'
+      && document.querySelector('[data-chart-inst]')?.dataset.chartTakerState === 'ready')
+    assert.doesNotMatch(await chart.locator('[data-chart-status]').textContent(), /failed|not published|retry at/)
+  } finally {
+    await electron.evaluate(() => { const state = globalThis.__workspaceFixture; delete state.chartOverride; delete state.sourceBaseline })
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]').waitFor({ state: 'visible' })
   }
 })

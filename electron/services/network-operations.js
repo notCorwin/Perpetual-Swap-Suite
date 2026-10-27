@@ -1,5 +1,8 @@
-import { beginOperation } from './operations.js'
+import { beginOperation, captureOperationContext, recordOperation } from './operations.js'
+import { Buffer } from 'node:buffer'
+import { performance } from 'node:perf_hooks'
 
+const timeOrigin = performance.timeOrigin
 let nextConnection = 0
 const recordedSockets = new WeakMap()
 const recordedConstructionErrors = new WeakSet()
@@ -62,17 +65,24 @@ function recordWebSocket(socket, url, suppliedAttributes, pendingConnect) {
       connectFinished = true
       connect.end({ status })
     }
-    const record = (name, detail = {}, status = 'ok') => beginOperation({ category: 'network', name, resource, attributes: { ...attributes, ...detail } }).end({ status })
+    // These callbacks observe an event already delivered by the transport. They
+    // have an observation time, rather than an application operation to time.
+    const record = (name, detail = {}, status = 'ok') => recordOperation({ category: 'network', name, resource,
+      startedAt: timeOrigin + performance.now(), durationMS: 0, status, attributes: { ...attributes, ...detail } })
+    // Native observers retain connection IDs without restoring application hook
+    // scopes. Suppression belongs to the execution delivering each event.
+    const resumeObserver = captureOperationContext()
+    const observe = listener => event => resumeObserver(() => listener(event))
     const listeners = {
-      open: () => { connected = true; finishConnect('ok') },
-      message: event => record('websocket.receive', { bytes: networkByteLength(event.data) }),
-      error: () => { finishConnect('error'); record('websocket.error', {}, 'error') },
-      close: event => {
+      open: observe(() => { connected = true; finishConnect('ok') }),
+      message: observe(event => record('websocket.receive', { bytes: networkByteLength(event.data) })),
+      error: observe(() => { finishConnect('error'); record('websocket.error', {}, 'error') }),
+      close: observe(event => {
         finishConnect(connected ? 'ok' : 'error')
         const clean = event.wasClean === true || event.code === 1000 || event.code === 1001
         record('websocket.closed', { code: Number.isInteger(event.code) ? event.code : null, clean }, clean ? 'ok' : 'error')
         for (const [type, listener] of Object.entries(listeners)) socket.removeEventListener(type, listener)
-      },
+      }),
     }
     for (const [type, listener] of Object.entries(listeners)) socket.addEventListener(type, listener)
     if (socket.readyState === 1) listeners.open()
