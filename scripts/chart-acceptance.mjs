@@ -1105,8 +1105,10 @@ export async function measureMissingWindow(electron, page, { timeframe = '15m', 
       assert.equal(failedState.requestedEnd, latestEnd)
       assert.notEqual(failedState.completedEnd, latestEnd, 'A failed page must not publish the missing target as complete.')
       assert.match(failedState.alert, /price history failed/i)
+      assert.equal(nearest.error, 'Configured cold-window source failure.', `The delayed fixture must fail for its configured reason: ${JSON.stringify(nearest)}`)
+      assert.match(failedState.alert, /Configured cold-window source failure\./)
       assert.ok(nearest.failedAt - nearest.startedAt >= fixture.sourceDelayMS,
-        'The configured failed price source must remain delayed for the full interval.')
+        `The configured failed price source must remain delayed for the full interval: ${JSON.stringify(nearest)}`)
     } else {
       await waitForRendered(page, fixture, timeframe, latestEnd)
       await page.waitForFunction(instId => {
@@ -1130,7 +1132,7 @@ export async function measureMissingWindow(electron, page, { timeframe = '15m', 
       && request.from <= fixture.targetEnd && request.through >= fixture.targetWindowStart)
     const finishedAt = failSource ? nearest.failedAt : nearest.completedAt
     assert.ok(Number.isFinite(finishedAt) && finishedAt - nearest.startedAt >= fixture.sourceDelayMS,
-      'The configured price source must remain delayed for the full interval before success or failure.')
+      `The configured price source must remain delayed for the full interval before success or failure: ${JSON.stringify(nearest)}`)
     const heldStatistics = sourceSnapshot.requests.filter(request => request.source !== 'candles'
       && request.held && request.completedAt === null)
     if (!failSource) assert.ok(heldStatistics.length, 'The ready price window must remain explicitly incomplete while OI/Taker source pages are held.')

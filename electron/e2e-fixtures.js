@@ -3,6 +3,7 @@ import { quoteTurnover24h } from './services/liquidity.js'
 
 const FIVE_MINUTES = 300_000
 const HOUR = 3_600_000
+const monotonicEpochNow = () => performance.timeOrigin + performance.now()
 
 // Fixtures use the same independent price/statistic ledgers as production.
 async function persistNativeFixture(store, marketService, rows) {
@@ -324,7 +325,7 @@ export async function createChartColdBoundaryFixture(store, marketService, {
     const nearestSourceEnd = scenario === 'full-missing-window' ? targetEnd : firstMissingEnd
     const held = source !== 'candles' || through < nearestSourceEnd
     const request = { source, path, parameters: { ...parameters }, from, through, priority, held: held && holding,
-      startedAt: Date.now(), completedAt: null, failedAt: null, error: null }
+      startedAt: monotonicEpochNow(), completedAt: null, failedAt: null, error: null }
     requests.push(request)
     active += 1; maxActive = Math.max(maxActive, active)
     try {
@@ -334,18 +335,21 @@ export async function createChartColdBoundaryFixture(store, marketService, {
         signal?.addEventListener('abort', abort, { once: true })
         released.then(() => { signal?.removeEventListener('abort', abort); resolve() })
       })
-      await new Promise(resolve => setTimeout(resolve, sourceDelayMS))
+      const deadline = monotonicEpochNow() + sourceDelayMS
+      for (let remaining = deadline - monotonicEpochNow(); remaining > 0; remaining = deadline - monotonicEpochNow()) {
+        await new Promise(resolve => setTimeout(resolve, Math.max(1, Math.ceil(remaining))))
+      }
       signal?.throwIfAborted()
       if (failNearestCandles && source === 'candles' && from <= targetEnd && through >= targetWindowStart) {
         throw new Error('Configured cold-window source failure.')
       }
       const page = rows.filter(row => row.timestamp >= from && row.timestamp <= through).reverse()
-      request.completedAt = Date.now()
+      request.completedAt = monotonicEpochNow()
       return page.map(row => source === 'candles'
         ? [row.timestamp, row.open, row.high, row.low, row.close, row.volume, row.baseVolume, row.quoteVolume, '1'].map(String)
         : (source === 'oi' ? [row.timestamp, row.oi] : [row.timestamp, row.sell, row.buy]).map(String))
     } catch (error) {
-      request.failedAt = Date.now(); request.error = error instanceof Error ? error.message : String(error)
+      request.failedAt = monotonicEpochNow(); request.error = error instanceof Error ? error.message : String(error)
       throw error
     } finally { active -= 1 }
   }
