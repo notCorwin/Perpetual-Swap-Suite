@@ -11,6 +11,12 @@ import { backgroundArchiveRows, seedMarketResources, startBackgroundArchive } fr
 
 let metadata, store, service, preferences, sourceProbe
 let resourceFixture, acquisitionFixture, coldBoundaryFixture
+let coldBoundaryOperation = Promise.resolve()
+const coldBoundaryLifecycle = operation => {
+  const result = coldBoundaryOperation.then(operation)
+  coldBoundaryOperation = result.then(() => undefined, () => undefined)
+  return result
+}
 const emit = (name, value) => parentPort.postMessage({ type: 'event', name, value })
 const offline = async (_input, { signal } = {}) => {
   if (workerData.e2eLiveRefresh) await new Promise((resolve, reject) => {
@@ -107,6 +113,7 @@ async function request(value) {
         preparedWorkerThreadId: service.preparedCharts.worker?.threadId ?? service.preparedCharts.workers?.[0]?.threadId ?? null }
       case 'seedCandles': return { written: await store.appendCandles(input.candles) }
       case 'readCandles': return store.candles(input)
+      case 'readStatistics': return store.statistics(input)
       case 'seedCachedListProjection': return seedCachedListProjection(store, service)
       case 'seedChartScrollBenchmark': return seedChartScrollBenchmark(store, service)
       case 'seedHistoricalStatisticsBoundary': return seedHistoricalStatisticsBoundary(store, service)
@@ -128,19 +135,27 @@ async function probe(input) {
     const state = value => value ? { rows: value.rows.size, indicators: value.indicators.size, generation: value.generation,
       calculating: Boolean(value.calculation), indicatorVersion: value.indicatorVersion, latestHour: value.latestHour } : null
     return { tasks: [...pipeline.candidateTasks.keys()].map(value => value.key), queue: pipeline.candidateQueue.map(value => value.key),
+      focus: pipeline.focus ? { instId: pipeline.focus.instId, timeframe: pipeline.focus.timeframe } : null,
+      catalog: [...service.catalog.keys()], listRemovals: [...service.listRemovals.keys()],
       seeds: [...pipeline.liveSeeds.keys()], sources: [...pipeline.sourceTasks.values()].map(value => ({ key: value.seriesKey, source: value.source, from: value.from, through: value.through })),
       series: [...pipeline.universe.keys()].map(key => ({ key, compact: state(pipeline.liveStates.get(key)), history: state(pipeline.series.get(key)),
         cached: pipeline.cached(key)?.indicatorState, cachedGeneration: pipeline.cached(key)?.generation })) }
   }
   if (input.action === 'seedChartScrollBenchmark') return seedChartScrollBenchmark(store, service, { instId: input.instId })
-  if (input.action === 'coldBoundaryInstall') {
-    coldBoundaryFixture?.remove()
+  if (input.action === 'coldBoundaryInstall') return coldBoundaryLifecycle(async () => {
+    await coldBoundaryFixture?.remove()
+    coldBoundaryFixture = null
     coldBoundaryFixture = await createChartColdBoundaryFixture(store, service, input)
     return coldBoundaryFixture.fixture
-  }
+  })
   if (input.action === 'coldBoundaryRead') return coldBoundaryFixture?.read() ?? null
   if (input.action === 'coldBoundaryRelease') { coldBoundaryFixture?.release(); return { ok: true } }
-  if (input.action === 'coldBoundaryRemove') { coldBoundaryFixture?.remove(); coldBoundaryFixture = null; return { ok: true } }
+  if (input.action === 'coldBoundaryRemove') return coldBoundaryLifecycle(async () => {
+    const previous = coldBoundaryFixture
+    await previous?.remove()
+    coldBoundaryFixture = null
+    return { ok: true, disposed: previous?.read() ?? null }
+  })
   if (input.action === 'acquisitionInstall') {
     acquisitionFixture = await createChartAcquisitionFixture(store, service, input)
     return acquisitionFixture.fixture
@@ -353,7 +368,9 @@ async function probe(input) {
     }
     throw new Error('Market traffic receipt capture phase must be arm or end.')
   }
-  if (input.action === 'diagnostics') return { backendThreadId: threadId, tasks: service.history.sync.listTasks(), writeMetrics: store.getWriteMetrics() }
+  if (input.action === 'diagnostics') return { backendThreadId: threadId, tasks: service.history.sync.listTasks(),
+    activeHistory: [...service.history.sync.active.values()].map(({ group }) => ({ instrument: group.instrument, timeframe: group.timeframe, source: group.source })),
+    writeMetrics: store.getWriteMetrics() }
   if (input.action === 'backgroundStart') return startBackgroundArchive(store, service)
   if (input.action === 'backgroundStatus') {
     const audit = await service.dataAuditRequest({ action: 'status' }), tasks = service.history.sync.listTasks()
@@ -376,7 +393,8 @@ onOperationMessage(parentPort, 'market-backend', async ({ id, method, value }) =
     else if (method === 'dispose') {
       sourceProbe?.release()
       const failures = []
-      for (const close of [() => service.dispose(), () => store.close(), () => metadata.close()]) {
+      for (const close of [() => coldBoundaryLifecycle(async () => { await coldBoundaryFixture?.remove(); coldBoundaryFixture = null }),
+        () => service.dispose(), () => store.close(), () => metadata.close()]) {
         try { await close() } catch (error) { failures.push(error) }
       }
       if (failures.length) throw new AggregateError(failures, `Market backend shutdown failed: ${failures.map(error => error?.message ?? String(error)).join('; ')}`)

@@ -15,7 +15,6 @@ requireForegroundTests()
 const root = new URL('../..', import.meta.url).pathname
 const userData = await mkdtemp(join(tmpdir(), 'perp-chart-paint-e2e-'))
 let electron, page, stopDiagnostics
-const request = value => page.evaluate(value => window.radarDesktop.request(value), value)
 
 before(async () => {
   await writeFile(join(userData, 'settings.json'), JSON.stringify({
@@ -51,7 +50,7 @@ test('bulk-warmed history updates every renderer target within 100 ms during scr
     assert.equal(restored, foreground.previous.visible, 'The latency test must restore the native window visibility.')
   })
   context.diagnostic(`Native foreground timing window: ${JSON.stringify({ before: foreground.previous, during: foreground.native, environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence })}`)
-  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark' }))
   // Complete the initial durable hydration before holding subsequent disk
   // deliveries and source maintenance. Resident navigation uses transferred
   // data independently of either backend preparation or the two read lanes.

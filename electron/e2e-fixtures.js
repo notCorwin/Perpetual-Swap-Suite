@@ -310,50 +310,71 @@ export async function createChartColdBoundaryFixture(store, marketService, {
       oi: 2_000_000 + index * 113, buy: 70_000 + index % 701, sell: 60_000 + index % 601,
       statisticsVersion: 11, statisticsSources: 3, statisticsObserved: true }
   })
-  const original = marketService.get.bind(marketService), requests = []
+  const original = marketService.get, requests = [], pending = new Set()
+  const disposal = new AbortController()
   let release
   const released = new Promise(resolve => { release = resolve })
   let holding = true, active = 0, maxActive = 0
-  marketService.get = async (path, parameters, signal, priority) => {
-    if (parameters?.instId !== instId) return original(path, parameters, signal, priority)
-    const source = path === '/market/history-candles' ? 'candles'
-      : path === '/rubik/stat/contracts/open-interest-history' ? 'oi'
-        : path === '/rubik/stat/taker-volume-contract' ? 'taker' : null
-    if (!source || (source === 'candles' ? parameters.bar : parameters.period) !== timeframe) return original(path, parameters, signal, priority)
-    const through = source === 'candles' ? Number(parameters.after) - intervalMS : Number(parameters.end) - intervalMS
-    const from = source === 'candles' ? through - (Number(parameters.limit) - 1) * intervalMS : Number(parameters.begin) + intervalMS
-    const nearestSourceEnd = scenario === 'full-missing-window' ? targetEnd : firstMissingEnd
-    const held = source !== 'candles' || through < nearestSourceEnd
-    const request = { source, path, parameters: { ...parameters }, from, through, priority, held: held && holding,
-      startedAt: monotonicEpochNow(), completedAt: null, failedAt: null, error: null }
-    requests.push(request)
-    active += 1; maxActive = Math.max(maxActive, active)
-    try {
-      if (held && holding) await new Promise((resolve, reject) => {
-        const abort = () => { signal?.removeEventListener('abort', abort); reject(signal.reason ?? new Error('Cold-boundary request aborted.')) }
-        if (signal?.aborted) return abort()
-        signal?.addEventListener('abort', abort, { once: true })
-        released.then(() => { signal?.removeEventListener('abort', abort); resolve() })
-      })
-      const deadline = monotonicEpochNow() + sourceDelayMS
-      for (let remaining = deadline - monotonicEpochNow(); remaining > 0; remaining = deadline - monotonicEpochNow()) {
-        await new Promise(resolve => setTimeout(resolve, Math.max(1, Math.ceil(remaining))))
+  const wait = (promise, signal) => new Promise((resolve, reject) => {
+    const abort = () => { signal.removeEventListener('abort', abort); reject(signal.reason) }
+    if (signal.aborted) return abort()
+    signal.addEventListener('abort', abort, { once: true })
+    promise.then(value => { signal.removeEventListener('abort', abort); resolve(value) }, error => { signal.removeEventListener('abort', abort); reject(error) })
+  })
+  const waitUntil = (deadline, signal) => new Promise((resolve, reject) => {
+    let timer
+    const abort = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); reject(signal.reason) }
+    const tick = () => {
+      const remaining = deadline - monotonicEpochNow()
+      if (remaining <= 0) { signal.removeEventListener('abort', abort); resolve(); return }
+      timer = setTimeout(tick, Math.max(1, Math.ceil(remaining)))
+    }
+    if (signal.aborted) return abort()
+    signal.addEventListener('abort', abort, { once: true })
+    tick()
+  })
+  const fixtureGet = (path, parameters, signal, priority, ...options) => {
+    if (parameters?.instId !== instId) return original.call(marketService, path, parameters, signal, priority, ...options)
+    const fixtureSignal = signal ? AbortSignal.any([signal, disposal.signal]) : disposal.signal
+    const task = (async () => {
+      fixtureSignal.throwIfAborted()
+      const source = path === '/market/history-candles' ? 'candles'
+        : path === '/rubik/stat/contracts/open-interest-history' ? 'oi'
+          : path === '/rubik/stat/taker-volume-contract' ? 'taker' : null
+      if (!source || (source === 'candles' ? parameters.bar : parameters.period) !== timeframe) {
+        return original.call(marketService, path, parameters, fixtureSignal, priority, ...options)
       }
-      signal?.throwIfAborted()
-      if (failNearestCandles && source === 'candles' && from <= targetEnd && through >= targetWindowStart) {
-        throw new Error('Configured cold-window source failure.')
-      }
-      const page = rows.filter(row => row.timestamp >= from && row.timestamp <= through).reverse()
-      request.completedAt = monotonicEpochNow()
-      return page.map(row => source === 'candles'
-        ? [row.timestamp, row.open, row.high, row.low, row.close, row.volume, row.baseVolume, row.quoteVolume, '1'].map(String)
-        : (source === 'oi' ? [row.timestamp, row.oi] : [row.timestamp, row.sell, row.buy]).map(String))
-    } catch (error) {
-      request.failedAt = monotonicEpochNow(); request.error = error instanceof Error ? error.message : String(error)
-      throw error
-    } finally { active -= 1 }
+      const through = source === 'candles' ? Number(parameters.after) - intervalMS : Number(parameters.end) - intervalMS
+      const from = source === 'candles' ? through - (Number(parameters.limit) - 1) * intervalMS : Number(parameters.begin) + intervalMS
+      const nearestSourceEnd = scenario === 'full-missing-window' ? targetEnd : firstMissingEnd
+      const held = source !== 'candles' || through < nearestSourceEnd
+      const request = { source, path, parameters: { ...parameters }, from, through, priority, held: held && holding,
+        startedAt: monotonicEpochNow(), completedAt: null, failedAt: null, error: null }
+      requests.push(request)
+      active += 1; maxActive = Math.max(maxActive, active)
+      try {
+        if (held && holding) await wait(released, fixtureSignal)
+        await waitUntil(monotonicEpochNow() + sourceDelayMS, fixtureSignal)
+        fixtureSignal.throwIfAborted()
+        if (failNearestCandles && source === 'candles' && from <= targetEnd && through >= targetWindowStart) {
+          throw new Error('Configured cold-window source failure.')
+        }
+        const page = rows.filter(row => row.timestamp >= from && row.timestamp <= through).reverse()
+        request.completedAt = monotonicEpochNow()
+        return page.map(row => source === 'candles'
+          ? [row.timestamp, row.open, row.high, row.low, row.close, row.volume, row.baseVolume, row.quoteVolume, '1'].map(String)
+          : (source === 'oi' ? [row.timestamp, row.oi] : [row.timestamp, row.sell, row.buy]).map(String))
+      } catch (error) {
+        request.failedAt = monotonicEpochNow(); request.error = error instanceof Error ? error.message : String(error)
+        throw error
+      } finally { active -= 1 }
+    })()
+    pending.add(task)
+    void task.finally(() => pending.delete(task)).catch(() => {})
+    return task
   }
   await persistNativeFixture(store, marketService, rows.slice(-initialHistoryBars))
+  marketService.get = fixtureGet
   const instrument = { instId, instCategory: '1', settleCcy: 'USDT', state: 'live', ctVal: '0.1', ctValCcy: 'COLD', listTime: String(start) }
   const ticker = { instId, last: String(rows.at(-1).close), open24h: String(rows.at(-25).open), low24h: '100', high24h: '230',
     bidPx: String(rows.at(-1).close - .01), askPx: String(rows.at(-1).close + .01), volCcy24h: '500000' }
@@ -361,6 +382,7 @@ export async function createChartColdBoundaryFixture(store, marketService, {
   marketService.catalogUpdatedAt = Date.now(); marketService.catalogSource = 'live'
   marketService.replaceCatalog([{ instrument, ticker, result: { eligible: true, turnover: 90_000_000, oiUSD: 8_000_000,
     spread: .01, depth: 300_000, slippage: .02 }, change24h: 5.2 }])
+  const catalogEntry = marketService.catalog.get(instId)
   marketService.error = ''; marketService.lastRefreshAt = Date.now()
   const fixture = { instId, timeframe, timeframes: [timeframe], intervalMS, end, start, periods, scenario,
     initialHistoryBars, targetDistance, targetEnd, targetWindowStart, firstMissingEnd, sourceDelayMS, failNearestCandles,
@@ -393,7 +415,45 @@ export async function createChartColdBoundaryFixture(store, marketService, {
     preparedTarget = { at: monotonicEpochNow(), sourceCompletedAt: nearest.completedAt, frameEndHour: frame.endHour,
       historyBars: frame.bars.length, targetStart: targetWindowStart, targetEnd, generation: frame.generation, revision: frame.revision }
   }) : () => {}
-  return { fixture, read: () => ({ holding, active, maxActive, sourceTimeOrigin: performance.timeOrigin, preparedTarget, requests: requests.map(request => ({ ...request })) }),
+  let removeTask
+  const remove = () => {
+    if (removeTask) return removeTask
+    removeTask = Promise.resolve().then(async () => {
+      disposal.abort(new DOMException('Cold-boundary fixture disposed.', 'AbortError'))
+      holding = false; release(); unsubscribe()
+
+      const current = marketService.catalog.get(instId), removal = marketService.listRemovals.get(instId)
+      const ownsInstrument = marketService.instruments.get(instId) === instrument
+        && (!current || current === catalogEntry) && (!removal || removal.entry === catalogEntry)
+      if (ownsInstrument && marketService.preparedCharts.focus?.instId === instId) marketService.preparedCharts.setFocus(null)
+      let listChanged = false
+      if (current === catalogEntry) { marketService.catalog.delete(instId); marketService.catalogRevision += 1; listChanged = true }
+      if (removal?.entry === catalogEntry) { marketService.listRemovals.delete(instId); listChanged = true }
+      if (ownsInstrument) marketService.instruments.delete(instId)
+      if (listChanged) {
+        marketService.touchList()
+        marketService.updateListedUniverse()
+        marketService.updateSubscriptions()
+        marketService.scheduleMarketDeadline()
+      }
+
+      if (ownsInstrument) {
+        const owned = map => [...map].filter(([key]) => key.startsWith(`${instId}:`)).map(([, task]) => task)
+        // A list-ranking read can admit a history repair after catalog removal.
+        // Finish those reads before retiring all history targets for this fixture.
+        await Promise.allSettled(owned(marketService.rankingTasks))
+        const sync = marketService.history.sync
+        const activeHistory = () => [...sync.active.values()].filter(entry => entry.group.instrument === instId).map(entry => entry.promise)
+        const admitted = activeHistory()
+        await marketService.history.removeTargets([instId])
+        await Promise.allSettled([...admitted, ...activeHistory(), ...owned(marketService.rankingRepairs)])
+      }
+      await Promise.allSettled([...pending])
+      if (marketService.get === fixtureGet) marketService.get = original
+    })
+    return removeTask
+  }
+  return { fixture, read: () => ({ holding, active, pending: pending.size, maxActive, sourceTimeOrigin: performance.timeOrigin, preparedTarget, requests: requests.map(request => ({ ...request })) }),
     release: () => { holding = false; release() },
-    remove: () => { holding = false; release(); unsubscribe(); marketService.get = original } }
+    remove }
 }

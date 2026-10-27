@@ -252,8 +252,11 @@ export async function openChart(page, fixture, timeframe = fixture.timeframe) {
 // treating the requested viewport or an aggregate loading flag as a render.
 // __chartSnapshot is a reference to the rendered object; it avoids serializing
 // 96 full bars into an attribute on every production animation frame.
+const paintOracleSeries = new WeakMap()
+
 export async function startPaintProbe(page, fixture, { requireMatureData = false, requireWarmStatistics = false, indicatorValidation = 'fixture' } = {}) {
   assert.ok(['fixture', 'finite', 'deferred-canonical'].includes(indicatorValidation), 'Unknown chart indicator validation contract.')
+  assert.ok(!paintOracleSeries.has(page), 'The previous paint probe must finish before starting another.')
   if (requireWarmStatistics) {
     const { timeframe, bars } = await page.locator(`[data-chart-inst="${fixture.instId}"]`).evaluate(chart => ({
       timeframe: chart.__chartSnapshot?.timeframe,
@@ -480,23 +483,60 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       }
     }
     window.__chartPaintProbe = probe
-  }, { instId: fixture.instId, series: fixture.series, requireMatureData, requireWarmStatistics, indicatorValidation })
+  }, { instId: fixture.instId,
+    series: Object.fromEntries(Object.entries(fixture.series).map(([timeframe, entry]) => [timeframe, { intervalMS: entry.intervalMS }])),
+    requireMatureData, requireWarmStatistics, indicatorValidation })
+  paintOracleSeries.set(page, fixture.series)
 }
 
 export async function finishPaintProbe(page, { readyTarget = null, includeRequestCommits = false, includeTimingEvidence = false } = {}) {
-  const report = await page.evaluate(({ readyTarget, includeRequestCommits, includeTimingEvidence }) => {
+  const oracleSeries = paintOracleSeries.get(page)
+  assert.ok(oracleSeries, 'No paint oracle belongs to this page.')
+  try {
+    // Stop capture before transporting any oracle values into the renderer.
+    // A full fixture can contain thousands of bars that no observed viewport
+    // uses. Keep that archive in Node and send only the retained observations'
+    // timestamps after the measured input/RAF phase has ended.
+    const observed = await page.evaluate(() => {
+      const probe = window.__chartPaintProbe
+      if (!probe) throw new Error('No chart paint probe was installed.')
+      probe.capturePending()
+      probe.active = false
+      cancelAnimationFrame(probe.raf)
+      probe.observer.disconnect()
+      for (const { observer, record } of probe.schedulerObservers) { record(observer.takeRecords()); observer.disconnect() }
+      const hours = new Map(), seenBars = new Map()
+      for (const { snapshot, bars } of probe.observations) {
+        if (!snapshot || !Array.isArray(bars)) continue
+        const timeframe = snapshot.timeframe
+        if (!hours.has(timeframe)) { hours.set(timeframe, new Set()); seenBars.set(timeframe, new WeakSet()) }
+        if (seenBars.get(timeframe).has(bars)) continue
+        seenBars.get(timeframe).add(bars)
+        for (const bar of bars) if (bar && Number.isFinite(bar.hour)) hours.get(timeframe).add(bar.hour)
+      }
+      return Object.fromEntries([...hours].map(([timeframe, values]) => [timeframe, [...values]]))
+    })
+    let fixtureBars = 0, transferredBars = 0
+    const series = Object.fromEntries(Object.entries(oracleSeries).map(([timeframe, entry]) => {
+      const hours = new Set(observed[timeframe] ?? [])
+      const bars = entry.bars.filter(bar => hours.has(bar.hour))
+      fixtureBars += entry.bars.length; transferredBars += bars.length
+      return [timeframe, { intervalMS: entry.intervalMS, bars }]
+    }))
+    return await validateStoppedPaintProbe(page, { readyTarget, includeRequestCommits, includeTimingEvidence, series,
+      oracleTransfer: { phase: 'after capture stopped', fixtureBars, transferredBars } })
+  } finally { paintOracleSeries.delete(page) }
+}
+
+async function validateStoppedPaintProbe(page, { readyTarget, includeRequestCommits, includeTimingEvidence, series, oracleTransfer }) {
+  const report = await page.evaluate(({ readyTarget, includeRequestCommits, includeTimingEvidence, series }) => {
     const probe = window.__chartPaintProbe
-    if (!probe) throw new Error('No chart paint probe was installed.')
-    probe.capturePending()
-    probe.active = false
-    cancelAnimationFrame(probe.raf)
-    probe.observer.disconnect()
-    for (const { observer, record } of probe.schedulerObservers) { record(observer.takeRecords()); observer.disconnect() }
+    if (!probe || probe.active) throw new Error('Paint validation requires the stopped capture.')
 
     const validationStartedAt = performance.now()
     const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
     const indicatorFields = fields.slice(4, -3), statisticFields = ['oi', 'buy', 'sell'], curveFields = [...indicatorFields, 'oi']
-    const { instId, series, requireMatureData, requireWarmStatistics, indicatorValidation } = probe
+    const { instId, requireMatureData, requireWarmStatistics, indicatorValidation } = probe
     const oracles = Object.fromEntries(Object.entries(series).map(([frame, entry]) => [frame, new Map(entry.bars.map(bar => [bar.hour, bar]))]))
     const expectedGeometry = new WeakMap(), known = new Map(), seenErrors = new Set(probe.errors)
     const fail = message => { if (!seenErrors.has(message)) { seenErrors.add(message); probe.errors.push(message) } }
@@ -654,12 +694,12 @@ export async function finishPaintProbe(page, { readyTarget = null, includeReques
       ...(includeRequestCommits ? { requestCommits: probe.requestCommits } : {}),
       ...(includeTimingEvidence ? { captureTimings: probe.validationSamples } : {}),
     }
-  }, { readyTarget, includeRequestCommits, includeTimingEvidence })
+  }, { readyTarget, includeRequestCommits, includeTimingEvidence, series })
   const frameGaps = summarizeLatencySamples(report.frameGaps)
   const capture = summarizeLatencySamples(report.validationDurations)
   delete report.frameGaps
   delete report.validationDurations
-  return { ...report, rafSampleCount: report.frames,
+  return { ...report, oracleTransfer, rafSampleCount: report.frames,
     p95FrameGapMS: frameGaps.p95MS, maxFrameGapMS: frameGaps.maxMS,
     p95FrameGapSampleCount: frameGaps.sampleCount, p95FrameGapSampleMinimum: frameGaps.p95SampleMinimum,
     p99FrameGapMS: frameGaps.p99MS, p99FrameGapSampleMinimum: frameGaps.p99SampleMinimum,
@@ -687,7 +727,7 @@ function paintPhaseEvidence(paint) {
     totalProbeCaptureMS: paint.totalProbeCaptureMS, maxProbeCaptureMS: paint.maxProbeCaptureMS, scheduler: paint.scheduler,
     firstFrameAt: paint.firstFrameAt, inputBursts: paint.inputBursts, commits: paint.commits,
     requestCommits: paint.requestCommits, frameSamples: paint.frameSamples, captureTimings: paint.captureTimings,
-    observationSamples: paint.observationSamples }
+    observationSamples: paint.observationSamples, oracleTransfer: paint.oracleTransfer }
 }
 
 function prefetchPerformanceChecks(latency) {
@@ -1370,7 +1410,7 @@ export async function measureMissingWindow(electron, page, { timeframe = '15m', 
     assert.equal(nearest.completedAt, null, 'The delayed request must remain active through continuing and reversed input.')
     assert.equal(nearest.failedAt, null, 'A configured delayed source failure must occur after continuing and reversed input.')
     const pendingInputAcknowledgment = await measureChartIntentLatency(page, {
-      inputs: latestInputs, targets: latestTargets, requireForeground: !offscreen, milestone: 'requested-cursor',
+      inputs: latestInputs, targets: latestTargets, requireForeground: !offscreen, milestone: 'requested-cursor', enforceBudgets: false,
     })
 
     let latency = null
@@ -1427,23 +1467,37 @@ export async function measureMissingWindow(electron, page, { timeframe = '15m', 
     if (!failSource) assert.ok(heldStatistics.length, 'The ready price window must remain explicitly incomplete while OI/Taker source pages are held.')
 
     const finalWindow = await readColdWindowState(page, fixture.instId)
-    const paint = await finishPaintProbe(page)
+    const paint = await finishPaintProbe(page, { includeRequestCommits: true, includeTimingEvidence: true })
     paintStarted = false
-    assertCompletePaints(paint)
-    if (!offscreen) assert.ok(paint.maxFrameGapMS < 100,
-      `A completely absent viewport caused a renderer RAF stall of at least 100 ms: ${JSON.stringify({ maxFrameGapMS: paint.maxFrameGapMS, scheduler: paint.scheduler })}`)
     // End the timing phase at the terminal UI state. Reading and independently
     // checking its SQLite prefix is correctness verification outside that phase.
-    const observedFieldOracle = await assertColdCanonicalViewport(electron, page, fixture, finalWindow.renderedEnd)
-    assert.equal(finalWindow.indicatorState, observedFieldOracle.expectedIndicatorState,
-      'Indicator readiness must describe the available SQLite prefix, including its real warmup boundary.')
+    let observedFieldOracle, oracleError
+    try { observedFieldOracle = await assertColdCanonicalViewport(electron, page, fixture, finalWindow.renderedEnd) }
+    catch (error) { oracleError = error }
     const requests = await readRequestProbe(electron)
-    assert.ok(requests.maxHistoricalActive <= 2, `Cold acquisition exceeded the two historical read lanes: ${JSON.stringify(requests)}`)
-    assert.equal(requests.legacyWindowCalls, 0)
     const sourceKeys = sourceSnapshot.requests.map(request => `${request.source}:${request.from}:${request.through}`)
     const duplicatePages = sourceKeys.length - new Set(sourceKeys).size
-    assert.ok(sourceSnapshot.requests.length <= 8, `A single cold viewport admitted too many source requests: ${JSON.stringify(sourceSnapshot.requests)}`)
-    assert.ok(duplicatePages <= (failSource ? 1 : 0), `The same cold source page was requested repeatedly: ${JSON.stringify(sourceSnapshot.requests)}`)
+    const { results, failures } = collectAcceptanceChecks([
+      ['complete paints', () => assertCompletePaints(paint)],
+      ['canonical viewport', () => { if (oracleError) throw oracleError }],
+      ['indicator readiness', () => assert.equal(finalWindow.indicatorState, observedFieldOracle?.expectedIndicatorState,
+        'Indicator readiness must describe the available SQLite prefix, including its real warmup boundary.')],
+      ['historical read lanes', () => assert.ok(requests.maxHistoricalActive <= 2, 'Cold acquisition exceeded the two historical read lanes.')],
+      ['legacy window calls', () => assert.equal(requests.legacyWindowCalls, 0)],
+      ['source request budget', () => assert.ok(sourceSnapshot.requests.length <= 8, 'A single cold viewport admitted too many source requests.')],
+      ['duplicate source pages', () => assert.ok(duplicatePages <= (failSource ? 1 : 0), 'The same cold source page was requested repeatedly.')],
+      ...(!offscreen ? [
+        ['100 ms pending input and RAF budgets', () => assertScrollResponsiveness(pendingInputAcknowledgment)],
+        ['100 ms terminal phase RAF budget', () => assert.ok(paint.maxFrameGapMS < 100,
+          `A completely absent viewport caused a renderer RAF stall of at least 100 ms: ${paint.maxFrameGapMS}`)],
+      ] : []),
+    ])
+    if (failures.length) {
+      const evidence = { rendererTimeOrigin: pendingInputAcknowledgment.rendererTimeOrigin, pendingInputAcknowledgment,
+        finalWindow, sourceSnapshot, requests, observedFieldOracle, paint: paintPhaseEvidence(paint), checks: results }
+      throw new Error(`${failures.map(error => error?.message ?? String(error)).join('\n')}\nMissing-window phase data: ${JSON.stringify(evidence)}`,
+        { cause: new AggregateError(failures) })
+    }
     return { scenario: 'full-missing-window', observedFieldOracle, initiallyMissingCandles: fixture.initiallyMissingViewportBars,
       initiallyPresentCandles: initialRows.length,
       latestIntentPreserved: failSource ? latestState.requestedEnd === latestEnd : true,
@@ -1464,7 +1518,8 @@ export async function measureMissingWindow(electron, page, { timeframe = '15m', 
       exactInputAccounting: latency ? { intents: latestInputs.length, committed: latency.committedInputs,
         superseded: latency.supersededInputs, maximumIntentToRafSampleMS: latency.maxInputToRafSampleMS,
         allIntentsAccounted: latency.unaccountedInputs.length === 0 } : null,
-      nativePaintMeasured: false, rendererRafSamples: paint.frames, ...paint }
+      nativePaintMeasured: false, rendererRafSamples: paint.frames, ...paint,
+      frameSamples: undefined, captureTimings: undefined, requestCommits: undefined, observationSamples: undefined }
   } finally {
     if (paintStarted) await finishPaintProbe(page)
     if (probeInstalled) { await releaseRequestProbe(electron); await removeRequestProbe(electron) }

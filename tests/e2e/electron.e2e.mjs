@@ -406,17 +406,24 @@ test('the 1600 design workspace keeps both panels and chart selection when searc
   }
 })
 
-test('the paint probe accepts an unchanged complete frame after deferred validation', async () => {
+test('the paint probe accepts an unchanged complete frame after deferred validation', async context => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   await openChart(page, fixture)
   await startPaintProbe(page, fixture)
   let report
   try {
+    assert.equal(await page.evaluate(() => Object.values(window.__chartPaintProbe.series).some(entry => 'bars' in entry)), false,
+      'Oracle bar archives must stay outside the renderer during input and RAF capture.')
     await page.evaluate(async () => { for (let frame = 0; frame < 3; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
     report = await finishPaintProbe(page)
     assertCompletePaints(report)
     assert.equal(report.deferredValidationSamples, report.probeCaptureSamples)
     assert.equal(report.quality.length, report.commits.length)
+    assert.equal(report.oracleTransfer.phase, 'after capture stopped')
+    assert.equal(report.oracleTransfer.fixtureBars, Object.values(fixture.series).reduce((sum, entry) => sum + entry.bars.length, 0))
+    assert.ok(report.oracleTransfer.transferredBars > 0 && report.oracleTransfer.transferredBars <= 192)
+    assert.ok(report.oracleTransfer.transferredBars < report.oracleTransfer.fixtureBars)
+    context.diagnostic(`Deferred oracle transfer: ${JSON.stringify(report.oracleTransfer)}`)
   } finally { if (!report) await finishPaintProbe(page) }
 })
 

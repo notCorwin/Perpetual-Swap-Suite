@@ -74,6 +74,73 @@ after(async () => {
   if (userData) await rm(userData, { recursive: true, force: true })
 })
 
+test('cold fixture disposal isolates held source work from the next fixture', { timeout: 60_000 }, async () => {
+  const probe = value => electron.evaluate((_, input) => globalThis.__marketBackend.probe(input), value)
+  const backendRequest = value => electron.evaluate((_, input) => globalThis.__marketBackend.request(input), value)
+  const install = timeframe => probe({ action: 'coldBoundaryInstall', timeframe, scenario: 'full-missing-window', sourceDelayMS: 1800 })
+  const heldRequests = async fixture => {
+    await backendRequest({ chartFocus: { id: `isolation-${fixture.instId}`, target: {
+      instId: fixture.instId, timeframe: fixture.timeframe, endHour: fixture.targetEnd,
+    } } })
+    const deadline = Date.now() + 20_000
+    while (Date.now() < deadline) {
+      const snapshot = await probe({ action: 'coldBoundaryRead' })
+      const held = snapshot.requests.filter(item => item.held && item.completedAt === null && item.failedAt === null)
+      if (held.length) return held
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    throw new Error(`No optional or reserve source was held for ${fixture.instId}.`)
+  }
+  const assertRetired = async fixture => {
+    const [prepared, history] = await Promise.all([probe({ action: 'preparedDiagnostics' }), probe({ action: 'diagnostics' })])
+    assert.notEqual(prepared.focus?.instId, fixture.instId)
+    assert.equal(prepared.catalog.includes(fixture.instId), false)
+    assert.equal(prepared.listRemovals.includes(fixture.instId), false)
+    assert.equal(prepared.series.some(item => item.key.startsWith(`${fixture.instId}:`)), false)
+    assert.equal(prepared.sources.some(item => item.key.startsWith(`${fixture.instId}:`)), false)
+    assert.equal(prepared.tasks.some(key => key.startsWith(`${fixture.instId}:`)), false)
+    assert.equal(prepared.queue.some(key => key.startsWith(`${fixture.instId}:`)), false)
+    assert.equal(history.activeHistory.some(item => item.instrument === fixture.instId), false)
+    assert.equal(history.tasks.some(item => item.instrument === fixture.instId), false)
+  }
+  const readRanges = async (fixture, held) => Promise.all(held.map(item => backendRequest({ e2e: {
+    action: item.source === 'candles' ? 'readCandles' : 'readStatistics', instrument: fixture.instId,
+    timeframe: fixture.timeframe, from: item.from, through: item.through,
+  } })))
+  await offscreenChartWindow(electron)
+  try {
+    const first = await install('15m'), firstHeld = await heldRequests(first)
+    const [removed, next] = await electron.evaluate(async () => Promise.all([
+      globalThis.__marketBackend.probe({ action: 'coldBoundaryRemove' }),
+      globalThis.__marketBackend.probe({ action: 'coldBoundaryInstall', timeframe: '1H', scenario: 'full-missing-window', sourceDelayMS: 1800 }),
+    ]))
+    assert.equal(removed.disposed.active, 0)
+    assert.equal(removed.disposed.pending, 0)
+    for (const item of removed.disposed.requests.filter(item => item.held)) {
+      assert.equal(item.completedAt, null)
+      assert.ok(Number.isFinite(item.failedAt), 'Held requests must be cancelled instead of released into a source write.')
+    }
+    await assertRetired(first)
+    const firstAfterRemoval = await readRanges(first, firstHeld)
+    assert.ok(firstAfterRemoval.every(rows => rows.length === 0), 'The held ranges must still be absent after disposal.')
+    const durableTail = await backendRequest({ e2e: { action: 'readCandles', instrument: first.instId,
+      timeframe: first.timeframe, from: first.end, through: first.end } })
+    assert.equal(durableTail.length, 1, 'Disposal must retain previously committed fixture facts.')
+    const nextHeld = await heldRequests(next)
+    // Installation itself must await the prior fixture even without an explicit remove.
+    await install('5m')
+    await assertRetired(next)
+    const nextAfterRemoval = await readRanges(next, nextHeld)
+    assert.ok(nextAfterRemoval.every(rows => rows.length === 0), 'Replacement must not release the old held ranges.')
+    await new Promise(resolve => setTimeout(resolve, 2200))
+    assert.deepEqual(await readRanges(first, firstHeld), firstAfterRemoval)
+    assert.deepEqual(await readRanges(next, nextHeld), nextAfterRemoval)
+    await assertRetired(first)
+    await assertRetired(next)
+    await offscreenChartWindow(electron)
+  } finally { await probe({ action: 'coldBoundaryRemove' }) }
+})
+
 test('sub-candle wheel frames move continuously while axes stay fixed and native bursts coalesce', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   const timeframe = '15m', interval = fixture.series[timeframe].intervalMS
