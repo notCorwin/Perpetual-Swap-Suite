@@ -39,6 +39,60 @@ export function assertScrollResponsiveness(report, { inputBudgetMS = 100, frameB
   }
 }
 
+// Renderer timestamps are performance.now() offsets; fixture timestamps use
+// the source worker's performance.timeOrigin + performance.now(). Convert
+// the renderer offsets to the same epoch before comparing the two domains.
+export function coldBoundaryTiming({ rendererTimeOrigin, approachInputAt, finalInputAt, firstTargetRAFAt, readyTargetRAFAt,
+  nearestStartedAt, nearestCompletedAt, preparedTargetAt }) {
+  const timestamps = { rendererTimeOrigin, approachInputAt, finalInputAt, firstTargetRAFAt, readyTargetRAFAt,
+    nearestStartedAt, nearestCompletedAt, preparedTargetAt }
+  for (const [name, value] of Object.entries(timestamps)) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) throw new TypeError(`${name} must be a finite nonnegative timestamp.`)
+  }
+  if (nearestStartedAt > nearestCompletedAt || nearestCompletedAt > preparedTargetAt
+    || approachInputAt > finalInputAt || finalInputAt > firstTargetRAFAt || firstTargetRAFAt > readyTargetRAFAt) {
+    throw new RangeError('Cold-boundary timestamps are out of order within a clock domain.')
+  }
+  const approachInputEpoch = rendererTimeOrigin + approachInputAt, finalInputEpoch = rendererTimeOrigin + finalInputAt
+  const firstTargetRAFEpoch = rendererTimeOrigin + firstTargetRAFAt, readyTargetRAFEpoch = rendererTimeOrigin + readyTargetRAFAt
+  if (![approachInputEpoch, finalInputEpoch, firstTargetRAFEpoch, readyTargetRAFEpoch].every(Number.isFinite)
+    || readyTargetRAFEpoch < nearestCompletedAt) throw new RangeError('Cold-boundary renderer and source timestamps are inconsistent.')
+  return {
+    clocks: { renderer: 'performance.now() offsets plus renderer performance.timeOrigin', source: 'worker performance.timeOrigin plus performance.now()' },
+    timestamps: { ...timestamps, approachInputEpoch, finalInputEpoch, firstTargetRAFEpoch, readyTargetRAFEpoch },
+    dataInputOrder: nearestCompletedAt < finalInputEpoch ? 'data-before-input' : nearestCompletedAt > finalInputEpoch ? 'input-before-data' : 'simultaneous',
+    preInputLeadMS: finalInputEpoch - nearestCompletedAt,
+    rawPageToFirstRAFMS: firstTargetRAFEpoch - nearestCompletedAt,
+    rawPageToReadyRAFMS: readyTargetRAFEpoch - nearestCompletedAt,
+    inputToFirstRAFMS: firstTargetRAFAt - finalInputAt,
+    inputToReadyRAFMS: readyTargetRAFAt - finalInputAt,
+    readyAfterPrerequisitesMS: readyTargetRAFEpoch - Math.max(nearestCompletedAt, finalInputEpoch),
+    preparedAfterSourceMS: preparedTargetAt - nearestCompletedAt,
+    preparedBeforeFinalInput: preparedTargetAt <= finalInputEpoch,
+  }
+}
+
+export function assertColdBoundaryTiming(timing) {
+  if (!Number.isFinite(timing?.readyAfterPrerequisitesMS) || timing.readyAfterPrerequisitesMS < 0
+    || timing.readyAfterPrerequisitesMS >= 1_000) throw new Error(`Cold ready RAF exceeded the 1000 ms post-prerequisite budget: ${timing?.readyAfterPrerequisitesMS} ms.`)
+  if (!Number.isFinite(timing.preparedAfterSourceMS) || timing.preparedAfterSourceMS < 0
+    || timing.preparedAfterSourceMS >= 1_000) throw new Error(`Cold prefetch preparation exceeded the 1000 ms source-to-prepared budget: ${timing.preparedAfterSourceMS} ms.`)
+  if (!timing.preparedBeforeFinalInput) throw new Error('No passive prepared-target history publication was observed before the final input; prefetch readiness cannot be established independently of demand.')
+}
+
+export function assertColdBoundaryResponsiveness({ approachLatency, finalLatency, sourcePhaseRAF, targetPhaseRAF }) {
+  assertScrollResponsiveness(approachLatency)
+  assertScrollResponsiveness(finalLatency)
+  if (!Number.isFinite(finalLatency.maxInputToRafSampleMS) || finalLatency.maxInputToRafSampleMS >= 100) {
+    throw new Error(`A boundary intent took ${finalLatency.maxInputToRafSampleMS} ms to reach its exact or coalesced chart target.`)
+  }
+  for (const [phase, report] of [['approach/source', sourcePhaseRAF], ['target-to-ready', targetPhaseRAF]]) {
+    if (!Number.isFinite(report?.maxGapMS) || report.maxGapMS < 0 || report.maxGapMS >= 100) {
+      throw new Error(`A ${phase} renderer RAF gap exceeded 100 ms: ${report?.maxGapMS} ms.`)
+    }
+  }
+}
+
 // The seeded warm fixture promises numeric source values for every populated
 // OI and Taker slot. This explicit contract catches missing data even if the
 // renderer marks those fields unobserved, while empty oracle slots stay null.

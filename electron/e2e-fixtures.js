@@ -366,7 +366,34 @@ export async function createChartColdBoundaryFixture(store, marketService, {
     initialHistoryBars, targetDistance, targetEnd, targetWindowStart, firstMissingEnd, sourceDelayMS, failNearestCandles,
     initiallyMissingViewportBars: scenario === 'full-missing-window' ? 96 : 1,
     series: { [timeframe]: { intervalMS, start, end, bars: barsWithIndicators(rows, intervalMS) } } }
-  return { fixture, read: () => ({ holding, active, maxActive, requests: requests.map(request => ({ ...request })) }),
+  // Observe only existing history publications. In particular, this listener
+  // never creates demand, queries storage, or schedules preparation itself.
+  const priceFields = ['open', 'high', 'low', 'close']
+  const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
+  let preparedTarget = null
+  const unsubscribe = scenario === 'single-missing-boundary' ? marketService.subscribePreparedCharts(frame => {
+    if (preparedTarget || frame?.instId !== instId || frame.timeframe !== timeframe || !Array.isArray(frame.bars) || frame.bars.length <= 96) return
+    const nearest = requests.find(request => request.source === 'candles' && request.through === firstMissingEnd && Number.isFinite(request.completedAt))
+    if (!nearest) return
+    // History frames are ordered, so find the target without scanning the
+    // entire resident reserve on every publication.
+    let low = 0, high = frame.bars.length
+    while (low < high) {
+      const middle = (low + high) >>> 1
+      if (frame.bars[middle].hour < targetWindowStart) low = middle + 1
+      else high = middle
+    }
+    if (low + 96 > frame.bars.length) return
+    for (let index = 0; index < 96; index += 1) {
+      const bar = frame.bars[low + index]
+      if (bar.hour !== targetWindowStart + index * intervalMS || !bar.confirmed || bar.priceComplete === false || !bar.indicatorsObserved
+        || !priceFields.every(field => Number.isFinite(bar[field]))
+        || !indicatorFields.every(field => Number.isFinite(bar[field]))) return
+    }
+    preparedTarget = { at: monotonicEpochNow(), sourceCompletedAt: nearest.completedAt, frameEndHour: frame.endHour,
+      historyBars: frame.bars.length, targetStart: targetWindowStart, targetEnd, generation: frame.generation, revision: frame.revision }
+  }) : () => {}
+  return { fixture, read: () => ({ holding, active, maxActive, sourceTimeOrigin: performance.timeOrigin, preparedTarget, requests: requests.map(request => ({ ...request })) }),
     release: () => { holding = false; release() },
-    remove: () => { holding = false; release(); marketService.get = original } }
+    remove: () => { holding = false; release(); unsubscribe(); marketService.get = original } }
 }

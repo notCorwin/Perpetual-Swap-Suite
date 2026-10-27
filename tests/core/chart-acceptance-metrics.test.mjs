@@ -8,7 +8,64 @@ test('a different native timeframe or instrument cannot acknowledge a scroll tar
     assert.equal(result[0].status, 'unaccounted')
   }
 })
-import { accountChartIntents, assertScrollResponsiveness, assertWarmStatistics, summarizeLatencySamples } from '../../scripts/chart-acceptance-metrics.mjs'
+import { accountChartIntents, assertColdBoundaryResponsiveness, assertColdBoundaryTiming, assertScrollResponsiveness, assertWarmStatistics, coldBoundaryTiming, summarizeLatencySamples } from '../../scripts/chart-acceptance-metrics.mjs'
+
+const coldTimes = () => ({ rendererTimeOrigin: 1_000_000, approachInputAt: 1_000, finalInputAt: 2_000,
+  firstTargetRAFAt: 2_020, readyTargetRAFAt: 2_080, nearestStartedAt: 1_000_500,
+  nearestCompletedAt: 1_000_700, preparedTargetAt: 1_000_750 })
+
+test('pre-intent lead is reported but is not charged to target response', () => {
+  const report = coldBoundaryTiming(coldTimes())
+  assert.equal(report.dataInputOrder, 'data-before-input')
+  assert.equal(report.preInputLeadMS, 1300)
+  assert.equal(report.rawPageToFirstRAFMS, 1320)
+  assert.equal(report.rawPageToReadyRAFMS, 1380)
+  assert.equal(report.readyAfterPrerequisitesMS, 80)
+  assert.equal(report.preparedAfterSourceMS, 50)
+  assert.doesNotThrow(() => assertColdBoundaryTiming(report))
+})
+
+test('data arriving after input makes the source completion the ready-response prerequisite', () => {
+  const report = coldBoundaryTiming({ ...coldTimes(), nearestStartedAt: 1_002_030, nearestCompletedAt: 1_002_050,
+    preparedTargetAt: 1_002_070, readyTargetRAFAt: 2_120 })
+  assert.equal(report.dataInputOrder, 'input-before-data')
+  assert.equal(report.preInputLeadMS, -50)
+  assert.equal(report.rawPageToFirstRAFMS, -30)
+  assert.equal(report.inputToReadyRAFMS, 120)
+  assert.equal(report.readyAfterPrerequisitesMS, 70)
+  assert.throws(() => assertColdBoundaryTiming(report), /prefetch readiness cannot be established independently of demand/)
+})
+
+test('post-prerequisite and source-to-prepared stalls each retain the strict 1000 ms budget', () => {
+  const readyStall = coldBoundaryTiming({ ...coldTimes(), readyTargetRAFAt: 3_000 })
+  assert.equal(readyStall.readyAfterPrerequisitesMS, 1000)
+  assert.throws(() => assertColdBoundaryTiming(readyStall), /ready RAF exceeded/)
+  const preparationStall = coldBoundaryTiming({ ...coldTimes(), nearestCompletedAt: 1_000_700, preparedTargetAt: 1_001_700 })
+  assert.equal(preparationStall.preparedAfterSourceMS, 1000)
+  assert.throws(() => assertColdBoundaryTiming(preparationStall), /prefetch preparation exceeded/)
+})
+
+test('cold timing rejects missing, nonfinite, negative, and out-of-order timestamps', () => {
+  for (const patch of [{ readyTargetRAFAt: undefined }, { finalInputAt: NaN }, { preparedTargetAt: Infinity },
+    { nearestStartedAt: -1 }, { nearestStartedAt: 1_000_701 }, { preparedTargetAt: 1_000_699 },
+    { finalInputAt: 999 }, { firstTargetRAFAt: 1_999 }, { readyTargetRAFAt: 2_019 },
+    { nearestCompletedAt: 1_002_081, preparedTargetAt: 1_002_082 }]) {
+    assert.throws(() => coldBoundaryTiming({ ...coldTimes(), ...patch }), /timestamp|out of order|inconsistent/i)
+  }
+  assert.throws(() => assertColdBoundaryTiming({ readyAfterPrerequisitesMS: NaN }), /ready RAF exceeded/)
+})
+
+test('cold responsiveness catches approach and source/target RAF stalls even when ready timing passes', () => {
+  const latency = { intentLatenciesMS: [20], unaccountedInputs: [], maxFrameGapMS: 25, maxInputToRafSampleMS: 20 }
+  const report = { approachLatency: latency, finalLatency: latency, sourcePhaseRAF: { maxGapMS: 25 }, targetPhaseRAF: { maxGapMS: 25 } }
+  assert.doesNotThrow(() => assertColdBoundaryTiming(coldBoundaryTiming(coldTimes())))
+  assert.doesNotThrow(() => assertColdBoundaryResponsiveness(report))
+  assert.throws(() => assertColdBoundaryResponsiveness({ ...report, approachLatency: { ...latency, intentLatenciesMS: [100] } }), /Scroll intent exceeded/)
+  assert.throws(() => assertColdBoundaryResponsiveness({ ...report, sourcePhaseRAF: { maxGapMS: 282 } }), /approach\/source renderer RAF gap/)
+  assert.throws(() => assertColdBoundaryResponsiveness({ ...report, targetPhaseRAF: { maxGapMS: 100 } }), /target-to-ready renderer RAF gap/)
+  assert.throws(() => assertColdBoundaryResponsiveness({ ...report, sourcePhaseRAF: { maxGapMS: NaN } }), /approach\/source renderer RAF gap/)
+  assert.throws(() => assertColdBoundaryResponsiveness({ ...report, sourcePhaseRAF: { maxGapMS: -1 } }), /approach\/source renderer RAF gap/)
+})
 
 test('RAF stalls fail even when the synthetic input loop resumes with fast responses', () => {
   const report = { intentLatenciesMS: [12, 15, 10], unaccountedInputs: [], maxFrameGapMS: 200 }

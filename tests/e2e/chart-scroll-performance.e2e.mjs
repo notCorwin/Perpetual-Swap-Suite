@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { _electron } from 'playwright'
 import {
-  installRequestProbe, measureLatencyCoveredPrefetch, measureMissingWindow, offscreenChartWindow, openChart, readRequestProbe, removeRequestProbe, resetRequestProbe,
+  installRequestProbe, measureLatencyCoveredPrefetch, measureMissingWindow, measureOffscreenColdBoundary, offscreenChartWindow, openChart, readRequestProbe, removeRequestProbe, resetRequestProbe,
   separateSourceMaintenance, waitForLocalHistory, waitForRendered, wheelBurst,
 } from '../../scripts/chart-acceptance.mjs'
 
@@ -27,6 +27,25 @@ async function waitForRequestQuiescence(timeoutMS = 5_000) {
   }
   throw new Error('Chart IPC and prepared-frame delivery did not settle.')
 }
+
+test('cold boundary witnesses prepared target history and validates its selected ready RAF', { timeout: 60_000 }, async context => {
+  const report = await measureOffscreenColdBoundary(electron, page)
+  context.diagnostic(`Cold boundary witness: ${JSON.stringify({ timing: report.coldTiming, preparedTarget: report.preparedTarget,
+    approach: report.approachLatency, sourcePhaseRAF: report.sourcePhaseRAF, targetPhaseRAF: report.targetPhaseRAF })}`)
+  assert.equal(report.preparedTarget.targetEnd, report.targetEnd)
+  assert.ok(report.preparedTarget.historyBars > 96)
+  assert.equal(report.coldTiming.preparedBeforeFinalInput, true, 'The witness must precede target demand.')
+  assert.equal(report.preparedTarget.sourceCompletedAt, report.coldTiming.timestamps.nearestCompletedAt)
+  assert.equal(report.observedFieldOracle.priceBars, 96)
+  assert.equal(report.observedFieldOracle.indicatorBars, 96)
+  assert.equal(report.inputBursts.length, 2)
+  assert.ok(report.observationSamples.length > 0)
+  assert.ok(report.observationSamples.every(sample => Number.isFinite(sample.at) && typeof sample.frame === 'boolean'))
+  for (const phase of [report.sourcePhaseRAF, report.targetPhaseRAF]) {
+    assert.ok(phase.samples.length > 0)
+    assert.ok(phase.samples.every(sample => [sample.at, sample.rafTimestamp, sample.previousRafTimestamp, sample.gapMS].every(Number.isFinite)))
+  }
+})
 
 before(async () => {
   userData = await mkdtemp(join(tmpdir(), 'perp-radar-chart-scroll-e2e-'))

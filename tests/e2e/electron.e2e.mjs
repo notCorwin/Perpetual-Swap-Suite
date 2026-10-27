@@ -420,6 +420,67 @@ test('the paint probe accepts an unchanged complete frame after deferred validat
   } finally { if (!report) await finishPaintProbe(page) }
 })
 
+test('the paint probe selects the first ready target RAF and retains its mutable data', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await openChart(page, fixture)
+  await page.waitForFunction(instId => {
+    const chart = document.querySelector(`[data-chart-inst="${instId}"]`), bars = chart?.__chartRenderedBars ?? chart?.__chartSnapshot?.bars
+    const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
+    return bars?.length === 96 && bars.every(bar => bar.indicatorsObserved && fields.every(field => Number.isFinite(bar[field])))
+  }, fixture.instId)
+  await startPaintProbe(page, fixture, { indicatorValidation: 'deferred-canonical' })
+  let report
+  try {
+    const sample = await page.evaluate(async instId => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`), probe = window.__chartPaintProbe
+      const originalSnapshot = chart.__chartSnapshot, originalBars = chart.__chartRenderedBars
+      const bars = (originalBars ?? originalSnapshot.bars).map(bar => ({ ...bar }))
+      const snapshot = { ...originalSnapshot, bars, priceState: 'ready', indicatorState: 'loading', priceStatus: { ...originalSnapshot.priceStatus } }
+      const expectedClose = bars[0].close, expectedEMA = bars[0].ema, expectedStatus = snapshot.priceStatus.state
+      const afterAt = performance.now()
+      try {
+        bars[0].ema = null; bars[0].indicatorsObserved = false
+        Object.defineProperty(chart, '__chartSnapshot', { configurable: true, value: snapshot })
+        Object.defineProperty(chart, '__chartRenderedBars', { configurable: true, value: bars })
+        chart.setAttribute('data-probe-paint-marker', 'not ready')
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+        const incompleteRAF = probe.observations.find(observation => observation.frame && observation.at >= afterAt && observation.bars?.[0].ema === null)
+        bars[0].ema = expectedEMA; bars[0].indicatorsObserved = true
+        const priceComplete = bars[0].priceComplete
+        bars[0].priceComplete = false
+        chart.setAttribute('data-probe-paint-marker', 'incomplete price')
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+        const incompletePriceRAF = probe.observations.find(observation => observation.frame && observation.at >= afterAt && observation.bars?.[0].priceComplete === false)
+        bars[0].priceComplete = priceComplete
+        chart.setAttribute('data-probe-paint-marker', 'ready')
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+        const readyRAF = probe.observations.find(observation => observation.frame && observation.at >= afterAt && observation.bars?.[0].ema === expectedEMA && observation.bars[0].priceComplete !== false)
+        bars[0].close += 100; snapshot.indicatorState = 'ready'; snapshot.priceStatus.state = 'error'
+        chart.setAttribute('data-probe-paint-marker', 'mutated after ready')
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+        return { afterAt, incompleteAt: incompleteRAF?.at, incompletePriceAt: incompletePriceRAF?.at, readyAt: readyRAF?.at, expectedClose, expectedEMA, expectedStatus,
+          observationsHaveEntryAndFrame: probe.observations.every(observation => Number.isFinite(observation.at) && typeof observation.frame === 'boolean') }
+      } finally {
+        Object.defineProperty(chart, '__chartSnapshot', { configurable: true, value: originalSnapshot })
+        Object.defineProperty(chart, '__chartRenderedBars', { configurable: true, value: originalBars })
+        chart.removeAttribute('data-probe-paint-marker')
+        await Promise.resolve()
+      }
+    }, fixture.instId)
+    report = await finishPaintProbe(page, { readyTarget: { instId: fixture.instId, timeframe: fixture.timeframe,
+      endHour: fixture.end, intervalMS: fixture.intervalMS, afterAt: sample.afterAt } })
+    assert.equal(sample.observationsHaveEntryAndFrame, true)
+    assert.ok(Number.isFinite(sample.incompleteAt) && sample.readyAt > sample.incompleteAt)
+    assert.ok(Number.isFinite(sample.incompletePriceAt) && sample.readyAt > sample.incompletePriceAt)
+    assert.equal(report.readyFrame.at, sample.readyAt, 'An earlier incomplete RAF must not be selected.')
+    assert.equal(report.readyFrame.frame, true)
+    assert.equal(report.readyFrame.bars[0].close, sample.expectedClose, 'Later mutation must not alter the selected ready bars.')
+    assert.equal(report.readyFrame.bars[0].ema, sample.expectedEMA)
+    assert.equal(report.readyFrame.snapshot.indicatorState, 'loading', 'Complete observed values determine readiness even before aggregate status catches up.')
+    assert.equal(report.readyFrame.snapshot.priceStatus.state, sample.expectedStatus, 'Later mutation must not alter the selected snapshot.')
+  } finally { if (!report) await finishPaintProbe(page) }
+})
+
 test('the paint probe retains geometry and metadata corruption without a new snapshot', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   await openChart(page, fixture)
