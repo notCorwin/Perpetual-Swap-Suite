@@ -10,9 +10,13 @@ import { offscreenChartWindow, selectTimeframe } from './chart-acceptance.mjs'
 import { requireForegroundTests } from '../electron/test-presentation.js'
 import { assessResourceBudgets, summarizeResourceDelivery } from './resource-acceptance.mjs'
 import { waitForAsyncCondition } from './async-readiness.mjs'
+import { startRendererDiagnostics } from './renderer-diagnostics.mjs'
 
-const { values } = parseArgs({ options: { offscreen: { type: 'boolean' }, ticks: { type: 'string' }, 'cadence-ms': { type: 'string' } } })
+const { values } = parseArgs({ options: { offscreen: { type: 'boolean' }, diagnostic: { type: 'boolean' }, ticks: { type: 'string' }, 'cadence-ms': { type: 'string' } } })
 const offscreen = values.offscreen === true
+const diagnosticDirectory = process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS
+if (diagnosticDirectory && !values.diagnostic) throw new Error('Normal resource acceptance rejects renderer profiling. Use --diagnostic only for a separate diagnostic run.')
+if (values.diagnostic && !diagnosticDirectory) throw new Error('--diagnostic requires PERPETUAL_SWAP_RENDERER_DIAGNOSTICS for its separate profile output.')
 const ticks = Number(values.ticks ?? 60), cadenceMS = Number(values['cadence-ms'] ?? 500)
 if (!Number.isSafeInteger(ticks) || ticks < 60 || ticks > 1200 || !Number.isSafeInteger(cadenceMS) || cadenceMS < 20 || cadenceMS > 2000) throw new Error('Resource workloads require 60–1200 ticks and a 20–2000 ms cadence.')
 if (!offscreen) requireForegroundTests()
@@ -21,11 +25,12 @@ const root = fileURLToPath(new URL('..', import.meta.url))
 const reportPath = resolve(root, process.env.PERPETUAL_SWAP_RESOURCE_REPORT ?? '.build/resource-benchmark.json')
 const userData = await mkdtemp(join(tmpdir(), 'perp-market-resources-'))
 const report = { generatedAt: new Date().toISOString(), mode: 'real Electron renderer, worker backend and SQLite; synthetic native intake',
+  diagnosticOnly: values.diagnostic === true,
   nativePresentationMeasured: false, timing: 'Scheduled synthetic input to SVG commit and next RAF opportunity; no native compositor presentation.',
   clock: 'Epoch-origin monotonic performance clocks for source schedule/receipt and renderer input/commit/RAF; 2 ms origin precision tolerance with raw clock deltas retained.',
   externalWebSocketTransportMeasured: false, externalNetworkMeasured: false, receiveToFrameBudgetMS: offscreen ? null : 100,
   samples: [], switches: [], history: [], memorySamples: [], viewIntents: [], outcome: 'running' }
-let electron, page, stopped = false
+let electron, page, stopDiagnostics, stopped = false
 const probe = input => electron.evaluate((_electron, value) => globalThis.__marketBackend.probe(value), input)
 
 try {
@@ -49,6 +54,7 @@ try {
   report.windowAvailableMS = Date.now() - launchedAt
   report.gpuFeatureStatus = await electron.evaluate(({ app }) => app.getGPUFeatureStatus())
   report.appMetricsAtStart = await electron.evaluate(({ app }) => app.getAppMetrics())
+  if (report.diagnosticOnly) stopDiagnostics = await startRendererDiagnostics(electron, page, diagnosticDirectory)
   await page.evaluate(() => {
     const state = window.__resourceScheduler = { timeOrigin: performance.timeOrigin, supportedEntryTypes: PerformanceObserver.supportedEntryTypes,
       phase: 'fixed-rate-intake', active: false, startedAt: null, endedAt: null,
@@ -294,7 +300,7 @@ try {
   assert.ok(report.switches.some(value => value.phase.includes('during fixed-rate')) && report.history.length === 2,
     'The workload must exercise selection and reversal while background writes and intake continue.')
   assert.deepEqual(report.acceptanceFailures, [], 'Resource performance budgets failed; all independent failures and samples are retained.')
-  report.outcome = 'passed'
+  report.outcome = report.diagnosticOnly ? 'diagnostic-passed' : 'passed'
 } catch (error) {
   report.outcome = 'failed'; report.error = error.stack ?? error.message
   if (page) {
@@ -311,6 +317,8 @@ try {
   process.exitCode = 1
 } finally {
   if (electron && !stopped) { try { report.final = await probe({ action: 'scaleStop' }) } catch {} }
+  try { await stopDiagnostics?.() }
+  catch (error) { report.diagnosticError = error.stack ?? error.message; report.outcome = 'failed'; process.exitCode = 1 }
   await mkdir(dirname(reportPath), { recursive: true })
   await writeFile(reportPath, JSON.stringify(report, null, 2))
   await electron?.close()

@@ -270,15 +270,12 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
     if (!(chart instanceof HTMLElement)) throw new Error('No chart surface to inspect.')
     const expectedTimeframe = chart.__chartSnapshot?.timeframe
     if (!series[expectedTimeframe]) throw new Error('The initial chart needs a known fixture timeframe.')
-    const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
-    const indicatorFields = fields.slice(4, -3), statisticFields = ['oi', 'buy', 'sell']
-    const curveFields = [...indicatorFields, 'oi'], expectedGeometry = new WeakMap()
-    const oracles = Object.fromEntries(Object.entries(series).map(([frame, entry]) => [frame, new Map(entry.bars.map(bar => [bar.hour, bar]))]))
+    const curveFields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
     const probe = {
-      instId, expectedTimeframe,
+      instId, expectedTimeframe, series, requireMatureData, requireWarmStatistics, indicatorValidation,
       active: true, frames: 0, pendingFrames: 0, paints: 0, minimumBars: Infinity, errors: [],
-      frameGaps: [], frameSamples: [], validationSamples: [], inputBursts: [], commits: [], requestCommits: [], pendingWindows: [], previousFrame: null, previousSnapshot: null, previousBars: null,
-      phase: 'initial', quality: [], known: new Map(), geometry: new Map(),
+      frameGaps: [], frameSamples: [], validationSamples: [], inputBursts: [], commits: [], requestCommits: [], pendingWindows: [], previousFrame: null,
+      phase: 'initial', quality: [], observations: [],
       raf: null, observer: null, schedulerObservers: [],
       scheduler: { counts: {}, entries: [], supportedEntryTypes: PerformanceObserver.supportedEntryTypes },
     }
@@ -288,182 +285,197 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
           probe.scheduler.counts[type] = (probe.scheduler.counts[type] ?? 0) + 1
           probe.scheduler.entries.push({ type, startTime: entry.startTime, duration: entry.duration,
             blockingDuration: entry.blockingDuration, renderStart: entry.renderStart, styleAndLayoutStart: entry.styleAndLayoutStart,
-            scripts: [...(entry.scripts ?? [])].slice(0, 5).map(script => ({ sourceURL: script.sourceURL, invoker: script.invoker,
+            scripts: [...(entry.scripts ?? [])].map(script => ({ sourceURL: script.sourceURL, invoker: script.invoker,
               invokerType: script.invokerType, duration: script.duration, forcedStyleAndLayoutDuration: script.forcedStyleAndLayoutDuration })) })
         }
-        probe.scheduler.entries = probe.scheduler.entries.slice(-50)
       }
       const observer = new PerformanceObserver(list => record(list.getEntries()))
       observer.observe({ type })
       probe.schedulerObservers.push({ observer, record })
     }
-    const fail = message => { if (probe.errors.length < 20) probe.errors.push(message) }
-    const validateSample = (frame, timestamp, sampledAt) => {
-      if (frame) {
-        probe.frames += 1
-        if (chart.dataset.chartLoading === 'true') probe.pendingFrames += 1
-        if (probe.previousFrame !== null) {
-          const gapMS = timestamp - probe.previousFrame
-          probe.frameGaps.push(gapMS)
-          probe.frameSamples.push({ at: sampledAt, gapMS })
-        }
-        probe.previousFrame = timestamp
+
+    // The store normally supplies frozen windows and bars. The live plot may
+    // use an unfrozen array of frozen bars, and negative fixtures may publish
+    // mutable objects. Preserve their observed values without freezing or
+    // modifying app data, and share each unchanged immutable capture.
+    const barCopies = new WeakMap(), barsCopies = new WeakMap(), snapshotCopies = new WeakMap()
+    const nestedSnapshotFields = ['bars', 'liveBar', 'priceStatus', 'oiStatus', 'takerStatus', 'indicatorStatus', 'sourceVersions']
+    const retainBar = bar => {
+      if (!bar || typeof bar !== 'object' || Object.isFrozen(bar)) return bar
+      const previous = barCopies.get(bar), keys = Object.keys(bar)
+      if (previous && keys.length === Object.keys(previous).length && keys.every(key => Object.is(bar[key], previous[key]))) return previous
+      const retained = Object.freeze({ ...bar })
+      barCopies.set(bar, retained)
+      return retained
+    }
+    const retainBars = bars => {
+      if (!Array.isArray(bars)) return bars
+      const entry = barsCopies.get(bars)
+      if (entry?.immutable) return entry.value
+      if (!entry && Object.isFrozen(bars) && bars.every(bar => !bar || typeof bar !== 'object' || Object.isFrozen(bar))) {
+        barsCopies.set(bars, { immutable: true, value: bars })
+        return bars
       }
-      const snapshot = chart.__chartSnapshot
-      const svg = chart.querySelector('svg[data-rendered-inst]')
-      if (!snapshot || !svg) { fail('The current chart SVG disappeared.'); return }
-      const { timeframe } = snapshot
-      const bars = chart.__chartRenderedBars ?? snapshot.bars
-      const requestedEnd = Number(chart.dataset.chartRequestedEnd)
-      if (Number.isFinite(requestedEnd) && requestedEnd > 0) {
-        const previous = probe.requestCommits.at(-1)
-        if (!previous || previous.end !== requestedEnd || previous.instId !== snapshot.instId || previous.timeframe !== timeframe) {
-          probe.requestCommits.push({ at: sampledAt, rafSampledAt: frame ? sampledAt : null,
-            end: requestedEnd, instId: snapshot.instId, timeframe })
-        } else if (frame && previous.rafSampledAt === null) previous.rafSampledAt = sampledAt
-      }
-      if (frame && chart.dataset.chartLoading === 'true' && probe.pendingWindows.length < 10) probe.pendingWindows.push({
-        at: sampledAt, end: snapshot.endHour, requestedEnd: chart.dataset.chartRequestedEnd, generation: snapshot.generation,
-        bars: bars?.length, indicatorState: snapshot.indicatorState, priceState: snapshot.priceState,
-        observedIndicators: bars?.filter(bar => bar.indicatorsObserved).length,
-      })
-      if (Array.isArray(bars)) {
-        if (Number(svg.dataset.renderedStart) !== bars[0]?.hour || Number(svg.dataset.renderedEnd) !== bars.at(-1)?.hour) fail('SVG labels and the drawn range disagree.')
-        if (Number(chart.dataset.chartStart) !== bars[0]?.hour || Number(chart.dataset.chartEnd) !== bars.at(-1)?.hour) fail('Header and actual plot refer to different ranges.')
-        const requestedEnd = Number(chart.dataset.chartRequestedEnd)
-        if (chart.dataset.chartLoading === 'false' && requestedEnd > 0 && requestedEnd !== snapshot.endHour) fail('The chart claims completion for a different requested range.')
-      }
-      // Plot geometry may change without a new snapshot (for example during
-      // an effect). Check actual paths before the immutable-snapshot shortcut.
-      if (Array.isArray(bars)) {
-        let expected = expectedGeometry.get(bars)
-        if (!expected || expected.intervalMS !== snapshot.intervalMS) {
-          const firstAtLeft = bars[0]?.hour === bars.at(-1)?.hour - 95 * snapshot.intervalMS
-          expected = { intervalMS: snapshot.intervalMS, curves: new Map(curveFields.map(field => {
-            const samples = bars.filter(bar => typeof bar[field] === 'number' && Number.isFinite(bar[field])).length
-            return [field, { samples, points: samples + (firstAtLeft && Number.isFinite(bars[0]?.[field]) ? 1 : 0) }]
-          })) }
-          expectedGeometry.set(bars, expected)
-        }
-        for (const field of curveFields) {
-          const path = svg.querySelector(`[data-chart-indicator="${field}"]`), d = path?.getAttribute('d') ?? ''
-          const previous = probe.geometry.get(field)
-          if (previous?.d === d && previous.expected === expected) continue
-          probe.geometry.set(field, { d, expected })
-          const { samples, points: expectedPoints } = expected.curves.get(field)
-          if (samples > 1 && !d) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} lost its ${field} SVG curve with ${samples} known samples.`)
-          const clipId = svg.querySelector('[data-chart-wheel-content]')?.parentElement?.getAttribute('clip-path')?.match(/#([^)]*)/)?.[1]
-          const clip = clipId ? svg.querySelector(`[id="${clipId}"] rect`) : null
-          const coordinates = [...d.matchAll(/[ML]([\d.e+-]+)[ ,]+([\d.e+-]+)/gi)].map(point => Number(point[1]))
-          if (clip) {
-            const left = Number(clip.getAttribute('x')), right = left + Number(clip.getAttribute('width'))
-            const inside = coordinates.filter(x => x >= left - .05 && x <= right + .05)
-            const padding = expectedPoints > samples && inside.some(x => Math.abs(x - left) <= .05) ? 1 : 0
-            if (inside.length !== samples + padding || coordinates.filter(x => x < left - .05).length > 1
-              || coordinates.filter(x => x > right + .05).length > 1) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.length} points; expected ${samples} visible samples and at most one adjacent sample per side.`)
-          } else if (coordinates.length !== expectedPoints) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.length} points for ${expectedPoints} known positions.`)
-          if (/NaN|Infinity|undefined/.test(d)) fail('Nonfinite SVG geometry.')
-        }
-        if (requireMatureData) {
-          for (const field of indicatorFields) if (!svg.querySelector(`[data-chart-indicator="${field}"]`)?.getAttribute('d')) fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} has no ${field} SVG curve for mature local history.`)
-          const expectsOI = bars.some(bar => Number.isFinite(oracles[timeframe]?.get(bar.hour)?.oi))
-          const expectsTaker = bars.some(bar => Number.isFinite(oracles[timeframe]?.get(bar.hour)?.buy) && Number.isFinite(oracles[timeframe]?.get(bar.hour)?.sell))
-          if ((requireWarmStatistics ? expectsOI : bars.some(bar => bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)))
-            && svg.querySelector('[data-chart-oi]')?.getAttribute('data-chart-oi') !== 'complete') fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} lost complete observed OI geometry.`)
-          if ((requireWarmStatistics ? expectsTaker : bars.some(bar => bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2)))
-            && svg.querySelector('[data-chart-taker]')?.getAttribute('data-chart-taker') !== 'complete') fail(`${probe.phase}: ${timeframe} ${snapshot.endHour} lost complete observed Taker geometry.`)
-        }
-      }
-      if (snapshot === probe.previousSnapshot && bars === probe.previousBars) {
-        if (frame && probe.commits.at(-1)?.rafSampledAt === null) probe.commits.at(-1).rafSampledAt = sampledAt
-        return
-      }
-      probe.previousSnapshot = snapshot
-      probe.previousBars = bars
-      probe.paints += 1
-      const intervalMS = series[timeframe]?.intervalMS
-      if (!Array.isArray(bars)) { fail('The rendered snapshot has no bars.'); return }
-      probe.minimumBars = Math.min(probe.minimumBars, bars.length)
-      // A mutation is a React commit; the following RAF callback samples that
-      // DOM state. This does not prove that Electron's compositor presented it.
-      probe.commits.push({ at: sampledAt, rafSampledAt: frame ? sampledAt : null, end: snapshot.endHour, instId: snapshot.instId, timeframe, phase: probe.phase })
-      probe.quality.push({ phase: probe.phase, end: snapshot.endHour, timeframe, indicators: bars.filter(bar => indicatorFields.every(field => Number.isFinite(bar[field]))).length,
-        oi: bars.filter(bar => Number.isFinite(bar.oi)).length, taker: bars.filter(bar => Number.isFinite(bar.buy) && Number.isFinite(bar.sell)).length })
-      if (bars.length !== 96) fail(`Rendered ${bars.length} bars for ${timeframe}.`)
-      if (snapshot.instId !== instId || svg.dataset.renderedInst !== instId) fail('Mixed instrument in the rendered surface.')
-      if (svg.dataset.renderedTimeframe !== timeframe) fail('SVG and snapshot timeframes disagree.')
+      const previous = entry?.value
+      let next = !previous || previous.length !== bars.length ? [] : null
       for (let index = 0; index < bars.length; index += 1) {
-        const bar = bars[index]
-        if (!bar.confirmed) continue // Forming values are checked against the live payload, independently of the closed-bar oracle.
-        const expected = oracles[timeframe]?.get(bar.hour)
-        if (!expected) { fail(`Unexpected ${timeframe} timestamp ${bar.hour}.`); continue }
-        if (index && bar.hour - bars[index - 1].hour !== intervalMS) fail(`Noncontiguous ${timeframe} candles at ${bar.hour}.`)
-        const key = `${timeframe}:${snapshot.generation}:${bar.hour}`, previous = probe.known.get(key)
-        const samePrice = previous && ['open', 'high', 'low', 'close'].every(field => previous[field] === bar[field])
-        if (samePrice) for (const field of [...indicatorFields, ...statisticFields]) {
-          if (Number.isFinite(previous[field]) && !Number.isFinite(bar[field])) fail(`${probe.phase}: ${key} downgraded previously drawn ${field} from ${previous[field]} to ${bar[field]} without a price change.`)
-        }
-        probe.known.set(key, { ...bar })
-        const expectedOI = Number.isFinite(expected.oi)
-        const expectedTaker = Number.isFinite(expected.buy) && Number.isFinite(expected.sell)
-        if (requireWarmStatistics && expectedOI && !(bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1))) fail(`${probe.phase}: ${key} has fixture-known OI but it is not observed in the warm-statistics contract.`)
-        if (requireWarmStatistics && expectedTaker && !(bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2))) fail(`${probe.phase}: ${key} has fixture-known Taker values but they are not observed in the warm-statistics contract.`)
-        if (!bar.indicatorsObserved) for (const field of indicatorFields) {
-          if (bar[field] !== null) fail(`${probe.phase}: ${key} retained ${field} without an observed calculation for its canonical generation.`)
-        }
-        for (const field of fields.filter(field => {
-          if (['open', 'high', 'low', 'close'].includes(field)) return true
-          if (field === 'oi') return (requireWarmStatistics && Number.isFinite(expected.oi))
-            || (bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1))
-          if (field === 'buy' || field === 'sell') return (requireWarmStatistics && Number.isFinite(expected[field]))
-            || (bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2))
-          if (requireMatureData && Number.isFinite(expected[field])) return true
-          return bar.indicatorsObserved
-        })) {
-          const actual = bar[field], wanted = expected[field]
-          // A new canonical prefix can legitimately change recursive values and
-          // its warmup boundary. Deferred mode checks exact local inputs after
-          // replay settles; it never substitutes the unseen provider archive.
-          if (indicatorValidation !== 'fixture' && indicatorFields.includes(field)) {
-            if (!Number.isFinite(actual) && !(indicatorValidation === 'deferred-canonical' && actual === null)) {
-              fail(`${probe.phase}: ${timeframe} ${bar.hour} ${field} retracted to ${actual} during prefix acquisition.`)
-            }
-            continue
-          }
-          if (wanted === null) {
-            if (actual !== null) fail(`${timeframe} ${bar.hour} ${field}: expected missing, got ${actual}.`)
-          } else if (typeof actual !== 'number' || !Number.isFinite(actual)
-            || Math.abs(actual - wanted) > Math.max(1, Math.abs(wanted)) * 1e-10) {
-            fail(`${timeframe} ${bar.hour} ${field}: expected ${wanted}, got ${actual}.`)
-          }
-        }
+        const bar = retainBar(bars[index])
+        if (!next && previous[index] !== bar) next = previous.slice(0, index)
+        if (next) next.push(bar)
       }
-      const oiCount = bars.filter(bar => bar.oi !== null).length
-      const takerCount = bars.filter(bar => bar.buy !== null && bar.sell !== null).length
-      const buyRectangles = bars.filter(bar => bar.buy !== null && bar.buy > 0).length
-      const sellRectangles = bars.filter(bar => bar.sell !== null && bar.sell > 0).length
-      if (Number(chart.dataset.chartOiSamples) !== oiCount || Number(chart.dataset.chartTakerSamples) !== takerCount) fail('Published statistics sample counts disagree with the actual snapshot.')
-      const oi = svg.querySelector('[data-chart-oi]')
-      const taker = svg.querySelector('[data-chart-taker]')
-      if (Number(oi?.getAttribute('data-chart-oi-samples')) !== oiCount) fail('The actual OI geometry does not cover the snapshot.')
-      if (Number(taker?.querySelector('[data-chart-taker-buy-samples]')?.getAttribute('data-chart-taker-buy-samples')) !== buyRectangles) fail('The actual Taker buy geometry does not cover the snapshot.')
-      if (Number(taker?.querySelector('[data-chart-taker-sell-samples]')?.getAttribute('data-chart-taker-sell-samples')) !== sellRectangles) fail('The actual Taker sell geometry does not cover the snapshot.')
-      for (const path of svg.querySelectorAll('path[d]')) if (/NaN|Infinity|undefined/.test(path.getAttribute('d'))) fail('Nonfinite SVG geometry.')
+      if (!next) return previous
+      const retained = Object.freeze(next)
+      barsCopies.set(bars, { immutable: false, value: retained })
+      return retained
     }
-    const sample = (frame = false, timestamp) => {
+    const retainSnapshot = snapshot => {
+      if (!snapshot || typeof snapshot !== 'object') return snapshot
+      const retainedFields = Object.fromEntries(nestedSnapshotFields.filter(field => Object.hasOwn(snapshot, field)).map(field => [field,
+        field === 'bars' ? retainBars(snapshot[field]) : retainBar(snapshot[field])]))
+      const keys = Object.keys(snapshot)
+      const retainedValue = field => Object.hasOwn(retainedFields, field) ? retainedFields[field] : snapshot[field]
+      if (Object.isFrozen(snapshot) && keys.every(field => Object.is(snapshot[field], retainedValue(field)))) return snapshot
+      const previous = snapshotCopies.get(snapshot)
+      if (previous && keys.length === Object.keys(previous).length && keys.every(field => Object.is(retainedValue(field), previous[field]))) return previous
+      const retained = Object.freeze({ ...snapshot, ...retainedFields })
+      snapshotCopies.set(snapshot, retained)
+      return retained
+    }
+    const shareRecord = (previous, current) => previous && Object.keys(current).every(key => Object.is(previous[key], current[key]))
+      ? previous : Object.freeze(current)
+    let lastSurface = null
+    const captureSurface = () => {
+      const previous = lastSurface
+      const status = chart.querySelector('[data-chart-status]')
+      const chartState = shareRecord(previous?.chart, {
+        instId: chart.dataset.chartInst, label: chart.getAttribute('aria-label'), start: chart.dataset.chartStart, end: chart.dataset.chartEnd,
+        completedEnd: chart.dataset.chartCompletedEnd, requestedEnd: chart.dataset.chartRequestedEnd, renderedBars: chart.dataset.chartRenderedBars,
+        targetBars: chart.dataset.chartTargetBars, loading: chart.dataset.chartLoading, visualStale: chart.dataset.chartVisualStale,
+        candleState: chart.dataset.chartCandleState, statisticsState: chart.dataset.chartStatisticsState, statisticsEnd: chart.dataset.chartStatisticsEnd,
+        oiState: chart.dataset.chartOiState, takerState: chart.dataset.chartTakerState, incomplete: chart.dataset.chartIncomplete,
+        oiSamples: chart.dataset.chartOiSamples, takerSamples: chart.dataset.chartTakerSamples,
+        indicatorState: status?.getAttribute('data-chart-indicator-state'), indicatorInput: status?.getAttribute('data-chart-indicator-input'), status: status?.textContent,
+      })
+      const svg = chart.querySelector('svg[data-rendered-inst]')
+      if (!svg) {
+        lastSurface = shareRecord(previous, { chart: chartState, svg: null })
+        return lastSurface
+      }
+      const previousSVG = previous?.svg
+      let curves = null
+      for (let index = 0; index < curveFields.length; index += 1) {
+        const d = svg.querySelector(`[data-chart-indicator="${curveFields[index]}"]`)?.getAttribute('d') ?? ''
+        if (!curves && (!previousSVG || previousSVG.curves[index] !== d)) curves = previousSVG ? previousSVG.curves.slice(0, index) : []
+        if (curves) curves.push(d)
+      }
+      curves = curves ? Object.freeze(curves) : previousSVG.curves
+      const paths = svg.querySelectorAll('path[d]')
+      let pathData = previousSVG?.pathData
+      let pathsChanged = !pathData || pathData.length !== paths.length
+      for (let index = 0; !pathsChanged && index < paths.length; index += 1) pathsChanged = paths[index].getAttribute('d') !== pathData[index]
+      if (pathsChanged) {
+        pathData = Object.freeze(Array.from(paths, path => path.getAttribute('d')))
+      }
+      const clipPath = svg.querySelector('[data-chart-wheel-content]')?.parentElement?.getAttribute('clip-path')
+      const hash = clipPath?.indexOf('#') ?? -1, close = hash < 0 ? -1 : clipPath.indexOf(')', hash)
+      const clipId = hash < 0 ? null : clipPath.slice(hash + 1, close < 0 ? undefined : close)
+      const clip = clipId ? svg.querySelector(`[id="${CSS.escape(clipId)}"] rect`) : null
+      const oi = svg.querySelector('[data-chart-oi]'), taker = svg.querySelector('[data-chart-taker]')
+      const svgState = shareRecord(previousSVG, {
+        instId: svg.dataset.renderedInst, timeframe: svg.dataset.renderedTimeframe, start: svg.dataset.renderedStart, end: svg.dataset.renderedEnd,
+        label: svg.getAttribute('aria-label'),
+        clipPath, hasClip: Boolean(clip), clipX: clip?.getAttribute('x'), clipWidth: clip?.getAttribute('width'), curves, pathData,
+        oi: oi?.getAttribute('data-chart-oi'), oiState: oi?.getAttribute('data-chart-oi-state'), oiSamples: oi?.getAttribute('data-chart-oi-samples'),
+        taker: taker?.getAttribute('data-chart-taker'), takerState: taker?.getAttribute('data-chart-taker-state'),
+        buySamples: taker?.querySelector('[data-chart-taker-buy-samples]')?.getAttribute('data-chart-taker-buy-samples'),
+        sellSamples: taker?.querySelector('[data-chart-taker-sell-samples]')?.getAttribute('data-chart-taker-sell-samples'),
+      })
+      lastSurface = shareRecord(previous, { chart: chartState, svg: svgState })
+      return lastSurface
+    }
+
+    let previousSnapshot = null, previousBars = null, previousRetainedSnapshot = null, previousRetainedBars = null
+    const sample = (frame, timestamp, sampledAt, dirty) => {
+      try {
+        if (frame) {
+          probe.frames += 1
+          if (chart.dataset.chartLoading === 'true') probe.pendingFrames += 1
+          if (probe.previousFrame !== null) {
+            const gapMS = timestamp - probe.previousFrame
+            probe.frameGaps.push(gapMS)
+            probe.frameSamples.push({ at: sampledAt, gapMS })
+          }
+          probe.previousFrame = timestamp
+        }
+        // A mutation queued by an earlier RAF callback must not be hidden by
+        // reuse of the previous surface. Mutation callbacks capture directly.
+        if (frame && probe.observer.takeRecords().length) dirty = true
+        const snapshot = chart.__chartSnapshot
+        const bars = chart.__chartRenderedBars ?? snapshot?.bars
+        const retainedSnapshot = retainSnapshot(snapshot), retainedBars = retainBars(bars)
+        const surface = dirty || !lastSurface || snapshot !== previousSnapshot || bars !== previousBars ? captureSurface() : lastSurface
+        const loading = surface.chart.loading === 'true'
+        let newPaint = false, pendingWindowIndex = null
+        if (snapshot && surface.svg) {
+          const { timeframe } = retainedSnapshot
+          const requestedEnd = Number(surface.chart.requestedEnd)
+          if (Number.isFinite(requestedEnd) && requestedEnd > 0) {
+            const previous = probe.requestCommits.at(-1)
+            if (!previous || previous.end !== requestedEnd || previous.instId !== retainedSnapshot.instId || previous.timeframe !== timeframe) {
+              probe.requestCommits.push({ at: sampledAt, rafSampledAt: frame ? sampledAt : null, end: requestedEnd, instId: retainedSnapshot.instId, timeframe })
+            } else if (frame && previous.rafSampledAt === null) previous.rafSampledAt = sampledAt
+          }
+          if (frame && loading && probe.pendingWindows.length < 10) {
+            pendingWindowIndex = probe.pendingWindows.length
+            probe.pendingWindows.push({ at: sampledAt, end: retainedSnapshot.endHour, requestedEnd: surface.chart.requestedEnd, generation: retainedSnapshot.generation,
+              bars: retainedBars?.length, indicatorState: retainedSnapshot.indicatorState, priceState: retainedSnapshot.priceState })
+          }
+          newPaint = snapshot !== previousSnapshot || bars !== previousBars || retainedSnapshot !== previousRetainedSnapshot || retainedBars !== previousRetainedBars
+          if (newPaint) {
+            previousSnapshot = snapshot; previousBars = bars
+            previousRetainedSnapshot = retainedSnapshot; previousRetainedBars = retainedBars
+            probe.paints += 1
+            if (Array.isArray(retainedBars)) {
+              probe.minimumBars = Math.min(probe.minimumBars, retainedBars.length)
+              // A mutation is a React commit; the following RAF samples the DOM.
+              // Neither timestamp asserts compositor presentation.
+              probe.commits.push({ at: sampledAt, rafSampledAt: frame ? sampledAt : null, end: retainedSnapshot.endHour,
+                instId: retainedSnapshot.instId, timeframe, phase: probe.phase })
+            }
+          } else if (frame && probe.commits.at(-1)?.rafSampledAt === null) probe.commits.at(-1).rafSampledAt = sampledAt
+        }
+        probe.observations.push({ snapshot: retainedSnapshot, bars: retainedBars, surface, phase: probe.phase, newPaint, pendingWindowIndex })
+      } catch (error) {
+        probe.errors.push(`${probe.phase}: Paint capture failed: ${error?.message ?? String(error)}`)
+        probe.observations.push({ captureFailure: true })
+      } finally {
+        // Keep the existing live diagnostics used by intent accounting. These
+        // samples now measure synchronous capture, never deferred validation.
+        probe.validationSamples.push({ at: sampledAt, durationMS: performance.now() - sampledAt })
+      }
+    }
+    probe.observer = new MutationObserver(() => {
       const sampledAt = performance.now()
-      try { validateSample(frame, timestamp ?? sampledAt, sampledAt) }
-      finally { probe.validationSamples.push({ at: sampledAt, durationMS: performance.now() - sampledAt }) }
-    }
-    probe.observer = new MutationObserver(() => sample())
-    probe.observer.observe(chart, { subtree: true, childList: true, attributes: true })
+      sample(false, sampledAt, sampledAt, true)
+    })
+    probe.observer.observe(chart, { subtree: true, childList: true, attributes: true, characterData: true })
     const frame = timestamp => {
+      const sampledAt = performance.now()
       if (!probe.active) return
-      sample(true, timestamp)
+      sample(true, timestamp, sampledAt, false)
       probe.raf = requestAnimationFrame(frame)
     }
-    sample()
+    const sampledAt = performance.now()
+    sample(false, sampledAt, sampledAt, true)
     probe.raf = requestAnimationFrame(frame)
+    // Expose the final pending mutation batch to finish without changing RAF
+    // or input timestamps.
+    probe.capturePending = () => {
+      const sampledAt = performance.now()
+      if (probe.observer.takeRecords().length) {
+        sample(false, sampledAt, sampledAt, true)
+      }
+    }
     window.__chartPaintProbe = probe
   }, { instId: fixture.instId, series: fixture.series, requireMatureData, requireWarmStatistics, indicatorValidation })
 }
@@ -472,10 +484,145 @@ export async function finishPaintProbe(page) {
   const report = await page.evaluate(() => {
     const probe = window.__chartPaintProbe
     if (!probe) throw new Error('No chart paint probe was installed.')
+    probe.capturePending()
     probe.active = false
     cancelAnimationFrame(probe.raf)
     probe.observer.disconnect()
     for (const { observer, record } of probe.schedulerObservers) { record(observer.takeRecords()); observer.disconnect() }
+
+    const validationStartedAt = performance.now()
+    const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
+    const indicatorFields = fields.slice(4, -3), statisticFields = ['oi', 'buy', 'sell'], curveFields = [...indicatorFields, 'oi']
+    const { instId, series, requireMatureData, requireWarmStatistics, indicatorValidation } = probe
+    const oracles = Object.fromEntries(Object.entries(series).map(([frame, entry]) => [frame, new Map(entry.bars.map(bar => [bar.hour, bar]))]))
+    const expectedGeometry = new WeakMap(), known = new Map(), seenErrors = new Set(probe.errors)
+    const fail = message => { if (!seenErrors.has(message)) { seenErrors.add(message); probe.errors.push(message) } }
+    let deferredValidationSamples = 0, failedCaptureSamples = 0
+    for (const { snapshot, bars, surface, phase, newPaint, pendingWindowIndex, captureFailure } of probe.observations) {
+      if (captureFailure) { failedCaptureSamples += 1; continue }
+      deferredValidationSamples += 1
+      try {
+        if (pendingWindowIndex !== null) probe.pendingWindows[pendingWindowIndex].observedIndicators = bars?.filter(bar => bar.indicatorsObserved).length
+        const chart = surface.chart, svg = surface.svg
+        if (!snapshot || !svg) { fail('The current chart SVG disappeared.'); continue }
+        const { timeframe } = snapshot
+        if (Array.isArray(bars)) {
+          if (Number(chart.renderedBars) !== bars.length || Number(chart.targetBars) !== 96) fail('Chart candle-count metadata disagrees with the actual snapshot.')
+          if (Number(svg.start) !== bars[0]?.hour || Number(svg.end) !== bars.at(-1)?.hour) fail('SVG labels and the drawn range disagree.')
+          if (Number(chart.start) !== bars[0]?.hour || Number(chart.end) !== bars.at(-1)?.hour) fail('Header and actual plot refer to different ranges.')
+          if (Number(chart.completedEnd) !== snapshot.endHour || Number(chart.statisticsEnd) !== snapshot.endHour) fail('Chart completed-range metadata disagrees with the snapshot.')
+          if (chart.label !== `${snapshot.instId} chart` || !svg.label?.startsWith(`${snapshot.instId} ${bars.length}-candle ${String(timeframe ?? '').toLowerCase()} chart.`)) fail('Chart labels disagree with the rendered snapshot.')
+          const requestedEnd = Number(chart.requestedEnd)
+          if (chart.loading === 'false' && requestedEnd > 0 && requestedEnd !== snapshot.endHour) fail('The chart claims completion for a different requested range.')
+          let expected = expectedGeometry.get(bars)
+          if (!expected || expected.intervalMS !== snapshot.intervalMS) {
+            const firstAtLeft = bars[0]?.hour === bars.at(-1)?.hour - 95 * snapshot.intervalMS
+            expected = { intervalMS: snapshot.intervalMS, curves: new Map(curveFields.map(field => {
+              const samples = bars.filter(bar => typeof bar[field] === 'number' && Number.isFinite(bar[field])).length
+              return [field, { samples, points: samples + (firstAtLeft && Number.isFinite(bars[0]?.[field]) ? 1 : 0) }]
+            })) }
+            expectedGeometry.set(bars, expected)
+          }
+          for (let index = 0; index < curveFields.length; index += 1) {
+            const field = curveFields[index], d = svg.curves[index]
+            const { samples, points: expectedPoints } = expected.curves.get(field)
+            if (samples > 1 && !d) fail(`${phase}: ${timeframe} ${snapshot.endHour} lost its ${field} SVG curve with ${samples} known samples.`)
+            const coordinates = [...d.matchAll(/[ML]([\d.e+-]+)[ ,]+([\d.e+-]+)/gi)].map(point => Number(point[1]))
+            if (svg.hasClip) {
+              const left = Number(svg.clipX), right = left + Number(svg.clipWidth)
+              const inside = coordinates.filter(x => x >= left - .05 && x <= right + .05)
+              const padding = expectedPoints > samples && inside.some(x => Math.abs(x - left) <= .05) ? 1 : 0
+              if (inside.length !== samples + padding || coordinates.filter(x => x < left - .05).length > 1
+                || coordinates.filter(x => x > right + .05).length > 1) fail(`${phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.length} points; expected ${samples} visible samples and at most one adjacent sample per side.`)
+            } else if (coordinates.length !== expectedPoints) fail(`${phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.length} points for ${expectedPoints} known positions.`)
+            if (/NaN|Infinity|undefined/.test(d)) fail('Nonfinite SVG geometry.')
+          }
+          if (requireMatureData) {
+            for (let index = 0; index < indicatorFields.length; index += 1) if (!svg.curves[index]) fail(`${phase}: ${timeframe} ${snapshot.endHour} has no ${indicatorFields[index]} SVG curve for mature local history.`)
+            const expectsOI = bars.some(bar => Number.isFinite(oracles[timeframe]?.get(bar.hour)?.oi))
+            const expectsTaker = bars.some(bar => Number.isFinite(oracles[timeframe]?.get(bar.hour)?.buy) && Number.isFinite(oracles[timeframe]?.get(bar.hour)?.sell))
+            if ((requireWarmStatistics ? expectsOI : bars.some(bar => bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)))
+              && svg.oi !== 'complete') fail(`${phase}: ${timeframe} ${snapshot.endHour} lost complete observed OI geometry.`)
+            if ((requireWarmStatistics ? expectsTaker : bars.some(bar => bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2)))
+              && svg.taker !== 'complete') fail(`${phase}: ${timeframe} ${snapshot.endHour} lost complete observed Taker geometry.`)
+          }
+          const oiCount = bars.filter(bar => bar.oi !== null).length
+          const takerCount = bars.filter(bar => bar.buy !== null && bar.sell !== null).length
+          const buyRectangles = bars.filter(bar => bar.buy !== null && bar.buy > 0).length
+          const sellRectangles = bars.filter(bar => bar.sell !== null && bar.sell > 0).length
+          if (Number(chart.oiSamples) !== oiCount || Number(chart.takerSamples) !== takerCount) fail('Published statistics sample counts disagree with the actual snapshot.')
+          if (Number(svg.oiSamples) !== oiCount) fail('The actual OI geometry does not cover the snapshot.')
+          if (Number(svg.buySamples) !== buyRectangles) fail('The actual Taker buy geometry does not cover the snapshot.')
+          if (Number(svg.sellSamples) !== sellRectangles) fail('The actual Taker sell geometry does not cover the snapshot.')
+        }
+        if (snapshot.instId !== instId || chart.instId !== instId || svg.instId !== instId) fail('Mixed instrument in the rendered surface.')
+        if (svg.timeframe !== timeframe) fail('SVG and snapshot timeframes disagree.')
+        const oiState = snapshot.oiState ?? 'ready', takerState = snapshot.takerState ?? 'ready', priceState = snapshot.priceState ?? 'loading'
+        const statisticsState = oiState === 'error' || takerState === 'error' ? 'error' : oiState === 'loading' || takerState === 'loading' ? 'loading'
+          : oiState === 'unavailable' || takerState === 'unavailable' ? 'unavailable' : 'ready'
+        const incomplete = priceState !== 'ready' || snapshot.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready'
+        if (chart.candleState !== priceState || chart.indicatorState !== (snapshot.indicatorState ?? null)
+          || chart.indicatorInput !== (snapshot.indicatorStatus?.inputVersion ?? null)
+          || chart.oiState !== oiState || chart.takerState !== takerState || chart.statisticsState !== statisticsState
+          || chart.incomplete !== String(incomplete) || svg.oiState !== oiState || svg.takerState !== takerState) fail('Published source states disagree with the snapshot.')
+        for (const d of svg.pathData) if (/NaN|Infinity|undefined/.test(d)) fail('Nonfinite SVG geometry.')
+        if (!newPaint) continue
+        if (!Array.isArray(bars)) { fail('The rendered snapshot has no bars.'); continue }
+        probe.quality.push({ phase, end: snapshot.endHour, timeframe, indicators: bars.filter(bar => indicatorFields.every(field => Number.isFinite(bar[field]))).length,
+          oi: bars.filter(bar => Number.isFinite(bar.oi)).length, taker: bars.filter(bar => Number.isFinite(bar.buy) && Number.isFinite(bar.sell)).length })
+        if (bars.length !== 96) fail(`Rendered ${bars.length} bars for ${timeframe}.`)
+        const intervalMS = series[timeframe]?.intervalMS
+        for (let index = 0; index < bars.length; index += 1) {
+          const bar = bars[index]
+          if (!bar.confirmed) continue // Forming values are checked against the live payload, independently of the closed-bar oracle.
+          const expected = oracles[timeframe]?.get(bar.hour)
+          if (!expected) { fail(`Unexpected ${timeframe} timestamp ${bar.hour}.`); continue }
+          if (index && bar.hour - bars[index - 1].hour !== intervalMS) fail(`Noncontiguous ${timeframe} candles at ${bar.hour}.`)
+          const key = `${timeframe}:${snapshot.generation}:${bar.hour}`, previous = known.get(key)
+          const samePrice = previous && ['open', 'high', 'low', 'close'].every(field => previous[field] === bar[field])
+          if (samePrice) for (const field of [...indicatorFields, ...statisticFields]) {
+            if (Number.isFinite(previous[field]) && !Number.isFinite(bar[field])) fail(`${phase}: ${key} downgraded previously drawn ${field} from ${previous[field]} to ${bar[field]} without a price change.`)
+          }
+          known.set(key, { ...bar })
+          const expectedOI = Number.isFinite(expected.oi)
+          const expectedTaker = Number.isFinite(expected.buy) && Number.isFinite(expected.sell)
+          if (requireWarmStatistics && expectedOI && !(bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1))) fail(`${phase}: ${key} has fixture-known OI but it is not observed in the warm-statistics contract.`)
+          if (requireWarmStatistics && expectedTaker && !(bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2))) fail(`${phase}: ${key} has fixture-known Taker values but they are not observed in the warm-statistics contract.`)
+          if (!bar.indicatorsObserved) for (const field of indicatorFields) {
+            if (bar[field] !== null) fail(`${phase}: ${key} retained ${field} without an observed calculation for its canonical generation.`)
+          }
+          for (const field of fields.filter(field => {
+            if (['open', 'high', 'low', 'close'].includes(field)) return true
+            if (field === 'oi') return (requireWarmStatistics && Number.isFinite(expected.oi))
+              || (bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1))
+            if (field === 'buy' || field === 'sell') return (requireWarmStatistics && Number.isFinite(expected[field]))
+              || (bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2))
+            if (requireMatureData && Number.isFinite(expected[field])) return true
+            return bar.indicatorsObserved
+          })) {
+            const actual = bar[field], wanted = expected[field]
+            // A new canonical prefix can legitimately change recursive values and
+            // its warmup boundary. Deferred mode checks exact local inputs after
+            // replay settles; it never substitutes the unseen provider archive.
+            if (indicatorValidation !== 'fixture' && indicatorFields.includes(field)) {
+              if (!Number.isFinite(actual) && !(indicatorValidation === 'deferred-canonical' && actual === null)) {
+                fail(`${phase}: ${timeframe} ${bar.hour} ${field} retracted to ${actual} during prefix acquisition.`)
+              }
+              continue
+            }
+            if (wanted === null) {
+              if (actual !== null) fail(`${timeframe} ${bar.hour} ${field}: expected missing, got ${actual}.`)
+            } else if (typeof actual !== 'number' || !Number.isFinite(actual)
+              || Math.abs(actual - wanted) > Math.max(1, Math.abs(wanted)) * 1e-10) {
+              fail(`${timeframe} ${bar.hour} ${field}: expected ${wanted}, got ${actual}.`)
+            }
+          }
+        }
+      } catch (error) {
+        fail(`${phase}: Paint validation failed: ${error?.message ?? String(error)}`)
+      }
+    }
+    const deferredValidationMS = performance.now() - validationStartedAt
     delete window.__chartPaintProbe
     return {
       frames: probe.frames, pendingFrames: probe.pendingFrames, pendingWindows: probe.pendingWindows, paints: probe.paints, minimumBars: probe.minimumBars,
@@ -485,18 +632,21 @@ export async function finishPaintProbe(page) {
       probeValidationSamples: probe.validationSamples.length,
       totalProbeValidationMS: Number(probe.validationSamples.reduce((sum, sample) => sum + sample.durationMS, 0).toFixed(3)),
       validationDurations: probe.validationSamples.map(sample => sample.durationMS),
+      deferredValidationSamples, failedCaptureSamples, totalDeferredValidationMS: Number(deferredValidationMS.toFixed(3)),
     }
   })
   const frameGaps = summarizeLatencySamples(report.frameGaps)
-  const validation = summarizeLatencySamples(report.validationDurations)
+  const capture = summarizeLatencySamples(report.validationDurations)
   delete report.frameGaps
   delete report.validationDurations
   return { ...report, rafSampleCount: report.frames,
     p95FrameGapMS: frameGaps.p95MS, maxFrameGapMS: frameGaps.maxMS,
     p95FrameGapSampleCount: frameGaps.sampleCount, p95FrameGapSampleMinimum: frameGaps.p95SampleMinimum,
     p99FrameGapMS: frameGaps.p99MS, p99FrameGapSampleMinimum: frameGaps.p99SampleMinimum,
-    p95ProbeValidationMS: validation.p95MS, maxProbeValidationMS: validation.maxMS,
-    p95ProbeValidationSampleMinimum: validation.p95SampleMinimum }
+    p95ProbeValidationMS: capture.p95MS, maxProbeValidationMS: capture.maxMS,
+    p95ProbeValidationSampleMinimum: capture.p95SampleMinimum,
+    probeCaptureSamples: report.probeValidationSamples, totalProbeCaptureMS: report.totalProbeValidationMS,
+    p95ProbeCaptureMS: capture.p95MS, maxProbeCaptureMS: capture.maxMS }
 }
 
 export function assertCompletePaints(report) {
@@ -598,6 +748,10 @@ export async function measureChartIntentLatency(page, { inputs, targets, require
       totalProbeValidationMS: Number(validation.reduce((sum, duration) => sum + duration, 0).toFixed(3)),
       p95ProbeValidationMS: validationSummary.p95MS, p95ProbeValidationSampleMinimum: validationSummary.p95SampleMinimum,
       maxProbeValidationMS: validationSummary.maxMS,
+      probeMeasurement: 'Synchronous state capture; correctness validation runs after input timing.',
+      probeCaptureSamples: validation.length,
+      totalProbeCaptureMS: Number(validation.reduce((sum, duration) => sum + duration, 0).toFixed(3)),
+      p95ProbeCaptureMS: validationSummary.p95MS, maxProbeCaptureMS: validationSummary.maxMS,
   }
   if (report.unaccountedInputs.length) {
     throw new Error(`Chart intents disappeared without a committed target or coalescing successor: ${JSON.stringify(report.unaccountedInputs)}`)

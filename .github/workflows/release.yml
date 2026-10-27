@@ -61,12 +61,21 @@ jobs:
           node scripts/build-artifact-reuse.mjs verify --manifest artifacts/build/renderer.json
           npm run sandbox -- command --desktop --output artifacts/sandbox -- node scripts/workspace-visual-check.mjs
       - name: Verify short full-market intake under held statistics and archive writes
+        id: resource-gate
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         env:
           PERPETUAL_SWAP_RESOURCE_REPORT: artifacts/market-resources.json
         run: |
           node scripts/build-artifact-reuse.mjs verify --manifest artifacts/build/renderer.json
           npm run sandbox -- command --desktop --foreground --output artifacts/sandbox -- node scripts/market-resource-benchmark.mjs
+      - name: Collect separate profiles after resource acceptance failure
+        if: ${{ !cancelled() && steps.resource-gate.outcome == 'failure' }}
+        env:
+          PERPETUAL_SWAP_RESOURCE_REPORT: artifacts/market-resources-diagnostic.json
+          PERPETUAL_SWAP_RENDERER_DIAGNOSTICS: artifacts/market-resource-diagnostic-profile
+        run: |
+          node scripts/build-artifact-reuse.mjs verify --manifest artifacts/build/renderer.json
+          npm run sandbox -- command --desktop --foreground --output artifacts/diagnostic-sandbox -- node scripts/market-resource-benchmark.mjs --diagnostic
       - name: Enforce paired operation recording overhead budgets
         # Keep this independent gate collecting its own evidence after an
         # earlier acceptance failure. Its isolated pairs preserve the baseline.
@@ -214,7 +223,7 @@ jobs:
           PERPETUAL_SWAP_RENDERER_DIAGNOSTICS: artifacts/market-traffic-diagnostic-profile
         run: |
           node scripts/build-artifact-reuse.mjs verify --manifest artifacts/build/renderer.json
-          npm run sandbox -- command --desktop --foreground --output artifacts/sandbox -- node scripts/market-traffic-benchmark.mjs --expect-optimized --foreground --output artifacts/market-traffic-diagnostic.json
+          npm run sandbox -- command --desktop --foreground --output artifacts/sandbox -- node scripts/market-traffic-benchmark.mjs --diagnostic --expect-optimized --foreground --output artifacts/market-traffic-diagnostic.json
       - name: Retain current-version traffic and timing diagnostics
         if: always()
         uses: actions/upload-artifact@v7

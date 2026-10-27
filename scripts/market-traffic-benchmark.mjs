@@ -19,11 +19,14 @@ const { values } = parseArgs({
     'app-root': { type: 'string' }, output: { type: 'string' },
     'candidate-count': { type: 'string' }, 'passing-count': { type: 'string' },
     'spread-failure-count': { type: 'string' }, 'duration-seconds': { type: 'string' }, 'cadence-ms': { type: 'string' },
-    'expect-optimized': { type: 'boolean' }, foreground: { type: 'boolean' },
+    'expect-optimized': { type: 'boolean' }, foreground: { type: 'boolean' }, diagnostic: { type: 'boolean' },
     'wait-ready': { type: 'boolean' }, 'baseline-report': { type: 'string' },
   },
   allowPositionals: false,
 })
+const diagnosticDirectory = process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS
+if (diagnosticDirectory && !values.diagnostic) throw new Error('Normal traffic acceptance rejects renderer profiling. Use --diagnostic only for a separate diagnostic run.')
+if (values.diagnostic && !diagnosticDirectory) throw new Error('--diagnostic requires PERPETUAL_SWAP_RENDERER_DIAGNOSTICS for its separate profile output.')
 
 const numberOption = (name, fallback) => {
   const value = Number(values[name] ?? fallback)
@@ -38,6 +41,7 @@ const cadenceMS = numberOption('cadence-ms', 500)
 const expectOptimized = values['expect-optimized'] === true
 const foreground = values.foreground === true
 const baselineReportPath = values['baseline-report'] ? resolve(values['baseline-report']) : null
+if (values.diagnostic && baselineReportPath) throw new Error('Diagnostic profiling cannot be compared with an acceptance baseline.')
 const waitReady = foreground || values['wait-ready'] === true
 const searchEventCount = (passingCount + 1) * (foreground ? Math.ceil(21 / (passingCount + 1)) : 1)
 const searchScenario = foreground ? { version: 'distributed-input-v1', eventCount: searchEventCount,
@@ -322,7 +326,7 @@ try {
     optimizedDemand.candle15mCount = expectedSubscriptions.candle15m.length
     optimizedDemand.candle1HCount = expectedSubscriptions.candle1H.length
   }
-  if (process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS) stopDiagnostics = await startRendererDiagnostics(electron, page, process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS)
+  if (values.diagnostic) stopDiagnostics = await startRendererDiagnostics(electron, page, diagnosticDirectory)
   const sampleWindow = await fixture.beginSample()
   const sampleStartedAt = sampleWindow.startedAt
   await page.evaluate(({ requireForeground, passingIDs }) => {
@@ -377,7 +381,7 @@ try {
   const traffic = fixture.endSample()
   failureMeasurements = {
     schemaVersion: 1, mode: benchmarkMode, partial: true, generatedAt: new Date().toISOString(),
-    diagnosticOnly: Boolean(stopDiagnostics),
+    diagnosticOnly: values.diagnostic === true,
     app: { path: app.selected, entry: app.entry, build: target, checkout },
     runtime: { ...runtime, testPresentation: runtime.testPresentation, presentation,
       network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' },
@@ -467,7 +471,7 @@ try {
     schemaVersion: 1,
     mode: benchmarkMode,
     generatedAt: new Date().toISOString(),
-    diagnosticOnly: Boolean(stopDiagnostics),
+    diagnosticOnly: values.diagnostic === true,
     app: { path: app.selected, entry: app.entry, build: target, checkout },
     runtime: { ...runtime, testPresentation: runtime.testPresentation, presentation,
       network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' },
@@ -513,7 +517,7 @@ try {
     }
   }
   await writeFile(output, `${JSON.stringify(report, null, 2)}\n`)
-  console.log(JSON.stringify({ report: output, diagnosticOnly: Boolean(stopDiagnostics), candidates: candidateCount, qualified: passingCount,
+  console.log(JSON.stringify({ report: output, diagnosticOnly: values.diagnostic === true, candidates: candidateCount, qualified: passingCount,
     completeRounds: receiptEvidence.fixtureRounds.length, matchedPayloads: receiptEvidence.fixtureEvents.length,
     maximumSendToCallbackAcceptanceMS: receiptEvidence.aggregateLatenciesUS.fixtureSendToCallbackAcceptance.maximumUS / 1_000,
     totalPayloadBytes: report.traffic.totalPayloadBytes }, null, 2))

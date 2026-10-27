@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { after, before, test } from 'node:test'
+import { after, afterEach, before, beforeEach, test } from 'node:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -14,7 +14,7 @@ requireForegroundTests()
 // window can suspend its animation frames, so functional tests use another app.
 const root = new URL('../..', import.meta.url).pathname
 const userData = await mkdtemp(join(tmpdir(), 'perp-chart-paint-e2e-'))
-let electron, page
+let electron, page, stopDiagnostics
 const request = value => page.evaluate(value => window.radarDesktop.request(value), value)
 
 before(async () => {
@@ -27,6 +27,15 @@ before(async () => {
       PERPETUAL_SWAP_E2E_LIVE_REFRESH: '0', PERPETUAL_SWAP_USER_DATA: userData } })
   page = await electron.firstWindow()
   await page.waitForLoadState('domcontentloaded')
+})
+beforeEach(async context => {
+  if (process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS) stopDiagnostics = await startRendererDiagnostics(electron, page,
+    join(process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS, 'chart-paint', context.name.replace(/[^a-z0-9]+/gi, '-')))
+})
+afterEach(async () => {
+  const stop = stopDiagnostics
+  stopDiagnostics = undefined
+  await stop?.()
 })
 after(async () => {
   try { await electron?.close() }
@@ -55,8 +64,6 @@ test('bulk-warmed history updates every renderer target within 100 ms during scr
       warmedHistory.set(timeframe, await waitForLocalHistory(electron, page, fixture, timeframe, { requireIndicators: true }))
     }
     context.diagnostic(`Resident history before stalls: ${JSON.stringify(Object.fromEntries(warmedHistory))}`)
-    if (process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS) context.after(await startRendererDiagnostics(electron, page,
-      join(process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS, 'resident-scroll')))
     await electron.evaluate(async () => {
       globalThis.__chartRequestProbe.holdHistorical = true
       globalThis.__chartRequestProbe.holdLocal = true
