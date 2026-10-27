@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
 import { requireForegroundTests } from '../../electron/test-presentation.js'
+import { startRendererDiagnostics } from '../../scripts/renderer-diagnostics.mjs'
 import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureMissingWindow, measureNativeColdBoundary, measureChartIntentLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
 
 requireForegroundTests()
@@ -54,6 +55,8 @@ test('bulk-warmed history updates every renderer target within 100 ms during scr
       warmedHistory.set(timeframe, await waitForLocalHistory(electron, page, fixture, timeframe, { requireIndicators: true }))
     }
     context.diagnostic(`Resident history before stalls: ${JSON.stringify(Object.fromEntries(warmedHistory))}`)
+    if (process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS) context.after(await startRendererDiagnostics(electron, page,
+      join(process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS, 'resident-scroll')))
     await electron.evaluate(async () => {
       globalThis.__chartRequestProbe.holdHistorical = true
       globalThis.__chartRequestProbe.holdLocal = true

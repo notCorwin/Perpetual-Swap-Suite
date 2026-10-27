@@ -3,6 +3,7 @@ import test from 'node:test'
 import type { Bar, PreparedChartBar, PreparedChartLiveUpdate, PreparedChartResponse } from './chart-data.ts'
 import { PreparedChartStore } from './chart-series-store.ts'
 import { timeframeMilliseconds } from './timeframe.ts'
+import { attachOperationSink, type OperationEvent } from '../electron/services/operations.js'
 
 const hour = 3_600_000
 const instId = 'BTC-USDT-SWAP'
@@ -19,6 +20,32 @@ const response = (values: PreparedChartBar[], overrides: Partial<PreparedChartRe
   endHour: values.at(-1)?.hour ?? null, latestEnd: values.at(-1)?.hour ?? null,
   oldestHour: values[0]?.hour ?? null, historyExhausted: false, bars: values,
   oiState: 'ready', takerState: 'ready', indicatorState: 'ready', error: '', ...overrides,
+})
+
+test('resident window projection is reused until canonical bars or source metadata change', () => {
+  const store = new PreparedChartStore(), events: OperationEvent[] = []
+  store.ingest(response(bars(0, 400)))
+  const stop = attachOperationSink(event => { if (event.name === 'chart.window.project') events.push(event) })
+  try {
+    const first = store.window(instId, '1H', 300 * hour)!
+    for (let index = 0; index < 32; index++) assert.equal(store.window(instId, '1H', 300 * hour), first)
+    assert.equal(events.length, 1, 'Unchanged navigation must not repeat the 96-slot projection or source checks.')
+
+    store.ingest(response([bar(250, hour, { close: 102 })], { revision: 2, latestEnd: 399 * hour }))
+    const corrected = store.window(instId, '1H', 300 * hour)!
+    assert.equal(corrected.bars.find(value => value.hour === 250 * hour)!.close, 102)
+    assert.equal(first.bars.find(value => value.hour === 250 * hour)!.close, 101)
+    assert.equal(events.length, 2)
+
+    store.ingest(response([], { revision: 3, endHour: 300 * hour, latestEnd: 399 * hour, realtimeState: 'live', priceObservedAt: 1_800_000_000_000 }))
+    const refreshed = store.window(instId, '1H', 300 * hour)!
+    assert.equal(refreshed.realtimeState, 'live')
+    assert.equal(refreshed.priceObservedAt, 1_800_000_000_000)
+    assert.equal(refreshed.bars, corrected.bars, 'Metadata changes preserve canonical bar identity.')
+    assert.equal(events.length, 3)
+    assert.equal(store.window(instId, '1H', 300 * hour), refreshed)
+    assert.equal(events.length, 3)
+  } finally { stop() }
 })
 
 test('partial price windows render independently of unknown indicators and statistics', () => {

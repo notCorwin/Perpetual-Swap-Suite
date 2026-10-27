@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { _electron } from 'playwright'
 import { summarizeLatencySamples } from '../../scripts/chart-acceptance-metrics.mjs'
+import { startRendererDiagnostics } from '../../scripts/renderer-diagnostics.mjs'
 import {
   assertNavigationFrames, exerciseInstrumentNavigation, finishNavigationFrameProbe, installNavigationProbe,
   measureNavigation, persistNavigationCatalog, removeNavigationProbe, selectionRequests,
@@ -107,6 +108,8 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
     if (presentation === 'foreground') assert.ok(startup.inputToSVGCommitMS <= 50,
       `The warm startup selection blocked native foreground input for ${startup.inputToSVGCommitMS} ms: ${JSON.stringify(startup)}`)
     await installNavigationProbe(electron)
+    if (process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS) context.after(await startRendererDiagnostics(electron, page,
+      join(process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS, 'restart-navigation')))
     const report = await exerciseInstrumentNavigation(electron, page, fixture, { holdHistory: false, presentation })
     assert.equal(report.phases.length, 3)
     assert.equal(report.initialPreparation.readyFrameCount, fixture.instIds.length * 3)

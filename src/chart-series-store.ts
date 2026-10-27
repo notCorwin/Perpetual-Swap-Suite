@@ -1,4 +1,4 @@
-import { hookOperationMethods } from '../electron/services/operations.js'
+import { hookOperationMethods, measureOperation } from '../electron/services/operations.js'
 import { completeChartPriceRange } from './chart-data.ts'
 import type { Bar, ChartSourceStatus, PreparedChartBar, PreparedChartLiveUpdate, PreparedChartMeta, PreparedChartResponse, PreparedChartState, ReadyChartWindow } from './chart-data.ts'
 import { RADAR_TIMEFRAMES, timeframeMilliseconds, type RadarTimeframe } from './timeframe.ts'
@@ -21,13 +21,15 @@ const retainedStatus = (value: ChartSourceStatus | undefined, previous: ChartSou
 export type ReadyChartBoundary = Readonly<{ firstEnd: number; lastEnd: number }>
 export type PreparedChartStoreLimits = { maxSeries?: number; maxBarsPerSeries?: number; maxWindowsPerSeries?: number; maxBytes?: number }
 type CachedBar = { bar: PreparedChartBar; revision: number; generation: number }
+type CachedWindow = { window: ReadyChartWindow; meta: PreparedChartMeta; version: number; liveBar?: Bar }
 type Series = {
   epoch: number
+  version: number
   byteSize: number
   meta: PreparedChartMeta
   bars: Map<number, CachedBar>
   hours: number[]
-  windows: Map<number, ReadyChartWindow>
+  windows: Map<number, CachedWindow>
   boundaries: readonly ReadyChartBoundary[] | null
   liveBar?: Bar
   liveRevision: number
@@ -236,6 +238,7 @@ export class PreparedChartStore {
     this.seriesBytes += delta
     if (value) entry.bars.set(hour, value)
     else entry.bars.delete(hour)
+    entry.version += 1
     this.markChanged(entry.meta.key)
   }
 
@@ -421,11 +424,11 @@ export class PreparedChartStore {
       const newGeneration = !entry || entry.meta.generation !== generation
       if (newGeneration) {
         entry = {
-          epoch: ++this.nextEpoch, byteSize: entry?.byteSize ?? (latest ? this.sizeOfBars(latest.window.bars) : 0),
+          epoch: ++this.nextEpoch, version: 0, byteSize: entry?.byteSize ?? (latest ? this.sizeOfBars(latest.window.bars) : 0),
           meta: Object.freeze({ ...(entry?.meta ?? latest?.meta), key, instId, timeframe, intervalMS, generation, revision, latestEnd: entry?.meta.latestEnd ?? latest?.meta.latestEnd ?? null, oldestHour: entry?.meta.oldestHour ?? latest?.meta.oldestHour ?? null, historyExhausted: entry?.meta.historyExhausted ?? latest?.meta.historyExhausted ?? false, error: '' }),
           bars: entry?.bars ?? new Map(latest?.window.bars.map(bar => [bar.hour, { bar, revision: latest.meta.revision, generation: latest.meta.generation }]) ?? []),
           hours: entry?.hours ?? latest?.window.bars.map(bar => bar.hour) ?? [],
-          windows: latest?.meta.generation === generation ? new Map([[latest.window.endHour, latest.window]]) : new Map(), boundaries: null,
+          windows: latest?.meta.generation === generation ? new Map([[latest.window.endHour, { window: latest.window, meta: latest.meta, version: 0, liveBar: latest.window.liveBar }]]) : new Map(), boundaries: null,
           liveBar: latest?.meta.generation === generation ? latest.window.liveBar : undefined, liveRevision: latest?.meta.generation === generation ? latest.meta.revision : -1,
         }
         if (previousGeneration !== generation) entry.meta = Object.freeze({ ...entry.meta, indicatorStatus: undefined, sourceStatuses: entry.meta.sourceStatuses?.filter(value => value.source !== 'indicator') })
@@ -574,19 +577,24 @@ export class PreparedChartStore {
 
   private seriesWindow(entry: Series, endHour: number): ReadyChartWindow | null {
     if (entry.meta.generation !== this.generations.get(entry.meta.key)) return null
-    const bars: PreparedChartBar[] = []
-    for (let index = WINDOW_BARS - 1; index >= 0; index -= 1) {
-      const value = entry.bars.get(endHour - index * entry.meta.intervalMS)
-      if (!value || value.generation !== entry.meta.generation) continue
-      bars.push(value.bar)
-    }
     const liveBar = endHour === entry.meta.latestEnd ? entry.liveBar : undefined
-    if (entry.bars.get(endHour)?.generation !== entry.meta.generation && !liveBar) return null
-    if (!bars.length && !liveBar) return null
     const cached = entry.windows.get(endHour)
-    const window = readyWindow(entry.meta, bars, endHour, liveBar, cached)
+    // Immutable metadata owns source status/freshness; version owns changed or
+    // evicted bars. Repeated navigation reads need no 96-slot projection work.
+    const reusable = cached?.meta === entry.meta && cached.version === entry.version && cached.liveBar === liveBar
+    const window = reusable ? cached.window : measureOperation({ category: 'cpu', name: 'chart.window.project', resource: entry.meta.instId,
+      attributes: { inputRows: WINDOW_BARS } }, () => {
+      const bars: PreparedChartBar[] = []
+      for (let index = WINDOW_BARS - 1; index >= 0; index -= 1) {
+        const value = entry.bars.get(endHour - index * entry.meta.intervalMS)
+        if (value?.generation === entry.meta.generation) bars.push(value.bar)
+      }
+      if (entry.bars.get(endHour)?.generation !== entry.meta.generation && !liveBar || !bars.length && !liveBar) return null
+      return readyWindow(entry.meta, bars, endHour, liveBar, cached?.window)
+    })
+    if (!window) return null
     entry.windows.delete(endHour)
-    entry.windows.set(endHour, window)
+    entry.windows.set(endHour, reusable ? cached : { window, meta: entry.meta, version: entry.version, liveBar })
     while (entry.windows.size > this.maxWindowsPerSeries) entry.windows.delete(entry.windows.keys().next().value!)
     return window
   }
