@@ -597,8 +597,26 @@ async function validateStoppedPaintProbe(page, { readyTarget, includeRequestComm
     const indicatorFields = fields.slice(4, -3), statisticFields = ['oi', 'buy', 'sell'], curveFields = [...indicatorFields, 'oi']
     const { instId, requireMatureData, requireWarmStatistics, indicatorValidation } = probe
     const oracles = Object.fromEntries(Object.entries(series).map(([frame, entry]) => [frame, new Map(entry.bars.map(bar => [bar.hour, bar]))]))
-    const expectedGeometry = new WeakMap(), known = new Map(), seenErrors = new Set(probe.errors)
+    const expectedGeometry = new WeakMap(), svgGeometry = new WeakMap(), known = new Map(), seenErrors = new Set(probe.errors)
     const fail = message => { if (!seenErrors.has(message)) { seenErrors.add(message); probe.errors.push(message) } }
+    // The capture owns immutable SVG records, including curves and clip bounds.
+    // Many RAFs share one record: parse each path once, but compare its counts
+    // with every observation's bars and report that observation's phase.
+    const curveGeometry = (svg, index) => {
+      let curves = svgGeometry.get(svg)
+      if (!curves) { curves = []; svgGeometry.set(svg, curves) }
+      if (curves[index]) return curves[index]
+      const left = Number(svg.clipX), right = left + Number(svg.clipWidth)
+      let count = 0, inside = 0, before = 0, after = 0, atLeft = false
+      for (const point of svg.curves[index].matchAll(/[ML]([\d.e+-]+)[ ,]+([\d.e+-]+)/gi)) {
+        const x = Number(point[1])
+        count += 1
+        if (x >= left - .05 && x <= right + .05) { inside += 1; if (Math.abs(x - left) <= .05) atLeft = true }
+        if (x < left - .05) before += 1
+        if (x > right + .05) after += 1
+      }
+      return curves[index] = { count, inside, before, after, atLeft }
+    }
     let deferredValidationSamples = 0, failedCaptureSamples = 0, readyFrame = null
     for (const { at, frame, snapshot, bars, surface, phase, newPaint, pendingWindowIndex, captureFailure } of probe.observations) {
       if (captureFailure) { failedCaptureSamples += 1; continue }
@@ -641,14 +659,11 @@ async function validateStoppedPaintProbe(page, { readyTarget, includeRequestComm
             const field = curveFields[index], d = svg.curves[index]
             const { samples, points: expectedPoints } = expected.curves.get(field)
             if (samples > 1 && !d) fail(`${phase}: ${timeframe} ${snapshot.endHour} lost its ${field} SVG curve with ${samples} known samples.`)
-            const coordinates = [...d.matchAll(/[ML]([\d.e+-]+)[ ,]+([\d.e+-]+)/gi)].map(point => Number(point[1]))
+            const coordinates = curveGeometry(svg, index)
             if (svg.hasClip) {
-              const left = Number(svg.clipX), right = left + Number(svg.clipWidth)
-              const inside = coordinates.filter(x => x >= left - .05 && x <= right + .05)
-              const padding = expectedPoints > samples && inside.some(x => Math.abs(x - left) <= .05) ? 1 : 0
-              if (inside.length !== samples + padding || coordinates.filter(x => x < left - .05).length > 1
-                || coordinates.filter(x => x > right + .05).length > 1) fail(`${phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.length} points; expected ${samples} visible samples and at most one adjacent sample per side.`)
-            } else if (coordinates.length !== expectedPoints) fail(`${phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.length} points for ${expectedPoints} known positions.`)
+              const padding = expectedPoints > samples && coordinates.atLeft ? 1 : 0
+              if (coordinates.inside !== samples + padding || coordinates.before > 1 || coordinates.after > 1) fail(`${phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.count} points; expected ${samples} visible samples and at most one adjacent sample per side.`)
+            } else if (coordinates.count !== expectedPoints) fail(`${phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.count} points for ${expectedPoints} known positions.`)
             if (/NaN|Infinity|undefined/.test(d)) fail('Nonfinite SVG geometry.')
           }
           if (requireMatureData) {

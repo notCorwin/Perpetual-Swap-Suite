@@ -621,6 +621,97 @@ test('the paint probe retains geometry and metadata corruption without a new sna
   } finally { if (!report) await finishPaintProbe(page) }
 })
 
+test('every retained SVG observation agrees with independent curve checks when paths, clips and bars change', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await openChart(page, fixture)
+  await startPaintProbe(page, fixture)
+  let report
+  try {
+    const evidence = await page.evaluate(async instId => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`), probe = window.__chartPaintProbe
+      const svg = chart.querySelector('svg[data-rendered-inst]'), path = svg.querySelector('[data-chart-indicator="rsi12"]')
+      const clipOwner = svg.querySelector('[data-chart-wheel-content]').parentElement
+      const reference = clipOwner.getAttribute('clip-path')
+      const clipId = reference.slice(reference.indexOf('#') + 1, reference.indexOf(')'))
+      const clip = svg.querySelector(`[id="${CSS.escape(clipId)}"] rect`)
+      const pathValue = path.getAttribute('d'), clipValue = clip.getAttribute('width')
+      const originalSnapshot = chart.__chartSnapshot, originalBars = chart.__chartRenderedBars
+      const bars = (originalBars ?? originalSnapshot.bars).map(bar => ({ ...bar }))
+      const snapshot = { ...originalSnapshot, bars }
+      let sharedSVG = false, changedBarsSameSVG = false
+      try {
+        probe.phase = 'first invalid curve'
+        path.setAttribute('d', 'M0,0')
+        await Promise.resolve()
+        const invalidSVG = probe.observations.at(-1).surface.svg
+        await new Promise(resolve => requestAnimationFrame(resolve))
+        probe.phase = 'repeated invalid curve'
+        await new Promise(resolve => requestAnimationFrame(resolve))
+        sharedSVG = probe.observations.at(-1).surface.svg === invalidSVG
+        probe.phase = 'changed clip'
+        clip.setAttribute('width', '0')
+        await Promise.resolve()
+        await new Promise(resolve => requestAnimationFrame(resolve))
+        probe.phase = 'no clip'
+        clipOwner.setAttribute('clip-path', 'none')
+        await Promise.resolve()
+        await new Promise(resolve => requestAnimationFrame(resolve))
+        clipOwner.setAttribute('clip-path', reference); clip.setAttribute('width', clipValue); path.setAttribute('d', pathValue)
+        await Promise.resolve()
+        const restoredSVG = probe.observations.at(-1).surface.svg
+        bars[0].rsi12 = null
+        probe.phase = 'changed bars'
+        Object.defineProperty(chart, '__chartSnapshot', { configurable: true, value: snapshot })
+        Object.defineProperty(chart, '__chartRenderedBars', { configurable: true, value: bars })
+        chart.setAttribute('data-probe-paint-marker', 'changed bars')
+        await Promise.resolve()
+        changedBarsSameSVG = probe.observations.at(-1).surface.svg === restoredSVG
+        await new Promise(resolve => requestAnimationFrame(resolve))
+      } finally {
+        path.setAttribute('d', pathValue); clip.setAttribute('width', clipValue); clipOwner.setAttribute('clip-path', reference)
+        Object.defineProperty(chart, '__chartSnapshot', { configurable: true, value: originalSnapshot })
+        Object.defineProperty(chart, '__chartRenderedBars', { configurable: true, value: originalBars })
+        chart.removeAttribute('data-probe-paint-marker')
+        await Promise.resolve()
+      }
+      // Reference uses the original per-observation array-based calculation,
+      // independently of the validator's cached path summaries.
+      const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
+      const errors = new Set()
+      for (const { snapshot, bars, surface, phase, captureFailure } of probe.observations) {
+        if (captureFailure || !snapshot || !surface?.svg || !Array.isArray(bars)) continue
+        const svg = surface.svg, firstAtLeft = bars[0]?.hour === bars.at(-1)?.hour - 95 * snapshot.intervalMS
+        for (const [index, field] of fields.entries()) {
+          const d = svg.curves[index], samples = bars.filter(bar => typeof bar[field] === 'number' && Number.isFinite(bar[field])).length
+          const points = samples + (firstAtLeft && Number.isFinite(bars[0]?.[field]) ? 1 : 0)
+          if (samples > 1 && !d) errors.add(`${phase}: ${snapshot.timeframe} ${snapshot.endHour} lost its ${field} SVG curve with ${samples} known samples.`)
+          const coordinates = [...d.matchAll(/[ML]([\d.e+-]+)[ ,]+([\d.e+-]+)/gi)].map(point => Number(point[1]))
+          if (svg.hasClip) {
+            const left = Number(svg.clipX), right = left + Number(svg.clipWidth)
+            const inside = coordinates.filter(x => x >= left - .05 && x <= right + .05)
+            const padding = points > samples && inside.some(x => Math.abs(x - left) <= .05) ? 1 : 0
+            if (inside.length !== samples + padding || coordinates.filter(x => x < left - .05).length > 1
+              || coordinates.filter(x => x > right + .05).length > 1) errors.add(`${phase}: ${snapshot.timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.length} points; expected ${samples} visible samples and at most one adjacent sample per side.`)
+          } else if (coordinates.length !== points) errors.add(`${phase}: ${snapshot.timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.length} points for ${points} known positions.`)
+        }
+      }
+      return { sharedSVG, changedBarsSameSVG, errors: [...errors].sort(), observations: probe.observations.length }
+    }, fixture.instId)
+    report = await finishPaintProbe(page)
+    const actual = report.violations.filter(error => / SVG has | lost its .* SVG curve /.test(error)).sort()
+    assert.equal(evidence.sharedSVG, true, 'Repeated RAFs must use the same captured SVG record.')
+    assert.equal(evidence.changedBarsSameSVG, true, 'Changing bar evidence must not require a new SVG record.')
+    assert.ok(evidence.errors.some(error => /first invalid curve: .*rsi12 SVG has/.test(error)))
+    assert.ok(evidence.errors.some(error => /repeated invalid curve: .*rsi12 SVG has/.test(error)))
+    assert.ok(evidence.errors.some(error => /changed clip: .* SVG has/.test(error)))
+    assert.ok(evidence.errors.some(error => /no clip: .*rsi12 SVG has/.test(error)))
+    assert.ok(evidence.errors.some(error => /changed bars: .*rsi12 SVG has/.test(error)))
+    assert.deepEqual(actual, evidence.errors, 'Every observed phase must retain the same geometry verdict as independent checks.')
+    assert.ok(report.deferredValidationSamples >= evidence.observations)
+    assert.equal(report.deferredValidationSamples + report.failedCaptureSamples, report.probeCaptureSamples)
+  } finally { if (!report) await finishPaintProbe(page) }
+})
+
 test('the paint probe validates mutable wrong and incomplete bars after they are restored', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   await openChart(page, fixture)
