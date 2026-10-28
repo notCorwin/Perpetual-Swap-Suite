@@ -440,6 +440,57 @@ test('health-file write failure rejects flush and remains visible after orderly 
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
+test('descriptor finalization failure publishes failed health and permanently rejects later flushes', async () => {
+  for (const failFlush of [false, true]) {
+    const directory = await mkdtemp(join(tmpdir(), 'perp-operation-runtime-close-failure-'))
+    try {
+      const recordings = await execute(directory, `
+        import assert from 'node:assert/strict';
+        import fs from 'node:fs';
+        import { syncBuiltinESMExports } from 'node:module';
+        const open = fs.openSync, close = fs.closeSync, sync = fs.fdatasync;
+        let journal, armed = false;
+        const closeFailure = Object.assign(new Error('injected journal close failure'), { code: 'EIO' });
+        fs.openSync = (path, ...args) => {
+          const fd = open(path, ...args);
+          if (String(path).endsWith('.brj')) journal = fd;
+          return fd;
+        };
+        fs.closeSync = fd => {
+          close(fd);
+          if (armed && fd === journal) { armed = false; throw closeFailure; }
+        };
+        fs.fdatasync = (fd, callback) => {
+          if (${failFlush} && armed && fd === journal) return queueMicrotask(() => callback(Object.assign(new Error('injected sync failure'), { code: 'EIO' })));
+          sync(fd, callback);
+        };
+        syncBuiltinESMExports();
+        const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+        const { measureOperation } = await import(${JSON.stringify(operations)});
+        const recording = initializeOperationRecording(), writer = recording.writers.get(recording.executionId);
+        measureOperation({ category: 'cpu', name: 'runtime.before-failed-close' }, () => {});
+        armed = true;
+        await assert.rejects(writer.close(), error => {
+          if (${failFlush}) {
+            assert.ok(error instanceof AggregateError);
+            assert.match(error.errors[0].message, /persistence did not complete/);
+            assert.equal(error.errors[1], closeFailure, 'The original flush failure precedes the independent close failure.');
+          } else assert.equal(error, closeFailure);
+          return true;
+        });
+        const health = JSON.parse(fs.readFileSync(${JSON.stringify(directory)} + '/' + recording.executionId + '.health.json', 'utf8'));
+        assert.equal(health.closed, true, 'Final health publication still runs when descriptor closure fails.');
+        assert.ok(health.failed >= ${failFlush ? 2 : 1});
+        await assert.rejects(recording.flush(), /persistence did not complete/, 'Later flushes cannot erase a finalization failure.');
+        await assert.rejects(recording.close(), /did not close cleanly/);
+      `)
+      assert.equal(recordings[0].health.closed, true)
+      assert.ok(recordings[0].health.failed >= (failFlush ? 2 : 1))
+      assert.equal(recordings[0].events.filter(event => event.name === 'runtime.before-failed-close').length, 2)
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  }
+})
+
 test('a closed renderer journal rejects late imports without acknowledging dropped records', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'perp-operation-runtime-closed-import-'))
   try {

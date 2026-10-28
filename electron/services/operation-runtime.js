@@ -442,18 +442,22 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
       accepting = false
       clearTimeout(timer); clearInterval(checkpointTimer)
       closing = (async () => {
-        try { await flush() }
-        finally {
-          await suppress(async () => {
-            // Every submitted write, including later disjoint batches, must stop
-            // using the descriptor before it can be closed or reused.
-            await Promise.all([...jobs].map(job => job.promise))
-            await Promise.all([...nativeRequests].map(request => request.promise))
-            closed = true; closeSync(descriptor)
-            if (spill) { spillCount = 0; clearSpill() }
-            await writeHealth()
-          })
-        }
+        const failures = []
+        try { await flush() } catch (error) { failures.push(error) }
+        await suppress(async () => {
+          // Every submitted write, including later disjoint batches, must stop
+          // using the descriptor before it can be closed or reused.
+          await Promise.all([...jobs].map(job => job.promise))
+          await Promise.all([...nativeRequests].map(request => request.promise))
+          closed = true
+          try { closeSync(descriptor) } catch (error) { failed(error); failures.push(error) }
+          try { if (spill) { spillCount = 0; clearSpill() } } catch (error) { failed(error); failures.push(error) }
+          // Cleanup failures are permanent and must appear in the final health
+          // even when another finalizer has already failed.
+          try { await writeHealth() } catch (error) { failures.push(error) }
+        })
+        if (failures.length === 1) throw failures[0]
+        if (failures.length) throw new AggregateError(failures, 'Operation journal did not close cleanly.', { cause: failures[0] })
       })().finally(() => { closeFinished = true })
     }
     return closing
