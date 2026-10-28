@@ -646,6 +646,7 @@ export class PreparedChartPipeline {
     if (pricesChanged) this.invalidateDerived(state, changedFrom)
     const retained = this.retainRows(state, this.liveStates.get(state.key) === state ? TAIL : HISTORY, end)
     const inspectedPriceVersion = state.priceVersion
+    const inspectedRetentionVersion = state.retentionVersion ?? 0
     const coverage = await this.store.coverage(state.instId, state.timeframe, priority)
     state.latestHour = coverage.last === null ? state.latestHour : Math.max(state.latestHour ?? -Infinity, coverage.last)
     const listing = Number(this.instrument(state.instId)?.listTime)
@@ -657,9 +658,12 @@ export class PreparedChartPipeline {
       // missing source data must not trigger another identical read on every
       // cursor move, and a revision change must invalidate the proof.
       const currentRetention = state.retainedRange
-      if (retained && currentRetention) {
+      if (retained && currentRetention && inspectedRetentionVersion === (state.retentionVersion ?? 0)) {
         const retainedFrom = Math.max(retained.from, currentRetention.from), retainedThrough = Math.min(retained.through, currentRetention.through)
-        let first = Math.max(from ?? 0, retainedFrom), last = Math.min(through, retainedThrough)
+        // An unbounded descending query only inspects its complete prefix when
+        // it exhausts the ledger. A full SQL limit says nothing about older rows.
+        const inspectedFrom = from ?? (rows.length < limit ? 0 : Math.min(...rows.map(row => row.timestamp)))
+        let first = Math.max(inspectedFrom, retainedFrom), last = Math.min(through, retainedThrough)
         const prior = state.historyReadRange
         if (prior && prior.revision === residentRevision && prior.priceVersion === inspectedPriceVersion
           && prior.from <= last + state.intervalMS && prior.through >= first - state.intervalMS) {
@@ -695,9 +699,14 @@ export class PreparedChartPipeline {
     const historical = cursor !== null && cursor !== undefined
     const anchor = historical ? cursor : Math.max(...state.rows.keys()), ahead = historical ? HISTORY_AHEAD : 0
     const first = anchor - (limit - ahead - 1) * state.intervalMS, last = anchor + ahead * state.intervalMS
+    let evicted = false
     for (const hour of state.rows.keys()) if (hour < first || hour > last) {
       state.rows.delete(hour); state.indicators.delete(hour); state.projectedBars?.delete(hour)
+      evicted = true
     }
+    // A cursor may leave and return while coverage is pending. Matching final
+    // bounds cannot restore facts discarded by an intermediate retention pass.
+    if (evicted) state.retentionVersion = (state.retentionVersion ?? 0) + 1
     state.retainedRange = { from: first, through: last }
     if (state.historyReadRange) {
       const from = Math.max(first, state.historyReadRange.from), through = Math.min(last, state.historyReadRange.through)

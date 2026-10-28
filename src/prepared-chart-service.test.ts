@@ -1586,6 +1586,81 @@ test('evicting a previously inspected reserve also retires its read proof', asyn
   } finally { await pipeline.dispose() }
 })
 
+test('evictions during coverage cannot restore a discarded reserve inspection', async () => {
+  const rows = source(6000), { pipeline, store } = fixture(rows)
+  const coverageEntered = deferred(), coverageRelease = deferred(), tailEntered = deferred(), tailRelease = deferred()
+  const coverage = store.coverage.bind(store), read = store.candles.bind(store)
+  let holdCoverage = false, coverageHeld = false, holdTail = false, tailHeld = false, sourceRequests = 0
+  store.coverage = async () => {
+    if (holdCoverage && !coverageHeld) { coverageHeld = true; coverageEntered.resolve(); await coverageRelease.promise }
+    return coverage()
+  }
+  store.candles = async query => {
+    const result = await read(query)
+    if (holdTail && !tailHeld && query.limit === 128) { tailHeld = true; tailEntered.resolve(); await tailRelease.promise }
+    return result
+  }
+  const a = rows[4000].timestamp, b = rows[4600].timestamp
+  try {
+    await focusLatest(pipeline, instId, '15m'); await pipeline.focus.task; await finishSeed(pipeline)
+    holdCoverage = true
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: a }, 'inspection-a')
+    const oldRead = pipeline.focus.task
+    await coverageEntered.promise
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: b }, 'inspection-b')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    holdTail = true
+    pipeline.setFocus({ instId, timeframe: '15m' }, 'held-latest')
+    const latestRead = pipeline.focus.task
+    await tailEntered.promise
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: a }, 'inspection-a-return')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    tailRelease.resolve(); await latestRead
+    const state = pipeline.series.get(`${instId}:15m`)
+    assert.equal(state.rows.has(a - 1000 * interval), false, 'The intervening selection evicted the older admitted rows.')
+    coverageRelease.resolve(); await oldRead
+    pipeline.history.ensurePrices = async (_id: string, _timeframe: string, from: number, through: number) => {
+      sourceRequests += 1
+      return { rows: rows.filter(row => row.timestamp >= from && row.timestamp <= through) }
+    }
+    const target = a - 250 * interval
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target }, 'after-eviction')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    assert.equal(sourceRequests, 0, 'The persisted reserve must be read locally after any intervening eviction.')
+    const visible = pipeline.frame(state, target, true).bars
+    assert.equal(visible.length, 96)
+    assert.ok(visible.every((bar: any) => bar.indicatorsObserved))
+  } finally { coverageRelease.resolve(); tailRelease.resolve(); await pipeline.dispose() }
+})
+
+test('implicit latest history cannot certify rows omitted by its descending SQL limit', async () => {
+  const rows = source(6000), { pipeline, store } = fixture(rows)
+  const a = rows[3000].timestamp, b = rows[3600].timestamp
+  let sourceRequests = 0
+  try {
+    await focusHistory(pipeline, instId, '15m', b); await pipeline.focus.task; await finishSeed(pipeline)
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: a }, 'older-resident')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    await pipeline.localHistory(instId, '15m', undefined)
+    const query = store.queries.at(-1), state = pipeline.series.get(`${instId}:15m`)
+    assert.equal(query.from, undefined)
+    assert.equal(query.limit, 1536)
+    assert.ok(rows.at(-1536)!.timestamp > a + 256 * interval, 'Every selected latest row is outside the active historical reserve.')
+    assert.equal(state.rows.has(a - 1000 * interval), false)
+    pipeline.history.ensurePrices = async (_id: string, _timeframe: string, from: number, through: number) => {
+      sourceRequests += 1
+      return { rows: rows.filter(row => row.timestamp >= from && row.timestamp <= through) }
+    }
+    const target = a - 250 * interval
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target }, 'after-limited-read')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    assert.equal(sourceRequests, 0, 'An unselected persisted interval must not be redirected through source acquisition.')
+    const visible = pipeline.frame(state, target, true).bars
+    assert.equal(visible.length, 96)
+    assert.ok(visible.every((bar: any) => bar.indicatorsObserved))
+  } finally { await pipeline.dispose() }
+})
+
 for (const heldReplay of [false, true]) test(`historical invalidation restarts backend focus without renderer reads${heldReplay ? ' while an obsolete replay is in flight' : ''}`, async () => {
   const rows = source(5000), target = rows[2000].timestamp, { pipeline, store } = fixture(rows)
   const gate = deferred(), entered = deferred(), frames: any[] = []
