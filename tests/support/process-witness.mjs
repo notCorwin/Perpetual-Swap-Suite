@@ -40,7 +40,7 @@ export async function startProcessWitness(electron, name, { capacity = 6_002, di
       complete: !errors.length && evidence.nodeDriverLoop?.complete === true && evidence.mainLoop?.complete === true,
       collectionErrors: errors.map(({ stage, error }) => ({ stage, message: error.stack ?? error.message ?? String(error) })) }
     const outputDirectory = resolve(directory ?? process.env.PERPETUAL_SWAP_PROCESS_WITNESS_DIRECTORY ?? '.build/process-witness')
-    report.artifact = join(outputDirectory, `${name.replace(/[^a-z0-9]+/gi, '-')}.json`)
+    report.artifact = join(outputDirectory, `${name.replace(/[^a-z0-9]+/gi, '-')}-${ownerId}.json`)
     try {
       await mkdir(outputDirectory, { recursive: true })
       await writeFile(report.artifact, `${JSON.stringify(report)}\n`)

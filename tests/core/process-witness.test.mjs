@@ -55,6 +55,13 @@ test('process witness retains aligned independently owned Node and Electron evid
     assert.equal(report.nodeDriverLoop.samples[2].callbackAtMS, 40)
     assert.equal(report.mainLoop.samples[2].callbackAtMS, 170)
     assert.deepEqual(JSON.parse(await readFile(report.artifact, 'utf8')), report)
+    const secondDriver = loopRuntime(), secondMain = loopRuntime()
+    const secondStop = await startProcessWitness(electronHost(secondMain, { driver: secondDriver }), 'fixture', {
+      capacity: 6_002, directory, driverRuntime: secondDriver.runtime })
+    const secondReport = await secondStop()
+    assert.notEqual(secondReport.artifact, report.artifact, 'A later diagnostic with the same label cannot overwrite formal evidence.')
+    assert.deepEqual(JSON.parse(await readFile(report.artifact, 'utf8')), report)
+    assert.deepEqual(JSON.parse(await readFile(secondReport.artifact, 'utf8')), secondReport)
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
