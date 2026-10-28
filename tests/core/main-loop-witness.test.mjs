@@ -113,3 +113,51 @@ test('a scheduling failure cleans up its partially installed witness and retains
   })
   assert.equal(target.__mainLoopWitness, undefined)
 })
+
+test('event-loop evidence distinguishes idle polling from low-CPU synchronous waiting', async () => {
+  const witness = startNodeDriverLoopWitness({ capacity: 64 })
+  try {
+    await new Promise(resolve => setTimeout(resolve, 60))
+    const startedAt = performance.timeOrigin + performance.now()
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 80)
+    const endedAt = performance.timeOrigin + performance.now()
+    await new Promise(resolve => setTimeout(resolve, 60))
+    const report = witness.stop()
+    assert.equal(report.complete, true)
+    assert.equal(report.eventLoopEvidence.state, 'observed')
+    const intervals = report.samples.slice(1).map((sample, index) => {
+      const previous = report.samples[index]
+      return { startedAt: report.timeOriginMS + previous.callbackAtMS, endedAt: report.timeOriginMS + sample.callbackAtMS,
+        activeMS: sample.eventLoop.activeMS - previous.eventLoop.activeMS,
+        idleMS: sample.eventLoop.idleMS - previous.eventLoop.idleMS,
+        cpuMS: (sample.threadCPUUS.user + sample.threadCPUUS.system - previous.threadCPUUS.user - previous.threadCPUUS.system) / 1000 }
+    })
+    const waiting = intervals.find(value => value.startedAt <= startedAt && value.endedAt >= endedAt)
+    assert.ok(waiting, 'A retained timer interval must bracket the known synchronous wait.')
+    assert.ok(waiting.activeMS >= endedAt - startedAt - 1, 'Synchronous waiting must remain active event-loop time.')
+    assert.ok(waiting.cpuMS < waiting.activeMS / 2, 'Active event-loop time must not be mistaken for busy CPU.')
+    assert.ok(intervals.some(value => value.endedAt <= startedAt && value.idleMS > value.activeMS),
+      'The preceding asynchronous timer wait must retain its idle polling time.')
+  } finally { witness.stop() }
+})
+
+test('invalid event-loop evidence stays explicit while retaining valid timer and CPU samples', () => {
+  const target = {}
+  installMainLoopWitness(null, { runtime: { target, readEventLoop: () => ({ idle: NaN, active: 1, utilization: 1 }),
+    schedule: () => 1, cancel: () => {} } })
+  const report = target.__mainLoopWitness.stop()
+  assert.equal(report.complete, false)
+  assert.deepEqual(report.captureErrors.map(error => error.stage), ['start-event-loop', 'stop-event-loop'])
+  assert.equal(report.sampleCount, 2)
+  assert.ok(report.samples.every(sample => sample.threadCPUUS && sample.eventLoop === undefined))
+  assert.equal(report.eventLoopEvidence.state, 'invalid')
+})
+
+test('an all-zero integrated-loop counter does not establish idle or active time', () => {
+  const target = {}
+  installMainLoopWitness(null, { runtime: { target, readEventLoop: () => ({ idle: 0, active: 0, utilization: 0 }),
+    schedule: () => 1, cancel: () => {} } })
+  const report = target.__mainLoopWitness.stop()
+  assert.equal(report.complete, true, 'Timer and thread-CPU evidence remains usable independently of event-loop activity.')
+  assert.deepEqual(report.eventLoopEvidence, { readableSamples: 2, nonzeroSamples: 0, invalidSamples: 0, state: 'all-zero' })
+})

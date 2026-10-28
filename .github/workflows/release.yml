@@ -119,6 +119,7 @@ jobs:
         env:
           PERPETUAL_SWAP_RENDERER_DIAGNOSTICS: artifacts/native-chart-diagnostic-trace
           PERPETUAL_SWAP_RENDERER_TRACE_ONLY: '1'
+          PERPETUAL_SWAP_PROCESS_WITNESS_DIRECTORY: artifacts/native-chart-diagnostic-process-witness
         run: |
           test -f dist/index.html
           npm run sandbox -- command --desktop --foreground --output artifacts/diagnostic-sandbox -- node --test-concurrency=1 --test tests/e2e/chart-paint.foreground.mjs tests/e2e/instrument-navigation.foreground.mjs

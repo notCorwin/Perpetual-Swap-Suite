@@ -23,9 +23,16 @@ test('process witness aligns an actual main-thread wait with CPU and recorder ev
     })
     await electron.evaluate(() => new Promise(resolve => setTimeout(resolve, 40)))
     const report = await stop(), loop = report.mainLoop
+    assert.equal(report.complete, true, JSON.stringify(report.collectionErrors))
+    assert.equal(report.nodeDriverLoop.eventLoopEvidence.state, 'observed')
+    assert.notEqual(report.nodeDriverLoop.pid, loop.pid, 'The driver clock must run in its independently owned process.')
+    assert.ok([loop, report.nodeDriverLoop].every(witness => witness.samples.every(sample =>
+      Number.isFinite(sample.eventLoop?.idleMS) && Number.isFinite(sample.eventLoop?.activeMS))))
     const intervals = loop.samples.slice(1).map((sample, index) => {
       const previous = loop.samples[index]
       return { startedAt: loop.timeOriginMS + previous.callbackAtMS, endedAt: loop.timeOriginMS + sample.callbackAtMS,
+        idleMS: sample.eventLoop.idleMS - previous.eventLoop.idleMS,
+        activeMS: sample.eventLoop.activeMS - previous.eventLoop.activeMS,
         cpuMS: (sample.threadCPUUS.user + sample.threadCPUUS.system - previous.threadCPUUS.user - previous.threadCPUUS.system) / 1_000 }
     })
     const observed = intervals.find(sample => sample.startedAt <= wait.startedAt && sample.endedAt >= wait.endedAt)
@@ -37,7 +44,10 @@ test('process witness aligns an actual main-thread wait with CPU and recorder ev
     assert.equal(await electron.evaluate(() => globalThis.__mainLoopWitness), undefined)
     assert.equal(await stop(), report, 'Repeated collection must return the retained report without restarting or sampling again.')
     context.diagnostic(JSON.stringify({ wait, observed, samples: loop.samples.length,
-      captureCostMS: loop.captureCostMS, maxCaptureCostMS: loop.maxCaptureCostMS }))
+      captureCostMS: loop.captureCostMS, maxCaptureCostMS: loop.maxCaptureCostMS,
+      eventLoopEvidence: loop.eventLoopEvidence, nodeDriverEventLoopEvidence: report.nodeDriverLoop.eventLoopEvidence,
+      nodeDriverCaptureCostMS: report.nodeDriverLoop.captureCostMS,
+      nodeDriverMaxCaptureCostMS: report.nodeDriverLoop.maxCaptureCostMS }))
   } finally {
     try { await stop?.() }
     finally { await electron?.close(); await rm(userData, { recursive: true, force: true }) }
