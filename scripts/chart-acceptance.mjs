@@ -1444,16 +1444,17 @@ export async function measureOffscreenColdBoundary(electron, page, options = {})
 // must remain the cursor that eventually resolves. A second run fails that
 // source page and checks that the UI does not claim the absent range completed.
 export async function measureMissingWindow(electron, page, { timeframe = '15m', failSource = false, offscreen = true } = {}) {
-  const foreground = offscreen ? null : await foregroundPaintWindow(electron, page)
-  const native = await electron.evaluate(({ BrowserWindow }) => {
-    const window = BrowserWindow.getAllWindows()[0]
-    return { visible: window.isVisible(), focused: window.isFocused(), offscreen: window.webContents.isOffscreen() }
-  })
-  assert.deepEqual(native, { visible: !offscreen, focused: !offscreen, offscreen }, 'Cold missing-window measurement must use its declared window presentation.')
   const probe = value => electron.evaluate((_, value) => globalThis.__marketBackend.probe(value), value)
-  const fixture = await probe({ action: 'coldBoundaryInstall', timeframe, scenario: 'full-missing-window', sourceDelayMS: 1_800, failNearestCandles: failSource })
-  let probeInstalled = false, paintStarted = false
+  let foreground, failure, sourceStarted = false, probeInstalled = false, paintStarted = false
   try {
+    foreground = offscreen ? null : await foregroundPaintWindow(electron, page)
+    const native = await electron.evaluate(({ BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows()[0]
+      return { visible: window.isVisible(), focused: window.isFocused(), offscreen: window.webContents.isOffscreen() }
+    })
+    assert.deepEqual(native, { visible: !offscreen, focused: !offscreen, offscreen }, 'Cold missing-window measurement must use its declared window presentation.')
+    sourceStarted = true
+    const fixture = await probe({ action: 'coldBoundaryInstall', timeframe, scenario: 'full-missing-window', sourceDelayMS: 1_800, failNearestCandles: failSource })
     const initialRows = await electron.evaluate((_, fixture) => globalThis.__marketBackend.request({ e2e: {
       action: 'readCandles', instrument: fixture.instId, timeframe: fixture.timeframe,
       from: fixture.targetWindowStart, through: fixture.targetEnd,
@@ -1615,11 +1616,22 @@ export async function measureMissingWindow(electron, page, { timeframe = '15m', 
         allIntentsAccounted: latency.unaccountedInputs.length === 0 } : null,
       nativePaintMeasured: false, rendererRafSamples: paint.frames, ...paint,
       frameSamples: undefined, captureTimings: undefined, requestCommits: undefined, observationSamples: undefined }
+  } catch (error) {
+    failure = error
+    throw error
   } finally {
-    if (paintStarted) await finishPaintProbe(page)
-    if (probeInstalled) { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
-    await probe({ action: 'coldBoundaryRemove' })
-    await foreground?.restore()
+    const cleanupErrors = []
+    if (paintStarted) try { await finishPaintProbe(page) } catch (error) { cleanupErrors.push(error) }
+    if (probeInstalled) {
+      try { await releaseRequestProbe(electron) } catch (error) { cleanupErrors.push(error) }
+      try { await removeRequestProbe(electron) } catch (error) { cleanupErrors.push(error) }
+    }
+    if (sourceStarted) try { await probe({ action: 'coldBoundaryRemove' }) } catch (error) { cleanupErrors.push(error) }
+    try { await foreground?.restore() } catch (error) { cleanupErrors.push(error) }
+    if (cleanupErrors.length) {
+      const errors = failure ? [failure, ...cleanupErrors] : cleanupErrors
+      throw new AggregateError(errors, errors.map(error => error?.message ?? String(error)).join('\n'), { cause: errors[0] })
+    }
   }
 }
 

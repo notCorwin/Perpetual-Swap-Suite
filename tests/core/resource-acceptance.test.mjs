@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { buildIndicatorSeries } from '../../electron/services/indicators.js'
 import { assessResourceBudgets, assertResourceDeliveryBudget, installResourcePaintProbe, summarizeResourceDelivery } from '../../scripts/resource-acceptance.mjs'
 
 const load = (count = 3) => ({ state: 'complete', emitted: count, completed: count, plannedTicks: count, failed: 0, maxScheduleLatenessMS: 0, cadenceMS: 100,
@@ -24,90 +25,228 @@ const liveIntent = (at, extra = {}) => ({ at, instId: 'BTC', timeframe: '5m', li
 const historyIntent = at => liveIntent(at, { historical: true, endHour: 900 })
 const returnIntent = at => liveIntent(at, { historical: false, endHour: 1000 })
 
-test('renderer probe reads the displayed SVG and snapshot again at RAF, including an unchanged cached frame', context => {
-  let now = 1000
+function resourceProbeFixture(context, { indicators = false, frozen = false } = {}) {
+  let now = 1000, mutation, disconnected = 0, disconnectError
   context.mock.method(performance, 'now', () => now)
-  const names = ['window', 'document', 'MutationObserver', 'requestAnimationFrame']
+  const names = ['window', 'document', 'MutationObserver', 'requestAnimationFrame', 'cancelAnimationFrame']
   const original = new Map(names.map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]))
-  const callbacks = [], label = { textContent: '113.204 ↑' }
-  let mutation
+  const callbacks = [], cancelled = [], label = { textContent: '113.204 ↑' }
   const svg = { dataset: { renderedInst: 'SCALE000-USDT-SWAP', renderedTimeframe: '15m', renderedEnd: '1000' },
     style: { visibility: 'visible' }, isConnected: true, getAttribute: () => 'false', querySelector: () => label }
-  const bars = Array.from({ length: 96 }, (_, offset) => {
-    const index = 224 + offset, close = 110 + index * .01
-    return { hour: -31_000 + index * 100, open: close - .02, high: close + .06, low: close - .05, close, indicatorsObserved: false }
+  const candles = Array.from({ length: 320 }, (_, index) => {
+    const close = 110 + index * .01
+    return { timestamp: -31_000 + index * 100, open: close - .02, high: close + .06, low: close - .05, close, baseVolume: 100 + index % 7 }
   })
+  const bars = buildIndicatorSeries(candles, 100).bars.slice(-96).map(value => ({ ...value, indicatorsObserved: indicators }))
   const snapshot = { instId: 'SCALE000-USDT-SWAP', timeframe: '15m', endHour: 900, bars, liveBar: { hour: 1000, close: 113.204 },
     priceObservedAt: 402, indicatorState: 'ready', oiState: 'loading', takerState: 'loading' }
+  if (frozen) { bars.forEach(Object.freeze); Object.freeze(bars); Object.freeze(snapshot.liveBar); Object.freeze(snapshot) }
   const chart = { __chartSnapshot: snapshot, dataset: { chartInst: snapshot.instId, chartEnd: '1000', chartRequestedEnd: '900',
     chartRenderedBars: '96', chartVisualStale: 'false', chartLoading: 'false' }, querySelector: () => svg }
-  try {
-    globalThis.window = {}
-    globalThis.document = { querySelector: () => chart }
-    globalThis.MutationObserver = class { constructor(callback) { mutation = callback } observe() {} }
-    globalThis.requestAnimationFrame = callback => { callbacks.push(callback) }
-    installResourcePaintProbe({ intervals: { '15m': 100 }, periods: 320, asOf: 1000 })
-    mutation()
-    const paint = window.__resourcePaint, record = paint.records[0]
-    chart.dataset.chartRequestedEnd = '800' // The requested history has not replaced the live SVG.
-    now = 1010
-    callbacks[1](10)
-    assert.equal(record.frame.sameSnapshot, true)
-    assert.equal(record.frame.requestedEnd, 800)
-    assert.equal(record.frame.renderedEnd, 1000)
-    assert.equal(record.frame.sequence, 4)
-    assert.equal(record.frame.label, '113.204 ↑')
-    assert.equal(paint.isFrame(record), true)
-    assert.deepEqual(paint.violations, [])
-    const input = { instId: snapshot.instId, timeframe: snapshot.timeframe, sequence: 4, afterAt: performance.timeOrigin + 1011 }
-    assert.equal(paint.readyForLatest(input), false, 'An earlier verified frame must not satisfy a later return input.')
-
-    now = 1012
-    paint.recheck()
-    const unchanged = paint.records.at(-1)
-    now = 1015
-    callbacks.at(-1)(20)
-    assert.equal(unchanged.kind, 'recheck')
-    assert.equal(unchanged.committedAt, record.committedAt)
-    assert.equal(paint.isFrame(unchanged), true)
-    assert.equal(paint.readyForLatest(input), true)
-    chart.__chartSnapshot = { ...snapshot, liveBar: { hour: 1000, close: 113.203 } }
-    assert.equal(paint.readyForLatest(input), false, 'A stale current snapshot cannot reuse an earlier good frame.')
-    chart.__chartSnapshot = snapshot
-    chart.dataset.chartRenderedBars = '95'
-    assert.equal(paint.readyForLatest(input), false, 'Current DOM completeness must still match the verified frame.')
-    chart.dataset.chartRenderedBars = '96'
-
-    paint.recheck()
-    const wrongLabel = paint.records.at(-1)
-    label.textContent = '113.203 ↑'
-    callbacks.at(-1)(25)
-    assert.equal(paint.isFrame(wrongLabel), false)
-    assert.match(paint.violations.at(-1), /RAF SVG live-price label/)
-    label.textContent = '113.204 ↑'
-
-    paint.recheck()
-    const replaced = paint.records.at(-1)
-    chart.__chartSnapshot = { ...snapshot, liveBar: { hour: 1000, close: 113.205 } }
-    label.textContent = '113.205 ↑'
-    callbacks.at(-1)(30)
-    assert.equal(replaced.frame.sequence, 5)
-    assert.equal(replaced.frame.sameSnapshot, false)
-    assert.equal(paint.isFrame(replaced), false)
-    chart.__chartSnapshot = { ...snapshot, liveBar: { hour: 1000, close: 113.2044 } }
-    label.textContent = '113.2044 ↑'
-    mutation()
-    const offGrid = paint.records.at(-1)
-    callbacks.at(-1)(35)
-    assert.equal(offGrid.frame.sequence, 4, 'Rounding alone would accept this incorrect quote.')
-    assert.equal(paint.readyForLatest(input), false)
-    assert.match(paint.violations.at(-1), /synthetic quote/)
-  } finally {
-    for (const [name, descriptor] of original) {
-      if (descriptor) Object.defineProperty(globalThis, name, descriptor)
-      else delete globalThis[name]
+  context.after(() => {
+    try { window.__resourcePaint?.stop() }
+    finally {
+      for (const [name, descriptor] of original) {
+        if (descriptor) Object.defineProperty(globalThis, name, descriptor)
+        else delete globalThis[name]
+      }
     }
+  })
+  globalThis.window = {}
+  globalThis.document = { querySelector: () => chart }
+  globalThis.MutationObserver = class {
+    constructor(callback) { mutation = callback }
+    observe() {}
+    disconnect() { disconnected++; if (disconnectError) throw disconnectError }
   }
+  globalThis.requestAnimationFrame = callback => { callbacks.push(callback); return callbacks.length }
+  globalThis.cancelAnimationFrame = id => cancelled.push(id)
+  installResourcePaintProbe({ intervals: { '15m': 100 }, periods: 320, asOf: 1000 })
+  return { chart, bars, snapshot, svg, label, callbacks, cancelled, paint: window.__resourcePaint,
+    mutation: () => mutation(), at: value => { now = value }, disconnected: () => disconnected,
+    failDisconnect: error => { disconnectError = error } }
+}
+
+test('renderer probe reads the displayed SVG and snapshot again at RAF, including an unchanged cached frame', context => {
+  const { chart, snapshot, label, callbacks, paint, mutation, at } = resourceProbeFixture(context)
+  mutation()
+  const record = paint.records[0]
+  chart.dataset.chartRequestedEnd = '800' // The requested history has not replaced the live SVG.
+  at(1010)
+  callbacks[1](10)
+  assert.equal(record.frame.sameSnapshot, true)
+  assert.equal(record.frame.requestedEnd, 800)
+  assert.equal(record.frame.renderedEnd, 1000)
+  assert.equal(record.frame.sequence, 4)
+  assert.equal(record.frame.label, '113.204 ↑')
+  assert.equal(paint.isFrame(record), true)
+  assert.deepEqual(paint.violations, [])
+  const input = { instId: snapshot.instId, timeframe: snapshot.timeframe, sequence: 4, afterAt: performance.timeOrigin + 1011 }
+  assert.equal(paint.readyForLatest(input), false, 'An earlier verified frame must not satisfy a later return input.')
+
+  at(1012)
+  paint.recheck()
+  const unchanged = paint.records.at(-1)
+  at(1015)
+  callbacks.at(-1)(20)
+  assert.equal(unchanged.kind, 'recheck')
+  assert.equal(unchanged.committedAt, record.committedAt)
+  assert.equal(paint.isFrame(unchanged), true)
+  assert.equal(paint.readyForLatest(input), true)
+  chart.__chartSnapshot = { ...snapshot, liveBar: { hour: 1000, close: 113.203 } }
+  assert.equal(paint.readyForLatest(input), false, 'A stale current snapshot cannot reuse an earlier good frame.')
+  chart.__chartSnapshot = snapshot
+  chart.dataset.chartRenderedBars = '95'
+  assert.equal(paint.readyForLatest(input), false, 'Current DOM completeness must still match the verified frame.')
+  chart.dataset.chartRenderedBars = '96'
+
+  paint.recheck()
+  const wrongLabel = paint.records.at(-1)
+  label.textContent = '113.203 ↑'
+  callbacks.at(-1)(25)
+  assert.equal(paint.isFrame(wrongLabel), false)
+  assert.deepEqual(paint.violations, [], 'Numerical validation must not run inside the timed RAF.')
+  label.textContent = '113.204 ↑'
+
+  paint.recheck()
+  const replaced = paint.records.at(-1)
+  chart.__chartSnapshot = { ...snapshot, liveBar: { hour: 1000, close: 113.205 } }
+  label.textContent = '113.205 ↑'
+  callbacks.at(-1)(30)
+  assert.equal(replaced.frame.sequence, 5)
+  assert.equal(replaced.frame.sameSnapshot, false)
+  assert.equal(paint.isFrame(replaced), false)
+  chart.__chartSnapshot = { ...snapshot, liveBar: { hour: 1000, close: 113.2044 } }
+  label.textContent = '113.2044 ↑'
+  mutation()
+  const offGrid = paint.records.at(-1)
+  callbacks.at(-1)(35)
+  assert.equal(offGrid.frame.sequence, 4, 'Rounding alone would accept this incorrect quote.')
+  assert.equal(paint.readyForLatest(input), false)
+  assert.deepEqual(paint.violations, [])
+  const result = paint.finish()
+  assert.equal(result.complete, false)
+  assert.ok(result.violations.some(value => /RAF SVG live-price label/.test(value)))
+  assert.ok(result.violations.some(value => /synthetic quote/.test(value)))
+})
+
+test('resource capture ends before numerical validation and reuses unchanged immutable bars', context => {
+  const { paint, mutation, callbacks, at, disconnected, cancelled } = resourceProbeFixture(context, { indicators: true, frozen: true })
+  let oracleCalls = 0
+  const markers = []
+  context.mock.method(console, 'timeStamp', title => markers.push(JSON.parse(title.slice('resource-test:'.length))))
+  const sqrt = Math.sqrt
+  context.mock.method(Math, 'sqrt', value => { oracleCalls++; return sqrt(value) })
+  mutation()
+  at(1010); callbacks[1](10)
+  assert.deepEqual(markers, [], 'Initial preparation must not enter the measured CPU stream.')
+  paint.armCPU('resource-test:')
+  at(1011); callbacks[0](11)
+  paint.recheck()
+  at(1015); callbacks.at(-1)(15)
+  assert.equal(oracleCalls, 0)
+  assert.equal(paint.indicatorValuesChecked, 0)
+  const stopped = paint.stop(), count = paint.records.length, samples = paint.captureTimings.samples
+  assert.equal(paint.active, false)
+  assert.equal(oracleCalls, 0, 'Stopping timing must not start the oracle before memory/scheduler windows end.')
+  assert.equal(disconnected(), 1)
+  assert.ok(cancelled.includes(3), 'The next continuous RAF callback must be cancelled.')
+  at(1050)
+  mutation(); callbacks[0](50); callbacks[1](50); callbacks[2](50); paint.recheck()
+  assert.equal(paint.records.length, count)
+  assert.equal(paint.captureTimings.samples, samples)
+  assert.equal(paint.stop(), stopped)
+  assert.deepEqual(markers.map(value => [value.phase, value.index]), [['start', 0], ['raf', 1], ['stop', 2]])
+  const result = paint.finish()
+  assert.equal(result.complete, true)
+  assert.deepEqual(result.violations, [])
+  assert.equal(result.indicatorValuesChecked, 96 * 12)
+  assert.equal(oracleCalls, 96, 'The identical retained bar set is checked once across commit and RAF captures.')
+  assert.ok(result.deferredValidation.reusedBarChecks > 0)
+  assert.ok(result.captureTimings.samples > 0)
+  assert.equal(result.cpuMarkerTimings.samples, 3)
+  assert.ok(result.deferredValidation.durationMS >= 0)
+  assert.equal(paint.finish(), result)
+  assert.ok(Object.isFrozen(result.captureTimings) && Object.isFrozen(result.violations))
+})
+
+test('resource commit timestamps precede capture work and repaired incomplete paints remain rejected', context => {
+  const { paint, mutation, callbacks, snapshot, bars, chart, at } = resourceProbeFixture(context)
+  let advanced = false
+  Object.defineProperty(snapshot, 'bars', { configurable: true, get() {
+    if (!advanced) { advanced = true; at(1025) }
+    return bars
+  } })
+  const removed = bars.pop()
+  chart.dataset.chartRenderedBars = '95'
+  mutation()
+  const record = paint.records[0]
+  assert.equal(record.committedAt, performance.timeOrigin + 1000, 'Observed commit time must not include capture or oracle work.')
+  assert.equal(paint.captureTimings.maxMS, 25)
+  at(1040); callbacks[1](40)
+  assert.equal(paint.isFrame(record), false)
+  bars.push(removed); chart.dataset.chartRenderedBars = '96'
+  const result = paint.finish()
+  assert.equal(result.complete, false)
+  assert.ok(result.violations.some(value => /ready resource paint is incomplete/.test(value)))
+})
+
+test('deferred resource validation retains mutable corruption and wrong RAF labels after repair', context => {
+  const { paint, mutation, callbacks, bars, label, at } = resourceProbeFixture(context, { indicators: true })
+  const ema = bars[0].ema
+  bars[0].ema += 7
+  mutation()
+  const record = paint.records[0]
+  bars[0].ema = ema
+  label.textContent = '113.203 ↑'
+  at(1010); callbacks[1](10)
+  assert.equal(record.frame.sameSnapshot, false, 'Mutating the same source object cannot reuse a retained earlier frame.')
+  label.textContent = '113.204 ↑'
+  const result = paint.finish()
+  assert.equal(result.complete, false)
+  assert.ok(result.violations.some(value => /224\/ema/.test(value)), 'Repairing the source must not rewrite the captured corruption.')
+  assert.ok(result.violations.some(value => /RAF SVG live-price label/.test(value)), 'Repairing the current label must not rewrite the RAF observation.')
+  assert.equal(Object.isFrozen(bars), false)
+  assert.equal(Object.isFrozen(bars[0]), false, 'Capture must not mutate or freeze application-owned fixture data.')
+})
+
+test('continuous resource RAF capture retains repaired DOM-only corruption with an unchanged snapshot', context => {
+  const { paint, mutation, callbacks, label, svg, at } = resourceProbeFixture(context, { frozen: true })
+  mutation(); at(1010); callbacks[1](10)
+  label.textContent = '113.203 ↑'
+  at(1015); callbacks[0](15)
+  label.textContent = '113.204 ↑'
+  svg.dataset.renderedInst = 'SCALE999-USDT-SWAP'
+  at(1020); callbacks[2](20)
+  svg.dataset.renderedInst = 'SCALE000-USDT-SWAP'
+  assert.equal(paint.records.length, 1, 'Continuous display checks must not fabricate extra commits.')
+  const result = paint.finish()
+  assert.equal(result.complete, false)
+  assert.ok(result.violations.some(value => /RAF SVG live-price label/.test(value)))
+  assert.ok(result.violations.some(value => /SVG mixed native series identities/.test(value)))
+})
+
+test('resource capture failures and pending RAF cleanup remain explicit and idempotent', context => {
+  const { paint, mutation, callbacks, snapshot, bars, failDisconnect, disconnected, cancelled } = resourceProbeFixture(context)
+  Object.defineProperty(snapshot, 'bars', { configurable: true, get() { throw new Error('injected retained-bar read failure') } })
+  mutation()
+  assert.equal(paint.records.length, 0)
+  Object.defineProperty(snapshot, 'bars', { configurable: true, value: bars })
+  mutation()
+  failDisconnect(new Error('injected observer disconnect failure'))
+  const result = paint.finish()
+  assert.equal(paint.active, false)
+  assert.equal(result.complete, false)
+  assert.ok(result.captureErrors.some(value => /retained-bar read/.test(value.message)))
+  assert.ok(result.captureErrors.some(value => value.stage === 'disconnect'))
+  assert.equal(result.stopped.pendingFrameObservations, 1)
+  assert.deepEqual(cancelled, [1, 2])
+  const count = paint.records.length
+  callbacks[1](20); mutation()
+  assert.equal(paint.records.length, count)
+  assert.equal(paint.records[0].nextFrameAt, null, 'A cancelled RAF must not turn into fabricated display evidence.')
+  assert.equal(paint.finish(), result)
+  assert.equal(disconnected(), 1)
 })
 
 test('resource acceptance rejects a middle stall even when the final input is fast', () => {

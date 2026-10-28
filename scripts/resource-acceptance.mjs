@@ -2,14 +2,77 @@ import assert from 'node:assert/strict'
 const crossProcessOriginToleranceMS = 2 // Epoch-origin precision across Node and Chromium monotonic clocks.
 const liveDeliveryBudgetMS = 100
 
-// Installed in the renderer so each RAF records the actual displayed state.
+// Timed callbacks retain observed data and the displayed SVG. The fixture
+// oracle runs only after capture and the benchmark's measurement windows stop.
 export function installResourcePaintProbe(fixture) {
-  const state = window.__resourcePaint = { records: [], violations: [], indicatorValuesChecked: 0, previous: null, frameGaps: [], previousFrame: null }
-  const snapshots = new WeakMap()
-  const near = (actual, expected, description) => {
-    if (expected === null ? actual !== null : typeof actual !== 'number' || !Number.isFinite(actual) || Math.abs(actual - expected) > Math.max(1, Math.abs(expected)) * 1e-10) {
-      if (state.violations.length < 40) state.violations.push(`${description}: ${actual} != ${expected}`)
+  if (window.__resourcePaint?.active) throw new Error('The previous resource paint probe must stop before starting another.')
+  const state = window.__resourcePaint = { active: true, records: [], violations: [], indicatorValuesChecked: 0,
+    previous: null, frameGaps: [], previousFrame: null, captureErrors: [], omittedCaptureErrors: 0,
+    captureTimings: { samples: 0, totalMS: 0, maxMS: 0 }, cpuMarkerTimings: { samples: 0, totalMS: 0, maxMS: 0 } }
+  const observations = [], snapshots = new WeakMap(), pendingFrames = new Set()
+  const barCopies = new WeakMap(), barsCopies = new WeakMap(), snapshotCopies = new WeakMap()
+  let previousRetained, observer, loopFrame, stopped, finished, cpuPrefix, cpuIndex = 0
+  const failCapture = (stage, error) => {
+    if (state.captureErrors.length < 40) state.captureErrors.push({ stage, message: String(error?.message ?? error) })
+    else state.omittedCaptureErrors++
+  }
+  const capture = (stage, operation) => {
+    if (!state.active) return
+    const started = performance.now()
+    try { return operation(performance.timeOrigin + started) }
+    catch (error) { failCapture(stage, error) }
+    finally {
+      const durationMS = performance.now() - started
+      state.captureTimings.samples++; state.captureTimings.totalMS += durationMS
+      state.captureTimings.maxMS = Math.max(state.captureTimings.maxMS, durationMS)
     }
+  }
+  const markCPU = phase => {
+    if (!cpuPrefix) return
+    const started = performance.now()
+    try { console.timeStamp(cpuPrefix + JSON.stringify({ at: started, timeOrigin: performance.timeOrigin, phase, index: cpuIndex++ })) }
+    catch (error) { failCapture('cpu-marker', error) }
+    finally {
+      const durationMS = performance.now() - started
+      state.cpuMarkerTimings.samples++; state.cpuMarkerTimings.totalMS += durationMS
+      state.cpuMarkerTimings.maxMS = Math.max(state.cpuMarkerTimings.maxMS, durationMS)
+    }
+  }
+  state.armCPU = prefix => {
+    if (!state.active || cpuPrefix || typeof prefix !== 'string' || !prefix) throw new Error('A resource CPU marker stream can be armed once during active capture.')
+    cpuPrefix = prefix; markCPU('start')
+  }
+  const retainBar = value => {
+    if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value
+    const previous = barCopies.get(value), keys = Object.keys(value)
+    if (previous && keys.length === Object.keys(previous).length && keys.every(key => Object.is(value[key], previous[key]))) return previous
+    const retained = Object.freeze({ ...value }); barCopies.set(value, retained); return retained
+  }
+  const retainBars = bars => {
+    if (!Array.isArray(bars)) return bars
+    const entry = barsCopies.get(bars)
+    if (entry?.immutable) return entry.value
+    if (!entry && Object.isFrozen(bars) && bars.every(value => !value || typeof value !== 'object' || Object.isFrozen(value))) {
+      barsCopies.set(bars, { immutable: true, value: bars }); return bars
+    }
+    const previous = entry?.value
+    let next = !previous || previous.length !== bars.length ? [] : null
+    for (let index = 0; index < bars.length; index++) {
+      const value = retainBar(bars[index])
+      if (!next && previous[index] !== value) next = previous.slice(0, index)
+      if (next) next.push(value)
+    }
+    if (!next) return previous
+    const retained = Object.freeze(next); barsCopies.set(bars, { immutable: false, value: retained }); return retained
+  }
+  const retainSnapshot = snapshot => {
+    if (!snapshot || typeof snapshot !== 'object') return snapshot
+    const bars = retainBars(snapshot.bars), liveBar = retainBar(snapshot.liveBar)
+    if (Object.isFrozen(snapshot) && bars === snapshot.bars && liveBar === snapshot.liveBar) return snapshot
+    const keys = Object.keys(snapshot), valueAt = key => key === 'bars' ? bars : key === 'liveBar' ? liveBar : snapshot[key]
+    const previous = snapshotCopies.get(snapshot)
+    if (previous && keys.length === Object.keys(previous).length && keys.every(key => Object.is(valueAt(key), previous[key]))) return previous
+    const retained = Object.freeze({ ...snapshot, bars, liveBar }); snapshotCopies.set(snapshot, retained); return retained
   }
   const displayed = (chart = document.querySelector('[data-chart-inst]')) => {
     const snapshot = chart?.__chartSnapshot, svg = chart?.querySelector('svg[data-rendered-inst]')
@@ -19,7 +82,7 @@ export function installResourcePaintProbe(fixture) {
     const instrument = Number(snapshot?.instId?.slice(5, 8)), step = fixture.intervals[snapshot?.timeframe]
     const baseline = 100 + instrument * 3 + ({ '5m': 0, '15m': 10, '1H': 20 })[snapshot?.timeframe]
     const sequence = liveVisible && Number.isFinite(baseline) && step ? Math.round((snapshot.liveBar.close - baseline - fixture.periods * .01) * 1000) : 0
-    return { snapshot, frame: { instId: snapshot?.instId ?? null, timeframe: snapshot?.timeframe ?? null,
+    return { snapshot, frame: Object.freeze({ instId: snapshot?.instId ?? null, timeframe: snapshot?.timeframe ?? null,
       chartInst: chart?.dataset.chartInst ?? null, chartEnd: number(chart?.dataset.chartEnd),
       requestedEnd: number(chart?.dataset.chartRequestedEnd), visualStale: chart?.dataset.chartVisualStale ?? null,
       loading: chart?.dataset.chartLoading ?? null, endHour: snapshot?.endHour ?? null,
@@ -29,7 +92,7 @@ export function installResourcePaintProbe(fixture) {
       sequence, expectedLivePrice: liveVisible ? baseline + fixture.periods * .01 + sequence * .001 : null,
       label: svg?.querySelector('[data-chart-price-label-value]')?.textContent ?? '',
       bars: snapshot?.bars?.length ?? 0, renderedBars: number(chart?.dataset.chartRenderedBars), indicatorState: snapshot?.indicatorState ?? null,
-      oiState: snapshot?.oiState ?? null, takerState: snapshot?.takerState ?? null } }
+      oiState: snapshot?.oiState ?? null, takerState: snapshot?.takerState ?? null }) }
   }
   state.isFrame = record => {
     const frame = record?.frame
@@ -40,85 +103,147 @@ export function installResourcePaintProbe(fixture) {
       && record.label === frame.label && Number.isFinite(record.nextFrameAt)
       && record.nextFrameAt >= record.committedAt)
   }
-  const observeFrame = (record, snapshot) => {
-    snapshots.set(record, snapshot)
-    requestAnimationFrame(() => {
-      record.nextFrameAt = performance.timeOrigin + performance.now()
-      const observed = displayed()
-      record.frame = { ...observed.frame, sameSnapshot: observed.snapshot === snapshot }
-      if (record.frame.sameSnapshot && record.frame.liveHour !== null && record.frame.liveHour === record.frame.renderedEnd) {
-        near(record.frame.livePrice, record.frame.expectedLivePrice, 'RAF synthetic quote')
-        near(Number(record.frame.label.split(/\s/)[0].replaceAll(',', '')), record.frame.livePrice, 'RAF SVG live-price label')
-      }
+  const observeFrame = (record, snapshot, retained) => {
+    snapshots.set(record, { snapshot, retained })
+    const id = requestAnimationFrame(() => {
+      pendingFrames.delete(id)
+      capture('raf', at => {
+        const observed = displayed(), observedSnapshot = retainSnapshot(observed.snapshot)
+        record.nextFrameAt = at
+        record.frame = Object.freeze({ ...observed.frame, sameSnapshot: observed.snapshot === snapshot && observedSnapshot === retained })
+        observations.push({ kind: 'raf', at, snapshot: observedSnapshot, frame: record.frame })
+      })
     })
+    pendingFrames.add(id)
   }
-  const sample = () => {
+  const sample = () => capture('snapshot', at => {
     const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
-    if (!snapshot?.instId?.startsWith('SCALE') || snapshot === state.previous) return
-    const observed = displayed(chart)
-    if (!observed.frame.renderedInst) return
-    const frame = observed.frame
-    state.previous = snapshot
-    if (frame.renderedInst !== snapshot.instId || frame.renderedTimeframe !== snapshot.timeframe) state.violations.push('SVG mixed native series identities.')
-    const instrument = Number(snapshot.instId.slice(5, 8)), step = fixture.intervals[snapshot.timeframe]
-    const first = Math.floor(fixture.asOf / step) * step - fixture.periods * step
-    const baseline = 100 + instrument * 3 + ({ '5m': 0, '15m': 10, '1H': 20 })[snapshot.timeframe]
-    for (const value of snapshot.bars) {
-      const index = (value.hour - first) / step, close = baseline + index * .01
-      if (!Number.isInteger(index) || index < 0 || index >= fixture.periods) { state.violations.push('A persisted candle fell outside its seeded native range.'); continue }
-      for (const [field, expected] of Object.entries({ open: close - .02, high: close + .06, low: close - .05, close })) near(value[field], expected, `${snapshot.instId}/${snapshot.timeframe}/${index}/${field}`)
-      if (value.indicatorsObserved) {
-        const middle = close - .095, deviation = .01 * Math.sqrt(399 / 12)
-        const roc = i => (baseline + i * .01 - (baseline + (i - 9) * .01)) / Math.abs(baseline + (i - 9) * .01) * 100
-        let numerator = 0, denominator = 0
-        for (let i = Math.max(0, index - 13); i <= index; i += 1) { const volume = 100 + i % 7; numerator += (baseline + i * .01 + .01 / 3) * volume; denominator += volume }
-        const expected = { ema: index >= 199 ? close - .995 : null,
-          bollMiddle: index >= 19 ? middle : null, bollUpper: index >= 19 ? middle + 2 * deviation : null, bollLower: index >= 19 ? middle - 2 * deviation : null,
-          vwap: index >= 13 ? numerator / denominator : null, roc: index >= 9 ? roc(index) : null,
-          maroc: index >= 17 ? Array.from({ length: 9 }, (_, offset) => roc(index - offset)).reduce((a, b) => a + b, 0) / 9 : null,
-          rsi6: index >= 6 ? 100 : null, rsi12: index >= 12 ? 100 : null, rsi24: index >= 24 ? 100 : null,
-          atrPercent: index >= 13 ? .11 / close * 100 : null, bbw: index >= 19 ? 4 * deviation / middle * 100 : null }
-        for (const [field, expectedValue] of Object.entries(expected)) { near(value[field], expectedValue, `${snapshot.instId}/${snapshot.timeframe}/${index}/${field}`); state.indicatorValuesChecked += 1 }
-      }
-    }
-    const label = frame.label
-    const liveVisible = snapshot.liveBar && frame.renderedEnd === snapshot.liveBar.hour
-    if (liveVisible) {
-      near(snapshot.liveBar.close, frame.expectedLivePrice, 'Visible synthetic quote')
-      near(Number(label.split(/\s/)[0].replaceAll(',', '')), snapshot.liveBar.close, 'Visible SVG live-price label')
-    }
-    const record = { instId: snapshot.instId, timeframe: snapshot.timeframe, endHour: snapshot.endHour,
-      livePrice: snapshot.liveBar?.close ?? null, priceObservedAt: snapshot.priceObservedAt,
-      sequence: frame.sequence, kind: 'commit', committedAt: performance.timeOrigin + performance.now(), nextFrameAt: null, frame: null, label, bars: snapshot.bars.length,
-      indicatorState: snapshot.indicatorState, oiState: snapshot.oiState, takerState: snapshot.takerState }
-    state.records.push(record)
-    state.current = record
-    state.latestWitness = record
-    observeFrame(record, snapshot)
-  }
-  // Recheck even an unchanged cached live snapshot after a viewport input.
-  // This is a frame observation, not a new SVG commit.
+    if (!snapshot?.instId?.startsWith('SCALE')) return
+    const retained = retainSnapshot(snapshot)
+    if (snapshot === state.previous && retained === previousRetained) return
+    const observed = displayed(chart), frame = observed.frame
+    if (!frame.renderedInst) return
+    state.previous = snapshot; previousRetained = retained
+    observations.push({ kind: 'commit', at, snapshot: retained, frame })
+    const record = { instId: retained.instId, timeframe: retained.timeframe, endHour: retained.endHour,
+      livePrice: retained.liveBar?.close ?? null, priceObservedAt: retained.priceObservedAt,
+      sequence: frame.sequence, kind: 'commit', committedAt: at, nextFrameAt: null, frame: null, label: frame.label, bars: retained.bars?.length ?? 0,
+      indicatorState: retained.indicatorState, oiState: retained.oiState, takerState: retained.takerState }
+    state.records.push(record); state.current = record; state.latestWitness = record
+    observeFrame(record, snapshot, retained)
+  })
+  // A cached frame still owes a fresh RAF observation after viewport input.
   state.recheck = () => {
     sample()
-    if (!state.current) return
-    const record = { ...state.current, kind: 'recheck', sampledAt: performance.timeOrigin + performance.now(), nextFrameAt: null, frame: null }
-    state.records.push(record)
-    state.latestWitness = record
-    observeFrame(record, state.previous)
+    capture('recheck', at => {
+      if (!state.current) return
+      const record = { ...state.current, kind: 'recheck', sampledAt: at, nextFrameAt: null, frame: null }
+      state.records.push(record); state.latestWitness = record
+      observeFrame(record, state.previous, previousRetained)
+    })
   }
-  state.readyForLatest = ({ instId, timeframe, sequence, afterAt }) => {
-    const observed = displayed(), record = state.latestWitness
-    if (!record || observed.snapshot !== state.previous || snapshots.get(record) !== observed.snapshot || !state.isFrame(record)
+  state.readyForLatest = input => capture('readiness', () => {
+    const { instId, timeframe, sequence, afterAt } = input, observed = displayed(), record = state.latestWitness, source = snapshots.get(record)
+    if (!record || observed.snapshot !== state.previous || source?.snapshot !== observed.snapshot
+      || source.retained !== retainSnapshot(observed.snapshot) || !state.isFrame(record)
       || record.instId !== instId || record.timeframe !== timeframe || record.sequence !== sequence || record.nextFrameAt < afterAt) return false
-    const frame = observed.frame
-    const current = { ...record, frame: { ...frame, sameSnapshot: true } }
+    const frame = observed.frame, current = { ...record, frame: { ...frame, sameSnapshot: true } }
     return state.isFrame(current) && frame.sequence === sequence && frame.liveHour === frame.renderedEnd
       && Number.isFinite(frame.expectedLivePrice) && Number.isFinite(frame.livePrice)
       && Math.abs(frame.livePrice - frame.expectedLivePrice) <= Math.max(1, Math.abs(frame.expectedLivePrice)) * 1e-10
+  })
+  state.stop = () => {
+    if (stopped) return stopped
+    sample()
+    state.active = false
+    const endedAt = performance.timeOrigin + performance.now(), pendingFrameObservations = pendingFrames.size
+    try { observer?.disconnect() } catch (error) { failCapture('disconnect', error) }
+    for (const id of [loopFrame, ...pendingFrames]) if (id !== undefined) {
+      try { cancelAnimationFrame(id) } catch (error) { failCapture('cancel-raf', error) }
+    }
+    pendingFrames.clear()
+    markCPU('stop')
+    for (const record of state.records) Object.freeze(record)
+    Object.freeze(state.records); Object.freeze(state.frameGaps)
+    return stopped = Object.freeze({ endedAt, pendingFrameObservations })
   }
-  new MutationObserver(sample).observe(document, { subtree: true, attributes: true, childList: true })
-  const frame = timestamp => { if (state.previousFrame !== null) state.frameGaps.push(timestamp - state.previousFrame); state.previousFrame = timestamp; sample(); requestAnimationFrame(frame) }
-  requestAnimationFrame(frame)
+  state.finish = () => {
+    if (finished) return finished
+    const stop = state.stop(), started = performance.now(), validated = new WeakMap()
+    let omittedViolations = 0, reusedBarChecks = 0
+    const violate = message => { if (state.violations.length < 40) state.violations.push(message); else omittedViolations++ }
+    const near = (actual, expected, description) => {
+      if (expected === null ? actual !== null : typeof actual !== 'number' || !Number.isFinite(actual) || Math.abs(actual - expected) > Math.max(1, Math.abs(expected)) * 1e-10) {
+        violate(`${description}: ${actual} != ${expected}`)
+      }
+    }
+    for (const { kind, snapshot, frame } of observations) {
+      if (!snapshot?.instId?.startsWith('SCALE')) continue
+      try {
+        if (frame.renderedInst !== snapshot.instId || frame.renderedTimeframe !== snapshot.timeframe) violate('SVG mixed native series identities.')
+        const instrument = Number(snapshot.instId.slice(5, 8)), step = fixture.intervals[snapshot.timeframe]
+        const first = Math.floor(fixture.asOf / step) * step - fixture.periods * step
+        const baseline = 100 + instrument * 3 + ({ '5m': 0, '15m': 10, '1H': 20 })[snapshot.timeframe]
+        if (!Array.isArray(snapshot.bars)) { violate('A resource observation lacks its persisted bars.'); continue }
+        if (frame.visible && frame.visualStale === 'false' && frame.loading === 'false' && snapshot.indicatorState === 'ready'
+          && (snapshot.bars.length !== 96 || frame.bars !== 96 || frame.renderedBars !== 96)) {
+          violate(`A ready resource paint is incomplete: ${snapshot.bars.length} retained, ${frame.bars} snapshot and ${frame.renderedBars} rendered bars.`)
+        }
+        const key = `${snapshot.instId}:${snapshot.timeframe}`, known = validated.get(snapshot.bars)
+        if (known?.has(key)) reusedBarChecks++
+        else {
+          for (const value of snapshot.bars) {
+            const index = (value.hour - first) / step, close = baseline + index * .01
+            if (!Number.isInteger(index) || index < 0 || index >= fixture.periods) { violate('A persisted candle fell outside its seeded native range.'); continue }
+            for (const [field, expected] of Object.entries({ open: close - .02, high: close + .06, low: close - .05, close })) near(value[field], expected, `${snapshot.instId}/${snapshot.timeframe}/${index}/${field}`)
+            if (value.indicatorsObserved) {
+              const middle = close - .095, deviation = .01 * Math.sqrt(399 / 12)
+              const roc = i => (baseline + i * .01 - (baseline + (i - 9) * .01)) / Math.abs(baseline + (i - 9) * .01) * 100
+              let numerator = 0, denominator = 0
+              for (let i = Math.max(0, index - 13); i <= index; i += 1) { const volume = 100 + i % 7; numerator += (baseline + i * .01 + .01 / 3) * volume; denominator += volume }
+              const expected = { ema: index >= 199 ? close - .995 : null,
+                bollMiddle: index >= 19 ? middle : null, bollUpper: index >= 19 ? middle + 2 * deviation : null, bollLower: index >= 19 ? middle - 2 * deviation : null,
+                vwap: index >= 13 ? numerator / denominator : null, roc: index >= 9 ? roc(index) : null,
+                maroc: index >= 17 ? Array.from({ length: 9 }, (_, offset) => roc(index - offset)).reduce((a, b) => a + b, 0) / 9 : null,
+                rsi6: index >= 6 ? 100 : null, rsi12: index >= 12 ? 100 : null, rsi24: index >= 24 ? 100 : null,
+                atrPercent: index >= 13 ? .11 / close * 100 : null, bbw: index >= 19 ? 4 * deviation / middle * 100 : null }
+              for (const [field, expectedValue] of Object.entries(expected)) { near(value[field], expectedValue, `${snapshot.instId}/${snapshot.timeframe}/${index}/${field}`); state.indicatorValuesChecked++ }
+            }
+          }
+          if (known) known.add(key); else validated.set(snapshot.bars, new Set([key]))
+        }
+        if (snapshot.liveBar && frame.renderedEnd === snapshot.liveBar.hour) {
+          near(snapshot.liveBar.close, frame.expectedLivePrice, `${kind === 'raf' ? 'RAF' : 'Visible'} synthetic quote`)
+          near(Number(frame.label.split(/\s/)[0].replaceAll(',', '')), snapshot.liveBar.close, `${kind === 'raf' ? 'RAF' : 'Visible'} SVG live-price label`)
+        }
+      } catch (error) { violate(`Deferred resource validation failed: ${String(error?.message ?? error)}`) }
+    }
+    if (!observations.length) failCapture('observations', 'No resource paint observations were captured.')
+    const deferredValidation = Object.freeze({ observations: observations.length, reusedBarChecks, durationMS: performance.now() - started })
+    Object.freeze(state.violations)
+    return finished = Object.freeze({ complete: state.captureErrors.length === 0 && state.omittedCaptureErrors === 0 && state.violations.length === 0,
+      violations: state.violations, omittedViolations, indicatorValuesChecked: state.indicatorValuesChecked, rendererCommits: state.records.length,
+      captureErrors: Object.freeze(state.captureErrors.map(error => Object.freeze({ ...error }))), omittedCaptureErrors: state.omittedCaptureErrors,
+      captureTimings: Object.freeze({ ...state.captureTimings }), cpuMarkerTimings: Object.freeze({ ...state.cpuMarkerTimings }),
+      deferredValidation, stopped: stop })
+  }
+  observer = new MutationObserver(sample)
+  observer.observe(document, { subtree: true, attributes: true, childList: true })
+  const frame = timestamp => {
+    if (!state.active) return
+    if (state.previousFrame !== null) state.frameGaps.push(timestamp - state.previousFrame)
+    state.previousFrame = timestamp
+    sample()
+    // DOM-only corruption must not disappear behind an unchanged data snapshot
+    // or be repaired before the next explicit commit/recheck observation.
+    capture('displayed-raf', at => {
+      const observed = displayed()
+      if (observed.snapshot?.instId?.startsWith('SCALE')) observations.push({ kind: 'raf', at,
+        snapshot: retainSnapshot(observed.snapshot), frame: observed.frame })
+    })
+    markCPU('raf'); loopFrame = requestAnimationFrame(frame)
+  }
+  loopFrame = requestAnimationFrame(frame)
 }
 
 // A commit is only evidence of a displayed frame when the RAF callback read

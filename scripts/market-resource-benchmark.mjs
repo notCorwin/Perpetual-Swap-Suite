@@ -11,6 +11,7 @@ import { requireForegroundTests } from '../electron/test-presentation.js'
 import { assessResourceBudgets, installResourcePaintProbe, summarizeResourceDelivery } from './resource-acceptance.mjs'
 import { waitForAsyncCondition } from './async-readiness.mjs'
 import { startRendererDiagnostics } from './renderer-diagnostics.mjs'
+import { startRendererCPUCounter } from './renderer-cpu-counter.mjs'
 
 const { values } = parseArgs({ options: { offscreen: { type: 'boolean' }, diagnostic: { type: 'boolean' }, ticks: { type: 'string' }, 'cadence-ms': { type: 'string' } } })
 const offscreen = values.offscreen === true
@@ -19,6 +20,11 @@ if (diagnosticDirectory && !values.diagnostic) throw new Error('Normal resource 
 if (values.diagnostic && !diagnosticDirectory) throw new Error('--diagnostic requires PERPETUAL_SWAP_RENDERER_DIAGNOSTICS for its separate profile output.')
 const ticks = Number(values.ticks ?? 60), cadenceMS = Number(values['cadence-ms'] ?? 500)
 if (!Number.isSafeInteger(ticks) || ticks < 60 || ticks > 1200 || !Number.isSafeInteger(cadenceMS) || cadenceMS < 20 || cadenceMS > 2000) throw new Error('Resource workloads require 60–1200 ticks and a 20–2000 ms cadence.')
+// Retain the full declared workload, including the 40-minute maximum, at known
+// display rates through 240 Hz. The extra three minutes cover setup selections,
+// interaction waits and draining. The counter grows on admission, not up front.
+const cpuCapacityBasis = { inputDurationMS: ticks * cadenceMS, additionalWindowMS: 180_000, maximumRAFRateHz: 240 }
+const cpuCapacity = Math.ceil((cpuCapacityBasis.inputDurationMS + cpuCapacityBasis.additionalWindowMS) * cpuCapacityBasis.maximumRAFRateHz / 1000) + 2
 if (!offscreen) requireForegroundTests()
 
 const root = fileURLToPath(new URL('..', import.meta.url))
@@ -30,8 +36,51 @@ const report = { generatedAt: new Date().toISOString(), mode: 'real Electron ren
   clock: 'Epoch-origin monotonic performance clocks for source schedule/receipt and renderer input/commit/RAF; 2 ms origin precision tolerance with raw clock deltas retained.',
   externalWebSocketTransportMeasured: false, externalNetworkMeasured: false, receiveToFrameBudgetMS: offscreen ? null : 100,
   samples: [], switches: [], history: [], memorySamples: [], viewIntents: [], outcome: 'running' }
-let electron, page, stopDiagnostics, stopped = false
+let electron, page, stopDiagnostics, rendererCPUCounter, rendererCPUStopped = false
+let stopped = false, measurementsStopped = false, paintValidated = false
 const probe = input => electron.evaluate((_electron, value) => globalThis.__marketBackend.probe(value), input)
+const stopMeasurements = async () => {
+  if (!page || measurementsStopped) return
+  const result = await page.evaluate(() => ({ capture: window.__resourcePaint?.stop(), scheduler: window.__finishResourceScheduler?.() }))
+  measurementsStopped = true
+  if (result.capture) report.paintCaptureStopped = result.capture
+  if (result.scheduler) report.schedulerAfterTicks = result.scheduler
+}
+const finishDiagnostics = async () => {
+  const finish = stopDiagnostics
+  stopDiagnostics = undefined
+  await finish?.()
+}
+const stopRendererCPU = async () => {
+  if (!rendererCPUCounter || rendererCPUStopped) return
+  rendererCPUStopped = true
+  const retain = value => {
+    const { samples, ...summary } = value
+    const markers = { start: samples[0]?.phase === 'start' && samples[0]?.index === 0,
+      raf: samples.some(sample => sample.phase === 'raf'), stop: samples.at(-1)?.phase === 'stop' }
+    report.rendererCPU = { ...summary, capacityBasis: cpuCapacityBasis, markers,
+      complete: summary.complete && markers.start && markers.raf && markers.stop }
+  }
+  try { retain(await rendererCPUCounter.stop()) }
+  catch (error) {
+    if (error.rendererCPUCounter) {
+      retain(error.rendererCPUCounter)
+      report.rendererCPU.complete = false
+      report.rendererCPU.artifactError = error.stack ?? error.message
+    }
+    throw error
+  }
+}
+const validatePaint = async () => {
+  if (!page || paintValidated) return
+  const value = await page.evaluate(() => window.__resourcePaint?.finish())
+  if (value) { report.correctness = value; paintValidated = true }
+}
+const secondaryFailure = (stage, error) => {
+  report.secondaryErrors ??= []
+  report.secondaryErrors.push({ stage, error: error.stack ?? error.message ?? String(error) })
+  report.outcome = 'failed'; process.exitCode = 1
+}
 
 try {
   const launchedAt = Date.now()
@@ -154,6 +203,9 @@ try {
   report.rendererFrameBarrier.selectedRaf = await selectedRaf.jsonValue()
   await selectedRaf.dispose()
   report.rendererFrameBarrier.selectedRaf.waitAfterUniverseMS = performance.now() - selectedFrameWaitStartedAt
+  rendererCPUCounter = await startRendererCPUCounter(page, { label: 'market-resources', capacity: cpuCapacity,
+    directory: join(dirname(reportPath), 'process-witness') })
+  await page.evaluate(prefix => window.__resourcePaint.armCPU(prefix), rendererCPUCounter.markerPrefix)
   let sequence = 0
   const choose = async (instId, phase) => {
     const expected = sequence ? 100 + Number(instId.slice(5, 8)) * 3 + 10 + fixture.periods * .01 + sequence * .001 : null
@@ -221,12 +273,24 @@ try {
       report.history.push({ distance, expectedEnd, inputToFrameMS: frame.nextFrameAt - inputAt, bars: frame.bars, oiState: frame.oiState, takerState: frame.takerState })
     }
   }
-  await Promise.all([monitor(), interact()])
+  // Join both measurement owners even when one fails. Neither memory sampling
+  // nor an in-flight interaction may overlap deferred numerical validation.
+  const workloadFailures = []
+  await Promise.allSettled([['monitor', monitor], ['interaction', interact]].map(async ([phase, operation]) => {
+    try { await operation() }
+    catch (error) { workloadFailures.push({ phase, error }); throw error }
+  }))
+  if (workloadFailures.length) {
+    report.workloadErrors = workloadFailures.map(({ phase, error }) => ({ phase, error: error.stack ?? error.message ?? String(error) }))
+    throw workloadFailures[0].error
+  }
   const finalIntent = report.viewIntents.at(-1)
   assert.ok(finalIntent && !finalIntent.historical && finalIntent.instId === focus && finalIntent.timeframe === timeframe,
     'The fixed-rate workload must finish on the selected live viewport.')
   await page.waitForFunction(input => window.__resourcePaint.readyForLatest(input),
     { instId: focus, timeframe, sequence, afterAt: finalIntent.at }, { timeout: 10_000 })
+  await stopMeasurements()
+  await stopRendererCPU()
   const commits = await page.evaluate(() => window.__resourcePaint.records)
   report.rendererCommits = commits
   report.load = load
@@ -234,20 +298,22 @@ try {
     const gaps = [...window.__resourcePaint.frameGaps].sort((left, right) => left - right)
     return { frames: gaps.length, medianMS: gaps[Math.floor((gaps.length - 1) * .5)], p95MS: gaps[Math.floor((gaps.length - 1) * .95)], maxMS: gaps.at(-1), visibilityState: document.visibilityState, focused: document.hasFocus() }
   })
-  report.schedulerAfterTicks = await page.evaluate(() => window.__finishResourceScheduler())
   assert.ok(load.ticks.every(tick => tick.nativeUpdates === fixture.instIds.length * fixture.timeframes.length),
     'Every fixed-rate input must update the complete contract/timeframe universe before visible-series timing can acknowledge it.')
   report.delivery = summarizeResourceDelivery(load, commits, { intents: report.viewIntents })
   report.samples = report.delivery.samples
-  await page.waitForFunction(() => window.__resourcePaint.indicatorValuesChecked > 0, null, { timeout: 30_000 })
-  report.correctness = await page.evaluate(() => ({ violations: window.__resourcePaint.violations, indicatorValuesChecked: window.__resourcePaint.indicatorValuesChecked, rendererCommits: window.__resourcePaint.records.length }))
+  report.acceptanceFailures = assessResourceBudgets({ load, delivery: report.delivery, switches: report.switches,
+    frameCadence: report.foregroundFrameCadence }, { offscreen })
   report.background = await probe({ action: 'backgroundStatus' })
   report.appMetricsAfterLoad = await electron.evaluate(({ app }) => app.getAppMetrics())
   report.schedulerAfterLoad = await page.evaluate(() => window.__resourceScheduler)
   report.rendererMemoryAfterLoad = await page.evaluate(() => performance.memory ? { usedJSHeapSize: performance.memory.usedJSHeapSize, totalJSHeapSize: performance.memory.totalJSHeapSize, jsHeapSizeLimit: performance.memory.jsHeapSizeLimit } : null)
   report.final = await probe({ action: 'scaleStop' }); stopped = true
-  report.acceptanceFailures = assessResourceBudgets({ load, delivery: report.delivery, switches: report.switches,
-    frameCadence: report.foregroundFrameCadence }, { offscreen })
+  await finishDiagnostics()
+  await validatePaint()
+  assert.equal(report.correctness.complete, true, 'Resource paint capture or deferred validation failed; all retained evidence is in correctness.')
+  assert.equal(report.rendererCPU.complete, true, 'Resource renderer CPU evidence must retain its complete start/RAF/stop marker stream.')
+  assert.ok(report.correctness.indicatorValuesChecked > 0, 'Resource acceptance must validate observed numerical indicators.')
   assert.deepEqual(report.correctness.violations, [])
   assert.equal(report.final.actualRows, fixture.rowsSeeded)
   assert.equal(report.final.minimumRowsPerSeries, fixture.periods)
@@ -274,9 +340,16 @@ try {
   console.error(error.stack ?? error.message)
   process.exitCode = 1
 } finally {
-  if (electron && !stopped) { try { report.final = await probe({ action: 'scaleStop' }) } catch {} }
-  try { await stopDiagnostics?.() }
-  catch (error) { report.diagnosticError = error.stack ?? error.message; report.outcome = 'failed'; process.exitCode = 1 }
+  try { await stopMeasurements() } catch (error) { secondaryFailure('stop-measurements', error) }
+  try { await stopRendererCPU() } catch (error) { secondaryFailure('stop-renderer-cpu', error) }
+  if (electron && !stopped) {
+    try { report.final = await probe({ action: 'scaleStop' }); stopped = true }
+    catch (error) { secondaryFailure('stop-source', error) }
+  }
+  try { await finishDiagnostics() } catch (error) { secondaryFailure('stop-diagnostics', error) }
+  try { await validatePaint() } catch (error) { secondaryFailure('validate-paint', error) }
+  if (report.correctness && !report.correctness.complete) { report.outcome = 'failed'; process.exitCode = 1 }
+  if (report.rendererCPU && !report.rendererCPU.complete) { report.outcome = 'failed'; process.exitCode = 1 }
   await mkdir(dirname(reportPath), { recursive: true })
   await writeFile(reportPath, JSON.stringify(report, null, 2))
   await electron?.close()

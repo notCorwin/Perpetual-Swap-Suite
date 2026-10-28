@@ -1,6 +1,33 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createChartColdBoundaryFixture } from '../../electron/e2e-fixtures.js'
+import { measureMissingWindow } from '../../scripts/chart-acceptance.mjs'
+
+for (const cleanupFails of [false, true]) test(`missing-window setup drains a partial source installation${cleanupFails ? ' without replacing its error with a cleanup error' : ''}`, async () => {
+  const setupError = new Error('Source installation failed after admission.')
+  const cleanupError = new Error('Source cleanup failed after draining.')
+  const actions = []
+  let active = false
+  const electron = { async evaluate(_operation, input) {
+    if (!input) return { visible: false, focused: false, offscreen: true }
+    actions.push(input.action)
+    if (input.action === 'coldBoundaryInstall') { active = true; throw setupError }
+    if (input.action === 'coldBoundaryRemove') { active = false; if (cleanupFails) throw cleanupError; return }
+    assert.fail(`Unexpected backend action: ${input.action}`)
+  } }
+  await assert.rejects(measureMissingWindow(electron, {}), error => {
+    if (cleanupFails) {
+      assert.ok(error instanceof AggregateError)
+      assert.deepEqual(error.errors, [setupError, cleanupError])
+      assert.equal(error.cause, setupError)
+      assert.match(error.message, /Source installation failed/)
+      assert.match(error.message, /Source cleanup failed/)
+    } else assert.equal(error, setupError)
+    return true
+  })
+  assert.equal(active, false, 'A failed setup must not leave source work owned by the next test.')
+  assert.deepEqual(actions, ['coldBoundaryInstall', 'coldBoundaryRemove'])
+})
 
 function fakeService(get = async () => []) {
   const listeners = new Set(), retired = [], focusChanges = []
