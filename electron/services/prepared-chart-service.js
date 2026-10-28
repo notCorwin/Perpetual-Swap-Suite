@@ -942,12 +942,16 @@ export class PreparedChartPipeline {
       }
       const admitted = await this.read(entry.state, entry.end, HISTORY, 'foreground', { ahead: entry.ahead, wanted })
       if (!admitted) this.recordFocusCancellation(entry, this.closed ? 'closed' : 'superseded', 'chart.history.admission')
-      if (admitted && wanted()) this.seed(entry.state, 'foreground', this.focus)
+      if (admitted && wanted()) this.focusSeed(entry.state, this.focus)
       return admitted
     })
     const finish = (succeeded, value) => {
       this.focusReads.delete(entry)
-      if (!this.closed) this.trim()
+      try { if (!this.closed) this.trim() }
+      catch (cleanup) {
+        value = succeeded ? cleanup : new AggregateError([value, cleanup], `${value?.message ?? value}\n${cleanup.message}`, { cause: value })
+        succeeded = false
+      }
       for (const waiter of entry.waiters.values()) succeeded ? waiter.resolve(value) : waiter.reject(value)
       entry.waiters.clear(); entry.resolveDone()
       const next = this.pendingFocusRead

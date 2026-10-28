@@ -226,6 +226,29 @@ test('historical reads bypass a held old cursor and bounded read completion hydr
   close()
 })
 
+test('superseded empty replies cannot certify a partial current viewport as hydrated', async () => {
+  const gates = [deferred<PreparedChartResponse | null>(), deferred<PreparedChartResponse | null>()]
+  const requests: number[] = []
+  const controller = new ChartController(transport({ history: async target => {
+    requests.push(target.end! / hour)
+    if (requests.length <= 2) return gates[requests.length - 1].promise
+    return prepared(btc, 1005, { latestEnd: 1199 * hour, bars: bars(910, 96), revision: 2 })
+  } }), cached())
+  const close = controller.open(btc, '1H')
+  try {
+    controller.scroll(-399); controller.scroll(-100); controller.scroll(305)
+    assert.deepEqual(requests, [800, 700])
+    assert.equal(controller.getSnapshot().requested?.end, 1005 * hour)
+    assert.equal(controller.getSnapshot().presented?.bars.length, 6)
+    gates[0].resolve(null); await settled()
+    gates[1].resolve(null); await settled()
+    assert.deepEqual(requests, [800, 700, 1005], 'A cancelled old request cannot suppress hydration of the current cursor.')
+    assert.equal(controller.getSnapshot().presented?.endHour, 1005 * hour)
+    assert.equal(controller.getSnapshot().presented?.bars.length, 96)
+    assert.equal(controller.getSnapshot().pending, false)
+  } finally { for (const gate of gates) gate.resolve(null); close() }
+})
+
 test('failed durable reads do not spin or schedule retries, and changed backend input allows a new read', async context => {
   context.mock.timers.enable({ apis: ['setTimeout'] })
   let reads = 0

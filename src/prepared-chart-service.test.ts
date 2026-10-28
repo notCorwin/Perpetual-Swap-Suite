@@ -2651,6 +2651,59 @@ test('a 120 Hz reversal keeps exact resident windows while replay and the opposi
   } finally { replayGate.resolve(); readGate.resolve(); close(); unsubscribe(); await pipeline.dispose() }
 })
 
+test('admitted reads share one replay continuation across distant focus changes', async () => {
+  const rows = source(6000), { pipeline, store } = fixture(rows)
+  const entered = deferred(), release = deferred()
+  pipeline.calculate = async () => { entered.resolve(); await release.promise; throw new Error('Released held replay.') }
+  let running: any, then: any, continuations = 0
+  try {
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: rows[2000].timestamp }, 'first-replay')
+    await entered.promise
+    running = pipeline.series.get(`${instId}:15m`).calculation
+    then = running.then
+    running.then = function (...args: any[]) { continuations += 1; return then.apply(this, args) }
+    for (let index = 0; index < 20; index += 1) {
+      pipeline.setFocus({ instId, timeframe: '15m', endHour: rows[index % 2 ? 4500 : 1000].timestamp }, `replay-owner-${index}`)
+      for (let turn = 0; turn < 3; turn += 1) await new Promise<void>(resolve => setImmediate(resolve))
+    }
+    assert.ok(store.queries.filter(query => query.order === 'desc' && query.limit === 1536).length >= 4,
+      'The held replay must coexist with multiple completed durable admissions.')
+    assert.ok(continuations <= 4, `One held replay accumulated ${continuations} continuation registrations.`)
+    assert.ok([...pipeline.focusWaits.values()].every((group: any) => group.waiters.size <= 1))
+  } finally {
+    if (running) running.then = then
+    const disposed = pipeline.dispose(); release.resolve(); await disposed
+  }
+})
+
+for (const failedRead of [false, true]) test(`read finalization settles consumers despite cleanup failure${failedRead ? ' and preserves the original read failure' : ''}`, async () => {
+  const { pipeline } = fixture()
+  const readFailure = new Error('Injected SQLite read failure.'), trimFailure = new Error('Injected resident trim failure.')
+  const trim = pipeline.trim
+  const target = end() - 1000 * interval
+  pipeline.prepareFocus = async () => null // Isolate the admitted read's completion from independent source preparation.
+  pipeline.replaceFocus({ instId, timeframe: '15m', endHour: target }, 'read-finalizer')
+  const state = pipeline.series.get(`${instId}:15m`)
+  pipeline.read = async () => { if (failedRead) throw readFailure; return true }
+  pipeline.trim = () => { throw trimFailure }
+  let outcome: { value?: unknown; error?: unknown } | undefined, done = false
+  try {
+    const consumer = pipeline.focusHistoryRead(state, pipeline.focus, 256, target)
+      .then((value: unknown) => { outcome = { value } }, (error: unknown) => { outcome = { error } })
+    const entry = [...pipeline.focusReads][0]
+    entry.done.then(() => { done = true })
+    for (let turn = 0; turn < 3; turn += 1) await new Promise<void>(resolve => setImmediate(resolve))
+    assert.ok(outcome, 'Cleanup must not strand the read consumer.')
+    assert.equal(done, true, 'The physical-read completion barrier must settle independently of cleanup.')
+    assert.equal(pipeline.focusReads.size, 0)
+    if (failedRead) {
+      assert.ok(outcome.error instanceof AggregateError)
+      assert.deepEqual(outcome.error.errors, [readFailure, trimFailure])
+    } else assert.equal(outcome.error, trimFailure)
+    await consumer
+  } finally { pipeline.trim = trim; await pipeline.dispose() }
+})
+
 test('closing focus cancels queued reads before IO and drains only already admitted lanes', { timeout: 30_000 }, async () => {
   const rows = source(6000), { pipeline, store } = fixture(rows), read = store.candles.bind(store)
   const gate = deferred(), starts = [deferred(), deferred()], operations: OperationEvent[] = []

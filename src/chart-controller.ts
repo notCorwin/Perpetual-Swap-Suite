@@ -321,14 +321,14 @@ export class ChartController {
         const meta = this.store.snapshotMeta(target.instId, target.timeframe)
         // A newer compact notification can arrive while this bulk read is in
         // flight. Its revision must not certify older historical observations.
-        if (accepted) this.historyHydrated.set(key, `${response.generation}:${JSON.stringify(response.sourceVersions ?? response.revision)}:${meta?.latestEnd ?? -1}:${this.store.historyEpoch(target.instId, target.timeframe)}:${meta?.indicatorStatus?.inputVersion ?? ''}:${meta?.indicatorStatus?.state ?? ''}`)
+        if (accepted && focusId === this.focusId) this.historyHydrated.set(key, `${response.generation}:${JSON.stringify(response.sourceVersions ?? response.revision)}:${meta?.latestEnd ?? -1}:${this.store.historyEpoch(target.instId, target.timeframe)}:${meta?.indicatorStatus?.inputVersion ?? ''}:${meta?.indicatorStatus?.state ?? ''}`)
         if (this.active) this.commit()
-      } else this.historyHydrated.set(key, watermark)
-      this.historyAttempts.set(key, checkedKey)
+      } else if (focusId === this.focusId) this.historyHydrated.set(key, watermark)
+      if (focusId === this.focusId) this.historyAttempts.set(key, checkedKey)
     } catch {
       // Failed reads wait for changed input or a new viewport. Backend source
       // repair proceeds independently and publishes its own lifecycle.
-      this.historyAttempts.set(key, checkedKey)
+      if (focusId === this.focusId) this.historyAttempts.set(key, checkedKey)
     } finally {
       this.historyTargets.delete(requestKey)
       void this.pump()
