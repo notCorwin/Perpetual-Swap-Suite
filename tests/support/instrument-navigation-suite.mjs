@@ -8,6 +8,7 @@ import { _electron } from 'playwright'
 import { summarizeLatencySamples } from '../../scripts/chart-acceptance-metrics.mjs'
 import { startRendererDiagnostics } from '../../scripts/renderer-diagnostics.mjs'
 import { startProcessWitness } from './process-witness.mjs'
+import { finishAcceptanceResources } from './acceptance-resources.mjs'
 import {
   assertNavigationFrames, exerciseInstrumentNavigation, finishNavigationFrameProbe, installNavigationProbe,
   measureNavigation, persistNavigationCatalog, removeNavigationProbe, selectionRequests,
@@ -44,18 +45,13 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
   })
 
   after(async () => {
-    try {
-      await presentationState?.restore?.()
-      if (electron) {
-        try { await stopWitness?.() }
-        finally {
-          try { await removeNavigationProbe(electron) }
-          finally { await electron.close() }
-        }
-      }
-    } finally {
-      await rm(await userData, { recursive: true, force: true })
-    }
+    await finishAcceptanceResources([
+      () => presentationState?.restore?.(),
+      () => stopWitness?.(),
+      () => electron && removeNavigationProbe(electron),
+      () => electron?.close(),
+      async () => rm(await userData, { recursive: true, force: true }),
+    ])
   })
 
   test('an unprepared selection acknowledges input before all sixteen prepared contracts switch by the next frame', { timeout: 120_000 }, async context => {

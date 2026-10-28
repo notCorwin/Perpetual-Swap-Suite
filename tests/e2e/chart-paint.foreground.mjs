@@ -7,6 +7,7 @@ import { _electron } from 'playwright'
 import { requireForegroundTests } from '../../electron/test-presentation.js'
 import { startRendererDiagnostics } from '../../scripts/renderer-diagnostics.mjs'
 import { startProcessWitness } from '../support/process-witness.mjs'
+import { finishAcceptanceResources } from '../support/acceptance-resources.mjs'
 import { assertCompletePaints, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureMissingWindow, measureNativeColdBoundary, measureChartIntentLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, waitForLocalHistory, waitForRendered, wheelBurst, withPaintProbe } from '../../scripts/chart-acceptance.mjs'
 
 requireForegroundTests()
@@ -37,12 +38,13 @@ beforeEach(async context => {
 afterEach(async () => {
   const stop = stopDiagnostics, witness = stopWitness
   stopDiagnostics = undefined; stopWitness = undefined
-  try { await witness?.() }
-  finally { await stop?.() }
+  await finishAcceptanceResources([witness, stop])
 })
 after(async () => {
-  try { await electron?.close() }
-  finally { await rm(userData, { recursive: true, force: true }) }
+  await finishAcceptanceResources([
+    () => electron?.close(),
+    () => rm(userData, { recursive: true, force: true }),
+  ])
 })
 
 test('bulk-warmed history updates every renderer target within 100 ms during scroll, reversal, and jumps', { timeout: 90_000 }, async context => {
