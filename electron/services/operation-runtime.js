@@ -200,7 +200,9 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
   const put = (sequence, line, length) => {
     const memory = line === null ? 0 : line.length * 2
     if (queue.size < recordLimit && memoryBytes + memory <= memoryLimit) {
-      queue.set(sequence, line); memoryBytes += memory
+      // The immutable serialized line keeps its admitted UTF-8 size, including
+      // its delimiter, through every timer, pressure drain and flush lookup.
+      queue.set(sequence, { line, length, stored: false }); memoryBytes += memory
     } else suppress(() => {
       // A sparse on-disk index preserves sequence holes without an unbounded
       // in-memory index when a reentrant producer has not admitted its prefix.
@@ -214,7 +216,8 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
     pendingBytes += length
   }
   const get = sequence => {
-    if (queue.has(sequence)) return { line: queue.get(sequence), stored: false }
+    const retained = queue.get(sequence)
+    if (retained) return retained
     if (!spillCount || sequence < spillFirst) return undefined
     return suppress(() => {
       const index = Buffer.alloc(16)
@@ -229,7 +232,7 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
       }
       if (index.readBigUInt64LE(0) === 0n) return undefined
       const length = index.readUInt32LE(8)
-      if (length === 0xffffffff) return { line: null, stored: true }
+      if (length === 0xffffffff) return { line: null, length: 0, stored: true }
       const data = Buffer.allocUnsafe(length), offset = Number(index.readBigUInt64LE(0) - 1n)
       let read = 0
       while (read < length) {
@@ -237,7 +240,7 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
         if (!size) throw new Error('Operation journal spill read made no progress.')
         read += size
       }
-      return { line: data.toString(), stored: true }
+      return { line: data.toString(), length: length + 1, stored: true }
     })
   }
   const queued = () => queue.size + spillCount
@@ -252,7 +255,7 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
         while (entries.length < recordLimit) {
           const entry = get(through)
           if (!entry) break
-          const length = entry.line === null ? 0 : Buffer.byteLength(entry.line) + 1
+          const length = entry.length
           if (lines.length && rawBytes + length > batchLimit) break
           entries.push(entry); through++; rawBytes += length
           if (entry.line !== null) lines.push(entry.line)

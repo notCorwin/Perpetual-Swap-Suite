@@ -580,8 +580,9 @@ export class PreparedChartPipeline {
     const fields = ['instId', 'timeframe', 'intervalMS', 'endHour', 'latestEnd', 'oldestHour', 'historyExhausted', 'generation',
       'priceState', 'priceStatus', 'priceAsOf', 'priceObservedAt', 'realtimeState', 'sourceVersions',
       'oiState', 'oiStatus', 'takerState', 'takerStatus', 'indicatorState', 'indicatorStatus', 'error']
-    return fields.every(field => JSON.stringify(left[field]) === JSON.stringify(right[field]))
-      && JSON.stringify(left.liveBar) === JSON.stringify(right.liveBar)
+    // Frame fields are owned JSON data; unchanged identities need no encoding.
+    return fields.every(field => Object.is(left[field], right[field]) || JSON.stringify(left[field]) === JSON.stringify(right[field]))
+      && (Object.is(left.liveBar, right.liveBar) || JSON.stringify(left.liveBar) === JSON.stringify(right.liveBar))
   }
 
   samePublishedHistory(left, right) {
