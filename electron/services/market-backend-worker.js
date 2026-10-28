@@ -93,7 +93,8 @@ async function request(value) {
       const { instId, timeframe, endHour, historyBars, focusId } = value.chartWindow ?? value.chartLocal ?? value.chartHistory
       if (value.chartWindow) return service.preparedCharts.prepare(instId, timeframe, endHour, historyBars, { focusId })
       if (value.chartLocal) return service.preparedCharts.local(instId, timeframe)
-      return service.preparedCharts.localHistory(instId, timeframe, endHour)
+      return focusId === undefined ? service.preparedCharts.localHistory(instId, timeframe, endHour)
+        : service.preparedCharts.localHistory(instId, timeframe, endHour, { focusId })
     })
     service.barTasks.add(task)
     return task.finally(() => service.barTasks.delete(task))
