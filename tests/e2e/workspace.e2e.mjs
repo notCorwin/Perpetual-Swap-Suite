@@ -28,7 +28,7 @@ before(async () => {
       instId: `${symbol}-USDT-SWAP`, price: 100, lastPrice: 100, rankingChange, rankingAsOf: 1_800_000_000_000,
       turnover24hUSDT: 50_000_000,
     }))
-    const state = globalThis.__workspaceFixture = { preferences, analysisSettings: { model: 'fixture/vision', hasAPIKey: false }, rows, initialRows: rows, requests: [], coldTimeframes: [], revision: 1, loading: false, error: '', catalogSource: 'live', catalogProgress: undefined, failNextSave: false, failSnapshots: 0, staleNextSnapshot: false, staleReplies: 0, chartGeneration: 1, bollMode: 'standard', holdNextSnapshot: false, releaseSnapshot: null, snapshotActive: 0, snapshotMaximum: 0,
+    const state = globalThis.__workspaceFixture = { preferences, analysisSettings: { model: 'fixture/vision', hasAPIKey: false }, rows, initialRows: rows, requests: [], coldTimeframes: [], revision: 1, loading: false, error: '', realtimeState: 'live', updatedAt: 1_800_000_000_000, catalogSource: 'live', catalogProgress: undefined, failNextSave: false, failSnapshots: 0, staleNextSnapshot: false, staleReplies: 0, chartGeneration: 1, bollMode: 'standard', holdNextSnapshot: false, releaseSnapshot: null, snapshotActive: 0, snapshotMaximum: 0,
       holdAuditAction: null, releaseAudit: null, heldAuditReply: null,
       holdDownloadAction: null, releaseDownload: null, heldDownloadReply: null,
       historyDownload: { schemaVersion: 2, phase: 'idle', startedAt: null, updatedAt: null, finishedAt: null,
@@ -86,7 +86,7 @@ before(async () => {
         state.staleNextSnapshot = false
         if (stale) state.staleReplies += 1
         const snapshot = { rows: stale ? [] : state.rows, turnoverOrder: [...state.rows].sort((a, b) => (b.turnover24hUSDT ?? -1) - (a.turnover24hUSDT ?? -1) || a.instId.localeCompare(b.instId, 'en')).map(row => row.instId), revision: state.revision - (stale ? 1 : 0), serviceSession: 'renderer-fixture',
-          realtimeState: 'Connected', updatedAt: 1_800_000_000_000,
+          realtimeState: state.realtimeState, updatedAt: state.updatedAt,
           catalogSource: state.catalogSource, catalogProgress: state.catalogProgress, error: state.error, loading: state.loading }
         state.snapshotActive += 1
         state.snapshotMaximum = Math.max(state.snapshotMaximum, state.snapshotActive)
@@ -192,7 +192,7 @@ after(async () => {
 })
 
 const selected = () => page.locator('[data-market-index][aria-selected="true"]')
-const waitForMarketStatus = status => page.waitForFunction(status => document.querySelector('[data-market-list] [data-slot="badge"]')?.textContent.trim() === status, status)
+const waitForMarketStatus = status => page.waitForFunction(status => document.querySelector('[data-market-status]')?.textContent.trim() === status, status)
 const settingsPage = () => page.getByRole('main', { name: 'Settings', exact: true })
 const chooseSettingsCategory = async category => {
   const settings = settingsPage()
@@ -659,7 +659,7 @@ test('snapshot failures wait for a new notification and resume immediately on re
       state.revision += 1; state.notify()
       return before
     })
-    const error = page.getByRole('alert').filter({ hasText: 'Snapshot temporarily unavailable.' })
+    const error = page.locator('[data-market-status][role="alert"][title*="Snapshot temporarily unavailable."]')
     await error.waitFor({ state: 'visible' })
     assert.deepEqual(await page.evaluate(() => globalThis.__snapshotRetryClock.delays), [])
     assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before + 1)
@@ -1216,6 +1216,42 @@ test('constant Bollinger bands stay finite and negative lower bands explicitly s
   } finally { await publishMode('standard') }
 })
 
+test('market status changes do not move the contract list', async () => {
+  const publish = values => electron.evaluate((_electron, values) => {
+    const state = globalThis.__workspaceFixture
+    Object.assign(state, values)
+    state.revision += 1
+    state.notify()
+  }, values)
+  const positions = async () => page.locator('[data-market-list]').evaluate(list => {
+    const header = list.querySelector('thead').getBoundingClientRect()
+    const row = list.querySelector('[data-market-index]').getBoundingClientRect()
+    return { header: header.top, row: row.top }
+  })
+  try {
+    await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), loading: false, error: '', realtimeState: 'live', catalogSource: 'live', catalogProgress: undefined })
+    await page.waitForFunction(() => document.querySelector('[data-market-status]')?.textContent.startsWith('Updated '))
+    const baseline = await positions()
+    for (const [index, pending] of [1, 4, 0, 3, 0].entries()) {
+      const updatedAt = 1_800_000_000_000 + (index + 1) * 60_000
+      await publish({ updatedAt, loading: pending > 0, catalogProgress: { total: 4, completed: 4, verified: 4, failed: 0, unknown: 0, pending } })
+      await page.waitForFunction(updatedAt => document.querySelector('[data-market-status]')?.textContent === `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}`, updatedAt)
+      assert.deepEqual(await positions(), baseline, 'Background acquisition must not move the table.')
+    }
+    await publish({ loading: false, error: 'Order book data is unavailable.', catalogProgress: undefined })
+    await page.locator('[data-market-status][role="alert"][title="Order book data is unavailable."]').waitFor()
+    assert.deepEqual(await positions(), baseline, 'An error must not move the table.')
+    await publish({ error: '', realtimeState: 'disconnected' })
+    await page.waitForFunction(() => document.querySelector('[data-market-status]')?.textContent.toLowerCase().includes('disconnect'))
+    assert.deepEqual(await positions(), baseline, 'A connection failure must not move the table.')
+    await publish({ realtimeState: 'live' })
+    await page.waitForFunction(() => document.querySelector('[data-market-status]')?.textContent.startsWith('Updated '))
+    assert.deepEqual(await positions(), baseline, 'Recovery must not move the table.')
+  } finally {
+    await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), loading: false, error: '', realtimeState: 'live', catalogSource: 'live', catalogProgress: undefined })
+  }
+})
+
 test('a rejected old snapshot preserves notifications and backend exclusions remove rows immediately', async () => {
   try {
     await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.staleNextSnapshot = true; state.notify() })
@@ -1226,7 +1262,6 @@ test('a rejected old snapshot preserves notifications and backend exclusions rem
       state.rows = state.rows.filter(row => row.instId !== 'BETA-USDT-SWAP')
       state.loading = true; state.revision += 1; state.notify()
     })
-    await waitForMarketStatus('Refreshing')
     await page.locator('[data-market-index][aria-selected="true"][aria-label="View ZETA-USDT-SWAP chart"]').waitFor()
     assert.equal(await page.locator('[data-total-market-count]').getAttribute('data-total-market-count'), '3')
     assert.equal(await page.locator('[aria-label="View BETA-USDT-SWAP chart"]').count(), 0)
@@ -1263,7 +1298,7 @@ test('empty snapshots distinguish startup, verification failures, confirmed excl
     await page.reload({ waitUntil: 'domcontentloaded' })
     await assertEmpty('Loading contracts')
     // A full initial snapshot is not proof that qualification has finished.
-    await page.waitForFunction(() => document.querySelector('[data-market-list] [data-slot="badge"]')?.textContent.includes('Refreshing'))
+    await waitForMarketStatus('Refreshing')
     await publish({ catalogSource: 'live', catalogProgress: { total: 4, completed: 2, verified: 0, failed: 1, unknown: 1, pending: 2 } })
     await assertEmpty('Verifying contracts')
     await page.locator('[data-market-list]').getByText('Checking enabled conditions: 2 / 4 contracts completed.', { exact: true }).waitFor()
@@ -1274,12 +1309,12 @@ test('empty snapshots distinguish startup, verification failures, confirmed excl
     await page.locator('[data-market-list]').getByText('Updating 2 contracts', { exact: true }).waitFor()
     await publish({ loading: false, error: 'Order book data is unavailable. Qualification could not be verified.', catalogProgress: { total: 4, completed: 4, verified: 0, failed: 0, unknown: 4, pending: 0 } })
     await assertEmpty('Market verification unavailable')
-    await page.getByRole('alert').filter({ hasText: 'Order book data is unavailable.' }).waitFor()
+    await page.locator('[data-market-status][role="alert"][title^="Order book data is unavailable. Qualification could not be verified."]').waitFor()
     await publish({ error: '' })
     await page.getByRole('alert').waitFor({ state: 'hidden' })
     await assertEmpty('Market verification unavailable')
     await publish({ catalogSource: 'none', catalogProgress: undefined })
-    await page.waitForFunction(() => document.querySelector('[data-market-list] [data-slot="badge"]')?.textContent.includes('Waiting'))
+    await waitForMarketStatus('Waiting')
     await assertEmpty('Market verification unavailable')
     await publish({ loading: true, catalogSource: 'live', catalogProgress: { total: 4, completed: 4, verified: 0, failed: 4, unknown: 0, pending: 0 } })
     await assertEmpty('No qualified contracts')
@@ -1331,9 +1366,8 @@ test('temporary qualification gaps preserve the current chart and interaction un
     state.revision += 1
     state.notify()
   }, values)
-  const assertRetained = async (title, status) => {
+  const assertRetained = async title => {
     await page.locator('[data-market-list]').getByText(title, { exact: true }).waitFor()
-    await page.getByRole('status').filter({ hasText: status }).waitFor()
     assert.equal(await page.locator('[data-total-market-count]').getAttribute('data-total-market-count'), '0', 'The renderer must use the backend membership immediately.')
     assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
     assert.equal(await page.evaluate(() => globalThis.__continuityChart === document.querySelector('[data-chart-inst]') && globalThis.__continuitySVG === document.querySelector('svg[data-rendered-inst]')), true, 'A temporary verification gap must preserve the existing chart surface.')
@@ -1354,12 +1388,12 @@ test('temporary qualification gaps preserve the current chart and interaction un
     await waitForMarketStatus('Verifying 0/4')
     assert.equal(await page.locator('[data-total-market-count]').getAttribute('data-total-market-count'), '0', 'A verification gap may empty backend membership without discarding the current chart.')
     assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
-    await assertRetained('Verifying contracts', 'Rechecking qualification · Current chart remains available')
+    await assertRetained('Verifying contracts')
     await publish({ loading: false, error: 'Order book observations are temporarily unavailable.', catalogProgress: { total: 4, completed: 4, verified: 0, failed: 0, unknown: 4, pending: 0 } })
-    await assertRetained('Market verification unavailable', 'Qualification data unavailable · Current chart remains available')
+    await assertRetained('Market verification unavailable')
     await publish({ error: '', catalogSource: 'none', catalogProgress: undefined })
-    await page.waitForFunction(() => document.querySelector('[data-market-list] [data-slot="badge"]')?.textContent.includes('Waiting'))
-    await assertRetained('Market verification unavailable', 'Qualification data unavailable · Current chart remains available')
+    await waitForMarketStatus('Waiting')
+    await assertRetained('Market verification unavailable')
     await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), catalogSource: 'live', catalogProgress: { total: 4, completed: 4, verified: 4, failed: 0, unknown: 0, pending: 0 } })
     await page.locator('[data-market-index][aria-selected="true"][aria-label="View BETA-USDT-SWAP chart"]').waitFor()
     assert.equal(await page.evaluate(() => globalThis.__continuityChart === document.querySelector('[data-chart-inst]') && globalThis.__continuitySVG === document.querySelector('svg[data-rendered-inst]')), true, 'Recovery of the selected contract must not remount the chart.')

@@ -284,7 +284,7 @@ const ChartSurface = memo(function ChartSurface({ surface, size, selected, inspe
       data-rendered-start={bars[0]!.hour} data-rendered-end={bars.at(-1)!.hour}
       viewBox={`0 0 ${size.width} ${size.height}`} aria-hidden={!selected}
       style={{ visibility: selected ? 'visible' : 'hidden' }}
-      className={cn('absolute inset-0 h-full w-full font-mono text-[length:var(--chart-text-size)] select-none focus-visible:outline-2 focus-visible:outline-ring', !selected && 'pointer-events-none')}
+      className={cn('absolute inset-0 h-full w-full font-mono text-[length:var(--chart-text-size)] select-none outline-none', !selected && 'pointer-events-none')}
       role="img" tabIndex={selected ? 0 : -1}
       aria-label={`${surface.instId} ${bars.length}-candle ${timeframeLabel(surface.timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end. Hover RSI crossing triangles to inspect their candle and time. Alt+Left and Alt+Right inspect RSI crossings; Escape clears inspection. Scroll to review history. Arrow keys navigate markets.`}>
       <Plot bars={bars} geometry={geometry} liveBar={surface.liveBar ?? bars.at(-1)!} liveOverlay={!!surface.liveBar} contentOffset={contentOffset}
@@ -552,7 +552,7 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
         {([['Open', active.open], ['High', active.high], ['Low', active.low], ['Close', active.close]] as const).map(([label, value]) => <div key={label} data-chart-ohlc={label.toLowerCase()} className="min-w-0"><span className="text-muted-foreground">{label} </span><span title={price(value)}>{price(value)}</span></div>)}
         <span data-chart-price-scale={priceScale} className="ml-auto text-muted-foreground" title={priceScale === 'linear' ? 'Linear scale · BOLL includes zero or negative values' : 'Logarithmic price scale'}>{priceScale === 'linear' ? 'Linear' : 'Log'}</span>
       </div>}
-      <div ref={plotRef} data-chart-plot tabIndex={-1} className="relative min-h-0 flex-1 overflow-hidden focus-visible:outline-2 focus-visible:outline-ring focus-visible:-outline-offset-2" onKeyDown={event => {
+      <div ref={plotRef} data-chart-plot tabIndex={-1} className="relative min-h-0 flex-1 overflow-hidden outline-none" onKeyDown={event => {
         if (event.key === 'Escape') { endInspection(); return }
         if (!matchesSelection || !surface || !plotGeometry || !event.altKey || !(event.key === 'ArrowLeft' || event.key === 'ArrowRight')) return
         event.preventDefault()
