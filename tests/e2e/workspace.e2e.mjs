@@ -186,6 +186,35 @@ after(async () => {
 })
 
 const selected = () => page.locator('[data-market-index][aria-selected="true"]')
+
+test('contract header remains distinct from an adjacent selected row', async () => {
+  try {
+    for (const colorScheme of ['light', 'dark']) {
+      await page.emulateMedia({ colorScheme })
+      const styles = await page.locator('[data-market-list]').evaluate(list => {
+        const header = list.querySelector('thead')
+        const heading = header.querySelector('th')
+        const row = list.querySelector('[data-market-index][aria-selected="true"]')
+        const cell = row.querySelector('td')
+        const lastHeading = header.querySelector('th:last-child')
+        const lastCell = row.querySelector('td:last-child')
+        return {
+          headerBackground: getComputedStyle(header).backgroundColor,
+          selectedBackground: getComputedStyle(row).backgroundColor,
+          headerColor: getComputedStyle(heading).color,
+          rowColor: getComputedStyle(cell).color,
+          leftPadding: [getComputedStyle(heading).paddingLeft, getComputedStyle(cell).paddingLeft],
+          rightPadding: [getComputedStyle(lastHeading).paddingRight, getComputedStyle(lastCell).paddingRight],
+        }
+      })
+      assert.notEqual(styles.headerBackground, styles.selectedBackground, `${colorScheme}: header and selected row must not merge`)
+      assert.notEqual(styles.headerColor, styles.rowColor, `${colorScheme}: headings must be visually distinct from values`)
+      assert.deepEqual(styles.leftPadding, ['16px', '16px'])
+      assert.deepEqual(styles.rightPadding, ['16px', '16px'])
+      if (process.env.PERPETUAL_SWAP_UI_SCREENSHOTS) await page.locator('[data-market-list]').screenshot({ path: join(process.env.PERPETUAL_SWAP_UI_SCREENSHOTS, `contract-list-${colorScheme}.png`) })
+    }
+  } finally { await page.emulateMedia({ colorScheme: null }) }
+})
 const waitForMarketStatus = status => page.waitForFunction(status => document.querySelector('[data-market-status]')?.textContent.trim() === status, status)
 const settingsPage = () => page.getByRole('main', { name: 'Settings', exact: true })
 const chooseSettingsCategory = async category => {
