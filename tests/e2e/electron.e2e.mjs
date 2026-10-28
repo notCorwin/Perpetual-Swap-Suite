@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
 import { measureNativeWindowControls } from '../helpers/native-window-controls.mjs'
-import { assertCompletePaints, assertIndicatorLegends, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
+import { assertScrollResponsiveness } from '../../scripts/chart-acceptance-metrics.mjs'
+import { assertCompletePaints, assertIndicatorLegends, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst, withPaintProbe } from '../../scripts/chart-acceptance.mjs'
 
 
 const root = new URL('../..', import.meta.url).pathname
@@ -412,6 +413,48 @@ test('the 1600 design workspace keeps both panels and chart selection when searc
   }
 })
 
+test('a failed measured paint scope retains failures and releases the next capture', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await openChart(page, fixture)
+  for (const mode of ['latency', 'validation', 'finalization']) {
+    let primary
+    let failure
+    await assert.rejects(withPaintProbe(page, fixture, {}, async () => {
+      await page.evaluate(async mode => {
+        for (let frame = 0; frame < 2; frame++) await new Promise(resolve => requestAnimationFrame(resolve))
+        if (mode === 'validation') window.__chartPaintProbe.errors.push('Injected retained paint violation.')
+        if (mode === 'finalization') window.__chartPaintProbe.capturePending = () => { throw new Error('Injected final capture failure.') }
+      }, mode)
+      try { assertScrollResponsiveness({ intentLatenciesMS: [268], unaccountedInputs: [], maxFrameGapMS: 250.034 }) }
+      catch (error) { primary = error; throw error }
+    }), error => {
+      failure = error
+      assert.match(error.message, /Scroll intent exceeded 100 ms: 268 ms/)
+      if (mode === 'latency') assert.equal(error.cause, primary)
+      else {
+        assert.ok(error.cause instanceof AggregateError)
+        assert.equal(error.cause.errors[0], primary, 'The measured-phase failure must remain the primary cause.')
+        assert.match(error.message, mode === 'validation' ? /Injected retained paint violation/ : /Injected final capture failure/)
+      }
+      if (mode !== 'finalization') {
+        assert.ok(error.paintPhaseData.frames > 0)
+        if (mode === 'validation') assert.ok(error.paintPhaseData.violations.includes('Injected retained paint violation.'))
+        else assert.deepEqual(error.paintPhaseData.violations, [])
+        assert.ok(error.paintPhaseData.frameSamples.length > 0)
+      } else assert.equal(error.paintPhaseData, null)
+      return true
+    })
+    assert.equal(await page.evaluate(() => Boolean(window.__chartPaintProbe?.active)), false,
+      'A failed measured phase or final capture must leave no active RAF/observer owner.')
+    const retained = JSON.stringify(failure.paintPhaseData)
+    const next = await withPaintProbe(page, fixture, {}, () => page.evaluate(async () => {
+      for (let frame = 0; frame < 2; frame++) await new Promise(resolve => requestAnimationFrame(resolve))
+    }))
+    assertCompletePaints(next)
+    assert.equal(JSON.stringify(failure.paintPhaseData), retained, 'The next capture must not overwrite the failed phase evidence.')
+  }
+})
+
 test('the paint probe accepts an unchanged complete frame after deferred validation', async context => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   await openChart(page, fixture)
@@ -430,6 +473,8 @@ test('the paint probe accepts an unchanged complete frame after deferred validat
     assert.ok(report.oracleTransfer.transferredBars > 0 && report.oracleTransfer.transferredBars <= 192)
     assert.ok(report.oracleTransfer.transferredBars < report.oracleTransfer.fixtureBars)
     context.diagnostic(`Deferred oracle transfer: ${JSON.stringify(report.oracleTransfer)}`)
+    assert.equal(report.rendererCPU.sampleCount, report.frames + 2, 'Every captured RAF needs a CPU witness between the start and stop markers.')
+    context.diagnostic(`Renderer CPU capture: ${JSON.stringify({ samples: report.rendererCPU.sampleCount, markerCostMS: report.cpuMarkerCostMS })}`)
   } finally { if (!report) await finishPaintProbe(page) }
 })
 

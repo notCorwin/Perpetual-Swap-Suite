@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { requireForegroundTests } from '../electron/test-presentation.js'
 import { barsWithIndicators } from '../electron/services/indicators.js'
+import { startRendererCPUCounter } from './renderer-cpu-counter.mjs'
 import { accountChartIntents, assertColdBoundaryResponsiveness, assertColdBoundaryTiming, assertScrollResponsiveness, assertWarmStatistics, coldBoundaryTiming, collectAcceptanceChecks, summarizeLatencySamples } from './chart-acceptance-metrics.mjs'
 
 // The guarded runtime owns focus isolation. Performance acceptance keeps the
@@ -252,11 +253,11 @@ export async function openChart(page, fixture, timeframe = fixture.timeframe) {
 // treating the requested viewport or an aggregate loading flag as a render.
 // __chartSnapshot is a reference to the rendered object; it avoids serializing
 // 96 full bars into an attribute on every production animation frame.
-const paintOracleSeries = new WeakMap()
+const paintProbes = new WeakMap()
 
 export async function startPaintProbe(page, fixture, { requireMatureData = false, requireWarmStatistics = false, indicatorValidation = 'fixture' } = {}) {
   assert.ok(['fixture', 'finite', 'deferred-canonical'].includes(indicatorValidation), 'Unknown chart indicator validation contract.')
-  assert.ok(!paintOracleSeries.has(page), 'The previous paint probe must finish before starting another.')
+  assert.ok(!paintProbes.has(page), 'The previous paint probe must finish before starting another.')
   if (requireWarmStatistics) {
     const { timeframe, bars } = await page.locator(`[data-chart-inst="${fixture.instId}"]`).evaluate(chart => ({
       timeframe: chart.__chartSnapshot?.timeframe,
@@ -268,7 +269,8 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
     assert.ok(fixture.series[timeframe], `The warm chart timeframe ${timeframe} must have a fixture oracle.`)
     assertWarmStatistics(bars, fixture.series[timeframe].bars)
   }
-  await page.evaluate(({ instId, series, requireMatureData, requireWarmStatistics, indicatorValidation }) => {
+  const cpu = await startRendererCPUCounter(page, { label: fixture.instId })
+  try { await page.evaluate(({ instId, series, requireMatureData, requireWarmStatistics, indicatorValidation, cpuMarkerPrefix }) => {
     const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
     if (!(chart instanceof HTMLElement)) throw new Error('No chart surface to inspect.')
     const expectedTimeframe = chart.__chartSnapshot?.timeframe
@@ -279,8 +281,18 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       active: true, frames: 0, pendingFrames: 0, paints: 0, minimumBars: Infinity, errors: [],
       frameGaps: [], frameSamples: [], validationSamples: [], inputBursts: [], commits: [], requestCommits: [], pendingWindows: [], previousFrame: null,
       phase: 'initial', quality: [], observations: [],
+      cpuMarkerIndex: 0, cpuMarkerCostMS: { samples: 0, totalMS: 0, maxMS: 0 },
       raf: null, observer: null, schedulerObservers: [],
       scheduler: { counts: {}, entries: [], supportedEntryTypes: PerformanceObserver.supportedEntryTypes },
+    }
+    probe.markCPU = phase => {
+      const at = performance.now()
+      try { console.timeStamp(cpuMarkerPrefix + JSON.stringify({ at, timeOrigin: performance.timeOrigin, phase, index: probe.cpuMarkerIndex++ })) }
+      finally {
+        const duration = performance.now() - at
+        probe.cpuMarkerCostMS.samples++; probe.cpuMarkerCostMS.totalMS += duration
+        probe.cpuMarkerCostMS.maxMS = Math.max(probe.cpuMarkerCostMS.maxMS, duration)
+      }
     }
     for (const type of ['longtask', 'long-animation-frame']) if (probe.scheduler.supportedEntryTypes.includes(type)) {
       const record = entries => {
@@ -469,6 +481,7 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       const sampledAt = performance.now()
       if (!probe.active) return
       sample(true, timestamp, sampledAt, false)
+      probe.markCPU('raf')
       probe.raf = requestAnimationFrame(frame)
     }
     const sampledAt = performance.now()
@@ -483,28 +496,42 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       }
     }
     window.__chartPaintProbe = probe
+    probe.markCPU('start')
   }, { instId: fixture.instId,
     series: Object.fromEntries(Object.entries(fixture.series).map(([timeframe, entry]) => [timeframe, { intervalMS: entry.intervalMS }])),
-    requireMatureData, requireWarmStatistics, indicatorValidation })
-  paintOracleSeries.set(page, fixture.series)
+    requireMatureData, requireWarmStatistics, indicatorValidation, cpuMarkerPrefix: cpu.markerPrefix }) }
+  catch (error) {
+    try { await cpu.stop() }
+    catch (cleanup) { throw new AggregateError([error, cleanup], error.message, { cause: error }) }
+    throw error
+  }
+  paintProbes.set(page, { series: fixture.series, cpu })
 }
 
 export async function finishPaintProbe(page, { readyTarget = null, includeRequestCommits = false, includeTimingEvidence = false } = {}) {
-  const oracleSeries = paintOracleSeries.get(page)
-  assert.ok(oracleSeries, 'No paint oracle belongs to this page.')
+  const owner = paintProbes.get(page)
+  assert.ok(owner, 'No paint oracle belongs to this page.')
+  const oracleSeries = owner.series
   try {
     // Stop capture before transporting any oracle values into the renderer.
     // A full fixture can contain thousands of bars that no observed viewport
     // uses. Keep that archive in Node and send only the retained observations'
     // timestamps after the measured input/RAF phase has ended.
-    const observed = await page.evaluate(() => {
+    let observed, captureFailure
+    try { observed = await page.evaluate(() => {
       const probe = window.__chartPaintProbe
       if (!probe) throw new Error('No chart paint probe was installed.')
-      probe.capturePending()
-      probe.active = false
-      cancelAnimationFrame(probe.raf)
-      probe.observer.disconnect()
-      for (const { observer, record } of probe.schedulerObservers) { record(observer.takeRecords()); observer.disconnect() }
+      try { probe.capturePending() }
+      finally {
+        probe.active = false
+        cancelAnimationFrame(probe.raf)
+        probe.observer.disconnect()
+        for (const { observer, record } of probe.schedulerObservers) {
+          try { record(observer.takeRecords()) }
+          finally { observer.disconnect() }
+        }
+        probe.markCPU('stop')
+      }
       const hours = new Map(), seenBars = new Map()
       for (const { snapshot, bars } of probe.observations) {
         if (!snapshot || !Array.isArray(bars)) continue
@@ -515,7 +542,15 @@ export async function finishPaintProbe(page, { readyTarget = null, includeReques
         for (const bar of bars) if (bar && Number.isFinite(bar.hour)) hours.get(timeframe).add(bar.hour)
       }
       return Object.fromEntries([...hours].map(([timeframe, values]) => [timeframe, [...values]]))
-    })
+    }) } catch (error) { captureFailure = error }
+    let rendererCPU
+    try { rendererCPU = await owner.cpu.stop() }
+    catch (error) {
+      if (captureFailure) throw new AggregateError([captureFailure, error], captureFailure.message, { cause: captureFailure })
+      throw error
+    }
+    if (captureFailure) throw captureFailure
+    assert.ok(rendererCPU.complete, `Renderer thread CPU evidence is incomplete: ${JSON.stringify(rendererCPU.captureErrors)}`)
     let fixtureBars = 0, transferredBars = 0
     const series = Object.fromEntries(Object.entries(oracleSeries).map(([timeframe, entry]) => {
       const hours = new Set(observed[timeframe] ?? [])
@@ -523,9 +558,33 @@ export async function finishPaintProbe(page, { readyTarget = null, includeReques
       fixtureBars += entry.bars.length; transferredBars += bars.length
       return [timeframe, { intervalMS: entry.intervalMS, bars }]
     }))
-    return await validateStoppedPaintProbe(page, { readyTarget, includeRequestCommits, includeTimingEvidence, series,
+    const paint = await validateStoppedPaintProbe(page, { readyTarget, includeRequestCommits, includeTimingEvidence, series,
       oracleTransfer: { phase: 'after capture stopped', fixtureBars, transferredBars } })
-  } finally { paintOracleSeries.delete(page) }
+    return { ...paint, rendererCPU }
+  } finally { paintProbes.delete(page) }
+}
+
+// The measured phase owns capture even when an assertion aborts that phase.
+// Finish deferred validation before releasing ownership, retaining both the
+// original failure and any paint/cleanup failure rather than poisoning the next test.
+export async function withPaintProbe(page, fixture, options, measure) {
+  await startPaintProbe(page, fixture, options)
+  const failures = []
+  let paint
+  try { await measure() } catch (error) { failures.push(error) }
+  try {
+    paint = await finishPaintProbe(page, { includeTimingEvidence: failures.length > 0 })
+    if (failures.length) assertCompletePaints(paint)
+  } catch (error) { failures.push(error) }
+  if (failures.length) {
+    const message = failures.map(error => error?.message ?? String(error)).join('\n')
+    const phase = paint ? paintPhaseEvidence(paint) : null
+    const error = new Error(`${message}\nPaint phase data: ${JSON.stringify(phase)}`,
+      { cause: failures.length === 1 ? failures[0] : new AggregateError(failures, message) })
+    error.paintPhaseData = phase
+    throw error
+  }
+  return paint
 }
 
 async function validateStoppedPaintProbe(page, { readyTarget, includeRequestCommits, includeTimingEvidence, series, oracleTransfer }) {
@@ -688,6 +747,7 @@ async function validateStoppedPaintProbe(page, { readyTarget, includeRequestComm
       totalProbeValidationMS: Number(probe.validationSamples.reduce((sum, sample) => sum + sample.durationMS, 0).toFixed(3)),
       validationDurations: probe.validationSamples.map(sample => sample.durationMS),
       deferredValidationSamples, failedCaptureSamples, totalDeferredValidationMS: Number(deferredValidationMS.toFixed(3)),
+      cpuMarkerCostMS: probe.cpuMarkerCostMS,
       ...(readyTarget || includeTimingEvidence ? { firstFrameAt: probe.firstFrameAt ?? null, frameSamples: probe.frameSamples, inputBursts: probe.inputBursts,
         observationSamples: probe.observations.map(({ at, frame, phase, captureFailure }) => ({ at, frame, phase, captureFailure: Boolean(captureFailure) })) } : {}),
       ...(readyTarget ? { readyFrame } : {}),
@@ -727,7 +787,10 @@ function paintPhaseEvidence(paint) {
     totalProbeCaptureMS: paint.totalProbeCaptureMS, maxProbeCaptureMS: paint.maxProbeCaptureMS, scheduler: paint.scheduler,
     firstFrameAt: paint.firstFrameAt, inputBursts: paint.inputBursts, commits: paint.commits,
     requestCommits: paint.requestCommits, frameSamples: paint.frameSamples, captureTimings: paint.captureTimings,
-    observationSamples: paint.observationSamples, oracleTransfer: paint.oracleTransfer }
+    observationSamples: paint.observationSamples, oracleTransfer: paint.oracleTransfer,
+    rendererCPU: { complete: paint.rendererCPU.complete, sampleCount: paint.rendererCPU.sampleCount,
+      droppedSamples: paint.rendererCPU.droppedSamples, captureErrors: paint.rendererCPU.captureErrors,
+      artifact: paint.rendererCPU.artifact }, cpuMarkerCostMS: paint.cpuMarkerCostMS }
 }
 
 function prefetchPerformanceChecks(latency) {
