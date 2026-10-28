@@ -25,7 +25,7 @@ const liveIntent = (at, extra = {}) => ({ at, instId: 'BTC', timeframe: '5m', li
 const historyIntent = at => liveIntent(at, { historical: true, endHour: 900 })
 const returnIntent = at => liveIntent(at, { historical: false, endHour: 1000 })
 
-function resourceProbeFixture(context, { indicators = false, frozen = false } = {}) {
+function resourceProbeFixture(context, { indicators = false, frozen = false, cpuMarkerPrefix } = {}) {
   let now = 1000, mutation, disconnected = 0, disconnectError
   context.mock.method(performance, 'now', () => now)
   const names = ['window', 'document', 'MutationObserver', 'requestAnimationFrame', 'cancelAnimationFrame']
@@ -61,7 +61,7 @@ function resourceProbeFixture(context, { indicators = false, frozen = false } = 
   }
   globalThis.requestAnimationFrame = callback => { callbacks.push(callback); return callbacks.length }
   globalThis.cancelAnimationFrame = id => cancelled.push(id)
-  installResourcePaintProbe({ intervals: { '15m': 100 }, periods: 320, asOf: 1000 })
+  installResourcePaintProbe({ intervals: { '15m': 100 }, periods: 320, asOf: 1000, cpuMarkerPrefix })
   return { chart, bars, snapshot, svg, label, callbacks, cancelled, paint: window.__resourcePaint,
     mutation: () => mutation(), at: value => { now = value }, disconnected: () => disconnected,
     failDisconnect: error => { disconnectError = error } }
@@ -168,6 +168,51 @@ test('resource capture ends before numerical validation and reuses unchanged imm
   assert.ok(result.deferredValidation.durationMS >= 0)
   assert.equal(paint.finish(), result)
   assert.ok(Object.isFrozen(result.captureTimings) && Object.isFrozen(result.violations))
+})
+
+test('raw resource RAF markers retain the original maximum frame pair and callback epoch across cadence reset', context => {
+  const markers = []
+  context.mock.method(console, 'timeStamp', title => markers.push(JSON.parse(title.slice('raw-raf:'.length))))
+  const { paint, callbacks, at } = resourceProbeFixture(context, { cpuMarkerPrefix: 'raw-raf:' })
+  assert.deepEqual(markers.map(marker => marker.phase), ['capture-start'])
+  at(1001); callbacks[0](1000)
+  at(1253); callbacks.at(-1)(1252)
+  assert.equal(paint.frameCadence.maxGapMS, 252)
+  assert.equal(paint.frameCadence.unmarkedFrames, 0)
+  const original = markers.find(marker => marker.index === paint.frameCadence.maxGapMarkerIndex)
+  assert.equal(original.rafTimestamp - original.previousRafTimestamp, 252)
+  assert.equal(original.callbackAt, 1253)
+  assert.equal(original.timeOrigin + original.callbackAt, performance.timeOrigin + 1253)
+  paint.armCPU('raw-raf:') // Preserve the original post-readiness CPU boundary.
+  assert.equal(markers.at(-1).phase, 'start')
+  assert.throws(() => paint.armCPU('raw-raf:'), /armed once/)
+  paint.resetFrameCadence()
+  at(1254); callbacks.at(-1)(1253)
+  at(1274); callbacks.at(-1)(1273)
+  at(1424); callbacks.at(-1)(1423)
+  const stop = paint.stop(), evidence = stop.frameCadence
+  assert.equal(evidence.maxGapMS, 150)
+  assert.deepEqual(paint.frameGaps, [20, 150])
+  const retained = markers.find(marker => marker.index === evidence.maxGapMarkerIndex)
+  assert.equal(retained.previousRafTimestamp, 1273)
+  assert.equal(retained.rafTimestamp, 1423)
+  assert.equal(retained.callbackAt, 1424)
+  assert.equal(markers.find(marker => marker.index === evidence.firstRAFMarkerIndex).previousRafTimestamp, null)
+  assert.equal(evidence.lastRAFMarkerIndex, retained.index)
+  assert.equal(evidence.endedAt, 1424)
+  assert.equal(evidence.frames, 3)
+  assert.equal(evidence.unmarkedFrames, 0)
+  assert.ok(Object.isFrozen(evidence))
+  assert.equal(markers.at(-1).phase, 'stop')
+})
+
+test('resource cadence declares frames missing from a later-armed CPU stream', context => {
+  const { paint, callbacks, at } = resourceProbeFixture(context)
+  at(1001); callbacks[0](1000)
+  at(1151); callbacks.at(-1)(1150)
+  assert.equal(paint.frameCadence.maxGapMS, 150)
+  assert.equal(paint.frameCadence.maxGapMarkerIndex, null)
+  assert.equal(paint.frameCadence.unmarkedFrames, 2)
 })
 
 test('resource commit timestamps precede capture work and repaired incomplete paints remain rejected', context => {

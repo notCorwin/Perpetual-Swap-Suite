@@ -17,14 +17,16 @@ const units = Object.freeze({
   JSHeapTotalSize: 'bytes',
 })
 
-// console.timeStamp(prefix + JSON.stringify({ at, timeOrigin, phase, index }))
+// RAF markers also retain rafTimestamp/previousRafTimestamp from the browser
+// and callbackAt from performance.now(), all using the same renderer origin.
+// console.timeStamp(prefix + JSON.stringify({ at, timeOrigin, phase, index, ...raf }))
 // samples cumulative counters at the marker, without a sampled CPU profiler.
 export async function startRendererCPUCounter(page, { label = 'chart', capacity = 8_192, directory } = {}) {
   if (typeof label !== 'string' || !Number.isSafeInteger(capacity) || capacity < 1) throw new TypeError('Invalid renderer CPU counter options.')
   const id = randomUUID(), markerPrefix = `renderer-cpu:${id}:`, samples = [], captureErrors = []
   const artifact = join(resolve(directory ?? process.env.PERPETUAL_SWAP_PROCESS_WITNESS_DIRECTORY ?? '.build/process-witness'),
     `renderer-cpu-${label.replace(/[^a-z0-9]+/gi, '-').slice(0, 120)}-${id}.json`)
-  let session, stopped, previous, origin, active = true, totalSamples = 0, droppedSamples = 0, droppedCaptureErrors = 0
+  let session, stopped, previous, origin, active = true, totalSamples = 0, droppedSamples = 0, droppedCaptureErrors = 0, totalRAFSamples = 0, invalidRAFSamples = 0
   const failed = (stage, error) => {
     if (captureErrors.length < 32) captureErrors.push({ stage, message: String(error?.message ?? error) })
     else droppedCaptureErrors++
@@ -53,6 +55,17 @@ export async function startRendererCPUCounter(page, { label = 'chart', capacity 
         failed('sequence', 'Renderer CPU marker indices have a gap, duplicate or reversal.')
       }
       const sample = { at: marker.at, timeOrigin: marker.timeOrigin, phase: marker.phase, index: marker.index, metrics }
+      if (marker.phase === 'raf') {
+        totalRAFSamples++
+        Object.assign(sample, { rafTimestamp: marker.rafTimestamp, previousRafTimestamp: marker.previousRafTimestamp, callbackAt: marker.callbackAt })
+        if (!Number.isFinite(marker.rafTimestamp) || marker.rafTimestamp < 0
+          || !Number.isFinite(marker.callbackAt) || marker.callbackAt < 0 || marker.callbackAt > marker.at
+          || !(marker.previousRafTimestamp === null || Number.isFinite(marker.previousRafTimestamp)
+            && marker.previousRafTimestamp >= 0 && marker.previousRafTimestamp <= marker.rafTimestamp)) {
+          invalidRAFSamples++
+          failed('raf', 'A RAF CPU marker lacks valid original RAF timestamp, previous RAF timestamp or callback-entry performance.now() evidence.')
+        }
+      }
       samples.push(sample); previous = sample
       totalSamples++
       if (samples.length > capacity) { samples.shift(); droppedSamples++ }
@@ -70,9 +83,11 @@ export async function startRendererCPUCounter(page, { label = 'chart', capacity 
     } else active = false
     if (!totalSamples) failed('markers', 'No matching renderer CPU markers were captured.')
     const retained = samples.map(sample => Object.freeze({ ...sample, metrics: Object.freeze({ ...sample.metrics }) }))
-    const report = Object.freeze({ schemaVersion: 1, label, artifact, timeDomain: 'threadTicks',
+    const report = Object.freeze({ schemaVersion: 2, label, artifact, timeDomain: 'threadTicks',
       measurement: 'Cumulative Chromium counters at explicit renderer markers; ThreadTime measures main-thread CPU, not elapsed waiting. No sampled CPU profiler or tracing domain is enabled.',
       units, capacity, sampleRetention: 'latest', totalSamples, sampleCount: retained.length, droppedSamples,
+      rafEvidence: Object.freeze({ totalSamples: totalRAFSamples, invalidSamples: invalidRAFSamples,
+        clock: 'Epoch milliseconds = timeOrigin + rafTimestamp or callbackAt; at remains the CPU marker time. A null previousRafTimestamp starts or resets the original RAF gap window.' }),
       complete: captureErrors.length === 0 && droppedCaptureErrors === 0 && droppedSamples === 0,
       captureErrors: Object.freeze(captureErrors.map(error => Object.freeze({ ...error }))), droppedCaptureErrors,
       samples: Object.freeze(retained) })

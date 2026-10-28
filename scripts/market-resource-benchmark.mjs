@@ -12,6 +12,7 @@ import { assessResourceBudgets, installResourcePaintProbe, summarizeResourceDeli
 import { waitForAsyncCondition } from './async-readiness.mjs'
 import { startRendererDiagnostics } from './renderer-diagnostics.mjs'
 import { startRendererCPUCounter } from './renderer-cpu-counter.mjs'
+import { startProcessWitness } from '../tests/support/process-witness.mjs'
 
 const { values } = parseArgs({ options: { offscreen: { type: 'boolean' }, diagnostic: { type: 'boolean' }, ticks: { type: 'string' }, 'cadence-ms': { type: 'string' } } })
 const offscreen = values.offscreen === true
@@ -24,7 +25,9 @@ if (!Number.isSafeInteger(ticks) || ticks < 60 || ticks > 1200 || !Number.isSafe
 // display rates through 240 Hz. The extra three minutes cover setup selections,
 // interaction waits and draining. The counter grows on admission, not up front.
 const cpuCapacityBasis = { inputDurationMS: ticks * cadenceMS, additionalWindowMS: 180_000, maximumRAFRateHz: 240 }
-const cpuCapacity = Math.ceil((cpuCapacityBasis.inputDurationMS + cpuCapacityBasis.additionalWindowMS) * cpuCapacityBasis.maximumRAFRateHz / 1000) + 2
+const cpuCapacity = Math.ceil((cpuCapacityBasis.inputDurationMS + cpuCapacityBasis.additionalWindowMS) * cpuCapacityBasis.maximumRAFRateHz / 1000) + 3 // capture-start/start/stop
+const loopCapacityBasis = { inputDurationMS: ticks * cadenceMS, additionalWindowMS: 180_000, intervalMS: 20 }
+const loopCapacity = Math.ceil((loopCapacityBasis.inputDurationMS + loopCapacityBasis.additionalWindowMS) / loopCapacityBasis.intervalMS) + 2
 if (!offscreen) requireForegroundTests()
 
 const root = fileURLToPath(new URL('..', import.meta.url))
@@ -36,7 +39,7 @@ const report = { generatedAt: new Date().toISOString(), mode: 'real Electron ren
   clock: 'Epoch-origin monotonic performance clocks for source schedule/receipt and renderer input/commit/RAF; 2 ms origin precision tolerance with raw clock deltas retained.',
   externalWebSocketTransportMeasured: false, externalNetworkMeasured: false, receiveToFrameBudgetMS: offscreen ? null : 100,
   samples: [], switches: [], history: [], memorySamples: [], viewIntents: [], outcome: 'running' }
-let electron, page, stopDiagnostics, rendererCPUCounter, rendererCPUStopped = false
+let electron, page, stopDiagnostics, rendererCPUCounter, rendererCPUStopped = false, stopProcessWitness
 let stopped = false, measurementsStopped = false, paintValidated = false
 const probe = input => electron.evaluate((_electron, value) => globalThis.__marketBackend.probe(value), input)
 const stopMeasurements = async () => {
@@ -56,10 +59,15 @@ const stopRendererCPU = async () => {
   rendererCPUStopped = true
   const retain = value => {
     const { samples, ...summary } = value
-    const markers = { start: samples[0]?.phase === 'start' && samples[0]?.index === 0,
+    const markers = { captureStart: samples[0]?.phase === 'capture-start' && samples[0]?.index === 0,
+      start: samples.some(sample => sample.phase === 'start'),
       raf: samples.some(sample => sample.phase === 'raf'), stop: samples.at(-1)?.phase === 'stop' }
     report.rendererCPU = { ...summary, capacityBasis: cpuCapacityBasis, markers,
-      complete: summary.complete && markers.start && markers.raf && markers.stop }
+      timingWindow: { captureStart: samples[0]?.at ?? null, start: samples.find(sample => sample.phase === 'start')?.at ?? null,
+        stop: samples.at(-1)?.phase === 'stop' ? samples.at(-1).at : null,
+        timeOrigin: samples[0]?.timeOrigin ?? null,
+        scope: 'Raw RAF evidence covers paint-probe installation through stop. The start marker retains the original post-readiness CPU measurement boundary.' },
+      complete: summary.complete && markers.captureStart && markers.start && markers.raf && markers.stop }
   }
   try { retain(await rendererCPUCounter.stop()) }
   catch (error) {
@@ -86,6 +94,8 @@ try {
   const launchedAt = Date.now()
   electron = await _electron.launch({ args: ['.'], cwd: root,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData } })
+  stopProcessWitness = await startProcessWitness(electron, 'market-resources', { capacity: loopCapacity,
+    directory: join(dirname(reportPath), 'process-witness') })
   page = await electron.firstWindow()
   await page.waitForLoadState('domcontentloaded')
   report.windowBeforeBenchmark = await electron.evaluate(({ BrowserWindow }) => { const window = BrowserWindow.getAllWindows()[0]; return { visible: window.isVisible(), focused: window.isFocused() } })
@@ -157,7 +167,9 @@ try {
   report.fixture = fixture
   report.appMetricsAfterSeed = await electron.evaluate(({ app }) => app.getAppMetrics())
   assert.equal(fixture.rowsSeeded, 287 * 3 * 320)
-  await page.evaluate(installResourcePaintProbe, fixture)
+  rendererCPUCounter = await startRendererCPUCounter(page, { label: 'market-resources', capacity: cpuCapacity,
+    directory: join(dirname(reportPath), 'process-witness') })
+  await page.evaluate(installResourcePaintProbe, { ...fixture, cpuMarkerPrefix: rendererCPUCounter.markerPrefix })
   await page.waitForFunction(() => Number(document.querySelector('[data-total-market-count]')?.getAttribute('data-total-market-count')) === 287, null, { timeout: 60_000 })
   const rendererFramesStartedAt = Date.now()
   const readiness = await waitForAsyncCondition(() => page.evaluate(async ({ instIds, timeframes }) => {
@@ -203,8 +215,6 @@ try {
   report.rendererFrameBarrier.selectedRaf = await selectedRaf.jsonValue()
   await selectedRaf.dispose()
   report.rendererFrameBarrier.selectedRaf.waitAfterUniverseMS = performance.now() - selectedFrameWaitStartedAt
-  rendererCPUCounter = await startRendererCPUCounter(page, { label: 'market-resources', capacity: cpuCapacity,
-    directory: join(dirname(reportPath), 'process-witness') })
   await page.evaluate(prefix => window.__resourcePaint.armCPU(prefix), rendererCPUCounter.markerPrefix)
   let sequence = 0
   const choose = async (instId, phase) => {
@@ -235,7 +245,7 @@ try {
   report.backgroundReady = await probe({ action: 'backgroundStart' })
   report.backgroundStarted = true
   const loadInputAt = await page.evaluate(() => {
-    window.__resourcePaint.frameGaps = []; window.__resourcePaint.previousFrame = null
+    window.__resourcePaint.resetFrameCadence()
     window.__armResourceScheduler()
     return performance.timeOrigin + performance.now()
   })
@@ -296,7 +306,8 @@ try {
   report.load = load
   report.foregroundFrameCadence = await page.evaluate(() => {
     const gaps = [...window.__resourcePaint.frameGaps].sort((left, right) => left - right)
-    return { frames: gaps.length, medianMS: gaps[Math.floor((gaps.length - 1) * .5)], p95MS: gaps[Math.floor((gaps.length - 1) * .95)], maxMS: gaps.at(-1), visibilityState: document.visibilityState, focused: document.hasFocus() }
+    return { frames: gaps.length, medianMS: gaps[Math.floor((gaps.length - 1) * .5)], p95MS: gaps[Math.floor((gaps.length - 1) * .95)], maxMS: gaps.at(-1),
+      rawEvidence: window.__resourcePaint.frameCadence, visibilityState: document.visibilityState, focused: document.hasFocus() }
   })
   assert.ok(load.ticks.every(tick => tick.nativeUpdates === fixture.instIds.length * fixture.timeframes.length),
     'Every fixed-rate input must update the complete contract/timeframe universe before visible-series timing can acknowledge it.')
@@ -327,6 +338,7 @@ try {
   report.outcome = report.diagnosticOnly ? 'diagnostic-passed' : 'passed'
 } catch (error) {
   report.outcome = 'failed'; report.error = error.stack ?? error.message
+  if (error.processWitness) report.processWitness = { ...error.processWitness, capacityBasis: loopCapacityBasis }
   if (page) {
     try { report.failureRenderer = await page.evaluate(() => {
       const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
@@ -342,6 +354,12 @@ try {
 } finally {
   try { await stopMeasurements() } catch (error) { secondaryFailure('stop-measurements', error) }
   try { await stopRendererCPU() } catch (error) { secondaryFailure('stop-renderer-cpu', error) }
+  try {
+    if (stopProcessWitness) report.processWitness = { ...await stopProcessWitness(), capacityBasis: loopCapacityBasis }
+  } catch (error) {
+    if (error.processWitness) report.processWitness = { ...error.processWitness, capacityBasis: loopCapacityBasis }
+    secondaryFailure('stop-process-witness', error)
+  }
   if (electron && !stopped) {
     try { report.final = await probe({ action: 'scaleStop' }); stopped = true }
     catch (error) { secondaryFailure('stop-source', error) }

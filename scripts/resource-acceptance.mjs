@@ -11,7 +11,7 @@ export function installResourcePaintProbe(fixture) {
     captureTimings: { samples: 0, totalMS: 0, maxMS: 0 }, cpuMarkerTimings: { samples: 0, totalMS: 0, maxMS: 0 } }
   const observations = [], snapshots = new WeakMap(), pendingFrames = new Set()
   const barCopies = new WeakMap(), barsCopies = new WeakMap(), snapshotCopies = new WeakMap()
-  let previousRetained, observer, loopFrame, stopped, finished, cpuPrefix, cpuIndex = 0
+  let previousRetained, observer, loopFrame, stopped, finished, cpuPrefix = fixture.cpuMarkerPrefix, cpuArmed = false, cpuIndex = 0
   const failCapture = (stage, error) => {
     if (state.captureErrors.length < 40) state.captureErrors.push({ stage, message: String(error?.message ?? error) })
     else state.omittedCaptureErrors++
@@ -27,10 +27,10 @@ export function installResourcePaintProbe(fixture) {
       state.captureTimings.maxMS = Math.max(state.captureTimings.maxMS, durationMS)
     }
   }
-  const markCPU = phase => {
+  const markCPU = (phase, frame) => {
     if (!cpuPrefix) return
     const started = performance.now()
-    try { console.timeStamp(cpuPrefix + JSON.stringify({ at: started, timeOrigin: performance.timeOrigin, phase, index: cpuIndex++ })) }
+    try { console.timeStamp(cpuPrefix + JSON.stringify({ at: started, timeOrigin: performance.timeOrigin, phase, index: cpuIndex++, ...frame })) }
     catch (error) { failCapture('cpu-marker', error) }
     finally {
       const durationMS = performance.now() - started
@@ -39,8 +39,16 @@ export function installResourcePaintProbe(fixture) {
     }
   }
   state.armCPU = prefix => {
-    if (!state.active || cpuPrefix || typeof prefix !== 'string' || !prefix) throw new Error('A resource CPU marker stream can be armed once during active capture.')
-    cpuPrefix = prefix; markCPU('start')
+    if (!state.active || cpuArmed || cpuPrefix && cpuPrefix !== prefix || typeof prefix !== 'string' || !prefix) throw new Error('A resource CPU marker stream can be armed once during active capture.')
+    cpuArmed = true; cpuPrefix = prefix; markCPU('start')
+  }
+  const cadenceWindow = () => ({ timeOrigin: performance.timeOrigin, startedAt: performance.now(), endedAt: null,
+    firstRAFMarkerIndex: null, lastRAFMarkerIndex: null, maxGapMarkerIndex: null, maxGapMS: null,
+    frames: 0, unmarkedFrames: 0 })
+  state.frameCadence = cadenceWindow()
+  state.resetFrameCadence = () => {
+    if (!state.active) throw new Error('Resource RAF cadence can only reset during active capture.')
+    state.frameGaps = []; state.previousFrame = null; state.frameCadence = cadenceWindow()
   }
   const retainBar = value => {
     if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value
@@ -157,6 +165,7 @@ export function installResourcePaintProbe(fixture) {
     sample()
     state.active = false
     const endedAt = performance.timeOrigin + performance.now(), pendingFrameObservations = pendingFrames.size
+    state.frameCadence.endedAt = endedAt - performance.timeOrigin
     try { observer?.disconnect() } catch (error) { failCapture('disconnect', error) }
     for (const id of [loopFrame, ...pendingFrames]) if (id !== undefined) {
       try { cancelAnimationFrame(id) } catch (error) { failCapture('cancel-raf', error) }
@@ -165,7 +174,7 @@ export function installResourcePaintProbe(fixture) {
     markCPU('stop')
     for (const record of state.records) Object.freeze(record)
     Object.freeze(state.records); Object.freeze(state.frameGaps)
-    return stopped = Object.freeze({ endedAt, pendingFrameObservations })
+    return stopped = Object.freeze({ endedAt, pendingFrameObservations, frameCadence: Object.freeze({ ...state.frameCadence }) })
   }
   state.finish = () => {
     if (finished) return finished
@@ -230,7 +239,16 @@ export function installResourcePaintProbe(fixture) {
   observer = new MutationObserver(sample)
   observer.observe(document, { subtree: true, attributes: true, childList: true })
   const frame = timestamp => {
+    const callbackAt = performance.now()
     if (!state.active) return
+    const previousRafTimestamp = state.previousFrame
+    const cadence = state.frameCadence, markerIndex = cpuPrefix ? cpuIndex : null
+    cadence.frames++
+    if (markerIndex === null) cadence.unmarkedFrames++
+    else { cadence.firstRAFMarkerIndex ??= markerIndex; cadence.lastRAFMarkerIndex = markerIndex }
+    if (previousRafTimestamp !== null && (cadence.maxGapMS === null || timestamp - previousRafTimestamp > cadence.maxGapMS)) {
+      cadence.maxGapMS = timestamp - previousRafTimestamp; cadence.maxGapMarkerIndex = markerIndex
+    }
     if (state.previousFrame !== null) state.frameGaps.push(timestamp - state.previousFrame)
     state.previousFrame = timestamp
     sample()
@@ -241,8 +259,9 @@ export function installResourcePaintProbe(fixture) {
       if (observed.snapshot?.instId?.startsWith('SCALE')) observations.push({ kind: 'raf', at,
         snapshot: retainSnapshot(observed.snapshot), frame: observed.frame })
     })
-    markCPU('raf'); loopFrame = requestAnimationFrame(frame)
+    markCPU('raf', { rafTimestamp: timestamp, previousRafTimestamp, callbackAt }); loopFrame = requestAnimationFrame(frame)
   }
+  if (cpuPrefix) markCPU('capture-start')
   loopFrame = requestAnimationFrame(frame)
 }
 

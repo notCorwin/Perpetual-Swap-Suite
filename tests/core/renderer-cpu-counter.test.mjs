@@ -18,7 +18,8 @@ function browser({ enableError, disableError, detachError, drain } = {}) {
   return { page, session, calls }
 }
 const emit = (session, prefix, index, metrics = [{ name: 'Timestamp', value: 100 + index / 100 }, { name: 'ThreadTime', value: index / 1_000 }], metadata = {}) =>
-  session.emit('Performance.metrics', { title: `${prefix}${JSON.stringify({ at: index * 10, timeOrigin: 1_000, phase: 'raf', index, ...metadata })}`, metrics })
+  session.emit('Performance.metrics', { title: `${prefix}${JSON.stringify({ at: index * 10, timeOrigin: 1_000, phase: 'raf', index,
+    rafTimestamp: index * 10, previousRafTimestamp: index ? (index - 1) * 10 : null, callbackAt: index * 10, ...metadata })}`, metrics })
 
 test('renderer CPU counter drains matching markers before detach and preserves raw clock units', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'renderer-counter-'))
@@ -39,6 +40,10 @@ test('renderer CPU counter drains matching markers before detach and preserves r
     assert.equal(report.sampleCount, 2)
     assert.equal(report.samples[0].metrics.ThreadTime, .012)
     assert.equal(report.samples[0].timeOrigin + report.samples[0].at, 1_000)
+    assert.equal(report.samples[1].rafTimestamp - report.samples[1].previousRafTimestamp, 10)
+    assert.equal(report.samples[1].timeOrigin + report.samples[1].callbackAt, 1_010)
+    assert.equal(report.rafEvidence.totalSamples, 2)
+    assert.equal(report.rafEvidence.invalidSamples, 0)
     assert.equal(report.samples[0].metrics.IgnoredCounter, undefined)
     assert.match(report.units.ThreadTime, /renderer main-thread CPU seconds/)
     assert.equal(report.units.JSHeapUsedSize, 'bytes')
@@ -111,5 +116,23 @@ test('renderer CPU evidence rejects counter resets, origin changes and missing o
       assert.ok(report.captureErrors.some(error => error.stage === scenario.stage), JSON.stringify(report.captureErrors))
       assert.equal(report.samples.length, 2, 'Keep the raw reset/reordered witness for diagnosis instead of correcting its counters.')
     }
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('missing or invalid raw RAF evidence remains explicit without altering native CPU counters', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'renderer-counter-'))
+  try {
+    const host = browser(), counter = await startRendererCPUCounter(host.page, { directory })
+    emit(host.session, counter.markerPrefix, 0, undefined, { rafTimestamp: undefined, callbackAt: undefined })
+    emit(host.session, counter.markerPrefix, 1, undefined, { previousRafTimestamp: 20 })
+    emit(host.session, counter.markerPrefix, 2, undefined, { callbackAt: 21 })
+    const report = await counter.stop()
+    assert.equal(report.complete, false)
+    assert.deepEqual(report.captureErrors.map(error => error.stage), ['raf', 'raf', 'raf'])
+    assert.equal(report.rafEvidence.totalSamples, 3)
+    assert.equal(report.rafEvidence.invalidSamples, 3)
+    assert.equal(report.samples[1].previousRafTimestamp, 20, 'Retain the invalid raw witness; do not repair its timestamp.')
+    assert.equal(report.samples[2].metrics.ThreadTime, .002)
+    assert.equal(report.samples[2].metrics.ProcessTime, undefined)
   } finally { await rm(directory, { recursive: true, force: true }) }
 })

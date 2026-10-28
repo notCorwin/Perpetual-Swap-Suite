@@ -311,9 +311,9 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
     }
     // Initialization owns resources as soon as it starts acquiring them.
     window.__chartPaintProbe = probe
-    probe.markCPU = phase => {
+    probe.markCPU = (phase, frame) => {
       const at = performance.now()
-      try { console.timeStamp(cpuMarkerPrefix + JSON.stringify({ at, timeOrigin: performance.timeOrigin, phase, index: probe.cpuMarkerIndex++ })) }
+      try { console.timeStamp(cpuMarkerPrefix + JSON.stringify({ at, timeOrigin: performance.timeOrigin, phase, index: probe.cpuMarkerIndex++, ...frame })) }
       finally {
         const duration = performance.now() - at
         probe.cpuMarkerCostMS.samples++; probe.cpuMarkerCostMS.totalMS += duration
@@ -506,8 +506,9 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
     const frame = timestamp => {
       const sampledAt = performance.now()
       if (!probe.active) return
+      const previousRafTimestamp = probe.previousFrame
       sample(true, timestamp, sampledAt, false)
-      probe.markCPU('raf')
+      probe.markCPU('raf', { rafTimestamp: timestamp, previousRafTimestamp, callbackAt: sampledAt })
       probe.raf = requestAnimationFrame(frame)
     }
     const sampledAt = performance.now()
