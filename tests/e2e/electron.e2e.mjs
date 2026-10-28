@@ -413,17 +413,61 @@ test('the 1600 design workspace keeps both panels and chart selection when searc
   }
 })
 
+test('paint initialization failure disconnects acquired observers and releases its owner', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await openChart(page, fixture)
+  await page.evaluate(() => {
+    const mutation = new Set(), performance = new Set()
+    const observeMutation = MutationObserver.prototype.observe, disconnectMutation = MutationObserver.prototype.disconnect
+    const observePerformance = PerformanceObserver.prototype.observe, disconnectPerformance = PerformanceObserver.prototype.disconnect
+    MutationObserver.prototype.observe = function (target, options) {
+      const result = observeMutation.call(this, target, options)
+      if (target.matches?.('[data-chart-inst]')) { mutation.add(this); throw new Error('Injected paint initialization failure.') }
+      return result
+    }
+    MutationObserver.prototype.disconnect = function () { mutation.delete(this); return disconnectMutation.call(this) }
+    PerformanceObserver.prototype.observe = function (options) {
+      const result = observePerformance.call(this, options)
+      if (['longtask', 'long-animation-frame'].includes(options.type)) performance.add(this)
+      return result
+    }
+    PerformanceObserver.prototype.disconnect = function () { performance.delete(this); return disconnectPerformance.call(this) }
+    window.__paintInitializationFault = {
+      pending: () => mutation.size + performance.size,
+      restore() {
+        for (const observer of mutation) disconnectMutation.call(observer)
+        for (const observer of performance) disconnectPerformance.call(observer)
+        MutationObserver.prototype.observe = observeMutation; MutationObserver.prototype.disconnect = disconnectMutation
+        PerformanceObserver.prototype.observe = observePerformance; PerformanceObserver.prototype.disconnect = disconnectPerformance
+        delete window.__paintInitializationFault
+      },
+    }
+  })
+  try {
+    await assert.rejects(startPaintProbe(page, fixture), /Injected paint initialization failure/)
+    assert.equal(await page.evaluate(() => window.__paintInitializationFault.pending()), 0, 'Partially initialized capture must release every acquired observer.')
+    assert.equal(await page.evaluate(() => Object.hasOwn(window, '__chartPaintProbe')), false)
+  } finally { await page.evaluate(() => window.__paintInitializationFault.restore()) }
+  const paint = await withPaintProbe(page, fixture, {}, () => page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve))))
+  assertCompletePaints(paint)
+})
+
 test('a failed measured paint scope retains failures and releases the next capture', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   await openChart(page, fixture)
-  for (const mode of ['latency', 'validation', 'finalization']) {
+  for (const mode of ['latency', 'validation', 'finalization', 'finalization-and-cleanup']) {
     let primary
     let failure
     await assert.rejects(withPaintProbe(page, fixture, {}, async () => {
       await page.evaluate(async mode => {
         for (let frame = 0; frame < 2; frame++) await new Promise(resolve => requestAnimationFrame(resolve))
         if (mode === 'validation') window.__chartPaintProbe.errors.push('Injected retained paint violation.')
-        if (mode === 'finalization') window.__chartPaintProbe.capturePending = () => { throw new Error('Injected final capture failure.') }
+        if (mode.startsWith('finalization')) window.__chartPaintProbe.capturePending = () => { throw new Error('Injected final capture failure.') }
+        if (mode === 'finalization-and-cleanup') {
+          const observer = window.__chartPaintProbe.observer, disconnect = observer.disconnect.bind(observer)
+          let first = true
+          observer.disconnect = () => { disconnect(); if (first) { first = false; throw new Error('Injected observer cleanup failure.') } }
+        }
       }, mode)
       try { assertScrollResponsiveness({ intentLatenciesMS: [268], unaccountedInputs: [], maxFrameGapMS: 250.034 }) }
       catch (error) { primary = error; throw error }
@@ -435,8 +479,9 @@ test('a failed measured paint scope retains failures and releases the next captu
         assert.ok(error.cause instanceof AggregateError)
         assert.equal(error.cause.errors[0], primary, 'The measured-phase failure must remain the primary cause.')
         assert.match(error.message, mode === 'validation' ? /Injected retained paint violation/ : /Injected final capture failure/)
+        if (mode === 'finalization-and-cleanup') assert.match(error.message, /Injected observer cleanup failure/)
       }
-      if (mode !== 'finalization') {
+      if (!mode.startsWith('finalization')) {
         assert.ok(error.paintPhaseData.frames > 0)
         if (mode === 'validation') assert.ok(error.paintPhaseData.violations.includes('Injected retained paint violation.'))
         else assert.deepEqual(error.paintPhaseData.violations, [])
@@ -446,6 +491,8 @@ test('a failed measured paint scope retains failures and releases the next captu
     })
     assert.equal(await page.evaluate(() => Boolean(window.__chartPaintProbe?.active)), false,
       'A failed measured phase or final capture must leave no active RAF/observer owner.')
+    assert.equal(await page.evaluate(() => Object.hasOwn(window, '__chartPaintProbe')), false,
+      'A stopped failed capture must release its retained bars and SVG evidence.')
     const retained = JSON.stringify(failure.paintPhaseData)
     const next = await withPaintProbe(page, fixture, {}, () => page.evaluate(async () => {
       for (let frame = 0; frame < 2; frame++) await new Promise(resolve => requestAnimationFrame(resolve))

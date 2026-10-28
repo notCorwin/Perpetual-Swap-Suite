@@ -255,6 +255,15 @@ export async function openChart(page, fixture, timeframe = fixture.timeframe) {
 // 96 full bars into an attribute on every production animation frame.
 const paintProbes = new WeakMap()
 
+async function releasePaintProbe(page) {
+  await page.evaluate(() => {
+    const probe = window.__chartPaintProbe
+    // Release retained snapshots even if stopping one resource fails.
+    delete window.__chartPaintProbe
+    probe?.stop({ capturePending: false })
+  })
+}
+
 export async function startPaintProbe(page, fixture, { requireMatureData = false, requireWarmStatistics = false, indicatorValidation = 'fixture' } = {}) {
   assert.ok(['fixture', 'finite', 'deferred-canonical'].includes(indicatorValidation), 'Unknown chart indicator validation contract.')
   assert.ok(!paintProbes.has(page), 'The previous paint probe must finish before starting another.')
@@ -285,6 +294,23 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       raf: null, observer: null, schedulerObservers: [],
       scheduler: { counts: {}, entries: [], supportedEntryTypes: PerformanceObserver.supportedEntryTypes },
     }
+    probe.stop = ({ capturePending = true } = {}) => {
+      const failures = [], wasActive = probe.active
+      const attempt = operation => { try { operation() } catch (error) { failures.push(error) } }
+      if (wasActive && capturePending) attempt(() => probe.capturePending?.())
+      probe.active = false
+      attempt(() => cancelAnimationFrame(probe.raf))
+      attempt(() => probe.observer?.disconnect())
+      for (const { observer, record } of probe.schedulerObservers) {
+        if (wasActive) attempt(() => record(observer.takeRecords()))
+        attempt(() => observer.disconnect())
+      }
+      if (wasActive && probe.cpuMarkerIndex > 0) attempt(() => probe.markCPU('stop'))
+      if (failures.length === 1) throw failures[0]
+      if (failures.length) throw new AggregateError(failures, failures.map(error => error.message).join('\n'), { cause: failures[0] })
+    }
+    // Initialization owns resources as soon as it starts acquiring them.
+    window.__chartPaintProbe = probe
     probe.markCPU = phase => {
       const at = performance.now()
       try { console.timeStamp(cpuMarkerPrefix + JSON.stringify({ at, timeOrigin: performance.timeOrigin, phase, index: probe.cpuMarkerIndex++ })) }
@@ -495,14 +521,15 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
         sample(false, sampledAt, sampledAt, true)
       }
     }
-    window.__chartPaintProbe = probe
     probe.markCPU('start')
   }, { instId: fixture.instId,
     series: Object.fromEntries(Object.entries(fixture.series).map(([timeframe, entry]) => [timeframe, { intervalMS: entry.intervalMS }])),
     requireMatureData, requireWarmStatistics, indicatorValidation, cpuMarkerPrefix: cpu.markerPrefix }) }
   catch (error) {
-    try { await cpu.stop() }
-    catch (cleanup) { throw new AggregateError([error, cleanup], error.message, { cause: error }) }
+    const failures = [error]
+    try { await releasePaintProbe(page) } catch (cleanup) { failures.push(cleanup) }
+    try { await cpu.stop() } catch (cleanup) { failures.push(cleanup) }
+    if (failures.length > 1) throw new AggregateError(failures, failures.map(error => error.message).join('\n'), { cause: error })
     throw error
   }
   paintProbes.set(page, { series: fixture.series, cpu })
@@ -521,17 +548,7 @@ export async function finishPaintProbe(page, { readyTarget = null, includeReques
     try { observed = await page.evaluate(() => {
       const probe = window.__chartPaintProbe
       if (!probe) throw new Error('No chart paint probe was installed.')
-      try { probe.capturePending() }
-      finally {
-        probe.active = false
-        cancelAnimationFrame(probe.raf)
-        probe.observer.disconnect()
-        for (const { observer, record } of probe.schedulerObservers) {
-          try { record(observer.takeRecords()) }
-          finally { observer.disconnect() }
-        }
-        probe.markCPU('stop')
-      }
+      probe.stop()
       const hours = new Map(), seenBars = new Map()
       for (const { snapshot, bars } of probe.observations) {
         if (!snapshot || !Array.isArray(bars)) continue
@@ -561,6 +578,10 @@ export async function finishPaintProbe(page, { readyTarget = null, includeReques
     const paint = await validateStoppedPaintProbe(page, { readyTarget, includeRequestCommits, includeTimingEvidence, series,
       oracleTransfer: { phase: 'after capture stopped', fixtureBars, transferredBars } })
     return { ...paint, rendererCPU }
+  } catch (error) {
+    try { await releasePaintProbe(page) }
+    catch (cleanup) { throw new AggregateError([error, cleanup], `${error.message}\n${cleanup.message}`, { cause: error }) }
+    throw error
   } finally { paintProbes.delete(page) }
 }
 
