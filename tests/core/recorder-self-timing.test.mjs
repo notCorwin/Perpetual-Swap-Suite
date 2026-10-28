@@ -51,3 +51,20 @@ test('retained recorder snapshots neither change on future work nor expose mutab
   assert.equal(current.cpuClock, null)
   assert.equal(current.stages['batch-build'].cpuMeasuredCount, 0)
 })
+
+test('asynchronous wait timing never charges unrelated event-loop CPU', () => {
+  let wall = 10, cpu = 2
+  const timing = createRecorderSelfTiming({ now: () => wall, timeOrigin: 1000, cpuTime: () => cpu })
+  const finish = timing.startWait('journal-write-wait')
+  wall = 30; cpu = 18
+  timing.measure('other-work', () => { wall = 32; cpu = 19 })
+  wall = 42; cpu = 40
+  finish(); finish('error')
+  const { stages, slowSamples } = timing.snapshot()
+  assert.equal(stages['journal-write-wait'].count, 1)
+  assert.equal(stages['journal-write-wait'].totalMS, 32)
+  assert.equal(stages['journal-write-wait'].cpuMeasuredCount, 0)
+  assert.equal(stages['journal-write-wait'].totalCPUTimeMS, 0)
+  assert.equal(stages['other-work'].totalCPUTimeMS, 1)
+  assert.equal(Object.hasOwn(slowSamples.at(-1), 'cpuTimeMS'), false)
+})
