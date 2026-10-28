@@ -24,13 +24,13 @@ class Socket extends EventTarget implements RealtimeWebSocket {
   close() { this.readyState = 3; queueMicrotask(() => this.dispatchEvent(new Event('close'))) }
 }
 
-for (const volume of [5, 8]) test(`late forming REST cannot replace a newer native price with cumulative volume ${volume}`, async t => {
+for (const volume of [5, 8]) test(`late forming REST cannot replace a newer native price with cumulative volume ${volume}`, { timeout: 10_000 }, async t => {
   // Both observations have the exact same clock value: admission is a source
   // revision, and an equal-volume native OHLC correction is still newer.
   const now = Math.floor(Date.now() / step) * step + 60_000
   t.mock.method(Date, 'now', () => now)
   const root = await mkdtemp(join(tmpdir(), 'perp-forming-source-race-')), store = await MarketStore.open(root)
-  const held = deferred(), requested = deferred(), socket = new Socket(), published: PreparedChartResponse[] = []
+  const held = deferred(), requested = deferred(), nativePublished = deferred(), socket = new Socket(), published: PreparedChartResponse[] = []
   const service = new MarketService(store, () => DEFAULT_PREFERENCES, async input => {
     const url = new URL(String(input))
     if (url.pathname.startsWith('/api/v5/rubik/')) return new Response(JSON.stringify({ code: '0', data: [] }))
@@ -43,7 +43,10 @@ for (const volume of [5, 8]) test(`late forming REST cannot replace a newer nati
     await service.ready
     service.installInstruments(new Map([[instId, { instId, instType: 'SWAP', instCategory: '1', settleCcy: 'USDT', ctType: 'linear', state: 'live', ctVal: '0.01', ctMult: '1', ctValCcy: 'BTC', ruleType: 'normal' }]]))
     await service.localChartWindow(instId, timeframe)
-    service.subscribePreparedCharts(frame => published.push(frame))
+    service.subscribePreparedCharts(frame => {
+      published.push(frame)
+      if (frame.instId === instId && frame.timeframe === timeframe && frame.liveBar?.close === 200) nativePublished.resolve()
+    })
     // Quote acquisition has its own lifetime; chart history demand now owns
     // completed-window coverage instead of substituting a latest-only read.
     pending = service.history.latest(instId, timeframe)
@@ -54,6 +57,7 @@ for (const volume of [5, 8]) test(`late forming REST cannot replace a newer nati
     socket.message({ arg: { channel: 'candle5m', instId }, data: [raw(now - 60_000, 200, volume)] })
     await service.realtime.whenIdle()
     assert.equal(service.liveCandles.get(`${instId}:${timeframe}`).close, 200)
+    await nativePublished.promise
     assert.equal(service.preparedCharts.cached(`${instId}:${timeframe}`).liveBar.close, 200)
     held.resolve(); await pending
     await Promise.allSettled([...service.preparedCharts.tasks.values()])

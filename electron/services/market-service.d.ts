@@ -22,7 +22,7 @@ export class MarketService {
   refresh(options?: { reuse?: boolean }): Promise<void>
   /** Pure projection of the canonical list, including its bounded exit buffer. */
   listRowsFor(now?: number): RankedMarketRow[]
-  prepareChartWindow(instId: string, timeframe: '5m' | '15m' | '1H', end?: number, historyBars?: number): Promise<PreparedChartWindow>
+  prepareChartWindow(instId: string, timeframe: '5m' | '15m' | '1H', end?: number, historyBars?: number): Promise<PreparedChartWindow | null>
   getPreparedCharts(): Promise<{ frames: PreparedChartWindow[] }>
   subscribePreparedCharts(listener: (frame: PreparedChartWindow) => void): () => void
   subscribeMarket(listener: () => void): () => void

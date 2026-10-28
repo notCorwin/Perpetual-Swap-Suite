@@ -8,30 +8,94 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { _electron } from 'playwright'
 import { offscreenChartWindow, selectTimeframe } from './chart-acceptance.mjs'
 import { requireForegroundTests } from '../electron/test-presentation.js'
-import { assessResourceBudgets, summarizeResourceDelivery } from './resource-acceptance.mjs'
+import { assessResourceBudgets, installResourcePaintProbe, summarizeResourceDelivery } from './resource-acceptance.mjs'
 import { waitForAsyncCondition } from './async-readiness.mjs'
+import { startRendererDiagnostics } from './renderer-diagnostics.mjs'
+import { startRendererCPUCounter } from './renderer-cpu-counter.mjs'
+import { startProcessWitness } from '../tests/support/process-witness.mjs'
 
-const { values } = parseArgs({ options: { offscreen: { type: 'boolean' }, ticks: { type: 'string' }, 'cadence-ms': { type: 'string' } } })
+const { values } = parseArgs({ options: { offscreen: { type: 'boolean' }, diagnostic: { type: 'boolean' }, ticks: { type: 'string' }, 'cadence-ms': { type: 'string' } } })
 const offscreen = values.offscreen === true
+const diagnosticDirectory = process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS
+if (diagnosticDirectory && !values.diagnostic) throw new Error('Normal resource acceptance rejects renderer profiling. Use --diagnostic only for a separate diagnostic run.')
+if (values.diagnostic && !diagnosticDirectory) throw new Error('--diagnostic requires PERPETUAL_SWAP_RENDERER_DIAGNOSTICS for its separate profile output.')
 const ticks = Number(values.ticks ?? 60), cadenceMS = Number(values['cadence-ms'] ?? 500)
 if (!Number.isSafeInteger(ticks) || ticks < 60 || ticks > 1200 || !Number.isSafeInteger(cadenceMS) || cadenceMS < 20 || cadenceMS > 2000) throw new Error('Resource workloads require 60–1200 ticks and a 20–2000 ms cadence.')
+// Retain the full declared workload, including the 40-minute maximum, at known
+// display rates through 240 Hz. The extra three minutes cover setup selections,
+// interaction waits and draining. The counter grows on admission, not up front.
+const cpuCapacityBasis = { inputDurationMS: ticks * cadenceMS, additionalWindowMS: 180_000, maximumRAFRateHz: 240 }
+const cpuCapacity = Math.ceil((cpuCapacityBasis.inputDurationMS + cpuCapacityBasis.additionalWindowMS) * cpuCapacityBasis.maximumRAFRateHz / 1000) + 3 // capture-start/start/stop
+const loopCapacityBasis = { inputDurationMS: ticks * cadenceMS, additionalWindowMS: 180_000, intervalMS: 20 }
+const loopCapacity = Math.ceil((loopCapacityBasis.inputDurationMS + loopCapacityBasis.additionalWindowMS) / loopCapacityBasis.intervalMS) + 2
 if (!offscreen) requireForegroundTests()
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const reportPath = resolve(root, process.env.PERPETUAL_SWAP_RESOURCE_REPORT ?? '.build/resource-benchmark.json')
 const userData = await mkdtemp(join(tmpdir(), 'perp-market-resources-'))
 const report = { generatedAt: new Date().toISOString(), mode: 'real Electron renderer, worker backend and SQLite; synthetic native intake',
-  nativePresentationMeasured: false, timing: 'Scheduled synthetic input to SVG commit and next RAF opportunity; no native compositor presentation.',
+  diagnosticOnly: values.diagnostic === true,
+  nativePresentationMeasured: false, timing: 'Scheduled synthetic input to SVG commit and a RAF opportunity that rechecks the displayed chart; no native compositor presentation.',
   clock: 'Epoch-origin monotonic performance clocks for source schedule/receipt and renderer input/commit/RAF; 2 ms origin precision tolerance with raw clock deltas retained.',
   externalWebSocketTransportMeasured: false, externalNetworkMeasured: false, receiveToFrameBudgetMS: offscreen ? null : 100,
   samples: [], switches: [], history: [], memorySamples: [], viewIntents: [], outcome: 'running' }
-let electron, page, stopped = false
+let electron, page, stopDiagnostics, rendererCPUCounter, rendererCPUStopped = false, stopProcessWitness
+let stopped = false, measurementsStopped = false, paintValidated = false
 const probe = input => electron.evaluate((_electron, value) => globalThis.__marketBackend.probe(value), input)
+const stopMeasurements = async () => {
+  if (!page || measurementsStopped) return
+  const result = await page.evaluate(() => ({ capture: window.__resourcePaint?.stop(), scheduler: window.__finishResourceScheduler?.() }))
+  measurementsStopped = true
+  if (result.capture) report.paintCaptureStopped = result.capture
+  if (result.scheduler) report.schedulerAfterTicks = result.scheduler
+}
+const finishDiagnostics = async () => {
+  const finish = stopDiagnostics
+  stopDiagnostics = undefined
+  await finish?.()
+}
+const stopRendererCPU = async () => {
+  if (!rendererCPUCounter || rendererCPUStopped) return
+  rendererCPUStopped = true
+  const retain = value => {
+    const { samples, ...summary } = value
+    const markers = { captureStart: samples[0]?.phase === 'capture-start' && samples[0]?.index === 0,
+      start: samples.some(sample => sample.phase === 'start'),
+      raf: samples.some(sample => sample.phase === 'raf'), stop: samples.at(-1)?.phase === 'stop' }
+    report.rendererCPU = { ...summary, capacityBasis: cpuCapacityBasis, markers,
+      timingWindow: { captureStart: samples[0]?.at ?? null, start: samples.find(sample => sample.phase === 'start')?.at ?? null,
+        stop: samples.at(-1)?.phase === 'stop' ? samples.at(-1).at : null,
+        timeOrigin: samples[0]?.timeOrigin ?? null,
+        scope: 'Raw RAF evidence covers paint-probe installation through stop. The start marker retains the original post-readiness CPU measurement boundary.' },
+      complete: summary.complete && markers.captureStart && markers.start && markers.raf && markers.stop }
+  }
+  try { retain(await rendererCPUCounter.stop()) }
+  catch (error) {
+    if (error.rendererCPUCounter) {
+      retain(error.rendererCPUCounter)
+      report.rendererCPU.complete = false
+      report.rendererCPU.artifactError = error.stack ?? error.message
+    }
+    throw error
+  }
+}
+const validatePaint = async () => {
+  if (!page || paintValidated) return
+  const value = await page.evaluate(() => window.__resourcePaint?.finish())
+  if (value) { report.correctness = value; paintValidated = true }
+}
+const secondaryFailure = (stage, error) => {
+  report.secondaryErrors ??= []
+  report.secondaryErrors.push({ stage, error: error.stack ?? error.message ?? String(error) })
+  report.outcome = 'failed'; process.exitCode = 1
+}
 
 try {
   const launchedAt = Date.now()
   electron = await _electron.launch({ args: ['.'], cwd: root,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData } })
+  stopProcessWitness = await startProcessWitness(electron, 'market-resources', { capacity: loopCapacity,
+    directory: join(dirname(reportPath), 'process-witness') })
   page = await electron.firstWindow()
   await page.waitForLoadState('domcontentloaded')
   report.windowBeforeBenchmark = await electron.evaluate(({ BrowserWindow }) => { const window = BrowserWindow.getAllWindows()[0]; return { visible: window.isVisible(), focused: window.isFocused() } })
@@ -49,6 +113,7 @@ try {
   report.windowAvailableMS = Date.now() - launchedAt
   report.gpuFeatureStatus = await electron.evaluate(({ app }) => app.getGPUFeatureStatus())
   report.appMetricsAtStart = await electron.evaluate(({ app }) => app.getAppMetrics())
+  if (report.diagnosticOnly) stopDiagnostics = await startRendererDiagnostics(electron, page, diagnosticDirectory)
   await page.evaluate(() => {
     const state = window.__resourceScheduler = { timeOrigin: performance.timeOrigin, supportedEntryTypes: PerformanceObserver.supportedEntryTypes,
       phase: 'fixed-rate-intake', active: false, startedAt: null, endedAt: null,
@@ -102,54 +167,9 @@ try {
   report.fixture = fixture
   report.appMetricsAfterSeed = await electron.evaluate(({ app }) => app.getAppMetrics())
   assert.equal(fixture.rowsSeeded, 287 * 3 * 320)
-  await page.evaluate(fixture => {
-    const state = window.__resourcePaint = { records: [], violations: [], indicatorValuesChecked: 0, previous: null, frameGaps: [], previousFrame: null }
-    const near = (actual, expected, description) => {
-      if (expected === null ? actual !== null : typeof actual !== 'number' || Math.abs(actual - expected) > Math.max(1, Math.abs(expected)) * 1e-10) {
-        if (state.violations.length < 40) state.violations.push(`${description}: ${actual} != ${expected}`)
-      }
-    }
-    const sample = () => {
-      const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot, svg = chart?.querySelector('svg[data-rendered-inst]')
-      if (!snapshot?.instId?.startsWith('SCALE') || !svg || snapshot === state.previous) return
-      state.previous = snapshot
-      if (svg.dataset.renderedInst !== snapshot.instId || svg.dataset.renderedTimeframe !== snapshot.timeframe) state.violations.push('SVG mixed native series identities.')
-      const instrument = Number(snapshot.instId.slice(5, 8)), step = fixture.intervals[snapshot.timeframe]
-      const first = Math.floor(fixture.asOf / step) * step - fixture.periods * step
-      const baseline = 100 + instrument * 3 + ({ '5m': 0, '15m': 10, '1H': 20 })[snapshot.timeframe]
-      for (const value of snapshot.bars) {
-        const index = (value.hour - first) / step, close = baseline + index * .01
-        if (!Number.isInteger(index) || index < 0 || index >= fixture.periods) { state.violations.push('A persisted candle fell outside its seeded native range.'); continue }
-        for (const [field, expected] of Object.entries({ open: close - .02, high: close + .06, low: close - .05, close })) near(value[field], expected, `${snapshot.instId}/${snapshot.timeframe}/${index}/${field}`)
-        if (value.indicatorsObserved) {
-          const middle = close - .095, deviation = .01 * Math.sqrt(399 / 12)
-          const roc = i => (baseline + i * .01 - (baseline + (i - 9) * .01)) / Math.abs(baseline + (i - 9) * .01) * 100
-          let numerator = 0, denominator = 0
-          for (let i = Math.max(0, index - 13); i <= index; i += 1) { const volume = 100 + i % 7; numerator += (baseline + i * .01 + .01 / 3) * volume; denominator += volume }
-          const expected = { ema: index >= 199 ? close - .995 : null,
-            bollMiddle: index >= 19 ? middle : null, bollUpper: index >= 19 ? middle + 2 * deviation : null, bollLower: index >= 19 ? middle - 2 * deviation : null,
-            vwap: index >= 13 ? numerator / denominator : null, roc: index >= 9 ? roc(index) : null,
-            maroc: index >= 17 ? Array.from({ length: 9 }, (_, offset) => roc(index - offset)).reduce((a, b) => a + b, 0) / 9 : null,
-            rsi6: index >= 6 ? 100 : null, rsi12: index >= 12 ? 100 : null, rsi24: index >= 24 ? 100 : null,
-            atrPercent: index >= 13 ? .11 / close * 100 : null, bbw: index >= 19 ? 4 * deviation / middle * 100 : null }
-          for (const [field, expectedValue] of Object.entries(expected)) { near(value[field], expectedValue, `${snapshot.instId}/${snapshot.timeframe}/${index}/${field}`); state.indicatorValuesChecked += 1 }
-        }
-      }
-      const label = chart.querySelector('[data-chart-price-label-value]')?.textContent ?? ''
-      const liveVisible = snapshot.liveBar && Number(svg.dataset.renderedEnd) === snapshot.liveBar.hour
-      if (liveVisible) near(Number(label.split(/\s/)[0].replaceAll(',', '')), snapshot.liveBar.close, 'Visible SVG live-price label')
-      const record = { instId: snapshot.instId, timeframe: snapshot.timeframe, endHour: snapshot.endHour,
-        livePrice: snapshot.liveBar?.close ?? null, priceObservedAt: snapshot.priceObservedAt,
-        sequence: liveVisible ? Math.round((snapshot.liveBar.close - baseline - fixture.periods * .01) * 1000) : 0,
-        committedAt: performance.timeOrigin + performance.now(), nextFrameAt: null, label, bars: snapshot.bars.length,
-        indicatorState: snapshot.indicatorState, oiState: snapshot.oiState, takerState: snapshot.takerState }
-      state.records.push(record)
-      requestAnimationFrame(() => { record.nextFrameAt = performance.timeOrigin + performance.now() })
-    }
-    new MutationObserver(sample).observe(document, { subtree: true, attributes: true, childList: true })
-    const frame = timestamp => { if (state.previousFrame !== null) state.frameGaps.push(timestamp - state.previousFrame); state.previousFrame = timestamp; sample(); requestAnimationFrame(frame) }
-    requestAnimationFrame(frame)
-  }, fixture)
+  rendererCPUCounter = await startRendererCPUCounter(page, { label: 'market-resources', capacity: cpuCapacity,
+    directory: join(dirname(reportPath), 'process-witness') })
+  await page.evaluate(installResourcePaintProbe, { ...fixture, cpuMarkerPrefix: rendererCPUCounter.markerPrefix })
   await page.waitForFunction(() => Number(document.querySelector('[data-total-market-count]')?.getAttribute('data-total-market-count')) === 287, null, { timeout: 60_000 })
   const rendererFramesStartedAt = Date.now()
   const readiness = await waitForAsyncCondition(() => page.evaluate(async ({ instIds, timeframes }) => {
@@ -177,6 +197,7 @@ try {
   // Start prepared-selection timing only after that visible baseline exists;
   // retain its preparation wait separately from subsequent input latency.
   const focus = fixture.instIds[0], timeframe = '15m'
+  const currentEnd = Math.floor(fixture.asOf / fixture.intervals[timeframe]) * fixture.intervals[timeframe] - fixture.intervals[timeframe]
   const selectedFrameWaitStartedAt = performance.now()
   const selectedRaf = await page.waitForFunction(({ focus, timeframe }) => {
     const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
@@ -187,13 +208,14 @@ try {
       || Number(svg.dataset.renderedEnd) !== snapshot.endHour
       || snapshot !== window.__resourcePaint.previous || record.instId !== snapshot.instId
       || record.timeframe !== snapshot.timeframe || record.bars !== 96 || record.indicatorState !== 'ready'
-      || !Number.isFinite(record.nextFrameAt) || record.nextFrameAt < record.committedAt) return false
+      || !window.__resourcePaint.isFrame(record)) return false
     const { instId, committedAt, nextFrameAt } = record
     return { instId, timeframe, committedAt, nextFrameAt }
   }, { focus, timeframe }, { timeout: 20_000 })
   report.rendererFrameBarrier.selectedRaf = await selectedRaf.jsonValue()
   await selectedRaf.dispose()
   report.rendererFrameBarrier.selectedRaf.waitAfterUniverseMS = performance.now() - selectedFrameWaitStartedAt
+  await page.evaluate(prefix => window.__resourcePaint.armCPU(prefix), rendererCPUCounter.markerPrefix)
   let sequence = 0
   const choose = async (instId, phase) => {
     const expected = sequence ? 100 + Number(instId.slice(5, 8)) * 3 + 10 + fixture.periods * .01 + sequence * .001 : null
@@ -210,9 +232,9 @@ try {
       return at
     })
     report.pendingSelection.inputAt = inputAt
-    report.viewIntents.push({ at: inputAt, instId, timeframe: '15m' })
-    await page.waitForFunction(({ instId, inputAt, expected }) => window.__resourcePaint.records.some(record => record.instId === instId && record.nextFrameAt >= inputAt && record.bars === 96 && record.indicatorState === 'ready' && (expected === null || record.livePrice >= expected)), { instId, inputAt, expected }, { timeout: 20_000 })
-    const value = await page.evaluate(({ instId, inputAt, expected }) => window.__resourcePaint.records.find(record => record.instId === instId && record.nextFrameAt >= inputAt && record.bars === 96 && record.indicatorState === 'ready' && (expected === null || record.livePrice >= expected)), { instId, inputAt, expected })
+    report.viewIntents.push({ at: inputAt, instId, timeframe: '15m', liveEndHour: currentEnd })
+    await page.waitForFunction(({ instId, inputAt, expected }) => window.__resourcePaint.records.some(record => window.__resourcePaint.isFrame(record) && record.instId === instId && record.timeframe === '15m' && record.nextFrameAt >= inputAt && record.bars === 96 && record.indicatorState === 'ready' && (expected === null || record.frame.livePrice >= expected)), { instId, inputAt, expected }, { timeout: 20_000 })
+    const value = await page.evaluate(({ instId, inputAt, expected }) => window.__resourcePaint.records.find(record => window.__resourcePaint.isFrame(record) && record.instId === instId && record.timeframe === '15m' && record.nextFrameAt >= inputAt && record.bars === 96 && record.indicatorState === 'ready' && (expected === null || record.frame.livePrice >= expected)), { instId, inputAt, expected })
     report.switches.push({ phase, instId, inputMode: 'row click after search filtering', selectedBeforeClick, rowClickToFrameMS: value.nextFrameAt - inputAt, bars: value.bars, indicatorState: value.indicatorState, expected, actualPrice: value.livePrice })
     delete report.pendingSelection
   }
@@ -223,11 +245,11 @@ try {
   report.backgroundReady = await probe({ action: 'backgroundStart' })
   report.backgroundStarted = true
   const loadInputAt = await page.evaluate(() => {
-    window.__resourcePaint.frameGaps = []; window.__resourcePaint.previousFrame = null
+    window.__resourcePaint.resetFrameCadence()
     window.__armResourceScheduler()
     return performance.timeOrigin + performance.now()
   })
-  report.viewIntents.push({ at: loadInputAt, instId: focus, timeframe })
+  report.viewIntents.push({ at: loadInputAt, instId: focus, timeframe, liveEndHour: currentEnd })
   report.loadStart = await probe({ action: 'scaleLoadStart', ticks, cadenceMS, focusInstId: focus, timeframe })
   const loadDeadline = performance.now() + ticks * cadenceMS + 20_000
   let load, nextMemorySample = 0
@@ -247,43 +269,62 @@ try {
   const interact = async () => {
     await sleep(Math.min(500, cadenceMS * 5))
     for (const index of [286, 175, 96, 14]) { await choose(fixture.instIds[index], 'selection during fixed-rate intake'); await choose(focus, 'warm revisit during fixed-rate intake') }
-    const currentEnd = Math.floor(fixture.asOf / fixture.intervals[timeframe]) * fixture.intervals[timeframe] - fixture.intervals[timeframe]
     for (const distance of [64, -64]) {
       const expectedEnd = distance > 0 ? currentEnd - 64 * fixture.intervals[timeframe] : currentEnd
       const inputAt = await page.evaluate(distance => {
         const inputAt = performance.timeOrigin + performance.now()
         document.querySelector('[data-chart-plot]').dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: distance * 12 }))
+        window.__resourcePaint.recheck()
         return inputAt
       }, distance)
-      report.viewIntents.push({ at: inputAt, instId: focus, timeframe, historical: distance > 0 })
-      await page.waitForFunction(({ focus, expectedEnd, inputAt }) => window.__resourcePaint.records.some(record => record.instId === focus && record.endHour === expectedEnd && record.bars === 96 && record.nextFrameAt >= inputAt), { focus, expectedEnd, inputAt }, { timeout: 20_000 })
-      const frame = await page.evaluate(({ focus, expectedEnd, inputAt }) => window.__resourcePaint.records.find(record => record.instId === focus && record.endHour === expectedEnd && record.bars === 96 && record.nextFrameAt >= inputAt), { focus, expectedEnd, inputAt })
+      report.viewIntents.push({ at: inputAt, instId: focus, timeframe, endHour: expectedEnd, liveEndHour: currentEnd, historical: distance > 0 })
+      await page.waitForFunction(({ focus, timeframe, expectedEnd, inputAt }) => window.__resourcePaint.records.some(record => window.__resourcePaint.isFrame(record) && record.instId === focus && record.timeframe === timeframe && record.frame.endHour === expectedEnd && record.bars === 96 && record.nextFrameAt >= inputAt), { focus, timeframe, expectedEnd, inputAt }, { timeout: 20_000 })
+      const frame = await page.evaluate(({ focus, timeframe, expectedEnd, inputAt }) => window.__resourcePaint.records.find(record => window.__resourcePaint.isFrame(record) && record.instId === focus && record.timeframe === timeframe && record.frame.endHour === expectedEnd && record.bars === 96 && record.nextFrameAt >= inputAt), { focus, timeframe, expectedEnd, inputAt })
       report.history.push({ distance, expectedEnd, inputToFrameMS: frame.nextFrameAt - inputAt, bars: frame.bars, oiState: frame.oiState, takerState: frame.takerState })
     }
   }
-  await Promise.all([monitor(), interact()])
-  await page.waitForFunction(({ focus, sequence }) => window.__resourcePaint.records.some(record => record.instId === focus && record.sequence === sequence && record.nextFrameAt !== null), { focus, sequence }, { timeout: 10_000 })
+  // Join both measurement owners even when one fails. Neither memory sampling
+  // nor an in-flight interaction may overlap deferred numerical validation.
+  const workloadFailures = []
+  await Promise.allSettled([['monitor', monitor], ['interaction', interact]].map(async ([phase, operation]) => {
+    try { await operation() }
+    catch (error) { workloadFailures.push({ phase, error }); throw error }
+  }))
+  if (workloadFailures.length) {
+    report.workloadErrors = workloadFailures.map(({ phase, error }) => ({ phase, error: error.stack ?? error.message ?? String(error) }))
+    throw workloadFailures[0].error
+  }
+  const finalIntent = report.viewIntents.at(-1)
+  assert.ok(finalIntent && !finalIntent.historical && finalIntent.instId === focus && finalIntent.timeframe === timeframe,
+    'The fixed-rate workload must finish on the selected live viewport.')
+  await page.waitForFunction(input => window.__resourcePaint.readyForLatest(input),
+    { instId: focus, timeframe, sequence, afterAt: finalIntent.at }, { timeout: 10_000 })
+  await stopMeasurements()
+  await stopRendererCPU()
   const commits = await page.evaluate(() => window.__resourcePaint.records)
   report.rendererCommits = commits
   report.load = load
   report.foregroundFrameCadence = await page.evaluate(() => {
     const gaps = [...window.__resourcePaint.frameGaps].sort((left, right) => left - right)
-    return { frames: gaps.length, medianMS: gaps[Math.floor((gaps.length - 1) * .5)], p95MS: gaps[Math.floor((gaps.length - 1) * .95)], maxMS: gaps.at(-1), visibilityState: document.visibilityState, focused: document.hasFocus() }
+    return { frames: gaps.length, medianMS: gaps[Math.floor((gaps.length - 1) * .5)], p95MS: gaps[Math.floor((gaps.length - 1) * .95)], maxMS: gaps.at(-1),
+      rawEvidence: window.__resourcePaint.frameCadence, visibilityState: document.visibilityState, focused: document.hasFocus() }
   })
-  report.schedulerAfterTicks = await page.evaluate(() => window.__finishResourceScheduler())
   assert.ok(load.ticks.every(tick => tick.nativeUpdates === fixture.instIds.length * fixture.timeframes.length),
     'Every fixed-rate input must update the complete contract/timeframe universe before visible-series timing can acknowledge it.')
   report.delivery = summarizeResourceDelivery(load, commits, { intents: report.viewIntents })
   report.samples = report.delivery.samples
-  await page.waitForFunction(() => window.__resourcePaint.indicatorValuesChecked > 0, null, { timeout: 30_000 })
-  report.correctness = await page.evaluate(() => ({ violations: window.__resourcePaint.violations, indicatorValuesChecked: window.__resourcePaint.indicatorValuesChecked, rendererCommits: window.__resourcePaint.records.length }))
+  report.acceptanceFailures = assessResourceBudgets({ load, delivery: report.delivery, switches: report.switches,
+    frameCadence: report.foregroundFrameCadence }, { offscreen })
   report.background = await probe({ action: 'backgroundStatus' })
   report.appMetricsAfterLoad = await electron.evaluate(({ app }) => app.getAppMetrics())
   report.schedulerAfterLoad = await page.evaluate(() => window.__resourceScheduler)
   report.rendererMemoryAfterLoad = await page.evaluate(() => performance.memory ? { usedJSHeapSize: performance.memory.usedJSHeapSize, totalJSHeapSize: performance.memory.totalJSHeapSize, jsHeapSizeLimit: performance.memory.jsHeapSizeLimit } : null)
   report.final = await probe({ action: 'scaleStop' }); stopped = true
-  report.acceptanceFailures = assessResourceBudgets({ load, delivery: report.delivery, switches: report.switches,
-    frameCadence: report.foregroundFrameCadence }, { offscreen })
+  await finishDiagnostics()
+  await validatePaint()
+  assert.equal(report.correctness.complete, true, 'Resource paint capture or deferred validation failed; all retained evidence is in correctness.')
+  assert.equal(report.rendererCPU.complete, true, 'Resource renderer CPU evidence must retain its complete start/RAF/stop marker stream.')
+  assert.ok(report.correctness.indicatorValuesChecked > 0, 'Resource acceptance must validate observed numerical indicators.')
   assert.deepEqual(report.correctness.violations, [])
   assert.equal(report.final.actualRows, fixture.rowsSeeded)
   assert.equal(report.final.minimumRowsPerSeries, fixture.periods)
@@ -294,9 +335,10 @@ try {
   assert.ok(report.switches.some(value => value.phase.includes('during fixed-rate')) && report.history.length === 2,
     'The workload must exercise selection and reversal while background writes and intake continue.')
   assert.deepEqual(report.acceptanceFailures, [], 'Resource performance budgets failed; all independent failures and samples are retained.')
-  report.outcome = 'passed'
+  report.outcome = report.diagnosticOnly ? 'diagnostic-passed' : 'passed'
 } catch (error) {
   report.outcome = 'failed'; report.error = error.stack ?? error.message
+  if (error.processWitness) report.processWitness = { ...error.processWitness, capacityBasis: loopCapacityBasis }
   if (page) {
     try { report.failureRenderer = await page.evaluate(() => {
       const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
@@ -310,7 +352,22 @@ try {
   console.error(error.stack ?? error.message)
   process.exitCode = 1
 } finally {
-  if (electron && !stopped) { try { report.final = await probe({ action: 'scaleStop' }) } catch {} }
+  try { await stopMeasurements() } catch (error) { secondaryFailure('stop-measurements', error) }
+  try { await stopRendererCPU() } catch (error) { secondaryFailure('stop-renderer-cpu', error) }
+  try {
+    if (stopProcessWitness) report.processWitness = { ...await stopProcessWitness(), capacityBasis: loopCapacityBasis }
+  } catch (error) {
+    if (error.processWitness) report.processWitness = { ...error.processWitness, capacityBasis: loopCapacityBasis }
+    secondaryFailure('stop-process-witness', error)
+  }
+  if (electron && !stopped) {
+    try { report.final = await probe({ action: 'scaleStop' }); stopped = true }
+    catch (error) { secondaryFailure('stop-source', error) }
+  }
+  try { await finishDiagnostics() } catch (error) { secondaryFailure('stop-diagnostics', error) }
+  try { await validatePaint() } catch (error) { secondaryFailure('validate-paint', error) }
+  if (report.correctness && !report.correctness.complete) { report.outcome = 'failed'; process.exitCode = 1 }
+  if (report.rendererCPU && !report.rendererCPU.complete) { report.outcome = 'failed'; process.exitCode = 1 }
   await mkdir(dirname(reportPath), { recursive: true })
   await writeFile(reportPath, JSON.stringify(report, null, 2))
   await electron?.close()

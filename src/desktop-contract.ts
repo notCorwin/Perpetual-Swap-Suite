@@ -10,7 +10,7 @@ export type OperationAcknowledgment = { batchId: string; lastSequence: number }
 export type OperationBridgeHooks = {
   beginRequest(command: string): { id: string; context: OperationContext }
   endRequest(id: string, status: 'ok' | 'error'): void
-  receive(channel: string, detail: unknown, context?: OperationContext): void
+  receive(channel: string, detail: unknown, context?: OperationContext, decode?: (detail: unknown) => unknown): void
   flush(): Promise<void>
 }
 
@@ -60,9 +60,9 @@ export type DesktopCommands = {
   copyText: { input: string; output: { ok: boolean } }
   captureChart: { input: ChartCaptureBounds & { output?: 'png' }; output: { ok: boolean } }
   chartFocus: { input: { id: string; target: { instId: string; timeframe: RadarTimeframe; endHour?: number } | null }; output: { ok: boolean } }
-  chartWindow: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number; historyBars?: number; focusId?: string }; output: PreparedChartResponse }
+  chartWindow: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number; historyBars?: number; focusId?: string }; output: PreparedChartResponse | null }
   chartLocal: { input: { instId: string; timeframe: RadarTimeframe }; output: PreparedChartResponse | null }
-  chartHistory: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number }; output: PreparedChartResponse | null }
+  chartHistory: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number; focusId?: string }; output: PreparedChartResponse | null }
   chartUniverse: { input: Record<string, never>; output: { frames: PreparedChartResponse[] } }
 }
 export type DesktopRequest = { [K in keyof DesktopCommands]: { [P in K]: DesktopCommands[K]['input'] } }[keyof DesktopCommands]

@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
 import { measureNativeWindowControls } from '../helpers/native-window-controls.mjs'
-import { assertCompletePaints, assertIndicatorLegends, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from '../../scripts/chart-acceptance.mjs'
+import { assertScrollResponsiveness } from '../../scripts/chart-acceptance-metrics.mjs'
+import { assertCompletePaints, assertIndicatorLegends, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst, withPaintProbe } from '../../scripts/chart-acceptance.mjs'
 
 
 const root = new URL('../..', import.meta.url).pathname
@@ -39,7 +40,8 @@ const waitFor = async (read, timeout = 10_000) => {
 // Prepared snapshots reach the controller through local hits, universe hits,
 // pushed publications, and demand reads. Exercise the same payload at every
 // ingress so these geometry tests do not depend on a particular cache miss.
-const installPreparedTransform = async options => electron.evaluate(({ ipcMain, BrowserWindow }, options) => {
+const installPreparedTransform = async options => electron.evaluate(async ({ ipcMain, BrowserWindow }, options) => {
+  const { encodeChartWire, decodeChartWire } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/chart-wire.js')
   const original = ipcMain._invokeHandlers.get('radar:request')
   const contents = BrowserWindow.getAllWindows()[0].webContents
   const originalSend = contents.send
@@ -76,14 +78,19 @@ const installPreparedTransform = async options => electron.evaluate(({ ipcMain, 
     return response
   }
   ipcMain.removeHandler('radar:request')
-  ipcMain.handle('radar:request', async (event, value) => {
+  ipcMain.handle('radar:request', async (event, value, context) => {
     if (value.chartWindow?.instId === options.instId) probe.calls += 1
-    const response = await original(event, value)
-    return value.chartUniverse ? { ...response, frames: response.frames.map(transform) }
-      : value.chartLocal || value.chartHistory || value.chartWindow ? transform(response) : response
+    const wire = await original(event, value, context)
+    if (!(value.chartUniverse || value.chartLocal || value.chartHistory || value.chartWindow)) return wire
+    const response = decodeChartWire(wire)
+    const result = value.chartUniverse ? { ...response, frames: response.frames.map(transform) } : transform(response)
+    return result === response ? wire : encodeChartWire(result)
   })
   contents.send = function (channel, ...args) {
-    if (channel === 'radar:chart-prepared') args[0] = transform(args[0])
+    if (channel === 'radar:chart-prepared') {
+      const frame = decodeChartWire(args[0]), result = transform(frame)
+      if (result !== frame) args[0] = encodeChartWire(result)
+    }
     return originalSend.call(this, channel, ...args)
   }
   globalThis.__preparedTransform = probe
@@ -406,7 +413,184 @@ test('the 1600 design workspace keeps both panels and chart selection when searc
   }
 })
 
-test('the paint probe catches changed indicator geometry without a new snapshot and retains the violation', async () => {
+test('paint initialization failure disconnects acquired observers and releases its owner', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await openChart(page, fixture)
+  await page.evaluate(() => {
+    const mutation = new Set(), performance = new Set()
+    const observeMutation = MutationObserver.prototype.observe, disconnectMutation = MutationObserver.prototype.disconnect
+    const observePerformance = PerformanceObserver.prototype.observe, disconnectPerformance = PerformanceObserver.prototype.disconnect
+    MutationObserver.prototype.observe = function (target, options) {
+      const result = observeMutation.call(this, target, options)
+      if (target.matches?.('[data-chart-inst]')) { mutation.add(this); throw new Error('Injected paint initialization failure.') }
+      return result
+    }
+    MutationObserver.prototype.disconnect = function () { mutation.delete(this); return disconnectMutation.call(this) }
+    PerformanceObserver.prototype.observe = function (options) {
+      const result = observePerformance.call(this, options)
+      if (['longtask', 'long-animation-frame'].includes(options.type)) performance.add(this)
+      return result
+    }
+    PerformanceObserver.prototype.disconnect = function () { performance.delete(this); return disconnectPerformance.call(this) }
+    window.__paintInitializationFault = {
+      pending: () => mutation.size + performance.size,
+      restore() {
+        for (const observer of mutation) disconnectMutation.call(observer)
+        for (const observer of performance) disconnectPerformance.call(observer)
+        MutationObserver.prototype.observe = observeMutation; MutationObserver.prototype.disconnect = disconnectMutation
+        PerformanceObserver.prototype.observe = observePerformance; PerformanceObserver.prototype.disconnect = disconnectPerformance
+        delete window.__paintInitializationFault
+      },
+    }
+  })
+  try {
+    await assert.rejects(startPaintProbe(page, fixture), /Injected paint initialization failure/)
+    assert.equal(await page.evaluate(() => window.__paintInitializationFault.pending()), 0, 'Partially initialized capture must release every acquired observer.')
+    assert.equal(await page.evaluate(() => Object.hasOwn(window, '__chartPaintProbe')), false)
+  } finally { await page.evaluate(() => window.__paintInitializationFault.restore()) }
+  const paint = await withPaintProbe(page, fixture, {}, () => page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve))))
+  assertCompletePaints(paint)
+})
+
+test('a failed measured paint scope retains failures and releases the next capture', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await openChart(page, fixture)
+  for (const mode of ['latency', 'validation', 'finalization', 'finalization-and-cleanup']) {
+    let primary
+    let failure
+    await assert.rejects(withPaintProbe(page, fixture, {}, async () => {
+      await page.evaluate(async mode => {
+        for (let frame = 0; frame < 2; frame++) await new Promise(resolve => requestAnimationFrame(resolve))
+        if (mode === 'validation') window.__chartPaintProbe.errors.push('Injected retained paint violation.')
+        if (mode.startsWith('finalization')) window.__chartPaintProbe.capturePending = () => { throw new Error('Injected final capture failure.') }
+        if (mode === 'finalization-and-cleanup') {
+          const observer = window.__chartPaintProbe.observer, disconnect = observer.disconnect.bind(observer)
+          let first = true
+          observer.disconnect = () => { disconnect(); if (first) { first = false; throw new Error('Injected observer cleanup failure.') } }
+        }
+      }, mode)
+      try { assertScrollResponsiveness({ intentLatenciesMS: [268], unaccountedInputs: [], maxFrameGapMS: 250.034 }) }
+      catch (error) { primary = error; throw error }
+    }), error => {
+      failure = error
+      assert.match(error.message, /Scroll intent exceeded 100 ms: 268 ms/)
+      if (mode === 'latency') assert.equal(error.cause, primary)
+      else {
+        assert.ok(error.cause instanceof AggregateError)
+        assert.equal(error.cause.errors[0], primary, 'The measured-phase failure must remain the primary cause.')
+        assert.match(error.message, mode === 'validation' ? /Injected retained paint violation/ : /Injected final capture failure/)
+        if (mode === 'finalization-and-cleanup') assert.match(error.message, /Injected observer cleanup failure/)
+      }
+      if (!mode.startsWith('finalization')) {
+        assert.ok(error.paintPhaseData.frames > 0)
+        if (mode === 'validation') assert.ok(error.paintPhaseData.violations.includes('Injected retained paint violation.'))
+        else assert.deepEqual(error.paintPhaseData.violations, [])
+        assert.ok(error.paintPhaseData.frameSamples.length > 0)
+      } else assert.equal(error.paintPhaseData, null)
+      return true
+    })
+    assert.equal(await page.evaluate(() => Boolean(window.__chartPaintProbe?.active)), false,
+      'A failed measured phase or final capture must leave no active RAF/observer owner.')
+    assert.equal(await page.evaluate(() => Object.hasOwn(window, '__chartPaintProbe')), false,
+      'A stopped failed capture must release its retained bars and SVG evidence.')
+    const retained = JSON.stringify(failure.paintPhaseData)
+    const next = await withPaintProbe(page, fixture, {}, () => page.evaluate(async () => {
+      for (let frame = 0; frame < 2; frame++) await new Promise(resolve => requestAnimationFrame(resolve))
+    }))
+    assertCompletePaints(next)
+    assert.equal(JSON.stringify(failure.paintPhaseData), retained, 'The next capture must not overwrite the failed phase evidence.')
+  }
+})
+
+test('the paint probe accepts an unchanged complete frame after deferred validation', async context => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await openChart(page, fixture)
+  await startPaintProbe(page, fixture)
+  let report
+  try {
+    assert.equal(await page.evaluate(() => Object.values(window.__chartPaintProbe.series).some(entry => 'bars' in entry)), false,
+      'Oracle bar archives must stay outside the renderer during input and RAF capture.')
+    await page.evaluate(async () => { for (let frame = 0; frame < 3; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
+    report = await finishPaintProbe(page)
+    assertCompletePaints(report)
+    assert.equal(report.deferredValidationSamples, report.probeCaptureSamples)
+    assert.equal(report.quality.length, report.commits.length)
+    assert.equal(report.oracleTransfer.phase, 'after capture stopped')
+    assert.equal(report.oracleTransfer.fixtureBars, Object.values(fixture.series).reduce((sum, entry) => sum + entry.bars.length, 0))
+    assert.ok(report.oracleTransfer.transferredBars > 0 && report.oracleTransfer.transferredBars <= 192)
+    assert.ok(report.oracleTransfer.transferredBars < report.oracleTransfer.fixtureBars)
+    context.diagnostic(`Deferred oracle transfer: ${JSON.stringify(report.oracleTransfer)}`)
+    assert.equal(report.rendererCPU.sampleCount, report.frames + 2, 'Every captured RAF needs a CPU witness between the start and stop markers.')
+    context.diagnostic(`Renderer CPU capture: ${JSON.stringify({ samples: report.rendererCPU.sampleCount, markerCostMS: report.cpuMarkerCostMS })}`)
+  } finally { if (!report) await finishPaintProbe(page) }
+})
+
+test('the paint probe selects the first ready target RAF and retains its mutable data', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await openChart(page, fixture)
+  await page.waitForFunction(instId => {
+    const chart = document.querySelector(`[data-chart-inst="${instId}"]`), bars = chart?.__chartRenderedBars ?? chart?.__chartSnapshot?.bars
+    const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
+    return bars?.length === 96 && bars.every(bar => bar.indicatorsObserved && fields.every(field => Number.isFinite(bar[field])))
+  }, fixture.instId)
+  await startPaintProbe(page, fixture, { indicatorValidation: 'deferred-canonical' })
+  let report
+  try {
+    const sample = await page.evaluate(async instId => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`), probe = window.__chartPaintProbe
+      const originalSnapshot = chart.__chartSnapshot, originalBars = chart.__chartRenderedBars
+      const bars = (originalBars ?? originalSnapshot.bars).map(bar => ({ ...bar }))
+      const snapshot = { ...originalSnapshot, bars, priceState: 'ready', indicatorState: 'loading', priceStatus: { ...originalSnapshot.priceStatus } }
+      const expectedClose = bars[0].close, expectedEMA = bars[0].ema, expectedStatus = snapshot.priceStatus.state
+      const afterAt = performance.now()
+      try {
+        bars[0].ema = null; bars[0].indicatorsObserved = false
+        Object.defineProperty(chart, '__chartSnapshot', { configurable: true, value: snapshot })
+        Object.defineProperty(chart, '__chartRenderedBars', { configurable: true, value: bars })
+        chart.setAttribute('data-probe-paint-marker', 'not ready')
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+        const incompleteRAF = probe.observations.find(observation => observation.frame && observation.at >= afterAt && observation.bars?.[0].ema === null)
+        bars[0].ema = expectedEMA; bars[0].indicatorsObserved = true
+        const priceComplete = bars[0].priceComplete
+        bars[0].priceComplete = false
+        chart.setAttribute('data-probe-paint-marker', 'incomplete price')
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+        const incompletePriceRAF = probe.observations.find(observation => observation.frame && observation.at >= afterAt && observation.bars?.[0].priceComplete === false)
+        bars[0].priceComplete = priceComplete
+        chart.setAttribute('data-probe-paint-marker', 'ready')
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+        const readyRAF = probe.observations.find(observation => observation.frame && observation.at >= afterAt && observation.bars?.[0].ema === expectedEMA && observation.bars[0].priceComplete !== false)
+        bars[0].close += 100; snapshot.indicatorState = 'ready'; snapshot.priceStatus.state = 'error'
+        chart.setAttribute('data-probe-paint-marker', 'mutated after ready')
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+        return { afterAt, incompleteAt: incompleteRAF?.at, incompletePriceAt: incompletePriceRAF?.at, readyAt: readyRAF?.at, expectedClose, expectedEMA, expectedStatus,
+          observationsHaveEntryAndFrame: probe.observations.every(observation => Number.isFinite(observation.at) && typeof observation.frame === 'boolean') }
+      } finally {
+        Object.defineProperty(chart, '__chartSnapshot', { configurable: true, value: originalSnapshot })
+        Object.defineProperty(chart, '__chartRenderedBars', { configurable: true, value: originalBars })
+        chart.removeAttribute('data-probe-paint-marker')
+        await Promise.resolve()
+      }
+    }, fixture.instId)
+    report = await finishPaintProbe(page, { readyTarget: { instId: fixture.instId, timeframe: fixture.timeframe,
+      endHour: fixture.end, intervalMS: fixture.intervalMS, afterAt: sample.afterAt }, includeRequestCommits: true, includeTimingEvidence: true })
+    assert.equal(sample.observationsHaveEntryAndFrame, true)
+    assert.ok(Number.isFinite(sample.incompleteAt) && sample.readyAt > sample.incompleteAt)
+    assert.ok(Number.isFinite(sample.incompletePriceAt) && sample.readyAt > sample.incompletePriceAt)
+    assert.equal(report.readyFrame.at, sample.readyAt, 'An earlier incomplete RAF must not be selected.')
+    assert.equal(report.readyFrame.frame, true)
+    assert.equal(report.readyFrame.bars[0].close, sample.expectedClose, 'Later mutation must not alter the selected ready bars.')
+    assert.equal(report.readyFrame.bars[0].ema, sample.expectedEMA)
+    assert.equal(report.readyFrame.snapshot.indicatorState, 'loading', 'Complete observed values determine readiness even before aggregate status catches up.')
+    assert.equal(report.readyFrame.snapshot.priceStatus.state, sample.expectedStatus, 'Later mutation must not alter the selected snapshot.')
+    assert.ok(report.requestCommits.some(commit => commit.instId === fixture.instId && commit.timeframe === fixture.timeframe
+      && commit.end === fixture.end && Number.isFinite(commit.rafSampledAt)))
+    assert.equal(report.captureTimings.length, report.probeCaptureSamples)
+    assert.ok(report.captureTimings.every(sample => Number.isFinite(sample.at) && Number.isFinite(sample.durationMS)))
+  } finally { if (!report) await finishPaintProbe(page) }
+})
+
+test('the paint probe retains geometry and metadata corruption without a new snapshot', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   await openChart(page, fixture)
   await startPaintProbe(page, fixture)
@@ -414,35 +598,261 @@ test('the paint probe catches changed indicator geometry without a new snapshot 
   try {
     const observation = await page.evaluate(async instId => {
       const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
-      const snapshot = chart.__chartSnapshot
-      const path = chart.querySelector('svg[data-rendered-inst] [data-chart-indicator="rsi12"]')
-      const original = path.getAttribute('d')
-      const initiallyValid = window.__chartPaintProbe.errors.length === 0
-      try {
-        path.setAttribute('d', 'M0,0')
-        // Mutation observers run before the next task, with the same rendered
-        // data. Further frames then exercise the unchanged corrupted path.
-        await Promise.resolve()
-        const detected = window.__chartPaintProbe.errors.find(error => /rsi12 SVG has 1 points/.test(error))
-        const sameSnapshot = chart.__chartSnapshot === snapshot
-        for (let frame = 0; frame < 3; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve))
-        return {
-          initiallyValid, detected, sameSnapshot,
-          sameCorruptedGeometry: path.getAttribute('d') === 'M0,0',
-          retained: window.__chartPaintProbe.errors.includes(detected),
+      const snapshot = chart.__chartSnapshot, probe = window.__chartPaintProbe
+      const svg = chart.querySelector('svg[data-rendered-inst]')
+      const path = svg.querySelector('[data-chart-indicator="rsi12"]')
+      const otherPath = svg.querySelector('path[d]:not([data-chart-indicator])')
+      const oi = svg.querySelector('[data-chart-oi]')
+      const buy = svg.querySelector('[data-chart-taker-buy-samples]')
+      const status = chart.querySelector('[data-chart-status]')
+      const clipPath = svg.querySelector('[data-chart-wheel-content]').parentElement.getAttribute('clip-path')
+      const clipId = clipPath.slice(clipPath.indexOf('#') + 1, clipPath.indexOf(')'))
+      const clip = svg.querySelector(`[id="${CSS.escape(clipId)}"] rect`)
+      const changes = [
+        [path, 'd', 'M0,0', 'curve corruption'],
+        [clip, 'width', '0', 'clip corruption'],
+        [otherPath, 'd', 'MNaN 0', 'nonfinite path'],
+        [svg, 'data-rendered-start', '-1', 'range corruption'],
+        [svg, 'data-rendered-timeframe', 'wrong', 'identity corruption'],
+        [svg, 'aria-label', 'wrong', 'label corruption'],
+        [chart, 'data-chart-rendered-bars', '-1', 'candle count corruption'],
+        [chart, 'data-chart-completed-end', '-1', 'completed range corruption'],
+        [chart, 'data-chart-candle-state', 'wrong', 'price state corruption'],
+        [oi, 'data-chart-oi-state', 'wrong', 'OI state corruption'],
+        [status, 'data-chart-indicator-input', 'wrong', 'indicator input corruption'],
+        [chart, 'data-chart-oi-samples', '-1', 'published count corruption'],
+        [oi, 'data-chart-oi-samples', '-1', 'OI count corruption'],
+        [buy, 'data-chart-taker-buy-samples', '-1', 'Taker count corruption'],
+      ]
+      const sameSnapshot = () => chart.__chartSnapshot === snapshot
+      let unchangedSnapshot = sameSnapshot(), sharedBars = false, capturedCorruption = false
+      for (const [node, attribute, value, phase] of changes) {
+        if (!node) throw new Error(`The ${phase} fixture is unavailable.`)
+        const original = node.getAttribute(attribute)
+        try {
+          probe.phase = phase
+          node.setAttribute(attribute, value)
+          await Promise.resolve()
+          unchangedSnapshot &&= sameSnapshot()
+          if (phase === 'curve corruption') {
+            const bad = probe.observations.at(-1)
+            capturedCorruption = bad.surface.svg.curves.includes(value)
+            for (let frame = 0; frame < 3; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve))
+            sharedBars = probe.observations.at(-1).bars === bad.bars
+          }
+        } finally {
+          if (original === null) node.removeAttribute(attribute)
+          else node.setAttribute(attribute, original)
+          await Promise.resolve()
         }
-      } finally { path.setAttribute('d', original) }
+      }
+      return { unchangedSnapshot, sharedBars, capturedCorruption, errorsBeforeFinish: probe.errors.length,
+        observations: probe.observations.length, captureSamples: probe.validationSamples.length }
     }, fixture.instId)
-    await page.evaluate(async () => { for (let frame = 0; frame < 2; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
     report = await finishPaintProbe(page)
-    assert.equal(observation.initiallyValid, true)
-    assert.equal(observation.sameSnapshot, true, 'The corrupted curve must be checked without a data publication.')
-    assert.match(observation.detected ?? '', /rsi12 SVG has 1 points/)
-    assert.equal(observation.sameCorruptedGeometry, true)
-    assert.equal(observation.retained, true, 'Repeated unchanged geometry must retain the detected violation.')
-    assert.ok(report.violations.includes(observation.detected), 'Restoring valid geometry must not erase an earlier incorrect paint.')
+    assert.equal(observation.unchangedSnapshot, true, 'DOM mutations must be inspected without a data publication.')
+    assert.equal(observation.capturedCorruption, true)
+    assert.equal(observation.sharedBars, true, 'Unchanged observations must share retained bars.')
+    assert.equal(observation.errorsBeforeFinish, 0, 'Correctness validation must wait until timing has ended.')
+    assert.equal(observation.observations, observation.captureSamples, 'Every timed sample must retain its state.')
+    assert.equal(report.deferredValidationSamples, report.probeCaptureSamples)
+    assert.ok(report.violations.some(error => /curve corruption: .*rsi12 SVG has 1 points/.test(error)), 'Restoring a curve must not erase its earlier corruption.')
+    assert.ok(report.violations.some(error => /clip corruption: .* SVG has .* points/.test(error)), 'Clip changes must revalidate unchanged paths.')
+    for (const error of [
+      'Nonfinite SVG geometry.', 'SVG labels and the drawn range disagree.', 'SVG and snapshot timeframes disagree.',
+      'Chart labels disagree with the rendered snapshot.', 'Chart candle-count metadata disagrees with the actual snapshot.',
+      'Chart completed-range metadata disagrees with the snapshot.', 'Published source states disagree with the snapshot.',
+      'Published statistics sample counts disagree with the actual snapshot.', 'The actual OI geometry does not cover the snapshot.',
+      'The actual Taker buy geometry does not cover the snapshot.',
+    ]) assert.ok(report.violations.includes(error), `Missing retained violation: ${error}`)
   } finally { if (!report) await finishPaintProbe(page) }
+})
 
+test('every retained SVG observation agrees with independent curve checks when paths, clips and bars change', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await openChart(page, fixture)
+  await startPaintProbe(page, fixture)
+  let report
+  try {
+    const evidence = await page.evaluate(async instId => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`), probe = window.__chartPaintProbe
+      const svg = chart.querySelector('svg[data-rendered-inst]'), path = svg.querySelector('[data-chart-indicator="rsi12"]')
+      const clipOwner = svg.querySelector('[data-chart-wheel-content]').parentElement
+      const reference = clipOwner.getAttribute('clip-path')
+      const clipId = reference.slice(reference.indexOf('#') + 1, reference.indexOf(')'))
+      const clip = svg.querySelector(`[id="${CSS.escape(clipId)}"] rect`)
+      const pathValue = path.getAttribute('d'), clipValue = clip.getAttribute('width')
+      const originalSnapshot = chart.__chartSnapshot, originalBars = chart.__chartRenderedBars
+      const bars = (originalBars ?? originalSnapshot.bars).map(bar => ({ ...bar }))
+      const snapshot = { ...originalSnapshot, bars }
+      let sharedSVG = false, changedBarsSameSVG = false
+      try {
+        probe.phase = 'first invalid curve'
+        path.setAttribute('d', 'M0,0')
+        await Promise.resolve()
+        const invalidSVG = probe.observations.at(-1).surface.svg
+        await new Promise(resolve => requestAnimationFrame(resolve))
+        probe.phase = 'repeated invalid curve'
+        await new Promise(resolve => requestAnimationFrame(resolve))
+        sharedSVG = probe.observations.at(-1).surface.svg === invalidSVG
+        probe.phase = 'changed clip'
+        clip.setAttribute('width', '0')
+        await Promise.resolve()
+        await new Promise(resolve => requestAnimationFrame(resolve))
+        probe.phase = 'no clip'
+        clipOwner.setAttribute('clip-path', 'none')
+        await Promise.resolve()
+        await new Promise(resolve => requestAnimationFrame(resolve))
+        clipOwner.setAttribute('clip-path', reference); clip.setAttribute('width', clipValue); path.setAttribute('d', pathValue)
+        await Promise.resolve()
+        const restoredSVG = probe.observations.at(-1).surface.svg
+        bars[0].rsi12 = null
+        probe.phase = 'changed bars'
+        Object.defineProperty(chart, '__chartSnapshot', { configurable: true, value: snapshot })
+        Object.defineProperty(chart, '__chartRenderedBars', { configurable: true, value: bars })
+        chart.setAttribute('data-probe-paint-marker', 'changed bars')
+        await Promise.resolve()
+        changedBarsSameSVG = probe.observations.at(-1).surface.svg === restoredSVG
+        await new Promise(resolve => requestAnimationFrame(resolve))
+      } finally {
+        path.setAttribute('d', pathValue); clip.setAttribute('width', clipValue); clipOwner.setAttribute('clip-path', reference)
+        Object.defineProperty(chart, '__chartSnapshot', { configurable: true, value: originalSnapshot })
+        Object.defineProperty(chart, '__chartRenderedBars', { configurable: true, value: originalBars })
+        chart.removeAttribute('data-probe-paint-marker')
+        await Promise.resolve()
+      }
+      // Reference uses the original per-observation array-based calculation,
+      // independently of the validator's cached path summaries.
+      const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
+      const errors = new Set()
+      for (const { snapshot, bars, surface, phase, captureFailure } of probe.observations) {
+        if (captureFailure || !snapshot || !surface?.svg || !Array.isArray(bars)) continue
+        const svg = surface.svg, firstAtLeft = bars[0]?.hour === bars.at(-1)?.hour - 95 * snapshot.intervalMS
+        for (const [index, field] of fields.entries()) {
+          const d = svg.curves[index], samples = bars.filter(bar => typeof bar[field] === 'number' && Number.isFinite(bar[field])).length
+          const points = samples + (firstAtLeft && Number.isFinite(bars[0]?.[field]) ? 1 : 0)
+          if (samples > 1 && !d) errors.add(`${phase}: ${snapshot.timeframe} ${snapshot.endHour} lost its ${field} SVG curve with ${samples} known samples.`)
+          const coordinates = [...d.matchAll(/[ML]([\d.e+-]+)[ ,]+([\d.e+-]+)/gi)].map(point => Number(point[1]))
+          if (svg.hasClip) {
+            const left = Number(svg.clipX), right = left + Number(svg.clipWidth)
+            const inside = coordinates.filter(x => x >= left - .05 && x <= right + .05)
+            const padding = points > samples && inside.some(x => Math.abs(x - left) <= .05) ? 1 : 0
+            if (inside.length !== samples + padding || coordinates.filter(x => x < left - .05).length > 1
+              || coordinates.filter(x => x > right + .05).length > 1) errors.add(`${phase}: ${snapshot.timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.length} points; expected ${samples} visible samples and at most one adjacent sample per side.`)
+          } else if (coordinates.length !== points) errors.add(`${phase}: ${snapshot.timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.length} points for ${points} known positions.`)
+        }
+      }
+      return { sharedSVG, changedBarsSameSVG, errors: [...errors].sort(), observations: probe.observations.length }
+    }, fixture.instId)
+    report = await finishPaintProbe(page)
+    const actual = report.violations.filter(error => / SVG has | lost its .* SVG curve /.test(error)).sort()
+    assert.equal(evidence.sharedSVG, true, 'Repeated RAFs must use the same captured SVG record.')
+    assert.equal(evidence.changedBarsSameSVG, true, 'Changing bar evidence must not require a new SVG record.')
+    assert.ok(evidence.errors.some(error => /first invalid curve: .*rsi12 SVG has/.test(error)))
+    assert.ok(evidence.errors.some(error => /repeated invalid curve: .*rsi12 SVG has/.test(error)))
+    assert.ok(evidence.errors.some(error => /changed clip: .* SVG has/.test(error)))
+    assert.ok(evidence.errors.some(error => /no clip: .*rsi12 SVG has/.test(error)))
+    assert.ok(evidence.errors.some(error => /changed bars: .*rsi12 SVG has/.test(error)))
+    assert.deepEqual(actual, evidence.errors, 'Every observed phase must retain the same geometry verdict as independent checks.')
+    assert.ok(report.deferredValidationSamples >= evidence.observations)
+    assert.equal(report.deferredValidationSamples + report.failedCaptureSamples, report.probeCaptureSamples)
+  } finally { if (!report) await finishPaintProbe(page) }
+})
+
+test('the paint probe validates mutable wrong and incomplete bars after they are restored', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await openChart(page, fixture)
+  await startPaintProbe(page, fixture)
+  let report
+  try {
+    const observation = await page.evaluate(async instId => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`), probe = window.__chartPaintProbe
+      const originalSnapshot = chart.__chartSnapshot, originalBars = chart.__chartRenderedBars
+      const bars = (originalBars ?? originalSnapshot.bars).map(bar => ({ ...bar }))
+      const index = bars.findIndex(bar => bar.confirmed)
+      if (index < 0) throw new Error('The fixture needs a confirmed candle.')
+      const originalClose = bars[index].close, hour = bars[index].hour, removed = bars.pop()
+      bars[index].close += Math.max(1, Math.abs(originalClose)) * .01
+      const snapshot = { ...originalSnapshot, bars, priceStatus: { state: 'ready', from: 1, through: 2 } }
+      try {
+        Object.defineProperty(chart, '__chartSnapshot', { configurable: true, value: snapshot })
+        Object.defineProperty(chart, '__chartRenderedBars', { configurable: true, value: bars })
+        chart.setAttribute('data-probe-paint-marker', 'wrong and incomplete')
+        await Promise.resolve()
+        const bad = probe.observations.at(-1), wrongClose = bars[index].close
+        await new Promise(resolve => requestAnimationFrame(resolve))
+        const sharedBars = probe.observations.at(-1).bars === bad.bars
+        snapshot.oiState = 'loading'
+        snapshot.priceStatus.state = 'error'
+        chart.setAttribute('data-probe-paint-marker', 'changed mutable snapshot')
+        await Promise.resolve()
+        const changed = probe.observations.at(-1)
+        snapshot.oiState = originalSnapshot.oiState
+        snapshot.priceStatus.state = 'ready'
+        bars[index].close = originalClose
+        bars.push(removed)
+        chart.setAttribute('data-probe-paint-marker', 'restored in place')
+        await Promise.resolve()
+        return { hour, wrongClose, retainedClose: bad.bars[index].close, retainedLength: bad.bars.length, sharedBars,
+          retainedOldStatus: bad.snapshot.priceStatus.state, retainedChangedStatus: changed.snapshot.priceStatus.state, retainedChangedOI: changed.snapshot.oiState,
+          sameMutableSnapshot: chart.__chartSnapshot === snapshot, errorsBeforeFinish: probe.errors.length }
+      } finally {
+        Object.defineProperty(chart, '__chartSnapshot', { configurable: true, value: originalSnapshot })
+        Object.defineProperty(chart, '__chartRenderedBars', { configurable: true, value: originalBars })
+        chart.removeAttribute('data-probe-paint-marker')
+        await Promise.resolve()
+      }
+    }, fixture.instId)
+    report = await finishPaintProbe(page)
+    assert.equal(observation.sameMutableSnapshot, true)
+    assert.equal(observation.sharedBars, true)
+    assert.equal(observation.retainedClose, observation.wrongClose, 'A mutable bar must retain its captured value after restoration.')
+    assert.equal(observation.retainedLength, 95, 'A mutable array must retain its captured length after restoration.')
+    assert.equal(observation.retainedOldStatus, 'ready')
+    assert.equal(observation.retainedChangedStatus, 'error')
+    assert.equal(observation.retainedChangedOI, 'loading')
+    assert.equal(observation.errorsBeforeFinish, 0)
+    assert.equal(report.minimumBars, 95)
+    assert.ok(report.violations.some(error => /Rendered 95 bars for/.test(error)))
+    assert.ok(report.violations.some(error => error.includes(`${observation.hour} close: expected`) && error.includes(`got ${observation.wrongClose}`)))
+    assert.ok(report.violations.includes('Published source states disagree with the snapshot.'))
+    assert.equal(report.deferredValidationSamples, report.probeCaptureSamples)
+  } finally { if (!report) await finishPaintProbe(page) }
+})
+
+test('the paint probe reports capture failures without dropping observations', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await openChart(page, fixture)
+  await startPaintProbe(page, fixture)
+  let report
+  try {
+    const capturedFailure = await page.evaluate(async instId => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`), probe = window.__chartPaintProbe
+      const descriptor = Object.getOwnPropertyDescriptor(chart, '__chartRenderedBars')
+      const bars = [...(chart.__chartRenderedBars ?? chart.__chartSnapshot.bars)]
+      const broken = { ...bars[0] }
+      Object.defineProperty(broken, 'close', { enumerable: true, get() { throw new Error('synthetic capture failure') } })
+      bars[0] = broken
+      try {
+        Object.defineProperty(chart, '__chartRenderedBars', { configurable: true, value: bars })
+        chart.setAttribute('data-probe-paint-marker', 'capture failure')
+        await Promise.resolve()
+        return probe.observations.at(-1).captureFailure === true
+      } finally {
+        if (descriptor) Object.defineProperty(chart, '__chartRenderedBars', descriptor)
+        else delete chart.__chartRenderedBars
+        chart.removeAttribute('data-probe-paint-marker')
+        await Promise.resolve()
+      }
+    }, fixture.instId)
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)))
+    report = await finishPaintProbe(page)
+    assert.equal(capturedFailure, true)
+    assert.ok(report.violations.some(error => error.includes('Paint capture failed: synthetic capture failure')))
+    assert.ok(report.failedCaptureSamples > 0)
+    assert.equal(report.deferredValidationSamples + report.failedCaptureSamples, report.probeCaptureSamples)
+    assert.ok(report.frames > 0, 'Capture failure must not stop subsequent frame accounting.')
+  } finally { if (!report) await finishPaintProbe(page) }
 })
 
 test('prepared resident indicators and statistics stay drawn through rapid scrolling, latest pushes and reversal', async context => {
@@ -483,9 +893,10 @@ test('prepared resident indicators and statistics stay drawn through rapid scrol
       // Forward an actual backend local frame through the ordinary event
       // ingress. Its contents are unchanged; only delivery timing is controlled.
       await electron.evaluate(async ({ BrowserWindow }, { instId, timeframe }) => {
+        const { encodeChartWire } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/chart-wire.js')
         const frame = await globalThis.__marketBackend.request({ chartLocal: { instId, timeframe } })
         if (!frame) throw new Error('The active backend must retain its latest local frame.')
-        BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', frame)
+        BrowserWindow.getAllWindows()[0].webContents.send('radar:chart-prepared', encodeChartWire(frame))
       }, { instId: fixture.instId, timeframe })
       await settle()
       assert.equal(Number(await page.locator('[data-chart-inst]').getAttribute('data-chart-completed-end')), historicalEnd, 'A latest publication must preserve the historical viewport.')

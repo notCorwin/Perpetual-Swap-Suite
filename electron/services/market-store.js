@@ -3,11 +3,157 @@ import { mkdir, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { CANDLE_INTERVALS, validateQuery } from './market-records.js'
+import { measureOperation } from './operations.js'
 export { CANDLE_INTERVALS, validateCandle } from './market-records.js'
 
 const keyOf = (instrument, timeframe) => `${instrument}:${timeframe}`
 const priorityRank = value => ({ interactive: 5, foreground: 4, prepared: 4, repair: 4, continuity: 3, statistics: 2, prefetch: 1, chartWarm: 1, background: 0 })[value] ?? 0
 const PRIORITY_BUCKET_COUNT = 6
+
+// The limits include query keys, empty results, and pending deduplication, not
+// just candle payloads. Row accounting deliberately overestimates the current
+// flat SQLite projection so that an entry cannot consume the whole process heap.
+const CANDLE_CACHE_ENTRIES = 512, CANDLE_CACHE_BYTES = 8 * 1024 * 1024
+const CANDLE_PENDING_ENTRIES = 512, CANDLE_PENDING_BYTES = 256 * 1024, CANDLE_KEY_BYTES = 8 * 1024
+
+function copyCandleRows(rows, snapshot = false) {
+  const copy = () => {
+    // A reader response is already an owned structured clone. Retain it once;
+    // only the mutable values returned to callers need another allocation.
+    if (snapshot) {
+      for (const row of rows) Object.freeze(row)
+      return Object.freeze(rows)
+    }
+    return rows.map(row => ({ ...row }))
+  }
+  // Small copies are cheaper than a trace. Record the actual bulk CPU work,
+  // independently of the database/IPC operations a cache hit eliminates.
+  return rows.length < 128 ? copy() : measureOperation({ category: 'cpu', name: snapshot ? 'market.candle-cache.snapshot' : 'market.candle-cache.copy',
+    resource: 'market-store', attributes: { rows: rows.length } }, copy)
+}
+
+function candleRowBytes(rows) {
+  const count = () => {
+    let bytes = 64
+    for (const row of rows) {
+      bytes += 64
+      for (const name of Object.keys(row)) {
+        const value = row[name]
+        bytes += 48 + name.length * 2 + (typeof value === 'string' ? value.length * 2 : 8)
+      }
+      if (bytes > CANDLE_CACHE_BYTES) break
+    }
+    return bytes
+  }
+  return rows.length < 128 ? count() : measureOperation({ category: 'cpu', name: 'market.candle-cache.size',
+    resource: 'market-store', attributes: { rows: rows.length } }, count)
+}
+
+/** Private snapshots are shared only inside this store, never with callers. */
+class CandleReadCache {
+  #entries = new Map()
+  #entryBytes = 0
+  #pending = new Map()
+  #pendingBytes = 0
+  #inspections = new Map()
+  #integrityInspections = 0
+
+  constructor(store) { this.store = store }
+
+  eligible(series) {
+    const { store } = this, writer = store.writer
+    return !store.closed && !store.readers.failed && !writer.failed && !writer.tasks.size && !writer.queuedCount
+      && !writer.workers.some(worker => worker.busy) && !this.#integrityInspections && !this.#inspections.has(series)
+  }
+
+  #deleteEntry(key) {
+    const entry = this.#entries.get(key)
+    if (entry) { this.#entryBytes -= entry.bytes; this.#entries.delete(key) }
+  }
+
+  #deletePending(key, pending = this.#pending.get(key)) {
+    if (pending && this.#pending.get(key) === pending) { this.#pendingBytes -= pending.bytes; this.#pending.delete(key) }
+  }
+
+  #retire(series) {
+    for (const [key, entry] of this.#entries) if (series === null || entry.series === series) this.#deleteEntry(key)
+    for (const [key, pending] of this.#pending) if (series === null || pending.series === series) {
+      pending.retired = true
+      this.#deletePending(key, pending)
+    }
+  }
+
+  beginInspection(series = null) {
+    if (series === null) this.#integrityInspections += 1
+    else this.#inspections.set(series, (this.#inspections.get(series) ?? 0) + 1)
+    this.#retire(series)
+  }
+
+  endInspection(series = null) {
+    this.#retire(series)
+    if (series === null) this.#integrityInspections -= 1
+    else {
+      const remaining = this.#inspections.get(series) - 1
+      if (remaining) this.#inspections.set(series, remaining)
+      else this.#inspections.delete(series)
+    }
+  }
+
+  clear() { this.#retire(null) }
+
+  snapshot() {
+    return { entries: this.#entries.size, estimatedBytes: this.#entryBytes,
+      pending: this.#pending.size, pendingKeyBytes: this.#pendingBytes }
+  }
+
+  async read(query, priority) {
+    const { store } = this, series = keyOf(query.instrument, query.timeframe)
+    const dispatch = () => store.readers.request('candles', [query], priority)
+    if (!this.eligible(series)) return dispatch()
+    const key = JSON.stringify([query.instrument, query.timeframe, query.from, query.through, query.limit, query.order])
+    const keyBytes = 256 + 2 * (key.length + series.length)
+    if (keyBytes > CANDLE_KEY_BYTES) return dispatch()
+    const revision = store.candleRevision(query.instrument, query.timeframe), writerSequence = store.writer.nextID
+    const entry = this.#entries.get(key)
+    if (entry && entry.revision === revision) {
+      this.#entries.delete(key); this.#entries.set(key, entry)
+      return copyCandleRows(entry.rows)
+    }
+    if (entry) this.#deleteEntry(key)
+
+    const rank = priorityRank(priority)
+    for (let candidate = rank; candidate < PRIORITY_BUCKET_COUNT; candidate += 1) {
+      const pending = this.#pending.get(`${candidate}:${key}`)
+      if (pending && pending.revision === revision && pending.writerSequence === writerSequence) return copyCandleRows(await pending.task)
+    }
+
+    const pendingKey = `${rank}:${key}`
+    // A stale generation can still be running; its completion must not remove
+    // the replacement entry, or admit data under the replacement's revision.
+    this.#deletePending(pendingKey)
+    if (this.#pending.size >= CANDLE_PENDING_ENTRIES || this.#pendingBytes + keyBytes > CANDLE_PENDING_BYTES) return dispatch()
+    const pending = { series, revision, writerSequence, retired: false, bytes: keyBytes, task: null }
+    const task = dispatch().then(rows => {
+      const snapshot = copyCandleRows(rows, true)
+      const current = () => !pending.retired && this.eligible(series) && store.writer.nextID === writerSequence
+        && store.candleRevision(query.instrument, query.timeframe) === revision
+      if (current()) {
+        const bytes = keyBytes + candleRowBytes(snapshot)
+        // Bulk-work observers can close the store or begin an inspection.
+        // Revalidate after their callbacks, immediately before admission.
+        if (bytes <= CANDLE_CACHE_BYTES && current()) {
+          this.#deleteEntry(key)
+          while (this.#entries.size >= CANDLE_CACHE_ENTRIES || this.#entryBytes + bytes > CANDLE_CACHE_BYTES) this.#deleteEntry(this.#entries.keys().next().value)
+          this.#entries.set(key, { series, revision, rows: snapshot, bytes }); this.#entryBytes += bytes
+        }
+      }
+      return snapshot
+    }).finally(() => this.#deletePending(pendingKey, pending))
+    pending.task = task
+    this.#pending.set(pendingKey, pending); this.#pendingBytes += keyBytes
+    return copyCandleRows(await task)
+  }
+}
 
 function emptyPriorityBuckets() {
   return Array.from({ length: PRIORITY_BUCKET_COUNT }, () => ({ head: null, tail: null }))
@@ -162,6 +308,7 @@ export class MarketStore {
     this.writeMetrics = { partitions: 0, rowsSubmitted: 0, bytesRead: 0, bytesWritten: 0, durationMS: 0 }
     this.writer = new DatabaseWorkers([writer], (mutations, duration) => this.committed(mutations, duration))
     this.readers = new DatabaseWorkers(readers)
+    this.candleReads = new CandleReadCache(this)
     this.workerThreadIds = { writer: writer.threadId, readers: readers.map(worker => worker.threadId) }
   }
 
@@ -204,7 +351,7 @@ export class MarketStore {
     return { revision, ranges }
   }
   getWriteMetrics() { return { ...this.writeMetrics } }
-  getDiagnostics() { return { workerThreadIds: this.workerThreadIds, reads: { ...this.readers.metrics, queued: this.readers.queuedCount }, writes: { ...this.writer.metrics, queued: this.writer.queuedCount }, migrationComplete: this.migrationComplete ?? false, migrationProcessId: this.migration?.pid ?? null } }
+  getDiagnostics() { return { workerThreadIds: this.workerThreadIds, reads: { ...this.readers.metrics, queued: this.readers.queuedCount }, writes: { ...this.writer.metrics, queued: this.writer.queuedCount }, candleCache: this.candleReads.snapshot(), migrationComplete: this.migrationComplete ?? false, migrationProcessId: this.migration?.pid ?? null } }
 
   async startMigration() {
     if (await this.writer.request('migrationState', ['__complete__'])) { this.migrationComplete = true; return }
@@ -278,7 +425,7 @@ export class MarketStore {
       const request = createWorkerRequest('market-migration', 'import', resolve, reject, { priority })
       this.migrationPending.set(id, request)
       child.ref(); child.channel?.ref()
-      request.dispatch(child, { id, query: validateQuery(query), priority: priorityRank(priority) >= 3 ? 'foreground' : 'background', tolerateIssues }, error => {
+      request.dispatch(child, { id, query, priority: priorityRank(priority) >= 3 ? 'foreground' : 'background', tolerateIssues }, error => {
         if (!error) return
         this.migrationPending.delete(id); request.reject(error)
       })
@@ -287,12 +434,26 @@ export class MarketStore {
   }
 
   read(command, query, priority = 'background', ...args) {
+    if (this.closed) return Promise.reject(new Error('MarketStore is closed.'))
+    // Snapshot the candle query before any asynchronous import or caller edit.
+    // Inspection also owns its identity for the entire cache fence.
+    try {
+      if (command === 'candles') query = validateQuery(query)
+      else if (command === 'inspect') query = { ...query }
+    } catch (error) { return Promise.reject(error) }
     return this.operation(async () => {
-      validateQuery(query)
-      // Metadata describes committed SQLite facts. Asking for a watermark or
-      // a current tail must never make the viewport wait for the full archive.
-      if (!['coverage', 'watermark', 'checkpointRead'].includes(command)) await this.imported(query, priority, command === 'inspect')
-      return this.readers.request(command, [query, ...args], priority)
+      const valid = command === 'candles' ? query : validateQuery(query)
+      const inspection = command === 'inspect' ? keyOf(valid.instrument, valid.timeframe) : null
+      if (inspection !== null) this.candleReads.beginInspection(inspection)
+      try {
+        // Metadata describes committed SQLite facts. Asking for a watermark or
+        // a current tail must never make the viewport wait for the full archive.
+        if (!['coverage', 'watermark', 'checkpointRead'].includes(command)) await this.imported(valid, priority, command === 'inspect')
+        if (command === 'candles') return await this.candleReads.read(query, priority)
+        return await this.readers.request(command, [query, ...args], priority)
+      } finally {
+        if (inspection !== null) this.candleReads.endInspection(inspection)
+      }
     })
   }
   appendCandles(candles, priority = 'background') {
@@ -341,7 +502,13 @@ export class MarketStore {
   }
   statisticsMissingRanges(query, priority = 'background') { return this.read('missingRanges', query, priority, query.source) }
   inspectCandles(query, priority = 'background') { return this.read('inspect', query, priority) }
-  integrityCheck() { return this.operation(() => this.readers.request('integrity')) }
+  integrityCheck() {
+    return this.operation(async () => {
+      this.candleReads.beginInspection()
+      try { return await this.readers.request('integrity') }
+      finally { this.candleReads.endInspection() }
+    })
+  }
   migrationStatus() { return this.operation(async () => { await this.migrationReady; const report = await this.readers.request('migrationReport'); return { ...report, complete: this.migrationComplete || report.complete, error: this.migrationError?.message ?? this.migrationWarning ?? '' } }) }
   readIndicatorCheckpoint(query, priority = 'background') { return this.read('checkpointRead', { ...query, through: query.before }, priority) }
   writeIndicatorCheckpoint(query, priority = 'background') { return this.operation(() => this.writer.request('checkpointWrite', [query], priority)) }
@@ -349,6 +516,7 @@ export class MarketStore {
   close() {
     if (this.closeTask) return this.closeTask
     this.closed = true
+    this.candleReads.clear()
     this.closeTask = (async () => {
       await this.migrationReady?.catch(() => undefined)
       // A read must not make shutdown finish a multi-year archive migration.

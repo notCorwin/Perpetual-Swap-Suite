@@ -28,11 +28,11 @@ export class PreparedChartPipeline {
   })
   /** Declare viewport demand and immediately own its hydration, repair, priority and bounded reserve. */
   setFocus(target: { instId: string; timeframe: HistoryTimeframe; endHour?: number } | null, id?: string): void
-  prepare(instId: string, timeframe: HistoryTimeframe, targetEnd?: number, historyBars?: number, options?: { focusId?: string }): Promise<PreparedChartResponse>
+  prepare(instId: string, timeframe: HistoryTimeframe, targetEnd?: number, historyBars?: number, options?: { focusId?: string }): Promise<PreparedChartResponse | null>
   /** Pure latest durable read; never starts calculation, changes focus, or schedules source work. */
   local(instId: string, timeframe: HistoryTimeframe, options?: { priority?: HistoryPriority }): Promise<PreparedChartResponse | null>
-  /** Pure bounded durable read. Never changes focus or schedules source work. */
-  localHistory(instId: string, timeframe: HistoryTimeframe, targetEnd?: number): Promise<PreparedChartResponse | null>
+  /** Without focusId, a pure independent durable read. A focusId shares the selected preparation and returns null if superseded. */
+  localHistory(instId: string, timeframe: HistoryTimeframe, targetEnd?: number, options?: { focusId?: string }): Promise<PreparedChartResponse | null>
   /** Backend catalog membership owns every supported timeframe, with bounded independent preparation. */
   setUniverse(instIds: string[]): void
   /** Pure renderer hydration of cached frames; never admits work or changes membership. */

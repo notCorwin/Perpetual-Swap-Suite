@@ -6,6 +6,9 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { _electron } from 'playwright'
 import { summarizeLatencySamples } from '../../scripts/chart-acceptance-metrics.mjs'
+import { startRendererDiagnostics } from '../../scripts/renderer-diagnostics.mjs'
+import { startProcessWitness } from './process-witness.mjs'
+import { finishAcceptanceResources } from './acceptance-resources.mjs'
 import {
   assertNavigationFrames, exerciseInstrumentNavigation, finishNavigationFrameProbe, installNavigationProbe,
   measureNavigation, persistNavigationCatalog, removeNavigationProbe, selectionRequests,
@@ -18,7 +21,7 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
 
   const root = fileURLToPath(new URL('../..', import.meta.url))
   const userData = mkdtemp(join(tmpdir(), `perp-instrument-navigation-${presentation}-`))
-  let electron, page, fixture, presentationState
+  let electron, page, fixture, presentationState, stopWitness
 
   const launch = async (restart = false) => {
     electron = await _electron.launch({
@@ -30,6 +33,7 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
     if (presentation === 'foreground') presentationState = await prepareWindow(electron, page)
     await page.waitForLoadState('domcontentloaded')
     if (presentation === 'offscreen') presentationState = await prepareWindow(electron, page)
+    stopWitness = await startProcessWitness(electron, `${presentation}-navigation-${restart ? 'restarted' : 'initial'}`)
   }
 
   before(async () => {
@@ -41,18 +45,19 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
   })
 
   after(async () => {
-    try {
-      await presentationState?.restore?.()
-      if (electron) {
-        await removeNavigationProbe(electron)
-        await electron.close()
-      }
-    } finally {
-      await rm(await userData, { recursive: true, force: true })
-    }
+    await finishAcceptanceResources([
+      () => presentationState?.restore?.(),
+      () => stopWitness?.(),
+      () => electron && removeNavigationProbe(electron),
+      () => electron?.close(),
+      async () => rm(await userData, { recursive: true, force: true }),
+    ])
   })
 
   test('an unprepared selection acknowledges input before all sixteen prepared contracts switch by the next frame', { timeout: 120_000 }, async context => {
+    if (process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS) context.after(await startRendererDiagnostics(electron, page,
+      join(process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS, 'initial-navigation'),
+      { cpuProfile: process.env.PERPETUAL_SWAP_RENDERER_TRACE_ONLY !== '1' }))
     context.diagnostic(`Presentation: ${JSON.stringify({ native: presentationState?.native, environment: presentationState?.environment, idleFrameCadence: presentationState?.idleFrameCadence })}`)
     const report = await exerciseInstrumentNavigation(electron, page, fixture, { presentation, unpreparedInstId: 'BTC-USDT-SWAP' })
     assert.equal(report.unpreparedSelection.rendererFrameAvailableBeforeInput, false)
@@ -64,6 +69,9 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
     assert.deepEqual(report.violations, [])
     const inputs = report.phases.flatMap(phase => [phase.firstVisit, phase.mouseSwitch, phase.rapid, ...phase.keyboard,
       ...(phase.timeframeSwitch ? [phase.timeframeSwitch] : [])])
+    assert.ok(inputs.every(input => Number.isFinite(input.rendererTimeOrigin) && input.inputAt <= input.commitAt
+      && input.commitAt <= input.rafSampleAt && ['click', 'keydown'].includes(input.inputType)),
+    'Every measured selection must retain ordered input, SVG commit and RAF timestamps from its renderer document.')
     const svg = summarizeLatencySamples(inputs.map(input => input.inputToSVGCommitMS))
     const raf = summarizeLatencySamples(inputs.map(input => input.inputToNextRafSampleMS))
     context.diagnostic(`Navigation timing (${JSON.stringify(report.timingScope)}): ${JSON.stringify({ initialPreparation: report.initialPreparation, inputs: inputs.length,
@@ -77,6 +85,7 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
     assert.equal(await persistNavigationCatalog(electron, page), fixture.instIds.length)
     await removeNavigationProbe(electron)
     presentationState = null
+    await stopWitness?.(); stopWitness = undefined
     await electron.close()
     electron = null
     const launchedAt = Date.now()
@@ -107,6 +116,9 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
     if (presentation === 'foreground') assert.ok(startup.inputToSVGCommitMS <= 50,
       `The warm startup selection blocked native foreground input for ${startup.inputToSVGCommitMS} ms: ${JSON.stringify(startup)}`)
     await installNavigationProbe(electron)
+    if (process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS) context.after(await startRendererDiagnostics(electron, page,
+      join(process.env.PERPETUAL_SWAP_RENDERER_DIAGNOSTICS, 'restart-navigation'),
+      { cpuProfile: process.env.PERPETUAL_SWAP_RENDERER_TRACE_ONLY !== '1' }))
     const report = await exerciseInstrumentNavigation(electron, page, fixture, { holdHistory: false, presentation })
     assert.equal(report.phases.length, 3)
     assert.equal(report.initialPreparation.readyFrameCount, fixture.instIds.length * 3)

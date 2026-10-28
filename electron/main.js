@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { parseDesktopRequest } from './desktop-contract.js'
+import { encodeChartWire } from './chart-wire.js'
 import { createDesktopSecurity } from './desktop-security.js'
 import { assertBackgroundTestLaunch, testPresentation, testWindowOptions } from './test-presentation.js'
 import { startTestOwnerWatchdog } from './test-owner.js'
@@ -70,7 +71,7 @@ function sendGateway(event, detail) {
 
 function sendNotification(sender, channel, detail) {
   const operation = beginOperation({ category: 'ipc', name: 'desktop.notification.send', resource: channel })
-  try { operation.run(() => sender.send(channel, detail, operation.context)) }
+  try { operation.run(() => sender.send(channel, channel === 'radar:chart-prepared' ? encodeChartWire(detail) : detail, operation.context)) }
   finally { operation.end() }
 }
 
@@ -164,7 +165,7 @@ async function handleRequest(event, payload, context) {
     const build = await readFile(join(process.resourcesPath, 'build-revision.json'), 'utf8').then(JSON.parse).catch(() => null)
     return { ...response, revision: build?.revision ?? null }
   }
-  return response
+  return request.chartWindow || request.chartLocal || request.chartHistory || request.chartUniverse ? encodeChartWire(response) : response
   }))
   desktopRequests.add(task)
   task.then(() => desktopRequests.delete(task), () => desktopRequests.delete(task))

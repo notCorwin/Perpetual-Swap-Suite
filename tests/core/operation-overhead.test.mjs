@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -238,6 +239,9 @@ test('native traffic and the real renderer retain matched trials and separate fa
     assert.deepEqual(report.failures, assessBudgets(report, budgets))
     assert.equal(report.runs.length, 8, 'Diagnostic runs cannot enter gated medians.')
     assert.ok(report.sourceHashes['src/rsi-crossings.ts'], 'Renderer source identity must include transitive chart calculations.')
+    assert.equal(report.sourceHashes['electron/services/market-store.js'], createHash('sha256')
+      .update(await readFile(new URL('../../electron/services/market-store.js', import.meta.url))).digest('hex'),
+    'The measured backend source identity includes the candle reuse implementation.')
     assert.ok(report.phases.rendererEndToEnd)
     const rendererRuns = report.runs.filter(run => run.desktop)
     assert.equal(rendererRuns.length, 4)

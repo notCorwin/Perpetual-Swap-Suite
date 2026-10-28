@@ -1,21 +1,12 @@
 const { contextBridge, ipcRenderer } = require('electron')
 
 let operationHooks
+const pendingNotifications = []
 const operationNonce = Array.from(globalThis.crypto.getRandomValues(new Uint8Array(16)), value => value.toString(16).padStart(2, '0')).join('')
-const request = async value => {
-  const operation = operationHooks?.beginRequest(Object.keys(value ?? {})[0] ?? 'invalid')
-  return ipcRenderer.invoke('radar:request', value, operation?.context).then(result => {
-    if (operation) operationHooks.endRequest(operation.id, 'ok')
-    return result
-  }, error => {
-    if (operation) operationHooks.endRequest(operation.id, 'error')
-    throw error
-  })
-}
 for (const channel of ['radar:gateway-stream', 'radar:chart-prepared', 'radar:market-changed', 'radar:audit-changed', 'radar:history-download-changed']) {
   ipcRenderer.on(channel, (_event, detail, context) => {
     if (operationHooks) operationHooks.receive(channel, detail, context)
-    else window.dispatchEvent(new CustomEvent(channel.replace(':', '-'), { detail }))
+    else pendingNotifications.push([channel, detail, context])
   })
 }
 ipcRenderer.on('radar:operations-drain', async (_event, { id }) => {
@@ -26,10 +17,24 @@ ipcRenderer.on('radar:operations-drain', async (_event, { id }) => {
   } catch { ipcRenderer.send('radar:operations-drained', { id, ok: false }) }
 })
 window.addEventListener('pagehide', () => { if (operationHooks) void operationHooks.flush().catch(() => {}) })
-contextBridge.exposeInMainWorld('radarDesktop', {
+const transport = {
   nativeWindowControls: process.platform === 'darwin',
-  request,
-  initializeOperations: hooks => { operationHooks = hooks; return ipcRenderer.invoke('radar:operations-initialize', { nonce: operationNonce }) },
+  request: (value, context) => ipcRenderer.invoke('radar:request', value, context),
+  initializeOperations: hooks => {
+    operationHooks = hooks
+    for (const [channel, detail, context] of pendingNotifications.splice(0)) hooks.receive(channel, detail, context)
+    return ipcRenderer.invoke('radar:operations-initialize', { nonce: operationNonce })
+  },
   recordOperations: batch => ipcRenderer.invoke('radar:operations', batch),
   operationSourceFailure: value => ipcRenderer.invoke('radar:operations-failure', value),
+}
+// Hand the transport to the application once through the stable bridge API.
+// Bulk values remain strings when the resulting function proxies are called.
+let connected = false
+contextBridge.exposeInMainWorld('radarDesktopBootstrap', {
+  connect: accept => {
+    if (connected || typeof accept !== 'function') throw new Error('The desktop transport is already connected or the receiver is invalid.')
+    connected = true
+    accept(transport)
+  },
 })

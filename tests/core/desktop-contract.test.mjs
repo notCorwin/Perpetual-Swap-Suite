@@ -25,6 +25,7 @@ test('desktop requests accept each supported operation and preserve the public p
     { chartLocal: { instId, timeframe: '15m' } },
     { chartHistory: { instId, timeframe: '5m' } },
     { chartHistory: { instId, timeframe: '1H', endHour: 1_729_080_000_000 } },
+    { chartHistory: { instId, timeframe: '5m', focusId: 'focus-1' } },
     { chartUniverse: {} },
     { captureChart: { x: 0, y: 0, width: 80, height: 60 } },
     { captureChart: { x: 1.5, y: 2.5, width: 80.5, height: 60.5, backgroundRGB: [.1, .2, .3], output: 'png' } },
@@ -65,7 +66,7 @@ test('mixed commands and unknown top-level or nested fields are rejected before 
   assert.equal(effects, 0)
 })
 
-test('read requests reject retired timeframe, universe, and focus demand fields before dispatch', () => {
+test('read requests reject retired timeframe, universe, and unrelated focus demand fields before dispatch', () => {
   let effects = 0
   const dispatch = input => { const request = parseDesktopRequest(input); effects++; return request }
   for (const request of [
@@ -79,8 +80,9 @@ test('read requests reject retired timeframe, universe, and focus demand fields 
     { chartLocal: { instId, timeframe: '5m', focusId: 'focus-1' } },
     { chartLocal: { instId, timeframe: '5m', historyBars: 96 } },
     { chartHistory: { instId, timeframe: '5m', historyBars: 96 } },
-    { chartHistory: { instId, timeframe: '5m', focusId: 'focus-1' } },
-    { chartHistory: { instId, timeframe: '5m', endHour: 1_729_080_000_000, focusId: undefined } },
+    { chartHistory: { instId, timeframe: '5m', focusId: '' } },
+    { chartHistory: { instId, timeframe: '5m', focusId: null } },
+    { chartHistory: { instId, timeframe: '5m', focusId: 1 } },
   ]) assert.throws(() => dispatch(request), DesktopRequestError)
   assert.equal(effects, 0)
 })

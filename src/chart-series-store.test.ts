@@ -3,6 +3,7 @@ import test from 'node:test'
 import type { Bar, PreparedChartBar, PreparedChartLiveUpdate, PreparedChartResponse } from './chart-data.ts'
 import { PreparedChartStore } from './chart-series-store.ts'
 import { timeframeMilliseconds } from './timeframe.ts'
+import { attachOperationSink, type OperationEvent } from '../electron/services/operations.js'
 
 const hour = 3_600_000
 const instId = 'BTC-USDT-SWAP'
@@ -19,6 +20,58 @@ const response = (values: PreparedChartBar[], overrides: Partial<PreparedChartRe
   endHour: values.at(-1)?.hour ?? null, latestEnd: values.at(-1)?.hour ?? null,
   oldestHour: values[0]?.hour ?? null, historyExhausted: false, bars: values,
   oiState: 'ready', takerState: 'ready', indicatorState: 'ready', error: '', ...overrides,
+})
+
+test('resident window projection is reused until canonical bars or source metadata change', () => {
+  const store = new PreparedChartStore(), events: OperationEvent[] = []
+  store.ingest(response(bars(0, 400)))
+  const stop = attachOperationSink(event => { if (event.name === 'chart.window.project') events.push(event) })
+  try {
+    const first = store.window(instId, '1H', 300 * hour)!
+    for (let index = 0; index < 32; index++) assert.equal(store.window(instId, '1H', 300 * hour), first)
+    assert.equal(events.length, 1, 'Unchanged navigation must not repeat the 96-slot projection or source checks.')
+
+    store.ingest(response([bar(250, hour, { close: 102 })], { revision: 2, latestEnd: 399 * hour }))
+    const corrected = store.window(instId, '1H', 300 * hour)!
+    assert.equal(corrected.bars.find(value => value.hour === 250 * hour)!.close, 102)
+    assert.equal(first.bars.find(value => value.hour === 250 * hour)!.close, 101)
+    assert.equal(events.length, 2)
+
+    store.ingest(response([], { revision: 3, endHour: 300 * hour, latestEnd: 399 * hour, realtimeState: 'live', priceObservedAt: 1_800_000_000_000 }))
+    const refreshed = store.window(instId, '1H', 300 * hour)!
+    assert.equal(refreshed.realtimeState, 'live')
+    assert.equal(refreshed.priceObservedAt, 1_800_000_000_000)
+    assert.equal(refreshed.bars, corrected.bars, 'Metadata changes preserve canonical bar identity.')
+    assert.equal(events.length, 3)
+    assert.equal(store.window(instId, '1H', 300 * hour), refreshed)
+    assert.equal(events.length, 3)
+  } finally { stop() }
+})
+
+test('unchanged prepared bars advance revision and freshness without hiding later corrections', () => {
+  for (const compact of [false, true]) {
+    const store = new PreparedChartStore()
+    if (compact) store.setUniverse([instId], '1H')
+    const ingest = (frame: PreparedChartResponse) => compact ? store.ingestLatest(frame) : store.ingest(frame)
+    const values = bars(0, 96)
+    ingest(response(values))
+    const original = store.window(instId, '1H')!
+    const repeated = values.map(value => ({ ...value }))
+    ingest(response(repeated, { revision: 10, sourceVersions: { price: 1, oi: 2, taker: 3 }, realtimeState: 'live', priceObservedAt: 1234 }))
+    const refreshed = store.window(instId, '1H')!
+    assert.ok(refreshed.bars.every((value, index) => value === original.bars[index]))
+    assert.equal(repeated.every(value => Object.isFrozen(value)), false, 'Incoming transport data must remain caller-owned.')
+    assert.equal(store.snapshotMeta(instId, '1H')!.revision, 10)
+    assert.deepEqual(refreshed.sourceVersions, { price: 1, oi: 2, taker: 3 })
+    assert.equal(refreshed.realtimeState, 'live')
+    assert.equal(refreshed.priceObservedAt, 1234)
+    const correction = values.map((value, index) => index === 95 ? { ...value, close: 101.5 } : value)
+    ingest(response(correction, { revision: 9 }))
+    assert.equal(store.window(instId, '1H')!.bars.at(-1)!.close, 101, 'An unchanged newer response must still fence stale corrections.')
+    ingest(response(correction, { revision: 11 }))
+    assert.equal(store.window(instId, '1H')!.bars.at(-1)!.close, 101.5)
+    assert.equal(original.bars.at(-1)!.close, 101)
+  }
 })
 
 test('partial price windows render independently of unknown indicators and statistics', () => {
@@ -411,6 +464,160 @@ test('forming-only subscription deltas retain the exact frozen completed window 
   assert.equal(next.liveBar?.close, 101, 'Clearing a newer overlay preserves the prior immutable view.')
 })
 
+test('live-only projections match full-frame projections across price, source, and boundary states', () => {
+  const endHour = 199 * hour, complete = bars(104, 96)
+  const readyStatus = { state: 'ready' as const, from: 104 * hour, through: endHour, inputVersion: 'basis-1' }
+  const errorStatus = { state: 'error' as const, from: 104 * hour, through: endHour, error: 'source failed', retryAt: 42 }
+  const attached: Bar = { ...bar(200), confirmed: false }
+  const detached: Bar = { ...bar(203), confirmed: false }
+  const frame = (values: PreparedChartBar[], overrides: Partial<PreparedChartResponse> = {}) => response(values, {
+    endHour, latestEnd: endHour, priceState: 'ready', priceAsOf: endHour, priceObservedAt: 10, realtimeState: 'live',
+    sourceVersions: { price: 1, oi: 2, taker: 3 }, liveBar: attached,
+    priceStatus: readyStatus, oiStatus: readyStatus, takerStatus: readyStatus, indicatorStatus: readyStatus, ...overrides,
+  })
+  const cases = [
+    ['ready', frame(complete)],
+    ['stale', frame(complete, { priceState: 'stale' })],
+    ['detached', frame(complete, { liveBar: detached })],
+    ['no source statuses', frame(complete, { priceStatus: undefined, oiStatus: undefined, takerStatus: undefined, indicatorStatus: undefined })],
+    ['complete prices supersede a source error', frame(complete, { priceStatus: errorStatus })],
+    ['observed null values', frame(complete.map((value, index) => index === 10 ? { ...value, oi: null, buy: null, sell: null, ema: null } : value))],
+    ['independent source failure', frame(complete.map(value => ({ ...value, oi: null, oiObserved: false, statisticsObserved: false, statisticsSources: 2 })), { oiStatus: errorStatus })],
+    ['exhausted listing boundary', frame(bars(188, 12), { oldestHour: 188 * hour, historyExhausted: true })],
+    ['partial price range', frame(complete.map((value, index) => index === 10 ? { ...value, priceComplete: false } : value), { priceStatus: undefined })],
+    ['failed price range', frame(complete.filter((_, index) => index !== 10), { priceStatus: errorStatus })],
+    ['forming only', frame([], { oldestHour: null })],
+    ['forming only with price failure', frame([], { oldestHour: null, priceStatus: errorStatus })],
+  ] as const
+
+  for (const [name, initial] of cases) {
+    const actual = new PreparedChartStore(), reference = new PreparedChartStore()
+    actual.setUniverse([instId], '1H'); reference.setUniverse([instId], '1H')
+    assert.equal(actual.ingestLatest(initial), true, name)
+    assert.equal(reference.ingestLatest(initial), true, name)
+    let full = initial
+    const changes: Array<Partial<PreparedChartLiveUpdate> & { liveBar: Bar | null }> = [
+      { liveBar: { ...attached, close: 100.5 }, priceState: 'ready', priceAsOf: 200 * hour, priceObservedAt: 20, sourceVersions: { price: 2, oi: 3, taker: 4 } },
+      { liveBar: detached, priceState: 'ready', realtimeState: 'stale' },
+      { liveBar: attached, priceState: 'stale', priceAsOf: null, priceObservedAt: null },
+      ...(initial.bars.length ? [{ liveBar: null, priceState: 'ready' as const }] : []),
+      { liveBar: { ...attached, close: 100.25 }, priceState: 'ready', realtimeState: 'live', sourceVersions: { price: 3, oi: 4, taker: 5 } },
+    ]
+    for (const [index, change] of changes.entries()) {
+      const revision = index + 2
+      const before = actual.window(instId, '1H')!, beforeCopy = structuredClone(before)
+      const delta: PreparedChartLiveUpdate = { type: 'live', instId, timeframe: '1H', generation: 1, revision, endHour, ...change }
+      full = { ...full, revision, liveBar: change.liveBar ?? undefined,
+        priceState: change.priceState ?? full.priceState, priceAsOf: change.priceAsOf ?? full.priceAsOf,
+        priceObservedAt: change.priceObservedAt ?? full.priceObservedAt, realtimeState: change.realtimeState ?? full.realtimeState,
+        sourceVersions: change.sourceVersions ?? full.sourceVersions }
+      assert.equal(actual.ingestLive(delta), true, `${name}: delta ${index}`)
+      assert.equal(reference.ingestLatest(full), true, `${name}: full frame ${index}`)
+      const result = actual.window(instId, '1H')!
+      assert.deepEqual(result, reference.window(instId, '1H'), `${name}: full projection ${index}`)
+      assert.deepEqual(before, beforeCopy, `${name}: previous snapshot ${index}`)
+      assert.equal(result.bars, before.bars, `${name}: completed bars ${index}`)
+      assert.equal(result.oiStatus, before.oiStatus, `${name}: OI status ${index}`)
+      assert.equal(result.takerStatus, before.takerStatus, `${name}: taker status ${index}`)
+      assert.equal(result.indicatorStatus, before.indicatorStatus, `${name}: indicator status ${index}`)
+      if (JSON.stringify(result.priceStatus) === JSON.stringify(before.priceStatus)) assert.equal(result.priceStatus, before.priceStatus, `${name}: price status ${index}`)
+      assert.ok(Object.isFrozen(result) && Object.isFrozen(result.bars))
+      if (result.liveBar) assert.ok(Object.isFrozen(result.liveBar))
+      for (const value of [result.priceStatus, result.oiStatus, result.takerStatus, result.indicatorStatus, result.sourceVersions]) {
+        if (value) assert.ok(Object.isFrozen(value), `${name}: published metadata must be immutable`)
+      }
+    }
+
+    if (!initial.bars.length) {
+      const before = actual.window(instId, '1H')!, beforeCopy = structuredClone(before)
+      assert.equal(actual.ingestLive({ type: 'live', instId, timeframe: '1H', generation: 1, revision: 20, endHour, liveBar: null }), true)
+      const { liveBar: _liveBar, ...withoutLive } = before
+      const expected = { ...withoutLive, priceState: before.priceStatus?.state === 'error' ? 'error' : 'loading',
+        priceStatus: before.priceStatus?.state === 'error' ? before.priceStatus : before.priceStatus && { state: 'loading', from: 104 * hour, through: endHour } }
+      assert.deepEqual(actual.window(instId, '1H'), expected, `${name}: clearing the only forming bar`)
+      assert.deepEqual(before, beforeCopy)
+    }
+  }
+})
+
+test('live price freshness is recalculated when a historical projection is repinned as latest', () => {
+  const store = new PreparedChartStore(), reference = new PreparedChartStore(), endHour = 199 * hour
+  store.setUniverse([instId], '1H', instId); reference.setUniverse([instId], '1H')
+  const priceStatus = { state: 'ready' as const, from: 104 * hour, through: endHour }
+  const initial = response(bars(104, 96), { priceState: 'stale', priceStatus })
+  assert.equal(store.ingest(initial), true)
+  assert.equal(store.window(instId, '1H')!.priceState, 'stale')
+  assert.equal(store.ingest(response([bar(150)], { revision: 2, endHour: 150 * hour, latestEnd: 201 * hour })), true)
+  const repinned = store.window(instId, '1H')!
+  assert.equal(repinned.endHour, endHour); assert.equal(repinned.priceState, 'ready')
+  assert.equal(store.ingestLive({ type: 'live', instId, timeframe: '1H', generation: 1, revision: 3, endHour, liveBar: null }), true)
+  assert.equal(reference.ingestLatest({ ...initial, revision: 3 }), true)
+  assert.equal(store.window(instId, '1H')!.priceState, 'stale')
+  assert.equal(store.window(instId, '1H')!.bars, repinned.bars)
+  assert.deepEqual(store.window(instId, '1H'), reference.window(instId, '1H'))
+})
+
+test('live reuse retains immutable metadata and invalidates on full corrections and generation changes', () => {
+  const store = new PreparedChartStore(), full = new PreparedChartStore(), endHour = 199 * hour
+  store.setUniverse([instId], '1H', instId); full.setUniverse([instId], '1H', instId)
+  const versions = { price: 1, oi: 2, taker: 3 }, live: Bar = { ...bar(200), confirmed: false }
+  const status = { state: 'ready' as const, from: 104 * hour, through: endHour }
+  let frame = response(bars(104, 96), { liveBar: live, sourceVersions: versions, priceState: 'ready', oiStatus: status })
+  assert.equal(store.ingest(frame), true); assert.equal(full.ingest(frame), true)
+  const first = store.window(instId, '1H')!, firstCopy = structuredClone(first), meta = store.snapshotMeta(instId, '1H')!
+  assert.ok(Object.isFrozen(meta.oiStatus) && Object.isFrozen(meta.sourceStatuses)
+    && meta.sourceStatuses!.every(value => Object.isFrozen(value) && Object.isFrozen(value.status)))
+  versions.oi = 99; live.close = 100.5; status.through = 104 * hour
+  assert.deepEqual(first, firstCopy, 'Transport mutations cannot change a previously published view.')
+  assert.equal(meta.oiStatus!.through, endHour, 'Source metadata remains detached from the transport.')
+
+  const nextVersions = { price: 2, oi: 2, taker: 3 }, nextLive: Bar = { ...bar(200), confirmed: false, close: 100.5 }
+  const delta: PreparedChartLiveUpdate = { type: 'live', instId, timeframe: '1H', generation: 1, revision: 2, endHour,
+    liveBar: nextLive, priceObservedAt: 20, sourceVersions: nextVersions }
+  assert.equal(store.ingestLive(delta), true)
+  const updated = store.window(instId, '1H')!, updatedCopy = structuredClone(updated)
+  nextVersions.oi = 90; nextLive.close = 100.25
+  assert.deepEqual(updated, updatedCopy, 'Live payloads are detached from the frozen view.')
+  assert.deepEqual(first, firstCopy)
+  assert.notEqual(updated.sourceVersions, first.sourceVersions)
+  assert.equal(store.ingestLive({ ...delta, revision: 3, liveBar: { ...updated.liveBar! }, sourceVersions: { ...updated.sourceVersions! } }), true)
+  assert.equal(store.window(instId, '1H'), updated, 'An equal live update keeps the entire published object.')
+  assert.equal(store.ingestLive({ ...delta, revision: 4, liveBar: { ...updated.liveBar! }, priceObservedAt: 21, sourceVersions: { ...updated.sourceVersions! } }), true)
+  assert.equal(store.window(instId, '1H')!.sourceVersions, updated.sourceVersions, 'Equal source versions retain their identity even when freshness changes.')
+
+  const corrected = bars(104, 96).map((value, index) => index === 40 ? { ...value, close: 102, oi: null } : value)
+  frame = response(corrected, { revision: 5, liveBar: { ...updated.liveBar! }, sourceVersions: { ...updated.sourceVersions! }, priceState: 'ready',
+    oiStatus: { state: 'ready', from: 104 * hour, through: endHour } })
+  assert.equal(store.ingest(frame), true); assert.equal(full.ingest(frame), true)
+  const correction = store.window(instId, '1H')!
+  assert.equal(correction.bars[40].close, 102); assert.equal(correction.oiState, 'unavailable')
+  assert.notEqual(correction.bars, first.bars)
+  assert.deepEqual(first, firstCopy)
+  const afterCorrection = { ...delta, revision: 6, liveBar: { ...updated.liveBar! }, sourceVersions: { ...updated.sourceVersions! } }
+  assert.equal(store.ingestLive(afterCorrection), true)
+  assert.equal(full.ingest({ ...frame, revision: 6, priceObservedAt: afterCorrection.priceObservedAt }), true)
+  assert.deepEqual(store.window(instId, '1H'), full.window(instId, '1H'))
+  assert.equal(store.window(instId, '1H')!.bars, correction.bars)
+
+  const newGeneration = response(bars(188, 12), { generation: 2, revision: 1, oldestHour: 188 * hour, historyExhausted: true,
+    liveBar: { ...bar(200), confirmed: false }, priceState: 'ready' })
+  assert.equal(store.ingestLatest(newGeneration), true); assert.equal(full.ingestLatest(newGeneration), true)
+  const regenerated = store.window(instId, '1H')!
+  assert.equal(regenerated.generation, 2); assert.equal(regenerated.priceState, 'partial'); assert.equal(regenerated.bars.length, 12)
+  assert.equal(store.snapshotMeta(instId, '1H')!.oldestHour, 104 * hour, 'A new generation cannot move an established listing boundary forward.')
+  assert.equal(store.ingestLive({ ...afterCorrection, revision: 100 }), false, 'Old provenance cannot update a new generation.')
+  assert.equal(store.window(instId, '1H'), regenerated)
+  assert.equal(store.ingestLive({ ...afterCorrection, generation: 2, revision: 2 }), true)
+  assert.equal(full.ingestLatest({ ...newGeneration, revision: 2, liveBar: afterCorrection.liveBar!, priceObservedAt: afterCorrection.priceObservedAt,
+    sourceVersions: afterCorrection.sourceVersions }), true)
+  assert.deepEqual(store.window(instId, '1H'), full.window(instId, '1H'))
+  const repaired = response(bars(104, 96), { generation: 2, revision: 3, historyExhausted: true, liveBar: afterCorrection.liveBar!, priceState: 'ready' })
+  assert.equal(store.ingestLatest(repaired), true); assert.equal(full.ingestLatest(repaired), true)
+  assert.equal(store.window(instId, '1H')!.priceState, 'ready')
+  assert.deepEqual(store.window(instId, '1H'), full.window(instId, '1H'))
+  assert.deepEqual(first, firstCopy)
+})
+
 test('forming deltas require an existing exact generation and completed end and reject stale or malformed input', () => {
   const store = new PreparedChartStore()
   store.setUniverse([instId], '1H')
@@ -428,6 +635,9 @@ test('forming deltas require an existing exact generation and completed end and 
     { ...delta, liveBar: { ...live, hour: 199 * hour } },
     { ...delta, liveBar: { ...live, hour: 200 * hour + 1 } },
     { ...delta, liveBar: { ...live, confirmed: true } },
+    { ...delta, liveBar: { ...live, confirmed: undefined as unknown as boolean } },
+    { ...delta, liveBar: undefined as unknown as Bar },
+    { ...delta, liveBar: { ...live, high: Number.NaN } },
     { ...delta, liveBar: { ...live, close: 200 } },
   ]) {
     assert.equal(store.ingestLive(invalid), false)
@@ -436,6 +646,26 @@ test('forming deltas require an existing exact generation and completed end and 
   assert.equal(store.ingestLatest(response(bars(104, 96), { generation: 2 })), true, 'A rejected delta cannot poison a later complete generation.')
   assert.equal(store.ingestLive({ ...delta, generation: 2 }), true)
   assert.equal(store.size, 0)
+})
+
+test('full frames also require a validated forming bar before presenting it', () => {
+  for (const compact of [false, true]) {
+    const store = new PreparedChartStore()
+    store.setUniverse([instId], '1H')
+    const invalid = { ...bar(200), confirmed: undefined as unknown as boolean }
+    const frame = response(bars(104, 96), { liveBar: invalid })
+    assert.equal(compact ? store.ingestLatest(frame) : store.ingest(frame), true)
+    assert.equal(store.window(instId, '1H')!.liveBar, undefined)
+    assert.equal(store.window(instId, '1H')!.priceState, 'ready')
+  }
+  for (const endHour of [null, 199 * hour]) {
+    const store = new PreparedChartStore()
+    store.setUniverse([instId], '1H')
+    const invalid = { ...bar(200), confirmed: undefined as unknown as boolean }
+    assert.equal(store.ingestLatest(response([], { endHour, latestEnd: endHour, liveBar: invalid })), false,
+      'An invalid forming bar cannot establish a boundary or admit an empty frame.')
+    assert.equal(store.window(instId, '1H'), null)
+  }
 })
 
 test('forming deltas preserve deep durable history bounds when compact latest outlives raw bar pressure', () => {

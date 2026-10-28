@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { _electron } from 'playwright'
 import {
-  installRequestProbe, measureLatencyCoveredPrefetch, measureMissingWindow, offscreenChartWindow, openChart, readRequestProbe, removeRequestProbe, resetRequestProbe,
+  installRequestProbe, measureLatencyCoveredPrefetch, measureMissingWindow, measureOffscreenColdBoundary, offscreenChartWindow, openChart, readRequestProbe, removeRequestProbe, resetRequestProbe,
   separateSourceMaintenance, waitForLocalHistory, waitForRendered, wheelBurst,
 } from '../../scripts/chart-acceptance.mjs'
 
@@ -28,6 +28,32 @@ async function waitForRequestQuiescence(timeoutMS = 5_000) {
   throw new Error('Chart IPC and prepared-frame delivery did not settle.')
 }
 
+test('cold boundary witnesses prepared target history and validates its selected ready RAF', { timeout: 60_000 }, async context => {
+  const report = await measureOffscreenColdBoundary(electron, page)
+  context.diagnostic(`Cold boundary witness: ${JSON.stringify({ timing: report.coldTiming, preparedTarget: report.preparedTarget,
+    approach: report.approachLatency, approachAcknowledgment: report.approachAcknowledgment,
+    sourcePhaseRAF: report.sourcePhaseRAF, targetPhaseRAF: report.targetPhaseRAF })}`)
+  assert.equal(report.preparedTarget.targetEnd, report.targetEnd)
+  assert.ok(report.preparedTarget.historyBars > 96)
+  assert.equal(report.coldTiming.preparedBeforeFinalInput, true, 'The witness must precede target demand.')
+  assert.equal(report.preparedTarget.sourceCompletedAt, report.coldTiming.timestamps.nearestCompletedAt)
+  assert.equal(report.observedFieldOracle.priceBars, 96)
+  assert.equal(report.observedFieldOracle.indicatorBars, 96)
+  assert.equal(report.inputBursts.length, 2)
+  assert.equal(report.approachLatency.milestone, 'rendered-window')
+  assert.match(report.approachLatency.meaning, /no 100 ms content deadline/)
+  assert.equal(report.approachAcknowledgment.milestone, 'requested-cursor')
+  assert.equal(report.approachAcknowledgment.unaccountedInputs.length, 0)
+  assert.equal(report.approachAcknowledgment.lastCommit.end, report.approachAcknowledgment.intents.at(-1).target)
+  assert.ok(Number.isFinite(report.approachAcknowledgment.lastCommit.rafSampledAt))
+  assert.ok(report.observationSamples.length > 0)
+  assert.ok(report.observationSamples.every(sample => Number.isFinite(sample.at) && typeof sample.frame === 'boolean'))
+  for (const phase of [report.sourcePhaseRAF, report.targetPhaseRAF]) {
+    assert.ok(phase.samples.length > 0)
+    assert.ok(phase.samples.every(sample => [sample.at, sample.rafTimestamp, sample.previousRafTimestamp, sample.gapMS].every(Number.isFinite)))
+  }
+})
+
 before(async () => {
   userData = await mkdtemp(join(tmpdir(), 'perp-radar-chart-scroll-e2e-'))
   await writeFile(join(userData, 'settings.json'), JSON.stringify({ monitoringPaused: true, backgroundMonitoringEnabled: false }))
@@ -46,6 +72,73 @@ before(async () => {
 after(async () => {
   await electron?.close()
   if (userData) await rm(userData, { recursive: true, force: true })
+})
+
+test('cold fixture disposal isolates held source work from the next fixture', { timeout: 60_000 }, async () => {
+  const probe = value => electron.evaluate((_, input) => globalThis.__marketBackend.probe(input), value)
+  const backendRequest = value => electron.evaluate((_, input) => globalThis.__marketBackend.request(input), value)
+  const install = timeframe => probe({ action: 'coldBoundaryInstall', timeframe, scenario: 'full-missing-window', sourceDelayMS: 1800 })
+  const heldRequests = async fixture => {
+    await backendRequest({ chartFocus: { id: `isolation-${fixture.instId}`, target: {
+      instId: fixture.instId, timeframe: fixture.timeframe, endHour: fixture.targetEnd,
+    } } })
+    const deadline = Date.now() + 20_000
+    while (Date.now() < deadline) {
+      const snapshot = await probe({ action: 'coldBoundaryRead' })
+      const held = snapshot.requests.filter(item => item.held && item.completedAt === null && item.failedAt === null)
+      if (held.length) return held
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    throw new Error(`No optional or reserve source was held for ${fixture.instId}.`)
+  }
+  const assertRetired = async fixture => {
+    const [prepared, history] = await Promise.all([probe({ action: 'preparedDiagnostics' }), probe({ action: 'diagnostics' })])
+    assert.notEqual(prepared.focus?.instId, fixture.instId)
+    assert.equal(prepared.catalog.includes(fixture.instId), false)
+    assert.equal(prepared.listRemovals.includes(fixture.instId), false)
+    assert.equal(prepared.series.some(item => item.key.startsWith(`${fixture.instId}:`)), false)
+    assert.equal(prepared.sources.some(item => item.key.startsWith(`${fixture.instId}:`)), false)
+    assert.equal(prepared.tasks.some(key => key.startsWith(`${fixture.instId}:`)), false)
+    assert.equal(prepared.queue.some(key => key.startsWith(`${fixture.instId}:`)), false)
+    assert.equal(history.activeHistory.some(item => item.instrument === fixture.instId), false)
+    assert.equal(history.tasks.some(item => item.instrument === fixture.instId), false)
+  }
+  const readRanges = async (fixture, held) => Promise.all(held.map(item => backendRequest({ e2e: {
+    action: item.source === 'candles' ? 'readCandles' : 'readStatistics', instrument: fixture.instId,
+    timeframe: fixture.timeframe, from: item.from, through: item.through,
+  } })))
+  await offscreenChartWindow(electron)
+  try {
+    const first = await install('15m'), firstHeld = await heldRequests(first)
+    const [removed, next] = await electron.evaluate(async () => Promise.all([
+      globalThis.__marketBackend.probe({ action: 'coldBoundaryRemove' }),
+      globalThis.__marketBackend.probe({ action: 'coldBoundaryInstall', timeframe: '1H', scenario: 'full-missing-window', sourceDelayMS: 1800 }),
+    ]))
+    assert.equal(removed.disposed.active, 0)
+    assert.equal(removed.disposed.pending, 0)
+    for (const item of removed.disposed.requests.filter(item => item.held)) {
+      assert.equal(item.completedAt, null)
+      assert.ok(Number.isFinite(item.failedAt), 'Held requests must be cancelled instead of released into a source write.')
+    }
+    await assertRetired(first)
+    const firstAfterRemoval = await readRanges(first, firstHeld)
+    assert.ok(firstAfterRemoval.every(rows => rows.length === 0), 'The held ranges must still be absent after disposal.')
+    const durableTail = await backendRequest({ e2e: { action: 'readCandles', instrument: first.instId,
+      timeframe: first.timeframe, from: first.end, through: first.end } })
+    assert.equal(durableTail.length, 1, 'Disposal must retain previously committed fixture facts.')
+    const nextHeld = await heldRequests(next)
+    // Installation itself must await the prior fixture even without an explicit remove.
+    await install('5m')
+    await assertRetired(next)
+    const nextAfterRemoval = await readRanges(next, nextHeld)
+    assert.ok(nextAfterRemoval.every(rows => rows.length === 0), 'Replacement must not release the old held ranges.')
+    await new Promise(resolve => setTimeout(resolve, 2200))
+    assert.deepEqual(await readRanges(first, firstHeld), firstAfterRemoval)
+    assert.deepEqual(await readRanges(next, nextHeld), nextAfterRemoval)
+    await assertRetired(first)
+    await assertRetired(next)
+    await offscreenChartWindow(electron)
+  } finally { await probe({ action: 'coldBoundaryRemove' }) }
 })
 
 test('sub-candle wheel frames move continuously while axes stay fixed and native bursts coalesce', async () => {
@@ -100,6 +193,73 @@ test('sub-candle wheel frames move continuously while axes stay fixed and native
     const probe = await readRequestProbe(electron)
     assert.equal(probe.focusCalls.length, 1, '32 events in one animation frame must produce one backend navigation intent.')
     assert.equal(probe.traffic.fullHistoryPushes, 0)
+
+    await wheelBurst(page, { deltaY: 3 })
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    const fractionalStart = await read()
+    assert.ok(fractionalStart.offset > 0, 'The resident window must have a visible fractional offset before the burst.')
+    await waitForRequestQuiescence()
+    await resetRequestProbe(electron)
+    const leading = await page.evaluate(async instId => {
+      const plot = document.querySelector('[data-chart-plot]')
+      let framePassed = false
+      const frame = requestAnimationFrame(() => { framePassed = true })
+      try {
+        for (let event = 0; event < 32; event += 1) {
+          plot.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: 3 }))
+        }
+        await Promise.resolve()
+        const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+        const svg = chart.querySelector('svg[data-rendered-inst]')
+        return {
+          framePassed,
+          requestedEnd: Number(chart.dataset.chartRequestedEnd),
+          completedEnd: Number(chart.dataset.chartCompletedEnd),
+          renderedEnd: Number(svg.dataset.renderedEnd),
+          bars: chart.__chartRenderedBars.length,
+          lastBar: chart.__chartRenderedBars.at(-1)?.hour,
+          loading: chart.dataset.chartLoading,
+          offsets: [...svg.querySelectorAll('[data-chart-wheel-content]')].map(element => Number(element.dataset.chartWheelOffset)),
+        }
+      } finally { cancelAnimationFrame(frame) }
+    }, fixture.instId)
+    const expectedEnd = startEnd - 17 * interval
+    assert.equal(leading.framePassed, false, 'The leading update must be observed before the next animation frame.')
+    assert.equal(leading.requestedEnd, expectedEnd)
+    assert.equal(leading.completedEnd, expectedEnd)
+    assert.equal(leading.renderedEnd, expectedEnd, 'The cached target must already be presented at the microtask boundary.')
+    assert.equal(leading.lastBar, expectedEnd)
+    assert.equal(leading.bars, 96)
+    assert.equal(leading.loading, 'false')
+    assert.ok(leading.offsets.length > 0 && leading.offsets.every(offset => Math.abs(offset - fractionalStart.offset) < 1e-9),
+      `The new window must retain the existing fractional displacement: ${JSON.stringify({ leading, fractionalStart })}`)
+    await waitForRendered(page, fixture, timeframe, expectedEnd)
+    await waitForRequestQuiescence()
+    const leadingProbe = await readRequestProbe(electron)
+    assert.equal(leadingProbe.focusCalls.length, 1, 'The leading 32-event burst must produce one backend navigation intent.')
+    assert.equal(leadingProbe.focusCalls[0].target.endHour, expectedEnd)
+    assert.equal(leadingProbe.traffic.fullHistoryPushes, 0)
+
+    await resetRequestProbe(electron)
+    await page.evaluate(async () => {
+      const plot = document.querySelector('[data-chart-plot]')
+      const wheel = deltaY => plot.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY }))
+      wheel(3)
+      await Promise.resolve()
+      wheel(120)
+      const button = [...document.querySelectorAll('[aria-label="Chart timeframe"] button')]
+        .find(element => element.textContent.trim() === '5m')
+      button.click()
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+    })
+    await waitForRendered(page, fixture, '5m')
+    await waitForRequestQuiescence()
+    const switchedProbe = await readRequestProbe(electron)
+    assert.ok(switchedProbe.focusCalls.some(call => call.target?.timeframe === '5m'), 'The new timeframe must declare its selection.')
+    assert.equal(switchedProbe.focusCalls.some(call => call.target?.timeframe === timeframe), false,
+      'A trailing wheel batch from the previous timeframe must be cancelled before it can declare demand.')
+    assert.equal(switchedProbe.focusCalls.findLast(call => call.target?.timeframe === '5m')?.target.endHour, undefined,
+      'The cancelled batch must not move the new timeframe away from its latest window.')
   } finally {
     await removeRequestProbe(electron)
   }
@@ -213,6 +373,56 @@ test('real resident reserve covers delayed history delivery before continuous in
     minimumBars: report.minimumBars, pendingFrames: report.pendingFrames, latestInputToRafSampleMS: report.latestInputToRafSampleMS,
     nativePaintMeasured: report.nativePaintMeasured }))
   await writeFile(join(root, '.build/chart-prefetch-latency.json'), `${JSON.stringify(report, null, 2)}\n`)
+})
+
+test('a prefetch validation failure retains complete timing and delivery evidence', { timeout: 90_000 }, async context => {
+  const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark', instId: 'PREFETCH-EVIDENCE-USDT-SWAP' }))
+  // Inject paint and delivery-report failures only after the real 768-input
+  // phase and deferred probe have completed; the workload is unchanged.
+  const failingPage = new Proxy(page, { get(target, key) {
+    const value = target[key]
+    if (key === 'evaluate') return async (...args) => {
+      const result = await value.apply(target, args)
+      if (args[1]?.includeTimingEvidence && Array.isArray(result?.violations)) result.violations.push('Injected deferred paint validation failure.')
+      return result
+    }
+    return typeof value === 'function' ? value.bind(target) : value
+  } })
+  const failingElectron = new Proxy(electron, { get(target, key) {
+    const value = target[key]
+    if (key === 'evaluate') return async (...args) => {
+      const result = await value.apply(target, args)
+      const completed = result?.extensions?.find(record => Number.isFinite(record.completedAt))
+      if (completed) completed.completedAt += 60_000
+      return result
+    }
+    return typeof value === 'function' ? value.bind(target) : value
+  } })
+  await assert.rejects(measureLatencyCoveredPrefetch(failingElectron, failingPage, fixture, { offscreen: true }), error => {
+    const marker = '\nPrefetch phase data: '
+    const position = error.message.lastIndexOf(marker)
+    assert.ok(position >= 0, 'The failure must include the phase evidence.')
+    const evidence = JSON.parse(error.message.slice(position + marker.length))
+    assert.ok(Number.isFinite(evidence.rendererTimeOrigin))
+    assert.equal(evidence.inputs.length, 768)
+    assert.equal(evidence.latency.intents.length, 768)
+    assert.ok(evidence.latency.intents.every(intent => Number.isFinite(intent.inputAt)
+      && Number.isFinite(intent.commitAt) && Number.isFinite(intent.rafSampledAt)))
+    assert.ok(evidence.paint.violations.includes('Injected deferred paint validation failure.'))
+    assert.ok(evidence.paint.frames > 0 && evidence.paint.paints > 0)
+    assert.ok(evidence.paint.frameSamples.length > 0 && evidence.paint.captureTimings.length > 0)
+    assert.ok(evidence.paint.captureTimings.every(sample => Number.isFinite(sample.at) && Number.isFinite(sample.durationMS)))
+    assert.ok(evidence.requests.extensions.length > 0)
+    assert.ok(Number.isFinite(evidence.runway.runwayAtRequest))
+    assert.deepEqual(evidence.sources.historical, [])
+    assert.equal(evidence.checks.find(check => check.name === 'complete paints').passed, false)
+    const delivery = evidence.checks.find(check => check.name === 'delivery before crossing')
+    assert.equal(delivery?.passed, false, 'An independent delivery failure must survive the injected paint failure.')
+    assert.match(delivery.message, /reach the renderer before the first viewport crosses/)
+    assert.equal(evidence.checks.find(check => check.name === 'persisted sources').passed, true)
+    context.diagnostic(`Injected prefetch failure checks: ${JSON.stringify(evidence.checks)}`)
+    return true
+  })
 })
 
 test('a completely absent 96-candle viewport stays truthful through delayed acquisition, continuing input, and reversal', { timeout: 45_000 }, async context => {

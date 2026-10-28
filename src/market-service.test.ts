@@ -1344,6 +1344,37 @@ class TestSocket extends EventTarget {
   close() { this.readyState = 3; queueMicrotask(() => this.dispatchEvent(new Event('close'))) }
 }
 
+test('native forming admission and derived prices advance while background projection is held', async () => {
+  const socket = new TestSocket(), f = await fixture(disabled(), undefined, { webSocketFactory: () => socket })
+  const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes, key = `${instId}:5m`
+  const pipeline = f.service.preparedCharts, schedule = pipeline.scheduleLivePublications
+  try {
+    await f.service.persistCandles(instId, Array.from({ length: 300 }, (_, index) => rawCandle(asOf - (300 - index) * fiveMinutes)))
+    await f.service.localChartWindow(instId, '5m')
+    pipeline.queueCandidate = () => {}; pipeline.scheduleCandidates = () => {}; pipeline.scheduleRefresh = () => {}
+    pipeline.scheduleLivePublications = () => {}
+    f.service.realtime.setSubscriptions([{ instId, timeframe: '5m' }])
+    f.service.realtime.start(); socket.open(); await f.service.realtime.whenIdle()
+    socket.candle(asOf, 105, false); socket.candle(asOf, 106, false)
+    let idle = false
+    void f.service.realtime.whenIdle().then(() => { idle = true })
+    for (let turn = 0; turn < 5; turn++) await new Promise<void>(resolve => setImmediate(resolve))
+    assert.equal(f.service.liveCandles.get(key)?.close, 106, 'A pending old projection cannot hold the next raw socket fact.')
+    assert.equal(idle, true, 'Source admission completion is independent of derived frame publication.')
+    assert.ok(pipeline.livePublications.has(key), 'The projection must still be held during the raw-admission assertion.')
+    const publication = pipeline.livePublications.get(key).promise, tracked = f.service.track(publication)
+    const backgroundCount = f.service.backgroundTasks.size
+    for (let index = 0; index < 1000; index++) assert.strictEqual(f.service.track(publication), tracked)
+    assert.equal(f.service.backgroundTasks.size, backgroundCount, 'A shared projection has only one background completion observer.')
+    await waitFor(() => f.service.liveCandles.get(`${instId}:15m`)?.close === 106)
+    pipeline.scheduleLivePublications = schedule; pipeline.scheduleLivePublications()
+    await waitFor(() => pipeline.cached(key)?.liveBar?.close === 106)
+  } finally {
+    pipeline.scheduleLivePublications = schedule; pipeline.scheduleLivePublications()
+    await f.close()
+  }
+})
+
 test('live integration stays in memory and close drains accepted confirmation while preserving a newer forming bar', async () => {
   const socket = new TestSocket()
   const f = await fixture(disabled(), undefined, { webSocketFactory: () => socket })
@@ -1361,6 +1392,7 @@ test('live integration stays in memory and close drains accepted confirmation wh
     socket.candle(asOf - fiveMinutes, 105, false)
     await f.service.realtime.whenIdle()
     assert.equal(writes, 0)
+    await waitFor(() => f.service.preparedCharts.cached(`${instId}:5m`)?.liveBar?.close === 105)
     assert.equal(f.service.preparedCharts.cached(`${instId}:5m`).liveBar.close, 105)
     socket.candle(asOf, 106, false)
     await f.service.realtime.whenIdle()

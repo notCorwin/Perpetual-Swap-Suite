@@ -246,10 +246,11 @@ test('repeated durable flushes of unchanged journals do no additional disk synch
       import assert from 'node:assert/strict';
       import fs from 'node:fs';
       import { syncBuiltinESMExports } from 'node:module';
-      const fdatasync = fs.fdatasync, writeFileSync = fs.writeFileSync;
+      const fdatasync = fs.fdatasync, writeFileSync = fs.writeFileSync, writeFile = fs.writeFile;
       let synchronizations = 0, healthWrites = 0;
       fs.fdatasync = (...args) => { synchronizations++; return fdatasync(...args) };
       fs.writeFileSync = (path, ...args) => { if (String(path).endsWith('.health.json')) healthWrites++; return writeFileSync(path, ...args) };
+      fs.writeFile = (path, ...args) => { if (String(path).endsWith('.health.json')) healthWrites++; return writeFile(path, ...args) };
       syncBuiltinESMExports();
       const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
       const { measureOperation } = await import(${JSON.stringify(operations)});
@@ -265,6 +266,58 @@ test('repeated durable flushes of unchanged journals do no additional disk synch
       assert.ok(healthWrites > expected.healthWrites);
       await recording.close();
     `)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('recorder self-timing attributes delayed bulk stages without recursive records or redundant health writes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-operation-runtime-self-timing-'))
+  try {
+    const recordings = await execute(directory, `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import zlib from 'node:zlib';
+      import { syncBuiltinESMExports } from 'node:module';
+      const waiting = new Int32Array(new SharedArrayBuffer(4));
+      const delay = () => Atomics.wait(waiting, 0, 0, 12);
+      let encodeDelay = false, writeDelay = false, healthDelay = false, healthWrites = 0;
+      const compress = zlib.brotliCompressSync, write = fs.write, writeFile = fs.writeFile;
+      zlib.brotliCompressSync = (...args) => { if (encodeDelay) { encodeDelay = false; delay() } return compress(...args) };
+      fs.write = (...args) => { if (writeDelay) { writeDelay = false; setTimeout(() => write(...args), 15) } else write(...args) };
+      fs.writeFile = (path, ...args) => {
+        if (String(path).endsWith('.health.json')) {
+          healthWrites++;
+          if (healthDelay) { healthDelay = false; setTimeout(() => writeFile(path, ...args), 15); return }
+        }
+        writeFile(path, ...args);
+      };
+      syncBuiltinESMExports();
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      const { measureOperation, withOperationSuppressed } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording();
+      encodeDelay = writeDelay = healthDelay = true;
+      for (let count = 0; count < 200; count++) measureOperation({ category: 'cpu', name: 'runtime.self-timing', resource: '界'.repeat(256), attributes: { count } }, () => {});
+      await recording.flush();
+      assert.equal(encodeDelay || writeDelay || healthDelay, false, 'Every controlled bulk path must actually execute.');
+      const live = recording.health().selfTiming;
+      for (const stage of ['batch-build', 'journal-write-wait', 'health-publish-wait']) {
+        assert.ok(live.slowSamples.some(sample => sample.stage === stage && sample.durationMS >= 12), stage);
+      }
+      const published = withOperationSuppressed(() => JSON.parse(fs.readFileSync(${JSON.stringify(directory)} + '/' + recording.executionId + '.health.json', 'utf8'))).selfTiming;
+      assert.equal(live.stages['health-publish-wait'].count, (published.stages['health-publish-wait']?.count ?? 0) + 1,
+        'A persisted publication cannot include its own unfinished measurement.');
+      const writes = healthWrites;
+      await Promise.all([recording.flush(), recording.flush(), recording.flush()]);
+      assert.equal(healthWrites, writes, 'Unpublished diagnostic progress must not invalidate the durable proof.');
+      await recording.close();
+    `)
+    const { events, health } = recordings[0]
+    assert.deepEqual(events.filter(event => event.name === 'runtime.self-timing' && event.phase === 'end').map(event => event.attributes.count), Array.from({ length: 200 }, (_, index) => index))
+    assert.equal(events.some(event => ['batch-build', 'journal-write-wait', 'health-publish-wait'].includes(event.name)), false)
+    assert.equal(health.failed, 0)
+    assert.equal(health.pending, 0)
+    assert.equal(health.recorded, events.length)
+    assert.equal(health.durableRecords, events.length)
+    for (const stage of ['batch-build', 'journal-write-wait', 'health-publish-wait']) assert.ok(health.selfTiming.slowSamples.some(sample => sample.stage === stage && sample.durationMS >= 12), stage)
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
@@ -304,8 +357,10 @@ test('persisted health reflects hook replacement and recovery without new record
       assert.ok(restored.enabledHooks.includes('filesystem'));
       await recording.close();
       const persisted = readHealth(), live = recording.health();
-      const withoutTimestamp = ({ updatedAt, ...state }) => state;
-      assert.deepEqual(withoutTimestamp(persisted), withoutTimestamp(live));
+      const durableState = ({ updatedAt, selfTiming, ...state }) => state;
+      assert.deepEqual(durableState(persisted), durableState(live));
+      assert.equal(live.selfTiming.stages['health-publish-wait'].count, (persisted.selfTiming.stages['health-publish-wait']?.count ?? 0) + 1,
+        'The final health publication remains observable in live timing without recursively publishing itself.');
       assert.equal(persisted.closed, true);
     `)
     assert.equal(recordings.length, 1)
@@ -357,14 +412,16 @@ test('health-file write failure rejects flush and remains visible after orderly 
       import assert from 'node:assert/strict';
       import fs from 'node:fs';
       import { syncBuiltinESMExports } from 'node:module';
-      const writeFileSync = fs.writeFileSync;
+      const writeFile = fs.writeFile;
       let rejectHealth = false;
-      fs.writeFileSync = (path, ...args) => {
+      fs.writeFile = (path, ...args) => {
         if (rejectHealth && String(path).endsWith('.health.json')) {
           rejectHealth = false;
-          throw Object.assign(new Error('Injected health failure'), { code: 'ENOSPC' });
+          const callback = args.at(-1);
+          queueMicrotask(() => callback(Object.assign(new Error('Injected health failure'), { code: 'ENOSPC' })));
+          return;
         }
-        return writeFileSync(path, ...args);
+        return writeFile(path, ...args);
       };
       syncBuiltinESMExports();
       const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
@@ -381,6 +438,57 @@ test('health-file write failure rejects flush and remains visible after orderly 
     assert.equal(recordings[0].health.pending, 0)
     assert.equal(recordings[0].health.closed, true)
   } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('descriptor finalization failure publishes failed health and permanently rejects later flushes', async () => {
+  for (const failFlush of [false, true]) {
+    const directory = await mkdtemp(join(tmpdir(), 'perp-operation-runtime-close-failure-'))
+    try {
+      const recordings = await execute(directory, `
+        import assert from 'node:assert/strict';
+        import fs from 'node:fs';
+        import { syncBuiltinESMExports } from 'node:module';
+        const open = fs.openSync, close = fs.closeSync, sync = fs.fdatasync;
+        let journal, armed = false;
+        const closeFailure = Object.assign(new Error('injected journal close failure'), { code: 'EIO' });
+        fs.openSync = (path, ...args) => {
+          const fd = open(path, ...args);
+          if (String(path).endsWith('.brj')) journal = fd;
+          return fd;
+        };
+        fs.closeSync = fd => {
+          close(fd);
+          if (armed && fd === journal) { armed = false; throw closeFailure; }
+        };
+        fs.fdatasync = (fd, callback) => {
+          if (${failFlush} && armed && fd === journal) return queueMicrotask(() => callback(Object.assign(new Error('injected sync failure'), { code: 'EIO' })));
+          sync(fd, callback);
+        };
+        syncBuiltinESMExports();
+        const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+        const { measureOperation } = await import(${JSON.stringify(operations)});
+        const recording = initializeOperationRecording(), writer = recording.writers.get(recording.executionId);
+        measureOperation({ category: 'cpu', name: 'runtime.before-failed-close' }, () => {});
+        armed = true;
+        await assert.rejects(writer.close(), error => {
+          if (${failFlush}) {
+            assert.ok(error instanceof AggregateError);
+            assert.match(error.errors[0].message, /persistence did not complete/);
+            assert.equal(error.errors[1], closeFailure, 'The original flush failure precedes the independent close failure.');
+          } else assert.equal(error, closeFailure);
+          return true;
+        });
+        const health = JSON.parse(fs.readFileSync(${JSON.stringify(directory)} + '/' + recording.executionId + '.health.json', 'utf8'));
+        assert.equal(health.closed, true, 'Final health publication still runs when descriptor closure fails.');
+        assert.ok(health.failed >= ${failFlush ? 2 : 1});
+        await assert.rejects(recording.flush(), /persistence did not complete/, 'Later flushes cannot erase a finalization failure.');
+        await assert.rejects(recording.close(), /did not close cleanly/);
+      `)
+      assert.equal(recordings[0].health.closed, true)
+      assert.ok(recordings[0].health.failed >= (failFlush ? 2 : 1))
+      assert.equal(recordings[0].events.filter(event => event.name === 'runtime.before-failed-close').length, 2)
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  }
 })
 
 test('a closed renderer journal rejects late imports without acknowledging dropped records', async () => {
@@ -559,5 +667,552 @@ test('sandbox blocks external transports before construction, permits loopback f
     assert.equal(recordings[0].health.closed, true)
     assert.equal(recordings[0].health.failed, 0)
     assert.equal(recordings[0].health.pending, 0)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('pressure batches use bounded asynchronous writes and flush waits for the earlier prefix', { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-recorder-async-pressure-'))
+  try {
+    const recordings = await execute(directory, `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const open = fs.openSync, write = fs.write, writeSync = fs.writeSync;
+      let journalFD, armed = false, synchronousWrites = 0;
+      const held = [];
+      fs.openSync = (path, ...args) => { const fd = open(path, ...args); if (String(path).endsWith('.jsonl.brj')) journalFD = fd; return fd };
+      fs.writeSync = (fd, ...args) => { if (armed && fd === journalFD) synchronousWrites++; return writeSync(fd, ...args) };
+      fs.write = (fd, buffer, offset, length, position, callback) => {
+        if (armed && fd === journalFD) held.push({ fd, buffer, offset, length, position, callback });
+        else write(fd, buffer, offset, length, position, callback);
+      };
+      syncBuiltinESMExports();
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      const { measureOperation } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording();
+      const emit = count => measureOperation({ category: 'cpu', name: 'runtime.async-pressure', resource: '界'.repeat(256), attributes: { count } }, () => {});
+      armed = true;
+      let count = 0;
+      while (held.length < 4 && count < 5000) emit(count++);
+      assert.equal(held.length, 4, 'Normal pressure starts four independent bounded asynchronous batches.');
+      assert.equal(synchronousWrites, 0, 'The ordinary 256 KiB trigger does not synchronously write the journal.');
+      while (!synchronousWrites && count < 6000) emit(count++);
+      assert.ok(synchronousWrites > 0, 'Synchronous backpressure is explicit only after the job bound is saturated.');
+      assert.equal(held.length, 4, 'Saturation never grows the outstanding native write count.');
+      let settled = false;
+      const flushing = recording.flush().then(() => { settled = true });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(settled, false, 'The event loop can run while the flush waits.');
+      const before = recording.health();
+      assert.ok(before.persisted > 0, 'Newer overload batches completed synchronously.');
+      assert.equal(before.durableRecords, 0, 'Later persisted batches cannot prove the earlier prefix durable.');
+      const later = held.at(-1).buffer;
+      const release = async item => new Promise((resolve, reject) => {
+        write(item.fd, item.buffer, item.offset, Math.min(item.length, 1024), item.position, (error, size) => {
+          item.callback(error, size);
+          if (error) reject(error); else resolve();
+        });
+      });
+      while (held.some(item => item.buffer === later)) {
+        const index = held.findIndex(item => item.buffer === later);
+        await release(held.splice(index, 1)[0]);
+      }
+      assert.ok(recording.health().persisted > before.persisted, 'A later batch actually completed first.');
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(settled, false, 'The earlier in-flight batches still hold the durability barrier.');
+      assert.equal(recording.health().durableRecords, 0);
+      while (held.length) await release(held.shift());
+      await flushing;
+      armed = false;
+      await recording.close();
+    `)
+    const { events, health } = recordings[0]
+    assert.deepEqual(events.map(event => event.sequence), Array.from({ length: events.length }, (_, index) => index + 1))
+    assert.equal(health.recorded, events.length)
+    assert.equal(health.persisted, events.length)
+    assert.equal(health.durableRecords, events.length)
+    assert.equal(health.failed, 0)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('a reentrant sequence hole spills excess admissions to disk without dropping or reordering', { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-recorder-spill-'))
+  try {
+    const recordings = await execute(directory, `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const open = fs.openSync, write = fs.writeSync, read = fs.readSync, spillFDs = new Set(), indexFDs = new Set();
+      let spillWrites = 0;
+      fs.openSync = (path, ...args) => { const fd = open(path, ...args); if (String(path).includes('.spill')) spillFDs.add(fd); if (String(path).endsWith('.spill.index')) indexFDs.add(fd); return fd };
+      fs.writeSync = (fd, ...args) => { if (spillFDs.has(fd)) spillWrites++; return write(fd, ...args) };
+      fs.readSync = (fd, buffer, offset, length, position) => read(fd, buffer, offset, indexFDs.has(fd) ? Math.min(length, 5) : length, position);
+      syncBuiltinESMExports();
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      const { measureOperation } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording(), writer = recording.writers.get(recording.executionId), enqueue = writer.enqueue;
+      let interrupted = false, pending;
+      writer.enqueue = entry => {
+        if (!interrupted && entry.name === 'runtime.spill-hole' && entry.phase === 'end') {
+          interrupted = true;
+          for (let count = 0; count < 2600; count++) measureOperation({ category: 'cpu', name: 'runtime.spilled', resource: '界'.repeat(256), attributes: { count } }, () => {});
+          assert.ok(spillWrites > 0, 'The bounded memory queue switches to a synchronous on-disk spill.');
+          pending = recording.flush();
+        }
+        return enqueue(entry);
+      };
+      measureOperation({ category: 'cpu', name: 'runtime.spill-hole' }, () => {});
+      await pending;
+      await recording.close();
+      assert.equal(fs.readdirSync(${JSON.stringify(directory)}).some(file => file.includes('.spill')), false, 'Drained spill files are removed.');
+    `)
+    const { events, health } = recordings[0]
+    assert.deepEqual(events.map(event => event.sequence), Array.from({ length: events.length }, (_, index) => index + 1))
+    assert.deepEqual(events.filter(event => event.name === 'runtime.spilled' && event.phase === 'end').map(event => event.attributes.count), Array.from({ length: 2600 }, (_, index) => index))
+    assert.equal(health.recorded, events.length)
+    assert.equal(health.persisted, events.length)
+    assert.equal(health.durableRecords, events.length)
+    assert.equal(health.failed, 0)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('renderer ACK waits for health publication and a newer synchronous failure cannot be overwritten', { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-recorder-health-barrier-'))
+  try {
+    const recordings = await execute(directory, `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const writeFile = fs.writeFile, open = fs.open, close = fs.close, sync = fs.fdatasync, held = [], syncHeld = [], healthFDs = new Set();
+      let armed = false, holdSync = false;
+      fs.open = (path, ...args) => {
+        const callback = args.pop();
+        open(path, ...args, (error, fd) => { if (!error && String(path).endsWith('.health.json')) healthFDs.add(fd); callback(error, fd) });
+      };
+      fs.close = (fd, callback) => { healthFDs.delete(fd); close(fd, callback) };
+      fs.fdatasync = (fd, callback) => {
+        if (holdSync && healthFDs.has(fd)) { holdSync = false; syncHeld.push(() => sync(fd, callback)) }
+        else sync(fd, callback);
+      };
+      fs.writeFile = (path, ...args) => {
+        if (armed && String(path).endsWith('.health.json')) held.push(() => writeFile(path, ...args));
+        else writeFile(path, ...args);
+      };
+      syncBuiltinESMExports();
+      const { initializeOperationRecording, registerOperationParticipant, claimExternalOperationParticipant, flushExternalOperationSource, markExternalOperationSourceIncomplete } = await import(${JSON.stringify(runtime)});
+      const { importOperationEvents, withOperationSuppressed } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording();
+      const identity = name => claimExternalOperationParticipant(registerOperationParticipant('renderer').id, name);
+      const admit = source => {
+        const base = { schemaVersion: 2, ...source, id: source.executionId + ':1', traceId: source.executionId + ':1', category: 'cpu', name: 'renderer.barrier', startedAt: Date.now(), attributes: {} };
+        assert.equal(importOperationEvents([{ ...base, sequence: 1, phase: 'start', durationMS: 0, status: 'running' }, { ...base, sequence: 2, phase: 'end', durationMS: 1, status: 'ok' }]).accepted, 2);
+      };
+      const untilHeld = async () => { while (!held.length) await new Promise(resolve => setImmediate(resolve)) };
+      const readHealth = source => withOperationSuppressed(() => JSON.parse(fs.readFileSync(${JSON.stringify(directory)} + '/' + source.executionId + '.health.json', 'utf8')));
+      const first = identity('renderer-async-health-ok'); admit(first); armed = true; holdSync = true;
+      let acknowledged = false;
+      const ack = flushExternalOperationSource(first.executionId).then(() => { acknowledged = true });
+      await untilHeld();
+      let frame = false; await new Promise(resolve => setImmediate(() => { frame = true; resolve() }));
+      assert.equal(frame, true); assert.equal(acknowledged, false, 'ACK waits while health I/O is held.');
+      assert.equal(recording.writers.get(first.executionId).health().durableRecords, 2, 'Journal sync completed before health publication.');
+      assert.equal(readHealth(first).durableRecords, 0, 'The old health proof remains until atomic publication.');
+      held.shift()();
+      while (!syncHeld.length) await new Promise(resolve => setImmediate(resolve));
+      assert.equal(acknowledged, false, 'ACK also waits for the health file durability barrier.');
+      assert.equal(readHealth(first).durableRecords, 0);
+      syncHeld.shift()(); await ack;
+      assert.equal(readHealth(first).durableRecords, 2);
+      armed = false;
+      const second = identity('renderer-async-health-stale'); admit(second); armed = true;
+      const stale = flushExternalOperationSource(second.executionId);
+      await untilHeld();
+      markExternalOperationSourceIncomplete(second.executionId, 'injected-terminal-failure', 3);
+      const newer = readHealth(second);
+      assert.equal(newer.sourceFailures, 1); assert.equal(newer.omittedRecords, 3);
+      held.shift()();
+      await assert.rejects(stale, /did not complete/);
+      const final = readHealth(second);
+      assert.equal(final.sourceFailures, 1); assert.equal(final.omittedRecords, 3);
+      assert.equal(final.durableRecords, 2);
+      armed = false;
+      await assert.rejects(recording.close(), /did not close cleanly/);
+      assert.equal(fs.readdirSync(${JSON.stringify(directory)}).some(file => file.startsWith('.tmp-')), false, 'Superseded temporary health files are removed.');
+    `)
+    const good = recordings.find(value => value.health.executionId === 'renderer-async-health-ok')
+    const bad = recordings.find(value => value.health.executionId === 'renderer-async-health-stale')
+    assert.equal(good.events.length, 2)
+    assert.equal(good.health.durableRecords, 2)
+    assert.equal(bad.events.length, 2)
+    assert.equal(bad.health.sourceFailures, 1)
+    assert.equal(bad.health.omittedRecords, 3)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('forced process exit synchronously drains held journal writes and supersedes a pending health publication', { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-recorder-exit-drain-'))
+  try {
+    const recordings = await execute(directory, `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const open = fs.openSync, write = fs.write, writeFile = fs.writeFile;
+      let journalFD, holdJournal = false, holdHealth = false, healthStarted, journalStarted;
+      const healthPending = new Promise(resolve => { healthStarted = resolve });
+      const journalPending = new Promise(resolve => { journalStarted = resolve });
+      fs.openSync = (path, ...args) => { const fd = open(path, ...args); if (String(path).endsWith('.jsonl.brj')) journalFD = fd; return fd };
+      fs.write = (fd, buffer, offset, length, position, callback) => {
+        if (holdJournal && fd === journalFD) {
+          holdJournal = false;
+          write(fd, buffer, offset, Math.min(length, 1024), position, (error, size) => { assert.ifError(error); assert.ok(size > 0); journalStarted() });
+        } else write(fd, buffer, offset, length, position, callback);
+      };
+      fs.writeFile = (path, ...args) => {
+        if (holdHealth && String(path).endsWith('.health.json')) {
+          holdHealth = false; args.pop();
+          writeFile(path, ...args, error => { assert.ifError(error); healthStarted() });
+        } else writeFile(path, ...args);
+      };
+      syncBuiltinESMExports();
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      const { measureOperation } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording();
+      measureOperation({ category: 'cpu', name: 'runtime.before-exit-health' }, () => {});
+      holdHealth = true;
+      void recording.flush();
+      await healthPending;
+      holdJournal = true;
+      for (let count = 0; count < 500; count++) measureOperation({ category: 'cpu', name: 'runtime.exit-drain', resource: '界'.repeat(256), attributes: { count } }, () => {});
+      await journalPending;
+      await new Promise(resolve => setImmediate(resolve));
+      process.exit(0);
+    `)
+    const { events, health } = recordings[0]
+    assert.deepEqual(events.map(event => event.sequence), Array.from({ length: events.length }, (_, index) => index + 1))
+    assert.equal(events.filter(event => event.name === 'runtime.exit-drain' && event.phase === 'end').length, 500)
+    assert.equal(health.recorded, events.length)
+    assert.equal(health.persisted, events.length)
+    assert.equal(health.durableRecords, events.length)
+    assert.equal(health.failed, 0)
+    assert.equal((await readdir(directory)).some(file => file.startsWith('.tmp-')), false)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('asynchronous write failure or zero progress fails durability without inventing persisted records', async () => {
+  for (const mode of ['error', 'zero']) {
+    const directory = await mkdtemp(join(tmpdir(), 'perp-recorder-write-failure-'))
+    try {
+      const recordings = await execute(directory, `
+        import assert from 'node:assert/strict';
+        import fs from 'node:fs';
+        import { syncBuiltinESMExports } from 'node:module';
+        const open = fs.openSync, write = fs.write;
+        let journalFD, armed = false;
+        fs.openSync = (path, ...args) => { const fd = open(path, ...args); if (String(path).endsWith('.jsonl.brj')) journalFD = fd; return fd };
+        fs.write = (fd, buffer, offset, length, position, callback) => {
+          if (armed && fd === journalFD) {
+            armed = false;
+            queueMicrotask(() => ${JSON.stringify(mode)} === 'error' ? callback(Object.assign(new Error('Injected journal failure'), { code: 'ENOSPC' })) : callback(null, 0, buffer));
+          } else write(fd, buffer, offset, length, position, callback);
+        };
+        syncBuiltinESMExports();
+        const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+        const { measureOperation } = await import(${JSON.stringify(operations)});
+        const recording = initializeOperationRecording();
+        measureOperation({ category: 'cpu', name: 'runtime.failed-write' }, () => {});
+        armed = true;
+        await assert.rejects(recording.flush(), /did not complete/);
+        assert.equal(recording.health().failed, 1);
+        assert.equal(recording.health().persisted, 0);
+        assert.equal(recording.health().durableRecords, 0);
+        await assert.rejects(recording.close(), /did not close cleanly/);
+        assert.equal(recording.health().closed, true);
+      `)
+      assert.equal(recordings[0].events.length, 0)
+      assert.ok(recordings[0].health.recorded >= 2)
+      assert.equal(recordings[0].health.persisted, 0)
+      assert.equal(recordings[0].health.durableRecords, 0)
+      assert.equal(recordings[0].health.pending, recordings[0].health.recorded)
+      assert.equal(recordings[0].health.failed, 1)
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  }
+})
+
+test('reentrant terminal health publication during atomic rename is repaired before returning', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-recorder-health-reentry-'))
+  try {
+    const recordings = await execute(directory, `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const rename = fs.renameSync;
+      let armed = false, reenter;
+      fs.renameSync = (from, to) => {
+        if (armed && String(to).endsWith('.health.json')) { armed = false; reenter() }
+        return rename(from, to);
+      };
+      syncBuiltinESMExports();
+      const { initializeOperationRecording, registerOperationParticipant, claimExternalOperationParticipant, flushExternalOperationSource, markExternalOperationSourceIncomplete } = await import(${JSON.stringify(runtime)});
+      const { importOperationEvents, withOperationSuppressed } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording(), source = claimExternalOperationParticipant(registerOperationParticipant('renderer').id, 'renderer-health-reentry');
+      const base = { schemaVersion: 2, ...source, id: source.executionId + ':1', traceId: source.executionId + ':1', category: 'cpu', name: 'renderer.reentry', startedAt: Date.now(), attributes: {} };
+      assert.equal(importOperationEvents([{ ...base, sequence: 1, phase: 'start', durationMS: 0, status: 'running' }, { ...base, sequence: 2, phase: 'end', durationMS: 1, status: 'ok' }]).accepted, 2);
+      reenter = () => markExternalOperationSourceIncomplete(source.executionId, 'reentrant-terminal', 1);
+      armed = true;
+      await assert.rejects(flushExternalOperationSource(source.executionId), /did not complete/);
+      const health = withOperationSuppressed(() => JSON.parse(fs.readFileSync(${JSON.stringify(directory)} + '/' + source.executionId + '.health.json', 'utf8')));
+      assert.equal(health.sourceFailures, 1); assert.equal(health.omittedRecords, 1); assert.equal(health.durableRecords, 2);
+      await assert.rejects(recording.close(), /did not close cleanly/);
+    `)
+    const health = recordings.find(value => value.health.executionId === 'renderer-health-reentry').health
+    assert.equal(health.sourceFailures, 1)
+    assert.equal(health.omittedRecords, 1)
+    assert.equal(health.closed, true)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('concurrent flush requests coalesce behind one active barrier and retain the latest target', { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-recorder-flush-coalesce-'))
+  try {
+    const recordings = await execute(directory, `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const open = fs.openSync, sync = fs.fdatasync;
+      let journalFD, release, started, armed = false, journalSyncs = 0;
+      const entered = new Promise(resolve => { started = resolve });
+      fs.openSync = (path, ...args) => { const fd = open(path, ...args); if (String(path).endsWith('.jsonl.brj')) journalFD = fd; return fd };
+      fs.fdatasync = (fd, callback) => {
+        if (fd === journalFD) journalSyncs++;
+        if (armed && fd === journalFD) { armed = false; release = () => sync(fd, callback); started() }
+        else sync(fd, callback);
+      };
+      syncBuiltinESMExports();
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      const { measureOperation } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording(), writer = recording.writers.get(recording.executionId);
+      measureOperation({ category: 'cpu', name: 'runtime.coalesce-first' }, () => {});
+      armed = true;
+      const first = writer.flush();
+      await entered;
+      const requests = [writer.flush()];
+      measureOperation({ category: 'cpu', name: 'runtime.coalesce-later' }, () => {});
+      for (let i = 0; i < 1000; i++) requests.push(writer.flush());
+      assert.equal(new Set(requests).size, 1, 'Pending requests share one bounded successor job.');
+      release();
+      await Promise.all([first, ...requests]);
+      assert.equal(writer.health().durableRecords, writer.health().recorded, 'The shared barrier includes the newest requested records.');
+      assert.equal(journalSyncs, 2, 'One successor synchronizes all queued targets.');
+      await recording.close();
+    `)
+    const { events, health } = recordings[0]
+    assert.equal(events.filter(event => event.name === 'runtime.coalesce-first' && event.phase === 'end').length, 1)
+    assert.equal(events.filter(event => event.name === 'runtime.coalesce-later' && event.phase === 'end').length, 1)
+    assert.equal(health.recorded, events.length)
+    assert.equal(health.durableRecords, events.length)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('a failed admission during a reentrant flush cannot create a false durable count', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-recorder-failed-target-'))
+  try {
+    const recordings = await execute(directory, `
+      import assert from 'node:assert/strict';
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      const { measureOperation } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording(), stringify = JSON.stringify;
+      let pending;
+      JSON.stringify = (value, ...args) => {
+        if (value?.name === 'runtime.failed-flush-target' && value.phase === 'end') {
+          pending = recording.flush();
+          throw new Error('Injected admission failure');
+        }
+        return stringify(value, ...args);
+      };
+      measureOperation({ category: 'cpu', name: 'runtime.failed-flush-target' }, () => {});
+      JSON.stringify = stringify;
+      await assert.rejects(pending, /did not complete/);
+      const health = recording.health();
+      assert.ok(health.durableRecords <= health.persisted);
+      assert.ok(health.durableRecords <= health.recorded);
+      await assert.rejects(recording.close(), /did not close cleanly/);
+    `)
+    const health = recordings[0].health
+    assert.ok(health.durableRecords <= health.persisted)
+    assert.ok(health.durableRecords <= health.recorded)
+    assert.equal(health.failed, 1)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('forced exit during orderly close still drains records admitted during the first flush', { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-recorder-exit-during-close-'))
+  try {
+    const recordings = await execute(directory, `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const open = fs.openSync, sync = fs.fdatasync, write = fs.write;
+      let journalFD, holdSync = true, releaseSync, syncEntered, holdWrite = false, writeEntered;
+      const syncPending = new Promise(resolve => { syncEntered = resolve });
+      const writePending = new Promise(resolve => { writeEntered = resolve });
+      fs.openSync = (path, ...args) => { const fd = open(path, ...args); if (String(path).endsWith('.jsonl.brj')) journalFD = fd; return fd };
+      fs.fdatasync = (fd, callback) => {
+        if (fd === journalFD && holdSync) { holdSync = false; releaseSync = () => sync(fd, callback); syncEntered() }
+        else sync(fd, callback);
+      };
+      fs.write = (fd, buffer, offset, length, position, callback) => {
+        if (fd === journalFD && holdWrite) { holdWrite = false; writeEntered() }
+        else write(fd, buffer, offset, length, position, callback);
+      };
+      syncBuiltinESMExports();
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      const { measureOperation } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording();
+      measureOperation({ category: 'cpu', name: 'runtime.before-close' }, () => {});
+      void recording.close();
+      await syncPending;
+      measureOperation({ category: 'cpu', name: 'runtime.during-close-flush' }, () => {});
+      holdWrite = true;
+      releaseSync();
+      await writePending;
+      process.exit(0);
+    `)
+    const { events, health } = recordings[0]
+    assert.deepEqual(events.filter(event => event.name === 'runtime.during-close-flush').map(event => event.phase), ['start', 'end'])
+    assert.equal(health.recorded, events.length)
+    assert.equal(health.persisted, events.length)
+    assert.equal(health.durableRecords, events.length)
+    assert.equal(health.failed, 0)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('terminal handoff joins a late native callback before descriptor closure without double counting', { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-recorder-exit-callback-'))
+  try {
+    const recordings = await execute(directory, `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const open = fs.openSync, write = fs.write;
+      let journalFD, hold = false, pending;
+      fs.openSync = (path, ...args) => { const fd = open(path, ...args); if (String(path).endsWith('.jsonl.brj')) journalFD = fd; return fd };
+      fs.write = (fd, buffer, offset, length, position, callback) => {
+        if (hold && fd === journalFD) { hold = false; pending = () => write(fd, buffer, offset, length, position, callback) }
+        else write(fd, buffer, offset, length, position, callback);
+      };
+      syncBuiltinESMExports();
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      const { measureOperation } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording(), writer = recording.writers.get(recording.executionId);
+      hold = true;
+      let count = 0;
+      while (!pending && count < 1000) measureOperation({ category: 'cpu', name: 'runtime.exit-callback', resource: '界'.repeat(256), attributes: { count: count++ } }, () => {});
+      assert.ok(pending);
+      writer.exit();
+      const before = writer.health();
+      assert.equal(before.recorded, before.persisted);
+      assert.equal(before.persisted, before.durableRecords);
+      let finished = false;
+      const closing = writer.close().then(() => { finished = true });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(finished, false, 'The descriptor remains open until the native write callback returns.');
+      pending();
+      await closing;
+      const after = writer.health();
+      assert.equal(after.persisted, before.persisted, 'The late callback cannot count the terminal handoff twice.');
+      assert.equal(after.durableRecords, before.durableRecords);
+      await recording.close();
+    `)
+    const { events, health } = recordings[0]
+    assert.equal(health.recorded, events.length)
+    assert.equal(health.persisted, events.length)
+    assert.equal(health.durableRecords, events.length)
+    assert.equal(health.failed, 0)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('terminal handoff with an unfillable sequence hole reports failure and does not hang close', { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-recorder-exit-hole-'))
+  try {
+    const recordings = await execute(directory, `
+      import assert from 'node:assert/strict';
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      const recording = initializeOperationRecording(), writer = recording.writers.get(recording.executionId);
+      writer.enqueue({ sequence: 2, phase: 'start', name: 'runtime.missing-prefix' });
+      writer.exit(); writer.exit();
+      assert.equal(writer.health().sourceFailures, 1);
+      assert.equal(writer.health().omittedRecords, 1);
+      assert.equal(writer.health().durableRecords, 0);
+      await assert.rejects(writer.close(), /did not complete/);
+      await assert.rejects(recording.close(), /did not close cleanly/);
+    `)
+    assert.equal(recordings[0].events.length, 0)
+    assert.equal(recordings[0].health.recorded, 1)
+    assert.equal(recordings[0].health.sourceFailures, 1)
+    assert.equal(recordings[0].health.omittedRecords, 1)
+    assert.equal(recordings[0].health.durableRecords, 0)
+    assert.equal(recordings[0].health.closed, true)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('forced exit reentrant inside health rename publishes the terminal durable proof immediately', { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-recorder-exit-health-rename-'))
+  try {
+    const recordings = await execute(directory, `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const rename = fs.renameSync;
+      let armed = false;
+      fs.renameSync = (from, to) => {
+        if (armed && String(to).endsWith('.health.json')) { armed = false; process.exit(0) }
+        return rename(from, to);
+      };
+      syncBuiltinESMExports();
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      const { measureOperation } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording();
+      measureOperation({ category: 'cpu', name: 'runtime.exit-in-health-rename' }, () => {});
+      armed = true;
+      await recording.flush();
+      throw new Error('The armed terminal interrupt did not fire.');
+    `)
+    const { events, health } = recordings[0]
+    assert.deepEqual(events.filter(event => event.name === 'runtime.exit-in-health-rename').map(event => event.phase), ['start', 'end'])
+    assert.equal(health.recorded, events.length)
+    assert.equal(health.persisted, events.length)
+    assert.equal(health.durableRecords, events.length)
+    assert.equal(health.failed, 0)
+    assert.equal((await readdir(directory)).some(file => file.startsWith('.tmp-')), false)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('failed health temporary cleanup remains bounded and permanently fails subsequent flushes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'perp-recorder-health-cleanup-'))
+  try {
+    await execute(directory, `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const writeFile = fs.writeFile, unlink = fs.unlink;
+      let armed = false, healthCreations = 0;
+      fs.writeFile = (path, ...args) => { if (armed && String(path).endsWith('.health.json')) healthCreations++; return writeFile(path, ...args) };
+      fs.unlink = (path, callback) => {
+        if (armed && String(path).endsWith('.health.json')) queueMicrotask(() => callback(Object.assign(new Error('Injected cleanup failure'), { code: 'EACCES' })));
+        else unlink(path, callback);
+      };
+      syncBuiltinESMExports();
+      const { initializeOperationRecording } = await import(${JSON.stringify(runtime)});
+      const { measureOperation } = await import(${JSON.stringify(operations)});
+      const recording = initializeOperationRecording(), writer = recording.writers.get(recording.executionId);
+      measureOperation({ category: 'cpu', name: 'runtime.health-cleanup' }, () => {});
+      armed = true;
+      await assert.rejects(writer.flush(), /Injected cleanup failure/);
+      for (let index = 0; index < 5; index++) await assert.rejects(writer.flush(), /Injected cleanup failure/);
+      assert.equal(healthCreations, 1, 'A blocked cleanup cannot grow a queue of temporary snapshots.');
+      assert.ok(writer.health().failed >= 1);
+      await assert.rejects(recording.close(), /did not close cleanly/);
+      assert.equal(writer.health().closed, true);
+      assert.equal(healthCreations, 1);
+    `)
   } finally { await rm(directory, { recursive: true, force: true }) }
 })

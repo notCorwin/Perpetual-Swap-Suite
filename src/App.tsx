@@ -187,7 +187,7 @@ function App() {
       <header className="flex flex-col">
         <div data-sidebar-toolbar data-window-toolbar data-window-drag-region data-native-window-controls-row className="flex items-center gap-3 border-b px-4"><h1 className="min-w-0 flex-1 truncate text-sm font-medium">Perpetual Swap Suite</h1><a ref={settingsLauncher} href={settingsHref('workspace')} aria-label="Settings" title="Settings" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}><Settings2 aria-hidden="true" /></a></div>
         <div className="flex flex-col gap-4 border-b p-4">
-        <Input aria-label="Search contracts" placeholder="Search contracts…" value={query} onChange={event => setQuery(event.target.value)} />
+        <Input aria-label="Search contracts" placeholder="Search contracts…" spellCheck={false} autoCorrect="off" autoCapitalize="off" autoComplete="off" value={query} onChange={event => setQuery(event.target.value)} />
         <div className="flex min-h-5 min-w-0 items-start justify-between gap-3 text-xs leading-5 text-muted-foreground"><span className="shrink-0">{query.trim() ? `${visible.length} / ${rows.length}` : rows.length} contracts</span><span data-market-status role={marketProblem ? 'alert' : marketStatus ? 'status' : undefined} className={cn('min-w-0 break-words text-left', (marketProblem || connectionProblem) && 'text-destructive')} title={marketStatusDetail || undefined} aria-label={marketStatusDetail || undefined}>{marketStatus || (updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data')}</span></div>
         </div>
       </header>

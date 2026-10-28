@@ -42,6 +42,7 @@ function validateComparisonBuildProvenance(report, label) {
 }
 
 export function validateMarketTrafficReport(report, label, { baseline = false } = {}) {
+  assert.notEqual(report?.diagnosticOnly, true, `${label} diagnostic profiling cannot satisfy traffic acceptance or serve as a comparison baseline.`)
   const foreground = report.mode === foregroundMode
   assert.ok(foreground || report.mode === hiddenMode, `${label} is not the deterministic loopback market benchmark.`)
   assert.equal(report.runtime?.network, 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1', `${label} must be loopback-only.`)

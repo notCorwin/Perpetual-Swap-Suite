@@ -147,12 +147,17 @@ export async function initializeOperationTelemetry(host: TelemetryHost = {
       return { id, context: operation.context }
     },
     endRequest(id, status) { requests.get(id)?.end({ status }); requests.delete(id) },
-    receive(channel, detail, context) {
+    receive(channel, detail, context, decode) {
       if (stopped) return
       runWithOperationContext(context, () => {
         const operation = beginOperation({ category: 'ipc', name: 'desktop.notification.receive', resource: channel })
-        try { operation.run(() => window.dispatchEvent(new CustomEvent(channel.replace(':', '-'), { detail }))) }
-        finally { operation.end() }
+        try {
+          operation.run(() => window.dispatchEvent(new CustomEvent(channel.replace(':', '-'), { detail: decode ? decode(detail) : detail })))
+          operation.end()
+        } catch (error) {
+          operation.end({ status: 'error', attributes: { errorName: error instanceof Error ? error.name : 'Error' } })
+          throw error
+        }
       })
     },
     flush: detachRequests,

@@ -18,17 +18,18 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
     page.on('pageerror', error => pageErrors.push(error.message))
     // Withhold chart delivery before the first fixture frame can be ingested.
     // This keeps list behavior observable without allowing a chart surface.
-    await electron.evaluate(({ ipcMain, BrowserWindow }) => {
+    await electron.evaluate(async ({ ipcMain, BrowserWindow }) => {
+      const { encodeChartWire, decodeChartWire } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/chart-wire.js')
       const contents = BrowserWindow.getAllWindows()[0].webContents
       const original = ipcMain._invokeHandlers.get('radar:request'), originalSend = contents.send
       const gate = globalThis.__prerenderGate = { original, originalSend, contents, held: true, suppressedReads: 0, suppressedPushes: 0, event: null }
       ipcMain.removeHandler('radar:request')
-      ipcMain.handle('radar:request', async (event, value) => {
+      ipcMain.handle('radar:request', async (event, value, context) => {
         gate.event = event
-        const response = await original(event, value)
+        const response = await original(event, value, context)
         if (!gate.held) return response
-        if (value.chartUniverse) { gate.suppressedReads += 1; return { ...response, frames: [] } }
-        if (value.chartLocal || value.chartHistory || value.chartWindow) { gate.suppressedReads += 1; return null }
+        if (value.chartUniverse) { gate.suppressedReads += 1; return encodeChartWire({ ...decodeChartWire(response), frames: [] }) }
+        if (value.chartLocal || value.chartHistory || value.chartWindow) { gate.suppressedReads += 1; return encodeChartWire(null) }
         return response
       })
       contents.send = function (channel, ...args) {
@@ -37,8 +38,8 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
       }
       gate.release = async () => {
         gate.held = false
-        const { frames } = await original(gate.event, { chartUniverse: {} })
-        for (const frame of frames) originalSend.call(contents, 'radar:chart-prepared', frame)
+        const { frames } = decodeChartWire(await original(gate.event, { chartUniverse: {} }))
+        for (const frame of frames) originalSend.call(contents, 'radar:chart-prepared', encodeChartWire(frame))
       }
     })
     const fixture = await page.evaluate(() => window.radarDesktop.request({ e2e: { action: 'seedInstrumentNavigationBenchmark' } }))
@@ -208,8 +209,9 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
     // turn. The current SVG node must show that frame at the next animation frame.
     const liveTarget = target
     const liveFrame = await electron.evaluate(async (_electron, instId) => {
+      const { decodeChartWire } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/chart-wire.js')
       const gate = globalThis.__prerenderGate
-      const { frames } = await gate.original(gate.event, { chartUniverse: {} })
+      const { frames } = decodeChartWire(await gate.original(gate.event, { chartUniverse: {} }))
       const frame = frames.find(value => value.instId === instId && value.timeframe === '15m')
       // Isolate the synthetic input from real backend publications. A newer
       // authoritative frame is allowed to supersede it after this measurement.

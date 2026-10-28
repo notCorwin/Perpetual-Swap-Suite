@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain, session } = require('electron')
 const { mkdirSync, writeFileSync } = require('node:fs')
 const { join } = require('node:path')
 const { startupNavigationProbe } = require('./instrument-navigation-acceptance.mjs')
+const { encodeChartWire, decodeChartWire } = require('../electron/chart-wire.js')
 
 // Loaded with Electron's -r before the unchanged production entry point. Its
 // session preload measures the first document rather than a renderer reload.
@@ -15,20 +16,20 @@ writeFileSync(preload, `require('electron').contextBridge.executeInMainWorld({ f
 
 const handle = ipcMain.handle.bind(ipcMain)
 const probe = globalThis.__navigationStartupRequests = { requests: [], rendererFrames: new Set() }
-ipcMain.handle = (channel, handler) => handle(channel, channel !== 'radar:request' ? handler : async (event, value) => {
+ipcMain.handle = (channel, handler) => handle(channel, channel !== 'radar:request' ? handler : async (event, value, context) => {
   const kind = ['chartUniverse', 'chartFocus', 'chartLocal', 'chartWindow', 'chartHistory'].find(kind => value[kind])
   if (kind) probe.requests.push({ kind, ...(kind === 'chartFocus' ? value[kind].target : value[kind]), at: Date.now() })
-  const result = await handler(event, value)
+  const result = await handler(event, value, context)
   // The first-document probe observes the renderer's existing prepared-frame
   // event. Forward the canonical universe response through that same ingress
   // so readiness means the UI received it, while chart geometry stays lazy.
-  if (kind === 'chartUniverse') for (const frame of result.frames ?? []) {
+  if (kind === 'chartUniverse') for (const frame of decodeChartWire(result).frames ?? []) {
     if (frame.bars?.length === 96 && frame.indicatorState === 'ready'
       && ['ready', 'stale'].includes(frame.priceState) && ['ready', 'unavailable'].includes(frame.oiState)
       && ['ready', 'unavailable'].includes(frame.takerState)) {
       const key = `${frame.timeframe}:${frame.instId}`
       if (probe.rendererFrames.has(key)) continue
-      BrowserWindow.getAllWindows()[0]?.webContents.send('radar:chart-prepared', frame)
+      BrowserWindow.getAllWindows()[0]?.webContents.send('radar:chart-prepared', encodeChartWire(frame))
       probe.rendererFrames.add(key)
     }
   }

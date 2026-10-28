@@ -16,7 +16,7 @@ export type ChartView = {
 export type ChartTransport = {
   focus: (target: ChartTarget | null, id: string) => Promise<unknown> | void
   local: (instId: string, timeframe: RadarTimeframe) => Promise<PreparedChartResponse | null>
-  history?: (target: ChartTarget) => Promise<PreparedChartResponse | null>
+  history?: (target: ChartTarget, focusId: string) => Promise<PreparedChartResponse | null>
   universe: () => Promise<{ frames: PreparedChartResponse[] }>
 }
 const targetKey = (target: ChartTarget) => `${target.timeframe}:${target.instId}:${target.end ?? 'latest'}`
@@ -191,9 +191,10 @@ export class ChartController {
   private updateFocus(target: ChartTarget | null) {
     this.focusId = `${this.identity}:${++this.focusVersion}`
     const focusId = this.focusId
-    void Promise.resolve().then(() => this.transport.focus(target, focusId)).catch(cause => {
+    const failed = (cause: unknown) => {
       if (this.active && focusId === this.focusId) this.publish({ ...this.view, error: cause instanceof Error ? cause.message : 'Could not declare chart demand.' })
-    })
+    }
+    try { void Promise.resolve(this.transport.focus(target, focusId)).catch(failed) } catch (cause) { queueMicrotask(() => failed(cause)) }
   }
 
   private setTarget(target: ChartTarget, forceFocus = false) {
@@ -313,21 +314,21 @@ export class ChartController {
     this.historyTargets.add(requestKey)
     const admittedAt = this.notificationVersion
     try {
-      const response = await this.transport.history!(target)
+      const response = await this.transport.history!(target, focusId)
       if (response) {
         if ((this.notificationVersions.get(seriesKey(response)) ?? 0) <= admittedAt) this.retainPriceSource(response, focusId)
         const accepted = this.admitDrawable(response) && Boolean(response.bars.length || response.liveBar) && this.store.ingest(this.preservePushedLive(response, admittedAt))
         const meta = this.store.snapshotMeta(target.instId, target.timeframe)
         // A newer compact notification can arrive while this bulk read is in
         // flight. Its revision must not certify older historical observations.
-        if (accepted) this.historyHydrated.set(key, `${response.generation}:${JSON.stringify(response.sourceVersions ?? response.revision)}:${meta?.latestEnd ?? -1}:${this.store.historyEpoch(target.instId, target.timeframe)}:${meta?.indicatorStatus?.inputVersion ?? ''}:${meta?.indicatorStatus?.state ?? ''}`)
+        if (accepted && focusId === this.focusId) this.historyHydrated.set(key, `${response.generation}:${JSON.stringify(response.sourceVersions ?? response.revision)}:${meta?.latestEnd ?? -1}:${this.store.historyEpoch(target.instId, target.timeframe)}:${meta?.indicatorStatus?.inputVersion ?? ''}:${meta?.indicatorStatus?.state ?? ''}`)
         if (this.active) this.commit()
-      } else this.historyHydrated.set(key, watermark)
-      this.historyAttempts.set(key, checkedKey)
+      } else if (focusId === this.focusId) this.historyHydrated.set(key, watermark)
+      if (focusId === this.focusId) this.historyAttempts.set(key, checkedKey)
     } catch {
       // Failed reads wait for changed input or a new viewport. Backend source
       // repair proceeds independently and publishes its own lifecycle.
-      this.historyAttempts.set(key, checkedKey)
+      if (focusId === this.focusId) this.historyAttempts.set(key, checkedKey)
     } finally {
       this.historyTargets.delete(requestKey)
       void this.pump()
@@ -339,6 +340,6 @@ export class ChartController {
 export const chartController = new ChartController({
   focus: (target, id) => window.radarDesktop.request({ chartFocus: { id, target: target ? { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } : null } }),
   local: (instId, timeframe) => window.radarDesktop.request({ chartLocal: { instId, timeframe } }),
-  history: target => window.radarDesktop.request({ chartHistory: { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } }),
+  history: (target, focusId) => window.radarDesktop.request({ chartHistory: { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined, focusId } }),
   universe: () => window.radarDesktop.request({ chartUniverse: {} }),
 })

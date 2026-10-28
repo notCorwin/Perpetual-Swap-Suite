@@ -68,7 +68,7 @@ function chart(value, path) {
   const fields = ['instId', 'timeframe']
   if (path !== 'chartLocal') fields.push('endHour')
   if (path === 'chartWindow') fields.push('historyBars')
-  if (path === 'chartWindow') fields.push('focusId')
+  if (path === 'chartWindow' || path === 'chartHistory') fields.push('focusId')
   record(value, path, fields, ['instId', 'timeframe'])
   const result = { instId: text(value.instId, `${path}.instId`, { maximum: 256 }), timeframe: choice(value.timeframe, `${path}.timeframe`, TIMEFRAMES) }
   optional(result, value, 'historyBars', input => number(input, `${path}.historyBars`, 96, 4_096, true))

@@ -101,10 +101,13 @@ test('an untrusted renderer cannot use the real IPC channel even when supplied w
       for (const url of ['data:text/html,<title>Untrusted renderer</title>', rendererURL]) {
         await attacker.loadURL(url)
         results.push(await attacker.webContents.executeJavaScript(`(async () => {
-          const exposed = typeof window.radarDesktop?.request === 'function'
+          let transport
+          if (!window.radarDesktop) window.radarDesktopBootstrap.connect(value => { transport = value })
+          const desktop = window.radarDesktop ?? transport
+          const exposed = typeof desktop?.request === 'function'
           if (!exposed) return { exposed }
           try {
-            await window.radarDesktop.request({ preferences: { action: 'update', values: { rankingLookback: ${rankingLookback} } } })
+            await desktop.request({ preferences: { action: 'update', values: { rankingLookback: ${rankingLookback} } } })
             return { exposed, accepted: true }
           } catch (error) { return { exposed, accepted: false, error: error.message } }
         })()`))

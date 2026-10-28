@@ -12,7 +12,7 @@ import { type AnalysisDirection } from '@/chart-analysis'
 import { chartCaptureBounds } from '@/chart-capture'
 import { CHART_PANELS, chartContentClip, chartPanelClip, chartPriceLabelLayout, type ChartPanel as Panel } from "@/chart-layout"
 import { chartCompact as compact, chartPrice as price, chartPercent, type ChartGeometry } from "@/chart-geometry"
-import { chartRsiNavigationTarget, chartWheelContentOffset, createChartWheelBatch } from '@/chart-navigation'
+import { chartRsiNavigationTarget, chartWheelContentOffset, createChartWheelBatch, createChartWheelScheduler } from '@/chart-navigation'
 import { chartStatisticsSamples } from '@/chart-legend'
 import { RSI_FIELDS, type RsiField } from '@/rsi-crossings'
 import { cn } from "@/lib/utils"
@@ -336,7 +336,11 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
   const captureStatus = capture.status
   const wheelBatch = useRef(createChartWheelBatch())
   const wheelRemainder = useRef(0)
-  const wheelFrame = useRef<number | null>(null)
+  const [wheelScheduler] = useState(() => createChartWheelScheduler({
+    queueMicrotask: callback => queueMicrotask(callback),
+    requestFrame: callback => window.requestAnimationFrame(callback),
+    cancelFrame: handle => window.cancelAnimationFrame(handle),
+  }))
   const [wheelFraction, setWheelFraction] = useState(0)
   const [wheelOwner, setWheelOwner] = useState<{ session: object; instId: string; timeframe: RadarTimeframe; generation: number } | null>(null)
   const wheelOwnerRef = useRef<typeof wheelOwner>(null)
@@ -354,11 +358,10 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
     navigationTask.current = null
     wheelBatch.current.reset()
     wheelRemainder.current = 0
-    if (wheelFrame.current !== null) window.cancelAnimationFrame(wheelFrame.current)
-    wheelFrame.current = null
+    wheelScheduler.cancel()
     wheelOwnerRef.current = null
     releaseInspection()
-  }, [isActive, instId, timeframe, releaseInspection])
+  }, [isActive, instId, timeframe, releaseInspection, wheelScheduler])
   useLayoutEffect(() => {
     const element = chartRef.current
     if (element) {
@@ -366,11 +369,11 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
       Object.defineProperty(element, '__chartRenderedBars', { configurable: true, value: bars })
     }
   }, [surface, bars])
-  useEffect(() => () => {
-    if (wheelFrame.current !== null) window.cancelAnimationFrame(wheelFrame.current)
+  useLayoutEffect(() => () => {
+    wheelScheduler.cancel()
     wheelBatch.current.reset()
     navigationTask.current = null
-  }, [])
+  }, [wheelScheduler])
   useLayoutEffect(() => {
     const element = plotRef.current
     if (!element) return
@@ -434,20 +437,19 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
       wheelOwnerRef.current = owner
       wheelBatch.current.reset()
       wheelRemainder.current = 0
-      if (wheelFrame.current !== null) window.cancelAnimationFrame(wheelFrame.current)
-      wheelFrame.current = null
+      wheelScheduler.cancel()
     }
     wheelBatch.current.add(pixels)
-    if (wheelFrame.current !== null) return
-    wheelFrame.current = window.requestAnimationFrame(() => {
-      wheelFrame.current = null
+    wheelScheduler.schedule(() => {
       const progress = wheelBatch.current.consume(wheelRemainder.current)
       wheelRemainder.current = progress.remainderPixels
-      setWheelFraction(progress.fraction)
-      setWheelOwner(current => current?.session === owner.session && current.instId === owner.instId && current.timeframe === owner.timeframe && current.generation === owner.generation ? current : owner)
-      endInspection()
-      if (progress.steps) chartController.scroll(progress.steps)
-      if (progress.fraction) chartController.prefetchAdjacent(progress.fraction)
+      flushSync(() => {
+        setWheelFraction(progress.fraction)
+        setWheelOwner(current => current?.session === owner.session && current.instId === owner.instId && current.timeframe === owner.timeframe && current.generation === owner.generation ? current : owner)
+        endInspection()
+        if (progress.steps) chartController.scroll(progress.steps)
+      })
+      if (progress.fraction && wheelOwnerRef.current?.session === owner.session) chartController.prefetchAdjacent(progress.fraction)
     })
   }
   const inspectAt = (target: SVGSVGElement, clientX: number) => {

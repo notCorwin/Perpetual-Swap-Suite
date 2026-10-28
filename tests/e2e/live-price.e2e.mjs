@@ -132,7 +132,12 @@ test('native WebSocket prices reach the selected SVG and survive delayed durable
     }
     const heldPrice = await readPrice(), released = await exchange.releaseHistory()
     assert.equal(released, 1, 'The missing 15m parent should be repaired directly without downloading an unselected 5m child.')
-    const repairedParent = await readCandles({ instId: btc, timeframe: '15m', from: exchange.deferredEnd, through: exchange.deferredEnd })
+    // HTTP response completion precedes the backend's durable write. Await the
+    // closed fact through the public read bridge before inspecting its values.
+    const repairedParent = await waitForAsyncCondition(async () => {
+      const rows = await readCandles({ instId: btc, timeframe: '15m', from: exchange.deferredEnd, through: exchange.deferredEnd })
+      return rows.length === 1 && rows[0].confirmed ? rows : null
+    }, { description: 'the durable repaired 15m parent' })
     assert.equal(repairedParent.length, 1)
     assert.equal(repairedParent[0].confirmed, true)
     assert.equal(repairedParent[0].volume, 300, 'Native 15m fallback volume must equal the sum of its three 5m source candles.')
@@ -140,12 +145,6 @@ test('native WebSocket prices reach the selected SVG and survive delayed durable
     assert.equal(repairedParent[0].quoteVolume, 30_000)
     const missingBase = await readCandles({ instId: btc, timeframe: '5m', from: exchange.missingBaseEnd, through: exchange.missingBaseEnd })
     assert.deepEqual(missingBase, [], 'A coarse fallback must not fabricate the missing canonical 5m child.')
-    // Await the missing closed fact through the public read bridge. Its durable
-    // commit must preserve the separately observed native forming price.
-    await waitForAsyncCondition(async () => {
-      const rows = await readCandles({ instId: btc, timeframe: '15m', from: exchange.deferredEnd, through: exchange.deferredEnd })
-      return rows.length === 1 && rows[0].confirmed
-    }, { description: 'the durable repaired 15m parent' })
     // Observe actual UI commits during the source completion, without issuing a
     // chart refresh that could conceal a push-delivery or cache invalidation bug.
     for (let index = 0; index < 10; index++) {

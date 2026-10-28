@@ -73,7 +73,7 @@ function telemetryHost() {
   const timers = new Map<number, () => void>()
   let nextTimer = 0, flush: (() => Promise<void>) | undefined, detach: (() => Promise<void>) | undefined
   let hooks: OperationBridgeHooks | undefined
-  let fail = false, blocked = false, hold = false, release: (() => void) | undefined
+  let fail = false, blocked = false, hold = false, holdEvery = false, release: (() => void) | undefined
   return {
     batches, attempts, timers, failures,
     flush: () => flush?.() ?? Promise.resolve(),
@@ -82,6 +82,7 @@ function telemetryHost() {
     failNext: () => { fail = true },
     block: (value: boolean) => { blocked = value },
     holdNext: () => { hold = true },
+    holdEvery: (value: boolean) => { holdEvery = value },
     release: () => release?.(),
     host: {
       // Keep the enclosing sandbox's source identity while exercising bridge hooks.
@@ -89,7 +90,7 @@ function telemetryHost() {
       recordOperations: async (batch: OperationBatch) => {
         attempts.push(structuredClone(batch))
         if (fail || blocked) { fail = false; throw new Error('Transient IPC failure') }
-        if (hold) { hold = false; await new Promise<void>(resolve => { release = resolve }) }
+        if (hold || holdEvery) { hold = false; await new Promise<void>(resolve => { release = resolve }) }
         batches.push(structuredClone(batch))
         return { batchId: batch.batchId, lastSequence: batch.events.at(-1)!.sequence }
       },
@@ -104,6 +105,33 @@ function telemetryHost() {
 }
 
 const ended = (batches: OperationBatch[]): OperationJournalEvent[] => batches.flatMap(batch => batch.events).filter(event => event.phase === 'end')
+
+test('notification decoding belongs to receive lineage and failed decoding remains an error record', async () => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'window')
+  const delivered: CustomEvent[] = [], events: OperationEvent[] = []
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: { dispatchEvent: (event: CustomEvent) => { delivered.push(event); return true } } })
+  const harness = telemetryHost(), stop = await initializeOperationTelemetry(harness.host)
+  const detach = attachOperationSink(event => events.push(event))
+  try {
+    const context = { traceId: 'wire:trace', parentId: 'wire:send' }
+    harness.hooks().receive('radar:chart-prepared', 'encoded', context, () => measureOperation({ category: 'cpu', name: 'fixture.decode' }, () => ({ revision: 7 })))
+    assert.deepEqual(delivered.map(event => event.detail), [{ revision: 7 }])
+    const received = events.find(event => event.name === 'desktop.notification.receive')!
+    const decoded = events.find(event => event.name === 'fixture.decode')!
+    assert.equal(received.parentId, context.parentId)
+    assert.equal(received.traceId, context.traceId)
+    assert.equal(decoded.parentId, received.id)
+    assert.equal(decoded.traceId, received.traceId)
+    assert.throws(() => harness.hooks().receive('radar:chart-prepared', 'malformed', context, () => { throw new SyntaxError('Invalid wire') }), SyntaxError)
+    assert.equal(delivered.length, 1, 'Malformed data cannot dispatch a business notification.')
+    assert.deepEqual(events.filter(event => event.name === 'desktop.notification.receive').map(event => event.status), ['ok', 'error'])
+    assert.equal(events.at(-1)!.attributes!.errorName, 'SyntaxError')
+  } finally {
+    await stop(); detach()
+    if (previous) Object.defineProperty(globalThis, 'window', previous)
+    else Reflect.deleteProperty(globalThis, 'window')
+  }
+})
 
 test('renderer retains lifecycle records until acknowledgment and retries the same immutable batch', async () => {
   const harness = telemetryHost(), stop = await initializeOperationTelemetry(harness.host)
@@ -149,7 +177,7 @@ test('renderer drains sustained backlog in large durable batches after a delayed
     harness.release()
     await harness.flush()
     const sizes = harness.batches.map(value => value.events.length)
-    assert.deepEqual(sizes, [128, ...Array(6).fill(MAX_OPERATION_BATCH_SIZE), 128])
+    assert.deepEqual(sizes, [128, ...Array(3).fill(MAX_OPERATION_BATCH_SIZE), 128])
     assert.ok(sizes.every(size => size > 0 && size <= MAX_OPERATION_BATCH_SIZE))
     assert.equal(new Set(harness.batches.map(value => value.batchId)).size, harness.batches.length)
     const records = harness.batches.flatMap(value => value.events)
@@ -159,6 +187,27 @@ test('renderer drains sustained backlog in large durable batches after a delayed
     assert.equal(new Set(records.map(value => `${value.id}:${value.phase}`)).size, records.length)
     assert.equal(harness.failures.length, 0, 'A drain below the unchanged 8192-record cap does not poison the source.')
   } finally { await stop() }
+})
+
+test('renderer drains repeated full-market bursts with one durable acknowledgment per burst', async () => {
+  const harness = telemetryHost(), stop = await initializeOperationTelemetry(harness.host)
+  harness.holdEvery(true)
+  try {
+    for (let tick = 0; tick < 60; tick++) {
+      for (let index = 0; index < 287 * 3; index++) measureOperation({ category: 'ipc', name: 'fixture.market-notification' }, () => {})
+      // The first two bursts arrive before the first ACK. Thereafter only one
+      // batch may become durable between bursts, regardless of machine speed.
+      if (tick > 0) { harness.release(); await new Promise<void>(resolve => setImmediate(resolve)) }
+    }
+    harness.holdEvery(false); harness.release(); await harness.flush()
+    const records = harness.batches.flatMap(batch => batch.events)
+    assert.equal(records.length, 60 * 287 * 3 * 2)
+    assert.ok(records.every((event, index) => !index || event.sequence === records[index - 1].sequence + 1))
+    assert.equal(new Set(records.map(event => `${event.id}:${event.phase}`)).size, records.length)
+    assert.ok(harness.batches.some(batch => batch.events.length === MAX_OPERATION_BATCH_SIZE))
+    assert.ok(harness.batches.every(batch => batch.events.length <= MAX_OPERATION_BATCH_SIZE))
+    assert.deepEqual(harness.failures, [])
+  } finally { harness.holdEvery(false); harness.release(); await stop() }
 })
 
 test('leaving a renderer submits cancelled requests before an earlier durable ACK can resume the document', async () => {
@@ -235,7 +284,7 @@ test('renderer final handoff replays the active batch and submits ordered batche
     let completed = false
     const detached = harness.detach().finally(() => { completed = true })
     await Promise.resolve()
-    assert.deepEqual(harness.attempts.map(value => value.events.length), [128, 128, ...Array(6).fill(MAX_OPERATION_BATCH_SIZE), 128])
+    assert.deepEqual(harness.attempts.map(value => value.events.length), [128, 128, ...Array(3).fill(MAX_OPERATION_BATCH_SIZE), 128])
     assert.deepEqual(harness.attempts[1], harness.attempts[0], 'Final handoff resubmits the in-flight batch ID and sequence range.')
     assert.equal(persisted.size, 0, 'No batch is durable before the held ACK releases.')
     assert.equal(completed, false)
