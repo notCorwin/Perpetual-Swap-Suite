@@ -117,7 +117,7 @@ try {
         && actual.svgEnd === Number(expected.raw[0]) && live?.hour === Number(expected.raw[0]) && live.confirmed === false
         && ['open', 'high', 'low', 'close'].every((field, index) => live[field] === Number(expected.raw[index + 1]))
         && actual.price === Number(expected.raw[4]) && actual.snapshot.priceObservedAt >= expected.forwardedAt
-        && Date.now() - actual.snapshot.priceObservedAt < 10_000 && actual.snapshot.realtimeState === 'live' && actual.statuses.includes('Live price')
+        && Date.now() - actual.snapshot.priceObservedAt < 10_000 && actual.snapshot.realtimeState === 'live' && !actual.statuses.includes('Cached price') && !actual.statuses.includes('Live price')
     }, 8_000, 'app-failure', `A genuine, delivered ${instId} candle failed to reach the selected SVG with exact OHLC, identity and freshness.`)
     assertionActive = false
     if (previous) assert.ok(actual.snapshot.priceObservedAt > previous.actual.snapshot.priceObservedAt, 'New real candle delivery must advance the observed timestamp even when price repeats.')

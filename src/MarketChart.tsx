@@ -30,7 +30,7 @@ const PriceStatus = memo(function PriceStatus({ observedAt, realtime }: { observ
   const [now, setNow] = useState(Date.now)
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer) }, [])
   const fresh = realtime === 'live' && observedAt != null && now - observedAt < 30_000
-  return <Badge variant="secondary" role="status" title={observedAt ? `Last price observation ${new Date(observedAt).toLocaleTimeString('en-US')}` : 'Waiting for a current price observation'}>{fresh ? 'Live price' : 'Cached price'}</Badge>
+  return fresh ? null : <Badge variant="secondary" role="status" title={observedAt ? `Last price observation ${new Date(observedAt).toLocaleTimeString('en-US')}` : 'Waiting for a current price observation'}>Cached price</Badge>
 })
 
 const chartTimeFormatter = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })
