@@ -1281,6 +1281,41 @@ test('a rejected old snapshot preserves notifications and backend exclusions rem
     await waitForAuditFixture(() => globalThis.__workspaceFixture.staleReplies > 0)
     assert.equal(await selected().getAttribute('aria-label'), 'View BETA-USDT-SWAP chart', 'An old empty snapshot cannot clear selection.')
     await electron.evaluate(() => {
+test('long market errors remain fully visible when the list is empty', async () => {
+  const error = 'Market verification is unavailable for 17 contracts because the latest order book observations are incomplete.'
+  const publish = values => electron.evaluate((_electron, values) => {
+    const state = globalThis.__workspaceFixture
+    Object.assign(state, values)
+    state.revision += 1
+    state.notify()
+  }, values)
+  try {
+    await page.emulateMedia({ colorScheme: 'dark' })
+    await publish({ rows: [], loading: false, error, realtimeState: 'live', catalogSource: 'live', catalogProgress: undefined })
+    const status = page.locator('[data-market-status][role="alert"]')
+    await status.waitFor()
+    assert.equal(await status.textContent(), error)
+    for (const width of [800, 1600]) {
+      await page.setViewportSize({ width, height: 1000 })
+      const bounds = await status.evaluate(element => {
+        const rect = element.getBoundingClientRect(), parent = element.parentElement.getBoundingClientRect()
+        const table = document.querySelector('[data-market-list] thead').getBoundingClientRect()
+        return { width: element.clientWidth, scrollWidth: element.scrollWidth, height: element.clientHeight,
+          scrollHeight: element.scrollHeight, lineHeight: parseFloat(getComputedStyle(element).lineHeight),
+          top: rect.top, bottom: rect.bottom, parentBottom: parent.bottom, tableTop: table.top }
+      })
+      assert.ok(bounds.height > bounds.lineHeight, `The long error must wrap at width ${width}.`)
+      assert.ok(bounds.scrollWidth <= bounds.width && bounds.scrollHeight <= bounds.height, `The error must not be clipped: ${JSON.stringify(bounds)}`)
+      assert.ok(bounds.bottom <= bounds.parentBottom && bounds.bottom < bounds.tableTop, `The error must remain above the table: ${JSON.stringify(bounds)}`)
+      if (process.env.PERPETUAL_SWAP_UI_SCREENSHOTS) await page.locator('[data-market-list]').screenshot({ path: join(process.env.PERPETUAL_SWAP_UI_SCREENSHOTS, `market-error-${width}.png`) })
+    }
+  } finally {
+    await page.emulateMedia({ colorScheme: null })
+    await page.setViewportSize({ width: 800, height: 572 })
+    await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), loading: false, error: '', realtimeState: 'live', catalogSource: 'live', catalogProgress: undefined })
+  }
+})
+
       const state = globalThis.__workspaceFixture
       state.rows = state.rows.filter(row => row.instId !== 'BETA-USDT-SWAP')
       state.loading = true; state.revision += 1; state.notify()
