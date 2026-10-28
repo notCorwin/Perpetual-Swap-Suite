@@ -1275,12 +1275,6 @@ test('market status changes do not move the contract list', async () => {
   }
 })
 
-test('a rejected old snapshot preserves notifications and backend exclusions remove rows immediately', async () => {
-  try {
-    await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.staleNextSnapshot = true; state.notify() })
-    await waitForAuditFixture(() => globalThis.__workspaceFixture.staleReplies > 0)
-    assert.equal(await selected().getAttribute('aria-label'), 'View BETA-USDT-SWAP chart', 'An old empty snapshot cannot clear selection.')
-    await electron.evaluate(() => {
 test('long market errors remain fully visible when the list is empty', async () => {
   const error = 'Market verification is unavailable for 17 contracts because the latest order book observations are incomplete.'
   const publish = values => electron.evaluate((_electron, values) => {
@@ -1316,6 +1310,12 @@ test('long market errors remain fully visible when the list is empty', async () 
   }
 })
 
+test('a rejected old snapshot preserves notifications and backend exclusions remove rows immediately', async () => {
+  try {
+    await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.staleNextSnapshot = true; state.notify() })
+    await waitForAuditFixture(() => globalThis.__workspaceFixture.staleReplies > 0)
+    assert.equal(await selected().getAttribute('aria-label'), 'View BETA-USDT-SWAP chart', 'An old empty snapshot cannot clear selection.')
+    await electron.evaluate(() => {
       const state = globalThis.__workspaceFixture
       state.rows = state.rows.filter(row => row.instId !== 'BETA-USDT-SWAP')
       state.loading = true; state.revision += 1; state.notify()
