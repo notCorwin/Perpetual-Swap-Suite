@@ -186,7 +186,11 @@ function App() {
         <div className="flex flex-col gap-4 border-b p-4">
         <Input aria-label="Search contracts" placeholder="Search contracts…" spellCheck={false} autoCorrect="off" autoCapitalize="off" autoComplete="off" value={query} onChange={event => setQuery(event.target.value)} />
         <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground"><span>{query.trim() ? `${visible.length} / ${rows.length}` : rows.length} contracts</span><span>{updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data'}</span></div>
-        {status !== 'Live' && <div><Badge variant="outline"><Radio aria-hidden="true" />{status}</Badge></div>}
+        {(status !== 'Live' || retainedChart || realtime.toLowerCase() !== 'live') && <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground" aria-live="polite">
+          {status !== 'Live' && <Badge variant="outline"><Radio aria-hidden="true" />{status}</Badge>}
+          {realtime.toLowerCase() !== 'live' && <span aria-label={`Realtime connection: ${realtime}`}>{realtime}</span>}
+          {retainedChart && <span role="status">{verifying ? 'Rechecking qualification · Current chart remains available' : 'Qualification data unavailable · Current chart remains available'}</span>}
+        </div>}
         </div>
       </header>
       {preferencesError && <p role="alert" className="border-b p-3 text-sm text-destructive">{preferencesError}</p>}
@@ -200,7 +204,6 @@ function App() {
           </TableCell></TableRow></TableBody>}
         </Table>
       </section>
-      {(retainedChart || realtime.toLowerCase() !== 'live') && <footer className="flex flex-col gap-1 border-t p-4 text-xs text-muted-foreground" aria-live="polite">{retainedChart && <span role="status">{verifying ? 'Rechecking qualification · Current chart remains available' : 'Qualification data unavailable · Current chart remains available'}</span>}{realtime.toLowerCase() !== 'live' && <span aria-label={`Realtime connection: ${realtime}`}>{realtime}</span>}</footer>}
     </aside>
     <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
       {selectedID ? <MarketChart active={settingsSection === null} instId={selectedID} timeframe={timeframe} candidateIds={candidateIds} onTimeframeChange={changeTimeframe} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
