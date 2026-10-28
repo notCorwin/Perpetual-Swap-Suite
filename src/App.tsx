@@ -1,7 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Radio, Settings2 } from 'lucide-react'
+import { Settings2 } from 'lucide-react'
 import { buttonVariants } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
@@ -158,6 +157,10 @@ function App() {
   const selectedRow = rows.find(row => row.instId === selected) ?? rows[0]
   const retainedChart = !rows.length && Boolean(selected) && (verifying || verificationUnavailable)
   const selectedID = selectedRow?.instId ?? (retainedChart ? selected : null)
+  const connectionProblem = !['live', 'connected'].includes(realtime.toLowerCase())
+  const marketProblem = preferencesError || error
+  const marketStatus = marketProblem || (connectionProblem ? realtime : !rows.length && status !== 'Live' ? status : status === 'Cached' ? 'Cached' : '')
+  const marketStatusDetail = [marketStatus, retainedChart ? 'Current chart remains available' : ''].filter(Boolean).join(' · ')
   const listOrder = candidateIds
   useEffect(() => { if (ready) chartController.setUniverse(retainedChart && selectedID ? [selectedID] : candidateIds, timeframe) }, [ready, candidateIds, timeframe, retainedChart, selectedID])
   const savePreferences = useCallback(async (values: Partial<Preferences>) => {
@@ -185,16 +188,9 @@ function App() {
         <div data-sidebar-toolbar data-window-toolbar data-window-drag-region data-native-window-controls-row className="flex items-center gap-3 border-b px-4"><h1 className="min-w-0 flex-1 truncate text-sm font-medium">Perpetual Swap Suite</h1><a ref={settingsLauncher} href={settingsHref('workspace')} aria-label="Settings" title="Settings" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}><Settings2 aria-hidden="true" /></a></div>
         <div className="flex flex-col gap-4 border-b p-4">
         <Input aria-label="Search contracts" placeholder="Search contracts…" value={query} onChange={event => setQuery(event.target.value)} />
-        <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground"><span>{query.trim() ? `${visible.length} / ${rows.length}` : rows.length} contracts</span><span>{updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data'}</span></div>
-        {(status !== 'Live' || retainedChart || realtime.toLowerCase() !== 'live') && <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground" aria-live="polite">
-          {status !== 'Live' && <Badge variant="outline"><Radio aria-hidden="true" />{status}</Badge>}
-          {realtime.toLowerCase() !== 'live' && <span aria-label={`Realtime connection: ${realtime}`}>{realtime}</span>}
-          {retainedChart && <span role="status">{verifying ? 'Rechecking qualification · Current chart remains available' : 'Qualification data unavailable · Current chart remains available'}</span>}
-        </div>}
+        <div className="flex h-5 min-w-0 items-center justify-between gap-3 text-xs text-muted-foreground"><span className="shrink-0">{query.trim() ? `${visible.length} / ${rows.length}` : rows.length} contracts</span><span data-market-status role={marketProblem ? 'alert' : marketStatus ? 'status' : undefined} className={cn('min-w-0 truncate text-right', (marketProblem || connectionProblem) && 'text-destructive')} title={marketStatusDetail || undefined} aria-label={marketStatusDetail || undefined}>{marketStatus || (updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data')}</span></div>
         </div>
       </header>
-      {preferencesError && <p role="alert" className="border-b p-3 text-sm text-destructive">{preferencesError}</p>}
-      {error && <p role="alert" className="border-b p-3 text-sm text-destructive">{error}</p>}
       <section data-market-scroll className="min-h-0 flex-1 overflow-y-auto [&>[data-slot=table-container]]:overflow-visible" aria-label="Perpetual swap markets">
         <Table className="table-fixed" data-market-count={visible.length} data-total-market-count={rows.length} aria-rowcount={visible.length + 1}>
           <colgroup><col className="w-[35%]" /><col className="w-[33%]" /><col className="w-[32%]" /></colgroup>
