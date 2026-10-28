@@ -2,11 +2,12 @@ import { createOperationWorker, createWorkerRequest } from './worker-operations.
 import { availableParallelism } from 'node:os'
 import { statisticsMask, statisticsVersionFor } from './statistics-state.js'
 import { appendIndicatorCandle, projectIndicatorCandle } from './indicators.js'
-import { hookOperationMethods, measureOperation, recordOperation } from './operations.js'
+import { captureOperationContext, hookOperationMethods, measureOperation, recordOperation } from './operations.js'
 import { stopOperationWorker } from './operation-worker.js'
 import { completePriceCandle } from './market-records.js'
 
 const VISIBLE = 96, TAIL = 128, CHUNK = 1024, HISTORY = 1536, HISTORY_AHEAD = 256, HISTORY_PAGE = 300
+const LIVE_TURN_MS = 4, LIVE_TURN_FRAMES = 32
 // 192 remaining candles after 1.5 s of two-candle input at 120 Hz.
 const HISTORY_RUNWAY = 192 + 2 * 120 * 1.5 + 2 // Include the two-candle gesture that crosses the threshold.
 // One 1536-row read plus overlap is retained around the active cursor. The
@@ -107,6 +108,7 @@ export class PreparedChartPipeline {
     this.focus = null; this.explicitFocus = false
     this.focusReads = new Set(); this.pendingFocusRead = null
     this.focusWaits = new Map()
+    this.livePublications = new Map(); this.livePublicationTimer = null
     this.priceJournal = new Map()
     this.unsubscribeStore = store.subscribe?.(change => {
       const key = seriesKey(change.instrument, change.timeframe)
@@ -295,21 +297,25 @@ export class PreparedChartPipeline {
   }
 
   scheduleCandidates() {
-    if (this.candidateTimer !== null) clearTimeout(this.candidateTimer)
-    this.candidateTimer = null
-    this.candidateTimerAt = Infinity
-    if (this.closed || !this.universe.size) return
+    if (this.closed || !this.universe.size) {
+      if (this.candidateTimer !== null) clearTimeout(this.candidateTimer)
+      this.candidateTimer = null; this.candidateTimerAt = Infinity
+      return
+    }
     const now = Date.now()
     let deadline = Infinity
+    const retries = new Map()
+    for (const attempt of this.sourceAttempts.values()) if (attempt.retryAt > now)
+      retries.set(attempt.seriesKey, Math.min(retries.get(attempt.seriesKey) ?? Infinity, attempt.retryAt))
     for (const demand of this.universe.values()) {
       const step = intervalFor(demand.timeframe), state = this.liveStates.get(demand.key)
       let at = Math.min((Math.floor(now / step) + 1) * step + 1000,
-        state?.statisticsDeadline > now ? state.statisticsDeadline : Infinity)
-      for (const attempt of this.sourceAttempts.values()) if (attempt.seriesKey === demand.key && attempt.retryAt > now) at = Math.min(at, attempt.retryAt)
+        state?.statisticsDeadline > now ? state.statisticsDeadline : Infinity, retries.get(demand.key) ?? Infinity)
       demand.refreshAt = at; deadline = Math.min(deadline, at)
-      if (this.cached(demand.key)?.realtimeState === 'live' && state?.observedAt != null) deadline = Math.min(deadline, state.observedAt + 30_000)
+      const frame = this.cached(demand.key)
+      if (frame?.realtimeState === 'live' && frame.priceObservedAt != null) deadline = Math.min(deadline, frame.priceObservedAt + 30_000)
     }
-    this.armCandidateTimer(deadline)
+    if (this.candidateTimer === null || deadline !== this.candidateTimerAt) this.armCandidateTimer(deadline)
   }
 
   armCandidateTimer(deadline) {
@@ -322,7 +328,8 @@ export class PreparedChartPipeline {
         const state = this.liveStates.get(demand.key)
         // A quote lease is metadata, not a preparation task. It must expire
         // even while every core preparation slot awaits a slow provider.
-        if (this.cached(demand.key)?.realtimeState === 'live' && state?.observedAt + 30_000 <= Date.now()) this.publish(state)
+        const frame = this.cached(demand.key)
+        if (frame?.realtimeState === 'live' && frame.priceObservedAt + 30_000 <= Date.now() && state) this.publish(state)
         if (demand.refreshAt <= Date.now()) this.queueCandidate(demand, true)
       }
       this.scheduleCandidates()
@@ -332,7 +339,7 @@ export class PreparedChartPipeline {
 
   scheduleQuoteExpiry(state) {
     if (this.closed || !this.universe.has(state.key) || this.cached(state.key)?.realtimeState !== 'live') return
-    const deadline = state.observedAt + 30_000
+    const deadline = this.cached(state.key).priceObservedAt + 30_000
     if (deadline < this.candidateTimerAt) this.armCandidateTimer(deadline)
   }
 
@@ -361,8 +368,12 @@ export class PreparedChartPipeline {
     this.focus = target ? { key, instId: target.instId, timeframe: target.timeframe, end: target.endHour, id,
       direction: direction || (previous?.key === key ? previous.direction : 0) } : null
     this.focusKey = key
+    const owner = this.focus
     const state = target ? this.state(target.instId, target.timeframe) : null
     if (state) state.historyEnd = target.endHour ?? null
+    // Selection promotes an already admitted quote ahead of background work.
+    if (state && this.livePublications.has(key)) this.publish(state)
+    if (this.closed || this.focus !== owner) return
     const candidate = this.universe.get(key), queued = this.candidateQueue.indexOf(candidate)
     if (queued > 0) { this.candidateQueue.splice(queued, 1); this.candidateQueue.unshift(candidate) }
     this.reconcileSourceJobs()
@@ -588,6 +599,33 @@ export class PreparedChartPipeline {
   }
 
   publish(state) {
+    // A source/repair publication can satisfy a queued live projection too.
+    // Do not let an obsolete resident state consume another generation's work.
+    const current = this.series.get(state.key) === state || this.liveStates.get(state.key) === state
+    const pending = current ? this.livePublications.get(state.key) : null
+    if (pending) {
+      this.livePublications.delete(state.key)
+      if (!this.livePublications.size && this.livePublicationTimer !== null) {
+        clearImmediate(this.livePublicationTimer); this.livePublicationTimer = null
+      }
+    }
+    const project = () => {
+      const frame = this.publishFrame(state)
+      if (pending) {
+        const live = this.liveStates.get(state.key)
+        if (state.key === this.focusKey) this.scheduleRefresh()
+        if (live) this.scheduleQuoteExpiry(live)
+        pending.resolve(frame)
+      }
+      return frame
+    }
+    try { return pending ? pending.run(project) : project() } catch (error) {
+      pending?.reject(error)
+      throw error
+    }
+  }
+
+  publishFrame(state) {
     // Collector/list-metric residency alone still never materializes a chart.
     if (!state.chartRequested && state.key !== this.focusKey && !this.universe.has(state.key) && !this.snapshots.has(state.key)) return null
     const built = this.frame(state), previous = this.snapshots.get(state.key)
@@ -608,6 +646,42 @@ export class PreparedChartPipeline {
       }
     }
     return frame
+  }
+
+  queueLivePublication(key) {
+    let pending = this.livePublications.get(key)
+    if (!pending) {
+      let resolve, reject
+      const promise = new Promise((done, fail) => { resolve = done; reject = fail })
+      pending = { promise, resolve, reject }
+      this.livePublications.set(key, pending)
+    }
+    // The last admitted source owns the facts used by the eventual frame.
+    // A shared immediate otherwise inherits the first series' async context.
+    pending.run = captureOperationContext()
+    this.scheduleLivePublications()
+    return pending.promise
+  }
+
+  scheduleLivePublications() {
+    if (this.closed || this.livePublicationTimer !== null || !this.livePublications.size) return
+    this.livePublicationTimer = setImmediate(() => {
+      this.livePublicationTimer = null
+      const deadline = performance.now() + LIVE_TURN_MS
+      let count = 0
+      while (!this.closed && this.livePublications.size && count < LIVE_TURN_FRAMES && (count === 0 || performance.now() < deadline)) {
+        const [key, pending] = this.livePublications.entries().next().value
+        const state = this.series.get(key) ?? this.liveStates.get(key)
+        if (!state) { this.livePublications.delete(key); pending.resolve(null) }
+        else {
+          // publish settles the shared promise; a failed series must not stop
+          // unrelated series from making progress in subsequent turns.
+          try { this.publish(state) } catch { /* The admitted callers receive the failure. */ }
+        }
+        count += 1
+      }
+      this.scheduleLivePublications()
+    })
   }
 
   historyFrame(state, end) {
@@ -1734,17 +1808,33 @@ export class PreparedChartPipeline {
     if (demand) this.queueCandidate(demand, true)
   }
 
-  async setLive(instId, timeframe, candle, context = {}) {
-    const observedAt = typeof context === 'number' ? context : context.receivedAt ?? Date.now()
-    if (this.closed) return null
-    if (!intervalFor(timeframe) || candle && (candle.confirmed || candle.instrument !== instId || candle.timeframe !== timeframe)) throw new Error('Invalid forming candle.')
-    const live = this.liveState(instId, timeframe), state = this.series.get(live.key)
-    if (candle && live.live && (candle.timestamp < live.live.timestamp || candle.timestamp === live.live.timestamp && candle.volume < live.live.volume)) return this.cached(live.key)
-    for (const current of [live, state].filter(Boolean)) { current.live = candle; current.observedAt = observedAt }
-    // A current price can publish before any historical seed has been restored.
-    if (state) { const frame = this.publish(state); this.scheduleRefresh(); this.scheduleQuoteExpiry(live); return frame }
-    if (this.universe.has(live.key)) { const frame = this.publish(live); this.scheduleQuoteExpiry(live); return frame }
-    return null
+  setLive(instId, timeframe, candle, context = {}) {
+    try {
+      const observedAt = typeof context === 'number' ? context : context.receivedAt ?? Date.now()
+      if (this.closed) return Promise.resolve(null)
+      if (!intervalFor(timeframe) || candle && (candle.confirmed || candle.instrument !== instId || candle.timeframe !== timeframe)) throw new Error('Invalid forming candle.')
+      const live = this.liveState(instId, timeframe), state = this.series.get(live.key)
+      if (candle && live.live && (candle.timestamp < live.live.timestamp || candle.timestamp === live.live.timestamp && candle.volume < live.live.volume))
+        return this.livePublications.get(live.key)?.promise ?? Promise.resolve(this.cached(live.key))
+      const unchanged = observedAt === live.observedAt && (candle == null ? live.live == null
+        : live.live && Object.keys(candle).length === Object.keys(live.live).length
+          && Object.keys(candle).every(key => Object.hasOwn(live.live, key) && Object.is(candle[key], live.live[key])))
+      if (unchanged && this.livePublications.has(live.key)) return this.livePublications.get(live.key).promise
+      // With no pending projection, status/lease work may still be due even
+      // for an identical raw fact. Reuse its owned input while checking it.
+      const admitted = unchanged ? live.live : candle ? immutableRecord(candle) : null
+      for (const current of [live, state].filter(Boolean)) { current.live = admitted; current.observedAt = observedAt }
+      if (!state && !this.universe.has(live.key)) return Promise.resolve(null)
+      // Collector-only residency cannot materialize a chart.
+      const current = state ?? live
+      if (!current.chartRequested && current.key !== this.focusKey && !this.universe.has(current.key) && !this.snapshots.has(current.key)) return Promise.resolve(null)
+      if (current.key !== this.focusKey) return this.queueLivePublication(current.key)
+      // Focused data remains visible immediately, including when selection has
+      // promoted a quote that was already queued for this series.
+      const pending = this.livePublications.has(current.key), frame = this.publish(current)
+      if (!pending) { this.scheduleRefresh(); this.scheduleQuoteExpiry(live) }
+      return Promise.resolve(frame)
+    } catch (error) { return Promise.reject(error) }
   }
 
   job(key, operation) {
@@ -1813,6 +1903,10 @@ export class PreparedChartPipeline {
   dispose() {
     if (this.disposeTask) return this.disposeTask
     this.closed = true
+    if (this.livePublicationTimer !== null) clearImmediate(this.livePublicationTimer)
+    this.livePublicationTimer = null
+    for (const pending of this.livePublications.values()) pending.resolve(null)
+    this.livePublications.clear()
     this.cancelPendingFocusRead('closed')
     this.cancelFocusWaits('closed')
     for (const entry of this.focusReads) this.cancelFocusReadWaiters(entry, 'closed')

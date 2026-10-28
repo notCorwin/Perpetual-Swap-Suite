@@ -225,6 +225,7 @@ export class MarketService {
     this.candleMutations = new Map()
     this.barTasks = new Set()
     this.backgroundTasks = new Set()
+    this.backgroundTaskSources = new WeakMap()
     this.requestLanes = new Map(Object.entries(REQUEST_LANE_INTERVALS).map(([name, interval]) => [name, { name, interval, queue: [], task: null, running: false, active: new Map(), buckets: new Map(), wake: null, nextAt: 0, rateLimitedUntil: 0,
       ...(instrumentRateLimit(name) ? { concurrency: 8 } : {}) }]))
     this.activeRequests = new Set()
@@ -341,7 +342,10 @@ export class MarketService {
       },
       onForming: (row, context) => {
         this.track(this.candleDerivations.observe(row, context))
-        return this.setLive(row.instrument, row.timeframe, row, context)
+        // The source has admitted its raw fact synchronously. Background chart
+        // publication has a separate completion and must not hold the next
+        // same-series socket event or its selected higher-timeframe derivative.
+        this.track(this.setLive(row.instrument, row.timeframe, row, context))
       },
       onConfirmed: row => this.confirmPriceCandle(row),
       onReconnect: (subscriptions, context) => this.reconcileRealtime(subscriptions, context),
@@ -674,7 +678,12 @@ export class MarketService {
   }
 
   track(promise) {
-    const task = Promise.resolve(promise).catch(() => undefined).finally(() => this.backgroundTasks.delete(task))
+    const source = Promise.resolve(promise), existing = this.backgroundTaskSources.get(source)
+    if (existing) return existing
+    const task = source.catch(() => undefined).finally(() => {
+      this.backgroundTasks.delete(task); this.backgroundTaskSources.delete(source)
+    })
+    this.backgroundTaskSources.set(source, task)
     this.backgroundTasks.add(task)
     return task
   }

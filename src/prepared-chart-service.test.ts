@@ -8,7 +8,7 @@ import { ChartController } from './chart-controller.ts'
 import { ChartNotificationEncoder } from '../electron/services/chart-notifications.js'
 import { MarketStore } from '../electron/services/market-store.js'
 import { buildIndicatorSeries } from '../electron/services/indicators.js'
-import { attachOperationSink, type OperationEvent } from '../electron/services/operations.js'
+import { attachOperationSink, getOperationContext, runWithOperationContext, type OperationEvent } from '../electron/services/operations.js'
 import { stopOperationWorker } from '../electron/services/operation-worker.js'
 
 const interval = 900_000, instId = 'BTC-USDT-SWAP'
@@ -704,6 +704,304 @@ test('collector subscriptions perform no eager source restoration', async () => 
     pipeline.setRealtimeSubscriptions(ids.flatMap(instId => ['5m', '15m', '1H'].map(timeframe => ({ instId, timeframe }))))
     assert.equal(pipeline.realtimeKeys.size, 861)
     assert.equal(store.queries.length, 0); assert.equal(pipeline.nextCalculation, 0); assert.equal(pipeline.series.size, 0)
+  } finally { await pipeline.dispose() }
+})
+
+test('a full prepared universe yields backend callbacks while retaining the focused quote and every exact projection', { timeout: 30_000 }, async () => {
+  const { pipeline } = fixture([]), frames: any[] = []
+  const ids = Array.from({ length: 287 }, (_, index) => `BURST${index}-USDT-SWAP`)
+  const periods = [['5m', 300_000], ['15m', 900_000], ['1H', 3_600_000]] as const
+  const bases = new Map<string, { rows: any[]; indicators: any; quote: any; oracle: any }>()
+  // Seed the same already-prepared workload as the market resource fixture;
+  // candidate restoration is unrelated to the intake under test.
+  pipeline.queueCandidate = () => {}; pipeline.scheduleCandidates = () => {}
+  pipeline.setUniverse(ids)
+  pipeline.setRealtimeSubscriptions(ids.flatMap(instrument => periods.map(([timeframe]) => ({ instId: instrument, timeframe }))))
+  for (const [timeframe, step] of periods) {
+    const boundary = Math.floor(Date.now() / step) * step
+    const rows = Array.from({ length: 240 }, (_, index) => ({ ...candle(boundary - (240 - index) * step, index), timeframe }))
+    const indicators = buildIndicatorSeries(rows, step)
+    const quote = { ...candle(boundary, 240), timeframe, high: 150, close: 126, volume: 123, confirmed: false }
+    const oracle = buildIndicatorSeries([...rows, quote], step).bars.at(-1)
+    bases.set(timeframe, { rows, indicators, quote, oracle })
+  }
+  const initial = new Map<string, any>(), receivedAt = Date.now()
+  for (const instrument of ids) for (const [timeframe] of periods) {
+    const { rows, indicators } = bases.get(timeframe)!
+    const state = pipeline.liveState(instrument, timeframe)
+    state.rows = new Map(rows.slice(-96).map(row => [row.timestamp, Object.freeze(row)]))
+    state.indicators = new Map(indicators.bars.slice(-96).map((value: any) => [value.hour, Object.freeze(value)]))
+    state.latestHour = rows.at(-1)!.timestamp; state.floor = rows.at(-96)!.timestamp
+    state.indicatorState = indicators.state; state.loaded = true
+    const frame = pipeline.frame(state)
+    pipeline.snapshots.set(state.key, { valid: true, frame }); initial.set(state.key, frame)
+  }
+  const selected = ids[0], selectedKey = `${selected}:15m`
+  try {
+    pipeline.setFocus({ instId: selected, timeframe: '15m' }, 'burst-focus')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    pipeline.subscribe((frame: any) => frames.push(frame))
+    const callback = new Promise<{ first: number; count: number; focused: number | undefined }>(resolve => setImmediate(() => {
+      const first = frames.length, focused = pipeline.cached(selectedKey)?.liveBar?.close
+      setImmediate(() => resolve({ first, count: frames.length, focused }))
+    }))
+    const updates: Promise<any>[] = []
+    for (const instrument of ids) for (const [timeframe] of periods) {
+      const quote = { ...bases.get(timeframe)!.quote, instrument }
+      updates.push(pipeline.setLive(instrument, timeframe, quote, { receivedAt }))
+    }
+    assert.equal(updates.length, 861)
+    assert.equal(pipeline.liveStates.get(`${ids.at(-1)}:1H`).live.close, 126, 'Every raw source quote is admitted synchronously.')
+    const during = await callback
+    assert.equal(during.focused, 126, 'The selected quote is fresh before a queued backend callback runs.')
+    assert.ok(during.first < updates.length, `The first callback must run before all background frames; saw ${during.first}.`)
+    assert.ok(during.count > during.first && during.count < updates.length,
+      `A second callback must run between background projection turns; saw ${during.first} then ${during.count}.`)
+    const results = await Promise.all(updates)
+    assert.equal(frames.length, 861, 'All distinct prepared series receive their admitted quote.')
+    for (const [index, instrument] of ids.entries()) for (const [offset, [timeframe]] of periods.entries()) {
+      const key = `${instrument}:${timeframe}`, frame = results[index * periods.length + offset], basis = bases.get(timeframe)!
+      assert.equal(frame, pipeline.cached(key))
+      assert.equal(frame.priceObservedAt, receivedAt); assert.equal(frame.realtimeState, 'live')
+      assert.equal(frame.liveBar.close, basis.quote.close)
+      assert.ok(frame.revision > initial.get(key).revision)
+      assert.deepEqual(frame.sourceVersions, initial.get(key).sourceVersions)
+      assert.equal(frame.bars, initial.get(key).bars, 'Completed bar projections remain shared.')
+      for (const field of indicatorFields) assert.equal(frame.liveBar[field], basis.oracle[field], `${key} ${field}`)
+    }
+  } finally { await pipeline.dispose() }
+})
+
+test('queued quotes share completion, preserve the winning lineage and promote on focus', async () => {
+  const { pipeline } = fixture([]), other = 'ETH-USDT-SWAP', frames: any[] = [], operations: OperationEvent[] = []
+  pipeline.queueCandidate = () => {}; pipeline.scheduleCandidates = () => {}
+  pipeline.setUniverse([instId, other])
+  pipeline.subscribe((frame: any) => frames.push({ frame, context: getOperationContext() }))
+  const detach = attachOperationSink(event => { if (event.name === 'chart.frame') operations.push(event) })
+  const now = Date.now(), quote = { ...candle(end() + interval), volume: 10, confirmed: false }
+  try {
+    const first = runWithOperationContext({ traceId: 'quote-first' }, () => pipeline.setLive(instId, '15m', quote, { receivedAt: now - 4 }))
+    const correction = runWithOperationContext({ traceId: 'quote-correction' }, () => pipeline.setLive(instId, '15m', { ...quote, close: 101.5 }, { receivedAt: now - 3 }))
+    const rejected = runWithOperationContext({ traceId: 'quote-rejected' }, () => pipeline.setLive(instId, '15m', { ...quote, volume: 9 }, { receivedAt: now - 2 }))
+    const clear = runWithOperationContext({ traceId: 'quote-clear' }, () => pipeline.setLive(instId, '15m', null, { receivedAt: now - 1 }))
+    const rolled = { ...quote, timestamp: quote.timestamp + interval, close: 102, volume: 1 }
+    const last = runWithOperationContext({ traceId: 'quote-rollover' }, () => pipeline.setLive(instId, '15m', rolled, { receivedAt: now }))
+    for (let index = 0; index < 5000; index++) {
+      assert.strictEqual(pipeline.setLive(instId, '15m', rolled, { receivedAt: now }), first, 'One pending series has one shared completion.')
+    }
+    const otherQuote = { ...quote, instrument: other }
+    const otherTask = runWithOperationContext({ traceId: 'quote-other' }, () => pipeline.setLive(other, '15m', otherQuote, { receivedAt: now }))
+    assert.strictEqual(first, correction); assert.strictEqual(first, rejected); assert.strictEqual(first, clear); assert.strictEqual(first, last)
+    assert.equal(pipeline.livePublications.size, 2)
+    assert.equal(frames.length, 0)
+    runWithOperationContext({ traceId: 'focus-command' }, () => pipeline.setFocus({ instId, timeframe: '15m' }, 'promoted'))
+    assert.equal(pipeline.cached(`${instId}:15m`).liveBar.close, 102, 'Focus promotes the latest accepted quote synchronously.')
+    assert.equal(frames[0].context.traceId, 'quote-rollover')
+    assert.equal(frames[0].frame.priceObservedAt, now)
+    assert.equal((await first).liveBar.hour, rolled.timestamp)
+    assert.equal((await otherTask).liveBar.close, quote.close)
+    assert.equal(frames.find(value => value.frame.instId === other).context.traceId, 'quote-other')
+    assert.equal(operations.find(value => value.resource === instId)?.traceId, 'quote-rollover')
+    assert.equal(operations.find(value => value.resource === other)?.traceId, 'quote-other')
+    pipeline.setFocus(null, 'closed-focus')
+    const removed = await pipeline.setLive(instId, '15m', null, { receivedAt: now + 1 })
+    assert.equal(removed.liveBar, undefined); assert.equal(removed.priceObservedAt, now + 1)
+  } finally { detach(); await pipeline.dispose() }
+})
+
+test('a corrected confirmed basis publishes an admitted quote once under the current generation', async () => {
+  const rows = source(400), { pipeline, store } = fixture(rows), notifications: any[] = []
+  pipeline.queueCandidate = () => {}; pipeline.scheduleCandidates = () => {}
+  pipeline.setUniverse([instId])
+  try {
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
+    const before = pipeline.cached(`${instId}:15m`)
+    pipeline.setFocus(null)
+    pipeline.subscribe((frame: any) => notifications.push({ frame, context: getOperationContext() }))
+    const live = { ...candle(end() + interval, 400), high: 150, close: 141, volume: 150, confirmed: false }
+    const pending = runWithOperationContext({ traceId: 'admitted-quote' }, () => pipeline.setLive(instId, '15m', live, { receivedAt: Date.now() }))
+    const corrected = { ...rows[100], close: rows[100].close + .5 }, previous = store.change(corrected)
+    runWithOperationContext({ traceId: 'confirmed-correction' }, () => pipeline.observe([corrected], previous))
+    const admitted = await pending
+    assert.ok(admitted.generation > before.generation)
+    assert.equal(admitted.liveBar.close, live.close)
+    assert.equal(notifications[0].context.traceId, 'admitted-quote')
+    assert.equal(pipeline.livePublications.size, 0, 'The source publication satisfies the pending projection without a second frame.')
+    await finishSeed(pipeline)
+    const latest = pipeline.cached(`${instId}:15m`), oracle = buildIndicatorSeries([...store.rows, live], interval).bars.at(-1) as any
+    assert.equal(latest.generation, admitted.generation)
+    for (const field of indicatorFields) assert.equal(latest.liveBar[field], oracle[field])
+  } finally { await pipeline.dispose() }
+})
+
+test('queued raw quotes are owned snapshots and no-op repeats keep the winning producer', async () => {
+  const { pipeline } = fixture([]), seen: any[] = [], now = Date.now()
+  pipeline.queueCandidate = () => {}; pipeline.scheduleCandidates = () => {}
+  pipeline.setUniverse([instId])
+  pipeline.subscribe((frame: any) => seen.push({ close: frame.liveBar?.close, trace: getOperationContext().traceId }))
+  try {
+    const quote = { ...candle(end() + interval), high: 110, close: 101, confirmed: false }
+    const first = runWithOperationContext({ traceId: 'first-input' }, () => pipeline.setLive(instId, '15m', quote, { receivedAt: now }))
+    quote.close = 102
+    assert.equal(pipeline.liveStates.get(`${instId}:15m`).live.close, 101, 'Caller mutation cannot alter admitted raw facts.')
+    const next = runWithOperationContext({ traceId: 'changed-input' }, () => pipeline.setLive(instId, '15m', quote, { receivedAt: now }))
+    assert.strictEqual(first, next)
+    runWithOperationContext({ traceId: 'duplicate-input' }, () => pipeline.setLive(instId, '15m', { ...quote }, { receivedAt: now }))
+    quote.close = 103
+    assert.equal((await next).liveBar.close, 102)
+    assert.deepEqual(seen, [{ close: 102, trace: 'changed-input' }])
+  } finally { await pipeline.dispose() }
+})
+
+test('either current resident can publish the admitted quote with its winning context', async () => {
+  const { pipeline } = fixture([]), key = `${instId}:15m`, seen: any[] = []
+  pipeline.queueCandidate = () => {}; pipeline.scheduleCandidates = () => {}
+  pipeline.setUniverse([instId])
+  const live = pipeline.liveState(instId, '15m')
+  pipeline.publish(live); pipeline.state(instId, '15m')
+  pipeline.subscribe((frame: any) => seen.push({ close: frame.liveBar?.close, trace: getOperationContext().traceId }))
+  try {
+    const quote = { ...candle(end() + interval), close: 101, confirmed: false }
+    const task = runWithOperationContext({ traceId: 'winning-quote' }, () => pipeline.setLive(instId, '15m', quote))
+    runWithOperationContext({ traceId: 'other-source' }, () => pipeline.publish(live))
+    assert.equal(pipeline.livePublications.has(key), false)
+    assert.equal((await task).liveBar.close, 101)
+    assert.deepEqual(seen, [{ close: 101, trace: 'winning-quote' }])
+  } finally { await pipeline.dispose() }
+})
+
+test('promoted-frame reentrancy cannot duplicate a replacement focus or revive disposed demand', async () => {
+  for (const dispose of [false, true]) {
+    const { pipeline } = fixture([]), other = 'ETH-USDT-SWAP', prepared: string[] = [], focused: string[] = []
+    pipeline.queueCandidate = () => {}; pipeline.scheduleCandidates = () => {}; pipeline.scheduleRefresh = () => {}
+    pipeline.reconcileSourceJobs = () => {}
+    pipeline.prepareFocus = async (focus: any) => { prepared.push(focus.key) }
+    pipeline.onFocus = (focus: any) => { focused.push(focus?.key) }
+    pipeline.setUniverse([instId, other])
+    const quote = { ...candle(end() + interval), confirmed: false }
+    try {
+      const task = pipeline.setLive(instId, '15m', quote)
+      pipeline.subscribe((frame: any) => {
+        if (frame.instId === instId) {
+          if (dispose) void pipeline.dispose()
+          else pipeline.setFocus({ instId: other, timeframe: '15m' }, 'replacement')
+        }
+      })
+      pipeline.setFocus({ instId, timeframe: '15m' }, 'promoted')
+      await task; await Promise.resolve(); await Promise.resolve()
+      assert.deepEqual(prepared, dispose ? [] : [`${other}:15m`])
+      assert.deepEqual(focused, dispose ? [] : [`${other}:15m`])
+    } finally { await pipeline.dispose() }
+  }
+})
+
+test('the displayed quote lease cannot be extended by an unprojected raw quote', async context => {
+  const now = Math.floor(Date.now() / 3_600_000) * 3_600_000 + 1000, key = `${instId}:15m`
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
+  const { pipeline } = fixture([])
+  pipeline.queueCandidate = () => {}
+  pipeline.setUniverse([instId])
+  try {
+    const quote = { ...candle(end() + interval), close: 101, volume: 10, confirmed: false }
+    await pipeline.setLive(instId, '15m', quote, { receivedAt: now })
+    context.mock.timers.tick(29_999)
+    const pending = pipeline.setLive(instId, '15m', { ...quote, close: 102, volume: 11 }, { receivedAt: now + 29_999 })
+    pipeline.scheduleCandidates()
+    assert.equal(pipeline.candidateTimerAt, now + 30_000, 'The cached frame still owes its original expiry deadline.')
+    context.mock.timers.tick(1)
+    assert.equal(pipeline.cached(key).liveBar.close, 102, 'Expiry must replace or expire the displayed old quote even before the queued immediate.')
+    assert.equal((await pending).priceObservedAt, now + 29_999)
+  } finally { await pipeline.dispose() }
+})
+
+test('disposing a queued projection settles all callers and prevents later publication', async () => {
+  const { pipeline } = fixture([]), frames: any[] = []
+  pipeline.queueCandidate = () => {}; pipeline.scheduleCandidates = () => {}
+  pipeline.setUniverse([instId]); pipeline.subscribe((frame: any) => frames.push(frame))
+  const quote = { ...candle(end() + interval), confirmed: false }
+  const first = pipeline.setLive(instId, '15m', quote), second = pipeline.setLive(instId, '15m', { ...quote, volume: 101 })
+  assert.strictEqual(first, second)
+  await pipeline.dispose()
+  assert.equal(await first, null); assert.equal(await second, null)
+  await new Promise<void>(resolve => setImmediate(resolve))
+  assert.deepEqual(frames, []); assert.equal(pipeline.livePublications.size, 0)
+  assert.equal(await pipeline.setLive(instId, '15m', quote), null)
+})
+
+test('queued work follows universe removal, readmission and generation invalidation', async () => {
+  const { pipeline } = fixture([]), frames: any[] = []
+  pipeline.queueCandidate = () => {}; pipeline.scheduleCandidates = () => {}
+  pipeline.subscribe((frame: any) => frames.push(frame))
+  const quote = { ...candle(end() + interval), confirmed: false }
+  try {
+    pipeline.setUniverse([instId])
+    const removed = pipeline.setLive(instId, '15m', quote)
+    pipeline.setUniverse([])
+    assert.equal(await removed, null)
+    assert.deepEqual(frames, [], 'Removed demand cannot publish an obsolete queued chart.')
+    pipeline.setUniverse([instId])
+    const admitted = pipeline.setLive(instId, '15m', { ...quote, volume: 101 })
+    const oldGeneration = pipeline.liveStates.get(`${instId}:15m`).generation
+    pipeline.invalidate(instId, '15m')
+    const nextGeneration = pipeline.liveStates.get(`${instId}:15m`).generation
+    assert.ok(nextGeneration > oldGeneration)
+    const frame = await admitted
+    assert.equal(frame.generation, nextGeneration)
+    assert.equal(frame.liveBar.close, quote.close)
+    assert.equal(frames.length, 1)
+  } finally { await pipeline.dispose() }
+})
+
+test('a failed queued projection rejects its own callers without blocking other series', async () => {
+  const { pipeline } = fixture([]), other = 'ETH-USDT-SWAP', failure = new Error('Projection failed')
+  pipeline.queueCandidate = () => {}; pipeline.scheduleCandidates = () => {}
+  pipeline.setUniverse([instId, other])
+  const publish = pipeline.publishFrame.bind(pipeline)
+  pipeline.publishFrame = (state: any) => { if (state.instId === instId) throw failure; return publish(state) }
+  try {
+    const quote = { ...candle(end() + interval), confirmed: false }
+    const failed = pipeline.setLive(instId, '15m', quote)
+    const healthy = pipeline.setLive(other, '15m', { ...quote, instrument: other })
+    await assert.rejects(failed, (error: unknown) => error === failure)
+    assert.equal((await healthy).liveBar.close, quote.close)
+    assert.equal(pipeline.livePublications.size, 0)
+  } finally { await pipeline.dispose() }
+})
+
+test('unrelated quotes leave focus repair scheduling alone while each lease and retry keeps its deadline', async context => {
+  const now = Math.floor(Date.now() / 3_600_000) * 3_600_000 + 1000, other = 'ETH-USDT-SWAP'
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
+  const { pipeline } = fixture([])
+  pipeline.queueCandidate = () => {}
+  try {
+    pipeline.setUniverse([instId, other])
+    pipeline.setFocus({ instId, timeframe: '15m' }, 'deadline-focus')
+    await pipeline.focus.task; await new Promise<void>(resolve => setImmediate(resolve))
+    let refreshes = 0
+    const refresh = pipeline.scheduleRefresh.bind(pipeline)
+    pipeline.scheduleRefresh = () => { refreshes += 1; return refresh() }
+    const quote = { ...candle(end() + interval), confirmed: false }
+    await pipeline.setLive(other, '15m', { ...quote, instrument: other }, { receivedAt: now })
+    assert.equal(refreshes, 0, 'A different series cannot change the selected series repair deadline.')
+    await pipeline.setLive(instId, '15m', quote, { receivedAt: now })
+    assert.equal(refreshes, 1)
+    assert.equal(pipeline.candidateTimerAt, now + 30_000)
+    pipeline.sourceAttempts.set('first-retry', { seriesKey: `${other}:15m`, retryAt: now + 7000 })
+    pipeline.sourceAttempts.set('second-retry', { seriesKey: `${other}:15m`, retryAt: now + 9000 })
+    pipeline.scheduleCandidates()
+    assert.equal(pipeline.universe.get(`${other}:15m`).refreshAt, now + 7000)
+    assert.equal(pipeline.candidateTimerAt, now + 7000)
+    const timer = pipeline.candidateTimer
+    pipeline.scheduleCandidates()
+    assert.strictEqual(pipeline.candidateTimer, timer, 'An unchanged earliest deadline retains the armed timer.')
+    context.mock.timers.tick(7000)
+    assert.equal(pipeline.candidateTimerAt, now + 9000)
+    context.mock.timers.tick(2000)
+    assert.equal(pipeline.candidateTimerAt, now + 30_000)
+    assert.equal(pipeline.cached(`${other}:15m`).realtimeState, 'live')
+    context.mock.timers.tick(21_000)
+    assert.equal(pipeline.cached(`${other}:15m`).realtimeState, 'stale')
+    assert.equal(pipeline.cached(`${instId}:15m`).realtimeState, 'stale')
   } finally { await pipeline.dispose() }
 })
 
