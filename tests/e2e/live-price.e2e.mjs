@@ -49,7 +49,7 @@ test('native WebSocket prices reach the selected SVG and survive delayed durable
           && svg?.getAttribute('data-rendered-inst') === expected.instId && svg.getAttribute('data-rendered-timeframe') === expected.timeframe
           && Number(svg.getAttribute('data-rendered-end')) === expected.hour
           && snapshot.priceObservedAt >= expected.sentAt && snapshot.realtimeState === 'live'
-          && [...workspace.querySelectorAll('[role="status"]')].some(value => value.textContent?.trim() === 'Live price')
+          && ![...workspace.querySelectorAll('[role="status"]')].some(value => ['Live price', 'Cached price'].includes(value.textContent?.trim()))
       }, expected, { timeout: 10_000 })
     } catch (error) {
       throw new Error(`Native price failed to reach the selected chart. Expected ${JSON.stringify(expected)}; actual ${JSON.stringify(await readPrice())}; exchange ${JSON.stringify({ errors: exchange.errors, requests: exchange.requests })}`, { cause: error })

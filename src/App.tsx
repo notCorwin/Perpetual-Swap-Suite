@@ -185,7 +185,7 @@ function App() {
         <div data-sidebar-toolbar data-window-toolbar data-window-drag-region data-native-window-controls-row className="flex items-center gap-3 border-b px-4"><h1 className="min-w-0 flex-1 truncate text-sm font-medium">Perpetual Swap Suite</h1><a ref={settingsLauncher} href={settingsHref('workspace')} aria-label="Settings" title="Settings" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}><Settings2 aria-hidden="true" /></a></div>
         <div className="flex flex-col gap-4 border-b p-4">
         <Input aria-label="Search contracts" placeholder="Search contracts…" value={query} onChange={event => setQuery(event.target.value)} />
-        <div className="flex items-center justify-between gap-2"><span className="text-xs text-muted-foreground">{query.trim() ? `${visible.length} / ${rows.length}` : rows.length} contracts</span><Badge variant="outline"><Radio aria-hidden="true" />{status}</Badge></div>
+        <div className="flex items-center justify-between gap-2"><span className="text-xs text-muted-foreground">{query.trim() ? `${visible.length} / ${rows.length}` : rows.length} contracts</span>{status !== 'Live' && <Badge variant="outline"><Radio aria-hidden="true" />{status}</Badge>}</div>
         </div>
       </header>
       {preferencesError && <p role="alert" className="border-b p-3 text-sm text-destructive">{preferencesError}</p>}
