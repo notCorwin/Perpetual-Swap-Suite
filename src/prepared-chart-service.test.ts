@@ -1389,6 +1389,203 @@ test('the first history gesture expands a resident latest tail into its durable 
   } finally { await pipeline.dispose() }
 })
 
+test('continuous navigation extends persisted history before a held delivery reaches the resident boundary', { timeout: 30_000 }, async () => {
+  const rows = source(4000), latest = rows.at(-1)!.timestamp
+  const sourceGate = deferred()
+  let sourceRequests = 0, firstSourceAt: number | null = null, step = 0, sourceReleased = false
+  const { pipeline, store } = fixture(rows, { async ensurePrices(_id: string, _timeframe: string, from: number, through: number) {
+    sourceRequests += 1
+    firstSourceAt ??= step
+    await sourceGate.promise
+    return { rows: rows.filter(row => row.timestamp >= from && row.timestamp <= through) }
+  } })
+  const encoder = new ChartNotificationEncoder(), pending: Array<{ due: number; deliver: () => void }> = []
+  let initialFirst = -Infinity, firstExtension: number | null = null, holding = false
+  const hold = (frame: any, deliver: (value: any) => void) => {
+    if (!holding || !frame?.bars?.length || frame.bars[0].hour >= initialFirst) { deliver(frame); return }
+    firstExtension ??= step
+    pending.push({ due: step + 90, deliver: () => deliver(frame) }) // 1500 ms at 60 input frames per second.
+  }
+  const controller = new ChartController({
+    focus: (target, id) => pipeline.setFocus(target ? { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } : null, id),
+    local: (id, timeframe) => pipeline.local(id, timeframe),
+    history: async target => {
+      const frame = await pipeline.localHistory(target.instId, target.timeframe, target.end ?? undefined)
+      return new Promise(resolve => hold(frame, resolve))
+    },
+    universe: () => Promise.resolve(pipeline.residentFrames()),
+  })
+  const unsubscribe = pipeline.subscribe((frame: any) => hold(frame, value => controller.ingestPrepared(encoder.encode(value))))
+  const flush = () => new Promise<void>(resolve => setImmediate(resolve))
+  const close = controller.open(instId, '15m')
+  try {
+    await flush(); await pipeline.focus.task; await finishSeed(pipeline); await flush()
+    controller.scroll(-1)
+    await flush(); await pipeline.focus.task; await finishSeed(pipeline); await flush()
+    const state = pipeline.series.get(`${instId}:15m`), initial = pipeline.historyFrame(state, latest - interval)
+    assert.ok(initial.bars.length > 96 && initial.bars.every((bar: any) => bar.indicatorsObserved))
+    initialFirst = initial.bars[0].hour
+    const initialBars = (latest - initialFirst) / interval + 1
+    assert.equal(initialBars, 1281)
+    controller.scroll(1)
+    await flush(); await pipeline.focus.task; await flush()
+    const oracle = new Map(buildIndicatorSeries(rows, interval).bars.map((bar: any) => [bar.hour, bar]))
+    holding = true
+    for (step = 1; step <= 768; step += 1) {
+      controller.scroll(-2)
+      await flush()
+      // If the implementation incorrectly routes already-persisted rows via
+      // source preparation, let input continue while that work is held.
+      if (firstSourceAt !== null && step >= firstSourceAt + 80 && !sourceReleased) { sourceReleased = true; sourceGate.resolve() }
+      if (firstSourceAt === null || sourceReleased) await pipeline.focus.task
+      await finishSeed(pipeline); await flush()
+      for (const entry of pending.filter(item => item.due <= step)) entry.deliver()
+      for (let index = pending.length - 1; index >= 0; index -= 1) if (pending[index].due <= step) pending.splice(index, 1)
+      await flush()
+      const view = controller.getSnapshot(), bars = view.presented?.bars ?? []
+      assert.equal(view.pending, false, `Input ${step} must not expose a pending viewport.`)
+      assert.equal(bars.length, 96, `Input ${step} must retain the complete viewport.`)
+      assert.equal(view.presented?.endHour, latest - step * 2 * interval)
+      for (const bar of bars) {
+        assert.equal(bar.indicatorsObserved, true)
+        for (const field of indicatorFields) assert.equal(bar[field as keyof typeof bar], (oracle.get(bar.hour) as any)[field])
+      }
+    }
+    assert.notEqual(firstExtension, null, 'A reserve extension must be delivered during the gesture.')
+    assert.ok(initialBars - 96 - firstExtension! * 2 >= 192, 'The extension starts with at least 192 resident candles of runway.')
+    assert.equal(sourceRequests, 0)
+    assert.ok(store.queries.filter(query => query.order === 'desc' && query.limit === 1536).length <= 4)
+  } finally {
+    holding = false
+    sourceGate.resolve()
+    for (const entry of pending) entry.deliver()
+    close(); unsubscribe(); await pipeline.dispose()
+  }
+})
+
+test('a reserve read survives nearby focus changes and shares its admission', async () => {
+  const rows = source(4000), latest = rows.at(-1)!.timestamp, { pipeline, store } = fixture(rows)
+  const entered = deferred(), release = deferred(), read = store.candles.bind(store)
+  let heldReads = 0, hold = false
+  store.candles = async query => {
+    if (hold && query.order === 'desc' && query.limit === 1536) {
+      heldReads += 1
+      entered.resolve()
+      await release.promise
+    }
+    return read(query)
+  }
+  try {
+    await focusHistory(pipeline, instId, '15m', latest - interval); await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`), first = Math.min(...state.rows.keys())
+    hold = true
+    const target = latest - 802 * interval
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target }, 'reserve-0')
+    await entered.promise
+    for (let index = 1; index <= 20; index += 1) {
+      pipeline.setFocus({ instId, timeframe: '15m', endHour: target - 2 * index * interval }, `reserve-${index}`)
+      await new Promise<void>(resolve => setImmediate(resolve))
+    }
+    assert.equal(heldReads, 1, 'Nearby cursor changes must join the same durable read.')
+    release.resolve(); await pipeline.focus.task; await finishSeed(pipeline)
+    const current = target - 40 * interval, frame = pipeline.historyFrame(state, current)
+    assert.ok(frame.bars[0].hour < first, 'The admitted read must extend the original reserve.')
+    const visible = frame.bars.filter((bar: any) => bar.hour >= current - 95 * interval && bar.hour <= current)
+    assert.equal(visible.length, 96)
+    assert.ok(visible.every((bar: any) => bar.indicatorsObserved))
+    assert.equal(state.historyEnd, current)
+    assert.equal(heldReads, 1)
+  } finally { release.resolve(); await pipeline.dispose() }
+})
+
+test('a distant missing viewport is not blocked by an older held reserve read', async () => {
+  const rows = source(4000), latest = rows.at(-1)!.timestamp, { pipeline, store } = fixture(rows)
+  const entered = deferred(), release = deferred(), read = store.candles.bind(store)
+  let hold = false, held = false
+  store.candles = async query => {
+    if (hold && !held && query.order === 'desc' && query.limit === 1536) {
+      held = true; entered.resolve(); await release.promise
+    }
+    return read(query)
+  }
+  try {
+    await focusHistory(pipeline, instId, '15m', latest - interval); await finishSeed(pipeline)
+    hold = true
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: latest - 802 * interval }, 'near')
+    await entered.promise
+    const distant = latest - 2200 * interval
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: distant }, 'distant')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`), visible = pipeline.historyFrame(state, distant).bars
+      .filter((bar: any) => bar.hour >= distant - 95 * interval && bar.hour <= distant)
+    assert.equal(visible.length, 96)
+    assert.ok(visible.every((bar: any) => bar.indicatorsObserved))
+    release.resolve(); await new Promise<void>(resolve => setImmediate(resolve))
+    assert.equal(state.historyEnd, distant)
+    assert.ok(visible.every((bar: any) => state.rows.has(bar.hour)), 'The late read must not evict the active viewport.')
+  } finally { release.resolve(); await pipeline.dispose() }
+})
+
+test('an inspected sparse reserve does not cause a durable reread on each cursor move', async () => {
+  const rows = source(4000), latest = rows.at(-1)!.timestamp, gate = deferred()
+  let sourceRequests = 0
+  const { pipeline, store } = fixture(rows.slice(-1281), { async ensurePrices() { sourceRequests += 1; await gate.promise; return { rows: [] } } })
+  try {
+    await focusHistory(pipeline, instId, '15m', latest - interval); await finishSeed(pipeline)
+    const before = store.queries.filter(query => query.order === 'desc' && query.limit === 1536).length
+    for (let index = 0; index < 20; index += 1) {
+      pipeline.setFocus({ instId, timeframe: '15m', endHour: latest - (802 + 2 * index) * interval }, `sparse-${index}`)
+      await new Promise<void>(resolve => setImmediate(resolve))
+    }
+    const reads = store.queries.filter(query => query.order === 'desc' && query.limit === 1536).length - before
+    assert.equal(reads, 1, 'A proven empty part of the reserve is inspected once, not once per focus.')
+    assert.ok(sourceRequests > 0, 'Missing durable facts still reach the source acquisition path.')
+  } finally { gate.resolve(); await pipeline.dispose() }
+})
+
+test('a price change during coverage cannot certify a reserve read against the newer input', async () => {
+  const rows = source(4000), latest = rows.at(-1)!.timestamp, { pipeline, store } = fixture(rows)
+  const entered = deferred(), release = deferred(), coverage = store.coverage.bind(store)
+  let hold = false, held = false
+  store.coverage = async () => {
+    if (hold && !held) { held = true; entered.resolve(); await release.promise }
+    return coverage()
+  }
+  try {
+    await focusHistory(pipeline, instId, '15m', latest - interval); await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`), before = store.queries.filter(query => query.order === 'desc' && query.limit === 1536).length
+    hold = true
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: latest - 802 * interval }, 'revision-race')
+    await entered.promise
+    state.priceVersion += 1 // An observer advances the input after rows were read, while coverage is pending.
+    release.resolve(); await pipeline.focus.task; await finishSeed(pipeline)
+    const reads = store.queries.filter(query => query.order === 'desc' && query.limit === 1536).length - before
+    assert.equal(reads, 2, 'The stale read proof must be refreshed for the new price input.')
+    assert.equal(state.historyReadRange.priceVersion, state.priceVersion)
+  } finally { release.resolve(); await pipeline.dispose() }
+})
+
+test('evicting a previously inspected reserve also retires its read proof', async () => {
+  const rows = source(4000), latest = rows.at(-1)!.timestamp, { pipeline, store } = fixture(rows)
+  try {
+    await focusHistory(pipeline, instId, '15m', latest - interval); await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`)
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: latest - 802 * interval }, 'extend')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    assert.ok(state.historyReadRange.from <= latest - 2000 * interval)
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: latest - 200 * interval }, 'newer')
+    await pipeline.focus.task
+    pipeline.retainRows(state, 1536)
+    assert.ok(state.historyReadRange.from >= latest - 1479 * interval)
+    const before = store.queries.filter(query => query.order === 'desc' && query.limit === 1536).length
+    const target = latest - 1100 * interval
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target }, 'older')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    assert.equal(store.queries.filter(query => query.order === 'desc' && query.limit === 1536).length, before + 1)
+    assert.ok(state.rows.has(target - (96 + 384 - 1) * interval), 'Navigation must read back evicted durable rows before the margin runs out.')
+  } finally { await pipeline.dispose() }
+})
+
 for (const heldReplay of [false, true]) test(`historical invalidation restarts backend focus without renderer reads${heldReplay ? ' while an obsolete replay is in flight' : ''}`, async () => {
   const rows = source(5000), target = rows[2000].timestamp, { pipeline, store } = fixture(rows)
   const gate = deferred(), entered = deferred(), frames: any[] = []

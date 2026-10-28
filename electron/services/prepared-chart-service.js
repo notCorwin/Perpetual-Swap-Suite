@@ -7,6 +7,7 @@ import { stopOperationWorker } from './operation-worker.js'
 import { completePriceCandle } from './market-records.js'
 
 const VISIBLE = 96, TAIL = 128, CHUNK = 1024, HISTORY = 1536, HISTORY_AHEAD = 256, HISTORY_PAGE = 300
+const HISTORY_RUNWAY = 384 // Covers 192 candles plus 1.5 s at two candles per 60 Hz frame.
 const INDICATOR_WARMUP = 199 // EMA200 is the longest initial seed.
 // Formula versions identify the complete recursive state and verified producer.
 // Older checkpoints do not contain ATR14's Wilder accumulator and SMA seed.
@@ -643,13 +644,30 @@ export class PreparedChartPipeline {
     if (oiChanged) state.oiVersion = (state.oiVersion ?? 0) + 1
     if (takerChanged) state.takerVersion = (state.takerVersion ?? 0) + 1
     if (pricesChanged) this.invalidateDerived(state, changedFrom)
-    this.retainRows(state, this.liveStates.get(state.key) === state ? TAIL : HISTORY, end)
+    const retained = this.retainRows(state, this.liveStates.get(state.key) === state ? TAIL : HISTORY, end)
+    const inspectedPriceVersion = state.priceVersion
     const coverage = await this.store.coverage(state.instId, state.timeframe, priority)
     state.latestHour = coverage.last === null ? state.latestHour : Math.max(state.latestHour ?? -Infinity, coverage.last)
     const listing = Number(this.instrument(state.instId)?.listTime)
     state.floor = Number.isFinite(listing) && listing > 0 ? Math.ceil(listing / state.intervalMS) * state.intervalMS : null
     state.loaded = true
     if (limit === HISTORY) {
+      // A local read proves which durable interval was inspected even when it
+      // contains holes. Keep that proof separate from the rows actually found:
+      // missing source data must not trigger another identical read on every
+      // cursor move, and a revision change must invalidate the proof.
+      const currentRetention = state.retainedRange
+      if (retained && currentRetention) {
+        const retainedFrom = Math.max(retained.from, currentRetention.from), retainedThrough = Math.min(retained.through, currentRetention.through)
+        let first = Math.max(from ?? 0, retainedFrom), last = Math.min(through, retainedThrough)
+        const prior = state.historyReadRange
+        if (prior && prior.revision === residentRevision && prior.priceVersion === inspectedPriceVersion
+          && prior.from <= last + state.intervalMS && prior.through >= first - state.intervalMS) {
+          first = Math.max(retainedFrom, Math.min(first, prior.from))
+          last = Math.min(retainedThrough, Math.max(last, prior.through))
+        }
+        state.historyReadRange = first <= last ? { from: first, through: last, revision: residentRevision, priceVersion: inspectedPriceVersion } : null
+      }
       const hours = rows.filter(row => row.confirmed && state.rows.has(row.timestamp)).map(row => row.timestamp)
       // Combine same-revision admission only inside the retained facts. A late
       // overlapping query cannot narrow the current reserve's local proof.
@@ -670,7 +688,7 @@ export class PreparedChartPipeline {
   }
 
   retainRows(state, limit, cursor = state.historyEnd) {
-    if (!state.rows.size) { this.pruneSourceAttempts(state); return }
+    if (!state.rows.size) { state.retainedRange = null; state.historyReadRange = null; this.pruneSourceAttempts(state); return null }
     // Current navigation owns the whole reserve, even when an older query or
     // a latest-tail hydration finishes after focus has moved.
     if (limit !== TAIL && state.key === this.focus?.key) cursor = this.focus.end
@@ -680,8 +698,14 @@ export class PreparedChartPipeline {
     for (const hour of state.rows.keys()) if (hour < first || hour > last) {
       state.rows.delete(hour); state.indicators.delete(hour); state.projectedBars?.delete(hour)
     }
+    state.retainedRange = { from: first, through: last }
+    if (state.historyReadRange) {
+      const from = Math.max(first, state.historyReadRange.from), through = Math.min(last, state.historyReadRange.through)
+      state.historyReadRange = from <= through ? { ...state.historyReadRange, from, through } : null
+    }
     for (const hour of state.indicatorFailures?.keys() ?? []) if (!state.rows.has(hour)) state.indicatorFailures.delete(hour)
     this.pruneSourceAttempts(state)
+    return state.retainedRange
   }
 
   pruneSourceAttempts(state) {
@@ -824,15 +848,38 @@ export class PreparedChartPipeline {
     const reserve = targetEnd === undefined ? undefined : { from: targetEnd - (reserveBars - 1) * intervalFor(timeframe), through: targetEnd }
     const resident = this.series.get(seriesKey(instId, timeframe))
     if (resident) resident.chartRequested = true
-    // Keep a visible window plus one ahead-page resident before extending the
-    // larger reserve. This amortizes edge expansion across many cursor moves.
-    if (resident && this.preparedHistoryReserve(resident, targetEnd, VISIBLE + HISTORY_AHEAD)) {
+    // Keep enough prepared runway to cover a delayed history transfer while
+    // amortizing each local admission across many cursor moves.
+    if (resident && this.preparedHistoryReserve(resident, targetEnd, VISIBLE + HISTORY_RUNWAY)) {
       const first = targetEnd - (VISIBLE - 1) * resident.intervalMS
       const failureVisible = [...resident.indicatorFailures.keys()].some(hour => hour >= first && hour <= targetEnd)
         || [...this.sourceAttempts.values()].some(attempt => attempt.seriesKey === resident.key
           && attempt.from <= targetEnd && attempt.through >= first)
       if (failureVisible) this.publish(resident)
       return null
+    }
+    if (resident && targetEnd !== undefined && resident.loaded) {
+      const needsReserveRead = () => {
+        const step = resident.intervalMS, firstVisible = Math.max(0, targetEnd - (VISIBLE - 1) * step, resident.floor ?? 0)
+        const admitted = resident.historyRange, revision = this.store.candleRevision?.(instId, timeframe)
+        let visible = Boolean(admitted && firstVisible >= admitted.from && targetEnd <= admitted.through && admitted.revision === revision)
+        for (let hour = firstVisible; visible && hour <= targetEnd; hour += step) visible = completePriceCandle(resident.rows.get(hour))
+        const firstReserve = Math.max(0, targetEnd - (VISIBLE + HISTORY_RUNWAY - 1) * step, resident.floor ?? 0)
+        const read = resident.historyReadRange
+        const inspected = read && read.from <= firstReserve && read.through >= targetEnd
+          && read.revision === revision && read.priceVersion === resident.priceVersion
+        return visible && !inspected
+      }
+      while (this.currentFocus(focus) && needsReserveRead()) {
+        // An admitted reserve read belongs to the series, not the transient
+        // cursor that happened to request it. New cursors share it, and a
+        // distant missing viewport can still take its independent read lane.
+        await this.job(`reserve:${resident.key}`, async () => {
+          await this.read(resident, targetEnd, HISTORY, 'foreground')
+          if (this.focus?.key === resident.key && this.focus.end !== undefined) this.seed(resident, 'foreground', this.focus)
+        })
+      }
+      if (!this.currentFocus(focus)) return null
     }
     let frame = targetEnd === undefined ? await this.local(instId, timeframe) : await this.localHistory(instId, timeframe, targetEnd)
     const state = this.state(instId, timeframe)
