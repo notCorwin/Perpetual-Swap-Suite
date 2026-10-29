@@ -713,6 +713,38 @@ test('restored renewal targets include prior qualification without turning every
   } finally { await restored?.dispose(); await f.close() }
 })
 
+test('restored expired checks wait for startup discovery before reporting unavailable', async () => {
+  const configuration = disabled(); configuration.liquidity.openInterest.enabled = true
+  const f = await fixture(configuration)
+  const gate = deferred()
+  let blocked = false, restored: MarketService | undefined, refresh: Promise<void> | undefined
+  try {
+    const timestamp = Date.now() - 100_000
+    await f.service.persistCatalog([{ instrument, ticker, result: { eligible: true, status: 'verified' }, status: 'verified', observedAt: timestamp, expiresAt: timestamp + 1 }])
+    await f.service.dispose()
+    restored = new MarketService(f.store, () => configuration, async input => {
+      const path = new URL(String(input)).pathname
+      if (path.endsWith('/public/instruments')) { blocked = true; await gate.promise; return response([instrument]) }
+      if (path.endsWith('/market/tickers')) return response([ticker])
+      if (path.endsWith('/public/open-interest')) return response([])
+      throw new Error(`Unexpected ${path}`)
+    }, false)
+    isolateQualification(restored)
+    await restored.ready
+    refresh = restored.refresh()
+    await waitFor(() => blocked)
+    const waiting = await restored.snapshot()
+    assert.equal(waiting.catalogProgress.unknown, 1)
+    assert.equal(waiting.catalogProgress.pending, 1)
+    assert.equal(waiting.loading, true)
+    assert.equal(waiting.error, '')
+    gate.resolve(); await refresh
+    const completed = await restored.snapshot()
+    assert.equal(completed.catalogProgress.pending, 0)
+    assert.match(completed.error, /verification is unavailable/i)
+  } finally { gate.resolve(); await refresh; await restored?.dispose(); await f.close() }
+})
+
 test('known failing historical turnover does not consume per-contract book requests', async () => {
   const configuration = disabled()
   for (const key of ['spread', 'depth', 'openInterest', 'volume24h'] as const) configuration.liquidity[key].enabled = true

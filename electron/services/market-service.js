@@ -145,6 +145,7 @@ export class MarketService {
     this.renewalTargets = new Map()
     this.candidateTasks = new Map()
     this.pendingCandidates = new Map()
+    this.refreshAdmission = null
     this.catalogControllers = new Set()
     this.qualificationReads = new Set()
     this.qualificationReadQueue = []
@@ -2597,6 +2598,10 @@ export class MarketService {
     const controller = new AbortController(), config = this.prefs().liquidity, configKey = JSON.stringify(config)
     this.refreshController = controller
     this.catalogControllers.add(controller)
+    // Cached checks are already scheduled for the full refresh, even while
+    // discovery and the shared ticker request have yet to admit each check.
+    const admission = { configKey, ids: new Set([...this.catalogChecks].filter(([, record]) => !reuse || record.status === 'unknown' || record.status === 'verified' && !this.validCatalogEntry(record)).map(([id]) => id)) }
+    this.refreshAdmission = admission
     const startedAt = Date.now()
     this.refreshStartedAt = startedAt
     this.refreshing = (async () => {
@@ -2613,8 +2618,10 @@ export class MarketService {
         candidates.sort((a, b) => Number(this.renewalTargets.has(b.instId)) - Number(this.renewalTargets.has(a.instId)))
         // A successful check publishes independently; the first row does not wait for the full exchange scan.
         const sources = {}
-        await Promise.all(candidates.filter(instrument => !reuse || this.catalogChecks.get(instrument.instId)?.status === 'unknown')
-          .map(instrument => this.checkCandidate(instrument, config, configKey, controller.signal, 'foreground', { sources })))
+        const checks = candidates.filter(instrument => !reuse || this.catalogChecks.get(instrument.instId)?.status === 'unknown')
+          .map(instrument => this.checkCandidate(instrument, config, configKey, controller.signal, 'foreground', { sources }))
+        if (this.refreshAdmission === admission) this.refreshAdmission = null
+        await Promise.all(checks)
         if (!controller.signal.aborted && this.catalogCriteriaKey() === configKey) {
           this.lastRefreshAt = startedAt
           this.sourceError('refresh', null)
@@ -2622,6 +2629,7 @@ export class MarketService {
       } catch (error) {
         if (!controller.signal.aborted && !this.disposed && !(error && typeof error === 'object' && this.handledSourceErrors.has(error))) this.sourceError('refresh', error)
       } finally {
+        if (this.refreshAdmission === admission) this.refreshAdmission = null
         this.catalogControllers.delete(controller)
         this.pruneCatalog()
         if (this.refreshController === controller) this.refreshController = null
@@ -2768,6 +2776,7 @@ export class MarketService {
     const { rows, turnoverOrder, qualifiedCount, current: listCurrent } = this.canonicalMarketList()
     const configKey = this.catalogCriteriaKey()
     const pendingIDs = new Set([...this.pendingCandidates.values()].filter(value => value.configKey === configKey).map(value => value.instId))
+    if (this.refreshAdmission?.configKey === configKey) for (const instId of this.refreshAdmission.ids) pendingIDs.add(instId)
     for (const recovery of this.sourceRecoveries.values()) pendingIDs.add(recovery.instId)
     for (const instId of this.tickerRecoveries.keys()) pendingIDs.add(instId)
     // A live notification can reach IPC before an already-due deadline gets
