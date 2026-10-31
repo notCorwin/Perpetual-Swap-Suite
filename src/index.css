@@ -5,7 +5,8 @@
 @source "../node_modules/@streamdown/code/dist/*.js";
 
 @theme inline {
-  --font-sans: system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --font-sans: var(--font-mono);
   --font-heading: var(--font-sans);
   --color-positive: var(--positive);
   --color-negative: var(--negative);
@@ -62,7 +63,7 @@
   --chart-roc-negative-area: color-mix(in srgb, var(--negative) 12%, transparent);
   --chart-positive-label: color-mix(in srgb, var(--positive) 50%, var(--foreground));
   --chart-negative-label: color-mix(in srgb, var(--negative) 50%, var(--foreground));
-  --chart-text-size: 10px;
+  --chart-text-size: 14px;
   --chart-line-width: 1px;
   --chart-legend-gap: 24px;
   --chart-price-label-padding-y: 3px;

@@ -268,6 +268,8 @@ const clickByRect = async locator => {
 }
 
 test('default selection uses absolute completed-candle change with nulls last and stable contract ties', async () => {
+  const rankingHeader = page.getByRole('columnheader', { name: /15m change.*By magnitude/ })
+  assert.equal(await rankingHeader.getAttribute('aria-sort'), 'other')
   assert.deepEqual(await page.locator('[data-market-index]').evaluateAll(rows => rows.map(row => row.getAttribute('aria-label'))), [
     'View BETA-USDT-SWAP chart', 'View ZETA-USDT-SWAP chart', 'View ALPHA-USDT-SWAP chart', 'View NULL-USDT-SWAP chart',
   ])
@@ -421,7 +423,7 @@ test('the existing chart toolbar provides window dragging while its controls rem
   const toolbar = page.locator('[data-chart-toolbar]')
   await assertWorkspaceLayout(page)
   assert.equal(await toolbar.evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'drag')
-  for (const name of ['5m', '15m', '1h', 'Copy chart', 'Analyze Long', 'Analyze Short']) {
+  for (const name of ['5m', '15m', '1h', 'Copy chart', 'Analyze Long', 'Analyze Short', 'Chart controls']) {
     assert.equal(await toolbar.getByRole('button', { name, exact: true }).evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
   }
   assert.equal(await toolbar.getByRole('heading').count(), 0, 'The toolbar must retain the original chart actions and status without an application title.')
@@ -446,6 +448,50 @@ test('the existing chart toolbar provides window dragging while its controls rem
   }
   assert.equal(await settings.getByRole('link', { name: 'Back to markets', exact: true }).evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
   await backToMarkets()
+})
+
+test('chart controls explain interaction and keep market shortcuts out of the dialog', async () => {
+  const trigger = page.getByRole('button', { name: 'Chart controls', exact: true })
+  await trigger.click()
+  const dialog = page.getByRole('dialog', { name: 'Chart controls' })
+  assert.equal(await dialog.isVisible(), true)
+  assert.match(await dialog.textContent(), /Scroll over the chart to browse history/)
+  const current = await selected().getAttribute('aria-label')
+  await page.keyboard.press('ArrowDown')
+  assert.equal(await selected().getAttribute('aria-label'), current)
+  await page.keyboard.press('Escape')
+  assert.equal(await dialog.isVisible(), false)
+  assert.equal(await trigger.evaluate(element => element === document.activeElement), true)
+})
+
+test('chart legends remain inside the plot with analysis open at the minimum window size', async () => {
+  const originalSize = page.viewportSize()
+  try {
+    await page.setViewportSize({ width: 1200, height: 640 })
+    await page.waitForFunction(() => document.querySelector('[data-chart-inst]')?.dataset.chartLoading === 'false')
+    await page.getByRole('button', { name: 'Analyze Long', exact: true }).click()
+    await page.getByRole('complementary', { name: 'Chart analysis' }).waitFor()
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    const overflow = await page.locator('svg[data-rendered-inst]').evaluate(svg => {
+      const plot = svg.getBoundingClientRect()
+      return [...svg.querySelectorAll('[data-chart-panel-header]')].map(header => {
+        const bounds = header.getBoundingClientRect()
+        return { panel: header.dataset.chartPanelHeader, left: bounds.left - plot.left, right: bounds.right - plot.right }
+      }).filter(bounds => bounds.left < -1 || bounds.right > 1)
+    })
+    assert.deepEqual(overflow, [], 'Indicator legends must fit inside the resized chart.')
+    const timeLabels = await page.locator('svg[data-rendered-inst] [data-chart-time-label]').evaluateAll(labels => labels.map(label => {
+      const bounds = label.getBoundingClientRect()
+      return { left: bounds.left, right: bounds.right }
+    }))
+    assert.ok(timeLabels.length >= 2, 'The time axis must retain context and its newest label.')
+    assert.ok(timeLabels.every((label, index) => index === 0 || label.left >= timeLabels[index - 1].right), 'Time labels must not overlap.')
+    if (process.env.PERPETUAL_SWAP_ANALYSIS_SCREENSHOT) await page.screenshot({ path: process.env.PERPETUAL_SWAP_ANALYSIS_SCREENSHOT })
+  } finally {
+    const close = page.getByRole('button', { name: 'Close analysis' })
+    if (await close.isVisible()) await close.click()
+    await page.setViewportSize(originalSize)
+  }
 })
 
 test('a prepared idle chart makes no periodic window requests and accepts a pushed forming candle', async () => {
@@ -908,7 +954,7 @@ test('preference drafts survive category changes and validation returns to the f
   assert.equal(preferences.liquidity.spread.enabled, false)
   assert.deepEqual(preferences.liquidity.volumeStability, { enabled: true, maxRatio: 2.5 })
   await backToMarkets()
-  await page.getByRole('columnheader', { name: '30m change', exact: true }).waitFor()
+  await page.getByRole('columnheader', { name: '30m change By magnitude', exact: true }).waitFor()
   await selectTimeframe(page, '5m')
   await page.waitForFunction(() => document.querySelector('[aria-label="Chart timeframe"] button[aria-pressed="true"]')?.textContent === '5m')
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.preferences.rankingLookback), 30, 'Chart timeframe must not change the independent ranking window.')
@@ -1015,7 +1061,7 @@ test('saving only the ranking lookback keeps the chosen chart and qualified mark
   await settings.getByRole('button', { name: 'Save settings', exact: true }).click()
   await settings.getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
   await backToMarkets()
-  await page.getByRole('columnheader', { name: '45m change', exact: true }).waitFor()
+  await page.getByRole('columnheader', { name: '45m change By magnitude', exact: true }).waitFor()
   assert.equal(await selected().getAttribute('aria-label'), 'View BETA-USDT-SWAP chart')
   assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
   assert.equal(await page.locator('[aria-label="Chart timeframe"] button[aria-pressed="true"]').textContent(), '5m')
@@ -1117,6 +1163,9 @@ test('manual history downloads show exact pushed progress and retry details, con
   await settings.getByRole('button', { name: 'Download all qualified history', exact: true }).click()
   await settings.getByRole('status').filter({ hasText: 'Downloading history · 10.0%' }).waitFor()
   const details = settings.locator('[aria-label="History download details"]')
+  assert.equal(await details.isVisible(), false)
+  await settings.getByText('100 / 1,000 source timestamps checked', { exact: true }).waitFor()
+  await settings.getByText('Download details and coverage', { exact: true }).click()
   await details.getByText('100 / 1,000', { exact: true }).waitFor()
   await details.getByText('1 / 18', { exact: true }).waitFor()
   const active = settings.getByRole('list', { name: 'Active history downloads' })

@@ -42,7 +42,7 @@ const chartTokenNumber = (token: string, fallback: number) => {
   return Number.isFinite(value) ? value : fallback
 }
 const chartTokens = {
-  textSize: chartTokenNumber('--chart-text-size', 10),
+  textSize: chartTokenNumber('--chart-text-size', 14),
   legendGap: chartTokenNumber('--chart-legend-gap', 24),
   priceLabelPaddingY: chartTokenNumber('--chart-price-label-padding-y', 3),
 } as const
@@ -153,6 +153,17 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       </g>
     </g>
   }
+  // Reserve the newest label first; older ticks are only useful when their
+  // measured text fits without colliding with the next retained label.
+  let nextTimeLabelStart = Infinity
+  const timeLabels = bars.map((bar, index) => ({ bar, index })).filter(({ bar, index }) => index === n - 1 || (bar.hour - firstHour) % (24 * intervalMS) === 0).reverse().filter(({ bar, index }) => {
+    const width = chartTextWidth(hourLabel(bar.hour))
+    const start = x[index] + contentOffset - (index === 0 ? 0 : index === n - 1 ? width : width / 2)
+    const end = start + width
+    if (end + 8 > nextTimeLabelStart || inspectedTime && !(end < inspectedTimeX - 4 || start > inspectedTimeX + inspectedTimeWidth + 4)) return false
+    nextTimeLabelStart = start
+    return true
+  }).reverse()
   return <>
     <defs>
       <pattern id={`${areaClipId}-sell-hatch`} width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
@@ -178,11 +189,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     <g clipPath={`url(#${areaClipId}-content)`}>
       <g transform={`translate(${contentOffset},0)`} data-chart-wheel-content data-chart-wheel-offset={contentOffset}>
     {bars.flatMap((bar, index) => (bar.hour - firstHour) % (12 * intervalMS) === 0 ? panelKeys.map(key => <line key={`${(bar.hour - firstHour) / intervalMS}-${key}`} x1={x[index]} x2={x[index]} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--border)" strokeOpacity="0.22" />) : [])}
-    {bars.map((bar, index) => ({ bar, index })).filter(({ bar, index }) => index === n - 1 || (bar.hour - firstHour) % (24 * intervalMS) === 0).filter(({ bar, index }) => {
-      if (!inspectedTime) return true
-      const width = chartTextWidth(hourLabel(bar.hour)), start = x[index] + contentOffset - (index === 0 ? 0 : index === n - 1 ? width : width / 2)
-      return start + width < inspectedTimeX - 4 || start > inspectedTimeX + inspectedTimeWidth + 4
-    }).map(({ bar, index }) => <text key={(bar.hour - firstHour) / intervalMS} x={x[index]} y={height - 7} textAnchor={index === 0 ? "start" : index === n - 1 ? "end" : "middle"} fill="var(--muted-foreground)">{hourLabel(bar.hour)}</text>)}
+    {timeLabels.map(({ bar, index }) => <text data-chart-time-label key={(bar.hour - firstHour) / intervalMS} x={x[index]} y={height - 7} textAnchor={index === 0 ? "start" : index === n - 1 ? "end" : "middle"} fill="var(--muted-foreground)">{hourLabel(bar.hour)}</text>)}
     {/* Expose contrasting segments within the same 1px stroke for the mandated light green. */}
     <g clipPath={`url(#${areaClipId}-price)`}>
     <path d={upWicks} fill="none" stroke="var(--foreground)" />
@@ -294,6 +301,7 @@ const ChartSurface = memo(function ChartSurface({ surface, size, selected, inspe
 })
 
 export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect }: { instId: string; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
+  const controlsHelp = useRef<HTMLDialogElement>(null)
   const view = useSyncExternalStore(chartController.subscribe, chartController.getSnapshot)
   useLayoutEffect(() => {
     if (!isActive) return
@@ -406,7 +414,7 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
     const navigate = (event: KeyboardEvent) => {
       if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.defaultPrevented || event.isComposing || event.keyCode === 229) return
       const target = event.target instanceof Element ? event.target : document.activeElement
-      if (target?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="radio"], [role="radiogroup"], [role="combobox"], [role="slider"], [role="spinbutton"], [role="tablist"], [role="tree"], [role="grid"], [role="dialog"], [role="alertdialog"], [role="menu"], [role="menubar"], [role="listbox"], [aria-haspopup][aria-expanded="true"]')) return
+      if (target?.closest('input, textarea, select, dialog, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="radio"], [role="radiogroup"], [role="combobox"], [role="slider"], [role="spinbutton"], [role="tablist"], [role="tree"], [role="grid"], [role="dialog"], [role="alertdialog"], [role="menu"], [role="menubar"], [role="listbox"], [aria-haspopup][aria-expanded="true"]')) return
       if (!(event.key === 'ArrowUp' || event.key === 'ArrowDown' || event.key === 'ArrowLeft' || event.key === 'ArrowRight')) return
       const id = chartNavigationTarget(listOrder, turnoverOrder, navigationId.current, event.key)
       if (!id) return
@@ -532,10 +540,24 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
       <ToggleGroup variant="outline" size="sm" className="mr-auto" value={[timeframe]} onValueChange={values => { const value = values[0]; if (value) onTimeframeChange?.(value as RadarTimeframe) }} aria-label="Chart timeframe">{RADAR_TIMEFRAMES.map(item => <ToggleGroupItem key={item.value} value={item.value}>{item.label}</ToggleGroupItem>)}</ToggleGroup>
       <Button variant="outline" size="sm" disabled={pending || !bars.length || plotSize.width <= 0 || captureStatus === 'copying' || analysis?.phase === 'capturing'} onClick={() => { void captureChart() }}><Camera data-icon="inline-start" aria-hidden="true" />{captureStatus === 'copying' ? 'Copying…' : 'Copy chart'}</Button>
       <ButtonGroup aria-label="Chart analysis actions">{(['long', 'short'] as const).map(direction => <Button key={direction} variant="outline" size="sm" disabled={captureStatus === 'copying' || (analysis?.direction !== direction && (analysisBusy || pending || !bars.length || plotSize.width <= 0))} title={analysis?.direction === direction ? `Open existing ${direction} analysis` : undefined} onClick={() => { if (analysis?.direction === direction) setAnalysisOpen(true); else analyzeChart(direction) }}>{analysisBusy && analysis?.direction === direction && <Spinner data-icon="inline-start" />}Analyze {direction === 'long' ? 'Long' : 'Short'}</Button>)}</ButtonGroup>
+      <Button variant="ghost" size="sm" onClick={() => controlsHelp.current?.showModal()}>Chart controls</Button>
       <span role="status" className="sr-only">{captureStatus === 'flashing' ? 'Chart copied to clipboard' : ''}</span>
       {(historical || displayedFrame !== timeframe) && <Badge variant="secondary">{timeframeLabel(displayedFrame)}{historical ? ' history' : ' chart'}</Badge>}
       {!historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} />}
     </header>
+    <dialog ref={controlsHelp} aria-labelledby="chart-controls-title" className="m-auto w-[min(28rem,calc(100%-2rem))] rounded-lg border bg-popover p-6 text-popover-foreground backdrop:bg-background/80">
+      <div className="flex flex-col gap-4">
+        <h2 id="chart-controls-title" className="text-base font-medium">Chart controls</h2>
+        <ul className="flex list-disc flex-col gap-2 pl-4 text-sm">
+          <li>Scroll over the chart to browse history</li>
+          <li>Hold and drag on the chart to inspect candles; release to return to the window end</li>
+          <li>Hover an RSI crossing marker to inspect it, or focus the chart and use Alt + Left or Right to move between crossings</li>
+          <li>Press Escape to clear a chart inspection</li>
+          <li>Use Up or Down to change contracts; Left selects the largest move and Right selects the highest 24h volume</li>
+        </ul>
+        <div className="flex justify-end"><Button variant="outline" size="sm" onClick={() => controlsHelp.current?.close()}>Close</Button></div>
+      </div>
+    </dialog>
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}</div>}
     {capture.error && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{capture.error}</p>}
     <div className="flex min-h-0 flex-1">

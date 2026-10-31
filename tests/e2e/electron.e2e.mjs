@@ -270,7 +270,7 @@ test('canonical catalog rows show contract, live price, and ranking independentl
   assert.equal(await cells.nth(0).getAttribute('title'), fixture.instId)
   assert.doesNotMatch((await cells.nth(1).textContent()) ?? '', /—/)
   assert.match((await cells.nth(2).textContent()) ?? '', /[↑↓→▲▼↔+−-].*%|—/)
-  assert.deepEqual(await page.locator('[data-market-list] th').allTextContents(), ['Contract', 'Price', '15m change'])
+  assert.deepEqual(await page.locator('[data-market-list] th').allTextContents(), ['Contract', 'Price', '15m changeBy magnitude'])
   await page.locator('[data-chart-panel]').waitFor({ state: 'visible' })
   await selectTimeframe(page, fixture.timeframe)
   await page.locator(`[data-chart-inst="${fixture.instId}"]`).waitFor({ state: 'visible' })

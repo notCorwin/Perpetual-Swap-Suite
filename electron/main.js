@@ -178,7 +178,7 @@ async function createWindow() {
     ...testWindowOptions(backgroundTests),
     frame: false,
     ...(process.platform === 'darwin' ? { titleBarStyle: 'hidden', trafficLightPosition: windowToolbarLayout(1600, true).buttonsPosition } : {}),
-    width: 1600, height: 1000, minWidth: 400, minHeight: 300,
+    width: 1600, height: 1000, minWidth: 1200, minHeight: 640,
     title: 'Perpetual Swap Suite', backgroundColor: '#101114', show: !testMode && !backgroundTests,
     webPreferences: { ...testWindowOptions(backgroundTests).webPreferences,
       preload: join(root, 'electron', 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
