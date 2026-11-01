@@ -3,6 +3,7 @@ import { strict as assert } from 'node:assert'
 import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { MarketStore } from '../electron/services/market-store.js'
 
 const step = 300_000, base = Date.UTC(2024, 0, 1)
@@ -89,6 +90,45 @@ test('native coverage reports exact gaps and independently expires explicit abse
     assert.deepEqual(await f.store.statisticsMissingRanges(source), [{ from: base + step, through: query.through }])
     await f.store.appendStatistics({ ...source, expiresAt: Date.now() + 60_000 })
     assert.deepEqual(await f.store.statisticsMissingRanges(source), [])
+  } finally { await f.close() }
+})
+
+test('coverage follows continuous series bounds through gaps, replacement and imported facts', async () => {
+  const f = await fixture(), range = { ...query, through: base + 4 * step }
+  try {
+    assert.deepEqual(await f.store.missingCandleRanges(range), [{ from: base, through: range.through }])
+    await f.store.appendCandles([0, 1, 3, 4].map(index => candle(index)))
+    assert.deepEqual(await f.store.missingCandleRanges(range), [{ from: base + 2 * step, through: base + 2 * step }])
+    await f.store.appendCandles([candle(2), candle(2)])
+    assert.deepEqual(await f.store.missingCandleRanges(range), [])
+    assert.deepEqual(await f.store.missingCandleRanges({ ...range, from: base + 1, through: base + 4 * step - 1 }), [])
+    assert.deepEqual(await f.store.missingCandleRanges({ ...range, through: base + 5 * step }), [{ from: base + 5 * step, through: base + 5 * step }])
+
+    await f.store.replaceCandles({ ...range, from: base + 2 * step, through: base + 2 * step }, [])
+    assert.deepEqual(await f.store.missingCandleRanges(range), [{ from: base + 2 * step, through: base + 2 * step }])
+    // Imported rows cannot resurrect a replaced range; native repairs can.
+    await (f.store as any).writer.request('append', [[{ ...candle(2), writtenAt: 100 }], { importing: true }])
+    assert.deepEqual(await f.store.missingCandleRanges(range), [{ from: base + 2 * step, through: base + 2 * step }])
+    await f.store.appendCandles([candle(2)])
+    assert.deepEqual(await f.store.missingCandleRanges(range), [])
+
+    const expired = { ...range, source: 'oi' as const, values: [[base, 10]], expiresAt: 1 }
+    await f.store.appendStatistics(expired)
+    assert.deepEqual(await f.store.statisticsMissingRanges(expired), [{ from: base + step, through: range.through }])
+    await f.store.appendStatistics({ ...expired, expiresAt: Date.now() + 60_000 })
+    assert.deepEqual(await f.store.statisticsMissingRanges(expired), [])
+  } finally { await f.close() }
+})
+
+test('integrity inspection detects gaps even if series metadata was corrupted', async () => {
+  const f = await fixture(), range = { ...query, through: base + 2 * step }
+  try {
+    await f.store.appendCandles([candle(0), candle(1), candle(2)])
+    const database = new DatabaseSync(f.store.path)
+    try { database.prepare('DELETE FROM candles WHERE timestamp=?').run(base + step) } finally { database.close() }
+    const inspection = await f.store.inspectCandles(range)
+    assert.deepEqual(inspection.missingRanges, [{ from: base + step, through: base + step }])
+    assert.ok(inspection.issues.some(issue => issue.reason === 'gap' && issue.from === base + step))
   } finally { await f.close() }
 })
 

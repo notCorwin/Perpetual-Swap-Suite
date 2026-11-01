@@ -1743,9 +1743,12 @@ export class PreparedChartPipeline {
     for (const row of rows) assertCandleGrid(row.timestamp, intervalFor(row.timeframe))
     for (const [key, batch] of Map.groupBy(rows, row => seriesKey(row.instrument, row.timeframe))) {
       const state = this.series.get(key), live = this.liveStates.get(key)
+      const consumers = [state, live].filter(Boolean)
+      if (!consumers.length) continue
+      const ordered = batch.length > 1 ? batch.toSorted((a, b) => a.timestamp - b.timestamp) : batch
       let changedFrom = Infinity
-      for (const current of [state, live].filter(Boolean)) {
-        for (const row of batch.toSorted((a, b) => a.timestamp - b.timestamp)) {
+      for (const current of consumers) {
+        for (const row of ordered) {
           const changed = !samePrice(previous.get(row.timestamp), row)
           if (changed) {
             current.priceVersion += 1

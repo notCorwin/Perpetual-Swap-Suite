@@ -374,12 +374,18 @@ const statisticRows = query => {
   return [...result.values()]
 }
 
-function missingRanges(query, source = 'candles') {
+function missingRanges(query, source = 'candles', verify = false) {
   if (!['candles', 'oi', 'taker'].includes(source)) throw new TypeError('Invalid history source.')
   const valid = validateQuery(query), step = CANDLE_INTERVALS[valid.timeframe], series = identity(valid)
   const from = Math.ceil(valid.from / step) * step, through = Math.floor(valid.through / step) * step
   if (from > through) return []
   if (!series) return [{ from, through }]
+  // A series' bounds and count commit atomically with its unique, on-grid
+  // candles. Equality proves every slot in the series exists, so a contained
+  // range needs no scan. Audits deliberately inspect the facts themselves.
+  if (!verify && source === 'candles' && series.first_ts !== null && series.last_ts !== null
+    && from >= series.first_ts && through <= series.last_ts
+    && series.candle_count === (series.last_ts - series.first_ts) / step + 1) return []
   const sourceBit = source === 'oi' ? 1 : 2
   const contradicted = source === 'taker' ? ' AND NOT(value1=0 AND value2=0 AND EXISTS(SELECT 1 FROM candles c WHERE c.series_id=statistics.series_id AND c.timestamp=statistics.timestamp AND (c.volume>0 OR c.quote_volume>0)))' : ''
   const staleDerived = source === 'taker' ? ' AND (observed_volume IS NULL OR EXISTS(SELECT 1 FROM candles c WHERE c.series_id=statistics.series_id AND c.timestamp=statistics.timestamp AND c.volume=statistics.observed_volume))' : ''
@@ -431,7 +437,7 @@ const commands = {
     return { result: undefined }
   },
   inspect: query => {
-    const valid = validateQuery(query), rows = candleRows(valid), gaps = missingRanges(valid), issues = []
+    const valid = validateQuery(query), rows = candleRows(valid), gaps = missingRanges(valid, 'candles', true), issues = []
     for (const row of rows) {
       const first = Math.floor(row.timestamp / CANDLE_INTERVALS[query.timeframe]) * CANDLE_INTERVALS[query.timeframe]
       const issue = reason => issues.push({ instrument: query.instrument, timeframe: query.timeframe, source: 'candles', from: first, through: first, reason, repairable: true })

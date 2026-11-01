@@ -1424,7 +1424,8 @@ export class MarketService {
       const observations = { ...(this.observations.get(instId) ?? {}) }
       const instrumentObservation = this.instrumentObservations.get(instId)
       const input = this.liquidityInput(instrument, config, observations, now)
-      if (input.book && (config.depth.enabled || config.slippage.enabled) && this.cheapLiquidity(input).status !== 'failed') {
+      const cheap = input.book && (config.depth.enabled || config.slippage.enabled) ? this.cheapLiquidity(input) : null
+      if (cheap && cheap.status !== 'failed') {
         // Keep at most one pending calculation per instrument. A new book
         // replaces pending observations instead of growing the worker backlog.
         if (this.streamEvaluations.has(instId)) continue
@@ -1455,7 +1456,7 @@ export class MarketService {
         })
         this.streamEvaluations.set(instId, task)
         this.track(task)
-      } else records.push(this.observedCandidate(instrument, config, configKey, observations, {}, now))
+      } else records.push(this.observedCandidate(instrument, config, configKey, observations, {}, now, undefined, cheap))
     }
     this.publishStreamRecords(records)
     this.scheduleMarketDeadline()
@@ -2033,9 +2034,9 @@ export class MarketService {
     return this.evaluateLiquidity({ ...input, book: null, config: { ...config, depth: { ...config.depth, enabled: false }, slippage: { ...config.slippage, enabled: false } } })
   }
 
-  observedCandidate(instrument, config, configKey, observations, errors = {}, now = Date.now(), evaluatedResult) {
+  observedCandidate(instrument, config, configKey, observations, errors = {}, now = Date.now(), evaluatedResult, cheapResult) {
     let assessed = observations, input = this.liquidityInput(instrument, config, observations, now)
-    if (!evaluatedResult && input.book && (config.depth.enabled || config.slippage.enabled) && this.cheapLiquidity(input).status === 'failed') input.book = null
+    if (!evaluatedResult && input.book && (config.depth.enabled || config.slippage.enabled) && (cheapResult ?? this.cheapLiquidity(input)).status === 'failed') input.book = null
     let result = evaluatedResult ?? this.evaluateLiquidity(input)
     const required = requiredLiquiditySources(config)
     const historical = required.filter(key => key === 'turnover' || key === 'hourly')

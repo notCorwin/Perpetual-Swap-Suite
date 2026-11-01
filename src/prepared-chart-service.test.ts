@@ -1550,6 +1550,22 @@ test('restored latest cores do not share mutable recursive state and volume corr
   } finally { await pipeline.dispose() }
 })
 
+test('out-of-order confirmed batches advance both chart and live indicators in candle order', async () => {
+  const rows = source(500), { pipeline, store } = fixture(rows)
+  try {
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
+    const additions = Array.from({ length: 3 }, (_, index) => candle(end() + (index + 1) * interval, 500 + index))
+    for (const row of additions) store.change(row)
+    pipeline.observe(additions.toReversed(), new Map())
+    const oracle = buildIndicatorSeries(store.rows, interval).bars.at(-1) as any
+    for (const state of [pipeline.series.get(`${instId}:15m`), pipeline.liveStates.get(`${instId}:15m`)]) {
+      assert.equal(state.indicatorState.lastTimestamp, additions.at(-1)!.timestamp)
+      const latest = state.indicators.get(additions.at(-1)!.timestamp)
+      for (const field of indicatorFields) assert.equal(latest[field], oracle[field])
+    }
+  } finally { await pipeline.dispose() }
+})
+
 
 test('the requested historical viewport publishes exact indicators before its remaining reserve finishes', async () => {
   const rows = source(3500), { pipeline } = fixture(rows), hold = deferred(), reached = deferred()

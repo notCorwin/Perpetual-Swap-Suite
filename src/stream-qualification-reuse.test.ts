@@ -76,6 +76,33 @@ test('enabled source changes and preference changes invalidate assessment reuse'
   } finally { unsubscribe() }
 })
 
+test('a failing cheap qualification preserves complete checks without evaluating the book', async t => {
+  const { service, config } = await fixture(t, ['spread', 'depth'])
+  const failingTicker = ticker(100, 1), currentBook = book()
+  service.receivePublicObservation(instId, 'ticker', failingTicker)
+  service.receivePublicObservation(instId, 'book', currentBook)
+  const operations: OperationEvent[] = []
+  const unsubscribe = attachOperationSink(operation => operations.push(operation))
+  try {
+    service.flushStreamQualifications()
+    assert.equal(operations.filter(operation => operation.name === 'liquidity.evaluate').length, 2,
+      'The cheap rejection is reused; the final enabled-filter checks still require a full assessment.')
+    const input = service.liquidityInput(instrument, config.liquidity, service.observations.get(instId))
+    const expected = evaluateLiquidity({ ...input, book: null })
+    const record = service.catalogChecks.get(instId)
+    assert.equal(record.status, 'failed')
+    assert.deepEqual(record.result, { ...expected, eligible: false })
+    assert.equal(record.result.checks.find((check: { key: string }) => check.key === 'depth')?.status, 'unknown')
+    assert.equal(service.streamEvaluations.size, 0)
+    service.streamLiquidity = { evaluate: async (value: LiquidityInput) => evaluateLiquidity(value), close: async () => {} }
+    service.receivePublicObservation(instId, 'ticker', ticker(100, .01))
+    service.flushStreamQualifications()
+    await Promise.all([...service.streamEvaluations.values()])
+    assert.equal(service.catalogChecks.get(instId).status, 'verified', 'A later observation must be checked against its own inputs.')
+    assert.equal(service.catalogChecks.get(instId).result.checks.find((check: { key: string }) => check.key === 'depth')?.status, 'verified')
+  } finally { unsubscribe() }
+})
+
 test('an in-flight depth result is reused when only disabled source families change', async t => {
   const { service } = await fixture(t, ['depth'])
   let release!: () => void, evaluations = 0
