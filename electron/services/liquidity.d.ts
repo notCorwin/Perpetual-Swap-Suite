@@ -82,7 +82,7 @@ export function eligibleInstrument(instrument: unknown): boolean
 export function evaluateLiquidity(input: LiquidityInput): LiquidityResult
 
 /** Retains exact book calculations for immutable snapshots; contract units and trade notional remain part of the calculation identity. */
-export function createLiquidityEvaluator(): (input: LiquidityInput) => LiquidityResult
+export function createLiquidityEvaluator(): (input: LiquidityInput, previousBook?: LiquidityInput['book']) => LiquidityResult
 
 /**
  * Sum actual quoteVolume over [floor(asOf/300000)*300000 - 24h, floor(asOf/300000)*300000).

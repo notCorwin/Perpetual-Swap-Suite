@@ -120,7 +120,11 @@ export function quoteTurnover24h(candles, asOf) {
   return volumes ? numeric(volumes.reduce(add, ZERO)) : null
 }
 
-function bookSide(levels, instrument, side) {
+const BOOK_BLOCK_SIZE = 32
+
+// A first observation may never be updated. Keep that path as compact as the
+// original evaluator; construct reusable blocks only for a replacement book.
+function initialBookSide(levels, instrument, side) {
   if (!Array.isArray(levels)) return null
   const contractValue = positive(instrument?.ctVal), multiplier = positive(instrument?.ctMult)
   const baseCurrency = typeof instrument?.instId === 'string' ? instrument.instId.split('-')[0] : null
@@ -142,25 +146,99 @@ function bookSide(levels, instrument, side) {
   return { levels: parsed, depth }
 }
 
+function bookSide(levels, instrument, side, prior) {
+  if (!Array.isArray(levels)) return null
+  const contractValue = positive(instrument?.ctVal), multiplier = positive(instrument?.ctMult)
+  const baseCurrency = typeof instrument?.instId === 'string' ? instrument.instId.split('-')[0] : null
+  const denomination = instrument?.ctValCcy
+  if (!contractValue || !multiplier || !baseCurrency || denomination !== baseCurrency && denomination !== 'USDT') return null
+  const units = multiply(contractValue, multiplier)
+  let previous = null
+  const observed = [], parsed = []
+  for (const [index, level] of levels.entries()) {
+    if (!Array.isArray(level)) return null
+    const cached = prior?.observed[index]
+    const entry = cached && Object.is(cached.rawPrice, level[0]) && Object.is(cached.rawSize, level[1]) ? cached : (() => {
+      const price = positive(level[0]), contracts = nonnegative(level[1])
+      if (!price || !contracts) return null
+      const amount = multiply(contracts, units)
+      return { rawPrice: level[0], rawSize: level[1], price, active: contracts.n > 0n, quote: denomination === 'USDT' ? amount : multiply(amount, price) }
+    })()
+    if (!entry) return null
+    const { price } = entry
+    if (previous && (side === 'ask' ? compare(price, previous) <= 0 : compare(price, previous) >= 0)) return null
+    previous = price
+    observed.push(entry)
+    if (entry.active) parsed.push(entry)
+  }
+  let depth = ZERO
+  const blocks = [], through = []
+  for (let start = 0; start < parsed.length; start += BOOK_BLOCK_SIZE) {
+    const entries = parsed.slice(start, start + BOOK_BLOCK_SIZE), old = prior?.blocks[blocks.length]
+    const block = old && old.entries.length === entries.length && entries.every((entry, index) => entry === old.entries[index]) ? old : (() => {
+      let total = ZERO
+      const through = entries.map(entry => { total = add(total, entry.quote); return total })
+      return { entries, through, depth: total }
+    })()
+    blocks.push(block)
+    depth = add(depth, block.depth)
+    through.push(depth)
+  }
+  return { observed, blocks, through, depth, first: parsed[0], baseQuantities: [ZERO] }
+}
+
 function sideSlippage(side, target, direction) {
-  if (!side?.levels.length || !target || compare(side.depth, target) < 0) return null
+  if (side?.levels) {
+    if (!side.levels.length || !target || compare(side.depth, target) < 0) return null
+    let first = 0, last = side.levels.length - 1
+    while (first < last) {
+      const middle = Math.floor((first + last) / 2)
+      if (compare(side.levels[middle].through, target) < 0) first = middle + 1
+      else last = middle
+    }
+    const prefix = side.baseQuantities ??= [ZERO]
+    while (prefix.length <= first) {
+      const level = side.levels[prefix.length - 1]
+      prefix.push(add(prefix.at(-1), divide(level.quote, level.price)))
+    }
+    const level = side.levels[first], remaining = subtract(target, first ? side.levels[first - 1].through : ZERO)
+    const baseQuantity = add(prefix[first], divide(remaining, level.price))
+    if (baseQuantity.n <= 0n) return null
+    const average = divide(target, baseQuantity), reference = side.levels[0].price
+    return multiply(divide(direction === 'ask' ? subtract(average, reference) : subtract(reference, average), reference), HUNDRED)
+  }
+  if (!side?.blocks.length || !target || compare(side.depth, target) < 0) return null
   // Find the terminal fill level, then reuse exact quantities for fully
   // consumed levels. A trade-size edit only recalculates its partial fill.
-  let first = 0, last = side.levels.length - 1
+  let first = 0, last = side.blocks.length - 1
   while (first < last) {
     const middle = Math.floor((first + last) / 2)
-    if (compare(side.levels[middle].through, target) < 0) first = middle + 1
+    if (compare(side.through[middle], target) < 0) first = middle + 1
     else last = middle
   }
-  const prefix = side.baseQuantities ??= [ZERO]
+  const blockIndex = first, block = side.blocks[blockIndex]
+  const blockTarget = subtract(target, blockIndex ? side.through[blockIndex - 1] : ZERO)
+  first = 0; last = block.entries.length - 1
+  while (first < last) {
+    const middle = Math.floor((first + last) / 2)
+    if (compare(block.through[middle], blockTarget) < 0) first = middle + 1
+    else last = middle
+  }
+  const blocksPrefix = side.baseQuantities
+  while (blocksPrefix.length <= blockIndex) {
+    const previousBlock = side.blocks[blocksPrefix.length - 1]
+    previousBlock.baseQuantity ??= previousBlock.entries.reduce((sum, level) => add(sum, divide(level.quote, level.price)), ZERO)
+    blocksPrefix.push(add(blocksPrefix.at(-1), previousBlock.baseQuantity))
+  }
+  const prefix = block.baseQuantities ??= [ZERO]
   while (prefix.length <= first) {
-    const level = side.levels[prefix.length - 1]
+    const level = block.entries[prefix.length - 1]
     prefix.push(add(prefix.at(-1), divide(level.quote, level.price)))
   }
-  const level = side.levels[first], remaining = subtract(target, first ? side.levels[first - 1].through : ZERO)
-  const baseQuantity = add(prefix[first], divide(remaining, level.price))
+  const level = block.entries[first], remaining = subtract(blockTarget, first ? block.through[first - 1] : ZERO)
+  const baseQuantity = add(blocksPrefix[blockIndex], add(prefix[first], divide(remaining, level.price)))
   if (baseQuantity.n <= 0n) return null
-  const average = divide(target, baseQuantity), reference = side.levels[0].price
+  const average = divide(target, baseQuantity), reference = side.first.price
   return multiply(divide(direction === 'ask' ? subtract(average, reference) : subtract(reference, average), reference), HUNDRED)
 }
 
@@ -172,10 +250,10 @@ export function evaluateLiquidity(input) {
 // never rounded output values, while comparing every new threshold afresh.
 export function createLiquidityEvaluator() {
   const books = new WeakMap()
-  return input => evaluateLiquiditySnapshot(input, books)
+  return (input, previousBook) => evaluateLiquiditySnapshot(input, books, previousBook)
 }
 
-function evaluateLiquiditySnapshot(input, books) {
+function evaluateLiquiditySnapshot(input, books, previousBook) {
   return measureOperation({ category: 'cpu', name: 'liquidity.evaluate', resource: input?.instrument?.instId,
     attributes: { bidLevels: input?.book?.bids?.length ?? 0, askLevels: input?.book?.asks?.length ?? 0, bookResident: Boolean(books?.has(input?.book)) } }, () => {
   const { instrument, ticker, book, openInterest, hourlyCandles, turnover24hUSDT, asOf, config } = input ?? {}
@@ -211,10 +289,17 @@ function evaluateLiquiditySnapshot(input, books) {
       const cacheable = book && typeof book === 'object'
       snapshot = cacheable ? books?.get(book) : null
       if (!snapshot || snapshot.units !== units) {
-        bidSide = bookSide(book?.bids, instrument, 'bid')
-        askSide = bookSide(book?.asks, instrument, 'ask')
+        const previous = previousBook && typeof previousBook === 'object' ? books?.get(previousBook) : null
+        if (previous?.units === units) {
+          bidSide = bookSide(book?.bids, instrument, 'bid', previous.bidSide?.observed ? previous.bidSide : null)
+          askSide = bookSide(book?.asks, instrument, 'ask', previous.askSide?.observed ? previous.askSide : null)
+        } else {
+          bidSide = initialBookSide(book?.bids, instrument, 'bid')
+          askSide = initialBookSide(book?.asks, instrument, 'ask')
+        }
         // A crossed snapshot cannot support either depth or fill calculations.
-        if (bidSide?.levels.length && askSide?.levels.length && compare(bidSide.levels[0].price, askSide.levels[0].price) > 0) bidSide = askSide = null
+        const firstBid = bidSide?.first ?? bidSide?.levels?.[0], firstAsk = askSide?.first ?? askSide?.levels?.[0]
+        if (firstBid && firstAsk && compare(firstBid.price, firstAsk.price) > 0) bidSide = askSide = null
         snapshot = { units, bidSide, askSide }
         if (cacheable) books?.set(book, snapshot)
       }

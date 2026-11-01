@@ -12,13 +12,17 @@ onOperationMessage(parentPort, 'stream-liquidity', ({ type, id, input, bookVersi
   try {
     const instId = input?.instrument?.instId
     if (evictBook !== undefined) books.delete(evictBook)
+    let previousBook
     if (bookVersion !== undefined) {
-      if (bookSnapshot) books.set(instId, { version: bookVersion, book: bookSnapshot })
+      if (bookSnapshot) {
+        previousBook = books.get(instId)?.book
+        books.set(instId, { version: bookVersion, book: bookSnapshot })
+      }
       const snapshot = books.get(instId)
       if (!snapshot || snapshot.version !== bookVersion) throw new Error('The requested order book version is not resident in this worker.')
       input = { ...input, book: snapshot.book }
     }
-    return { id, result: evaluate(input) }
+    return { id, result: evaluate(input, previousBook) }
   } catch (error) {
     return { id, error: error instanceof Error ? error.message : String(error) }
   }

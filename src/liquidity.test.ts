@@ -254,6 +254,117 @@ test('cached book evaluation respects changed contract units, denomination, inst
   assert.deepEqual(assertCachedLiquidity(evaluate, input), baseline, 'Revisiting an older immutable snapshot must retain its own exact calculations.')
 })
 
+test('incremental deep-book results match full recalculation across changed levels and fill boundaries', () => {
+  const evaluate = createLiquidityEvaluator(), config = only('slippage')
+  config.depth.enabled = true
+  config.depth.minUSDT = 1
+  config.slippage.maxPercent = 100
+  const metadata = { ...instrument, ctVal: '1' }
+  let bids = Array.from({ length: 400 }, (_, index) => [String(1000 - index), String(index % 7 + 1)])
+  let asks = Array.from({ length: 400 }, (_, index) => [String(1001 + index), String(index % 5 + 1)])
+  let previousBook: LiquidityInput['book']
+  const numericFill = (levels: string[][], target: number, direction: 'ask' | 'bid') => {
+    const active = levels.filter(([, size]) => Number(size) > 0)
+    let remaining = target, quantity = 0
+    for (const [rawPrice, rawSize] of active) {
+      const price = Number(rawPrice), quote = Math.min(remaining, price * Number(rawSize))
+      quantity += quote / price; remaining -= quote
+      if (remaining <= 0) break
+    }
+    if (remaining > 0) return null
+    const reference = Number(active[0][0]), average = target / quantity
+    return (direction === 'ask' ? average - reference : reference - average) / reference * 100
+  }
+  for (let iteration = 0; iteration < 30; iteration += 1) {
+    // Exercise changes at the first level, on both sides of block boundaries,
+    // and in deep levels. Snapshots model structured-cloned worker messages.
+    const index = [0, 31, 32, 63, 64, 199, 399][iteration % 7]
+    bids = bids.map(level => [...level]); asks = asks.map(level => [...level])
+    bids[Math.min(index, bids.length - 1)][1] = String(iteration % 6)
+    asks[Math.min(399 - index, asks.length - 1)][1] = String((iteration + 2) % 6)
+    if (iteration === 8) { bids.splice(80, 1); asks.splice(160, 1) }
+    if (iteration === 16) { bids.splice(80, 0, ['920', '3']); asks.splice(160, 0, ['1161', '3']) }
+    config.slippage.notionalUSDT = [1, 31_000, 32_000, 100_000, 300_000, 900_000][iteration % 6]
+    const input = fixture({ instrument: metadata, book: { bids, asks }, config })
+    const actual = evaluate(input, previousBook)
+    previousBook = input.book
+    assert.deepEqual(actual, evaluateLiquidity(input), `Full recalculation at update ${iteration}`)
+    near(actual.depthBid, bids.reduce((sum, [price, size]) => sum + Number(price) * Number(size), 0))
+    near(actual.depthAsk, asks.reduce((sum, [price, size]) => sum + Number(price) * Number(size), 0))
+    const expectedBid = numericFill(bids, config.slippage.notionalUSDT, 'bid')
+    const expectedAsk = numericFill(asks, config.slippage.notionalUSDT, 'ask')
+    if (expectedBid === null) assert.equal(actual.bidSlippage, null); else near(actual.bidSlippage, expectedBid)
+    if (expectedAsk === null) assert.equal(actual.askSlippage, null); else near(actual.askSlippage, expectedAsk)
+  }
+  const invalid = fixture({ instrument: metadata, book: { bids: [...bids.slice(0, 50), ['NaN', '1'], ...bids.slice(51)], asks }, config })
+  assert.deepEqual(evaluate(invalid, previousBook), evaluateLiquidity(invalid), 'Malformed replacement cannot reuse a prior valid level.')
+  assert.equal(evaluate(invalid).depthBid, null)
+  const units = fixture({ instrument: { ...metadata, ctVal: '2' }, book: { bids, asks }, config })
+  assert.deepEqual(evaluate(units, previousBook), evaluateLiquidity(units), 'Changed units invalidate all per-level values.')
+})
+
+test('a fill ending exactly at the 32-level boundary retains exact depth and slippage thresholds', () => {
+  const evaluate = createLiquidityEvaluator(), config = only('slippage')
+  config.depth.enabled = true
+  config.depth.minUSDT = 1
+  config.slippage.notionalUSDT = 3696
+  config.slippage.maxPercent = 15.5
+  const book = { asks: Array.from({ length: 40 }, (_, index) => [String(100 + index), '1']),
+    bids: Array.from({ length: 40 }, (_, index) => [String(100 - index), '2']) }
+  const input = fixture({ instrument: { ...instrument, ctVal: '1' }, book, config })
+  const result = evaluate(input)
+  assert.equal(result.askSlippage, 15.5)
+  assert.equal(result.checks.find(check => check.key === 'slippage')?.status, 'failed')
+  const secondBook = { bids: book.bids.map(level => [...level]), asks: book.asks.map(level => [...level]) }
+  secondBook.asks[39][1] = '2'
+  const secondInput = { ...input, book: secondBook }, second = evaluate(secondInput, book)
+  assert.deepEqual(second, evaluateLiquidity(secondInput))
+  assert.equal(second.depthAsk, 4919)
+  assert.equal(second.askSlippage, 15.5)
+  assert.equal(second.checks.find(check => check.key === 'slippage')?.status, 'failed')
+  config.slippage.maxPercent = 15.500001
+  const thirdBook = { bids: secondBook.bids.map(level => [...level]), asks: secondBook.asks.map(level => [...level]) }
+  thirdBook.bids[39][1] = '3'
+  const thirdInput = { ...input, book: thirdBook }, third = evaluate(thirdInput, secondBook)
+  assert.deepEqual(third, evaluateLiquidity(thirdInput))
+  assert.equal(third.depthBid, 6501)
+  assert.equal(third.depthAsk, 4919)
+  assert.equal(third.askSlippage, 15.5)
+  assert.equal(third.checks.find(check => check.key === 'slippage')?.status, 'verified')
+})
+
+test('quote-denominated decimal deep books use quote units for depth and base quantity for fills', () => {
+  const evaluate = createLiquidityEvaluator(), config = only('slippage')
+  config.depth.enabled = true
+  config.depth.minUSDT = 4_000
+  config.slippage.notionalUSDT = 3_200
+  config.slippage.maxPercent = 10
+  const book = { asks: Array.from({ length: 40 }, (_, index) => [(100 + index / 100).toFixed(2), '1']),
+    bids: Array.from({ length: 40 }, (_, index) => [(99.99 - index / 100).toFixed(2), '1']) }
+  const input = fixture({ instrument: { ...instrument, ctVal: '100', ctValCcy: 'USDT' }, book, config })
+  const result = evaluate(input)
+  const expectedAsk = (3_200 / book.asks.slice(0, 32).reduce((sum, [price]) => sum + 100 / Number(price), 0) - 100) / 100 * 100
+  near(result.askSlippage, expectedAsk)
+  assert.equal(result.depthAsk, 4_000)
+  assert.equal(result.checks.find(check => check.key === 'depth')?.status, 'unknown')
+  const secondBook = { bids: book.bids.map(level => [...level]), asks: book.asks.map(level => [...level]) }
+  secondBook.asks[39][1] = '2'
+  const secondInput = { ...input, book: secondBook }, second = evaluate(secondInput, book)
+  assert.deepEqual(second, evaluateLiquidity(secondInput))
+  near(second.askSlippage, expectedAsk)
+  assert.equal(second.depthBid, 4_000)
+  assert.equal(second.depthAsk, 4_100)
+  assert.equal(second.checks.find(check => check.key === 'depth')?.status, 'unknown')
+  const thirdBook = { bids: secondBook.bids.map(level => [...level]), asks: secondBook.asks.map(level => [...level]) }
+  thirdBook.bids[39][1] = '2'
+  const thirdInput = { ...input, book: thirdBook }, third = evaluate(thirdInput, secondBook)
+  assert.deepEqual(third, evaluateLiquidity(thirdInput))
+  near(third.askSlippage, expectedAsk)
+  assert.equal(third.depthBid, 4_100)
+  assert.equal(third.depthAsk, 4_100)
+  assert.equal(third.checks.find(check => check.key === 'depth')?.status, 'verified')
+})
+
 test('the pure liquidity evaluator recomputes a mutable book without retaining snapshot cache state', () => {
   const book = { asks: [['100', '200000']], bids: [['100', '200000']] }
   const input = fixture({ config: only('depth'), book })

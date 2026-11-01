@@ -30,17 +30,17 @@ const settle = async (service: MarketService) => {
     await Promise.allSettled([...service.backgroundTasks, ...service.candidateTasks.values()])
   } while (service.backgroundTasks.size || service.candidateTasks.size || service.refreshing)
 }
-const fixture = async (automatic = false, sources: { book?: () => Response | Promise<Response>; openInterest?: () => Response | Promise<Response> } = {}) => {
+const fixture = async (automatic = false, sources: { book?: () => Response | Promise<Response>; openInterest?: () => Response | Promise<Response>; tickers?: (signal: AbortSignal) => Response | Promise<Response> } = {}) => {
   const preferences = structuredClone(DEFAULT_PREFERENCES)
   for (const condition of Object.values(preferences.liquidity)) condition.enabled = false
   preferences.liquidity.spread.enabled = true
   const root = await mkdtemp(join(tmpdir(), 'perp-network-reuse-')), store = await MarketStore.open(root)
   const requests: string[] = [], sockets: Socket[] = []
-  const service = new MarketService(store, () => preferences, async input => {
+  const service = new MarketService(store, () => preferences, async (input, init) => {
     const path = new URL(String(input)).pathname
     requests.push(path)
     if (path.endsWith('/public/instruments')) return response([instrument])
-    if (path.endsWith('/market/tickers')) return response([{ instId, last: '100', bidPx: '99.99', askPx: '100' }])
+    if (path.endsWith('/market/tickers')) return sources.tickers ? sources.tickers(init!.signal as AbortSignal) : response([{ instId, last: '100', bidPx: '99.99', askPx: '100' }])
     if (path.endsWith('/market/books')) return sources.book ? sources.book() : response([{ ts: String(Date.now()), bids: [['99.99', '200001']], asks: [['100', '200001']] }])
     if (path.endsWith('/public/open-interest')) return sources.openInterest ? sources.openInterest() : response([{ instId, oiUsd: '6000000', ts: String(Date.now()) }])
     throw new Error(`Unexpected source request: ${path}`)
@@ -51,6 +51,88 @@ const fixture = async (automatic = false, sources: { book?: () => Response | Pro
   for (const lane of service.requestLanes.values()) lane.interval = 0
   return { service, preferences, requests, sockets, async close() { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) } }
 }
+
+test('concurrent ticker consumers retain one download when the first consumer cancels', async () => {
+  let release!: (value: Response) => void, started!: () => void
+  const entered = new Promise<void>(resolve => { started = resolve })
+  const held = new Promise<Response>(resolve => { release = resolve })
+  const f = await fixture(false, { tickers: () => { started(); return held } })
+  try {
+    const first = new AbortController(), second = new AbortController()
+    const abandoned = f.service.tickerObservations(first.signal, 'foreground', true)
+    const rejected = assert.rejects(abandoned, { name: 'AbortError' })
+    const retained = f.service.tickerObservations(second.signal, 'foreground', true)
+    await entered
+    first.abort()
+    await rejected
+    release(response([{ instId, last: '100', bidPx: '99.99', askPx: '100' }]))
+    const observations = await retained
+    assert.equal(observations.get(instId).value.last, '100')
+    assert.equal(f.service.tickerCache.values, observations)
+    assert.equal(f.requests.filter(path => path.endsWith('/market/tickers')).length, 1)
+  } finally { release?.(response([])); await f.close() }
+})
+
+test('the ticker download aborts only after its last consumer cancels', async () => {
+  let started!: (signal: AbortSignal) => void, release!: (value: Response) => void
+  const entered = new Promise<AbortSignal>(resolve => { started = resolve })
+  const held = new Promise<Response>(resolve => { release = resolve })
+  const f = await fixture(false, { tickers: signal => { started(signal); return held } })
+  try {
+    const first = new AbortController(), second = new AbortController()
+    const firstResult = assert.rejects(f.service.tickerObservations(first.signal, 'foreground', true), { name: 'AbortError' })
+    const secondResult = assert.rejects(f.service.tickerObservations(second.signal, 'foreground', true), { name: 'AbortError' })
+    const transportSignal = await entered
+    first.abort()
+    await firstResult
+    assert.equal(transportSignal.aborted, false)
+    second.abort()
+    await secondResult
+    assert.equal(transportSignal.aborted, true)
+    assert.equal(f.service.tickerTask, null)
+    assert.equal(f.requests.filter(path => path.endsWith('/market/tickers')).length, 1)
+  } finally { release(response([])); await f.close() }
+})
+
+test('disposing the service aborts the shared ticker download and rejects all consumers', async () => {
+  let started!: (signal: AbortSignal) => void, release!: (value: Response) => void
+  const entered = new Promise<AbortSignal>(resolve => { started = resolve })
+  const held = new Promise<Response>(resolve => { release = resolve })
+  const f = await fixture(false, { tickers: signal => { started(signal); return held } })
+  try {
+    const first = assert.rejects(f.service.tickerObservations(new AbortController().signal, 'foreground', true), { name: 'AbortError' })
+    const second = assert.rejects(f.service.tickerObservations(new AbortController().signal, 'foreground', true), { name: 'AbortError' })
+    const transportSignal = await entered
+    const disposing = f.service.dispose()
+    await Promise.all([first, second, disposing])
+    assert.equal(transportSignal.aborted, true)
+    assert.equal(f.service.tickerTask, null)
+    assert.equal(f.service.tickerCache, null)
+    assert.equal(f.requests.filter(path => path.endsWith('/market/tickers')).length, 1)
+  } finally { release(response([])); await f.close() }
+})
+
+test('an abandoned ticker download cannot overwrite a newer snapshot', async () => {
+  let release!: (value: Response) => void, started!: () => void
+  const entered = new Promise<void>(resolve => { started = resolve })
+  const held = new Promise<Response>(resolve => { release = resolve })
+  let calls = 0
+  const f = await fixture(false, { tickers: () => ++calls === 1 ? (started(), held) : response([{ instId, last: '200', bidPx: '199.99', askPx: '200' }]) })
+  try {
+    const controller = new AbortController()
+    const abandoned = f.service.tickerObservations(controller.signal, 'foreground', true)
+    const rejected = assert.rejects(abandoned, { name: 'AbortError' })
+    await entered
+    controller.abort()
+    await rejected
+    const latest = await f.service.tickerObservations(new AbortController().signal, 'foreground', true)
+    release(response([{ instId, last: '100', bidPx: '99.99', askPx: '100' }]))
+    await setImmediate()
+    assert.equal(f.service.tickerCache.values, latest)
+    assert.equal(f.service.tickerCache.values.get(instId).value.last, '200')
+    assert.equal(calls, 2)
+  } finally { release?.(response([])); await f.close() }
+})
 
 test('automatic threshold changes reuse fresh REST metadata, ticker, book and OI without source requests', async () => {
   const f = await fixture()

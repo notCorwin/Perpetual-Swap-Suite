@@ -80,6 +80,22 @@ test('ticker and OI changes reuse the resident book without cloning its content 
   assert.notEqual(sent[2].bookVersion, sent[1].bookVersion)
 })
 
+test('resident deep-book replacement remains correct across 50 interleaved instruments', async t => {
+  const worker = new StreamLiquidityEvaluator()
+  t.after(() => worker.close())
+  const inputs = Array.from({ length: 50 }, (_, index) => {
+    const value = fixture(), base = `T${index}`
+    value.instrument = { ...(value.instrument as Record<string, unknown>), instId: `${base}-USDT-SWAP`, ctValCcy: base }
+    return value
+  })
+  for (let round = 0; round < 3; round += 1) for (const input of inputs) {
+    const bids = input.book!.bids!.map(level => [...level]), asks = input.book!.asks!.map(level => [...level])
+    bids[31][1] = String(5000 + round); asks[32][1] = String(5001 + round)
+    input.book = { bids, asks }
+    assert.deepEqual(await worker.evaluate(input), evaluateLiquidity(input))
+  }
+})
+
 test('a replacement worker receives the required book again after its old lifetime ends', async t => {
   const evaluator = new StreamLiquidityEvaluator()
   t.after(() => evaluator.close())

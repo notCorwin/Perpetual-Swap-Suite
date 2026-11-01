@@ -2093,31 +2093,57 @@ export class MarketService {
   }
 
   async tickerObservations(signal, priority = 'background', force = false) {
+    signal?.throwIfAborted()
     if (this.candidateIDs?.size && [...this.candidateIDs].every(id => {
       const observation = this.tickerCache?.values.get(id)
       return observation?.source === 'websocket' && this.observationExpiry(observation, 'ticker', id) > Date.now()
     })) return this.tickerCache.values
     if (!force && this.tickerCache && Date.now() - this.tickerCache.observedAt < CATALOG_RENEW_INTERVAL) return this.tickerCache.values
-    if (this.tickerTask && !this.tickerTask.signal.aborted) return this.tickerTask.task
-    const task = this.get('/market/tickers', { instType: 'SWAP' }, signal, priority).then(values => {
-      if (!Array.isArray(values) || !values.length) throw new Error('OKX returned no swap tickers.')
-      const observedAt = Date.now()
-      const observations = new Map(values.map(value => [value.instId, { value, observedAt, expiresAt: observedAt + OBSERVATION_TTL }]))
-      for (const [id, observation] of this.tickerCache?.values ?? []) if (observation.source === 'websocket' && this.observationExpiry(observation, 'ticker', id) > observedAt) observations.set(id, observation)
-      if (!signal.aborted && !this.disposed) this.tickerCache = { values: observations, observedAt }
-      for (const [id, value] of observations) if (this.validTicker(value.value)) this.clearTickerFault(id)
-      return observations
-    }).catch(error => {
-      if (!signal.aborted) {
-        if (error && typeof error === 'object') this.handledSourceErrors.add(error)
-        for (const id of this.candidateIDs ?? this.instruments.keys()) if (this.observationExpiry(this.tickerCache?.values.get(id), 'ticker', id) <= Date.now()) this.tickerFaults.set(id, error)
-        if (!this.candidateIDs && !this.instruments.size) this.tickerFaults.set('*', error)
-        if (this.tickerFaults.size) this.sourceError('tickers', error)
+    let pending = this.tickerTask
+    if (!pending) {
+      pending = { controller: new AbortController(), waiters: new Set(), settled: false, task: null }
+      this.tickerTask = pending
+      pending.task = Promise.resolve().then(() => this.get('/market/tickers', { instType: 'SWAP' }, pending.controller.signal, priority)).then(values => {
+        pending.controller.signal.throwIfAborted()
+        if (!Array.isArray(values) || !values.length) throw new Error('OKX returned no swap tickers.')
+        const observedAt = Date.now()
+        const observations = new Map(values.map(value => [value.instId, { value, observedAt, expiresAt: observedAt + OBSERVATION_TTL }]))
+        for (const [id, observation] of this.tickerCache?.values ?? []) if (observation.source === 'websocket' && this.observationExpiry(observation, 'ticker', id) > observedAt) observations.set(id, observation)
+        if (this.tickerTask === pending && !this.disposed) {
+          this.tickerCache = { values: observations, observedAt }
+          for (const [id, value] of observations) if (this.validTicker(value.value)) this.clearTickerFault(id)
+        }
+        return observations
+      }).catch(error => {
+        if (this.tickerTask === pending && !pending.controller.signal.aborted) {
+          if (error && typeof error === 'object') this.handledSourceErrors.add(error)
+          for (const id of this.candidateIDs ?? this.instruments.keys()) if (this.observationExpiry(this.tickerCache?.values.get(id), 'ticker', id) <= Date.now()) this.tickerFaults.set(id, error)
+          if (!this.candidateIDs && !this.instruments.size) this.tickerFaults.set('*', error)
+          if (this.tickerFaults.size) this.sourceError('tickers', error)
+        }
+        throw error
+      }).finally(() => {
+        pending.settled = true
+        if (this.tickerTask === pending) this.tickerTask = null
+      })
+    }
+    return new Promise((resolve, reject) => {
+      const waiter = {}
+      const finish = (complete, value) => {
+        if (!pending.waiters.delete(waiter)) return
+        signal?.removeEventListener('abort', onAbort)
+        complete(value)
+        if (!pending.settled && !pending.waiters.size && this.tickerTask === pending) {
+          this.tickerTask = null
+          pending.controller.abort(signal?.reason)
+        }
       }
-      throw error
-    }).finally(() => { if (this.tickerTask?.task === task) this.tickerTask = null })
-    this.tickerTask = { signal, task }
-    return task
+      const onAbort = () => finish(reject, signal.reason)
+      pending.waiters.add(waiter)
+      signal?.addEventListener('abort', onAbort, { once: true })
+      pending.task.then(value => finish(resolve, value), error => finish(reject, error))
+      if (signal?.aborted) onAbort()
+    })
   }
 
   async checkCandidate(instrument, config, configKey, signal, priority = 'foreground', options = {}) {
